@@ -6,6 +6,7 @@
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
 use reqwest::Client;
+use reqwest::header::CONTENT_TYPE;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -66,8 +67,8 @@ impl KiroProvider {
         );
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client
-        let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
-            .expect("创建 HTTP 客户端失败");
+        let initial_client =
+            build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
 
@@ -94,10 +95,7 @@ impl KiroProvider {
     }
 
     /// 根据凭据选择 endpoint 实现
-    fn endpoint_for(
-        &self,
-        credentials: &KiroCredentials,
-    ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
+    fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
         let name = credentials
             .endpoint
             .as_deref()
@@ -222,7 +220,12 @@ impl KiroProvider {
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
+                    if self
+                        .token_manager
+                        .force_refresh_token_for(ctx.id)
+                        .await
+                        .is_ok()
+                    {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
                         continue;
                     }
@@ -353,6 +356,45 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
+                if is_stream && !Self::is_event_stream_response(&response) {
+                    let content_type = response
+                        .headers()
+                        .get(CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let body = response.text().await.unwrap_or_default();
+                    let exception = Self::extract_aws_exception(&body);
+
+                    tracing::warn!(
+                        "流式 API 返回 2xx 但不是 eventstream（尝试 {}/{}）: content-type={}, exception={:?}, body={}",
+                        attempt + 1,
+                        max_retries,
+                        content_type,
+                        exception,
+                        body
+                    );
+
+                    let err = anyhow::anyhow!(
+                        "{} API 返回非 eventstream 响应: content-type={}, exception={:?}, body={}",
+                        api_type,
+                        content_type,
+                        exception,
+                        body
+                    );
+
+                    if attempt + 1 < max_retries
+                        && exception
+                            .as_deref()
+                            .is_some_and(Self::is_retryable_aws_exception)
+                    {
+                        last_error = Some(err);
+                        sleep(Self::retry_delay(attempt)).await;
+                        continue;
+                    }
+
+                    return Err(err);
+                }
                 self.token_manager.report_success(ctx.id);
                 return Ok(response);
             }
@@ -408,7 +450,12 @@ impl KiroProvider {
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
                     tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
+                    if self
+                        .token_manager
+                        .force_refresh_token_for(ctx.id)
+                        .await
+                        .is_ok()
+                    {
                         tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
                         continue;
                     }
@@ -515,5 +562,46 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+
+    fn is_event_stream_response(response: &reqwest::Response) -> bool {
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| {
+                ct.split(';')
+                    .next()
+                    .map(|media_type| {
+                        let media_type = media_type.trim().to_ascii_lowercase();
+                        media_type == "application/vnd.amazon.eventstream"
+                            || media_type == "application/octet-stream"
+                    })
+                    .unwrap_or(false)
+            })
+    }
+
+    fn extract_aws_exception(body: &str) -> Option<String> {
+        let value: serde_json::Value = serde_json::from_str(body).ok()?;
+        value
+            .get("__type")
+            .or_else(|| value.get("code"))
+            .or_else(|| value.get("Code"))
+            .or_else(|| value.get("type"))
+            .or_else(|| value.pointer("/error/type"))
+            .or_else(|| value.pointer("/error/code"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.rsplit(['#', '.']).next().unwrap_or(s).to_string())
+    }
+
+    fn is_retryable_aws_exception(exception: &str) -> bool {
+        matches!(
+            exception,
+            "ThrottlingException"
+                | "TooManyRequestsException"
+                | "InternalServerException"
+                | "ServiceUnavailableException"
+                | "RequestTimeoutException"
+        )
     }
 }

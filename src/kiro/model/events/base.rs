@@ -12,10 +12,18 @@ pub enum EventType {
     AssistantResponse,
     /// 工具使用事件
     ToolUse,
+    /// 原生 reasoning/thinking 事件
+    ReasoningContent,
+    /// 元数据事件（包含 token usage）
+    Metadata,
     /// 计费事件
     Metering,
     /// 上下文使用率事件
     ContextUsage,
+    /// 消息元数据事件
+    MessageMetadata,
+    /// 无效会话/状态事件
+    InvalidState,
     /// 未知事件类型
     Unknown,
 }
@@ -26,8 +34,12 @@ impl EventType {
         match s {
             "assistantResponseEvent" => Self::AssistantResponse,
             "toolUseEvent" => Self::ToolUse,
+            "reasoningContentEvent" => Self::ReasoningContent,
+            "metadataEvent" => Self::Metadata,
             "meteringEvent" => Self::Metering,
             "contextUsageEvent" => Self::ContextUsage,
+            "messageMetadataEvent" => Self::MessageMetadata,
+            "invalidStateEvent" => Self::InvalidState,
             _ => Self::Unknown,
         }
     }
@@ -37,8 +49,12 @@ impl EventType {
         match self {
             Self::AssistantResponse => "assistantResponseEvent",
             Self::ToolUse => "toolUseEvent",
+            Self::ReasoningContent => "reasoningContentEvent",
+            Self::Metadata => "metadataEvent",
             Self::Metering => "meteringEvent",
             Self::ContextUsage => "contextUsageEvent",
+            Self::MessageMetadata => "messageMetadataEvent",
+            Self::InvalidState => "invalidStateEvent",
             Self::Unknown => "unknown",
         }
     }
@@ -67,10 +83,18 @@ pub enum Event {
     AssistantResponse(super::AssistantResponseEvent),
     /// 工具使用
     ToolUse(super::ToolUseEvent),
+    /// 原生 reasoning/thinking 内容
+    ReasoningContent(super::ReasoningContentEvent),
+    /// 元数据
+    Metadata(super::MetadataEvent),
     /// 计费
     Metering(()),
     /// 上下文使用率
     ContextUsage(super::ContextUsageEvent),
+    /// 消息元数据
+    MessageMetadata(super::MessageMetadataEvent),
+    /// 无效状态
+    InvalidState(super::InvalidStateEvent),
     /// 未知事件 (保留原始帧数据)
     Unknown {},
     /// 服务端错误
@@ -116,10 +140,26 @@ impl Event {
                 let payload = super::ToolUseEvent::from_frame(&frame)?;
                 Ok(Self::ToolUse(payload))
             }
+            EventType::ReasoningContent => {
+                let payload = super::ReasoningContentEvent::from_frame(&frame)?;
+                Ok(Self::ReasoningContent(payload))
+            }
+            EventType::Metadata => {
+                let payload = super::MetadataEvent::from_frame(&frame)?;
+                Ok(Self::Metadata(payload))
+            }
             EventType::Metering => Ok(Self::Metering(())),
             EventType::ContextUsage => {
                 let payload = super::ContextUsageEvent::from_frame(&frame)?;
                 Ok(Self::ContextUsage(payload))
+            }
+            EventType::MessageMetadata => {
+                let payload = super::MessageMetadataEvent::from_frame(&frame)?;
+                Ok(Self::MessageMetadata(payload))
+            }
+            EventType::InvalidState => {
+                let payload = super::InvalidStateEvent::from_frame(&frame)?;
+                Ok(Self::InvalidState(payload))
             }
             EventType::Unknown => Ok(Self::Unknown {}),
         }
@@ -172,6 +212,19 @@ mod tests {
             EventType::from_str("contextUsageEvent"),
             EventType::ContextUsage
         );
+        assert_eq!(
+            EventType::from_str("reasoningContentEvent"),
+            EventType::ReasoningContent
+        );
+        assert_eq!(EventType::from_str("metadataEvent"), EventType::Metadata);
+        assert_eq!(
+            EventType::from_str("messageMetadataEvent"),
+            EventType::MessageMetadata
+        );
+        assert_eq!(
+            EventType::from_str("invalidStateEvent"),
+            EventType::InvalidState
+        );
         assert_eq!(EventType::from_str("unknown_type"), EventType::Unknown);
     }
 
@@ -182,5 +235,12 @@ mod tests {
             "assistantResponseEvent"
         );
         assert_eq!(EventType::ToolUse.as_str(), "toolUseEvent");
+        assert_eq!(
+            EventType::ReasoningContent.as_str(),
+            "reasoningContentEvent"
+        );
+        assert_eq!(EventType::Metadata.as_str(), "metadataEvent");
+        assert_eq!(EventType::MessageMetadata.as_str(), "messageMetadataEvent");
+        assert_eq!(EventType::InvalidState.as_str(), "invalidStateEvent");
     }
 }

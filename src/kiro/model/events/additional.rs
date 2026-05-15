@@ -1,0 +1,159 @@
+//! Additional Kiro event payloads.
+//!
+//! These events are emitted by newer Kiro runtimes but were not part of the
+//! original minimal parser. Keeping them typed lets the Anthropic adapter use
+//! authoritative token usage, native thinking, and upstream invalid-state
+//! failures instead of treating them as opaque unknown frames.
+
+use serde::{Deserialize, Serialize};
+
+use crate::kiro::parser::error::ParseResult;
+use crate::kiro::parser::frame::Frame;
+
+use super::base::EventPayload;
+
+/// Native reasoning/thinking event.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningContentEvent {
+    #[serde(default)]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redacted_content: Option<String>,
+}
+
+impl EventPayload for ReasoningContentEvent {
+    fn from_frame(frame: &Frame) -> ParseResult<Self> {
+        frame.payload_as_json()
+    }
+}
+
+/// Token usage details reported by `metadataEvent`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MetadataTokenUsage {
+    #[serde(default)]
+    pub uncached_input_tokens: i32,
+    #[serde(default)]
+    pub output_tokens: i32,
+    #[serde(default)]
+    pub total_tokens: i32,
+    #[serde(default)]
+    pub cache_read_input_tokens: i32,
+    #[serde(default)]
+    pub cache_write_input_tokens: i32,
+}
+
+impl MetadataTokenUsage {
+    pub fn input_tokens(&self) -> i32 {
+        self.uncached_input_tokens + self.cache_read_input_tokens
+    }
+}
+
+/// Metadata event containing authoritative token usage.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MetadataEvent {
+    #[serde(default)]
+    pub token_usage: Option<MetadataTokenUsage>,
+}
+
+impl EventPayload for MetadataEvent {
+    fn from_frame(frame: &Frame) -> ParseResult<Self> {
+        frame.payload_as_json()
+    }
+}
+
+/// Conversation metadata event.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageMetadataEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub utterance_id: Option<String>,
+}
+
+impl EventPayload for MessageMetadataEvent {
+    fn from_frame(frame: &Frame) -> ParseResult<Self> {
+        frame.payload_as_json()
+    }
+}
+
+/// Invalid state event returned inside an otherwise successful event stream.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct InvalidStateEvent {
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub message: String,
+}
+
+impl InvalidStateEvent {
+    pub fn error_text(&self) -> String {
+        if self.message.is_empty() {
+            self.reason.clone()
+        } else {
+            self.message.clone()
+        }
+    }
+}
+
+impl EventPayload for InvalidStateEvent {
+    fn from_frame(frame: &Frame) -> ParseResult<Self> {
+        frame.payload_as_json()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_usage_deserializes_camel_case_and_computes_input_tokens() {
+        let event: MetadataEvent = serde_json::from_str(
+            r#"{
+                "tokenUsage": {
+                    "uncachedInputTokens": 120,
+                    "cacheReadInputTokens": 30,
+                    "cacheWriteInputTokens": 7,
+                    "outputTokens": 11,
+                    "totalTokens": 168
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let usage = event.token_usage.unwrap();
+        assert_eq!(usage.input_tokens(), 150);
+        assert_eq!(usage.output_tokens, 11);
+        assert_eq!(usage.cache_write_input_tokens, 7);
+    }
+
+    #[test]
+    fn invalid_state_prefers_message_but_falls_back_to_reason() {
+        let with_message: InvalidStateEvent =
+            serde_json::from_str(r#"{"reason":"Expired","message":"session expired"}"#).unwrap();
+        assert_eq!(with_message.error_text(), "session expired");
+
+        let without_message: InvalidStateEvent =
+            serde_json::from_str(r#"{"reason":"Expired"}"#).unwrap();
+        assert_eq!(without_message.error_text(), "Expired");
+    }
+
+    #[test]
+    fn reasoning_content_supports_signature_and_redacted_content() {
+        let event: ReasoningContentEvent =
+            serde_json::from_str(r#"{"text":"thinking","signature":"sig"}"#).unwrap();
+        assert_eq!(event.text, "thinking");
+        assert_eq!(event.signature.as_deref(), Some("sig"));
+
+        let redacted: ReasoningContentEvent =
+            serde_json::from_str(r#"{"redactedContent":"opaque"}"#).unwrap();
+        assert_eq!(redacted.redacted_content.as_deref(), Some("opaque"));
+        assert!(redacted.text.is_empty());
+    }
+}

@@ -2,11 +2,11 @@
 
 use std::convert::Infallible;
 
-use anyhow::Error;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
+use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
@@ -18,13 +18,16 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use serde_json::json;
 use std::time::Duration;
-use tokio::time::interval;
+use tokio::time::{Instant, interval, sleep_until};
 use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::types::{
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
+    OutputConfig, Thinking,
+};
 use super::websearch;
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
@@ -313,7 +316,15 @@ pub async fn post_messages(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+        )
+        .await
     }
 }
 
@@ -333,7 +344,8 @@ async fn handle_stream_request(
     };
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx =
+        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -353,6 +365,8 @@ async fn handle_stream_request(
 
 /// Ping 事件间隔（25秒）
 const PING_INTERVAL_SECS: u64 = 25;
+/// 上游 eventstream 读空闲超时（180秒）
+const UPSTREAM_IDLE_TIMEOUT_SECS: u64 = 180;
 
 /// 创建 ping 事件的 SSE 字符串
 fn create_ping_sse() -> Bytes {
@@ -376,18 +390,36 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS))),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        (
+            body_stream,
+            ctx,
+            EventStreamDecoder::new(),
+            false,
+            interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            Instant::now() + Duration::from_secs(UPSTREAM_IDLE_TIMEOUT_SECS),
+        ),
+        |(
+            mut body_stream,
+            mut ctx,
+            mut decoder,
+            finished,
+            mut ping_interval,
+            mut idle_deadline,
+        )| async move {
             if finished {
                 return None;
             }
 
-            // 使用 select! 同时等待数据和 ping 定时器
+            let idle_sleep = sleep_until(idle_deadline);
+            tokio::pin!(idle_sleep);
+
+            // 使用 select! 同时等待数据、ping 定时器和上游空闲超时
             tokio::select! {
                 // 处理数据流
                 chunk_result = body_stream.next() => {
                     match chunk_result {
                         Some(Ok(chunk)) => {
+                            idle_deadline = Instant::now() + Duration::from_secs(UPSTREAM_IDLE_TIMEOUT_SECS);
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
                                 tracing::warn!("缓冲区溢出: {}", e);
@@ -414,17 +446,18 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, idle_deadline)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            // 发送最终事件并结束
+                            // 读取错误：关闭已有内容块后发送 SSE error，不再发送正常 message_stop。
+                            ctx.record_stream_error("api_error", format!("upstream stream read error: {}", e));
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, idle_deadline)))
                         }
                         None => {
                             // 流结束，发送最终事件
@@ -433,15 +466,28 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, idle_deadline)))
                         }
                     }
+                }
+                _ = &mut idle_sleep => {
+                    tracing::error!(
+                        "上游响应流超过 {} 秒未产生数据，结束流并发送错误事件",
+                        UPSTREAM_IDLE_TIMEOUT_SECS
+                    );
+                    ctx.record_stream_error("api_error", "upstream stream idle timeout");
+                    let final_events = ctx.generate_final_events();
+                    let bytes: Vec<Result<Bytes, Infallible>> = final_events
+                        .into_iter()
+                        .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                        .collect();
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, idle_deadline)))
                 }
                 // 发送 ping 保活
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, idle_deadline)))
                 }
             }
         },
@@ -496,6 +542,10 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
+    let mut metadata_usage: Option<crate::kiro::model::events::MetadataTokenUsage> = None;
+    let mut native_thinking_content = String::new();
+    let mut native_thinking_signature: Option<String> = None;
+    let mut redacted_thinking: Option<String> = None;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -508,6 +558,19 @@ async fn handle_non_stream_request(
                     match event {
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
+                        }
+                        Event::ReasoningContent(reasoning) => {
+                            if let Some(redacted) = reasoning.redacted_content {
+                                if !redacted.is_empty() {
+                                    redacted_thinking = Some(redacted);
+                                }
+                            }
+                            if !reasoning.text.is_empty() {
+                                native_thinking_content = reasoning.text;
+                            }
+                            if reasoning.signature.is_some() {
+                                native_thinking_signature = reasoning.signature;
+                            }
                         }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
@@ -523,14 +586,14 @@ async fn handle_non_stream_request(
                                 let input: serde_json::Value = if buffer.is_empty() {
                                     serde_json::json!({})
                                 } else {
-                                    serde_json::from_str(buffer)
-                                        .unwrap_or_else(|e| {
-                                            tracing::warn!(
-                                                "工具输入 JSON 解析失败: {}, tool_use_id: {}",
-                                                e, tool_use.tool_use_id
-                                            );
-                                            serde_json::json!({})
-                                        })
+                                    serde_json::from_str(buffer).unwrap_or_else(|e| {
+                                        tracing::warn!(
+                                            "工具输入 JSON 解析失败: {}, tool_use_id: {}",
+                                            e,
+                                            tool_use.tool_use_id
+                                        );
+                                        serde_json::json!({})
+                                    })
                                 };
 
                                 let original_name = tool_name_map
@@ -549,10 +612,9 @@ async fn handle_non_stream_request(
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
                             let window_size = get_context_window_size(model);
-                            let actual_input_tokens = (context_usage.context_usage_percentage
-                                * (window_size as f64)
-                                / 100.0)
-                                as i32;
+                            let actual_input_tokens =
+                                (context_usage.context_usage_percentage * (window_size as f64)
+                                    / 100.0) as i32;
                             context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
@@ -563,6 +625,24 @@ async fn handle_non_stream_request(
                                 context_usage.context_usage_percentage,
                                 actual_input_tokens
                             );
+                        }
+                        Event::Metadata(metadata) => {
+                            if let Some(token_usage) = metadata.token_usage {
+                                metadata_usage = Some(token_usage);
+                            }
+                        }
+                        Event::InvalidState(invalid) => {
+                            let message = invalid.error_text();
+                            tracing::warn!(
+                                reason = %invalid.reason,
+                                message = %message,
+                                "非流式响应收到 invalidStateEvent"
+                            );
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(ErrorResponse::new("invalid_request_error", message)),
+                            )
+                                .into_response();
                         }
                         Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
@@ -587,7 +667,29 @@ async fn handle_non_stream_request(
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
 
-    if thinking_enabled {
+    if thinking_enabled && redacted_thinking.is_some() {
+        content.push(json!({
+            "type": "redacted_thinking",
+            "data": redacted_thinking.unwrap()
+        }));
+    } else if thinking_enabled && !native_thinking_content.is_empty() {
+        let mut thinking_block = json!({
+            "type": "thinking",
+            "thinking": native_thinking_content
+        });
+        if let Some(signature) = native_thinking_signature {
+            if !signature.is_empty() {
+                thinking_block["signature"] = json!(signature);
+            }
+        }
+        content.push(thinking_block);
+        if !text_content.is_empty() {
+            content.push(json!({
+                "type": "text",
+                "text": text_content
+            }));
+        }
+    } else if thinking_enabled {
         // 从完整文本中提取 thinking 块
         let (thinking, remaining_text) =
             super::stream::extract_thinking_from_complete_text(&text_content);
@@ -615,10 +717,17 @@ async fn handle_non_stream_request(
     content.extend(tool_uses);
 
     // 估算输出 tokens
-    let output_tokens = token::estimate_output_tokens(&content);
+    let output_tokens = metadata_usage
+        .as_ref()
+        .map(|usage| usage.output_tokens)
+        .unwrap_or_else(|| token::estimate_output_tokens(&content));
 
-    // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-    let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    // 优先使用 metadataEvent 的准确 usage，其次使用 contextUsageEvent 估算值。
+    let final_input_tokens = metadata_usage
+        .as_ref()
+        .map(|usage| usage.input_tokens())
+        .or(context_input_tokens)
+        .unwrap_or(input_tokens);
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -631,7 +740,15 @@ async fn handle_non_stream_request(
         "stop_sequence": null,
         "usage": {
             "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens
+            "output_tokens": output_tokens,
+            "cache_read_input_tokens": metadata_usage
+                .as_ref()
+                .map(|usage| usage.cache_read_input_tokens)
+                .unwrap_or(0),
+            "cache_creation_input_tokens": metadata_usage
+                .as_ref()
+                .map(|usage| usage.cache_write_input_tokens)
+                .unwrap_or(0)
         }
     });
 
@@ -649,14 +766,10 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 =
-        model_lower.contains("opus") && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let is_opus_4_6 = model_lower.contains("opus")
+        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
 
-    let thinking_type = if is_opus_4_6 {
-        "adaptive"
-    } else {
-        "enabled"
-    };
+    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
 
     tracing::info!(
         model = %payload.model,
@@ -668,7 +781,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         thinking_type: thinking_type.to_string(),
         budget_tokens: 20000,
     });
-    
+
     if is_opus_4_6 {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
@@ -826,7 +939,15 @@ pub async fn post_messages_cc(
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
-        handle_non_stream_request(provider, &request_body, &payload.model, input_tokens, extract_thinking, tool_name_map).await
+        handle_non_stream_request(
+            provider,
+            &request_body,
+            &payload.model,
+            input_tokens,
+            extract_thinking,
+            tool_name_map,
+        )
+        .await
     }
 }
 
@@ -849,7 +970,12 @@ async fn handle_stream_request_buffered(
     };
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    let ctx = BufferedStreamContext::new(
+        model,
+        estimated_input_tokens,
+        thinking_enabled,
+        tool_name_map,
+    );
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx);
@@ -884,13 +1010,24 @@ fn create_buffered_sse_stream(
             EventStreamDecoder::new(),
             false,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            Instant::now() + Duration::from_secs(UPSTREAM_IDLE_TIMEOUT_SECS),
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        |(
+            mut body_stream,
+            mut ctx,
+            mut decoder,
+            finished,
+            mut ping_interval,
+            mut idle_deadline,
+        )| async move {
             if finished {
                 return None;
             }
 
             loop {
+                let idle_sleep = sleep_until(idle_deadline);
+                tokio::pin!(idle_sleep);
+
                 tokio::select! {
                     // 使用 biased 模式，优先检查 ping 定时器
                     // 避免在上游 chunk 密集时 ping 被"饿死"
@@ -900,13 +1037,14 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, idle_deadline)));
                     }
 
                     // 然后处理数据流
                     chunk_result = body_stream.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
+                                idle_deadline = Instant::now() + Duration::from_secs(UPSTREAM_IDLE_TIMEOUT_SECS);
                                 // 解码事件
                                 if let Err(e) = decoder.feed(&chunk) {
                                     tracing::warn!("缓冲区溢出: {}", e);
@@ -930,12 +1068,13 @@ fn create_buffered_sse_stream(
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
                                 // 发生错误，完成处理并返回所有事件
+                                ctx.record_stream_error("api_error", format!("upstream stream read error: {}", e));
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, idle_deadline)));
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
@@ -944,9 +1083,22 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, idle_deadline)));
                             }
                         }
+                    }
+                    _ = &mut idle_sleep => {
+                        tracing::error!(
+                            "上游响应流超过 {} 秒未产生数据（缓冲模式）",
+                            UPSTREAM_IDLE_TIMEOUT_SECS
+                        );
+                        ctx.record_stream_error("api_error", "upstream stream idle timeout");
+                        let all_events = ctx.finish_and_get_all_events();
+                        let bytes: Vec<Result<Bytes, Infallible>> = all_events
+                            .into_iter()
+                            .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                            .collect();
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, idle_deadline)));
                     }
                 }
             }
