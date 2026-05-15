@@ -4,6 +4,11 @@ on:
   push:
     tags:
       - 'v*'
+  create:
+
+concurrency:
+  group: docker-publish-${{ github.event.ref || github.ref_name }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -14,6 +19,7 @@ env:
 
 jobs:
   build:
+    if: github.event_name == 'push' || (github.event_name == 'create' && github.event.ref_type == 'tag' && startsWith(github.event.ref, 'v'))
     runs-on: ${{ matrix.runner }}
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -38,7 +44,11 @@ jobs:
         id: version
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "create" ]; then
+            VERSION="${{ github.event.ref }}"
+          else
+            VERSION="${GITHUB_REF_NAME}"
+          fi
           VERSION_WITHOUT_V="${VERSION#v}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "version_without_v=${VERSION_WITHOUT_V}" >> "$GITHUB_OUTPUT"
