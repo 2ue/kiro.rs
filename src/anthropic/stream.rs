@@ -734,6 +734,11 @@ impl StreamContext {
         self.stream_error = Some((error_type.into(), message.into()));
     }
 
+    /// 当前流是否已经记录了上游或协议错误。
+    pub fn has_stream_error(&self) -> bool {
+        self.stream_error.is_some()
+    }
+
     fn create_error_event(error_type: String, message: String) -> SseEvent {
         SseEvent::new(
             "error",
@@ -1388,6 +1393,11 @@ impl BufferedStreamContext {
         message: impl Into<String>,
     ) {
         self.inner.record_stream_error(error_type, message);
+    }
+
+    /// 当前缓冲流是否已经记录了上游或协议错误。
+    pub fn has_stream_error(&self) -> bool {
+        self.inner.has_stream_error()
     }
 
     /// 完成流处理并返回所有事件

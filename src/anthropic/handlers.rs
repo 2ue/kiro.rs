@@ -29,6 +29,7 @@ use super::types::{
     OutputConfig, Thinking,
 };
 use super::websearch;
+use crate::kiro::provider::KiroStreamCompletion;
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
@@ -342,6 +343,7 @@ async fn handle_stream_request(
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+    let (response, completion) = response.into_parts();
 
     // 创建流处理上下文
     let mut ctx =
@@ -351,7 +353,7 @@ async fn handle_stream_request(
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events);
+    let stream = create_sse_stream(response, ctx, initial_events, completion);
 
     // 返回 SSE 响应
     Response::builder()
@@ -378,6 +380,7 @@ fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
+    completion: KiroStreamCompletion,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -395,6 +398,7 @@ fn create_sse_stream(
             ctx,
             EventStreamDecoder::new(),
             false,
+            completion,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
             Instant::now() + Duration::from_secs(UPSTREAM_IDLE_TIMEOUT_SECS),
         ),
@@ -403,6 +407,7 @@ fn create_sse_stream(
             mut ctx,
             mut decoder,
             finished,
+            completion,
             mut ping_interval,
             mut idle_deadline,
         )| async move {
@@ -446,10 +451,11 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, idle_deadline)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, completion, ping_interval, idle_deadline)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
+                            completion.report_soft_failure();
                             // 读取错误：关闭已有内容块后发送 SSE error，不再发送正常 message_stop。
                             ctx.record_stream_error("api_error", format!("upstream stream read error: {}", e));
                             let final_events = ctx.generate_final_events();
@@ -457,16 +463,21 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, idle_deadline)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, ping_interval, idle_deadline)))
                         }
                         None => {
                             // 流结束，发送最终事件
+                            if ctx.has_stream_error() {
+                                completion.report_soft_failure();
+                            } else {
+                                completion.report_success();
+                            }
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, idle_deadline)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, ping_interval, idle_deadline)))
                         }
                     }
                 }
@@ -475,19 +486,20 @@ fn create_sse_stream(
                         "上游响应流超过 {} 秒未产生数据，结束流并发送错误事件",
                         UPSTREAM_IDLE_TIMEOUT_SECS
                     );
+                    completion.report_soft_failure();
                     ctx.record_stream_error("api_error", "upstream stream idle timeout");
                     let final_events = ctx.generate_final_events();
                     let bytes: Vec<Result<Bytes, Infallible>> = final_events
                         .into_iter()
                         .map(|e| Ok(Bytes::from(e.to_sse_string())))
                         .collect();
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, idle_deadline)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, ping_interval, idle_deadline)))
                 }
                 // 发送 ping 保活
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, idle_deadline)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, completion, ping_interval, idle_deadline)))
                 }
             }
         },
@@ -968,6 +980,7 @@ async fn handle_stream_request_buffered(
         Ok(resp) => resp,
         Err(e) => return map_provider_error(e),
     };
+    let (response, completion) = response.into_parts();
 
     // 创建缓冲流处理上下文
     let ctx = BufferedStreamContext::new(
@@ -978,7 +991,7 @@ async fn handle_stream_request_buffered(
     );
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx);
+    let stream = create_buffered_sse_stream(response, ctx, completion);
 
     // 返回 SSE 响应
     Response::builder()
@@ -1000,6 +1013,7 @@ async fn handle_stream_request_buffered(
 fn create_buffered_sse_stream(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
+    completion: KiroStreamCompletion,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
@@ -1009,6 +1023,7 @@ fn create_buffered_sse_stream(
             ctx,
             EventStreamDecoder::new(),
             false,
+            completion,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
             Instant::now() + Duration::from_secs(UPSTREAM_IDLE_TIMEOUT_SECS),
         ),
@@ -1017,6 +1032,7 @@ fn create_buffered_sse_stream(
             mut ctx,
             mut decoder,
             finished,
+            completion,
             mut ping_interval,
             mut idle_deadline,
         )| async move {
@@ -1037,7 +1053,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, idle_deadline)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, completion, ping_interval, idle_deadline)));
                     }
 
                     // 然后处理数据流
@@ -1067,6 +1083,7 @@ fn create_buffered_sse_stream(
                             }
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
+                                completion.report_soft_failure();
                                 // 发生错误，完成处理并返回所有事件
                                 ctx.record_stream_error("api_error", format!("upstream stream read error: {}", e));
                                 let all_events = ctx.finish_and_get_all_events();
@@ -1074,16 +1091,21 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, idle_deadline)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, ping_interval, idle_deadline)));
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
+                                if ctx.has_stream_error() {
+                                    completion.report_soft_failure();
+                                } else {
+                                    completion.report_success();
+                                }
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, idle_deadline)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, ping_interval, idle_deadline)));
                             }
                         }
                     }
@@ -1092,13 +1114,14 @@ fn create_buffered_sse_stream(
                             "上游响应流超过 {} 秒未产生数据（缓冲模式）",
                             UPSTREAM_IDLE_TIMEOUT_SECS
                         );
+                        completion.report_soft_failure();
                         ctx.record_stream_error("api_error", "upstream stream idle timeout");
                         let all_events = ctx.finish_and_get_all_events();
                         let bytes: Vec<Result<Bytes, Infallible>> = all_events
                             .into_iter()
                             .map(|e| Ok(Bytes::from(e.to_sse_string())))
                             .collect();
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, idle_deadline)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, ping_interval, idle_deadline)));
                     }
                 }
             }

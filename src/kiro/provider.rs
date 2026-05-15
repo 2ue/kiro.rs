@@ -8,7 +8,10 @@
 use reqwest::Client;
 use reqwest::header::CONTENT_TYPE;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -46,9 +49,90 @@ pub struct KiroProvider {
     default_endpoint: String,
 }
 
+struct ApiCallResponse {
+    response: reqwest::Response,
+    credential_id: u64,
+    session_id: Option<String>,
+}
+
+/// 流式调用完成上报器。
+///
+/// Provider 只能确认上游返回了成功响应头；流式 body 是否完整消费需要
+/// SSE 处理链路在 EOF、读错误或 idle timeout 时回报。
+pub struct KiroStreamCompletion {
+    token_manager: Arc<MultiTokenManager>,
+    credential_id: u64,
+    session_id: Option<String>,
+    reported: AtomicBool,
+}
+
+impl KiroStreamCompletion {
+    fn new(
+        token_manager: Arc<MultiTokenManager>,
+        credential_id: u64,
+        session_id: Option<String>,
+    ) -> Self {
+        Self {
+            token_manager,
+            credential_id,
+            session_id,
+            reported: AtomicBool::new(false),
+        }
+    }
+
+    /// 上游流正常 EOF 后调用，计入成功并清理 sticky 软失败计数。
+    pub fn report_success(&self) {
+        if self.reported.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.token_manager
+            .report_success_for_session(self.credential_id, self.session_id.as_deref());
+    }
+
+    /// 上游流中断、idle timeout 或上游错误事件时调用。
+    ///
+    /// 这里不调用 `report_failure`，避免瞬态流读取问题直接禁用账号。
+    pub fn report_soft_failure(&self) {
+        if self.reported.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(session_id) = self.session_id.as_deref() {
+            self.token_manager
+                .record_session_soft_failure(session_id, self.credential_id);
+        }
+    }
+}
+
+impl Drop for KiroStreamCompletion {
+    fn drop(&mut self) {
+        if self.reported.load(Ordering::Acquire) {
+            return;
+        }
+        self.report_soft_failure();
+    }
+}
+
+pub struct KiroStreamResponse {
+    response: reqwest::Response,
+    completion: KiroStreamCompletion,
+}
+
+impl KiroStreamResponse {
+    pub fn into_parts(self) -> (reqwest::Response, KiroStreamCompletion) {
+        (self.response, self.completion)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::KiroProvider;
+    use std::sync::Arc;
+
+    use chrono::{Duration, Utc};
+
+    use super::{KiroProvider, KiroStreamCompletion};
+    use crate::kiro::model::credentials::KiroCredentials;
+    use crate::kiro::token_manager::MultiTokenManager;
+    use crate::model::config::Config;
 
     #[test]
     fn extracts_model_and_conversation_id_from_kiro_request() {
@@ -81,6 +165,40 @@ mod tests {
             KiroProvider::test_extract_conversation_id_from_request(body),
             None
         );
+    }
+
+    #[test]
+    fn stream_completion_reports_success_once() {
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("token".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
+        );
+        let completion = KiroStreamCompletion::new(manager.clone(), 1, Some("session".into()));
+
+        completion.report_success();
+        completion.report_success();
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.entries[0].success_count, 1);
+    }
+
+    #[test]
+    fn stream_completion_soft_failure_does_not_count_success() {
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("token".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
+        );
+        let completion = KiroStreamCompletion::new(manager.clone(), 1, Some("session".into()));
+
+        completion.report_soft_failure();
+        completion.report_success();
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.entries[0].success_count, 0);
     }
 }
 
@@ -148,12 +266,23 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
     pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, false).await
+        let result = self.call_api_with_retry(request_body, false).await?;
+        self.token_manager
+            .report_success_for_session(result.credential_id, result.session_id.as_deref());
+        Ok(result.response)
     }
 
     /// 发送流式 API 请求
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, true).await
+    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<KiroStreamResponse> {
+        let result = self.call_api_with_retry(request_body, true).await?;
+        Ok(KiroStreamResponse {
+            response: result.response,
+            completion: KiroStreamCompletion::new(
+                self.token_manager.clone(),
+                result.credential_id,
+                result.session_id,
+            ),
+        })
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -321,7 +450,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<ApiCallResponse> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -463,9 +592,11 @@ impl KiroProvider {
 
                     return Err(err);
                 }
-                self.token_manager
-                    .report_success_for_session(ctx.id, conversation_id.as_deref());
-                return Ok(response);
+                return Ok(ApiCallResponse {
+                    response,
+                    credential_id: ctx.id,
+                    session_id: conversation_id.clone(),
+                });
             }
 
             // 失败响应：读取 body 用于日志/错误信息

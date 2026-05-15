@@ -17,6 +17,16 @@
 
 本轮仍不把会话绑定持久化到文件。原因是当前项目的账号状态、统计和调度都以进程内 `MultiTokenManager` 为核心，服务重启后重新分配会话是可接受边界；如果后续需要跨重启粘性，再单独设计小型持久化索引。
 
+## 2026-05-16 补充落地记录
+
+针对上一轮复查出的真实缺陷，补充落地：
+
+1. 流式请求不再在收到 `2xx eventstream` 响应头时立即上报成功。
+2. `call_api_stream` 返回带完成上报器的响应包装，普通流式和 `/cc/v1/messages` 缓冲流式都在上游 body 正常 EOF 后才调用 `report_success_for_session`。
+3. 上游流读取错误、idle timeout、Kiro error/exception/invalidState 事件，以及客户端中途断开导致 stream 被 drop，都会按 sticky soft failure 记录，不直接禁用账号。
+4. 非流式请求仍在 provider 拿到成功响应后上报成功，因为非流式 body 会在 handler 中一次性读取和解析；后续如需更严格，可把非流式也改为解码成功后再上报。
+5. `admin-ui/pnpm-workspace.yaml` 增加单包 `packages` 配置，使 pnpm v9/v10 能正常识别 workspace 并执行类型检查/构建。
+
 ## 当前核心链路
 
 当前项目的核心定位是 Anthropic API 兼容代理，而不是通用 Kiro SDK。
