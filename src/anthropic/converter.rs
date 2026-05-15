@@ -204,6 +204,13 @@ fn extract_session_id(user_id: &str) -> Option<String> {
     None
 }
 
+pub(crate) fn extract_stable_conversation_id(req: &MessagesRequest) -> Option<String> {
+    req.metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_ref())
+        .and_then(|user_id| extract_session_id(user_id))
+}
+
 /// 简单验证 UUID 格式（36 字符，包含 4 个连字符）
 fn is_valid_uuid(s: &str) -> bool {
     s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
@@ -273,12 +280,8 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     // 3. 生成会话 ID 和代理 ID
     // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
-    let conversation_id = req
-        .metadata
-        .as_ref()
-        .and_then(|m| m.user_id.as_ref())
-        .and_then(|user_id| extract_session_id(user_id))
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let conversation_id =
+        extract_stable_conversation_id(req).unwrap_or_else(|| Uuid::new_v4().to_string());
     let agent_continuation_id = Uuid::new_v4().to_string();
 
     // 4. 确定触发类型

@@ -111,10 +111,7 @@ async fn main() {
 
     // 校验所有凭据声明的端点都已注册
     for cred in &credentials_list {
-        let name = cred
-            .endpoint
-            .as_deref()
-            .unwrap_or(&config.default_endpoint);
+        let name = cred.endpoint.as_deref().unwrap_or(&config.default_endpoint);
         if !endpoints.contains_key(name) {
             tracing::error!(
                 "凭据 id={:?} 指定了未知端点 \"{}\"（已注册: {:?}）",
@@ -127,6 +124,18 @@ async fn main() {
     }
 
     let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
+    let usage_record_path = if config.usage_record_persist {
+        std::path::Path::new(&credentials_path)
+            .parent()
+            .map(|dir| dir.join("kiro_usage_records.jsonl"))
+    } else {
+        None
+    };
+    let usage_recorder = Arc::new(anthropic::usage::UsageRecorder::new(
+        config.usage_record_limit,
+        usage_record_path,
+    ));
+    let prompt_cache = Arc::new(anthropic::prompt_cache::PromptCacheTracker::default());
 
     // 创建 MultiTokenManager 和 KiroProvider
     let token_manager = MultiTokenManager::new(
@@ -162,6 +171,10 @@ async fn main() {
         &api_key,
         Some(kiro_provider),
         config.extract_thinking,
+        usage_recorder.clone(),
+        prompt_cache.clone(),
+        config.prompt_cache_simulation_mode,
+        config.high_cache_threshold,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -177,8 +190,13 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
-            let admin_service =
-                admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
+            let admin_service = admin::AdminService::new(
+                token_manager.clone(),
+                endpoint_names.clone(),
+                usage_recorder.clone(),
+                prompt_cache.clone(),
+                config.high_cache_threshold,
+            );
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 
@@ -206,6 +224,8 @@ async fn main() {
     if admin_key_valid {
         tracing::info!("Admin API:");
         tracing::info!("  GET  /api/admin/credentials");
+        tracing::info!("  GET  /api/admin/usage-records");
+        tracing::info!("  GET  /api/admin/usage-summary");
         tracing::info!("  POST /api/admin/credentials/:index/disabled");
         tracing::info!("  POST /api/admin/credentials/:index/priority");
         tracing::info!("  POST /api/admin/credentials/:index/reset");

@@ -22,6 +22,7 @@ interface CredentialInput {
   refreshToken?: string
   clientId?: string
   clientSecret?: string
+  email?: string
   region?: string
   authRegion?: string
   apiRegion?: string
@@ -229,6 +230,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             const addedCred = await addCredential({
               authMethod: 'api_key',
               kiroApiKey: cred.kiroApiKey?.trim(),
+              email: cred.email?.trim() || undefined,
               priority: cred.priority || 0,
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
@@ -253,7 +255,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                 ...newResults[i],
                 status: 'verified',
                 usage: `${balance.currentUsage}/${balance.usageLimit}`,
-                email: addedCred.email || undefined,
+                email: addedCred.email || cred.email || undefined,
                 credentialId: addedCred.credentialId
               }
               return newResults
@@ -276,6 +278,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           const addedCred = await addCredential({
             refreshToken: token,
             authMethod,
+            email: cred.email?.trim() || undefined,
             authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
             apiRegion: cred.apiRegion?.trim() || undefined,
             clientId,
@@ -303,7 +306,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               ...newResults[i],
               status: 'verified',
               usage: `${balance.currentUsage}/${balance.usageLimit}`,
-              email: addedCred.email || undefined,
+              email: addedCred.email || cred.email || undefined,
               credentialId: addedCred.credentialId
             }
             return newResults

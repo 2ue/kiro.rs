@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, BarChart3 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -12,6 +12,7 @@ import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
+import { UsageRecordsPanel } from '@/components/usage-records-panel'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
@@ -38,6 +39,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
+  const [activeTab, setActiveTab] = useState<'credentials' | 'usage'>('credentials')
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
@@ -554,6 +556,22 @@ export function Dashboard({ onLogout }: DashboardProps) {
           </div>
           <div className="flex items-center gap-2">
             <Button
+              variant={activeTab === 'credentials' ? 'secondary' : 'ghost'}
+              size="sm"
+              onClick={() => setActiveTab('credentials')}
+            >
+              <Server className="h-4 w-4" />
+              凭据
+            </Button>
+            <Button
+              variant={activeTab === 'usage' ? 'secondary' : 'ghost'}
+              size="sm"
+              onClick={() => setActiveTab('usage')}
+            >
+              <BarChart3 className="h-4 w-4" />
+              Usage
+            </Button>
+            <Button
               variant="outline"
               size="sm"
               onClick={handleToggleLoadBalancing}
@@ -577,6 +595,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
       {/* 主内容 */}
       <main className="container mx-auto px-4 md:px-8 py-6">
+        {activeTab === 'usage' ? (
+          <UsageRecordsPanel />
+        ) : (
+          <>
         {/* 统计卡片 */}
         <div className="grid gap-4 md:grid-cols-3 mb-6">
           <Card>
@@ -753,6 +775,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </>
           )}
         </div>
+          </>
+        )}
       </main>
 
       {/* 余额对话框 */}

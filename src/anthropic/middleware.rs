@@ -12,8 +12,9 @@ use axum::{
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
+use crate::model::config::PromptCacheSimulationMode;
 
-use super::types::ErrorResponse;
+use super::{prompt_cache::PromptCacheTracker, types::ErrorResponse, usage::UsageRecorder};
 
 /// 应用共享状态
 #[derive(Clone)]
@@ -25,15 +26,34 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// 请求级 usage 记录器
+    pub usage_recorder: Arc<UsageRecorder>,
+    /// 本地 prompt-cache tracker
+    pub prompt_cache: Arc<PromptCacheTracker>,
+    /// 本地 prompt-cache usage 模拟模式
+    pub prompt_cache_simulation_mode: PromptCacheSimulationMode,
+    /// Admin 高缓存阈值
+    pub high_cache_threshold: i32,
 }
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(api_key: impl Into<String>, extract_thinking: bool) -> Self {
+    pub fn new(
+        api_key: impl Into<String>,
+        extract_thinking: bool,
+        usage_recorder: Arc<UsageRecorder>,
+        prompt_cache: Arc<PromptCacheTracker>,
+        prompt_cache_simulation_mode: PromptCacheSimulationMode,
+        high_cache_threshold: i32,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
+            usage_recorder,
+            prompt_cache,
+            prompt_cache_simulation_mode,
+            high_cache_threshold,
         }
     }
 

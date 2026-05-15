@@ -557,6 +557,10 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+    /// 本次请求是否实际命中了已有会话绑定。
+    pub sticky_bound: bool,
+    /// 本次请求是否从已有会话绑定临时 fallback 到其他凭据。
+    pub fallback_from_sticky: bool,
 }
 
 impl MultiTokenManager {
@@ -929,13 +933,15 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials) = {
+            let (id, credentials, sticky_bound, fallback_from_sticky) = {
+                let existing_bound_id = session_id.and_then(|sid| self.bound_credential_id(sid));
                 let bound_hit =
                     session_id.and_then(|sid| self.get_bound_credential(sid, model, excluded_ids));
 
                 if let Some(hit) = bound_hit {
-                    hit
+                    (hit.0, hit.1, true, false)
                 } else {
+                    let fallback_from_sticky = existing_bound_id.is_some();
                     let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
                     // balanced 模式：新会话重新均衡选择；已有会话已在 bound_hit 返回
@@ -956,7 +962,7 @@ impl MultiTokenManager {
                     };
 
                     if let Some(hit) = current_hit {
-                        hit
+                        (hit.0, hit.1, false, fallback_from_sticky)
                     } else {
                         // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
                         let mut best = self.select_next_credential_excluding(model, excluded_ids);
@@ -987,7 +993,7 @@ impl MultiTokenManager {
                             // 更新 current_id
                             let mut current_id = self.current_id.lock();
                             *current_id = new_id;
-                            (new_id, new_creds)
+                            (new_id, new_creds, false, fallback_from_sticky)
                         } else {
                             let entries = self.entries.lock();
                             // 注意：必须在 bail! 之前计算 available_count，
@@ -1014,7 +1020,11 @@ impl MultiTokenManager {
                             self.bind_session_to_credential(sid, ctx.id);
                         }
                     }
-                    return Ok(ctx);
+                    return Ok(CallContext {
+                        sticky_bound,
+                        fallback_from_sticky,
+                        ..ctx
+                    });
                 }
                 Err(e) => {
                     // refreshToken 永久失效 → 立即禁用，不累计重试
@@ -1081,6 +1091,8 @@ impl MultiTokenManager {
                 id,
                 credentials: credentials.clone(),
                 token,
+                sticky_bound: false,
+                fallback_from_sticky: false,
             });
         }
 
@@ -1150,6 +1162,8 @@ impl MultiTokenManager {
             id,
             credentials: creds,
             token,
+            sticky_bound: false,
+            fallback_from_sticky: false,
         })
     }
 

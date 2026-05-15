@@ -48,7 +48,13 @@ pub struct MetadataTokenUsage {
 
 impl MetadataTokenUsage {
     pub fn input_tokens(&self) -> i32 {
-        self.uncached_input_tokens + self.cache_read_input_tokens
+        self.uncached_input_tokens
+    }
+
+    pub fn total_input_tokens(&self) -> i32 {
+        self.uncached_input_tokens
+            .saturating_add(self.cache_read_input_tokens)
+            .saturating_add(self.cache_write_input_tokens)
     }
 }
 
@@ -128,7 +134,8 @@ mod tests {
         .unwrap();
 
         let usage = event.token_usage.unwrap();
-        assert_eq!(usage.input_tokens(), 150);
+        assert_eq!(usage.input_tokens(), 120);
+        assert_eq!(usage.total_input_tokens(), 157);
         assert_eq!(usage.output_tokens, 11);
         assert_eq!(usage.cache_write_input_tokens, 7);
     }
@@ -149,7 +156,8 @@ mod tests {
         .unwrap();
 
         let usage = event.token_usage.unwrap();
-        assert_eq!(usage.input_tokens(), 181200);
+        assert_eq!(usage.input_tokens(), 1200);
+        assert_eq!(usage.total_input_tokens(), 205200);
         assert_eq!(usage.cache_read_input_tokens, 180000);
         assert_eq!(usage.cache_write_input_tokens, 24000);
         assert_eq!(usage.output_tokens, 900);

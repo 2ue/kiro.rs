@@ -67,6 +67,7 @@ export function CredentialCard({
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
+  const displayName = credential.email || credential.maskedApiKey || `凭据 #${credential.id}`
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -152,8 +153,9 @@ export function CredentialCard({
                 checked={selected}
                 onCheckedChange={onToggleSelect}
               />
-              <CardTitle className="text-lg flex items-center gap-2">
-                {credential.email || `凭据 #${credential.id}`}
+              <CardTitle className="flex min-w-0 flex-wrap items-center gap-2 text-lg">
+                <span className="max-w-[280px] truncate">{displayName}</span>
+                <Badge variant="outline">#{credential.id}</Badge>
                 {credential.isCurrent && (
                   <Badge variant="success">当前</Badge>
                 )}
@@ -259,6 +261,12 @@ export function CredentialCard({
               <span className="text-muted-foreground">最后调用：</span>
               <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
             </div>
+            {credential.email && (
+              <div className="col-span-2">
+                <span className="text-muted-foreground">邮箱：</span>
+                <span className="font-medium">{credential.email}</span>
+              </div>
+            )}
             {credential.maskedApiKey && (
               <div className="col-span-2">
                 <span className="text-muted-foreground">API Key：</span>

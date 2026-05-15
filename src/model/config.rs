@@ -17,6 +17,24 @@ impl Default for TlsBackend {
     }
 }
 
+/// 本地 prompt-cache usage 模拟模式。
+///
+/// 默认关闭；真实 Kiro metadata usage 始终优先。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PromptCacheSimulationMode {
+    Disabled,
+    HeuristicCacheControl,
+    LocalPromptCache,
+    ForceHighCache,
+}
+
+impl Default for PromptCacheSimulationMode {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -98,6 +116,22 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
+    /// 本地 prompt-cache usage 模拟模式（默认 disabled）。
+    #[serde(default = "default_prompt_cache_simulation_mode")]
+    pub prompt_cache_simulation_mode: PromptCacheSimulationMode,
+
+    /// 请求级 usage record 内存保留上限。
+    #[serde(default = "default_usage_record_limit")]
+    pub usage_record_limit: usize,
+
+    /// 是否将 usage record 追加写入 JSONL 文件。
+    #[serde(default = "default_usage_record_persist")]
+    pub usage_record_persist: bool,
+
+    /// Admin 高缓存请求阈值。
+    #[serde(default = "default_high_cache_threshold")]
+    pub high_cache_threshold: i32,
+
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -155,6 +189,22 @@ fn default_extract_thinking() -> bool {
     true
 }
 
+fn default_prompt_cache_simulation_mode() -> PromptCacheSimulationMode {
+    PromptCacheSimulationMode::Disabled
+}
+
+fn default_usage_record_limit() -> usize {
+    5000
+}
+
+fn default_usage_record_persist() -> bool {
+    true
+}
+
+fn default_high_cache_threshold() -> i32 {
+    10_000
+}
+
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
@@ -182,6 +232,10 @@ impl Default for Config {
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
+            prompt_cache_simulation_mode: default_prompt_cache_simulation_mode(),
+            usage_record_limit: default_usage_record_limit(),
+            usage_record_persist: default_usage_record_persist(),
+            high_cache_threshold: default_high_cache_threshold(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             config_path: None,
@@ -236,7 +290,8 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content).with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        fs::write(path, content)
+            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
     }
 }

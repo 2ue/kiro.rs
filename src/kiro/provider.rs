@@ -49,10 +49,20 @@ pub struct KiroProvider {
     default_endpoint: String,
 }
 
+pub struct KiroApiResponse {
+    pub response: reqwest::Response,
+    pub credential_id: u64,
+    pub session_id: Option<String>,
+    pub sticky_bound: bool,
+    pub fallback_from_sticky: bool,
+}
+
 struct ApiCallResponse {
     response: reqwest::Response,
     credential_id: u64,
     session_id: Option<String>,
+    sticky_bound: bool,
+    fallback_from_sticky: bool,
 }
 
 /// 流式调用完成上报器。
@@ -63,6 +73,8 @@ pub struct KiroStreamCompletion {
     token_manager: Arc<MultiTokenManager>,
     credential_id: u64,
     session_id: Option<String>,
+    sticky_bound: bool,
+    fallback_from_sticky: bool,
     reported: AtomicBool,
 }
 
@@ -71,11 +83,15 @@ impl KiroStreamCompletion {
         token_manager: Arc<MultiTokenManager>,
         credential_id: u64,
         session_id: Option<String>,
+        sticky_bound: bool,
+        fallback_from_sticky: bool,
     ) -> Self {
         Self {
             token_manager,
             credential_id,
             session_id,
+            sticky_bound,
+            fallback_from_sticky,
             reported: AtomicBool::new(false),
         }
     }
@@ -100,6 +116,18 @@ impl KiroStreamCompletion {
             self.token_manager
                 .record_session_soft_failure(session_id, self.credential_id);
         }
+    }
+
+    pub fn credential_id(&self) -> u64 {
+        self.credential_id
+    }
+
+    pub fn sticky_bound(&self) -> bool {
+        self.sticky_bound
+    }
+
+    pub fn fallback_from_sticky(&self) -> bool {
+        self.fallback_from_sticky
     }
 }
 
@@ -175,7 +203,8 @@ mod tests {
         let manager = Arc::new(
             MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
         );
-        let completion = KiroStreamCompletion::new(manager.clone(), 1, Some("session".into()));
+        let completion =
+            KiroStreamCompletion::new(manager.clone(), 1, Some("session".into()), false, false);
 
         completion.report_success();
         completion.report_success();
@@ -192,7 +221,8 @@ mod tests {
         let manager = Arc::new(
             MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
         );
-        let completion = KiroStreamCompletion::new(manager.clone(), 1, Some("session".into()));
+        let completion =
+            KiroStreamCompletion::new(manager.clone(), 1, Some("session".into()), false, false);
 
         completion.report_soft_failure();
         completion.report_success();
@@ -250,6 +280,20 @@ impl KiroProvider {
         Ok(client)
     }
 
+    /// 获取凭据的脱敏展示名称，用于请求级 usage 记录。
+    pub fn credential_label(&self, id: u64) -> Option<String> {
+        self.token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| {
+                entry.email.or(entry.masked_api_key).or(entry
+                    .endpoint
+                    .map(|endpoint| format!("#{} {}", id, endpoint)))
+            })
+    }
+
     /// 根据凭据选择 endpoint 实现
     fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
         let name = credentials
@@ -265,11 +309,32 @@ impl KiroProvider {
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
+    #[allow(dead_code)]
     pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
         let result = self.call_api_with_retry(request_body, false).await?;
-        self.token_manager
-            .report_success_for_session(result.credential_id, result.session_id.as_deref());
+        self.report_success_for_context(result.credential_id, result.session_id.as_deref());
         Ok(result.response)
+    }
+
+    /// 发送非流式 API 请求，并返回实际使用的凭据与 sticky 会话信息。
+    pub async fn call_api_with_context(
+        &self,
+        request_body: &str,
+    ) -> anyhow::Result<KiroApiResponse> {
+        let result = self.call_api_with_retry(request_body, false).await?;
+        Ok(KiroApiResponse {
+            response: result.response,
+            credential_id: result.credential_id,
+            session_id: result.session_id,
+            sticky_bound: result.sticky_bound,
+            fallback_from_sticky: result.fallback_from_sticky,
+        })
+    }
+
+    /// 在 handler 完成非流式 body 读取和事件解析后上报成功。
+    pub fn report_success_for_context(&self, credential_id: u64, session_id: Option<&str>) {
+        self.token_manager
+            .report_success_for_session(credential_id, session_id);
     }
 
     /// 发送流式 API 请求
@@ -281,6 +346,8 @@ impl KiroProvider {
                 self.token_manager.clone(),
                 result.credential_id,
                 result.session_id,
+                result.sticky_bound,
+                result.fallback_from_sticky,
             ),
         })
     }
@@ -596,6 +663,8 @@ impl KiroProvider {
                     response,
                     credential_id: ctx.id,
                     session_id: conversation_id.clone(),
+                    sticky_bound: ctx.sticky_bound,
+                    fallback_from_sticky: ctx.fallback_from_sticky,
                 });
             }
 

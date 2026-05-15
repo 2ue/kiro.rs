@@ -151,6 +151,7 @@ where
         {
             Ok(Some(vec![SystemMessage {
                 text: value.to_string(),
+                cache_control: None,
             }]))
         }
 
@@ -199,6 +200,8 @@ pub struct Message {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SystemMessage {
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<serde_json::Value>,
 }
 
 /// 工具定义

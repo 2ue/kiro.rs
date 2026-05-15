@@ -468,11 +468,20 @@ impl SseStateManager {
     }
 
     /// 生成最终事件序列
+    #[allow(dead_code)]
     pub fn generate_final_events(
         &mut self,
         input_tokens: i32,
         output_tokens: i32,
     ) -> Vec<SseEvent> {
+        self.generate_final_events_with_usage(json!({
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens
+        }))
+    }
+
+    /// 生成带完整 usage 对象的最终事件序列
+    pub fn generate_final_events_with_usage(&mut self, usage: serde_json::Value) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
         // 关闭所有未关闭的块
@@ -489,10 +498,7 @@ impl SseStateManager {
                         "stop_reason": self.get_stop_reason(),
                         "stop_sequence": null
                     },
-                    "usage": {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens
-                    }
+                    "usage": usage
                 }),
             ));
         }
@@ -553,15 +559,48 @@ pub struct StreamContext {
     native_reasoning_content: String,
     /// 上游流内错误，最终以 SSE error 事件暴露
     stream_error: Option<(String, String)>,
+    /// 无 metadata 时使用的本地 prompt-cache usage 模拟结果
+    pub simulated_usage: Option<super::cache::CacheSimulation>,
+    /// 最近一次最终 usage，用于请求级记录。
+    final_usage: Option<super::cache::CacheUsage>,
 }
 
 impl StreamContext {
     /// 创建启用thinking的StreamContext
+    #[allow(dead_code)]
     pub fn new_with_thinking(
         model: impl Into<String>,
         input_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
+    ) -> Self {
+        Self::new_with_cache(model, input_tokens, thinking_enabled, tool_name_map, 0)
+    }
+
+    /// 创建带 prompt-cache usage 模拟信息的 StreamContext。
+    pub fn new_with_cache(
+        model: impl Into<String>,
+        input_tokens: i32,
+        thinking_enabled: bool,
+        tool_name_map: HashMap<String, String>,
+        cached_msg_tokens: i32,
+    ) -> Self {
+        let simulation = super::cache::CacheSimulation::heuristic(cached_msg_tokens, input_tokens);
+        Self::new_with_simulation(
+            model,
+            input_tokens,
+            thinking_enabled,
+            tool_name_map,
+            simulation,
+        )
+    }
+
+    pub fn new_with_simulation(
+        model: impl Into<String>,
+        input_tokens: i32,
+        thinking_enabled: bool,
+        tool_name_map: HashMap<String, String>,
+        simulated_usage: Option<super::cache::CacheSimulation>,
     ) -> Self {
         Self {
             state_manager: SseStateManager::new(),
@@ -583,11 +622,20 @@ impl StreamContext {
             native_reasoning_seen: false,
             native_reasoning_content: String::new(),
             stream_error: None,
+            simulated_usage,
+            final_usage: None,
         }
     }
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        let usage = super::cache::build_usage_with_simulation(
+            None,
+            self.input_tokens,
+            1,
+            self.simulated_usage,
+        )
+        .to_json();
         json!({
             "type": "message_start",
             "message": {
@@ -598,10 +646,7 @@ impl StreamContext {
                 "model": self.model,
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": {
-                    "input_tokens": self.input_tokens,
-                    "output_tokens": 1
-                }
+                "usage": usage
             }
         })
     }
@@ -737,6 +782,22 @@ impl StreamContext {
     /// 当前流是否已经记录了上游或协议错误。
     pub fn has_stream_error(&self) -> bool {
         self.stream_error.is_some()
+    }
+
+    pub fn final_usage(&self) -> Option<super::cache::CacheUsage> {
+        self.final_usage
+    }
+
+    pub fn metadata_usage_seen(&self) -> bool {
+        self.metadata_usage.is_some()
+    }
+
+    pub fn context_input_tokens_seen(&self) -> bool {
+        self.context_input_tokens.is_some()
+    }
+
+    pub fn stream_error_detail(&self) -> Option<(String, String)> {
+        self.stream_error.clone()
     }
 
     fn create_error_event(error_type: String, message: String) -> SseEvent {
@@ -1309,7 +1370,7 @@ impl StreamContext {
         let final_input_tokens = self
             .metadata_usage
             .as_ref()
-            .map(|usage| usage.input_tokens())
+            .map(|usage| usage.total_input_tokens())
             .or(self.context_input_tokens)
             .unwrap_or(self.input_tokens);
         let final_output_tokens = self
@@ -1317,11 +1378,18 @@ impl StreamContext {
             .as_ref()
             .map(|usage| usage.output_tokens)
             .unwrap_or(self.output_tokens);
+        let final_usage = super::cache::build_usage_with_simulation(
+            self.metadata_usage.as_ref(),
+            final_input_tokens,
+            final_output_tokens,
+            self.simulated_usage,
+        );
+        self.final_usage = Some(final_usage);
 
         // 生成最终事件
         events.extend(
             self.state_manager
-                .generate_final_events(final_input_tokens, final_output_tokens),
+                .generate_final_events_with_usage(final_usage.to_json()),
         );
         events
     }
@@ -1350,18 +1418,58 @@ pub struct BufferedStreamContext {
 
 impl BufferedStreamContext {
     /// 创建缓冲流上下文
+    #[allow(dead_code)]
     pub fn new(
         model: impl Into<String>,
         estimated_input_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
-        let inner = StreamContext::new_with_thinking(
+        Self::new_with_cache(
             model,
             estimated_input_tokens,
             thinking_enabled,
             tool_name_map,
+            0,
+        )
+    }
+
+    /// 创建带 prompt-cache usage 模拟信息的缓冲流上下文。
+    pub fn new_with_cache(
+        model: impl Into<String>,
+        estimated_input_tokens: i32,
+        thinking_enabled: bool,
+        tool_name_map: HashMap<String, String>,
+        cached_msg_tokens: i32,
+    ) -> Self {
+        let inner = StreamContext::new_with_cache(
+            model,
+            estimated_input_tokens,
+            thinking_enabled,
+            tool_name_map,
+            cached_msg_tokens,
         );
+        Self::from_inner(inner, estimated_input_tokens)
+    }
+
+    pub fn new_with_simulation(
+        model: impl Into<String>,
+        estimated_input_tokens: i32,
+        thinking_enabled: bool,
+        tool_name_map: HashMap<String, String>,
+        simulated_usage: Option<super::cache::CacheSimulation>,
+    ) -> Self {
+        let inner = StreamContext::new_with_simulation(
+            model,
+            estimated_input_tokens,
+            thinking_enabled,
+            tool_name_map,
+            simulated_usage,
+        );
+        Self::from_inner(inner, estimated_input_tokens)
+    }
+
+    fn from_inner(inner: StreamContext, estimated_input_tokens: i32) -> Self {
         Self {
             inner,
             event_buffer: Vec::new(),
@@ -1400,6 +1508,22 @@ impl BufferedStreamContext {
         self.inner.has_stream_error()
     }
 
+    pub fn final_usage(&self) -> Option<super::cache::CacheUsage> {
+        self.inner.final_usage()
+    }
+
+    pub fn metadata_usage_seen(&self) -> bool {
+        self.inner.metadata_usage_seen()
+    }
+
+    pub fn context_input_tokens_seen(&self) -> bool {
+        self.inner.context_input_tokens_seen()
+    }
+
+    pub fn stream_error_detail(&self) -> Option<(String, String)> {
+        self.inner.stream_error_detail()
+    }
+
     /// 完成流处理并返回所有事件
     ///
     /// 此方法会：
@@ -1423,24 +1547,29 @@ impl BufferedStreamContext {
             .inner
             .metadata_usage
             .as_ref()
-            .map(|usage| usage.input_tokens())
+            .map(|usage| usage.total_input_tokens())
             .or(self.inner.context_input_tokens)
             .unwrap_or(self.estimated_input_tokens);
+        let final_output_tokens = self
+            .inner
+            .metadata_usage
+            .as_ref()
+            .map(|usage| usage.output_tokens)
+            .unwrap_or(self.inner.output_tokens);
+        let final_usage = super::cache::build_usage_with_simulation(
+            self.inner.metadata_usage.as_ref(),
+            final_input_tokens,
+            final_output_tokens,
+            self.inner.simulated_usage,
+        );
+        self.inner.final_usage = Some(final_usage);
 
-        // 更正 message_start 事件中的 input_tokens
+        // 更正 message_start 事件中的 usage
         for event in &mut self.event_buffer {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {
                     if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
-                        if let Some(metadata_usage) = &self.inner.metadata_usage {
-                            usage["output_tokens"] =
-                                serde_json::json!(metadata_usage.output_tokens);
-                            usage["cache_read_input_tokens"] =
-                                serde_json::json!(metadata_usage.cache_read_input_tokens);
-                            usage["cache_creation_input_tokens"] =
-                                serde_json::json!(metadata_usage.cache_write_input_tokens);
-                        }
+                        *usage = final_usage.to_json();
                     }
                 }
             }
@@ -1614,7 +1743,7 @@ mod tests {
             .iter()
             .find(|e| e.event == "message_delta")
             .expect("message_delta should exist");
-        assert_eq!(message_delta.data["usage"]["input_tokens"], 107);
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 100);
         assert_eq!(message_delta.data["usage"]["output_tokens"], 9);
     }
 
@@ -1642,7 +1771,7 @@ mod tests {
             .iter()
             .find(|e| e.event == "message_delta")
             .expect("message_delta should exist");
-        assert_eq!(message_delta.data["usage"]["input_tokens"], 181200);
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 1200);
         assert_eq!(message_delta.data["usage"]["output_tokens"], 900);
     }
 
@@ -1667,7 +1796,7 @@ mod tests {
             .find(|e| e.event == "message_start")
             .expect("message_start should exist");
         let usage = &message_start.data["message"]["usage"];
-        assert_eq!(usage["input_tokens"], 181200);
+        assert_eq!(usage["input_tokens"], 1200);
         assert_eq!(usage["output_tokens"], 900);
         assert_eq!(usage["cache_read_input_tokens"], 180000);
         assert_eq!(usage["cache_creation_input_tokens"], 24000);

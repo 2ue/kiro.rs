@@ -69,6 +69,7 @@ export interface AddCredentialRequest {
   authMethod?: 'social' | 'idc' | 'api_key'
   clientId?: string
   clientSecret?: string
+  email?: string
   priority?: number
   authRegion?: string
   apiRegion?: string
@@ -86,4 +87,86 @@ export interface AddCredentialResponse {
   message: string
   credentialId: number
   email?: string
+}
+
+export type UsageRecordStatus =
+  | 'success'
+  | 'error'
+  | 'stream_error'
+  | 'upstream_timeout'
+  | 'client_dropped'
+
+export type UsageSource =
+  | 'upstream_metadata'
+  | 'local_prompt_cache'
+  | 'heuristic_cache_control'
+  | 'forced_high_cache'
+  | 'context_estimate'
+  | 'request_estimate'
+  | 'none'
+
+export interface UsageRecord {
+  id: string
+  createdAt: string
+  endpoint: string
+  stream: boolean
+  model: string
+  conversationId?: string
+  credentialId?: number
+  credentialLabel?: string
+  status: UsageRecordStatus
+  usageSource: UsageSource
+  totalInputTokens: number
+  compatInputTokens: number
+  billableInputTokens: number
+  outputTokens: number
+  cacheReadInputTokens: number
+  cacheCreationInputTokens: number
+  cacheCreation5mInputTokens: number
+  cacheCreation1hInputTokens: number
+  durationMs: number
+  simulated: boolean
+  stickyBound: boolean
+  fallbackFromSticky: boolean
+  errorType?: string
+  errorMessage?: string
+}
+
+export interface UsageRecordsResult {
+  total: number
+  records: UsageRecord[]
+}
+
+export interface UsageAggregate {
+  key: string
+  label?: string
+  requests: number
+  cacheReadInputTokens: number
+  cacheCreationInputTokens: number
+}
+
+export interface UsageSummary {
+  totalRequests: number
+  successRequests: number
+  errorRequests: number
+  highCacheRequests: number
+  totalInputTokens: number
+  totalOutputTokens: number
+  totalCacheReadInputTokens: number
+  totalCacheCreationInputTokens: number
+  simulatedRequests: number
+  upstreamMetadataRequests: number
+  topCredentials: UsageAggregate[]
+  topConversations: UsageAggregate[]
+}
+
+export interface UsageRecordsQuery {
+  limit?: number
+  conversationId?: string
+  credentialId?: number
+  model?: string
+  status?: UsageRecordStatus
+  source?: UsageSource
+  stream?: boolean
+  minCacheRead?: number
 }

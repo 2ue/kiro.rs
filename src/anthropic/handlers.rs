@@ -1,10 +1,18 @@
 //! Anthropic API Handler 函数
 
-use std::convert::Infallible;
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::model::config::PromptCacheSimulationMode;
 use crate::token;
 use anyhow::Error;
 use axum::{
@@ -15,21 +23,390 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
+use chrono::Utc;
 use futures::{Stream, StreamExt, stream};
 use serde_json::json;
 use std::time::Duration;
 use tokio::time::{Instant, interval, sleep_until};
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request};
+use super::converter::{ConversionError, convert_request, extract_stable_conversation_id};
 use super::middleware::AppState;
+use super::prompt_cache::{PromptCacheProfile, PromptCacheScope};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
     OutputConfig, Thinking,
 };
+use super::usage::{UsageRecord, UsageRecordStatus, UsageSource};
 use super::websearch;
 use crate::kiro::provider::KiroStreamCompletion;
+
+#[derive(Clone)]
+struct RequestUsageContext {
+    recorder: Arc<super::usage::UsageRecorder>,
+    prompt_cache: Arc<super::prompt_cache::PromptCacheTracker>,
+    request_id: String,
+    endpoint: &'static str,
+    stream: bool,
+    model: String,
+    conversation_id: Option<String>,
+    input_tokens: i32,
+    prompt_cache_profile: Option<PromptCacheProfile>,
+    simulation_mode: PromptCacheSimulationMode,
+    simulated_usage: Option<super::cache::CacheSimulation>,
+    simulated_source: Option<UsageSource>,
+    started_at: Instant,
+}
+
+#[derive(Clone)]
+struct CredentialUsageContext {
+    request: RequestUsageContext,
+    credential_id: Option<u64>,
+    credential_label: Option<String>,
+    sticky_bound: bool,
+    fallback_from_sticky: bool,
+}
+
+impl RequestUsageContext {
+    fn attach_credential(
+        self,
+        credential_id: Option<u64>,
+        credential_label: Option<String>,
+        sticky_bound: bool,
+        fallback_from_sticky: bool,
+    ) -> CredentialUsageContext {
+        CredentialUsageContext {
+            request: self,
+            credential_id,
+            credential_label,
+            sticky_bound,
+            fallback_from_sticky,
+        }
+    }
+}
+
+impl CredentialUsageContext {
+    fn scope(&self) -> Option<PromptCacheScope> {
+        Some(PromptCacheScope {
+            credential_id: self.credential_id?,
+            conversation_id: self.request.conversation_id.clone()?,
+            model: self.request.model.clone(),
+        })
+    }
+
+    fn usage_source(
+        &self,
+        usage: &super::cache::CacheUsage,
+        has_metadata: bool,
+        context_estimated: bool,
+    ) -> UsageSource {
+        if has_metadata {
+            UsageSource::UpstreamMetadata
+        } else if self.request.simulated_source.is_some()
+            && (usage.cache_read_input_tokens > 0 || usage.cache_creation_input_tokens > 0)
+        {
+            self.request.simulated_source.unwrap()
+        } else if context_estimated {
+            UsageSource::ContextEstimate
+        } else {
+            UsageSource::RequestEstimate
+        }
+    }
+
+    fn record_success_from_stream(&self, ctx: &StreamContext) {
+        let Some(usage) = ctx.final_usage() else {
+            return;
+        };
+        let has_metadata = ctx.metadata_usage_seen();
+        let context_estimated = !has_metadata && ctx.context_input_tokens_seen();
+        let usage_source = self.usage_source(&usage, has_metadata, context_estimated);
+        self.record_success(usage, usage_source, context_estimated);
+    }
+
+    fn record_success_from_buffered_stream(&self, ctx: &BufferedStreamContext) {
+        let Some(usage) = ctx.final_usage() else {
+            return;
+        };
+        let has_metadata = ctx.metadata_usage_seen();
+        let context_estimated = !has_metadata && ctx.context_input_tokens_seen();
+        let usage_source = self.usage_source(&usage, has_metadata, context_estimated);
+        self.record_success(usage, usage_source, context_estimated);
+    }
+
+    fn record_stream_failure_from_context(
+        &self,
+        status: UsageRecordStatus,
+        usage: Option<super::cache::CacheUsage>,
+        error_detail: Option<(String, String)>,
+        has_metadata: bool,
+        context_estimated: bool,
+    ) {
+        let usage = usage.unwrap_or(super::cache::CacheUsage {
+            total_input_tokens: self.request.input_tokens,
+            input_tokens: self.request.input_tokens,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        });
+        let source = self.usage_source(&usage, has_metadata, context_estimated);
+        let (error_type, error_message) = error_detail.unwrap_or_else(|| {
+            (
+                "api_error".to_string(),
+                "upstream stream did not complete successfully".to_string(),
+            )
+        });
+        self.record(status, usage, source, Some(error_type), Some(error_message));
+    }
+
+    fn record_success(
+        &self,
+        usage: super::cache::CacheUsage,
+        usage_source: UsageSource,
+        context_estimated: bool,
+    ) {
+        self.record(UsageRecordStatus::Success, usage, usage_source, None, None);
+
+        if usage_source != UsageSource::LocalPromptCache || context_estimated {
+            return;
+        }
+
+        if let Some(scope) = self.scope() {
+            self.request
+                .prompt_cache
+                .update(Some(scope), self.request.prompt_cache_profile.as_ref());
+        }
+    }
+
+    fn record_failure(
+        &self,
+        status: UsageRecordStatus,
+        error_type: impl Into<String>,
+        error_message: impl Into<String>,
+    ) {
+        let usage = super::cache::CacheUsage {
+            total_input_tokens: self.request.input_tokens,
+            input_tokens: self.request.input_tokens,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        self.record(
+            status,
+            usage,
+            UsageSource::None,
+            Some(error_type.into()),
+            Some(error_message.into()),
+        );
+    }
+
+    fn record_client_dropped(&self) {
+        self.record_failure(
+            UsageRecordStatus::ClientDropped,
+            "client_dropped",
+            "downstream client dropped before upstream stream completed",
+        );
+    }
+
+    fn record(
+        &self,
+        status: UsageRecordStatus,
+        usage: super::cache::CacheUsage,
+        usage_source: UsageSource,
+        error_type: Option<String>,
+        error_message: Option<String>,
+    ) {
+        self.request.recorder.record(UsageRecord {
+            id: self.request.request_id.clone(),
+            created_at: Utc::now().to_rfc3339(),
+            endpoint: self.request.endpoint.to_string(),
+            stream: self.request.stream,
+            model: self.request.model.clone(),
+            conversation_id: self.request.conversation_id.clone(),
+            credential_id: self.credential_id,
+            credential_label: self.credential_label.clone(),
+            status,
+            usage_source,
+            total_input_tokens: usage.total_input_tokens,
+            compat_input_tokens: usage.input_tokens,
+            billable_input_tokens: usage.billable_input_tokens(),
+            output_tokens: usage.output_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_creation_5m_input_tokens: usage.cache_creation_5m_input_tokens,
+            cache_creation_1h_input_tokens: usage.cache_creation_1h_input_tokens,
+            duration_ms: self.request.started_at.elapsed().as_millis() as u64,
+            simulated: usage_source.is_simulated(),
+            sticky_bound: self.sticky_bound,
+            fallback_from_sticky: self.fallback_from_sticky,
+            error_type,
+            error_message,
+        });
+    }
+}
+
+#[derive(Clone)]
+struct StreamUsageGuard {
+    usage_context: CredentialUsageContext,
+    completed: Arc<AtomicBool>,
+}
+
+impl StreamUsageGuard {
+    fn new(usage_context: CredentialUsageContext) -> Self {
+        Self {
+            usage_context,
+            completed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn context(&self) -> &CredentialUsageContext {
+        &self.usage_context
+    }
+
+    fn complete(&self) {
+        self.completed.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for StreamUsageGuard {
+    fn drop(&mut self) {
+        if self.completed.load(Ordering::Acquire) {
+            return;
+        }
+        if self.completed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.usage_context.record_client_dropped();
+    }
+}
+
+fn request_id() -> String {
+    format!("req_{}", Uuid::new_v4().to_string().replace('-', ""))
+}
+
+fn credential_label(provider: &crate::kiro::provider::KiroProvider, id: u64) -> Option<String> {
+    provider.credential_label(id)
+}
+
+fn prepare_usage_context(
+    state: &AppState,
+    endpoint: &'static str,
+    stream: bool,
+    payload: &MessagesRequest,
+    conversation_id: Option<String>,
+    stable_conversation_id: Option<String>,
+    input_tokens: i32,
+) -> RequestUsageContext {
+    let prompt_cache_profile = state.prompt_cache.build_profile(payload, input_tokens);
+    let (simulated_usage, simulated_source) = build_simulated_usage(
+        state,
+        payload,
+        stable_conversation_id.as_deref(),
+        input_tokens,
+        prompt_cache_profile.as_ref(),
+    );
+
+    RequestUsageContext {
+        recorder: state.usage_recorder.clone(),
+        prompt_cache: state.prompt_cache.clone(),
+        request_id: request_id(),
+        endpoint,
+        stream,
+        model: payload.model.clone(),
+        conversation_id,
+        input_tokens,
+        prompt_cache_profile,
+        simulation_mode: state.prompt_cache_simulation_mode,
+        simulated_usage,
+        simulated_source,
+        started_at: Instant::now(),
+    }
+}
+
+fn build_simulated_usage(
+    state: &AppState,
+    payload: &MessagesRequest,
+    conversation_id: Option<&str>,
+    input_tokens: i32,
+    prompt_cache_profile: Option<&PromptCacheProfile>,
+) -> (Option<super::cache::CacheSimulation>, Option<UsageSource>) {
+    match state.prompt_cache_simulation_mode {
+        PromptCacheSimulationMode::Disabled => (None, None),
+        PromptCacheSimulationMode::HeuristicCacheControl => {
+            let cached_msg_tokens = super::cache::estimate_cached_message_tokens(&payload.messages);
+            (
+                super::cache::CacheSimulation::heuristic(cached_msg_tokens, input_tokens),
+                Some(UsageSource::HeuristicCacheControl),
+            )
+        }
+        PromptCacheSimulationMode::LocalPromptCache => {
+            if conversation_id.is_none() {
+                let cached_msg_tokens =
+                    super::cache::estimate_cached_message_tokens(&payload.messages);
+                return (
+                    super::cache::CacheSimulation::heuristic(cached_msg_tokens, input_tokens),
+                    Some(UsageSource::HeuristicCacheControl),
+                );
+            }
+
+            // credential_id 需要等 provider 选中账号后才能确定；这里先保留 profile，
+            // 真正的 local prompt-cache 计算在 attach credential 后重新完成。
+            if prompt_cache_profile.is_some() {
+                (None, Some(UsageSource::LocalPromptCache))
+            } else {
+                (None, None)
+            }
+        }
+        PromptCacheSimulationMode::ForceHighCache => (
+            super::cache::CacheSimulation::forced_high_cache(
+                input_tokens,
+                state.high_cache_threshold,
+            ),
+            Some(UsageSource::ForcedHighCache),
+        ),
+    }
+}
+
+fn prepare_credential_usage_context(
+    usage_context: RequestUsageContext,
+    provider: &crate::kiro::provider::KiroProvider,
+    credential_id: u64,
+    sticky_bound: bool,
+    fallback_from_sticky: bool,
+) -> CredentialUsageContext {
+    let mut usage_context = usage_context;
+    if usage_context.simulation_mode == PromptCacheSimulationMode::LocalPromptCache {
+        let scope = usage_context
+            .conversation_id
+            .as_ref()
+            .map(|conversation_id| PromptCacheScope {
+                credential_id,
+                conversation_id: conversation_id.clone(),
+                model: usage_context.model.clone(),
+            });
+        let prompt_usage = usage_context
+            .prompt_cache
+            .compute(scope, usage_context.prompt_cache_profile.as_ref());
+        usage_context.simulated_usage =
+            super::cache::CacheSimulation::from_prompt_cache(prompt_usage);
+        if usage_context.simulated_usage.is_some() {
+            usage_context.simulated_source = Some(UsageSource::LocalPromptCache);
+        } else {
+            usage_context.simulated_source = None;
+        }
+    }
+
+    usage_context.attach_credential(
+        Some(credential_id),
+        credential_label(provider, credential_id),
+        sticky_bound,
+        fallback_from_sticky,
+    )
+}
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
@@ -289,10 +666,19 @@ pub async fn post_messages(
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
     ) as i32;
+    let usage_context = prepare_usage_context(
+        &state,
+        "/v1/messages",
+        payload.stream,
+        &payload,
+        Some(kiro_request.conversation_state.conversation_id.clone()),
+        extract_stable_conversation_id(&payload),
+        input_tokens,
+    );
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -312,6 +698,7 @@ pub async fn post_messages(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            usage_context,
         )
         .await
     } else {
@@ -324,6 +711,7 @@ pub async fn post_messages(
             input_tokens,
             extract_thinking,
             tool_name_map,
+            usage_context,
         )
         .await
     }
@@ -336,24 +724,43 @@ async fn handle_stream_request(
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
-    tool_name_map: std::collections::HashMap<String, String>,
+    tool_name_map: HashMap<String, String>,
+    usage_context: RequestUsageContext,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            let message = e.to_string();
+            usage_context
+                .attach_credential(None, None, false, false)
+                .record_failure(UsageRecordStatus::Error, "api_error", message);
+            return map_provider_error(e);
+        }
     };
     let (response, completion) = response.into_parts();
+    let credential_usage = prepare_credential_usage_context(
+        usage_context,
+        &provider,
+        completion.credential_id(),
+        completion.sticky_bound(),
+        completion.fallback_from_sticky(),
+    );
 
     // 创建流处理上下文
-    let mut ctx =
-        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    let mut ctx = StreamContext::new_with_simulation(
+        model,
+        input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        credential_usage.request.simulated_usage,
+    );
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events, completion);
+    let stream = create_sse_stream(response, ctx, initial_events, completion, credential_usage);
 
     // 返回 SSE 响应
     Response::builder()
@@ -381,7 +788,9 @@ fn create_sse_stream(
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
     completion: KiroStreamCompletion,
+    usage_context: CredentialUsageContext,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
+    let usage_guard = StreamUsageGuard::new(usage_context);
     // 先发送初始事件
     let initial_stream = stream::iter(
         initial_events
@@ -399,6 +808,7 @@ fn create_sse_stream(
             EventStreamDecoder::new(),
             false,
             completion,
+            usage_guard,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
             Instant::now() + Duration::from_secs(UPSTREAM_IDLE_TIMEOUT_SECS),
         ),
@@ -408,6 +818,7 @@ fn create_sse_stream(
             mut decoder,
             finished,
             completion,
+            usage_guard,
             mut ping_interval,
             mut idle_deadline,
         )| async move {
@@ -451,19 +862,28 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, completion, ping_interval, idle_deadline)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, completion, usage_guard, ping_interval, idle_deadline)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
                             completion.report_soft_failure();
                             // 读取错误：关闭已有内容块后发送 SSE error，不再发送正常 message_stop。
                             ctx.record_stream_error("api_error", format!("upstream stream read error: {}", e));
+                            let error_detail = ctx.stream_error_detail();
                             let final_events = ctx.generate_final_events();
+                            usage_guard.context().record_stream_failure_from_context(
+                                UsageRecordStatus::StreamError,
+                                ctx.final_usage(),
+                                error_detail,
+                                ctx.metadata_usage_seen(),
+                                !ctx.metadata_usage_seen() && ctx.context_input_tokens_seen(),
+                            );
+                            usage_guard.complete();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, ping_interval, idle_deadline)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, usage_guard, ping_interval, idle_deadline)))
                         }
                         None => {
                             // 流结束，发送最终事件
@@ -472,12 +892,26 @@ fn create_sse_stream(
                             } else {
                                 completion.report_success();
                             }
+                            let had_stream_error = ctx.has_stream_error();
+                            let error_detail = ctx.stream_error_detail();
                             let final_events = ctx.generate_final_events();
+                            if had_stream_error {
+                                usage_guard.context().record_stream_failure_from_context(
+                                    UsageRecordStatus::StreamError,
+                                    ctx.final_usage(),
+                                    error_detail,
+                                    ctx.metadata_usage_seen(),
+                                    !ctx.metadata_usage_seen() && ctx.context_input_tokens_seen(),
+                                );
+                            } else {
+                                usage_guard.context().record_success_from_stream(&ctx);
+                            }
+                            usage_guard.complete();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, ping_interval, idle_deadline)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, usage_guard, ping_interval, idle_deadline)))
                         }
                     }
                 }
@@ -488,18 +922,27 @@ fn create_sse_stream(
                     );
                     completion.report_soft_failure();
                     ctx.record_stream_error("api_error", "upstream stream idle timeout");
+                    let error_detail = ctx.stream_error_detail();
                     let final_events = ctx.generate_final_events();
+                    usage_guard.context().record_stream_failure_from_context(
+                        UsageRecordStatus::UpstreamTimeout,
+                        ctx.final_usage(),
+                        error_detail,
+                        ctx.metadata_usage_seen(),
+                        !ctx.metadata_usage_seen() && ctx.context_input_tokens_seen(),
+                    );
+                    usage_guard.complete();
                     let bytes: Vec<Result<Bytes, Infallible>> = final_events
                         .into_iter()
                         .map(|e| Ok(Bytes::from(e.to_sse_string())))
                         .collect();
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, ping_interval, idle_deadline)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, usage_guard, ping_interval, idle_deadline)))
                 }
                 // 发送 ping 保活
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, completion, ping_interval, idle_deadline)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, completion, usage_guard, ping_interval, idle_deadline)))
                 }
             }
         },
@@ -518,19 +961,38 @@ async fn handle_non_stream_request(
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
-    tool_name_map: std::collections::HashMap<String, String>,
+    tool_name_map: HashMap<String, String>,
+    usage_context: RequestUsageContext,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api(request_body).await {
+    let api_response = match provider.call_api_with_context(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            let message = e.to_string();
+            usage_context
+                .attach_credential(None, None, false, false)
+                .record_failure(UsageRecordStatus::Error, "api_error", message);
+            return map_provider_error(e);
+        }
     };
+    let credential_usage = prepare_credential_usage_context(
+        usage_context,
+        &provider,
+        api_response.credential_id,
+        api_response.sticky_bound,
+        api_response.fallback_from_sticky,
+    );
 
     // 读取响应体
-    let body_bytes = match response.bytes().await {
+    let body_bytes = match api_response.response.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!("读取响应体失败: {}", e);
+            credential_usage.record_failure(
+                UsageRecordStatus::Error,
+                "api_error",
+                format!("读取响应失败: {}", e),
+            );
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
@@ -650,6 +1112,11 @@ async fn handle_non_stream_request(
                                 message = %message,
                                 "非流式响应收到 invalidStateEvent"
                             );
+                            credential_usage.record_failure(
+                                UsageRecordStatus::Error,
+                                "invalid_request_error",
+                                message.clone(),
+                            );
                             return (
                                 StatusCode::BAD_REQUEST,
                                 Json(ErrorResponse::new("invalid_request_error", message)),
@@ -737,9 +1204,24 @@ async fn handle_non_stream_request(
     // 优先使用 metadataEvent 的准确 usage，其次使用 contextUsageEvent 估算值。
     let final_input_tokens = metadata_usage
         .as_ref()
-        .map(|usage| usage.input_tokens())
+        .map(|usage| usage.total_input_tokens())
         .or(context_input_tokens)
         .unwrap_or(input_tokens);
+
+    let usage = super::cache::build_usage_with_simulation(
+        metadata_usage.as_ref(),
+        final_input_tokens,
+        output_tokens,
+        credential_usage.request.simulated_usage,
+    );
+    let has_metadata = metadata_usage.is_some();
+    let context_estimated = !has_metadata && context_input_tokens.is_some();
+    let usage_source = credential_usage.usage_source(&usage, has_metadata, context_estimated);
+    credential_usage.record_success(usage, usage_source, context_estimated);
+    provider.report_success_for_context(
+        api_response.credential_id,
+        api_response.session_id.as_deref(),
+    );
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -750,18 +1232,7 @@ async fn handle_non_stream_request(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens,
-            "cache_read_input_tokens": metadata_usage
-                .as_ref()
-                .map(|usage| usage.cache_read_input_tokens)
-                .unwrap_or(0),
-            "cache_creation_input_tokens": metadata_usage
-                .as_ref()
-                .map(|usage| usage.cache_write_input_tokens)
-                .unwrap_or(0)
-        }
+        "usage": usage.to_json()
     });
 
     (StatusCode::OK, Json(response_body)).into_response()
@@ -923,10 +1394,19 @@ pub async fn post_messages_cc(
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
-        payload.system,
-        payload.messages,
-        payload.tools,
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
     ) as i32;
+    let usage_context = prepare_usage_context(
+        &state,
+        "/cc/v1/messages",
+        payload.stream,
+        &payload,
+        Some(kiro_request.conversation_state.conversation_id.clone()),
+        extract_stable_conversation_id(&payload),
+        input_tokens,
+    );
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -946,6 +1426,7 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            usage_context,
         )
         .await
     } else {
@@ -958,6 +1439,7 @@ pub async fn post_messages_cc(
             input_tokens,
             extract_thinking,
             tool_name_map,
+            usage_context,
         )
         .await
     }
@@ -973,25 +1455,40 @@ async fn handle_stream_request_buffered(
     model: &str,
     estimated_input_tokens: i32,
     thinking_enabled: bool,
-    tool_name_map: std::collections::HashMap<String, String>,
+    tool_name_map: HashMap<String, String>,
+    usage_context: RequestUsageContext,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            let message = e.to_string();
+            usage_context
+                .attach_credential(None, None, false, false)
+                .record_failure(UsageRecordStatus::Error, "api_error", message);
+            return map_provider_error(e);
+        }
     };
     let (response, completion) = response.into_parts();
+    let credential_usage = prepare_credential_usage_context(
+        usage_context,
+        &provider,
+        completion.credential_id(),
+        completion.sticky_bound(),
+        completion.fallback_from_sticky(),
+    );
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(
+    let ctx = BufferedStreamContext::new_with_simulation(
         model,
         estimated_input_tokens,
         thinking_enabled,
         tool_name_map,
+        credential_usage.request.simulated_usage,
     );
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx, completion);
+    let stream = create_buffered_sse_stream(response, ctx, completion, credential_usage);
 
     // 返回 SSE 响应
     Response::builder()
@@ -1014,7 +1511,9 @@ fn create_buffered_sse_stream(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
     completion: KiroStreamCompletion,
+    usage_context: CredentialUsageContext,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
+    let usage_guard = StreamUsageGuard::new(usage_context);
     let body_stream = response.bytes_stream();
 
     stream::unfold(
@@ -1024,6 +1523,7 @@ fn create_buffered_sse_stream(
             EventStreamDecoder::new(),
             false,
             completion,
+            usage_guard,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
             Instant::now() + Duration::from_secs(UPSTREAM_IDLE_TIMEOUT_SECS),
         ),
@@ -1033,6 +1533,7 @@ fn create_buffered_sse_stream(
             mut decoder,
             finished,
             completion,
+            usage_guard,
             mut ping_interval,
             mut idle_deadline,
         )| async move {
@@ -1053,7 +1554,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, completion, ping_interval, idle_deadline)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, completion, usage_guard, ping_interval, idle_deadline)));
                     }
 
                     // 然后处理数据流
@@ -1086,12 +1587,21 @@ fn create_buffered_sse_stream(
                                 completion.report_soft_failure();
                                 // 发生错误，完成处理并返回所有事件
                                 ctx.record_stream_error("api_error", format!("upstream stream read error: {}", e));
+                                let error_detail = ctx.stream_error_detail();
                                 let all_events = ctx.finish_and_get_all_events();
+                                usage_guard.context().record_stream_failure_from_context(
+                                    UsageRecordStatus::StreamError,
+                                    ctx.final_usage(),
+                                    error_detail,
+                                    ctx.metadata_usage_seen(),
+                                    !ctx.metadata_usage_seen() && ctx.context_input_tokens_seen(),
+                                );
+                                usage_guard.complete();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, ping_interval, idle_deadline)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, usage_guard, ping_interval, idle_deadline)));
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
@@ -1100,12 +1610,26 @@ fn create_buffered_sse_stream(
                                 } else {
                                     completion.report_success();
                                 }
+                                let had_stream_error = ctx.has_stream_error();
+                                let error_detail = ctx.stream_error_detail();
                                 let all_events = ctx.finish_and_get_all_events();
+                                if had_stream_error {
+                                    usage_guard.context().record_stream_failure_from_context(
+                                        UsageRecordStatus::StreamError,
+                                        ctx.final_usage(),
+                                        error_detail,
+                                        ctx.metadata_usage_seen(),
+                                        !ctx.metadata_usage_seen() && ctx.context_input_tokens_seen(),
+                                    );
+                                } else {
+                                    usage_guard.context().record_success_from_buffered_stream(&ctx);
+                                }
+                                usage_guard.complete();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, ping_interval, idle_deadline)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, usage_guard, ping_interval, idle_deadline)));
                             }
                         }
                     }
@@ -1116,12 +1640,21 @@ fn create_buffered_sse_stream(
                         );
                         completion.report_soft_failure();
                         ctx.record_stream_error("api_error", "upstream stream idle timeout");
+                        let error_detail = ctx.stream_error_detail();
                         let all_events = ctx.finish_and_get_all_events();
+                        usage_guard.context().record_stream_failure_from_context(
+                            UsageRecordStatus::UpstreamTimeout,
+                            ctx.final_usage(),
+                            error_detail,
+                            ctx.metadata_usage_seen(),
+                            !ctx.metadata_usage_seen() && ctx.context_input_tokens_seen(),
+                        );
+                        usage_guard.complete();
                         let bytes: Vec<Result<Bytes, Infallible>> = all_events
                             .into_iter()
                             .map(|e| Ok(Bytes::from(e.to_sse_string())))
                             .collect();
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, ping_interval, idle_deadline)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, usage_guard, ping_interval, idle_deadline)));
                     }
                 }
             }

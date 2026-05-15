@@ -1,0 +1,288 @@
+import { useMemo, useState } from 'react'
+import { RefreshCw, Trash2 } from 'lucide-react'
+import { toast } from 'sonner'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
+import { useCredentials } from '@/hooks/use-credentials'
+import { useClearUsageRecords, useUsageRecords, useUsageSummary } from '@/hooks/use-usage'
+import { extractErrorMessage } from '@/lib/utils'
+import type { UsageRecordsQuery, UsageSource } from '@/types/api'
+
+function formatNumber(value: number): string {
+  return new Intl.NumberFormat('zh-CN').format(value)
+}
+
+function formatDate(value: string): string {
+  return new Date(value).toLocaleString('zh-CN', {
+    hour12: false,
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
+}
+
+function sourceLabel(source: UsageSource): string {
+  switch (source) {
+    case 'upstream_metadata':
+      return '上游 metadata'
+    case 'local_prompt_cache':
+      return '本地 prompt cache'
+    case 'heuristic_cache_control':
+      return 'cache_control 估算'
+    case 'forced_high_cache':
+      return '强制高缓存'
+    case 'context_estimate':
+      return '上下文估算'
+    case 'request_estimate':
+      return '请求估算'
+    default:
+      return '无缓存'
+  }
+}
+
+function statusVariant(status: string): 'success' | 'destructive' | 'warning' {
+  if (status === 'success') return 'success'
+  if (status === 'client_dropped') return 'warning'
+  return 'destructive'
+}
+
+export function UsageRecordsPanel() {
+  const [conversationId, setConversationId] = useState('')
+  const [credentialId, setCredentialId] = useState('')
+  const [source, setSource] = useState<UsageSource | ''>('')
+  const [minCacheRead, setMinCacheRead] = useState('')
+
+  const query = useMemo<UsageRecordsQuery>(() => {
+    const next: UsageRecordsQuery = { limit: 100 }
+    if (conversationId.trim()) {
+      next.conversationId = conversationId.trim()
+    }
+    const parsedCredentialId = Number(credentialId)
+    if (credentialId.trim() && Number.isFinite(parsedCredentialId)) {
+      next.credentialId = parsedCredentialId
+    }
+    if (source) {
+      next.source = source
+    }
+    const parsedMinCacheRead = Number(minCacheRead)
+    if (minCacheRead.trim() && Number.isFinite(parsedMinCacheRead)) {
+      next.minCacheRead = parsedMinCacheRead
+    }
+    return next
+  }, [conversationId, credentialId, minCacheRead, source])
+
+  const summary = useUsageSummary()
+  const records = useUsageRecords(query)
+  const credentials = useCredentials()
+  const clearRecords = useClearUsageRecords()
+
+  const credentialLabels = useMemo(() => {
+    const labels = new Map<number, string>()
+    for (const credential of credentials.data?.credentials || []) {
+      labels.set(
+        credential.id,
+        credential.email || credential.maskedApiKey || `凭据 #${credential.id}`
+      )
+    }
+    return labels
+  }, [credentials.data?.credentials])
+
+  const handleRefresh = () => {
+    summary.refetch()
+    records.refetch()
+  }
+
+  const handleClear = () => {
+    if (!confirm('确定清空 usage 记录吗？此操作会同时截断本地 JSONL 记录文件。')) {
+      return
+    }
+    clearRecords.mutate(undefined, {
+      onSuccess: (res) => toast.success(res.message),
+      onError: (err) => toast.error(`清空失败: ${extractErrorMessage(err)}`),
+    })
+  }
+
+  const summaryData = summary.data
+
+  return (
+    <div className="space-y-4">
+      <div className="grid gap-4 md:grid-cols-4">
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium text-muted-foreground">请求总数</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">{formatNumber(summaryData?.totalRequests || 0)}</div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium text-muted-foreground">高缓存请求</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold text-green-600">{formatNumber(summaryData?.highCacheRequests || 0)}</div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium text-muted-foreground">Cache Read</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">{formatNumber(summaryData?.totalCacheReadInputTokens || 0)}</div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium text-muted-foreground">模拟记录</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">{formatNumber(summaryData?.simulatedRequests || 0)}</div>
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="flex flex-col gap-3 rounded-lg border bg-card p-4 md:flex-row md:items-center md:justify-between">
+        <div className="grid flex-1 gap-2 md:grid-cols-4">
+          <Input
+            value={conversationId}
+            onChange={(event) => setConversationId(event.target.value)}
+            placeholder="conversationId"
+          />
+          <Input
+            value={credentialId}
+            onChange={(event) => setCredentialId(event.target.value)}
+            placeholder="credentialId"
+            inputMode="numeric"
+          />
+          <select
+            value={source}
+            onChange={(event) => setSource(event.target.value as UsageSource | '')}
+            className="h-10 rounded-md border border-input bg-background px-3 py-2 text-sm"
+          >
+            <option value="">全部来源</option>
+            <option value="upstream_metadata">上游 metadata</option>
+            <option value="local_prompt_cache">本地 prompt cache</option>
+            <option value="heuristic_cache_control">cache_control 估算</option>
+            <option value="forced_high_cache">强制高缓存</option>
+            <option value="context_estimate">上下文估算</option>
+            <option value="request_estimate">请求估算</option>
+          </select>
+          <Input
+            value={minCacheRead}
+            onChange={(event) => setMinCacheRead(event.target.value)}
+            placeholder="最小 cache read"
+            inputMode="numeric"
+          />
+        </div>
+        <div className="flex gap-2">
+          <Button variant="outline" size="sm" onClick={handleRefresh}>
+            <RefreshCw className="h-4 w-4" />
+            刷新
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="text-destructive hover:text-destructive"
+            onClick={handleClear}
+            disabled={clearRecords.isPending}
+          >
+            <Trash2 className="h-4 w-4" />
+            清空
+          </Button>
+        </div>
+      </div>
+
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base">Usage 记录</CardTitle>
+        </CardHeader>
+        <CardContent>
+          {records.isLoading ? (
+            <div className="py-8 text-center text-muted-foreground">加载中...</div>
+          ) : records.error ? (
+            <div className="py-8 text-center text-destructive">{extractErrorMessage(records.error)}</div>
+          ) : records.data?.records.length === 0 ? (
+            <div className="py-8 text-center text-muted-foreground">暂无记录</div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[1280px] text-sm">
+                <thead>
+                  <tr className="border-b text-left text-muted-foreground">
+                    <th className="px-3 py-2 font-medium">时间</th>
+                    <th className="px-3 py-2 font-medium">账号</th>
+                    <th className="px-3 py-2 font-medium">会话</th>
+                    <th className="px-3 py-2 font-medium">来源</th>
+                    <th className="px-3 py-2 font-medium">状态</th>
+                    <th className="px-3 py-2 font-medium text-right">Total In</th>
+                    <th className="px-3 py-2 font-medium text-right">Compat In</th>
+                    <th className="px-3 py-2 font-medium text-right">Billable In</th>
+                    <th className="px-3 py-2 font-medium text-right">Cache Read</th>
+                    <th className="px-3 py-2 font-medium text-right">Cache Create</th>
+                    <th className="px-3 py-2 font-medium text-right">输出</th>
+                    <th className="px-3 py-2 font-medium text-right">耗时</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {records.data?.records.map((record) => {
+                    const credentialLabel =
+                      typeof record.credentialId === 'number'
+                        ? credentialLabels.get(record.credentialId) || record.credentialLabel
+                        : record.credentialLabel
+
+                    return (
+                    <tr key={record.id} className="border-b last:border-0">
+                      <td className="px-3 py-2 whitespace-nowrap">{formatDate(record.createdAt)}</td>
+                      <td className="px-3 py-2">
+                        <div className="font-medium">#{record.credentialId ?? '-'}</div>
+                        {credentialLabel && (
+                          <div className="max-w-[240px] truncate text-xs text-muted-foreground" title={credentialLabel}>
+                            {credentialLabel}
+                          </div>
+                        )}
+                      </td>
+                      <td className="px-3 py-2">
+                        <div className="max-w-[220px] truncate">{record.conversationId || '-'}</div>
+                        <div className="mt-1 flex flex-wrap gap-1">
+                          {record.stream && <Badge variant="outline">stream</Badge>}
+                          {record.stickyBound && <Badge variant="secondary">sticky</Badge>}
+                          {record.fallbackFromSticky && <Badge variant="warning">fallback</Badge>}
+                        </div>
+                      </td>
+                      <td className="px-3 py-2">
+                        <Badge variant={record.simulated ? 'warning' : 'secondary'}>
+                          {sourceLabel(record.usageSource)}
+                        </Badge>
+                      </td>
+                      <td className="px-3 py-2">
+                        <Badge variant={statusVariant(record.status)}>
+                          {record.status}
+                        </Badge>
+                        {record.errorMessage && (
+                          <div className="mt-1 max-w-[220px] truncate text-xs text-muted-foreground">
+                            {record.errorMessage}
+                          </div>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 text-right">{formatNumber(record.totalInputTokens)}</td>
+                      <td className="px-3 py-2 text-right">{formatNumber(record.compatInputTokens)}</td>
+                      <td className="px-3 py-2 text-right">{formatNumber(record.billableInputTokens)}</td>
+                      <td className="px-3 py-2 text-right">{formatNumber(record.cacheReadInputTokens)}</td>
+                      <td className="px-3 py-2 text-right">{formatNumber(record.cacheCreationInputTokens)}</td>
+                      <td className="px-3 py-2 text-right">{formatNumber(record.outputTokens)}</td>
+                      <td className="px-3 py-2 text-right">{formatNumber(record.durationMs)}ms</td>
+                    </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  )
+}

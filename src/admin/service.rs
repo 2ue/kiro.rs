@@ -8,6 +8,10 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::anthropic::{
+    prompt_cache::PromptCacheTracker,
+    usage::{UsageRecordQuery, UsageRecorder, UsageRecordsResult, UsageSummary},
+};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 
@@ -38,12 +42,18 @@ pub struct AdminService {
     cache_path: Option<PathBuf>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
+    usage_recorder: Arc<UsageRecorder>,
+    prompt_cache: Arc<PromptCacheTracker>,
+    high_cache_threshold: i32,
 }
 
 impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
         known_endpoints: impl IntoIterator<Item = String>,
+        usage_recorder: Arc<UsageRecorder>,
+        prompt_cache: Arc<PromptCacheTracker>,
+        high_cache_threshold: i32,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
@@ -56,6 +66,9 @@ impl AdminService {
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
+            usage_recorder,
+            prompt_cache,
+            high_cache_threshold,
         }
     }
 
@@ -119,6 +132,9 @@ impl AdminService {
             .set_disabled(id, disabled)
             .map_err(|e| self.classify_error(e, id))?;
         self.invalidate_balance_cache(id);
+        if disabled {
+            self.prompt_cache.clear_credential(id);
+        }
 
         // 只有禁用的是当前凭据时才尝试切换到下一个
         if disabled && id == current_id {
@@ -276,6 +292,7 @@ impl AdminService {
         self.token_manager
             .delete_credential(id)
             .map_err(|e| self.classify_delete_error(e, id))?;
+        self.prompt_cache.clear_credential(id);
 
         // 清理已删除凭据的余额缓存
         {
@@ -285,6 +302,21 @@ impl AdminService {
         self.save_balance_cache();
 
         Ok(())
+    }
+
+    /// 查询请求级 usage 记录。
+    pub fn get_usage_records(&self, query: UsageRecordQuery) -> UsageRecordsResult {
+        self.usage_recorder.query(query)
+    }
+
+    /// 获取 usage 汇总。
+    pub fn get_usage_summary(&self) -> UsageSummary {
+        self.usage_recorder.summary(self.high_cache_threshold)
+    }
+
+    /// 清空 usage 记录。
+    pub fn clear_usage_records(&self) {
+        self.usage_recorder.clear();
     }
 
     /// 获取负载均衡模式

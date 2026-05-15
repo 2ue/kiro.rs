@@ -27,6 +27,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [apiRegion, setApiRegion] = useState('')
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
+  const [email, setEmail] = useState('')
   const [priority, setPriority] = useState('0')
   const [machineId, setMachineId] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
@@ -44,6 +45,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setApiRegion('')
     setClientId('')
     setClientSecret('')
+    setEmail('')
     setPriority('0')
     setMachineId('')
     setProxyUrl('')
@@ -90,6 +92,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         apiRegion: apiRegion.trim() || undefined,
         clientId: isApiKey ? undefined : clientId.trim() || undefined,
         clientSecret: isApiKey ? undefined : clientSecret.trim() || undefined,
+        email: email.trim() || undefined,
         priority: parsedPriority,
         machineId: machineId.trim() || undefined,
         proxyUrl: proxyUrl.trim() || undefined,
@@ -170,6 +173,21 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 />
               </div>
             )}
+
+            {/* 账号邮箱 */}
+            <div className="space-y-2">
+              <label htmlFor="email" className="text-sm font-medium">
+                账号邮箱
+              </label>
+              <Input
+                id="email"
+                type="email"
+                placeholder="可选，用于管理页识别账号"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                disabled={isPending}
+              />
+            </div>
 
             {/* Region 配置 */}
             <div className="space-y-2">
