@@ -1,49 +1,23 @@
-name: Build and Push Docker Images
+name: Publish Docker Images
 
 on:
   push:
-    branches:
-      - master
     tags:
       - 'v*'
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version tag for Docker images (e.g., 2025.12.1)'
-        required: true
-        default: '2026.1.1'
 
 permissions:
   contents: read
   packages: write
 
-jobs:
-  pre-check:
-    runs-on: ubuntu-latest
-    outputs:
-      should_build: ${{ steps.check.outputs.should_build }}
-    steps:
-      - uses: actions/checkout@v4
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
-        with:
-          fetch-depth: 0
-      - name: Check if commit has release tag
-        id: check
-        run: |
-          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/heads/* ]] && git tag --points-at HEAD | grep -q '^v'; then
-            echo "should_build=false" >> $GITHUB_OUTPUT
-            echo "::notice::Skipping beta build: commit already has a release tag"
-          else
-            echo "should_build=true" >> $GITHUB_OUTPUT
-          fi
+env:
+  IMAGE_NAME: kiro-rs
 
+jobs:
   build:
-    needs: pre-check
-    if: needs.pre-check.outputs.should_build == 'true'
     runs-on: ${{ matrix.runner }}
     outputs:
       version: ${{ steps.version.outputs.version }}
-      is_beta: ${{ steps.version.outputs.is_beta }}
+      version_without_v: ${{ steps.version.outputs.version_without_v }}
 
     strategy:
       fail-fast: false
@@ -62,17 +36,22 @@ jobs:
 
       - name: Determine version
         id: version
+        shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-            echo "is_beta=false" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-            echo "is_beta=false" >> $GITHUB_OUTPUT
-          else
-            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-6)
-            echo "version=beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
-            echo "is_beta=true" >> $GITHUB_OUTPUT
+          VERSION="${GITHUB_REF_NAME}"
+          VERSION_WITHOUT_V="${VERSION#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "version_without_v=${VERSION_WITHOUT_V}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate Docker Hub secrets
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "::error::Docker Hub publish requires DOCKERHUB_USERNAME and DOCKERHUB_TOKEN repository secrets."
+            exit 1
           fi
 
       - name: Set up Docker Buildx
@@ -85,6 +64,12 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ github.token }}
 
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -94,10 +79,16 @@ jobs:
           cache-to: type=gha,mode=max
           push: true
           provenance: false
-          tags: ghcr.io/${{ github.repository_owner }}/kiro-rs:${{ steps.version.outputs.version }}-${{ matrix.arch }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}-${{ matrix.arch }}
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version_without_v }}-${{ matrix.arch }}
+            docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}-${{ matrix.arch }}
+            docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version_without_v }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=Kiro.rs Docker Image
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
 
   manifest:
     needs: build
@@ -110,25 +101,34 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ github.token }}
 
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Create and push multi-arch manifest
+        shell: bash
         run: |
           VERSION="${{ needs.build.outputs.version }}"
-          IS_BETA="${{ needs.build.outputs.is_beta }}"
-          IMAGE="ghcr.io/${{ github.repository_owner }}/kiro-rs"
+          VERSION_WITHOUT_V="${{ needs.build.outputs.version_without_v }}"
+          GHCR_IMAGE="ghcr.io/${{ github.repository_owner }}/${IMAGE_NAME}"
+          DOCKERHUB_IMAGE="docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${IMAGE_NAME}"
+          GHCR_IMAGE="${GHCR_IMAGE,,}"
 
-          # Create manifest for version tag
-          docker manifest create ${IMAGE}:${VERSION} \
-            ${IMAGE}:${VERSION}-amd64 \
-            ${IMAGE}:${VERSION}-arm64
-          docker manifest push ${IMAGE}:${VERSION}
+          create_manifest() {
+            local image="$1"
+            local tag="$2"
+            local source_tag="$3"
 
-          # Create manifest for latest/beta alias tag
-          if [ "${IS_BETA}" = "true" ]; then
-            ALIAS_TAG="beta"
-          else
-            ALIAS_TAG="latest"
-          fi
-          docker manifest create ${IMAGE}:${ALIAS_TAG} \
-            ${IMAGE}:${VERSION}-amd64 \
-            ${IMAGE}:${VERSION}-arm64
-          docker manifest push ${IMAGE}:${ALIAS_TAG}
+            docker manifest create "${image}:${tag}" \
+              "${image}:${source_tag}-amd64" \
+              "${image}:${source_tag}-arm64"
+            docker manifest push "${image}:${tag}"
+          }
+
+          for image in "$GHCR_IMAGE" "$DOCKERHUB_IMAGE"; do
+            create_manifest "$image" "$VERSION" "$VERSION"
+            create_manifest "$image" "$VERSION_WITHOUT_V" "$VERSION_WITHOUT_V"
+            create_manifest "$image" "latest" "$VERSION"
+          done
