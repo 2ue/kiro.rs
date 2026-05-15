@@ -1609,6 +1609,61 @@ mod tests {
     }
 
     #[test]
+    fn test_high_cache_metadata_usage_is_preserved_in_final_usage() {
+        use crate::kiro::model::events::{MetadataEvent, MetadataTokenUsage};
+
+        let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_assistant_response("hello"));
+        all_events.extend(ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
+            token_usage: Some(MetadataTokenUsage {
+                uncached_input_tokens: 1200,
+                output_tokens: 900,
+                total_tokens: 206100,
+                cache_read_input_tokens: 180000,
+                cache_write_input_tokens: 24000,
+            }),
+        })));
+        all_events.extend(ctx.generate_final_events());
+
+        let message_delta = all_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("message_delta should exist");
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 181200);
+        assert_eq!(message_delta.data["usage"]["output_tokens"], 900);
+    }
+
+    #[test]
+    fn test_buffered_stream_preserves_high_cache_usage_in_message_start() {
+        use crate::kiro::model::events::{MetadataEvent, MetadataTokenUsage};
+
+        let mut ctx = BufferedStreamContext::new("test-model", 12, false, HashMap::new());
+        ctx.process_and_buffer(&Event::Metadata(MetadataEvent {
+            token_usage: Some(MetadataTokenUsage {
+                uncached_input_tokens: 1200,
+                output_tokens: 900,
+                total_tokens: 206100,
+                cache_read_input_tokens: 180000,
+                cache_write_input_tokens: 24000,
+            }),
+        }));
+
+        let events = ctx.finish_and_get_all_events();
+        let message_start = events
+            .iter()
+            .find(|e| e.event == "message_start")
+            .expect("message_start should exist");
+        let usage = &message_start.data["message"]["usage"];
+        assert_eq!(usage["input_tokens"], 181200);
+        assert_eq!(usage["output_tokens"], 900);
+        assert_eq!(usage["cache_read_input_tokens"], 180000);
+        assert_eq!(usage["cache_creation_input_tokens"], 24000);
+    }
+
+    #[test]
     fn test_invalid_state_finishes_with_error_not_message_stop() {
         use crate::kiro::model::events::InvalidStateEvent;
 

@@ -16,6 +16,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
+import { extractErrorMessage } from '@/lib/utils'
 import {
   useSetDisabled,
   useSetPriority,
@@ -75,7 +76,7 @@ export function CredentialCard({
           toast.success(res.message)
         },
         onError: (err) => {
-          toast.error('操作失败: ' + (err as Error).message)
+          toast.error('操作失败: ' + extractErrorMessage(err))
         },
       }
     )
@@ -95,7 +96,7 @@ export function CredentialCard({
           setEditingPriority(false)
         },
         onError: (err) => {
-          toast.error('操作失败: ' + (err as Error).message)
+          toast.error('操作失败: ' + extractErrorMessage(err))
         },
       }
     )
@@ -107,7 +108,7 @@ export function CredentialCard({
         toast.success(res.message)
       },
       onError: (err) => {
-        toast.error('操作失败: ' + (err as Error).message)
+        toast.error('操作失败: ' + extractErrorMessage(err))
       },
     })
   }
@@ -118,7 +119,7 @@ export function CredentialCard({
         toast.success(res.message)
       },
       onError: (err) => {
-        toast.error('刷新失败: ' + (err as Error).message)
+        toast.error('刷新失败: ' + extractErrorMessage(err))
       },
     })
   }
@@ -136,7 +137,7 @@ export function CredentialCard({
         setShowDeleteDialog(false)
       },
       onError: (err) => {
-        toast.error('删除失败: ' + (err as Error).message)
+        toast.error('删除失败: ' + extractErrorMessage(err))
       },
     })
   }
@@ -324,7 +325,7 @@ export function CredentialCard({
                   { id: credential.id, priority: newPriority },
                   {
                     onSuccess: (res) => toast.success(res.message),
-                    onError: (err) => toast.error('操作失败: ' + (err as Error).message),
+                    onError: (err) => toast.error('操作失败: ' + extractErrorMessage(err)),
                   }
                 )
               }}
@@ -342,7 +343,7 @@ export function CredentialCard({
                   { id: credential.id, priority: newPriority },
                   {
                     onSuccess: (res) => toast.success(res.message),
-                    onError: (err) => toast.error('操作失败: ' + (err as Error).message),
+                    onError: (err) => toast.error('操作失败: ' + extractErrorMessage(err)),
                   }
                 )
               }}

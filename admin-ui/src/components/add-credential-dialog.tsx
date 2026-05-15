@@ -75,6 +75,12 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       }
     }
 
+    const parsedPriority = Number(priority)
+    if (!Number.isInteger(parsedPriority) || parsedPriority < 0) {
+      toast.error('优先级必须是非负整数')
+      return
+    }
+
     mutate(
       {
         authMethod,
@@ -84,7 +90,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         apiRegion: apiRegion.trim() || undefined,
         clientId: isApiKey ? undefined : clientId.trim() || undefined,
         clientSecret: isApiKey ? undefined : clientSecret.trim() || undefined,
-        priority: parseInt(priority) || 0,
+        priority: parsedPriority,
         machineId: machineId.trim() || undefined,
         proxyUrl: proxyUrl.trim() || undefined,
         proxyUsername: proxyUsername.trim() || undefined,

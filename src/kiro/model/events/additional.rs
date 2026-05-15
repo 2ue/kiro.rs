@@ -134,6 +134,28 @@ mod tests {
     }
 
     #[test]
+    fn high_cache_metadata_usage_keeps_large_cache_token_counts() {
+        let event: MetadataEvent = serde_json::from_str(
+            r#"{
+                "tokenUsage": {
+                    "uncachedInputTokens": 1200,
+                    "cacheReadInputTokens": 180000,
+                    "cacheWriteInputTokens": 24000,
+                    "outputTokens": 900,
+                    "totalTokens": 206100
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let usage = event.token_usage.unwrap();
+        assert_eq!(usage.input_tokens(), 181200);
+        assert_eq!(usage.cache_read_input_tokens, 180000);
+        assert_eq!(usage.cache_write_input_tokens, 24000);
+        assert_eq!(usage.output_tokens, 900);
+    }
+
+    #[test]
     fn invalid_state_prefers_message_but_falls_back_to_reason() {
         let with_message: InvalidStateEvent =
             serde_json::from_str(r#"{"reason":"Expired","message":"session expired"}"#).unwrap();

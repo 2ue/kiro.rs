@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -413,6 +413,13 @@ struct CredentialEntry {
     last_used_at: Option<String>,
 }
 
+/// 会话到凭据的粘性绑定。
+struct SessionBinding {
+    credential_id: u64,
+    last_used_at: DateTime<Utc>,
+    soft_failure_count: u32,
+}
+
 /// 禁用原因
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DisabledReason {
@@ -523,12 +530,20 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 会话粘性绑定：conversationId -> credential id
+    session_bindings: Mutex<HashMap<String, SessionBinding>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+/// 会话绑定最长保留时间，避免长期运行进程无限增长。
+const SESSION_BINDING_TTL_SECS: i64 = 6 * 60 * 60;
+/// 会话绑定表上限。
+const MAX_SESSION_BINDINGS: usize = 10_000;
+/// 同一会话绑定账号连续软失败达到该阈值后，本次请求允许临时 fallback。
+const MAX_SESSION_SOFT_FAILURES: u32 = 2;
 
 /// API 调用上下文
 ///
@@ -652,6 +667,7 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            session_bindings: Mutex::new(HashMap::new()),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -684,33 +700,35 @@ impl MultiTokenManager {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
 
-    /// 根据负载均衡模式选择下一个凭据
-    ///
-    /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
-    /// - balanced 模式：均衡选择可用凭据
-    ///
-    /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
-        let entries = self.entries.lock();
-
-        // 检查是否是 opus 模型
-        let is_opus = model
+    fn is_opus_model(model: Option<&str>) -> bool {
+        model
             .map(|m| m.to_lowercase().contains("opus"))
-            .unwrap_or(false);
+            .unwrap_or(false)
+    }
+
+    fn credential_is_usable_for_model(entry: &CredentialEntry, model: Option<&str>) -> bool {
+        if entry.disabled {
+            return false;
+        }
+        if Self::is_opus_model(model) && !entry.credentials.supports_opus() {
+            return false;
+        }
+        true
+    }
+
+    /// 根据负载均衡模式选择下一个凭据，并排除本次请求已临时失败的凭据。
+    fn select_next_credential_excluding(
+        &self,
+        model: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+    ) -> Option<(u64, KiroCredentials)> {
+        let entries = self.entries.lock();
 
         // 过滤可用凭据
         let available: Vec<_> = entries
             .iter()
             .filter(|e| {
-                if e.disabled {
-                    return false;
-                }
-                // 如果是 opus 模型，需要检查订阅等级
-                if is_opus && !e.credentials.supports_opus() {
-                    return false;
-                }
-                true
+                !excluded_ids.contains(&e.id) && Self::credential_is_usable_for_model(e, model)
             })
             .collect();
 
@@ -739,6 +757,141 @@ impl MultiTokenManager {
         }
     }
 
+    fn prune_session_bindings_locked(bindings: &mut HashMap<String, SessionBinding>) {
+        let now = Utc::now();
+        bindings.retain(|_, binding| {
+            now.signed_duration_since(binding.last_used_at)
+                .num_seconds()
+                <= SESSION_BINDING_TTL_SECS
+        });
+
+        if bindings.len() <= MAX_SESSION_BINDINGS {
+            return;
+        }
+
+        let mut sessions_by_age: Vec<_> = bindings
+            .iter()
+            .map(|(session_id, binding)| (session_id.clone(), binding.last_used_at))
+            .collect();
+        sessions_by_age.sort_by_key(|(_, last_used_at)| *last_used_at);
+
+        let remove_count = bindings.len() - MAX_SESSION_BINDINGS;
+        for (session_id, _) in sessions_by_age.into_iter().take(remove_count) {
+            bindings.remove(&session_id);
+        }
+    }
+
+    fn get_bound_credential(
+        &self,
+        session_id: &str,
+        model: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+    ) -> Option<(u64, KiroCredentials)> {
+        let bound_id = {
+            let mut bindings = self.session_bindings.lock();
+            Self::prune_session_bindings_locked(&mut bindings);
+            bindings
+                .get(session_id)
+                .map(|binding| binding.credential_id)
+        }?;
+
+        if excluded_ids.contains(&bound_id) {
+            return None;
+        }
+
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|e| e.id == bound_id && Self::credential_is_usable_for_model(e, model))
+            .map(|e| (e.id, e.credentials.clone()))
+    }
+
+    fn bound_credential_id(&self, session_id: &str) -> Option<u64> {
+        self.session_bindings
+            .lock()
+            .get(session_id)
+            .map(|binding| binding.credential_id)
+    }
+
+    fn bound_credential_exists_but_unusable(&self, session_id: &str, model: Option<&str>) -> bool {
+        let Some(bound_id) = self.bound_credential_id(session_id) else {
+            return false;
+        };
+
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|e| e.id == bound_id)
+            .is_none_or(|e| !Self::credential_is_usable_for_model(e, model))
+    }
+
+    fn bind_session_to_credential(&self, session_id: &str, credential_id: u64) {
+        let mut bindings = self.session_bindings.lock();
+        Self::prune_session_bindings_locked(&mut bindings);
+        match bindings.get_mut(session_id) {
+            Some(binding) if binding.credential_id == credential_id => {
+                binding.last_used_at = Utc::now();
+            }
+            _ => {
+                bindings.insert(
+                    session_id.to_string(),
+                    SessionBinding {
+                        credential_id,
+                        last_used_at: Utc::now(),
+                        soft_failure_count: 0,
+                    },
+                );
+            }
+        }
+    }
+
+    /// 清理指定会话的粘性绑定。
+    pub fn unbind_session(&self, session_id: &str) {
+        self.session_bindings.lock().remove(session_id);
+    }
+
+    /// 仅当指定会话当前绑定到该凭据时清理绑定。
+    pub fn unbind_session_if_bound_to(&self, session_id: &str, credential_id: u64) {
+        let mut bindings = self.session_bindings.lock();
+        if bindings
+            .get(session_id)
+            .is_some_and(|binding| binding.credential_id == credential_id)
+        {
+            bindings.remove(session_id);
+        }
+    }
+
+    /// 清理某个凭据关联的所有会话绑定。
+    pub fn unbind_sessions_for_credential(&self, credential_id: u64) {
+        self.session_bindings
+            .lock()
+            .retain(|_, binding| binding.credential_id != credential_id);
+    }
+
+    /// 记录绑定账号的一次软失败。返回 true 表示本次请求可以临时 fallback。
+    pub fn record_session_soft_failure(&self, session_id: &str, credential_id: u64) -> bool {
+        let mut bindings = self.session_bindings.lock();
+        if let Some(binding) = bindings.get_mut(session_id) {
+            if binding.credential_id == credential_id {
+                binding.last_used_at = Utc::now();
+                binding.soft_failure_count = binding.soft_failure_count.saturating_add(1);
+                return binding.soft_failure_count >= MAX_SESSION_SOFT_FAILURES;
+            }
+        }
+        false
+    }
+
+    /// 清理绑定账号的软失败计数。
+    pub fn clear_session_soft_failure(&self, session_id: &str, credential_id: u64) {
+        let mut bindings = self.session_bindings.lock();
+        if let Some(binding) = bindings.get_mut(session_id) {
+            if binding.credential_id == credential_id {
+                binding.last_used_at = Utc::now();
+                binding.soft_failure_count = 0;
+            }
+        }
+    }
+
     /// 获取 API 调用上下文
     ///
     /// 返回绑定了 id、credentials 和 token 的调用上下文
@@ -750,6 +903,19 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+        self.acquire_context_for_session(model, None, &HashSet::new())
+            .await
+    }
+
+    /// 获取 API 调用上下文，优先保持同一会话使用同一个凭据。
+    ///
+    /// `excluded_ids` 只作用于本次请求，用于 sticky-aware retry 的临时 fallback。
+    pub async fn acquire_context_for_session(
+        &self,
+        model: Option<&str>,
+        session_id: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -764,60 +930,72 @@ impl MultiTokenManager {
             }
 
             let (id, credentials) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+                let bound_hit =
+                    session_id.and_then(|sid| self.get_bound_credential(sid, model, excluded_ids));
 
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
-                    None
-                } else {
-                    let entries = self.entries.lock();
-                    let current_id = *self.current_id.lock();
-                    entries
-                        .iter()
-                        .find(|e| e.id == current_id && !e.disabled)
-                        .map(|e| (e.id, e.credentials.clone()))
-                };
-
-                if let Some(hit) = current_hit {
+                if let Some(hit) = bound_hit {
                     hit
                 } else {
-                    // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model);
+                    let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
-                    // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
-                    if best.is_none() {
-                        let mut entries = self.entries.lock();
-                        if entries.iter().any(|e| {
-                            e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
-                        }) {
-                            tracing::warn!(
-                                "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
-                            );
-                            for e in entries.iter_mut() {
-                                if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
-                                    e.disabled = false;
-                                    e.disabled_reason = None;
-                                    e.failure_count = 0;
-                                }
-                            }
-                            drop(entries);
-                            best = self.select_next_credential(model);
-                        }
-                    }
-
-                    if let Some((new_id, new_creds)) = best {
-                        // 更新 current_id
-                        let mut current_id = self.current_id.lock();
-                        *current_id = new_id;
-                        (new_id, new_creds)
+                    // balanced 模式：新会话重新均衡选择；已有会话已在 bound_hit 返回
+                    // priority 模式：优先使用 current_id 指向的凭据
+                    let current_hit = if is_balanced {
+                        None
                     } else {
                         let entries = self.entries.lock();
-                        // 注意：必须在 bail! 之前计算 available_count，
-                        // 因为 available_count() 会尝试获取 entries 锁，
-                        // 而此时我们已经持有该锁，会导致死锁
-                        let available = entries.iter().filter(|e| !e.disabled).count();
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                        let current_id = *self.current_id.lock();
+                        entries
+                            .iter()
+                            .find(|e| {
+                                e.id == current_id
+                                    && !excluded_ids.contains(&e.id)
+                                    && Self::credential_is_usable_for_model(e, model)
+                            })
+                            .map(|e| (e.id, e.credentials.clone()))
+                    };
+
+                    if let Some(hit) = current_hit {
+                        hit
+                    } else {
+                        // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
+                        let mut best = self.select_next_credential_excluding(model, excluded_ids);
+
+                        // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
+                        if best.is_none() {
+                            let mut entries = self.entries.lock();
+                            if entries.iter().any(|e| {
+                                e.disabled
+                                    && e.disabled_reason == Some(DisabledReason::TooManyFailures)
+                            }) {
+                                tracing::warn!(
+                                    "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
+                                );
+                                for e in entries.iter_mut() {
+                                    if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
+                                        e.disabled = false;
+                                        e.disabled_reason = None;
+                                        e.failure_count = 0;
+                                    }
+                                }
+                                drop(entries);
+                                best = self.select_next_credential_excluding(model, excluded_ids);
+                            }
+                        }
+
+                        if let Some((new_id, new_creds)) = best {
+                            // 更新 current_id
+                            let mut current_id = self.current_id.lock();
+                            *current_id = new_id;
+                            (new_id, new_creds)
+                        } else {
+                            let entries = self.entries.lock();
+                            // 注意：必须在 bail! 之前计算 available_count，
+                            // 因为 available_count() 会尝试获取 entries 锁，
+                            // 而此时我们已经持有该锁，会导致死锁
+                            let available = entries.iter().filter(|e| !e.disabled).count();
+                            anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                        }
                     }
                 }
             };
@@ -825,6 +1003,17 @@ impl MultiTokenManager {
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
+                    if let Some(sid) = session_id {
+                        if self.bound_credential_exists_but_unusable(sid, model) {
+                            self.unbind_session(sid);
+                        }
+                        let should_bind = self
+                            .bound_credential_id(sid)
+                            .is_none_or(|bound_id| bound_id == ctx.id);
+                        if should_bind {
+                            self.bind_session_to_credential(sid, ctx.id);
+                        }
+                    }
                     return Ok(ctx);
                 }
                 Err(e) => {
@@ -1138,6 +1327,14 @@ impl MultiTokenManager {
         self.save_stats_debounced();
     }
 
+    /// 报告指定会话在该凭据上的 API 调用成功，并清理 sticky 软失败计数。
+    pub fn report_success_for_session(&self, id: u64, session_id: Option<&str>) {
+        self.report_success(id);
+        if let Some(sid) = session_id {
+            self.clear_session_soft_failure(sid, id);
+        }
+    }
+
     /// 报告指定凭据 API 调用失败
     ///
     /// 增加失败计数，达到阈值时禁用凭据并切换到优先级最高的可用凭据
@@ -1194,6 +1391,13 @@ impl MultiTokenManager {
 
             entries.iter().any(|e| !e.disabled)
         };
+        {
+            let entries = self.entries.lock();
+            if entries.iter().any(|e| e.id == id && e.disabled) {
+                drop(entries);
+                self.unbind_sessions_for_credential(id);
+            }
+        }
         self.save_stats_debounced();
         result
     }
@@ -1244,6 +1448,7 @@ impl MultiTokenManager {
                 false
             }
         };
+        self.unbind_sessions_for_credential(id);
         self.save_stats_debounced();
         result
     }
@@ -1307,6 +1512,13 @@ impl MultiTokenManager {
                 false
             }
         };
+        {
+            let entries = self.entries.lock();
+            if entries.iter().any(|e| e.id == id && e.disabled) {
+                drop(entries);
+                self.unbind_sessions_for_credential(id);
+            }
+        }
         self.save_stats_debounced();
         result
     }
@@ -1355,6 +1567,7 @@ impl MultiTokenManager {
                 false
             }
         };
+        self.unbind_sessions_for_credential(id);
         self.save_stats_debounced();
         result
     }
@@ -1480,6 +1693,11 @@ impl MultiTokenManager {
                 entry.disabled_reason = Some(DisabledReason::Manual);
             }
         }
+        if disabled {
+            self.unbind_sessions_for_credential(id);
+        } else {
+            self.select_highest_priority();
+        }
         // 持久化更改
         self.persist_credentials()?;
         Ok(())
@@ -1521,6 +1739,7 @@ impl MultiTokenManager {
             entry.disabled = false;
             entry.disabled_reason = None;
         }
+        self.select_highest_priority();
         // 持久化更改
         self.persist_credentials()?;
         Ok(())
@@ -1810,6 +2029,7 @@ impl MultiTokenManager {
         if was_current {
             self.select_highest_priority();
         }
+        self.unbind_sessions_for_credential(id);
 
         // 如果删除后没有任何凭据，将 current_id 重置为 0（与初始化行为保持一致）
         {
@@ -2350,6 +2570,136 @@ mod tests {
         let ctx = manager.acquire_context(None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_sticks_same_session_to_same_credential_in_balanced_mode() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let excluded = HashSet::new();
+
+        let first = manager
+            .acquire_context_for_session(None, Some("session-a"), &excluded)
+            .await
+            .unwrap();
+        manager.report_success_for_session(first.id, Some("session-a"));
+
+        let second = manager
+            .acquire_context_for_session(None, Some("session-a"), &excluded)
+            .await
+            .unwrap();
+
+        assert_eq!(first.id, second.id);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_excluded_bound_session_can_fallback() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let empty = HashSet::new();
+
+        let first = manager
+            .acquire_context_for_session(None, Some("session-b"), &empty)
+            .await
+            .unwrap();
+
+        let mut excluded = HashSet::new();
+        excluded.insert(first.id);
+        let fallback = manager
+            .acquire_context_for_session(None, Some("session-b"), &excluded)
+            .await
+            .unwrap();
+
+        assert_ne!(first.id, fallback.id);
+
+        let rebound = manager
+            .acquire_context_for_session(None, Some("session-b"), &empty)
+            .await
+            .unwrap();
+        assert_eq!(first.id, rebound.id);
+    }
+
+    #[tokio::test]
+    async fn test_unbind_session_if_bound_to_does_not_clear_original_binding() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let empty = HashSet::new();
+
+        let bound = manager
+            .acquire_context_for_session(None, Some("session-c"), &empty)
+            .await
+            .unwrap();
+
+        let mut excluded = HashSet::new();
+        excluded.insert(bound.id);
+        let fallback = manager
+            .acquire_context_for_session(None, Some("session-c"), &excluded)
+            .await
+            .unwrap();
+        assert_ne!(bound.id, fallback.id);
+
+        manager.unbind_session_if_bound_to("session-c", fallback.id);
+
+        let rebound = manager
+            .acquire_context_for_session(None, Some("session-c"), &empty)
+            .await
+            .unwrap();
+        assert_eq!(bound.id, rebound.id);
+    }
+
+    #[tokio::test]
+    async fn test_current_id_respects_opus_model_filter() {
+        let mut free = KiroCredentials::default();
+        free.priority = 0;
+        free.subscription_title = Some("Free".to_string());
+        free.access_token = Some("free-token".to_string());
+        free.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let mut pro = KiroCredentials::default();
+        pro.priority = 1;
+        pro.subscription_title = Some("Pro".to_string());
+        pro.access_token = Some("pro-token".to_string());
+        pro.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![free, pro], None, None, false).unwrap();
+
+        let ctx = manager
+            .acquire_context(Some("claude-opus-4"))
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 2);
+        assert_eq!(ctx.token, "pro-token");
     }
 
     #[test]

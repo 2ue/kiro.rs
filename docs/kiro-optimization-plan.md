@@ -4,6 +4,19 @@
 
 本文档只针对当前 `kiro.rs` 项目的 Kiro 相关核心逻辑，目标是把已经分析出的优化点落实为可执行方案。范围包括账号管理、会话调度、代理、Kiro Provider 重试、AWS eventstream/SSE、非流式聚合、usage/token、Admin 管理接口和缓存。
 
+## 2026-05-15 本轮落地记录
+
+本轮优化先落地最贴近当前核心链路的问题：
+
+1. `conversationState.conversationId` 参与账号调度，新增进程内 `conversationId -> credentialId` 粘性绑定。
+2. 统一账号可用性判断，避免 priority 模式下 `current_id` 绕过 Opus/Free 过滤。
+3. Provider 对 `408/429/5xx` 做 sticky-aware 临时 fallback：优先保持绑定账号，连续软失败后仅在本次请求中排除该账号尝试其他账号。
+4. 临时 fallback 账号发生硬失败时，只清理绑定到该失败账号的会话，避免误删原账号绑定。
+5. Admin 后端对状态变更清理余额缓存，避免管理页显示旧订阅/旧用量。
+6. Admin 前端 mutation 同步清理 `credential-balance` 查询缓存，并修正批量刷新 API Key 账号被计失败的问题。
+
+本轮仍不把会话绑定持久化到文件。原因是当前项目的账号状态、统计和调度都以进程内 `MultiTokenManager` 为核心，服务重启后重新分配会话是可接受边界；如果后续需要跨重启粘性，再单独设计小型持久化索引。
+
 ## 当前核心链路
 
 当前项目的核心定位是 Anthropic API 兼容代理，而不是通用 Kiro SDK。
@@ -210,6 +223,98 @@ fn extract_conversation_id_from_request(request_body: &str) -> Option<String>
 5. 软失败先 `record_session_soft_failure`，达到阈值后将该账号加入 `excluded_ids`，进行本次临时 fallback。
 
 注意：MCP 请求当前没有明确 conversation id。除非后续能从 MCP request body 中稳定提取会话，否则 `call_mcp_with_retry` 暂不纳入 session sticky，只保留现有账号策略。
+
+## 高缓存场景模拟与验证方案
+
+这里的“高缓存”特指 Kiro `metadataEvent.tokenUsage` 返回大量 cache token 的场景，即：
+
+```json
+{
+  "tokenUsage": {
+    "uncachedInputTokens": 1200,
+    "cacheReadInputTokens": 180000,
+    "cacheWriteInputTokens": 24000,
+    "outputTokens": 900,
+    "totalTokens": 206100
+  }
+}
+```
+
+当前项目里 cache token 不由本地缓存系统产生，而是由 Kiro 上游在 `metadataEvent` 中报告。项目只负责：
+
+1. 正确解析 `cacheReadInputTokens` 和 `cacheWriteInputTokens`。
+2. 将 `input_tokens` 计算为 `uncachedInputTokens + cacheReadInputTokens`。
+3. 在 Anthropic 兼容响应中输出：
+   - `cache_read_input_tokens`
+   - `cache_creation_input_tokens`
+4. 在 `metadataEvent` 缺失时继续回退到 `contextUsageEvent` 或本地估算。
+
+### 单元测试模拟
+
+适合验证转换逻辑，不依赖真实 Kiro 账号。
+
+1. 在 `src/kiro/model/events/additional.rs` 增加大数值 metadata 反序列化测试：
+   - `uncachedInputTokens = 1200`
+   - `cacheReadInputTokens = 180000`
+   - `cacheWriteInputTokens = 24000`
+   - 断言 `input_tokens() == 181200`
+2. 在 `src/anthropic/stream.rs` 增加流式上下文测试：
+   - 构造 `Event::Metadata(MetadataEvent { token_usage: Some(...) })`
+   - 调用 `generate_final_events()`
+   - 断言 `message_delta.usage.input_tokens == 181200`
+   - 断言 `message_delta.usage.output_tokens == 900`
+3. 在 `BufferedStreamContext` 上增加测试：
+   - 处理 metadata 事件后 finish
+   - 断言 `message_start.message.usage.cache_read_input_tokens == 180000`
+   - 断言 `message_start.message.usage.cache_creation_input_tokens == 24000`
+
+### 集成测试模拟
+
+适合验证 eventstream 解码到 SSE 的完整路径。当前项目已有 AWS eventstream decoder，但没有 test-only encoder。建议添加测试辅助函数，不进入生产路径：
+
+1. 构造 AWS eventstream frame：
+   - header `:message-type = event`
+   - header `:event-type = metadataEvent`
+   - payload 为上面的 JSON
+2. 将 frame bytes 切成多个 chunk，喂给 `EventStreamDecoder`。
+3. 断言 decoder 可以解析出 `Event::Metadata`，且 cache token 字段无丢失。
+4. 再把事件送入 `StreamContext` 或 `BufferedStreamContext`，验证 SSE usage。
+
+### 本地 mock 上游模拟
+
+适合验证 provider、HTTP content-type、非流式/流式处理以及客户端观测结果。
+
+1. 启动一个本地 mock HTTP 服务，返回：
+   - `content-type: application/vnd.amazon.eventstream`
+   - body 为若干 AWS eventstream frame
+2. frame 顺序：
+   - `assistantResponseEvent`
+   - `metadataEvent`，包含高 `cacheReadInputTokens/cacheWriteInputTokens`
+   - 可选 `messageMetadataEvent`
+3. 将测试配置中的 endpoint 指向 mock 服务，或在测试中注入一个 test endpoint。
+4. 用 `/v1/messages` 和 `/cc/v1/messages` 分别请求：
+   - 普通流式：检查最终 `message_delta.usage`
+   - 缓冲流式：检查 `message_start.message.usage`
+   - 非流式：检查 JSON 响应 `usage`
+
+### 真实上游近似模拟
+
+真实 Kiro cache hit 由上游决定，本地无法强制生成。但可以用以下方式提高出现高 cache read 的概率：
+
+1. 使用同一个 Claude Code session，也就是保持 `metadata.user_id` 中的 `session_id` 不变。
+2. 使用同一个模型和同一个 Kiro 账号，避免切账号导致上游侧会话/cache 不连续。
+3. 构造较长、重复的上下文，例如连续多轮发送相同大段代码或同一个仓库摘要。
+4. 第二轮及后续请求观察日志和响应 usage：
+   - `cache_read_input_tokens` 应明显上升。
+   - `cache_creation_input_tokens` 通常在首次建立缓存或上下文变化时上升。
+5. 用本轮新增的粘性会话调度保证上述请求尽量固定在同一个账号上，否则无法稳定复现高 cache read。
+
+### 验收标准
+
+1. 高 cache read 场景下，`input_tokens` 不能只显示 uncached tokens。
+2. `cache_read_input_tokens` 和 `cache_creation_input_tokens` 不能丢失。
+3. 普通流式、缓冲流式、非流式三条路径 usage 语义一致。
+4. 同一 `conversationId` 的多轮真实请求应尽量使用同一账号，除非账号被禁用、额度用尽、刷新失败或不支持目标模型。
 
 ## P0：账号模型过滤修复
 
@@ -568,4 +673,3 @@ CC=/usr/bin/cc RUSTFLAGS='-C linker=/usr/bin/cc' cargo check --locked
 6. Admin 禁用、删除、强刷、重置后，余额缓存和 session binding 状态一致。
 7. 非流式上游异常不会返回空成功。
 8. 流式 decoder 严重错误不会继续发送正常完成事件。
-

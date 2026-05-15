@@ -253,39 +253,47 @@ export function Dashboard({ onLogout }: DashboardProps) {
       return
     }
 
-    const enabledIds = Array.from(selectedIds).filter(id => {
+    const refreshableIds = Array.from(selectedIds).filter(id => {
       const cred = data?.credentials.find(c => c.id === id)
-      return cred && !cred.disabled
+      return cred && !cred.disabled && cred.authMethod !== 'api_key'
     })
+    const skippedCount = selectedIds.size - refreshableIds.length
 
-    if (enabledIds.length === 0) {
-      toast.error('选中的凭据中没有启用的凭据')
+    if (refreshableIds.length === 0) {
+      toast.error('选中的凭据中没有可刷新 Token 的 OAuth 凭据')
       return
     }
 
     setBatchRefreshing(true)
-    setBatchRefreshProgress({ current: 0, total: enabledIds.length })
+    setBatchRefreshProgress({ current: 0, total: refreshableIds.length })
 
     let successCount = 0
     let failCount = 0
 
-    for (let i = 0; i < enabledIds.length; i++) {
+    for (let i = 0; i < refreshableIds.length; i++) {
       try {
-        await forceRefreshToken(enabledIds[i])
+        await forceRefreshToken(refreshableIds[i])
         successCount++
       } catch {
         failCount++
       }
-      setBatchRefreshProgress({ current: i + 1, total: enabledIds.length })
+      setBatchRefreshProgress({ current: i + 1, total: refreshableIds.length })
     }
 
     setBatchRefreshing(false)
     queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    queryClient.invalidateQueries({ queryKey: ['credential-balance'] })
+    setBalanceMap(prev => {
+      const next = new Map(prev)
+      refreshableIds.forEach(id => next.delete(id))
+      return next
+    })
+    const skippedText = skippedCount > 0 ? `，跳过 ${skippedCount} 个禁用或 API Key 凭据` : ''
 
     if (failCount === 0) {
-      toast.success(`成功刷新 ${successCount} 个凭据的 Token`)
+      toast.success(`成功刷新 ${successCount} 个凭据的 Token${skippedText}`)
     } else {
-      toast.warning(`刷新 Token：成功 ${successCount} 个，失败 ${failCount} 个`)
+      toast.warning(`刷新 Token：成功 ${successCount} 个，失败 ${failCount} 个${skippedText}`)
     }
 
     deselectAll()
@@ -524,7 +532,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
         <Card className="w-full max-w-md">
           <CardContent className="pt-6 text-center">
             <div className="text-red-500 mb-4">加载失败</div>
-            <p className="text-muted-foreground mb-4">{(error as Error).message}</p>
+            <p className="text-muted-foreground mb-4">{extractErrorMessage(error)}</p>
             <div className="space-x-2">
               <Button onClick={() => refetch()}>重试</Button>
               <Button variant="outline" onClick={handleLogout}>重新登录</Button>

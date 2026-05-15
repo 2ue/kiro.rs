@@ -59,6 +59,14 @@ impl AdminService {
         }
     }
 
+    fn invalidate_balance_cache(&self, id: u64) {
+        {
+            let mut cache = self.balance_cache.lock();
+            cache.remove(&id);
+        }
+        self.save_balance_cache();
+    }
+
     /// 获取所有凭据状态
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
         let snapshot = self.token_manager.snapshot();
@@ -110,6 +118,7 @@ impl AdminService {
         self.token_manager
             .set_disabled(id, disabled)
             .map_err(|e| self.classify_error(e, id))?;
+        self.invalidate_balance_cache(id);
 
         // 只有禁用的是当前凭据时才尝试切换到下一个
         if disabled && id == current_id {
@@ -122,14 +131,18 @@ impl AdminService {
     pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_priority(id, priority)
-            .map_err(|e| self.classify_error(e, id))
+            .map_err(|e| self.classify_error(e, id))?;
+        self.invalidate_balance_cache(id);
+        Ok(())
     }
 
     /// 重置失败计数并重新启用
     pub fn reset_and_enable(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager
             .reset_and_enable(id)
-            .map_err(|e| self.classify_error(e, id))
+            .map_err(|e| self.classify_error(e, id))?;
+        self.invalidate_balance_cache(id);
+        Ok(())
     }
 
     /// 获取凭据余额（带缓存）
@@ -248,6 +261,7 @@ impl AdminService {
         if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
             tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
         }
+        self.invalidate_balance_cache(credential_id);
 
         Ok(AddCredentialResponse {
             success: true,
@@ -304,7 +318,9 @@ impl AdminService {
         self.token_manager
             .force_refresh_token_for(id)
             .await
-            .map_err(|e| self.classify_balance_error(e, id))
+            .map_err(|e| self.classify_balance_error(e, id))?;
+        self.invalidate_balance_cache(id);
+        Ok(())
     }
 
     // ============ 余额缓存持久化 ============
@@ -448,7 +464,8 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
+        {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)

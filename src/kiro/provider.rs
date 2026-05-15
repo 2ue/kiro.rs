@@ -46,6 +46,44 @@ pub struct KiroProvider {
     default_endpoint: String,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::KiroProvider;
+
+    #[test]
+    fn extracts_model_and_conversation_id_from_kiro_request() {
+        let body = r#"{
+            "conversationState": {
+                "conversationId": "session-123",
+                "currentMessage": {
+                    "userInputMessage": {
+                        "modelId": "claude-opus-4"
+                    }
+                }
+            }
+        }"#;
+
+        assert_eq!(
+            KiroProvider::test_extract_conversation_id_from_request(body).as_deref(),
+            Some("session-123")
+        );
+        assert_eq!(
+            KiroProvider::test_extract_model_from_request(body).as_deref(),
+            Some("claude-opus-4")
+        );
+    }
+
+    #[test]
+    fn ignores_blank_conversation_id() {
+        let body = r#"{"conversationState":{"conversationId":"  "}}"#;
+
+        assert_eq!(
+            KiroProvider::test_extract_conversation_id_from_request(body),
+            None
+        );
+    }
+}
+
 impl KiroProvider {
     /// 创建带代理配置和端点注册表的 KiroProvider 实例
     ///
@@ -292,10 +330,20 @@ impl KiroProvider {
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
+        let conversation_id = Self::extract_conversation_id_from_request(request_body);
+        let mut excluded_ids: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let ctx = match self
+                .token_manager
+                .acquire_context_for_session(
+                    model.as_deref(),
+                    conversation_id.as_deref(),
+                    &excluded_ids,
+                )
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -310,6 +358,10 @@ impl KiroProvider {
                 Ok(e) => e,
                 Err(e) => {
                     last_error = Some(e);
+                    if let Some(session_id) = conversation_id.as_deref() {
+                        self.token_manager
+                            .unbind_session_if_bound_to(session_id, ctx.id);
+                    }
                     self.token_manager.report_failure(ctx.id);
                     continue;
                 }
@@ -345,6 +397,14 @@ impl KiroProvider {
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
                     last_error = Some(e.into());
+                    if let Some(session_id) = conversation_id.as_deref() {
+                        if self
+                            .token_manager
+                            .record_session_soft_failure(session_id, ctx.id)
+                        {
+                            excluded_ids.insert(ctx.id);
+                        }
+                    }
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -388,6 +448,14 @@ impl KiroProvider {
                             .as_deref()
                             .is_some_and(Self::is_retryable_aws_exception)
                     {
+                        if let Some(session_id) = conversation_id.as_deref() {
+                            if self
+                                .token_manager
+                                .record_session_soft_failure(session_id, ctx.id)
+                            {
+                                excluded_ids.insert(ctx.id);
+                            }
+                        }
                         last_error = Some(err);
                         sleep(Self::retry_delay(attempt)).await;
                         continue;
@@ -395,7 +463,8 @@ impl KiroProvider {
 
                     return Err(err);
                 }
-                self.token_manager.report_success(ctx.id);
+                self.token_manager
+                    .report_success_for_session(ctx.id, conversation_id.as_deref());
                 return Ok(response);
             }
 
@@ -413,6 +482,10 @@ impl KiroProvider {
                 );
 
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                if let Some(session_id) = conversation_id.as_deref() {
+                    self.token_manager
+                        .unbind_session_if_bound_to(session_id, ctx.id);
+                }
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
@@ -428,6 +501,14 @@ impl KiroProvider {
                     status,
                     body
                 ));
+                if let Some(session_id) = conversation_id.as_deref() {
+                    if self
+                        .token_manager
+                        .record_session_soft_failure(session_id, ctx.id)
+                    {
+                        excluded_ids.insert(ctx.id);
+                    }
+                }
                 continue;
             }
 
@@ -464,6 +545,12 @@ impl KiroProvider {
 
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
+                    if let Some(session_id) = conversation_id.as_deref() {
+                        self.token_manager
+                            .unbind_session_if_bound_to(session_id, ctx.id);
+                    }
+                }
+                if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
                         api_type,
@@ -497,6 +584,14 @@ impl KiroProvider {
                     status,
                     body
                 ));
+                if let Some(session_id) = conversation_id.as_deref() {
+                    if self
+                        .token_manager
+                        .record_session_soft_failure(session_id, ctx.id)
+                    {
+                        excluded_ids.insert(ctx.id);
+                    }
+                }
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -522,6 +617,14 @@ impl KiroProvider {
                 status,
                 body
             ));
+            if let Some(session_id) = conversation_id.as_deref() {
+                if self
+                    .token_manager
+                    .record_session_soft_failure(session_id, ctx.id)
+                {
+                    excluded_ids.insert(ctx.id);
+                }
+            }
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
@@ -551,6 +654,30 @@ impl KiroProvider {
             .get("modelId")?
             .as_str()
             .map(|s| s.to_string())
+    }
+
+    /// 从请求体中提取 Kiro conversationId，用于账号粘性调度。
+    fn extract_conversation_id_from_request(request_body: &str) -> Option<String> {
+        use serde_json::Value;
+
+        let json: Value = serde_json::from_str(request_body).ok()?;
+
+        json.get("conversationState")?
+            .get("conversationId")?
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_extract_model_from_request(request_body: &str) -> Option<String> {
+        Self::extract_model_from_request(request_body)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_extract_conversation_id_from_request(request_body: &str) -> Option<String> {
+        Self::extract_conversation_id_from_request(request_body)
     }
 
     fn retry_delay(attempt: usize) -> Duration {

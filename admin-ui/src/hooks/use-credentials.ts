@@ -13,6 +13,15 @@ import {
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
+function invalidateCredentialCaches(queryClient: ReturnType<typeof useQueryClient>, id?: number) {
+  queryClient.invalidateQueries({ queryKey: ['credentials'] })
+  if (typeof id === 'number') {
+    queryClient.invalidateQueries({ queryKey: ['credential-balance', id] })
+  } else {
+    queryClient.invalidateQueries({ queryKey: ['credential-balance'] })
+  }
+}
+
 // 查询凭据列表
 export function useCredentials() {
   return useQuery({
@@ -38,8 +47,8 @@ export function useSetDisabled() {
   return useMutation({
     mutationFn: ({ id, disabled }: { id: number; disabled: boolean }) =>
       setCredentialDisabled(id, disabled),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    onSuccess: (_data, variables) => {
+      invalidateCredentialCaches(queryClient, variables.id)
     },
   })
 }
@@ -50,8 +59,8 @@ export function useSetPriority() {
   return useMutation({
     mutationFn: ({ id, priority }: { id: number; priority: number }) =>
       setCredentialPriority(id, priority),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    onSuccess: (_data, variables) => {
+      invalidateCredentialCaches(queryClient, variables.id)
     },
   })
 }
@@ -61,8 +70,8 @@ export function useResetFailure() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: number) => resetCredentialFailure(id),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    onSuccess: (_data, id) => {
+      invalidateCredentialCaches(queryClient, id)
     },
   })
 }
@@ -72,8 +81,8 @@ export function useForceRefreshToken() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: number) => forceRefreshToken(id),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    onSuccess: (_data, id) => {
+      invalidateCredentialCaches(queryClient, id)
     },
   })
 }
@@ -84,7 +93,7 @@ export function useAddCredential() {
   return useMutation({
     mutationFn: (req: AddCredentialRequest) => addCredential(req),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      invalidateCredentialCaches(queryClient)
     },
   })
 }
@@ -94,8 +103,8 @@ export function useDeleteCredential() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: number) => deleteCredential(id),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    onSuccess: (_data, id) => {
+      invalidateCredentialCaches(queryClient, id)
     },
   })
 }
