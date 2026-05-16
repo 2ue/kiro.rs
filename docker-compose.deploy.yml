@@ -1,0 +1,21 @@
+services:
+  kiro-rs:
+    image: ${KIRO_RS_IMAGE:-docker.io/2ue/kiro-rs}:${KIRO_RS_VERSION:-latest}
+    container_name: kiro-rs
+    restart: unless-stopped
+    ports:
+      - "${KIRO_RS_PORT:-8990}:8990"
+    volumes:
+      - ./config:/app/config
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "nc -z 127.0.0.1 8990 || exit 1"
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

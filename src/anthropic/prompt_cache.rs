@@ -438,6 +438,10 @@ fn min_cacheable_tokens_for_model(model: &str) -> i32 {
 }
 
 fn is_anthropic_billing_header_block(value: &Value) -> bool {
+    if let Some(block) = value.get("block") {
+        return is_anthropic_billing_header_block(block);
+    }
+
     let Some(obj) = value.as_object() else {
         return false;
     };
@@ -623,5 +627,47 @@ mod tests {
         tracker.update(Some(scope_a), Some(&profile));
         let usage = tracker.compute(Some(scope_b), Some(&profile));
         assert_eq!(usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn billing_header_block_is_not_cacheable() {
+        let tracker = PromptCacheTracker::default();
+        let mut req = request(long_text());
+        req.messages[0].content = json!([
+            {
+                "type": "text",
+                "text": "x-anthropic-billing-header: cache-read=999999",
+                "cache_control": {"type": "ephemeral"}
+            }
+        ]);
+
+        assert!(
+            tracker.build_profile(&req, 4096).is_none(),
+            "synthetic billing header text must not create local cache entries"
+        );
+    }
+
+    #[test]
+    fn hour_ttl_breakdown_is_reported_separately() {
+        let tracker = PromptCacheTracker::default();
+        let mut req = request(long_text());
+        req.messages[0].content = json!([
+            {
+                "type": "text",
+                "text": long_text(),
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }
+        ]);
+        let profile = tracker.build_profile(&req, 4096).unwrap();
+        let scope = PromptCacheScope {
+            credential_id: 1,
+            conversation_id: "ttl-session".to_string(),
+            model: req.model.clone(),
+        };
+
+        let usage = tracker.compute(Some(scope), Some(&profile));
+        assert!(usage.cache_creation_input_tokens > 0);
+        assert_eq!(usage.cache_creation_5m_input_tokens, 0);
+        assert!(usage.cache_creation_1h_input_tokens > 0);
     }
 }

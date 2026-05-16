@@ -16,11 +16,13 @@ COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
 COPY --from=frontend-builder /app/admin-ui/dist /app/admin-ui/dist
 
+ENV CARGO_PROFILE_RELEASE_LTO=false \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
 RUN cargo build --release --no-default-features
 
 FROM alpine:3.21
 
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache busybox-extras ca-certificates
 
 WORKDIR /app
 COPY --from=builder /app/target/release/kiro-rs /app/kiro-rs

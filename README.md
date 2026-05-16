@@ -152,6 +152,20 @@ docker-compose up
 
 需要将 `config.json` 和 `credentials.json` 挂载到容器中，具体参见 `docker-compose.yml`。
 
+使用已发布镜像部署：
+
+```bash
+docker compose -f docker-compose.deploy.yml up -d
+```
+
+部署版默认使用 `docker.io/2ue/kiro-rs:latest`，可通过环境变量固定版本：
+
+```bash
+KIRO_RS_VERSION=0.0.3 docker compose -f docker-compose.deploy.yml up -d
+```
+
+容器端口固定为 `8990`，请确保挂载的 `config/config.json` 中 `host` 配置为 `0.0.0.0`，否则宿主机端口映射后可能无法访问服务。
+
 ## 配置详解
 
 ### config.json

@@ -436,10 +436,15 @@ fn top_aggregates(map: HashMap<String, UsageAggregate>) -> Vec<UsageAggregate> {
 mod tests {
     use super::*;
 
-    fn record(id: &str, cache_read: i32, source: UsageSource) -> UsageRecord {
+    fn record_with_time(
+        id: &str,
+        cache_read: i32,
+        source: UsageSource,
+        created_at: String,
+    ) -> UsageRecord {
         UsageRecord {
             id: id.to_string(),
-            created_at: Utc::now().to_rfc3339(),
+            created_at,
             endpoint: "/v1/messages".to_string(),
             stream: true,
             model: "claude-sonnet-4-5".to_string(),
@@ -463,6 +468,10 @@ mod tests {
             error_type: None,
             error_message: None,
         }
+    }
+
+    fn record(id: &str, cache_read: i32, source: UsageSource) -> UsageRecord {
+        record_with_time(id, cache_read, source, Utc::now().to_rfc3339())
     }
 
     #[test]
@@ -499,5 +508,64 @@ mod tests {
         assert_eq!(summary.simulated_requests, 1);
         assert_eq!(summary.upstream_metadata_requests, 1);
         assert_eq!(summary.top_credentials[0].key, "1");
+    }
+
+    #[test]
+    fn recorder_persists_recent_records_and_clear_truncates_file() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro-rs-usage-test-{}.jsonl",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+
+        let recorder = UsageRecorder::new(2, Some(path.clone()));
+        recorder.record(record("1", 10, UsageSource::UpstreamMetadata));
+        recorder.record(record("2", 20, UsageSource::LocalPromptCache));
+        recorder.record(record("3", 30, UsageSource::ForcedHighCache));
+
+        let reloaded = UsageRecorder::new(2, Some(path.clone()));
+        let result = reloaded.query(UsageRecordQuery::default());
+        assert_eq!(result.total, 2);
+        assert_eq!(result.records[0].id, "3");
+        assert_eq!(result.records[1].id, "2");
+
+        reloaded.clear();
+        let cleared = UsageRecorder::new(2, Some(path.clone()));
+        assert_eq!(cleared.query(UsageRecordQuery::default()).total, 0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recorder_filters_by_time_window_and_invalid_times_do_not_match() {
+        let recorder = UsageRecorder::new(10, None);
+        recorder.record(record_with_time(
+            "old",
+            10,
+            UsageSource::UpstreamMetadata,
+            "2026-01-01T00:00:00Z".to_string(),
+        ));
+        recorder.record(record_with_time(
+            "new",
+            20,
+            UsageSource::LocalPromptCache,
+            "2026-01-02T00:00:00Z".to_string(),
+        ));
+        recorder.record(record_with_time(
+            "bad-time",
+            30,
+            UsageSource::ForcedHighCache,
+            "not-a-time".to_string(),
+        ));
+
+        let since = DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let filtered = recorder.query(UsageRecordQuery {
+            since: Some(since),
+            ..Default::default()
+        });
+
+        assert_eq!(filtered.total, 1);
+        assert_eq!(filtered.records[0].id, "new");
     }
 }

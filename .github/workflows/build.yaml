@@ -51,4 +51,4 @@ jobs:
           cache-on-failure: true
 
       - name: Run Rust tests
-        run: cargo test --locked
+        run: cargo test --locked --no-default-features

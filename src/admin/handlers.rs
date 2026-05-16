@@ -219,3 +219,86 @@ pub async fn clear_usage_records(State(state): State<AdminState>) -> impl IntoRe
     state.service.clear_usage_records();
     Json(SuccessResponse::new("Usage 记录已清空"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_records_query_ignores_blank_text_filters() {
+        let query = UsageRecordsQueryParams {
+            limit: Some(25),
+            conversation_id: Some("   ".to_string()),
+            credential_id: Some(7),
+            model: Some("".to_string()),
+            status: Some("success".to_string()),
+            source: Some("local_prompt_cache".to_string()),
+            stream: Some(true),
+            min_cache_read: Some(10_000),
+            since: None,
+            until: None,
+        }
+        .into_query()
+        .expect("valid query");
+
+        assert_eq!(query.limit, 25);
+        assert_eq!(query.conversation_id, None);
+        assert_eq!(query.credential_id, Some(7));
+        assert_eq!(query.model, None);
+        assert_eq!(query.status, Some(UsageRecordStatus::Success));
+        assert_eq!(query.source, Some(UsageSource::LocalPromptCache));
+        assert_eq!(query.stream, Some(true));
+        assert_eq!(query.min_cache_read, Some(10_000));
+    }
+
+    #[test]
+    fn usage_records_query_rejects_invalid_enums_and_time() {
+        let bad_status = UsageRecordsQueryParams {
+            limit: None,
+            conversation_id: None,
+            credential_id: None,
+            model: None,
+            status: Some("ok".to_string()),
+            source: None,
+            stream: None,
+            min_cache_read: None,
+            since: None,
+            until: None,
+        }
+        .into_query()
+        .unwrap_err();
+        assert!(bad_status.contains("无效 status"));
+
+        let bad_source = UsageRecordsQueryParams {
+            limit: None,
+            conversation_id: None,
+            credential_id: None,
+            model: None,
+            status: None,
+            source: Some("cache".to_string()),
+            stream: None,
+            min_cache_read: None,
+            since: None,
+            until: None,
+        }
+        .into_query()
+        .unwrap_err();
+        assert!(bad_source.contains("无效 source"));
+
+        let bad_time = UsageRecordsQueryParams {
+            limit: None,
+            conversation_id: None,
+            credential_id: None,
+            model: None,
+            status: None,
+            source: None,
+            stream: None,
+            min_cache_read: None,
+            since: Some("not-a-time".to_string()),
+            until: None,
+        }
+        .into_query()
+        .unwrap_err();
+        assert!(bad_time.contains("无效时间"));
+    }
+}
