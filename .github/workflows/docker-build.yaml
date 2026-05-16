@@ -102,7 +102,9 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
           provenance: false
-          outputs: type=image,name="${{ steps.images.outputs.ghcr_image }},${{ steps.images.outputs.dockerhub_image }}",push-by-digest=true,name-canonical=true,push=true
+          outputs: |
+            type=image,name=${{ steps.images.outputs.ghcr_image }},push-by-digest=true,name-canonical=true,push=true
+            type=image,name=${{ steps.images.outputs.dockerhub_image }},push-by-digest=true,name-canonical=true,push=true
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=Kiro.rs Docker Image
