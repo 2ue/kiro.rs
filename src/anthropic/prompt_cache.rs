@@ -14,6 +14,7 @@ const DEFAULT_PROMPT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const HOUR_PROMPT_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_MIN_CACHEABLE_TOKENS: i32 = 1024;
 const OPUS_MIN_CACHEABLE_TOKENS: i32 = 4096;
+const TARGET_READ_RATIO_SPREAD: f64 = 0.03;
 
 #[derive(Debug, Clone, Eq)]
 pub struct PromptCacheScope {
@@ -64,12 +65,13 @@ pub struct PromptCacheProfile {
     model: String,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PromptCacheUsage {
     pub cache_creation_input_tokens: i32,
     pub cache_read_input_tokens: i32,
     pub cache_creation_5m_input_tokens: i32,
     pub cache_creation_1h_input_tokens: i32,
+    pub effective_cache_ratio: Option<f64>,
 }
 
 #[derive(Debug, Default)]
@@ -151,8 +153,9 @@ impl PromptCacheTracker {
         }
 
         let min_tokens = min_cacheable_tokens_for_model(&profile.model);
+        let effective_ratio = effective_cache_read_ratio(profile, target_read_ratio);
         let target_tokens =
-            target_cache_tokens(profile.total_input_tokens, target_read_ratio, min_tokens);
+            target_cache_tokens(profile.total_input_tokens, effective_ratio, min_tokens);
         if target_tokens <= 0 {
             return PromptCacheUsage::default();
         }
@@ -168,6 +171,7 @@ impl PromptCacheTracker {
                 cache_read_input_tokens: 0,
                 cache_creation_5m_input_tokens: cache5m,
                 cache_creation_1h_input_tokens: cache1h,
+                effective_cache_ratio: Some(effective_ratio),
             };
         };
 
@@ -194,6 +198,7 @@ impl PromptCacheTracker {
             cache_read_input_tokens: matched_tokens,
             cache_creation_5m_input_tokens: cache5m,
             cache_creation_1h_input_tokens: cache1h,
+            effective_cache_ratio: Some(effective_ratio),
         }
     }
 
@@ -214,8 +219,9 @@ impl PromptCacheTracker {
         }
 
         let min_tokens = min_cacheable_tokens_for_model(&profile.model);
+        let effective_ratio = effective_cache_read_ratio(profile, target_read_ratio);
         let target_tokens =
-            target_cache_tokens(profile.total_input_tokens, target_read_ratio, min_tokens);
+            target_cache_tokens(profile.total_input_tokens, effective_ratio, min_tokens);
         if target_tokens <= 0 {
             return;
         }
@@ -304,12 +310,17 @@ fn flatten_cache_blocks(req: &MessagesRequest) -> Vec<CacheBlock> {
 }
 
 fn append_tool_block(blocks: &mut Vec<CacheBlock>, tool: &Tool) {
-    let value = serde_json::json!({
+    let mut value = serde_json::json!({
         "kind": "tool",
+        "type": tool.tool_type,
         "name": tool.name,
         "description": tool.description,
         "input_schema": tool.input_schema,
+        "max_uses": tool.max_uses,
     });
+    if let Some(cache_control) = &tool.cache_control {
+        value["cache_control"] = cache_control.clone();
+    }
     append_cache_block(blocks, value, false);
 }
 
@@ -440,6 +451,32 @@ fn target_cache_tokens(total_input_tokens: i32, target_read_ratio: f64, min_toke
     }
 }
 
+fn effective_cache_read_ratio(profile: &PromptCacheProfile, target_read_ratio: f64) -> f64 {
+    let target = target_read_ratio.clamp(0.0, 0.99);
+    if target <= 0.0 {
+        return 0.0;
+    }
+
+    let low = (target - TARGET_READ_RATIO_SPREAD).max(0.0);
+    let high = (target + TARGET_READ_RATIO_SPREAD).min(0.99);
+    if high <= low {
+        return low;
+    }
+
+    low + deterministic_ratio_unit(profile) * (high - low)
+}
+
+fn deterministic_ratio_unit(profile: &PromptCacheProfile) -> f64 {
+    let Some(point) = profile.lookup_points.last() else {
+        return 0.5;
+    };
+
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&point.fingerprint[..8]);
+    let raw = u64::from_be_bytes(bytes);
+    raw as f64 / u64::MAX as f64
+}
+
 fn target_ttl_breakdown(profile: &PromptCacheProfile, creation: i32) -> (i32, i32) {
     if creation <= 0 {
         return (0, 0);
@@ -560,6 +597,7 @@ fn write_hash_chunk(hasher: &mut Sha256, chunk: &str) {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use std::collections::HashMap;
 
     use super::*;
     use crate::anthropic::types::Metadata;
@@ -637,6 +675,36 @@ mod tests {
 
         let profile = tracker.build_profile(&req, 4096);
         assert!(profile.is_some());
+    }
+
+    #[test]
+    fn tool_cache_control_creates_profile_and_second_request_reads() {
+        let tracker = PromptCacheTracker::default();
+        let mut req = request("short system".to_string());
+        req.tools = Some(vec![Tool {
+            tool_type: None,
+            name: "Read".to_string(),
+            description: long_text(),
+            input_schema: HashMap::new(),
+            max_uses: None,
+            cache_control: Some(json!({"type": "ephemeral"})),
+        }]);
+        let profile = tracker
+            .build_profile(&req, 4096)
+            .expect("tool cache_control should create a cache profile");
+        let scope = PromptCacheScope {
+            credential_id: 1,
+            conversation_id: "tool-cache-session".to_string(),
+            model: req.model.clone(),
+        };
+
+        let first = tracker.compute(Some(scope.clone()), Some(&profile), 0.85);
+        assert!(first.cache_creation_input_tokens > 0);
+        assert_eq!(first.cache_read_input_tokens, 0);
+
+        tracker.update(Some(scope.clone()), Some(&profile), 0.85);
+        let second = tracker.compute(Some(scope), Some(&profile), 0.85);
+        assert!(second.cache_read_input_tokens > 0);
     }
 
     #[test]
@@ -796,5 +864,32 @@ mod tests {
             "local prompt cache must not invent reads across credentials"
         );
         assert!(isolated.cache_creation_input_tokens > 0);
+    }
+
+    #[test]
+    fn target_read_ratio_is_a_bounded_effective_range_not_an_exact_percent() {
+        let tracker = PromptCacheTracker::default();
+        let mut req = request("cacheable bounded ratio block ".repeat(4000));
+        req.messages[0].content = json!([
+            {
+                "type": "text",
+                "text": "cacheable bounded ratio block ".repeat(4000),
+                "cache_control": {"type": "ephemeral"}
+            }
+        ]);
+        let profile = tracker.build_profile(&req, 120_000).unwrap();
+
+        let ratio = effective_cache_read_ratio(&profile, 0.95);
+
+        assert!(
+            (0.92..=0.98).contains(&ratio),
+            "ratio={} should stay within 95% +/- 3%",
+            ratio
+        );
+        assert!(
+            (ratio - 0.95).abs() > 0.0001,
+            "ratio={} should not be pinned to exactly 95%",
+            ratio
+        );
     }
 }

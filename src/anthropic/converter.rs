@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -96,33 +97,40 @@ Complete all chunked operations without commentary.";
 /// 严格对照版本号
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
+    let model_base = model_lower.strip_suffix("[1m]").unwrap_or(&model_lower);
 
-    if model_lower.contains("sonnet") {
-        if model_lower.contains("4-6") || model_lower.contains("4.6") {
+    if matches!(model_base, "opus" | "opusplan" | "best" | "default") {
+        Some("claude-opus-4.7".to_string())
+    } else if model_base == "sonnet" {
+        Some("claude-sonnet-4.6".to_string())
+    } else if model_base == "haiku" {
+        Some("claude-haiku-4.5".to_string())
+    } else if model_base.contains("sonnet") {
+        if model_base.contains("4-6") || model_base.contains("4.6") {
             Some("claude-sonnet-4.6".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
+        } else if model_base.contains("4-5") || model_base.contains("4.5") {
             Some("claude-sonnet-4.5".to_string())
-        } else if model_lower.contains("4")
-            || model_lower.contains("3-5")
-            || model_lower.contains("3.5")
+        } else if model_base.contains("4")
+            || model_base.contains("3-5")
+            || model_base.contains("3.5")
         {
             Some("claude-sonnet-4.5".to_string())
         } else {
             None
         }
-    } else if model_lower.contains("opus") {
-        if model_lower.contains("4-5") || model_lower.contains("4.5") {
+    } else if model_base.contains("opus") {
+        if model_base.contains("4-5") || model_base.contains("4.5") {
             Some("claude-opus-4.5".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
+        } else if model_base.contains("4-6") || model_base.contains("4.6") {
             Some("claude-opus-4.6".to_string())
-        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
+        } else if model_base.contains("4-7") || model_base.contains("4.7") {
             Some("claude-opus-4.7".to_string())
-        } else if model_lower.contains("4") {
-            Some("claude-opus-4.6".to_string())
+        } else if model_base.contains("4") {
+            Some("claude-opus-4.7".to_string())
         } else {
             None
         }
-    } else if model_lower.contains("haiku") {
+    } else if model_base.contains("haiku") {
         Some("claude-haiku-4.5".to_string())
     } else {
         None
@@ -161,6 +169,7 @@ pub struct ConversionResult {
 pub enum ConversionError {
     UnsupportedModel(String),
     EmptyMessages,
+    UnsupportedContent(String),
 }
 
 impl std::fmt::Display for ConversionError {
@@ -168,6 +177,7 @@ impl std::fmt::Display for ConversionError {
         match self {
             ConversionError::UnsupportedModel(model) => write!(f, "模型不支持: {}", model),
             ConversionError::EmptyMessages => write!(f, "消息列表为空"),
+            ConversionError::UnsupportedContent(message) => write!(f, "内容块不支持: {}", message),
         }
     }
 }
@@ -342,7 +352,6 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     if !images.is_empty() {
         user_input = user_input.with_images(images);
     }
-
     let current_message = CurrentMessage::new(user_input);
 
     // 13. 构建 ConversationState
@@ -391,10 +400,22 @@ fn process_message_content(
                             }
                         }
                         "image" => {
-                            if let Some(source) = block.source {
-                                if let Some(format) = get_image_format(&source.media_type) {
-                                    images.push(KiroImage::from_base64(format, source.data));
-                                }
+                            let source = block.source.ok_or_else(|| {
+                                ConversionError::UnsupportedContent(
+                                    "image block missing source".to_string(),
+                                )
+                            })?;
+                            images.push(convert_image_source(source)?);
+                        }
+                        "document" => {
+                            let source = block.source.ok_or_else(|| {
+                                ConversionError::UnsupportedContent(
+                                    "document block missing source".to_string(),
+                                )
+                            })?;
+                            let document_text = convert_document_source_to_text(source)?;
+                            if !document_text.is_empty() {
+                                text_parts.push(document_text);
                             }
                         }
                         "tool_result" => {
@@ -416,6 +437,11 @@ fn process_message_content(
                         "tool_use" => {
                             // tool_use 在 assistant 消息中处理，这里忽略
                         }
+                        "redacted_thinking" => {
+                            tracing::debug!(
+                                "用户消息中的 redacted_thinking 无法传递给当前 Kiro upstream，已跳过"
+                            );
+                        }
                         _ => {}
                     }
                 }
@@ -427,6 +453,216 @@ fn process_message_content(
     Ok((text_parts.join("\n"), images, tool_results))
 }
 
+fn convert_image_source(source: super::types::ImageSource) -> Result<KiroImage, ConversionError> {
+    match source.source_type.as_str() {
+        "base64" => {
+            let media_type = source.media_type.ok_or_else(|| {
+                ConversionError::UnsupportedContent(
+                    "base64 image source missing media_type".to_string(),
+                )
+            })?;
+            let data = source.data.ok_or_else(|| {
+                ConversionError::UnsupportedContent("base64 image source missing data".to_string())
+            })?;
+            let format = get_image_format(&media_type).ok_or_else(|| {
+                ConversionError::UnsupportedContent(format!(
+                    "unsupported image media_type: {}",
+                    media_type
+                ))
+            })?;
+            Ok(KiroImage::from_base64(format, data))
+        }
+        "url" => {
+            let url = source.url.ok_or_else(|| {
+                ConversionError::UnsupportedContent("image URL source missing url".to_string())
+            })?;
+            if let Some((media_type, data)) = parse_data_url(&url) {
+                let format = get_image_format(&media_type).ok_or_else(|| {
+                    ConversionError::UnsupportedContent(format!(
+                        "unsupported image media_type: {}",
+                        media_type
+                    ))
+                })?;
+                Ok(KiroImage::from_base64(format, data))
+            } else {
+                Err(ConversionError::UnsupportedContent(
+                    "remote image URL source was not materialized before conversion".to_string(),
+                ))
+            }
+        }
+        "file" => Err(ConversionError::UnsupportedContent(
+            "image file source requires an Anthropic Files API adapter, which is not implemented"
+                .to_string(),
+        )),
+        other => Err(ConversionError::UnsupportedContent(format!(
+            "unsupported image source type: {}",
+            other
+        ))),
+    }
+}
+
+fn convert_document_source_to_text(
+    source: super::types::ImageSource,
+) -> Result<String, ConversionError> {
+    match source.source_type.as_str() {
+        "text" => {
+            let media_type = source.media_type.unwrap_or_else(|| "text/plain".to_string());
+            let data = source.data.ok_or_else(|| {
+                ConversionError::UnsupportedContent("text document source missing data".to_string())
+            })?;
+            Ok(format_document_text(&media_type, data))
+        }
+        "base64" => {
+            let media_type = source.media_type.ok_or_else(|| {
+                ConversionError::UnsupportedContent(
+                    "base64 document source missing media_type".to_string(),
+                )
+            })?;
+            let data = source.data.ok_or_else(|| {
+                ConversionError::UnsupportedContent(
+                    "base64 document source missing data".to_string(),
+                )
+            })?;
+            decode_document_to_text(&media_type, &data)
+        }
+        "url" => {
+            let url = source.url.ok_or_else(|| {
+                ConversionError::UnsupportedContent("document URL source missing url".to_string())
+            })?;
+            if let Some((media_type, data)) = parse_data_url(&url) {
+                decode_document_to_text(&media_type, &data)
+            } else {
+                Err(ConversionError::UnsupportedContent(
+                    "remote document URL source was not materialized before conversion"
+                        .to_string(),
+                ))
+            }
+        }
+        "file" => {
+            Err(ConversionError::UnsupportedContent(
+                "document file source requires an Anthropic Files API adapter, which is not implemented"
+                    .to_string(),
+            ))
+        }
+        other => Err(ConversionError::UnsupportedContent(format!(
+            "unsupported document source type: {}",
+            other
+        ))),
+    }
+}
+
+fn decode_document_to_text(media_type: &str, data: &str) -> Result<String, ConversionError> {
+    let bytes = BASE64_STANDARD.decode(data).map_err(|_| {
+        ConversionError::UnsupportedContent(format!(
+            "base64 document source contains invalid data for {}",
+            media_type
+        ))
+    })?;
+
+    let text = match media_type {
+        "text/plain" | "text/markdown" | "text/html" | "text/csv" | "application/json" => {
+            String::from_utf8(bytes).map_err(|_| {
+                ConversionError::UnsupportedContent(format!(
+                    "document media_type {} is not valid UTF-8 text",
+                    media_type
+                ))
+            })?
+        }
+        "application/pdf" => extract_text_from_pdf_bytes(&bytes).ok_or_else(|| {
+            ConversionError::UnsupportedContent(
+                "PDF document text could not be extracted for the current Kiro upstream"
+                    .to_string(),
+            )
+        })?,
+        _ => {
+            return Err(ConversionError::UnsupportedContent(format!(
+                "unsupported document media_type: {}",
+                media_type
+            )));
+        }
+    };
+
+    Ok(format_document_text(media_type, text))
+}
+
+fn format_document_text(media_type: &str, text: String) -> String {
+    format!(
+        "<document media_type=\"{}\">\n{}\n</document>",
+        media_type, text
+    )
+}
+
+fn extract_text_from_pdf_bytes(bytes: &[u8]) -> Option<String> {
+    let raw = String::from_utf8_lossy(bytes);
+    if !raw.contains("%PDF") {
+        return None;
+    }
+
+    let chars: Vec<char> = raw.chars().collect();
+    let mut pieces = Vec::new();
+    let mut idx = 0;
+
+    while idx < chars.len() {
+        if chars[idx] != '(' {
+            idx += 1;
+            continue;
+        }
+
+        let start = idx + 1;
+        idx = start;
+        let mut escaped = false;
+        let mut piece = String::new();
+        while idx < chars.len() {
+            let ch = chars[idx];
+            if escaped {
+                piece.push(match ch {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    'b' => '\u{0008}',
+                    'f' => '\u{000c}',
+                    '(' | ')' | '\\' => ch,
+                    other => other,
+                });
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == ')' {
+                break;
+            } else {
+                piece.push(ch);
+            }
+            idx += 1;
+        }
+
+        if idx >= chars.len() {
+            break;
+        }
+
+        let tail: String = chars.iter().skip(idx + 1).take(80).collect::<String>();
+        if tail.contains("Tj") || tail.contains("TJ") || tail.contains('\'') || tail.contains('"') {
+            let trimmed = piece.trim();
+            if !trimmed.is_empty() {
+                pieces.push(trimmed.to_string());
+            }
+        }
+
+        idx += 1;
+    }
+
+    if pieces.is_empty() {
+        None
+    } else {
+        Some(pieces.join("\n"))
+    }
+}
+
+fn parse_data_url(url: &str) -> Option<(String, String)> {
+    let data_part = url.strip_prefix("data:")?;
+    let (media_type, data) = data_part.split_once(";base64,")?;
+    Some((media_type.to_string(), data.to_string()))
+}
+
 /// 从 media_type 获取图片格式
 fn get_image_format(media_type: &str) -> Option<String> {
     match media_type {
@@ -435,6 +671,36 @@ fn get_image_format(media_type: &str) -> Option<String> {
         "image/gif" => Some("gif".to_string()),
         "image/webp" => Some("webp".to_string()),
         _ => None,
+    }
+}
+
+pub(crate) fn infer_image_format_from_url(url: &str) -> Option<String> {
+    let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+    if path.ends_with(".jpg") || path.ends_with(".jpeg") {
+        Some("jpeg".to_string())
+    } else if path.ends_with(".png") {
+        Some("png".to_string())
+    } else if path.ends_with(".gif") {
+        Some("gif".to_string())
+    } else if path.ends_with(".webp") {
+        Some("webp".to_string())
+    } else {
+        None
+    }
+}
+
+pub(crate) fn infer_document_media_type_from_url(url: &str) -> String {
+    let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+    if path.ends_with(".pdf") {
+        "application/pdf".to_string()
+    } else if path.ends_with(".md") {
+        "text/markdown".to_string()
+    } else if path.ends_with(".html") || path.ends_with(".htm") {
+        "text/html".to_string()
+    } else if path.ends_with(".txt") {
+        "text/plain".to_string()
+    } else {
+        "application/octet-stream".to_string()
     }
 }
 
@@ -810,7 +1076,6 @@ fn merge_user_messages(
     if !all_images.is_empty() {
         user_msg = user_msg.with_images(all_images);
     }
-
     if !all_tool_results.is_empty() {
         let mut ctx = UserInputMessageContext::new();
         ctx = ctx.with_tool_results(all_tool_results);
@@ -840,8 +1105,20 @@ fn convert_assistant_message(
                 if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
                     match block.block_type.as_str() {
                         "thinking" => {
+                            if block.signature.as_deref().is_some_and(|s| !s.is_empty()) {
+                                tracing::debug!(
+                                    "当前 Kiro history 模型不支持 Anthropic thinking signature；仅透传 thinking 文本"
+                                );
+                            }
                             if let Some(thinking) = block.thinking {
                                 thinking_content.push_str(&thinking);
+                            }
+                        }
+                        "redacted_thinking" => {
+                            if block.data.as_deref().is_some_and(|s| !s.is_empty()) {
+                                tracing::debug!(
+                                    "当前 Kiro history 模型不支持 redacted_thinking；已跳过该历史块"
+                                );
                             }
                         }
                         "text" => {
@@ -972,6 +1249,118 @@ mod tests {
     #[test]
     fn test_map_model_unsupported() {
         assert!(map_model("gpt-4").is_none());
+    }
+
+    #[test]
+    fn test_map_model_claude_code_aliases() {
+        assert_eq!(map_model("opus"), Some("claude-opus-4.7".to_string()));
+        assert_eq!(map_model("opusplan"), Some("claude-opus-4.7".to_string()));
+        assert_eq!(map_model("best"), Some("claude-opus-4.7".to_string()));
+        assert_eq!(map_model("default"), Some("claude-opus-4.7".to_string()));
+        assert_eq!(map_model("sonnet"), Some("claude-sonnet-4.6".to_string()));
+        assert_eq!(
+            map_model("claude-opus-4-7[1m]"),
+            Some("claude-opus-4.7".to_string())
+        );
+    }
+
+    #[test]
+    fn test_content_block_preserves_thinking_signature_and_redacted_data() {
+        let thinking: ContentBlock = serde_json::from_value(serde_json::json!({
+            "type": "thinking",
+            "thinking": "reasoning",
+            "signature": "sig"
+        }))
+        .unwrap();
+        assert_eq!(thinking.thinking.as_deref(), Some("reasoning"));
+        assert_eq!(thinking.signature.as_deref(), Some("sig"));
+
+        let redacted: ContentBlock = serde_json::from_value(serde_json::json!({
+            "type": "redacted_thinking",
+            "data": "opaque"
+        }))
+        .unwrap();
+        assert_eq!(redacted.data.as_deref(), Some("opaque"));
+    }
+
+    #[test]
+    fn test_process_message_content_accepts_base64_image_source() {
+        let content = serde_json::json!([
+            {"type": "text", "text": "describe"},
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "aW1hZ2U="
+                }
+            }
+        ]);
+
+        let (text, images, tool_results) = process_message_content(&content).unwrap();
+        assert_eq!(text, "describe");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, "png");
+        assert_eq!(images[0].source.bytes.as_deref(), Some("aW1hZ2U="));
+        assert!(tool_results.is_empty());
+    }
+
+    #[test]
+    fn test_process_message_content_accepts_image_data_url_source() {
+        let content = serde_json::json!([
+            {
+                "type": "image",
+                "source": {
+                    "type": "url",
+                    "url": "data:image/png;base64,aW1hZ2U="
+                }
+            }
+        ]);
+
+        let (_, images, _) = process_message_content(&content).unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, "png");
+        assert_eq!(images[0].source.bytes.as_deref(), Some("aW1hZ2U="));
+    }
+
+    #[test]
+    fn test_process_message_content_extracts_text_document_block() {
+        let content = serde_json::json!([
+            {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "text/plain",
+                    "data": "a2lyby1kb2MtdGVzdA=="
+                }
+            }
+        ]);
+
+        let (text, images, _) = process_message_content(&content).unwrap();
+        assert!(images.is_empty());
+        assert!(text.contains("kiro-doc-test"));
+        assert!(text.contains("media_type=\"text/plain\""));
+    }
+
+    #[test]
+    fn test_process_message_content_extracts_simple_pdf_text() {
+        let pdf = b"%PDF-1.1\nBT /F1 12 Tf 20 100 Td (kiro-pdf-test) Tj ET\n%%EOF";
+        let data = BASE64_STANDARD.encode(pdf);
+        let content = serde_json::json!([
+            {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": data
+                }
+            }
+        ]);
+
+        let (text, images, _) = process_message_content(&content).unwrap();
+        assert!(images.is_empty());
+        assert!(text.contains("kiro-pdf-test"));
+        assert!(text.contains("media_type=\"application/pdf\""));
     }
 
     #[test]
@@ -1130,6 +1519,7 @@ mod tests {
                 input_schema: schema,
                 tool_type: None,
                 max_uses: None,
+                cache_control: None,
             }]),
             thinking: None,
             tool_choice: None,
@@ -1198,6 +1588,7 @@ mod tests {
                 input_schema: schema,
                 tool_type: None,
                 max_uses: None,
+                cache_control: None,
             }]),
             thinking: None,
             tool_choice: None,

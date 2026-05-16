@@ -118,10 +118,11 @@ pub struct Config {
     #[serde(default = "default_prompt_cache_simulation_mode")]
     pub prompt_cache_simulation_mode: PromptCacheSimulationMode,
 
-    /// 本地 prompt-cache 模拟的目标 cache read 比例。
+    /// 本地 prompt-cache 模拟的目标 cache read 中心比例。
     ///
     /// 仅对 local-prompt-cache 生效；读取仍必须命中同一凭据、会话、模型下
-    /// 已创建过的缓存前缀，不会凭空制造 cache read。
+    /// 已创建过的缓存前缀，不会凭空制造 cache read。实际比例会围绕该值
+    /// 做小范围确定性浮动，避免每次都精确落在同一个百分比。
     #[serde(default = "default_prompt_cache_target_read_ratio")]
     pub prompt_cache_target_read_ratio: f64,
 

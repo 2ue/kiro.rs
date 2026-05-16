@@ -188,7 +188,7 @@ impl KiroImage {
     pub fn from_base64(format: impl Into<String>, data: impl Into<String>) -> Self {
         Self {
             format: format.into(),
-            source: KiroImageSource { bytes: data.into() },
+            source: KiroImageSource::from_bytes(data),
         }
     }
 }
@@ -197,7 +197,16 @@ impl KiroImage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KiroImageSource {
     /// base64 编码的图片数据
-    pub bytes: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<String>,
+}
+
+impl KiroImageSource {
+    pub fn from_bytes(data: impl Into<String>) -> Self {
+        Self {
+            bytes: Some(data.into()),
+        }
+    }
 }
 
 /// 历史消息
@@ -370,5 +379,15 @@ mod tests {
         assert!(json.contains("\"conversationId\":\"conv-123\""));
         assert!(json.contains("\"agentTaskType\":\"vibe\""));
         assert!(json.contains("\"content\":\"Hello\""));
+    }
+
+    #[test]
+    fn test_image_source_serialize() {
+        let msg = UserInputMessage::new("Analyze attachments", "claude-opus-4.7")
+            .with_images(vec![KiroImage::from_base64("png", "aW1hZ2U=")]);
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"images\""));
+        assert!(json.contains("\"bytes\":\"aW1hZ2U=\""));
     }
 }

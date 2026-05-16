@@ -557,6 +557,10 @@ pub struct StreamContext {
     native_reasoning_seen: bool,
     /// 原生 reasoning 累计内容，用于从快照计算 delta
     native_reasoning_content: String,
+    /// 原生 reasoning 签名，按 Anthropic SSE 规范在 thinking block stop 前发送 signature_delta。
+    native_reasoning_signature: Option<String>,
+    /// 原生 reasoning 签名是否已通过 signature_delta 发送。
+    native_reasoning_signature_sent: bool,
     /// 上游流内错误，最终以 SSE error 事件暴露
     stream_error: Option<(String, String)>,
     /// 无 metadata 时使用的本地 prompt-cache usage 模拟结果
@@ -603,6 +607,8 @@ impl StreamContext {
             strip_thinking_leading_newline: false,
             native_reasoning_seen: false,
             native_reasoning_content: String::new(),
+            native_reasoning_signature: None,
+            native_reasoning_signature_sent: false,
             stream_error: None,
             simulated_usage,
             final_usage: None,
@@ -825,6 +831,11 @@ impl StreamContext {
 
         self.native_reasoning_seen = true;
         let mut events = Vec::new();
+        if let Some(signature) = reasoning.signature.as_deref() {
+            if !signature.is_empty() {
+                self.native_reasoning_signature = Some(signature.to_string());
+            }
+        }
 
         if let Some(redacted) = reasoning.redacted_content.as_deref() {
             if !redacted.is_empty() {
@@ -870,15 +881,10 @@ impl StreamContext {
         } else {
             let idx = self.state_manager.next_block_index();
             self.thinking_block_index = Some(idx);
-            let mut content_block = json!({
+            let content_block = json!({
                 "type": "thinking",
                 "thinking": ""
             });
-            if let Some(signature) = reasoning.signature.as_deref() {
-                if !signature.is_empty() {
-                    content_block["signature"] = json!(signature);
-                }
-            }
             let start_events = self.state_manager.handle_content_block_start(
                 idx,
                 "thinking",
@@ -1117,6 +1123,48 @@ impl StreamContext {
         )
     }
 
+    /// 创建官方 Anthropic extended-thinking 签名 delta。
+    fn create_signature_delta_event(&self, index: i32, signature: &str) -> SseEvent {
+        SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": signature
+                }
+            }),
+        )
+    }
+
+    fn take_native_signature_delta_event(&mut self, index: i32) -> Option<SseEvent> {
+        if self.native_reasoning_signature_sent {
+            return None;
+        }
+
+        let signature = self.native_reasoning_signature.as_ref()?.clone();
+        if signature.is_empty() {
+            return None;
+        }
+
+        self.native_reasoning_signature_sent = true;
+        Some(self.create_signature_delta_event(index, &signature))
+    }
+
+    fn close_native_reasoning_block(&mut self) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        if let Some(thinking_index) = self.thinking_block_index {
+            if let Some(signature_event) = self.take_native_signature_delta_event(thinking_index) {
+                events.push(signature_event);
+            }
+            if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index) {
+                events.push(stop_event);
+            }
+        }
+        events
+    }
+
     /// 处理工具使用事件
     fn process_tool_use(
         &mut self,
@@ -1127,13 +1175,7 @@ impl StreamContext {
         self.state_manager.set_has_tool_use(true);
 
         if self.native_reasoning_seen {
-            if let Some(thinking_index) = self.thinking_block_index {
-                if let Some(stop_event) =
-                    self.state_manager.handle_content_block_stop(thinking_index)
-                {
-                    events.push(stop_event);
-                }
-            }
+            events.extend(self.close_native_reasoning_block());
             self.thinking_buffer.clear();
         }
 
@@ -1257,13 +1299,7 @@ impl StreamContext {
         let mut events = Vec::new();
 
         if self.native_reasoning_seen {
-            if let Some(thinking_index) = self.thinking_block_index {
-                if let Some(stop_event) =
-                    self.state_manager.handle_content_block_stop(thinking_index)
-                {
-                    events.push(stop_event);
-                }
-            }
+            events.extend(self.close_native_reasoning_block());
             self.thinking_buffer.clear();
             self.in_thinking_block = false;
             self.thinking_extracted = true;
@@ -1514,7 +1550,27 @@ mod tests {
                 e.event == "content_block_start" && e.data["content_block"]["type"] == "thinking"
             })
             .expect("native thinking block should start");
-        assert_eq!(thinking_start.data["content_block"]["signature"], "sig");
+        assert!(thinking_start.data["content_block"]["signature"].is_null());
+
+        let signature_delta_pos = all_events
+            .iter()
+            .position(|e| {
+                e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "signature_delta"
+                    && e.data["delta"]["signature"] == "sig"
+            })
+            .expect("native thinking signature should be emitted as signature_delta");
+        let thinking_stop_pos = all_events
+            .iter()
+            .position(|e| {
+                e.event == "content_block_stop"
+                    && e.data["index"].as_i64() == thinking_start.data["index"].as_i64()
+            })
+            .expect("native thinking block should stop");
+        assert!(
+            signature_delta_pos < thinking_stop_pos,
+            "signature_delta must be emitted before content_block_stop"
+        );
     }
 
     #[test]

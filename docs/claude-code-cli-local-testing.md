@@ -88,3 +88,10 @@ The first request in a stable session normally creates cache but cannot read it.
 Later requests read the old prefix and create the newly extended tail. Seeing
 both read and creation in the same request is expected for growing Claude Code
 sessions.
+
+When `promptCacheSimulationMode` is `local-prompt-cache`,
+`promptCacheTargetReadRatio` is treated as a center target rather than an exact
+percentage. The effective simulated cache ratio is deterministic for the
+cacheable request prefix and floats within about +/- 3 percentage points. For
+example, a target of `0.95` should usually produce roughly `92%` to `98%`
+cached tokens instead of every record landing exactly on `95%`.

@@ -22,15 +22,20 @@ use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use chrono::Utc;
 use futures::{Stream, StreamExt, stream};
-use serde_json::json;
+use reqwest::header::CONTENT_TYPE as REQWEST_CONTENT_TYPE;
+use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::time::{Instant, interval, sleep_until};
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request, extract_stable_conversation_id};
+use super::converter::{
+    ConversionError, convert_request, extract_stable_conversation_id,
+    infer_document_media_type_from_url, infer_image_format_from_url,
+};
 use super::middleware::AppState;
 use super::prompt_cache::{PromptCacheProfile, PromptCacheScope};
 use super::stream::{SseEvent, StreamContext};
@@ -41,6 +46,8 @@ use super::types::{
 use super::usage::{UsageRecord, UsageRecordStatus, UsageSource};
 use super::websearch;
 use crate::kiro::provider::KiroStreamCompletion;
+
+const MAX_REMOTE_MULTIMODAL_BYTES: usize = 20 * 1024 * 1024;
 
 #[derive(Clone)]
 struct RequestUsageContext {
@@ -285,6 +292,211 @@ fn credential_label(provider: &crate::kiro::provider::KiroProvider, id: u64) -> 
     provider.credential_label(id)
 }
 
+async fn materialize_remote_multimodal_sources(
+    payload: &mut MessagesRequest,
+) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(25))
+        .build()
+        .map_err(|e| format!("failed to create remote source client: {}", e))?;
+
+    for message in &mut payload.messages {
+        materialize_content_sources(&client, &mut message.content).await?;
+    }
+
+    Ok(())
+}
+
+async fn materialize_content_sources(
+    client: &reqwest::Client,
+    content: &mut Value,
+) -> Result<(), String> {
+    let Value::Array(items) = content else {
+        return Ok(());
+    };
+
+    for item in items {
+        let Some((block_type, url, provided_media_type)) = remote_source_info(item) else {
+            continue;
+        };
+        if url.starts_with("data:") {
+            continue;
+        }
+
+        let (media_type, data) =
+            download_remote_multimodal_source(client, &block_type, &url, provided_media_type)
+                .await?;
+        replace_source_with_base64(item, media_type, data);
+    }
+
+    Ok(())
+}
+
+fn remote_source_info(item: &Value) -> Option<(String, String, Option<String>)> {
+    let obj = item.as_object()?;
+    let block_type = obj.get("type")?.as_str()?;
+    if block_type != "image" && block_type != "document" {
+        return None;
+    }
+    let source = obj.get("source")?.as_object()?;
+    if source.get("type")?.as_str()? != "url" {
+        return None;
+    }
+    let url = source.get("url")?.as_str()?.to_string();
+    let media_type = source
+        .get("media_type")
+        .and_then(|v| v.as_str())
+        .map(normalize_media_type);
+    Some((block_type.to_string(), url, media_type))
+}
+
+async fn download_remote_multimodal_source(
+    client: &reqwest::Client,
+    block_type: &str,
+    url: &str,
+    provided_media_type: Option<String>,
+) -> Result<(String, String), String> {
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return Err(format!(
+            "{} URL source must use http or https: {}",
+            block_type, url
+        ));
+    }
+
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("failed to download {} URL source: {}", block_type, e))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!(
+            "failed to download {} URL source: HTTP {}",
+            block_type, status
+        ));
+    }
+
+    let response_media_type = response
+        .headers()
+        .get(REQWEST_CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(normalize_media_type);
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("failed to read {} URL source: {}", block_type, e))?;
+    if bytes.len() > MAX_REMOTE_MULTIMODAL_BYTES {
+        return Err(format!(
+            "{} URL source exceeds {} bytes",
+            block_type, MAX_REMOTE_MULTIMODAL_BYTES
+        ));
+    }
+
+    let media_type = infer_remote_media_type(
+        block_type,
+        url,
+        provided_media_type.as_deref(),
+        response_media_type.as_deref(),
+        bytes.as_ref(),
+    )
+    .ok_or_else(|| format!("unsupported {} URL media type for {}", block_type, url))?;
+
+    Ok((media_type, BASE64_STANDARD.encode(bytes.as_ref())))
+}
+
+fn replace_source_with_base64(item: &mut Value, media_type: String, data: String) {
+    let Some(obj) = item.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        "source".to_string(),
+        json!({
+            "type": "base64",
+            "media_type": media_type,
+            "data": data
+        }),
+    );
+}
+
+fn infer_remote_media_type(
+    block_type: &str,
+    url: &str,
+    provided: Option<&str>,
+    response: Option<&str>,
+    bytes: &[u8],
+) -> Option<String> {
+    for candidate in [provided, response].into_iter().flatten() {
+        if is_supported_remote_media_type(block_type, candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+
+    if block_type == "image" {
+        if let Some(media_type) = infer_image_media_type_from_bytes(bytes) {
+            return Some(media_type.to_string());
+        }
+        return infer_image_format_from_url(url)
+            .and_then(|format| image_media_type_from_format(&format).map(str::to_string));
+    }
+
+    if bytes.starts_with(b"%PDF") {
+        return Some("application/pdf".to_string());
+    }
+    let inferred = infer_document_media_type_from_url(url);
+    is_supported_remote_media_type(block_type, &inferred).then_some(inferred)
+}
+
+fn is_supported_remote_media_type(block_type: &str, media_type: &str) -> bool {
+    match block_type {
+        "image" => matches!(
+            media_type,
+            "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+        ),
+        "document" => matches!(
+            media_type,
+            "application/pdf"
+                | "text/plain"
+                | "text/markdown"
+                | "text/html"
+                | "text/csv"
+                | "application/json"
+        ),
+        _ => false,
+    }
+}
+
+fn normalize_media_type(raw: &str) -> String {
+    raw.split(';')
+        .next()
+        .unwrap_or(raw)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn infer_image_media_type_from_bytes(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+fn image_media_type_from_format(format: &str) -> Option<&'static str> {
+    match format {
+        "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
 fn prepare_usage_context(
     state: &AppState,
     endpoint: &'static str,
@@ -430,6 +642,60 @@ pub async fn get_models() -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
     let models = vec![
+        Model {
+            id: "opus".to_string(),
+            object: "model".to_string(),
+            created: 1776276000,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Code Alias: Opus".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "opusplan".to_string(),
+            object: "model".to_string(),
+            created: 1776276000,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Code Alias: Opus Plan".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "best".to_string(),
+            object: "model".to_string(),
+            created: 1776276000,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Code Alias: Best Available".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "default".to_string(),
+            object: "model".to_string(),
+            created: 1776276000,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Code Alias: Default".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "sonnet".to_string(),
+            object: "model".to_string(),
+            created: 1771286400,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Code Alias: Sonnet".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "haiku".to_string(),
+            object: "model".to_string(),
+            created: 1760486400,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Code Alias: Haiku".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
         Model {
             id: "claude-opus-4-7".to_string(),
             object: "model".to_string(),
@@ -579,6 +845,15 @@ pub async fn post_messages(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
+    if let Err(message) = materialize_remote_multimodal_sources(&mut payload).await {
+        tracing::warn!("多模态远程 source 处理失败: {}", message);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid_request_error", message)),
+        )
+            .into_response();
+    }
+
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
@@ -604,6 +879,9 @@ pub async fn post_messages(
                 }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
+                }
+                ConversionError::UnsupportedContent(message) => {
+                    ("invalid_request_error", message.clone())
                 }
             };
             tracing::warn!("请求转换失败: {}", e);
@@ -1215,7 +1493,7 @@ async fn handle_non_stream_request(
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
-/// - Opus 4.6：覆写为 adaptive 类型
+/// - Opus 4.6 / 4.7：覆写为 adaptive 类型
 /// - 其他模型：覆写为 enabled 类型
 /// - budget_tokens 固定为 20000
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
@@ -1224,10 +1502,28 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 = model_lower.contains("opus")
-        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
+    let model_base = model_lower.strip_suffix("[1m]").unwrap_or(&model_lower);
+    let is_opus_alias = matches!(
+        model_base,
+        "opus-thinking" | "opusplan-thinking" | "best-thinking" | "default-thinking"
+    );
+    let is_opus_4_7 = is_opus_alias
+        || (model_base.contains("opus")
+            && (model_base.contains("4-7")
+                || model_base.contains("4.7")
+                || model_base == "opus"
+                || model_base == "opusplan"
+                || model_base == "best"
+                || model_base == "default"));
+    let is_opus_4_6 =
+        model_base.contains("opus") && (model_base.contains("4-6") || model_base.contains("4.6"));
+    let is_adaptive_opus = is_opus_4_7 || is_opus_4_6;
 
-    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
+    let thinking_type = if is_adaptive_opus {
+        "adaptive"
+    } else {
+        "enabled"
+    };
 
     tracing::info!(
         model = %payload.model,
@@ -1240,9 +1536,9 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         budget_tokens: 20000,
     });
 
-    if is_opus_4_6 {
+    if is_adaptive_opus {
         payload.output_config = Some(OutputConfig {
-            effort: "high".to_string(),
+            effort: if is_opus_4_7 { "xhigh" } else { "high" }.to_string(),
         });
     }
 }
@@ -1307,6 +1603,15 @@ pub async fn post_messages_cc(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
+    if let Err(message) = materialize_remote_multimodal_sources(&mut payload).await {
+        tracing::warn!("多模态远程 source 处理失败: {}", message);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid_request_error", message)),
+        )
+            .into_response();
+    }
+
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
@@ -1332,6 +1637,9 @@ pub async fn post_messages_cc(
                 }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
+                }
+                ConversionError::UnsupportedContent(message) => {
+                    ("invalid_request_error", message.clone())
                 }
             };
             tracing::warn!("请求转换失败: {}", e);
@@ -1428,6 +1736,70 @@ mod tests {
     use crate::anthropic::types::Message;
     use crate::anthropic::usage::UsageRecorder;
     use serde_json::json;
+
+    fn messages_request_for_model(model: &str) -> MessagesRequest {
+        MessagesRequest {
+            model: model.to_string(),
+            max_tokens: 16,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!("hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn thinking_suffix_opus_4_7_uses_adaptive() {
+        let mut payload = messages_request_for_model("claude-opus-4-7-thinking");
+
+        override_thinking_from_model_name(&mut payload);
+
+        let thinking = payload.thinking.expect("thinking should be set");
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.budget_tokens, 20000);
+        assert_eq!(
+            payload
+                .output_config
+                .expect("output_config should be set")
+                .effort,
+            "xhigh"
+        );
+    }
+
+    #[test]
+    fn thinking_suffix_opus_alias_uses_opus_4_7_adaptive_defaults() {
+        let mut payload = messages_request_for_model("opus-thinking");
+
+        override_thinking_from_model_name(&mut payload);
+
+        let thinking = payload.thinking.expect("thinking should be set");
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(
+            payload
+                .output_config
+                .expect("output_config should be set")
+                .effort,
+            "xhigh"
+        );
+    }
+
+    #[test]
+    fn thinking_suffix_sonnet_stays_enabled() {
+        let mut payload = messages_request_for_model("claude-sonnet-4-6-thinking");
+
+        override_thinking_from_model_name(&mut payload);
+
+        let thinking = payload.thinking.expect("thinking should be set");
+        assert_eq!(thinking.thinking_type, "enabled");
+        assert!(payload.output_config.is_none());
+    }
 
     #[test]
     fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {

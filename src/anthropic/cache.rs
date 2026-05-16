@@ -57,7 +57,7 @@ impl CacheSimulation {
             cache_read_input_tokens: usage.cache_read_input_tokens.max(0),
             cache_creation_5m_input_tokens: usage.cache_creation_5m_input_tokens.max(0),
             cache_creation_1h_input_tokens: usage.cache_creation_1h_input_tokens.max(0),
-            target_cache_ratio: None,
+            target_cache_ratio: usage.effective_cache_ratio,
         };
         (!simulation.is_empty()).then_some(simulation)
     }
@@ -67,7 +67,7 @@ impl CacheSimulation {
         target_cache_ratio: f64,
     ) -> Option<Self> {
         let mut simulation = Self::from_prompt_cache(usage)?;
-        simulation.target_cache_ratio = Some(target_cache_ratio);
+        simulation.target_cache_ratio = usage.effective_cache_ratio.or(Some(target_cache_ratio));
         Some(simulation)
     }
 
@@ -229,6 +229,7 @@ mod tests {
                 cache_read_input_tokens: 0,
                 cache_creation_5m_input_tokens: 95_000,
                 cache_creation_1h_input_tokens: 0,
+                effective_cache_ratio: None,
             },
             0.95,
         )
@@ -243,6 +244,26 @@ mod tests {
     }
 
     #[test]
+    fn prompt_cache_effective_ratio_overrides_configured_target() {
+        let simulation = CacheSimulation::from_prompt_cache_with_ratio(
+            PromptCacheUsage {
+                cache_creation_input_tokens: 95_000,
+                cache_read_input_tokens: 0,
+                cache_creation_5m_input_tokens: 95_000,
+                cache_creation_1h_input_tokens: 0,
+                effective_cache_ratio: Some(0.9325),
+            },
+            0.95,
+        )
+        .unwrap();
+
+        let usage = simulation.to_usage(200_000, 10);
+
+        assert_eq!(usage.cache_creation_input_tokens, 186_500);
+        assert_eq!(usage.input_tokens, 13_500);
+    }
+
+    #[test]
     fn target_ratio_simulation_only_reports_read_after_tracker_match() {
         let creation_only = CacheSimulation::from_prompt_cache_with_ratio(
             PromptCacheUsage {
@@ -250,6 +271,7 @@ mod tests {
                 cache_read_input_tokens: 0,
                 cache_creation_5m_input_tokens: 95_000,
                 cache_creation_1h_input_tokens: 0,
+                effective_cache_ratio: None,
             },
             0.95,
         )
@@ -264,6 +286,7 @@ mod tests {
                 cache_read_input_tokens: 95_000,
                 cache_creation_5m_input_tokens: 0,
                 cache_creation_1h_input_tokens: 0,
+                effective_cache_ratio: None,
             },
             0.95,
         )
