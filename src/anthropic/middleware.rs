@@ -32,8 +32,8 @@ pub struct AppState {
     pub prompt_cache: Arc<PromptCacheTracker>,
     /// 本地 prompt-cache usage 模拟模式
     pub prompt_cache_simulation_mode: PromptCacheSimulationMode,
-    /// Admin 高缓存阈值
-    pub high_cache_threshold: i32,
+    /// 本地 prompt-cache 模拟目标 cache read 比例
+    pub prompt_cache_target_read_ratio: f64,
 }
 
 impl AppState {
@@ -44,7 +44,7 @@ impl AppState {
         usage_recorder: Arc<UsageRecorder>,
         prompt_cache: Arc<PromptCacheTracker>,
         prompt_cache_simulation_mode: PromptCacheSimulationMode,
-        high_cache_threshold: i32,
+        prompt_cache_target_read_ratio: f64,
     ) -> Self {
         Self {
             api_key: api_key.into(),
@@ -53,7 +53,7 @@ impl AppState {
             usage_recorder,
             prompt_cache,
             prompt_cache_simulation_mode,
-            high_cache_threshold,
+            prompt_cache_target_read_ratio: prompt_cache_target_read_ratio.clamp(0.0, 0.99),
         }
     }
 

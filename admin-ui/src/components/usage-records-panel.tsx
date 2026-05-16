@@ -14,6 +14,18 @@ function formatNumber(value: number): string {
   return new Intl.NumberFormat('zh-CN').format(value)
 }
 
+function formatPercent(value: number): string {
+  if (!Number.isFinite(value)) return '-'
+  return `${(value * 100).toFixed(1)}%`
+}
+
+function ratio(part: number, total: number): number {
+  if (!Number.isFinite(part) || !Number.isFinite(total) || total <= 0) {
+    return Number.NaN
+  }
+  return part / total
+}
+
 function formatDate(value: string): string {
   return new Date(value).toLocaleString('zh-CN', {
     hour12: false,
@@ -31,10 +43,6 @@ function sourceLabel(source: UsageSource): string {
       return '上游 metadata'
     case 'local_prompt_cache':
       return '本地 prompt cache'
-    case 'heuristic_cache_control':
-      return 'cache_control 估算'
-    case 'forced_high_cache':
-      return '强制高缓存'
     case 'context_estimate':
       return '上下文估算'
     case 'request_estimate':
@@ -107,6 +115,15 @@ export function UsageRecordsPanel() {
   }
 
   const summaryData = summary.data
+  const localReadRatio = ratio(
+    summaryData?.localPromptCacheReadInputTokens || 0,
+    summaryData?.localPromptCacheInputTokens || 0
+  )
+  const localCachedRatio = ratio(
+    (summaryData?.localPromptCacheReadInputTokens || 0) +
+      (summaryData?.localPromptCacheCreationInputTokens || 0),
+    summaryData?.localPromptCacheInputTokens || 0
+  )
 
   return (
     <div className="space-y-4">
@@ -133,14 +150,18 @@ export function UsageRecordsPanel() {
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">{formatNumber(summaryData?.totalCacheReadInputTokens || 0)}</div>
+            <div className="text-xs text-muted-foreground">local read {formatPercent(localReadRatio)}</div>
           </CardContent>
         </Card>
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">模拟记录</CardTitle>
+            <CardTitle className="text-sm font-medium text-muted-foreground">Local Cached</CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{formatNumber(summaryData?.simulatedRequests || 0)}</div>
+            <div className="text-2xl font-bold">{formatPercent(localCachedRatio)}</div>
+            <div className="text-xs text-muted-foreground">
+              local {formatNumber(summaryData?.localPromptCacheRequests || 0)}
+            </div>
           </CardContent>
         </Card>
       </div>
@@ -166,8 +187,6 @@ export function UsageRecordsPanel() {
             <option value="">全部来源</option>
             <option value="upstream_metadata">上游 metadata</option>
             <option value="local_prompt_cache">本地 prompt cache</option>
-            <option value="heuristic_cache_control">cache_control 估算</option>
-            <option value="forced_high_cache">强制高缓存</option>
             <option value="context_estimate">上下文估算</option>
             <option value="request_estimate">请求估算</option>
           </select>
@@ -209,7 +228,7 @@ export function UsageRecordsPanel() {
             <div className="py-8 text-center text-muted-foreground">暂无记录</div>
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[1280px] text-sm">
+              <table className="w-full min-w-[1440px] text-sm">
                 <thead>
                   <tr className="border-b text-left text-muted-foreground">
                     <th className="px-3 py-2 font-medium">时间</th>
@@ -222,6 +241,8 @@ export function UsageRecordsPanel() {
                     <th className="px-3 py-2 font-medium text-right">Billable In</th>
                     <th className="px-3 py-2 font-medium text-right">Cache Read</th>
                     <th className="px-3 py-2 font-medium text-right">Cache Create</th>
+                    <th className="px-3 py-2 font-medium text-right">Read %</th>
+                    <th className="px-3 py-2 font-medium text-right">Cached %</th>
                     <th className="px-3 py-2 font-medium text-right">输出</th>
                     <th className="px-3 py-2 font-medium text-right">耗时</th>
                   </tr>
@@ -232,6 +253,11 @@ export function UsageRecordsPanel() {
                       typeof record.credentialId === 'number'
                         ? credentialLabels.get(record.credentialId) || record.credentialLabel
                         : record.credentialLabel
+                    const readRatio = ratio(record.cacheReadInputTokens, record.totalInputTokens)
+                    const cachedRatio = ratio(
+                      record.cacheReadInputTokens + record.cacheCreationInputTokens,
+                      record.totalInputTokens
+                    )
 
                     return (
                     <tr key={record.id} className="border-b last:border-0">
@@ -272,6 +298,8 @@ export function UsageRecordsPanel() {
                       <td className="px-3 py-2 text-right">{formatNumber(record.billableInputTokens)}</td>
                       <td className="px-3 py-2 text-right">{formatNumber(record.cacheReadInputTokens)}</td>
                       <td className="px-3 py-2 text-right">{formatNumber(record.cacheCreationInputTokens)}</td>
+                      <td className="px-3 py-2 text-right">{formatPercent(readRatio)}</td>
+                      <td className="px-3 py-2 text-right">{formatPercent(cachedRatio)}</td>
                       <td className="px-3 py-2 text-right">{formatNumber(record.outputTokens)}</td>
                       <td className="px-3 py-2 text-right">{formatNumber(record.durationMs)}ms</td>
                     </tr>

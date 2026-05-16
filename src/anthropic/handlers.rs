@@ -33,7 +33,7 @@ use uuid::Uuid;
 use super::converter::{ConversionError, convert_request, extract_stable_conversation_id};
 use super::middleware::AppState;
 use super::prompt_cache::{PromptCacheProfile, PromptCacheScope};
-use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
+use super::stream::{SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
     OutputConfig, Thinking,
@@ -54,6 +54,7 @@ struct RequestUsageContext {
     input_tokens: i32,
     prompt_cache_profile: Option<PromptCacheProfile>,
     simulation_mode: PromptCacheSimulationMode,
+    prompt_cache_target_read_ratio: f64,
     simulated_usage: Option<super::cache::CacheSimulation>,
     simulated_source: Option<UsageSource>,
     started_at: Instant,
@@ -124,16 +125,6 @@ impl CredentialUsageContext {
         self.record_success(usage, usage_source, context_estimated);
     }
 
-    fn record_success_from_buffered_stream(&self, ctx: &BufferedStreamContext) {
-        let Some(usage) = ctx.final_usage() else {
-            return;
-        };
-        let has_metadata = ctx.metadata_usage_seen();
-        let context_estimated = !has_metadata && ctx.context_input_tokens_seen();
-        let usage_source = self.usage_source(&usage, has_metadata, context_estimated);
-        self.record_success(usage, usage_source, context_estimated);
-    }
-
     fn record_stream_failure_from_context(
         &self,
         status: UsageRecordStatus,
@@ -165,18 +156,20 @@ impl CredentialUsageContext {
         &self,
         usage: super::cache::CacheUsage,
         usage_source: UsageSource,
-        context_estimated: bool,
+        _context_estimated: bool,
     ) {
         self.record(UsageRecordStatus::Success, usage, usage_source, None, None);
 
-        if usage_source != UsageSource::LocalPromptCache || context_estimated {
+        if usage_source != UsageSource::LocalPromptCache {
             return;
         }
 
         if let Some(scope) = self.scope() {
-            self.request
-                .prompt_cache
-                .update(Some(scope), self.request.prompt_cache_profile.as_ref());
+            self.request.prompt_cache.update(
+                Some(scope),
+                self.request.prompt_cache_profile.as_ref(),
+                self.request.prompt_cache_target_read_ratio,
+            );
         }
     }
 
@@ -304,9 +297,7 @@ fn prepare_usage_context(
     let prompt_cache_profile = state.prompt_cache.build_profile(payload, input_tokens);
     let (simulated_usage, simulated_source) = build_simulated_usage(
         state,
-        payload,
         stable_conversation_id.as_deref(),
-        input_tokens,
         prompt_cache_profile.as_ref(),
     );
 
@@ -321,6 +312,7 @@ fn prepare_usage_context(
         input_tokens,
         prompt_cache_profile,
         simulation_mode: state.prompt_cache_simulation_mode,
+        prompt_cache_target_read_ratio: state.prompt_cache_target_read_ratio,
         simulated_usage,
         simulated_source,
         started_at: Instant::now(),
@@ -329,28 +321,14 @@ fn prepare_usage_context(
 
 fn build_simulated_usage(
     state: &AppState,
-    payload: &MessagesRequest,
     conversation_id: Option<&str>,
-    input_tokens: i32,
     prompt_cache_profile: Option<&PromptCacheProfile>,
 ) -> (Option<super::cache::CacheSimulation>, Option<UsageSource>) {
     match state.prompt_cache_simulation_mode {
         PromptCacheSimulationMode::Disabled => (None, None),
-        PromptCacheSimulationMode::HeuristicCacheControl => {
-            let cached_msg_tokens = super::cache::estimate_cached_message_tokens(&payload.messages);
-            (
-                super::cache::CacheSimulation::heuristic(cached_msg_tokens, input_tokens),
-                Some(UsageSource::HeuristicCacheControl),
-            )
-        }
         PromptCacheSimulationMode::LocalPromptCache => {
             if conversation_id.is_none() {
-                let cached_msg_tokens =
-                    super::cache::estimate_cached_message_tokens(&payload.messages);
-                return (
-                    super::cache::CacheSimulation::heuristic(cached_msg_tokens, input_tokens),
-                    Some(UsageSource::HeuristicCacheControl),
-                );
+                return (None, None);
             }
 
             // credential_id 需要等 provider 选中账号后才能确定；这里先保留 profile，
@@ -361,13 +339,6 @@ fn build_simulated_usage(
                 (None, None)
             }
         }
-        PromptCacheSimulationMode::ForceHighCache => (
-            super::cache::CacheSimulation::forced_high_cache(
-                input_tokens,
-                state.high_cache_threshold,
-            ),
-            Some(UsageSource::ForcedHighCache),
-        ),
     }
 }
 
@@ -388,11 +359,15 @@ fn prepare_credential_usage_context(
                 conversation_id: conversation_id.clone(),
                 model: usage_context.model.clone(),
             });
-        let prompt_usage = usage_context
-            .prompt_cache
-            .compute(scope, usage_context.prompt_cache_profile.as_ref());
-        usage_context.simulated_usage =
-            super::cache::CacheSimulation::from_prompt_cache(prompt_usage);
+        let prompt_usage = usage_context.prompt_cache.compute(
+            scope,
+            usage_context.prompt_cache_profile.as_ref(),
+            usage_context.prompt_cache_target_read_ratio,
+        );
+        usage_context.simulated_usage = super::cache::CacheSimulation::from_prompt_cache_with_ratio(
+            prompt_usage,
+            usage_context.prompt_cache_target_read_ratio,
+        );
         if usage_context.simulated_usage.is_some() {
             usage_context.simulated_source = Some(UsageSource::LocalPromptCache);
         } else {
@@ -1299,8 +1274,8 @@ pub async fn count_tokens(
 /// POST /cc/v1/messages
 ///
 /// Claude Code 兼容端点，与 /v1/messages 的区别在于：
-/// - 流式响应会等待 kiro 端返回 contextUsageEvent 后再发送 message_start
-/// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
+/// - 流式响应实时转发 Kiro eventstream，避免 Claude Code CLI 长时间没有过程输出
+/// - 最终 usage 仍会在 message_delta 和 usage records 中修正
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
@@ -1418,8 +1393,8 @@ pub async fn post_messages_cc(
     let tool_name_map = conversion_result.tool_name_map;
 
     if payload.stream {
-        // 流式响应（缓冲模式）
-        handle_stream_request_buffered(
+        // 流式响应（实时模式）
+        handle_stream_request(
             provider,
             &request_body,
             &payload.model,
@@ -1445,220 +1420,117 @@ pub async fn post_messages_cc(
     }
 }
 
-/// 处理流式请求（缓冲版本）
-///
-/// 与 `handle_stream_request` 不同，此函数会缓冲所有事件直到流结束，
-/// 然后用从 contextUsageEvent 计算的正确 input_tokens 生成 message_start 事件。
-async fn handle_stream_request_buffered(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
-    request_body: &str,
-    model: &str,
-    estimated_input_tokens: i32,
-    thinking_enabled: bool,
-    tool_name_map: HashMap<String, String>,
-    usage_context: RequestUsageContext,
-) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            let message = e.to_string();
-            usage_context
-                .attach_credential(None, None, false, false)
-                .record_failure(UsageRecordStatus::Error, "api_error", message);
-            return map_provider_error(e);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::anthropic::cache::CacheUsage;
+    use crate::anthropic::prompt_cache::PromptCacheTracker;
+    use crate::anthropic::types::Message;
+    use crate::anthropic::usage::UsageRecorder;
+    use serde_json::json;
+
+    #[test]
+    fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
+        let prompt_cache = Arc::new(PromptCacheTracker::default());
+        let usage_recorder = Arc::new(UsageRecorder::new(10, None));
+        let payload = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 16,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!([
+                    {
+                        "type": "text",
+                        "text": "cacheable prompt block ".repeat(700),
+                        "cache_control": {"type": "ephemeral"}
+                    }
+                ]),
+            }],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let profile = prompt_cache.build_profile(&payload, 4096);
+        let usage_context = RequestUsageContext {
+            recorder: usage_recorder,
+            prompt_cache: prompt_cache.clone(),
+            request_id: "req_test".to_string(),
+            endpoint: "/v1/messages",
+            stream: true,
+            model: payload.model.clone(),
+            conversation_id: Some("session-a".to_string()),
+            input_tokens: 4096,
+            prompt_cache_profile: profile.clone(),
+            simulation_mode: PromptCacheSimulationMode::LocalPromptCache,
+            prompt_cache_target_read_ratio: 0.85,
+            simulated_usage: None,
+            simulated_source: Some(UsageSource::LocalPromptCache),
+            started_at: Instant::now(),
         }
-    };
-    let (response, completion) = response.into_parts();
-    let credential_usage = prepare_credential_usage_context(
-        usage_context,
-        &provider,
-        completion.credential_id(),
-        completion.sticky_bound(),
-        completion.fallback_from_sticky(),
-    );
+        .attach_credential(Some(1), None, false, false);
+        let usage = CacheUsage {
+            total_input_tokens: 4096,
+            input_tokens: 128,
+            output_tokens: 1,
+            cache_creation_input_tokens: 3968,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 3968,
+            cache_creation_1h_input_tokens: 0,
+        };
 
-    // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new_with_simulation(
-        model,
-        estimated_input_tokens,
-        thinking_enabled,
-        tool_name_map,
-        credential_usage.request.simulated_usage,
-    );
+        usage_context.record_success(usage, UsageSource::LocalPromptCache, true);
 
-    // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx, completion, credential_usage);
+        let scope = PromptCacheScope {
+            credential_id: 1,
+            conversation_id: "session-a".to_string(),
+            model: payload.model,
+        };
+        let second = prompt_cache.compute(Some(scope), profile.as_ref(), 0.85);
+        assert!(second.cache_read_input_tokens > 0);
+    }
 
-    // 返回 SSE 响应
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
-}
-
-/// 创建缓冲 SSE 事件流
-///
-/// 工作流程：
-/// 1. 等待上游流完成，期间只发送 ping 保活信号
-/// 2. 使用 StreamContext 的事件处理逻辑处理所有 Kiro 事件，结果缓存
-/// 3. 流结束后，用正确的 input_tokens 更正 message_start 事件
-/// 4. 一次性发送所有事件
-fn create_buffered_sse_stream(
-    response: reqwest::Response,
-    ctx: BufferedStreamContext,
-    completion: KiroStreamCompletion,
-    usage_context: CredentialUsageContext,
-) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let usage_guard = StreamUsageGuard::new(usage_context);
-    let body_stream = response.bytes_stream();
-
-    stream::unfold(
-        (
-            body_stream,
-            ctx,
-            EventStreamDecoder::new(),
-            false,
-            completion,
-            usage_guard,
-            interval(Duration::from_secs(PING_INTERVAL_SECS)),
-            Instant::now() + Duration::from_secs(UPSTREAM_IDLE_TIMEOUT_SECS),
-        ),
-        |(
-            mut body_stream,
-            mut ctx,
-            mut decoder,
-            finished,
-            completion,
-            usage_guard,
-            mut ping_interval,
-            mut idle_deadline,
-        )| async move {
-            if finished {
-                return None;
-            }
-
-            loop {
-                let idle_sleep = sleep_until(idle_deadline);
-                tokio::pin!(idle_sleep);
-
-                tokio::select! {
-                    // 使用 biased 模式，优先检查 ping 定时器
-                    // 避免在上游 chunk 密集时 ping 被"饿死"
-                    biased;
-
-                    // 优先检查 ping 保活（等待期间唯一发送的数据）
-                    _ = ping_interval.tick() => {
-                        tracing::trace!("发送 ping 保活事件（缓冲模式）");
-                        let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, completion, usage_guard, ping_interval, idle_deadline)));
+    #[test]
+    fn local_prompt_cache_does_not_simulate_without_stable_conversation_id() {
+        let prompt_cache = Arc::new(PromptCacheTracker::default());
+        let usage_recorder = Arc::new(UsageRecorder::new(10, None));
+        let state = AppState::new(
+            "test-key",
+            true,
+            usage_recorder,
+            prompt_cache.clone(),
+            PromptCacheSimulationMode::LocalPromptCache,
+            0.95,
+        );
+        let payload = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 16,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!([
+                    {
+                        "type": "text",
+                        "text": "cacheable prompt block ".repeat(700),
+                        "cache_control": {"type": "ephemeral"}
                     }
+                ]),
+            }],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let profile = prompt_cache.build_profile(&payload, 4096);
 
-                    // 然后处理数据流
-                    chunk_result = body_stream.next() => {
-                        match chunk_result {
-                            Some(Ok(chunk)) => {
-                                idle_deadline = Instant::now() + Duration::from_secs(UPSTREAM_IDLE_TIMEOUT_SECS);
-                                // 解码事件
-                                if let Err(e) = decoder.feed(&chunk) {
-                                    tracing::warn!("缓冲区溢出: {}", e);
-                                }
+        let (simulation, source) = build_simulated_usage(&state, None, profile.as_ref());
 
-                                for result in decoder.decode_iter() {
-                                    match result {
-                                        Ok(frame) => {
-                                            if let Ok(event) = Event::from_frame(frame) {
-                                                // 缓冲事件（复用 StreamContext 的处理逻辑）
-                                                ctx.process_and_buffer(&event);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("解码事件失败: {}", e);
-                                        }
-                                    }
-                                }
-                                // 继续读取下一个 chunk，不发送任何数据
-                            }
-                            Some(Err(e)) => {
-                                tracing::error!("读取响应流失败: {}", e);
-                                completion.report_soft_failure();
-                                // 发生错误，完成处理并返回所有事件
-                                ctx.record_stream_error("api_error", format!("upstream stream read error: {}", e));
-                                let error_detail = ctx.stream_error_detail();
-                                let all_events = ctx.finish_and_get_all_events();
-                                usage_guard.context().record_stream_failure_from_context(
-                                    UsageRecordStatus::StreamError,
-                                    ctx.final_usage(),
-                                    error_detail,
-                                    ctx.metadata_usage_seen(),
-                                    !ctx.metadata_usage_seen() && ctx.context_input_tokens_seen(),
-                                );
-                                usage_guard.complete();
-                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                    .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                    .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, usage_guard, ping_interval, idle_deadline)));
-                            }
-                            None => {
-                                // 流结束，完成处理并返回所有事件（已更正 input_tokens）
-                                if ctx.has_stream_error() {
-                                    completion.report_soft_failure();
-                                } else {
-                                    completion.report_success();
-                                }
-                                let had_stream_error = ctx.has_stream_error();
-                                let error_detail = ctx.stream_error_detail();
-                                let all_events = ctx.finish_and_get_all_events();
-                                if had_stream_error {
-                                    usage_guard.context().record_stream_failure_from_context(
-                                        UsageRecordStatus::StreamError,
-                                        ctx.final_usage(),
-                                        error_detail,
-                                        ctx.metadata_usage_seen(),
-                                        !ctx.metadata_usage_seen() && ctx.context_input_tokens_seen(),
-                                    );
-                                } else {
-                                    usage_guard.context().record_success_from_buffered_stream(&ctx);
-                                }
-                                usage_guard.complete();
-                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                    .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                    .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, usage_guard, ping_interval, idle_deadline)));
-                            }
-                        }
-                    }
-                    _ = &mut idle_sleep => {
-                        tracing::error!(
-                            "上游响应流超过 {} 秒未产生数据（缓冲模式）",
-                            UPSTREAM_IDLE_TIMEOUT_SECS
-                        );
-                        completion.report_soft_failure();
-                        ctx.record_stream_error("api_error", "upstream stream idle timeout");
-                        let error_detail = ctx.stream_error_detail();
-                        let all_events = ctx.finish_and_get_all_events();
-                        usage_guard.context().record_stream_failure_from_context(
-                            UsageRecordStatus::UpstreamTimeout,
-                            ctx.final_usage(),
-                            error_detail,
-                            ctx.metadata_usage_seen(),
-                            !ctx.metadata_usage_seen() && ctx.context_input_tokens_seen(),
-                        );
-                        usage_guard.complete();
-                        let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                            .into_iter()
-                            .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                            .collect();
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, usage_guard, ping_interval, idle_deadline)));
-                    }
-                }
-            }
-        },
-    )
-    .flatten()
+        assert!(simulation.is_none());
+        assert!(source.is_none());
+    }
 }

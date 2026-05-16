@@ -53,6 +53,7 @@
   - [Claude Code 兼容端点 (/cc/v1)](#claude-code-兼容端点-ccv1)
   - [Thinking 模式](#thinking-模式)
   - [工具调用](#工具调用)
+- [本地 Claude Code CLI 测试](docs/claude-code-cli-local-testing.md)
 - [模型映射](#模型映射)
 - [Admin（可选）](#admin可选)
 - [注意事项](#注意事项)

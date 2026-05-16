@@ -38,8 +38,6 @@ impl UsageRecordStatus {
 pub enum UsageSource {
     UpstreamMetadata,
     LocalPromptCache,
-    HeuristicCacheControl,
-    ForcedHighCache,
     ContextEstimate,
     RequestEstimate,
     None,
@@ -50,8 +48,6 @@ impl UsageSource {
         match value {
             "upstream_metadata" => Some(Self::UpstreamMetadata),
             "local_prompt_cache" => Some(Self::LocalPromptCache),
-            "heuristic_cache_control" => Some(Self::HeuristicCacheControl),
-            "forced_high_cache" => Some(Self::ForcedHighCache),
             "context_estimate" => Some(Self::ContextEstimate),
             "request_estimate" => Some(Self::RequestEstimate),
             "none" => Some(Self::None),
@@ -60,10 +56,7 @@ impl UsageSource {
     }
 
     pub fn is_simulated(self) -> bool {
-        matches!(
-            self,
-            Self::LocalPromptCache | Self::HeuristicCacheControl | Self::ForcedHighCache
-        )
+        matches!(self, Self::LocalPromptCache)
     }
 }
 
@@ -161,6 +154,10 @@ pub struct UsageSummary {
     pub total_output_tokens: i64,
     pub total_cache_read_input_tokens: i64,
     pub total_cache_creation_input_tokens: i64,
+    pub local_prompt_cache_requests: usize,
+    pub local_prompt_cache_input_tokens: i64,
+    pub local_prompt_cache_read_input_tokens: i64,
+    pub local_prompt_cache_creation_input_tokens: i64,
     pub simulated_requests: usize,
     pub upstream_metadata_requests: usize,
     pub top_credentials: Vec<UsageAggregate>,
@@ -245,6 +242,10 @@ impl UsageRecorder {
             total_output_tokens: 0,
             total_cache_read_input_tokens: 0,
             total_cache_creation_input_tokens: 0,
+            local_prompt_cache_requests: 0,
+            local_prompt_cache_input_tokens: 0,
+            local_prompt_cache_read_input_tokens: 0,
+            local_prompt_cache_creation_input_tokens: 0,
             simulated_requests: 0,
             upstream_metadata_requests: 0,
             top_credentials: Vec::new(),
@@ -272,6 +273,14 @@ impl UsageRecorder {
             summary.total_output_tokens += record.output_tokens as i64;
             summary.total_cache_read_input_tokens += record.cache_read_input_tokens as i64;
             summary.total_cache_creation_input_tokens += record.cache_creation_input_tokens as i64;
+            if record.usage_source == UsageSource::LocalPromptCache {
+                summary.local_prompt_cache_requests += 1;
+                summary.local_prompt_cache_input_tokens += record.total_input_tokens as i64;
+                summary.local_prompt_cache_read_input_tokens +=
+                    record.cache_read_input_tokens as i64;
+                summary.local_prompt_cache_creation_input_tokens +=
+                    record.cache_creation_input_tokens as i64;
+            }
 
             if let Some(id) = record.credential_id {
                 let key = id.to_string();
@@ -507,6 +516,10 @@ mod tests {
         assert_eq!(summary.high_cache_requests, 1);
         assert_eq!(summary.simulated_requests, 1);
         assert_eq!(summary.upstream_metadata_requests, 1);
+        assert_eq!(summary.local_prompt_cache_requests, 1);
+        assert_eq!(summary.local_prompt_cache_input_tokens, 100);
+        assert_eq!(summary.local_prompt_cache_read_input_tokens, 20_000);
+        assert_eq!(summary.local_prompt_cache_creation_input_tokens, 5);
         assert_eq!(summary.top_credentials[0].key, "1");
     }
 
@@ -520,7 +533,7 @@ mod tests {
         let recorder = UsageRecorder::new(2, Some(path.clone()));
         recorder.record(record("1", 10, UsageSource::UpstreamMetadata));
         recorder.record(record("2", 20, UsageSource::LocalPromptCache));
-        recorder.record(record("3", 30, UsageSource::ForcedHighCache));
+        recorder.record(record("3", 30, UsageSource::RequestEstimate));
 
         let reloaded = UsageRecorder::new(2, Some(path.clone()));
         let result = reloaded.query(UsageRecordQuery::default());
@@ -553,7 +566,7 @@ mod tests {
         recorder.record(record_with_time(
             "bad-time",
             30,
-            UsageSource::ForcedHighCache,
+            UsageSource::RequestEstimate,
             "not-a-time".to_string(),
         ));
 

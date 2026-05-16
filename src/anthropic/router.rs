@@ -46,7 +46,7 @@ pub fn create_router_with_provider(
     usage_recorder: Arc<UsageRecorder>,
     prompt_cache: Arc<PromptCacheTracker>,
     prompt_cache_simulation_mode: PromptCacheSimulationMode,
-    high_cache_threshold: i32,
+    prompt_cache_target_read_ratio: f64,
 ) -> Router {
     let mut state = AppState::new(
         api_key,
@@ -54,7 +54,7 @@ pub fn create_router_with_provider(
         usage_recorder,
         prompt_cache,
         prompt_cache_simulation_mode,
-        high_cache_threshold,
+        prompt_cache_target_read_ratio,
     );
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);

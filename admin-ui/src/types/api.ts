@@ -99,8 +99,6 @@ export type UsageRecordStatus =
 export type UsageSource =
   | 'upstream_metadata'
   | 'local_prompt_cache'
-  | 'heuristic_cache_control'
-  | 'forced_high_cache'
   | 'context_estimate'
   | 'request_estimate'
   | 'none'
@@ -154,6 +152,10 @@ export interface UsageSummary {
   totalOutputTokens: number
   totalCacheReadInputTokens: number
   totalCacheCreationInputTokens: number
+  localPromptCacheRequests: number
+  localPromptCacheInputTokens: number
+  localPromptCacheReadInputTokens: number
+  localPromptCacheCreationInputTokens: number
   simulatedRequests: number
   upstreamMetadataRequests: number
   topCredentials: UsageAggregate[]

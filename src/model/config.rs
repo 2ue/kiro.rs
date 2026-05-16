@@ -24,9 +24,7 @@ impl Default for TlsBackend {
 #[serde(rename_all = "kebab-case")]
 pub enum PromptCacheSimulationMode {
     Disabled,
-    HeuristicCacheControl,
     LocalPromptCache,
-    ForceHighCache,
 }
 
 impl Default for PromptCacheSimulationMode {
@@ -120,6 +118,13 @@ pub struct Config {
     #[serde(default = "default_prompt_cache_simulation_mode")]
     pub prompt_cache_simulation_mode: PromptCacheSimulationMode,
 
+    /// 本地 prompt-cache 模拟的目标 cache read 比例。
+    ///
+    /// 仅对 local-prompt-cache 生效；读取仍必须命中同一凭据、会话、模型下
+    /// 已创建过的缓存前缀，不会凭空制造 cache read。
+    #[serde(default = "default_prompt_cache_target_read_ratio")]
+    pub prompt_cache_target_read_ratio: f64,
+
     /// 请求级 usage record 内存保留上限。
     #[serde(default = "default_usage_record_limit")]
     pub usage_record_limit: usize,
@@ -193,6 +198,10 @@ fn default_prompt_cache_simulation_mode() -> PromptCacheSimulationMode {
     PromptCacheSimulationMode::Disabled
 }
 
+fn default_prompt_cache_target_read_ratio() -> f64 {
+    0.85
+}
+
 fn default_usage_record_limit() -> usize {
     5000
 }
@@ -233,6 +242,7 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             prompt_cache_simulation_mode: default_prompt_cache_simulation_mode(),
+            prompt_cache_target_read_ratio: default_prompt_cache_target_read_ratio(),
             usage_record_limit: default_usage_record_limit(),
             usage_record_persist: default_usage_record_persist(),
             high_cache_threshold: default_high_cache_threshold(),

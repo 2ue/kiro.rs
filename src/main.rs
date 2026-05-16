@@ -174,7 +174,7 @@ async fn main() {
         usage_recorder.clone(),
         prompt_cache.clone(),
         config.prompt_cache_simulation_mode,
-        config.high_cache_threshold,
+        config.prompt_cache_target_read_ratio,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）

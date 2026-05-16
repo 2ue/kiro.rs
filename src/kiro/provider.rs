@@ -230,6 +230,20 @@ mod tests {
         let snapshot = manager.snapshot();
         assert_eq!(snapshot.entries[0].success_count, 0);
     }
+
+    #[test]
+    fn accepts_kiro_json_labeled_event_stream_content_type() {
+        assert!(KiroProvider::is_event_stream_content_type(
+            "application/vnd.amazon.eventstream"
+        ));
+        assert!(KiroProvider::is_event_stream_content_type(
+            "application/octet-stream; charset=utf-8"
+        ));
+        assert!(KiroProvider::is_event_stream_content_type(
+            "application/json"
+        ));
+        assert!(!KiroProvider::is_event_stream_content_type("text/plain"));
+    }
 }
 
 impl KiroProvider {
@@ -896,16 +910,22 @@ impl KiroProvider {
             .headers()
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|ct| {
-                ct.split(';')
-                    .next()
-                    .map(|media_type| {
-                        let media_type = media_type.trim().to_ascii_lowercase();
-                        media_type == "application/vnd.amazon.eventstream"
-                            || media_type == "application/octet-stream"
-                    })
-                    .unwrap_or(false)
+            .is_some_and(Self::is_event_stream_content_type)
+    }
+
+    fn is_event_stream_content_type(content_type: &str) -> bool {
+        content_type
+            .split(';')
+            .next()
+            .map(|media_type| {
+                let media_type = media_type.trim().to_ascii_lowercase();
+                media_type == "application/vnd.amazon.eventstream"
+                    || media_type == "application/octet-stream"
+                    // Kiro occasionally labels AWS event-stream framed bodies as JSON.
+                    // The downstream decoder still validates the actual frame format.
+                    || media_type == "application/json"
             })
+            .unwrap_or(false)
     }
 
     fn extract_aws_exception(body: &str) -> Option<String> {
