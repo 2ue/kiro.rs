@@ -158,11 +158,13 @@ docker-compose up
 docker compose -f docker-compose.deploy.yml up -d
 ```
 
-部署版默认使用 `docker.io/2ue/kiro-rs:latest`，可通过环境变量固定版本：
+部署版默认使用 `ghcr.io/2ue/kiro-rs:latest`，可通过环境变量固定版本：
 
 ```bash
 KIRO_RS_VERSION=0.0.3 docker compose -f docker-compose.deploy.yml up -d
 ```
+
+如需改用 Docker Hub 镜像，可通过 `KIRO_RS_IMAGE` 覆盖镜像仓库。
 
 容器端口固定为 `8990`，请确保挂载的 `config/config.json` 中 `host` 配置为 `0.0.0.0`，否则宿主机端口映射后可能无法访问服务。
 

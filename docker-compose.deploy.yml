@@ -1,6 +1,6 @@
 services:
   kiro-rs:
-    image: ${KIRO_RS_IMAGE:-docker.io/2ue/kiro-rs}:${KIRO_RS_VERSION:-latest}
+    image: ${KIRO_RS_IMAGE:-ghcr.io/2ue/kiro-rs}:${KIRO_RS_VERSION:-latest}
     container_name: kiro-rs
     restart: unless-stopped
     ports:
