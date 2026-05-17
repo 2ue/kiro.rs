@@ -4,6 +4,17 @@
   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
   "tlsBackend": "rustls",
   "region": "us-east-1",
+  "kiroVersion": "0.11.107",
+  "nodeVersion": "22.22.0",
   "adminApiKey": "sk-admin-your-secret-key",
-  "defaultEndpoint": "ide"
+  "loadBalancingMode": "priority",
+  "compatProfile": "claude-code",
+  "extractThinking": true,
+  "promptCacheSimulationMode": "disabled",
+  "promptCacheTargetReadRatio": 0.85,
+  "usageRecordLimit": 5000,
+  "usageRecordPersist": true,
+  "highCacheThreshold": 10000,
+  "defaultEndpoint": "ide",
+  "exposeProxyWarnings": false
 }

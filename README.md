@@ -2,8 +2,6 @@
 
 一个用 Rust 编写的 Anthropic Claude API 兼容代理服务，将 Anthropic API 请求转换为 Kiro API 请求。
 
-#### [LINUX DO 讨论帖](https://linux.do/t/topic/1571986)
-
 ## 免责声明
 
 本项目仅供研究使用, Use at your own risk, 使用本项目所导致的任何后果由使用人承担, 与本项目无关。
@@ -14,7 +12,7 @@
 因 TLS 默认从 native-tls 切换至 rustls，你可能需要专门安装证书后才能配置 HTTP 代理。可通过 `config.json` 的 `tlsBackend` 切回 `native-tls`。
 如果遇到请求报错, 尤其是无法刷新 token, 或者是直接返回 error request, 请尝试切换 tls 后端为 `native-tls`, 一般即可解决。
 
-**Write Failed/会话卡死**: 如果遇到持续的 Write File / Write Failed 并导致会话不可用，参考 Issue [#22](https://github.com/hank9999/kiro.rs/issues/22) 和 [#49](https://github.com/hank9999/kiro.rs/issues/49) 的说明与临时解决方案（通常与输出过长被截断有关，可尝试调低输出相关 token 上限）
+**Write Failed/会话卡死**: 如果遇到持续的 Write File / Write Failed 并导致会话不可用，通常与输出过长被截断有关，可尝试调低输出相关 token 上限。
 
 ## 功能特性
 
@@ -162,7 +160,7 @@ docker compose -f docker-compose.deploy.yml up -d
 部署版默认使用 `ghcr.io/2ue/kiro-rs:latest`，可通过环境变量固定版本：
 
 ```bash
-KIRO_RS_VERSION=0.0.3 docker compose -f docker-compose.deploy.yml up -d
+KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 ```
 
 如需改用 Docker Hub 镜像，可通过 `KIRO_RS_IMAGE` 覆盖镜像仓库。
@@ -181,10 +179,10 @@ KIRO_RS_VERSION=0.0.3 docker compose -f docker-compose.deploy.yml up -d
 | `region` | string | `us-east-1` | AWS 区域 |
 | `authRegion` | string | - | Auth Region（用于 Token 刷新），未配置时回退到 region |
 | `apiRegion` | string | - | API Region（用于 API 请求），未配置时回退到 region |
-| `kiroVersion` | string | `0.9.2` | Kiro 版本号 |
+| `kiroVersion` | string | `0.11.107` | Kiro 版本号 |
 | `machineId` | string | - | 自定义机器码（64位十六进制），不定义则自动生成 |
 | `systemVersion` | string | 随机 | 系统版本标识 |
-| `nodeVersion` | string | `22.21.1` | Node.js 版本标识 |
+| `nodeVersion` | string | `22.22.0` | Node.js 版本标识 |
 | `tlsBackend` | string | `rustls` | TLS 后端：`rustls` 或 `native-tls` |
 | `countTokensApiUrl` | string | - | 外部 count_tokens API 地址 |
 | `countTokensApiKey` | string | - | 外部 count_tokens API 密钥 |
@@ -194,8 +192,15 @@ KIRO_RS_VERSION=0.0.3 docker compose -f docker-compose.deploy.yml up -d
 | `proxyPassword` | string | - | 代理密码 |
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
+| `compatProfile` | string | `claude-code` | 兼容 profile：`claude-code` 优先真实 Claude Code CLI 可用性；`anthropic-strict` 减少代理改写和调试特征；`debug` 等同 `claude-code` 但默认暴露代理 warning |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
+| `promptCacheSimulationMode` | string | `disabled` | 本地 prompt-cache usage 模拟模式。生产建议保持 `disabled`；联调可用 `local-prompt-cache` |
+| `promptCacheTargetReadRatio` | number | `0.85` | 本地 prompt-cache 模拟的目标 cache read 中心比例，仅对 `local-prompt-cache` 生效 |
+| `usageRecordLimit` | number | `5000` | Admin usage record 内存保留上限 |
+| `usageRecordPersist` | boolean | `true` | 是否将 usage record 追加写入 `kiro_usage_records.jsonl` |
+| `highCacheThreshold` | number | `10000` | Admin 统计高缓存请求的 cache read 阈值 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
+| `exposeProxyWarnings` | boolean | `false` | 是否通过 `x-kiro-rs-warnings` 暴露代理侧兜底改写。`anthropic-strict` 下会强制关闭 |
 
 完整配置示例：
 
@@ -206,10 +211,10 @@ KIRO_RS_VERSION=0.0.3 docker compose -f docker-compose.deploy.yml up -d
    "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
    "region": "us-east-1",
    "tlsBackend": "rustls",
-   "kiroVersion": "0.9.2",
+   "kiroVersion": "0.11.107",
    "machineId": "64位十六进制机器码",
    "systemVersion": "darwin#24.6.0",
-   "nodeVersion": "22.21.1",
+   "nodeVersion": "22.22.0",
    "authRegion": "us-east-1",
    "apiRegion": "us-east-1",
    "countTokensApiUrl": "https://api.example.com/v1/messages/count_tokens",
@@ -220,7 +225,15 @@ KIRO_RS_VERSION=0.0.3 docker compose -f docker-compose.deploy.yml up -d
    "proxyPassword": "pass",
    "adminApiKey": "sk-admin-your-secret-key",
    "loadBalancingMode": "priority",
-   "extractThinking": true
+   "compatProfile": "claude-code",
+   "extractThinking": true,
+   "promptCacheSimulationMode": "disabled",
+   "promptCacheTargetReadRatio": 0.85,
+   "usageRecordLimit": 5000,
+   "usageRecordPersist": true,
+   "highCacheThreshold": 10000,
+   "defaultEndpoint": "ide",
+   "exposeProxyWarnings": false
 }
 ```
 
@@ -368,11 +381,21 @@ KIRO_RS_VERSION=0.0.3 docker compose -f docker-compose.deploy.yml up -d
 
 ### 环境变量
 
-可通过环境变量配置日志级别：
+服务运行时主要使用配置文件和启动参数。以下环境变量可选：
 
 ```bash
 RUST_LOG=debug ./target/release/kiro-rs
 ```
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `RUST_LOG` | `info` | 日志级别，例如 `debug` / `info` |
+| `KIRO_API_KEY` | - | 自动注入一个最高优先级的 Kiro API Key 凭据，可用于不写入 `credentials.json` 的场景 |
+| `KIRO_RS_IMAGE` | `ghcr.io/2ue/kiro-rs` | `docker-compose.deploy.yml` 使用的镜像仓库 |
+| `KIRO_RS_VERSION` | `latest` | `docker-compose.deploy.yml` 使用的镜像 tag |
+| `KIRO_RS_PORT` | `8990` | Docker 部署时映射到宿主机的端口 |
+
+Admin UI 本地开发时还可以用 `VITE_API_PROXY_TARGET` 覆盖 Vite 代理后端地址，默认 `http://localhost:8080`。
 
 ## API 端点
 

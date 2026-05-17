@@ -33,6 +33,40 @@ impl Default for PromptCacheSimulationMode {
     }
 }
 
+/// Anthropic compatibility profile.
+///
+/// `claude-code` keeps the pragmatic rewrites needed by Claude Code CLI and
+/// the Kiro upstream. `anthropic-strict` minimizes synthetic protocol and
+/// prompt rewrites for detector-style checks. `debug` follows `claude-code`
+/// behavior but exposes proxy warning headers by default.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompatProfile {
+    ClaudeCode,
+    AnthropicStrict,
+    Debug,
+}
+
+impl Default for CompatProfile {
+    fn default() -> Self {
+        Self::ClaudeCode
+    }
+}
+
+impl CompatProfile {
+    pub fn is_strict(self) -> bool {
+        matches!(self, Self::AnthropicStrict)
+    }
+
+    pub fn is_debug(self) -> bool {
+        matches!(self, Self::Debug)
+    }
+
+    pub fn allows_unsigned_thinking(self) -> bool {
+        !self.is_strict()
+    }
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -107,6 +141,10 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// Anthropic 兼容 profile（默认 claude-code）。
+    #[serde(default = "default_compat_profile")]
+    pub compat_profile: CompatProfile,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -141,6 +179,14 @@ pub struct Config {
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
+
+    /// 是否在响应头中暴露代理改写动作（默认 false）。
+    ///
+    /// 启用后，凡涉及消息合并 / 孤立 tool_use|tool_result 清理 / thinking 覆写等
+    /// 代理侧的隐式改写都会通过 `x-kiro-rs-warnings` 响应头汇总反馈，便于排查。
+    /// 仅写头，不会修改响应体，对客户端无副作用。
+    #[serde(default = "default_expose_proxy_warnings")]
+    pub expose_proxy_warnings: bool,
 
     /// 端点特定的配置
     ///
@@ -191,6 +237,10 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_compat_profile() -> CompatProfile {
+    CompatProfile::ClaudeCode
+}
+
 fn default_extract_thinking() -> bool {
     true
 }
@@ -219,6 +269,10 @@ fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
 
+fn default_expose_proxy_warnings() -> bool {
+    false
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -241,6 +295,7 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            compat_profile: default_compat_profile(),
             extract_thinking: default_extract_thinking(),
             prompt_cache_simulation_mode: default_prompt_cache_simulation_mode(),
             prompt_cache_target_read_ratio: default_prompt_cache_target_read_ratio(),
@@ -249,6 +304,7 @@ impl Default for Config {
             high_cache_threshold: default_high_cache_threshold(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
+            expose_proxy_warnings: default_expose_proxy_warnings(),
             config_path: None,
         }
     }
@@ -304,5 +360,28 @@ impl Config {
         fs::write(path, content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_compat_profile_is_claude_code() {
+        assert_eq!(Config::default().compat_profile, CompatProfile::ClaudeCode);
+    }
+
+    #[test]
+    fn compat_profile_deserializes_from_camel_case_config() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "apiKey": "sk-test",
+                "compatProfile": "anthropic-strict"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.compat_profile, CompatProfile::AnthropicStrict);
     }
 }

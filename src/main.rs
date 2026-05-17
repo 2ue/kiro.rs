@@ -175,6 +175,8 @@ async fn main() {
         prompt_cache.clone(),
         config.prompt_cache_simulation_mode,
         config.prompt_cache_target_read_ratio,
+        config.compat_profile,
+        config.expose_proxy_warnings,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）

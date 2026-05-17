@@ -5,9 +5,10 @@
 use std::collections::HashMap;
 
 use serde_json::json;
-use uuid::Uuid;
 
 use crate::kiro::model::events::{Event, MetadataTokenUsage};
+
+use super::envelope;
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
@@ -540,6 +541,8 @@ pub struct StreamContext {
     pub tool_name_map: HashMap<String, String>,
     /// thinking 是否启用
     pub thinking_enabled: bool,
+    /// 是否把 XML `<thinking>` 文本提取为 unsigned thinking block
+    pub extract_xml_thinking: bool,
     /// thinking 内容缓冲区
     pub thinking_buffer: String,
     /// 是否在 thinking 块内
@@ -578,20 +581,28 @@ impl StreamContext {
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
-        Self::new_with_simulation(model, input_tokens, thinking_enabled, tool_name_map, None)
+        Self::new_with_simulation(
+            model,
+            input_tokens,
+            thinking_enabled,
+            true,
+            tool_name_map,
+            None,
+        )
     }
 
     pub fn new_with_simulation(
         model: impl Into<String>,
         input_tokens: i32,
         thinking_enabled: bool,
+        extract_xml_thinking: bool,
         tool_name_map: HashMap<String, String>,
         simulated_usage: Option<super::cache::CacheSimulation>,
     ) -> Self {
         Self {
             state_manager: SseStateManager::new(),
             model: model.into(),
-            message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+            message_id: envelope::message_id(),
             input_tokens,
             context_input_tokens: None,
             metadata_usage: None,
@@ -599,6 +610,7 @@ impl StreamContext {
             tool_block_indices: HashMap::new(),
             tool_name_map,
             thinking_enabled,
+            extract_xml_thinking,
             thinking_buffer: String::new(),
             in_thinking_block: false,
             thinking_extracted: false,
@@ -811,7 +823,7 @@ impl StreamContext {
         self.output_tokens += estimate_tokens(content);
 
         // 如果启用了thinking，需要处理thinking块
-        if self.thinking_enabled && !self.native_reasoning_seen {
+        if self.thinking_enabled && self.extract_xml_thinking && !self.native_reasoning_seen {
             return self.process_content_with_thinking(content);
         }
 
@@ -1183,7 +1195,7 @@ impl StreamContext {
         // 但当 `</thinking>` 后面没有 `\n\n`（例如紧跟 tool_use 或流结束）时，
         // thinking 结束标签会滞留在 thinking_buffer，导致后续 flush 时把 `</thinking>` 当作内容输出。
         // 这里在开始 tool_use block 前做一次“边界场景”的结束标签识别与过滤。
-        if self.thinking_enabled && self.in_thinking_block {
+        if self.thinking_enabled && self.extract_xml_thinking && self.in_thinking_block {
             if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer) {
                 let thinking_content = self.thinking_buffer[..end_pos].to_string();
                 if !thinking_content.is_empty() {
@@ -1223,6 +1235,7 @@ impl StreamContext {
         // 如果此时直接开始 tool_use，状态机会自动关闭 text block，导致这段"待输出文本"看起来被 tool_use 吞掉。
         // 约束：只在尚未进入 thinking block、且 thinking 尚未被提取时，将缓冲区当作普通文本 flush。
         if self.thinking_enabled
+            && self.extract_xml_thinking
             && !self.in_thinking_block
             && !self.thinking_extracted
             && !self.thinking_buffer.is_empty()
@@ -1306,7 +1319,7 @@ impl StreamContext {
         }
 
         // Flush thinking_buffer 中的剩余内容
-        if self.thinking_enabled && !self.thinking_buffer.is_empty() {
+        if self.thinking_enabled && self.extract_xml_thinking && !self.thinking_buffer.is_empty() {
             if self.in_thinking_block {
                 // 末尾可能残留 `</thinking>`（例如紧跟 tool_use 或流结束），需要在 flush 时过滤掉结束标签。
                 if let Some(end_pos) =
@@ -1377,6 +1390,7 @@ impl StreamContext {
         // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
         // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
         if self.thinking_enabled
+            && self.extract_xml_thinking
             && self.thinking_block_index.is_some()
             && !self.state_manager.has_non_thinking_blocks()
         {
@@ -1570,6 +1584,32 @@ mod tests {
         assert!(
             signature_delta_pos < thinking_stop_pos,
             "signature_delta must be emitted before content_block_stop"
+        );
+    }
+
+    #[test]
+    fn test_xml_thinking_extraction_can_be_disabled_for_strict_profile() {
+        let mut ctx =
+            StreamContext::new_with_simulation("test-model", 1, true, false, HashMap::new(), None);
+
+        let mut events = ctx.process_assistant_response("<thinking>secret</thinking>\n\nvisible");
+        events.extend(ctx.generate_final_events());
+
+        assert!(
+            events.iter().all(|e| {
+                !(e.event == "content_block_start" && e.data["content_block"]["type"] == "thinking")
+            }),
+            "unsigned XML thinking should not be exposed as thinking block"
+        );
+        assert!(
+            events.iter().any(|e| {
+                e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "text_delta"
+                    && e.data["delta"]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("<thinking>secret</thinking>"))
+            }),
+            "XML thinking tags should remain ordinary text when extraction is disabled"
         );
     }
 

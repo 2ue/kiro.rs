@@ -12,36 +12,37 @@ use std::{
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
-use crate::model::config::PromptCacheSimulationMode;
+use crate::model::config::{CompatProfile, PromptCacheSimulationMode};
 use crate::token;
 use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
     extract::State,
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use chrono::Utc;
 use futures::{Stream, StreamExt, stream};
-use reqwest::header::CONTENT_TYPE as REQWEST_CONTENT_TYPE;
+use reqwest::header::{CONTENT_TYPE as REQWEST_CONTENT_TYPE, LOCATION as REQWEST_LOCATION};
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::time::{Instant, interval, sleep_until};
-use uuid::Uuid;
 
 use super::converter::{
-    ConversionError, convert_request, extract_stable_conversation_id,
-    infer_document_media_type_from_url, infer_image_format_from_url,
+    ConversionError, ConverterOptions, convert_request_with_options,
+    extract_stable_conversation_id, infer_document_media_type_from_url,
+    infer_image_format_from_url,
 };
+use super::envelope;
 use super::middleware::AppState;
 use super::prompt_cache::{PromptCacheProfile, PromptCacheScope};
 use super::stream::{SseEvent, StreamContext};
 use super::types::{
-    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
-    OutputConfig, Thinking,
+    CountTokensRequest, CountTokensResponse, MessagesRequest, Model, ModelsResponse, OutputConfig,
+    Thinking,
 };
 use super::usage::{UsageRecord, UsageRecordStatus, UsageSource};
 use super::websearch;
@@ -284,19 +285,24 @@ impl Drop for StreamUsageGuard {
     }
 }
 
-fn request_id() -> String {
-    format!("req_{}", Uuid::new_v4().to_string().replace('-', ""))
-}
-
 fn credential_label(provider: &crate::kiro::provider::KiroProvider, id: u64) -> Option<String> {
     provider.credential_label(id)
 }
 
 async fn materialize_remote_multimodal_sources(
     payload: &mut MessagesRequest,
+    caller_user_agent: Option<&str>,
 ) -> Result<(), String> {
-    let client = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(25))
+        .redirect(reqwest::redirect::Policy::none());
+    // 透传调用方原始 User-Agent；若调用方未提供则不强制设置。
+    if let Some(ua) = caller_user_agent {
+        if !ua.is_empty() {
+            builder = builder.user_agent(ua);
+        }
+    }
+    let client = builder
         .build()
         .map_err(|e| format!("failed to create remote source client: {}", e))?;
 
@@ -356,18 +362,67 @@ async fn download_remote_multimodal_source(
     url: &str,
     provided_media_type: Option<String>,
 ) -> Result<(String, String), String> {
-    if !url.starts_with("https://") && !url.starts_with("http://") {
-        return Err(format!(
-            "{} URL source must use http or https: {}",
-            block_type, url
-        ));
+    let mut current_url = url.to_string();
+    let mut response = None;
+
+    for redirect_count in 0..=5 {
+        if !current_url.starts_with("https://") && !current_url.starts_with("http://") {
+            return Err(format!(
+                "{} URL source must use http or https: {}",
+                block_type, current_url
+            ));
+        }
+
+        ensure_safe_remote_url_resolves(&current_url)
+            .await
+            .map_err(|reason| format!("{} URL rejected: {}", block_type, reason))?;
+
+        let candidate = client
+            .get(&current_url)
+            .send()
+            .await
+            .map_err(|e| format!("failed to download {} URL source: {}", block_type, e))?;
+
+        if candidate.status().is_redirection() {
+            if redirect_count >= 5 {
+                return Err(format!("{} URL source has too many redirects", block_type));
+            }
+
+            let location = candidate
+                .headers()
+                .get(REQWEST_LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| {
+                    format!(
+                        "{} URL source redirect is missing Location header",
+                        block_type
+                    )
+                })?;
+            let next_url = candidate
+                .url()
+                .join(location)
+                .map_err(|e| format!("invalid {} URL redirect: {}", block_type, e))?;
+            current_url = next_url.to_string();
+            continue;
+        }
+
+        response = Some(candidate);
+        break;
     }
 
-    let response = client
-        .get(url)
-        .send()
+    let response =
+        response.ok_or_else(|| format!("failed to download {} URL source", block_type))?;
+    let final_url = response.url().to_string();
+    if !final_url.starts_with("https://") && !final_url.starts_with("http://") {
+        return Err(format!(
+            "{} URL source must use http or https: {}",
+            block_type, final_url
+        ));
+    }
+    ensure_safe_remote_url_resolves(&final_url)
         .await
-        .map_err(|e| format!("failed to download {} URL source: {}", block_type, e))?;
+        .map_err(|reason| format!("{} URL rejected: {}", block_type, reason))?;
+
     let status = response.status();
     if !status.is_success() {
         return Err(format!(
@@ -376,32 +431,60 @@ async fn download_remote_multimodal_source(
         ));
     }
 
-    let response_media_type = response
-        .headers()
-        .get(REQWEST_CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(normalize_media_type);
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| format!("failed to read {} URL source: {}", block_type, e))?;
-    if bytes.len() > MAX_REMOTE_MULTIMODAL_BYTES {
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_REMOTE_MULTIMODAL_BYTES as u64)
+    {
         return Err(format!(
             "{} URL source exceeds {} bytes",
             block_type, MAX_REMOTE_MULTIMODAL_BYTES
         ));
     }
 
+    let response_media_type = response
+        .headers()
+        .get(REQWEST_CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(normalize_media_type);
+    let bytes = read_limited_response_body(response, block_type).await?;
+
     let media_type = infer_remote_media_type(
         block_type,
-        url,
+        &final_url,
         provided_media_type.as_deref(),
         response_media_type.as_deref(),
-        bytes.as_ref(),
+        bytes.as_slice(),
     )
-    .ok_or_else(|| format!("unsupported {} URL media type for {}", block_type, url))?;
+    .ok_or_else(|| {
+        format!(
+            "unsupported {} URL media type for {}",
+            block_type, final_url
+        )
+    })?;
 
-    Ok((media_type, BASE64_STANDARD.encode(bytes.as_ref())))
+    Ok((media_type, BASE64_STANDARD.encode(bytes.as_slice())))
+}
+
+async fn read_limited_response_body(
+    response: reqwest::Response,
+    block_type: &str,
+) -> Result<Vec<u8>, String> {
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|e| format!("failed to read {} URL source: {}", block_type, e))?;
+        if bytes.len() + chunk.len() > MAX_REMOTE_MULTIMODAL_BYTES {
+            return Err(format!(
+                "{} URL source exceeds {} bytes",
+                block_type, MAX_REMOTE_MULTIMODAL_BYTES
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
+    Ok(bytes)
 }
 
 fn replace_source_with_base64(item: &mut Value, media_type: String, data: String) {
@@ -497,6 +580,109 @@ fn image_media_type_from_format(format: &str) -> Option<&'static str> {
     }
 }
 
+/// 拒绝指向私有/回环/链路本地/云元数据等敏感网络的 URL，避免 SSRF。
+fn ensure_safe_remote_url(url_str: &str) -> Result<(), String> {
+    let parsed = ::url::Url::parse(url_str).map_err(|e| format!("invalid URL: {}", e))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL missing host".to_string())?;
+
+    let lower = host.to_ascii_lowercase();
+    const BLOCKED_HOSTS: &[&str] = &[
+        "localhost",
+        "ip6-localhost",
+        "ip6-loopback",
+        "metadata.google.internal",
+        "metadata",
+        "instance-data",
+    ];
+    if BLOCKED_HOSTS.contains(&lower.as_str()) || lower.ends_with(".localhost") {
+        return Err(format!("host {} is blocked", host));
+    }
+
+    let parsed_host_ip = match parsed.host() {
+        Some(::url::Host::Ipv4(ip)) => Some(std::net::IpAddr::V4(ip)),
+        Some(::url::Host::Ipv6(ip)) => Some(std::net::IpAddr::V6(ip)),
+        _ => host.parse::<std::net::IpAddr>().ok(),
+    };
+    if let Some(addr) = parsed_host_ip {
+        if is_blocked_ip(&addr) {
+            return Err(format!("IP {} is in a blocked range", addr));
+        }
+    }
+
+    Ok(())
+}
+
+async fn ensure_safe_remote_url_resolves(url_str: &str) -> Result<(), String> {
+    ensure_safe_remote_url(url_str)?;
+
+    let parsed = ::url::Url::parse(url_str).map_err(|e| format!("invalid URL: {}", e))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL missing host".to_string())?;
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "URL has no resolvable port".to_string())?;
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("DNS lookup failed for {}: {}", host, e))?;
+
+    let mut resolved_any = false;
+    for addr in addrs {
+        resolved_any = true;
+        let ip = addr.ip();
+        if is_blocked_ip(&ip) {
+            return Err(format!("resolved IP {} is in a blocked range", ip));
+        }
+    }
+
+    if !resolved_any {
+        return Err(format!("DNS lookup returned no records for {}", host));
+    }
+
+    Ok(())
+}
+
+fn is_blocked_ip(addr: &std::net::IpAddr) -> bool {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    match addr {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_documentation()
+                // CGNAT 100.64.0.0/10
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
+                // AWS/GCP/Azure metadata 169.254.169.254 已被 link_local 覆盖
+                || *v4 == Ipv4Addr::new(0, 0, 0, 0)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // ULA fc00::/7
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // Link-local fe80::/10
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                // IPv4-mapped: 解出来再判
+                || v6
+                    .to_ipv4_mapped()
+                    .map(|m| is_blocked_ip(&IpAddr::V4(m)))
+                    .unwrap_or(false)
+                || *v6 == Ipv6Addr::UNSPECIFIED
+        }
+    }
+}
+
 fn prepare_usage_context(
     state: &AppState,
     endpoint: &'static str,
@@ -516,7 +702,7 @@ fn prepare_usage_context(
     RequestUsageContext {
         recorder: state.usage_recorder.clone(),
         prompt_cache: state.prompt_cache.clone(),
-        request_id: request_id(),
+        request_id: envelope::request_id(),
         endpoint,
         stream,
         model: payload.model.clone(),
@@ -596,43 +782,84 @@ fn prepare_credential_usage_context(
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
-fn map_provider_error(err: Error) -> Response {
+fn map_provider_error(err: Error, request_id: Option<&str>) -> Response {
     let err_str = err.to_string();
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
     if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
         tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
+        return if let Some(request_id) = request_id {
+            envelope::error_response_with_id(
+                StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 "Context window is full. Reduce conversation history, system prompt, or tools.",
-            )),
-        )
-            .into_response();
+                request_id,
+            )
+        } else {
+            envelope::error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Context window is full. Reduce conversation history, system prompt, or tools.",
+            )
+        };
     }
 
     // 单次输入太长（请求体本身超出上游限制）
     if err_str.contains("Input is too long") {
         tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
+        return if let Some(request_id) = request_id {
+            envelope::error_response_with_id(
+                StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 "Input is too long. Reduce the size of your messages.",
-            )),
-        )
-            .into_response();
+                request_id,
+            )
+        } else {
+            envelope::error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Input is too long. Reduce the size of your messages.",
+            )
+        };
     }
     tracing::error!("Kiro API 调用失败: {}", err);
-    (
-        StatusCode::BAD_GATEWAY,
-        Json(ErrorResponse::new(
+    if let Some(request_id) = request_id {
+        envelope::error_response_with_id(
+            StatusCode::BAD_GATEWAY,
             "api_error",
             format!("上游 API 调用失败: {}", err),
-        )),
-    )
-        .into_response()
+            request_id,
+        )
+    } else {
+        envelope::error_response(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            format!("上游 API 调用失败: {}", err),
+        )
+    }
+}
+
+fn conversion_error_response(e: &ConversionError) -> Response {
+    let (error_type, message) = match e {
+        ConversionError::UnsupportedModel(model) => {
+            ("invalid_request_error", format!("模型不支持: {}", model))
+        }
+        ConversionError::EmptyMessages => ("invalid_request_error", "消息列表为空".to_string()),
+        ConversionError::UnsupportedContent(message) => ("invalid_request_error", message.clone()),
+    };
+    envelope::error_response(StatusCode::BAD_REQUEST, error_type, message)
+}
+
+fn should_expose_proxy_warnings(state: &AppState) -> bool {
+    state.expose_proxy_warnings && !state.compat_profile.is_strict()
+}
+
+fn should_extract_unsigned_thinking(state: &AppState, thinking_enabled: bool) -> bool {
+    state.extract_thinking && thinking_enabled && state.compat_profile.allows_unsigned_thinking()
+}
+
+fn websearch_supported_for_profile(profile: CompatProfile) -> bool {
+    !profile.is_strict()
 }
 
 /// GET /v1/models
@@ -817,6 +1044,7 @@ pub async fn get_models() -> impl IntoResponse {
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
+    headers: HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -831,31 +1059,34 @@ pub async fn post_messages(
         Some(p) => p.clone(),
         None => {
             tracing::error!("KiroProvider 未配置");
-            return (
+            return envelope::error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse::new(
-                    "service_unavailable",
-                    "Kiro API provider not configured",
-                )),
-            )
-                .into_response();
+                "service_unavailable",
+                "Kiro API provider not configured",
+            );
         }
     };
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
-    if let Err(message) = materialize_remote_multimodal_sources(&mut payload).await {
+    let caller_ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok());
+    if let Err(message) = materialize_remote_multimodal_sources(&mut payload, caller_ua).await {
         tracing::warn!("多模态远程 source 处理失败: {}", message);
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new("invalid_request_error", message)),
-        )
-            .into_response();
+        return envelope::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message);
     }
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
+        if !websearch_supported_for_profile(state.compat_profile) {
+            return envelope::error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "web_search server-tool synthesis is disabled in anthropic-strict profile",
+            );
+        }
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
@@ -870,26 +1101,16 @@ pub async fn post_messages(
     }
 
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let conversion_result = match convert_request_with_options(
+        &payload,
+        ConverterOptions {
+            compat_profile: state.compat_profile,
+        },
+    ) {
         Ok(result) => result,
         Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-                ConversionError::UnsupportedContent(message) => {
-                    ("invalid_request_error", message.clone())
-                }
-            };
             tracing::warn!("请求转换失败: {}", e);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
+            return conversion_error_response(&e);
         }
     };
 
@@ -903,14 +1124,11 @@ pub async fn post_messages(
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
-            return (
+            return envelope::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "internal_error",
-                    format!("序列化请求失败: {}", e),
-                )),
-            )
-                .into_response();
+                "internal_error",
+                format!("序列化请求失败: {}", e),
+            );
         }
     };
 
@@ -941,6 +1159,12 @@ pub async fn post_messages(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
+    let warnings_header = if should_expose_proxy_warnings(&state) {
+        conversion_result.warnings.encode_header()
+    } else {
+        None
+    };
+    let extract_xml_thinking = state.compat_profile.allows_unsigned_thinking();
 
     if payload.stream {
         // 流式响应
@@ -950,13 +1174,15 @@ pub async fn post_messages(
             &payload.model,
             input_tokens,
             thinking_enabled,
+            extract_xml_thinking,
             tool_name_map,
             usage_context,
+            warnings_header,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = state.extract_thinking && thinking_enabled;
+        let extract_thinking = should_extract_unsigned_thinking(&state, thinking_enabled);
         handle_non_stream_request(
             provider,
             &request_body,
@@ -965,6 +1191,7 @@ pub async fn post_messages(
             extract_thinking,
             tool_name_map,
             usage_context,
+            warnings_header,
         )
         .await
     }
@@ -977,18 +1204,21 @@ async fn handle_stream_request(
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
+    extract_xml_thinking: bool,
     tool_name_map: HashMap<String, String>,
     usage_context: RequestUsageContext,
+    warnings_header: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let response = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => {
             let message = e.to_string();
+            let request_id = usage_context.request_id.clone();
             usage_context
                 .attach_credential(None, None, false, false)
                 .record_failure(UsageRecordStatus::Error, "api_error", message);
-            return map_provider_error(e);
+            return map_provider_error(e, Some(&request_id));
         }
     };
     let (response, completion) = response.into_parts();
@@ -1005,6 +1235,7 @@ async fn handle_stream_request(
         model,
         input_tokens,
         thinking_enabled,
+        extract_xml_thinking,
         tool_name_map,
         credential_usage.request.simulated_usage,
     );
@@ -1013,16 +1244,15 @@ async fn handle_stream_request(
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
+    let response_request_id = credential_usage.request.request_id.clone();
     let stream = create_sse_stream(response, ctx, initial_events, completion, credential_usage);
 
     // 返回 SSE 响应
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
+    let mut builder = envelope::sse_builder_with_id(&response_request_id);
+    if let Some(warnings) = warnings_header {
+        builder = builder.header("x-kiro-rs-warnings", warnings);
+    }
+    builder.body(Body::from_stream(stream)).unwrap()
 }
 
 /// Ping 事件间隔（25秒）
@@ -1216,16 +1446,18 @@ async fn handle_non_stream_request(
     thinking_enabled: bool,
     tool_name_map: HashMap<String, String>,
     usage_context: RequestUsageContext,
+    warnings_header: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let api_response = match provider.call_api_with_context(request_body).await {
         Ok(resp) => resp,
         Err(e) => {
             let message = e.to_string();
+            let request_id = usage_context.request_id.clone();
             usage_context
                 .attach_credential(None, None, false, false)
                 .record_failure(UsageRecordStatus::Error, "api_error", message);
-            return map_provider_error(e);
+            return map_provider_error(e, Some(&request_id));
         }
     };
     let credential_usage = prepare_credential_usage_context(
@@ -1246,14 +1478,12 @@ async fn handle_non_stream_request(
                 "api_error",
                 format!("读取响应失败: {}", e),
             );
-            return (
+            return envelope::error_response_with_id(
                 StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new(
-                    "api_error",
-                    format!("读取响应失败: {}", e),
-                )),
-            )
-                .into_response();
+                "api_error",
+                format!("读取响应失败: {}", e),
+                &credential_usage.request.request_id,
+            );
         }
     };
 
@@ -1370,11 +1600,12 @@ async fn handle_non_stream_request(
                                 "invalid_request_error",
                                 message.clone(),
                             );
-                            return (
+                            return envelope::error_response_with_id(
                                 StatusCode::BAD_REQUEST,
-                                Json(ErrorResponse::new("invalid_request_error", message)),
-                            )
-                                .into_response();
+                                "invalid_request_error",
+                                message,
+                                &credential_usage.request.request_id,
+                            );
                         }
                         Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
@@ -1478,7 +1709,7 @@ async fn handle_non_stream_request(
 
     // 构建 Anthropic 响应
     let response_body = json!({
-        "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+        "id": envelope::message_id(),
         "type": "message",
         "role": "assistant",
         "content": content,
@@ -1488,14 +1719,22 @@ async fn handle_non_stream_request(
         "usage": usage.to_json()
     });
 
-    (StatusCode::OK, Json(response_body)).into_response()
+    envelope::json_response_with_id(
+        StatusCode::OK,
+        response_body,
+        &credential_usage.request.request_id,
+        warnings_header,
+    )
 }
 
-/// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+/// 检测模型名是否包含 "thinking" 后缀，若包含则在调用方未显式配置时注入 thinking
 ///
-/// - Opus 4.6 / 4.7：覆写为 adaptive 类型
-/// - 其他模型：覆写为 enabled 类型
-/// - budget_tokens 固定为 20000
+/// - 调用方已指定 `thinking` 字段：保留原值
+/// - 调用方未指定：根据模型注入
+///   - Opus 4.6 / 4.7：adaptive 类型
+///   - 其他模型：enabled 类型
+///   - budget_tokens 固定为 20000
+/// - `output_config.effort` 同样仅在调用方未设置时填充
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let model_lower = payload.model.to_lowercase();
     if !model_lower.contains("thinking") {
@@ -1525,18 +1764,24 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         "enabled"
     };
 
-    tracing::info!(
-        model = %payload.model,
-        thinking_type = thinking_type,
-        "模型名包含 thinking 后缀，覆写 thinking 配置"
-    );
+    if payload.thinking.is_none() {
+        tracing::info!(
+            model = %payload.model,
+            thinking_type = thinking_type,
+            "模型名包含 thinking 后缀，注入默认 thinking 配置"
+        );
+        payload.thinking = Some(Thinking {
+            thinking_type: thinking_type.to_string(),
+            budget_tokens: 20000,
+        });
+    } else {
+        tracing::debug!(
+            model = %payload.model,
+            "调用方已指定 thinking 配置，保留原值"
+        );
+    }
 
-    payload.thinking = Some(Thinking {
-        thinking_type: thinking_type.to_string(),
-        budget_tokens: 20000,
-    });
-
-    if is_adaptive_opus {
+    if is_adaptive_opus && payload.output_config.is_none() {
         payload.output_config = Some(OutputConfig {
             effort: if is_opus_4_7 { "xhigh" } else { "high" }.to_string(),
         });
@@ -1574,6 +1819,7 @@ pub async fn count_tokens(
 /// - 最终 usage 仍会在 message_delta 和 usage records 中修正
 pub async fn post_messages_cc(
     State(state): State<AppState>,
+    headers: HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -1589,31 +1835,34 @@ pub async fn post_messages_cc(
         Some(p) => p.clone(),
         None => {
             tracing::error!("KiroProvider 未配置");
-            return (
+            return envelope::error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse::new(
-                    "service_unavailable",
-                    "Kiro API provider not configured",
-                )),
-            )
-                .into_response();
+                "service_unavailable",
+                "Kiro API provider not configured",
+            );
         }
     };
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
-    if let Err(message) = materialize_remote_multimodal_sources(&mut payload).await {
+    let caller_ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok());
+    if let Err(message) = materialize_remote_multimodal_sources(&mut payload, caller_ua).await {
         tracing::warn!("多模态远程 source 处理失败: {}", message);
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new("invalid_request_error", message)),
-        )
-            .into_response();
+        return envelope::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message);
     }
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
+        if !websearch_supported_for_profile(state.compat_profile) {
+            return envelope::error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "web_search server-tool synthesis is disabled in anthropic-strict profile",
+            );
+        }
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
@@ -1628,26 +1877,16 @@ pub async fn post_messages_cc(
     }
 
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let conversion_result = match convert_request_with_options(
+        &payload,
+        ConverterOptions {
+            compat_profile: state.compat_profile,
+        },
+    ) {
         Ok(result) => result,
         Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-                ConversionError::UnsupportedContent(message) => {
-                    ("invalid_request_error", message.clone())
-                }
-            };
             tracing::warn!("请求转换失败: {}", e);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
+            return conversion_error_response(&e);
         }
     };
 
@@ -1661,14 +1900,11 @@ pub async fn post_messages_cc(
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
-            return (
+            return envelope::error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::new(
-                    "internal_error",
-                    format!("序列化请求失败: {}", e),
-                )),
-            )
-                .into_response();
+                "internal_error",
+                format!("序列化请求失败: {}", e),
+            );
         }
     };
 
@@ -1699,6 +1935,12 @@ pub async fn post_messages_cc(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
+    let warnings_header = if should_expose_proxy_warnings(&state) {
+        conversion_result.warnings.encode_header()
+    } else {
+        None
+    };
+    let extract_xml_thinking = state.compat_profile.allows_unsigned_thinking();
 
     if payload.stream {
         // 流式响应（实时模式）
@@ -1708,13 +1950,15 @@ pub async fn post_messages_cc(
             &payload.model,
             input_tokens,
             thinking_enabled,
+            extract_xml_thinking,
             tool_name_map,
             usage_context,
+            warnings_header,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = state.extract_thinking && thinking_enabled;
+        let extract_thinking = should_extract_unsigned_thinking(&state, thinking_enabled);
         handle_non_stream_request(
             provider,
             &request_body,
@@ -1723,6 +1967,7 @@ pub async fn post_messages_cc(
             extract_thinking,
             tool_name_map,
             usage_context,
+            warnings_header,
         )
         .await
     }
@@ -1876,6 +2121,8 @@ mod tests {
             prompt_cache.clone(),
             PromptCacheSimulationMode::LocalPromptCache,
             0.95,
+            CompatProfile::ClaudeCode,
+            false,
         );
         let payload = MessagesRequest {
             model: "claude-sonnet-4-6".to_string(),
@@ -1904,5 +2151,39 @@ mod tests {
 
         assert!(simulation.is_none());
         assert!(source.is_none());
+    }
+
+    #[test]
+    fn strict_profile_suppresses_proxy_warning_header() {
+        let prompt_cache = Arc::new(PromptCacheTracker::default());
+        let usage_recorder = Arc::new(UsageRecorder::new(10, None));
+        let state = AppState::new(
+            "test-key",
+            true,
+            usage_recorder,
+            prompt_cache,
+            PromptCacheSimulationMode::Disabled,
+            0.85,
+            CompatProfile::AnthropicStrict,
+            true,
+        );
+
+        assert!(!should_expose_proxy_warnings(&state));
+    }
+
+    #[test]
+    fn remote_url_safety_rejects_local_and_private_targets() {
+        for url in [
+            "http://localhost/image.png",
+            "http://127.0.0.1/image.png",
+            "http://10.0.0.5/image.png",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::1]/image.png",
+        ] {
+            assert!(
+                ensure_safe_remote_url(url).is_err(),
+                "{url} should be blocked"
+            );
+        }
     }
 }

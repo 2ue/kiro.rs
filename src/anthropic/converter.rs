@@ -15,6 +15,7 @@ use crate::kiro::model::requests::conversation::{
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
+use crate::model::config::CompatProfile;
 
 use super::types::{ContentBlock, MessagesRequest};
 
@@ -162,6 +163,75 @@ pub struct ConversionResult {
     pub conversation_state: ConversationState,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
+    /// 代理对入参的隐式改写汇总（兜底动作的统计），用于可选的 `x-kiro-rs-warnings` 响应头。
+    pub warnings: ProxyWarnings,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ConverterOptions {
+    pub compat_profile: CompatProfile,
+}
+
+impl Default for ConverterOptions {
+    fn default() -> Self {
+        Self {
+            compat_profile: CompatProfile::ClaudeCode,
+        }
+    }
+}
+
+impl ConverterOptions {
+    fn is_strict(self) -> bool {
+        self.compat_profile.is_strict()
+    }
+
+    fn inject_chunked_policy(self) -> bool {
+        !self.is_strict()
+    }
+
+    fn inject_thinking_prefix(self) -> bool {
+        !self.is_strict()
+    }
+}
+
+/// 代理在请求转换过程中执行的兜底改写计数
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ProxyWarnings {
+    /// 末尾 assistant 消息（prefill）被丢弃的次数
+    pub prefill_dropped: u32,
+    /// 因找不到对应 tool_use 而被跳过的当前轮 tool_result
+    pub orphan_tool_results: u32,
+    /// 因找不到对应 tool_result 而被从历史移除的 tool_use
+    pub orphan_tool_uses: u32,
+    /// 历史中重复出现的 tool_result（已配对过）被跳过
+    pub duplicate_tool_results: u32,
+}
+
+impl ProxyWarnings {
+    /// 编码为 `x-kiro-rs-warnings` 头值（仅包含计数 > 0 的项）。
+    pub fn encode_header(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if self.prefill_dropped > 0 {
+            parts.push(format!("prefill-dropped={}", self.prefill_dropped));
+        }
+        if self.orphan_tool_results > 0 {
+            parts.push(format!("orphan-tool-result={}", self.orphan_tool_results));
+        }
+        if self.orphan_tool_uses > 0 {
+            parts.push(format!("orphan-tool-use={}", self.orphan_tool_uses));
+        }
+        if self.duplicate_tool_results > 0 {
+            parts.push(format!(
+                "duplicate-tool-result={}",
+                self.duplicate_tool_results
+            ));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(","))
+        }
+    }
 }
 
 /// 转换错误
@@ -264,7 +334,18 @@ fn create_placeholder_tool(name: &str) -> Tool {
 }
 
 /// 将 Anthropic 请求转换为 Kiro 请求
+#[allow(dead_code)]
 pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
+    convert_request_with_options(req, ConverterOptions::default())
+}
+
+/// 将 Anthropic 请求转换为 Kiro 请求，并按兼容 profile 控制代理侧改写。
+pub fn convert_request_with_options(
+    req: &MessagesRequest,
+    options: ConverterOptions,
+) -> Result<ConversionResult, ConversionError> {
+    let mut warnings = ProxyWarnings::default();
+
     // 1. 映射模型
     let model_id = map_model(&req.model)
         .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
@@ -277,6 +358,13 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     // 2.5. 预处理 prefill：如果末尾是 assistant，静默丢弃并截断到最后一条 user
     // Claude 4.x 已弃用 assistant prefill，Kiro API 也不支持
     let messages: &[_] = if req.messages.last().is_some_and(|m| m.role != "user") {
+        if options.is_strict() {
+            return Err(ConversionError::UnsupportedContent(
+                "assistant prefill is not supported by this Kiro-backed Anthropic adapter"
+                    .to_string(),
+            ));
+        }
+        warnings.prefill_dropped += 1;
         tracing::info!("检测到末尾 assistant 消息（prefill），静默丢弃");
         let last_user_idx = req
             .messages
@@ -306,16 +394,29 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let mut tools = convert_tools(&req.tools, &mut tool_name_map);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
-    let mut history = build_history(req, messages, &model_id, &mut tool_name_map)?;
+    let mut history = build_history(req, messages, &model_id, &mut tool_name_map, options)?;
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
     // 同时返回孤立的 tool_use_id 集合，用于后续清理
     let (validated_tool_results, orphaned_tool_use_ids) =
-        validate_tool_pairing(&history, &tool_results);
+        validate_tool_pairing(&history, &tool_results, &mut warnings);
+
+    if options.is_strict()
+        && (warnings.orphan_tool_results > 0
+            || warnings.orphan_tool_uses > 0
+            || warnings.duplicate_tool_results > 0
+            || !orphaned_tool_use_ids.is_empty())
+    {
+        return Err(ConversionError::UnsupportedContent(
+            "tool_use/tool_result history is not strictly paired".to_string(),
+        ));
+    }
 
     // 9. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
-    remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
+    if !options.is_strict() {
+        remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
+    }
 
     // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
@@ -328,6 +429,12 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 
     for tool_name in history_tool_names {
         if !existing_tool_names.contains(&tool_name.to_lowercase()) {
+            if options.is_strict() {
+                return Err(ConversionError::UnsupportedContent(format!(
+                    "tool {} appears in history but is missing from tools",
+                    tool_name
+                )));
+            }
             tools.push(create_placeholder_tool(&tool_name));
         }
     }
@@ -369,6 +476,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     Ok(ConversionResult {
         conversation_state,
         tool_name_map,
+        warnings,
     })
 }
 
@@ -570,7 +678,7 @@ fn decode_document_to_text(media_type: &str, data: &str) -> Result<String, Conve
         }
         "application/pdf" => extract_text_from_pdf_bytes(&bytes).ok_or_else(|| {
             ConversionError::UnsupportedContent(
-                "PDF document text could not be extracted for the current Kiro upstream"
+                "PDF document text could not be extracted (encrypted, image-only, or malformed PDF)"
                     .to_string(),
             )
         })?,
@@ -593,6 +701,34 @@ fn format_document_text(media_type: &str, text: String) -> String {
 }
 
 fn extract_text_from_pdf_bytes(bytes: &[u8]) -> Option<String> {
+    if !bytes.starts_with(b"%PDF") {
+        return None;
+    }
+
+    // 优先使用 pdf-extract（支持压缩流、字体编码、布局）
+    match std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(bytes)) {
+        Ok(Ok(text)) => {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+            tracing::debug!("pdf-extract 返回空文本，尝试简易解析回退");
+        }
+        Ok(Err(err)) => {
+            tracing::debug!("pdf-extract 抽取失败，回退到简易解析: {}", err);
+        }
+        Err(_) => {
+            tracing::warn!("pdf-extract 抽取过程发生 panic，回退到简易解析");
+        }
+    }
+
+    extract_text_from_pdf_bytes_fallback(bytes)
+}
+
+/// 简易 PDF 文本抽取兜底：仅处理未压缩的 `(...) Tj` / `TJ` 形态。
+///
+/// 当 pdf-extract 解析失败（坏 PDF、不支持的编码等）时使用，能力非常有限。
+fn extract_text_from_pdf_bytes_fallback(bytes: &[u8]) -> Option<String> {
     let raw = String::from_utf8_lossy(bytes);
     if !raw.contains("%PDF") {
         return None;
@@ -736,6 +872,7 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
 fn validate_tool_pairing(
     history: &[Message],
     tool_results: &[ToolResult],
+    warnings: &mut ProxyWarnings,
 ) -> (Vec<ToolResult>, std::collections::HashSet<String>) {
     use std::collections::HashSet;
 
@@ -782,12 +919,14 @@ fn validate_tool_pairing(
             unpaired_tool_use_ids.remove(&result.tool_use_id);
         } else if all_tool_use_ids.contains(&result.tool_use_id) {
             // tool_use 存在但已经在历史中配对过了，这是重复的 tool_result
+            warnings.duplicate_tool_results += 1;
             tracing::warn!(
                 "跳过重复的 tool_result：该 tool_use 已在历史中配对，tool_use_id={}",
                 result.tool_use_id
             );
         } else {
             // 孤立 tool_result - 找不到对应的 tool_use
+            warnings.orphan_tool_results += 1;
             tracing::warn!(
                 "跳过孤立的 tool_result：找不到对应的 tool_use，tool_use_id={}",
                 result.tool_use_id
@@ -797,6 +936,7 @@ fn validate_tool_pairing(
 
     // 5. 检测真正孤立的 tool_use（有 tool_use 但在历史和当前消息中都没有 tool_result）
     for orphaned_id in &unpaired_tool_use_ids {
+        warnings.orphan_tool_uses += 1;
         tracing::warn!(
             "检测到孤立的 tool_use：找不到对应的 tool_result，将从历史中移除，tool_use_id={}",
             orphaned_id
@@ -955,11 +1095,16 @@ fn build_history(
     messages: &[super::types::Message],
     model_id: &str,
     tool_name_map: &mut HashMap<String, String>,
+    options: ConverterOptions,
 ) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
-    let thinking_prefix = generate_thinking_prefix(req);
+    let thinking_prefix = if options.inject_thinking_prefix() {
+        generate_thinking_prefix(req)
+    } else {
+        None
+    };
 
     // 1. 处理系统消息
     if let Some(ref system) = req.system {
@@ -971,7 +1116,11 @@ fn build_history(
 
         if !system_content.is_empty() {
             // 追加分块写入策略到系统消息
-            let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
+            let system_content = if options.inject_chunked_policy() {
+                format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY)
+            } else {
+                system_content
+            };
 
             // 注入thinking标签到系统消息最前面（如果需要且不存在）
             let final_content = if let Some(ref prefix) = thinking_prefix {
@@ -1784,6 +1933,92 @@ mod tests {
     }
 
     #[test]
+    fn test_anthropic_strict_avoids_chunk_policy_and_thinking_prefix() {
+        use super::super::types::{Message as AnthropicMessage, SystemMessage, Thinking};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: "Reply tersely.".to_string(),
+                cache_control: None,
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: 20000,
+            }),
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request_with_options(
+            &req,
+            ConverterOptions {
+                compat_profile: CompatProfile::AnthropicStrict,
+            },
+        )
+        .unwrap();
+
+        let first_user = result
+            .conversation_state
+            .history
+            .iter()
+            .find_map(|message| match message {
+                Message::User(user) => Some(&user.user_input_message.content),
+                _ => None,
+            })
+            .expect("system should be represented as first user history message");
+
+        assert_eq!(first_user, "Reply tersely.");
+        assert!(!first_user.contains(SYSTEM_CHUNKED_POLICY));
+        assert!(!first_user.contains("<thinking_mode>"));
+    }
+
+    #[test]
+    fn test_anthropic_strict_rejects_prefill_instead_of_dropping_it() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Hello"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("prefill"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let err = convert_request_with_options(
+            &req,
+            ConverterOptions {
+                compat_profile: CompatProfile::AnthropicStrict,
+            },
+        )
+        .expect_err("strict profile should reject prefill");
+
+        assert!(err.to_string().contains("assistant prefill"));
+    }
+
+    #[test]
     fn test_validate_tool_pairing_orphaned_result() {
         // 测试孤立的 tool_result 被过滤
         // 历史中没有 tool_use，但 tool_results 中有 tool_result
@@ -1794,7 +2029,8 @@ mod tests {
 
         let tool_results = vec![ToolResult::success("orphan-123", "some result")];
 
-        let (filtered, _) = validate_tool_pairing(&history, &tool_results);
+        let (filtered, _) =
+            validate_tool_pairing(&history, &tool_results, &mut ProxyWarnings::default());
 
         // 孤立的 tool_result 应该被过滤掉
         assert!(filtered.is_empty(), "孤立的 tool_result 应该被过滤");
@@ -1824,7 +2060,8 @@ mod tests {
         // 没有 tool_result
         let tool_results: Vec<ToolResult> = vec![];
 
-        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results);
+        let (filtered, orphaned) =
+            validate_tool_pairing(&history, &tool_results, &mut ProxyWarnings::default());
 
         // 结果应该为空（因为没有 tool_result）
         // 同时应该返回孤立的 tool_use_id
@@ -1855,7 +2092,8 @@ mod tests {
 
         let tool_results = vec![ToolResult::success("tool-1", "file content")];
 
-        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results);
+        let (filtered, orphaned) =
+            validate_tool_pairing(&history, &tool_results, &mut ProxyWarnings::default());
 
         // 配对成功，应该保留，无孤立
         assert_eq!(filtered.len(), 1);
@@ -1887,7 +2125,8 @@ mod tests {
             ToolResult::success("tool-3", "orphan result"), // 孤立
         ];
 
-        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results);
+        let (filtered, orphaned) =
+            validate_tool_pairing(&history, &tool_results, &mut ProxyWarnings::default());
 
         // 只有 tool-1 应该保留
         assert_eq!(filtered.len(), 1);
@@ -1935,7 +2174,8 @@ mod tests {
         // 当前消息没有 tool_results（用户只是继续对话）
         let tool_results: Vec<ToolResult> = vec![];
 
-        let (filtered, orphaned) = validate_tool_pairing(&history, &tool_results);
+        let (filtered, orphaned) =
+            validate_tool_pairing(&history, &tool_results, &mut ProxyWarnings::default());
 
         // 结果应该为空，且不应该有孤立 tool_use
         // 因为 tool-1 已经在历史中配对了
@@ -1977,7 +2217,8 @@ mod tests {
         // 当前消息又发送了相同的 tool_result（重复）
         let tool_results = vec![ToolResult::success("tool-1", "file content again")];
 
-        let (filtered, _) = validate_tool_pairing(&history, &tool_results);
+        let (filtered, _) =
+            validate_tool_pairing(&history, &tool_results, &mut ProxyWarnings::default());
 
         // 重复的 tool_result 应该被过滤掉
         assert!(filtered.is_empty(), "重复的 tool_result 应该被过滤");

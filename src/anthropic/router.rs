@@ -10,7 +10,7 @@ use axum::{
 };
 
 use crate::kiro::provider::KiroProvider;
-use crate::model::config::PromptCacheSimulationMode;
+use crate::model::config::{CompatProfile, PromptCacheSimulationMode};
 
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
@@ -47,6 +47,8 @@ pub fn create_router_with_provider(
     prompt_cache: Arc<PromptCacheTracker>,
     prompt_cache_simulation_mode: PromptCacheSimulationMode,
     prompt_cache_target_read_ratio: f64,
+    compat_profile: CompatProfile,
+    expose_proxy_warnings: bool,
 ) -> Router {
     let mut state = AppState::new(
         api_key,
@@ -55,6 +57,8 @@ pub fn create_router_with_provider(
         prompt_cache,
         prompt_cache_simulation_mode,
         prompt_cache_target_read_ratio,
+        compat_profile,
+        expose_proxy_warnings,
     );
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);

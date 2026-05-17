@@ -8,7 +8,11 @@ use std::collections::HashMap;
 /// API 错误响应
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
+    #[serde(rename = "type")]
+    pub response_type: &'static str,
     pub error: ErrorDetail,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 /// 错误详情
@@ -23,14 +27,22 @@ impl ErrorResponse {
     /// 创建新的错误响应
     pub fn new(error_type: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
+            response_type: "error",
             error: ErrorDetail {
                 error_type: error_type.into(),
                 message: message.into(),
             },
+            request_id: None,
         }
     }
 
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
+        self
+    }
+
     /// 创建认证错误响应
+    #[allow(dead_code)]
     pub fn authentication_error() -> Self {
         Self::new("authentication_error", "Invalid API key")
     }

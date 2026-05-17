@@ -7,14 +7,14 @@ use axum::{
     extract::State,
     http::{Request, StatusCode},
     middleware::Next,
-    response::{IntoResponse, Json, Response},
+    response::Response,
 };
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
-use crate::model::config::PromptCacheSimulationMode;
+use crate::model::config::{CompatProfile, PromptCacheSimulationMode};
 
-use super::{prompt_cache::PromptCacheTracker, types::ErrorResponse, usage::UsageRecorder};
+use super::{envelope, prompt_cache::PromptCacheTracker, usage::UsageRecorder};
 
 /// 应用共享状态
 #[derive(Clone)]
@@ -34,6 +34,10 @@ pub struct AppState {
     pub prompt_cache_simulation_mode: PromptCacheSimulationMode,
     /// 本地 prompt-cache 模拟目标 cache read 比例
     pub prompt_cache_target_read_ratio: f64,
+    /// Anthropic compatibility profile
+    pub compat_profile: CompatProfile,
+    /// 是否在响应头中暴露代理改写动作
+    pub expose_proxy_warnings: bool,
 }
 
 impl AppState {
@@ -45,6 +49,8 @@ impl AppState {
         prompt_cache: Arc<PromptCacheTracker>,
         prompt_cache_simulation_mode: PromptCacheSimulationMode,
         prompt_cache_target_read_ratio: f64,
+        compat_profile: CompatProfile,
+        expose_proxy_warnings: bool,
     ) -> Self {
         Self {
             api_key: api_key.into(),
@@ -54,6 +60,8 @@ impl AppState {
             prompt_cache,
             prompt_cache_simulation_mode,
             prompt_cache_target_read_ratio: prompt_cache_target_read_ratio.clamp(0.0, 0.99),
+            compat_profile,
+            expose_proxy_warnings: expose_proxy_warnings || compat_profile.is_debug(),
         }
     }
 
@@ -71,11 +79,19 @@ pub async fn auth_middleware(
     next: Next,
 ) -> Response {
     match auth::extract_api_key(&request) {
-        Some(key) if auth::constant_time_eq(&key, &state.api_key) => next.run(request).await,
-        _ => {
-            let error = ErrorResponse::authentication_error();
-            (StatusCode::UNAUTHORIZED, Json(error)).into_response()
+        Some(key) if auth::constant_time_eq(&key, &state.api_key) => {
+            let mut response = next.run(request).await;
+            if !response.headers().contains_key("request-id") {
+                let request_id = envelope::request_id();
+                envelope::insert_request_id_headers(response.headers_mut(), &request_id);
+            }
+            response
         }
+        _ => envelope::error_response(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "Invalid API key",
+        ),
     }
 }
 

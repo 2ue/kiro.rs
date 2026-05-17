@@ -24,6 +24,7 @@
 
 pub(crate) mod cache;
 mod converter;
+mod envelope;
 mod handlers;
 mod middleware;
 pub(crate) mod prompt_cache;

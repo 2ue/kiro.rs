@@ -4,19 +4,16 @@
 
 use std::convert::Infallible;
 
-use axum::{
-    body::Body,
-    http::{StatusCode, header},
-    response::{IntoResponse, Json, Response},
-};
+use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
 use futures::{Stream, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
+use super::envelope;
 use super::stream::SseEvent;
-use super::types::{ErrorResponse, MessagesRequest};
+use super::types::MessagesRequest;
 
 /// MCP 请求
 #[derive(Debug, Serialize)]
@@ -240,10 +237,7 @@ fn generate_websearch_events(
     input_tokens: i32,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
-    let message_id = format!(
-        "msg_{}",
-        Uuid::new_v4().to_string().replace('-', "")[..24].to_string()
-    );
+    let message_id = envelope::message_id();
 
     // 1. message_start
     events.push(SseEvent::new(
@@ -480,14 +474,11 @@ pub async fn handle_websearch_request(
     let query = match extract_search_query(payload) {
         Some(q) => q,
         None => {
-            return (
+            return envelope::error_response(
                 StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(
-                    "invalid_request_error",
-                    "无法从消息中提取搜索查询",
-                )),
-            )
-                .into_response();
+                "invalid_request_error",
+                "无法从消息中提取搜索查询",
+            );
         }
     };
 
@@ -510,11 +501,8 @@ pub async fn handle_websearch_request(
     let stream =
         create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
+    let request_id = envelope::request_id();
+    envelope::sse_builder_with_id(&request_id)
         .body(Body::from_stream(stream))
         .unwrap()
 }

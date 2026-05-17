@@ -11,6 +11,7 @@ it from the repository root when the goal is tool behavior testing.
 ```powershell
 $env:ANTHROPIC_BASE_URL = 'http://127.0.0.1:8080'
 $env:ANTHROPIC_AUTH_TOKEN = 'sk-kiro-rs-local-dev'
+$env:ANTHROPIC_API_KEY = 'sk-kiro-rs-local-dev'
 $env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'
 
 Get-Content .\prompt.txt -Raw | claude -p `
