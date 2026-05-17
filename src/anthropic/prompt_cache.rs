@@ -557,7 +557,7 @@ fn is_anthropic_billing_header_block(value: &Value) -> bool {
         .unwrap_or(false)
 }
 
-fn canonicalize_cache_value(value: &Value) -> String {
+pub(crate) fn canonicalize_cache_value(value: &Value) -> String {
     let mut out = String::new();
     write_canonical_json(value, &mut out);
     out

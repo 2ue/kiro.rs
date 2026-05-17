@@ -197,10 +197,12 @@ pub fn build_usage_with_simulation_policy(
                 } else {
                     output_tokens
                 };
-                return simulation.to_usage(
-                    usage.total_input_tokens().max(total_input_tokens),
-                    output_tokens,
-                );
+                let total_input_tokens = if usage.total_input_tokens() > 0 {
+                    usage.total_input_tokens()
+                } else {
+                    total_input_tokens
+                };
+                return simulation.to_usage(total_input_tokens, output_tokens);
             }
         }
 
@@ -282,11 +284,11 @@ mod tests {
         let usage =
             build_usage_with_simulation_policy(Some(&metadata), 100_000, 7, simulation, true);
 
-        assert_eq!(usage.total_input_tokens, 100_000);
+        assert_eq!(usage.total_input_tokens, 50_000);
         assert_eq!(usage.output_tokens, 42);
-        assert_eq!(usage.cache_read_input_tokens, 95_000);
+        assert_eq!(usage.cache_read_input_tokens, 47_500);
         assert_eq!(usage.cache_creation_input_tokens, 0);
-        assert_eq!(usage.input_tokens, 5_000);
+        assert_eq!(usage.input_tokens, 2_500);
     }
 
     #[test]

@@ -18,7 +18,9 @@ The local instance is running with high-cache prompt-cache usage simulation:
 }
 ```
 
-In high-cache mode, the proxy builds a local prompt cache profile even when the request does not include explicit `cache_control`. If upstream metadata reports zero cache read/write tokens, the local simulated usage is used to fill Anthropic-compatible cache fields so downstream usage records are not all zero.
+In high-cache mode, the proxy builds a local prompt cache profile even when the request does not include explicit `cache_control`. If upstream metadata reports zero cache read/write tokens, the local simulated usage is used to fill Anthropic-compatible cache fields so downstream usage records are not all zero. When metadata total input is available, it is preserved instead of being replaced by a larger local estimate.
+
+For requests without metadata/session, the converter now derives a deterministic conversation id from the stable prompt anchor, which keeps the local prompt cache scope stable across turns.
 
 ## Real Test Summary
 

@@ -8,6 +8,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::anthropic::prompt_cache::canonicalize_cache_value;
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
     HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
@@ -289,6 +290,41 @@ pub(crate) fn extract_stable_conversation_id(req: &MessagesRequest) -> Option<St
         .as_ref()
         .and_then(|m| m.user_id.as_ref())
         .and_then(|user_id| extract_session_id(user_id))
+        .or_else(|| derive_fallback_conversation_id(req))
+}
+
+fn derive_fallback_conversation_id(req: &MessagesRequest) -> Option<String> {
+    let seed = if let Some(first_user_message) =
+        req.messages.iter().find(|message| message.role == "user")
+    {
+        serde_json::json!({
+            "system": &req.system,
+            "tools": &req.tools,
+            "first_user_message": first_user_message,
+        })
+    } else {
+        serde_json::json!({
+            "system": &req.system,
+            "tools": &req.tools,
+            "messages": &req.messages,
+        })
+    };
+
+    Some(deterministic_conversation_id(&canonicalize_cache_value(
+        &seed,
+    )))
+}
+
+fn deterministic_conversation_id(seed: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"kiro.rs:anthropic:conversation-id:v1:");
+    hasher.update(seed.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes).to_string()
 }
 
 /// 简单验证 UUID 格式（36 字符，包含 4 个连字符）
@@ -377,7 +413,7 @@ pub fn convert_request_with_options(
     };
 
     // 3. 生成会话 ID 和代理 ID
-    // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
+    // 优先从 metadata.user_id 中提取 session UUID；缺失时从稳定请求锚点派生确定性 UUID
     let conversation_id =
         extract_stable_conversation_id(req).unwrap_or_else(|| Uuid::new_v4().to_string());
     let agent_continuation_id = Uuid::new_v4().to_string();
@@ -1898,11 +1934,10 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_request_without_metadata() {
-        use super::super::types::Message as AnthropicMessage;
+    fn test_convert_request_without_metadata_is_stable_across_turns() {
+        use super::super::types::{Message as AnthropicMessage, SystemMessage};
 
-        // 测试没有 metadata 的请求，应该生成新的 UUID
-        let req = MessagesRequest {
+        let first_req = MessagesRequest {
             model: "claude-sonnet-4".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
@@ -1910,7 +1945,10 @@ mod tests {
                 content: serde_json::json!("Hello"),
             }],
             stream: false,
-            system: None,
+            system: Some(vec![SystemMessage {
+                text: "You are a helpful coding assistant.".to_string(),
+                cache_control: Some(serde_json::json!({"type": "ephemeral"})),
+            }]),
             tools: None,
             tool_choice: None,
             thinking: None,
@@ -1918,17 +1956,42 @@ mod tests {
             metadata: None,
         };
 
-        let result = convert_request(&req).unwrap();
-        // 验证生成的是有效的 UUID 格式
-        assert_eq!(result.conversation_state.conversation_id.len(), 36);
+        let second_req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Hello"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("Sure."),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Add tests for it."),
+                },
+            ],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: "You are a helpful coding assistant.".to_string(),
+                cache_control: None,
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let first_result = convert_request(&first_req).unwrap();
+        let second_result = convert_request(&second_req).unwrap();
+
+        assert_eq!(first_result.conversation_state.conversation_id.len(), 36);
         assert_eq!(
-            result
-                .conversation_state
-                .conversation_id
-                .chars()
-                .filter(|c| *c == '-')
-                .count(),
-            4
+            first_result.conversation_state.conversation_id,
+            second_result.conversation_state.conversation_id
         );
     }
 

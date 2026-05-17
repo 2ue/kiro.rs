@@ -2210,6 +2210,120 @@ mod tests {
     }
 
     #[test]
+    fn high_cache_missing_metadata_fallback_conversation_reads_second_turn() {
+        let prompt_cache = Arc::new(PromptCacheTracker::default());
+        let usage_recorder = Arc::new(UsageRecorder::new(10, None));
+        let state = AppState::new(
+            "test-key",
+            true,
+            usage_recorder,
+            prompt_cache,
+            PromptCacheSimulationMode::HighCache,
+            0.95,
+            CompatProfile::ClaudeCode,
+            false,
+        );
+        let first_payload = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 16,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!("start high cache session"),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: "stable high cache system prompt ".repeat(700),
+                cache_control: None,
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let first_conversation_id =
+            extract_stable_conversation_id(&first_payload).expect("fallback id");
+        let first_context = prepare_usage_context(
+            &state,
+            "/v1/messages",
+            false,
+            &first_payload,
+            Some(first_conversation_id.clone()),
+            Some(first_conversation_id.clone()),
+            4096,
+        );
+        let first_usage = attach_test_credential_usage(first_context, 1);
+        let first_usage_body = cache::build_usage_with_simulation_policy(
+            None,
+            4096,
+            1,
+            first_usage.request.simulated_usage,
+            true,
+        );
+        assert!(first_usage_body.cache_creation_input_tokens > 0);
+        assert_eq!(first_usage_body.cache_read_input_tokens, 0);
+        let first_source = first_usage.usage_source(&first_usage_body, None, false);
+        assert_eq!(first_source, UsageSource::LocalPromptCache);
+        first_usage.record_success(first_usage_body, first_source, false);
+
+        let second_payload = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 16,
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: json!("start high cache session"),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: json!("ready"),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: json!("continue the same session"),
+                },
+            ],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: "stable high cache system prompt ".repeat(700),
+                cache_control: None,
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let second_conversation_id =
+            extract_stable_conversation_id(&second_payload).expect("fallback id");
+        assert_eq!(first_conversation_id, second_conversation_id);
+
+        let second_context = prepare_usage_context(
+            &state,
+            "/v1/messages",
+            false,
+            &second_payload,
+            Some(second_conversation_id.clone()),
+            Some(second_conversation_id),
+            8192,
+        );
+        let second_usage = attach_test_credential_usage(second_context, 1);
+        let second_usage_body = cache::build_usage_with_simulation_policy(
+            None,
+            8192,
+            1,
+            second_usage.request.simulated_usage,
+            true,
+        );
+
+        assert!(second_usage_body.cache_read_input_tokens > 0);
+        assert_eq!(
+            second_usage.usage_source(&second_usage_body, None, false),
+            UsageSource::LocalPromptCache
+        );
+    }
+
+    #[test]
     fn local_prompt_cache_does_not_simulate_without_stable_conversation_id() {
         let prompt_cache = Arc::new(PromptCacheTracker::default());
         let usage_recorder = Arc::new(UsageRecorder::new(10, None));
@@ -2250,6 +2364,33 @@ mod tests {
 
         assert!(simulation.is_none());
         assert!(source.is_none());
+    }
+
+    fn attach_test_credential_usage(
+        mut usage_context: RequestUsageContext,
+        credential_id: u64,
+    ) -> CredentialUsageContext {
+        let scope = usage_context
+            .conversation_id
+            .as_ref()
+            .map(|conversation_id| PromptCacheScope {
+                credential_id,
+                conversation_id: conversation_id.clone(),
+                model: usage_context.model.clone(),
+            });
+        let prompt_usage = usage_context.prompt_cache.compute(
+            scope,
+            usage_context.prompt_cache_profile.as_ref(),
+            usage_context.prompt_cache_target_read_ratio,
+        );
+        usage_context.simulated_usage = cache::CacheSimulation::from_prompt_cache_with_ratio(
+            prompt_usage,
+            usage_context.prompt_cache_target_read_ratio,
+        );
+        usage_context.simulated_source = usage_context
+            .simulated_usage
+            .map(|_| UsageSource::LocalPromptCache);
+        usage_context.attach_credential(Some(credential_id), None, false, false)
     }
 
     #[test]

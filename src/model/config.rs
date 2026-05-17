@@ -251,7 +251,7 @@ fn default_prompt_cache_simulation_mode() -> PromptCacheSimulationMode {
 }
 
 fn default_prompt_cache_target_read_ratio() -> f64 {
-    0.85
+    0.95
 }
 
 fn default_usage_record_limit() -> usize {
@@ -379,6 +379,11 @@ mod tests {
             Config::default().prompt_cache_simulation_mode,
             PromptCacheSimulationMode::HighCache
         );
+    }
+
+    #[test]
+    fn default_prompt_cache_target_read_ratio_is_95_percent() {
+        assert_eq!(Config::default().prompt_cache_target_read_ratio, 0.95);
     }
 
     #[test]
