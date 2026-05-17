@@ -10,7 +10,7 @@
   "loadBalancingMode": "priority",
   "compatProfile": "claude-code",
   "extractThinking": true,
-  "promptCacheSimulationMode": "disabled",
+  "promptCacheSimulationMode": "high-cache",
   "promptCacheTargetReadRatio": 0.85,
   "usageRecordLimit": 5000,
   "usageRecordPersist": true,

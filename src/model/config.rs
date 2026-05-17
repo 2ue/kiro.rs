@@ -19,7 +19,7 @@ impl Default for TlsBackend {
 
 /// 本地 prompt-cache usage 模拟模式。
 ///
-/// 默认关闭；`high-cache` 会在上游 metadata 未报告 cache 时用本地缓存估算补足。
+/// 默认启用 high-cache；`disabled` 可关闭本地 prompt-cache usage 模拟。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum PromptCacheSimulationMode {
@@ -153,7 +153,7 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
-    /// 本地 prompt-cache usage 模拟模式（默认 disabled）。
+    /// 本地 prompt-cache usage 模拟模式（默认 high-cache）。
     #[serde(default = "default_prompt_cache_simulation_mode")]
     pub prompt_cache_simulation_mode: PromptCacheSimulationMode,
 
@@ -247,7 +247,7 @@ fn default_extract_thinking() -> bool {
 }
 
 fn default_prompt_cache_simulation_mode() -> PromptCacheSimulationMode {
-    PromptCacheSimulationMode::Disabled
+    PromptCacheSimulationMode::HighCache
 }
 
 fn default_prompt_cache_target_read_ratio() -> f64 {
@@ -374,6 +374,29 @@ mod tests {
     }
 
     #[test]
+    fn default_prompt_cache_simulation_mode_is_high_cache() {
+        assert_eq!(
+            Config::default().prompt_cache_simulation_mode,
+            PromptCacheSimulationMode::HighCache
+        );
+    }
+
+    #[test]
+    fn missing_prompt_cache_simulation_mode_defaults_to_high_cache() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "apiKey": "sk-test"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.prompt_cache_simulation_mode,
+            PromptCacheSimulationMode::HighCache
+        );
+    }
+
+    #[test]
     fn compat_profile_deserializes_from_camel_case_config() {
         let config: Config = serde_json::from_str(
             r#"{
@@ -399,6 +422,22 @@ mod tests {
         assert_eq!(
             config.prompt_cache_simulation_mode,
             PromptCacheSimulationMode::HighCache
+        );
+    }
+
+    #[test]
+    fn prompt_cache_simulation_mode_still_deserializes_local_prompt_cache() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "apiKey": "sk-test",
+                "promptCacheSimulationMode": "local-prompt-cache"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.prompt_cache_simulation_mode,
+            PromptCacheSimulationMode::LocalPromptCache
         );
     }
 }
