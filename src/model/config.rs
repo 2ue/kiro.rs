@@ -19,12 +19,13 @@ impl Default for TlsBackend {
 
 /// 本地 prompt-cache usage 模拟模式。
 ///
-/// 默认关闭；真实 Kiro metadata usage 始终优先。
+/// 默认关闭；`high-cache` 会在上游 metadata 未报告 cache 时用本地缓存估算补足。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum PromptCacheSimulationMode {
     Disabled,
     LocalPromptCache,
+    HighCache,
 }
 
 impl Default for PromptCacheSimulationMode {
@@ -158,9 +159,9 @@ pub struct Config {
 
     /// 本地 prompt-cache 模拟的目标 cache read 中心比例。
     ///
-    /// 仅对 local-prompt-cache 生效；读取仍必须命中同一凭据、会话、模型下
-    /// 已创建过的缓存前缀，不会凭空制造 cache read。实际比例会围绕该值
-    /// 做小范围确定性浮动，避免每次都精确落在同一个百分比。
+    /// 对 local-prompt-cache 和 high-cache 生效；读取仍必须命中同一凭据、
+    /// 会话、模型下已创建过的缓存前缀，不会凭空制造 cache read。实际比例会
+    /// 围绕该值做小范围确定性浮动，避免每次都精确落在同一个百分比。
     #[serde(default = "default_prompt_cache_target_read_ratio")]
     pub prompt_cache_target_read_ratio: f64,
 
@@ -383,5 +384,21 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.compat_profile, CompatProfile::AnthropicStrict);
+    }
+
+    #[test]
+    fn prompt_cache_simulation_mode_deserializes_high_cache() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "apiKey": "sk-test",
+                "promptCacheSimulationMode": "high-cache"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.prompt_cache_simulation_mode,
+            PromptCacheSimulationMode::HighCache
+        );
     }
 }

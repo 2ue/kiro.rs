@@ -194,8 +194,8 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `compatProfile` | string | `claude-code` | 兼容 profile：`claude-code` 优先真实 Claude Code CLI 可用性；`anthropic-strict` 减少代理改写和调试特征；`debug` 等同 `claude-code` 但默认暴露代理 warning |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
-| `promptCacheSimulationMode` | string | `disabled` | 本地 prompt-cache usage 模拟模式。生产建议保持 `disabled`；联调可用 `local-prompt-cache` |
-| `promptCacheTargetReadRatio` | number | `0.85` | 本地 prompt-cache 模拟的目标 cache read 中心比例，仅对 `local-prompt-cache` 生效 |
+| `promptCacheSimulationMode` | string | `disabled` | 本地 prompt-cache usage 模拟模式。生产建议保持 `disabled`；联调可用 `local-prompt-cache`，需要尽量高缓存可显式设为 `high-cache` |
+| `promptCacheTargetReadRatio` | number | `0.85` | 本地 prompt-cache 模拟的目标 cache read 中心比例，对 `local-prompt-cache` 和 `high-cache` 生效 |
 | `usageRecordLimit` | number | `5000` | Admin usage record 内存保留上限 |
 | `usageRecordPersist` | boolean | `true` | 是否将 usage record 追加写入 `kiro_usage_records.jsonl` |
 | `highCacheThreshold` | number | `10000` | Admin 统计高缓存请求的 cache read 阈值 |
@@ -236,6 +236,12 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
    "exposeProxyWarnings": false
 }
 ```
+
+`promptCacheSimulationMode` 支持：
+
+- `disabled`：默认值，不做本地 prompt-cache usage 模拟。
+- `local-prompt-cache`：仅在请求存在显式 `cache_control` 时按同一凭据、会话、模型的本地缓存命中情况模拟 usage。
+- `high-cache`：即使请求没有显式 `cache_control`，也会按稳定前缀建立本地缓存；如果上游 metadata 返回的 cache read/write 都是 0，会用本地缓存 usage 补足 cache 字段。
 
 ### credentials.json
 

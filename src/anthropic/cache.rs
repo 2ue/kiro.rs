@@ -173,7 +173,37 @@ pub fn build_usage_with_simulation(
     output_tokens: i32,
     simulation: Option<CacheSimulation>,
 ) -> CacheUsage {
+    build_usage_with_simulation_policy(
+        metadata_usage,
+        total_input_tokens,
+        output_tokens,
+        simulation,
+        false,
+    )
+}
+
+pub fn build_usage_with_simulation_policy(
+    metadata_usage: Option<&MetadataTokenUsage>,
+    total_input_tokens: i32,
+    output_tokens: i32,
+    simulation: Option<CacheSimulation>,
+    fill_zero_metadata_cache_from_simulation: bool,
+) -> CacheUsage {
     if let Some(usage) = metadata_usage {
+        if fill_zero_metadata_cache_from_simulation && metadata_cache_is_empty(usage) {
+            if let Some(simulation) = simulation {
+                let output_tokens = if usage.output_tokens > 0 {
+                    usage.output_tokens
+                } else {
+                    output_tokens
+                };
+                return simulation.to_usage(
+                    usage.total_input_tokens().max(total_input_tokens),
+                    output_tokens,
+                );
+            }
+        }
+
         return CacheUsage {
             total_input_tokens: usage.total_input_tokens(),
             input_tokens: usage.input_tokens(),
@@ -198,6 +228,14 @@ pub fn build_usage_with_simulation(
         })
 }
 
+pub fn metadata_cache_is_empty(usage: &MetadataTokenUsage) -> bool {
+    usage.cache_read_input_tokens <= 0 && usage.cache_write_input_tokens <= 0
+}
+
+pub fn usage_has_cache(usage: &CacheUsage) -> bool {
+    usage.cache_read_input_tokens > 0 || usage.cache_creation_input_tokens > 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +257,95 @@ mod tests {
         assert_eq!(usage.cache_read_input_tokens, 180_000);
         assert_eq!(usage.cache_creation_input_tokens, 24_000);
         assert_eq!(usage.billable_input_tokens(), 25_200);
+    }
+
+    #[test]
+    fn high_cache_policy_fills_zero_metadata_cache_from_simulation() {
+        let metadata = MetadataTokenUsage {
+            uncached_input_tokens: 50_000,
+            output_tokens: 42,
+            total_tokens: 50_042,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+        };
+        let simulation = CacheSimulation::from_prompt_cache_with_ratio(
+            PromptCacheUsage {
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 95_000,
+                cache_creation_5m_input_tokens: 0,
+                cache_creation_1h_input_tokens: 0,
+                effective_cache_ratio: None,
+            },
+            0.95,
+        );
+
+        let usage =
+            build_usage_with_simulation_policy(Some(&metadata), 100_000, 7, simulation, true);
+
+        assert_eq!(usage.total_input_tokens, 100_000);
+        assert_eq!(usage.output_tokens, 42);
+        assert_eq!(usage.cache_read_input_tokens, 95_000);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.input_tokens, 5_000);
+    }
+
+    #[test]
+    fn high_cache_policy_uses_local_totals_when_metadata_is_all_zero() {
+        let metadata = MetadataTokenUsage {
+            uncached_input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+        };
+        let simulation = CacheSimulation::from_prompt_cache_with_ratio(
+            PromptCacheUsage {
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 95_000,
+                cache_creation_5m_input_tokens: 0,
+                cache_creation_1h_input_tokens: 0,
+                effective_cache_ratio: None,
+            },
+            0.95,
+        );
+
+        let usage =
+            build_usage_with_simulation_policy(Some(&metadata), 100_000, 123, simulation, true);
+
+        assert_eq!(usage.total_input_tokens, 100_000);
+        assert_eq!(usage.output_tokens, 123);
+        assert_eq!(usage.cache_read_input_tokens, 95_000);
+        assert_eq!(usage.input_tokens, 5_000);
+    }
+
+    #[test]
+    fn high_cache_policy_preserves_nonzero_metadata_cache() {
+        let metadata = MetadataTokenUsage {
+            uncached_input_tokens: 1200,
+            output_tokens: 900,
+            total_tokens: 207_300,
+            cache_read_input_tokens: 180_000,
+            cache_write_input_tokens: 24_000,
+        };
+        let simulation = CacheSimulation::from_prompt_cache_with_ratio(
+            PromptCacheUsage {
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 95_000,
+                cache_creation_5m_input_tokens: 0,
+                cache_creation_1h_input_tokens: 0,
+                effective_cache_ratio: None,
+            },
+            0.95,
+        );
+
+        let usage =
+            build_usage_with_simulation_policy(Some(&metadata), 250_000, 7, simulation, true);
+
+        assert_eq!(usage.total_input_tokens, 205_200);
+        assert_eq!(usage.input_tokens, 1_200);
+        assert_eq!(usage.output_tokens, 900);
+        assert_eq!(usage.cache_read_input_tokens, 180_000);
+        assert_eq!(usage.cache_creation_input_tokens, 24_000);
     }
 
     #[test]

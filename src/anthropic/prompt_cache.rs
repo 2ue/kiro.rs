@@ -85,6 +85,23 @@ impl PromptCacheTracker {
         req: &MessagesRequest,
         total_input_tokens: i32,
     ) -> Option<PromptCacheProfile> {
+        self.build_profile_with_policy(req, total_input_tokens, false)
+    }
+
+    pub fn build_high_cache_profile(
+        &self,
+        req: &MessagesRequest,
+        total_input_tokens: i32,
+    ) -> Option<PromptCacheProfile> {
+        self.build_profile_with_policy(req, total_input_tokens, true)
+    }
+
+    fn build_profile_with_policy(
+        &self,
+        req: &MessagesRequest,
+        total_input_tokens: i32,
+        synthesize_stable_prefix: bool,
+    ) -> Option<PromptCacheProfile> {
         let blocks = flatten_cache_blocks(req);
         if blocks.is_empty() {
             return None;
@@ -122,6 +139,12 @@ impl PromptCacheTracker {
             };
 
             breakpoints.push(PromptCacheBreakpoint { ttl });
+        }
+
+        if breakpoints.is_empty() && synthesize_stable_prefix {
+            breakpoints.push(PromptCacheBreakpoint {
+                ttl: DEFAULT_PROMPT_CACHE_TTL,
+            });
         }
 
         if breakpoints.is_empty() {
@@ -661,6 +684,28 @@ mod tests {
 
         tracker.update(Some(scope.clone()), Some(&profile), 0.85);
         let second = tracker.compute(Some(scope), Some(&profile), 0.85);
+        assert!(second.cache_read_input_tokens > 0);
+    }
+
+    #[test]
+    fn high_cache_profile_creates_without_explicit_cache_control() {
+        let tracker = PromptCacheTracker::default();
+        let req = request(long_text());
+        let profile = tracker
+            .build_high_cache_profile(&req, 4096)
+            .expect("high-cache should synthesize a stable-prefix breakpoint");
+        let scope = PromptCacheScope {
+            credential_id: 1,
+            conversation_id: "high-cache-session".to_string(),
+            model: req.model.clone(),
+        };
+
+        let first = tracker.compute(Some(scope.clone()), Some(&profile), 0.95);
+        assert!(first.cache_creation_input_tokens > 0);
+        assert_eq!(first.cache_read_input_tokens, 0);
+
+        tracker.update(Some(scope.clone()), Some(&profile), 0.95);
+        let second = tracker.compute(Some(scope), Some(&profile), 0.95);
         assert!(second.cache_read_input_tokens > 0);
     }
 

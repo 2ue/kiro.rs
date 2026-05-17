@@ -107,14 +107,14 @@ impl CredentialUsageContext {
     fn usage_source(
         &self,
         usage: &super::cache::CacheUsage,
-        has_metadata: bool,
+        metadata_usage: Option<&crate::kiro::model::events::MetadataTokenUsage>,
         context_estimated: bool,
     ) -> UsageSource {
-        if has_metadata {
+        if self.uses_local_prompt_cache_fallback(metadata_usage, usage) {
+            UsageSource::LocalPromptCache
+        } else if metadata_usage.is_some() {
             UsageSource::UpstreamMetadata
-        } else if self.request.simulated_source.is_some()
-            && (usage.cache_read_input_tokens > 0 || usage.cache_creation_input_tokens > 0)
-        {
+        } else if self.request.simulated_source.is_some() && super::cache::usage_has_cache(usage) {
             self.request.simulated_source.unwrap()
         } else if context_estimated {
             UsageSource::ContextEstimate
@@ -123,13 +123,24 @@ impl CredentialUsageContext {
         }
     }
 
+    fn uses_local_prompt_cache_fallback(
+        &self,
+        metadata_usage: Option<&crate::kiro::model::events::MetadataTokenUsage>,
+        usage: &super::cache::CacheUsage,
+    ) -> bool {
+        self.request.simulation_mode == PromptCacheSimulationMode::HighCache
+            && metadata_usage.is_some_and(super::cache::metadata_cache_is_empty)
+            && self.request.simulated_source == Some(UsageSource::LocalPromptCache)
+            && super::cache::usage_has_cache(usage)
+    }
+
     fn record_success_from_stream(&self, ctx: &StreamContext) {
         let Some(usage) = ctx.final_usage() else {
             return;
         };
-        let has_metadata = ctx.metadata_usage_seen();
-        let context_estimated = !has_metadata && ctx.context_input_tokens_seen();
-        let usage_source = self.usage_source(&usage, has_metadata, context_estimated);
+        let metadata_usage = ctx.metadata_usage();
+        let context_estimated = metadata_usage.is_none() && ctx.context_input_tokens_seen();
+        let usage_source = self.usage_source(&usage, metadata_usage, context_estimated);
         self.record_success(usage, usage_source, context_estimated);
     }
 
@@ -138,7 +149,7 @@ impl CredentialUsageContext {
         status: UsageRecordStatus,
         usage: Option<super::cache::CacheUsage>,
         error_detail: Option<(String, String)>,
-        has_metadata: bool,
+        metadata_usage: Option<&crate::kiro::model::events::MetadataTokenUsage>,
         context_estimated: bool,
     ) {
         let usage = usage.unwrap_or(super::cache::CacheUsage {
@@ -150,7 +161,7 @@ impl CredentialUsageContext {
             cache_creation_5m_input_tokens: 0,
             cache_creation_1h_input_tokens: 0,
         });
-        let source = self.usage_source(&usage, has_metadata, context_estimated);
+        let source = self.usage_source(&usage, metadata_usage, context_estimated);
         let (error_type, error_message) = error_detail.unwrap_or_else(|| {
             (
                 "api_error".to_string(),
@@ -692,7 +703,14 @@ fn prepare_usage_context(
     stable_conversation_id: Option<String>,
     input_tokens: i32,
 ) -> RequestUsageContext {
-    let prompt_cache_profile = state.prompt_cache.build_profile(payload, input_tokens);
+    let prompt_cache_profile =
+        if state.prompt_cache_simulation_mode == PromptCacheSimulationMode::HighCache {
+            state
+                .prompt_cache
+                .build_high_cache_profile(payload, input_tokens)
+        } else {
+            state.prompt_cache.build_profile(payload, input_tokens)
+        };
     let (simulated_usage, simulated_source) = build_simulated_usage(
         state,
         stable_conversation_id.as_deref(),
@@ -724,7 +742,7 @@ fn build_simulated_usage(
 ) -> (Option<super::cache::CacheSimulation>, Option<UsageSource>) {
     match state.prompt_cache_simulation_mode {
         PromptCacheSimulationMode::Disabled => (None, None),
-        PromptCacheSimulationMode::LocalPromptCache => {
+        PromptCacheSimulationMode::LocalPromptCache | PromptCacheSimulationMode::HighCache => {
             if conversation_id.is_none() {
                 return (None, None);
             }
@@ -748,7 +766,10 @@ fn prepare_credential_usage_context(
     fallback_from_sticky: bool,
 ) -> CredentialUsageContext {
     let mut usage_context = usage_context;
-    if usage_context.simulation_mode == PromptCacheSimulationMode::LocalPromptCache {
+    if matches!(
+        usage_context.simulation_mode,
+        PromptCacheSimulationMode::LocalPromptCache | PromptCacheSimulationMode::HighCache
+    ) {
         let scope = usage_context
             .conversation_id
             .as_ref()
@@ -1238,6 +1259,7 @@ async fn handle_stream_request(
         extract_xml_thinking,
         tool_name_map,
         credential_usage.request.simulated_usage,
+        credential_usage.request.simulation_mode,
     );
 
     // 生成初始事件
@@ -1358,8 +1380,8 @@ fn create_sse_stream(
                                 UsageRecordStatus::StreamError,
                                 ctx.final_usage(),
                                 error_detail,
-                                ctx.metadata_usage_seen(),
-                                !ctx.metadata_usage_seen() && ctx.context_input_tokens_seen(),
+                                ctx.metadata_usage(),
+                                ctx.metadata_usage().is_none() && ctx.context_input_tokens_seen(),
                             );
                             usage_guard.complete();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -1383,8 +1405,8 @@ fn create_sse_stream(
                                     UsageRecordStatus::StreamError,
                                     ctx.final_usage(),
                                     error_detail,
-                                    ctx.metadata_usage_seen(),
-                                    !ctx.metadata_usage_seen() && ctx.context_input_tokens_seen(),
+                                    ctx.metadata_usage(),
+                                    ctx.metadata_usage().is_none() && ctx.context_input_tokens_seen(),
                                 );
                             } else {
                                 usage_guard.context().record_success_from_stream(&ctx);
@@ -1411,8 +1433,8 @@ fn create_sse_stream(
                         UsageRecordStatus::UpstreamTimeout,
                         ctx.final_usage(),
                         error_detail,
-                        ctx.metadata_usage_seen(),
-                        !ctx.metadata_usage_seen() && ctx.context_input_tokens_seen(),
+                        ctx.metadata_usage(),
+                        ctx.metadata_usage().is_none() && ctx.context_input_tokens_seen(),
                     );
                     usage_guard.complete();
                     let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -1692,15 +1714,17 @@ async fn handle_non_stream_request(
         .or(context_input_tokens)
         .unwrap_or(input_tokens);
 
-    let usage = super::cache::build_usage_with_simulation(
+    let usage = super::cache::build_usage_with_simulation_policy(
         metadata_usage.as_ref(),
         final_input_tokens,
         output_tokens,
         credential_usage.request.simulated_usage,
+        credential_usage.request.simulation_mode == PromptCacheSimulationMode::HighCache,
     );
     let has_metadata = metadata_usage.is_some();
     let context_estimated = !has_metadata && context_input_tokens.is_some();
-    let usage_source = credential_usage.usage_source(&usage, has_metadata, context_estimated);
+    let usage_source =
+        credential_usage.usage_source(&usage, metadata_usage.as_ref(), context_estimated);
     credential_usage.record_success(usage, usage_source, context_estimated);
     provider.report_success_for_context(
         api_response.credential_id,
@@ -1976,10 +2000,11 @@ pub async fn post_messages_cc(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anthropic::cache::CacheUsage;
+    use crate::anthropic::cache::{self, CacheUsage};
     use crate::anthropic::prompt_cache::PromptCacheTracker;
-    use crate::anthropic::types::Message;
+    use crate::anthropic::types::{Message, SystemMessage};
     use crate::anthropic::usage::UsageRecorder;
+    use crate::kiro::model::events::MetadataTokenUsage;
     use serde_json::json;
 
     fn messages_request_for_model(model: &str) -> MessagesRequest {
@@ -2107,6 +2132,80 @@ mod tests {
             model: payload.model,
         };
         let second = prompt_cache.compute(Some(scope), profile.as_ref(), 0.85);
+        assert!(second.cache_read_input_tokens > 0);
+    }
+
+    #[test]
+    fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
+        let prompt_cache = Arc::new(PromptCacheTracker::default());
+        let usage_recorder = Arc::new(UsageRecorder::new(10, None));
+        let payload = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 16,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!("hello"),
+            }],
+            stream: true,
+            system: Some(vec![SystemMessage {
+                text: "cacheable prompt block ".repeat(700),
+                cache_control: None,
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let profile = prompt_cache.build_high_cache_profile(&payload, 4096);
+        let usage_context = RequestUsageContext {
+            recorder: usage_recorder,
+            prompt_cache: prompt_cache.clone(),
+            request_id: "req_high_cache".to_string(),
+            endpoint: "/v1/messages",
+            stream: true,
+            model: payload.model.clone(),
+            conversation_id: Some("session-high-cache".to_string()),
+            input_tokens: 4096,
+            prompt_cache_profile: profile.clone(),
+            simulation_mode: PromptCacheSimulationMode::HighCache,
+            prompt_cache_target_read_ratio: 0.95,
+            simulated_usage: Some(cache::CacheSimulation {
+                cache_creation_input_tokens: 3968,
+                cache_read_input_tokens: 0,
+                cache_creation_5m_input_tokens: 3968,
+                cache_creation_1h_input_tokens: 0,
+                target_cache_ratio: Some(0.95),
+            }),
+            simulated_source: Some(UsageSource::LocalPromptCache),
+            started_at: Instant::now(),
+        }
+        .attach_credential(Some(1), None, false, false);
+        let metadata = MetadataTokenUsage {
+            uncached_input_tokens: 4096,
+            output_tokens: 1,
+            total_tokens: 4097,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+        };
+        let usage = cache::build_usage_with_simulation_policy(
+            Some(&metadata),
+            4096,
+            1,
+            usage_context.request.simulated_usage,
+            true,
+        );
+
+        let source = usage_context.usage_source(&usage, Some(&metadata), false);
+        assert_eq!(source, UsageSource::LocalPromptCache);
+        usage_context.record_success(usage, source, false);
+
+        let scope = PromptCacheScope {
+            credential_id: 1,
+            conversation_id: "session-high-cache".to_string(),
+            model: payload.model,
+        };
+        let second = prompt_cache.compute(Some(scope), profile.as_ref(), 0.95);
         assert!(second.cache_read_input_tokens > 0);
     }
 

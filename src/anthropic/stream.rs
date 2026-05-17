@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use serde_json::json;
 
 use crate::kiro::model::events::{Event, MetadataTokenUsage};
+use crate::model::config::PromptCacheSimulationMode;
 
 use super::envelope;
 
@@ -568,6 +569,8 @@ pub struct StreamContext {
     stream_error: Option<(String, String)>,
     /// 无 metadata 时使用的本地 prompt-cache usage 模拟结果
     pub simulated_usage: Option<super::cache::CacheSimulation>,
+    /// 本地 prompt-cache usage 模拟模式。
+    pub simulation_mode: PromptCacheSimulationMode,
     /// 最近一次最终 usage，用于请求级记录。
     final_usage: Option<super::cache::CacheUsage>,
 }
@@ -588,6 +591,7 @@ impl StreamContext {
             true,
             tool_name_map,
             None,
+            PromptCacheSimulationMode::Disabled,
         )
     }
 
@@ -598,6 +602,7 @@ impl StreamContext {
         extract_xml_thinking: bool,
         tool_name_map: HashMap<String, String>,
         simulated_usage: Option<super::cache::CacheSimulation>,
+        simulation_mode: PromptCacheSimulationMode,
     ) -> Self {
         Self {
             state_manager: SseStateManager::new(),
@@ -623,6 +628,7 @@ impl StreamContext {
             native_reasoning_signature_sent: false,
             stream_error: None,
             simulated_usage,
+            simulation_mode,
             final_usage: None,
         }
     }
@@ -788,8 +794,8 @@ impl StreamContext {
         self.final_usage
     }
 
-    pub fn metadata_usage_seen(&self) -> bool {
-        self.metadata_usage.is_some()
+    pub fn metadata_usage(&self) -> Option<&MetadataTokenUsage> {
+        self.metadata_usage.as_ref()
     }
 
     pub fn context_input_tokens_seen(&self) -> bool {
@@ -1410,11 +1416,12 @@ impl StreamContext {
             .as_ref()
             .map(|usage| usage.output_tokens)
             .unwrap_or(self.output_tokens);
-        let final_usage = super::cache::build_usage_with_simulation(
+        let final_usage = super::cache::build_usage_with_simulation_policy(
             self.metadata_usage.as_ref(),
             final_input_tokens,
             final_output_tokens,
             self.simulated_usage,
+            self.simulation_mode == PromptCacheSimulationMode::HighCache,
         );
         self.final_usage = Some(final_usage);
 
@@ -1589,8 +1596,15 @@ mod tests {
 
     #[test]
     fn test_xml_thinking_extraction_can_be_disabled_for_strict_profile() {
-        let mut ctx =
-            StreamContext::new_with_simulation("test-model", 1, true, false, HashMap::new(), None);
+        let mut ctx = StreamContext::new_with_simulation(
+            "test-model",
+            1,
+            true,
+            false,
+            HashMap::new(),
+            None,
+            PromptCacheSimulationMode::Disabled,
+        );
 
         let mut events = ctx.process_assistant_response("<thinking>secret</thinking>\n\nvisible");
         events.extend(ctx.generate_final_events());
