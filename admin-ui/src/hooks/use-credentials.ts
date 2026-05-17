@@ -1,6 +1,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   getCredentials,
+  getCredentialsPage,
   setCredentialDisabled,
   setCredentialPriority,
   resetCredentialFailure,
@@ -11,10 +12,11 @@ import {
   getLoadBalancingMode,
   setLoadBalancingMode,
 } from '@/api/credentials'
-import type { AddCredentialRequest } from '@/types/api'
+import type { AddCredentialRequest, CredentialsPageQuery } from '@/types/api'
 
 function invalidateCredentialCaches(queryClient: ReturnType<typeof useQueryClient>, id?: number) {
   queryClient.invalidateQueries({ queryKey: ['credentials'] })
+  queryClient.invalidateQueries({ queryKey: ['credentials-page'] })
   if (typeof id === 'number') {
     queryClient.invalidateQueries({ queryKey: ['credential-balance', id] })
   } else {
@@ -22,12 +24,27 @@ function invalidateCredentialCaches(queryClient: ReturnType<typeof useQueryClien
   }
 }
 
+interface UseCredentialsOptions {
+  enabled?: boolean
+}
+
 // 查询凭据列表
-export function useCredentials() {
+export function useCredentials(options: UseCredentialsOptions = {}) {
   return useQuery({
     queryKey: ['credentials'],
     queryFn: getCredentials,
+    enabled: options.enabled ?? true,
     refetchInterval: 30000, // 每 30 秒刷新一次
+  })
+}
+
+// 分页查询凭据列表
+export function useCredentialsPage(query: CredentialsPageQuery) {
+  return useQuery({
+    queryKey: ['credentials-page', query],
+    queryFn: () => getCredentialsPage(query),
+    refetchInterval: 30000,
+    placeholderData: (previousData) => previousData,
   })
 }
 

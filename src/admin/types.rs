@@ -18,6 +18,26 @@ pub struct CredentialsStatusResponse {
     pub credentials: Vec<CredentialStatusItem>,
 }
 
+/// 分页凭据状态响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialsPageResponse {
+    /// 凭据总数
+    pub total: usize,
+    /// 可用凭据数量（未禁用）
+    pub available: usize,
+    /// 当前活跃凭据 ID
+    pub current_id: u64,
+    /// 当前页码（从 1 开始）
+    pub page: usize,
+    /// 每页数量
+    pub limit: usize,
+    /// 总页数
+    pub total_pages: usize,
+    /// 当前页凭据状态列表
+    pub credentials: Vec<CredentialStatusItem>,
+}
+
 /// 单个凭据的状态信息
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

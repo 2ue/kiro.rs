@@ -2,6 +2,8 @@ import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
   CredentialsStatusResponse,
+  CredentialsPageQuery,
+  CredentialsPageResponse,
   BalanceResponse,
   SuccessResponse,
   SetDisabledRequest,
@@ -30,6 +32,16 @@ api.interceptors.request.use((config) => {
 // 获取所有凭据状态
 export async function getCredentials(): Promise<CredentialsStatusResponse> {
   const { data } = await api.get<CredentialsStatusResponse>('/credentials')
+  return data
+}
+
+// 分页获取凭据状态
+export async function getCredentialsPage(
+  query: CredentialsPageQuery
+): Promise<CredentialsPageResponse> {
+  const { data } = await api.get<CredentialsPageResponse>('/credentials-paged', {
+    params: query,
+  })
   return data
 }
 

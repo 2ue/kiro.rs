@@ -97,6 +97,7 @@ pub struct UsageRecord {
 #[derive(Debug, Clone)]
 pub struct UsageRecordQuery {
     pub limit: usize,
+    pub q: Option<String>,
     pub conversation_id: Option<String>,
     pub credential_id: Option<u64>,
     pub model: Option<String>,
@@ -112,6 +113,7 @@ impl Default for UsageRecordQuery {
     fn default() -> Self {
         Self {
             limit: DEFAULT_QUERY_LIMIT,
+            q: None,
             conversation_id: None,
             credential_id: None,
             model: None,
@@ -129,6 +131,16 @@ impl Default for UsageRecordQuery {
 #[serde(rename_all = "camelCase")]
 pub struct UsageRecordsResult {
     pub total: usize,
+    pub records: Vec<UsageRecord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageRecordsPageResult {
+    pub total: usize,
+    pub page: usize,
+    pub limit: usize,
+    pub total_pages: usize,
     pub records: Vec<UsageRecord>,
 }
 
@@ -228,6 +240,36 @@ impl UsageRecorder {
         UsageRecordsResult {
             total,
             records: matched,
+        }
+    }
+
+    pub fn query_page(
+        &self,
+        query: UsageRecordQuery,
+        page: usize,
+        limit: usize,
+    ) -> UsageRecordsPageResult {
+        let page = normalize_page(page);
+        let limit = normalize_limit(limit);
+        let matched: Vec<UsageRecord> = self
+            .records
+            .lock()
+            .iter()
+            .rev()
+            .filter(|record| record_matches(record, &query))
+            .cloned()
+            .collect();
+        let total = matched.len();
+        let total_pages = total_pages(total, limit);
+        let start = page.saturating_sub(1).saturating_mul(limit);
+        let records = matched.into_iter().skip(start).take(limit).collect();
+
+        UsageRecordsPageResult {
+            total,
+            page,
+            limit,
+            total_pages,
+            records,
         }
     }
 
@@ -368,7 +410,20 @@ fn normalize_limit(limit: usize) -> usize {
     }
 }
 
+fn normalize_page(page: usize) -> usize {
+    page.max(1)
+}
+
+fn total_pages(total: usize, limit: usize) -> usize {
+    if total == 0 { 0 } else { total.div_ceil(limit) }
+}
+
 fn record_matches(record: &UsageRecord, query: &UsageRecordQuery) -> bool {
+    if let Some(q) = &query.q {
+        if !record_matches_search(record, q) {
+            return false;
+        }
+    }
     if let Some(conversation_id) = &query.conversation_id {
         if record.conversation_id.as_ref() != Some(conversation_id) {
             return false;
@@ -421,6 +476,54 @@ fn record_matches(record: &UsageRecord, query: &UsageRecordQuery) -> bool {
         }
     }
     true
+}
+
+fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
+    let q = q.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+
+    let status = usage_status_value(record.status);
+    let source = usage_source_value(record.usage_source);
+    let credential_id = record.credential_id.map(|id| id.to_string());
+
+    [
+        Some(record.id.as_str()),
+        Some(record.created_at.as_str()),
+        Some(record.endpoint.as_str()),
+        Some(record.model.as_str()),
+        record.conversation_id.as_deref(),
+        record.credential_label.as_deref(),
+        Some(status),
+        Some(source),
+        record.error_type.as_deref(),
+        record.error_message.as_deref(),
+        credential_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| value.to_ascii_lowercase().contains(&q))
+}
+
+fn usage_status_value(status: UsageRecordStatus) -> &'static str {
+    match status {
+        UsageRecordStatus::Success => "success",
+        UsageRecordStatus::Error => "error",
+        UsageRecordStatus::StreamError => "stream_error",
+        UsageRecordStatus::UpstreamTimeout => "upstream_timeout",
+        UsageRecordStatus::ClientDropped => "client_dropped",
+    }
+}
+
+fn usage_source_value(source: UsageSource) -> &'static str {
+    match source {
+        UsageSource::UpstreamMetadata => "upstream_metadata",
+        UsageSource::LocalPromptCache => "local_prompt_cache",
+        UsageSource::ContextEstimate => "context_estimate",
+        UsageSource::RequestEstimate => "request_estimate",
+        UsageSource::None => "none",
+    }
 }
 
 fn parse_record_time(value: &str) -> Option<DateTime<Utc>> {
@@ -502,6 +605,77 @@ mod tests {
         let filtered = recorder.query(query);
         assert_eq!(filtered.total, 1);
         assert_eq!(filtered.records[0].id, "3");
+    }
+
+    #[test]
+    fn recorder_query_page_paginates_filtered_records() {
+        let recorder = UsageRecorder::new(10, None);
+        recorder.record(record("1", 10, UsageSource::LocalPromptCache));
+        recorder.record(record("2", 20, UsageSource::LocalPromptCache));
+        recorder.record(record("3", 30, UsageSource::LocalPromptCache));
+        recorder.record(record("4", 40, UsageSource::UpstreamMetadata));
+
+        let result = recorder.query_page(
+            UsageRecordQuery {
+                source: Some(UsageSource::LocalPromptCache),
+                ..Default::default()
+            },
+            2,
+            2,
+        );
+
+        assert_eq!(result.total, 3);
+        assert_eq!(result.page, 2);
+        assert_eq!(result.limit, 2);
+        assert_eq!(result.total_pages, 2);
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].id, "1");
+    }
+
+    #[test]
+    fn recorder_search_matches_model_account_session_and_error_text() {
+        let recorder = UsageRecorder::new(10, None);
+        let mut first = record("1", 10, UsageSource::LocalPromptCache);
+        first.model = "claude-sonnet-4-5".to_string();
+        first.credential_label = Some("alpha@example.com".to_string());
+        first.conversation_id = Some("session-alpha".to_string());
+        recorder.record(first);
+
+        let mut second = record("2", 20, UsageSource::UpstreamMetadata);
+        second.model = "claude-opus-4-5".to_string();
+        second.credential_id = Some(42);
+        second.credential_label = Some("beta@example.com".to_string());
+        second.conversation_id = Some("session-beta".to_string());
+        second.error_message = Some("upstream quota exceeded".to_string());
+        recorder.record(second);
+
+        let by_model = recorder.query(UsageRecordQuery {
+            q: Some("opus".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(by_model.total, 1);
+        assert_eq!(by_model.records[0].id, "2");
+
+        let by_account = recorder.query(UsageRecordQuery {
+            q: Some("alpha@example".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(by_account.total, 1);
+        assert_eq!(by_account.records[0].id, "1");
+
+        let by_credential_id = recorder.query(UsageRecordQuery {
+            q: Some("42".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(by_credential_id.total, 1);
+        assert_eq!(by_credential_id.records[0].id, "2");
+
+        let by_error = recorder.query(UsageRecordQuery {
+            q: Some("quota".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(by_error.total, 1);
+        assert_eq!(by_error.records[0].id, "2");
     }
 
     #[test]

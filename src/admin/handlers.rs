@@ -20,8 +20,16 @@ use crate::anthropic::usage::{UsageRecordQuery, UsageRecordStatus, UsageSource};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CredentialsPageQueryParams {
+    pub page: Option<usize>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UsageRecordsQueryParams {
     pub limit: Option<usize>,
+    pub q: Option<String>,
     pub conversation_id: Option<String>,
     pub credential_id: Option<u64>,
     pub model: Option<String>,
@@ -33,10 +41,19 @@ pub struct UsageRecordsQueryParams {
     pub until: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageRecordsPageQueryParams {
+    pub page: Option<usize>,
+    #[serde(flatten)]
+    pub filters: UsageRecordsQueryParams,
+}
+
 impl UsageRecordsQueryParams {
     fn into_query(self) -> Result<UsageRecordQuery, String> {
         Ok(UsageRecordQuery {
             limit: self.limit.unwrap_or_default(),
+            q: self.q.filter(|v| !v.trim().is_empty()),
             conversation_id: self.conversation_id.filter(|v| !v.trim().is_empty()),
             credential_id: self.credential_id,
             model: self.model.filter(|v| !v.trim().is_empty()),
@@ -47,6 +64,15 @@ impl UsageRecordsQueryParams {
             since: self.since.as_deref().map(parse_time).transpose()?,
             until: self.until.as_deref().map(parse_time).transpose()?,
         })
+    }
+}
+
+impl UsageRecordsPageQueryParams {
+    fn into_query(self) -> Result<(UsageRecordQuery, usize, usize), String> {
+        let page = self.page.unwrap_or_default();
+        let limit = self.filters.limit.unwrap_or_default();
+        let query = self.filters.into_query()?;
+        Ok((query, page, limit))
     }
 }
 
@@ -69,6 +95,18 @@ fn parse_time(value: &str) -> Result<DateTime<Utc>, String> {
 pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
     let response = state.service.get_all_credentials();
     Json(response)
+}
+
+/// GET /api/admin/credentials-paged
+/// 分页获取凭据状态
+pub async fn get_credentials_page(
+    State(state): State<AdminState>,
+    Query(params): Query<CredentialsPageQueryParams>,
+) -> impl IntoResponse {
+    Json(state.service.get_credentials_page(
+        params.page.unwrap_or_default(),
+        params.limit.unwrap_or_default(),
+    ))
 }
 
 /// POST /api/admin/credentials/:id/disabled
@@ -207,6 +245,24 @@ pub async fn get_usage_records(
     }
 }
 
+/// GET /api/admin/usage-records-paged
+/// 分页查询请求级 usage 记录
+pub async fn get_usage_records_page(
+    State(state): State<AdminState>,
+    Query(params): Query<UsageRecordsPageQueryParams>,
+) -> impl IntoResponse {
+    match params.into_query() {
+        Ok((query, page, limit)) => {
+            Json(state.service.get_usage_records_page(query, page, limit)).into_response()
+        }
+        Err(message) => (
+            StatusCode::BAD_REQUEST,
+            Json(AdminErrorResponse::invalid_request(message)),
+        )
+            .into_response(),
+    }
+}
+
 /// GET /api/admin/usage-summary
 /// 获取请求级 usage 汇总
 pub async fn get_usage_summary(State(state): State<AdminState>) -> impl IntoResponse {
@@ -228,6 +284,7 @@ mod tests {
     fn usage_records_query_ignores_blank_text_filters() {
         let query = UsageRecordsQueryParams {
             limit: Some(25),
+            q: Some("   ".to_string()),
             conversation_id: Some("   ".to_string()),
             credential_id: Some(7),
             model: Some("".to_string()),
@@ -242,6 +299,7 @@ mod tests {
         .expect("valid query");
 
         assert_eq!(query.limit, 25);
+        assert_eq!(query.q, None);
         assert_eq!(query.conversation_id, None);
         assert_eq!(query.credential_id, Some(7));
         assert_eq!(query.model, None);
@@ -255,6 +313,7 @@ mod tests {
     fn usage_records_query_rejects_invalid_enums_and_time() {
         let bad_status = UsageRecordsQueryParams {
             limit: None,
+            q: None,
             conversation_id: None,
             credential_id: None,
             model: None,
@@ -271,6 +330,7 @@ mod tests {
 
         let bad_source = UsageRecordsQueryParams {
             limit: None,
+            q: None,
             conversation_id: None,
             credential_id: None,
             model: None,
@@ -287,6 +347,7 @@ mod tests {
 
         let bad_time = UsageRecordsQueryParams {
             limit: None,
+            q: None,
             conversation_id: None,
             credential_id: None,
             model: None,
@@ -300,5 +361,33 @@ mod tests {
         .into_query()
         .unwrap_err();
         assert!(bad_time.contains("无效时间"));
+    }
+
+    #[test]
+    fn usage_records_page_query_keeps_pagination_separate_from_filters() {
+        let (query, page, limit) = UsageRecordsPageQueryParams {
+            page: Some(3),
+            filters: UsageRecordsQueryParams {
+                limit: Some(50),
+                q: Some("sonnet".to_string()),
+                conversation_id: Some("session-a".to_string()),
+                credential_id: None,
+                model: None,
+                status: None,
+                source: None,
+                stream: None,
+                min_cache_read: None,
+                since: None,
+                until: None,
+            },
+        }
+        .into_query()
+        .expect("valid page query");
+
+        assert_eq!(page, 3);
+        assert_eq!(limit, 50);
+        assert_eq!(query.limit, 50);
+        assert_eq!(query.q.as_deref(), Some("sonnet"));
+        assert_eq!(query.conversation_id.as_deref(), Some("session-a"));
     }
 }

@@ -1,14 +1,14 @@
-import { useMemo, useState } from 'react'
-import { RefreshCw, Trash2 } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
+import { RefreshCw, Trash2, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { useCredentials } from '@/hooks/use-credentials'
-import { useClearUsageRecords, useUsageRecords, useUsageSummary } from '@/hooks/use-usage'
+import { useClearUsageRecords, useUsageRecordsPage, useUsageSummary } from '@/hooks/use-usage'
 import { extractErrorMessage } from '@/lib/utils'
-import type { UsageRecordsQuery, UsageSource } from '@/types/api'
+import type { UsageRecordsPageQuery, UsageRecordStatus, UsageSource } from '@/types/api'
 
 function formatNumber(value: number): string {
   return new Intl.NumberFormat('zh-CN').format(value)
@@ -58,14 +58,43 @@ function statusVariant(status: string): 'success' | 'destructive' | 'warning' {
   return 'destructive'
 }
 
+function statusLabel(status: string): string {
+  switch (status) {
+    case 'success':
+      return '成功'
+    case 'error':
+      return '错误'
+    case 'stream_error':
+      return '流错误'
+    case 'upstream_timeout':
+      return '上游超时'
+    case 'client_dropped':
+      return '客户端断开'
+    default:
+      return status
+  }
+}
+
 export function UsageRecordsPanel() {
+  const [searchText, setSearchText] = useState('')
+  const [model, setModel] = useState('')
   const [conversationId, setConversationId] = useState('')
   const [credentialId, setCredentialId] = useState('')
+  const [status, setStatus] = useState<UsageRecordStatus | ''>('')
   const [source, setSource] = useState<UsageSource | ''>('')
+  const [streamMode, setStreamMode] = useState<'all' | 'stream' | 'non_stream'>('all')
   const [minCacheRead, setMinCacheRead] = useState('')
+  const [currentPage, setCurrentPage] = useState(1)
+  const itemsPerPage = 100
 
-  const query = useMemo<UsageRecordsQuery>(() => {
-    const next: UsageRecordsQuery = { limit: 100 }
+  const query = useMemo<UsageRecordsPageQuery>(() => {
+    const next: UsageRecordsPageQuery = { page: currentPage, limit: itemsPerPage }
+    if (searchText.trim()) {
+      next.q = searchText.trim()
+    }
+    if (model.trim()) {
+      next.model = model.trim()
+    }
     if (conversationId.trim()) {
       next.conversationId = conversationId.trim()
     }
@@ -76,17 +105,38 @@ export function UsageRecordsPanel() {
     if (source) {
       next.source = source
     }
+    if (status) {
+      next.status = status
+    }
+    if (streamMode !== 'all') {
+      next.stream = streamMode === 'stream'
+    }
     const parsedMinCacheRead = Number(minCacheRead)
     if (minCacheRead.trim() && Number.isFinite(parsedMinCacheRead)) {
       next.minCacheRead = parsedMinCacheRead
     }
     return next
-  }, [conversationId, credentialId, minCacheRead, source])
+  }, [conversationId, credentialId, currentPage, minCacheRead, model, searchText, source, status, streamMode])
 
   const summary = useUsageSummary()
-  const records = useUsageRecords(query)
+  const records = useUsageRecordsPage(query)
   const credentials = useCredentials()
   const clearRecords = useClearUsageRecords()
+
+  useEffect(() => {
+    setCurrentPage(1)
+  }, [conversationId, credentialId, minCacheRead, model, searchText, source, status, streamMode])
+
+  useEffect(() => {
+    if (!records.data) {
+      return
+    }
+
+    const nextPage = records.data.totalPages > 0 ? Math.min(currentPage, records.data.totalPages) : 1
+    if (currentPage !== nextPage) {
+      setCurrentPage(nextPage)
+    }
+  }, [currentPage, records.data])
 
   const credentialLabels = useMemo(() => {
     const labels = new Map<number, string>()
@@ -104,6 +154,28 @@ export function UsageRecordsPanel() {
     records.refetch()
   }
 
+  const hasFilters = Boolean(
+    searchText.trim() ||
+    model.trim() ||
+    conversationId.trim() ||
+    credentialId.trim() ||
+    status ||
+    source ||
+    streamMode !== 'all' ||
+    minCacheRead.trim()
+  )
+
+  const handleResetFilters = () => {
+    setSearchText('')
+    setModel('')
+    setConversationId('')
+    setCredentialId('')
+    setStatus('')
+    setSource('')
+    setStreamMode('all')
+    setMinCacheRead('')
+  }
+
   const handleClear = () => {
     if (!confirm('确定清空 usage 记录吗？此操作会同时截断本地 JSONL 记录文件。')) {
       return
@@ -115,6 +187,8 @@ export function UsageRecordsPanel() {
   }
 
   const summaryData = summary.data
+  const totalPages = records.data?.totalPages || 0
+  const totalRecords = records.data?.total || 0
   const localReadRatio = ratio(
     summaryData?.localPromptCacheReadInputTokens || 0,
     summaryData?.localPromptCacheInputTokens || 0
@@ -167,18 +241,41 @@ export function UsageRecordsPanel() {
       </div>
 
       <div className="flex flex-col gap-3 rounded-lg border bg-card p-4 md:flex-row md:items-center md:justify-between">
-        <div className="grid flex-1 gap-2 md:grid-cols-4">
+        <div className="grid flex-1 gap-2 md:grid-cols-2 xl:grid-cols-4">
+          <Input
+            value={searchText}
+            onChange={(event) => setSearchText(event.target.value)}
+            placeholder="搜索模型、账号、会话、错误"
+            className="xl:col-span-2"
+          />
+          <Input
+            value={model}
+            onChange={(event) => setModel(event.target.value)}
+            placeholder="模型"
+          />
           <Input
             value={conversationId}
             onChange={(event) => setConversationId(event.target.value)}
-            placeholder="conversationId"
+            placeholder="会话 ID"
           />
           <Input
             value={credentialId}
             onChange={(event) => setCredentialId(event.target.value)}
-            placeholder="credentialId"
+            placeholder="账号 ID"
             inputMode="numeric"
           />
+          <select
+            value={status}
+            onChange={(event) => setStatus(event.target.value as UsageRecordStatus | '')}
+            className="h-10 rounded-md border border-input bg-background px-3 py-2 text-sm"
+          >
+            <option value="">全部状态</option>
+            <option value="success">成功</option>
+            <option value="error">错误</option>
+            <option value="stream_error">流错误</option>
+            <option value="upstream_timeout">上游超时</option>
+            <option value="client_dropped">客户端断开</option>
+          </select>
           <select
             value={source}
             onChange={(event) => setSource(event.target.value as UsageSource | '')}
@@ -189,6 +286,16 @@ export function UsageRecordsPanel() {
             <option value="local_prompt_cache">本地 prompt cache</option>
             <option value="context_estimate">上下文估算</option>
             <option value="request_estimate">请求估算</option>
+            <option value="none">无缓存</option>
+          </select>
+          <select
+            value={streamMode}
+            onChange={(event) => setStreamMode(event.target.value as 'all' | 'stream' | 'non_stream')}
+            className="h-10 rounded-md border border-input bg-background px-3 py-2 text-sm"
+          >
+            <option value="all">全部请求</option>
+            <option value="stream">Stream</option>
+            <option value="non_stream">非 Stream</option>
           </select>
           <Input
             value={minCacheRead}
@@ -198,6 +305,10 @@ export function UsageRecordsPanel() {
           />
         </div>
         <div className="flex gap-2">
+          <Button variant="outline" size="sm" onClick={handleResetFilters} disabled={!hasFilters}>
+            <X className="h-4 w-4" />
+            重置
+          </Button>
           <Button variant="outline" size="sm" onClick={handleRefresh}>
             <RefreshCw className="h-4 w-4" />
             刷新
@@ -224,15 +335,18 @@ export function UsageRecordsPanel() {
             <div className="py-8 text-center text-muted-foreground">加载中...</div>
           ) : records.error ? (
             <div className="py-8 text-center text-destructive">{extractErrorMessage(records.error)}</div>
-          ) : records.data?.records.length === 0 ? (
+          ) : totalRecords === 0 ? (
             <div className="py-8 text-center text-muted-foreground">暂无记录</div>
+          ) : records.data?.records.length === 0 ? (
+            <div className="py-8 text-center text-muted-foreground">当前页暂无记录</div>
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[1440px] text-sm">
+              <table className="w-full min-w-[1600px] text-sm">
                 <thead>
                   <tr className="border-b text-left text-muted-foreground">
                     <th className="px-3 py-2 font-medium">时间</th>
                     <th className="px-3 py-2 font-medium">账号</th>
+                    <th className="px-3 py-2 font-medium">模型</th>
                     <th className="px-3 py-2 font-medium">会话</th>
                     <th className="px-3 py-2 font-medium">来源</th>
                     <th className="px-3 py-2 font-medium">状态</th>
@@ -271,9 +385,17 @@ export function UsageRecordsPanel() {
                         )}
                       </td>
                       <td className="px-3 py-2">
+                        <div className="max-w-[260px] truncate font-medium" title={record.model}>
+                          {record.model || '-'}
+                        </div>
+                        <div className="mt-1 flex flex-wrap gap-1">
+                          <Badge variant="outline">{record.endpoint || '-'}</Badge>
+                          {record.stream ? <Badge variant="secondary">stream</Badge> : <Badge variant="outline">non-stream</Badge>}
+                        </div>
+                      </td>
+                      <td className="px-3 py-2">
                         <div className="max-w-[220px] truncate">{record.conversationId || '-'}</div>
                         <div className="mt-1 flex flex-wrap gap-1">
-                          {record.stream && <Badge variant="outline">stream</Badge>}
                           {record.stickyBound && <Badge variant="secondary">sticky</Badge>}
                           {record.fallbackFromSticky && <Badge variant="warning">fallback</Badge>}
                         </div>
@@ -284,8 +406,8 @@ export function UsageRecordsPanel() {
                         </Badge>
                       </td>
                       <td className="px-3 py-2">
-                        <Badge variant={statusVariant(record.status)}>
-                          {record.status}
+                        <Badge variant={statusVariant(record.status)} title={record.status}>
+                          {statusLabel(record.status)}
                         </Badge>
                         {record.errorMessage && (
                           <div className="mt-1 max-w-[220px] truncate text-xs text-muted-foreground">
@@ -307,6 +429,29 @@ export function UsageRecordsPanel() {
                   })}
                 </tbody>
               </table>
+            </div>
+          )}
+          {totalPages > 1 && (
+            <div className="mt-4 flex items-center justify-center gap-4">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                disabled={currentPage === 1}
+              >
+                上一页
+              </Button>
+              <span className="text-sm text-muted-foreground">
+                第 {currentPage} / {totalPages} 页（共 {totalRecords} 条记录）
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                disabled={currentPage === totalPages}
+              >
+                下一页
+              </Button>
             </div>
           )}
         </CardContent>

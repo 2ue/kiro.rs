@@ -8,9 +8,9 @@ use axum::{
 use super::{
     handlers::{
         add_credential, clear_usage_records, delete_credential, force_refresh_token,
-        get_all_credentials, get_credential_balance, get_load_balancing_mode, get_usage_records,
-        get_usage_summary, reset_failure_count, set_credential_disabled, set_credential_priority,
-        set_load_balancing_mode,
+        get_all_credentials, get_credential_balance, get_credentials_page, get_load_balancing_mode,
+        get_usage_records, get_usage_records_page, get_usage_summary, reset_failure_count,
+        set_credential_disabled, set_credential_priority, set_load_balancing_mode,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -19,6 +19,7 @@ use super::{
 ///
 /// # 端点
 /// - `GET /credentials` - 获取所有凭据状态
+/// - `GET /credentials-paged` - 分页获取凭据状态
 /// - `POST /credentials` - 添加新凭据
 /// - `DELETE /credentials/:id` - 删除凭据
 /// - `POST /credentials/:id/disabled` - 设置凭据禁用状态
@@ -39,6 +40,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/credentials",
             get(get_all_credentials).post(add_credential),
         )
+        .route("/credentials-paged", get(get_credentials_page))
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
@@ -46,6 +48,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))
         .route("/usage-records", get(get_usage_records))
+        .route("/usage-records-paged", get(get_usage_records_page))
         .route("/usage-records/clear", post(clear_usage_records))
         .route("/usage-summary", get(get_usage_summary))
         .route(

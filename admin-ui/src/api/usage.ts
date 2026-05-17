@@ -2,6 +2,8 @@ import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
   SuccessResponse,
+  UsageRecordsPageQuery,
+  UsageRecordsPageResult,
   UsageRecordsQuery,
   UsageRecordsResult,
   UsageSummary,
@@ -26,6 +28,15 @@ export async function getUsageRecords(
   query: UsageRecordsQuery = {}
 ): Promise<UsageRecordsResult> {
   const { data } = await api.get<UsageRecordsResult>('/usage-records', {
+    params: query,
+  })
+  return data
+}
+
+export async function getUsageRecordsPage(
+  query: UsageRecordsPageQuery
+): Promise<UsageRecordsPageResult> {
+  const { data } = await api.get<UsageRecordsPageResult>('/usage-records-paged', {
     params: query,
   })
   return data

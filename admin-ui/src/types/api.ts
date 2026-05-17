@@ -6,6 +6,17 @@ export interface CredentialsStatusResponse {
   credentials: CredentialStatusItem[]
 }
 
+export interface CredentialsPageResponse extends CredentialsStatusResponse {
+  page: number
+  limit: number
+  totalPages: number
+}
+
+export interface CredentialsPageQuery {
+  page: number
+  limit: number
+}
+
 // 单个凭据状态
 export interface CredentialStatusItem {
   id: number
@@ -135,6 +146,12 @@ export interface UsageRecordsResult {
   records: UsageRecord[]
 }
 
+export interface UsageRecordsPageResult extends UsageRecordsResult {
+  page: number
+  limit: number
+  totalPages: number
+}
+
 export interface UsageAggregate {
   key: string
   label?: string
@@ -164,6 +181,7 @@ export interface UsageSummary {
 
 export interface UsageRecordsQuery {
   limit?: number
+  q?: string
   conversationId?: string
   credentialId?: number
   model?: string
@@ -171,4 +189,9 @@ export interface UsageRecordsQuery {
   source?: UsageSource
   stream?: boolean
   minCacheRead?: number
+}
+
+export interface UsageRecordsPageQuery extends UsageRecordsQuery {
+  page: number
+  limit: number
 }

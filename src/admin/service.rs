@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::anthropic::{
     prompt_cache::PromptCacheTracker,
-    usage::{UsageRecordQuery, UsageRecorder, UsageRecordsResult, UsageSummary},
+    usage::{
+        UsageRecordQuery, UsageRecorder, UsageRecordsPageResult, UsageRecordsResult, UsageSummary,
+    },
 };
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
@@ -18,11 +20,14 @@ use crate::kiro::token_manager::MultiTokenManager;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    CredentialsPageResponse, CredentialsStatusResponse, LoadBalancingModeResponse,
+    SetLoadBalancingModeRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
+const DEFAULT_CREDENTIALS_PAGE_LIMIT: usize = 12;
+const MAX_CREDENTIALS_PAGE_LIMIT: usize = 500;
 
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +87,37 @@ impl AdminService {
 
     /// 获取所有凭据状态
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
+        let (total, available, current_id, credentials) = self.credential_status_items();
+
+        CredentialsStatusResponse {
+            total,
+            available,
+            current_id,
+            credentials,
+        }
+    }
+
+    /// 分页获取凭据状态。
+    pub fn get_credentials_page(&self, page: usize, limit: usize) -> CredentialsPageResponse {
+        let page = normalize_page(page);
+        let limit = normalize_credentials_limit(limit);
+        let (total, available, current_id, credentials) = self.credential_status_items();
+        let total_pages = total_pages(total, limit);
+        let start = page.saturating_sub(1).saturating_mul(limit);
+        let credentials = credentials.into_iter().skip(start).take(limit).collect();
+
+        CredentialsPageResponse {
+            total,
+            available,
+            current_id,
+            page,
+            limit,
+            total_pages,
+            credentials,
+        }
+    }
+
+    fn credential_status_items(&self) -> (usize, usize, u64, Vec<CredentialStatusItem>) {
         let snapshot = self.token_manager.snapshot();
         let default_endpoint = self.token_manager.config().default_endpoint.clone();
 
@@ -114,12 +150,12 @@ impl AdminService {
         // 按优先级排序（数字越小优先级越高）
         credentials.sort_by_key(|c| c.priority);
 
-        CredentialsStatusResponse {
-            total: snapshot.total,
-            available: snapshot.available,
-            current_id: snapshot.current_id,
+        (
+            snapshot.total,
+            snapshot.available,
+            snapshot.current_id,
             credentials,
-        }
+        )
     }
 
     /// 设置凭据禁用状态
@@ -307,6 +343,16 @@ impl AdminService {
     /// 查询请求级 usage 记录。
     pub fn get_usage_records(&self, query: UsageRecordQuery) -> UsageRecordsResult {
         self.usage_recorder.query(query)
+    }
+
+    /// 分页查询请求级 usage 记录。
+    pub fn get_usage_records_page(
+        &self,
+        query: UsageRecordQuery,
+        page: usize,
+        limit: usize,
+    ) -> UsageRecordsPageResult {
+        self.usage_recorder.query_page(query, page, limit)
     }
 
     /// 获取 usage 汇总。
@@ -503,4 +549,20 @@ impl AdminService {
             AdminServiceError::InternalError(msg)
         }
     }
+}
+
+fn normalize_page(page: usize) -> usize {
+    page.max(1)
+}
+
+fn normalize_credentials_limit(limit: usize) -> usize {
+    if limit == 0 {
+        DEFAULT_CREDENTIALS_PAGE_LIMIT
+    } else {
+        limit.min(MAX_CREDENTIALS_PAGE_LIMIT)
+    }
+}
+
+fn total_pages(total: usize, limit: usize) -> usize {
+    if total == 0 { 0 } else { total.div_ceil(limit) }
 }

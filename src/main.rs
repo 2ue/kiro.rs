@@ -226,7 +226,9 @@ async fn main() {
     if admin_key_valid {
         tracing::info!("Admin API:");
         tracing::info!("  GET  /api/admin/credentials");
+        tracing::info!("  GET  /api/admin/credentials-paged");
         tracing::info!("  GET  /api/admin/usage-records");
+        tracing::info!("  GET  /api/admin/usage-records-paged");
         tracing::info!("  GET  /api/admin/usage-summary");
         tracing::info!("  POST /api/admin/credentials/:index/disabled");
         tracing::info!("  POST /api/admin/credentials/:index/priority");
