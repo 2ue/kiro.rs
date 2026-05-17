@@ -45,24 +45,33 @@ pub struct UsageRecordsQueryParams {
 #[serde(rename_all = "camelCase")]
 pub struct UsageRecordsPageQueryParams {
     pub page: Option<usize>,
-    #[serde(flatten)]
-    pub filters: UsageRecordsQueryParams,
+    pub limit: Option<usize>,
+    pub q: Option<String>,
+    pub conversation_id: Option<String>,
+    pub credential_id: Option<u64>,
+    pub model: Option<String>,
+    pub status: Option<String>,
+    pub source: Option<String>,
+    pub stream: Option<bool>,
+    pub min_cache_read: Option<i32>,
+    pub since: Option<String>,
+    pub until: Option<String>,
 }
 
 impl UsageRecordsQueryParams {
     fn into_query(self) -> Result<UsageRecordQuery, String> {
         Ok(UsageRecordQuery {
             limit: self.limit.unwrap_or_default(),
-            q: self.q.filter(|v| !v.trim().is_empty()),
-            conversation_id: self.conversation_id.filter(|v| !v.trim().is_empty()),
+            q: non_blank(self.q),
+            conversation_id: non_blank(self.conversation_id),
             credential_id: self.credential_id,
-            model: self.model.filter(|v| !v.trim().is_empty()),
-            status: self.status.as_deref().map(parse_usage_status).transpose()?,
-            source: self.source.as_deref().map(parse_usage_source).transpose()?,
+            model: non_blank(self.model),
+            status: parse_optional_usage_status(self.status)?,
+            source: parse_optional_usage_source(self.source)?,
             stream: self.stream,
             min_cache_read: self.min_cache_read,
-            since: self.since.as_deref().map(parse_time).transpose()?,
-            until: self.until.as_deref().map(parse_time).transpose()?,
+            since: parse_optional_time(self.since)?,
+            until: parse_optional_time(self.until)?,
         })
     }
 }
@@ -70,10 +79,41 @@ impl UsageRecordsQueryParams {
 impl UsageRecordsPageQueryParams {
     fn into_query(self) -> Result<(UsageRecordQuery, usize, usize), String> {
         let page = self.page.unwrap_or_default();
-        let limit = self.filters.limit.unwrap_or_default();
-        let query = self.filters.into_query()?;
+        let limit = self.limit.unwrap_or_default();
+        let query = UsageRecordQuery {
+            limit,
+            q: non_blank(self.q),
+            conversation_id: non_blank(self.conversation_id),
+            credential_id: self.credential_id,
+            model: non_blank(self.model),
+            status: parse_optional_usage_status(self.status)?,
+            source: parse_optional_usage_source(self.source)?,
+            stream: self.stream,
+            min_cache_read: self.min_cache_read,
+            since: parse_optional_time(self.since)?,
+            until: parse_optional_time(self.until)?,
+        };
         Ok((query, page, limit))
     }
+}
+
+fn non_blank(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.trim().is_empty())
+}
+
+fn parse_optional_usage_status(value: Option<String>) -> Result<Option<UsageRecordStatus>, String> {
+    let value = non_blank(value);
+    value.as_deref().map(parse_usage_status).transpose()
+}
+
+fn parse_optional_usage_source(value: Option<String>) -> Result<Option<UsageSource>, String> {
+    let value = non_blank(value);
+    value.as_deref().map(parse_usage_source).transpose()
+}
+
+fn parse_optional_time(value: Option<String>) -> Result<Option<DateTime<Utc>>, String> {
+    let value = non_blank(value);
+    value.as_deref().map(parse_time).transpose()
 }
 
 fn parse_usage_status(value: &str) -> Result<UsageRecordStatus, String> {
@@ -288,8 +328,8 @@ mod tests {
             conversation_id: Some("   ".to_string()),
             credential_id: Some(7),
             model: Some("".to_string()),
-            status: Some("success".to_string()),
-            source: Some("local_prompt_cache".to_string()),
+            status: Some("".to_string()),
+            source: Some("   ".to_string()),
             stream: Some(true),
             min_cache_read: Some(10_000),
             since: None,
@@ -303,8 +343,8 @@ mod tests {
         assert_eq!(query.conversation_id, None);
         assert_eq!(query.credential_id, Some(7));
         assert_eq!(query.model, None);
-        assert_eq!(query.status, Some(UsageRecordStatus::Success));
-        assert_eq!(query.source, Some(UsageSource::LocalPromptCache));
+        assert_eq!(query.status, None);
+        assert_eq!(query.source, None);
         assert_eq!(query.stream, Some(true));
         assert_eq!(query.min_cache_read, Some(10_000));
     }
@@ -367,19 +407,17 @@ mod tests {
     fn usage_records_page_query_keeps_pagination_separate_from_filters() {
         let (query, page, limit) = UsageRecordsPageQueryParams {
             page: Some(3),
-            filters: UsageRecordsQueryParams {
-                limit: Some(50),
-                q: Some("sonnet".to_string()),
-                conversation_id: Some("session-a".to_string()),
-                credential_id: None,
-                model: None,
-                status: None,
-                source: None,
-                stream: None,
-                min_cache_read: None,
-                since: None,
-                until: None,
-            },
+            limit: Some(50),
+            q: Some("sonnet".to_string()),
+            conversation_id: Some("session-a".to_string()),
+            credential_id: None,
+            model: None,
+            status: None,
+            source: None,
+            stream: None,
+            min_cache_read: None,
+            since: None,
+            until: None,
         }
         .into_query()
         .expect("valid page query");
