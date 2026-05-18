@@ -175,6 +175,11 @@ async fn main() {
         prompt_cache.clone(),
         config.prompt_cache_simulation_mode,
         config.prompt_cache_target_read_ratio,
+        config.prompt_cache_token_scale,
+        config.prompt_cache_max_simulated_input_tokens,
+        config.prompt_cache_cap_jitter_min_tokens,
+        config.prompt_cache_cap_jitter_max_tokens,
+        config.prompt_cache_scale_min_input_tokens,
         config.compat_profile,
         config.expose_proxy_warnings,
     );

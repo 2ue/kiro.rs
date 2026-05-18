@@ -37,6 +37,92 @@ impl CacheUsage {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CacheAmplification {
+    pub token_scale: f64,
+    pub max_simulated_input_tokens: i32,
+    pub cap_jitter_min_tokens: i32,
+    pub cap_jitter_max_tokens: i32,
+    pub scale_min_input_tokens: i32,
+    pub jitter_seed: u64,
+}
+
+impl CacheAmplification {
+    const MAX_TOKEN_SCALE: f64 = 3.0;
+
+    pub fn new(
+        token_scale: f64,
+        max_simulated_input_tokens: i32,
+        cap_jitter_min_tokens: i32,
+        cap_jitter_max_tokens: i32,
+        scale_min_input_tokens: i32,
+        jitter_seed: u64,
+    ) -> Self {
+        let token_scale = if token_scale.is_finite() && token_scale > 0.0 {
+            token_scale.clamp(1.0, Self::MAX_TOKEN_SCALE)
+        } else {
+            1.0
+        };
+        let mut cap_jitter_min_tokens = cap_jitter_min_tokens.max(0);
+        let mut cap_jitter_max_tokens = cap_jitter_max_tokens.max(0);
+        if cap_jitter_min_tokens > cap_jitter_max_tokens {
+            std::mem::swap(&mut cap_jitter_min_tokens, &mut cap_jitter_max_tokens);
+        }
+
+        Self {
+            token_scale,
+            max_simulated_input_tokens: max_simulated_input_tokens.max(0),
+            cap_jitter_min_tokens,
+            cap_jitter_max_tokens,
+            scale_min_input_tokens: scale_min_input_tokens.max(0),
+            jitter_seed,
+        }
+    }
+
+    pub fn apply(self, base_total_input_tokens: i32) -> i32 {
+        let base_total_input_tokens = base_total_input_tokens.max(0);
+        if base_total_input_tokens <= 1 || base_total_input_tokens < self.scale_min_input_tokens {
+            return base_total_input_tokens;
+        }
+
+        let scaled_total = ((base_total_input_tokens as f64) * self.token_scale).round() as i32;
+        let scaled_total = scaled_total.max(base_total_input_tokens);
+        if self.max_simulated_input_tokens <= 1 {
+            return scaled_total;
+        }
+        if scaled_total <= self.max_simulated_input_tokens {
+            return scaled_total;
+        }
+
+        let jitter = self.cap_jitter();
+        let soft_cap = self
+            .max_simulated_input_tokens
+            .saturating_sub(jitter)
+            .clamp(1, self.max_simulated_input_tokens);
+        scaled_total.min(soft_cap)
+    }
+
+    fn cap_jitter(self) -> i32 {
+        if self.cap_jitter_max_tokens <= 0 || self.max_simulated_input_tokens <= 1 {
+            return 0;
+        }
+
+        let cap_relative_max = ((self.max_simulated_input_tokens as f64) * 0.08).round() as i32;
+        let max_jitter = self
+            .cap_jitter_max_tokens
+            .min(cap_relative_max)
+            .min(self.max_simulated_input_tokens.saturating_sub(1))
+            .max(0);
+        if max_jitter <= 0 {
+            return 0;
+        }
+
+        let min_jitter = self.cap_jitter_min_tokens.min(max_jitter).max(0);
+        let range = (max_jitter - min_jitter + 1) as u64;
+        min_jitter + (self.jitter_seed % range) as i32
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct CacheSimulation {
     pub cache_creation_input_tokens: i32,
@@ -44,6 +130,7 @@ pub struct CacheSimulation {
     pub cache_creation_5m_input_tokens: i32,
     pub cache_creation_1h_input_tokens: i32,
     pub target_cache_ratio: Option<f64>,
+    pub amplification: Option<CacheAmplification>,
 }
 
 impl CacheSimulation {
@@ -58,6 +145,7 @@ impl CacheSimulation {
             cache_creation_5m_input_tokens: usage.cache_creation_5m_input_tokens.max(0),
             cache_creation_1h_input_tokens: usage.cache_creation_1h_input_tokens.max(0),
             target_cache_ratio: usage.effective_cache_ratio,
+            amplification: None,
         };
         (!simulation.is_empty()).then_some(simulation)
     }
@@ -71,8 +159,21 @@ impl CacheSimulation {
         Some(simulation)
     }
 
+    pub fn from_prompt_cache_with_ratio_and_amplification(
+        usage: PromptCacheUsage,
+        target_cache_ratio: f64,
+        amplification: Option<CacheAmplification>,
+    ) -> Option<Self> {
+        let mut simulation = Self::from_prompt_cache_with_ratio(usage, target_cache_ratio)?;
+        simulation.amplification = amplification;
+        Some(simulation)
+    }
+
     pub fn to_usage(self, total_input_tokens: i32, output_tokens: i32) -> CacheUsage {
-        let total_input_tokens = total_input_tokens.max(0);
+        let total_input_tokens = self
+            .amplification
+            .map(|amplification| amplification.apply(total_input_tokens))
+            .unwrap_or_else(|| total_input_tokens.max(0));
         if let Some(target_ratio) = self.target_cache_ratio {
             return self.to_target_ratio_usage(total_input_tokens, output_tokens, target_ratio);
         }
@@ -197,11 +298,7 @@ pub fn build_usage_with_simulation_policy(
                 } else {
                     output_tokens
                 };
-                let total_input_tokens = if usage.total_input_tokens() > 0 {
-                    usage.total_input_tokens()
-                } else {
-                    total_input_tokens
-                };
+                let total_input_tokens = usage.total_input_tokens().max(total_input_tokens);
                 return simulation.to_usage(total_input_tokens, output_tokens);
             }
         }
@@ -262,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn high_cache_policy_fills_zero_metadata_cache_from_simulation() {
+    fn high_cache_policy_fills_zero_metadata_cache_from_larger_local_total() {
         let metadata = MetadataTokenUsage {
             uncached_input_tokens: 50_000,
             output_tokens: 42,
@@ -284,11 +381,11 @@ mod tests {
         let usage =
             build_usage_with_simulation_policy(Some(&metadata), 100_000, 7, simulation, true);
 
-        assert_eq!(usage.total_input_tokens, 50_000);
+        assert_eq!(usage.total_input_tokens, 100_000);
         assert_eq!(usage.output_tokens, 42);
-        assert_eq!(usage.cache_read_input_tokens, 47_500);
+        assert_eq!(usage.cache_read_input_tokens, 95_000);
         assert_eq!(usage.cache_creation_input_tokens, 0);
-        assert_eq!(usage.input_tokens, 2_500);
+        assert_eq!(usage.input_tokens, 5_000);
     }
 
     #[test]
@@ -423,5 +520,76 @@ mod tests {
         .to_usage(100_000, 1);
         assert_eq!(read_match.cache_read_input_tokens, 95_000);
         assert_eq!(read_match.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn amplification_scales_simulated_total_for_large_high_cache_requests() {
+        let amplification = CacheAmplification::new(1.5, 0, 0, 0, 8_000, 0);
+        let usage = CacheSimulation::from_prompt_cache_with_ratio_and_amplification(
+            PromptCacheUsage {
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 95_000,
+                cache_creation_5m_input_tokens: 0,
+                cache_creation_1h_input_tokens: 0,
+                effective_cache_ratio: None,
+            },
+            0.95,
+            Some(amplification),
+        )
+        .unwrap()
+        .to_usage(100_000, 1);
+
+        assert_eq!(usage.total_input_tokens, 150_000);
+        assert_eq!(usage.cache_read_input_tokens, 142_500);
+        assert_eq!(usage.input_tokens, 7_500);
+    }
+
+    #[test]
+    fn amplification_does_not_scale_small_requests() {
+        let amplification = CacheAmplification::new(2.0, 200_000, 5_000, 20_000, 8_000, 0);
+        let usage = CacheSimulation::from_prompt_cache_with_ratio_and_amplification(
+            PromptCacheUsage {
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 95_000,
+                cache_creation_5m_input_tokens: 0,
+                cache_creation_1h_input_tokens: 0,
+                effective_cache_ratio: None,
+            },
+            0.95,
+            Some(amplification),
+        )
+        .unwrap()
+        .to_usage(4_096, 1);
+
+        assert_eq!(usage.total_input_tokens, 4_096);
+        assert_eq!(usage.cache_read_input_tokens, 3_891);
+        assert_eq!(usage.input_tokens, 205);
+    }
+
+    #[test]
+    fn amplification_uses_deterministic_soft_cap_instead_of_fixed_cap() {
+        let first = CacheAmplification::new(3.0, 200_000, 5_000, 20_000, 8_000, 0);
+        let second = CacheAmplification::new(3.0, 200_000, 5_000, 20_000, 8_000, 10_000);
+
+        let first_total = first.apply(100_000);
+        let second_total = second.apply(100_000);
+
+        assert!((184_000..=195_000).contains(&first_total));
+        assert!((184_000..=195_000).contains(&second_total));
+        assert_ne!(first_total, 200_000);
+        assert_ne!(second_total, 200_000);
+        assert!(
+            (first_total - second_total).abs() >= 5_000,
+            "soft cap jitter should be visible at the k-token level"
+        );
+    }
+
+    #[test]
+    fn invalid_amplification_config_is_sanitized() {
+        let amplification = CacheAmplification::new(-2.0, 0, 20_000, 5_000, -1, 0);
+
+        assert_eq!(amplification.apply(10_000), 10_000);
+        assert_eq!(amplification.cap_jitter_min_tokens, 5_000);
+        assert_eq!(amplification.cap_jitter_max_tokens, 20_000);
     }
 }

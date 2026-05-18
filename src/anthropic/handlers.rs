@@ -64,6 +64,11 @@ struct RequestUsageContext {
     prompt_cache_profile: Option<PromptCacheProfile>,
     simulation_mode: PromptCacheSimulationMode,
     prompt_cache_target_read_ratio: f64,
+    prompt_cache_token_scale: f64,
+    prompt_cache_max_simulated_input_tokens: i32,
+    prompt_cache_cap_jitter_min_tokens: i32,
+    prompt_cache_cap_jitter_max_tokens: i32,
+    prompt_cache_scale_min_input_tokens: i32,
     simulated_usage: Option<super::cache::CacheSimulation>,
     simulated_source: Option<UsageSource>,
     started_at: Instant,
@@ -79,6 +84,24 @@ struct CredentialUsageContext {
 }
 
 impl RequestUsageContext {
+    fn cache_amplification(&self) -> Option<super::cache::CacheAmplification> {
+        if self.simulation_mode != PromptCacheSimulationMode::HighCache {
+            return None;
+        }
+
+        Some(super::cache::CacheAmplification::new(
+            self.prompt_cache_token_scale,
+            self.prompt_cache_max_simulated_input_tokens,
+            self.prompt_cache_cap_jitter_min_tokens,
+            self.prompt_cache_cap_jitter_max_tokens,
+            self.prompt_cache_scale_min_input_tokens,
+            self.prompt_cache_profile
+                .as_ref()
+                .map(|profile| profile.cache_jitter_seed())
+                .unwrap_or(0),
+        ))
+    }
+
     fn attach_credential(
         self,
         credential_id: Option<u64>,
@@ -731,6 +754,11 @@ fn prepare_usage_context(
         prompt_cache_profile,
         simulation_mode: state.prompt_cache_simulation_mode,
         prompt_cache_target_read_ratio: state.prompt_cache_target_read_ratio,
+        prompt_cache_token_scale: state.prompt_cache_token_scale,
+        prompt_cache_max_simulated_input_tokens: state.prompt_cache_max_simulated_input_tokens,
+        prompt_cache_cap_jitter_min_tokens: state.prompt_cache_cap_jitter_min_tokens,
+        prompt_cache_cap_jitter_max_tokens: state.prompt_cache_cap_jitter_max_tokens,
+        prompt_cache_scale_min_input_tokens: state.prompt_cache_scale_min_input_tokens,
         simulated_usage,
         simulated_source,
         started_at: Instant::now(),
@@ -796,10 +824,12 @@ fn prepare_credential_usage_context(
             usage_context.prompt_cache_profile.as_ref(),
             usage_context.prompt_cache_target_read_ratio,
         );
-        usage_context.simulated_usage = super::cache::CacheSimulation::from_prompt_cache_with_ratio(
-            prompt_usage,
-            usage_context.prompt_cache_target_read_ratio,
-        );
+        usage_context.simulated_usage =
+            super::cache::CacheSimulation::from_prompt_cache_with_ratio_and_amplification(
+                prompt_usage,
+                usage_context.prompt_cache_target_read_ratio,
+                usage_context.cache_amplification(),
+            );
         if usage_context.simulated_usage.is_some() {
             usage_context.simulated_source = Some(UsageSource::LocalPromptCache);
         } else {
@@ -1727,10 +1757,16 @@ async fn handle_non_stream_request(
         .map(|usage| usage.total_input_tokens())
         .or(context_input_tokens)
         .unwrap_or(input_tokens);
+    let usage_input_tokens =
+        if credential_usage.request.simulation_mode == PromptCacheSimulationMode::HighCache {
+            final_input_tokens.max(credential_usage.request.input_tokens)
+        } else {
+            final_input_tokens
+        };
 
     let usage = super::cache::build_usage_with_simulation_policy(
         metadata_usage.as_ref(),
-        final_input_tokens,
+        usage_input_tokens,
         output_tokens,
         credential_usage.request.simulated_usage,
         credential_usage.request.simulation_mode == PromptCacheSimulationMode::HighCache,
@@ -2125,6 +2161,11 @@ mod tests {
             prompt_cache_profile: profile.clone(),
             simulation_mode: PromptCacheSimulationMode::LocalPromptCache,
             prompt_cache_target_read_ratio: 0.85,
+            prompt_cache_token_scale: 1.0,
+            prompt_cache_max_simulated_input_tokens: 0,
+            prompt_cache_cap_jitter_min_tokens: 0,
+            prompt_cache_cap_jitter_max_tokens: 0,
+            prompt_cache_scale_min_input_tokens: 0,
             simulated_usage: None,
             simulated_source: Some(UsageSource::LocalPromptCache),
             started_at: Instant::now(),
@@ -2187,12 +2228,18 @@ mod tests {
             prompt_cache_profile: profile.clone(),
             simulation_mode: PromptCacheSimulationMode::HighCache,
             prompt_cache_target_read_ratio: 0.95,
+            prompt_cache_token_scale: 1.0,
+            prompt_cache_max_simulated_input_tokens: 0,
+            prompt_cache_cap_jitter_min_tokens: 0,
+            prompt_cache_cap_jitter_max_tokens: 0,
+            prompt_cache_scale_min_input_tokens: 0,
             simulated_usage: Some(cache::CacheSimulation {
                 cache_creation_input_tokens: 3968,
                 cache_read_input_tokens: 0,
                 cache_creation_5m_input_tokens: 3968,
                 cache_creation_1h_input_tokens: 0,
                 target_cache_ratio: Some(0.95),
+                amplification: None,
             }),
             simulated_source: Some(UsageSource::LocalPromptCache),
             started_at: Instant::now(),
@@ -2416,10 +2463,12 @@ mod tests {
             usage_context.prompt_cache_profile.as_ref(),
             usage_context.prompt_cache_target_read_ratio,
         );
-        usage_context.simulated_usage = cache::CacheSimulation::from_prompt_cache_with_ratio(
-            prompt_usage,
-            usage_context.prompt_cache_target_read_ratio,
-        );
+        usage_context.simulated_usage =
+            cache::CacheSimulation::from_prompt_cache_with_ratio_and_amplification(
+                prompt_usage,
+                usage_context.prompt_cache_target_read_ratio,
+                usage_context.cache_amplification(),
+            );
         usage_context.simulated_source = usage_context
             .simulated_usage
             .map(|_| UsageSource::LocalPromptCache);

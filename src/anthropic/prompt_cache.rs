@@ -65,6 +65,18 @@ pub struct PromptCacheProfile {
     model: String,
 }
 
+impl PromptCacheProfile {
+    pub(crate) fn cache_jitter_seed(&self) -> u64 {
+        let Some(point) = self.lookup_points.last() else {
+            return 0;
+        };
+
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&point.fingerprint[..8]);
+        u64::from_be_bytes(bytes)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PromptCacheUsage {
     pub cache_creation_input_tokens: i32,

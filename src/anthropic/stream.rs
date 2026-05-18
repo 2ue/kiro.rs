@@ -1411,6 +1411,11 @@ impl StreamContext {
             .map(|usage| usage.total_input_tokens())
             .or(self.context_input_tokens)
             .unwrap_or(self.input_tokens);
+        let usage_input_tokens = if self.simulation_mode == PromptCacheSimulationMode::HighCache {
+            final_input_tokens.max(self.input_tokens)
+        } else {
+            final_input_tokens
+        };
         let final_output_tokens = self
             .metadata_usage
             .as_ref()
@@ -1418,7 +1423,7 @@ impl StreamContext {
             .unwrap_or(self.output_tokens);
         let final_usage = super::cache::build_usage_with_simulation_policy(
             self.metadata_usage.as_ref(),
-            final_input_tokens,
+            usage_input_tokens,
             final_output_tokens,
             self.simulated_usage,
             self.simulation_mode == PromptCacheSimulationMode::HighCache,

@@ -165,6 +165,30 @@ pub struct Config {
     #[serde(default = "default_prompt_cache_target_read_ratio")]
     pub prompt_cache_target_read_ratio: f64,
 
+    /// high-cache 模拟专用的 total input 放大倍数。
+    ///
+    /// 只影响本地 high-cache usage 模拟，不影响真实 Kiro metadata cache。
+    #[serde(default = "default_prompt_cache_token_scale")]
+    pub prompt_cache_token_scale: f64,
+
+    /// high-cache 模拟 total input 的上限。
+    ///
+    /// 触顶时会按稳定 fingerprint 做确定性 soft-cap 抖动，避免每次固定卡在上限。
+    #[serde(default = "default_prompt_cache_max_simulated_input_tokens")]
+    pub prompt_cache_max_simulated_input_tokens: i32,
+
+    /// high-cache 模拟触顶 soft-cap 的最小扣减 token。
+    #[serde(default = "default_prompt_cache_cap_jitter_min_tokens")]
+    pub prompt_cache_cap_jitter_min_tokens: i32,
+
+    /// high-cache 模拟触顶 soft-cap 的最大扣减 token。
+    #[serde(default = "default_prompt_cache_cap_jitter_max_tokens")]
+    pub prompt_cache_cap_jitter_max_tokens: i32,
+
+    /// 基础输入达到该门槛后才启用 high-cache token scale，避免短测试请求被放大。
+    #[serde(default = "default_prompt_cache_scale_min_input_tokens")]
+    pub prompt_cache_scale_min_input_tokens: i32,
+
     /// 请求级 usage record 内存保留上限。
     #[serde(default = "default_usage_record_limit")]
     pub usage_record_limit: usize,
@@ -251,7 +275,27 @@ fn default_prompt_cache_simulation_mode() -> PromptCacheSimulationMode {
 }
 
 fn default_prompt_cache_target_read_ratio() -> f64 {
-    0.95
+    0.98
+}
+
+fn default_prompt_cache_token_scale() -> f64 {
+    1.6
+}
+
+fn default_prompt_cache_max_simulated_input_tokens() -> i32 {
+    300_000
+}
+
+fn default_prompt_cache_cap_jitter_min_tokens() -> i32 {
+    12_000
+}
+
+fn default_prompt_cache_cap_jitter_max_tokens() -> i32 {
+    24_000
+}
+
+fn default_prompt_cache_scale_min_input_tokens() -> i32 {
+    20_000
 }
 
 fn default_usage_record_limit() -> usize {
@@ -300,6 +344,12 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             prompt_cache_simulation_mode: default_prompt_cache_simulation_mode(),
             prompt_cache_target_read_ratio: default_prompt_cache_target_read_ratio(),
+            prompt_cache_token_scale: default_prompt_cache_token_scale(),
+            prompt_cache_max_simulated_input_tokens:
+                default_prompt_cache_max_simulated_input_tokens(),
+            prompt_cache_cap_jitter_min_tokens: default_prompt_cache_cap_jitter_min_tokens(),
+            prompt_cache_cap_jitter_max_tokens: default_prompt_cache_cap_jitter_max_tokens(),
+            prompt_cache_scale_min_input_tokens: default_prompt_cache_scale_min_input_tokens(),
             usage_record_limit: default_usage_record_limit(),
             usage_record_persist: default_usage_record_persist(),
             high_cache_threshold: default_high_cache_threshold(),
@@ -382,8 +432,19 @@ mod tests {
     }
 
     #[test]
-    fn default_prompt_cache_target_read_ratio_is_95_percent() {
-        assert_eq!(Config::default().prompt_cache_target_read_ratio, 0.95);
+    fn default_prompt_cache_target_read_ratio_is_98_percent() {
+        assert_eq!(Config::default().prompt_cache_target_read_ratio, 0.98);
+    }
+
+    #[test]
+    fn default_prompt_cache_token_amplification_is_configured() {
+        let config = Config::default();
+
+        assert_eq!(config.prompt_cache_token_scale, 1.6);
+        assert_eq!(config.prompt_cache_max_simulated_input_tokens, 300_000);
+        assert_eq!(config.prompt_cache_cap_jitter_min_tokens, 12_000);
+        assert_eq!(config.prompt_cache_cap_jitter_max_tokens, 24_000);
+        assert_eq!(config.prompt_cache_scale_min_input_tokens, 20_000);
     }
 
     #[test]
@@ -444,5 +505,26 @@ mod tests {
             config.prompt_cache_simulation_mode,
             PromptCacheSimulationMode::LocalPromptCache
         );
+    }
+
+    #[test]
+    fn prompt_cache_token_amplification_deserializes_from_camel_case_config() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "apiKey": "sk-test",
+                "promptCacheTokenScale": 1.5,
+                "promptCacheMaxSimulatedInputTokens": 200000,
+                "promptCacheCapJitterMinTokens": 5000,
+                "promptCacheCapJitterMaxTokens": 20000,
+                "promptCacheScaleMinInputTokens": 10000
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.prompt_cache_token_scale, 1.5);
+        assert_eq!(config.prompt_cache_max_simulated_input_tokens, 200_000);
+        assert_eq!(config.prompt_cache_cap_jitter_min_tokens, 5_000);
+        assert_eq!(config.prompt_cache_cap_jitter_max_tokens, 20_000);
+        assert_eq!(config.prompt_cache_scale_min_input_tokens, 10_000);
     }
 }

@@ -2,9 +2,9 @@
 
 ## Current Running Instance
 
-- Service URL: `http://127.0.0.1:8080`
-- Admin UI: `http://127.0.0.1:8080/admin`
-- Observed process: `target/debug/kiro-rs.exe`
+- Service URL: `http://127.0.0.1:9022`
+- Admin UI: `http://127.0.0.1:9020/admin`
+- Observed process: `target/debug/kiro-rs`
 - Active local config: `config.json`
 
 ## Current Cache Mode
@@ -14,11 +14,16 @@ The local instance is running with high-cache prompt-cache usage simulation:
 ```json
 {
   "promptCacheSimulationMode": "high-cache",
-  "promptCacheTargetReadRatio": 0.95
+  "promptCacheTargetReadRatio": 0.98,
+  "promptCacheTokenScale": 1.6,
+  "promptCacheMaxSimulatedInputTokens": 300000,
+  "promptCacheCapJitterMinTokens": 12000,
+  "promptCacheCapJitterMaxTokens": 24000,
+  "promptCacheScaleMinInputTokens": 20000
 }
 ```
 
-In high-cache mode, the proxy builds a local prompt cache profile even when the request does not include explicit `cache_control`. If upstream metadata reports zero cache read/write tokens, the local simulated usage is used to fill Anthropic-compatible cache fields so downstream usage records are not all zero. When metadata total input is available, it is preserved instead of being replaced by a larger local estimate.
+In high-cache mode, the proxy builds a local prompt cache profile even when the request does not include explicit `cache_control`. If upstream metadata reports zero cache read/write tokens, the local simulated usage is used to fill Anthropic-compatible cache fields so downstream usage records are not all zero. Real upstream cache read/write values remain authoritative. When metadata cache is zero, high-cache simulation uses the larger of upstream metadata total input and local request estimate, then applies the high-cache-only token scale and deterministic soft cap.
 
 For requests without metadata/session, the converter now derives a deterministic conversation id from the stable prompt anchor, which keeps the local prompt cache scope stable across turns.
 

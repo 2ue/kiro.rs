@@ -47,6 +47,11 @@ pub fn create_router_with_provider(
     prompt_cache: Arc<PromptCacheTracker>,
     prompt_cache_simulation_mode: PromptCacheSimulationMode,
     prompt_cache_target_read_ratio: f64,
+    prompt_cache_token_scale: f64,
+    prompt_cache_max_simulated_input_tokens: i32,
+    prompt_cache_cap_jitter_min_tokens: i32,
+    prompt_cache_cap_jitter_max_tokens: i32,
+    prompt_cache_scale_min_input_tokens: i32,
     compat_profile: CompatProfile,
     expose_proxy_warnings: bool,
 ) -> Router {
@@ -59,6 +64,13 @@ pub fn create_router_with_provider(
         prompt_cache_target_read_ratio,
         compat_profile,
         expose_proxy_warnings,
+    )
+    .with_prompt_cache_amplification(
+        prompt_cache_token_scale,
+        prompt_cache_max_simulated_input_tokens,
+        prompt_cache_cap_jitter_min_tokens,
+        prompt_cache_cap_jitter_max_tokens,
+        prompt_cache_scale_min_input_tokens,
     );
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
