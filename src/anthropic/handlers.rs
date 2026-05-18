@@ -33,8 +33,8 @@ use tokio::time::{Instant, interval, sleep_until};
 
 use super::converter::{
     ConversionError, ConverterOptions, convert_request_with_options,
-    extract_stable_conversation_id, infer_document_media_type_from_url,
-    infer_image_format_from_url,
+    extract_metadata_conversation_id, extract_stable_conversation_id,
+    infer_document_media_type_from_url, infer_image_format_from_url,
 };
 use super::envelope;
 use super::middleware::AppState;
@@ -59,6 +59,7 @@ struct RequestUsageContext {
     stream: bool,
     model: String,
     conversation_id: Option<String>,
+    prompt_cache_scope_conversation_id: Option<String>,
     input_tokens: i32,
     prompt_cache_profile: Option<PromptCacheProfile>,
     simulation_mode: PromptCacheSimulationMode,
@@ -99,7 +100,7 @@ impl CredentialUsageContext {
     fn scope(&self) -> Option<PromptCacheScope> {
         Some(PromptCacheScope {
             credential_id: self.credential_id?,
-            conversation_id: self.request.conversation_id.clone()?,
+            conversation_id: self.request.prompt_cache_scope_conversation_id.clone()?,
             model: self.request.model.clone(),
         })
     }
@@ -725,6 +726,7 @@ fn prepare_usage_context(
         stream,
         model: payload.model.clone(),
         conversation_id,
+        prompt_cache_scope_conversation_id: stable_conversation_id,
         input_tokens,
         prompt_cache_profile,
         simulation_mode: state.prompt_cache_simulation_mode,
@@ -732,6 +734,17 @@ fn prepare_usage_context(
         simulated_usage,
         simulated_source,
         started_at: Instant::now(),
+    }
+}
+
+fn prompt_cache_scope_conversation_id(
+    mode: PromptCacheSimulationMode,
+    payload: &MessagesRequest,
+) -> Option<String> {
+    match mode {
+        PromptCacheSimulationMode::Disabled => None,
+        PromptCacheSimulationMode::LocalPromptCache => extract_metadata_conversation_id(payload),
+        PromptCacheSimulationMode::HighCache => extract_stable_conversation_id(payload),
     }
 }
 
@@ -771,7 +784,7 @@ fn prepare_credential_usage_context(
         PromptCacheSimulationMode::LocalPromptCache | PromptCacheSimulationMode::HighCache
     ) {
         let scope = usage_context
-            .conversation_id
+            .prompt_cache_scope_conversation_id
             .as_ref()
             .map(|conversation_id| PromptCacheScope {
                 credential_id,
@@ -1126,6 +1139,7 @@ pub async fn post_messages(
         &payload,
         ConverterOptions {
             compat_profile: state.compat_profile,
+            prompt_cache_simulation_mode: state.prompt_cache_simulation_mode,
         },
     ) {
         Ok(result) => result,
@@ -1168,7 +1182,7 @@ pub async fn post_messages(
         payload.stream,
         &payload,
         Some(kiro_request.conversation_state.conversation_id.clone()),
-        extract_stable_conversation_id(&payload),
+        prompt_cache_scope_conversation_id(state.prompt_cache_simulation_mode, &payload),
         input_tokens,
     );
 
@@ -1905,6 +1919,7 @@ pub async fn post_messages_cc(
         &payload,
         ConverterOptions {
             compat_profile: state.compat_profile,
+            prompt_cache_simulation_mode: state.prompt_cache_simulation_mode,
         },
     ) {
         Ok(result) => result,
@@ -1947,7 +1962,7 @@ pub async fn post_messages_cc(
         payload.stream,
         &payload,
         Some(kiro_request.conversation_state.conversation_id.clone()),
-        extract_stable_conversation_id(&payload),
+        prompt_cache_scope_conversation_id(state.prompt_cache_simulation_mode, &payload),
         input_tokens,
     );
 
@@ -2105,6 +2120,7 @@ mod tests {
             stream: true,
             model: payload.model.clone(),
             conversation_id: Some("session-a".to_string()),
+            prompt_cache_scope_conversation_id: Some("session-a".to_string()),
             input_tokens: 4096,
             prompt_cache_profile: profile.clone(),
             simulation_mode: PromptCacheSimulationMode::LocalPromptCache,
@@ -2166,6 +2182,7 @@ mod tests {
             stream: true,
             model: payload.model.clone(),
             conversation_id: Some("session-high-cache".to_string()),
+            prompt_cache_scope_conversation_id: Some("session-high-cache".to_string()),
             input_tokens: 4096,
             prompt_cache_profile: profile.clone(),
             simulation_mode: PromptCacheSimulationMode::HighCache,
@@ -2364,6 +2381,22 @@ mod tests {
 
         assert!(simulation.is_none());
         assert!(source.is_none());
+
+        let context = prepare_usage_context(
+            &state,
+            "/v1/messages",
+            true,
+            &payload,
+            Some("random-conversation".to_string()),
+            prompt_cache_scope_conversation_id(state.prompt_cache_simulation_mode, &payload),
+            4096,
+        );
+        assert!(context.prompt_cache_profile.is_some());
+        assert!(context.prompt_cache_scope_conversation_id.is_none());
+
+        let credential_usage = attach_test_credential_usage(context, 1);
+        assert!(credential_usage.request.simulated_usage.is_none());
+        assert!(credential_usage.request.simulated_source.is_none());
     }
 
     fn attach_test_credential_usage(
@@ -2371,7 +2404,7 @@ mod tests {
         credential_id: u64,
     ) -> CredentialUsageContext {
         let scope = usage_context
-            .conversation_id
+            .prompt_cache_scope_conversation_id
             .as_ref()
             .map(|conversation_id| PromptCacheScope {
                 credential_id,

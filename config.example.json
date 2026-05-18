@@ -11,7 +11,7 @@
   "compatProfile": "claude-code",
   "extractThinking": true,
   "promptCacheSimulationMode": "high-cache",
-  "promptCacheTargetReadRatio": 0.85,
+  "promptCacheTargetReadRatio": 0.95,
   "usageRecordLimit": 5000,
   "usageRecordPersist": true,
   "highCacheThreshold": 10000,

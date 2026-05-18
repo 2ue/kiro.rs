@@ -195,7 +195,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `compatProfile` | string | `claude-code` | 兼容 profile：`claude-code` 优先真实 Claude Code CLI 可用性；`anthropic-strict` 减少代理改写和调试特征；`debug` 等同 `claude-code` 但默认暴露代理 warning |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `promptCacheSimulationMode` | string | `high-cache` | 本地 prompt-cache usage 模拟模式。默认尽量高缓存；可设为 `disabled` 关闭，或设为 `local-prompt-cache` 保留仅显式 `cache_control` 的旧行为 |
-| `promptCacheTargetReadRatio` | number | `0.85` | 本地 prompt-cache 模拟的目标 cache read 中心比例，对 `local-prompt-cache` 和 `high-cache` 生效 |
+| `promptCacheTargetReadRatio` | number | `0.95` | 本地 prompt-cache 模拟的目标 cache read 中心比例，对 `local-prompt-cache` 和 `high-cache` 生效 |
 | `usageRecordLimit` | number | `5000` | Admin usage record 内存保留上限 |
 | `usageRecordPersist` | boolean | `true` | 是否将 usage record 追加写入 `kiro_usage_records.jsonl` |
 | `highCacheThreshold` | number | `10000` | Admin 统计高缓存请求的 cache read 阈值 |
@@ -228,7 +228,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
    "compatProfile": "claude-code",
    "extractThinking": true,
    "promptCacheSimulationMode": "high-cache",
-   "promptCacheTargetReadRatio": 0.85,
+   "promptCacheTargetReadRatio": 0.95,
    "usageRecordLimit": 5000,
    "usageRecordPersist": true,
    "highCacheThreshold": 10000,

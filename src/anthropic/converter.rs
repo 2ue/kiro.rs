@@ -16,7 +16,7 @@ use crate::kiro::model::requests::conversation::{
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
-use crate::model::config::CompatProfile;
+use crate::model::config::{CompatProfile, PromptCacheSimulationMode};
 
 use super::types::{ContentBlock, MessagesRequest};
 
@@ -171,12 +171,14 @@ pub struct ConversionResult {
 #[derive(Debug, Clone, Copy)]
 pub struct ConverterOptions {
     pub compat_profile: CompatProfile,
+    pub prompt_cache_simulation_mode: PromptCacheSimulationMode,
 }
 
 impl Default for ConverterOptions {
     fn default() -> Self {
         Self {
             compat_profile: CompatProfile::ClaudeCode,
+            prompt_cache_simulation_mode: PromptCacheSimulationMode::HighCache,
         }
     }
 }
@@ -285,12 +287,24 @@ fn extract_session_id(user_id: &str) -> Option<String> {
     None
 }
 
-pub(crate) fn extract_stable_conversation_id(req: &MessagesRequest) -> Option<String> {
+pub(crate) fn extract_metadata_conversation_id(req: &MessagesRequest) -> Option<String> {
     req.metadata
         .as_ref()
         .and_then(|m| m.user_id.as_ref())
         .and_then(|user_id| extract_session_id(user_id))
-        .or_else(|| derive_fallback_conversation_id(req))
+}
+
+pub(crate) fn extract_stable_conversation_id(req: &MessagesRequest) -> Option<String> {
+    extract_metadata_conversation_id(req).or_else(|| derive_fallback_conversation_id(req))
+}
+
+fn conversation_id_for_options(req: &MessagesRequest, options: ConverterOptions) -> Option<String> {
+    match options.prompt_cache_simulation_mode {
+        PromptCacheSimulationMode::HighCache => extract_stable_conversation_id(req),
+        PromptCacheSimulationMode::Disabled | PromptCacheSimulationMode::LocalPromptCache => {
+            extract_metadata_conversation_id(req)
+        }
+    }
 }
 
 fn derive_fallback_conversation_id(req: &MessagesRequest) -> Option<String> {
@@ -413,9 +427,10 @@ pub fn convert_request_with_options(
     };
 
     // 3. 生成会话 ID 和代理 ID
-    // 优先从 metadata.user_id 中提取 session UUID；缺失时从稳定请求锚点派生确定性 UUID
+    // High-cache 模式下缺失 metadata 时从稳定请求锚点派生确定性 UUID；
+    // 其他模式保持旧语义，只信任显式 metadata session。
     let conversation_id =
-        extract_stable_conversation_id(req).unwrap_or_else(|| Uuid::new_v4().to_string());
+        conversation_id_for_options(req, options).unwrap_or_else(|| Uuid::new_v4().to_string());
     let agent_continuation_id = Uuid::new_v4().to_string();
 
     // 4. 确定触发类型
@@ -1996,6 +2011,52 @@ mod tests {
     }
 
     #[test]
+    fn test_convert_request_without_metadata_is_not_stabilized_when_high_cache_disabled() {
+        use super::super::types::{Message as AnthropicMessage, SystemMessage};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: "You are a helpful coding assistant.".to_string(),
+                cache_control: Some(serde_json::json!({"type": "ephemeral"})),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let first_result = convert_request_with_options(
+            &req,
+            ConverterOptions {
+                prompt_cache_simulation_mode: PromptCacheSimulationMode::Disabled,
+                ..ConverterOptions::default()
+            },
+        )
+        .unwrap();
+        let second_result = convert_request_with_options(
+            &req,
+            ConverterOptions {
+                prompt_cache_simulation_mode: PromptCacheSimulationMode::Disabled,
+                ..ConverterOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_ne!(
+            first_result.conversation_state.conversation_id,
+            second_result.conversation_state.conversation_id
+        );
+    }
+
+    #[test]
     fn test_anthropic_strict_avoids_chunk_policy_and_thinking_prefix() {
         use super::super::types::{Message as AnthropicMessage, SystemMessage, Thinking};
 
@@ -2025,6 +2086,7 @@ mod tests {
             &req,
             ConverterOptions {
                 compat_profile: CompatProfile::AnthropicStrict,
+                ..ConverterOptions::default()
             },
         )
         .unwrap();
@@ -2074,6 +2136,7 @@ mod tests {
             &req,
             ConverterOptions {
                 compat_profile: CompatProfile::AnthropicStrict,
+                ..ConverterOptions::default()
             },
         )
         .expect_err("strict profile should reject prefill");
