@@ -814,7 +814,77 @@ impl MultiTokenManager {
 
         self.db = Some(storage.db);
         self.redis = Some(storage.redis);
+        self.hydrate_rate_limit_fallbacks_from_redis().await;
         Ok(())
+    }
+
+    async fn hydrate_rate_limit_fallbacks_from_redis(&self) {
+        let Some(redis) = self.redis.clone() else {
+            return;
+        };
+        let ids: Vec<u64> = self.entries.lock().iter().map(|entry| entry.id).collect();
+        if ids.is_empty() {
+            return;
+        }
+
+        let mut conn = match redis.get().await {
+            Ok(conn) => conn,
+            Err(err) => {
+                tracing::warn!("启动期读取 Redis 429 冷却状态失败: {}", err);
+                return;
+            }
+        };
+
+        let mut pipe = redis::pipe();
+        for id in &ids {
+            pipe.cmd("HMGET").arg(Self::sched_state_key(*id)).arg(&[
+                "rate_limited_until_ms",
+                "rate_limit_level",
+                "rate_limited_status",
+                "rate_limited_reason",
+            ]);
+        }
+
+        let values: redis::RedisResult<
+            Vec<(Option<i64>, Option<u64>, Option<u16>, Option<String>)>,
+        > = pipe.query_async(&mut *conn).await;
+        let values = match values {
+            Ok(values) => values,
+            Err(err) => {
+                tracing::warn!("启动期解析 Redis 429 冷却状态失败: {}", err);
+                return;
+            }
+        };
+
+        let now_ms = Utc::now().timestamp_millis();
+        let mut hydrated = 0usize;
+        let mut states = self.rate_limit_fallbacks.lock();
+        states.clear();
+        for (id, (until_ms, level, upstream_status, reason)) in ids.into_iter().zip(values) {
+            let Some(until_ms) = until_ms else {
+                continue;
+            };
+            if until_ms <= now_ms {
+                continue;
+            }
+            let Some(rate_limited_until) = DateTime::<Utc>::from_timestamp_millis(until_ms) else {
+                continue;
+            };
+            states.insert(
+                id,
+                RateLimitFallbackState {
+                    rate_limited_until,
+                    strike_count: level.unwrap_or(1).max(1),
+                    upstream_status,
+                    reason,
+                },
+            );
+            hydrated += 1;
+        }
+
+        if hydrated > 0 {
+            tracing::info!("已从 Redis 恢复 {} 个账号的 429 冷却状态", hydrated);
+        }
     }
 
     /// 从外部覆盖当前进程的负载均衡模式(仅内存,不持久化到 config.json)
@@ -902,19 +972,6 @@ impl MultiTokenManager {
             .iter()
             .filter(|entry| !entry.disabled)
             .count()
-    }
-
-    fn fallback_global_rate_limit_until_ms(&self) -> Option<i64> {
-        let now = Utc::now();
-        let mut until = self.global_rate_limit_fallback_until.lock();
-        match *until {
-            Some(ts) if ts > now => Some(ts.timestamp_millis()),
-            Some(_) => {
-                *until = None;
-                None
-            }
-            None => None,
-        }
     }
 
     fn maybe_write_global_rate_limit_fallback(&self) -> Option<i64> {
@@ -1085,30 +1142,6 @@ impl MultiTokenManager {
         self.scheduler_state_for(id)
             .await
             .is_schedulable_at(Utc::now().timestamp_millis())
-    }
-
-    async fn global_rate_limit_backoff_until_ms(&self) -> Option<i64> {
-        let fallback_until_ms = self.fallback_global_rate_limit_until_ms();
-        let Some(redis) = self.redis.clone() else {
-            return fallback_until_ms;
-        };
-        let mut conn = match redis.get().await {
-            Ok(conn) => conn,
-            Err(err) => {
-                tracing::warn!("读取 Redis 全池 429 退避失败，使用进程内降级状态: {}", err);
-                return fallback_until_ms;
-            }
-        };
-        let redis_until_ms = redis::cmd("GET")
-            .arg(Self::sched_global_rate_limit_key())
-            .query_async::<Option<i64>>(&mut *conn)
-            .await
-            .ok()
-            .flatten();
-        let now_ms = Utc::now().timestamp_millis();
-        redis_until_ms
-            .filter(|until_ms| *until_ms > now_ms)
-            .or(fallback_until_ms)
     }
 
     async fn maybe_write_global_rate_limit_backoff(
@@ -1522,6 +1555,30 @@ impl MultiTokenManager {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
 
+    pub async fn active_rate_limited_credential_ids(&self, model: Option<&str>) -> Vec<u64> {
+        let candidate_ids: Vec<u64> = self
+            .entries
+            .lock()
+            .iter()
+            .filter(|entry| Self::credential_is_usable_for_model(entry, model))
+            .map(|entry| entry.id)
+            .collect();
+        if candidate_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let states = self.scheduler_states_for(&candidate_ids).await;
+        let now_ms = Utc::now().timestamp_millis();
+        candidate_ids
+            .into_iter()
+            .filter(|id| {
+                states
+                    .get(id)
+                    .is_some_and(|state| !state.is_schedulable_at(now_ms))
+            })
+            .collect()
+    }
+
     fn is_opus_model(model: Option<&str>) -> bool {
         model
             .map(|m| m.to_lowercase().contains("opus"))
@@ -1768,12 +1825,6 @@ impl MultiTokenManager {
     ) -> anyhow::Result<CallContext> {
         // 入口先做一次配额冷却自愈,把过期的软冷却凭据放回池
         self.recover_quota_cooldowns();
-        if let Some(until_ms) = self.global_rate_limit_backoff_until_ms().await {
-            anyhow::bail!(
-                "账号池处于全局 429 退避中，暂不可调度（until_ms={}）",
-                until_ms
-            );
-        }
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -1880,6 +1931,14 @@ impl MultiTokenManager {
                                 .filter(|e| Self::credential_is_usable_for_model(e, model))
                                 .count();
                             if available > 0 {
+                                if !excluded_ids.is_empty() {
+                                    anyhow::bail!(
+                                        "当前请求已尝试并排除所有可用凭据（{}/{} 可用，已排除 {} 个）",
+                                        available,
+                                        total,
+                                        excluded_ids.len()
+                                    );
+                                }
                                 anyhow::bail!(
                                     "所有可用凭据当前均不可调度（{}/{} 可用，可能处于 429 冷却）",
                                     available,
@@ -2051,6 +2110,35 @@ impl MultiTokenManager {
             sticky_bound: false,
             fallback_from_sticky: false,
         })
+    }
+
+    /// 为 Admin 单凭据测试获取调用上下文。
+    ///
+    /// 该方法只按 ID 取凭据并保证 token 可用，不参与 current_id、负载均衡、
+    /// sticky 会话或 429 冷却过滤，因此可以准确测试用户选中的那一张凭据。
+    pub async fn acquire_context_for_credential(&self, id: u64) -> anyhow::Result<CallContext> {
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| entry.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?
+        };
+
+        match self.try_ensure_token(id, &credentials).await {
+            Ok(ctx) => Ok(ctx),
+            Err(err) => {
+                if err.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+                    tracing::warn!("凭据 #{} 测试时 refreshToken 永久失效: {}", id, err);
+                    self.report_refresh_token_invalid(id);
+                } else {
+                    tracing::warn!("凭据 #{} 测试时 Token 刷新失败: {}", id, err);
+                    self.report_refresh_failure(id);
+                }
+                Err(err)
+            }
+        }
     }
 
     /// 将凭据列表回写到源文件
@@ -4105,7 +4193,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_global_rate_limit_backoff_triggers_after_pool_wave() {
+    async fn test_global_rate_limit_wave_does_not_block_healthy_credentials() {
         let credentials: Vec<KiroCredentials> = (0..5)
             .map(|idx| {
                 let mut cred = KiroCredentials::default();
@@ -4124,16 +4212,11 @@ mod tests {
                 .await;
         }
 
-        let err = manager
-            .acquire_context(None)
-            .await
-            .err()
-            .unwrap()
-            .to_string();
+        let ctx = manager.acquire_context(None).await.unwrap();
         assert!(
-            err.contains("全局 429 退避"),
-            "错误应提示全局退避，实际: {}",
-            err
+            ctx.id == 4 || ctx.id == 5,
+            "全局 429 波动保护不应阻断仍健康的账号，实际选中 #{}",
+            ctx.id
         );
         assert_eq!(manager.available_count(), 5);
     }

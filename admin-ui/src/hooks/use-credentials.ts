@@ -7,12 +7,15 @@ import {
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
+  testCredential,
+  listPricing,
   addCredential,
   deleteCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
 } from '@/api/credentials'
 import type { AddCredentialRequest, CredentialsPageQuery } from '@/types/api'
+import type { CredentialTestRequest } from '@/types/api'
 
 function invalidateCredentialCaches(queryClient: ReturnType<typeof useQueryClient>, id?: number) {
   queryClient.invalidateQueries({ queryKey: ['credentials'] })
@@ -55,6 +58,26 @@ export function useCredentialBalance(id: number | null) {
     queryFn: () => getCredentialBalance(id!),
     enabled: id !== null,
     retry: false, // 余额查询失败时不重试（避免重复请求被封禁的账号）
+  })
+}
+
+export function usePricing(enabled = true) {
+  return useQuery({
+    queryKey: ['pricing'],
+    queryFn: listPricing,
+    enabled,
+    staleTime: 60 * 1000,
+  })
+}
+
+export function useCredentialTest() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, request }: { id: number; request: CredentialTestRequest }) =>
+      testCredential(id, request),
+    onSettled: (_data, _error, variables) => {
+      invalidateCredentialCaches(queryClient, variables.id)
+    },
   })
 }
 

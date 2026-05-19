@@ -47,7 +47,7 @@ use super::types::{
 };
 use super::usage::{UsageRecord, UsageRecordStatus, UsageSource};
 use super::websearch;
-use crate::kiro::provider::KiroStreamCompletion;
+use crate::kiro::provider::{CredentialAttemptTrace, KiroProviderError, KiroStreamCompletion};
 
 const MAX_REMOTE_MULTIMODAL_BYTES: usize = 20 * 1024 * 1024;
 
@@ -86,6 +86,7 @@ struct CredentialUsageContext {
     credential_label: Option<String>,
     sticky_bound: bool,
     fallback_from_sticky: bool,
+    credential_trace: CredentialAttemptTrace,
 }
 
 impl RequestUsageContext {
@@ -107,6 +108,7 @@ impl RequestUsageContext {
         ))
     }
 
+    #[cfg(test)]
     fn attach_credential(
         self,
         credential_id: Option<u64>,
@@ -114,12 +116,38 @@ impl RequestUsageContext {
         sticky_bound: bool,
         fallback_from_sticky: bool,
     ) -> CredentialUsageContext {
+        self.attach_credential_with_trace(
+            credential_id,
+            credential_label,
+            sticky_bound,
+            fallback_from_sticky,
+            CredentialAttemptTrace::default(),
+        )
+    }
+
+    fn attach_credential_with_trace(
+        self,
+        credential_id: Option<u64>,
+        credential_label: Option<String>,
+        sticky_bound: bool,
+        fallback_from_sticky: bool,
+        mut credential_trace: CredentialAttemptTrace,
+    ) -> CredentialUsageContext {
+        if let Some(id) = credential_id {
+            if credential_trace.attempted_credential_ids.is_empty() {
+                credential_trace.attempted_credential_ids.push(id);
+            }
+            if credential_trace.last_attempted_credential_id.is_none() {
+                credential_trace.last_attempted_credential_id = Some(id);
+            }
+        }
         CredentialUsageContext {
             request: self,
             credential_id,
             credential_label,
             sticky_bound,
             fallback_from_sticky,
+            credential_trace,
         }
     }
 }
@@ -270,6 +298,10 @@ impl CredentialUsageContext {
             conversation_id: self.request.conversation_id.clone(),
             credential_id: self.credential_id,
             credential_label: self.credential_label.clone(),
+            attempted_credential_ids: self.credential_trace.attempted_credential_ids.clone(),
+            rate_limited_credential_ids: self.credential_trace.rate_limited_credential_ids.clone(),
+            last_attempted_credential_id: self.credential_trace.last_attempted_credential_id,
+            scheduler_blocked: self.credential_trace.scheduler_blocked,
             status,
             usage_source,
             total_input_tokens: usage.total_input_tokens,
@@ -331,6 +363,28 @@ impl Drop for StreamUsageGuard {
 
 fn credential_label(provider: &crate::kiro::provider::KiroProvider, id: u64) -> Option<String> {
     provider.credential_label(id)
+}
+
+fn provider_error_trace(err: &Error) -> CredentialAttemptTrace {
+    err.downcast_ref::<KiroProviderError>()
+        .map(|provider_error| provider_error.credential_trace().clone())
+        .unwrap_or_default()
+}
+
+fn prepare_error_usage_context(
+    usage_context: RequestUsageContext,
+    provider: &crate::kiro::provider::KiroProvider,
+    credential_trace: CredentialAttemptTrace,
+) -> CredentialUsageContext {
+    let credential_id = credential_trace.last_attempted_credential_id;
+    let credential_label = credential_id.and_then(|id| credential_label(provider, id));
+    usage_context.attach_credential_with_trace(
+        credential_id,
+        credential_label,
+        false,
+        false,
+        credential_trace,
+    )
 }
 
 async fn materialize_remote_multimodal_sources(
@@ -850,6 +904,7 @@ fn prepare_credential_usage_context(
     credential_id: u64,
     sticky_bound: bool,
     fallback_from_sticky: bool,
+    credential_trace: CredentialAttemptTrace,
 ) -> CredentialUsageContext {
     let mut usage_context = usage_context;
     let scope = usage_context
@@ -899,11 +954,12 @@ fn prepare_credential_usage_context(
             .map(|_| UsageSource::LocalPromptCache);
     }
 
-    usage_context.attach_credential(
+    usage_context.attach_credential_with_trace(
         Some(credential_id),
         credential_label(provider, credential_id),
         sticky_bound,
         fallback_from_sticky,
+        credential_trace,
     )
 }
 
@@ -1016,12 +1072,8 @@ fn websearch_supported_for_profile(profile: CompatProfile) -> bool {
     !profile.is_strict()
 }
 
-/// GET /v1/models
-///
-/// 返回可用的模型列表
-pub async fn get_models() -> impl IntoResponse {
-    tracing::info!("Received GET /v1/models request");
-
+/// 返回可用模型列表，供 `/v1/models` 和 Admin UI 的模型下拉复用。
+fn models_response() -> ModelsResponse {
     let models = vec![
         Model {
             id: "opus".to_string(),
@@ -1187,10 +1239,18 @@ pub async fn get_models() -> impl IntoResponse {
         },
     ];
 
-    Json(ModelsResponse {
+    ModelsResponse {
         object: "list".to_string(),
         data: models,
-    })
+    }
+}
+
+/// GET /v1/models
+///
+/// 返回可用的模型列表
+pub async fn get_models() -> impl IntoResponse {
+    tracing::info!("Received GET /v1/models request");
+    Json(models_response())
 }
 
 /// POST /v1/messages
@@ -1374,17 +1434,18 @@ async fn handle_stream_request(
     warnings_header: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            let message = e.to_string();
-            let request_id = usage_context.request_id.clone();
-            usage_context
-                .attach_credential(None, None, false, false)
-                .record_failure(UsageRecordStatus::Error, "api_error", message);
-            return map_provider_error(e, Some(&request_id));
-        }
-    };
+    let response =
+        match provider.call_api_stream(request_body).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let message = e.to_string();
+                let request_id = usage_context.request_id.clone();
+                let credential_trace = provider_error_trace(&e);
+                prepare_error_usage_context(usage_context, &provider, credential_trace)
+                    .record_failure(UsageRecordStatus::Error, "api_error", message);
+                return map_provider_error(e, Some(&request_id));
+            }
+        };
     let (response, completion) = response.into_parts();
     let credential_usage = prepare_credential_usage_context(
         usage_context,
@@ -1392,6 +1453,7 @@ async fn handle_stream_request(
         completion.credential_id(),
         completion.sticky_bound(),
         completion.fallback_from_sticky(),
+        completion.credential_trace().clone(),
     );
 
     // 创建流处理上下文
@@ -1614,23 +1676,25 @@ async fn handle_non_stream_request(
     warnings_header: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let api_response = match provider.call_api_with_context(request_body).await {
-        Ok(resp) => resp,
-        Err(e) => {
-            let message = e.to_string();
-            let request_id = usage_context.request_id.clone();
-            usage_context
-                .attach_credential(None, None, false, false)
-                .record_failure(UsageRecordStatus::Error, "api_error", message);
-            return map_provider_error(e, Some(&request_id));
-        }
-    };
+    let api_response =
+        match provider.call_api_with_context(request_body).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let message = e.to_string();
+                let request_id = usage_context.request_id.clone();
+                let credential_trace = provider_error_trace(&e);
+                prepare_error_usage_context(usage_context, &provider, credential_trace)
+                    .record_failure(UsageRecordStatus::Error, "api_error", message);
+                return map_provider_error(e, Some(&request_id));
+            }
+        };
     let credential_usage = prepare_credential_usage_context(
         usage_context,
         &provider,
         api_response.credential_id,
         api_response.sticky_bound,
         api_response.fallback_from_sticky,
+        api_response.credential_trace,
     );
 
     // 读取响应体

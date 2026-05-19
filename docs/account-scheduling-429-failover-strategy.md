@@ -1,19 +1,39 @@
-# 账号调度、429 冷却与故障转移最终方案
+# 账号调度、冷却与故障转移策略
 
-本文档记录当前项目在账号调度、sticky 会话、429 / 5xx / 认证错误处理上的现状、问题、设计目标、错误分类、指数退避、fallback 策略、永久不可调度策略、前后端可观测性和测试清单。
+本文档记录当前项目在账号调度、sticky 会话、429 / 5xx / 认证错误处理上的现状、问题、设计目标、错误分类、指数退避、fallback 策略、永久不可调度策略、前后端可观测性和测试清单。429 是最常见的账号级异常信号，但本策略不只针对 429；认证、额度、上游 5xx、网络错误、代理错误和 sticky 会话迁移都必须纳入同一套“可调度性优先”的框架。
 
 目标是让后续实现者脱离当前对话也能完整理解方案，并按本文稳定实施，不依赖口头上下文。
 
+## 当前结论（2026-05-19）
+
+服务可用性的优先级高于“保护某个坏账号继续尝试”。只要账号池里仍存在可调度账号，单个请求就不应因为前面的账号异常、全局 429 观测事件或 sticky 绑定而直接返回服务不可用。
+
+当前实现的账号故障转移边界如下：
+
+1. API 主调用已经移除 `MAX_RETRIES_PER_CREDENTIAL = 3` / `MAX_TOTAL_RETRIES = 9` 这类账号级全局硬上限。
+2. 账号级错误会立即故障转移：
+   - `429`：写入账号级冷却，解绑相关 sticky，会话内排除该账号，然后继续调度下一个健康账号。
+   - `401` / `403`：按凭据错误处理，必要时强制刷新一次 token，失败后排除该账号并继续调度。
+   - `402` 且识别为月度额度用尽：标记额度耗尽并故障转移。
+3. 瞬态错误只允许同账号少量原地重试：`408` / `5xx` / 网络发送失败当前最多同账号重试 1 次，仍失败后把该账号加入本次请求的 `excluded_ids`。
+4. 本次请求的账号级 fallback 不设置固定“最多换几个账号”的上限；终止条件是“本次请求已经排除所有可用凭据”或“账号池没有可调度凭据”。
+5. sticky 只是健康账号偏好，不是强制绑定。sticky 命中的账号如果处于冷却、手动恢复要求、禁用、模型不支持或本次请求已排除状态，会解绑并进入普通调度。
+6. 全局 429 波动只作为观测/保护信号：记录事件、暂停把单账号升级到人工恢复，必要时为“无健康账号”的情况提供 retry-after 依据；它不能在仍有健康账号时阻断调度。
+7. 成功请求会清理该账号的 rate-limit 冷却字段并衰减冷却档位，避免偶发账号异常永久污染调度。
+8. usage 记录应能展示调度链路：`attemptedCredentialIds`、`rateLimitedCredentialIds`、`lastAttemptedCredentialId`、`schedulerBlocked`、`stickyBound`、`fallbackFromSticky`。这些字段是判断“是否真的转移到健康账号”的主要证据。
+
+因此，`MAX_TOTAL_RETRIES` 在旧方案中表示“单请求最多尝试 9 次”的全局上限，这会导致账号池较大或前几个账号冷却时提前失败。当前策略不再使用该上限控制账号级故障转移；只保留瞬态错误的同账号短重试限制。
+
 ## 状态
 
-- 文档状态：方案设计完成；第一阶段核心调度链路已实施，长期 manual recovery、完整 half-open probe、全局 429 波动保护和双 UI 状态展示仍作为后续阶段。
+- 文档状态：方案设计完成；核心调度链路已按“可调度账号优先”修正。长期 manual recovery、完整 half-open probe、双 UI 状态展示仍作为后续阶段；全局 429 波动当前只能作为观测和人工恢复抑制信号，不允许阻断健康账号调度。
 - 适用范围：`kiro.rs` 当前多凭据账号池、Anthropic-compatible API、流式/非流式请求、MCP/工具调用、Admin UI 与 Console UI。
 - 参考项目：`~/Desktop/project/sub2api`，但只学习其“可调度性前置、sticky 健康检查、状态影响调度”的架构思想，不照搬其 reset-time 驱动的 429 策略。
-- 核心结论：不能只靠 `priority` / `balanced` / round-robin 解决 429；必须把账号健康状态变成调度前置条件。
+- 核心结论：不能只靠 `priority` / `balanced` / round-robin 解决账号异常；必须把账号健康状态变成调度前置条件。
 
 ## 本次已落地范围
 
-本次实施选择先落地“能直接解决 sticky 持续打 429 账号”的最小稳定闭环，不在同一批改动中引入 PG schema、双 UI 展示或自动人工恢复判定，原因是这些属于更大可观测性/持久化变更，和调度热路径的风险边界不同。
+本次实施选择先落地“只要存在健康账号就继续服务”的最小稳定闭环，不在同一批改动中引入 PG schema、双 UI 展示或自动人工恢复判定，原因是这些属于更大可观测性/持久化变更，和调度热路径的风险边界不同。
 
 已落地代码：
 
@@ -23,26 +43,27 @@
    - 冷却档位为 `45s -> 120s -> 300s -> 900s -> 1800s -> max 7200s`，并加 20% jitter。
    - Redis 不可用时降级到进程内 `rate_limit_fallbacks`，只影响当前进程，不持久化。
    - 账号选择前先读取动态调度状态；候选账号使用 Redis pipeline 批量读取 state，后续账号池进一步变大时可再收敛为 Lua 或聚合 hash。
-   - 短窗口内多个账号同时 429 时，写入 Redis 全池 backoff，后续调度在 3-5 分钟内快速失败，避免继续把整池账号推高冷却档位。
+   - 短窗口内多个账号同时 429 时，写入 Redis 全池 backoff/event 作为观测信号；调度路径不能因为这个全局信号跳过仍健康的账号。
    - sticky 命中时也重新检查动态调度状态；账号不可调度则解绑。
    - 429 不会写成 `disabled=true`，`available_count` 仍反映账号配置可用性。
    - 成功请求会清理 429 冷却字段，并衰减 `rate_limit_level`。
 
 2. `src/kiro/provider.rs`
    - API 429 从原来的“瞬态 sleep 重试”改为“立即写账号级冷却、解绑 sticky、本次请求排除该账号、fallback 到其他健康账号”。
+   - 移除账号级全局尝试上限；账号级错误不再受 `MAX_TOTAL_RETRIES` 截断。
    - MCP / 工具调用也使用同一套 `excluded_ids + acquire_context_for_session` 逻辑，429 后不继续打同一账号。
-   - 408 / 5xx 仍按瞬态上游错误处理，不因为普通上游抖动禁用账号。
+   - 408 / 5xx / 网络发送失败仍按瞬态上游错误处理，只允许同账号短重试，不因为普通上游抖动禁用账号。
 
 本次暂未落地但文档继续保留为最终方案：
 
 1. 最近 outcome 窗口、同一 `request_id + credential_id` 去重。
 2. 完整 half-open probe 锁。
-3. 更完整的全局 429 波动保护，包括成功率下降判断、全局事件 UI 展示和后台清理任务；本次只落地 Redis 短窗口全池 backoff。
+3. 更完整的全局 429 波动保护，包括成功率下降判断、全局事件 UI 展示和后台清理任务；注意该保护只能防止误升级/提供观测，不能在有健康账号时 fail-closed。
 4. `manual_recovery_required` 的 PG 低频持久化和 UI 展示。
 5. 5xx / 网络错误的轻量惩罚评分。
 6. Admin UI 与 Console UI 的账号调度状态可视化。
 
-这个阶段的行为预期是：429 账号会快速退出当前请求和后续短时间调度，但不会因为少量 429 被永久禁用；如果所有可用账号都在 429 冷却中，请求会快速返回“所有可用凭据当前均不可调度”，而不是长时间 sticky 重试同一个账号。
+这个阶段的行为预期是：账号级异常会快速退出当前请求和后续短时间调度，但不会因为少量 429 被永久禁用；如果存在健康账号，请求必须继续转移调度；只有所有可用账号都被本次请求排除、或所有可用账号都处于冷却/不可调度状态时，才快速返回明确错误。
 
 ## 背景
 
@@ -76,7 +97,9 @@
 9. “原地重试”只适合少数可能瞬间恢复且换号没有收益的错误；大部分账号级 429 应该立即 fallback 到其他健康账号。
 10. 用户随口举的“最近 100 次”可以变成一个可配置统计窗口，但不能简单理解为“100 次都是 429 就禁用”；必须排除同一请求 retry 放大的样本，并判断是否存在全局上游波动。
 
-## 变更前代码链路（问题来源）
+## 历史代码链路（问题来源）
+
+本节记录的是旧实现的问题来源，用于解释为什么需要当前策略。当前实现已经移除 `MAX_RETRIES_PER_CREDENTIAL` / `MAX_TOTAL_RETRIES` 这组账号级 API fallback 上限，账号级错误会按前文“当前结论”立即转移到下一个可调度账号。
 
 ### API 主调用
 
@@ -84,7 +107,7 @@
 
 函数：`call_api_with_retry(...)`
 
-当前行为：
+历史行为：
 
 1. 最大重试次数为 `min(total_credentials * MAX_RETRIES_PER_CREDENTIAL, MAX_TOTAL_RETRIES)`。
 2. 当前常量：
@@ -104,7 +127,7 @@
    - 不记录账号级 429 状态；
    - 不持久化事件。
 
-这意味着 429 不会影响后续请求的账号调度。
+这意味着旧实现里 429 不会影响后续请求的账号调度。
 
 ### MCP / 工具调用
 
@@ -112,7 +135,7 @@
 
 函数：`call_mcp_with_retry(...)`
 
-当前行为：
+历史行为：
 
 1. 使用 `token_manager.acquire_context(None)`。
 2. 不带 session。
@@ -121,7 +144,7 @@
 5. 不记录 sticky soft failure。
 6. 不记录账号 cooldown。
 
-因此工具调用场景比普通对话更容易反复打到同一个 429 账号。
+因此旧实现里工具调用场景比普通对话更容易反复打到同一个 429 账号。
 
 ### Sticky 会话
 
@@ -138,7 +161,7 @@
 4. 不检查 429 冷却，因为当前没有 429 冷却状态。
 5. fallback 到其他账号成功后，不一定改绑 sticky。
 
-当前绑定逻辑的含义是：
+旧绑定逻辑的含义是：
 
 ```text
 如果 session 已经绑定 A，本次临时 fallback 到 B 并成功，
@@ -146,19 +169,19 @@
 下一次请求 excluded_ids 清空后，又可能继续命中 A。
 ```
 
-这会造成“当前请求临时绕过，下一请求继续粘坏号”。
+这会造成“当前请求临时绕过，下一请求继续粘坏号”。当前实现要求 sticky 命中前重新检查可调度性，账号进入冷却或本次请求排除时必须解绑或跳过。
 
 ### 错误 usage 记录
 
 文件：`src/anthropic/handlers.rs`
 
-当前 provider 返回失败时，handler 使用：
+旧 provider 返回失败时，handler 使用：
 
 ```text
 attach_credential(None, None, false, false)
 ```
 
-所以错误记录无法显示最后尝试的账号，更无法显示完整 attempt 链路。这不是前端展示问题，而是错误对象没有携带账号上下文。
+所以错误记录无法显示最后尝试的账号，更无法显示完整 attempt 链路。这不是前端展示问题，而是错误对象没有携带账号上下文。当前实现要求错误对象携带 `CredentialAttemptTrace`，并在 usage 中记录 attempt 链路字段。
 
 ## sub2api 可借鉴点
 
@@ -680,6 +703,8 @@ TTL:
   global backoff remaining seconds
 ```
 
+注意：`global_backoff_until_ms` 是全池波动观测信号，不是调度 fail-closed 开关。调度器仍必须逐个检查账号级 schedulable 状态；只要有账号没有进入账号级冷却/禁用/人工恢复状态，就应该继续调度该账号。该 key 可用于 UI、日志、retry-after 建议和暂停单账号人工恢复升级。
+
 判断全局 429：
 
 ```text
@@ -689,7 +714,7 @@ recent_429_accounts = ZCOUNT pool:429_accounts window_start +inf
 recent_success_accounts = ZCOUNT pool:success_accounts window_start +inf
 ```
 
-如果近期 429 账号占比过高且成功账号明显减少，则设置 `global_backoff_until_ms`。
+如果近期 429 账号占比过高且成功账号明显减少，则设置 `global_backoff_until_ms` 作为观测事件。它不应直接导致“所有请求快速失败”；只有当账号级筛选后确实没有健康候选时，客户端才应收到不可用错误。
 
 Sticky session：
 
@@ -1110,6 +1135,8 @@ rate_limit_429_auto_disable_enabled = false by default
 
 如果多个账号同时 429，不能把每个账号都按单账号坏号处理。
 
+当前原则：全局 429 波动保护不能把健康账号挡在调度外。它的作用是观测、暂停单账号人工恢复升级、给全池不可用时的错误和 retry-after 提供依据。只要账号级筛选后仍有可调度账号，请求必须继续转移到该账号。
+
 建议维护 pool-level 统计：
 
 ```text
@@ -1117,7 +1144,7 @@ global429WindowSeconds = 300
 global429MinAccounts = 3
 global429AccountRatio = 0.6
 global429SuccessDropRatio = 0.5
-globalBackoffSeconds = 30-90s ± 20%
+globalBackoffSeconds = 180-300s as observation/retry-after hint
 ```
 
 触发条件：
@@ -1130,7 +1157,7 @@ globalBackoffSeconds = 30-90s ± 20%
 
 ```text
 暂停把单账号 429 升级到 manual_recovery_required
-对全池设置短 global backoff
+记录全池 global backoff/event，但不阻断健康账号调度
 保留少量 probe
 客户端请求在无健康账号时快速返回 503 + retry-after
 记录 pool_rate_limited / upstream_global_429 事件
@@ -1138,7 +1165,7 @@ globalBackoffSeconds = 30-90s ± 20%
 
 原因：
 
-这能避免 Kiro 上游全局波动时，系统把所有账号逐个隔离或误标记为人工恢复。
+这能避免 Kiro 上游全局波动时，系统把所有账号逐个隔离或误标记为人工恢复，同时避免“明明还有健康账号，却因为全局 key 存在而直接报不可用”的服务可用性问题。
 
 ### G 类：疑似风控 / suspicious / abuse 的 429 或 403，长冷却或人工恢复
 
@@ -1468,22 +1495,22 @@ attempt 4+: 2000-2500ms
 
 1. 对 429 / auth / quota 不走多次 request 内 sleep，直接 fallback。
 2. 对 408 / generic 5xx 最多原地 retry 1 次。
-3. original request 总 attempt 数仍应有硬上限。
-4. 不应该因为账号数量多，就让单个用户等待过长。
+3. 不使用 `MAX_TOTAL_RETRIES` 这类账号级全局 fallback 上限；账号级错误应该持续转移，直到本次请求排除所有可用候选或成功。
+4. 不应该因为账号数量多，就让单个用户在同一个坏账号上等待过长；等待预算主要约束瞬态同账号 sleep，不约束健康账号 fallback。
 
-建议 request retry budget：
+当前 request retry budget：
 
 ```text
-max_total_attempts = min(total_schedulable_credentials + 2, 6)
-max_same_credential_attempts = 2
-max_fallback_credentials = min(total_schedulable_credentials, 5)
-max_total_retry_elapsed = 15s for non-stream before response
-max_total_retry_elapsed = 20s for stream before response
+account_level_errors = fallback until all usable candidates are excluded
+same_credential_transient_retries = 1
+same_credential_transient_delay = 250ms exponential backoff, capped at 2s
+token_refresh_internal_attempts = bounded by credential count and refresh-failure thresholds
+non_retryable_request_errors = return immediately
 ```
 
 说明：
 
-当前 `MAX_TOTAL_RETRIES = 9` 在 429 每次耗时较长时会让用户等待过久。新策略应该更重视“快速换健康账号”和“全池不可用时快速失败”。
+旧 `MAX_TOTAL_RETRIES = 9` 在账号池较大或前几个账号冷却时会提前截断故障转移。当前策略更重视“快速换健康账号”和“确实无健康账号时快速失败”。如果未来需要增加防御性总耗时上限，也必须以时间预算形式限制 sleep 和上游等待，不能限制账号级 fallback 的候选覆盖范围。
 
 ### 账号级 cooldown 退避
 
@@ -1957,8 +1984,8 @@ sticky_unbound
   "global_429_min_accounts": 3,
   "global_429_account_ratio": 0.6,
   "global_429_success_drop_ratio": 0.5,
-  "global_429_backoff_min_seconds": 30,
-  "global_429_backoff_max_seconds": 90,
+  "global_429_backoff_min_seconds": 180,
+  "global_429_backoff_max_seconds": 300,
 
   "half_open_probe_enabled": true,
   "half_open_max_concurrent_probes_per_credential": 1,
@@ -2022,7 +2049,7 @@ sticky_unbound
 5. suspicious 长冷却。
 6. 5xx / 408 短原地 retry 后 fallback。
 7. 429 cooldown 到期后进入 half-open probe，probe 成功恢复，probe 429 升级档位。
-8. 实现全局 429 波动保护，避免大量账号同时被误判为坏号。
+8. 实现全局 429 波动观测与保护，避免大量账号同时被误判为坏号；该保护不得在仍有健康账号时阻断调度。
 9. 实现 manual recovery required，但默认不把 429 升级为 `disabled=true`。
 10. manual recovery required 需要写 Redis state，并低频同步到 PG。
 
@@ -2049,6 +2076,25 @@ sticky_unbound
 4. 增加手动 reset/恢复入口。
 
 ### 第六阶段：测试
+
+当前核心调度链路应至少通过以下本地测试命令：
+
+```bash
+cargo fmt --check
+cargo test -q global_rate_limit_wave
+cargo test -q rate_limited
+cargo test -q provider
+cargo check -q
+```
+
+这些测试覆盖的关键断言：
+
+1. 全局 429 波动观测不能阻断健康账号调度。
+2. rate-limited 账号会被跳过但不会被写成 `disabled=true`。
+3. 所有账号都处于冷却时返回不可调度，而不是无限 retry。
+4. 成功请求会清理对应账号冷却状态。
+5. sticky 绑定账号进入冷却后会解绑并 fallback。
+6. provider 错误会携带 attempt trace，供 usage 记录排查调度链路。
 
 1. 单元测试错误分类。
 2. 单元测试 cooldown 计算和 jitter 范围。
@@ -2259,8 +2305,9 @@ rate_limit_level 只按一次 original request 升级
 预期：
 
 ```text
-触发 global_429_backoff
+触发 global_429_backoff/event 观测信号
 暂停单账号 manual_recovery_required 升级
+仍有健康账号时继续调度健康账号
 无健康账号时快速返回 503 + retry-after
 保留少量 probe
 ```

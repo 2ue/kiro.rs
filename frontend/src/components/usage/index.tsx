@@ -45,6 +45,7 @@ import {
 } from '@/lib/utils'
 import { usePreferences } from '@/store/preferences'
 import type {
+  UsageRecord,
   UsageRecordStatus,
   UsageRecordsPageQuery,
   UsageRecordsQuery,
@@ -92,6 +93,26 @@ function ratio(part: number, total: number): number {
     return Number.NaN
   }
   return part / total
+}
+
+function uniqueIds(ids: number[] | undefined): number[] {
+  return Array.from(new Set(ids || []))
+}
+
+function credentialTraceTitle(record: UsageRecord): string {
+  const parts: string[] = []
+  const attempts = record.attemptedCredentialIds || []
+  const rateLimited = uniqueIds(record.rateLimitedCredentialIds)
+  if (attempts.length > 0) {
+    parts.push(`尝试链路: ${attempts.map((id) => `#${id}`).join(' -> ')}`)
+  }
+  if (rateLimited.length > 0) {
+    parts.push(`429账号: ${rateLimited.map((id) => `#${id}`).join(', ')}`)
+  }
+  if (record.schedulerBlocked) {
+    parts.push('调度阶段被全池退避/冷却拦截')
+  }
+  return parts.join('\n')
 }
 
 export default function UsagePage() {
@@ -528,10 +549,14 @@ export default function UsagePage() {
                 </thead>
                 <tbody>
                   {recordsQuery.data?.records.map((r) => {
+                    const primaryCredentialId = r.credentialId ?? r.lastAttemptedCredentialId
                     const credLabel =
-                      typeof r.credentialId === 'number'
-                        ? credentialLabels.get(r.credentialId) ?? r.credentialLabel
+                      typeof primaryCredentialId === 'number'
+                        ? credentialLabels.get(primaryCredentialId) ?? r.credentialLabel
                         : r.credentialLabel
+                    const attempts = r.attemptedCredentialIds || []
+                    const rateLimited = uniqueIds(r.rateLimitedCredentialIds)
+                    const traceTitle = credentialTraceTitle(r)
                     const cost = r.costUsd
                     const readRatio = r.totalInputTokens > 0
                       ? r.cacheReadInputTokens / r.totalInputTokens
@@ -547,11 +572,17 @@ export default function UsagePage() {
                         </td>
                         <td className="sticky left-[140px] z-10 bg-background px-3 py-2 shadow-[1px_0_0_hsl(var(--border))]">
                           <div className="font-medium tabular-nums">
-                            #{r.credentialId ?? '-'}
+                            #{primaryCredentialId ?? '-'}
                           </div>
                           {credLabel && (
                             <div className="max-w-[140px] truncate text-xs text-muted-foreground" title={credLabel}>
                               {credLabel}
+                            </div>
+                          )}
+                          {traceTitle && (
+                            <div className="mt-1 max-w-[150px] truncate text-xs text-muted-foreground" title={traceTitle}>
+                              {attempts.length > 0 && `尝试 ${attempts.map((id) => `#${id}`).join(' -> ')}`}
+                              {attempts.length === 0 && rateLimited.length > 0 && `429 ${rateLimited.map((id) => `#${id}`).join(', ')}`}
                             </div>
                           )}
                         </td>

@@ -8,7 +8,7 @@ import { Input } from '@/components/ui/input'
 import { useCredentials } from '@/hooks/use-credentials'
 import { useClearUsageRecords, useUsageRecordsPage, useUsageSummary } from '@/hooks/use-usage'
 import { extractErrorMessage } from '@/lib/utils'
-import type { UsageRecordsPageQuery, UsageRecordStatus, UsageSource } from '@/types/api'
+import type { UsageRecord, UsageRecordsPageQuery, UsageRecordStatus, UsageSource } from '@/types/api'
 
 function formatNumber(value: number): string {
   return new Intl.NumberFormat('zh-CN').format(value)
@@ -73,6 +73,26 @@ function statusLabel(status: string): string {
     default:
       return status
   }
+}
+
+function uniqueIds(ids: number[] | undefined): number[] {
+  return Array.from(new Set(ids || []))
+}
+
+function traceTitle(record: UsageRecord): string {
+  const parts: string[] = []
+  const attempts = record.attemptedCredentialIds || []
+  const rateLimited = uniqueIds(record.rateLimitedCredentialIds)
+  if (attempts.length > 0) {
+    parts.push(`尝试链路: ${attempts.map((id) => `#${id}`).join(' -> ')}`)
+  }
+  if (rateLimited.length > 0) {
+    parts.push(`429账号: ${rateLimited.map((id) => `#${id}`).join(', ')}`)
+  }
+  if (record.schedulerBlocked) {
+    parts.push('调度阶段被全池退避/冷却拦截')
+  }
+  return parts.join('\n')
 }
 
 export function UsageRecordsPanel() {
@@ -363,10 +383,14 @@ export function UsageRecordsPanel() {
                 </thead>
                 <tbody>
                   {records.data?.records.map((record) => {
+                    const primaryCredentialId = record.credentialId ?? record.lastAttemptedCredentialId
                     const credentialLabel =
-                      typeof record.credentialId === 'number'
-                        ? credentialLabels.get(record.credentialId) || record.credentialLabel
+                      typeof primaryCredentialId === 'number'
+                        ? credentialLabels.get(primaryCredentialId) || record.credentialLabel
                         : record.credentialLabel
+                    const attempts = record.attemptedCredentialIds || []
+                    const rateLimited = uniqueIds(record.rateLimitedCredentialIds)
+                    const trace = traceTitle(record)
                     const readRatio = ratio(record.cacheReadInputTokens, record.totalInputTokens)
                     const cachedRatio = ratio(
                       record.cacheReadInputTokens + record.cacheCreationInputTokens,
@@ -377,10 +401,16 @@ export function UsageRecordsPanel() {
                     <tr key={record.id} className="border-b last:border-0">
                       <td className="px-3 py-2 whitespace-nowrap">{formatDate(record.createdAt)}</td>
                       <td className="px-3 py-2">
-                        <div className="font-medium">#{record.credentialId ?? '-'}</div>
+                        <div className="font-medium">#{primaryCredentialId ?? '-'}</div>
                         {credentialLabel && (
                           <div className="max-w-[240px] truncate text-xs text-muted-foreground" title={credentialLabel}>
                             {credentialLabel}
+                          </div>
+                        )}
+                        {trace && (
+                          <div className="mt-1 max-w-[240px] truncate text-xs text-muted-foreground" title={trace}>
+                            {attempts.length > 0 && `尝试 ${attempts.map((id) => `#${id}`).join(' -> ')}`}
+                            {attempts.length === 0 && rateLimited.length > 0 && `429 ${rateLimited.map((id) => `#${id}`).join(', ')}`}
                           </div>
                         )}
                       </td>

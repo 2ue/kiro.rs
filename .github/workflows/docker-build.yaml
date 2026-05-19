@@ -41,8 +41,8 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME}"
           VERSION_WITHOUT_V="${VERSION#v}"
-          if [[ ! "$VERSION_WITHOUT_V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Docker publish tags must use Git tag format vMAJOR.MINOR.PATCH, for example v0.0.2."
+          if [[ ! "$VERSION_WITHOUT_V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "::error::Docker publish tags must use Git tag format vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-PRERELEASE, for example v0.0.2 or v0.0.2-alpha.1."
             exit 1
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
@@ -141,11 +141,16 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME}"
           VERSION_WITHOUT_V="${VERSION#v}"
-          if [[ ! "$VERSION_WITHOUT_V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Docker publish tags must use Git tag format vMAJOR.MINOR.PATCH, for example v0.0.2."
+          IS_PRERELEASE=false
+          if [[ ! "$VERSION_WITHOUT_V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "::error::Docker publish tags must use Git tag format vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-PRERELEASE, for example v0.0.2 or v0.0.2-alpha.1."
             exit 1
           fi
+          if [[ "$VERSION_WITHOUT_V" == *-* ]]; then
+            IS_PRERELEASE=true
+          fi
           echo "version_without_v=${VERSION_WITHOUT_V}" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=${IS_PRERELEASE}" >> "$GITHUB_OUTPUT"
 
       - name: Set image names
         id: images
@@ -211,9 +216,13 @@ jobs:
               refs+=("${image}@sha256:${digest}")
             done
 
+            local tags=(-t "${image}:${VERSION_WITHOUT_V}")
+            if [ "${{ steps.version.outputs.is_prerelease }}" != "true" ]; then
+              tags+=(-t "${image}:latest")
+            fi
+
             docker buildx imagetools create \
-              -t "${image}:${VERSION_WITHOUT_V}" \
-              -t "${image}:latest" \
+              "${tags[@]}" \
               "${refs[@]}"
           }
 

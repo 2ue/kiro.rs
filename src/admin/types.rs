@@ -190,6 +190,35 @@ pub struct AddCredentialResponse {
     pub email: Option<String>,
 }
 
+// ============ 凭据测试 ============
+
+/// 单凭据测试请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialTestRequest {
+    /// 使用模型列表中的模型 ID
+    pub model: String,
+    /// 可选测试提示词；为空时使用默认短提示词
+    #[serde(default)]
+    pub prompt: Option<String>,
+}
+
+/// 单凭据测试响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialTestResponse {
+    pub success: bool,
+    pub credential_id: u64,
+    pub model: String,
+    pub status_code: Option<u16>,
+    pub output_text: Option<String>,
+    pub error_type: Option<String>,
+    pub error_message: Option<String>,
+    pub duration_ms: u128,
+    pub content_type: Option<String>,
+    pub raw_preview: Option<String>,
+}
+
 // ============ 余额查询 ============
 
 /// 余额查询响应

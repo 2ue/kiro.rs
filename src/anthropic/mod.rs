@@ -35,5 +35,6 @@ pub mod types;
 pub(crate) mod usage;
 mod websearch;
 
+pub(crate) use converter::map_model;
 pub use router::create_router_with_provider;
 pub(crate) use runtime_config::{PromptCacheRuntimeConfig, PromptCacheRuntimeConfigSnapshot};

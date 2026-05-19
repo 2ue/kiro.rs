@@ -12,7 +12,7 @@ use super::{
         get_usage_records, get_usage_records_page, get_usage_stats, get_usage_summary,
         list_admin_actions, list_app_config, list_pricing, list_quota_events, reset_failure_count,
         set_credential_disabled, set_credential_priority, set_load_balancing_mode, sync_pricing,
-        update_app_config,
+        test_credential, update_app_config,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -31,6 +31,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/reset", post(reset_failure_count))
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))
+        .route("/credentials/{id}/test", post(test_credential))
         .route("/usage-records", get(get_usage_records))
         .route("/usage-records-paged", get(get_usage_records_page))
         .route("/usage-records/clear", post(clear_usage_records))

@@ -105,6 +105,38 @@ export interface AddCredentialResponse {
   email?: string
 }
 
+export interface CredentialTestRequest {
+  model: string
+  prompt?: string
+}
+
+export interface CredentialTestResponse {
+  success: boolean
+  credentialId: number
+  model: string
+  statusCode?: number
+  outputText?: string
+  errorType?: string
+  errorMessage?: string
+  durationMs: number
+  contentType?: string
+  rawPreview?: string
+}
+
+export interface ModelPrice {
+  modelId: string
+  displayName?: string
+  provider: string
+  inputCostPerToken?: number | null
+  outputCostPerToken?: number | null
+  cacheReadInputTokenCost?: number | null
+  cacheCreationInputTokenCost?: number | null
+  maxInputTokens?: number | null
+  maxOutputTokens?: number | null
+  source: string
+  syncedAt: string
+}
+
 export type UsageRecordStatus =
   | 'success'
   | 'error'
@@ -128,6 +160,10 @@ export interface UsageRecord {
   conversationId?: string
   credentialId?: number
   credentialLabel?: string
+  attemptedCredentialIds?: number[]
+  rateLimitedCredentialIds?: number[]
+  lastAttemptedCredentialId?: number
+  schedulerBlocked?: boolean
   status: UsageRecordStatus
   usageSource: UsageSource
   totalInputTokens: number

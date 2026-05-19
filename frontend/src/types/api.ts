@@ -91,6 +91,24 @@ export interface AddCredentialResponse {
   email?: string
 }
 
+export interface CredentialTestRequest {
+  model: string
+  prompt?: string
+}
+
+export interface CredentialTestResponse {
+  success: boolean
+  credentialId: number
+  model: string
+  statusCode?: number
+  outputText?: string
+  errorType?: string
+  errorMessage?: string
+  durationMs: number
+  contentType?: string
+  rawPreview?: string
+}
+
 // ----- 用量记录 -----
 
 export type UsageRecordStatus =
@@ -116,6 +134,10 @@ export interface UsageRecord {
   conversationId?: string
   credentialId?: number
   credentialLabel?: string
+  attemptedCredentialIds?: number[]
+  rateLimitedCredentialIds?: number[]
+  lastAttemptedCredentialId?: number
+  schedulerBlocked?: boolean
   status: UsageRecordStatus
   usageSource: UsageSource
   totalInputTokens: number

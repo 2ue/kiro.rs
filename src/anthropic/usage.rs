@@ -74,6 +74,18 @@ pub struct UsageRecord {
     pub credential_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential_label: Option<String>,
+    /// 本次客户端请求在 provider 内部实际尝试过的凭据 ID（按尝试顺序）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempted_credential_ids: Vec<u64>,
+    /// 本次请求中收到 429 并进入冷却的凭据 ID。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rate_limited_credential_ids: Vec<u64>,
+    /// 最后一个被实际调度/尝试的凭据 ID。失败记录用它作为主要排查入口。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempted_credential_id: Option<u64>,
+    /// 调度阶段已被全池退避/冷却拦截，可能没有新的实际上游尝试。
+    #[serde(default)]
+    pub scheduler_blocked: bool,
     pub status: UsageRecordStatus,
     pub usage_source: UsageSource,
     pub total_input_tokens: i32,
@@ -660,7 +672,11 @@ fn record_matches(record: &UsageRecord, query: &UsageRecordQuery) -> bool {
         }
     }
     if let Some(credential_id) = query.credential_id {
-        if record.credential_id != Some(credential_id) {
+        if record.credential_id != Some(credential_id)
+            && record.last_attempted_credential_id != Some(credential_id)
+            && !record.attempted_credential_ids.contains(&credential_id)
+            && !record.rate_limited_credential_ids.contains(&credential_id)
+        {
             return false;
         }
     }
@@ -717,6 +733,9 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
     let status = usage_status_value(record.status);
     let source = usage_source_value(record.usage_source);
     let credential_id = record.credential_id.map(|id| id.to_string());
+    let last_attempted_credential_id = record.last_attempted_credential_id.map(|id| id.to_string());
+    let attempted_credential_ids = join_credential_ids(&record.attempted_credential_ids);
+    let rate_limited_credential_ids = join_credential_ids(&record.rate_limited_credential_ids);
 
     [
         Some(record.id.as_str()),
@@ -730,10 +749,25 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
         record.error_type.as_deref(),
         record.error_message.as_deref(),
         credential_id.as_deref(),
+        last_attempted_credential_id.as_deref(),
+        attempted_credential_ids.as_deref(),
+        rate_limited_credential_ids.as_deref(),
     ]
     .into_iter()
     .flatten()
     .any(|value| value.to_ascii_lowercase().contains(&q))
+}
+
+fn join_credential_ids(ids: &[u64]) -> Option<String> {
+    if ids.is_empty() {
+        return None;
+    }
+    Some(
+        ids.iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+    )
 }
 
 fn usage_status_value(status: UsageRecordStatus) -> &'static str {
@@ -795,13 +829,14 @@ async fn insert_usage_record_to_pg(
     sqlx::query(
         "INSERT INTO usage_records (id, created_at, request_id, endpoint, stream, model, \
             model_provider, conversation_id, credential_id, credential_label, \
+            attempted_credential_ids, rate_limited_credential_ids, last_attempted_credential_id, scheduler_blocked, \
             status, usage_source, error_type, error_message, \
             total_input_tokens, compat_input_tokens, billable_input_tokens, \
             output_tokens, cache_read_input_tokens, cache_creation_input_tokens, \
             cache_creation_5m_input_tokens, cache_creation_1h_input_tokens, \
             cost_usd, client_user_agent, client_ip, duration_ms, \
             simulated, sticky_bound, fallback_from_sticky) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25::inet,$26,$27,$28,$29) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29::inet,$30,$31,$32,$33) \
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(id)
@@ -814,6 +849,22 @@ async fn insert_usage_record_to_pg(
     .bind(&record.conversation_id)
     .bind(record.credential_id.map(|x| x as i64))
     .bind(&record.credential_label)
+    .bind(
+        record
+            .attempted_credential_ids
+            .iter()
+            .map(|x| *x as i64)
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        record
+            .rate_limited_credential_ids
+            .iter()
+            .map(|x| *x as i64)
+            .collect::<Vec<_>>(),
+    )
+    .bind(record.last_attempted_credential_id.map(|x| x as i64))
+    .bind(record.scheduler_blocked)
     .bind(usage_status_value(record.status))
     .bind(usage_source_value(record.usage_source))
     .bind(&record.error_type)
@@ -931,11 +982,14 @@ pub async fn query_usage_stats(
         $1::text IS NULL OR \
         model ILIKE '%' || $1 || '%' OR \
         COALESCE(credential_label, '') ILIKE '%' || $1 || '%' OR \
+        COALESCE(last_attempted_credential_id::text, '') ILIKE '%' || $1 || '%' OR \
+        COALESCE(array_to_string(attempted_credential_ids, ','), '') ILIKE '%' || $1 || '%' OR \
+        COALESCE(array_to_string(rate_limited_credential_ids, ','), '') ILIKE '%' || $1 || '%' OR \
         COALESCE(conversation_id, '') ILIKE '%' || $1 || '%' OR \
         COALESCE(error_message, '') ILIKE '%' || $1 || '%' \
     ) \
     AND ($2::text IS NULL OR conversation_id = $2) \
-    AND ($3::bigint IS NULL OR credential_id = $3) \
+    AND ($3::bigint IS NULL OR credential_id = $3 OR last_attempted_credential_id = $3 OR $3 = ANY(attempted_credential_ids) OR $3 = ANY(rate_limited_credential_ids)) \
     AND ($4::text IS NULL OR model = $4) \
     AND ($5::text IS NULL OR status = $5) \
     AND ($6::text IS NULL OR usage_source = $6) \
@@ -1170,11 +1224,14 @@ pub async fn query_records_from_pg(
         $1::text IS NULL OR \
         model ILIKE '%' || $1 || '%' OR \
         COALESCE(credential_label, '') ILIKE '%' || $1 || '%' OR \
+        COALESCE(last_attempted_credential_id::text, '') ILIKE '%' || $1 || '%' OR \
+        COALESCE(array_to_string(attempted_credential_ids, ','), '') ILIKE '%' || $1 || '%' OR \
+        COALESCE(array_to_string(rate_limited_credential_ids, ','), '') ILIKE '%' || $1 || '%' OR \
         COALESCE(conversation_id, '') ILIKE '%' || $1 || '%' OR \
         COALESCE(error_message, '') ILIKE '%' || $1 || '%' \
     ) \
     AND ($2::text IS NULL OR conversation_id = $2) \
-    AND ($3::bigint IS NULL OR credential_id = $3) \
+    AND ($3::bigint IS NULL OR credential_id = $3 OR last_attempted_credential_id = $3 OR $3 = ANY(attempted_credential_ids) OR $3 = ANY(rate_limited_credential_ids)) \
     AND ($4::text IS NULL OR model = $4) \
     AND ($5::text IS NULL OR status = $5) \
     AND ($6::text IS NULL OR usage_source = $6) \
@@ -1206,7 +1263,8 @@ pub async fn query_records_from_pg(
     // 2) records(按时间倒序)
     let select_sql = format!(
         "SELECT id, request_id, created_at, endpoint, stream, model, conversation_id, \
-                credential_id, credential_label, status, usage_source, \
+                credential_id, credential_label, attempted_credential_ids, rate_limited_credential_ids, \
+                last_attempted_credential_id, scheduler_blocked, status, usage_source, \
                 error_type, error_message, \
                 total_input_tokens, compat_input_tokens, billable_input_tokens, output_tokens, \
                 cache_read_input_tokens, cache_creation_input_tokens, \
@@ -1242,6 +1300,14 @@ pub async fn query_records_from_pg(
         let status_text: String = r.try_get("status")?;
         let source_text: String = r.try_get("usage_source")?;
         let credential_id: Option<i64> = r.try_get("credential_id").ok();
+        let attempted_credential_ids: Vec<i64> = r
+            .try_get("attempted_credential_ids")
+            .unwrap_or_else(|_| Vec::new());
+        let rate_limited_credential_ids: Vec<i64> = r
+            .try_get("rate_limited_credential_ids")
+            .unwrap_or_else(|_| Vec::new());
+        let last_attempted_credential_id: Option<i64> =
+            r.try_get("last_attempted_credential_id").ok();
 
         records.push(UsageRecord {
             // 显示用 request_id(更接近 anthropic 习惯),fallback uuid
@@ -1253,6 +1319,17 @@ pub async fn query_records_from_pg(
             conversation_id: r.try_get("conversation_id").ok(),
             credential_id: credential_id.map(|v| v as u64),
             credential_label: r.try_get("credential_label").ok(),
+            attempted_credential_ids: attempted_credential_ids
+                .into_iter()
+                .filter_map(|v| u64::try_from(v).ok())
+                .collect(),
+            rate_limited_credential_ids: rate_limited_credential_ids
+                .into_iter()
+                .filter_map(|v| u64::try_from(v).ok())
+                .collect(),
+            last_attempted_credential_id: last_attempted_credential_id
+                .and_then(|v| u64::try_from(v).ok()),
+            scheduler_blocked: r.try_get("scheduler_blocked").unwrap_or(false),
             status: UsageRecordStatus::parse(&status_text).unwrap_or(UsageRecordStatus::Success),
             usage_source: UsageSource::parse(&source_text).unwrap_or(UsageSource::None),
             total_input_tokens: r.try_get::<i32, _>("total_input_tokens")?,
@@ -1306,6 +1383,10 @@ mod tests {
             conversation_id: Some("session-a".to_string()),
             credential_id: Some(1),
             credential_label: Some("test@example.com".to_string()),
+            attempted_credential_ids: vec![1],
+            rate_limited_credential_ids: Vec::new(),
+            last_attempted_credential_id: Some(1),
+            scheduler_blocked: false,
             status: UsageRecordStatus::Success,
             usage_source: source,
             total_input_tokens: 100,

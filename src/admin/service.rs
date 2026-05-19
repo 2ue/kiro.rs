@@ -2,11 +2,12 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
 use crate::anthropic::{
-    PromptCacheRuntimeConfig,
+    PromptCacheRuntimeConfig, map_model,
     prompt_cache::PromptCacheTracker,
     usage::{
         UsageRecordQuery, UsageRecorder, UsageRecordsPageResult, UsageRecordsResult, UsageSummary,
@@ -14,19 +15,28 @@ use crate::anthropic::{
 };
 use crate::app_config::AppConfigService;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::events::Event;
+use crate::kiro::model::requests::{
+    conversation::{ConversationState, CurrentMessage, UserInputMessage},
+    kiro::KiroRequest,
+};
+use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::storage::{Db, RedisPool};
 
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsPageResponse, CredentialsStatusResponse, LoadBalancingModeResponse,
-    SetLoadBalancingModeRequest,
+    CredentialTestRequest, CredentialTestResponse, CredentialsPageResponse,
+    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
 };
 
 const DEFAULT_BALANCE_CACHE_TTL_SECS: i64 = 300;
 const DEFAULT_CREDENTIALS_PAGE_LIMIT: usize = 12;
 const MAX_CREDENTIALS_PAGE_LIMIT: usize = 500;
+const DEFAULT_CREDENTIAL_TEST_PROMPT: &str = "Reply with OK.";
+const MAX_TEST_PREVIEW_CHARS: usize = 4000;
 
 /// Redis 中存储的余额条目(JSON)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +69,7 @@ fn balance_cache_key(id: u64) -> String {
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
+    kiro_provider: Arc<KiroProvider>,
     /// Redis 句柄,用于 balance 缓存
     redis: RedisPool,
     /// app_config 句柄,用于读取 balance_cache_ttl_seconds
@@ -75,6 +86,7 @@ pub struct AdminService {
 impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
+        kiro_provider: Arc<KiroProvider>,
         known_endpoints: impl IntoIterator<Item = String>,
         usage_recorder: Arc<UsageRecorder>,
         prompt_cache: Arc<PromptCacheTracker>,
@@ -85,6 +97,7 @@ impl AdminService {
     ) -> Self {
         Self {
             token_manager,
+            kiro_provider,
             redis,
             app_config,
             db,
@@ -305,6 +318,82 @@ impl AdminService {
             remaining,
             usage_percentage,
             next_reset_at: usage.next_date_reset,
+        })
+    }
+
+    /// 使用指定凭据和指定模型发起一次最小化测试调用。
+    pub async fn test_credential(
+        &self,
+        id: u64,
+        req: CredentialTestRequest,
+    ) -> Result<CredentialTestResponse, AdminServiceError> {
+        let model = req.model.trim();
+        if model.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "模型不能为空".to_string(),
+            ));
+        }
+
+        let mapped_model = map_model(model).ok_or_else(|| {
+            AdminServiceError::InvalidCredential(format!("模型不支持: {}", model))
+        })?;
+        let prompt = req
+            .prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(DEFAULT_CREDENTIAL_TEST_PROMPT);
+
+        let kiro_request = build_credential_test_request(prompt, &mapped_model);
+        let request_body = serde_json::to_string(&kiro_request)
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+
+        let started = Instant::now();
+        let call = self
+            .kiro_provider
+            .test_api_with_credential(id, &request_body)
+            .await
+            .map_err(|err| self.classify_test_error(err, id))?;
+        let duration_ms = started.elapsed().as_millis();
+
+        if call.status.is_success() {
+            let output_text = extract_test_output(&call.body);
+            self.kiro_provider
+                .report_success_for_context(call.credential_id, None);
+            return Ok(CredentialTestResponse {
+                success: true,
+                credential_id: call.credential_id,
+                model: model.to_string(),
+                status_code: Some(call.status.as_u16()),
+                output_text: Some(if output_text.is_empty() {
+                    "上游返回成功，但未解析到文本输出。".to_string()
+                } else {
+                    output_text
+                }),
+                error_type: None,
+                error_message: None,
+                duration_ms,
+                content_type: call.content_type,
+                raw_preview: None,
+            });
+        }
+
+        let raw_preview = text_preview(&call.body, MAX_TEST_PREVIEW_CHARS);
+        Ok(CredentialTestResponse {
+            success: false,
+            credential_id: call.credential_id,
+            model: model.to_string(),
+            status_code: Some(call.status.as_u16()),
+            output_text: None,
+            error_type: Some(status_error_type(call.status.as_u16()).to_string()),
+            error_message: Some(if raw_preview.is_empty() {
+                format!("上游返回 HTTP {}", call.status.as_u16())
+            } else {
+                raw_preview.clone()
+            }),
+            duration_ms,
+            content_type: call.content_type,
+            raw_preview: Some(raw_preview),
         })
     }
 
@@ -600,6 +689,122 @@ impl AdminService {
         } else {
             AdminServiceError::InternalError(msg)
         }
+    }
+
+    fn classify_test_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
+        let msg = e.to_string();
+        if msg.contains("不存在") {
+            AdminServiceError::NotFound { id }
+        } else if msg.contains("缺少 refreshToken")
+            || msg.contains("缺少 kiroApiKey")
+            || msg.contains("Token")
+            || msg.contains("accessToken")
+            || msg.contains("refreshToken")
+        {
+            AdminServiceError::InvalidCredential(msg)
+        } else if msg.contains("error trying to connect")
+            || msg.contains("connection")
+            || msg.contains("timeout")
+            || msg.contains("timed out")
+        {
+            AdminServiceError::UpstreamError(msg)
+        } else {
+            AdminServiceError::InternalError(msg)
+        }
+    }
+}
+
+fn build_credential_test_request(prompt: &str, mapped_model: &str) -> KiroRequest {
+    let user_input = UserInputMessage::new(prompt, mapped_model).with_origin("AI_EDITOR");
+    let conversation_state = ConversationState::new(uuid::Uuid::new_v4().to_string())
+        .with_agent_continuation_id(uuid::Uuid::new_v4().to_string())
+        .with_agent_task_type("vibe")
+        .with_chat_trigger_type("MANUAL")
+        .with_current_message(CurrentMessage::new(user_input));
+
+    KiroRequest {
+        conversation_state,
+        profile_arn: None,
+    }
+}
+
+fn extract_test_output(body: &[u8]) -> String {
+    let mut decoder = EventStreamDecoder::new();
+    if decoder.feed(body).is_err() {
+        return text_preview(body, MAX_TEST_PREVIEW_CHARS);
+    }
+
+    let mut text = String::new();
+    let mut tool_names: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for result in decoder.decode_iter() {
+        let Ok(frame) = result else {
+            continue;
+        };
+        let Ok(event) = Event::from_frame(frame) else {
+            continue;
+        };
+        match event {
+            Event::AssistantResponse(resp) => text.push_str(&resp.content),
+            Event::ReasoningContent(reasoning) => {
+                if text.is_empty() && !reasoning.text.is_empty() {
+                    text.push_str(&reasoning.text);
+                }
+            }
+            Event::ToolUse(tool_use) if tool_use.stop => tool_names.push(tool_use.name),
+            Event::InvalidState(invalid) => errors.push(invalid.error_text()),
+            Event::Error {
+                error_code,
+                error_message,
+            } => errors.push(format!("{}: {}", error_code, error_message)),
+            Event::Exception {
+                exception_type,
+                message,
+            } => errors.push(format!("{}: {}", exception_type, message)),
+            _ => {}
+        }
+    }
+
+    if !text.trim().is_empty() {
+        return truncate_chars(text.trim(), MAX_TEST_PREVIEW_CHARS);
+    }
+    if !tool_names.is_empty() {
+        return truncate_chars(
+            &format!("上游返回工具调用: {}", tool_names.join(", ")),
+            MAX_TEST_PREVIEW_CHARS,
+        );
+    }
+    if !errors.is_empty() {
+        return truncate_chars(&errors.join("\n"), MAX_TEST_PREVIEW_CHARS);
+    }
+
+    text_preview(body, MAX_TEST_PREVIEW_CHARS)
+}
+
+fn text_preview(body: &[u8], max_chars: usize) -> String {
+    truncate_chars(String::from_utf8_lossy(body).trim(), max_chars)
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let mut out: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        out.push_str("...");
+    }
+    out
+}
+
+fn status_error_type(status: u16) -> &'static str {
+    match status {
+        400 => "invalid_request_error",
+        401 => "authentication_error",
+        402 => "quota_exhausted",
+        403 => "permission_error",
+        408 => "upstream_timeout",
+        429 => "rate_limited",
+        500..=599 => "upstream_error",
+        _ => "api_error",
     }
 }
 

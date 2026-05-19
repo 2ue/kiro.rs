@@ -220,6 +220,7 @@ async fn main() {
         endpoints,
         config.default_endpoint.clone(),
     );
+    let admin_kiro_provider = Arc::new(kiro_provider.clone());
 
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
@@ -257,6 +258,7 @@ async fn main() {
         } else {
             let admin_service = admin::AdminService::new(
                 token_manager.clone(),
+                admin_kiro_provider.clone(),
                 endpoint_names.clone(),
                 usage_recorder.clone(),
                 prompt_cache.clone(),

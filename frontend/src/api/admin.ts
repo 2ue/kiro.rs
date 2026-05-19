@@ -7,6 +7,8 @@ import type {
   CredentialsPageQuery,
   CredentialsPageResponse,
   CredentialsStatusResponse,
+  CredentialTestRequest,
+  CredentialTestResponse,
   LoadBalancingMode,
   ModelPrice,
   PricingSyncSummary,
@@ -70,6 +72,17 @@ export async function forceRefreshToken(id: number): Promise<SuccessResponse> {
 
 export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
   const { data } = await adminApi.get<BalanceResponse>(`/credentials/${id}/balance`)
+  return data
+}
+
+export async function testCredential(
+  id: number,
+  req: CredentialTestRequest,
+): Promise<CredentialTestResponse> {
+  const { data } = await adminApi.post<CredentialTestResponse>(
+    `/credentials/${id}/test`,
+    req,
+  )
   return data
 }
 

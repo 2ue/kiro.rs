@@ -11,9 +11,11 @@ import {
   setCredentialDisabled,
   setCredentialPriority,
   setLoadBalancingMode,
+  testCredential,
 } from '@/api/admin'
 import type {
   AddCredentialRequest,
+  CredentialTestRequest,
   CredentialsPageQuery,
   LoadBalancingMode,
 } from '@/types/api'
@@ -48,6 +50,15 @@ export function useCredentialBalance(id: number | null) {
     queryFn: () => getCredentialBalance(id!),
     enabled: id !== null,
     retry: false,
+  })
+}
+
+export function useCredentialTest() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, request }: { id: number; request: CredentialTestRequest }) =>
+      testCredential(id, request),
+    onSettled: () => invalidateAll(qc),
   })
 }
 

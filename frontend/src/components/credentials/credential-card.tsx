@@ -2,8 +2,8 @@ import { useState } from 'react'
 import { toast } from 'sonner'
 import {
   CheckCircle2,
-  ExternalLink,
   Loader2,
+  PlayCircle,
   RefreshCw,
   Trash2,
   Wallet,
@@ -36,6 +36,7 @@ import type {
   CredentialStatusItem,
   ModelPrice,
 } from '@/types/api'
+import { CredentialTestDialog } from './credential-test-dialog'
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
@@ -97,6 +98,7 @@ export function CredentialCard({
   totalTokens,
 }: CredentialCardProps) {
   const [busy, setBusy] = useState(false)
+  const [testOpen, setTestOpen] = useState(false)
 
   const setDisabled = useSetDisabled()
   const resetFailure = useResetFailure()
@@ -323,6 +325,14 @@ export function CredentialCard({
           <Button
             size="sm"
             variant="outline"
+            onClick={() => setTestOpen(true)}
+          >
+            <PlayCircle className="h-4 w-4" />
+            测试
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
             onClick={handleReset}
             disabled={
               resetFailure.isPending ||
@@ -367,17 +377,13 @@ export function CredentialCard({
               删除
             </Button>
           )}
-          {credential.email && (
-            <a
-              className="ml-auto inline-flex items-center gap-1 text-xs text-muted-foreground hover:underline"
-              href={`mailto:${credential.email}`}
-            >
-              <ExternalLink className="h-3 w-3" />
-              {credential.email}
-            </a>
-          )}
         </div>
       </CardContent>
+      <CredentialTestDialog
+        credential={credential}
+        open={testOpen}
+        onOpenChange={setTestOpen}
+      />
     </Card>
   )
 }

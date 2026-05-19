@@ -12,8 +12,8 @@ use serde::Deserialize;
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, AdminErrorResponse, SetDisabledRequest, SetLoadBalancingModeRequest,
-        SetPriorityRequest, SuccessResponse,
+        AddCredentialRequest, AdminErrorResponse, CredentialTestRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
     },
 };
 use crate::anthropic::usage::{UsageRecordQuery, UsageRecordStatus, UsageSource};
@@ -255,6 +255,37 @@ pub async fn get_credential_balance(
 ) -> impl IntoResponse {
     match state.service.get_balance(id).await {
         Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/test
+/// 使用指定凭据和模型发起一次测试调用
+pub async fn test_credential(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<CredentialTestRequest>,
+) -> impl IntoResponse {
+    let model = payload.model.clone();
+    match state.service.test_credential(id, payload).await {
+        Ok(response) => {
+            record_admin_action(
+                &state.db,
+                "admin",
+                "credential_test",
+                Some("credential"),
+                Some(id.to_string()),
+                Some(serde_json::json!({
+                    "model": model,
+                    "success": response.success,
+                    "statusCode": response.status_code,
+                    "errorType": response.error_type,
+                    "durationMs": response.duration_ms,
+                })),
+            )
+            .await;
+            Json(response).into_response()
+        }
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
