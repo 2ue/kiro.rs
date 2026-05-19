@@ -599,9 +599,9 @@ const GLOBAL_RATE_LIMIT_RATIO_NUMERATOR: usize = 3;
 /// 触发全池退避的账号比例分母（默认 3/5 = 60%）。
 const GLOBAL_RATE_LIMIT_RATIO_DENOMINATOR: usize = 5;
 /// 全池 429 退避最短秒数。
-const GLOBAL_RATE_LIMIT_BACKOFF_MIN_SECS: i64 = 30;
+const GLOBAL_RATE_LIMIT_BACKOFF_MIN_SECS: i64 = 180;
 /// 全池 429 退避最长秒数。
-const GLOBAL_RATE_LIMIT_BACKOFF_MAX_SECS: i64 = 90;
+const GLOBAL_RATE_LIMIT_BACKOFF_MAX_SECS: i64 = 300;
 
 #[derive(Debug, Clone, Default)]
 struct SchedulerCredentialState {
