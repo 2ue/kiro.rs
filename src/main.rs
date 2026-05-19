@@ -1,10 +1,13 @@
 mod admin;
 mod admin_ui;
 mod anthropic;
+mod app_config;
 mod common;
 mod http_client;
 mod kiro;
 mod model;
+mod pricing;
+mod storage;
 pub mod token;
 
 use std::collections::HashMap;
@@ -77,6 +80,41 @@ async fn main() {
     let first_credentials = credentials_list.first().cloned().unwrap_or_default();
     tracing::debug!("主凭证: {:?}", first_credentials);
 
+    // 连接 PostgreSQL + Redis（硬依赖，失败即退出）
+    let database_url = config.resolve_database_url().unwrap_or_else(|e| {
+        tracing::error!("{}", e);
+        std::process::exit(1);
+    });
+    let redis_url = config.resolve_redis_url().unwrap_or_else(|e| {
+        tracing::error!("{}", e);
+        std::process::exit(1);
+    });
+    let _storage = storage::init(&database_url, &redis_url)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("数据持久化层初始化失败: {:#}", e);
+            std::process::exit(1);
+        });
+
+    // 初始化在线运行时配置(读 app_config 表)
+    let app_config_service = app_config::AppConfigService::new(_storage.db.clone())
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("加载 app_config 失败: {:#}", e);
+            std::process::exit(1);
+        });
+
+    // 初始化模型计价(启动时若未 bootstrap 则异步同步一次)
+    let pricing_registry =
+        pricing::ModelPricingRegistry::new(_storage.db.clone(), app_config_service.clone());
+    if let Err(err) = pricing_registry.bootstrap().await {
+        tracing::warn!("ModelPricingRegistry bootstrap 失败(不影响启动): {:#}", err);
+    }
+    // 立即把已有的 model_prices 灌进内存缓存,保证 record 立刻能算 cost_usd
+    if let Err(err) = pricing_registry.warm_cache().await {
+        tracing::warn!("ModelPricingRegistry 内存缓存初始化失败: {:#}", err);
+    }
+
     // 获取 API Key
     let api_key = config.api_key.clone().unwrap_or_else(|| {
         tracing::error!("配置文件中未设置 apiKey");
@@ -131,14 +169,22 @@ async fn main() {
     } else {
         None
     };
-    let usage_recorder = Arc::new(anthropic::usage::UsageRecorder::new(
-        config.usage_record_limit,
-        usage_record_path,
-    ));
+    let mut usage_recorder =
+        anthropic::usage::UsageRecorder::new(config.usage_record_limit, usage_record_path);
+    usage_recorder
+        .attach_storage(_storage.db.clone(), pricing_registry.clone())
+        .await;
+    let usage_recorder = Arc::new(usage_recorder);
     let prompt_cache = Arc::new(anthropic::prompt_cache::PromptCacheTracker::default());
+    let prompt_cache_runtime_config = Arc::new(anthropic::PromptCacheRuntimeConfig::new(
+        anthropic::PromptCacheRuntimeConfigSnapshot::from_config_and_app_config(
+            &config,
+            &app_config_service,
+        ),
+    ));
 
-    // 创建 MultiTokenManager 和 KiroProvider
-    let token_manager = MultiTokenManager::new(
+    // 创建 MultiTokenManager 并 attach 存储层
+    let mut token_manager = MultiTokenManager::new(
         config.clone(),
         credentials_list,
         proxy_config.clone(),
@@ -149,6 +195,24 @@ async fn main() {
         tracing::error!("创建 Token 管理器失败: {}", e);
         std::process::exit(1);
     });
+    if let Err(e) = token_manager.attach_storage(_storage.clone()).await {
+        tracing::error!("Token 管理器接入 PG 存储失败: {:#}", e);
+        std::process::exit(1);
+    }
+    // 应用 app_config 中的配额阈值(失败回退到默认 3 次 / 30 分)
+    let strike_limit: u32 = app_config_service
+        .get_as::<u32>("quota_soft_fail_limit")
+        .unwrap_or(3);
+    let cooldown_minutes: i64 = app_config_service
+        .get_as::<i64>("quota_cooldown_minutes")
+        .unwrap_or(30);
+    token_manager.set_quota_settings(strike_limit, cooldown_minutes);
+
+    // 让 app_config 中的 load_balancing_mode 在内存生效(修双源 bug)
+    if let Some(mode) = app_config_service.get_as::<String>("load_balancing_mode") {
+        token_manager.override_load_balancing_mode(&mode);
+    }
+
     let token_manager = Arc::new(token_manager);
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
@@ -173,13 +237,7 @@ async fn main() {
         config.extract_thinking,
         usage_recorder.clone(),
         prompt_cache.clone(),
-        config.prompt_cache_simulation_mode,
-        config.prompt_cache_target_read_ratio,
-        config.prompt_cache_token_scale,
-        config.prompt_cache_max_simulated_input_tokens,
-        config.prompt_cache_cap_jitter_min_tokens,
-        config.prompt_cache_cap_jitter_max_tokens,
-        config.prompt_cache_scale_min_input_tokens,
+        prompt_cache_runtime_config.clone(),
         config.compat_profile,
         config.expose_proxy_warnings,
     );
@@ -202,19 +260,32 @@ async fn main() {
                 endpoint_names.clone(),
                 usage_recorder.clone(),
                 prompt_cache.clone(),
-                config.high_cache_threshold,
+                prompt_cache_runtime_config.clone(),
+                app_config_service.clone(),
+                _storage.redis.clone(),
+                _storage.db.clone(),
             );
-            let admin_state = admin::AdminState::new(admin_key, admin_service);
+            let admin_state = admin::AdminState::new(
+                admin_key,
+                admin_service,
+                app_config_service.clone(),
+                pricing_registry.clone(),
+                _storage.db.clone(),
+                token_manager.clone(),
+                prompt_cache_runtime_config.clone(),
+            );
             let admin_app = admin::create_admin_router(admin_state);
 
-            // 创建 Admin UI 路由
+            // 创建 Admin UI 路由(旧版 + 新版并存)
             let admin_ui_app = admin_ui::create_admin_ui_router();
+            let console_app = admin_ui::create_console_router();
 
             tracing::info!("Admin API 已启用");
-            tracing::info!("Admin UI 已启用: /admin");
+            tracing::info!("Admin UI 已启用: /admin (旧版) · /console (新版)");
             anthropic_app
                 .nest("/api/admin", admin_app)
                 .nest("/admin", admin_ui_app)
+                .nest("/console", console_app)
         }
     } else {
         anthropic_app

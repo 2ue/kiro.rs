@@ -1,0 +1,36 @@
+# 可选:本机没有 PostgreSQL / Redis 时启动一对开发用容器。
+#
+# 用法:
+#   docker compose -f docker-compose.dev-infra.yml up -d
+#
+# 已有本地 pg/redis 的用户**不需要**用这个文件,直接用主 docker-compose.yml 即可。
+# 这里所有容器名、网络名、端口、用户都加 `kiro_rs_` 前缀以避免与已有实例冲突。
+# 不使用 volumes,数据**不持久化**(开发用)。
+
+services:
+  kiro-rs-postgres:
+    image: postgres:16-alpine
+    container_name: kiro-rs-dev-postgres
+    environment:
+      POSTGRES_USER: kiro_rs
+      POSTGRES_PASSWORD: kiro_rs_dev_pwd
+      POSTGRES_DB: kiro_rs
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kiro_rs -d kiro_rs"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  kiro-rs-redis:
+    image: redis:7-alpine
+    container_name: kiro-rs-dev-redis
+    command: ["redis-server", "--save", ""]
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5

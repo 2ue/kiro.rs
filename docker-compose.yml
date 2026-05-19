@@ -8,4 +8,8 @@ services:
       - "${KIRO_RS_PORT:-8990}:8990"
     volumes:
       - ./config/:/app/config/
+    environment:
+      # 默认连本机已起的 pg/redis（host.docker.internal 指向宿主机）
+      DATABASE_URL: ${DATABASE_URL:-postgres://kiro_rs:kiro_rs_dev_pwd@host.docker.internal:5433/kiro_rs}
+      REDIS_URL: ${REDIS_URL:-redis://host.docker.internal:6380/0}
     restart: unless-stopped

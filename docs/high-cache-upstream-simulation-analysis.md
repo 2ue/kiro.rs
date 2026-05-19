@@ -11,10 +11,11 @@
 结论先行：
 
 1. 当前项目核心链路已经具备高缓存场景的基础：会话粘性调度、Kiro `metadataEvent.tokenUsage` 解析、普通流/缓冲流/非流式 usage 透出方向都已经有基础。
-2. 当前项目最大的缺口不是“能不能返回 cache 字段”，而是“作为上游服务时，能不能稳定模拟高缓存，并能在 Admin 里追踪每次请求的高缓存记录”。
-3. `../kiro.rs-new.rs` 的价值是轻量级 `cache_control` 启发式模拟，适合 P0/P1 快速兜底。
-4. `Kiro-Go` 的价值是更真实的 prompt cache tracker：按账号记录缓存指纹，首轮 creation、后续 read，TTL、阈值、规范化 fingerprint 都更接近真实上游行为，适合作为当前项目 P2 的主要学习对象。
+2. 当前项目已经具备状态化 high-cache 模拟、真实 metadata 优先、token scale、deterministic soft cap 和 Admin usage 观察能力；当前主要缺口是连续会话中的小请求 cache 断层。
+3. `../kiro.rs-new.rs` 的价值主要是历史参考：它说明了轻量 cache 字段如何接入流式/非流式响应，但不应作为当前最终模拟模式。
+4. `Kiro-Go` 的 prompt cache tracker 思路已经被当前项目吸收为 `PromptCacheTracker`。后续重点不是再移植一套 tracker，而是在 high-cache 模式上补充 continuity floor。
 5. 当前项目的 sticky session 方向是正确的，而且比简单轮询更符合高缓存场景：同一个下游会话应该尽可能固定在同一个 Kiro 账号上完成，只有硬失败或连续软失败才 fallback。
+6. 连续请求 cache 断层的最终方案见 `docs/high-cache-continuity-cache-gap-plan.md`。
 
 ## 当前项目核心链路
 
@@ -76,23 +77,15 @@ Provider 对错误做了区分：
 
 ### SSE 与非流式 usage
 
-当前工作区已经有一组未提交/未最终验证的高缓存相关改动：
+当前项目已经把 high-cache usage 组装收敛到 `src/anthropic/cache.rs`、`src/anthropic/prompt_cache.rs`、`src/anthropic/handlers.rs` 和 `src/anthropic/stream.rs`：
 
-1. `src/anthropic/cache.rs` 是未跟踪文件，提供 `CacheUsage`、`estimate_cached_message_tokens` 和 `build_usage`。
-2. `src/anthropic/mod.rs` 已把 `mod cache;` 接入。
-3. `src/anthropic/handlers.rs` 在 messages 被 move 前计算 `cached_msg_tokens`，见 `src/anthropic/handlers.rs:289-298` 和 `src/anthropic/handlers.rs:931-940`。
-4. 非流式响应通过 `super::cache::build_usage(...)` 输出 usage，见 `src/anthropic/handlers.rs:743-773`。
-5. 普通流的 `message_delta.usage` 已改为完整 usage 对象，见 `src/anthropic/stream.rs:1326-1349`。
-6. 缓冲流在完成后回填 `message_start.message.usage`，见 `src/anthropic/stream.rs:1463-1490`。
-7. `SseStateManager` 已新增 `generate_final_events_with_usage`，见 `src/anthropic/stream.rs:470-500`。
+1. `src/anthropic/cache.rs` 提供 `CacheUsage`、`CacheSimulation` 和 `build_usage_with_simulation_policy(...)`。
+2. `src/anthropic/prompt_cache.rs` 提供状态化 `PromptCacheTracker`，按 `credential_id + conversation_id + model` 维护本地 cache entry。
+3. `src/anthropic/handlers.rs` 在 provider 选中 credential 后计算同 scope 的 simulated usage。
+4. `src/anthropic/stream.rs` 和非流式 handler 都通过同一 simulation policy 生成最终 usage。
+5. 真实 upstream metadata 中已有非零 cache read/write 时，本地 simulation 不覆盖真实值。
 
-这些改动方向正确，但目前还不能视为完整方案，因为缺少：
-
-1. usage 记录存储。
-2. Admin 查询页面/API。
-3. 稳定的 per-account/per-session prompt cache tracker。
-4. 运行时开关和测试模式边界。
-5. 对当前 `cache.rs` 语义的进一步校正和测试。
+当前剩余问题不是“能不能输出 cache 字段”，而是 high-cache 连续小请求会因为本次 input token 太少而出现 cache 断层。该问题的具体方案见 `docs/high-cache-continuity-cache-gap-plan.md`。
 
 ### Admin 账号管理
 
@@ -207,7 +200,7 @@ Provider 对错误做了区分：
 2. 普通流最终 `message_delta.usage` 加 cache 字段，见 `kiro.rs-new.rs/src/anthropic/stream.rs:456-498`。
 3. 缓冲流完成后回填 `message_start.message.usage`，见 `kiro.rs-new.rs/src/anthropic/stream.rs:1220-1237`。
 
-当前工作区的 `src/anthropic/cache.rs` 基本已经吸收这部分思路，并额外加了 metadata 优先逻辑。后续建议保留它作为 `heuristic_cache_control` 模式，而不是把它当最终真实模拟。
+当前项目早期曾参考这部分轻量思路，但最终方案已经转向状态化 `PromptCacheTracker + CacheSimulation`。不建议再新增独立的轻量 cache-control 模式；如果需要临时联调，应优先使用现有 `high-cache` 并通过配置调整 ratio/scale/cap。
 
 ## `Kiro-Go` 可借鉴点
 
@@ -343,7 +336,6 @@ Provider 对错误做了区分：
     - `upstream_metadata`
     - `context_estimate`
     - `local_prompt_cache`
-    - `heuristic_cache_control`
     - `none`
 12. `total_input_tokens`。
 13. `billable_input_tokens`。
@@ -438,11 +430,17 @@ Admin 页面不应该只显示余额，因为余额是账号级，而高缓存�
 
 ## 高缓存模拟模式
 
-建议明确配置开关，默认关闭本地模拟，真实 metadata 优先。
+当前项目已经收敛为三个配置值：
+
+```text
+disabled
+local-prompt-cache
+high-cache
+```
+
+无论哪种模式，真实 Kiro metadata 中的非零 cache read/write 都必须优先，本地模拟不得覆盖真实值。
 
 ### 模式 0：disabled
-
-默认模式。
 
 行为：
 
@@ -455,36 +453,9 @@ Admin 页面不应该只显示余额，因为余额是账号级，而高缓存�
 1. 生产默认。
 2. 不希望本地制造 usage 字段的环境。
 
-### 模式 1：heuristic_cache_control
+### 模式 1：local-prompt-cache
 
-基于当前 `src/anthropic/cache.rs` 和 `kiro.rs-new.rs` 的轻量模拟。
-
-行为：
-
-1. Kiro metadata 存在时，metadata 优先。
-2. metadata 缺失且请求里存在非 null `cache_control` 时，根据 token 估算切分 cache usage。
-3. source 记为 `heuristic_cache_control`。
-
-优点：
-
-1. 实现成本低。
-2. 可快速让下游看到高缓存字段。
-3. 与当前工作区改动吻合。
-
-缺点：
-
-1. 不是真正的 first creation/second read。
-2. 不按账号/会话维护缓存。
-3. 不适合验证长期粘性会话效果。
-
-建议定位：
-
-1. P1 fallback。
-2. 兼容 `../kiro.rs-new.rs` 的行为。
-
-### 模式 2：local_prompt_cache
-
-移植 `Kiro-Go` 的 promptCacheTracker 思路。
+严格本地 prompt-cache tracker，要求请求里有明确 cacheable breakpoint 或显式 cache control 语义。
 
 行为：
 
@@ -494,46 +465,53 @@ Admin 页面不应该只显示余额，因为余额是账号级，而高缓存�
 4. 上游成功后：写入本地 prompt cache tracker。
 5. 后续同账号、同会话、同模型、同稳定 prefix：返回 cache read。
 6. source 记为 `local_prompt_cache`。
-7. 真实 Kiro metadata 存在时仍以 metadata 为准，除非显式开启 override。
+7. 真实 Kiro metadata 存在时仍以 metadata 为准。
 
 为什么建议比 `Kiro-Go` 多加 `conversation_id`：
 
 1. `Kiro-Go` 只按 account ID 分区，这适合它自己的代理模型。
 2. 当前项目已经有 sticky session，用户明确要求一个会话尽量在同账号完成。
 3. 对“作为其他服务上游的高缓存模拟”来说，下游通常希望同一 session 重复请求才命中，而不是不同下游会话共享同账号缓存。
-4. 因此推荐 key 为 `credential_id + conversation_id + model`，必要时配置允许降级为 account-level。
+4. 因此 key 应保持为 `credential_id + conversation_id + model`，不建议降级为 account-level。
 
-### 模式 3：force_high_cache
+### 模式 2：high-cache
 
-仅限开发/集成测试。
+面向上游集成测试和高缓存验证的本地模拟模式。当前项目默认配置使用 high-cache。
 
 行为：
 
-1. 不依赖 prompt fingerprint。
-2. 按配置固定制造高 cache read，比如 `cache_read_input_tokens = min(total_input_tokens * 0.8, 180000)`。
-3. source 记为 `forced_high_cache`。
-4. 必须通过 env/config/admin 明确开启，生产默认永远关闭。
+1. 即使请求没有显式 `cache_control`，也会从原始 Anthropic payload 构建稳定 cache profile。
+2. 使用 `credential_id + conversation_id + model` 作为缓存域。
+3. 优先从 `metadata.user_id` 提取 conversation id；缺失时从 system/tools/first user message 派生 fallback conversation id。
+4. 首次同 scope 大请求通常表现为 cache creation。
+5. 后续同 scope 请求命中历史 entry 后表现为 cache read。
+6. 当真实 metadata cache 为 0 或 metadata 缺失时，本地 high-cache simulation 可以填充 Anthropic-compatible cache 字段。
+7. high-cache 可以使用 `promptCacheTokenScale`、`promptCacheMaxSimulatedInputTokens` 和 deterministic soft cap jitter 放大 simulated total input。
+8. 连续请求中间的小请求断层问题应按 `docs/high-cache-continuity-cache-gap-plan.md` 实施：只有同 scope 已存在未过期 entry 时，小请求才可通过 continuity floor 读取历史 cache。
 
 用途：
 
 1. 下游服务联调：验证它能解析和展示高缓存字段。
-2. Admin UI 压测：快速生成大量高缓存记录。
+2. 多轮对话、工具调用、Claude Code/OpenCode 这类长会话场景的高缓存行为测试。
+3. Admin usage 统计中稳定复现 cache read/write 分布。
 
 风险：
 
-1. 最不真实。
-2. 容易误导成本/usage 判断。
-3. 必须在 UI 和 usage record 中明确标记 `simulated=true`。
+1. 它仍然是本地模拟，不代表 Kiro upstream 真实计费。
+2. 如果客户端复用同一个 session id 做多个无关任务，可能在 TTL 内共享本地模拟 cache。
+3. 缺 metadata 时 fallback conversation id 可能被相同 prompt anchor 的请求复用。
+4. 必须在 UI 和 usage record 中明确标记 `simulated=true` 或 `source=local_prompt_cache`。
+5. 真实 metadata 非零 cache 必须始终优先，不能被 high-cache 模拟覆盖。
 
 ## 高缓存模拟请求方法
 
 当前服务作为上游时，下游服务可以这样模拟：
 
-1. 启用 `local_prompt_cache` 或 `heuristic_cache_control`。
+1. 启用 `high-cache`。如果需要严格 cache-control 语义，则启用 `local-prompt-cache`。
 2. 使用同一个下游 session，让请求最终转成稳定的 `conversationState.conversationId`。
 3. 使用同一个模型。
 4. 让 sticky session 绑定到同一个 Kiro credential。
-5. 在 system 或早期 message block 上放一个足够长的稳定 prefix，并加：
+5. high-cache 不要求显式 `cache_control`；如果使用 `local-prompt-cache`，需要在 system、tools 或早期 message block 上放一个足够长的稳定 prefix，并加：
 
 ```json
 {
@@ -620,27 +598,29 @@ Admin 页面不应该只显示余额，因为余额是账号级，而高缓存�
 2. 流式中断时，record status 不是 success。
 3. 可以按 credential/conversation/minCacheRead 查询。
 
-### P1：稳定当前轻量 cache_control 模拟
+### P1：修复 high-cache 连续小请求断层
 
 目标：
 
-1. 把当前工作区 `src/anthropic/cache.rs` 改动稳定成明确模式。
-2. 不让生产默认悄悄制造 cache usage。
+1. 同一 high-cache scope 已经创建过缓存后，后续连续小请求不应因为本次 input token 较少而 cache read 归零。
+2. 首次或无历史缓存的小请求仍不能凭空出现高 cache。
+3. 修复仅作用于 high-cache，不影响 local-prompt-cache。
 
 任务：
 
-1. 增加配置项，例如 `prompt_cache_simulation_mode`。
-2. 默认 `disabled`。
-3. 开启 `heuristic_cache_control` 时才用当前 `estimate_cached_message_tokens`。
-4. usage record 标记 source。
-5. 普通流、缓冲流、非流式都保持字段一致。
+1. 新增 high-cache 专用 `compute_high_cache(...)` 或等价 policy。
+2. 当本次请求 `target_tokens <= 0` 时，检查同 scope 是否已有未过期 cache entry。
+3. 只有已有 entry 时，生成 read-only usage 和 `simulated_total_input_floor_tokens`。
+4. 给 `CacheSimulation` 增加 total input floor，避免最终 usage 被本次小 input 压低。
+5. 补齐 high-cache/local-prompt-cache 隔离测试。
 
 验收：
 
-1. 默认不模拟。
-2. 开启后请求带 `cache_control` 会出现 cache fields。
-3. metadata 存在时 metadata 永远优先。
-4. 测试覆盖普通流 `message_delta`、缓冲流 `message_start`、非流式 JSON。
+1. 首次小请求 cache read/write 为 0。
+2. 大请求成功创建 entry 后，同 scope 小请求 cache read > 0，creation = 0。
+3. 不同 credential/conversation/model 不共享 read。
+4. local-prompt-cache 小请求保持旧行为。
+5. metadata 存在且 cache 非 0 时 metadata 永远优先。
 
 ### P2：移植 Kiro-Go 风格 local_prompt_cache
 
@@ -718,12 +698,11 @@ Admin 页面不应该只显示余额，因为余额是账号级，而高缓存�
 优先级必须是：
 
 1. Kiro metadata usage。
-2. local_prompt_cache。
-3. heuristic_cache_control。
-4. context estimate。
-5. request estimate。
+2. high-cache/local-prompt-cache 本地 simulation。
+3. context estimate。
+4. request estimate。
 
-只有 `force_high_cache` 可以覆盖，但必须显式配置并标记。
+不应再引入固定数值覆盖模式来覆盖真实 metadata。需要更大缓存数字时，应通过 high-cache 的 ratio、scale、cap jitter 和 continuity floor 调整模拟总量，并保持 `simulated=true` 或 `source=local_prompt_cache` 可追踪。
 
 ### 不要在失败请求后更新 prompt cache
 
@@ -772,15 +751,16 @@ local prompt cache 应该只在上游成功后 update：
 7. 第一轮请求和第二轮请求的模拟结果符合 creation/read 语义。
 8. 流式失败、idle timeout、client drop 不会被误记为成功高缓存。
 9. 模拟记录和真实 metadata 记录可以区分。
-10. 所有本地模拟默认关闭，生产不会无意制造 cache usage。
+10. 本地模拟可以通过 `promptCacheSimulationMode = "disabled"` 关闭；开启 high-cache 时，真实 metadata 非零 cache 仍然是权威来源。
 
 ## 推荐下一步
 
-按当前项目实际情况，下一步不应该先继续堆启发式 cache 字段，而应该：
+按当前项目实际情况，下一步不应该继续堆固定数值或启发式 cache 字段，而应该：
 
-1. 先实现 `UsageRecordStore` 和 Admin 查询 API。
-2. 再把当前 `src/anthropic/cache.rs` 纳入配置化 `heuristic_cache_control` 模式。
-3. 然后移植 `Kiro-Go` 的 `PromptCacheTracker`，形成真正适合上游集成测试的 `local_prompt_cache`。
-4. 最后补 Admin UI 的高缓存记录页面。
+1. 保持真实 metadata 优先和 `credential_id + conversation_id + model` scope 隔离。
+2. 在 high-cache 路径实施 `docs/high-cache-continuity-cache-gap-plan.md` 中的 continuity floor，修复连续请求中间 cache 断层。
+3. 保留 `local-prompt-cache` 的严格语义，不让它继承 high-cache 的宽松连续 read。
+4. 用 Admin usage records 重新统计 cache 请求占比、超过 100k/200k 的 read/write 占比。
+5. 再根据真实分布微调 `promptCacheTargetReadRatio`、`promptCacheTokenScale`、cap 和 jitter 默认值。
 
-这样顺序最贴合当前服务核心逻辑：先可观测，再可控模拟，再可视化管理。
+这样顺序最贴合当前服务核心逻辑：先保证模拟语义自洽，再用可观测数据调参。

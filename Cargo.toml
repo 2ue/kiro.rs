@@ -24,7 +24,7 @@ anyhow = "1.0"
 http = "1.0"
 futures = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.10", features = ["v1", "v4", "fast-rng"] }
+uuid = { version = "1.10", features = ["v1", "v4", "fast-rng", "serde"] }
 fastrand = "2"
 sha2 = "0.10"
 hex = "0.4"
@@ -39,3 +39,9 @@ rust-embed = "8"      # 嵌入静态文件
 mime_guess = "2"      # MIME 类型推断
 pdf-extract = "0.7"   # PDF 文本抽取
 url = "2"             # URL 解析（SSRF 防护）
+# 数据持久化层
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "chrono", "uuid", "json", "migrate"] }
+bb8 = "0.8"
+bb8-redis = "0.17"
+redis = { version = "0.27", features = ["tokio-rustls-comp", "connection-manager"] }
+async-trait = "0.1"

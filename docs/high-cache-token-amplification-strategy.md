@@ -2,6 +2,8 @@
 
 本文档记录 high-cache token 放大方案、实施约束和验证清单。当前实现已落地核心配置、high-cache 专用 scale、deterministic soft cap、小请求保护，以及真实 metadata cache 优先规则。
 
+连续请求中间出现 cache 断层的问题和最终修复方案见 `docs/high-cache-continuity-cache-gap-plan.md`。本文中的“小请求保护”应理解为“首次或无历史缓存的小请求不能凭空变成高缓存”；同一 high-cache scope 已经成功创建过缓存后，后续连续小请求可以通过 continuity floor 继承历史 cache read。
+
 ## 目标
 
 在 `promptCacheSimulationMode = "high-cache"` 的本地模拟路径中，让返回给下游和 Admin 的缓存字段更大、更像高缓存场景：
@@ -18,7 +20,7 @@
 1. 不修改真实 Kiro metadata 中已经存在的 cache read/write。
 2. 不全局修改 `token::count_tokens` 的 token 估算口径。
 3. 不对每个请求硬塞固定 cache 大数。
-4. 不让短测试请求凭空出现很大的 cache read/write。
+4. 不让首次或无历史缓存的短测试请求凭空出现很大的 cache read/write。
 5. 不让大量请求频繁卡在同一个 `promptCacheMaxSimulatedInputTokens` 上限值。
 
 ## 当前计算基础
@@ -40,6 +42,8 @@ target_tokens = round(total_input_tokens * effective_cache_ratio)
 因此只提高 `promptCacheTargetReadRatio` 的放大能力有限。如果 `total_input_tokens = 10000`，即使 ratio 从 `0.95` 提到 `0.99`，cache token 也只是从约 `9500` 提到约 `9900`。
 
 真正让 cache read/write 明显变大的关键是 high-cache 模拟使用的 `total_input_tokens`。
+
+连续请求修复后，high-cache 的 `total_input_tokens` 不应只来自本次请求或 upstream metadata。对于已经在同一 scope 建立过缓存的连续小请求，还需要引入一个由历史 cache read 推导出的 `continuity_floor`，避免本次小 input 把最终 cache read 压成几百 tokens。
 
 ## 推荐新增配置
 
@@ -108,7 +112,8 @@ target_tokens = round(total_input_tokens * effective_cache_ratio)
 ```text
 local_total = 本地请求 token 估算
 metadata_total = upstream metadata 中的 total input，如果存在
-base_total = max(local_total, metadata_total)
+continuity_floor = 已建缓存的连续小请求 floor，如果没有则为 0
+base_total = max(local_total, metadata_total, continuity_floor)
 
 if base_total < promptCacheScaleMinInputTokens:
     simulated_total = base_total
@@ -123,11 +128,12 @@ cache_total = min(cache_total, simulated_total - 1)
 
 注意：
 
-1. `base_total` 使用 `max(local_total, metadata_total)`，避免 metadata total 偏小时压低 high-cache 模拟。
+1. `base_total` 使用 `max(local_total, metadata_total, continuity_floor)`，避免 metadata total 偏小或本次小请求压低 high-cache 模拟。
 2. scale 只在 high-cache 模拟中生效。
 3. cap jitter 只在 `scaled_total` 触达或超过上限时有实际影响。
 4. jitter 作用于 `simulated_total`，不要直接作用于 read/write。
 5. 最后仍然保留 `input_tokens >= 1` 的自洽约束。
+6. `continuity_floor` 只能在同一 `credential_id + conversation_id + model` 已存在未过期 cache entry 时使用，不能用于首次小请求。
 
 ## 封顶波动策略
 
@@ -188,16 +194,16 @@ if metadata.cache_read_input_tokens > 0 || metadata.cache_write_input_tokens > 0
 
 这样可以避免覆盖真实上游已经给出的 cache 行为。
 
-## 小请求保护
+## 小请求保护和连续小请求
 
-短请求不应被放大出高 cache。建议保留多层保护：
+首次或无历史缓存的短请求不应被放大出高 cache。建议保留多层保护：
 
 1. 原有最小 cacheable tokens：普通模型 `1024`，Opus `4096`。
 2. 新增 `promptCacheScaleMinInputTokens`，默认 `20000`。
-3. `base_total < promptCacheScaleMinInputTokens` 时不启用 `promptCacheTokenScale`。
-4. 可选：`base_total < 1024` 时不做 high-cache 模拟，只返回普通 usage。
+3. 无 continuity floor 时，`base_total < promptCacheScaleMinInputTokens` 不启用 `promptCacheTokenScale`。
+4. 无历史 cache entry 时，`base_total < 1024` 不做 high-cache 模拟，只返回普通 usage。
 
-典型小请求：
+典型首次小请求：
 
 ```json
 {"messages":[{"role":"user","content":"hello"}]}
@@ -211,6 +217,20 @@ cache_read_input_tokens = 0
 ```
 
 或最多保持当前低 token 行为，不应出现几万、十几万 cache token。
+
+连续小请求是例外，但必须满足更严格条件：
+
+```text
+同一 credential_id
+同一 conversation_id
+同一 model
+同一 scope 下已有未过期 cache entry
+该 entry.cached_tokens >= 当前模型 min cacheable tokens
+```
+
+满足这些条件时，high-cache 可以使用历史 cache entry 生成 read-only usage，并设置 `continuity_floor = ceil(history_read_tokens / effective_cache_ratio)`。这样连续会话中的短追问、工具调用中间态、状态同步请求不会突然掉到 0。
+
+连续小请求不能创建新的 cache entry；它只能读取和刷新已有 entry。
 
 ## Creation 和 Read 行为
 
@@ -228,6 +248,14 @@ cache_read_input_tokens = 0
 ```text
 cache_read_input_tokens > 0
 cache_creation_input_tokens = 0 或较小
+```
+
+后续同 scope 且已有未过期 entry 的连续小请求：
+
+```text
+cache_read_input_tokens > 0
+cache_creation_input_tokens = 0
+simulated_total_input_floor_tokens > 本次实际 input_tokens
 ```
 
 多轮会话增长时，较自然的结果是：
@@ -251,8 +279,9 @@ credential_id + conversation_id + model
 
 1. 同一会话切换 credential 会导致 read 下降或重新 creation。
 2. model 名不同会隔离 cache。
-3. 没有稳定 conversation id 的请求不应跨请求共享 cache。
-4. high-cache token 放大不应绕开这些 scope 规则。
+3. high-cache 缺少显式 metadata session 时，可以从 system/tools/first user 派生 fallback conversation id；该 fallback 仍必须落在同一 scope 内，不能跨 credential/model。
+4. local-prompt-cache 仍只信任显式 metadata conversation id，不应继承 high-cache fallback。
+5. high-cache token 放大和 continuity floor 都不应绕开这些 scope 规则。
 
 如果目标是稳定高 read，需要保持 sticky session 到同一 credential。
 
@@ -267,7 +296,7 @@ credential_id + conversation_id + model
 5. `promptCacheCapJitterMinTokens > promptCacheCapJitterMaxTokens`：应交换、clamp 或回退默认值。
 6. jitter 大于 cap：`soft_cap` 必须至少大于 `1`，避免负数或 0。
 7. `scaled_total <= promptCacheMaxSimulatedInputTokens`：不应强行扣 cap jitter。
-8. `base_total` 很小：不应生成高 cache。
+8. `base_total` 很小且没有同 scope 历史 cache entry：不应生成高 cache。
 9. `metadata` 有真实 cache：不得覆盖。
 10. `metadata` cache 为 0 但 total 很小、本地估算很大：应使用 `max(metadata_total, local_total)`。
 11. 并发同 scope 请求：不得产生不自洽的负 creation/read。
@@ -278,6 +307,8 @@ credential_id + conversation_id + model
 16. `cache_read + cache_creation >= simulated_total`：必须 clamp，保留至少 1 个 uncached input token。
 17. cap 触顶请求很多：soft cap 应随 profile 变化，不应大量固定同一个值。
 18. profile fingerprint 缺失：使用稳定 fallback jitter，例如 cap 中位扣减，不使用随机。
+19. 同 scope 已建缓存后的连续小请求：可以 read，但必须是 read-only，不能 creation。
+20. local-prompt-cache 小请求：不得使用 high-cache continuity floor。
 
 ## 建议测试清单
 
@@ -285,7 +316,7 @@ credential_id + conversation_id + model
 
 1. 真实 metadata cache 非 0 时不被 scale/cap 覆盖。
 2. metadata cache 为 0 时 high-cache 使用本地模拟。
-3. `base_total = max(metadata_total, local_total)`。
+3. `base_total = max(metadata_total, local_total, continuity_floor)`。
 4. `base_total < promptCacheScaleMinInputTokens` 不启用 scale。
 5. `scaled_total` 未触顶时不扣 cap jitter。
 6. `scaled_total` 触顶时使用 deterministic soft cap。
@@ -296,7 +327,9 @@ credential_id + conversation_id + model
 11. 首次请求 creation，第二次请求 read。
 12. 不同 credential/conversation/model 不共享 read。
 13. Opus min cacheable tokens 保持生效。
-14. 小请求不出现高 cache。
+14. 首次或无历史小请求不出现高 cache。
+15. high-cache 已建缓存后的连续小请求能通过 continuity floor 保持 read。
+16. local-prompt-cache 小请求不使用 continuity floor。
 
 集成测试：
 
@@ -337,6 +370,7 @@ credential_id + conversation_id + model
 1. cache read/write 会明显变大。
 2. 不覆盖真实 cache。
 3. 不污染全局 token 估算。
-4. 短请求不会被夸张放大。
+4. 首次或无历史短请求不会被夸张放大。
 5. 触顶时有 k 级别 deterministic 波动。
 6. 仍保留首次 creation、后续 read 的自然行为。
+7. 已建缓存的连续小请求不会因为本次 input 较小而突然 cache read 归零。

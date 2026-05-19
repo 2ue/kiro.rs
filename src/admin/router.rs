@@ -9,31 +9,15 @@ use super::{
     handlers::{
         add_credential, clear_usage_records, delete_credential, force_refresh_token,
         get_all_credentials, get_credential_balance, get_credentials_page, get_load_balancing_mode,
-        get_usage_records, get_usage_records_page, get_usage_summary, reset_failure_count,
-        set_credential_disabled, set_credential_priority, set_load_balancing_mode,
+        get_usage_records, get_usage_records_page, get_usage_stats, get_usage_summary,
+        list_admin_actions, list_app_config, list_pricing, list_quota_events, reset_failure_count,
+        set_credential_disabled, set_credential_priority, set_load_balancing_mode, sync_pricing,
+        update_app_config,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
 
 /// 创建 Admin API 路由
-///
-/// # 端点
-/// - `GET /credentials` - 获取所有凭据状态
-/// - `GET /credentials-paged` - 分页获取凭据状态
-/// - `POST /credentials` - 添加新凭据
-/// - `DELETE /credentials/:id` - 删除凭据
-/// - `POST /credentials/:id/disabled` - 设置凭据禁用状态
-/// - `POST /credentials/:id/priority` - 设置凭据优先级
-/// - `POST /credentials/:id/reset` - 重置失败计数
-/// - `POST /credentials/:id/refresh` - 强制刷新 Token
-/// - `GET /credentials/:id/balance` - 获取凭据余额
-/// - `GET /config/load-balancing` - 获取负载均衡模式
-/// - `PUT /config/load-balancing` - 设置负载均衡模式
-///
-/// # 认证
-/// 需要 Admin API Key 认证，支持：
-/// - `x-api-key` header
-/// - `Authorization: Bearer <token>` header
 pub fn create_admin_router(state: AdminState) -> Router {
     Router::new()
         .route(
@@ -51,10 +35,16 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/usage-records-paged", get(get_usage_records_page))
         .route("/usage-records/clear", post(clear_usage_records))
         .route("/usage-summary", get(get_usage_summary))
+        .route("/usage-stats", get(get_usage_stats))
+        .route("/quota-events", get(list_quota_events))
+        .route("/admin-actions", get(list_admin_actions))
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
         )
+        .route("/config", get(list_app_config).put(update_app_config))
+        .route("/pricing", get(list_pricing))
+        .route("/pricing/sync", post(sync_pricing))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

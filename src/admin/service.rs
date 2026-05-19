@@ -1,21 +1,21 @@
 //! Admin API 业务逻辑服务
 
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use chrono::Utc;
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::anthropic::{
+    PromptCacheRuntimeConfig,
     prompt_cache::PromptCacheTracker,
     usage::{
         UsageRecordQuery, UsageRecorder, UsageRecordsPageResult, UsageRecordsResult, UsageSummary,
     },
 };
+use crate::app_config::AppConfigService;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::storage::{Db, RedisPool};
 
 use super::error::AdminServiceError;
 use super::types::{
@@ -24,18 +24,34 @@ use super::types::{
     SetLoadBalancingModeRequest,
 };
 
-/// 余额缓存过期时间（秒），5 分钟
-const BALANCE_CACHE_TTL_SECS: i64 = 300;
+const DEFAULT_BALANCE_CACHE_TTL_SECS: i64 = 300;
 const DEFAULT_CREDENTIALS_PAGE_LIMIT: usize = 12;
 const MAX_CREDENTIALS_PAGE_LIMIT: usize = 500;
 
-/// 缓存的余额条目（含时间戳）
+/// Redis 中存储的余额条目(JSON)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedBalance {
-    /// 缓存时间（Unix 秒）
+    /// 缓存时间(Unix 秒,用于前端展示"几分钟前查询")
     cached_at: f64,
     /// 缓存的余额数据
     data: BalanceResponse,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaEventItem {
+    pub id: i64,
+    pub credential_id: i64,
+    pub occurred_at: chrono::DateTime<chrono::Utc>,
+    pub kind: String,
+    pub reason: Option<String>,
+    pub upstream_status: Option<i16>,
+    pub cooldown_until: Option<chrono::DateTime<chrono::Utc>>,
+    pub note: Option<String>,
+}
+
+fn balance_cache_key(id: u64) -> String {
+    format!("kiro_rs:balance:{}", id)
 }
 
 /// Admin 服务
@@ -43,13 +59,17 @@ struct CachedBalance {
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
-    balance_cache: Mutex<HashMap<u64, CachedBalance>>,
-    cache_path: Option<PathBuf>,
-    /// 已注册的端点名称集合（用于 add_credential 校验）
+    /// Redis 句柄,用于 balance 缓存
+    redis: RedisPool,
+    /// app_config 句柄,用于读取 balance_cache_ttl_seconds
+    app_config: Arc<AppConfigService>,
+    /// PG 句柄,用于 quota_events 查询
+    db: Db,
+    /// 已注册的端点名称集合(用于 add_credential 校验)
     known_endpoints: HashSet<String>,
     usage_recorder: Arc<UsageRecorder>,
     prompt_cache: Arc<PromptCacheTracker>,
-    high_cache_threshold: i32,
+    prompt_cache_runtime_config: Arc<PromptCacheRuntimeConfig>,
 }
 
 impl AdminService {
@@ -58,31 +78,39 @@ impl AdminService {
         known_endpoints: impl IntoIterator<Item = String>,
         usage_recorder: Arc<UsageRecorder>,
         prompt_cache: Arc<PromptCacheTracker>,
-        high_cache_threshold: i32,
+        prompt_cache_runtime_config: Arc<PromptCacheRuntimeConfig>,
+        app_config: Arc<AppConfigService>,
+        redis: RedisPool,
+        db: Db,
     ) -> Self {
-        let cache_path = token_manager
-            .cache_dir()
-            .map(|d| d.join("kiro_balance_cache.json"));
-
-        let balance_cache = Self::load_balance_cache_from(&cache_path);
-
         Self {
             token_manager,
-            balance_cache: Mutex::new(balance_cache),
-            cache_path,
+            redis,
+            app_config,
+            db,
             known_endpoints: known_endpoints.into_iter().collect(),
             usage_recorder,
             prompt_cache,
-            high_cache_threshold,
+            prompt_cache_runtime_config,
         }
     }
 
+    /// 失效指定凭据的余额缓存(spawn 一个后台任务做 DEL,失败仅打日志)
     fn invalidate_balance_cache(&self, id: u64) {
-        {
-            let mut cache = self.balance_cache.lock();
-            cache.remove(&id);
-        }
-        self.save_balance_cache();
+        let me_redis = self.redis.clone();
+        tokio::spawn(async move {
+            let key = balance_cache_key(id);
+            match me_redis.get().await {
+                Ok(mut conn) => {
+                    let res: Result<(), _> =
+                        ::redis::cmd("DEL").arg(&key).query_async(&mut *conn).await;
+                    if let Err(err) = res {
+                        tracing::warn!("Redis DEL {} 失败: {}", key, err);
+                    }
+                }
+                Err(err) => tracing::warn!("Redis 取连接失败,跳过缓存失效: {}", err),
+            }
+        });
     }
 
     /// 获取所有凭据状态
@@ -197,35 +225,52 @@ impl AdminService {
         Ok(())
     }
 
-    /// 获取凭据余额（带缓存）
+    /// 获取凭据余额(Redis 缓存,TTL 由 app_config.balance_cache_ttl_seconds 控制)
     pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        // 先查缓存
-        {
-            let cache = self.balance_cache.lock();
-            if let Some(cached) = cache.get(&id) {
-                let now = Utc::now().timestamp() as f64;
-                if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    tracing::debug!("凭据 #{} 余额命中缓存", id);
-                    return Ok(cached.data.clone());
+        let key = balance_cache_key(id);
+        let ttl_secs: i64 = self
+            .app_config
+            .get_as::<i64>("balance_cache_ttl_seconds")
+            .unwrap_or(DEFAULT_BALANCE_CACHE_TTL_SECS)
+            .max(1);
+
+        // 1) 先查 Redis
+        if let Ok(mut conn) = self.redis.get().await {
+            let cached: Result<Option<String>, _> =
+                ::redis::cmd("GET").arg(&key).query_async(&mut *conn).await;
+            if let Ok(Some(json)) = cached {
+                if let Ok(entry) = serde_json::from_str::<CachedBalance>(&json) {
+                    tracing::debug!("凭据 #{} 余额命中 Redis 缓存", id);
+                    return Ok(entry.data);
                 }
             }
         }
 
-        // 缓存未命中或已过期，从上游获取
+        // 2) 缓存未命中,从上游获取
         let balance = self.fetch_balance(id).await?;
 
-        // 更新缓存
-        {
-            let mut cache = self.balance_cache.lock();
-            cache.insert(
-                id,
-                CachedBalance {
-                    cached_at: Utc::now().timestamp() as f64,
-                    data: balance.clone(),
-                },
-            );
+        // 3) 写回 Redis(SETEX)
+        let entry = CachedBalance {
+            cached_at: chrono::Utc::now().timestamp() as f64,
+            data: balance.clone(),
+        };
+        if let Ok(json) = serde_json::to_string(&entry) {
+            match self.redis.get().await {
+                Ok(mut conn) => {
+                    let res: Result<(), _> = ::redis::cmd("SET")
+                        .arg(&key)
+                        .arg(&json)
+                        .arg("EX")
+                        .arg(ttl_secs)
+                        .query_async(&mut *conn)
+                        .await;
+                    if let Err(err) = res {
+                        tracing::warn!("Redis SETEX {} 失败: {}", key, err);
+                    }
+                }
+                Err(err) => tracing::warn!("Redis 取连接失败,跳过缓存写入: {}", err),
+            }
         }
-        self.save_balance_cache();
 
         Ok(balance)
     }
@@ -329,40 +374,48 @@ impl AdminService {
             .delete_credential(id)
             .map_err(|e| self.classify_delete_error(e, id))?;
         self.prompt_cache.clear_credential(id);
-
-        // 清理已删除凭据的余额缓存
-        {
-            let mut cache = self.balance_cache.lock();
-            cache.remove(&id);
-        }
-        self.save_balance_cache();
-
+        self.invalidate_balance_cache(id);
         Ok(())
     }
 
-    /// 查询请求级 usage 记录。
-    pub fn get_usage_records(&self, query: UsageRecordQuery) -> UsageRecordsResult {
-        self.usage_recorder.query(query)
+    /// 查询请求级 usage 记录(优先 PG,失败回退内存)。
+    pub async fn get_usage_records(&self, query: UsageRecordQuery) -> UsageRecordsResult {
+        self.usage_recorder.query_async(query).await
     }
 
-    /// 分页查询请求级 usage 记录。
-    pub fn get_usage_records_page(
+    /// 分页查询请求级 usage 记录(优先 PG,失败回退内存)。
+    pub async fn get_usage_records_page(
         &self,
         query: UsageRecordQuery,
         page: usize,
         limit: usize,
     ) -> UsageRecordsPageResult {
-        self.usage_recorder.query_page(query, page, limit)
+        self.usage_recorder
+            .query_page_async(query, page, limit)
+            .await
     }
 
     /// 获取 usage 汇总。
     pub fn get_usage_summary(&self) -> UsageSummary {
-        self.usage_recorder.summary(self.high_cache_threshold)
+        self.usage_recorder.summary(
+            self.prompt_cache_runtime_config
+                .snapshot()
+                .high_cache_threshold,
+        )
     }
 
     /// 清空 usage 记录。
-    pub fn clear_usage_records(&self) {
-        self.usage_recorder.clear();
+    pub async fn clear_usage_records(&self) -> anyhow::Result<u64> {
+        self.usage_recorder.clear_all().await
+    }
+
+    /// PG 聚合统计(today / 累计 / 按模型 / 按凭据,带与 usage 列表一致的过滤参数)。
+    pub async fn get_usage_stats(
+        &self,
+        db: &crate::storage::Db,
+        filter: &crate::anthropic::usage::UsageStatsFilter,
+    ) -> anyhow::Result<crate::anthropic::usage::UsageStats> {
+        crate::anthropic::usage::query_usage_stats(db, filter).await
     }
 
     /// 获取负载均衡模式
@@ -401,61 +454,55 @@ impl AdminService {
         Ok(())
     }
 
-    // ============ 余额缓存持久化 ============
-
-    fn load_balance_cache_from(cache_path: &Option<PathBuf>) -> HashMap<u64, CachedBalance> {
-        let path = match cache_path {
-            Some(p) => p,
-            None => return HashMap::new(),
+    /// 查询最近 N 条配额事件(供前端凭据详情查看)
+    pub async fn list_quota_events(
+        &self,
+        credential_id: Option<u64>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<QuotaEventItem>> {
+        use sqlx::Row;
+        let limit = limit.clamp(1, 500);
+        let rows = if let Some(id) = credential_id {
+            sqlx::query(
+                "SELECT id, credential_id, occurred_at, kind, reason, upstream_status, \
+                        cooldown_until, note \
+                 FROM quota_events WHERE credential_id = $1 \
+                 ORDER BY occurred_at DESC LIMIT $2",
+            )
+            .bind(id as i64)
+            .bind(limit)
+            .fetch_all(&self.db)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT id, credential_id, occurred_at, kind, reason, upstream_status, \
+                        cooldown_until, note \
+                 FROM quota_events ORDER BY occurred_at DESC LIMIT $1",
+            )
+            .bind(limit)
+            .fetch_all(&self.db)
+            .await?
         };
-
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => return HashMap::new(),
-        };
-
-        // 文件中使用字符串 key 以兼容 JSON 格式
-        let map: HashMap<String, CachedBalance> = match serde_json::from_str(&content) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("解析余额缓存失败，将忽略: {}", e);
-                return HashMap::new();
-            }
-        };
-
-        let now = Utc::now().timestamp() as f64;
-        map.into_iter()
-            .filter_map(|(k, v)| {
-                let id = k.parse::<u64>().ok()?;
-                // 丢弃超过 TTL 的条目
-                if (now - v.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    Some((id, v))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    fn save_balance_cache(&self) {
-        let path = match &self.cache_path {
-            Some(p) => p,
-            None => return,
-        };
-
-        // 持有锁期间完成序列化和写入，防止并发损坏
-        let cache = self.balance_cache.lock();
-        let map: HashMap<String, &CachedBalance> =
-            cache.iter().map(|(k, v)| (k.to_string(), v)).collect();
-
-        match serde_json::to_string_pretty(&map) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
-                    tracing::warn!("保存余额缓存失败: {}", e);
-                }
-            }
-            Err(e) => tracing::warn!("序列化余额缓存失败: {}", e),
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push(QuotaEventItem {
+                id: r.try_get::<i64, _>("id")?,
+                credential_id: r.try_get::<i64, _>("credential_id")?,
+                occurred_at: r.try_get::<chrono::DateTime<chrono::Utc>, _>("occurred_at")?,
+                kind: r.try_get("kind")?,
+                reason: r.try_get("reason").ok(),
+                upstream_status: r
+                    .try_get::<Option<i16>, _>("upstream_status")
+                    .ok()
+                    .flatten(),
+                cooldown_until: r
+                    .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("cooldown_until")
+                    .ok()
+                    .flatten(),
+                note: r.try_get("note").ok(),
+            });
         }
+        Ok(out)
     }
 
     // ============ 错误分类 ============

@@ -7,6 +7,8 @@
   "kiroVersion": "0.11.107",
   "nodeVersion": "22.22.0",
   "adminApiKey": "sk-admin-your-secret-key",
+  "databaseUrl": "postgres://kiro_rs:kiro_rs_dev_pwd@127.0.0.1:5433/kiro_rs",
+  "redisUrl": "redis://127.0.0.1:6380/0",
   "loadBalancingMode": "priority",
   "compatProfile": "claude-code",
   "extractThinking": true,

@@ -29,9 +29,11 @@ mod handlers;
 mod middleware;
 pub(crate) mod prompt_cache;
 mod router;
+mod runtime_config;
 mod stream;
 pub mod types;
 pub(crate) mod usage;
 mod websearch;
 
 pub use router::create_router_with_provider;
+pub(crate) use runtime_config::{PromptCacheRuntimeConfig, PromptCacheRuntimeConfigSnapshot};

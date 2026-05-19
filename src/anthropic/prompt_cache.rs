@@ -86,6 +86,12 @@ pub struct PromptCacheUsage {
     pub effective_cache_ratio: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PromptCacheComputation {
+    pub usage: PromptCacheUsage,
+    pub simulated_total_input_floor_tokens: Option<i32>,
+}
+
 #[derive(Debug, Default)]
 pub struct PromptCacheTracker {
     entries: Mutex<HashMap<PromptCacheScope, HashMap<[u8; 32], PromptCacheEntry>>>,
@@ -237,6 +243,110 @@ impl PromptCacheTracker {
         }
     }
 
+    pub fn compute_high_cache(
+        &self,
+        scope: Option<PromptCacheScope>,
+        profile: Option<&PromptCacheProfile>,
+        target_read_ratio: f64,
+    ) -> PromptCacheComputation {
+        let Some(scope) = scope else {
+            return PromptCacheComputation::default();
+        };
+        let Some(profile) = profile else {
+            return PromptCacheComputation::default();
+        };
+        if profile.breakpoints.is_empty() {
+            return PromptCacheComputation::default();
+        }
+
+        let min_tokens = min_cacheable_tokens_for_model(&profile.model);
+        let effective_ratio = effective_cache_read_ratio(profile, target_read_ratio);
+        let target_tokens =
+            target_cache_tokens(profile.total_input_tokens, effective_ratio, min_tokens);
+        if effective_ratio <= 0.0 {
+            return PromptCacheComputation::default();
+        }
+
+        let now = Utc::now();
+        let mut entries_by_scope = self.entries.lock();
+        prune_expired_locked(&mut entries_by_scope, now);
+
+        let Some(entries) = entries_by_scope.get_mut(&scope) else {
+            if target_tokens <= 0 {
+                return PromptCacheComputation::default();
+            }
+            let (cache5m, cache1h) = target_ttl_breakdown(profile, target_tokens);
+            return PromptCacheComputation {
+                usage: PromptCacheUsage {
+                    cache_creation_input_tokens: target_tokens,
+                    cache_read_input_tokens: 0,
+                    cache_creation_5m_input_tokens: cache5m,
+                    cache_creation_1h_input_tokens: cache1h,
+                    effective_cache_ratio: Some(effective_ratio),
+                },
+                simulated_total_input_floor_tokens: None,
+            };
+        };
+
+        let mut matched_tokens = 0;
+        for point in profile.lookup_points.iter().rev() {
+            if point.cumulative_tokens < min_tokens {
+                continue;
+            }
+            let Some(entry) = entries.get_mut(&point.fingerprint) else {
+                continue;
+            };
+            if entry.expires_at <= now {
+                continue;
+            }
+            entry.expires_at = now + chrono::Duration::from_std(entry.ttl).unwrap_or_default();
+            matched_tokens = entry.cached_tokens.min(target_tokens).max(0);
+            break;
+        }
+
+        if matched_tokens > 0 {
+            let creation = (target_tokens - matched_tokens).max(0);
+            let (cache5m, cache1h) = target_ttl_breakdown(profile, creation);
+            return PromptCacheComputation {
+                usage: PromptCacheUsage {
+                    cache_creation_input_tokens: creation,
+                    cache_read_input_tokens: matched_tokens,
+                    cache_creation_5m_input_tokens: cache5m,
+                    cache_creation_1h_input_tokens: cache1h,
+                    effective_cache_ratio: Some(effective_ratio),
+                },
+                simulated_total_input_floor_tokens: None,
+            };
+        }
+
+        let best_existing_tokens = best_cache_entry_tokens(entries, now, min_tokens).unwrap_or(0);
+        let should_use_continuity = best_existing_tokens > 0
+            && (target_tokens <= 0 || target_tokens < best_existing_tokens);
+        if should_use_continuity {
+            if let Some(computation) =
+                high_cache_continuity_computation(entries, now, min_tokens, effective_ratio)
+            {
+                return computation;
+            }
+        }
+
+        if target_tokens <= 0 {
+            return PromptCacheComputation::default();
+        }
+
+        let (cache5m, cache1h) = target_ttl_breakdown(profile, target_tokens);
+        PromptCacheComputation {
+            usage: PromptCacheUsage {
+                cache_creation_input_tokens: target_tokens,
+                cache_read_input_tokens: 0,
+                cache_creation_5m_input_tokens: cache5m,
+                cache_creation_1h_input_tokens: cache1h,
+                effective_cache_ratio: Some(effective_ratio),
+            },
+            simulated_total_input_floor_tokens: None,
+        }
+    }
+
     pub fn update(
         &self,
         scope: Option<PromptCacheScope>,
@@ -306,6 +416,50 @@ impl PromptCacheTracker {
             .lock()
             .retain(|scope, _| scope.credential_id != credential_id);
     }
+}
+
+fn best_cache_entry_tokens(
+    entries: &HashMap<[u8; 32], PromptCacheEntry>,
+    now: DateTime<Utc>,
+    min_tokens: i32,
+) -> Option<i32> {
+    entries
+        .values()
+        .filter(|entry| entry.expires_at > now && entry.cached_tokens >= min_tokens)
+        .map(|entry| entry.cached_tokens)
+        .max()
+}
+
+fn high_cache_continuity_computation(
+    entries: &mut HashMap<[u8; 32], PromptCacheEntry>,
+    now: DateTime<Utc>,
+    min_tokens: i32,
+    effective_ratio: f64,
+) -> Option<PromptCacheComputation> {
+    let best_key = entries
+        .iter()
+        .filter(|(_, entry)| entry.expires_at > now && entry.cached_tokens >= min_tokens)
+        .max_by_key(|(_, entry)| entry.cached_tokens)
+        .map(|(key, _)| *key)?;
+    let entry = entries.get_mut(&best_key)?;
+    entry.expires_at = now + chrono::Duration::from_std(entry.ttl).unwrap_or_default();
+
+    let read_tokens = entry.cached_tokens.max(0);
+    if read_tokens <= 0 {
+        return None;
+    }
+    let floor_tokens = ((read_tokens as f64) / effective_ratio).ceil() as i32;
+
+    Some(PromptCacheComputation {
+        usage: PromptCacheUsage {
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: read_tokens,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+            effective_cache_ratio: Some(effective_ratio),
+        },
+        simulated_total_input_floor_tokens: Some(floor_tokens.max(read_tokens + 1)),
+    })
 }
 
 #[derive(Debug)]
@@ -719,6 +873,118 @@ mod tests {
         tracker.update(Some(scope.clone()), Some(&profile), 0.95);
         let second = tracker.compute(Some(scope), Some(&profile), 0.95);
         assert!(second.cache_read_input_tokens > 0);
+    }
+
+    #[test]
+    fn high_cache_continuity_reads_existing_entry_for_small_followup() {
+        let tracker = PromptCacheTracker::default();
+        let large_req = request("stable high-cache context ".repeat(900));
+        let large_profile = tracker
+            .build_high_cache_profile(&large_req, 12_000)
+            .expect("high-cache should synthesize a profile");
+        let scope = PromptCacheScope {
+            credential_id: 1,
+            conversation_id: "high-cache-continuity".to_string(),
+            model: large_req.model.clone(),
+        };
+
+        let first = tracker.compute_high_cache(Some(scope.clone()), Some(&large_profile), 0.98);
+        assert!(first.usage.cache_creation_input_tokens > 0);
+        tracker.update(Some(scope.clone()), Some(&large_profile), 0.98);
+
+        let small_req = request("tiny followup".to_string());
+        let small_profile = tracker
+            .build_high_cache_profile(&small_req, 128)
+            .expect("high-cache should synthesize a profile for small followup");
+        let second = tracker.compute_high_cache(Some(scope), Some(&small_profile), 0.98);
+
+        assert!(second.usage.cache_read_input_tokens > 0);
+        assert_eq!(second.usage.cache_creation_input_tokens, 0);
+        assert!(
+            second
+                .simulated_total_input_floor_tokens
+                .is_some_and(|floor| floor > second.usage.cache_read_input_tokens)
+        );
+    }
+
+    #[test]
+    fn high_cache_continuity_reads_existing_entry_when_followup_is_above_min_tokens() {
+        let tracker = PromptCacheTracker::default();
+        let large_req = request("stable high-cache context ".repeat(900));
+        let large_profile = tracker
+            .build_high_cache_profile(&large_req, 12_000)
+            .expect("high-cache should synthesize a profile");
+        let scope = PromptCacheScope {
+            credential_id: 1,
+            conversation_id: "high-cache-continuity-above-min".to_string(),
+            model: large_req.model.clone(),
+        };
+        tracker.update(Some(scope.clone()), Some(&large_profile), 0.98);
+
+        let followup_req = request("different followup content ".repeat(500));
+        let followup_profile = tracker
+            .build_high_cache_profile(&followup_req, 4_096)
+            .expect("high-cache should synthesize a followup profile");
+        let usage = tracker.compute_high_cache(Some(scope), Some(&followup_profile), 0.98);
+
+        assert!(usage.usage.cache_read_input_tokens > 0);
+        assert_eq!(usage.usage.cache_creation_input_tokens, 0);
+        assert!(
+            usage
+                .simulated_total_input_floor_tokens
+                .is_some_and(|floor| floor > usage.usage.cache_read_input_tokens)
+        );
+    }
+
+    #[test]
+    fn high_cache_small_first_request_does_not_invent_cache() {
+        let tracker = PromptCacheTracker::default();
+        let small_req = request("tiny first request".to_string());
+        let small_profile = tracker
+            .build_high_cache_profile(&small_req, 128)
+            .expect("high-cache should synthesize a profile");
+        let scope = PromptCacheScope {
+            credential_id: 1,
+            conversation_id: "high-cache-small-first".to_string(),
+            model: small_req.model.clone(),
+        };
+
+        let usage = tracker.compute_high_cache(Some(scope), Some(&small_profile), 0.98);
+
+        assert_eq!(usage, PromptCacheComputation::default());
+    }
+
+    #[test]
+    fn local_prompt_cache_small_followup_keeps_strict_behavior() {
+        let tracker = PromptCacheTracker::default();
+        let mut req = request("cacheable strict context ".repeat(900));
+        req.messages[0].content = json!([
+            {
+                "type": "text",
+                "text": "cacheable strict context ".repeat(900),
+                "cache_control": {"type": "ephemeral"}
+            }
+        ]);
+        let profile = tracker.build_profile(&req, 12_000).unwrap();
+        let scope = PromptCacheScope {
+            credential_id: 1,
+            conversation_id: "local-strict-small".to_string(),
+            model: req.model.clone(),
+        };
+        tracker.update(Some(scope.clone()), Some(&profile), 0.98);
+
+        let mut small_req = request("tiny strict followup".to_string());
+        small_req.messages[0].content = json!([
+            {
+                "type": "text",
+                "text": "tiny strict followup",
+                "cache_control": {"type": "ephemeral"}
+            }
+        ]);
+        let small_profile = tracker.build_profile(&small_req, 128).unwrap();
+        let usage = tracker.compute(Some(scope), Some(&small_profile), 0.98);
+
+        assert_eq!(usage, PromptCacheUsage::default());
     }
 
     #[test]

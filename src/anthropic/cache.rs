@@ -131,6 +131,7 @@ pub struct CacheSimulation {
     pub cache_creation_1h_input_tokens: i32,
     pub target_cache_ratio: Option<f64>,
     pub amplification: Option<CacheAmplification>,
+    pub simulated_total_input_floor_tokens: Option<i32>,
 }
 
 impl CacheSimulation {
@@ -146,6 +147,7 @@ impl CacheSimulation {
             cache_creation_1h_input_tokens: usage.cache_creation_1h_input_tokens.max(0),
             target_cache_ratio: usage.effective_cache_ratio,
             amplification: None,
+            simulated_total_input_floor_tokens: None,
         };
         (!simulation.is_empty()).then_some(simulation)
     }
@@ -169,11 +171,30 @@ impl CacheSimulation {
         Some(simulation)
     }
 
+    pub fn from_prompt_cache_with_ratio_amplification_and_floor(
+        usage: PromptCacheUsage,
+        target_cache_ratio: f64,
+        amplification: Option<CacheAmplification>,
+        simulated_total_input_floor_tokens: Option<i32>,
+    ) -> Option<Self> {
+        let mut simulation = Self::from_prompt_cache_with_ratio_and_amplification(
+            usage,
+            target_cache_ratio,
+            amplification,
+        )?;
+        simulation.simulated_total_input_floor_tokens =
+            simulated_total_input_floor_tokens.map(|tokens| tokens.max(0));
+        Some(simulation)
+    }
+
     pub fn to_usage(self, total_input_tokens: i32, output_tokens: i32) -> CacheUsage {
+        let base_total_input_tokens = total_input_tokens
+            .max(self.simulated_total_input_floor_tokens.unwrap_or(0))
+            .max(0);
         let total_input_tokens = self
             .amplification
-            .map(|amplification| amplification.apply(total_input_tokens))
-            .unwrap_or_else(|| total_input_tokens.max(0));
+            .map(|amplification| amplification.apply(base_total_input_tokens))
+            .unwrap_or(base_total_input_tokens);
         if let Some(target_ratio) = self.target_cache_ratio {
             return self.to_target_ratio_usage(total_input_tokens, output_tokens, target_ratio);
         }
@@ -564,6 +585,29 @@ mod tests {
         assert_eq!(usage.total_input_tokens, 4_096);
         assert_eq!(usage.cache_read_input_tokens, 3_891);
         assert_eq!(usage.input_tokens, 205);
+    }
+
+    #[test]
+    fn simulated_floor_prevents_small_high_cache_reads_from_collapsing() {
+        let amplification = CacheAmplification::new(1.6, 300_000, 12_000, 24_000, 20_000, 42);
+        let usage = CacheSimulation::from_prompt_cache_with_ratio_amplification_and_floor(
+            PromptCacheUsage {
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 180_000,
+                cache_creation_5m_input_tokens: 0,
+                cache_creation_1h_input_tokens: 0,
+                effective_cache_ratio: Some(0.98),
+            },
+            0.98,
+            Some(amplification),
+            Some(184_000),
+        )
+        .unwrap()
+        .to_usage(512, 1);
+
+        assert!(usage.total_input_tokens > 250_000);
+        assert!(usage.cache_read_input_tokens > 240_000);
+        assert_ne!(usage.total_input_tokens, 300_000);
     }
 
     #[test]

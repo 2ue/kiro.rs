@@ -31,6 +31,7 @@ use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::time::{Instant, interval, sleep_until};
 
+use super::PromptCacheRuntimeConfigSnapshot;
 use super::converter::{
     ConversionError, ConverterOptions, convert_request_with_options,
     extract_metadata_conversation_id, extract_stable_conversation_id,
@@ -72,6 +73,10 @@ struct RequestUsageContext {
     simulated_usage: Option<super::cache::CacheSimulation>,
     simulated_source: Option<UsageSource>,
     started_at: Instant,
+    /// 客户端 User-Agent(自 v2026.4)
+    client_user_agent: Option<String>,
+    /// 客户端 IP(自 v2026.4)
+    client_ip: Option<String>,
 }
 
 #[derive(Clone)]
@@ -281,6 +286,10 @@ impl CredentialUsageContext {
             fallback_from_sticky: self.fallback_from_sticky,
             error_type,
             error_message,
+            client_user_agent: self.request.client_user_agent.clone(),
+            client_ip: self.request.client_ip.clone(),
+            request_id: Some(self.request.request_id.clone()),
+            cost_usd: None,
         });
     }
 }
@@ -720,23 +729,27 @@ fn is_blocked_ip(addr: &std::net::IpAddr) -> bool {
 
 fn prepare_usage_context(
     state: &AppState,
+    prompt_cache_config: PromptCacheRuntimeConfigSnapshot,
     endpoint: &'static str,
     stream: bool,
     payload: &MessagesRequest,
     conversation_id: Option<String>,
     stable_conversation_id: Option<String>,
     input_tokens: i32,
+    client_user_agent: Option<String>,
+    client_ip: Option<String>,
 ) -> RequestUsageContext {
-    let prompt_cache_profile =
-        if state.prompt_cache_simulation_mode == PromptCacheSimulationMode::HighCache {
-            state
-                .prompt_cache
-                .build_high_cache_profile(payload, input_tokens)
-        } else {
-            state.prompt_cache.build_profile(payload, input_tokens)
-        };
+    let prompt_cache_profile = if prompt_cache_config.prompt_cache_simulation_mode
+        == PromptCacheSimulationMode::HighCache
+    {
+        state
+            .prompt_cache
+            .build_high_cache_profile(payload, input_tokens)
+    } else {
+        state.prompt_cache.build_profile(payload, input_tokens)
+    };
     let (simulated_usage, simulated_source) = build_simulated_usage(
-        state,
+        prompt_cache_config.prompt_cache_simulation_mode,
         stable_conversation_id.as_deref(),
         prompt_cache_profile.as_ref(),
     );
@@ -752,16 +765,20 @@ fn prepare_usage_context(
         prompt_cache_scope_conversation_id: stable_conversation_id,
         input_tokens,
         prompt_cache_profile,
-        simulation_mode: state.prompt_cache_simulation_mode,
-        prompt_cache_target_read_ratio: state.prompt_cache_target_read_ratio,
-        prompt_cache_token_scale: state.prompt_cache_token_scale,
-        prompt_cache_max_simulated_input_tokens: state.prompt_cache_max_simulated_input_tokens,
-        prompt_cache_cap_jitter_min_tokens: state.prompt_cache_cap_jitter_min_tokens,
-        prompt_cache_cap_jitter_max_tokens: state.prompt_cache_cap_jitter_max_tokens,
-        prompt_cache_scale_min_input_tokens: state.prompt_cache_scale_min_input_tokens,
+        simulation_mode: prompt_cache_config.prompt_cache_simulation_mode,
+        prompt_cache_target_read_ratio: prompt_cache_config.prompt_cache_target_read_ratio,
+        prompt_cache_token_scale: prompt_cache_config.prompt_cache_token_scale,
+        prompt_cache_max_simulated_input_tokens: prompt_cache_config
+            .prompt_cache_max_simulated_input_tokens,
+        prompt_cache_cap_jitter_min_tokens: prompt_cache_config.prompt_cache_cap_jitter_min_tokens,
+        prompt_cache_cap_jitter_max_tokens: prompt_cache_config.prompt_cache_cap_jitter_max_tokens,
+        prompt_cache_scale_min_input_tokens: prompt_cache_config
+            .prompt_cache_scale_min_input_tokens,
         simulated_usage,
         simulated_source,
         started_at: Instant::now(),
+        client_user_agent,
+        client_ip,
     }
 }
 
@@ -776,12 +793,40 @@ fn prompt_cache_scope_conversation_id(
     }
 }
 
+/// 从 HTTP 请求头提取客户端 User-Agent 与 IP。
+///
+/// IP 解析顺序:`x-real-ip` → `x-forwarded-for` 第一段 → 无。
+/// User-Agent 直接取 `user-agent` 头。值为空字符串时返回 None。
+fn extract_client_meta(headers: &HeaderMap) -> (Option<String>, Option<String>) {
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let ip = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            headers
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.split(',').next().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+        });
+
+    (ua, ip)
+}
+
 fn build_simulated_usage(
-    state: &AppState,
+    simulation_mode: PromptCacheSimulationMode,
     conversation_id: Option<&str>,
     prompt_cache_profile: Option<&PromptCacheProfile>,
 ) -> (Option<super::cache::CacheSimulation>, Option<UsageSource>) {
-    match state.prompt_cache_simulation_mode {
+    match simulation_mode {
         PromptCacheSimulationMode::Disabled => (None, None),
         PromptCacheSimulationMode::LocalPromptCache | PromptCacheSimulationMode::HighCache => {
             if conversation_id.is_none() {
@@ -807,34 +852,51 @@ fn prepare_credential_usage_context(
     fallback_from_sticky: bool,
 ) -> CredentialUsageContext {
     let mut usage_context = usage_context;
+    let scope = usage_context
+        .prompt_cache_scope_conversation_id
+        .as_ref()
+        .map(|conversation_id| PromptCacheScope {
+            credential_id,
+            conversation_id: conversation_id.clone(),
+            model: usage_context.model.clone(),
+        });
+    match usage_context.simulation_mode {
+        PromptCacheSimulationMode::Disabled => {}
+        PromptCacheSimulationMode::LocalPromptCache => {
+            let prompt_usage = usage_context.prompt_cache.compute(
+                scope,
+                usage_context.prompt_cache_profile.as_ref(),
+                usage_context.prompt_cache_target_read_ratio,
+            );
+            usage_context.simulated_usage =
+                super::cache::CacheSimulation::from_prompt_cache_with_ratio_and_amplification(
+                    prompt_usage,
+                    usage_context.prompt_cache_target_read_ratio,
+                    usage_context.cache_amplification(),
+                );
+        }
+        PromptCacheSimulationMode::HighCache => {
+            let computation = usage_context.prompt_cache.compute_high_cache(
+                scope,
+                usage_context.prompt_cache_profile.as_ref(),
+                usage_context.prompt_cache_target_read_ratio,
+            );
+            usage_context.simulated_usage =
+                super::cache::CacheSimulation::from_prompt_cache_with_ratio_amplification_and_floor(
+                    computation.usage,
+                    usage_context.prompt_cache_target_read_ratio,
+                    usage_context.cache_amplification(),
+                    computation.simulated_total_input_floor_tokens,
+                );
+        }
+    }
     if matches!(
         usage_context.simulation_mode,
         PromptCacheSimulationMode::LocalPromptCache | PromptCacheSimulationMode::HighCache
     ) {
-        let scope = usage_context
-            .prompt_cache_scope_conversation_id
-            .as_ref()
-            .map(|conversation_id| PromptCacheScope {
-                credential_id,
-                conversation_id: conversation_id.clone(),
-                model: usage_context.model.clone(),
-            });
-        let prompt_usage = usage_context.prompt_cache.compute(
-            scope,
-            usage_context.prompt_cache_profile.as_ref(),
-            usage_context.prompt_cache_target_read_ratio,
-        );
-        usage_context.simulated_usage =
-            super::cache::CacheSimulation::from_prompt_cache_with_ratio_and_amplification(
-                prompt_usage,
-                usage_context.prompt_cache_target_read_ratio,
-                usage_context.cache_amplification(),
-            );
-        if usage_context.simulated_usage.is_some() {
-            usage_context.simulated_source = Some(UsageSource::LocalPromptCache);
-        } else {
-            usage_context.simulated_source = None;
-        }
+        usage_context.simulated_source = usage_context
+            .simulated_usage
+            .map(|_| UsageSource::LocalPromptCache);
     }
 
     usage_context.attach_credential(
@@ -886,6 +948,34 @@ fn map_provider_error(err: Error, request_id: Option<&str>) -> Response {
             )
         };
     }
+
+    // 全凭据用尽 / 全凭据无法获取 token —— 503 Service Unavailable + Retry-After
+    if err_str.contains("所有凭据已用尽")
+        || err_str.contains("所有凭据均无法")
+        || err_str.contains("所有凭据均已禁用")
+    {
+        tracing::warn!(error = %err, "凭据池暂时全部不可用,返回 503 引导客户端重试");
+        let mut response = if let Some(request_id) = request_id {
+            envelope::error_response_with_id(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overloaded_error",
+                "All upstream credentials are temporarily unavailable. Please retry shortly.",
+                request_id,
+            )
+        } else {
+            envelope::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overloaded_error",
+                "All upstream credentials are temporarily unavailable. Please retry shortly.",
+            )
+        };
+        // 30 秒重试,与默认 quota_cooldown_minutes 配合
+        if let Ok(value) = axum::http::HeaderValue::from_str("30") {
+            response.headers_mut().insert("retry-after", value);
+        }
+        return response;
+    }
+
     tracing::error!("Kiro API 调用失败: {}", err);
     if let Some(request_id) = request_id {
         envelope::error_response_with_id(
@@ -1164,12 +1254,14 @@ pub async fn post_messages(
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
+    let prompt_cache_config = state.prompt_cache_runtime_config.snapshot();
+
     // 转换请求
     let conversion_result = match convert_request_with_options(
         &payload,
         ConverterOptions {
             compat_profile: state.compat_profile,
-            prompt_cache_simulation_mode: state.prompt_cache_simulation_mode,
+            prompt_cache_simulation_mode: prompt_cache_config.prompt_cache_simulation_mode,
         },
     ) {
         Ok(result) => result,
@@ -1206,14 +1298,21 @@ pub async fn post_messages(
         payload.messages.clone(),
         payload.tools.clone(),
     ) as i32;
+    let (client_ua, client_ip) = extract_client_meta(&headers);
     let usage_context = prepare_usage_context(
         &state,
+        prompt_cache_config,
         "/v1/messages",
         payload.stream,
         &payload,
         Some(kiro_request.conversation_state.conversation_id.clone()),
-        prompt_cache_scope_conversation_id(state.prompt_cache_simulation_mode, &payload),
+        prompt_cache_scope_conversation_id(
+            prompt_cache_config.prompt_cache_simulation_mode,
+            &payload,
+        ),
         input_tokens,
+        client_ua,
+        client_ip,
     );
 
     // 检查是否启用了thinking
@@ -1950,12 +2049,14 @@ pub async fn post_messages_cc(
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
+    let prompt_cache_config = state.prompt_cache_runtime_config.snapshot();
+
     // 转换请求
     let conversion_result = match convert_request_with_options(
         &payload,
         ConverterOptions {
             compat_profile: state.compat_profile,
-            prompt_cache_simulation_mode: state.prompt_cache_simulation_mode,
+            prompt_cache_simulation_mode: prompt_cache_config.prompt_cache_simulation_mode,
         },
     ) {
         Ok(result) => result,
@@ -1992,14 +2093,21 @@ pub async fn post_messages_cc(
         payload.messages.clone(),
         payload.tools.clone(),
     ) as i32;
+    let (client_ua_cc, client_ip_cc) = extract_client_meta(&headers);
     let usage_context = prepare_usage_context(
         &state,
+        prompt_cache_config,
         "/cc/v1/messages",
         payload.stream,
         &payload,
         Some(kiro_request.conversation_state.conversation_id.clone()),
-        prompt_cache_scope_conversation_id(state.prompt_cache_simulation_mode, &payload),
+        prompt_cache_scope_conversation_id(
+            prompt_cache_config.prompt_cache_simulation_mode,
+            &payload,
+        ),
         input_tokens,
+        client_ua_cc,
+        client_ip_cc,
     );
 
     // 检查是否启用了thinking
@@ -2051,12 +2159,32 @@ pub async fn post_messages_cc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::anthropic::PromptCacheRuntimeConfig;
     use crate::anthropic::cache::{self, CacheUsage};
     use crate::anthropic::prompt_cache::PromptCacheTracker;
     use crate::anthropic::types::{Message, SystemMessage};
     use crate::anthropic::usage::UsageRecorder;
     use crate::kiro::model::events::MetadataTokenUsage;
     use serde_json::json;
+    use std::sync::Arc;
+
+    fn test_prompt_cache_runtime_config(
+        mode: PromptCacheSimulationMode,
+        ratio: f64,
+    ) -> Arc<PromptCacheRuntimeConfig> {
+        Arc::new(PromptCacheRuntimeConfig::new(
+            PromptCacheRuntimeConfigSnapshot {
+                prompt_cache_simulation_mode: mode,
+                prompt_cache_target_read_ratio: ratio,
+                prompt_cache_token_scale: 1.0,
+                prompt_cache_max_simulated_input_tokens: 0,
+                prompt_cache_cap_jitter_min_tokens: 0,
+                prompt_cache_cap_jitter_max_tokens: 0,
+                prompt_cache_scale_min_input_tokens: 0,
+                high_cache_threshold: 10_000,
+            },
+        ))
+    }
 
     fn messages_request_for_model(model: &str) -> MessagesRequest {
         MessagesRequest {
@@ -2169,6 +2297,8 @@ mod tests {
             simulated_usage: None,
             simulated_source: Some(UsageSource::LocalPromptCache),
             started_at: Instant::now(),
+            client_user_agent: None,
+            client_ip: None,
         }
         .attach_credential(Some(1), None, false, false);
         let usage = CacheUsage {
@@ -2240,9 +2370,12 @@ mod tests {
                 cache_creation_1h_input_tokens: 0,
                 target_cache_ratio: Some(0.95),
                 amplification: None,
+                simulated_total_input_floor_tokens: None,
             }),
             simulated_source: Some(UsageSource::LocalPromptCache),
             started_at: Instant::now(),
+            client_user_agent: None,
+            client_ip: None,
         }
         .attach_credential(Some(1), None, false, false);
         let metadata = MetadataTokenUsage {
@@ -2282,8 +2415,7 @@ mod tests {
             true,
             usage_recorder,
             prompt_cache,
-            PromptCacheSimulationMode::HighCache,
-            0.95,
+            test_prompt_cache_runtime_config(PromptCacheSimulationMode::HighCache, 0.95),
             CompatProfile::ClaudeCode,
             false,
         );
@@ -2309,12 +2441,15 @@ mod tests {
             extract_stable_conversation_id(&first_payload).expect("fallback id");
         let first_context = prepare_usage_context(
             &state,
+            state.prompt_cache_runtime_config.snapshot(),
             "/v1/messages",
             false,
             &first_payload,
             Some(first_conversation_id.clone()),
             Some(first_conversation_id.clone()),
             4096,
+            None,
+            None,
         );
         let first_usage = attach_test_credential_usage(first_context, 1);
         let first_usage_body = cache::build_usage_with_simulation_policy(
@@ -2364,12 +2499,15 @@ mod tests {
 
         let second_context = prepare_usage_context(
             &state,
+            state.prompt_cache_runtime_config.snapshot(),
             "/v1/messages",
             false,
             &second_payload,
             Some(second_conversation_id.clone()),
             Some(second_conversation_id),
             8192,
+            None,
+            None,
         );
         let second_usage = attach_test_credential_usage(second_context, 1);
         let second_usage_body = cache::build_usage_with_simulation_policy(
@@ -2396,8 +2534,7 @@ mod tests {
             true,
             usage_recorder,
             prompt_cache.clone(),
-            PromptCacheSimulationMode::LocalPromptCache,
-            0.95,
+            test_prompt_cache_runtime_config(PromptCacheSimulationMode::LocalPromptCache, 0.95),
             CompatProfile::ClaudeCode,
             false,
         );
@@ -2424,19 +2561,29 @@ mod tests {
         };
         let profile = prompt_cache.build_profile(&payload, 4096);
 
-        let (simulation, source) = build_simulated_usage(&state, None, profile.as_ref());
+        let (simulation, source) = build_simulated_usage(
+            PromptCacheSimulationMode::LocalPromptCache,
+            None,
+            profile.as_ref(),
+        );
 
         assert!(simulation.is_none());
         assert!(source.is_none());
 
         let context = prepare_usage_context(
             &state,
+            state.prompt_cache_runtime_config.snapshot(),
             "/v1/messages",
             true,
             &payload,
             Some("random-conversation".to_string()),
-            prompt_cache_scope_conversation_id(state.prompt_cache_simulation_mode, &payload),
+            prompt_cache_scope_conversation_id(
+                PromptCacheSimulationMode::LocalPromptCache,
+                &payload,
+            ),
             4096,
+            None,
+            None,
         );
         assert!(context.prompt_cache_profile.is_some());
         assert!(context.prompt_cache_scope_conversation_id.is_none());
@@ -2458,17 +2605,34 @@ mod tests {
                 conversation_id: conversation_id.clone(),
                 model: usage_context.model.clone(),
             });
-        let prompt_usage = usage_context.prompt_cache.compute(
-            scope,
-            usage_context.prompt_cache_profile.as_ref(),
-            usage_context.prompt_cache_target_read_ratio,
-        );
-        usage_context.simulated_usage =
-            cache::CacheSimulation::from_prompt_cache_with_ratio_and_amplification(
-                prompt_usage,
-                usage_context.prompt_cache_target_read_ratio,
-                usage_context.cache_amplification(),
-            );
+        usage_context.simulated_usage = match usage_context.simulation_mode {
+            PromptCacheSimulationMode::Disabled => None,
+            PromptCacheSimulationMode::LocalPromptCache => {
+                let prompt_usage = usage_context.prompt_cache.compute(
+                    scope,
+                    usage_context.prompt_cache_profile.as_ref(),
+                    usage_context.prompt_cache_target_read_ratio,
+                );
+                cache::CacheSimulation::from_prompt_cache_with_ratio_and_amplification(
+                    prompt_usage,
+                    usage_context.prompt_cache_target_read_ratio,
+                    usage_context.cache_amplification(),
+                )
+            }
+            PromptCacheSimulationMode::HighCache => {
+                let computation = usage_context.prompt_cache.compute_high_cache(
+                    scope,
+                    usage_context.prompt_cache_profile.as_ref(),
+                    usage_context.prompt_cache_target_read_ratio,
+                );
+                cache::CacheSimulation::from_prompt_cache_with_ratio_amplification_and_floor(
+                    computation.usage,
+                    usage_context.prompt_cache_target_read_ratio,
+                    usage_context.cache_amplification(),
+                    computation.simulated_total_input_floor_tokens,
+                )
+            }
+        };
         usage_context.simulated_source = usage_context
             .simulated_usage
             .map(|_| UsageSource::LocalPromptCache);
@@ -2484,8 +2648,7 @@ mod tests {
             true,
             usage_recorder,
             prompt_cache,
-            PromptCacheSimulationMode::Disabled,
-            0.85,
+            test_prompt_cache_runtime_config(PromptCacheSimulationMode::Disabled, 0.85),
             CompatProfile::AnthropicStrict,
             true,
         );

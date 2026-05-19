@@ -496,10 +496,45 @@ Admin UI 本地开发时还可以用 `VITE_API_PROXY_TARGET` 覆盖 Vite 代理�
   - `POST /api/admin/credentials/:id/disabled` - 设置凭据禁用状态
   - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
   - `POST /api/admin/credentials/:id/reset` - 重置失败计数
-  - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
+  - `GET /api/admin/credentials/:id/balance` - 获取凭据余额(Redis 缓存,TTL 由 `balance_cache_ttl_seconds` 控制)
+  - `GET /api/admin/config` / `PUT /api/admin/config` - 在线读写运行时配置(自 v2026.4)
+  - `GET /api/admin/pricing` / `POST /api/admin/pricing/sync` - 模型计价同步(自 v2026.4)
+  - `GET /api/admin/usage-stats` - 后端 SQL 聚合 today/累计/按模型/按账号(自 v2026.4)
+  - `GET /api/admin/quota-events` - 配额事件历史(soft_402 / hard_disabled / cooldown_recovered,自 v2026.4)
 
 - **Admin UI**
-  - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）
+  - `GET /admin` - 旧版管理页面(`admin-ui/dist`)
+  - `GET /console` - **新版控制台(自 v2026.4,`frontend/dist`)**,使用 Tailwind + Radix UI,
+    带仪表盘 / 模型计价 / 在线配置 / 美元成本估算 / UA + IP 展示等增强功能
+
+### 数据架构(自 v2026.4)
+
+启动期硬依赖 PostgreSQL + Redis,任一不可用即退出:
+
+| 表 | 用途 |
+|---|---|
+| `credentials` | 凭据全字段 + 失败/成功计数 + 优先级 |
+| `usage_records` | 每次请求一条,含 `cost_usd / client_user_agent / client_ip / request_id` |
+| `model_prices` | 模型单价(LiteLLM 同步,内置兜底) |
+| `app_config` | 运行时配置 KV |
+| `quota_events` | 402 软冷却历史 |
+
+| Redis Key | TTL |
+|---|---|
+| `kiro_rs:balance:{id}` | 由 `balance_cache_ttl_seconds` 控制(默认 300s) |
+
+启动行为:
+- `credentials` 表为空时从 `credentials.json` 一次性 seed,有数据则以 PG 为准
+- `usage_records` 表为空时把 `kiro_usage_records.jsonl` 历史回放进 PG
+- `model_prices` 表为空时启动后异步同步 LiteLLM(失败回退到内置 Anthropic 快照)
+- 配额阈值/冷却时长从 `app_config` 读取(`quota_soft_fail_limit` / `quota_cooldown_minutes`)
+
+### 启动数据依赖
+
+- 主 `docker-compose.yml` 仅含 `kiro-rs` 服务,默认连本机已起的 pg/redis
+- 本机没有时可用 `docker-compose -f docker-compose.dev-infra.yml up -d` 启动一对开发用容器
+  (容器名 `kiro-rs-dev-postgres` / `kiro-rs-dev-redis`,无 volumes,数据不持久化)
+- 连接串通过 `config.json` 的 `databaseUrl` / `redisUrl` 字段或同名环境变量传入
 
 ## 注意事项
 

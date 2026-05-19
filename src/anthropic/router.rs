@@ -10,9 +10,10 @@ use axum::{
 };
 
 use crate::kiro::provider::KiroProvider;
-use crate::model::config::{CompatProfile, PromptCacheSimulationMode};
+use crate::model::config::CompatProfile;
 
 use super::{
+    PromptCacheRuntimeConfig,
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
     middleware::{AppState, auth_middleware, cors_layer},
     prompt_cache::PromptCacheTracker,
@@ -45,13 +46,7 @@ pub fn create_router_with_provider(
     extract_thinking: bool,
     usage_recorder: Arc<UsageRecorder>,
     prompt_cache: Arc<PromptCacheTracker>,
-    prompt_cache_simulation_mode: PromptCacheSimulationMode,
-    prompt_cache_target_read_ratio: f64,
-    prompt_cache_token_scale: f64,
-    prompt_cache_max_simulated_input_tokens: i32,
-    prompt_cache_cap_jitter_min_tokens: i32,
-    prompt_cache_cap_jitter_max_tokens: i32,
-    prompt_cache_scale_min_input_tokens: i32,
+    prompt_cache_runtime_config: Arc<PromptCacheRuntimeConfig>,
     compat_profile: CompatProfile,
     expose_proxy_warnings: bool,
 ) -> Router {
@@ -60,17 +55,9 @@ pub fn create_router_with_provider(
         extract_thinking,
         usage_recorder,
         prompt_cache,
-        prompt_cache_simulation_mode,
-        prompt_cache_target_read_ratio,
+        prompt_cache_runtime_config,
         compat_profile,
         expose_proxy_warnings,
-    )
-    .with_prompt_cache_amplification(
-        prompt_cache_token_scale,
-        prompt_cache_max_simulated_input_tokens,
-        prompt_cache_cap_jitter_min_tokens,
-        prompt_cache_cap_jitter_max_tokens,
-        prompt_cache_scale_min_input_tokens,
     );
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);

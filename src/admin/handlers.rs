@@ -18,6 +18,31 @@ use super::{
 };
 use crate::anthropic::usage::{UsageRecordQuery, UsageRecordStatus, UsageSource};
 
+/// 写一条管理员操作审计(失败仅打日志,不影响主流程)
+async fn record_admin_action(
+    db: &crate::storage::Db,
+    actor: &str,
+    action: &str,
+    target_type: Option<&str>,
+    target_id: Option<String>,
+    payload: Option<serde_json::Value>,
+) {
+    let res = sqlx::query(
+        "INSERT INTO admin_actions (actor, action, target_type, target_id, payload) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(actor)
+    .bind(action)
+    .bind(target_type)
+    .bind(target_id)
+    .bind(payload)
+    .execute(db)
+    .await;
+    if let Err(err) = res {
+        tracing::warn!("写 admin_actions 失败: {:#}", err);
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialsPageQueryParams {
@@ -159,6 +184,19 @@ pub async fn set_credential_disabled(
     match state.service.set_disabled(id, payload.disabled) {
         Ok(_) => {
             let action = if payload.disabled { "禁用" } else { "启用" };
+            record_admin_action(
+                &state.db,
+                "admin",
+                if payload.disabled {
+                    "credential_disable"
+                } else {
+                    "credential_enable"
+                },
+                Some("credential"),
+                Some(id.to_string()),
+                Some(serde_json::json!({ "disabled": payload.disabled })),
+            )
+            .await;
             Json(SuccessResponse::new(format!("凭据 #{} 已{}", id, action))).into_response()
         }
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
@@ -173,11 +211,22 @@ pub async fn set_credential_priority(
     Json(payload): Json<SetPriorityRequest>,
 ) -> impl IntoResponse {
     match state.service.set_priority(id, payload.priority) {
-        Ok(_) => Json(SuccessResponse::new(format!(
-            "凭据 #{} 优先级已设置为 {}",
-            id, payload.priority
-        )))
-        .into_response(),
+        Ok(_) => {
+            record_admin_action(
+                &state.db,
+                "admin",
+                "credential_set_priority",
+                Some("credential"),
+                Some(id.to_string()),
+                Some(serde_json::json!({ "priority": payload.priority })),
+            )
+            .await;
+            Json(SuccessResponse::new(format!(
+                "凭据 #{} 优先级已设置为 {}",
+                id, payload.priority
+            )))
+            .into_response()
+        }
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -229,7 +278,18 @@ pub async fn delete_credential(
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.delete_credential(id) {
-        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 已删除", id))).into_response(),
+        Ok(_) => {
+            record_admin_action(
+                &state.db,
+                "admin",
+                "credential_delete",
+                Some("credential"),
+                Some(id.to_string()),
+                None,
+            )
+            .await;
+            Json(SuccessResponse::new(format!("凭据 #{} 已删除", id))).into_response()
+        }
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -241,11 +301,22 @@ pub async fn force_refresh_token(
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.force_refresh_token(id).await {
-        Ok(_) => Json(SuccessResponse::new(format!(
-            "凭据 #{} Token 已强制刷新",
-            id
-        )))
-        .into_response(),
+        Ok(_) => {
+            record_admin_action(
+                &state.db,
+                "admin",
+                "credential_force_refresh",
+                Some("credential"),
+                Some(id.to_string()),
+                None,
+            )
+            .await;
+            Json(SuccessResponse::new(format!(
+                "凭据 #{} Token 已强制刷新",
+                id
+            )))
+            .into_response()
+        }
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -276,7 +347,7 @@ pub async fn get_usage_records(
     Query(params): Query<UsageRecordsQueryParams>,
 ) -> impl IntoResponse {
     match params.into_query() {
-        Ok(query) => Json(state.service.get_usage_records(query)).into_response(),
+        Ok(query) => Json(state.service.get_usage_records(query).await).into_response(),
         Err(message) => (
             StatusCode::BAD_REQUEST,
             Json(AdminErrorResponse::invalid_request(message)),
@@ -292,9 +363,13 @@ pub async fn get_usage_records_page(
     Query(params): Query<UsageRecordsPageQueryParams>,
 ) -> impl IntoResponse {
     match params.into_query() {
-        Ok((query, page, limit)) => {
-            Json(state.service.get_usage_records_page(query, page, limit)).into_response()
-        }
+        Ok((query, page, limit)) => Json(
+            state
+                .service
+                .get_usage_records_page(query, page, limit)
+                .await,
+        )
+        .into_response(),
         Err(message) => (
             StatusCode::BAD_REQUEST,
             Json(AdminErrorResponse::invalid_request(message)),
@@ -312,8 +387,400 @@ pub async fn get_usage_summary(State(state): State<AdminState>) -> impl IntoResp
 /// POST /api/admin/usage-records/clear
 /// 清空请求级 usage 记录
 pub async fn clear_usage_records(State(state): State<AdminState>) -> impl IntoResponse {
-    state.service.clear_usage_records();
-    Json(SuccessResponse::new("Usage 记录已清空"))
+    match state.service.clear_usage_records().await {
+        Ok(deleted) => {
+            record_admin_action(
+                &state.db,
+                "admin",
+                "usage_clear",
+                Some("usage"),
+                None,
+                Some(serde_json::json!({ "deletedUsageRecords": deleted })),
+            )
+            .await;
+            Json(SuccessResponse::new(format!(
+                "Usage 记录已清空，PG 删除 {} 条",
+                deleted
+            )))
+            .into_response()
+        }
+        Err(err) => {
+            tracing::error!("清空 usage_records 失败: {:#}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(AdminErrorResponse::internal_error("清空 Usage 记录失败")),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// GET /api/admin/usage-stats
+/// 后端 SQL 聚合的 today / 累计 / 范围内 / 时间序列 / 按模型 / 按账号 统计。
+/// 支持过滤参数(q / model / credentialId / status / source / stream / minCacheRead / conversationId)
+/// + 时间范围 since / until + bucket(hour / day);默认 since = 今日 0 点。
+pub async fn get_usage_stats(
+    State(state): State<AdminState>,
+    Query(params): Query<UsageStatsQueryParams>,
+) -> impl IntoResponse {
+    use crate::anthropic::usage::UsageStatsFilter;
+    let status = match parse_optional_usage_status(params.status.clone()) {
+        Ok(v) => v,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(AdminErrorResponse::invalid_request(msg)),
+            )
+                .into_response();
+        }
+    };
+    let source = match parse_optional_usage_source(params.source.clone()) {
+        Ok(v) => v,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(AdminErrorResponse::invalid_request(msg)),
+            )
+                .into_response();
+        }
+    };
+    let since = match parse_optional_time(params.since) {
+        Ok(v) => v,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(AdminErrorResponse::invalid_request(msg)),
+            )
+                .into_response();
+        }
+    };
+    let until = match parse_optional_time(params.until) {
+        Ok(v) => v,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(AdminErrorResponse::invalid_request(msg)),
+            )
+                .into_response();
+        }
+    };
+    let bucket = match params.bucket.as_deref() {
+        None | Some("") => None,
+        Some("hour") => Some("hour".to_string()),
+        Some("day") => Some("day".to_string()),
+        Some(other) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(AdminErrorResponse::invalid_request(format!(
+                    "无效 bucket: {}(只接受 hour / day)",
+                    other
+                ))),
+            )
+                .into_response();
+        }
+    };
+    let filter = UsageStatsFilter {
+        q: non_blank(params.q),
+        conversation_id: non_blank(params.conversation_id),
+        credential_id: params.credential_id,
+        model: non_blank(params.model),
+        status: status.map(|s| {
+            match s {
+                UsageRecordStatus::Success => "success",
+                UsageRecordStatus::Error => "error",
+                UsageRecordStatus::StreamError => "stream_error",
+                UsageRecordStatus::UpstreamTimeout => "upstream_timeout",
+                UsageRecordStatus::ClientDropped => "client_dropped",
+            }
+            .to_string()
+        }),
+        source: source.map(|s| {
+            match s {
+                UsageSource::UpstreamMetadata => "upstream_metadata",
+                UsageSource::LocalPromptCache => "local_prompt_cache",
+                UsageSource::ContextEstimate => "context_estimate",
+                UsageSource::RequestEstimate => "request_estimate",
+                UsageSource::None => "none",
+            }
+            .to_string()
+        }),
+        stream: params.stream,
+        min_cache_read: params.min_cache_read,
+        since,
+        until,
+        bucket,
+    };
+    match state.service.get_usage_stats(&state.db, &filter).await {
+        Ok(stats) => Json(stats).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AdminErrorResponse::internal_error(err.to_string())),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageStatsQueryParams {
+    pub q: Option<String>,
+    pub conversation_id: Option<String>,
+    pub credential_id: Option<u64>,
+    pub model: Option<String>,
+    pub status: Option<String>,
+    pub source: Option<String>,
+    pub stream: Option<bool>,
+    pub min_cache_read: Option<i32>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub bucket: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaEventsQuery {
+    #[serde(default)]
+    pub credential_id: Option<u64>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// GET /api/admin/quota-events
+/// 配额事件历史(soft_402 / hard_disabled / cooldown_recovered / manual_reset)
+pub async fn list_quota_events(
+    State(state): State<AdminState>,
+    Query(params): Query<QuotaEventsQuery>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(50);
+    match state
+        .service
+        .list_quota_events(params.credential_id, limit)
+        .await
+    {
+        Ok(items) => Json(items).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AdminErrorResponse::internal_error(err.to_string())),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminActionsQuery {
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub target_type: Option<String>,
+}
+
+/// GET /api/admin/admin-actions
+/// 管理员操作审计历史(自 v2026.4)
+pub async fn list_admin_actions(
+    State(state): State<AdminState>,
+    Query(params): Query<AdminActionsQuery>,
+) -> impl IntoResponse {
+    use sqlx::Row;
+    let limit = params.limit.unwrap_or(100).clamp(1, 500);
+    let action_filter = params.action.filter(|s| !s.trim().is_empty());
+    let target_filter = params.target_type.filter(|s| !s.trim().is_empty());
+
+    let res = sqlx::query(
+        "SELECT id, occurred_at, actor, action, target_type, target_id, payload, note \
+         FROM admin_actions \
+         WHERE ($1::text IS NULL OR action = $1) \
+           AND ($2::text IS NULL OR target_type = $2) \
+         ORDER BY occurred_at DESC LIMIT $3",
+    )
+    .bind(&action_filter)
+    .bind(&target_filter)
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await;
+
+    match res {
+        Ok(rows) => {
+            let items: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "id": r.try_get::<i64, _>("id").unwrap_or(0),
+                        "occurredAt": r.try_get::<chrono::DateTime<chrono::Utc>, _>("occurred_at")
+                            .map(|d| d.to_rfc3339())
+                            .unwrap_or_default(),
+                        "actor": r.try_get::<String, _>("actor").unwrap_or_default(),
+                        "action": r.try_get::<String, _>("action").unwrap_or_default(),
+                        "targetType": r.try_get::<Option<String>, _>("target_type").ok().flatten(),
+                        "targetId": r.try_get::<Option<String>, _>("target_id").ok().flatten(),
+                        "payload": r.try_get::<Option<serde_json::Value>, _>("payload").ok().flatten(),
+                        "note": r.try_get::<Option<String>, _>("note").ok().flatten(),
+                    })
+                })
+                .collect();
+            Json(items).into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AdminErrorResponse::internal_error(err.to_string())),
+        )
+            .into_response(),
+    }
+}
+
+// ============ 在线配置 (app_config) ============
+
+/// GET /api/admin/config
+/// 列出所有运行时配置项
+pub async fn list_app_config(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.app_config.list().await {
+        Ok(items) => Json(items).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AdminErrorResponse::internal_error(e.to_string())),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AppConfigUpdate {
+    pub items: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// PUT /api/admin/config
+/// 批量更新配置项(只允许白名单 key)
+pub async fn update_app_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<AppConfigUpdate>,
+) -> impl IntoResponse {
+    let items: Vec<(String, serde_json::Value)> = payload.items.into_iter().collect();
+    match state.app_config.set_many(&items, "admin").await {
+        Ok(_) => {
+            // 关键 key 同步推到运行时模块,避免改了不生效
+            for (k, v) in &items {
+                match k.as_str() {
+                    "load_balancing_mode" => {
+                        if let Some(m) = v.as_str() {
+                            state.token_manager.override_load_balancing_mode(m);
+                        }
+                    }
+                    "quota_soft_fail_limit" => {
+                        let limit = v.as_u64().map(|x| x as u32).unwrap_or(3);
+                        // cooldown 也一起拉一下,保持一致性
+                        let cooldown = state
+                            .app_config
+                            .get_as::<i64>("quota_cooldown_minutes")
+                            .unwrap_or(30);
+                        state.token_manager.set_quota_settings(limit, cooldown);
+                    }
+                    "quota_cooldown_minutes" => {
+                        let cooldown = v.as_i64().unwrap_or(30);
+                        let limit = state
+                            .app_config
+                            .get_as::<u32>("quota_soft_fail_limit")
+                            .unwrap_or(3);
+                        state.token_manager.set_quota_settings(limit, cooldown);
+                    }
+                    _ => {}
+                }
+            }
+            state
+                .prompt_cache_runtime_config
+                .reload_from_app_config(&state.app_config);
+            // 审计
+            record_admin_action(
+                &state.db,
+                "admin",
+                "config_update",
+                Some("config"),
+                None,
+                Some(serde_json::json!({ "items": items })),
+            )
+            .await;
+            Json(SuccessResponse::new(format!(
+                "已更新 {} 项配置",
+                items.len()
+            )))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(AdminErrorResponse::invalid_request(e.to_string())),
+        )
+            .into_response(),
+    }
+}
+
+// ============ 模型计价 ============
+
+/// GET /api/admin/pricing
+/// 列出所有模型价格
+pub async fn list_pricing(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.pricing.list().await {
+        Ok(items) => Json(items).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AdminErrorResponse::internal_error(e.to_string())),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncPricingRequest {
+    /// 强制使用内置快照而不是 LiteLLM
+    #[serde(default)]
+    pub force_builtin: bool,
+}
+
+/// POST /api/admin/pricing/sync
+/// 立即同步模型价格(从 LiteLLM 或内置快照)
+pub async fn sync_pricing(
+    State(state): State<AdminState>,
+    payload: Option<Json<SyncPricingRequest>>,
+) -> impl IntoResponse {
+    let force_builtin = payload.map(|p| p.0.force_builtin).unwrap_or(false);
+    match state.pricing.sync(force_builtin).await {
+        Ok(summary) => {
+            // 同步成功后标记 bootstrap 完成,前端可据此显示同步时间
+            let _ = state
+                .app_config
+                .set(
+                    "pricing_bootstrap_done",
+                    serde_json::Value::Bool(true),
+                    "admin",
+                )
+                .await;
+            // 刷新内存缓存,后续 record 计算 cost_usd 立即生效
+            if let Err(err) = state.pricing.warm_cache().await {
+                tracing::warn!("warm pricing cache 失败: {:#}", err);
+            }
+            record_admin_action(
+                &state.db,
+                "admin",
+                "pricing_sync",
+                Some("pricing"),
+                None,
+                Some(serde_json::json!({
+                    "source": summary.source,
+                    "fetchedCount": summary.fetched_count,
+                    "upserted": summary.upserted,
+                    "usedFallback": summary.used_fallback,
+                })),
+            )
+            .await;
+            Json(summary).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AdminErrorResponse::internal_error(e.to_string())),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]

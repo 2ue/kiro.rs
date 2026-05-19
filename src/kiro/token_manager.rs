@@ -411,6 +411,11 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    /// 累计 402 (MONTHLY_REQUEST_COUNT) 命中次数
+    /// 达到阈值才永久禁用,期间用 cooldown_until 做软冷却(自 v2026.4)
+    quota_strike_count: u32,
+    /// 软冷却到期时间;到期后会被自愈逻辑自动启用
+    cooldown_until: Option<DateTime<Utc>>,
 }
 
 /// 会话到凭据的粘性绑定。
@@ -520,7 +525,7 @@ pub struct MultiTokenManager {
     current_id: Mutex<u64>,
     /// Token 刷新锁，确保同一时间只有一个刷新操作
     refresh_lock: TokioMutex<()>,
-    /// 凭据文件路径（用于回写）
+    /// 凭据文件路径（用于回写,作为 PG 落盘的热备份）
     credentials_path: Option<PathBuf>,
     /// 是否为多凭据格式（数组格式才回写）
     is_multiple_format: bool,
@@ -532,6 +537,13 @@ pub struct MultiTokenManager {
     stats_dirty: AtomicBool,
     /// 会话粘性绑定：conversationId -> credential id
     session_bindings: Mutex<HashMap<String, SessionBinding>>,
+    /// PostgreSQL 句柄(自 v2026.4 持久化层)
+    db: Option<crate::storage::Db>,
+    /// Redis 句柄(预留,balance / session 等可重建状态用)
+    #[allow(dead_code)]
+    redis: Option<crate::storage::RedisPool>,
+    /// 配额冷却参数:(strike_limit, cooldown_minutes),由 attach_storage 时从 app_config 读入
+    quota_settings: Mutex<(u32, i64)>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -615,6 +627,8 @@ impl MultiTokenManager {
                     },
                     success_count: 0,
                     last_used_at: None,
+                    quota_strike_count: 0,
+                    cooldown_until: None,
                 }
             })
             .collect();
@@ -672,6 +686,9 @@ impl MultiTokenManager {
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             session_bindings: Mutex::new(HashMap::new()),
+            db: None,
+            redis: None,
+            quota_settings: Mutex::new((3, 30)),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -692,6 +709,131 @@ impl MultiTokenManager {
     /// 获取配置的引用
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// 注入数据持久化层句柄(PG/Redis)。
+    ///
+    /// 启动期调用一次,启用 PG 持久化路径:
+    /// - 若 PG `credentials` 表为空,把当前内存凭据 seed 进 PG(等价"首次迁移")
+    /// - 若 PG 已有数据,以 PG 为准重载内存,文件视为热备
+    /// - 任何 entries 修改之后异步双写 PG + 文件,失败仅打日志不阻塞
+    pub async fn attach_storage(&mut self, storage: crate::storage::Storage) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let row = sqlx::query("SELECT COUNT(*)::bigint AS n FROM credentials")
+            .fetch_one(&storage.db)
+            .await
+            .context("查询 credentials 表行数失败")?;
+        let count: i64 = sqlx::Row::try_get(&row, "n")?;
+
+        if count == 0 {
+            tracing::info!("PG credentials 表为空,从文件 seed 一次");
+            seed_credentials_to_pg(&storage.db, &self.entries.lock()).await?;
+            seed_stats_to_pg(&storage.db, &self.entries.lock()).await?;
+        } else {
+            tracing::info!("PG credentials 表已有 {} 条,以 PG 为准重载内存", count);
+            let loaded = load_credentials_from_pg(&storage.db).await?;
+            *self.entries.lock() = loaded;
+            self.select_highest_priority();
+        }
+
+        self.db = Some(storage.db);
+        self.redis = Some(storage.redis);
+        Ok(())
+    }
+
+    /// 从外部覆盖当前进程的负载均衡模式(仅内存,不持久化到 config.json)
+    /// 供 app_config 在线 PUT 时同步生效
+    pub fn override_load_balancing_mode(&self, mode: &str) {
+        if mode != "priority" && mode != "balanced" {
+            tracing::warn!("无效负载均衡模式 '{}',忽略", mode);
+            return;
+        }
+        let mut current = self.load_balancing_mode.lock();
+        if *current == mode {
+            return;
+        }
+        tracing::info!("负载均衡模式热更新: {} -> {}", *current, mode);
+        *current = mode.to_string();
+    }
+
+    /// 应用 app_config 中的配额阈值。
+    pub fn set_quota_settings(&self, strike_limit: u32, cooldown_minutes: i64) {
+        let strike_limit = strike_limit.max(1);
+        let cooldown_minutes = cooldown_minutes.max(1);
+        *self.quota_settings.lock() = (strike_limit, cooldown_minutes);
+        tracing::info!(
+            "配额阈值已应用: strike_limit={} cooldown_minutes={}",
+            strike_limit,
+            cooldown_minutes
+        );
+    }
+
+    /// 异步把当前内存凭据全量写回 PG。
+    ///
+    /// 通过 spawn 跑在后台,调用方不阻塞。任意失败只打 warn,不破坏内存状态。
+    fn persist_credentials_to_pg_async(&self) {
+        let Some(db) = self.db.clone() else {
+            return;
+        };
+        let snapshot: Vec<PgCredentialRow> = self
+            .entries
+            .lock()
+            .iter()
+            .map(PgCredentialRow::from_entry)
+            .collect();
+        tokio::spawn(async move {
+            if let Err(err) = upsert_credentials_to_pg(&db, &snapshot).await {
+                tracing::warn!("PG 凭据持久化失败(非阻塞): {:#}", err);
+            }
+        });
+    }
+
+    /// 异步把统计字段写回 PG(success_count / failure_count / disabled / cooldown 等)。
+    fn persist_stats_to_pg_async(&self) {
+        let Some(db) = self.db.clone() else {
+            return;
+        };
+        let snapshot: Vec<PgStatsRow> = self
+            .entries
+            .lock()
+            .iter()
+            .map(PgStatsRow::from_entry)
+            .collect();
+        tokio::spawn(async move {
+            if let Err(err) = upsert_stats_to_pg(&db, &snapshot).await {
+                tracing::warn!("PG 统计持久化失败(非阻塞): {:#}", err);
+            }
+        });
+    }
+
+    /// 写一条 quota_event 到 PG(soft_402 / hard_disabled / cooldown_recovered / manual_reset)
+    fn record_quota_event_async(
+        &self,
+        credential_id: u64,
+        kind: &'static str,
+        reason: Option<String>,
+        upstream_status: Option<i16>,
+        cooldown_until: Option<DateTime<Utc>>,
+    ) {
+        let Some(db) = self.db.clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let res = sqlx::query(
+                "INSERT INTO quota_events (credential_id, kind, reason, upstream_status, cooldown_until) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(credential_id as i64)
+            .bind(kind)
+            .bind(reason)
+            .bind(upstream_status)
+            .bind(cooldown_until)
+            .execute(&db)
+            .await;
+            if let Err(err) = res {
+                tracing::warn!("写 quota_events 失败: {:#}", err);
+            }
+        });
     }
 
     /// 获取凭据总数
@@ -920,6 +1062,8 @@ impl MultiTokenManager {
         session_id: Option<&str>,
         excluded_ids: &HashSet<u64>,
     ) -> anyhow::Result<CallContext> {
+        // 入口先做一次配额冷却自愈,把过期的软冷却凭据放回池
+        self.recover_quota_cooldowns();
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -1180,7 +1324,10 @@ impl MultiTokenManager {
     fn persist_credentials(&self) -> anyhow::Result<bool> {
         use anyhow::Context;
 
-        // 仅多凭据格式才回写
+        // 1) 异步写 PG(若已 attach_storage)
+        self.persist_credentials_to_pg_async();
+
+        // 2) 仅多凭据格式才回写文件(保留作为热备)
         if !self.is_multiple_format {
             return Ok(false);
         }
@@ -1266,9 +1413,19 @@ impl MultiTokenManager {
 
     /// 将当前统计数据持久化到磁盘
     fn save_stats(&self) {
+        // 异步双写 PG
+        self.persist_stats_to_pg_async();
+
         let path = match self.stats_path() {
             Some(p) => p,
-            None => return,
+            None => {
+                // 没有文件路径但有 PG 时,标记为已落盘
+                if self.db.is_some() {
+                    *self.last_stats_save_at.lock() = Some(Instant::now());
+                    self.stats_dirty.store(false, Ordering::Relaxed);
+                }
+                return;
+            }
         };
 
         let stats: HashMap<String, StatsEntry> = {
@@ -1331,11 +1488,12 @@ impl MultiTokenManager {
                 entry.refresh_failure_count = 0;
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
-                tracing::debug!(
-                    "凭据 #{} API 调用成功（累计 {} 次）",
-                    id,
-                    entry.success_count
-                );
+                // 配额连续成功一次即衰减 strike,避免软超限永久累积
+                if entry.quota_strike_count > 0 {
+                    entry.quota_strike_count -= 1;
+                }
+                entry.cooldown_until = None;
+                tracing::debug!("凭据 #{} API 调用成功(累计 {} 次)", id, entry.success_count);
             }
         }
         self.save_stats_debounced();
@@ -1416,13 +1574,16 @@ impl MultiTokenManager {
         result
     }
 
-    /// 报告指定凭据额度已用尽
+    /// 报告指定凭据额度已用尽(402 MONTHLY_REQUEST_COUNT)。
     ///
-    /// 用于处理 402 Payment Required 且 reason 为 `MONTHLY_REQUEST_COUNT` 的场景：
-    /// - 立即禁用该凭据（不等待连续失败阈值）
-    /// - 切换到下一个可用凭据继续重试
-    /// - 返回是否还有可用凭据
+    /// **三次冷却策略(自 v2026.4)**:
+    /// - 第 1、2 次:进入软冷却(30 分钟,可配置 `quota_cooldown_minutes`),
+    ///   暂时禁用并切换;到期后自愈逻辑会自动启用,这样可以榨干"软超限"窗口。
+    /// - 第 N 次(默认 3,可配置 `quota_soft_fail_limit`):永久禁用,标记 QuotaExceeded。
     pub fn report_quota_exhausted(&self, id: u64) -> bool {
+        let (strike_limit, cooldown_minutes) = *self.quota_settings.lock();
+
+        let emitted_event: Option<(&'static str, Option<DateTime<Utc>>)>;
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -1436,13 +1597,36 @@ impl MultiTokenManager {
                 return entries.iter().any(|e| !e.disabled);
             }
 
-            entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
+            entry.quota_strike_count = entry.quota_strike_count.saturating_add(1);
             entry.last_used_at = Some(Utc::now().to_rfc3339());
-            // 设为阈值，便于在管理面板中直观看到该凭据已不可用
-            entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
 
-            tracing::error!("凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用", id);
+            if entry.quota_strike_count >= strike_limit {
+                // 永久禁用
+                entry.disabled = true;
+                entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
+                entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+                entry.cooldown_until = None;
+                tracing::error!(
+                    "凭据 #{} 累计 {} 次 402 已达阈值,永久禁用(QuotaExceeded)",
+                    id,
+                    entry.quota_strike_count
+                );
+                emitted_event = Some(("hard_disabled", None));
+            } else {
+                // 软冷却
+                let until = Utc::now() + chrono::Duration::minutes(cooldown_minutes);
+                entry.disabled = true;
+                entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
+                entry.cooldown_until = Some(until);
+                tracing::warn!(
+                    "凭据 #{} 触发 402(累计 {}/{}),进入冷却至 {}",
+                    id,
+                    entry.quota_strike_count,
+                    strike_limit,
+                    until
+                );
+                emitted_event = Some(("soft_402", Some(until)));
+            }
 
             // 切换到优先级最高的可用凭据
             if let Some(next) = entries
@@ -1452,19 +1636,63 @@ impl MultiTokenManager {
             {
                 *current_id = next.id;
                 tracing::info!(
-                    "已切换到凭据 #{}（优先级 {}）",
+                    "已切换到凭据 #{}(优先级 {})",
                     next.id,
                     next.credentials.priority
                 );
                 true
             } else {
-                tracing::error!("所有凭据均已禁用！");
+                tracing::error!("所有凭据均已禁用!");
                 false
             }
         };
+        if let Some((kind, cooldown)) = emitted_event {
+            self.record_quota_event_async(
+                id,
+                kind,
+                Some("MONTHLY_REQUEST_COUNT".to_string()),
+                Some(402i16),
+                cooldown,
+            );
+        }
         self.unbind_sessions_for_credential(id);
         self.save_stats_debounced();
         result
+    }
+
+    /// 自愈:把已过冷却时间的 QuotaExceeded 凭据重新启用。
+    ///
+    /// 调用点:`acquire_context_for_session` 入口,每次选择凭据前先扫描一遍。
+    /// 不会改变永久禁用(strike 已达阈值)的凭据。
+    fn recover_quota_cooldowns(&self) {
+        let now = Utc::now();
+        let mut recovered_ids: Vec<u64> = Vec::new();
+        let mut entries = self.entries.lock();
+        for entry in entries.iter_mut() {
+            if entry.disabled && entry.disabled_reason == Some(DisabledReason::QuotaExceeded) {
+                if let Some(until) = entry.cooldown_until {
+                    if now >= until {
+                        entry.disabled = false;
+                        entry.disabled_reason = None;
+                        entry.cooldown_until = None;
+                        entry.failure_count = 0;
+                        tracing::info!(
+                            "凭据 #{} 配额冷却结束,自动恢复(累计 strike={})",
+                            entry.id,
+                            entry.quota_strike_count
+                        );
+                        recovered_ids.push(entry.id);
+                    }
+                }
+            }
+        }
+        drop(entries);
+        for id in &recovered_ids {
+            self.record_quota_event_async(*id, "cooldown_recovered", None, None, None);
+        }
+        if !recovered_ids.is_empty() {
+            self.save_stats_debounced();
+        }
     }
 
     /// 报告指定凭据刷新 Token 失败。
@@ -1988,6 +2216,8 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 last_used_at: None,
+                quota_strike_count: 0,
+                cooldown_until: None,
             });
         }
 
@@ -2152,6 +2382,374 @@ impl MultiTokenManager {
         tracing::info!("负载均衡模式已设置为: {}", mode);
         Ok(())
     }
+}
+
+// ============================================================================
+// PG 持久化辅助(自 v2026.4)
+// ============================================================================
+
+/// 用于 upsert credentials 表的一行投影
+struct PgCredentialRow {
+    id: i64,
+    auth_method: String,
+    email: Option<String>,
+    machine_id: Option<String>,
+    profile_arn: Option<String>,
+    subscription_title: Option<String>,
+    endpoint: String,
+    refresh_token: Option<String>,
+    access_token: Option<String>,
+    expires_at: Option<DateTime<Utc>>,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    auth_region: Option<String>,
+    api_region: Option<String>,
+    kiro_api_key: Option<String>,
+    proxy_url: Option<String>,
+    proxy_username: Option<String>,
+    proxy_password: Option<String>,
+    refresh_token_hash: Option<String>,
+    api_key_hash: Option<String>,
+    priority: i32,
+    disabled: bool,
+    disabled_reason: Option<String>,
+    failure_count: i32,
+    refresh_failure_count: i32,
+    success_count: i64,
+    last_used_at: Option<DateTime<Utc>>,
+    quota_strike_count: i32,
+    cooldown_until: Option<DateTime<Utc>>,
+}
+
+/// 用于 update 统计字段的一行投影
+struct PgStatsRow {
+    id: i64,
+    success_count: i64,
+    failure_count: i32,
+    refresh_failure_count: i32,
+    disabled: bool,
+    disabled_reason: Option<String>,
+    last_used_at: Option<DateTime<Utc>>,
+    quota_strike_count: i32,
+    cooldown_until: Option<DateTime<Utc>>,
+}
+
+fn parse_rfc3339_to_utc(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn disabled_reason_to_str(reason: Option<DisabledReason>) -> Option<String> {
+    reason.map(|r| match r {
+        DisabledReason::Manual => "manual".to_string(),
+        DisabledReason::TooManyFailures => "too_many_failures".to_string(),
+        DisabledReason::TooManyRefreshFailures => "too_many_refresh_failures".to_string(),
+        DisabledReason::QuotaExceeded => "quota_exceeded".to_string(),
+        DisabledReason::InvalidRefreshToken => "invalid_refresh_token".to_string(),
+        DisabledReason::InvalidConfig => "invalid_config".to_string(),
+    })
+}
+
+fn disabled_reason_from_str(value: Option<String>) -> Option<DisabledReason> {
+    value.as_deref().and_then(|s| match s {
+        "manual" => Some(DisabledReason::Manual),
+        "too_many_failures" => Some(DisabledReason::TooManyFailures),
+        "too_many_refresh_failures" => Some(DisabledReason::TooManyRefreshFailures),
+        "quota_exceeded" => Some(DisabledReason::QuotaExceeded),
+        "invalid_refresh_token" => Some(DisabledReason::InvalidRefreshToken),
+        "invalid_config" => Some(DisabledReason::InvalidConfig),
+        _ => None,
+    })
+}
+
+impl PgCredentialRow {
+    fn from_entry(e: &CredentialEntry) -> Self {
+        let cred = &e.credentials;
+        let token_hash = cred
+            .refresh_token
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|t| {
+                use sha2::{Digest, Sha256};
+                hex::encode(Sha256::digest(t.as_bytes()))
+            });
+        let api_key_hash = cred
+            .kiro_api_key
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|t| {
+                use sha2::{Digest, Sha256};
+                hex::encode(Sha256::digest(t.as_bytes()))
+            });
+        Self {
+            id: e.id as i64,
+            auth_method: cred
+                .auth_method
+                .clone()
+                .unwrap_or_else(|| "social".to_string()),
+            email: cred.email.clone(),
+            machine_id: cred.machine_id.clone(),
+            profile_arn: cred.profile_arn.clone(),
+            subscription_title: cred.subscription_title.clone(),
+            endpoint: cred.endpoint.clone().unwrap_or_else(|| "ide".to_string()),
+            refresh_token: cred.refresh_token.clone(),
+            access_token: cred.access_token.clone(),
+            expires_at: cred.expires_at.as_deref().and_then(parse_rfc3339_to_utc),
+            client_id: cred.client_id.clone(),
+            client_secret: cred.client_secret.clone(),
+            auth_region: cred.auth_region.clone(),
+            api_region: cred.api_region.clone(),
+            kiro_api_key: cred.kiro_api_key.clone(),
+            proxy_url: cred.proxy_url.clone(),
+            proxy_username: cred.proxy_username.clone(),
+            proxy_password: cred.proxy_password.clone(),
+            refresh_token_hash: token_hash,
+            api_key_hash,
+            priority: cred.priority as i32,
+            disabled: e.disabled,
+            disabled_reason: disabled_reason_to_str(e.disabled_reason),
+            failure_count: e.failure_count as i32,
+            refresh_failure_count: e.refresh_failure_count as i32,
+            success_count: e.success_count as i64,
+            last_used_at: e.last_used_at.as_deref().and_then(parse_rfc3339_to_utc),
+            quota_strike_count: e.quota_strike_count as i32,
+            cooldown_until: e.cooldown_until,
+        }
+    }
+}
+
+impl PgStatsRow {
+    fn from_entry(e: &CredentialEntry) -> Self {
+        Self {
+            id: e.id as i64,
+            success_count: e.success_count as i64,
+            failure_count: e.failure_count as i32,
+            refresh_failure_count: e.refresh_failure_count as i32,
+            disabled: e.disabled,
+            disabled_reason: disabled_reason_to_str(e.disabled_reason),
+            last_used_at: e.last_used_at.as_deref().and_then(parse_rfc3339_to_utc),
+            quota_strike_count: e.quota_strike_count as i32,
+            cooldown_until: e.cooldown_until,
+        }
+    }
+}
+
+async fn upsert_credentials_to_pg(
+    db: &crate::storage::Db,
+    rows: &[PgCredentialRow],
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let mut tx = db.begin().await?;
+    for r in rows {
+        sqlx::query(
+            "INSERT INTO credentials (id, auth_method, email, machine_id, profile_arn, \
+                subscription_title, endpoint, refresh_token, access_token, expires_at, \
+                client_id, client_secret, auth_region, api_region, kiro_api_key, \
+                proxy_url, proxy_username, proxy_password, \
+                refresh_token_hash, api_key_hash, priority, \
+                disabled, disabled_reason, failure_count, refresh_failure_count, \
+                success_count, last_used_at, quota_strike_count, cooldown_until, updated_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,NOW()) \
+             ON CONFLICT (id) DO UPDATE SET \
+                auth_method = EXCLUDED.auth_method, \
+                email = EXCLUDED.email, \
+                machine_id = EXCLUDED.machine_id, \
+                profile_arn = EXCLUDED.profile_arn, \
+                subscription_title = EXCLUDED.subscription_title, \
+                endpoint = EXCLUDED.endpoint, \
+                refresh_token = EXCLUDED.refresh_token, \
+                access_token = EXCLUDED.access_token, \
+                expires_at = EXCLUDED.expires_at, \
+                client_id = EXCLUDED.client_id, \
+                client_secret = EXCLUDED.client_secret, \
+                auth_region = EXCLUDED.auth_region, \
+                api_region = EXCLUDED.api_region, \
+                kiro_api_key = EXCLUDED.kiro_api_key, \
+                proxy_url = EXCLUDED.proxy_url, \
+                proxy_username = EXCLUDED.proxy_username, \
+                proxy_password = EXCLUDED.proxy_password, \
+                refresh_token_hash = EXCLUDED.refresh_token_hash, \
+                api_key_hash = EXCLUDED.api_key_hash, \
+                priority = EXCLUDED.priority, \
+                disabled = EXCLUDED.disabled, \
+                disabled_reason = EXCLUDED.disabled_reason, \
+                failure_count = EXCLUDED.failure_count, \
+                refresh_failure_count = EXCLUDED.refresh_failure_count, \
+                success_count = EXCLUDED.success_count, \
+                last_used_at = EXCLUDED.last_used_at, \
+                quota_strike_count = EXCLUDED.quota_strike_count, \
+                cooldown_until = EXCLUDED.cooldown_until, \
+                updated_at = NOW()",
+        )
+        .bind(r.id)
+        .bind(&r.auth_method)
+        .bind(&r.email)
+        .bind(&r.machine_id)
+        .bind(&r.profile_arn)
+        .bind(&r.subscription_title)
+        .bind(&r.endpoint)
+        .bind(&r.refresh_token)
+        .bind(&r.access_token)
+        .bind(r.expires_at)
+        .bind(&r.client_id)
+        .bind(&r.client_secret)
+        .bind(&r.auth_region)
+        .bind(&r.api_region)
+        .bind(&r.kiro_api_key)
+        .bind(&r.proxy_url)
+        .bind(&r.proxy_username)
+        .bind(&r.proxy_password)
+        .bind(&r.refresh_token_hash)
+        .bind(&r.api_key_hash)
+        .bind(r.priority)
+        .bind(r.disabled)
+        .bind(&r.disabled_reason)
+        .bind(r.failure_count)
+        .bind(r.refresh_failure_count)
+        .bind(r.success_count)
+        .bind(r.last_used_at)
+        .bind(r.quota_strike_count)
+        .bind(r.cooldown_until)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("upsert credentials[{}] 失败", r.id))?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn upsert_stats_to_pg(db: &crate::storage::Db, rows: &[PgStatsRow]) -> anyhow::Result<()> {
+    let mut tx = db.begin().await?;
+    for r in rows {
+        sqlx::query(
+            "UPDATE credentials SET \
+                success_count = $2, \
+                failure_count = $3, \
+                refresh_failure_count = $4, \
+                disabled = $5, \
+                disabled_reason = $6, \
+                last_used_at = $7, \
+                quota_strike_count = $8, \
+                cooldown_until = $9, \
+                updated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(r.id)
+        .bind(r.success_count)
+        .bind(r.failure_count)
+        .bind(r.refresh_failure_count)
+        .bind(r.disabled)
+        .bind(&r.disabled_reason)
+        .bind(r.last_used_at)
+        .bind(r.quota_strike_count)
+        .bind(r.cooldown_until)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn seed_credentials_to_pg(
+    db: &crate::storage::Db,
+    entries: &[CredentialEntry],
+) -> anyhow::Result<()> {
+    let rows: Vec<PgCredentialRow> = entries.iter().map(PgCredentialRow::from_entry).collect();
+    upsert_credentials_to_pg(db, &rows).await
+}
+
+async fn seed_stats_to_pg(
+    db: &crate::storage::Db,
+    entries: &[CredentialEntry],
+) -> anyhow::Result<()> {
+    let rows: Vec<PgStatsRow> = entries.iter().map(PgStatsRow::from_entry).collect();
+    upsert_stats_to_pg(db, &rows).await
+}
+
+async fn load_credentials_from_pg(db: &crate::storage::Db) -> anyhow::Result<Vec<CredentialEntry>> {
+    use anyhow::Context;
+    let rows = sqlx::query(
+        "SELECT id, auth_method, email, machine_id, profile_arn, subscription_title, endpoint, \
+                refresh_token, access_token, expires_at, client_id, client_secret, \
+                auth_region, api_region, kiro_api_key, proxy_url, proxy_username, proxy_password, \
+                priority, disabled, disabled_reason, failure_count, refresh_failure_count, \
+                success_count, last_used_at, quota_strike_count, cooldown_until \
+         FROM credentials ORDER BY priority, id",
+    )
+    .fetch_all(db)
+    .await
+    .context("查询 credentials 失败")?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        use sqlx::Row;
+        let id: i64 = row.try_get("id")?;
+        let auth_method: String = row.try_get("auth_method")?;
+        let email: Option<String> = row.try_get("email").ok();
+        let machine_id: Option<String> = row.try_get("machine_id").ok();
+        let profile_arn: Option<String> = row.try_get("profile_arn").ok();
+        let subscription_title: Option<String> = row.try_get("subscription_title").ok();
+        let endpoint: String = row.try_get("endpoint")?;
+        let refresh_token: Option<String> = row.try_get("refresh_token").ok();
+        let access_token: Option<String> = row.try_get("access_token").ok();
+        let expires_at: Option<DateTime<Utc>> = row.try_get("expires_at").ok();
+        let client_id: Option<String> = row.try_get("client_id").ok();
+        let client_secret: Option<String> = row.try_get("client_secret").ok();
+        let auth_region: Option<String> = row.try_get("auth_region").ok();
+        let api_region: Option<String> = row.try_get("api_region").ok();
+        let kiro_api_key: Option<String> = row.try_get("kiro_api_key").ok();
+        let proxy_url: Option<String> = row.try_get("proxy_url").ok();
+        let proxy_username: Option<String> = row.try_get("proxy_username").ok();
+        let proxy_password: Option<String> = row.try_get("proxy_password").ok();
+        let priority: i32 = row.try_get("priority")?;
+        let disabled: bool = row.try_get("disabled")?;
+        let disabled_reason: Option<String> = row.try_get("disabled_reason").ok();
+        let failure_count: i32 = row.try_get("failure_count")?;
+        let refresh_failure_count: i32 = row.try_get("refresh_failure_count")?;
+        let success_count: i64 = row.try_get("success_count")?;
+        let last_used_at: Option<DateTime<Utc>> = row.try_get("last_used_at").ok();
+        let quota_strike_count: i32 = row.try_get("quota_strike_count").unwrap_or(0);
+        let cooldown_until: Option<DateTime<Utc>> = row.try_get("cooldown_until").ok();
+
+        let credentials = KiroCredentials {
+            id: Some(id as u64),
+            access_token,
+            refresh_token,
+            profile_arn,
+            expires_at: expires_at.map(|dt| dt.to_rfc3339()),
+            auth_method: Some(auth_method),
+            client_id,
+            client_secret,
+            priority: priority.max(0) as u32,
+            region: None,
+            auth_region,
+            api_region,
+            machine_id,
+            email,
+            subscription_title,
+            proxy_url,
+            proxy_username,
+            proxy_password,
+            disabled,
+            kiro_api_key,
+            endpoint: Some(endpoint),
+        };
+
+        out.push(CredentialEntry {
+            id: id as u64,
+            credentials,
+            failure_count: failure_count.max(0) as u32,
+            refresh_failure_count: refresh_failure_count.max(0) as u32,
+            disabled,
+            disabled_reason: disabled_reason_from_str(disabled_reason),
+            success_count: success_count.max(0) as u64,
+            last_used_at: last_used_at.map(|dt| dt.to_rfc3339()),
+            quota_strike_count: quota_strike_count.max(0) as u32,
+            cooldown_until,
+        });
+    }
+    Ok(out)
 }
 
 impl Drop for MultiTokenManager {

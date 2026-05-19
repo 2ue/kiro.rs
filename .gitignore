@@ -8,6 +8,9 @@
 /admin-ui/node_modules/
 /admin-ui/dist/
 /admin-ui/tsconfig.tsbuildinfo
+/frontend/node_modules/
+/frontend/dist/
+/frontend/tsconfig.tsbuildinfo
 /credentials.*
 /kiro_balance_cache.json
 /kiro_stats.json

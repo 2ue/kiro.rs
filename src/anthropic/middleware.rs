@@ -12,9 +12,11 @@ use axum::{
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
-use crate::model::config::{CompatProfile, PromptCacheSimulationMode};
+use crate::model::config::CompatProfile;
 
-use super::{envelope, prompt_cache::PromptCacheTracker, usage::UsageRecorder};
+use super::{
+    PromptCacheRuntimeConfig, envelope, prompt_cache::PromptCacheTracker, usage::UsageRecorder,
+};
 
 /// 应用共享状态
 #[derive(Clone)]
@@ -30,20 +32,8 @@ pub struct AppState {
     pub usage_recorder: Arc<UsageRecorder>,
     /// 本地 prompt-cache tracker
     pub prompt_cache: Arc<PromptCacheTracker>,
-    /// 本地 prompt-cache usage 模拟模式
-    pub prompt_cache_simulation_mode: PromptCacheSimulationMode,
-    /// 本地 prompt-cache 模拟目标 cache read 比例
-    pub prompt_cache_target_read_ratio: f64,
-    /// high-cache 模拟专用的 total input 放大倍数
-    pub prompt_cache_token_scale: f64,
-    /// high-cache 模拟 total input 的上限
-    pub prompt_cache_max_simulated_input_tokens: i32,
-    /// high-cache 模拟触顶 soft-cap 最小扣减
-    pub prompt_cache_cap_jitter_min_tokens: i32,
-    /// high-cache 模拟触顶 soft-cap 最大扣减
-    pub prompt_cache_cap_jitter_max_tokens: i32,
-    /// high-cache 模拟启用 scale 的最小基础输入
-    pub prompt_cache_scale_min_input_tokens: i32,
+    /// prompt-cache 运行时配置，可由 app_config 热更新。
+    pub prompt_cache_runtime_config: Arc<PromptCacheRuntimeConfig>,
     /// Anthropic compatibility profile
     pub compat_profile: CompatProfile,
     /// 是否在响应头中暴露代理改写动作
@@ -57,8 +47,7 @@ impl AppState {
         extract_thinking: bool,
         usage_recorder: Arc<UsageRecorder>,
         prompt_cache: Arc<PromptCacheTracker>,
-        prompt_cache_simulation_mode: PromptCacheSimulationMode,
-        prompt_cache_target_read_ratio: f64,
+        prompt_cache_runtime_config: Arc<PromptCacheRuntimeConfig>,
         compat_profile: CompatProfile,
         expose_proxy_warnings: bool,
     ) -> Self {
@@ -68,32 +57,10 @@ impl AppState {
             extract_thinking,
             usage_recorder,
             prompt_cache,
-            prompt_cache_simulation_mode,
-            prompt_cache_target_read_ratio: prompt_cache_target_read_ratio.clamp(0.0, 0.99),
-            prompt_cache_token_scale: 1.0,
-            prompt_cache_max_simulated_input_tokens: 0,
-            prompt_cache_cap_jitter_min_tokens: 0,
-            prompt_cache_cap_jitter_max_tokens: 0,
-            prompt_cache_scale_min_input_tokens: 0,
+            prompt_cache_runtime_config,
             compat_profile,
             expose_proxy_warnings: expose_proxy_warnings || compat_profile.is_debug(),
         }
-    }
-
-    pub fn with_prompt_cache_amplification(
-        mut self,
-        token_scale: f64,
-        max_simulated_input_tokens: i32,
-        cap_jitter_min_tokens: i32,
-        cap_jitter_max_tokens: i32,
-        scale_min_input_tokens: i32,
-    ) -> Self {
-        self.prompt_cache_token_scale = token_scale;
-        self.prompt_cache_max_simulated_input_tokens = max_simulated_input_tokens;
-        self.prompt_cache_cap_jitter_min_tokens = cap_jitter_min_tokens;
-        self.prompt_cache_cap_jitter_max_tokens = cap_jitter_max_tokens;
-        self.prompt_cache_scale_min_input_tokens = scale_min_input_tokens;
-        self
     }
 
     /// 设置 KiroProvider

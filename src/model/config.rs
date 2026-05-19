@@ -138,6 +138,16 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
+    /// PostgreSQL 连接串（必填）
+    /// 优先读 config.json 的 `databaseUrl` 字段，未配置时回退到 `DATABASE_URL` 环境变量。
+    #[serde(default)]
+    pub database_url: Option<String>,
+
+    /// Redis 连接串（必填）
+    /// 优先读 config.json 的 `redisUrl` 字段，未配置时回退到 `REDIS_URL` 环境变量。
+    #[serde(default)]
+    pub redis_url: Option<String>,
+
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
@@ -339,6 +349,8 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
+            database_url: None,
+            redis_url: None,
             load_balancing_mode: default_load_balancing_mode(),
             compat_profile: default_compat_profile(),
             extract_thinking: default_extract_thinking(),
@@ -377,6 +389,34 @@ impl Config {
     /// 优先使用 api_region，未配置时回退到 region
     pub fn effective_api_region(&self) -> &str {
         self.api_region.as_deref().unwrap_or(&self.region)
+    }
+
+    /// 解析 PostgreSQL 连接串：优先 config.databaseUrl，回退到 DATABASE_URL 环境变量。
+    pub fn resolve_database_url(&self) -> anyhow::Result<String> {
+        if let Some(url) = self.database_url.as_deref() {
+            if !url.trim().is_empty() {
+                return Ok(url.to_string());
+            }
+        }
+        std::env::var("DATABASE_URL").map_err(|_| {
+            anyhow::anyhow!(
+                "未配置 databaseUrl（config.json 字段或 DATABASE_URL 环境变量），无法连接 PostgreSQL"
+            )
+        })
+    }
+
+    /// 解析 Redis 连接串：优先 config.redisUrl，回退到 REDIS_URL 环境变量。
+    pub fn resolve_redis_url(&self) -> anyhow::Result<String> {
+        if let Some(url) = self.redis_url.as_deref() {
+            if !url.trim().is_empty() {
+                return Ok(url.to_string());
+            }
+        }
+        std::env::var("REDIS_URL").map_err(|_| {
+            anyhow::anyhow!(
+                "未配置 redisUrl（config.json 字段或 REDIS_URL 环境变量），无法连接 Redis"
+            )
+        })
     }
 
     /// 从文件加载配置

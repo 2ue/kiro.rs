@@ -27,6 +27,8 @@ In high-cache mode, the proxy builds a local prompt cache profile even when the 
 
 For requests without metadata/session, the converter now derives a deterministic conversation id from the stable prompt anchor, which keeps the local prompt cache scope stable across turns.
 
+Continuity gap note: the current implementation can still produce cache gaps in a continuous high-cache session when an intermediate request has a small estimated input. The reason is that prompt-cache simulation currently decides whether cache is possible from the current request's target token count before considering already-created entries in the same scope. The planned fix is documented in `docs/high-cache-continuity-cache-gap-plan.md`: high-cache should use an existing, non-expired entry in the same `credentialId + conversationId + model` scope as a read-only continuity floor for later small requests, while first small requests remain uncached.
+
 ## Real Test Summary
 
 Clean logs and admin usage were cleared before the high-cache matrix. The final real run produced:
@@ -48,7 +50,7 @@ The `highCacheRequests` admin summary field is threshold-based. It counts record
 - `/v1/messages` streaming same-session calls: first call created cache; later streaming calls read cache.
 - Mixed synchronous and streaming calls in the same session: cache was shared across stream modes.
 - Independent sessions with the same prompt: no cross-session cache read.
-- Requests without `metadata.user_id`: each request received a random conversation id, so no stable local read was available.
+- Requests without `metadata.user_id`: high-cache derives a deterministic fallback conversation id from the stable prompt anchor. This can keep the local prompt cache scope stable when system/tools/first user message remain stable, but it is weaker than an explicit session id and can be affected by prompt-anchor changes.
 - Explicit `cache_control`: still works and remains compatible with the previous local-prompt-cache behavior.
 - Long multi-turn conversations: existing stable prefixes were read, and new suffixes could create additional cache.
 - Model isolation: `sonnet` and `sonnet[1m]` did not share cache scope.
@@ -75,7 +77,7 @@ This scope prevents cache reads across credentials, unrelated sessions, or diffe
 
 ## Stable Conversation Id
 
-The proxy extracts the stable conversation id from `metadata.user_id`. Supported forms include JSON values such as:
+The proxy first tries to extract the stable conversation id from `metadata.user_id`. Supported forms include JSON values such as:
 
 ```json
 {
@@ -83,15 +85,26 @@ The proxy extracts the stable conversation id from `metadata.user_id`. Supported
 }
 ```
 
-If no valid UUID can be extracted, the converter generates a random conversation id. That request can still create cache for its generated scope, but later client calls will not reuse it unless they provide the same stable session id.
+If no valid UUID can be extracted in high-cache mode, the converter derives a deterministic fallback conversation id from the stable prompt anchor:
+
+- `system`
+- `tools`
+- first user message, when present
+- otherwise the full messages array
+
+This fallback allows repeated compatible requests to share a local high-cache scope. It is still safer to provide an explicit session id in `metadata.user_id`, because the fallback can change when the prompt anchor changes and can be reused by unrelated requests that share the same anchor within the cache TTL.
+
+In `local-prompt-cache` mode, the proxy should continue to rely on explicit metadata session ids and should not inherit high-cache fallback/continuity behavior.
 
 ## Cache Miss / Invalidation Scenarios
 
 - First request for a stable prefix only creates cache.
-- No stable conversation id is present.
+- No prompt-cache scope/profile can be built.
+- The high-cache fallback conversation anchor changes.
 - Credential id changes.
 - Model changes.
 - Prompt prefix changes in system, tool, or message blocks.
+- A small request appears before any successful larger request has created a same-scope cache entry.
 - Cache entry TTL expires.
 - Request fails before success handling updates the local tracker.
 - Stream fails or the client disconnects before successful completion.
