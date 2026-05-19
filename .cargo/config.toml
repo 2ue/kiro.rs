@@ -5,18 +5,33 @@
 # 这里把 macOS 目标的链接器显式指回 Xcode clang,只对本项目生效。
 [target.aarch64-apple-darwin]
 linker = "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"
+rustflags = [
+  "-C",
+  "link-arg=-isysroot",
+  "-C",
+  "link-arg=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+]
 
 [target.x86_64-apple-darwin]
 linker = "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"
+rustflags = [
+  "-C",
+  "link-arg=-isysroot",
+  "-C",
+  "link-arg=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+]
 
 [env]
-# build script 也会调 cc;这里给一个肯定可用的真实 clang
-CC = "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"
-CXX = "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang++"
-# macOS SDK 根,clang 链接 -lSystem 时需要
-SDKROOT = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
-# 把 volta 从 PATH 中前置移除,优先走 /usr/bin
-PATH = "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin:/Library/Developer/CommandLineTools/usr/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
+# build script 也会调 cc;这里只给 macOS target 设置真实 clang。
+# 不要设置全局 CC/CXX/SDKROOT,否则 Ubuntu CI 会读到不存在的 Xcode 路径。
+CC_aarch64_apple_darwin = "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"
+CXX_aarch64_apple_darwin = "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang++"
+CFLAGS_aarch64_apple_darwin = "-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+CXXFLAGS_aarch64_apple_darwin = "-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+CC_x86_64_apple_darwin = "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"
+CXX_x86_64_apple_darwin = "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang++"
+CFLAGS_x86_64_apple_darwin = "-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+CXXFLAGS_x86_64_apple_darwin = "-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
 
 # sqlx-cli 离线模式开关,迁移文件改动后无需联连数据库即可编译
 SQLX_OFFLINE = "true"
