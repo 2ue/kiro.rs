@@ -38,6 +38,11 @@ export interface CredentialStatusItem {
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
+  schedulingStatus: 'healthy' | 'disabled' | 'rate_limited' | 'quota_cooldown'
+  schedulingReason?: string
+  schedulingUntil?: string
+  lastUpstreamStatus?: number
+  rateLimitedCount?: number
 }
 
 // 余额响应

@@ -377,10 +377,15 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut excluded_ids: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            let ctx = match self
+                .token_manager
+                .acquire_context_for_session(None, None, &excluded_ids)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -488,8 +493,25 @@ impl KiroProvider {
                 continue;
             }
 
+            // 429 - 工具调用也必须让账号进入短冷却并切换，避免连续打同一账号。
+            if status.as_u16() == 429 {
+                tracing::warn!(
+                    "MCP 请求失败（账号触发 429 冷却并切换，尝试 {}/{}）: {} {}",
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+                self.token_manager
+                    .report_rate_limited(ctx.id, status.as_u16(), &body)
+                    .await;
+                excluded_ids.insert(ctx.id);
+                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                continue;
+            }
+
             // 瞬态错误
-            if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+            if status.as_u16() == 408 || status.is_server_error() {
                 tracing::warn!(
                     "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -782,9 +804,35 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
-            // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
-            if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+            // 429 - Kiro 通常不返回明确 reset 时间；立即把该账号放入短冷却并 fallback。
+            if status.as_u16() == 429 {
+                tracing::warn!(
+                    "API 请求失败（账号触发 429 冷却并切换，尝试 {}/{}）: {} {}",
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+                self.token_manager
+                    .report_rate_limited(ctx.id, status.as_u16(), &body)
+                    .await;
+                if let Some(session_id) = conversation_id.as_deref() {
+                    self.token_manager
+                        .unbind_session_if_bound_to(session_id, ctx.id);
+                }
+                excluded_ids.insert(ctx.id);
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                continue;
+            }
+
+            // 408/5xx - 瞬态上游错误：重试但不禁用凭据。
+            // 账号级 429 已在上方单独进入 Redis 冷却，避免后续请求继续 sticky 到该账号。
+            if status.as_u16() == 408 || status.is_server_error() {
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,

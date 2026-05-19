@@ -172,6 +172,11 @@ impl AdminService {
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                scheduling_status: entry.scheduling_status,
+                scheduling_reason: entry.scheduling_reason,
+                scheduling_until: entry.scheduling_until,
+                last_upstream_status: entry.last_upstream_status,
+                rate_limited_count: entry.rate_limited_count,
             })
             .collect();
 

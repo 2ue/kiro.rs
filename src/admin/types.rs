@@ -82,6 +82,20 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 调度状态：healthy / disabled / rate_limited / quota_cooldown
+    pub scheduling_status: String,
+    /// 调度状态原因
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduling_reason: Option<String>,
+    /// 调度状态到期时间（RFC3339）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduling_until: Option<String>,
+    /// 最近一次上游状态码
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_upstream_status: Option<u16>,
+    /// 429 冷却档位/次数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limited_count: Option<u64>,
 }
 
 // ============ 操作请求 ============

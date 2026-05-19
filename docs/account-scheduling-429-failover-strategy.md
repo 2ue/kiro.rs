@@ -6,10 +6,42 @@
 
 ## 状态
 
-- 文档状态：方案设计完成，尚未实施业务代码。
+- 文档状态：方案设计完成；第一阶段核心调度链路已实施，长期 manual recovery、完整 half-open probe、全局 429 波动保护和双 UI 状态展示仍作为后续阶段。
 - 适用范围：`kiro.rs` 当前多凭据账号池、Anthropic-compatible API、流式/非流式请求、MCP/工具调用、Admin UI 与 Console UI。
 - 参考项目：`~/Desktop/project/sub2api`，但只学习其“可调度性前置、sticky 健康检查、状态影响调度”的架构思想，不照搬其 reset-time 驱动的 429 策略。
 - 核心结论：不能只靠 `priority` / `balanced` / round-robin 解决 429；必须把账号健康状态变成调度前置条件。
+
+## 本次已落地范围
+
+本次实施选择先落地“能直接解决 sticky 持续打 429 账号”的最小稳定闭环，不在同一批改动中引入 PG schema、双 UI 展示或自动人工恢复判定，原因是这些属于更大可观测性/持久化变更，和调度热路径的风险边界不同。
+
+已落地代码：
+
+1. `src/kiro/token_manager.rs`
+   - 新增 Redis-first 调度状态：`kiro:sched:v1:cred:{credential_id}:state`。
+   - 429 写入 `rate_limited_until_ms`、`rate_limit_level`、最近状态、cooldown zset、事件 stream。
+   - 冷却档位为 `45s -> 120s -> 300s -> 900s -> 1800s -> max 7200s`，并加 20% jitter。
+   - Redis 不可用时降级到进程内 `rate_limit_fallbacks`，只影响当前进程，不持久化。
+   - 账号选择前先读取动态调度状态；候选账号使用 Redis pipeline 批量读取 state，后续账号池进一步变大时可再收敛为 Lua 或聚合 hash。
+   - sticky 命中时也重新检查动态调度状态；账号不可调度则解绑。
+   - 429 不会写成 `disabled=true`，`available_count` 仍反映账号配置可用性。
+   - 成功请求会清理 429 冷却字段，并衰减 `rate_limit_level`。
+
+2. `src/kiro/provider.rs`
+   - API 429 从原来的“瞬态 sleep 重试”改为“立即写账号级冷却、解绑 sticky、本次请求排除该账号、fallback 到其他健康账号”。
+   - MCP / 工具调用也使用同一套 `excluded_ids + acquire_context_for_session` 逻辑，429 后不继续打同一账号。
+   - 408 / 5xx 仍按瞬态上游错误处理，不因为普通上游抖动禁用账号。
+
+本次暂未落地但文档继续保留为最终方案：
+
+1. 最近 outcome 窗口、同一 `request_id + credential_id` 去重。
+2. 完整 half-open probe 锁。
+3. 全局 429 波动保护。
+4. `manual_recovery_required` 的 PG 低频持久化和 UI 展示。
+5. 5xx / 网络错误的轻量惩罚评分。
+6. Admin UI 与 Console UI 的账号调度状态可视化。
+
+这个阶段的行为预期是：429 账号会快速退出当前请求和后续短时间调度，但不会因为少量 429 被永久禁用；如果所有可用账号都在 429 冷却中，请求会快速返回“所有可用凭据当前均不可调度”，而不是长时间 sticky 重试同一个账号。
 
 ## 背景
 
@@ -43,7 +75,7 @@
 9. “原地重试”只适合少数可能瞬间恢复且换号没有收益的错误；大部分账号级 429 应该立即 fallback 到其他健康账号。
 10. 用户随口举的“最近 100 次”可以变成一个可配置统计窗口，但不能简单理解为“100 次都是 429 就禁用”；必须排除同一请求 retry 放大的样本，并判断是否存在全局上游波动。
 
-## 当前代码链路
+## 变更前代码链路（问题来源）
 
 ### API 主调用
 

@@ -425,6 +425,15 @@ struct SessionBinding {
     soft_failure_count: u32,
 }
 
+/// Redis 不可用或测试场景下的进程内 429 冷却降级状态。
+#[derive(Clone)]
+struct RateLimitFallbackState {
+    rate_limited_until: DateTime<Utc>,
+    strike_count: u64,
+    upstream_status: Option<u16>,
+    reason: Option<String>,
+}
+
 /// 禁用原因
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DisabledReason {
@@ -496,6 +505,20 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 调度状态：healthy / disabled / rate_limited / quota_cooldown。
+    pub scheduling_status: String,
+    /// 调度状态原因。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduling_reason: Option<String>,
+    /// 调度状态到期时间（RFC3339）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduling_until: Option<String>,
+    /// 最近一次上游状态码。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_upstream_status: Option<u16>,
+    /// 429 冷却档位/次数。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limited_count: Option<u64>,
 }
 
 /// 凭据管理器状态快照
@@ -540,8 +563,9 @@ pub struct MultiTokenManager {
     /// PostgreSQL 句柄(自 v2026.4 持久化层)
     db: Option<crate::storage::Db>,
     /// Redis 句柄(预留,balance / session 等可重建状态用)
-    #[allow(dead_code)]
     redis: Option<crate::storage::RedisPool>,
+    /// Redis 不可用时的进程内 429 冷却降级状态；不持久化、不跨进程。
+    rate_limit_fallbacks: Mutex<HashMap<u64, RateLimitFallbackState>>,
     /// 配额冷却参数:(strike_limit, cooldown_minutes),由 attach_storage 时从 app_config 读入
     quota_settings: Mutex<(u32, i64)>,
 }
@@ -556,6 +580,42 @@ const SESSION_BINDING_TTL_SECS: i64 = 6 * 60 * 60;
 const MAX_SESSION_BINDINGS: usize = 10_000;
 /// 同一会话绑定账号连续软失败达到该阈值后，本次请求允许临时 fallback。
 const MAX_SESSION_SOFT_FAILURES: u32 = 2;
+/// Redis 429 冷却 key 前缀。
+const RATE_LIMIT_REDIS_PREFIX: &str = "kiro:sched:v1";
+/// Kiro 429 无 reset 时的冷却档位（秒）。
+const RATE_LIMIT_COOLDOWN_LEVELS_SECS: [i64; 5] = [45, 120, 300, 900, 1800];
+/// 429 冷却最大值（秒）。
+const RATE_LIMIT_MAX_COOLDOWN_SECS: i64 = 7200;
+/// 调度状态 Redis TTL（秒）。
+const SCHED_STATE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
+
+#[derive(Debug, Clone, Default)]
+struct SchedulerCredentialState {
+    rate_limited_until_ms: Option<i64>,
+    temp_unschedulable_until_ms: Option<i64>,
+    manual_recovery_required: bool,
+}
+
+impl SchedulerCredentialState {
+    fn is_schedulable_at(&self, now_ms: i64) -> bool {
+        if self.manual_recovery_required {
+            return false;
+        }
+        if self
+            .rate_limited_until_ms
+            .is_some_and(|until| now_ms < until)
+        {
+            return false;
+        }
+        if self
+            .temp_unschedulable_until_ms
+            .is_some_and(|until| now_ms < until)
+        {
+            return false;
+        }
+        true
+    }
+}
 
 /// API 调用上下文
 ///
@@ -688,6 +748,7 @@ impl MultiTokenManager {
             session_bindings: Mutex::new(HashMap::new()),
             db: None,
             redis: None,
+            rate_limit_fallbacks: Mutex::new(HashMap::new()),
             quota_settings: Mutex::new((3, 30)),
         };
 
@@ -766,6 +827,391 @@ impl MultiTokenManager {
             strike_limit,
             cooldown_minutes
         );
+    }
+
+    fn sched_state_key(id: u64) -> String {
+        format!("{RATE_LIMIT_REDIS_PREFIX}:cred:{id}:state")
+    }
+
+    fn sched_rate_limit_zset_key() -> &'static str {
+        "kiro:sched:v1:cooldowns:rate_limit"
+    }
+
+    fn sched_event_stream_key() -> &'static str {
+        "kiro:sched:v1:events"
+    }
+
+    fn rate_limit_cooldown_secs(level: i64) -> i64 {
+        let base = RATE_LIMIT_COOLDOWN_LEVELS_SECS
+            .get(level.saturating_sub(1).max(0) as usize)
+            .copied()
+            .unwrap_or(RATE_LIMIT_MAX_COOLDOWN_SECS);
+        base.min(RATE_LIMIT_MAX_COOLDOWN_SECS)
+    }
+
+    fn jittered_cooldown_secs(base_secs: i64) -> i64 {
+        let jitter = ((base_secs as f64) * 0.2).round() as i64;
+        if jitter <= 0 {
+            return base_secs.max(1);
+        }
+        let min = (base_secs - jitter).max(1);
+        let max = (base_secs + jitter).max(min);
+        fastrand::i64(min..=max)
+    }
+
+    fn fallback_scheduler_state_for(&self, id: u64) -> SchedulerCredentialState {
+        let states = self.rate_limit_fallbacks.lock();
+        SchedulerCredentialState {
+            rate_limited_until_ms: states
+                .get(&id)
+                .map(|state| state.rate_limited_until.timestamp_millis()),
+            temp_unschedulable_until_ms: None,
+            manual_recovery_required: false,
+        }
+    }
+
+    fn write_rate_limit_fallback_state(
+        &self,
+        id: u64,
+        upstream_status: Option<u16>,
+        reason: Option<String>,
+    ) -> (u64, i64, i64) {
+        let mut states = self.rate_limit_fallbacks.lock();
+        let strike_count = states
+            .get(&id)
+            .map(|state| state.strike_count.saturating_add(1))
+            .unwrap_or(1);
+        let cooldown_secs =
+            Self::jittered_cooldown_secs(Self::rate_limit_cooldown_secs(strike_count as i64));
+        let until = Utc::now() + chrono::Duration::seconds(cooldown_secs);
+        let until_ms = until.timestamp_millis();
+        states.insert(
+            id,
+            RateLimitFallbackState {
+                rate_limited_until: until,
+                strike_count,
+                upstream_status,
+                reason,
+            },
+        );
+        (strike_count, cooldown_secs, until_ms)
+    }
+
+    fn mirror_rate_limit_fallback_state(
+        &self,
+        id: u64,
+        strike_count: u64,
+        until_ms: i64,
+        upstream_status: Option<u16>,
+        reason: Option<String>,
+    ) {
+        if let Some(until) = DateTime::<Utc>::from_timestamp_millis(until_ms) {
+            self.rate_limit_fallbacks.lock().insert(
+                id,
+                RateLimitFallbackState {
+                    rate_limited_until: until,
+                    strike_count,
+                    upstream_status,
+                    reason,
+                },
+            );
+        }
+    }
+
+    async fn scheduler_state_for(&self, id: u64) -> SchedulerCredentialState {
+        self.scheduler_states_for(&[id])
+            .await
+            .remove(&id)
+            .unwrap_or_default()
+    }
+
+    async fn scheduler_states_for(&self, ids: &[u64]) -> HashMap<u64, SchedulerCredentialState> {
+        if ids.is_empty() {
+            return HashMap::new();
+        }
+
+        let Some(redis) = self.redis.clone() else {
+            return ids
+                .iter()
+                .map(|id| (*id, self.fallback_scheduler_state_for(*id)))
+                .collect();
+        };
+        let mut conn = match redis.get().await {
+            Ok(conn) => conn,
+            Err(err) => {
+                tracing::warn!("读取 Redis 调度状态失败，使用进程内降级状态: {}", err);
+                return ids
+                    .iter()
+                    .map(|id| (*id, self.fallback_scheduler_state_for(*id)))
+                    .collect();
+            }
+        };
+
+        let mut pipe = redis::pipe();
+        for id in ids {
+            pipe.cmd("HMGET").arg(Self::sched_state_key(*id)).arg(&[
+                "rate_limited_until_ms",
+                "temp_unschedulable_until_ms",
+                "manual_recovery_required",
+            ]);
+        }
+
+        let values: redis::RedisResult<Vec<(Option<i64>, Option<i64>, Option<String>)>> =
+            pipe.query_async(&mut *conn).await;
+
+        match values {
+            Ok(values) => ids
+                .iter()
+                .zip(values)
+                .map(
+                    |(id, (rate_limited_until_ms, temp_unschedulable_until_ms, manual))| {
+                        let state = SchedulerCredentialState {
+                            rate_limited_until_ms,
+                            temp_unschedulable_until_ms,
+                            manual_recovery_required: manual
+                                .as_deref()
+                                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+                        };
+                        let fallback = self.fallback_scheduler_state_for(*id);
+                        let now_ms = Utc::now().timestamp_millis();
+                        let effective_state = if state.is_schedulable_at(now_ms)
+                            && !fallback.is_schedulable_at(now_ms)
+                        {
+                            fallback
+                        } else {
+                            state
+                        };
+                        (*id, effective_state)
+                    },
+                )
+                .collect(),
+            Err(err) => {
+                tracing::warn!("解析 Redis 调度状态失败，使用进程内降级状态: {}", err);
+                ids.iter()
+                    .map(|id| (*id, self.fallback_scheduler_state_for(*id)))
+                    .collect()
+            }
+        }
+    }
+
+    async fn credential_is_schedulable_dynamic(&self, id: u64) -> bool {
+        self.scheduler_state_for(id)
+            .await
+            .is_schedulable_at(Utc::now().timestamp_millis())
+    }
+
+    /// 记录一次 Kiro 429，并把账号放入 Redis 短冷却。
+    ///
+    /// 该状态只影响调度，不会把账号永久 disabled。
+    pub async fn report_rate_limited(&self, id: u64, upstream_status: u16, reason: &str) {
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.last_used_at = Some(Utc::now().to_rfc3339());
+            }
+        }
+
+        let Some(redis) = self.redis.clone() else {
+            let (level, cooldown_secs, until_ms) = self.write_rate_limit_fallback_state(
+                id,
+                Some(upstream_status),
+                Some(reason.chars().take(512).collect()),
+            );
+            tracing::warn!(
+                "Redis 未配置，使用进程内 429 冷却: credential_id={} status={} level={} cooldown={}s until_ms={}",
+                id,
+                upstream_status,
+                level,
+                cooldown_secs,
+                until_ms
+            );
+            self.unbind_sessions_for_credential(id);
+            return;
+        };
+
+        let key = Self::sched_state_key(id);
+        let now_ms = Utc::now().timestamp_millis();
+        let mut conn = match redis.get().await {
+            Ok(conn) => conn,
+            Err(err) => {
+                tracing::warn!(
+                    "获取 Redis 连接失败，降级为进程内 429 冷却: credential_id={} err={}",
+                    id,
+                    err
+                );
+                self.write_rate_limit_fallback_state(
+                    id,
+                    Some(upstream_status),
+                    Some(reason.chars().take(512).collect()),
+                );
+                self.unbind_sessions_for_credential(id);
+                return;
+            }
+        };
+
+        let level: i64 = match redis::cmd("HINCRBY")
+            .arg(&key)
+            .arg("rate_limit_level")
+            .arg(1_i64)
+            .query_async(&mut *conn)
+            .await
+        {
+            Ok(level) => level,
+            Err(err) => {
+                tracing::warn!(
+                    "更新 429 冷却档位失败，降级为进程内冷却: credential_id={} err={}",
+                    id,
+                    err
+                );
+                self.write_rate_limit_fallback_state(
+                    id,
+                    Some(upstream_status),
+                    Some(reason.chars().take(512).collect()),
+                );
+                self.unbind_sessions_for_credential(id);
+                return;
+            }
+        };
+
+        let base_secs = Self::rate_limit_cooldown_secs(level);
+        let cooldown_secs = Self::jittered_cooldown_secs(base_secs);
+        let until_ms = now_ms + cooldown_secs.saturating_mul(1000);
+        let trimmed_reason: String = reason.chars().take(512).collect();
+
+        let pipe_result: redis::RedisResult<()> = redis::pipe()
+            .atomic()
+            .cmd("HSET")
+            .arg(&key)
+            .arg("rate_limited_until_ms")
+            .arg(until_ms)
+            .arg("rate_limited_reason")
+            .arg(&trimmed_reason)
+            .arg("rate_limited_status")
+            .arg(upstream_status as i64)
+            .arg("last_rate_limited_at_ms")
+            .arg(now_ms)
+            .arg("manual_recovery_required")
+            .arg("0")
+            .ignore()
+            .cmd("EXPIRE")
+            .arg(&key)
+            .arg(SCHED_STATE_TTL_SECS)
+            .ignore()
+            .cmd("ZADD")
+            .arg(Self::sched_rate_limit_zset_key())
+            .arg(until_ms)
+            .arg(id)
+            .ignore()
+            .cmd("XADD")
+            .arg(Self::sched_event_stream_key())
+            .arg("MAXLEN")
+            .arg("~")
+            .arg(10_000)
+            .arg("*")
+            .arg("kind")
+            .arg("rate_limited")
+            .arg("credential_id")
+            .arg(id)
+            .arg("status")
+            .arg(upstream_status as i64)
+            .arg("reason")
+            .arg(&trimmed_reason)
+            .arg("cooldown_until_ms")
+            .arg(until_ms)
+            .ignore()
+            .query_async(&mut *conn)
+            .await;
+
+        if let Err(err) = pipe_result {
+            tracing::warn!(
+                "写入 429 冷却状态失败，降级为进程内冷却: credential_id={} err={}",
+                id,
+                err
+            );
+            self.write_rate_limit_fallback_state(
+                id,
+                Some(upstream_status),
+                Some(trimmed_reason.clone()),
+            );
+            self.unbind_sessions_for_credential(id);
+            return;
+        }
+
+        self.mirror_rate_limit_fallback_state(
+            id,
+            level.max(1) as u64,
+            until_ms,
+            Some(upstream_status),
+            Some(trimmed_reason),
+        );
+        self.unbind_sessions_for_credential(id);
+        tracing::warn!(
+            "凭据 #{} 触发 429 冷却: level={} cooldown={}s until_ms={}",
+            id,
+            level,
+            cooldown_secs,
+            until_ms
+        );
+    }
+
+    fn record_scheduler_success_async(&self, id: u64) {
+        self.rate_limit_fallbacks.lock().remove(&id);
+        let Some(redis) = self.redis.clone() else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        tokio::spawn(async move {
+            let key = Self::sched_state_key(id);
+            let now_ms = Utc::now().timestamp_millis();
+            let mut conn = match redis.get().await {
+                Ok(conn) => conn,
+                Err(err) => {
+                    tracing::warn!(
+                        "获取 Redis 连接失败，跳过调度成功记录: credential_id={} err={}",
+                        id,
+                        err
+                    );
+                    return;
+                }
+            };
+
+            let level: i64 = redis::cmd("HGET")
+                .arg(&key)
+                .arg("rate_limit_level")
+                .query_async::<Option<i64>>(&mut *conn)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+            let next_level = level.saturating_sub(2).max(0);
+            let res: redis::RedisResult<()> = redis::pipe()
+                .atomic()
+                .cmd("HSET")
+                .arg(&key)
+                .arg("rate_limit_level")
+                .arg(next_level)
+                .arg("last_success_at_ms")
+                .arg(now_ms)
+                .ignore()
+                .cmd("HDEL")
+                .arg(&key)
+                .arg("rate_limited_until_ms")
+                .arg("rate_limited_reason")
+                .arg("rate_limited_status")
+                .arg("last_rate_limited_at_ms")
+                .ignore()
+                .cmd("ZREM")
+                .arg(Self::sched_rate_limit_zset_key())
+                .arg(id)
+                .ignore()
+                .query_async(&mut *conn)
+                .await;
+            if let Err(err) = res {
+                tracing::warn!("清理 Redis 调度冷却失败: credential_id={} err={}", id, err);
+            }
+        });
     }
 
     /// 异步把当前内存凭据全量写回 PG。
@@ -863,20 +1309,40 @@ impl MultiTokenManager {
     }
 
     /// 根据负载均衡模式选择下一个凭据，并排除本次请求已临时失败的凭据。
-    fn select_next_credential_excluding(
+    async fn select_next_credential_excluding(
         &self,
         model: Option<&str>,
         excluded_ids: &HashSet<u64>,
     ) -> Option<(u64, KiroCredentials)> {
-        let entries = self.entries.lock();
-
-        // 过滤可用凭据
-        let available: Vec<_> = entries
+        let candidates: Vec<_> = self
+            .entries
+            .lock()
             .iter()
             .filter(|e| {
                 !excluded_ids.contains(&e.id) && Self::credential_is_usable_for_model(e, model)
             })
+            .map(|e| {
+                (
+                    e.id,
+                    e.credentials.clone(),
+                    e.success_count,
+                    e.credentials.priority,
+                )
+            })
             .collect();
+
+        let candidate_ids: Vec<u64> = candidates.iter().map(|candidate| candidate.0).collect();
+        let states = self.scheduler_states_for(&candidate_ids).await;
+        let now_ms = Utc::now().timestamp_millis();
+        let mut available = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if states
+                .get(&candidate.0)
+                .is_none_or(|state| state.is_schedulable_at(now_ms))
+            {
+                available.push(candidate);
+            }
+        }
 
         if available.is_empty() {
             return None;
@@ -889,16 +1355,13 @@ impl MultiTokenManager {
             "balanced" => {
                 // Least-Used 策略：选择成功次数最少的凭据
                 // 平局时按优先级排序（数字越小优先级越高）
-                let entry = available
-                    .iter()
-                    .min_by_key(|e| (e.success_count, e.credentials.priority))?;
-
-                Some((entry.id, entry.credentials.clone()))
+                let entry = available.iter().min_by_key(|e| (e.2, e.3))?;
+                Some((entry.0, entry.1.clone()))
             }
             _ => {
                 // priority 模式（默认）：选择优先级最高的
-                let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
-                Some((entry.id, entry.credentials.clone()))
+                let entry = available.iter().min_by_key(|e| e.3)?;
+                Some((entry.0, entry.1.clone()))
             }
         }
     }
@@ -927,7 +1390,7 @@ impl MultiTokenManager {
         }
     }
 
-    fn get_bound_credential(
+    async fn get_bound_credential(
         &self,
         session_id: &str,
         model: Option<&str>,
@@ -945,11 +1408,21 @@ impl MultiTokenManager {
             return None;
         }
 
-        let entries = self.entries.lock();
-        entries
+        let hit = self
+            .entries
+            .lock()
             .iter()
             .find(|e| e.id == bound_id && Self::credential_is_usable_for_model(e, model))
-            .map(|e| (e.id, e.credentials.clone()))
+            .map(|e| (e.id, e.credentials.clone()));
+
+        if let Some((id, credentials)) = hit {
+            if self.credential_is_schedulable_dynamic(id).await {
+                return Some((id, credentials));
+            }
+            self.unbind_session_if_bound_to(session_id, id);
+        }
+
+        None
     }
 
     fn bound_credential_id(&self, session_id: &str) -> Option<u64> {
@@ -1048,6 +1521,7 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    #[allow(dead_code)]
     pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
         self.acquire_context_for_session(model, None, &HashSet::new())
             .await
@@ -1079,8 +1553,10 @@ impl MultiTokenManager {
 
             let (id, credentials, sticky_bound, fallback_from_sticky) = {
                 let existing_bound_id = session_id.and_then(|sid| self.bound_credential_id(sid));
-                let bound_hit =
-                    session_id.and_then(|sid| self.get_bound_credential(sid, model, excluded_ids));
+                let bound_hit = match session_id {
+                    Some(sid) => self.get_bound_credential(sid, model, excluded_ids).await,
+                    None => None,
+                };
 
                 if let Some(hit) = bound_hit {
                     (hit.0, hit.1, true, false)
@@ -1093,43 +1569,63 @@ impl MultiTokenManager {
                     let current_hit = if is_balanced {
                         None
                     } else {
-                        let entries = self.entries.lock();
                         let current_id = *self.current_id.lock();
-                        entries
+                        let candidate = self
+                            .entries
+                            .lock()
                             .iter()
                             .find(|e| {
                                 e.id == current_id
                                     && !excluded_ids.contains(&e.id)
                                     && Self::credential_is_usable_for_model(e, model)
                             })
-                            .map(|e| (e.id, e.credentials.clone()))
+                            .map(|e| (e.id, e.credentials.clone()));
+                        match candidate {
+                            Some(hit) if self.credential_is_schedulable_dynamic(hit.0).await => {
+                                Some(hit)
+                            }
+                            _ => None,
+                        }
                     };
 
                     if let Some(hit) = current_hit {
                         (hit.0, hit.1, false, fallback_from_sticky)
                     } else {
                         // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                        let mut best = self.select_next_credential_excluding(model, excluded_ids);
+                        let mut best = self
+                            .select_next_credential_excluding(model, excluded_ids)
+                            .await;
 
                         // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                         if best.is_none() {
-                            let mut entries = self.entries.lock();
-                            if entries.iter().any(|e| {
-                                e.disabled
-                                    && e.disabled_reason == Some(DisabledReason::TooManyFailures)
-                            }) {
-                                tracing::warn!(
-                                    "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
-                                );
-                                for e in entries.iter_mut() {
-                                    if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
-                                        e.disabled = false;
-                                        e.disabled_reason = None;
-                                        e.failure_count = 0;
+                            let recovered = {
+                                let mut entries = self.entries.lock();
+                                if entries.iter().any(|e| {
+                                    e.disabled
+                                        && e.disabled_reason
+                                            == Some(DisabledReason::TooManyFailures)
+                                }) {
+                                    tracing::warn!(
+                                        "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
+                                    );
+                                    for e in entries.iter_mut() {
+                                        if e.disabled_reason
+                                            == Some(DisabledReason::TooManyFailures)
+                                        {
+                                            e.disabled = false;
+                                            e.disabled_reason = None;
+                                            e.failure_count = 0;
+                                        }
                                     }
+                                    true
+                                } else {
+                                    false
                                 }
-                                drop(entries);
-                                best = self.select_next_credential_excluding(model, excluded_ids);
+                            };
+                            if recovered {
+                                best = self
+                                    .select_next_credential_excluding(model, excluded_ids)
+                                    .await;
                             }
                         }
 
@@ -1143,7 +1639,17 @@ impl MultiTokenManager {
                             // 注意：必须在 bail! 之前计算 available_count，
                             // 因为 available_count() 会尝试获取 entries 锁，
                             // 而此时我们已经持有该锁，会导致死锁
-                            let available = entries.iter().filter(|e| !e.disabled).count();
+                            let available = entries
+                                .iter()
+                                .filter(|e| Self::credential_is_usable_for_model(e, model))
+                                .count();
+                            if available > 0 {
+                                anyhow::bail!(
+                                    "所有可用凭据当前均不可调度（{}/{} 可用，可能处于 429 冷却）",
+                                    available,
+                                    total
+                                );
+                            }
                             anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                         }
                     }
@@ -1496,6 +2002,7 @@ impl MultiTokenManager {
                 tracing::debug!("凭据 #{} API 调用成功(累计 {} 次)", id, entry.success_count);
             }
         }
+        self.record_scheduler_success_async(id);
         self.save_stats_debounced();
     }
 
@@ -1849,66 +2356,103 @@ impl MultiTokenManager {
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
+        let now = Utc::now();
+        let rate_limit_fallbacks = self.rate_limit_fallbacks.lock().clone();
 
         ManagerSnapshot {
             entries: entries
                 .iter()
-                .map(|e| CredentialEntrySnapshot {
-                    id: e.id,
-                    priority: e.credentials.priority,
-                    disabled: e.disabled,
-                    failure_count: e.failure_count,
-                    auth_method: if e.credentials.is_api_key_credential() {
-                        Some("api_key".to_string())
+                .map(|e| {
+                    let rate_limit_state = rate_limit_fallbacks.get(&e.id);
+                    let active_rate_limit =
+                        rate_limit_state.filter(|state| state.rate_limited_until > now);
+                    let active_quota_cooldown = e.cooldown_until.filter(|until| *until > now);
+                    let (scheduling_status, scheduling_reason, scheduling_until) = if e.disabled {
+                        (
+                            "disabled".to_string(),
+                            disabled_reason_to_str(e.disabled_reason),
+                            e.cooldown_until.map(|until| until.to_rfc3339()),
+                        )
+                    } else if let Some(until) = active_quota_cooldown {
+                        (
+                            "quota_cooldown".to_string(),
+                            Some("MONTHLY_REQUEST_COUNT".to_string()),
+                            Some(until.to_rfc3339()),
+                        )
+                    } else if let Some(state) = active_rate_limit {
+                        (
+                            "rate_limited".to_string(),
+                            state.reason.clone().or_else(|| Some("429".to_string())),
+                            Some(state.rate_limited_until.to_rfc3339()),
+                        )
                     } else {
-                        e.credentials.auth_method.as_deref().map(|m| {
-                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam")
-                            {
-                                "idc".to_string()
-                            } else {
-                                m.to_string()
+                        ("healthy".to_string(), None, None)
+                    };
+
+                    CredentialEntrySnapshot {
+                        id: e.id,
+                        priority: e.credentials.priority,
+                        disabled: e.disabled,
+                        failure_count: e.failure_count,
+                        auth_method: if e.credentials.is_api_key_credential() {
+                            Some("api_key".to_string())
+                        } else {
+                            e.credentials.auth_method.as_deref().map(|m| {
+                                if m.eq_ignore_ascii_case("builder-id")
+                                    || m.eq_ignore_ascii_case("iam")
+                                {
+                                    "idc".to_string()
+                                } else {
+                                    m.to_string()
+                                }
+                            })
+                        },
+                        has_profile_arn: e.credentials.profile_arn.is_some(),
+                        expires_at: if e.credentials.is_api_key_credential() {
+                            None // API Key 凭据本地不维护过期时间（服务端策略未知）
+                        } else {
+                            e.credentials.expires_at.clone()
+                        },
+                        refresh_token_hash: if e.credentials.is_api_key_credential() {
+                            None
+                        } else {
+                            e.credentials.refresh_token.as_deref().map(sha256_hex)
+                        },
+                        api_key_hash: if e.credentials.is_api_key_credential() {
+                            e.credentials.kiro_api_key.as_deref().map(sha256_hex)
+                        } else {
+                            None
+                        },
+                        masked_api_key: if e.credentials.is_api_key_credential() {
+                            e.credentials.kiro_api_key.as_deref().map(mask_api_key)
+                        } else {
+                            None
+                        },
+                        email: e.credentials.email.clone(),
+                        success_count: e.success_count,
+                        last_used_at: e.last_used_at.clone(),
+                        has_proxy: e.credentials.proxy_url.is_some(),
+                        proxy_url: e.credentials.proxy_url.clone(),
+                        refresh_failure_count: e.refresh_failure_count,
+                        disabled_reason: e.disabled_reason.map(|r| {
+                            match r {
+                                DisabledReason::Manual => "Manual",
+                                DisabledReason::TooManyFailures => "TooManyFailures",
+                                DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
+                                DisabledReason::QuotaExceeded => "QuotaExceeded",
+                                DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
+                                DisabledReason::InvalidConfig => "InvalidConfig",
                             }
-                        })
-                    },
-                    has_profile_arn: e.credentials.profile_arn.is_some(),
-                    expires_at: if e.credentials.is_api_key_credential() {
-                        None // API Key 凭据本地不维护过期时间（服务端策略未知）
-                    } else {
-                        e.credentials.expires_at.clone()
-                    },
-                    refresh_token_hash: if e.credentials.is_api_key_credential() {
-                        None
-                    } else {
-                        e.credentials.refresh_token.as_deref().map(sha256_hex)
-                    },
-                    api_key_hash: if e.credentials.is_api_key_credential() {
-                        e.credentials.kiro_api_key.as_deref().map(sha256_hex)
-                    } else {
-                        None
-                    },
-                    masked_api_key: if e.credentials.is_api_key_credential() {
-                        e.credentials.kiro_api_key.as_deref().map(mask_api_key)
-                    } else {
-                        None
-                    },
-                    email: e.credentials.email.clone(),
-                    success_count: e.success_count,
-                    last_used_at: e.last_used_at.clone(),
-                    has_proxy: e.credentials.proxy_url.is_some(),
-                    proxy_url: e.credentials.proxy_url.clone(),
-                    refresh_failure_count: e.refresh_failure_count,
-                    disabled_reason: e.disabled_reason.map(|r| {
-                        match r {
-                            DisabledReason::Manual => "Manual",
-                            DisabledReason::TooManyFailures => "TooManyFailures",
-                            DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
-                            DisabledReason::QuotaExceeded => "QuotaExceeded",
-                            DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
-                            DisabledReason::InvalidConfig => "InvalidConfig",
-                        }
-                        .to_string()
-                    }),
-                    endpoint: e.credentials.endpoint.clone(),
+                            .to_string()
+                        }),
+                        endpoint: e.credentials.endpoint.clone(),
+                        scheduling_status,
+                        scheduling_reason,
+                        scheduling_until,
+                        last_upstream_status: rate_limit_state
+                            .and_then(|state| state.upstream_status),
+                        rate_limited_count: rate_limit_state.map(|state| state.strike_count),
+                    }
                 })
                 .collect(),
             current_id,
@@ -3290,6 +3834,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rate_limited_bound_session_is_unbound_and_skipped() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let empty = HashSet::new();
+
+        let bound = manager
+            .acquire_context_for_session(None, Some("session-d"), &empty)
+            .await
+            .unwrap();
+        manager.report_success_for_session(bound.id, Some("session-d"));
+
+        manager
+            .report_rate_limited(bound.id, 429, "too many requests")
+            .await;
+
+        let fallback = manager
+            .acquire_context_for_session(None, Some("session-d"), &empty)
+            .await
+            .unwrap();
+
+        assert_ne!(bound.id, fallback.id);
+        assert!(!manager.credential_is_schedulable_dynamic(bound.id).await);
+    }
+
+    #[tokio::test]
     async fn test_current_id_respects_opus_model_filter() {
         let mut free = KiroCredentials::default();
         free.priority = 0;
@@ -3312,6 +3891,97 @@ mod tests {
             .unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "pro-token");
+    }
+
+    #[test]
+    fn test_rate_limit_cooldown_levels_are_bounded() {
+        assert_eq!(MultiTokenManager::rate_limit_cooldown_secs(1), 45);
+        assert_eq!(MultiTokenManager::rate_limit_cooldown_secs(2), 120);
+        assert_eq!(MultiTokenManager::rate_limit_cooldown_secs(3), 300);
+        assert_eq!(MultiTokenManager::rate_limit_cooldown_secs(4), 900);
+        assert_eq!(MultiTokenManager::rate_limit_cooldown_secs(5), 1800);
+        assert_eq!(
+            MultiTokenManager::rate_limit_cooldown_secs(99),
+            RATE_LIMIT_MAX_COOLDOWN_SECS
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rate_limited_credential_is_skipped_without_disabling() {
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred1, cred2], None, None, false)
+                .unwrap();
+
+        manager
+            .report_rate_limited(1, 429, "too many requests")
+            .await;
+
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(!first.disabled);
+        assert_eq!(first.scheduling_status, "rate_limited");
+        assert!(first.scheduling_until.is_some());
+        assert_eq!(first.last_upstream_status, Some(429));
+        assert_eq!(first.rate_limited_count, Some(1));
+        assert_eq!(manager.available_count(), 2);
+
+        let ctx = manager.acquire_context(None).await.unwrap();
+        assert_eq!(ctx.id, 2);
+        assert_eq!(ctx.token, "t2");
+    }
+
+    #[tokio::test]
+    async fn test_all_rate_limited_credentials_are_unavailable_but_not_disabled() {
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("t1".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap();
+
+        manager
+            .report_rate_limited(1, 429, "too many requests")
+            .await;
+
+        let err = manager
+            .acquire_context(None)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("不可调度"),
+            "错误应提示不可调度，实际: {}",
+            err
+        );
+        assert_eq!(manager.available_count(), 1);
+        assert!(!manager.snapshot().entries[0].disabled);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_state_is_cleared_on_success() {
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("t1".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap();
+
+        manager
+            .report_rate_limited(1, 429, "too many requests")
+            .await;
+        assert!(!manager.credential_is_schedulable_dynamic(1).await);
+
+        manager.report_success(1);
+
+        assert!(manager.credential_is_schedulable_dynamic(1).await);
     }
 
     #[test]
