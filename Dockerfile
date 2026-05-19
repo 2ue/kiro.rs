@@ -2,7 +2,7 @@ FROM node:22-alpine AS admin-ui-builder
 
 WORKDIR /app/admin-ui
 COPY admin-ui/package.json admin-ui/pnpm-lock.yaml admin-ui/.npmrc admin-ui/pnpm-workspace.yaml ./
-RUN npm install -g pnpm
+RUN npm install -g pnpm@9.15.0
 RUN pnpm install --frozen-lockfile
 COPY admin-ui ./
 RUN pnpm build
@@ -11,7 +11,7 @@ FROM node:22-alpine AS console-builder
 
 WORKDIR /app/frontend
 COPY frontend/package.json frontend/pnpm-lock.yaml frontend/.npmrc ./
-RUN npm install -g pnpm
+RUN npm install -g pnpm@9.15.0
 RUN pnpm install --frozen-lockfile
 COPY frontend ./
 RUN pnpm build
