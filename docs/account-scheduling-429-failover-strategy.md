@@ -23,6 +23,7 @@
    - 冷却档位为 `45s -> 120s -> 300s -> 900s -> 1800s -> max 7200s`，并加 20% jitter。
    - Redis 不可用时降级到进程内 `rate_limit_fallbacks`，只影响当前进程，不持久化。
    - 账号选择前先读取动态调度状态；候选账号使用 Redis pipeline 批量读取 state，后续账号池进一步变大时可再收敛为 Lua 或聚合 hash。
+   - 短窗口内多个账号同时 429 时，写入 Redis 全池 backoff，后续调度快速失败一小段时间，避免继续把整池账号推高冷却档位。
    - sticky 命中时也重新检查动态调度状态；账号不可调度则解绑。
    - 429 不会写成 `disabled=true`，`available_count` 仍反映账号配置可用性。
    - 成功请求会清理 429 冷却字段，并衰减 `rate_limit_level`。
@@ -36,7 +37,7 @@
 
 1. 最近 outcome 窗口、同一 `request_id + credential_id` 去重。
 2. 完整 half-open probe 锁。
-3. 全局 429 波动保护。
+3. 更完整的全局 429 波动保护，包括成功率下降判断、全局事件 UI 展示和后台清理任务；本次只落地 Redis 短窗口全池 backoff。
 4. `manual_recovery_required` 的 PG 低频持久化和 UI 展示。
 5. 5xx / 网络错误的轻量惩罚评分。
 6. Admin UI 与 Console UI 的账号调度状态可视化。

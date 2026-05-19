@@ -566,6 +566,8 @@ pub struct MultiTokenManager {
     redis: Option<crate::storage::RedisPool>,
     /// Redis 不可用时的进程内 429 冷却降级状态；不持久化、不跨进程。
     rate_limit_fallbacks: Mutex<HashMap<u64, RateLimitFallbackState>>,
+    /// Redis 不可用时的进程内全池 429 退避状态；不持久化、不跨进程。
+    global_rate_limit_fallback_until: Mutex<Option<DateTime<Utc>>>,
     /// 配额冷却参数:(strike_limit, cooldown_minutes),由 attach_storage 时从 app_config 读入
     quota_settings: Mutex<(u32, i64)>,
 }
@@ -588,6 +590,18 @@ const RATE_LIMIT_COOLDOWN_LEVELS_SECS: [i64; 5] = [45, 120, 300, 900, 1800];
 const RATE_LIMIT_MAX_COOLDOWN_SECS: i64 = 7200;
 /// 调度状态 Redis TTL（秒）。
 const SCHED_STATE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
+/// 全池 429 波动观测窗口（秒）。
+const GLOBAL_RATE_LIMIT_WINDOW_SECS: i64 = 5 * 60;
+/// 触发全池退避所需的最小账号数。
+const GLOBAL_RATE_LIMIT_MIN_ACCOUNTS: usize = 3;
+/// 触发全池退避的账号比例分子（默认 3/5 = 60%）。
+const GLOBAL_RATE_LIMIT_RATIO_NUMERATOR: usize = 3;
+/// 触发全池退避的账号比例分母（默认 3/5 = 60%）。
+const GLOBAL_RATE_LIMIT_RATIO_DENOMINATOR: usize = 5;
+/// 全池 429 退避最短秒数。
+const GLOBAL_RATE_LIMIT_BACKOFF_MIN_SECS: i64 = 30;
+/// 全池 429 退避最长秒数。
+const GLOBAL_RATE_LIMIT_BACKOFF_MAX_SECS: i64 = 90;
 
 #[derive(Debug, Clone, Default)]
 struct SchedulerCredentialState {
@@ -749,6 +763,7 @@ impl MultiTokenManager {
             db: None,
             redis: None,
             rate_limit_fallbacks: Mutex::new(HashMap::new()),
+            global_rate_limit_fallback_until: Mutex::new(None),
             quota_settings: Mutex::new((3, 30)),
         };
 
@@ -841,6 +856,14 @@ impl MultiTokenManager {
         "kiro:sched:v1:events"
     }
 
+    fn sched_pool_rate_limit_accounts_key() -> &'static str {
+        "kiro:sched:v1:pool:429_accounts"
+    }
+
+    fn sched_global_rate_limit_key() -> &'static str {
+        "kiro:sched:v1:pool:global_backoff_until_ms"
+    }
+
     fn rate_limit_cooldown_secs(level: i64) -> i64 {
         let base = RATE_LIMIT_COOLDOWN_LEVELS_SECS
             .get(level.saturating_sub(1).max(0) as usize)
@@ -857,6 +880,70 @@ impl MultiTokenManager {
         let min = (base_secs - jitter).max(1);
         let max = (base_secs + jitter).max(min);
         fastrand::i64(min..=max)
+    }
+
+    fn global_rate_limit_threshold(pool_size: usize) -> usize {
+        if pool_size == 0 {
+            return GLOBAL_RATE_LIMIT_MIN_ACCOUNTS;
+        }
+        let ratio_threshold = pool_size
+            .saturating_mul(GLOBAL_RATE_LIMIT_RATIO_NUMERATOR)
+            .div_ceil(GLOBAL_RATE_LIMIT_RATIO_DENOMINATOR);
+        GLOBAL_RATE_LIMIT_MIN_ACCOUNTS.max(ratio_threshold)
+    }
+
+    fn jittered_global_rate_limit_backoff_secs() -> i64 {
+        fastrand::i64(GLOBAL_RATE_LIMIT_BACKOFF_MIN_SECS..=GLOBAL_RATE_LIMIT_BACKOFF_MAX_SECS)
+    }
+
+    fn usable_credential_count_for_global_backoff(&self) -> usize {
+        self.entries
+            .lock()
+            .iter()
+            .filter(|entry| !entry.disabled)
+            .count()
+    }
+
+    fn fallback_global_rate_limit_until_ms(&self) -> Option<i64> {
+        let now = Utc::now();
+        let mut until = self.global_rate_limit_fallback_until.lock();
+        match *until {
+            Some(ts) if ts > now => Some(ts.timestamp_millis()),
+            Some(_) => {
+                *until = None;
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn maybe_write_global_rate_limit_fallback(&self) -> Option<i64> {
+        let now = Utc::now();
+        let pool_size = self.usable_credential_count_for_global_backoff();
+        let threshold = Self::global_rate_limit_threshold(pool_size);
+        let active_rate_limited = self
+            .rate_limit_fallbacks
+            .lock()
+            .values()
+            .filter(|state| state.rate_limited_until > now)
+            .count();
+        if active_rate_limited < threshold {
+            return None;
+        }
+
+        let backoff_secs = Self::jittered_global_rate_limit_backoff_secs();
+        let until = now + chrono::Duration::seconds(backoff_secs);
+        let until_ms = until.timestamp_millis();
+        *self.global_rate_limit_fallback_until.lock() = Some(until);
+        tracing::warn!(
+            "触发进程内全池 429 退避: active_rate_limited={} threshold={} pool_size={} backoff={}s until_ms={}",
+            active_rate_limited,
+            threshold,
+            pool_size,
+            backoff_secs,
+            until_ms
+        );
+        Some(until_ms)
     }
 
     fn fallback_scheduler_state_for(&self, id: u64) -> SchedulerCredentialState {
@@ -1000,6 +1087,129 @@ impl MultiTokenManager {
             .is_schedulable_at(Utc::now().timestamp_millis())
     }
 
+    async fn global_rate_limit_backoff_until_ms(&self) -> Option<i64> {
+        let fallback_until_ms = self.fallback_global_rate_limit_until_ms();
+        let Some(redis) = self.redis.clone() else {
+            return fallback_until_ms;
+        };
+        let mut conn = match redis.get().await {
+            Ok(conn) => conn,
+            Err(err) => {
+                tracing::warn!("读取 Redis 全池 429 退避失败，使用进程内降级状态: {}", err);
+                return fallback_until_ms;
+            }
+        };
+        let redis_until_ms = redis::cmd("GET")
+            .arg(Self::sched_global_rate_limit_key())
+            .query_async::<Option<i64>>(&mut *conn)
+            .await
+            .ok()
+            .flatten();
+        let now_ms = Utc::now().timestamp_millis();
+        redis_until_ms
+            .filter(|until_ms| *until_ms > now_ms)
+            .or(fallback_until_ms)
+    }
+
+    async fn maybe_write_global_rate_limit_backoff(
+        &self,
+        redis: &crate::storage::RedisPool,
+        now_ms: i64,
+    ) -> Option<i64> {
+        let pool_size = self.usable_credential_count_for_global_backoff();
+        let threshold = Self::global_rate_limit_threshold(pool_size);
+        let window_start_ms = now_ms - GLOBAL_RATE_LIMIT_WINDOW_SECS.saturating_mul(1000);
+        let mut conn = match redis.get().await {
+            Ok(conn) => conn,
+            Err(err) => {
+                tracing::warn!("获取 Redis 连接失败，无法判断全池 429 退避: {}", err);
+                return self.maybe_write_global_rate_limit_fallback();
+            }
+        };
+
+        let cleanup: redis::RedisResult<()> = redis::pipe()
+            .atomic()
+            .cmd("ZREMRANGEBYSCORE")
+            .arg(Self::sched_pool_rate_limit_accounts_key())
+            .arg("-inf")
+            .arg(window_start_ms - 1)
+            .ignore()
+            .cmd("EXPIRE")
+            .arg(Self::sched_pool_rate_limit_accounts_key())
+            .arg(GLOBAL_RATE_LIMIT_WINDOW_SECS * 2)
+            .ignore()
+            .query_async(&mut *conn)
+            .await;
+        if let Err(err) = cleanup {
+            tracing::warn!("清理 Redis 全池 429 窗口失败: {}", err);
+            return self.maybe_write_global_rate_limit_fallback();
+        }
+
+        let recent_count: usize = match redis::cmd("ZCOUNT")
+            .arg(Self::sched_pool_rate_limit_accounts_key())
+            .arg(window_start_ms)
+            .arg("+inf")
+            .query_async(&mut *conn)
+            .await
+        {
+            Ok(count) => count,
+            Err(err) => {
+                tracing::warn!("统计 Redis 全池 429 窗口失败: {}", err);
+                return self.maybe_write_global_rate_limit_fallback();
+            }
+        };
+        if recent_count < threshold {
+            return None;
+        }
+
+        let backoff_secs = Self::jittered_global_rate_limit_backoff_secs();
+        let until_ms = now_ms + backoff_secs.saturating_mul(1000);
+        let res: redis::RedisResult<()> = redis::pipe()
+            .atomic()
+            .cmd("SET")
+            .arg(Self::sched_global_rate_limit_key())
+            .arg(until_ms)
+            .arg("PX")
+            .arg(backoff_secs.saturating_mul(1000))
+            .ignore()
+            .cmd("XADD")
+            .arg(Self::sched_event_stream_key())
+            .arg("MAXLEN")
+            .arg("~")
+            .arg(10_000)
+            .arg("*")
+            .arg("kind")
+            .arg("global_rate_limited")
+            .arg("recent_429_accounts")
+            .arg(recent_count)
+            .arg("threshold")
+            .arg(threshold)
+            .arg("pool_size")
+            .arg(pool_size)
+            .arg("cooldown_until_ms")
+            .arg(until_ms)
+            .ignore()
+            .query_async(&mut *conn)
+            .await;
+        if let Err(err) = res {
+            tracing::warn!("写入 Redis 全池 429 退避失败: {}", err);
+            return self.maybe_write_global_rate_limit_fallback();
+        }
+
+        if let Some(until) = DateTime::<Utc>::from_timestamp_millis(until_ms) {
+            *self.global_rate_limit_fallback_until.lock() = Some(until);
+        }
+        tracing::warn!(
+            "触发 Redis 全池 429 退避: recent_429_accounts={} threshold={} pool_size={} backoff={}s until_ms={}",
+            recent_count,
+            threshold,
+            pool_size,
+            backoff_secs,
+            until_ms
+        );
+        Some(until_ms)
+    }
+
     /// 记录一次 Kiro 429，并把账号放入 Redis 短冷却。
     ///
     /// 该状态只影响调度，不会把账号永久 disabled。
@@ -1025,6 +1235,7 @@ impl MultiTokenManager {
                 cooldown_secs,
                 until_ms
             );
+            self.maybe_write_global_rate_limit_fallback();
             self.unbind_sessions_for_credential(id);
             return;
         };
@@ -1044,6 +1255,7 @@ impl MultiTokenManager {
                     Some(upstream_status),
                     Some(reason.chars().take(512).collect()),
                 );
+                self.maybe_write_global_rate_limit_fallback();
                 self.unbind_sessions_for_credential(id);
                 return;
             }
@@ -1068,6 +1280,7 @@ impl MultiTokenManager {
                     Some(upstream_status),
                     Some(reason.chars().take(512).collect()),
                 );
+                self.maybe_write_global_rate_limit_fallback();
                 self.unbind_sessions_for_credential(id);
                 return;
             }
@@ -1102,6 +1315,11 @@ impl MultiTokenManager {
             .arg(until_ms)
             .arg(id)
             .ignore()
+            .cmd("ZADD")
+            .arg(Self::sched_pool_rate_limit_accounts_key())
+            .arg(now_ms)
+            .arg(id)
+            .ignore()
             .cmd("XADD")
             .arg(Self::sched_event_stream_key())
             .arg("MAXLEN")
@@ -1133,6 +1351,7 @@ impl MultiTokenManager {
                 Some(upstream_status),
                 Some(trimmed_reason.clone()),
             );
+            self.maybe_write_global_rate_limit_fallback();
             self.unbind_sessions_for_credential(id);
             return;
         }
@@ -1144,6 +1363,8 @@ impl MultiTokenManager {
             Some(upstream_status),
             Some(trimmed_reason),
         );
+        self.maybe_write_global_rate_limit_backoff(&redis, now_ms)
+            .await;
         self.unbind_sessions_for_credential(id);
         tracing::warn!(
             "凭据 #{} 触发 429 冷却: level={} cooldown={}s until_ms={}",
@@ -1156,6 +1377,7 @@ impl MultiTokenManager {
 
     fn record_scheduler_success_async(&self, id: u64) {
         self.rate_limit_fallbacks.lock().remove(&id);
+        *self.global_rate_limit_fallback_until.lock() = None;
         let Some(redis) = self.redis.clone() else {
             return;
         };
@@ -1205,6 +1427,14 @@ impl MultiTokenManager {
                 .cmd("ZREM")
                 .arg(Self::sched_rate_limit_zset_key())
                 .arg(id)
+                .ignore()
+                .cmd("ZADD")
+                .arg("kiro:sched:v1:pool:success_accounts")
+                .arg(now_ms)
+                .arg(id)
+                .ignore()
+                .cmd("DEL")
+                .arg(Self::sched_global_rate_limit_key())
                 .ignore()
                 .query_async(&mut *conn)
                 .await;
@@ -1538,6 +1768,12 @@ impl MultiTokenManager {
     ) -> anyhow::Result<CallContext> {
         // 入口先做一次配额冷却自愈,把过期的软冷却凭据放回池
         self.recover_quota_cooldowns();
+        if let Some(until_ms) = self.global_rate_limit_backoff_until_ms().await {
+            anyhow::bail!(
+                "账号池处于全局 429 退避中，暂不可调度（until_ms={}）",
+                until_ms
+            );
+        }
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -3866,6 +4102,40 @@ mod tests {
 
         assert_ne!(bound.id, fallback.id);
         assert!(!manager.credential_is_schedulable_dynamic(bound.id).await);
+    }
+
+    #[tokio::test]
+    async fn test_global_rate_limit_backoff_triggers_after_pool_wave() {
+        let credentials: Vec<KiroCredentials> = (0..5)
+            .map(|idx| {
+                let mut cred = KiroCredentials::default();
+                cred.access_token = Some(format!("t{}", idx + 1));
+                cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+                cred
+            })
+            .collect();
+
+        let manager =
+            MultiTokenManager::new(Config::default(), credentials, None, None, false).unwrap();
+
+        for id in 1..=3 {
+            manager
+                .report_rate_limited(id, 429, "too many requests")
+                .await;
+        }
+
+        let err = manager
+            .acquire_context(None)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("全局 429 退避"),
+            "错误应提示全局退避，实际: {}",
+            err
+        );
+        assert_eq!(manager.available_count(), 5);
     }
 
     #[tokio::test]
