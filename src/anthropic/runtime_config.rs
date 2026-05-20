@@ -3,6 +3,11 @@ use parking_lot::RwLock;
 use crate::app_config::AppConfigService;
 use crate::model::config::{Config, PromptCacheSimulationMode};
 
+const DEFAULT_PROMPT_CACHE_CREATION_RATIO_MIN: f64 = 0.12;
+const DEFAULT_PROMPT_CACHE_CREATION_RATIO_MAX: f64 = 0.35;
+const DEFAULT_PROMPT_CACHE_CREATION_BURST_PROBABILITY: f64 = 0.10;
+const DEFAULT_PROMPT_CACHE_MIN_CACHEABLE_TOKENS: i32 = 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PromptCacheRuntimeConfigSnapshot {
     pub prompt_cache_simulation_mode: PromptCacheSimulationMode,
@@ -12,6 +17,10 @@ pub struct PromptCacheRuntimeConfigSnapshot {
     pub prompt_cache_cap_jitter_min_tokens: i32,
     pub prompt_cache_cap_jitter_max_tokens: i32,
     pub prompt_cache_scale_min_input_tokens: i32,
+    pub prompt_cache_creation_ratio_min: f64,
+    pub prompt_cache_creation_ratio_max: f64,
+    pub prompt_cache_creation_burst_probability: f64,
+    pub prompt_cache_min_cacheable_tokens: i32,
     pub high_cache_threshold: i32,
 }
 
@@ -27,9 +36,14 @@ impl PromptCacheRuntimeConfigSnapshot {
             prompt_cache_cap_jitter_min_tokens: config.prompt_cache_cap_jitter_min_tokens.max(0),
             prompt_cache_cap_jitter_max_tokens: config.prompt_cache_cap_jitter_max_tokens.max(0),
             prompt_cache_scale_min_input_tokens: config.prompt_cache_scale_min_input_tokens.max(0),
+            prompt_cache_creation_ratio_min: DEFAULT_PROMPT_CACHE_CREATION_RATIO_MIN,
+            prompt_cache_creation_ratio_max: DEFAULT_PROMPT_CACHE_CREATION_RATIO_MAX,
+            prompt_cache_creation_burst_probability:
+                DEFAULT_PROMPT_CACHE_CREATION_BURST_PROBABILITY,
+            prompt_cache_min_cacheable_tokens: DEFAULT_PROMPT_CACHE_MIN_CACHEABLE_TOKENS,
             high_cache_threshold: config.high_cache_threshold.max(0),
         }
-        .normalize_jitter()
+        .normalize_bounds()
     }
 
     pub fn from_config_and_app_config(config: &Config, app_config: &AppConfigService) -> Self {
@@ -60,17 +74,35 @@ impl PromptCacheRuntimeConfigSnapshot {
         if let Some(value) = app_config.get_as::<i32>("prompt_cache_scale_min_input_tokens") {
             self.prompt_cache_scale_min_input_tokens = value.max(0);
         }
+        if let Some(value) = app_config.get_as::<f64>("prompt_cache_creation_ratio_min") {
+            self.prompt_cache_creation_ratio_min = sanitize_ratio(value);
+        }
+        if let Some(value) = app_config.get_as::<f64>("prompt_cache_creation_ratio_max") {
+            self.prompt_cache_creation_ratio_max = sanitize_ratio(value);
+        }
+        if let Some(value) = app_config.get_as::<f64>("prompt_cache_creation_burst_probability") {
+            self.prompt_cache_creation_burst_probability = sanitize_probability(value);
+        }
+        if let Some(value) = app_config.get_as::<i32>("prompt_cache_min_cacheable_tokens") {
+            self.prompt_cache_min_cacheable_tokens = value.max(0);
+        }
         if let Some(value) = app_config.get_as::<i32>("high_cache_threshold") {
             self.high_cache_threshold = value.max(0);
         }
-        self.normalize_jitter()
+        self.normalize_bounds()
     }
 
-    fn normalize_jitter(mut self) -> Self {
+    fn normalize_bounds(mut self) -> Self {
         if self.prompt_cache_cap_jitter_min_tokens > self.prompt_cache_cap_jitter_max_tokens {
             std::mem::swap(
                 &mut self.prompt_cache_cap_jitter_min_tokens,
                 &mut self.prompt_cache_cap_jitter_max_tokens,
+            );
+        }
+        if self.prompt_cache_creation_ratio_min > self.prompt_cache_creation_ratio_max {
+            std::mem::swap(
+                &mut self.prompt_cache_creation_ratio_min,
+                &mut self.prompt_cache_creation_ratio_max,
             );
         }
         self
@@ -114,6 +146,14 @@ fn sanitize_token_scale(value: f64) -> f64 {
     }
 }
 
+fn sanitize_probability(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +178,10 @@ mod tests {
         assert_eq!(snapshot.prompt_cache_cap_jitter_min_tokens, 12_000);
         assert_eq!(snapshot.prompt_cache_cap_jitter_max_tokens, 24_000);
         assert_eq!(snapshot.prompt_cache_scale_min_input_tokens, 0);
+        assert_eq!(snapshot.prompt_cache_creation_ratio_min, 0.12);
+        assert_eq!(snapshot.prompt_cache_creation_ratio_max, 0.35);
+        assert_eq!(snapshot.prompt_cache_creation_burst_probability, 0.10);
+        assert_eq!(snapshot.prompt_cache_min_cacheable_tokens, 1024);
         assert_eq!(snapshot.high_cache_threshold, 0);
     }
 }

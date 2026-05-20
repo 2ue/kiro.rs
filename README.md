@@ -253,6 +253,12 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 - `local-prompt-cache`：仅在请求存在显式 `cache_control` 时按同一凭据、会话、模型的本地缓存命中情况模拟 usage。
 - `disabled`：关闭本地 prompt-cache usage 模拟。
 
+`high-cache` 的创建量可通过 `app_config` 独立控制，不影响后续 cache read 的高比例模拟：
+`prompt_cache_creation_ratio_min` 默认 `0.12`，`prompt_cache_creation_ratio_max` 默认 `0.35`，
+`prompt_cache_creation_burst_probability` 默认 `0.10`。普通创建按较小比例浮动，命中 burst 时仍使用完整高缓存比例。
+最小可缓存目标 token 门槛由 `prompt_cache_min_cacheable_tokens` 控制，默认 `1024`，
+`high-cache` 与 `local-prompt-cache` 共用，不区分 opus / 非 opus。
+
 ### credentials.json
 
 支持单对象格式（向后兼容）或数组格式（多凭据）。

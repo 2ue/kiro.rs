@@ -70,6 +70,10 @@ struct RequestUsageContext {
     prompt_cache_cap_jitter_min_tokens: i32,
     prompt_cache_cap_jitter_max_tokens: i32,
     prompt_cache_scale_min_input_tokens: i32,
+    prompt_cache_creation_ratio_min: f64,
+    prompt_cache_creation_ratio_max: f64,
+    prompt_cache_creation_burst_probability: f64,
+    prompt_cache_min_cacheable_tokens: i32,
     simulated_usage: Option<super::cache::CacheSimulation>,
     simulated_source: Option<UsageSource>,
     started_at: Instant,
@@ -106,6 +110,29 @@ impl RequestUsageContext {
                 .map(|profile| profile.cache_jitter_seed())
                 .unwrap_or(0),
         ))
+    }
+
+    fn cache_creation_policy(&self) -> Option<super::cache::CacheCreationPolicy> {
+        if self.simulation_mode != PromptCacheSimulationMode::HighCache {
+            return None;
+        }
+
+        Some(super::cache::CacheCreationPolicy::new(
+            self.prompt_cache_creation_ratio_min,
+            self.prompt_cache_creation_ratio_max,
+            self.prompt_cache_creation_burst_probability,
+            self.prompt_cache_profile
+                .as_ref()
+                .map(|profile| profile.cache_jitter_seed())
+                .unwrap_or(0),
+        ))
+    }
+
+    fn apply_cache_creation_policy(
+        &self,
+        simulation: Option<super::cache::CacheSimulation>,
+    ) -> Option<super::cache::CacheSimulation> {
+        simulation.map(|simulation| simulation.with_creation_policy(self.cache_creation_policy()))
     }
 
     #[cfg(test)]
@@ -241,10 +268,11 @@ impl CredentialUsageContext {
         }
 
         if let Some(scope) = self.scope() {
-            self.request.prompt_cache.update(
+            self.request.prompt_cache.update_with_min_cacheable_tokens(
                 Some(scope),
                 self.request.prompt_cache_profile.as_ref(),
                 self.request.prompt_cache_target_read_ratio,
+                self.request.prompt_cache_min_cacheable_tokens,
             );
         }
     }
@@ -828,6 +856,11 @@ fn prepare_usage_context(
         prompt_cache_cap_jitter_max_tokens: prompt_cache_config.prompt_cache_cap_jitter_max_tokens,
         prompt_cache_scale_min_input_tokens: prompt_cache_config
             .prompt_cache_scale_min_input_tokens,
+        prompt_cache_creation_ratio_min: prompt_cache_config.prompt_cache_creation_ratio_min,
+        prompt_cache_creation_ratio_max: prompt_cache_config.prompt_cache_creation_ratio_max,
+        prompt_cache_creation_burst_probability: prompt_cache_config
+            .prompt_cache_creation_burst_probability,
+        prompt_cache_min_cacheable_tokens: prompt_cache_config.prompt_cache_min_cacheable_tokens,
         simulated_usage,
         simulated_source,
         started_at: Instant::now(),
@@ -918,11 +951,14 @@ fn prepare_credential_usage_context(
     match usage_context.simulation_mode {
         PromptCacheSimulationMode::Disabled => {}
         PromptCacheSimulationMode::LocalPromptCache => {
-            let prompt_usage = usage_context.prompt_cache.compute(
-                scope,
-                usage_context.prompt_cache_profile.as_ref(),
-                usage_context.prompt_cache_target_read_ratio,
-            );
+            let prompt_usage = usage_context
+                .prompt_cache
+                .compute_with_min_cacheable_tokens(
+                    scope,
+                    usage_context.prompt_cache_profile.as_ref(),
+                    usage_context.prompt_cache_target_read_ratio,
+                    usage_context.prompt_cache_min_cacheable_tokens,
+                );
             usage_context.simulated_usage =
                 super::cache::CacheSimulation::from_prompt_cache_with_ratio_and_amplification(
                     prompt_usage,
@@ -931,18 +967,22 @@ fn prepare_credential_usage_context(
                 );
         }
         PromptCacheSimulationMode::HighCache => {
-            let computation = usage_context.prompt_cache.compute_high_cache(
-                scope,
-                usage_context.prompt_cache_profile.as_ref(),
-                usage_context.prompt_cache_target_read_ratio,
-            );
-            usage_context.simulated_usage =
+            let computation = usage_context
+                .prompt_cache
+                .compute_high_cache_with_min_cacheable_tokens(
+                    scope,
+                    usage_context.prompt_cache_profile.as_ref(),
+                    usage_context.prompt_cache_target_read_ratio,
+                    usage_context.prompt_cache_min_cacheable_tokens,
+                );
+            usage_context.simulated_usage = usage_context.apply_cache_creation_policy(
                 super::cache::CacheSimulation::from_prompt_cache_with_ratio_amplification_and_floor(
                     computation.usage,
                     usage_context.prompt_cache_target_read_ratio,
                     usage_context.cache_amplification(),
                     computation.simulated_total_input_floor_tokens,
-                );
+                ),
+            );
         }
     }
     if matches!(
@@ -2247,6 +2287,10 @@ mod tests {
                 prompt_cache_cap_jitter_min_tokens: 0,
                 prompt_cache_cap_jitter_max_tokens: 0,
                 prompt_cache_scale_min_input_tokens: 0,
+                prompt_cache_creation_ratio_min: 0.12,
+                prompt_cache_creation_ratio_max: 0.35,
+                prompt_cache_creation_burst_probability: 0.10,
+                prompt_cache_min_cacheable_tokens: 1024,
                 high_cache_threshold: 10_000,
             },
         ))
@@ -2360,6 +2404,10 @@ mod tests {
             prompt_cache_cap_jitter_min_tokens: 0,
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
+            prompt_cache_creation_ratio_min: 0.12,
+            prompt_cache_creation_ratio_max: 0.35,
+            prompt_cache_creation_burst_probability: 0.10,
+            prompt_cache_min_cacheable_tokens: 1024,
             simulated_usage: None,
             simulated_source: Some(UsageSource::LocalPromptCache),
             started_at: Instant::now(),
@@ -2429,6 +2477,10 @@ mod tests {
             prompt_cache_cap_jitter_min_tokens: 0,
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
+            prompt_cache_creation_ratio_min: 0.12,
+            prompt_cache_creation_ratio_max: 0.35,
+            prompt_cache_creation_burst_probability: 0.10,
+            prompt_cache_min_cacheable_tokens: 1024,
             simulated_usage: Some(cache::CacheSimulation {
                 cache_creation_input_tokens: 3968,
                 cache_read_input_tokens: 0,
@@ -2436,6 +2488,7 @@ mod tests {
                 cache_creation_1h_input_tokens: 0,
                 target_cache_ratio: Some(0.95),
                 amplification: None,
+                creation_policy: None,
                 simulated_total_input_floor_tokens: None,
             }),
             simulated_source: Some(UsageSource::LocalPromptCache),
@@ -2674,11 +2727,14 @@ mod tests {
         usage_context.simulated_usage = match usage_context.simulation_mode {
             PromptCacheSimulationMode::Disabled => None,
             PromptCacheSimulationMode::LocalPromptCache => {
-                let prompt_usage = usage_context.prompt_cache.compute(
-                    scope,
-                    usage_context.prompt_cache_profile.as_ref(),
-                    usage_context.prompt_cache_target_read_ratio,
-                );
+                let prompt_usage = usage_context
+                    .prompt_cache
+                    .compute_with_min_cacheable_tokens(
+                        scope,
+                        usage_context.prompt_cache_profile.as_ref(),
+                        usage_context.prompt_cache_target_read_ratio,
+                        usage_context.prompt_cache_min_cacheable_tokens,
+                    );
                 cache::CacheSimulation::from_prompt_cache_with_ratio_and_amplification(
                     prompt_usage,
                     usage_context.prompt_cache_target_read_ratio,
@@ -2686,16 +2742,21 @@ mod tests {
                 )
             }
             PromptCacheSimulationMode::HighCache => {
-                let computation = usage_context.prompt_cache.compute_high_cache(
-                    scope,
-                    usage_context.prompt_cache_profile.as_ref(),
-                    usage_context.prompt_cache_target_read_ratio,
-                );
-                cache::CacheSimulation::from_prompt_cache_with_ratio_amplification_and_floor(
-                    computation.usage,
-                    usage_context.prompt_cache_target_read_ratio,
-                    usage_context.cache_amplification(),
-                    computation.simulated_total_input_floor_tokens,
+                let computation = usage_context
+                    .prompt_cache
+                    .compute_high_cache_with_min_cacheable_tokens(
+                        scope,
+                        usage_context.prompt_cache_profile.as_ref(),
+                        usage_context.prompt_cache_target_read_ratio,
+                        usage_context.prompt_cache_min_cacheable_tokens,
+                    );
+                usage_context.apply_cache_creation_policy(
+                    cache::CacheSimulation::from_prompt_cache_with_ratio_amplification_and_floor(
+                        computation.usage,
+                        usage_context.prompt_cache_target_read_ratio,
+                        usage_context.cache_amplification(),
+                        computation.simulated_total_input_floor_tokens,
+                    ),
                 )
             }
         };

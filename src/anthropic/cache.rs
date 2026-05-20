@@ -123,6 +123,60 @@ impl CacheAmplification {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CacheCreationPolicy {
+    pub ratio_min: f64,
+    pub ratio_max: f64,
+    pub burst_probability: f64,
+    pub seed: u64,
+}
+
+impl CacheCreationPolicy {
+    pub fn new(ratio_min: f64, ratio_max: f64, burst_probability: f64, seed: u64) -> Self {
+        let mut ratio_min = sanitize_ratio(ratio_min);
+        let mut ratio_max = sanitize_ratio(ratio_max);
+        if ratio_min > ratio_max {
+            std::mem::swap(&mut ratio_min, &mut ratio_max);
+        }
+
+        Self {
+            ratio_min,
+            ratio_max,
+            burst_probability: sanitize_probability(burst_probability),
+            seed,
+        }
+    }
+
+    fn target_cached(self, total_input_tokens: i32, target_ratio: f64) -> i32 {
+        if total_input_tokens <= 1 {
+            return 0;
+        }
+
+        let ratio = self.effective_ratio(target_ratio);
+        let target_cached = ((total_input_tokens as f64) * ratio).round() as i32;
+        target_cached.clamp(0, total_input_tokens.saturating_sub(1))
+    }
+
+    fn effective_ratio(self, target_ratio: f64) -> f64 {
+        let target_ratio = sanitize_ratio(target_ratio);
+        if target_ratio <= 0.0 {
+            return 0.0;
+        }
+
+        if deterministic_unit(self.seed ^ 0x2f7d_5a9b_3c81_e064) < self.burst_probability {
+            return target_ratio;
+        }
+
+        let ratio_max = self.ratio_max.min(target_ratio);
+        let ratio_min = self.ratio_min.min(ratio_max);
+        if ratio_max <= ratio_min {
+            return ratio_min;
+        }
+
+        ratio_min + deterministic_unit(self.seed ^ 0xa11c_e512_6b47_d90f) * (ratio_max - ratio_min)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct CacheSimulation {
     pub cache_creation_input_tokens: i32,
@@ -131,6 +185,7 @@ pub struct CacheSimulation {
     pub cache_creation_1h_input_tokens: i32,
     pub target_cache_ratio: Option<f64>,
     pub amplification: Option<CacheAmplification>,
+    pub creation_policy: Option<CacheCreationPolicy>,
     pub simulated_total_input_floor_tokens: Option<i32>,
 }
 
@@ -147,6 +202,7 @@ impl CacheSimulation {
             cache_creation_1h_input_tokens: usage.cache_creation_1h_input_tokens.max(0),
             target_cache_ratio: usage.effective_cache_ratio,
             amplification: None,
+            creation_policy: None,
             simulated_total_input_floor_tokens: None,
         };
         (!simulation.is_empty()).then_some(simulation)
@@ -185,6 +241,11 @@ impl CacheSimulation {
         simulation.simulated_total_input_floor_tokens =
             simulated_total_input_floor_tokens.map(|tokens| tokens.max(0));
         Some(simulation)
+    }
+
+    pub fn with_creation_policy(mut self, creation_policy: Option<CacheCreationPolicy>) -> Self {
+        self.creation_policy = creation_policy;
+        self
     }
 
     pub fn to_usage(self, total_input_tokens: i32, output_tokens: i32) -> CacheUsage {
@@ -253,6 +314,11 @@ impl CacheSimulation {
         let target_cached =
             ((total_input_tokens as f64) * target_ratio.clamp(0.0, 0.99)).round() as i32;
         let target_cached = target_cached.clamp(0, total_input_tokens.saturating_sub(1));
+        let creation_target_cached = self
+            .creation_policy
+            .map(|policy| policy.target_cached(total_input_tokens, target_ratio))
+            .unwrap_or(target_cached)
+            .min(target_cached);
         let has_read = self.cache_read_input_tokens > 0;
         let has_creation = self.cache_creation_input_tokens > 0;
 
@@ -260,10 +326,11 @@ impl CacheSimulation {
         {
             (true, true) => {
                 let read = self.cache_read_input_tokens.max(0).min(target_cached);
-                (read, target_cached.saturating_sub(read))
+                let creation = creation_target_cached.min(target_cached.saturating_sub(read));
+                (read, creation)
             }
             (true, false) => (target_cached, 0),
-            (false, true) => (0, target_cached),
+            (false, true) => (0, creation_target_cached),
             (false, false) => (0, 0),
         };
 
@@ -354,6 +421,30 @@ pub fn metadata_cache_is_empty(usage: &MetadataTokenUsage) -> bool {
 
 pub fn usage_has_cache(usage: &CacheUsage) -> bool {
     usage.cache_read_input_tokens > 0 || usage.cache_creation_input_tokens > 0
+}
+
+fn sanitize_ratio(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 0.99)
+    } else {
+        0.0
+    }
+}
+
+fn sanitize_probability(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn deterministic_unit(seed: u64) -> f64 {
+    let mut value = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    value as f64 / u64::MAX as f64
 }
 
 #[cfg(test)]
@@ -541,6 +632,68 @@ mod tests {
         .to_usage(100_000, 1);
         assert_eq!(read_match.cache_read_input_tokens, 95_000);
         assert_eq!(read_match.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn creation_policy_reduces_creation_without_reducing_reads() {
+        let policy = CacheCreationPolicy::new(0.20, 0.20, 0.0, 42);
+        let creation_only = CacheSimulation::from_prompt_cache_with_ratio(
+            PromptCacheUsage {
+                cache_creation_input_tokens: 95_000,
+                cache_read_input_tokens: 0,
+                cache_creation_5m_input_tokens: 95_000,
+                cache_creation_1h_input_tokens: 0,
+                effective_cache_ratio: None,
+            },
+            0.95,
+        )
+        .unwrap()
+        .with_creation_policy(Some(policy))
+        .to_usage(100_000, 1);
+
+        assert_eq!(creation_only.cache_creation_input_tokens, 20_000);
+        assert_eq!(creation_only.cache_read_input_tokens, 0);
+        assert_eq!(creation_only.input_tokens, 80_000);
+
+        let read_match = CacheSimulation::from_prompt_cache_with_ratio(
+            PromptCacheUsage {
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 95_000,
+                cache_creation_5m_input_tokens: 0,
+                cache_creation_1h_input_tokens: 0,
+                effective_cache_ratio: None,
+            },
+            0.95,
+        )
+        .unwrap()
+        .with_creation_policy(Some(policy))
+        .to_usage(100_000, 1);
+
+        assert_eq!(read_match.cache_read_input_tokens, 95_000);
+        assert_eq!(read_match.cache_creation_input_tokens, 0);
+        assert_eq!(read_match.input_tokens, 5_000);
+    }
+
+    #[test]
+    fn creation_policy_can_burst_to_full_target_creation() {
+        let policy = CacheCreationPolicy::new(0.20, 0.20, 1.0, 42);
+        let usage = CacheSimulation::from_prompt_cache_with_ratio(
+            PromptCacheUsage {
+                cache_creation_input_tokens: 95_000,
+                cache_read_input_tokens: 0,
+                cache_creation_5m_input_tokens: 95_000,
+                cache_creation_1h_input_tokens: 0,
+                effective_cache_ratio: None,
+            },
+            0.95,
+        )
+        .unwrap()
+        .with_creation_policy(Some(policy))
+        .to_usage(100_000, 1);
+
+        assert_eq!(usage.cache_creation_input_tokens, 95_000);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.input_tokens, 5_000);
     }
 
     #[test]

@@ -13,7 +13,6 @@ use crate::token;
 const DEFAULT_PROMPT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const HOUR_PROMPT_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_MIN_CACHEABLE_TOKENS: i32 = 1024;
-const OPUS_MIN_CACHEABLE_TOKENS: i32 = 4096;
 const TARGET_READ_RATIO_SPREAD: f64 = 0.03;
 
 #[derive(Debug, Clone, Eq)]
@@ -62,7 +61,6 @@ pub struct PromptCacheProfile {
     breakpoints: Vec<PromptCacheBreakpoint>,
     lookup_points: Vec<PromptCacheLookupPoint>,
     total_input_tokens: i32,
-    model: String,
 }
 
 impl PromptCacheProfile {
@@ -173,7 +171,6 @@ impl PromptCacheTracker {
             breakpoints,
             lookup_points,
             total_input_tokens: total_input_tokens.max(cumulative_tokens),
-            model: req.model.clone(),
         })
     }
 
@@ -182,6 +179,21 @@ impl PromptCacheTracker {
         scope: Option<PromptCacheScope>,
         profile: Option<&PromptCacheProfile>,
         target_read_ratio: f64,
+    ) -> PromptCacheUsage {
+        self.compute_with_min_cacheable_tokens(
+            scope,
+            profile,
+            target_read_ratio,
+            DEFAULT_MIN_CACHEABLE_TOKENS,
+        )
+    }
+
+    pub fn compute_with_min_cacheable_tokens(
+        &self,
+        scope: Option<PromptCacheScope>,
+        profile: Option<&PromptCacheProfile>,
+        target_read_ratio: f64,
+        min_cacheable_tokens: i32,
     ) -> PromptCacheUsage {
         let Some(scope) = scope else {
             return PromptCacheUsage::default();
@@ -193,7 +205,7 @@ impl PromptCacheTracker {
             return PromptCacheUsage::default();
         }
 
-        let min_tokens = min_cacheable_tokens_for_model(&profile.model);
+        let min_tokens = sanitize_min_cacheable_tokens(min_cacheable_tokens);
         let effective_ratio = effective_cache_read_ratio(profile, target_read_ratio);
         let target_tokens =
             target_cache_tokens(profile.total_input_tokens, effective_ratio, min_tokens);
@@ -249,6 +261,21 @@ impl PromptCacheTracker {
         profile: Option<&PromptCacheProfile>,
         target_read_ratio: f64,
     ) -> PromptCacheComputation {
+        self.compute_high_cache_with_min_cacheable_tokens(
+            scope,
+            profile,
+            target_read_ratio,
+            DEFAULT_MIN_CACHEABLE_TOKENS,
+        )
+    }
+
+    pub fn compute_high_cache_with_min_cacheable_tokens(
+        &self,
+        scope: Option<PromptCacheScope>,
+        profile: Option<&PromptCacheProfile>,
+        target_read_ratio: f64,
+        min_cacheable_tokens: i32,
+    ) -> PromptCacheComputation {
         let Some(scope) = scope else {
             return PromptCacheComputation::default();
         };
@@ -259,7 +286,7 @@ impl PromptCacheTracker {
             return PromptCacheComputation::default();
         }
 
-        let min_tokens = min_cacheable_tokens_for_model(&profile.model);
+        let min_tokens = sanitize_min_cacheable_tokens(min_cacheable_tokens);
         let effective_ratio = effective_cache_read_ratio(profile, target_read_ratio);
         let target_tokens =
             target_cache_tokens(profile.total_input_tokens, effective_ratio, min_tokens);
@@ -353,6 +380,21 @@ impl PromptCacheTracker {
         profile: Option<&PromptCacheProfile>,
         target_read_ratio: f64,
     ) {
+        self.update_with_min_cacheable_tokens(
+            scope,
+            profile,
+            target_read_ratio,
+            DEFAULT_MIN_CACHEABLE_TOKENS,
+        )
+    }
+
+    pub fn update_with_min_cacheable_tokens(
+        &self,
+        scope: Option<PromptCacheScope>,
+        profile: Option<&PromptCacheProfile>,
+        target_read_ratio: f64,
+        min_cacheable_tokens: i32,
+    ) {
         let Some(scope) = scope else {
             return;
         };
@@ -363,7 +405,7 @@ impl PromptCacheTracker {
             return;
         }
 
-        let min_tokens = min_cacheable_tokens_for_model(&profile.model);
+        let min_tokens = sanitize_min_cacheable_tokens(min_cacheable_tokens);
         let effective_ratio = effective_cache_read_ratio(profile, target_read_ratio);
         let target_tokens =
             target_cache_tokens(profile.total_input_tokens, effective_ratio, min_tokens);
@@ -692,12 +734,8 @@ fn prune_expired_locked(
     });
 }
 
-fn min_cacheable_tokens_for_model(model: &str) -> i32 {
-    if model.to_lowercase().contains("opus") {
-        OPUS_MIN_CACHEABLE_TOKENS
-    } else {
-        DEFAULT_MIN_CACHEABLE_TOKENS
-    }
+fn sanitize_min_cacheable_tokens(value: i32) -> i32 {
+    value.max(0)
 }
 
 fn is_anthropic_billing_header_block(value: &Value) -> bool {
@@ -952,6 +990,37 @@ mod tests {
         let usage = tracker.compute_high_cache(Some(scope), Some(&small_profile), 0.98);
 
         assert_eq!(usage, PromptCacheComputation::default());
+    }
+
+    #[test]
+    fn opus_and_non_opus_use_same_simulated_cache_threshold() {
+        let tracker = PromptCacheTracker::default();
+        let sonnet_req = request("same threshold prompt".to_string());
+        let sonnet_profile = tracker
+            .build_high_cache_profile(&sonnet_req, 1_100)
+            .expect("sonnet high-cache profile");
+        let sonnet_scope = PromptCacheScope {
+            credential_id: 1,
+            conversation_id: "same-threshold-sonnet".to_string(),
+            model: sonnet_req.model.clone(),
+        };
+        let sonnet_usage =
+            tracker.compute_high_cache(Some(sonnet_scope), Some(&sonnet_profile), 0.98);
+
+        let mut opus_req = request("same threshold prompt".to_string());
+        opus_req.model = "claude-opus-4-7".to_string();
+        let opus_profile = tracker
+            .build_high_cache_profile(&opus_req, 1_100)
+            .expect("opus high-cache profile");
+        let opus_scope = PromptCacheScope {
+            credential_id: 1,
+            conversation_id: "same-threshold-opus".to_string(),
+            model: opus_req.model.clone(),
+        };
+        let opus_usage = tracker.compute_high_cache(Some(opus_scope), Some(&opus_profile), 0.98);
+
+        assert!(sonnet_usage.usage.cache_creation_input_tokens > 0);
+        assert!(opus_usage.usage.cache_creation_input_tokens > 0);
     }
 
     #[test]

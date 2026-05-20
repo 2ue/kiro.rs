@@ -22,19 +22,24 @@ function ProtectedShell() {
   )
 }
 
-export const router = createBrowserRouter([
-  { path: '/login', element: <LoginPage /> },
+export const router = createBrowserRouter(
+  [
+    { path: '/login', element: <LoginPage /> },
+    {
+      path: '/',
+      element: <ProtectedShell />,
+      children: [
+        { index: true, element: <Navigate to="/dashboard" replace /> },
+        { path: 'dashboard', element: <DashboardPage /> },
+        { path: 'credentials', element: <CredentialsPage /> },
+        { path: 'usage', element: <UsagePage /> },
+        { path: 'pricing', element: <PricingPage /> },
+        { path: 'settings', element: <SettingsPage /> },
+      ],
+    },
+    { path: '*', element: <Navigate to="/" replace /> },
+  ],
   {
-    path: '/',
-    element: <ProtectedShell />,
-    children: [
-      { index: true, element: <Navigate to="/dashboard" replace /> },
-      { path: 'dashboard', element: <DashboardPage /> },
-      { path: 'credentials', element: <CredentialsPage /> },
-      { path: 'usage', element: <UsagePage /> },
-      { path: 'pricing', element: <PricingPage /> },
-      { path: 'settings', element: <SettingsPage /> },
-    ],
+    basename: '/console',
   },
-  { path: '*', element: <Navigate to="/" replace /> },
-])
+)
