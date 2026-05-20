@@ -158,7 +158,7 @@ fn parse_time(value: &str) -> Result<DateTime<Utc>, String> {
 /// GET /api/admin/credentials
 /// 获取所有凭据状态
 pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
-    let response = state.service.get_all_credentials();
+    let response = state.service.get_all_credentials().await;
     Json(response)
 }
 
@@ -168,10 +168,15 @@ pub async fn get_credentials_page(
     State(state): State<AdminState>,
     Query(params): Query<CredentialsPageQueryParams>,
 ) -> impl IntoResponse {
-    Json(state.service.get_credentials_page(
-        params.page.unwrap_or_default(),
-        params.limit.unwrap_or_default(),
-    ))
+    Json(
+        state
+            .service
+            .get_credentials_page(
+                params.page.unwrap_or_default(),
+                params.limit.unwrap_or_default(),
+            )
+            .await,
+    )
 }
 
 /// POST /api/admin/credentials/:id/disabled
@@ -365,8 +370,19 @@ pub async fn set_load_balancing_mode(
     State(state): State<AdminState>,
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
-    match state.service.set_load_balancing_mode(payload) {
-        Ok(response) => Json(response).into_response(),
+    match state.service.set_load_balancing_mode(payload).await {
+        Ok(response) => {
+            record_admin_action(
+                &state.db,
+                "admin",
+                "config_update",
+                Some("app_config"),
+                Some("load_balancing_mode".to_string()),
+                Some(serde_json::json!({ "load_balancing_mode": response.mode })),
+            )
+            .await;
+            Json(response).into_response()
+        }
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -688,6 +704,34 @@ pub async fn update_app_config(
     Json(payload): Json<AppConfigUpdate>,
 ) -> impl IntoResponse {
     let items: Vec<(String, serde_json::Value)> = payload.items.into_iter().collect();
+    for (key, value) in &items {
+        match key.as_str() {
+            "load_balancing_mode" => match value.as_str() {
+                Some("priority" | "balanced") => {}
+                _ => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(AdminErrorResponse::invalid_request(
+                            "load_balancing_mode 必须是 priority 或 balanced",
+                        )),
+                    )
+                        .into_response();
+                }
+            },
+            "session_binding_ttl_minutes" => {
+                if value.as_i64().is_none_or(|ttl| ttl < 1) {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(AdminErrorResponse::invalid_request(
+                            "session_binding_ttl_minutes 必须是正整数",
+                        )),
+                    )
+                        .into_response();
+                }
+            }
+            _ => {}
+        }
+    }
     match state.app_config.set_many(&items, "admin").await {
         Ok(_) => {
             // 关键 key 同步推到运行时模块,避免改了不生效
@@ -714,6 +758,10 @@ pub async fn update_app_config(
                             .get_as::<u32>("quota_soft_fail_limit")
                             .unwrap_or(3);
                         state.token_manager.set_quota_settings(limit, cooldown);
+                    }
+                    "session_binding_ttl_minutes" => {
+                        let ttl = v.as_i64().unwrap_or(30);
+                        state.token_manager.set_session_binding_ttl_minutes(ttl);
                     }
                     _ => {}
                 }

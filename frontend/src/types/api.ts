@@ -3,6 +3,13 @@
 // =========================================================
 
 export type LoadBalancingMode = 'priority' | 'balanced'
+export type SchedulingStatus =
+  | 'healthy'
+  | 'disabled'
+  | 'rate_limited'
+  | 'quota_cooldown'
+  | 'temp_unschedulable'
+  | 'manual_recovery_required'
 
 // ----- 凭据 -----
 
@@ -26,7 +33,7 @@ export interface CredentialStatusItem {
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
-  schedulingStatus: 'healthy' | 'disabled' | 'rate_limited' | 'quota_cooldown'
+  schedulingStatus: SchedulingStatus
   schedulingReason?: string
   schedulingUntil?: string
   lastUpstreamStatus?: number

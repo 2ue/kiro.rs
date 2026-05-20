@@ -51,6 +51,43 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
+function formatScheduleUntil(value: string | undefined): string | undefined {
+  if (!value) return undefined
+  return new Date(value).toLocaleString()
+}
+
+function schedulingStatusMeta(credential: CredentialStatusItem) {
+  const until = formatScheduleUntil(credential.schedulingUntil)
+  switch (credential.schedulingStatus) {
+    case 'rate_limited':
+      return {
+        label: '429 冷却',
+        title: [credential.schedulingReason, until].filter(Boolean).join(' · '),
+        variant: 'warning' as const,
+      }
+    case 'quota_cooldown':
+      return {
+        label: '配额冷却',
+        title: [credential.schedulingReason, until].filter(Boolean).join(' · '),
+        variant: 'warning' as const,
+      }
+    case 'temp_unschedulable':
+      return {
+        label: '临时不可调度',
+        title: [credential.schedulingReason, until].filter(Boolean).join(' · '),
+        variant: 'warning' as const,
+      }
+    case 'manual_recovery_required':
+      return {
+        label: '需人工恢复',
+        title: credential.schedulingReason,
+        variant: 'destructive' as const,
+      }
+    default:
+      return null
+  }
+}
+
 export function CredentialCard({
   credential,
   onViewBalance,
@@ -70,6 +107,7 @@ export function CredentialCard({
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
   const displayName = credential.email || credential.maskedApiKey || `凭据 #${credential.id}`
+  const schedulingMeta = schedulingStatusMeta(credential)
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -166,6 +204,11 @@ export function CredentialCard({
                 )}
                 {credential.disabled && credential.disabledReason && (
                   <Badge variant="outline">{credential.disabledReason}</Badge>
+                )}
+                {schedulingMeta && (
+                  <Badge variant={schedulingMeta.variant} title={schedulingMeta.title}>
+                    {schedulingMeta.label}
+                  </Badge>
                 )}
                 {credential.authMethod && (
                   <Badge variant="secondary">

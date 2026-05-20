@@ -1,4 +1,12 @@
 // 凭据状态响应
+export type SchedulingStatus =
+  | 'healthy'
+  | 'disabled'
+  | 'rate_limited'
+  | 'quota_cooldown'
+  | 'temp_unschedulable'
+  | 'manual_recovery_required'
+
 export interface CredentialsStatusResponse {
   total: number
   available: number
@@ -38,7 +46,7 @@ export interface CredentialStatusItem {
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
-  schedulingStatus: 'healthy' | 'disabled' | 'rate_limited' | 'quota_cooldown'
+  schedulingStatus: SchedulingStatus
   schedulingReason?: string
   schedulingUntil?: string
   lastUpstreamStatus?: number

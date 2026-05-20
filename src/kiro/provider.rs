@@ -5,8 +5,8 @@
 //! 支持多凭据故障转移和重试
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
-use reqwest::Client;
 use reqwest::header::CONTENT_TYPE;
+use reqwest::{Client, RequestBuilder};
 use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt;
@@ -15,9 +15,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, build_client_without_total_timeout};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -31,6 +31,9 @@ use parking_lot::Mutex;
 /// fallback 到下一个可调度账号。这样避免 `MAX_TOTAL_RETRIES` 这类全局硬上限在
 /// 账号池较大或部分账号异常时提前截断故障转移。
 const MAX_TRANSIENT_SAME_CREDENTIAL_RETRIES: usize = 1;
+/// 等待上游返回响应头的超时。流式 body 不使用 reqwest 总请求超时，
+/// 避免长流在 body 阶段被客户端超时误切断。
+const UPSTREAM_HEADER_TIMEOUT_SECS: u64 = 720;
 
 /// Kiro API Provider
 ///
@@ -194,6 +197,23 @@ impl KiroStreamCompletion {
             self.token_manager
                 .record_session_soft_failure(session_id, self.credential_id);
         }
+    }
+
+    /// 上游流传输层中断或 idle timeout 时调用。
+    ///
+    /// 这类错误无法在当前已经开始的 SSE 响应里透明换账号，但应该把当前账号短暂
+    /// 移出调度池，并解除相关 sticky 绑定，避免后续请求继续命中同一个异常账号。
+    pub async fn report_transport_failure(&self, reason: &str) {
+        if self.reported.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(session_id) = self.session_id.as_deref() {
+            self.token_manager
+                .record_session_soft_failure(session_id, self.credential_id);
+        }
+        self.token_manager
+            .report_temp_unschedulable(self.credential_id, reason)
+            .await;
     }
 
     pub fn credential_id(&self) -> u64 {
@@ -384,8 +404,12 @@ impl KiroProvider {
         );
         let tls_backend = token_manager.config().tls_backend;
         // 预热：构建全局代理对应的 Client
-        let initial_client =
-            build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
+        let initial_client = build_client_without_total_timeout(
+            proxy.as_ref(),
+            UPSTREAM_HEADER_TIMEOUT_SECS,
+            tls_backend,
+        )
+        .expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
 
@@ -406,9 +430,36 @@ impl KiroProvider {
         if let Some(client) = cache.get(&effective) {
             return Ok(client.clone());
         }
-        let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
+        let client = build_client_without_total_timeout(
+            effective.as_ref(),
+            UPSTREAM_HEADER_TIMEOUT_SECS,
+            self.tls_backend,
+        )?;
         cache.insert(effective, client.clone());
         Ok(client)
+    }
+
+    async fn send_with_total_timeout(request: RequestBuilder) -> anyhow::Result<reqwest::Response> {
+        Ok(request
+            .timeout(Duration::from_secs(UPSTREAM_HEADER_TIMEOUT_SECS))
+            .send()
+            .await?)
+    }
+
+    async fn send_stream_headers(request: RequestBuilder) -> anyhow::Result<reqwest::Response> {
+        match timeout(
+            Duration::from_secs(UPSTREAM_HEADER_TIMEOUT_SECS),
+            request.send(),
+        )
+        .await
+        {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(err)) => Err(err.into()),
+            Err(_) => anyhow::bail!(
+                "upstream response header timeout after {}s",
+                UPSTREAM_HEADER_TIMEOUT_SECS
+            ),
+        }
     }
 
     fn tracked_error(
@@ -514,7 +565,7 @@ impl KiroProvider {
                 .header("Connection", "close");
             let request = endpoint.decorate_api(base, &rctx);
 
-            let response = request.send().await?;
+            let response = Self::send_with_total_timeout(request).await?;
             let status = response.status();
             let content_type = response
                 .headers()
@@ -676,7 +727,7 @@ impl KiroProvider {
                 .header("Connection", "close");
             let request = endpoint.decorate_mcp(base, &rctx);
 
-            let response = match request.send().await {
+            let response = match Self::send_with_total_timeout(request).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
@@ -685,12 +736,16 @@ impl KiroProvider {
                         ctx.id,
                         e
                     );
-                    last_error = Some(e.into());
+                    let temp_reason = format!("mcp_request_send_error: {}", e);
+                    last_error = Some(e);
                     if Self::record_transient_failure(
                         &mut transient_failures,
                         &mut excluded_ids,
                         ctx.id,
                     ) {
+                        self.token_manager
+                            .report_temp_unschedulable(ctx.id, &temp_reason)
+                            .await;
                         continue;
                     } else {
                         sleep(Self::retry_delay(attempt)).await;
@@ -785,6 +840,10 @@ impl KiroProvider {
                     &mut excluded_ids,
                     ctx.id,
                 ) {
+                    let temp_reason = format!("mcp_transient_http_error: {}", status);
+                    self.token_manager
+                        .report_temp_unschedulable(ctx.id, &temp_reason)
+                        .await;
                     continue;
                 } else {
                     sleep(Self::retry_delay(attempt)).await;
@@ -800,6 +859,10 @@ impl KiroProvider {
             // 兜底
             last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
             if Self::record_transient_failure(&mut transient_failures, &mut excluded_ids, ctx.id) {
+                let temp_reason = format!("mcp_unknown_http_error: {}", status);
+                self.token_manager
+                    .report_temp_unschedulable(ctx.id, &temp_reason)
+                    .await;
                 continue;
             } else {
                 sleep(Self::retry_delay(attempt)).await;
@@ -892,6 +955,10 @@ impl KiroProvider {
                 Ok(client) => client,
                 Err(e) => {
                     last_error = Some(e);
+                    if let Some(session_id) = conversation_id.as_deref() {
+                        self.token_manager
+                            .unbind_session_if_bound_to(session_id, ctx.id);
+                    }
                     fallback_from_sticky |= ctx.sticky_bound;
                     excluded_ids.insert(ctx.id);
                     continue;
@@ -904,7 +971,11 @@ impl KiroProvider {
                 .header("Connection", "close");
             let request = endpoint.decorate_api(base, &rctx);
 
-            let response = match request.send().await {
+            let response = match if is_stream {
+                Self::send_stream_headers(request).await
+            } else {
+                Self::send_with_total_timeout(request).await
+            } {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
@@ -913,9 +984,9 @@ impl KiroProvider {
                         ctx.id,
                         e
                     );
-                    // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
-                    // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
-                    last_error = Some(e.into());
+                    // 网络错误通常是上游/链路瞬态问题，不禁用凭据；连续失败后短暂摘出并切换。
+                    let temp_reason = format!("api_request_send_error: {}", e);
+                    last_error = Some(e);
                     if let Some(session_id) = conversation_id.as_deref() {
                         if self
                             .token_manager
@@ -930,6 +1001,9 @@ impl KiroProvider {
                         &mut excluded_ids,
                         ctx.id,
                     ) {
+                        self.token_manager
+                            .report_temp_unschedulable(ctx.id, &temp_reason)
+                            .await;
                         fallback_from_sticky |= ctx.sticky_bound;
                         continue;
                     } else {
@@ -989,6 +1063,11 @@ impl KiroProvider {
                             &mut excluded_ids,
                             ctx.id,
                         ) {
+                            let temp_reason =
+                                format!("api_retryable_aws_exception: {:?}", exception);
+                            self.token_manager
+                                .report_temp_unschedulable(ctx.id, &temp_reason)
+                                .await;
                             fallback_from_sticky |= ctx.sticky_bound;
                             continue;
                         } else {
@@ -1092,13 +1171,11 @@ impl KiroProvider {
                     tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
                 }
 
-                let has_available = self.token_manager.report_failure(ctx.id);
-                if !has_available {
-                    if let Some(session_id) = conversation_id.as_deref() {
-                        self.token_manager
-                            .unbind_session_if_bound_to(session_id, ctx.id);
-                    }
+                if let Some(session_id) = conversation_id.as_deref() {
+                    self.token_manager
+                        .unbind_session_if_bound_to(session_id, ctx.id);
                 }
+                let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
                     return Err(Self::tracked_error(
                         format!(
@@ -1178,6 +1255,10 @@ impl KiroProvider {
                     &mut excluded_ids,
                     ctx.id,
                 ) {
+                    let temp_reason = format!("api_transient_http_error: {}", status);
+                    self.token_manager
+                        .report_temp_unschedulable(ctx.id, &temp_reason)
+                        .await;
                     fallback_from_sticky |= ctx.sticky_bound;
                     continue;
                 } else {
@@ -1218,6 +1299,10 @@ impl KiroProvider {
                 }
             }
             if Self::record_transient_failure(&mut transient_failures, &mut excluded_ids, ctx.id) {
+                let temp_reason = format!("api_unknown_http_error: {}", status);
+                self.token_manager
+                    .report_temp_unschedulable(ctx.id, &temp_reason)
+                    .await;
                 fallback_from_sticky |= ctx.sticky_bound;
                 continue;
             } else {

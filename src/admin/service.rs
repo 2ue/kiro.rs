@@ -127,8 +127,8 @@ impl AdminService {
     }
 
     /// 获取所有凭据状态
-    pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
-        let (total, available, current_id, credentials) = self.credential_status_items();
+    pub async fn get_all_credentials(&self) -> CredentialsStatusResponse {
+        let (total, available, current_id, credentials) = self.credential_status_items().await;
 
         CredentialsStatusResponse {
             total,
@@ -139,10 +139,10 @@ impl AdminService {
     }
 
     /// 分页获取凭据状态。
-    pub fn get_credentials_page(&self, page: usize, limit: usize) -> CredentialsPageResponse {
+    pub async fn get_credentials_page(&self, page: usize, limit: usize) -> CredentialsPageResponse {
         let page = normalize_page(page);
         let limit = normalize_credentials_limit(limit);
-        let (total, available, current_id, credentials) = self.credential_status_items();
+        let (total, available, current_id, credentials) = self.credential_status_items().await;
         let total_pages = total_pages(total, limit);
         let start = page.saturating_sub(1).saturating_mul(limit);
         let credentials = credentials.into_iter().skip(start).take(limit).collect();
@@ -158,8 +158,8 @@ impl AdminService {
         }
     }
 
-    fn credential_status_items(&self) -> (usize, usize, u64, Vec<CredentialStatusItem>) {
-        let snapshot = self.token_manager.snapshot();
+    async fn credential_status_items(&self) -> (usize, usize, u64, Vec<CredentialStatusItem>) {
+        let snapshot = self.token_manager.snapshot_for_admin().await;
         let default_endpoint = self.token_manager.config().default_endpoint.clone();
 
         let mut credentials: Vec<CredentialStatusItem> = snapshot
@@ -520,7 +520,7 @@ impl AdminService {
     }
 
     /// 设置负载均衡模式
-    pub fn set_load_balancing_mode(
+    pub async fn set_load_balancing_mode(
         &self,
         req: SetLoadBalancingModeRequest,
     ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
@@ -531,6 +531,14 @@ impl AdminService {
             ));
         }
 
+        self.app_config
+            .set(
+                "load_balancing_mode",
+                serde_json::Value::String(req.mode.clone()),
+                "admin",
+            )
+            .await
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
         self.token_manager
             .set_load_balancing_mode(req.mode.clone())
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;

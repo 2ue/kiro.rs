@@ -49,7 +49,32 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    build_client_inner(proxy, timeout_secs, tls_backend, true)
+}
+
+/// 构建不带总请求超时的 HTTP Client。
+///
+/// 该 client 主要用于流式响应：reqwest 的总请求超时会覆盖 response body 读取阶段，
+/// 长流被切断时会表现为 `upstream stream read error`。调用方应当在 `send()` 阶段
+/// 自行包一层超时，只限制拿响应头的时间。
+pub fn build_client_without_total_timeout(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    build_client_inner(proxy, timeout_secs, tls_backend, false)
+}
+
+fn build_client_inner(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    tls_backend: TlsBackend,
+    total_timeout: bool,
+) -> anyhow::Result<Client> {
+    let mut builder = Client::builder().connect_timeout(Duration::from_secs(timeout_secs));
+    if total_timeout {
+        builder = builder.timeout(Duration::from_secs(timeout_secs));
+    }
 
     match tls_backend {
         TlsBackend::Rustls => {
@@ -112,6 +137,12 @@ mod tests {
     fn test_build_client_with_proxy() {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
         let client = build_client(Some(&config), 30, TlsBackend::Rustls);
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_build_client_without_total_timeout() {
+        let client = build_client_without_total_timeout(None, 30, TlsBackend::Rustls);
         assert!(client.is_ok());
     }
 }

@@ -207,6 +207,10 @@ async fn main() {
         .get_as::<i64>("quota_cooldown_minutes")
         .unwrap_or(30);
     token_manager.set_quota_settings(strike_limit, cooldown_minutes);
+    let session_binding_ttl_minutes: i64 = app_config_service
+        .get_as::<i64>("session_binding_ttl_minutes")
+        .unwrap_or(30);
+    token_manager.set_session_binding_ttl_minutes(session_binding_ttl_minutes);
 
     // 让 app_config 中的 load_balancing_mode 在内存生效(修双源 bug)
     if let Some(mode) = app_config_service.get_as::<String>("load_balancing_mode") {

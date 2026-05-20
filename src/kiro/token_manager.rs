@@ -434,6 +434,13 @@ struct RateLimitFallbackState {
     reason: Option<String>,
 }
 
+/// Redis 不可用或测试场景下的进程内临时不可调度状态。
+#[derive(Clone)]
+struct TempUnschedulableFallbackState {
+    until: DateTime<Utc>,
+    reason: Option<String>,
+}
+
 /// 禁用原因
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DisabledReason {
@@ -566,18 +573,22 @@ pub struct MultiTokenManager {
     redis: Option<crate::storage::RedisPool>,
     /// Redis 不可用时的进程内 429 冷却降级状态；不持久化、不跨进程。
     rate_limit_fallbacks: Mutex<HashMap<u64, RateLimitFallbackState>>,
+    /// Redis 不可用时的进程内临时不可调度降级状态；不持久化、不跨进程。
+    temp_unschedulable_fallbacks: Mutex<HashMap<u64, TempUnschedulableFallbackState>>,
     /// Redis 不可用时的进程内全池 429 退避状态；不持久化、不跨进程。
     global_rate_limit_fallback_until: Mutex<Option<DateTime<Utc>>>,
     /// 配额冷却参数:(strike_limit, cooldown_minutes),由 attach_storage 时从 app_config 读入
     quota_settings: Mutex<(u32, i64)>,
+    /// sticky session 绑定 TTL，运行时从 app_config 热更新。
+    session_binding_ttl_secs: Mutex<i64>,
 }
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
-/// 会话绑定最长保留时间，避免长期运行进程无限增长。
-const SESSION_BINDING_TTL_SECS: i64 = 6 * 60 * 60;
+/// 默认会话绑定最长保留时间，避免长期运行进程无限增长。
+const DEFAULT_SESSION_BINDING_TTL_SECS: i64 = 30 * 60;
 /// 会话绑定表上限。
 const MAX_SESSION_BINDINGS: usize = 10_000;
 /// 同一会话绑定账号连续软失败达到该阈值后，本次请求允许临时 fallback。
@@ -602,11 +613,14 @@ const GLOBAL_RATE_LIMIT_RATIO_DENOMINATOR: usize = 5;
 const GLOBAL_RATE_LIMIT_BACKOFF_MIN_SECS: i64 = 180;
 /// 全池 429 退避最长秒数。
 const GLOBAL_RATE_LIMIT_BACKOFF_MAX_SECS: i64 = 300;
+/// 流式传输/上游瞬态异常后，账号临时从调度池摘出的时间。
+const TEMP_UNSCHEDULABLE_COOLDOWN_SECS: i64 = 60;
 
 #[derive(Debug, Clone, Default)]
 struct SchedulerCredentialState {
     rate_limited_until_ms: Option<i64>,
     temp_unschedulable_until_ms: Option<i64>,
+    temp_unschedulable_reason: Option<String>,
     manual_recovery_required: bool,
 }
 
@@ -763,8 +777,10 @@ impl MultiTokenManager {
             db: None,
             redis: None,
             rate_limit_fallbacks: Mutex::new(HashMap::new()),
+            temp_unschedulable_fallbacks: Mutex::new(HashMap::new()),
             global_rate_limit_fallback_until: Mutex::new(None),
             quota_settings: Mutex::new((3, 30)),
+            session_binding_ttl_secs: Mutex::new(DEFAULT_SESSION_BINDING_TTL_SECS),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -914,6 +930,13 @@ impl MultiTokenManager {
         );
     }
 
+    /// 应用 app_config 中的 sticky session TTL。
+    pub fn set_session_binding_ttl_minutes(&self, ttl_minutes: i64) {
+        let ttl_minutes = ttl_minutes.max(1);
+        *self.session_binding_ttl_secs.lock() = ttl_minutes.saturating_mul(60);
+        tracing::info!("sticky session TTL 已应用: {} minutes", ttl_minutes);
+    }
+
     fn sched_state_key(id: u64) -> String {
         format!("{RATE_LIMIT_REDIS_PREFIX}:cred:{id}:state")
     }
@@ -1004,12 +1027,18 @@ impl MultiTokenManager {
     }
 
     fn fallback_scheduler_state_for(&self, id: u64) -> SchedulerCredentialState {
-        let states = self.rate_limit_fallbacks.lock();
+        let rate_limit_states = self.rate_limit_fallbacks.lock();
+        let temp_unschedulable_states = self.temp_unschedulable_fallbacks.lock();
         SchedulerCredentialState {
-            rate_limited_until_ms: states
+            rate_limited_until_ms: rate_limit_states
                 .get(&id)
                 .map(|state| state.rate_limited_until.timestamp_millis()),
-            temp_unschedulable_until_ms: None,
+            temp_unschedulable_until_ms: temp_unschedulable_states
+                .get(&id)
+                .map(|state| state.until.timestamp_millis()),
+            temp_unschedulable_reason: temp_unschedulable_states
+                .get(&id)
+                .and_then(|state| state.reason.clone()),
             manual_recovery_required: false,
         }
     }
@@ -1062,6 +1091,28 @@ impl MultiTokenManager {
         }
     }
 
+    fn write_temp_unschedulable_fallback_state(&self, id: u64, reason: Option<String>) -> i64 {
+        let until = Utc::now() + chrono::Duration::seconds(TEMP_UNSCHEDULABLE_COOLDOWN_SECS);
+        let until_ms = until.timestamp_millis();
+        self.temp_unschedulable_fallbacks
+            .lock()
+            .insert(id, TempUnschedulableFallbackState { until, reason });
+        until_ms
+    }
+
+    fn mirror_temp_unschedulable_fallback_state(
+        &self,
+        id: u64,
+        until_ms: i64,
+        reason: Option<String>,
+    ) {
+        if let Some(until) = DateTime::<Utc>::from_timestamp_millis(until_ms) {
+            self.temp_unschedulable_fallbacks
+                .lock()
+                .insert(id, TempUnschedulableFallbackState { until, reason });
+        }
+    }
+
     async fn scheduler_state_for(&self, id: u64) -> SchedulerCredentialState {
         self.scheduler_states_for(&[id])
             .await
@@ -1096,22 +1147,33 @@ impl MultiTokenManager {
             pipe.cmd("HMGET").arg(Self::sched_state_key(*id)).arg(&[
                 "rate_limited_until_ms",
                 "temp_unschedulable_until_ms",
+                "temp_unschedulable_reason",
                 "manual_recovery_required",
             ]);
         }
 
-        let values: redis::RedisResult<Vec<(Option<i64>, Option<i64>, Option<String>)>> =
-            pipe.query_async(&mut *conn).await;
+        let values: redis::RedisResult<
+            Vec<(Option<i64>, Option<i64>, Option<String>, Option<String>)>,
+        > = pipe.query_async(&mut *conn).await;
 
         match values {
             Ok(values) => ids
                 .iter()
                 .zip(values)
                 .map(
-                    |(id, (rate_limited_until_ms, temp_unschedulable_until_ms, manual))| {
+                    |(
+                        id,
+                        (
+                            rate_limited_until_ms,
+                            temp_unschedulable_until_ms,
+                            temp_unschedulable_reason,
+                            manual,
+                        ),
+                    )| {
                         let state = SchedulerCredentialState {
                             rate_limited_until_ms,
                             temp_unschedulable_until_ms,
+                            temp_unschedulable_reason,
                             manual_recovery_required: manual
                                 .as_deref()
                                 .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
@@ -1136,6 +1198,88 @@ impl MultiTokenManager {
                     .collect()
             }
         }
+    }
+
+    fn fallback_rate_limit_display_states_for_ids(
+        &self,
+        ids: &[u64],
+    ) -> HashMap<u64, RateLimitFallbackState> {
+        let states = self.rate_limit_fallbacks.lock();
+        ids.iter()
+            .filter_map(|id| states.get(id).cloned().map(|state| (*id, state)))
+            .collect()
+    }
+
+    async fn rate_limit_display_states_for(
+        &self,
+        ids: &[u64],
+    ) -> HashMap<u64, RateLimitFallbackState> {
+        if ids.is_empty() {
+            return HashMap::new();
+        }
+        let fallback = self.fallback_rate_limit_display_states_for_ids(ids);
+        let Some(redis) = self.redis.clone() else {
+            return fallback;
+        };
+        let mut conn = match redis.get().await {
+            Ok(conn) => conn,
+            Err(err) => {
+                tracing::warn!("读取 Redis 429 展示状态失败，使用进程内降级状态: {}", err);
+                return fallback;
+            }
+        };
+
+        let mut pipe = redis::pipe();
+        for id in ids {
+            pipe.cmd("HMGET").arg(Self::sched_state_key(*id)).arg(&[
+                "rate_limited_until_ms",
+                "rate_limit_level",
+                "rate_limited_status",
+                "rate_limited_reason",
+            ]);
+        }
+
+        let values: redis::RedisResult<
+            Vec<(Option<i64>, Option<u64>, Option<u16>, Option<String>)>,
+        > = pipe.query_async(&mut *conn).await;
+
+        let values = match values {
+            Ok(values) => values,
+            Err(err) => {
+                tracing::warn!("解析 Redis 429 展示状态失败，使用进程内降级状态: {}", err);
+                return fallback;
+            }
+        };
+
+        let now_ms = Utc::now().timestamp_millis();
+        let mut out = HashMap::new();
+        for (id, (until_ms, level, upstream_status, reason)) in ids.iter().copied().zip(values) {
+            let Some(until_ms) = until_ms else {
+                continue;
+            };
+            if until_ms <= now_ms {
+                continue;
+            }
+            let Some(rate_limited_until) = DateTime::<Utc>::from_timestamp_millis(until_ms) else {
+                continue;
+            };
+            out.insert(
+                id,
+                RateLimitFallbackState {
+                    rate_limited_until,
+                    strike_count: level.unwrap_or(1).max(1),
+                    upstream_status,
+                    reason,
+                },
+            );
+        }
+
+        for (id, state) in fallback {
+            if state.rate_limited_until.timestamp_millis() > now_ms {
+                out.entry(id).or_insert(state);
+            }
+        }
+        out
     }
 
     async fn credential_is_schedulable_dynamic(&self, id: u64) -> bool {
@@ -1243,10 +1387,112 @@ impl MultiTokenManager {
         Some(until_ms)
     }
 
+    /// 记录一次非配额/非鉴权类瞬态异常，把账号短暂移出调度池。
+    ///
+    /// 典型来源是流式 body 读取错误、上游 idle timeout、连续网络发送超时或 5xx。
+    /// 该状态只影响调度，不会禁用账号；到期后自动恢复，成功调用会提前清除。
+    pub async fn report_temp_unschedulable(&self, id: u64, reason: &str) {
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.last_used_at = Some(Utc::now().to_rfc3339());
+            }
+        }
+
+        let trimmed_reason: String = reason.chars().take(512).collect();
+        let Some(redis) = self.redis.clone() else {
+            let until_ms =
+                self.write_temp_unschedulable_fallback_state(id, Some(trimmed_reason.clone()));
+            tracing::warn!(
+                "Redis 未配置，使用进程内临时不可调度: credential_id={} cooldown={}s until_ms={} reason={}",
+                id,
+                TEMP_UNSCHEDULABLE_COOLDOWN_SECS,
+                until_ms,
+                trimmed_reason
+            );
+            self.unbind_sessions_for_credential(id);
+            return;
+        };
+
+        let key = Self::sched_state_key(id);
+        let now_ms = Utc::now().timestamp_millis();
+        let until_ms = now_ms + TEMP_UNSCHEDULABLE_COOLDOWN_SECS.saturating_mul(1000);
+        let mut conn = match redis.get().await {
+            Ok(conn) => conn,
+            Err(err) => {
+                tracing::warn!(
+                    "获取 Redis 连接失败，降级为进程内临时不可调度: credential_id={} err={}",
+                    id,
+                    err
+                );
+                self.write_temp_unschedulable_fallback_state(id, Some(trimmed_reason.clone()));
+                self.unbind_sessions_for_credential(id);
+                return;
+            }
+        };
+
+        let res: redis::RedisResult<()> = redis::pipe()
+            .atomic()
+            .cmd("HSET")
+            .arg(&key)
+            .arg("temp_unschedulable_until_ms")
+            .arg(until_ms)
+            .arg("temp_unschedulable_reason")
+            .arg(&trimmed_reason)
+            .arg("last_temp_unschedulable_at_ms")
+            .arg(now_ms)
+            .arg("manual_recovery_required")
+            .arg("0")
+            .ignore()
+            .cmd("EXPIRE")
+            .arg(&key)
+            .arg(SCHED_STATE_TTL_SECS)
+            .ignore()
+            .cmd("XADD")
+            .arg(Self::sched_event_stream_key())
+            .arg("MAXLEN")
+            .arg("~")
+            .arg(10_000)
+            .arg("*")
+            .arg("kind")
+            .arg("temp_unschedulable")
+            .arg("credential_id")
+            .arg(id)
+            .arg("reason")
+            .arg(&trimmed_reason)
+            .arg("cooldown_until_ms")
+            .arg(until_ms)
+            .ignore()
+            .query_async(&mut *conn)
+            .await;
+
+        if let Err(err) = res {
+            tracing::warn!(
+                "写入临时不可调度状态失败，降级为进程内状态: credential_id={} err={}",
+                id,
+                err
+            );
+            self.write_temp_unschedulable_fallback_state(id, Some(trimmed_reason.clone()));
+            self.unbind_sessions_for_credential(id);
+            return;
+        }
+
+        self.mirror_temp_unschedulable_fallback_state(id, until_ms, Some(trimmed_reason.clone()));
+        self.unbind_sessions_for_credential(id);
+        tracing::warn!(
+            "凭据 #{} 进入临时不可调度: cooldown={}s until_ms={} reason={}",
+            id,
+            TEMP_UNSCHEDULABLE_COOLDOWN_SECS,
+            until_ms,
+            trimmed_reason
+        );
+    }
+
     /// 记录一次 Kiro 429，并把账号放入 Redis 短冷却。
     ///
     /// 该状态只影响调度，不会把账号永久 disabled。
     pub async fn report_rate_limited(&self, id: u64, upstream_status: u16, reason: &str) {
+        self.temp_unschedulable_fallbacks.lock().remove(&id);
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -1339,6 +1585,12 @@ impl MultiTokenManager {
             .arg("manual_recovery_required")
             .arg("0")
             .ignore()
+            .cmd("HDEL")
+            .arg(&key)
+            .arg("temp_unschedulable_until_ms")
+            .arg("temp_unschedulable_reason")
+            .arg("last_temp_unschedulable_at_ms")
+            .ignore()
             .cmd("EXPIRE")
             .arg(&key)
             .arg(SCHED_STATE_TTL_SECS)
@@ -1410,6 +1662,7 @@ impl MultiTokenManager {
 
     fn record_scheduler_success_async(&self, id: u64) {
         self.rate_limit_fallbacks.lock().remove(&id);
+        self.temp_unschedulable_fallbacks.lock().remove(&id);
         *self.global_rate_limit_fallback_until.lock() = None;
         let Some(redis) = self.redis.clone() else {
             return;
@@ -1456,6 +1709,9 @@ impl MultiTokenManager {
                 .arg("rate_limited_reason")
                 .arg("rate_limited_status")
                 .arg("last_rate_limited_at_ms")
+                .arg("temp_unschedulable_until_ms")
+                .arg("temp_unschedulable_reason")
+                .arg("last_temp_unschedulable_at_ms")
                 .ignore()
                 .cmd("ZREM")
                 .arg(Self::sched_rate_limit_zset_key())
@@ -1653,12 +1909,19 @@ impl MultiTokenManager {
         }
     }
 
-    fn prune_session_bindings_locked(bindings: &mut HashMap<String, SessionBinding>) {
+    fn session_binding_ttl_secs(&self) -> i64 {
+        *self.session_binding_ttl_secs.lock()
+    }
+
+    fn prune_session_bindings_locked(
+        bindings: &mut HashMap<String, SessionBinding>,
+        ttl_secs: i64,
+    ) {
         let now = Utc::now();
         bindings.retain(|_, binding| {
             now.signed_duration_since(binding.last_used_at)
                 .num_seconds()
-                <= SESSION_BINDING_TTL_SECS
+                <= ttl_secs
         });
 
         if bindings.len() <= MAX_SESSION_BINDINGS {
@@ -1684,8 +1947,9 @@ impl MultiTokenManager {
         excluded_ids: &HashSet<u64>,
     ) -> Option<(u64, KiroCredentials)> {
         let bound_id = {
+            let ttl_secs = self.session_binding_ttl_secs();
             let mut bindings = self.session_bindings.lock();
-            Self::prune_session_bindings_locked(&mut bindings);
+            Self::prune_session_bindings_locked(&mut bindings, ttl_secs);
             bindings
                 .get(session_id)
                 .map(|binding| binding.credential_id)
@@ -1732,8 +1996,9 @@ impl MultiTokenManager {
     }
 
     fn bind_session_to_credential(&self, session_id: &str, credential_id: u64) {
+        let ttl_secs = self.session_binding_ttl_secs();
         let mut bindings = self.session_bindings.lock();
-        Self::prune_session_bindings_locked(&mut bindings);
+        Self::prune_session_bindings_locked(&mut bindings, ttl_secs);
         match bindings.get_mut(session_id) {
             Some(binding) if binding.credential_id == credential_id => {
                 binding.last_used_at = Utc::now();
@@ -2330,11 +2595,18 @@ impl MultiTokenManager {
         self.save_stats_debounced();
     }
 
-    /// 报告指定会话在该凭据上的 API 调用成功，并清理 sticky 软失败计数。
+    /// 报告指定会话在该凭据上的 API 调用成功，并把 sticky 绑定迁移到成功账号。
+    ///
+    /// `acquire_context_for_session` 的 request-local fallback 在拿到上下文时不会立即改绑，
+    /// 只有请求最终成功后才迁移，避免失败的临时尝试污染后续会话调度。
     pub fn report_success_for_session(&self, id: u64, session_id: Option<&str>) {
         self.report_success(id);
         if let Some(sid) = session_id {
-            self.clear_session_soft_failure(sid, id);
+            if self.bound_credential_id(sid) == Some(id) {
+                self.clear_session_soft_failure(sid, id);
+            } else {
+                self.bind_session_to_credential(sid, id);
+            }
         }
     }
 
@@ -2675,43 +2947,98 @@ impl MultiTokenManager {
     // Admin API 方法
     // ========================================================================
 
-    /// 获取管理器状态快照（用于 Admin API）
+    /// 获取管理器状态快照（测试和无 Redis 展示路径）。
     pub fn snapshot(&self) -> ManagerSnapshot {
+        let ids: Vec<u64> = self.entries.lock().iter().map(|entry| entry.id).collect();
+        let scheduler_states: HashMap<u64, SchedulerCredentialState> = ids
+            .iter()
+            .map(|id| (*id, self.fallback_scheduler_state_for(*id)))
+            .collect();
+        let rate_limit_states = self.fallback_rate_limit_display_states_for_ids(&ids);
+        self.build_snapshot(Some(&scheduler_states), rate_limit_states)
+    }
+
+    /// 获取管理器状态快照（用于 Admin API）。该路径直接读取 Redis 动态调度状态，
+    /// 避免多实例或启动恢复后 UI 显示与真实调度条件不一致。
+    pub async fn snapshot_for_admin(&self) -> ManagerSnapshot {
+        let ids: Vec<u64> = self.entries.lock().iter().map(|entry| entry.id).collect();
+        let scheduler_states = self.scheduler_states_for(&ids).await;
+        let rate_limit_states = self.rate_limit_display_states_for(&ids).await;
+        self.build_snapshot(Some(&scheduler_states), rate_limit_states)
+    }
+
+    fn build_snapshot(
+        &self,
+        scheduler_states: Option<&HashMap<u64, SchedulerCredentialState>>,
+        rate_limit_states: HashMap<u64, RateLimitFallbackState>,
+    ) -> ManagerSnapshot {
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
         let now = Utc::now();
-        let rate_limit_fallbacks = self.rate_limit_fallbacks.lock().clone();
+        let now_ms = now.timestamp_millis();
 
         ManagerSnapshot {
             entries: entries
                 .iter()
                 .map(|e| {
-                    let rate_limit_state = rate_limit_fallbacks.get(&e.id);
-                    let active_rate_limit =
-                        rate_limit_state.filter(|state| state.rate_limited_until > now);
+                    let scheduler_state = scheduler_states.and_then(|states| states.get(&e.id));
+                    let rate_limit_state = rate_limit_states.get(&e.id);
+                    let active_rate_limit = rate_limit_state
+                        .filter(|state| state.rate_limited_until.timestamp_millis() > now_ms);
+                    let dynamic_rate_limited_until = scheduler_state
+                        .and_then(|state| state.rate_limited_until_ms)
+                        .filter(|until| now_ms < *until)
+                        .and_then(DateTime::<Utc>::from_timestamp_millis);
+                    let active_rate_limited_until = active_rate_limit
+                        .map(|state| state.rate_limited_until)
+                        .or(dynamic_rate_limited_until);
+                    let active_temp_unschedulable_until = scheduler_state
+                        .and_then(|state| state.temp_unschedulable_until_ms)
+                        .filter(|until| now_ms < *until)
+                        .and_then(DateTime::<Utc>::from_timestamp_millis);
+                    let manual_recovery_required = scheduler_state
+                        .map(|state| state.manual_recovery_required)
+                        .unwrap_or(false);
                     let active_quota_cooldown = e.cooldown_until.filter(|until| *until > now);
-                    let (scheduling_status, scheduling_reason, scheduling_until) = if e.disabled {
-                        (
-                            "disabled".to_string(),
-                            disabled_reason_to_str(e.disabled_reason),
-                            e.cooldown_until.map(|until| until.to_rfc3339()),
-                        )
-                    } else if let Some(until) = active_quota_cooldown {
-                        (
-                            "quota_cooldown".to_string(),
-                            Some("MONTHLY_REQUEST_COUNT".to_string()),
-                            Some(until.to_rfc3339()),
-                        )
-                    } else if let Some(state) = active_rate_limit {
-                        (
-                            "rate_limited".to_string(),
-                            state.reason.clone().or_else(|| Some("429".to_string())),
-                            Some(state.rate_limited_until.to_rfc3339()),
-                        )
-                    } else {
-                        ("healthy".to_string(), None, None)
-                    };
+                    let (scheduling_status, scheduling_reason, scheduling_until) =
+                        if let Some(until) = active_quota_cooldown {
+                            (
+                                "quota_cooldown".to_string(),
+                                Some("MONTHLY_REQUEST_COUNT".to_string()),
+                                Some(until.to_rfc3339()),
+                            )
+                        } else if e.disabled {
+                            (
+                                "disabled".to_string(),
+                                disabled_reason_to_str(e.disabled_reason),
+                                e.cooldown_until.map(|until| until.to_rfc3339()),
+                            )
+                        } else if manual_recovery_required {
+                            (
+                                "manual_recovery_required".to_string(),
+                                Some("manual_recovery_required".to_string()),
+                                None,
+                            )
+                        } else if let Some(until) = active_temp_unschedulable_until {
+                            (
+                                "temp_unschedulable".to_string(),
+                                scheduler_state
+                                    .and_then(|state| state.temp_unschedulable_reason.clone())
+                                    .or_else(|| Some("temp_unschedulable".to_string())),
+                                Some(until.to_rfc3339()),
+                            )
+                        } else if let Some(until) = active_rate_limited_until {
+                            (
+                                "rate_limited".to_string(),
+                                active_rate_limit
+                                    .and_then(|state| state.reason.clone())
+                                    .or_else(|| Some("429".to_string())),
+                                Some(until.to_rfc3339()),
+                            )
+                        } else {
+                            ("healthy".to_string(), None, None)
+                        };
 
                     CredentialEntrySnapshot {
                         id: e.id,
@@ -2773,9 +3100,9 @@ impl MultiTokenManager {
                         scheduling_status,
                         scheduling_reason,
                         scheduling_until,
-                        last_upstream_status: rate_limit_state
+                        last_upstream_status: active_rate_limit
                             .and_then(|state| state.upstream_status),
-                        rate_limited_count: rate_limit_state.map(|state| state.strike_count),
+                        rate_limited_count: active_rate_limit.map(|state| state.strike_count),
                     }
                 })
                 .collect(),
@@ -3207,27 +3534,6 @@ impl MultiTokenManager {
         self.load_balancing_mode.lock().clone()
     }
 
-    fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
-        use anyhow::Context;
-
-        let config_path = match self.config.config_path() {
-            Some(path) => path.to_path_buf(),
-            None => {
-                tracing::warn!("配置文件路径未知，负载均衡模式仅在当前进程生效: {}", mode);
-                return Ok(());
-            }
-        };
-
-        let mut config = Config::load(&config_path)
-            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
-        config.load_balancing_mode = mode.to_string();
-        config
-            .save()
-            .with_context(|| format!("持久化负载均衡模式失败: {}", config_path.display()))?;
-
-        Ok(())
-    }
-
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         // 验证模式值
@@ -3235,18 +3541,7 @@ impl MultiTokenManager {
             anyhow::bail!("无效的负载均衡模式: {}", mode);
         }
 
-        let previous_mode = self.get_load_balancing_mode();
-        if previous_mode == mode {
-            return Ok(());
-        }
-
-        *self.load_balancing_mode.lock() = mode.clone();
-
-        if let Err(err) = self.persist_load_balancing_mode(&mode) {
-            *self.load_balancing_mode.lock() = previous_mode;
-            return Err(err);
-        }
-
+        self.override_load_balancing_mode(&mode);
         tracing::info!("负载均衡模式已设置为: {}", mode);
         Ok(())
     }
@@ -3979,25 +4274,21 @@ mod tests {
     }
 
     #[test]
-    fn test_set_load_balancing_mode_persists_to_config_file() {
-        let config_path =
-            std::env::temp_dir().join(format!("kiro-load-balancing-{}.json", uuid::Uuid::new_v4()));
-        std::fs::write(&config_path, r#"{"loadBalancingMode":"priority"}"#).unwrap();
-
-        let config = Config::load(&config_path).unwrap();
-        let manager =
-            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
-                .unwrap();
+    fn test_set_load_balancing_mode_updates_runtime_only() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
 
         manager
             .set_load_balancing_mode("balanced".to_string())
             .unwrap();
 
-        let persisted = Config::load(&config_path).unwrap();
-        assert_eq!(persisted.load_balancing_mode, "balanced");
         assert_eq!(manager.get_load_balancing_mode(), "balanced");
-
-        std::fs::remove_file(&config_path).unwrap();
     }
 
     #[tokio::test]
@@ -4120,6 +4411,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_session_binding_ttl_minutes_prunes_old_binding() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        manager.set_session_binding_ttl_minutes(1);
+
+        let empty = HashSet::new();
+        let first = manager
+            .acquire_context_for_session(None, Some("session-ttl"), &empty)
+            .await
+            .unwrap();
+        manager.report_success_for_session(first.id, Some("session-ttl"));
+
+        {
+            let mut bindings = manager.session_bindings.lock();
+            bindings.get_mut("session-ttl").unwrap().last_used_at =
+                Utc::now() - Duration::minutes(2);
+        }
+
+        let second = manager
+            .acquire_context_for_session(None, Some("session-ttl"), &empty)
+            .await
+            .unwrap();
+
+        assert_ne!(first.id, second.id);
+    }
+
+    #[tokio::test]
     async fn test_unbind_session_if_bound_to_does_not_clear_original_binding() {
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
@@ -4155,6 +4483,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bound.id, rebound.id);
+    }
+
+    #[tokio::test]
+    async fn test_successful_fallback_migrates_session_binding() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let empty = HashSet::new();
+
+        let bound = manager
+            .acquire_context_for_session(None, Some("session-fallback-success"), &empty)
+            .await
+            .unwrap();
+        manager.report_success_for_session(bound.id, Some("session-fallback-success"));
+
+        let mut excluded = HashSet::new();
+        excluded.insert(bound.id);
+        let fallback = manager
+            .acquire_context_for_session(None, Some("session-fallback-success"), &excluded)
+            .await
+            .unwrap();
+        assert_ne!(bound.id, fallback.id);
+
+        let before_success = manager
+            .acquire_context_for_session(None, Some("session-fallback-success"), &empty)
+            .await
+            .unwrap();
+        assert_eq!(bound.id, before_success.id);
+
+        manager.report_success_for_session(fallback.id, Some("session-fallback-success"));
+
+        let migrated = manager
+            .acquire_context_for_session(None, Some("session-fallback-success"), &empty)
+            .await
+            .unwrap();
+        assert_eq!(fallback.id, migrated.id);
     }
 
     #[tokio::test]
@@ -4288,6 +4661,69 @@ mod tests {
         let ctx = manager.acquire_context(None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "t2");
+    }
+
+    #[tokio::test]
+    async fn test_temp_unschedulable_credential_is_skipped_without_disabling() {
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred1, cred2], None, None, false)
+                .unwrap();
+
+        manager
+            .report_temp_unschedulable(1, "upstream stream read error: timeout")
+            .await;
+
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(!first.disabled);
+        assert_eq!(first.scheduling_status, "temp_unschedulable");
+        assert_eq!(
+            first.scheduling_reason.as_deref(),
+            Some("upstream stream read error: timeout")
+        );
+        assert!(first.scheduling_until.is_some());
+        assert_eq!(manager.available_count(), 2);
+
+        let ctx = manager.acquire_context(None).await.unwrap();
+        assert_eq!(ctx.id, 2);
+        assert_eq!(ctx.token, "t2");
+
+        manager.report_success(1);
+        assert!(manager.credential_is_schedulable_dynamic(1).await);
+    }
+
+    #[test]
+    fn test_soft_quota_cooldown_is_reported_as_quota_cooldown() {
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred1, cred2], None, None, false)
+                .unwrap();
+
+        manager.set_quota_settings(3, 30);
+        assert!(manager.report_quota_exhausted(1));
+
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(first.disabled);
+        assert_eq!(first.scheduling_status, "quota_cooldown");
+        assert_eq!(
+            first.scheduling_reason.as_deref(),
+            Some("MONTHLY_REQUEST_COUNT")
+        );
+        assert!(first.scheduling_until.is_some());
     }
 
     #[tokio::test]

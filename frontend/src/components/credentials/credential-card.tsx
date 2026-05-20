@@ -84,6 +84,40 @@ function disabledReasonLabel(reason: string | undefined) {
   }
 }
 
+function schedulingStatusMeta(credential: CredentialStatusItem) {
+  const until = credential.schedulingUntil
+    ? `至 ${formatRelative(credential.schedulingUntil)}`
+    : undefined
+  switch (credential.schedulingStatus) {
+    case 'rate_limited':
+      return {
+        label: '429 冷却',
+        title: [credential.schedulingReason, until].filter(Boolean).join(' · '),
+        variant: 'warning' as const,
+      }
+    case 'quota_cooldown':
+      return {
+        label: '配额冷却',
+        title: [credential.schedulingReason, until].filter(Boolean).join(' · '),
+        variant: 'warning' as const,
+      }
+    case 'temp_unschedulable':
+      return {
+        label: '临时不可调度',
+        title: [credential.schedulingReason, until].filter(Boolean).join(' · '),
+        variant: 'warning' as const,
+      }
+    case 'manual_recovery_required':
+      return {
+        label: '需人工恢复',
+        title: credential.schedulingReason,
+        variant: 'destructive' as const,
+      }
+    default:
+      return null
+  }
+}
+
 export function CredentialCard({
   credential,
   selected,
@@ -108,6 +142,7 @@ export function CredentialCard({
   const displayName =
     credential.email || credential.maskedApiKey || `凭据 #${credential.id}`
   const reasonLabel = disabledReasonLabel(credential.disabledReason)
+  const schedulingMeta = schedulingStatusMeta(credential)
   const remainingPercent = balance
     ? Math.max(0, Math.min(100, 100 - balance.usagePercentage))
     : null
@@ -195,6 +230,11 @@ export function CredentialCard({
                 )}
                 {reasonLabel && (
                   <Badge variant="warning">{reasonLabel}</Badge>
+                )}
+                {schedulingMeta && (
+                  <Badge variant={schedulingMeta.variant} title={schedulingMeta.title}>
+                    {schedulingMeta.label}
+                  </Badge>
                 )}
               </div>
             </div>

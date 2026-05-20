@@ -1576,9 +1576,10 @@ fn create_sse_stream(
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            completion.report_soft_failure();
                             // 读取错误：关闭已有内容块后发送 SSE error，不再发送正常 message_stop。
-                            ctx.record_stream_error("api_error", format!("upstream stream read error: {}", e));
+                            let stream_error = format!("upstream stream read error: {}", e);
+                            completion.report_transport_failure(&stream_error).await;
+                            ctx.record_stream_error("api_error", stream_error);
                             let error_detail = ctx.stream_error_detail();
                             let final_events = ctx.generate_final_events();
                             usage_guard.context().record_stream_failure_from_context(
@@ -1630,8 +1631,9 @@ fn create_sse_stream(
                         "上游响应流超过 {} 秒未产生数据，结束流并发送错误事件",
                         UPSTREAM_IDLE_TIMEOUT_SECS
                     );
-                    completion.report_soft_failure();
-                    ctx.record_stream_error("api_error", "upstream stream idle timeout");
+                    let stream_error = "upstream stream idle timeout";
+                    completion.report_transport_failure(stream_error).await;
+                    ctx.record_stream_error("api_error", stream_error);
                     let error_detail = ctx.stream_error_detail();
                     let final_events = ctx.generate_final_events();
                     usage_guard.context().record_stream_failure_from_context(

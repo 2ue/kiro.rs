@@ -1,8 +1,7 @@
-use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -229,10 +228,6 @@ pub struct Config {
     /// 未在此表出现的端点沿用实现内置默认值。
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
-
-    /// 配置文件路径（运行时元数据，不写入 JSON）
-    #[serde(skip)]
-    config_path: Option<PathBuf>,
 }
 
 fn default_host() -> String {
@@ -368,7 +363,6 @@ impl Default for Config {
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             expose_proxy_warnings: default_expose_proxy_warnings(),
-            config_path: None,
         }
     }
 }
@@ -424,33 +418,11 @@ impl Config {
         let path = path.as_ref();
         if !path.exists() {
             // 配置文件不存在，返回默认配置
-            let mut config = Self::default();
-            config.config_path = Some(path.to_path_buf());
-            return Ok(config);
+            return Ok(Self::default());
         }
 
         let content = fs::read_to_string(path)?;
-        let mut config: Config = serde_json::from_str(&content)?;
-        config.config_path = Some(path.to_path_buf());
-        Ok(config)
-    }
-
-    /// 获取配置文件路径（如果有）
-    pub fn config_path(&self) -> Option<&Path> {
-        self.config_path.as_deref()
-    }
-
-    /// 将当前配置写回原始配置文件
-    pub fn save(&self) -> anyhow::Result<()> {
-        let path = self
-            .config_path
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
-
-        let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content)
-            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
-        Ok(())
+        Ok(serde_json::from_str(&content)?)
     }
 }
 
