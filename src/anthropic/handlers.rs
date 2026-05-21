@@ -49,7 +49,6 @@ use super::websearch;
 use crate::kiro::provider::KiroStreamCompletion;
 
 const MAX_REMOTE_MULTIMODAL_BYTES: usize = 20 * 1024 * 1024;
-const REPORTED_CACHE_CREATION_JITTER_PERCENT: i32 = 10;
 
 #[derive(Clone)]
 struct RequestUsageContext {
@@ -70,7 +69,7 @@ struct RequestUsageContext {
     prompt_cache_cap_jitter_min_tokens: i32,
     prompt_cache_cap_jitter_max_tokens: i32,
     prompt_cache_scale_min_input_tokens: i32,
-    reported_cache_creation_limit: Option<i32>,
+    reported_cache_creation_policy: Option<super::cache::ReportedCacheCreationPolicy>,
     simulated_usage: Option<super::cache::CacheSimulation>,
     simulated_source: Option<UsageSource>,
     started_at: Instant,
@@ -120,8 +119,8 @@ impl RequestUsageContext {
         }
     }
 
-    fn reported_cache_creation_limit(&self) -> Option<i32> {
-        self.reported_cache_creation_limit
+    fn reported_cache_creation_policy(&self) -> Option<super::cache::ReportedCacheCreationPolicy> {
+        self.reported_cache_creation_policy
     }
 
     fn reported_usage_for_downstream(
@@ -135,40 +134,23 @@ impl RequestUsageContext {
             return usage;
         }
 
-        self.reported_cache_creation_limit
-            .map(|limit| usage.with_reported_cache_creation_limit(limit))
+        self.reported_cache_creation_policy
+            .map(|policy| usage.with_reported_cache_creation_policy(policy))
             .unwrap_or(usage)
     }
 }
 
-fn reported_cache_creation_limit(
+fn reported_cache_creation_policy(
     endpoint: &str,
     simulation_mode: PromptCacheSimulationMode,
     target_tokens: i32,
-    jitter_seed: u64,
-) -> Option<i32> {
+    seed: u64,
+) -> Option<super::cache::ReportedCacheCreationPolicy> {
     if endpoint != "/cc/v1/messages" || simulation_mode != PromptCacheSimulationMode::HighCache {
         return None;
     }
 
-    jittered_reported_cache_creation_limit(target_tokens, jitter_seed)
-}
-
-fn jittered_reported_cache_creation_limit(target_tokens: i32, jitter_seed: u64) -> Option<i32> {
-    let target_tokens = target_tokens.max(0);
-    if target_tokens <= 0 {
-        return None;
-    }
-
-    let jitter = ((target_tokens as f64) * (REPORTED_CACHE_CREATION_JITTER_PERCENT as f64 / 100.0))
-        .round() as i32;
-    if jitter <= 0 {
-        return Some(target_tokens);
-    }
-
-    let span = (jitter as u64).saturating_mul(2).saturating_add(1);
-    let offset = (jitter_seed % span) as i32 - jitter;
-    Some(target_tokens.saturating_add(offset).max(1))
+    super::cache::ReportedCacheCreationPolicy::new(target_tokens, seed)
 }
 
 impl CredentialUsageContext {
@@ -797,20 +779,23 @@ fn prepare_usage_context(
         stable_conversation_id.as_deref(),
         prompt_cache_profile.as_ref(),
     );
-    let reported_cache_creation_limit = reported_cache_creation_limit(
+    let request_id = envelope::request_id();
+    let reported_cache_creation_seed = prompt_cache_profile
+        .as_ref()
+        .map(|profile| profile.cache_jitter_seed())
+        .unwrap_or(0)
+        ^ fastrand::u64(..);
+    let reported_cache_creation_policy = reported_cache_creation_policy(
         endpoint,
         state.prompt_cache_simulation_mode,
         state.cc_high_cache_reported_cache_creation_target_tokens,
-        prompt_cache_profile
-            .as_ref()
-            .map(|profile| profile.cache_jitter_seed())
-            .unwrap_or(0),
+        reported_cache_creation_seed,
     );
 
     RequestUsageContext {
         recorder: state.usage_recorder.clone(),
         prompt_cache: state.prompt_cache.clone(),
-        request_id: envelope::request_id(),
+        request_id,
         endpoint,
         stream,
         model: payload.model.clone(),
@@ -825,7 +810,7 @@ fn prepare_usage_context(
         prompt_cache_cap_jitter_min_tokens: state.prompt_cache_cap_jitter_min_tokens,
         prompt_cache_cap_jitter_max_tokens: state.prompt_cache_cap_jitter_max_tokens,
         prompt_cache_scale_min_input_tokens: state.prompt_cache_scale_min_input_tokens,
-        reported_cache_creation_limit,
+        reported_cache_creation_policy,
         simulated_usage,
         simulated_source,
         started_at: Instant::now(),
@@ -1372,7 +1357,9 @@ async fn handle_stream_request(
         credential_usage.request.simulated_usage,
         credential_usage.request.simulation_mode,
     );
-    ctx.set_reported_cache_creation_limit(credential_usage.request.reported_cache_creation_limit());
+    ctx.set_reported_cache_creation_policy(
+        credential_usage.request.reported_cache_creation_policy(),
+    );
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -2194,31 +2181,40 @@ mod tests {
     }
 
     #[test]
-    fn cc_high_cache_reported_writer_limit_is_jittered_around_target() {
-        let first = reported_cache_creation_limit(
-            "/cc/v1/messages",
-            PromptCacheSimulationMode::HighCache,
-            3_000,
-            11,
-        )
-        .expect("limit should apply");
-        let second = reported_cache_creation_limit(
-            "/cc/v1/messages",
-            PromptCacheSimulationMode::HighCache,
-            3_000,
-            412,
-        )
-        .expect("limit should apply");
+    fn cc_high_cache_reported_writer_policy_samples_within_target_band() {
+        let usage = CacheUsage {
+            total_input_tokens: 100_000,
+            input_tokens: 50_000,
+            output_tokens: 1,
+            cache_creation_input_tokens: 50_000,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 50_000,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let values: Vec<i32> = (0..24)
+            .map(|seed| {
+                let policy = reported_cache_creation_policy(
+                    "/cc/v1/messages",
+                    PromptCacheSimulationMode::HighCache,
+                    3_000,
+                    seed,
+                )
+                .expect("policy should apply");
+                usage
+                    .with_reported_cache_creation_policy(policy)
+                    .cache_creation_input_tokens
+            })
+            .collect();
 
-        assert!((2_700..=3_300).contains(&first));
-        assert!((2_700..=3_300).contains(&second));
-        assert_ne!(first, second);
+        assert!(values.iter().all(|value| (1..=3_300).contains(value)));
+        assert!(values.windows(2).any(|pair| pair[1] < pair[0]));
+        assert!(values.iter().any(|value| value % 10 != 0));
     }
 
     #[test]
-    fn reported_writer_limit_only_applies_to_cc_high_cache_local_prompt_cache() {
+    fn reported_writer_policy_only_applies_to_cc_high_cache_local_prompt_cache() {
         assert_eq!(
-            reported_cache_creation_limit(
+            reported_cache_creation_policy(
                 "/v1/messages",
                 PromptCacheSimulationMode::HighCache,
                 3_000,
@@ -2227,7 +2223,7 @@ mod tests {
             None
         );
         assert_eq!(
-            reported_cache_creation_limit(
+            reported_cache_creation_policy(
                 "/cc/v1/messages",
                 PromptCacheSimulationMode::LocalPromptCache,
                 3_000,
@@ -2256,7 +2252,12 @@ mod tests {
             prompt_cache_cap_jitter_min_tokens: 0,
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
-            reported_cache_creation_limit: Some(3_123),
+            reported_cache_creation_policy: reported_cache_creation_policy(
+                "/cc/v1/messages",
+                PromptCacheSimulationMode::HighCache,
+                3_000,
+                7,
+            ),
             simulated_usage: None,
             simulated_source: Some(UsageSource::LocalPromptCache),
             started_at: Instant::now(),
@@ -2273,7 +2274,7 @@ mod tests {
 
         let capped =
             usage_context.reported_usage_for_downstream(usage, UsageSource::LocalPromptCache);
-        assert_eq!(capped.cache_creation_input_tokens, 3_123);
+        assert!((0..=3_300).contains(&capped.cache_creation_input_tokens));
         assert_eq!(capped.cache_read_input_tokens, 40_000);
 
         let upstream_metadata =
@@ -2325,7 +2326,7 @@ mod tests {
             prompt_cache_cap_jitter_min_tokens: 0,
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
-            reported_cache_creation_limit: None,
+            reported_cache_creation_policy: None,
             simulated_usage: None,
             simulated_source: Some(UsageSource::LocalPromptCache),
             started_at: Instant::now(),
@@ -2393,7 +2394,7 @@ mod tests {
             prompt_cache_cap_jitter_min_tokens: 0,
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
-            reported_cache_creation_limit: None,
+            reported_cache_creation_policy: None,
             simulated_usage: Some(cache::CacheSimulation {
                 cache_creation_input_tokens: 3968,
                 cache_read_input_tokens: 0,

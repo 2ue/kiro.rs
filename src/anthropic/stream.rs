@@ -571,8 +571,8 @@ pub struct StreamContext {
     pub simulated_usage: Option<super::cache::CacheSimulation>,
     /// 本地 prompt-cache usage 模拟模式。
     pub simulation_mode: PromptCacheSimulationMode,
-    /// 仅用于下游上报的 cache write 限制。
-    reported_cache_creation_limit: Option<i32>,
+    /// 仅用于下游上报的 cache write 改写策略。
+    reported_cache_creation_policy: Option<super::cache::ReportedCacheCreationPolicy>,
     /// 最近一次最终 usage，用于请求级记录。
     final_usage: Option<super::cache::CacheUsage>,
 }
@@ -631,13 +631,16 @@ impl StreamContext {
             stream_error: None,
             simulated_usage,
             simulation_mode,
-            reported_cache_creation_limit: None,
+            reported_cache_creation_policy: None,
             final_usage: None,
         }
     }
 
-    pub fn set_reported_cache_creation_limit(&mut self, limit: Option<i32>) {
-        self.reported_cache_creation_limit = limit.filter(|value| *value > 0);
+    pub fn set_reported_cache_creation_policy(
+        &mut self,
+        policy: Option<super::cache::ReportedCacheCreationPolicy>,
+    ) {
+        self.reported_cache_creation_policy = policy;
     }
 
     fn reported_usage_for_downstream(
@@ -654,8 +657,8 @@ impl StreamContext {
             return usage;
         }
 
-        self.reported_cache_creation_limit
-            .map(|limit| usage.with_reported_cache_creation_limit(limit))
+        self.reported_cache_creation_policy
+            .map(|policy| usage.with_reported_cache_creation_policy(policy))
             .unwrap_or(usage)
     }
 

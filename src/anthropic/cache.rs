@@ -31,26 +31,39 @@ impl CacheUsage {
         })
     }
 
-    pub fn with_reported_cache_creation_limit(self, max_cache_creation_input_tokens: i32) -> Self {
-        let limit = max_cache_creation_input_tokens.max(0);
-        if limit <= 0 || self.cache_creation_input_tokens <= limit {
+    pub fn with_reported_cache_creation_policy(self, policy: ReportedCacheCreationPolicy) -> Self {
+        let raw_creation = self.cache_creation_input_tokens.max(0);
+        if raw_creation <= 0 {
             return self;
         }
 
+        let cache_read_input_tokens = self.cache_read_input_tokens.max(0);
+        let available_creation = self
+            .total_input_tokens
+            .max(0)
+            .saturating_sub(cache_read_input_tokens);
+        let effective_max = raw_creation
+            .min(policy.normal_max_tokens())
+            .min(available_creation);
+        if effective_max <= 0 {
+            return self;
+        }
+
+        let reported_creation = policy.sample(self, effective_max, cache_read_input_tokens > 0);
         let (cache_creation_5m_input_tokens, cache_creation_1h_input_tokens) =
             cap_cache_creation_breakdown(
                 self.cache_creation_5m_input_tokens,
                 self.cache_creation_1h_input_tokens,
-                limit,
+                reported_creation,
             );
 
         Self {
-            cache_creation_input_tokens: limit,
+            cache_creation_input_tokens: reported_creation,
             cache_creation_5m_input_tokens,
             cache_creation_1h_input_tokens,
             input_tokens: self
                 .total_input_tokens
-                .saturating_sub(limit)
+                .saturating_sub(reported_creation)
                 .saturating_sub(self.cache_read_input_tokens)
                 .max(0),
             ..self
@@ -61,6 +74,95 @@ impl CacheUsage {
         self.input_tokens
             .saturating_add(self.cache_creation_input_tokens)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportedCacheCreationPolicy {
+    target_tokens: i32,
+    seed: u64,
+}
+
+impl ReportedCacheCreationPolicy {
+    pub fn new(target_tokens: i32, seed: u64) -> Option<Self> {
+        let target_tokens = target_tokens.max(0);
+        (target_tokens > 0).then_some(Self {
+            target_tokens,
+            seed,
+        })
+    }
+
+    fn normal_max_tokens(self) -> i32 {
+        ((self.target_tokens as i64) * 11 / 10).min(i32::MAX as i64) as i32
+    }
+
+    fn sample(self, usage: CacheUsage, effective_max: i32, has_cache_read: bool) -> i32 {
+        if effective_max <= 0 {
+            return 0;
+        }
+
+        let random = self.random_for_usage(usage);
+        let bucket_roll = (random % 100) as i32;
+        let value_roll = splitmix64(random ^ 0x9e37_79b9_7f4a_7c15);
+        if has_cache_read && bucket_roll < 20 {
+            return 0;
+        }
+
+        let normal_max = self.normal_max_tokens().max(1);
+        let buckets: &[(i32, i32, i32)] = if has_cache_read {
+            &[(45, 1, 10), (75, 11, 45), (93, 46, 85), (100, 86, 100)]
+        } else {
+            &[(35, 1, 12), (70, 13, 50), (92, 51, 88), (100, 89, 100)]
+        };
+
+        let (_, low_pct, high_pct) = buckets
+            .iter()
+            .find(|(threshold, _, _)| bucket_roll < *threshold)
+            .copied()
+            .unwrap_or_else(|| *buckets.last().expect("reported cache buckets"));
+        let low = percent_of(normal_max, low_pct).max(1);
+        let high = percent_of(normal_max, high_pct).max(low);
+        sample_in_range(value_roll, low, high, effective_max)
+    }
+
+    fn random_for_usage(self, usage: CacheUsage) -> u64 {
+        let mut state = self.seed ^ 0xd6e8_feb8_6659_fd93;
+        for value in [
+            self.target_tokens,
+            usage.total_input_tokens,
+            usage.input_tokens,
+            usage.cache_creation_input_tokens,
+            usage.cache_read_input_tokens,
+            usage.cache_creation_5m_input_tokens,
+            usage.cache_creation_1h_input_tokens,
+        ] {
+            state = splitmix64(state ^ value.max(0) as u64);
+        }
+        state
+    }
+}
+
+fn percent_of(value: i32, percent: i32) -> i32 {
+    ((value as i64) * (percent as i64) / 100).min(i32::MAX as i64) as i32
+}
+
+fn sample_in_range(random: u64, low: i32, high: i32, effective_max: i32) -> i32 {
+    let effective_max = effective_max.max(1);
+    let mut low = low.clamp(1, effective_max);
+    let mut high = high.clamp(1, effective_max);
+    if low > high {
+        low = 1;
+        high = effective_max;
+    }
+
+    let span = (high - low + 1) as u64;
+    low + (random % span) as i32
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
 }
 
 fn cap_cache_creation_breakdown(cache5m: i32, cache1h: i32, limit: i32) -> (i32, i32) {
@@ -637,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn reported_creation_limit_caps_only_writer_and_preserves_read() {
+    fn reported_creation_policy_rewrites_only_writer_and_preserves_read() {
         let usage = CacheUsage {
             total_input_tokens: 120_000,
             input_tokens: 5_000,
@@ -647,15 +749,100 @@ mod tests {
             cache_creation_5m_input_tokens: 30_000,
             cache_creation_1h_input_tokens: 10_000,
         };
+        let policy = ReportedCacheCreationPolicy::new(3_000, 13).unwrap();
 
-        let capped = usage.with_reported_cache_creation_limit(3_000);
+        let reported = usage.with_reported_cache_creation_policy(policy);
 
-        assert_eq!(capped.total_input_tokens, 120_000);
-        assert_eq!(capped.output_tokens, 9);
-        assert_eq!(capped.cache_read_input_tokens, 75_000);
-        assert_eq!(capped.cache_creation_input_tokens, 3_000);
-        assert_eq!(capped.cache_creation_5m_input_tokens, 2_250);
-        assert_eq!(capped.cache_creation_1h_input_tokens, 750);
-        assert_eq!(capped.input_tokens, 42_000);
+        assert_eq!(reported.total_input_tokens, 120_000);
+        assert_eq!(reported.output_tokens, 9);
+        assert_eq!(reported.cache_read_input_tokens, 75_000);
+        assert!((0..=3_300).contains(&reported.cache_creation_input_tokens));
+        assert_eq!(
+            reported.cache_creation_input_tokens,
+            reported
+                .cache_creation_5m_input_tokens
+                .saturating_add(reported.cache_creation_1h_input_tokens)
+        );
+        assert_eq!(
+            reported.input_tokens,
+            reported
+                .total_input_tokens
+                .saturating_sub(reported.cache_read_input_tokens)
+                .saturating_sub(reported.cache_creation_input_tokens)
+        );
+    }
+
+    #[test]
+    fn reported_creation_policy_can_report_zero_writer_when_read_exists() {
+        let usage = CacheUsage {
+            total_input_tokens: 120_000,
+            input_tokens: 5_000,
+            output_tokens: 9,
+            cache_creation_input_tokens: 40_000,
+            cache_read_input_tokens: 75_000,
+            cache_creation_5m_input_tokens: 40_000,
+            cache_creation_1h_input_tokens: 0,
+        };
+
+        let found_zero = (0..500).any(|seed| {
+            usage
+                .with_reported_cache_creation_policy(
+                    ReportedCacheCreationPolicy::new(3_000, seed).unwrap(),
+                )
+                .cache_creation_input_tokens
+                == 0
+        });
+
+        assert!(found_zero);
+    }
+
+    #[test]
+    fn reported_creation_policy_keeps_writer_nonzero_without_read() {
+        let usage = CacheUsage {
+            total_input_tokens: 120_000,
+            input_tokens: 80_000,
+            output_tokens: 9,
+            cache_creation_input_tokens: 40_000,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 30_000,
+            cache_creation_1h_input_tokens: 10_000,
+        };
+
+        for seed in 0..200 {
+            let reported = usage.with_reported_cache_creation_policy(
+                ReportedCacheCreationPolicy::new(3_000, seed).unwrap(),
+            );
+            assert!(
+                (1..=3_300).contains(&reported.cache_creation_input_tokens),
+                "seed {seed} produced {}",
+                reported.cache_creation_input_tokens
+            );
+        }
+    }
+
+    #[test]
+    fn reported_creation_policy_samples_natural_non_monotonic_values() {
+        let usage = CacheUsage {
+            total_input_tokens: 120_000,
+            input_tokens: 80_000,
+            output_tokens: 9,
+            cache_creation_input_tokens: 40_000,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 40_000,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let values: Vec<i32> = (0..24)
+            .map(|seed| {
+                usage
+                    .with_reported_cache_creation_policy(
+                        ReportedCacheCreationPolicy::new(3_000, seed).unwrap(),
+                    )
+                    .cache_creation_input_tokens
+            })
+            .collect();
+
+        assert!(values.iter().all(|value| (1..=3_300).contains(value)));
+        assert!(values.windows(2).any(|pair| pair[1] < pair[0]));
+        assert!(values.iter().any(|value| value % 10 != 0));
     }
 }

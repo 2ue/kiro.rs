@@ -201,7 +201,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `promptCacheCapJitterMinTokens` | number | `12000` | high-cache 触顶 soft-cap 的最小扣减 token |
 | `promptCacheCapJitterMaxTokens` | number | `24000` | high-cache 触顶 soft-cap 的最大扣减 token |
 | `promptCacheScaleMinInputTokens` | number | `20000` | 基础输入达到该门槛后才启用 high-cache token scale，避免短测试请求被放大 |
-| `ccHighCacheReportedCacheCreationTargetTokens` | number | `3000` | 仅限制 `/cc/v1/messages` high-cache 对下游上报的 cache write，实际值会围绕目标值抖动；不影响 reader 计算和本地缓存 tracker |
+| `ccHighCacheReportedCacheCreationTargetTokens` | number | `3000` | 仅改写 `/cc/v1/messages` high-cache 对下游上报的 cache write，通常按概率分布落在 0 到目标值 110% 之间；不影响 reader 计算和本地缓存 tracker |
 | `usageRecordLimit` | number | `5000` | Admin usage record 内存保留上限 |
 | `usageRecordPersist` | boolean | `true` | 是否将 usage record 追加写入 `kiro_usage_records.jsonl` |
 | `highCacheThreshold` | number | `10000` | Admin 统计高缓存请求的 cache read 阈值 |
