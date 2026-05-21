@@ -571,6 +571,8 @@ pub struct StreamContext {
     pub simulated_usage: Option<super::cache::CacheSimulation>,
     /// 本地 prompt-cache usage 模拟模式。
     pub simulation_mode: PromptCacheSimulationMode,
+    /// 仅用于下游上报的 cache write 限制。
+    reported_cache_creation_limit: Option<i32>,
     /// 最近一次最终 usage，用于请求级记录。
     final_usage: Option<super::cache::CacheUsage>,
 }
@@ -629,8 +631,32 @@ impl StreamContext {
             stream_error: None,
             simulated_usage,
             simulation_mode,
+            reported_cache_creation_limit: None,
             final_usage: None,
         }
+    }
+
+    pub fn set_reported_cache_creation_limit(&mut self, limit: Option<i32>) {
+        self.reported_cache_creation_limit = limit.filter(|value| *value > 0);
+    }
+
+    fn reported_usage_for_downstream(
+        &self,
+        usage: super::cache::CacheUsage,
+    ) -> super::cache::CacheUsage {
+        if self.simulation_mode != PromptCacheSimulationMode::HighCache
+            || self.simulated_usage.is_none()
+            || self
+                .metadata_usage
+                .as_ref()
+                .is_some_and(|usage| !super::cache::metadata_cache_is_empty(usage))
+        {
+            return usage;
+        }
+
+        self.reported_cache_creation_limit
+            .map(|limit| usage.with_reported_cache_creation_limit(limit))
+            .unwrap_or(usage)
     }
 
     /// 生成 message_start 事件
@@ -640,8 +666,8 @@ impl StreamContext {
             self.input_tokens,
             1,
             self.simulated_usage,
-        )
-        .to_json();
+        );
+        let usage = self.reported_usage_for_downstream(usage).to_json();
         json!({
             "type": "message_start",
             "message": {
@@ -1429,11 +1455,12 @@ impl StreamContext {
             self.simulation_mode == PromptCacheSimulationMode::HighCache,
         );
         self.final_usage = Some(final_usage);
+        let reported_usage = self.reported_usage_for_downstream(final_usage);
 
         // 生成最终事件
         events.extend(
             self.state_manager
-                .generate_final_events_with_usage(final_usage.to_json()),
+                .generate_final_events_with_usage(reported_usage.to_json()),
         );
         events
     }

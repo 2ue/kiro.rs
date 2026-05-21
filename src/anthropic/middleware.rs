@@ -44,6 +44,8 @@ pub struct AppState {
     pub prompt_cache_cap_jitter_max_tokens: i32,
     /// high-cache 模拟启用 scale 的最小基础输入
     pub prompt_cache_scale_min_input_tokens: i32,
+    /// /cc high-cache 下游上报的 cache write 目标值
+    pub cc_high_cache_reported_cache_creation_target_tokens: i32,
     /// Anthropic compatibility profile
     pub compat_profile: CompatProfile,
     /// 是否在响应头中暴露代理改写动作
@@ -75,6 +77,7 @@ impl AppState {
             prompt_cache_cap_jitter_min_tokens: 0,
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
+            cc_high_cache_reported_cache_creation_target_tokens: 3_000,
             compat_profile,
             expose_proxy_warnings: expose_proxy_warnings || compat_profile.is_debug(),
         }
@@ -93,6 +96,11 @@ impl AppState {
         self.prompt_cache_cap_jitter_min_tokens = cap_jitter_min_tokens;
         self.prompt_cache_cap_jitter_max_tokens = cap_jitter_max_tokens;
         self.prompt_cache_scale_min_input_tokens = scale_min_input_tokens;
+        self
+    }
+
+    pub fn with_cc_high_cache_reported_creation_target(mut self, target_tokens: i32) -> Self {
+        self.cc_high_cache_reported_cache_creation_target_tokens = target_tokens.max(0);
         self
     }
 

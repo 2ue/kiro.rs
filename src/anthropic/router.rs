@@ -39,6 +39,7 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// - `kiro_provider`: 可选的 KiroProvider，用于调用上游 API
 
 /// 创建带有 KiroProvider 的 Anthropic API 路由
+#[allow(clippy::too_many_arguments)]
 pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
@@ -52,6 +53,7 @@ pub fn create_router_with_provider(
     prompt_cache_cap_jitter_min_tokens: i32,
     prompt_cache_cap_jitter_max_tokens: i32,
     prompt_cache_scale_min_input_tokens: i32,
+    cc_high_cache_reported_cache_creation_target_tokens: i32,
     compat_profile: CompatProfile,
     expose_proxy_warnings: bool,
 ) -> Router {
@@ -71,6 +73,9 @@ pub fn create_router_with_provider(
         prompt_cache_cap_jitter_min_tokens,
         prompt_cache_cap_jitter_max_tokens,
         prompt_cache_scale_min_input_tokens,
+    )
+    .with_cc_high_cache_reported_creation_target(
+        cc_high_cache_reported_cache_creation_target_tokens,
     );
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);

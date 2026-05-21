@@ -31,10 +31,53 @@ impl CacheUsage {
         })
     }
 
+    pub fn with_reported_cache_creation_limit(self, max_cache_creation_input_tokens: i32) -> Self {
+        let limit = max_cache_creation_input_tokens.max(0);
+        if limit <= 0 || self.cache_creation_input_tokens <= limit {
+            return self;
+        }
+
+        let (cache_creation_5m_input_tokens, cache_creation_1h_input_tokens) =
+            cap_cache_creation_breakdown(
+                self.cache_creation_5m_input_tokens,
+                self.cache_creation_1h_input_tokens,
+                limit,
+            );
+
+        Self {
+            cache_creation_input_tokens: limit,
+            cache_creation_5m_input_tokens,
+            cache_creation_1h_input_tokens,
+            input_tokens: self
+                .total_input_tokens
+                .saturating_sub(limit)
+                .saturating_sub(self.cache_read_input_tokens)
+                .max(0),
+            ..self
+        }
+    }
+
     pub fn billable_input_tokens(self) -> i32 {
         self.input_tokens
             .saturating_add(self.cache_creation_input_tokens)
     }
+}
+
+fn cap_cache_creation_breakdown(cache5m: i32, cache1h: i32, limit: i32) -> (i32, i32) {
+    let limit = limit.max(0);
+    let cache5m = cache5m.max(0);
+    let cache1h = cache1h.max(0);
+    let total = cache5m.saturating_add(cache1h);
+    if limit <= 0 || total <= 0 {
+        return (0, 0);
+    }
+    if total <= limit {
+        return (cache5m, cache1h);
+    }
+
+    let capped_5m = ((cache5m as i64) * (limit as i64) / (total as i64)) as i32;
+    let capped_1h = limit.saturating_sub(capped_5m);
+    (capped_5m, capped_1h)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -591,5 +634,28 @@ mod tests {
         assert_eq!(amplification.apply(10_000), 10_000);
         assert_eq!(amplification.cap_jitter_min_tokens, 5_000);
         assert_eq!(amplification.cap_jitter_max_tokens, 20_000);
+    }
+
+    #[test]
+    fn reported_creation_limit_caps_only_writer_and_preserves_read() {
+        let usage = CacheUsage {
+            total_input_tokens: 120_000,
+            input_tokens: 5_000,
+            output_tokens: 9,
+            cache_creation_input_tokens: 40_000,
+            cache_read_input_tokens: 75_000,
+            cache_creation_5m_input_tokens: 30_000,
+            cache_creation_1h_input_tokens: 10_000,
+        };
+
+        let capped = usage.with_reported_cache_creation_limit(3_000);
+
+        assert_eq!(capped.total_input_tokens, 120_000);
+        assert_eq!(capped.output_tokens, 9);
+        assert_eq!(capped.cache_read_input_tokens, 75_000);
+        assert_eq!(capped.cache_creation_input_tokens, 3_000);
+        assert_eq!(capped.cache_creation_5m_input_tokens, 2_250);
+        assert_eq!(capped.cache_creation_1h_input_tokens, 750);
+        assert_eq!(capped.input_tokens, 42_000);
     }
 }

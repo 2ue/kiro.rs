@@ -180,6 +180,7 @@ async fn main() {
         config.prompt_cache_cap_jitter_min_tokens,
         config.prompt_cache_cap_jitter_max_tokens,
         config.prompt_cache_scale_min_input_tokens,
+        config.cc_high_cache_reported_cache_creation_target_tokens,
         config.compat_profile,
         config.expose_proxy_warnings,
     );

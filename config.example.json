@@ -17,6 +17,7 @@
   "promptCacheCapJitterMinTokens": 12000,
   "promptCacheCapJitterMaxTokens": 24000,
   "promptCacheScaleMinInputTokens": 20000,
+  "ccHighCacheReportedCacheCreationTargetTokens": 3000,
   "usageRecordLimit": 5000,
   "usageRecordPersist": true,
   "highCacheThreshold": 10000,

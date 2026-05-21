@@ -49,6 +49,7 @@ use super::websearch;
 use crate::kiro::provider::KiroStreamCompletion;
 
 const MAX_REMOTE_MULTIMODAL_BYTES: usize = 20 * 1024 * 1024;
+const REPORTED_CACHE_CREATION_JITTER_PERCENT: i32 = 10;
 
 #[derive(Clone)]
 struct RequestUsageContext {
@@ -69,6 +70,7 @@ struct RequestUsageContext {
     prompt_cache_cap_jitter_min_tokens: i32,
     prompt_cache_cap_jitter_max_tokens: i32,
     prompt_cache_scale_min_input_tokens: i32,
+    reported_cache_creation_limit: Option<i32>,
     simulated_usage: Option<super::cache::CacheSimulation>,
     simulated_source: Option<UsageSource>,
     started_at: Instant,
@@ -117,6 +119,56 @@ impl RequestUsageContext {
             fallback_from_sticky,
         }
     }
+
+    fn reported_cache_creation_limit(&self) -> Option<i32> {
+        self.reported_cache_creation_limit
+    }
+
+    fn reported_usage_for_downstream(
+        &self,
+        usage: super::cache::CacheUsage,
+        usage_source: UsageSource,
+    ) -> super::cache::CacheUsage {
+        if usage_source != UsageSource::LocalPromptCache
+            || self.simulation_mode != PromptCacheSimulationMode::HighCache
+        {
+            return usage;
+        }
+
+        self.reported_cache_creation_limit
+            .map(|limit| usage.with_reported_cache_creation_limit(limit))
+            .unwrap_or(usage)
+    }
+}
+
+fn reported_cache_creation_limit(
+    endpoint: &str,
+    simulation_mode: PromptCacheSimulationMode,
+    target_tokens: i32,
+    jitter_seed: u64,
+) -> Option<i32> {
+    if endpoint != "/cc/v1/messages" || simulation_mode != PromptCacheSimulationMode::HighCache {
+        return None;
+    }
+
+    jittered_reported_cache_creation_limit(target_tokens, jitter_seed)
+}
+
+fn jittered_reported_cache_creation_limit(target_tokens: i32, jitter_seed: u64) -> Option<i32> {
+    let target_tokens = target_tokens.max(0);
+    if target_tokens <= 0 {
+        return None;
+    }
+
+    let jitter = ((target_tokens as f64) * (REPORTED_CACHE_CREATION_JITTER_PERCENT as f64 / 100.0))
+        .round() as i32;
+    if jitter <= 0 {
+        return Some(target_tokens);
+    }
+
+    let span = (jitter as u64).saturating_mul(2).saturating_add(1);
+    let offset = (jitter_seed % span) as i32 - jitter;
+    Some(target_tokens.saturating_add(offset).max(1))
 }
 
 impl CredentialUsageContext {
@@ -165,7 +217,12 @@ impl CredentialUsageContext {
         let metadata_usage = ctx.metadata_usage();
         let context_estimated = metadata_usage.is_none() && ctx.context_input_tokens_seen();
         let usage_source = self.usage_source(&usage, metadata_usage, context_estimated);
-        self.record_success(usage, usage_source, context_estimated);
+        self.record_success(
+            self.request
+                .reported_usage_for_downstream(usage, usage_source),
+            usage_source,
+            context_estimated,
+        );
     }
 
     fn record_stream_failure_from_context(
@@ -740,6 +797,15 @@ fn prepare_usage_context(
         stable_conversation_id.as_deref(),
         prompt_cache_profile.as_ref(),
     );
+    let reported_cache_creation_limit = reported_cache_creation_limit(
+        endpoint,
+        state.prompt_cache_simulation_mode,
+        state.cc_high_cache_reported_cache_creation_target_tokens,
+        prompt_cache_profile
+            .as_ref()
+            .map(|profile| profile.cache_jitter_seed())
+            .unwrap_or(0),
+    );
 
     RequestUsageContext {
         recorder: state.usage_recorder.clone(),
@@ -759,6 +825,7 @@ fn prepare_usage_context(
         prompt_cache_cap_jitter_min_tokens: state.prompt_cache_cap_jitter_min_tokens,
         prompt_cache_cap_jitter_max_tokens: state.prompt_cache_cap_jitter_max_tokens,
         prompt_cache_scale_min_input_tokens: state.prompt_cache_scale_min_input_tokens,
+        reported_cache_creation_limit,
         simulated_usage,
         simulated_source,
         started_at: Instant::now(),
@@ -1305,6 +1372,7 @@ async fn handle_stream_request(
         credential_usage.request.simulated_usage,
         credential_usage.request.simulation_mode,
     );
+    ctx.set_reported_cache_creation_limit(credential_usage.request.reported_cache_creation_limit());
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1775,7 +1843,10 @@ async fn handle_non_stream_request(
     let context_estimated = !has_metadata && context_input_tokens.is_some();
     let usage_source =
         credential_usage.usage_source(&usage, metadata_usage.as_ref(), context_estimated);
-    credential_usage.record_success(usage, usage_source, context_estimated);
+    let reported_usage = credential_usage
+        .request
+        .reported_usage_for_downstream(usage, usage_source);
+    credential_usage.record_success(reported_usage, usage_source, context_estimated);
     provider.report_success_for_context(
         api_response.credential_id,
         api_response.session_id.as_deref(),
@@ -1790,7 +1861,7 @@ async fn handle_non_stream_request(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": usage.to_json()
+        "usage": reported_usage.to_json()
     });
 
     envelope::json_response_with_id(
@@ -2123,6 +2194,94 @@ mod tests {
     }
 
     #[test]
+    fn cc_high_cache_reported_writer_limit_is_jittered_around_target() {
+        let first = reported_cache_creation_limit(
+            "/cc/v1/messages",
+            PromptCacheSimulationMode::HighCache,
+            3_000,
+            11,
+        )
+        .expect("limit should apply");
+        let second = reported_cache_creation_limit(
+            "/cc/v1/messages",
+            PromptCacheSimulationMode::HighCache,
+            3_000,
+            412,
+        )
+        .expect("limit should apply");
+
+        assert!((2_700..=3_300).contains(&first));
+        assert!((2_700..=3_300).contains(&second));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn reported_writer_limit_only_applies_to_cc_high_cache_local_prompt_cache() {
+        assert_eq!(
+            reported_cache_creation_limit(
+                "/v1/messages",
+                PromptCacheSimulationMode::HighCache,
+                3_000,
+                0,
+            ),
+            None
+        );
+        assert_eq!(
+            reported_cache_creation_limit(
+                "/cc/v1/messages",
+                PromptCacheSimulationMode::LocalPromptCache,
+                3_000,
+                0,
+            ),
+            None
+        );
+
+        let prompt_cache = Arc::new(PromptCacheTracker::default());
+        let usage_recorder = Arc::new(UsageRecorder::new(10, None));
+        let usage_context = RequestUsageContext {
+            recorder: usage_recorder,
+            prompt_cache,
+            request_id: "req_reported_limit".to_string(),
+            endpoint: "/cc/v1/messages",
+            stream: false,
+            model: "claude-sonnet-4-6".to_string(),
+            conversation_id: Some("session-limit".to_string()),
+            prompt_cache_scope_conversation_id: Some("session-limit".to_string()),
+            input_tokens: 100_000,
+            prompt_cache_profile: None,
+            simulation_mode: PromptCacheSimulationMode::HighCache,
+            prompt_cache_target_read_ratio: 0.95,
+            prompt_cache_token_scale: 1.0,
+            prompt_cache_max_simulated_input_tokens: 0,
+            prompt_cache_cap_jitter_min_tokens: 0,
+            prompt_cache_cap_jitter_max_tokens: 0,
+            prompt_cache_scale_min_input_tokens: 0,
+            reported_cache_creation_limit: Some(3_123),
+            simulated_usage: None,
+            simulated_source: Some(UsageSource::LocalPromptCache),
+            started_at: Instant::now(),
+        };
+        let usage = CacheUsage {
+            total_input_tokens: 100_000,
+            input_tokens: 10_000,
+            output_tokens: 1,
+            cache_creation_input_tokens: 50_000,
+            cache_read_input_tokens: 40_000,
+            cache_creation_5m_input_tokens: 50_000,
+            cache_creation_1h_input_tokens: 0,
+        };
+
+        let capped =
+            usage_context.reported_usage_for_downstream(usage, UsageSource::LocalPromptCache);
+        assert_eq!(capped.cache_creation_input_tokens, 3_123);
+        assert_eq!(capped.cache_read_input_tokens, 40_000);
+
+        let upstream_metadata =
+            usage_context.reported_usage_for_downstream(usage, UsageSource::UpstreamMetadata);
+        assert_eq!(upstream_metadata.cache_creation_input_tokens, 50_000);
+    }
+
+    #[test]
     fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
         let prompt_cache = Arc::new(PromptCacheTracker::default());
         let usage_recorder = Arc::new(UsageRecorder::new(10, None));
@@ -2166,6 +2325,7 @@ mod tests {
             prompt_cache_cap_jitter_min_tokens: 0,
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
+            reported_cache_creation_limit: None,
             simulated_usage: None,
             simulated_source: Some(UsageSource::LocalPromptCache),
             started_at: Instant::now(),
@@ -2233,6 +2393,7 @@ mod tests {
             prompt_cache_cap_jitter_min_tokens: 0,
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
+            reported_cache_creation_limit: None,
             simulated_usage: Some(cache::CacheSimulation {
                 cache_creation_input_tokens: 3968,
                 cache_read_input_tokens: 0,

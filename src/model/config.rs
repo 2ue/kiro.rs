@@ -189,6 +189,13 @@ pub struct Config {
     #[serde(default = "default_prompt_cache_scale_min_input_tokens")]
     pub prompt_cache_scale_min_input_tokens: i32,
 
+    /// /cc high-cache 下游上报的 cache write 目标值。
+    ///
+    /// 只限制 `/cc/v1/messages` 对下游返回和 usage record 的 writer 上报；
+    /// 不影响上游请求、本地 prompt-cache reader 计算和 tracker 更新。
+    #[serde(default = "default_cc_high_cache_reported_cache_creation_target_tokens")]
+    pub cc_high_cache_reported_cache_creation_target_tokens: i32,
+
     /// 请求级 usage record 内存保留上限。
     #[serde(default = "default_usage_record_limit")]
     pub usage_record_limit: usize,
@@ -298,6 +305,10 @@ fn default_prompt_cache_scale_min_input_tokens() -> i32 {
     20_000
 }
 
+fn default_cc_high_cache_reported_cache_creation_target_tokens() -> i32 {
+    3_000
+}
+
 fn default_usage_record_limit() -> usize {
     5000
 }
@@ -350,6 +361,8 @@ impl Default for Config {
             prompt_cache_cap_jitter_min_tokens: default_prompt_cache_cap_jitter_min_tokens(),
             prompt_cache_cap_jitter_max_tokens: default_prompt_cache_cap_jitter_max_tokens(),
             prompt_cache_scale_min_input_tokens: default_prompt_cache_scale_min_input_tokens(),
+            cc_high_cache_reported_cache_creation_target_tokens:
+                default_cc_high_cache_reported_cache_creation_target_tokens(),
             usage_record_limit: default_usage_record_limit(),
             usage_record_persist: default_usage_record_persist(),
             high_cache_threshold: default_high_cache_threshold(),
