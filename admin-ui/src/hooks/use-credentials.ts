@@ -7,12 +7,13 @@ import {
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
+  testCredential,
   addCredential,
   deleteCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
 } from '@/api/credentials'
-import type { AddCredentialRequest, CredentialsPageQuery } from '@/types/api'
+import type { AddCredentialRequest, CredentialsPageQuery, TestCredentialRequest } from '@/types/api'
 
 function invalidateCredentialCaches(queryClient: ReturnType<typeof useQueryClient>, id?: number) {
   queryClient.invalidateQueries({ queryKey: ['credentials'] })
@@ -55,6 +56,14 @@ export function useCredentialBalance(id: number | null) {
     queryFn: () => getCredentialBalance(id!),
     enabled: id !== null,
     retry: false, // 余额查询失败时不重试（避免重复请求被封禁的账号）
+  })
+}
+
+// 测试指定凭据的模型调用
+export function useTestCredential() {
+  return useMutation({
+    mutationFn: ({ id, request }: { id: number; request: TestCredentialRequest }) =>
+      testCredential(id, request),
   })
 }
 

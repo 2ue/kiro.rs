@@ -10,6 +10,8 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  TestCredentialRequest,
+  TestCredentialResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -88,6 +90,15 @@ export async function forceRefreshToken(
 // 获取凭据余额
 export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
   const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
+  return data
+}
+
+// 测试指定凭据的模型调用
+export async function testCredential(
+  id: number,
+  req: TestCredentialRequest
+): Promise<TestCredentialResponse> {
+  const { data } = await api.post<TestCredentialResponse>(`/credentials/${id}/test`, req)
   return data
 }
 

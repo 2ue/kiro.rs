@@ -23,7 +23,7 @@
 //! ```
 
 pub(crate) mod cache;
-mod converter;
+pub(crate) mod converter;
 mod envelope;
 mod handlers;
 mod middleware;

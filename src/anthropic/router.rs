@@ -42,7 +42,7 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 #[allow(clippy::too_many_arguments)]
 pub fn create_router_with_provider(
     api_key: impl Into<String>,
-    kiro_provider: Option<KiroProvider>,
+    kiro_provider: Option<Arc<KiroProvider>>,
     extract_thinking: bool,
     usage_recorder: Arc<UsageRecorder>,
     prompt_cache: Arc<PromptCacheTracker>,

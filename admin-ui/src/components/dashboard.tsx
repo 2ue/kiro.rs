@@ -12,11 +12,12 @@ import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
+import { CredentialTestDialog } from '@/components/credential-test-dialog'
 import { UsageRecordsPanel } from '@/components/usage-records-panel'
 import { useCredentialsPage, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken, getCredentials } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
-import type { BalanceResponse } from '@/types/api'
+import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
 
 interface DashboardProps {
   onLogout: () => void
@@ -24,6 +25,8 @@ interface DashboardProps {
 
 export function Dashboard({ onLogout }: DashboardProps) {
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
+  const [testingCredential, setTestingCredential] = useState<CredentialStatusItem | null>(null)
+  const [testDialogOpen, setTestDialogOpen] = useState(false)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
@@ -127,6 +130,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const handleViewBalance = (id: number) => {
     setSelectedCredentialId(id)
     setBalanceDialogOpen(true)
+  }
+
+  const handleTestCredential = (credential: CredentialStatusItem) => {
+    setTestingCredential(credential)
+    setTestDialogOpen(true)
   }
 
   const handleRefresh = () => {
@@ -760,6 +768,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     key={credential.id}
                     credential={credential}
                     onViewBalance={handleViewBalance}
+                    onTestCredential={handleTestCredential}
                     selected={selectedIds.has(credential.id)}
                     onToggleSelect={() => toggleSelect(credential.id)}
                     balance={balanceMap.get(credential.id) || null}
@@ -810,6 +819,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <AddCredentialDialog
         open={addDialogOpen}
         onOpenChange={setAddDialogOpen}
+      />
+
+      {/* 测试账号连接对话框 */}
+      <CredentialTestDialog
+        credential={testingCredential}
+        open={testDialogOpen}
+        onOpenChange={setTestDialogOpen}
       />
 
       {/* 批量导入对话框 */}

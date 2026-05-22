@@ -100,6 +100,21 @@ export interface AddCredentialResponse {
   email?: string
 }
 
+export interface TestCredentialRequest {
+  model: string
+  prompt?: string
+}
+
+export interface TestCredentialResponse {
+  success: boolean
+  credentialId: number
+  model: string
+  modelId: string
+  prompt: string
+  response: string
+  durationMs: number
+}
+
 export type UsageRecordStatus =
   | 'success'
   | 'error'

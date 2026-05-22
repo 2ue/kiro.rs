@@ -926,6 +926,22 @@ impl MultiTokenManager {
             .await
     }
 
+    /// 获取指定凭据的 API 调用上下文，不参与负载均衡或会话绑定。
+    ///
+    /// 仅用于 Admin 手动模型调用测试；即使凭据已被禁用，也允许验证一次上游模型调用。
+    pub async fn acquire_context_for_credential(&self, id: u64) -> anyhow::Result<CallContext> {
+        let credentials = {
+            let entries = self.entries.lock();
+            let entry = entries
+                .iter()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.clone()
+        };
+
+        self.try_ensure_token(id, &credentials, false).await
+    }
+
     /// 获取 API 调用上下文，优先保持同一会话使用同一个凭据。
     ///
     /// `excluded_ids` 只作用于本次请求，用于 sticky-aware retry 的临时 fallback。
@@ -1048,7 +1064,7 @@ impl MultiTokenManager {
             };
 
             // 尝试获取/刷新 Token
-            match self.try_ensure_token(id, &credentials).await {
+            match self.try_ensure_token(id, &credentials, true).await {
                 Ok(ctx) => {
                     if let Some(sid) = session_id {
                         if self.bound_credential_exists_but_unusable(sid, model) {
@@ -1121,6 +1137,7 @@ impl MultiTokenManager {
         &self,
         id: u64,
         credentials: &KiroCredentials,
+        update_refresh_health: bool,
     ) -> anyhow::Result<CallContext> {
         // API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需刷新
         if credentials.is_api_key_credential() {
@@ -1192,7 +1209,7 @@ impl MultiTokenManager {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("没有可用的 accessToken"))?;
 
-        {
+        if update_refresh_health {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 entry.refresh_failure_count = 0;

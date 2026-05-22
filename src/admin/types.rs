@@ -176,6 +176,32 @@ pub struct AddCredentialResponse {
     pub email: Option<String>,
 }
 
+/// 测试凭据模型调用请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestCredentialRequest {
+    /// Anthropic 兼容模型名，例如 claude-opus-4-5-20251101
+    pub model: String,
+    /// 测试消息，默认 hi
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+}
+
+/// 测试凭据模型调用响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestCredentialResponse {
+    pub success: bool,
+    pub credential_id: u64,
+    /// 前端选择的 Anthropic 兼容模型名
+    pub model: String,
+    /// 发送到 Kiro 上游的模型 ID
+    pub model_id: String,
+    pub prompt: String,
+    pub response: String,
+    pub duration_ms: u64,
+}
+
 // ============ 余额查询 ============
 
 /// 余额查询响应

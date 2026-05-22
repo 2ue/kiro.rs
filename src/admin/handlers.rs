@@ -13,7 +13,7 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, AdminErrorResponse, SetDisabledRequest, SetLoadBalancingModeRequest,
-        SetPriorityRequest, SuccessResponse,
+        SetPriorityRequest, SuccessResponse, TestCredentialRequest,
     },
 };
 use crate::anthropic::usage::{UsageRecordQuery, UsageRecordStatus, UsageSource};
@@ -205,6 +205,19 @@ pub async fn get_credential_balance(
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.get_balance(id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/test
+/// 使用指定凭据发起一次模型调用测试
+pub async fn test_credential(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<TestCredentialRequest>,
+) -> impl IntoResponse {
+    match state.service.test_credential(id, payload).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

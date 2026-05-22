@@ -9,19 +9,26 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::anthropic::{
+    converter::map_model,
     prompt_cache::PromptCacheTracker,
     usage::{
         UsageRecordQuery, UsageRecorder, UsageRecordsPageResult, UsageRecordsResult, UsageSummary,
     },
 };
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::events::Event;
+use crate::kiro::model::requests::{
+    ConversationState, CurrentMessage, KiroRequest, UserInputMessage,
+};
+use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
     CredentialsPageResponse, CredentialsStatusResponse, LoadBalancingModeResponse,
-    SetLoadBalancingModeRequest,
+    SetLoadBalancingModeRequest, TestCredentialRequest, TestCredentialResponse,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -50,6 +57,7 @@ pub struct AdminService {
     usage_recorder: Arc<UsageRecorder>,
     prompt_cache: Arc<PromptCacheTracker>,
     high_cache_threshold: i32,
+    kiro_provider: Arc<KiroProvider>,
 }
 
 impl AdminService {
@@ -59,6 +67,7 @@ impl AdminService {
         usage_recorder: Arc<UsageRecorder>,
         prompt_cache: Arc<PromptCacheTracker>,
         high_cache_threshold: i32,
+        kiro_provider: Arc<KiroProvider>,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
@@ -74,6 +83,7 @@ impl AdminService {
             usage_recorder,
             prompt_cache,
             high_cache_threshold,
+            kiro_provider,
         }
     }
 
@@ -228,6 +238,68 @@ impl AdminService {
         self.save_balance_cache();
 
         Ok(balance)
+    }
+
+    /// 使用指定凭据发起一次模型调用测试。
+    pub async fn test_credential(
+        &self,
+        id: u64,
+        req: TestCredentialRequest,
+    ) -> Result<TestCredentialResponse, AdminServiceError> {
+        let model = req.model.trim();
+        if model.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "请选择测试模型".to_string(),
+            ));
+        }
+        let prompt = req.prompt.unwrap_or_else(|| "hi".to_string());
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "测试消息不能为空".to_string(),
+            ));
+        }
+
+        let model_id = map_model(model).ok_or_else(|| {
+            AdminServiceError::InvalidCredential(format!("不支持的测试模型: {}", model))
+        })?;
+
+        let conversation_id = uuid::Uuid::new_v4().to_string();
+        let agent_continuation_id = uuid::Uuid::new_v4().to_string();
+        let user_input = UserInputMessage::new(prompt, &model_id).with_origin("AI_EDITOR");
+        let conversation_state = ConversationState::new(conversation_id)
+            .with_agent_continuation_id(agent_continuation_id)
+            .with_agent_task_type("vibe")
+            .with_chat_trigger_type("MANUAL")
+            .with_current_message(CurrentMessage::new(user_input));
+        let kiro_request = KiroRequest {
+            conversation_state,
+            profile_arn: None,
+        };
+        let request_body = serde_json::to_string(&kiro_request)
+            .map_err(|e| AdminServiceError::InternalError(format!("序列化测试请求失败: {}", e)))?;
+
+        let started_at = std::time::Instant::now();
+        let api_response = self
+            .kiro_provider
+            .call_api_with_credential(id, &request_body)
+            .await
+            .map_err(|e| self.classify_test_error(e, id))?;
+        let body_bytes =
+            api_response.response.bytes().await.map_err(|e| {
+                AdminServiceError::UpstreamError(format!("读取测试响应失败: {}", e))
+            })?;
+        let response_text = parse_model_test_response(&body_bytes)?;
+
+        Ok(TestCredentialResponse {
+            success: true,
+            credential_id: api_response.credential_id,
+            model: model.to_string(),
+            model_id,
+            prompt: prompt.to_string(),
+            response: response_text,
+            duration_ms: started_at.elapsed().as_millis() as u64,
+        })
     }
 
     /// 从上游获取余额（无缓存）
@@ -508,6 +580,17 @@ impl AdminService {
         }
     }
 
+    fn classify_test_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
+        let msg = e.to_string();
+        if msg.contains("不存在") {
+            AdminServiceError::NotFound { id }
+        } else if msg.contains("已禁用") || msg.contains("不支持") {
+            AdminServiceError::InvalidCredential(msg)
+        } else {
+            AdminServiceError::UpstreamError(msg)
+        }
+    }
+
     /// 分类添加凭据错误
     fn classify_add_error(&self, e: anyhow::Error) -> AdminServiceError {
         let msg = e.to_string();
@@ -549,6 +632,66 @@ impl AdminService {
             AdminServiceError::InternalError(msg)
         }
     }
+}
+
+fn parse_model_test_response(body_bytes: &[u8]) -> Result<String, AdminServiceError> {
+    let mut decoder = EventStreamDecoder::new();
+    decoder
+        .feed(body_bytes)
+        .map_err(|e| AdminServiceError::UpstreamError(format!("解析测试响应失败: {}", e)))?;
+
+    let mut text_content = String::new();
+    let mut invalid_state: Option<String> = None;
+    let mut error: Option<String> = None;
+    let mut exception: Option<String> = None;
+    for result in decoder.decode_iter() {
+        match result {
+            Ok(frame) => match Event::from_frame(frame) {
+                Ok(Event::AssistantResponse(resp)) => {
+                    text_content.push_str(&resp.content);
+                }
+                Ok(Event::InvalidState(invalid)) => {
+                    invalid_state = Some(invalid.error_text());
+                }
+                Ok(Event::Error {
+                    error_code,
+                    error_message,
+                }) => {
+                    error = Some(format!("{}: {}", error_code, error_message));
+                }
+                Ok(Event::Exception {
+                    exception_type,
+                    message,
+                }) => {
+                    exception = Some(format!("{}: {}", exception_type, message));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("测试响应事件解析失败: {}", e);
+                }
+            },
+            Err(e) => {
+                tracing::warn!("测试响应解码失败: {}", e);
+            }
+        }
+    }
+
+    if let Some(message) = invalid_state {
+        return Err(AdminServiceError::UpstreamError(message));
+    }
+    if let Some(message) = error {
+        return Err(AdminServiceError::UpstreamError(message));
+    }
+    if let Some(message) = exception {
+        return Err(AdminServiceError::UpstreamError(message));
+    }
+    if text_content.trim().is_empty() {
+        return Err(AdminServiceError::UpstreamError(
+            "模型调用成功但响应为空".to_string(),
+        ));
+    }
+
+    Ok(text_content)
 }
 
 fn normalize_page(page: usize) -> usize {

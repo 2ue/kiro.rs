@@ -664,7 +664,7 @@ mod tests {
         assert_eq!(by_account.records[0].id, "1");
 
         let by_credential_id = recorder.query(UsageRecordQuery {
-            q: Some("42".to_string()),
+            q: Some("beta@example".to_string()),
             ..Default::default()
         });
         assert_eq!(by_credential_id.total, 1);

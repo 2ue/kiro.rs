@@ -417,6 +417,79 @@ impl KiroProvider {
         })
     }
 
+    /// 使用指定凭据发送一次非流式 API 请求。
+    ///
+    /// Admin 测试账号连通性时使用；不参与负载均衡、不做凭据 fallback，
+    /// 失败也不累计禁用计数，避免手动测试改变调度状态。
+    pub async fn call_api_with_credential(
+        &self,
+        credential_id: u64,
+        request_body: &str,
+    ) -> anyhow::Result<KiroApiResponse> {
+        let ctx = self
+            .token_manager
+            .acquire_context_for_credential(credential_id)
+            .await?;
+        let credential_label = self.credential_log_label(ctx.id);
+        let credential_context = format!("凭据 {}", credential_label);
+
+        let config = self.token_manager.config();
+        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
+        let endpoint = self.endpoint_for(&ctx.credentials).map_err(|e| {
+            anyhow::anyhow!(
+                "非流式 API 凭据 endpoint 解析失败（{}）: {}",
+                credential_context,
+                e
+            )
+        })?;
+
+        let rctx = RequestContext {
+            credentials: &ctx.credentials,
+            token: &ctx.token,
+            machine_id: &machine_id,
+            config,
+        };
+
+        let url = endpoint.api_url(&rctx);
+        let body = endpoint.transform_api_body(request_body, &rctx);
+        let base = self
+            .client_for(&ctx.credentials)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "非流式 API 创建 HTTP client 失败（{}）: {}",
+                    credential_context,
+                    e
+                )
+            })?
+            .post(&url)
+            .body(body)
+            .header("content-type", "application/json")
+            .header("Connection", "close");
+        let request = endpoint.decorate_api(base, &rctx);
+
+        let response = request.send().await.map_err(|e| {
+            anyhow::anyhow!("非流式 API 请求发送失败（{}）: {}", credential_context, e)
+        })?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(KiroApiResponse {
+                response,
+                credential_id: ctx.id,
+                session_id: None,
+                sticky_bound: false,
+                fallback_from_sticky: false,
+            });
+        }
+
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "非流式 API 请求失败（{}）: {} {}",
+            credential_context,
+            status,
+            body
+        );
+    }
+
     /// 在 handler 完成非流式 body 读取和事件解析后上报成功。
     pub fn report_success_for_context(&self, credential_id: u64, session_id: Option<&str>) {
         self.token_manager

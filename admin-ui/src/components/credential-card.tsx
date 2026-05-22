@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, PlayCircle } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -28,6 +28,7 @@ import {
 interface CredentialCardProps {
   credential: CredentialStatusItem
   onViewBalance: (id: number) => void
+  onTestCredential: (credential: CredentialStatusItem) => void
   selected: boolean
   onToggleSelect: () => void
   balance: BalanceResponse | null
@@ -53,6 +54,7 @@ function formatLastUsed(lastUsedAt: string | null): string {
 export function CredentialCard({
   credential,
   onViewBalance,
+  onTestCredential,
   selected,
   onToggleSelect,
   balance,
@@ -363,6 +365,15 @@ export function CredentialCard({
             <Button
               size="sm"
               variant="default"
+              onClick={() => onTestCredential(credential)}
+              title="测试模型调用"
+            >
+              <PlayCircle className="h-4 w-4 mr-1" />
+              测试
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
               onClick={() => onViewBalance(credential.id)}
             >
               <Wallet className="h-4 w-4 mr-1" />
