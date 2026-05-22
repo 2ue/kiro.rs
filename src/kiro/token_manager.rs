@@ -720,6 +720,21 @@ impl MultiTokenManager {
         true
     }
 
+    /// 判断排除当前凭据后，本次请求是否还有其他可用凭据可 fallback。
+    pub fn has_alternate_usable_credential(
+        &self,
+        model: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        current_id: u64,
+    ) -> bool {
+        let entries = self.entries.lock();
+        entries.iter().any(|entry| {
+            entry.id != current_id
+                && !excluded_ids.contains(&entry.id)
+                && Self::credential_is_usable_for_model(entry, model)
+        })
+    }
+
     /// 根据负载均衡模式选择下一个凭据，并排除本次请求已临时失败的凭据。
     fn select_next_credential_excluding(
         &self,
@@ -1000,6 +1015,32 @@ impl MultiTokenManager {
                             // 因为 available_count() 会尝试获取 entries 锁，
                             // 而此时我们已经持有该锁，会导致死锁
                             let available = entries.iter().filter(|e| !e.disabled).count();
+                            let usable = entries
+                                .iter()
+                                .filter(|e| Self::credential_is_usable_for_model(e, model))
+                                .count();
+                            let excluded_usable = entries
+                                .iter()
+                                .filter(|e| {
+                                    excluded_ids.contains(&e.id)
+                                        && Self::credential_is_usable_for_model(e, model)
+                                })
+                                .count();
+                            if usable > 0 && excluded_usable >= usable {
+                                anyhow::bail!(
+                                    "本次请求临时排除了所有可用凭据（可用: {}/{}, 临时排除: {}）",
+                                    available,
+                                    total,
+                                    excluded_usable
+                                );
+                            }
+                            if available > 0 && usable == 0 && model.is_some() {
+                                anyhow::bail!(
+                                    "没有支持当前模型的可用凭据（可用: {}/{}）",
+                                    available,
+                                    total
+                                );
+                            }
                             anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                         }
                     }
@@ -2651,6 +2692,75 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first.id, rebound.id);
+    }
+
+    #[tokio::test]
+    async fn test_only_available_credential_is_not_an_alternate_after_soft_failure() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut disabled1 = KiroCredentials::default();
+        disabled1.disabled = true;
+        let mut disabled2 = KiroCredentials::default();
+        disabled2.disabled = true;
+        let mut active = KiroCredentials::default();
+        active.access_token = Some("active-token".to_string());
+        active.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![disabled1, disabled2, active],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let empty = HashSet::new();
+        let ctx = manager
+            .acquire_context_for_session(None, Some("session-only"), &empty)
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.id, 3);
+        assert!(!manager.has_alternate_usable_credential(None, &empty, ctx.id));
+        assert!(!manager.record_session_soft_failure("session-only", ctx.id));
+        assert!(manager.record_session_soft_failure("session-only", ctx.id));
+        assert!(!manager.has_alternate_usable_credential(None, &empty, ctx.id));
+    }
+
+    #[tokio::test]
+    async fn test_excluding_only_available_credential_reports_temporary_exclusion() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut disabled = KiroCredentials::default();
+        disabled.disabled = true;
+        let mut active = KiroCredentials::default();
+        active.access_token = Some("active-token".to_string());
+        active.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![disabled, active], None, None, false).unwrap();
+        let mut excluded = HashSet::new();
+        excluded.insert(2);
+
+        let err = manager
+            .acquire_context_for_session(None, Some("session-excluded"), &excluded)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(
+            err.contains("本次请求临时排除了所有可用凭据"),
+            "错误应提示临时排除，实际: {}",
+            err
+        );
+        assert!(
+            !err.contains("所有凭据均已禁用"),
+            "错误不应误报所有凭据禁用，实际: {}",
+            err
+        );
     }
 
     #[tokio::test]
