@@ -8,6 +8,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_QUERY_LIMIT: usize = 100;
+const DEFAULT_PAGE_QUERY_LIMIT: usize = 20;
 const MAX_QUERY_LIMIT: usize = 1000;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -147,10 +148,9 @@ pub struct UsageRecordsResult {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageRecordsPageResult {
-    pub total: usize,
     pub page: usize,
     pub limit: usize,
-    pub total_pages: usize,
+    pub has_next: bool,
     pub records: Vec<UsageRecord>,
 }
 
@@ -271,25 +271,27 @@ impl UsageRecorder {
         limit: usize,
     ) -> UsageRecordsPageResult {
         let page = normalize_page(page);
-        let limit = normalize_limit(limit);
-        let matched: Vec<UsageRecord> = self
+        let limit = normalize_page_limit(limit);
+        let start = page.saturating_sub(1).saturating_mul(limit);
+        let mut records: Vec<UsageRecord> = self
             .records
             .lock()
             .iter()
             .rev()
             .filter(|record| record_matches(record, &query))
+            .skip(start)
+            .take(limit.saturating_add(1))
             .cloned()
             .collect();
-        let total = matched.len();
-        let total_pages = total_pages(total, limit);
-        let start = page.saturating_sub(1).saturating_mul(limit);
-        let records = matched.into_iter().skip(start).take(limit).collect();
+        let has_next = records.len() > limit;
+        if has_next {
+            records.truncate(limit);
+        }
 
         UsageRecordsPageResult {
-            total,
             page,
             limit,
-            total_pages,
+            has_next,
             records,
         }
     }
@@ -461,12 +463,16 @@ fn normalize_limit(limit: usize) -> usize {
     }
 }
 
-fn normalize_page(page: usize) -> usize {
-    page.max(1)
+fn normalize_page_limit(limit: usize) -> usize {
+    if limit == 0 {
+        DEFAULT_PAGE_QUERY_LIMIT
+    } else {
+        limit.min(MAX_QUERY_LIMIT)
+    }
 }
 
-fn total_pages(total: usize, limit: usize) -> usize {
-    if total == 0 { 0 } else { total.div_ceil(limit) }
+fn normalize_page(page: usize) -> usize {
+    page.max(1)
 }
 
 fn record_matches(record: &UsageRecord, query: &UsageRecordQuery) -> bool {
@@ -675,7 +681,23 @@ mod tests {
         recorder.record(record("3", 30, UsageSource::LocalPromptCache));
         recorder.record(record("4", 40, UsageSource::UpstreamMetadata));
 
-        let result = recorder.query_page(
+        let first_page = recorder.query_page(
+            UsageRecordQuery {
+                source: Some(UsageSource::LocalPromptCache),
+                ..Default::default()
+            },
+            1,
+            2,
+        );
+
+        assert_eq!(first_page.page, 1);
+        assert_eq!(first_page.limit, 2);
+        assert!(first_page.has_next);
+        assert_eq!(first_page.records.len(), 2);
+        assert_eq!(first_page.records[0].id, "3");
+        assert_eq!(first_page.records[1].id, "2");
+
+        let second_page = recorder.query_page(
             UsageRecordQuery {
                 source: Some(UsageSource::LocalPromptCache),
                 ..Default::default()
@@ -684,12 +706,39 @@ mod tests {
             2,
         );
 
-        assert_eq!(result.total, 3);
-        assert_eq!(result.page, 2);
-        assert_eq!(result.limit, 2);
-        assert_eq!(result.total_pages, 2);
-        assert_eq!(result.records.len(), 1);
-        assert_eq!(result.records[0].id, "1");
+        assert_eq!(second_page.page, 2);
+        assert_eq!(second_page.limit, 2);
+        assert!(!second_page.has_next);
+        assert_eq!(second_page.records.len(), 1);
+        assert_eq!(second_page.records[0].id, "1");
+    }
+
+    #[test]
+    fn recorder_query_page_defaults_to_twenty_and_uses_has_next() {
+        let recorder = UsageRecorder::new(25, None);
+        for index in 1..=21 {
+            recorder.record(record(
+                &index.to_string(),
+                index,
+                UsageSource::LocalPromptCache,
+            ));
+        }
+
+        let first_page = recorder.query_page(UsageRecordQuery::default(), 1, 0);
+
+        assert_eq!(first_page.page, 1);
+        assert_eq!(first_page.limit, 20);
+        assert!(first_page.has_next);
+        assert_eq!(first_page.records.len(), 20);
+        assert_eq!(first_page.records[0].id, "21");
+        assert_eq!(first_page.records[19].id, "2");
+
+        let second_page = recorder.query_page(UsageRecordQuery::default(), 2, 0);
+
+        assert_eq!(second_page.limit, 20);
+        assert!(!second_page.has_next);
+        assert_eq!(second_page.records.len(), 1);
+        assert_eq!(second_page.records[0].id, "1");
     }
 
     #[test]

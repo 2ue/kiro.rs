@@ -2,6 +2,9 @@ use serde_json::json;
 
 use crate::anthropic::prompt_cache::PromptCacheUsage;
 use crate::kiro::model::events::MetadataTokenUsage;
+use crate::model::config::{
+    ReportedUsageFieldMode, ReportedUsageFieldPolicy, ReportedUsagePathPolicy,
+};
 
 /// Usage split used for Anthropic prompt-cache compatible responses.
 ///
@@ -60,43 +63,48 @@ impl CacheUsage {
             return self;
         }
 
-        let mut usage = policy
-            .creation_policy()
-            .map(|creation_policy| self.with_reported_cache_creation_fields(creation_policy))
-            .unwrap_or(self);
-        let current_input = self.input_tokens.max(0);
-        if current_input <= 0 {
-            return usage;
+        if !policy.reports_local_prompt_cache() {
+            return self.without_prompt_cache_reporting();
         }
 
-        let reported_input = policy.sample_uncached_input(self).min(current_input).max(1);
-        let input_delta = current_input.saturating_sub(reported_input);
-        usage.input_tokens = reported_input;
-        usage.cache_read_input_tokens = self
-            .cache_read_input_tokens
-            .max(0)
-            .saturating_add(input_delta);
+        let mut usage = self;
+        if let Some(reported_creation) = policy.sample_cache_creation(self) {
+            let (cache_creation_5m_input_tokens, cache_creation_1h_input_tokens) =
+                cap_cache_creation_breakdown(
+                    self.cache_creation_5m_input_tokens,
+                    self.cache_creation_1h_input_tokens,
+                    reported_creation,
+                );
+            usage.cache_creation_input_tokens = reported_creation;
+            usage.cache_creation_5m_input_tokens = cache_creation_5m_input_tokens;
+            usage.cache_creation_1h_input_tokens = cache_creation_1h_input_tokens;
+        }
+        let current_input = self.input_tokens.max(0);
+        if current_input > 0 {
+            if let Some(reported_input) = policy.sample_input(self, current_input) {
+                let input_delta = current_input.saturating_sub(reported_input);
+                usage.input_tokens = reported_input;
+                if policy.input_moves_delta_to_cache_read() {
+                    usage.cache_read_input_tokens = self
+                        .cache_read_input_tokens
+                        .max(0)
+                        .saturating_add(input_delta);
+                }
+            }
+        }
+
+        if let Some(output_tokens) = policy.sample_output(self, usage.output_tokens.max(0)) {
+            usage.output_tokens = output_tokens;
+        }
+        if let Some(cache_read_input_tokens) =
+            policy.sample_cache_read(self, usage.cache_read_input_tokens.max(0))
+        {
+            usage.cache_read_input_tokens = cache_read_input_tokens;
+        }
         usage
     }
 
-    fn with_reported_cache_creation_fields(self, policy: ReportedCacheCreationPolicy) -> Self {
-        let Some((
-            reported_creation,
-            cache_creation_5m_input_tokens,
-            cache_creation_1h_input_tokens,
-        )) = self.reported_cache_creation_fields(policy)
-        else {
-            return self;
-        };
-
-        Self {
-            cache_creation_input_tokens: reported_creation,
-            cache_creation_5m_input_tokens,
-            cache_creation_1h_input_tokens,
-            ..self
-        }
-    }
-
+    #[cfg(test)]
     fn reported_cache_creation_fields(
         self,
         policy: ReportedCacheCreationPolicy,
@@ -137,15 +145,27 @@ impl CacheUsage {
         self.cache_creation_input_tokens > 0 || self.cache_read_input_tokens > 0
     }
 
+    fn without_prompt_cache_reporting(self) -> Self {
+        Self {
+            input_tokens: self.total_input_tokens.max(self.input_tokens).max(0),
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+            ..self
+        }
+    }
+
     pub fn billable_input_tokens(self) -> i32 {
         self.input_tokens
             .saturating_add(self.cache_creation_input_tokens)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ReportedCacheCreationPolicy {
     target_tokens: i32,
+    normal_max_multiplier: f64,
     seed: u64,
 }
 
@@ -155,12 +175,15 @@ impl ReportedCacheCreationPolicy {
         let target_tokens = target_tokens.max(0);
         (target_tokens > 0).then_some(Self {
             target_tokens,
+            normal_max_multiplier: 1.1,
             seed,
         })
     }
 
     fn normal_max_tokens(self) -> i32 {
-        ((self.target_tokens as i64) * 11 / 10).min(i32::MAX as i64) as i32
+        ((self.target_tokens as f64) * self.normal_max_multiplier)
+            .round()
+            .clamp(1.0, i32::MAX as f64) as i32
     }
 
     fn sample(self, usage: CacheUsage, effective_max: i32, has_cache_read: bool) -> i32 {
@@ -209,50 +232,152 @@ impl ReportedCacheCreationPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReportedCacheUsagePolicy {
-    creation_target_tokens: Option<i32>,
-    uncached_input_max_tokens: i32,
+    policy: ReportedUsagePathPolicy,
     seed: u64,
 }
 
 impl ReportedCacheUsagePolicy {
+    pub fn from_path_policy(policy: ReportedUsagePathPolicy, seed: u64) -> Option<Self> {
+        Some(Self {
+            policy: policy.normalized(),
+            seed,
+        })
+    }
+
+    fn reports_local_prompt_cache(&self) -> bool {
+        self.policy.enabled
+    }
+
+    #[cfg(test)]
     pub fn new(
         creation_target_tokens: i32,
         uncached_input_max_tokens: i32,
         seed: u64,
     ) -> Option<Self> {
-        let creation_target_tokens = creation_target_tokens.max(0);
-        let uncached_input_max_tokens = uncached_input_max_tokens.max(0);
-        (creation_target_tokens > 0 && uncached_input_max_tokens > 0).then_some(Self {
-            creation_target_tokens: Some(creation_target_tokens),
-            uncached_input_max_tokens,
+        Self::from_path_policy(
+            ReportedUsagePathPolicy {
+                input: crate::model::config::ReportedUsageFieldPolicy::sample_input_max(
+                    uncached_input_max_tokens,
+                ),
+                cache_creation: crate::model::config::ReportedUsageFieldPolicy::sample_target(
+                    creation_target_tokens,
+                ),
+                ..ReportedUsagePathPolicy::default()
+            },
             seed,
-        })
+        )
     }
 
+    #[cfg(test)]
     pub fn input_only(uncached_input_max_tokens: i32, seed: u64) -> Option<Self> {
-        let uncached_input_max_tokens = uncached_input_max_tokens.max(0);
-        (uncached_input_max_tokens > 0).then_some(Self {
-            creation_target_tokens: None,
-            uncached_input_max_tokens,
+        Self::from_path_policy(
+            ReportedUsagePathPolicy {
+                input: crate::model::config::ReportedUsageFieldPolicy::sample_input_max(
+                    uncached_input_max_tokens,
+                ),
+                ..ReportedUsagePathPolicy::default()
+            },
             seed,
-        })
+        )
     }
 
-    fn creation_policy(self) -> Option<ReportedCacheCreationPolicy> {
-        self.creation_target_tokens
-            .map(|target_tokens| ReportedCacheCreationPolicy {
-                target_tokens,
+    fn input_moves_delta_to_cache_read(&self) -> bool {
+        self.policy.input.move_delta_to_cache_read
+    }
+
+    fn sample_cache_creation(&self, usage: CacheUsage) -> Option<i32> {
+        let raw_creation = usage.cache_creation_input_tokens.max(0);
+        if raw_creation <= 0 {
+            return None;
+        }
+        let field = self.policy.cache_creation.normalized();
+        let policy = match field.mode {
+            ReportedUsageFieldMode::Preserve => return None,
+            ReportedUsageFieldMode::SampleMax => ReportedCacheCreationPolicy {
+                target_tokens: field.max_tokens,
+                normal_max_multiplier: 1.0,
                 seed: self.seed,
-            })
+            },
+            ReportedUsageFieldMode::SampleTarget => ReportedCacheCreationPolicy {
+                target_tokens: field.target_tokens,
+                normal_max_multiplier: field.normal_max_multiplier,
+                seed: self.seed,
+            },
+        };
+        if policy.target_tokens <= 0 {
+            return None;
+        }
+        let cache_read_input_tokens = usage.cache_read_input_tokens.max(0);
+        let available_creation = usage
+            .total_input_tokens
+            .max(0)
+            .saturating_sub(cache_read_input_tokens);
+        let effective_max = raw_creation
+            .min(policy.normal_max_tokens())
+            .min(available_creation);
+        (effective_max > 0)
+            .then(|| policy.sample(usage, effective_max, cache_read_input_tokens > 0))
     }
 
-    fn sample_uncached_input(self, usage: CacheUsage) -> i32 {
-        let max_tokens = self.uncached_input_max_tokens.max(1);
+    fn sample_input(&self, usage: CacheUsage, current_input: i32) -> Option<i32> {
+        self.sample_field(
+            self.policy.input.normalized(),
+            usage,
+            current_input,
+            0xa24b_aed4_963e_e407,
+        )
+        .map(|value| value.min(current_input).max(1))
+    }
+
+    fn sample_output(&self, usage: CacheUsage, current_output: i32) -> Option<i32> {
+        self.sample_field(
+            self.policy.output.normalized(),
+            usage,
+            current_output,
+            0x6d2b_79f5_aa54_21d1,
+        )
+    }
+
+    fn sample_cache_read(&self, usage: CacheUsage, current_read: i32) -> Option<i32> {
+        self.sample_field(
+            self.policy.cache_read.normalized(),
+            usage,
+            current_read,
+            0x94d0_49bb_1331_11eb,
+        )
+    }
+
+    fn sample_field(
+        &self,
+        field: ReportedUsageFieldPolicy,
+        usage: CacheUsage,
+        current_value: i32,
+        salt: u64,
+    ) -> Option<i32> {
+        if current_value <= 0 {
+            return None;
+        }
+        let max_tokens = match field.mode {
+            ReportedUsageFieldMode::Preserve => return None,
+            ReportedUsageFieldMode::SampleMax => field.max_tokens.max(0).min(current_value),
+            ReportedUsageFieldMode::SampleTarget => {
+                let policy = ReportedCacheCreationPolicy {
+                    target_tokens: field.target_tokens.max(0),
+                    normal_max_multiplier: field.normal_max_multiplier,
+                    seed: self.seed,
+                };
+                policy.normal_max_tokens().min(current_value)
+            }
+        };
+        if max_tokens <= 0 {
+            return None;
+        }
+
         let random = self.random_for_usage(usage);
         let bucket_roll = (random % 100) as i32;
-        let value_roll = splitmix64(random ^ 0xa24b_aed4_963e_e407);
+        let value_roll = splitmix64(random ^ salt);
 
         let buckets: &[(i32, i32, i32)] = &[(70, 2, 25), (95, 26, 70), (100, 71, 100)];
         let (_, low_pct, high_pct) = buckets
@@ -263,14 +388,20 @@ impl ReportedCacheUsagePolicy {
         let low = percent_of(max_tokens, low_pct).max(1);
         let high = percent_of(max_tokens, high_pct).max(low);
 
-        sample_in_range(value_roll, low, high, max_tokens)
+        Some(sample_in_range(value_roll, low, high, max_tokens))
     }
 
-    fn random_for_usage(self, usage: CacheUsage) -> u64 {
+    fn random_for_usage(&self, usage: CacheUsage) -> u64 {
         let mut state = self.seed ^ 0x69b2_3f0a_9c7d_f1e5;
         for value in [
-            self.creation_target_tokens.unwrap_or(0),
-            self.uncached_input_max_tokens,
+            self.policy.input.max_tokens,
+            self.policy.input.target_tokens,
+            self.policy.output.max_tokens,
+            self.policy.output.target_tokens,
+            self.policy.cache_read.max_tokens,
+            self.policy.cache_read.target_tokens,
+            self.policy.cache_creation.max_tokens,
+            self.policy.cache_creation.target_tokens,
             usage.total_input_tokens,
             usage.input_tokens,
             usage.cache_creation_input_tokens,

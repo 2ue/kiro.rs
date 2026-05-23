@@ -9,8 +9,11 @@
   "adminApiKey": "sk-admin-your-secret-key",
   "loadBalancingMode": "priority",
   "credentialRpm": null,
+  "credentialMaxConcurrentRequests": 0,
   "credentialTransientCooldownSecs": 10,
   "credentialMaxCooldownSecs": 300,
+  "credentialDispatchMaxWaitSecs": 120,
+  "credentialInFlightLeaseMaxSecs": 900,
   "credentialWarmupRequests": 3,
   "credentialWarmupSelectionPercent": 5,
   "credentialsPersist": true,
@@ -27,8 +30,41 @@
   "promptCacheCapJitterMinTokens": 12000,
   "promptCacheCapJitterMaxTokens": 24000,
   "promptCacheScaleMinInputTokens": 20000,
-  "ccHighCacheReportedCacheCreationTargetTokens": 3000,
-  "ccHighCacheReportedInputMaxTokens": 96,
+  "reportedUsage": {
+    "default": {
+      "enabled": true,
+      "input": { "mode": "preserve" },
+      "output": { "mode": "preserve" },
+      "cacheRead": { "mode": "preserve" },
+      "cacheCreation": { "mode": "preserve" }
+    },
+    "pathOverrides": {
+      "/na": {
+        "enabled": false
+      },
+      "/cc": {
+        "enabled": true,
+        "input": {
+          "mode": "sample-max",
+          "maxTokens": 96,
+          "moveDeltaToCacheRead": true
+        },
+        "cacheCreation": {
+          "mode": "sample-target",
+          "targetTokens": 3000,
+          "normalMaxMultiplier": 1.1
+        }
+      },
+      "/ha": {
+        "enabled": true,
+        "input": {
+          "mode": "sample-max",
+          "maxTokens": 96,
+          "moveDeltaToCacheRead": true
+        }
+      }
+    }
+  },
   "usageRecordLimit": 5000,
   "usageRecordPersist": true,
   "highCacheThreshold": 10000,

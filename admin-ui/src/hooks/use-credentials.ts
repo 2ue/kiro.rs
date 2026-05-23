@@ -5,6 +5,7 @@ import {
   setCredentialDisabled,
   setCredentialPriority,
   setCredentialWarmup,
+  clearCredentialInFlight,
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
@@ -99,6 +100,17 @@ export function useSetWarmup() {
   return useMutation({
     mutationFn: ({ id, warmupRemaining }: { id: number; warmupRemaining: number }) =>
       setCredentialWarmup(id, warmupRemaining),
+    onSuccess: (_data, variables) => {
+      invalidateCredentialCaches(queryClient, variables.id)
+    },
+  })
+}
+
+export function useClearInFlight() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, minIdleSecs }: { id: number; minIdleSecs?: number }) =>
+      clearCredentialInFlight(id, minIdleSecs),
     onSuccess: (_data, variables) => {
       invalidateCredentialCaches(queryClient, variables.id)
     },

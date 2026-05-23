@@ -43,6 +43,11 @@ export interface CredentialStatusItem {
   cooldownReason?: string
   rateLimited: boolean
   rateLimitRemainingSecs: number
+  inFlightRequests: number
+  oldestInFlightAgeSecs: number
+  newestInFlightIdleSecs: number
+  maxConcurrentRequests: number
+  inFlightLeaseMaxSecs: number
   warmupRemaining: number
   estimatedCostUsd: number
   pricedRequests: number
@@ -178,10 +183,11 @@ export interface UsageRecordsResult {
   records: UsageRecord[]
 }
 
-export interface UsageRecordsPageResult extends UsageRecordsResult {
+export interface UsageRecordsPageResult {
   page: number
   limit: number
-  totalPages: number
+  hasNext: boolean
+  records: UsageRecord[]
 }
 
 export interface UsageAggregate {
@@ -234,10 +240,36 @@ export interface UsageRecordsPageQuery extends UsageRecordsQuery {
 
 export type CompatProfile = 'claude-code' | 'anthropic-strict' | 'debug'
 
+export type ReportedUsageFieldMode = 'preserve' | 'sample-max' | 'sample-target'
+
+export interface ReportedUsageFieldPolicy {
+  mode: ReportedUsageFieldMode
+  maxTokens: number
+  targetTokens: number
+  normalMaxMultiplier: number
+  moveDeltaToCacheRead: boolean
+}
+
+export interface ReportedUsagePathPolicy {
+  enabled: boolean
+  input: ReportedUsageFieldPolicy
+  output: ReportedUsageFieldPolicy
+  cacheRead: ReportedUsageFieldPolicy
+  cacheCreation: ReportedUsageFieldPolicy
+}
+
+export interface ReportedUsageConfig {
+  default: ReportedUsagePathPolicy
+  pathOverrides: Record<string, ReportedUsagePathPolicy>
+}
+
 export interface RuntimeConfig {
   credentialRpm: number
+  credentialMaxConcurrentRequests: number
   credentialTransientCooldownSecs: number
   credentialMaxCooldownSecs: number
+  credentialDispatchMaxWaitSecs: number
+  credentialInFlightLeaseMaxSecs: number
   credentialWarmupRequests: number
   credentialWarmupSelectionPercent: number
   compressionEnabled: boolean
@@ -248,8 +280,7 @@ export interface RuntimeConfig {
   promptCacheCapJitterMinTokens: number
   promptCacheCapJitterMaxTokens: number
   promptCacheScaleMinInputTokens: number
-  ccHighCacheReportedCacheCreationTargetTokens: number
-  ccHighCacheReportedInputMaxTokens: number
+  reportedUsage: ReportedUsageConfig
   highCacheThreshold: number
   compatProfile: CompatProfile
   extractThinking: boolean

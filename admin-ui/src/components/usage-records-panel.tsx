@@ -104,7 +104,7 @@ export function UsageRecordsPanel() {
   const [minCacheRead, setMinCacheRead] = useState('')
   const [selectedRecord, setSelectedRecord] = useState<UsageRecord | null>(null)
   const [currentPage, setCurrentPage] = useState(1)
-  const itemsPerPage = 100
+  const itemsPerPage = 20
 
   const query = useMemo<UsageRecordsPageQuery>(() => {
     const next: UsageRecordsPageQuery = { page: currentPage, limit: itemsPerPage }
@@ -147,17 +147,6 @@ export function UsageRecordsPanel() {
   useEffect(() => {
     setCurrentPage(1)
   }, [conversationId, credentialId, minCacheRead, model, searchText, source, status, streamMode])
-
-  useEffect(() => {
-    if (!records.data) {
-      return
-    }
-
-    const nextPage = records.data.totalPages > 0 ? Math.min(currentPage, records.data.totalPages) : 1
-    if (currentPage !== nextPage) {
-      setCurrentPage(nextPage)
-    }
-  }, [currentPage, records.data])
 
   const credentialLabels = useMemo(() => {
     const labels = new Map<number, string>()
@@ -224,8 +213,8 @@ export function UsageRecordsPanel() {
   }
 
   const summaryData = summary.data
-  const totalPages = records.data?.totalPages || 0
-  const totalRecords = records.data?.total || 0
+  const pageRecords = records.data?.records || []
+  const hasNextPage = Boolean(records.data?.hasNext)
   const localReadRatio = ratio(
     summaryData?.localPromptCacheReadInputTokens || 0,
     summaryData?.localPromptCacheInputTokens || 0
@@ -403,9 +392,9 @@ export function UsageRecordsPanel() {
             <div className="py-8 text-center text-muted-foreground">加载中...</div>
           ) : records.error ? (
             <div className="py-8 text-center text-destructive">{extractErrorMessage(records.error)}</div>
-          ) : totalRecords === 0 ? (
+          ) : pageRecords.length === 0 && currentPage === 1 ? (
             <div className="py-8 text-center text-muted-foreground">暂无记录</div>
-          ) : records.data?.records.length === 0 ? (
+          ) : pageRecords.length === 0 ? (
             <div className="py-8 text-center text-muted-foreground">当前页暂无记录</div>
           ) : (
             <div className="overflow-x-auto">
@@ -431,7 +420,7 @@ export function UsageRecordsPanel() {
                   </tr>
                 </thead>
                 <tbody>
-                  {records.data?.records.map((record) => {
+                  {pageRecords.map((record) => {
                     const credentialLabel =
                       typeof record.credentialId === 'number'
                         ? credentialLabels.get(record.credentialId) || record.credentialLabel
@@ -526,7 +515,7 @@ export function UsageRecordsPanel() {
               </table>
             </div>
           )}
-          {totalPages > 1 && (
+          {(currentPage > 1 || hasNextPage) && (
             <div className="mt-4 flex items-center justify-center gap-4">
               <Button
                 variant="outline"
@@ -537,13 +526,13 @@ export function UsageRecordsPanel() {
                 上一页
               </Button>
               <span className="text-sm text-muted-foreground">
-                第 {currentPage} / {totalPages} 页（共 {totalRecords} 条记录）
+                第 {currentPage} 页，每页 {itemsPerPage} 条
               </span>
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
-                disabled={currentPage === totalPages}
+                onClick={() => setCurrentPage(p => p + 1)}
+                disabled={!hasNextPage}
               >
                 下一页
               </Button>

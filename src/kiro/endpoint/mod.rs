@@ -45,7 +45,7 @@ pub trait KiroEndpoint: Send + Sync {
         body.to_string()
     }
 
-    /// 判断响应体是否表示"月度配额用尽"（禁用凭据并转移）
+    /// 判断响应体是否表示"额度/透支请求额度用尽"（禁用凭据并转移）
     fn is_monthly_request_limit(&self, body: &str) -> bool {
         default_is_monthly_request_limit(body)
     }
@@ -70,11 +70,11 @@ pub struct RequestContext<'a> {
     pub config: &'a Config,
 }
 
-/// 默认的 MONTHLY_REQUEST_COUNT 判断逻辑
+/// 默认的额度用尽判断逻辑
 ///
-/// 同时识别顶层 `reason` 字段和嵌套 `error.reason` 字段。
-pub fn default_is_monthly_request_limit(body: &str) -> bool {
-    if body.contains("MONTHLY_REQUEST_COUNT") {
+/// 同时识别顶层 `reason` 字段、嵌套 `error.reason` 字段和 Kiro overage 限制。
+pub fn default_is_quota_exhausted(body: &str) -> bool {
+    if body.contains("MONTHLY_REQUEST_COUNT") || body.contains("OVERAGE_REQUEST_LIMIT_EXCEEDED") {
         return true;
     }
 
@@ -85,7 +85,12 @@ pub fn default_is_monthly_request_limit(body: &str) -> bool {
     if value
         .get("reason")
         .and_then(|v| v.as_str())
-        .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
+        .is_some_and(|v| {
+            matches!(
+                v,
+                "MONTHLY_REQUEST_COUNT" | "OVERAGE_REQUEST_LIMIT_EXCEEDED"
+            )
+        })
     {
         return true;
     }
@@ -93,7 +98,17 @@ pub fn default_is_monthly_request_limit(body: &str) -> bool {
     value
         .pointer("/error/reason")
         .and_then(|v| v.as_str())
-        .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
+        .is_some_and(|v| {
+            matches!(
+                v,
+                "MONTHLY_REQUEST_COUNT" | "OVERAGE_REQUEST_LIMIT_EXCEEDED"
+            )
+        })
+}
+
+/// 向后兼容旧名称：语义已扩展为额度用尽。
+pub fn default_is_monthly_request_limit(body: &str) -> bool {
+    default_is_quota_exhausted(body)
 }
 
 /// 默认的 bearer token 失效判断逻辑
@@ -121,6 +136,18 @@ mod tests {
     fn test_default_monthly_request_limit_false() {
         let body = r#"{"message":"nope","reason":"DAILY_REQUEST_COUNT"}"#;
         assert!(!default_is_monthly_request_limit(body));
+    }
+
+    #[test]
+    fn test_default_quota_exhausted_detects_overage_limit() {
+        let body = r#"{"message":"You have reached the limit for overages.","reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}"#;
+        assert!(default_is_monthly_request_limit(body));
+    }
+
+    #[test]
+    fn test_default_quota_exhausted_detects_nested_overage_limit() {
+        let body = r#"{"error":{"reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}}"#;
+        assert!(default_is_quota_exhausted(body));
     }
 
     #[test]

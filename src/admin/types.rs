@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::config::{CompatProfile, CompressionConfig};
+use crate::model::config::{CompatProfile, CompressionConfig, ReportedUsageConfig};
 
 // ============ 凭据状态 ============
 
@@ -95,6 +95,16 @@ pub struct CredentialStatusItem {
     pub rate_limited: bool,
     /// 本地速率限制剩余秒数。
     pub rate_limit_remaining_secs: u64,
+    /// 当前正在使用该凭据的请求数。
+    pub in_flight_requests: u32,
+    /// 最老并发占用已经持续的秒数。
+    pub oldest_in_flight_age_secs: u64,
+    /// 最近活跃并发占用距离现在的秒数。
+    pub newest_in_flight_idle_secs: u64,
+    /// 单凭据最大并发请求数。0 表示不限制。
+    pub max_concurrent_requests: u32,
+    /// 并发占用自动回收阈值。0 表示关闭。
+    pub in_flight_lease_max_secs: u64,
     /// 预热剩余请求数。
     pub warmup_remaining: u32,
     /// 该凭据已记录的估算费用（USD）。
@@ -135,6 +145,14 @@ pub struct SetPriorityRequest {
 pub struct SetWarmupRequest {
     /// 预热剩余请求数；0 表示关闭预热。
     pub warmup_remaining: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearInFlightRequest {
+    /// 只清理超过该秒数未活跃的并发占用；不传表示清理该凭据全部占用。
+    #[serde(default)]
+    pub min_idle_secs: Option<u64>,
 }
 
 /// 添加凭据请求
@@ -283,8 +301,11 @@ pub struct SetLoadBalancingModeRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeConfigResponse {
     pub credential_rpm: u32,
+    pub credential_max_concurrent_requests: u32,
     pub credential_transient_cooldown_secs: u64,
     pub credential_max_cooldown_secs: u64,
+    pub credential_dispatch_max_wait_secs: u64,
+    pub credential_in_flight_lease_max_secs: u64,
     pub credential_warmup_requests: u32,
     pub credential_warmup_selection_percent: u32,
     pub compression_enabled: bool,
@@ -295,8 +316,7 @@ pub struct RuntimeConfigResponse {
     pub prompt_cache_cap_jitter_min_tokens: i32,
     pub prompt_cache_cap_jitter_max_tokens: i32,
     pub prompt_cache_scale_min_input_tokens: i32,
-    pub cc_high_cache_reported_cache_creation_target_tokens: i32,
-    pub cc_high_cache_reported_input_max_tokens: i32,
+    pub reported_usage: ReportedUsageConfig,
     pub high_cache_threshold: i32,
     pub compat_profile: CompatProfile,
     pub extract_thinking: bool,
@@ -307,8 +327,14 @@ pub struct RuntimeConfigResponse {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateRuntimeConfigRequest {
     pub credential_rpm: u32,
+    #[serde(default)]
+    pub credential_max_concurrent_requests: u32,
     pub credential_transient_cooldown_secs: u64,
     pub credential_max_cooldown_secs: u64,
+    #[serde(default)]
+    pub credential_dispatch_max_wait_secs: Option<u64>,
+    #[serde(default)]
+    pub credential_in_flight_lease_max_secs: Option<u64>,
     pub credential_warmup_requests: u32,
     #[serde(default)]
     pub credential_warmup_selection_percent: Option<u32>,
@@ -328,9 +354,7 @@ pub struct UpdateRuntimeConfigRequest {
     #[serde(default)]
     pub prompt_cache_scale_min_input_tokens: Option<i32>,
     #[serde(default)]
-    pub cc_high_cache_reported_cache_creation_target_tokens: Option<i32>,
-    #[serde(default)]
-    pub cc_high_cache_reported_input_max_tokens: Option<i32>,
+    pub reported_usage: Option<ReportedUsageConfig>,
     #[serde(default)]
     pub high_cache_threshold: Option<i32>,
     #[serde(default)]

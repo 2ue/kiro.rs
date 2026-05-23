@@ -12,7 +12,7 @@ use std::{
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
-use crate::model::config::{CompatProfile, Config, PromptCacheSimulationMode};
+use crate::model::config::{CompatProfile, Config, PromptCacheSimulationMode, ReportedUsageConfig};
 use crate::token;
 use anyhow::Error;
 use axum::{
@@ -91,7 +91,7 @@ struct CredentialErrorHint {
     label: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RequestRuntimeConfig {
     extract_thinking: bool,
     prompt_cache_target_read_ratio: f64,
@@ -100,8 +100,7 @@ struct RequestRuntimeConfig {
     prompt_cache_cap_jitter_min_tokens: i32,
     prompt_cache_cap_jitter_max_tokens: i32,
     prompt_cache_scale_min_input_tokens: i32,
-    cc_high_cache_reported_cache_creation_target_tokens: i32,
-    cc_high_cache_reported_input_max_tokens: i32,
+    reported_usage: ReportedUsageConfig,
     compat_profile: CompatProfile,
     expose_proxy_warnings: bool,
 }
@@ -116,9 +115,7 @@ impl RequestRuntimeConfig {
             prompt_cache_cap_jitter_min_tokens: state.prompt_cache_cap_jitter_min_tokens,
             prompt_cache_cap_jitter_max_tokens: state.prompt_cache_cap_jitter_max_tokens,
             prompt_cache_scale_min_input_tokens: state.prompt_cache_scale_min_input_tokens,
-            cc_high_cache_reported_cache_creation_target_tokens: state
-                .cc_high_cache_reported_cache_creation_target_tokens,
-            cc_high_cache_reported_input_max_tokens: state.cc_high_cache_reported_input_max_tokens,
+            reported_usage: state.reported_usage.clone(),
             compat_profile: state.compat_profile,
             expose_proxy_warnings: state.expose_proxy_warnings,
         }
@@ -143,12 +140,7 @@ impl RequestRuntimeConfig {
             prompt_cache_cap_jitter_min_tokens: config.prompt_cache_cap_jitter_min_tokens.max(0),
             prompt_cache_cap_jitter_max_tokens: config.prompt_cache_cap_jitter_max_tokens.max(0),
             prompt_cache_scale_min_input_tokens: config.prompt_cache_scale_min_input_tokens.max(0),
-            cc_high_cache_reported_cache_creation_target_tokens: config
-                .cc_high_cache_reported_cache_creation_target_tokens
-                .max(0),
-            cc_high_cache_reported_input_max_tokens: config
-                .cc_high_cache_reported_input_max_tokens
-                .max(0),
+            reported_usage: config.reported_usage.normalized(),
             compat_profile: config.compat_profile,
             expose_proxy_warnings: config.expose_proxy_warnings || config.compat_profile.is_debug(),
         }
@@ -217,7 +209,7 @@ impl RequestUsageContext {
     }
 
     fn reported_cache_usage_policy(&self) -> Option<super::cache::ReportedCacheUsagePolicy> {
-        self.reported_cache_usage_policy
+        self.reported_cache_usage_policy.clone()
     }
 
     fn reported_usage_for_downstream(
@@ -232,6 +224,7 @@ impl RequestUsageContext {
         }
 
         self.reported_cache_usage_policy
+            .clone()
             .map(|policy| usage.with_reported_cache_usage_policy(policy))
             .unwrap_or(usage)
     }
@@ -240,25 +233,21 @@ impl RequestUsageContext {
 fn reported_cache_usage_policy(
     endpoint: &str,
     simulation_mode: PromptCacheSimulationMode,
-    creation_target_tokens: i32,
-    input_max_tokens: i32,
+    reported_usage: &ReportedUsageConfig,
     seed: u64,
 ) -> Option<super::cache::ReportedCacheUsagePolicy> {
     if simulation_mode != PromptCacheSimulationMode::HighCache {
         return None;
     }
 
-    match endpoint {
-        "/cc/v1/messages" => super::cache::ReportedCacheUsagePolicy::new(
-            creation_target_tokens,
-            input_max_tokens,
-            seed,
-        ),
-        "/ha/v1/messages" => {
-            super::cache::ReportedCacheUsagePolicy::input_only(input_max_tokens, seed)
-        }
-        _ => None,
-    }
+    super::cache::ReportedCacheUsagePolicy::from_path_policy(
+        reported_usage.policy_for_path(endpoint),
+        seed,
+    )
+}
+
+fn should_build_local_prompt_cache_usage(simulation_mode: PromptCacheSimulationMode) -> bool {
+    simulation_mode == PromptCacheSimulationMode::HighCache
 }
 
 fn credential_display_label(id: u64, label: Option<&str>) -> String {
@@ -1020,8 +1009,7 @@ fn prepare_usage_context(
     let reported_cache_usage_policy = reported_cache_usage_policy(
         endpoint,
         state.prompt_cache_simulation_mode,
-        runtime_config.cc_high_cache_reported_cache_creation_target_tokens,
-        runtime_config.cc_high_cache_reported_input_max_tokens,
+        &runtime_config.reported_usage,
         reported_cache_creation_seed,
     );
 
@@ -1175,6 +1163,8 @@ fn map_provider_error(err: Error, request_id: Option<&str>) -> Response {
 
     if err_str.contains("临时冷却")
         || err_str.contains("本地限流")
+        || err_str.contains("凭据调度排队等待超时")
+        || err_str.contains("暂不可调度")
         || err_str.contains("retry-after")
         || err_str.contains("Retry-After")
         || err_str.contains("429")
@@ -1267,12 +1257,12 @@ fn conversion_error_response(e: &ConversionError) -> Response {
     envelope::error_response(StatusCode::BAD_REQUEST, error_type, message)
 }
 
-fn should_expose_proxy_warnings(runtime_config: RequestRuntimeConfig) -> bool {
+fn should_expose_proxy_warnings(runtime_config: &RequestRuntimeConfig) -> bool {
     runtime_config.expose_proxy_warnings && !runtime_config.compat_profile.is_strict()
 }
 
 fn should_extract_unsigned_thinking(
-    runtime_config: RequestRuntimeConfig,
+    runtime_config: &RequestRuntimeConfig,
     thinking_enabled: bool,
 ) -> bool {
     runtime_config.extract_thinking
@@ -1474,8 +1464,8 @@ pub async fn post_messages(
 
 /// POST /na/v1/messages
 ///
-/// 创建消息（对话），不做本地 prompt-cache usage 模拟
-pub async fn post_messages_no_cache(
+/// 创建消息（对话），底层 high-cache 计算保持开启；默认只上报真实上游 cache usage。
+pub async fn post_messages_real_cache_usage(
     State(state): State<AppState>,
     headers: HeaderMap,
     JsonExtractor(payload): JsonExtractor<MessagesRequest>,
@@ -1485,8 +1475,7 @@ pub async fn post_messages_no_cache(
 
 /// POST /ha/v1/messages
 ///
-/// 创建消息（对话），使用 high-cache 计算；下游 input 上报采用 `/cc/v1` 的压低策略，
-/// 但不套用 `/cc/v1` 的 writer 上报改写。
+/// 创建消息（对话），使用 high-cache 计算；下游 usage 上报由 `/ha` 路径覆盖项独立控制。
 pub async fn post_messages_ha(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1600,7 +1589,7 @@ async fn post_messages_inner(
     ) as i32;
     let usage_context = prepare_usage_context(
         &state,
-        runtime_config,
+        runtime_config.clone(),
         endpoint,
         payload.stream,
         &payload,
@@ -1617,7 +1606,7 @@ async fn post_messages_inner(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
-    let warnings_header = if should_expose_proxy_warnings(runtime_config) {
+    let warnings_header = if should_expose_proxy_warnings(&runtime_config) {
         conversion_result.warnings.encode_header()
     } else {
         None
@@ -1640,7 +1629,7 @@ async fn post_messages_inner(
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = should_extract_unsigned_thinking(runtime_config, thinking_enabled);
+        let extract_thinking = should_extract_unsigned_thinking(&runtime_config, thinking_enabled);
         handle_non_stream_request(
             provider,
             &request_body,
@@ -1780,6 +1769,7 @@ fn create_sse_stream(
                     match chunk_result {
                         Some(Ok(chunk)) => {
                             idle_deadline = Instant::now() + Duration::from_secs(UPSTREAM_IDLE_TIMEOUT_SECS);
+                            completion.touch();
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
                                 tracing::warn!("缓冲区溢出: {}", e);
@@ -1925,13 +1915,14 @@ async fn handle_non_stream_request(
     let credential_usage = prepare_credential_usage_context(
         usage_context,
         &provider,
-        api_response.credential_id,
-        api_response.sticky_bound,
-        api_response.fallback_from_sticky,
+        api_response.credential_id(),
+        api_response.sticky_bound(),
+        api_response.fallback_from_sticky(),
     );
+    let (response, completion) = api_response.into_parts();
 
     // 读取响应体
-    let body_bytes = match api_response.response.bytes().await {
+    let body_bytes = match response.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!("读取响应体失败: {}", e);
@@ -1940,6 +1931,7 @@ async fn handle_non_stream_request(
                 "api_error",
                 format!("读取响应失败: {}", e),
             );
+            completion.release();
             return envelope::error_response_with_id(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
@@ -2062,6 +2054,7 @@ async fn handle_non_stream_request(
                                 "invalid_request_error",
                                 message.clone(),
                             );
+                            completion.release();
                             return envelope::error_response_with_id(
                                 StatusCode::BAD_REQUEST,
                                 "invalid_request_error",
@@ -2154,7 +2147,7 @@ async fn handle_non_stream_request(
         .or(context_input_tokens)
         .unwrap_or(input_tokens);
     let usage_input_tokens =
-        if credential_usage.request.simulation_mode == PromptCacheSimulationMode::HighCache {
+        if should_build_local_prompt_cache_usage(credential_usage.request.simulation_mode) {
             final_input_tokens.max(credential_usage.request.input_tokens)
         } else {
             final_input_tokens
@@ -2165,7 +2158,7 @@ async fn handle_non_stream_request(
         usage_input_tokens,
         output_tokens,
         credential_usage.request.simulated_usage,
-        credential_usage.request.simulation_mode == PromptCacheSimulationMode::HighCache,
+        should_build_local_prompt_cache_usage(credential_usage.request.simulation_mode),
     );
     let has_metadata = metadata_usage.is_some();
     let context_estimated = !has_metadata && context_input_tokens.is_some();
@@ -2175,10 +2168,7 @@ async fn handle_non_stream_request(
         .request
         .reported_usage_for_downstream(usage, usage_source);
     credential_usage.record_success(reported_usage, usage_source, context_estimated);
-    provider.report_success_for_context(
-        api_response.credential_id,
-        api_response.session_id.as_deref(),
-    );
+    completion.report_success();
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -2394,7 +2384,7 @@ pub async fn post_messages_cc(
     ) as i32;
     let usage_context = prepare_usage_context(
         &state,
-        runtime_config,
+        runtime_config.clone(),
         "/cc/v1/messages",
         payload.stream,
         &payload,
@@ -2411,7 +2401,7 @@ pub async fn post_messages_cc(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
-    let warnings_header = if should_expose_proxy_warnings(runtime_config) {
+    let warnings_header = if should_expose_proxy_warnings(&runtime_config) {
         conversion_result.warnings.encode_header()
     } else {
         None
@@ -2434,7 +2424,7 @@ pub async fn post_messages_cc(
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = should_extract_unsigned_thinking(runtime_config, thinking_enabled);
+        let extract_thinking = should_extract_unsigned_thinking(&runtime_config, thinking_enabled);
         handle_non_stream_request(
             provider,
             &request_body,
@@ -2525,7 +2515,8 @@ mod tests {
     }
 
     #[test]
-    fn cc_high_cache_reported_usage_policy_samples_natural_usage() {
+    fn path_reported_usage_policy_samples_natural_usage() {
+        let reported_usage_config = ReportedUsageConfig::default();
         let usage = CacheUsage {
             total_input_tokens: 100_000,
             input_tokens: 50_000,
@@ -2540,8 +2531,7 @@ mod tests {
                 let policy = reported_cache_usage_policy(
                     "/cc/v1/messages",
                     PromptCacheSimulationMode::HighCache,
-                    3_000,
-                    96,
+                    &reported_usage_config,
                     seed,
                 )
                 .expect("policy should apply");
@@ -2559,8 +2549,7 @@ mod tests {
             reported_cache_usage_policy(
                 "/cc/v1/messages",
                 PromptCacheSimulationMode::HighCache,
-                3_000,
-                96,
+                &reported_usage_config,
                 9,
             )
             .expect("policy should apply"),
@@ -2575,23 +2564,33 @@ mod tests {
     }
 
     #[test]
-    fn reported_usage_policy_only_applies_to_cc_high_cache_local_prompt_cache() {
+    fn reported_usage_rewrite_only_changes_local_prompt_cache_downstream_usage() {
+        let reported_usage_config = ReportedUsageConfig::default();
+        let v1_policy = reported_cache_usage_policy(
+            "/v1/messages",
+            PromptCacheSimulationMode::HighCache,
+            &reported_usage_config,
+            0,
+        )
+        .expect("default policy should apply");
+        let unchanged_usage = CacheUsage {
+            total_input_tokens: 100_000,
+            input_tokens: 10_000,
+            output_tokens: 1,
+            cache_creation_input_tokens: 50_000,
+            cache_read_input_tokens: 40_000,
+            cache_creation_5m_input_tokens: 50_000,
+            cache_creation_1h_input_tokens: 0,
+        };
         assert_eq!(
-            reported_cache_usage_policy(
-                "/v1/messages",
-                PromptCacheSimulationMode::HighCache,
-                3_000,
-                96,
-                0,
-            ),
-            None
+            unchanged_usage.with_reported_cache_usage_policy(v1_policy),
+            unchanged_usage
         );
         assert_eq!(
             reported_cache_usage_policy(
                 "/cc/v1/messages",
                 PromptCacheSimulationMode::Disabled,
-                3_000,
-                96,
+                &reported_usage_config,
                 0,
             ),
             None
@@ -2621,8 +2620,7 @@ mod tests {
             reported_cache_usage_policy: reported_cache_usage_policy(
                 "/cc/v1/messages",
                 PromptCacheSimulationMode::HighCache,
-                3_000,
-                96,
+                &reported_usage_config,
                 7,
             ),
             simulated_usage: None,
@@ -2657,7 +2655,8 @@ mod tests {
     }
 
     #[test]
-    fn v1_and_cc_share_high_cache_strategy_but_only_cc_rewrites_reported_writer() {
+    fn path_overrides_independently_control_reported_usage_fields() {
+        let reported_usage_config = ReportedUsageConfig::default();
         let usage = CacheUsage {
             total_input_tokens: 100_000,
             input_tokens: 10_000,
@@ -2692,8 +2691,7 @@ mod tests {
             reported_cache_usage_policy: reported_cache_usage_policy(
                 "/v1/messages",
                 PromptCacheSimulationMode::HighCache,
-                3_000,
-                96,
+                &reported_usage_config,
                 7,
             ),
             simulated_usage: None,
@@ -2706,8 +2704,7 @@ mod tests {
             reported_cache_usage_policy: reported_cache_usage_policy(
                 "/cc/v1/messages",
                 PromptCacheSimulationMode::HighCache,
-                3_000,
-                96,
+                &reported_usage_config,
                 7,
             ),
             ..v1_context.clone()
@@ -2718,16 +2715,27 @@ mod tests {
             reported_cache_usage_policy: reported_cache_usage_policy(
                 "/ha/v1/messages",
                 PromptCacheSimulationMode::HighCache,
-                3_000,
-                96,
+                &reported_usage_config,
+                7,
+            ),
+            ..v1_context.clone()
+        };
+        let na_context = RequestUsageContext {
+            endpoint: "/na/v1/messages",
+            request_id: "req_na_policy".to_string(),
+            reported_cache_usage_policy: reported_cache_usage_policy(
+                "/na/v1/messages",
+                PromptCacheSimulationMode::HighCache,
+                &reported_usage_config,
                 7,
             ),
             ..v1_context.clone()
         };
 
-        assert_eq!(v1_context.reported_cache_usage_policy(), None);
+        assert!(v1_context.reported_cache_usage_policy().is_some());
         assert!(cc_context.reported_cache_usage_policy().is_some());
         assert!(ha_context.reported_cache_usage_policy().is_some());
+        assert!(na_context.reported_cache_usage_policy().is_some());
 
         let v1_reported =
             v1_context.reported_usage_for_downstream(usage, UsageSource::LocalPromptCache);
@@ -2767,6 +2775,16 @@ mod tests {
                 .saturating_add(usage.input_tokens.saturating_sub(ha_reported.input_tokens))
         );
         assert_eq!(ha_reported.output_tokens, usage.output_tokens);
+
+        let na_reported =
+            na_context.reported_usage_for_downstream(usage, UsageSource::LocalPromptCache);
+        assert_eq!(na_reported.total_input_tokens, usage.total_input_tokens);
+        assert_eq!(na_reported.input_tokens, usage.total_input_tokens);
+        assert_eq!(na_reported.cache_creation_input_tokens, 0);
+        assert_eq!(na_reported.cache_read_input_tokens, 0);
+        assert_eq!(na_reported.cache_creation_5m_input_tokens, 0);
+        assert_eq!(na_reported.cache_creation_1h_input_tokens, 0);
+        assert_eq!(na_reported.output_tokens, usage.output_tokens);
     }
 
     #[test]
@@ -3148,7 +3166,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_prompt_cache_mode_does_not_build_local_profile() {
+    fn disabled_prompt_cache_mode_does_not_build_local_profile_even_for_na_path() {
         let prompt_cache = Arc::new(PromptCacheTracker::default());
         let usage_recorder = Arc::new(UsageRecorder::new(10, None));
         let state = AppState::new(
@@ -3247,7 +3265,7 @@ mod tests {
         );
 
         assert!(!should_expose_proxy_warnings(
-            RequestRuntimeConfig::from_app_state(&state)
+            &RequestRuntimeConfig::from_app_state(&state)
         ));
     }
 

@@ -658,6 +658,7 @@ impl StreamContext {
         }
 
         self.reported_cache_usage_policy
+            .clone()
             .map(|policy| usage.with_reported_cache_usage_policy(policy))
             .unwrap_or(usage)
     }

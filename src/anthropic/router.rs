@@ -10,12 +10,12 @@ use axum::{
 };
 
 use crate::kiro::provider::KiroProvider;
-use crate::model::config::{CompatProfile, PromptCacheSimulationMode};
+use crate::model::config::{CompatProfile, PromptCacheSimulationMode, ReportedUsageConfig};
 
 use super::{
     handlers::{
         count_tokens, get_models, post_messages, post_messages_cc, post_messages_ha,
-        post_messages_no_cache,
+        post_messages_real_cache_usage,
     },
     middleware::{AppState, auth_middleware, cors_layer},
     pricing::PricingCatalog,
@@ -32,11 +32,11 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// - `GET /v1/models` - 获取可用模型列表
 /// - `POST /v1/messages` - 创建消息（对话）
 /// - `POST /v1/messages/count_tokens` - 计算 token 数量
-/// - `GET /na/v1/models` - 获取可用模型列表（无本地 prompt-cache usage 模拟）
-/// - `POST /na/v1/messages` - 创建消息（无本地 prompt-cache usage 模拟）
+/// - `GET /na/v1/models` - 获取可用模型列表（保留真实上游 usage）
+/// - `POST /na/v1/messages` - 创建消息（保留真实上游 usage）
 /// - `POST /na/v1/messages/count_tokens` - 计算 token 数量
-/// - `GET /ha/v1/models` - 获取可用模型列表（high-cache，压低 input 上报）
-/// - `POST /ha/v1/messages` - 创建消息（high-cache，压低 input 上报）
+/// - `GET /ha/v1/models` - 获取可用模型列表（high-cache，usage 上报由 `/ha` 覆盖项控制）
+/// - `POST /ha/v1/messages` - 创建消息（high-cache，usage 上报由 `/ha` 覆盖项控制）
 /// - `POST /ha/v1/messages/count_tokens` - 计算 token 数量
 ///
 /// # 认证
@@ -63,8 +63,7 @@ pub fn create_router_with_provider(
     prompt_cache_cap_jitter_min_tokens: i32,
     prompt_cache_cap_jitter_max_tokens: i32,
     prompt_cache_scale_min_input_tokens: i32,
-    cc_high_cache_reported_cache_creation_target_tokens: i32,
-    cc_high_cache_reported_input_max_tokens: i32,
+    reported_usage: ReportedUsageConfig,
     compat_profile: CompatProfile,
     expose_proxy_warnings: bool,
 ) -> Router {
@@ -85,10 +84,7 @@ pub fn create_router_with_provider(
         prompt_cache_cap_jitter_max_tokens,
         prompt_cache_scale_min_input_tokens,
     )
-    .with_cc_high_cache_reported_creation_target(
-        cc_high_cache_reported_cache_creation_target_tokens,
-    )
-    .with_cc_high_cache_reported_input_max(cc_high_cache_reported_input_max_tokens)
+    .with_reported_usage(reported_usage)
     .with_pricing_catalog(pricing_catalog);
     if let Some(provider) = kiro_provider {
         base_state = base_state.with_kiro_provider(provider);
@@ -107,10 +103,10 @@ pub fn create_router_with_provider(
         ))
         .with_state(v1_state);
 
-    // 需要认证的 /na/v1 路由（no-cache，不做本地 prompt-cache usage 模拟）
+    // 需要认证的 /na/v1 路由（默认只上报真实上游 usage）
     let na_v1_routes = Router::new()
         .route("/models", get(get_models))
-        .route("/messages", post(post_messages_no_cache))
+        .route("/messages", post(post_messages_real_cache_usage))
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
             na_v1_state.clone(),
@@ -130,7 +126,7 @@ pub fn create_router_with_provider(
         ))
         .with_state(cc_v1_state);
 
-    // 需要认证的 /ha/v1 路由（high-cache；input 上报采用 /cc/v1 的压低策略，writer 不改写）
+    // 需要认证的 /ha/v1 路由（high-cache；usage 上报由 /ha 路径覆盖项独立控制）
     let ha_v1_routes = Router::new()
         .route("/models", get(get_models))
         .route("/messages", post(post_messages_ha))
@@ -157,7 +153,7 @@ fn route_prompt_cache_states(base_state: AppState) -> (AppState, AppState, AppSt
             .with_prompt_cache_simulation_mode(PromptCacheSimulationMode::HighCache),
         base_state
             .clone()
-            .with_prompt_cache_simulation_mode(PromptCacheSimulationMode::Disabled),
+            .with_prompt_cache_simulation_mode(PromptCacheSimulationMode::HighCache),
         base_state
             .clone()
             .with_prompt_cache_simulation_mode(PromptCacheSimulationMode::HighCache),
@@ -183,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn route_prompt_cache_states_force_v1_cc_ha_high_cache_and_na_disabled() {
+    fn route_prompt_cache_states_force_all_message_paths_to_high_cache() {
         for base_mode in [
             PromptCacheSimulationMode::Disabled,
             PromptCacheSimulationMode::HighCache,
@@ -197,7 +193,7 @@ mod tests {
             );
             assert_eq!(
                 na_v1_state.prompt_cache_simulation_mode,
-                PromptCacheSimulationMode::Disabled
+                PromptCacheSimulationMode::HighCache
             );
             assert_eq!(
                 cc_v1_state.prompt_cache_simulation_mode,

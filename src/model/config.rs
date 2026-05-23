@@ -1,5 +1,6 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -19,7 +20,8 @@ impl Default for TlsBackend {
 /// 路径级 prompt-cache usage 模式。
 ///
 /// 该枚举仍作为内部请求链路标记使用；外部配置不再选择缓存模式：
-/// `/v1` 和 `/cc/v1` 固定使用 high-cache，`/na/v1` 固定禁用本地缓存模拟。
+/// `/v1`、`/cc/v1`、`/ha/v1`、`/na/v1` 消息路径固定使用 high-cache；
+/// `/na` 默认通过路径级上报策略关闭本地模拟 cache usage 补足。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum PromptCacheSimulationMode {
@@ -45,6 +47,249 @@ pub struct CompressionConfig {
 
     #[serde(default = "default_true")]
     pub whitespace_compression: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReportedUsageFieldMode {
+    Preserve,
+    SampleMax,
+    SampleTarget,
+}
+
+impl Default for ReportedUsageFieldMode {
+    fn default() -> Self {
+        Self::Preserve
+    }
+}
+
+/// 单个 usage 字段的下游上报策略。
+///
+/// 这些策略只用于把内部计算出的 usage 投影成下游响应和后台记录看到的 usage；
+/// 不参与 prompt-cache tracker、reader 命中或上游请求计算。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportedUsageFieldPolicy {
+    #[serde(default)]
+    pub mode: ReportedUsageFieldMode,
+
+    /// `sample-max` 的上限。
+    #[serde(default)]
+    pub max_tokens: i32,
+
+    /// `sample-target` 的中心目标值。
+    #[serde(default)]
+    pub target_tokens: i32,
+
+    /// `sample-target` 的常规最大倍率。writer 默认 1.1，即约 110%。
+    #[serde(default = "default_reported_usage_normal_max_multiplier")]
+    pub normal_max_multiplier: f64,
+
+    /// input 被压低后的差值是否转入 cache_read_input_tokens。
+    #[serde(default)]
+    pub move_delta_to_cache_read: bool,
+}
+
+impl Default for ReportedUsageFieldPolicy {
+    fn default() -> Self {
+        Self {
+            mode: ReportedUsageFieldMode::Preserve,
+            max_tokens: 0,
+            target_tokens: 0,
+            normal_max_multiplier: default_reported_usage_normal_max_multiplier(),
+            move_delta_to_cache_read: false,
+        }
+    }
+}
+
+impl ReportedUsageFieldPolicy {
+    pub fn preserve() -> Self {
+        Self::default()
+    }
+
+    pub fn sample_max(max_tokens: i32) -> Self {
+        Self {
+            mode: ReportedUsageFieldMode::SampleMax,
+            max_tokens,
+            ..Self::default()
+        }
+    }
+
+    pub fn sample_input_max(max_tokens: i32) -> Self {
+        Self {
+            move_delta_to_cache_read: true,
+            ..Self::sample_max(max_tokens)
+        }
+    }
+
+    pub fn sample_target(target_tokens: i32) -> Self {
+        Self {
+            mode: ReportedUsageFieldMode::SampleTarget,
+            target_tokens,
+            ..Self::default()
+        }
+    }
+
+    pub fn normalized(&self) -> Self {
+        let mut normalized = self.clone();
+        normalized.max_tokens = normalized.max_tokens.max(0);
+        normalized.target_tokens = normalized.target_tokens.max(0);
+        normalized.normal_max_multiplier =
+            normalize_reported_usage_normal_max_multiplier(normalized.normal_max_multiplier);
+        normalized
+    }
+
+    fn validate(&self, label: &str) -> Result<(), String> {
+        if self.max_tokens < 0 {
+            return Err(format!("{} 的 sample-max 上限不能小于 0", label));
+        }
+        if self.target_tokens < 0 {
+            return Err(format!("{} 的 sample-target 目标值不能小于 0", label));
+        }
+        if !self.normal_max_multiplier.is_finite() || self.normal_max_multiplier < 1.0 {
+            return Err(format!(
+                "{} 的 sample-target 最大倍率必须大于或等于 1",
+                label
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportedUsagePathPolicy {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub input: ReportedUsageFieldPolicy,
+
+    #[serde(default)]
+    pub output: ReportedUsageFieldPolicy,
+
+    #[serde(default)]
+    pub cache_read: ReportedUsageFieldPolicy,
+
+    #[serde(default)]
+    pub cache_creation: ReportedUsageFieldPolicy,
+}
+
+impl Default for ReportedUsagePathPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            input: ReportedUsageFieldPolicy::preserve(),
+            output: ReportedUsageFieldPolicy::preserve(),
+            cache_read: ReportedUsageFieldPolicy::preserve(),
+            cache_creation: ReportedUsageFieldPolicy::preserve(),
+        }
+    }
+}
+
+impl ReportedUsagePathPolicy {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
+    }
+
+    pub fn normalized(&self) -> Self {
+        Self {
+            enabled: self.enabled,
+            input: self.input.normalized(),
+            output: self.output.normalized(),
+            cache_read: self.cache_read.normalized(),
+            cache_creation: self.cache_creation.normalized(),
+        }
+    }
+
+    fn validate(&self, label: &str) -> Result<(), String> {
+        self.input.validate(&format!("{} input", label))?;
+        self.output.validate(&format!("{} output", label))?;
+        self.cache_read.validate(&format!("{} cacheRead", label))?;
+        self.cache_creation
+            .validate(&format!("{} cacheCreation", label))?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportedUsageConfig {
+    #[serde(default)]
+    pub default: ReportedUsagePathPolicy,
+
+    #[serde(default)]
+    pub path_overrides: BTreeMap<String, ReportedUsagePathPolicy>,
+}
+
+impl Default for ReportedUsageConfig {
+    fn default() -> Self {
+        let mut path_overrides = BTreeMap::new();
+        path_overrides.insert("/na".to_string(), ReportedUsagePathPolicy::disabled());
+        path_overrides.insert(
+            "/cc".to_string(),
+            ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy::sample_input_max(96),
+                cache_creation: ReportedUsageFieldPolicy::sample_target(3_000),
+                ..ReportedUsagePathPolicy::default()
+            },
+        );
+        path_overrides.insert(
+            "/ha".to_string(),
+            ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy::sample_input_max(96),
+                ..ReportedUsagePathPolicy::default()
+            },
+        );
+
+        Self {
+            default: ReportedUsagePathPolicy::default(),
+            path_overrides,
+        }
+    }
+}
+
+impl ReportedUsageConfig {
+    pub fn normalized(&self) -> Self {
+        let path_overrides = self
+            .path_overrides
+            .iter()
+            .filter_map(|(prefix, policy)| {
+                normalize_reported_usage_path_prefix(prefix)
+                    .map(|prefix| (prefix, policy.normalized()))
+            })
+            .collect();
+
+        Self {
+            default: self.default.normalized(),
+            path_overrides,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        self.default.validate("默认上报策略")?;
+        for (prefix, policy) in &self.path_overrides {
+            let Some(normalized_prefix) = normalize_reported_usage_path_prefix(prefix) else {
+                return Err("路径覆盖前缀不能为空".to_string());
+            };
+            policy.validate(&format!("路径 {} 上报策略", normalized_prefix))?;
+        }
+        Ok(())
+    }
+
+    pub fn policy_for_path(&self, path: &str) -> ReportedUsagePathPolicy {
+        let normalized = self.normalized();
+        normalized
+            .path_overrides
+            .iter()
+            .filter(|(prefix, _)| reported_usage_path_matches(prefix, path))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .map(|(_, policy)| policy.clone())
+            .unwrap_or(normalized.default)
+    }
 }
 
 impl Default for CompressionConfig {
@@ -167,6 +412,13 @@ pub struct Config {
     #[serde(default)]
     pub credential_rpm: Option<u32>,
 
+    /// 单凭据最大并发请求数。
+    ///
+    /// `0` 表示不限制；`>0` 时，同一凭据同时在处理的请求达到上限后，
+    /// 新请求会优先调度到其他可用凭据。
+    #[serde(default)]
+    pub credential_max_concurrent_requests: u32,
+
     /// 上游瞬态错误没有 Retry-After 时，对单个凭据设置的临时冷却秒数。
     #[serde(default = "default_credential_transient_cooldown_secs")]
     pub credential_transient_cooldown_secs: u64,
@@ -174,6 +426,20 @@ pub struct Config {
     /// 单个凭据临时冷却最长秒数，用于限制 Retry-After 头的影响范围。
     #[serde(default = "default_credential_max_cooldown_secs")]
     pub credential_max_cooldown_secs: u64,
+
+    /// 单个请求等待凭据可调度的最长秒数。
+    ///
+    /// `0` 表示不限制等待时间；`>0` 时，如果所有可用凭据持续处于冷却、
+    /// 本地限流或并发占满状态，超过该时间后返回明确的本地调度限流错误。
+    #[serde(default = "default_credential_dispatch_max_wait_secs")]
+    pub credential_dispatch_max_wait_secs: u64,
+
+    /// 并发占用 lease 的最大存活秒数。
+    ///
+    /// `0` 表示不自动回收；`>0` 时，调度前会清理超过该时间仍未释放的占用，
+    /// 避免异常路径导致某个凭据永久被视为并发占满。
+    #[serde(default = "default_credential_in_flight_lease_max_secs")]
+    pub credential_in_flight_lease_max_secs: u64,
 
     /// 新凭据预热请求次数。预热期内 balanced 会降低该凭据调度权重，但不会伪造 success_count。
     #[serde(default = "default_credential_warmup_requests")]
@@ -242,20 +508,12 @@ pub struct Config {
     #[serde(default = "default_prompt_cache_scale_min_input_tokens")]
     pub prompt_cache_scale_min_input_tokens: i32,
 
-    /// /cc high-cache 下游上报的 cache write 目标值。
+    /// 下游 usage 上报投影配置。
     ///
-    /// 只限制 `/cc/v1/messages` 对下游返回和 usage record 的 writer 上报；
-    /// 不影响上游请求、本地 prompt-cache reader 计算和 tracker 更新。
-    #[serde(default = "default_cc_high_cache_reported_cache_creation_target_tokens")]
-    pub cc_high_cache_reported_cache_creation_target_tokens: i32,
-
-    /// /cc high-cache 下游上报的 uncached input token 上限。
-    ///
-    /// 有缓存 usage 时，`/cc/v1/messages` 会把下游看到的 `input_tokens`
-    /// 采样到该上限内，并把剩余输入归入 `cache_read_input_tokens`。
-    /// 只影响上报，不影响 reader/tracker/upstream。
-    #[serde(default = "default_cc_high_cache_reported_input_max_tokens")]
-    pub cc_high_cache_reported_input_max_tokens: i32,
+    /// 默认策略先应用，再按路径前缀使用最长匹配覆盖；只影响 response usage
+    /// 和后台 usage record，不影响 prompt-cache reader 计算、tracker 更新和上游请求。
+    #[serde(default)]
+    pub reported_usage: ReportedUsageConfig,
 
     /// 请求级 usage record 内存保留上限。
     #[serde(default = "default_usage_record_limit")]
@@ -331,6 +589,14 @@ fn default_credential_max_cooldown_secs() -> u64 {
     300
 }
 
+fn default_credential_dispatch_max_wait_secs() -> u64 {
+    120
+}
+
+fn default_credential_in_flight_lease_max_secs() -> u64 {
+    900
+}
+
 fn default_credential_warmup_requests() -> u32 {
     3
 }
@@ -383,14 +649,6 @@ fn default_prompt_cache_scale_min_input_tokens() -> i32 {
     20_000
 }
 
-fn default_cc_high_cache_reported_cache_creation_target_tokens() -> i32 {
-    3_000
-}
-
-fn default_cc_high_cache_reported_input_max_tokens() -> i32 {
-    96
-}
-
 fn default_usage_record_limit() -> usize {
     5000
 }
@@ -409,6 +667,46 @@ fn default_endpoint() -> String {
 
 fn default_expose_proxy_warnings() -> bool {
     false
+}
+
+fn default_reported_usage_normal_max_multiplier() -> f64 {
+    1.1
+}
+
+fn normalize_reported_usage_normal_max_multiplier(value: f64) -> f64 {
+    if value.is_finite() && value >= 1.0 {
+        value.min(10.0)
+    } else {
+        default_reported_usage_normal_max_multiplier()
+    }
+}
+
+fn normalize_reported_usage_path_prefix(prefix: &str) -> Option<String> {
+    let trimmed = prefix.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let with_slash = if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{}", trimmed)
+    };
+    let normalized = with_slash.trim_end_matches('/').to_string();
+    Some(if normalized.is_empty() {
+        "/".to_string()
+    } else {
+        normalized
+    })
+}
+
+fn reported_usage_path_matches(prefix: &str, path: &str) -> bool {
+    if prefix == "/" {
+        return true;
+    }
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 impl Default for Config {
@@ -433,8 +731,11 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             credential_rpm: None,
+            credential_max_concurrent_requests: 0,
             credential_transient_cooldown_secs: default_credential_transient_cooldown_secs(),
             credential_max_cooldown_secs: default_credential_max_cooldown_secs(),
+            credential_dispatch_max_wait_secs: default_credential_dispatch_max_wait_secs(),
+            credential_in_flight_lease_max_secs: default_credential_in_flight_lease_max_secs(),
             credential_warmup_requests: default_credential_warmup_requests(),
             credential_warmup_selection_percent: default_credential_warmup_selection_percent(),
             credentials_persist: default_credentials_persist(),
@@ -450,10 +751,7 @@ impl Default for Config {
             prompt_cache_cap_jitter_min_tokens: default_prompt_cache_cap_jitter_min_tokens(),
             prompt_cache_cap_jitter_max_tokens: default_prompt_cache_cap_jitter_max_tokens(),
             prompt_cache_scale_min_input_tokens: default_prompt_cache_scale_min_input_tokens(),
-            cc_high_cache_reported_cache_creation_target_tokens:
-                default_cc_high_cache_reported_cache_creation_target_tokens(),
-            cc_high_cache_reported_input_max_tokens:
-                default_cc_high_cache_reported_input_max_tokens(),
+            reported_usage: ReportedUsageConfig::default(),
             usage_record_limit: default_usage_record_limit(),
             usage_record_persist: default_usage_record_persist(),
             high_cache_threshold: default_high_cache_threshold(),
@@ -536,15 +834,25 @@ mod tests {
         let config = Config::default();
 
         assert_eq!(config.credential_rpm, None);
+        assert_eq!(config.credential_max_concurrent_requests, 0);
         assert_eq!(config.credential_transient_cooldown_secs, 10);
         assert_eq!(config.credential_max_cooldown_secs, 300);
+        assert_eq!(config.credential_dispatch_max_wait_secs, 120);
+        assert_eq!(config.credential_in_flight_lease_max_secs, 900);
         assert_eq!(config.credential_warmup_requests, 3);
         assert_eq!(config.credential_warmup_selection_percent, 5);
         assert!(config.credentials_persist);
         assert!(config.credential_stats_persist);
         assert!(!config.compression.enabled);
         assert!(config.compression.whitespace_compression);
-        assert_eq!(config.cc_high_cache_reported_input_max_tokens, 96);
+        assert_eq!(
+            config
+                .reported_usage
+                .policy_for_path("/cc/v1/messages")
+                .input
+                .max_tokens,
+            96
+        );
     }
 
     #[test]
@@ -600,16 +908,41 @@ mod tests {
     }
 
     #[test]
-    fn cc_reported_input_max_deserializes_from_camel_case_config() {
+    fn reported_usage_deserializes_from_camel_case_config() {
         let config: Config = serde_json::from_str(
             r#"{
                 "apiKey": "sk-test",
-                "ccHighCacheReportedInputMaxTokens": 64
+                "reportedUsage": {
+                    "default": {
+                        "input": { "mode": "preserve" }
+                    },
+                    "pathOverrides": {
+                        "cc": {
+                            "input": {
+                                "mode": "sample-max",
+                                "maxTokens": 64,
+                                "moveDeltaToCacheRead": true
+                            },
+                            "cacheCreation": {
+                                "mode": "sample-target",
+                                "targetTokens": 2048
+                            }
+                        }
+                    }
+                }
             }"#,
         )
         .unwrap();
 
-        assert_eq!(config.cc_high_cache_reported_input_max_tokens, 64);
+        let policy = config.reported_usage.policy_for_path("/cc/v1/messages");
+        assert_eq!(policy.input.mode, ReportedUsageFieldMode::SampleMax);
+        assert_eq!(policy.input.max_tokens, 64);
+        assert!(policy.input.move_delta_to_cache_read);
+        assert_eq!(
+            policy.cache_creation.mode,
+            ReportedUsageFieldMode::SampleTarget
+        );
+        assert_eq!(policy.cache_creation.target_tokens, 2048);
     }
 
     #[test]
@@ -631,5 +964,34 @@ mod tests {
         assert_eq!(config.prompt_cache_cap_jitter_min_tokens, 5_000);
         assert_eq!(config.prompt_cache_cap_jitter_max_tokens, 20_000);
         assert_eq!(config.prompt_cache_scale_min_input_tokens, 10_000);
+    }
+
+    #[test]
+    fn reported_usage_default_and_prefix_overrides_match_longest_prefix() {
+        let mut reported_usage = ReportedUsageConfig::default();
+        reported_usage.path_overrides.insert(
+            "/cc/v1".to_string(),
+            ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy::sample_input_max(32),
+                ..ReportedUsagePathPolicy::default()
+            },
+        );
+
+        assert_eq!(
+            reported_usage.policy_for_path("/v1/messages").input.mode,
+            ReportedUsageFieldMode::Preserve
+        );
+        assert_eq!(
+            reported_usage
+                .policy_for_path("/cc/v1/messages")
+                .input
+                .max_tokens,
+            32
+        );
+        assert_eq!(
+            reported_usage.policy_for_path("/cc/other").input.max_tokens,
+            96
+        );
+        assert!(!reported_usage.policy_for_path("/na/v1/messages").enabled);
     }
 }

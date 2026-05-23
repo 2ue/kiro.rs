@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 
 use chrono::Utc;
 use parking_lot::Mutex;
@@ -10,10 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsPageResponse, CredentialsStatusResponse, LoadBalancingModeResponse,
-    RuntimeConfigResponse, SetLoadBalancingModeRequest, SetWarmupRequest, TestCredentialRequest,
-    TestCredentialResponse, UpdateRuntimeConfigRequest,
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse, ClearInFlightRequest,
+    CredentialStatusItem, CredentialsPageResponse, CredentialsStatusResponse,
+    LoadBalancingModeResponse, RuntimeConfigResponse, SetLoadBalancingModeRequest,
+    SetWarmupRequest, TestCredentialRequest, TestCredentialResponse, UpdateRuntimeConfigRequest,
 };
 use crate::anthropic::{
     converter::map_model,
@@ -171,6 +172,11 @@ impl AdminService {
                     cooldown_reason: entry.cooldown_reason,
                     rate_limited: entry.rate_limited,
                     rate_limit_remaining_secs: entry.rate_limit_remaining_secs,
+                    in_flight_requests: entry.in_flight_requests,
+                    oldest_in_flight_age_secs: entry.oldest_in_flight_age_secs,
+                    newest_in_flight_idle_secs: entry.newest_in_flight_idle_secs,
+                    max_concurrent_requests: entry.max_concurrent_requests,
+                    in_flight_lease_max_secs: entry.in_flight_lease_max_secs,
                     warmup_remaining: entry.warmup_remaining,
                     estimated_cost_usd: cost.estimated_cost_usd,
                     priced_requests: cost.priced_requests,
@@ -307,15 +313,24 @@ impl AdminService {
             .call_api_with_credential(id, &request_body)
             .await
             .map_err(|e| self.classify_test_error(e, id))?;
-        let body_bytes =
-            api_response.response.bytes().await.map_err(|e| {
-                AdminServiceError::UpstreamError(format!("读取测试响应失败: {}", e))
-            })?;
+        let credential_id = api_response.credential_id();
+        let (response, completion) = api_response.into_parts();
+        let body_bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                completion.release();
+                return Err(AdminServiceError::UpstreamError(format!(
+                    "读取测试响应失败: {}",
+                    e
+                )));
+            }
+        };
         let response_text = parse_model_test_response(&body_bytes)?;
+        completion.release();
 
         Ok(TestCredentialResponse {
             success: true,
-            credential_id: api_response.credential_id,
+            credential_id,
             model: model.to_string(),
             model_id,
             prompt: prompt.to_string(),
@@ -513,8 +528,11 @@ impl AdminService {
         let config = self.token_manager.runtime_config();
         RuntimeConfigResponse {
             credential_rpm: config.credential_rpm.unwrap_or(0),
+            credential_max_concurrent_requests: config.credential_max_concurrent_requests,
             credential_transient_cooldown_secs: config.credential_transient_cooldown_secs,
             credential_max_cooldown_secs: config.credential_max_cooldown_secs,
+            credential_dispatch_max_wait_secs: config.credential_dispatch_max_wait_secs,
+            credential_in_flight_lease_max_secs: config.credential_in_flight_lease_max_secs,
             credential_warmup_requests: config.credential_warmup_requests,
             credential_warmup_selection_percent: config.credential_warmup_selection_percent,
             compression_enabled: config.compression.enabled,
@@ -525,9 +543,7 @@ impl AdminService {
             prompt_cache_cap_jitter_min_tokens: config.prompt_cache_cap_jitter_min_tokens,
             prompt_cache_cap_jitter_max_tokens: config.prompt_cache_cap_jitter_max_tokens,
             prompt_cache_scale_min_input_tokens: config.prompt_cache_scale_min_input_tokens,
-            cc_high_cache_reported_cache_creation_target_tokens: config
-                .cc_high_cache_reported_cache_creation_target_tokens,
-            cc_high_cache_reported_input_max_tokens: config.cc_high_cache_reported_input_max_tokens,
+            reported_usage: config.reported_usage.normalized(),
             high_cache_threshold: config.high_cache_threshold,
             compat_profile: config.compat_profile,
             extract_thinking: config.extract_thinking,
@@ -541,6 +557,12 @@ impl AdminService {
         req: UpdateRuntimeConfigRequest,
     ) -> Result<RuntimeConfigResponse, AdminServiceError> {
         let current_config = self.token_manager.runtime_config();
+        let credential_dispatch_max_wait_secs = req
+            .credential_dispatch_max_wait_secs
+            .unwrap_or(current_config.credential_dispatch_max_wait_secs);
+        let credential_in_flight_lease_max_secs = req
+            .credential_in_flight_lease_max_secs
+            .unwrap_or(current_config.credential_in_flight_lease_max_secs);
         let warmup_selection_percent = req
             .credential_warmup_selection_percent
             .unwrap_or(current_config.credential_warmup_selection_percent);
@@ -562,12 +584,11 @@ impl AdminService {
         let prompt_cache_scale_min_input_tokens = req
             .prompt_cache_scale_min_input_tokens
             .unwrap_or(current_config.prompt_cache_scale_min_input_tokens);
-        let cc_high_cache_reported_cache_creation_target_tokens = req
-            .cc_high_cache_reported_cache_creation_target_tokens
-            .unwrap_or(current_config.cc_high_cache_reported_cache_creation_target_tokens);
-        let cc_high_cache_reported_input_max_tokens = req
-            .cc_high_cache_reported_input_max_tokens
-            .unwrap_or(current_config.cc_high_cache_reported_input_max_tokens);
+        let reported_usage = req
+            .reported_usage
+            .clone()
+            .unwrap_or_else(|| current_config.reported_usage.clone())
+            .normalized();
         let high_cache_threshold = req
             .high_cache_threshold
             .unwrap_or(current_config.high_cache_threshold);
@@ -628,16 +649,9 @@ impl AdminService {
                 "promptCacheScaleMinInputTokens 不能小于 0".to_string(),
             ));
         }
-        if cc_high_cache_reported_cache_creation_target_tokens < 0 {
-            return Err(AdminServiceError::InvalidCredential(
-                "ccHighCacheReportedCacheCreationTargetTokens 不能小于 0".to_string(),
-            ));
-        }
-        if cc_high_cache_reported_input_max_tokens < 0 {
-            return Err(AdminServiceError::InvalidCredential(
-                "ccHighCacheReportedInputMaxTokens 不能小于 0".to_string(),
-            ));
-        }
+        reported_usage
+            .validate()
+            .map_err(AdminServiceError::InvalidCredential)?;
         if high_cache_threshold < 0 {
             return Err(AdminServiceError::InvalidCredential(
                 "highCacheThreshold 不能小于 0".to_string(),
@@ -650,8 +664,11 @@ impl AdminService {
         self.token_manager
             .update_runtime_config(|config| {
                 config.credential_rpm = credential_rpm;
+                config.credential_max_concurrent_requests = req.credential_max_concurrent_requests;
                 config.credential_transient_cooldown_secs = req.credential_transient_cooldown_secs;
                 config.credential_max_cooldown_secs = req.credential_max_cooldown_secs;
+                config.credential_dispatch_max_wait_secs = credential_dispatch_max_wait_secs;
+                config.credential_in_flight_lease_max_secs = credential_in_flight_lease_max_secs;
                 config.credential_warmup_requests = req.credential_warmup_requests;
                 config.credential_warmup_selection_percent = warmup_selection_percent;
                 config.compression = compression.clone();
@@ -662,10 +679,7 @@ impl AdminService {
                 config.prompt_cache_cap_jitter_min_tokens = prompt_cache_cap_jitter_min_tokens;
                 config.prompt_cache_cap_jitter_max_tokens = prompt_cache_cap_jitter_max_tokens;
                 config.prompt_cache_scale_min_input_tokens = prompt_cache_scale_min_input_tokens;
-                config.cc_high_cache_reported_cache_creation_target_tokens =
-                    cc_high_cache_reported_cache_creation_target_tokens;
-                config.cc_high_cache_reported_input_max_tokens =
-                    cc_high_cache_reported_input_max_tokens;
+                config.reported_usage = reported_usage;
                 config.high_cache_threshold = high_cache_threshold;
                 config.compat_profile = compat_profile;
                 config.extract_thinking = extract_thinking;
@@ -681,6 +695,20 @@ impl AdminService {
         self.token_manager
             .set_warmup_remaining(id, req.warmup_remaining)
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))
+    }
+
+    /// 清理指定凭据的并发占用 lease。
+    pub fn clear_in_flight(
+        &self,
+        id: u64,
+        req: ClearInFlightRequest,
+    ) -> Result<usize, AdminServiceError> {
+        let snapshot = self.token_manager.snapshot();
+        if !snapshot.entries.iter().any(|entry| entry.id == id) {
+            return Err(AdminServiceError::NotFound { id });
+        }
+        let min_idle = req.min_idle_secs.map(StdDuration::from_secs);
+        Ok(self.token_manager.clear_in_flight_leases(id, min_idle))
     }
 
     /// 获取负载均衡模式

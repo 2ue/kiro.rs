@@ -21,6 +21,7 @@ import {
   useSetDisabled,
   useSetPriority,
   useSetWarmup,
+  useClearInFlight,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
@@ -82,6 +83,7 @@ export function CredentialCard({
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
   const setWarmup = useSetWarmup()
+  const clearInFlight = useClearInFlight()
   const runtimeConfig = useRuntimeConfig()
   const displayName = credential.email || credential.maskedApiKey || `凭据 #${credential.id}`
   const warmupTarget = Math.max(0, runtimeConfig.data?.credentialWarmupRequests ?? 3)
@@ -140,6 +142,19 @@ export function CredentialCard({
         toast.error('刷新失败: ' + extractErrorMessage(err))
       },
     })
+  }
+
+  const handleClearInFlight = () => {
+    if (!confirm(`确定清理凭据 #${credential.id} 的当前并发占用吗？真实仍在运行的请求可能因此不再计入并发限制。`)) {
+      return
+    }
+    clearInFlight.mutate(
+      { id: credential.id },
+      {
+        onSuccess: (res) => toast.success(res.message),
+        onError: (err) => toast.error('清理失败: ' + extractErrorMessage(err)),
+      }
+    )
   }
 
   const handleToggleWarmup = () => {
@@ -202,6 +217,18 @@ export function CredentialCard({
                 )}
                 {!credential.disabled && credential.rateLimited && (
                   <Badge variant="outline">限流 {credential.rateLimitRemainingSecs}s</Badge>
+                )}
+                {!credential.disabled && credential.maxConcurrentRequests > 0 && (
+                  <Badge
+                    variant={credential.inFlightRequests >= credential.maxConcurrentRequests ? 'destructive' : 'outline'}
+                    title={
+                      credential.inFlightRequests > 0
+                        ? `最老占用 ${credential.oldestInFlightAgeSecs}s，最近活跃 ${credential.newestInFlightIdleSecs}s 前`
+                        : undefined
+                    }
+                  >
+                    并发 {credential.inFlightRequests}/{credential.maxConcurrentRequests}
+                  </Badge>
                 )}
                 {!credential.disabled && credential.warmupRemaining > 0 && (
                   <Badge variant="secondary">预热 {credential.warmupRemaining}</Badge>
@@ -299,6 +326,19 @@ export function CredentialCard({
               <span className="font-medium">{credential.successCount}</span>
             </div>
             <div>
+              <span className="text-muted-foreground">当前并发：</span>
+              <span className="font-medium">
+                {credential.inFlightRequests}
+                {credential.maxConcurrentRequests > 0 ? `/${credential.maxConcurrentRequests}` : '（不限）'}
+              </span>
+              {credential.inFlightRequests > 0 && (
+                <span className="ml-1 text-xs text-muted-foreground">
+                  最老 {credential.oldestInFlightAgeSecs}s
+                  {credential.inFlightLeaseMaxSecs > 0 ? ` / 回收 ${credential.inFlightLeaseMaxSecs}s` : ''}
+                </span>
+              )}
+            </div>
+            <div>
               <span className="text-muted-foreground">估算费用：</span>
               <span className="font-medium">{formatUsd(credential.estimatedCostUsd || 0)}</span>
             </div>
@@ -310,7 +350,7 @@ export function CredentialCard({
                 </span>
               </div>
             )}
-            {(credential.cooledDown || credential.rateLimited || credential.warmupRemaining > 0) && (
+            {(credential.cooledDown || credential.rateLimited || credential.warmupRemaining > 0 || (credential.maxConcurrentRequests > 0 && credential.inFlightRequests >= credential.maxConcurrentRequests)) && (
               <div className="col-span-2">
                 <span className="text-muted-foreground">调度状态：</span>
                 <span className="font-medium">
@@ -318,7 +358,9 @@ export function CredentialCard({
                     ? `冷却中 ${credential.cooldownRemainingSecs}s`
                     : credential.rateLimited
                       ? `本地限流 ${credential.rateLimitRemainingSecs}s`
-                      : `预热剩余 ${credential.warmupRemaining} 次`}
+                      : credential.maxConcurrentRequests > 0 && credential.inFlightRequests >= credential.maxConcurrentRequests
+                        ? `并发已满 ${credential.inFlightRequests}/${credential.maxConcurrentRequests}`
+                        : `预热剩余 ${credential.warmupRemaining} 次`}
                 </span>
                 {credential.cooldownReason && (
                   <span className="ml-1 text-xs text-muted-foreground">
@@ -402,6 +444,15 @@ export function CredentialCard({
               title={credential.disabled ? '已禁用的凭据无法调整预热' : undefined}
             >
               {credential.warmupRemaining > 0 ? '关闭预热' : `预热 ${warmupTarget} 次`}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleClearInFlight}
+              disabled={clearInFlight.isPending || credential.inFlightRequests === 0}
+              title={credential.inFlightRequests === 0 ? '当前没有并发占用' : '清理异常并发占用'}
+            >
+              清理并发
             </Button>
             <Button
               size="sm"

@@ -8,7 +8,7 @@
 
 - Anthropic 兼容接口：`http://服务器地址:8990/v1`
 - Claude Code 兼容接口：`http://服务器地址:8990/cc/v1`
-- 无缓存模拟接口：`http://服务器地址:8990/na/v1`
+- 真实 cache usage 上报接口：`http://服务器地址:8990/na/v1`
 - 管理后台：`http://服务器地址:8990/admin`
 
 默认 Docker 镜像：
@@ -118,8 +118,11 @@ KIRO_RS_PORT=9022 KIRO_RS_VERSION=0.0.17 docker compose up -d
   "adminApiKey": "sk-admin-change-me",
   "loadBalancingMode": "priority",
   "credentialRpm": null,
+  "credentialMaxConcurrentRequests": 0,
   "credentialTransientCooldownSecs": 10,
   "credentialMaxCooldownSecs": 300,
+  "credentialDispatchMaxWaitSecs": 120,
+  "credentialInFlightLeaseMaxSecs": 900,
   "credentialWarmupRequests": 3,
   "credentialWarmupSelectionPercent": 5,
   "credentialsPersist": true,
@@ -136,8 +139,41 @@ KIRO_RS_PORT=9022 KIRO_RS_VERSION=0.0.17 docker compose up -d
   "promptCacheCapJitterMinTokens": 12000,
   "promptCacheCapJitterMaxTokens": 24000,
   "promptCacheScaleMinInputTokens": 20000,
-  "ccHighCacheReportedCacheCreationTargetTokens": 3000,
-  "ccHighCacheReportedInputMaxTokens": 96,
+  "reportedUsage": {
+    "default": {
+      "enabled": true,
+      "input": { "mode": "preserve" },
+      "output": { "mode": "preserve" },
+      "cacheRead": { "mode": "preserve" },
+      "cacheCreation": { "mode": "preserve" }
+    },
+    "pathOverrides": {
+      "/na": {
+        "enabled": false
+      },
+      "/cc": {
+        "enabled": true,
+        "input": {
+          "mode": "sample-max",
+          "maxTokens": 96,
+          "moveDeltaToCacheRead": true
+        },
+        "cacheCreation": {
+          "mode": "sample-target",
+          "targetTokens": 3000,
+          "normalMaxMultiplier": 1.1
+        }
+      },
+      "/ha": {
+        "enabled": true,
+        "input": {
+          "mode": "sample-max",
+          "maxTokens": 96,
+          "moveDeltaToCacheRead": true
+        }
+      }
+    }
+  },
   "usageRecordLimit": 5000,
   "usageRecordPersist": true,
   "highCacheThreshold": 10000,
@@ -194,8 +230,11 @@ openssl rand -hex 32
 | --- | --- | --- |
 | `loadBalancingMode` | `priority` 或 `balanced` | 控制多凭据调度方式。`priority` 按优先级优先使用；`balanced` 会参考统计和预热状态做均衡选择。 |
 | `credentialRpm` | `null` | 控制每个凭据的本地请求速率限制。`null` 或 `0` 表示关闭；大于 0 表示单个凭据每分钟最多请求次数。 |
+| `credentialMaxConcurrentRequests` | `0` | 控制每个凭据最多同时处理多少个请求。`0` 表示不限制；大于 0 时，同一凭据占满后会优先把新请求分配给其他可用凭据。 |
 | `credentialTransientCooldownSecs` | `10` | 控制上游临时错误但没有 `Retry-After` 时，单个凭据临时冷却多少秒。 |
 | `credentialMaxCooldownSecs` | `300` | 控制临时冷却最长秒数，防止上游 `Retry-After` 过长导致账号长期不用。 |
+| `credentialDispatchMaxWaitSecs` | `120` | 控制单个请求最多排队等待凭据可调度多久。`0` 表示不限制；超过后返回本地调度限流错误，避免客户端一直挂起。 |
+| `credentialInFlightLeaseMaxSecs` | `900` | 控制单个并发占用超过多久未活跃时自动释放。`0` 表示关闭；用于兜底异常路径导致的账号并发槽长期占用。 |
 | `credentialWarmupRequests` | `3` | 控制新凭据预热剩余请求数。预热不会伪造成功次数，只降低被选中的概率。 |
 | `credentialWarmupSelectionPercent` | `5` | 控制 `balanced` 模式下预热凭据参与真实请求调度的概率百分比。 |
 | `credentialsPersist` | `true` | 控制是否把 Token 刷新、禁用状态、优先级等变更写回 `credentials.json`。生产建议开启。 |
@@ -224,8 +263,9 @@ openssl rand -hex 32
 | 路径 | 行为 |
 | --- | --- |
 | `/v1/messages` | 高缓存模式。 |
-| `/cc/v1/messages` | 高缓存模式，且对下游 usage 上报做 Claude Code 兼容改写。 |
-| `/na/v1/messages` | 无缓存模拟模式。 |
+| `/cc/v1/messages` | 高缓存模式，底层计算同 `/v1`；默认只由 `/cc` 路径覆盖项改写下游 input 和 cache write 上报。 |
+| `/ha/v1/messages` | 高缓存模式，底层计算同 `/v1`；默认只由 `/ha` 路径覆盖项改写下游 input 上报。 |
+| `/na/v1/messages` | 高缓存路由；默认由 `/na` 路径覆盖项关闭本地模拟 cache usage 补足，只保留真实上游 cache usage。 |
 
 ### 高缓存模拟
 
@@ -240,14 +280,18 @@ openssl rand -hex 32
 | `promptCacheCapJitterMaxTokens` | `24000` | 控制触顶时 soft-cap 最大扣减值。 |
 | `promptCacheScaleMinInputTokens` | `20000` | 控制基础输入达到多少 token 后才启用放大，避免短请求被放大。 |
 
-### `/cc/v1` 下游 usage 上报
+### 路径级下游 usage 上报
 
-这些配置只影响 `/cc/v1/messages` 返回给下游和写入 usage record 的上报值，不影响本地 reader 计算、prompt-cache tracker、上游请求。
+`reportedUsage` 只影响返回给下游和写入 usage record 的上报值，不影响本地 reader 计算、prompt-cache tracker、上游请求。配置先使用 `default`，再用 `pathOverrides` 按路径前缀做最长匹配覆盖；例如 `/cc` 会匹配 `/cc/v1/messages`。
 
 | 字段名 | 建议值 | 控制什么 |
 | --- | --- | --- |
-| `ccHighCacheReportedCacheCreationTargetTokens` | `3000` | 控制 `/cc/v1` 高缓存时下游看到的 cache write 目标值。实际会在 0 到约 3300 范围内自然浮动。 |
-| `ccHighCacheReportedInputMaxTokens` | `96` | 控制 `/cc/v1` 高缓存时下游看到的 uncached input 上限。剩余 input 会转入下游看到的 cache read。 |
+| `reportedUsage.default` | 原样上报 | 控制所有路径的默认 input、output、cache read、cache write 上报方式。 |
+| `reportedUsage.pathOverrides` | `/na`、`/cc`、`/ha` | 控制路径前缀覆盖策略。每个前缀独立配置，最长前缀优先。 |
+| `mode: "preserve"` | 默认 | 原样上报该字段。 |
+| `mode: "sample-max"` | input 可用 | 把字段采样到 `maxTokens` 以内，数值自然浮动，不固定到上限。 |
+| `mode: "sample-target"` | cache write 可用 | 按 `targetTokens` 和 `normalMaxMultiplier` 生成自然分布。 |
+| `moveDeltaToCacheRead` | input 建议 `true` | input 被压低的差值转入 cache read，只改变下游上报外观。 |
 
 ### Usage 记录和后台统计
 
@@ -459,9 +503,9 @@ base_url = http://服务器地址:8990/v1
 api_key = config.json 里的 apiKey
 ```
 
-### 无缓存模拟路径
+### 真实 cache usage 上报路径
 
-如果需要不做本地缓存 usage 模拟：
+如果需要底层仍按高缓存计算，但下游只看真实上游 cache usage：
 
 ```text
 base_url = http://服务器地址:8990/na/v1
@@ -606,7 +650,7 @@ x-api-key: sk-kiro-rs-change-me
 | --- | --- |
 | `/cc/v1` | Claude Code CLI 或类似客户端。 |
 | `/v1` | 普通 Anthropic 兼容客户端，默认高缓存模拟。 |
-| `/na/v1` | 想关闭本地缓存 usage 模拟时使用。 |
+| `/na/v1` | 想只上报真实上游 cache usage 时使用。 |
 
 ## 16. 最小可用部署命令汇总
 

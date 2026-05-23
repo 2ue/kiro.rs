@@ -86,6 +86,17 @@ export async function setCredentialWarmup(
   return data
 }
 
+export async function clearCredentialInFlight(
+  id: number,
+  minIdleSecs?: number
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/in-flight/clear`,
+    { minIdleSecs }
+  )
+  return data
+}
+
 // 重置失败计数
 export async function resetCredentialFailure(
   id: number

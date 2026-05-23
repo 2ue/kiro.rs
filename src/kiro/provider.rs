@@ -20,7 +20,9 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{
+    CallContext, InFlightKind, InFlightLeaseGuard, MultiTokenManager,
+};
 use crate::model::config::{Config, TlsBackend};
 use parking_lot::Mutex;
 
@@ -51,19 +53,108 @@ pub struct KiroProvider {
 }
 
 pub struct KiroApiResponse {
-    pub response: reqwest::Response,
-    pub credential_id: u64,
-    pub session_id: Option<String>,
-    pub sticky_bound: bool,
-    pub fallback_from_sticky: bool,
+    response: reqwest::Response,
+    completion: KiroApiCompletion,
 }
 
 struct ApiCallResponse {
     response: reqwest::Response,
     credential_id: u64,
+    in_flight_lease: Option<InFlightLeaseGuard>,
     session_id: Option<String>,
     sticky_bound: bool,
     fallback_from_sticky: bool,
+}
+
+/// 非流式调用完成上报器。
+///
+/// 非流式响应头返回后，body 读取和事件解析仍可能失败或被取消。
+/// 这个 guard 用 Drop 兜底释放并发槽，避免调用链中途退出导致凭据长期不可调度。
+pub struct KiroApiCompletion {
+    token_manager: Arc<MultiTokenManager>,
+    credential_id: u64,
+    in_flight_lease: Mutex<Option<InFlightLeaseGuard>>,
+    session_id: Option<String>,
+    sticky_bound: bool,
+    fallback_from_sticky: bool,
+    reported: AtomicBool,
+}
+
+impl KiroApiCompletion {
+    fn new(
+        token_manager: Arc<MultiTokenManager>,
+        credential_id: u64,
+        in_flight_lease: Option<InFlightLeaseGuard>,
+        session_id: Option<String>,
+        sticky_bound: bool,
+        fallback_from_sticky: bool,
+    ) -> Self {
+        Self {
+            token_manager,
+            credential_id,
+            in_flight_lease: Mutex::new(in_flight_lease),
+            session_id,
+            sticky_bound,
+            fallback_from_sticky,
+            reported: AtomicBool::new(false),
+        }
+    }
+
+    pub fn report_success(&self) {
+        if self.reported.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if self.in_flight_lease.lock().take().is_some() {
+            self.token_manager
+                .report_success_for_session(self.credential_id, self.session_id.as_deref());
+        }
+    }
+
+    pub fn release(&self) {
+        if self.reported.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.in_flight_lease.lock().take();
+    }
+
+    pub fn credential_id(&self) -> u64 {
+        self.credential_id
+    }
+
+    pub fn sticky_bound(&self) -> bool {
+        self.sticky_bound
+    }
+
+    pub fn fallback_from_sticky(&self) -> bool {
+        self.fallback_from_sticky
+    }
+}
+
+impl Drop for KiroApiCompletion {
+    fn drop(&mut self) {
+        if self.reported.load(Ordering::Acquire) {
+            return;
+        }
+        self.release();
+    }
+}
+
+impl KiroApiResponse {
+    pub fn credential_id(&self) -> u64 {
+        self.completion.credential_id()
+    }
+
+    pub fn sticky_bound(&self) -> bool {
+        self.completion.sticky_bound()
+    }
+
+    pub fn fallback_from_sticky(&self) -> bool {
+        self.completion.fallback_from_sticky()
+    }
+
+    pub fn into_parts(self) -> (reqwest::Response, KiroApiCompletion) {
+        (self.response, self.completion)
+    }
 }
 
 /// 流式调用完成上报器。
@@ -73,6 +164,7 @@ struct ApiCallResponse {
 pub struct KiroStreamCompletion {
     token_manager: Arc<MultiTokenManager>,
     credential_id: u64,
+    in_flight_lease: Mutex<Option<InFlightLeaseGuard>>,
     session_id: Option<String>,
     sticky_bound: bool,
     fallback_from_sticky: bool,
@@ -83,6 +175,7 @@ impl KiroStreamCompletion {
     fn new(
         token_manager: Arc<MultiTokenManager>,
         credential_id: u64,
+        in_flight_lease: Option<InFlightLeaseGuard>,
         session_id: Option<String>,
         sticky_bound: bool,
         fallback_from_sticky: bool,
@@ -90,6 +183,7 @@ impl KiroStreamCompletion {
         Self {
             token_manager,
             credential_id,
+            in_flight_lease: Mutex::new(in_flight_lease),
             session_id,
             sticky_bound,
             fallback_from_sticky,
@@ -104,6 +198,7 @@ impl KiroStreamCompletion {
         }
         self.token_manager
             .report_success_for_session(self.credential_id, self.session_id.as_deref());
+        self.in_flight_lease.lock().take();
     }
 
     /// 上游流中断、idle timeout 或上游错误事件时调用。
@@ -116,6 +211,13 @@ impl KiroStreamCompletion {
         if let Some(session_id) = self.session_id.as_deref() {
             self.token_manager
                 .record_session_soft_failure(session_id, self.credential_id);
+        }
+        self.in_flight_lease.lock().take();
+    }
+
+    pub fn touch(&self) {
+        if let Some(lease) = self.in_flight_lease.lock().as_ref() {
+            lease.touch();
         }
     }
 
@@ -217,8 +319,14 @@ mod tests {
         let manager = Arc::new(
             MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
         );
-        let completion =
-            KiroStreamCompletion::new(manager.clone(), 1, Some("session".into()), false, false);
+        let completion = KiroStreamCompletion::new(
+            manager.clone(),
+            1,
+            None,
+            Some("session".into()),
+            false,
+            false,
+        );
 
         completion.report_success();
         completion.report_success();
@@ -235,14 +343,73 @@ mod tests {
         let manager = Arc::new(
             MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
         );
-        let completion =
-            KiroStreamCompletion::new(manager.clone(), 1, Some("session".into()), false, false);
+        let completion = KiroStreamCompletion::new(
+            manager.clone(),
+            1,
+            None,
+            Some("session".into()),
+            false,
+            false,
+        );
 
         completion.report_soft_failure();
         completion.report_success();
 
         let snapshot = manager.snapshot();
         assert_eq!(snapshot.entries[0].success_count, 0);
+    }
+
+    #[test]
+    fn api_completion_drop_releases_in_flight_without_counting_success() {
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("token".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
+        );
+        let lease = manager.acquire_in_flight_lease_for_test(1);
+
+        {
+            let _completion = super::KiroApiCompletion::new(
+                manager.clone(),
+                1,
+                lease,
+                Some("session".into()),
+                false,
+                false,
+            );
+        }
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.entries[0].in_flight_requests, 0);
+        assert_eq!(snapshot.entries[0].success_count, 0);
+    }
+
+    #[test]
+    fn api_completion_report_success_once() {
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("token".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
+        );
+        let lease = manager.acquire_in_flight_lease_for_test(1);
+
+        let completion = super::KiroApiCompletion::new(
+            manager.clone(),
+            1,
+            lease,
+            Some("session".into()),
+            false,
+            false,
+        );
+        completion.report_success();
+        completion.report_success();
+        drop(completion);
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.entries[0].in_flight_requests, 0);
+        assert_eq!(snapshot.entries[0].success_count, 1);
     }
 
     #[test]
@@ -398,14 +565,19 @@ impl KiroProvider {
         }
     }
 
+    fn finish_attempt(&self, ctx: &mut CallContext) {
+        ctx.release_in_flight();
+    }
+
     /// 发送非流式 API 请求
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
     #[allow(dead_code)]
     pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        let result = self.call_api_with_retry(request_body, false).await?;
-        self.report_success_for_context(result.credential_id, result.session_id.as_deref());
-        Ok(result.response)
+        let response = self.call_api_with_context(request_body).await?;
+        let (response, completion) = response.into_parts();
+        completion.report_success();
+        Ok(response)
     }
 
     /// 发送非流式 API 请求，并返回实际使用的凭据与 sticky 会话信息。
@@ -416,10 +588,14 @@ impl KiroProvider {
         let result = self.call_api_with_retry(request_body, false).await?;
         Ok(KiroApiResponse {
             response: result.response,
-            credential_id: result.credential_id,
-            session_id: result.session_id,
-            sticky_bound: result.sticky_bound,
-            fallback_from_sticky: result.fallback_from_sticky,
+            completion: KiroApiCompletion::new(
+                self.token_manager.clone(),
+                result.credential_id,
+                result.in_flight_lease,
+                result.session_id,
+                result.sticky_bound,
+                result.fallback_from_sticky,
+            ),
         })
     }
 
@@ -432,10 +608,11 @@ impl KiroProvider {
         credential_id: u64,
         request_body: &str,
     ) -> anyhow::Result<KiroApiResponse> {
-        let ctx = self
+        let mut ctx = self
             .token_manager
             .acquire_context_for_credential(credential_id)
             .await?;
+        ctx.mark_in_flight_kind(InFlightKind::Test);
         let credential_label = self.credential_log_label(ctx.id);
         let credential_context = format!("凭据 {}", credential_label);
 
@@ -483,10 +660,14 @@ impl KiroProvider {
         if status.is_success() {
             return Ok(KiroApiResponse {
                 response,
-                credential_id: ctx.id,
-                session_id: None,
-                sticky_bound: false,
-                fallback_from_sticky: false,
+                completion: KiroApiCompletion::new(
+                    self.token_manager.clone(),
+                    ctx.id,
+                    ctx.take_in_flight_lease(),
+                    None,
+                    false,
+                    false,
+                ),
             });
         }
 
@@ -499,12 +680,6 @@ impl KiroProvider {
         );
     }
 
-    /// 在 handler 完成非流式 body 读取和事件解析后上报成功。
-    pub fn report_success_for_context(&self, credential_id: u64, session_id: Option<&str>) {
-        self.token_manager
-            .report_success_for_session(credential_id, session_id);
-    }
-
     /// 发送流式 API 请求
     pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<KiroStreamResponse> {
         let result = self.call_api_with_retry(request_body, true).await?;
@@ -513,6 +688,7 @@ impl KiroProvider {
             completion: KiroStreamCompletion::new(
                 self.token_manager.clone(),
                 result.credential_id,
+                result.in_flight_lease,
                 result.session_id,
                 result.sticky_bound,
                 result.fallback_from_sticky,
@@ -534,13 +710,14 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            let mut ctx = match self.token_manager.acquire_context(None).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
                     continue;
                 }
             };
+            ctx.mark_in_flight_kind(InFlightKind::Mcp);
             let credential_label = self.credential_log_label(ctx.id);
             let credential_context = format!("凭据 {}", credential_label);
 
@@ -564,6 +741,7 @@ impl KiroProvider {
                         e
                     );
                     self.token_manager.report_failure(ctx.id);
+                    self.finish_attempt(&mut ctx);
                     continue;
                 }
             };
@@ -581,11 +759,14 @@ impl KiroProvider {
                 config.compression.enabled && config.compression.whitespace_compression,
             );
 
-            let base = self
-                .client_for(&ctx.credentials)
-                .map_err(|e| {
-                    anyhow::anyhow!("MCP 创建 HTTP client 失败（{}）: {}", credential_context, e)
-                })?
+            let client = match self.client_for(&ctx.credentials) {
+                Ok(client) => client,
+                Err(e) => {
+                    self.finish_attempt(&mut ctx);
+                    anyhow::bail!("MCP 创建 HTTP client 失败（{}）: {}", credential_context, e);
+                }
+            };
+            let base = client
                 .post(&url)
                 .body(body)
                 .header("content-type", "application/json")
@@ -609,6 +790,7 @@ impl KiroProvider {
                         credential_context,
                         e
                     ));
+                    self.finish_attempt(&mut ctx);
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -622,6 +804,7 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
+                self.finish_attempt(&mut ctx);
                 return Ok(response);
             }
 
@@ -642,6 +825,7 @@ impl KiroProvider {
                 );
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
+                    self.finish_attempt(&mut ctx);
                     anyhow::bail!(
                         "MCP 请求失败（{}，所有凭据已用尽）: {} {}",
                         credential_context,
@@ -655,11 +839,13 @@ impl KiroProvider {
                     status,
                     body
                 ));
+                self.finish_attempt(&mut ctx);
                 continue;
             }
 
             // 400 Bad Request
             if status.as_u16() == 400 {
+                self.finish_attempt(&mut ctx);
                 anyhow::bail!(
                     "MCP 请求失败（{}）: {} {}",
                     credential_context,
@@ -699,6 +885,7 @@ impl KiroProvider {
                             credential_label = %credential_label,
                             "MCP 凭据 token 强制刷新成功，重试请求"
                         );
+                        self.finish_attempt(&mut ctx);
                         continue;
                     }
                     tracing::warn!(
@@ -710,6 +897,7 @@ impl KiroProvider {
 
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
+                    self.finish_attempt(&mut ctx);
                     anyhow::bail!(
                         "MCP 请求失败（{}，所有凭据已用尽）: {} {}",
                         credential_context,
@@ -723,6 +911,7 @@ impl KiroProvider {
                     status,
                     body
                 ));
+                self.finish_attempt(&mut ctx);
                 continue;
             }
 
@@ -750,6 +939,7 @@ impl KiroProvider {
                     retry_after,
                     format!("{} {}", status, body),
                 );
+                self.finish_attempt(&mut ctx);
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -758,6 +948,7 @@ impl KiroProvider {
 
             // 其他 4xx
             if status.is_client_error() {
+                self.finish_attempt(&mut ctx);
                 anyhow::bail!(
                     "MCP 请求失败（{}）: {} {}",
                     credential_context,
@@ -783,6 +974,7 @@ impl KiroProvider {
                 status,
                 body
             ));
+            self.finish_attempt(&mut ctx);
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
@@ -817,7 +1009,7 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self
+            let mut ctx = match self
                 .token_manager
                 .acquire_context_for_session(
                     model.as_deref(),
@@ -839,6 +1031,11 @@ impl KiroProvider {
                     break;
                 }
             };
+            ctx.mark_in_flight_kind(if is_stream {
+                InFlightKind::Stream
+            } else {
+                InFlightKind::Api
+            });
             let credential_label = self.credential_log_label(ctx.id);
             let credential_context = format!("凭据 {}", credential_label);
 
@@ -866,6 +1063,7 @@ impl KiroProvider {
                         e
                     );
                     self.token_manager.report_failure(ctx.id);
+                    self.finish_attempt(&mut ctx);
                     continue;
                 }
             };
@@ -883,16 +1081,19 @@ impl KiroProvider {
                 config.compression.enabled && config.compression.whitespace_compression,
             );
 
-            let base = self
-                .client_for(&ctx.credentials)
-                .map_err(|e| {
-                    anyhow::anyhow!(
+            let client = match self.client_for(&ctx.credentials) {
+                Ok(client) => client,
+                Err(e) => {
+                    self.finish_attempt(&mut ctx);
+                    anyhow::bail!(
                         "{} API 创建 HTTP client 失败（{}）: {}",
                         api_type,
                         credential_context,
                         e
-                    )
-                })?
+                    );
+                }
+            };
+            let base = client
                 .post(&url)
                 .body(body)
                 .header("content-type", "application/json")
@@ -926,6 +1127,7 @@ impl KiroProvider {
                         &credential_label,
                         &mut excluded_ids,
                     );
+                    self.finish_attempt(&mut ctx);
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -982,15 +1184,18 @@ impl KiroProvider {
                             &mut excluded_ids,
                         );
                         last_error = Some(err);
+                        self.finish_attempt(&mut ctx);
                         sleep(Self::retry_delay(attempt)).await;
                         continue;
                     }
 
+                    self.finish_attempt(&mut ctx);
                     return Err(err);
                 }
                 return Ok(ApiCallResponse {
                     response,
                     credential_id: ctx.id,
+                    in_flight_lease: ctx.take_in_flight_lease(),
                     session_id: conversation_id.clone(),
                     sticky_bound: ctx.sticky_bound,
                     fallback_from_sticky: ctx.fallback_from_sticky,
@@ -1019,6 +1224,7 @@ impl KiroProvider {
                         .unbind_session_if_bound_to(session_id, ctx.id);
                 }
                 if !has_available {
+                    self.finish_attempt(&mut ctx);
                     anyhow::bail!(
                         "{} API 请求失败（{}，所有凭据已用尽）: {} {}",
                         api_type,
@@ -1042,11 +1248,13 @@ impl KiroProvider {
                     &credential_label,
                     &mut excluded_ids,
                 );
+                self.finish_attempt(&mut ctx);
                 continue;
             }
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
+                self.finish_attempt(&mut ctx);
                 anyhow::bail!(
                     "{} API 请求失败（{}）: {} {}",
                     api_type,
@@ -1088,6 +1296,7 @@ impl KiroProvider {
                             credential_label = %credential_label,
                             "凭据 token 强制刷新成功，重试请求"
                         );
+                        self.finish_attempt(&mut ctx);
                         continue;
                     }
                     tracing::warn!(
@@ -1105,6 +1314,7 @@ impl KiroProvider {
                     }
                 }
                 if !has_available {
+                    self.finish_attempt(&mut ctx);
                     anyhow::bail!(
                         "{} API 请求失败（{}，所有凭据已用尽）: {} {}",
                         api_type,
@@ -1121,6 +1331,7 @@ impl KiroProvider {
                     status,
                     body
                 ));
+                self.finish_attempt(&mut ctx);
                 continue;
             }
 
@@ -1157,6 +1368,7 @@ impl KiroProvider {
                     &credential_label,
                     &mut excluded_ids,
                 );
+                self.finish_attempt(&mut ctx);
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -1165,6 +1377,7 @@ impl KiroProvider {
 
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
             if status.is_client_error() {
+                self.finish_attempt(&mut ctx);
                 anyhow::bail!(
                     "{} API 请求失败（{}）: {} {}",
                     api_type,
@@ -1199,6 +1412,7 @@ impl KiroProvider {
                 &credential_label,
                 &mut excluded_ids,
             );
+            self.finish_attempt(&mut ctx);
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }

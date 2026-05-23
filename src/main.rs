@@ -211,8 +211,7 @@ async fn main() {
         config.prompt_cache_cap_jitter_min_tokens,
         config.prompt_cache_cap_jitter_max_tokens,
         config.prompt_cache_scale_min_input_tokens,
-        config.cc_high_cache_reported_cache_creation_target_tokens,
-        config.cc_high_cache_reported_input_max_tokens,
+        config.reported_usage.clone(),
         config.compat_profile,
         config.expose_proxy_warnings,
     );
@@ -263,7 +262,7 @@ async fn main() {
     tracing::info!("  POST /v1/messages (high-cache)");
     tracing::info!("  POST /v1/messages/count_tokens");
     tracing::info!("  GET  /na/v1/models");
-    tracing::info!("  POST /na/v1/messages (no-cache)");
+    tracing::info!("  POST /na/v1/messages (real-cache-usage)");
     tracing::info!("  POST /na/v1/messages/count_tokens");
     tracing::info!("  GET  /ha/v1/models");
     tracing::info!("  POST /ha/v1/messages (high-cache input-compatible)");

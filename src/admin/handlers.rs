@@ -13,9 +13,9 @@ use serde::Deserialize;
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, AdminErrorResponse, ExportCredentialsQuery, SetDisabledRequest,
-        SetLoadBalancingModeRequest, SetPriorityRequest, SetWarmupRequest, SuccessResponse,
-        TestCredentialRequest, UpdateRuntimeConfigRequest,
+        AddCredentialRequest, AdminErrorResponse, ClearInFlightRequest, ExportCredentialsQuery,
+        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SetWarmupRequest,
+        SuccessResponse, TestCredentialRequest, UpdateRuntimeConfigRequest,
     },
 };
 use crate::anthropic::usage::{UsageRecordQuery, UsageRecordStatus, UsageSource};
@@ -193,6 +193,23 @@ pub async fn set_credential_warmup(
 ) -> impl IntoResponse {
     match state.service.set_warmup(id, payload) {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 预热状态已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/in-flight/clear
+/// 清理凭据并发占用
+pub async fn clear_credential_in_flight(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<ClearInFlightRequest>,
+) -> impl IntoResponse {
+    match state.service.clear_in_flight(id, payload) {
+        Ok(count) => Json(SuccessResponse::new(format!(
+            "凭据 #{} 已清理 {} 个并发占用",
+            id, count
+        )))
+        .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

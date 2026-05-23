@@ -340,7 +340,7 @@ foxfishc 的 release 和 Docker workflow 更完整，但当前仓库已经使用
 
 ## 和当前 `/cc` Writer 的边界
 
-当前 `/cc` high-cache writer 逻辑是独立 writer policy：
+当前 `/cc` high-cache writer 逻辑来自路径级 usage 上报策略：
 
 1. 只对 `/cc/v1/messages` 生效。
 2. 只影响返回给下游的 usage 字段。
@@ -351,8 +351,8 @@ foxfishc 的 release 和 Docker workflow 更完整，但当前仓库已经使用
 
 当前配置字段：
 
-1. `src/model/config.rs:192`
-2. `ccHighCacheReportedCacheCreationTargetTokens`
+1. `src/model/config.rs`
+2. `reportedUsage.pathOverrides["/cc"].cacheCreation`
 
 当前 writer policy：
 

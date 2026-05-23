@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { BadgeInfo, Gauge, Save, Shield, Sparkles, Wand2, Zap } from 'lucide-react'
+import { BadgeInfo, Gauge, Save, Shield, Sparkles, Trash2, Wand2, Zap } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
@@ -8,12 +8,64 @@ import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { useRuntimeConfig, useUpdateRuntimeConfig } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
-import type { CompatProfile, RuntimeConfig } from '@/types/api'
+import type {
+  CompatProfile,
+  ReportedUsageConfig,
+  ReportedUsageFieldMode,
+  ReportedUsageFieldPolicy,
+  ReportedUsagePathPolicy,
+  RuntimeConfig,
+} from '@/types/api'
+
+const preserveFieldPolicy = (): ReportedUsageFieldPolicy => ({
+  mode: 'preserve',
+  maxTokens: 0,
+  targetTokens: 0,
+  normalMaxMultiplier: 1.1,
+  moveDeltaToCacheRead: false,
+})
+
+const inputSamplePolicy = (maxTokens = 96): ReportedUsageFieldPolicy => ({
+  ...preserveFieldPolicy(),
+  mode: 'sample-max',
+  maxTokens,
+  moveDeltaToCacheRead: true,
+})
+
+const writerSamplePolicy = (targetTokens = 3000): ReportedUsageFieldPolicy => ({
+  ...preserveFieldPolicy(),
+  mode: 'sample-target',
+  targetTokens,
+})
+
+const pathPolicy = (
+  enabled = true,
+  input: ReportedUsageFieldPolicy = preserveFieldPolicy(),
+  cacheCreation: ReportedUsageFieldPolicy = preserveFieldPolicy()
+): ReportedUsagePathPolicy => ({
+  enabled,
+  input,
+  output: preserveFieldPolicy(),
+  cacheRead: preserveFieldPolicy(),
+  cacheCreation,
+})
+
+const defaultReportedUsage = (): ReportedUsageConfig => ({
+  default: pathPolicy(),
+  pathOverrides: {
+    '/na': pathPolicy(false),
+    '/cc': pathPolicy(true, inputSamplePolicy(96), writerSamplePolicy(3000)),
+    '/ha': pathPolicy(true, inputSamplePolicy(96), preserveFieldPolicy()),
+  },
+})
 
 const emptyConfig: RuntimeConfig = {
   credentialRpm: 0,
+  credentialMaxConcurrentRequests: 0,
   credentialTransientCooldownSecs: 10,
   credentialMaxCooldownSecs: 300,
+  credentialDispatchMaxWaitSecs: 120,
+  credentialInFlightLeaseMaxSecs: 900,
   credentialWarmupRequests: 3,
   credentialWarmupSelectionPercent: 5,
   compressionEnabled: false,
@@ -24,8 +76,7 @@ const emptyConfig: RuntimeConfig = {
   promptCacheCapJitterMinTokens: 12000,
   promptCacheCapJitterMaxTokens: 24000,
   promptCacheScaleMinInputTokens: 20000,
-  ccHighCacheReportedCacheCreationTargetTokens: 3000,
-  ccHighCacheReportedInputMaxTokens: 96,
+  reportedUsage: defaultReportedUsage(),
   highCacheThreshold: 10000,
   compatProfile: 'claude-code',
   extractThinking: true,
@@ -133,6 +184,25 @@ interface SelectFieldProps {
   onChange: (value: CompatProfile) => void
 }
 
+interface ModeSelectProps {
+  value: ReportedUsageFieldMode
+  onChange: (value: ReportedUsageFieldMode) => void
+}
+
+function ModeSelect({ value, onChange }: ModeSelectProps) {
+  return (
+    <select
+      className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+      value={value}
+      onChange={(event) => onChange(event.target.value as ReportedUsageFieldMode)}
+    >
+      <option value="preserve">原样上报</option>
+      <option value="sample-max">采样到上限内</option>
+      <option value="sample-target">按目标值采样</option>
+    </select>
+  )
+}
+
 function SelectField({ title, description, value, onChange }: SelectFieldProps) {
   return (
     <label className="block rounded-md border bg-background p-4">
@@ -150,6 +220,160 @@ function SelectField({ title, description, value, onChange }: SelectFieldProps) 
         <option value="debug">调试模式</option>
       </select>
     </label>
+  )
+}
+
+interface ReportedUsageFieldEditorProps {
+  title: string
+  description: string
+  value: ReportedUsageFieldPolicy
+  allowMoveDelta?: boolean
+  onChange: (value: ReportedUsageFieldPolicy) => void
+}
+
+function ReportedUsageFieldEditor({
+  title,
+  description,
+  value,
+  allowMoveDelta,
+  onChange,
+}: ReportedUsageFieldEditorProps) {
+  return (
+    <div className="rounded-md border bg-background p-4">
+      <div className="mb-3">
+        <div className="text-sm font-medium">{title}</div>
+        <div className="mt-1 text-xs leading-5 text-muted-foreground">{description}</div>
+      </div>
+      <div className="grid gap-3">
+        <ModeSelect
+          value={value.mode}
+          onChange={(mode) => onChange({ ...value, mode })}
+        />
+        {fieldNeedsMax(value) && (
+          <Input
+            type="number"
+            value={value.maxTokens}
+            min={0}
+            inputMode="numeric"
+            placeholder="上限 tokens"
+            onChange={(event) =>
+              onChange({ ...value, maxTokens: toNumber(event.target.value, 0) })
+            }
+          />
+        )}
+        {fieldNeedsTarget(value) && (
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Input
+              type="number"
+              value={value.targetTokens}
+              min={0}
+              inputMode="numeric"
+              placeholder="目标 tokens"
+              onChange={(event) =>
+                onChange({ ...value, targetTokens: toNumber(event.target.value, 0) })
+              }
+            />
+            <Input
+              type="number"
+              value={value.normalMaxMultiplier}
+              min={1}
+              step={0.1}
+              inputMode="decimal"
+              placeholder="最大倍率"
+              onChange={(event) =>
+                onChange({
+                  ...value,
+                  normalMaxMultiplier: toNumber(event.target.value, 1.1),
+                })
+              }
+            />
+          </div>
+        )}
+        {allowMoveDelta && (
+          <ToggleField
+            title="差值计入缓存读取"
+            description="开启后，input_tokens 被压低的差值会加到 cache_read_input_tokens，只改变下游上报外观。"
+            checked={value.moveDeltaToCacheRead}
+            disabled={value.mode === 'preserve'}
+            onCheckedChange={(moveDeltaToCacheRead) =>
+              onChange({ ...value, moveDeltaToCacheRead })
+            }
+          />
+        )}
+      </div>
+    </div>
+  )
+}
+
+interface ReportedUsagePathEditorProps {
+  title: string
+  description: string
+  value: ReportedUsagePathPolicy
+  onDelete?: () => void
+  onChange: (value: ReportedUsagePathPolicy) => void
+}
+
+function ReportedUsagePathEditor({
+  title,
+  description,
+  value,
+  onDelete,
+  onChange,
+}: ReportedUsagePathEditorProps) {
+  return (
+    <div className="rounded-lg border bg-muted/20 p-4">
+      <div className="mb-4 flex items-start justify-between gap-4">
+        <div>
+          <h4 className="text-sm font-semibold">{title}</h4>
+          <p className="mt-1 text-xs leading-5 text-muted-foreground">{description}</p>
+        </div>
+        <div className="flex items-center gap-2">
+          {onDelete && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 text-muted-foreground hover:text-destructive"
+              onClick={onDelete}
+              title="删除这条路径覆盖"
+            >
+              <Trash2 className="h-4 w-4" />
+            </Button>
+          )}
+          <Switch
+            checked={value.enabled}
+            onCheckedChange={(enabled) => onChange({ ...value, enabled })}
+          />
+        </div>
+      </div>
+      <div className="grid gap-4 lg:grid-cols-2">
+        <ReportedUsageFieldEditor
+          title="输入上报"
+          description="控制 input_tokens。常见做法是采样到几十以内，并把差值计入缓存读取。"
+          value={value.input}
+          allowMoveDelta
+          onChange={(input) => onChange({ ...value, input })}
+        />
+        <ReportedUsageFieldEditor
+          title="输出上报"
+          description="控制 output_tokens。默认建议原样上报，避免影响客户端对输出量的判断。"
+          value={value.output}
+          onChange={(output) => onChange({ ...value, output })}
+        />
+        <ReportedUsageFieldEditor
+          title="缓存读取上报"
+          description="控制 cache_read_input_tokens。默认建议原样，通常由输入差值自然增加。"
+          value={value.cacheRead}
+          onChange={(cacheRead) => onChange({ ...value, cacheRead })}
+        />
+        <ReportedUsageFieldEditor
+          title="缓存写入上报"
+          description="控制 cache_creation_input_tokens。/cc 可设置目标值 3000，实际会自然浮动。"
+          value={value.cacheCreation}
+          onChange={(cacheCreation) => onChange({ ...value, cacheCreation })}
+        />
+      </div>
+    </div>
   )
 }
 
@@ -172,6 +396,60 @@ function toScale(value: number): number {
   return Math.min(3, Math.max(1, Number(value.toFixed(2))))
 }
 
+function toMultiplier(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 1.1
+  }
+  return Math.max(1, Number(value.toFixed(2)))
+}
+
+function normalizeFieldPolicy(policy: ReportedUsageFieldPolicy): ReportedUsageFieldPolicy {
+  return {
+    ...policy,
+    maxTokens: toWhole(policy.maxTokens),
+    targetTokens: toWhole(policy.targetTokens),
+    normalMaxMultiplier: toMultiplier(policy.normalMaxMultiplier),
+  }
+}
+
+function normalizePathPolicy(policy: ReportedUsagePathPolicy): ReportedUsagePathPolicy {
+  return {
+    ...policy,
+    input: normalizeFieldPolicy(policy.input),
+    output: normalizeFieldPolicy(policy.output),
+    cacheRead: normalizeFieldPolicy(policy.cacheRead),
+    cacheCreation: normalizeFieldPolicy(policy.cacheCreation),
+  }
+}
+
+function normalizeReportedUsage(config: ReportedUsageConfig): ReportedUsageConfig {
+  const pathOverrides = Object.fromEntries(
+    Object.entries(config.pathOverrides)
+      .map(([prefix, policy]) => {
+        const trimmed = prefix.trim()
+        if (!trimmed) {
+          return null
+        }
+        const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
+        const normalizedPrefix = withSlash.replace(/\/+$/, '') || '/'
+        return [normalizedPrefix, normalizePathPolicy(policy)] as const
+      })
+      .filter((entry): entry is readonly [string, ReportedUsagePathPolicy] => Boolean(entry))
+  )
+  return {
+    default: normalizePathPolicy(config.default),
+    pathOverrides,
+  }
+}
+
+function fieldNeedsMax(policy: ReportedUsageFieldPolicy): boolean {
+  return policy.mode === 'sample-max'
+}
+
+function fieldNeedsTarget(policy: ReportedUsageFieldPolicy): boolean {
+  return policy.mode === 'sample-target'
+}
+
 export function RuntimeConfigPanel() {
   const config = useRuntimeConfig()
   const updateConfig = useUpdateRuntimeConfig()
@@ -187,8 +465,11 @@ export function RuntimeConfigPanel() {
     const next: RuntimeConfig = {
       ...draft,
       credentialRpm: toWhole(draft.credentialRpm),
+      credentialMaxConcurrentRequests: toWhole(draft.credentialMaxConcurrentRequests),
       credentialTransientCooldownSecs: toWhole(draft.credentialTransientCooldownSecs, 1),
       credentialMaxCooldownSecs: toWhole(draft.credentialMaxCooldownSecs, 1),
+      credentialDispatchMaxWaitSecs: toWhole(draft.credentialDispatchMaxWaitSecs),
+      credentialInFlightLeaseMaxSecs: toWhole(draft.credentialInFlightLeaseMaxSecs),
       credentialWarmupRequests: toWhole(draft.credentialWarmupRequests),
       credentialWarmupSelectionPercent: toWhole(draft.credentialWarmupSelectionPercent, 0, 100),
       promptCacheTargetReadRatio: toRatio(draft.promptCacheTargetReadRatio),
@@ -197,10 +478,7 @@ export function RuntimeConfigPanel() {
       promptCacheCapJitterMinTokens: toWhole(draft.promptCacheCapJitterMinTokens),
       promptCacheCapJitterMaxTokens: toWhole(draft.promptCacheCapJitterMaxTokens),
       promptCacheScaleMinInputTokens: toWhole(draft.promptCacheScaleMinInputTokens),
-      ccHighCacheReportedCacheCreationTargetTokens: toWhole(
-        draft.ccHighCacheReportedCacheCreationTargetTokens
-      ),
-      ccHighCacheReportedInputMaxTokens: toWhole(draft.ccHighCacheReportedInputMaxTokens),
+      reportedUsage: normalizeReportedUsage(draft.reportedUsage),
       highCacheThreshold: toWhole(draft.highCacheThreshold),
     }
     if (next.credentialTransientCooldownSecs > next.credentialMaxCooldownSecs) {
@@ -209,10 +487,6 @@ export function RuntimeConfigPanel() {
     }
     if (next.promptCacheCapJitterMinTokens > next.promptCacheCapJitterMaxTokens) {
       toast.error('触顶扣减下限不能大于上限')
-      return
-    }
-    if (next.ccHighCacheReportedCacheCreationTargetTokens > 0 && next.ccHighCacheReportedInputMaxTokens === 0) {
-      toast.error('/cc/v1 未缓存输入上限必须大于 0')
       return
     }
     updateConfig.mutate(next, {
@@ -261,6 +535,16 @@ export function RuntimeConfigPanel() {
               }
             />
             <NumberField
+              title="单凭据最大并发请求数"
+              description="控制同一个凭据同时处理多少个请求。填 0 表示不限制；填 1 表示该凭据一次只跑一个请求，其他请求优先换到别的凭据。"
+              value={draft.credentialMaxConcurrentRequests}
+              min={0}
+              suffix="并发"
+              onChange={(credentialMaxConcurrentRequests) =>
+                setDraft((prev) => ({ ...prev, credentialMaxConcurrentRequests }))
+              }
+            />
+            <NumberField
               title="临时冷却秒数"
               description="当上游返回 429 或临时错误但没有 Retry-After 时，控制该凭据暂停使用多久。"
               value={draft.credentialTransientCooldownSecs}
@@ -278,6 +562,26 @@ export function RuntimeConfigPanel() {
               suffix="秒"
               onChange={(credentialMaxCooldownSecs) =>
                 setDraft((prev) => ({ ...prev, credentialMaxCooldownSecs }))
+              }
+            />
+            <NumberField
+              title="单请求最长排队等待"
+              description="控制请求在所有可用凭据都处于冷却、限速或并发占满时最多等待多久。填 0 表示不限制；建议生产设置为 60 到 180 秒，避免客户端一直挂起。"
+              value={draft.credentialDispatchMaxWaitSecs}
+              min={0}
+              suffix="秒"
+              onChange={(credentialDispatchMaxWaitSecs) =>
+                setDraft((prev) => ({ ...prev, credentialDispatchMaxWaitSecs }))
+              }
+            />
+            <NumberField
+              title="异常并发自动回收"
+              description="控制单个并发占用超过多久未活跃时自动释放。填 0 表示关闭；建议大于正常长请求耗时，避免异常路径把账号永久占满。"
+              value={draft.credentialInFlightLeaseMaxSecs}
+              min={0}
+              suffix="秒"
+              onChange={(credentialInFlightLeaseMaxSecs) =>
+                setDraft((prev) => ({ ...prev, credentialInFlightLeaseMaxSecs }))
               }
             />
           </ConfigSection>
@@ -407,29 +711,105 @@ export function RuntimeConfigPanel() {
 
           <ConfigSection
             icon={<BadgeInfo className="h-4 w-4" />}
-            title="/cc/v1 与 /ha/v1 下游上报"
-            description="控制特殊 high-cache 路径对下游返回的缓存 usage 外观。底层本地 reader 计算仍与 /v1 一致；/cc/v1 会同时改写 writer 和未缓存 input，/ha/v1 只改写未缓存 input。"
+            title="路径级 Usage 上报"
+            description="每个路径前缀都是独立覆盖项：先使用默认策略，再按最长匹配的路径前缀覆盖。这里只改变下游响应和后台 usage 记录，不影响本地 reader 计算、缓存 tracker 或上游请求。"
           >
-            <NumberField
-              title="写缓存上报目标"
-              description="控制 /cc/v1 有缓存时 cache_creation_input_tokens 的常规目标值。实际会在 0 到目标值约 110% 内自然浮动。填 0 表示关闭这项 /cc writer 改写；/ha/v1 不使用这个 writer 改写。"
-              value={draft.ccHighCacheReportedCacheCreationTargetTokens}
-              min={0}
-              suffix="tokens"
-              onChange={(ccHighCacheReportedCacheCreationTargetTokens) =>
-                setDraft((prev) => ({ ...prev, ccHighCacheReportedCacheCreationTargetTokens }))
-              }
-            />
-            <NumberField
-              title="未缓存输入上限"
-              description="控制 /cc/v1 和 /ha/v1 有缓存时 input_tokens 的上限，通常保持几十以内；被压低的那部分会归入 cache_read_input_tokens。"
-              value={draft.ccHighCacheReportedInputMaxTokens}
-              min={0}
-              suffix="tokens"
-              onChange={(ccHighCacheReportedInputMaxTokens) =>
-                setDraft((prev) => ({ ...prev, ccHighCacheReportedInputMaxTokens }))
-              }
-            />
+            <div className="md:col-span-2 space-y-4">
+              <ReportedUsagePathEditor
+                title="默认策略"
+                description="所有路径都会先使用这份策略。默认原样上报，适合 /v1。"
+                value={draft.reportedUsage.default}
+                onChange={(defaultPolicy) =>
+                  setDraft((prev) => ({
+                    ...prev,
+                    reportedUsage: { ...prev.reportedUsage, default: defaultPolicy },
+                  }))
+                }
+              />
+              {Object.entries(draft.reportedUsage.pathOverrides).map(([prefix, policy]) => (
+                <div key={prefix} className="space-y-3">
+                  <label className="block rounded-md border bg-background p-4">
+                    <div className="mb-3">
+                      <div className="text-sm font-medium">路径前缀</div>
+                      <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                        当前前缀只控制它自己匹配到的路径。例如 /cc、/ha、/na 互相独立，后续可以分别改 input、output、cache read、cache write。
+                      </div>
+                    </div>
+                    <Input
+                      value={prefix}
+                      onChange={(event) => {
+                        const nextPrefix = event.target.value
+                        setDraft((prev) => {
+                          const pathOverrides = { ...prev.reportedUsage.pathOverrides }
+                          delete pathOverrides[prefix]
+                          pathOverrides[nextPrefix] = policy
+                          return {
+                            ...prev,
+                            reportedUsage: { ...prev.reportedUsage, pathOverrides },
+                          }
+                        })
+                      }}
+                    />
+                  </label>
+                  <ReportedUsagePathEditor
+                    title={`${prefix || '/'} 覆盖策略`}
+                    description="只覆盖这个路径前缀匹配到的请求。关闭后该路径前缀不会用本地模拟补足 cache usage，只保留真实上游 cache usage。"
+                    value={policy}
+                    onDelete={() =>
+                      setDraft((prev) => {
+                        const pathOverrides = { ...prev.reportedUsage.pathOverrides }
+                        delete pathOverrides[prefix]
+                        return {
+                          ...prev,
+                          reportedUsage: { ...prev.reportedUsage, pathOverrides },
+                        }
+                      })
+                    }
+                    onChange={(nextPolicy) =>
+                      setDraft((prev) => ({
+                        ...prev,
+                        reportedUsage: {
+                          ...prev.reportedUsage,
+                          pathOverrides: {
+                            ...prev.reportedUsage.pathOverrides,
+                            [prefix]: nextPolicy,
+                          },
+                        },
+                      }))
+                    }
+                  />
+                </div>
+              ))}
+              <div className="flex justify-end">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() =>
+                    setDraft((prev) => {
+                      const base = '/new'
+                      let index = 1
+                      let prefix = base
+                      while (prev.reportedUsage.pathOverrides[prefix]) {
+                        index += 1
+                        prefix = `${base}-${index}`
+                      }
+                      return {
+                        ...prev,
+                        reportedUsage: {
+                          ...prev.reportedUsage,
+                          pathOverrides: {
+                            ...prev.reportedUsage.pathOverrides,
+                            [prefix]: pathPolicy(),
+                          },
+                        },
+                      }
+                    })
+                  }
+                >
+                  添加路径覆盖
+                </Button>
+              </div>
+            </div>
           </ConfigSection>
 
           <ConfigSection

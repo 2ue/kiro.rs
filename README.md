@@ -193,8 +193,11 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `credentialRpm` | number/null | `null` | 单凭据本地 RPM 限速；`null` 或 `0` 表示关闭。开启后会优先分流到其他可用凭据 |
+| `credentialMaxConcurrentRequests` | number | `0` | 单凭据最大并发请求数；`0` 表示不限制。开启后同一凭据达到并发上限时，新请求会优先换其他可用凭据 |
 | `credentialTransientCooldownSecs` | number | `10` | 上游 408/429/5xx 且没有 Retry-After 时的凭据临时冷却秒数；只有存在其他可用凭据时才冷却当前凭据 |
 | `credentialMaxCooldownSecs` | number | `300` | 单凭据临时冷却上限，用于限制 Retry-After 的影响范围 |
+| `credentialDispatchMaxWaitSecs` | number | `120` | 单个请求等待凭据可调度的最长秒数；`0` 表示不限制。超时后返回本地调度限流错误，避免请求长期挂起 |
+| `credentialInFlightLeaseMaxSecs` | number | `900` | 单个并发占用超过多久未活跃时自动释放；`0` 表示关闭。用于兜底异常路径导致的并发槽长期占用 |
 | `credentialWarmupRequests` | number | `3` | 新增凭据默认预热次数；预热只通过真实业务请求成功递减，不伪造 success_count |
 | `credentialWarmupSelectionPercent` | number | `5` | balanced 模式下预热凭据参与真实业务请求调度的概率百分比 |
 | `credentialsPersist` | boolean | `true` | 是否持久化凭据文件变更（刷新 Token、禁用、优先级等） |
@@ -203,14 +206,14 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `compression.whitespaceCompression` | boolean | `true` | 启用 compression 后是否只做 JSON whitespace 压缩；默认只开启该低风险压缩 |
 | `compatProfile` | string | `claude-code` | 兼容 profile：`claude-code` 优先真实 Claude Code CLI 可用性；`anthropic-strict` 减少代理改写和调试特征；`debug` 等同 `claude-code` 但默认暴露代理 warning |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
-| `promptCacheTargetReadRatio` | number | `0.98` | `/v1/messages` 与 `/cc/v1/messages` high-cache 的目标 cache read 中心比例；`/na/v1/messages` 不使用本地缓存模拟 |
-| `promptCacheTokenScale` | number | `1.6` | `/v1/messages` 与 `/cc/v1/messages` high-cache 模拟专用的 total input 放大倍数，只影响本地模拟 cache usage |
-| `promptCacheMaxSimulatedInputTokens` | number | `300000` | `/v1/messages` 与 `/cc/v1/messages` high-cache 模拟 total input 的上限；触顶时会做确定性 soft-cap 抖动 |
+| `promptCacheTargetReadRatio` | number | `0.98` | `/v1/messages`、`/cc/v1/messages`、`/ha/v1/messages`、`/na/v1/messages` high-cache 的目标 cache read 中心比例；`/na` 默认只保留真实上游 cache usage，不用本地模拟补足 cache usage |
+| `promptCacheTokenScale` | number | `1.6` | `/v1/messages`、`/cc/v1/messages`、`/ha/v1/messages`、`/na/v1/messages` high-cache 模拟专用的 total input 放大倍数，只影响本地模拟 cache usage |
+| `promptCacheMaxSimulatedInputTokens` | number | `300000` | `/v1/messages`、`/cc/v1/messages`、`/ha/v1/messages`、`/na/v1/messages` high-cache 模拟 total input 的上限；触顶时会做确定性 soft-cap 抖动 |
 | `promptCacheCapJitterMinTokens` | number | `12000` | high-cache 触顶 soft-cap 的最小扣减 token |
 | `promptCacheCapJitterMaxTokens` | number | `24000` | high-cache 触顶 soft-cap 的最大扣减 token |
 | `promptCacheScaleMinInputTokens` | number | `20000` | 基础输入达到该门槛后才启用 high-cache token scale，避免短测试请求被放大 |
-| `ccHighCacheReportedCacheCreationTargetTokens` | number | `3000` | 仅改写 `/cc/v1/messages` high-cache 对下游上报的 cache write，通常按概率分布落在 0 到目标值 110% 之间；不影响 reader 计算、本地缓存 tracker 或 `/v1/messages` 上报 |
-| `ccHighCacheReportedInputMaxTokens` | number | `96` | 仅改写 `/cc/v1/messages` high-cache 对下游上报的 uncached input；有缓存 usage 时将 `input_tokens` 采样到该上限内，并只把减少的 input 差额归入 `cache_read_input_tokens` |
+| `reportedUsage.default` | object | 原样上报 | 控制所有路径的默认 usage 上报方式，只影响响应和后台 usage record，不影响 reader 计算、本地缓存 tracker 或上游请求 |
+| `reportedUsage.pathOverrides` | object | `/na`、`/cc`、`/ha` | 按路径前缀独立覆盖默认 usage 上报策略，最长前缀优先；例如 `/cc` 会匹配 `/cc/v1/messages`，`/ha` 和 `/na` 不会继承 `/cc` 的 writer 配置 |
 | `usageRecordLimit` | number | `5000` | Admin usage record 内存保留上限 |
 | `usageRecordPersist` | boolean | `true` | 是否将 usage record 追加写入 `kiro_usage_records.jsonl` |
 | `highCacheThreshold` | number | `10000` | Admin 统计高缓存请求的 cache read 阈值 |
@@ -241,8 +244,11 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
    "adminApiKey": "sk-admin-your-secret-key",
    "loadBalancingMode": "priority",
    "credentialRpm": null,
+   "credentialMaxConcurrentRequests": 0,
    "credentialTransientCooldownSecs": 10,
    "credentialMaxCooldownSecs": 300,
+   "credentialDispatchMaxWaitSecs": 120,
+   "credentialInFlightLeaseMaxSecs": 900,
    "credentialWarmupRequests": 3,
    "credentialWarmupSelectionPercent": 5,
    "credentialsPersist": true,
@@ -259,8 +265,41 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
    "promptCacheCapJitterMinTokens": 12000,
    "promptCacheCapJitterMaxTokens": 24000,
    "promptCacheScaleMinInputTokens": 20000,
-   "ccHighCacheReportedCacheCreationTargetTokens": 3000,
-   "ccHighCacheReportedInputMaxTokens": 96,
+   "reportedUsage": {
+      "default": {
+         "enabled": true,
+         "input": { "mode": "preserve" },
+         "output": { "mode": "preserve" },
+         "cacheRead": { "mode": "preserve" },
+         "cacheCreation": { "mode": "preserve" }
+      },
+      "pathOverrides": {
+         "/na": {
+            "enabled": false
+         },
+         "/cc": {
+            "enabled": true,
+            "input": {
+               "mode": "sample-max",
+               "maxTokens": 96,
+               "moveDeltaToCacheRead": true
+            },
+            "cacheCreation": {
+               "mode": "sample-target",
+               "targetTokens": 3000,
+               "normalMaxMultiplier": 1.1
+            }
+         },
+         "/ha": {
+            "enabled": true,
+            "input": {
+               "mode": "sample-max",
+               "maxTokens": 96,
+               "moveDeltaToCacheRead": true
+            }
+         }
+      }
+   },
    "usageRecordLimit": 5000,
    "usageRecordPersist": true,
    "highCacheThreshold": 10000,
@@ -272,8 +311,16 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 缓存模式由路径固定选择：
 
 - `/v1/messages`：high-cache。即使请求没有显式 `cache_control`，也会按稳定前缀建立本地缓存；如果上游 metadata 返回的 cache read/write 都是 0，会用本地缓存 usage 补足 cache 字段。
-- `/cc/v1/messages`：high-cache，与 `/v1/messages` 使用同一套底层缓存模拟；额外使用 `ccHighCacheReportedCacheCreationTargetTokens` 和 `ccHighCacheReportedInputMaxTokens` 改写下游上报。
-- `/na/v1/messages`：no-cache，不做本地 prompt-cache usage 模拟。
+- `/cc/v1/messages`：high-cache，与 `/v1/messages` 使用同一套底层缓存模拟；默认只通过 `reportedUsage.pathOverrides["/cc"]` 改写下游 input 和 cache write 上报。
+- `/ha/v1/messages`：high-cache，与 `/v1/messages` 使用同一套底层缓存模拟；默认只通过 `reportedUsage.pathOverrides["/ha"]` 改写下游 input 上报。后续如果要改 writer，需要单独改 `/ha` 覆盖项。
+- `/na/v1/messages`：high-cache 路由；`reportedUsage.pathOverrides["/na"]` 默认关闭本地模拟 cache usage 补足，只保留真实上游 cache usage。
+
+路径级 usage 上报策略支持这些字段：
+
+- `input`：控制 `input_tokens`。使用 `sample-max` 时会采样到 `maxTokens` 以内；`moveDeltaToCacheRead` 为 true 时，减少的 input 差值会加入 `cache_read_input_tokens`。
+- `output`：控制 `output_tokens`。默认建议 `preserve`。
+- `cacheRead`：控制 `cache_read_input_tokens`。默认建议 `preserve`。
+- `cacheCreation`：控制 `cache_creation_input_tokens`。`/cc` 默认使用 `sample-target`，`targetTokens` 为 `3000`，`normalMaxMultiplier` 为 `1.1`。
 
 旧配置字段 `promptCacheSimulationMode` 已无运行时效果，会在读取时被忽略，也不会再写入示例配置。
 
@@ -447,12 +494,12 @@ Admin UI 本地开发时还可以用 `VITE_API_PROXY_TARGET` 覆盖 Vite 代理�
 | `/v1/messages` | POST | 创建消息（对话，固定 high-cache 本地 usage 模拟） |
 | `/v1/messages/count_tokens` | POST | 估算 Token 数量 |
 
-### 无缓存模拟端点 (/na/v1)
+### 真实 Cache Usage 上报端点 (/na/v1)
 
 | 端点 | 方法 | 描述 |
 |------|------|------|
 | `/na/v1/models` | GET | 获取可用模型列表 |
-| `/na/v1/messages` | POST | 创建消息（对话，固定关闭本地 prompt-cache usage 模拟） |
+| `/na/v1/messages` | POST | 创建消息（对话；底层 high-cache 计算保持开启，默认只上报真实上游 cache usage） |
 | `/na/v1/messages/count_tokens` | POST | 估算 Token 数量 |
 
 ### Claude Code 兼容端点 (/cc/v1)
