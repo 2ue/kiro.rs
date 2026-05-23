@@ -745,6 +745,21 @@ impl MultiTokenManager {
         persisted.credential_warmup_requests = updated.credential_warmup_requests;
         persisted.credential_warmup_selection_percent = updated.credential_warmup_selection_percent;
         persisted.compression = updated.compression.clone();
+        persisted.prompt_cache_target_read_ratio = updated.prompt_cache_target_read_ratio;
+        persisted.prompt_cache_token_scale = updated.prompt_cache_token_scale;
+        persisted.prompt_cache_max_simulated_input_tokens =
+            updated.prompt_cache_max_simulated_input_tokens;
+        persisted.prompt_cache_cap_jitter_min_tokens = updated.prompt_cache_cap_jitter_min_tokens;
+        persisted.prompt_cache_cap_jitter_max_tokens = updated.prompt_cache_cap_jitter_max_tokens;
+        persisted.prompt_cache_scale_min_input_tokens = updated.prompt_cache_scale_min_input_tokens;
+        persisted.cc_high_cache_reported_cache_creation_target_tokens =
+            updated.cc_high_cache_reported_cache_creation_target_tokens;
+        persisted.cc_high_cache_reported_input_max_tokens =
+            updated.cc_high_cache_reported_input_max_tokens;
+        persisted.high_cache_threshold = updated.high_cache_threshold;
+        persisted.compat_profile = updated.compat_profile;
+        persisted.extract_thinking = updated.extract_thinking;
+        persisted.expose_proxy_warnings = updated.expose_proxy_warnings;
         persisted
             .save()
             .with_context(|| format!("持久化运行时配置失败: {}", config_path.display()))?;

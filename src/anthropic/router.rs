@@ -13,7 +13,10 @@ use crate::kiro::provider::KiroProvider;
 use crate::model::config::{CompatProfile, PromptCacheSimulationMode};
 
 use super::{
-    handlers::{count_tokens, get_models, post_messages, post_messages_cc, post_messages_no_cache},
+    handlers::{
+        count_tokens, get_models, post_messages, post_messages_cc, post_messages_ha,
+        post_messages_no_cache,
+    },
     middleware::{AppState, auth_middleware, cors_layer},
     pricing::PricingCatalog,
     prompt_cache::PromptCacheTracker,
@@ -32,6 +35,9 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// - `GET /na/v1/models` - 获取可用模型列表（无本地 prompt-cache usage 模拟）
 /// - `POST /na/v1/messages` - 创建消息（无本地 prompt-cache usage 模拟）
 /// - `POST /na/v1/messages/count_tokens` - 计算 token 数量
+/// - `GET /ha/v1/models` - 获取可用模型列表（high-cache，压低 input 上报）
+/// - `POST /ha/v1/messages` - 创建消息（high-cache，压低 input 上报）
+/// - `POST /ha/v1/messages/count_tokens` - 计算 token 数量
 ///
 /// # 认证
 /// 所有 `/v1` 路径需要 API Key 认证，支持：
@@ -88,7 +94,7 @@ pub fn create_router_with_provider(
         base_state = base_state.with_kiro_provider(provider);
     }
 
-    let (v1_state, na_v1_state, cc_v1_state) = route_prompt_cache_states(base_state);
+    let (v1_state, na_v1_state, cc_v1_state, ha_v1_state) = route_prompt_cache_states(base_state);
 
     // 需要认证的 /v1 路由（默认 high-cache）
     let v1_routes = Router::new()
@@ -124,15 +130,27 @@ pub fn create_router_with_provider(
         ))
         .with_state(cc_v1_state);
 
+    // 需要认证的 /ha/v1 路由（high-cache；input 上报采用 /cc/v1 的压低策略，writer 不改写）
+    let ha_v1_routes = Router::new()
+        .route("/models", get(get_models))
+        .route("/messages", post(post_messages_ha))
+        .route("/messages/count_tokens", post(count_tokens))
+        .layer(middleware::from_fn_with_state(
+            ha_v1_state.clone(),
+            auth_middleware,
+        ))
+        .with_state(ha_v1_state);
+
     Router::new()
         .nest("/v1", v1_routes)
         .nest("/na/v1", na_v1_routes)
         .nest("/cc/v1", cc_v1_routes)
+        .nest("/ha/v1", ha_v1_routes)
         .layer(cors_layer())
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
 }
 
-fn route_prompt_cache_states(base_state: AppState) -> (AppState, AppState, AppState) {
+fn route_prompt_cache_states(base_state: AppState) -> (AppState, AppState, AppState, AppState) {
     (
         base_state
             .clone()
@@ -140,6 +158,9 @@ fn route_prompt_cache_states(base_state: AppState) -> (AppState, AppState, AppSt
         base_state
             .clone()
             .with_prompt_cache_simulation_mode(PromptCacheSimulationMode::Disabled),
+        base_state
+            .clone()
+            .with_prompt_cache_simulation_mode(PromptCacheSimulationMode::HighCache),
         base_state.with_prompt_cache_simulation_mode(PromptCacheSimulationMode::HighCache),
     )
 }
@@ -162,12 +183,12 @@ mod tests {
     }
 
     #[test]
-    fn route_prompt_cache_states_force_v1_and_cc_high_cache_and_na_disabled() {
+    fn route_prompt_cache_states_force_v1_cc_ha_high_cache_and_na_disabled() {
         for base_mode in [
             PromptCacheSimulationMode::Disabled,
             PromptCacheSimulationMode::HighCache,
         ] {
-            let (v1_state, na_v1_state, cc_v1_state) =
+            let (v1_state, na_v1_state, cc_v1_state, ha_v1_state) =
                 route_prompt_cache_states(base_state(base_mode));
 
             assert_eq!(
@@ -182,6 +203,10 @@ mod tests {
                 cc_v1_state.prompt_cache_simulation_mode,
                 PromptCacheSimulationMode::HighCache
             );
+            assert_eq!(
+                ha_v1_state.prompt_cache_simulation_mode,
+                PromptCacheSimulationMode::HighCache
+            );
             assert!(Arc::ptr_eq(
                 &v1_state.prompt_cache,
                 &na_v1_state.prompt_cache
@@ -189,6 +214,10 @@ mod tests {
             assert!(Arc::ptr_eq(
                 &v1_state.prompt_cache,
                 &cc_v1_state.prompt_cache
+            ));
+            assert!(Arc::ptr_eq(
+                &v1_state.prompt_cache,
+                &ha_v1_state.prompt_cache
             ));
         }
     }

@@ -66,7 +66,6 @@ pub struct AdminService {
     usage_recorder: Arc<UsageRecorder>,
     prompt_cache: Arc<PromptCacheTracker>,
     pricing_catalog: Arc<PricingCatalog>,
-    high_cache_threshold: i32,
     kiro_provider: Arc<KiroProvider>,
 }
 
@@ -77,7 +76,6 @@ impl AdminService {
         usage_recorder: Arc<UsageRecorder>,
         prompt_cache: Arc<PromptCacheTracker>,
         pricing_catalog: Arc<PricingCatalog>,
-        high_cache_threshold: i32,
         kiro_provider: Arc<KiroProvider>,
     ) -> Self {
         let cache_path = token_manager
@@ -94,7 +92,6 @@ impl AdminService {
             usage_recorder,
             prompt_cache,
             pricing_catalog,
-            high_cache_threshold,
             kiro_provider,
         }
     }
@@ -454,7 +451,8 @@ impl AdminService {
 
     /// 获取 usage 汇总。
     pub fn get_usage_summary(&self) -> UsageSummary {
-        self.usage_recorder.summary(self.high_cache_threshold)
+        let high_cache_threshold = self.token_manager.runtime_config().high_cache_threshold;
+        self.usage_recorder.summary(high_cache_threshold)
     }
 
     /// 获取模型价格同步状态。
@@ -521,6 +519,19 @@ impl AdminService {
             credential_warmup_selection_percent: config.credential_warmup_selection_percent,
             compression_enabled: config.compression.enabled,
             whitespace_compression: config.compression.whitespace_compression,
+            prompt_cache_target_read_ratio: config.prompt_cache_target_read_ratio,
+            prompt_cache_token_scale: config.prompt_cache_token_scale,
+            prompt_cache_max_simulated_input_tokens: config.prompt_cache_max_simulated_input_tokens,
+            prompt_cache_cap_jitter_min_tokens: config.prompt_cache_cap_jitter_min_tokens,
+            prompt_cache_cap_jitter_max_tokens: config.prompt_cache_cap_jitter_max_tokens,
+            prompt_cache_scale_min_input_tokens: config.prompt_cache_scale_min_input_tokens,
+            cc_high_cache_reported_cache_creation_target_tokens: config
+                .cc_high_cache_reported_cache_creation_target_tokens,
+            cc_high_cache_reported_input_max_tokens: config.cc_high_cache_reported_input_max_tokens,
+            high_cache_threshold: config.high_cache_threshold,
+            compat_profile: config.compat_profile,
+            extract_thinking: config.extract_thinking,
+            expose_proxy_warnings: config.expose_proxy_warnings,
         }
     }
 
@@ -533,6 +544,40 @@ impl AdminService {
         let warmup_selection_percent = req
             .credential_warmup_selection_percent
             .unwrap_or(current_config.credential_warmup_selection_percent);
+        let prompt_cache_target_read_ratio = req
+            .prompt_cache_target_read_ratio
+            .unwrap_or(current_config.prompt_cache_target_read_ratio);
+        let prompt_cache_token_scale = req
+            .prompt_cache_token_scale
+            .unwrap_or(current_config.prompt_cache_token_scale);
+        let prompt_cache_max_simulated_input_tokens = req
+            .prompt_cache_max_simulated_input_tokens
+            .unwrap_or(current_config.prompt_cache_max_simulated_input_tokens);
+        let prompt_cache_cap_jitter_min_tokens = req
+            .prompt_cache_cap_jitter_min_tokens
+            .unwrap_or(current_config.prompt_cache_cap_jitter_min_tokens);
+        let prompt_cache_cap_jitter_max_tokens = req
+            .prompt_cache_cap_jitter_max_tokens
+            .unwrap_or(current_config.prompt_cache_cap_jitter_max_tokens);
+        let prompt_cache_scale_min_input_tokens = req
+            .prompt_cache_scale_min_input_tokens
+            .unwrap_or(current_config.prompt_cache_scale_min_input_tokens);
+        let cc_high_cache_reported_cache_creation_target_tokens = req
+            .cc_high_cache_reported_cache_creation_target_tokens
+            .unwrap_or(current_config.cc_high_cache_reported_cache_creation_target_tokens);
+        let cc_high_cache_reported_input_max_tokens = req
+            .cc_high_cache_reported_input_max_tokens
+            .unwrap_or(current_config.cc_high_cache_reported_input_max_tokens);
+        let high_cache_threshold = req
+            .high_cache_threshold
+            .unwrap_or(current_config.high_cache_threshold);
+        let compat_profile = req.compat_profile.unwrap_or(current_config.compat_profile);
+        let extract_thinking = req
+            .extract_thinking
+            .unwrap_or(current_config.extract_thinking);
+        let expose_proxy_warnings = req
+            .expose_proxy_warnings
+            .unwrap_or(current_config.expose_proxy_warnings);
 
         if req.credential_max_cooldown_secs == 0 {
             return Err(AdminServiceError::InvalidCredential(
@@ -549,6 +594,55 @@ impl AdminService {
                 "credentialWarmupSelectionPercent 不能大于 100".to_string(),
             ));
         }
+        if !(0.0..=0.99).contains(&prompt_cache_target_read_ratio)
+            || !prompt_cache_target_read_ratio.is_finite()
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "promptCacheTargetReadRatio 必须在 0 到 0.99 之间".to_string(),
+            ));
+        }
+        if !(1.0..=3.0).contains(&prompt_cache_token_scale) || !prompt_cache_token_scale.is_finite()
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "promptCacheTokenScale 必须在 1 到 3 之间".to_string(),
+            ));
+        }
+        if prompt_cache_max_simulated_input_tokens < 0 {
+            return Err(AdminServiceError::InvalidCredential(
+                "promptCacheMaxSimulatedInputTokens 不能小于 0".to_string(),
+            ));
+        }
+        if prompt_cache_cap_jitter_min_tokens < 0 || prompt_cache_cap_jitter_max_tokens < 0 {
+            return Err(AdminServiceError::InvalidCredential(
+                "promptCacheCapJitterMinTokens 和 promptCacheCapJitterMaxTokens 不能小于 0"
+                    .to_string(),
+            ));
+        }
+        if prompt_cache_cap_jitter_min_tokens > prompt_cache_cap_jitter_max_tokens {
+            return Err(AdminServiceError::InvalidCredential(
+                "promptCacheCapJitterMinTokens 不能大于 promptCacheCapJitterMaxTokens".to_string(),
+            ));
+        }
+        if prompt_cache_scale_min_input_tokens < 0 {
+            return Err(AdminServiceError::InvalidCredential(
+                "promptCacheScaleMinInputTokens 不能小于 0".to_string(),
+            ));
+        }
+        if cc_high_cache_reported_cache_creation_target_tokens < 0 {
+            return Err(AdminServiceError::InvalidCredential(
+                "ccHighCacheReportedCacheCreationTargetTokens 不能小于 0".to_string(),
+            ));
+        }
+        if cc_high_cache_reported_input_max_tokens < 0 {
+            return Err(AdminServiceError::InvalidCredential(
+                "ccHighCacheReportedInputMaxTokens 不能小于 0".to_string(),
+            ));
+        }
+        if high_cache_threshold < 0 {
+            return Err(AdminServiceError::InvalidCredential(
+                "highCacheThreshold 不能小于 0".to_string(),
+            ));
+        }
 
         let credential_rpm = (req.credential_rpm > 0).then_some(req.credential_rpm);
         let compression = req.compression();
@@ -561,6 +655,21 @@ impl AdminService {
                 config.credential_warmup_requests = req.credential_warmup_requests;
                 config.credential_warmup_selection_percent = warmup_selection_percent;
                 config.compression = compression.clone();
+                config.prompt_cache_target_read_ratio = prompt_cache_target_read_ratio;
+                config.prompt_cache_token_scale = prompt_cache_token_scale;
+                config.prompt_cache_max_simulated_input_tokens =
+                    prompt_cache_max_simulated_input_tokens;
+                config.prompt_cache_cap_jitter_min_tokens = prompt_cache_cap_jitter_min_tokens;
+                config.prompt_cache_cap_jitter_max_tokens = prompt_cache_cap_jitter_max_tokens;
+                config.prompt_cache_scale_min_input_tokens = prompt_cache_scale_min_input_tokens;
+                config.cc_high_cache_reported_cache_creation_target_tokens =
+                    cc_high_cache_reported_cache_creation_target_tokens;
+                config.cc_high_cache_reported_input_max_tokens =
+                    cc_high_cache_reported_input_max_tokens;
+                config.high_cache_threshold = high_cache_threshold;
+                config.compat_profile = compat_profile;
+                config.extract_thinking = extract_thinking;
+                config.expose_proxy_warnings = expose_proxy_warnings;
             })
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 

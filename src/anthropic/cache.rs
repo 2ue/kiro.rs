@@ -60,7 +60,10 @@ impl CacheUsage {
             return self;
         }
 
-        let mut usage = self.with_reported_cache_creation_fields(policy.creation_policy());
+        let mut usage = policy
+            .creation_policy()
+            .map(|creation_policy| self.with_reported_cache_creation_fields(creation_policy))
+            .unwrap_or(self);
         let current_input = self.input_tokens.max(0);
         if current_input <= 0 {
             return usage;
@@ -208,7 +211,7 @@ impl ReportedCacheCreationPolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReportedCacheUsagePolicy {
-    creation_target_tokens: i32,
+    creation_target_tokens: Option<i32>,
     uncached_input_max_tokens: i32,
     seed: u64,
 }
@@ -222,17 +225,27 @@ impl ReportedCacheUsagePolicy {
         let creation_target_tokens = creation_target_tokens.max(0);
         let uncached_input_max_tokens = uncached_input_max_tokens.max(0);
         (creation_target_tokens > 0 && uncached_input_max_tokens > 0).then_some(Self {
-            creation_target_tokens,
+            creation_target_tokens: Some(creation_target_tokens),
             uncached_input_max_tokens,
             seed,
         })
     }
 
-    fn creation_policy(self) -> ReportedCacheCreationPolicy {
-        ReportedCacheCreationPolicy {
-            target_tokens: self.creation_target_tokens,
-            seed: self.seed,
-        }
+    pub fn input_only(uncached_input_max_tokens: i32, seed: u64) -> Option<Self> {
+        let uncached_input_max_tokens = uncached_input_max_tokens.max(0);
+        (uncached_input_max_tokens > 0).then_some(Self {
+            creation_target_tokens: None,
+            uncached_input_max_tokens,
+            seed,
+        })
+    }
+
+    fn creation_policy(self) -> Option<ReportedCacheCreationPolicy> {
+        self.creation_target_tokens
+            .map(|target_tokens| ReportedCacheCreationPolicy {
+                target_tokens,
+                seed: self.seed,
+            })
     }
 
     fn sample_uncached_input(self, usage: CacheUsage) -> i32 {
@@ -256,7 +269,7 @@ impl ReportedCacheUsagePolicy {
     fn random_for_usage(self, usage: CacheUsage) -> u64 {
         let mut state = self.seed ^ 0x69b2_3f0a_9c7d_f1e5;
         for value in [
-            self.creation_target_tokens,
+            self.creation_target_tokens.unwrap_or(0),
             self.uncached_input_max_tokens,
             usage.total_input_tokens,
             usage.input_tokens,
@@ -1026,6 +1039,31 @@ mod tests {
             usage.input_tokens.saturating_sub(reported.input_tokens)
         );
         assert!(reported.cache_read_input_tokens < 80_000);
+    }
+
+    #[test]
+    fn input_only_reported_usage_policy_preserves_writer() {
+        let usage = CacheUsage {
+            total_input_tokens: 120_000,
+            input_tokens: 80_000,
+            output_tokens: 9,
+            cache_creation_input_tokens: 40_000,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 30_000,
+            cache_creation_1h_input_tokens: 10_000,
+        };
+        let policy = ReportedCacheUsagePolicy::input_only(96, 29).unwrap();
+
+        let reported = usage.with_reported_cache_usage_policy(policy);
+
+        assert_eq!(reported.cache_creation_input_tokens, 40_000);
+        assert_eq!(reported.cache_creation_5m_input_tokens, 30_000);
+        assert_eq!(reported.cache_creation_1h_input_tokens, 10_000);
+        assert!((1..=96).contains(&reported.input_tokens));
+        assert_eq!(
+            reported.cache_read_input_tokens,
+            usage.input_tokens.saturating_sub(reported.input_tokens)
+        );
     }
 
     #[test]

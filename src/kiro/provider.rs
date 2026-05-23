@@ -21,7 +21,7 @@ use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
-use crate::model::config::TlsBackend;
+use crate::model::config::{Config, TlsBackend};
 use parking_lot::Mutex;
 
 /// 每个凭据的最大重试次数
@@ -320,6 +320,11 @@ impl KiroProvider {
                     .endpoint
                     .map(|endpoint| format!("#{} {}", id, endpoint)))
             })
+    }
+
+    /// 获取当前运行时配置快照。
+    pub fn runtime_config(&self) -> Config {
+        self.token_manager.runtime_config()
     }
 
     fn credential_log_label(&self, id: u64) -> String {

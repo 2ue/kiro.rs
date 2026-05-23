@@ -236,7 +236,6 @@ async fn main() {
                 usage_recorder.clone(),
                 prompt_cache.clone(),
                 pricing_catalog.clone(),
-                config.high_cache_threshold,
                 kiro_provider.clone(),
             );
             let admin_state = admin::AdminState::new(admin_key, admin_service);
@@ -266,6 +265,9 @@ async fn main() {
     tracing::info!("  GET  /na/v1/models");
     tracing::info!("  POST /na/v1/messages (no-cache)");
     tracing::info!("  POST /na/v1/messages/count_tokens");
+    tracing::info!("  GET  /ha/v1/models");
+    tracing::info!("  POST /ha/v1/messages (high-cache input-compatible)");
+    tracing::info!("  POST /ha/v1/messages/count_tokens");
     tracing::info!("  GET  /cc/v1/models");
     tracing::info!("  POST /cc/v1/messages");
     tracing::info!("  POST /cc/v1/messages/count_tokens");

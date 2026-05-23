@@ -232,6 +232,8 @@ export interface UsageRecordsPageQuery extends UsageRecordsQuery {
   limit: number
 }
 
+export type CompatProfile = 'claude-code' | 'anthropic-strict' | 'debug'
+
 export interface RuntimeConfig {
   credentialRpm: number
   credentialTransientCooldownSecs: number
@@ -240,6 +242,18 @@ export interface RuntimeConfig {
   credentialWarmupSelectionPercent: number
   compressionEnabled: boolean
   whitespaceCompression: boolean
+  promptCacheTargetReadRatio: number
+  promptCacheTokenScale: number
+  promptCacheMaxSimulatedInputTokens: number
+  promptCacheCapJitterMinTokens: number
+  promptCacheCapJitterMaxTokens: number
+  promptCacheScaleMinInputTokens: number
+  ccHighCacheReportedCacheCreationTargetTokens: number
+  ccHighCacheReportedInputMaxTokens: number
+  highCacheThreshold: number
+  compatProfile: CompatProfile
+  extractThinking: boolean
+  exposeProxyWarnings: boolean
 }
 
 export type UpdateRuntimeConfigRequest = RuntimeConfig

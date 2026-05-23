@@ -12,7 +12,7 @@ use std::{
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
-use crate::model::config::{CompatProfile, PromptCacheSimulationMode};
+use crate::model::config::{CompatProfile, Config, PromptCacheSimulationMode};
 use crate::token;
 use anyhow::Error;
 use axum::{
@@ -46,7 +46,7 @@ use super::types::{
 };
 use super::usage::{UsageRecord, UsageRecordStatus, UsageSource};
 use super::websearch;
-use crate::kiro::provider::KiroStreamCompletion;
+use crate::kiro::provider::{KiroProvider, KiroStreamCompletion};
 
 const MAX_REMOTE_MULTIMODAL_BYTES: usize = 20 * 1024 * 1024;
 
@@ -89,6 +89,77 @@ struct CredentialUsageContext {
 struct CredentialErrorHint {
     id: u64,
     label: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RequestRuntimeConfig {
+    extract_thinking: bool,
+    prompt_cache_target_read_ratio: f64,
+    prompt_cache_token_scale: f64,
+    prompt_cache_max_simulated_input_tokens: i32,
+    prompt_cache_cap_jitter_min_tokens: i32,
+    prompt_cache_cap_jitter_max_tokens: i32,
+    prompt_cache_scale_min_input_tokens: i32,
+    cc_high_cache_reported_cache_creation_target_tokens: i32,
+    cc_high_cache_reported_input_max_tokens: i32,
+    compat_profile: CompatProfile,
+    expose_proxy_warnings: bool,
+}
+
+impl RequestRuntimeConfig {
+    fn from_app_state(state: &AppState) -> Self {
+        Self {
+            extract_thinking: state.extract_thinking,
+            prompt_cache_target_read_ratio: state.prompt_cache_target_read_ratio,
+            prompt_cache_token_scale: state.prompt_cache_token_scale,
+            prompt_cache_max_simulated_input_tokens: state.prompt_cache_max_simulated_input_tokens,
+            prompt_cache_cap_jitter_min_tokens: state.prompt_cache_cap_jitter_min_tokens,
+            prompt_cache_cap_jitter_max_tokens: state.prompt_cache_cap_jitter_max_tokens,
+            prompt_cache_scale_min_input_tokens: state.prompt_cache_scale_min_input_tokens,
+            cc_high_cache_reported_cache_creation_target_tokens: state
+                .cc_high_cache_reported_cache_creation_target_tokens,
+            cc_high_cache_reported_input_max_tokens: state.cc_high_cache_reported_input_max_tokens,
+            compat_profile: state.compat_profile,
+            expose_proxy_warnings: state.expose_proxy_warnings,
+        }
+    }
+
+    fn from_config_with_fallback(config: &Config, fallback: Self) -> Self {
+        Self {
+            extract_thinking: config.extract_thinking,
+            prompt_cache_target_read_ratio: if config.prompt_cache_target_read_ratio.is_finite() {
+                config.prompt_cache_target_read_ratio.clamp(0.0, 0.99)
+            } else {
+                fallback.prompt_cache_target_read_ratio
+            },
+            prompt_cache_token_scale: if config.prompt_cache_token_scale.is_finite() {
+                config.prompt_cache_token_scale.clamp(1.0, 3.0)
+            } else {
+                fallback.prompt_cache_token_scale
+            },
+            prompt_cache_max_simulated_input_tokens: config
+                .prompt_cache_max_simulated_input_tokens
+                .max(0),
+            prompt_cache_cap_jitter_min_tokens: config.prompt_cache_cap_jitter_min_tokens.max(0),
+            prompt_cache_cap_jitter_max_tokens: config.prompt_cache_cap_jitter_max_tokens.max(0),
+            prompt_cache_scale_min_input_tokens: config.prompt_cache_scale_min_input_tokens.max(0),
+            cc_high_cache_reported_cache_creation_target_tokens: config
+                .cc_high_cache_reported_cache_creation_target_tokens
+                .max(0),
+            cc_high_cache_reported_input_max_tokens: config
+                .cc_high_cache_reported_input_max_tokens
+                .max(0),
+            compat_profile: config.compat_profile,
+            expose_proxy_warnings: config.expose_proxy_warnings || config.compat_profile.is_debug(),
+        }
+    }
+}
+
+fn request_runtime_config(state: &AppState, provider: &KiroProvider) -> RequestRuntimeConfig {
+    RequestRuntimeConfig::from_config_with_fallback(
+        &provider.runtime_config(),
+        RequestRuntimeConfig::from_app_state(state),
+    )
 }
 
 impl CredentialErrorHint {
@@ -173,11 +244,21 @@ fn reported_cache_usage_policy(
     input_max_tokens: i32,
     seed: u64,
 ) -> Option<super::cache::ReportedCacheUsagePolicy> {
-    if endpoint != "/cc/v1/messages" || simulation_mode != PromptCacheSimulationMode::HighCache {
+    if simulation_mode != PromptCacheSimulationMode::HighCache {
         return None;
     }
 
-    super::cache::ReportedCacheUsagePolicy::new(creation_target_tokens, input_max_tokens, seed)
+    match endpoint {
+        "/cc/v1/messages" => super::cache::ReportedCacheUsagePolicy::new(
+            creation_target_tokens,
+            input_max_tokens,
+            seed,
+        ),
+        "/ha/v1/messages" => {
+            super::cache::ReportedCacheUsagePolicy::input_only(input_max_tokens, seed)
+        }
+        _ => None,
+    }
 }
 
 fn credential_display_label(id: u64, label: Option<&str>) -> String {
@@ -911,6 +992,7 @@ fn is_blocked_ip(addr: &std::net::IpAddr) -> bool {
 
 fn prepare_usage_context(
     state: &AppState,
+    runtime_config: RequestRuntimeConfig,
     endpoint: &'static str,
     stream: bool,
     payload: &MessagesRequest,
@@ -938,8 +1020,8 @@ fn prepare_usage_context(
     let reported_cache_usage_policy = reported_cache_usage_policy(
         endpoint,
         state.prompt_cache_simulation_mode,
-        state.cc_high_cache_reported_cache_creation_target_tokens,
-        state.cc_high_cache_reported_input_max_tokens,
+        runtime_config.cc_high_cache_reported_cache_creation_target_tokens,
+        runtime_config.cc_high_cache_reported_input_max_tokens,
         reported_cache_creation_seed,
     );
 
@@ -956,12 +1038,13 @@ fn prepare_usage_context(
         input_tokens,
         prompt_cache_profile,
         simulation_mode: state.prompt_cache_simulation_mode,
-        prompt_cache_target_read_ratio: state.prompt_cache_target_read_ratio,
-        prompt_cache_token_scale: state.prompt_cache_token_scale,
-        prompt_cache_max_simulated_input_tokens: state.prompt_cache_max_simulated_input_tokens,
-        prompt_cache_cap_jitter_min_tokens: state.prompt_cache_cap_jitter_min_tokens,
-        prompt_cache_cap_jitter_max_tokens: state.prompt_cache_cap_jitter_max_tokens,
-        prompt_cache_scale_min_input_tokens: state.prompt_cache_scale_min_input_tokens,
+        prompt_cache_target_read_ratio: runtime_config.prompt_cache_target_read_ratio,
+        prompt_cache_token_scale: runtime_config.prompt_cache_token_scale,
+        prompt_cache_max_simulated_input_tokens: runtime_config
+            .prompt_cache_max_simulated_input_tokens,
+        prompt_cache_cap_jitter_min_tokens: runtime_config.prompt_cache_cap_jitter_min_tokens,
+        prompt_cache_cap_jitter_max_tokens: runtime_config.prompt_cache_cap_jitter_max_tokens,
+        prompt_cache_scale_min_input_tokens: runtime_config.prompt_cache_scale_min_input_tokens,
         reported_cache_usage_policy,
         simulated_usage,
         simulated_source,
@@ -1184,12 +1267,17 @@ fn conversion_error_response(e: &ConversionError) -> Response {
     envelope::error_response(StatusCode::BAD_REQUEST, error_type, message)
 }
 
-fn should_expose_proxy_warnings(state: &AppState) -> bool {
-    state.expose_proxy_warnings && !state.compat_profile.is_strict()
+fn should_expose_proxy_warnings(runtime_config: RequestRuntimeConfig) -> bool {
+    runtime_config.expose_proxy_warnings && !runtime_config.compat_profile.is_strict()
 }
 
-fn should_extract_unsigned_thinking(state: &AppState, thinking_enabled: bool) -> bool {
-    state.extract_thinking && thinking_enabled && state.compat_profile.allows_unsigned_thinking()
+fn should_extract_unsigned_thinking(
+    runtime_config: RequestRuntimeConfig,
+    thinking_enabled: bool,
+) -> bool {
+    runtime_config.extract_thinking
+        && thinking_enabled
+        && runtime_config.compat_profile.allows_unsigned_thinking()
 }
 
 fn websearch_supported_for_profile(profile: CompatProfile) -> bool {
@@ -1395,6 +1483,18 @@ pub async fn post_messages_no_cache(
     post_messages_inner(state, headers, payload, "/na/v1/messages").await
 }
 
+/// POST /ha/v1/messages
+///
+/// 创建消息（对话），使用 high-cache 计算；下游 input 上报采用 `/cc/v1` 的压低策略，
+/// 但不套用 `/cc/v1` 的 writer 上报改写。
+pub async fn post_messages_ha(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    JsonExtractor(payload): JsonExtractor<MessagesRequest>,
+) -> Response {
+    post_messages_inner(state, headers, payload, "/ha/v1/messages").await
+}
+
 async fn post_messages_inner(
     state: AppState,
     headers: HeaderMap,
@@ -1421,6 +1521,7 @@ async fn post_messages_inner(
             );
         }
     };
+    let runtime_config = request_runtime_config(&state, &provider);
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
@@ -1435,7 +1536,7 @@ async fn post_messages_inner(
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
-        if !websearch_supported_for_profile(state.compat_profile) {
+        if !websearch_supported_for_profile(runtime_config.compat_profile) {
             return envelope::error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
@@ -1459,7 +1560,7 @@ async fn post_messages_inner(
     let conversion_result = match convert_request_with_options(
         &payload,
         ConverterOptions {
-            compat_profile: state.compat_profile,
+            compat_profile: runtime_config.compat_profile,
             prompt_cache_simulation_mode: state.prompt_cache_simulation_mode,
         },
     ) {
@@ -1499,6 +1600,7 @@ async fn post_messages_inner(
     ) as i32;
     let usage_context = prepare_usage_context(
         &state,
+        runtime_config,
         endpoint,
         payload.stream,
         &payload,
@@ -1515,12 +1617,12 @@ async fn post_messages_inner(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
-    let warnings_header = if should_expose_proxy_warnings(&state) {
+    let warnings_header = if should_expose_proxy_warnings(runtime_config) {
         conversion_result.warnings.encode_header()
     } else {
         None
     };
-    let extract_xml_thinking = state.compat_profile.allows_unsigned_thinking();
+    let extract_xml_thinking = runtime_config.compat_profile.allows_unsigned_thinking();
 
     if payload.stream {
         // 流式响应
@@ -1538,7 +1640,7 @@ async fn post_messages_inner(
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = should_extract_unsigned_thinking(&state, thinking_enabled);
+        let extract_thinking = should_extract_unsigned_thinking(runtime_config, thinking_enabled);
         handle_non_stream_request(
             provider,
             &request_body,
@@ -2213,6 +2315,7 @@ pub async fn post_messages_cc(
             );
         }
     };
+    let runtime_config = request_runtime_config(&state, &provider);
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
@@ -2227,7 +2330,7 @@ pub async fn post_messages_cc(
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
-        if !websearch_supported_for_profile(state.compat_profile) {
+        if !websearch_supported_for_profile(runtime_config.compat_profile) {
             return envelope::error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
@@ -2251,7 +2354,7 @@ pub async fn post_messages_cc(
     let conversion_result = match convert_request_with_options(
         &payload,
         ConverterOptions {
-            compat_profile: state.compat_profile,
+            compat_profile: runtime_config.compat_profile,
             prompt_cache_simulation_mode: state.prompt_cache_simulation_mode,
         },
     ) {
@@ -2291,6 +2394,7 @@ pub async fn post_messages_cc(
     ) as i32;
     let usage_context = prepare_usage_context(
         &state,
+        runtime_config,
         "/cc/v1/messages",
         payload.stream,
         &payload,
@@ -2307,12 +2411,12 @@ pub async fn post_messages_cc(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
-    let warnings_header = if should_expose_proxy_warnings(&state) {
+    let warnings_header = if should_expose_proxy_warnings(runtime_config) {
         conversion_result.warnings.encode_header()
     } else {
         None
     };
-    let extract_xml_thinking = state.compat_profile.allows_unsigned_thinking();
+    let extract_xml_thinking = runtime_config.compat_profile.allows_unsigned_thinking();
 
     if payload.stream {
         // 流式响应（实时模式）
@@ -2330,7 +2434,7 @@ pub async fn post_messages_cc(
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = should_extract_unsigned_thinking(&state, thinking_enabled);
+        let extract_thinking = should_extract_unsigned_thinking(runtime_config, thinking_enabled);
         handle_non_stream_request(
             provider,
             &request_body,
@@ -2608,9 +2712,22 @@ mod tests {
             ),
             ..v1_context.clone()
         };
+        let ha_context = RequestUsageContext {
+            endpoint: "/ha/v1/messages",
+            request_id: "req_ha_policy".to_string(),
+            reported_cache_usage_policy: reported_cache_usage_policy(
+                "/ha/v1/messages",
+                PromptCacheSimulationMode::HighCache,
+                3_000,
+                96,
+                7,
+            ),
+            ..v1_context.clone()
+        };
 
         assert_eq!(v1_context.reported_cache_usage_policy(), None);
         assert!(cc_context.reported_cache_usage_policy().is_some());
+        assert!(ha_context.reported_cache_usage_policy().is_some());
 
         let v1_reported =
             v1_context.reported_usage_for_downstream(usage, UsageSource::LocalPromptCache);
@@ -2627,6 +2744,29 @@ mod tests {
                 .saturating_add(usage.input_tokens.saturating_sub(cc_reported.input_tokens))
         );
         assert_eq!(cc_reported.output_tokens, usage.output_tokens);
+
+        let ha_reported =
+            ha_context.reported_usage_for_downstream(usage, UsageSource::LocalPromptCache);
+        assert!((1..=96).contains(&ha_reported.input_tokens));
+        assert_eq!(
+            ha_reported.cache_creation_input_tokens,
+            usage.cache_creation_input_tokens
+        );
+        assert_eq!(
+            ha_reported.cache_creation_5m_input_tokens,
+            usage.cache_creation_5m_input_tokens
+        );
+        assert_eq!(
+            ha_reported.cache_creation_1h_input_tokens,
+            usage.cache_creation_1h_input_tokens
+        );
+        assert_eq!(
+            ha_reported.cache_read_input_tokens,
+            usage
+                .cache_read_input_tokens
+                .saturating_add(usage.input_tokens.saturating_sub(ha_reported.input_tokens))
+        );
+        assert_eq!(ha_reported.output_tokens, usage.output_tokens);
     }
 
     #[test]
@@ -2869,6 +3009,7 @@ mod tests {
             extract_stable_conversation_id(&first_payload).expect("fallback id");
         let first_context = prepare_usage_context(
             &state,
+            RequestRuntimeConfig::from_app_state(&state),
             "/v1/messages",
             false,
             &first_payload,
@@ -2924,6 +3065,7 @@ mod tests {
 
         let second_context = prepare_usage_context(
             &state,
+            RequestRuntimeConfig::from_app_state(&state),
             "/v1/messages",
             false,
             &second_payload,
@@ -2989,6 +3131,7 @@ mod tests {
 
         let context = prepare_usage_context(
             &state,
+            RequestRuntimeConfig::from_app_state(&state),
             "/v1/messages",
             true,
             &payload,
@@ -3042,6 +3185,7 @@ mod tests {
 
         let context = prepare_usage_context(
             &state,
+            RequestRuntimeConfig::from_app_state(&state),
             "/na/v1/messages",
             false,
             &payload,
@@ -3102,7 +3246,9 @@ mod tests {
             true,
         );
 
-        assert!(!should_expose_proxy_warnings(&state));
+        assert!(!should_expose_proxy_warnings(
+            RequestRuntimeConfig::from_app_state(&state)
+        ));
     }
 
     #[test]

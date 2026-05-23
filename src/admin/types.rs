@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::config::CompressionConfig;
+use crate::model::config::{CompatProfile, CompressionConfig};
 
 // ============ 凭据状态 ============
 
@@ -289,6 +289,18 @@ pub struct RuntimeConfigResponse {
     pub credential_warmup_selection_percent: u32,
     pub compression_enabled: bool,
     pub whitespace_compression: bool,
+    pub prompt_cache_target_read_ratio: f64,
+    pub prompt_cache_token_scale: f64,
+    pub prompt_cache_max_simulated_input_tokens: i32,
+    pub prompt_cache_cap_jitter_min_tokens: i32,
+    pub prompt_cache_cap_jitter_max_tokens: i32,
+    pub prompt_cache_scale_min_input_tokens: i32,
+    pub cc_high_cache_reported_cache_creation_target_tokens: i32,
+    pub cc_high_cache_reported_input_max_tokens: i32,
+    pub high_cache_threshold: i32,
+    pub compat_profile: CompatProfile,
+    pub extract_thinking: bool,
+    pub expose_proxy_warnings: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -303,6 +315,30 @@ pub struct UpdateRuntimeConfigRequest {
     pub compression_enabled: bool,
     #[serde(default = "default_true")]
     pub whitespace_compression: bool,
+    #[serde(default)]
+    pub prompt_cache_target_read_ratio: Option<f64>,
+    #[serde(default)]
+    pub prompt_cache_token_scale: Option<f64>,
+    #[serde(default)]
+    pub prompt_cache_max_simulated_input_tokens: Option<i32>,
+    #[serde(default)]
+    pub prompt_cache_cap_jitter_min_tokens: Option<i32>,
+    #[serde(default)]
+    pub prompt_cache_cap_jitter_max_tokens: Option<i32>,
+    #[serde(default)]
+    pub prompt_cache_scale_min_input_tokens: Option<i32>,
+    #[serde(default)]
+    pub cc_high_cache_reported_cache_creation_target_tokens: Option<i32>,
+    #[serde(default)]
+    pub cc_high_cache_reported_input_max_tokens: Option<i32>,
+    #[serde(default)]
+    pub high_cache_threshold: Option<i32>,
+    #[serde(default)]
+    pub compat_profile: Option<CompatProfile>,
+    #[serde(default)]
+    pub extract_thinking: Option<bool>,
+    #[serde(default)]
+    pub expose_proxy_warnings: Option<bool>,
 }
 
 impl UpdateRuntimeConfigRequest {
