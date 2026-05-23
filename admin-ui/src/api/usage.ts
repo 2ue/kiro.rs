@@ -2,6 +2,7 @@ import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
   SuccessResponse,
+  ModelPricingStatus,
   UsageRecordsPageQuery,
   UsageRecordsPageResult,
   UsageRecordsQuery,
@@ -49,5 +50,15 @@ export async function getUsageSummary(): Promise<UsageSummary> {
 
 export async function clearUsageRecords(): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>('/usage-records/clear')
+  return data
+}
+
+export async function getModelPricing(): Promise<ModelPricingStatus> {
+  const { data } = await api.get<ModelPricingStatus>('/model-pricing')
+  return data
+}
+
+export async function syncModelPricing(): Promise<ModelPricingStatus> {
+  const { data } = await api.post<ModelPricingStatus>('/model-pricing/sync')
   return data
 }

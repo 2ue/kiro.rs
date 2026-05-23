@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, BarChart3 } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, BarChart3, Settings, DollarSign, Download } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -14,9 +14,13 @@ import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { CredentialTestDialog } from '@/components/credential-test-dialog'
 import { UsageRecordsPanel } from '@/components/usage-records-panel'
+import { RuntimeConfigPanel } from '@/components/runtime-config-panel'
+import { ModelPricingPanel } from '@/components/model-pricing-panel'
+import { CredentialExportDialog } from '@/components/credential-export-dialog'
 import { useCredentialsPage, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
-import { getCredentialBalance, forceRefreshToken, getCredentials } from '@/api/credentials'
+import { getCredentialBalance, forceRefreshToken, getCredentials, testCredential } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
+import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
 import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
 
 interface DashboardProps {
@@ -31,6 +35,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
+  const [exportDialogOpen, setExportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
@@ -42,7 +47,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
-  const [activeTab, setActiveTab] = useState<'credentials' | 'usage'>('credentials')
+  const [activeTab, setActiveTab] = useState<'credentials' | 'usage' | 'pricing' | 'config'>('credentials')
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
@@ -481,7 +486,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
       })
 
       try {
-        const balance = await getCredentialBalance(id)
+        const response = await testCredential(id, {
+          model: DEFAULT_TEST_MODEL,
+          prompt: DEFAULT_TEST_PROMPT,
+        })
         successCount++
 
         // 更新为成功状态
@@ -490,7 +498,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
           newResults.set(id, {
             id,
             status: 'success',
-            usage: `${balance.currentUsage}/${balance.usageLimit}`
+            model: testModelLabel(response.model),
+            response: response.response,
           })
           return newResults
         })
@@ -600,6 +609,22 @@ export function Dashboard({ onLogout }: DashboardProps) {
               Usage
             </Button>
             <Button
+              variant={activeTab === 'pricing' ? 'secondary' : 'ghost'}
+              size="sm"
+              onClick={() => setActiveTab('pricing')}
+            >
+              <DollarSign className="h-4 w-4" />
+              价格
+            </Button>
+            <Button
+              variant={activeTab === 'config' ? 'secondary' : 'ghost'}
+              size="sm"
+              onClick={() => setActiveTab('config')}
+            >
+              <Settings className="h-4 w-4" />
+              配置
+            </Button>
+            <Button
               variant="outline"
               size="sm"
               onClick={handleToggleLoadBalancing}
@@ -625,6 +650,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <main className="container mx-auto px-4 md:px-8 py-6">
         {activeTab === 'usage' ? (
           <UsageRecordsPanel />
+        ) : activeTab === 'pricing' ? (
+          <ModelPricingPanel />
+        ) : activeTab === 'config' ? (
+          <RuntimeConfigPanel />
         ) : (
           <>
         {/* 统计卡片 */}
@@ -748,6 +777,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 <Upload className="h-4 w-4 mr-2" />
                 批量导入
               </Button>
+              <Button onClick={() => setExportDialogOpen(true)} size="sm" variant="outline">
+                <Download className="h-4 w-4 mr-2" />
+                导出
+              </Button>
               <Button onClick={() => setAddDialogOpen(true)} size="sm">
                 <Plus className="h-4 w-4 mr-2" />
                 添加凭据
@@ -838,6 +871,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <KamImportDialog
         open={kamImportDialogOpen}
         onOpenChange={setKamImportDialogOpen}
+      />
+
+      <CredentialExportDialog
+        open={exportDialogOpen}
+        onOpenChange={setExportDialogOpen}
       />
 
       {/* 批量验活对话框 */}

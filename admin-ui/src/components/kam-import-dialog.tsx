@@ -10,8 +10,9 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
-import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
+import { setCredentialDisabled, testCredential } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
+import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
 
 interface KamImportDialogProps {
   open: boolean
@@ -39,7 +40,8 @@ interface VerificationResult {
   index: number
   status: 'pending' | 'checking' | 'verifying' | 'verified' | 'duplicate' | 'failed' | 'skipped'
   error?: string
-  usage?: string
+  model?: string
+  response?: string
   email?: string
   credentialId?: number
   rollbackStatus?: 'success' | 'failed' | 'skipped'
@@ -288,7 +290,10 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
           await new Promise(resolve => setTimeout(resolve, 1000))
 
-          const balance = await getCredentialBalance(addedCred.credentialId)
+          const testResult = await testCredential(addedCred.credentialId, {
+            model: DEFAULT_TEST_MODEL,
+            prompt: DEFAULT_TEST_PROMPT,
+          })
 
           successCount++
           existingTokenHashes.add(tokenHash)
@@ -298,7 +303,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             next[i] = {
               ...next[i],
               status: 'verified',
-              usage: `${balance.currentUsage}/${balance.usageLimit}`,
+              model: testModelLabel(testResult.model),
+              response: testResult.response,
               email: addedCred.email || account.email,
               credentialId: addedCred.credentialId,
             }
@@ -497,8 +503,13 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
                             {getStatusText(result)}
                           </span>
                         </div>
-                        {result.usage && (
-                          <div className="text-xs text-muted-foreground mt-1">用量: {result.usage}</div>
+                        {result.model && (
+                          <div className="text-xs text-muted-foreground mt-1">模型: {result.model}</div>
+                        )}
+                        {result.response && (
+                          <div className="text-xs text-muted-foreground mt-1 line-clamp-2">
+                            响应: {result.response}
+                          </div>
                         )}
                         {result.error && (
                           <div className="text-xs text-red-600 dark:text-red-400 mt-1">{result.error}</div>

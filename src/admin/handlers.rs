@@ -2,9 +2,10 @@
 
 use axum::{
     Json,
+    body::Body,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -12,8 +13,9 @@ use serde::Deserialize;
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, AdminErrorResponse, SetDisabledRequest, SetLoadBalancingModeRequest,
-        SetPriorityRequest, SuccessResponse, TestCredentialRequest,
+        AddCredentialRequest, AdminErrorResponse, ExportCredentialsQuery, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SetWarmupRequest, SuccessResponse,
+        TestCredentialRequest, UpdateRuntimeConfigRequest,
     },
 };
 use crate::anthropic::usage::{UsageRecordQuery, UsageRecordStatus, UsageSource};
@@ -182,6 +184,19 @@ pub async fn set_credential_priority(
     }
 }
 
+/// POST /api/admin/credentials/:id/warmup
+/// 设置凭据预热剩余请求数
+pub async fn set_credential_warmup(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetWarmupRequest>,
+) -> impl IntoResponse {
+    match state.service.set_warmup(id, payload) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 预热状态已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials/:id/reset
 /// 重置失败计数并重新启用
 pub async fn reset_failure_count(
@@ -278,6 +293,64 @@ pub async fn set_load_balancing_mode(
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
         Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/runtime
+/// 获取运行时全局配置
+pub async fn get_runtime_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_runtime_config())
+}
+
+/// PUT /api/admin/config/runtime
+/// 更新运行时全局配置
+pub async fn update_runtime_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<UpdateRuntimeConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.update_runtime_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/model-pricing
+/// 获取模型价格目录状态
+pub async fn get_model_pricing(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_model_pricing())
+}
+
+/// POST /api/admin/model-pricing/sync
+/// 手动同步模型价格目录
+pub async fn sync_model_pricing(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.sync_model_pricing().await)
+}
+
+/// GET /api/admin/credentials/export?format=json|backup-json|jsonl
+/// 导出完整凭据。
+pub async fn export_credentials(
+    State(state): State<AdminState>,
+    Query(query): Query<ExportCredentialsQuery>,
+) -> Response {
+    let format = query.format.as_deref().unwrap_or("json");
+    match state.service.export_credentials(format) {
+        Ok((body, filename)) => {
+            let content_type = if filename.ends_with(".jsonl") {
+                "application/x-ndjson; charset=utf-8"
+            } else {
+                "application/json; charset=utf-8"
+            };
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, content_type)
+                .header(
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{}\"", filename),
+                )
+                .body(Body::from(body))
+                .expect("valid credentials export response")
+        }
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

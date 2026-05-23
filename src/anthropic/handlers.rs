@@ -33,8 +33,8 @@ use tokio::time::{Instant, interval, sleep_until};
 
 use super::converter::{
     ConversionError, ConverterOptions, convert_request_with_options,
-    extract_metadata_conversation_id, extract_stable_conversation_id,
-    infer_document_media_type_from_url, infer_image_format_from_url,
+    extract_stable_conversation_id, infer_document_media_type_from_url,
+    infer_image_format_from_url,
 };
 use super::envelope;
 use super::middleware::AppState;
@@ -54,6 +54,7 @@ const MAX_REMOTE_MULTIMODAL_BYTES: usize = 20 * 1024 * 1024;
 struct RequestUsageContext {
     recorder: Arc<super::usage::UsageRecorder>,
     prompt_cache: Arc<super::prompt_cache::PromptCacheTracker>,
+    pricing_catalog: Arc<super::pricing::PricingCatalog>,
     request_id: String,
     endpoint: &'static str,
     stream: bool,
@@ -69,7 +70,7 @@ struct RequestUsageContext {
     prompt_cache_cap_jitter_min_tokens: i32,
     prompt_cache_cap_jitter_max_tokens: i32,
     prompt_cache_scale_min_input_tokens: i32,
-    reported_cache_creation_policy: Option<super::cache::ReportedCacheCreationPolicy>,
+    reported_cache_usage_policy: Option<super::cache::ReportedCacheUsagePolicy>,
     simulated_usage: Option<super::cache::CacheSimulation>,
     simulated_source: Option<UsageSource>,
     started_at: Instant,
@@ -82,6 +83,18 @@ struct CredentialUsageContext {
     credential_label: Option<String>,
     sticky_bound: bool,
     fallback_from_sticky: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CredentialErrorHint {
+    id: u64,
+    label: Option<String>,
+}
+
+impl CredentialErrorHint {
+    fn display_label(&self) -> String {
+        credential_display_label(self.id, self.label.as_deref())
+    }
 }
 
 impl RequestUsageContext {
@@ -119,8 +132,21 @@ impl RequestUsageContext {
         }
     }
 
-    fn reported_cache_creation_policy(&self) -> Option<super::cache::ReportedCacheCreationPolicy> {
-        self.reported_cache_creation_policy
+    fn attach_provider_error_credential(
+        self,
+        provider: &crate::kiro::provider::KiroProvider,
+        error_message: &str,
+    ) -> CredentialUsageContext {
+        let hint = extract_credential_error_hint(error_message);
+        let credential_id = hint.as_ref().map(|hint| hint.id);
+        let credential_label =
+            hint.and_then(|hint| provider.credential_label(hint.id).or(hint.label));
+
+        self.attach_credential(credential_id, credential_label, false, false)
+    }
+
+    fn reported_cache_usage_policy(&self) -> Option<super::cache::ReportedCacheUsagePolicy> {
+        self.reported_cache_usage_policy
     }
 
     fn reported_usage_for_downstream(
@@ -134,23 +160,121 @@ impl RequestUsageContext {
             return usage;
         }
 
-        self.reported_cache_creation_policy
-            .map(|policy| usage.with_reported_cache_creation_policy(policy))
+        self.reported_cache_usage_policy
+            .map(|policy| usage.with_reported_cache_usage_policy(policy))
             .unwrap_or(usage)
     }
 }
 
-fn reported_cache_creation_policy(
+fn reported_cache_usage_policy(
     endpoint: &str,
     simulation_mode: PromptCacheSimulationMode,
-    target_tokens: i32,
+    creation_target_tokens: i32,
+    input_max_tokens: i32,
     seed: u64,
-) -> Option<super::cache::ReportedCacheCreationPolicy> {
+) -> Option<super::cache::ReportedCacheUsagePolicy> {
     if endpoint != "/cc/v1/messages" || simulation_mode != PromptCacheSimulationMode::HighCache {
         return None;
     }
 
-    super::cache::ReportedCacheCreationPolicy::new(target_tokens, seed)
+    super::cache::ReportedCacheUsagePolicy::new(creation_target_tokens, input_max_tokens, seed)
+}
+
+fn credential_display_label(id: u64, label: Option<&str>) -> String {
+    let prefix = format!("#{}", id);
+    let Some(label) = label.map(str::trim).filter(|label| !label.is_empty()) else {
+        return prefix;
+    };
+
+    if label == prefix || label.starts_with(&format!("{} ", prefix)) {
+        label.to_string()
+    } else {
+        format!("{} {}", prefix, label)
+    }
+}
+
+fn extract_credential_error_hint(message: &str) -> Option<CredentialErrorHint> {
+    let marker = "凭据 #";
+    let marker_start = message.rfind(marker)?;
+    let digits_start = marker_start + marker.len();
+    let digits_len = message[digits_start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .map(char::len_utf8)
+        .sum::<usize>();
+    if digits_len == 0 {
+        return None;
+    }
+
+    let digits_end = digits_start + digits_len;
+    let id = message[digits_start..digits_end].parse::<u64>().ok()?;
+    let label = message[digits_end..]
+        .trim_start()
+        .trim_start_matches(['#', ' '])
+        .split(['）', ')', '，', ',', '：', ':'])
+        .next()
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(ToString::to_string);
+
+    Some(CredentialErrorHint { id, label })
+}
+
+fn log_provider_call_failure(message: &str) {
+    if let Some(hint) = extract_credential_error_hint(message) {
+        tracing::warn!(
+            credential_id = hint.id,
+            credential_label = %hint.display_label(),
+            error = %message,
+            "上游 API 调用失败"
+        );
+    } else {
+        tracing::warn!(error = %message, "上游 API 调用失败");
+    }
+}
+
+fn log_provider_warning_with_hint(message: &str, reason: &'static str) {
+    if let Some(hint) = extract_credential_error_hint(message) {
+        tracing::warn!(
+            credential_id = hint.id,
+            credential_label = %hint.display_label(),
+            error = %message,
+            "{}", reason
+        );
+    } else {
+        tracing::warn!(error = %message, "{}", reason);
+    }
+}
+
+fn log_provider_rate_limit_with_hint(message: &str, retry_after_secs: u64) {
+    if let Some(hint) = extract_credential_error_hint(message) {
+        tracing::warn!(
+            credential_id = hint.id,
+            credential_label = %hint.display_label(),
+            error = %message,
+            retry_after_secs,
+            "上游或本地凭据调度临时不可用，返回 429"
+        );
+    } else {
+        tracing::warn!(
+            error = %message,
+            retry_after_secs,
+            "上游或本地凭据调度临时不可用，返回 429"
+        );
+    }
+}
+
+fn log_provider_error_with_hint(message: &str, reason: &'static str) {
+    if let Some(hint) = extract_credential_error_hint(message) {
+        tracing::error!(
+            credential_id = hint.id,
+            credential_label = %hint.display_label(),
+            error = %message,
+            "{}", reason
+        );
+    } else {
+        tracing::error!(error = %message, "{}", reason);
+    }
 }
 
 impl CredentialUsageContext {
@@ -231,7 +355,15 @@ impl CredentialUsageContext {
                 "upstream stream did not complete successfully".to_string(),
             )
         });
-        self.record(status, usage, source, Some(error_type), Some(error_message));
+        let error_detail = format!("{}: {}", error_type, error_message);
+        self.record(
+            status,
+            usage,
+            source,
+            Some(error_type),
+            Some(error_message),
+            Some(error_detail),
+        );
     }
 
     fn record_success(
@@ -240,7 +372,14 @@ impl CredentialUsageContext {
         usage_source: UsageSource,
         _context_estimated: bool,
     ) {
-        self.record(UsageRecordStatus::Success, usage, usage_source, None, None);
+        self.record(
+            UsageRecordStatus::Success,
+            usage,
+            usage_source,
+            None,
+            None,
+            None,
+        );
 
         if usage_source != UsageSource::LocalPromptCache {
             return;
@@ -261,6 +400,9 @@ impl CredentialUsageContext {
         error_type: impl Into<String>,
         error_message: impl Into<String>,
     ) {
+        let error_type = error_type.into();
+        let error_message = error_message.into();
+        let error_detail = format!("{}: {}", error_type, error_message);
         let usage = super::cache::CacheUsage {
             total_input_tokens: self.request.input_tokens,
             input_tokens: self.request.input_tokens,
@@ -274,8 +416,9 @@ impl CredentialUsageContext {
             status,
             usage,
             UsageSource::None,
-            Some(error_type.into()),
-            Some(error_message.into()),
+            Some(error_type),
+            Some(error_message),
+            Some(error_detail),
         );
     }
 
@@ -294,7 +437,12 @@ impl CredentialUsageContext {
         usage_source: UsageSource,
         error_type: Option<String>,
         error_message: Option<String>,
+        error_detail: Option<String>,
     ) {
+        let pricing = self
+            .request
+            .pricing_catalog
+            .estimate(&self.request.model, usage);
         self.request.recorder.record(UsageRecord {
             id: self.request.request_id.clone(),
             created_at: Utc::now().to_rfc3339(),
@@ -314,12 +462,16 @@ impl CredentialUsageContext {
             cache_creation_input_tokens: usage.cache_creation_input_tokens,
             cache_creation_5m_input_tokens: usage.cache_creation_5m_input_tokens,
             cache_creation_1h_input_tokens: usage.cache_creation_1h_input_tokens,
+            estimated_cost_usd: pricing.cost_usd,
+            pricing_available: pricing.available,
+            pricing_model: Some(pricing.model),
             duration_ms: self.request.started_at.elapsed().as_millis() as u64,
             simulated: usage_source.is_simulated(),
             sticky_bound: self.sticky_bound,
             fallback_from_sticky: self.fallback_from_sticky,
             error_type,
             error_message,
+            error_detail,
         });
     }
 }
@@ -766,14 +918,12 @@ fn prepare_usage_context(
     stable_conversation_id: Option<String>,
     input_tokens: i32,
 ) -> RequestUsageContext {
-    let prompt_cache_profile =
-        if state.prompt_cache_simulation_mode == PromptCacheSimulationMode::HighCache {
-            state
-                .prompt_cache
-                .build_high_cache_profile(payload, input_tokens)
-        } else {
-            state.prompt_cache.build_profile(payload, input_tokens)
-        };
+    let prompt_cache_profile = match state.prompt_cache_simulation_mode {
+        PromptCacheSimulationMode::Disabled => None,
+        PromptCacheSimulationMode::HighCache => state
+            .prompt_cache
+            .build_high_cache_profile(payload, input_tokens),
+    };
     let (simulated_usage, simulated_source) = build_simulated_usage(
         state,
         stable_conversation_id.as_deref(),
@@ -785,16 +935,18 @@ fn prepare_usage_context(
         .map(|profile| profile.cache_jitter_seed())
         .unwrap_or(0)
         ^ fastrand::u64(..);
-    let reported_cache_creation_policy = reported_cache_creation_policy(
+    let reported_cache_usage_policy = reported_cache_usage_policy(
         endpoint,
         state.prompt_cache_simulation_mode,
         state.cc_high_cache_reported_cache_creation_target_tokens,
+        state.cc_high_cache_reported_input_max_tokens,
         reported_cache_creation_seed,
     );
 
     RequestUsageContext {
         recorder: state.usage_recorder.clone(),
         prompt_cache: state.prompt_cache.clone(),
+        pricing_catalog: state.pricing_catalog.clone(),
         request_id,
         endpoint,
         stream,
@@ -810,7 +962,7 @@ fn prepare_usage_context(
         prompt_cache_cap_jitter_min_tokens: state.prompt_cache_cap_jitter_min_tokens,
         prompt_cache_cap_jitter_max_tokens: state.prompt_cache_cap_jitter_max_tokens,
         prompt_cache_scale_min_input_tokens: state.prompt_cache_scale_min_input_tokens,
-        reported_cache_creation_policy,
+        reported_cache_usage_policy,
         simulated_usage,
         simulated_source,
         started_at: Instant::now(),
@@ -823,7 +975,6 @@ fn prompt_cache_scope_conversation_id(
 ) -> Option<String> {
     match mode {
         PromptCacheSimulationMode::Disabled => None,
-        PromptCacheSimulationMode::LocalPromptCache => extract_metadata_conversation_id(payload),
         PromptCacheSimulationMode::HighCache => extract_stable_conversation_id(payload),
     }
 }
@@ -835,7 +986,7 @@ fn build_simulated_usage(
 ) -> (Option<super::cache::CacheSimulation>, Option<UsageSource>) {
     match state.prompt_cache_simulation_mode {
         PromptCacheSimulationMode::Disabled => (None, None),
-        PromptCacheSimulationMode::LocalPromptCache | PromptCacheSimulationMode::HighCache => {
+        PromptCacheSimulationMode::HighCache => {
             if conversation_id.is_none() {
                 return (None, None);
             }
@@ -861,7 +1012,7 @@ fn prepare_credential_usage_context(
     let mut usage_context = usage_context;
     if matches!(
         usage_context.simulation_mode,
-        PromptCacheSimulationMode::LocalPromptCache | PromptCacheSimulationMode::HighCache
+        PromptCacheSimulationMode::HighCache
     ) {
         let scope = usage_context
             .prompt_cache_scope_conversation_id
@@ -903,7 +1054,7 @@ fn map_provider_error(err: Error, request_id: Option<&str>) -> Response {
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
     if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
-        tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
+        log_provider_warning_with_hint(&err_str, "上游拒绝请求：上下文窗口已满（不应重试）");
         return if let Some(request_id) = request_id {
             envelope::error_response_with_id(
                 StatusCode::BAD_REQUEST,
@@ -922,7 +1073,7 @@ fn map_provider_error(err: Error, request_id: Option<&str>) -> Response {
 
     // 单次输入太长（请求体本身超出上游限制）
     if err_str.contains("Input is too long") {
-        tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
+        log_provider_warning_with_hint(&err_str, "上游拒绝请求：输入过长（不应重试）");
         return if let Some(request_id) = request_id {
             envelope::error_response_with_id(
                 StatusCode::BAD_REQUEST,
@@ -938,7 +1089,55 @@ fn map_provider_error(err: Error, request_id: Option<&str>) -> Response {
             )
         };
     }
-    tracing::error!("Kiro API 调用失败: {}", err);
+
+    if err_str.contains("临时冷却")
+        || err_str.contains("本地限流")
+        || err_str.contains("retry-after")
+        || err_str.contains("Retry-After")
+        || err_str.contains("429")
+    {
+        let retry_after_secs = retry_after_secs_from_error(&err_str).unwrap_or(1).max(1);
+        log_provider_rate_limit_with_hint(&err_str, retry_after_secs);
+        let message = format!(
+            "Upstream temporarily rate limited. Retry after {} seconds.",
+            retry_after_secs
+        );
+        return if let Some(request_id) = request_id {
+            envelope::error_response_with_id_and_headers(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                message,
+                request_id,
+                [("retry-after", retry_after_secs.to_string())],
+            )
+        } else {
+            envelope::error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", message)
+        };
+    }
+
+    if err_str.contains("所有凭据均已禁用")
+        || err_str.contains("所有凭据已用尽")
+        || err_str.contains("没有支持当前模型的可用凭据")
+    {
+        log_provider_error_with_hint(&err_str, "没有可调度凭据");
+        let message = format!("No available credentials: {}", err);
+        return if let Some(request_id) = request_id {
+            envelope::error_response_with_id(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                message,
+                request_id,
+            )
+        } else {
+            envelope::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                message,
+            )
+        };
+    }
+
+    log_provider_error_with_hint(&err_str, "Kiro API 调用失败");
     if let Some(request_id) = request_id {
         envelope::error_response_with_id(
             StatusCode::BAD_GATEWAY,
@@ -953,6 +1152,25 @@ fn map_provider_error(err: Error, request_id: Option<&str>) -> Response {
             format!("上游 API 调用失败: {}", err),
         )
     }
+}
+
+fn retry_after_secs_from_error(value: &str) -> Option<u64> {
+    let lower = value.to_lowercase();
+    for marker in ["retry_after_secs=", "retry-after=", "retry after "] {
+        let Some(index) = lower.find(marker) else {
+            continue;
+        };
+        let tail = &lower[index + marker.len()..];
+        let digits: String = tail
+            .chars()
+            .skip_while(|ch| !ch.is_ascii_digit())
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect();
+        if let Ok(seconds) = digits.parse::<u64>() {
+            return Some(seconds);
+        }
+    }
+    None
 }
 
 fn conversion_error_response(e: &ConversionError) -> Response {
@@ -1161,14 +1379,35 @@ pub async fn get_models() -> impl IntoResponse {
 pub async fn post_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    JsonExtractor(payload): JsonExtractor<MessagesRequest>,
+) -> Response {
+    post_messages_inner(state, headers, payload, "/v1/messages").await
+}
+
+/// POST /na/v1/messages
+///
+/// 创建消息（对话），不做本地 prompt-cache usage 模拟
+pub async fn post_messages_no_cache(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    JsonExtractor(payload): JsonExtractor<MessagesRequest>,
+) -> Response {
+    post_messages_inner(state, headers, payload, "/na/v1/messages").await
+}
+
+async fn post_messages_inner(
+    state: AppState,
+    headers: HeaderMap,
+    mut payload: MessagesRequest,
+    endpoint: &'static str,
 ) -> Response {
     tracing::info!(
+        endpoint = endpoint,
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
         message_count = %payload.messages.len(),
-        "Received POST /v1/messages request"
+        "Received POST messages request"
     );
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
@@ -1260,7 +1499,7 @@ pub async fn post_messages(
     ) as i32;
     let usage_context = prepare_usage_context(
         &state,
-        "/v1/messages",
+        endpoint,
         payload.stream,
         &payload,
         Some(kiro_request.conversation_state.conversation_id.clone()),
@@ -1332,8 +1571,9 @@ async fn handle_stream_request(
         Err(e) => {
             let message = e.to_string();
             let request_id = usage_context.request_id.clone();
+            log_provider_call_failure(&message);
             usage_context
-                .attach_credential(None, None, false, false)
+                .attach_provider_error_credential(&provider, &message)
                 .record_failure(UsageRecordStatus::Error, "api_error", message);
             return map_provider_error(e, Some(&request_id));
         }
@@ -1357,9 +1597,7 @@ async fn handle_stream_request(
         credential_usage.request.simulated_usage,
         credential_usage.request.simulation_mode,
     );
-    ctx.set_reported_cache_creation_policy(
-        credential_usage.request.reported_cache_creation_policy(),
-    );
+    ctx.set_reported_cache_usage_policy(credential_usage.request.reported_cache_usage_policy());
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1575,8 +1813,9 @@ async fn handle_non_stream_request(
         Err(e) => {
             let message = e.to_string();
             let request_id = usage_context.request_id.clone();
+            log_provider_call_failure(&message);
             usage_context
-                .attach_credential(None, None, false, false)
+                .attach_provider_error_credential(&provider, &message)
                 .record_failure(UsageRecordStatus::Error, "api_error", message);
             return map_provider_error(e, Some(&request_id));
         }
@@ -2110,6 +2349,7 @@ pub async fn post_messages_cc(
 mod tests {
     use super::*;
     use crate::anthropic::cache::{self, CacheUsage};
+    use crate::anthropic::pricing::PricingCatalog;
     use crate::anthropic::prompt_cache::PromptCacheTracker;
     use crate::anthropic::types::{Message, SystemMessage};
     use crate::anthropic::usage::UsageRecorder;
@@ -2181,7 +2421,7 @@ mod tests {
     }
 
     #[test]
-    fn cc_high_cache_reported_writer_policy_samples_within_target_band() {
+    fn cc_high_cache_reported_usage_policy_samples_natural_usage() {
         let usage = CacheUsage {
             total_input_tokens: 100_000,
             input_tokens: 50_000,
@@ -2193,15 +2433,16 @@ mod tests {
         };
         let values: Vec<i32> = (0..24)
             .map(|seed| {
-                let policy = reported_cache_creation_policy(
+                let policy = reported_cache_usage_policy(
                     "/cc/v1/messages",
                     PromptCacheSimulationMode::HighCache,
                     3_000,
+                    96,
                     seed,
                 )
                 .expect("policy should apply");
                 usage
-                    .with_reported_cache_creation_policy(policy)
+                    .with_reported_cache_usage_policy(policy)
                     .cache_creation_input_tokens
             })
             .collect();
@@ -2209,24 +2450,44 @@ mod tests {
         assert!(values.iter().all(|value| (1..=3_300).contains(value)));
         assert!(values.windows(2).any(|pair| pair[1] < pair[0]));
         assert!(values.iter().any(|value| value % 10 != 0));
+
+        let reported = usage.with_reported_cache_usage_policy(
+            reported_cache_usage_policy(
+                "/cc/v1/messages",
+                PromptCacheSimulationMode::HighCache,
+                3_000,
+                96,
+                9,
+            )
+            .expect("policy should apply"),
+        );
+        assert!((1..=96).contains(&reported.input_tokens));
+        assert_eq!(
+            reported.cache_read_input_tokens,
+            usage.input_tokens.saturating_sub(reported.input_tokens)
+        );
+        assert!(reported.cache_read_input_tokens < usage.input_tokens);
+        assert_eq!(reported.output_tokens, 1);
     }
 
     #[test]
-    fn reported_writer_policy_only_applies_to_cc_high_cache_local_prompt_cache() {
+    fn reported_usage_policy_only_applies_to_cc_high_cache_local_prompt_cache() {
         assert_eq!(
-            reported_cache_creation_policy(
+            reported_cache_usage_policy(
                 "/v1/messages",
                 PromptCacheSimulationMode::HighCache,
                 3_000,
+                96,
                 0,
             ),
             None
         );
         assert_eq!(
-            reported_cache_creation_policy(
+            reported_cache_usage_policy(
                 "/cc/v1/messages",
-                PromptCacheSimulationMode::LocalPromptCache,
+                PromptCacheSimulationMode::Disabled,
                 3_000,
+                96,
                 0,
             ),
             None
@@ -2237,6 +2498,7 @@ mod tests {
         let usage_context = RequestUsageContext {
             recorder: usage_recorder,
             prompt_cache,
+            pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_reported_limit".to_string(),
             endpoint: "/cc/v1/messages",
             stream: false,
@@ -2252,10 +2514,11 @@ mod tests {
             prompt_cache_cap_jitter_min_tokens: 0,
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
-            reported_cache_creation_policy: reported_cache_creation_policy(
+            reported_cache_usage_policy: reported_cache_usage_policy(
                 "/cc/v1/messages",
                 PromptCacheSimulationMode::HighCache,
                 3_000,
+                96,
                 7,
             ),
             simulated_usage: None,
@@ -2275,11 +2538,144 @@ mod tests {
         let capped =
             usage_context.reported_usage_for_downstream(usage, UsageSource::LocalPromptCache);
         assert!((0..=3_300).contains(&capped.cache_creation_input_tokens));
-        assert_eq!(capped.cache_read_input_tokens, 40_000);
+        assert!((1..=96).contains(&capped.input_tokens));
+        assert_eq!(
+            capped.cache_read_input_tokens,
+            usage
+                .cache_read_input_tokens
+                .saturating_add(usage.input_tokens.saturating_sub(capped.input_tokens))
+        );
+        assert!(capped.cache_read_input_tokens < 50_000);
 
         let upstream_metadata =
             usage_context.reported_usage_for_downstream(usage, UsageSource::UpstreamMetadata);
         assert_eq!(upstream_metadata.cache_creation_input_tokens, 50_000);
+    }
+
+    #[test]
+    fn v1_and_cc_share_high_cache_strategy_but_only_cc_rewrites_reported_writer() {
+        let usage = CacheUsage {
+            total_input_tokens: 100_000,
+            input_tokens: 10_000,
+            output_tokens: 1,
+            cache_creation_input_tokens: 50_000,
+            cache_read_input_tokens: 40_000,
+            cache_creation_5m_input_tokens: 50_000,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let prompt_cache = Arc::new(PromptCacheTracker::default());
+        let usage_recorder = Arc::new(UsageRecorder::new(10, None));
+
+        let v1_context = RequestUsageContext {
+            recorder: usage_recorder.clone(),
+            prompt_cache: prompt_cache.clone(),
+            pricing_catalog: Arc::new(PricingCatalog::new()),
+            request_id: "req_v1_policy".to_string(),
+            endpoint: "/v1/messages",
+            stream: false,
+            model: "claude-sonnet-4-6".to_string(),
+            conversation_id: Some("session-policy".to_string()),
+            prompt_cache_scope_conversation_id: Some("session-policy".to_string()),
+            input_tokens: 100_000,
+            prompt_cache_profile: None,
+            simulation_mode: PromptCacheSimulationMode::HighCache,
+            prompt_cache_target_read_ratio: 0.95,
+            prompt_cache_token_scale: 1.0,
+            prompt_cache_max_simulated_input_tokens: 0,
+            prompt_cache_cap_jitter_min_tokens: 0,
+            prompt_cache_cap_jitter_max_tokens: 0,
+            prompt_cache_scale_min_input_tokens: 0,
+            reported_cache_usage_policy: reported_cache_usage_policy(
+                "/v1/messages",
+                PromptCacheSimulationMode::HighCache,
+                3_000,
+                96,
+                7,
+            ),
+            simulated_usage: None,
+            simulated_source: Some(UsageSource::LocalPromptCache),
+            started_at: Instant::now(),
+        };
+        let cc_context = RequestUsageContext {
+            endpoint: "/cc/v1/messages",
+            request_id: "req_cc_policy".to_string(),
+            reported_cache_usage_policy: reported_cache_usage_policy(
+                "/cc/v1/messages",
+                PromptCacheSimulationMode::HighCache,
+                3_000,
+                96,
+                7,
+            ),
+            ..v1_context.clone()
+        };
+
+        assert_eq!(v1_context.reported_cache_usage_policy(), None);
+        assert!(cc_context.reported_cache_usage_policy().is_some());
+
+        let v1_reported =
+            v1_context.reported_usage_for_downstream(usage, UsageSource::LocalPromptCache);
+        assert_eq!(v1_reported, usage);
+
+        let cc_reported =
+            cc_context.reported_usage_for_downstream(usage, UsageSource::LocalPromptCache);
+        assert!((1..=96).contains(&cc_reported.input_tokens));
+        assert!((0..=3_300).contains(&cc_reported.cache_creation_input_tokens));
+        assert_eq!(
+            cc_reported.cache_read_input_tokens,
+            usage
+                .cache_read_input_tokens
+                .saturating_add(usage.input_tokens.saturating_sub(cc_reported.input_tokens))
+        );
+        assert_eq!(cc_reported.output_tokens, usage.output_tokens);
+    }
+
+    #[test]
+    fn provider_error_hint_extracts_credential_for_failure_records() {
+        let hint = extract_credential_error_hint(
+            "非流式 API 请求失败（凭据 #2 IlmiMiazzi@gmail.com）: 429 Too Many Requests",
+        )
+        .expect("credential hint");
+        assert_eq!(hint.id, 2);
+        assert_eq!(hint.label.as_deref(), Some("IlmiMiazzi@gmail.com"));
+        assert_eq!(hint.display_label(), "#2 IlmiMiazzi@gmail.com");
+
+        let prompt_cache = Arc::new(PromptCacheTracker::default());
+        let usage_recorder = Arc::new(UsageRecorder::new(10, None));
+        let usage_context = RequestUsageContext {
+            recorder: usage_recorder.clone(),
+            prompt_cache,
+            pricing_catalog: Arc::new(PricingCatalog::new()),
+            request_id: "req_error_hint".to_string(),
+            endpoint: "/v1/messages",
+            stream: false,
+            model: "claude-sonnet-4-6".to_string(),
+            conversation_id: Some("session-error".to_string()),
+            prompt_cache_scope_conversation_id: Some("session-error".to_string()),
+            input_tokens: 4096,
+            prompt_cache_profile: None,
+            simulation_mode: PromptCacheSimulationMode::HighCache,
+            prompt_cache_target_read_ratio: 0.95,
+            prompt_cache_token_scale: 1.0,
+            prompt_cache_max_simulated_input_tokens: 0,
+            prompt_cache_cap_jitter_min_tokens: 0,
+            prompt_cache_cap_jitter_max_tokens: 0,
+            prompt_cache_scale_min_input_tokens: 0,
+            reported_cache_usage_policy: None,
+            simulated_usage: None,
+            simulated_source: None,
+            started_at: Instant::now(),
+        };
+        usage_context
+            .attach_credential(Some(hint.id), hint.label, false, false)
+            .record_failure(UsageRecordStatus::Error, "api_error", "upstream failed");
+
+        let records = usage_recorder.query(Default::default()).records;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].credential_id, Some(2));
+        assert_eq!(
+            records[0].credential_label.as_deref(),
+            Some("IlmiMiazzi@gmail.com")
+        );
     }
 
     #[test]
@@ -2311,6 +2707,7 @@ mod tests {
         let usage_context = RequestUsageContext {
             recorder: usage_recorder,
             prompt_cache: prompt_cache.clone(),
+            pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_test".to_string(),
             endpoint: "/v1/messages",
             stream: true,
@@ -2319,14 +2716,14 @@ mod tests {
             prompt_cache_scope_conversation_id: Some("session-a".to_string()),
             input_tokens: 4096,
             prompt_cache_profile: profile.clone(),
-            simulation_mode: PromptCacheSimulationMode::LocalPromptCache,
+            simulation_mode: PromptCacheSimulationMode::HighCache,
             prompt_cache_target_read_ratio: 0.85,
             prompt_cache_token_scale: 1.0,
             prompt_cache_max_simulated_input_tokens: 0,
             prompt_cache_cap_jitter_min_tokens: 0,
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
-            reported_cache_creation_policy: None,
+            reported_cache_usage_policy: None,
             simulated_usage: None,
             simulated_source: Some(UsageSource::LocalPromptCache),
             started_at: Instant::now(),
@@ -2379,6 +2776,7 @@ mod tests {
         let usage_context = RequestUsageContext {
             recorder: usage_recorder,
             prompt_cache: prompt_cache.clone(),
+            pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_high_cache".to_string(),
             endpoint: "/v1/messages",
             stream: true,
@@ -2394,7 +2792,7 @@ mod tests {
             prompt_cache_cap_jitter_min_tokens: 0,
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
-            reported_cache_creation_policy: None,
+            reported_cache_usage_policy: None,
             simulated_usage: Some(cache::CacheSimulation {
                 cache_creation_input_tokens: 3968,
                 cache_read_input_tokens: 0,
@@ -2550,7 +2948,7 @@ mod tests {
     }
 
     #[test]
-    fn local_prompt_cache_does_not_simulate_without_stable_conversation_id() {
+    fn disabled_prompt_cache_does_not_simulate_without_stable_conversation_id() {
         let prompt_cache = Arc::new(PromptCacheTracker::default());
         let usage_recorder = Arc::new(UsageRecorder::new(10, None));
         let state = AppState::new(
@@ -2558,7 +2956,7 @@ mod tests {
             true,
             usage_recorder,
             prompt_cache.clone(),
-            PromptCacheSimulationMode::LocalPromptCache,
+            PromptCacheSimulationMode::Disabled,
             0.95,
             CompatProfile::ClaudeCode,
             false,
@@ -2584,9 +2982,7 @@ mod tests {
             output_config: None,
             metadata: None,
         };
-        let profile = prompt_cache.build_profile(&payload, 4096);
-
-        let (simulation, source) = build_simulated_usage(&state, None, profile.as_ref());
+        let (simulation, source) = build_simulated_usage(&state, None, None);
 
         assert!(simulation.is_none());
         assert!(source.is_none());
@@ -2600,12 +2996,66 @@ mod tests {
             prompt_cache_scope_conversation_id(state.prompt_cache_simulation_mode, &payload),
             4096,
         );
-        assert!(context.prompt_cache_profile.is_some());
+        assert!(context.prompt_cache_profile.is_none());
         assert!(context.prompt_cache_scope_conversation_id.is_none());
 
         let credential_usage = attach_test_credential_usage(context, 1);
         assert!(credential_usage.request.simulated_usage.is_none());
         assert!(credential_usage.request.simulated_source.is_none());
+    }
+
+    #[test]
+    fn disabled_prompt_cache_mode_does_not_build_local_profile() {
+        let prompt_cache = Arc::new(PromptCacheTracker::default());
+        let usage_recorder = Arc::new(UsageRecorder::new(10, None));
+        let state = AppState::new(
+            "test-key",
+            true,
+            usage_recorder,
+            prompt_cache,
+            PromptCacheSimulationMode::Disabled,
+            0.95,
+            CompatProfile::ClaudeCode,
+            false,
+        );
+        let payload = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 16,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!([
+                    {
+                        "type": "text",
+                        "text": "cacheable prompt block ".repeat(700),
+                        "cache_control": {"type": "ephemeral"}
+                    }
+                ]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let context = prepare_usage_context(
+            &state,
+            "/na/v1/messages",
+            false,
+            &payload,
+            Some("conversation-id".to_string()),
+            prompt_cache_scope_conversation_id(state.prompt_cache_simulation_mode, &payload),
+            4096,
+        );
+
+        assert_eq!(context.simulation_mode, PromptCacheSimulationMode::Disabled);
+        assert!(context.prompt_cache_profile.is_none());
+        assert!(context.prompt_cache_scope_conversation_id.is_none());
+        assert!(context.simulated_usage.is_none());
+        assert!(context.simulated_source.is_none());
+        assert!(context.reported_cache_usage_policy.is_none());
     }
 
     fn attach_test_credential_usage(

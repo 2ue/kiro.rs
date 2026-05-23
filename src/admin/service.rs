@@ -8,8 +8,16 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use super::error::AdminServiceError;
+use super::types::{
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
+    CredentialsPageResponse, CredentialsStatusResponse, LoadBalancingModeResponse,
+    RuntimeConfigResponse, SetLoadBalancingModeRequest, SetWarmupRequest, TestCredentialRequest,
+    TestCredentialResponse, UpdateRuntimeConfigRequest,
+};
 use crate::anthropic::{
     converter::map_model,
+    pricing::{PricingCatalog, PricingStatus},
     prompt_cache::PromptCacheTracker,
     usage::{
         UsageRecordQuery, UsageRecorder, UsageRecordsPageResult, UsageRecordsResult, UsageSummary,
@@ -23,13 +31,6 @@ use crate::kiro::model::requests::{
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::MultiTokenManager;
-
-use super::error::AdminServiceError;
-use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsPageResponse, CredentialsStatusResponse, LoadBalancingModeResponse,
-    SetLoadBalancingModeRequest, TestCredentialRequest, TestCredentialResponse,
-};
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
@@ -45,6 +46,14 @@ struct CachedBalance {
     data: BalanceResponse,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CredentialsBackupExport {
+    format: &'static str,
+    exported_at: String,
+    credentials: Vec<KiroCredentials>,
+}
+
 /// Admin 服务
 ///
 /// 封装所有 Admin API 的业务逻辑
@@ -56,6 +65,7 @@ pub struct AdminService {
     known_endpoints: HashSet<String>,
     usage_recorder: Arc<UsageRecorder>,
     prompt_cache: Arc<PromptCacheTracker>,
+    pricing_catalog: Arc<PricingCatalog>,
     high_cache_threshold: i32,
     kiro_provider: Arc<KiroProvider>,
 }
@@ -66,6 +76,7 @@ impl AdminService {
         known_endpoints: impl IntoIterator<Item = String>,
         usage_recorder: Arc<UsageRecorder>,
         prompt_cache: Arc<PromptCacheTracker>,
+        pricing_catalog: Arc<PricingCatalog>,
         high_cache_threshold: i32,
         kiro_provider: Arc<KiroProvider>,
     ) -> Self {
@@ -82,6 +93,7 @@ impl AdminService {
             known_endpoints: known_endpoints.into_iter().collect(),
             usage_recorder,
             prompt_cache,
+            pricing_catalog,
             high_cache_threshold,
             kiro_provider,
         }
@@ -129,31 +141,44 @@ impl AdminService {
 
     fn credential_status_items(&self) -> (usize, usize, u64, Vec<CredentialStatusItem>) {
         let snapshot = self.token_manager.snapshot();
-        let default_endpoint = self.token_manager.config().default_endpoint.clone();
+        let default_endpoint = self.token_manager.runtime_config().default_endpoint;
+        let cost_summary = self.usage_recorder.credential_cost_summary();
 
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
             .into_iter()
-            .map(|entry| CredentialStatusItem {
-                id: entry.id,
-                priority: entry.priority,
-                disabled: entry.disabled,
-                failure_count: entry.failure_count,
-                is_current: entry.id == snapshot.current_id,
-                expires_at: entry.expires_at,
-                auth_method: entry.auth_method,
-                has_profile_arn: entry.has_profile_arn,
-                refresh_token_hash: entry.refresh_token_hash,
-                api_key_hash: entry.api_key_hash,
-                masked_api_key: entry.masked_api_key,
-                email: entry.email,
-                success_count: entry.success_count,
-                last_used_at: entry.last_used_at.clone(),
-                has_proxy: entry.has_proxy,
-                proxy_url: entry.proxy_url,
-                refresh_failure_count: entry.refresh_failure_count,
-                disabled_reason: entry.disabled_reason,
-                endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+            .map(|entry| {
+                let cost = cost_summary.get(&entry.id).copied().unwrap_or_default();
+                CredentialStatusItem {
+                    id: entry.id,
+                    priority: entry.priority,
+                    disabled: entry.disabled,
+                    failure_count: entry.failure_count,
+                    is_current: entry.id == snapshot.current_id,
+                    expires_at: entry.expires_at,
+                    auth_method: entry.auth_method,
+                    has_profile_arn: entry.has_profile_arn,
+                    refresh_token_hash: entry.refresh_token_hash,
+                    api_key_hash: entry.api_key_hash,
+                    masked_api_key: entry.masked_api_key,
+                    email: entry.email,
+                    success_count: entry.success_count,
+                    last_used_at: entry.last_used_at.clone(),
+                    has_proxy: entry.has_proxy,
+                    proxy_url: entry.proxy_url,
+                    refresh_failure_count: entry.refresh_failure_count,
+                    disabled_reason: entry.disabled_reason,
+                    endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                    cooled_down: entry.cooled_down,
+                    cooldown_remaining_secs: entry.cooldown_remaining_secs,
+                    cooldown_reason: entry.cooldown_reason,
+                    rate_limited: entry.rate_limited,
+                    rate_limit_remaining_secs: entry.rate_limit_remaining_secs,
+                    warmup_remaining: entry.warmup_remaining,
+                    estimated_cost_usd: cost.estimated_cost_usd,
+                    priced_requests: cost.priced_requests,
+                    unpriced_requests: cost.unpriced_requests,
+                }
             })
             .collect();
 
@@ -432,9 +457,121 @@ impl AdminService {
         self.usage_recorder.summary(self.high_cache_threshold)
     }
 
+    /// 获取模型价格同步状态。
+    pub fn get_model_pricing(&self) -> PricingStatus {
+        self.pricing_catalog.status()
+    }
+
+    /// 手动同步模型价格。失败不影响调度，只体现在返回状态的 last_error。
+    pub async fn sync_model_pricing(&self) -> PricingStatus {
+        self.pricing_catalog.sync().await
+    }
+
+    /// 导出完整凭据。仅格式化当前内存快照，不修改凭据状态。
+    pub fn export_credentials(&self, format: &str) -> Result<(String, String), AdminServiceError> {
+        let credentials = self.token_manager.export_credentials();
+        let normalized = format.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "" | "json" => {
+                let body = serde_json::to_string_pretty(&credentials).map_err(|e| {
+                    AdminServiceError::InternalError(format!("序列化凭据失败: {}", e))
+                })?;
+                Ok((body, "kiro-credentials.json".to_string()))
+            }
+            "backup-json" | "wrapped-json" => {
+                let export = CredentialsBackupExport {
+                    format: "kiro-rs-credentials-backup",
+                    exported_at: Utc::now().to_rfc3339(),
+                    credentials,
+                };
+                let body = serde_json::to_string_pretty(&export).map_err(|e| {
+                    AdminServiceError::InternalError(format!("序列化凭据失败: {}", e))
+                })?;
+                Ok((body, "kiro-credentials-backup.json".to_string()))
+            }
+            "jsonl" => {
+                let mut lines = Vec::with_capacity(credentials.len());
+                for credential in credentials {
+                    lines.push(serde_json::to_string(&credential).map_err(|e| {
+                        AdminServiceError::InternalError(format!("序列化凭据失败: {}", e))
+                    })?);
+                }
+                Ok((lines.join("\n"), "kiro-credentials.jsonl".to_string()))
+            }
+            _ => Err(AdminServiceError::InvalidCredential(format!(
+                "不支持的导出格式: {}，可选 json、backup-json、jsonl",
+                format
+            ))),
+        }
+    }
+
     /// 清空 usage 记录。
     pub fn clear_usage_records(&self) {
         self.usage_recorder.clear();
+    }
+
+    /// 获取运行时全局配置。
+    pub fn get_runtime_config(&self) -> RuntimeConfigResponse {
+        let config = self.token_manager.runtime_config();
+        RuntimeConfigResponse {
+            credential_rpm: config.credential_rpm.unwrap_or(0),
+            credential_transient_cooldown_secs: config.credential_transient_cooldown_secs,
+            credential_max_cooldown_secs: config.credential_max_cooldown_secs,
+            credential_warmup_requests: config.credential_warmup_requests,
+            credential_warmup_selection_percent: config.credential_warmup_selection_percent,
+            compression_enabled: config.compression.enabled,
+            whitespace_compression: config.compression.whitespace_compression,
+        }
+    }
+
+    /// 更新运行时全局配置，并写回 config.json。
+    pub fn update_runtime_config(
+        &self,
+        req: UpdateRuntimeConfigRequest,
+    ) -> Result<RuntimeConfigResponse, AdminServiceError> {
+        let current_config = self.token_manager.runtime_config();
+        let warmup_selection_percent = req
+            .credential_warmup_selection_percent
+            .unwrap_or(current_config.credential_warmup_selection_percent);
+
+        if req.credential_max_cooldown_secs == 0 {
+            return Err(AdminServiceError::InvalidCredential(
+                "credentialMaxCooldownSecs 必须大于 0".to_string(),
+            ));
+        }
+        if req.credential_transient_cooldown_secs > req.credential_max_cooldown_secs {
+            return Err(AdminServiceError::InvalidCredential(
+                "credentialTransientCooldownSecs 不能大于 credentialMaxCooldownSecs".to_string(),
+            ));
+        }
+        if warmup_selection_percent > 100 {
+            return Err(AdminServiceError::InvalidCredential(
+                "credentialWarmupSelectionPercent 不能大于 100".to_string(),
+            ));
+        }
+
+        let credential_rpm = (req.credential_rpm > 0).then_some(req.credential_rpm);
+        let compression = req.compression();
+
+        self.token_manager
+            .update_runtime_config(|config| {
+                config.credential_rpm = credential_rpm;
+                config.credential_transient_cooldown_secs = req.credential_transient_cooldown_secs;
+                config.credential_max_cooldown_secs = req.credential_max_cooldown_secs;
+                config.credential_warmup_requests = req.credential_warmup_requests;
+                config.credential_warmup_selection_percent = warmup_selection_percent;
+                config.compression = compression.clone();
+            })
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(self.get_runtime_config())
+    }
+
+    /// 设置凭据预热剩余请求数。
+    pub fn set_warmup(&self, id: u64, req: SetWarmupRequest) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_warmup_remaining(id, req.warmup_remaining)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))
     }
 
     /// 获取负载均衡模式
@@ -485,6 +622,9 @@ impl AdminService {
             Ok(c) => c,
             Err(_) => return HashMap::new(),
         };
+        if content.trim().is_empty() {
+            return HashMap::new();
+        }
 
         // 文件中使用字符串 key 以兼容 JSON 格式
         let map: HashMap<String, CachedBalance> = match serde_json::from_str(&content) {
@@ -522,7 +662,7 @@ impl AdminService {
 
         match serde_json::to_string_pretty(&map) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
+                if let Err(e) = crate::common::fs::write_file_atomic(path, json) {
                     tracing::warn!("保存余额缓存失败: {}", e);
                 }
             }

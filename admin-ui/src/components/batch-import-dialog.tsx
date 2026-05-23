@@ -10,8 +10,9 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
-import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
+import { setCredentialDisabled, testCredential } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
+import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
 
 interface BatchImportDialogProps {
   open: boolean
@@ -37,7 +38,8 @@ interface VerificationResult {
   index: number
   status: 'pending' | 'checking' | 'verifying' | 'verified' | 'duplicate' | 'failed'
   error?: string
-  usage?: string
+  model?: string
+  response?: string
   email?: string
   credentialId?: number
   rollbackStatus?: 'success' | 'failed' | 'skipped'
@@ -243,8 +245,11 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             // 延迟 1 秒
             await new Promise(resolve => setTimeout(resolve, 1000))
 
-            // 验活
-            const balance = await getCredentialBalance(addedCred.credentialId)
+            // 验活：只做模型调用测试，不查余额。
+            const testResult = await testCredential(addedCred.credentialId, {
+              model: DEFAULT_TEST_MODEL,
+              prompt: DEFAULT_TEST_PROMPT,
+            })
 
             successCount++
             existingApiKeyHashes.add(credHash)
@@ -254,7 +259,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               newResults[i] = {
                 ...newResults[i],
                 status: 'verified',
-                usage: `${balance.currentUsage}/${balance.usageLimit}`,
+                model: testModelLabel(testResult.model),
+                response: testResult.response,
                 email: addedCred.email || cred.email || undefined,
                 credentialId: addedCred.credentialId
               }
@@ -293,8 +299,11 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           // 延迟 1 秒
           await new Promise(resolve => setTimeout(resolve, 1000))
 
-          // 验活
-          const balance = await getCredentialBalance(addedCred.credentialId)
+          // 验活：只做模型调用测试，不查余额。
+          const testResult = await testCredential(addedCred.credentialId, {
+            model: DEFAULT_TEST_MODEL,
+            prompt: DEFAULT_TEST_PROMPT,
+          })
 
           // 验活成功
           successCount++
@@ -305,7 +314,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             newResults[i] = {
               ...newResults[i],
               status: 'verified',
-              usage: `${balance.currentUsage}/${balance.usageLimit}`,
+              model: testModelLabel(testResult.model),
+              response: testResult.response,
               email: addedCred.email || cred.email || undefined,
               credentialId: addedCred.credentialId
             }
@@ -485,9 +495,14 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                             {getStatusText(result)}
                           </span>
                         </div>
-                        {result.usage && (
+                        {result.model && (
                           <div className="text-xs text-muted-foreground mt-1">
-                            用量: {result.usage}
+                            模型: {result.model}
+                          </div>
+                        )}
+                        {result.response && (
+                          <div className="text-xs text-muted-foreground mt-1 line-clamp-2">
+                            响应: {result.response}
                           </div>
                         )}
                         {result.error && (

@@ -4,6 +4,7 @@ import {
   getCredentialsPage,
   setCredentialDisabled,
   setCredentialPriority,
+  setCredentialWarmup,
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
@@ -12,8 +13,10 @@ import {
   deleteCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  getRuntimeConfig,
+  updateRuntimeConfig,
 } from '@/api/credentials'
-import type { AddCredentialRequest, CredentialsPageQuery, TestCredentialRequest } from '@/types/api'
+import type { AddCredentialRequest, CredentialsPageQuery, TestCredentialRequest, UpdateRuntimeConfigRequest } from '@/types/api'
 
 function invalidateCredentialCaches(queryClient: ReturnType<typeof useQueryClient>, id?: number) {
   queryClient.invalidateQueries({ queryKey: ['credentials'] })
@@ -91,6 +94,17 @@ export function useSetPriority() {
   })
 }
 
+export function useSetWarmup() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, warmupRemaining }: { id: number; warmupRemaining: number }) =>
+      setCredentialWarmup(id, warmupRemaining),
+    onSuccess: (_data, variables) => {
+      invalidateCredentialCaches(queryClient, variables.id)
+    },
+  })
+}
+
 // 重置失败计数
 export function useResetFailure() {
   const queryClient = useQueryClient()
@@ -150,6 +164,25 @@ export function useSetLoadBalancingMode() {
     mutationFn: setLoadBalancingMode,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+    },
+  })
+}
+
+export function useRuntimeConfig() {
+  return useQuery({
+    queryKey: ['runtimeConfig'],
+    queryFn: getRuntimeConfig,
+  })
+}
+
+export function useUpdateRuntimeConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: UpdateRuntimeConfigRequest) => updateRuntimeConfig(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['runtimeConfig'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials-page'] })
     },
   })
 }

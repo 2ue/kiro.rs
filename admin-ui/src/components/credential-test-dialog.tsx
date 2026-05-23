@@ -13,21 +13,8 @@ import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { useTestCredential } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
+import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, TEST_MODELS, testModelLabel } from '@/lib/test-models'
 import type { CredentialStatusItem, TestCredentialResponse } from '@/types/api'
-
-interface TestModelOption {
-  id: string
-  label: string
-}
-
-const TEST_MODELS: TestModelOption[] = [
-  { id: 'claude-opus-4-5-20251101', label: 'Claude Opus 4.5' },
-  { id: 'claude-sonnet-4-5-20250929', label: 'Claude Sonnet 4.5' },
-  { id: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5' },
-  { id: 'claude-opus-4-6', label: 'Claude Opus 4.6' },
-  { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6' },
-  { id: 'claude-opus-4-7', label: 'Claude Opus 4.7' },
-]
 
 interface CredentialTestDialogProps {
   credential: CredentialStatusItem | null
@@ -51,14 +38,14 @@ export function CredentialTestDialog({
   open,
   onOpenChange,
 }: CredentialTestDialogProps) {
-  const [model, setModel] = useState(TEST_MODELS[0].id)
-  const [prompt, setPrompt] = useState('hi')
+  const [model, setModel] = useState(DEFAULT_TEST_MODEL)
+  const [prompt, setPrompt] = useState(DEFAULT_TEST_PROMPT)
   const [result, setResult] = useState<TestCredentialResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const testCredential = useTestCredential()
 
   const selectedModelLabel = useMemo(
-    () => TEST_MODELS.find((option) => option.id === model)?.label || model,
+    () => testModelLabel(model),
     [model]
   )
 
@@ -68,7 +55,7 @@ export function CredentialTestDialog({
     }
     setResult(null)
     setError(null)
-    setPrompt('hi')
+    setPrompt(DEFAULT_TEST_PROMPT)
   }, [open, credential?.id])
 
   const handleRun = () => {

@@ -5,8 +5,9 @@
 //! 支持多凭据故障转移和重试
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
+use chrono::Utc;
 use reqwest::Client;
-use reqwest::header::CONTENT_TYPE;
+use reqwest::header::{CONTENT_TYPE, HeaderMap};
 use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc,
@@ -278,7 +279,7 @@ impl KiroProvider {
             "默认端点 {} 未在 endpoints 注册表中",
             default_endpoint
         );
-        let tls_backend = token_manager.config().tls_backend;
+        let tls_backend = token_manager.runtime_config().tls_backend;
         // 预热：构建全局代理对应的 Client
         let initial_client =
             build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
@@ -433,8 +434,8 @@ impl KiroProvider {
         let credential_label = self.credential_log_label(ctx.id);
         let credential_context = format!("凭据 {}", credential_label);
 
-        let config = self.token_manager.config();
-        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
+        let config = self.token_manager.runtime_config();
+        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
         let endpoint = self.endpoint_for(&ctx.credentials).map_err(|e| {
             anyhow::anyhow!(
                 "非流式 API 凭据 endpoint 解析失败（{}）: {}",
@@ -447,11 +448,14 @@ impl KiroProvider {
             credentials: &ctx.credentials,
             token: &ctx.token,
             machine_id: &machine_id,
-            config,
+            config: &config,
         };
 
         let url = endpoint.api_url(&rctx);
-        let body = endpoint.transform_api_body(request_body, &rctx);
+        let body = crate::http_client::maybe_compress_json_whitespace(
+            endpoint.transform_api_body(request_body, &rctx),
+            config.compression.enabled && config.compression.whitespace_compression,
+        );
         let base = self
             .client_for(&ctx.credentials)
             .map_err(|e| {
@@ -535,8 +539,8 @@ impl KiroProvider {
             let credential_label = self.credential_log_label(ctx.id);
             let credential_context = format!("凭据 {}", credential_label);
 
-            let config = self.token_manager.config();
-            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
+            let config = self.token_manager.runtime_config();
+            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
 
             let endpoint = match self.endpoint_for(&ctx.credentials) {
                 Ok(e) => e,
@@ -563,11 +567,14 @@ impl KiroProvider {
                 credentials: &ctx.credentials,
                 token: &ctx.token,
                 machine_id: &machine_id,
-                config,
+                config: &config,
             };
 
             let url = endpoint.mcp_url(&rctx);
-            let body = endpoint.transform_mcp_body(request_body, &rctx);
+            let body = crate::http_client::maybe_compress_json_whitespace(
+                endpoint.transform_mcp_body(request_body, &rctx),
+                config.compression.enabled && config.compression.whitespace_compression,
+            );
 
             let base = self
                 .client_for(&ctx.credentials)
@@ -605,6 +612,7 @@ impl KiroProvider {
             };
 
             let status = response.status();
+            let retry_after = Self::retry_after_duration(response.headers());
 
             // 成功响应
             if status.is_success() {
@@ -731,6 +739,12 @@ impl KiroProvider {
                     status,
                     body
                 ));
+                self.token_manager.report_transient_failure(
+                    ctx.id,
+                    None,
+                    retry_after,
+                    format!("{} {}", status, body),
+                );
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -823,8 +837,8 @@ impl KiroProvider {
             let credential_label = self.credential_log_label(ctx.id);
             let credential_context = format!("凭据 {}", credential_label);
 
-            let config = self.token_manager.config();
-            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
+            let config = self.token_manager.runtime_config();
+            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
 
             let endpoint = match self.endpoint_for(&ctx.credentials) {
                 Ok(e) => e,
@@ -855,11 +869,14 @@ impl KiroProvider {
                 credentials: &ctx.credentials,
                 token: &ctx.token,
                 machine_id: &machine_id,
-                config,
+                config: &config,
             };
 
             let url = endpoint.api_url(&rctx);
-            let body = endpoint.transform_api_body(request_body, &rctx);
+            let body = crate::http_client::maybe_compress_json_whitespace(
+                endpoint.transform_api_body(request_body, &rctx),
+                config.compression.enabled && config.compression.whitespace_compression,
+            );
 
             let base = self
                 .client_for(&ctx.credentials)
@@ -912,6 +929,7 @@ impl KiroProvider {
             };
 
             let status = response.status();
+            let retry_after = Self::retry_after_duration(response.headers());
 
             // 成功响应
             if status.is_success() {
@@ -1121,6 +1139,12 @@ impl KiroProvider {
                     status,
                     body
                 ));
+                self.token_manager.report_transient_failure(
+                    ctx.id,
+                    model.as_deref(),
+                    retry_after,
+                    format!("{} {}", status, body),
+                );
                 self.maybe_exclude_after_soft_failure(
                     conversation_id.as_deref(),
                     model.as_deref(),
@@ -1234,6 +1258,27 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+
+    fn retry_after_duration(headers: &HeaderMap) -> Option<Duration> {
+        let value = headers.get("retry-after")?.to_str().ok()?.trim();
+        if value.is_empty() {
+            return None;
+        }
+
+        if let Ok(seconds) = value.parse::<u64>() {
+            return Some(Duration::from_secs(seconds));
+        }
+
+        let retry_at = chrono::DateTime::parse_from_rfc2822(value)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))?;
+        let seconds = retry_at.signed_duration_since(Utc::now()).num_seconds();
+        if seconds <= 0 {
+            Some(Duration::from_secs(1))
+        } else {
+            Some(Duration::from_secs(seconds as u64))
+        }
     }
 
     fn is_event_stream_response(response: &reqwest::Response) -> bool {

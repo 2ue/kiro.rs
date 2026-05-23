@@ -92,6 +92,7 @@ pub struct PromptCacheTracker {
 }
 
 impl PromptCacheTracker {
+    #[allow(dead_code)]
     pub fn build_profile(
         &self,
         req: &MessagesRequest,

@@ -20,9 +20,11 @@ import { extractErrorMessage } from '@/lib/utils'
 import {
   useSetDisabled,
   useSetPriority,
+  useSetWarmup,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
+  useRuntimeConfig,
 } from '@/hooks/use-credentials'
 
 interface CredentialCardProps {
@@ -51,6 +53,16 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
+function formatUsd(value: number): string {
+  if (!Number.isFinite(value)) return '-'
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: value >= 1 ? 2 : 6,
+    maximumFractionDigits: value >= 1 ? 2 : 6,
+  }).format(value)
+}
+
 export function CredentialCard({
   credential,
   onViewBalance,
@@ -69,7 +81,10 @@ export function CredentialCard({
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
+  const setWarmup = useSetWarmup()
+  const runtimeConfig = useRuntimeConfig()
   const displayName = credential.email || credential.maskedApiKey || `凭据 #${credential.id}`
+  const warmupTarget = Math.max(0, runtimeConfig.data?.credentialWarmupRequests ?? 3)
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -127,6 +142,21 @@ export function CredentialCard({
     })
   }
 
+  const handleToggleWarmup = () => {
+    const nextWarmup = credential.warmupRemaining > 0 ? 0 : Math.max(1, warmupTarget)
+    setWarmup.mutate(
+      { id: credential.id, warmupRemaining: nextWarmup },
+      {
+        onSuccess: () => {
+          toast.success(nextWarmup > 0 ? `凭据 #${credential.id} 已开启预热` : `凭据 #${credential.id} 已关闭预热`)
+        },
+        onError: (err) => {
+          toast.error('预热设置失败: ' + extractErrorMessage(err))
+        },
+      }
+    )
+  }
+
   const handleDelete = () => {
     if (!credential.disabled) {
       toast.error('请先禁用凭据再删除')
@@ -166,6 +196,15 @@ export function CredentialCard({
                 )}
                 {credential.disabled && credential.disabledReason && (
                   <Badge variant="outline">{credential.disabledReason}</Badge>
+                )}
+                {!credential.disabled && credential.cooledDown && (
+                  <Badge variant="outline">冷却 {credential.cooldownRemainingSecs}s</Badge>
+                )}
+                {!credential.disabled && credential.rateLimited && (
+                  <Badge variant="outline">限流 {credential.rateLimitRemainingSecs}s</Badge>
+                )}
+                {!credential.disabled && credential.warmupRemaining > 0 && (
+                  <Badge variant="secondary">预热 {credential.warmupRemaining}</Badge>
                 )}
                 {credential.authMethod && (
                   <Badge variant="secondary">
@@ -259,6 +298,35 @@ export function CredentialCard({
               <span className="text-muted-foreground">成功次数：</span>
               <span className="font-medium">{credential.successCount}</span>
             </div>
+            <div>
+              <span className="text-muted-foreground">估算费用：</span>
+              <span className="font-medium">{formatUsd(credential.estimatedCostUsd || 0)}</span>
+            </div>
+            {(credential.pricedRequests > 0 || credential.unpricedRequests > 0) && (
+              <div>
+                <span className="text-muted-foreground">计价请求：</span>
+                <span className="font-medium">
+                  {credential.pricedRequests}/{credential.pricedRequests + credential.unpricedRequests}
+                </span>
+              </div>
+            )}
+            {(credential.cooledDown || credential.rateLimited || credential.warmupRemaining > 0) && (
+              <div className="col-span-2">
+                <span className="text-muted-foreground">调度状态：</span>
+                <span className="font-medium">
+                  {credential.cooledDown
+                    ? `冷却中 ${credential.cooldownRemainingSecs}s`
+                    : credential.rateLimited
+                      ? `本地限流 ${credential.rateLimitRemainingSecs}s`
+                      : `预热剩余 ${credential.warmupRemaining} 次`}
+                </span>
+                {credential.cooldownReason && (
+                  <span className="ml-1 text-xs text-muted-foreground">
+                    {credential.cooldownReason}
+                  </span>
+                )}
+              </div>
+            )}
             <div className="col-span-2">
               <span className="text-muted-foreground">最后调用：</span>
               <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
@@ -325,6 +393,15 @@ export function CredentialCard({
             >
               <RefreshCw className={`h-4 w-4 mr-1 ${forceRefresh.isPending ? 'animate-spin' : ''}`} />
               刷新 Token
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleToggleWarmup}
+              disabled={setWarmup.isPending || credential.disabled}
+              title={credential.disabled ? '已禁用的凭据无法调整预热' : undefined}
+            >
+              {credential.warmupRemaining > 0 ? '关闭预热' : `预热 ${warmupTarget} 次`}
             </Button>
             <Button
               size="sm"

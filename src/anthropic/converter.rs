@@ -301,9 +301,7 @@ pub(crate) fn extract_stable_conversation_id(req: &MessagesRequest) -> Option<St
 fn conversation_id_for_options(req: &MessagesRequest, options: ConverterOptions) -> Option<String> {
     match options.prompt_cache_simulation_mode {
         PromptCacheSimulationMode::HighCache => extract_stable_conversation_id(req),
-        PromptCacheSimulationMode::Disabled | PromptCacheSimulationMode::LocalPromptCache => {
-            extract_metadata_conversation_id(req)
-        }
+        PromptCacheSimulationMode::Disabled => extract_metadata_conversation_id(req),
     }
 }
 

@@ -15,7 +15,7 @@ use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
-use model::arg::Args;
+use model::arg::{Args, Command, CredentialsCommand};
 use model::config::Config;
 
 #[tokio::main]
@@ -48,6 +48,16 @@ async fn main() {
         tracing::error!("加载凭证失败: {}", e);
         std::process::exit(1);
     });
+
+    if let Some(command) = args.command {
+        if let Err(err) =
+            handle_cli_command(command, &config, credentials_config, &credentials_path)
+        {
+            tracing::error!("{}", err);
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // 判断是否为多凭据格式（用于刷新后回写）
     let is_multiple_format = credentials_config.is_multiple();
@@ -136,6 +146,26 @@ async fn main() {
         usage_record_path,
     ));
     let prompt_cache = Arc::new(anthropic::prompt_cache::PromptCacheTracker::default());
+    let pricing_catalog = Arc::new(anthropic::pricing::PricingCatalog::new());
+    {
+        let pricing_catalog = pricing_catalog.clone();
+        tokio::spawn(async move {
+            let status = pricing_catalog.sync().await;
+            if status.last_error.is_some() {
+                tracing::warn!(
+                    source = %status.source,
+                    model_count = status.model_count,
+                    "模型价格启动同步失败，使用当前价格目录继续运行"
+                );
+            } else {
+                tracing::info!(
+                    source = %status.source,
+                    model_count = status.model_count,
+                    "模型价格已初始化"
+                );
+            }
+        });
+    }
 
     // 创建 MultiTokenManager 和 KiroProvider
     let token_manager = MultiTokenManager::new(
@@ -174,7 +204,7 @@ async fn main() {
         config.extract_thinking,
         usage_recorder.clone(),
         prompt_cache.clone(),
-        config.prompt_cache_simulation_mode,
+        pricing_catalog.clone(),
         config.prompt_cache_target_read_ratio,
         config.prompt_cache_token_scale,
         config.prompt_cache_max_simulated_input_tokens,
@@ -182,6 +212,7 @@ async fn main() {
         config.prompt_cache_cap_jitter_max_tokens,
         config.prompt_cache_scale_min_input_tokens,
         config.cc_high_cache_reported_cache_creation_target_tokens,
+        config.cc_high_cache_reported_input_max_tokens,
         config.compat_profile,
         config.expose_proxy_warnings,
     );
@@ -204,6 +235,7 @@ async fn main() {
                 endpoint_names.clone(),
                 usage_recorder.clone(),
                 prompt_cache.clone(),
+                pricing_catalog.clone(),
                 config.high_cache_threshold,
                 kiro_provider.clone(),
             );
@@ -229,15 +261,24 @@ async fn main() {
     tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
     tracing::info!("可用 API:");
     tracing::info!("  GET  /v1/models");
-    tracing::info!("  POST /v1/messages");
+    tracing::info!("  POST /v1/messages (high-cache)");
     tracing::info!("  POST /v1/messages/count_tokens");
+    tracing::info!("  GET  /na/v1/models");
+    tracing::info!("  POST /na/v1/messages (no-cache)");
+    tracing::info!("  POST /na/v1/messages/count_tokens");
+    tracing::info!("  GET  /cc/v1/models");
+    tracing::info!("  POST /cc/v1/messages");
+    tracing::info!("  POST /cc/v1/messages/count_tokens");
     if admin_key_valid {
         tracing::info!("Admin API:");
         tracing::info!("  GET  /api/admin/credentials");
         tracing::info!("  GET  /api/admin/credentials-paged");
+        tracing::info!("  GET  /api/admin/credentials/export");
         tracing::info!("  GET  /api/admin/usage-records");
         tracing::info!("  GET  /api/admin/usage-records-paged");
         tracing::info!("  GET  /api/admin/usage-summary");
+        tracing::info!("  GET  /api/admin/model-pricing");
+        tracing::info!("  POST /api/admin/model-pricing/sync");
         tracing::info!("  POST /api/admin/credentials/:index/disabled");
         tracing::info!("  POST /api/admin/credentials/:index/priority");
         tracing::info!("  POST /api/admin/credentials/:index/reset");
@@ -248,4 +289,140 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+fn handle_cli_command(
+    command: Command,
+    config: &Config,
+    credentials_config: CredentialsConfig,
+    credentials_path: &str,
+) -> anyhow::Result<()> {
+    match command {
+        Command::Credentials { command } => {
+            handle_credentials_command(command, config, credentials_config, credentials_path)
+        }
+    }
+}
+
+fn handle_credentials_command(
+    command: CredentialsCommand,
+    config: &Config,
+    credentials_config: CredentialsConfig,
+    credentials_path: &str,
+) -> anyhow::Result<()> {
+    let is_multiple = credentials_config.is_multiple();
+    let credentials = credentials_config.into_sorted_credentials();
+    let stats = load_cli_stats(credentials_path);
+
+    match command {
+        CredentialsCommand::Stats => {
+            println!("credentials: {}", credentials.len());
+            println!(
+                "format: {}",
+                if is_multiple { "multiple" } else { "single" }
+            );
+            println!("loadBalancingMode: {}", config.load_balancing_mode);
+            println!(
+                "credentialRpm: {}",
+                config
+                    .credential_rpm
+                    .map(|rpm| rpm.to_string())
+                    .unwrap_or_else(|| "disabled".to_string())
+            );
+            println!("credentialsPersist: {}", config.credentials_persist);
+            println!(
+                "credentialStatsPersist: {}",
+                config.credential_stats_persist
+            );
+            for (index, credential) in credentials.iter().enumerate() {
+                let id = credential.id.unwrap_or((index + 1) as u64);
+                let stat = stats
+                    .as_ref()
+                    .and_then(|map| map.get(&id.to_string()))
+                    .cloned()
+                    .unwrap_or_default();
+                let label = credential
+                    .email
+                    .as_deref()
+                    .or_else(|| credential.endpoint.as_deref())
+                    .unwrap_or("-");
+                println!(
+                    "#{id} priority={} disabled={} auth={} label={} success={} lastUsed={}",
+                    credential.priority,
+                    credential.disabled,
+                    credential.auth_method.as_deref().unwrap_or(
+                        if credential.kiro_api_key.is_some() {
+                            "api_key"
+                        } else {
+                            "oauth"
+                        }
+                    ),
+                    label,
+                    stat.success_count,
+                    stat.last_used_at.unwrap_or_else(|| "-".to_string())
+                );
+            }
+        }
+        CredentialsCommand::Diagnostics => {
+            println!("credentialsPath: {}", credentials_path);
+            println!("credentials: {}", credentials.len());
+            println!(
+                "format: {}",
+                if is_multiple { "multiple" } else { "single" }
+            );
+            if !is_multiple {
+                println!("warning: single credentials format cannot be rewritten by token refresh");
+            }
+            if !config.credentials_persist {
+                println!("warning: credentials persistence is disabled");
+            }
+            if !config.credential_stats_persist {
+                println!("warning: credential stats persistence is disabled");
+            }
+            if config.load_balancing_mode != "priority" && config.load_balancing_mode != "balanced"
+            {
+                println!(
+                    "error: invalid loadBalancingMode '{}', expected priority or balanced",
+                    config.load_balancing_mode
+                );
+            }
+            let mut ids = std::collections::HashSet::new();
+            for (index, credential) in credentials.iter().enumerate() {
+                let id = credential.id.unwrap_or((index + 1) as u64);
+                if !ids.insert(id) {
+                    println!("error: duplicate credential id #{id}");
+                }
+                if credential.is_api_key_credential() && credential.kiro_api_key.is_none() {
+                    println!("error: credential #{id} authMethod=api_key but missing kiroApiKey");
+                }
+                if !credential.is_api_key_credential() && credential.refresh_token.is_none() {
+                    println!("warning: credential #{id} missing refreshToken");
+                }
+                if credential.machine_id.is_none() {
+                    println!(
+                        "info: credential #{id} missing machineId, it will be generated at startup"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Default, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CliStatsEntry {
+    success_count: u64,
+    last_used_at: Option<String>,
+}
+
+fn load_cli_stats(
+    credentials_path: &str,
+) -> Option<std::collections::HashMap<String, CliStatsEntry>> {
+    let stats_path = std::path::Path::new(credentials_path)
+        .parent()
+        .map(|dir| dir.join("kiro_stats.json"))?;
+    let content = std::fs::read_to_string(stats_path).ok()?;
+    serde_json::from_str(&content).ok()
 }

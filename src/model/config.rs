@@ -1,6 +1,5 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -17,20 +16,43 @@ impl Default for TlsBackend {
     }
 }
 
-/// 本地 prompt-cache usage 模拟模式。
+/// 路径级 prompt-cache usage 模式。
 ///
-/// 默认启用 high-cache；`disabled` 可关闭本地 prompt-cache usage 模拟。
+/// 该枚举仍作为内部请求链路标记使用；外部配置不再选择缓存模式：
+/// `/v1` 和 `/cc/v1` 固定使用 high-cache，`/na/v1` 固定禁用本地缓存模拟。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum PromptCacheSimulationMode {
     Disabled,
-    LocalPromptCache,
+    #[serde(alias = "local-prompt-cache")]
     HighCache,
 }
 
 impl Default for PromptCacheSimulationMode {
     fn default() -> Self {
-        Self::Disabled
+        Self::HighCache
+    }
+}
+
+/// 上游请求压缩配置。
+///
+/// 默认总开关关闭；如果启用，默认只执行低风险的 whitespace 压缩。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CompressionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default = "default_true")]
+    pub whitespace_compression: bool,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            whitespace_compression: true,
+        }
     }
 }
 
@@ -138,6 +160,41 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
+    /// 单凭据目标请求速率（RPM）。
+    ///
+    /// `None` 或 `0` 表示禁用本地凭据级限速；`>0` 会按每个凭据计算最小请求间隔，
+    /// 并在调度时优先分流到其他可用凭据。
+    #[serde(default)]
+    pub credential_rpm: Option<u32>,
+
+    /// 上游瞬态错误没有 Retry-After 时，对单个凭据设置的临时冷却秒数。
+    #[serde(default = "default_credential_transient_cooldown_secs")]
+    pub credential_transient_cooldown_secs: u64,
+
+    /// 单个凭据临时冷却最长秒数，用于限制 Retry-After 头的影响范围。
+    #[serde(default = "default_credential_max_cooldown_secs")]
+    pub credential_max_cooldown_secs: u64,
+
+    /// 新凭据预热请求次数。预热期内 balanced 会降低该凭据调度权重，但不会伪造 success_count。
+    #[serde(default = "default_credential_warmup_requests")]
+    pub credential_warmup_requests: u32,
+
+    /// balanced 模式下预热凭据参与真实业务请求调度的概率百分比。
+    #[serde(default = "default_credential_warmup_selection_percent")]
+    pub credential_warmup_selection_percent: u32,
+
+    /// 是否持久化凭据文件变更（Token 刷新、禁用、优先级等）。
+    #[serde(default = "default_credentials_persist")]
+    pub credentials_persist: bool,
+
+    /// 是否持久化调度统计缓存（success_count、last_used_at）。
+    #[serde(default = "default_credential_stats_persist")]
+    pub credential_stats_persist: bool,
+
+    /// 输入压缩配置。默认不启用；启用后默认只做 whitespace 压缩。
+    #[serde(default)]
+    pub compression: CompressionConfig,
+
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
@@ -153,13 +210,9 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
-    /// 本地 prompt-cache usage 模拟模式（默认 high-cache）。
-    #[serde(default = "default_prompt_cache_simulation_mode")]
-    pub prompt_cache_simulation_mode: PromptCacheSimulationMode,
-
     /// 本地 prompt-cache 模拟的目标 cache read 中心比例。
     ///
-    /// 对 local-prompt-cache 和 high-cache 生效；读取仍必须命中同一凭据、
+    /// 对 high-cache 生效；读取仍必须命中同一凭据、
     /// 会话、模型下已创建过的缓存前缀，不会凭空制造 cache read。实际比例会
     /// 围绕该值做小范围确定性浮动，避免每次都精确落在同一个百分比。
     #[serde(default = "default_prompt_cache_target_read_ratio")]
@@ -196,6 +249,14 @@ pub struct Config {
     #[serde(default = "default_cc_high_cache_reported_cache_creation_target_tokens")]
     pub cc_high_cache_reported_cache_creation_target_tokens: i32,
 
+    /// /cc high-cache 下游上报的 uncached input token 上限。
+    ///
+    /// 有缓存 usage 时，`/cc/v1/messages` 会把下游看到的 `input_tokens`
+    /// 采样到该上限内，并把剩余输入归入 `cache_read_input_tokens`。
+    /// 只影响上报，不影响 reader/tracker/upstream。
+    #[serde(default = "default_cc_high_cache_reported_input_max_tokens")]
+    pub cc_high_cache_reported_input_max_tokens: i32,
+
     /// 请求级 usage record 内存保留上限。
     #[serde(default = "default_usage_record_limit")]
     pub usage_record_limit: usize,
@@ -219,13 +280,6 @@ pub struct Config {
     /// 仅写头，不会修改响应体，对客户端无副作用。
     #[serde(default = "default_expose_proxy_warnings")]
     pub expose_proxy_warnings: bool,
-
-    /// 端点特定的配置
-    ///
-    /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
-    /// 未在此表出现的端点沿用实现内置默认值。
-    #[serde(default)]
-    pub endpoints: HashMap<String, serde_json::Value>,
 
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
@@ -269,6 +323,30 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_credential_transient_cooldown_secs() -> u64 {
+    10
+}
+
+fn default_credential_max_cooldown_secs() -> u64 {
+    300
+}
+
+fn default_credential_warmup_requests() -> u32 {
+    3
+}
+
+fn default_credential_warmup_selection_percent() -> u32 {
+    5
+}
+
+fn default_credentials_persist() -> bool {
+    true
+}
+
+fn default_credential_stats_persist() -> bool {
+    true
+}
+
 fn default_compat_profile() -> CompatProfile {
     CompatProfile::ClaudeCode
 }
@@ -277,8 +355,8 @@ fn default_extract_thinking() -> bool {
     true
 }
 
-fn default_prompt_cache_simulation_mode() -> PromptCacheSimulationMode {
-    PromptCacheSimulationMode::HighCache
+fn default_true() -> bool {
+    true
 }
 
 fn default_prompt_cache_target_read_ratio() -> f64 {
@@ -307,6 +385,10 @@ fn default_prompt_cache_scale_min_input_tokens() -> i32 {
 
 fn default_cc_high_cache_reported_cache_creation_target_tokens() -> i32 {
     3_000
+}
+
+fn default_cc_high_cache_reported_input_max_tokens() -> i32 {
+    96
 }
 
 fn default_usage_record_limit() -> usize {
@@ -350,10 +432,17 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
+            credential_rpm: None,
+            credential_transient_cooldown_secs: default_credential_transient_cooldown_secs(),
+            credential_max_cooldown_secs: default_credential_max_cooldown_secs(),
+            credential_warmup_requests: default_credential_warmup_requests(),
+            credential_warmup_selection_percent: default_credential_warmup_selection_percent(),
+            credentials_persist: default_credentials_persist(),
+            credential_stats_persist: default_credential_stats_persist(),
+            compression: CompressionConfig::default(),
             load_balancing_mode: default_load_balancing_mode(),
             compat_profile: default_compat_profile(),
             extract_thinking: default_extract_thinking(),
-            prompt_cache_simulation_mode: default_prompt_cache_simulation_mode(),
             prompt_cache_target_read_ratio: default_prompt_cache_target_read_ratio(),
             prompt_cache_token_scale: default_prompt_cache_token_scale(),
             prompt_cache_max_simulated_input_tokens:
@@ -363,11 +452,12 @@ impl Default for Config {
             prompt_cache_scale_min_input_tokens: default_prompt_cache_scale_min_input_tokens(),
             cc_high_cache_reported_cache_creation_target_tokens:
                 default_cc_high_cache_reported_cache_creation_target_tokens(),
+            cc_high_cache_reported_input_max_tokens:
+                default_cc_high_cache_reported_input_max_tokens(),
             usage_record_limit: default_usage_record_limit(),
             usage_record_persist: default_usage_record_persist(),
             high_cache_threshold: default_high_cache_threshold(),
             default_endpoint: default_endpoint(),
-            endpoints: HashMap::new(),
             expose_proxy_warnings: default_expose_proxy_warnings(),
             config_path: None,
         }
@@ -421,7 +511,7 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content)
+        crate::common::fs::write_file_atomic(path, content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
     }
@@ -437,16 +527,24 @@ mod tests {
     }
 
     #[test]
-    fn default_prompt_cache_simulation_mode_is_high_cache() {
-        assert_eq!(
-            Config::default().prompt_cache_simulation_mode,
-            PromptCacheSimulationMode::HighCache
-        );
+    fn default_prompt_cache_target_read_ratio_is_98_percent() {
+        assert_eq!(Config::default().prompt_cache_target_read_ratio, 0.98);
     }
 
     #[test]
-    fn default_prompt_cache_target_read_ratio_is_98_percent() {
-        assert_eq!(Config::default().prompt_cache_target_read_ratio, 0.98);
+    fn default_runtime_controls_are_conservative() {
+        let config = Config::default();
+
+        assert_eq!(config.credential_rpm, None);
+        assert_eq!(config.credential_transient_cooldown_secs, 10);
+        assert_eq!(config.credential_max_cooldown_secs, 300);
+        assert_eq!(config.credential_warmup_requests, 3);
+        assert_eq!(config.credential_warmup_selection_percent, 5);
+        assert!(config.credentials_persist);
+        assert!(config.credential_stats_persist);
+        assert!(!config.compression.enabled);
+        assert!(config.compression.whitespace_compression);
+        assert_eq!(config.cc_high_cache_reported_input_max_tokens, 96);
     }
 
     #[test]
@@ -458,21 +556,6 @@ mod tests {
         assert_eq!(config.prompt_cache_cap_jitter_min_tokens, 12_000);
         assert_eq!(config.prompt_cache_cap_jitter_max_tokens, 24_000);
         assert_eq!(config.prompt_cache_scale_min_input_tokens, 20_000);
-    }
-
-    #[test]
-    fn missing_prompt_cache_simulation_mode_defaults_to_high_cache() {
-        let config: Config = serde_json::from_str(
-            r#"{
-                "apiKey": "sk-test"
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            config.prompt_cache_simulation_mode,
-            PromptCacheSimulationMode::HighCache
-        );
     }
 
     #[test]
@@ -489,23 +572,20 @@ mod tests {
     }
 
     #[test]
-    fn prompt_cache_simulation_mode_deserializes_high_cache() {
+    fn legacy_prompt_cache_simulation_mode_is_ignored() {
         let config: Config = serde_json::from_str(
             r#"{
                 "apiKey": "sk-test",
-                "promptCacheSimulationMode": "high-cache"
+                "promptCacheSimulationMode": "disabled"
             }"#,
         )
         .unwrap();
 
-        assert_eq!(
-            config.prompt_cache_simulation_mode,
-            PromptCacheSimulationMode::HighCache
-        );
+        assert_eq!(config.prompt_cache_target_read_ratio, 0.98);
     }
 
     #[test]
-    fn prompt_cache_simulation_mode_still_deserializes_local_prompt_cache() {
+    fn legacy_local_prompt_cache_mode_is_ignored() {
         let config: Config = serde_json::from_str(
             r#"{
                 "apiKey": "sk-test",
@@ -514,10 +594,22 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            config.prompt_cache_simulation_mode,
-            PromptCacheSimulationMode::LocalPromptCache
-        );
+        let json = serde_json::to_string(&config).unwrap();
+
+        assert!(!json.contains("promptCacheSimulationMode"));
+    }
+
+    #[test]
+    fn cc_reported_input_max_deserializes_from_camel_case_config() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "apiKey": "sk-test",
+                "ccHighCacheReportedInputMaxTokens": 64
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.cc_high_cache_reported_input_max_tokens, 64);
     }
 
     #[test]

@@ -18,6 +18,16 @@ pub struct ProxyConfig {
     pub password: Option<String>,
 }
 
+pub fn maybe_compress_json_whitespace(body: String, enabled: bool) -> String {
+    if !enabled {
+        return body;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return body;
+    };
+    serde_json::to_string(&value).unwrap_or(body)
+}
+
 impl ProxyConfig {
     /// 从 url 创建代理配置
     pub fn new(url: impl Into<String>) -> Self {

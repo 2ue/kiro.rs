@@ -7,10 +7,12 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, clear_usage_records, delete_credential, force_refresh_token,
-        get_all_credentials, get_credential_balance, get_credentials_page, get_load_balancing_mode,
-        get_usage_records, get_usage_records_page, get_usage_summary, reset_failure_count,
-        set_credential_disabled, set_credential_priority, set_load_balancing_mode, test_credential,
+        add_credential, clear_usage_records, delete_credential, export_credentials,
+        force_refresh_token, get_all_credentials, get_credential_balance, get_credentials_page,
+        get_load_balancing_mode, get_model_pricing, get_runtime_config, get_usage_records,
+        get_usage_records_page, get_usage_summary, reset_failure_count, set_credential_disabled,
+        set_credential_priority, set_credential_warmup, set_load_balancing_mode,
+        sync_model_pricing, test_credential, update_runtime_config,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -41,10 +43,12 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/credentials",
             get(get_all_credentials).post(add_credential),
         )
+        .route("/credentials/export", get(export_credentials))
         .route("/credentials-paged", get(get_credentials_page))
         .route("/credentials/{id}", delete(delete_credential))
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
+        .route("/credentials/{id}/warmup", post(set_credential_warmup))
         .route("/credentials/{id}/reset", post(reset_failure_count))
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))
@@ -57,6 +61,12 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
         )
+        .route(
+            "/config/runtime",
+            get(get_runtime_config).put(update_runtime_config),
+        )
+        .route("/model-pricing", get(get_model_pricing))
+        .route("/model-pricing/sync", post(sync_model_pricing))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

@@ -411,6 +411,14 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    /// 临时冷却到期时间（上游 Retry-After/瞬态错误触发），不持久化。
+    cooldown_until: Option<Instant>,
+    /// 临时冷却原因，便于诊断。
+    cooldown_reason: Option<String>,
+    /// 下一次本地限流允许发送请求的时间，不持久化。
+    rate_limit_available_at: Option<Instant>,
+    /// 预热剩余请求数。仅影响 balanced 选择，不伪造 success_count。
+    warmup_remaining: u32,
 }
 
 /// 会话到凭据的粘性绑定。
@@ -491,6 +499,19 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 是否处于临时冷却。
+    pub cooled_down: bool,
+    /// 临时冷却剩余秒数。
+    pub cooldown_remaining_secs: u64,
+    /// 临时冷却原因。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_reason: Option<String>,
+    /// 是否因本地速率限制暂不可用。
+    pub rate_limited: bool,
+    /// 本地速率限制剩余秒数。
+    pub rate_limit_remaining_secs: u64,
+    /// 预热剩余请求数。
+    pub warmup_remaining: u32,
 }
 
 /// 凭据管理器状态快照
@@ -512,7 +533,7 @@ pub struct ManagerSnapshot {
 /// 支持多个凭据的管理，实现固定优先级 + 故障转移策略
 /// 故障统计基于 API 调用结果，而非 Token 刷新结果
 pub struct MultiTokenManager {
-    config: Config,
+    config: Mutex<Config>,
     proxy: Option<ProxyConfig>,
     /// 凭据条目列表
     entries: Mutex<Vec<CredentialEntry>>,
@@ -615,6 +636,10 @@ impl MultiTokenManager {
                     },
                     success_count: 0,
                     last_used_at: None,
+                    cooldown_until: None,
+                    cooldown_reason: None,
+                    rate_limit_available_at: None,
+                    warmup_remaining: 0,
                 }
             })
             .collect();
@@ -661,7 +686,7 @@ impl MultiTokenManager {
 
         let load_balancing_mode = config.load_balancing_mode.clone();
         let manager = Self {
-            config,
+            config: Mutex::new(config),
             proxy,
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
@@ -689,9 +714,52 @@ impl MultiTokenManager {
         Ok(manager)
     }
 
-    /// 获取配置的引用
-    pub fn config(&self) -> &Config {
-        &self.config
+    /// 获取当前运行时配置快照。
+    pub fn runtime_config(&self) -> Config {
+        self.config.lock().clone()
+    }
+
+    /// 更新当前运行时配置并写回 config.json。
+    pub fn update_runtime_config(&self, update: impl FnOnce(&mut Config)) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let mut updated = self.runtime_config();
+        update(&mut updated);
+        let config_path = updated.config_path().map(|path| path.to_path_buf());
+
+        let Some(config_path) = config_path else {
+            {
+                let mut config = self.config.lock();
+                *config = updated;
+            }
+            self.update_credential_rpm_from_config();
+            tracing::warn!("配置文件路径未知，运行时配置仅在当前进程生效");
+            return Ok(());
+        };
+
+        let mut persisted = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        persisted.credential_rpm = updated.credential_rpm;
+        persisted.credential_transient_cooldown_secs = updated.credential_transient_cooldown_secs;
+        persisted.credential_max_cooldown_secs = updated.credential_max_cooldown_secs;
+        persisted.credential_warmup_requests = updated.credential_warmup_requests;
+        persisted.credential_warmup_selection_percent = updated.credential_warmup_selection_percent;
+        persisted.compression = updated.compression.clone();
+        persisted
+            .save()
+            .with_context(|| format!("持久化运行时配置失败: {}", config_path.display()))?;
+
+        {
+            let mut config = self.config.lock();
+            *config = updated;
+        }
+        self.update_credential_rpm_from_config();
+
+        Ok(())
+    }
+
+    pub fn update_load_balancing_mode_in_config(&self, mode: &str) {
+        self.config.lock().load_balancing_mode = mode.to_string();
     }
 
     /// 获取凭据总数
@@ -720,6 +788,96 @@ impl MultiTokenManager {
         true
     }
 
+    fn entry_cooldown_remaining(entry: &CredentialEntry, now: Instant) -> Option<StdDuration> {
+        entry
+            .cooldown_until
+            .and_then(|until| until.checked_duration_since(now))
+    }
+
+    fn entry_rate_limit_remaining(entry: &CredentialEntry, now: Instant) -> Option<StdDuration> {
+        entry
+            .rate_limit_available_at
+            .and_then(|until| until.checked_duration_since(now))
+    }
+
+    fn credential_is_dispatchable(
+        entry: &CredentialEntry,
+        model: Option<&str>,
+        now: Instant,
+    ) -> bool {
+        Self::credential_is_usable_for_model(entry, model)
+            && Self::entry_cooldown_remaining(entry, now).is_none()
+            && Self::entry_rate_limit_remaining(entry, now).is_none()
+    }
+
+    fn rate_limit_interval(&self) -> Option<StdDuration> {
+        let rpm = self.config.lock().credential_rpm.unwrap_or(0);
+        if rpm == 0 {
+            return None;
+        }
+
+        let millis = (60_000u64 / rpm as u64).max(1);
+        Some(StdDuration::from_millis(millis))
+    }
+
+    fn cooldown_duration_from_retry_after(&self, retry_after: Option<StdDuration>) -> StdDuration {
+        let config = self.config.lock();
+        let fallback = StdDuration::from_secs(config.credential_transient_cooldown_secs);
+        let max = StdDuration::from_secs(config.credential_max_cooldown_secs.max(1));
+        let requested = retry_after.unwrap_or(fallback);
+        requested.clamp(StdDuration::from_secs(1), max)
+    }
+
+    fn update_credential_rpm_from_config(&self) {
+        if self.rate_limit_interval().is_none() {
+            let mut entries = self.entries.lock();
+            for entry in entries.iter_mut() {
+                entry.rate_limit_available_at = None;
+            }
+        }
+    }
+
+    fn min_dispatch_wait(
+        &self,
+        entries: &[CredentialEntry],
+        model: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        now: Instant,
+    ) -> Option<StdDuration> {
+        entries
+            .iter()
+            .filter(|entry| {
+                !excluded_ids.contains(&entry.id)
+                    && Self::credential_is_usable_for_model(entry, model)
+            })
+            .filter_map(|entry| {
+                match (
+                    Self::entry_cooldown_remaining(entry, now),
+                    Self::entry_rate_limit_remaining(entry, now),
+                ) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                }
+            })
+            .min()
+    }
+
+    fn mark_rate_limited_at(&self, id: u64, now: Instant) {
+        let Some(interval) = self.rate_limit_interval() else {
+            return;
+        };
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            let base = entry
+                .rate_limit_available_at
+                .filter(|at| *at > now)
+                .unwrap_or(now);
+            entry.rate_limit_available_at = Some(base + interval);
+        }
+    }
+
     /// 判断排除当前凭据后，本次请求是否还有其他可用凭据可 fallback。
     pub fn has_alternate_usable_credential(
         &self,
@@ -728,10 +886,11 @@ impl MultiTokenManager {
         current_id: u64,
     ) -> bool {
         let entries = self.entries.lock();
+        let now = Instant::now();
         entries.iter().any(|entry| {
             entry.id != current_id
                 && !excluded_ids.contains(&entry.id)
-                && Self::credential_is_usable_for_model(entry, model)
+                && Self::credential_is_dispatchable(entry, model, now)
         })
     }
 
@@ -742,12 +901,13 @@ impl MultiTokenManager {
         excluded_ids: &HashSet<u64>,
     ) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
+        let now = Instant::now();
 
         // 过滤可用凭据
         let available: Vec<_> = entries
             .iter()
             .filter(|e| {
-                !excluded_ids.contains(&e.id) && Self::credential_is_usable_for_model(e, model)
+                !excluded_ids.contains(&e.id) && Self::credential_is_dispatchable(e, model, now)
             })
             .collect();
 
@@ -760,9 +920,40 @@ impl MultiTokenManager {
 
         match mode {
             "balanced" => {
-                // Least-Used 策略：选择成功次数最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
-                let entry = available
+                let ready: Vec<_> = available
+                    .iter()
+                    .filter(|e| e.warmup_remaining == 0)
+                    .copied()
+                    .collect();
+                let warming: Vec<_> = available
+                    .iter()
+                    .filter(|e| e.warmup_remaining > 0)
+                    .copied()
+                    .collect();
+
+                // 预热不是后台主动打流量，而是在真实业务请求中低概率参与调度；
+                // 成功后才扣 warmup_remaining，且不伪造 success_count。
+                if !ready.is_empty() && !warming.is_empty() {
+                    let percent = self
+                        .config
+                        .lock()
+                        .credential_warmup_selection_percent
+                        .min(100);
+                    if percent > 0 && fastrand::u32(0..100) < percent {
+                        let entry = warming
+                            .iter()
+                            .min_by_key(|e| (e.success_count, e.credentials.priority))?;
+                        return Some((entry.id, entry.credentials.clone()));
+                    }
+
+                    let entry = ready
+                        .iter()
+                        .min_by_key(|e| (e.success_count, e.credentials.priority))?;
+                    return Some((entry.id, entry.credentials.clone()));
+                }
+
+                let candidates = if ready.is_empty() { warming } else { ready };
+                let entry = candidates
                     .iter()
                     .min_by_key(|e| (e.success_count, e.credentials.priority))?;
 
@@ -819,9 +1010,10 @@ impl MultiTokenManager {
         }
 
         let entries = self.entries.lock();
+        let now = Instant::now();
         entries
             .iter()
-            .find(|e| e.id == bound_id && Self::credential_is_usable_for_model(e, model))
+            .find(|e| e.id == bound_id && Self::credential_is_dispatchable(e, model, now))
             .map(|e| (e.id, e.credentials.clone()))
     }
 
@@ -838,10 +1030,11 @@ impl MultiTokenManager {
         };
 
         let entries = self.entries.lock();
+        let now = Instant::now();
         entries
             .iter()
             .find(|e| e.id == bound_id)
-            .is_none_or(|e| !Self::credential_is_usable_for_model(e, model))
+            .is_none_or(|e| !Self::credential_is_dispatchable(e, model, now))
     }
 
     fn bind_session_to_credential(&self, session_id: &str, credential_id: u64) {
@@ -982,12 +1175,13 @@ impl MultiTokenManager {
                     } else {
                         let entries = self.entries.lock();
                         let current_id = *self.current_id.lock();
+                        let now = Instant::now();
                         entries
                             .iter()
                             .find(|e| {
                                 e.id == current_id
                                     && !excluded_ids.contains(&e.id)
-                                    && Self::credential_is_usable_for_model(e, model)
+                                    && Self::credential_is_dispatchable(e, model, now)
                             })
                             .map(|e| (e.id, e.credentials.clone()))
                     };
@@ -1035,6 +1229,16 @@ impl MultiTokenManager {
                                 .iter()
                                 .filter(|e| Self::credential_is_usable_for_model(e, model))
                                 .count();
+                            let dispatchable = {
+                                let now = Instant::now();
+                                entries
+                                    .iter()
+                                    .filter(|e| {
+                                        !excluded_ids.contains(&e.id)
+                                            && Self::credential_is_dispatchable(e, model, now)
+                                    })
+                                    .count()
+                            };
                             let excluded_usable = entries
                                 .iter()
                                 .filter(|e| {
@@ -1057,6 +1261,23 @@ impl MultiTokenManager {
                                     total
                                 );
                             }
+                            if usable > 0 && dispatchable == 0 {
+                                let retry_after_secs = self
+                                    .min_dispatch_wait(
+                                        &entries,
+                                        model,
+                                        excluded_ids,
+                                        Instant::now(),
+                                    )
+                                    .map(|duration| duration.as_secs().saturating_add(1))
+                                    .unwrap_or(1);
+                                anyhow::bail!(
+                                    "所有可用凭据均处于临时冷却或本地限流中（可用: {}/{}, 临时可调度: 0, retry_after_secs={}）",
+                                    available,
+                                    total,
+                                    retry_after_secs
+                                );
+                            }
                             anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                         }
                     }
@@ -1066,6 +1287,7 @@ impl MultiTokenManager {
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials, true).await {
                 Ok(ctx) => {
+                    self.mark_rate_limited_at(ctx.id, Instant::now());
                     if let Some(sid) = session_id {
                         if self.bound_credential_exists_but_unusable(sid, model) {
                             self.unbind_session(sid);
@@ -1174,8 +1396,9 @@ impl MultiTokenManager {
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 // 确实需要刷新
                 let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+                let config = self.runtime_config();
                 let new_creds =
-                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+                    refresh_token(&current_creds, &config, effective_proxy.as_ref()).await?;
 
                 if is_token_expired(&new_creds) {
                     anyhow::bail!("刷新后的 Token 仍然无效或已过期");
@@ -1239,7 +1462,7 @@ impl MultiTokenManager {
         use anyhow::Context;
 
         // 仅多凭据格式才回写
-        if !self.is_multiple_format {
+        if !self.runtime_config().credentials_persist || !self.is_multiple_format {
             return Ok(false);
         }
 
@@ -1268,10 +1491,11 @@ impl MultiTokenManager {
 
         // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
         if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| std::fs::write(path, &json))
+            tokio::task::block_in_place(|| crate::common::fs::write_file_atomic(path, &json))
                 .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
         } else {
-            std::fs::write(path, &json).with_context(|| format!("回写凭据文件失败: {:?}", path))?;
+            crate::common::fs::write_file_atomic(path, &json)
+                .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
         }
 
         tracing::debug!("已回写凭据到文件: {:?}", path);
@@ -1287,6 +1511,9 @@ impl MultiTokenManager {
 
     /// 统计数据文件路径
     fn stats_path(&self) -> Option<PathBuf> {
+        if !self.runtime_config().credential_stats_persist {
+            return None;
+        }
         self.cache_dir().map(|d| d.join("kiro_stats.json"))
     }
 
@@ -1347,7 +1574,7 @@ impl MultiTokenManager {
 
         match serde_json::to_string_pretty(&stats) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
+                if let Err(e) = crate::common::fs::write_file_atomic(&path, json) {
                     tracing::warn!("保存统计缓存失败: {}", e);
                 } else {
                     *self.last_stats_save_at.lock() = Some(Instant::now());
@@ -1387,6 +1614,11 @@ impl MultiTokenManager {
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
+                entry.cooldown_until = None;
+                entry.cooldown_reason = None;
+                if entry.warmup_remaining > 0 {
+                    entry.warmup_remaining -= 1;
+                }
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
                 tracing::debug!(
@@ -1397,6 +1629,63 @@ impl MultiTokenManager {
             }
         }
         self.save_stats_debounced();
+    }
+
+    /// 报告指定凭据遇到上游瞬态错误，按 Retry-After 或默认值临时冷却。
+    ///
+    /// 不增加 failure_count，不禁用凭据；冷却到期后自动重新参与调度。
+    pub fn report_transient_failure(
+        &self,
+        id: u64,
+        model: Option<&str>,
+        retry_after: Option<StdDuration>,
+        reason: impl Into<String>,
+    ) -> bool {
+        let reason = reason.into();
+        let duration = self.cooldown_duration_from_retry_after(retry_after);
+        let now = Instant::now();
+        let until = now + duration;
+
+        {
+            let mut entries = self.entries.lock();
+            let usable_count = entries
+                .iter()
+                .filter(|e| Self::credential_is_usable_for_model(e, model))
+                .count();
+            let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
+                return entries.iter().any(|e| !e.disabled);
+            };
+
+            if entry.disabled {
+                return entries.iter().any(|e| !e.disabled);
+            }
+
+            if usable_count <= 1 {
+                entry.last_used_at = Some(Utc::now().to_rfc3339());
+                tracing::warn!(
+                    "凭据 #{} 遇到上游瞬态错误，但没有其他可用凭据；不进入本地临时冷却: {}",
+                    id,
+                    reason
+                );
+                return false;
+            }
+
+            entry.cooldown_until = Some(until);
+            entry.cooldown_reason = Some(reason.clone());
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+        }
+
+        tracing::warn!(
+            "凭据 #{} 因上游瞬态错误进入临时冷却 {} 秒: {}",
+            id,
+            duration.as_secs(),
+            reason
+        );
+
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .any(|e| e.id != id && Self::credential_is_dispatchable(e, model, Instant::now()))
     }
 
     /// 报告指定会话在该凭据上的 API 调用成功，并清理 sticky 软失败计数。
@@ -1679,6 +1968,7 @@ impl MultiTokenManager {
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
+        let now = Instant::now();
 
         ManagerSnapshot {
             entries: entries
@@ -1739,12 +2029,47 @@ impl MultiTokenManager {
                         .to_string()
                     }),
                     endpoint: e.credentials.endpoint.clone(),
+                    cooled_down: Self::entry_cooldown_remaining(e, now).is_some(),
+                    cooldown_remaining_secs: Self::entry_cooldown_remaining(e, now)
+                        .map(|duration| duration.as_secs().saturating_add(1))
+                        .unwrap_or(0),
+                    cooldown_reason: if Self::entry_cooldown_remaining(e, now).is_some() {
+                        e.cooldown_reason.clone()
+                    } else {
+                        None
+                    },
+                    rate_limited: Self::entry_rate_limit_remaining(e, now).is_some(),
+                    rate_limit_remaining_secs: Self::entry_rate_limit_remaining(e, now)
+                        .map(|duration| duration.as_secs().saturating_add(1))
+                        .unwrap_or(0),
+                    warmup_remaining: e.warmup_remaining,
                 })
                 .collect(),
             current_id,
             total: entries.len(),
             available,
         }
+    }
+
+    /// 导出完整凭据快照（包含 refreshToken / kiroApiKey 等敏感字段）。
+    ///
+    /// 仅供 Admin API 显式导出使用；不改变调度状态，也不触发持久化。
+    pub fn export_credentials(&self) -> Vec<KiroCredentials> {
+        let mut credentials: Vec<KiroCredentials> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .map(|entry| {
+                    let mut credentials = entry.credentials.clone();
+                    credentials.canonicalize_auth_method();
+                    credentials.disabled = entry.disabled;
+                    credentials
+                })
+                .collect()
+        };
+
+        credentials.sort_by_key(|credential| (credential.priority, credential.id.unwrap_or(0)));
+        credentials
     }
 
     /// 设置凭据禁用状态（Admin API）
@@ -1761,8 +2086,14 @@ impl MultiTokenManager {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.disabled_reason = None;
+                entry.cooldown_until = None;
+                entry.cooldown_reason = None;
+                entry.rate_limit_available_at = None;
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
+                entry.cooldown_until = None;
+                entry.cooldown_reason = None;
+                entry.rate_limit_available_at = None;
             }
         }
         if disabled {
@@ -1810,6 +2141,9 @@ impl MultiTokenManager {
             entry.refresh_failure_count = 0;
             entry.disabled = false;
             entry.disabled_reason = None;
+            entry.cooldown_until = None;
+            entry.cooldown_reason = None;
+            entry.rate_limit_available_at = None;
         }
         self.select_highest_priority();
         // 持久化更改
@@ -1852,9 +2186,9 @@ impl MultiTokenManager {
 
                 if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                     let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+                    let config = self.runtime_config();
                     let new_creds =
-                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
-                            .await?;
+                        refresh_token(&current_creds, &config, effective_proxy.as_ref()).await?;
                     {
                         let mut entries = self.entries.lock();
                         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -1890,8 +2224,9 @@ impl MultiTokenManager {
         };
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let config = self.runtime_config();
         let usage_limits =
-            get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+            get_usage_limits(&credentials, &config, &token, effective_proxy.as_ref()).await?;
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -2003,7 +2338,8 @@ impl MultiTokenManager {
             new_cred.clone()
         } else {
             let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
-            refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
+            let config = self.runtime_config();
+            refresh_token(&new_cred, &config, effective_proxy.as_ref()).await?
         };
 
         // 4. 分配新 ID
@@ -2046,6 +2382,10 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 last_used_at: None,
+                cooldown_until: None,
+                cooldown_reason: None,
+                rate_limit_available_at: None,
+                warmup_remaining: self.runtime_config().credential_warmup_requests,
             });
         }
 
@@ -2054,6 +2394,19 @@ impl MultiTokenManager {
 
         tracing::info!("成功添加凭据 #{}", new_id);
         Ok(new_id)
+    }
+
+    /// 设置凭据预热剩余请求数。0 表示关闭预热。
+    pub fn set_warmup_remaining(&self, id: u64, warmup_remaining: u32) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.warmup_remaining = warmup_remaining;
+        }
+        Ok(())
     }
 
     /// 删除凭据（Admin API）
@@ -2142,7 +2495,8 @@ impl MultiTokenManager {
 
         // 无条件调用 refresh_token
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let new_creds = refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
+        let config = self.runtime_config();
+        let new_creds = refresh_token(&credentials, &config, effective_proxy.as_ref()).await?;
 
         // 更新 entries 中对应凭据
         {
@@ -2170,7 +2524,7 @@ impl MultiTokenManager {
     fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
         use anyhow::Context;
 
-        let config_path = match self.config.config_path() {
+        let config_path = match self.runtime_config().config_path() {
             Some(path) => path.to_path_buf(),
             None => {
                 tracing::warn!("配置文件路径未知，负载均衡模式仅在当前进程生效: {}", mode);
@@ -2202,10 +2556,13 @@ impl MultiTokenManager {
 
         *self.load_balancing_mode.lock() = mode.clone();
 
-        if let Err(err) = self.persist_load_balancing_mode(&mode) {
-            *self.load_balancing_mode.lock() = previous_mode;
-            return Err(err);
+        if self.runtime_config().credentials_persist {
+            if let Err(err) = self.persist_load_balancing_mode(&mode) {
+                *self.load_balancing_mode.lock() = previous_mode;
+                return Err(err);
+            }
         }
+        self.update_load_balancing_mode_in_config(&mode);
 
         tracing::info!("负载均衡模式已设置为: {}", mode);
         Ok(())
@@ -2592,6 +2949,32 @@ mod tests {
         std::fs::remove_file(&config_path).unwrap();
     }
 
+    #[test]
+    fn test_set_load_balancing_mode_respects_disabled_persistence() {
+        let config_path =
+            std::env::temp_dir().join(format!("kiro-no-persist-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &config_path,
+            r#"{"loadBalancingMode":"priority","credentialsPersist":false}"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        manager
+            .set_load_balancing_mode("balanced".to_string())
+            .unwrap();
+
+        let persisted = Config::load(&config_path).unwrap();
+        assert_eq!(persisted.load_balancing_mode, "priority");
+        assert_eq!(manager.get_load_balancing_mode(), "balanced");
+
+        std::fs::remove_file(&config_path).unwrap();
+    }
+
     #[tokio::test]
     async fn test_multi_token_manager_acquire_context_auto_recovers_all_disabled() {
         let config = Config::default();
@@ -2709,6 +3092,172 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first.id, rebound.id);
+    }
+
+    #[tokio::test]
+    async fn test_transient_failure_cools_down_without_disabling_credential() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.credential_transient_cooldown_secs = 60;
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        assert!(manager.report_transient_failure(1, None, Some(StdDuration::from_secs(20)), "429"));
+
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert!(!first.disabled);
+        assert_eq!(first.failure_count, 0);
+        assert!(first.cooled_down);
+        assert!(first.cooldown_remaining_secs > 0);
+
+        let ctx = manager.acquire_context(None).await.unwrap();
+        assert_eq!(ctx.id, 2);
+        assert_eq!(manager.available_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_transient_failure_does_not_cool_down_only_usable_credential() {
+        let mut config = Config::default();
+        config.credential_transient_cooldown_secs = 60;
+
+        let mut disabled = KiroCredentials::default();
+        disabled.disabled = true;
+        let mut active = KiroCredentials::default();
+        active.access_token = Some("active-token".to_string());
+        active.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![disabled, active], None, None, false).unwrap();
+
+        assert!(!manager.report_transient_failure(
+            2,
+            None,
+            Some(StdDuration::from_secs(20)),
+            "429"
+        ));
+
+        let snapshot = manager.snapshot();
+        let active = snapshot.entries.iter().find(|entry| entry.id == 2).unwrap();
+        assert!(!active.disabled);
+        assert_eq!(active.failure_count, 0);
+        assert!(!active.cooled_down);
+
+        let ctx = manager.acquire_context(None).await.unwrap();
+        assert_eq!(ctx.id, 2);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_prefers_other_dispatchable_credential() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.credential_rpm = Some(60);
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        let first = manager.acquire_context(None).await.unwrap();
+        let second = manager.acquire_context(None).await.unwrap();
+
+        assert_ne!(first.id, second.id);
+        assert!(
+            manager
+                .snapshot()
+                .entries
+                .iter()
+                .filter(|entry| entry.rate_limited)
+                .count()
+                >= 2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_added_credential_warmup_does_not_fake_success_count() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.credential_warmup_requests = 2;
+        config.credential_warmup_selection_percent = 0;
+
+        let mut existing = KiroCredentials::default();
+        existing.access_token = Some("existing".to_string());
+        existing.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
+
+        let mut new_cred = KiroCredentials::default();
+        new_cred.kiro_api_key = Some("ksk_new_key".to_string());
+        new_cred.auth_method = Some("api_key".to_string());
+        let new_id = manager.add_credential(new_cred).await.unwrap();
+
+        let snapshot = manager.snapshot();
+        let added = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.id == new_id)
+            .unwrap();
+        assert_eq!(added.success_count, 0);
+        assert_eq!(added.warmup_remaining, 2);
+
+        let ctx = manager.acquire_context(None).await.unwrap();
+        assert_ne!(ctx.id, new_id);
+        manager.report_success(ctx.id);
+
+        manager.set_warmup_remaining(new_id, 0).unwrap();
+        let ctx = manager.acquire_context(None).await.unwrap();
+        assert_eq!(ctx.id, new_id);
+        manager.report_success(ctx.id);
+
+        let snapshot = manager.snapshot();
+        let added = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.id == new_id)
+            .unwrap();
+        assert_eq!(added.success_count, 1);
+        assert_eq!(added.warmup_remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn test_warmup_selection_percent_allows_real_request_sampling() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.credential_warmup_requests = 2;
+        config.credential_warmup_selection_percent = 100;
+
+        let mut ready = KiroCredentials::default();
+        ready.access_token = Some("ready".to_string());
+        ready.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut warming = KiroCredentials::default();
+        warming.access_token = Some("warming".to_string());
+        warming.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![ready, warming], None, None, false).unwrap();
+        manager.set_warmup_remaining(2, 2).unwrap();
+
+        let ctx = manager.acquire_context(None).await.unwrap();
+        assert_eq!(ctx.id, 2);
+        manager.report_success(ctx.id);
+
+        let snapshot = manager.snapshot();
+        let warming = snapshot.entries.iter().find(|entry| entry.id == 2).unwrap();
+        assert_eq!(warming.success_count, 1);
+        assert_eq!(warming.warmup_remaining, 1);
     }
 
     #[tokio::test]

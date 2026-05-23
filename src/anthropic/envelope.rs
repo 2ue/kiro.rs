@@ -65,6 +65,22 @@ pub(crate) fn error_response_with_id(
     response
 }
 
+pub(crate) fn error_response_with_id_and_headers(
+    status: StatusCode,
+    error_type: impl Into<String>,
+    message: impl Into<String>,
+    request_id: &str,
+    extra_headers: impl IntoIterator<Item = (&'static str, String)>,
+) -> Response {
+    let mut response = error_response_with_id(status, error_type, message, request_id);
+    for (name, value) in extra_headers {
+        if let Ok(value) = HeaderValue::from_str(&value) {
+            response.headers_mut().insert(name, value);
+        }
+    }
+    response
+}
+
 pub(crate) fn error_response(
     status: StatusCode,
     error_type: impl Into<String>,

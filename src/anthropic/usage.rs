@@ -84,6 +84,13 @@ pub struct UsageRecord {
     pub cache_creation_input_tokens: i32,
     pub cache_creation_5m_input_tokens: i32,
     pub cache_creation_1h_input_tokens: i32,
+    #[serde(default)]
+    pub estimated_cost_usd: f64,
+    #[serde(default)]
+    pub pricing_available: bool,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pricing_model: Option<String>,
     pub duration_ms: u64,
     pub simulated: bool,
     pub sticky_bound: bool,
@@ -92,6 +99,9 @@ pub struct UsageRecord {
     pub error_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_detail: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +163,7 @@ pub struct UsageAggregate {
     pub requests: usize,
     pub cache_read_input_tokens: i64,
     pub cache_creation_input_tokens: i64,
+    pub estimated_cost_usd: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -166,6 +177,9 @@ pub struct UsageSummary {
     pub total_output_tokens: i64,
     pub total_cache_read_input_tokens: i64,
     pub total_cache_creation_input_tokens: i64,
+    pub total_estimated_cost_usd: f64,
+    pub priced_requests: usize,
+    pub unpriced_requests: usize,
     pub local_prompt_cache_requests: usize,
     pub local_prompt_cache_input_tokens: i64,
     pub local_prompt_cache_read_input_tokens: i64,
@@ -180,6 +194,13 @@ pub struct UsageRecorder {
     records: Mutex<VecDeque<UsageRecord>>,
     limit: usize,
     persist_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CredentialCostSummary {
+    pub estimated_cost_usd: f64,
+    pub priced_requests: usize,
+    pub unpriced_requests: usize,
 }
 
 impl UsageRecorder {
@@ -284,6 +305,9 @@ impl UsageRecorder {
             total_output_tokens: 0,
             total_cache_read_input_tokens: 0,
             total_cache_creation_input_tokens: 0,
+            total_estimated_cost_usd: 0.0,
+            priced_requests: 0,
+            unpriced_requests: 0,
             local_prompt_cache_requests: 0,
             local_prompt_cache_input_tokens: 0,
             local_prompt_cache_read_input_tokens: 0,
@@ -315,6 +339,12 @@ impl UsageRecorder {
             summary.total_output_tokens += record.output_tokens as i64;
             summary.total_cache_read_input_tokens += record.cache_read_input_tokens as i64;
             summary.total_cache_creation_input_tokens += record.cache_creation_input_tokens as i64;
+            summary.total_estimated_cost_usd += record.estimated_cost_usd;
+            if record.pricing_available {
+                summary.priced_requests += 1;
+            } else {
+                summary.unpriced_requests += 1;
+            }
             if record.usage_source == UsageSource::LocalPromptCache {
                 summary.local_prompt_cache_requests += 1;
                 summary.local_prompt_cache_input_tokens += record.total_input_tokens as i64;
@@ -332,10 +362,12 @@ impl UsageRecorder {
                     requests: 0,
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
+                    estimated_cost_usd: 0.0,
                 });
                 entry.requests += 1;
                 entry.cache_read_input_tokens += record.cache_read_input_tokens as i64;
                 entry.cache_creation_input_tokens += record.cache_creation_input_tokens as i64;
+                entry.estimated_cost_usd += record.estimated_cost_usd;
                 if entry.label.is_none() {
                     entry.label = record.credential_label.clone();
                 }
@@ -351,16 +383,35 @@ impl UsageRecorder {
                             requests: 0,
                             cache_read_input_tokens: 0,
                             cache_creation_input_tokens: 0,
+                            estimated_cost_usd: 0.0,
                         });
                 entry.requests += 1;
                 entry.cache_read_input_tokens += record.cache_read_input_tokens as i64;
                 entry.cache_creation_input_tokens += record.cache_creation_input_tokens as i64;
+                entry.estimated_cost_usd += record.estimated_cost_usd;
             }
         }
 
         summary.top_credentials = top_aggregates(credentials);
         summary.top_conversations = top_aggregates(conversations);
         summary
+    }
+
+    pub fn credential_cost_summary(&self) -> HashMap<u64, CredentialCostSummary> {
+        let mut summaries: HashMap<u64, CredentialCostSummary> = HashMap::new();
+        for record in self.records.lock().iter() {
+            let Some(credential_id) = record.credential_id else {
+                continue;
+            };
+            let entry = summaries.entry(credential_id).or_default();
+            entry.estimated_cost_usd += record.estimated_cost_usd;
+            if record.pricing_available {
+                entry.priced_requests += 1;
+            } else {
+                entry.unpriced_requests += 1;
+            }
+        }
+        summaries
     }
 
     pub fn clear(&self) {
@@ -487,6 +538,7 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
     let status = usage_status_value(record.status);
     let source = usage_source_value(record.usage_source);
     let credential_id = record.credential_id.map(|id| id.to_string());
+    let estimated_cost = record.estimated_cost_usd.to_string();
 
     [
         Some(record.id.as_str()),
@@ -499,6 +551,9 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
         Some(source),
         record.error_type.as_deref(),
         record.error_message.as_deref(),
+        record.error_detail.as_deref(),
+        record.pricing_model.as_deref(),
+        Some(estimated_cost.as_str()),
         credential_id.as_deref(),
     ]
     .into_iter()
@@ -536,8 +591,9 @@ fn top_aggregates(map: HashMap<String, UsageAggregate>) -> Vec<UsageAggregate> {
     let mut values: Vec<_> = map.into_values().collect();
     values.sort_by_key(|item| {
         (
-            std::cmp::Reverse(item.cache_read_input_tokens),
+            std::cmp::Reverse((item.estimated_cost_usd * 1_000_000.0).round() as i64),
             std::cmp::Reverse(item.requests),
+            std::cmp::Reverse(item.cache_read_input_tokens),
         )
     });
     values.truncate(10);
@@ -573,12 +629,16 @@ mod tests {
             cache_creation_input_tokens: 5,
             cache_creation_5m_input_tokens: 5,
             cache_creation_1h_input_tokens: 0,
+            estimated_cost_usd: 0.001,
+            pricing_available: true,
+            pricing_model: Some("claude-sonnet-4-5".to_string()),
             duration_ms: 10,
             simulated: source.is_simulated(),
             sticky_bound: false,
             fallback_from_sticky: false,
             error_type: None,
             error_message: None,
+            error_detail: None,
         }
     }
 

@@ -38,6 +38,15 @@ export interface CredentialStatusItem {
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
+  cooledDown: boolean
+  cooldownRemainingSecs: number
+  cooldownReason?: string
+  rateLimited: boolean
+  rateLimitRemainingSecs: number
+  warmupRemaining: number
+  estimatedCostUsd: number
+  pricedRequests: number
+  unpricedRequests: number
 }
 
 // 余额响应
@@ -72,6 +81,10 @@ export interface SetDisabledRequest {
 
 export interface SetPriorityRequest {
   priority: number
+}
+
+export interface SetWarmupRequest {
+  warmupRemaining: number
 }
 
 // 添加凭据请求
@@ -148,12 +161,16 @@ export interface UsageRecord {
   cacheCreationInputTokens: number
   cacheCreation5mInputTokens: number
   cacheCreation1hInputTokens: number
+  estimatedCostUsd: number
+  pricingAvailable: boolean
+  pricingModel?: string
   durationMs: number
   simulated: boolean
   stickyBound: boolean
   fallbackFromSticky: boolean
   errorType?: string
   errorMessage?: string
+  errorDetail?: string
 }
 
 export interface UsageRecordsResult {
@@ -173,6 +190,7 @@ export interface UsageAggregate {
   requests: number
   cacheReadInputTokens: number
   cacheCreationInputTokens: number
+  estimatedCostUsd: number
 }
 
 export interface UsageSummary {
@@ -184,6 +202,9 @@ export interface UsageSummary {
   totalOutputTokens: number
   totalCacheReadInputTokens: number
   totalCacheCreationInputTokens: number
+  totalEstimatedCostUsd: number
+  pricedRequests: number
+  unpricedRequests: number
   localPromptCacheRequests: number
   localPromptCacheInputTokens: number
   localPromptCacheReadInputTokens: number
@@ -210,3 +231,39 @@ export interface UsageRecordsPageQuery extends UsageRecordsQuery {
   page: number
   limit: number
 }
+
+export interface RuntimeConfig {
+  credentialRpm: number
+  credentialTransientCooldownSecs: number
+  credentialMaxCooldownSecs: number
+  credentialWarmupRequests: number
+  credentialWarmupSelectionPercent: number
+  compressionEnabled: boolean
+  whitespaceCompression: boolean
+}
+
+export type UpdateRuntimeConfigRequest = RuntimeConfig
+
+export interface ModelPricing {
+  inputCostPerToken: number
+  outputCostPerToken: number
+  cacheCreationInputTokenCost: number
+  cacheReadInputTokenCost: number
+}
+
+export interface ModelPriceItem {
+  model: string
+  pricing: ModelPricing
+}
+
+export interface ModelPricingStatus {
+  available: boolean
+  source: string
+  sourceUrl: string
+  modelCount: number
+  lastSyncedAt?: string
+  lastError?: string
+  models: ModelPriceItem[]
+}
+
+export type CredentialExportFormat = 'json' | 'backup-json' | 'jsonl'

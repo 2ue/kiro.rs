@@ -1,14 +1,21 @@
 import { useEffect, useMemo, useState } from 'react'
-import { RefreshCw, Trash2, X } from 'lucide-react'
+import { DollarSign, Eye, RefreshCw, Trash2, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { useCredentials } from '@/hooks/use-credentials'
-import { useClearUsageRecords, useUsageRecordsPage, useUsageSummary } from '@/hooks/use-usage'
+import {
+  useClearUsageRecords,
+  useModelPricing,
+  useSyncModelPricing,
+  useUsageRecordsPage,
+  useUsageSummary,
+} from '@/hooks/use-usage'
 import { extractErrorMessage } from '@/lib/utils'
-import type { UsageRecordsPageQuery, UsageRecordStatus, UsageSource } from '@/types/api'
+import type { UsageRecord, UsageRecordsPageQuery, UsageRecordStatus, UsageSource } from '@/types/api'
 
 function formatNumber(value: number): string {
   return new Intl.NumberFormat('zh-CN').format(value)
@@ -19,6 +26,16 @@ function formatPercent(value: number): string {
   return `${(value * 100).toFixed(1)}%`
 }
 
+function formatUsd(value: number): string {
+  if (!Number.isFinite(value)) return '-'
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: value >= 1 ? 2 : 6,
+    maximumFractionDigits: value >= 1 ? 2 : 6,
+  }).format(value)
+}
+
 function ratio(part: number, total: number): number {
   if (!Number.isFinite(part) || !Number.isFinite(total) || total <= 0) {
     return Number.NaN
@@ -26,7 +43,8 @@ function ratio(part: number, total: number): number {
   return part / total
 }
 
-function formatDate(value: string): string {
+function formatDate(value?: string): string {
+  if (!value) return '-'
   return new Date(value).toLocaleString('zh-CN', {
     hour12: false,
     month: '2-digit',
@@ -84,6 +102,7 @@ export function UsageRecordsPanel() {
   const [source, setSource] = useState<UsageSource | ''>('')
   const [streamMode, setStreamMode] = useState<'all' | 'stream' | 'non_stream'>('all')
   const [minCacheRead, setMinCacheRead] = useState('')
+  const [selectedRecord, setSelectedRecord] = useState<UsageRecord | null>(null)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 100
 
@@ -120,6 +139,8 @@ export function UsageRecordsPanel() {
 
   const summary = useUsageSummary()
   const records = useUsageRecordsPage(query)
+  const modelPricing = useModelPricing()
+  const syncPricing = useSyncModelPricing()
   const credentials = useCredentials()
   const clearRecords = useClearUsageRecords()
 
@@ -152,6 +173,22 @@ export function UsageRecordsPanel() {
   const handleRefresh = () => {
     summary.refetch()
     records.refetch()
+    modelPricing.refetch()
+  }
+
+  const handleSyncPricing = () => {
+    syncPricing.mutate(undefined, {
+      onSuccess: (status) => {
+        if (status.lastError) {
+          toast.warning(`价格同步失败，继续使用${status.source === 'built-in' ? '内置价格' : '当前价格'}: ${status.lastError}`)
+          return
+        }
+        toast.success(`价格已同步：${status.modelCount} 个模型`)
+        summary.refetch()
+        records.refetch()
+      },
+      onError: (err) => toast.error(`同步失败: ${extractErrorMessage(err)}`),
+    })
   }
 
   const hasFilters = Boolean(
@@ -198,6 +235,8 @@ export function UsageRecordsPanel() {
       (summaryData?.localPromptCacheCreationInputTokens || 0),
     summaryData?.localPromptCacheInputTokens || 0
   )
+  const pricingStatus = modelPricing.data
+  const pricedRatio = ratio(summaryData?.pricedRequests || 0, summaryData?.totalRequests || 0)
 
   return (
     <div className="space-y-4">
@@ -224,21 +263,50 @@ export function UsageRecordsPanel() {
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">{formatNumber(summaryData?.totalCacheReadInputTokens || 0)}</div>
-            <div className="text-xs text-muted-foreground">local read {formatPercent(localReadRatio)}</div>
+            <div className="text-xs text-muted-foreground">
+              local read {formatPercent(localReadRatio)} / cached {formatPercent(localCachedRatio)}
+            </div>
           </CardContent>
         </Card>
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">Local Cached</CardTitle>
+            <CardTitle className="text-sm font-medium text-muted-foreground">估算费用</CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{formatPercent(localCachedRatio)}</div>
-            <div className="text-xs text-muted-foreground">
-              local {formatNumber(summaryData?.localPromptCacheRequests || 0)}
-            </div>
+            <div className="text-2xl font-bold">{formatUsd(summaryData?.totalEstimatedCostUsd || 0)}</div>
+            <div className="text-xs text-muted-foreground">priced {formatPercent(pricedRatio)}</div>
           </CardContent>
         </Card>
       </div>
+
+      <Card>
+        <CardContent className="flex flex-col gap-3 py-4 md:flex-row md:items-center md:justify-between">
+          <div className="space-y-1">
+            <div className="flex flex-wrap items-center gap-2 text-sm">
+              <span className="font-medium">模型计价</span>
+              <Badge variant={pricingStatus?.lastError ? 'warning' : 'secondary'}>
+                {pricingStatus?.source || 'loading'}
+              </Badge>
+              <Badge variant="outline">{formatNumber(pricingStatus?.modelCount || 0)} models</Badge>
+              {pricingStatus?.lastSyncedAt && (
+                <span className="text-muted-foreground">同步 {formatDate(pricingStatus.lastSyncedAt)}</span>
+              )}
+            </div>
+            <div className="break-all text-xs text-muted-foreground">
+              {pricingStatus?.lastError || pricingStatus?.sourceUrl || '正在加载价格目录'}
+            </div>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleSyncPricing}
+            disabled={syncPricing.isPending}
+          >
+            <DollarSign className="h-4 w-4" />
+            {syncPricing.isPending ? '同步中...' : '同步价格'}
+          </Button>
+        </CardContent>
+      </Card>
 
       <div className="flex flex-col gap-3 rounded-lg border bg-card p-4 md:flex-row md:items-center md:justify-between">
         <div className="grid flex-1 gap-2 md:grid-cols-2 xl:grid-cols-4">
@@ -341,7 +409,7 @@ export function UsageRecordsPanel() {
             <div className="py-8 text-center text-muted-foreground">当前页暂无记录</div>
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[1600px] text-sm">
+              <table className="w-full min-w-[1720px] text-sm">
                 <thead>
                   <tr className="border-b text-left text-muted-foreground">
                     <th className="px-3 py-2 font-medium">时间</th>
@@ -358,6 +426,7 @@ export function UsageRecordsPanel() {
                     <th className="px-3 py-2 font-medium text-right">Read %</th>
                     <th className="px-3 py-2 font-medium text-right">Cached %</th>
                     <th className="px-3 py-2 font-medium text-right">输出</th>
+                    <th className="px-3 py-2 font-medium text-right">费用</th>
                     <th className="px-3 py-2 font-medium text-right">耗时</th>
                   </tr>
                 </thead>
@@ -410,9 +479,14 @@ export function UsageRecordsPanel() {
                           {statusLabel(record.status)}
                         </Badge>
                         {record.errorMessage && (
-                          <div className="mt-1 max-w-[220px] truncate text-xs text-muted-foreground">
+                          <button
+                            type="button"
+                            className="mt-1 block max-w-[220px] truncate text-left text-xs text-muted-foreground underline-offset-2 hover:underline"
+                            onClick={() => setSelectedRecord(record)}
+                            title={record.errorDetail || record.errorMessage}
+                          >
                             {record.errorMessage}
-                          </div>
+                          </button>
                         )}
                       </td>
                       <td className="px-3 py-2 text-right">{formatNumber(record.totalInputTokens)}</td>
@@ -423,7 +497,28 @@ export function UsageRecordsPanel() {
                       <td className="px-3 py-2 text-right">{formatPercent(readRatio)}</td>
                       <td className="px-3 py-2 text-right">{formatPercent(cachedRatio)}</td>
                       <td className="px-3 py-2 text-right">{formatNumber(record.outputTokens)}</td>
-                      <td className="px-3 py-2 text-right">{formatNumber(record.durationMs)}ms</td>
+                      <td className="px-3 py-2 text-right">
+                        <div>{formatUsd(record.estimatedCostUsd || 0)}</div>
+                        <div className="text-xs text-muted-foreground">
+                          {record.pricingAvailable ? record.pricingModel || 'priced' : 'unpriced'}
+                        </div>
+                      </td>
+                      <td className="px-3 py-2 text-right">
+                        <div className="flex items-center justify-end gap-2">
+                          <span>{formatNumber(record.durationMs)}ms</span>
+                          {(record.errorMessage || record.errorDetail) && (
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-7 w-7"
+                              onClick={() => setSelectedRecord(record)}
+                              title="查看错误详情"
+                            >
+                              <Eye className="h-4 w-4" />
+                            </Button>
+                          )}
+                        </div>
+                      </td>
                     </tr>
                     )
                   })}
@@ -456,6 +551,63 @@ export function UsageRecordsPanel() {
           )}
         </CardContent>
       </Card>
+
+      <Dialog open={Boolean(selectedRecord)} onOpenChange={(open) => !open && setSelectedRecord(null)}>
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>Usage 详情</DialogTitle>
+          </DialogHeader>
+          {selectedRecord && (
+            <div className="space-y-4">
+              <div className="grid gap-3 text-sm md:grid-cols-2">
+                <div>
+                  <div className="text-xs text-muted-foreground">请求 ID</div>
+                  <div className="break-all font-mono">{selectedRecord.id}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">时间</div>
+                  <div>{formatDate(selectedRecord.createdAt)}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">模型</div>
+                  <div className="break-all">{selectedRecord.model || '-'}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">会话</div>
+                  <div className="break-all">{selectedRecord.conversationId || '-'}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">账号</div>
+                  <div>
+                    #{selectedRecord.credentialId ?? '-'} {selectedRecord.credentialLabel || ''}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">状态</div>
+                  <div>{statusLabel(selectedRecord.status)}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">估算费用</div>
+                  <div>
+                    {formatUsd(selectedRecord.estimatedCostUsd || 0)}
+                    <span className="ml-2 text-xs text-muted-foreground">
+                      {selectedRecord.pricingAvailable
+                        ? selectedRecord.pricingModel || 'priced'
+                        : 'unpriced'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+              <div>
+                <div className="mb-2 text-sm font-medium">错误详情</div>
+                <pre className="max-h-[360px] overflow-auto rounded-md border bg-muted p-3 text-xs whitespace-pre-wrap break-words">
+                  {selectedRecord.errorDetail || selectedRecord.errorMessage || '-'}
+                </pre>
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

@@ -14,7 +14,9 @@ use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{CompatProfile, PromptCacheSimulationMode};
 
-use super::{envelope, prompt_cache::PromptCacheTracker, usage::UsageRecorder};
+use super::{
+    envelope, pricing::PricingCatalog, prompt_cache::PromptCacheTracker, usage::UsageRecorder,
+};
 
 /// 应用共享状态
 #[derive(Clone)]
@@ -28,6 +30,8 @@ pub struct AppState {
     pub extract_thinking: bool,
     /// 请求级 usage 记录器
     pub usage_recorder: Arc<UsageRecorder>,
+    /// 模型价格目录。仅用于统计计价，失败不影响请求。
+    pub pricing_catalog: Arc<PricingCatalog>,
     /// 本地 prompt-cache tracker
     pub prompt_cache: Arc<PromptCacheTracker>,
     /// 本地 prompt-cache usage 模拟模式
@@ -46,6 +50,8 @@ pub struct AppState {
     pub prompt_cache_scale_min_input_tokens: i32,
     /// /cc high-cache 下游上报的 cache write 目标值
     pub cc_high_cache_reported_cache_creation_target_tokens: i32,
+    /// /cc high-cache 下游上报的 uncached input 上限
+    pub cc_high_cache_reported_input_max_tokens: i32,
     /// Anthropic compatibility profile
     pub compat_profile: CompatProfile,
     /// 是否在响应头中暴露代理改写动作
@@ -69,6 +75,7 @@ impl AppState {
             kiro_provider: None,
             extract_thinking,
             usage_recorder,
+            pricing_catalog: Arc::new(PricingCatalog::new()),
             prompt_cache,
             prompt_cache_simulation_mode,
             prompt_cache_target_read_ratio: prompt_cache_target_read_ratio.clamp(0.0, 0.99),
@@ -78,6 +85,7 @@ impl AppState {
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
             cc_high_cache_reported_cache_creation_target_tokens: 3_000,
+            cc_high_cache_reported_input_max_tokens: 96,
             compat_profile,
             expose_proxy_warnings: expose_proxy_warnings || compat_profile.is_debug(),
         }
@@ -99,8 +107,23 @@ impl AppState {
         self
     }
 
+    pub fn with_pricing_catalog(mut self, pricing_catalog: Arc<PricingCatalog>) -> Self {
+        self.pricing_catalog = pricing_catalog;
+        self
+    }
+
     pub fn with_cc_high_cache_reported_creation_target(mut self, target_tokens: i32) -> Self {
         self.cc_high_cache_reported_cache_creation_target_tokens = target_tokens.max(0);
+        self
+    }
+
+    pub fn with_cc_high_cache_reported_input_max(mut self, max_tokens: i32) -> Self {
+        self.cc_high_cache_reported_input_max_tokens = max_tokens.max(0);
+        self
+    }
+
+    pub fn with_prompt_cache_simulation_mode(mut self, mode: PromptCacheSimulationMode) -> Self {
+        self.prompt_cache_simulation_mode = mode;
         self
     }
 

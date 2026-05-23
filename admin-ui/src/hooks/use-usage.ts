@@ -1,5 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { clearUsageRecords, getUsageRecords, getUsageRecordsPage, getUsageSummary } from '@/api/usage'
+import {
+  clearUsageRecords,
+  getModelPricing,
+  getUsageRecords,
+  getUsageRecordsPage,
+  getUsageSummary,
+  syncModelPricing,
+} from '@/api/usage'
 import type { UsageRecordsPageQuery, UsageRecordsQuery } from '@/types/api'
 
 export function useUsageRecords(query: UsageRecordsQuery) {
@@ -35,6 +42,24 @@ export function useClearUsageRecords() {
       queryClient.invalidateQueries({ queryKey: ['usage-records'] })
       queryClient.invalidateQueries({ queryKey: ['usage-records-page'] })
       queryClient.invalidateQueries({ queryKey: ['usage-summary'] })
+    },
+  })
+}
+
+export function useModelPricing() {
+  return useQuery({
+    queryKey: ['model-pricing'],
+    queryFn: getModelPricing,
+    refetchInterval: 60000,
+  })
+}
+
+export function useSyncModelPricing() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: syncModelPricing,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['model-pricing'] })
     },
   })
 }

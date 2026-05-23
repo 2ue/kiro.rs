@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::config::CompressionConfig;
+
 // ============ 凭据状态 ============
 
 /// 所有凭据状态响应
@@ -82,6 +84,31 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 是否处于临时冷却。
+    pub cooled_down: bool,
+    /// 临时冷却剩余秒数。
+    pub cooldown_remaining_secs: u64,
+    /// 临时冷却原因。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_reason: Option<String>,
+    /// 是否因本地速率限制暂不可用。
+    pub rate_limited: bool,
+    /// 本地速率限制剩余秒数。
+    pub rate_limit_remaining_secs: u64,
+    /// 预热剩余请求数。
+    pub warmup_remaining: u32,
+    /// 该凭据已记录的估算费用（USD）。
+    pub estimated_cost_usd: f64,
+    /// 有价格表命中的请求数。
+    pub priced_requests: usize,
+    /// 无价格表命中的请求数。
+    pub unpriced_requests: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportCredentialsQuery {
+    pub format: Option<String>,
 }
 
 // ============ 操作请求 ============
@@ -100,6 +127,14 @@ pub struct SetDisabledRequest {
 pub struct SetPriorityRequest {
     /// 新优先级值
     pub priority: u32,
+}
+
+/// 修改凭据预热状态请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetWarmupRequest {
+    /// 预热剩余请求数；0 表示关闭预热。
+    pub warmup_remaining: u32,
 }
 
 /// 添加凭据请求
@@ -240,6 +275,47 @@ pub struct LoadBalancingModeResponse {
 pub struct SetLoadBalancingModeRequest {
     /// 模式（"priority" 或 "balanced"）
     pub mode: String,
+}
+
+// ============ 运行时全局配置 ============
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeConfigResponse {
+    pub credential_rpm: u32,
+    pub credential_transient_cooldown_secs: u64,
+    pub credential_max_cooldown_secs: u64,
+    pub credential_warmup_requests: u32,
+    pub credential_warmup_selection_percent: u32,
+    pub compression_enabled: bool,
+    pub whitespace_compression: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateRuntimeConfigRequest {
+    pub credential_rpm: u32,
+    pub credential_transient_cooldown_secs: u64,
+    pub credential_max_cooldown_secs: u64,
+    pub credential_warmup_requests: u32,
+    #[serde(default)]
+    pub credential_warmup_selection_percent: Option<u32>,
+    pub compression_enabled: bool,
+    #[serde(default = "default_true")]
+    pub whitespace_compression: bool,
+}
+
+impl UpdateRuntimeConfigRequest {
+    pub fn compression(&self) -> CompressionConfig {
+        CompressionConfig {
+            enabled: self.compression_enabled,
+            whitespace_compression: self.whitespace_compression,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // ============ 通用响应 ============

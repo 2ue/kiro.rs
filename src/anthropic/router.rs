@@ -13,8 +13,9 @@ use crate::kiro::provider::KiroProvider;
 use crate::model::config::{CompatProfile, PromptCacheSimulationMode};
 
 use super::{
-    handlers::{count_tokens, get_models, post_messages, post_messages_cc},
+    handlers::{count_tokens, get_models, post_messages, post_messages_cc, post_messages_no_cache},
     middleware::{AppState, auth_middleware, cors_layer},
+    pricing::PricingCatalog,
     prompt_cache::PromptCacheTracker,
     usage::UsageRecorder,
 };
@@ -28,6 +29,9 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// - `GET /v1/models` - 获取可用模型列表
 /// - `POST /v1/messages` - 创建消息（对话）
 /// - `POST /v1/messages/count_tokens` - 计算 token 数量
+/// - `GET /na/v1/models` - 获取可用模型列表（无本地 prompt-cache usage 模拟）
+/// - `POST /na/v1/messages` - 创建消息（无本地 prompt-cache usage 模拟）
+/// - `POST /na/v1/messages/count_tokens` - 计算 token 数量
 ///
 /// # 认证
 /// 所有 `/v1` 路径需要 API Key 认证，支持：
@@ -46,7 +50,7 @@ pub fn create_router_with_provider(
     extract_thinking: bool,
     usage_recorder: Arc<UsageRecorder>,
     prompt_cache: Arc<PromptCacheTracker>,
-    prompt_cache_simulation_mode: PromptCacheSimulationMode,
+    pricing_catalog: Arc<PricingCatalog>,
     prompt_cache_target_read_ratio: f64,
     prompt_cache_token_scale: f64,
     prompt_cache_max_simulated_input_tokens: i32,
@@ -54,15 +58,16 @@ pub fn create_router_with_provider(
     prompt_cache_cap_jitter_max_tokens: i32,
     prompt_cache_scale_min_input_tokens: i32,
     cc_high_cache_reported_cache_creation_target_tokens: i32,
+    cc_high_cache_reported_input_max_tokens: i32,
     compat_profile: CompatProfile,
     expose_proxy_warnings: bool,
 ) -> Router {
-    let mut state = AppState::new(
+    let mut base_state = AppState::new(
         api_key,
         extract_thinking,
         usage_recorder,
         prompt_cache,
-        prompt_cache_simulation_mode,
+        PromptCacheSimulationMode::HighCache,
         prompt_cache_target_read_ratio,
         compat_profile,
         expose_proxy_warnings,
@@ -76,35 +81,115 @@ pub fn create_router_with_provider(
     )
     .with_cc_high_cache_reported_creation_target(
         cc_high_cache_reported_cache_creation_target_tokens,
-    );
+    )
+    .with_cc_high_cache_reported_input_max(cc_high_cache_reported_input_max_tokens)
+    .with_pricing_catalog(pricing_catalog);
     if let Some(provider) = kiro_provider {
-        state = state.with_kiro_provider(provider);
+        base_state = base_state.with_kiro_provider(provider);
     }
 
-    // 需要认证的 /v1 路由
+    let (v1_state, na_v1_state, cc_v1_state) = route_prompt_cache_states(base_state);
+
+    // 需要认证的 /v1 路由（默认 high-cache）
     let v1_routes = Router::new()
         .route("/models", get(get_models))
         .route("/messages", post(post_messages))
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
-            state.clone(),
+            v1_state.clone(),
             auth_middleware,
-        ));
+        ))
+        .with_state(v1_state);
+
+    // 需要认证的 /na/v1 路由（no-cache，不做本地 prompt-cache usage 模拟）
+    let na_v1_routes = Router::new()
+        .route("/models", get(get_models))
+        .route("/messages", post(post_messages_no_cache))
+        .route("/messages/count_tokens", post(count_tokens))
+        .layer(middleware::from_fn_with_state(
+            na_v1_state.clone(),
+            auth_middleware,
+        ))
+        .with_state(na_v1_state);
 
     // 需要认证的 /cc/v1 路由（Claude Code 兼容端点）
     // 与 /v1 的区别：流式响应会等待 contextUsageEvent 后再发送 message_start
     let cc_v1_routes = Router::new()
+        .route("/models", get(get_models))
         .route("/messages", post(post_messages_cc))
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
-            state.clone(),
+            cc_v1_state.clone(),
             auth_middleware,
-        ));
+        ))
+        .with_state(cc_v1_state);
 
     Router::new()
         .nest("/v1", v1_routes)
+        .nest("/na/v1", na_v1_routes)
         .nest("/cc/v1", cc_v1_routes)
         .layer(cors_layer())
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
-        .with_state(state)
+}
+
+fn route_prompt_cache_states(base_state: AppState) -> (AppState, AppState, AppState) {
+    (
+        base_state
+            .clone()
+            .with_prompt_cache_simulation_mode(PromptCacheSimulationMode::HighCache),
+        base_state
+            .clone()
+            .with_prompt_cache_simulation_mode(PromptCacheSimulationMode::Disabled),
+        base_state.with_prompt_cache_simulation_mode(PromptCacheSimulationMode::HighCache),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_state(mode: PromptCacheSimulationMode) -> AppState {
+        AppState::new(
+            "test-key",
+            true,
+            Arc::new(UsageRecorder::new(10, None)),
+            Arc::new(PromptCacheTracker::default()),
+            mode,
+            0.98,
+            CompatProfile::ClaudeCode,
+            false,
+        )
+    }
+
+    #[test]
+    fn route_prompt_cache_states_force_v1_and_cc_high_cache_and_na_disabled() {
+        for base_mode in [
+            PromptCacheSimulationMode::Disabled,
+            PromptCacheSimulationMode::HighCache,
+        ] {
+            let (v1_state, na_v1_state, cc_v1_state) =
+                route_prompt_cache_states(base_state(base_mode));
+
+            assert_eq!(
+                v1_state.prompt_cache_simulation_mode,
+                PromptCacheSimulationMode::HighCache
+            );
+            assert_eq!(
+                na_v1_state.prompt_cache_simulation_mode,
+                PromptCacheSimulationMode::Disabled
+            );
+            assert_eq!(
+                cc_v1_state.prompt_cache_simulation_mode,
+                PromptCacheSimulationMode::HighCache
+            );
+            assert!(Arc::ptr_eq(
+                &v1_state.prompt_cache,
+                &na_v1_state.prompt_cache
+            ));
+            assert!(Arc::ptr_eq(
+                &v1_state.prompt_cache,
+                &cc_v1_state.prompt_cache
+            ));
+        }
+    }
 }

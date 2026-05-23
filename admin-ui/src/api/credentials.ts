@@ -8,10 +8,14 @@ import type {
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
+  SetWarmupRequest,
   AddCredentialRequest,
   AddCredentialResponse,
   TestCredentialRequest,
   TestCredentialResponse,
+  RuntimeConfig,
+  UpdateRuntimeConfigRequest,
+  CredentialExportFormat,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -71,6 +75,17 @@ export async function setCredentialPriority(
   return data
 }
 
+export async function setCredentialWarmup(
+  id: number,
+  warmupRemaining: number
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/warmup`,
+    { warmupRemaining } as SetWarmupRequest
+  )
+  return data
+}
+
 // 重置失败计数
 export async function resetCredentialFailure(
   id: number
@@ -125,5 +140,25 @@ export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'bala
 // 设置负载均衡模式
 export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
   const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
+  return data
+}
+
+export async function getRuntimeConfig(): Promise<RuntimeConfig> {
+  const { data } = await api.get<RuntimeConfig>('/config/runtime')
+  return data
+}
+
+export async function updateRuntimeConfig(
+  req: UpdateRuntimeConfigRequest
+): Promise<RuntimeConfig> {
+  const { data } = await api.put<RuntimeConfig>('/config/runtime', req)
+  return data
+}
+
+export async function exportCredentials(format: CredentialExportFormat): Promise<Blob> {
+  const { data } = await api.get<Blob>('/credentials/export', {
+    params: { format },
+    responseType: 'blob',
+  })
   return data
 }
