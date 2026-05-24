@@ -4,6 +4,7 @@ import type {
   AdminAuditLogPage,
   AdminAuditLogPageQuery,
   SuccessResponse,
+  ModelCapabilitiesStatus,
   ModelPricingStatus,
   UsageRecordsPageQuery,
   UsageRecordsPageResult,
@@ -71,5 +72,15 @@ export async function getModelPricing(): Promise<ModelPricingStatus> {
 
 export async function syncModelPricing(): Promise<ModelPricingStatus> {
   const { data } = await api.post<ModelPricingStatus>('/model-pricing/sync')
+  return data
+}
+
+export async function getModelCapabilities(): Promise<ModelCapabilitiesStatus> {
+  const { data } = await api.get<ModelCapabilitiesStatus>('/model-capabilities')
+  return data
+}
+
+export async function syncModelCapabilities(): Promise<ModelCapabilitiesStatus> {
+  const { data } = await api.post<ModelCapabilitiesStatus>('/model-capabilities/sync')
   return data
 }

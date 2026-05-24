@@ -2,11 +2,13 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   clearUsageRecords,
   getAuditLogsPage,
+  getModelCapabilities,
   getModelPricing,
   getUsageRecords,
   getUsageRecordsPage,
   getUsageSummary,
   syncModelPricing,
+  syncModelCapabilities,
 } from '@/api/usage'
 import type { AdminAuditLogPageQuery, UsageRecordsPageQuery, UsageRecordsQuery } from '@/types/api'
 
@@ -70,6 +72,24 @@ export function useSyncModelPricing() {
     mutationFn: syncModelPricing,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['model-pricing'] })
+    },
+  })
+}
+
+export function useModelCapabilities() {
+  return useQuery({
+    queryKey: ['model-capabilities'],
+    queryFn: getModelCapabilities,
+    refetchInterval: 60000,
+  })
+}
+
+export function useSyncModelCapabilities() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: syncModelCapabilities,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['model-capabilities'] })
     },
   })
 }

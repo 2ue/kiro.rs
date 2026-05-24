@@ -80,9 +80,39 @@ pub struct MessageMetadataEvent {
     pub conversation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub utterance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<MetadataTokenUsage>,
 }
 
 impl EventPayload for MessageMetadataEvent {
+    fn from_frame(frame: &Frame) -> ParseResult<Self> {
+        frame.payload_as_json()
+    }
+}
+
+/// Metering event emitted by Kiro with credit usage information.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MeteringEvent {
+    #[serde(default)]
+    pub usage: f64,
+}
+
+impl EventPayload for MeteringEvent {
+    fn from_frame(frame: &Frame) -> ParseResult<Self> {
+        frame.payload_as_json()
+    }
+}
+
+/// Code content event emitted by Amazon Q CLI style streams.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeEvent {
+    #[serde(default)]
+    pub content: String,
+}
+
+impl EventPayload for CodeEvent {
     fn from_frame(frame: &Frame) -> ParseResult<Self> {
         frame.payload_as_json()
     }
@@ -161,6 +191,41 @@ mod tests {
         assert_eq!(usage.cache_read_input_tokens, 180000);
         assert_eq!(usage.cache_write_input_tokens, 24000);
         assert_eq!(usage.output_tokens, 900);
+    }
+
+    #[test]
+    fn message_metadata_usage_deserializes_token_usage() {
+        let event: MessageMetadataEvent = serde_json::from_str(
+            r#"{
+                "conversationId": "conv-1",
+                "utteranceId": "utt-1",
+                "tokenUsage": {
+                    "uncachedInputTokens": 12,
+                    "cacheReadInputTokens": 345,
+                    "cacheWriteInputTokens": 67,
+                    "outputTokens": 8,
+                    "totalTokens": 432
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(event.conversation_id.as_deref(), Some("conv-1"));
+        assert_eq!(event.utterance_id.as_deref(), Some("utt-1"));
+        let usage = event.token_usage.unwrap();
+        assert_eq!(usage.input_tokens(), 12);
+        assert_eq!(usage.cache_read_input_tokens, 345);
+        assert_eq!(usage.cache_write_input_tokens, 67);
+        assert_eq!(usage.output_tokens, 8);
+    }
+
+    #[test]
+    fn metering_and_code_events_deserialize_without_extra_requirements() {
+        let metering: MeteringEvent = serde_json::from_str(r#"{"usage":1.25}"#).unwrap();
+        assert_eq!(metering.usage, 1.25);
+
+        let code: CodeEvent = serde_json::from_str(r#"{"content":"println!(\"hi\");"}"#).unwrap();
+        assert_eq!(code.content, "println!(\"hi\");");
     }
 
     #[test]

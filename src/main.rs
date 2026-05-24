@@ -270,6 +270,19 @@ async fn main() {
             }
         });
     }
+    let model_capabilities =
+        Arc::new(anthropic::model_capabilities::ModelCapabilitiesCatalog::new());
+    match postgres_store.load_model_capabilities_status().await {
+        Ok(Some(status)) => {
+            model_capabilities.load_persisted_status(status);
+            tracing::info!("已从 PgSQL 加载模型能力目录");
+        }
+        Ok(None) => {}
+        Err(err) => tracing::warn!(
+            "从 PgSQL 加载模型能力状态失败，使用内置模型目录继续: {}",
+            err
+        ),
+    }
 
     // 创建 MultiTokenManager 和 KiroProvider
     let token_manager = MultiTokenManager::new_with_stores(
@@ -299,6 +312,36 @@ async fn main() {
         config.default_endpoint.clone(),
     );
     let kiro_provider = Arc::new(kiro_provider);
+    {
+        let model_capabilities = model_capabilities.clone();
+        let postgres_store = postgres_store.clone();
+        let kiro_provider = kiro_provider.clone();
+        tokio::spawn(async move {
+            let status = match kiro_provider.list_available_models().await {
+                Ok(models) => model_capabilities.sync_from_kiro_models(models),
+                Err(err) => {
+                    tracing::warn!("模型能力启动同步失败，使用当前模型目录继续运行: {}", err);
+                    model_capabilities.record_sync_error(err.to_string())
+                }
+            };
+            if let Err(err) = postgres_store.save_model_capabilities_status(&status).await {
+                tracing::warn!("保存模型能力到 PgSQL 失败，不影响调度: {}", err);
+            }
+            if status.last_error.is_some() {
+                tracing::warn!(
+                    source = %status.source,
+                    model_count = status.model_count,
+                    "模型能力启动同步失败，使用当前模型目录继续运行"
+                );
+            } else {
+                tracing::info!(
+                    source = %status.source,
+                    model_count = status.model_count,
+                    "模型能力已初始化"
+                );
+            }
+        });
+    }
 
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
@@ -317,6 +360,7 @@ async fn main() {
         usage_recorder.clone(),
         prompt_cache.clone(),
         pricing_catalog.clone(),
+        model_capabilities.clone(),
         config.prompt_cache_target_read_ratio,
         config.prompt_cache_token_scale,
         config.prompt_cache_max_simulated_input_tokens,
@@ -347,6 +391,7 @@ async fn main() {
                 usage_recorder.clone(),
                 prompt_cache.clone(),
                 pricing_catalog.clone(),
+                model_capabilities.clone(),
                 kiro_provider.clone(),
                 postgres_store.clone(),
                 redis_store.clone(),

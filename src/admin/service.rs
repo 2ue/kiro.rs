@@ -17,6 +17,7 @@ use super::types::{
 };
 use crate::anthropic::{
     converter::map_model,
+    model_capabilities::{ModelCapabilitiesCatalog, ModelCapabilitiesStatus},
     pricing::{PricingCatalog, PricingStatus},
     prompt_cache::PromptCacheTracker,
     usage::{
@@ -73,6 +74,7 @@ pub struct AdminService {
     usage_recorder: Arc<UsageRecorder>,
     prompt_cache: Arc<PromptCacheTracker>,
     pricing_catalog: Arc<PricingCatalog>,
+    model_capabilities: Arc<ModelCapabilitiesCatalog>,
     kiro_provider: Arc<KiroProvider>,
 }
 
@@ -83,6 +85,7 @@ impl AdminService {
         usage_recorder: Arc<UsageRecorder>,
         prompt_cache: Arc<PromptCacheTracker>,
         pricing_catalog: Arc<PricingCatalog>,
+        model_capabilities: Arc<ModelCapabilitiesCatalog>,
         kiro_provider: Arc<KiroProvider>,
         postgres_store: Arc<PostgresStore>,
         redis_store: Arc<RedisStore>,
@@ -95,6 +98,7 @@ impl AdminService {
             usage_recorder,
             prompt_cache,
             pricing_catalog,
+            model_capabilities,
             kiro_provider,
         }
     }
@@ -562,6 +566,42 @@ impl AdminService {
         self.audit(
             "sync_model_pricing",
             "model_pricing",
+            None,
+            status.last_error.is_none(),
+            status.last_error.clone(),
+            json!({ "source": status.source, "modelCount": status.model_count }),
+        );
+        status
+    }
+
+    /// 获取 Kiro 模型能力同步状态。
+    pub fn get_model_capabilities(&self) -> ModelCapabilitiesStatus {
+        self.model_capabilities.status()
+    }
+
+    /// 手动同步 Kiro 模型能力。失败不影响调度，只体现在返回状态的 last_error。
+    pub async fn sync_model_capabilities(&self) -> ModelCapabilitiesStatus {
+        let status = match self.kiro_provider.list_available_models().await {
+            Ok(models) => self.model_capabilities.sync_from_kiro_models(models),
+            Err(err) => {
+                tracing::warn!("同步 Kiro 模型能力失败，不影响请求调度: {}", err);
+                self.model_capabilities.record_sync_error(err.to_string())
+            }
+        };
+        let mut status = status;
+        if let Err(err) = self
+            .postgres_store
+            .save_model_capabilities_status(&status)
+            .await
+        {
+            tracing::warn!("保存模型能力到 PgSQL 失败: {}", err);
+            if status.last_error.is_none() {
+                status.last_error = Some(format!("模型能力已同步，但保存到 PgSQL 失败: {}", err));
+            }
+        }
+        self.audit(
+            "sync_model_capabilities",
+            "model_capabilities",
             None,
             status.last_error.is_none(),
             status.last_error.clone(),

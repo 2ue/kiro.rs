@@ -15,7 +15,8 @@ use crate::kiro::provider::KiroProvider;
 use crate::model::config::{CompatProfile, PromptCacheSimulationMode, ReportedUsageConfig};
 
 use super::{
-    envelope, pricing::PricingCatalog, prompt_cache::PromptCacheTracker, usage::UsageRecorder,
+    envelope, model_capabilities::ModelCapabilitiesCatalog, pricing::PricingCatalog,
+    prompt_cache::PromptCacheTracker, usage::UsageRecorder,
 };
 
 /// 应用共享状态
@@ -32,6 +33,8 @@ pub struct AppState {
     pub usage_recorder: Arc<UsageRecorder>,
     /// 模型价格目录。仅用于统计计价，失败不影响请求。
     pub pricing_catalog: Arc<PricingCatalog>,
+    /// 模型能力目录。仅用于 /models 和后台观测，失败不影响请求调度。
+    pub model_capabilities: Arc<ModelCapabilitiesCatalog>,
     /// 本地 prompt-cache tracker
     pub prompt_cache: Arc<PromptCacheTracker>,
     /// 本地 prompt-cache usage 模拟模式
@@ -74,6 +77,7 @@ impl AppState {
             extract_thinking,
             usage_recorder,
             pricing_catalog: Arc::new(PricingCatalog::new()),
+            model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
             prompt_cache,
             prompt_cache_simulation_mode,
             prompt_cache_target_read_ratio: prompt_cache_target_read_ratio.clamp(0.0, 0.99),
@@ -106,6 +110,14 @@ impl AppState {
 
     pub fn with_pricing_catalog(mut self, pricing_catalog: Arc<PricingCatalog>) -> Self {
         self.pricing_catalog = pricing_catalog;
+        self
+    }
+
+    pub fn with_model_capabilities(
+        mut self,
+        model_capabilities: Arc<ModelCapabilitiesCatalog>,
+    ) -> Self {
+        self.model_capabilities = model_capabilities;
         self
     }
 

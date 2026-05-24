@@ -41,7 +41,7 @@ use super::middleware::AppState;
 use super::prompt_cache::{PromptCacheProfile, PromptCacheScope};
 use super::stream::{SseEvent, StreamContext};
 use super::types::{
-    CountTokensRequest, CountTokensResponse, MessagesRequest, Model, ModelsResponse, OutputConfig,
+    CountTokensRequest, CountTokensResponse, MessagesRequest, ModelsResponse, OutputConfig,
     Thinking,
 };
 use super::usage::{UsageRecord, UsageRecordStatus, UsageSource};
@@ -1277,173 +1277,10 @@ fn websearch_supported_for_profile(profile: CompatProfile) -> bool {
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
-pub async fn get_models() -> impl IntoResponse {
+pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
-    let models = vec![
-        Model {
-            id: "opus".to_string(),
-            object: "model".to_string(),
-            created: 1776276000,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Code Alias: Opus".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "opusplan".to_string(),
-            object: "model".to_string(),
-            created: 1776276000,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Code Alias: Opus Plan".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "best".to_string(),
-            object: "model".to_string(),
-            created: 1776276000,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Code Alias: Best Available".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "default".to_string(),
-            object: "model".to_string(),
-            created: 1776276000,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Code Alias: Default".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "sonnet".to_string(),
-            object: "model".to_string(),
-            created: 1771286400,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Code Alias: Sonnet".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "haiku".to_string(),
-            object: "model".to_string(),
-            created: 1760486400,
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Code Alias: Haiku".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-7".to_string(),
-            object: "model".to_string(),
-            created: 1776276000, // Apr 16, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-7-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1776276000, // Apr 16, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-    ];
+    let models = state.model_capabilities.anthropic_models();
 
     Json(ModelsResponse {
         object: "list".to_string(),
@@ -1970,6 +1807,9 @@ async fn handle_non_stream_request(
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
                         }
+                        Event::Code(code) => {
+                            text_content.push_str(&code.content);
+                        }
                         Event::ReasoningContent(reasoning) => {
                             if let Some(redacted) = reasoning.redacted_content {
                                 if !redacted.is_empty() {
@@ -2039,8 +1879,32 @@ async fn handle_non_stream_request(
                         }
                         Event::Metadata(metadata) => {
                             if let Some(token_usage) = metadata.token_usage {
+                                tracing::debug!(
+                                    input_tokens = token_usage.input_tokens(),
+                                    output_tokens = token_usage.output_tokens,
+                                    cache_read_input_tokens = token_usage.cache_read_input_tokens,
+                                    cache_write_input_tokens = token_usage.cache_write_input_tokens,
+                                    "非流式响应收到 metadataEvent token usage"
+                                );
                                 metadata_usage = Some(token_usage);
                             }
+                        }
+                        Event::MessageMetadata(metadata) => {
+                            if let Some(token_usage) = metadata.token_usage {
+                                tracing::debug!(
+                                    conversation_id = ?metadata.conversation_id,
+                                    utterance_id = ?metadata.utterance_id,
+                                    input_tokens = token_usage.input_tokens(),
+                                    output_tokens = token_usage.output_tokens,
+                                    cache_read_input_tokens = token_usage.cache_read_input_tokens,
+                                    cache_write_input_tokens = token_usage.cache_write_input_tokens,
+                                    "非流式响应收到 messageMetadataEvent token usage"
+                                );
+                                metadata_usage = Some(token_usage);
+                            }
+                        }
+                        Event::Metering(metering) => {
+                            tracing::debug!(usage = metering.usage, "非流式响应收到 meteringEvent");
                         }
                         Event::InvalidState(invalid) => {
                             let message = invalid.error_text();

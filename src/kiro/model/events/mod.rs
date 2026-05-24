@@ -9,8 +9,8 @@ mod context_usage;
 mod tool_use;
 
 pub use additional::{
-    InvalidStateEvent, MessageMetadataEvent, MetadataEvent, MetadataTokenUsage,
-    ReasoningContentEvent,
+    CodeEvent, InvalidStateEvent, MessageMetadataEvent, MetadataEvent, MetadataTokenUsage,
+    MeteringEvent, ReasoningContentEvent,
 };
 pub use assistant::AssistantResponseEvent;
 pub use base::Event;

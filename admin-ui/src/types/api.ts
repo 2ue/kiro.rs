@@ -335,4 +335,23 @@ export interface ModelPricingStatus {
   models: ModelPriceItem[]
 }
 
+export interface ModelCapabilityItem {
+  model: string
+  displayName: string
+  description?: string
+  maxInputTokens?: number
+  maxOutputTokens?: number
+  supportsPromptCaching?: boolean
+  supportedInputTypes: string[]
+}
+
+export interface ModelCapabilitiesStatus {
+  available: boolean
+  source: string
+  modelCount: number
+  lastSyncedAt?: string
+  lastError?: string
+  models: ModelCapabilityItem[]
+}
+
 export type CredentialExportFormat = 'json' | 'backup-json' | 'jsonl'

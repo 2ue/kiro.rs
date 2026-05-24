@@ -18,6 +18,7 @@ use super::{
         post_messages_real_cache_usage,
     },
     middleware::{AppState, auth_middleware, cors_layer},
+    model_capabilities::ModelCapabilitiesCatalog,
     pricing::PricingCatalog,
     prompt_cache::PromptCacheTracker,
     usage::UsageRecorder,
@@ -57,6 +58,7 @@ pub fn create_router_with_provider(
     usage_recorder: Arc<UsageRecorder>,
     prompt_cache: Arc<PromptCacheTracker>,
     pricing_catalog: Arc<PricingCatalog>,
+    model_capabilities: Arc<ModelCapabilitiesCatalog>,
     prompt_cache_target_read_ratio: f64,
     prompt_cache_token_scale: f64,
     prompt_cache_max_simulated_input_tokens: i32,
@@ -85,7 +87,8 @@ pub fn create_router_with_provider(
         prompt_cache_scale_min_input_tokens,
     )
     .with_reported_usage(reported_usage)
-    .with_pricing_catalog(pricing_catalog);
+    .with_pricing_catalog(pricing_catalog)
+    .with_model_capabilities(model_capabilities);
     if let Some(provider) = kiro_provider {
         base_state = base_state.with_kiro_provider(provider);
     }

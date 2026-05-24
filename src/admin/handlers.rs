@@ -351,6 +351,18 @@ pub async fn sync_model_pricing(State(state): State<AdminState>) -> impl IntoRes
     Json(state.service.sync_model_pricing().await)
 }
 
+/// GET /api/admin/model-capabilities
+/// 获取 Kiro 模型能力同步状态
+pub async fn get_model_capabilities(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_model_capabilities())
+}
+
+/// POST /api/admin/model-capabilities/sync
+/// 手动同步 Kiro 模型能力
+pub async fn sync_model_capabilities(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.sync_model_capabilities().await)
+}
+
 /// GET /api/admin/credentials/export?format=json|backup-json|jsonl
 /// 导出完整凭据。
 pub async fn export_credentials(

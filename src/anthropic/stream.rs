@@ -730,6 +730,7 @@ impl StreamContext {
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
         match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
+            Event::Code(code) => self.process_assistant_response(&code.content),
             Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::Metadata(metadata) => {
@@ -765,11 +766,28 @@ impl StreamContext {
                 Vec::new()
             }
             Event::MessageMetadata(metadata) => {
+                if let Some(token_usage) = &metadata.token_usage {
+                    self.output_tokens = token_usage.output_tokens;
+                    self.metadata_usage = Some(token_usage.clone());
+                    tracing::debug!(
+                        conversation_id = ?metadata.conversation_id,
+                        utterance_id = ?metadata.utterance_id,
+                        input_tokens = token_usage.input_tokens(),
+                        output_tokens = token_usage.output_tokens,
+                        cache_read_input_tokens = token_usage.cache_read_input_tokens,
+                        cache_write_input_tokens = token_usage.cache_write_input_tokens,
+                        "收到 messageMetadataEvent token usage"
+                    );
+                }
                 tracing::debug!(
                     conversation_id = ?metadata.conversation_id,
                     utterance_id = ?metadata.utterance_id,
                     "收到 messageMetadataEvent"
                 );
+                Vec::new()
+            }
+            Event::Metering(metering) => {
+                tracing::debug!(usage = metering.usage, "收到 meteringEvent");
                 Vec::new()
             }
             Event::InvalidState(invalid) => {
@@ -1689,6 +1707,61 @@ mod tests {
             .expect("message_delta should exist");
         assert_eq!(message_delta.data["usage"]["input_tokens"], 100);
         assert_eq!(message_delta.data["usage"]["output_tokens"], 9);
+    }
+
+    #[test]
+    fn test_message_metadata_usage_overrides_final_usage() {
+        use crate::kiro::model::events::{MessageMetadataEvent, MetadataTokenUsage};
+
+        let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_assistant_response("hello"));
+        all_events.extend(
+            ctx.process_kiro_event(&Event::MessageMetadata(MessageMetadataEvent {
+                conversation_id: Some("conv-1".to_string()),
+                utterance_id: Some("utt-1".to_string()),
+                token_usage: Some(MetadataTokenUsage {
+                    uncached_input_tokens: 21,
+                    output_tokens: 13,
+                    total_tokens: 377,
+                    cache_read_input_tokens: 300,
+                    cache_write_input_tokens: 43,
+                }),
+            })),
+        );
+        all_events.extend(ctx.generate_final_events());
+
+        let message_delta = all_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("message_delta should exist");
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 21);
+        assert_eq!(message_delta.data["usage"]["cache_read_input_tokens"], 300);
+        assert_eq!(
+            message_delta.data["usage"]["cache_creation_input_tokens"],
+            43
+        );
+        assert_eq!(message_delta.data["usage"]["output_tokens"], 13);
+    }
+
+    #[test]
+    fn test_code_event_is_forwarded_as_text_content() {
+        use crate::kiro::model::events::CodeEvent;
+
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let events = ctx.process_kiro_event(&Event::Code(CodeEvent {
+            content: "let value = 1;".to_string(),
+        }));
+
+        assert!(events.iter().any(|e| {
+            e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "text_delta"
+                && e.data["delta"]["text"] == "let value = 1;"
+        }));
     }
 
     #[test]

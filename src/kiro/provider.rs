@@ -19,9 +19,10 @@ use tokio::time::sleep;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
+use crate::kiro::model::available_models::{KiroAvailableModel, KiroAvailableModelsResponse};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{
-    CallContext, InFlightKind, InFlightLeaseGuard, MultiTokenManager,
+    CallContext, CredentialRiskControlReason, InFlightKind, InFlightLeaseGuard, MultiTokenManager,
 };
 use crate::model::config::{Config, TlsBackend};
 use parking_lot::Mutex;
@@ -260,7 +261,7 @@ mod tests {
 
     use chrono::{Duration, Utc};
 
-    use super::{KiroProvider, KiroStreamCompletion};
+    use super::{CredentialRiskControlReason, KiroProvider, KiroStreamCompletion};
     use crate::kiro::model::credentials::KiroCredentials;
     use crate::kiro::token_manager::MultiTokenManager;
     use crate::model::config::Config;
@@ -308,6 +309,38 @@ mod tests {
         assert_eq!(
             KiroProvider::format_credential_log_label(6, Some("#6 custom".to_string())),
             "#6 custom"
+        );
+    }
+
+    #[test]
+    fn detects_risk_controlled_upstream_errors() {
+        assert_eq!(
+            KiroProvider::detect_risk_control_error(
+                reqwest::StatusCode::FORBIDDEN,
+                r#"{"reason":"TEMPORARILY_SUSPENDED","message":"User ID is temporarily suspended"}"#
+            ),
+            Some(CredentialRiskControlReason::TemporarilySuspended)
+        );
+        assert_eq!(
+            KiroProvider::detect_risk_control_error(
+                reqwest::StatusCode::FORBIDDEN,
+                r#"{"__type":"AccountSuspendedException","message":"Account suspended"}"#
+            ),
+            Some(CredentialRiskControlReason::AccountSuspended)
+        );
+        assert_eq!(
+            KiroProvider::detect_risk_control_error(
+                reqwest::StatusCode::LOCKED,
+                r#"{"message":"Locked"}"#
+            ),
+            Some(CredentialRiskControlReason::AccountLocked)
+        );
+        assert_eq!(
+            KiroProvider::detect_risk_control_error(
+                reqwest::StatusCode::FORBIDDEN,
+                r#"{"message":"The bearer token included in the request is invalid"}"#
+            ),
+            None
         );
     }
 
@@ -680,6 +713,92 @@ impl KiroProvider {
         );
     }
 
+    /// 从 Kiro 上游同步可用模型列表。
+    ///
+    /// 该方法只用于后台模型能力同步：失败会返回给调用方记录状态，不会写入调度失败、
+    /// 不会禁用凭据，也不会占用请求并发槽。
+    pub async fn list_available_models(&self) -> anyhow::Result<Vec<KiroAvailableModel>> {
+        let credential_ids: Vec<u64> = self
+            .token_manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .filter(|entry| !entry.disabled)
+            .map(|entry| entry.id)
+            .collect();
+        let mut last_error: Option<anyhow::Error> = None;
+
+        for id in credential_ids {
+            let ctx = match self.token_manager.acquire_context_for_credential(id).await {
+                Ok(ctx) => ctx,
+                Err(err) => {
+                    last_error = Some(anyhow::anyhow!("凭据 #{} 获取 token 失败: {}", id, err));
+                    continue;
+                }
+            };
+            match self.list_available_models_for_context(&ctx).await {
+                Ok(models) if !models.is_empty() => return Ok(models),
+                Ok(_) => {
+                    last_error = Some(anyhow::anyhow!("凭据 #{} 返回空模型列表", id));
+                }
+                Err(err) => {
+                    let label = self.credential_log_label(ctx.id);
+                    tracing::warn!(
+                        credential_id = ctx.id,
+                        credential_label = %label,
+                        "同步 Kiro 模型能力失败: {}",
+                        err
+                    );
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("没有可用于同步模型能力的凭据")))
+    }
+
+    async fn list_available_models_for_context(
+        &self,
+        ctx: &CallContext,
+    ) -> anyhow::Result<Vec<KiroAvailableModel>> {
+        let config = self.token_manager.runtime_config();
+        let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
+        let endpoint = self.endpoint_for(&ctx.credentials)?;
+        let client = self.client_for(&ctx.credentials)?;
+        let rctx = RequestContext {
+            credentials: &ctx.credentials,
+            token: &ctx.token,
+            machine_id: &machine_id,
+            config: &config,
+        };
+
+        let mut all_models = Vec::new();
+        let mut next_token: Option<String> = None;
+        for _ in 0..20 {
+            let url = endpoint.models_url(&rctx, next_token.as_deref());
+            let request = endpoint.decorate_models(client.get(&url), &rctx);
+            let response = request.send().await?;
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            if !status.is_success() {
+                anyhow::bail!("ListAvailableModels 失败: {} {}", status, body);
+            }
+            let parsed: KiroAvailableModelsResponse = serde_json::from_str(&body)?;
+            all_models.extend(
+                parsed
+                    .models
+                    .into_iter()
+                    .filter(|model| !model.model_id.trim().is_empty()),
+            );
+            next_token = parsed.next_token.filter(|token| !token.trim().is_empty());
+            if next_token.is_none() {
+                break;
+            }
+        }
+
+        Ok(all_models)
+    }
+
     /// 发送流式 API 请求
     pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<KiroStreamResponse> {
         let result = self.call_api_with_retry(request_body, true).await?;
@@ -810,6 +929,42 @@ impl KiroProvider {
 
             // 失败响应
             let body = response.text().await.unwrap_or_default();
+
+            if let Some(risk_reason) = Self::detect_risk_control_error(status, &body) {
+                tracing::error!(
+                    credential_id = ctx.id,
+                    credential_label = %credential_label,
+                    risk_reason = ?risk_reason,
+                    "MCP 请求失败（{}，命中上游风控/封禁状态，禁用凭据并切换，尝试 {}/{}）: {} {}",
+                    credential_context,
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+                let has_available = self.token_manager.report_risk_controlled(
+                    ctx.id,
+                    risk_reason,
+                    format!("MCP {} {}", status, body),
+                );
+                if !has_available {
+                    self.finish_attempt(&mut ctx);
+                    anyhow::bail!(
+                        "MCP 请求失败（{}，所有凭据已用尽）: {} {}",
+                        credential_context,
+                        status,
+                        body
+                    );
+                }
+                last_error = Some(anyhow::anyhow!(
+                    "MCP 请求失败（{}）: {} {}",
+                    credential_context,
+                    status,
+                    body
+                ));
+                self.finish_attempt(&mut ctx);
+                continue;
+            }
 
             // 402 额度用尽
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
@@ -1212,6 +1367,48 @@ impl KiroProvider {
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
 
+            if let Some(risk_reason) = Self::detect_risk_control_error(status, &body) {
+                tracing::error!(
+                    credential_id = ctx.id,
+                    credential_label = %credential_label,
+                    risk_reason = ?risk_reason,
+                    "API 请求失败（{}，命中上游风控/封禁状态，禁用凭据并切换，尝试 {}/{}）: {} {}",
+                    credential_context,
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+                let has_available = self.token_manager.report_risk_controlled(
+                    ctx.id,
+                    risk_reason,
+                    format!("{} API {} {}", api_type, status, body),
+                );
+                if let Some(session_id) = conversation_id.as_deref() {
+                    self.token_manager
+                        .unbind_session_if_bound_to(session_id, ctx.id);
+                }
+                if !has_available {
+                    self.finish_attempt(&mut ctx);
+                    anyhow::bail!(
+                        "{} API 请求失败（{}，所有凭据已用尽）: {} {}",
+                        api_type,
+                        credential_context,
+                        status,
+                        body
+                    );
+                }
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败（{}）: {} {}",
+                    api_type,
+                    credential_context,
+                    status,
+                    body
+                ));
+                self.finish_attempt(&mut ctx);
+                continue;
+            }
+
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
                 tracing::warn!(
@@ -1513,6 +1710,72 @@ impl KiroProvider {
         } else {
             Some(Duration::from_secs(seconds as u64))
         }
+    }
+
+    fn detect_risk_control_error(
+        status: reqwest::StatusCode,
+        body: &str,
+    ) -> Option<CredentialRiskControlReason> {
+        let lower = body.to_ascii_lowercase();
+
+        if status.as_u16() == 423 {
+            return Some(CredentialRiskControlReason::AccountLocked);
+        }
+
+        if body.contains("TEMPORARILY_SUSPENDED")
+            || lower.contains("temporarily suspended")
+            || lower.contains("temporary suspended")
+        {
+            return Some(CredentialRiskControlReason::TemporarilySuspended);
+        }
+
+        if body.contains("PERMANENTLY_SUSPENDED")
+            || body.contains("ACCOUNT_SUSPENDED")
+            || body.contains("AccountSuspendedException")
+            || lower.contains("account suspended")
+            || lower.contains("permanently suspended")
+            || lower.contains("user is suspended")
+        {
+            return Some(CredentialRiskControlReason::AccountSuspended);
+        }
+
+        if lower.contains("account locked")
+            || lower.contains("user locked")
+            || lower.contains("locked account")
+        {
+            return Some(CredentialRiskControlReason::AccountLocked);
+        }
+
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+            return None;
+        };
+        for pointer in [
+            "/reason",
+            "/error/reason",
+            "/__type",
+            "/code",
+            "/error/code",
+            "/exceptionType",
+            "/error/exceptionType",
+        ] {
+            let Some(text) = value.pointer(pointer).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            match text {
+                "TEMPORARILY_SUSPENDED" => {
+                    return Some(CredentialRiskControlReason::TemporarilySuspended);
+                }
+                "ACCOUNT_SUSPENDED" | "PERMANENTLY_SUSPENDED" | "AccountSuspendedException" => {
+                    return Some(CredentialRiskControlReason::AccountSuspended);
+                }
+                "ACCOUNT_LOCKED" | "LOCKED" | "AccountLockedException" => {
+                    return Some(CredentialRiskControlReason::AccountLocked);
+                }
+                _ => {}
+            }
+        }
+
+        None
     }
 
     fn is_event_stream_response(response: &reqwest::Response) -> bool {

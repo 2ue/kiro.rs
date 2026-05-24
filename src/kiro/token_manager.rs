@@ -489,6 +489,12 @@ enum DisabledReason {
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
     InvalidConfig,
+    /// 上游明确返回临时风控/暂停
+    TemporarilySuspended,
+    /// 上游明确返回账号已暂停/封禁
+    AccountSuspended,
+    /// 上游明确返回账号锁定
+    AccountLocked,
 }
 
 impl DisabledReason {
@@ -500,6 +506,9 @@ impl DisabledReason {
             DisabledReason::QuotaExceeded => "QuotaExceeded",
             DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
             DisabledReason::InvalidConfig => "InvalidConfig",
+            DisabledReason::TemporarilySuspended => "TemporarilySuspended",
+            DisabledReason::AccountSuspended => "AccountSuspended",
+            DisabledReason::AccountLocked => "AccountLocked",
         }
     }
 
@@ -511,7 +520,42 @@ impl DisabledReason {
             "QuotaExceeded" => Some(DisabledReason::QuotaExceeded),
             "InvalidRefreshToken" => Some(DisabledReason::InvalidRefreshToken),
             "InvalidConfig" => Some(DisabledReason::InvalidConfig),
+            "TemporarilySuspended" => Some(DisabledReason::TemporarilySuspended),
+            "AccountSuspended" => Some(DisabledReason::AccountSuspended),
+            "AccountLocked" => Some(DisabledReason::AccountLocked),
             _ => None,
+        }
+    }
+}
+
+/// 上游明确返回的账号风控/暂停状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialRiskControlReason {
+    TemporarilySuspended,
+    AccountSuspended,
+    AccountLocked,
+}
+
+impl CredentialRiskControlReason {
+    fn disabled_reason(self) -> DisabledReason {
+        match self {
+            CredentialRiskControlReason::TemporarilySuspended => {
+                DisabledReason::TemporarilySuspended
+            }
+            CredentialRiskControlReason::AccountSuspended => DisabledReason::AccountSuspended,
+            CredentialRiskControlReason::AccountLocked => DisabledReason::AccountLocked,
+        }
+    }
+
+    fn event_reason(self) -> &'static str {
+        self.disabled_reason().as_str()
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            CredentialRiskControlReason::TemporarilySuspended => "临时风控/暂停",
+            CredentialRiskControlReason::AccountSuspended => "账号暂停/封禁",
+            CredentialRiskControlReason::AccountLocked => "账号锁定",
         }
     }
 }
@@ -3377,6 +3421,114 @@ impl MultiTokenManager {
         result
     }
 
+    /// 报告指定凭据被上游明确风控、暂停或锁定。
+    ///
+    /// 这类错误不是普通瞬态 429，也不是连续失败阈值问题；继续调度该凭据通常只会
+    /// 放大风控。这里立即禁用并记录独立原因，后台可通过 reset/enable 人工恢复。
+    pub fn report_risk_controlled(
+        &self,
+        id: u64,
+        reason: CredentialRiskControlReason,
+        detail: impl Into<String>,
+    ) -> bool {
+        let detail = detail.into();
+        let disabled_reason = reason.disabled_reason();
+        let last_used_at: String;
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let entry = match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) => e,
+                None => return entries.iter().any(|e| !e.disabled),
+            };
+
+            if entry.disabled {
+                return entries.iter().any(|e| !e.disabled);
+            }
+
+            entry.disabled = true;
+            entry.disabled_reason = Some(disabled_reason);
+            let now = Utc::now().to_rfc3339();
+            entry.last_used_at = Some(now.clone());
+            last_used_at = now;
+            entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+
+            tracing::error!(
+                credential_id = id,
+                reason = reason.event_reason(),
+                detail = %detail,
+                "凭据 #{} 命中上游{}，已被禁用",
+                id,
+                reason.label()
+            );
+
+            if let Some(next) = entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .min_by_key(|e| e.credentials.priority)
+            {
+                *current_id = next.id;
+                tracing::info!(
+                    "已切换到凭据 #{}（优先级 {}）",
+                    next.id,
+                    next.credentials.priority
+                );
+                true
+            } else {
+                tracing::error!("所有凭据均已禁用！");
+                false
+            }
+        };
+        self.unbind_sessions_for_credential(id);
+        self.clear_scheduler_state_for_credential(id, false);
+        let mut persisted = false;
+        match self.persist_disabled_state(
+            id,
+            disabled_reason,
+            Some(MAX_FAILURES_PER_CREDENTIAL),
+            None,
+            &last_used_at,
+        ) {
+            Ok(Some(state)) => {
+                persisted = true;
+                self.apply_runtime_state_for(id, &state);
+            }
+            Ok(None) => {}
+            Err(err) => tracing::warn!("记录风控禁用状态到 PgSQL 失败: {}", err),
+        }
+        if !persisted {
+            if let Err(err) = self.persist_credential_entry(id) {
+                tracing::warn!("风控禁用凭据后持久化凭据失败: {}", err);
+            }
+            self.save_runtime_state_for(id);
+            self.persist_last_used_at(id, &last_used_at);
+        }
+        if let Some(store) = &self.postgres_store {
+            let store = store.clone();
+            let event_reason = reason.event_reason().to_string();
+            let detail_value = serde_json::json!({
+                "reason": event_reason,
+                "detail": detail,
+            });
+            if let Err(err) = block_on_storage("记录凭据风控事件到 PgSQL", async move {
+                store
+                    .record_credential_event(
+                        Some(id),
+                        "credential_risk_controlled",
+                        Some(&event_reason),
+                        detail_value,
+                    )
+                    .await
+            }) {
+                tracing::warn!("记录凭据风控事件失败: {}", err);
+            }
+        }
+        self.publish_credentials_changed("credential_risk_controlled");
+        self.notify_dispatch_state_changed();
+        result
+    }
+
     /// 报告指定凭据刷新 Token 失败。
     ///
     /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换，
@@ -5904,6 +6056,33 @@ mod tests {
         // 再禁用第二个后，无可用凭据
         assert!(!manager.report_quota_exhausted(2));
         assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn test_report_risk_controlled_disables_with_specific_reason() {
+        let config = Config::default();
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        assert!(manager.report_risk_controlled(
+            1,
+            CredentialRiskControlReason::TemporarilySuspended,
+            "TEMPORARILY_SUSPENDED"
+        ));
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.available, 1);
+        assert_eq!(snapshot.current_id, 2);
+        let disabled = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert!(disabled.disabled);
+        assert_eq!(
+            disabled.disabled_reason.as_deref(),
+            Some("TemporarilySuspended")
+        );
+        assert_eq!(disabled.failure_count, MAX_FAILURES_PER_CREDENTIAL);
     }
 
     #[tokio::test]

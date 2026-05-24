@@ -38,6 +38,7 @@ pub(crate) mod converter;
 mod envelope;
 mod handlers;
 mod middleware;
+pub(crate) mod model_capabilities;
 pub(crate) mod pricing;
 pub(crate) mod prompt_cache;
 mod router;

@@ -70,6 +70,21 @@ impl KiroEndpoint for IdeEndpoint {
         format!("https://q.{}.amazonaws.com/mcp", self.api_region(ctx))
     }
 
+    fn models_url(&self, ctx: &RequestContext<'_>, next_token: Option<&str>) -> String {
+        let mut params = vec!["origin=AI_EDITOR".to_string(), "maxResults=50".to_string()];
+        if let Some(profile_arn) = ctx.credentials.profile_arn.as_deref() {
+            params.push(format!("profileArn={}", urlencoding::encode(profile_arn)));
+        }
+        if let Some(next_token) = next_token {
+            params.push(format!("nextToken={}", urlencoding::encode(next_token)));
+        }
+        format!(
+            "https://q.{}.amazonaws.com/ListAvailableModels?{}",
+            self.api_region(ctx),
+            params.join("&")
+        )
+    }
+
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
         let mut req = req
             .header("x-amzn-codewhisperer-optout", "true")
@@ -89,6 +104,26 @@ impl KiroEndpoint for IdeEndpoint {
 
     fn decorate_mcp(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
         let mut req = req
+            .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
+            .header("user-agent", self.user_agent(ctx))
+            .header("host", self.host(ctx))
+            .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=3")
+            .header("Authorization", format!("Bearer {}", ctx.token));
+
+        if let Some(ref arn) = ctx.credentials.profile_arn {
+            req = req.header("x-amzn-kiro-profile-arn", arn);
+        }
+        if ctx.credentials.is_api_key_credential() {
+            req = req.header("tokentype", "API_KEY");
+        }
+        req
+    }
+
+    fn decorate_models(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
+        let mut req = req
+            .header("accept", "application/json")
+            .header("x-amzn-codewhisperer-optout", "true")
             .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
             .header("user-agent", self.user_agent(ctx))
             .header("host", self.host(ctx))

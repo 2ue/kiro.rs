@@ -100,6 +100,7 @@ Complete all chunked operations without commentary.";
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
     let model_base = model_lower.strip_suffix("[1m]").unwrap_or(&model_lower);
+    let model_base = model_base.strip_suffix("-thinking").unwrap_or(model_base);
 
     if matches!(model_base, "opus" | "opusplan" | "best" | "default") {
         Some("claude-opus-4.7".to_string())
@@ -107,6 +108,14 @@ pub fn map_model(model: &str) -> Option<String> {
         Some("claude-sonnet-4.6".to_string())
     } else if model_base == "haiku" {
         Some("claude-haiku-4.5".to_string())
+    } else if is_native_claude_family_model(model_base, "sonnet") {
+        if model_base.contains("4-6") || model_base.contains("4.6") {
+            Some("claude-sonnet-4.6".to_string())
+        } else if model_base.contains("4-5") || model_base.contains("4.5") {
+            Some("claude-sonnet-4.5".to_string())
+        } else {
+            Some(model_base.to_string())
+        }
     } else if model_base.contains("sonnet") {
         if model_base.contains("4-6") || model_base.contains("4.6") {
             Some("claude-sonnet-4.6".to_string())
@@ -120,6 +129,16 @@ pub fn map_model(model: &str) -> Option<String> {
         } else {
             None
         }
+    } else if is_native_claude_family_model(model_base, "opus") {
+        if model_base.contains("4-5") || model_base.contains("4.5") {
+            Some("claude-opus-4.5".to_string())
+        } else if model_base.contains("4-6") || model_base.contains("4.6") {
+            Some("claude-opus-4.6".to_string())
+        } else if model_base.contains("4-7") || model_base.contains("4.7") {
+            Some("claude-opus-4.7".to_string())
+        } else {
+            Some(model_base.to_string())
+        }
     } else if model_base.contains("opus") {
         if model_base.contains("4-5") || model_base.contains("4.5") {
             Some("claude-opus-4.5".to_string())
@@ -132,11 +151,24 @@ pub fn map_model(model: &str) -> Option<String> {
         } else {
             None
         }
+    } else if is_native_claude_family_model(model_base, "haiku") {
+        if model_base.contains("4-5") || model_base.contains("4.5") {
+            Some("claude-haiku-4.5".to_string())
+        } else {
+            Some(model_base.to_string())
+        }
     } else if model_base.contains("haiku") {
         Some("claude-haiku-4.5".to_string())
     } else {
         None
     }
+}
+
+fn is_native_claude_family_model(model: &str, family: &str) -> bool {
+    model
+        .strip_prefix("claude-")
+        .and_then(|rest| rest.strip_prefix(family))
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', '.']))
 }
 
 /// 根据模型名称返回对应的上下文窗口大小
@@ -1459,6 +1491,26 @@ mod tests {
         assert_eq!(
             map_model("claude-opus-4-7[1m]"),
             Some("claude-opus-4.7".to_string())
+        );
+    }
+
+    #[test]
+    fn test_map_model_future_claude_models_pass_through() {
+        assert_eq!(
+            map_model("claude-sonnet-4-9-20270101"),
+            Some("claude-sonnet-4-9-20270101".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5-20270101"),
+            Some("claude-opus-5-20270101".to_string())
+        );
+        assert_eq!(
+            map_model("claude-haiku-4-7-20270101"),
+            Some("claude-haiku-4-7-20270101".to_string())
+        );
+        assert_eq!(
+            map_model("Claude-Sonnet-4-9-20270101-thinking[1m]"),
+            Some("claude-sonnet-4-9-20270101".to_string())
         );
     }
 

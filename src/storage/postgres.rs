@@ -9,6 +9,7 @@ use sqlx::{
     postgres::{PgPoolOptions, PgRow},
 };
 
+use crate::anthropic::model_capabilities::{ModelCapabilitiesStatus, ModelCapabilityItem};
 use crate::anthropic::pricing::{ModelPriceItem, ModelPricing, PricingStatus};
 use crate::anthropic::usage::{
     CredentialCostSummary, UsageAggregate, UsageRecord, UsageRecordQuery, UsageRecordStatus,
@@ -944,6 +945,149 @@ impl PostgresStore {
         }))
     }
 
+    pub async fn save_model_capabilities_status(
+        &self,
+        status: &ModelCapabilitiesStatus,
+    ) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let incoming_models: Vec<String> = status
+            .models
+            .iter()
+            .map(|item| item.model.clone())
+            .collect();
+        for item in &status.models {
+            sqlx::query(
+                r#"
+                INSERT INTO model_capabilities (
+                    model, display_name, description, max_input_tokens, max_output_tokens,
+                    supports_prompt_caching, supported_input_types, source,
+                    last_synced_at, last_error, updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+                ON CONFLICT (model) DO UPDATE
+                SET display_name = EXCLUDED.display_name,
+                    description = EXCLUDED.description,
+                    max_input_tokens = EXCLUDED.max_input_tokens,
+                    max_output_tokens = EXCLUDED.max_output_tokens,
+                    supports_prompt_caching = EXCLUDED.supports_prompt_caching,
+                    supported_input_types = EXCLUDED.supported_input_types,
+                    source = EXCLUDED.source,
+                    last_synced_at = EXCLUDED.last_synced_at,
+                    last_error = EXCLUDED.last_error,
+                    updated_at = now()
+                "#,
+            )
+            .bind(&item.model)
+            .bind(&item.display_name)
+            .bind(&item.description)
+            .bind(item.max_input_tokens)
+            .bind(item.max_output_tokens)
+            .bind(item.supports_prompt_caching)
+            .bind(&item.supported_input_types)
+            .bind(&status.source)
+            .bind(&status.last_synced_at)
+            .bind(&status.last_error)
+            .execute(&mut *tx)
+            .await?;
+        }
+        if incoming_models.is_empty() {
+            sqlx::query("DELETE FROM model_capabilities")
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            sqlx::query("DELETE FROM model_capabilities WHERE model <> ALL($1::text[])")
+                .bind(incoming_models)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO model_capabilities_sync_status (
+                id, source, last_synced_at, last_error, model_count, updated_at
+            )
+            VALUES ('default', $1, $2, $3, $4, now())
+            ON CONFLICT (id) DO UPDATE
+            SET source = EXCLUDED.source,
+                last_synced_at = EXCLUDED.last_synced_at,
+                last_error = EXCLUDED.last_error,
+                model_count = EXCLUDED.model_count,
+                updated_at = now()
+            "#,
+        )
+        .bind(&status.source)
+        .bind(&status.last_synced_at)
+        .bind(&status.last_error)
+        .bind(status.model_count as i32)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn load_model_capabilities_status(
+        &self,
+    ) -> anyhow::Result<Option<ModelCapabilitiesStatus>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT model, display_name, description, max_input_tokens, max_output_tokens,
+                   supports_prompt_caching, supported_input_types, source,
+                   last_synced_at, last_error
+            FROM model_capabilities
+            ORDER BY model ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let status_row = sqlx::query(
+            r#"
+            SELECT source, last_synced_at, last_error
+            FROM model_capabilities_sync_status
+            WHERE id = 'default'
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        let (source, last_synced_at, last_error): (String, Option<String>, Option<String>) =
+            if let Some(row) = status_row {
+                (
+                    row.try_get("source")?,
+                    row.try_get("last_synced_at")?,
+                    row.try_get("last_error")?,
+                )
+            } else {
+                (
+                    rows[0].try_get("source")?,
+                    rows[0].try_get("last_synced_at")?,
+                    rows[0].try_get("last_error")?,
+                )
+            };
+        let mut models = Vec::with_capacity(rows.len());
+        for row in rows {
+            models.push(ModelCapabilityItem {
+                model: row.try_get("model")?,
+                display_name: row.try_get("display_name")?,
+                description: row.try_get("description")?,
+                max_input_tokens: row.try_get("max_input_tokens")?,
+                max_output_tokens: row.try_get("max_output_tokens")?,
+                supports_prompt_caching: row.try_get("supports_prompt_caching")?,
+                supported_input_types: row.try_get("supported_input_types")?,
+            });
+        }
+
+        Ok(Some(ModelCapabilitiesStatus {
+            available: true,
+            source,
+            model_count: models.len(),
+            last_synced_at,
+            last_error,
+            models,
+        }))
+    }
+
     pub async fn record_admin_audit_log(
         &self,
         actor: &str,
@@ -1717,6 +1861,29 @@ CREATE TABLE IF NOT EXISTS model_pricing_sync_status (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS model_capabilities (
+    model TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    description TEXT,
+    max_input_tokens INTEGER,
+    max_output_tokens INTEGER,
+    supports_prompt_caching BOOLEAN,
+    supported_input_types TEXT[] NOT NULL DEFAULT '{}',
+    source TEXT NOT NULL,
+    last_synced_at TEXT,
+    last_error TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS model_capabilities_sync_status (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    last_synced_at TEXT,
+    last_error TEXT,
+    model_count INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS admin_audit_logs (
     id BIGSERIAL PRIMARY KEY,
     actor TEXT NOT NULL,
@@ -2051,6 +2218,47 @@ mod tests {
         assert_eq!(pricing_status.source_url, "local");
         assert_eq!(pricing_status.last_synced_at, status.last_synced_at);
         assert_eq!(pricing_status.model_count, 1);
+
+        let capabilities_status = ModelCapabilitiesStatus {
+            available: true,
+            source: "test".to_string(),
+            model_count: 1,
+            last_synced_at: Some(Utc::now().to_rfc3339()),
+            last_error: None,
+            models: vec![ModelCapabilityItem {
+                model: "claude-sonnet-4-9".to_string(),
+                display_name: "Claude Sonnet 4.9".to_string(),
+                description: Some("future test model".to_string()),
+                max_input_tokens: Some(1_000_000),
+                max_output_tokens: Some(128_000),
+                supports_prompt_caching: Some(true),
+                supported_input_types: vec!["TEXT".to_string(), "IMAGE".to_string()],
+            }],
+        };
+        store
+            .save_model_capabilities_status(&capabilities_status)
+            .await
+            .unwrap();
+        let loaded_capabilities = store
+            .load_model_capabilities_status()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded_capabilities.source, "test");
+        assert_eq!(
+            loaded_capabilities.last_synced_at,
+            capabilities_status.last_synced_at
+        );
+        assert_eq!(loaded_capabilities.model_count, 1);
+        assert_eq!(loaded_capabilities.models[0].model, "claude-sonnet-4-9");
+        assert_eq!(
+            loaded_capabilities.models[0].max_input_tokens,
+            Some(1_000_000)
+        );
+        assert_eq!(
+            loaded_capabilities.models[0].supported_input_types,
+            vec!["TEXT".to_string(), "IMAGE".to_string()]
+        );
 
         store
             .record_admin_audit_log(
