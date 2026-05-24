@@ -140,87 +140,20 @@ KIRO_RS_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强
 
 ## 5. config.json
 
-在 `/opt/kiro-rs/config/config.json` 写入下面内容，并按实际情况修改密钥和策略：
+在 `/opt/kiro-rs/config/config.json` 写入下面内容，并按实际情况修改密钥：
 
 ```json
 {
   "postgres": {
-    "url": "postgres://kiro_rs:change-me@kiro-rs-postgres:5432/kiro_rs",
-    "maxConnections": 10,
-    "migrateOnStart": true
+    "url": "postgres://kiro_rs:change-me@kiro-rs-postgres:5432/kiro_rs"
   },
   "redis": {
-    "url": "redis://kiro-rs-redis:6379/0",
-    "keyPrefix": "kiro_rs:prod"
+    "url": "redis://kiro-rs-redis:6379/0"
   },
   "host": "0.0.0.0",
   "port": 8990,
   "apiKey": "sk-kiro-rs-change-me",
-  "tlsBackend": "rustls",
-  "region": "us-east-1",
-  "kiroVersion": "0.11.107",
-  "nodeVersion": "22.22.0",
-  "adminApiKey": "sk-admin-change-me",
-  "loadBalancingMode": "priority",
-  "credentialRpm": null,
-  "credentialMaxConcurrentRequests": 0,
-  "credentialTransientCooldownSecs": 10,
-  "credentialMaxCooldownSecs": 300,
-  "credentialDispatchMaxWaitSecs": 120,
-  "credentialInFlightLeaseMaxSecs": 900,
-  "credentialWarmupRequests": 3,
-  "credentialWarmupSelectionPercent": 5,
-  "compression": {
-    "enabled": false,
-    "whitespaceCompression": true
-  },
-  "compatProfile": "claude-code",
-  "extractThinking": true,
-  "promptCacheTargetReadRatio": 0.98,
-  "promptCacheTokenScale": 1.6,
-  "promptCacheMaxSimulatedInputTokens": 300000,
-  "promptCacheCapJitterMinTokens": 12000,
-  "promptCacheCapJitterMaxTokens": 24000,
-  "promptCacheScaleMinInputTokens": 20000,
-  "reportedUsage": {
-    "default": {
-      "enabled": true,
-      "input": { "mode": "preserve" },
-      "output": { "mode": "preserve" },
-      "cacheRead": { "mode": "preserve" },
-      "cacheCreation": { "mode": "preserve" }
-    },
-    "pathOverrides": {
-      "/na": {
-        "enabled": false
-      },
-      "/cc": {
-        "enabled": true,
-        "input": {
-          "mode": "sample-max",
-          "maxTokens": 96,
-          "moveDeltaToCacheRead": true
-        },
-        "cacheCreation": {
-          "mode": "sample-target",
-          "targetTokens": 3000,
-          "normalMaxMultiplier": 1.2
-        }
-      },
-      "/ha": {
-        "enabled": true,
-        "input": {
-          "mode": "sample-max",
-          "maxTokens": 96,
-          "moveDeltaToCacheRead": true
-        }
-      }
-    }
-  },
-  "usageRecordLimit": 5000,
-  "highCacheThreshold": 10000,
-  "defaultEndpoint": "ide",
-  "exposeProxyWarnings": false
+  "adminApiKey": "sk-admin-change-me"
 }
 ```
 
@@ -228,6 +161,7 @@ KIRO_RS_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强
 
 - Docker 部署时 `host` 必须是 `0.0.0.0`，否则宿主机端口映射后可能访问不到服务。
 - Compose 会通过 `KIRO_RS_POSTGRES_URL` 和 `KIRO_RS_REDIS_URL` 注入数据库连接地址；文件里的 `postgres.url` 和 `redis.url` 也可以保留，主要用于本地或非 Compose 场景。
+- 未写出的配置会使用内置默认值。首次启动导入 PgSQL 后，可以在后台配置页热更新调度、高缓存模拟和路径级 usage 上报策略。
 - 首次启动时，如果 PgSQL 没有运行配置或凭据，服务会从 `config.json` 和 `credentials.json` 导入。
 - 导入后运行配置、凭据状态、Token 刷新结果、失败计数、预热状态、调度统计、usage 记录、模型价格都以 PgSQL 为准。
 - 会话粘性绑定、同会话软失败计数、上游瞬态错误冷却、本地 RPM 限流、单凭据并发 lease 和跨实例 Token 刷新锁都以 Redis 为准。
@@ -342,9 +276,10 @@ KIRO_RS_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强
 | `promptCacheCapJitterMinTokens` | `12000` | 控制触顶时 soft-cap 最小扣减值。 |
 | `promptCacheCapJitterMaxTokens` | `24000` | 控制触顶时 soft-cap 最大扣减值。 |
 | `promptCacheScaleMinInputTokens` | `20000` | 控制基础输入达到多少 token 后才启用放大。 |
-| `reportedUsage.default` | 原样上报 | 控制所有路径的默认 input、output、cache read、cache write 上报方式。 |
+| `reportedUsage.default` | input/output 原始值，cache read/write 保留计算值 | 控制所有路径的默认 input、output、cache read、cache write 上报方式。 |
 | `reportedUsage.pathOverrides` | `/na`、`/cc`、`/ha` | 控制路径前缀覆盖策略。每个前缀独立配置，最长前缀优先。 |
-| `mode: "preserve"` | 默认 | 原样上报该字段。 |
+| `mode: "preserve"` | 默认用于 cache read/write | 保留本地 high-cache 计算后的字段值。 |
+| `mode: "raw"` | 默认用于 input/output | 使用请求和上游响应的原始字段值，不使用本地 high-cache 放大后的值。 |
 | `mode: "sample-max"` | input 可用 | 把字段采样到 `maxTokens` 以内，数值自然浮动，不固定到上限。 |
 | `mode: "sample-target"` | cache write 可用 | 按 `targetTokens` 和 `normalMaxMultiplier` 生成自然分布。 |
 | `moveDeltaToCacheRead` | input 建议 `true` | input 被压低的差值转入 cache read，只改变下游上报外观。 |

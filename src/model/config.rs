@@ -25,7 +25,6 @@ impl Default for TlsBackend {
 #[serde(rename_all = "kebab-case")]
 pub enum PromptCacheSimulationMode {
     Disabled,
-    #[serde(alias = "local-prompt-cache")]
     HighCache,
 }
 
@@ -948,34 +947,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_prompt_cache_simulation_mode_is_ignored() {
-        let config: Config = serde_json::from_str(
-            r#"{
-                "apiKey": "sk-test",
-                "promptCacheSimulationMode": "disabled"
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(config.prompt_cache_target_read_ratio, 0.98);
-    }
-
-    #[test]
-    fn legacy_local_prompt_cache_mode_is_ignored() {
-        let config: Config = serde_json::from_str(
-            r#"{
-                "apiKey": "sk-test",
-                "promptCacheSimulationMode": "local-prompt-cache"
-            }"#,
-        )
-        .unwrap();
-
-        let json = serde_json::to_string(&config).unwrap();
-
-        assert!(!json.contains("promptCacheSimulationMode"));
-    }
-
-    #[test]
     fn reported_usage_deserializes_from_camel_case_config() {
         let config: Config = serde_json::from_str(
             r#"{
@@ -1069,5 +1040,50 @@ mod tests {
             96
         );
         assert!(!reported_usage.policy_for_path("/na/v1/messages").enabled);
+    }
+
+    #[test]
+    fn config_example_bootstraps_desired_reported_usage_defaults() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let example_path = std::path::Path::new(manifest_dir).join("config.example.json");
+        let json = std::fs::read_to_string(example_path).unwrap();
+        let config: Config = serde_json::from_str(&json).unwrap();
+
+        let default_policy = config.reported_usage.policy_for_path("/v1/messages");
+        assert_eq!(default_policy.input.mode, ReportedUsageFieldMode::Raw);
+        assert_eq!(default_policy.output.mode, ReportedUsageFieldMode::Raw);
+        assert_eq!(
+            default_policy.cache_read.mode,
+            ReportedUsageFieldMode::Preserve
+        );
+        assert_eq!(
+            default_policy.cache_creation.mode,
+            ReportedUsageFieldMode::Preserve
+        );
+
+        let cc_policy = config.reported_usage.policy_for_path("/cc/v1/messages");
+        assert_eq!(cc_policy.input.mode, ReportedUsageFieldMode::SampleMax);
+        assert_eq!(cc_policy.input.max_tokens, 96);
+        assert!(cc_policy.input.move_delta_to_cache_read);
+        assert_eq!(
+            cc_policy.cache_creation.mode,
+            ReportedUsageFieldMode::SampleTarget
+        );
+        assert_eq!(cc_policy.cache_creation.target_tokens, 3_000);
+        assert_eq!(cc_policy.cache_creation.normal_max_multiplier, 1.2);
+
+        let ha_policy = config.reported_usage.policy_for_path("/ha/v1/messages");
+        assert_eq!(ha_policy.input.mode, ReportedUsageFieldMode::SampleMax);
+        assert_eq!(
+            ha_policy.cache_creation.mode,
+            ReportedUsageFieldMode::Preserve
+        );
+
+        assert!(
+            !config
+                .reported_usage
+                .policy_for_path("/na/v1/messages")
+                .enabled
+        );
     }
 }

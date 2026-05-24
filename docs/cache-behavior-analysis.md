@@ -9,11 +9,12 @@
 
 ## Current Cache Mode
 
-The local instance is running with high-cache prompt-cache usage simulation:
+The local instance is running with path-fixed high-cache prompt-cache usage simulation.
+`/v1/messages`, `/cc/v1/messages`, `/ha/v1/messages`, and `/na/v1/messages` are routed by path,
+while downstream usage projection is controlled by `reportedUsage`.
 
 ```json
 {
-  "promptCacheSimulationMode": "high-cache",
   "promptCacheTargetReadRatio": 0.98,
   "promptCacheTokenScale": 1.6,
   "promptCacheMaxSimulatedInputTokens": 300000,
@@ -49,7 +50,7 @@ The `highCacheRequests` admin summary field is threshold-based. It counts record
 - Mixed synchronous and streaming calls in the same session: cache was shared across stream modes.
 - Independent sessions with the same prompt: no cross-session cache read.
 - Requests without `metadata.user_id`: each request received a random conversation id, so no stable local read was available.
-- Explicit `cache_control`: still works and remains compatible with the previous local-prompt-cache behavior.
+- Explicit `cache_control`: still works and remains compatible with the current path-fixed high-cache behavior.
 - Long multi-turn conversations: existing stable prefixes were read, and new suffixes could create additional cache.
 - Model isolation: `sonnet` and `sonnet[1m]` did not share cache scope.
 - Tool / agent-like payloads: tool definitions were included in cacheable prefixes and later read.

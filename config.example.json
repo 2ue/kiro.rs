@@ -1,79 +1,12 @@
 {
   "postgres": {
-    "url": "postgres://kiro_rs:kiro_rs_dev_password@127.0.0.1:25432/kiro_rs",
-    "maxConnections": 10,
-    "migrateOnStart": true
+    "url": "postgres://kiro_rs:kiro_rs_dev_password@127.0.0.1:25432/kiro_rs"
   },
   "redis": {
-    "url": "redis://127.0.0.1:26379/0",
-    "keyPrefix": "kiro_rs:local"
+    "url": "redis://127.0.0.1:26379/0"
   },
   "host": "127.0.0.1",
   "port": 8990,
   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
-  "tlsBackend": "rustls",
-  "region": "us-east-1",
-  "kiroVersion": "0.11.107",
-  "nodeVersion": "22.22.0",
-  "adminApiKey": "sk-admin-your-secret-key",
-  "loadBalancingMode": "priority",
-  "credentialRpm": null,
-  "credentialMaxConcurrentRequests": 0,
-  "credentialTransientCooldownSecs": 10,
-  "credentialMaxCooldownSecs": 300,
-  "credentialDispatchMaxWaitSecs": 120,
-  "credentialInFlightLeaseMaxSecs": 900,
-  "credentialWarmupRequests": 3,
-  "credentialWarmupSelectionPercent": 5,
-  "compression": {
-    "enabled": false,
-    "whitespaceCompression": true
-  },
-  "compatProfile": "claude-code",
-  "extractThinking": true,
-  "promptCacheTargetReadRatio": 0.98,
-  "promptCacheTokenScale": 1.6,
-  "promptCacheMaxSimulatedInputTokens": 300000,
-  "promptCacheCapJitterMinTokens": 12000,
-  "promptCacheCapJitterMaxTokens": 24000,
-  "promptCacheScaleMinInputTokens": 20000,
-  "reportedUsage": {
-    "default": {
-      "enabled": true,
-      "input": { "mode": "preserve" },
-      "output": { "mode": "preserve" },
-      "cacheRead": { "mode": "preserve" },
-      "cacheCreation": { "mode": "preserve" }
-    },
-    "pathOverrides": {
-      "/na": {
-        "enabled": false
-      },
-      "/cc": {
-        "enabled": true,
-        "input": {
-          "mode": "sample-max",
-          "maxTokens": 96,
-          "moveDeltaToCacheRead": true
-        },
-        "cacheCreation": {
-          "mode": "sample-target",
-          "targetTokens": 3000,
-          "normalMaxMultiplier": 1.2
-        }
-      },
-      "/ha": {
-        "enabled": true,
-        "input": {
-          "mode": "sample-max",
-          "maxTokens": 96,
-          "moveDeltaToCacheRead": true
-        }
-      }
-    }
-  },
-  "usageRecordLimit": 5000,
-  "highCacheThreshold": 10000,
-  "defaultEndpoint": "ide",
-  "exposeProxyWarnings": false
+  "adminApiKey": "sk-admin-your-secret-key"
 }

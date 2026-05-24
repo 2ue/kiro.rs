@@ -4,7 +4,8 @@
 
 ## 目标
 
-在 `promptCacheSimulationMode = "high-cache"` 的本地模拟路径中，让返回给下游和 Admin 的缓存字段更大、更像高缓存场景：
+在路径固定的 high-cache 本地模拟链路中，让返回给下游和 Admin 的缓存字段更大、更像高缓存场景。
+消息路径固定进入对应策略，下游 usage 外观由 `reportedUsage` 控制：
 
 1. `cache_read_input_tokens`
 2. `cache_creation_input_tokens`

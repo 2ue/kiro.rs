@@ -222,106 +222,31 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `promptCacheCapJitterMinTokens` | number | `12000` | high-cache 触顶 soft-cap 的最小扣减 token |
 | `promptCacheCapJitterMaxTokens` | number | `24000` | high-cache 触顶 soft-cap 的最大扣减 token |
 | `promptCacheScaleMinInputTokens` | number | `20000` | 基础输入达到该门槛后才启用 high-cache token scale，避免短测试请求被放大 |
-| `reportedUsage.default` | object | 原样上报 | 控制所有路径的默认 usage 上报方式，只影响响应和后台 usage record，不影响 reader 计算、本地缓存 tracker 或上游请求 |
+| `reportedUsage.default` | object | input/output 原始值，cache read/write 保留计算值 | 控制所有路径的默认 usage 上报方式，只影响响应和后台 usage record，不影响 reader 计算、本地缓存 tracker 或上游请求 |
 | `reportedUsage.pathOverrides` | object | `/na`、`/cc`、`/ha` | 按路径前缀独立覆盖默认 usage 上报策略，最长前缀优先；例如 `/cc` 会匹配 `/cc/v1/messages`，`/ha` 和 `/na` 不会继承 `/cc` 的 writer 配置 |
 | `usageRecordLimit` | number | `5000` | 内存中保留的最近 usage 记录数量；完整 usage 记录写入 PgSQL |
 | `highCacheThreshold` | number | `10000` | Admin 统计高缓存请求的 cache read 阈值 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 | `exposeProxyWarnings` | boolean | `false` | 是否通过 `x-kiro-rs-warnings` 暴露代理侧兜底改写。`anthropic-strict` 下会强制关闭 |
 
-完整配置示例：
+最小配置示例：
 
 ```json
 {
    "postgres": {
-      "url": "postgres://kiro_rs:kiro_rs_dev_password@127.0.0.1:25432/kiro_rs",
-      "maxConnections": 10,
-      "migrateOnStart": true
+      "url": "postgres://kiro_rs:kiro_rs_dev_password@127.0.0.1:25432/kiro_rs"
    },
    "redis": {
-      "url": "redis://127.0.0.1:26379/0",
-      "keyPrefix": "kiro_rs:local"
+      "url": "redis://127.0.0.1:26379/0"
    },
    "host": "127.0.0.1",
    "port": 8990,
    "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
-   "region": "us-east-1",
-   "tlsBackend": "rustls",
-   "kiroVersion": "0.11.107",
-   "machineId": "64位十六进制机器码",
-   "systemVersion": "darwin#24.6.0",
-   "nodeVersion": "22.22.0",
-   "authRegion": "us-east-1",
-   "apiRegion": "us-east-1",
-   "countTokensApiUrl": "https://api.example.com/v1/messages/count_tokens",
-   "countTokensApiKey": "sk-your-count-tokens-api-key",
-   "countTokensAuthType": "x-api-key",
-   "proxyUrl": "http://127.0.0.1:7890",
-   "proxyUsername": "user",
-   "proxyPassword": "pass",
-   "adminApiKey": "sk-admin-your-secret-key",
-   "loadBalancingMode": "priority",
-   "credentialRpm": null,
-   "credentialMaxConcurrentRequests": 0,
-   "credentialTransientCooldownSecs": 10,
-   "credentialMaxCooldownSecs": 300,
-   "credentialDispatchMaxWaitSecs": 120,
-   "credentialInFlightLeaseMaxSecs": 900,
-   "credentialWarmupRequests": 3,
-   "credentialWarmupSelectionPercent": 5,
-   "compression": {
-      "enabled": false,
-      "whitespaceCompression": true
-   },
-   "compatProfile": "claude-code",
-   "extractThinking": true,
-   "promptCacheTargetReadRatio": 0.98,
-   "promptCacheTokenScale": 1.6,
-   "promptCacheMaxSimulatedInputTokens": 300000,
-   "promptCacheCapJitterMinTokens": 12000,
-   "promptCacheCapJitterMaxTokens": 24000,
-   "promptCacheScaleMinInputTokens": 20000,
-   "reportedUsage": {
-      "default": {
-         "enabled": true,
-         "input": { "mode": "preserve" },
-         "output": { "mode": "preserve" },
-         "cacheRead": { "mode": "preserve" },
-         "cacheCreation": { "mode": "preserve" }
-      },
-      "pathOverrides": {
-         "/na": {
-            "enabled": false
-         },
-         "/cc": {
-            "enabled": true,
-            "input": {
-               "mode": "sample-max",
-               "maxTokens": 96,
-               "moveDeltaToCacheRead": true
-            },
-            "cacheCreation": {
-               "mode": "sample-target",
-               "targetTokens": 3000,
-               "normalMaxMultiplier": 1.1
-            }
-         },
-         "/ha": {
-            "enabled": true,
-            "input": {
-               "mode": "sample-max",
-               "maxTokens": 96,
-               "moveDeltaToCacheRead": true
-            }
-         }
-      }
-   },
-   "usageRecordLimit": 5000,
-   "highCacheThreshold": 10000,
-   "defaultEndpoint": "ide",
-   "exposeProxyWarnings": false
+   "adminApiKey": "sk-admin-your-secret-key"
 }
 ```
+
+未写出的字段会使用内置默认值。首次启动导入 PgSQL 后，也可以在后台配置页热更新调度、高缓存模拟和路径级 usage 上报策略。
 
 缓存模式由路径固定选择：
 
@@ -333,11 +258,9 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 路径级 usage 上报策略支持这些字段：
 
 - `input`：控制 `input_tokens`。使用 `sample-max` 时会采样到 `maxTokens` 以内；`moveDeltaToCacheRead` 为 true 时，减少的 input 差值会加入 `cache_read_input_tokens`。
-- `output`：控制 `output_tokens`。默认建议 `preserve`。
+- `output`：控制 `output_tokens`。默认建议 `raw`，也就是直接使用上游返回的原始输出。
 - `cacheRead`：控制 `cache_read_input_tokens`。默认建议 `preserve`。
-- `cacheCreation`：控制 `cache_creation_input_tokens`。`/cc` 默认使用 `sample-target`，`targetTokens` 为 `3000`，`normalMaxMultiplier` 为 `1.1`。
-
-旧配置字段 `promptCacheSimulationMode` 已无运行时效果，会在读取时被忽略，也不会再写入示例配置。
+- `cacheCreation`：控制 `cache_creation_input_tokens`。`/cc` 默认使用 `sample-target`，`targetTokens` 为 `3000`，`normalMaxMultiplier` 为 `1.2`。
 
 ### credentials.json
 
