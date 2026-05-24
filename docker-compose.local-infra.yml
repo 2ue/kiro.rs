@@ -1,0 +1,51 @@
+services:
+  kiro-rs-postgres-local:
+    image: postgres:16-alpine
+    container_name: kiro-rs-postgres-local
+    environment:
+      POSTGRES_DB: ${KIRO_RS_POSTGRES_DB:-kiro_rs}
+      POSTGRES_USER: ${KIRO_RS_POSTGRES_USER:-kiro_rs}
+      POSTGRES_PASSWORD: ${KIRO_RS_POSTGRES_PASSWORD:-kiro_rs_dev_password}
+    ports:
+      - "${KIRO_RS_POSTGRES_PORT:-25432}:5432"
+    volumes:
+      - kiro-rs-postgres-local-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${KIRO_RS_POSTGRES_USER:-kiro_rs} -d ${KIRO_RS_POSTGRES_DB:-kiro_rs}"
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  kiro-rs-redis-local:
+    image: redis:7-alpine
+    container_name: kiro-rs-redis-local
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "yes"
+      ]
+    ports:
+      - "${KIRO_RS_REDIS_PORT:-26379}:6379"
+    volumes:
+      - kiro-rs-redis-local-data:/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "redis-cli",
+          "ping"
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  kiro-rs-postgres-local-data:
+  kiro-rs-redis-local-data:

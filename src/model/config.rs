@@ -1,4 +1,3 @@
-use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -130,6 +129,13 @@ impl ReportedUsageFieldPolicy {
         }
     }
 
+    pub fn sample_target_with_multiplier(target_tokens: i32, normal_max_multiplier: f64) -> Self {
+        Self {
+            normal_max_multiplier,
+            ..Self::sample_target(target_tokens)
+        }
+    }
+
     pub fn normalized(&self) -> Self {
         let mut normalized = self.clone();
         normalized.max_tokens = normalized.max_tokens.max(0);
@@ -233,7 +239,7 @@ impl Default for ReportedUsageConfig {
             "/cc".to_string(),
             ReportedUsagePathPolicy {
                 input: ReportedUsageFieldPolicy::sample_input_max(96),
-                cache_creation: ReportedUsageFieldPolicy::sample_target(3_000),
+                cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(3_000, 1.2),
                 ..ReportedUsagePathPolicy::default()
             },
         );
@@ -335,10 +341,59 @@ impl CompatProfile {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostgresConfig {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default = "default_postgres_max_connections")]
+    pub max_connections: u32,
+    #[serde(default = "default_true")]
+    pub migrate_on_start: bool,
+}
+
+impl Default for PostgresConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            max_connections: default_postgres_max_connections(),
+            migrate_on_start: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedisConfig {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default = "default_redis_key_prefix")]
+    pub key_prefix: String,
+}
+
+impl Default for RedisConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            key_prefix: default_redis_key_prefix(),
+        }
+    }
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
+    /// PgSQL 配置。服务启动必须可连接；首次启动可从配置文件 bootstrap 运行配置和凭据。
+    #[serde(default)]
+    pub postgres: PostgresConfig,
+
+    /// Redis 配置。用于运行时缓存、锁和后续跨实例调度状态。
+    #[serde(default)]
+    pub redis: RedisConfig,
+
     #[serde(default = "default_host")]
     pub host: String,
 
@@ -449,14 +504,6 @@ pub struct Config {
     #[serde(default = "default_credential_warmup_selection_percent")]
     pub credential_warmup_selection_percent: u32,
 
-    /// 是否持久化凭据文件变更（Token 刷新、禁用、优先级等）。
-    #[serde(default = "default_credentials_persist")]
-    pub credentials_persist: bool,
-
-    /// 是否持久化调度统计缓存（success_count、last_used_at）。
-    #[serde(default = "default_credential_stats_persist")]
-    pub credential_stats_persist: bool,
-
     /// 输入压缩配置。默认不启用；启用后默认只做 whitespace 压缩。
     #[serde(default)]
     pub compression: CompressionConfig,
@@ -518,10 +565,6 @@ pub struct Config {
     /// 请求级 usage record 内存保留上限。
     #[serde(default = "default_usage_record_limit")]
     pub usage_record_limit: usize,
-
-    /// 是否将 usage record 追加写入 JSONL 文件。
-    #[serde(default = "default_usage_record_persist")]
-    pub usage_record_persist: bool,
 
     /// Admin 高缓存请求阈值。
     #[serde(default = "default_high_cache_threshold")]
@@ -605,14 +648,6 @@ fn default_credential_warmup_selection_percent() -> u32 {
     5
 }
 
-fn default_credentials_persist() -> bool {
-    true
-}
-
-fn default_credential_stats_persist() -> bool {
-    true
-}
-
 fn default_compat_profile() -> CompatProfile {
     CompatProfile::ClaudeCode
 }
@@ -653,10 +688,6 @@ fn default_usage_record_limit() -> usize {
     5000
 }
 
-fn default_usage_record_persist() -> bool {
-    true
-}
-
 fn default_high_cache_threshold() -> i32 {
     10_000
 }
@@ -667,6 +698,14 @@ fn default_endpoint() -> String {
 
 fn default_expose_proxy_warnings() -> bool {
     false
+}
+
+fn default_postgres_max_connections() -> u32 {
+    10
+}
+
+fn default_redis_key_prefix() -> String {
+    "kiro_rs:local".to_string()
 }
 
 fn default_reported_usage_normal_max_multiplier() -> f64 {
@@ -712,6 +751,8 @@ fn reported_usage_path_matches(prefix: &str, path: &str) -> bool {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            postgres: PostgresConfig::default(),
+            redis: RedisConfig::default(),
             host: default_host(),
             port: default_port(),
             region: default_region(),
@@ -738,8 +779,6 @@ impl Default for Config {
             credential_in_flight_lease_max_secs: default_credential_in_flight_lease_max_secs(),
             credential_warmup_requests: default_credential_warmup_requests(),
             credential_warmup_selection_percent: default_credential_warmup_selection_percent(),
-            credentials_persist: default_credentials_persist(),
-            credential_stats_persist: default_credential_stats_persist(),
             compression: CompressionConfig::default(),
             load_balancing_mode: default_load_balancing_mode(),
             compat_profile: default_compat_profile(),
@@ -753,7 +792,6 @@ impl Default for Config {
             prompt_cache_scale_min_input_tokens: default_prompt_cache_scale_min_input_tokens(),
             reported_usage: ReportedUsageConfig::default(),
             usage_record_limit: default_usage_record_limit(),
-            usage_record_persist: default_usage_record_persist(),
             high_cache_threshold: default_high_cache_threshold(),
             default_endpoint: default_endpoint(),
             expose_proxy_warnings: default_expose_proxy_warnings(),
@@ -792,26 +830,27 @@ impl Config {
 
         let content = fs::read_to_string(path)?;
         let mut config: Config = serde_json::from_str(&content)?;
+        config.apply_env_overrides();
         config.config_path = Some(path.to_path_buf());
         Ok(config)
     }
 
-    /// 获取配置文件路径（如果有）
-    pub fn config_path(&self) -> Option<&Path> {
-        self.config_path.as_deref()
+    fn apply_env_overrides(&mut self) {
+        if let Ok(url) = std::env::var("KIRO_RS_POSTGRES_URL") {
+            if !url.trim().is_empty() {
+                self.postgres.url = Some(url);
+            }
+        }
+        if let Ok(url) = std::env::var("KIRO_RS_REDIS_URL") {
+            if !url.trim().is_empty() {
+                self.redis.url = Some(url);
+            }
+        }
     }
 
-    /// 将当前配置写回原始配置文件
-    pub fn save(&self) -> anyhow::Result<()> {
-        let path = self
-            .config_path
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
-
-        let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        crate::common::fs::write_file_atomic(path, content)
-            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
-        Ok(())
+    /// 设置运行时配置路径元数据。数据库加载的配置没有对应文件路径。
+    pub(crate) fn set_config_path_for_runtime(&mut self, path: Option<PathBuf>) {
+        self.config_path = path;
     }
 }
 
@@ -833,6 +872,8 @@ mod tests {
     fn default_runtime_controls_are_conservative() {
         let config = Config::default();
 
+        assert_eq!(config.postgres.max_connections, 10);
+        assert_eq!(config.redis.key_prefix, "kiro_rs:local");
         assert_eq!(config.credential_rpm, None);
         assert_eq!(config.credential_max_concurrent_requests, 0);
         assert_eq!(config.credential_transient_cooldown_secs, 10);
@@ -841,8 +882,6 @@ mod tests {
         assert_eq!(config.credential_in_flight_lease_max_secs, 900);
         assert_eq!(config.credential_warmup_requests, 3);
         assert_eq!(config.credential_warmup_selection_percent, 5);
-        assert!(config.credentials_persist);
-        assert!(config.credential_stats_persist);
         assert!(!config.compression.enabled);
         assert!(config.compression.whitespace_compression);
         assert_eq!(
@@ -852,6 +891,27 @@ mod tests {
                 .input
                 .max_tokens,
             96
+        );
+        let cc_policy = config.reported_usage.policy_for_path("/cc/v1/messages");
+        assert_eq!(
+            cc_policy.cache_creation.mode,
+            ReportedUsageFieldMode::SampleTarget
+        );
+        assert_eq!(cc_policy.cache_creation.target_tokens, 3_000);
+        assert_eq!(cc_policy.cache_creation.normal_max_multiplier, 1.2);
+        let ha_policy = config.reported_usage.policy_for_path("/ha/v1/messages");
+        assert_eq!(ha_policy.input.mode, ReportedUsageFieldMode::SampleMax);
+        assert_eq!(ha_policy.input.max_tokens, 96);
+        assert!(ha_policy.input.move_delta_to_cache_read);
+        assert_eq!(
+            ha_policy.cache_creation.mode,
+            ReportedUsageFieldMode::Preserve
+        );
+        assert!(
+            !config
+                .reported_usage
+                .policy_for_path("/na/v1/messages")
+                .enabled
         );
     }
 

@@ -1,13 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   clearUsageRecords,
+  getAuditLogsPage,
   getModelPricing,
   getUsageRecords,
   getUsageRecordsPage,
   getUsageSummary,
   syncModelPricing,
 } from '@/api/usage'
-import type { UsageRecordsPageQuery, UsageRecordsQuery } from '@/types/api'
+import type { AdminAuditLogPageQuery, UsageRecordsPageQuery, UsageRecordsQuery } from '@/types/api'
 
 export function useUsageRecords(query: UsageRecordsQuery) {
   return useQuery({
@@ -43,6 +44,15 @@ export function useClearUsageRecords() {
       queryClient.invalidateQueries({ queryKey: ['usage-records-page'] })
       queryClient.invalidateQueries({ queryKey: ['usage-summary'] })
     },
+  })
+}
+
+export function useAuditLogsPage(query: AdminAuditLogPageQuery) {
+  return useQuery({
+    queryKey: ['audit-logs-page', query],
+    queryFn: () => getAuditLogsPage(query),
+    refetchInterval: 15000,
+    placeholderData: (previousData) => previousData,
   })
 }
 

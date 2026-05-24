@@ -103,7 +103,7 @@ If no valid UUID can be extracted, the converter generates a random conversation
 Admin balance caching is separate from prompt-cache usage simulation.
 
 - TTL: `300` seconds.
-- Persisted as `kiro_balance_cache.json` under the token manager cache directory.
+- Persisted in Redis with the service key prefix; the old `kiro_balance_cache.json` file is no longer used by the service runtime.
 - Invalidated by credential disable/enable, priority changes, failure reset, credential add/delete, and token refresh.
 
 ## Static / Client Caches

@@ -5,18 +5,35 @@ mod common;
 mod http_client;
 mod kiro;
 mod model;
+mod storage;
 pub mod token;
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicI64, Ordering},
+    },
+    time::{Duration as StdDuration, Instant},
+};
 
+use anyhow::Context as _;
+use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+use chrono::Utc;
 use clap::Parser;
+use futures::StreamExt;
 use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
 use model::arg::{Args, Command, CredentialsCommand};
 use model::config::Config;
+use serde_json::{Value, json};
+use storage::postgres::{PostgresStore, PostgresUsageStore};
+use storage::redis_cache::RedisStore;
+
+const STARTUP_DEPENDENCY_MAX_WAIT: StdDuration = StdDuration::from_secs(60);
 
 #[tokio::main]
 async fn main() {
@@ -35,23 +52,22 @@ async fn main() {
     let config_path = args
         .config
         .unwrap_or_else(|| Config::default_config_path().to_string());
-    let config = Config::load(&config_path).unwrap_or_else(|e| {
+    let file_config = Config::load(&config_path).unwrap_or_else(|e| {
         tracing::error!("加载配置失败: {}", e);
         std::process::exit(1);
     });
 
-    // 加载凭证（支持单对象或数组格式）
-    let credentials_path = args
-        .credentials
-        .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
-    let credentials_config = CredentialsConfig::load(&credentials_path).unwrap_or_else(|e| {
-        tracing::error!("加载凭证失败: {}", e);
-        std::process::exit(1);
-    });
-
     if let Some(command) = args.command {
+        // CLI 凭据诊断仍然面向本地文件，用于首次导入前排查 credentials.json。
+        let credentials_path = args
+            .credentials
+            .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
+        let credentials_config = CredentialsConfig::load(&credentials_path).unwrap_or_else(|e| {
+            tracing::error!("加载凭证失败: {}", e);
+            std::process::exit(1);
+        });
         if let Err(err) =
-            handle_cli_command(command, &config, credentials_config, &credentials_path)
+            handle_cli_command(command, &file_config, credentials_config, &credentials_path)
         {
             tracing::error!("{}", err);
             std::process::exit(1);
@@ -59,27 +75,110 @@ async fn main() {
         return;
     }
 
-    // 判断是否为多凭据格式（用于刷新后回写）
-    let is_multiple_format = credentials_config.is_multiple();
-
-    // 转换为按优先级排序的凭据列表
-    let mut credentials_list = credentials_config.into_sorted_credentials();
-
-    // 检查 KIRO_API_KEY 环境变量，自动创建 API Key 凭据
-    if let Ok(kiro_api_key) = std::env::var("KIRO_API_KEY") {
-        if kiro_api_key.is_empty() {
+    let postgres_store = Arc::new(
+        retry_startup_dependency("PgSQL", STARTUP_DEPENDENCY_MAX_WAIT, || {
+            PostgresStore::connect(&file_config)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("连接或初始化 PgSQL 失败: {}", e);
+            std::process::exit(1);
+        }),
+    );
+    let redis_store = Arc::new(
+        retry_startup_dependency("Redis", STARTUP_DEPENDENCY_MAX_WAIT, || {
+            RedisStore::connect(&file_config)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("连接 Redis 失败: {}", e);
+            std::process::exit(1);
+        }),
+    );
+    let env_kiro_api_key = match std::env::var("KIRO_API_KEY") {
+        Ok(value) if value.trim().is_empty() => {
             tracing::warn!("KIRO_API_KEY 环境变量已设置但为空，视为未配置");
-        } else {
-            tracing::info!("检测到 KIRO_API_KEY 环境变量，添加 API Key 凭据（最高优先级）");
-            let api_key_cred = KiroCredentials {
-                kiro_api_key: Some(kiro_api_key),
-                auth_method: Some("api_key".to_string()),
-                priority: 0,
-                ..Default::default()
-            };
-            credentials_list.insert(0, api_key_cred);
+            None
+        }
+        Ok(value) => Some(value.trim().to_string()),
+        Err(_) => None,
+    };
+
+    postgres_store
+        .bootstrap_runtime_config_from_file(&file_config)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("从配置文件 bootstrap 运行配置到 PgSQL 失败: {}", e);
+            std::process::exit(1);
+        });
+    let credentials_exist = postgres_store
+        .credentials_exist()
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("检查 PgSQL 凭据是否存在失败: {}", e);
+            std::process::exit(1);
+        });
+    if !credentials_exist {
+        let credentials_path = args
+            .credentials
+            .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
+        match CredentialsConfig::load(&credentials_path) {
+            Ok(file_credentials) => {
+                let file_credentials_list = file_credentials.into_sorted_credentials();
+                postgres_store
+                    .bootstrap_credentials_from_file(&file_credentials_list)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::error!("从凭据文件 bootstrap 凭据到 PgSQL 失败: {}", e);
+                        std::process::exit(1);
+                    });
+            }
+            Err(err) if env_kiro_api_key.is_some() => {
+                tracing::warn!(
+                    "首次导入凭据文件不可用，将仅使用 KIRO_API_KEY 自动导入: {}",
+                    err
+                );
+            }
+            Err(err) => {
+                tracing::error!("加载首次导入凭据文件失败: {}", err);
+                std::process::exit(1);
+            }
         }
     }
+
+    if let Some(kiro_api_key) = &env_kiro_api_key {
+        postgres_store
+            .ensure_api_key_credential(kiro_api_key)
+            .await
+            .map(|credential| {
+                tracing::info!(
+                    credential_id = credential.id.unwrap_or_default(),
+                    "KIRO_API_KEY 已作为 API Key 凭据存在或完成一次性导入"
+                );
+            })
+            .unwrap_or_else(|e| {
+                tracing::error!("导入 KIRO_API_KEY 到 PgSQL 失败: {}", e);
+                std::process::exit(1);
+            });
+    }
+
+    let mut config = postgres_store
+        .load_runtime_config()
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("从 PgSQL 加载运行配置失败: {}", e);
+            std::process::exit(1);
+        })
+        .unwrap_or_else(|| {
+            tracing::error!("PgSQL runtime_config 为空，且从配置文件 bootstrap 失败");
+            std::process::exit(1);
+        });
+    config.set_config_path_for_runtime(None);
+
+    let credentials_list = postgres_store.load_credentials().await.unwrap_or_else(|e| {
+        tracing::error!("从 PgSQL 加载凭据失败: {}", e);
+        std::process::exit(1);
+    });
 
     tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
 
@@ -134,23 +233,28 @@ async fn main() {
     }
 
     let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
-    let usage_record_path = if config.usage_record_persist {
-        std::path::Path::new(&credentials_path)
-            .parent()
-            .map(|dir| dir.join("kiro_usage_records.jsonl"))
-    } else {
-        None
-    };
-    let usage_recorder = Arc::new(anthropic::usage::UsageRecorder::new(
+    let usage_recorder = Arc::new(anthropic::usage::UsageRecorder::with_postgres(
         config.usage_record_limit,
-        usage_record_path,
+        Arc::new(PostgresUsageStore::new(postgres_store.clone())),
     ));
     let prompt_cache = Arc::new(anthropic::prompt_cache::PromptCacheTracker::default());
     let pricing_catalog = Arc::new(anthropic::pricing::PricingCatalog::new());
+    match postgres_store.load_pricing_status().await {
+        Ok(Some(status)) => {
+            pricing_catalog.load_persisted_status(status);
+            tracing::info!("已从 PgSQL 加载模型价格");
+        }
+        Ok(None) => {}
+        Err(err) => tracing::warn!("从 PgSQL 加载模型价格状态失败，使用内置价格继续: {}", err),
+    }
     {
         let pricing_catalog = pricing_catalog.clone();
+        let postgres_store = postgres_store.clone();
         tokio::spawn(async move {
             let status = pricing_catalog.sync().await;
+            if let Err(err) = postgres_store.save_pricing_status(&status).await {
+                tracing::warn!("保存模型价格到 PgSQL 失败，不影响调度: {}", err);
+            }
             if status.last_error.is_some() {
                 tracing::warn!(
                     source = %status.source,
@@ -168,18 +272,26 @@ async fn main() {
     }
 
     // 创建 MultiTokenManager 和 KiroProvider
-    let token_manager = MultiTokenManager::new(
+    let token_manager = MultiTokenManager::new_with_stores(
         config.clone(),
         credentials_list,
         proxy_config.clone(),
-        Some(credentials_path.into()),
-        is_multiple_format,
+        None,
+        true,
+        Some(postgres_store.clone()),
+        Some(redis_store.clone()),
     )
     .unwrap_or_else(|e| {
         tracing::error!("创建 Token 管理器失败: {}", e);
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+    let runtime_event_health = Arc::new(RuntimeEventHealth::default());
+    spawn_redis_runtime_event_listener(
+        redis_store.clone(),
+        token_manager.clone(),
+        runtime_event_health.clone(),
+    );
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
@@ -236,6 +348,8 @@ async fn main() {
                 prompt_cache.clone(),
                 pricing_catalog.clone(),
                 kiro_provider.clone(),
+                postgres_store.clone(),
+                redis_store.clone(),
             );
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
@@ -252,6 +366,12 @@ async fn main() {
     } else {
         anthropic_app
     };
+    let health_state = Arc::new(AppHealthState {
+        postgres_store: postgres_store.clone(),
+        redis_store: redis_store.clone(),
+        runtime_events: runtime_event_health,
+    });
+    let app = app.merge(create_health_router(health_state));
 
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
@@ -292,6 +412,191 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
+async fn retry_startup_dependency<T, F, Fut>(
+    name: &'static str,
+    max_wait: StdDuration,
+    mut operation: F,
+) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    let started_at = Instant::now();
+    let mut attempt = 1u32;
+    loop {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(err) if started_at.elapsed() >= max_wait => {
+                return Err(err)
+                    .with_context(|| format!("{} 在 {} 秒内未就绪", name, max_wait.as_secs()));
+            }
+            Err(err) => {
+                let delay = startup_retry_delay(attempt);
+                tracing::warn!(
+                    attempt,
+                    retry_in_ms = delay.as_millis() as u64,
+                    "{} 暂不可用，准备重试: {}",
+                    name,
+                    err
+                );
+                tokio::time::sleep(delay).await;
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn startup_retry_delay(attempt: u32) -> StdDuration {
+    let shift = attempt.saturating_sub(1).min(3);
+    let millis = 500u64.saturating_mul(1u64 << shift).min(5_000);
+    StdDuration::from_millis(millis)
+}
+
+#[derive(Default)]
+struct RuntimeEventHealth {
+    redis_events_connected: AtomicBool,
+    last_event_at_ms: AtomicI64,
+    last_subscribe_error_at_ms: AtomicI64,
+}
+
+impl RuntimeEventHealth {
+    fn mark_connected(&self) {
+        self.redis_events_connected.store(true, Ordering::Release);
+    }
+
+    fn mark_disconnected(&self) {
+        self.redis_events_connected.store(false, Ordering::Release);
+    }
+
+    fn mark_event(&self) {
+        self.last_event_at_ms
+            .store(Utc::now().timestamp_millis(), Ordering::Release);
+    }
+
+    fn mark_subscribe_error(&self) {
+        self.last_subscribe_error_at_ms
+            .store(Utc::now().timestamp_millis(), Ordering::Release);
+        self.mark_disconnected();
+    }
+}
+
+struct AppHealthState {
+    postgres_store: Arc<PostgresStore>,
+    redis_store: Arc<RedisStore>,
+    runtime_events: Arc<RuntimeEventHealth>,
+}
+
+fn create_health_router(state: Arc<AppHealthState>) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .with_state(state)
+}
+
+async fn healthz() -> Json<Value> {
+    Json(json!({
+        "status": "ok",
+        "service": "kiro-rs"
+    }))
+}
+
+async fn readyz(State(state): State<Arc<AppHealthState>>) -> impl IntoResponse {
+    let postgres_ok = state.postgres_store.ping().await.is_ok();
+    let redis_ok = state.redis_store.ping().await.is_ok();
+    let redis_events_connected = state
+        .runtime_events
+        .redis_events_connected
+        .load(Ordering::Acquire);
+    let ready = postgres_ok && redis_ok && redis_events_connected;
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        status,
+        Json(json!({
+            "status": if ready { "ready" } else { "not_ready" },
+            "checks": {
+                "postgres": postgres_ok,
+                "redis": redis_ok,
+                "redisRuntimeEvents": redis_events_connected
+            },
+            "lastRedisRuntimeEventAtMs": state.runtime_events.last_event_at_ms.load(Ordering::Acquire),
+            "lastRedisSubscribeErrorAtMs": state.runtime_events.last_subscribe_error_at_ms.load(Ordering::Acquire)
+        })),
+    )
+}
+
+fn spawn_redis_runtime_event_listener(
+    redis_store: Arc<RedisStore>,
+    token_manager: Arc<MultiTokenManager>,
+    health: Arc<RuntimeEventHealth>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let config_channel = redis_store.runtime_config_changed_channel();
+            let credentials_channel = redis_store.credentials_changed_channel();
+            let wakeup_channel = redis_store.dispatch_wakeup_channel();
+            let mut pubsub = match redis_store.subscribe_runtime_events().await {
+                Ok(pubsub) => pubsub,
+                Err(err) => {
+                    health.mark_subscribe_error();
+                    tracing::warn!("订阅 Redis 运行时事件失败，5 秒后重试: {}", err);
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+            health.mark_connected();
+            tracing::info!("已订阅 Redis 运行时事件");
+            let mut stream = pubsub.on_message();
+            let mut periodic_reload = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                tokio::select! {
+                    message = stream.next() => {
+                        let Some(message) = message else {
+                            break;
+                        };
+                        let channel = message.get_channel_name().to_string();
+                        let payload = message
+                            .get_payload::<String>()
+                            .unwrap_or_else(|_| String::new());
+                        health.mark_event();
+                        if channel == config_channel {
+                            match token_manager.reload_runtime_config_from_postgres() {
+                                Ok(true) => tracing::info!(payload, "已根据 Redis 通知热加载运行配置"),
+                                Ok(false) => tracing::debug!(payload, "收到运行配置通知，但未执行热加载"),
+                                Err(err) => tracing::warn!(payload, "热加载运行配置失败: {}", err),
+                            }
+                        } else if channel == credentials_channel {
+                            match token_manager.reload_credentials_from_postgres() {
+                                Ok(true) => tracing::info!(payload, "已根据 Redis 通知同步凭据快照"),
+                                Ok(false) => tracing::debug!(payload, "收到凭据通知，但凭据快照无变化"),
+                                Err(err) => tracing::warn!(payload, "同步凭据快照失败: {}", err),
+                            }
+                            token_manager.notify_dispatch_state_changed();
+                        } else if channel == wakeup_channel {
+                            token_manager.notify_dispatch_state_changed();
+                        }
+                    }
+                    _ = periodic_reload.tick() => {
+                        if let Err(err) = token_manager.reload_runtime_config_from_postgres() {
+                            tracing::warn!("定时热加载运行配置失败: {}", err);
+                        }
+                        if let Err(err) = token_manager.reload_credentials_from_postgres() {
+                            tracing::warn!("定时同步凭据快照失败: {}", err);
+                        }
+                    }
+                }
+            }
+            health.mark_disconnected();
+            tracing::warn!("Redis 运行时事件订阅已断开，准备重新订阅");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+}
+
 fn handle_cli_command(
     command: Command,
     config: &Config,
@@ -313,7 +618,6 @@ fn handle_credentials_command(
 ) -> anyhow::Result<()> {
     let is_multiple = credentials_config.is_multiple();
     let credentials = credentials_config.into_sorted_credentials();
-    let stats = load_cli_stats(credentials_path);
 
     match command {
         CredentialsCommand::Stats => {
@@ -330,25 +634,15 @@ fn handle_credentials_command(
                     .map(|rpm| rpm.to_string())
                     .unwrap_or_else(|| "disabled".to_string())
             );
-            println!("credentialsPersist: {}", config.credentials_persist);
-            println!(
-                "credentialStatsPersist: {}",
-                config.credential_stats_persist
-            );
             for (index, credential) in credentials.iter().enumerate() {
                 let id = credential.id.unwrap_or((index + 1) as u64);
-                let stat = stats
-                    .as_ref()
-                    .and_then(|map| map.get(&id.to_string()))
-                    .cloned()
-                    .unwrap_or_default();
                 let label = credential
                     .email
                     .as_deref()
                     .or_else(|| credential.endpoint.as_deref())
                     .unwrap_or("-");
                 println!(
-                    "#{id} priority={} disabled={} auth={} label={} success={} lastUsed={}",
+                    "#{id} priority={} disabled={} auth={} label={}",
                     credential.priority,
                     credential.disabled,
                     credential.auth_method.as_deref().unwrap_or(
@@ -358,9 +652,7 @@ fn handle_credentials_command(
                             "oauth"
                         }
                     ),
-                    label,
-                    stat.success_count,
-                    stat.last_used_at.unwrap_or_else(|| "-".to_string())
+                    label
                 );
             }
         }
@@ -373,12 +665,6 @@ fn handle_credentials_command(
             );
             if !is_multiple {
                 println!("warning: single credentials format cannot be rewritten by token refresh");
-            }
-            if !config.credentials_persist {
-                println!("warning: credentials persistence is disabled");
-            }
-            if !config.credential_stats_persist {
-                println!("warning: credential stats persistence is disabled");
             }
             if config.load_balancing_mode != "priority" && config.load_balancing_mode != "balanced"
             {
@@ -409,21 +695,4 @@ fn handle_credentials_command(
     }
 
     Ok(())
-}
-
-#[derive(Default, Clone, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CliStatsEntry {
-    success_count: u64,
-    last_used_at: Option<String>,
-}
-
-fn load_cli_stats(
-    credentials_path: &str,
-) -> Option<std::collections::HashMap<String, CliStatsEntry>> {
-    let stats_path = std::path::Path::new(credentials_path)
-        .parent()
-        .map(|dir| dir.join("kiro_stats.json"))?;
-    let content = std::fs::read_to_string(stats_path).ok()?;
-    serde_json::from_str(&content).ok()
 }

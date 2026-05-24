@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, BarChart3, Settings, DollarSign, Download } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, BarChart3, Settings, DollarSign, Download, FileClock } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -16,6 +16,7 @@ import { CredentialTestDialog } from '@/components/credential-test-dialog'
 import { UsageRecordsPanel } from '@/components/usage-records-panel'
 import { RuntimeConfigPanel } from '@/components/runtime-config-panel'
 import { ModelPricingPanel } from '@/components/model-pricing-panel'
+import { AuditLogsPanel } from '@/components/audit-logs-panel'
 import { CredentialExportDialog } from '@/components/credential-export-dialog'
 import { useCredentialsPage, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken, getCredentials, testCredential } from '@/api/credentials'
@@ -47,7 +48,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
-  const [activeTab, setActiveTab] = useState<'credentials' | 'usage' | 'pricing' | 'config'>('credentials')
+  const [activeTab, setActiveTab] = useState<'credentials' | 'usage' | 'pricing' | 'audit' | 'config'>('credentials')
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
@@ -617,6 +618,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
               价格
             </Button>
             <Button
+              variant={activeTab === 'audit' ? 'secondary' : 'ghost'}
+              size="sm"
+              onClick={() => setActiveTab('audit')}
+            >
+              <FileClock className="h-4 w-4" />
+              审计
+            </Button>
+            <Button
               variant={activeTab === 'config' ? 'secondary' : 'ghost'}
               size="sm"
               onClick={() => setActiveTab('config')}
@@ -652,6 +661,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <UsageRecordsPanel />
         ) : activeTab === 'pricing' ? (
           <ModelPricingPanel />
+        ) : activeTab === 'audit' ? (
+          <AuditLogsPanel />
         ) : activeTab === 'config' ? (
           <RuntimeConfigPanel />
         ) : (

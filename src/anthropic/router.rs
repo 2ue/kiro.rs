@@ -169,7 +169,7 @@ mod tests {
         AppState::new(
             "test-key",
             true,
-            Arc::new(UsageRecorder::new(10, None)),
+            Arc::new(UsageRecorder::new(10)),
             Arc::new(PromptCacheTracker::default()),
             mode,
             0.98,

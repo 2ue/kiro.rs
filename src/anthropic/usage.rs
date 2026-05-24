@@ -1,15 +1,20 @@
 use std::collections::{HashMap, VecDeque};
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+
+use crate::storage::postgres::PostgresUsageStore;
 
 const DEFAULT_QUERY_LIMIT: usize = 100;
 const DEFAULT_PAGE_QUERY_LIMIT: usize = 20;
 const MAX_QUERY_LIMIT: usize = 1000;
+const USAGE_WRITER_QUEUE_CAPACITY: usize = 4096;
+const USAGE_WRITER_MAX_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -190,10 +195,24 @@ pub struct UsageSummary {
     pub top_conversations: Vec<UsageAggregate>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageRecorderStats {
+    pub in_memory_limit: usize,
+    pub in_memory_records: usize,
+    pub postgres_enabled: bool,
+    pub writer_queue_enabled: bool,
+    pub writer_queue_capacity: usize,
+    pub writer_queue_available: usize,
+    pub dropped_persist_records: u64,
+}
+
 pub struct UsageRecorder {
     records: Mutex<VecDeque<UsageRecord>>,
     limit: usize,
-    persist_path: Option<PathBuf>,
+    postgres_store: Option<Arc<PostgresUsageStore>>,
+    writer_tx: Option<mpsc::Sender<UsageRecord>>,
+    dropped_persist_records: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -204,15 +223,36 @@ pub struct CredentialCostSummary {
 }
 
 impl UsageRecorder {
-    pub fn new(limit: usize, persist_path: Option<PathBuf>) -> Self {
+    #[cfg(test)]
+    pub fn new(limit: usize) -> Self {
         let limit = limit.max(1);
-        let recorder = Self {
+        Self {
             records: Mutex::new(VecDeque::with_capacity(limit.min(1024))),
             limit,
-            persist_path,
+            postgres_store: None,
+            writer_tx: None,
+            dropped_persist_records: AtomicU64::new(0),
+        }
+    }
+
+    pub fn with_postgres(limit: usize, postgres_store: Arc<PostgresUsageStore>) -> Self {
+        let writer_tx = if tokio::runtime::Handle::try_current().is_ok() {
+            let (tx, rx) = mpsc::channel(USAGE_WRITER_QUEUE_CAPACITY);
+            tokio::spawn(usage_writer_loop(postgres_store.clone(), rx));
+            Some(tx)
+        } else {
+            tracing::warn!(
+                "创建 UsageRecorder 时没有运行中的 Tokio runtime，将同步写入 PgSQL usage"
+            );
+            None
         };
-        recorder.load_recent_records();
-        recorder
+        Self {
+            records: Mutex::new(VecDeque::with_capacity(limit.max(1).min(1024))),
+            limit: limit.max(1),
+            postgres_store: Some(postgres_store),
+            writer_tx,
+            dropped_persist_records: AtomicU64::new(0),
+        }
     }
 
     pub fn record(&self, record: UsageRecord) {
@@ -224,29 +264,64 @@ impl UsageRecorder {
             }
         }
 
-        if let Some(path) = &self.persist_path {
-            if let Some(parent) = path.parent() {
-                if let Err(err) = std::fs::create_dir_all(parent) {
-                    tracing::warn!("创建 usage record 目录失败: {}", err);
-                    return;
+        if let Some(tx) = &self.writer_tx {
+            match tx.try_send(record.clone()) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    let dropped = self.dropped_persist_records.fetch_add(1, Ordering::Relaxed) + 1;
+                    tracing::warn!(dropped, "PgSQL usage 写入队列已满，本条 usage 持久化被丢弃");
+                }
+                Err(mpsc::error::TrySendError::Closed(record)) => {
+                    self.persist_usage_sync(record);
                 }
             }
+        } else {
+            self.persist_usage_sync(record);
+        }
+    }
 
-            match OpenOptions::new().create(true).append(true).open(path) {
-                Ok(mut file) => match serde_json::to_string(&record) {
-                    Ok(line) => {
-                        if let Err(err) = writeln!(file, "{}", line) {
-                            tracing::warn!("写入 usage record 失败: {}", err);
-                        }
-                    }
-                    Err(err) => tracing::warn!("序列化 usage record 失败: {}", err),
-                },
-                Err(err) => tracing::warn!("打开 usage record 文件失败: {}", err),
+    pub fn writer_stats(&self) -> UsageRecorderStats {
+        let in_memory_records = self.records.lock().len();
+        let (writer_queue_enabled, writer_queue_capacity, writer_queue_available) =
+            if let Some(tx) = &self.writer_tx {
+                (true, tx.max_capacity(), tx.capacity())
+            } else {
+                (false, 0, 0)
+            };
+        UsageRecorderStats {
+            in_memory_limit: self.limit,
+            in_memory_records,
+            postgres_enabled: self.postgres_store.is_some(),
+            writer_queue_enabled,
+            writer_queue_capacity,
+            writer_queue_available,
+            dropped_persist_records: self.dropped_persist_records.load(Ordering::Relaxed),
+        }
+    }
+
+    fn persist_usage_sync(&self, record: UsageRecord) {
+        if let Some(store) = &self.postgres_store {
+            let store = store.clone();
+            if let Err(err) = block_on_usage_store(async move { store.record(record).await }) {
+                tracing::warn!("写入 PgSQL usage record 失败: {}", err);
             }
         }
     }
 
     pub fn query(&self, query: UsageRecordQuery) -> UsageRecordsResult {
+        if let Some(store) = &self.postgres_store {
+            let store = store.clone();
+            let db_query = query.clone();
+            return block_on_usage_store(async move { store.query(db_query).await })
+                .unwrap_or_else(|err| {
+                    tracing::warn!("查询 PgSQL usage records 失败，回退内存记录: {}", err);
+                    self.query_memory(query)
+                });
+        }
+        self.query_memory(query)
+    }
+
+    fn query_memory(&self, query: UsageRecordQuery) -> UsageRecordsResult {
         let limit = normalize_limit(query.limit);
         let mut matched: Vec<UsageRecord> = self
             .records
@@ -265,6 +340,24 @@ impl UsageRecorder {
     }
 
     pub fn query_page(
+        &self,
+        query: UsageRecordQuery,
+        page: usize,
+        limit: usize,
+    ) -> UsageRecordsPageResult {
+        if let Some(store) = &self.postgres_store {
+            let store = store.clone();
+            let query_for_fallback = query.clone();
+            return block_on_usage_store(async move { store.query_page(query, page, limit).await })
+                .unwrap_or_else(|err| {
+                    tracing::warn!("分页查询 PgSQL usage records 失败，回退内存记录: {}", err);
+                    self.query_page_memory(query_for_fallback, page, limit)
+                });
+        }
+        self.query_page_memory(query, page, limit)
+    }
+
+    fn query_page_memory(
         &self,
         query: UsageRecordQuery,
         page: usize,
@@ -297,6 +390,18 @@ impl UsageRecorder {
     }
 
     pub fn summary(&self, high_cache_threshold: i32) -> UsageSummary {
+        if let Some(store) = &self.postgres_store {
+            let store = store.clone();
+            return block_on_usage_store(async move { store.summary(high_cache_threshold).await })
+                .unwrap_or_else(|err| {
+                    tracing::warn!("汇总 PgSQL usage records 失败，回退内存记录: {}", err);
+                    self.summary_memory(high_cache_threshold)
+                });
+        }
+        self.summary_memory(high_cache_threshold)
+    }
+
+    fn summary_memory(&self, high_cache_threshold: i32) -> UsageSummary {
         let records = self.records.lock();
         let mut summary = UsageSummary {
             total_requests: records.len(),
@@ -400,6 +505,18 @@ impl UsageRecorder {
     }
 
     pub fn credential_cost_summary(&self) -> HashMap<u64, CredentialCostSummary> {
+        if let Some(store) = &self.postgres_store {
+            let store = store.clone();
+            return block_on_usage_store(async move { store.credential_cost_summary().await })
+                .unwrap_or_else(|err| {
+                    tracing::warn!("汇总 PgSQL 凭据费用失败，回退内存记录: {}", err);
+                    self.credential_cost_summary_memory()
+                });
+        }
+        self.credential_cost_summary_memory()
+    }
+
+    fn credential_cost_summary_memory(&self) -> HashMap<u64, CredentialCostSummary> {
         let mut summaries: HashMap<u64, CredentialCostSummary> = HashMap::new();
         for record in self.records.lock().iter() {
             let Some(credential_id) = record.credential_id else {
@@ -418,40 +535,56 @@ impl UsageRecorder {
 
     pub fn clear(&self) {
         self.records.lock().clear();
-        if let Some(path) = &self.persist_path {
-            if let Err(err) = File::create(path) {
-                tracing::warn!("清空 usage record 文件失败: {}", err);
+        if let Some(store) = &self.postgres_store {
+            let store = store.clone();
+            if let Err(err) = block_on_usage_store(async move { store.clear().await }) {
+                tracing::warn!("清空 PgSQL usage records 失败: {}", err);
             }
         }
     }
+}
 
-    fn load_recent_records(&self) {
-        let Some(path) = &self.persist_path else {
-            return;
-        };
-        let Ok(file) = File::open(path) else {
-            return;
-        };
-
-        let reader = BufReader::new(file);
-        let mut loaded = VecDeque::new();
-        for line in reader.lines() {
-            match line {
-                Ok(line) if line.trim().is_empty() => {}
-                Ok(line) => match serde_json::from_str::<UsageRecord>(&line) {
-                    Ok(record) => {
-                        loaded.push_back(record);
-                        while loaded.len() > self.limit {
-                            loaded.pop_front();
-                        }
-                    }
-                    Err(err) => tracing::warn!("跳过损坏的 usage record 行: {}", err),
-                },
-                Err(err) => tracing::warn!("读取 usage record 行失败: {}", err),
+async fn usage_writer_loop(store: Arc<PostgresUsageStore>, mut rx: mpsc::Receiver<UsageRecord>) {
+    while let Some(record) = rx.recv().await {
+        let mut attempt = 1;
+        loop {
+            match store.record(record.clone()).await {
+                Ok(()) => break,
+                Err(err) if attempt < USAGE_WRITER_MAX_ATTEMPTS => {
+                    let delay_ms = 100u64.saturating_mul(2u64.saturating_pow(attempt - 1));
+                    tracing::warn!(
+                        request_id = %record.id,
+                        attempt,
+                        "写入 PgSQL usage record 失败，准备重试: {}",
+                        err
+                    );
+                    tokio::time::sleep(StdDuration::from_millis(delay_ms)).await;
+                    attempt += 1;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        request_id = %record.id,
+                        attempt,
+                        "写入 PgSQL usage record 最终失败，已放弃本条持久化: {}",
+                        err
+                    );
+                    break;
+                }
             }
         }
+    }
+}
 
-        *self.records.lock() = loaded;
+fn block_on_usage_store<T>(
+    future: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(future))
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(future)
     }
 }
 
@@ -654,7 +787,7 @@ mod tests {
 
     #[test]
     fn recorder_respects_limit_and_filters() {
-        let recorder = UsageRecorder::new(2, None);
+        let recorder = UsageRecorder::new(2);
         recorder.record(record("1", 10, UsageSource::UpstreamMetadata));
         recorder.record(record("2", 20, UsageSource::LocalPromptCache));
         recorder.record(record("3", 30, UsageSource::LocalPromptCache));
@@ -675,7 +808,7 @@ mod tests {
 
     #[test]
     fn recorder_query_page_paginates_filtered_records() {
-        let recorder = UsageRecorder::new(10, None);
+        let recorder = UsageRecorder::new(10);
         recorder.record(record("1", 10, UsageSource::LocalPromptCache));
         recorder.record(record("2", 20, UsageSource::LocalPromptCache));
         recorder.record(record("3", 30, UsageSource::LocalPromptCache));
@@ -715,7 +848,7 @@ mod tests {
 
     #[test]
     fn recorder_query_page_defaults_to_twenty_and_uses_has_next() {
-        let recorder = UsageRecorder::new(25, None);
+        let recorder = UsageRecorder::new(25);
         for index in 1..=21 {
             recorder.record(record(
                 &index.to_string(),
@@ -743,7 +876,7 @@ mod tests {
 
     #[test]
     fn recorder_search_matches_model_account_session_and_error_text() {
-        let recorder = UsageRecorder::new(10, None);
+        let recorder = UsageRecorder::new(10);
         let mut first = record("1", 10, UsageSource::LocalPromptCache);
         first.model = "claude-sonnet-4-5".to_string();
         first.credential_label = Some("alpha@example.com".to_string());
@@ -789,7 +922,7 @@ mod tests {
 
     #[test]
     fn summary_counts_high_cache_and_sources() {
-        let recorder = UsageRecorder::new(10, None);
+        let recorder = UsageRecorder::new(10);
         recorder.record(record("1", 5, UsageSource::UpstreamMetadata));
         recorder.record(record("2", 20_000, UsageSource::LocalPromptCache));
 
@@ -807,33 +940,8 @@ mod tests {
     }
 
     #[test]
-    fn recorder_persists_recent_records_and_clear_truncates_file() {
-        let path = std::env::temp_dir().join(format!(
-            "kiro-rs-usage-test-{}.jsonl",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-
-        let recorder = UsageRecorder::new(2, Some(path.clone()));
-        recorder.record(record("1", 10, UsageSource::UpstreamMetadata));
-        recorder.record(record("2", 20, UsageSource::LocalPromptCache));
-        recorder.record(record("3", 30, UsageSource::RequestEstimate));
-
-        let reloaded = UsageRecorder::new(2, Some(path.clone()));
-        let result = reloaded.query(UsageRecordQuery::default());
-        assert_eq!(result.total, 2);
-        assert_eq!(result.records[0].id, "3");
-        assert_eq!(result.records[1].id, "2");
-
-        reloaded.clear();
-        let cleared = UsageRecorder::new(2, Some(path.clone()));
-        assert_eq!(cleared.query(UsageRecordQuery::default()).total, 0);
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
     fn recorder_filters_by_time_window_and_invalid_times_do_not_match() {
-        let recorder = UsageRecorder::new(10, None);
+        let recorder = UsageRecorder::new(10);
         recorder.record(record_with_time(
             "old",
             10,

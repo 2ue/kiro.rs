@@ -238,6 +238,30 @@ export interface UsageRecordsPageQuery extends UsageRecordsQuery {
   limit: number
 }
 
+export interface AdminAuditLogRow {
+  id: number
+  createdAt: string
+  actor: string
+  action: string
+  objectType: string
+  objectId?: string
+  success: boolean
+  errorMessage?: string
+  detail: unknown
+}
+
+export interface AdminAuditLogPage {
+  page: number
+  limit: number
+  hasNext: boolean
+  records: AdminAuditLogRow[]
+}
+
+export interface AdminAuditLogPageQuery {
+  page: number
+  limit: number
+}
+
 export type CompatProfile = 'claude-code' | 'anthropic-strict' | 'debug'
 
 export type ReportedUsageFieldMode = 'preserve' | 'sample-max' | 'sample-target'

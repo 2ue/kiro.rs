@@ -123,6 +123,22 @@ impl PricingCatalog {
         }
     }
 
+    pub fn load_persisted_status(&self, status: PricingStatus) {
+        if status.models.is_empty() {
+            return;
+        }
+        let mut prices = HashMap::with_capacity(status.models.len());
+        for item in status.models {
+            prices.insert(item.model, item.pricing);
+        }
+        let mut inner = self.inner.write();
+        inner.prices = prices;
+        inner.source = status.source;
+        inner.source_url = status.source_url;
+        inner.last_synced_at = status.last_synced_at;
+        inner.last_error = status.last_error;
+    }
+
     pub fn status(&self) -> PricingStatus {
         self.inner.read().status()
     }

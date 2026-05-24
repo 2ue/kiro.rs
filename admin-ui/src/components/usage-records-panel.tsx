@@ -203,7 +203,7 @@ export function UsageRecordsPanel() {
   }
 
   const handleClear = () => {
-    if (!confirm('确定清空 usage 记录吗？此操作会同时截断本地 JSONL 记录文件。')) {
+    if (!confirm('确定清空 Usage 展示记录吗？此操作会在 PgSQL 中软删除当前记录，历史行仍保留用于审计。')) {
       return
     }
     clearRecords.mutate(undefined, {

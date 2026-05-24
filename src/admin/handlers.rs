@@ -29,6 +29,13 @@ pub struct CredentialsPageQueryParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AuditLogsQueryParams {
+    pub page: Option<usize>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UsageRecordsQueryParams {
     pub limit: Option<usize>,
     pub q: Option<String>,
@@ -412,11 +419,30 @@ pub async fn get_usage_summary(State(state): State<AdminState>) -> impl IntoResp
     Json(state.service.get_usage_summary())
 }
 
+/// GET /api/admin/usage-writer-stats
+/// 获取 usage 持久化 writer 观测状态。
+pub async fn get_usage_writer_stats(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_usage_writer_stats())
+}
+
 /// POST /api/admin/usage-records/clear
 /// 清空请求级 usage 记录
 pub async fn clear_usage_records(State(state): State<AdminState>) -> impl IntoResponse {
     state.service.clear_usage_records();
     Json(SuccessResponse::new("Usage 记录已清空"))
+}
+
+/// GET /api/admin/audit-logs
+/// 分页查询 Admin 审计日志。
+pub async fn get_audit_logs(
+    State(state): State<AdminState>,
+    Query(params): Query<AuditLogsQueryParams>,
+) -> impl IntoResponse {
+    Json(
+        state
+            .service
+            .get_audit_logs(params.page.unwrap_or(1), params.limit.unwrap_or(20)),
+    )
 }
 
 #[cfg(test)]

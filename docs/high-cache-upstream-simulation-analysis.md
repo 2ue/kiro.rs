@@ -324,8 +324,8 @@ Provider 对错误做了区分：
 
 1. 记录每次请求的最终 usage。
 2. 支持内存 ring buffer，避免无限增长。
-3. 可选 JSONL 落盘，路径可放在 `token_manager.cache_dir()/kiro_usage_records.jsonl`。
-4. Admin 查询时从内存读取，服务重启后可加载最近 N 条 JSONL。
+3. 当前实现已迁移到 PgSQL：完整 usage record 写入数据库，内存 ring buffer 只保留最近记录用于快速统计。
+4. Admin 查询优先读取 PgSQL；不再使用 JSONL 文件作为服务运行时持久化。
 
 建议字段：
 

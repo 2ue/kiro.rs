@@ -8,11 +8,12 @@ use axum::{
 use super::{
     handlers::{
         add_credential, clear_credential_in_flight, clear_usage_records, delete_credential,
-        export_credentials, force_refresh_token, get_all_credentials, get_credential_balance,
-        get_credentials_page, get_load_balancing_mode, get_model_pricing, get_runtime_config,
-        get_usage_records, get_usage_records_page, get_usage_summary, reset_failure_count,
-        set_credential_disabled, set_credential_priority, set_credential_warmup,
-        set_load_balancing_mode, sync_model_pricing, test_credential, update_runtime_config,
+        export_credentials, force_refresh_token, get_all_credentials, get_audit_logs,
+        get_credential_balance, get_credentials_page, get_load_balancing_mode, get_model_pricing,
+        get_runtime_config, get_usage_records, get_usage_records_page, get_usage_summary,
+        get_usage_writer_stats, reset_failure_count, set_credential_disabled,
+        set_credential_priority, set_credential_warmup, set_load_balancing_mode,
+        sync_model_pricing, test_credential, update_runtime_config,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -61,6 +62,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/usage-records-paged", get(get_usage_records_page))
         .route("/usage-records/clear", post(clear_usage_records))
         .route("/usage-summary", get(get_usage_summary))
+        .route("/usage-writer-stats", get(get_usage_writer_stats))
+        .route("/audit-logs", get(get_audit_logs))
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),

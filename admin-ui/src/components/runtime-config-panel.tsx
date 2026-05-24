@@ -32,10 +32,14 @@ const inputSamplePolicy = (maxTokens = 96): ReportedUsageFieldPolicy => ({
   moveDeltaToCacheRead: true,
 })
 
-const writerSamplePolicy = (targetTokens = 3000): ReportedUsageFieldPolicy => ({
+const writerSamplePolicy = (
+  targetTokens = 3000,
+  normalMaxMultiplier = 1.2
+): ReportedUsageFieldPolicy => ({
   ...preserveFieldPolicy(),
   mode: 'sample-target',
   targetTokens,
+  normalMaxMultiplier,
 })
 
 const pathPolicy = (
@@ -111,26 +115,26 @@ function NumberField({
 }: NumberFieldProps) {
   return (
     <label className="block rounded-md border bg-background p-4">
-      <div className="mb-3 flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="text-sm font-medium">{title}</div>
-          <div className="mt-1 text-xs leading-5 text-muted-foreground">{description}</div>
-        </div>
+      <div className="mb-3">
+        <div className="text-sm font-medium">{title}</div>
+        <div className="mt-1 text-xs leading-5 text-muted-foreground">{description}</div>
+      </div>
+      <div className="flex items-center gap-2">
+        <Input
+          type="number"
+          value={value}
+          min={min}
+          max={max}
+          step={step}
+          inputMode="numeric"
+          onChange={(event) => onChange(toNumber(event.target.value, min ?? 0))}
+        />
         {suffix && (
-          <span className="shrink-0 rounded-md bg-muted px-2 py-1 text-xs text-muted-foreground">
+          <span className="min-w-16 shrink-0 rounded-md border bg-muted px-3 py-2 text-center text-sm text-muted-foreground">
             {suffix}
           </span>
         )}
       </div>
-      <Input
-        type="number"
-        value={value}
-        min={min}
-        max={max}
-        step={step}
-        inputMode="numeric"
-        onChange={(event) => onChange(toNumber(event.target.value, min ?? 0))}
-      />
     </label>
   )
 }
@@ -186,19 +190,21 @@ interface SelectFieldProps {
 
 interface ModeSelectProps {
   value: ReportedUsageFieldMode
+  disabled?: boolean
   onChange: (value: ReportedUsageFieldMode) => void
 }
 
-function ModeSelect({ value, onChange }: ModeSelectProps) {
+function ModeSelect({ value, disabled, onChange }: ModeSelectProps) {
   return (
     <select
-      className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+      className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
       value={value}
+      disabled={disabled}
       onChange={(event) => onChange(event.target.value as ReportedUsageFieldMode)}
     >
-      <option value="preserve">原样上报</option>
-      <option value="sample-max">采样到上限内</option>
-      <option value="sample-target">按目标值采样</option>
+      <option value="preserve">保留计算值（不改写）</option>
+      <option value="sample-max">按上限采样改写</option>
+      <option value="sample-target">按目标采样改写</option>
     </select>
   )
 }
@@ -223,11 +229,66 @@ function SelectField({ title, description, value, onChange }: SelectFieldProps) 
   )
 }
 
+interface PolicyNumberInputProps {
+  title: string
+  description: string
+  value: number
+  min?: number
+  step?: number
+  suffix: string
+  disabled?: boolean
+  onChange: (value: number) => void
+}
+
+function PolicyNumberInput({
+  title,
+  description,
+  value,
+  min,
+  step,
+  suffix,
+  disabled,
+  onChange,
+}: PolicyNumberInputProps) {
+  return (
+    <label className="grid gap-2 rounded-md border bg-muted/20 p-3">
+      <span className="text-xs font-medium">{title}</span>
+      <span className="text-xs leading-5 text-muted-foreground">{description}</span>
+      <div className="flex items-center gap-2">
+        <Input
+          type="number"
+          value={value}
+          min={min}
+          step={step}
+          inputMode={step ? 'decimal' : 'numeric'}
+          disabled={disabled}
+          onChange={(event) => onChange(toNumber(event.target.value, min ?? 0))}
+        />
+        <span className="min-w-16 shrink-0 rounded-md border bg-background px-3 py-2 text-center text-sm text-muted-foreground">
+          {suffix}
+        </span>
+      </div>
+    </label>
+  )
+}
+
+function reportedUsageModeDescription(mode: ReportedUsageFieldMode): string {
+  switch (mode) {
+    case 'preserve':
+      return '保留计算值表示不对这个字段做二次改写，直接使用 high-cache、上游 metadata 或估算完成后的当前字段值。'
+    case 'sample-max':
+      return '按上限采样改写会把这个字段改写到上限以内，分布偏向较小值，不会固定贴着上限。需要配置“采样上限”。'
+    case 'sample-target':
+      return '按目标采样改写会围绕目标值生成自然浮动结果，常规最大值由“目标 tokens × 常规最大倍率”决定，并且不会超过当前可用字段值。'
+  }
+}
+
 interface ReportedUsageFieldEditorProps {
   title: string
   description: string
   value: ReportedUsageFieldPolicy
   allowMoveDelta?: boolean
+  disabled?: boolean
   onChange: (value: ReportedUsageFieldPolicy) => void
 }
 
@@ -236,6 +297,7 @@ function ReportedUsageFieldEditor({
   description,
   value,
   allowMoveDelta,
+  disabled,
   onChange,
 }: ReportedUsageFieldEditorProps) {
   return (
@@ -247,44 +309,44 @@ function ReportedUsageFieldEditor({
       <div className="grid gap-3">
         <ModeSelect
           value={value.mode}
+          disabled={disabled}
           onChange={(mode) => onChange({ ...value, mode })}
         />
+        <div className="rounded-md bg-muted/40 px-3 py-2 text-xs leading-5 text-muted-foreground">
+          {reportedUsageModeDescription(value.mode)}
+        </div>
         {fieldNeedsMax(value) && (
-          <Input
-            type="number"
+          <PolicyNumberInput
+            title="采样上限"
+            description="控制改写后的最大 token 数。实际值会在 1 到这个上限之间自然浮动。"
             value={value.maxTokens}
             min={0}
-            inputMode="numeric"
-            placeholder="上限 tokens"
-            onChange={(event) =>
-              onChange({ ...value, maxTokens: toNumber(event.target.value, 0) })
-            }
+            suffix="tokens"
+            disabled={disabled}
+            onChange={(maxTokens) => onChange({ ...value, maxTokens })}
           />
         )}
         {fieldNeedsTarget(value) && (
           <div className="grid gap-3 sm:grid-cols-2">
-            <Input
-              type="number"
+            <PolicyNumberInput
+              title="目标值"
+              description="控制采样分布的目标 token 数。比如 writer 设置 3000，表示常规结果围绕 3000 附近自然浮动。"
               value={value.targetTokens}
               min={0}
-              inputMode="numeric"
-              placeholder="目标 tokens"
-              onChange={(event) =>
-                onChange({ ...value, targetTokens: toNumber(event.target.value, 0) })
-              }
+              suffix="tokens"
+              disabled={disabled}
+              onChange={(targetTokens) => onChange({ ...value, targetTokens })}
             />
-            <Input
-              type="number"
+            <PolicyNumberInput
+              title="常规最大倍率"
+              description="控制正常随机范围的上限，常规最大值 = 目标值 × 倍率。比如 3000 和 1.2 表示正常最高约 3600。"
               value={value.normalMaxMultiplier}
               min={1}
               step={0.1}
-              inputMode="decimal"
-              placeholder="最大倍率"
-              onChange={(event) =>
-                onChange({
-                  ...value,
-                  normalMaxMultiplier: toNumber(event.target.value, 1.1),
-                })
+              suffix="倍"
+              disabled={disabled}
+              onChange={(normalMaxMultiplier) =>
+                onChange({ ...value, normalMaxMultiplier })
               }
             />
           </div>
@@ -294,7 +356,7 @@ function ReportedUsageFieldEditor({
             title="差值计入缓存读取"
             description="开启后，input_tokens 被压低的差值会加到 cache_read_input_tokens，只改变下游上报外观。"
             checked={value.moveDeltaToCacheRead}
-            disabled={value.mode === 'preserve'}
+            disabled={disabled || value.mode === 'preserve'}
             onCheckedChange={(moveDeltaToCacheRead) =>
               onChange({ ...value, moveDeltaToCacheRead })
             }
@@ -331,13 +393,14 @@ function ReportedUsagePathEditor({
           {onDelete && (
             <Button
               type="button"
-              variant="ghost"
-              size="icon"
-              className="h-8 w-8 text-muted-foreground hover:text-destructive"
+              variant="outline"
+              size="sm"
+              className="text-muted-foreground hover:text-destructive"
               onClick={onDelete}
               title="删除这条路径覆盖"
             >
               <Trash2 className="h-4 w-4" />
+              删除覆盖
             </Button>
           )}
           <Switch
@@ -346,33 +409,41 @@ function ReportedUsagePathEditor({
           />
         </div>
       </div>
-      <div className="grid gap-4 lg:grid-cols-2">
-        <ReportedUsageFieldEditor
-          title="输入上报"
-          description="控制 input_tokens。常见做法是采样到几十以内，并把差值计入缓存读取。"
-          value={value.input}
-          allowMoveDelta
-          onChange={(input) => onChange({ ...value, input })}
-        />
-        <ReportedUsageFieldEditor
-          title="输出上报"
-          description="控制 output_tokens。默认建议原样上报，避免影响客户端对输出量的判断。"
-          value={value.output}
-          onChange={(output) => onChange({ ...value, output })}
-        />
-        <ReportedUsageFieldEditor
-          title="缓存读取上报"
-          description="控制 cache_read_input_tokens。默认建议原样，通常由输入差值自然增加。"
-          value={value.cacheRead}
-          onChange={(cacheRead) => onChange({ ...value, cacheRead })}
-        />
-        <ReportedUsageFieldEditor
-          title="缓存写入上报"
-          description="控制 cache_creation_input_tokens。/cc 可设置目标值 3000，实际会自然浮动。"
-          value={value.cacheCreation}
-          onChange={(cacheCreation) => onChange({ ...value, cacheCreation })}
-        />
-      </div>
+      {!value.enabled && (
+        <div className="mb-4 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-5 text-amber-900">
+          当前路径已关闭本地模拟缓存上报：下游响应和后台 usage 记录会隐藏模拟 cache read/write，
+          并把 input 展示为完整输入。字段改写配置已隐藏，重新开启后才会显示并生效。
+        </div>
+      )}
+      {value.enabled && (
+        <div className="grid gap-4 lg:grid-cols-2">
+          <ReportedUsageFieldEditor
+            title="输入字段改写（input_tokens）"
+            description="控制计算完成后给下游和后台记录的 input_tokens。保留计算值表示不再二次改写；常见做法是采样到几十以内，并把差值计入缓存读取。"
+            value={value.input}
+            allowMoveDelta
+            onChange={(input) => onChange({ ...value, input })}
+          />
+          <ReportedUsageFieldEditor
+            title="输出字段改写（output_tokens）"
+            description="控制计算完成后给下游和后台记录的 output_tokens。默认建议保留计算值，避免影响客户端对输出量的判断。"
+            value={value.output}
+            onChange={(output) => onChange({ ...value, output })}
+          />
+          <ReportedUsageFieldEditor
+            title="缓存读取字段改写（cache_read_input_tokens）"
+            description="控制计算完成后给下游和后台记录的 cache_read_input_tokens。保留计算值表示保留 high-cache/上游 metadata/估算后的读缓存值。"
+            value={value.cacheRead}
+            onChange={(cacheRead) => onChange({ ...value, cacheRead })}
+          />
+          <ReportedUsageFieldEditor
+            title="缓存写入字段改写（cache_creation_input_tokens）"
+            description="控制计算完成后给下游和后台记录的 cache_creation_input_tokens。/cc 可设置目标值 3000，实际会自然浮动。"
+            value={value.cacheCreation}
+            onChange={(cacheCreation) => onChange({ ...value, cacheCreation })}
+          />
+        </div>
+      )}
     </div>
   )
 }
@@ -515,7 +586,7 @@ export function RuntimeConfigPanel() {
         <CardHeader>
           <CardTitle className="text-base">运行时配置</CardTitle>
           <CardDescription>
-            这些配置会写回配置文件，并对后续新请求热加载生效；监听地址、密钥、代理客户端等启动期配置仍需要改配置文件后重启。
+            这些配置会写入 PgSQL 并对后续新请求热加载生效；监听地址、密钥、数据库连接和代理客户端等启动期配置仍需要改启动配置后重启。
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
@@ -711,13 +782,13 @@ export function RuntimeConfigPanel() {
 
           <ConfigSection
             icon={<BadgeInfo className="h-4 w-4" />}
-            title="路径级 Usage 上报"
-            description="每个路径前缀都是独立覆盖项：先使用默认策略，再按最长匹配的路径前缀覆盖。这里只改变下游响应和后台 usage 记录，不影响本地 reader 计算、缓存 tracker 或上游请求。"
+            title="路径级 Usage 上报改写"
+            description="每个路径前缀都是独立覆盖项：先使用未匹配路径的默认改写策略，再按最长匹配的路径前缀覆盖。这里处理的是 high-cache、上游 metadata 或估算完成后的 usage 投影；只改变下游响应和后台 usage 记录，不影响本地 reader 计算、缓存 tracker 或上游请求。"
           >
             <div className="md:col-span-2 space-y-4">
               <ReportedUsagePathEditor
-                title="默认策略"
-                description="所有路径都会先使用这份策略。默认原样上报，适合 /v1。"
+                title="未匹配路径默认上报改写"
+                description="没有命中 /cc、/ha、/na 等路径覆盖时使用。默认适合 /v1：保留 high-cache 计算后的 usage，不额外压 input、reader、writer 或 output。"
                 value={draft.reportedUsage.default}
                 onChange={(defaultPolicy) =>
                   setDraft((prev) => ({
@@ -753,7 +824,7 @@ export function RuntimeConfigPanel() {
                   </label>
                   <ReportedUsagePathEditor
                     title={`${prefix || '/'} 覆盖策略`}
-                    description="只覆盖这个路径前缀匹配到的请求。关闭后该路径前缀不会用本地模拟补足 cache usage，只保留真实上游 cache usage。"
+                    description="只覆盖这个路径前缀匹配到的请求。关闭后不会把本地模拟 cache usage 展示给下游或后台记录；如果请求本身带有真实上游 metadata usage，仍按真实值处理。"
                     value={policy}
                     onDelete={() =>
                       setDraft((prev) => {

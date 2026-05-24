@@ -933,12 +933,19 @@ impl KiroProvider {
                     status,
                     body
                 ));
-                self.token_manager.report_transient_failure(
+                if let Err(err) = self.token_manager.report_transient_failure(
                     ctx.id,
                     None,
                     retry_after,
                     format!("{} {}", status, body),
-                );
+                ) {
+                    self.finish_attempt(&mut ctx);
+                    anyhow::bail!(
+                        "MCP 请求失败（{}，调度状态写入失败）: {}",
+                        credential_context,
+                        err
+                    );
+                }
                 self.finish_attempt(&mut ctx);
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
@@ -1355,12 +1362,20 @@ impl KiroProvider {
                     status,
                     body
                 ));
-                self.token_manager.report_transient_failure(
+                if let Err(err) = self.token_manager.report_transient_failure(
                     ctx.id,
                     model.as_deref(),
                     retry_after,
                     format!("{} {}", status, body),
-                );
+                ) {
+                    self.finish_attempt(&mut ctx);
+                    anyhow::bail!(
+                        "{} API 请求失败（{}，调度状态写入失败）: {}",
+                        api_type,
+                        credential_context,
+                        err
+                    );
+                }
                 self.maybe_exclude_after_soft_failure(
                     conversation_id.as_deref(),
                     model.as_deref(),

@@ -362,7 +362,7 @@ foxfishc 的 release 和 Docker workflow 更完整，但当前仓库已经使用
 当前 sampling 特性：
 
 1. 最大正常值约为 `target * 1.1`。
-2. 如果 target 为 3000，正常范围约为 0 到 3300。
+2. 如果 target 为 3000 且 normalMaxMultiplier 为 1.2，正常范围约为 0 到 3600。
 3. 分布不是固定 3000，也不是递增序列。
 4. 值由请求 usage 和 seed 决定，看起来更自然。
 5. 默认不出现极大值。

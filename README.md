@@ -22,7 +22,7 @@
 - **多凭据支持**: 支持配置多个凭据，按优先级自动故障转移
 - **负载均衡**: 支持 `priority`（按优先级）和 `balanced`（均衡分配）两种模式
 - **智能重试**: 单凭据最多重试 3 次，单请求最多重试 9 次
-- **凭据回写**: 多凭据格式下自动回写刷新后的 Token
+- **数据库持久化**: 运行配置、凭据、凭据运行态、usage 记录和模型价格使用 PgSQL；会话绑定、冷却、限流、并发 lease、刷新锁和余额缓存使用 Redis
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
 - **工具调用**: 完整支持 function calling / tool use
 - **WebSearch**: 内置 WebSearch 工具转换逻辑
@@ -81,6 +81,12 @@ cargo build --release
 
 ```json
 {
+   "postgres": {
+      "url": "postgres://kiro_rs:kiro_rs_dev_password@127.0.0.1:25432/kiro_rs"
+   },
+   "redis": {
+      "url": "redis://127.0.0.1:26379/0"
+   },
    "host": "127.0.0.1",
    "port": 8990,
    "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
@@ -88,6 +94,7 @@ cargo build --release
 }
 ```
 > PS: 如果你需要 Web 管理面板, 请注意配置 `adminApiKey`
+> PgSQL 和 Redis 为必需依赖。首次启动时会把 `config.json` 和 `credentials.json` 导入 PgSQL；之后运行配置、凭据状态、Token 刷新结果、失败计数、预热状态、统计和 usage 记录都以数据库为准。会话粘性、临时冷却、本地限流、并发占用和跨实例 Token 刷新锁以 Redis 为准。
 
 创建 `credentials.json`（从 Kiro IDE 等中获取凭证信息）：
 > PS: 可以前往 Web 管理面板配置跳过本步骤
@@ -143,13 +150,13 @@ curl http://127.0.0.1:8990/v1/messages \
 
 ### Docker
 
-也可以通过 Docker 启动：
+完整部署请使用不会覆盖旧文件的 `docker-compose.database.yml`，它包含当前服务、PgSQL 和 Redis：
 
 ```bash
-docker-compose up
+docker compose -f docker-compose.database.yml up -d
 ```
 
-需要将 `config.json` 和 `credentials.json` 挂载到容器中，具体参见 `docker-compose.yml`。
+需要将首次导入用的 `config.json` 和 `credentials.json` 挂载到容器中，具体参见 `docker-compose.database.yml`。
 
 使用已发布镜像部署：
 
@@ -191,6 +198,11 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `proxyUsername` | string | - | 代理用户名 |
 | `proxyPassword` | string | - | 代理密码 |
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
+| `postgres.url` | string | 必填 | PgSQL 连接地址。服务启动必须能连接；首次启动可从配置文件导入运行配置和凭据 |
+| `postgres.maxConnections` | number | `10` | PgSQL 连接池最大连接数 |
+| `postgres.migrateOnStart` | boolean | `true` | 启动时是否自动创建/升级数据库表 |
+| `redis.url` | string | 必填 | Redis 连接地址，用于会话绑定、临时冷却、本地限流、并发 lease、跨实例 Token 刷新锁和余额缓存 |
+| `redis.keyPrefix` | string | `kiro_rs:local` | Redis key 前缀，用于和同一个 Redis 中的其他业务隔离 |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `credentialRpm` | number/null | `null` | 单凭据本地 RPM 限速；`null` 或 `0` 表示关闭。开启后会优先分流到其他可用凭据 |
 | `credentialMaxConcurrentRequests` | number | `0` | 单凭据最大并发请求数；`0` 表示不限制。开启后同一凭据达到并发上限时，新请求会优先换其他可用凭据 |
@@ -200,8 +212,6 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `credentialInFlightLeaseMaxSecs` | number | `900` | 单个并发占用超过多久未活跃时自动释放；`0` 表示关闭。用于兜底异常路径导致的并发槽长期占用 |
 | `credentialWarmupRequests` | number | `3` | 新增凭据默认预热次数；预热只通过真实业务请求成功递减，不伪造 success_count |
 | `credentialWarmupSelectionPercent` | number | `5` | balanced 模式下预热凭据参与真实业务请求调度的概率百分比 |
-| `credentialsPersist` | boolean | `true` | 是否持久化凭据文件变更（刷新 Token、禁用、优先级等） |
-| `credentialStatsPersist` | boolean | `true` | 是否持久化调度统计缓存（success_count、last_used_at） |
 | `compression.enabled` | boolean | `false` | 是否启用上游请求压缩；默认关闭 |
 | `compression.whitespaceCompression` | boolean | `true` | 启用 compression 后是否只做 JSON whitespace 压缩；默认只开启该低风险压缩 |
 | `compatProfile` | string | `claude-code` | 兼容 profile：`claude-code` 优先真实 Claude Code CLI 可用性；`anthropic-strict` 减少代理改写和调试特征；`debug` 等同 `claude-code` 但默认暴露代理 warning |
@@ -214,8 +224,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `promptCacheScaleMinInputTokens` | number | `20000` | 基础输入达到该门槛后才启用 high-cache token scale，避免短测试请求被放大 |
 | `reportedUsage.default` | object | 原样上报 | 控制所有路径的默认 usage 上报方式，只影响响应和后台 usage record，不影响 reader 计算、本地缓存 tracker 或上游请求 |
 | `reportedUsage.pathOverrides` | object | `/na`、`/cc`、`/ha` | 按路径前缀独立覆盖默认 usage 上报策略，最长前缀优先；例如 `/cc` 会匹配 `/cc/v1/messages`，`/ha` 和 `/na` 不会继承 `/cc` 的 writer 配置 |
-| `usageRecordLimit` | number | `5000` | Admin usage record 内存保留上限 |
-| `usageRecordPersist` | boolean | `true` | 是否将 usage record 追加写入 `kiro_usage_records.jsonl` |
+| `usageRecordLimit` | number | `5000` | 内存中保留的最近 usage 记录数量；完整 usage 记录写入 PgSQL |
 | `highCacheThreshold` | number | `10000` | Admin 统计高缓存请求的 cache read 阈值 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 | `exposeProxyWarnings` | boolean | `false` | 是否通过 `x-kiro-rs-warnings` 暴露代理侧兜底改写。`anthropic-strict` 下会强制关闭 |
@@ -224,6 +233,15 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 
 ```json
 {
+   "postgres": {
+      "url": "postgres://kiro_rs:kiro_rs_dev_password@127.0.0.1:25432/kiro_rs",
+      "maxConnections": 10,
+      "migrateOnStart": true
+   },
+   "redis": {
+      "url": "redis://127.0.0.1:26379/0",
+      "keyPrefix": "kiro_rs:local"
+   },
    "host": "127.0.0.1",
    "port": 8990,
    "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
@@ -251,8 +269,6 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
    "credentialInFlightLeaseMaxSecs": 900,
    "credentialWarmupRequests": 3,
    "credentialWarmupSelectionPercent": 5,
-   "credentialsPersist": true,
-   "credentialStatsPersist": true,
    "compression": {
       "enabled": false,
       "whitespaceCompression": true
@@ -301,7 +317,6 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
       }
    },
    "usageRecordLimit": 5000,
-   "usageRecordPersist": true,
    "highCacheThreshold": 10000,
    "defaultEndpoint": "ide",
    "exposeProxyWarnings": false
@@ -477,7 +492,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `RUST_LOG` | `info` | 日志级别，例如 `debug` / `info` |
-| `KIRO_API_KEY` | - | 自动注入一个最高优先级的 Kiro API Key 凭据，可用于不写入 `credentials.json` 的场景 |
+| `KIRO_API_KEY` | - | 自动导入一个最高优先级的 Kiro API Key 凭据并写入 PgSQL，可用于不准备 `credentials.json` 的场景 |
 | `KIRO_RS_IMAGE` | `ghcr.io/2ue/kiro-rs` | `docker-compose.deploy.yml` 使用的镜像仓库 |
 | `KIRO_RS_VERSION` | `latest` | `docker-compose.deploy.yml` 使用的镜像 tag |
 | `KIRO_RS_PORT` | `8990` | Docker 部署时映射到宿主机的端口 |
@@ -575,15 +590,24 @@ Admin UI 本地开发时还可以用 `VITE_API_PROXY_TARGET` 覆盖 Vite 代理�
   - `DELETE /api/admin/credentials/:id` - 删除凭据
   - `POST /api/admin/credentials/:id/disabled` - 设置凭据禁用状态
   - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
+  - `POST /api/admin/credentials/:id/warmup` - 设置凭据预热次数
+  - `POST /api/admin/credentials/:id/in-flight/clear` - 清理凭据并发占用
   - `POST /api/admin/credentials/:id/reset` - 重置失败计数
+  - `POST /api/admin/credentials/:id/refresh` - 强制刷新 Token
   - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
+  - `POST /api/admin/credentials/:id/test` - 测试指定凭据的模型调用
+  - `GET /api/admin/usage-records-paged` - 分页查询 Usage 记录
+  - `POST /api/admin/usage-records/clear` - 软删除当前 Usage 展示记录
+  - `GET /api/admin/model-pricing` - 获取模型价格目录
+  - `POST /api/admin/model-pricing/sync` - 手动同步模型价格目录
+  - `GET /api/admin/audit-logs` - 分页查询后台审计日志
 
 - **Admin UI**
   - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）
 
 ## 注意事项
 
-1. **凭证安全**: 请妥善保管 `credentials.json` 文件，不要提交到版本控制
+1. **凭证安全**: 请妥善保管首次导入用的 `credentials.json` 和 PgSQL 数据库，不要提交到版本控制
 2. **Token 刷新**: 服务会自动刷新过期的 Token，无需手动干预
 3. **WebSearch 工具**: 当 `tools` 列表仅包含一个 `web_search` 工具时，会走内置 WebSearch 转换逻辑
 
@@ -634,13 +658,18 @@ kiro-rs/
 │   │   └── error.rs            # 错误处理
 │   ├── admin_ui/               # Admin UI 静态文件嵌入
 │   │   └── router.rs           # 静态文件路由
+│   ├── storage/                # PgSQL 和 Redis 存储
+│   │   ├── postgres.rs         # PgSQL 表结构和读写
+│   │   └── redis_cache.rs      # Redis 缓存和调度运行态
 │   └── common/                 # 公共模块
 │       └── auth.rs             # 认证工具函数
 ├── admin-ui/                   # Admin UI 前端工程（构建产物会嵌入二进制）
 ├── tools/                      # 辅助工具
 ├── Cargo.toml                  # 项目配置
 ├── config.example.json         # 配置示例
-├── docker-compose.yml          # Docker Compose 配置
+├── docker-compose.yml          # 旧版单服务 Docker Compose 配置
+├── docker-compose.local-infra.yml # 本地 PgSQL/Redis 测试依赖
+├── docker-compose.database.yml # 服务 + PgSQL + Redis 部署配置
 └── Dockerfile                  # Docker 构建文件
 ```
 
@@ -652,6 +681,8 @@ kiro-rs/
 - **序列化**: [Serde](https://serde.rs/)
 - **日志**: [tracing](https://github.com/tokio-rs/tracing)
 - **命令行**: [Clap](https://github.com/clap-rs/clap)
+- **数据库**: [SQLx](https://github.com/launchbadge/sqlx) + PostgreSQL
+- **缓存**: [Redis](https://redis.io/)
 
 ## License
 

@@ -2541,7 +2541,7 @@ mod tests {
             })
             .collect();
 
-        assert!(values.iter().all(|value| (1..=3_300).contains(value)));
+        assert!(values.iter().all(|value| (1..=3_600).contains(value)));
         assert!(values.windows(2).any(|pair| pair[1] < pair[0]));
         assert!(values.iter().any(|value| value % 10 != 0));
 
@@ -2597,7 +2597,7 @@ mod tests {
         );
 
         let prompt_cache = Arc::new(PromptCacheTracker::default());
-        let usage_recorder = Arc::new(UsageRecorder::new(10, None));
+        let usage_recorder = Arc::new(UsageRecorder::new(10));
         let usage_context = RequestUsageContext {
             recorder: usage_recorder,
             prompt_cache,
@@ -2667,7 +2667,7 @@ mod tests {
             cache_creation_1h_input_tokens: 0,
         };
         let prompt_cache = Arc::new(PromptCacheTracker::default());
-        let usage_recorder = Arc::new(UsageRecorder::new(10, None));
+        let usage_recorder = Arc::new(UsageRecorder::new(10));
 
         let v1_context = RequestUsageContext {
             recorder: usage_recorder.clone(),
@@ -2798,7 +2798,7 @@ mod tests {
         assert_eq!(hint.display_label(), "#2 IlmiMiazzi@gmail.com");
 
         let prompt_cache = Arc::new(PromptCacheTracker::default());
-        let usage_recorder = Arc::new(UsageRecorder::new(10, None));
+        let usage_recorder = Arc::new(UsageRecorder::new(10));
         let usage_context = RequestUsageContext {
             recorder: usage_recorder.clone(),
             prompt_cache,
@@ -2839,7 +2839,7 @@ mod tests {
     #[test]
     fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
         let prompt_cache = Arc::new(PromptCacheTracker::default());
-        let usage_recorder = Arc::new(UsageRecorder::new(10, None));
+        let usage_recorder = Arc::new(UsageRecorder::new(10));
         let payload = MessagesRequest {
             model: "claude-sonnet-4-6".to_string(),
             max_tokens: 16,
@@ -2911,7 +2911,7 @@ mod tests {
     #[test]
     fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
         let prompt_cache = Arc::new(PromptCacheTracker::default());
-        let usage_recorder = Arc::new(UsageRecorder::new(10, None));
+        let usage_recorder = Arc::new(UsageRecorder::new(10));
         let payload = MessagesRequest {
             model: "claude-sonnet-4-6".to_string(),
             max_tokens: 16,
@@ -2994,7 +2994,7 @@ mod tests {
     #[test]
     fn high_cache_missing_metadata_fallback_conversation_reads_second_turn() {
         let prompt_cache = Arc::new(PromptCacheTracker::default());
-        let usage_recorder = Arc::new(UsageRecorder::new(10, None));
+        let usage_recorder = Arc::new(UsageRecorder::new(10));
         let state = AppState::new(
             "test-key",
             true,
@@ -3110,7 +3110,7 @@ mod tests {
     #[test]
     fn disabled_prompt_cache_does_not_simulate_without_stable_conversation_id() {
         let prompt_cache = Arc::new(PromptCacheTracker::default());
-        let usage_recorder = Arc::new(UsageRecorder::new(10, None));
+        let usage_recorder = Arc::new(UsageRecorder::new(10));
         let state = AppState::new(
             "test-key",
             true,
@@ -3168,7 +3168,7 @@ mod tests {
     #[test]
     fn disabled_prompt_cache_mode_does_not_build_local_profile_even_for_na_path() {
         let prompt_cache = Arc::new(PromptCacheTracker::default());
-        let usage_recorder = Arc::new(UsageRecorder::new(10, None));
+        let usage_recorder = Arc::new(UsageRecorder::new(10));
         let state = AppState::new(
             "test-key",
             true,
@@ -3252,7 +3252,7 @@ mod tests {
     #[test]
     fn strict_profile_suppresses_proxy_warning_header() {
         let prompt_cache = Arc::new(PromptCacheTracker::default());
-        let usage_recorder = Arc::new(UsageRecorder::new(10, None));
+        let usage_recorder = Arc::new(UsageRecorder::new(10));
         let state = AppState::new(
             "test-key",
             true,

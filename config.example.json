@@ -1,4 +1,13 @@
 {
+  "postgres": {
+    "url": "postgres://kiro_rs:kiro_rs_dev_password@127.0.0.1:25432/kiro_rs",
+    "maxConnections": 10,
+    "migrateOnStart": true
+  },
+  "redis": {
+    "url": "redis://127.0.0.1:26379/0",
+    "keyPrefix": "kiro_rs:local"
+  },
   "host": "127.0.0.1",
   "port": 8990,
   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
@@ -16,8 +25,6 @@
   "credentialInFlightLeaseMaxSecs": 900,
   "credentialWarmupRequests": 3,
   "credentialWarmupSelectionPercent": 5,
-  "credentialsPersist": true,
-  "credentialStatsPersist": true,
   "compression": {
     "enabled": false,
     "whitespaceCompression": true
@@ -52,7 +59,7 @@
         "cacheCreation": {
           "mode": "sample-target",
           "targetTokens": 3000,
-          "normalMaxMultiplier": 1.1
+          "normalMaxMultiplier": 1.2
         }
       },
       "/ha": {
@@ -66,7 +73,6 @@
     }
   },
   "usageRecordLimit": 5000,
-  "usageRecordPersist": true,
   "highCacheThreshold": 10000,
   "defaultEndpoint": "ide",
   "exposeProxyWarnings": false

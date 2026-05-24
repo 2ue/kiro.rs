@@ -1,13 +1,12 @@
 //! Admin API 业务逻辑服务
 
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use chrono::Utc;
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use super::error::AdminServiceError;
 use super::types::{
@@ -21,7 +20,8 @@ use crate::anthropic::{
     pricing::{PricingCatalog, PricingStatus},
     prompt_cache::PromptCacheTracker,
     usage::{
-        UsageRecordQuery, UsageRecorder, UsageRecordsPageResult, UsageRecordsResult, UsageSummary,
+        UsageRecordQuery, UsageRecorder, UsageRecorderStats, UsageRecordsPageResult,
+        UsageRecordsResult, UsageSummary,
     },
 };
 use crate::kiro::model::credentials::KiroCredentials;
@@ -32,6 +32,8 @@ use crate::kiro::model::requests::{
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::storage::postgres::{AdminAuditLogPage, PostgresStore};
+use crate::storage::redis_cache::RedisStore;
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
@@ -47,6 +49,10 @@ struct CachedBalance {
     data: BalanceResponse,
 }
 
+fn balance_cache_key(id: u64) -> String {
+    format!("balance:{}", id)
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CredentialsBackupExport {
@@ -60,8 +66,8 @@ struct CredentialsBackupExport {
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
-    balance_cache: Mutex<HashMap<u64, CachedBalance>>,
-    cache_path: Option<PathBuf>,
+    postgres_store: Arc<PostgresStore>,
+    redis_store: Arc<RedisStore>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
     usage_recorder: Arc<UsageRecorder>,
@@ -78,17 +84,13 @@ impl AdminService {
         prompt_cache: Arc<PromptCacheTracker>,
         pricing_catalog: Arc<PricingCatalog>,
         kiro_provider: Arc<KiroProvider>,
+        postgres_store: Arc<PostgresStore>,
+        redis_store: Arc<RedisStore>,
     ) -> Self {
-        let cache_path = token_manager
-            .cache_dir()
-            .map(|d| d.join("kiro_balance_cache.json"));
-
-        let balance_cache = Self::load_balance_cache_from(&cache_path);
-
         Self {
             token_manager,
-            balance_cache: Mutex::new(balance_cache),
-            cache_path,
+            postgres_store,
+            redis_store,
             known_endpoints: known_endpoints.into_iter().collect(),
             usage_recorder,
             prompt_cache,
@@ -98,11 +100,40 @@ impl AdminService {
     }
 
     fn invalidate_balance_cache(&self, id: u64) {
-        {
-            let mut cache = self.balance_cache.lock();
-            cache.remove(&id);
-        }
-        self.save_balance_cache();
+        let redis = self.redis_store.clone();
+        tokio::spawn(async move {
+            if let Err(err) = redis.del(balance_cache_key(id)).await {
+                tracing::warn!("清理 Redis 余额缓存失败: {}", err);
+            }
+        });
+    }
+
+    fn audit(
+        &self,
+        action: &'static str,
+        object_type: &'static str,
+        object_id: Option<String>,
+        success: bool,
+        error_message: Option<String>,
+        detail: serde_json::Value,
+    ) {
+        let store = self.postgres_store.clone();
+        tokio::spawn(async move {
+            if let Err(err) = store
+                .record_admin_audit_log(
+                    "admin-api",
+                    action,
+                    object_type,
+                    object_id.as_deref(),
+                    success,
+                    error_message.as_deref(),
+                    detail,
+                )
+                .await
+            {
+                tracing::warn!("写入 Admin 审计日志失败: {}", err);
+            }
+        });
     }
 
     /// 获取所有凭据状态
@@ -214,6 +245,14 @@ impl AdminService {
         if disabled && id == current_id {
             let _ = self.token_manager.switch_to_next();
         }
+        self.audit(
+            "set_credential_disabled",
+            "credential",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({ "disabled": disabled }),
+        );
         Ok(())
     }
 
@@ -223,6 +262,14 @@ impl AdminService {
             .set_priority(id, priority)
             .map_err(|e| self.classify_error(e, id))?;
         self.invalidate_balance_cache(id);
+        self.audit(
+            "set_credential_priority",
+            "credential",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({ "priority": priority }),
+        );
         Ok(())
     }
 
@@ -232,38 +279,49 @@ impl AdminService {
             .reset_and_enable(id)
             .map_err(|e| self.classify_error(e, id))?;
         self.invalidate_balance_cache(id);
+        self.audit(
+            "reset_credential",
+            "credential",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({}),
+        );
         Ok(())
     }
 
     /// 获取凭据余额（带缓存）
     pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        // 先查缓存
+        if let Ok(Some(cached)) = self
+            .redis_store
+            .get_json::<CachedBalance>(balance_cache_key(id))
+            .await
         {
-            let cache = self.balance_cache.lock();
-            if let Some(cached) = cache.get(&id) {
-                let now = Utc::now().timestamp() as f64;
-                if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    tracing::debug!("凭据 #{} 余额命中缓存", id);
-                    return Ok(cached.data.clone());
-                }
+            let now = Utc::now().timestamp() as f64;
+            if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
+                tracing::debug!("凭据 #{} 余额命中 Redis 缓存", id);
+                return Ok(cached.data);
             }
         }
 
         // 缓存未命中或已过期，从上游获取
         let balance = self.fetch_balance(id).await?;
 
-        // 更新缓存
+        let cached = CachedBalance {
+            cached_at: Utc::now().timestamp() as f64,
+            data: balance.clone(),
+        };
+        if let Err(err) = self
+            .redis_store
+            .set_json(
+                balance_cache_key(id),
+                &cached,
+                BALANCE_CACHE_TTL_SECS as usize,
+            )
+            .await
         {
-            let mut cache = self.balance_cache.lock();
-            cache.insert(
-                id,
-                CachedBalance {
-                    cached_at: Utc::now().timestamp() as f64,
-                    data: balance.clone(),
-                },
-            );
+            tracing::warn!("保存 Redis 余额缓存失败: {}", err);
         }
-        self.save_balance_cache();
 
         Ok(balance)
     }
@@ -423,6 +481,14 @@ impl AdminService {
             tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
         }
         self.invalidate_balance_cache(credential_id);
+        self.audit(
+            "add_credential",
+            "credential",
+            Some(credential_id.to_string()),
+            true,
+            None,
+            json!({ "email": email }),
+        );
 
         Ok(AddCredentialResponse {
             success: true,
@@ -440,11 +506,15 @@ impl AdminService {
         self.prompt_cache.clear_credential(id);
 
         // 清理已删除凭据的余额缓存
-        {
-            let mut cache = self.balance_cache.lock();
-            cache.remove(&id);
-        }
-        self.save_balance_cache();
+        self.invalidate_balance_cache(id);
+        self.audit(
+            "delete_credential",
+            "credential",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({}),
+        );
 
         Ok(())
     }
@@ -470,6 +540,11 @@ impl AdminService {
         self.usage_recorder.summary(high_cache_threshold)
     }
 
+    /// 获取 usage 持久化 writer 状态。该状态只用于观测，不参与调度。
+    pub fn get_usage_writer_stats(&self) -> UsageRecorderStats {
+        self.usage_recorder.writer_stats()
+    }
+
     /// 获取模型价格同步状态。
     pub fn get_model_pricing(&self) -> PricingStatus {
         self.pricing_catalog.status()
@@ -477,14 +552,30 @@ impl AdminService {
 
     /// 手动同步模型价格。失败不影响调度，只体现在返回状态的 last_error。
     pub async fn sync_model_pricing(&self) -> PricingStatus {
-        self.pricing_catalog.sync().await
+        let mut status = self.pricing_catalog.sync().await;
+        if let Err(err) = self.postgres_store.save_pricing_status(&status).await {
+            tracing::warn!("保存手动同步后的模型价格到 PgSQL 失败: {}", err);
+            if status.last_error.is_none() {
+                status.last_error = Some(format!("价格已同步，但保存到 PgSQL 失败: {}", err));
+            }
+        }
+        self.audit(
+            "sync_model_pricing",
+            "model_pricing",
+            None,
+            status.last_error.is_none(),
+            status.last_error.clone(),
+            json!({ "source": status.source, "modelCount": status.model_count }),
+        );
+        status
     }
 
     /// 导出完整凭据。仅格式化当前内存快照，不修改凭据状态。
     pub fn export_credentials(&self, format: &str) -> Result<(String, String), AdminServiceError> {
         let credentials = self.token_manager.export_credentials();
+        let credential_count = credentials.len();
         let normalized = format.trim().to_ascii_lowercase();
-        match normalized.as_str() {
+        let result = match normalized.as_str() {
             "" | "json" => {
                 let body = serde_json::to_string_pretty(&credentials).map_err(|e| {
                     AdminServiceError::InternalError(format!("序列化凭据失败: {}", e))
@@ -504,7 +595,7 @@ impl AdminService {
             }
             "jsonl" => {
                 let mut lines = Vec::with_capacity(credentials.len());
-                for credential in credentials {
+                for credential in &credentials {
                     lines.push(serde_json::to_string(&credential).map_err(|e| {
                         AdminServiceError::InternalError(format!("序列化凭据失败: {}", e))
                     })?);
@@ -515,12 +606,43 @@ impl AdminService {
                 "不支持的导出格式: {}，可选 json、backup-json、jsonl",
                 format
             ))),
-        }
+        };
+        self.audit(
+            "export_credentials",
+            "credential",
+            None,
+            result.is_ok(),
+            result.as_ref().err().map(ToString::to_string),
+            json!({ "format": normalized, "count": credential_count }),
+        );
+        result
     }
 
     /// 清空 usage 记录。
     pub fn clear_usage_records(&self) {
         self.usage_recorder.clear();
+        self.audit(
+            "clear_usage_records",
+            "usage_record",
+            None,
+            true,
+            None,
+            json!({ "mode": "soft_delete" }),
+        );
+    }
+
+    pub fn get_audit_logs(&self, page: usize, limit: usize) -> AdminAuditLogPage {
+        let store = self.postgres_store.clone();
+        block_on_admin_store(async move { store.query_admin_audit_logs(page, limit).await })
+            .unwrap_or_else(|err| {
+                tracing::warn!("查询 Admin 审计日志失败: {}", err);
+                AdminAuditLogPage {
+                    page: page.max(1),
+                    limit: if limit == 0 { 20 } else { limit.min(200) },
+                    has_next: false,
+                    records: Vec::new(),
+                }
+            })
     }
 
     /// 获取运行时全局配置。
@@ -551,7 +673,7 @@ impl AdminService {
         }
     }
 
-    /// 更新运行时全局配置，并写回 config.json。
+    /// 更新运行时全局配置，并写入 PgSQL。
     pub fn update_runtime_config(
         &self,
         req: UpdateRuntimeConfigRequest,
@@ -686,6 +808,14 @@ impl AdminService {
                 config.expose_proxy_warnings = expose_proxy_warnings;
             })
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        self.audit(
+            "update_runtime_config",
+            "runtime_config",
+            Some("default".to_string()),
+            true,
+            None,
+            json!({}),
+        );
 
         Ok(self.get_runtime_config())
     }
@@ -694,7 +824,16 @@ impl AdminService {
     pub fn set_warmup(&self, id: u64, req: SetWarmupRequest) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_warmup_remaining(id, req.warmup_remaining)
-            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+        self.audit(
+            "set_credential_warmup",
+            "credential",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({ "warmupRemaining": req.warmup_remaining }),
+        );
+        Ok(())
     }
 
     /// 清理指定凭据的并发占用 lease。
@@ -708,7 +847,16 @@ impl AdminService {
             return Err(AdminServiceError::NotFound { id });
         }
         let min_idle = req.min_idle_secs.map(StdDuration::from_secs);
-        Ok(self.token_manager.clear_in_flight_leases(id, min_idle))
+        let cleared = self.token_manager.clear_in_flight_leases(id, min_idle);
+        self.audit(
+            "clear_credential_in_flight",
+            "credential",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({ "minIdleSecs": req.min_idle_secs, "cleared": cleared }),
+        );
+        Ok(cleared)
     }
 
     /// 获取负载均衡模式
@@ -733,6 +881,14 @@ impl AdminService {
         self.token_manager
             .set_load_balancing_mode(req.mode.clone())
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        self.audit(
+            "set_load_balancing_mode",
+            "runtime_config",
+            Some("default".to_string()),
+            true,
+            None,
+            json!({ "mode": req.mode }),
+        );
 
         Ok(LoadBalancingModeResponse { mode: req.mode })
     }
@@ -744,67 +900,15 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_balance_error(e, id))?;
         self.invalidate_balance_cache(id);
+        self.audit(
+            "force_refresh_token",
+            "credential",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({}),
+        );
         Ok(())
-    }
-
-    // ============ 余额缓存持久化 ============
-
-    fn load_balance_cache_from(cache_path: &Option<PathBuf>) -> HashMap<u64, CachedBalance> {
-        let path = match cache_path {
-            Some(p) => p,
-            None => return HashMap::new(),
-        };
-
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => return HashMap::new(),
-        };
-        if content.trim().is_empty() {
-            return HashMap::new();
-        }
-
-        // 文件中使用字符串 key 以兼容 JSON 格式
-        let map: HashMap<String, CachedBalance> = match serde_json::from_str(&content) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("解析余额缓存失败，将忽略: {}", e);
-                return HashMap::new();
-            }
-        };
-
-        let now = Utc::now().timestamp() as f64;
-        map.into_iter()
-            .filter_map(|(k, v)| {
-                let id = k.parse::<u64>().ok()?;
-                // 丢弃超过 TTL 的条目
-                if (now - v.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    Some((id, v))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    fn save_balance_cache(&self) {
-        let path = match &self.cache_path {
-            Some(p) => p,
-            None => return,
-        };
-
-        // 持有锁期间完成序列化和写入，防止并发损坏
-        let cache = self.balance_cache.lock();
-        let map: HashMap<String, &CachedBalance> =
-            cache.iter().map(|(k, v)| (k.to_string(), v)).collect();
-
-        match serde_json::to_string_pretty(&map) {
-            Ok(json) => {
-                if let Err(e) = crate::common::fs::write_file_atomic(path, json) {
-                    tracing::warn!("保存余额缓存失败: {}", e);
-                }
-            }
-            Err(e) => tracing::warn!("序列化余额缓存失败: {}", e),
-        }
     }
 
     // ============ 错误分类 ============
@@ -985,4 +1089,17 @@ fn normalize_credentials_limit(limit: usize) -> usize {
 
 fn total_pages(total: usize, limit: usize) -> usize {
     if total == 0 { 0 } else { total.div_ceil(limit) }
+}
+
+fn block_on_admin_store<T>(
+    future: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(future))
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(future)
+    }
 }

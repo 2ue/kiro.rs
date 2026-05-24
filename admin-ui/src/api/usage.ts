@@ -1,6 +1,8 @@
 import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
+  AdminAuditLogPage,
+  AdminAuditLogPageQuery,
   SuccessResponse,
   ModelPricingStatus,
   UsageRecordsPageQuery,
@@ -50,6 +52,15 @@ export async function getUsageSummary(): Promise<UsageSummary> {
 
 export async function clearUsageRecords(): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>('/usage-records/clear')
+  return data
+}
+
+export async function getAuditLogsPage(
+  query: AdminAuditLogPageQuery
+): Promise<AdminAuditLogPage> {
+  const { data } = await api.get<AdminAuditLogPage>('/audit-logs', {
+    params: query,
+  })
   return data
 }
 
