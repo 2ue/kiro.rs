@@ -659,7 +659,12 @@ impl StreamContext {
 
         self.reported_cache_usage_policy
             .clone()
-            .map(|policy| usage.with_reported_cache_usage_policy(policy))
+            .map(|policy| {
+                usage.with_reported_cache_usage_policy_and_raw(
+                    policy,
+                    super::cache::RawUsage::uncached(self.input_tokens, usage.output_tokens),
+                )
+            })
             .unwrap_or(usage)
     }
 

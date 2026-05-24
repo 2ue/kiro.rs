@@ -225,7 +225,12 @@ impl RequestUsageContext {
 
         self.reported_cache_usage_policy
             .clone()
-            .map(|policy| usage.with_reported_cache_usage_policy(policy))
+            .map(|policy| {
+                usage.with_reported_cache_usage_policy_and_raw(
+                    policy,
+                    super::cache::RawUsage::uncached(self.input_tokens, usage.output_tokens),
+                )
+            })
             .unwrap_or(usage)
     }
 }
@@ -2425,6 +2430,24 @@ mod tests {
         );
         assert!(reported.cache_read_input_tokens < usage.input_tokens);
         assert_eq!(reported.output_tokens, 1);
+
+        let raw_reported = usage.with_reported_cache_usage_policy_and_raw(
+            reported_cache_usage_policy(
+                "/cc/v1/messages",
+                PromptCacheSimulationMode::HighCache,
+                &reported_usage_config,
+                9,
+            )
+            .expect("policy should apply"),
+            cache::RawUsage::uncached(100_000, 1),
+        );
+        assert!((1..=96).contains(&raw_reported.input_tokens));
+        assert_eq!(
+            raw_reported.cache_read_input_tokens,
+            usage
+                .cache_read_input_tokens
+                .saturating_add(100_000_i32.saturating_sub(raw_reported.input_tokens))
+        );
     }
 
     #[test]
@@ -2446,9 +2469,19 @@ mod tests {
             cache_creation_5m_input_tokens: 50_000,
             cache_creation_1h_input_tokens: 0,
         };
+        let v1_reported = unchanged_usage.with_reported_cache_usage_policy_and_raw(
+            v1_policy,
+            cache::RawUsage::uncached(100_000, 1),
+        );
+        assert_eq!(v1_reported.input_tokens, 100_000);
+        assert_eq!(v1_reported.output_tokens, 1);
         assert_eq!(
-            unchanged_usage.with_reported_cache_usage_policy(v1_policy),
-            unchanged_usage
+            v1_reported.cache_creation_input_tokens,
+            unchanged_usage.cache_creation_input_tokens
+        );
+        assert_eq!(
+            v1_reported.cache_read_input_tokens,
+            unchanged_usage.cache_read_input_tokens
         );
         assert_eq!(
             reported_cache_usage_policy(
@@ -2507,11 +2540,13 @@ mod tests {
         assert!((1..=96).contains(&capped.input_tokens));
         assert_eq!(
             capped.cache_read_input_tokens,
-            usage
-                .cache_read_input_tokens
-                .saturating_add(usage.input_tokens.saturating_sub(capped.input_tokens))
+            usage.cache_read_input_tokens.saturating_add(
+                usage_context
+                    .input_tokens
+                    .saturating_sub(capped.input_tokens)
+            )
         );
-        assert!(capped.cache_read_input_tokens < 50_000);
+        assert!(capped.cache_read_input_tokens > usage.cache_read_input_tokens);
 
         let upstream_metadata =
             usage_context.reported_usage_for_downstream(usage, UsageSource::UpstreamMetadata);
@@ -2603,7 +2638,16 @@ mod tests {
 
         let v1_reported =
             v1_context.reported_usage_for_downstream(usage, UsageSource::LocalPromptCache);
-        assert_eq!(v1_reported, usage);
+        assert_eq!(v1_reported.input_tokens, v1_context.input_tokens);
+        assert_eq!(v1_reported.output_tokens, usage.output_tokens);
+        assert_eq!(
+            v1_reported.cache_creation_input_tokens,
+            usage.cache_creation_input_tokens
+        );
+        assert_eq!(
+            v1_reported.cache_read_input_tokens,
+            usage.cache_read_input_tokens
+        );
 
         let cc_reported =
             cc_context.reported_usage_for_downstream(usage, UsageSource::LocalPromptCache);
@@ -2611,9 +2655,11 @@ mod tests {
         assert!((0..=3_300).contains(&cc_reported.cache_creation_input_tokens));
         assert_eq!(
             cc_reported.cache_read_input_tokens,
-            usage
-                .cache_read_input_tokens
-                .saturating_add(usage.input_tokens.saturating_sub(cc_reported.input_tokens))
+            usage.cache_read_input_tokens.saturating_add(
+                cc_context
+                    .input_tokens
+                    .saturating_sub(cc_reported.input_tokens)
+            )
         );
         assert_eq!(cc_reported.output_tokens, usage.output_tokens);
 
@@ -2634,16 +2680,18 @@ mod tests {
         );
         assert_eq!(
             ha_reported.cache_read_input_tokens,
-            usage
-                .cache_read_input_tokens
-                .saturating_add(usage.input_tokens.saturating_sub(ha_reported.input_tokens))
+            usage.cache_read_input_tokens.saturating_add(
+                ha_context
+                    .input_tokens
+                    .saturating_sub(ha_reported.input_tokens)
+            )
         );
         assert_eq!(ha_reported.output_tokens, usage.output_tokens);
 
         let na_reported =
             na_context.reported_usage_for_downstream(usage, UsageSource::LocalPromptCache);
-        assert_eq!(na_reported.total_input_tokens, usage.total_input_tokens);
-        assert_eq!(na_reported.input_tokens, usage.total_input_tokens);
+        assert_eq!(na_reported.total_input_tokens, na_context.input_tokens);
+        assert_eq!(na_reported.input_tokens, na_context.input_tokens);
         assert_eq!(na_reported.cache_creation_input_tokens, 0);
         assert_eq!(na_reported.cache_read_input_tokens, 0);
         assert_eq!(na_reported.cache_creation_5m_input_tokens, 0);

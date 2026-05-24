@@ -25,6 +25,11 @@ const preserveFieldPolicy = (): ReportedUsageFieldPolicy => ({
   moveDeltaToCacheRead: false,
 })
 
+const rawFieldPolicy = (): ReportedUsageFieldPolicy => ({
+  ...preserveFieldPolicy(),
+  mode: 'raw',
+})
+
 const inputSamplePolicy = (maxTokens = 96): ReportedUsageFieldPolicy => ({
   ...preserveFieldPolicy(),
   mode: 'sample-max',
@@ -44,12 +49,12 @@ const writerSamplePolicy = (
 
 const pathPolicy = (
   enabled = true,
-  input: ReportedUsageFieldPolicy = preserveFieldPolicy(),
+  input: ReportedUsageFieldPolicy = rawFieldPolicy(),
   cacheCreation: ReportedUsageFieldPolicy = preserveFieldPolicy()
 ): ReportedUsagePathPolicy => ({
   enabled,
   input,
-  output: preserveFieldPolicy(),
+  output: rawFieldPolicy(),
   cacheRead: preserveFieldPolicy(),
   cacheCreation,
 })
@@ -202,6 +207,7 @@ function ModeSelect({ value, disabled, onChange }: ModeSelectProps) {
       disabled={disabled}
       onChange={(event) => onChange(event.target.value as ReportedUsageFieldMode)}
     >
+      <option value="raw">原始值（不经过缓存计算）</option>
       <option value="preserve">保留计算值（不改写）</option>
       <option value="sample-max">按上限采样改写</option>
       <option value="sample-target">按目标采样改写</option>
@@ -274,8 +280,10 @@ function PolicyNumberInput({
 
 function reportedUsageModeDescription(mode: ReportedUsageFieldMode): string {
   switch (mode) {
+    case 'raw':
+      return '原始值表示这个字段不经过本地 high-cache 模拟、放大或路径采样改写。input 使用请求原始 token，output 优先使用上游返回值，缺失时使用本地输出估算。'
     case 'preserve':
-      return '保留计算值表示不对这个字段做二次改写，直接使用 high-cache、上游 metadata 或估算完成后的当前字段值。'
+      return '保留计算值表示这个字段使用 high-cache、上游 metadata 或本地估算完成后的缓存计算结果。它不是原始请求值。'
     case 'sample-max':
       return '按上限采样改写会把这个字段改写到上限以内，分布偏向较小值，不会固定贴着上限。需要配置“采样上限”。'
     case 'sample-target':
@@ -356,7 +364,7 @@ function ReportedUsageFieldEditor({
             title="差值计入缓存读取"
             description="开启后，input_tokens 被压低的差值会加到 cache_read_input_tokens，只改变下游上报外观。"
             checked={value.moveDeltaToCacheRead}
-            disabled={disabled || value.mode === 'preserve'}
+            disabled={disabled || value.mode === 'preserve' || value.mode === 'raw'}
             onCheckedChange={(moveDeltaToCacheRead) =>
               onChange({ ...value, moveDeltaToCacheRead })
             }
@@ -419,14 +427,14 @@ function ReportedUsagePathEditor({
         <div className="grid gap-4 lg:grid-cols-2">
           <ReportedUsageFieldEditor
             title="输入字段改写（input_tokens）"
-            description="控制计算完成后给下游和后台记录的 input_tokens。保留计算值表示不再二次改写；常见做法是采样到几十以内，并把差值计入缓存读取。"
+            description="控制给下游和后台记录的 input_tokens。原始值表示请求输入是多少就报多少；保留计算值表示使用 high-cache 计算后的 input；采样可把 input 压到几十以内并把差值计入缓存读取。"
             value={value.input}
             allowMoveDelta
             onChange={(input) => onChange({ ...value, input })}
           />
           <ReportedUsageFieldEditor
             title="输出字段改写（output_tokens）"
-            description="控制计算完成后给下游和后台记录的 output_tokens。默认建议保留计算值，避免影响客户端对输出量的判断。"
+            description="控制给下游和后台记录的 output_tokens。默认建议使用原始值，避免本地模拟影响客户端对输出量的判断。"
             value={value.output}
             onChange={(output) => onChange({ ...value, output })}
           />
@@ -788,7 +796,7 @@ export function RuntimeConfigPanel() {
             <div className="md:col-span-2 space-y-4">
               <ReportedUsagePathEditor
                 title="未匹配路径默认上报改写"
-                description="没有命中 /cc、/ha、/na 等路径覆盖时使用。默认适合 /v1：保留 high-cache 计算后的 usage，不额外压 input、reader、writer 或 output。"
+                description="没有命中 /cc、/ha、/na 等路径覆盖时使用。默认适合 /v1：input/output 使用原始值，cache read/write 保留 high-cache 计算值。"
                 value={draft.reportedUsage.default}
                 onChange={(defaultPolicy) =>
                   setDraft((prev) => ({

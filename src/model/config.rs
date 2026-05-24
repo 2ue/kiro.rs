@@ -51,6 +51,7 @@ pub struct CompressionConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ReportedUsageFieldMode {
+    Raw,
     Preserve,
     SampleMax,
     SampleTarget,
@@ -104,6 +105,13 @@ impl Default for ReportedUsageFieldPolicy {
 impl ReportedUsageFieldPolicy {
     pub fn preserve() -> Self {
         Self::default()
+    }
+
+    pub fn raw() -> Self {
+        Self {
+            mode: ReportedUsageFieldMode::Raw,
+            ..Self::default()
+        }
     }
 
     pub fn sample_max(max_tokens: i32) -> Self {
@@ -185,8 +193,8 @@ impl Default for ReportedUsagePathPolicy {
     fn default() -> Self {
         Self {
             enabled: true,
-            input: ReportedUsageFieldPolicy::preserve(),
-            output: ReportedUsageFieldPolicy::preserve(),
+            input: ReportedUsageFieldPolicy::raw(),
+            output: ReportedUsageFieldPolicy::raw(),
             cache_read: ReportedUsageFieldPolicy::preserve(),
             cache_creation: ReportedUsageFieldPolicy::preserve(),
         }
@@ -974,7 +982,7 @@ mod tests {
                 "apiKey": "sk-test",
                 "reportedUsage": {
                     "default": {
-                        "input": { "mode": "preserve" }
+                        "input": { "mode": "raw" }
                     },
                     "pathOverrides": {
                         "cc": {
@@ -994,6 +1002,14 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(
+            config
+                .reported_usage
+                .policy_for_path("/v1/messages")
+                .input
+                .mode,
+            ReportedUsageFieldMode::Raw
+        );
         let policy = config.reported_usage.policy_for_path("/cc/v1/messages");
         assert_eq!(policy.input.mode, ReportedUsageFieldMode::SampleMax);
         assert_eq!(policy.input.max_tokens, 64);
@@ -1039,7 +1055,7 @@ mod tests {
 
         assert_eq!(
             reported_usage.policy_for_path("/v1/messages").input.mode,
-            ReportedUsageFieldMode::Preserve
+            ReportedUsageFieldMode::Raw
         );
         assert_eq!(
             reported_usage

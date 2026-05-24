@@ -264,7 +264,7 @@ export interface AdminAuditLogPageQuery {
 
 export type CompatProfile = 'claude-code' | 'anthropic-strict' | 'debug'
 
-export type ReportedUsageFieldMode = 'preserve' | 'sample-max' | 'sample-target'
+export type ReportedUsageFieldMode = 'raw' | 'preserve' | 'sample-max' | 'sample-target'
 
 export interface ReportedUsageFieldPolicy {
   mode: ReportedUsageFieldMode
