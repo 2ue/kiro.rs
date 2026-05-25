@@ -8,6 +8,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use crate::kiro::call_trace::{KiroCredentialAttempt, summarize_attempts};
 use crate::storage::postgres::PostgresUsageStore;
 
 const DEFAULT_QUERY_LIMIT: usize = 100;
@@ -101,6 +102,8 @@ pub struct UsageRecord {
     pub simulated: bool,
     pub sticky_bound: bool,
     pub fallback_from_sticky: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credential_attempts: Vec<KiroCredentialAttempt>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -678,6 +681,7 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
     let source = usage_source_value(record.usage_source);
     let credential_id = record.credential_id.map(|id| id.to_string());
     let estimated_cost = record.estimated_cost_usd.to_string();
+    let attempt_chain = summarize_attempts(&record.credential_attempts);
 
     [
         Some(record.id.as_str()),
@@ -693,6 +697,7 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
         record.error_detail.as_deref(),
         record.pricing_model.as_deref(),
         Some(estimated_cost.as_str()),
+        Some(attempt_chain.as_str()),
         credential_id.as_deref(),
     ]
     .into_iter()
@@ -775,6 +780,7 @@ mod tests {
             simulated: source.is_simulated(),
             sticky_bound: false,
             fallback_from_sticky: false,
+            credential_attempts: Vec::new(),
             error_type: None,
             error_message: None,
             error_detail: None,
@@ -918,6 +924,38 @@ mod tests {
         });
         assert_eq!(by_error.total, 1);
         assert_eq!(by_error.records[0].id, "2");
+
+        let mut chained = record("3", 30, UsageSource::LocalPromptCache);
+        chained.credential_attempts = vec![
+            KiroCredentialAttempt::new(
+                0,
+                6,
+                Some("first@example.com".to_string()),
+                Some(reqwest::StatusCode::TOO_MANY_REQUESTS),
+                "transient_retry",
+                Some("transient_error"),
+                Some("429 Too Many Requests".to_string()),
+                10,
+            ),
+            KiroCredentialAttempt::new(
+                1,
+                9,
+                Some("second@example.com".to_string()),
+                Some(reqwest::StatusCode::OK),
+                "success",
+                None::<&str>,
+                None::<String>,
+                20,
+            ),
+        ];
+        recorder.record(chained);
+
+        let by_chain = recorder.query(UsageRecordQuery {
+            q: Some("#6(429)>#9(200)".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(by_chain.total, 1);
+        assert_eq!(by_chain.records[0].id, "3");
     }
 
     #[test]

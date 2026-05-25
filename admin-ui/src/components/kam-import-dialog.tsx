@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react'
 import { toast } from 'sonner'
-import { CheckCircle2, XCircle, AlertCircle, Loader2 } from 'lucide-react'
+import { CheckCircle2, XCircle, AlertCircle, Loader2, FileUp } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -143,6 +143,26 @@ function parseKamJson(raw: string): KamAccount[] {
   return validAccounts
 }
 
+async function parseKamFiles(files: File[]): Promise<{ accounts: KamAccount[]; errors: string[] }> {
+  const accounts: KamAccount[] = []
+  const errors: string[] = []
+
+  for (const file of files) {
+    try {
+      const parsed = parseKamJson(await file.text())
+      if (parsed.length === 0) {
+        errors.push(`${file.name}: 未找到有效账号`)
+      } else {
+        accounts.push(...parsed)
+      }
+    } catch (error) {
+      errors.push(`${file.name}: ${extractErrorMessage(error)}`)
+    }
+  }
+
+  return { accounts, errors }
+}
+
 export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
   const [importing, setImporting] = useState(false)
@@ -174,6 +194,35 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
+  }
+
+  const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || [])
+    event.target.value = ''
+    if (files.length === 0) {
+      return
+    }
+
+    const result = await parseKamFiles(files)
+    if (result.accounts.length > 0) {
+      const current = jsonInput.trim()
+      let existing: KamAccount[] = []
+      if (current) {
+        try {
+          existing = parseKamJson(current)
+        } catch {
+          existing = []
+        }
+      }
+      setJsonInput(JSON.stringify({ accounts: [...existing, ...result.accounts] }, null, 2))
+      toast.success(`已从 ${files.length} 个文件读取 ${result.accounts.length} 个账号`)
+    }
+    if (result.errors.length > 0) {
+      toast.warning(`部分文件未读取: ${result.errors.slice(0, 3).join('；')}`)
+    }
+    if (result.accounts.length === 0 && result.errors.length === 0) {
+      toast.error('没有读取到有效账号')
+    }
   }
 
   const handleImport = async () => {
@@ -421,14 +470,33 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
           <div className="space-y-2">
-            <label className="text-sm font-medium">KAM 导出 JSON</label>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <label className="text-sm font-medium">KAM 导出 JSON</label>
+              <Button type="button" variant="outline" size="sm" disabled={importing} asChild>
+                <label className="cursor-pointer">
+                  <FileUp className="h-4 w-4 mr-2" />
+                  选择文件
+                  <input
+                    type="file"
+                    accept=".json,.jsonl,.txt,application/json"
+                    multiple
+                    className="hidden"
+                    onChange={handleFileSelect}
+                    disabled={importing}
+                  />
+                </label>
+              </Button>
+            </div>
             <textarea
-              placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1"\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
+              placeholder={'粘贴 Kiro Account Manager 导出的 JSON，或选择一个/多个文件\n\n每个文件可以包含单个账号，也可以包含 accounts 数组或账号数组。\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1"\n  }\n]\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
               className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
+            <p className="text-xs text-muted-foreground">
+              支持单选或多选文件，每个文件可包含单个账号或多个账号。
+            </p>
           </div>
 
           {/* 解析预览 */}

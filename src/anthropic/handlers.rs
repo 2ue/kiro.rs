@@ -46,6 +46,7 @@ use super::types::{
 };
 use super::usage::{UsageRecord, UsageRecordStatus, UsageSource};
 use super::websearch;
+use crate::kiro::call_trace::KiroCredentialAttempt;
 use crate::kiro::provider::{KiroProvider, KiroStreamCompletion};
 
 const MAX_REMOTE_MULTIMODAL_BYTES: usize = 20 * 1024 * 1024;
@@ -83,6 +84,7 @@ struct CredentialUsageContext {
     credential_label: Option<String>,
     sticky_bound: bool,
     fallback_from_sticky: bool,
+    credential_attempts: Vec<KiroCredentialAttempt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,6 +187,7 @@ impl RequestUsageContext {
         credential_label: Option<String>,
         sticky_bound: bool,
         fallback_from_sticky: bool,
+        credential_attempts: Vec<KiroCredentialAttempt>,
     ) -> CredentialUsageContext {
         CredentialUsageContext {
             request: self,
@@ -192,6 +195,7 @@ impl RequestUsageContext {
             credential_label,
             sticky_bound,
             fallback_from_sticky,
+            credential_attempts,
         }
     }
 
@@ -199,13 +203,30 @@ impl RequestUsageContext {
         self,
         provider: &crate::kiro::provider::KiroProvider,
         error_message: &str,
+        credential_attempts: Vec<KiroCredentialAttempt>,
     ) -> CredentialUsageContext {
         let hint = extract_credential_error_hint(error_message);
-        let credential_id = hint.as_ref().map(|hint| hint.id);
-        let credential_label =
-            hint.and_then(|hint| provider.credential_label(hint.id).or(hint.label));
+        let attempt_hint = credential_attempts.last();
+        let credential_id = hint
+            .as_ref()
+            .map(|hint| hint.id)
+            .or_else(|| attempt_hint.map(|attempt| attempt.credential_id));
+        let credential_label = credential_id
+            .and_then(|id| {
+                provider
+                    .credential_label(id)
+                    .or_else(|| hint.as_ref().and_then(|hint| hint.label.clone()))
+                    .or_else(|| attempt_hint.and_then(|attempt| attempt.credential_label.clone()))
+            })
+            .or_else(|| hint.and_then(|hint| hint.label));
 
-        self.attach_credential(credential_id, credential_label, false, false)
+        self.attach_credential(
+            credential_id,
+            credential_label,
+            false,
+            false,
+            credential_attempts,
+        )
     }
 
     fn reported_cache_usage_policy(&self) -> Option<super::cache::ReportedCacheUsagePolicy> {
@@ -544,6 +565,7 @@ impl CredentialUsageContext {
             simulated: usage_source.is_simulated(),
             sticky_bound: self.sticky_bound,
             fallback_from_sticky: self.fallback_from_sticky,
+            credential_attempts: self.credential_attempts.clone(),
             error_type,
             error_message,
             error_detail,
@@ -1084,6 +1106,7 @@ fn prepare_credential_usage_context(
     credential_id: u64,
     sticky_bound: bool,
     fallback_from_sticky: bool,
+    credential_attempts: Vec<KiroCredentialAttempt>,
 ) -> CredentialUsageContext {
     let mut usage_context = usage_context;
     if matches!(
@@ -1121,6 +1144,7 @@ fn prepare_credential_usage_context(
         credential_label(provider, credential_id),
         sticky_bound,
         fallback_from_sticky,
+        credential_attempts,
     )
 }
 
@@ -1499,25 +1523,31 @@ async fn handle_stream_request(
     warnings_header: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let response = match provider.call_api_stream(request_body).await {
+    let request_id = usage_context.request_id.clone();
+    let response = match provider
+        .call_api_stream_with_request_id(request_body, Some(&request_id))
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             let message = e.to_string();
-            let request_id = usage_context.request_id.clone();
+            let attempts = KiroProvider::attempts_from_error(&e);
             log_provider_call_failure(&message);
             usage_context
-                .attach_provider_error_credential(&provider, &message)
+                .attach_provider_error_credential(&provider, &message, attempts)
                 .record_failure(UsageRecordStatus::Error, "api_error", message);
             return map_provider_error(e, Some(&request_id));
         }
     };
     let (response, completion) = response.into_parts();
+    let credential_attempts = completion.attempts().to_vec();
     let credential_usage = prepare_credential_usage_context(
         usage_context,
         &provider,
         completion.credential_id(),
         completion.sticky_bound(),
         completion.fallback_from_sticky(),
+        credential_attempts,
     );
 
     // 创建流处理上下文
@@ -1742,24 +1772,30 @@ async fn handle_non_stream_request(
     warnings_header: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let api_response = match provider.call_api_with_context(request_body).await {
+    let request_id = usage_context.request_id.clone();
+    let api_response = match provider
+        .call_api_with_context_with_request_id(request_body, Some(&request_id))
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             let message = e.to_string();
-            let request_id = usage_context.request_id.clone();
+            let attempts = KiroProvider::attempts_from_error(&e);
             log_provider_call_failure(&message);
             usage_context
-                .attach_provider_error_credential(&provider, &message)
+                .attach_provider_error_credential(&provider, &message, attempts)
                 .record_failure(UsageRecordStatus::Error, "api_error", message);
             return map_provider_error(e, Some(&request_id));
         }
     };
+    let credential_attempts = api_response.attempts().to_vec();
     let credential_usage = prepare_credential_usage_context(
         usage_context,
         &provider,
         api_response.credential_id(),
         api_response.sticky_bound(),
         api_response.fallback_from_sticky(),
+        credential_attempts,
     );
     let (response, completion) = api_response.into_parts();
 
@@ -2736,7 +2772,7 @@ mod tests {
             started_at: Instant::now(),
         };
         usage_context
-            .attach_credential(Some(hint.id), hint.label, false, false)
+            .attach_credential(Some(hint.id), hint.label, false, false, Vec::new())
             .record_failure(UsageRecordStatus::Error, "api_error", "upstream failed");
 
         let records = usage_recorder.query(Default::default()).records;
@@ -2798,7 +2834,7 @@ mod tests {
             simulated_source: Some(UsageSource::LocalPromptCache),
             started_at: Instant::now(),
         }
-        .attach_credential(Some(1), None, false, false);
+        .attach_credential(Some(1), None, false, false, Vec::new());
         let usage = CacheUsage {
             total_input_tokens: 4096,
             input_tokens: 128,
@@ -2874,7 +2910,7 @@ mod tests {
             simulated_source: Some(UsageSource::LocalPromptCache),
             started_at: Instant::now(),
         }
-        .attach_credential(Some(1), None, false, false);
+        .attach_credential(Some(1), None, false, false, Vec::new());
         let metadata = MetadataTokenUsage {
             uncached_input_tokens: 4096,
             output_tokens: 1,
@@ -3158,7 +3194,7 @@ mod tests {
         usage_context.simulated_source = usage_context
             .simulated_usage
             .map(|_| UsageSource::LocalPromptCache);
-        usage_context.attach_credential(Some(credential_id), None, false, false)
+        usage_context.attach_credential(Some(credential_id), None, false, false, Vec::new())
     }
 
     #[test]

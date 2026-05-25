@@ -93,6 +93,43 @@ function statusLabel(status: string): string {
   }
 }
 
+function attemptActionLabel(action: string): string {
+  switch (action) {
+    case 'success':
+      return '成功'
+    case 'retry':
+    case 'transient_retry':
+      return '重试'
+    case 'fail':
+      return '失败'
+    case 'disable_and_retry':
+      return '禁用后重试'
+    case 'failure_count_and_retry':
+      return '计失败后重试'
+    case 'force_refresh_and_retry':
+      return '刷新后重试'
+    default:
+      return action || '-'
+  }
+}
+
+function attemptOutcomeLabel(record: NonNullable<UsageRecord['credentialAttempts']>[number]): string {
+  if (typeof record.status === 'number') {
+    return String(record.status)
+  }
+  if (record.errorType) {
+    return record.errorType
+  }
+  return attemptActionLabel(record.action)
+}
+
+function formatAttemptChain(record: UsageRecord): string {
+  const attempts = record.credentialAttempts || []
+  return attempts
+    .map((attempt) => `#${attempt.credentialId}(${attemptOutcomeLabel(attempt)})`)
+    .join(' > ')
+}
+
 export function UsageRecordsPanel() {
   const [searchText, setSearchText] = useState('')
   const [model, setModel] = useState('')
@@ -248,12 +285,12 @@ export function UsageRecordsPanel() {
         </Card>
         <Card>
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">Cache Read</CardTitle>
+            <CardTitle className="text-sm font-medium text-muted-foreground">缓存读取</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">{formatNumber(summaryData?.totalCacheReadInputTokens || 0)}</div>
             <div className="text-xs text-muted-foreground">
-              local read {formatPercent(localReadRatio)} / cached {formatPercent(localCachedRatio)}
+              本地读取 {formatPercent(localReadRatio)} / 总缓存 {formatPercent(localCachedRatio)}
             </div>
           </CardContent>
         </Card>
@@ -263,7 +300,7 @@ export function UsageRecordsPanel() {
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">{formatUsd(summaryData?.totalEstimatedCostUsd || 0)}</div>
-            <div className="text-xs text-muted-foreground">priced {formatPercent(pricedRatio)}</div>
+            <div className="text-xs text-muted-foreground">已计价 {formatPercent(pricedRatio)}</div>
           </CardContent>
         </Card>
       </div>
@@ -276,7 +313,7 @@ export function UsageRecordsPanel() {
               <Badge variant={pricingStatus?.lastError ? 'warning' : 'secondary'}>
                 {pricingStatus?.source || 'loading'}
               </Badge>
-              <Badge variant="outline">{formatNumber(pricingStatus?.modelCount || 0)} models</Badge>
+              <Badge variant="outline">{formatNumber(pricingStatus?.modelCount || 0)} 个模型</Badge>
               {pricingStatus?.lastSyncedAt && (
                 <span className="text-muted-foreground">同步 {formatDate(pricingStatus.lastSyncedAt)}</span>
               )}
@@ -385,7 +422,7 @@ export function UsageRecordsPanel() {
 
       <Card>
         <CardHeader className="pb-3">
-          <CardTitle className="text-base">Usage 记录</CardTitle>
+          <CardTitle className="text-base">使用记录</CardTitle>
         </CardHeader>
         <CardContent>
           {records.isLoading ? (
@@ -407,13 +444,13 @@ export function UsageRecordsPanel() {
                     <th className="px-3 py-2 font-medium">会话</th>
                     <th className="px-3 py-2 font-medium">来源</th>
                     <th className="px-3 py-2 font-medium">状态</th>
-                    <th className="px-3 py-2 font-medium text-right">Total In</th>
-                    <th className="px-3 py-2 font-medium text-right">Compat In</th>
-                    <th className="px-3 py-2 font-medium text-right">Billable In</th>
-                    <th className="px-3 py-2 font-medium text-right">Cache Read</th>
-                    <th className="px-3 py-2 font-medium text-right">Cache Create</th>
-                    <th className="px-3 py-2 font-medium text-right">Read %</th>
-                    <th className="px-3 py-2 font-medium text-right">Cached %</th>
+                    <th className="px-3 py-2 font-medium text-right">总输入</th>
+                    <th className="px-3 py-2 font-medium text-right">上报输入</th>
+                    <th className="px-3 py-2 font-medium text-right">计费输入</th>
+                    <th className="px-3 py-2 font-medium text-right">缓存读取</th>
+                    <th className="px-3 py-2 font-medium text-right">缓存写入</th>
+                    <th className="px-3 py-2 font-medium text-right">读取率</th>
+                    <th className="px-3 py-2 font-medium text-right">缓存率</th>
                     <th className="px-3 py-2 font-medium text-right">输出</th>
                     <th className="px-3 py-2 font-medium text-right">费用</th>
                     <th className="px-3 py-2 font-medium text-right">耗时</th>
@@ -430,6 +467,7 @@ export function UsageRecordsPanel() {
                       record.cacheReadInputTokens + record.cacheCreationInputTokens,
                       record.totalInputTokens
                     )
+                    const attemptChain = formatAttemptChain(record)
 
                     return (
                     <tr key={record.id} className="border-b last:border-0">
@@ -440,6 +478,16 @@ export function UsageRecordsPanel() {
                           <div className="max-w-[240px] truncate text-xs text-muted-foreground" title={credentialLabel}>
                             {credentialLabel}
                           </div>
+                        )}
+                        {attemptChain && (
+                          <button
+                            type="button"
+                            className="mt-1 block max-w-[260px] truncate text-left text-xs text-muted-foreground underline-offset-2 hover:underline"
+                            onClick={() => setSelectedRecord(record)}
+                            title={attemptChain}
+                          >
+                            链路 {attemptChain}
+                          </button>
                         )}
                       </td>
                       <td className="px-3 py-2">
@@ -495,13 +543,13 @@ export function UsageRecordsPanel() {
                       <td className="px-3 py-2 text-right">
                         <div className="flex items-center justify-end gap-2">
                           <span>{formatNumber(record.durationMs)}ms</span>
-                          {(record.errorMessage || record.errorDetail) && (
+                          {(record.errorMessage || record.errorDetail || attemptChain) && (
                             <Button
                               variant="ghost"
                               size="icon"
                               className="h-7 w-7"
                               onClick={() => setSelectedRecord(record)}
-                              title="查看错误详情"
+                              title="查看详情"
                             >
                               <Eye className="h-4 w-4" />
                             </Button>
@@ -542,9 +590,9 @@ export function UsageRecordsPanel() {
       </Card>
 
       <Dialog open={Boolean(selectedRecord)} onOpenChange={(open) => !open && setSelectedRecord(null)}>
-        <DialogContent className="max-w-3xl">
+        <DialogContent className="max-h-[85vh] max-w-4xl overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>Usage 详情</DialogTitle>
+            <DialogTitle>使用详情</DialogTitle>
           </DialogHeader>
           {selectedRecord && (
             <div className="space-y-4">
@@ -587,6 +635,51 @@ export function UsageRecordsPanel() {
                   </div>
                 </div>
               </div>
+              {(selectedRecord.credentialAttempts || []).length > 0 && (
+                <div>
+                  <div className="mb-2 text-sm font-medium">调用链路</div>
+                  <div className="mb-2 rounded-md border bg-muted px-3 py-2 font-mono text-xs">
+                    {formatAttemptChain(selectedRecord)}
+                  </div>
+                  <div className="overflow-x-auto rounded-md border">
+                    <table className="w-full min-w-[760px] text-xs">
+                      <thead className="bg-muted text-muted-foreground">
+                        <tr className="text-left">
+                          <th className="px-3 py-2 font-medium">顺序</th>
+                          <th className="px-3 py-2 font-medium">账号</th>
+                          <th className="px-3 py-2 font-medium">状态</th>
+                          <th className="px-3 py-2 font-medium">动作</th>
+                          <th className="px-3 py-2 font-medium text-right">耗时</th>
+                          <th className="px-3 py-2 font-medium">错误</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {(selectedRecord.credentialAttempts || []).map((attempt) => (
+                          <tr key={`${attempt.attempt}-${attempt.credentialId}-${attempt.durationMs}`} className="border-t">
+                            <td className="px-3 py-2">{attempt.attempt}</td>
+                            <td className="px-3 py-2">
+                              <div className="font-medium">#{attempt.credentialId}</div>
+                              {attempt.credentialLabel && (
+                                <div className="max-w-[220px] truncate text-muted-foreground" title={attempt.credentialLabel}>
+                                  {attempt.credentialLabel}
+                                </div>
+                              )}
+                            </td>
+                            <td className="px-3 py-2">{attempt.statusText || attempt.status || '-'}</td>
+                            <td className="px-3 py-2">{attemptActionLabel(attempt.action)}</td>
+                            <td className="px-3 py-2 text-right">{formatNumber(attempt.durationMs)}ms</td>
+                            <td className="px-3 py-2">
+                              <div className="max-w-[280px] truncate" title={attempt.errorMessage || attempt.errorType || ''}>
+                                {attempt.errorMessage || attempt.errorType || '-'}
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
               <div>
                 <div className="mb-2 text-sm font-medium">错误详情</div>
                 <pre className="max-h-[360px] overflow-auto rounded-md border bg-muted p-3 text-xs whitespace-pre-wrap break-words">

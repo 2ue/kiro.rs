@@ -13,10 +13,11 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::call_trace::{KiroCallError, KiroCredentialAttempt, summarize_attempts};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::{KiroAvailableModel, KiroAvailableModelsResponse};
@@ -65,6 +66,7 @@ struct ApiCallResponse {
     session_id: Option<String>,
     sticky_bound: bool,
     fallback_from_sticky: bool,
+    attempts: Vec<KiroCredentialAttempt>,
 }
 
 /// 非流式调用完成上报器。
@@ -78,6 +80,7 @@ pub struct KiroApiCompletion {
     session_id: Option<String>,
     sticky_bound: bool,
     fallback_from_sticky: bool,
+    attempts: Vec<KiroCredentialAttempt>,
     reported: AtomicBool,
 }
 
@@ -89,6 +92,7 @@ impl KiroApiCompletion {
         session_id: Option<String>,
         sticky_bound: bool,
         fallback_from_sticky: bool,
+        attempts: Vec<KiroCredentialAttempt>,
     ) -> Self {
         Self {
             token_manager,
@@ -97,6 +101,7 @@ impl KiroApiCompletion {
             session_id,
             sticky_bound,
             fallback_from_sticky,
+            attempts,
             reported: AtomicBool::new(false),
         }
     }
@@ -129,6 +134,10 @@ impl KiroApiCompletion {
     pub fn fallback_from_sticky(&self) -> bool {
         self.fallback_from_sticky
     }
+
+    pub fn attempts(&self) -> &[KiroCredentialAttempt] {
+        &self.attempts
+    }
 }
 
 impl Drop for KiroApiCompletion {
@@ -153,6 +162,10 @@ impl KiroApiResponse {
         self.completion.fallback_from_sticky()
     }
 
+    pub fn attempts(&self) -> &[KiroCredentialAttempt] {
+        self.completion.attempts()
+    }
+
     pub fn into_parts(self) -> (reqwest::Response, KiroApiCompletion) {
         (self.response, self.completion)
     }
@@ -169,6 +182,7 @@ pub struct KiroStreamCompletion {
     session_id: Option<String>,
     sticky_bound: bool,
     fallback_from_sticky: bool,
+    attempts: Vec<KiroCredentialAttempt>,
     reported: AtomicBool,
 }
 
@@ -180,6 +194,7 @@ impl KiroStreamCompletion {
         session_id: Option<String>,
         sticky_bound: bool,
         fallback_from_sticky: bool,
+        attempts: Vec<KiroCredentialAttempt>,
     ) -> Self {
         Self {
             token_manager,
@@ -188,6 +203,7 @@ impl KiroStreamCompletion {
             session_id,
             sticky_bound,
             fallback_from_sticky,
+            attempts,
             reported: AtomicBool::new(false),
         }
     }
@@ -232,6 +248,10 @@ impl KiroStreamCompletion {
 
     pub fn fallback_from_sticky(&self) -> bool {
         self.fallback_from_sticky
+    }
+
+    pub fn attempts(&self) -> &[KiroCredentialAttempt] {
+        &self.attempts
     }
 }
 
@@ -359,6 +379,7 @@ mod tests {
             Some("session".into()),
             false,
             false,
+            Vec::new(),
         );
 
         completion.report_success();
@@ -383,6 +404,7 @@ mod tests {
             Some("session".into()),
             false,
             false,
+            Vec::new(),
         );
 
         completion.report_soft_failure();
@@ -410,6 +432,7 @@ mod tests {
                 Some("session".into()),
                 false,
                 false,
+                Vec::new(),
             );
         }
 
@@ -435,6 +458,7 @@ mod tests {
             Some("session".into()),
             false,
             false,
+            Vec::new(),
         );
         completion.report_success();
         completion.report_success();
@@ -547,6 +571,69 @@ impl KiroProvider {
         }
     }
 
+    pub fn attempts_from_error(err: &anyhow::Error) -> Vec<KiroCredentialAttempt> {
+        err.downcast_ref::<KiroCallError>()
+            .map(|err| err.attempts().to_vec())
+            .unwrap_or_default()
+    }
+
+    fn traced_error(
+        message: impl Into<String>,
+        attempts: &[KiroCredentialAttempt],
+    ) -> anyhow::Error {
+        KiroCallError::new(message, attempts.to_vec()).into()
+    }
+
+    fn push_attempt(
+        attempts: &mut Vec<KiroCredentialAttempt>,
+        attempt: usize,
+        credential_id: u64,
+        credential_label: &str,
+        status: Option<reqwest::StatusCode>,
+        action: &str,
+        error_type: Option<&str>,
+        error_message: Option<String>,
+        started_at: Instant,
+    ) {
+        attempts.push(KiroCredentialAttempt::new(
+            attempt,
+            credential_id,
+            Some(credential_label.to_string()),
+            status,
+            action,
+            error_type,
+            error_message,
+            started_at.elapsed().as_millis() as u64,
+        ));
+    }
+
+    fn log_attempt_chain(
+        request_id: Option<&str>,
+        api_type: &str,
+        attempts: &[KiroCredentialAttempt],
+        outcome: &str,
+    ) {
+        if attempts.is_empty() {
+            return;
+        }
+        let chain = summarize_attempts(attempts);
+        match request_id {
+            Some(request_id) => tracing::info!(
+                request_id,
+                api_type,
+                outcome,
+                credential_chain = %chain,
+                "Kiro API 凭据调用链路"
+            ),
+            None => tracing::info!(
+                api_type,
+                outcome,
+                credential_chain = %chain,
+                "Kiro API 凭据调用链路"
+            ),
+        }
+    }
+
     /// 根据凭据选择 endpoint 实现
     fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
         let name = credentials
@@ -618,7 +705,18 @@ impl KiroProvider {
         &self,
         request_body: &str,
     ) -> anyhow::Result<KiroApiResponse> {
-        let result = self.call_api_with_retry(request_body, false).await?;
+        self.call_api_with_context_with_request_id(request_body, None)
+            .await
+    }
+
+    pub async fn call_api_with_context_with_request_id(
+        &self,
+        request_body: &str,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<KiroApiResponse> {
+        let result = self
+            .call_api_with_retry(request_body, false, request_id)
+            .await?;
         Ok(KiroApiResponse {
             response: result.response,
             completion: KiroApiCompletion::new(
@@ -628,6 +726,7 @@ impl KiroProvider {
                 result.session_id,
                 result.sticky_bound,
                 result.fallback_from_sticky,
+                result.attempts,
             ),
         })
     }
@@ -700,6 +799,7 @@ impl KiroProvider {
                     None,
                     false,
                     false,
+                    Vec::new(),
                 ),
             });
         }
@@ -800,8 +900,20 @@ impl KiroProvider {
     }
 
     /// 发送流式 API 请求
+    #[allow(dead_code)]
     pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<KiroStreamResponse> {
-        let result = self.call_api_with_retry(request_body, true).await?;
+        self.call_api_stream_with_request_id(request_body, None)
+            .await
+    }
+
+    pub async fn call_api_stream_with_request_id(
+        &self,
+        request_body: &str,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<KiroStreamResponse> {
+        let result = self
+            .call_api_with_retry(request_body, true, request_id)
+            .await?;
         Ok(KiroStreamResponse {
             response: result.response,
             completion: KiroStreamCompletion::new(
@@ -811,6 +923,7 @@ impl KiroProvider {
                 result.session_id,
                 result.sticky_bound,
                 result.fallback_from_sticky,
+                result.attempts,
             ),
         })
     }
@@ -1157,12 +1270,14 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
+        request_id: Option<&str>,
     ) -> anyhow::Result<ApiCallResponse> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
+        let mut attempts: Vec<KiroCredentialAttempt> = Vec::new();
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
@@ -1200,6 +1315,7 @@ impl KiroProvider {
             });
             let credential_label = self.credential_log_label(ctx.id);
             let credential_context = format!("凭据 {}", credential_label);
+            let attempt_started_at = Instant::now();
 
             let config = self.token_manager.runtime_config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
@@ -1207,12 +1323,22 @@ impl KiroProvider {
             let endpoint = match self.endpoint_for(&ctx.credentials) {
                 Ok(e) => e,
                 Err(e) => {
-                    last_error = Some(anyhow::anyhow!(
+                    let message = format!(
                         "{} API 凭据 endpoint 解析失败（{}）: {}",
-                        api_type,
-                        credential_context,
-                        e
-                    ));
+                        api_type, credential_context, e
+                    );
+                    Self::push_attempt(
+                        &mut attempts,
+                        attempt,
+                        ctx.id,
+                        &credential_label,
+                        None,
+                        "retry",
+                        Some("endpoint_error"),
+                        Some(message.clone()),
+                        attempt_started_at,
+                    );
+                    last_error = Some(anyhow::anyhow!(message));
                     if let Some(session_id) = conversation_id.as_deref() {
                         self.token_manager
                             .unbind_session_if_bound_to(session_id, ctx.id);
@@ -1246,13 +1372,24 @@ impl KiroProvider {
             let client = match self.client_for(&ctx.credentials) {
                 Ok(client) => client,
                 Err(e) => {
-                    self.finish_attempt(&mut ctx);
-                    anyhow::bail!(
+                    let message = format!(
                         "{} API 创建 HTTP client 失败（{}）: {}",
-                        api_type,
-                        credential_context,
-                        e
+                        api_type, credential_context, e
                     );
+                    Self::push_attempt(
+                        &mut attempts,
+                        attempt,
+                        ctx.id,
+                        &credential_label,
+                        None,
+                        "fail",
+                        Some("client_error"),
+                        Some(message.clone()),
+                        attempt_started_at,
+                    );
+                    Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                    self.finish_attempt(&mut ctx);
+                    return Err(Self::traced_error(message, &attempts));
                 }
             };
             let base = client
@@ -1265,6 +1402,10 @@ impl KiroProvider {
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
+                    let message = format!(
+                        "{} API 请求发送失败（{}）: {}",
+                        api_type, credential_context, e
+                    );
                     tracing::warn!(
                         credential_id = ctx.id,
                         credential_label = %credential_label,
@@ -1276,12 +1417,18 @@ impl KiroProvider {
                     );
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
-                    last_error = Some(anyhow::anyhow!(
-                        "{} API 请求发送失败（{}）: {}",
-                        api_type,
-                        credential_context,
-                        e
-                    ));
+                    Self::push_attempt(
+                        &mut attempts,
+                        attempt,
+                        ctx.id,
+                        &credential_label,
+                        None,
+                        "retry",
+                        Some("send_error"),
+                        Some(message.clone()),
+                        attempt_started_at,
+                    );
+                    last_error = Some(anyhow::anyhow!(message));
                     self.maybe_exclude_after_soft_failure(
                         conversation_id.as_deref(),
                         model.as_deref(),
@@ -1324,13 +1471,9 @@ impl KiroProvider {
                         body
                     );
 
-                    let err = anyhow::anyhow!(
+                    let message = format!(
                         "{} API 返回非 eventstream 响应（{}）: content-type={}, exception={:?}, body={}",
-                        api_type,
-                        credential_context,
-                        content_type,
-                        exception,
-                        body
+                        api_type, credential_context, content_type, exception, body
                     );
 
                     if attempt + 1 < max_retries
@@ -1338,6 +1481,17 @@ impl KiroProvider {
                             .as_deref()
                             .is_some_and(Self::is_retryable_aws_exception)
                     {
+                        Self::push_attempt(
+                            &mut attempts,
+                            attempt,
+                            ctx.id,
+                            &credential_label,
+                            Some(status),
+                            "retry",
+                            Some("non_eventstream"),
+                            Some(message.clone()),
+                            attempt_started_at,
+                        );
                         self.maybe_exclude_after_soft_failure(
                             conversation_id.as_deref(),
                             model.as_deref(),
@@ -1345,14 +1499,26 @@ impl KiroProvider {
                             &credential_label,
                             &mut excluded_ids,
                         );
-                        last_error = Some(err);
+                        last_error = Some(anyhow::anyhow!(message));
                         self.finish_attempt(&mut ctx);
                         sleep(Self::retry_delay(attempt)).await;
                         continue;
                     }
 
+                    Self::push_attempt(
+                        &mut attempts,
+                        attempt,
+                        ctx.id,
+                        &credential_label,
+                        Some(status),
+                        "fail",
+                        Some("non_eventstream"),
+                        Some(message.clone()),
+                        attempt_started_at,
+                    );
+                    Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
                     self.finish_attempt(&mut ctx);
-                    return Err(err);
+                    return Err(Self::traced_error(message, &attempts));
                 }
                 return Ok(ApiCallResponse {
                     response,
@@ -1361,6 +1527,21 @@ impl KiroProvider {
                     session_id: conversation_id.clone(),
                     sticky_bound: ctx.sticky_bound,
                     fallback_from_sticky: ctx.fallback_from_sticky,
+                    attempts: {
+                        Self::push_attempt(
+                            &mut attempts,
+                            attempt,
+                            ctx.id,
+                            &credential_label,
+                            Some(status),
+                            "success",
+                            None::<&str>,
+                            None::<String>,
+                            attempt_started_at,
+                        );
+                        Self::log_attempt_chain(request_id, api_type, &attempts, "success");
+                        attempts
+                    },
                 });
             }
 
@@ -1368,6 +1549,10 @@ impl KiroProvider {
             let body = response.text().await.unwrap_or_default();
 
             if let Some(risk_reason) = Self::detect_risk_control_error(status, &body) {
+                let message = format!(
+                    "{} API 请求失败（{}）: {} {}",
+                    api_type, credential_context, status, body
+                );
                 tracing::error!(
                     credential_id = ctx.id,
                     credential_label = %credential_label,
@@ -1389,28 +1574,47 @@ impl KiroProvider {
                         .unbind_session_if_bound_to(session_id, ctx.id);
                 }
                 if !has_available {
-                    self.finish_attempt(&mut ctx);
-                    anyhow::bail!(
+                    let final_message = format!(
                         "{} API 请求失败（{}，所有凭据已用尽）: {} {}",
-                        api_type,
-                        credential_context,
-                        status,
-                        body
+                        api_type, credential_context, status, body
                     );
+                    Self::push_attempt(
+                        &mut attempts,
+                        attempt,
+                        ctx.id,
+                        &credential_label,
+                        Some(status),
+                        "fail",
+                        Some("risk_control"),
+                        Some(final_message.clone()),
+                        attempt_started_at,
+                    );
+                    Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                    self.finish_attempt(&mut ctx);
+                    return Err(Self::traced_error(final_message, &attempts));
                 }
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败（{}）: {} {}",
-                    api_type,
-                    credential_context,
-                    status,
-                    body
-                ));
+                Self::push_attempt(
+                    &mut attempts,
+                    attempt,
+                    ctx.id,
+                    &credential_label,
+                    Some(status),
+                    "disable_and_retry",
+                    Some("risk_control"),
+                    Some(message.clone()),
+                    attempt_started_at,
+                );
+                last_error = Some(anyhow::anyhow!(message));
                 self.finish_attempt(&mut ctx);
                 continue;
             }
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+                let message = format!(
+                    "{} API 请求失败（{}）: {} {}",
+                    api_type, credential_context, status, body
+                );
                 tracing::warn!(
                     credential_id = ctx.id,
                     credential_label = %credential_label,
@@ -1428,23 +1632,38 @@ impl KiroProvider {
                         .unbind_session_if_bound_to(session_id, ctx.id);
                 }
                 if !has_available {
-                    self.finish_attempt(&mut ctx);
-                    anyhow::bail!(
+                    let final_message = format!(
                         "{} API 请求失败（{}，所有凭据已用尽）: {} {}",
-                        api_type,
-                        credential_context,
-                        status,
-                        body
+                        api_type, credential_context, status, body
                     );
+                    Self::push_attempt(
+                        &mut attempts,
+                        attempt,
+                        ctx.id,
+                        &credential_label,
+                        Some(status),
+                        "fail",
+                        Some("quota_exhausted"),
+                        Some(final_message.clone()),
+                        attempt_started_at,
+                    );
+                    Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                    self.finish_attempt(&mut ctx);
+                    return Err(Self::traced_error(final_message, &attempts));
                 }
 
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败（{}）: {} {}",
-                    api_type,
-                    credential_context,
-                    status,
-                    body
-                ));
+                Self::push_attempt(
+                    &mut attempts,
+                    attempt,
+                    ctx.id,
+                    &credential_label,
+                    Some(status),
+                    "disable_and_retry",
+                    Some("quota_exhausted"),
+                    Some(message.clone()),
+                    attempt_started_at,
+                );
+                last_error = Some(anyhow::anyhow!(message));
                 self.maybe_exclude_after_soft_failure(
                     conversation_id.as_deref(),
                     model.as_deref(),
@@ -1458,18 +1677,32 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
-                self.finish_attempt(&mut ctx);
-                anyhow::bail!(
+                let message = format!(
                     "{} API 请求失败（{}）: {} {}",
-                    api_type,
-                    credential_context,
-                    status,
-                    body
+                    api_type, credential_context, status, body
                 );
+                Self::push_attempt(
+                    &mut attempts,
+                    attempt,
+                    ctx.id,
+                    &credential_label,
+                    Some(status),
+                    "fail",
+                    Some("bad_request"),
+                    Some(message.clone()),
+                    attempt_started_at,
+                );
+                Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                self.finish_attempt(&mut ctx);
+                return Err(Self::traced_error(message, &attempts));
             }
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
             if matches!(status.as_u16(), 401 | 403) {
+                let message = format!(
+                    "{} API 请求失败（{}）: {} {}",
+                    api_type, credential_context, status, body
+                );
                 tracing::warn!(
                     credential_id = ctx.id,
                     credential_label = %credential_label,
@@ -1500,6 +1733,17 @@ impl KiroProvider {
                             credential_label = %credential_label,
                             "凭据 token 强制刷新成功，重试请求"
                         );
+                        Self::push_attempt(
+                            &mut attempts,
+                            attempt,
+                            ctx.id,
+                            &credential_label,
+                            Some(status),
+                            "force_refresh_and_retry",
+                            Some("auth_error"),
+                            Some(message.clone()),
+                            attempt_started_at,
+                        );
                         self.finish_attempt(&mut ctx);
                         continue;
                     }
@@ -1518,23 +1762,38 @@ impl KiroProvider {
                     }
                 }
                 if !has_available {
-                    self.finish_attempt(&mut ctx);
-                    anyhow::bail!(
+                    let final_message = format!(
                         "{} API 请求失败（{}，所有凭据已用尽）: {} {}",
-                        api_type,
-                        credential_context,
-                        status,
-                        body
+                        api_type, credential_context, status, body
                     );
+                    Self::push_attempt(
+                        &mut attempts,
+                        attempt,
+                        ctx.id,
+                        &credential_label,
+                        Some(status),
+                        "fail",
+                        Some("credential_failure"),
+                        Some(final_message.clone()),
+                        attempt_started_at,
+                    );
+                    Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                    self.finish_attempt(&mut ctx);
+                    return Err(Self::traced_error(final_message, &attempts));
                 }
 
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败（{}）: {} {}",
-                    api_type,
-                    credential_context,
-                    status,
-                    body
-                ));
+                Self::push_attempt(
+                    &mut attempts,
+                    attempt,
+                    ctx.id,
+                    &credential_label,
+                    Some(status),
+                    "failure_count_and_retry",
+                    Some("credential_failure"),
+                    Some(message.clone()),
+                    attempt_started_at,
+                );
+                last_error = Some(anyhow::anyhow!(message));
                 self.finish_attempt(&mut ctx);
                 continue;
             }
@@ -1542,6 +1801,10 @@ impl KiroProvider {
             // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
             // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+                let message = format!(
+                    "{} API 请求失败（{}）: {} {}",
+                    api_type, credential_context, status, body
+                );
                 tracing::warn!(
                     credential_id = ctx.id,
                     credential_label = %credential_label,
@@ -1552,26 +1815,36 @@ impl KiroProvider {
                     status,
                     body
                 );
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败（{}）: {} {}",
-                    api_type,
-                    credential_context,
-                    status,
-                    body
-                ));
+                Self::push_attempt(
+                    &mut attempts,
+                    attempt,
+                    ctx.id,
+                    &credential_label,
+                    Some(status),
+                    "transient_retry",
+                    Some("transient_error"),
+                    Some(message.clone()),
+                    attempt_started_at,
+                );
+                last_error = Some(anyhow::anyhow!(message));
                 if let Err(err) = self.token_manager.report_transient_failure(
                     ctx.id,
                     model.as_deref(),
                     retry_after,
                     format!("{} {}", status, body),
                 ) {
-                    self.finish_attempt(&mut ctx);
-                    anyhow::bail!(
+                    let final_message = format!(
                         "{} API 请求失败（{}，调度状态写入失败）: {}",
-                        api_type,
-                        credential_context,
-                        err
+                        api_type, credential_context, err
                     );
+                    if let Some(last) = attempts.last_mut() {
+                        last.action = "fail".to_string();
+                        last.error_type = Some("scheduler_state_error".to_string());
+                        last.error_message = Some(final_message.clone());
+                    }
+                    Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                    self.finish_attempt(&mut ctx);
+                    return Err(Self::traced_error(final_message, &attempts));
                 }
                 self.maybe_exclude_after_soft_failure(
                     conversation_id.as_deref(),
@@ -1589,17 +1862,31 @@ impl KiroProvider {
 
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
             if status.is_client_error() {
-                self.finish_attempt(&mut ctx);
-                anyhow::bail!(
+                let message = format!(
                     "{} API 请求失败（{}）: {} {}",
-                    api_type,
-                    credential_context,
-                    status,
-                    body
+                    api_type, credential_context, status, body
                 );
+                Self::push_attempt(
+                    &mut attempts,
+                    attempt,
+                    ctx.id,
+                    &credential_label,
+                    Some(status),
+                    "fail",
+                    Some("client_error"),
+                    Some(message.clone()),
+                    attempt_started_at,
+                );
+                Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                self.finish_attempt(&mut ctx);
+                return Err(Self::traced_error(message, &attempts));
             }
 
             // 兜底：当作可重试的瞬态错误处理（不切换凭据）
+            let message = format!(
+                "{} API 请求失败（{}）: {} {}",
+                api_type, credential_context, status, body
+            );
             tracing::warn!(
                 credential_id = ctx.id,
                 credential_label = %credential_label,
@@ -1610,13 +1897,18 @@ impl KiroProvider {
                 status,
                 body
             );
-            last_error = Some(anyhow::anyhow!(
-                "{} API 请求失败（{}）: {} {}",
-                api_type,
-                credential_context,
-                status,
-                body
-            ));
+            Self::push_attempt(
+                &mut attempts,
+                attempt,
+                ctx.id,
+                &credential_label,
+                Some(status),
+                "retry",
+                Some("unknown_error"),
+                Some(message.clone()),
+                attempt_started_at,
+            );
+            last_error = Some(anyhow::anyhow!(message));
             self.maybe_exclude_after_soft_failure(
                 conversation_id.as_deref(),
                 model.as_deref(),
@@ -1631,13 +1923,14 @@ impl KiroProvider {
         }
 
         // 所有重试都失败
-        Err(last_error.unwrap_or_else(|| {
-            anyhow::anyhow!(
+        Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+        let message = last_error.map(|err| err.to_string()).unwrap_or_else(|| {
+            format!(
                 "{} API 请求失败：已达到最大重试次数（{}次）",
-                api_type,
-                max_retries
+                api_type, max_retries
             )
-        }))
+        });
+        Err(Self::traced_error(message, &attempts))
     }
 
     /// 从请求体中提取模型信息

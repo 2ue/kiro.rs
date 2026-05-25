@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { CheckCircle2, XCircle, AlertCircle, Loader2 } from 'lucide-react'
+import { CheckCircle2, XCircle, AlertCircle, Loader2, FileUp } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -13,26 +13,15 @@ import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/u
 import { setCredentialDisabled, testCredential } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
+import { parseCredentialImportFiles, parseCredentialImportText } from '@/lib/credential-import'
+import type { AddCredentialRequest } from '@/types/api'
 
 interface BatchImportDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
 }
 
-interface CredentialInput {
-  refreshToken?: string
-  clientId?: string
-  clientSecret?: string
-  email?: string
-  region?: string
-  authRegion?: string
-  apiRegion?: string
-  priority?: number
-  machineId?: string
-  kiroApiKey?: string
-  authMethod?: string
-  endpoint?: string
-}
+type CredentialInput = AddCredentialRequest & { region?: string }
 
 interface VerificationResult {
   index: number
@@ -87,12 +76,44 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     setResults([])
   }
 
+  const appendCredentialsToInput = (credentials: AddCredentialRequest[]) => {
+    const current = jsonInput.trim()
+    let existing: AddCredentialRequest[] = []
+    if (current) {
+      try {
+        existing = parseCredentialImportText(current)
+      } catch {
+        existing = []
+      }
+    }
+    setJsonInput(JSON.stringify([...existing, ...credentials], null, 2))
+  }
+
+  const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || [])
+    event.target.value = ''
+    if (files.length === 0) {
+      return
+    }
+
+    const result = await parseCredentialImportFiles(files)
+    if (result.credentials.length > 0) {
+      appendCredentialsToInput(result.credentials)
+      toast.success(`已从 ${files.length} 个文件读取 ${result.credentials.length} 条凭据`)
+    }
+    if (result.errors.length > 0) {
+      toast.warning(`部分文件未读取: ${result.errors.slice(0, 3).join('；')}`)
+    }
+    if (result.credentials.length === 0 && result.errors.length === 0) {
+      toast.error('没有读取到有效凭据')
+    }
+  }
+
   const handleBatchImport = async () => {
     // 先单独解析 JSON，给出精准的错误提示
     let credentials: CredentialInput[]
     try {
-      const parsed = JSON.parse(jsonInput)
-      credentials = Array.isArray(parsed) ? parsed : [parsed]
+      credentials = parseCredentialImportText(jsonInput)
     } catch (error) {
       toast.error('JSON 格式错误: ' + extractErrorMessage(error))
       return
@@ -237,6 +258,9 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
               machineId: cred.machineId?.trim() || undefined,
+              proxyUrl: cred.proxyUrl?.trim() || undefined,
+              proxyUsername: cred.proxyUsername?.trim() || undefined,
+              proxyPassword: cred.proxyPassword?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
             })
 
@@ -274,7 +298,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           const token = cred.refreshToken!.trim()
           const clientId = cred.clientId?.trim() || undefined
           const clientSecret = cred.clientSecret?.trim() || undefined
-          const authMethod = clientId && clientSecret ? 'idc' : 'social'
+          const authMethod = cred.authMethod === 'idc' || (clientId && clientSecret) ? 'idc' : 'social'
 
           // idc 模式下必须同时提供 clientId 和 clientSecret
           if (authMethod === 'social' && (clientId || clientSecret)) {
@@ -291,6 +315,9 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             clientSecret,
             priority: cred.priority || 0,
             machineId: cred.machineId?.trim() || undefined,
+            proxyUrl: cred.proxyUrl?.trim() || undefined,
+            proxyUsername: cred.proxyUsername?.trim() || undefined,
+            proxyPassword: cred.proxyPassword?.trim() || undefined,
             endpoint: cred.endpoint?.trim() || undefined,
           })
 
@@ -431,18 +458,34 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
           <div className="space-y-2">
-            <label className="text-sm font-medium">
-              JSON 格式凭据
-            </label>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <label className="text-sm font-medium">
+                JSON / JSONL 格式凭据
+              </label>
+              <Button type="button" variant="outline" size="sm" disabled={importing} asChild>
+                <label className="cursor-pointer">
+                  <FileUp className="h-4 w-4 mr-2" />
+                  选择文件
+                  <input
+                    type="file"
+                    accept=".json,.jsonl,.txt,application/json"
+                    multiple
+                    className="hidden"
+                    onChange={handleFileSelect}
+                    disabled={importing}
+                  />
+                </label>
+              </Button>
+            </div>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴 JSON / JSONL 格式的凭据，或选择一个/多个文件\n\n每个文件可以是单个对象、数组、jsonl 多行，或导出的 { "credentials": [...] } / { "accounts": [...] }\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
               className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
             <p className="text-xs text-muted-foreground">
-              💡 导入时自动验活，失败的凭据会被排除
+              支持单选或多选文件。导入时自动验活，失败的凭据会被排除。
             </p>
           </div>
 

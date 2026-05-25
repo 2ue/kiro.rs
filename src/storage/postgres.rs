@@ -1558,6 +1558,7 @@ fn push_usage_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &UsageRec
             "pricing_model",
             "credential_id::text",
             "estimated_cost_usd::text",
+            "data::text",
         ];
         for (index, field) in fields.iter().enumerate() {
             if index > 0 {
@@ -1977,6 +1978,7 @@ mod tests {
             simulated: true,
             sticky_bound: true,
             fallback_from_sticky: false,
+            credential_attempts: Vec::new(),
             error_type: None,
             error_message: None,
             error_detail: None,

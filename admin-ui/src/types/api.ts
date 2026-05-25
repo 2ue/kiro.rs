@@ -147,6 +147,18 @@ export type UsageSource =
   | 'request_estimate'
   | 'none'
 
+export interface KiroCredentialAttempt {
+  attempt: number
+  credentialId: number
+  credentialLabel?: string
+  status?: number
+  statusText?: string
+  action: string
+  errorType?: string
+  errorMessage?: string
+  durationMs: number
+}
+
 export interface UsageRecord {
   id: string
   createdAt: string
@@ -173,6 +185,7 @@ export interface UsageRecord {
   simulated: boolean
   stickyBound: boolean
   fallbackFromSticky: boolean
+  credentialAttempts?: KiroCredentialAttempt[]
   errorType?: string
   errorMessage?: string
   errorDetail?: string

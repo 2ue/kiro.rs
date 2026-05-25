@@ -11,6 +11,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { useAddCredential } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
+import { parseCredentialImportFiles } from '@/lib/credential-import'
 
 interface AddCredentialDialogProps {
   open: boolean
@@ -55,6 +56,60 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   }
 
   const isApiKey = authMethod === 'api_key'
+
+  const fillFromCredential = (credential: {
+    authMethod?: 'social' | 'idc' | 'api_key'
+    refreshToken?: string
+    kiroApiKey?: string
+    authRegion?: string
+    apiRegion?: string
+    clientId?: string
+    clientSecret?: string
+    email?: string
+    priority?: number
+    machineId?: string
+    proxyUrl?: string
+    proxyUsername?: string
+    proxyPassword?: string
+    endpoint?: string
+  }) => {
+    setAuthMethod(credential.authMethod || (credential.kiroApiKey ? 'api_key' : credential.clientId && credential.clientSecret ? 'idc' : 'social'))
+    setRefreshToken(credential.refreshToken || '')
+    setKiroApiKey(credential.kiroApiKey || '')
+    setAuthRegion(credential.authRegion || '')
+    setApiRegion(credential.apiRegion || '')
+    setClientId(credential.clientId || '')
+    setClientSecret(credential.clientSecret || '')
+    setEmail(credential.email || '')
+    setPriority(String(credential.priority ?? 0))
+    setMachineId(credential.machineId || '')
+    setProxyUrl(credential.proxyUrl || '')
+    setProxyUsername(credential.proxyUsername || '')
+    setProxyPassword(credential.proxyPassword || '')
+    setEndpoint(credential.endpoint || '')
+  }
+
+  const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || [])
+    event.target.value = ''
+    if (files.length === 0) {
+      return
+    }
+
+    const result = await parseCredentialImportFiles(files)
+    const first = result.credentials[0]
+    if (!first) {
+      toast.error(result.errors[0] || '文件中没有有效凭据')
+      return
+    }
+
+    fillFromCredential(first)
+    const suffix = result.credentials.length > 1 ? `，已取第一条，另有 ${result.credentials.length - 1} 条可用批量导入` : ''
+    toast.success(`已从文件填充凭据${suffix}`)
+    if (result.errors.length > 0) {
+      toast.warning(`部分文件未读取: ${result.errors.slice(0, 3).join('；')}`)
+    }
+  }
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -117,7 +172,21 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col">
         <DialogHeader>
-          <DialogTitle>添加凭据</DialogTitle>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <DialogTitle>添加凭据</DialogTitle>
+            <Button type="button" variant="outline" size="sm" disabled={isPending} asChild>
+              <label className="cursor-pointer">
+                从文件填充
+                <input
+                  type="file"
+                  accept=".json,.jsonl,.txt,application/json"
+                  className="hidden"
+                  onChange={handleFileSelect}
+                  disabled={isPending}
+                />
+              </label>
+            </Button>
+          </div>
         </DialogHeader>
 
         <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">

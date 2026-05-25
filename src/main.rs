@@ -19,7 +19,13 @@ use std::{
 };
 
 use anyhow::Context as _;
-use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Redirect},
+    routing::get,
+};
 use chrono::Utc;
 use clap::Parser;
 use futures::StreamExt;
@@ -406,6 +412,7 @@ async fn main() {
             tracing::info!("Admin UI 已启用: /admin");
             anthropic_app
                 .nest("/api/admin", admin_app)
+                .route("/admin/", get(admin_ui_index_redirect))
                 .nest("/admin", admin_ui_app)
         }
     } else {
@@ -572,6 +579,10 @@ async fn readyz(State(state): State<Arc<AppHealthState>>) -> impl IntoResponse {
             "lastRedisSubscribeErrorAtMs": state.runtime_events.last_subscribe_error_at_ms.load(Ordering::Acquire)
         })),
     )
+}
+
+async fn admin_ui_index_redirect() -> Redirect {
+    Redirect::permanent("/admin")
 }
 
 fn spawn_redis_runtime_event_listener(
