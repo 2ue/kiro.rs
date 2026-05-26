@@ -30,7 +30,7 @@ import {
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
-  onViewBalance: (id: number) => void
+  onQueryBalance: (id: number) => void
   onTestCredential: (credential: CredentialStatusItem) => void
   selected: boolean
   onToggleSelect: () => void
@@ -77,7 +77,7 @@ function formatUsd(value: number): string {
   }).format(value)
 }
 
-function formatCredits(value: number): string {
+function formatQuota(value: number): string {
   if (!Number.isFinite(value)) return '-'
   return new Intl.NumberFormat('zh-CN', {
     minimumFractionDigits: value >= 1 ? 2 : 6,
@@ -87,7 +87,7 @@ function formatCredits(value: number): string {
 
 export function CredentialCard({
   credential,
-  onViewBalance,
+  onQueryBalance,
   onTestCredential,
   selected,
   onToggleSelect,
@@ -417,14 +417,14 @@ export function CredentialCard({
               </div>
             )}
             <div className="col-span-2">
-              <span className="text-muted-foreground">Credits：</span>
+              <span className="text-muted-foreground">额度：</span>
               {loadingBalance ? (
                 <span className="text-sm ml-1">
                   <Loader2 className="inline w-3 h-3 animate-spin" /> 加载中...
                 </span>
               ) : accountInfo ? (
                 <span className="font-medium ml-1">
-                  {formatCredits(accountInfo.currentUsage)}/{formatCredits(accountInfo.usageLimit)}
+                  {formatQuota(accountInfo.currentUsage)}/{formatQuota(accountInfo.usageLimit)}
                   <span className="text-xs text-muted-foreground ml-1">
                     {formatDateTime(accountInfo.checkedAt)}
                     {accountInfo.nextResetAt ? ` · 重置 ${new Date(accountInfo.nextResetAt * 1000).toLocaleString('zh-CN', { hour12: false })}` : ''}
@@ -534,10 +534,12 @@ export function CredentialCard({
             <Button
               size="sm"
               variant="outline"
-              onClick={() => onViewBalance(credential.id)}
+              onClick={() => onQueryBalance(credential.id)}
+              disabled={loadingBalance || credential.disabled}
+              title={credential.disabled ? '已禁用的凭据无法查询额度' : '查询额度并更新卡片'}
             >
-              <Wallet className="h-4 w-4 mr-1" />
-              Credits
+              {loadingBalance ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Wallet className="h-4 w-4 mr-1" />}
+              {loadingBalance ? '查询中' : '查询额度'}
             </Button>
             <Button
               size="sm"

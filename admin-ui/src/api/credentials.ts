@@ -113,7 +113,7 @@ export async function forceRefreshToken(
   return data
 }
 
-// 获取凭据 Kiro Credits
+// 获取凭据额度
 export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
   const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
   return data

@@ -22,7 +22,7 @@ export function formatUsd(value: number | undefined | null): string {
   }).format(num)
 }
 
-export function formatCredits(value: number | undefined | null): string {
+export function formatQuota(value: number | undefined | null): string {
   if (!Number.isFinite(value ?? Number.NaN)) return '-'
   const num = value as number
   return new Intl.NumberFormat('zh-CN', {

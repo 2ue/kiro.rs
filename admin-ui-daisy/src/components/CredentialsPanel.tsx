@@ -20,7 +20,6 @@ import { forceRefreshToken, getCredentialBalance, getCredentials, testCredential
 import { Badge, EmptyState, ErrorState, FieldLabel, LoadingState, SectionCard, StatCard } from '@/components/common'
 import {
   AddCredentialModal,
-  BalanceModal,
   BatchImportModal,
   BatchVerifyModal,
   CredentialExportModal,
@@ -28,7 +27,7 @@ import {
   KamImportModal,
   type VerifyResult,
 } from '@/components/CredentialDialogs'
-import { formatCredits, formatDate, formatLastUsed, formatNumber, formatUsd } from '@/lib/format'
+import { formatDate, formatLastUsed, formatNumber, formatQuota, formatUsd } from '@/lib/format'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
 import { extractErrorMessage } from '@/lib/utils'
 import {
@@ -70,7 +69,7 @@ function CredentialCard({
   credential,
   selected,
   onToggleSelect,
-  onViewBalance,
+  onQueryBalance,
   onTest,
   balance,
   loadingBalance,
@@ -78,7 +77,7 @@ function CredentialCard({
   credential: CredentialStatusItem
   selected: boolean
   onToggleSelect: () => void
-  onViewBalance: (id: number) => void
+  onQueryBalance: (id: number) => void
   onTest: (credential: CredentialStatusItem) => void
   balance?: BalanceResponse
   loadingBalance: boolean
@@ -236,19 +235,19 @@ function CredentialCard({
             <div className="text-[0.72rem] font-medium text-base-content/50">本地估算成本</div>
             <div className="font-semibold">{formatUsd(credential.estimatedCostUsd)}</div>
           </div>
-          {(loadingBalance || accountInfo) && (
-            <div>
-              <div className="text-[0.72rem] font-medium text-base-content/50">Credits</div>
-              {loadingBalance ? (
-                <Loading size="sm" className="mt-1" />
-              ) : accountInfo ? (
-                <>
-                  <div className="font-semibold">{formatCredits(accountInfo.currentUsage)}/{formatCredits(accountInfo.usageLimit)}</div>
-                  <div className="text-xs text-base-content/50">{formatDate(accountInfo.checkedAt)}</div>
-                </>
-              ) : null}
-            </div>
-          )}
+          <div>
+            <div className="text-[0.72rem] font-medium text-base-content/50">额度</div>
+            {loadingBalance ? (
+              <Loading size="sm" className="mt-1" />
+            ) : accountInfo ? (
+              <>
+                <div className="font-semibold">{formatQuota(accountInfo.currentUsage)}/{formatQuota(accountInfo.usageLimit)}</div>
+                <div className="text-xs text-base-content/50">{formatDate(accountInfo.checkedAt)}</div>
+              </>
+            ) : (
+              <div className="font-semibold text-base-content/50">未知</div>
+            )}
+          </div>
         </div>
 
         <div className="credential-actions">
@@ -256,9 +255,9 @@ function CredentialCard({
             <Wand2 className="h-3.5 w-3.5" />
             测试
           </Button>
-          <Button type="button" color="ghost" size="xs" onClick={() => onViewBalance(credential.id)}>
-            <Wallet className="h-3.5 w-3.5" />
-            Credits
+          <Button type="button" color="ghost" size="xs" onClick={() => onQueryBalance(credential.id)} disabled={loadingBalance || credential.disabled} title={credential.disabled ? '已禁用的凭据无法查询额度' : '查询额度并更新卡片'}>
+            {loadingBalance ? <Loading size="xs" /> : <Wallet className="h-3.5 w-3.5" />}
+            {loadingBalance ? '查询中' : '查询额度'}
           </Button>
           <Button type="button" color="ghost" size="xs" onClick={handleForceRefresh} disabled={credential.authMethod === 'api_key'}>
             <RefreshCw className="h-3.5 w-3.5" />
@@ -327,7 +326,6 @@ export function CredentialsPanel() {
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [balanceMap, setBalanceMap] = useState<Map<number, BalanceResponse>>(new Map())
   const [loadingBalanceIds, setLoadingBalanceIds] = useState<Set<number>>(new Set())
-  const [selectedBalanceId, setSelectedBalanceId] = useState<number | null>(null)
   const [testingCredential, setTestingCredential] = useState<CredentialStatusItem | null>(null)
   const [addOpen, setAddOpen] = useState(false)
   const [batchOpen, setBatchOpen] = useState(false)
@@ -376,26 +374,42 @@ export function CredentialsPanel() {
     })
   }
 
+  const fetchBalanceForCredential = async (id: number) => {
+    setLoadingBalanceIds((prev) => new Set(prev).add(id))
+    try {
+      const balance = await getCredentialBalance(id)
+      setBalanceMap((prev) => new Map(prev).set(id, balance))
+      return { ok: true as const, balance }
+    } catch (error) {
+      return { ok: false as const, error }
+    } finally {
+      setLoadingBalanceIds((prev) => {
+        const next = new Set(prev)
+        next.delete(id)
+        return next
+      })
+    }
+  }
+
+  const queryCredentialBalance = async (id: number) => {
+    const result = await fetchBalanceForCredential(id)
+    invalidate()
+    if (result.ok) toast.success(`凭据 #${id} 额度已更新`)
+    else toast.error(`查询额度失败: ${extractErrorMessage(result.error)}`)
+  }
+
   const queryCurrentPageInfo = async () => {
     const ids = currentCredentials.filter((item) => !item.disabled).map((item) => item.id)
-    if (!ids.length) return toast.error('当前页没有可查询的启用凭据')
+    if (!ids.length) return toast.error('当前页没有可查询额度的启用凭据')
     setQueryingInfo(true)
     let success = 0
     let fail = 0
     for (const id of ids) {
-      setLoadingBalanceIds((prev) => new Set(prev).add(id))
-      try {
-        const balance = await getCredentialBalance(id)
-        setBalanceMap((prev) => new Map(prev).set(id, balance))
+      const result = await fetchBalanceForCredential(id)
+      if (result.ok) {
         success += 1
-      } catch {
+      } else {
         fail += 1
-      } finally {
-        setLoadingBalanceIds((prev) => {
-          const next = new Set(prev)
-          next.delete(id)
-          return next
-        })
       }
     }
     setQueryingInfo(false)
@@ -550,7 +564,7 @@ export function CredentialsPanel() {
             </Button>
             <Button type="button" variant="outline" size="sm" onClick={queryCurrentPageInfo} disabled={queryingInfo || currentCredentials.length === 0}>
               {queryingInfo ? <Loading size="xs" /> : <Wallet className="h-4 w-4" />}
-              {queryingInfo ? '查询中...' : '查询 Credits'}
+              {queryingInfo ? '查询中...' : '查询本页额度'}
             </Button>
             <Button type="button" variant="outline" size="sm" onClick={() => setKamOpen(true)}>
               <FileUp className="h-4 w-4" />
@@ -615,7 +629,7 @@ export function CredentialsPanel() {
                 credential={credential}
                 selected={selectedIds.has(credential.id)}
                 onToggleSelect={() => toggleSelect(credential.id)}
-                onViewBalance={setSelectedBalanceId}
+                onQueryBalance={queryCredentialBalance}
                 onTest={setTestingCredential}
                 balance={balanceMap.get(credential.id)}
                 loadingBalance={loadingBalanceIds.has(credential.id)}
@@ -639,7 +653,6 @@ export function CredentialsPanel() {
 
       <AddCredentialModal open={addOpen} onClose={() => setAddOpen(false)} />
       <CredentialTestModal credential={testingCredential} open={Boolean(testingCredential)} onClose={() => setTestingCredential(null)} />
-      <BalanceModal credentialId={selectedBalanceId} open={selectedBalanceId !== null} onClose={() => setSelectedBalanceId(null)} />
       <BatchImportModal open={batchOpen} onClose={() => setBatchOpen(false)} existingCredentials={importDuplicateCheckCredentials} onDone={invalidate} />
       <KamImportModal open={kamOpen} onClose={() => setKamOpen(false)} existingCredentials={importDuplicateCheckCredentials} onDone={invalidate} />
       <CredentialExportModal open={exportOpen} onClose={() => setExportOpen(false)} />

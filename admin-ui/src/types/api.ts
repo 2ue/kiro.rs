@@ -68,7 +68,7 @@ export interface CredentialAccountInfo {
   checkedAt: string
 }
 
-// Kiro Credits 响应
+// Kiro 额度响应
 export interface BalanceResponse {
   id: number
   checkedAt: string

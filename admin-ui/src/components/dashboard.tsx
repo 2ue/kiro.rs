@@ -7,7 +7,6 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { CredentialCard } from '@/components/credential-card'
-import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
@@ -29,10 +28,8 @@ interface DashboardProps {
 }
 
 export function Dashboard({ onLogout }: DashboardProps) {
-  const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [testingCredential, setTestingCredential] = useState<CredentialStatusItem | null>(null)
   const [testDialogOpen, setTestDialogOpen] = useState(false)
-  const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
@@ -131,11 +128,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const toggleDarkMode = () => {
     setDarkMode(!darkMode)
     document.documentElement.classList.toggle('dark')
-  }
-
-  const handleViewBalance = (id: number) => {
-    setSelectedCredentialId(id)
-    setBalanceDialogOpen(true)
   }
 
   const handleTestCredential = (credential: CredentialStatusItem) => {
@@ -379,7 +371,45 @@ export function Dashboard({ onLogout }: DashboardProps) {
     deselectAll()
   }
 
-  // 查询当前页凭据信息（逐个查询，避免瞬时并发）
+  const fetchBalanceForCredential = async (id: number) => {
+    setLoadingBalanceIds(prev => {
+      const next = new Set(prev)
+      next.add(id)
+      return next
+    })
+
+    try {
+      const balance = await getCredentialBalance(id)
+      setBalanceMap(prev => {
+        const next = new Map(prev)
+        next.set(id, balance)
+        return next
+      })
+      return { ok: true as const, balance }
+    } catch (error) {
+      return { ok: false as const, error }
+    } finally {
+      setLoadingBalanceIds(prev => {
+        const next = new Set(prev)
+        next.delete(id)
+        return next
+      })
+    }
+  }
+
+  const handleQueryCredentialBalance = async (id: number) => {
+    const result = await fetchBalanceForCredential(id)
+    queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    queryClient.invalidateQueries({ queryKey: ['credentials-page'] })
+
+    if (result.ok) {
+      toast.success(`凭据 #${id} 额度已更新`)
+    } else {
+      toast.error(`查询额度失败: ${extractErrorMessage(result.error)}`)
+    }
+  }
+
+  // 查询当前页额度（逐个查询，避免瞬时并发）
   const handleQueryCurrentPageInfo = async () => {
     if (currentCredentials.length === 0) {
       toast.error('当前页没有可查询的凭据')
@@ -391,7 +421,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       .map(credential => credential.id)
 
     if (ids.length === 0) {
-      toast.error('当前页没有可查询的启用凭据')
+      toast.error('当前页没有可查询额度的启用凭据')
       return
     }
 
@@ -404,29 +434,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
     for (let i = 0; i < ids.length; i++) {
       const id = ids[i]
 
-      setLoadingBalanceIds(prev => {
-        const next = new Set(prev)
-        next.add(id)
-        return next
-      })
-
-      try {
-        const balance = await getCredentialBalance(id)
+      const result = await fetchBalanceForCredential(id)
+      if (result.ok) {
         successCount++
-
-        setBalanceMap(prev => {
-          const next = new Map(prev)
-          next.set(id, balance)
-          return next
-        })
-      } catch (error) {
+      } else {
         failCount++
-      } finally {
-        setLoadingBalanceIds(prev => {
-          const next = new Set(prev)
-          next.delete(id)
-          return next
-        })
       }
 
       setQueryInfoProgress({ current: i + 1, total: ids.length })
@@ -762,7 +774,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   disabled={queryingInfo}
                 >
                   <RefreshCw className={`h-4 w-4 mr-2 ${queryingInfo ? 'animate-spin' : ''}`} />
-                  {queryingInfo ? `查询中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询 Credits'}
+                  {queryingInfo ? `查询中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询本页额度'}
                 </Button>
               )}
               {(data?.total || 0) > 0 && (
@@ -809,7 +821,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   <CredentialCard
                     key={credential.id}
                     credential={credential}
-                    onViewBalance={handleViewBalance}
+                    onQueryBalance={handleQueryCredentialBalance}
                     onTestCredential={handleTestCredential}
                     selected={selectedIds.has(credential.id)}
                     onToggleSelect={() => toggleSelect(credential.id)}
@@ -849,13 +861,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
           </>
         )}
       </main>
-
-      {/* Credits 对话框 */}
-      <BalanceDialog
-        credentialId={selectedCredentialId}
-        open={balanceDialogOpen}
-        onOpenChange={setBalanceDialogOpen}
-      />
 
       {/* 添加凭据对话框 */}
       <AddCredentialDialog
