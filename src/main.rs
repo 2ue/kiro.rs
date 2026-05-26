@@ -722,10 +722,12 @@ fn handle_credentials_command(
             if !is_multiple {
                 println!("warning: single credentials format cannot be rewritten by token refresh");
             }
-            if config.load_balancing_mode != "priority" && config.load_balancing_mode != "balanced"
+            if config.load_balancing_mode != "priority"
+                && config.load_balancing_mode != "balanced"
+                && config.load_balancing_mode != "health_balanced"
             {
                 println!(
-                    "error: invalid loadBalancingMode '{}', expected priority or balanced",
+                    "error: invalid loadBalancingMode '{}', expected priority, balanced or health_balanced",
                     config.load_balancing_mode
                 );
             }

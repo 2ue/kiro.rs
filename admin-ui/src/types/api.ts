@@ -3,6 +3,10 @@ export interface CredentialsStatusResponse {
   total: number
   available: number
   currentId: number
+  globalInFlightRequests: number
+  queuedRequests: number
+  globalMaxConcurrentRequests: number
+  maxQueuedRequests: number
   credentials: CredentialStatusItem[]
 }
 
@@ -53,6 +57,16 @@ export interface CredentialStatusItem {
   maxConcurrentRequests: number
   inFlightLeaseMaxSecs: number
   warmupRemaining: number
+  transientFailureStreak: number
+  recentErrorRate: number
+  latencyEwmaMs: number | null
+  lastErrorKind?: string
+  lastErrorReason?: string
+  lastErrorAtMs: number | null
+  inProbation: boolean
+  probationRemainingSecs: number
+  schedulerSelectionCount: number
+  schedulerScore: number
   estimatedCostUsd: number
   pricedRequests: number
   unpricedRequests: number
@@ -319,11 +333,29 @@ export interface RuntimeConfig {
   credentialRpm: number
   credentialMaxConcurrentRequests: number
   credentialTransientCooldownSecs: number
+  credentialRateLimitCooldownSecs: number
+  credentialServerErrorCooldownSecs: number
+  credentialNetworkErrorCooldownSecs: number
+  credentialStreamErrorCooldownSecs: number
+  credentialProtocolErrorCooldownSecs: number
+  credentialAuthErrorCooldownSecs: number
+  credentialCooldownBackoffMultiplier: number
+  credentialCooldownJitterPercent: number
+  credentialProbationSecs: number
   credentialMaxCooldownSecs: number
   credentialDispatchMaxWaitSecs: number
   credentialInFlightLeaseMaxSecs: number
+  dispatchGlobalMaxConcurrentRequests: number
+  dispatchMaxQueuedRequests: number
   credentialWarmupRequests: number
   credentialWarmupSelectionPercent: number
+  schedulerErrorEwmaAlpha: number
+  schedulerPriorityWeight: number
+  schedulerLoadWeight: number
+  schedulerErrorWeight: number
+  schedulerLatencyWeight: number
+  schedulerProbationWeight: number
+  schedulerTopK: number
   compressionEnabled: boolean
   whitespaceCompression: boolean
   promptCacheTargetReadRatio: number
@@ -340,6 +372,8 @@ export interface RuntimeConfig {
 }
 
 export type UpdateRuntimeConfigRequest = RuntimeConfig
+
+export type LoadBalancingMode = 'priority' | 'balanced' | 'health_balanced'
 
 export interface ModelPricing {
   inputCostPerToken: number

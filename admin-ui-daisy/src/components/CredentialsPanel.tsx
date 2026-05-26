@@ -15,7 +15,7 @@ import {
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { Button, Card, Checkbox, Input, Join, Loading, Toggle } from 'react-daisyui'
+import { Button, Card, Checkbox, Input, Join, Loading, Select, Toggle } from 'react-daisyui'
 import { forceRefreshToken, getCredentialBalance, getCredentials, testCredential } from '@/api/credentials'
 import { Badge, EmptyState, ErrorState, FieldLabel, LoadingState, SectionCard, StatCard } from '@/components/common'
 import {
@@ -43,7 +43,7 @@ import {
   useSetPriority,
   useSetWarmup,
 } from '@/hooks/use-credentials'
-import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
+import type { BalanceResponse, CredentialStatusItem, LoadBalancingMode } from '@/types/api'
 
 function credentialLabel(credential: CredentialStatusItem) {
   return credential.email || credential.maskedApiKey || `凭据 #${credential.id}`
@@ -166,6 +166,8 @@ function CredentialCard({
                   </Badge>
                 )}
                 {!credential.disabled && credential.warmupRemaining > 0 && <Badge tone="secondary">预热 {credential.warmupRemaining}</Badge>}
+                {!credential.disabled && credential.inProbation && <Badge tone="secondary">观察 {credential.probationRemainingSecs}s</Badge>}
+                {credential.transientFailureStreak > 0 && <Badge tone="warning">瞬态错误 {credential.transientFailureStreak}</Badge>}
                 <Badge>{authLabel(credential.authMethod)}</Badge>
                 {credential.endpoint && credential.endpoint !== 'ide' && <Badge>{credential.endpoint}</Badge>}
                 {credential.hasProxy && <Badge tone="info">代理</Badge>}
@@ -220,9 +222,27 @@ function CredentialCard({
             <div className="font-semibold">{formatNumber(credential.successCount)}</div>
           </div>
           <div>
+            <div className="text-[0.72rem] font-medium text-base-content/50">近期错误率</div>
+            <div className={credential.recentErrorRate > 0 ? 'font-semibold text-error' : 'font-semibold'}>{(credential.recentErrorRate * 100).toFixed(1)}%</div>
+          </div>
+          <div>
+            <div className="text-[0.72rem] font-medium text-base-content/50">耗时 EWMA</div>
+            <div className="font-semibold">{credential.latencyEwmaMs == null ? '未知' : `${Math.round(credential.latencyEwmaMs)}ms`}</div>
+          </div>
+          <div>
+            <div className="text-[0.72rem] font-medium text-base-content/50">调度评分 / 选中</div>
+            <div className="font-semibold">{credential.schedulerScore.toFixed(2)} / {credential.schedulerSelectionCount}</div>
+          </div>
+          <div>
             <div className="text-[0.72rem] font-medium text-base-content/50">最近使用</div>
             <div className="font-semibold">{formatLastUsed(credential.lastUsedAt)}</div>
           </div>
+          {credential.lastErrorReason && (
+            <div className="col-span-full">
+              <div className="text-[0.72rem] font-medium text-base-content/50">最近瞬态错误</div>
+              <div className="truncate font-semibold" title={credential.lastErrorReason}>{credential.lastErrorKind || 'unknown'}: {credential.lastErrorReason}</div>
+            </div>
+          )}
           <div>
             <div className="text-[0.72rem] font-medium text-base-content/50">创建时间</div>
             <div className="font-semibold">{formatDate(credential.createdAt)}</div>
@@ -531,10 +551,9 @@ export function CredentialsPanel() {
     if (!cancelVerifyRef.current) toast.success(`验活完成：成功 ${success}/${ids.length}`)
   }
 
-  const toggleLoadBalancing = () => {
-    const next = loadBalancing.data?.mode === 'priority' ? 'balanced' : 'priority'
+  const setLoadBalancingMode = (next: LoadBalancingMode) => {
     setLoadBalancing.mutate(next, {
-      onSuccess: () => toast.success(`已切换到${next === 'priority' ? '优先级模式' : '均衡负载模式'}`),
+      onSuccess: () => toast.success(`已切换到${next === 'priority' ? '优先级模式' : next === 'balanced' ? '均衡负载模式' : '健康均衡模式'}`),
       onError: (error) => toast.error(`切换失败: ${extractErrorMessage(error)}`),
     })
   }
@@ -547,7 +566,8 @@ export function CredentialsPanel() {
       <div className="metric-grid">
         <StatCard title="凭据总数" value={formatNumber(credentials.data?.total || 0)} />
         <StatCard title="可用凭据" value={formatNumber(credentials.data?.available || 0)} tone="success" />
-        <StatCard title="当前活跃" value={`#${credentials.data?.currentId || '-'}`} desc={loadBalancing.data?.mode === 'priority' ? '优先级模式' : '均衡负载模式'} tone="info" />
+        <StatCard title="当前活跃" value={`#${credentials.data?.currentId || '-'}`} desc={loadBalancing.data?.mode === 'priority' ? '优先级模式' : loadBalancing.data?.mode === 'balanced' ? '均衡负载模式' : '健康均衡模式'} tone="info" />
+        <StatCard title="调度容量" value={`${credentials.data?.globalInFlightRequests || 0}/${credentials.data?.globalMaxConcurrentRequests || '不限'}`} desc={`排队 ${credentials.data?.queuedRequests || 0}/${credentials.data?.maxQueuedRequests || '不限'}`} tone="info" />
         <StatCard title="已禁用" value={formatNumber(disabledCredentialCount)} tone={disabledCredentialCount ? 'warning' : 'default'} />
       </div>
 
@@ -555,9 +575,11 @@ export function CredentialsPanel() {
         title="凭据管理"
         actions={
           <>
-            <Button type="button" variant="outline" size="sm" onClick={toggleLoadBalancing} disabled={setLoadBalancing.isPending || loadBalancing.isLoading}>
-              {loadBalancing.data?.mode === 'priority' ? '优先级模式' : '均衡负载'}
-            </Button>
+            <Select bordered size="sm" value={loadBalancing.data?.mode || 'priority'} disabled={setLoadBalancing.isPending || loadBalancing.isLoading} onChange={(event) => setLoadBalancingMode(event.target.value as LoadBalancingMode)}>
+              <Select.Option value="priority">优先级模式</Select.Option>
+              <Select.Option value="balanced">均衡负载模式</Select.Option>
+              <Select.Option value="health_balanced">健康均衡模式</Select.Option>
+            </Select>
             <Button type="button" variant="outline" size="sm" onClick={() => credentials.refetch()}>
               <RefreshCw className="h-4 w-4" />
               刷新列表

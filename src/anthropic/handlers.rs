@@ -1672,7 +1672,10 @@ fn create_sse_stream(
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            completion.report_soft_failure();
+                            completion.report_upstream_stream_failure(format!(
+                                "upstream stream read error: {}",
+                                e
+                            ));
                             // 读取错误：关闭已有内容块后发送 SSE error，不再发送正常 message_stop。
                             ctx.record_stream_error("api_error", format!("upstream stream read error: {}", e));
                             let error_detail = ctx.stream_error_detail();
@@ -1694,7 +1697,11 @@ fn create_sse_stream(
                         None => {
                             // 流结束，发送最终事件
                             if ctx.has_stream_error() {
-                                completion.report_soft_failure();
+                                let scheduler_reason = ctx
+                                    .stream_error_detail()
+                                    .map(|(kind, detail)| format!("{}: {}", kind, detail))
+                                    .unwrap_or_else(|| "upstream stream error event".to_string());
+                                completion.report_upstream_stream_failure(scheduler_reason);
                             } else {
                                 completion.report_success();
                             }
@@ -1726,7 +1733,7 @@ fn create_sse_stream(
                         "上游响应流超过 {} 秒未产生数据，结束流并发送错误事件",
                         UPSTREAM_IDLE_TIMEOUT_SECS
                     );
-                    completion.report_soft_failure();
+                    completion.report_upstream_stream_failure("upstream stream idle timeout");
                     ctx.record_stream_error("api_error", "upstream stream idle timeout");
                     let error_detail = ctx.stream_error_detail();
                     let final_events = ctx.generate_final_events();

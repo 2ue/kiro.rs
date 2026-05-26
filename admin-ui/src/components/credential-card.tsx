@@ -256,6 +256,12 @@ export function CredentialCard({
                 {!credential.disabled && credential.warmupRemaining > 0 && (
                   <Badge variant="secondary">预热 {credential.warmupRemaining}</Badge>
                 )}
+                {!credential.disabled && credential.inProbation && (
+                  <Badge variant="secondary">观察 {credential.probationRemainingSecs}s</Badge>
+                )}
+                {credential.transientFailureStreak > 0 && (
+                  <Badge variant="outline">瞬态错误 {credential.transientFailureStreak}</Badge>
+                )}
                 {credential.authMethod && (
                   <Badge variant="secondary">
                     {credential.authMethod === 'api_key' ? 'API Key' :
@@ -362,6 +368,26 @@ export function CredentialCard({
               )}
             </div>
             <div>
+              <span className="text-muted-foreground">近期错误率：</span>
+              <span className={credential.recentErrorRate > 0 ? 'font-medium text-red-500' : 'font-medium'}>
+                {(credential.recentErrorRate * 100).toFixed(1)}%
+              </span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">耗时 EWMA：</span>
+              <span className="font-medium">
+                {credential.latencyEwmaMs == null ? '未知' : `${Math.round(credential.latencyEwmaMs)}ms`}
+              </span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">调度评分：</span>
+              <span className="font-medium">{credential.schedulerScore.toFixed(2)}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">被选中：</span>
+              <span className="font-medium">{credential.schedulerSelectionCount}</span>
+            </div>
+            <div>
               <span className="text-muted-foreground">本地估算成本：</span>
               <span className="font-medium">{formatUsd(credential.estimatedCostUsd || 0)}</span>
             </div>
@@ -373,7 +399,7 @@ export function CredentialCard({
                 </span>
               </div>
             )}
-            {(credential.cooledDown || credential.rateLimited || credential.warmupRemaining > 0 || (credential.maxConcurrentRequests > 0 && credential.inFlightRequests >= credential.maxConcurrentRequests)) && (
+            {(credential.cooledDown || credential.rateLimited || credential.inProbation || credential.warmupRemaining > 0 || (credential.maxConcurrentRequests > 0 && credential.inFlightRequests >= credential.maxConcurrentRequests)) && (
               <div className="col-span-2">
                 <span className="text-muted-foreground">调度状态：</span>
                 <span className="font-medium">
@@ -383,6 +409,8 @@ export function CredentialCard({
                       ? `本地限流 ${credential.rateLimitRemainingSecs}s`
                       : credential.maxConcurrentRequests > 0 && credential.inFlightRequests >= credential.maxConcurrentRequests
                         ? `并发已满 ${credential.inFlightRequests}/${credential.maxConcurrentRequests}`
+                        : credential.inProbation
+                          ? `恢复观察 ${credential.probationRemainingSecs}s`
                         : `预热剩余 ${credential.warmupRemaining} 次`}
                 </span>
                 {credential.cooldownReason && (
@@ -390,6 +418,13 @@ export function CredentialCard({
                     {credential.cooldownReason}
                   </span>
                 )}
+              </div>
+            )}
+            {credential.lastErrorReason && (
+              <div className="col-span-2">
+                <span className="text-muted-foreground">最近瞬态错误：</span>
+                <span className="font-medium">{credential.lastErrorKind || 'unknown'}</span>
+                <span className="ml-1 text-xs text-muted-foreground">{credential.lastErrorReason}</span>
               </div>
             )}
             <div className="col-span-2">

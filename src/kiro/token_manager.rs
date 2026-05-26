@@ -15,7 +15,7 @@ use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -28,7 +28,8 @@ use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
 use crate::storage::postgres::{CredentialRuntimeStateRow, CredentialStatsRow, PostgresStore};
 use crate::storage::redis_cache::{
-    RedisStore, SchedulerCooldownState, SchedulerCredentialState, SchedulerSessionBinding,
+    RedisStore, SchedulerCredentialState, SchedulerGlobalCapacityState, SchedulerHealthState,
+    SchedulerSessionBinding,
 };
 
 /// 检查 Token 是否在指定时间内过期
@@ -429,6 +430,8 @@ struct CredentialEntry {
     in_flight_leases: Vec<InFlightLease>,
     /// 预热剩余请求数。仅影响 balanced 选择，不伪造 success_count。
     warmup_remaining: u32,
+    /// 近期上游健康状态；Redis 部署下在调度前同步。
+    health: SchedulerHealthState,
 }
 
 #[derive(Debug, Clone)]
@@ -534,6 +537,29 @@ pub enum CredentialRiskControlReason {
     TemporarilySuspended,
     AccountSuspended,
     AccountLocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransientFailureKind {
+    RateLimit,
+    Server,
+    Network,
+    Stream,
+    Protocol,
+    Auth,
+}
+
+impl TransientFailureKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RateLimit => "rate_limit",
+            Self::Server => "server",
+            Self::Network => "network",
+            Self::Stream => "stream",
+            Self::Protocol => "protocol",
+            Self::Auth => "auth",
+        }
+    }
 }
 
 impl CredentialRiskControlReason {
@@ -671,6 +697,28 @@ pub struct CredentialEntrySnapshot {
     pub in_flight_lease_max_secs: u64,
     /// 预热剩余请求数。
     pub warmup_remaining: u32,
+    /// 连续瞬态错误次数。
+    pub transient_failure_streak: u32,
+    /// 近期错误率 EWMA，范围 0..=1。
+    pub recent_error_rate: f64,
+    /// 成功调用总耗时 EWMA（毫秒）。
+    pub latency_ewma_ms: Option<f64>,
+    /// 最近瞬态错误类型。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_kind: Option<String>,
+    /// 最近瞬态错误原因。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_reason: Option<String>,
+    /// 最近瞬态错误时间（Unix 毫秒）。
+    pub last_error_at_ms: Option<i64>,
+    /// 是否处于冷却结束后的降权观察窗口。
+    pub in_probation: bool,
+    /// 降权观察窗口剩余秒数。
+    pub probation_remaining_secs: u64,
+    /// 调度选中该凭据次数。
+    pub scheduler_selection_count: u64,
+    /// 当前健康评分；越低越优先，仅健康均衡模式有实际决策意义。
+    pub scheduler_score: f64,
 }
 
 /// 凭据管理器状态快照
@@ -685,6 +733,14 @@ pub struct ManagerSnapshot {
     pub total: usize,
     /// 可用凭据数量
     pub available: usize,
+    /// 全局正在处理的调度请求数量。
+    pub global_in_flight_requests: u32,
+    /// 全局等待调度容量的请求数量。
+    pub queued_requests: u32,
+    /// 全局最大并发限制。0 表示不限。
+    pub global_max_concurrent_requests: u32,
+    /// 全局等待队列上限。0 表示不限。
+    pub max_queued_requests: u32,
 }
 
 /// 多凭据 Token 管理器
@@ -715,6 +771,7 @@ pub struct MultiTokenManager {
     /// 凭据并发槽释放通知，用于所有凭据占满时排队等待。
     in_flight_notify: Arc<Notify>,
     next_in_flight_lease_id: AtomicU64,
+    queued_requests: Arc<AtomicU32>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -903,6 +960,51 @@ impl Drop for InFlightLeaseGuard {
     }
 }
 
+struct DispatchQueueGuard {
+    redis_store: Option<Arc<RedisStore>>,
+    local_queued: Arc<AtomicU32>,
+    in_flight_notify: Arc<Notify>,
+    released: AtomicBool,
+}
+
+impl DispatchQueueGuard {
+    fn new(
+        redis_store: Option<Arc<RedisStore>>,
+        local_queued: Arc<AtomicU32>,
+        in_flight_notify: Arc<Notify>,
+    ) -> Self {
+        Self {
+            redis_store,
+            local_queued,
+            in_flight_notify,
+            released: AtomicBool::new(false),
+        }
+    }
+
+    fn release(&self) {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            if let Err(err) = block_on_storage("释放 Redis 调度排队占位", async move {
+                redis.leave_dispatch_queue().await
+            }) {
+                tracing::warn!("释放 Redis 调度排队占位失败: {}", err);
+            }
+        } else {
+            self.local_queued.fetch_sub(1, Ordering::AcqRel);
+        }
+        self.in_flight_notify.notify_waiters();
+    }
+}
+
+impl Drop for DispatchQueueGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 fn release_in_flight_lease_from_entries(
     entries: &Mutex<Vec<CredentialEntry>>,
     credential_id: u64,
@@ -1080,6 +1182,7 @@ impl MultiTokenManager {
                     in_flight_requests: 0,
                     in_flight_leases: Vec::new(),
                     warmup_remaining: 0,
+                    health: SchedulerHealthState::default(),
                 }
             })
             .collect();
@@ -1139,6 +1242,7 @@ impl MultiTokenManager {
             session_bindings: Mutex::new(HashMap::new()),
             in_flight_notify: Arc::new(Notify::new()),
             next_in_flight_lease_id: AtomicU64::new(1),
+            queued_requests: Arc::new(AtomicU32::new(0)),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到 PgSQL。
@@ -1287,6 +1391,14 @@ impl MultiTokenManager {
         self.config.lock().credential_max_concurrent_requests
     }
 
+    fn global_max_concurrent_requests(&self) -> u32 {
+        self.config.lock().dispatch_global_max_concurrent_requests
+    }
+
+    fn max_queued_requests(&self) -> u32 {
+        self.config.lock().dispatch_max_queued_requests
+    }
+
     fn in_flight_lease_max_age(&self) -> Option<StdDuration> {
         let secs = self.config.lock().credential_in_flight_lease_max_secs;
         (secs > 0).then(|| StdDuration::from_secs(secs))
@@ -1302,12 +1414,74 @@ impl MultiTokenManager {
         Some(StdDuration::from_millis(millis))
     }
 
-    fn cooldown_duration_from_retry_after(&self, retry_after: Option<StdDuration>) -> StdDuration {
+    fn transient_failure_settings(
+        &self,
+        kind: TransientFailureKind,
+    ) -> (StdDuration, StdDuration, f64, f64, StdDuration, f64) {
         let config = self.config.lock();
-        let fallback = StdDuration::from_secs(config.credential_transient_cooldown_secs);
-        let max = StdDuration::from_secs(config.credential_max_cooldown_secs.max(1));
-        let requested = retry_after.unwrap_or(fallback);
+        let base = match kind {
+            TransientFailureKind::RateLimit => config.credential_rate_limit_cooldown_secs,
+            TransientFailureKind::Server => config.credential_server_error_cooldown_secs,
+            TransientFailureKind::Network => config.credential_network_error_cooldown_secs,
+            TransientFailureKind::Stream => config.credential_stream_error_cooldown_secs,
+            TransientFailureKind::Protocol => config.credential_protocol_error_cooldown_secs,
+            TransientFailureKind::Auth => config.credential_auth_error_cooldown_secs,
+        }
+        .max(1);
+        let max = config.credential_max_cooldown_secs.max(1);
+        let multiplier = config.credential_cooldown_backoff_multiplier.max(1.0);
+        let jitter_percent = config.credential_cooldown_jitter_percent.min(100) as f64 / 100.0;
+        let offset = if jitter_percent == 0.0 {
+            0.0
+        } else {
+            fastrand::f64() * jitter_percent * 2.0 - jitter_percent
+        };
+        (
+            StdDuration::from_secs(base),
+            StdDuration::from_secs(max),
+            multiplier,
+            1.0 + offset,
+            StdDuration::from_secs(config.credential_probation_secs),
+            config.scheduler_error_ewma_alpha.clamp(0.01, 1.0),
+        )
+    }
+
+    fn local_cooldown_duration(
+        retry_after: Option<StdDuration>,
+        base: StdDuration,
+        max: StdDuration,
+        multiplier: f64,
+        jitter: f64,
+        streak: u32,
+    ) -> StdDuration {
+        let requested = retry_after.unwrap_or_else(|| {
+            let millis = base.as_millis() as f64
+                * multiplier.powi(streak.saturating_sub(1).min(20) as i32)
+                * jitter;
+            StdDuration::from_millis(millis.max(1.0).round() as u64)
+        });
         requested.clamp(StdDuration::from_secs(1), max)
+    }
+
+    fn scheduler_score(&self, entry: &CredentialEntry, now_ms: i64) -> f64 {
+        let config = self.config.lock();
+        let max_concurrent = config.credential_max_concurrent_requests;
+        let load = if max_concurrent > 0 {
+            entry.in_flight_requests as f64 / max_concurrent as f64
+        } else {
+            entry.in_flight_requests as f64
+        };
+        let probation = entry
+            .health
+            .probation_until_ms
+            .is_some_and(|until_ms| until_ms > now_ms) as u8 as f64;
+        entry.credentials.priority as f64 * config.scheduler_priority_weight.max(0.0)
+            + load * config.scheduler_load_weight.max(0.0)
+            + entry.health.recent_error_rate.clamp(0.0, 1.0)
+                * config.scheduler_error_weight.max(0.0)
+            + entry.health.latency_ewma_ms.unwrap_or(0.0).max(0.0)
+                * config.scheduler_latency_weight.max(0.0)
+            + probation * config.scheduler_probation_weight.max(0.0)
     }
 
     fn update_credential_rpm_from_config(&self) {
@@ -1416,6 +1590,7 @@ impl MultiTokenManager {
     fn acquire_in_flight_slot(&self, id: u64) -> anyhow::Result<Option<InFlightLeaseGuard>> {
         self.cleanup_expired_in_flight_leases_result()?;
         let max_concurrent_requests = self.max_concurrent_requests();
+        let global_max_concurrent_requests = self.global_max_concurrent_requests();
         let now = Instant::now();
 
         if let Some(redis) = &self.redis_store {
@@ -1430,10 +1605,11 @@ impl MultiTokenManager {
                 let redis = redis.clone();
                 async move {
                     redis
-                        .acquire_in_flight_lease(
+                        .acquire_dispatch_lease(
                             id,
                             lease_id,
                             max_concurrent_requests,
+                            global_max_concurrent_requests,
                             max_age,
                             InFlightKind::Api.as_str(),
                         )
@@ -1466,6 +1642,11 @@ impl MultiTokenManager {
 
         let lease_id = self.next_in_flight_lease_id.fetch_add(1, Ordering::Relaxed);
         let mut entries = self.entries.lock();
+        let global_in_flight: u32 = entries.iter().map(|entry| entry.in_flight_requests).sum();
+        if global_max_concurrent_requests > 0 && global_in_flight >= global_max_concurrent_requests
+        {
+            return Ok(None);
+        }
         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
             if !Self::entry_has_concurrency_capacity(entry, max_concurrent_requests) {
                 return Ok(None);
@@ -1649,6 +1830,61 @@ impl MultiTokenManager {
         let _ = tokio::time::timeout(wakeup, self.in_flight_notify.notified()).await;
     }
 
+    fn try_enter_dispatch_queue(&self) -> anyhow::Result<Option<DispatchQueueGuard>> {
+        let max_queued = self.max_queued_requests();
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            let admitted = block_on_storage("占用 Redis 调度排队名额", async move {
+                redis.try_enter_dispatch_queue(max_queued).await
+            })?;
+            if !admitted {
+                return Ok(None);
+            }
+        } else {
+            loop {
+                let queued = self.queued_requests.load(Ordering::Acquire);
+                if max_queued > 0 && queued >= max_queued {
+                    return Ok(None);
+                }
+                if self
+                    .queued_requests
+                    .compare_exchange(queued, queued + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+        }
+        Ok(Some(DispatchQueueGuard::new(
+            self.redis_store.clone(),
+            self.queued_requests.clone(),
+            self.in_flight_notify.clone(),
+        )))
+    }
+
+    fn global_capacity_state(&self) -> SchedulerGlobalCapacityState {
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            return block_on_storage("读取 Redis 全局调度容量", async move {
+                redis.global_capacity_state().await
+            })
+            .unwrap_or_else(|err| {
+                tracing::warn!("读取 Redis 全局调度容量失败: {}", err);
+                SchedulerGlobalCapacityState::default()
+            });
+        }
+        let in_flight_requests = self
+            .entries
+            .lock()
+            .iter()
+            .map(|entry| entry.in_flight_requests)
+            .sum();
+        SchedulerGlobalCapacityState {
+            in_flight_requests,
+            queued_requests: self.queued_requests.load(Ordering::Acquire),
+        }
+    }
+
     fn dispatch_max_wait(&self) -> Option<StdDuration> {
         let secs = self.config.lock().credential_dispatch_max_wait_secs;
         (secs > 0).then(|| StdDuration::from_secs(secs))
@@ -1721,7 +1957,7 @@ impl MultiTokenManager {
         let mode = mode.as_str();
 
         match mode {
-            "balanced" => {
+            "health_balanced" => {
                 let ready: Vec<_> = available
                     .iter()
                     .filter(|e| e.warmup_remaining == 0)
@@ -1742,31 +1978,113 @@ impl MultiTokenManager {
                         .credential_warmup_selection_percent
                         .min(100);
                     if percent > 0 && fastrand::u32(0..100) < percent {
-                        let entry = warming
-                            .iter()
-                            .min_by_key(|e| (e.success_count, e.credentials.priority))?;
+                        let entry =
+                            self.select_health_weighted(warming, Utc::now().timestamp_millis())?;
                         return Some((entry.id, entry.credentials.clone()));
                     }
 
-                    let entry = ready
-                        .iter()
-                        .min_by_key(|e| (e.success_count, e.credentials.priority))?;
+                    let entry =
+                        self.select_health_weighted(ready, Utc::now().timestamp_millis())?;
                     return Some((entry.id, entry.credentials.clone()));
                 }
 
                 let candidates = if ready.is_empty() { warming } else { ready };
-                let entry = candidates
-                    .iter()
-                    .min_by_key(|e| (e.success_count, e.credentials.priority))?;
+                let entry =
+                    self.select_health_weighted(candidates, Utc::now().timestamp_millis())?;
 
                 Some((entry.id, entry.credentials.clone()))
             }
+            "balanced" => {
+                let ready: Vec<_> = available
+                    .iter()
+                    .filter(|entry| entry.warmup_remaining == 0)
+                    .copied()
+                    .collect();
+                let warming: Vec<_> = available
+                    .iter()
+                    .filter(|entry| entry.warmup_remaining > 0)
+                    .copied()
+                    .collect();
+                if !ready.is_empty() && !warming.is_empty() {
+                    let percent = self
+                        .config
+                        .lock()
+                        .credential_warmup_selection_percent
+                        .min(100);
+                    if percent > 0 && fastrand::u32(0..100) < percent {
+                        let entry = warming
+                            .iter()
+                            .min_by_key(|entry| Self::balanced_selection_key(entry))?;
+                        return Some((entry.id, entry.credentials.clone()));
+                    }
+                    let entry = ready
+                        .iter()
+                        .min_by_key(|entry| Self::balanced_selection_key(entry))?;
+                    return Some((entry.id, entry.credentials.clone()));
+                }
+                let candidates = if ready.is_empty() { warming } else { ready };
+                let entry = candidates
+                    .iter()
+                    .min_by_key(|entry| Self::balanced_selection_key(entry))?;
+                Some((entry.id, entry.credentials.clone()))
+            }
             _ => {
-                // priority 模式（默认）：选择优先级最高的
-                let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
+                // priority 模式（默认）：优先级仍是第一排序，但同优先级账号优先选低并发。
+                let entry = available
+                    .iter()
+                    .min_by_key(|e| Self::priority_selection_key(e))?;
                 Some((entry.id, entry.credentials.clone()))
             }
         }
+    }
+
+    fn select_health_weighted<'a>(
+        &self,
+        candidates: Vec<&'a CredentialEntry>,
+        now_ms: i64,
+    ) -> Option<&'a CredentialEntry> {
+        let mut scored: Vec<(&CredentialEntry, f64)> = candidates
+            .into_iter()
+            .map(|entry| (entry, self.scheduler_score(entry, now_ms)))
+            .collect();
+        scored.sort_by(|(left_entry, left), (right_entry, right)| {
+            left.partial_cmp(right)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left_entry.id.cmp(&right_entry.id))
+        });
+        let top_k = self.config.lock().scheduler_top_k.max(1) as usize;
+        let top = &scored[..scored.len().min(top_k)];
+        let worst_score = top.last()?.1;
+        let total_weight: f64 = top
+            .iter()
+            .map(|(_, score)| (worst_score - score + 1.0).max(0.01))
+            .sum();
+        let mut roll = fastrand::f64() * total_weight;
+        for (entry, score) in top {
+            roll -= (worst_score - score + 1.0).max(0.01);
+            if roll <= 0.0 {
+                return Some(*entry);
+            }
+        }
+        top.last().map(|(entry, _)| *entry)
+    }
+
+    fn balanced_selection_key(entry: &CredentialEntry) -> (u32, u64, u32, u64) {
+        (
+            entry.in_flight_requests,
+            entry.success_count,
+            entry.credentials.priority,
+            entry.id,
+        )
+    }
+
+    fn priority_selection_key(entry: &CredentialEntry) -> (u32, u32, u64, u64) {
+        (
+            entry.credentials.priority,
+            entry.in_flight_requests,
+            entry.success_count,
+            entry.id,
+        )
     }
 
     fn prune_session_bindings_locked(bindings: &mut HashMap<String, SessionBinding>) {
@@ -2085,6 +2403,7 @@ impl MultiTokenManager {
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
         let dispatch_wait_started_at = Instant::now();
+        let mut queue_guard: Option<DispatchQueueGuard> = None;
 
         loop {
             self.refresh_scheduler_state_from_redis()?;
@@ -2106,36 +2425,8 @@ impl MultiTokenManager {
                     AcquireDecision::Selected(hit.0, hit.1, true, false)
                 } else {
                     let fallback_from_sticky = existing_bound_id.is_some();
-                    let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
-
-                    // balanced 模式：新会话重新均衡选择；已有会话已在 bound_hit 返回
-                    // priority 模式：优先使用 current_id 指向的凭据
-                    let current_hit = if is_balanced {
-                        None
-                    } else {
-                        let entries = self.entries.lock();
-                        let current_id = *self.current_id.lock();
-                        let now = Instant::now();
-                        let max_concurrent_requests = self.max_concurrent_requests();
-                        entries
-                            .iter()
-                            .find(|e| {
-                                e.id == current_id
-                                    && !excluded_ids.contains(&e.id)
-                                    && Self::credential_is_dispatchable(
-                                        e,
-                                        model,
-                                        now,
-                                        max_concurrent_requests,
-                                    )
-                            })
-                            .map(|e| (e.id, e.credentials.clone()))
-                    };
-
-                    if let Some(hit) = current_hit {
-                        AcquireDecision::Selected(hit.0, hit.1, false, fallback_from_sticky)
-                    } else {
-                        // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
+                    {
+                        // 根据负载均衡策略选择；priority 模式也会在同优先级账号之间优先低并发。
                         let mut best = self.select_next_credential_excluding(model, excluded_ids);
 
                         // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
@@ -2290,6 +2581,16 @@ impl MultiTokenManager {
                     max_concurrent_requests,
                     wait_for,
                 } => {
+                    if queue_guard.is_none() {
+                        queue_guard = self.try_enter_dispatch_queue()?;
+                        if queue_guard.is_none() {
+                            anyhow::bail!(
+                                "凭据调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
+                                self.max_queued_requests(),
+                                self.global_max_concurrent_requests()
+                            );
+                        }
+                    }
                     let now = Instant::now();
                     let retry_after_secs = wait_for
                         .map(|duration| duration.as_secs().saturating_add(1))
@@ -2324,6 +2625,16 @@ impl MultiTokenManager {
             };
 
             let Some(in_flight_lease) = self.acquire_in_flight_slot(id)? else {
+                if queue_guard.is_none() {
+                    queue_guard = self.try_enter_dispatch_queue()?;
+                    if queue_guard.is_none() {
+                        anyhow::bail!(
+                            "凭据调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
+                            self.max_queued_requests(),
+                            self.global_max_concurrent_requests()
+                        );
+                    }
+                }
                 let now = Instant::now();
                 if let Some((waited, max_wait)) =
                     self.dispatch_wait_exceeded(dispatch_wait_started_at, now)
@@ -2348,6 +2659,7 @@ impl MultiTokenManager {
                 .await;
                 continue;
             };
+            drop(queue_guard.take());
 
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials, true).await {
@@ -2367,6 +2679,7 @@ impl MultiTokenManager {
                             self.bind_session_to_credential(sid, ctx.id);
                         }
                     }
+                    self.record_scheduler_selection(ctx.id);
                     return Ok(CallContext {
                         sticky_bound,
                         fallback_from_sticky,
@@ -2381,6 +2694,13 @@ impl MultiTokenManager {
                         self.report_refresh_token_invalid(id)
                     } else {
                         tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
+                        self.report_transient_failure_kind(
+                            id,
+                            model,
+                            TransientFailureKind::Auth,
+                            None,
+                            format!("token_refresh_failure {}", e),
+                        )?;
                         self.report_refresh_failure(id)
                     };
                     drop(in_flight_lease);
@@ -2722,6 +3042,7 @@ impl MultiTokenManager {
                 in_flight_requests: 0,
                 in_flight_leases: Vec::new(),
                 warmup_remaining: 0,
+                health: SchedulerHealthState::default(),
             });
             changed = true;
         }
@@ -3100,16 +3421,48 @@ impl MultiTokenManager {
                 })
                 .collect();
             entry.in_flight_requests = entry.in_flight_leases.len() as u32;
+            entry.health = state.health;
+        }
+    }
+
+    fn record_scheduler_selection(&self, id: u64) {
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                entry.health.selection_count = entry.health.selection_count.saturating_add(1);
+            }
+        }
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            if let Err(err) = block_on_storage("记录 Redis 调度选中次数", async move {
+                redis.record_scheduler_selection(id).await
+            }) {
+                tracing::warn!(credential_id = id, "记录 Redis 调度选中次数失败: {}", err);
+            }
         }
     }
 
     fn clear_scheduler_state_for_credential(&self, id: u64, clear_in_flight: bool) {
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                entry.cooldown_until = None;
+                entry.cooldown_reason = None;
+                entry.rate_limit_available_at = None;
+                entry.health = SchedulerHealthState::default();
+                if clear_in_flight {
+                    entry.in_flight_requests = 0;
+                    entry.in_flight_leases.clear();
+                }
+            }
+        }
         let Some(redis) = &self.redis_store else {
             return;
         };
         let redis = redis.clone();
         if let Err(err) = block_on_storage("清理 Redis 凭据调度状态", async move {
             redis.clear_scheduler_cooldown(id).await?;
+            redis.clear_scheduler_health(id).await?;
             redis.clear_rate_limit(id).await?;
             redis.delete_sessions_for_credential(id).await?;
             if clear_in_flight {
@@ -3127,21 +3480,42 @@ impl MultiTokenManager {
     ///
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
+    #[allow(dead_code)]
     pub fn report_success(&self, id: u64) {
+        self.report_success_with_latency(id, None);
+    }
+
+    pub fn report_success_with_latency(&self, id: u64, latency: Option<StdDuration>) {
         let mut last_used_at: Option<String> = None;
+        let alpha = self
+            .config
+            .lock()
+            .scheduler_error_ewma_alpha
+            .clamp(0.01, 1.0);
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
-                entry.cooldown_until = None;
-                entry.cooldown_reason = None;
                 if entry.warmup_remaining > 0 {
                     entry.warmup_remaining -= 1;
                 }
                 entry.success_count += 1;
                 let now = Utc::now().to_rfc3339();
                 entry.last_used_at = Some(now.clone());
+                entry.health.recent_error_rate *= 1.0 - alpha;
+                entry.health.transient_failure_streak =
+                    entry.health.transient_failure_streak.saturating_sub(1);
+                if let Some(latency) = latency {
+                    let latency_ms = latency.as_millis() as f64;
+                    entry.health.latency_ewma_ms = Some(
+                        entry
+                            .health
+                            .latency_ewma_ms
+                            .map(|previous| previous + alpha * (latency_ms - previous))
+                            .unwrap_or(latency_ms),
+                    );
+                }
                 last_used_at = Some(now);
                 tracing::debug!(
                     "凭据 #{} API 调用成功（累计 {} 次）",
@@ -3150,16 +3524,26 @@ impl MultiTokenManager {
                 );
             }
         }
-        if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            if let Err(err) = block_on_storage("清理 Redis 凭据临时冷却", async move {
-                redis.clear_scheduler_cooldown(id).await
-            }) {
-                tracing::warn!(credential_id = id, "清理 Redis 凭据临时冷却失败: {}", err);
-            }
-        }
         if let Some(last_used_at) = last_used_at {
             self.persist_success_state(id, &last_used_at);
+        }
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            match block_on_storage("记录 Redis 调度成功健康状态", async move {
+                redis.record_scheduler_success(id, latency, alpha).await
+            }) {
+                Ok(health) => {
+                    let mut entries = self.entries.lock();
+                    if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                        entry.health = health;
+                    }
+                }
+                Err(err) => tracing::warn!(
+                    credential_id = id,
+                    "记录 Redis 调度成功健康状态失败: {}",
+                    err
+                ),
+            }
         }
         self.notify_dispatch_state_changed();
     }
@@ -3167,6 +3551,7 @@ impl MultiTokenManager {
     /// 报告指定凭据遇到上游瞬态错误，按 Retry-After 或默认值临时冷却。
     ///
     /// 不增加 failure_count，不禁用凭据；冷却到期后自动重新参与调度。
+    #[allow(dead_code)]
     pub fn report_transient_failure(
         &self,
         id: u64,
@@ -3174,17 +3559,31 @@ impl MultiTokenManager {
         retry_after: Option<StdDuration>,
         reason: impl Into<String>,
     ) -> anyhow::Result<bool> {
+        self.report_transient_failure_kind(
+            id,
+            model,
+            TransientFailureKind::Protocol,
+            retry_after,
+            reason,
+        )
+    }
+
+    pub fn report_transient_failure_kind(
+        &self,
+        id: u64,
+        model: Option<&str>,
+        kind: TransientFailureKind,
+        retry_after: Option<StdDuration>,
+        reason: impl Into<String>,
+    ) -> anyhow::Result<bool> {
         let reason = reason.into();
-        let duration = self.cooldown_duration_from_retry_after(retry_after);
+        let (base, max, multiplier, jitter, probation, alpha) =
+            self.transient_failure_settings(kind);
         let now = Instant::now();
-        let until = now + duration;
+        let now_ms = Utc::now().timestamp_millis();
 
         {
             let mut entries = self.entries.lock();
-            let usable_count = entries
-                .iter()
-                .filter(|e| Self::credential_is_usable_for_model(e, model))
-                .count();
             let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
                 return Ok(entries.iter().any(|e| !e.disabled));
             };
@@ -3192,33 +3591,37 @@ impl MultiTokenManager {
             if entry.disabled {
                 return Ok(entries.iter().any(|e| !e.disabled));
             }
-
-            if usable_count <= 1 {
-                entry.last_used_at = Some(Utc::now().to_rfc3339());
-                tracing::warn!(
-                    "凭据 #{} 遇到上游瞬态错误，但没有其他可用凭据；不进入本地临时冷却: {}",
-                    id,
-                    reason
-                );
-                return Ok(false);
-            }
         }
 
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
             let reason_for_redis = reason.clone();
-            match block_on_storage("写入 Redis 凭据临时冷却", async move {
+            match block_on_storage("写入 Redis 凭据临时冷却与健康状态", async move {
                 redis
-                    .set_scheduler_cooldown(id, duration, Some(reason_for_redis))
+                    .record_scheduler_transient_failure(
+                        id,
+                        kind.as_str(),
+                        &reason_for_redis,
+                        retry_after,
+                        base,
+                        max,
+                        multiplier,
+                        jitter,
+                        probation,
+                        alpha,
+                    )
                     .await
             }) {
-                Ok(SchedulerCooldownState { until_ms, reason }) => {
-                    let now_ms = Utc::now().timestamp_millis();
+                Ok((cooldown, health)) => {
                     let mut entries = self.entries.lock();
                     if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
-                        entry.cooldown_until =
-                            instant_from_epoch_ms(until_ms, now_ms, Instant::now());
-                        entry.cooldown_reason = reason;
+                        entry.cooldown_until = instant_from_epoch_ms(
+                            cooldown.until_ms,
+                            Utc::now().timestamp_millis(),
+                            Instant::now(),
+                        );
+                        entry.cooldown_reason = cooldown.reason;
+                        entry.health = health;
                         entry.last_used_at = Some(Utc::now().to_rfc3339());
                     }
                 }
@@ -3227,35 +3630,82 @@ impl MultiTokenManager {
         } else {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
-                entry.cooldown_until = Some(until);
-                entry.cooldown_reason = Some(reason.clone());
+                entry.health.transient_failure_streak =
+                    entry.health.transient_failure_streak.saturating_add(1);
+                entry.health.recent_error_rate += alpha * (1.0 - entry.health.recent_error_rate);
+                entry.health.last_error_kind = Some(kind.as_str().to_string());
+                entry.health.last_error_reason = Some(reason.clone());
+                entry.health.last_error_at_ms = Some(now_ms);
+                let duration = Self::local_cooldown_duration(
+                    retry_after,
+                    base,
+                    max,
+                    multiplier,
+                    jitter,
+                    entry.health.transient_failure_streak,
+                );
+                let until = now + duration;
+                if entry.cooldown_until.is_none_or(|existing| until > existing) {
+                    entry.cooldown_until = Some(until);
+                    entry.cooldown_reason = Some(reason.clone());
+                }
+                entry.health.probation_until_ms =
+                    Some(
+                        entry.health.probation_until_ms.unwrap_or(0).max(
+                            now_ms + duration.as_millis() as i64 + probation.as_millis() as i64,
+                        ),
+                    );
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
             }
         }
 
+        let duration = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .and_then(|entry| Self::entry_cooldown_remaining(entry, Instant::now()))
+                .unwrap_or(base)
+        };
+
         tracing::warn!(
-            "凭据 #{} 因上游瞬态错误进入临时冷却 {} 秒: {}",
+            "凭据 #{} 因 {} 瞬态错误进入临时冷却 {} 秒: {}",
             id,
+            kind.as_str(),
             duration.as_secs(),
             reason
         );
 
-        let entries = self.entries.lock();
-        let max_concurrent_requests = self.max_concurrent_requests();
-        Ok(entries.iter().any(|e| {
-            e.id != id
-                && Self::credential_is_dispatchable(
-                    e,
-                    model,
-                    Instant::now(),
-                    max_concurrent_requests,
-                )
-        }))
+        let has_alternate = {
+            let entries = self.entries.lock();
+            let max_concurrent_requests = self.max_concurrent_requests();
+            entries.iter().any(|e| {
+                e.id != id
+                    && Self::credential_is_dispatchable(
+                        e,
+                        model,
+                        Instant::now(),
+                        max_concurrent_requests,
+                    )
+            })
+        };
+        self.notify_dispatch_state_changed();
+        Ok(has_alternate)
     }
 
     /// 报告指定会话在该凭据上的 API 调用成功，并清理 sticky 软失败计数。
+    #[allow(dead_code)]
     pub fn report_success_for_session(&self, id: u64, session_id: Option<&str>) {
-        self.report_success(id);
+        self.report_success_for_session_with_latency(id, session_id, None);
+    }
+
+    pub fn report_success_for_session_with_latency(
+        &self,
+        id: u64,
+        session_id: Option<&str>,
+        latency: Option<StdDuration>,
+    ) {
+        self.report_success_with_latency(id, latency);
         if let Some(sid) = session_id {
             self.clear_session_soft_failure(sid, id);
         }
@@ -3749,10 +4199,13 @@ impl MultiTokenManager {
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
         self.refresh_scheduler_state_from_redis_best_effort();
+        let global_capacity = self.global_capacity_state();
+        let config = self.config.lock().clone();
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
         let now = Instant::now();
+        let now_ms = Utc::now().timestamp_millis();
         let max_concurrent_requests = self.max_concurrent_requests();
         let lease_max_age = self.in_flight_lease_max_age();
 
@@ -3843,12 +4296,34 @@ impl MultiTokenManager {
                             .map(|duration| duration.as_secs())
                             .unwrap_or(0),
                         warmup_remaining: e.warmup_remaining,
+                        transient_failure_streak: e.health.transient_failure_streak,
+                        recent_error_rate: e.health.recent_error_rate,
+                        latency_ewma_ms: e.health.latency_ewma_ms,
+                        last_error_kind: e.health.last_error_kind.clone(),
+                        last_error_reason: e.health.last_error_reason.clone(),
+                        last_error_at_ms: e.health.last_error_at_ms,
+                        in_probation: e
+                            .health
+                            .probation_until_ms
+                            .is_some_and(|until_ms| until_ms > now_ms),
+                        probation_remaining_secs: e
+                            .health
+                            .probation_until_ms
+                            .filter(|until_ms| *until_ms > now_ms)
+                            .map(|until_ms| ((until_ms - now_ms) as u64).div_ceil(1000))
+                            .unwrap_or(0),
+                        scheduler_selection_count: e.health.selection_count,
+                        scheduler_score: self.scheduler_score(e, now_ms),
                     }
                 })
                 .collect(),
             current_id,
             total: entries.len(),
             available,
+            global_in_flight_requests: global_capacity.in_flight_requests,
+            queued_requests: global_capacity.queued_requests,
+            global_max_concurrent_requests: config.dispatch_global_max_concurrent_requests,
+            max_queued_requests: config.dispatch_max_queued_requests,
         }
     }
 
@@ -4197,6 +4672,7 @@ impl MultiTokenManager {
                 in_flight_requests: 0,
                 in_flight_leases: Vec::new(),
                 warmup_remaining,
+                health: SchedulerHealthState::default(),
             });
         }
 
@@ -4402,7 +4878,7 @@ impl MultiTokenManager {
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         // 验证模式值
-        if mode != "priority" && mode != "balanced" {
+        if mode != "priority" && mode != "balanced" && mode != "health_balanced" {
             anyhow::bail!("无效的负载均衡模式: {}", mode);
         }
 
@@ -5128,9 +5604,144 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_transient_failure_does_not_cool_down_only_usable_credential() {
+    async fn test_transient_failure_does_not_shorten_existing_cooldown() {
         let mut config = Config::default();
         config.credential_transient_cooldown_secs = 60;
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        manager
+            .report_transient_failure(1, None, Some(StdDuration::from_secs(30)), "long")
+            .unwrap();
+        manager
+            .report_transient_failure(1, None, Some(StdDuration::from_secs(1)), "short")
+            .unwrap();
+
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(first.cooldown_reason.as_deref(), Some("long"));
+        assert!(first.cooldown_remaining_secs >= 20);
+    }
+
+    #[test]
+    fn test_success_does_not_clear_active_transient_cooldown() {
+        let mut config = Config::default();
+        config.credential_transient_cooldown_secs = 60;
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        manager
+            .report_transient_failure(1, None, Some(StdDuration::from_secs(30)), "429")
+            .unwrap();
+        manager.report_success(1);
+
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert!(first.cooled_down);
+        assert_eq!(first.success_count, 1);
+    }
+
+    #[test]
+    fn test_structured_transient_failure_updates_health_and_backoff() {
+        let mut config = Config::default();
+        config.credential_rate_limit_cooldown_secs = 1;
+        config.credential_max_cooldown_secs = 10;
+        config.credential_cooldown_backoff_multiplier = 2.0;
+        config.credential_cooldown_jitter_percent = 0;
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        manager
+            .report_transient_failure_kind(1, None, TransientFailureKind::RateLimit, None, "429")
+            .unwrap();
+        manager
+            .report_transient_failure_kind(
+                1,
+                None,
+                TransientFailureKind::RateLimit,
+                None,
+                "429 again",
+            )
+            .unwrap();
+
+        let entry = &manager.snapshot().entries[0];
+        assert_eq!(entry.transient_failure_streak, 2);
+        assert!(entry.recent_error_rate > 0.0);
+        assert_eq!(entry.last_error_kind.as_deref(), Some("rate_limit"));
+        assert!(entry.cooldown_remaining_secs >= 2);
+        assert!(entry.in_probation);
+    }
+
+    #[test]
+    fn test_success_updates_health_latency_without_clearing_cooldown() {
+        let mut config = Config::default();
+        config.credential_stream_error_cooldown_secs = 10;
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+        manager
+            .report_transient_failure_kind(
+                1,
+                None,
+                TransientFailureKind::Stream,
+                None,
+                "stream idle timeout",
+            )
+            .unwrap();
+        manager.report_success_with_latency(1, Some(StdDuration::from_millis(120)));
+
+        let entry = &manager.snapshot().entries[0];
+        assert!(entry.cooled_down);
+        assert_eq!(entry.transient_failure_streak, 0);
+        assert_eq!(entry.latency_ewma_ms, Some(120.0));
+    }
+
+    #[tokio::test]
+    async fn test_health_balanced_mode_prefers_best_scored_candidate() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "health_balanced".to_string();
+        config.scheduler_top_k = 1;
+        let mut first = KiroCredentials::default();
+        first.access_token = Some("first".to_string());
+        first.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut second = KiroCredentials::default();
+        second.access_token = Some("second".to_string());
+        second.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager =
+            MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].health.recent_error_rate = 1.0;
+            entries[0].health.latency_ewma_ms = Some(10_000.0);
+        }
+
+        let mut ctx = manager.acquire_context(None).await.unwrap();
+        assert_eq!(ctx.id, 2);
+        ctx.release_in_flight();
+    }
+
+    #[tokio::test]
+    async fn test_transient_failure_cools_down_only_usable_credential() {
+        let mut config = Config::default();
+        config.credential_transient_cooldown_secs = 1;
+        config.credential_max_cooldown_secs = 1;
 
         let mut disabled = KiroCredentials::default();
         disabled.disabled = true;
@@ -5138,12 +5749,13 @@ mod tests {
         active.access_token = Some("active-token".to_string());
         active.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-        let manager =
-            MultiTokenManager::new(config, vec![disabled, active], None, None, false).unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(config, vec![disabled, active], None, None, false).unwrap(),
+        );
 
         assert!(
             !manager
-                .report_transient_failure(2, None, Some(StdDuration::from_secs(20)), "429")
+                .report_transient_failure(2, None, Some(StdDuration::from_millis(20)), "429")
                 .unwrap()
         );
 
@@ -5151,9 +5763,17 @@ mod tests {
         let active = snapshot.entries.iter().find(|entry| entry.id == 2).unwrap();
         assert!(!active.disabled);
         assert_eq!(active.failure_count, 0);
-        assert!(!active.cooled_down);
+        assert!(active.cooled_down);
 
-        let mut ctx = manager.acquire_context(None).await.unwrap();
+        let started = Instant::now();
+        let mut ctx = tokio::time::timeout(
+            StdDuration::from_millis(1_500),
+            manager.acquire_context(None),
+        )
+        .await
+        .expect("唯一可用凭据冷却恢复后应继续调度")
+        .expect("等待请求应成功获取凭据");
+        assert!(started.elapsed() >= StdDuration::from_millis(900));
         assert_eq!(ctx.id, 2);
         ctx.release_in_flight();
     }
@@ -5294,6 +5914,72 @@ mod tests {
             .unwrap();
         assert_eq!(released.in_flight_requests, 0);
         second.release_in_flight();
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_prefers_lower_in_flight_with_same_priority() {
+        let config = Config::default();
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        let mut first = manager.acquire_context(None).await.unwrap();
+        let mut second = manager.acquire_context(None).await.unwrap();
+
+        assert_ne!(first.id, second.id);
+
+        first.release_in_flight();
+        second.release_in_flight();
+    }
+
+    #[tokio::test]
+    async fn test_global_capacity_limits_dispatch_and_bounds_wait_queue() {
+        let mut config = Config::default();
+        config.dispatch_global_max_concurrent_requests = 1;
+        config.dispatch_max_queued_requests = 1;
+        let mut first_cred = KiroCredentials::default();
+        first_cred.access_token = Some("first".to_string());
+        first_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut second_cred = KiroCredentials::default();
+        second_cred.access_token = Some("second".to_string());
+        second_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager = Arc::new(
+            MultiTokenManager::new(config, vec![first_cred, second_cred], None, None, false)
+                .unwrap(),
+        );
+
+        let mut first = manager.acquire_context(None).await.unwrap();
+        assert_eq!(manager.snapshot().global_in_flight_requests, 1);
+
+        let waiting_manager = manager.clone();
+        let waiting = tokio::spawn(async move { waiting_manager.acquire_context(None).await });
+        tokio::time::sleep(StdDuration::from_millis(30)).await;
+        assert_eq!(manager.snapshot().queued_requests, 1);
+
+        let rejected = match manager.acquire_context(None).await {
+            Ok(mut ctx) => {
+                ctx.release_in_flight();
+                panic!("超过等待队列上限的请求不应获得调度上下文")
+            }
+            Err(err) => err,
+        };
+        assert!(rejected.to_string().contains("等待队列已满"));
+
+        first.release_in_flight();
+        let mut next = tokio::time::timeout(StdDuration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(manager.snapshot().queued_requests, 0);
+        next.release_in_flight();
     }
 
     #[tokio::test]

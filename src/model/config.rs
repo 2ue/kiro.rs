@@ -485,6 +485,42 @@ pub struct Config {
     #[serde(default = "default_credential_transient_cooldown_secs")]
     pub credential_transient_cooldown_secs: u64,
 
+    /// 上游 429 没有 Retry-After 时的基础冷却秒数。
+    #[serde(default = "default_credential_rate_limit_cooldown_secs")]
+    pub credential_rate_limit_cooldown_secs: u64,
+
+    /// 上游 5xx/408 等服务器瞬态错误的基础冷却秒数。
+    #[serde(default = "default_credential_server_error_cooldown_secs")]
+    pub credential_server_error_cooldown_secs: u64,
+
+    /// 网络发送错误的基础冷却秒数。
+    #[serde(default = "default_credential_network_error_cooldown_secs")]
+    pub credential_network_error_cooldown_secs: u64,
+
+    /// 流式读取/idle timeout 错误的基础冷却秒数。
+    #[serde(default = "default_credential_stream_error_cooldown_secs")]
+    pub credential_stream_error_cooldown_secs: u64,
+
+    /// 可重试协议异常或无法分类错误的基础冷却秒数。
+    #[serde(default = "default_credential_protocol_error_cooldown_secs")]
+    pub credential_protocol_error_cooldown_secs: u64,
+
+    /// 认证失败进入刷新/判定期间的基础冷却秒数。
+    #[serde(default = "default_credential_auth_error_cooldown_secs")]
+    pub credential_auth_error_cooldown_secs: u64,
+
+    /// 同一凭据连续瞬态失败时的冷却退避倍率。
+    #[serde(default = "default_credential_cooldown_backoff_multiplier")]
+    pub credential_cooldown_backoff_multiplier: f64,
+
+    /// 冷却退避随机抖动百分比，范围 0..=100。
+    #[serde(default = "default_credential_cooldown_jitter_percent")]
+    pub credential_cooldown_jitter_percent: u32,
+
+    /// 冷却结束后的降权观察窗口秒数。
+    #[serde(default = "default_credential_probation_secs")]
+    pub credential_probation_secs: u64,
+
     /// 单个凭据临时冷却最长秒数，用于限制 Retry-After 头的影响范围。
     #[serde(default = "default_credential_max_cooldown_secs")]
     pub credential_max_cooldown_secs: u64,
@@ -503,6 +539,14 @@ pub struct Config {
     #[serde(default = "default_credential_in_flight_lease_max_secs")]
     pub credential_in_flight_lease_max_secs: u64,
 
+    /// 全局最大并发调度请求数。`0` 表示不限制。
+    #[serde(default)]
+    pub dispatch_global_max_concurrent_requests: u32,
+
+    /// 全局最多允许等待调度容量的请求数。`0` 表示不限制。
+    #[serde(default)]
+    pub dispatch_max_queued_requests: u32,
+
     /// 新凭据预热请求次数。预热期内 balanced 会降低该凭据调度权重，但不会伪造 success_count。
     #[serde(default = "default_credential_warmup_requests")]
     pub credential_warmup_requests: u32,
@@ -518,6 +562,34 @@ pub struct Config {
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
+
+    /// 健康调度的错误率 EWMA 新样本权重。
+    #[serde(default = "default_scheduler_error_ewma_alpha")]
+    pub scheduler_error_ewma_alpha: f64,
+
+    /// 健康调度的配置优先级权重。
+    #[serde(default = "default_scheduler_priority_weight")]
+    pub scheduler_priority_weight: f64,
+
+    /// 健康调度的实时并发负载权重。
+    #[serde(default = "default_scheduler_load_weight")]
+    pub scheduler_load_weight: f64,
+
+    /// 健康调度的近期错误率权重。
+    #[serde(default = "default_scheduler_error_weight")]
+    pub scheduler_error_weight: f64,
+
+    /// 健康调度的延迟 EWMA 权重。
+    #[serde(default = "default_scheduler_latency_weight")]
+    pub scheduler_latency_weight: f64,
+
+    /// 健康调度的恢复观察期惩罚权重。
+    #[serde(default = "default_scheduler_probation_weight")]
+    pub scheduler_probation_weight: f64,
+
+    /// 健康模式在得分最佳的前 N 个候选中加权抽样，降低并发抢占集中度。
+    #[serde(default = "default_scheduler_top_k")]
+    pub scheduler_top_k: u32,
 
     /// Anthropic 兼容 profile（默认 claude-code）。
     #[serde(default = "default_compat_profile")]
@@ -635,6 +707,42 @@ fn default_credential_transient_cooldown_secs() -> u64 {
     10
 }
 
+fn default_credential_rate_limit_cooldown_secs() -> u64 {
+    30
+}
+
+fn default_credential_server_error_cooldown_secs() -> u64 {
+    5
+}
+
+fn default_credential_network_error_cooldown_secs() -> u64 {
+    5
+}
+
+fn default_credential_stream_error_cooldown_secs() -> u64 {
+    5
+}
+
+fn default_credential_protocol_error_cooldown_secs() -> u64 {
+    10
+}
+
+fn default_credential_auth_error_cooldown_secs() -> u64 {
+    10
+}
+
+fn default_credential_cooldown_backoff_multiplier() -> f64 {
+    2.0
+}
+
+fn default_credential_cooldown_jitter_percent() -> u32 {
+    20
+}
+
+fn default_credential_probation_secs() -> u64 {
+    30
+}
+
 fn default_credential_max_cooldown_secs() -> u64 {
     300
 }
@@ -653,6 +761,34 @@ fn default_credential_warmup_requests() -> u32 {
 
 fn default_credential_warmup_selection_percent() -> u32 {
     5
+}
+
+fn default_scheduler_error_ewma_alpha() -> f64 {
+    0.2
+}
+
+fn default_scheduler_priority_weight() -> f64 {
+    1.0
+}
+
+fn default_scheduler_load_weight() -> f64 {
+    100.0
+}
+
+fn default_scheduler_error_weight() -> f64 {
+    100.0
+}
+
+fn default_scheduler_latency_weight() -> f64 {
+    0.01
+}
+
+fn default_scheduler_probation_weight() -> f64 {
+    50.0
+}
+
+fn default_scheduler_top_k() -> u32 {
+    3
 }
 
 fn default_compat_profile() -> CompatProfile {
@@ -781,13 +917,34 @@ impl Default for Config {
             credential_rpm: None,
             credential_max_concurrent_requests: 0,
             credential_transient_cooldown_secs: default_credential_transient_cooldown_secs(),
+            credential_rate_limit_cooldown_secs: default_credential_rate_limit_cooldown_secs(),
+            credential_server_error_cooldown_secs: default_credential_server_error_cooldown_secs(),
+            credential_network_error_cooldown_secs: default_credential_network_error_cooldown_secs(
+            ),
+            credential_stream_error_cooldown_secs: default_credential_stream_error_cooldown_secs(),
+            credential_protocol_error_cooldown_secs:
+                default_credential_protocol_error_cooldown_secs(),
+            credential_auth_error_cooldown_secs: default_credential_auth_error_cooldown_secs(),
+            credential_cooldown_backoff_multiplier: default_credential_cooldown_backoff_multiplier(
+            ),
+            credential_cooldown_jitter_percent: default_credential_cooldown_jitter_percent(),
+            credential_probation_secs: default_credential_probation_secs(),
             credential_max_cooldown_secs: default_credential_max_cooldown_secs(),
             credential_dispatch_max_wait_secs: default_credential_dispatch_max_wait_secs(),
             credential_in_flight_lease_max_secs: default_credential_in_flight_lease_max_secs(),
+            dispatch_global_max_concurrent_requests: 0,
+            dispatch_max_queued_requests: 0,
             credential_warmup_requests: default_credential_warmup_requests(),
             credential_warmup_selection_percent: default_credential_warmup_selection_percent(),
             compression: CompressionConfig::default(),
             load_balancing_mode: default_load_balancing_mode(),
+            scheduler_error_ewma_alpha: default_scheduler_error_ewma_alpha(),
+            scheduler_priority_weight: default_scheduler_priority_weight(),
+            scheduler_load_weight: default_scheduler_load_weight(),
+            scheduler_error_weight: default_scheduler_error_weight(),
+            scheduler_latency_weight: default_scheduler_latency_weight(),
+            scheduler_probation_weight: default_scheduler_probation_weight(),
+            scheduler_top_k: default_scheduler_top_k(),
             compat_profile: default_compat_profile(),
             extract_thinking: default_extract_thinking(),
             prompt_cache_target_read_ratio: default_prompt_cache_target_read_ratio(),
@@ -884,11 +1041,19 @@ mod tests {
         assert_eq!(config.credential_rpm, None);
         assert_eq!(config.credential_max_concurrent_requests, 0);
         assert_eq!(config.credential_transient_cooldown_secs, 10);
+        assert_eq!(config.credential_rate_limit_cooldown_secs, 30);
+        assert_eq!(config.credential_server_error_cooldown_secs, 5);
+        assert_eq!(config.credential_auth_error_cooldown_secs, 10);
+        assert_eq!(config.credential_cooldown_backoff_multiplier, 2.0);
+        assert_eq!(config.credential_probation_secs, 30);
         assert_eq!(config.credential_max_cooldown_secs, 300);
         assert_eq!(config.credential_dispatch_max_wait_secs, 120);
         assert_eq!(config.credential_in_flight_lease_max_secs, 900);
+        assert_eq!(config.dispatch_global_max_concurrent_requests, 0);
+        assert_eq!(config.dispatch_max_queued_requests, 0);
         assert_eq!(config.credential_warmup_requests, 3);
         assert_eq!(config.credential_warmup_selection_percent, 5);
+        assert_eq!(config.scheduler_top_k, 3);
         assert!(!config.compression.enabled);
         assert!(config.compression.whitespace_compression);
         assert_eq!(

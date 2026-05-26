@@ -143,12 +143,25 @@ impl AdminService {
 
     /// 获取所有凭据状态
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
-        let (total, available, current_id, credentials) = self.credential_status_items();
+        let (
+            total,
+            available,
+            current_id,
+            global_in_flight_requests,
+            queued_requests,
+            global_max_concurrent_requests,
+            max_queued_requests,
+            credentials,
+        ) = self.credential_status_items();
 
         CredentialsStatusResponse {
             total,
             available,
             current_id,
+            global_in_flight_requests,
+            queued_requests,
+            global_max_concurrent_requests,
+            max_queued_requests,
             credentials,
         }
     }
@@ -157,7 +170,16 @@ impl AdminService {
     pub fn get_credentials_page(&self, page: usize, limit: usize) -> CredentialsPageResponse {
         let page = normalize_page(page);
         let limit = normalize_credentials_limit(limit);
-        let (total, available, current_id, credentials) = self.credential_status_items();
+        let (
+            total,
+            available,
+            current_id,
+            global_in_flight_requests,
+            queued_requests,
+            global_max_concurrent_requests,
+            max_queued_requests,
+            credentials,
+        ) = self.credential_status_items();
         let total_pages = total_pages(total, limit);
         let start = page.saturating_sub(1).saturating_mul(limit);
         let credentials = credentials.into_iter().skip(start).take(limit).collect();
@@ -166,6 +188,10 @@ impl AdminService {
             total,
             available,
             current_id,
+            global_in_flight_requests,
+            queued_requests,
+            global_max_concurrent_requests,
+            max_queued_requests,
             page,
             limit,
             total_pages,
@@ -173,7 +199,18 @@ impl AdminService {
         }
     }
 
-    fn credential_status_items(&self) -> (usize, usize, u64, Vec<CredentialStatusItem>) {
+    fn credential_status_items(
+        &self,
+    ) -> (
+        usize,
+        usize,
+        u64,
+        u32,
+        u32,
+        u32,
+        u32,
+        Vec<CredentialStatusItem>,
+    ) {
         let snapshot = self.token_manager.snapshot();
         let default_endpoint = self.token_manager.runtime_config().default_endpoint;
         let cost_summary = self.usage_recorder.credential_cost_summary();
@@ -229,6 +266,16 @@ impl AdminService {
                     max_concurrent_requests: entry.max_concurrent_requests,
                     in_flight_lease_max_secs: entry.in_flight_lease_max_secs,
                     warmup_remaining: entry.warmup_remaining,
+                    transient_failure_streak: entry.transient_failure_streak,
+                    recent_error_rate: entry.recent_error_rate,
+                    latency_ewma_ms: entry.latency_ewma_ms,
+                    last_error_kind: entry.last_error_kind,
+                    last_error_reason: entry.last_error_reason,
+                    last_error_at_ms: entry.last_error_at_ms,
+                    in_probation: entry.in_probation,
+                    probation_remaining_secs: entry.probation_remaining_secs,
+                    scheduler_selection_count: entry.scheduler_selection_count,
+                    scheduler_score: entry.scheduler_score,
                     estimated_cost_usd: cost.estimated_cost_usd,
                     priced_requests: cost.priced_requests,
                     unpriced_requests: cost.unpriced_requests,
@@ -243,6 +290,10 @@ impl AdminService {
             snapshot.total,
             snapshot.available,
             snapshot.current_id,
+            snapshot.global_in_flight_requests,
+            snapshot.queued_requests,
+            snapshot.global_max_concurrent_requests,
+            snapshot.max_queued_requests,
             credentials,
         )
     }
@@ -737,11 +788,29 @@ impl AdminService {
             credential_rpm: config.credential_rpm.unwrap_or(0),
             credential_max_concurrent_requests: config.credential_max_concurrent_requests,
             credential_transient_cooldown_secs: config.credential_transient_cooldown_secs,
+            credential_rate_limit_cooldown_secs: config.credential_rate_limit_cooldown_secs,
+            credential_server_error_cooldown_secs: config.credential_server_error_cooldown_secs,
+            credential_network_error_cooldown_secs: config.credential_network_error_cooldown_secs,
+            credential_stream_error_cooldown_secs: config.credential_stream_error_cooldown_secs,
+            credential_protocol_error_cooldown_secs: config.credential_protocol_error_cooldown_secs,
+            credential_auth_error_cooldown_secs: config.credential_auth_error_cooldown_secs,
+            credential_cooldown_backoff_multiplier: config.credential_cooldown_backoff_multiplier,
+            credential_cooldown_jitter_percent: config.credential_cooldown_jitter_percent,
+            credential_probation_secs: config.credential_probation_secs,
             credential_max_cooldown_secs: config.credential_max_cooldown_secs,
             credential_dispatch_max_wait_secs: config.credential_dispatch_max_wait_secs,
             credential_in_flight_lease_max_secs: config.credential_in_flight_lease_max_secs,
+            dispatch_global_max_concurrent_requests: config.dispatch_global_max_concurrent_requests,
+            dispatch_max_queued_requests: config.dispatch_max_queued_requests,
             credential_warmup_requests: config.credential_warmup_requests,
             credential_warmup_selection_percent: config.credential_warmup_selection_percent,
+            scheduler_error_ewma_alpha: config.scheduler_error_ewma_alpha,
+            scheduler_priority_weight: config.scheduler_priority_weight,
+            scheduler_load_weight: config.scheduler_load_weight,
+            scheduler_error_weight: config.scheduler_error_weight,
+            scheduler_latency_weight: config.scheduler_latency_weight,
+            scheduler_probation_weight: config.scheduler_probation_weight,
+            scheduler_top_k: config.scheduler_top_k,
             compression_enabled: config.compression.enabled,
             whitespace_compression: config.compression.whitespace_compression,
             prompt_cache_target_read_ratio: config.prompt_cache_target_read_ratio,
@@ -770,9 +839,63 @@ impl AdminService {
         let credential_in_flight_lease_max_secs = req
             .credential_in_flight_lease_max_secs
             .unwrap_or(current_config.credential_in_flight_lease_max_secs);
+        let credential_rate_limit_cooldown_secs = req
+            .credential_rate_limit_cooldown_secs
+            .unwrap_or(current_config.credential_rate_limit_cooldown_secs);
+        let credential_server_error_cooldown_secs = req
+            .credential_server_error_cooldown_secs
+            .unwrap_or(current_config.credential_server_error_cooldown_secs);
+        let credential_network_error_cooldown_secs = req
+            .credential_network_error_cooldown_secs
+            .unwrap_or(current_config.credential_network_error_cooldown_secs);
+        let credential_stream_error_cooldown_secs = req
+            .credential_stream_error_cooldown_secs
+            .unwrap_or(current_config.credential_stream_error_cooldown_secs);
+        let credential_protocol_error_cooldown_secs = req
+            .credential_protocol_error_cooldown_secs
+            .unwrap_or(current_config.credential_protocol_error_cooldown_secs);
+        let credential_auth_error_cooldown_secs = req
+            .credential_auth_error_cooldown_secs
+            .unwrap_or(current_config.credential_auth_error_cooldown_secs);
+        let credential_cooldown_backoff_multiplier = req
+            .credential_cooldown_backoff_multiplier
+            .unwrap_or(current_config.credential_cooldown_backoff_multiplier);
+        let credential_cooldown_jitter_percent = req
+            .credential_cooldown_jitter_percent
+            .unwrap_or(current_config.credential_cooldown_jitter_percent);
+        let credential_probation_secs = req
+            .credential_probation_secs
+            .unwrap_or(current_config.credential_probation_secs);
+        let dispatch_global_max_concurrent_requests = req
+            .dispatch_global_max_concurrent_requests
+            .unwrap_or(current_config.dispatch_global_max_concurrent_requests);
+        let dispatch_max_queued_requests = req
+            .dispatch_max_queued_requests
+            .unwrap_or(current_config.dispatch_max_queued_requests);
         let warmup_selection_percent = req
             .credential_warmup_selection_percent
             .unwrap_or(current_config.credential_warmup_selection_percent);
+        let scheduler_error_ewma_alpha = req
+            .scheduler_error_ewma_alpha
+            .unwrap_or(current_config.scheduler_error_ewma_alpha);
+        let scheduler_priority_weight = req
+            .scheduler_priority_weight
+            .unwrap_or(current_config.scheduler_priority_weight);
+        let scheduler_load_weight = req
+            .scheduler_load_weight
+            .unwrap_or(current_config.scheduler_load_weight);
+        let scheduler_error_weight = req
+            .scheduler_error_weight
+            .unwrap_or(current_config.scheduler_error_weight);
+        let scheduler_latency_weight = req
+            .scheduler_latency_weight
+            .unwrap_or(current_config.scheduler_latency_weight);
+        let scheduler_probation_weight = req
+            .scheduler_probation_weight
+            .unwrap_or(current_config.scheduler_probation_weight);
+        let scheduler_top_k = req
+            .scheduler_top_k
+            .unwrap_or(current_config.scheduler_top_k);
         let prompt_cache_target_read_ratio = req
             .prompt_cache_target_read_ratio
             .unwrap_or(current_config.prompt_cache_target_read_ratio);
@@ -815,6 +938,59 @@ impl AdminService {
         if req.credential_transient_cooldown_secs > req.credential_max_cooldown_secs {
             return Err(AdminServiceError::InvalidCredential(
                 "credentialTransientCooldownSecs 不能大于 credentialMaxCooldownSecs".to_string(),
+            ));
+        }
+        if [
+            credential_rate_limit_cooldown_secs,
+            credential_server_error_cooldown_secs,
+            credential_network_error_cooldown_secs,
+            credential_stream_error_cooldown_secs,
+            credential_protocol_error_cooldown_secs,
+            credential_auth_error_cooldown_secs,
+        ]
+        .into_iter()
+        .any(|value| value == 0 || value > req.credential_max_cooldown_secs)
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "各错误类型基础冷却秒数必须大于 0 且不能大于 credentialMaxCooldownSecs".to_string(),
+            ));
+        }
+        if !credential_cooldown_backoff_multiplier.is_finite()
+            || !(1.0..=10.0).contains(&credential_cooldown_backoff_multiplier)
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "credentialCooldownBackoffMultiplier 必须在 1 到 10 之间".to_string(),
+            ));
+        }
+        if credential_cooldown_jitter_percent > 100 {
+            return Err(AdminServiceError::InvalidCredential(
+                "credentialCooldownJitterPercent 不能大于 100".to_string(),
+            ));
+        }
+        if !scheduler_error_ewma_alpha.is_finite()
+            || !(0.01..=1.0).contains(&scheduler_error_ewma_alpha)
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "schedulerErrorEwmaAlpha 必须在 0.01 到 1 之间".to_string(),
+            ));
+        }
+        if [
+            scheduler_priority_weight,
+            scheduler_load_weight,
+            scheduler_error_weight,
+            scheduler_latency_weight,
+            scheduler_probation_weight,
+        ]
+        .into_iter()
+        .any(|value| !value.is_finite() || value < 0.0)
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "调度评分权重必须为非负有限数字".to_string(),
+            ));
+        }
+        if scheduler_top_k == 0 || scheduler_top_k > 100 {
+            return Err(AdminServiceError::InvalidCredential(
+                "schedulerTopK 必须在 1 到 100 之间".to_string(),
             ));
         }
         if warmup_selection_percent > 100 {
@@ -873,11 +1049,35 @@ impl AdminService {
                 config.credential_rpm = credential_rpm;
                 config.credential_max_concurrent_requests = req.credential_max_concurrent_requests;
                 config.credential_transient_cooldown_secs = req.credential_transient_cooldown_secs;
+                config.credential_rate_limit_cooldown_secs = credential_rate_limit_cooldown_secs;
+                config.credential_server_error_cooldown_secs =
+                    credential_server_error_cooldown_secs;
+                config.credential_network_error_cooldown_secs =
+                    credential_network_error_cooldown_secs;
+                config.credential_stream_error_cooldown_secs =
+                    credential_stream_error_cooldown_secs;
+                config.credential_protocol_error_cooldown_secs =
+                    credential_protocol_error_cooldown_secs;
+                config.credential_auth_error_cooldown_secs = credential_auth_error_cooldown_secs;
+                config.credential_cooldown_backoff_multiplier =
+                    credential_cooldown_backoff_multiplier;
+                config.credential_cooldown_jitter_percent = credential_cooldown_jitter_percent;
+                config.credential_probation_secs = credential_probation_secs;
                 config.credential_max_cooldown_secs = req.credential_max_cooldown_secs;
                 config.credential_dispatch_max_wait_secs = credential_dispatch_max_wait_secs;
                 config.credential_in_flight_lease_max_secs = credential_in_flight_lease_max_secs;
+                config.dispatch_global_max_concurrent_requests =
+                    dispatch_global_max_concurrent_requests;
+                config.dispatch_max_queued_requests = dispatch_max_queued_requests;
                 config.credential_warmup_requests = req.credential_warmup_requests;
                 config.credential_warmup_selection_percent = warmup_selection_percent;
+                config.scheduler_error_ewma_alpha = scheduler_error_ewma_alpha;
+                config.scheduler_priority_weight = scheduler_priority_weight;
+                config.scheduler_load_weight = scheduler_load_weight;
+                config.scheduler_error_weight = scheduler_error_weight;
+                config.scheduler_latency_weight = scheduler_latency_weight;
+                config.scheduler_probation_weight = scheduler_probation_weight;
+                config.scheduler_top_k = scheduler_top_k;
                 config.compression = compression.clone();
                 config.prompt_cache_target_read_ratio = prompt_cache_target_read_ratio;
                 config.prompt_cache_token_scale = prompt_cache_token_scale;
@@ -957,9 +1157,9 @@ impl AdminService {
         req: SetLoadBalancingModeRequest,
     ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
         // 验证模式值
-        if req.mode != "priority" && req.mode != "balanced" {
+        if req.mode != "priority" && req.mode != "balanced" && req.mode != "health_balanced" {
             return Err(AdminServiceError::InvalidCredential(
-                "mode 必须是 'priority' 或 'balanced'".to_string(),
+                "mode 必须是 'priority'、'balanced' 或 'health_balanced'".to_string(),
             ));
         }
 

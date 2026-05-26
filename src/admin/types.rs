@@ -39,6 +39,14 @@ pub struct CredentialsStatusResponse {
     pub available: usize,
     /// 当前活跃凭据 ID
     pub current_id: u64,
+    /// 全局正在处理的调度请求数量。
+    pub global_in_flight_requests: u32,
+    /// 全局等待调度容量的请求数量。
+    pub queued_requests: u32,
+    /// 全局最大并发限制。0 表示不限。
+    pub global_max_concurrent_requests: u32,
+    /// 全局等待队列上限。0 表示不限。
+    pub max_queued_requests: u32,
     /// 各凭据状态列表
     pub credentials: Vec<CredentialStatusItem>,
 }
@@ -53,6 +61,10 @@ pub struct CredentialsPageResponse {
     pub available: usize,
     /// 当前活跃凭据 ID
     pub current_id: u64,
+    pub global_in_flight_requests: u32,
+    pub queued_requests: u32,
+    pub global_max_concurrent_requests: u32,
+    pub max_queued_requests: u32,
     /// 当前页码（从 1 开始）
     pub page: usize,
     /// 每页数量
@@ -139,6 +151,28 @@ pub struct CredentialStatusItem {
     pub in_flight_lease_max_secs: u64,
     /// 预热剩余请求数。
     pub warmup_remaining: u32,
+    /// 连续瞬态失败次数。
+    pub transient_failure_streak: u32,
+    /// 近期错误率 EWMA，范围 0..=1。
+    pub recent_error_rate: f64,
+    /// 成功调用总耗时 EWMA（毫秒）。
+    pub latency_ewma_ms: Option<f64>,
+    /// 最近瞬态错误类型。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_kind: Option<String>,
+    /// 最近瞬态错误原因。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_reason: Option<String>,
+    /// 最近瞬态错误时间（Unix 毫秒）。
+    pub last_error_at_ms: Option<i64>,
+    /// 是否处于冷却结束后的降权观察窗口。
+    pub in_probation: bool,
+    /// 降权观察剩余秒数。
+    pub probation_remaining_secs: u64,
+    /// 调度选中次数。
+    pub scheduler_selection_count: u64,
+    /// 调度健康评分，越低越优先。
+    pub scheduler_score: f64,
     /// 该凭据已记录的估算费用（USD）。
     pub estimated_cost_usd: f64,
     /// 有价格表命中的请求数。
@@ -317,7 +351,7 @@ pub struct BalanceResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoadBalancingModeResponse {
-    /// 当前模式（"priority" 或 "balanced"）
+    /// 当前模式（"priority"、"balanced" 或 "health_balanced"）
     pub mode: String,
 }
 
@@ -325,7 +359,7 @@ pub struct LoadBalancingModeResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetLoadBalancingModeRequest {
-    /// 模式（"priority" 或 "balanced"）
+    /// 模式（"priority"、"balanced" 或 "health_balanced"）
     pub mode: String,
 }
 
@@ -337,11 +371,29 @@ pub struct RuntimeConfigResponse {
     pub credential_rpm: u32,
     pub credential_max_concurrent_requests: u32,
     pub credential_transient_cooldown_secs: u64,
+    pub credential_rate_limit_cooldown_secs: u64,
+    pub credential_server_error_cooldown_secs: u64,
+    pub credential_network_error_cooldown_secs: u64,
+    pub credential_stream_error_cooldown_secs: u64,
+    pub credential_protocol_error_cooldown_secs: u64,
+    pub credential_auth_error_cooldown_secs: u64,
+    pub credential_cooldown_backoff_multiplier: f64,
+    pub credential_cooldown_jitter_percent: u32,
+    pub credential_probation_secs: u64,
     pub credential_max_cooldown_secs: u64,
     pub credential_dispatch_max_wait_secs: u64,
     pub credential_in_flight_lease_max_secs: u64,
+    pub dispatch_global_max_concurrent_requests: u32,
+    pub dispatch_max_queued_requests: u32,
     pub credential_warmup_requests: u32,
     pub credential_warmup_selection_percent: u32,
+    pub scheduler_error_ewma_alpha: f64,
+    pub scheduler_priority_weight: f64,
+    pub scheduler_load_weight: f64,
+    pub scheduler_error_weight: f64,
+    pub scheduler_latency_weight: f64,
+    pub scheduler_probation_weight: f64,
+    pub scheduler_top_k: u32,
     pub compression_enabled: bool,
     pub whitespace_compression: bool,
     pub prompt_cache_target_read_ratio: f64,
@@ -364,14 +416,50 @@ pub struct UpdateRuntimeConfigRequest {
     #[serde(default)]
     pub credential_max_concurrent_requests: u32,
     pub credential_transient_cooldown_secs: u64,
+    #[serde(default)]
+    pub credential_rate_limit_cooldown_secs: Option<u64>,
+    #[serde(default)]
+    pub credential_server_error_cooldown_secs: Option<u64>,
+    #[serde(default)]
+    pub credential_network_error_cooldown_secs: Option<u64>,
+    #[serde(default)]
+    pub credential_stream_error_cooldown_secs: Option<u64>,
+    #[serde(default)]
+    pub credential_protocol_error_cooldown_secs: Option<u64>,
+    #[serde(default)]
+    pub credential_auth_error_cooldown_secs: Option<u64>,
+    #[serde(default)]
+    pub credential_cooldown_backoff_multiplier: Option<f64>,
+    #[serde(default)]
+    pub credential_cooldown_jitter_percent: Option<u32>,
+    #[serde(default)]
+    pub credential_probation_secs: Option<u64>,
     pub credential_max_cooldown_secs: u64,
     #[serde(default)]
     pub credential_dispatch_max_wait_secs: Option<u64>,
     #[serde(default)]
     pub credential_in_flight_lease_max_secs: Option<u64>,
+    #[serde(default)]
+    pub dispatch_global_max_concurrent_requests: Option<u32>,
+    #[serde(default)]
+    pub dispatch_max_queued_requests: Option<u32>,
     pub credential_warmup_requests: u32,
     #[serde(default)]
     pub credential_warmup_selection_percent: Option<u32>,
+    #[serde(default)]
+    pub scheduler_error_ewma_alpha: Option<f64>,
+    #[serde(default)]
+    pub scheduler_priority_weight: Option<f64>,
+    #[serde(default)]
+    pub scheduler_load_weight: Option<f64>,
+    #[serde(default)]
+    pub scheduler_error_weight: Option<f64>,
+    #[serde(default)]
+    pub scheduler_latency_weight: Option<f64>,
+    #[serde(default)]
+    pub scheduler_probation_weight: Option<f64>,
+    #[serde(default)]
+    pub scheduler_top_k: Option<u32>,
     pub compression_enabled: bool,
     #[serde(default = "default_true")]
     pub whitespace_compression: bool,

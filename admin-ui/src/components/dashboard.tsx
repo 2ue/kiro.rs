@@ -21,7 +21,7 @@ import { useCredentialsPage, useDeleteCredential, useResetFailure, useLoadBalanc
 import { getCredentialBalance, forceRefreshToken, getCredentials, testCredential } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
-import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
+import type { BalanceResponse, CredentialStatusItem, LoadBalancingMode } from '@/types/api'
 
 interface DashboardProps {
   onLogout: () => void
@@ -548,14 +548,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setVerifying(false)
   }
 
-  // 切换负载均衡模式
-  const handleToggleLoadBalancing = () => {
-    const currentMode = loadBalancingData?.mode || 'priority'
-    const newMode = currentMode === 'priority' ? 'balanced' : 'priority'
-
+  const handleLoadBalancingChange = (newMode: LoadBalancingMode) => {
     setLoadBalancingMode(newMode, {
       onSuccess: () => {
-        const modeName = newMode === 'priority' ? '优先级模式' : '均衡负载模式'
+        const modeName = newMode === 'priority' ? '优先级模式' : newMode === 'balanced' ? '均衡负载模式' : '健康均衡模式'
         toast.success(`已切换到${modeName}`)
       },
       onError: (error) => {
@@ -642,15 +638,17 @@ export function Dashboard({ onLogout }: DashboardProps) {
               <Settings className="h-4 w-4" />
               配置
             </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleToggleLoadBalancing}
+            <select
+              className="h-9 rounded-md border bg-background px-3 text-sm"
+              value={loadBalancingData?.mode || 'priority'}
               disabled={isLoadingMode || isSettingMode}
-              title="切换负载均衡模式"
+              title="负载均衡模式"
+              onChange={(event) => handleLoadBalancingChange(event.target.value as LoadBalancingMode)}
             >
-              {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
-            </Button>
+              <option value="priority">优先级模式</option>
+              <option value="balanced">均衡负载模式</option>
+              <option value="health_balanced">健康均衡模式</option>
+            </select>
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
@@ -674,7 +672,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
         ) : (
           <>
         {/* 统计卡片 */}
-        <div className="grid gap-4 md:grid-cols-3 mb-6">
+        <div className="grid gap-4 md:grid-cols-4 mb-6">
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm font-medium text-muted-foreground">
@@ -706,6 +704,17 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 #{data?.currentId || '-'}
                 <Badge variant="success">活跃</Badge>
               </div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground">调度容量</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="text-2xl font-bold">
+                {data?.globalInFlightRequests || 0}/{data?.globalMaxConcurrentRequests || '不限'}
+              </div>
+              <div className="text-xs text-muted-foreground">排队 {data?.queuedRequests || 0}/{data?.maxQueuedRequests || '不限'}</div>
             </CardContent>
           </Card>
         </div>

@@ -24,6 +24,7 @@ use crate::kiro::model::available_models::{KiroAvailableModel, KiroAvailableMode
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{
     CallContext, CredentialRiskControlReason, InFlightKind, InFlightLeaseGuard, MultiTokenManager,
+    TransientFailureKind,
 };
 use crate::model::config::{Config, TlsBackend};
 use parking_lot::Mutex;
@@ -67,6 +68,7 @@ struct ApiCallResponse {
     sticky_bound: bool,
     fallback_from_sticky: bool,
     attempts: Vec<KiroCredentialAttempt>,
+    started_at: Instant,
 }
 
 /// 非流式调用完成上报器。
@@ -82,6 +84,7 @@ pub struct KiroApiCompletion {
     fallback_from_sticky: bool,
     attempts: Vec<KiroCredentialAttempt>,
     reported: AtomicBool,
+    started_at: Instant,
 }
 
 impl KiroApiCompletion {
@@ -93,6 +96,7 @@ impl KiroApiCompletion {
         sticky_bound: bool,
         fallback_from_sticky: bool,
         attempts: Vec<KiroCredentialAttempt>,
+        started_at: Instant,
     ) -> Self {
         Self {
             token_manager,
@@ -103,6 +107,7 @@ impl KiroApiCompletion {
             fallback_from_sticky,
             attempts,
             reported: AtomicBool::new(false),
+            started_at,
         }
     }
 
@@ -111,8 +116,11 @@ impl KiroApiCompletion {
             return;
         }
         if self.in_flight_lease.lock().take().is_some() {
-            self.token_manager
-                .report_success_for_session(self.credential_id, self.session_id.as_deref());
+            self.token_manager.report_success_for_session_with_latency(
+                self.credential_id,
+                self.session_id.as_deref(),
+                Some(self.started_at.elapsed()),
+            );
         }
     }
 
@@ -184,6 +192,7 @@ pub struct KiroStreamCompletion {
     fallback_from_sticky: bool,
     attempts: Vec<KiroCredentialAttempt>,
     reported: AtomicBool,
+    started_at: Instant,
 }
 
 impl KiroStreamCompletion {
@@ -195,6 +204,7 @@ impl KiroStreamCompletion {
         sticky_bound: bool,
         fallback_from_sticky: bool,
         attempts: Vec<KiroCredentialAttempt>,
+        started_at: Instant,
     ) -> Self {
         Self {
             token_manager,
@@ -205,6 +215,7 @@ impl KiroStreamCompletion {
             fallback_from_sticky,
             attempts,
             reported: AtomicBool::new(false),
+            started_at,
         }
     }
 
@@ -213,8 +224,11 @@ impl KiroStreamCompletion {
         if self.reported.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.token_manager
-            .report_success_for_session(self.credential_id, self.session_id.as_deref());
+        self.token_manager.report_success_for_session_with_latency(
+            self.credential_id,
+            self.session_id.as_deref(),
+            Some(self.started_at.elapsed()),
+        );
         self.in_flight_lease.lock().take();
     }
 
@@ -224,6 +238,32 @@ impl KiroStreamCompletion {
     pub fn report_soft_failure(&self) {
         if self.reported.swap(true, Ordering::AcqRel) {
             return;
+        }
+        if let Some(session_id) = self.session_id.as_deref() {
+            self.token_manager
+                .record_session_soft_failure(session_id, self.credential_id);
+        }
+        self.in_flight_lease.lock().take();
+    }
+
+    /// 上游流读取错误、idle timeout 或上游错误事件时调用，并让调度器短暂避开该凭据。
+    pub fn report_upstream_stream_failure(&self, reason: impl Into<String>) {
+        if self.reported.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let reason = reason.into();
+        if let Err(err) = self.token_manager.report_transient_failure_kind(
+            self.credential_id,
+            None,
+            TransientFailureKind::Stream,
+            None,
+            format!("stream_error {}", reason),
+        ) {
+            tracing::warn!(
+                credential_id = self.credential_id,
+                "记录上游流式失败冷却失败: {}",
+                err
+            );
         }
         if let Some(session_id) = self.session_id.as_deref() {
             self.token_manager
@@ -278,6 +318,7 @@ impl KiroStreamResponse {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Instant;
 
     use chrono::{Duration, Utc};
 
@@ -380,6 +421,7 @@ mod tests {
             false,
             false,
             Vec::new(),
+            Instant::now(),
         );
 
         completion.report_success();
@@ -405,6 +447,7 @@ mod tests {
             false,
             false,
             Vec::new(),
+            Instant::now(),
         );
 
         completion.report_soft_failure();
@@ -412,6 +455,34 @@ mod tests {
 
         let snapshot = manager.snapshot();
         assert_eq!(snapshot.entries[0].success_count, 0);
+    }
+
+    #[test]
+    fn stream_completion_upstream_failure_cools_down_credential() {
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("token".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap(),
+        );
+        let completion = KiroStreamCompletion::new(
+            manager.clone(),
+            1,
+            None,
+            Some("session".into()),
+            false,
+            false,
+            Vec::new(),
+            Instant::now(),
+        );
+
+        completion.report_upstream_stream_failure("upstream stream read error");
+        completion.report_success();
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.entries[0].success_count, 0);
+        assert!(snapshot.entries[0].cooled_down);
+        assert_eq!(snapshot.entries[0].failure_count, 0);
     }
 
     #[test]
@@ -433,6 +504,7 @@ mod tests {
                 false,
                 false,
                 Vec::new(),
+                Instant::now(),
             );
         }
 
@@ -459,6 +531,7 @@ mod tests {
             false,
             false,
             Vec::new(),
+            Instant::now(),
         );
         completion.report_success();
         completion.report_success();
@@ -727,6 +800,7 @@ impl KiroProvider {
                 result.sticky_bound,
                 result.fallback_from_sticky,
                 result.attempts,
+                result.started_at,
             ),
         })
     }
@@ -800,6 +874,7 @@ impl KiroProvider {
                     false,
                     false,
                     Vec::new(),
+                    Instant::now(),
                 ),
             });
         }
@@ -924,6 +999,7 @@ impl KiroProvider {
                 result.sticky_bound,
                 result.fallback_from_sticky,
                 result.attempts,
+                result.started_at,
             ),
         })
     }
@@ -952,6 +1028,7 @@ impl KiroProvider {
             ctx.mark_in_flight_kind(InFlightKind::Mcp);
             let credential_label = self.credential_log_label(ctx.id);
             let credential_context = format!("凭据 {}", credential_label);
+            let attempt_started_at = Instant::now();
 
             let config = self.token_manager.runtime_config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
@@ -1022,6 +1099,20 @@ impl KiroProvider {
                         credential_context,
                         e
                     ));
+                    if let Err(err) = self.token_manager.report_transient_failure_kind(
+                        ctx.id,
+                        None,
+                        TransientFailureKind::Network,
+                        None,
+                        format!("send_error {}", e),
+                    ) {
+                        self.finish_attempt(&mut ctx);
+                        anyhow::bail!(
+                            "MCP 请求发送失败（{}，调度状态写入失败）: {}",
+                            credential_context,
+                            err
+                        );
+                    }
                     self.finish_attempt(&mut ctx);
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
@@ -1035,7 +1126,8 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
-                self.token_manager.report_success(ctx.id);
+                self.token_manager
+                    .report_success_with_latency(ctx.id, Some(attempt_started_at.elapsed()));
                 self.finish_attempt(&mut ctx);
                 return Ok(response);
             }
@@ -1111,6 +1203,31 @@ impl KiroProvider {
                 continue;
             }
 
+            if status.as_u16() == 402 {
+                last_error = Some(anyhow::anyhow!(
+                    "MCP 请求失败（{}，支付状态待确认）: {} {}",
+                    credential_context,
+                    status,
+                    body
+                ));
+                if let Err(err) = self.token_manager.report_transient_failure_kind(
+                    ctx.id,
+                    None,
+                    TransientFailureKind::RateLimit,
+                    retry_after,
+                    format!("payment_required {} {}", status, body),
+                ) {
+                    self.finish_attempt(&mut ctx);
+                    anyhow::bail!(
+                        "MCP 请求失败（{}，调度状态写入失败）: {}",
+                        credential_context,
+                        err
+                    );
+                }
+                self.finish_attempt(&mut ctx);
+                continue;
+            }
+
             // 400 Bad Request
             if status.as_u16() == 400 {
                 self.finish_attempt(&mut ctx);
@@ -1134,6 +1251,20 @@ impl KiroProvider {
                     status,
                     body
                 );
+                if let Err(err) = self.token_manager.report_transient_failure_kind(
+                    ctx.id,
+                    None,
+                    TransientFailureKind::Auth,
+                    None,
+                    format!("auth_error {} {}", status, body),
+                ) {
+                    self.finish_attempt(&mut ctx);
+                    anyhow::bail!(
+                        "MCP 请求失败（{}，调度状态写入失败）: {}",
+                        credential_context,
+                        err
+                    );
+                }
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
@@ -1201,9 +1332,15 @@ impl KiroProvider {
                     status,
                     body
                 ));
-                if let Err(err) = self.token_manager.report_transient_failure(
+                let kind = if status.as_u16() == 429 {
+                    TransientFailureKind::RateLimit
+                } else {
+                    TransientFailureKind::Server
+                };
+                if let Err(err) = self.token_manager.report_transient_failure_kind(
                     ctx.id,
                     None,
+                    kind,
                     retry_after,
                     format!("{} {}", status, body),
                 ) {
@@ -1249,6 +1386,20 @@ impl KiroProvider {
                 status,
                 body
             ));
+            if let Err(err) = self.token_manager.report_transient_failure_kind(
+                ctx.id,
+                None,
+                TransientFailureKind::Protocol,
+                retry_after,
+                format!("unknown_error {} {}", status, body),
+            ) {
+                self.finish_attempt(&mut ctx);
+                anyhow::bail!(
+                    "MCP 请求失败（{}，调度状态写入失败）: {}",
+                    credential_context,
+                    err
+                );
+            }
             self.finish_attempt(&mut ctx);
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
@@ -1429,6 +1580,26 @@ impl KiroProvider {
                         attempt_started_at,
                     );
                     last_error = Some(anyhow::anyhow!(message));
+                    if let Err(err) = self.token_manager.report_transient_failure_kind(
+                        ctx.id,
+                        model.as_deref(),
+                        TransientFailureKind::Network,
+                        None,
+                        format!("send_error {}", e),
+                    ) {
+                        let final_message = format!(
+                            "{} API 请求发送失败（{}，调度状态写入失败）: {}",
+                            api_type, credential_context, err
+                        );
+                        if let Some(last) = attempts.last_mut() {
+                            last.action = "fail".to_string();
+                            last.error_type = Some("scheduler_state_error".to_string());
+                            last.error_message = Some(final_message.clone());
+                        }
+                        Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                        self.finish_attempt(&mut ctx);
+                        return Err(Self::traced_error(final_message, &attempts));
+                    }
                     self.maybe_exclude_after_soft_failure(
                         conversation_id.as_deref(),
                         model.as_deref(),
@@ -1492,6 +1663,26 @@ impl KiroProvider {
                             Some(message.clone()),
                             attempt_started_at,
                         );
+                        if let Err(err) = self.token_manager.report_transient_failure_kind(
+                            ctx.id,
+                            model.as_deref(),
+                            TransientFailureKind::Protocol,
+                            retry_after,
+                            format!("non_eventstream {} {}", status, body),
+                        ) {
+                            let final_message = format!(
+                                "{} API 返回非 eventstream 响应（{}，调度状态写入失败）: {}",
+                                api_type, credential_context, err
+                            );
+                            if let Some(last) = attempts.last_mut() {
+                                last.action = "fail".to_string();
+                                last.error_type = Some("scheduler_state_error".to_string());
+                                last.error_message = Some(final_message.clone());
+                            }
+                            Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                            self.finish_attempt(&mut ctx);
+                            return Err(Self::traced_error(final_message, &attempts));
+                        }
                         self.maybe_exclude_after_soft_failure(
                             conversation_id.as_deref(),
                             model.as_deref(),
@@ -1542,6 +1733,7 @@ impl KiroProvider {
                         Self::log_attempt_chain(request_id, api_type, &attempts, "success");
                         attempts
                     },
+                    started_at: attempt_started_at,
                 });
             }
 
@@ -1675,6 +1867,42 @@ impl KiroProvider {
                 continue;
             }
 
+            if status.as_u16() == 402 {
+                let message = format!(
+                    "{} API 请求失败（{}，支付状态待确认）: {} {}",
+                    api_type, credential_context, status, body
+                );
+                Self::push_attempt(
+                    &mut attempts,
+                    attempt,
+                    ctx.id,
+                    &credential_label,
+                    Some(status),
+                    "transient_retry",
+                    Some("payment_required"),
+                    Some(message.clone()),
+                    attempt_started_at,
+                );
+                last_error = Some(anyhow::anyhow!(message));
+                if let Err(err) = self.token_manager.report_transient_failure_kind(
+                    ctx.id,
+                    model.as_deref(),
+                    TransientFailureKind::RateLimit,
+                    retry_after,
+                    format!("payment_required {} {}", status, body),
+                ) {
+                    let final_message = format!(
+                        "{} API 请求失败（{}，调度状态写入失败）: {}",
+                        api_type, credential_context, err
+                    );
+                    Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                    self.finish_attempt(&mut ctx);
+                    return Err(Self::traced_error(final_message, &attempts));
+                }
+                self.finish_attempt(&mut ctx);
+                continue;
+            }
+
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
                 let message = format!(
@@ -1713,6 +1941,32 @@ impl KiroProvider {
                     status,
                     body
                 );
+                if let Err(err) = self.token_manager.report_transient_failure_kind(
+                    ctx.id,
+                    model.as_deref(),
+                    TransientFailureKind::Auth,
+                    None,
+                    format!("auth_error {} {}", status, body),
+                ) {
+                    let final_message = format!(
+                        "{} API 请求失败（{}，调度状态写入失败）: {}",
+                        api_type, credential_context, err
+                    );
+                    Self::push_attempt(
+                        &mut attempts,
+                        attempt,
+                        ctx.id,
+                        &credential_label,
+                        Some(status),
+                        "fail",
+                        Some("scheduler_state_error"),
+                        Some(final_message.clone()),
+                        attempt_started_at,
+                    );
+                    Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                    self.finish_attempt(&mut ctx);
+                    return Err(Self::traced_error(final_message, &attempts));
+                }
 
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
@@ -1827,9 +2081,15 @@ impl KiroProvider {
                     attempt_started_at,
                 );
                 last_error = Some(anyhow::anyhow!(message));
-                if let Err(err) = self.token_manager.report_transient_failure(
+                let kind = if status.as_u16() == 429 {
+                    TransientFailureKind::RateLimit
+                } else {
+                    TransientFailureKind::Server
+                };
+                if let Err(err) = self.token_manager.report_transient_failure_kind(
                     ctx.id,
                     model.as_deref(),
+                    kind,
                     retry_after,
                     format!("{} {}", status, body),
                 ) {
@@ -1909,6 +2169,26 @@ impl KiroProvider {
                 attempt_started_at,
             );
             last_error = Some(anyhow::anyhow!(message));
+            if let Err(err) = self.token_manager.report_transient_failure_kind(
+                ctx.id,
+                model.as_deref(),
+                TransientFailureKind::Protocol,
+                retry_after,
+                format!("unknown_error {} {}", status, body),
+            ) {
+                let final_message = format!(
+                    "{} API 请求失败（{}，调度状态写入失败）: {}",
+                    api_type, credential_context, err
+                );
+                if let Some(last) = attempts.last_mut() {
+                    last.action = "fail".to_string();
+                    last.error_type = Some("scheduler_state_error".to_string());
+                    last.error_message = Some(final_message.clone());
+                }
+                Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                self.finish_attempt(&mut ctx);
+                return Err(Self::traced_error(final_message, &attempts));
+            }
             self.maybe_exclude_after_soft_failure(
                 conversation_id.as_deref(),
                 model.as_deref(),
