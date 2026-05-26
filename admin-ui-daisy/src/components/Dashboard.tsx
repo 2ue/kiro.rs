@@ -1,8 +1,8 @@
-import { BarChart3, ChevronDown, Command, DollarSign, FileClock, LogOut, Palette, RefreshCw, Server, Settings } from 'lucide-react'
+import { BarChart3, ChevronDown, Command, DollarSign, FileClock, LogOut, Moon, Palette, RefreshCw, Server, Settings, Sun } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { Button, Card, Navbar } from 'react-daisyui'
+import { Button, Card } from 'react-daisyui'
 import { AuditPanel } from '@/components/AuditPanel'
 import { ConfigPanel } from '@/components/ConfigPanel'
 import { CredentialsPanel } from '@/components/CredentialsPanel'
@@ -46,7 +46,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
   const refreshAll = () => {
     queryClient.invalidateQueries()
-    toast.success('已刷新页面数据')
+    toast.success('已刷新后台数据')
   }
 
   const selectTab = (tab: TabKey) => {
@@ -54,59 +54,36 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     setMobileMenuOpen(false)
   }
 
+  const active = tabs.find((tab) => tab.key === activeTab) || tabs[0]
+
   return (
-    <div className="app-shell bg-base-200">
-      <aside className="sidebar-surface sticky top-0 hidden h-screen border-r p-3 lg:block" style={{ borderColor: 'var(--shell-sidebar-border)' }}>
-        <div className="flex h-full flex-col">
-          <div className="flex items-center gap-2 px-2 py-2">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary text-primary-content shadow-md shadow-black/20">
+    <div className="min-h-screen bg-base-200">
+      <header className="top-shell sticky top-0 z-40 border-b border-base-300">
+        <div className="mx-auto flex max-w-[var(--page-max)] items-center gap-3 px-4 py-2 lg:px-6">
+          <div className="flex min-w-0 items-center gap-2">
+            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary text-primary-content shadow-sm">
               <Command className="h-5 w-5" />
             </div>
-            <div>
-              <div className="text-sm font-semibold tracking-tight text-white">Kiro Admin</div>
-            </div>
+            <div className="hidden text-sm font-semibold tracking-tight sm:block">Kiro Admin</div>
           </div>
 
-          <nav className="mt-5 space-y-1">
+          <nav className="hidden flex-1 items-center justify-center gap-1 lg:flex">
             {tabs.map((tab) => (
-              <button
-                type="button"
+              <Button
                 key={tab.key}
-                className={`sidebar-nav-item flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left transition ${
-                  activeTab === tab.key
-                    ? 'is-active text-white'
-                    : 'text-slate-300 hover:bg-white/8 hover:text-white'
-                }`}
+                type="button"
+                size="sm"
+                color={activeTab === tab.key ? 'primary' : 'ghost'}
+                className="gap-2"
                 onClick={() => selectTab(tab.key)}
               >
-                <span className={`flex h-7 w-7 items-center justify-center rounded-md ${activeTab === tab.key ? 'bg-primary/18 text-primary-content' : 'bg-white/[0.06]'}`}>
-                  {tab.icon}
-                </span>
-                <span className="truncate text-sm font-medium">{tab.label}</span>
-              </button>
+                {tab.icon}
+                {tab.label}
+              </Button>
             ))}
           </nav>
 
-          <Card className="mt-auto border border-white/10 bg-white/[0.04] shadow-none">
-            <Card.Body className="p-2">
-            <Button type="button" color="primary" size="sm" className="w-full" onClick={refreshAll}>
-              <RefreshCw className="h-4 w-4" />
-              刷新
-            </Button>
-            </Card.Body>
-          </Card>
-        </div>
-      </aside>
-
-      <div className="workspace-surface min-w-0">
-        <Navbar className="glass-nav sticky top-0 z-30 border-b border-base-300 lg:hidden">
-          <Navbar.Start>
-            <div className="flex items-center gap-2 px-2 font-semibold">
-              <Server className="h-5 w-5" />
-              Kiro Admin
-            </div>
-          </Navbar.Start>
-          <Navbar.End className="relative">
+          <div className="relative flex flex-1 justify-end lg:hidden">
             <Button
               type="button"
               color="primary"
@@ -115,11 +92,11 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
               aria-expanded={mobileMenuOpen}
               onClick={() => setMobileMenuOpen((value) => !value)}
             >
-              {tabs.find((tab) => tab.key === activeTab)?.label}
+              {active.label}
               <ChevronDown className={`h-4 w-4 transition ${mobileMenuOpen ? 'rotate-180' : ''}`} />
             </Button>
             {mobileMenuOpen && (
-              <Card className="absolute right-0 top-12 z-50 w-64 border border-base-300 bg-base-100 shadow-xl">
+              <Card className="absolute right-0 top-11 z-50 w-64 border border-base-300 bg-base-100 shadow-xl">
                 <Card.Body className="p-2">
                   <div className="space-y-1">
                     {tabs.map((tab) => (
@@ -139,48 +116,59 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
                 </Card.Body>
               </Card>
             )}
-          </Navbar.End>
-        </Navbar>
+          </div>
 
-        <main className="mx-auto max-w-[var(--page-max)] px-4 py-4 lg:px-6 lg:py-5">
-          <Card className="page-hero mb-5 rounded-box">
-            <Card.Body className="flex flex-col gap-3 p-4 md:flex-row md:items-center md:justify-between">
-              <div className="min-w-0">
-              <div className="mb-1 flex items-center gap-2 text-xs font-semibold text-primary">
-                {tabs.find((tab) => tab.key === activeTab)?.icon}
-                {tabs.find((tab) => tab.key === activeTab)?.label}
-              </div>
-              <h1 className="text-xl font-semibold tracking-tight md:text-2xl">{pageTitle[activeTab]}</h1>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <Button
-                type="button"
-                size="sm"
-                onClick={() => setDark((value) => !value)}
-                title="切换主题"
-                className="theme-toggle-btn gap-2"
-              >
-                <Palette className="h-4 w-4" />
-                {dark ? '深色主题' : '浅色主题'}
-              </Button>
-              <Button type="button" variant="outline" size="sm" onClick={refreshAll} title="刷新">
-                <RefreshCw className="h-4 w-4" />
-                刷新
-              </Button>
-              <Button type="button" color="ghost" size="sm" shape="square" onClick={logout} title="退出登录">
+          <div className="hidden items-center gap-1.5 sm:flex">
+            <Button
+              type="button"
+              size="sm"
+              onClick={() => setDark((value) => !value)}
+              title="切换主题"
+              className="theme-toggle-btn gap-2"
+            >
+              {dark ? <Moon className="h-4 w-4" /> : <Sun className="h-4 w-4" />}
+              {dark ? '深色' : '浅色'}
+            </Button>
+            <Button type="button" variant="outline" size="sm" onClick={refreshAll} title="刷新当前后台数据">
+              <RefreshCw className="h-4 w-4" />
+              刷新全部
+            </Button>
+            <Button type="button" color="ghost" size="sm" onClick={logout} title="退出登录">
               <LogOut className="h-4 w-4" />
-              </Button>
-            </div>
-            </Card.Body>
-          </Card>
+              退出
+            </Button>
+          </div>
+        </div>
+      </header>
 
-          {activeTab === 'credentials' && <CredentialsPanel />}
-          {activeTab === 'usage' && <UsagePanel />}
-          {activeTab === 'pricing' && <PricingPanel />}
-          {activeTab === 'audit' && <AuditPanel />}
-          {activeTab === 'config' && <ConfigPanel />}
-        </main>
-      </div>
+      <main className="mx-auto max-w-[var(--page-max)] px-4 py-4 lg:px-6 lg:py-5">
+        <div className="page-heading mb-4 flex flex-col gap-3 px-1 py-2.5 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0">
+            <div className="mb-1 flex items-center gap-2 text-xs font-semibold text-primary">
+              {active.icon}
+              {active.label}
+            </div>
+            <h1 className="text-lg font-semibold tracking-tight md:text-xl">{pageTitle[activeTab]}</h1>
+          </div>
+          <div className="flex gap-2 sm:hidden">
+            <Button type="button" size="sm" onClick={() => setDark((value) => !value)} className="theme-toggle-btn" title="切换主题">
+              <Palette className="h-4 w-4" />
+            </Button>
+            <Button type="button" variant="outline" size="sm" onClick={refreshAll} title="刷新页面数据">
+              <RefreshCw className="h-4 w-4" />
+            </Button>
+            <Button type="button" color="ghost" size="sm" shape="square" onClick={logout} title="退出登录">
+              <LogOut className="h-4 w-4" />
+            </Button>
+          </div>
+        </div>
+
+        {activeTab === 'credentials' && <CredentialsPanel />}
+        {activeTab === 'usage' && <UsagePanel />}
+        {activeTab === 'pricing' && <PricingPanel />}
+        {activeTab === 'audit' && <AuditPanel />}
+        {activeTab === 'config' && <ConfigPanel />}
+      </main>
     </div>
   )
 }

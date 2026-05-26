@@ -1,4 +1,4 @@
-import { CheckCircle2, Eye, FileClock, RefreshCw, XCircle } from 'lucide-react'
+import { CheckCircle2, Eye, FileClock, XCircle } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { Button, Table } from 'react-daisyui'
 import { Badge, EmptyState, ErrorState, LoadingState, ModalShell, SectionCard } from '@/components/common'
@@ -55,12 +55,6 @@ export function AuditPanel() {
       <SectionCard
         title={<span className="flex items-center gap-2"><FileClock className="h-4 w-4" /> 审计日志</span>}
         description="记录后台关键写操作和导出动作，便于排查配置、凭据和统计数据的变化来源。"
-        actions={
-          <Button type="button" variant="outline" size="sm" onClick={() => logs.refetch()}>
-            <RefreshCw className="h-4 w-4" />
-            刷新
-          </Button>
-        }
       >
         {logs.isLoading ? (
           <LoadingState />

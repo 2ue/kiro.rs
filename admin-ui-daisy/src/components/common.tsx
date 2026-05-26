@@ -29,13 +29,13 @@ export function StatCard({
   }
   return (
     <Card className={`metric-card ${toneClass[tone].bg}`}>
-      <Card.Body className="relative p-3">
-        <div className={`mb-2 h-0.5 w-8 rounded-full ${toneClass[tone].accent}`} />
-        <div className="text-xs font-semibold text-base-content/55">{title}</div>
-        <div className={`mt-0.5 truncate text-[1.35rem] font-semibold leading-tight tracking-tight ${toneClass[tone].text}`}>
+      <Card.Body className="relative gap-0.5 p-2.5 pl-3.5">
+        <div className={`absolute bottom-2.5 left-0 top-2.5 w-0.5 rounded-full ${toneClass[tone].accent}`} />
+        <div className="text-[0.72rem] font-semibold leading-4 text-base-content/55">{title}</div>
+        <div className={`truncate text-[1.12rem] font-semibold leading-6 tracking-tight ${toneClass[tone].text}`}>
           {value}
         </div>
-        {desc && <div className="mt-0.5 truncate text-xs leading-4 text-base-content/58">{desc}</div>}
+        {desc && <div className="truncate text-[0.72rem] leading-4 text-base-content/58">{desc}</div>}
       </Card.Body>
     </Card>
   )

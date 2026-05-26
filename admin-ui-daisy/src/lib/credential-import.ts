@@ -1,4 +1,5 @@
 import type { AddCredentialRequest } from '@/types/api'
+import { camelizeKeys } from '@/lib/object-keys'
 
 type JsonObject = Record<string, unknown>
 
@@ -60,20 +61,21 @@ function extractCredentialItems(value: unknown): unknown[] {
 }
 
 export function normalizeCredentialImportItem(value: unknown): AddCredentialRequest | null {
-  if (!isObject(value)) return null
+  const normalized = camelizeKeys(value)
+  if (!isObject(normalized)) return null
 
-  const nested = isObject(value.credentials) ? value.credentials : undefined
-  const refreshToken = stringField(value.refreshToken) ?? stringField(nested?.refreshToken)
-  const kiroApiKey = stringField(value.kiroApiKey) ?? stringField(value.apiKey) ?? stringField(value.kiro_api_key)
-  const clientId = stringField(value.clientId) ?? stringField(nested?.clientId)
-  const clientSecret = stringField(value.clientSecret) ?? stringField(nested?.clientSecret)
+  const nested = isObject(normalized.credentials) ? normalized.credentials : undefined
+  const refreshToken = stringField(normalized.refreshToken) ?? stringField(nested?.refreshToken)
+  const kiroApiKey = stringField(normalized.kiroApiKey) ?? stringField(normalized.apiKey)
+  const clientId = stringField(normalized.clientId) ?? stringField(nested?.clientId)
+  const clientSecret = stringField(normalized.clientSecret) ?? stringField(nested?.clientSecret)
   const authRegion =
-    stringField(value.authRegion) ??
+    stringField(normalized.authRegion) ??
     stringField(nested?.authRegion) ??
-    stringField(value.region) ??
+    stringField(normalized.region) ??
     stringField(nested?.region)
-  const apiRegion = stringField(value.apiRegion) ?? stringField(nested?.apiRegion)
-  const rawAuthMethod = authMethodField(value.authMethod) ?? authMethodField(nested?.authMethod)
+  const apiRegion = stringField(normalized.apiRegion) ?? stringField(nested?.apiRegion)
+  const rawAuthMethod = authMethodField(normalized.authMethod) ?? authMethodField(nested?.authMethod)
   const authMethod: AddCredentialRequest['authMethod'] = kiroApiKey
     ? 'api_key'
     : rawAuthMethod ?? (clientId && clientSecret ? 'idc' : 'social')
@@ -90,15 +92,15 @@ export function normalizeCredentialImportItem(value: unknown): AddCredentialRequ
     kiroApiKey: authMethod === 'api_key' ? kiroApiKey : undefined,
     clientId: authMethod === 'api_key' ? undefined : clientId,
     clientSecret: authMethod === 'api_key' ? undefined : clientSecret,
-    email: stringField(value.email) ?? stringField(value.nickname),
-    priority: numberField(value.priority),
+    email: stringField(normalized.email) ?? stringField(normalized.nickname),
+    priority: numberField(normalized.priority),
     authRegion,
     apiRegion,
-    machineId: stringField(value.machineId) ?? stringField(nested?.machineId),
-    proxyUrl: stringField(value.proxyUrl) ?? stringField(nested?.proxyUrl),
-    proxyUsername: stringField(value.proxyUsername) ?? stringField(nested?.proxyUsername),
-    proxyPassword: stringField(value.proxyPassword) ?? stringField(nested?.proxyPassword),
-    endpoint: stringField(value.endpoint) ?? stringField(nested?.endpoint),
+    machineId: stringField(normalized.machineId) ?? stringField(nested?.machineId),
+    proxyUrl: stringField(normalized.proxyUrl) ?? stringField(nested?.proxyUrl),
+    proxyUsername: stringField(normalized.proxyUsername) ?? stringField(nested?.proxyUsername),
+    proxyPassword: stringField(normalized.proxyPassword) ?? stringField(nested?.proxyPassword),
+    endpoint: stringField(normalized.endpoint) ?? stringField(nested?.endpoint),
   }
 }
 

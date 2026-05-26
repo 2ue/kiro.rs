@@ -8,17 +8,11 @@
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  --shell-sidebar: #111827;
-  --shell-sidebar-muted: #94a3b8;
-  --shell-sidebar-border: rgb(255 255 255 / 0.08);
   --page-max: 1420px;
 }
 
 html[data-theme='kiroDark'] {
   color-scheme: dark;
-  --shell-sidebar: #060b16;
-  --shell-sidebar-muted: #8290a5;
-  --shell-sidebar-border: rgb(255 255 255 / 0.09);
 }
 
 body {
@@ -85,47 +79,15 @@ select {
   box-shadow: 0 24px 80px rgb(15 23 42 / 18%);
 }
 
-.glass-nav {
+.top-shell {
   background: color-mix(in srgb, oklch(var(--b1)) 94%, transparent);
   backdrop-filter: blur(16px);
 }
 
-.app-shell {
-  display: grid;
-  grid-template-columns: 14.75rem minmax(0, 1fr);
-  min-height: 100vh;
-}
-
-.sidebar-surface {
-  background: var(--shell-sidebar);
-  color: #f8fafc;
-}
-
-.sidebar-nav-item {
-  position: relative;
-  min-height: 2.75rem;
-  border: 1px solid transparent;
-  appearance: none;
+.page-heading {
+  border-bottom: 1px solid color-mix(in srgb, oklch(var(--b3)) 72%, transparent);
   background: transparent;
-  font: inherit;
-}
-
-.sidebar-nav-item.is-active {
-  background: rgb(37 99 235 / 0.15);
-  border-color: rgb(96 165 250 / 0.32);
-  box-shadow: inset 3px 0 0 #60a5fa;
-}
-
-.workspace-surface {
-  background: transparent;
-}
-
-.page-hero {
-  border: 1px solid color-mix(in srgb, oklch(var(--b3)) 70%, transparent);
-  background:
-    radial-gradient(circle at 92% 10%, color-mix(in srgb, oklch(var(--p)) 10%, transparent), transparent 20rem),
-    linear-gradient(135deg, color-mix(in srgb, oklch(var(--b1)) 98%, transparent), color-mix(in srgb, oklch(var(--b1)) 90%, oklch(var(--b2)) 10%));
-  box-shadow: 0 1px 2px rgb(15 23 42 / 4%), 0 10px 28px rgb(15 23 42 / 4%);
+  box-shadow: none;
 }
 
 .soft-panel {
@@ -265,7 +227,7 @@ select {
 
 .metric-card {
   border: 1px solid color-mix(in srgb, oklch(var(--b3)) 72%, transparent);
-  box-shadow: 0 1px 2px rgb(15 23 42 / 4%), 0 10px 26px rgb(15 23 42 / 3%);
+  box-shadow: 0 1px 2px rgb(15 23 42 / 3%);
 }
 
 .credential-card {
@@ -334,8 +296,8 @@ select {
 
 .metric-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(165px, 1fr));
-  gap: 0.55rem;
+  grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
+  gap: 0.5rem;
 }
 
 .form-grid {
@@ -344,11 +306,40 @@ select {
   gap: 0.6rem;
 }
 
-@media (max-width: 1023px) {
-  .app-shell {
-    display: block;
-  }
+.config-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  min-height: auto;
+  border: 1px solid color-mix(in srgb, oklch(var(--b3)) 72%, transparent);
+  background: color-mix(in srgb, oklch(var(--b2)) 64%, transparent);
+  padding: 0.25rem;
+}
 
+.config-tab {
+  min-width: 0;
+  flex: 1 1 10rem;
+  height: auto;
+  min-height: 2.35rem;
+  border-radius: calc(var(--rounded-box, 0.5rem) - 0.15rem);
+  padding: 0.42rem 0.62rem;
+  text-align: left;
+  color: color-mix(in srgb, oklch(var(--bc)) 72%, transparent);
+  transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.config-tab:hover {
+  background: color-mix(in srgb, oklch(var(--b1)) 74%, transparent);
+  color: oklch(var(--bc));
+}
+
+.config-tab.tab-active {
+  background: oklch(var(--b1));
+  color: oklch(var(--bc));
+  box-shadow: 0 1px 2px rgb(15 23 42 / 6%);
+}
+
+@media (max-width: 1023px) {
   main {
     padding-left: 0.75rem !important;
     padding-right: 0.75rem !important;

@@ -1,4 +1,5 @@
 import { extractErrorMessage } from '@/lib/utils'
+import { camelizeKeys } from '@/lib/object-keys'
 
 export interface KamAccount {
   email?: string
@@ -17,8 +18,9 @@ export interface KamAccount {
 }
 
 function normalizeKamAccount(item: unknown): unknown {
-  if (typeof item !== 'object' || item === null) return item
-  const obj = item as Record<string, unknown>
+  const normalized = camelizeKeys(item)
+  if (typeof normalized !== 'object' || normalized === null) return normalized
+  const obj = normalized as Record<string, unknown>
   if (typeof obj.refreshToken === 'string' && typeof obj.credentials === 'undefined') {
     return {
       email: typeof obj.email === 'string' ? obj.email : undefined,
@@ -48,7 +50,7 @@ function isValidKamAccount(item: unknown): item is KamAccount {
 }
 
 export function parseKamJson(raw: string): KamAccount[] {
-  const parsed = JSON.parse(raw)
+  const parsed = camelizeKeys(JSON.parse(raw)) as Record<string, unknown>
   let rawItems: unknown[]
   if (parsed.accounts && Array.isArray(parsed.accounts)) rawItems = parsed.accounts
   else if (Array.isArray(parsed)) rawItems = parsed

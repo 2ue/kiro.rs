@@ -1,7 +1,7 @@
 import { BadgeInfo, Gauge, Save, Shield, Sparkles, Trash2, Wand2, Zap } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import { Alert, Button, Card, Collapse, Input, Join, Loading, Select, Toggle } from 'react-daisyui'
+import { Alert, Button, Card, Collapse, Input, Join, Loading, Select, Tabs, Toggle } from 'react-daisyui'
 import { ErrorState, FieldLabel, SectionCard } from '@/components/common'
 import {
   emptyRuntimeConfig,
@@ -23,6 +23,15 @@ import type {
   ReportedUsagePathPolicy,
   RuntimeConfig,
 } from '@/types/api'
+
+type ConfigTab = 'dispatch' | 'cache' | 'usage' | 'compat'
+
+const configTabs: Array<{ key: ConfigTab; label: string; description: string }> = [
+  { key: 'dispatch', label: '调度', description: '限速、冷却、并发、预热、请求压缩' },
+  { key: 'cache', label: '高缓存', description: '缓存模拟比例、放大、触顶扣减' },
+  { key: 'usage', label: '路径上报', description: '按路径改写 input、output、cache read/write' },
+  { key: 'compat', label: '兼容诊断', description: '协议兼容、调试头、后台统计' },
+]
 
 function numberValue(value: string, fallback: number): number {
   const parsed = Number(value)
@@ -321,6 +330,7 @@ export function ConfigPanel() {
   const config = useRuntimeConfig()
   const updateConfig = useUpdateRuntimeConfig()
   const [draft, setDraft] = useState<RuntimeConfig>(emptyRuntimeConfig)
+  const [activeTab, setActiveTab] = useState<ConfigTab>('dispatch')
 
   useEffect(() => {
     if (config.data) setDraft(config.data)
@@ -369,127 +379,157 @@ export function ConfigPanel() {
       }
     >
       <div className="space-y-4">
-        <ConfigGroup icon={<Gauge className="h-4 w-4" />} title="凭据限速与冷却" description="控制单个账号被调用的频率，以及上游临时错误后多久再尝试使用该账号。">
-          <NumberField title="单凭据每分钟请求上限" description="控制每个凭据每分钟最多承接多少请求。填 0 表示关闭本地限速。" value={draft.credentialRpm} min={0} suffix="次/分钟" onChange={(credentialRpm) => setDraft((prev) => ({ ...prev, credentialRpm }))} />
-          <NumberField title="单凭据最大并发请求数" description="控制同一个凭据同时处理多少个请求。填 0 表示不限制。" value={draft.credentialMaxConcurrentRequests} min={0} suffix="并发" onChange={(credentialMaxConcurrentRequests) => setDraft((prev) => ({ ...prev, credentialMaxConcurrentRequests }))} />
-          <NumberField title="临时冷却秒数" description="当上游返回 429 或临时错误但没有 Retry-After 时，该凭据暂停使用多久。" value={draft.credentialTransientCooldownSecs} min={1} suffix="秒" onChange={(credentialTransientCooldownSecs) => setDraft((prev) => ({ ...prev, credentialTransientCooldownSecs }))} />
-          <NumberField title="最大冷却秒数" description="控制单个凭据最长冷却时间。" value={draft.credentialMaxCooldownSecs} min={1} suffix="秒" onChange={(credentialMaxCooldownSecs) => setDraft((prev) => ({ ...prev, credentialMaxCooldownSecs }))} />
-          <NumberField title="单请求最长排队等待" description="所有可用凭据都处于冷却、限速或并发占满时最多等待多久。填 0 表示不限制。" value={draft.credentialDispatchMaxWaitSecs} min={0} suffix="秒" onChange={(credentialDispatchMaxWaitSecs) => setDraft((prev) => ({ ...prev, credentialDispatchMaxWaitSecs }))} />
-          <NumberField title="异常并发自动回收" description="单个并发占用超过多久未活跃时自动释放。填 0 表示关闭。" value={draft.credentialInFlightLeaseMaxSecs} min={0} suffix="秒" onChange={(credentialInFlightLeaseMaxSecs) => setDraft((prev) => ({ ...prev, credentialInFlightLeaseMaxSecs }))} />
-        </ConfigGroup>
+        <Tabs variant="boxed" size="sm" className="config-tabs">
+          {configTabs.map((tab) => (
+            <Tabs.Tab
+              key={tab.key}
+              href="#"
+              active={activeTab === tab.key}
+              className="config-tab"
+              onClick={(event) => {
+                event.preventDefault()
+                setActiveTab(tab.key)
+              }}
+            >
+              <span className="font-semibold">{tab.label}</span>
+              <span className="hidden text-[0.68rem] text-base-content/55 md:block">{tab.description}</span>
+            </Tabs.Tab>
+          ))}
+        </Tabs>
 
-        <ConfigGroup icon={<Sparkles className="h-4 w-4" />} title="新凭据预热" description="预热不会伪造成功次数，只会让新账号在均衡模式下更少被选中。">
-          <NumberField title="预热剩余请求数" description="新添加凭据默认进入预热状态的请求次数。填 0 表示不预热。" value={draft.credentialWarmupRequests} min={0} suffix="次" onChange={(credentialWarmupRequests) => setDraft((prev) => ({ ...prev, credentialWarmupRequests }))} />
-          <NumberField title="预热凭据参与概率" description="balanced 模式下预热凭据参与真实请求调度的概率。值越低，新凭据被调用越少。" value={draft.credentialWarmupSelectionPercent} min={0} max={100} suffix="%" onChange={(credentialWarmupSelectionPercent) => setDraft((prev) => ({ ...prev, credentialWarmupSelectionPercent }))} />
-        </ConfigGroup>
+        {activeTab === 'dispatch' && (
+          <>
+            <ConfigGroup icon={<Gauge className="h-4 w-4" />} title="凭据限速与冷却" description="控制单个账号被调用的频率，以及上游临时错误后多久再尝试使用该账号。">
+              <NumberField title="单凭据每分钟请求上限" description="控制每个凭据每分钟最多承接多少请求。填 0 表示关闭本地限速。" value={draft.credentialRpm} min={0} suffix="次/分钟" onChange={(credentialRpm) => setDraft((prev) => ({ ...prev, credentialRpm }))} />
+              <NumberField title="单凭据最大并发请求数" description="控制同一个凭据同时处理多少个请求。填 0 表示不限制。" value={draft.credentialMaxConcurrentRequests} min={0} suffix="并发" onChange={(credentialMaxConcurrentRequests) => setDraft((prev) => ({ ...prev, credentialMaxConcurrentRequests }))} />
+              <NumberField title="临时冷却秒数" description="当上游返回 429 或临时错误但没有 Retry-After 时，该凭据暂停使用多久。" value={draft.credentialTransientCooldownSecs} min={1} suffix="秒" onChange={(credentialTransientCooldownSecs) => setDraft((prev) => ({ ...prev, credentialTransientCooldownSecs }))} />
+              <NumberField title="最大冷却秒数" description="控制单个凭据最长冷却时间。" value={draft.credentialMaxCooldownSecs} min={1} suffix="秒" onChange={(credentialMaxCooldownSecs) => setDraft((prev) => ({ ...prev, credentialMaxCooldownSecs }))} />
+              <NumberField title="单请求最长排队等待" description="所有可用凭据都处于冷却、限速或并发占满时最多等待多久。填 0 表示不限制。" value={draft.credentialDispatchMaxWaitSecs} min={0} suffix="秒" onChange={(credentialDispatchMaxWaitSecs) => setDraft((prev) => ({ ...prev, credentialDispatchMaxWaitSecs }))} />
+              <NumberField title="异常并发自动回收" description="单个并发占用超过多久未活跃时自动释放。填 0 表示关闭。" value={draft.credentialInFlightLeaseMaxSecs} min={0} suffix="秒" onChange={(credentialInFlightLeaseMaxSecs) => setDraft((prev) => ({ ...prev, credentialInFlightLeaseMaxSecs }))} />
+            </ConfigGroup>
 
-        <ConfigGroup icon={<Wand2 className="h-4 w-4" />} title="请求压缩" description="控制发往上游前是否压缩请求内容。默认关闭总开关；如需开启，建议只使用空白压缩。">
-          <ToggleField title="启用请求压缩" description="控制是否对上游请求做压缩处理。关闭时不会改变请求内容。" checked={draft.compressionEnabled} onChange={(compressionEnabled) => setDraft((prev) => ({ ...prev, compressionEnabled }))} />
-          <ToggleField title="仅压缩空白字符" description="控制压缩时是否只处理多余空白。这是当前推荐的低风险压缩方式。" checked={draft.whitespaceCompression} disabled={!draft.compressionEnabled} onChange={(whitespaceCompression) => setDraft((prev) => ({ ...prev, whitespaceCompression }))} />
-        </ConfigGroup>
+            <ConfigGroup icon={<Sparkles className="h-4 w-4" />} title="新凭据预热" description="预热不会伪造成功次数，只会让新账号在均衡模式下更少被选中。">
+              <NumberField title="预热剩余请求数" description="新添加凭据默认进入预热状态的请求次数。填 0 表示不预热。" value={draft.credentialWarmupRequests} min={0} suffix="次" onChange={(credentialWarmupRequests) => setDraft((prev) => ({ ...prev, credentialWarmupRequests }))} />
+              <NumberField title="预热凭据参与概率" description="balanced 模式下预热凭据参与真实请求调度的概率。值越低，新凭据被调用越少。" value={draft.credentialWarmupSelectionPercent} min={0} max={100} suffix="%" onChange={(credentialWarmupSelectionPercent) => setDraft((prev) => ({ ...prev, credentialWarmupSelectionPercent }))} />
+            </ConfigGroup>
 
-        <ConfigGroup icon={<Zap className="h-4 w-4" />} title="高缓存模拟" description="控制 /v1/messages 和 /cc/v1/messages 的本地高缓存 usage 模拟。只影响下游看到的统计和后台记录，不影响 count_tokens 计算接口。">
-          <NumberField title="缓存读取目标比例" description="cache_read_input_tokens 大致占输入的目标比例。常用值 0.95 到 0.99。" value={draft.promptCacheTargetReadRatio} min={0} max={0.99} step={0.01} suffix="比例" onChange={(promptCacheTargetReadRatio) => setDraft((prev) => ({ ...prev, promptCacheTargetReadRatio }))} />
-          <NumberField title="高缓存输入放大倍数" description="控制高缓存模拟时 total input 的放大程度。只影响缓存计算，不代表 input 上报一定放大。" value={draft.promptCacheTokenScale} min={1} max={3} step={0.1} suffix="倍" onChange={(promptCacheTokenScale) => setDraft((prev) => ({ ...prev, promptCacheTokenScale }))} />
-          <NumberField title="模拟输入上限" description="高缓存模拟后 total input 的最高值。填 0 表示不设置上限。" value={draft.promptCacheMaxSimulatedInputTokens} min={0} suffix="tokens" onChange={(promptCacheMaxSimulatedInputTokens) => setDraft((prev) => ({ ...prev, promptCacheMaxSimulatedInputTokens }))} />
-          <NumberField title="放大启用门槛" description="基础输入达到多少 tokens 后才启用输入放大。" value={draft.promptCacheScaleMinInputTokens} min={0} suffix="tokens" onChange={(promptCacheScaleMinInputTokens) => setDraft((prev) => ({ ...prev, promptCacheScaleMinInputTokens }))} />
-          <NumberField title="触顶扣减下限" description="模拟输入达到上限时，最少从上限扣掉多少 tokens。" value={draft.promptCacheCapJitterMinTokens} min={0} suffix="tokens" onChange={(promptCacheCapJitterMinTokens) => setDraft((prev) => ({ ...prev, promptCacheCapJitterMinTokens }))} />
-          <NumberField title="触顶扣减上限" description="模拟输入达到上限时，最多从上限扣掉多少 tokens。" value={draft.promptCacheCapJitterMaxTokens} min={0} suffix="tokens" onChange={(promptCacheCapJitterMaxTokens) => setDraft((prev) => ({ ...prev, promptCacheCapJitterMaxTokens }))} />
-        </ConfigGroup>
+            <ConfigGroup icon={<Wand2 className="h-4 w-4" />} title="请求压缩" description="控制发往上游前是否压缩请求内容。默认关闭总开关；如需开启，建议只使用空白压缩。">
+              <ToggleField title="启用请求压缩" description="控制是否对上游请求做压缩处理。关闭时不会改变请求内容。" checked={draft.compressionEnabled} onChange={(compressionEnabled) => setDraft((prev) => ({ ...prev, compressionEnabled }))} />
+              <ToggleField title="仅压缩空白字符" description="控制压缩时是否只处理多余空白。这是当前推荐的低风险压缩方式。" checked={draft.whitespaceCompression} disabled={!draft.compressionEnabled} onChange={(whitespaceCompression) => setDraft((prev) => ({ ...prev, whitespaceCompression }))} />
+            </ConfigGroup>
+          </>
+        )}
 
-        <ConfigGroup icon={<BadgeInfo className="h-4 w-4" />} title="路径级 Usage 上报改写" description="每个路径前缀都是独立覆盖项：先使用未匹配路径默认策略，再按最长匹配路径前缀覆盖。只改变下游响应和后台 usage 记录，不影响本地 reader 计算、缓存 tracker 或上游请求。">
-          <div className="space-y-3 md:col-span-2">
-            <ReportedUsagePathEditor
-              title="未匹配路径默认上报改写"
-              description="没有命中 /cc、/ha、/na 等路径覆盖时使用。默认适合 /v1：input/output 使用原始值，cache read/write 保留 high-cache 计算值。"
-              value={draft.reportedUsage.default}
-              onChange={(defaultPolicy) => setDraft((prev) => ({ ...prev, reportedUsage: { ...prev.reportedUsage, default: defaultPolicy } }))}
-            />
-            {Object.entries(draft.reportedUsage.pathOverrides).map(([prefix, policy]) => (
-              <div key={prefix} className="space-y-3">
-                <FieldLabel title="路径前缀" description="当前前缀只控制它自己匹配到的路径。例如 /cc、/ha、/na 互相独立，后续可以分别改 input、output、cache read、cache write。">
-                  <Input
-                    bordered
-                    size="sm"
-                    value={prefix}
-                    onChange={(event) => {
-                      const nextPrefix = event.target.value
+        {activeTab === 'cache' && (
+          <ConfigGroup icon={<Zap className="h-4 w-4" />} title="高缓存模拟" description="控制 /v1/messages 和 /cc/v1/messages 的本地高缓存 usage 模拟。只影响下游看到的统计和后台记录，不影响 count_tokens 计算接口。">
+            <NumberField title="缓存读取目标比例" description="cache_read_input_tokens 大致占输入的目标比例。常用值 0.95 到 0.99。" value={draft.promptCacheTargetReadRatio} min={0} max={0.99} step={0.01} suffix="比例" onChange={(promptCacheTargetReadRatio) => setDraft((prev) => ({ ...prev, promptCacheTargetReadRatio }))} />
+            <NumberField title="高缓存输入放大倍数" description="控制高缓存模拟时 total input 的放大程度。只影响缓存计算，不代表 input 上报一定放大。" value={draft.promptCacheTokenScale} min={1} max={3} step={0.1} suffix="倍" onChange={(promptCacheTokenScale) => setDraft((prev) => ({ ...prev, promptCacheTokenScale }))} />
+            <NumberField title="模拟输入上限" description="高缓存模拟后 total input 的最高值。填 0 表示不设置上限。" value={draft.promptCacheMaxSimulatedInputTokens} min={0} suffix="tokens" onChange={(promptCacheMaxSimulatedInputTokens) => setDraft((prev) => ({ ...prev, promptCacheMaxSimulatedInputTokens }))} />
+            <NumberField title="放大启用门槛" description="基础输入达到多少 tokens 后才启用输入放大。" value={draft.promptCacheScaleMinInputTokens} min={0} suffix="tokens" onChange={(promptCacheScaleMinInputTokens) => setDraft((prev) => ({ ...prev, promptCacheScaleMinInputTokens }))} />
+            <NumberField title="触顶扣减下限" description="模拟输入达到上限时，最少从上限扣掉多少 tokens。" value={draft.promptCacheCapJitterMinTokens} min={0} suffix="tokens" onChange={(promptCacheCapJitterMinTokens) => setDraft((prev) => ({ ...prev, promptCacheCapJitterMinTokens }))} />
+            <NumberField title="触顶扣减上限" description="模拟输入达到上限时，最多从上限扣掉多少 tokens。" value={draft.promptCacheCapJitterMaxTokens} min={0} suffix="tokens" onChange={(promptCacheCapJitterMaxTokens) => setDraft((prev) => ({ ...prev, promptCacheCapJitterMaxTokens }))} />
+          </ConfigGroup>
+        )}
+
+        {activeTab === 'usage' && (
+          <ConfigGroup icon={<BadgeInfo className="h-4 w-4" />} title="路径级 Usage 上报改写" description="每个路径前缀都是独立覆盖项：先使用未匹配路径默认策略，再按最长匹配路径前缀覆盖。只改变下游响应和后台 usage 记录，不影响本地 reader 计算、缓存 tracker 或上游请求。">
+            <div className="space-y-3 md:col-span-2">
+              <ReportedUsagePathEditor
+                title="未匹配路径默认上报改写"
+                description="没有命中 /cc、/ha、/na 等路径覆盖时使用。默认适合 /v1：input/output 使用原始值，cache read/write 保留 high-cache 计算值。"
+                value={draft.reportedUsage.default}
+                onChange={(defaultPolicy) => setDraft((prev) => ({ ...prev, reportedUsage: { ...prev.reportedUsage, default: defaultPolicy } }))}
+              />
+              {Object.entries(draft.reportedUsage.pathOverrides).map(([prefix, policy]) => (
+                <div key={prefix} className="space-y-3">
+                  <FieldLabel title="路径前缀" description="当前前缀只控制它自己匹配到的路径。例如 /cc、/ha、/na 互相独立，后续可以分别改 input、output、cache read、cache write。">
+                    <Input
+                      bordered
+                      size="sm"
+                      value={prefix}
+                      onChange={(event) => {
+                        const nextPrefix = event.target.value
+                        setDraft((prev) => {
+                          const pathOverrides = { ...prev.reportedUsage.pathOverrides }
+                          delete pathOverrides[prefix]
+                          pathOverrides[nextPrefix] = policy
+                          return { ...prev, reportedUsage: { ...prev.reportedUsage, pathOverrides } }
+                        })
+                      }}
+                    />
+                  </FieldLabel>
+                  <ReportedUsagePathEditor
+                    title={`${prefix || '/'} 覆盖策略`}
+                    description="只覆盖这个路径前缀匹配到的请求。关闭后不会把本地模拟 cache usage 展示给下游或后台记录；如果请求本身带有真实上游 metadata usage，仍按真实值处理。"
+                    value={policy}
+                    onDelete={() =>
                       setDraft((prev) => {
                         const pathOverrides = { ...prev.reportedUsage.pathOverrides }
                         delete pathOverrides[prefix]
-                        pathOverrides[nextPrefix] = policy
                         return { ...prev, reportedUsage: { ...prev.reportedUsage, pathOverrides } }
                       })
-                    }}
+                    }
+                    onChange={(nextPolicy) =>
+                      setDraft((prev) => ({
+                        ...prev,
+                        reportedUsage: {
+                          ...prev.reportedUsage,
+                          pathOverrides: { ...prev.reportedUsage.pathOverrides, [prefix]: nextPolicy },
+                        },
+                      }))
+                    }
                   />
-                </FieldLabel>
-                <ReportedUsagePathEditor
-                  title={`${prefix || '/'} 覆盖策略`}
-                  description="只覆盖这个路径前缀匹配到的请求。关闭后不会把本地模拟 cache usage 展示给下游或后台记录；如果请求本身带有真实上游 metadata usage，仍按真实值处理。"
-                  value={policy}
-                  onDelete={() =>
+                </div>
+              ))}
+              <div className="flex justify-end">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
                     setDraft((prev) => {
-                      const pathOverrides = { ...prev.reportedUsage.pathOverrides }
-                      delete pathOverrides[prefix]
-                      return { ...prev, reportedUsage: { ...prev.reportedUsage, pathOverrides } }
+                      let index = 1
+                      let prefix = '/new'
+                      while (prev.reportedUsage.pathOverrides[prefix]) {
+                        index += 1
+                        prefix = `/new-${index}`
+                      }
+                      return {
+                        ...prev,
+                        reportedUsage: {
+                          ...prev.reportedUsage,
+                          pathOverrides: { ...prev.reportedUsage.pathOverrides, [prefix]: pathPolicy() },
+                        },
+                      }
                     })
                   }
-                  onChange={(nextPolicy) =>
-                    setDraft((prev) => ({
-                      ...prev,
-                      reportedUsage: {
-                        ...prev.reportedUsage,
-                        pathOverrides: { ...prev.reportedUsage.pathOverrides, [prefix]: nextPolicy },
-                      },
-                    }))
-                  }
-                />
+                >
+                  添加路径覆盖
+                </Button>
               </div>
-            ))}
-            <div className="flex justify-end">
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() =>
-                  setDraft((prev) => {
-                    let index = 1
-                    let prefix = '/new'
-                    while (prev.reportedUsage.pathOverrides[prefix]) {
-                      index += 1
-                      prefix = `/new-${index}`
-                    }
-                    return {
-                      ...prev,
-                      reportedUsage: {
-                        ...prev.reportedUsage,
-                        pathOverrides: { ...prev.reportedUsage.pathOverrides, [prefix]: pathPolicy() },
-                      },
-                    }
-                  })
-                }
-              >
-                添加路径覆盖
-              </Button>
             </div>
-          </div>
-        </ConfigGroup>
+          </ConfigGroup>
+        )}
 
-        <ConfigGroup icon={<Shield className="h-4 w-4" />} title="兼容与诊断" description="控制协议兼容细节和调试信息展示。调试信息只影响响应头或非流式 thinking 解析，不改变凭据调度。">
-          <FieldLabel title="兼容模式" description="Claude Code 兼容适合日常 CLI 使用；Anthropic 严格模式会减少代理侧改写；调试模式会默认暴露代理改写告警头。">
-            <Select bordered size="sm" value={draft.compatProfile} onChange={(event) => setDraft((prev) => ({ ...prev, compatProfile: event.target.value as CompatProfile }))}>
-              <Select.Option value="claude-code">Claude Code 兼容</Select.Option>
-              <Select.Option value="anthropic-strict">Anthropic 严格模式</Select.Option>
-              <Select.Option value="debug">调试模式</Select.Option>
-            </Select>
-          </FieldLabel>
-          <ToggleField title="提取 Thinking 内容块" description="非流式响应里是否把 <thinking> 标签解析成独立 thinking 内容块。" checked={draft.extractThinking} onChange={(extractThinking) => setDraft((prev) => ({ ...prev, extractThinking }))} />
-          <ToggleField title="暴露代理改写告警" description="是否通过 x-kiro-rs-warnings 响应头展示代理侧动作，方便排查兼容问题。" checked={draft.exposeProxyWarnings} onChange={(exposeProxyWarnings) => setDraft((prev) => ({ ...prev, exposeProxyWarnings }))} />
-        </ConfigGroup>
+        {activeTab === 'compat' && (
+          <>
+            <ConfigGroup icon={<Shield className="h-4 w-4" />} title="兼容与诊断" description="控制协议兼容细节和调试信息展示。调试信息只影响响应头或非流式 thinking 解析，不改变凭据调度。">
+              <FieldLabel title="兼容模式" description="Claude Code 兼容适合日常 CLI 使用；Anthropic 严格模式会减少代理侧改写；调试模式会默认暴露代理改写告警头。">
+                <Select bordered size="sm" value={draft.compatProfile} onChange={(event) => setDraft((prev) => ({ ...prev, compatProfile: event.target.value as CompatProfile }))}>
+                  <Select.Option value="claude-code">Claude Code 兼容</Select.Option>
+                  <Select.Option value="anthropic-strict">Anthropic 严格模式</Select.Option>
+                  <Select.Option value="debug">调试模式</Select.Option>
+                </Select>
+              </FieldLabel>
+              <ToggleField title="提取 Thinking 内容块" description="非流式响应里是否把 <thinking> 标签解析成独立 thinking 内容块。" checked={draft.extractThinking} onChange={(extractThinking) => setDraft((prev) => ({ ...prev, extractThinking }))} />
+              <ToggleField title="暴露代理改写告警" description="是否通过 x-kiro-rs-warnings 响应头展示代理侧动作，方便排查兼容问题。" checked={draft.exposeProxyWarnings} onChange={(exposeProxyWarnings) => setDraft((prev) => ({ ...prev, exposeProxyWarnings }))} />
+            </ConfigGroup>
 
-        <ConfigGroup icon={<Gauge className="h-4 w-4" />} title="后台统计" description="控制后台 usage 汇总的判断口径，只影响页面统计，不影响真实请求、缓存计算和费用估算。">
-          <NumberField title="高缓存判定阈值" description="后台把一次请求统计为高缓存请求的 cache_read_input_tokens 门槛。" value={draft.highCacheThreshold} min={0} suffix="tokens" onChange={(highCacheThreshold) => setDraft((prev) => ({ ...prev, highCacheThreshold }))} />
-        </ConfigGroup>
+            <ConfigGroup icon={<Gauge className="h-4 w-4" />} title="后台统计" description="控制后台 usage 汇总的判断口径，只影响页面统计，不影响真实请求、缓存计算和费用估算。">
+              <NumberField title="高缓存判定阈值" description="后台把一次请求统计为高缓存请求的 cache_read_input_tokens 门槛。" value={draft.highCacheThreshold} min={0} suffix="tokens" onChange={(highCacheThreshold) => setDraft((prev) => ({ ...prev, highCacheThreshold }))} />
+            </ConfigGroup>
+          </>
+        )}
 
         <Alert status="info" className="py-2 text-sm">
           <Shield className="h-4 w-4" />

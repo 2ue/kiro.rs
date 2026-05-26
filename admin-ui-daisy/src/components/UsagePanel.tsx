@@ -1,15 +1,13 @@
-import { DollarSign, Eye, RefreshCw, Trash2, X } from 'lucide-react'
+import { Eye, Trash2, X } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
-import { Button, Card, Input, Loading, Select, Table } from 'react-daisyui'
+import { Button, Card, Input, Select, Table } from 'react-daisyui'
 import { Badge, EmptyState, ErrorState, LoadingState, ModalShell, SectionCard, StatCard } from '@/components/common'
 import { formatDate, formatNumber, formatPercent, formatUsd, ratio } from '@/lib/format'
 import { extractErrorMessage } from '@/lib/utils'
 import { useCredentials } from '@/hooks/use-credentials'
 import {
   useClearUsageRecords,
-  useModelPricing,
-  useSyncModelPricing,
   useUsageRecordsPage,
   useUsageSummary,
 } from '@/hooks/use-usage'
@@ -114,8 +112,6 @@ export function UsagePanel() {
 
   const summary = useUsageSummary()
   const records = useUsageRecordsPage(query)
-  const pricing = useModelPricing()
-  const syncPricing = useSyncModelPricing()
   const credentials = useCredentials()
   const clearRecords = useClearUsageRecords()
 
@@ -142,12 +138,6 @@ export function UsagePanel() {
   )
   const pricedRatio = ratio(summaryData?.pricedRequests || 0, summaryData?.totalRequests || 0)
 
-  const refresh = () => {
-    summary.refetch()
-    records.refetch()
-    pricing.refetch()
-  }
-
   const resetFilters = () => {
     setSearchText('')
     setModel('')
@@ -157,17 +147,6 @@ export function UsagePanel() {
     setSource('')
     setStreamMode('all')
     setMinCacheRead('')
-  }
-
-  const syncPrice = () => {
-    syncPricing.mutate(undefined, {
-      onSuccess: (statusData) => {
-        if (statusData.lastError) toast.warning(`价格同步失败，继续使用当前价格: ${statusData.lastError}`)
-        else toast.success(`价格已同步：${statusData.modelCount} 个模型`)
-        refresh()
-      },
-      onError: (error) => toast.error(`同步失败: ${extractErrorMessage(error)}`),
-    })
   }
 
   const clear = () => {
@@ -188,24 +167,6 @@ export function UsagePanel() {
       </div>
 
       <SectionCard
-        title="模型计价"
-        description={pricing.data?.lastError || pricing.data?.sourceUrl || '正在加载价格目录'}
-        actions={
-          <Button type="button" variant="outline" size="sm" onClick={syncPrice} disabled={syncPricing.isPending}>
-            {syncPricing.isPending ? <Loading size="xs" /> : <DollarSign className="h-4 w-4" />}
-            同步价格
-          </Button>
-        }
-      >
-        <div className="flex flex-wrap items-center gap-2 text-sm">
-          <span className="font-medium">来源</span>
-          <Badge tone={pricing.data?.lastError ? 'warning' : 'secondary'}>{pricing.data?.source || 'loading'}</Badge>
-          <Badge>{formatNumber(pricing.data?.modelCount || 0)} 个模型</Badge>
-          {pricing.data?.lastSyncedAt && <span className="text-base-content/60">同步 {formatDate(pricing.data.lastSyncedAt)}</span>}
-        </div>
-      </SectionCard>
-
-      <SectionCard
         title="使用记录"
         description="错误详情和账号切换链路可点击查看。"
         actions={
@@ -213,10 +174,6 @@ export function UsagePanel() {
             <Button type="button" variant="outline" size="sm" onClick={resetFilters} disabled={!hasFilters}>
               <X className="h-4 w-4" />
               重置
-            </Button>
-            <Button type="button" variant="outline" size="sm" onClick={refresh}>
-              <RefreshCw className="h-4 w-4" />
-              刷新
             </Button>
             <Button type="button" color="error" variant="outline" size="sm" onClick={clear} disabled={clearRecords.isPending}>
               <Trash2 className="h-4 w-4" />

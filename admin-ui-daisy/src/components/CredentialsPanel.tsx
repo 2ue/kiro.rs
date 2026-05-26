@@ -522,10 +522,6 @@ export function CredentialsPanel() {
             <Button type="button" variant="outline" size="sm" onClick={toggleLoadBalancing} disabled={setLoadBalancing.isPending || loadBalancing.isLoading}>
               {loadBalancing.data?.mode === 'priority' ? '优先级模式' : '均衡负载'}
             </Button>
-            <Button type="button" variant="outline" size="sm" onClick={() => credentials.refetch()}>
-              <RefreshCw className="h-4 w-4" />
-              刷新
-            </Button>
             <Button type="button" variant="outline" size="sm" onClick={queryCurrentPageInfo} disabled={queryingInfo || currentCredentials.length === 0}>
               {queryingInfo ? <Loading size="xs" /> : <Wallet className="h-4 w-4" />}
               查询信息
