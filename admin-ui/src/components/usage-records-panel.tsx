@@ -263,16 +263,40 @@ export function UsageRecordsPanel() {
   )
   const pricingStatus = modelPricing.data
   const pricedRatio = ratio(summaryData?.pricedRequests || 0, summaryData?.totalRequests || 0)
+  const realtime = summaryData?.realtime
+  const realtimeWindow = realtime?.windowSeconds || 60
 
   return (
     <div className="space-y-4">
-      <div className="grid gap-4 md:grid-cols-4">
+      <div className="grid gap-4 md:grid-cols-3 xl:grid-cols-6">
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium text-muted-foreground">请求总数</CardTitle>
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">{formatNumber(summaryData?.totalRequests || 0)}</div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium text-muted-foreground">实时 RPM</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">{formatNumber(realtime?.rpm || 0)}</div>
+            <div className="text-xs text-muted-foreground">
+              近 {realtimeWindow} 秒 {formatNumber(realtime?.requests || 0)} 请求
+            </div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium text-muted-foreground">实时 TPM</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold">{formatNumber(realtime?.totalTpm || 0)}</div>
+            <div className="text-xs text-muted-foreground">
+              计费 {formatNumber(realtime?.billableTpm || 0)}
+            </div>
           </CardContent>
         </Card>
         <Card>

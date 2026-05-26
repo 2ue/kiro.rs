@@ -16,6 +16,7 @@ const DEFAULT_PAGE_QUERY_LIMIT: usize = 20;
 const MAX_QUERY_LIMIT: usize = 1000;
 const USAGE_WRITER_QUEUE_CAPACITY: usize = 4096;
 const USAGE_WRITER_MAX_ATTEMPTS: u32 = 3;
+pub const REALTIME_USAGE_WINDOW_SECS: u32 = 60;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -176,6 +177,57 @@ pub struct UsageAggregate {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UsageRealtimeStats {
+    pub window_seconds: u32,
+    pub requests: usize,
+    pub rpm: f64,
+    pub input_tpm: f64,
+    pub output_tpm: f64,
+    pub total_tpm: f64,
+    pub billable_tpm: f64,
+}
+
+impl UsageRealtimeStats {
+    pub fn empty(window_seconds: u32) -> Self {
+        Self {
+            window_seconds,
+            requests: 0,
+            rpm: 0.0,
+            input_tpm: 0.0,
+            output_tpm: 0.0,
+            total_tpm: 0.0,
+            billable_tpm: 0.0,
+        }
+    }
+
+    pub fn from_totals(
+        window_seconds: u32,
+        requests: usize,
+        input_tokens: i64,
+        output_tokens: i64,
+        billable_input_tokens: i64,
+    ) -> Self {
+        let scale = if window_seconds == 0 {
+            0.0
+        } else {
+            60.0 / window_seconds as f64
+        };
+        let input_tpm = input_tokens.max(0) as f64 * scale;
+        let output_tpm = output_tokens.max(0) as f64 * scale;
+        Self {
+            window_seconds,
+            requests,
+            rpm: requests as f64 * scale,
+            input_tpm,
+            output_tpm,
+            total_tpm: input_tpm + output_tpm,
+            billable_tpm: (billable_input_tokens.max(0) + output_tokens.max(0)) as f64 * scale,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UsageSummary {
     pub total_requests: usize,
     pub success_requests: usize,
@@ -194,6 +246,7 @@ pub struct UsageSummary {
     pub local_prompt_cache_creation_input_tokens: i64,
     pub simulated_requests: usize,
     pub upstream_metadata_requests: usize,
+    pub realtime: UsageRealtimeStats,
     pub top_credentials: Vec<UsageAggregate>,
     pub top_conversations: Vec<UsageAggregate>,
 }
@@ -424,11 +477,18 @@ impl UsageRecorder {
             local_prompt_cache_creation_input_tokens: 0,
             simulated_requests: 0,
             upstream_metadata_requests: 0,
+            realtime: UsageRealtimeStats::empty(REALTIME_USAGE_WINDOW_SECS),
             top_credentials: Vec::new(),
             top_conversations: Vec::new(),
         };
         let mut credentials: HashMap<String, UsageAggregate> = HashMap::new();
         let mut conversations: HashMap<String, UsageAggregate> = HashMap::new();
+        let realtime_cutoff =
+            Utc::now() - chrono::Duration::seconds(REALTIME_USAGE_WINDOW_SECS as i64);
+        let mut realtime_requests = 0usize;
+        let mut realtime_input_tokens = 0i64;
+        let mut realtime_output_tokens = 0i64;
+        let mut realtime_billable_input_tokens = 0i64;
 
         for record in records.iter() {
             if record.status == UsageRecordStatus::Success {
@@ -462,6 +522,15 @@ impl UsageRecorder {
                     record.cache_read_input_tokens as i64;
                 summary.local_prompt_cache_creation_input_tokens +=
                     record.cache_creation_input_tokens as i64;
+            }
+            if DateTime::parse_from_rfc3339(&record.created_at)
+                .map(|created_at| created_at.with_timezone(&Utc) >= realtime_cutoff)
+                .unwrap_or(false)
+            {
+                realtime_requests += 1;
+                realtime_input_tokens += record.total_input_tokens as i64;
+                realtime_output_tokens += record.output_tokens as i64;
+                realtime_billable_input_tokens += record.billable_input_tokens as i64;
             }
 
             if let Some(id) = record.credential_id {
@@ -504,6 +573,13 @@ impl UsageRecorder {
 
         summary.top_credentials = top_aggregates(credentials);
         summary.top_conversations = top_aggregates(conversations);
+        summary.realtime = UsageRealtimeStats::from_totals(
+            REALTIME_USAGE_WINDOW_SECS,
+            realtime_requests,
+            realtime_input_tokens,
+            realtime_output_tokens,
+            realtime_billable_input_tokens,
+        );
         summary
     }
 
@@ -974,6 +1050,11 @@ mod tests {
         assert_eq!(summary.local_prompt_cache_input_tokens, 100);
         assert_eq!(summary.local_prompt_cache_read_input_tokens, 20_000);
         assert_eq!(summary.local_prompt_cache_creation_input_tokens, 5);
+        assert_eq!(summary.realtime.window_seconds, REALTIME_USAGE_WINDOW_SECS);
+        assert_eq!(summary.realtime.requests, 2);
+        assert_eq!(summary.realtime.rpm, 2.0);
+        assert_eq!(summary.realtime.total_tpm, 220.0);
+        assert_eq!(summary.realtime.billable_tpm, 120.0);
         assert_eq!(summary.top_credentials[0].key, "1");
     }
 

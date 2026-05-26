@@ -137,6 +137,8 @@ export function UsagePanel() {
     summaryData?.localPromptCacheInputTokens || 0
   )
   const pricedRatio = ratio(summaryData?.pricedRequests || 0, summaryData?.totalRequests || 0)
+  const realtime = summaryData?.realtime
+  const realtimeWindow = realtime?.windowSeconds || 60
 
   const resetFilters = () => {
     setSearchText('')
@@ -161,6 +163,18 @@ export function UsagePanel() {
     <div className="space-y-4">
       <div className="metric-grid">
         <StatCard title="请求总数" value={formatNumber(summaryData?.totalRequests || 0)} />
+        <StatCard
+          title="实时 RPM"
+          value={formatNumber(realtime?.rpm || 0)}
+          desc={`近 ${realtimeWindow} 秒 ${formatNumber(realtime?.requests || 0)} 请求`}
+          tone="info"
+        />
+        <StatCard
+          title="实时 TPM"
+          value={formatNumber(realtime?.totalTpm || 0)}
+          desc={`计费 ${formatNumber(realtime?.billableTpm || 0)}`}
+          tone="info"
+        />
         <StatCard title="高缓存请求" value={formatNumber(summaryData?.highCacheRequests || 0)} tone="success" />
         <StatCard title="缓存读取" value={formatNumber(summaryData?.totalCacheReadInputTokens || 0)} desc={`本地读取 ${formatPercent(readRatio)} / 总缓存 ${formatPercent(cachedRatio)}`} />
         <StatCard title="估算费用" value={formatUsd(summaryData?.totalEstimatedCostUsd || 0)} desc={`已计价 ${formatPercent(pricedRatio)}`} tone="info" />

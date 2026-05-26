@@ -230,6 +230,16 @@ export interface UsageAggregate {
   estimatedCostUsd: number
 }
 
+export interface UsageRealtimeStats {
+  windowSeconds: number
+  requests: number
+  rpm: number
+  inputTpm: number
+  outputTpm: number
+  totalTpm: number
+  billableTpm: number
+}
+
 export interface UsageSummary {
   totalRequests: number
   successRequests: number
@@ -248,6 +258,7 @@ export interface UsageSummary {
   localPromptCacheCreationInputTokens: number
   simulatedRequests: number
   upstreamMetadataRequests: number
+  realtime: UsageRealtimeStats
   topCredentials: UsageAggregate[]
   topConversations: UsageAggregate[]
 }

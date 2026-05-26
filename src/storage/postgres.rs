@@ -12,8 +12,9 @@ use sqlx::{
 use crate::anthropic::model_capabilities::{ModelCapabilitiesStatus, ModelCapabilityItem};
 use crate::anthropic::pricing::{ModelPriceItem, ModelPricing, PricingStatus};
 use crate::anthropic::usage::{
-    CredentialCostSummary, UsageAggregate, UsageRecord, UsageRecordQuery, UsageRecordStatus,
-    UsageRecordsPageResult, UsageRecordsResult, UsageSummary,
+    CredentialCostSummary, REALTIME_USAGE_WINDOW_SECS, UsageAggregate, UsageRealtimeStats,
+    UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult, UsageRecordsResult,
+    UsageSummary,
 };
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
@@ -1501,7 +1502,11 @@ impl PostgresUsageStore {
                 COALESCE(SUM(cache_read_input_tokens) FILTER (WHERE usage_source = 'local_prompt_cache'), 0)::bigint AS local_prompt_cache_read_input_tokens,
                 COALESCE(SUM(cache_creation_input_tokens) FILTER (WHERE usage_source = 'local_prompt_cache'), 0)::bigint AS local_prompt_cache_creation_input_tokens,
                 COUNT(*) FILTER (WHERE simulated)::bigint AS simulated_requests,
-                COUNT(*) FILTER (WHERE usage_source = 'upstream_metadata')::bigint AS upstream_metadata_requests
+                COUNT(*) FILTER (WHERE usage_source = 'upstream_metadata')::bigint AS upstream_metadata_requests,
+                COUNT(*) FILTER (WHERE created_at >= now() - interval '60 seconds')::bigint AS realtime_requests,
+                COALESCE(SUM(total_input_tokens) FILTER (WHERE created_at >= now() - interval '60 seconds'), 0)::bigint AS realtime_input_tokens,
+                COALESCE(SUM(output_tokens) FILTER (WHERE created_at >= now() - interval '60 seconds'), 0)::bigint AS realtime_output_tokens,
+                COALESCE(SUM(billable_input_tokens) FILTER (WHERE created_at >= now() - interval '60 seconds'), 0)::bigint AS realtime_billable_input_tokens
             FROM usage_records
             WHERE deleted_at IS NULL
             "#,
@@ -1530,6 +1535,13 @@ impl PostgresUsageStore {
                 .try_get("local_prompt_cache_creation_input_tokens")?,
             simulated_requests: row_i64_to_usize(&row, "simulated_requests")?,
             upstream_metadata_requests: row_i64_to_usize(&row, "upstream_metadata_requests")?,
+            realtime: UsageRealtimeStats::from_totals(
+                REALTIME_USAGE_WINDOW_SECS,
+                row_i64_to_usize(&row, "realtime_requests")?,
+                row.try_get("realtime_input_tokens")?,
+                row.try_get("realtime_output_tokens")?,
+                row.try_get("realtime_billable_input_tokens")?,
+            ),
             top_credentials: self.top_credential_aggregates().await?,
             top_conversations: self.top_conversation_aggregates().await?,
         })
@@ -2341,6 +2353,11 @@ mod tests {
         assert_eq!(summary.local_prompt_cache_requests, 2);
         assert_eq!(summary.priced_requests, 1);
         assert_eq!(summary.unpriced_requests, 1);
+        assert_eq!(summary.realtime.window_seconds, REALTIME_USAGE_WINDOW_SECS);
+        assert_eq!(summary.realtime.requests, 2);
+        assert_eq!(summary.realtime.rpm, 2.0);
+        assert_eq!(summary.realtime.total_tpm, 240.0);
+        assert_eq!(summary.realtime.billable_tpm, 60.0);
         assert_eq!(summary.top_credentials[0].key, "7");
         assert_eq!(summary.top_conversations.len(), 2);
 
