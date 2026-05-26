@@ -79,9 +79,9 @@ function UsageMetric({
 }) {
   const toneClass = tone === 'success' ? 'text-success' : tone === 'info' ? 'text-primary' : 'text-base-content'
   return (
-    <div className="rounded-box border border-base-300/60 bg-base-100 px-3 py-2">
+    <div className="rounded-box border border-base-300/60 bg-base-100 px-2.5 py-1.5">
       <div className="text-[0.68rem] font-medium text-base-content/50">{label}</div>
-      <div className={`mt-0.5 truncate font-mono text-sm font-semibold ${toneClass}`}>{value}</div>
+      <div className={`mt-0.5 truncate font-mono text-[0.82rem] font-semibold ${toneClass}`}>{value}</div>
     </div>
   )
 }
@@ -207,7 +207,7 @@ export function UsagePanel() {
 
       <SectionCard
         title="使用记录"
-        description="默认每页 20 条，接口只返回是否还有下一页。错误详情和账号切换链路可点击查看。"
+        description="错误详情和账号切换链路可点击查看。"
         actions={
           <>
             <Button type="button" variant="outline" size="sm" onClick={resetFilters} disabled={!hasFilters}>
@@ -225,12 +225,12 @@ export function UsagePanel() {
           </>
         }
       >
-        <div className="mb-4 grid gap-2 md:grid-cols-2 xl:grid-cols-4">
-          <Input bordered className="xl:col-span-2" value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="搜索模型、账号、会话、错误" />
-          <Input bordered value={model} onChange={(event) => setModel(event.target.value)} placeholder="模型" />
-          <Input bordered value={conversationId} onChange={(event) => setConversationId(event.target.value)} placeholder="会话 ID" />
-          <Input bordered value={credentialId} onChange={(event) => setCredentialId(event.target.value)} placeholder="账号 ID" inputMode="numeric" />
-          <Select bordered value={status} onChange={(event) => setStatus(event.target.value as UsageRecordStatus | '')}>
+        <div className="mb-3 grid gap-2 md:grid-cols-2 xl:grid-cols-4">
+          <Input bordered size="sm" className="xl:col-span-2" value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="搜索模型、账号、会话、错误" />
+          <Input bordered size="sm" value={model} onChange={(event) => setModel(event.target.value)} placeholder="模型" />
+          <Input bordered size="sm" value={conversationId} onChange={(event) => setConversationId(event.target.value)} placeholder="会话 ID" />
+          <Input bordered size="sm" value={credentialId} onChange={(event) => setCredentialId(event.target.value)} placeholder="账号 ID" inputMode="numeric" />
+          <Select bordered size="sm" value={status} onChange={(event) => setStatus(event.target.value as UsageRecordStatus | '')}>
             <Select.Option value="">全部状态</Select.Option>
             <Select.Option value="success">成功</Select.Option>
             <Select.Option value="error">错误</Select.Option>
@@ -238,7 +238,7 @@ export function UsagePanel() {
             <Select.Option value="upstream_timeout">上游超时</Select.Option>
             <Select.Option value="client_dropped">客户端断开</Select.Option>
           </Select>
-          <Select bordered value={source} onChange={(event) => setSource(event.target.value as UsageSource | '')}>
+          <Select bordered size="sm" value={source} onChange={(event) => setSource(event.target.value as UsageSource | '')}>
             <Select.Option value="">全部来源</Select.Option>
             <Select.Option value="upstream_metadata">上游 metadata</Select.Option>
             <Select.Option value="local_prompt_cache">本地 prompt cache</Select.Option>
@@ -246,12 +246,12 @@ export function UsagePanel() {
             <Select.Option value="request_estimate">请求估算</Select.Option>
             <Select.Option value="none">无缓存</Select.Option>
           </Select>
-          <Select bordered value={streamMode} onChange={(event) => setStreamMode(event.target.value as 'all' | 'stream' | 'non_stream')}>
+          <Select bordered size="sm" value={streamMode} onChange={(event) => setStreamMode(event.target.value as 'all' | 'stream' | 'non_stream')}>
             <Select.Option value="all">全部请求</Select.Option>
             <Select.Option value="stream">Stream</Select.Option>
             <Select.Option value="non_stream">非 Stream</Select.Option>
           </Select>
-          <Input bordered value={minCacheRead} onChange={(event) => setMinCacheRead(event.target.value)} placeholder="最小 cache read" inputMode="numeric" />
+          <Input bordered size="sm" value={minCacheRead} onChange={(event) => setMinCacheRead(event.target.value)} placeholder="最小 cache read" inputMode="numeric" />
         </div>
 
         {records.isLoading ? (
@@ -269,16 +269,16 @@ export function UsagePanel() {
               const attemptChain = formatAttemptChain(record)
               return (
                 <Card key={record.id} className="usage-record-card">
-                  <Card.Body className="gap-3 p-4">
-                    <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
+                  <Card.Body className="gap-2.5 p-3">
+                    <div className="flex flex-col gap-2 xl:flex-row xl:items-start xl:justify-between">
                       <div className="min-w-0">
-                        <div className="flex flex-wrap items-center gap-2">
+                        <div className="flex flex-wrap items-center gap-1.5">
                           <span className="text-xs font-medium text-base-content/55">{formatDate(record.createdAt)}</span>
                           <Badge tone={statusTone(record.status)}>{statusLabel(record.status)}</Badge>
                           <Badge tone={record.simulated ? 'warning' : 'secondary'}>{sourceLabel(record.usageSource)}</Badge>
                           <Badge tone={record.stream ? 'secondary' : 'neutral'}>{record.stream ? 'stream' : 'non-stream'}</Badge>
                         </div>
-                        <div className="mt-2 flex flex-wrap items-center gap-2">
+                        <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
                           <span className="max-w-[360px] truncate text-sm font-semibold" title={record.model || '-'}>
                             {record.model || '-'}
                           </span>
@@ -287,7 +287,7 @@ export function UsagePanel() {
                           {record.fallbackFromSticky && <Badge tone="warning">fallback</Badge>}
                         </div>
                       </div>
-                      <div className="flex shrink-0 flex-wrap items-center gap-3 text-sm">
+                      <div className="flex shrink-0 flex-wrap items-center gap-2 text-sm">
                         <div className="text-right">
                           <div className="font-semibold">{formatUsd(record.estimatedCostUsd || 0)}</div>
                           <div className="text-xs text-base-content/50">{record.pricingAvailable ? record.pricingModel || 'priced' : 'unpriced'}</div>
@@ -296,20 +296,20 @@ export function UsagePanel() {
                           <div className="font-semibold">{formatNumber(record.durationMs)}ms</div>
                           <div className="text-xs text-base-content/50">耗时</div>
                         </div>
-                        <Button type="button" variant="outline" size="sm" onClick={() => setSelectedRecord(record)} title="查看详情">
-                          <Eye className="h-4 w-4" />
+                        <Button type="button" variant="outline" size="xs" onClick={() => setSelectedRecord(record)} title="查看详情">
+                          <Eye className="h-3.5 w-3.5" />
                           详情
                         </Button>
                       </div>
                     </div>
 
-                    <div className="grid gap-2 text-sm md:grid-cols-2 xl:grid-cols-[240px_1fr]">
-                      <div className="min-w-0 rounded-box bg-base-200/60 px-3 py-2">
+                    <div className="grid gap-2 text-sm md:grid-cols-2 xl:grid-cols-[220px_1fr]">
+                      <div className="min-w-0 rounded-box bg-base-200/60 px-2.5 py-1.5">
                         <div className="text-xs text-base-content/50">账号</div>
                         <div className="font-semibold">#{record.credentialId ?? '-'}</div>
                         {label && <div className="truncate text-xs text-base-content/60" title={label}>{label}</div>}
                       </div>
-                      <div className="min-w-0 rounded-box bg-base-200/60 px-3 py-2">
+                      <div className="min-w-0 rounded-box bg-base-200/60 px-2.5 py-1.5">
                         <div className="text-xs text-base-content/50">会话</div>
                         <div className="truncate font-mono text-xs" title={record.conversationId || '-'}>{record.conversationId || '-'}</div>
                         {attemptChain && (
@@ -339,7 +339,7 @@ export function UsagePanel() {
                     {record.errorMessage && (
                       <button
                         type="button"
-                        className="rounded-box border border-error/20 bg-error/5 px-3 py-2 text-left text-xs text-error hover:bg-error/10"
+                        className="rounded-box border border-error/20 bg-error/5 px-2.5 py-1.5 text-left text-xs text-error hover:bg-error/10"
                         onClick={() => setSelectedRecord(record)}
                         title={record.errorDetail || record.errorMessage}
                       >

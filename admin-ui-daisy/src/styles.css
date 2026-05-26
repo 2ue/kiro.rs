@@ -11,7 +11,7 @@
   --shell-sidebar: #111827;
   --shell-sidebar-muted: #94a3b8;
   --shell-sidebar-border: rgb(255 255 255 / 0.08);
-  --page-max: 1480px;
+  --page-max: 1420px;
 }
 
 html[data-theme='kiroDark'] {
@@ -92,7 +92,7 @@ select {
 
 .app-shell {
   display: grid;
-  grid-template-columns: 17rem minmax(0, 1fr);
+  grid-template-columns: 14.75rem minmax(0, 1fr);
   min-height: 100vh;
 }
 
@@ -103,7 +103,7 @@ select {
 
 .sidebar-nav-item {
   position: relative;
-  min-height: 3.85rem;
+  min-height: 2.75rem;
   border: 1px solid transparent;
   appearance: none;
   background: transparent;
@@ -125,7 +125,7 @@ select {
   background:
     radial-gradient(circle at 92% 10%, color-mix(in srgb, oklch(var(--p)) 10%, transparent), transparent 20rem),
     linear-gradient(135deg, color-mix(in srgb, oklch(var(--b1)) 98%, transparent), color-mix(in srgb, oklch(var(--b1)) 90%, oklch(var(--b2)) 10%));
-  box-shadow: 0 1px 2px rgb(15 23 42 / 4%), 0 18px 50px rgb(15 23 42 / 5%);
+  box-shadow: 0 1px 2px rgb(15 23 42 / 4%), 0 10px 28px rgb(15 23 42 / 4%);
 }
 
 .soft-panel {
@@ -194,19 +194,16 @@ select {
 
 .btn {
   font-weight: 500;
-  min-height: 2.25rem;
-  height: 2.25rem;
   text-transform: none;
 }
 
-.btn-sm {
-  min-height: 2rem;
-  height: 2rem;
+.toggle {
+  border-radius: 999px;
 }
 
-.btn-xs {
-  min-height: 1.5rem;
-  height: 1.5rem;
+.toggle::before,
+.toggle:before {
+  border-radius: 999px;
 }
 
 .btn-outline {
@@ -263,7 +260,7 @@ select {
 
 .section-card-header {
   border-bottom: 1px solid color-mix(in srgb, oklch(var(--b3)) 72%, transparent);
-  padding: 1rem 1.25rem;
+  padding: 0.75rem 1rem;
 }
 
 .metric-card {
@@ -337,14 +334,14 @@ select {
 
 .metric-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-  gap: 0.75rem;
+  grid-template-columns: repeat(auto-fit, minmax(165px, 1fr));
+  gap: 0.55rem;
 }
 
 .form-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 0.75rem;
+  gap: 0.6rem;
 }
 
 @media (max-width: 1023px) {

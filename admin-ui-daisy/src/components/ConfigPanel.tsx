@@ -53,6 +53,7 @@ function NumberField({
       <Join className="w-full">
         <Input
           bordered
+          size="sm"
           type="number"
           className="join-item w-full"
           value={value}
@@ -62,7 +63,7 @@ function NumberField({
           inputMode={step ? 'decimal' : 'numeric'}
           onChange={(event) => onChange(numberValue(event.target.value, min ?? 0))}
         />
-        <span className="join-item unit-addon min-w-24">{suffix}</span>
+        <span className="join-item unit-addon min-w-20">{suffix}</span>
       </Join>
     </FieldLabel>
   )
@@ -83,12 +84,12 @@ function ToggleField({
 }) {
   return (
     <Card bordered className="bg-base-100 shadow-none">
-      <Card.Body className="flex-row items-center justify-between gap-4 p-4">
+      <Card.Body className="flex-row items-center justify-between gap-3 p-3">
       <div className="min-w-0">
         <div className="text-sm font-semibold">{title}</div>
-        <div className="mt-1 text-xs leading-5 text-base-content/60">{description}</div>
+        <div className="mt-0.5 text-xs leading-4 text-base-content/60">{description}</div>
       </div>
-      <Toggle color="primary" className="shrink-0" checked={checked} disabled={disabled} onChange={(event) => onChange(event.target.checked)} />
+      <Toggle color="primary" size="sm" className="shrink-0" checked={checked} disabled={disabled} onChange={(event) => onChange(event.target.checked)} />
       </Card.Body>
     </Card>
   )
@@ -107,15 +108,15 @@ function ConfigGroup({
 }) {
   return (
     <Collapse icon="arrow" open className="rounded-box border border-base-300 bg-base-100 shadow-none">
-      <Collapse.Title className="flex items-start gap-3 px-4 py-3">
-        <span className="rounded-lg border border-base-300 bg-base-200 p-2 text-primary">{icon}</span>
+      <Collapse.Title className="flex items-start gap-2.5 px-3 py-2.5">
+        <span className="rounded-lg border border-base-300 bg-base-200 p-1.5 text-primary">{icon}</span>
         <span>
           <span className="block text-sm font-semibold">{title}</span>
-          <span className="mt-1 block text-xs leading-5 text-base-content/60">{description}</span>
+          <span className="mt-0.5 block text-xs leading-4 text-base-content/60">{description}</span>
         </span>
       </Collapse.Title>
       <Collapse.Content>
-        <div className="grid gap-4 border-t border-base-300/70 pt-4 md:grid-cols-2">{children}</div>
+        <div className="grid gap-3 border-t border-base-300/70 pt-3 md:grid-cols-2">{children}</div>
       </Collapse.Content>
     </Collapse>
   )
@@ -123,7 +124,7 @@ function ConfigGroup({
 
 function ModeSelect({ value, disabled, onChange }: { value: ReportedUsageFieldMode; disabled?: boolean; onChange: (value: ReportedUsageFieldMode) => void }) {
   return (
-    <Select bordered className="w-full" value={value} disabled={disabled} onChange={(event) => onChange(event.target.value as ReportedUsageFieldMode)}>
+    <Select bordered size="sm" className="w-full" value={value} disabled={disabled} onChange={(event) => onChange(event.target.value as ReportedUsageFieldMode)}>
       <Select.Option value="raw">原始值（不经过缓存计算）</Select.Option>
       <Select.Option value="preserve">保留计算值（不改写）</Select.Option>
       <Select.Option value="sample-max">按上限采样改写</Select.Option>
@@ -156,6 +157,7 @@ function PolicyNumberInput({
       <Join className="w-full">
         <Input
           bordered
+          size="sm"
           className="join-item w-full"
           type="number"
           value={value}
@@ -165,7 +167,7 @@ function PolicyNumberInput({
           disabled={disabled}
           onChange={(event) => onChange(numberValue(event.target.value, min ?? 0))}
         />
-        <span className="join-item unit-addon min-w-20">{suffix}</span>
+        <span className="join-item unit-addon min-w-16">{suffix}</span>
       </Join>
     </FieldLabel>
   )
@@ -188,14 +190,14 @@ function ReportedUsageFieldEditor({
 }) {
   return (
     <Card bordered className="bg-base-100 shadow-none">
-      <Card.Body className="p-4">
-      <div className="mb-3">
+      <Card.Body className="p-3">
+      <div className="mb-2">
         <div className="text-sm font-semibold">{title}</div>
-        <div className="mt-1 text-xs leading-5 text-base-content/60">{description}</div>
+        <div className="mt-0.5 text-xs leading-4 text-base-content/60">{description}</div>
       </div>
-      <div className="space-y-3">
+      <div className="space-y-2.5">
         <ModeSelect value={value.mode} disabled={disabled} onChange={(mode) => onChange({ ...value, mode })} />
-        <div className="rounded-box bg-base-200 px-3 py-2 text-xs leading-5 text-base-content/65">{reportedUsageModeDescription(value.mode)}</div>
+        <div className="rounded-box bg-base-200 px-2.5 py-1.5 text-xs leading-4 text-base-content/65">{reportedUsageModeDescription(value.mode)}</div>
         {fieldNeedsMax(value) && (
           <PolicyNumberInput
             title="采样上限"
@@ -260,29 +262,29 @@ function ReportedUsagePathEditor({
 }) {
   return (
     <Card bordered className="bg-base-200/55 shadow-none">
-      <Card.Body className="p-4">
-      <div className="mb-4 flex items-start justify-between gap-4">
-        <div>
+      <Card.Body className="p-3">
+      <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0">
           <h4 className="text-sm font-semibold">{title}</h4>
-          <p className="mt-1 text-xs leading-5 text-base-content/60">{description}</p>
+          <p className="mt-0.5 text-xs leading-4 text-base-content/60">{description}</p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex shrink-0 items-center justify-between gap-2 sm:justify-end">
           {onDelete && (
-            <Button type="button" color="error" variant="outline" size="sm" onClick={onDelete} title="删除这条路径覆盖">
-              <Trash2 className="h-4 w-4" />
+            <Button type="button" color="error" variant="outline" size="xs" onClick={onDelete} title="删除这条路径覆盖">
+              <Trash2 className="h-3.5 w-3.5" />
               删除覆盖
             </Button>
           )}
-          <Toggle color="primary" className="shrink-0" checked={value.enabled} onChange={(event) => onChange({ ...value, enabled: event.target.checked })} />
+          <Toggle color="primary" size="sm" className="shrink-0" checked={value.enabled} onChange={(event) => onChange({ ...value, enabled: event.target.checked })} />
         </div>
       </div>
       {!value.enabled && (
-        <Alert status="warning" className="mb-4 text-xs leading-5">
+        <Alert status="warning" className="mb-3 py-2 text-xs leading-5">
           当前路径已关闭本地模拟缓存上报：下游响应和后台 usage 记录会隐藏模拟 cache read/write，并把 input 展示为完整输入。字段改写配置已隐藏，重新开启后才会显示并生效。
         </Alert>
       )}
       {value.enabled && (
-        <div className="grid gap-4 xl:grid-cols-2">
+        <div className="grid gap-3 xl:grid-cols-2">
           <ReportedUsageFieldEditor
             title="输入字段改写（input_tokens）"
             description="控制给下游和后台记录的 input_tokens。原始值表示请求输入是多少就报多少；保留计算值表示使用 high-cache 计算后的 input；采样可把 input 压到几十以内并把差值计入缓存读取。"
@@ -366,7 +368,7 @@ export function ConfigPanel() {
         </Button>
       }
     >
-      <div className="space-y-6">
+      <div className="space-y-4">
         <ConfigGroup icon={<Gauge className="h-4 w-4" />} title="凭据限速与冷却" description="控制单个账号被调用的频率，以及上游临时错误后多久再尝试使用该账号。">
           <NumberField title="单凭据每分钟请求上限" description="控制每个凭据每分钟最多承接多少请求。填 0 表示关闭本地限速。" value={draft.credentialRpm} min={0} suffix="次/分钟" onChange={(credentialRpm) => setDraft((prev) => ({ ...prev, credentialRpm }))} />
           <NumberField title="单凭据最大并发请求数" description="控制同一个凭据同时处理多少个请求。填 0 表示不限制。" value={draft.credentialMaxConcurrentRequests} min={0} suffix="并发" onChange={(credentialMaxConcurrentRequests) => setDraft((prev) => ({ ...prev, credentialMaxConcurrentRequests }))} />
@@ -396,7 +398,7 @@ export function ConfigPanel() {
         </ConfigGroup>
 
         <ConfigGroup icon={<BadgeInfo className="h-4 w-4" />} title="路径级 Usage 上报改写" description="每个路径前缀都是独立覆盖项：先使用未匹配路径默认策略，再按最长匹配路径前缀覆盖。只改变下游响应和后台 usage 记录，不影响本地 reader 计算、缓存 tracker 或上游请求。">
-          <div className="space-y-4 md:col-span-2">
+          <div className="space-y-3 md:col-span-2">
             <ReportedUsagePathEditor
               title="未匹配路径默认上报改写"
               description="没有命中 /cc、/ha、/na 等路径覆盖时使用。默认适合 /v1：input/output 使用原始值，cache read/write 保留 high-cache 计算值。"
@@ -408,6 +410,7 @@ export function ConfigPanel() {
                 <FieldLabel title="路径前缀" description="当前前缀只控制它自己匹配到的路径。例如 /cc、/ha、/na 互相独立，后续可以分别改 input、output、cache read、cache write。">
                   <Input
                     bordered
+                    size="sm"
                     value={prefix}
                     onChange={(event) => {
                       const nextPrefix = event.target.value
@@ -474,7 +477,7 @@ export function ConfigPanel() {
 
         <ConfigGroup icon={<Shield className="h-4 w-4" />} title="兼容与诊断" description="控制协议兼容细节和调试信息展示。调试信息只影响响应头或非流式 thinking 解析，不改变凭据调度。">
           <FieldLabel title="兼容模式" description="Claude Code 兼容适合日常 CLI 使用；Anthropic 严格模式会减少代理侧改写；调试模式会默认暴露代理改写告警头。">
-            <Select bordered value={draft.compatProfile} onChange={(event) => setDraft((prev) => ({ ...prev, compatProfile: event.target.value as CompatProfile }))}>
+            <Select bordered size="sm" value={draft.compatProfile} onChange={(event) => setDraft((prev) => ({ ...prev, compatProfile: event.target.value as CompatProfile }))}>
               <Select.Option value="claude-code">Claude Code 兼容</Select.Option>
               <Select.Option value="anthropic-strict">Anthropic 严格模式</Select.Option>
               <Select.Option value="debug">调试模式</Select.Option>
@@ -488,7 +491,7 @@ export function ConfigPanel() {
           <NumberField title="高缓存判定阈值" description="后台把一次请求统计为高缓存请求的 cache_read_input_tokens 门槛。" value={draft.highCacheThreshold} min={0} suffix="tokens" onChange={(highCacheThreshold) => setDraft((prev) => ({ ...prev, highCacheThreshold }))} />
         </ConfigGroup>
 
-        <Alert status="info" className="text-sm">
+        <Alert status="info" className="py-2 text-sm">
           <Shield className="h-4 w-4" />
           <span>保存前会校验冷却、预热、缓存比例、放大倍数和触顶扣减范围；保存后新请求热加载生效。</span>
         </Alert>

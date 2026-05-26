@@ -29,13 +29,13 @@ export function StatCard({
   }
   return (
     <Card className={`metric-card ${toneClass[tone].bg}`}>
-      <Card.Body className="relative p-4">
-        <div className={`mb-3 h-1 w-9 rounded-full ${toneClass[tone].accent}`} />
+      <Card.Body className="relative p-3">
+        <div className={`mb-2 h-0.5 w-8 rounded-full ${toneClass[tone].accent}`} />
         <div className="text-xs font-semibold text-base-content/55">{title}</div>
-        <div className={`mt-1 truncate text-[1.55rem] font-semibold leading-tight tracking-tight ${toneClass[tone].text}`}>
+        <div className={`mt-0.5 truncate text-[1.35rem] font-semibold leading-tight tracking-tight ${toneClass[tone].text}`}>
           {value}
         </div>
-        {desc && <div className="mt-1 truncate text-xs leading-5 text-base-content/58">{desc}</div>}
+        {desc && <div className="mt-0.5 truncate text-xs leading-4 text-base-content/58">{desc}</div>}
       </Card.Body>
     </Card>
   )
@@ -58,14 +58,14 @@ export function SectionCard({
         <div className="section-card-header">
           <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
             <div className="min-w-0">
-              {title && <h2 className="text-base font-semibold tracking-tight">{title}</h2>}
-              {description && <p className="mt-1 text-sm leading-6 text-base-content/60">{description}</p>}
+              {title && <h2 className="text-sm font-semibold tracking-tight">{title}</h2>}
+              {description && <p className="mt-0.5 text-xs leading-5 text-base-content/60">{description}</p>}
             </div>
-            {actions && <div className="flex shrink-0 flex-wrap gap-2">{actions}</div>}
+            {actions && <div className="flex shrink-0 flex-wrap gap-1.5">{actions}</div>}
           </div>
         </div>
       )}
-      <div className="p-5 max-sm:p-4">{children}</div>
+      <div className="p-4 max-sm:p-3">{children}</div>
     </Card>
   )
 }
@@ -108,10 +108,10 @@ export function FieldLabel({
 }) {
   return (
     <label className="form-control">
-      <span className="label-text block pb-1 text-left text-xs font-semibold text-base-content/70">{title}</span>
+      <span className="label-text block pb-0.5 text-left text-xs font-semibold text-base-content/70">{title}</span>
       {children}
       {description && (
-        <span className="label-text-alt block pt-1 text-left leading-5 text-base-content/60">{description}</span>
+        <span className="label-text-alt block pt-0.5 text-left leading-4 text-base-content/56">{description}</span>
       )}
     </label>
   )

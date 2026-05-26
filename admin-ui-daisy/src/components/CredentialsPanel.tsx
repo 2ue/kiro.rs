@@ -86,6 +86,7 @@ function CredentialCard({
   const runtimeConfig = useRuntimeConfig()
   const queryClient = useQueryClient()
   const warmupTarget = Math.max(0, runtimeConfig.data?.credentialWarmupRequests ?? 3)
+  const balanceVisible = loadingBalance || Boolean(balance)
 
   useEffect(() => {
     setPriorityValue(String(credential.priority))
@@ -134,12 +135,12 @@ function CredentialCard({
 
   return (
     <Card className={`credential-card transition ${credential.isCurrent ? 'is-current' : ''}`}>
-      <Card.Body className="gap-4 p-4">
+      <Card.Body className="gap-3 p-3">
         <div className="flex items-start justify-between gap-3">
-          <div className="flex min-w-0 gap-3">
-            <Checkbox size="sm" className="mt-1" checked={selected} onChange={onToggleSelect} />
+          <div className="flex min-w-0 gap-2.5">
+            <Checkbox size="xs" className="mt-1" checked={selected} onChange={onToggleSelect} />
             <div className="min-w-0">
-              <div className="flex flex-wrap items-center gap-2">
+              <div className="flex flex-wrap items-center gap-1.5">
                 <h3 className="max-w-[260px] truncate text-sm font-semibold" title={credentialLabel(credential)}>
                   {credentialLabel(credential)}
                 </h3>
@@ -147,7 +148,7 @@ function CredentialCard({
                 {credential.isCurrent && <Badge tone="primary">当前</Badge>}
                 <Badge tone={credential.disabled ? 'error' : 'success'}>{credential.disabled ? '已禁用' : '启用'}</Badge>
               </div>
-              <div className="mt-2 flex flex-wrap gap-1.5">
+              <div className="mt-1.5 flex flex-wrap gap-1">
                 {credential.disabled && credential.disabledReason && <Badge tone="error">{credential.disabledReason}</Badge>}
                 {!credential.disabled && credential.cooledDown && <Badge tone="warning">冷却 {credential.cooldownRemainingSecs}s</Badge>}
                 {!credential.disabled && credential.rateLimited && <Badge tone="warning">限流 {credential.rateLimitRemainingSecs}s</Badge>}
@@ -158,13 +159,14 @@ function CredentialCard({
                 )}
                 {!credential.disabled && credential.warmupRemaining > 0 && <Badge tone="secondary">预热 {credential.warmupRemaining}</Badge>}
                 <Badge>{authLabel(credential.authMethod)}</Badge>
-                {credential.endpoint && <Badge>{credential.endpoint}</Badge>}
+                {credential.endpoint && credential.endpoint !== 'ide' && <Badge>{credential.endpoint}</Badge>}
                 {credential.hasProxy && <Badge tone="info">代理</Badge>}
               </div>
             </div>
           </div>
           <Toggle
             color="primary"
+            size="sm"
             className="shrink-0"
             checked={!credential.disabled}
             disabled={setDisabled.isPending}
@@ -212,21 +214,20 @@ function CredentialCard({
           <div>
             <div className="text-[0.72rem] font-medium text-base-content/50">估算费用</div>
             <div className="font-semibold">{formatUsd(credential.estimatedCostUsd)}</div>
-            <div className="text-xs text-base-content/50">priced {credential.pricedRequests} / unpriced {credential.unpricedRequests}</div>
           </div>
-          <div>
-            <div className="text-[0.72rem] font-medium text-base-content/50">订阅余额</div>
-            {loadingBalance ? (
-              <Loading size="sm" className="mt-1" />
-            ) : balance ? (
-              <div>
-                <div className="font-semibold">{balance.subscriptionTitle || '未知'}</div>
-                <div className="text-xs text-base-content/50">剩余 {formatUsd(balance.remaining)}</div>
-              </div>
-            ) : (
-              <div className="text-base-content/40">未查询</div>
+          {balanceVisible && (
+            <div>
+              <div className="text-[0.72rem] font-medium text-base-content/50">订阅余额</div>
+              {loadingBalance ? (
+                <Loading size="sm" className="mt-1" />
+              ) : balance ? (
+                <div>
+                  <div className="font-semibold">{balance.subscriptionTitle || '未知'}</div>
+                  <div className="text-xs text-base-content/50">剩余 {formatUsd(balance.remaining)}</div>
+                </div>
+              ) : null}
+            </div>
             )}
-          </div>
         </div>
 
         <div className="credential-actions">
@@ -516,7 +517,6 @@ export function CredentialsPanel() {
 
       <SectionCard
         title="凭据管理"
-        description="管理 Kiro 凭据、验活、导入导出、并发占用和余额查询。"
         actions={
           <>
             <Button type="button" variant="outline" size="sm" onClick={toggleLoadBalancing} disabled={setLoadBalancing.isPending || loadBalancing.isLoading}>
@@ -550,7 +550,7 @@ export function CredentialsPanel() {
         }
       >
         {selectedIds.size > 0 && (
-          <div className="mb-4 flex flex-wrap items-center gap-2 rounded-box border border-base-300 bg-base-200 p-3">
+          <div className="mb-3 flex flex-wrap items-center gap-2 rounded-box border border-base-300 bg-base-200 px-2.5 py-2">
             <Badge tone="primary">已选择 {selectedIds.size} 个</Badge>
             <Button type="button" variant="outline" size="xs" onClick={batchVerify}>
               <CheckCircle2 className="h-3.5 w-3.5" />
@@ -574,9 +574,9 @@ export function CredentialsPanel() {
           </div>
         )}
 
-        {(credentials.data?.total || 0) > 0 && (
-          <div className="mb-4 flex justify-end">
-            <Button type="button" color="error" variant="outline" size="sm" onClick={clearAllDisabled} disabled={disabledCredentialCount === 0}>
+        {disabledCredentialCount > 0 && (
+          <div className="mb-3 flex justify-end">
+            <Button type="button" color="error" variant="outline" size="sm" onClick={clearAllDisabled}>
               <Trash2 className="h-4 w-4" />
               清除已禁用
             </Button>
@@ -586,7 +586,7 @@ export function CredentialsPanel() {
         {currentCredentials.length === 0 ? (
           <EmptyState text={(credentials.data?.total || 0) === 0 ? '暂无凭据' : '当前页暂无凭据'} />
         ) : (
-          <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-3">
+          <div className="grid gap-3 lg:grid-cols-2 xl:grid-cols-3">
             {currentCredentials.map((credential) => (
               <CredentialCard
                 key={credential.id}
@@ -603,7 +603,7 @@ export function CredentialsPanel() {
         )}
 
         {totalPages > 1 && (
-          <div className="mt-6 flex items-center justify-center gap-3">
+          <div className="mt-4 flex items-center justify-center gap-3">
             <Button type="button" variant="outline" size="sm" disabled={page <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))}>
               上一页
             </Button>

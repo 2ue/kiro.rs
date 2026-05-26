@@ -139,64 +139,64 @@ export function AddCredentialModal({
         </div>
         <div className="form-grid">
           <FieldLabel title="认证方式">
-            <Select bordered value={form.authMethod} onChange={(event) => update('authMethod', event.target.value)}>
+            <Select bordered size="sm" value={form.authMethod} onChange={(event) => update('authMethod', event.target.value)}>
               <Select.Option value="social">Social</Select.Option>
               <Select.Option value="idc">IdC/Builder-ID/IAM</Select.Option>
               <Select.Option value="api_key">API Key</Select.Option>
             </Select>
           </FieldLabel>
           <FieldLabel title="账号邮箱" description="可选，用于管理页识别账号">
-            <Input bordered value={form.email} onChange={(event) => update('email', event.target.value)} />
+            <Input bordered size="sm" value={form.email} onChange={(event) => update('email', event.target.value)} />
           </FieldLabel>
           {isApiKey ? (
             <FieldLabel title="Kiro API Key">
-              <Input bordered type="password" value={form.kiroApiKey} onChange={(event) => update('kiroApiKey', event.target.value)} placeholder="ksk_xxxxxxxx" />
+              <Input bordered size="sm" type="password" value={form.kiroApiKey} onChange={(event) => update('kiroApiKey', event.target.value)} placeholder="ksk_xxxxxxxx" />
             </FieldLabel>
           ) : (
             <FieldLabel title="Refresh Token">
-              <Input bordered type="password" value={form.refreshToken} onChange={(event) => update('refreshToken', event.target.value)} />
+              <Input bordered size="sm" type="password" value={form.refreshToken} onChange={(event) => update('refreshToken', event.target.value)} />
             </FieldLabel>
           )}
           {form.authMethod === 'idc' && (
             <>
               <FieldLabel title="Client ID">
-                <Input bordered value={form.clientId} onChange={(event) => update('clientId', event.target.value)} />
+                <Input bordered size="sm" value={form.clientId} onChange={(event) => update('clientId', event.target.value)} />
               </FieldLabel>
               <FieldLabel title="Client Secret">
-                <Input bordered type="password" value={form.clientSecret} onChange={(event) => update('clientSecret', event.target.value)} />
+                <Input bordered size="sm" type="password" value={form.clientSecret} onChange={(event) => update('clientSecret', event.target.value)} />
               </FieldLabel>
             </>
           )}
           <FieldLabel title="Auth Region" description="留空使用全局配置">
-            <Input bordered value={form.authRegion} onChange={(event) => update('authRegion', event.target.value)} />
+            <Input bordered size="sm" value={form.authRegion} onChange={(event) => update('authRegion', event.target.value)} />
           </FieldLabel>
           <FieldLabel title="API Region" description="留空使用全局配置">
-            <Input bordered value={form.apiRegion} onChange={(event) => update('apiRegion', event.target.value)} />
+            <Input bordered size="sm" value={form.apiRegion} onChange={(event) => update('apiRegion', event.target.value)} />
           </FieldLabel>
           <FieldLabel title="优先级" description="数字越小优先级越高">
-            <Input bordered type="number" min={0} value={form.priority} onChange={(event) => update('priority', event.target.value)} />
+            <Input bordered size="sm" type="number" min={0} value={form.priority} onChange={(event) => update('priority', event.target.value)} />
           </FieldLabel>
           <FieldLabel title="Machine ID" description="留空使用配置中字段或自动派生">
-            <Input bordered value={form.machineId} onChange={(event) => update('machineId', event.target.value)} />
+            <Input bordered size="sm" value={form.machineId} onChange={(event) => update('machineId', event.target.value)} />
           </FieldLabel>
           <FieldLabel title="端点" description="留空使用全局 defaultEndpoint">
-            <Input bordered value={form.endpoint} onChange={(event) => update('endpoint', event.target.value)} placeholder="ide / cli" />
+            <Input bordered size="sm" value={form.endpoint} onChange={(event) => update('endpoint', event.target.value)} placeholder="ide / cli" />
           </FieldLabel>
           <FieldLabel title="代理 URL" description='留空使用全局代理，"direct" 表示直连'>
-            <Input bordered value={form.proxyUrl} onChange={(event) => update('proxyUrl', event.target.value)} />
+            <Input bordered size="sm" value={form.proxyUrl} onChange={(event) => update('proxyUrl', event.target.value)} />
           </FieldLabel>
           <FieldLabel title="代理用户名">
-            <Input bordered value={form.proxyUsername} onChange={(event) => update('proxyUsername', event.target.value)} />
+            <Input bordered size="sm" value={form.proxyUsername} onChange={(event) => update('proxyUsername', event.target.value)} />
           </FieldLabel>
           <FieldLabel title="代理密码">
-            <Input bordered type="password" value={form.proxyPassword} onChange={(event) => update('proxyPassword', event.target.value)} />
+            <Input bordered size="sm" type="password" value={form.proxyPassword} onChange={(event) => update('proxyPassword', event.target.value)} />
           </FieldLabel>
         </div>
         <Modal.Actions>
-          <Button type="button" color="ghost" onClick={onClose} disabled={add.isPending}>
+          <Button type="button" color="ghost" size="sm" onClick={onClose} disabled={add.isPending}>
             取消
           </Button>
-          <Button type="submit" color="primary" disabled={add.isPending}>
+          <Button type="submit" color="primary" size="sm" disabled={add.isPending}>
             {add.isPending && <Loading size="sm" />}
             添加
           </Button>
@@ -266,7 +266,7 @@ export function CredentialTestModal({
           </Card>
           <div className="grid gap-3 md:grid-cols-[1fr_240px]">
             <FieldLabel title="测试模型">
-              <Select bordered value={model} disabled={test.isPending} onChange={(event) => setModel(event.target.value)}>
+              <Select bordered size="sm" value={model} disabled={test.isPending} onChange={(event) => setModel(event.target.value)}>
                 {TEST_MODELS.map((option) => (
                   <Select.Option key={option.id} value={option.id}>
                     {option.label}
@@ -275,7 +275,7 @@ export function CredentialTestModal({
               </Select>
             </FieldLabel>
             <FieldLabel title="测试消息">
-              <Input bordered value={prompt} disabled={test.isPending} onChange={(event) => setPrompt(event.target.value)} />
+              <Input bordered size="sm" value={prompt} disabled={test.isPending} onChange={(event) => setPrompt(event.target.value)} />
             </FieldLabel>
           </div>
           <div className="rounded-box bg-neutral p-4 font-mono text-sm text-neutral-content">
@@ -295,10 +295,10 @@ export function CredentialTestModal({
             {!test.isPending && !result && !error && <div className="text-neutral-content/60">等待开始测试</div>}
           </div>
           <Modal.Actions>
-            <Button type="button" color="ghost" onClick={onClose} disabled={test.isPending}>
+            <Button type="button" color="ghost" size="sm" onClick={onClose} disabled={test.isPending}>
               关闭
             </Button>
-            <Button type="button" color="primary" onClick={run} disabled={test.isPending}>
+            <Button type="button" color="primary" size="sm" onClick={run} disabled={test.isPending}>
               {test.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : result || error ? <RotateCw className="h-4 w-4" /> : <Play className="h-4 w-4" />}
               {result || error ? '重试' : '开始测试'}
             </Button>
@@ -635,7 +635,8 @@ export function BatchImportModal({
         </div>
         <Textarea
           bordered
-          className="min-h-56 w-full font-mono text-xs"
+          size="sm"
+          className="min-h-48 w-full font-mono text-xs"
           value={jsonInput}
           onChange={(event) => setJsonInput(event.target.value)}
           disabled={importing}
@@ -643,11 +644,11 @@ export function BatchImportModal({
         />
         <ImportResults results={results} current={progress.current} total={progress.total} currentProcessing={currentProcessing} importing={importing} />
         <Modal.Actions>
-          <Button type="button" color="ghost" disabled={importing} onClick={() => { reset(); onClose() }}>
+          <Button type="button" color="ghost" size="sm" disabled={importing} onClick={() => { reset(); onClose() }}>
             {results.length ? '关闭' : '取消'}
           </Button>
           {results.length === 0 && (
-            <Button type="button" color="primary" disabled={importing || !jsonInput.trim()} onClick={run}>
+            <Button type="button" color="primary" size="sm" disabled={importing || !jsonInput.trim()} onClick={run}>
               开始导入并验活
             </Button>
           )}
@@ -817,7 +818,8 @@ export function KamImportModal({
         </div>
         <Textarea
           bordered
-          className="min-h-56 w-full font-mono text-xs"
+          size="sm"
+          className="min-h-48 w-full font-mono text-xs"
           value={jsonInput}
           onChange={(event) => setJsonInput(event.target.value)}
           disabled={importing}
@@ -829,7 +831,7 @@ export function KamImportModal({
             识别到 {preview.accounts.length} 个账号{errorCount > 0 && `，其中 ${errorCount} 个为 error 状态`}
             {errorCount > 0 && (
               <Form.Label className="mt-2 flex w-fit cursor-pointer items-center gap-2 rounded-box px-1 py-1 hover:bg-base-200">
-                <Checkbox size="sm" checked={skipErrorAccounts} onChange={(event) => setSkipErrorAccounts(event.target.checked)} />
+                <Checkbox size="xs" checked={skipErrorAccounts} onChange={(event) => setSkipErrorAccounts(event.target.checked)} />
                 跳过 error 状态的账号
               </Form.Label>
             )}
@@ -837,11 +839,11 @@ export function KamImportModal({
         )}
         <ImportResults results={results} current={progress.current} total={progress.total} currentProcessing={currentProcessing} importing={importing} />
         <Modal.Actions>
-          <Button type="button" color="ghost" disabled={importing} onClick={() => { reset(); onClose() }}>
+          <Button type="button" color="ghost" size="sm" disabled={importing} onClick={() => { reset(); onClose() }}>
             {results.length ? '关闭' : '取消'}
           </Button>
           {results.length === 0 && (
-            <Button type="button" color="primary" disabled={importing || !jsonInput.trim() || Boolean(preview.error) || !preview.accounts.length} onClick={run}>
+            <Button type="button" color="primary" size="sm" disabled={importing || !jsonInput.trim() || Boolean(preview.error) || !preview.accounts.length} onClick={run}>
               开始导入并验活
             </Button>
           )}
@@ -906,11 +908,11 @@ export function BatchVerifyModal({
         <Modal.Actions>
           {verifying ? (
             <>
-              <Button type="button" color="ghost" onClick={onClose}>后台运行</Button>
-              <Button type="button" color="error" onClick={onCancel}>取消验活</Button>
+              <Button type="button" color="ghost" size="sm" onClick={onClose}>后台运行</Button>
+              <Button type="button" color="error" size="sm" onClick={onCancel}>取消验活</Button>
             </>
           ) : (
-            <Button type="button" color="primary" onClick={onClose}>关闭</Button>
+            <Button type="button" color="primary" size="sm" onClick={onClose}>关闭</Button>
           )}
         </Modal.Actions>
       </div>
@@ -960,23 +962,24 @@ export function CredentialExportModal({ open, onClose }: { open: boolean; onClos
 
   return (
     <ModalShell open={open} title="导出凭据" width="max-w-xl" onClose={onClose}>
-      <Alert status="warning" className="mb-4 text-sm">导出内容包含完整 refreshToken、kiroApiKey、代理等敏感字段。</Alert>
+      <Alert status="warning" className="mb-3 py-2 text-sm">导出内容包含完整 refreshToken、kiroApiKey、代理等敏感字段。</Alert>
       <div className="space-y-2">
         {exportFormats.map((item) => (
           <Button
             key={item.value}
             type="button"
-            className={`h-auto w-full justify-start rounded-box border p-3 text-left ${format === item.value ? 'border-primary bg-primary/10' : 'border-base-300 hover:bg-base-200'}`}
+            size="sm"
+            className={`h-auto w-full justify-start rounded-box border p-2.5 text-left ${format === item.value ? 'border-primary bg-primary/10' : 'border-base-300 hover:bg-base-200'}`}
             onClick={() => setFormat(item.value)}
           >
             <div className="font-medium">{item.label}</div>
-            <div className="text-sm text-base-content/60">{item.description}</div>
+            <div className="text-xs text-base-content/60">{item.description}</div>
           </Button>
         ))}
       </div>
       <Modal.Actions>
-        <Button type="button" color="ghost" onClick={onClose} disabled={exporting}>取消</Button>
-        <Button type="button" color="primary" onClick={run} disabled={exporting}>
+        <Button type="button" color="ghost" size="sm" onClick={onClose} disabled={exporting}>取消</Button>
+        <Button type="button" color="primary" size="sm" onClick={run} disabled={exporting}>
           {exporting ? <Loading size="sm" /> : <Download className="h-4 w-4" />}
           导出
         </Button>
