@@ -2141,6 +2141,26 @@ mod tests {
         assert_eq!(credentials.len(), 1);
         assert_eq!(credentials[0].id, Some(7));
         assert_eq!(credentials[0].email.as_deref(), Some("alpha@example.com"));
+        store
+            .save_credential_account_info(
+                7,
+                &CredentialAccountInfoRow {
+                    subscription_title: Some("Kiro Pro".to_string()),
+                    current_usage: 90.0,
+                    usage_limit: 1000.0,
+                    remaining: 910.0,
+                    usage_percentage: 9.0,
+                    next_reset_at: Some(1_780_000_000.0),
+                    checked_at: Utc::now().to_rfc3339(),
+                },
+            )
+            .await
+            .unwrap();
+        let account_info = store.load_credential_account_info().await.unwrap();
+        let account_info = account_info.get(&7).unwrap();
+        assert_eq!(account_info.subscription_title.as_deref(), Some("Kiro Pro"));
+        assert_eq!(account_info.current_usage, 90.0);
+        assert_eq!(account_info.usage_limit, 1000.0);
 
         let inserted = store
             .insert_credential(&KiroCredentials {

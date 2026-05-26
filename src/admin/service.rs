@@ -320,14 +320,14 @@ impl AdminService {
             let now = Utc::now().timestamp() as f64;
             if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
                 tracing::debug!("凭据 #{} 余额命中 Redis 缓存", id);
-                self.save_account_info_snapshot(&cached.data).await;
+                self.save_account_info_snapshot(&cached.data).await?;
                 return Ok(cached.data);
             }
         }
 
         // 缓存未命中或已过期，从上游获取
         let balance = self.fetch_balance(id).await?;
-        self.save_account_info_snapshot(&balance).await;
+        self.save_account_info_snapshot(&balance).await?;
 
         let cached = CachedBalance {
             cached_at: Utc::now().timestamp() as f64,
@@ -448,7 +448,10 @@ impl AdminService {
         })
     }
 
-    async fn save_account_info_snapshot(&self, balance: &BalanceResponse) {
+    async fn save_account_info_snapshot(
+        &self,
+        balance: &BalanceResponse,
+    ) -> Result<(), AdminServiceError> {
         let info = CredentialAccountInfoRow {
             subscription_title: balance.subscription_title.clone(),
             current_usage: balance.current_usage,
@@ -463,12 +466,11 @@ impl AdminService {
             .save_credential_account_info(balance.id, &info)
             .await
         {
-            tracing::warn!(
-                credential_id = balance.id,
-                "保存凭据账号信息快照失败: {}",
-                err
-            );
+            let message = format!("保存凭据账号信息快照失败: {}", err);
+            tracing::warn!(credential_id = balance.id, "{}", message);
+            return Err(AdminServiceError::InternalError(message));
         }
+        Ok(())
     }
 
     /// 添加新凭据
