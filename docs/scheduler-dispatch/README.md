@@ -25,7 +25,7 @@ Implemented backend behavior:
    and upstream stream idle timeouts.
 2. Permanent account failures still disable credentials instead of using short cooldowns. This
    includes clear quota/monthly exhaustion, risk-control, suspended, and locked states.
-3. Cooldown is shared through Redis when Redis is configured, and cooldown writes are monotonic:
+3. Cooldown is shared through Redis, and cooldown writes are monotonic:
    a short later cooldown cannot shorten a longer active cooldown.
 4. Scheduler health is shared through Redis: transient streak, recent error-rate EWMA, latency
    EWMA, last error kind/reason/time, probation state, and recent selection windows.
@@ -38,7 +38,7 @@ Implemented backend behavior:
    one atomic acquisition path.
 8. A bounded global dispatch queue can reject overload early instead of allowing unbounded waiters.
 9. Total scheduler selection count is persisted in Postgres, while 10s/60s/5m recent selection
-   counts are kept in Redis/local state for scheduling pressure and UI diagnosis.
+   counts are kept in Redis for scheduling pressure and UI diagnosis.
 10. Warmup selection is target-share based: each warming credential receives a small target share,
     capped by a total warmup traffic ceiling, so batch imports do not wait indefinitely for a tiny
     fixed probability.
@@ -53,7 +53,7 @@ For high-concurrency production traffic, use:
 - a non-zero `credentialMaxConcurrentRequests`
 - a non-zero `dispatchGlobalMaxConcurrentRequests` when total process/upstream capacity is known
 - a non-zero `dispatchMaxQueuedRequests` when callers should receive fast overload feedback
-- Redis enabled for multi-instance deployments
+- Redis enabled; it is a required runtime dependency for shared scheduler state
 
 The default values preserve backward compatibility: global capacity and queue limits are unlimited
 when set to `0`, and existing `priority`/`balanced` behavior remains available.

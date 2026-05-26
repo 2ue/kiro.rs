@@ -2046,7 +2046,9 @@ impl MultiTokenManager {
         let mut entries = self.entries.lock();
         let now = Instant::now();
         let max_concurrent_requests = self.max_concurrent_requests();
-        Self::refresh_local_selection_windows_locked(&mut entries, now);
+        if self.redis_store.is_none() {
+            Self::refresh_local_selection_windows_locked(&mut entries, now);
+        }
         entries.iter().any(|entry| {
             entry.id != current_id
                 && !excluded_ids.contains(&entry.id)
@@ -4351,7 +4353,9 @@ impl MultiTokenManager {
         let global_capacity = self.global_capacity_state();
         let config = self.config.lock().clone();
         let mut entries = self.entries.lock();
-        Self::refresh_local_selection_windows_locked(&mut entries, Instant::now());
+        if self.redis_store.is_none() {
+            Self::refresh_local_selection_windows_locked(&mut entries, Instant::now());
+        }
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
         let now = Instant::now();

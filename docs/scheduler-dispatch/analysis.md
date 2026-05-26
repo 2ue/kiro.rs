@@ -137,8 +137,8 @@ different dimensions and should not be mixed in card labels or scheduler scoring
 
 The current scheduler implementation does not use official quota credits or local estimated dollar
 cost in the hot dispatch score. The reason is practical: quota/cost persistence is database-backed
-and not designed to be queried on every request dispatch. A future version can add a Redis/local
-cached quota snapshot as a scoring signal, but the hot path should stay fast and predictable.
+and not designed to be queried on every request dispatch. A future version can add a Redis cached
+quota snapshot as a scoring signal, but the hot path should stay fast and predictable.
 
 ## Selection count signals
 

@@ -183,7 +183,7 @@ Redis integration tests continue to skip unless `KIRO_RS_TEST_REDIS_URL` is conf
 Recommended rollout order:
 
 1. Deploy with the existing mode first if a conservative rollout is needed.
-2. Confirm Redis is configured for multi-instance deployments.
+2. Confirm Redis is healthy and reachable; it is required for shared scheduler state.
 3. Set per-credential concurrency caps.
 4. Set global capacity and bounded queue if overload needs deterministic behavior.
 5. Switch `loadBalancingMode` to `health_balanced`.

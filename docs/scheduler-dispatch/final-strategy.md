@@ -9,7 +9,7 @@ The final design makes dispatch conservative under failure and efficient under l
 2. Keep permanent account failures disabled until explicit recovery or refresh logic proves they are
    usable.
 3. Prefer healthy, low-load credentials.
-4. Share cooldown, in-flight leases, queue state, and health across instances through Redis.
+4. Share cooldown, in-flight leases, queue state, recent selection windows, and health through Redis.
 5. Preserve backward compatibility for existing `priority` and `balanced` deployments.
 6. Add an explicit `health_balanced` mode for production high-concurrency routing.
 7. Expose enough state in Admin APIs and UIs to explain scheduler decisions.
@@ -29,7 +29,7 @@ Each request passes through the same dispatch pipeline:
    - explicit retry-chain exclusions.
 3. Prefer a sticky credential only if it passes the same hard filters.
 4. Choose a candidate according to the configured mode.
-5. Acquire the Redis/local dispatch lease atomically.
+5. Acquire the Redis dispatch lease atomically.
 6. If no lease is available, wait until state changes or timeout.
 7. If the bounded queue is full, reject locally instead of adding more waiters.
 8. Report success, permanent failure, or structured transient failure after the attempt outcome is
@@ -94,8 +94,9 @@ Each credential also has a persisted total scheduler selection count in Postgres
 selection windows are scheduler signals; the total count is primarily observability and an optional
 weak long-term balancing signal.
 
-With Redis configured, this state is stored in Redis and read into scheduler snapshots. Without
-Redis, the same concepts are maintained locally in the process.
+Redis is the required runtime dependency for this shared scheduler state. Local mirrors are only used
+as in-process snapshots and for narrow unit-test construction; production scheduling should not rely
+on local-only windows.
 
 Success handling:
 
@@ -150,11 +151,9 @@ The redesign adds optional global controls:
 - `dispatchMaxQueuedRequests`: maximum requests allowed to wait for dispatch capacity. `0` means
   unlimited.
 
-When Redis is configured, per-credential and global lease acquisition happen in one Lua operation.
-That prevents multi-instance oversubscription under concurrency. Queue enter/leave is also kept in
-Redis so all instances see the same waiting count.
-
-When Redis is not configured, the same controls are enforced locally per process.
+Per-credential and global lease acquisition happen in one Redis Lua operation. That prevents
+multi-instance oversubscription under concurrency. Queue enter/leave is also kept in Redis so all
+instances see the same waiting count.
 
 ## Error handling matrix
 
@@ -209,7 +208,7 @@ For high-concurrency production:
 - Set per-credential concurrency according to upstream/account capacity.
 - Set global concurrency if the gateway, upstream proxy, or downstream SLA has a known limit.
 - Set bounded queue size if overload should fail fast instead of waiting.
-- Keep Redis enabled in multi-instance deployments.
+- Keep Redis healthy and monitored; scheduler correctness depends on it.
 - Start with default cooldowns and raise only the category that is actually noisy in logs.
 
 ## Non-goals in this implementation
