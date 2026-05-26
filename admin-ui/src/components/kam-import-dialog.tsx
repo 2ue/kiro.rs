@@ -346,7 +346,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           try {
             await getCredentialBalance(addedCred.credentialId)
           } catch (error) {
-            toast.warning(`凭据 #${addedCred.credentialId} 验活成功，但查询订阅信息失败: ${extractErrorMessage(error)}`)
+            toast.warning(`凭据 #${addedCred.credentialId} 验活成功，但查询 Credits 失败: ${extractErrorMessage(error)}`)
           }
 
           successCount++

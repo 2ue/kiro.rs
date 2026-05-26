@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, BarChart3, Settings, DollarSign, Download, FileClock } from 'lucide-react'
+import { LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, BarChart3, Settings, DollarSign, Download, FileClock, RefreshCw } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -141,11 +141,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const handleTestCredential = (credential: CredentialStatusItem) => {
     setTestingCredential(credential)
     setTestDialogOpen(true)
-  }
-
-  const handleRefresh = () => {
-    refetch()
-    toast.success('已刷新凭据列表')
   }
 
   const handleLogout = () => {
@@ -647,9 +642,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
-            <Button variant="ghost" size="icon" onClick={handleRefresh}>
-              <RefreshCw className="h-5 w-5" />
-            </Button>
             <Button variant="ghost" size="icon" onClick={handleLogout}>
               <LogOut className="h-5 w-5" />
             </Button>
@@ -721,6 +713,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
               )}
             </div>
             <div className="flex gap-2">
+              <Button onClick={() => refetch()} size="sm" variant="outline">
+                <RefreshCw className="h-4 w-4 mr-2" />
+                刷新列表
+              </Button>
               {selectedIds.size > 0 && (
                 <>
                   <Button onClick={handleBatchVerify} size="sm" variant="outline">
@@ -766,7 +762,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   disabled={queryingInfo}
                 >
                   <RefreshCw className={`h-4 w-4 mr-2 ${queryingInfo ? 'animate-spin' : ''}`} />
-                  {queryingInfo ? `查询中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询信息'}
+                  {queryingInfo ? `查询中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询 Credits'}
                 </Button>
               )}
               {(data?.total || 0) > 0 && (
@@ -854,7 +850,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
         )}
       </main>
 
-      {/* 余额对话框 */}
+      {/* Credits 对话框 */}
       <BalanceDialog
         credentialId={selectedCredentialId}
         open={balanceDialogOpen}

@@ -53,13 +53,13 @@ export function useCredentialsPage(query: CredentialsPageQuery) {
   })
 }
 
-// 查询凭据余额
+// 查询凭据 Kiro Credits
 export function useCredentialBalance(id: number | null) {
   return useQuery({
     queryKey: ['credential-balance', id],
     queryFn: () => getCredentialBalance(id!),
     enabled: id !== null,
-    retry: false, // 余额查询失败时不重试（避免重复请求被封禁的账号）
+    retry: false, // Credits 查询失败时不重试（避免重复请求被封禁的账号）
   })
 }
 

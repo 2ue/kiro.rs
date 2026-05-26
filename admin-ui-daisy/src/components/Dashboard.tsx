@@ -1,7 +1,6 @@
-import { BarChart3, ChevronDown, Command, DollarSign, FileClock, LogOut, Moon, Palette, RefreshCw, Server, Settings, Sun } from 'lucide-react'
+import { BarChart3, ChevronDown, Command, DollarSign, FileClock, LogOut, Moon, Palette, Server, Settings, Sun } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
-import { toast } from 'sonner'
 import { Button, Card } from 'react-daisyui'
 import { AuditPanel } from '@/components/AuditPanel'
 import { ConfigPanel } from '@/components/ConfigPanel'
@@ -42,11 +41,6 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     storage.removeApiKey()
     queryClient.clear()
     onLogout()
-  }
-
-  const refreshAll = () => {
-    queryClient.invalidateQueries()
-    toast.success('已刷新后台数据')
   }
 
   const selectTab = (tab: TabKey) => {
@@ -129,10 +123,6 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
               {dark ? <Moon className="h-4 w-4" /> : <Sun className="h-4 w-4" />}
               {dark ? '深色' : '浅色'}
             </Button>
-            <Button type="button" variant="outline" size="sm" onClick={refreshAll} title="刷新当前后台数据">
-              <RefreshCw className="h-4 w-4" />
-              刷新全部
-            </Button>
             <Button type="button" color="ghost" size="sm" onClick={logout} title="退出登录">
               <LogOut className="h-4 w-4" />
               退出
@@ -153,9 +143,6 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
           <div className="flex gap-2 sm:hidden">
             <Button type="button" size="sm" onClick={() => setDark((value) => !value)} className="theme-toggle-btn" title="切换主题">
               <Palette className="h-4 w-4" />
-            </Button>
-            <Button type="button" variant="outline" size="sm" onClick={refreshAll} title="刷新页面数据">
-              <RefreshCw className="h-4 w-4" />
             </Button>
             <Button type="button" color="ghost" size="sm" shape="square" onClick={logout} title="退出登录">
               <LogOut className="h-4 w-4" />

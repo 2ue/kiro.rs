@@ -6,7 +6,7 @@ import { Alert, Button, Card, Checkbox, Form, Input, Loading, Modal, Progress, S
 import { addCredential, deleteCredential, exportCredentials, getCredentialBalance, setCredentialDisabled, testCredential } from '@/api/credentials'
 import { Badge, FieldLabel, ModalShell } from '@/components/common'
 import { parseCredentialImportFiles, parseCredentialImportText } from '@/lib/credential-import'
-import { formatFullDate, formatUsd } from '@/lib/format'
+import { formatCredits, formatFullDate } from '@/lib/format'
 import { parseKamFiles, parseKamJson, type KamAccount } from '@/lib/kam-import'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, TEST_MODELS, testModelLabel } from '@/lib/test-models'
 import { extractErrorMessage, parseError, sha256Hex } from '@/lib/utils'
@@ -329,7 +329,7 @@ export function BalanceModal({
   }, [balance.data, queryClient])
 
   return (
-    <ModalShell open={open} title={`凭据 #${credentialId ?? '-'} 余额信息`} width="max-w-xl" onClose={onClose}>
+    <ModalShell open={open} title={`凭据 #${credentialId ?? '-'} Credits 信息`} width="max-w-xl" onClose={onClose}>
       {balance.isLoading && <div className="flex justify-center py-8"><Loading size="lg" /></div>}
       {balance.error && (() => {
         const parsed = parseError(balance.error)
@@ -356,25 +356,14 @@ function BalanceContent({ balance }: { balance: BalanceResponse }) {
       </div>
       <div>
         <div className="mb-2 flex justify-between text-sm">
-          <span>已使用: {formatUsd(balance.currentUsage)}</span>
-          <span>限额: {formatUsd(balance.usageLimit)}</span>
+          <span>Credits</span>
+          <span>{formatCredits(balance.currentUsage)} / {formatCredits(balance.usageLimit)}</span>
         </div>
         <Progress color="primary" value={balance.usagePercentage} max={100} />
-        <div className="mt-2 text-center text-sm text-base-content/60">{balance.usagePercentage.toFixed(1)}% 已使用</div>
+        <div className="mt-2 text-center text-sm text-base-content/60">{balance.usagePercentage.toFixed(1)}% 已用</div>
       </div>
-      <div className="grid grid-cols-2 gap-3">
-        <Card bordered>
-          <Card.Body className="p-3">
-          <div className="text-xs text-base-content/60">剩余额度</div>
-          <div className="font-semibold text-success">{formatUsd(balance.remaining)}</div>
-          </Card.Body>
-        </Card>
-        <Card bordered>
-          <Card.Body className="p-3">
-          <div className="text-xs text-base-content/60">下次重置</div>
-          <div className="font-semibold">{balance.nextResetAt ? new Date(balance.nextResetAt * 1000).toLocaleString('zh-CN') : '未知'}</div>
-          </Card.Body>
-        </Card>
+      <div className="text-center text-xs text-base-content/60">
+        下次重置: {balance.nextResetAt ? new Date(balance.nextResetAt * 1000).toLocaleString('zh-CN') : '未知'}
       </div>
     </div>
   )
@@ -603,7 +592,7 @@ export function BatchImportModal({
         try {
           await getCredentialBalance(added.credentialId)
         } catch (error) {
-          toast.warning(`凭据 #${added.credentialId} 验活成功，但查询订阅信息失败: ${extractErrorMessage(error)}`)
+          toast.warning(`凭据 #${added.credentialId} 验活成功，但查询 Credits 失败: ${extractErrorMessage(error)}`)
         }
         successCount += 1
         if (isApiKeyCred) existingApiKeyHashes.add(hash)
@@ -791,7 +780,7 @@ export function KamImportModal({
         try {
           await getCredentialBalance(added.credentialId)
         } catch (error) {
-          toast.warning(`凭据 #${added.credentialId} 验活成功，但查询订阅信息失败: ${extractErrorMessage(error)}`)
+          toast.warning(`凭据 #${added.credentialId} 验活成功，但查询 Credits 失败: ${extractErrorMessage(error)}`)
         }
         successCount += 1
         existingTokenHashes.add(tokenHash)

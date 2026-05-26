@@ -40,12 +40,16 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
     return num.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
   }
 
+  const formatCredits = (num: number) => {
+    return formatNumber(num)
+  }
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>
-            凭据 #{credentialId} 余额信息
+            凭据 #{credentialId} Credits 信息
           </DialogTitle>
         </DialogHeader>
 
@@ -89,29 +93,20 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
             {/* 使用进度 */}
             <div className="space-y-2">
               <div className="flex justify-between text-sm">
-                <span>已使用: ${formatNumber(balance.currentUsage)}</span>
-                <span>限额: ${formatNumber(balance.usageLimit)}</span>
+                <span>Credits</span>
+                <span>{formatCredits(balance.currentUsage)} / {formatCredits(balance.usageLimit)}</span>
               </div>
               <Progress value={balance.usagePercentage} />
               <div className="text-center text-sm text-muted-foreground">
-                {balance.usagePercentage.toFixed(1)}% 已使用
+                {balance.usagePercentage.toFixed(1)}% 已用
               </div>
             </div>
 
-            {/* 详细信息 */}
-            <div className="grid grid-cols-2 gap-4 pt-4 border-t text-sm">
-              <div>
-                <span className="text-muted-foreground">剩余额度：</span>
-                <span className="font-medium text-green-600">
-                  ${formatNumber(balance.remaining)}
-                </span>
-              </div>
-              <div>
-                <span className="text-muted-foreground">下次重置：</span>
-                <span className="font-medium">
-                  {formatDate(balance.nextResetAt)}
-                </span>
-              </div>
+            <div className="border-t pt-4 text-center text-sm">
+              <span className="text-muted-foreground">下次重置：</span>
+              <span className="font-medium">
+                {formatDate(balance.nextResetAt)}
+              </span>
             </div>
           </div>
         )}

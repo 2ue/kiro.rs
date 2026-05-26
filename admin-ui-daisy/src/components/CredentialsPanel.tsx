@@ -28,7 +28,7 @@ import {
   KamImportModal,
   type VerifyResult,
 } from '@/components/CredentialDialogs'
-import { formatDate, formatLastUsed, formatNumber, formatUsd } from '@/lib/format'
+import { formatCredits, formatDate, formatLastUsed, formatNumber, formatUsd } from '@/lib/format'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
 import { extractErrorMessage } from '@/lib/utils'
 import {
@@ -95,7 +95,6 @@ function CredentialCard({
   const runtimeConfig = useRuntimeConfig()
   const queryClient = useQueryClient()
   const warmupTarget = Math.max(0, runtimeConfig.data?.credentialWarmupRequests ?? 3)
-  const balanceVisible = loadingBalance || Boolean(balance)
   const accountInfo = accountInfoValue(credential, balance)
 
   useEffect(() => {
@@ -234,39 +233,21 @@ function CredentialCard({
             <div className="font-semibold">{formatDate(credential.updatedAt)}</div>
           </div>
           <div>
-            <div className="text-[0.72rem] font-medium text-base-content/50">估算费用</div>
+            <div className="text-[0.72rem] font-medium text-base-content/50">本地估算成本</div>
             <div className="font-semibold">{formatUsd(credential.estimatedCostUsd)}</div>
           </div>
-          {balanceVisible && (
+          {(loadingBalance || accountInfo) && (
             <div>
-              <div className="text-[0.72rem] font-medium text-base-content/50">订阅余额</div>
+              <div className="text-[0.72rem] font-medium text-base-content/50">Credits</div>
               {loadingBalance ? (
                 <Loading size="sm" className="mt-1" />
-              ) : balance ? (
-                <div>
-                  <div className="font-semibold">{subscriptionLabel(credential, balance)}</div>
-                  <div className="text-xs text-base-content/50">剩余 {formatUsd(balance.remaining)}</div>
-                </div>
+              ) : accountInfo ? (
+                <>
+                  <div className="font-semibold">{formatCredits(accountInfo.currentUsage)} / {formatCredits(accountInfo.usageLimit)}</div>
+                  <div className="text-xs text-base-content/50">{accountInfo.usagePercentage.toFixed(1)}% · {formatDate(accountInfo.checkedAt)}</div>
+                </>
               ) : null}
             </div>
-          )}
-          {accountInfo && (
-            <>
-              <div>
-                <div className="text-[0.72rem] font-medium text-base-content/50">上次余量</div>
-                <div className="font-semibold">{formatUsd(accountInfo.remaining)}</div>
-                <div className="text-xs text-base-content/50">限额 {formatUsd(accountInfo.usageLimit)}</div>
-              </div>
-              <div>
-                <div className="text-[0.72rem] font-medium text-base-content/50">上次用量</div>
-                <div className="font-semibold">{formatUsd(accountInfo.currentUsage)}</div>
-                <div className="text-xs text-base-content/50">{accountInfo.usagePercentage.toFixed(1)}% 已用</div>
-              </div>
-              <div>
-                <div className="text-[0.72rem] font-medium text-base-content/50">信息查询</div>
-                <div className="font-semibold">{formatDate(accountInfo.checkedAt)}</div>
-              </div>
-            </>
           )}
         </div>
 
@@ -277,7 +258,7 @@ function CredentialCard({
           </Button>
           <Button type="button" color="ghost" size="xs" onClick={() => onViewBalance(credential.id)}>
             <Wallet className="h-3.5 w-3.5" />
-            余额
+            Credits
           </Button>
           <Button type="button" color="ghost" size="xs" onClick={handleForceRefresh} disabled={credential.authMethod === 'api_key'}>
             <RefreshCw className="h-3.5 w-3.5" />
@@ -563,9 +544,13 @@ export function CredentialsPanel() {
             <Button type="button" variant="outline" size="sm" onClick={toggleLoadBalancing} disabled={setLoadBalancing.isPending || loadBalancing.isLoading}>
               {loadBalancing.data?.mode === 'priority' ? '优先级模式' : '均衡负载'}
             </Button>
+            <Button type="button" variant="outline" size="sm" onClick={() => credentials.refetch()}>
+              <RefreshCw className="h-4 w-4" />
+              刷新列表
+            </Button>
             <Button type="button" variant="outline" size="sm" onClick={queryCurrentPageInfo} disabled={queryingInfo || currentCredentials.length === 0}>
               {queryingInfo ? <Loading size="xs" /> : <Wallet className="h-4 w-4" />}
-              查询信息
+              {queryingInfo ? '查询中...' : '查询 Credits'}
             </Button>
             <Button type="button" variant="outline" size="sm" onClick={() => setKamOpen(true)}>
               <FileUp className="h-4 w-4" />

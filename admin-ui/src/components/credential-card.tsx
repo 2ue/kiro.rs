@@ -77,6 +77,14 @@ function formatUsd(value: number): string {
   }).format(value)
 }
 
+function formatCredits(value: number): string {
+  if (!Number.isFinite(value)) return '-'
+  return new Intl.NumberFormat('zh-CN', {
+    minimumFractionDigits: value >= 1 ? 2 : 6,
+    maximumFractionDigits: value >= 1 ? 2 : 6,
+  }).format(value)
+}
+
 export function CredentialCard({
   credential,
   onViewBalance,
@@ -354,7 +362,7 @@ export function CredentialCard({
               )}
             </div>
             <div>
-              <span className="text-muted-foreground">估算费用：</span>
+              <span className="text-muted-foreground">本地估算成本：</span>
               <span className="font-medium">{formatUsd(credential.estimatedCostUsd || 0)}</span>
             </div>
             {(credential.pricedRequests > 0 || credential.unpricedRequests > 0) && (
@@ -409,16 +417,16 @@ export function CredentialCard({
               </div>
             )}
             <div className="col-span-2">
-              <span className="text-muted-foreground">余额快照：</span>
+              <span className="text-muted-foreground">Credits：</span>
               {loadingBalance ? (
                 <span className="text-sm ml-1">
                   <Loader2 className="inline w-3 h-3 animate-spin" /> 加载中...
                 </span>
               ) : accountInfo ? (
                 <span className="font-medium ml-1">
-                  剩余 {formatUsd(accountInfo.remaining)} / 限额 {formatUsd(accountInfo.usageLimit)}
+                  {formatCredits(accountInfo.currentUsage)} / {formatCredits(accountInfo.usageLimit)}
                   <span className="text-xs text-muted-foreground ml-1">
-                    已用 {formatUsd(accountInfo.currentUsage)}（{accountInfo.usagePercentage.toFixed(1)}%） · 查询于 {formatDateTime(accountInfo.checkedAt)}
+                    {accountInfo.usagePercentage.toFixed(1)}% · {formatDateTime(accountInfo.checkedAt)}
                     {accountInfo.nextResetAt ? ` · 重置 ${new Date(accountInfo.nextResetAt * 1000).toLocaleString('zh-CN', { hour12: false })}` : ''}
                   </span>
                 </span>
@@ -529,7 +537,7 @@ export function CredentialCard({
               onClick={() => onViewBalance(credential.id)}
             >
               <Wallet className="h-4 w-4 mr-1" />
-              查看余额
+              Credits
             </Button>
             <Button
               size="sm"
