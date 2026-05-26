@@ -18,12 +18,15 @@ Redis, API, and dual-UI change set.
 - `credentialProbationSecs`
 - `dispatchGlobalMaxConcurrentRequests`
 - `dispatchMaxQueuedRequests`
+- `credentialWarmupMaxSelectionPercent`
 - `schedulerErrorEwmaAlpha`
 - `schedulerPriorityWeight`
 - `schedulerLoadWeight`
 - `schedulerErrorWeight`
 - `schedulerLatencyWeight`
 - `schedulerProbationWeight`
+- `schedulerSelectionPressureWeight`
+- `schedulerTotalSelectionWeight`
 - `schedulerTopK`
 
 `loadBalancingMode` now accepts:
@@ -46,11 +49,16 @@ unlimited when set to `0`.
 - Success reporting accepts optional latency and updates health state without clearing an active
   cooldown.
 - A single usable credential is no longer exempt from cooldown when it fails transiently.
-- `balanced` prefers lower in-flight load before historical counters.
+- `balanced` prefers lower in-flight load, then lower recent selection count, before historical
+  counters.
 - `priority` remains strict by priority, with lower in-flight load as a tie-breaker.
 - `health_balanced` scores candidates by priority, current load, recent error rate, latency EWMA,
-  and probation penalty.
+  probation penalty, recent selection pressure, and optional total selection count weight.
 - `schedulerTopK` weighted sampling reduces concurrent concentration on one candidate.
+- Warmup selection uses a target share derived from warming credential count and
+  `credentialWarmupMaxSelectionPercent`, avoiding the old fixed tiny probability for all warming
+  credentials combined.
+- Total scheduler selection count is persisted in Postgres and refreshed in Admin snapshots.
 - Dispatch waiting uses an optional bounded queue and rejects locally when the queue is full.
 - Snapshots include per-credential health fields and aggregate global capacity fields.
 
@@ -60,6 +68,7 @@ unlimited when set to `0`.
 
 - monotonic cooldown state per credential;
 - health state per credential;
+- recent selection windows per credential;
 - per-credential in-flight leases;
 - global in-flight lease indexes;
 - global queued dispatch count.
@@ -71,6 +80,7 @@ Important Redis behaviors:
 - dispatch lease acquisition checks per-credential and global capacity in one Lua path;
 - stale lease cleanup also keeps global indexes consistent;
 - queue enter/leave is shared across instances.
+- selection updates maintain 10s/60s/5m windows in Redis for multi-instance pressure scoring.
 
 ## Provider integration
 
@@ -101,7 +111,9 @@ soft failure.
 - latency EWMA;
 - last scheduler error kind/reason/time;
 - probation state;
-- scheduler selection count;
+- total scheduler selection count;
+- recent scheduler selection counts;
+- scheduler selection pressure;
 - scheduler score.
 
 Runtime config validation prevents invalid cooldowns, invalid EWMA alpha, invalid weights, and
@@ -122,7 +134,7 @@ Implemented UI behavior:
 - load-balancing selector includes `健康均衡模式`;
 - dashboard shows global dispatch capacity and queue state;
 - credential cards show probation, transient streak, error rate, latency, score, selection count,
-  and last scheduler error;
+  recent selection windows, selection pressure, and last scheduler error;
 - runtime config exposes category cooldowns, backoff, jitter, probation, global capacity, queue
   limit, health-score weights, EWMA alpha, and top-K.
 
@@ -141,6 +153,7 @@ Implemented behavior mirrors the old Admin UI:
 - `健康均衡模式` selector;
 - global capacity stat;
 - per-card health/error/score display;
+- recent selection windows and pressure display;
 - runtime controls for the new scheduler fields.
 
 ## Tests added or updated
@@ -152,10 +165,15 @@ Rust coverage includes:
 - structured transient failure updates health and backoff;
 - success updates latency health without clearing cooldown;
 - `health_balanced` prefers the best scored candidate when `schedulerTopK = 1`;
+- `health_balanced` penalizes credentials with excessive recent selection pressure;
+- `balanced` rotates across all-warming credentials using recent selection counts;
+- `balanced` gives warming credentials a scaled target share during batch import;
 - global capacity limits dispatch;
 - bounded queue rejects excess waiter;
 - Redis cooldown monotonicity;
 - Redis scheduler health round trip;
+- Redis scheduler selection window round trip;
+- Postgres total scheduler selection count persistence;
 - Redis global lease capacity state.
 
 Redis integration tests continue to skip unless `KIRO_RS_TEST_REDIS_URL` is configured.

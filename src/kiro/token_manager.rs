@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, Notify};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
@@ -416,6 +416,8 @@ struct CredentialEntry {
     disabled_reason: Option<DisabledReason>,
     /// API 调用成功次数
     success_count: u64,
+    /// 调度器实际选中该凭据的总次数。
+    total_selection_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
     /// 临时冷却到期时间（上游 Retry-After/瞬态错误触发），不持久化。
@@ -432,6 +434,8 @@ struct CredentialEntry {
     warmup_remaining: u32,
     /// 近期上游健康状态；Redis 部署下在调度前同步。
     health: SchedulerHealthState,
+    /// 本进程内的近期调度选中事件；无 Redis 时用于计算短窗口调度压力。
+    selection_events: VecDeque<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -590,6 +594,8 @@ impl CredentialRiskControlReason {
 #[derive(Serialize, Deserialize)]
 struct StatsEntry {
     success_count: u64,
+    #[serde(default)]
+    selection_count: u64,
     last_used_at: Option<String>,
 }
 
@@ -659,6 +665,8 @@ pub struct CredentialEntrySnapshot {
     pub subscription_title: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
+    /// 调度器实际选中该凭据的总次数。
+    pub total_selection_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
     /// 是否配置了凭据级代理
@@ -717,6 +725,14 @@ pub struct CredentialEntrySnapshot {
     pub probation_remaining_secs: u64,
     /// 调度选中该凭据次数。
     pub scheduler_selection_count: u64,
+    /// 10 秒内调度选中次数。
+    pub recent_scheduler_selection_count_10s: u32,
+    /// 60 秒内调度选中次数。
+    pub recent_scheduler_selection_count_60s: u32,
+    /// 5 分钟内调度选中次数。
+    pub recent_scheduler_selection_count_5m: u32,
+    /// 近期调度压力，1 表示约等于平均份额，越高表示近期被选中过多。
+    pub scheduler_selection_pressure: f64,
     /// 当前健康评分；越低越优先，仅健康均衡模式有实际决策意义。
     pub scheduler_score: f64,
 }
@@ -784,6 +800,9 @@ const MAX_SESSION_BINDINGS: usize = 10_000;
 const MAX_SESSION_SOFT_FAILURES: u32 = 2;
 /// 并发排队等待的周期性唤醒间隔，避免极端竞态下丢失通知后永久睡眠。
 const CONCURRENCY_WAIT_WAKEUP_SECS: u64 = 30;
+const SELECTION_WINDOW_10S: StdDuration = StdDuration::from_secs(10);
+const SELECTION_WINDOW_60S: StdDuration = StdDuration::from_secs(60);
+const SELECTION_WINDOW_5M: StdDuration = StdDuration::from_secs(5 * 60);
 
 /// API 调用上下文
 ///
@@ -1175,6 +1194,7 @@ impl MultiTokenManager {
                         None
                     },
                     success_count: 0,
+                    total_selection_count: 0,
                     last_used_at: None,
                     cooldown_until: None,
                     cooldown_reason: None,
@@ -1183,6 +1203,7 @@ impl MultiTokenManager {
                     in_flight_leases: Vec::new(),
                     warmup_remaining: 0,
                     health: SchedulerHealthState::default(),
+                    selection_events: VecDeque::new(),
                 }
             })
             .collect();
@@ -1463,7 +1484,12 @@ impl MultiTokenManager {
         requested.clamp(StdDuration::from_secs(1), max)
     }
 
-    fn scheduler_score(&self, entry: &CredentialEntry, now_ms: i64) -> f64 {
+    fn scheduler_score(
+        &self,
+        entry: &CredentialEntry,
+        now_ms: i64,
+        selection_pressure: f64,
+    ) -> f64 {
         let config = self.config.lock();
         let max_concurrent = config.credential_max_concurrent_requests;
         let load = if max_concurrent > 0 {
@@ -1482,6 +1508,107 @@ impl MultiTokenManager {
             + entry.health.latency_ewma_ms.unwrap_or(0.0).max(0.0)
                 * config.scheduler_latency_weight.max(0.0)
             + probation * config.scheduler_probation_weight.max(0.0)
+            + selection_pressure.max(0.0) * config.scheduler_selection_pressure_weight.max(0.0)
+            + (entry.total_selection_count as f64).ln_1p()
+                * config.scheduler_total_selection_weight.max(0.0)
+    }
+
+    fn prune_local_selection_events(entry: &mut CredentialEntry, now: Instant) {
+        while entry.selection_events.front().is_some_and(|selected_at| {
+            now.saturating_duration_since(*selected_at) > SELECTION_WINDOW_5M
+        }) {
+            entry.selection_events.pop_front();
+        }
+        entry.health.recent_selection_count_10s = entry
+            .selection_events
+            .iter()
+            .filter(|selected_at| {
+                now.saturating_duration_since(**selected_at) <= SELECTION_WINDOW_10S
+            })
+            .count()
+            .min(u32::MAX as usize) as u32;
+        entry.health.recent_selection_count_60s = entry
+            .selection_events
+            .iter()
+            .filter(|selected_at| {
+                now.saturating_duration_since(**selected_at) <= SELECTION_WINDOW_60S
+            })
+            .count()
+            .min(u32::MAX as usize) as u32;
+        entry.health.recent_selection_count_5m =
+            entry.selection_events.len().min(u32::MAX as usize) as u32;
+    }
+
+    fn record_local_selection(entry: &mut CredentialEntry, now: Instant) {
+        entry.total_selection_count = entry.total_selection_count.saturating_add(1);
+        entry.selection_events.push_back(now);
+        Self::prune_local_selection_events(entry, now);
+    }
+
+    fn refresh_local_selection_windows_locked(entries: &mut [CredentialEntry], now: Instant) {
+        for entry in entries {
+            Self::prune_local_selection_events(entry, now);
+        }
+    }
+
+    fn selection_pressure_for_candidates(
+        entry: &CredentialEntry,
+        candidates: &[&CredentialEntry],
+    ) -> f64 {
+        if candidates.len() <= 1 {
+            return 0.0;
+        }
+        let total_recent: u64 = candidates
+            .iter()
+            .map(|candidate| candidate.health.recent_selection_count_60s as u64)
+            .sum();
+        if total_recent == 0 {
+            return 0.0;
+        }
+        let share = entry.health.recent_selection_count_60s as f64 / total_recent as f64;
+        let expected_share = 1.0 / candidates.len() as f64;
+        (share / expected_share - 1.0).max(0.0)
+    }
+
+    fn warmup_target_share(&self, warming_count: usize) -> f64 {
+        if warming_count == 0 {
+            return 0.0;
+        }
+        let config = self.config.lock();
+        let per_warming = config.credential_warmup_selection_percent.min(100) as f64 / 100.0;
+        let max_share = config.credential_warmup_max_selection_percent.min(100) as f64 / 100.0;
+        (per_warming * warming_count as f64).min(max_share).min(1.0)
+    }
+
+    fn should_select_warming(
+        &self,
+        ready: &[&CredentialEntry],
+        warming: &[&CredentialEntry],
+        available: &[&CredentialEntry],
+    ) -> bool {
+        if warming.is_empty() {
+            return false;
+        }
+        if ready.is_empty() {
+            return true;
+        }
+        let target_share = self.warmup_target_share(warming.len());
+        if target_share <= 0.0 {
+            return false;
+        }
+        let total_recent: u64 = available
+            .iter()
+            .map(|entry| entry.health.recent_selection_count_60s as u64)
+            .sum();
+        if total_recent == 0 {
+            return true;
+        }
+        let warming_recent: u64 = warming
+            .iter()
+            .map(|entry| entry.health.recent_selection_count_60s as u64)
+            .sum();
+        let current_share = warming_recent as f64 / total_recent as f64;
+        current_share < target_share
     }
 
     fn update_credential_rpm_from_config(&self) {
@@ -1916,9 +2043,10 @@ impl MultiTokenManager {
             tracing::warn!("判断备选凭据前同步 Redis 调度状态失败: {}", err);
             return false;
         }
-        let entries = self.entries.lock();
+        let mut entries = self.entries.lock();
         let now = Instant::now();
         let max_concurrent_requests = self.max_concurrent_requests();
+        Self::refresh_local_selection_windows_locked(&mut entries, now);
         entries.iter().any(|entry| {
             entry.id != current_id
                 && !excluded_ids.contains(&entry.id)
@@ -1969,26 +2097,13 @@ impl MultiTokenManager {
                     .copied()
                     .collect();
 
-                // 预热不是后台主动打流量，而是在真实业务请求中低概率参与调度；
-                // 成功后才扣 warmup_remaining，且不伪造 success_count。
-                if !ready.is_empty() && !warming.is_empty() {
-                    let percent = self
-                        .config
-                        .lock()
-                        .credential_warmup_selection_percent
-                        .min(100);
-                    if percent > 0 && fastrand::u32(0..100) < percent {
-                        let entry =
-                            self.select_health_weighted(warming, Utc::now().timestamp_millis())?;
-                        return Some((entry.id, entry.credentials.clone()));
-                    }
-
-                    let entry =
-                        self.select_health_weighted(ready, Utc::now().timestamp_millis())?;
-                    return Some((entry.id, entry.credentials.clone()));
-                }
-
-                let candidates = if ready.is_empty() { warming } else { ready };
+                // 预热不是后台主动打流量，而是在真实业务请求中按目标份额参与调度；
+                // 份额按预热账号数量放大并受最大预热份额限制，避免批量导入后长期吃不到流量。
+                let candidates = if self.should_select_warming(&ready, &warming, &available) {
+                    warming
+                } else {
+                    ready
+                };
                 let entry =
                     self.select_health_weighted(candidates, Utc::now().timestamp_millis())?;
 
@@ -2005,24 +2120,11 @@ impl MultiTokenManager {
                     .filter(|entry| entry.warmup_remaining > 0)
                     .copied()
                     .collect();
-                if !ready.is_empty() && !warming.is_empty() {
-                    let percent = self
-                        .config
-                        .lock()
-                        .credential_warmup_selection_percent
-                        .min(100);
-                    if percent > 0 && fastrand::u32(0..100) < percent {
-                        let entry = warming
-                            .iter()
-                            .min_by_key(|entry| Self::balanced_selection_key(entry))?;
-                        return Some((entry.id, entry.credentials.clone()));
-                    }
-                    let entry = ready
-                        .iter()
-                        .min_by_key(|entry| Self::balanced_selection_key(entry))?;
-                    return Some((entry.id, entry.credentials.clone()));
-                }
-                let candidates = if ready.is_empty() { warming } else { ready };
+                let candidates = if self.should_select_warming(&ready, &warming, &available) {
+                    warming
+                } else {
+                    ready
+                };
                 let entry = candidates
                     .iter()
                     .min_by_key(|entry| Self::balanced_selection_key(entry))?;
@@ -2044,8 +2146,12 @@ impl MultiTokenManager {
         now_ms: i64,
     ) -> Option<&'a CredentialEntry> {
         let mut scored: Vec<(&CredentialEntry, f64)> = candidates
-            .into_iter()
-            .map(|entry| (entry, self.scheduler_score(entry, now_ms)))
+            .iter()
+            .copied()
+            .map(|entry| {
+                let pressure = Self::selection_pressure_for_candidates(entry, &candidates);
+                (entry, self.scheduler_score(entry, now_ms, pressure))
+            })
             .collect();
         scored.sort_by(|(left_entry, left), (right_entry, right)| {
             left.partial_cmp(right)
@@ -2069,20 +2175,26 @@ impl MultiTokenManager {
         top.last().map(|(entry, _)| *entry)
     }
 
-    fn balanced_selection_key(entry: &CredentialEntry) -> (u32, u64, u32, u64) {
+    fn balanced_selection_key(entry: &CredentialEntry) -> (u32, u32, u32, u64, u32, u64, u64) {
         (
             entry.in_flight_requests,
+            entry.health.recent_selection_count_10s,
+            entry.health.recent_selection_count_60s,
             entry.success_count,
             entry.credentials.priority,
+            entry.total_selection_count,
             entry.id,
         )
     }
 
-    fn priority_selection_key(entry: &CredentialEntry) -> (u32, u32, u64, u64) {
+    fn priority_selection_key(entry: &CredentialEntry) -> (u32, u32, u32, u32, u64, u64, u64) {
         (
             entry.credentials.priority,
             entry.in_flight_requests,
+            entry.health.recent_selection_count_10s,
+            entry.health.recent_selection_count_60s,
             entry.success_count,
+            entry.total_selection_count,
             entry.id,
         )
     }
@@ -3035,6 +3147,7 @@ impl MultiTokenManager {
                 failure_count: 0,
                 refresh_failure_count: 0,
                 success_count: 0,
+                total_selection_count: 0,
                 last_used_at: None,
                 cooldown_until: None,
                 cooldown_reason: None,
@@ -3043,6 +3156,7 @@ impl MultiTokenManager {
                 in_flight_leases: Vec::new(),
                 warmup_remaining: 0,
                 health: SchedulerHealthState::default(),
+                selection_events: VecDeque::new(),
             });
             changed = true;
         }
@@ -3116,6 +3230,14 @@ impl MultiTokenManager {
 
     /// 从 PgSQL 加载统计数据并应用到当前条目。
     fn load_stats(&self) {
+        self.load_stats_inner(true);
+    }
+
+    fn refresh_stats_from_postgres(&self) {
+        self.load_stats_inner(false);
+    }
+
+    fn load_stats_inner(&self, log_info: bool) {
         let Some(store) = &self.postgres_store else {
             return;
         };
@@ -3133,13 +3255,18 @@ impl MultiTokenManager {
         let mut entries = self.entries.lock();
         for entry in entries.iter_mut() {
             if let Some(s) = stats.get(&entry.id) {
-                entry.success_count = s.success_count;
+                entry.success_count = entry.success_count.max(s.success_count);
+                entry.total_selection_count = entry.total_selection_count.max(s.selection_count);
                 entry.last_used_at = s.last_used_at.clone();
             }
         }
         *self.last_stats_save_at.lock() = Some(Instant::now());
         self.stats_dirty.store(false, Ordering::Relaxed);
-        tracing::info!("已从 PgSQL 加载 {} 条凭据统计", stats.len());
+        if log_info {
+            tracing::info!("已从 PgSQL 加载 {} 条凭据统计", stats.len());
+        } else {
+            tracing::debug!("已刷新 {} 条 PgSQL 凭据统计", stats.len());
+        }
     }
 
     /// 将当前统计数据持久化到 PgSQL
@@ -3156,6 +3283,7 @@ impl MultiTokenManager {
                         e.id,
                         CredentialStatsRow {
                             success_count: e.success_count,
+                            selection_count: e.total_selection_count,
                             last_used_at: e.last_used_at.clone(),
                         },
                     )
@@ -3426,18 +3554,38 @@ impl MultiTokenManager {
     }
 
     fn record_scheduler_selection(&self, id: u64) {
+        let now = Instant::now();
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
-                entry.health.selection_count = entry.health.selection_count.saturating_add(1);
+                Self::record_local_selection(entry, now);
             }
         }
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
-            if let Err(err) = block_on_storage("记录 Redis 调度选中次数", async move {
+            match block_on_storage("记录 Redis 调度选中次数", async move {
                 redis.record_scheduler_selection(id).await
             }) {
-                tracing::warn!(credential_id = id, "记录 Redis 调度选中次数失败: {}", err);
+                Ok(health) => {
+                    let mut entries = self.entries.lock();
+                    if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                        entry.health = health;
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(credential_id = id, "记录 Redis 调度选中次数失败: {}", err);
+                }
+            }
+        }
+        if let Some(store) = &self.postgres_store {
+            let store = store.clone();
+            if let Err(err) = block_on_storage("记录 PgSQL 调度选中次数", async move {
+                store.record_credential_selection(id).await
+            }) {
+                tracing::warn!(credential_id = id, "记录 PgSQL 调度选中次数失败: {}", err);
+            } else {
+                *self.last_stats_save_at.lock() = Some(Instant::now());
+                self.stats_dirty.store(false, Ordering::Relaxed);
             }
         }
     }
@@ -4198,16 +4346,24 @@ impl MultiTokenManager {
 
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
+        self.refresh_stats_from_postgres();
         self.refresh_scheduler_state_from_redis_best_effort();
         let global_capacity = self.global_capacity_state();
         let config = self.config.lock().clone();
-        let entries = self.entries.lock();
+        let mut entries = self.entries.lock();
+        Self::refresh_local_selection_windows_locked(&mut entries, Instant::now());
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
         let now = Instant::now();
         let now_ms = Utc::now().timestamp_millis();
         let max_concurrent_requests = self.max_concurrent_requests();
         let lease_max_age = self.in_flight_lease_max_age();
+        let score_candidates: Vec<_> = entries
+            .iter()
+            .filter(|entry| {
+                Self::credential_is_dispatchable(entry, None, now, max_concurrent_requests)
+            })
+            .collect();
 
         ManagerSnapshot {
             entries: entries
@@ -4269,6 +4425,7 @@ impl MultiTokenManager {
                         email: e.credentials.email.clone(),
                         subscription_title: e.credentials.subscription_title.clone(),
                         success_count: e.success_count,
+                        total_selection_count: e.total_selection_count,
                         last_used_at: e.last_used_at.clone(),
                         has_proxy: e.credentials.proxy_url.is_some(),
                         proxy_url: e.credentials.proxy_url.clone(),
@@ -4312,8 +4469,19 @@ impl MultiTokenManager {
                             .filter(|until_ms| *until_ms > now_ms)
                             .map(|until_ms| ((until_ms - now_ms) as u64).div_ceil(1000))
                             .unwrap_or(0),
-                        scheduler_selection_count: e.health.selection_count,
-                        scheduler_score: self.scheduler_score(e, now_ms),
+                        scheduler_selection_count: e.total_selection_count,
+                        recent_scheduler_selection_count_10s: e.health.recent_selection_count_10s,
+                        recent_scheduler_selection_count_60s: e.health.recent_selection_count_60s,
+                        recent_scheduler_selection_count_5m: e.health.recent_selection_count_5m,
+                        scheduler_selection_pressure: Self::selection_pressure_for_candidates(
+                            e,
+                            &score_candidates,
+                        ),
+                        scheduler_score: self.scheduler_score(
+                            e,
+                            now_ms,
+                            Self::selection_pressure_for_candidates(e, &score_candidates),
+                        ),
                     }
                 })
                 .collect(),
@@ -4665,6 +4833,7 @@ impl MultiTokenManager {
                 disabled: false,
                 disabled_reason: None,
                 success_count: 0,
+                total_selection_count: 0,
                 last_used_at: None,
                 cooldown_until: None,
                 cooldown_reason: None,
@@ -4673,6 +4842,7 @@ impl MultiTokenManager {
                 in_flight_leases: Vec::new(),
                 warmup_remaining,
                 health: SchedulerHealthState::default(),
+                selection_events: VecDeque::new(),
             });
         }
 
@@ -5734,6 +5904,94 @@ mod tests {
 
         let mut ctx = manager.acquire_context(None).await.unwrap();
         assert_eq!(ctx.id, 2);
+        ctx.release_in_flight();
+    }
+
+    #[tokio::test]
+    async fn test_health_balanced_mode_penalizes_recent_selection_pressure() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "health_balanced".to_string();
+        config.scheduler_top_k = 1;
+        config.scheduler_selection_pressure_weight = 100.0;
+        let mut first = KiroCredentials::default();
+        first.access_token = Some("first".to_string());
+        first.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut second = KiroCredentials::default();
+        second.access_token = Some("second".to_string());
+        second.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager =
+            MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].health.recent_selection_count_60s = 100;
+        }
+
+        let mut ctx = manager.acquire_context(None).await.unwrap();
+        assert_eq!(ctx.id, 2);
+        ctx.release_in_flight();
+    }
+
+    #[tokio::test]
+    async fn test_balanced_mode_rotates_all_warming_credentials_by_recent_selection() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let mut first = KiroCredentials::default();
+        first.access_token = Some("first".to_string());
+        first.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut second = KiroCredentials::default();
+        second.access_token = Some("second".to_string());
+        second.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut third = KiroCredentials::default();
+        third.access_token = Some("third".to_string());
+        third.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager =
+            MultiTokenManager::new(config, vec![first, second, third], None, None, false).unwrap();
+        manager.set_warmup_remaining(1, 3).unwrap();
+        manager.set_warmup_remaining(2, 3).unwrap();
+        manager.set_warmup_remaining(3, 3).unwrap();
+
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let mut ctx = manager.acquire_context(None).await.unwrap();
+            seen.push(ctx.id);
+            ctx.release_in_flight();
+        }
+
+        assert_eq!(seen, vec![1, 2, 3]);
+        let snapshot = manager.snapshot();
+        assert_eq!(
+            snapshot
+                .entries
+                .iter()
+                .map(|entry| entry.recent_scheduler_selection_count_60s)
+                .collect::<Vec<_>>(),
+            vec![1, 1, 1]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_balanced_mode_gives_warming_group_scaled_target_share() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.credential_warmup_selection_percent = 5;
+        config.credential_warmup_max_selection_percent = 50;
+        let mut ready = KiroCredentials::default();
+        ready.access_token = Some("ready".to_string());
+        ready.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut warming_a = KiroCredentials::default();
+        warming_a.access_token = Some("warming-a".to_string());
+        warming_a.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut warming_b = KiroCredentials::default();
+        warming_b.access_token = Some("warming-b".to_string());
+        warming_b.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let manager =
+            MultiTokenManager::new(config, vec![ready, warming_a, warming_b], None, None, false)
+                .unwrap();
+        manager.set_warmup_remaining(2, 3).unwrap();
+        manager.set_warmup_remaining(3, 3).unwrap();
+
+        let mut ctx = manager.acquire_context(None).await.unwrap();
+        assert_ne!(ctx.id, 1);
         ctx.release_in_flight();
     }
 

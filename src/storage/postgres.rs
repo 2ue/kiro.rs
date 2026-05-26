@@ -488,19 +488,22 @@ impl PostgresStore {
     }
 
     pub async fn load_credential_stats(&self) -> anyhow::Result<HashMap<u64, CredentialStatsRow>> {
-        let rows =
-            sqlx::query("SELECT credential_id, success_count, last_used_at FROM credential_stats")
-                .fetch_all(&self.pool)
-                .await?;
+        let rows = sqlx::query(
+            "SELECT credential_id, success_count, selection_count, last_used_at FROM credential_stats",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         let mut stats = HashMap::with_capacity(rows.len());
         for row in rows {
             let credential_id: i64 = row.try_get("credential_id")?;
             let success_count: i64 = row.try_get("success_count")?;
+            let selection_count: i64 = row.try_get("selection_count")?;
             let last_used_at: Option<String> = row.try_get("last_used_at")?;
             stats.insert(
                 credential_id as u64,
                 CredentialStatsRow {
                     success_count: success_count.max(0) as u64,
+                    selection_count: selection_count.max(0) as u64,
                     last_used_at,
                 },
             );
@@ -670,16 +673,20 @@ impl PostgresStore {
     ) -> anyhow::Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO credential_stats (credential_id, success_count, last_used_at, updated_at)
-            VALUES ($1, $2, $3, now())
+            INSERT INTO credential_stats (
+                credential_id, success_count, selection_count, last_used_at, updated_at
+            )
+            VALUES ($1, $2, $3, $4, now())
             ON CONFLICT (credential_id) DO UPDATE
             SET success_count = EXCLUDED.success_count,
+                selection_count = GREATEST(credential_stats.selection_count, EXCLUDED.selection_count),
                 last_used_at = EXCLUDED.last_used_at,
                 updated_at = now()
             "#,
         )
         .bind(credential_id as i64)
         .bind(stat.success_count as i64)
+        .bind(stat.selection_count as i64)
         .bind(&stat.last_used_at)
         .execute(&self.pool)
         .await?;
@@ -725,6 +732,22 @@ impl PostgresStore {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn record_credential_selection(&self, credential_id: u64) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO credential_stats (credential_id, selection_count, updated_at)
+            VALUES ($1, 1, now())
+            ON CONFLICT (credential_id) DO UPDATE
+            SET selection_count = credential_stats.selection_count + 1,
+                updated_at = now()
+            "#,
+        )
+        .bind(credential_id as i64)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -1272,6 +1295,7 @@ impl PostgresStore {
 #[derive(Debug, Clone, Default)]
 pub struct CredentialStatsRow {
     pub success_count: u64,
+    pub selection_count: u64,
     pub last_used_at: Option<String>,
 }
 
@@ -1882,9 +1906,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_credentials_refresh_token_hash
 CREATE TABLE IF NOT EXISTS credential_stats (
     credential_id BIGINT PRIMARY KEY REFERENCES credentials(id) ON DELETE CASCADE,
     success_count BIGINT NOT NULL DEFAULT 0,
+    selection_count BIGINT NOT NULL DEFAULT 0,
     last_used_at TEXT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE credential_stats
+    ADD COLUMN IF NOT EXISTS selection_count BIGINT NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS credential_runtime_state (
     credential_id BIGINT PRIMARY KEY REFERENCES credentials(id) ON DELETE CASCADE,
@@ -2211,12 +2239,30 @@ mod tests {
             7,
             CredentialStatsRow {
                 success_count: 9,
+                selection_count: 11,
                 last_used_at: Some("2026-05-24T00:00:00Z".to_string()),
             },
         )]);
         store.save_credential_stats(&stats).await.unwrap();
         let loaded_stats = store.load_credential_stats().await.unwrap();
         assert_eq!(loaded_stats.get(&7).unwrap().success_count, 9);
+        assert_eq!(loaded_stats.get(&7).unwrap().selection_count, 11);
+        store.record_credential_selection(7).await.unwrap();
+        let loaded_stats = store.load_credential_stats().await.unwrap();
+        assert_eq!(loaded_stats.get(&7).unwrap().selection_count, 12);
+        store
+            .save_credential_stats(&HashMap::from([(
+                7,
+                CredentialStatsRow {
+                    success_count: 10,
+                    selection_count: 3,
+                    last_used_at: Some("2026-05-24T00:01:00Z".to_string()),
+                },
+            )]))
+            .await
+            .unwrap();
+        let loaded_stats = store.load_credential_stats().await.unwrap();
+        assert_eq!(loaded_stats.get(&7).unwrap().selection_count, 12);
 
         let runtime_state = HashMap::from([(
             7,

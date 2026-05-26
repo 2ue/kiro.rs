@@ -445,12 +445,15 @@ export function ConfigPanel() {
               <NumberField title="近期错误率权重" description="近期上游错误率对健康得分的影响。" value={draft.schedulerErrorWeight} min={0} step={1} suffix="权重" onChange={(schedulerErrorWeight) => setDraft((prev) => ({ ...prev, schedulerErrorWeight }))} />
               <NumberField title="耗时权重" description="每毫秒成功耗时 EWMA 对健康得分的影响。" value={draft.schedulerLatencyWeight} min={0} step={0.001} suffix="权重" onChange={(schedulerLatencyWeight) => setDraft((prev) => ({ ...prev, schedulerLatencyWeight }))} />
               <NumberField title="恢复观察惩罚" description="处于观察窗口时额外增加的健康得分。" value={draft.schedulerProbationWeight} min={0} step={1} suffix="权重" onChange={(schedulerProbationWeight) => setDraft((prev) => ({ ...prev, schedulerProbationWeight }))} />
+              <NumberField title="近期调度压力权重" description="最近 60 秒被选中比例高于平均值时增加的降权，避免短时间集中打同一账号。" value={draft.schedulerSelectionPressureWeight} min={0} step={1} suffix="权重" onChange={(schedulerSelectionPressureWeight) => setDraft((prev) => ({ ...prev, schedulerSelectionPressureWeight }))} />
+              <NumberField title="总调度次数权重" description="总调度次数对健康得分的影响。默认 0，只建议作为很弱的长期均衡信号。" value={draft.schedulerTotalSelectionWeight} min={0} step={0.001} suffix="权重" onChange={(schedulerTotalSelectionWeight) => setDraft((prev) => ({ ...prev, schedulerTotalSelectionWeight }))} />
               <NumberField title="最佳候选抽样数量" description="从得分最佳的前 N 个账号按权重选择，降低请求集中。" value={draft.schedulerTopK} min={1} max={100} suffix="个" onChange={(schedulerTopK) => setDraft((prev) => ({ ...prev, schedulerTopK }))} />
             </ConfigGroup>
 
-            <ConfigGroup icon={<Sparkles className="h-4 w-4" />} title="新凭据预热" description="预热不会伪造成功次数，只会让新账号在均衡模式下更少被选中。">
+            <ConfigGroup icon={<Sparkles className="h-4 w-4" />} title="新凭据预热" description="预热不会伪造成功次数；批量导入时按预热账号数量分配目标流量，避免新账号长期吃不到请求。">
               <NumberField title="预热剩余请求数" description="新添加凭据默认进入预热状态的请求次数。填 0 表示不预热。" value={draft.credentialWarmupRequests} min={0} suffix="次" onChange={(credentialWarmupRequests) => setDraft((prev) => ({ ...prev, credentialWarmupRequests }))} />
-              <NumberField title="预热凭据参与概率" description="balanced 模式下预热凭据参与真实请求调度的概率。值越低，新凭据被调用越少。" value={draft.credentialWarmupSelectionPercent} min={0} max={100} suffix="%" onChange={(credentialWarmupSelectionPercent) => setDraft((prev) => ({ ...prev, credentialWarmupSelectionPercent }))} />
+              <NumberField title="预热凭据参与概率" description="每个预热凭据的目标参与比例。批量导入时会按预热账号数放大。" value={draft.credentialWarmupSelectionPercent} min={0} max={100} suffix="%" onChange={(credentialWarmupSelectionPercent) => setDraft((prev) => ({ ...prev, credentialWarmupSelectionPercent }))} />
+              <NumberField title="预热总流量上限" description="已有非预热账号可用时，所有预热账号合计最多承接的真实请求比例。" value={draft.credentialWarmupMaxSelectionPercent} min={0} max={100} suffix="%" onChange={(credentialWarmupMaxSelectionPercent) => setDraft((prev) => ({ ...prev, credentialWarmupMaxSelectionPercent }))} />
             </ConfigGroup>
 
             <ConfigGroup icon={<Wand2 className="h-4 w-4" />} title="请求压缩" description="控制发往上游前是否压缩请求内容。默认关闭总开关；如需开启，建议只使用空白压缩。">

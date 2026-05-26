@@ -23,6 +23,7 @@ pub struct SchedulerCooldownState {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct SchedulerHealthState {
     pub transient_failure_streak: u32,
     pub recent_error_rate: f64,
@@ -32,6 +33,9 @@ pub struct SchedulerHealthState {
     pub last_error_at_ms: Option<i64>,
     pub probation_until_ms: Option<i64>,
     pub selection_count: u64,
+    pub recent_selection_count_10s: u32,
+    pub recent_selection_count_60s: u32,
+    pub recent_selection_count_5m: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -607,32 +611,63 @@ impl RedisStore {
         Ok(serde_json::from_str(&encoded)?)
     }
 
-    pub async fn record_scheduler_selection(&self, credential_id: u64) -> anyhow::Result<()> {
+    pub async fn record_scheduler_selection(
+        &self,
+        credential_id: u64,
+    ) -> anyhow::Result<SchedulerHealthState> {
+        let now = now_ms();
         let script = r#"
             local ttl = tonumber(ARGV[1])
+            local now = tonumber(ARGV[2])
+            local window_10s = tonumber(ARGV[3])
+            local window_60s = tonumber(ARGV[4])
+            local window_5m = tonumber(ARGV[5])
             local health = {}
             local raw = redis.call('GET', KEYS[1])
             if raw then
                 local ok, parsed = pcall(cjson.decode, raw)
                 if ok and parsed then health = parsed end
             end
+            local sequence = redis.call('INCR', KEYS[3])
+            local member = tostring(now) .. '-' .. tostring(sequence)
+            redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now - window_5m)
+            redis.call('ZADD', KEYS[2], now, member)
+            redis.call('EXPIRE', KEYS[2], ttl)
             health['selection_count'] = tonumber(health['selection_count'] or '0') + 1
+            health['recent_selection_count_10s'] = redis.call('ZCOUNT', KEYS[2], now - window_10s, '+inf')
+            health['recent_selection_count_60s'] = redis.call('ZCOUNT', KEYS[2], now - window_60s, '+inf')
+            health['recent_selection_count_5m'] = redis.call('ZCOUNT', KEYS[2], now - window_5m, '+inf')
             redis.call('SET', KEYS[1], cjson.encode(health), 'EX', ttl)
-            return 1
+            return cjson.encode(health)
         "#;
         let mut manager = self.manager.clone();
-        let _: i64 = redis::cmd("EVAL")
+        let encoded: String = redis::cmd("EVAL")
             .arg(script)
-            .arg(1)
+            .arg(3)
             .arg(self.key(scheduler_health_key(credential_id)))
+            .arg(self.key(scheduler_selection_window_key(credential_id)))
+            .arg(self.key("scheduler:selection:sequence"))
             .arg(30 * 24 * 60 * 60)
+            .arg(now)
+            .arg(10_000)
+            .arg(60_000)
+            .arg(5 * 60_000)
             .query_async(&mut manager)
             .await?;
-        Ok(())
+        Ok(serde_json::from_str(&encoded)?)
     }
 
     pub async fn clear_scheduler_health(&self, credential_id: u64) -> anyhow::Result<()> {
-        self.del(scheduler_health_key(credential_id)).await
+        let mut manager = self.manager.clone();
+        let _: (i64, i64) = redis::pipe()
+            .atomic()
+            .cmd("DEL")
+            .arg(self.key(scheduler_health_key(credential_id)))
+            .cmd("DEL")
+            .arg(self.key(scheduler_selection_window_key(credential_id)))
+            .query_async(&mut manager)
+            .await?;
+        Ok(())
     }
 
     pub async fn bump_rate_limit_available_at(
@@ -1014,6 +1049,7 @@ impl RedisStore {
             return Ok(states);
         }
 
+        let query_now = now_ms();
         let mut pipe = redis::pipe();
         for credential_id in credential_ids {
             let keys = in_flight_keys(*credential_id);
@@ -1034,7 +1070,19 @@ impl RedisStore {
                 .arg(-1)
                 .arg("WITHSCORES")
                 .cmd("HGETALL")
-                .arg(self.key(&keys.kind));
+                .arg(self.key(&keys.kind))
+                .cmd("ZCOUNT")
+                .arg(self.key(scheduler_selection_window_key(*credential_id)))
+                .arg(query_now - 10_000)
+                .arg("+inf")
+                .cmd("ZCOUNT")
+                .arg(self.key(scheduler_selection_window_key(*credential_id)))
+                .arg(query_now - 60_000)
+                .arg("+inf")
+                .cmd("ZCOUNT")
+                .arg(self.key(scheduler_selection_window_key(*credential_id)))
+                .arg(query_now - 5 * 60_000)
+                .arg("+inf");
         }
 
         let mut manager = self.manager.clone();
@@ -1042,13 +1090,16 @@ impl RedisStore {
         let now = now_ms();
         let mut keys_to_delete = Vec::new();
         for (index, credential_id) in credential_ids.iter().enumerate() {
-            let base = index * 6;
+            let base = index * 9;
             let cooldown_raw: Option<String> = redis::from_redis_value(&values[base])?;
             let health_raw: Option<String> = redis::from_redis_value(&values[base + 1])?;
             let rate_raw: Option<String> = redis::from_redis_value(&values[base + 2])?;
             let last_seen: Vec<(String, f64)> = redis::from_redis_value(&values[base + 3])?;
             let acquired: Vec<(String, f64)> = redis::from_redis_value(&values[base + 4])?;
             let kinds: HashMap<String, String> = redis::from_redis_value(&values[base + 5])?;
+            let recent_10s: i64 = redis::from_redis_value(&values[base + 6])?;
+            let recent_60s: i64 = redis::from_redis_value(&values[base + 7])?;
+            let recent_5m: i64 = redis::from_redis_value(&values[base + 8])?;
 
             let cooldown = cooldown_raw
                 .as_deref()
@@ -1072,10 +1123,13 @@ impl RedisStore {
                         Some(until_ms)
                     }
                 });
-            let health = health_raw
+            let mut health = health_raw
                 .as_deref()
                 .and_then(|raw| serde_json::from_str::<SchedulerHealthState>(raw).ok())
                 .unwrap_or_default();
+            health.recent_selection_count_10s = recent_10s.max(0).min(u32::MAX as i64) as u32;
+            health.recent_selection_count_60s = recent_60s.max(0).min(u32::MAX as i64) as u32;
+            health.recent_selection_count_5m = recent_5m.max(0).min(u32::MAX as i64) as u32;
             let acquired_map: HashMap<String, i64> = acquired
                 .into_iter()
                 .map(|(member, score)| (member, score as i64))
@@ -1222,6 +1276,10 @@ fn scheduler_cooldown_key(credential_id: u64) -> String {
 
 fn scheduler_health_key(credential_id: u64) -> String {
     format!("scheduler:health:{}", credential_id)
+}
+
+fn scheduler_selection_window_key(credential_id: u64) -> String {
+    format!("scheduler:selection:{}", credential_id)
 }
 
 fn scheduler_rate_limit_key(credential_id: u64) -> String {
@@ -1474,6 +1532,24 @@ mod tests {
             .unwrap();
         assert_eq!(success_health.transient_failure_streak, 0);
         assert_eq!(success_health.latency_ewma_ms, Some(120.0));
+        let selected_once = store.record_scheduler_selection(3).await.unwrap();
+        assert_eq!(selected_once.selection_count, 1);
+        assert_eq!(selected_once.recent_selection_count_10s, 1);
+        assert_eq!(selected_once.recent_selection_count_60s, 1);
+        assert_eq!(selected_once.recent_selection_count_5m, 1);
+        let selected_twice = store.record_scheduler_selection(3).await.unwrap();
+        assert_eq!(selected_twice.selection_count, 2);
+        assert_eq!(
+            store
+                .scheduler_state_for_credentials(&[3])
+                .await
+                .unwrap()
+                .get(&3)
+                .unwrap()
+                .health
+                .recent_selection_count_60s,
+            2
+        );
         store.clear_scheduler_health(3).await.unwrap();
     }
 

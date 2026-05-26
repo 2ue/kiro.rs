@@ -40,14 +40,22 @@ Each request passes through the same dispatch pipeline:
 ### priority
 
 `priority` keeps the existing intent: lower configured priority value wins first. Within the same
-priority, lower current in-flight count and lower success count are used as tie-breakers. This mode
-is useful when operators need strong manual routing preference.
+priority, lower current in-flight count, lower recent selection count, lower success count, and
+lower total selection count are used as tie-breakers. This mode is useful when operators need strong
+manual routing preference.
 
 ### balanced
 
 `balanced` remains the lightweight load-spreading mode. It prefers lower current in-flight count,
-then lower success count, then priority. It does not use health score weights, so it remains easy to
-reason about and backward-compatible.
+then lower recent selection count, then lower success count, then priority. It does not use health
+score weights, so it remains easy to reason about and backward-compatible.
+
+Warmup handling in `balanced` is target-share based. When both ready and warming credentials exist,
+each warming credential contributes `credentialWarmupSelectionPercent` to the target warmup traffic
+share, capped by `credentialWarmupMaxSelectionPercent`. With defaults, 10 warming credentials target
+50% total warmup traffic instead of all 10 sharing a fixed 5% probability. When all dispatchable
+credentials are warming, the scheduler balances across all warming credentials by recent selection
+counts.
 
 ### health_balanced
 
@@ -61,6 +69,8 @@ score =
   + recent_error_rate * schedulerErrorWeight
   + latency_ewma_ms * schedulerLatencyWeight
   + probation_penalty * schedulerProbationWeight
+  + recent_selection_pressure * schedulerSelectionPressureWeight
+  + ln(1 + total_selection_count) * schedulerTotalSelectionWeight
 ```
 
 The scheduler then selects from the best `schedulerTopK` candidates using weighted random sampling.
@@ -78,7 +88,11 @@ Each credential has scheduler health state:
 - `lastErrorReason`
 - `lastErrorAtMs`
 - `probationUntilMs`
-- `schedulerSelectionCount`
+- recent selection counts for 10s, 60s, and 5m windows
+
+Each credential also has a persisted total scheduler selection count in Postgres. The recent
+selection windows are scheduler signals; the total count is primarily observability and an optional
+weak long-term balancing signal.
 
 With Redis configured, this state is stored in Redis and read into scheduler snapshots. Without
 Redis, the same concepts are maintained locally in the process.
@@ -173,6 +187,7 @@ Admin credential snapshots expose:
 - last error kind/reason/time;
 - probation flag and remaining seconds;
 - scheduler selection count;
+- recent scheduler selection counts and selection pressure;
 - scheduler score;
 - estimated local dollar cost and request pricing counters from the usage recorder.
 

@@ -61,6 +61,12 @@ The old behavior still had several high-concurrency gaps:
 7. There was no shared error-rate EWMA, latency EWMA, probation state, or selection count.
 8. There was no optional global dispatch capacity or bounded global waiting queue.
 9. Admin views did not explain why a credential was avoided, degraded, or preferred.
+10. Warmup was controlled by one small global probability. If a ready credential already existed,
+    a batch of warming credentials shared that tiny probability, so importing 10 accounts with
+    `warmupRemaining = 3` could keep almost all traffic on the ready credential for a long time.
+11. Historical success count was not enough to express dispatch pressure. Fast requests can finish
+    before `inFlight` remains visible, so short-window selection count is needed to avoid repeatedly
+    selecting the same credential.
 
 ## sub2api reference points
 
@@ -133,3 +139,17 @@ The current scheduler implementation does not use official quota credits or loca
 cost in the hot dispatch score. The reason is practical: quota/cost persistence is database-backed
 and not designed to be queried on every request dispatch. A future version can add a Redis/local
 cached quota snapshot as a scoring signal, but the hot path should stay fast and predictable.
+
+## Selection count signals
+
+Recent selection count and total selection count have different uses:
+
+- 10s/60s/5m recent selection counts are scheduler signals. They capture short-window pressure and
+  prevent a credential from receiving a disproportionate share when it is otherwise healthy.
+- Total selection count is a persisted statistics signal. It is useful for audit, UI, and very weak
+  long-term tie-breaking, but it should not dominate scheduling because old credentials would be
+  permanently penalized and new credentials could be over-selected.
+
+The implemented scheduler therefore uses recent 60s selection pressure in `health_balanced`, uses
+recent selection counts as tie-breakers in `balanced`/same-priority selection, and keeps total
+selection count persisted for display and optional weak weighting.

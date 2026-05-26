@@ -275,6 +275,12 @@ impl AdminService {
                     in_probation: entry.in_probation,
                     probation_remaining_secs: entry.probation_remaining_secs,
                     scheduler_selection_count: entry.scheduler_selection_count,
+                    recent_scheduler_selection_count_10s: entry
+                        .recent_scheduler_selection_count_10s,
+                    recent_scheduler_selection_count_60s: entry
+                        .recent_scheduler_selection_count_60s,
+                    recent_scheduler_selection_count_5m: entry.recent_scheduler_selection_count_5m,
+                    scheduler_selection_pressure: entry.scheduler_selection_pressure,
                     scheduler_score: entry.scheduler_score,
                     estimated_cost_usd: cost.estimated_cost_usd,
                     priced_requests: cost.priced_requests,
@@ -804,12 +810,15 @@ impl AdminService {
             dispatch_max_queued_requests: config.dispatch_max_queued_requests,
             credential_warmup_requests: config.credential_warmup_requests,
             credential_warmup_selection_percent: config.credential_warmup_selection_percent,
+            credential_warmup_max_selection_percent: config.credential_warmup_max_selection_percent,
             scheduler_error_ewma_alpha: config.scheduler_error_ewma_alpha,
             scheduler_priority_weight: config.scheduler_priority_weight,
             scheduler_load_weight: config.scheduler_load_weight,
             scheduler_error_weight: config.scheduler_error_weight,
             scheduler_latency_weight: config.scheduler_latency_weight,
             scheduler_probation_weight: config.scheduler_probation_weight,
+            scheduler_selection_pressure_weight: config.scheduler_selection_pressure_weight,
+            scheduler_total_selection_weight: config.scheduler_total_selection_weight,
             scheduler_top_k: config.scheduler_top_k,
             compression_enabled: config.compression.enabled,
             whitespace_compression: config.compression.whitespace_compression,
@@ -875,6 +884,9 @@ impl AdminService {
         let warmup_selection_percent = req
             .credential_warmup_selection_percent
             .unwrap_or(current_config.credential_warmup_selection_percent);
+        let warmup_max_selection_percent = req
+            .credential_warmup_max_selection_percent
+            .unwrap_or(current_config.credential_warmup_max_selection_percent);
         let scheduler_error_ewma_alpha = req
             .scheduler_error_ewma_alpha
             .unwrap_or(current_config.scheduler_error_ewma_alpha);
@@ -893,6 +905,12 @@ impl AdminService {
         let scheduler_probation_weight = req
             .scheduler_probation_weight
             .unwrap_or(current_config.scheduler_probation_weight);
+        let scheduler_selection_pressure_weight = req
+            .scheduler_selection_pressure_weight
+            .unwrap_or(current_config.scheduler_selection_pressure_weight);
+        let scheduler_total_selection_weight = req
+            .scheduler_total_selection_weight
+            .unwrap_or(current_config.scheduler_total_selection_weight);
         let scheduler_top_k = req
             .scheduler_top_k
             .unwrap_or(current_config.scheduler_top_k);
@@ -980,6 +998,8 @@ impl AdminService {
             scheduler_error_weight,
             scheduler_latency_weight,
             scheduler_probation_weight,
+            scheduler_selection_pressure_weight,
+            scheduler_total_selection_weight,
         ]
         .into_iter()
         .any(|value| !value.is_finite() || value < 0.0)
@@ -996,6 +1016,11 @@ impl AdminService {
         if warmup_selection_percent > 100 {
             return Err(AdminServiceError::InvalidCredential(
                 "credentialWarmupSelectionPercent 不能大于 100".to_string(),
+            ));
+        }
+        if warmup_max_selection_percent > 100 {
+            return Err(AdminServiceError::InvalidCredential(
+                "credentialWarmupMaxSelectionPercent 不能大于 100".to_string(),
             ));
         }
         if !(0.0..=0.99).contains(&prompt_cache_target_read_ratio)
@@ -1071,12 +1096,15 @@ impl AdminService {
                 config.dispatch_max_queued_requests = dispatch_max_queued_requests;
                 config.credential_warmup_requests = req.credential_warmup_requests;
                 config.credential_warmup_selection_percent = warmup_selection_percent;
+                config.credential_warmup_max_selection_percent = warmup_max_selection_percent;
                 config.scheduler_error_ewma_alpha = scheduler_error_ewma_alpha;
                 config.scheduler_priority_weight = scheduler_priority_weight;
                 config.scheduler_load_weight = scheduler_load_weight;
                 config.scheduler_error_weight = scheduler_error_weight;
                 config.scheduler_latency_weight = scheduler_latency_weight;
                 config.scheduler_probation_weight = scheduler_probation_weight;
+                config.scheduler_selection_pressure_weight = scheduler_selection_pressure_weight;
+                config.scheduler_total_selection_weight = scheduler_total_selection_weight;
                 config.scheduler_top_k = scheduler_top_k;
                 config.compression = compression.clone();
                 config.prompt_cache_target_read_ratio = prompt_cache_target_read_ratio;

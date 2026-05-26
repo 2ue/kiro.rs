@@ -384,8 +384,23 @@ export function CredentialCard({
               <span className="font-medium">{credential.schedulerScore.toFixed(2)}</span>
             </div>
             <div>
-              <span className="text-muted-foreground">被选中：</span>
+              <span className="text-muted-foreground">总调度：</span>
               <span className="font-medium">{credential.schedulerSelectionCount}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">近期调度：</span>
+              <span className="font-medium">
+                {credential.recentSchedulerSelectionCount60s}/60s
+              </span>
+              <span className="ml-1 text-xs text-muted-foreground">
+                10s {credential.recentSchedulerSelectionCount10s} / 5m {credential.recentSchedulerSelectionCount5m}
+              </span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">调度压力：</span>
+              <span className={credential.schedulerSelectionPressure > 1 ? 'font-medium text-amber-600' : 'font-medium'}>
+                {credential.schedulerSelectionPressure.toFixed(2)}
+              </span>
             </div>
             <div>
               <span className="text-muted-foreground">本地估算成本：</span>

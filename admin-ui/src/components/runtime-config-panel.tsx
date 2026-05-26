@@ -88,12 +88,15 @@ const emptyConfig: RuntimeConfig = {
   dispatchMaxQueuedRequests: 0,
   credentialWarmupRequests: 3,
   credentialWarmupSelectionPercent: 5,
+  credentialWarmupMaxSelectionPercent: 50,
   schedulerErrorEwmaAlpha: 0.2,
   schedulerPriorityWeight: 1,
   schedulerLoadWeight: 100,
   schedulerErrorWeight: 100,
   schedulerLatencyWeight: 0.01,
   schedulerProbationWeight: 50,
+  schedulerSelectionPressureWeight: 25,
+  schedulerTotalSelectionWeight: 0,
   schedulerTopK: 3,
   compressionEnabled: false,
   whitespaceCompression: true,
@@ -727,6 +730,8 @@ export function RuntimeConfigPanel() {
             <NumberField title="近期错误率权重" description="近期上游错误率对健康得分的影响。" value={draft.schedulerErrorWeight} min={0} step={1} onChange={(schedulerErrorWeight) => setDraft((prev) => ({ ...prev, schedulerErrorWeight }))} />
             <NumberField title="耗时权重" description="每毫秒成功耗时 EWMA 对健康得分的影响。" value={draft.schedulerLatencyWeight} min={0} step={0.001} onChange={(schedulerLatencyWeight) => setDraft((prev) => ({ ...prev, schedulerLatencyWeight }))} />
             <NumberField title="恢复观察惩罚" description="处于观察窗口时额外增加的健康得分。" value={draft.schedulerProbationWeight} min={0} step={1} onChange={(schedulerProbationWeight) => setDraft((prev) => ({ ...prev, schedulerProbationWeight }))} />
+            <NumberField title="近期调度压力权重" description="凭据在最近 60 秒被选中比例高于平均值时增加的降权。用于避免短时间集中打同一账号。" value={draft.schedulerSelectionPressureWeight} min={0} step={1} onChange={(schedulerSelectionPressureWeight) => setDraft((prev) => ({ ...prev, schedulerSelectionPressureWeight }))} />
+            <NumberField title="总调度次数权重" description="总调度次数对健康得分的影响。默认 0；只建议作为很弱的长期均衡信号。" value={draft.schedulerTotalSelectionWeight} min={0} step={0.001} onChange={(schedulerTotalSelectionWeight) => setDraft((prev) => ({ ...prev, schedulerTotalSelectionWeight }))} />
             <NumberField title="最佳候选抽样数量" description="从得分最佳的前 N 个账号按权重选择，降低请求集中。" value={draft.schedulerTopK} min={1} max={100} suffix="个" onChange={(schedulerTopK) => setDraft((prev) => ({ ...prev, schedulerTopK }))} />
           </ConfigSection>
 
@@ -747,13 +752,24 @@ export function RuntimeConfigPanel() {
             />
             <NumberField
               title="预热凭据参与概率"
-              description="控制 balanced 模式下预热凭据参与真实请求调度的概率。值越低，新凭据被调用越少。"
+              description="每个预热凭据的目标参与比例。批量导入时会按预热账号数放大，但受下方总预热流量上限限制。"
               value={draft.credentialWarmupSelectionPercent}
               min={0}
               max={100}
               suffix="%"
               onChange={(credentialWarmupSelectionPercent) =>
                 setDraft((prev) => ({ ...prev, credentialWarmupSelectionPercent }))
+              }
+            />
+            <NumberField
+              title="预热总流量上限"
+              description="当已有非预热账号可用时，所有预热账号合计最多承接的真实请求比例，避免批量导入新账号后过度抢流。"
+              value={draft.credentialWarmupMaxSelectionPercent}
+              min={0}
+              max={100}
+              suffix="%"
+              onChange={(credentialWarmupMaxSelectionPercent) =>
+                setDraft((prev) => ({ ...prev, credentialWarmupMaxSelectionPercent }))
               }
             />
           </ConfigSection>

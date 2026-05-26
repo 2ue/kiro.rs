@@ -171,6 +171,14 @@ pub struct CredentialStatusItem {
     pub probation_remaining_secs: u64,
     /// 调度选中次数。
     pub scheduler_selection_count: u64,
+    /// 10 秒内调度选中次数。
+    pub recent_scheduler_selection_count_10s: u32,
+    /// 60 秒内调度选中次数。
+    pub recent_scheduler_selection_count_60s: u32,
+    /// 5 分钟内调度选中次数。
+    pub recent_scheduler_selection_count_5m: u32,
+    /// 近期调度压力，1 表示约等于平均份额，越高表示近期被选中过多。
+    pub scheduler_selection_pressure: f64,
     /// 调度健康评分，越低越优先。
     pub scheduler_score: f64,
     /// 该凭据已记录的估算费用（USD）。
@@ -387,12 +395,15 @@ pub struct RuntimeConfigResponse {
     pub dispatch_max_queued_requests: u32,
     pub credential_warmup_requests: u32,
     pub credential_warmup_selection_percent: u32,
+    pub credential_warmup_max_selection_percent: u32,
     pub scheduler_error_ewma_alpha: f64,
     pub scheduler_priority_weight: f64,
     pub scheduler_load_weight: f64,
     pub scheduler_error_weight: f64,
     pub scheduler_latency_weight: f64,
     pub scheduler_probation_weight: f64,
+    pub scheduler_selection_pressure_weight: f64,
+    pub scheduler_total_selection_weight: f64,
     pub scheduler_top_k: u32,
     pub compression_enabled: bool,
     pub whitespace_compression: bool,
@@ -447,6 +458,8 @@ pub struct UpdateRuntimeConfigRequest {
     #[serde(default)]
     pub credential_warmup_selection_percent: Option<u32>,
     #[serde(default)]
+    pub credential_warmup_max_selection_percent: Option<u32>,
+    #[serde(default)]
     pub scheduler_error_ewma_alpha: Option<f64>,
     #[serde(default)]
     pub scheduler_priority_weight: Option<f64>,
@@ -458,6 +471,10 @@ pub struct UpdateRuntimeConfigRequest {
     pub scheduler_latency_weight: Option<f64>,
     #[serde(default)]
     pub scheduler_probation_weight: Option<f64>,
+    #[serde(default)]
+    pub scheduler_selection_pressure_weight: Option<f64>,
+    #[serde(default)]
+    pub scheduler_total_selection_weight: Option<f64>,
     #[serde(default)]
     pub scheduler_top_k: Option<u32>,
     pub compression_enabled: bool,

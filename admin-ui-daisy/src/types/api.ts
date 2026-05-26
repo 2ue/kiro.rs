@@ -64,6 +64,10 @@ export interface CredentialStatusItem {
   inProbation: boolean
   probationRemainingSecs: number
   schedulerSelectionCount: number
+  recentSchedulerSelectionCount10s: number
+  recentSchedulerSelectionCount60s: number
+  recentSchedulerSelectionCount5m: number
+  schedulerSelectionPressure: number
   schedulerScore: number
   estimatedCostUsd: number
   pricedRequests: number
@@ -334,12 +338,15 @@ export interface RuntimeConfig {
   dispatchMaxQueuedRequests: number
   credentialWarmupRequests: number
   credentialWarmupSelectionPercent: number
+  credentialWarmupMaxSelectionPercent: number
   schedulerErrorEwmaAlpha: number
   schedulerPriorityWeight: number
   schedulerLoadWeight: number
   schedulerErrorWeight: number
   schedulerLatencyWeight: number
   schedulerProbationWeight: number
+  schedulerSelectionPressureWeight: number
+  schedulerTotalSelectionWeight: number
   schedulerTopK: number
   compressionEnabled: boolean
   whitespaceCompression: boolean

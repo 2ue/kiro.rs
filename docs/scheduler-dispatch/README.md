@@ -28,16 +28,22 @@ Implemented backend behavior:
 3. Cooldown is shared through Redis when Redis is configured, and cooldown writes are monotonic:
    a short later cooldown cannot shorten a longer active cooldown.
 4. Scheduler health is shared through Redis: transient streak, recent error-rate EWMA, latency
-   EWMA, last error kind/reason/time, probation state, and selection count.
+   EWMA, last error kind/reason/time, probation state, and recent selection windows.
 5. Success updates health and latency, but it no longer clears an active cooldown created by a
    concurrent failure.
 6. The existing `priority` and `balanced` modes remain supported, and a new `health_balanced`
-   mode selects among healthy candidates using score plus top-K weighted sampling.
+   mode selects among healthy candidates using score, recent selection pressure, and top-K weighted
+   sampling.
 7. Redis dispatch leases now support both per-credential capacity and optional global capacity in
    one atomic acquisition path.
 8. A bounded global dispatch queue can reject overload early instead of allowing unbounded waiters.
-9. Admin API snapshots expose per-credential health state and aggregate global capacity state.
-10. Both Admin UIs expose the new scheduler mode, runtime controls, and health/capacity state.
+9. Total scheduler selection count is persisted in Postgres, while 10s/60s/5m recent selection
+   counts are kept in Redis/local state for scheduling pressure and UI diagnosis.
+10. Warmup selection is target-share based: each warming credential receives a small target share,
+    capped by a total warmup traffic ceiling, so batch imports do not wait indefinitely for a tiny
+    fixed probability.
+11. Admin API snapshots expose per-credential health state and aggregate global capacity state.
+12. Both Admin UIs expose the new scheduler mode, runtime controls, and health/capacity state.
 
 ## Recommended runtime posture
 

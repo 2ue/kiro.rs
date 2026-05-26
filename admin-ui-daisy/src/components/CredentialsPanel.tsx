@@ -234,6 +234,21 @@ function CredentialCard({
             <div className="font-semibold">{credential.schedulerScore.toFixed(2)} / {credential.schedulerSelectionCount}</div>
           </div>
           <div>
+            <div className="text-[0.72rem] font-medium text-base-content/50">近期调度</div>
+            <div className="font-semibold">
+              {credential.recentSchedulerSelectionCount60s}/60s
+              <span className="ml-1 text-xs text-base-content/50">
+                10s {credential.recentSchedulerSelectionCount10s} / 5m {credential.recentSchedulerSelectionCount5m}
+              </span>
+            </div>
+          </div>
+          <div>
+            <div className="text-[0.72rem] font-medium text-base-content/50">调度压力</div>
+            <div className={credential.schedulerSelectionPressure > 1 ? 'font-semibold text-warning' : 'font-semibold'}>
+              {credential.schedulerSelectionPressure.toFixed(2)}
+            </div>
+          </div>
+          <div>
             <div className="text-[0.72rem] font-medium text-base-content/50">最近使用</div>
             <div className="font-semibold">{formatLastUsed(credential.lastUsedAt)}</div>
           </div>

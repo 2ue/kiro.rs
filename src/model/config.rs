@@ -555,6 +555,10 @@ pub struct Config {
     #[serde(default = "default_credential_warmup_selection_percent")]
     pub credential_warmup_selection_percent: u32,
 
+    /// 已有非预热凭据可用时，所有预热凭据合计最多承接的流量百分比。
+    #[serde(default = "default_credential_warmup_max_selection_percent")]
+    pub credential_warmup_max_selection_percent: u32,
+
     /// 输入压缩配置。默认不启用；启用后默认只做 whitespace 压缩。
     #[serde(default)]
     pub compression: CompressionConfig,
@@ -586,6 +590,14 @@ pub struct Config {
     /// 健康调度的恢复观察期惩罚权重。
     #[serde(default = "default_scheduler_probation_weight")]
     pub scheduler_probation_weight: f64,
+
+    /// 健康调度的近期选中压力权重，用于降低短窗口内被过度选中的凭据。
+    #[serde(default = "default_scheduler_selection_pressure_weight")]
+    pub scheduler_selection_pressure_weight: f64,
+
+    /// 健康调度的总选中次数权重。默认关闭，仅建议作为极弱长期均衡信号。
+    #[serde(default = "default_scheduler_total_selection_weight")]
+    pub scheduler_total_selection_weight: f64,
 
     /// 健康模式在得分最佳的前 N 个候选中加权抽样，降低并发抢占集中度。
     #[serde(default = "default_scheduler_top_k")]
@@ -763,6 +775,10 @@ fn default_credential_warmup_selection_percent() -> u32 {
     5
 }
 
+fn default_credential_warmup_max_selection_percent() -> u32 {
+    50
+}
+
 fn default_scheduler_error_ewma_alpha() -> f64 {
     0.2
 }
@@ -785,6 +801,14 @@ fn default_scheduler_latency_weight() -> f64 {
 
 fn default_scheduler_probation_weight() -> f64 {
     50.0
+}
+
+fn default_scheduler_selection_pressure_weight() -> f64 {
+    25.0
+}
+
+fn default_scheduler_total_selection_weight() -> f64 {
+    0.0
 }
 
 fn default_scheduler_top_k() -> u32 {
@@ -936,6 +960,8 @@ impl Default for Config {
             dispatch_max_queued_requests: 0,
             credential_warmup_requests: default_credential_warmup_requests(),
             credential_warmup_selection_percent: default_credential_warmup_selection_percent(),
+            credential_warmup_max_selection_percent:
+                default_credential_warmup_max_selection_percent(),
             compression: CompressionConfig::default(),
             load_balancing_mode: default_load_balancing_mode(),
             scheduler_error_ewma_alpha: default_scheduler_error_ewma_alpha(),
@@ -944,6 +970,8 @@ impl Default for Config {
             scheduler_error_weight: default_scheduler_error_weight(),
             scheduler_latency_weight: default_scheduler_latency_weight(),
             scheduler_probation_weight: default_scheduler_probation_weight(),
+            scheduler_selection_pressure_weight: default_scheduler_selection_pressure_weight(),
+            scheduler_total_selection_weight: default_scheduler_total_selection_weight(),
             scheduler_top_k: default_scheduler_top_k(),
             compat_profile: default_compat_profile(),
             extract_thinking: default_extract_thinking(),
@@ -1053,6 +1081,9 @@ mod tests {
         assert_eq!(config.dispatch_max_queued_requests, 0);
         assert_eq!(config.credential_warmup_requests, 3);
         assert_eq!(config.credential_warmup_selection_percent, 5);
+        assert_eq!(config.credential_warmup_max_selection_percent, 50);
+        assert_eq!(config.scheduler_selection_pressure_weight, 25.0);
+        assert_eq!(config.scheduler_total_selection_weight, 0.0);
         assert_eq!(config.scheduler_top_k, 3);
         assert!(!config.compression.enabled);
         assert!(config.compression.whitespace_compression);
