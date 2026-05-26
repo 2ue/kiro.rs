@@ -71,9 +71,13 @@ fn credential_from_row(row: PgRow) -> anyhow::Result<KiroCredentials> {
     let id: i64 = row.try_get("id")?;
     let priority: i32 = row.try_get("priority")?;
     let disabled: bool = row.try_get("disabled")?;
+    let created_at: DateTime<Utc> = row.try_get("created_at")?;
+    let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
     let value: serde_json::Value = row.try_get("data")?;
     let mut credential: KiroCredentials = serde_json::from_value(value)?;
     credential.id = Some(id as u64);
+    credential.created_at = Some(created_at.to_rfc3339());
+    credential.updated_at = Some(updated_at.to_rfc3339());
     credential.priority = priority.max(0) as u32;
     credential.disabled = disabled;
     credential.canonicalize_auth_method();
@@ -271,7 +275,7 @@ impl PostgresStore {
     pub async fn load_credentials(&self) -> anyhow::Result<Vec<KiroCredentials>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, priority, disabled, data
+            SELECT id, priority, disabled, data, created_at, updated_at
             FROM credentials
             WHERE deleted_at IS NULL
             ORDER BY priority ASC, id ASC
@@ -293,7 +297,7 @@ impl PostgresStore {
         }
         let row = sqlx::query(
             r#"
-            SELECT id, priority, disabled, data
+            SELECT id, priority, disabled, data, created_at, updated_at
             FROM credentials
             WHERE deleted_at IS NULL
               AND api_key_hash = $1
@@ -404,11 +408,13 @@ impl PostgresStore {
         let mut canonical = credential.clone();
         canonical.id = Some(id);
         canonical.canonicalize_auth_method();
-        self.upsert_credential(&canonical).await?;
-        Ok(canonical)
+        self.upsert_credential(&canonical).await
     }
 
-    pub async fn upsert_credential(&self, credential: &KiroCredentials) -> anyhow::Result<()> {
+    pub async fn upsert_credential(
+        &self,
+        credential: &KiroCredentials,
+    ) -> anyhow::Result<KiroCredentials> {
         let id = credential
             .id
             .ok_or_else(|| anyhow::anyhow!("保存到 PgSQL 的凭据必须先分配 id"))?;
@@ -417,7 +423,7 @@ impl PostgresStore {
         canonical.canonicalize_auth_method();
         let (auth_kind, api_key_hash, refresh_token_hash) = credential_hash_columns(&canonical);
         let value = serde_json::to_value(&canonical)?;
-        sqlx::query(
+        let row = sqlx::query(
             r#"
             INSERT INTO credentials (
                 id, priority, disabled, auth_kind, api_key_hash, refresh_token_hash,
@@ -433,6 +439,7 @@ impl PostgresStore {
                 data = EXCLUDED.data,
                 updated_at = now(),
                 deleted_at = NULL
+            RETURNING id, priority, disabled, data, created_at, updated_at
             "#,
         )
         .bind(id as i64)
@@ -442,10 +449,10 @@ impl PostgresStore {
         .bind(api_key_hash)
         .bind(refresh_token_hash)
         .bind(value)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
         .map_err(duplicate_credential_message)?;
-        Ok(())
+        credential_from_row(row)
     }
 
     pub async fn soft_delete_credential(&self, credential_id: u64) -> anyhow::Result<()> {
@@ -530,6 +537,78 @@ impl PostgresStore {
             );
         }
         Ok(states)
+    }
+
+    pub async fn load_credential_account_info(
+        &self,
+    ) -> anyhow::Result<HashMap<u64, CredentialAccountInfoRow>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT credential_id, subscription_title, current_usage, usage_limit,
+                   remaining, usage_percentage, next_reset_at, checked_at
+            FROM credential_account_info
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut info = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let credential_id: i64 = row.try_get("credential_id")?;
+            let checked_at: DateTime<Utc> = row.try_get("checked_at")?;
+            info.insert(
+                credential_id as u64,
+                CredentialAccountInfoRow {
+                    subscription_title: row.try_get("subscription_title")?,
+                    current_usage: row.try_get("current_usage")?,
+                    usage_limit: row.try_get("usage_limit")?,
+                    remaining: row.try_get("remaining")?,
+                    usage_percentage: row.try_get("usage_percentage")?,
+                    next_reset_at: row.try_get("next_reset_at")?,
+                    checked_at: checked_at.to_rfc3339(),
+                },
+            );
+        }
+        Ok(info)
+    }
+
+    pub async fn save_credential_account_info(
+        &self,
+        credential_id: u64,
+        info: &CredentialAccountInfoRow,
+    ) -> anyhow::Result<()> {
+        let checked_at = DateTime::parse_from_rfc3339(&info.checked_at)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        sqlx::query(
+            r#"
+            INSERT INTO credential_account_info (
+                credential_id, subscription_title, current_usage, usage_limit,
+                remaining, usage_percentage, next_reset_at, checked_at, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+            ON CONFLICT (credential_id) DO UPDATE
+            SET subscription_title = EXCLUDED.subscription_title,
+                current_usage = EXCLUDED.current_usage,
+                usage_limit = EXCLUDED.usage_limit,
+                remaining = EXCLUDED.remaining,
+                usage_percentage = EXCLUDED.usage_percentage,
+                next_reset_at = EXCLUDED.next_reset_at,
+                checked_at = EXCLUDED.checked_at,
+                updated_at = now()
+            "#,
+        )
+        .bind(credential_id as i64)
+        .bind(&info.subscription_title)
+        .bind(info.current_usage)
+        .bind(info.usage_limit)
+        .bind(info.remaining)
+        .bind(info.usage_percentage)
+        .bind(info.next_reset_at)
+        .bind(checked_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -1204,6 +1283,17 @@ pub struct CredentialRuntimeStateRow {
     pub warmup_remaining: u32,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct CredentialAccountInfoRow {
+    pub subscription_title: Option<String>,
+    pub current_usage: f64,
+    pub usage_limit: f64,
+    pub remaining: f64,
+    pub usage_percentage: f64,
+    pub next_reset_at: Option<f64>,
+    pub checked_at: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdminAuditLogRow {
@@ -1768,6 +1858,15 @@ ALTER TABLE credentials
 ALTER TABLE credentials
     ADD COLUMN IF NOT EXISTS refresh_token_hash TEXT;
 
+ALTER TABLE credentials
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+ALTER TABLE credentials
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+ALTER TABLE credentials
+    ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+
 CREATE INDEX IF NOT EXISTS idx_credentials_active_priority
     ON credentials (priority, id)
     WHERE deleted_at IS NULL;
@@ -1793,6 +1892,18 @@ CREATE TABLE IF NOT EXISTS credential_runtime_state (
     refresh_failure_count INTEGER NOT NULL DEFAULT 0,
     disabled_reason TEXT,
     warmup_remaining INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS credential_account_info (
+    credential_id BIGINT PRIMARY KEY REFERENCES credentials(id) ON DELETE CASCADE,
+    subscription_title TEXT,
+    current_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
+    usage_limit DOUBLE PRECISION NOT NULL DEFAULT 0,
+    remaining DOUBLE PRECISION NOT NULL DEFAULT 0,
+    usage_percentage DOUBLE PRECISION NOT NULL DEFAULT 0,
+    next_reset_at DOUBLE PRECISION,
+    checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

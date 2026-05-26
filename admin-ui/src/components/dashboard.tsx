@@ -438,6 +438,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
 
     setQueryingInfo(false)
+    queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    queryClient.invalidateQueries({ queryKey: ['credentials-page'] })
 
     if (failCount === 0) {
       toast.success(`查询完成：成功 ${successCount}/${ids.length}`)

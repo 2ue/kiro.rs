@@ -28,7 +28,7 @@ import {
   KamImportModal,
   type VerifyResult,
 } from '@/components/CredentialDialogs'
-import { formatLastUsed, formatNumber, formatUsd } from '@/lib/format'
+import { formatDate, formatLastUsed, formatNumber, formatUsd } from '@/lib/format'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
 import { extractErrorMessage } from '@/lib/utils'
 import {
@@ -55,6 +55,15 @@ function authLabel(authMethod: string | null) {
   if (authMethod === 'idc') return 'IdC'
   if (authMethod === 'social') return 'Social'
   return authMethod || 'Unknown'
+}
+
+function subscriptionLabel(credential: CredentialStatusItem, balance?: BalanceResponse) {
+  return balance?.subscriptionTitle || credential.accountInfo?.subscriptionTitle || credential.subscriptionTitle || '未知'
+}
+
+function accountInfoValue(credential: CredentialStatusItem, balance?: BalanceResponse) {
+  if (balance) return balance
+  return credential.accountInfo
 }
 
 function CredentialCard({
@@ -87,6 +96,7 @@ function CredentialCard({
   const queryClient = useQueryClient()
   const warmupTarget = Math.max(0, runtimeConfig.data?.credentialWarmupRequests ?? 3)
   const balanceVisible = loadingBalance || Boolean(balance)
+  const accountInfo = accountInfoValue(credential, balance)
 
   useEffect(() => {
     setPriorityValue(String(credential.priority))
@@ -184,6 +194,10 @@ function CredentialCard({
 
         <div className="credential-meta-grid">
           <div>
+            <div className="text-[0.72rem] font-medium text-base-content/50">订阅等级</div>
+            <div className="font-semibold">{loadingBalance ? <Loading size="sm" /> : subscriptionLabel(credential, balance)}</div>
+          </div>
+          <div>
             <div className="text-[0.72rem] font-medium text-base-content/50">优先级</div>
             {editingPriority ? (
               <Join className="mt-1">
@@ -212,6 +226,14 @@ function CredentialCard({
             <div className="font-semibold">{formatLastUsed(credential.lastUsedAt)}</div>
           </div>
           <div>
+            <div className="text-[0.72rem] font-medium text-base-content/50">创建时间</div>
+            <div className="font-semibold">{formatDate(credential.createdAt)}</div>
+          </div>
+          <div>
+            <div className="text-[0.72rem] font-medium text-base-content/50">更新时间</div>
+            <div className="font-semibold">{formatDate(credential.updatedAt)}</div>
+          </div>
+          <div>
             <div className="text-[0.72rem] font-medium text-base-content/50">估算费用</div>
             <div className="font-semibold">{formatUsd(credential.estimatedCostUsd)}</div>
           </div>
@@ -222,12 +244,30 @@ function CredentialCard({
                 <Loading size="sm" className="mt-1" />
               ) : balance ? (
                 <div>
-                  <div className="font-semibold">{balance.subscriptionTitle || '未知'}</div>
+                  <div className="font-semibold">{subscriptionLabel(credential, balance)}</div>
                   <div className="text-xs text-base-content/50">剩余 {formatUsd(balance.remaining)}</div>
                 </div>
               ) : null}
             </div>
-            )}
+          )}
+          {accountInfo && (
+            <>
+              <div>
+                <div className="text-[0.72rem] font-medium text-base-content/50">上次余量</div>
+                <div className="font-semibold">{formatUsd(accountInfo.remaining)}</div>
+                <div className="text-xs text-base-content/50">限额 {formatUsd(accountInfo.usageLimit)}</div>
+              </div>
+              <div>
+                <div className="text-[0.72rem] font-medium text-base-content/50">上次用量</div>
+                <div className="font-semibold">{formatUsd(accountInfo.currentUsage)}</div>
+                <div className="text-xs text-base-content/50">{accountInfo.usagePercentage.toFixed(1)}% 已用</div>
+              </div>
+              <div>
+                <div className="text-[0.72rem] font-medium text-base-content/50">信息查询</div>
+                <div className="font-semibold">{formatDate(accountInfo.checkedAt)}</div>
+              </div>
+            </>
+          )}
         </div>
 
         <div className="credential-actions">
@@ -378,6 +418,7 @@ export function CredentialsPanel() {
       }
     }
     setQueryingInfo(false)
+    invalidate()
     if (fail === 0) toast.success(`查询完成：成功 ${success}/${ids.length}`)
     else toast.warning(`查询完成：成功 ${success} 个，失败 ${fail} 个`)
   }

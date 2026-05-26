@@ -18,6 +18,14 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
 
+    /// 凭据创建时间（由 PgSQL credentials.created_at 提供，仅用于运行时展示）
+    #[serde(skip)]
+    pub created_at: Option<String>,
+
+    /// 凭据更新时间（由 PgSQL credentials.updated_at 提供，仅用于运行时展示）
+    #[serde(skip)]
+    pub updated_at: Option<String>,
+
     /// 访问令牌
     #[serde(skip_serializing_if = "Option::is_none")]
     pub access_token: Option<String>,
@@ -324,25 +332,8 @@ mod tests {
         let creds = KiroCredentials {
             id: None,
             access_token: Some("token".to_string()),
-            refresh_token: None,
-            profile_arn: None,
-            expires_at: None,
             auth_method: Some("social".to_string()),
-            client_id: None,
-            client_secret: None,
-            priority: 0,
-            region: None,
-            auth_region: None,
-            api_region: None,
-            machine_id: None,
-            email: None,
-            subscription_title: None,
-            proxy_url: None,
-            proxy_username: None,
-            proxy_password: None,
-            disabled: false,
-            kiro_api_key: None,
-            endpoint: None,
+            ..Default::default()
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -441,26 +432,9 @@ mod tests {
     fn test_region_field_serialization() {
         let creds = KiroCredentials {
             id: None,
-            access_token: None,
             refresh_token: Some("test".to_string()),
-            profile_arn: None,
-            expires_at: None,
-            auth_method: None,
-            client_id: None,
-            client_secret: None,
-            priority: 0,
             region: Some("eu-west-1".to_string()),
-            auth_region: None,
-            api_region: None,
-            machine_id: None,
-            email: None,
-            subscription_title: None,
-            proxy_url: None,
-            proxy_username: None,
-            proxy_password: None,
-            disabled: false,
-            kiro_api_key: None,
-            endpoint: None,
+            ..Default::default()
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -472,26 +446,8 @@ mod tests {
     fn test_region_field_none_not_serialized() {
         let creds = KiroCredentials {
             id: None,
-            access_token: None,
             refresh_token: Some("test".to_string()),
-            profile_arn: None,
-            expires_at: None,
-            auth_method: None,
-            client_id: None,
-            client_secret: None,
-            priority: 0,
-            region: None,
-            auth_region: None,
-            api_region: None,
-            machine_id: None,
-            email: None,
-            subscription_title: None,
-            proxy_url: None,
-            proxy_username: None,
-            proxy_password: None,
-            disabled: false,
-            kiro_api_key: None,
-            endpoint: None,
+            ..Default::default()
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -588,24 +544,11 @@ mod tests {
             id: Some(42),
             access_token: Some("token".to_string()),
             refresh_token: Some("refresh".to_string()),
-            profile_arn: None,
-            expires_at: None,
             auth_method: Some("social".to_string()),
-            client_id: None,
-            client_secret: None,
             priority: 3,
             region: Some("us-west-2".to_string()),
-            auth_region: None,
-            api_region: None,
             machine_id: Some("c".repeat(64)),
-            email: None,
-            subscription_title: None,
-            proxy_url: None,
-            proxy_username: None,
-            proxy_password: None,
-            disabled: false,
-            kiro_api_key: None,
-            endpoint: None,
+            ..Default::default()
         };
 
         let json = original.to_pretty_json().unwrap();

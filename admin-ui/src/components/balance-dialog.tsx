@@ -1,3 +1,5 @@
+import { useEffect } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import {
   Dialog,
   DialogContent,
@@ -16,10 +18,22 @@ interface BalanceDialogProps {
 
 export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialogProps) {
   const { data: balance, isLoading, error } = useCredentialBalance(credentialId)
+  const queryClient = useQueryClient()
+
+  useEffect(() => {
+    if (!balance) return
+    queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    queryClient.invalidateQueries({ queryKey: ['credentials-page'] })
+  }, [balance, queryClient])
 
   const formatDate = (timestamp: number | null) => {
     if (!timestamp) return '未知'
     return new Date(timestamp * 1000).toLocaleString('zh-CN')
+  }
+
+  const formatDateTime = (value: string | null | undefined) => {
+    if (!value) return '未知'
+    return new Date(value).toLocaleString('zh-CN', { hour12: false })
   }
 
   const formatNumber = (num: number) => {
@@ -67,6 +81,9 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
               <span className="text-lg font-semibold">
                 {balance.subscriptionTitle || '未知订阅类型'}
               </span>
+              <div className="mt-1 text-xs text-muted-foreground">
+                查询于 {formatDateTime(balance.checkedAt)}
+              </div>
             </div>
 
             {/* 使用进度 */}

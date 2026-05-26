@@ -54,6 +54,19 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
+function formatDateTime(value: string | null): string {
+  if (!value) return '未知'
+  return new Date(value).toLocaleString('zh-CN', {
+    hour12: false,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
+}
+
 function formatUsd(value: number): string {
   if (!Number.isFinite(value)) return '-'
   return new Intl.NumberFormat('en-US', {
@@ -87,6 +100,8 @@ export function CredentialCard({
   const runtimeConfig = useRuntimeConfig()
   const displayName = credential.email || credential.maskedApiKey || `凭据 #${credential.id}`
   const warmupTarget = Math.max(0, runtimeConfig.data?.credentialWarmupRequests ?? 3)
+  const accountInfo = balance || credential.accountInfo
+  const subscriptionTitle = balance?.subscriptionTitle || credential.accountInfo?.subscriptionTitle || credential.subscriptionTitle || '未知'
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -318,7 +333,7 @@ export function CredentialCard({
               <span className="font-medium">
                 {loadingBalance ? (
                   <Loader2 className="inline w-3 h-3 animate-spin" />
-                ) : balance?.subscriptionTitle || '未知'}
+                ) : subscriptionTitle}
               </span>
             </div>
             <div>
@@ -373,6 +388,14 @@ export function CredentialCard({
               <span className="text-muted-foreground">最后调用：</span>
               <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
             </div>
+            <div>
+              <span className="text-muted-foreground">创建时间：</span>
+              <span className="font-medium">{formatDateTime(credential.createdAt)}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">更新时间：</span>
+              <span className="font-medium">{formatDateTime(credential.updatedAt)}</span>
+            </div>
             {credential.email && (
               <div className="col-span-2">
                 <span className="text-muted-foreground">邮箱：</span>
@@ -386,16 +409,17 @@ export function CredentialCard({
               </div>
             )}
             <div className="col-span-2">
-              <span className="text-muted-foreground">剩余用量：</span>
+              <span className="text-muted-foreground">余额快照：</span>
               {loadingBalance ? (
                 <span className="text-sm ml-1">
                   <Loader2 className="inline w-3 h-3 animate-spin" /> 加载中...
                 </span>
-              ) : balance ? (
+              ) : accountInfo ? (
                 <span className="font-medium ml-1">
-                  {balance.remaining.toFixed(2)} / {balance.usageLimit.toFixed(2)}
+                  剩余 {formatUsd(accountInfo.remaining)} / 限额 {formatUsd(accountInfo.usageLimit)}
                   <span className="text-xs text-muted-foreground ml-1">
-                    ({(100 - balance.usagePercentage).toFixed(1)}% 剩余)
+                    已用 {formatUsd(accountInfo.currentUsage)}（{accountInfo.usagePercentage.toFixed(1)}%） · 查询于 {formatDateTime(accountInfo.checkedAt)}
+                    {accountInfo.nextResetAt ? ` · 重置 ${new Date(accountInfo.nextResetAt * 1000).toLocaleString('zh-CN', { hour12: false })}` : ''}
                   </span>
                 </span>
               ) : (

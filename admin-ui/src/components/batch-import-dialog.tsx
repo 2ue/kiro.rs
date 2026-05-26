@@ -10,7 +10,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
-import { setCredentialDisabled, testCredential } from '@/api/credentials'
+import { getCredentialBalance, setCredentialDisabled, testCredential } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
 import { parseCredentialImportFiles, parseCredentialImportText } from '@/lib/credential-import'
@@ -274,6 +274,11 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               model: DEFAULT_TEST_MODEL,
               prompt: DEFAULT_TEST_PROMPT,
             })
+            try {
+              await getCredentialBalance(addedCred.credentialId)
+            } catch (error) {
+              toast.warning(`凭据 #${addedCred.credentialId} 验活成功，但查询订阅信息失败: ${extractErrorMessage(error)}`)
+            }
 
             successCount++
             existingApiKeyHashes.add(credHash)
@@ -331,6 +336,11 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             model: DEFAULT_TEST_MODEL,
             prompt: DEFAULT_TEST_PROMPT,
           })
+          try {
+            await getCredentialBalance(addedCred.credentialId)
+          } catch (error) {
+            toast.warning(`凭据 #${addedCred.credentialId} 验活成功，但查询订阅信息失败: ${extractErrorMessage(error)}`)
+          }
 
           // 验活成功
           successCount++

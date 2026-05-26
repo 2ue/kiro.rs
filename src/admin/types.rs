@@ -6,6 +6,29 @@ use crate::model::config::{CompatProfile, CompressionConfig, ReportedUsageConfig
 
 // ============ 凭据状态 ============
 
+/// 凭据账号信息的最后一次查询快照。
+///
+/// 余额和用量来自上游 getUsageLimits，属于会变化的外部状态；这里表示“最后一次查询结果”，
+/// 前端应配合 checkedAt 展示，避免误解为实时值。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialAccountInfo {
+    /// 订阅类型
+    pub subscription_title: Option<String>,
+    /// 当前使用量
+    pub current_usage: f64,
+    /// 使用限额
+    pub usage_limit: f64,
+    /// 剩余额度
+    pub remaining: f64,
+    /// 使用百分比
+    pub usage_percentage: f64,
+    /// 下次重置时间（Unix 时间戳）
+    pub next_reset_at: Option<f64>,
+    /// 上次查询时间（RFC3339 格式）
+    pub checked_at: String,
+}
+
 /// 所有凭据状态响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,6 +69,10 @@ pub struct CredentialsPageResponse {
 pub struct CredentialStatusItem {
     /// 凭据唯一 ID
     pub id: u64,
+    /// 凭据创建时间（RFC3339 格式）
+    pub created_at: Option<String>,
+    /// 凭据更新时间（RFC3339 格式）
+    pub updated_at: Option<String>,
     /// 优先级（数字越小优先级越高）
     pub priority: u32,
     /// 是否被禁用
@@ -68,6 +95,11 @@ pub struct CredentialStatusItem {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
+    pub subscription_title: Option<String>,
+    /// 上次查询到的账号信息快照。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_info: Option<CredentialAccountInfo>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -263,6 +295,8 @@ pub struct TestCredentialResponse {
 pub struct BalanceResponse {
     /// 凭据 ID
     pub id: u64,
+    /// 查询时间（RFC3339 格式）
+    pub checked_at: String,
     /// 订阅类型
     pub subscription_title: Option<String>,
     /// 当前使用量

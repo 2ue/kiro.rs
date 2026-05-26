@@ -11,9 +11,10 @@ use serde_json::json;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, ClearInFlightRequest,
-    CredentialStatusItem, CredentialsPageResponse, CredentialsStatusResponse,
-    LoadBalancingModeResponse, RuntimeConfigResponse, SetLoadBalancingModeRequest,
-    SetWarmupRequest, TestCredentialRequest, TestCredentialResponse, UpdateRuntimeConfigRequest,
+    CredentialAccountInfo, CredentialStatusItem, CredentialsPageResponse,
+    CredentialsStatusResponse, LoadBalancingModeResponse, RuntimeConfigResponse,
+    SetLoadBalancingModeRequest, SetWarmupRequest, TestCredentialRequest, TestCredentialResponse,
+    UpdateRuntimeConfigRequest,
 };
 use crate::anthropic::{
     converter::map_model,
@@ -33,7 +34,7 @@ use crate::kiro::model::requests::{
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::MultiTokenManager;
-use crate::storage::postgres::{AdminAuditLogPage, PostgresStore};
+use crate::storage::postgres::{AdminAuditLogPage, CredentialAccountInfoRow, PostgresStore};
 use crate::storage::redis_cache::RedisStore;
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -176,14 +177,27 @@ impl AdminService {
         let snapshot = self.token_manager.snapshot();
         let default_endpoint = self.token_manager.runtime_config().default_endpoint;
         let cost_summary = self.usage_recorder.credential_cost_summary();
+        let account_info = match block_on_admin_store({
+            let store = self.postgres_store.clone();
+            async move { store.load_credential_account_info().await }
+        }) {
+            Ok(info) => info,
+            Err(err) => {
+                tracing::warn!("加载凭据账号信息快照失败: {}", err);
+                Default::default()
+            }
+        };
 
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
             .into_iter()
             .map(|entry| {
                 let cost = cost_summary.get(&entry.id).copied().unwrap_or_default();
+                let info = account_info.get(&entry.id).map(account_info_from_row);
                 CredentialStatusItem {
                     id: entry.id,
+                    created_at: entry.created_at,
+                    updated_at: entry.updated_at,
                     priority: entry.priority,
                     disabled: entry.disabled,
                     failure_count: entry.failure_count,
@@ -195,6 +209,8 @@ impl AdminService {
                     api_key_hash: entry.api_key_hash,
                     masked_api_key: entry.masked_api_key,
                     email: entry.email,
+                    subscription_title: entry.subscription_title,
+                    account_info: info,
                     success_count: entry.success_count,
                     last_used_at: entry.last_used_at.clone(),
                     has_proxy: entry.has_proxy,
@@ -304,12 +320,14 @@ impl AdminService {
             let now = Utc::now().timestamp() as f64;
             if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
                 tracing::debug!("凭据 #{} 余额命中 Redis 缓存", id);
+                self.save_account_info_snapshot(&cached.data).await;
                 return Ok(cached.data);
             }
         }
 
         // 缓存未命中或已过期，从上游获取
         let balance = self.fetch_balance(id).await?;
+        self.save_account_info_snapshot(&balance).await;
 
         let cached = CachedBalance {
             cached_at: Utc::now().timestamp() as f64,
@@ -420,6 +438,7 @@ impl AdminService {
 
         Ok(BalanceResponse {
             id,
+            checked_at: Utc::now().to_rfc3339(),
             subscription_title: usage.subscription_title().map(|s| s.to_string()),
             current_usage,
             usage_limit,
@@ -427,6 +446,29 @@ impl AdminService {
             usage_percentage,
             next_reset_at: usage.next_date_reset,
         })
+    }
+
+    async fn save_account_info_snapshot(&self, balance: &BalanceResponse) {
+        let info = CredentialAccountInfoRow {
+            subscription_title: balance.subscription_title.clone(),
+            current_usage: balance.current_usage,
+            usage_limit: balance.usage_limit,
+            remaining: balance.remaining,
+            usage_percentage: balance.usage_percentage,
+            next_reset_at: balance.next_reset_at,
+            checked_at: balance.checked_at.clone(),
+        };
+        if let Err(err) = self
+            .postgres_store
+            .save_credential_account_info(balance.id, &info)
+            .await
+        {
+            tracing::warn!(
+                credential_id = balance.id,
+                "保存凭据账号信息快照失败: {}",
+                err
+            );
+        }
     }
 
     /// 添加新凭据
@@ -451,6 +493,8 @@ impl AdminService {
         let email = req.email.clone();
         let new_cred = KiroCredentials {
             id: None,
+            created_at: None,
+            updated_at: None,
             access_token: None,
             refresh_token: req.refresh_token,
             profile_arn: None,
@@ -480,11 +524,10 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_add_error(e))?;
 
-        // 主动获取订阅等级，避免首次请求时 Free 账号绕过 Opus 模型过滤
-        if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
+        // 主动获取订阅等级并保存账号信息快照，避免首次请求时 Free 账号绕过 Opus 模型过滤
+        if let Err(e) = self.get_balance(credential_id).await {
             tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
         }
-        self.invalidate_balance_cache(credential_id);
         self.audit(
             "add_credential",
             "credential",
@@ -1129,6 +1172,18 @@ fn normalize_credentials_limit(limit: usize) -> usize {
 
 fn total_pages(total: usize, limit: usize) -> usize {
     if total == 0 { 0 } else { total.div_ceil(limit) }
+}
+
+fn account_info_from_row(row: &CredentialAccountInfoRow) -> CredentialAccountInfo {
+    CredentialAccountInfo {
+        subscription_title: row.subscription_title.clone(),
+        current_usage: row.current_usage,
+        usage_limit: row.usage_limit,
+        remaining: row.remaining,
+        usage_percentage: row.usage_percentage,
+        next_reset_at: row.next_reset_at,
+        checked_at: row.checked_at.clone(),
+    }
 }
 
 fn block_on_admin_store<T>(

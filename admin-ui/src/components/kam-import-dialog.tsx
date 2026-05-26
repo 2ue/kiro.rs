@@ -10,7 +10,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
-import { setCredentialDisabled, testCredential } from '@/api/credentials'
+import { getCredentialBalance, setCredentialDisabled, testCredential } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
 
@@ -343,6 +343,11 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             model: DEFAULT_TEST_MODEL,
             prompt: DEFAULT_TEST_PROMPT,
           })
+          try {
+            await getCredentialBalance(addedCred.credentialId)
+          } catch (error) {
+            toast.warning(`凭据 #${addedCred.credentialId} 验活成功，但查询订阅信息失败: ${extractErrorMessage(error)}`)
+          }
 
           successCount++
           existingTokenHashes.add(tokenHash)

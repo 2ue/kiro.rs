@@ -605,6 +605,10 @@ fn instant_from_elapsed_epoch_ms(target_ms: i64, now_ms: i64, now: Instant) -> I
 pub struct CredentialEntrySnapshot {
     /// 凭据唯一 ID
     pub id: u64,
+    /// 凭据创建时间（RFC3339 格式）
+    pub created_at: Option<String>,
+    /// 凭据更新时间（RFC3339 格式）
+    pub updated_at: Option<String>,
     /// 优先级
     pub priority: u32,
     /// 是否被禁用
@@ -625,6 +629,8 @@ pub struct CredentialEntrySnapshot {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 订阅等级（KIRO PRO+ / KIRO FREE 等）
+    pub subscription_title: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -2649,9 +2655,16 @@ impl MultiTokenManager {
         };
         let store = store.clone();
         let credential = credential.clone();
-        block_on_storage("保存凭据到 PgSQL", async move {
+        let saved = block_on_storage("保存凭据到 PgSQL", async move {
             store.upsert_credential(&credential).await
         })?;
+        if let Some(id) = saved.id {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                entry.credentials.created_at = saved.created_at;
+                entry.credentials.updated_at = saved.updated_at;
+            }
+        }
         Ok(true)
     }
 
@@ -3761,6 +3774,8 @@ impl MultiTokenManager {
                         .unwrap_or(0);
                     CredentialEntrySnapshot {
                         id: e.id,
+                        created_at: e.credentials.created_at.clone(),
+                        updated_at: e.credentials.updated_at.clone(),
                         priority: e.credentials.priority,
                         disabled: e.disabled,
                         failure_count: e.failure_count,
@@ -3799,6 +3814,7 @@ impl MultiTokenManager {
                             None
                         },
                         email: e.credentials.email.clone(),
+                        subscription_title: e.credentials.subscription_title.clone(),
                         success_count: e.success_count,
                         last_used_at: e.last_used_at.clone(),
                         has_proxy: e.credentials.proxy_url.is_some(),

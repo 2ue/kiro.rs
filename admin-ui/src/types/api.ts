@@ -20,6 +20,8 @@ export interface CredentialsPageQuery {
 // 单个凭据状态
 export interface CredentialStatusItem {
   id: number
+  createdAt: string | null
+  updatedAt: string | null
   priority: number
   disabled: boolean
   failureCount: number
@@ -31,6 +33,8 @@ export interface CredentialStatusItem {
   refreshTokenHash?: string
   apiKeyHash?: string
   maskedApiKey?: string
+  subscriptionTitle?: string
+  accountInfo?: CredentialAccountInfo
   successCount: number
   lastUsedAt: string | null
   hasProxy: boolean
@@ -54,9 +58,20 @@ export interface CredentialStatusItem {
   unpricedRequests: number
 }
 
+export interface CredentialAccountInfo {
+  subscriptionTitle: string | null
+  currentUsage: number
+  usageLimit: number
+  remaining: number
+  usagePercentage: number
+  nextResetAt: number | null
+  checkedAt: string
+}
+
 // 余额响应
 export interface BalanceResponse {
   id: number
+  checkedAt: string
   subscriptionTitle: string | null
   currentUsage: number
   usageLimit: number

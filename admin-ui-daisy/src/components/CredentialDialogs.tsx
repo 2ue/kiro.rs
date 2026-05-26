@@ -1,8 +1,9 @@
 import { AlertCircle, CheckCircle2, Download, FileUp, Loader2, Play, RotateCw, XCircle } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Alert, Button, Card, Checkbox, Form, Input, Loading, Modal, Progress, Select, Textarea } from 'react-daisyui'
-import { addCredential, deleteCredential, exportCredentials, setCredentialDisabled, testCredential } from '@/api/credentials'
+import { addCredential, deleteCredential, exportCredentials, getCredentialBalance, setCredentialDisabled, testCredential } from '@/api/credentials'
 import { Badge, FieldLabel, ModalShell } from '@/components/common'
 import { parseCredentialImportFiles, parseCredentialImportText } from '@/lib/credential-import'
 import { formatFullDate, formatUsd } from '@/lib/format'
@@ -319,6 +320,13 @@ export function BalanceModal({
   onClose: () => void
 }) {
   const balance = useCredentialBalance(open ? credentialId : null)
+  const queryClient = useQueryClient()
+
+  useEffect(() => {
+    if (!balance.data) return
+    queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    queryClient.invalidateQueries({ queryKey: ['credentials-page'] })
+  }, [balance.data, queryClient])
 
   return (
     <ModalShell open={open} title={`凭据 #${credentialId ?? '-'} 余额信息`} width="max-w-xl" onClose={onClose}>
@@ -342,7 +350,10 @@ export function BalanceModal({
 function BalanceContent({ balance }: { balance: BalanceResponse }) {
   return (
     <div className="space-y-5">
-      <div className="text-center text-xl font-semibold">{balance.subscriptionTitle || '未知订阅类型'}</div>
+      <div className="text-center">
+        <div className="text-xl font-semibold">{balance.subscriptionTitle || '未知订阅类型'}</div>
+        <div className="mt-1 text-xs text-base-content/60">查询于 {formatFullDate(balance.checkedAt)}</div>
+      </div>
       <div>
         <div className="mb-2 flex justify-between text-sm">
           <span>已使用: {formatUsd(balance.currentUsage)}</span>
@@ -589,6 +600,11 @@ export function BatchImportModal({
         addedId = added.credentialId
         await new Promise((resolve) => setTimeout(resolve, 1000))
         const tested = await testCredential(added.credentialId, { model: DEFAULT_TEST_MODEL, prompt: DEFAULT_TEST_PROMPT })
+        try {
+          await getCredentialBalance(added.credentialId)
+        } catch (error) {
+          toast.warning(`凭据 #${added.credentialId} 验活成功，但查询订阅信息失败: ${extractErrorMessage(error)}`)
+        }
         successCount += 1
         if (isApiKeyCred) existingApiKeyHashes.add(hash)
         else existingOauthHashes.add(hash)
@@ -772,6 +788,11 @@ export function KamImportModal({
         addedId = added.credentialId
         await new Promise((resolve) => setTimeout(resolve, 1000))
         const tested = await testCredential(added.credentialId, { model: DEFAULT_TEST_MODEL, prompt: DEFAULT_TEST_PROMPT })
+        try {
+          await getCredentialBalance(added.credentialId)
+        } catch (error) {
+          toast.warning(`凭据 #${added.credentialId} 验活成功，但查询订阅信息失败: ${extractErrorMessage(error)}`)
+        }
         successCount += 1
         existingTokenHashes.add(tokenHash)
         setResults((prev) =>
