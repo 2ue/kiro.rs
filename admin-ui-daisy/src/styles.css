@@ -1,0 +1,359 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  --shell-sidebar: #111827;
+  --shell-sidebar-muted: #94a3b8;
+  --shell-sidebar-border: rgb(255 255 255 / 0.08);
+  --page-max: 1480px;
+}
+
+html[data-theme='kiroDark'] {
+  color-scheme: dark;
+  --shell-sidebar: #060b16;
+  --shell-sidebar-muted: #8290a5;
+  --shell-sidebar-border: rgb(255 255 255 / 0.09);
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 20% -10%, color-mix(in srgb, oklch(var(--p)) 8%, transparent), transparent 32rem),
+    linear-gradient(180deg, color-mix(in srgb, oklch(var(--b1)) 52%, oklch(var(--b2)) 48%), oklch(var(--b2)) 18rem);
+  color: oklch(var(--bc));
+}
+
+button,
+input,
+textarea,
+select {
+  letter-spacing: 0;
+}
+
+.input,
+.select,
+.textarea {
+  background: oklch(var(--b1));
+  border-color: color-mix(in srgb, oklch(var(--b3)) 86%, transparent);
+  color: oklch(var(--bc));
+}
+
+.input:focus,
+.select:focus,
+.textarea:focus {
+  border-color: oklch(var(--p));
+  outline: 2px solid color-mix(in srgb, oklch(var(--p)) 18%, transparent);
+  outline-offset: 0;
+}
+
+.join .btn.cursor-default,
+.join .btn[disabled] {
+  background: color-mix(in srgb, oklch(var(--b2)) 82%, oklch(var(--b1)) 18%);
+  border-color: color-mix(in srgb, oklch(var(--b3)) 86%, transparent);
+  color: color-mix(in srgb, oklch(var(--bc)) 62%, transparent);
+  box-shadow: none;
+}
+
+.unit-addon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-width: 1px;
+  border-color: color-mix(in srgb, oklch(var(--b3)) 86%, transparent);
+  background: color-mix(in srgb, oklch(var(--b2)) 82%, oklch(var(--b1)) 18%);
+  padding-inline: 0.9rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: color-mix(in srgb, oklch(var(--bc)) 62%, transparent);
+}
+
+.table :where(th, td) {
+  white-space: nowrap;
+}
+
+.modal-box {
+  max-height: calc(100vh - 4rem);
+  border: 1px solid color-mix(in srgb, oklch(var(--b3)) 72%, transparent);
+  box-shadow: 0 24px 80px rgb(15 23 42 / 18%);
+}
+
+.glass-nav {
+  background: color-mix(in srgb, oklch(var(--b1)) 94%, transparent);
+  backdrop-filter: blur(16px);
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 17rem minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+.sidebar-surface {
+  background: var(--shell-sidebar);
+  color: #f8fafc;
+}
+
+.sidebar-nav-item {
+  position: relative;
+  min-height: 3.85rem;
+  border: 1px solid transparent;
+  appearance: none;
+  background: transparent;
+  font: inherit;
+}
+
+.sidebar-nav-item.is-active {
+  background: rgb(37 99 235 / 0.15);
+  border-color: rgb(96 165 250 / 0.32);
+  box-shadow: inset 3px 0 0 #60a5fa;
+}
+
+.workspace-surface {
+  background: transparent;
+}
+
+.page-hero {
+  border: 1px solid color-mix(in srgb, oklch(var(--b3)) 70%, transparent);
+  background:
+    radial-gradient(circle at 92% 10%, color-mix(in srgb, oklch(var(--p)) 10%, transparent), transparent 20rem),
+    linear-gradient(135deg, color-mix(in srgb, oklch(var(--b1)) 98%, transparent), color-mix(in srgb, oklch(var(--b1)) 90%, oklch(var(--b2)) 10%));
+  box-shadow: 0 1px 2px rgb(15 23 42 / 4%), 0 18px 50px rgb(15 23 42 / 5%);
+}
+
+.soft-panel {
+  border: 1px solid color-mix(in srgb, oklch(var(--b3)) 78%, transparent);
+  background: color-mix(in srgb, oklch(var(--b1)) 88%, oklch(var(--b2)) 12%);
+}
+
+.data-table :where(thead tr) {
+  background: color-mix(in srgb, oklch(var(--b2)) 58%, oklch(var(--b1)) 42%);
+}
+
+.data-table :where(th) {
+  color: color-mix(in srgb, oklch(var(--bc)) 70%, transparent);
+  font-size: 0.74rem;
+  font-weight: 650;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.data-table :where(th, td) {
+  padding-top: 0.56rem;
+  padding-bottom: 0.56rem;
+}
+
+.data-table :where(td) {
+  border-color: color-mix(in srgb, oklch(var(--b3)) 70%, transparent);
+  color: color-mix(in srgb, oklch(var(--bc)) 88%, transparent);
+}
+
+.data-table :where(tbody tr:nth-child(even)) {
+  background: color-mix(in srgb, oklch(var(--b2)) 34%, transparent);
+}
+
+.data-table :where(tbody tr:hover) {
+  background: color-mix(in srgb, oklch(var(--p)) 7%, oklch(var(--b1)) 93%);
+}
+
+.table-panel {
+  overflow-x: auto;
+  border-radius: var(--rounded-box, 0.5rem);
+  border: 1px solid color-mix(in srgb, oklch(var(--b3)) 72%, transparent);
+}
+
+.table-panel-tall {
+  max-height: 34rem;
+  overflow: auto;
+}
+
+.table-panel-tall thead {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.collapse {
+  background-image: none;
+}
+
+.collapse-title {
+  min-height: auto;
+}
+
+.form-control {
+  min-width: 0;
+}
+
+.btn {
+  font-weight: 500;
+  min-height: 2.25rem;
+  height: 2.25rem;
+  text-transform: none;
+}
+
+.btn-sm {
+  min-height: 2rem;
+  height: 2rem;
+}
+
+.btn-xs {
+  min-height: 1.5rem;
+  height: 1.5rem;
+}
+
+.btn-outline {
+  border-color: color-mix(in srgb, oklch(var(--b3)) 92%, oklch(var(--bc)) 8%);
+  color: color-mix(in srgb, oklch(var(--bc)) 84%, transparent);
+}
+
+.btn-outline:hover {
+  background: color-mix(in srgb, oklch(var(--b2)) 70%, oklch(var(--p)) 5%);
+  border-color: color-mix(in srgb, oklch(var(--bc)) 20%, oklch(var(--b3)) 80%);
+  color: oklch(var(--bc));
+}
+
+.btn-ghost {
+  color: color-mix(in srgb, oklch(var(--bc)) 76%, transparent);
+}
+
+.btn-ghost:hover {
+  background: color-mix(in srgb, oklch(var(--b2)) 74%, oklch(var(--p)) 6%);
+  color: oklch(var(--bc));
+}
+
+.btn-primary,
+.btn-secondary,
+.btn-accent {
+  box-shadow: 0 1px 0 rgb(255 255 255 / 14%) inset, 0 8px 18px rgb(15 23 42 / 8%);
+}
+
+.theme-toggle-btn {
+  border: 1px solid color-mix(in srgb, oklch(var(--p)) 28%, transparent);
+  background: color-mix(in srgb, oklch(var(--p)) 10%, oklch(var(--b1)) 90%);
+  color: color-mix(in srgb, oklch(var(--p)) 86%, oklch(var(--bc)) 14%);
+}
+
+.theme-toggle-btn:hover {
+  border-color: color-mix(in srgb, oklch(var(--p)) 42%, transparent);
+  background: color-mix(in srgb, oklch(var(--p)) 16%, oklch(var(--b1)) 84%);
+}
+
+.badge {
+  font-weight: 600;
+  border-color: transparent;
+}
+
+.card {
+  background-image: none;
+}
+
+.section-card {
+  border: 1px solid color-mix(in srgb, oklch(var(--b3)) 74%, transparent);
+  background: color-mix(in srgb, oklch(var(--b1)) 96%, transparent);
+  box-shadow: 0 1px 2px rgb(15 23 42 / 4%);
+}
+
+.section-card-header {
+  border-bottom: 1px solid color-mix(in srgb, oklch(var(--b3)) 72%, transparent);
+  padding: 1rem 1.25rem;
+}
+
+.metric-card {
+  border: 1px solid color-mix(in srgb, oklch(var(--b3)) 72%, transparent);
+  box-shadow: 0 1px 2px rgb(15 23 42 / 4%), 0 10px 26px rgb(15 23 42 / 3%);
+}
+
+.credential-card {
+  border: 1px solid color-mix(in srgb, oklch(var(--b3)) 76%, transparent);
+  background: color-mix(in srgb, oklch(var(--b1)) 98%, transparent);
+  box-shadow: 0 1px 2px rgb(15 23 42 / 4%);
+}
+
+.credential-card.is-current {
+  border-color: color-mix(in srgb, oklch(var(--p)) 92%, oklch(var(--b3)) 8%);
+  box-shadow: 0 0 0 1px color-mix(in srgb, oklch(var(--p)) 24%, transparent), 0 10px 28px rgb(37 99 235 / 7%);
+}
+
+.credential-meta-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.8rem 1rem;
+  font-size: 0.875rem;
+}
+
+.credential-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  border-top: 1px solid color-mix(in srgb, oklch(var(--b3)) 70%, transparent);
+  padding-top: 0.75rem;
+}
+
+.credential-actions .btn {
+  border-radius: 0.35rem;
+  padding-inline: 0.42rem;
+}
+
+.usage-record-list {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.usage-record-card {
+  border: 1px solid color-mix(in srgb, oklch(var(--b3)) 72%, transparent);
+  background: color-mix(in srgb, oklch(var(--b1)) 98%, transparent);
+  box-shadow: 0 1px 2px rgb(15 23 42 / 3%);
+}
+
+.usage-record-card:hover {
+  border-color: color-mix(in srgb, oklch(var(--p)) 24%, oklch(var(--b3)) 76%);
+}
+
+.usage-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.5rem;
+}
+
+@media (min-width: 768px) {
+  .usage-stat-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 1280px) {
+  .usage-stat-grid {
+    grid-template-columns: repeat(8, minmax(0, 1fr));
+  }
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 0.75rem;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.75rem;
+}
+
+@media (max-width: 1023px) {
+  .app-shell {
+    display: block;
+  }
+
+  main {
+    padding-left: 0.75rem !important;
+    padding-right: 0.75rem !important;
+  }
+}
