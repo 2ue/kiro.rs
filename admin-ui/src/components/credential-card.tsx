@@ -424,9 +424,9 @@ export function CredentialCard({
                 </span>
               ) : accountInfo ? (
                 <span className="font-medium ml-1">
-                  {formatCredits(accountInfo.currentUsage)} / {formatCredits(accountInfo.usageLimit)}
+                  {formatCredits(accountInfo.currentUsage)}/{formatCredits(accountInfo.usageLimit)}
                   <span className="text-xs text-muted-foreground ml-1">
-                    {accountInfo.usagePercentage.toFixed(1)}% · {formatDateTime(accountInfo.checkedAt)}
+                    {formatDateTime(accountInfo.checkedAt)}
                     {accountInfo.nextResetAt ? ` · 重置 ${new Date(accountInfo.nextResetAt * 1000).toLocaleString('zh-CN', { hour12: false })}` : ''}
                   </span>
                 </span>

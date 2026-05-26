@@ -94,12 +94,9 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
             <div className="space-y-2">
               <div className="flex justify-between text-sm">
                 <span>Credits</span>
-                <span>{formatCredits(balance.currentUsage)} / {formatCredits(balance.usageLimit)}</span>
+                <span>{formatCredits(balance.currentUsage)}/{formatCredits(balance.usageLimit)}</span>
               </div>
               <Progress value={balance.usagePercentage} />
-              <div className="text-center text-sm text-muted-foreground">
-                {balance.usagePercentage.toFixed(1)}% 已用
-              </div>
             </div>
 
             <div className="border-t pt-4 text-center text-sm">

@@ -357,10 +357,9 @@ function BalanceContent({ balance }: { balance: BalanceResponse }) {
       <div>
         <div className="mb-2 flex justify-between text-sm">
           <span>Credits</span>
-          <span>{formatCredits(balance.currentUsage)} / {formatCredits(balance.usageLimit)}</span>
+          <span>{formatCredits(balance.currentUsage)}/{formatCredits(balance.usageLimit)}</span>
         </div>
         <Progress color="primary" value={balance.usagePercentage} max={100} />
-        <div className="mt-2 text-center text-sm text-base-content/60">{balance.usagePercentage.toFixed(1)}% 已用</div>
       </div>
       <div className="text-center text-xs text-base-content/60">
         下次重置: {balance.nextResetAt ? new Date(balance.nextResetAt * 1000).toLocaleString('zh-CN') : '未知'}

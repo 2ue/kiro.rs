@@ -243,8 +243,8 @@ function CredentialCard({
                 <Loading size="sm" className="mt-1" />
               ) : accountInfo ? (
                 <>
-                  <div className="font-semibold">{formatCredits(accountInfo.currentUsage)} / {formatCredits(accountInfo.usageLimit)}</div>
-                  <div className="text-xs text-base-content/50">{accountInfo.usagePercentage.toFixed(1)}% · {formatDate(accountInfo.checkedAt)}</div>
+                  <div className="font-semibold">{formatCredits(accountInfo.currentUsage)}/{formatCredits(accountInfo.usageLimit)}</div>
+                  <div className="text-xs text-base-content/50">{formatDate(accountInfo.checkedAt)}</div>
                 </>
               ) : null}
             </div>
