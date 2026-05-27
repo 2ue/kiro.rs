@@ -451,7 +451,7 @@ pub struct Config {
     pub count_tokens_auth_type: String,
 
     /// HTTP 代理地址（可选）
-    /// 支持格式: http://host:port, https://host:port, socks5://host:port
+    /// 支持格式: http://host:port, https://host:port, socks5://host:port, socks5h://host:port
     #[serde(default)]
     pub proxy_url: Option<String>,
 

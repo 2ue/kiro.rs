@@ -69,7 +69,7 @@ export function AddCredentialModal({
   const [form, setForm] = useState(initialCredentialForm)
   const add = useAddCredential()
   const proxyResources = useProxyResources()
-  const proxyResourceOptions = proxyResources.data?.resources || []
+  const proxyResourceOptions = (proxyResources.data?.resources || []).filter((resource) => resource.enabled)
   const isApiKey = form.authMethod === 'api_key'
 
   useEffect(() => {
@@ -114,9 +114,6 @@ export function AddCredentialModal({
         email: form.email.trim() || undefined,
         priority,
         machineId: form.machineId.trim() || undefined,
-        proxyUrl: form.proxyUrl.trim() || undefined,
-        proxyUsername: form.proxyUsername.trim() || undefined,
-        proxyPassword: form.proxyPassword.trim() || undefined,
         proxyResourceId: form.proxyResourceId ? Number(form.proxyResourceId) : undefined,
         endpoint: form.endpoint.trim() || undefined,
       },
@@ -185,24 +182,15 @@ export function AddCredentialModal({
           <FieldLabel title="端点" description="留空使用全局 defaultEndpoint">
             <Input bordered size="sm" value={form.endpoint} onChange={(event) => update('endpoint', event.target.value)} placeholder="ide / cli" />
           </FieldLabel>
-          <FieldLabel title="代理资源" description="未填写代理 URL 时生效">
+          <FieldLabel title="代理资源" description="新增凭据会立即验证 Token，只能选择已启用的代理资源">
             <Select bordered size="sm" value={form.proxyResourceId} onChange={(event) => update('proxyResourceId', event.target.value)}>
               <Select.Option value="">不绑定</Select.Option>
               {proxyResourceOptions.map((resource) => (
-                <Select.Option key={resource.id} value={String(resource.id)} disabled={!resource.enabled}>
-                  {resource.name}{resource.enabled ? '' : '（已禁用）'}
+                <Select.Option key={resource.id} value={String(resource.id)}>
+                  {resource.name}
                 </Select.Option>
               ))}
             </Select>
-          </FieldLabel>
-          <FieldLabel title="代理 URL" description='留空使用全局代理，"direct" 表示直连'>
-            <Input bordered size="sm" value={form.proxyUrl} onChange={(event) => update('proxyUrl', event.target.value)} />
-          </FieldLabel>
-          <FieldLabel title="代理用户名">
-            <Input bordered size="sm" value={form.proxyUsername} onChange={(event) => update('proxyUsername', event.target.value)} />
-          </FieldLabel>
-          <FieldLabel title="代理密码">
-            <Input bordered size="sm" type="password" value={form.proxyPassword} onChange={(event) => update('proxyPassword', event.target.value)} />
           </FieldLabel>
         </div>
         <Modal.Actions>
@@ -325,6 +313,8 @@ export function CredentialTestModal({
 interface VerificationResult {
   index: number
   status: 'pending' | 'checking' | 'verifying' | 'verified' | 'duplicate' | 'failed' | 'skipped'
+  credential?: AddCredentialRequest
+  account?: KamAccount
   error?: string
   model?: string
   response?: string
@@ -457,19 +447,23 @@ export function BatchImportModal({
     if (!result.credentials.length && !result.errors.length) toast.error('没有读取到有效凭据')
   }
 
-  const run = async () => {
+  const run = async (retryCredentials?: AddCredentialRequest[]) => {
     let credentials: AddCredentialRequest[]
-    try {
-      credentials = parseCredentialImportText(jsonInput)
-    } catch (error) {
-      toast.error(`JSON 格式错误: ${extractErrorMessage(error)}`)
-      return
+    if (retryCredentials) {
+      credentials = retryCredentials
+    } else {
+      try {
+        credentials = parseCredentialImportText(jsonInput)
+      } catch (error) {
+        toast.error(`JSON 格式错误: ${extractErrorMessage(error)}`)
+        return
+      }
     }
     if (!credentials.length) return toast.error('没有可导入的凭据')
 
     setImporting(true)
     setProgress({ current: 0, total: credentials.length })
-    setResults(credentials.map((_, index) => ({ index: index + 1, status: 'pending' })))
+    setResults(credentials.map((credential, index) => ({ index: index + 1, status: 'pending', credential })))
 
     const existingOauthHashes = new Set(existingCredentials.map((item) => item.refreshTokenHash).filter((item): item is string => Boolean(item)))
     const existingApiKeyHashes = new Set(existingCredentials.map((item) => item.apiKeyHash).filter((item): item is string => Boolean(item)))
@@ -582,6 +576,20 @@ export function BatchImportModal({
     else toast.info(`验活完成：成功 ${successCount} 个，重复 ${duplicateCount} 个，失败 ${failCount} 个`)
   }
 
+  const failedCredentials = results
+    .filter((result): result is VerificationResult & { credential: AddCredentialRequest } => (
+      result.status === 'failed' && Boolean(result.credential)
+    ))
+    .map((result) => result.credential)
+
+  const retryFailed = async () => {
+    if (!failedCredentials.length) {
+      toast.error('没有可重试的失败凭据')
+      return
+    }
+    await run(failedCredentials)
+  }
+
   return (
     <ModalShell open={open} title="批量导入凭据（自动验活）" width="max-w-4xl" onClose={() => { if (!importing) { reset(); onClose() } }}>
       <div className="space-y-4">
@@ -607,8 +615,14 @@ export function BatchImportModal({
             {results.length ? '关闭' : '取消'}
           </Button>
           {results.length === 0 && (
-            <Button type="button" color="primary" size="sm" disabled={importing || !jsonInput.trim()} onClick={run}>
+            <Button type="button" color="primary" size="sm" disabled={importing || !jsonInput.trim()} onClick={() => run()}>
               开始导入并验活
+            </Button>
+          )}
+          {results.length > 0 && failedCredentials.length > 0 && (
+            <Button type="button" color="primary" size="sm" disabled={importing} onClick={retryFailed}>
+              <RotateCw className="h-4 w-4" />
+              重试失败账号
             </Button>
           )}
         </Modal.Actions>
@@ -671,13 +685,17 @@ export function KamImportModal({
     if (result.errors.length) toast.warning(`部分文件未读取: ${result.errors.slice(0, 3).join('；')}`)
   }
 
-  const run = async () => {
+  const run = async (retryAccounts?: KamAccount[]) => {
     let accounts: KamAccount[]
-    try {
-      accounts = parseKamJson(jsonInput)
-    } catch (error) {
-      toast.error(`JSON 格式错误: ${extractErrorMessage(error)}`)
-      return
+    if (retryAccounts) {
+      accounts = retryAccounts
+    } else {
+      try {
+        accounts = parseKamJson(jsonInput)
+      } catch (error) {
+        toast.error(`JSON 格式错误: ${extractErrorMessage(error)}`)
+        return
+      }
     }
     if (!accounts.length) return toast.error('没有可导入的账号')
 
@@ -687,6 +705,7 @@ export function KamImportModal({
       index: index + 1,
       status: skipErrorAccounts && account.status === 'error' ? 'skipped' : 'pending',
       email: account.email || account.nickname,
+      account,
     })))
 
     const existingTokenHashes = new Set(existingCredentials.map((item) => item.refreshTokenHash).filter((item): item is string => Boolean(item)))
@@ -768,6 +787,20 @@ export function KamImportModal({
     toast.info(`导入完成：成功 ${successCount}，重复 ${duplicateCount}，失败 ${failCount}，跳过 ${skippedCount}`)
   }
 
+  const failedAccounts = results
+    .filter((result): result is VerificationResult & { account: KamAccount } => (
+      result.status === 'failed' && Boolean(result.account)
+    ))
+    .map((result) => result.account)
+
+  const retryFailed = async () => {
+    if (!failedAccounts.length) {
+      toast.error('没有可重试的失败账号')
+      return
+    }
+    await run(failedAccounts)
+  }
+
   const errorCount = preview.accounts.filter((account) => account.status === 'error').length
 
   return (
@@ -807,8 +840,14 @@ export function KamImportModal({
             {results.length ? '关闭' : '取消'}
           </Button>
           {results.length === 0 && (
-            <Button type="button" color="primary" size="sm" disabled={importing || !jsonInput.trim() || Boolean(preview.error) || !preview.accounts.length} onClick={run}>
+            <Button type="button" color="primary" size="sm" disabled={importing || !jsonInput.trim() || Boolean(preview.error) || !preview.accounts.length} onClick={() => run()}>
               开始导入并验活
+            </Button>
+          )}
+          {results.length > 0 && failedAccounts.length > 0 && (
+            <Button type="button" color="primary" size="sm" disabled={importing} onClick={retryFailed}>
+              <RotateCw className="h-4 w-4" />
+              重试失败账号
             </Button>
           )}
         </Modal.Actions>

@@ -729,13 +729,20 @@ impl AdminService {
     }
 
     pub fn delete_proxy_resource(&self, id: u64) -> Result<(), AdminServiceError> {
-        let deleted = block_on_admin_store({
+        let delete_result = block_on_admin_store({
             let store = self.postgres_store.clone();
-            async move { store.soft_delete_proxy_resource(id).await }
+            async move { store.soft_delete_proxy_resource_if_unbound(id).await }
         })
         .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-        if !deleted {
-            return Err(AdminServiceError::NotFound { id });
+        match delete_result {
+            None => return Err(AdminServiceError::NotFound { id }),
+            Some(credential_count) if credential_count > 0 => {
+                return Err(AdminServiceError::Conflict(format!(
+                    "代理资源仍有 {} 个凭据绑定，请先解绑后再删除",
+                    credential_count
+                )));
+            }
+            Some(_) => {}
         }
         self.invalidate_all_credential_caches();
         self.reload_proxy_resources_after_admin_change();
@@ -1481,6 +1488,7 @@ impl AdminService {
             || msg.contains("kiroApiKey 重复")
             || msg.contains("缺少 kiroApiKey")
             || msg.contains("kiroApiKey 为空")
+            || msg.contains("代理资源不存在")
             || msg.contains("代理资源不存在或已禁用")
             || msg.contains("凭证已过期或无效")
             || msg.contains("权限不足")
@@ -1608,13 +1616,13 @@ fn optional_trimmed(value: Option<String>) -> Option<String> {
 fn validate_proxy_url(value: &str) -> Result<String, AdminServiceError> {
     let parsed = url::Url::parse(value).map_err(|_| {
         AdminServiceError::InvalidCredential(
-            "代理 URL 必须是 http://、https:// 或 socks5:// 开头的完整地址".to_string(),
+            "代理 URL 必须是 http://、https://、socks5:// 或 socks5h:// 开头的完整地址".to_string(),
         )
     })?;
     match parsed.scheme() {
-        "http" | "https" | "socks5" => Ok(value.to_string()),
+        "http" | "https" | "socks5" | "socks5h" => Ok(value.to_string()),
         scheme => Err(AdminServiceError::InvalidCredential(format!(
-            "不支持的代理协议: {}，仅支持 http/https/socks5",
+            "不支持的代理协议: {}，仅支持 http/https/socks5/socks5h",
             scheme
         ))),
     }

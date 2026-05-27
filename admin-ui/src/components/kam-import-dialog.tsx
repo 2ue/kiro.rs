@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react'
 import { toast } from 'sonner'
-import { CheckCircle2, XCircle, AlertCircle, Loader2, FileUp } from 'lucide-react'
+import { CheckCircle2, XCircle, AlertCircle, Loader2, FileUp, RotateCw } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -39,6 +39,7 @@ interface KamAccount {
 interface VerificationResult {
   index: number
   status: 'pending' | 'checking' | 'verifying' | 'verified' | 'duplicate' | 'failed' | 'skipped'
+  account?: KamAccount
   error?: string
   model?: string
   response?: string
@@ -225,25 +226,29 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     }
   }
 
-  const handleImport = async () => {
-    // 先单独解析 JSON，给出精准的错误提示
+  const handleImport = async (retryAccounts?: KamAccount[]) => {
     let validAccounts: KamAccount[]
-    try {
-      const accounts = parseKamJson(jsonInput)
+    if (retryAccounts) {
+      validAccounts = retryAccounts
+    } else {
+      // 先单独解析 JSON，给出精准的错误提示
+      try {
+        const accounts = parseKamJson(jsonInput)
 
-      if (accounts.length === 0) {
-        toast.error('没有可导入的账号')
+        if (accounts.length === 0) {
+          toast.error('没有可导入的账号')
+          return
+        }
+
+        validAccounts = accounts.filter(a => a.credentials?.refreshToken)
+        if (validAccounts.length === 0) {
+          toast.error('没有包含有效 refreshToken 的账号')
+          return
+        }
+      } catch (error) {
+        toast.error('JSON 格式错误: ' + extractErrorMessage(error))
         return
       }
-
-      validAccounts = accounts.filter(a => a.credentials?.refreshToken)
-      if (validAccounts.length === 0) {
-        toast.error('没有包含有效 refreshToken 的账号')
-        return
-      }
-    } catch (error) {
-      toast.error('JSON 格式错误: ' + extractErrorMessage(error))
-      return
     }
 
     try {
@@ -254,9 +259,9 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       // 初始化结果，标记 error 状态的账号
       const initialResults: VerificationResult[] = validAccounts.map((account, i) => {
         if (skipErrorAccounts && account.status === 'error') {
-          return { index: i + 1, status: 'skipped' as const, email: account.email || account.nickname }
+          return { index: i + 1, status: 'skipped' as const, email: account.email || account.nickname, account }
         }
-        return { index: i + 1, status: 'pending' as const, email: account.email || account.nickname }
+        return { index: i + 1, status: 'pending' as const, email: account.email || account.nickname, account }
       })
       setResults(initialResults)
 
@@ -412,6 +417,20 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     } finally {
       setImporting(false)
     }
+  }
+
+  const failedAccounts = results
+    .filter((result): result is VerificationResult & { account: KamAccount } => (
+      result.status === 'failed' && Boolean(result.account)
+    ))
+    .map((result) => result.account)
+
+  const handleRetryFailed = async () => {
+    if (failedAccounts.length === 0) {
+      toast.error('没有可重试的失败账号')
+      return
+    }
+    await handleImport(failedAccounts)
   }
 
   const getStatusIcon = (status: VerificationResult['status']) => {
@@ -608,10 +627,21 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           >
             {importing ? '导入中...' : results.length > 0 ? '关闭' : '取消'}
           </Button>
+          {results.length > 0 && failedAccounts.length > 0 && (
+            <Button
+              type="button"
+              variant="outline"
+              onClick={handleRetryFailed}
+              disabled={importing}
+            >
+              <RotateCw className="h-4 w-4 mr-2" />
+              重试失败账号
+            </Button>
+          )}
           {results.length === 0 && (
             <Button
               type="button"
-              onClick={handleImport}
+              onClick={() => handleImport()}
               disabled={importing || !jsonInput.trim() || previewAccounts.length === 0 || !!parseError}
             >
               开始导入并验活

@@ -46,7 +46,7 @@ export interface CredentialStatusItem {
   proxyResourceId?: number
   proxyResourceName?: string
   effectiveProxyUrl?: string
-  effectiveProxySource: 'credential' | 'resource' | 'global' | 'direct' | 'none'
+  effectiveProxySource: 'credential' | 'resource' | 'resource_disabled' | 'resource_missing' | 'global' | 'direct' | 'none'
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string

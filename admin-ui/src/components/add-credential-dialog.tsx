@@ -31,15 +31,12 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [email, setEmail] = useState('')
   const [priority, setPriority] = useState('0')
   const [machineId, setMachineId] = useState('')
-  const [proxyUrl, setProxyUrl] = useState('')
-  const [proxyUsername, setProxyUsername] = useState('')
-  const [proxyPassword, setProxyPassword] = useState('')
   const [proxyResourceId, setProxyResourceId] = useState('')
   const [endpoint, setEndpoint] = useState('')
 
   const { mutate, isPending } = useAddCredential()
   const proxyResources = useProxyResources()
-  const proxyResourceOptions = proxyResources.data?.resources || []
+  const proxyResourceOptions = (proxyResources.data?.resources || []).filter(resource => resource.enabled)
 
   const resetForm = () => {
     setRefreshToken('')
@@ -52,9 +49,6 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setEmail('')
     setPriority('0')
     setMachineId('')
-    setProxyUrl('')
-    setProxyUsername('')
-    setProxyPassword('')
     setProxyResourceId('')
     setEndpoint('')
   }
@@ -72,9 +66,6 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     email?: string
     priority?: number
     machineId?: string
-    proxyUrl?: string
-    proxyUsername?: string
-    proxyPassword?: string
     proxyResourceId?: number | null
     endpoint?: string
   }) => {
@@ -88,9 +79,6 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setEmail(credential.email || '')
     setPriority(String(credential.priority ?? 0))
     setMachineId(credential.machineId || '')
-    setProxyUrl(credential.proxyUrl || '')
-    setProxyUsername(credential.proxyUsername || '')
-    setProxyPassword(credential.proxyPassword || '')
     setProxyResourceId(credential.proxyResourceId ? String(credential.proxyResourceId) : '')
     setEndpoint(credential.endpoint || '')
   }
@@ -156,9 +144,6 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         email: email.trim() || undefined,
         priority: parsedPriority,
         machineId: machineId.trim() || undefined,
-        proxyUrl: proxyUrl.trim() || undefined,
-        proxyUsername: proxyUsername.trim() || undefined,
-        proxyPassword: proxyPassword.trim() || undefined,
         proxyResourceId: proxyResourceId ? Number(proxyResourceId) : undefined,
         endpoint: endpoint.trim() || undefined,
       },
@@ -379,7 +364,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
             {/* 代理配置 */}
             <div className="space-y-2">
-              <label className="text-sm font-medium">代理配置</label>
+              <label className="text-sm font-medium">代理资源</label>
               <select
                 id="proxyResourceId"
                 value={proxyResourceId}
@@ -389,37 +374,13 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               >
                 <option value="">不绑定代理资源</option>
                 {proxyResourceOptions.map((resource) => (
-                  <option key={resource.id} value={resource.id} disabled={!resource.enabled}>
-                    {resource.name}{resource.enabled ? '' : '（已禁用）'}
+                  <option key={resource.id} value={resource.id}>
+                    {resource.name}
                   </option>
                 ))}
               </select>
-              <Input
-                id="proxyUrl"
-                placeholder='代理 URL（留空使用全局配置，"direct" 不使用代理）'
-                value={proxyUrl}
-                onChange={(e) => setProxyUrl(e.target.value)}
-                disabled={isPending}
-              />
-              <div className="grid grid-cols-2 gap-2">
-                <Input
-                  id="proxyUsername"
-                  placeholder="代理用户名"
-                  value={proxyUsername}
-                  onChange={(e) => setProxyUsername(e.target.value)}
-                  disabled={isPending}
-                />
-                <Input
-                  id="proxyPassword"
-                  type="password"
-                  placeholder="代理密码"
-                  value={proxyPassword}
-                  onChange={(e) => setProxyPassword(e.target.value)}
-                  disabled={isPending}
-                />
-              </div>
               <p className="text-xs text-muted-foreground">
-                代理 URL 优先于代理资源。留空时使用绑定资源；都不设置则使用全局代理。输入 "direct" 可显式不使用代理
+                新增凭据会立即验证 Token，只能选择已启用的代理资源；不选择则使用全局代理或直连配置。
               </p>
             </div>
           </div>

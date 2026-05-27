@@ -570,6 +570,64 @@ impl PostgresStore {
         row.map(proxy_resource_from_row).transpose()
     }
 
+    pub async fn soft_delete_proxy_resource_if_unbound(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<Option<u64>> {
+        let mut tx = self.pool.begin().await?;
+        let exists = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT id
+            FROM proxy_resources
+            WHERE id = $1 AND deleted_at IS NULL
+            FOR UPDATE
+            "#,
+        )
+        .bind(id as i64)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if exists.is_none() {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+
+        let credential_count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM credentials
+            WHERE deleted_at IS NULL
+              AND (data->>'proxyResourceId') ~ '^[0-9]+$'
+              AND (data->>'proxyResourceId')::BIGINT = $1
+            "#,
+        )
+        .bind(id as i64)
+        .fetch_one(&mut *tx)
+        .await?;
+        let credential_count = credential_count.max(0) as u64;
+
+        if credential_count > 0 {
+            tx.rollback().await?;
+            return Ok(Some(credential_count));
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE proxy_resources
+            SET deleted_at = now(),
+                enabled = false,
+                updated_at = now()
+            WHERE id = $1 AND deleted_at IS NULL
+            "#,
+        )
+        .bind(id as i64)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(Some(0))
+    }
+
     pub async fn insert_proxy_resource(
         &self,
         resource: &CreateProxyResourceRow,
@@ -629,44 +687,6 @@ impl PostgresStore {
         .await?;
 
         self.get_proxy_resource(id).await
-    }
-
-    pub async fn soft_delete_proxy_resource(&self, id: u64) -> anyhow::Result<bool> {
-        let mut tx = self.pool.begin().await?;
-        let result = sqlx::query(
-            r#"
-            UPDATE proxy_resources
-            SET deleted_at = now(),
-                enabled = false,
-                updated_at = now()
-            WHERE id = $1 AND deleted_at IS NULL
-            "#,
-        )
-        .bind(id as i64)
-        .execute(&mut *tx)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            tx.rollback().await?;
-            return Ok(false);
-        }
-
-        sqlx::query(
-            r#"
-            UPDATE credentials
-            SET data = data - 'proxyResourceId',
-                updated_at = now()
-            WHERE deleted_at IS NULL
-              AND (data->>'proxyResourceId') ~ '^[0-9]+$'
-              AND (data->>'proxyResourceId')::BIGINT = $1
-            "#,
-        )
-        .bind(id as i64)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-        Ok(true)
     }
 
     pub async fn delete_credential_stats_and_runtime(

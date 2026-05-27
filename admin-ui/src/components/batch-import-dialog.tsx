@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { CheckCircle2, XCircle, AlertCircle, Loader2, FileUp } from 'lucide-react'
+import { CheckCircle2, XCircle, AlertCircle, Loader2, FileUp, RotateCw } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -26,6 +26,7 @@ type CredentialInput = AddCredentialRequest & { region?: string }
 interface VerificationResult {
   index: number
   status: 'pending' | 'checking' | 'verifying' | 'verified' | 'duplicate' | 'failed'
+  credential?: CredentialInput
   error?: string
   model?: string
   response?: string
@@ -109,14 +110,18 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     }
   }
 
-  const handleBatchImport = async () => {
-    // 先单独解析 JSON，给出精准的错误提示
+  const handleBatchImport = async (retryCredentials?: CredentialInput[]) => {
     let credentials: CredentialInput[]
-    try {
-      credentials = parseCredentialImportText(jsonInput)
-    } catch (error) {
-      toast.error('JSON 格式错误: ' + extractErrorMessage(error))
-      return
+    if (retryCredentials) {
+      credentials = retryCredentials
+    } else {
+      // 先单独解析 JSON，给出精准的错误提示
+      try {
+        credentials = parseCredentialImportText(jsonInput)
+      } catch (error) {
+        toast.error('JSON 格式错误: ' + extractErrorMessage(error))
+        return
+      }
     }
 
     if (credentials.length === 0) {
@@ -129,9 +134,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       setProgress({ current: 0, total: credentials.length })
 
       // 2. 初始化结果
-      const initialResults: VerificationResult[] = credentials.map((_, i) => ({
+      const initialResults: VerificationResult[] = credentials.map((credential, i) => ({
         index: i + 1,
-        status: 'pending'
+        status: 'pending',
+        credential,
       }))
       setResults(initialResults)
 
@@ -417,6 +423,20 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     }
   }
 
+  const failedCredentials = results
+    .filter((result): result is VerificationResult & { credential: CredentialInput } => (
+      result.status === 'failed' && Boolean(result.credential)
+    ))
+    .map((result) => result.credential)
+
+  const handleRetryFailed = async () => {
+    if (failedCredentials.length === 0) {
+      toast.error('没有可重试的失败凭据')
+      return
+    }
+    await handleBatchImport(failedCredentials)
+  }
+
   const getStatusIcon = (status: VerificationResult['status']) => {
     switch (status) {
       case 'pending':
@@ -591,10 +611,21 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           >
             {importing ? '验活中...' : results.length > 0 ? '关闭' : '取消'}
           </Button>
+          {results.length > 0 && failedCredentials.length > 0 && (
+            <Button
+              type="button"
+              variant="outline"
+              onClick={handleRetryFailed}
+              disabled={importing}
+            >
+              <RotateCw className="h-4 w-4 mr-2" />
+              重试失败账号
+            </Button>
+          )}
           {results.length === 0 && (
             <Button
               type="button"
-              onClick={handleBatchImport}
+              onClick={() => handleBatchImport()}
               disabled={importing || !jsonInput.trim()}
             >
               开始导入并验活

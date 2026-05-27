@@ -18,7 +18,7 @@ import { ModelPricingPanel } from '@/components/model-pricing-panel'
 import { AuditLogsPanel } from '@/components/audit-logs-panel'
 import { CredentialExportDialog } from '@/components/credential-export-dialog'
 import { ProxyResourcesPanel } from '@/components/proxy-resources-panel'
-import { useCredentialsPage, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
+import { useCredentialsPage, useDeleteCredential, useResetFailure, useLoadBalancingMode, useRuntimeConfig, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken, getCredentials, testCredential } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
@@ -66,6 +66,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: resetFailure } = useResetFailure()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
+  const runtimeConfig = useRuntimeConfig()
 
   // 计算分页
   const totalPages = data?.totalPages || 0
@@ -271,7 +272,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
     const refreshableIds = Array.from(selectedIds).filter(id => {
       const cred = currentCredentials.find(c => c.id === id)
-      return cred && !cred.disabled && cred.authMethod !== 'api_key'
+      return cred && cred.authMethod !== 'api_key'
     })
     const skippedCount = selectedIds.size - refreshableIds.length
 
@@ -304,7 +305,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       refreshableIds.forEach(id => next.delete(id))
       return next
     })
-    const skippedText = skippedCount > 0 ? `，跳过 ${skippedCount} 个禁用或 API Key 凭据` : ''
+    const skippedText = skippedCount > 0 ? `，跳过 ${skippedCount} 个 API Key 凭据` : ''
 
     if (failCount === 0) {
       toast.success(`成功刷新 ${successCount} 个凭据的 Token${skippedText}`)
@@ -417,12 +418,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
       return
     }
 
-    const ids = currentCredentials
-      .filter(credential => !credential.disabled)
-      .map(credential => credential.id)
+    const ids = currentCredentials.map(credential => credential.id)
 
     if (ids.length === 0) {
-      toast.error('当前页没有可查询额度的启用凭据')
+      toast.error('当前页没有可查询额度的凭据')
       return
     }
 
@@ -683,7 +682,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
         ) : (
           <>
         {/* 统计卡片 */}
-        <div className="grid gap-4 md:grid-cols-4 mb-6">
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5 mb-6">
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm font-medium text-muted-foreground">
@@ -725,7 +724,18 @@ export function Dashboard({ onLogout }: DashboardProps) {
               <div className="text-2xl font-bold">
                 {data?.globalInFlightRequests || 0}/{data?.globalMaxConcurrentRequests || '不限'}
               </div>
-              <div className="text-xs text-muted-foreground">排队 {data?.queuedRequests || 0}/{data?.maxQueuedRequests || '不限'}</div>
+              <div className="text-xs text-muted-foreground">全局并发 · 排队 {data?.queuedRequests || 0}/{data?.maxQueuedRequests || '不限'}</div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground">单凭据并发</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="text-2xl font-bold">
+                {runtimeConfig.data?.credentialMaxConcurrentRequests || '不限'}
+              </div>
+              <div className="text-xs text-muted-foreground">每个凭据同时处理请求上限</div>
             </CardContent>
           </Card>
         </div>

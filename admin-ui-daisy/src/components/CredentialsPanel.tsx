@@ -16,9 +16,9 @@ import {
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { Button, Card, Checkbox, Input, Join, Loading, Select, Toggle } from 'react-daisyui'
+import { Button, Card, Checkbox, Input, Join, Loading, Modal, Select, Toggle } from 'react-daisyui'
 import { forceRefreshToken, getCredentialBalance, getCredentials, testCredential } from '@/api/credentials'
-import { Badge, EmptyState, ErrorState, FieldLabel, LoadingState, SectionCard, StatCard } from '@/components/common'
+import { Badge, EmptyState, ErrorState, LoadingState, ModalShell, SectionCard, StatCard } from '@/components/common'
 import {
   AddCredentialModal,
   BatchImportModal,
@@ -75,6 +75,8 @@ function numberOrZero(value: number | null | undefined): number {
 function sourceLabel(source?: CredentialStatusItem['effectiveProxySource']) {
   if (source === 'credential') return '直接代理'
   if (source === 'resource') return '代理资源'
+  if (source === 'resource_disabled') return '代理资源已禁用'
+  if (source === 'resource_missing') return '代理资源不存在'
   if (source === 'global') return '全局代理'
   if (source === 'direct') return '直连'
   return '未配置代理'
@@ -101,9 +103,6 @@ function CredentialCard({
   const [editingProxy, setEditingProxy] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [proxyResourceId, setProxyResourceId] = useState(credential.proxyResourceId ? String(credential.proxyResourceId) : '')
-  const [proxyUrl, setProxyUrl] = useState(credential.proxyUrl || '')
-  const [proxyUsername, setProxyUsername] = useState('')
-  const [proxyPassword, setProxyPassword] = useState('')
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
   const setCredentialProxy = useSetCredentialProxy()
@@ -134,10 +133,7 @@ function CredentialCard({
 
   useEffect(() => {
     setProxyResourceId(credential.proxyResourceId ? String(credential.proxyResourceId) : '')
-    setProxyUrl(credential.proxyUrl || '')
-    setProxyUsername('')
-    setProxyPassword('')
-  }, [credential.id, credential.proxyResourceId, credential.proxyUrl])
+  }, [credential.id, credential.proxyResourceId])
 
   const savePriority = () => {
     const priority = Number(priorityValue)
@@ -163,9 +159,6 @@ function CredentialCard({
         id: credential.id,
         request: {
           proxyResourceId: proxyResourceId ? Number(proxyResourceId) : null,
-          proxyUrl: proxyUrl.trim() || undefined,
-          proxyUsername: proxyUsername.trim() || undefined,
-          proxyPassword: proxyPassword.trim() || undefined,
         },
       },
       {
@@ -346,41 +339,10 @@ function CredentialCard({
           </div>
           <div className="col-span-full">
             <div className="text-[0.72rem] font-medium text-base-content/50">代理</div>
-            {editingProxy ? (
-              <div className="mt-1 grid gap-2 rounded-box border border-base-300 bg-base-200 p-2 md:grid-cols-2">
-                <FieldLabel title="代理资源" description="代理 URL 留空时生效">
-                  <Select bordered size="xs" value={proxyResourceId} onChange={(event) => setProxyResourceId(event.target.value)}>
-                    <Select.Option value="">不绑定</Select.Option>
-                    {proxyResourceOptions.map((resource) => (
-                      <Select.Option key={resource.id} value={String(resource.id)} disabled={!resource.enabled}>
-                        {resource.name}{resource.enabled ? '' : '（已禁用）'}
-                      </Select.Option>
-                    ))}
-                  </Select>
-                </FieldLabel>
-                <FieldLabel title="代理 URL" description='直接代理优先，"direct" 表示直连'>
-                  <Input bordered size="xs" value={proxyUrl} onChange={(event) => setProxyUrl(event.target.value)} />
-                </FieldLabel>
-                <FieldLabel title="代理用户名">
-                  <Input bordered size="xs" value={proxyUsername} onChange={(event) => setProxyUsername(event.target.value)} placeholder="留空不修改/不设置" />
-                </FieldLabel>
-                <FieldLabel title="代理密码">
-                  <Input bordered size="xs" type="password" value={proxyPassword} onChange={(event) => setProxyPassword(event.target.value)} placeholder="留空不修改/不设置" />
-                </FieldLabel>
-                <div className="flex gap-2 md:col-span-2">
-                  <Button type="button" color="primary" size="xs" onClick={saveProxy} disabled={setCredentialProxy.isPending}>
-                    {setCredentialProxy.isPending && <Loading size="xs" />}
-                    保存代理
-                  </Button>
-                  <Button type="button" color="ghost" size="xs" onClick={() => setEditingProxy(false)}>取消</Button>
-                </div>
-              </div>
-            ) : (
-              <Button type="button" color="ghost" size="xs" className="h-auto min-h-0 px-1 font-semibold" onClick={() => setEditingProxy(true)}>
-                <Router className="h-3.5 w-3.5" />
-                {credential.effectiveProxyUrl ? `${credential.proxyResourceName || sourceLabel(credential.effectiveProxySource)} · ${credential.effectiveProxyUrl}` : sourceLabel(credential.effectiveProxySource)}
-              </Button>
-            )}
+            <Button type="button" color="ghost" size="xs" className="h-auto min-h-0 px-1 font-semibold" onClick={() => setEditingProxy(true)}>
+              <Router className="h-3.5 w-3.5" />
+              {credential.effectiveProxyUrl ? `${credential.proxyResourceName || sourceLabel(credential.effectiveProxySource)} · ${credential.effectiveProxyUrl}` : sourceLabel(credential.effectiveProxySource)}
+            </Button>
           </div>
         </div>
 
@@ -389,7 +351,7 @@ function CredentialCard({
             <Wand2 className="h-3.5 w-3.5" />
             测试
           </Button>
-          <Button type="button" color="ghost" size="xs" onClick={() => onQueryBalance(credential.id)} disabled={loadingBalance || credential.disabled} title={credential.disabled ? '已禁用的凭据无法查询额度' : '查询额度并更新卡片'}>
+          <Button type="button" color="ghost" size="xs" onClick={() => onQueryBalance(credential.id)} disabled={loadingBalance} title="查询额度并更新卡片">
             {loadingBalance ? <Loading size="xs" /> : <Wallet className="h-3.5 w-3.5" />}
             {loadingBalance ? '查询中' : '查询额度'}
           </Button>
@@ -451,6 +413,61 @@ function CredentialCard({
           </Button>
         </div>
       </Card.Body>
+      <ModalShell open={editingProxy} title={`绑定代理：${credentialLabel(credential)}`} width="max-w-2xl" onClose={() => setEditingProxy(false)}>
+        <div className="space-y-3">
+          <button
+            type="button"
+            className={`w-full rounded-box border p-3 text-left text-sm transition ${proxyResourceId ? 'border-base-300 bg-base-100 hover:bg-base-200' : 'border-primary bg-primary/5'}`}
+            onClick={() => setProxyResourceId('')}
+          >
+            <div className="flex items-center justify-between gap-3">
+              <span className="font-semibold">不绑定代理资源</span>
+              {!proxyResourceId && <Badge tone="primary">已选</Badge>}
+            </div>
+            <div className="mt-1 text-xs text-base-content/60">清除凭据上的代理资源绑定，并同时清除旧的直接代理配置。</div>
+          </button>
+
+          {proxyResources.isLoading ? (
+            <LoadingState text="加载代理资源..." />
+          ) : proxyResourceOptions.length === 0 ? (
+            <EmptyState text="暂无代理资源，请先在代理页新增" />
+          ) : (
+            <div className="max-h-80 space-y-2 overflow-y-auto">
+              {proxyResourceOptions.map((resource) => {
+                const selected = proxyResourceId === String(resource.id)
+                return (
+                  <button
+                    key={resource.id}
+                    type="button"
+                    className={`w-full rounded-box border p-3 text-left text-sm transition ${
+                      selected ? 'border-primary bg-primary/5' : resource.enabled ? 'border-base-300 bg-base-100 hover:bg-base-200' : 'border-error/25 bg-error/5 opacity-80 hover:bg-error/10'
+                    }`}
+                    onClick={() => setProxyResourceId(String(resource.id))}
+                  >
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="font-semibold">{resource.name}</span>
+                      <Badge>#{resource.id}</Badge>
+                      <Badge tone={resource.enabled ? 'success' : 'error'}>{resource.enabled ? '启用' : '已禁用'}</Badge>
+                      {selected && <Badge tone="primary">已选</Badge>}
+                    </div>
+                    <div className="mt-1 truncate text-xs text-base-content/60">{resource.proxyUrl}</div>
+                  </button>
+                )
+              })}
+            </div>
+          )}
+
+          <Modal.Actions>
+            <Button type="button" color="ghost" size="sm" onClick={() => setEditingProxy(false)} disabled={setCredentialProxy.isPending}>
+              取消
+            </Button>
+            <Button type="button" color="primary" size="sm" onClick={saveProxy} disabled={setCredentialProxy.isPending}>
+              {setCredentialProxy.isPending && <Loading size="sm" />}
+              保存绑定
+            </Button>
+          </Modal.Actions>
+        </div>
+      </ModalShell>
     </Card>
   )
 }
@@ -477,6 +494,7 @@ export function CredentialsPanel() {
   const credentials = useCredentialsPage({ page, limit: itemsPerPage })
   const allCredentials = useCredentials({ enabled: batchOpen || kamOpen })
   const loadBalancing = useLoadBalancingMode()
+  const runtimeConfig = useRuntimeConfig()
   const setLoadBalancing = useSetLoadBalancingMode()
   const deleteCredential = useDeleteCredential()
   const resetFailure = useResetFailure()
@@ -533,8 +551,8 @@ export function CredentialsPanel() {
   }
 
   const queryCurrentPageInfo = async () => {
-    const ids = currentCredentials.filter((item) => !item.disabled).map((item) => item.id)
-    if (!ids.length) return toast.error('当前页没有可查询额度的启用凭据')
+    const ids = currentCredentials.map((item) => item.id)
+    if (!ids.length) return toast.error('当前页没有可查询额度的凭据')
     setQueryingInfo(true)
     let success = 0
     let fail = 0
@@ -592,7 +610,7 @@ export function CredentialsPanel() {
   const batchForceRefresh = async () => {
     const ids = Array.from(selectedIds).filter((id) => {
       const cred = currentCredentials.find((item) => item.id === id)
-      return cred && !cred.disabled && cred.authMethod !== 'api_key'
+      return cred && cred.authMethod !== 'api_key'
     })
     if (!ids.length) return toast.error('选中的凭据中没有可刷新 Token 的 OAuth 凭据')
     setBatchRefreshing(true)
@@ -681,7 +699,8 @@ export function CredentialsPanel() {
         <StatCard title="凭据总数" value={formatNumber(credentials.data?.total || 0)} />
         <StatCard title="可用凭据" value={formatNumber(credentials.data?.available || 0)} tone="success" />
         <StatCard title="当前活跃" value={`#${credentials.data?.currentId || '-'}`} desc={loadBalancing.data?.mode === 'priority' ? '优先级模式' : loadBalancing.data?.mode === 'balanced' ? '均衡负载模式' : '健康均衡模式'} tone="info" />
-        <StatCard title="调度容量" value={`${credentials.data?.globalInFlightRequests || 0}/${credentials.data?.globalMaxConcurrentRequests || '不限'}`} desc={`排队 ${credentials.data?.queuedRequests || 0}/${credentials.data?.maxQueuedRequests || '不限'}`} tone="info" />
+        <StatCard title="调度容量" value={`${credentials.data?.globalInFlightRequests || 0}/${credentials.data?.globalMaxConcurrentRequests || '不限'}`} desc={`全局并发 · 排队 ${credentials.data?.queuedRequests || 0}/${credentials.data?.maxQueuedRequests || '不限'}`} tone="info" />
+        <StatCard title="单凭据并发" value={runtimeConfig.data?.credentialMaxConcurrentRequests || '不限'} desc="每个凭据同时处理请求上限" tone="info" />
         <StatCard title="已禁用" value={formatNumber(disabledCredentialCount)} tone={disabledCredentialCount ? 'warning' : 'default'} />
       </div>
 

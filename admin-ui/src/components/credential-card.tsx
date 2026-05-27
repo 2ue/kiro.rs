@@ -94,6 +94,8 @@ function numberOrZero(value: number | null | undefined): number {
 function sourceLabel(source?: CredentialStatusItem['effectiveProxySource']) {
   if (source === 'credential') return '直接代理'
   if (source === 'resource') return '代理资源'
+  if (source === 'resource_disabled') return '代理资源已禁用'
+  if (source === 'resource_missing') return '代理资源不存在'
   if (source === 'global') return '全局代理'
   if (source === 'direct') return '直连'
   return '未配置代理'
@@ -112,9 +114,6 @@ export function CredentialCard({
   const [editingProxy, setEditingProxy] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [proxyResourceId, setProxyResourceId] = useState(credential.proxyResourceId ? String(credential.proxyResourceId) : '')
-  const [proxyUrl, setProxyUrl] = useState(credential.proxyUrl || '')
-  const [proxyUsername, setProxyUsername] = useState('')
-  const [proxyPassword, setProxyPassword] = useState('')
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
@@ -148,10 +147,7 @@ export function CredentialCard({
 
   useEffect(() => {
     setProxyResourceId(credential.proxyResourceId ? String(credential.proxyResourceId) : '')
-    setProxyUrl(credential.proxyUrl || '')
-    setProxyUsername('')
-    setProxyPassword('')
-  }, [credential.id, credential.proxyResourceId, credential.proxyUrl])
+  }, [credential.id, credential.proxyResourceId])
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -193,9 +189,6 @@ export function CredentialCard({
         id: credential.id,
         request: {
           proxyResourceId: proxyResourceId ? Number(proxyResourceId) : null,
-          proxyUrl: proxyUrl.trim() || undefined,
-          proxyUsername: proxyUsername.trim() || undefined,
-          proxyPassword: proxyPassword.trim() || undefined,
         },
       },
       {
@@ -557,74 +550,18 @@ export function CredentialCard({
             </div>
             <div className="col-span-2">
               <span className="text-muted-foreground">代理：</span>
-              {editingProxy ? (
-                <div className="mt-2 rounded-md border bg-muted/30 p-3 space-y-3">
-                  <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
-                    <div className="space-y-1">
-                      <label className="text-xs text-muted-foreground">代理资源</label>
-                      <select
-                        value={proxyResourceId}
-                        onChange={(e) => setProxyResourceId(e.target.value)}
-                        className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm"
-                      >
-                        <option value="">不绑定代理资源</option>
-                        {proxyResourceOptions.map((resource) => (
-                          <option key={resource.id} value={resource.id} disabled={!resource.enabled}>
-                            {resource.name}{resource.enabled ? '' : '（已禁用）'}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                    <div className="space-y-1">
-                      <label className="text-xs text-muted-foreground">代理 URL</label>
-                      <Input
-                        value={proxyUrl}
-                        onChange={(e) => setProxyUrl(e.target.value)}
-                        placeholder='直接代理优先，"direct" 表示直连'
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <label className="text-xs text-muted-foreground">代理用户名</label>
-                      <Input
-                        value={proxyUsername}
-                        onChange={(e) => setProxyUsername(e.target.value)}
-                        placeholder="留空不设置"
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <label className="text-xs text-muted-foreground">代理密码</label>
-                      <Input
-                        type="password"
-                        value={proxyPassword}
-                        onChange={(e) => setProxyPassword(e.target.value)}
-                        placeholder="留空不设置"
-                      />
-                    </div>
-                  </div>
-                  <div className="flex gap-2">
-                    <Button size="sm" onClick={handleProxySave} disabled={setCredentialProxy.isPending}>
-                      {setCredentialProxy.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
-                      保存代理
-                    </Button>
-                    <Button size="sm" variant="outline" onClick={() => setEditingProxy(false)}>
-                      取消
-                    </Button>
-                  </div>
-                </div>
-              ) : (
-                <button
-                  type="button"
-                  className="ml-1 inline-flex max-w-full items-center gap-1 truncate font-medium hover:underline"
-                  onClick={() => setEditingProxy(true)}
-                >
-                  <Router className="h-3.5 w-3.5 shrink-0" />
-                  <span className="truncate">
-                    {credential.effectiveProxyUrl
-                      ? `${credential.proxyResourceName || sourceLabel(credential.effectiveProxySource)} · ${credential.effectiveProxyUrl}`
-                      : sourceLabel(credential.effectiveProxySource)}
-                  </span>
-                </button>
-              )}
+              <button
+                type="button"
+                className="ml-1 inline-flex max-w-full items-center gap-1 truncate font-medium hover:underline"
+                onClick={() => setEditingProxy(true)}
+              >
+                <Router className="h-3.5 w-3.5 shrink-0" />
+                <span className="truncate">
+                  {credential.effectiveProxyUrl
+                    ? `${credential.proxyResourceName || sourceLabel(credential.effectiveProxySource)} · ${credential.effectiveProxyUrl}`
+                    : sourceLabel(credential.effectiveProxySource)}
+                </span>
+              </button>
             </div>
             {credential.hasProfileArn && (
               <div className="col-span-2">
@@ -648,8 +585,8 @@ export function CredentialCard({
               size="sm"
               variant="outline"
               onClick={handleForceRefresh}
-              disabled={forceRefresh.isPending || credential.disabled || credential.authMethod === 'api_key'}
-              title={credential.authMethod === 'api_key' ? 'API Key 凭据无需刷新 Token' : credential.disabled ? '已禁用的凭据无法刷新 Token' : '强制刷新 Token'}
+              disabled={forceRefresh.isPending || credential.authMethod === 'api_key'}
+              title={credential.authMethod === 'api_key' ? 'API Key 凭据无需刷新 Token' : '强制刷新 Token'}
             >
               <RefreshCw className={`h-4 w-4 mr-1 ${forceRefresh.isPending ? 'animate-spin' : ''}`} />
               刷新 Token
@@ -658,8 +595,7 @@ export function CredentialCard({
               size="sm"
               variant="outline"
               onClick={handleToggleWarmup}
-              disabled={setWarmup.isPending || credential.disabled}
-              title={credential.disabled ? '已禁用的凭据无法调整预热' : undefined}
+              disabled={setWarmup.isPending}
             >
               {credential.warmupRemaining > 0 ? '关闭预热' : `预热 ${warmupTarget} 次`}
             </Button>
@@ -721,8 +657,8 @@ export function CredentialCard({
               size="sm"
               variant="outline"
               onClick={() => onQueryBalance(credential.id)}
-              disabled={loadingBalance || credential.disabled}
-              title={credential.disabled ? '已禁用的凭据无法查询额度' : '查询额度并更新卡片'}
+              disabled={loadingBalance}
+              title="查询额度并更新卡片"
             >
               {loadingBalance ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Wallet className="h-4 w-4 mr-1" />}
               {loadingBalance ? '查询中' : '查询额度'}
@@ -740,6 +676,76 @@ export function CredentialCard({
           </div>
         </CardContent>
       </Card>
+
+      <Dialog open={editingProxy} onOpenChange={setEditingProxy}>
+        <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>绑定代理：{displayName}</DialogTitle>
+            <DialogDescription>
+              直接选择已添加的代理资源；保存“不绑定”会清除凭据上的代理资源和旧的直接代理配置。
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <button
+              type="button"
+              className={`w-full rounded-md border p-3 text-left text-sm transition ${proxyResourceId ? 'hover:bg-muted/50' : 'border-primary bg-primary/5'}`}
+              onClick={() => setProxyResourceId('')}
+            >
+              <div className="flex items-center justify-between gap-3">
+                <span className="font-medium">不绑定代理资源</span>
+                {!proxyResourceId && <Badge variant="default">已选</Badge>}
+              </div>
+              <div className="mt-1 text-xs text-muted-foreground">使用全局代理或直连配置。</div>
+            </button>
+
+            {proxyResources.isLoading ? (
+              <div className="py-8 text-center text-sm text-muted-foreground">
+                <div className="mx-auto mb-3 h-8 w-8 animate-spin rounded-full border-b-2 border-primary" />
+                加载代理资源...
+              </div>
+            ) : proxyResourceOptions.length === 0 ? (
+              <Card>
+                <CardContent className="py-8 text-center text-sm text-muted-foreground">暂无代理资源，请先在代理页新增</CardContent>
+              </Card>
+            ) : (
+              <div className="max-h-80 space-y-2 overflow-y-auto">
+                {proxyResourceOptions.map((resource) => {
+                  const selected = proxyResourceId === String(resource.id)
+                  return (
+                    <button
+                      key={resource.id}
+                      type="button"
+                      className={`w-full rounded-md border p-3 text-left text-sm transition ${
+                        selected ? 'border-primary bg-primary/5' : resource.enabled ? 'hover:bg-muted/50' : 'border-red-200 bg-red-50 opacity-80 hover:bg-red-100 dark:border-red-900 dark:bg-red-950/30'
+                      }`}
+                      onClick={() => setProxyResourceId(String(resource.id))}
+                    >
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-medium">{resource.name}</span>
+                        <Badge variant="outline">#{resource.id}</Badge>
+                        <Badge variant={resource.enabled ? 'success' : 'destructive'}>{resource.enabled ? '启用' : '已禁用'}</Badge>
+                        {selected && <Badge variant="default">已选</Badge>}
+                      </div>
+                      <div className="mt-1 truncate text-xs text-muted-foreground">{resource.proxyUrl}</div>
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditingProxy(false)} disabled={setCredentialProxy.isPending}>
+              取消
+            </Button>
+            <Button onClick={handleProxySave} disabled={setCredentialProxy.isPending}>
+              {setCredentialProxy.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+              保存绑定
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* 删除确认对话框 */}
       <Dialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>

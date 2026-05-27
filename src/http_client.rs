@@ -10,7 +10,7 @@ use crate::model::config::TlsBackend;
 /// 代理配置
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ProxyConfig {
-    /// 代理地址，支持 http/https/socks5
+    /// 代理地址，支持 http/https/socks5/socks5h
     pub url: String,
     /// 代理认证用户名
     pub username: Option<String>,

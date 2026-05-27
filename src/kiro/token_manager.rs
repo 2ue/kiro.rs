@@ -105,6 +105,13 @@ struct ProxyResourceRuntime {
     enabled: bool,
 }
 
+#[derive(Debug, Clone)]
+enum ProxyResourceAvailability {
+    Available(ProxyResourceRuntime),
+    Missing(u64),
+    Disabled(ProxyResourceRuntime),
+}
+
 impl From<ProxyResourceRow> for ProxyResourceRuntime {
     fn from(row: ProxyResourceRow) -> Self {
         Self {
@@ -1437,25 +1444,78 @@ impl MultiTokenManager {
     }
 
     fn credential_is_dispatchable(
+        proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
         entry: &CredentialEntry,
         model: Option<&str>,
         now: Instant,
         max_concurrent_requests: u32,
     ) -> bool {
         Self::credential_is_usable_for_model(entry, model)
+            && Self::credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
             && Self::entry_cooldown_remaining(entry, now).is_none()
             && Self::entry_rate_limit_remaining(entry, now).is_none()
             && Self::entry_has_concurrency_capacity(entry, max_concurrent_requests)
     }
 
     fn credential_is_temporarily_available(
+        proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
         entry: &CredentialEntry,
         model: Option<&str>,
         now: Instant,
     ) -> bool {
         Self::credential_is_usable_for_model(entry, model)
+            && Self::credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
             && Self::entry_cooldown_remaining(entry, now).is_none()
             && Self::entry_rate_limit_remaining(entry, now).is_none()
+    }
+
+    fn credential_proxy_availability(
+        credentials: &KiroCredentials,
+        proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
+    ) -> Option<ProxyResourceAvailability> {
+        if credentials.proxy_url.is_some() {
+            return None;
+        }
+        let resource_id = credentials.proxy_resource_id?;
+        let Some(resource) = proxy_resources.get(&resource_id) else {
+            return Some(ProxyResourceAvailability::Missing(resource_id));
+        };
+        if !resource.enabled {
+            return Some(ProxyResourceAvailability::Disabled(resource.clone()));
+        }
+        Some(ProxyResourceAvailability::Available(resource.clone()))
+    }
+
+    fn credential_proxy_is_dispatchable(
+        credentials: &KiroCredentials,
+        proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
+    ) -> bool {
+        match Self::credential_proxy_availability(credentials, proxy_resources) {
+            Some(ProxyResourceAvailability::Missing(_))
+            | Some(ProxyResourceAvailability::Disabled(_)) => false,
+            Some(ProxyResourceAvailability::Available(_)) | None => true,
+        }
+    }
+
+    fn proxy_unavailable_error(
+        credential_id: Option<u64>,
+        availability: ProxyResourceAvailability,
+    ) -> anyhow::Error {
+        match availability {
+            ProxyResourceAvailability::Missing(resource_id) => anyhow::anyhow!(
+                "凭据 #{} 绑定的代理资源 #{} 不存在，已阻止回退到全局代理/直连",
+                credential_id.unwrap_or_default(),
+                resource_id
+            ),
+            ProxyResourceAvailability::Disabled(resource) => anyhow::anyhow!(
+                "凭据 #{} 绑定的代理资源「{}」已禁用，已阻止回退到全局代理/直连",
+                credential_id.unwrap_or_default(),
+                resource.name
+            ),
+            ProxyResourceAvailability::Available(_) => {
+                anyhow::anyhow!("代理资源可用状态异常")
+            }
+        }
     }
 
     fn entry_has_concurrency_capacity(
@@ -1696,6 +1756,7 @@ impl MultiTokenManager {
     fn min_dispatch_wait(
         &self,
         entries: &[CredentialEntry],
+        proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
         model: Option<&str>,
         excluded_ids: &HashSet<u64>,
         now: Instant,
@@ -1705,6 +1766,7 @@ impl MultiTokenManager {
             .filter(|entry| {
                 !excluded_ids.contains(&entry.id)
                     && Self::credential_is_usable_for_model(entry, model)
+                    && Self::credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
             })
             .filter_map(|entry| {
                 match (
@@ -1723,6 +1785,7 @@ impl MultiTokenManager {
     fn concurrency_blocked_count(
         &self,
         entries: &[CredentialEntry],
+        proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
         model: Option<&str>,
         excluded_ids: &HashSet<u64>,
         now: Instant,
@@ -1736,6 +1799,7 @@ impl MultiTokenManager {
             .filter(|entry| {
                 !excluded_ids.contains(&entry.id)
                     && Self::credential_is_usable_for_model(entry, model)
+                    && Self::credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
                     && Self::entry_cooldown_remaining(entry, now).is_none()
                     && Self::entry_rate_limit_remaining(entry, now).is_none()
                     && !Self::entry_has_concurrency_capacity(entry, max_concurrent_requests)
@@ -2106,10 +2170,17 @@ impl MultiTokenManager {
         if self.redis_store.is_none() {
             Self::refresh_local_selection_windows_locked(&mut entries, now);
         }
+        let proxy_resources = self.proxy_resources.lock();
         entries.iter().any(|entry| {
             entry.id != current_id
                 && !excluded_ids.contains(&entry.id)
-                && Self::credential_is_dispatchable(entry, model, now, max_concurrent_requests)
+                && Self::credential_is_dispatchable(
+                    &proxy_resources,
+                    entry,
+                    model,
+                    now,
+                    max_concurrent_requests,
+                )
         })
     }
 
@@ -2124,6 +2195,7 @@ impl MultiTokenManager {
             return None;
         }
         let entries = self.entries.lock();
+        let proxy_resources = self.proxy_resources.lock();
         let now = Instant::now();
         let max_concurrent_requests = self.max_concurrent_requests();
 
@@ -2132,7 +2204,13 @@ impl MultiTokenManager {
             .iter()
             .filter(|e| {
                 !excluded_ids.contains(&e.id)
-                    && Self::credential_is_dispatchable(e, model, now, max_concurrent_requests)
+                    && Self::credential_is_dispatchable(
+                        &proxy_resources,
+                        e,
+                        model,
+                        now,
+                        max_concurrent_requests,
+                    )
             })
             .collect();
 
@@ -2316,13 +2394,20 @@ impl MultiTokenManager {
         }
 
         let entries = self.entries.lock();
+        let proxy_resources = self.proxy_resources.lock();
         let now = Instant::now();
         let max_concurrent_requests = self.max_concurrent_requests();
         entries
             .iter()
             .find(|e| {
                 e.id == bound_id
-                    && Self::credential_is_dispatchable(e, model, now, max_concurrent_requests)
+                    && Self::credential_is_dispatchable(
+                        &proxy_resources,
+                        e,
+                        model,
+                        now,
+                        max_concurrent_requests,
+                    )
             })
             .map(|e| (e.id, e.credentials.clone()))
     }
@@ -2356,11 +2441,11 @@ impl MultiTokenManager {
         };
 
         let entries = self.entries.lock();
+        let proxy_resources = self.proxy_resources.lock();
         let now = Instant::now();
-        entries
-            .iter()
-            .find(|e| e.id == bound_id)
-            .is_none_or(|e| !Self::credential_is_temporarily_available(e, model, now))
+        entries.iter().find(|e| e.id == bound_id).is_none_or(|e| {
+            !Self::credential_is_temporarily_available(&proxy_resources, e, model, now)
+        })
     }
 
     fn bind_session_to_credential(&self, session_id: &str, credential_id: u64) {
@@ -2647,13 +2732,20 @@ impl MultiTokenManager {
                             )
                         } else {
                             let entries = self.entries.lock();
+                            let proxy_resources = self.proxy_resources.lock();
                             // 注意：必须在 bail! 之前计算 available_count，
                             // 因为 available_count() 会尝试获取 entries 锁，
                             // 而此时我们已经持有该锁，会导致死锁
                             let available = entries.iter().filter(|e| !e.disabled).count();
                             let usable = entries
                                 .iter()
-                                .filter(|e| Self::credential_is_usable_for_model(e, model))
+                                .filter(|e| {
+                                    Self::credential_is_usable_for_model(e, model)
+                                        && Self::credential_proxy_is_dispatchable(
+                                            &e.credentials,
+                                            &proxy_resources,
+                                        )
+                                })
                                 .count();
                             let dispatchable = {
                                 let now = Instant::now();
@@ -2663,6 +2755,7 @@ impl MultiTokenManager {
                                     .filter(|e| {
                                         !excluded_ids.contains(&e.id)
                                             && Self::credential_is_dispatchable(
+                                                &proxy_resources,
                                                 e,
                                                 model,
                                                 now,
@@ -2698,6 +2791,7 @@ impl MultiTokenManager {
                                 let max_concurrent_requests = self.max_concurrent_requests();
                                 let concurrency_blocked = self.concurrency_blocked_count(
                                     &entries,
+                                    &proxy_resources,
                                     model,
                                     excluded_ids,
                                     now,
@@ -2711,6 +2805,10 @@ impl MultiTokenManager {
                                                 !excluded_ids.contains(&e.id)
                                                     && Self::credential_is_usable_for_model(
                                                         e, model,
+                                                    )
+                                                    && Self::credential_proxy_is_dispatchable(
+                                                        &e.credentials,
+                                                        &proxy_resources,
                                                     )
                                             })
                                             .count()
@@ -2728,6 +2826,7 @@ impl MultiTokenManager {
                                         max_concurrent_requests,
                                         wait_for: self.min_dispatch_wait(
                                             &entries,
+                                            &proxy_resources,
                                             model,
                                             excluded_ids,
                                             now,
@@ -2924,7 +3023,7 @@ impl MultiTokenManager {
     ) -> anyhow::Result<CallContext> {
         // API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需刷新
         if credentials.is_api_key_credential() {
-            let credentials = self.resolve_proxy_for_credential(credentials.clone());
+            let credentials = self.resolve_proxy_for_credential(credentials.clone())?;
             let token = credentials
                 .kiro_api_key
                 .clone()
@@ -3009,13 +3108,17 @@ impl MultiTokenManager {
                 }
 
                 // 确实需要刷新
-                let current_creds_for_proxy =
-                    self.resolve_proxy_for_credential(current_creds.clone());
-                let effective_proxy = current_creds_for_proxy.effective_proxy(self.proxy.as_ref());
-                let config = self.runtime_config();
-                let refresh_result =
-                    refresh_token(&current_creds_for_proxy, &config, effective_proxy.as_ref())
-                        .await;
+                let refresh_result = match self.resolve_proxy_for_credential(current_creds.clone())
+                {
+                    Ok(current_creds_for_proxy) => {
+                        let effective_proxy =
+                            current_creds_for_proxy.effective_proxy(self.proxy.as_ref());
+                        let config = self.runtime_config();
+                        refresh_token(&current_creds_for_proxy, &config, effective_proxy.as_ref())
+                            .await
+                    }
+                    Err(err) => Err(err),
+                };
                 if let Some((redis, lock_token)) = redis_refresh_lock {
                     if let Err(err) = redis.release_refresh_lock(id, &lock_token).await {
                         tracing::warn!(credential_id = id, "释放 Redis Token 刷新锁失败: {}", err);
@@ -3065,7 +3168,7 @@ impl MultiTokenManager {
         creds: KiroCredentials,
         update_refresh_health: bool,
     ) -> anyhow::Result<CallContext> {
-        let creds = self.resolve_proxy_for_credential(creds);
+        let creds = self.resolve_proxy_for_credential(creds)?;
         let token = creds
             .access_token
             .clone()
@@ -3097,35 +3200,30 @@ impl MultiTokenManager {
         })
     }
 
-    fn resolve_proxy_for_credential(&self, mut creds: KiroCredentials) -> KiroCredentials {
+    fn resolve_proxy_for_credential(
+        &self,
+        mut creds: KiroCredentials,
+    ) -> anyhow::Result<KiroCredentials> {
         if creds.proxy_url.is_some() {
-            return creds;
+            return Ok(creds);
         }
-        let Some(resource_id) = creds.proxy_resource_id else {
-            return creds;
+        let availability = {
+            let resources = self.proxy_resources.lock();
+            Self::credential_proxy_availability(&creds, &resources)
         };
-        let resources = self.proxy_resources.lock();
-        let Some(resource) = resources.get(&resource_id) else {
-            tracing::warn!(
-                credential_id = creds.id.unwrap_or_default(),
-                proxy_resource_id = resource_id,
-                "凭据绑定的代理资源不存在，回退到全局代理/直连"
-            );
-            return creds;
+        let Some(availability) = availability else {
+            return Ok(creds);
         };
-        if !resource.enabled {
-            tracing::warn!(
-                credential_id = creds.id.unwrap_or_default(),
-                proxy_resource_id = resource_id,
-                proxy_resource_name = resource.name,
-                "凭据绑定的代理资源已禁用，回退到全局代理/直连"
-            );
-            return creds;
+
+        match availability {
+            ProxyResourceAvailability::Available(resource) => {
+                creds.proxy_url = Some(resource.proxy_url);
+                creds.proxy_username = resource.proxy_username;
+                creds.proxy_password = resource.proxy_password;
+                Ok(creds)
+            }
+            unavailable => Err(Self::proxy_unavailable_error(creds.id, unavailable)),
         }
-        creds.proxy_url = Some(resource.proxy_url.clone());
-        creds.proxy_username = resource.proxy_username.clone();
-        creds.proxy_password = resource.proxy_password.clone();
-        creds
     }
 
     fn effective_proxy_display(&self, creds: &KiroCredentials) -> (Option<String>, String) {
@@ -3141,7 +3239,9 @@ impl MultiTokenManager {
                         if resource.enabled {
                             return (Some(resource.proxy_url.clone()), "resource".to_string());
                         }
+                        return (None, "resource_disabled".to_string());
                     }
+                    return (None, "resource_missing".to_string());
                 }
                 match &self.proxy {
                     Some(proxy) => (Some(proxy.url.clone()), "global".to_string()),
@@ -3992,10 +4092,12 @@ impl MultiTokenManager {
 
         let has_alternate = {
             let entries = self.entries.lock();
+            let proxy_resources = self.proxy_resources.lock();
             let max_concurrent_requests = self.max_concurrent_requests();
             entries.iter().any(|e| {
                 e.id != id
                     && Self::credential_is_dispatchable(
+                        &proxy_resources,
                         e,
                         model,
                         Instant::now(),
@@ -4526,12 +4628,21 @@ impl MultiTokenManager {
         let now_ms = Utc::now().timestamp_millis();
         let max_concurrent_requests = self.max_concurrent_requests();
         let lease_max_age = self.in_flight_lease_max_age();
-        let score_candidates: Vec<_> = entries
-            .iter()
-            .filter(|entry| {
-                Self::credential_is_dispatchable(entry, None, now, max_concurrent_requests)
-            })
-            .collect();
+        let score_candidates: Vec<_> = {
+            let proxy_resources = self.proxy_resources.lock();
+            entries
+                .iter()
+                .filter(|entry| {
+                    Self::credential_is_dispatchable(
+                        &proxy_resources,
+                        entry,
+                        None,
+                        now,
+                        max_concurrent_requests,
+                    )
+                })
+                .collect()
+        };
 
         ManagerSnapshot {
             entries: entries
@@ -4888,14 +4999,9 @@ impl MultiTokenManager {
     pub async fn add_credential(&self, new_cred: KiroCredentials) -> anyhow::Result<u64> {
         // 1. 基本验证
         if let Some(resource_id) = new_cred.proxy_resource_id {
-            let exists = self
-                .proxy_resources
-                .lock()
-                .get(&resource_id)
-                .map(|resource| resource.enabled)
-                .unwrap_or(false);
+            let exists = self.proxy_resources.lock().contains_key(&resource_id);
             if !exists {
-                anyhow::bail!("代理资源不存在或已禁用: {}", resource_id);
+                anyhow::bail!("代理资源不存在: {}", resource_id);
             }
         }
 
@@ -4960,7 +5066,7 @@ impl MultiTokenManager {
         let mut validated_cred = if new_cred.is_api_key_credential() {
             new_cred.clone()
         } else {
-            let new_cred_for_proxy = self.resolve_proxy_for_credential(new_cred.clone());
+            let new_cred_for_proxy = self.resolve_proxy_for_credential(new_cred.clone())?;
             let effective_proxy = new_cred_for_proxy.effective_proxy(self.proxy.as_ref());
             let config = self.runtime_config();
             refresh_token(&new_cred_for_proxy, &config, effective_proxy.as_ref()).await?
@@ -5084,14 +5190,9 @@ impl MultiTokenManager {
         proxy_password: Option<String>,
     ) -> anyhow::Result<()> {
         if let Some(resource_id) = proxy_resource_id {
-            let exists = self
-                .proxy_resources
-                .lock()
-                .get(&resource_id)
-                .map(|resource| resource.enabled)
-                .unwrap_or(false);
+            let exists = self.proxy_resources.lock().contains_key(&resource_id);
             if !exists {
-                anyhow::bail!("代理资源不存在或已禁用: {}", resource_id);
+                anyhow::bail!("代理资源不存在: {}", resource_id);
             }
         }
 
@@ -5234,11 +5335,14 @@ impl MultiTokenManager {
         }
 
         // 无条件调用 refresh_token
-        let credentials_for_proxy = self.resolve_proxy_for_credential(credentials.clone());
-        let effective_proxy = credentials_for_proxy.effective_proxy(self.proxy.as_ref());
-        let config = self.runtime_config();
-        let refresh_result =
-            refresh_token(&credentials_for_proxy, &config, effective_proxy.as_ref()).await;
+        let refresh_result = match self.resolve_proxy_for_credential(credentials.clone()) {
+            Ok(credentials_for_proxy) => {
+                let effective_proxy = credentials_for_proxy.effective_proxy(self.proxy.as_ref());
+                let config = self.runtime_config();
+                refresh_token(&credentials_for_proxy, &config, effective_proxy.as_ref()).await
+            }
+            Err(err) => Err(err),
+        };
         if let Some((redis, lock_token)) = redis_refresh_lock {
             if let Err(err) = redis.release_refresh_lock(id, &lock_token).await {
                 tracing::warn!(credential_id = id, "释放 Redis Token 刷新锁失败: {}", err);
@@ -7261,6 +7365,78 @@ mod tests {
             "错误不应误报所有凭据禁用，实际: {}",
             err
         );
+    }
+
+    #[tokio::test]
+    async fn test_bound_disabled_proxy_resource_is_not_dispatchable() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut blocked = KiroCredentials::default();
+        blocked.access_token = Some("blocked-token".to_string());
+        blocked.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        blocked.proxy_resource_id = Some(7);
+
+        let mut active = KiroCredentials::default();
+        active.access_token = Some("active-token".to_string());
+        active.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![blocked, active], None, None, false).unwrap();
+        manager.proxy_resources.lock().insert(
+            7,
+            ProxyResourceRuntime {
+                id: 7,
+                name: "disabled-proxy".to_string(),
+                proxy_url: "socks5h://127.0.0.1:1080".to_string(),
+                proxy_username: None,
+                proxy_password: None,
+                enabled: false,
+            },
+        );
+
+        let ctx = manager.acquire_context(None).await.unwrap();
+        assert_eq!(ctx.id, 2);
+
+        let snapshot = manager.snapshot();
+        let blocked = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(blocked.effective_proxy_source, "resource_disabled");
+        assert_eq!(blocked.effective_proxy_url, None);
+    }
+
+    #[tokio::test]
+    async fn test_bound_missing_proxy_resource_does_not_fallback_to_global_proxy() {
+        let mut config = Config::default();
+        config.proxy_url = Some("http://global-proxy:8080".to_string());
+
+        let mut credential = KiroCredentials::default();
+        credential.access_token = Some("token".to_string());
+        credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        credential.proxy_resource_id = Some(404);
+
+        let manager = MultiTokenManager::new(config, vec![credential], None, None, false).unwrap();
+        let err = manager
+            .acquire_context_for_credential(1)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(
+            err.contains("代理资源 #404 不存在"),
+            "应返回代理资源缺失错误，实际: {}",
+            err
+        );
+        assert!(
+            err.contains("阻止回退"),
+            "不应静默回退到全局代理，实际: {}",
+            err
+        );
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(entry.effective_proxy_source, "resource_missing");
+        assert_eq!(entry.effective_proxy_url, None);
     }
 
     #[tokio::test]
