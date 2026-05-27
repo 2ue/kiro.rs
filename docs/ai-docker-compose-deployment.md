@@ -63,14 +63,14 @@ cd /opt/kiro-rs
 ```yaml
 services:
   kiro-rs-postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     container_name: kiro-rs-postgres
     environment:
       POSTGRES_DB: ${KIRO_RS_POSTGRES_DB:-kiro_rs}
       POSTGRES_USER: ${KIRO_RS_POSTGRES_USER:-kiro_rs}
       POSTGRES_PASSWORD: ${KIRO_RS_POSTGRES_PASSWORD:-change-me}
     volumes:
-      - kiro-rs-postgres-data:/var/lib/postgresql/data
+      - kiro-rs-postgres-data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${KIRO_RS_POSTGRES_USER:-kiro_rs} -d ${KIRO_RS_POSTGRES_DB:-kiro_rs}"]
       interval: 10s
@@ -114,6 +114,12 @@ volumes:
   kiro-rs-postgres-data:
   kiro-rs-redis-data:
 ```
+
+PostgreSQL 18 官方镜像默认使用版本化的数据目录，compose 中挂载父目录
+`/var/lib/postgresql`，不要继续把数据卷直接挂到旧路径
+`/var/lib/postgresql/data`。如果你已经用 PostgreSQL 16 跑过生产数据，
+不要直接把同一个旧数据卷换成 18 镜像启动；需要先备份并通过 dump/restore
+或官方 pg_upgrade 流程完成大版本升级。
 
 可配置环境变量：
 

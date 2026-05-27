@@ -1,6 +1,6 @@
 services:
   kiro-rs-postgres-local:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     container_name: kiro-rs-postgres-local
     environment:
       POSTGRES_DB: ${KIRO_RS_POSTGRES_DB:-kiro_rs}
@@ -9,7 +9,7 @@ services:
     ports:
       - "${KIRO_RS_POSTGRES_PORT:-25432}:5432"
     volumes:
-      - kiro-rs-postgres-local-data:/var/lib/postgresql/data
+      - kiro-rs-postgres-local-data:/var/lib/postgresql
     healthcheck:
       test:
         [

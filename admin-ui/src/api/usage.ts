@@ -20,6 +20,10 @@ const api = axios.create({
   },
 })
 
+function isAdminAuthFailure(status?: number) {
+  return status === 401 || status === 403
+}
+
 api.interceptors.request.use((config) => {
   const apiKey = storage.getApiKey()
   if (apiKey) {
@@ -27,6 +31,16 @@ api.interceptors.request.use((config) => {
   }
   return config
 })
+
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (isAdminAuthFailure(error?.response?.status) && typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('kiro-admin-auth-failed'))
+    }
+    return Promise.reject(error)
+  }
+)
 
 export async function getUsageRecords(
   query: UsageRecordsQuery = {}

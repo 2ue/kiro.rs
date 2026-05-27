@@ -1,4 +1,5 @@
 import { api } from '@/api/http'
+export { validateAdminApiKey } from '@/api/http'
 import type {
   AddCredentialRequest,
   AddCredentialResponse,

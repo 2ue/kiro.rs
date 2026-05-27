@@ -1,13 +1,13 @@
 services:
   kiro-rs-postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     container_name: kiro-rs-postgres
     environment:
       POSTGRES_DB: ${KIRO_RS_POSTGRES_DB:-kiro_rs}
       POSTGRES_USER: ${KIRO_RS_POSTGRES_USER:-kiro_rs}
       POSTGRES_PASSWORD: ${KIRO_RS_POSTGRES_PASSWORD:-change-me}
     volumes:
-      - kiro-rs-postgres-data:/var/lib/postgresql/data
+      - kiro-rs-postgres-data:/var/lib/postgresql
     healthcheck:
       test:
         [

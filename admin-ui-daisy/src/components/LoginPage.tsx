@@ -1,21 +1,38 @@
 import { KeyRound, Server } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Alert, Button, Card, Form, Input, Join } from 'react-daisyui'
 import { storage } from '@/lib/storage'
+import { validateAdminApiKey } from '@/api/credentials'
+import { extractErrorMessage } from '@/lib/utils'
 
-export function LoginPage({ onLogin }: { onLogin: () => void }) {
+export function LoginPage({ initialError = '', onLogin }: { initialError?: string; onLogin: () => void }) {
   const [apiKey, setApiKey] = useState(storage.getApiKey() || '')
-  const [error, setError] = useState('')
+  const [error, setError] = useState(initialError)
+  const [submitting, setSubmitting] = useState(false)
 
-  const handleSubmit = (event: React.FormEvent) => {
+  useEffect(() => {
+    setError(initialError)
+  }, [initialError])
+
+  const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault()
     const trimmed = apiKey.trim()
     if (!trimmed) {
       setError('请输入后台 API Key')
       return
     }
-    storage.setApiKey(trimmed)
-    onLogin()
+    setSubmitting(true)
+    setError('')
+    try {
+      await validateAdminApiKey(trimmed)
+      storage.setApiKey(trimmed)
+      onLogin()
+    } catch (error) {
+      storage.removeApiKey()
+      setError(extractErrorMessage(error))
+    } finally {
+      setSubmitting(false)
+    }
   }
 
   return (
@@ -72,8 +89,8 @@ export function LoginPage({ onLogin }: { onLogin: () => void }) {
                 </Join>
               </Form.Label>
               {error && <Alert status="error" className="py-2 text-sm">{error}</Alert>}
-              <Button type="submit" color="primary" className="w-full">
-                进入后台
+              <Button type="submit" color="primary" className="w-full" disabled={submitting || !apiKey.trim()}>
+                {submitting ? '验证中...' : '进入后台'}
               </Button>
             </Form>
           </section>

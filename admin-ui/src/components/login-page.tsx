@@ -1,16 +1,21 @@
 import { useState, useEffect } from 'react'
 import { KeyRound } from 'lucide-react'
 import { storage } from '@/lib/storage'
+import { validateAdminApiKey } from '@/api/credentials'
+import { extractErrorMessage } from '@/lib/utils'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 
 interface LoginPageProps {
   onLogin: (apiKey: string) => void
+  initialError?: string
 }
 
-export function LoginPage({ onLogin }: LoginPageProps) {
+export function LoginPage({ onLogin, initialError = '' }: LoginPageProps) {
   const [apiKey, setApiKey] = useState('')
+  const [error, setError] = useState(initialError)
+  const [submitting, setSubmitting] = useState(false)
 
   useEffect(() => {
     // 从 storage 读取保存的 API Key
@@ -20,11 +25,29 @@ export function LoginPage({ onLogin }: LoginPageProps) {
     }
   }, [])
 
-  const handleSubmit = (e: React.FormEvent) => {
+  useEffect(() => {
+    setError(initialError)
+  }, [initialError])
+
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (apiKey.trim()) {
-      storage.setApiKey(apiKey.trim())
-      onLogin(apiKey.trim())
+    const trimmed = apiKey.trim()
+    if (!trimmed) {
+      setError('请输入 Admin API Key')
+      return
+    }
+
+    setSubmitting(true)
+    setError('')
+    try {
+      await validateAdminApiKey(trimmed)
+      storage.setApiKey(trimmed)
+      onLogin(trimmed)
+    } catch (error) {
+      storage.removeApiKey()
+      setError(extractErrorMessage(error))
+    } finally {
+      setSubmitting(false)
     }
   }
 
@@ -47,12 +70,20 @@ export function LoginPage({ onLogin }: LoginPageProps) {
                 type="password"
                 placeholder="Admin API Key"
                 value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
+                onChange={(e) => {
+                  setApiKey(e.target.value)
+                  setError('')
+                }}
                 className="text-center"
               />
             </div>
-            <Button type="submit" className="w-full" disabled={!apiKey.trim()}>
-              登录
+            {error && (
+              <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                {error}
+              </div>
+            )}
+            <Button type="submit" className="w-full" disabled={!apiKey.trim() || submitting}>
+              {submitting ? '验证中...' : '登录'}
             </Button>
           </form>
         </CardContent>

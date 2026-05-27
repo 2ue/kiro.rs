@@ -32,6 +32,10 @@ const api = axios.create({
   },
 })
 
+function isAdminAuthFailure(status?: number) {
+  return status === 401 || status === 403
+}
+
 // 请求拦截器添加 API Key
 api.interceptors.request.use((config) => {
   const apiKey = storage.getApiKey()
@@ -40,6 +44,24 @@ api.interceptors.request.use((config) => {
   }
   return config
 })
+
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (isAdminAuthFailure(error?.response?.status) && typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('kiro-admin-auth-failed'))
+    }
+    return Promise.reject(error)
+  }
+)
+
+export async function validateAdminApiKey(apiKey: string): Promise<void> {
+  await axios.get('/api/admin/config/load-balancing', {
+    headers: {
+      'x-api-key': apiKey,
+    },
+  })
+}
 
 // 获取所有凭据状态
 export async function getCredentials(): Promise<CredentialsStatusResponse> {

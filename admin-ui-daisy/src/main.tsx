@@ -5,10 +5,22 @@ import { Toaster } from 'sonner'
 import App from './App'
 import './styles.css'
 
+function isAdminAuthFailure(error: unknown) {
+  const status = (error as { response?: { status?: number } } | null)?.response?.status
+  return status === 401 || status === 403
+}
+
+function shouldRetryQuery(failureCount: number, error: unknown) {
+  if (isAdminAuthFailure(error)) {
+    return false
+  }
+  return failureCount < 1
+}
+
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
-      retry: 1,
+      retry: shouldRetryQuery,
       staleTime: 5000,
       refetchOnWindowFocus: false,
     },
