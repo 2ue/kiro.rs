@@ -6000,6 +6000,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_simulation_balanced_mode_spreads_new_warming_batch() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let credentials = (1_u64..=10)
+            .map(|id| api_key_credential(&format!("ksk_warmup_{id}")))
+            .collect::<Vec<_>>();
+        let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+        for id in 1_u64..=10 {
+            manager.set_warmup_remaining(id, 3).unwrap();
+        }
+
+        let mut first_round = Vec::new();
+        for _ in 0..10 {
+            let mut ctx = manager.acquire_context(None).await.unwrap();
+            first_round.push(ctx.id);
+            ctx.release_in_flight();
+        }
+
+        assert_eq!(first_round, (1_u64..=10).collect::<Vec<_>>());
+
+        for _ in 0..40 {
+            let mut ctx = manager.acquire_context(None).await.unwrap();
+            ctx.release_in_flight();
+        }
+
+        let counts = manager
+            .snapshot()
+            .entries
+            .iter()
+            .map(|entry| entry.recent_scheduler_selection_count_60s)
+            .collect::<Vec<_>>();
+        let min = counts.iter().min().copied().unwrap();
+        let max = counts.iter().max().copied().unwrap();
+        assert!(
+            max - min <= 1,
+            "新导入预热账号应均衡参与调度，实际近期选中次数: {counts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_simulation_mixed_large_requests_failures_and_disabled_accounts() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.credential_max_concurrent_requests = 1;
+        config.credential_rate_limit_cooldown_secs = 60;
+        config.credential_server_error_cooldown_secs = 60;
+        config.credential_max_cooldown_secs = 60;
+        config.credential_cooldown_jitter_percent = 0;
+        config.credential_dispatch_max_wait_secs = 2;
+
+        let mut credentials = (1_u64..=8)
+            .map(|id| api_key_credential(&format!("ksk_mixed_{id}")))
+            .collect::<Vec<_>>();
+        credentials[1].disabled = true;
+        let manager =
+            Arc::new(MultiTokenManager::new(config, credentials, None, None, false).unwrap());
+
+        assert!(manager.report_quota_exhausted(3));
+        assert!(manager.report_risk_controlled(
+            4,
+            CredentialRiskControlReason::TemporarilySuspended,
+            "TEMPORARILY_SUSPENDED"
+        ));
+        assert!(
+            manager
+                .report_transient_failure_kind(
+                    5,
+                    None,
+                    TransientFailureKind::RateLimit,
+                    Some(StdDuration::from_secs(30)),
+                    "429 Too Many Requests",
+                )
+                .unwrap()
+        );
+        assert!(
+            manager
+                .report_transient_failure_kind(
+                    6,
+                    None,
+                    TransientFailureKind::Server,
+                    Some(StdDuration::from_secs(30)),
+                    "502 Bad Gateway",
+                )
+                .unwrap()
+        );
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.available, 5);
+        for id in [2, 3, 4] {
+            let entry = snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .unwrap();
+            assert!(entry.disabled, "凭据 #{id} 应被禁用");
+        }
+        for id in [5, 6] {
+            let entry = snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .unwrap();
+            assert!(entry.cooled_down, "凭据 #{id} 应处于瞬态冷却");
+        }
+
+        let mut long_a = manager.acquire_context(None).await.unwrap();
+        let mut long_b = manager.acquire_context(None).await.unwrap();
+        let mut long_c = manager.acquire_context(None).await.unwrap();
+        assert_eq!(vec![long_a.id, long_b.id, long_c.id], vec![1, 7, 8]);
+
+        let waiting_manager = manager.clone();
+        let waiting = tokio::spawn(async move { waiting_manager.acquire_context(None).await });
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        assert!(
+            !waiting.is_finished(),
+            "健康账号都被大请求占满时，后续请求应排队等待"
+        );
+
+        long_b.release_in_flight();
+        let mut recovered = tokio::time::timeout(StdDuration::from_secs(1), waiting)
+            .await
+            .expect("释放一个健康账号后等待请求应恢复")
+            .expect("等待任务不应 panic")
+            .expect("等待请求应成功获取凭据");
+        assert_eq!(recovered.id, 7);
+
+        recovered.release_in_flight();
+        long_a.release_in_flight();
+        long_c.release_in_flight();
+        assert_eq!(manager.snapshot().global_in_flight_requests, 0);
+    }
+
+    #[tokio::test]
     async fn test_transient_failure_cools_down_only_usable_credential() {
         let mut config = Config::default();
         config.credential_transient_cooldown_secs = 1;
