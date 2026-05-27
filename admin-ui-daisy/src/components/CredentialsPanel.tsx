@@ -65,6 +65,10 @@ function accountInfoValue(credential: CredentialStatusItem, balance?: BalanceRes
   return credential.accountInfo
 }
 
+function numberOrZero(value: number | null | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
 function CredentialCard({
   credential,
   selected,
@@ -95,6 +99,15 @@ function CredentialCard({
   const queryClient = useQueryClient()
   const warmupTarget = Math.max(0, runtimeConfig.data?.credentialWarmupRequests ?? 3)
   const accountInfo = accountInfoValue(credential, balance)
+  const transientFailureStreak = numberOrZero(credential.transientFailureStreak)
+  const probationRemainingSecs = numberOrZero(credential.probationRemainingSecs)
+  const recentErrorRate = numberOrZero(credential.recentErrorRate)
+  const schedulerScore = numberOrZero(credential.schedulerScore)
+  const schedulerSelectionCount = numberOrZero(credential.schedulerSelectionCount)
+  const recentSelection10s = numberOrZero(credential.recentSchedulerSelectionCount10s)
+  const recentSelection60s = numberOrZero(credential.recentSchedulerSelectionCount60s)
+  const recentSelection5m = numberOrZero(credential.recentSchedulerSelectionCount5m)
+  const schedulerSelectionPressure = numberOrZero(credential.schedulerSelectionPressure)
 
   useEffect(() => {
     setPriorityValue(String(credential.priority))
@@ -166,8 +179,8 @@ function CredentialCard({
                   </Badge>
                 )}
                 {!credential.disabled && credential.warmupRemaining > 0 && <Badge tone="secondary">预热 {credential.warmupRemaining}</Badge>}
-                {!credential.disabled && credential.inProbation && <Badge tone="secondary">观察 {credential.probationRemainingSecs}s</Badge>}
-                {credential.transientFailureStreak > 0 && <Badge tone="warning">瞬态错误 {credential.transientFailureStreak}</Badge>}
+                {!credential.disabled && credential.inProbation && <Badge tone="secondary">观察 {probationRemainingSecs}s</Badge>}
+                {transientFailureStreak > 0 && <Badge tone="warning">瞬态错误 {transientFailureStreak}</Badge>}
                 <Badge>{authLabel(credential.authMethod)}</Badge>
                 {credential.endpoint && credential.endpoint !== 'ide' && <Badge>{credential.endpoint}</Badge>}
                 {credential.hasProxy && <Badge tone="info">代理</Badge>}
@@ -223,7 +236,7 @@ function CredentialCard({
           </div>
           <div>
             <div className="text-[0.72rem] font-medium text-base-content/50">近期错误率</div>
-            <div className={credential.recentErrorRate > 0 ? 'font-semibold text-error' : 'font-semibold'}>{(credential.recentErrorRate * 100).toFixed(1)}%</div>
+            <div className={recentErrorRate > 0 ? 'font-semibold text-error' : 'font-semibold'}>{(recentErrorRate * 100).toFixed(1)}%</div>
           </div>
           <div>
             <div className="text-[0.72rem] font-medium text-base-content/50">耗时 EWMA</div>
@@ -231,21 +244,21 @@ function CredentialCard({
           </div>
           <div>
             <div className="text-[0.72rem] font-medium text-base-content/50">调度评分 / 选中</div>
-            <div className="font-semibold">{credential.schedulerScore.toFixed(2)} / {credential.schedulerSelectionCount}</div>
+            <div className="font-semibold">{schedulerScore.toFixed(2)} / {schedulerSelectionCount}</div>
           </div>
           <div>
             <div className="text-[0.72rem] font-medium text-base-content/50">近期调度</div>
             <div className="font-semibold">
-              {credential.recentSchedulerSelectionCount60s}/60s
+              {recentSelection60s}/60s
               <span className="ml-1 text-xs text-base-content/50">
-                10s {credential.recentSchedulerSelectionCount10s} / 5m {credential.recentSchedulerSelectionCount5m}
+                10s {recentSelection10s} / 5m {recentSelection5m}
               </span>
             </div>
           </div>
           <div>
             <div className="text-[0.72rem] font-medium text-base-content/50">调度压力</div>
-            <div className={credential.schedulerSelectionPressure > 1 ? 'font-semibold text-warning' : 'font-semibold'}>
-              {credential.schedulerSelectionPressure.toFixed(2)}
+            <div className={schedulerSelectionPressure > 1 ? 'font-semibold text-warning' : 'font-semibold'}>
+              {schedulerSelectionPressure.toFixed(2)}
             </div>
           </div>
           <div>

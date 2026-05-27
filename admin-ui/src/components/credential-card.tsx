@@ -85,6 +85,10 @@ function formatQuota(value: number): string {
   }).format(value)
 }
 
+function numberOrZero(value: number | null | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
 export function CredentialCard({
   credential,
   onQueryBalance,
@@ -110,6 +114,15 @@ export function CredentialCard({
   const warmupTarget = Math.max(0, runtimeConfig.data?.credentialWarmupRequests ?? 3)
   const accountInfo = balance || credential.accountInfo
   const subscriptionTitle = balance?.subscriptionTitle || credential.accountInfo?.subscriptionTitle || credential.subscriptionTitle || '未知'
+  const transientFailureStreak = numberOrZero(credential.transientFailureStreak)
+  const probationRemainingSecs = numberOrZero(credential.probationRemainingSecs)
+  const recentErrorRate = numberOrZero(credential.recentErrorRate)
+  const schedulerScore = numberOrZero(credential.schedulerScore)
+  const schedulerSelectionCount = numberOrZero(credential.schedulerSelectionCount)
+  const recentSelection10s = numberOrZero(credential.recentSchedulerSelectionCount10s)
+  const recentSelection60s = numberOrZero(credential.recentSchedulerSelectionCount60s)
+  const recentSelection5m = numberOrZero(credential.recentSchedulerSelectionCount5m)
+  const schedulerSelectionPressure = numberOrZero(credential.schedulerSelectionPressure)
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -257,10 +270,10 @@ export function CredentialCard({
                   <Badge variant="secondary">预热 {credential.warmupRemaining}</Badge>
                 )}
                 {!credential.disabled && credential.inProbation && (
-                  <Badge variant="secondary">观察 {credential.probationRemainingSecs}s</Badge>
+                  <Badge variant="secondary">观察 {probationRemainingSecs}s</Badge>
                 )}
-                {credential.transientFailureStreak > 0 && (
-                  <Badge variant="outline">瞬态错误 {credential.transientFailureStreak}</Badge>
+                {transientFailureStreak > 0 && (
+                  <Badge variant="outline">瞬态错误 {transientFailureStreak}</Badge>
                 )}
                 {credential.authMethod && (
                   <Badge variant="secondary">
@@ -369,8 +382,8 @@ export function CredentialCard({
             </div>
             <div>
               <span className="text-muted-foreground">近期错误率：</span>
-              <span className={credential.recentErrorRate > 0 ? 'font-medium text-red-500' : 'font-medium'}>
-                {(credential.recentErrorRate * 100).toFixed(1)}%
+              <span className={recentErrorRate > 0 ? 'font-medium text-red-500' : 'font-medium'}>
+                {(recentErrorRate * 100).toFixed(1)}%
               </span>
             </div>
             <div>
@@ -381,25 +394,25 @@ export function CredentialCard({
             </div>
             <div>
               <span className="text-muted-foreground">调度评分：</span>
-              <span className="font-medium">{credential.schedulerScore.toFixed(2)}</span>
+              <span className="font-medium">{schedulerScore.toFixed(2)}</span>
             </div>
             <div>
               <span className="text-muted-foreground">总调度：</span>
-              <span className="font-medium">{credential.schedulerSelectionCount}</span>
+              <span className="font-medium">{schedulerSelectionCount}</span>
             </div>
             <div>
               <span className="text-muted-foreground">近期调度：</span>
               <span className="font-medium">
-                {credential.recentSchedulerSelectionCount60s}/60s
+                {recentSelection60s}/60s
               </span>
               <span className="ml-1 text-xs text-muted-foreground">
-                10s {credential.recentSchedulerSelectionCount10s} / 5m {credential.recentSchedulerSelectionCount5m}
+                10s {recentSelection10s} / 5m {recentSelection5m}
               </span>
             </div>
             <div>
               <span className="text-muted-foreground">调度压力：</span>
-              <span className={credential.schedulerSelectionPressure > 1 ? 'font-medium text-amber-600' : 'font-medium'}>
-                {credential.schedulerSelectionPressure.toFixed(2)}
+              <span className={schedulerSelectionPressure > 1 ? 'font-medium text-amber-600' : 'font-medium'}>
+                {schedulerSelectionPressure.toFixed(2)}
               </span>
             </div>
             <div>
@@ -425,7 +438,7 @@ export function CredentialCard({
                       : credential.maxConcurrentRequests > 0 && credential.inFlightRequests >= credential.maxConcurrentRequests
                         ? `并发已满 ${credential.inFlightRequests}/${credential.maxConcurrentRequests}`
                         : credential.inProbation
-                          ? `恢复观察 ${credential.probationRemainingSecs}s`
+                          ? `恢复观察 ${probationRemainingSecs}s`
                         : `预热剩余 ${credential.warmupRemaining} 次`}
                 </span>
                 {credential.cooldownReason && (
