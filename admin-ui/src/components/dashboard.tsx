@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
-import { LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, BarChart3, Settings, DollarSign, Download, FileClock, RefreshCw } from 'lucide-react'
+import { LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, BarChart3, Settings, DollarSign, Download, FileClock, RefreshCw, Router } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -17,6 +17,7 @@ import { RuntimeConfigPanel } from '@/components/runtime-config-panel'
 import { ModelPricingPanel } from '@/components/model-pricing-panel'
 import { AuditLogsPanel } from '@/components/audit-logs-panel'
 import { CredentialExportDialog } from '@/components/credential-export-dialog'
+import { ProxyResourcesPanel } from '@/components/proxy-resources-panel'
 import { useCredentialsPage, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken, getCredentials, testCredential } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
@@ -45,7 +46,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
-  const [activeTab, setActiveTab] = useState<'credentials' | 'usage' | 'pricing' | 'audit' | 'config'>('credentials')
+  const [activeTab, setActiveTab] = useState<'credentials' | 'proxies' | 'usage' | 'pricing' | 'audit' | 'config'>('credentials')
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
@@ -607,6 +608,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
               凭据
             </Button>
             <Button
+              variant={activeTab === 'proxies' ? 'secondary' : 'ghost'}
+              size="sm"
+              onClick={() => setActiveTab('proxies')}
+            >
+              <Router className="h-4 w-4" />
+              代理
+            </Button>
+            <Button
               variant={activeTab === 'usage' ? 'secondary' : 'ghost'}
               size="sm"
               onClick={() => setActiveTab('usage')}
@@ -663,6 +672,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <main className="container mx-auto px-4 md:px-8 py-6">
         {activeTab === 'usage' ? (
           <UsageRecordsPanel />
+        ) : activeTab === 'proxies' ? (
+          <ProxyResourcesPanel />
         ) : activeTab === 'pricing' ? (
           <ModelPricingPanel />
         ) : activeTab === 'audit' ? (

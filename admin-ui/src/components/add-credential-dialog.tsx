@@ -9,7 +9,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { useAddCredential } from '@/hooks/use-credentials'
+import { useAddCredential, useProxyResources } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import { parseCredentialImportFiles } from '@/lib/credential-import'
 
@@ -34,9 +34,12 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [proxyUrl, setProxyUrl] = useState('')
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
+  const [proxyResourceId, setProxyResourceId] = useState('')
   const [endpoint, setEndpoint] = useState('')
 
   const { mutate, isPending } = useAddCredential()
+  const proxyResources = useProxyResources()
+  const proxyResourceOptions = proxyResources.data?.resources || []
 
   const resetForm = () => {
     setRefreshToken('')
@@ -52,6 +55,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setProxyUrl('')
     setProxyUsername('')
     setProxyPassword('')
+    setProxyResourceId('')
     setEndpoint('')
   }
 
@@ -71,6 +75,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     proxyUrl?: string
     proxyUsername?: string
     proxyPassword?: string
+    proxyResourceId?: number | null
     endpoint?: string
   }) => {
     setAuthMethod(credential.authMethod || (credential.kiroApiKey ? 'api_key' : credential.clientId && credential.clientSecret ? 'idc' : 'social'))
@@ -86,6 +91,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setProxyUrl(credential.proxyUrl || '')
     setProxyUsername(credential.proxyUsername || '')
     setProxyPassword(credential.proxyPassword || '')
+    setProxyResourceId(credential.proxyResourceId ? String(credential.proxyResourceId) : '')
     setEndpoint(credential.endpoint || '')
   }
 
@@ -153,6 +159,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         proxyUrl: proxyUrl.trim() || undefined,
         proxyUsername: proxyUsername.trim() || undefined,
         proxyPassword: proxyPassword.trim() || undefined,
+        proxyResourceId: proxyResourceId ? Number(proxyResourceId) : undefined,
         endpoint: endpoint.trim() || undefined,
       },
       {
@@ -373,6 +380,20 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
             {/* 代理配置 */}
             <div className="space-y-2">
               <label className="text-sm font-medium">代理配置</label>
+              <select
+                id="proxyResourceId"
+                value={proxyResourceId}
+                onChange={(e) => setProxyResourceId(e.target.value)}
+                disabled={isPending}
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <option value="">不绑定代理资源</option>
+                {proxyResourceOptions.map((resource) => (
+                  <option key={resource.id} value={resource.id} disabled={!resource.enabled}>
+                    {resource.name}{resource.enabled ? '' : '（已禁用）'}
+                  </option>
+                ))}
+              </select>
               <Input
                 id="proxyUrl"
                 placeholder='代理 URL（留空使用全局配置，"direct" 不使用代理）'
@@ -398,7 +419,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 />
               </div>
               <p className="text-xs text-muted-foreground">
-                留空使用全局代理。输入 "direct" 可显式不使用代理
+                代理 URL 优先于代理资源。留空时使用绑定资源；都不设置则使用全局代理。输入 "direct" 可显式不使用代理
               </p>
             </div>
           </div>

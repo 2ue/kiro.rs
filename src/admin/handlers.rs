@@ -13,9 +13,10 @@ use serde::Deserialize;
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, AdminErrorResponse, ClearInFlightRequest, ExportCredentialsQuery,
-        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SetWarmupRequest,
-        SuccessResponse, TestCredentialRequest, UpdateRuntimeConfigRequest,
+        AddCredentialRequest, AdminErrorResponse, ClearInFlightRequest, CreateProxyResourceRequest,
+        ExportCredentialsQuery, SetCredentialProxyRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SetWarmupRequest, SuccessResponse,
+        TestCredentialRequest, UpdateProxyResourceRequest, UpdateRuntimeConfigRequest,
     },
 };
 use crate::anthropic::usage::{UsageRecordQuery, UsageRecordStatus, UsageSource};
@@ -258,6 +259,65 @@ pub async fn test_credential(
 ) -> impl IntoResponse {
     match state.service.test_credential(id, payload).await {
         Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/proxy-resources
+/// 获取代理/家宽资源列表
+pub async fn get_proxy_resources(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.list_proxy_resources() {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/proxy-resources
+/// 新增代理/家宽资源
+pub async fn create_proxy_resource(
+    State(state): State<AdminState>,
+    Json(payload): Json<CreateProxyResourceRequest>,
+) -> impl IntoResponse {
+    match state.service.create_proxy_resource(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/proxy-resources/:id
+/// 更新代理/家宽资源
+pub async fn update_proxy_resource(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<UpdateProxyResourceRequest>,
+) -> impl IntoResponse {
+    match state.service.update_proxy_resource(id, payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// DELETE /api/admin/proxy-resources/:id
+/// 删除代理/家宽资源
+pub async fn delete_proxy_resource(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.delete_proxy_resource(id) {
+        Ok(_) => Json(SuccessResponse::new(format!("代理资源 #{} 已删除", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/proxy
+/// 设置凭据代理绑定
+pub async fn set_credential_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetCredentialProxyRequest>,
+) -> impl IntoResponse {
+    match state.service.set_credential_proxy(id, payload) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 代理已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

@@ -6,6 +6,7 @@ import {
   Loader2,
   Plus,
   RefreshCw,
+  Router,
   RotateCcw,
   Trash2,
   Upload,
@@ -36,8 +37,10 @@ import {
   useCredentialsPage,
   useDeleteCredential,
   useLoadBalancingMode,
+  useProxyResources,
   useResetFailure,
   useRuntimeConfig,
+  useSetCredentialProxy,
   useSetDisabled,
   useSetLoadBalancingMode,
   useSetPriority,
@@ -69,6 +72,14 @@ function numberOrZero(value: number | null | undefined): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0
 }
 
+function sourceLabel(source?: CredentialStatusItem['effectiveProxySource']) {
+  if (source === 'credential') return '直接代理'
+  if (source === 'resource') return '代理资源'
+  if (source === 'global') return '全局代理'
+  if (source === 'direct') return '直连'
+  return '未配置代理'
+}
+
 function CredentialCard({
   credential,
   selected,
@@ -87,9 +98,17 @@ function CredentialCard({
   loadingBalance: boolean
 }) {
   const [editingPriority, setEditingPriority] = useState(false)
+  const [editingProxy, setEditingProxy] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
+  const [proxyResourceId, setProxyResourceId] = useState(credential.proxyResourceId ? String(credential.proxyResourceId) : '')
+  const [proxyUrl, setProxyUrl] = useState(credential.proxyUrl || '')
+  const [proxyUsername, setProxyUsername] = useState('')
+  const [proxyPassword, setProxyPassword] = useState('')
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
+  const setCredentialProxy = useSetCredentialProxy()
+  const proxyResources = useProxyResources()
+  const proxyResourceOptions = proxyResources.data?.resources || []
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = forceRefreshToken
@@ -113,6 +132,13 @@ function CredentialCard({
     setPriorityValue(String(credential.priority))
   }, [credential.priority])
 
+  useEffect(() => {
+    setProxyResourceId(credential.proxyResourceId ? String(credential.proxyResourceId) : '')
+    setProxyUrl(credential.proxyUrl || '')
+    setProxyUsername('')
+    setProxyPassword('')
+  }, [credential.id, credential.proxyResourceId, credential.proxyUrl])
+
   const savePriority = () => {
     const priority = Number(priorityValue)
     if (!Number.isInteger(priority) || priority < 0) {
@@ -127,6 +153,27 @@ function CredentialCard({
           setEditingPriority(false)
         },
         onError: (error) => toast.error(`操作失败: ${extractErrorMessage(error)}`),
+      }
+    )
+  }
+
+  const saveProxy = () => {
+    setCredentialProxy.mutate(
+      {
+        id: credential.id,
+        request: {
+          proxyResourceId: proxyResourceId ? Number(proxyResourceId) : null,
+          proxyUrl: proxyUrl.trim() || undefined,
+          proxyUsername: proxyUsername.trim() || undefined,
+          proxyPassword: proxyPassword.trim() || undefined,
+        },
+      },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setEditingProxy(false)
+        },
+        onError: (error) => toast.error(`代理设置失败: ${extractErrorMessage(error)}`),
       }
     )
   }
@@ -184,6 +231,7 @@ function CredentialCard({
                 <Badge>{authLabel(credential.authMethod)}</Badge>
                 {credential.endpoint && credential.endpoint !== 'ide' && <Badge>{credential.endpoint}</Badge>}
                 {credential.hasProxy && <Badge tone="info">代理</Badge>}
+                {credential.proxyResourceName && <Badge tone="info">{credential.proxyResourceName}</Badge>}
               </div>
             </div>
           </div>
@@ -294,6 +342,44 @@ function CredentialCard({
               </>
             ) : (
               <div className="font-semibold text-base-content/50">未知</div>
+            )}
+          </div>
+          <div className="col-span-full">
+            <div className="text-[0.72rem] font-medium text-base-content/50">代理</div>
+            {editingProxy ? (
+              <div className="mt-1 grid gap-2 rounded-box border border-base-300 bg-base-200 p-2 md:grid-cols-2">
+                <FieldLabel title="代理资源" description="代理 URL 留空时生效">
+                  <Select bordered size="xs" value={proxyResourceId} onChange={(event) => setProxyResourceId(event.target.value)}>
+                    <Select.Option value="">不绑定</Select.Option>
+                    {proxyResourceOptions.map((resource) => (
+                      <Select.Option key={resource.id} value={String(resource.id)} disabled={!resource.enabled}>
+                        {resource.name}{resource.enabled ? '' : '（已禁用）'}
+                      </Select.Option>
+                    ))}
+                  </Select>
+                </FieldLabel>
+                <FieldLabel title="代理 URL" description='直接代理优先，"direct" 表示直连'>
+                  <Input bordered size="xs" value={proxyUrl} onChange={(event) => setProxyUrl(event.target.value)} />
+                </FieldLabel>
+                <FieldLabel title="代理用户名">
+                  <Input bordered size="xs" value={proxyUsername} onChange={(event) => setProxyUsername(event.target.value)} placeholder="留空不修改/不设置" />
+                </FieldLabel>
+                <FieldLabel title="代理密码">
+                  <Input bordered size="xs" type="password" value={proxyPassword} onChange={(event) => setProxyPassword(event.target.value)} placeholder="留空不修改/不设置" />
+                </FieldLabel>
+                <div className="flex gap-2 md:col-span-2">
+                  <Button type="button" color="primary" size="xs" onClick={saveProxy} disabled={setCredentialProxy.isPending}>
+                    {setCredentialProxy.isPending && <Loading size="xs" />}
+                    保存代理
+                  </Button>
+                  <Button type="button" color="ghost" size="xs" onClick={() => setEditingProxy(false)}>取消</Button>
+                </div>
+              </div>
+            ) : (
+              <Button type="button" color="ghost" size="xs" className="h-auto min-h-0 px-1 font-semibold" onClick={() => setEditingProxy(true)}>
+                <Router className="h-3.5 w-3.5" />
+                {credential.effectiveProxyUrl ? `${credential.proxyResourceName || sourceLabel(credential.effectiveProxySource)} · ${credential.effectiveProxyUrl}` : sourceLabel(credential.effectiveProxySource)}
+              </Button>
             )}
           </div>
         </div>

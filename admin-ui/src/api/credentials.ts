@@ -13,10 +13,15 @@ import type {
   AddCredentialResponse,
   TestCredentialRequest,
   TestCredentialResponse,
+  SetCredentialProxyRequest,
   RuntimeConfig,
   UpdateRuntimeConfigRequest,
   CredentialExportFormat,
   LoadBalancingMode,
+  ProxyResource,
+  ProxyResourcesResponse,
+  CreateProxyResourceRequest,
+  UpdateProxyResourceRequest,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -129,6 +134,14 @@ export async function testCredential(
   return data
 }
 
+export async function setCredentialProxy(
+  id: number,
+  req: SetCredentialProxyRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/proxy`, req)
+  return data
+}
+
 // 添加新凭据
 export async function addCredential(
   req: AddCredentialRequest
@@ -140,6 +153,31 @@ export async function addCredential(
 // 删除凭据
 export async function deleteCredential(id: number): Promise<SuccessResponse> {
   const { data } = await api.delete<SuccessResponse>(`/credentials/${id}`)
+  return data
+}
+
+export async function getProxyResources(): Promise<ProxyResourcesResponse> {
+  const { data } = await api.get<ProxyResourcesResponse>('/proxy-resources')
+  return data
+}
+
+export async function createProxyResource(
+  req: CreateProxyResourceRequest
+): Promise<ProxyResource> {
+  const { data } = await api.post<ProxyResource>('/proxy-resources', req)
+  return data
+}
+
+export async function updateProxyResource(
+  id: number,
+  req: UpdateProxyResourceRequest
+): Promise<ProxyResource> {
+  const { data } = await api.put<ProxyResource>(`/proxy-resources/${id}`, req)
+  return data
+}
+
+export async function deleteProxyResource(id: number): Promise<SuccessResponse> {
+  const { data } = await api.delete<SuccessResponse>(`/proxy-resources/${id}`)
   return data
 }
 

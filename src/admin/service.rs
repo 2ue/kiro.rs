@@ -11,9 +11,11 @@ use serde_json::json;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, ClearInFlightRequest,
-    CredentialAccountInfo, CredentialStatusItem, CredentialsPageResponse,
-    CredentialsStatusResponse, LoadBalancingModeResponse, RuntimeConfigResponse,
-    SetLoadBalancingModeRequest, SetWarmupRequest, TestCredentialRequest, TestCredentialResponse,
+    CreateProxyResourceRequest, CredentialAccountInfo, CredentialStatusItem,
+    CredentialsPageResponse, CredentialsStatusResponse, LoadBalancingModeResponse,
+    ProxyResourceResponse, ProxyResourcesResponse, RuntimeConfigResponse,
+    SetCredentialProxyRequest, SetLoadBalancingModeRequest, SetWarmupRequest,
+    TestCredentialRequest, TestCredentialResponse, UpdateProxyResourceRequest,
     UpdateRuntimeConfigRequest,
 };
 use crate::anthropic::{
@@ -34,7 +36,10 @@ use crate::kiro::model::requests::{
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::MultiTokenManager;
-use crate::storage::postgres::{AdminAuditLogPage, CredentialAccountInfoRow, PostgresStore};
+use crate::storage::postgres::{
+    AdminAuditLogPage, CreateProxyResourceRow, CredentialAccountInfoRow, PostgresStore,
+    ProxyResourceRow, UpdateProxyResourceRow,
+};
 use crate::storage::redis_cache::RedisStore;
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -111,6 +116,25 @@ impl AdminService {
                 tracing::warn!("清理 Redis 余额缓存失败: {}", err);
             }
         });
+    }
+
+    fn invalidate_all_credential_caches(&self) {
+        let snapshot = self.token_manager.snapshot();
+        for entry in snapshot.entries {
+            self.invalidate_balance_cache(entry.id);
+        }
+    }
+
+    fn reload_proxy_resources_after_admin_change(&self) {
+        if let Err(err) = self.token_manager.reload_proxy_resources_from_postgres() {
+            tracing::warn!("重新加载代理资源失败: {}", err);
+        }
+        if let Err(err) = self.token_manager.reload_credentials_from_postgres() {
+            tracing::warn!("代理资源变更后重新加载凭据失败: {}", err);
+        }
+        self.token_manager
+            .publish_admin_credentials_changed("proxy_resources_changed");
+        self.token_manager.notify_dispatch_state_changed();
     }
 
     fn audit(
@@ -252,6 +276,10 @@ impl AdminService {
                     last_used_at: entry.last_used_at.clone(),
                     has_proxy: entry.has_proxy,
                     proxy_url: entry.proxy_url,
+                    proxy_resource_id: entry.proxy_resource_id,
+                    proxy_resource_name: entry.proxy_resource_name,
+                    effective_proxy_url: entry.effective_proxy_url,
+                    effective_proxy_source: entry.effective_proxy_source,
                     refresh_failure_count: entry.refresh_failure_count,
                     disabled_reason: entry.disabled_reason,
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
@@ -571,6 +599,7 @@ impl AdminService {
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
+            proxy_resource_id: req.proxy_resource_id,
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
@@ -602,6 +631,160 @@ impl AdminService {
             credential_id,
             email,
         })
+    }
+
+    pub fn list_proxy_resources(&self) -> Result<ProxyResourcesResponse, AdminServiceError> {
+        let resources = block_on_admin_store({
+            let store = self.postgres_store.clone();
+            async move { store.load_proxy_resources().await }
+        })
+        .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        Ok(ProxyResourcesResponse {
+            resources: resources.into_iter().map(proxy_resource_response).collect(),
+        })
+    }
+
+    pub fn create_proxy_resource(
+        &self,
+        req: CreateProxyResourceRequest,
+    ) -> Result<ProxyResourceResponse, AdminServiceError> {
+        let name = required_trimmed(req.name, "代理名称")?;
+        let proxy_url = validate_proxy_url(&required_trimmed(req.proxy_url, "代理 URL")?)?;
+        let row = CreateProxyResourceRow {
+            name: name.clone(),
+            proxy_url: proxy_url.clone(),
+            proxy_username: optional_trimmed(req.proxy_username),
+            proxy_password: optional_trimmed(req.proxy_password),
+            enabled: req.enabled,
+            notes: optional_trimmed(req.notes),
+        };
+        let created = block_on_admin_store({
+            let store = self.postgres_store.clone();
+            async move { store.insert_proxy_resource(&row).await }
+        })
+        .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        self.reload_proxy_resources_after_admin_change();
+        self.audit(
+            "create_proxy_resource",
+            "proxy_resource",
+            Some(created.id.to_string()),
+            true,
+            None,
+            json!({ "name": name, "proxyUrl": proxy_url, "enabled": created.enabled }),
+        );
+        Ok(proxy_resource_response(created))
+    }
+
+    pub fn update_proxy_resource(
+        &self,
+        id: u64,
+        req: UpdateProxyResourceRequest,
+    ) -> Result<ProxyResourceResponse, AdminServiceError> {
+        let name = match req.name {
+            Some(value) => Some(required_trimmed(value, "代理名称")?),
+            None => None,
+        };
+        let proxy_url = match req.proxy_url {
+            Some(value) => Some(validate_proxy_url(&required_trimmed(value, "代理 URL")?)?),
+            None => None,
+        };
+        let update = UpdateProxyResourceRow {
+            name,
+            proxy_url,
+            proxy_username: if req.clear_username {
+                Some(None)
+            } else {
+                req.proxy_username
+                    .map(|value| optional_trimmed(Some(value)))
+            },
+            proxy_password: if req.clear_password {
+                Some(None)
+            } else {
+                req.proxy_password
+                    .map(|value| optional_trimmed(Some(value)))
+            },
+            enabled: req.enabled,
+            notes: if req.clear_notes {
+                Some(None)
+            } else {
+                req.notes.map(|value| optional_trimmed(Some(value)))
+            },
+        };
+        let updated = block_on_admin_store({
+            let store = self.postgres_store.clone();
+            async move { store.update_proxy_resource(id, &update).await }
+        })
+        .map_err(|e| AdminServiceError::InternalError(e.to_string()))?
+        .ok_or(AdminServiceError::NotFound { id })?;
+        self.reload_proxy_resources_after_admin_change();
+        self.audit(
+            "update_proxy_resource",
+            "proxy_resource",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({ "enabled": updated.enabled }),
+        );
+        Ok(proxy_resource_response(updated))
+    }
+
+    pub fn delete_proxy_resource(&self, id: u64) -> Result<(), AdminServiceError> {
+        let deleted = block_on_admin_store({
+            let store = self.postgres_store.clone();
+            async move { store.soft_delete_proxy_resource(id).await }
+        })
+        .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        if !deleted {
+            return Err(AdminServiceError::NotFound { id });
+        }
+        self.invalidate_all_credential_caches();
+        self.reload_proxy_resources_after_admin_change();
+        self.audit(
+            "delete_proxy_resource",
+            "proxy_resource",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({}),
+        );
+        Ok(())
+    }
+
+    pub fn set_credential_proxy(
+        &self,
+        id: u64,
+        req: SetCredentialProxyRequest,
+    ) -> Result<(), AdminServiceError> {
+        let proxy_url = match req.proxy_url {
+            Some(value) => {
+                let value = required_trimmed(value, "代理 URL")?;
+                if value.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT) {
+                    Some(KiroCredentials::PROXY_DIRECT.to_string())
+                } else {
+                    Some(validate_proxy_url(&value)?)
+                }
+            }
+            None => None,
+        };
+        self.token_manager
+            .set_credential_proxy(
+                id,
+                req.proxy_resource_id,
+                proxy_url,
+                optional_trimmed(req.proxy_username),
+                optional_trimmed(req.proxy_password),
+            )
+            .map_err(|e| self.classify_error(e, id))?;
+        self.invalidate_balance_cache(id);
+        self.audit(
+            "set_credential_proxy",
+            "credential",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({ "proxyResourceId": req.proxy_resource_id }),
+        );
+        Ok(())
     }
 
     /// 删除凭据
@@ -1298,6 +1481,7 @@ impl AdminService {
             || msg.contains("kiroApiKey 重复")
             || msg.contains("缺少 kiroApiKey")
             || msg.contains("kiroApiKey 为空")
+            || msg.contains("代理资源不存在或已禁用")
             || msg.contains("凭证已过期或无效")
             || msg.contains("权限不足")
             || msg.contains("已被限流");
@@ -1402,6 +1586,57 @@ fn normalize_credentials_limit(limit: usize) -> usize {
 
 fn total_pages(total: usize, limit: usize) -> usize {
     if total == 0 { 0 } else { total.div_ceil(limit) }
+}
+
+fn required_trimmed(value: String, label: &str) -> Result<String, AdminServiceError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(AdminServiceError::InvalidCredential(format!(
+            "{}不能为空",
+            label
+        )));
+    }
+    Ok(value.to_string())
+}
+
+fn optional_trimmed(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn validate_proxy_url(value: &str) -> Result<String, AdminServiceError> {
+    let parsed = url::Url::parse(value).map_err(|_| {
+        AdminServiceError::InvalidCredential(
+            "代理 URL 必须是 http://、https:// 或 socks5:// 开头的完整地址".to_string(),
+        )
+    })?;
+    match parsed.scheme() {
+        "http" | "https" | "socks5" => Ok(value.to_string()),
+        scheme => Err(AdminServiceError::InvalidCredential(format!(
+            "不支持的代理协议: {}，仅支持 http/https/socks5",
+            scheme
+        ))),
+    }
+}
+
+fn proxy_resource_response(row: ProxyResourceRow) -> ProxyResourceResponse {
+    ProxyResourceResponse {
+        id: row.id,
+        name: row.name,
+        proxy_url: row.proxy_url,
+        proxy_username: row.proxy_username,
+        has_password: row
+            .proxy_password
+            .as_deref()
+            .map(|value| !value.is_empty())
+            .unwrap_or(false),
+        enabled: row.enabled,
+        notes: row.notes,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        credential_count: row.credential_count,
+    }
 }
 
 fn account_info_from_row(row: &CredentialAccountInfoRow) -> CredentialAccountInfo {

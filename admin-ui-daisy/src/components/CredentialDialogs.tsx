@@ -8,7 +8,7 @@ import { parseCredentialImportFiles, parseCredentialImportText } from '@/lib/cre
 import { parseKamFiles, parseKamJson, type KamAccount } from '@/lib/kam-import'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, TEST_MODELS, testModelLabel } from '@/lib/test-models'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
-import { useAddCredential, useDeleteCredential, useTestCredential } from '@/hooks/use-credentials'
+import { useAddCredential, useDeleteCredential, useProxyResources, useTestCredential } from '@/hooks/use-credentials'
 import type {
   AddCredentialRequest,
   CredentialExportFormat,
@@ -18,7 +18,7 @@ import type {
 
 type AuthMethod = 'social' | 'idc' | 'api_key'
 
-function initialCredentialForm(): Required<Pick<AddCredentialRequest, 'email' | 'refreshToken' | 'kiroApiKey' | 'authRegion' | 'apiRegion' | 'clientId' | 'clientSecret' | 'machineId' | 'proxyUrl' | 'proxyUsername' | 'proxyPassword' | 'endpoint'>> & { authMethod: AuthMethod; priority: string } {
+function initialCredentialForm(): Required<Pick<AddCredentialRequest, 'email' | 'refreshToken' | 'kiroApiKey' | 'authRegion' | 'apiRegion' | 'clientId' | 'clientSecret' | 'machineId' | 'proxyUrl' | 'proxyUsername' | 'proxyPassword' | 'endpoint'>> & { authMethod: AuthMethod; priority: string; proxyResourceId: string } {
   return {
     authMethod: 'social',
     refreshToken: '',
@@ -33,6 +33,7 @@ function initialCredentialForm(): Required<Pick<AddCredentialRequest, 'email' | 
     proxyUrl: '',
     proxyUsername: '',
     proxyPassword: '',
+    proxyResourceId: '',
     endpoint: '',
   }
 }
@@ -53,6 +54,7 @@ function formFromCredential(credential: AddCredentialRequest) {
     proxyUrl: credential.proxyUrl || '',
     proxyUsername: credential.proxyUsername || '',
     proxyPassword: credential.proxyPassword || '',
+    proxyResourceId: credential.proxyResourceId ? String(credential.proxyResourceId) : '',
     endpoint: credential.endpoint || '',
   }
 }
@@ -66,6 +68,8 @@ export function AddCredentialModal({
 }) {
   const [form, setForm] = useState(initialCredentialForm)
   const add = useAddCredential()
+  const proxyResources = useProxyResources()
+  const proxyResourceOptions = proxyResources.data?.resources || []
   const isApiKey = form.authMethod === 'api_key'
 
   useEffect(() => {
@@ -113,6 +117,7 @@ export function AddCredentialModal({
         proxyUrl: form.proxyUrl.trim() || undefined,
         proxyUsername: form.proxyUsername.trim() || undefined,
         proxyPassword: form.proxyPassword.trim() || undefined,
+        proxyResourceId: form.proxyResourceId ? Number(form.proxyResourceId) : undefined,
         endpoint: form.endpoint.trim() || undefined,
       },
       {
@@ -179,6 +184,16 @@ export function AddCredentialModal({
           </FieldLabel>
           <FieldLabel title="端点" description="留空使用全局 defaultEndpoint">
             <Input bordered size="sm" value={form.endpoint} onChange={(event) => update('endpoint', event.target.value)} placeholder="ide / cli" />
+          </FieldLabel>
+          <FieldLabel title="代理资源" description="未填写代理 URL 时生效">
+            <Select bordered size="sm" value={form.proxyResourceId} onChange={(event) => update('proxyResourceId', event.target.value)}>
+              <Select.Option value="">不绑定</Select.Option>
+              {proxyResourceOptions.map((resource) => (
+                <Select.Option key={resource.id} value={String(resource.id)} disabled={!resource.enabled}>
+                  {resource.name}{resource.enabled ? '' : '（已禁用）'}
+                </Select.Option>
+              ))}
+            </Select>
           </FieldLabel>
           <FieldLabel title="代理 URL" description='留空使用全局代理，"direct" 表示直连'>
             <Input bordered size="sm" value={form.proxyUrl} onChange={(event) => update('proxyUrl', event.target.value)} />
@@ -522,6 +537,7 @@ export function BatchImportModal({
           proxyUrl: cred.proxyUrl?.trim() || undefined,
           proxyUsername: cred.proxyUsername?.trim() || undefined,
           proxyPassword: cred.proxyPassword?.trim() || undefined,
+          proxyResourceId: cred.proxyResourceId || undefined,
           endpoint: cred.endpoint?.trim() || undefined,
         })
         addedId = added.credentialId

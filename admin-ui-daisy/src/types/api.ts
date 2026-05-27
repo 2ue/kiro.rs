@@ -41,6 +41,10 @@ export interface CredentialStatusItem {
   lastUsedAt: string | null
   hasProxy: boolean
   proxyUrl?: string
+  proxyResourceId?: number
+  proxyResourceName?: string
+  effectiveProxyUrl?: string
+  effectiveProxySource: 'credential' | 'resource' | 'global' | 'direct' | 'none'
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
@@ -125,6 +129,7 @@ export interface AddCredentialRequest {
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
+  proxyResourceId?: number | null
   kiroApiKey?: string
   endpoint?: string
 }
@@ -149,6 +154,51 @@ export interface TestCredentialResponse {
   prompt: string
   response: string
   durationMs: number
+}
+
+export interface ProxyResource {
+  id: number
+  name: string
+  proxyUrl: string
+  proxyUsername?: string | null
+  hasPassword: boolean
+  enabled: boolean
+  notes?: string | null
+  createdAt: string
+  updatedAt: string
+  credentialCount: number
+}
+
+export interface ProxyResourcesResponse {
+  resources: ProxyResource[]
+}
+
+export interface CreateProxyResourceRequest {
+  name: string
+  proxyUrl: string
+  proxyUsername?: string
+  proxyPassword?: string
+  enabled?: boolean
+  notes?: string
+}
+
+export interface UpdateProxyResourceRequest {
+  name?: string
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+  clearUsername?: boolean
+  clearPassword?: boolean
+  enabled?: boolean
+  notes?: string
+  clearNotes?: boolean
+}
+
+export interface SetCredentialProxyRequest {
+  proxyResourceId?: number | null
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
 }
 
 export type UsageRecordStatus =

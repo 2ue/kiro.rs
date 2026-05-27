@@ -101,6 +101,12 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_password: Option<String>,
 
+    /// 绑定的代理/家宽资源 ID（可选）
+    ///
+    /// 直接配置 proxyUrl 时优先使用凭据级代理；未配置 proxyUrl 时才使用该资源。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_resource_id: Option<u64>,
+
     /// 凭据是否被禁用（默认为 false）
     #[serde(default)]
     pub disabled: bool,

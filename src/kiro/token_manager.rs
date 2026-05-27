@@ -26,7 +26,9 @@ use crate::kiro::model::token_refresh::{
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
-use crate::storage::postgres::{CredentialRuntimeStateRow, CredentialStatsRow, PostgresStore};
+use crate::storage::postgres::{
+    CredentialRuntimeStateRow, CredentialStatsRow, PostgresStore, ProxyResourceRow,
+};
 use crate::storage::redis_cache::{
     RedisStore, SchedulerCredentialState, SchedulerGlobalCapacityState, SchedulerHealthState,
     SchedulerSessionBinding,
@@ -91,6 +93,29 @@ pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::R
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ProxyResourceRuntime {
+    id: u64,
+    name: String,
+    proxy_url: String,
+    proxy_username: Option<String>,
+    proxy_password: Option<String>,
+    enabled: bool,
+}
+
+impl From<ProxyResourceRow> for ProxyResourceRuntime {
+    fn from(row: ProxyResourceRow) -> Self {
+        Self {
+            id: row.id,
+            name: row.name,
+            proxy_url: row.proxy_url,
+            proxy_username: row.proxy_username,
+            proxy_password: row.proxy_password,
+            enabled: row.enabled,
+        }
+    }
 }
 
 /// Refresh Token 永久失效错误
@@ -674,6 +699,17 @@ pub struct CredentialEntrySnapshot {
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// 绑定的代理/家宽资源 ID。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_resource_id: Option<u64>,
+    /// 绑定的代理/家宽资源名称。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_resource_name: Option<String>,
+    /// 实际生效的代理 URL（直接代理、绑定资源或全局代理）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_proxy_url: Option<String>,
+    /// 实际代理来源：direct / resource / global / none。
+    pub effective_proxy_source: String,
     /// Token 刷新连续失败次数
     pub refresh_failure_count: u32,
     /// 禁用原因
@@ -776,6 +812,8 @@ pub struct MultiTokenManager {
     postgres_store: Option<Arc<PostgresStore>>,
     /// Redis 运行态存储后端。生产用于跨实例调度状态；测试可使用 None 走本地内存。
     redis_store: Option<Arc<RedisStore>>,
+    /// 代理/家宽资源快照。凭据直接代理优先，未设置时可通过 proxy_resource_id 绑定这里的资源。
+    proxy_resources: Arc<Mutex<HashMap<u64, ProxyResourceRuntime>>>,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
     /// 最近一次统计持久化时间（用于 debounce）
@@ -1249,6 +1287,24 @@ impl MultiTokenManager {
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
+        let proxy_resources = if let Some(store) = &postgres_store {
+            let store = store.clone();
+            match block_on_storage("从 PgSQL 加载代理资源", async move {
+                store.load_proxy_resources().await
+            }) {
+                Ok(resources) => resources
+                    .into_iter()
+                    .map(ProxyResourceRuntime::from)
+                    .map(|resource| (resource.id, resource))
+                    .collect(),
+                Err(err) => {
+                    tracing::warn!("加载代理资源失败: {}", err);
+                    HashMap::new()
+                }
+            }
+        } else {
+            HashMap::new()
+        };
         let manager = Self {
             config: Mutex::new(config),
             proxy,
@@ -1257,6 +1313,7 @@ impl MultiTokenManager {
             refresh_lock: TokioMutex::new(()),
             postgres_store,
             redis_store,
+            proxy_resources: Arc::new(Mutex::new(proxy_resources)),
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
@@ -2867,13 +2924,14 @@ impl MultiTokenManager {
     ) -> anyhow::Result<CallContext> {
         // API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需刷新
         if credentials.is_api_key_credential() {
+            let credentials = self.resolve_proxy_for_credential(credentials.clone());
             let token = credentials
                 .kiro_api_key
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?;
             return Ok(CallContext {
                 id,
-                credentials: credentials.clone(),
+                credentials,
                 token,
                 sticky_bound: false,
                 fallback_from_sticky: false,
@@ -2951,16 +3009,23 @@ impl MultiTokenManager {
                 }
 
                 // 确实需要刷新
-                let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+                let current_creds_for_proxy =
+                    self.resolve_proxy_for_credential(current_creds.clone());
+                let effective_proxy = current_creds_for_proxy.effective_proxy(self.proxy.as_ref());
                 let config = self.runtime_config();
                 let refresh_result =
-                    refresh_token(&current_creds, &config, effective_proxy.as_ref()).await;
+                    refresh_token(&current_creds_for_proxy, &config, effective_proxy.as_ref())
+                        .await;
                 if let Some((redis, lock_token)) = redis_refresh_lock {
                     if let Err(err) = redis.release_refresh_lock(id, &lock_token).await {
                         tracing::warn!(credential_id = id, "释放 Redis Token 刷新锁失败: {}", err);
                     }
                 }
-                let new_creds = refresh_result?;
+                let mut new_creds = refresh_result?;
+                new_creds.proxy_url = current_creds.proxy_url.clone();
+                new_creds.proxy_username = current_creds.proxy_username.clone();
+                new_creds.proxy_password = current_creds.proxy_password.clone();
+                new_creds.proxy_resource_id = current_creds.proxy_resource_id;
 
                 if is_token_expired(&new_creds) {
                     anyhow::bail!("刷新后的 Token 仍然无效或已过期");
@@ -3000,6 +3065,7 @@ impl MultiTokenManager {
         creds: KiroCredentials,
         update_refresh_health: bool,
     ) -> anyhow::Result<CallContext> {
+        let creds = self.resolve_proxy_for_credential(creds);
         let token = creds
             .access_token
             .clone()
@@ -3029,6 +3095,68 @@ impl MultiTokenManager {
             fallback_from_sticky: false,
             in_flight_lease: None,
         })
+    }
+
+    fn resolve_proxy_for_credential(&self, mut creds: KiroCredentials) -> KiroCredentials {
+        if creds.proxy_url.is_some() {
+            return creds;
+        }
+        let Some(resource_id) = creds.proxy_resource_id else {
+            return creds;
+        };
+        let resources = self.proxy_resources.lock();
+        let Some(resource) = resources.get(&resource_id) else {
+            tracing::warn!(
+                credential_id = creds.id.unwrap_or_default(),
+                proxy_resource_id = resource_id,
+                "凭据绑定的代理资源不存在，回退到全局代理/直连"
+            );
+            return creds;
+        };
+        if !resource.enabled {
+            tracing::warn!(
+                credential_id = creds.id.unwrap_or_default(),
+                proxy_resource_id = resource_id,
+                proxy_resource_name = resource.name,
+                "凭据绑定的代理资源已禁用，回退到全局代理/直连"
+            );
+            return creds;
+        }
+        creds.proxy_url = Some(resource.proxy_url.clone());
+        creds.proxy_username = resource.proxy_username.clone();
+        creds.proxy_password = resource.proxy_password.clone();
+        creds
+    }
+
+    fn effective_proxy_display(&self, creds: &KiroCredentials) -> (Option<String>, String) {
+        match creds.proxy_url.as_deref() {
+            Some(url) if url.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT) => {
+                (None, "direct".to_string())
+            }
+            Some(url) => (Some(url.to_string()), "credential".to_string()),
+            None => {
+                if let Some(resource_id) = creds.proxy_resource_id {
+                    let resources = self.proxy_resources.lock();
+                    if let Some(resource) = resources.get(&resource_id) {
+                        if resource.enabled {
+                            return (Some(resource.proxy_url.clone()), "resource".to_string());
+                        }
+                    }
+                }
+                match &self.proxy {
+                    Some(proxy) => (Some(proxy.url.clone()), "global".to_string()),
+                    None => (None, "none".to_string()),
+                }
+            }
+        }
+    }
+
+    fn proxy_resource_name(&self, resource_id: Option<u64>) -> Option<String> {
+        let resource_id = resource_id?;
+        self.proxy_resources
+            .lock()
+            .get(&resource_id)
+            .map(|resource| resource.name.clone())
     }
 
     fn credential_from_entry(entry: &CredentialEntry) -> KiroCredentials {
@@ -3106,6 +3234,7 @@ impl MultiTokenManager {
         let Some(store) = &self.postgres_store else {
             return Ok(false);
         };
+        let proxy_changed = self.reload_proxy_resources_from_postgres()?;
         let store = store.clone();
         let credentials = block_on_storage("从 PgSQL 重新加载凭据", async move {
             store.load_credentials().await
@@ -3171,6 +3300,37 @@ impl MultiTokenManager {
             self.load_runtime_state();
             self.select_highest_priority();
         }
+        Ok(changed || proxy_changed)
+    }
+
+    pub fn reload_proxy_resources_from_postgres(&self) -> anyhow::Result<bool> {
+        let Some(store) = &self.postgres_store else {
+            return Ok(false);
+        };
+        let store = store.clone();
+        let resources = block_on_storage("从 PgSQL 重新加载代理资源", async move {
+            store.load_proxy_resources().await
+        })?;
+        let next: HashMap<u64, ProxyResourceRuntime> = resources
+            .into_iter()
+            .map(ProxyResourceRuntime::from)
+            .map(|resource| (resource.id, resource))
+            .collect();
+        let mut current = self.proxy_resources.lock();
+        let changed = current.len() != next.len()
+            || next.iter().any(|(id, next_resource)| {
+                current.get(id).is_none_or(|current_resource| {
+                    current_resource.name != next_resource.name
+                        || current_resource.proxy_url != next_resource.proxy_url
+                        || current_resource.proxy_username != next_resource.proxy_username
+                        || current_resource.proxy_password != next_resource.proxy_password
+                        || current_resource.enabled != next_resource.enabled
+                })
+            });
+        if changed {
+            *current = next;
+            tracing::info!("已重新加载 {} 个代理资源", current.len());
+        }
         Ok(changed)
     }
 
@@ -3224,6 +3384,10 @@ impl MultiTokenManager {
         }) {
             tracing::warn!("发布 Redis 凭据变更通知失败: {}", err);
         }
+    }
+
+    pub fn publish_admin_credentials_changed(&self, reason: &str) {
+        self.publish_credentials_changed(reason);
     }
 
     pub(crate) fn notify_dispatch_state_changed(&self) {
@@ -4373,6 +4537,10 @@ impl MultiTokenManager {
             entries: entries
                 .iter()
                 .map(|e| {
+                    let (effective_proxy_url, effective_proxy_source) =
+                        self.effective_proxy_display(&e.credentials);
+                    let proxy_resource_id = e.credentials.proxy_resource_id;
+                    let proxy_resource_name = self.proxy_resource_name(proxy_resource_id);
                     let oldest_in_flight_age_secs = e
                         .in_flight_leases
                         .iter()
@@ -4431,8 +4599,12 @@ impl MultiTokenManager {
                         success_count: e.success_count,
                         total_selection_count: e.total_selection_count,
                         last_used_at: e.last_used_at.clone(),
-                        has_proxy: e.credentials.proxy_url.is_some(),
+                        has_proxy: effective_proxy_url.is_some(),
                         proxy_url: e.credentials.proxy_url.clone(),
+                        proxy_resource_id,
+                        proxy_resource_name,
+                        effective_proxy_url,
+                        effective_proxy_source,
                         refresh_failure_count: e.refresh_failure_count,
                         disabled_reason: e.disabled_reason.map(|r| r.as_str().to_string()),
                         endpoint: e.credentials.endpoint.clone(),
@@ -4715,6 +4887,18 @@ impl MultiTokenManager {
     /// - `Err(_)` - 验证失败或添加失败
     pub async fn add_credential(&self, new_cred: KiroCredentials) -> anyhow::Result<u64> {
         // 1. 基本验证
+        if let Some(resource_id) = new_cred.proxy_resource_id {
+            let exists = self
+                .proxy_resources
+                .lock()
+                .get(&resource_id)
+                .map(|resource| resource.enabled)
+                .unwrap_or(false);
+            if !exists {
+                anyhow::bail!("代理资源不存在或已禁用: {}", resource_id);
+            }
+        }
+
         if new_cred.is_api_key_credential() {
             let api_key = new_cred
                 .kiro_api_key
@@ -4776,9 +4960,10 @@ impl MultiTokenManager {
         let mut validated_cred = if new_cred.is_api_key_credential() {
             new_cred.clone()
         } else {
-            let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
+            let new_cred_for_proxy = self.resolve_proxy_for_credential(new_cred.clone());
+            let effective_proxy = new_cred_for_proxy.effective_proxy(self.proxy.as_ref());
             let config = self.runtime_config();
-            refresh_token(&new_cred, &config, effective_proxy.as_ref()).await?
+            refresh_token(&new_cred_for_proxy, &config, effective_proxy.as_ref()).await?
         };
 
         // 4. 保留用户输入的元数据
@@ -4800,6 +4985,7 @@ impl MultiTokenManager {
         validated_cred.proxy_url = new_cred.proxy_url;
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
+        validated_cred.proxy_resource_id = new_cred.proxy_resource_id;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
         validated_cred.endpoint = new_cred.endpoint;
         if validated_cred.machine_id.is_none() {
@@ -4885,6 +5071,57 @@ impl MultiTokenManager {
             entry.warmup_remaining = warmup_remaining;
         }
         self.publish_credentials_changed("credential_warmup_updated");
+        self.notify_dispatch_state_changed();
+        Ok(())
+    }
+
+    pub fn set_credential_proxy(
+        &self,
+        id: u64,
+        proxy_resource_id: Option<u64>,
+        proxy_url: Option<String>,
+        proxy_username: Option<String>,
+        proxy_password: Option<String>,
+    ) -> anyhow::Result<()> {
+        if let Some(resource_id) = proxy_resource_id {
+            let exists = self
+                .proxy_resources
+                .lock()
+                .get(&resource_id)
+                .map(|resource| resource.enabled)
+                .unwrap_or(false);
+            if !exists {
+                anyhow::bail!("代理资源不存在或已禁用: {}", resource_id);
+            }
+        }
+
+        let credential = {
+            let entries = self.entries.lock();
+            let entry = entries
+                .iter()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            let mut credential = Self::credential_from_entry(entry);
+            credential.proxy_resource_id = proxy_resource_id;
+            credential.proxy_url = proxy_url;
+            credential.proxy_username = proxy_username;
+            credential.proxy_password = proxy_password;
+            credential
+        };
+        self.persist_credential_value(&credential)?;
+
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.proxy_resource_id = credential.proxy_resource_id;
+            entry.credentials.proxy_url = credential.proxy_url;
+            entry.credentials.proxy_username = credential.proxy_username;
+            entry.credentials.proxy_password = credential.proxy_password;
+        }
+        self.publish_credentials_changed("credential_proxy_updated");
         self.notify_dispatch_state_changed();
         Ok(())
     }
@@ -4997,15 +5234,21 @@ impl MultiTokenManager {
         }
 
         // 无条件调用 refresh_token
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let credentials_for_proxy = self.resolve_proxy_for_credential(credentials.clone());
+        let effective_proxy = credentials_for_proxy.effective_proxy(self.proxy.as_ref());
         let config = self.runtime_config();
-        let refresh_result = refresh_token(&credentials, &config, effective_proxy.as_ref()).await;
+        let refresh_result =
+            refresh_token(&credentials_for_proxy, &config, effective_proxy.as_ref()).await;
         if let Some((redis, lock_token)) = redis_refresh_lock {
             if let Err(err) = redis.release_refresh_lock(id, &lock_token).await {
                 tracing::warn!(credential_id = id, "释放 Redis Token 刷新锁失败: {}", err);
             }
         }
-        let new_creds = refresh_result?;
+        let mut new_creds = refresh_result?;
+        new_creds.proxy_url = credentials.proxy_url;
+        new_creds.proxy_username = credentials.proxy_username;
+        new_creds.proxy_password = credentials.proxy_password;
+        new_creds.proxy_resource_id = credentials.proxy_resource_id;
 
         // 更新 entries 中对应凭据
         {

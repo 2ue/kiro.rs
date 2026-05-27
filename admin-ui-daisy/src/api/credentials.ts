@@ -7,13 +7,18 @@ import type {
   CredentialsPageQuery,
   CredentialsPageResponse,
   CredentialsStatusResponse,
+  CreateProxyResourceRequest,
   RuntimeConfig,
   SetDisabledRequest,
+  SetCredentialProxyRequest,
   SetPriorityRequest,
   SetWarmupRequest,
   SuccessResponse,
   TestCredentialRequest,
   TestCredentialResponse,
+  ProxyResource,
+  ProxyResourcesResponse,
+  UpdateProxyResourceRequest,
   UpdateRuntimeConfigRequest,
   LoadBalancingMode,
 } from '@/types/api'
@@ -68,6 +73,11 @@ export async function testCredential(id: number, req: TestCredentialRequest): Pr
   return data
 }
 
+export async function setCredentialProxy(id: number, req: SetCredentialProxyRequest): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/proxy`, req)
+  return data
+}
+
 export async function addCredential(req: AddCredentialRequest): Promise<AddCredentialResponse> {
   const { data } = await api.post<AddCredentialResponse>('/credentials', req)
   return data
@@ -75,6 +85,26 @@ export async function addCredential(req: AddCredentialRequest): Promise<AddCrede
 
 export async function deleteCredential(id: number): Promise<SuccessResponse> {
   const { data } = await api.delete<SuccessResponse>(`/credentials/${id}`)
+  return data
+}
+
+export async function getProxyResources(): Promise<ProxyResourcesResponse> {
+  const { data } = await api.get<ProxyResourcesResponse>('/proxy-resources')
+  return data
+}
+
+export async function createProxyResource(req: CreateProxyResourceRequest): Promise<ProxyResource> {
+  const { data } = await api.post<ProxyResource>('/proxy-resources', req)
+  return data
+}
+
+export async function updateProxyResource(id: number, req: UpdateProxyResourceRequest): Promise<ProxyResource> {
+  const { data } = await api.put<ProxyResource>(`/proxy-resources/${id}`, req)
+  return data
+}
+
+export async function deleteProxyResource(id: number): Promise<SuccessResponse> {
+  const { data } = await api.delete<SuccessResponse>(`/proxy-resources/${id}`)
   return data
 }
 

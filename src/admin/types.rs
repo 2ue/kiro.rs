@@ -121,6 +121,17 @@ pub struct CredentialStatusItem {
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// 绑定的代理/家宽资源 ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_resource_id: Option<u64>,
+    /// 绑定的代理/家宽资源名称
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_resource_name: Option<String>,
+    /// 实际生效代理 URL
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_proxy_url: Option<String>,
+    /// 实际代理来源：credential / resource / global / direct / none
+    pub effective_proxy_source: String,
     /// Token 刷新连续失败次数
     pub refresh_failure_count: u32,
     /// 禁用原因
@@ -276,6 +287,9 @@ pub struct AddCredentialRequest {
     /// 凭据级代理认证密码（可选）
     pub proxy_password: Option<String>,
 
+    /// 绑定的代理/家宽资源 ID（可选）
+    pub proxy_resource_id: Option<u64>,
+
     /// Kiro API Key（API Key 凭据必填，格式: ksk_xxxxxxxx）
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -301,6 +315,71 @@ pub struct AddCredentialResponse {
     /// 用户邮箱（如果获取成功）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+}
+
+// ============ 代理/家宽资源 ============
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyResourceResponse {
+    pub id: u64,
+    pub name: String,
+    pub proxy_url: String,
+    pub proxy_username: Option<String>,
+    pub has_password: bool,
+    pub enabled: bool,
+    pub notes: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub credential_count: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyResourcesResponse {
+    pub resources: Vec<ProxyResourceResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateProxyResourceRequest {
+    pub name: String,
+    pub proxy_url: String,
+    pub proxy_username: Option<String>,
+    pub proxy_password: Option<String>,
+    #[serde(default = "default_proxy_resource_enabled")]
+    pub enabled: bool,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateProxyResourceRequest {
+    pub name: Option<String>,
+    pub proxy_url: Option<String>,
+    pub proxy_username: Option<String>,
+    pub proxy_password: Option<String>,
+    #[serde(default)]
+    pub clear_username: bool,
+    #[serde(default)]
+    pub clear_password: bool,
+    pub enabled: Option<bool>,
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub clear_notes: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialProxyRequest {
+    pub proxy_resource_id: Option<u64>,
+    pub proxy_url: Option<String>,
+    pub proxy_username: Option<String>,
+    pub proxy_password: Option<String>,
+}
+
+fn default_proxy_resource_enabled() -> bool {
+    true
 }
 
 /// 测试凭据模型调用请求

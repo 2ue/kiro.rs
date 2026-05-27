@@ -2,25 +2,33 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   addCredential,
   clearCredentialInFlight,
+  createProxyResource,
   deleteCredential,
+  deleteProxyResource,
   forceRefreshToken,
   getCredentialBalance,
   getCredentials,
   getCredentialsPage,
   getLoadBalancingMode,
+  getProxyResources,
   getRuntimeConfig,
   resetCredentialFailure,
   setCredentialDisabled,
   setCredentialPriority,
+  setCredentialProxy,
   setCredentialWarmup,
   setLoadBalancingMode,
   testCredential,
+  updateProxyResource,
   updateRuntimeConfig,
 } from '@/api/credentials'
 import type {
   AddCredentialRequest,
+  CreateProxyResourceRequest,
   CredentialsPageQuery,
+  SetCredentialProxyRequest,
   TestCredentialRequest,
+  UpdateProxyResourceRequest,
   UpdateRuntimeConfigRequest,
 } from '@/types/api'
 
@@ -61,6 +69,58 @@ export function useCredentialBalance(id: number | null) {
 export function useTestCredential() {
   return useMutation({
     mutationFn: ({ id, request }: { id: number; request: TestCredentialRequest }) => testCredential(id, request),
+  })
+}
+
+export function useProxyResources() {
+  return useQuery({
+    queryKey: ['proxy-resources'],
+    queryFn: getProxyResources,
+    refetchInterval: 30000,
+  })
+}
+
+export function useCreateProxyResource() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: CreateProxyResourceRequest) => createProxyResource(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['proxy-resources'] })
+      invalidateCredentialCaches(queryClient)
+    },
+  })
+}
+
+export function useUpdateProxyResource() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, request }: { id: number; request: UpdateProxyResourceRequest }) => updateProxyResource(id, request),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['proxy-resources'] })
+      invalidateCredentialCaches(queryClient)
+    },
+  })
+}
+
+export function useDeleteProxyResource() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => deleteProxyResource(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['proxy-resources'] })
+      invalidateCredentialCaches(queryClient)
+    },
+  })
+}
+
+export function useSetCredentialProxy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, request }: { id: number; request: SetCredentialProxyRequest }) => setCredentialProxy(id, request),
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({ queryKey: ['proxy-resources'] })
+      invalidateCredentialCaches(queryClient, variables.id)
+    },
   })
 }
 

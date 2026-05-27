@@ -261,6 +261,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               proxyUrl: cred.proxyUrl?.trim() || undefined,
               proxyUsername: cred.proxyUsername?.trim() || undefined,
               proxyPassword: cred.proxyPassword?.trim() || undefined,
+              proxyResourceId: cred.proxyResourceId || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
             })
 
@@ -323,6 +324,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             proxyUrl: cred.proxyUrl?.trim() || undefined,
             proxyUsername: cred.proxyUsername?.trim() || undefined,
             proxyPassword: cred.proxyPassword?.trim() || undefined,
+            proxyResourceId: cred.proxyResourceId || undefined,
             endpoint: cred.endpoint?.trim() || undefined,
           })
 

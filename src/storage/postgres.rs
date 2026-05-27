@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{
     PgPool, Postgres, QueryBuilder, Row, Transaction,
@@ -18,6 +18,61 @@ use crate::anthropic::usage::{
 };
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyResourceRow {
+    pub id: u64,
+    pub name: String,
+    pub proxy_url: String,
+    pub proxy_username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_password: Option<String>,
+    pub enabled: bool,
+    pub notes: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub credential_count: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateProxyResourceRow {
+    pub name: String,
+    pub proxy_url: String,
+    pub proxy_username: Option<String>,
+    pub proxy_password: Option<String>,
+    pub enabled: bool,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UpdateProxyResourceRow {
+    pub name: Option<String>,
+    pub proxy_url: Option<String>,
+    pub proxy_username: Option<Option<String>>,
+    pub proxy_password: Option<Option<String>>,
+    pub enabled: Option<bool>,
+    pub notes: Option<Option<String>>,
+}
+
+fn proxy_resource_from_row(row: PgRow) -> anyhow::Result<ProxyResourceRow> {
+    let id: i64 = row.try_get("id")?;
+    let created_at: DateTime<Utc> = row.try_get("created_at")?;
+    let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
+    let credential_count: i64 = row.try_get("credential_count").unwrap_or(0);
+    Ok(ProxyResourceRow {
+        id: id as u64,
+        name: row.try_get("name")?,
+        proxy_url: row.try_get("proxy_url")?,
+        proxy_username: row.try_get("proxy_username")?,
+        proxy_password: row.try_get("proxy_password")?,
+        enabled: row.try_get("enabled")?,
+        notes: row.try_get("notes")?,
+        created_at: created_at.to_rfc3339(),
+        updated_at: updated_at.to_rfc3339(),
+        credential_count: credential_count.max(0) as u64,
+    })
+}
 
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
@@ -469,6 +524,149 @@ impl PostgresStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn load_proxy_resources(&self) -> anyhow::Result<Vec<ProxyResourceRow>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT pr.id, pr.name, pr.proxy_url, pr.proxy_username, pr.proxy_password,
+                   pr.enabled, pr.notes, pr.created_at, pr.updated_at,
+                   COUNT(c.id) FILTER (WHERE c.deleted_at IS NULL) AS credential_count
+            FROM proxy_resources pr
+            LEFT JOIN credentials c
+              ON c.deleted_at IS NULL
+             AND (c.data->>'proxyResourceId') ~ '^[0-9]+$'
+             AND (c.data->>'proxyResourceId')::BIGINT = pr.id
+            WHERE pr.deleted_at IS NULL
+            GROUP BY pr.id
+            ORDER BY pr.id ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(proxy_resource_from_row).collect()
+    }
+
+    pub async fn get_proxy_resource(&self, id: u64) -> anyhow::Result<Option<ProxyResourceRow>> {
+        let row = sqlx::query(
+            r#"
+            SELECT pr.id, pr.name, pr.proxy_url, pr.proxy_username, pr.proxy_password,
+                   pr.enabled, pr.notes, pr.created_at, pr.updated_at,
+                   COUNT(c.id) FILTER (WHERE c.deleted_at IS NULL) AS credential_count
+            FROM proxy_resources pr
+            LEFT JOIN credentials c
+              ON c.deleted_at IS NULL
+             AND (c.data->>'proxyResourceId') ~ '^[0-9]+$'
+             AND (c.data->>'proxyResourceId')::BIGINT = pr.id
+            WHERE pr.id = $1 AND pr.deleted_at IS NULL
+            GROUP BY pr.id
+            "#,
+        )
+        .bind(id as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(proxy_resource_from_row).transpose()
+    }
+
+    pub async fn insert_proxy_resource(
+        &self,
+        resource: &CreateProxyResourceRow,
+    ) -> anyhow::Result<ProxyResourceRow> {
+        let row = sqlx::query(
+            r#"
+            INSERT INTO proxy_resources (
+                name, proxy_url, proxy_username, proxy_password,
+                enabled, notes, updated_at, deleted_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, now(), NULL)
+            RETURNING id, name, proxy_url, proxy_username, proxy_password,
+                      enabled, notes, created_at, updated_at,
+                      0::BIGINT AS credential_count
+            "#,
+        )
+        .bind(&resource.name)
+        .bind(&resource.proxy_url)
+        .bind(&resource.proxy_username)
+        .bind(&resource.proxy_password)
+        .bind(resource.enabled)
+        .bind(&resource.notes)
+        .fetch_one(&self.pool)
+        .await?;
+        proxy_resource_from_row(row)
+    }
+
+    pub async fn update_proxy_resource(
+        &self,
+        id: u64,
+        update: &UpdateProxyResourceRow,
+    ) -> anyhow::Result<Option<ProxyResourceRow>> {
+        sqlx::query(
+            r#"
+            UPDATE proxy_resources
+            SET name = COALESCE($2, name),
+                proxy_url = COALESCE($3, proxy_url),
+                proxy_username = CASE WHEN $4 THEN $5 ELSE proxy_username END,
+                proxy_password = CASE WHEN $6 THEN $7 ELSE proxy_password END,
+                enabled = COALESCE($8, enabled),
+                notes = CASE WHEN $9 THEN $10 ELSE notes END,
+                updated_at = now()
+            WHERE id = $1 AND deleted_at IS NULL
+            "#,
+        )
+        .bind(id as i64)
+        .bind(&update.name)
+        .bind(&update.proxy_url)
+        .bind(update.proxy_username.is_some())
+        .bind(update.proxy_username.clone().flatten())
+        .bind(update.proxy_password.is_some())
+        .bind(update.proxy_password.clone().flatten())
+        .bind(update.enabled)
+        .bind(update.notes.is_some())
+        .bind(update.notes.clone().flatten())
+        .execute(&self.pool)
+        .await?;
+
+        self.get_proxy_resource(id).await
+    }
+
+    pub async fn soft_delete_proxy_resource(&self, id: u64) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            r#"
+            UPDATE proxy_resources
+            SET deleted_at = now(),
+                enabled = false,
+                updated_at = now()
+            WHERE id = $1 AND deleted_at IS NULL
+            "#,
+        )
+        .bind(id as i64)
+        .execute(&mut *tx)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE credentials
+            SET data = data - 'proxyResourceId',
+                updated_at = now()
+            WHERE deleted_at IS NULL
+              AND (data->>'proxyResourceId') ~ '^[0-9]+$'
+              AND (data->>'proxyResourceId')::BIGINT = $1
+            "#,
+        )
+        .bind(id as i64)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub async fn delete_credential_stats_and_runtime(
@@ -1915,6 +2113,44 @@ CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_credentials_refresh_token_hash
     ON credentials (refresh_token_hash)
     WHERE deleted_at IS NULL AND refresh_token_hash IS NOT NULL;
 
+CREATE TABLE IF NOT EXISTS proxy_resources (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    proxy_url TEXT NOT NULL,
+    proxy_username TEXT,
+    proxy_password TEXT,
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    notes TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ
+);
+
+ALTER TABLE proxy_resources
+    ADD COLUMN IF NOT EXISTS proxy_username TEXT;
+
+ALTER TABLE proxy_resources
+    ADD COLUMN IF NOT EXISTS proxy_password TEXT;
+
+ALTER TABLE proxy_resources
+    ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT true;
+
+ALTER TABLE proxy_resources
+    ADD COLUMN IF NOT EXISTS notes TEXT;
+
+ALTER TABLE proxy_resources
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+ALTER TABLE proxy_resources
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+ALTER TABLE proxy_resources
+    ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_proxy_resources_active
+    ON proxy_resources (id)
+    WHERE deleted_at IS NULL;
+
 CREATE TABLE IF NOT EXISTS credential_stats (
     credential_id BIGINT PRIMARY KEY REFERENCES credentials(id) ON DELETE CASCADE,
     success_count BIGINT NOT NULL DEFAULT 0,
@@ -2096,6 +2332,7 @@ mod tests {
             "TRUNCATE TABLE credential_runtime_state CASCADE",
             "TRUNCATE TABLE credential_stats CASCADE",
             "TRUNCATE TABLE credentials CASCADE",
+            "TRUNCATE TABLE proxy_resources CASCADE",
             "TRUNCATE TABLE runtime_config",
         ] {
             sqlx::query(statement).execute(store.pool()).await.unwrap();

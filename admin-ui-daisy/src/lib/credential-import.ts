@@ -100,6 +100,7 @@ export function normalizeCredentialImportItem(value: unknown): AddCredentialRequ
     proxyUrl: stringField(normalized.proxyUrl) ?? stringField(nested?.proxyUrl),
     proxyUsername: stringField(normalized.proxyUsername) ?? stringField(nested?.proxyUsername),
     proxyPassword: stringField(normalized.proxyPassword) ?? stringField(nested?.proxyPassword),
+    proxyResourceId: numberField(normalized.proxyResourceId) ?? numberField(nested?.proxyResourceId),
     endpoint: stringField(normalized.endpoint) ?? stringField(nested?.endpoint),
   }
 }
