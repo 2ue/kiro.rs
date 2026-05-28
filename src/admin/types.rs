@@ -8,7 +8,7 @@ use crate::model::config::{CompatProfile, CompressionConfig, ReportedUsageConfig
 
 /// 凭据账号信息的最后一次查询快照。
 ///
-/// 余额和用量来自上游 getUsageLimits，属于会变化的外部状态；这里表示“最后一次查询结果”，
+/// 额度和用量来自上游 getUsageLimits，属于会变化的外部状态；这里表示“最后一次查询结果”，
 /// 前端应配合 checkedAt 展示，避免误解为实时值。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -71,12 +71,16 @@ pub struct CredentialsPageResponse {
     pub limit: usize,
     /// 总页数
     pub total_pages: usize,
+    /// 查询条件命中的凭据总数；无筛选时等于 total。
+    pub filtered_total: usize,
+    /// 查询条件命中的未禁用凭据数；无筛选时等于 available。
+    pub filtered_available: usize,
     /// 当前页凭据状态列表
     pub credentials: Vec<CredentialStatusItem>,
 }
 
 /// 单个凭据的状态信息
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialStatusItem {
     /// 凭据唯一 ID
@@ -241,7 +245,7 @@ pub struct ClearInFlightRequest {
 }
 
 /// 添加凭据请求
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddCredentialRequest {
     /// 刷新令牌（OAuth 凭据必填，API Key 凭据不需要）
@@ -408,9 +412,9 @@ pub struct TestCredentialResponse {
     pub duration_ms: u64,
 }
 
-// ============ 余额查询 ============
+// ============ 账号信息查询 ============
 
-/// 余额查询响应
+/// 账号信息查询响应。字段中的使用量和总额单位是 Kiro credits，不是美元。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BalanceResponse {
@@ -430,6 +434,102 @@ pub struct BalanceResponse {
     pub usage_percentage: f64,
     /// 下次重置时间（Unix 时间戳）
     pub next_reset_at: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshCredentialInfoRequest {
+    pub ids: Vec<u64>,
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialInfoRefreshItem {
+    pub id: u64,
+    pub email: Option<String>,
+    pub disabled: bool,
+    pub ok: bool,
+    pub info: Option<BalanceResponse>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialInfoRefreshResponse {
+    pub total: usize,
+    pub success: usize,
+    pub failed: usize,
+    pub items: Vec<CredentialInfoRefreshItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidateExistingCredentialsRequest {
+    /// all / enabled / disabled / selected
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub ids: Vec<u64>,
+    #[serde(default = "default_true")]
+    pub force: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidateExternalCredentialsRequest {
+    #[serde(default)]
+    pub credentials: Vec<AddCredentialRequest>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialValidationInfo {
+    pub subscription_title: Option<String>,
+    pub current_usage: f64,
+    pub usage_limit: f64,
+    pub usage_percentage: f64,
+    pub checked_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialValidationItem {
+    pub id: Option<u64>,
+    pub index: Option<usize>,
+    pub email: Option<String>,
+    pub disabled: Option<bool>,
+    pub ok: bool,
+    pub previous: Option<CredentialValidationInfo>,
+    pub current: Option<CredentialValidationInfo>,
+    pub change_kind: String,
+    pub subscription_key: String,
+    pub subscription_title: String,
+    pub error: Option<String>,
+    pub matched_existing_credential_id: Option<u64>,
+    pub existing_disabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialValidationGroup {
+    pub key: String,
+    pub title: String,
+    pub count: usize,
+    pub items: Vec<CredentialValidationItem>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialValidationResponse {
+    pub total: usize,
+    pub success: usize,
+    pub failed: usize,
+    pub downgraded: usize,
+    pub upgraded: usize,
+    pub unchanged: usize,
+    pub groups: Vec<CredentialValidationGroup>,
 }
 
 // ============ 负载均衡配置 ============

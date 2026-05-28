@@ -518,14 +518,16 @@ impl SseStateManager {
     }
 }
 
-use super::converter::get_context_window_size;
+const DEFAULT_CONTEXT_WINDOW_TOKENS: i32 = 200_000;
 
 /// 流处理上下文
 pub struct StreamContext {
     /// SSE 状态管理器
     pub state_manager: SseStateManager,
-    /// 请求的模型名称
+    /// 下游请求的模型名称，用于响应保持 Anthropic 兼容。
     pub model: String,
+    /// 当前上游模型目录中的输入窗口大小，用于 contextUsageEvent 百分比换算。
+    pub context_window_tokens: i32,
     /// 消息 ID
     pub message_id: String,
     /// 输入 tokens（估算值）
@@ -589,6 +591,7 @@ impl StreamContext {
         Self::new_with_simulation(
             model,
             input_tokens,
+            DEFAULT_CONTEXT_WINDOW_TOKENS,
             thinking_enabled,
             true,
             tool_name_map,
@@ -600,6 +603,7 @@ impl StreamContext {
     pub fn new_with_simulation(
         model: impl Into<String>,
         input_tokens: i32,
+        context_window_tokens: i32,
         thinking_enabled: bool,
         extract_xml_thinking: bool,
         tool_name_map: HashMap<String, String>,
@@ -609,6 +613,7 @@ impl StreamContext {
         Self {
             state_manager: SseStateManager::new(),
             model: model.into(),
+            context_window_tokens,
             message_id: envelope::message_id(),
             input_tokens,
             context_input_tokens: None,
@@ -754,7 +759,7 @@ impl StreamContext {
             }
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
-                let window_size = get_context_window_size(&self.model);
+                let window_size = self.context_window_tokens;
                 let actual_input_tokens =
                     (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
                 self.context_input_tokens = Some(actual_input_tokens);
@@ -1658,6 +1663,7 @@ mod tests {
         let mut ctx = StreamContext::new_with_simulation(
             "test-model",
             1,
+            DEFAULT_CONTEXT_WINDOW_TOKENS,
             true,
             false,
             HashMap::new(),

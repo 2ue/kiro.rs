@@ -76,6 +76,12 @@ pub struct UsageRecord {
     pub endpoint: String,
     pub stream: bool,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_resolution_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_resolution_note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -704,7 +710,7 @@ fn record_matches(record: &UsageRecord, query: &UsageRecordQuery) -> bool {
         }
     }
     if let Some(model) = &query.model {
-        if &record.model != model {
+        if &record.model != model && record.upstream_model.as_ref() != Some(model) {
             return false;
         }
     }
@@ -764,6 +770,9 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
         Some(record.created_at.as_str()),
         Some(record.endpoint.as_str()),
         Some(record.model.as_str()),
+        record.upstream_model.as_deref(),
+        record.model_resolution_source.as_deref(),
+        record.model_resolution_note.as_deref(),
         record.conversation_id.as_deref(),
         record.credential_label.as_deref(),
         Some(status),
@@ -836,6 +845,9 @@ mod tests {
             endpoint: "/v1/messages".to_string(),
             stream: true,
             model: "claude-sonnet-4-5".to_string(),
+            upstream_model: None,
+            model_resolution_source: None,
+            model_resolution_note: None,
             conversation_id: Some("session-a".to_string()),
             credential_id: Some(1),
             credential_label: Some("test@example.com".to_string()),

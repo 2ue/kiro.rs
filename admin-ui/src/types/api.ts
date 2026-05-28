@@ -14,11 +14,18 @@ export interface CredentialsPageResponse extends CredentialsStatusResponse {
   page: number
   limit: number
   totalPages: number
+  filteredTotal: number
+  filteredAvailable: number
 }
 
 export interface CredentialsPageQuery {
   page: number
   limit: number
+  q?: string
+  status?: string
+  authMethod?: string
+  subscription?: string
+  proxyResourceId?: number
 }
 
 // 单个凭据状态
@@ -100,6 +107,80 @@ export interface BalanceResponse {
   remaining: number
   usagePercentage: number
   nextResetAt: number | null
+}
+
+export type CredentialInfoResponse = BalanceResponse
+
+export interface RefreshCredentialInfoRequest {
+  ids: number[]
+  force?: boolean
+}
+
+export interface CredentialInfoRefreshItem {
+  id: number
+  email?: string | null
+  disabled: boolean
+  ok: boolean
+  info?: CredentialInfoResponse | null
+  error?: string | null
+}
+
+export interface CredentialInfoRefreshResponse {
+  total: number
+  success: number
+  failed: number
+  items: CredentialInfoRefreshItem[]
+}
+
+export interface ValidateExistingCredentialsRequest {
+  scope?: 'all' | 'enabled' | 'disabled' | 'selected'
+  ids?: number[]
+  force?: boolean
+}
+
+export interface ValidateExternalCredentialsRequest {
+  credentials: AddCredentialRequest[]
+}
+
+export interface CredentialValidationInfo {
+  subscriptionTitle: string | null
+  currentUsage: number
+  usageLimit: number
+  usagePercentage: number
+  checkedAt: string
+}
+
+export interface CredentialValidationItem {
+  id?: number | null
+  index?: number | null
+  email?: string | null
+  disabled?: boolean | null
+  ok: boolean
+  previous?: CredentialValidationInfo | null
+  current?: CredentialValidationInfo | null
+  changeKind: string
+  subscriptionKey: string
+  subscriptionTitle: string
+  error?: string | null
+  matchedExistingCredentialId?: number | null
+  existingDisabled?: boolean | null
+}
+
+export interface CredentialValidationGroup {
+  key: string
+  title: string
+  count: number
+  items: CredentialValidationItem[]
+}
+
+export interface CredentialValidationResponse {
+  total: number
+  success: number
+  failed: number
+  downgraded: number
+  upgraded: number
+  unchanged: number
+  groups: CredentialValidationGroup[]
 }
 
 // 成功响应
@@ -237,6 +318,7 @@ export interface KiroCredentialAttempt {
   status?: number
   statusText?: string
   action: string
+  model?: string
   errorType?: string
   errorMessage?: string
   durationMs: number
@@ -248,6 +330,9 @@ export interface UsageRecord {
   endpoint: string
   stream: boolean
   model: string
+  upstreamModel?: string
+  modelResolutionSource?: string
+  modelResolutionNote?: string
   conversationId?: string
   credentialId?: number
   credentialLabel?: string

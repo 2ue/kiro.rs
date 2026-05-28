@@ -390,14 +390,18 @@ export function ConfigPanel() {
     <SectionCard
       title="运行时配置"
       description="这些配置会写入 PgSQL 并对后续新请求热加载生效；监听地址、密钥、数据库连接和代理客户端等启动期配置仍需要改启动配置后重启。"
-      actions={
-        <Button type="button" color="primary" size="sm" onClick={save} disabled={updateConfig.isPending}>
-          {updateConfig.isPending ? <Loading size="xs" /> : <Save className="h-4 w-4" />}
-          保存
-        </Button>
-      }
     >
       <div className="space-y-4">
+        <div className="sticky top-[4.25rem] z-30 flex flex-col gap-2 rounded-box border border-base-300 bg-base-100/95 p-2 shadow-sm backdrop-blur sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0 text-xs leading-5 text-base-content/60">
+            修改运行时配置后点击保存，新请求会热加载生效。
+          </div>
+          <Button type="button" color="primary" size="sm" className="shrink-0" onClick={save} disabled={updateConfig.isPending}>
+            {updateConfig.isPending ? <Loading size="xs" /> : <Save className="h-4 w-4" />}
+            保存
+          </Button>
+        </div>
+
         <Tabs variant="boxed" size="sm" className="config-tabs">
           {configTabs.map((tab) => (
             <Tabs.Tab

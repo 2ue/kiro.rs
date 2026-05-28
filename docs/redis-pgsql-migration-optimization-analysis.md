@@ -30,7 +30,7 @@
 
 - 凭据日常写操作改为行级写入：新增、禁用、优先级、删除、Token 刷新、订阅等级更新都不再通过“旧内存快照覆盖整份凭据列表”来表达删除。
 - 新增凭据 ID 由 PgSQL sequence 分配，且 sequence 只在首次 bootstrap 显式导入旧 ID 后同步，避免并发新增时被 `setval(max(id)+1)` 倒回。
-- 凭据重复检测由 PgSQL active hash 唯一索引兜底，API Key 和 refreshToken 都有 active 唯一约束。
+- 凭据重复检测由 PgSQL 未软删除 hash 唯一索引兜底，API Key 和 refreshToken 都有未软删除唯一约束。这里不按 `disabled` 过滤，禁用凭据也应该阻止重复导入。
 - `success_count`、`last_used_at`、API 失败计数、刷新失败计数、额度禁用、refreshToken 失效禁用都走 PgSQL 单行事务或原子增量。
 - `reload_credentials_from_postgres()` 已改成完整 reconcile，能处理其他实例新增、删除、更新凭据。
 - runtime config 有 version，后台更新后发布 Redis 事件；主进程监听 pub/sub，并有 60 秒周期兜底 reload。
@@ -166,11 +166,11 @@ Redis 可以开 AOF，但业务仍不应该依赖 Redis 做持久事实源。
 
 ### 当前状态
 
-当前 `PostgresStore::save_credentials()` 仍是整份保存：
+当前 `PostgresStore::save_credentials()` 已经改成非破坏性保存：
 
 - 遍历传入凭据 upsert。
-- 查询数据库中所有 active 凭据。
-- 如果数据库 active ID 不在本次传入列表中，就软删除。
+- 不查询数据库中其他未软删除凭据并推导删除。
+- 明确删除只能走 delete action 的软删除路径。
 
 `MultiTokenManager::persist_credentials()` 会从当前 `entries` 生成完整凭据列表，再调用 `save_credentials()`。
 
@@ -263,7 +263,7 @@ INSERT INTO credentials (...) VALUES (...) RETURNING id
 - `credential_fingerprint`
 - `deleted_at`
 
-并加部分唯一索引：
+并加部分唯一索引；索引名里的 `active` 仅表示 `deleted_at IS NULL`，不表示 `disabled = false`：
 
 ```sql
 CREATE UNIQUE INDEX uniq_active_api_key_hash

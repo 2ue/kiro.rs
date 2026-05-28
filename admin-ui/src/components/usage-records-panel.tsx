@@ -632,6 +632,12 @@ export function UsageRecordsPanel() {
                 <div>
                   <div className="text-xs text-muted-foreground">模型</div>
                   <div className="break-all">{selectedRecord.model || '-'}</div>
+                  {selectedRecord.upstreamModel && selectedRecord.upstreamModel !== selectedRecord.model && (
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      上游模型：{selectedRecord.upstreamModel}
+                      {selectedRecord.modelResolutionSource ? `（${selectedRecord.modelResolutionSource}）` : ''}
+                    </div>
+                  )}
                 </div>
                 <div>
                   <div className="text-xs text-muted-foreground">会话</div>
@@ -686,6 +692,11 @@ export function UsageRecordsPanel() {
                               {attempt.credentialLabel && (
                                 <div className="max-w-[220px] truncate text-muted-foreground" title={attempt.credentialLabel}>
                                   {attempt.credentialLabel}
+                                </div>
+                              )}
+                              {attempt.model && (
+                                <div className="max-w-[220px] truncate text-xs text-muted-foreground" title={attempt.model}>
+                                  模型 {attempt.model}
                                 </div>
                               )}
                             </td>

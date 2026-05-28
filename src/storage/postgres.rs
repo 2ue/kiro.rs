@@ -343,7 +343,11 @@ impl PostgresStore {
         rows.into_iter().map(credential_from_row).collect()
     }
 
-    pub async fn find_active_api_key_credential(
+    /// 查询未软删除的 API Key 凭据。
+    ///
+    /// 这里的“存在”只对应 `deleted_at IS NULL`，不等于已启用或可调度。
+    /// 已禁用凭据仍然应该被识别为已有凭据，避免重启或导入时重复写入。
+    pub async fn find_existing_api_key_credential(
         &self,
         api_key: &str,
     ) -> anyhow::Result<Option<KiroCredentials>> {
@@ -376,7 +380,7 @@ impl PostgresStore {
         if api_key.is_empty() {
             anyhow::bail!("KIRO_API_KEY 为空");
         }
-        if let Some(existing) = self.find_active_api_key_credential(api_key).await? {
+        if let Some(existing) = self.find_existing_api_key_credential(api_key).await? {
             return Ok(existing);
         }
 
@@ -389,7 +393,7 @@ impl PostgresStore {
         match self.insert_credential(&credential).await {
             Ok(inserted) => Ok(inserted),
             Err(err) if err.to_string().contains("kiroApiKey 重复") => self
-                .find_active_api_key_credential(api_key)
+                .find_existing_api_key_credential(api_key)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("KIRO_API_KEY 已存在但重新查询失败")),
             Err(err) => Err(err),
@@ -441,7 +445,7 @@ impl PostgresStore {
     /// 非破坏性保存凭据列表。
     ///
     /// 该方法用于首次 bootstrap 或补全旧凭据字段，只 upsert 传入行，不删除
-    /// PgSQL 中其他 active 凭据，避免旧进程内存快照覆盖其他实例新增的凭据。
+    /// PgSQL 中其他未软删除凭据，避免旧进程内存快照覆盖其他实例新增的凭据。
     pub async fn save_credentials(&self, credentials: &[KiroCredentials]) -> anyhow::Result<()> {
         for credential in credentials {
             if credential.id.is_some() {
@@ -2121,6 +2125,9 @@ ALTER TABLE credentials
 ALTER TABLE credentials
     ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 
+-- 这里的 active 是数据库索引名里的历史术语，含义是“未软删除”
+-- (`deleted_at IS NULL`)，不是 `disabled = false`。禁用凭据仍属于后台
+-- 管理范围，也继续参与重复导入检测。
 CREATE INDEX IF NOT EXISTS idx_credentials_active_priority
     ON credentials (priority, id)
     WHERE deleted_at IS NULL;
@@ -2366,6 +2373,9 @@ mod tests {
             endpoint: "/v1/messages".to_string(),
             stream: false,
             model: "claude-sonnet-4-5".to_string(),
+            upstream_model: None,
+            model_resolution_source: None,
+            model_resolution_note: None,
             conversation_id: Some("session-a".to_string()),
             credential_id: Some(7),
             credential_label: Some("alpha@example.com".to_string()),
@@ -2481,7 +2491,7 @@ mod tests {
         assert_eq!(
             credentials.len(),
             2,
-            "保存旧快照不应软删除数据库中其他 active 凭据"
+            "保存旧快照不应软删除数据库中其他未软删除凭据"
         );
         store
             .save_credentials(&[KiroCredentials {

@@ -667,17 +667,21 @@ impl KiroProvider {
         error_type: Option<&str>,
         error_message: Option<String>,
         started_at: Instant,
+        model: Option<&str>,
     ) {
-        attempts.push(KiroCredentialAttempt::new(
-            attempt,
-            credential_id,
-            Some(credential_label.to_string()),
-            status,
-            action,
-            error_type,
-            error_message,
-            started_at.elapsed().as_millis() as u64,
-        ));
+        attempts.push(
+            KiroCredentialAttempt::new(
+                attempt,
+                credential_id,
+                Some(credential_label.to_string()),
+                status,
+                action,
+                error_type,
+                error_message,
+                started_at.elapsed().as_millis() as u64,
+            )
+            .with_model(model),
+        );
     }
 
     fn log_attempt_chain(
@@ -891,7 +895,8 @@ impl KiroProvider {
     /// 从 Kiro 上游同步可用模型列表。
     ///
     /// 该方法只用于后台模型能力同步：失败会返回给调用方记录状态，不会写入调度失败、
-    /// 不会禁用凭据，也不会占用请求并发槽。
+    /// 不会禁用凭据，也不会占用请求并发槽。由于同步会真实调用 Kiro 上游，
+    /// 这里只自动使用未禁用凭据，避免后台任务绕过用户手动禁用。
     pub async fn list_available_models(&self) -> anyhow::Result<Vec<KiroAvailableModel>> {
         let credential_ids: Vec<u64> = self
             .token_manager
@@ -929,7 +934,7 @@ impl KiroProvider {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("没有可用于同步模型能力的凭据")))
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("没有已启用且可用于同步模型能力的凭据")))
     }
 
     async fn list_available_models_for_context(
@@ -1488,6 +1493,7 @@ impl KiroProvider {
                         Some("endpoint_error"),
                         Some(message.clone()),
                         attempt_started_at,
+                        model.as_deref(),
                     );
                     last_error = Some(anyhow::anyhow!(message));
                     if let Some(session_id) = conversation_id.as_deref() {
@@ -1537,6 +1543,7 @@ impl KiroProvider {
                         Some("client_error"),
                         Some(message.clone()),
                         attempt_started_at,
+                        model.as_deref(),
                     );
                     Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
                     self.finish_attempt(&mut ctx);
@@ -1578,6 +1585,7 @@ impl KiroProvider {
                         Some("send_error"),
                         Some(message.clone()),
                         attempt_started_at,
+                        model.as_deref(),
                     );
                     last_error = Some(anyhow::anyhow!(message));
                     if let Err(err) = self.token_manager.report_transient_failure_kind(
@@ -1662,6 +1670,7 @@ impl KiroProvider {
                             Some("non_eventstream"),
                             Some(message.clone()),
                             attempt_started_at,
+                            model.as_deref(),
                         );
                         if let Err(err) = self.token_manager.report_transient_failure_kind(
                             ctx.id,
@@ -1706,6 +1715,7 @@ impl KiroProvider {
                         Some("non_eventstream"),
                         Some(message.clone()),
                         attempt_started_at,
+                        model.as_deref(),
                     );
                     Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
                     self.finish_attempt(&mut ctx);
@@ -1729,6 +1739,7 @@ impl KiroProvider {
                             None::<&str>,
                             None::<String>,
                             attempt_started_at,
+                            model.as_deref(),
                         );
                         Self::log_attempt_chain(request_id, api_type, &attempts, "success");
                         attempts
@@ -1780,6 +1791,7 @@ impl KiroProvider {
                         Some("risk_control"),
                         Some(final_message.clone()),
                         attempt_started_at,
+                        model.as_deref(),
                     );
                     Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
                     self.finish_attempt(&mut ctx);
@@ -1795,6 +1807,7 @@ impl KiroProvider {
                     Some("risk_control"),
                     Some(message.clone()),
                     attempt_started_at,
+                    model.as_deref(),
                 );
                 last_error = Some(anyhow::anyhow!(message));
                 self.finish_attempt(&mut ctx);
@@ -1838,6 +1851,7 @@ impl KiroProvider {
                         Some("quota_exhausted"),
                         Some(final_message.clone()),
                         attempt_started_at,
+                        model.as_deref(),
                     );
                     Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
                     self.finish_attempt(&mut ctx);
@@ -1854,6 +1868,7 @@ impl KiroProvider {
                     Some("quota_exhausted"),
                     Some(message.clone()),
                     attempt_started_at,
+                    model.as_deref(),
                 );
                 last_error = Some(anyhow::anyhow!(message));
                 self.maybe_exclude_after_soft_failure(
@@ -1882,6 +1897,7 @@ impl KiroProvider {
                     Some("payment_required"),
                     Some(message.clone()),
                     attempt_started_at,
+                    model.as_deref(),
                 );
                 last_error = Some(anyhow::anyhow!(message));
                 if let Err(err) = self.token_manager.report_transient_failure_kind(
@@ -1919,6 +1935,7 @@ impl KiroProvider {
                     Some("bad_request"),
                     Some(message.clone()),
                     attempt_started_at,
+                    model.as_deref(),
                 );
                 Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
                 self.finish_attempt(&mut ctx);
@@ -1962,6 +1979,7 @@ impl KiroProvider {
                         Some("scheduler_state_error"),
                         Some(final_message.clone()),
                         attempt_started_at,
+                        model.as_deref(),
                     );
                     Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
                     self.finish_attempt(&mut ctx);
@@ -1997,6 +2015,7 @@ impl KiroProvider {
                             Some("auth_error"),
                             Some(message.clone()),
                             attempt_started_at,
+                            model.as_deref(),
                         );
                         self.finish_attempt(&mut ctx);
                         continue;
@@ -2030,6 +2049,7 @@ impl KiroProvider {
                         Some("credential_failure"),
                         Some(final_message.clone()),
                         attempt_started_at,
+                        model.as_deref(),
                     );
                     Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
                     self.finish_attempt(&mut ctx);
@@ -2046,6 +2066,7 @@ impl KiroProvider {
                     Some("credential_failure"),
                     Some(message.clone()),
                     attempt_started_at,
+                    model.as_deref(),
                 );
                 last_error = Some(anyhow::anyhow!(message));
                 self.finish_attempt(&mut ctx);
@@ -2079,6 +2100,7 @@ impl KiroProvider {
                     Some("transient_error"),
                     Some(message.clone()),
                     attempt_started_at,
+                    model.as_deref(),
                 );
                 last_error = Some(anyhow::anyhow!(message));
                 let kind = if status.as_u16() == 429 {
@@ -2136,6 +2158,7 @@ impl KiroProvider {
                     Some("client_error"),
                     Some(message.clone()),
                     attempt_started_at,
+                    model.as_deref(),
                 );
                 Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
                 self.finish_attempt(&mut ctx);
@@ -2167,6 +2190,7 @@ impl KiroProvider {
                 Some("unknown_error"),
                 Some(message.clone()),
                 attempt_started_at,
+                model.as_deref(),
             );
             last_error = Some(anyhow::anyhow!(message));
             if let Err(err) = self.token_manager.report_transient_failure_kind(

@@ -14,9 +14,11 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, AdminErrorResponse, ClearInFlightRequest, CreateProxyResourceRequest,
-        ExportCredentialsQuery, SetCredentialProxyRequest, SetDisabledRequest,
-        SetLoadBalancingModeRequest, SetPriorityRequest, SetWarmupRequest, SuccessResponse,
-        TestCredentialRequest, UpdateProxyResourceRequest, UpdateRuntimeConfigRequest,
+        ExportCredentialsQuery, RefreshCredentialInfoRequest, SetCredentialProxyRequest,
+        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SetWarmupRequest,
+        SuccessResponse, TestCredentialRequest, UpdateProxyResourceRequest,
+        UpdateRuntimeConfigRequest, ValidateExistingCredentialsRequest,
+        ValidateExternalCredentialsRequest,
     },
 };
 use crate::anthropic::usage::{UsageRecordQuery, UsageRecordStatus, UsageSource};
@@ -26,6 +28,17 @@ use crate::anthropic::usage::{UsageRecordQuery, UsageRecordStatus, UsageSource};
 pub struct CredentialsPageQueryParams {
     pub page: Option<usize>,
     pub limit: Option<usize>,
+    pub q: Option<String>,
+    pub status: Option<String>,
+    pub auth_method: Option<String>,
+    pub subscription: Option<String>,
+    pub proxy_resource_id: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialInfoQueryParams {
+    pub force: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,6 +169,13 @@ pub async fn get_credentials_page(
     Json(state.service.get_credentials_page(
         params.page.unwrap_or_default(),
         params.limit.unwrap_or_default(),
+        super::service::CredentialListQuery {
+            q: non_blank(params.q),
+            status: non_blank(params.status),
+            auth_method: non_blank(params.auth_method),
+            subscription: non_blank(params.subscription),
+            proxy_resource_id: params.proxy_resource_id,
+        },
     ))
 }
 
@@ -239,12 +259,65 @@ pub async fn reset_failure_count(
 }
 
 /// GET /api/admin/credentials/:id/balance
-/// 获取指定凭据的余额
+/// 获取指定凭据的账号信息（兼容旧路径）
 pub async fn get_credential_balance(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
-    match state.service.get_balance(id).await {
+    match state.service.get_account_info(id, false).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/credentials/:id/info
+/// 查询指定凭据的账号信息
+pub async fn get_credential_info(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Query(params): Query<CredentialInfoQueryParams>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .get_account_info(id, params.force.unwrap_or(false))
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/info/refresh
+/// 批量查询凭据账号信息
+pub async fn refresh_credentials_info(
+    State(state): State<AdminState>,
+    Json(payload): Json<RefreshCredentialInfoRequest>,
+) -> impl IntoResponse {
+    match state.service.refresh_credentials_info(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credential-validation/existing
+/// 校验系统已有凭据订阅信息
+pub async fn validate_existing_credentials(
+    State(state): State<AdminState>,
+    Json(payload): Json<ValidateExistingCredentialsRequest>,
+) -> impl IntoResponse {
+    match state.service.validate_existing_credentials(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credential-validation/external
+/// 校验外部 JSON 凭据订阅信息
+pub async fn validate_external_credentials(
+    State(state): State<AdminState>,
+    Json(payload): Json<ValidateExternalCredentialsRequest>,
+) -> impl IntoResponse {
+    match state.service.validate_external_credentials(payload).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

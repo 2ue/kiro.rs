@@ -210,7 +210,7 @@ function ProxyEditorDialog({
       toast.error('请输入代理 URL')
       return
     }
-    if (!bindingReady || credentials.isLoading || credentials.isFetching) {
+    if (!bindingReady) {
       toast.error('凭据列表仍在加载，请稍后再保存')
       return
     }

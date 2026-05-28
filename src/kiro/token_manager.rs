@@ -1469,6 +1469,17 @@ impl MultiTokenManager {
             && Self::entry_rate_limit_remaining(entry, now).is_none()
     }
 
+    fn credential_is_dispatch_candidate(
+        proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
+        entry: &CredentialEntry,
+        model: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+    ) -> bool {
+        !excluded_ids.contains(&entry.id)
+            && Self::credential_is_usable_for_model(entry, model)
+            && Self::credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
+    }
+
     fn credential_proxy_availability(
         credentials: &KiroCredentials,
         proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
@@ -1764,9 +1775,7 @@ impl MultiTokenManager {
         entries
             .iter()
             .filter(|entry| {
-                !excluded_ids.contains(&entry.id)
-                    && Self::credential_is_usable_for_model(entry, model)
-                    && Self::credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
+                Self::credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids)
             })
             .filter_map(|entry| {
                 match (
@@ -1797,9 +1806,7 @@ impl MultiTokenManager {
         entries
             .iter()
             .filter(|entry| {
-                !excluded_ids.contains(&entry.id)
-                    && Self::credential_is_usable_for_model(entry, model)
-                    && Self::credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
+                Self::credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids)
                     && Self::entry_cooldown_remaining(entry, now).is_none()
                     && Self::entry_rate_limit_remaining(entry, now).is_none()
                     && !Self::entry_has_concurrency_capacity(entry, max_concurrent_requests)
@@ -2789,6 +2796,50 @@ impl MultiTokenManager {
                             if usable > 0 && dispatchable == 0 {
                                 let now = Instant::now();
                                 let max_concurrent_requests = self.max_concurrent_requests();
+                                let dispatch_candidate_count = entries
+                                    .iter()
+                                    .filter(|e| {
+                                        Self::credential_is_dispatch_candidate(
+                                            &proxy_resources,
+                                            e,
+                                            model,
+                                            excluded_ids,
+                                        )
+                                    })
+                                    .count();
+                                let cooldown_blocked = entries
+                                    .iter()
+                                    .filter(|e| {
+                                        Self::credential_is_dispatch_candidate(
+                                            &proxy_resources,
+                                            e,
+                                            model,
+                                            excluded_ids,
+                                        ) && Self::entry_cooldown_remaining(e, now).is_some()
+                                    })
+                                    .count();
+                                let wait_for = self.min_dispatch_wait(
+                                    &entries,
+                                    &proxy_resources,
+                                    model,
+                                    excluded_ids,
+                                    now,
+                                );
+                                if dispatch_candidate_count > 0
+                                    && cooldown_blocked >= dispatch_candidate_count
+                                {
+                                    let retry_after_secs = wait_for
+                                        .map(|duration| duration.as_secs().saturating_add(1))
+                                        .unwrap_or(1)
+                                        .max(1);
+                                    anyhow::bail!(
+                                        "所有可用凭据均处于上游临时冷却（可用: {}/{}, 临时可调度: 0, max_concurrent_requests={}, retry_after_secs={}）",
+                                        available,
+                                        total,
+                                        max_concurrent_requests,
+                                        retry_after_secs
+                                    );
+                                }
                                 let concurrency_blocked = self.concurrency_blocked_count(
                                     &entries,
                                     &proxy_resources,
@@ -2798,20 +2849,7 @@ impl MultiTokenManager {
                                     max_concurrent_requests,
                                 );
                                 if concurrency_blocked > 0
-                                    && concurrency_blocked
-                                        >= entries
-                                            .iter()
-                                            .filter(|e| {
-                                                !excluded_ids.contains(&e.id)
-                                                    && Self::credential_is_usable_for_model(
-                                                        e, model,
-                                                    )
-                                                    && Self::credential_proxy_is_dispatchable(
-                                                        &e.credentials,
-                                                        &proxy_resources,
-                                                    )
-                                            })
-                                            .count()
+                                    && concurrency_blocked >= dispatch_candidate_count
                                 {
                                     AcquireDecision::WaitForDispatch {
                                         available,
@@ -2824,13 +2862,7 @@ impl MultiTokenManager {
                                         available,
                                         total,
                                         max_concurrent_requests,
-                                        wait_for: self.min_dispatch_wait(
-                                            &entries,
-                                            &proxy_resources,
-                                            model,
-                                            excluded_ids,
-                                            now,
-                                        ),
+                                        wait_for,
                                     }
                                 }
                             } else {
@@ -3345,9 +3377,9 @@ impl MultiTokenManager {
             .collect();
         let mut entries = self.entries.lock();
         let mut changed = false;
-        let active_ids: HashSet<u64> = by_id.keys().copied().collect();
+        let non_deleted_ids: HashSet<u64> = by_id.keys().copied().collect();
         let before_len = entries.len();
-        entries.retain(|entry| active_ids.contains(&entry.id));
+        entries.retain(|entry| non_deleted_ids.contains(&entry.id));
         if entries.len() != before_len {
             changed = true;
         }
@@ -4983,6 +5015,35 @@ impl MultiTokenManager {
         Ok(usage_limits)
     }
 
+    /// 使用一份外部凭据临时查询账号信息，不加入凭据池、不改变调度状态。
+    ///
+    /// 这个方法用于 Admin 的外部 JSON 订阅校验。它允许使用凭据绑定的代理资源，
+    /// 但不会保存 token、不会启用/禁用任何系统凭据，也不会占用调度并发槽。
+    pub async fn probe_usage_limits_for_credentials(
+        &self,
+        mut credentials: KiroCredentials,
+    ) -> anyhow::Result<UsageLimitsResponse> {
+        credentials.canonicalize_auth_method();
+        let credentials = self.resolve_proxy_for_credential(credentials)?;
+        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let config = self.runtime_config();
+
+        if credentials.is_api_key_credential() {
+            let token = credentials
+                .kiro_api_key
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?;
+            return get_usage_limits(&credentials, &config, token, effective_proxy.as_ref()).await;
+        }
+
+        let refreshed = refresh_token(&credentials, &config, effective_proxy.as_ref()).await?;
+        let token = refreshed
+            .access_token
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Token 刷新成功但未返回 accessToken"))?;
+        get_usage_limits(&refreshed, &config, token, effective_proxy.as_ref()).await
+    }
+
     /// 添加新凭据（Admin API）
     ///
     /// # 流程
@@ -6508,16 +6569,27 @@ mod tests {
         assert!(active.cooled_down);
 
         let started = Instant::now();
-        let mut ctx = tokio::time::timeout(
-            StdDuration::from_millis(1_500),
-            manager.acquire_context(None),
-        )
-        .await
-        .expect("唯一可用凭据冷却恢复后应继续调度")
-        .expect("等待请求应成功获取凭据");
-        assert!(started.elapsed() >= StdDuration::from_millis(900));
-        assert_eq!(ctx.id, 2);
-        ctx.release_in_flight();
+        let err = match manager.acquire_context(None).await {
+            Ok(mut ctx) => {
+                ctx.release_in_flight();
+                panic!("唯一可用凭据处于上游冷却时应快速失败")
+            }
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            started.elapsed() < StdDuration::from_millis(200),
+            "全部候选都处于上游冷却时不应排队等待"
+        );
+        assert!(
+            err.contains("所有可用凭据均处于上游临时冷却"),
+            "错误应明确提示全部处于上游临时冷却，实际: {}",
+            err
+        );
+        assert!(
+            err.contains("retry_after_secs="),
+            "错误应携带 retry_after_secs 供下游快速重试退避，实际: {}",
+            err
+        );
     }
 
     #[tokio::test]
@@ -6578,7 +6650,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_transient_cooldown_waits_until_dispatchable() {
+    async fn test_all_transient_cooldown_fails_fast() {
         let mut config = Config::default();
         config.credential_transient_cooldown_secs = 1;
         config.credential_max_cooldown_secs = 1;
@@ -6605,16 +6677,28 @@ mod tests {
         );
 
         let started = Instant::now();
-        let mut ctx = tokio::time::timeout(
-            StdDuration::from_millis(1_500),
-            manager.acquire_context(None),
-        )
-        .await
-        .expect("临时冷却恢复后应继续调度")
-        .expect("等待请求应成功获取凭据");
+        let err = match manager.acquire_context(None).await {
+            Ok(mut ctx) => {
+                ctx.release_in_flight();
+                panic!("所有可用凭据都处于上游冷却时应快速失败")
+            }
+            Err(err) => err.to_string(),
+        };
 
-        assert!(started.elapsed() >= StdDuration::from_millis(900));
-        ctx.release_in_flight();
+        assert!(
+            started.elapsed() < StdDuration::from_millis(200),
+            "全账号上游冷却时不应让请求排队等冷却恢复"
+        );
+        assert!(
+            err.contains("所有可用凭据均处于上游临时冷却"),
+            "错误应明确提示全部处于上游临时冷却，实际: {}",
+            err
+        );
+        assert!(
+            err.contains("retry_after_secs="),
+            "错误应携带 retry_after_secs，实际: {}",
+            err
+        );
     }
 
     #[tokio::test]

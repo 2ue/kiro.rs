@@ -8,6 +8,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::anthropic::model_capabilities::{ModelResolution, strip_model_1m_suffix};
 use crate::anthropic::prompt_cache::canonicalize_cache_value;
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
@@ -177,6 +178,27 @@ fn is_native_claude_family_model(model: &str, family: &str) -> bool {
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
 /// 4.7 同 1M
 pub fn get_context_window_size(model: &str) -> i32 {
+    let base = strip_model_1m_suffix(model);
+    if base == "claude-opus-4-7"
+        || base == "claude-opus-4-7-thinking"
+        || base == "claude-opus-4-6"
+        || base == "claude-opus-4-6-thinking"
+        || base == "claude-sonnet-4-6"
+        || base == "claude-sonnet-4-6-thinking"
+    {
+        return 200_000;
+    }
+
+    if base == "auto"
+        || base == "claude-opus-4.7"
+        || base == "claude-opus-4.7-thinking"
+        || base == "claude-opus-4.6"
+        || base == "claude-opus-4.6-thinking"
+        || base == "claude-sonnet-4.6"
+    {
+        return 1_000_000;
+    }
+
     match map_model(model) {
         Some(mapped)
             if mapped == "claude-sonnet-4.6"
@@ -424,11 +446,30 @@ pub fn convert_request_with_options(
     req: &MessagesRequest,
     options: ConverterOptions,
 ) -> Result<ConversionResult, ConversionError> {
-    let mut warnings = ProxyWarnings::default();
-
-    // 1. 映射模型
     let model_id = map_model(&req.model)
         .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
+    convert_request_with_model_id(req, options, model_id)
+}
+
+/// 将 Anthropic 请求转换为 Kiro 请求，并使用已经按当前 Kiro 上游目录解析过的模型 ID。
+pub fn convert_request_with_resolved_model(
+    req: &MessagesRequest,
+    options: ConverterOptions,
+    resolution: &ModelResolution,
+) -> Result<ConversionResult, ConversionError> {
+    let model_id = resolution
+        .upstream_model
+        .clone()
+        .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
+    convert_request_with_model_id(req, options, model_id)
+}
+
+fn convert_request_with_model_id(
+    req: &MessagesRequest,
+    options: ConverterOptions,
+    model_id: String,
+) -> Result<ConversionResult, ConversionError> {
+    let mut warnings = ProxyWarnings::default();
 
     // 2. 检查消息列表
     if req.messages.is_empty() {
@@ -1639,6 +1680,18 @@ mod tests {
         // thinking 后缀不应影响 haiku 模型映射
         let result = map_model("claude-haiku-4-5-20251001-thinking");
         assert_eq!(result, Some("claude-haiku-4.5".to_string()));
+    }
+
+    #[test]
+    fn test_context_window_size_for_kiro_auto_and_dash_variants() {
+        assert_eq!(get_context_window_size("auto"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-opus-4.7"), 1_000_000);
+        assert_eq!(
+            get_context_window_size("claude-opus-4.7-thinking[1m]"),
+            1_000_000
+        );
+        assert_eq!(get_context_window_size("claude-opus-4-7"), 200_000);
+        assert_eq!(get_context_window_size("claude-sonnet-4-6"), 200_000);
     }
 
     #[test]

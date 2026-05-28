@@ -352,6 +352,12 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
             <Detail label="请求 ID" value={record.id} mono />
             <Detail label="时间" value={formatDate(record.createdAt)} />
             <Detail label="模型" value={record.model || '-'} />
+            {record.upstreamModel && record.upstreamModel !== record.model && (
+              <Detail
+                label="上游模型"
+                value={`${record.upstreamModel}${record.modelResolutionSource ? `（${record.modelResolutionSource}）` : ''}`}
+              />
+            )}
             <Detail label="会话" value={record.conversationId || '-'} mono />
             <Detail label="账号" value={`#${record.credentialId ?? '-'} ${record.credentialLabel || ''}`} />
             <Detail label="状态" value={statusLabel(record.status)} />
@@ -378,6 +384,7 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
                         <span>
                           <div className="font-medium">#{attempt.credentialId}</div>
                           {attempt.credentialLabel && <div className="max-w-[220px] truncate text-xs text-base-content/60">{attempt.credentialLabel}</div>}
+                          {attempt.model && <div className="max-w-[220px] truncate text-xs text-base-content/60">模型 {attempt.model}</div>}
                         </span>
                         <span>{attempt.statusText || attempt.status || '-'}</span>
                         <span>{attemptActionLabel(attempt.action)}</span>

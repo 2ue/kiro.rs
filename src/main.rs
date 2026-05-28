@@ -280,10 +280,41 @@ async fn main() {
         Arc::new(anthropic::model_capabilities::ModelCapabilitiesCatalog::new());
     match postgres_store.load_model_capabilities_status().await {
         Ok(Some(status)) => {
-            model_capabilities.load_persisted_status(status);
-            tracing::info!("已从 PgSQL 加载模型能力目录");
+            if status.should_refresh_from_seed() {
+                tracing::info!(
+                    source = %status.source,
+                    model_count = status.model_count,
+                    "PgSQL 模型能力目录为旧内置目录，使用本地 Kiro seed 刷新"
+                );
+                let status = anthropic::model_capabilities::ModelCapabilitiesCatalog::seed_status();
+                model_capabilities.load_persisted_status(status.clone());
+                if let Err(err) = postgres_store.save_model_capabilities_status(&status).await {
+                    tracing::warn!(
+                        "刷新 Kiro 模型 seed 到 PgSQL 失败，继续使用内存 seed: {}",
+                        err
+                    );
+                }
+            } else {
+                model_capabilities.load_persisted_status(status);
+                tracing::info!("已从 PgSQL 加载模型能力目录");
+            }
         }
-        Ok(None) => {}
+        Ok(None) => {
+            let status = anthropic::model_capabilities::ModelCapabilitiesCatalog::seed_status();
+            model_capabilities.load_persisted_status(status.clone());
+            if let Err(err) = postgres_store.save_model_capabilities_status(&status).await {
+                tracing::warn!(
+                    "保存 Kiro 模型 seed 到 PgSQL 失败，继续使用内存 seed: {}",
+                    err
+                );
+            } else {
+                tracing::info!(
+                    source = %status.source,
+                    model_count = status.model_count,
+                    "已使用本地 Kiro 模型 seed 初始化 PgSQL"
+                );
+            }
+        }
         Err(err) => tracing::warn!(
             "从 PgSQL 加载模型能力状态失败，使用内置模型目录继续: {}",
             err

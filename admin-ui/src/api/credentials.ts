@@ -5,6 +5,7 @@ import type {
   CredentialsPageQuery,
   CredentialsPageResponse,
   BalanceResponse,
+  CredentialInfoRefreshResponse,
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
@@ -22,6 +23,9 @@ import type {
   ProxyResourcesResponse,
   CreateProxyResourceRequest,
   UpdateProxyResourceRequest,
+  ValidateExistingCredentialsRequest,
+  ValidateExternalCredentialsRequest,
+  CredentialValidationResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -144,6 +148,38 @@ export async function forceRefreshToken(
 // 获取凭据额度
 export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
   const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
+  return data
+}
+
+export async function getCredentialInfo(id: number, force = true): Promise<BalanceResponse> {
+  const { data } = await api.get<BalanceResponse>(`/credentials/${id}/info`, {
+    params: { force },
+  })
+  return data
+}
+
+export async function refreshCredentialInfo(
+  ids: number[],
+  force = true
+): Promise<CredentialInfoRefreshResponse> {
+  const { data } = await api.post<CredentialInfoRefreshResponse>('/credentials/info/refresh', {
+    ids,
+    force,
+  })
+  return data
+}
+
+export async function validateExistingCredentials(
+  req: ValidateExistingCredentialsRequest
+): Promise<CredentialValidationResponse> {
+  const { data } = await api.post<CredentialValidationResponse>('/credential-validation/existing', req)
+  return data
+}
+
+export async function validateExternalCredentials(
+  req: ValidateExternalCredentialsRequest
+): Promise<CredentialValidationResponse> {
+  const { data } = await api.post<CredentialValidationResponse>('/credential-validation/external', req)
   return data
 }
 

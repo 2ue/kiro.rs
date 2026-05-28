@@ -106,7 +106,7 @@
 - `success_count` 和 `last_used_at` 用 PgSQL 原子增量记录。
 - `failure_count`、`refresh_failure_count`、`disabled_reason`、`warmup_remaining` 拆到 PgSQL runtime state。
 - 新增凭据 ID 由 PgSQL sequence 分配，避免多实例 `max(id)+1` 冲突。
-- API Key / refreshToken 的 active hash 增加唯一约束，内存重复检测仍用于快速报错，数据库约束负责跨实例兜底。
+- API Key / refreshToken 的未软删除 hash 增加唯一约束，内存重复检测仍用于快速报错，数据库约束负责跨实例兜底；该约束不按禁用状态过滤。
 - 删除凭据改为 PgSQL soft delete，并清理统计/运行态。
 
 配置热加载能力增强：
@@ -145,7 +145,7 @@ Admin 写操作的失败语义更严格：
 环境变量 `KIRO_API_KEY` 的行为需要注意：
 
 - 当前启动仍支持 `KIRO_API_KEY`。
-- 该入口已经明确为“一次性导入/复用”：启动时先按 active `api_key_hash` 查询 PgSQL，存在则复用，不存在才插入。
+- 该入口已经明确为“一次性导入/复用”：启动时先按未软删除的 `api_key_hash` 查询 PgSQL，存在则复用，不存在才插入。
 - 它不是临时覆盖；导入后 PgSQL 仍是凭据事实源。
 
 ## 缓存策略
@@ -347,7 +347,7 @@ Admin 写操作的失败语义更严格：
 
 当前工作区已经落地以下优化：
 
-- `KIRO_API_KEY` 改为查重后一次性导入：启动时先按 active `api_key_hash` 查询 PgSQL；已存在则复用，不再插入无 ID 凭据；不存在才插入。这样避免同一个环境变量在重启时重复导入，也避免触发唯一约束后导致 Token 管理器创建失败。
+- `KIRO_API_KEY` 改为查重后一次性导入：启动时先按未软删除的 `api_key_hash` 查询 PgSQL；已存在则复用，不再插入无 ID 凭据；不存在才插入。这样避免同一个环境变量在重启时重复导入，也避免触发唯一约束后导致 Token 管理器创建失败。
 - PgSQL/Redis 启动连接增加有限重试：启动时最多等待约 60 秒，减少 Compose 或容器重启时数据库刚启动但应用先启动造成的失败。
 - 新增 `/healthz` 和 `/readyz`：`/healthz` 表示进程存活；`/readyz` 会检查 PgSQL ping、Redis ping、Redis 运行时事件订阅状态。
 - Admin API 新增 `/api/admin/usage-writer-stats`：暴露 usage writer 是否启用、队列容量、当前可用容量、内存记录数和已丢弃的 PgSQL 持久化记录数。该接口只用于观测，不参与调度。
@@ -359,7 +359,7 @@ Admin 写操作的失败语义更严格：
 这个原行为有两个问题：
 
 - 它实际是“自动导入并持久化”，不是临时覆盖。
-- 如果同一个 API Key 已经存在于 PgSQL，再次启动时可能因为 active `api_key_hash` 唯一约束触发“凭据已存在”并导致 Token 管理器创建失败。
+- 如果同一个 API Key 已经存在于 PgSQL，再次启动时可能因为未软删除 `api_key_hash` 唯一约束触发“凭据已存在”并导致 Token 管理器创建失败。
 
 长期产品语义仍然可以二选一：
 

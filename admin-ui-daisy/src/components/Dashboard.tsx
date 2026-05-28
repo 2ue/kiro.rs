@@ -1,8 +1,9 @@
-import { BarChart3, ChevronDown, Command, DollarSign, FileClock, LogOut, Moon, Palette, Router, Server, Settings, Sun } from 'lucide-react'
+import { BarChart3, ChevronDown, Command, DollarSign, FileCheck2, FileClock, LogOut, Moon, Palette, Router, Server, Settings, Sun } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { Button, Card } from 'react-daisyui'
 import { AuditPanel } from '@/components/AuditPanel'
+import { AccountValidationPanel } from '@/components/AccountValidationPanel'
 import { ConfigPanel } from '@/components/ConfigPanel'
 import { CredentialsPanel } from '@/components/CredentialsPanel'
 import { PricingPanel } from '@/components/PricingPanel'
@@ -10,10 +11,11 @@ import { ProxyPanel } from '@/components/ProxyPanel'
 import { UsagePanel } from '@/components/UsagePanel'
 import { storage } from '@/lib/storage'
 
-type TabKey = 'credentials' | 'proxies' | 'usage' | 'pricing' | 'audit' | 'config'
+type TabKey = 'credentials' | 'validation' | 'proxies' | 'usage' | 'pricing' | 'audit' | 'config'
 
 const tabs: Array<{ key: TabKey; label: string; icon: React.ReactNode }> = [
   { key: 'credentials', label: '凭据', icon: <Server className="h-4 w-4" /> },
+  { key: 'validation', label: '账号校验', icon: <FileCheck2 className="h-4 w-4" /> },
   { key: 'proxies', label: '代理', icon: <Router className="h-4 w-4" /> },
   { key: 'usage', label: '使用记录', icon: <BarChart3 className="h-4 w-4" /> },
   { key: 'pricing', label: '模型价格', icon: <DollarSign className="h-4 w-4" /> },
@@ -23,6 +25,7 @@ const tabs: Array<{ key: TabKey; label: string; icon: React.ReactNode }> = [
 
 const pageTitle: Record<TabKey, string> = {
   credentials: '凭据控制台',
+  validation: '账号订阅校验',
   proxies: '代理 / 家宽',
   usage: '使用记录',
   pricing: '模型价格与能力',
@@ -154,6 +157,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         </div>
 
         {activeTab === 'credentials' && <CredentialsPanel />}
+        {activeTab === 'validation' && <AccountValidationPanel />}
         {activeTab === 'proxies' && <ProxyPanel />}
         {activeTab === 'usage' && <UsagePanel />}
         {activeTab === 'pricing' && <PricingPanel />}

@@ -641,6 +641,16 @@ export function RuntimeConfigPanel() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
+          <div className="sticky top-16 z-30 -mx-2 flex flex-col gap-2 rounded-lg border bg-background/95 p-2 shadow-sm backdrop-blur supports-[backdrop-filter]:bg-background/80 sm:flex-row sm:items-center sm:justify-between">
+            <div className="min-w-0 text-sm text-muted-foreground">
+              修改运行时配置后点击保存，新请求会热加载生效。
+            </div>
+            <Button onClick={handleSave} disabled={updateConfig.isPending} className="shrink-0">
+              <Save className="h-4 w-4" />
+              {updateConfig.isPending ? '保存中...' : '保存'}
+            </Button>
+          </div>
+
           <ConfigSection
             icon={<Gauge className="h-4 w-4" />}
             title="凭据限速与冷却"
@@ -1026,13 +1036,6 @@ export function RuntimeConfigPanel() {
             <div className="text-sm leading-6 text-muted-foreground">
               临时冷却秒数不能大于最大冷却秒数；预热参与概率会限制在 0 到 100 之间；缓存读取目标比例会限制在 0 到 0.99；触顶扣减下限不能大于上限。
             </div>
-          </div>
-
-          <div className="flex justify-end">
-            <Button onClick={handleSave} disabled={updateConfig.isPending}>
-              <Save className="h-4 w-4" />
-              {updateConfig.isPending ? '保存中...' : '保存'}
-            </Button>
           </div>
         </CardContent>
       </Card>

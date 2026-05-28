@@ -119,14 +119,11 @@ async function main() {
     logs.push('当前没有凭据卡片，跳过凭据测试弹窗')
   }
 
-  const balanceButtons = page.getByRole('button', { name: /^余额$/ })
-  if (await balanceButtons.count()) {
-    await balanceButtons.first().click()
-    await expectVisible(page.getByRole('heading', { name: /余额信息/ }))
-    await closeModal(page, /余额信息/)
-    logs.push('余额弹窗通过')
+  const infoButtons = page.getByRole('button', { name: /^查询信息$/ })
+  if (await infoButtons.count()) {
+    logs.push('凭据信息查询按钮可见')
   } else {
-    logs.push('当前没有凭据卡片，跳过余额弹窗')
+    logs.push('当前没有凭据卡片，跳过信息查询按钮检查')
   }
 
   await openNav(page, '使用记录')

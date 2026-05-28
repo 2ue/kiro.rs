@@ -178,7 +178,7 @@ function ProxyEditorModal({
     event.preventDefault()
     if (!form.name.trim()) return toast.error('请输入代理名称')
     if (!form.proxyUrl.trim()) return toast.error('请输入代理 URL')
-    if (!bindingReady || credentials.isLoading || credentials.isFetching) {
+    if (!bindingReady) {
       return toast.error('凭据列表仍在加载，请稍后再保存')
     }
     if (credentials.isError || !credentials.data) {

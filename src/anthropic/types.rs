@@ -51,7 +51,7 @@ impl ErrorResponse {
 // === Models 端点类型 ===
 
 /// 模型信息
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct Model {
     pub id: String,
     pub object: String,

@@ -32,12 +32,13 @@ use std::time::Duration;
 use tokio::time::{Instant, interval, sleep_until};
 
 use super::converter::{
-    ConversionError, ConverterOptions, convert_request_with_options,
+    ConversionError, ConverterOptions, convert_request_with_resolved_model,
     extract_stable_conversation_id, infer_document_media_type_from_url,
     infer_image_format_from_url,
 };
 use super::envelope;
 use super::middleware::AppState;
+use super::model_capabilities::{ModelResolution, ModelResolutionSource};
 use super::prompt_cache::{PromptCacheProfile, PromptCacheScope};
 use super::stream::{SseEvent, StreamContext};
 use super::types::{
@@ -60,9 +61,13 @@ struct RequestUsageContext {
     endpoint: &'static str,
     stream: bool,
     model: String,
+    upstream_model: Option<String>,
+    model_resolution_source: Option<String>,
+    model_resolution_note: Option<String>,
     conversation_id: Option<String>,
     prompt_cache_scope_conversation_id: Option<String>,
     input_tokens: i32,
+    context_window_tokens: i32,
     prompt_cache_profile: Option<PromptCacheProfile>,
     simulation_mode: PromptCacheSimulationMode,
     prompt_cache_target_read_ratio: f64,
@@ -378,7 +383,11 @@ impl CredentialUsageContext {
         Some(PromptCacheScope {
             credential_id: self.credential_id?,
             conversation_id: self.request.prompt_cache_scope_conversation_id.clone()?,
-            model: self.request.model.clone(),
+            model: self
+                .request
+                .upstream_model
+                .clone()
+                .unwrap_or_else(|| self.request.model.clone()),
         })
     }
 
@@ -535,16 +544,22 @@ impl CredentialUsageContext {
         error_message: Option<String>,
         error_detail: Option<String>,
     ) {
-        let pricing = self
-            .request
-            .pricing_catalog
-            .estimate(&self.request.model, usage);
+        let pricing = self.request.pricing_catalog.estimate(
+            self.request
+                .upstream_model
+                .as_deref()
+                .unwrap_or(&self.request.model),
+            usage,
+        );
         self.request.recorder.record(UsageRecord {
             id: self.request.request_id.clone(),
             created_at: Utc::now().to_rfc3339(),
             endpoint: self.request.endpoint.to_string(),
             stream: self.request.stream,
             model: self.request.model.clone(),
+            upstream_model: self.request.upstream_model.clone(),
+            model_resolution_source: self.request.model_resolution_source.clone(),
+            model_resolution_note: self.request.model_resolution_note.clone(),
             conversation_id: self.request.conversation_id.clone(),
             credential_id: self.credential_id,
             credential_label: self.credential_label.clone(),
@@ -1012,6 +1027,7 @@ fn prepare_usage_context(
     endpoint: &'static str,
     stream: bool,
     payload: &MessagesRequest,
+    model_resolution: Option<ModelResolution>,
     conversation_id: Option<String>,
     stable_conversation_id: Option<String>,
     input_tokens: i32,
@@ -1048,9 +1064,29 @@ fn prepare_usage_context(
         endpoint,
         stream,
         model: payload.model.clone(),
+        upstream_model: model_resolution
+            .as_ref()
+            .and_then(|resolution| resolution.upstream_model.clone()),
+        model_resolution_source: model_resolution
+            .as_ref()
+            .map(|resolution| resolution.source.as_str().to_string()),
+        model_resolution_note: model_resolution
+            .as_ref()
+            .and_then(|resolution| resolution.note.clone()),
         conversation_id,
         prompt_cache_scope_conversation_id: stable_conversation_id,
         input_tokens,
+        context_window_tokens: model_resolution
+            .as_ref()
+            .and_then(|resolution| resolution.upstream_model.as_deref())
+            .and_then(|model| state.model_capabilities.max_input_tokens_for(model))
+            .unwrap_or_else(|| {
+                let model = model_resolution
+                    .as_ref()
+                    .and_then(|resolution| resolution.upstream_model.as_deref())
+                    .unwrap_or(&payload.model);
+                get_context_window_size(model)
+            }),
         prompt_cache_profile,
         simulation_mode: state.prompt_cache_simulation_mode,
         prompt_cache_target_read_ratio: runtime_config.prompt_cache_target_read_ratio,
@@ -1119,7 +1155,10 @@ fn prepare_credential_usage_context(
             .map(|conversation_id| PromptCacheScope {
                 credential_id,
                 conversation_id: conversation_id.clone(),
-                model: usage_context.model.clone(),
+                model: usage_context
+                    .upstream_model
+                    .clone()
+                    .unwrap_or_else(|| usage_context.model.clone()),
             });
         let prompt_usage = usage_context.prompt_cache.compute(
             scope,
@@ -1286,6 +1325,44 @@ fn conversion_error_response(e: &ConversionError) -> Response {
     envelope::error_response(StatusCode::BAD_REQUEST, error_type, message)
 }
 
+fn resolve_request_model(
+    state: &AppState,
+    payload: &MessagesRequest,
+) -> Result<ModelResolution, Response> {
+    let resolution = state.model_capabilities.resolve_model(&payload.model);
+    if resolution.source == ModelResolutionSource::Unsupported {
+        return Err(envelope::error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!(
+                "模型不支持: {}。请同步 Kiro 模型能力或配置为当前上游支持的模型。",
+                payload.model
+            ),
+        ));
+    }
+
+    if let Some(upstream_model) = resolution.upstream_model.as_deref() {
+        if resolution.is_remapped() {
+            tracing::info!(
+                requested_model = %resolution.requested_model,
+                upstream_model = %upstream_model,
+                resolution = %resolution.source.as_str(),
+                note = ?resolution.note,
+                "请求模型已映射为 Kiro 上游模型"
+            );
+        } else {
+            tracing::debug!(
+                requested_model = %resolution.requested_model,
+                upstream_model = %upstream_model,
+                resolution = %resolution.source.as_str(),
+                "请求模型精确匹配 Kiro 上游模型"
+            );
+        }
+    }
+
+    Ok(resolution)
+}
+
 fn should_expose_proxy_warnings(runtime_config: &RequestRuntimeConfig) -> bool {
     runtime_config.expose_proxy_warnings && !runtime_config.compat_profile.is_strict()
 }
@@ -1408,16 +1485,27 @@ async fn post_messages_inner(
             payload.tools.clone(),
         ) as i32;
 
+        let _model_resolution = match resolve_request_model(&state, &payload) {
+            Ok(resolution) => resolution,
+            Err(response) => return response,
+        };
+
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
+    let model_resolution = match resolve_request_model(&state, &payload) {
+        Ok(resolution) => resolution,
+        Err(response) => return response,
+    };
+
     // 转换请求
-    let conversion_result = match convert_request_with_options(
+    let conversion_result = match convert_request_with_resolved_model(
         &payload,
         ConverterOptions {
             compat_profile: runtime_config.compat_profile,
             prompt_cache_simulation_mode: state.prompt_cache_simulation_mode,
         },
+        &model_resolution,
     ) {
         Ok(result) => result,
         Err(e) => {
@@ -1459,6 +1547,7 @@ async fn post_messages_inner(
         endpoint,
         payload.stream,
         &payload,
+        Some(model_resolution.clone()),
         Some(kiro_request.conversation_state.conversation_id.clone()),
         prompt_cache_scope_conversation_id(state.prompt_cache_simulation_mode, &payload),
         input_tokens,
@@ -1486,6 +1575,7 @@ async fn post_messages_inner(
             &request_body,
             &payload.model,
             input_tokens,
+            usage_context.context_window_tokens,
             thinking_enabled,
             extract_xml_thinking,
             tool_name_map,
@@ -1516,6 +1606,7 @@ async fn handle_stream_request(
     request_body: &str,
     model: &str,
     input_tokens: i32,
+    context_window_tokens: i32,
     thinking_enabled: bool,
     extract_xml_thinking: bool,
     tool_name_map: HashMap<String, String>,
@@ -1554,6 +1645,7 @@ async fn handle_stream_request(
     let mut ctx = StreamContext::new_with_simulation(
         model,
         input_tokens,
+        context_window_tokens,
         thinking_enabled,
         extract_xml_thinking,
         tool_name_map,
@@ -1910,7 +2002,7 @@ async fn handle_non_stream_request(
                         }
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
-                            let window_size = get_context_window_size(model);
+                            let window_size = credential_usage.request.context_window_tokens;
                             let actual_input_tokens =
                                 (context_usage.context_usage_percentage * (window_size as f64)
                                     / 100.0) as i32;
@@ -2249,16 +2341,27 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
+        let _model_resolution = match resolve_request_model(&state, &payload) {
+            Ok(resolution) => resolution,
+            Err(response) => return response,
+        };
+
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
+    let model_resolution = match resolve_request_model(&state, &payload) {
+        Ok(resolution) => resolution,
+        Err(response) => return response,
+    };
+
     // 转换请求
-    let conversion_result = match convert_request_with_options(
+    let conversion_result = match convert_request_with_resolved_model(
         &payload,
         ConverterOptions {
             compat_profile: runtime_config.compat_profile,
             prompt_cache_simulation_mode: state.prompt_cache_simulation_mode,
         },
+        &model_resolution,
     ) {
         Ok(result) => result,
         Err(e) => {
@@ -2300,6 +2403,7 @@ pub async fn post_messages_cc(
         "/cc/v1/messages",
         payload.stream,
         &payload,
+        Some(model_resolution.clone()),
         Some(kiro_request.conversation_state.conversation_id.clone()),
         prompt_cache_scope_conversation_id(state.prompt_cache_simulation_mode, &payload),
         input_tokens,
@@ -2327,6 +2431,7 @@ pub async fn post_messages_cc(
             &request_body,
             &payload.model,
             input_tokens,
+            usage_context.context_window_tokens,
             thinking_enabled,
             extract_xml_thinking,
             tool_name_map,
@@ -2546,9 +2651,13 @@ mod tests {
             endpoint: "/cc/v1/messages",
             stream: false,
             model: "claude-sonnet-4-6".to_string(),
+            upstream_model: None,
+            model_resolution_source: None,
+            model_resolution_note: None,
             conversation_id: Some("session-limit".to_string()),
             prompt_cache_scope_conversation_id: Some("session-limit".to_string()),
             input_tokens: 100_000,
+            context_window_tokens: 200_000,
             prompt_cache_profile: None,
             simulation_mode: PromptCacheSimulationMode::HighCache,
             prompt_cache_target_read_ratio: 0.95,
@@ -2619,9 +2728,13 @@ mod tests {
             endpoint: "/v1/messages",
             stream: false,
             model: "claude-sonnet-4-6".to_string(),
+            upstream_model: None,
+            model_resolution_source: None,
+            model_resolution_note: None,
             conversation_id: Some("session-policy".to_string()),
             prompt_cache_scope_conversation_id: Some("session-policy".to_string()),
             input_tokens: 100_000,
+            context_window_tokens: 200_000,
             prompt_cache_profile: None,
             simulation_mode: PromptCacheSimulationMode::HighCache,
             prompt_cache_target_read_ratio: 0.95,
@@ -2762,9 +2875,13 @@ mod tests {
             endpoint: "/v1/messages",
             stream: false,
             model: "claude-sonnet-4-6".to_string(),
+            upstream_model: None,
+            model_resolution_source: None,
+            model_resolution_note: None,
             conversation_id: Some("session-error".to_string()),
             prompt_cache_scope_conversation_id: Some("session-error".to_string()),
             input_tokens: 4096,
+            context_window_tokens: 200_000,
             prompt_cache_profile: None,
             simulation_mode: PromptCacheSimulationMode::HighCache,
             prompt_cache_target_read_ratio: 0.95,
@@ -2825,9 +2942,13 @@ mod tests {
             endpoint: "/v1/messages",
             stream: true,
             model: payload.model.clone(),
+            upstream_model: None,
+            model_resolution_source: None,
+            model_resolution_note: None,
             conversation_id: Some("session-a".to_string()),
             prompt_cache_scope_conversation_id: Some("session-a".to_string()),
             input_tokens: 4096,
+            context_window_tokens: 200_000,
             prompt_cache_profile: profile.clone(),
             simulation_mode: PromptCacheSimulationMode::HighCache,
             prompt_cache_target_read_ratio: 0.85,
@@ -2894,9 +3015,13 @@ mod tests {
             endpoint: "/v1/messages",
             stream: true,
             model: payload.model.clone(),
+            upstream_model: None,
+            model_resolution_source: None,
+            model_resolution_note: None,
             conversation_id: Some("session-high-cache".to_string()),
             prompt_cache_scope_conversation_id: Some("session-high-cache".to_string()),
             input_tokens: 4096,
+            context_window_tokens: 200_000,
             prompt_cache_profile: profile.clone(),
             simulation_mode: PromptCacheSimulationMode::HighCache,
             prompt_cache_target_read_ratio: 0.95,
@@ -2986,6 +3111,7 @@ mod tests {
             "/v1/messages",
             false,
             &first_payload,
+            None,
             Some(first_conversation_id.clone()),
             Some(first_conversation_id.clone()),
             4096,
@@ -3042,6 +3168,7 @@ mod tests {
             "/v1/messages",
             false,
             &second_payload,
+            None,
             Some(second_conversation_id.clone()),
             Some(second_conversation_id),
             8192,
@@ -3108,6 +3235,7 @@ mod tests {
             "/v1/messages",
             true,
             &payload,
+            None,
             Some("random-conversation".to_string()),
             prompt_cache_scope_conversation_id(state.prompt_cache_simulation_mode, &payload),
             4096,
@@ -3162,6 +3290,7 @@ mod tests {
             "/na/v1/messages",
             false,
             &payload,
+            None,
             Some("conversation-id".to_string()),
             prompt_cache_scope_conversation_id(state.prompt_cache_simulation_mode, &payload),
             4096,

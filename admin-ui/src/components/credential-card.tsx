@@ -658,10 +658,10 @@ export function CredentialCard({
               variant="outline"
               onClick={() => onQueryBalance(credential.id)}
               disabled={loadingBalance}
-              title="查询额度并更新卡片"
+              title="查询订阅、额度和用量并更新卡片"
             >
               {loadingBalance ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Wallet className="h-4 w-4 mr-1" />}
-              {loadingBalance ? '查询中' : '查询额度'}
+              {loadingBalance ? '查询中' : '查询信息'}
             </Button>
             <Button
               size="sm"

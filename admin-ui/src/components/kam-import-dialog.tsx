@@ -13,6 +13,7 @@ import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/u
 import { getCredentialBalance, setCredentialDisabled, testCredential } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
+import { camelizeKeys } from '@/lib/object-keys'
 
 interface KamImportDialogProps {
   open: boolean
@@ -53,8 +54,9 @@ interface VerificationResult {
 
 // 兼容 KAM 1.8.3 新版平铺格式，统一转换为旧格式（credentials 嵌套结构）
 function normalizeKamAccount(item: unknown): unknown {
-  if (typeof item !== 'object' || item === null) return item
-  const obj = item as Record<string, unknown>
+  const normalized = camelizeKeys(item)
+  if (typeof normalized !== 'object' || normalized === null) return normalized
+  const obj = normalized as Record<string, unknown>
   // 新格式：refreshToken 直接在账号对象上，无 credentials 嵌套
   if (typeof obj.refreshToken === 'string' && typeof obj.credentials === 'undefined') {
     const email = typeof obj.email === 'string' ? obj.email : undefined
@@ -90,7 +92,7 @@ function normalizeKamAccount(item: unknown): unknown {
       },
     }
   }
-  return item
+  return normalized
 }
 
 // 校验元素是否为有效的 KAM 账号结构
@@ -104,7 +106,7 @@ function isValidKamAccount(item: unknown): item is KamAccount {
 
 // 解析 KAM 导出 JSON，支持单账号和多账号格式
 function parseKamJson(raw: string): KamAccount[] {
-  const parsed = JSON.parse(raw)
+  const parsed = camelizeKeys(JSON.parse(raw)) as Record<string, unknown>
 
   let rawItems: unknown[]
 
@@ -351,7 +353,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           try {
             await getCredentialBalance(addedCred.credentialId)
           } catch (error) {
-            toast.warning(`凭据 #${addedCred.credentialId} 验活成功，但查询额度失败: ${extractErrorMessage(error)}`)
+            toast.warning(`凭据 #${addedCred.credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
           }
 
           successCount++

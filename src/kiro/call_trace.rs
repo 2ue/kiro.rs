@@ -17,6 +17,8 @@ pub struct KiroCredentialAttempt {
     pub status_text: Option<String>,
     pub action: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
@@ -41,10 +43,16 @@ impl KiroCredentialAttempt {
             status: status.map(|status| status.as_u16()),
             status_text: status.map(|status| status.to_string()),
             action: action.into(),
+            model: None,
             error_type: error_type.map(Into::into),
             error_message: error_message.map(Into::into),
             duration_ms,
         }
+    }
+
+    pub fn with_model(mut self, model: Option<&str>) -> Self {
+        self.model = model.map(str::to_string);
+        self
     }
 
     fn compact(&self) -> String {

@@ -8,6 +8,7 @@ import {
   RefreshCw,
   Router,
   RotateCcw,
+  Search,
   Trash2,
   Upload,
   Wallet,
@@ -17,7 +18,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Button, Card, Checkbox, Input, Join, Loading, Modal, Select, Toggle } from 'react-daisyui'
-import { forceRefreshToken, getCredentialBalance, getCredentials, testCredential } from '@/api/credentials'
+import { forceRefreshToken, getCredentialInfo, getCredentials, refreshCredentialInfo, testCredential } from '@/api/credentials'
 import { Badge, EmptyState, ErrorState, LoadingState, ModalShell, SectionCard, StatCard } from '@/components/common'
 import {
   AddCredentialModal,
@@ -351,9 +352,9 @@ function CredentialCard({
             <Wand2 className="h-3.5 w-3.5" />
             测试
           </Button>
-          <Button type="button" color="ghost" size="xs" onClick={() => onQueryBalance(credential.id)} disabled={loadingBalance} title="查询额度并更新卡片">
+          <Button type="button" color="ghost" size="xs" onClick={() => onQueryBalance(credential.id)} disabled={loadingBalance} title="查询订阅、额度和用量并更新卡片">
             {loadingBalance ? <Loading size="xs" /> : <Wallet className="h-3.5 w-3.5" />}
-            {loadingBalance ? '查询中' : '查询额度'}
+            {loadingBalance ? '查询中' : '查询信息'}
           </Button>
           <Button type="button" color="ghost" size="xs" onClick={handleForceRefresh} disabled={credential.authMethod === 'api_key'}>
             <RefreshCw className="h-3.5 w-3.5" />
@@ -487,12 +488,26 @@ export function CredentialsPanel() {
   const [verifyProgress, setVerifyProgress] = useState({ current: 0, total: 0 })
   const [verifyResults, setVerifyResults] = useState<Map<number, VerifyResult>>(new Map())
   const [queryingInfo, setQueryingInfo] = useState(false)
+  const [queryText, setQueryText] = useState('')
+  const [statusFilter, setStatusFilter] = useState('all')
+  const [authFilter, setAuthFilter] = useState('all')
+  const [subscriptionFilter, setSubscriptionFilter] = useState('all')
+  const [proxyFilter, setProxyFilter] = useState('all')
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const cancelVerifyRef = useRef(false)
   const itemsPerPage = 12
   const queryClient = useQueryClient()
-  const credentials = useCredentialsPage({ page, limit: itemsPerPage })
+  const credentials = useCredentialsPage({
+    page,
+    limit: itemsPerPage,
+    q: queryText.trim() || undefined,
+    status: statusFilter !== 'all' ? statusFilter : undefined,
+    authMethod: authFilter !== 'all' ? authFilter : undefined,
+    subscription: subscriptionFilter !== 'all' ? subscriptionFilter : undefined,
+    proxyResourceId: proxyFilter !== 'all' ? Number(proxyFilter) : undefined,
+  })
   const allCredentials = useCredentials({ enabled: batchOpen || kamOpen })
+  const proxyResources = useProxyResources()
   const loadBalancing = useLoadBalancingMode()
   const runtimeConfig = useRuntimeConfig()
   const setLoadBalancing = useSetLoadBalancingMode()
@@ -507,6 +522,11 @@ export function CredentialsPanel() {
   useEffect(() => {
     setSelectedIds(new Set())
   }, [page])
+
+  useEffect(() => {
+    setPage(1)
+    setSelectedIds(new Set())
+  }, [queryText, statusFilter, authFilter, subscriptionFilter, proxyFilter])
 
   useEffect(() => {
     if (credentials.data && page > Math.max(credentials.data.totalPages, 1)) setPage(Math.max(credentials.data.totalPages, 1))
@@ -529,7 +549,7 @@ export function CredentialsPanel() {
   const fetchBalanceForCredential = async (id: number) => {
     setLoadingBalanceIds((prev) => new Set(prev).add(id))
     try {
-      const balance = await getCredentialBalance(id)
+      const balance = await getCredentialInfo(id, true)
       setBalanceMap((prev) => new Map(prev).set(id, balance))
       return { ok: true as const, balance }
     } catch (error) {
@@ -546,28 +566,41 @@ export function CredentialsPanel() {
   const queryCredentialBalance = async (id: number) => {
     const result = await fetchBalanceForCredential(id)
     invalidate()
-    if (result.ok) toast.success(`凭据 #${id} 额度已更新`)
-    else toast.error(`查询额度失败: ${extractErrorMessage(result.error)}`)
+    if (result.ok) toast.success(`凭据 #${id} 信息已更新`)
+    else toast.error(`查询信息失败: ${extractErrorMessage(result.error)}`)
   }
 
-  const queryCurrentPageInfo = async () => {
-    const ids = currentCredentials.map((item) => item.id)
-    if (!ids.length) return toast.error('当前页没有可查询额度的凭据')
+  const queryCurrentPageInfo = async (enabledOnly = false) => {
+    const ids = currentCredentials.filter((item) => !enabledOnly || !item.disabled).map((item) => item.id)
+    if (!ids.length) return toast.error(enabledOnly ? '当前页没有启用凭据可查询' : '当前页没有可查询信息的凭据')
     setQueryingInfo(true)
-    let success = 0
-    let fail = 0
-    for (const id of ids) {
-      const result = await fetchBalanceForCredential(id)
-      if (result.ok) {
-        success += 1
-      } else {
-        fail += 1
-      }
+    setLoadingBalanceIds((prev) => {
+      const next = new Set(prev)
+      ids.forEach((id) => next.add(id))
+      return next
+    })
+    try {
+      const data = await refreshCredentialInfo(ids, true)
+      setBalanceMap((prev) => {
+        const next = new Map(prev)
+        data.items.forEach((item) => {
+          if (item.ok && item.info) next.set(item.id, item.info)
+        })
+        return next
+      })
+      invalidate()
+      if (data.failed === 0) toast.success(`查询完成：成功 ${data.success}/${data.total}`)
+      else toast.warning(`查询完成：成功 ${data.success} 个，失败 ${data.failed} 个`)
+    } catch (error) {
+      toast.error(`查询信息失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setQueryingInfo(false)
+      setLoadingBalanceIds((prev) => {
+        const next = new Set(prev)
+        ids.forEach((id) => next.delete(id))
+        return next
+      })
     }
-    setQueryingInfo(false)
-    invalidate()
-    if (fail === 0) toast.success(`查询完成：成功 ${success}/${ids.length}`)
-    else toast.warning(`查询完成：成功 ${success} 个，失败 ${fail} 个`)
   }
 
   const batchDelete = async () => {
@@ -717,9 +750,13 @@ export function CredentialsPanel() {
               <RefreshCw className="h-4 w-4" />
               刷新列表
             </Button>
-            <Button type="button" variant="outline" size="sm" onClick={queryCurrentPageInfo} disabled={queryingInfo || currentCredentials.length === 0}>
+            <Button type="button" variant="outline" size="sm" onClick={() => queryCurrentPageInfo(false)} disabled={queryingInfo || currentCredentials.length === 0}>
               {queryingInfo ? <Loading size="xs" /> : <Wallet className="h-4 w-4" />}
-              {queryingInfo ? '查询中...' : '查询本页额度'}
+              {queryingInfo ? '查询中...' : '查询本页信息'}
+            </Button>
+            <Button type="button" variant="outline" size="sm" onClick={() => queryCurrentPageInfo(true)} disabled={queryingInfo || currentCredentials.every((item) => item.disabled)}>
+              <Wallet className="h-4 w-4" />
+              仅查启用信息
             </Button>
             <Button type="button" variant="outline" size="sm" onClick={() => setKamOpen(true)}>
               <FileUp className="h-4 w-4" />
@@ -740,6 +777,53 @@ export function CredentialsPanel() {
           </>
         }
       >
+        <div className="mb-3 grid gap-2 md:grid-cols-2 xl:grid-cols-6">
+          <div className="relative md:col-span-2">
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-base-content/40" />
+            <Input
+              bordered
+              size="sm"
+              className="w-full pl-9"
+              value={queryText}
+              onChange={(event) => setQueryText(event.target.value)}
+              placeholder="搜索邮箱、ID、订阅、代理、错误"
+            />
+          </div>
+          <Select bordered size="sm" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
+            <Select.Option value="all">全部状态</Select.Option>
+            <Select.Option value="enabled">启用</Select.Option>
+            <Select.Option value="disabled">已禁用</Select.Option>
+            <Select.Option value="current">当前活跃</Select.Option>
+            <Select.Option value="cooldown">冷却中</Select.Option>
+            <Select.Option value="rate_limited">限流中</Select.Option>
+            <Select.Option value="proxy_blocked">代理不可用</Select.Option>
+            <Select.Option value="error">有错误</Select.Option>
+            <Select.Option value="unknown_subscription">未知订阅</Select.Option>
+          </Select>
+          <Select bordered size="sm" value={authFilter} onChange={(event) => setAuthFilter(event.target.value)}>
+            <Select.Option value="all">全部认证</Select.Option>
+            <Select.Option value="social">Social</Select.Option>
+            <Select.Option value="idc">IdC</Select.Option>
+            <Select.Option value="api_key">API Key</Select.Option>
+          </Select>
+          <Select bordered size="sm" value={subscriptionFilter} onChange={(event) => setSubscriptionFilter(event.target.value)}>
+            <Select.Option value="all">全部订阅</Select.Option>
+            <Select.Option value="pro_plus">Pro+</Select.Option>
+            <Select.Option value="pro">Pro</Select.Option>
+            <Select.Option value="trial">试用</Select.Option>
+            <Select.Option value="free">Free</Select.Option>
+            <Select.Option value="unknown">未知</Select.Option>
+          </Select>
+          <Select bordered size="sm" value={proxyFilter} onChange={(event) => setProxyFilter(event.target.value)}>
+            <Select.Option value="all">全部代理</Select.Option>
+            {(proxyResources.data?.resources || []).map((resource) => (
+              <Select.Option key={resource.id} value={String(resource.id)}>
+                {resource.enabled ? '' : '已禁用 · '}{resource.name}
+              </Select.Option>
+            ))}
+          </Select>
+        </div>
+
         {selectedIds.size > 0 && (
           <div className="mb-3 flex flex-wrap items-center gap-2 rounded-box border border-base-300 bg-base-200 px-2.5 py-2">
             <Badge tone="primary">已选择 {selectedIds.size} 个</Badge>
@@ -775,7 +859,7 @@ export function CredentialsPanel() {
         )}
 
         {currentCredentials.length === 0 ? (
-          <EmptyState text={(credentials.data?.total || 0) === 0 ? '暂无凭据' : '当前页暂无凭据'} />
+          <EmptyState text={(credentials.data?.filteredTotal || credentials.data?.total || 0) === 0 ? '暂无匹配凭据' : '当前页暂无凭据'} />
         ) : (
           <div className="grid gap-3 lg:grid-cols-2 xl:grid-cols-3">
             {currentCredentials.map((credential) => (
@@ -798,7 +882,7 @@ export function CredentialsPanel() {
             <Button type="button" variant="outline" size="sm" disabled={page <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))}>
               上一页
             </Button>
-            <span className="text-sm text-base-content/60">第 {page} / {totalPages} 页（共 {credentials.data?.total || 0} 个凭据）</span>
+            <span className="text-sm text-base-content/60">第 {page} / {totalPages} 页（共 {credentials.data?.filteredTotal ?? credentials.data?.total ?? 0} 个匹配凭据）</span>
             <Button type="button" variant="outline" size="sm" disabled={page >= totalPages} onClick={() => setPage((value) => Math.min(totalPages, value + 1))}>
               下一页
             </Button>

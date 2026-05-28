@@ -276,7 +276,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             // 延迟 1 秒
             await new Promise(resolve => setTimeout(resolve, 1000))
 
-            // 验活成功后查询额度，用于持久化账号快照。
+            // 验活成功后查询账号信息，用于持久化账号快照。
             const testResult = await testCredential(addedCred.credentialId, {
               model: DEFAULT_TEST_MODEL,
               prompt: DEFAULT_TEST_PROMPT,
@@ -284,7 +284,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             try {
               await getCredentialBalance(addedCred.credentialId)
             } catch (error) {
-              toast.warning(`凭据 #${addedCred.credentialId} 验活成功，但查询额度失败: ${extractErrorMessage(error)}`)
+              toast.warning(`凭据 #${addedCred.credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
             }
 
             successCount++
@@ -339,7 +339,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           // 延迟 1 秒
           await new Promise(resolve => setTimeout(resolve, 1000))
 
-          // 验活成功后查询额度，用于持久化账号快照。
+          // 验活成功后查询账号信息，用于持久化账号快照。
           const testResult = await testCredential(addedCred.credentialId, {
             model: DEFAULT_TEST_MODEL,
             prompt: DEFAULT_TEST_PROMPT,
@@ -347,7 +347,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           try {
             await getCredentialBalance(addedCred.credentialId)
           } catch (error) {
-            toast.warning(`凭据 #${addedCred.credentialId} 验活成功，但查询额度失败: ${extractErrorMessage(error)}`)
+            toast.warning(`凭据 #${addedCred.credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
           }
 
           // 验活成功

@@ -540,7 +540,7 @@ export function BatchImportModal({
         try {
           await getCredentialBalance(added.credentialId)
         } catch (error) {
-          toast.warning(`凭据 #${added.credentialId} 验活成功，但查询额度失败: ${extractErrorMessage(error)}`)
+          toast.warning(`凭据 #${added.credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
         }
         successCount += 1
         if (isApiKeyCred) existingApiKeyHashes.add(hash)
@@ -753,7 +753,7 @@ export function KamImportModal({
         try {
           await getCredentialBalance(added.credentialId)
         } catch (error) {
-          toast.warning(`凭据 #${added.credentialId} 验活成功，但查询额度失败: ${extractErrorMessage(error)}`)
+          toast.warning(`凭据 #${added.credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
         }
         successCount += 1
         existingTokenHashes.add(tokenHash)

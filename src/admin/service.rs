@@ -1,6 +1,6 @@
 //! Admin API 业务逻辑服务
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
@@ -11,16 +11,20 @@ use serde_json::json;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, ClearInFlightRequest,
-    CreateProxyResourceRequest, CredentialAccountInfo, CredentialStatusItem,
+    CreateProxyResourceRequest, CredentialAccountInfo, CredentialInfoRefreshItem,
+    CredentialInfoRefreshResponse, CredentialStatusItem, CredentialValidationGroup,
+    CredentialValidationInfo, CredentialValidationItem, CredentialValidationResponse,
     CredentialsPageResponse, CredentialsStatusResponse, LoadBalancingModeResponse,
-    ProxyResourceResponse, ProxyResourcesResponse, RuntimeConfigResponse,
-    SetCredentialProxyRequest, SetLoadBalancingModeRequest, SetWarmupRequest,
-    TestCredentialRequest, TestCredentialResponse, UpdateProxyResourceRequest,
-    UpdateRuntimeConfigRequest,
+    ProxyResourceResponse, ProxyResourcesResponse, RefreshCredentialInfoRequest,
+    RuntimeConfigResponse, SetCredentialProxyRequest, SetLoadBalancingModeRequest,
+    SetWarmupRequest, TestCredentialRequest, TestCredentialResponse, UpdateProxyResourceRequest,
+    UpdateRuntimeConfigRequest, ValidateExistingCredentialsRequest,
+    ValidateExternalCredentialsRequest,
 };
 use crate::anthropic::{
-    converter::map_model,
-    model_capabilities::{ModelCapabilitiesCatalog, ModelCapabilitiesStatus},
+    model_capabilities::{
+        ModelCapabilitiesCatalog, ModelCapabilitiesStatus, ModelResolutionSource,
+    },
     pricing::{PricingCatalog, PricingStatus},
     prompt_cache::PromptCacheTracker,
     usage::{
@@ -33,6 +37,7 @@ use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::{
     ConversationState, CurrentMessage, KiroRequest, UserInputMessage,
 };
+use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::MultiTokenManager;
@@ -42,17 +47,26 @@ use crate::storage::postgres::{
 };
 use crate::storage::redis_cache::RedisStore;
 
-/// 余额缓存过期时间（秒），5 分钟
+/// 账号信息缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
 const DEFAULT_CREDENTIALS_PAGE_LIMIT: usize = 12;
 const MAX_CREDENTIALS_PAGE_LIMIT: usize = 500;
 
-/// 缓存的余额条目（含时间戳）
+#[derive(Debug, Clone, Default)]
+pub struct CredentialListQuery {
+    pub q: Option<String>,
+    pub status: Option<String>,
+    pub auth_method: Option<String>,
+    pub subscription: Option<String>,
+    pub proxy_resource_id: Option<u64>,
+}
+
+/// 缓存的账号信息条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedBalance {
     /// 缓存时间（Unix 秒）
     cached_at: f64,
-    /// 缓存的余额数据
+    /// 缓存的账号信息数据
     data: BalanceResponse,
 }
 
@@ -113,9 +127,73 @@ impl AdminService {
         let redis = self.redis_store.clone();
         tokio::spawn(async move {
             if let Err(err) = redis.del(balance_cache_key(id)).await {
-                tracing::warn!("清理 Redis 余额缓存失败: {}", err);
+                tracing::warn!("清理 Redis 账号信息缓存失败: {}", err);
             }
         });
+    }
+
+    fn credential_lookup(&self) -> HashMap<u64, CredentialStatusItem> {
+        let (_, _, _, _, _, _, _, credentials) = self.credential_status_items();
+        credentials
+            .into_iter()
+            .map(|credential| (credential.id, credential))
+            .collect()
+    }
+
+    fn credential_lookup_by_email(&self) -> HashMap<String, CredentialStatusItem> {
+        let (_, _, _, _, _, _, _, credentials) = self.credential_status_items();
+        credentials
+            .into_iter()
+            .filter_map(|credential| {
+                let email = credential.email.as_deref()?;
+                Some((email_key(email), credential))
+            })
+            .collect()
+    }
+
+    fn credential_from_request(
+        &self,
+        req: AddCredentialRequest,
+        disabled: bool,
+    ) -> Result<KiroCredentials, AdminServiceError> {
+        if let Some(ref name) = req.endpoint {
+            if !self.known_endpoints.contains(name) {
+                let mut known: Vec<&str> =
+                    self.known_endpoints.iter().map(|s| s.as_str()).collect();
+                known.sort();
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "未知端点 \"{}\"，已注册端点: {:?}",
+                    name, known
+                )));
+            }
+        }
+
+        Ok(KiroCredentials {
+            id: None,
+            created_at: None,
+            updated_at: None,
+            access_token: None,
+            refresh_token: req.refresh_token,
+            profile_arn: None,
+            expires_at: None,
+            auth_method: Some(req.auth_method),
+            client_id: req.client_id,
+            client_secret: req.client_secret,
+            priority: req.priority,
+            region: req.region,
+            auth_region: req.auth_region,
+            api_region: req.api_region,
+            machine_id: req.machine_id,
+            email: req.email,
+            subscription_title: None,
+            proxy_url: req.proxy_url,
+            proxy_username: req.proxy_username,
+            proxy_password: req.proxy_password,
+            proxy_resource_id: req.proxy_resource_id,
+            disabled,
+            kiro_api_key: req.kiro_api_key,
+            endpoint: req.endpoint,
+        })
     }
 
     fn invalidate_all_credential_caches(&self) {
@@ -191,7 +269,12 @@ impl AdminService {
     }
 
     /// 分页获取凭据状态。
-    pub fn get_credentials_page(&self, page: usize, limit: usize) -> CredentialsPageResponse {
+    pub fn get_credentials_page(
+        &self,
+        page: usize,
+        limit: usize,
+        query: CredentialListQuery,
+    ) -> CredentialsPageResponse {
         let page = normalize_page(page);
         let limit = normalize_credentials_limit(limit);
         let (
@@ -204,9 +287,18 @@ impl AdminService {
             max_queued_requests,
             credentials,
         ) = self.credential_status_items();
-        let total_pages = total_pages(total, limit);
+        let filtered: Vec<_> = credentials
+            .into_iter()
+            .filter(|credential| credential_matches_query(credential, &query))
+            .collect();
+        let filtered_total = filtered.len();
+        let filtered_available = filtered
+            .iter()
+            .filter(|credential| !credential.disabled)
+            .count();
+        let total_pages = total_pages(filtered_total, limit);
         let start = page.saturating_sub(1).saturating_mul(limit);
-        let credentials = credentials.into_iter().skip(start).take(limit).collect();
+        let credentials = filtered.into_iter().skip(start).take(limit).collect();
 
         CredentialsPageResponse {
             total,
@@ -219,6 +311,8 @@ impl AdminService {
             page,
             limit,
             total_pages,
+            filtered_total,
+            filtered_available,
             credentials,
         }
     }
@@ -395,18 +489,24 @@ impl AdminService {
         Ok(())
     }
 
-    /// 获取凭据余额（带缓存）
-    pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        if let Ok(Some(cached)) = self
-            .redis_store
-            .get_json::<CachedBalance>(balance_cache_key(id))
-            .await
-        {
-            let now = Utc::now().timestamp() as f64;
-            if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                tracing::debug!("凭据 #{} 余额命中 Redis 缓存", id);
-                self.save_account_info_snapshot(&cached.data).await?;
-                return Ok(cached.data);
+    /// 获取凭据账号信息（带缓存）。force=true 时绕过 Redis 缓存，适合订阅复查。
+    pub async fn get_account_info(
+        &self,
+        id: u64,
+        force: bool,
+    ) -> Result<BalanceResponse, AdminServiceError> {
+        if !force {
+            if let Ok(Some(cached)) = self
+                .redis_store
+                .get_json::<CachedBalance>(balance_cache_key(id))
+                .await
+            {
+                let now = Utc::now().timestamp() as f64;
+                if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
+                    tracing::debug!("凭据 #{} 账号信息命中 Redis 缓存", id);
+                    self.save_account_info_snapshot(&cached.data).await?;
+                    return Ok(cached.data);
+                }
             }
         }
 
@@ -427,10 +527,249 @@ impl AdminService {
             )
             .await
         {
-            tracing::warn!("保存 Redis 余额缓存失败: {}", err);
+            tracing::warn!("保存 Redis 账号信息缓存失败: {}", err);
         }
 
         Ok(balance)
+    }
+
+    /// 兼容旧调用名。
+    pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
+        self.get_account_info(id, false).await
+    }
+
+    pub async fn refresh_credentials_info(
+        &self,
+        req: RefreshCredentialInfoRequest,
+    ) -> Result<CredentialInfoRefreshResponse, AdminServiceError> {
+        let mut ids = req.ids;
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "请至少选择一个凭据".to_string(),
+            ));
+        }
+        if ids.len() > MAX_CREDENTIALS_PAGE_LIMIT {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "单次最多查询 {} 个凭据",
+                MAX_CREDENTIALS_PAGE_LIMIT
+            )));
+        }
+
+        let labels = self.credential_lookup();
+        let mut items = Vec::with_capacity(ids.len());
+        let mut success = 0;
+        for id in ids {
+            let label = labels.get(&id);
+            match self.get_account_info(id, req.force).await {
+                Ok(info) => {
+                    success += 1;
+                    items.push(CredentialInfoRefreshItem {
+                        id,
+                        email: label.and_then(|item| item.email.clone()),
+                        disabled: label.map(|item| item.disabled).unwrap_or(false),
+                        ok: true,
+                        info: Some(info),
+                        error: None,
+                    });
+                }
+                Err(err) => items.push(CredentialInfoRefreshItem {
+                    id,
+                    email: label.and_then(|item| item.email.clone()),
+                    disabled: label.map(|item| item.disabled).unwrap_or(false),
+                    ok: false,
+                    info: None,
+                    error: Some(err.to_string()),
+                }),
+            }
+        }
+        let total = items.len();
+        Ok(CredentialInfoRefreshResponse {
+            total,
+            success,
+            failed: total.saturating_sub(success),
+            items,
+        })
+    }
+
+    pub async fn validate_existing_credentials(
+        &self,
+        req: ValidateExistingCredentialsRequest,
+    ) -> Result<CredentialValidationResponse, AdminServiceError> {
+        let previous = self
+            .postgres_store
+            .load_credential_account_info()
+            .await
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        let requested_ids: HashSet<u64> = req.ids.into_iter().collect();
+        let scope = req
+            .scope
+            .unwrap_or_else(|| "all".to_string())
+            .to_lowercase();
+        let (_, _, _, _, _, _, _, credentials) = self.credential_status_items();
+        let candidates: Vec<_> = credentials
+            .into_iter()
+            .filter(|credential| {
+                if !requested_ids.is_empty() {
+                    return requested_ids.contains(&credential.id);
+                }
+                match scope.as_str() {
+                    "enabled" => !credential.disabled,
+                    "disabled" => credential.disabled,
+                    "selected" => false,
+                    _ => true,
+                }
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "没有可校验的凭据".to_string(),
+            ));
+        }
+
+        let mut items = Vec::with_capacity(candidates.len());
+        for credential in candidates {
+            let previous_info = previous.get(&credential.id).map(validation_info_from_row);
+            match self.get_account_info(credential.id, req.force).await {
+                Ok(current) => {
+                    let current_info = validation_info_from_balance(&current);
+                    let change_kind =
+                        compare_subscription_change(previous_info.as_ref(), Some(&current_info));
+                    let subscription_title = current_info
+                        .subscription_title
+                        .clone()
+                        .unwrap_or_else(|| "未知".to_string());
+                    let subscription_key = subscription_key(Some(&subscription_title));
+                    items.push(CredentialValidationItem {
+                        id: Some(credential.id),
+                        index: None,
+                        email: credential.email.clone(),
+                        disabled: Some(credential.disabled),
+                        ok: true,
+                        previous: previous_info,
+                        current: Some(current_info),
+                        change_kind,
+                        subscription_key,
+                        subscription_title,
+                        error: None,
+                        matched_existing_credential_id: None,
+                        existing_disabled: None,
+                    });
+                }
+                Err(err) => items.push(CredentialValidationItem {
+                    id: Some(credential.id),
+                    index: None,
+                    email: credential.email.clone(),
+                    disabled: Some(credential.disabled),
+                    ok: false,
+                    previous: previous_info,
+                    current: None,
+                    change_kind: "failed".to_string(),
+                    subscription_key: "failed".to_string(),
+                    subscription_title: "查询失败".to_string(),
+                    error: Some(err.to_string()),
+                    matched_existing_credential_id: None,
+                    existing_disabled: None,
+                }),
+            }
+        }
+
+        Ok(build_validation_response(items))
+    }
+
+    pub async fn validate_external_credentials(
+        &self,
+        req: ValidateExternalCredentialsRequest,
+    ) -> Result<CredentialValidationResponse, AdminServiceError> {
+        if req.credentials.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "请先提供要校验的凭据 JSON".to_string(),
+            ));
+        }
+        if req.credentials.len() > MAX_CREDENTIALS_PAGE_LIMIT {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "单次最多校验 {} 个凭据",
+                MAX_CREDENTIALS_PAGE_LIMIT
+            )));
+        }
+
+        let existing_by_email = self.credential_lookup_by_email();
+        let mut items = Vec::with_capacity(req.credentials.len());
+        for (index, req) in req.credentials.into_iter().enumerate() {
+            let email = req.email.clone();
+            let matched = email
+                .as_deref()
+                .and_then(|value| existing_by_email.get(&email_key(value)))
+                .cloned();
+            let credential = match self.credential_from_request(req, false) {
+                Ok(credential) => credential,
+                Err(err) => {
+                    items.push(CredentialValidationItem {
+                        id: None,
+                        index: Some(index + 1),
+                        email,
+                        disabled: None,
+                        ok: false,
+                        previous: None,
+                        current: None,
+                        change_kind: "failed".to_string(),
+                        subscription_key: "failed".to_string(),
+                        subscription_title: "解析失败".to_string(),
+                        error: Some(err.to_string()),
+                        matched_existing_credential_id: matched.as_ref().map(|item| item.id),
+                        existing_disabled: matched.as_ref().map(|item| item.disabled),
+                    });
+                    continue;
+                }
+            };
+
+            match self
+                .token_manager
+                .probe_usage_limits_for_credentials(credential)
+                .await
+            {
+                Ok(usage) => {
+                    let current = validation_info_from_usage(&usage);
+                    let subscription_title = current
+                        .subscription_title
+                        .clone()
+                        .unwrap_or_else(|| "未知".to_string());
+                    items.push(CredentialValidationItem {
+                        id: None,
+                        index: Some(index + 1),
+                        email,
+                        disabled: None,
+                        ok: true,
+                        previous: None,
+                        current: Some(current),
+                        change_kind: "external".to_string(),
+                        subscription_key: subscription_key(Some(&subscription_title)),
+                        subscription_title,
+                        error: None,
+                        matched_existing_credential_id: matched.as_ref().map(|item| item.id),
+                        existing_disabled: matched.as_ref().map(|item| item.disabled),
+                    });
+                }
+                Err(err) => items.push(CredentialValidationItem {
+                    id: None,
+                    index: Some(index + 1),
+                    email,
+                    disabled: None,
+                    ok: false,
+                    previous: None,
+                    current: None,
+                    change_kind: "failed".to_string(),
+                    subscription_key: "failed".to_string(),
+                    subscription_title: "查询失败".to_string(),
+                    error: Some(err.to_string()),
+                    matched_existing_credential_id: matched.as_ref().map(|item| item.id),
+                    existing_disabled: matched.as_ref().map(|item| item.disabled),
+                }),
+            }
+        }
+
+        Ok(build_validation_response(items))
     }
 
     /// 使用指定凭据发起一次模型调用测试。
@@ -453,9 +792,16 @@ impl AdminService {
             ));
         }
 
-        let model_id = map_model(model).ok_or_else(|| {
+        let model_resolution = self.model_capabilities.resolve_model(model);
+        let model_id = model_resolution.upstream_model.ok_or_else(|| {
             AdminServiceError::InvalidCredential(format!("不支持的测试模型: {}", model))
         })?;
+        if model_resolution.source == ModelResolutionSource::Unsupported {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "不支持的测试模型: {}",
+                model
+            )));
+        }
 
         let conversation_id = uuid::Uuid::new_v4().to_string();
         let agent_continuation_id = uuid::Uuid::new_v4().to_string();
@@ -504,7 +850,7 @@ impl AdminService {
         })
     }
 
-    /// 从上游获取余额（无缓存）
+    /// 从上游获取账号信息（无缓存）
     async fn fetch_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
         let usage = self
             .token_manager
@@ -801,7 +1147,7 @@ impl AdminService {
             .map_err(|e| self.classify_delete_error(e, id))?;
         self.prompt_cache.clear_credential(id);
 
-        // 清理已删除凭据的余额缓存
+        // 清理已删除凭据的账号信息缓存
         self.invalidate_balance_cache(id);
         self.audit(
             "delete_credential",
@@ -1426,7 +1772,7 @@ impl AdminService {
         }
     }
 
-    /// 分类余额查询错误（可能涉及上游 API 调用）
+    /// 分类账号信息查询错误（可能涉及上游 API 调用）
     fn classify_balance_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
         let msg = e.to_string();
 
@@ -1657,6 +2003,300 @@ fn account_info_from_row(row: &CredentialAccountInfoRow) -> CredentialAccountInf
         next_reset_at: row.next_reset_at,
         checked_at: row.checked_at.clone(),
     }
+}
+
+fn credential_matches_query(
+    credential: &CredentialStatusItem,
+    query: &CredentialListQuery,
+) -> bool {
+    if let Some(proxy_resource_id) = query.proxy_resource_id {
+        if credential.proxy_resource_id != Some(proxy_resource_id) {
+            return false;
+        }
+    }
+
+    if let Some(auth_method) = query.auth_method.as_deref() {
+        let expected = auth_method.trim().to_lowercase();
+        if !expected.is_empty()
+            && expected != "all"
+            && credential
+                .auth_method
+                .as_deref()
+                .map(|value| value.to_lowercase())
+                .as_deref()
+                != Some(expected.as_str())
+        {
+            return false;
+        }
+    }
+
+    if let Some(status) = query.status.as_deref() {
+        let status = status.trim().to_lowercase();
+        let matched = match status.as_str() {
+            "" | "all" => true,
+            "enabled" => !credential.disabled,
+            "disabled" => credential.disabled,
+            "current" => credential.is_current,
+            "cooldown" => credential.cooled_down,
+            "rate_limited" | "rate-limited" => credential.rate_limited,
+            "proxy_blocked" | "proxy-blocked" => matches!(
+                credential.effective_proxy_source.as_str(),
+                "resource_disabled" | "resource_missing"
+            ),
+            "error" => {
+                credential.failure_count > 0
+                    || credential.refresh_failure_count > 0
+                    || credential.last_error_kind.is_some()
+            }
+            "unknown_subscription" | "unknown-subscription" => {
+                subscription_key(credential_subscription_title(credential).as_deref()) == "unknown"
+            }
+            _ => true,
+        };
+        if !matched {
+            return false;
+        }
+    }
+
+    if let Some(subscription) = query.subscription.as_deref() {
+        let expected = subscription.trim().to_lowercase();
+        if !expected.is_empty() && expected != "all" {
+            let title = credential_subscription_title(credential);
+            let key = subscription_key(title.as_deref());
+            let title_match = title
+                .as_deref()
+                .map(|value| value.to_lowercase().contains(&expected))
+                .unwrap_or(false);
+            if key != expected && !title_match {
+                return false;
+            }
+        }
+    }
+
+    if let Some(q) = query.q.as_deref() {
+        let q = q.trim().to_lowercase();
+        if !q.is_empty() && !credential_search_text(credential).contains(&q) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn credential_subscription_title(credential: &CredentialStatusItem) -> Option<String> {
+    credential
+        .account_info
+        .as_ref()
+        .and_then(|info| info.subscription_title.clone())
+        .or_else(|| credential.subscription_title.clone())
+}
+
+fn credential_search_text(credential: &CredentialStatusItem) -> String {
+    [
+        Some(credential.id.to_string()),
+        credential.email.clone(),
+        credential.masked_api_key.clone(),
+        credential.refresh_token_hash.clone(),
+        credential.api_key_hash.clone(),
+        credential_subscription_title(credential),
+        credential.proxy_resource_name.clone(),
+        credential.proxy_url.clone(),
+        credential.effective_proxy_url.clone(),
+        Some(credential.effective_proxy_source.clone()),
+        credential.disabled_reason.clone(),
+        credential.cooldown_reason.clone(),
+        credential.last_error_kind.clone(),
+        credential.last_error_reason.clone(),
+        Some(credential.endpoint.clone()),
+        credential.auth_method.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ")
+    .to_lowercase()
+}
+
+fn validation_info_from_row(row: &CredentialAccountInfoRow) -> CredentialValidationInfo {
+    CredentialValidationInfo {
+        subscription_title: row.subscription_title.clone(),
+        current_usage: row.current_usage,
+        usage_limit: row.usage_limit,
+        usage_percentage: row.usage_percentage,
+        checked_at: row.checked_at.clone(),
+    }
+}
+
+fn validation_info_from_balance(balance: &BalanceResponse) -> CredentialValidationInfo {
+    CredentialValidationInfo {
+        subscription_title: balance.subscription_title.clone(),
+        current_usage: balance.current_usage,
+        usage_limit: balance.usage_limit,
+        usage_percentage: balance.usage_percentage,
+        checked_at: balance.checked_at.clone(),
+    }
+}
+
+fn validation_info_from_usage(usage: &UsageLimitsResponse) -> CredentialValidationInfo {
+    let current_usage = usage.current_usage();
+    let usage_limit = usage.usage_limit();
+    let usage_percentage = if usage_limit > 0.0 {
+        (current_usage / usage_limit * 100.0).min(100.0)
+    } else {
+        0.0
+    };
+    CredentialValidationInfo {
+        subscription_title: usage.subscription_title().map(|value| value.to_string()),
+        current_usage,
+        usage_limit,
+        usage_percentage,
+        checked_at: Utc::now().to_rfc3339(),
+    }
+}
+
+fn compare_subscription_change(
+    previous: Option<&CredentialValidationInfo>,
+    current: Option<&CredentialValidationInfo>,
+) -> String {
+    let Some(previous) = previous else {
+        return "unknown".to_string();
+    };
+    let Some(current) = current else {
+        return "unknown".to_string();
+    };
+    let previous_rank = subscription_rank(previous.subscription_title.as_deref());
+    let current_rank = subscription_rank(current.subscription_title.as_deref());
+    if previous_rank == 0 || current_rank == 0 {
+        return "unknown".to_string();
+    }
+    if current_rank < previous_rank {
+        "downgraded".to_string()
+    } else if current_rank > previous_rank {
+        "upgraded".to_string()
+    } else {
+        "unchanged".to_string()
+    }
+}
+
+fn subscription_key(title: Option<&str>) -> String {
+    let Some(title) = title else {
+        return "unknown".to_string();
+    };
+    let lower = title.to_lowercase();
+    if lower.contains("pro+")
+        || lower.contains("pro plus")
+        || lower.contains("pro_plus")
+        || lower.contains("pro-plus")
+    {
+        "pro_plus".to_string()
+    } else if lower.contains("trial") || lower.contains("试用") {
+        "trial".to_string()
+    } else if lower.contains("free") || lower.contains("免费") {
+        "free".to_string()
+    } else if lower.contains("pro") {
+        "pro".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn subscription_rank(title: Option<&str>) -> u8 {
+    match subscription_key(title).as_str() {
+        "free" => 1,
+        "trial" => 2,
+        "pro" => 3,
+        "pro_plus" => 4,
+        _ => 0,
+    }
+}
+
+fn validation_group_key(item: &CredentialValidationItem) -> String {
+    match item.change_kind.as_str() {
+        "failed" | "downgraded" | "upgraded" => item.change_kind.clone(),
+        _ => item.subscription_key.clone(),
+    }
+}
+
+fn validation_group_title(key: &str) -> String {
+    match key {
+        "failed" => "查询失败".to_string(),
+        "downgraded" => "疑似订阅掉级".to_string(),
+        "upgraded" => "订阅升级".to_string(),
+        "pro_plus" => "Pro+".to_string(),
+        "pro" => "Pro".to_string(),
+        "trial" => "试用".to_string(),
+        "free" => "Free".to_string(),
+        "unknown" => "未知订阅".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn build_validation_response(items: Vec<CredentialValidationItem>) -> CredentialValidationResponse {
+    let total = items.len();
+    let success = items.iter().filter(|item| item.ok).count();
+    let failed = total.saturating_sub(success);
+    let downgraded = items
+        .iter()
+        .filter(|item| item.change_kind == "downgraded")
+        .count();
+    let upgraded = items
+        .iter()
+        .filter(|item| item.change_kind == "upgraded")
+        .count();
+    let unchanged = items
+        .iter()
+        .filter(|item| item.change_kind == "unchanged")
+        .count();
+    let mut grouped: BTreeMap<String, Vec<CredentialValidationItem>> = BTreeMap::new();
+    for item in items {
+        grouped
+            .entry(validation_group_key(&item))
+            .or_default()
+            .push(item);
+    }
+    let preferred = [
+        "downgraded",
+        "failed",
+        "upgraded",
+        "pro_plus",
+        "pro",
+        "trial",
+        "free",
+        "unknown",
+    ];
+    let mut groups = Vec::new();
+    for key in preferred {
+        if let Some(items) = grouped.remove(key) {
+            groups.push(CredentialValidationGroup {
+                key: key.to_string(),
+                title: validation_group_title(key),
+                count: items.len(),
+                items,
+            });
+        }
+    }
+    for (key, items) in grouped {
+        groups.push(CredentialValidationGroup {
+            title: validation_group_title(&key),
+            count: items.len(),
+            key,
+            items,
+        });
+    }
+
+    CredentialValidationResponse {
+        total,
+        success,
+        failed,
+        downgraded,
+        upgraded,
+        unchanged,
+        groups,
+    }
+}
+
+fn email_key(email: &str) -> String {
+    email.trim().to_lowercase()
 }
 
 fn block_on_admin_store<T>(

@@ -1,0 +1,254 @@
+{
+  "version": "2026-05-28",
+  "source": "kiro-upstream-seed",
+  "models": [
+    {
+      "model": "auto",
+      "displayName": "Auto",
+      "maxInputTokens": 1000000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "best",
+      "displayName": "Claude Code Alias: Best Available",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "claude-haiku-4-5-20251001",
+      "displayName": "Claude Haiku 4.5",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "claude-haiku-4-5-20251001-thinking",
+      "displayName": "Claude Haiku 4.5 (Thinking)",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "claude-haiku-4.5",
+      "displayName": "Claude Haiku 4.5",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "claude-opus-4-5-20251101",
+      "displayName": "Claude Opus 4.5",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "claude-opus-4-5-20251101-thinking",
+      "displayName": "Claude Opus 4.5 (Thinking)",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "claude-opus-4-6",
+      "displayName": "Claude Opus 4.6",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "claude-opus-4-6-thinking",
+      "displayName": "Claude Opus 4.6 (Thinking)",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "claude-opus-4-7",
+      "displayName": "Claude Opus 4.7",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "claude-opus-4-7-thinking",
+      "displayName": "Claude Opus 4.7 (Thinking)",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "claude-opus-4.5",
+      "displayName": "Claude Opus 4.5",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "claude-opus-4.6",
+      "displayName": "Claude Opus 4.6",
+      "maxInputTokens": 1000000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "claude-opus-4.7",
+      "displayName": "Claude Opus 4.7",
+      "maxInputTokens": 1000000,
+      "maxOutputTokens": 128000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "claude-sonnet-4",
+      "displayName": "Claude Sonnet 4",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "claude-sonnet-4-5-20250929",
+      "displayName": "Claude Sonnet 4.5",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "claude-sonnet-4-5-20250929-thinking",
+      "displayName": "Claude Sonnet 4.5 (Thinking)",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "claude-sonnet-4-6",
+      "displayName": "Claude Sonnet 4.6",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "claude-sonnet-4-6-thinking",
+      "displayName": "Claude Sonnet 4.6 (Thinking)",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "claude-sonnet-4.5",
+      "displayName": "Claude Sonnet 4.5",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "claude-sonnet-4.6",
+      "displayName": "Claude Sonnet 4.6",
+      "maxInputTokens": 1000000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "deepseek-3.2",
+      "displayName": "Deepseek v3.2",
+      "maxInputTokens": 164000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": false,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "default",
+      "displayName": "Claude Code Alias: Default",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "glm-5",
+      "displayName": "GLM 5",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": false,
+      "supportedInputTypes": ["TEXT"]
+    },
+    {
+      "model": "haiku",
+      "displayName": "Claude Code Alias: Haiku",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "minimax-m2.1",
+      "displayName": "MiniMax M2.1",
+      "maxInputTokens": 196000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": false,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "minimax-m2.5",
+      "displayName": "MiniMax M2.5",
+      "maxInputTokens": 196000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": false,
+      "supportedInputTypes": ["TEXT"]
+    },
+    {
+      "model": "opus",
+      "displayName": "Claude Code Alias: Opus",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "opusplan",
+      "displayName": "Claude Code Alias: Opus Plan",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "qwen3-coder-next",
+      "displayName": "Qwen3 Coder Next",
+      "maxInputTokens": 256000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": false,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
+      "model": "sonnet",
+      "displayName": "Claude Code Alias: Sonnet",
+      "maxInputTokens": 200000,
+      "maxOutputTokens": 64000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    }
+  ]
+}

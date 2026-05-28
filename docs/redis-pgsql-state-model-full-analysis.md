@@ -97,7 +97,7 @@ PgSQL schema 目前在 `src/storage/postgres.rs` 的 `SCHEMA_SQL` 中集中定�
 1. `migrate()` 用字符串 `split(";")` 执行 schema，缺少正式版本迁移。
 2. `credentials` 仍以 JSONB 为主，缺少列化字段和唯一约束。
 3. `save_credentials()`、`save_credential_stats()`、`save_credential_runtime_state()` 都是整份快照保存。
-4. `save_credentials()` 会把本次没有传入的 active ID 软删除，这是文件覆盖模型，不适合多实例。
+4. 历史版本的 `save_credentials()` 会把本次没有传入的未软删除 ID 软删除，这是文件覆盖模型，不适合多实例；当前代码已经改成只 upsert 传入行，不再由旧快照推导删除。
 5. `usage_records.clear()` 使用 `TRUNCATE`，适合开发，不适合审计型生产。
 
 ## Redis 当前职责和 key 模型
@@ -174,13 +174,15 @@ Redis 现在用于短期运行态，方向是正确的。
 
 `persist_credentials()` 会从当前 `entries` 生成完整凭据列表，然后调用 `PostgresStore::save_credentials()`。
 
-`save_credentials()` 做三件事：
+历史版本的 `save_credentials()` 做三件事：
 
-1. 查询当前 active 凭据 ID。
+1. 查询当前未软删除凭据 ID。
 2. 对传入凭据逐个 upsert。
 3. 对 DB 里存在但传入列表没有的 ID 标记 `deleted_at=now()`。
 
 这个逻辑和“把整个 credentials.json 覆盖写回磁盘”非常像。迁移到 PgSQL 后不应该继续这样做。
+
+当前代码已经修正为非破坏性保存：`PostgresStore::save_credentials()` 只 upsert 传入凭据，不会删除 PgSQL 中其他未软删除凭据。明确删除只能由删除接口触发软删除。
 
 主要风险：
 
@@ -235,7 +237,7 @@ Admin 操作应该变成：
 建议：
 
 - `credentials` 增加 `refresh_token_hash`、`api_key_hash`。
-- 增加部分唯一索引：
+- 增加部分唯一索引；索引名里的 `active` 仅表示 `deleted_at IS NULL`，不表示 `disabled = false`：
 
 ```sql
 CREATE UNIQUE INDEX uniq_credentials_refresh_token_hash_active

@@ -4,6 +4,7 @@ import type {
   AddCredentialRequest,
   AddCredentialResponse,
   BalanceResponse,
+  CredentialInfoRefreshResponse,
   CredentialExportFormat,
   CredentialsPageQuery,
   CredentialsPageResponse,
@@ -17,6 +18,9 @@ import type {
   SuccessResponse,
   TestCredentialRequest,
   TestCredentialResponse,
+  ValidateExistingCredentialsRequest,
+  ValidateExternalCredentialsRequest,
+  CredentialValidationResponse,
   ProxyResource,
   ProxyResourcesResponse,
   UpdateProxyResourceRequest,
@@ -66,6 +70,26 @@ export async function forceRefreshToken(id: number): Promise<SuccessResponse> {
 
 export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
   const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
+  return data
+}
+
+export async function getCredentialInfo(id: number, force = true): Promise<BalanceResponse> {
+  const { data } = await api.get<BalanceResponse>(`/credentials/${id}/info`, { params: { force } })
+  return data
+}
+
+export async function refreshCredentialInfo(ids: number[], force = true): Promise<CredentialInfoRefreshResponse> {
+  const { data } = await api.post<CredentialInfoRefreshResponse>('/credentials/info/refresh', { ids, force })
+  return data
+}
+
+export async function validateExistingCredentials(req: ValidateExistingCredentialsRequest): Promise<CredentialValidationResponse> {
+  const { data } = await api.post<CredentialValidationResponse>('/credential-validation/existing', req)
+  return data
+}
+
+export async function validateExternalCredentials(req: ValidateExternalCredentialsRequest): Promise<CredentialValidationResponse> {
+  const { data } = await api.post<CredentialValidationResponse>('/credential-validation/external', req)
   return data
 }
 
