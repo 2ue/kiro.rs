@@ -84,3 +84,16 @@ export function formatLastUsed(lastUsedAt: string | null): string {
   if (hours < 24) return `${hours} 小时前`
   return `${Math.floor(hours / 24)} 天前`
 }
+
+export function formatApproxElapsedMs(value?: number | null): string | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null
+  const diff = Date.now() - value
+  if (diff < 0) return '约刚刚'
+  const seconds = Math.floor(diff / 1000)
+  if (seconds < 60) return `约${seconds}秒前`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `约${minutes}分钟前`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `约${hours}小时前`
+  return `约${Math.floor(hours / 24)}天前`
+}

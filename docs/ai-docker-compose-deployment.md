@@ -159,7 +159,10 @@ KIRO_RS_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强
   "host": "0.0.0.0",
   "port": 8990,
   "apiKey": "sk-kiro-rs-change-me",
-  "adminApiKey": "sk-admin-change-me"
+  "adminApiKey": "sk-admin-change-me",
+  "payloadGuardEnabled": true,
+  "payloadGuardMaxBytes": 460800,
+  "payloadGuardTrimHistory": true
 }
 ```
 
@@ -167,7 +170,7 @@ KIRO_RS_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强
 
 - Docker 部署时 `host` 必须是 `0.0.0.0`，否则宿主机端口映射后可能访问不到服务。
 - Compose 会通过 `KIRO_RS_POSTGRES_URL` 和 `KIRO_RS_REDIS_URL` 注入数据库连接地址；文件里的 `postgres.url` 和 `redis.url` 也可以保留，主要用于本地或非 Compose 场景。
-- 未写出的配置会使用内置默认值。首次启动导入 PgSQL 后，可以在后台配置页热更新调度、高缓存模拟和路径级 usage 上报策略。
+- 未写出的配置会使用内置默认值。首次启动导入 PgSQL 后，可以在后台配置页热更新调度、payload 防护、高缓存模拟和路径级 usage 上报策略。
 - 首次启动时，如果 PgSQL 没有运行配置或凭据，服务会从 `config.json` 和 `credentials.json` 导入。
 - 导入后运行配置、凭据状态、Token 刷新结果、失败计数、预热状态、调度统计、usage 记录、模型价格都以 PgSQL 为准。
 - 会话粘性绑定、同会话软失败计数、上游瞬态错误冷却、本地 RPM 限流、单凭据并发 lease 和跨实例 Token 刷新锁都以 Redis 为准。
@@ -260,6 +263,14 @@ KIRO_RS_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强
 | `credentialWarmupRequests` | `3` | 控制新凭据预热剩余请求数。预热不会伪造成功次数，只降低被选中的概率。 |
 | `credentialWarmupSelectionPercent` | `5` | 控制 `balanced` 模式下预热凭据参与真实请求调度的概率百分比。 |
 | `defaultEndpoint` | `ide` | 控制凭据未单独指定 `endpoint` 时走哪个 Kiro 端点。 |
+
+### 上游请求体防护
+
+| 字段名 | 建议值 | 控制什么 |
+| --- | --- | --- |
+| `payloadGuardEnabled` | `true` | 是否在发送 Kiro 上游前按最终 JSON 字节数检查请求体。 |
+| `payloadGuardMaxBytes` | `460800` | Kiro 上游请求 JSON body 最大字节数。 |
+| `payloadGuardTrimHistory` | `true` | 请求体超限时是否裁剪最旧历史；关闭后只做协议修复，仍超限会直接返回客户端错误。 |
 
 ### 路径缓存行为
 

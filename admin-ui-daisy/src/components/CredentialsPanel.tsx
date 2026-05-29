@@ -29,7 +29,7 @@ import {
   KamImportModal,
   type VerifyResult,
 } from '@/components/CredentialDialogs'
-import { formatDate, formatLastUsed, formatNumber, formatQuota, formatUsd } from '@/lib/format'
+import { formatApproxElapsedMs, formatDate, formatLastUsed, formatNumber, formatQuota, formatUsd } from '@/lib/format'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
 import { extractErrorMessage } from '@/lib/utils'
 import {
@@ -127,6 +127,7 @@ function CredentialCard({
   const recentSelection60s = numberOrZero(credential.recentSchedulerSelectionCount60s)
   const recentSelection5m = numberOrZero(credential.recentSchedulerSelectionCount5m)
   const schedulerSelectionPressure = numberOrZero(credential.schedulerSelectionPressure)
+  const lastTransientErrorAgo = formatApproxElapsedMs(credential.lastErrorAtMs)
 
   useEffect(() => {
     setPriorityValue(String(credential.priority))
@@ -309,7 +310,9 @@ function CredentialCard({
           </div>
           {credential.lastErrorReason && (
             <div className="col-span-full">
-              <div className="text-[0.72rem] font-medium text-base-content/50">最近瞬态错误</div>
+              <div className="text-[0.72rem] font-medium text-base-content/50">
+                最近瞬态错误{lastTransientErrorAgo ? `(${lastTransientErrorAgo})` : ''}
+              </div>
               <div className="truncate font-semibold" title={credential.lastErrorReason}>{credential.lastErrorKind || 'unknown'}: {credential.lastErrorReason}</div>
             </div>
           )}

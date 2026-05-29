@@ -214,6 +214,9 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `credentialWarmupSelectionPercent` | number | `5` | balanced 模式下预热凭据参与真实业务请求调度的概率百分比 |
 | `compression.enabled` | boolean | `false` | 是否启用上游请求压缩；默认关闭 |
 | `compression.whitespaceCompression` | boolean | `true` | 启用 compression 后是否只做 JSON whitespace 压缩；默认只开启该低风险压缩 |
+| `payloadGuardEnabled` | boolean | `true` | 是否启用发送 Kiro 上游前的最终 payload 防护 |
+| `payloadGuardMaxBytes` | number | `460800` | Kiro 上游请求 JSON body 最大字节数，按最终发送的 JSON 字节数计算 |
+| `payloadGuardTrimHistory` | boolean | `true` | payload 超限时是否允许裁剪最旧历史；关闭后只做协议修复，仍超限会直接返回客户端错误 |
 | `compatProfile` | string | `claude-code` | 兼容 profile：`claude-code` 优先真实 Claude Code CLI 可用性；`anthropic-strict` 减少代理改写和调试特征；`debug` 等同 `claude-code` 但默认暴露代理 warning |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `promptCacheTargetReadRatio` | number | `0.98` | `/v1/messages`、`/cc/v1/messages`、`/ha/v1/messages`、`/na/v1/messages` high-cache 的目标 cache read 中心比例；`/na` 默认只保留真实上游 cache usage，不用本地模拟补足 cache usage |
@@ -242,11 +245,14 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
    "host": "127.0.0.1",
    "port": 8990,
    "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
-   "adminApiKey": "sk-admin-your-secret-key"
+   "adminApiKey": "sk-admin-your-secret-key",
+   "payloadGuardEnabled": true,
+   "payloadGuardMaxBytes": 460800,
+   "payloadGuardTrimHistory": true
 }
 ```
 
-未写出的字段会使用内置默认值。首次启动导入 PgSQL 后，也可以在后台配置页热更新调度、高缓存模拟和路径级 usage 上报策略。
+未写出的字段会使用内置默认值。首次启动导入 PgSQL 后，也可以在后台配置页热更新调度、payload 防护、高缓存模拟和路径级 usage 上报策略。
 
 缓存模式由路径固定选择：
 

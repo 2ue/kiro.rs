@@ -56,6 +56,20 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
+function formatApproxElapsedMs(value?: number | null): string | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null
+  const diff = Date.now() - value
+  if (diff < 0) return '约刚刚'
+  const seconds = Math.floor(diff / 1000)
+  if (seconds < 60) return `约${seconds}秒前`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `约${minutes}分钟前`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `约${hours}小时前`
+  const days = Math.floor(hours / 24)
+  return `约${days}天前`
+}
+
 function formatDateTime(value: string | null): string {
   if (!value) return '未知'
   return new Date(value).toLocaleString('zh-CN', {
@@ -140,6 +154,7 @@ export function CredentialCard({
   const recentSelection60s = numberOrZero(credential.recentSchedulerSelectionCount60s)
   const recentSelection5m = numberOrZero(credential.recentSchedulerSelectionCount5m)
   const schedulerSelectionPressure = numberOrZero(credential.schedulerSelectionPressure)
+  const lastTransientErrorAgo = formatApproxElapsedMs(credential.lastErrorAtMs)
 
   useEffect(() => {
     setPriorityValue(String(credential.priority))
@@ -501,7 +516,9 @@ export function CredentialCard({
             )}
             {credential.lastErrorReason && (
               <div className="col-span-2">
-                <span className="text-muted-foreground">最近瞬态错误：</span>
+                <span className="text-muted-foreground">
+                  最近瞬态错误{lastTransientErrorAgo ? `(${lastTransientErrorAgo})` : ''}：
+                </span>
                 <span className="font-medium">{credential.lastErrorKind || 'unknown'}</span>
                 <span className="ml-1 text-xs text-muted-foreground">{credential.lastErrorReason}</span>
               </div>
