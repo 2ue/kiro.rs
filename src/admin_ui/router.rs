@@ -9,25 +9,75 @@ use axum::{
 };
 use rust_embed::Embed;
 
-/// 嵌入前端构建产物
+/// 嵌入旧版前端构建产物
 #[derive(Embed)]
 #[folder = "admin-ui/dist"]
-struct Asset;
+struct AdminAsset;
 
-/// 创建 Admin UI 路由
-pub fn create_admin_ui_router() -> Router {
-    Router::new()
-        .route("/", get(index_handler))
-        .route("/{*file}", get(static_handler))
+/// 嵌入新版 Daisy 前端构建产物
+#[derive(Embed)]
+#[folder = "admin-ui-daisy/dist"]
+struct ConsoleAsset;
+
+trait UiAsset {
+    const BUILD_HINT: &'static str;
+
+    fn get(path: &str) -> Option<rust_embed::EmbeddedFile>;
 }
 
-/// 处理首页请求
-async fn index_handler() -> impl IntoResponse {
-    serve_index()
+impl UiAsset for AdminAsset {
+    const BUILD_HINT: &'static str = "Admin UI not built. Run 'pnpm build' in admin-ui directory.";
+
+    fn get(path: &str) -> Option<rust_embed::EmbeddedFile> {
+        <Self as rust_embed::RustEmbed>::get(path)
+    }
+}
+
+impl UiAsset for ConsoleAsset {
+    const BUILD_HINT: &'static str =
+        "Console UI not built. Run 'pnpm build' in admin-ui-daisy directory.";
+
+    fn get(path: &str) -> Option<rust_embed::EmbeddedFile> {
+        <Self as rust_embed::RustEmbed>::get(path)
+    }
+}
+
+/// 创建旧版 Admin UI 路由
+pub fn create_admin_ui_router() -> Router {
+    Router::new()
+        .route("/", get(admin_index_handler))
+        .route("/{*file}", get(admin_static_handler))
+}
+
+/// 创建新版 Console UI 路由
+pub fn create_console_ui_router() -> Router {
+    Router::new()
+        .route("/", get(console_index_handler))
+        .route("/{*file}", get(console_static_handler))
+}
+
+/// 处理旧版首页请求
+async fn admin_index_handler() -> impl IntoResponse {
+    serve_index::<AdminAsset>()
+}
+
+/// 处理新版首页请求
+async fn console_index_handler() -> impl IntoResponse {
+    serve_index::<ConsoleAsset>()
+}
+
+/// 处理旧版静态文件请求
+async fn admin_static_handler(uri: Uri) -> impl IntoResponse {
+    static_handler::<AdminAsset>(uri)
+}
+
+/// 处理新版静态文件请求
+async fn console_static_handler(uri: Uri) -> impl IntoResponse {
+    static_handler::<ConsoleAsset>(uri)
 }
 
 /// 处理静态文件请求
-async fn static_handler(uri: Uri) -> impl IntoResponse {
+fn static_handler<A: UiAsset>(uri: Uri) -> Response<Body> {
     let path = uri.path().trim_start_matches('/');
 
     // 安全检查：拒绝包含 .. 的路径
@@ -39,7 +89,7 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
     }
 
     // 尝试获取请求的文件
-    if let Some(content) = Asset::get(path) {
+    if let Some(content) = A::get(path) {
         let mime = mime_guess::from_path(path)
             .first_or_octet_stream()
             .to_string();
@@ -57,7 +107,7 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
 
     // SPA fallback: 如果文件不存在且不是资源文件，返回 index.html
     if !is_asset_path(path) {
-        return serve_index();
+        return serve_index::<A>();
     }
 
     // 404
@@ -68,8 +118,8 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
 }
 
 /// 提供 index.html
-fn serve_index() -> Response<Body> {
-    match Asset::get("index.html") {
+fn serve_index<A: UiAsset>() -> Response<Body> {
+    match A::get("index.html") {
         Some(content) => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
@@ -78,9 +128,7 @@ fn serve_index() -> Response<Body> {
             .expect("Failed to build response"),
         None => Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .body(Body::from(
-                "Admin UI not built. Run 'pnpm build' in admin-ui directory.",
-            ))
+            .body(Body::from(A::BUILD_HINT))
             .expect("Failed to build response"),
     }
 }
@@ -106,4 +154,24 @@ fn is_asset_path(path: &str) -> bool {
         .next()
         .map(|filename| filename.contains('.'))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_ui_indexes_use_expected_mount_prefixes() {
+        let admin = <AdminAsset as rust_embed::RustEmbed>::get("index.html")
+            .expect("admin-ui index should be embedded");
+        let admin = std::str::from_utf8(admin.data.as_ref()).expect("admin-ui index is utf-8");
+        assert!(admin.contains("/admin/assets/"));
+        assert!(!admin.contains("/console/assets/"));
+
+        let console = <ConsoleAsset as rust_embed::RustEmbed>::get("index.html")
+            .expect("console index should be embedded");
+        let console = std::str::from_utf8(console.data.as_ref()).expect("console index is utf-8");
+        assert!(console.contains("/console/assets/"));
+        assert!(!console.contains("/admin/assets/"));
+    }
 }

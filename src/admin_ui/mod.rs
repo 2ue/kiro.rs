@@ -4,4 +4,4 @@
 
 mod router;
 
-pub use router::create_admin_ui_router;
+pub use router::{create_admin_ui_router, create_console_ui_router};

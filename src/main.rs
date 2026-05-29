@@ -438,13 +438,17 @@ async fn main() {
 
             // 创建 Admin UI 路由
             let admin_ui_app = admin_ui::create_admin_ui_router();
+            let console_ui_app = admin_ui::create_console_ui_router();
 
             tracing::info!("Admin API 已启用");
             tracing::info!("Admin UI 已启用: /admin");
+            tracing::info!("Console UI 已启用: /console");
             anthropic_app
                 .nest("/api/admin", admin_app)
                 .route("/admin/", get(admin_ui_index_redirect))
+                .route("/console/", get(console_ui_index_redirect))
                 .nest("/admin", admin_ui_app)
+                .nest("/console", console_ui_app)
         }
     } else {
         anthropic_app
@@ -489,6 +493,7 @@ async fn main() {
         tracing::info!("  GET  /api/admin/credentials/:index/balance");
         tracing::info!("Admin UI:");
         tracing::info!("  GET  /admin");
+        tracing::info!("  GET  /console");
     }
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
@@ -614,6 +619,10 @@ async fn readyz(State(state): State<Arc<AppHealthState>>) -> impl IntoResponse {
 
 async fn admin_ui_index_redirect() -> Redirect {
     Redirect::permanent("/admin")
+}
+
+async fn console_ui_index_redirect() -> Redirect {
+    Redirect::permanent("/console")
 }
 
 fn spawn_redis_runtime_event_listener(

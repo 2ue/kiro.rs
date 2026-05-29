@@ -68,7 +68,8 @@
 
 > **前置步骤**：编译前需要先构建前端 Admin UI（用于嵌入到二进制中）：
 > ```bash
-> cd admin-ui && pnpm install && pnpm build
+> pnpm --dir admin-ui install && pnpm --dir admin-ui build
+> pnpm --dir admin-ui-daisy install && pnpm --dir admin-ui-daisy build
 > ```
 
 ```bash
@@ -532,7 +533,8 @@ Admin UI 本地开发时还可以用 `VITE_API_PROXY_TARGET` 覆盖 Vite 代理�
   - `GET /api/admin/audit-logs` - 分页查询后台审计日志
 
 - **Admin UI**
-  - `GET /admin` - 访问管理页面（需要在编译前构建 `admin-ui/dist`）
+  - `GET /console` - 访问新版 Daisy 管理页面（需要在编译前构建 `admin-ui-daisy/dist`）
+  - `GET /admin` - 访问旧版管理页面（需要在编译前构建 `admin-ui/dist`）
 
 ## 注意事项
 
@@ -592,7 +594,8 @@ kiro-rs/
 │   │   └── redis_cache.rs      # Redis 缓存和调度运行态
 │   └── common/                 # 公共模块
 │       └── auth.rs             # 认证工具函数
-├── admin-ui/                   # Admin UI 前端工程（构建产物会嵌入二进制）
+├── admin-ui/                   # 旧版 Admin UI 前端工程（构建产物会嵌入二进制）
+├── admin-ui-daisy/             # 新版 Console UI 前端工程（构建产物会嵌入二进制）
 ├── tools/                      # 辅助工具
 ├── Cargo.toml                  # 项目配置
 ├── config.example.json         # 配置示例

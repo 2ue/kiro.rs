@@ -6,6 +6,10 @@ admin-ui/node_modules/
 admin-ui/dist/
 admin-ui/tsconfig.tsbuildinfo
 admin-ui/.vite/
+admin-ui-daisy/node_modules/
+admin-ui-daisy/dist/
+admin-ui-daisy/tsconfig.tsbuildinfo
+admin-ui-daisy/.vite/
 
 # Version control
 .git/

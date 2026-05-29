@@ -1,10 +1,17 @@
 FROM node:22-alpine AS frontend-builder
 
+RUN npm install -g pnpm
+
 WORKDIR /app/admin-ui
 COPY admin-ui/package.json admin-ui/pnpm-lock.yaml admin-ui/.npmrc admin-ui/pnpm-workspace.yaml ./
-RUN npm install -g pnpm
 RUN pnpm install --frozen-lockfile
 COPY admin-ui ./
+RUN pnpm build
+
+WORKDIR /app/admin-ui-daisy
+COPY admin-ui-daisy/package.json admin-ui-daisy/pnpm-lock.yaml admin-ui-daisy/.npmrc admin-ui-daisy/pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY admin-ui-daisy ./
 RUN pnpm build
 
 FROM rust:1.92-alpine AS builder
@@ -16,6 +23,7 @@ COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
 COPY data ./data
 COPY --from=frontend-builder /app/admin-ui/dist /app/admin-ui/dist
+COPY --from=frontend-builder /app/admin-ui-daisy/dist /app/admin-ui-daisy/dist
 
 ENV CARGO_PROFILE_RELEASE_LTO=false \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
