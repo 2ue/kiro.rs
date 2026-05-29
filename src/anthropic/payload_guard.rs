@@ -148,12 +148,13 @@ pub fn guard_kiro_request(
     let original_bytes = original_body.len();
     let original_history_entries = request.conversation_state.history.len();
 
-    if !config.enabled || config.max_bytes == 0 {
+    if !config.enabled {
         return Ok((
             original_body,
             PayloadGuardReport::disabled(original_bytes, original_history_entries),
         ));
     }
+    let size_limit_enabled = config.max_bytes > 0;
 
     let mut report = PayloadGuardReport {
         enabled: true,
@@ -183,7 +184,7 @@ pub fn guard_kiro_request(
     let mut body = serialize_request(request)?;
     report.final_bytes = body.len();
 
-    if config.trim_history {
+    if size_limit_enabled && config.trim_history {
         while report.final_bytes > config.max_bytes
             && !request.conversation_state.history.is_empty()
         {
@@ -212,7 +213,7 @@ pub fn guard_kiro_request(
 
     report.final_history_entries = request.conversation_state.history.len();
     report.final_bytes = body.len();
-    report.still_oversized = report.final_bytes > config.max_bytes;
+    report.still_oversized = size_limit_enabled && report.final_bytes > config.max_bytes;
 
     if report.still_oversized {
         return Err(PayloadGuardError::Oversized {
@@ -624,6 +625,47 @@ mod tests {
         .expect_err("current message cannot be trimmed");
 
         assert!(matches!(err, PayloadGuardError::Oversized { .. }));
+    }
+
+    #[test]
+    fn guard_zero_max_bytes_repairs_without_size_limit() {
+        let assistant = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage {
+                content: "empty tools".to_string(),
+                tool_uses: Some(Vec::new()),
+            },
+        };
+        let mut request = request_with_history(vec![
+            Message::User(HistoryUserMessage::new("user", "claude-sonnet-4.6")),
+            Message::Assistant(assistant),
+        ]);
+        request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content = "x".repeat(10_000);
+
+        let (body, report) = guard_kiro_request(
+            &mut request,
+            PayloadGuardConfig {
+                enabled: true,
+                max_bytes: 0,
+                trim_history: true,
+            },
+        )
+        .expect("zero max bytes should disable only size limiting");
+
+        assert!(body.len() > 1_000);
+        assert_eq!(report.max_bytes, 0);
+        assert_eq!(report.final_bytes, body.len());
+        assert_eq!(report.trimmed_history_entries, 0);
+        assert_eq!(report.removed_empty_tool_uses, 1);
+        assert!(!report.still_oversized);
+        assert_eq!(request.conversation_state.history.len(), 2);
+        let Message::Assistant(assistant) = &request.conversation_state.history[1] else {
+            panic!("expected assistant");
+        };
+        assert!(assistant.assistant_response_message.tool_uses.is_none());
     }
 
     #[test]

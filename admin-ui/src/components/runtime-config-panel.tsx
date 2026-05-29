@@ -596,7 +596,7 @@ export function RuntimeConfigPanel() {
       schedulerSelectionPressureWeight: Math.max(0, Number(draft.schedulerSelectionPressureWeight.toFixed(2))),
       schedulerTotalSelectionWeight: Math.max(0, Number(draft.schedulerTotalSelectionWeight.toFixed(4))),
       schedulerTopK: toWhole(draft.schedulerTopK, 1, 100),
-      payloadGuardMaxBytes: toWhole(draft.payloadGuardMaxBytes, 65536),
+      payloadGuardMaxBytes: toWhole(draft.payloadGuardMaxBytes),
       promptCacheTargetReadRatio: toRatio(draft.promptCacheTargetReadRatio),
       promptCacheTokenScale: toScale(draft.promptCacheTokenScale),
       promptCacheMaxSimulatedInputTokens: toWhole(draft.promptCacheMaxSimulatedInputTokens),
@@ -618,8 +618,8 @@ export function RuntimeConfigPanel() {
       toast.error('触顶扣减下限不能大于上限')
       return
     }
-    if (next.payloadGuardEnabled && next.payloadGuardMaxBytes < 65536) {
-      toast.error('Kiro Payload 最大字节数不能小于 65536')
+    if (next.payloadGuardEnabled && next.payloadGuardMaxBytes > 0 && next.payloadGuardMaxBytes < 65536) {
+      toast.error('Kiro Payload 最大字节数必须为 0 或不小于 65536')
       return
     }
     updateConfig.mutate(next, {
@@ -836,9 +836,9 @@ export function RuntimeConfigPanel() {
             />
             <NumberField
               title="Kiro Payload 最大字节数"
-              description="按最终发送到 Kiro 的 JSON body 字节数计算。默认 460800 字节，用于提前规避上游 Improperly formed request。"
+              description="按最终发送到 Kiro 的 JSON body 字节数计算。默认 460800 字节；填 0 表示不限制大小，但仍执行 payload 协议修复。"
               value={draft.payloadGuardMaxBytes}
-              min={65536}
+              min={0}
               suffix="bytes"
               onChange={(payloadGuardMaxBytes) =>
                 setDraft((prev) => ({ ...prev, payloadGuardMaxBytes }))

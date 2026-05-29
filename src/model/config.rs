@@ -570,7 +570,7 @@ pub struct Config {
     #[serde(default = "default_payload_guard_enabled")]
     pub payload_guard_enabled: bool,
 
-    /// Kiro 上游请求 JSON body 最大字节数。默认使用保守阈值 450 KiB。
+    /// Kiro 上游请求 JSON body 最大字节数。默认使用保守阈值 450 KiB；`0` 表示不限制大小但仍执行协议修复。
     #[serde(default = "default_payload_guard_max_bytes")]
     pub payload_guard_max_bytes: usize,
 

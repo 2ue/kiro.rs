@@ -269,7 +269,7 @@ KIRO_RS_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强
 | 字段名 | 建议值 | 控制什么 |
 | --- | --- | --- |
 | `payloadGuardEnabled` | `true` | 是否在发送 Kiro 上游前按最终 JSON 字节数检查请求体。 |
-| `payloadGuardMaxBytes` | `460800` | Kiro 上游请求 JSON body 最大字节数。 |
+| `payloadGuardMaxBytes` | `460800` | Kiro 上游请求 JSON body 最大字节数；`0` 表示不限制大小但仍执行 payload 协议修复。 |
 | `payloadGuardTrimHistory` | `true` | 请求体超限时是否裁剪最旧历史；关闭后只做协议修复，仍超限会直接返回客户端错误。 |
 
 ### 路径缓存行为

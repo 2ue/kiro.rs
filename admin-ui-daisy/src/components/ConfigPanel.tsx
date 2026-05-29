@@ -368,7 +368,7 @@ export function ConfigPanel() {
       schedulerSelectionPressureWeight: Math.max(0, Number(draft.schedulerSelectionPressureWeight.toFixed(2))),
       schedulerTotalSelectionWeight: Math.max(0, Number(draft.schedulerTotalSelectionWeight.toFixed(4))),
       schedulerTopK: toWhole(draft.schedulerTopK, 1, 100),
-      payloadGuardMaxBytes: toWhole(draft.payloadGuardMaxBytes, 65536),
+      payloadGuardMaxBytes: toWhole(draft.payloadGuardMaxBytes),
       promptCacheTargetReadRatio: toRatio(draft.promptCacheTargetReadRatio),
       promptCacheTokenScale: toScale(draft.promptCacheTokenScale),
       promptCacheMaxSimulatedInputTokens: toWhole(draft.promptCacheMaxSimulatedInputTokens),
@@ -381,7 +381,7 @@ export function ConfigPanel() {
     if (next.credentialTransientCooldownSecs > next.credentialMaxCooldownSecs) return toast.error('临时冷却秒数不能大于最大冷却秒数')
     if ([next.credentialRateLimitCooldownSecs, next.credentialServerErrorCooldownSecs, next.credentialNetworkErrorCooldownSecs, next.credentialStreamErrorCooldownSecs, next.credentialProtocolErrorCooldownSecs, next.credentialAuthErrorCooldownSecs].some((value) => value > next.credentialMaxCooldownSecs)) return toast.error('错误类型基础冷却秒数不能大于最大冷却秒数')
     if (next.promptCacheCapJitterMinTokens > next.promptCacheCapJitterMaxTokens) return toast.error('触顶扣减下限不能大于上限')
-    if (next.payloadGuardEnabled && next.payloadGuardMaxBytes < 65536) return toast.error('Kiro Payload 最大字节数不能小于 65536')
+    if (next.payloadGuardEnabled && next.payloadGuardMaxBytes > 0 && next.payloadGuardMaxBytes < 65536) return toast.error('Kiro Payload 最大字节数必须为 0 或不小于 65536')
     updateConfig.mutate(next, {
       onSuccess: () => toast.success('配置已更新'),
       onError: (error) => toast.error(`更新失败: ${extractErrorMessage(error)}`),
@@ -470,7 +470,7 @@ export function ConfigPanel() {
               <ToggleField title="仅压缩空白字符" description="控制压缩时是否只处理多余空白。这是当前推荐的低风险压缩方式。" checked={draft.whitespaceCompression} disabled={!draft.compressionEnabled} onChange={(whitespaceCompression) => setDraft((prev) => ({ ...prev, whitespaceCompression }))} />
               <ToggleField title="启用 Kiro Payload 防护" description="发送上游前按真实 JSON 字节数检查请求，并修复空 toolUses、孤立 tool_result 等 Kiro 容易拒绝的形态。" checked={draft.payloadGuardEnabled} onChange={(payloadGuardEnabled) => setDraft((prev) => ({ ...prev, payloadGuardEnabled }))} />
               <ToggleField title="超限裁剪旧历史" description="请求超过最大字节数时，优先裁剪最旧历史；关闭后只做协议修复，仍超限会直接返回客户端错误。" checked={draft.payloadGuardTrimHistory} disabled={!draft.payloadGuardEnabled} onChange={(payloadGuardTrimHistory) => setDraft((prev) => ({ ...prev, payloadGuardTrimHistory }))} />
-              <NumberField title="Kiro Payload 最大字节数" description="按最终发送到 Kiro 的 JSON body 字节数计算。默认 460800 字节，用于提前规避上游 Improperly formed request。" value={draft.payloadGuardMaxBytes} min={65536} suffix="bytes" onChange={(payloadGuardMaxBytes) => setDraft((prev) => ({ ...prev, payloadGuardMaxBytes }))} />
+              <NumberField title="Kiro Payload 最大字节数" description="按最终发送到 Kiro 的 JSON body 字节数计算。默认 460800 字节；填 0 表示不限制大小，但仍执行 payload 协议修复。" value={draft.payloadGuardMaxBytes} min={0} suffix="bytes" onChange={(payloadGuardMaxBytes) => setDraft((prev) => ({ ...prev, payloadGuardMaxBytes }))} />
             </ConfigGroup>
           </>
         )}

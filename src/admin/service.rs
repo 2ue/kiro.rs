@@ -1673,9 +1673,12 @@ impl AdminService {
                 "promptCacheTargetReadRatio 必须在 0 到 0.99 之间".to_string(),
             ));
         }
-        if payload_guard_enabled && payload_guard_max_bytes < 64 * 1024 {
+        if payload_guard_enabled
+            && payload_guard_max_bytes > 0
+            && payload_guard_max_bytes < 64 * 1024
+        {
             return Err(AdminServiceError::InvalidCredential(
-                "payloadGuardMaxBytes 启用时不能小于 65536".to_string(),
+                "payloadGuardMaxBytes 启用时必须为 0 或不小于 65536".to_string(),
             ));
         }
         if !(1.0..=3.0).contains(&prompt_cache_token_scale) || !prompt_cache_token_scale.is_finite()

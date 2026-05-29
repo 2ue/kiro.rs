@@ -1506,7 +1506,9 @@ fn log_payload_guard_report(
             removed_orphan_tool_uses = report.removed_orphan_tool_uses,
             "Kiro payload guard modified request before upstream call"
         );
-    } else if report.original_bytes > report.max_bytes.saturating_mul(80) / 100 {
+    } else if report.max_bytes > 0
+        && report.original_bytes > report.max_bytes.saturating_mul(80) / 100
+    {
         tracing::info!(
             endpoint,
             requested_model,

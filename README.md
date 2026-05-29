@@ -215,7 +215,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `compression.enabled` | boolean | `false` | 是否启用上游请求压缩；默认关闭 |
 | `compression.whitespaceCompression` | boolean | `true` | 启用 compression 后是否只做 JSON whitespace 压缩；默认只开启该低风险压缩 |
 | `payloadGuardEnabled` | boolean | `true` | 是否启用发送 Kiro 上游前的最终 payload 防护 |
-| `payloadGuardMaxBytes` | number | `460800` | Kiro 上游请求 JSON body 最大字节数，按最终发送的 JSON 字节数计算 |
+| `payloadGuardMaxBytes` | number | `460800` | Kiro 上游请求 JSON body 最大字节数，按最终发送的 JSON 字节数计算；`0` 表示不限制大小但仍执行 payload 协议修复 |
 | `payloadGuardTrimHistory` | boolean | `true` | payload 超限时是否允许裁剪最旧历史；关闭后只做协议修复，仍超限会直接返回客户端错误 |
 | `compatProfile` | string | `claude-code` | 兼容 profile：`claude-code` 优先真实 Claude Code CLI 可用性；`anthropic-strict` 减少代理改写和调试特征；`debug` 等同 `claude-code` 但默认暴露代理 warning |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
