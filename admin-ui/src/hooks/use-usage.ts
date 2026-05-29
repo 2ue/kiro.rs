@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   clearUsageRecords,
+  deleteManualModel,
   getAuditLogsPage,
   getModelCapabilities,
   getModelPricing,
@@ -9,8 +10,9 @@ import {
   getUsageSummary,
   syncModelPricing,
   syncModelCapabilities,
+  upsertManualModel,
 } from '@/api/usage'
-import type { AdminAuditLogPageQuery, UsageRecordsPageQuery, UsageRecordsQuery } from '@/types/api'
+import type { AdminAuditLogPageQuery, UpsertManualModelRequest, UsageRecordsPageQuery, UsageRecordsQuery } from '@/types/api'
 
 export function useUsageRecords(query: UsageRecordsQuery) {
   return useQuery({
@@ -90,6 +92,28 @@ export function useSyncModelCapabilities() {
     mutationFn: syncModelCapabilities,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['model-capabilities'] })
+    },
+  })
+}
+
+export function useUpsertManualModel() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: UpsertManualModelRequest) => upsertManualModel(payload),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['model-capabilities'] })
+      queryClient.invalidateQueries({ queryKey: ['model-pricing'] })
+    },
+  })
+}
+
+export function useDeleteManualModel() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: deleteManualModel,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['model-capabilities'] })
+      queryClient.invalidateQueries({ queryKey: ['model-pricing'] })
     },
   })
 }

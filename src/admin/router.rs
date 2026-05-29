@@ -8,14 +8,15 @@ use axum::{
 use super::{
     handlers::{
         add_credential, clear_credential_in_flight, clear_usage_records, create_proxy_resource,
-        delete_credential, delete_proxy_resource, export_credentials, force_refresh_token,
-        get_all_credentials, get_audit_logs, get_credential_balance, get_credential_info,
-        get_credentials_page, get_load_balancing_mode, get_model_capabilities, get_model_pricing,
-        get_proxy_resources, get_runtime_config, get_usage_records, get_usage_records_page,
-        get_usage_summary, get_usage_writer_stats, refresh_credentials_info, reset_failure_count,
-        set_credential_disabled, set_credential_priority, set_credential_proxy,
-        set_credential_warmup, set_load_balancing_mode, sync_model_capabilities,
-        sync_model_pricing, test_credential, update_proxy_resource, update_runtime_config,
+        delete_credential, delete_manual_model, delete_proxy_resource, export_credentials,
+        force_refresh_token, get_all_credentials, get_audit_logs, get_credential_balance,
+        get_credential_info, get_credentials_page, get_load_balancing_mode, get_model_capabilities,
+        get_model_pricing, get_proxy_resources, get_runtime_config, get_usage_records,
+        get_usage_records_page, get_usage_summary, get_usage_writer_stats,
+        refresh_credentials_info, reset_failure_count, set_credential_disabled,
+        set_credential_priority, set_credential_proxy, set_credential_warmup,
+        set_load_balancing_mode, sync_model_capabilities, sync_model_pricing, test_credential,
+        update_proxy_resource, update_runtime_config, upsert_manual_model,
         validate_existing_credentials, validate_external_credentials,
     },
     middleware::{AdminState, admin_auth_middleware},
@@ -99,6 +100,11 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/model-pricing/sync", post(sync_model_pricing))
         .route("/model-capabilities", get(get_model_capabilities))
         .route("/model-capabilities/sync", post(sync_model_capabilities))
+        .route("/model-capabilities/manual", post(upsert_manual_model))
+        .route(
+            "/model-capabilities/manual/{model}",
+            delete(delete_manual_model),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

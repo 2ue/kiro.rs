@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 use crate::anthropic::types::Model;
 use crate::kiro::model::available_models::KiroAvailableModel;
 
-const SEED_SOURCE: &str = "kiro-upstream-seed";
-const KIRO_SOURCE: &str = "kiro-list-available-models";
+pub const SEED_SOURCE: &str = "kiro-upstream-seed";
+pub const KIRO_SOURCE: &str = "kiro-list-available-models";
+pub const MANUAL_SOURCE: &str = "manual";
 const SEED_JSON: &str = include_str!("../../data/kiro-upstream-models.seed.json");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +23,8 @@ pub struct ModelCapabilityItem {
     pub max_output_tokens: Option<i32>,
     pub supports_prompt_caching: Option<bool>,
     pub supported_input_types: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,8 +108,12 @@ impl ModelCapabilitiesCatalog {
         let models: BTreeMap<String, ModelCapabilityItem> = status
             .models
             .into_iter()
+            .filter_map(|item| sanitize_capability_item(item, &status.source))
             .map(|item| (item.model.clone(), item))
             .collect();
+        if models.is_empty() {
+            return;
+        }
         let mut inner = self.inner.write();
         inner.models = models;
         inner.source = status.source;
@@ -158,10 +165,6 @@ impl ModelCapabilitiesCatalog {
         models
     }
 
-    pub fn upstream_model_ids(&self) -> Vec<String> {
-        self.inner.read().models.keys().cloned().collect()
-    }
-
     pub fn max_input_tokens_for(&self, model: &str) -> Option<i32> {
         let model = normalize_model_id(model);
         self.inner
@@ -173,8 +176,26 @@ impl ModelCapabilitiesCatalog {
     }
 
     pub fn resolve_model(&self, requested_model: &str) -> ModelResolution {
-        let models = self.upstream_model_ids();
-        resolve_model_with_catalog(requested_model, &models)
+        let inner = self.inner.read();
+        let models = inner.models.keys().cloned().collect::<Vec<_>>();
+        let manual_models = inner
+            .models
+            .values()
+            .filter(|item| is_manual_source(item.source.as_deref()))
+            .map(|item| item.model.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let mut resolution = resolve_model_with_catalog(requested_model, &models);
+        if let Some(upstream_model) = resolution.upstream_model.as_deref() {
+            if manual_models.contains(upstream_model) {
+                resolution.source = ModelResolutionSource::Manual;
+                if let Some(note) = resolution.note.take() {
+                    resolution.note = Some(format!("{} (manual supplement)", note));
+                } else {
+                    resolution.note = Some("manual supplement".to_string());
+                }
+            }
+        }
+        resolution
     }
 
     pub fn seed_status() -> ModelCapabilitiesStatus {
@@ -199,6 +220,7 @@ impl ModelCapabilitiesCatalog {
                 merged.insert(item.model.clone(), item);
             }
         }
+        let using_seed_fallback = merged.is_empty();
         if merged.is_empty() {
             merged = seed_model_capabilities()
                 .into_iter()
@@ -206,6 +228,19 @@ impl ModelCapabilitiesCatalog {
                 .collect();
         }
         let mut inner = self.inner.write();
+        let manual_models = inner
+            .models
+            .values()
+            .filter(|item| is_manual_source(item.source.as_deref()))
+            .cloned()
+            .collect::<Vec<_>>();
+        for item in manual_models {
+            if using_seed_fallback {
+                merged.insert(item.model.clone(), item);
+            } else {
+                merged.entry(item.model.clone()).or_insert(item);
+            }
+        }
         inner.models = merged;
         inner.source = KIRO_SOURCE.to_string();
         inner.last_synced_at = Some(Utc::now().to_rfc3339());
@@ -216,6 +251,28 @@ impl ModelCapabilitiesCatalog {
     pub fn record_sync_error(&self, error: impl Into<String>) -> ModelCapabilitiesStatus {
         let mut inner = self.inner.write();
         inner.last_error = Some(error.into());
+        inner.status()
+    }
+
+    pub fn upsert_manual_model(&self, item: ModelCapabilityItem) -> ModelCapabilitiesStatus {
+        let Some(item) = sanitize_capability_item(item, MANUAL_SOURCE) else {
+            return self.status();
+        };
+        let mut inner = self.inner.write();
+        inner.models.insert(item.model.clone(), item);
+        inner.status()
+    }
+
+    pub fn delete_manual_model(&self, model: &str) -> ModelCapabilitiesStatus {
+        let model = normalize_model_id(model);
+        let mut inner = self.inner.write();
+        if inner
+            .models
+            .get(&model)
+            .is_some_and(|item| is_manual_source(item.source.as_deref()))
+        {
+            inner.models.remove(&model);
+        }
         inner.status()
     }
 }
@@ -234,6 +291,7 @@ struct SeedModelCapabilities {
 #[serde(rename_all = "snake_case")]
 pub enum ModelResolutionSource {
     ExactUpstream,
+    Manual,
     Alias,
     FamilyNormalized,
     Unsupported,
@@ -243,6 +301,7 @@ impl ModelResolutionSource {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ExactUpstream => "exact_upstream",
+            Self::Manual => "manual",
             Self::Alias => "alias",
             Self::FamilyNormalized => "family_normalized",
             Self::Unsupported => "unsupported",
@@ -331,6 +390,7 @@ fn model_capability_from_kiro(model: KiroAvailableModel) -> Option<ModelCapabili
             .map(|cache| cache.supports_prompt_caching),
         supported_input_types: model.supported_input_types,
         model: model_id,
+        source: Some(KIRO_SOURCE.to_string()),
     })
 }
 
@@ -348,6 +408,7 @@ fn seed_model_capabilities() -> Vec<ModelCapabilityItem> {
                     if item.supported_input_types.is_empty() {
                         item.supported_input_types = vec!["TEXT".to_string()];
                     }
+                    item.source = Some(SEED_SOURCE.to_string());
                     item
                 })
                 .collect()
@@ -359,6 +420,54 @@ fn seed_model_capabilities() -> Vec<ModelCapabilityItem> {
             );
             static_model_capabilities()
         })
+}
+
+fn sanitize_capability_item(
+    mut item: ModelCapabilityItem,
+    default_source: &str,
+) -> Option<ModelCapabilityItem> {
+    item.model = normalize_model_id(&item.model);
+    if item.model.is_empty() {
+        return None;
+    }
+    item.display_name = item.display_name.trim().to_string();
+    if item.display_name.is_empty() {
+        item.display_name = item.model.clone();
+    }
+    item.description = item
+        .description
+        .and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()));
+    item.max_input_tokens = item.max_input_tokens.filter(|value| *value > 0);
+    item.max_output_tokens = item.max_output_tokens.filter(|value| *value > 0);
+    item.supported_input_types = normalize_supported_input_types(item.supported_input_types);
+    item.source = Some(
+        item.source
+            .as_deref()
+            .filter(|source| !source.trim().is_empty())
+            .unwrap_or(default_source)
+            .trim()
+            .to_string(),
+    );
+    Some(item)
+}
+
+pub fn normalize_supported_input_types(values: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for value in values {
+        let value = value.trim().to_ascii_uppercase();
+        if value.is_empty() || normalized.contains(&value) {
+            continue;
+        }
+        normalized.push(value);
+    }
+    if normalized.is_empty() {
+        normalized.push("TEXT".to_string());
+    }
+    normalized
+}
+
+pub fn is_manual_source(source: Option<&str>) -> bool {
+    source.is_some_and(|source| source.eq_ignore_ascii_case(MANUAL_SOURCE))
 }
 
 pub fn normalize_model_id(model: &str) -> String {
@@ -748,6 +857,7 @@ fn static_model_capabilities() -> Vec<ModelCapabilityItem> {
             max_output_tokens: Some(model.max_tokens),
             supports_prompt_caching: Some(true),
             supported_input_types: vec!["TEXT".to_string(), "IMAGE".to_string()],
+            source: Some(SEED_SOURCE.to_string()),
         })
         .collect()
 }
@@ -896,6 +1006,61 @@ mod tests {
     }
 
     #[test]
+    fn manual_models_survive_sync_and_same_upstream_model_takes_over() {
+        let catalog = ModelCapabilitiesCatalog::new();
+        catalog.upsert_manual_model(ModelCapabilityItem {
+            model: "claude-opus-5-20270101".to_string(),
+            display_name: "Claude Opus 5".to_string(),
+            description: None,
+            max_input_tokens: Some(1_000_000),
+            max_output_tokens: Some(128_000),
+            supports_prompt_caching: Some(true),
+            supported_input_types: vec!["TEXT".to_string()],
+            source: Some(MANUAL_SOURCE.to_string()),
+        });
+
+        let status = catalog.sync_from_kiro_models(vec![KiroAvailableModel {
+            model_id: "claude-sonnet-4-9-20270101".to_string(),
+            model_name: Some("Claude Sonnet 4.9".to_string()),
+            token_limits: Some(KiroModelTokenLimits {
+                max_input_tokens: Some(1_000_000),
+                max_output_tokens: Some(128_000),
+            }),
+            ..Default::default()
+        }]);
+        let manual = status
+            .models
+            .iter()
+            .find(|item| item.model == "claude-opus-5-20270101")
+            .unwrap();
+        assert_eq!(manual.source.as_deref(), Some(MANUAL_SOURCE));
+        assert_eq!(
+            catalog.resolve_model("claude-opus-5-20270101").source,
+            ModelResolutionSource::Manual
+        );
+
+        let status = catalog.sync_from_kiro_models(vec![KiroAvailableModel {
+            model_id: "claude-opus-5-20270101".to_string(),
+            model_name: Some("Claude Opus 5 Upstream".to_string()),
+            token_limits: Some(KiroModelTokenLimits {
+                max_input_tokens: Some(200_000),
+                max_output_tokens: Some(64_000),
+            }),
+            ..Default::default()
+        }]);
+        let upstream = status
+            .models
+            .iter()
+            .find(|item| item.model == "claude-opus-5-20270101")
+            .unwrap();
+        assert_eq!(upstream.source.as_deref(), Some(KIRO_SOURCE));
+        assert_eq!(
+            catalog.resolve_model("claude-opus-5-20270101").source,
+            ModelResolutionSource::ExactUpstream
+        );
+    }
+
+    #[test]
     fn resolver_maps_legacy_dated_models_to_seeded_kiro_models() {
         let models = seed_model_capabilities()
             .into_iter()
@@ -1034,6 +1199,7 @@ mod tests {
                 max_output_tokens: Some(64_000),
                 supports_prompt_caching: Some(true),
                 supported_input_types: vec!["TEXT".to_string()],
+                source: None,
             }],
         };
         assert!(legacy.should_refresh_from_seed());

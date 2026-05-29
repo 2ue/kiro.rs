@@ -23,8 +23,8 @@ use crate::kiro::machine_id;
 use crate::kiro::model::available_models::{KiroAvailableModel, KiroAvailableModelsResponse};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{
-    CallContext, CredentialRiskControlReason, InFlightKind, InFlightLeaseGuard, MultiTokenManager,
-    TransientFailureKind,
+    CallContext, CredentialRiskControlReason, InFlightKind, InFlightLeaseGuard, ManagerSnapshot,
+    MultiTokenManager, TransientFailureKind,
 };
 use crate::model::config::{Config, TlsBackend};
 use parking_lot::Mutex;
@@ -622,6 +622,11 @@ impl KiroProvider {
     /// 获取当前运行时配置快照。
     pub fn runtime_config(&self) -> Config {
         self.token_manager.runtime_config()
+    }
+
+    /// 获取调度器状态快照，用于错误响应携带当前冷却/容量信息。
+    pub fn manager_snapshot(&self) -> ManagerSnapshot {
+        self.token_manager.snapshot()
     }
 
     fn credential_log_label(&self, id: u64) -> String {

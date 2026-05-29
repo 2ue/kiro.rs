@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::anthropic::pricing::ModelPricing;
 use crate::model::config::{CompatProfile, CompressionConfig, ReportedUsageConfig};
 
 // ============ 凭据状态 ============
@@ -586,6 +587,9 @@ pub struct RuntimeConfigResponse {
     pub scheduler_top_k: u32,
     pub compression_enabled: bool,
     pub whitespace_compression: bool,
+    pub payload_guard_enabled: bool,
+    pub payload_guard_max_bytes: u64,
+    pub payload_guard_trim_history: bool,
     pub prompt_cache_target_read_ratio: f64,
     pub prompt_cache_token_scale: f64,
     pub prompt_cache_max_simulated_input_tokens: i32,
@@ -660,6 +664,12 @@ pub struct UpdateRuntimeConfigRequest {
     #[serde(default = "default_true")]
     pub whitespace_compression: bool,
     #[serde(default)]
+    pub payload_guard_enabled: Option<bool>,
+    #[serde(default)]
+    pub payload_guard_max_bytes: Option<u64>,
+    #[serde(default)]
+    pub payload_guard_trim_history: Option<bool>,
+    #[serde(default)]
     pub prompt_cache_target_read_ratio: Option<f64>,
     #[serde(default)]
     pub prompt_cache_token_scale: Option<f64>,
@@ -694,6 +704,84 @@ impl UpdateRuntimeConfigRequest {
 
 fn default_true() -> bool {
     true
+}
+
+// ============ 手动模型补充 ============
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualModelPricingRequest {
+    pub input_cost_per_million: f64,
+    pub output_cost_per_million: f64,
+    #[serde(default)]
+    pub cache_creation_input_cost_per_million: Option<f64>,
+    #[serde(default)]
+    pub cache_read_input_cost_per_million: Option<f64>,
+}
+
+impl ManualModelPricingRequest {
+    pub fn to_pricing(&self) -> Option<ModelPricing> {
+        let input = cost_per_token(self.input_cost_per_million)?;
+        let output = cost_per_token(self.output_cost_per_million)?;
+        let cache_creation = self
+            .cache_creation_input_cost_per_million
+            .and_then(cost_per_token)
+            .unwrap_or(input * 1.25);
+        let cache_read = self
+            .cache_read_input_cost_per_million
+            .and_then(cost_per_token)
+            .unwrap_or(input * 0.1);
+        Some(ModelPricing {
+            input_cost_per_token: input,
+            output_cost_per_token: output,
+            cache_creation_input_token_cost: cache_creation,
+            cache_read_input_token_cost: cache_read,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpsertManualModelRequest {
+    pub model: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub max_input_tokens: Option<i32>,
+    #[serde(default)]
+    pub max_output_tokens: Option<i32>,
+    #[serde(default)]
+    pub supports_prompt_caching: Option<bool>,
+    #[serde(default)]
+    pub supported_input_types: Vec<String>,
+    #[serde(default)]
+    pub pricing: Option<ManualModelPricingRequest>,
+    #[serde(default)]
+    pub clear_pricing: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualModelResponse {
+    pub success: bool,
+    pub message: String,
+    pub model: String,
+}
+
+impl ManualModelResponse {
+    pub fn new(model: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            success: true,
+            model: model.into(),
+            message: message.into(),
+        }
+    }
+}
+
+fn cost_per_token(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value.max(0.0) / 1_000_000.0)
 }
 
 // ============ 通用响应 ============

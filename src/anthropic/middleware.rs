@@ -57,6 +57,12 @@ pub struct AppState {
     pub compat_profile: CompatProfile,
     /// 是否在响应头中暴露代理改写动作
     pub expose_proxy_warnings: bool,
+    /// 是否启用发送 Kiro 上游前的最终 payload 防护
+    pub payload_guard_enabled: bool,
+    /// Kiro 上游请求 JSON body 最大字节数
+    pub payload_guard_max_bytes: usize,
+    /// payload 超限时是否裁剪旧历史
+    pub payload_guard_trim_history: bool,
 }
 
 impl AppState {
@@ -89,6 +95,9 @@ impl AppState {
             reported_usage: ReportedUsageConfig::default(),
             compat_profile,
             expose_proxy_warnings: expose_proxy_warnings || compat_profile.is_debug(),
+            payload_guard_enabled: true,
+            payload_guard_max_bytes: 450 * 1024,
+            payload_guard_trim_history: true,
         }
     }
 
@@ -128,6 +137,18 @@ impl AppState {
 
     pub fn with_prompt_cache_simulation_mode(mut self, mode: PromptCacheSimulationMode) -> Self {
         self.prompt_cache_simulation_mode = mode;
+        self
+    }
+
+    pub fn with_payload_guard(
+        mut self,
+        enabled: bool,
+        max_bytes: usize,
+        trim_history: bool,
+    ) -> Self {
+        self.payload_guard_enabled = enabled;
+        self.payload_guard_max_bytes = max_bytes;
+        self.payload_guard_trim_history = trim_history;
         self
     }
 

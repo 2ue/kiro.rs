@@ -563,6 +563,21 @@ pub struct Config {
     #[serde(default)]
     pub compression: CompressionConfig,
 
+    /// 发送 Kiro 上游前启用最终 payload 防护。
+    ///
+    /// 防护在 Anthropic -> Kiro 转换之后运行，按真实 JSON 字节数裁剪旧历史，
+    /// 并修复 Kiro 容易返回 `400 Improperly formed request` 的工具配对边界。
+    #[serde(default = "default_payload_guard_enabled")]
+    pub payload_guard_enabled: bool,
+
+    /// Kiro 上游请求 JSON body 最大字节数。默认使用保守阈值 450 KiB。
+    #[serde(default = "default_payload_guard_max_bytes")]
+    pub payload_guard_max_bytes: usize,
+
+    /// payload 超限时是否允许裁剪最旧历史。关闭后只执行轻量协议修复并直接报错。
+    #[serde(default = "default_payload_guard_trim_history")]
+    pub payload_guard_trim_history: bool,
+
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
@@ -815,6 +830,18 @@ fn default_scheduler_top_k() -> u32 {
     3
 }
 
+fn default_payload_guard_enabled() -> bool {
+    true
+}
+
+fn default_payload_guard_max_bytes() -> usize {
+    450 * 1024
+}
+
+fn default_payload_guard_trim_history() -> bool {
+    true
+}
+
 fn default_compat_profile() -> CompatProfile {
     CompatProfile::ClaudeCode
 }
@@ -963,6 +990,9 @@ impl Default for Config {
             credential_warmup_max_selection_percent:
                 default_credential_warmup_max_selection_percent(),
             compression: CompressionConfig::default(),
+            payload_guard_enabled: default_payload_guard_enabled(),
+            payload_guard_max_bytes: default_payload_guard_max_bytes(),
+            payload_guard_trim_history: default_payload_guard_trim_history(),
             load_balancing_mode: default_load_balancing_mode(),
             scheduler_error_ewma_alpha: default_scheduler_error_ewma_alpha(),
             scheduler_priority_weight: default_scheduler_priority_weight(),
@@ -1082,6 +1112,9 @@ mod tests {
         assert_eq!(config.credential_warmup_requests, 3);
         assert_eq!(config.credential_warmup_selection_percent, 5);
         assert_eq!(config.credential_warmup_max_selection_percent, 50);
+        assert!(config.payload_guard_enabled);
+        assert_eq!(config.payload_guard_max_bytes, 450 * 1024);
+        assert!(config.payload_guard_trim_history);
         assert_eq!(config.scheduler_selection_pressure_weight, 25.0);
         assert_eq!(config.scheduler_total_selection_weight, 0.0);
         assert_eq!(config.scheduler_top_k, 3);

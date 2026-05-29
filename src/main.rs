@@ -253,29 +253,6 @@ async fn main() {
         Ok(None) => {}
         Err(err) => tracing::warn!("从 PgSQL 加载模型价格状态失败，使用内置价格继续: {}", err),
     }
-    {
-        let pricing_catalog = pricing_catalog.clone();
-        let postgres_store = postgres_store.clone();
-        tokio::spawn(async move {
-            let status = pricing_catalog.sync().await;
-            if let Err(err) = postgres_store.save_pricing_status(&status).await {
-                tracing::warn!("保存模型价格到 PgSQL 失败，不影响调度: {}", err);
-            }
-            if status.last_error.is_some() {
-                tracing::warn!(
-                    source = %status.source,
-                    model_count = status.model_count,
-                    "模型价格启动同步失败，使用当前价格目录继续运行"
-                );
-            } else {
-                tracing::info!(
-                    source = %status.source,
-                    model_count = status.model_count,
-                    "模型价格已初始化"
-                );
-            }
-        });
-    }
     let model_capabilities =
         Arc::new(anthropic::model_capabilities::ModelCapabilitiesCatalog::new());
     match postgres_store.load_model_capabilities_status().await {
@@ -353,6 +330,7 @@ async fn main() {
         let model_capabilities = model_capabilities.clone();
         let postgres_store = postgres_store.clone();
         let kiro_provider = kiro_provider.clone();
+        let pricing_catalog = pricing_catalog.clone();
         tokio::spawn(async move {
             let status = match kiro_provider.list_available_models().await {
                 Ok(models) => model_capabilities.sync_from_kiro_models(models),
@@ -375,6 +353,25 @@ async fn main() {
                     source = %status.source,
                     model_count = status.model_count,
                     "模型能力已初始化"
+                );
+            }
+
+            let capability_models = status.models.into_iter().map(|item| item.model);
+            let pricing_status = pricing_catalog.sync_for_models(capability_models).await;
+            if let Err(err) = postgres_store.save_pricing_status(&pricing_status).await {
+                tracing::warn!("保存模型价格到 PgSQL 失败，不影响调度: {}", err);
+            }
+            if pricing_status.last_error.is_some() {
+                tracing::warn!(
+                    source = %pricing_status.source,
+                    model_count = pricing_status.model_count,
+                    "模型价格启动同步失败，使用当前价格目录继续运行"
+                );
+            } else {
+                tracing::info!(
+                    source = %pricing_status.source,
+                    model_count = pricing_status.model_count,
+                    "模型价格已按当前模型能力目录初始化"
                 );
             }
         });
@@ -407,6 +404,9 @@ async fn main() {
         config.reported_usage.clone(),
         config.compat_profile,
         config.expose_proxy_warnings,
+        config.payload_guard_enabled,
+        config.payload_guard_max_bytes,
+        config.payload_guard_trim_history,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）

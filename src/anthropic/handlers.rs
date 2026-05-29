@@ -39,6 +39,9 @@ use super::converter::{
 use super::envelope;
 use super::middleware::AppState;
 use super::model_capabilities::{ModelResolution, ModelResolutionSource};
+use super::payload_guard::{
+    PayloadGuardConfig, PayloadGuardError, PayloadGuardReport, guard_kiro_request,
+};
 use super::prompt_cache::{PromptCacheProfile, PromptCacheScope};
 use super::stream::{SseEvent, StreamContext};
 use super::types::{
@@ -110,6 +113,9 @@ struct RequestRuntimeConfig {
     reported_usage: ReportedUsageConfig,
     compat_profile: CompatProfile,
     expose_proxy_warnings: bool,
+    payload_guard_enabled: bool,
+    payload_guard_max_bytes: usize,
+    payload_guard_trim_history: bool,
 }
 
 impl RequestRuntimeConfig {
@@ -125,6 +131,9 @@ impl RequestRuntimeConfig {
             reported_usage: state.reported_usage.clone(),
             compat_profile: state.compat_profile,
             expose_proxy_warnings: state.expose_proxy_warnings,
+            payload_guard_enabled: state.payload_guard_enabled,
+            payload_guard_max_bytes: state.payload_guard_max_bytes,
+            payload_guard_trim_history: state.payload_guard_trim_history,
         }
     }
 
@@ -150,6 +159,17 @@ impl RequestRuntimeConfig {
             reported_usage: config.reported_usage.normalized(),
             compat_profile: config.compat_profile,
             expose_proxy_warnings: config.expose_proxy_warnings || config.compat_profile.is_debug(),
+            payload_guard_enabled: config.payload_guard_enabled,
+            payload_guard_max_bytes: config.payload_guard_max_bytes,
+            payload_guard_trim_history: config.payload_guard_trim_history,
+        }
+    }
+
+    fn payload_guard_config(&self) -> PayloadGuardConfig {
+        PayloadGuardConfig {
+            enabled: self.payload_guard_enabled,
+            max_bytes: self.payload_guard_max_bytes,
+            trim_history: self.payload_guard_trim_history,
         }
     }
 }
@@ -1188,7 +1208,32 @@ fn prepare_credential_usage_context(
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
-fn map_provider_error(err: Error, request_id: Option<&str>) -> Response {
+fn cooldown_retry_after_secs(
+    provider: Option<&crate::kiro::provider::KiroProvider>,
+    fallback_secs: u64,
+) -> u64 {
+    let fallback_secs = fallback_secs.max(1);
+    let Some(provider) = provider else {
+        return fallback_secs;
+    };
+    let snapshot = provider.manager_snapshot();
+    let retry_after = snapshot
+        .entries
+        .iter()
+        .filter(|entry| !entry.disabled)
+        .filter_map(|entry| {
+            (entry.cooldown_remaining_secs > 0).then_some(entry.cooldown_remaining_secs)
+        })
+        .min()
+        .unwrap_or(fallback_secs);
+    retry_after.max(1)
+}
+
+fn map_provider_error(
+    err: Error,
+    request_id: Option<&str>,
+    provider: Option<&crate::kiro::provider::KiroProvider>,
+) -> Response {
     let err_str = err.to_string();
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
@@ -1229,6 +1274,24 @@ fn map_provider_error(err: Error, request_id: Option<&str>) -> Response {
         };
     }
 
+    if err_str.contains("Improperly formed request") || err_str.contains("IMPROPERLY_FORMED") {
+        log_provider_warning_with_hint(
+            &err_str,
+            "上游拒绝请求：Kiro payload 形态不合法（不应切换账号重试）",
+        );
+        let message = "Kiro rejected the converted request as improperly formed. Check model mapping, tool_use/tool_result pairing, tool schema, multimodal sources, and payload size.";
+        return if let Some(request_id) = request_id {
+            envelope::error_response_with_id(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                message,
+                request_id,
+            )
+        } else {
+            envelope::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message)
+        };
+    }
+
     if err_str.contains("临时冷却")
         || err_str.contains("本地限流")
         || err_str.contains("凭据调度排队等待超时")
@@ -1237,7 +1300,9 @@ fn map_provider_error(err: Error, request_id: Option<&str>) -> Response {
         || err_str.contains("Retry-After")
         || err_str.contains("429")
     {
-        let retry_after_secs = retry_after_secs_from_error(&err_str).unwrap_or(1).max(1);
+        let retry_after_secs = retry_after_secs_from_error(&err_str)
+            .map(|secs| secs.max(1))
+            .unwrap_or_else(|| cooldown_retry_after_secs(provider, 1));
         log_provider_rate_limit_with_hint(&err_str, retry_after_secs);
         let message = format!(
             "Upstream temporarily rate limited. Retry after {} seconds.",
@@ -1365,6 +1430,94 @@ fn resolve_request_model(
 
 fn should_expose_proxy_warnings(runtime_config: &RequestRuntimeConfig) -> bool {
     runtime_config.expose_proxy_warnings && !runtime_config.compat_profile.is_strict()
+}
+
+fn merge_warning_headers(
+    conversion_warnings: Option<String>,
+    payload_report: Option<&PayloadGuardReport>,
+) -> Option<String> {
+    let mut warnings = Vec::new();
+    if let Some(value) = conversion_warnings.filter(|value| !value.trim().is_empty()) {
+        warnings.push(value);
+    }
+    if let Some(fragment) = payload_report.and_then(PayloadGuardReport::warning_header_fragment) {
+        if !fragment.trim().is_empty() {
+            warnings.push(fragment);
+        }
+    }
+    (!warnings.is_empty()).then(|| warnings.join(","))
+}
+
+fn payload_guard_error_response(err: PayloadGuardError) -> Response {
+    match err {
+        PayloadGuardError::Serialize(message) => {
+            tracing::error!("序列化请求失败: {}", message);
+            envelope::error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
+        }
+        PayloadGuardError::Oversized {
+            final_bytes,
+            max_bytes,
+            original_bytes,
+        } => {
+            tracing::warn!(
+                final_bytes,
+                max_bytes,
+                original_bytes,
+                "Kiro request payload 仍超出限制，拒绝发送上游"
+            );
+            envelope::error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!(
+                    "Kiro request payload is too large after trimming: final={} bytes, limit={} bytes, original={} bytes. Reduce conversation history, tools, system prompt, documents, or image payloads.",
+                    final_bytes, max_bytes, original_bytes
+                ),
+            )
+        }
+    }
+}
+
+fn log_payload_guard_report(
+    report: &PayloadGuardReport,
+    endpoint: &str,
+    requested_model: &str,
+    upstream_model: Option<&str>,
+    conversation_id: Option<&str>,
+) {
+    if !report.enabled {
+        return;
+    }
+    if report.was_modified() {
+        tracing::warn!(
+            endpoint,
+            requested_model,
+            upstream_model,
+            conversation_id,
+            original_bytes = report.original_bytes,
+            final_bytes = report.final_bytes,
+            max_bytes = report.max_bytes,
+            original_history_entries = report.original_history_entries,
+            final_history_entries = report.final_history_entries,
+            trimmed_history_entries = report.trimmed_history_entries,
+            aligned_leading_entries = report.aligned_leading_entries,
+            removed_empty_tool_uses = report.removed_empty_tool_uses,
+            removed_orphan_tool_results = report.removed_orphan_tool_results,
+            textified_orphan_tool_results = report.textified_orphan_tool_results,
+            removed_orphan_tool_uses = report.removed_orphan_tool_uses,
+            "Kiro payload guard modified request before upstream call"
+        );
+    } else if report.original_bytes > report.max_bytes.saturating_mul(80) / 100 {
+        tracing::info!(
+            endpoint,
+            requested_model,
+            upstream_model,
+            conversation_id,
+            payload_bytes = report.final_bytes,
+            max_bytes = report.max_bytes,
+            history_entries = report.final_history_entries,
+            "Kiro payload guard observed large request"
+        );
+    }
 }
 
 fn should_extract_unsigned_thinking(
@@ -1515,21 +1668,34 @@ async fn post_messages_inner(
     };
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
-    let kiro_request = KiroRequest {
+    let mut kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
     };
+    let conversation_id = kiro_request.conversation_state.conversation_id.clone();
 
-    let request_body = match serde_json::to_string(&kiro_request) {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::error!("序列化请求失败: {}", e);
-            return envelope::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                format!("序列化请求失败: {}", e),
-            );
-        }
+    let (request_body, payload_guard_report) =
+        match guard_kiro_request(&mut kiro_request, runtime_config.payload_guard_config()) {
+            Ok(result) => result,
+            Err(err) => return payload_guard_error_response(err),
+        };
+    log_payload_guard_report(
+        &payload_guard_report,
+        endpoint,
+        &payload.model,
+        model_resolution.upstream_model.as_deref(),
+        Some(&conversation_id),
+    );
+    if model_resolution.is_remapped() {
+        tracing::info!(
+            endpoint,
+            requested_model = %model_resolution.requested_model,
+            upstream_model = ?model_resolution.upstream_model,
+            resolution = %model_resolution.source.as_str(),
+            note = ?model_resolution.note,
+            conversation_id = %conversation_id,
+            "Kiro upstream model mapping applied to request payload"
+        );
     };
 
     tracing::debug!("Kiro request body: {}", request_body);
@@ -1548,7 +1714,7 @@ async fn post_messages_inner(
         payload.stream,
         &payload,
         Some(model_resolution.clone()),
-        Some(kiro_request.conversation_state.conversation_id.clone()),
+        Some(conversation_id),
         prompt_cache_scope_conversation_id(state.prompt_cache_simulation_mode, &payload),
         input_tokens,
     );
@@ -1562,7 +1728,10 @@ async fn post_messages_inner(
 
     let tool_name_map = conversion_result.tool_name_map;
     let warnings_header = if should_expose_proxy_warnings(&runtime_config) {
-        conversion_result.warnings.encode_header()
+        merge_warning_headers(
+            conversion_result.warnings.encode_header(),
+            Some(&payload_guard_report),
+        )
     } else {
         None
     };
@@ -1627,7 +1796,7 @@ async fn handle_stream_request(
             usage_context
                 .attach_provider_error_credential(&provider, &message, attempts)
                 .record_failure(UsageRecordStatus::Error, "api_error", message);
-            return map_provider_error(e, Some(&request_id));
+            return map_provider_error(e, Some(&request_id), Some(provider.as_ref()));
         }
     };
     let (response, completion) = response.into_parts();
@@ -1884,7 +2053,7 @@ async fn handle_non_stream_request(
             usage_context
                 .attach_provider_error_credential(&provider, &message, attempts)
                 .record_failure(UsageRecordStatus::Error, "api_error", message);
-            return map_provider_error(e, Some(&request_id));
+            return map_provider_error(e, Some(&request_id), Some(provider.as_ref()));
         }
     };
     let credential_attempts = api_response.attempts().to_vec();
@@ -2371,21 +2540,34 @@ pub async fn post_messages_cc(
     };
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
-    let kiro_request = KiroRequest {
+    let mut kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
     };
+    let conversation_id = kiro_request.conversation_state.conversation_id.clone();
 
-    let request_body = match serde_json::to_string(&kiro_request) {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::error!("序列化请求失败: {}", e);
-            return envelope::error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                format!("序列化请求失败: {}", e),
-            );
-        }
+    let (request_body, payload_guard_report) =
+        match guard_kiro_request(&mut kiro_request, runtime_config.payload_guard_config()) {
+            Ok(result) => result,
+            Err(err) => return payload_guard_error_response(err),
+        };
+    log_payload_guard_report(
+        &payload_guard_report,
+        "/cc/v1/messages",
+        &payload.model,
+        model_resolution.upstream_model.as_deref(),
+        Some(&conversation_id),
+    );
+    if model_resolution.is_remapped() {
+        tracing::info!(
+            endpoint = "/cc/v1/messages",
+            requested_model = %model_resolution.requested_model,
+            upstream_model = ?model_resolution.upstream_model,
+            resolution = %model_resolution.source.as_str(),
+            note = ?model_resolution.note,
+            conversation_id = %conversation_id,
+            "Kiro upstream model mapping applied to request payload"
+        );
     };
 
     tracing::debug!("Kiro request body: {}", request_body);
@@ -2404,7 +2586,7 @@ pub async fn post_messages_cc(
         payload.stream,
         &payload,
         Some(model_resolution.clone()),
-        Some(kiro_request.conversation_state.conversation_id.clone()),
+        Some(conversation_id),
         prompt_cache_scope_conversation_id(state.prompt_cache_simulation_mode, &payload),
         input_tokens,
     );
@@ -2418,7 +2600,10 @@ pub async fn post_messages_cc(
 
     let tool_name_map = conversion_result.tool_name_map;
     let warnings_header = if should_expose_proxy_warnings(&runtime_config) {
-        conversion_result.warnings.encode_header()
+        merge_warning_headers(
+            conversion_result.warnings.encode_header(),
+            Some(&payload_guard_report),
+        )
     } else {
         None
     };

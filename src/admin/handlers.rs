@@ -17,7 +17,7 @@ use super::{
         ExportCredentialsQuery, RefreshCredentialInfoRequest, SetCredentialProxyRequest,
         SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SetWarmupRequest,
         SuccessResponse, TestCredentialRequest, UpdateProxyResourceRequest,
-        UpdateRuntimeConfigRequest, ValidateExistingCredentialsRequest,
+        UpdateRuntimeConfigRequest, UpsertManualModelRequest, ValidateExistingCredentialsRequest,
         ValidateExternalCredentialsRequest,
     },
 };
@@ -494,6 +494,30 @@ pub async fn get_model_capabilities(State(state): State<AdminState>) -> impl Int
 /// 手动同步 Kiro 模型能力
 pub async fn sync_model_capabilities(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.sync_model_capabilities().await)
+}
+
+/// POST /api/admin/model-capabilities/manual
+/// 添加或更新手动模型补充
+pub async fn upsert_manual_model(
+    State(state): State<AdminState>,
+    Json(payload): Json<UpsertManualModelRequest>,
+) -> impl IntoResponse {
+    match state.service.upsert_manual_model(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// DELETE /api/admin/model-capabilities/manual/:model
+/// 删除手动模型补充
+pub async fn delete_manual_model(
+    State(state): State<AdminState>,
+    Path(model): Path<String>,
+) -> impl IntoResponse {
+    match state.service.delete_manual_model(model).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
 /// GET /api/admin/credentials/export?format=json|backup-json|jsonl

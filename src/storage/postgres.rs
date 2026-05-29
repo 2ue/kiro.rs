@@ -9,8 +9,12 @@ use sqlx::{
     postgres::{PgPoolOptions, PgRow},
 };
 
-use crate::anthropic::model_capabilities::{ModelCapabilitiesStatus, ModelCapabilityItem};
-use crate::anthropic::pricing::{ModelPriceItem, ModelPricing, PricingStatus};
+use crate::anthropic::model_capabilities::{
+    MANUAL_SOURCE, ModelCapabilitiesStatus, ModelCapabilityItem,
+};
+use crate::anthropic::pricing::{
+    MANUAL_PRICING_SOURCE, ModelPriceItem, ModelPricing, PricingStatus,
+};
 use crate::anthropic::usage::{
     CredentialCostSummary, REALTIME_USAGE_WINDOW_SECS, UsageAggregate, UsageRealtimeStats,
     UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult, UsageRecordsResult,
@@ -1105,6 +1109,12 @@ impl PostgresStore {
             .map(|item| item.model.clone())
             .collect();
         for item in &status.models {
+            let item_source = item.source.as_deref().unwrap_or(&status.source);
+            let item_source_url = if item_source == MANUAL_PRICING_SOURCE {
+                "manual"
+            } else {
+                &status.source_url
+            };
             sqlx::query(
                 r#"
                 INSERT INTO model_pricing (
@@ -1130,22 +1140,26 @@ impl PostgresStore {
             .bind(item.pricing.output_cost_per_token)
             .bind(item.pricing.cache_creation_input_token_cost)
             .bind(item.pricing.cache_read_input_token_cost)
-            .bind(&status.source)
-            .bind(&status.source_url)
+            .bind(item_source)
+            .bind(item_source_url)
             .bind(&status.last_synced_at)
             .bind(&status.last_error)
             .execute(&mut *tx)
             .await?;
         }
         if incoming_models.is_empty() {
-            sqlx::query("DELETE FROM model_pricing")
+            sqlx::query("DELETE FROM model_pricing WHERE source <> $1")
+                .bind(MANUAL_PRICING_SOURCE)
                 .execute(&mut *tx)
                 .await?;
         } else {
-            sqlx::query("DELETE FROM model_pricing WHERE model <> ALL($1::text[])")
-                .bind(incoming_models)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "DELETE FROM model_pricing WHERE source <> $1 AND model <> ALL($2::text[])",
+            )
+            .bind(MANUAL_PRICING_SOURCE)
+            .bind(incoming_models)
+            .execute(&mut *tx)
+            .await?;
         }
         sqlx::query(
             r#"
@@ -1256,6 +1270,7 @@ impl PostgresStore {
                         .try_get("cache_creation_input_token_cost")?,
                     cache_read_input_token_cost: row.try_get("cache_read_input_token_cost")?,
                 },
+                source: Some(row.try_get("source")?),
             });
         }
 
@@ -1309,21 +1324,25 @@ impl PostgresStore {
             .bind(item.max_output_tokens)
             .bind(item.supports_prompt_caching)
             .bind(&item.supported_input_types)
-            .bind(&status.source)
+            .bind(item.source.as_deref().unwrap_or(&status.source))
             .bind(&status.last_synced_at)
             .bind(&status.last_error)
             .execute(&mut *tx)
             .await?;
         }
         if incoming_models.is_empty() {
-            sqlx::query("DELETE FROM model_capabilities")
+            sqlx::query("DELETE FROM model_capabilities WHERE source <> $1")
+                .bind(MANUAL_SOURCE)
                 .execute(&mut *tx)
                 .await?;
         } else {
-            sqlx::query("DELETE FROM model_capabilities WHERE model <> ALL($1::text[])")
-                .bind(incoming_models)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "DELETE FROM model_capabilities WHERE source <> $1 AND model <> ALL($2::text[])",
+            )
+            .bind(MANUAL_SOURCE)
+            .bind(incoming_models)
+            .execute(&mut *tx)
+            .await?;
         }
         sqlx::query(
             r#"
@@ -1400,6 +1419,7 @@ impl PostgresStore {
                 max_output_tokens: row.try_get("max_output_tokens")?,
                 supports_prompt_caching: row.try_get("supports_prompt_caching")?,
                 supported_input_types: row.try_get("supported_input_types")?,
+                source: Some(row.try_get("source")?),
             });
         }
 
@@ -1411,6 +1431,102 @@ impl PostgresStore {
             last_error,
             models,
         }))
+    }
+
+    pub async fn save_manual_model(
+        &self,
+        item: &ModelCapabilityItem,
+        pricing: Option<ModelPricing>,
+        clear_pricing: bool,
+    ) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"
+            INSERT INTO model_capabilities (
+                model, display_name, description, max_input_tokens, max_output_tokens,
+                supports_prompt_caching, supported_input_types, source,
+                last_synced_at, last_error, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NULL, now())
+            ON CONFLICT (model) DO UPDATE
+            SET display_name = EXCLUDED.display_name,
+                description = EXCLUDED.description,
+                max_input_tokens = EXCLUDED.max_input_tokens,
+                max_output_tokens = EXCLUDED.max_output_tokens,
+                supports_prompt_caching = EXCLUDED.supports_prompt_caching,
+                supported_input_types = EXCLUDED.supported_input_types,
+                source = EXCLUDED.source,
+                last_error = NULL,
+                updated_at = now()
+            "#,
+        )
+        .bind(&item.model)
+        .bind(&item.display_name)
+        .bind(&item.description)
+        .bind(item.max_input_tokens)
+        .bind(item.max_output_tokens)
+        .bind(item.supports_prompt_caching)
+        .bind(&item.supported_input_types)
+        .bind(item.source.as_deref().unwrap_or(MANUAL_SOURCE))
+        .execute(&mut *tx)
+        .await?;
+
+        if let Some(pricing) = pricing {
+            sqlx::query(
+                r#"
+                INSERT INTO model_pricing (
+                    model, input_cost_per_token, output_cost_per_token,
+                    cache_creation_input_token_cost, cache_read_input_token_cost,
+                    source, source_url, last_synced_at, last_error, updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, 'manual', NULL, NULL, now())
+                ON CONFLICT (model) DO UPDATE
+                SET input_cost_per_token = EXCLUDED.input_cost_per_token,
+                    output_cost_per_token = EXCLUDED.output_cost_per_token,
+                    cache_creation_input_token_cost = EXCLUDED.cache_creation_input_token_cost,
+                    cache_read_input_token_cost = EXCLUDED.cache_read_input_token_cost,
+                    source = EXCLUDED.source,
+                    source_url = EXCLUDED.source_url,
+                    last_error = NULL,
+                    updated_at = now()
+                "#,
+            )
+            .bind(&item.model)
+            .bind(pricing.input_cost_per_token)
+            .bind(pricing.output_cost_per_token)
+            .bind(pricing.cache_creation_input_token_cost)
+            .bind(pricing.cache_read_input_token_cost)
+            .bind(MANUAL_PRICING_SOURCE)
+            .execute(&mut *tx)
+            .await?;
+        } else if clear_pricing {
+            sqlx::query("DELETE FROM model_pricing WHERE model = $1 AND source = $2")
+                .bind(&item.model)
+                .bind(MANUAL_PRICING_SOURCE)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn delete_manual_model(&self, model: &str) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query("DELETE FROM model_capabilities WHERE model = $1 AND source = $2")
+            .bind(model)
+            .bind(MANUAL_SOURCE)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() > 0 {
+            sqlx::query("DELETE FROM model_pricing WHERE model = $1 AND source = $2")
+                .bind(model)
+                .bind(MANUAL_PRICING_SOURCE)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn record_admin_audit_log(
@@ -2671,6 +2787,7 @@ mod tests {
                     cache_creation_input_token_cost: 0.00000375,
                     cache_read_input_token_cost: 0.0000003,
                 },
+                source: None,
             }],
         };
         store.save_pricing_status(&status).await.unwrap();
@@ -2696,6 +2813,7 @@ mod tests {
                 max_output_tokens: Some(128_000),
                 supports_prompt_caching: Some(true),
                 supported_input_types: vec!["TEXT".to_string(), "IMAGE".to_string()],
+                source: None,
             }],
         };
         store
@@ -2721,6 +2839,55 @@ mod tests {
         assert_eq!(
             loaded_capabilities.models[0].supported_input_types,
             vec!["TEXT".to_string(), "IMAGE".to_string()]
+        );
+
+        let manual_capability = ModelCapabilityItem {
+            model: "claude-opus-5-manual".to_string(),
+            display_name: "Claude Opus 5 Manual".to_string(),
+            description: None,
+            max_input_tokens: Some(1_000_000),
+            max_output_tokens: Some(128_000),
+            supports_prompt_caching: Some(true),
+            supported_input_types: vec!["TEXT".to_string()],
+            source: Some(MANUAL_SOURCE.to_string()),
+        };
+        store
+            .save_manual_model(
+                &manual_capability,
+                Some(ModelPricing {
+                    input_cost_per_token: 0.00001,
+                    output_cost_per_token: 0.00002,
+                    cache_creation_input_token_cost: 0.0000125,
+                    cache_read_input_token_cost: 0.000001,
+                }),
+                false,
+            )
+            .await
+            .unwrap();
+        store.save_pricing_status(&status).await.unwrap();
+        store
+            .save_model_capabilities_status(&capabilities_status)
+            .await
+            .unwrap();
+        let loaded_pricing = store.load_pricing_status().await.unwrap().unwrap();
+        assert!(
+            loaded_pricing
+                .models
+                .iter()
+                .any(|item| item.model == "claude-opus-5-manual"
+                    && item.source.as_deref() == Some(MANUAL_PRICING_SOURCE))
+        );
+        let loaded_capabilities = store
+            .load_model_capabilities_status()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            loaded_capabilities
+                .models
+                .iter()
+                .any(|item| item.model == "claude-opus-5-manual"
+                    && item.source.as_deref() == Some(MANUAL_SOURCE))
         );
 
         store

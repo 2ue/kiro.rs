@@ -39,6 +39,7 @@ mod envelope;
 mod handlers;
 mod middleware;
 pub(crate) mod model_capabilities;
+pub(crate) mod payload_guard;
 pub(crate) mod pricing;
 pub(crate) mod prompt_cache;
 mod router;

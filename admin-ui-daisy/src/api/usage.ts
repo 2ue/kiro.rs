@@ -3,8 +3,10 @@ import type {
   AdminAuditLogPage,
   AdminAuditLogPageQuery,
   ModelCapabilitiesStatus,
+  ManualModelResponse,
   ModelPricingStatus,
   SuccessResponse,
+  UpsertManualModelRequest,
   UsageRecordsPageQuery,
   UsageRecordsPageResult,
   UsageRecordsQuery,
@@ -54,5 +56,15 @@ export async function getModelCapabilities(): Promise<ModelCapabilitiesStatus> {
 
 export async function syncModelCapabilities(): Promise<ModelCapabilitiesStatus> {
   const { data } = await api.post<ModelCapabilitiesStatus>('/model-capabilities/sync')
+  return data
+}
+
+export async function upsertManualModel(payload: UpsertManualModelRequest): Promise<ManualModelResponse> {
+  const { data } = await api.post<ManualModelResponse>('/model-capabilities/manual', payload)
+  return data
+}
+
+export async function deleteManualModel(model: string): Promise<ManualModelResponse> {
+  const { data } = await api.delete<ManualModelResponse>(`/model-capabilities/manual/${encodeURIComponent(model)}`)
   return data
 }

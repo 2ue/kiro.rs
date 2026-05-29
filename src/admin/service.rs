@@ -15,15 +15,16 @@ use super::types::{
     CredentialInfoRefreshResponse, CredentialStatusItem, CredentialValidationGroup,
     CredentialValidationInfo, CredentialValidationItem, CredentialValidationResponse,
     CredentialsPageResponse, CredentialsStatusResponse, LoadBalancingModeResponse,
-    ProxyResourceResponse, ProxyResourcesResponse, RefreshCredentialInfoRequest,
-    RuntimeConfigResponse, SetCredentialProxyRequest, SetLoadBalancingModeRequest,
-    SetWarmupRequest, TestCredentialRequest, TestCredentialResponse, UpdateProxyResourceRequest,
-    UpdateRuntimeConfigRequest, ValidateExistingCredentialsRequest,
-    ValidateExternalCredentialsRequest,
+    ManualModelResponse, ProxyResourceResponse, ProxyResourcesResponse,
+    RefreshCredentialInfoRequest, RuntimeConfigResponse, SetCredentialProxyRequest,
+    SetLoadBalancingModeRequest, SetWarmupRequest, TestCredentialRequest, TestCredentialResponse,
+    UpdateProxyResourceRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
+    ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
 };
 use crate::anthropic::{
     model_capabilities::{
-        ModelCapabilitiesCatalog, ModelCapabilitiesStatus, ModelResolutionSource,
+        MANUAL_SOURCE, ModelCapabilitiesCatalog, ModelCapabilitiesStatus, ModelCapabilityItem,
+        ModelResolutionSource, normalize_model_id, normalize_supported_input_types,
     },
     pricing::{PricingCatalog, PricingStatus},
     prompt_cache::PromptCacheTracker,
@@ -51,6 +52,7 @@ use crate::storage::redis_cache::RedisStore;
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
 const DEFAULT_CREDENTIALS_PAGE_LIMIT: usize = 12;
 const MAX_CREDENTIALS_PAGE_LIMIT: usize = 500;
+const MAX_MANUAL_MODEL_ID_LEN: usize = 160;
 
 #[derive(Debug, Clone, Default)]
 pub struct CredentialListQuery {
@@ -1194,7 +1196,16 @@ impl AdminService {
 
     /// 手动同步模型价格。失败不影响调度，只体现在返回状态的 last_error。
     pub async fn sync_model_pricing(&self) -> PricingStatus {
-        let mut status = self.pricing_catalog.sync().await;
+        let capability_models = self
+            .model_capabilities
+            .status()
+            .models
+            .into_iter()
+            .map(|item| item.model);
+        let mut status = self
+            .pricing_catalog
+            .sync_for_models(capability_models)
+            .await;
         if let Err(err) = self.postgres_store.save_pricing_status(&status).await {
             tracing::warn!("保存手动同步后的模型价格到 PgSQL 失败: {}", err);
             if status.last_error.is_none() {
@@ -1246,6 +1257,89 @@ impl AdminService {
             json!({ "source": status.source, "modelCount": status.model_count }),
         );
         status
+    }
+
+    /// 添加或更新手动模型补充。手动项参与模型解析和可选计价；后续上游同步同名模型会覆盖手动来源。
+    pub async fn upsert_manual_model(
+        &self,
+        req: UpsertManualModelRequest,
+    ) -> Result<ManualModelResponse, AdminServiceError> {
+        let item = manual_model_item_from_request(req.clone())?;
+        let clear_pricing = req.clear_pricing;
+        let pricing = req
+            .pricing
+            .as_ref()
+            .map(|pricing| {
+                pricing.to_pricing().ok_or_else(|| {
+                    AdminServiceError::InvalidCredential(
+                        "手动模型价格必须是有效的非负数字".to_string(),
+                    )
+                })
+            })
+            .transpose()?;
+        let has_pricing = pricing.is_some();
+        self.postgres_store
+            .save_manual_model(&item, pricing, clear_pricing)
+            .await
+            .map_err(|err| {
+                AdminServiceError::InternalError(format!("保存手动模型失败: {}", err))
+            })?;
+        self.model_capabilities.upsert_manual_model(item.clone());
+
+        if let Some(pricing) = pricing {
+            self.pricing_catalog
+                .upsert_manual_price(&item.model, pricing);
+        } else if clear_pricing {
+            self.pricing_catalog.delete_manual_price(&item.model);
+        }
+
+        self.audit(
+            "upsert_manual_model",
+            "model_capabilities",
+            Some(item.model.clone()),
+            true,
+            None,
+            json!({
+                "model": item.model,
+                "hasPricing": has_pricing,
+                "clearPricing": clear_pricing,
+                "source": MANUAL_SOURCE,
+            }),
+        );
+        Ok(ManualModelResponse::new(item.model, "手动模型已保存"))
+    }
+
+    /// 删除手动模型补充。只允许删除 source=manual 的模型，避免误删上游同步模型。
+    pub async fn delete_manual_model(
+        &self,
+        model: String,
+    ) -> Result<ManualModelResponse, AdminServiceError> {
+        let model = normalize_model_id(&model);
+        validate_manual_model_id(&model)?;
+        let removed = self
+            .postgres_store
+            .delete_manual_model(&model)
+            .await
+            .map_err(|err| {
+                AdminServiceError::InternalError(format!("删除手动模型失败: {}", err))
+            })?;
+        self.model_capabilities.delete_manual_model(&model);
+        self.pricing_catalog.delete_manual_price(&model);
+        if !removed {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "手动模型不存在或该模型不是手动添加: {}",
+                model
+            )));
+        }
+        self.audit(
+            "delete_manual_model",
+            "model_capabilities",
+            Some(model.clone()),
+            true,
+            None,
+            json!({ "model": model, "source": MANUAL_SOURCE }),
+        );
+        Ok(ManualModelResponse::new(model, "手动模型已删除"))
     }
 
     /// 导出完整凭据。仅格式化当前内存快照，不修改凭据状态。
@@ -1358,6 +1452,9 @@ impl AdminService {
             scheduler_top_k: config.scheduler_top_k,
             compression_enabled: config.compression.enabled,
             whitespace_compression: config.compression.whitespace_compression,
+            payload_guard_enabled: config.payload_guard_enabled,
+            payload_guard_max_bytes: config.payload_guard_max_bytes as u64,
+            payload_guard_trim_history: config.payload_guard_trim_history,
             prompt_cache_target_read_ratio: config.prompt_cache_target_read_ratio,
             prompt_cache_token_scale: config.prompt_cache_token_scale,
             prompt_cache_max_simulated_input_tokens: config.prompt_cache_max_simulated_input_tokens,
@@ -1453,6 +1550,16 @@ impl AdminService {
         let prompt_cache_target_read_ratio = req
             .prompt_cache_target_read_ratio
             .unwrap_or(current_config.prompt_cache_target_read_ratio);
+        let payload_guard_enabled = req
+            .payload_guard_enabled
+            .unwrap_or(current_config.payload_guard_enabled);
+        let payload_guard_max_bytes = req
+            .payload_guard_max_bytes
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(current_config.payload_guard_max_bytes);
+        let payload_guard_trim_history = req
+            .payload_guard_trim_history
+            .unwrap_or(current_config.payload_guard_trim_history);
         let prompt_cache_token_scale = req
             .prompt_cache_token_scale
             .unwrap_or(current_config.prompt_cache_token_scale);
@@ -1566,6 +1673,11 @@ impl AdminService {
                 "promptCacheTargetReadRatio 必须在 0 到 0.99 之间".to_string(),
             ));
         }
+        if payload_guard_enabled && payload_guard_max_bytes < 64 * 1024 {
+            return Err(AdminServiceError::InvalidCredential(
+                "payloadGuardMaxBytes 启用时不能小于 65536".to_string(),
+            ));
+        }
         if !(1.0..=3.0).contains(&prompt_cache_token_scale) || !prompt_cache_token_scale.is_finite()
         {
             return Err(AdminServiceError::InvalidCredential(
@@ -1643,6 +1755,9 @@ impl AdminService {
                 config.scheduler_total_selection_weight = scheduler_total_selection_weight;
                 config.scheduler_top_k = scheduler_top_k;
                 config.compression = compression.clone();
+                config.payload_guard_enabled = payload_guard_enabled;
+                config.payload_guard_max_bytes = payload_guard_max_bytes;
+                config.payload_guard_trim_history = payload_guard_trim_history;
                 config.prompt_cache_target_read_ratio = prompt_cache_target_read_ratio;
                 config.prompt_cache_token_scale = prompt_cache_token_scale;
                 config.prompt_cache_max_simulated_input_tokens =
@@ -1864,6 +1979,70 @@ impl AdminService {
             AdminServiceError::InternalError(msg)
         }
     }
+}
+
+fn manual_model_item_from_request(
+    req: UpsertManualModelRequest,
+) -> Result<ModelCapabilityItem, AdminServiceError> {
+    let model = normalize_model_id(&req.model);
+    validate_manual_model_id(&model)?;
+    let display_name = req
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&model)
+        .to_string();
+    if let Some(value) = req.max_input_tokens {
+        if value <= 0 {
+            return Err(AdminServiceError::InvalidCredential(
+                "输入上限必须大于 0，或留空".to_string(),
+            ));
+        }
+    }
+    if let Some(value) = req.max_output_tokens {
+        if value <= 0 {
+            return Err(AdminServiceError::InvalidCredential(
+                "输出上限必须大于 0，或留空".to_string(),
+            ));
+        }
+    }
+    Ok(ModelCapabilityItem {
+        model,
+        display_name,
+        description: req
+            .description
+            .and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string())),
+        max_input_tokens: req.max_input_tokens,
+        max_output_tokens: req.max_output_tokens,
+        supports_prompt_caching: req.supports_prompt_caching,
+        supported_input_types: normalize_supported_input_types(req.supported_input_types),
+        source: Some(MANUAL_SOURCE.to_string()),
+    })
+}
+
+fn validate_manual_model_id(model: &str) -> Result<(), AdminServiceError> {
+    if model.is_empty() {
+        return Err(AdminServiceError::InvalidCredential(
+            "模型 ID 不能为空".to_string(),
+        ));
+    }
+    if model.len() > MAX_MANUAL_MODEL_ID_LEN {
+        return Err(AdminServiceError::InvalidCredential(format!(
+            "模型 ID 不能超过 {} 个字符",
+            MAX_MANUAL_MODEL_ID_LEN
+        )));
+    }
+    if !model.chars().all(|ch| {
+        ch.is_ascii_lowercase()
+            || ch.is_ascii_digit()
+            || matches!(ch, '-' | '_' | '.' | ':' | '[' | ']')
+    }) {
+        return Err(AdminServiceError::InvalidCredential(
+            "模型 ID 只能包含小写字母、数字、-、_、.、:、[、]".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_model_test_response(body_bytes: &[u8]) -> Result<String, AdminServiceError> {

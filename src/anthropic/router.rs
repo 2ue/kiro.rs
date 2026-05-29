@@ -68,6 +68,9 @@ pub fn create_router_with_provider(
     reported_usage: ReportedUsageConfig,
     compat_profile: CompatProfile,
     expose_proxy_warnings: bool,
+    payload_guard_enabled: bool,
+    payload_guard_max_bytes: usize,
+    payload_guard_trim_history: bool,
 ) -> Router {
     let mut base_state = AppState::new(
         api_key,
@@ -87,6 +90,11 @@ pub fn create_router_with_provider(
         prompt_cache_scale_min_input_tokens,
     )
     .with_reported_usage(reported_usage)
+    .with_payload_guard(
+        payload_guard_enabled,
+        payload_guard_max_bytes,
+        payload_guard_trim_history,
+    )
     .with_pricing_catalog(pricing_catalog)
     .with_model_capabilities(model_capabilities);
     if let Some(provider) = kiro_provider {

@@ -100,6 +100,9 @@ const emptyConfig: RuntimeConfig = {
   schedulerTopK: 3,
   compressionEnabled: false,
   whitespaceCompression: true,
+  payloadGuardEnabled: true,
+  payloadGuardMaxBytes: 460800,
+  payloadGuardTrimHistory: true,
   promptCacheTargetReadRatio: 0.98,
   promptCacheTokenScale: 1.6,
   promptCacheMaxSimulatedInputTokens: 300000,
@@ -583,13 +586,17 @@ export function RuntimeConfigPanel() {
       dispatchMaxQueuedRequests: toWhole(draft.dispatchMaxQueuedRequests),
       credentialWarmupRequests: toWhole(draft.credentialWarmupRequests),
       credentialWarmupSelectionPercent: toWhole(draft.credentialWarmupSelectionPercent, 0, 100),
+      credentialWarmupMaxSelectionPercent: toWhole(draft.credentialWarmupMaxSelectionPercent, 0, 100),
       schedulerErrorEwmaAlpha: Math.min(1, Math.max(0.01, Number(draft.schedulerErrorEwmaAlpha.toFixed(2)))),
       schedulerPriorityWeight: Math.max(0, Number(draft.schedulerPriorityWeight.toFixed(2))),
       schedulerLoadWeight: Math.max(0, Number(draft.schedulerLoadWeight.toFixed(2))),
       schedulerErrorWeight: Math.max(0, Number(draft.schedulerErrorWeight.toFixed(2))),
       schedulerLatencyWeight: Math.max(0, Number(draft.schedulerLatencyWeight.toFixed(4))),
       schedulerProbationWeight: Math.max(0, Number(draft.schedulerProbationWeight.toFixed(2))),
+      schedulerSelectionPressureWeight: Math.max(0, Number(draft.schedulerSelectionPressureWeight.toFixed(2))),
+      schedulerTotalSelectionWeight: Math.max(0, Number(draft.schedulerTotalSelectionWeight.toFixed(4))),
       schedulerTopK: toWhole(draft.schedulerTopK, 1, 100),
+      payloadGuardMaxBytes: toWhole(draft.payloadGuardMaxBytes, 65536),
       promptCacheTargetReadRatio: toRatio(draft.promptCacheTargetReadRatio),
       promptCacheTokenScale: toScale(draft.promptCacheTokenScale),
       promptCacheMaxSimulatedInputTokens: toWhole(draft.promptCacheMaxSimulatedInputTokens),
@@ -609,6 +616,10 @@ export function RuntimeConfigPanel() {
     }
     if (next.promptCacheCapJitterMinTokens > next.promptCacheCapJitterMaxTokens) {
       toast.error('触顶扣减下限不能大于上限')
+      return
+    }
+    if (next.payloadGuardEnabled && next.payloadGuardMaxBytes < 65536) {
+      toast.error('Kiro Payload 最大字节数不能小于 65536')
       return
     }
     updateConfig.mutate(next, {
@@ -804,6 +815,33 @@ export function RuntimeConfigPanel() {
               disabled={!draft.compressionEnabled}
               onCheckedChange={(whitespaceCompression) =>
                 setDraft((prev) => ({ ...prev, whitespaceCompression }))
+              }
+            />
+            <ToggleField
+              title="启用 Kiro Payload 防护"
+              description="发送上游前按真实 JSON 字节数检查请求，并修复空 toolUses、孤立 tool_result 等 Kiro 容易拒绝的形态。"
+              checked={draft.payloadGuardEnabled}
+              onCheckedChange={(payloadGuardEnabled) =>
+                setDraft((prev) => ({ ...prev, payloadGuardEnabled }))
+              }
+            />
+            <ToggleField
+              title="超限裁剪旧历史"
+              description="请求超过最大字节数时，优先裁剪最旧历史；关闭后只做协议修复，仍超限会直接返回客户端错误。"
+              checked={draft.payloadGuardTrimHistory}
+              disabled={!draft.payloadGuardEnabled}
+              onCheckedChange={(payloadGuardTrimHistory) =>
+                setDraft((prev) => ({ ...prev, payloadGuardTrimHistory }))
+              }
+            />
+            <NumberField
+              title="Kiro Payload 最大字节数"
+              description="按最终发送到 Kiro 的 JSON body 字节数计算。默认 460800 字节，用于提前规避上游 Improperly formed request。"
+              value={draft.payloadGuardMaxBytes}
+              min={65536}
+              suffix="bytes"
+              onChange={(payloadGuardMaxBytes) =>
+                setDraft((prev) => ({ ...prev, payloadGuardMaxBytes }))
               }
             />
           </ConfigSection>

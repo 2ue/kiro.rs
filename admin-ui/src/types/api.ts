@@ -511,6 +511,9 @@ export interface RuntimeConfig {
   schedulerTopK: number
   compressionEnabled: boolean
   whitespaceCompression: boolean
+  payloadGuardEnabled: boolean
+  payloadGuardMaxBytes: number
+  payloadGuardTrimHistory: boolean
   promptCacheTargetReadRatio: number
   promptCacheTokenScale: number
   promptCacheMaxSimulatedInputTokens: number
@@ -538,6 +541,7 @@ export interface ModelPricing {
 export interface ModelPriceItem {
   model: string
   pricing: ModelPricing
+  source?: string
 }
 
 export interface ModelPricingStatus {
@@ -558,6 +562,7 @@ export interface ModelCapabilityItem {
   maxOutputTokens?: number
   supportsPromptCaching?: boolean
   supportedInputTypes: string[]
+  source?: string
 }
 
 export interface ModelCapabilitiesStatus {
@@ -567,6 +572,31 @@ export interface ModelCapabilitiesStatus {
   lastSyncedAt?: string
   lastError?: string
   models: ModelCapabilityItem[]
+}
+
+export interface ManualModelPricingRequest {
+  inputCostPerMillion: number
+  outputCostPerMillion: number
+  cacheCreationInputCostPerMillion?: number
+  cacheReadInputCostPerMillion?: number
+}
+
+export interface UpsertManualModelRequest {
+  model: string
+  displayName?: string
+  description?: string
+  maxInputTokens?: number
+  maxOutputTokens?: number
+  supportsPromptCaching?: boolean
+  supportedInputTypes: string[]
+  pricing?: ManualModelPricingRequest
+  clearPricing?: boolean
+}
+
+export interface ManualModelResponse {
+  success: boolean
+  message: string
+  model: string
 }
 
 export type CredentialExportFormat = 'json' | 'backup-json' | 'jsonl'
