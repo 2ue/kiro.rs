@@ -40,7 +40,8 @@ use super::envelope;
 use super::middleware::AppState;
 use super::model_capabilities::{ModelResolution, ModelResolutionSource};
 use super::payload_guard::{
-    PayloadGuardConfig, PayloadGuardError, PayloadGuardReport, guard_kiro_request,
+    PayloadByteBreakdown, PayloadGuardConfig, PayloadGuardError, PayloadGuardReport,
+    breakdown_kiro_request, guard_kiro_request,
 };
 use super::prompt_cache::{PromptCacheProfile, PromptCacheScope};
 use super::stream::{SseEvent, StreamContext};
@@ -1236,41 +1237,38 @@ fn map_provider_error(
 ) -> Response {
     let err_str = err.to_string();
 
-    // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
+    // Kiro 上游的 content length 阈值与模型上下文窗口不是同一层限制。
     if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
-        log_provider_warning_with_hint(&err_str, "上游拒绝请求：上下文窗口已满（不应重试）");
+        let message = "Kiro upstream rejected the request because input content length exceeded its request threshold. This limit is separate from the model context window. Reduce oversized tools, system prompt, documents, images, tool results, or conversation history.";
+        log_provider_warning_with_hint(
+            &err_str,
+            "上游拒绝请求：输入内容长度超过接口阈值（不应重试）",
+        );
         return if let Some(request_id) = request_id {
             envelope::error_response_with_id(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                "Context window is full. Reduce conversation history, system prompt, or tools.",
+                message,
                 request_id,
             )
         } else {
-            envelope::error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "Context window is full. Reduce conversation history, system prompt, or tools.",
-            )
+            envelope::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message)
         };
     }
 
-    // 单次输入太长（请求体本身超出上游限制）
+    // 单次输入太长（请求体或上游内部 content length 超出接口阈值）
     if err_str.contains("Input is too long") {
+        let message = "Kiro upstream rejected the request because the input is too long for its request threshold. This is separate from the model context window. Reduce oversized messages, tools, documents, images, or tool results.";
         log_provider_warning_with_hint(&err_str, "上游拒绝请求：输入过长（不应重试）");
         return if let Some(request_id) = request_id {
             envelope::error_response_with_id(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                "Input is too long. Reduce the size of your messages.",
+                message,
                 request_id,
             )
         } else {
-            envelope::error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "Input is too long. Reduce the size of your messages.",
-            )
+            envelope::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message)
         };
     }
 
@@ -1454,26 +1452,6 @@ fn payload_guard_error_response(err: PayloadGuardError) -> Response {
             tracing::error!("序列化请求失败: {}", message);
             envelope::error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
         }
-        PayloadGuardError::Oversized {
-            final_bytes,
-            max_bytes,
-            original_bytes,
-        } => {
-            tracing::warn!(
-                final_bytes,
-                max_bytes,
-                original_bytes,
-                "Kiro request payload 仍超出限制，拒绝发送上游"
-            );
-            envelope::error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                format!(
-                    "Kiro request payload is too large after trimming: final={} bytes, limit={} bytes, original={} bytes. Reduce conversation history, tools, system prompt, documents, or image payloads.",
-                    final_bytes, max_bytes, original_bytes
-                ),
-            )
-        }
     }
 }
 
@@ -1487,7 +1465,7 @@ fn log_payload_guard_report(
     if !report.enabled {
         return;
     }
-    if report.was_modified() {
+    if report.was_modified() || report.still_oversized {
         tracing::warn!(
             endpoint,
             requested_model,
@@ -1504,7 +1482,8 @@ fn log_payload_guard_report(
             removed_orphan_tool_results = report.removed_orphan_tool_results,
             textified_orphan_tool_results = report.textified_orphan_tool_results,
             removed_orphan_tool_uses = report.removed_orphan_tool_uses,
-            "Kiro payload guard modified request before upstream call"
+            still_oversized = report.still_oversized,
+            "Kiro payload guard applied before upstream call"
         );
     } else if report.max_bytes > 0
         && report.original_bytes > report.max_bytes.saturating_mul(80) / 100
@@ -1520,6 +1499,59 @@ fn log_payload_guard_report(
             "Kiro payload guard observed large request"
         );
     }
+}
+
+fn should_log_payload_byte_breakdown(report: &PayloadGuardReport) -> bool {
+    report.was_modified()
+        || report.still_oversized
+        || (report.max_bytes > 0 && report.final_bytes > report.max_bytes.saturating_mul(70) / 100)
+}
+
+fn log_payload_byte_breakdown(
+    breakdown: Option<PayloadByteBreakdown>,
+    report: &PayloadGuardReport,
+    endpoint: &str,
+    requested_model: &str,
+    upstream_model: Option<&str>,
+    conversation_id: Option<&str>,
+) {
+    let Some(breakdown) = breakdown else {
+        tracing::debug!(
+            endpoint,
+            requested_model,
+            upstream_model,
+            conversation_id,
+            total_bytes = report.final_bytes,
+            max_bytes = report.max_bytes,
+            still_oversized = report.still_oversized,
+            "Kiro payload byte breakdown skipped for small unmodified request"
+        );
+        return;
+    };
+
+    tracing::info!(
+        endpoint,
+        requested_model,
+        upstream_model,
+        conversation_id,
+        total_bytes = breakdown.total_bytes,
+        max_bytes = report.max_bytes,
+        history_bytes = breakdown.history_bytes,
+        current_message_bytes = breakdown.current_message_bytes,
+        current_content_bytes = breakdown.current_content_bytes,
+        current_tools_bytes = breakdown.current_tools_bytes,
+        current_tool_results_bytes = breakdown.current_tool_results_bytes,
+        current_images_bytes = breakdown.current_images_bytes,
+        history_entries = breakdown.history_entries,
+        current_tool_count = breakdown.current_tool_count,
+        current_tool_result_count = breakdown.current_tool_result_count,
+        current_image_count = breakdown.current_image_count,
+        largest_tool_bytes = breakdown.largest_tool_bytes,
+        history_tool_use_count = breakdown.history_tool_use_count,
+        history_tool_result_count = breakdown.history_tool_result_count,
+        still_oversized = report.still_oversized,
+        "Kiro payload byte breakdown"
+    );
 }
 
 fn should_extract_unsigned_thinking(
@@ -1682,6 +1714,16 @@ async fn post_messages_inner(
             Err(err) => return payload_guard_error_response(err),
         };
     log_payload_guard_report(
+        &payload_guard_report,
+        endpoint,
+        &payload.model,
+        model_resolution.upstream_model.as_deref(),
+        Some(&conversation_id),
+    );
+    let payload_breakdown = should_log_payload_byte_breakdown(&payload_guard_report)
+        .then(|| breakdown_kiro_request(&kiro_request, &request_body));
+    log_payload_byte_breakdown(
+        payload_breakdown,
         &payload_guard_report,
         endpoint,
         &payload.model,
@@ -2560,6 +2602,16 @@ pub async fn post_messages_cc(
         model_resolution.upstream_model.as_deref(),
         Some(&conversation_id),
     );
+    let payload_breakdown = should_log_payload_byte_breakdown(&payload_guard_report)
+        .then(|| breakdown_kiro_request(&kiro_request, &request_body));
+    log_payload_byte_breakdown(
+        payload_breakdown,
+        &payload_guard_report,
+        "/cc/v1/messages",
+        &payload.model,
+        model_resolution.upstream_model.as_deref(),
+        Some(&conversation_id),
+    );
     if model_resolution.is_remapped() {
         tracing::info!(
             endpoint = "/cc/v1/messages",
@@ -3093,6 +3145,32 @@ mod tests {
             records[0].credential_label.as_deref(),
             Some("IlmiMiazzi@gmail.com")
         );
+    }
+
+    #[tokio::test]
+    async fn content_length_threshold_error_is_not_reported_as_context_window_full() {
+        let response = map_provider_error(
+            anyhow::anyhow!(
+                "{}",
+                r#"流式 API 请求失败（凭据 #1 test@example.com）: 400 Bad Request {"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#
+            ),
+            Some("req_test_content_length"),
+            None,
+        );
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let message = value
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .expect("error message");
+
+        assert!(message.contains("input content length exceeded"));
+        assert!(message.contains("separate from the model context window"));
+        assert!(!message.contains("Context window is full"));
     }
 
     #[test]

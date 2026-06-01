@@ -275,6 +275,10 @@ impl ConverterOptions {
     fn inject_thinking_prefix(self) -> bool {
         !self.is_strict()
     }
+
+    fn inject_tool_choice_prefix(self) -> bool {
+        !self.is_strict()
+    }
 }
 
 /// 代理在请求转换过程中执行的兜底改写计数
@@ -290,6 +294,15 @@ pub struct ProxyWarnings {
     pub orphan_tool_uses: u32,
     /// 历史中重复出现的 tool_result（已配对过）被跳过
     pub duplicate_tool_results: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToolChoiceDirective {
+    Auto,
+    Any,
+    None,
+    Tool(String),
+    Unknown,
 }
 
 impl ProxyWarnings {
@@ -545,7 +558,7 @@ fn convert_request_with_model_id(
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
-    let mut tools = convert_tools(&req.tools, &mut tool_name_map);
+    let mut tools = convert_tools(&req.tools, &req.tool_choice, &mut tool_name_map);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
     let mut history = build_history(req, messages, &model_id, &mut tool_name_map, options)?;
@@ -1259,18 +1272,116 @@ fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> Str
     mapped
 }
 
+fn parse_tool_choice(tool_choice: &Option<serde_json::Value>) -> ToolChoiceDirective {
+    let Some(value) = tool_choice else {
+        return ToolChoiceDirective::Auto;
+    };
+
+    if let Some(choice) = value.as_str() {
+        return match choice {
+            "auto" => ToolChoiceDirective::Auto,
+            "any" => ToolChoiceDirective::Any,
+            "none" => ToolChoiceDirective::None,
+            _ => ToolChoiceDirective::Unknown,
+        };
+    }
+
+    let Some(obj) = value.as_object() else {
+        return ToolChoiceDirective::Unknown;
+    };
+
+    match obj.get("type").and_then(|v| v.as_str()) {
+        Some("auto") => ToolChoiceDirective::Auto,
+        Some("any") => ToolChoiceDirective::Any,
+        Some("none") => ToolChoiceDirective::None,
+        Some("tool") => obj
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|name| !name.trim().is_empty())
+            .map(|name| ToolChoiceDirective::Tool(name.to_string()))
+            .unwrap_or(ToolChoiceDirective::Unknown),
+        _ => ToolChoiceDirective::Unknown,
+    }
+}
+
+fn tool_choice_matches_name(tool_name: &str, requested_name: &str) -> bool {
+    tool_name == requested_name
+        || sanitize_tool_name(tool_name) == sanitize_tool_name(requested_name)
+}
+
+fn selected_tool_indices(
+    tools: &[super::types::Tool],
+    directive: &ToolChoiceDirective,
+) -> Vec<usize> {
+    match directive {
+        ToolChoiceDirective::None => Vec::new(),
+        ToolChoiceDirective::Tool(requested_name) => {
+            let selected = tools
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, tool)| {
+                    tool_choice_matches_name(&tool.name, requested_name).then_some(idx)
+                })
+                .collect::<Vec<_>>();
+            if selected.is_empty() {
+                tracing::warn!(
+                    requested_tool = requested_name,
+                    "tool_choice requested a tool that is not present in tools; preserving all tools for compatibility"
+                );
+                (0..tools.len()).collect()
+            } else {
+                selected
+            }
+        }
+        ToolChoiceDirective::Auto | ToolChoiceDirective::Any | ToolChoiceDirective::Unknown => {
+            (0..tools.len()).collect()
+        }
+    }
+}
+
+fn generate_tool_choice_prefix(req: &MessagesRequest, options: ConverterOptions) -> Option<String> {
+    if !options.inject_tool_choice_prefix() {
+        return None;
+    }
+
+    match parse_tool_choice(&req.tool_choice) {
+        ToolChoiceDirective::Any => Some(
+            "<tool_choice>any</tool_choice><tool_choice_policy>Use at least one available tool in this turn when a tool can satisfy the request.</tool_choice_policy>"
+                .to_string(),
+        ),
+        ToolChoiceDirective::Tool(name) => Some(format!(
+            "<tool_choice>tool</tool_choice><tool_choice_name>{}</tool_choice_name><tool_choice_policy>Use the named tool in this turn when responding.</tool_choice_policy>",
+            name
+        )),
+        ToolChoiceDirective::None if req.tools.as_ref().is_some_and(|tools| !tools.is_empty()) => {
+            Some(
+                "<tool_choice>none</tool_choice><tool_choice_policy>Do not call tools in this turn.</tool_choice_policy>"
+                    .to_string(),
+            )
+        }
+        _ => None,
+    }
+}
+
 /// 转换工具定义
 fn convert_tools(
     tools: &Option<Vec<super::types::Tool>>,
+    tool_choice: &Option<serde_json::Value>,
     tool_name_map: &mut HashMap<String, String>,
 ) -> Vec<Tool> {
     let Some(tools) = tools else {
         return Vec::new();
     };
+    let directive = parse_tool_choice(tool_choice);
+    let selected_indices = selected_tool_indices(tools, &directive);
+    let selected: std::collections::HashSet<_> = selected_indices.into_iter().collect();
 
     tools
         .iter()
+        .enumerate()
+        .filter(|(idx, _)| selected.contains(idx))
         .map(|t| {
+            let t = t.1;
             let mut description = t.description.clone();
 
             // 对 Write/Edit 工具追加自定义描述后缀
@@ -1354,6 +1465,7 @@ fn build_history(
     } else {
         None
     };
+    let tool_choice_prefix = generate_tool_choice_prefix(req, options);
 
     // 1. 处理系统消息
     if let Some(ref system) = req.system {
@@ -1367,6 +1479,12 @@ fn build_history(
             // 追加分块写入策略到系统消息
             let system_content = if options.inject_chunked_policy() {
                 format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY)
+            } else {
+                system_content
+            };
+
+            let system_content = if let Some(ref prefix) = tool_choice_prefix {
+                format!("{}\n{}", prefix, system_content)
             } else {
                 system_content
             };
@@ -1389,13 +1507,23 @@ fn build_history(
             let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
             history.push(Message::Assistant(assistant_msg));
         }
-    } else if let Some(ref prefix) = thinking_prefix {
-        // 没有系统消息但有thinking配置，插入新的系统消息
-        let user_msg = HistoryUserMessage::new(prefix.clone(), model_id);
-        history.push(Message::User(user_msg));
+    } else {
+        let mut synthetic_prefixes = Vec::new();
+        if let Some(prefix) = thinking_prefix {
+            synthetic_prefixes.push(prefix);
+        }
+        if let Some(prefix) = tool_choice_prefix {
+            synthetic_prefixes.push(prefix);
+        }
 
-        let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
-        history.push(Message::Assistant(assistant_msg));
+        if !synthetic_prefixes.is_empty() {
+            // 没有系统消息但有控制配置，插入新的系统消息
+            let user_msg = HistoryUserMessage::new(synthetic_prefixes.join("\n"), model_id);
+            history.push(Message::User(user_msg));
+
+            let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
+            history.push(Message::Assistant(assistant_msg));
+        }
     }
 
     // 2. 处理常规消息历史
@@ -2456,6 +2584,128 @@ mod tests {
         .expect_err("strict profile should reject prefill");
 
         assert!(err.to_string().contains("assistant prefill"));
+    }
+
+    fn test_tool(name: &str) -> super::super::types::Tool {
+        super::super::types::Tool {
+            tool_type: None,
+            name: name.to_string(),
+            description: format!("{} description", name),
+            input_schema: HashMap::from([
+                ("type".to_string(), serde_json::json!("object")),
+                ("properties".to_string(), serde_json::json!({})),
+            ]),
+            max_uses: None,
+            cache_control: None,
+        }
+    }
+
+    fn base_tool_choice_request(tool_choice: serde_json::Value) -> MessagesRequest {
+        use super::super::types::Message as AnthropicMessage;
+
+        MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("use the appropriate tool"),
+            }],
+            stream: false,
+            system: None,
+            tools: Some(vec![test_tool("read_file"), test_tool("write_file")]),
+            tool_choice: Some(tool_choice),
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_tool_choice_none_omits_current_tools() {
+        let req = base_tool_choice_request(serde_json::json!({"type": "none"}));
+
+        let result = convert_request_with_options(&req, ConverterOptions::default()).unwrap();
+        let context = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context;
+
+        assert!(context.tools.is_empty());
+        assert!(
+            result
+                .conversation_state
+                .history
+                .iter()
+                .any(|message| matches!(
+                    message,
+                    Message::User(user)
+                        if user.user_input_message.content.contains("<tool_choice>none</tool_choice>")
+                )),
+            "compat mode should steer Kiro away from tool calls when tool_choice is none"
+        );
+    }
+
+    #[test]
+    fn test_tool_choice_named_tool_filters_current_tools() {
+        let req = base_tool_choice_request(serde_json::json!({
+            "type": "tool",
+            "name": "read_file"
+        }));
+
+        let result = convert_request_with_options(&req, ConverterOptions::default()).unwrap();
+        let context = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context;
+
+        assert_eq!(context.tools.len(), 1);
+        let kiro_tool_name = &context.tools[0].tool_specification.name;
+        assert_eq!(
+            result.tool_name_map.get(kiro_tool_name),
+            Some(&"read_file".to_string())
+        );
+        assert!(
+            result
+                .conversation_state
+                .history
+                .iter()
+                .any(|message| matches!(
+                    message,
+                    Message::User(user)
+                        if user.user_input_message.content.contains("<tool_choice_name>read_file</tool_choice_name>")
+                )),
+            "compat mode should add a Kiro-facing forced-tool steering prefix"
+        );
+    }
+
+    #[test]
+    fn test_anthropic_strict_filters_tool_choice_without_prompt_steering() {
+        let req = base_tool_choice_request(serde_json::json!({
+            "type": "tool",
+            "name": "read_file"
+        }));
+
+        let result = convert_request_with_options(
+            &req,
+            ConverterOptions {
+                compat_profile: CompatProfile::AnthropicStrict,
+                ..ConverterOptions::default()
+            },
+        )
+        .unwrap();
+        let context = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context;
+
+        assert_eq!(context.tools.len(), 1);
+        assert!(
+            result.conversation_state.history.is_empty(),
+            "strict profile should avoid synthetic prompt steering"
+        );
     }
 
     #[test]

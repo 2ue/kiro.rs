@@ -1,25 +1,27 @@
 import {
   CheckCircle2,
-  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Download,
   FileUp,
-  Loader2,
+  Filter,
   Plus,
   RefreshCw,
-  Router,
   RotateCcw,
   Search,
+  Server,
   Trash2,
   Upload,
   Wallet,
-  Wand2,
+  X,
 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { Button, Card, Checkbox, Input, Join, Loading, Modal, Select, Toggle } from 'react-daisyui'
+import { Button, Checkbox, Collapse, Input, Loading, Select } from 'react-daisyui'
 import { forceRefreshToken, getCredentialInfo, getCredentials, refreshCredentialInfo, testCredential } from '@/api/credentials'
-import { Badge, EmptyState, ErrorState, LoadingState, ModalShell, SectionCard, StatCard } from '@/components/common'
+import { Badge, EmptyState, ErrorState, LoadingState, SectionCard, StatCard } from '@/components/ui'
+import { CredentialCard } from '@/components/credentials'
 import {
   AddCredentialModal,
   BatchImportModal,
@@ -29,11 +31,10 @@ import {
   KamImportModal,
   type VerifyResult,
 } from '@/components/CredentialDialogs'
-import { formatApproxElapsedMs, formatDate, formatLastUsed, formatNumber, formatQuota, formatUsd } from '@/lib/format'
+import { formatNumber } from '@/lib/format'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
 import { extractErrorMessage } from '@/lib/utils'
 import {
-  useClearInFlight,
   useCredentials,
   useCredentialsPage,
   useDeleteCredential,
@@ -41,444 +42,15 @@ import {
   useProxyResources,
   useResetFailure,
   useRuntimeConfig,
-  useSetCredentialProxy,
-  useSetDisabled,
   useSetLoadBalancingMode,
-  useSetPriority,
-  useSetWarmup,
 } from '@/hooks/use-credentials'
 import type { BalanceResponse, CredentialStatusItem, LoadBalancingMode } from '@/types/api'
 
-function credentialLabel(credential: CredentialStatusItem) {
-  return credential.email || credential.maskedApiKey || `凭据 #${credential.id}`
-}
-
-function authLabel(authMethod: string | null) {
-  if (authMethod === 'api_key') return 'API Key'
-  if (authMethod === 'idc') return 'IdC'
-  if (authMethod === 'social') return 'Social'
-  return authMethod || 'Unknown'
-}
-
-function subscriptionLabel(credential: CredentialStatusItem, balance?: BalanceResponse) {
-  return balance?.subscriptionTitle || credential.accountInfo?.subscriptionTitle || credential.subscriptionTitle || '未知'
-}
-
-function accountInfoValue(credential: CredentialStatusItem, balance?: BalanceResponse) {
-  if (balance) return balance
-  return credential.accountInfo
-}
-
-function numberOrZero(value: number | null | undefined): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0
-}
-
-function sourceLabel(source?: CredentialStatusItem['effectiveProxySource']) {
-  if (source === 'credential') return '直接代理'
-  if (source === 'resource') return '代理资源'
-  if (source === 'resource_disabled') return '代理资源已禁用'
-  if (source === 'resource_missing') return '代理资源不存在'
-  if (source === 'global') return '全局代理'
-  if (source === 'direct') return '直连'
-  return '未配置代理'
-}
-
-function CredentialCard({
-  credential,
-  selected,
-  onToggleSelect,
-  onQueryBalance,
-  onTest,
-  balance,
-  loadingBalance,
-}: {
-  credential: CredentialStatusItem
-  selected: boolean
-  onToggleSelect: () => void
-  onQueryBalance: (id: number) => void
-  onTest: (credential: CredentialStatusItem) => void
-  balance?: BalanceResponse
-  loadingBalance: boolean
-}) {
-  const [editingPriority, setEditingPriority] = useState(false)
-  const [editingProxy, setEditingProxy] = useState(false)
-  const [priorityValue, setPriorityValue] = useState(String(credential.priority))
-  const [proxyResourceId, setProxyResourceId] = useState(credential.proxyResourceId ? String(credential.proxyResourceId) : '')
-  const setDisabled = useSetDisabled()
-  const setPriority = useSetPriority()
-  const setCredentialProxy = useSetCredentialProxy()
-  const proxyResources = useProxyResources()
-  const proxyResourceOptions = proxyResources.data?.resources || []
-  const resetFailure = useResetFailure()
-  const deleteCredential = useDeleteCredential()
-  const forceRefresh = forceRefreshToken
-  const setWarmup = useSetWarmup()
-  const clearInFlight = useClearInFlight()
-  const runtimeConfig = useRuntimeConfig()
-  const queryClient = useQueryClient()
-  const warmupTarget = Math.max(0, runtimeConfig.data?.credentialWarmupRequests ?? 3)
-  const accountInfo = accountInfoValue(credential, balance)
-  const transientFailureStreak = numberOrZero(credential.transientFailureStreak)
-  const probationRemainingSecs = numberOrZero(credential.probationRemainingSecs)
-  const recentErrorRate = numberOrZero(credential.recentErrorRate)
-  const schedulerScore = numberOrZero(credential.schedulerScore)
-  const schedulerSelectionCount = numberOrZero(credential.schedulerSelectionCount)
-  const recentSelection10s = numberOrZero(credential.recentSchedulerSelectionCount10s)
-  const recentSelection60s = numberOrZero(credential.recentSchedulerSelectionCount60s)
-  const recentSelection5m = numberOrZero(credential.recentSchedulerSelectionCount5m)
-  const schedulerSelectionPressure = numberOrZero(credential.schedulerSelectionPressure)
-  const lastTransientErrorAgo = formatApproxElapsedMs(credential.lastErrorAtMs)
-
-  useEffect(() => {
-    setPriorityValue(String(credential.priority))
-  }, [credential.priority])
-
-  useEffect(() => {
-    setProxyResourceId(credential.proxyResourceId ? String(credential.proxyResourceId) : '')
-  }, [credential.id, credential.proxyResourceId])
-
-  const savePriority = () => {
-    const priority = Number(priorityValue)
-    if (!Number.isInteger(priority) || priority < 0) {
-      toast.error('优先级必须是非负整数')
-      return
-    }
-    setPriority.mutate(
-      { id: credential.id, priority },
-      {
-        onSuccess: (res) => {
-          toast.success(res.message)
-          setEditingPriority(false)
-        },
-        onError: (error) => toast.error(`操作失败: ${extractErrorMessage(error)}`),
-      }
-    )
-  }
-
-  const saveProxy = () => {
-    setCredentialProxy.mutate(
-      {
-        id: credential.id,
-        request: {
-          proxyResourceId: proxyResourceId ? Number(proxyResourceId) : null,
-        },
-      },
-      {
-        onSuccess: (res) => {
-          toast.success(res.message)
-          setEditingProxy(false)
-        },
-        onError: (error) => toast.error(`代理设置失败: ${extractErrorMessage(error)}`),
-      }
-    )
-  }
-
-  const handleDelete = () => {
-    if (!credential.disabled) {
-      toast.error('请先禁用凭据再删除')
-      return
-    }
-    if (!confirm(`确定删除凭据 #${credential.id} 吗？此操作无法撤销。`)) return
-    deleteCredential.mutate(credential.id, {
-      onSuccess: (res) => toast.success(res.message),
-      onError: (error) => toast.error(`删除失败: ${extractErrorMessage(error)}`),
-    })
-  }
-
-  const handleForceRefresh = async () => {
-    try {
-      const res = await forceRefresh(credential.id)
-      toast.success(res.message)
-      queryClient.invalidateQueries({ queryKey: ['credentials-page'] })
-      queryClient.invalidateQueries({ queryKey: ['credentials'] })
-    } catch (error) {
-      toast.error(`刷新失败: ${extractErrorMessage(error)}`)
-    }
-  }
-
-  return (
-    <Card className={`credential-card transition ${credential.isCurrent ? 'is-current' : ''}`}>
-      <Card.Body className="gap-3 p-3">
-        <div className="flex items-start justify-between gap-3">
-          <div className="flex min-w-0 gap-2.5">
-            <Checkbox size="xs" className="mt-1" checked={selected} onChange={onToggleSelect} />
-            <div className="min-w-0">
-              <div className="flex flex-wrap items-center gap-1.5">
-                <h3 className="max-w-[260px] truncate text-sm font-semibold" title={credentialLabel(credential)}>
-                  {credentialLabel(credential)}
-                </h3>
-                <Badge>#{credential.id}</Badge>
-                {credential.isCurrent && <Badge tone="primary">当前</Badge>}
-                <Badge tone={credential.disabled ? 'error' : 'success'}>{credential.disabled ? '已禁用' : '启用'}</Badge>
-              </div>
-              <div className="mt-1.5 flex flex-wrap gap-1">
-                {credential.disabled && credential.disabledReason && <Badge tone="error">{credential.disabledReason}</Badge>}
-                {!credential.disabled && credential.cooledDown && <Badge tone="warning">冷却 {credential.cooldownRemainingSecs}s</Badge>}
-                {!credential.disabled && credential.rateLimited && <Badge tone="warning">限流 {credential.rateLimitRemainingSecs}s</Badge>}
-                {!credential.disabled && credential.maxConcurrentRequests > 0 && (
-                  <Badge tone={credential.inFlightRequests >= credential.maxConcurrentRequests ? 'error' : 'neutral'} title={`最老占用 ${credential.oldestInFlightAgeSecs}s，最近活跃 ${credential.newestInFlightIdleSecs}s 前`}>
-                    并发 {credential.inFlightRequests}/{credential.maxConcurrentRequests}
-                  </Badge>
-                )}
-                {!credential.disabled && credential.warmupRemaining > 0 && <Badge tone="secondary">预热 {credential.warmupRemaining}</Badge>}
-                {!credential.disabled && credential.inProbation && <Badge tone="secondary">观察 {probationRemainingSecs}s</Badge>}
-                {transientFailureStreak > 0 && <Badge tone="warning">瞬态错误 {transientFailureStreak}</Badge>}
-                <Badge>{authLabel(credential.authMethod)}</Badge>
-                {credential.endpoint && credential.endpoint !== 'ide' && <Badge>{credential.endpoint}</Badge>}
-                {credential.hasProxy && <Badge tone="info">代理</Badge>}
-                {credential.proxyResourceName && <Badge tone="info">{credential.proxyResourceName}</Badge>}
-              </div>
-            </div>
-          </div>
-          <Toggle
-            color="primary"
-            size="sm"
-            className="shrink-0"
-            checked={!credential.disabled}
-            disabled={setDisabled.isPending}
-            onChange={() =>
-              setDisabled.mutate(
-                { id: credential.id, disabled: !credential.disabled },
-                {
-                  onSuccess: (res) => toast.success(res.message),
-                  onError: (error) => toast.error(`操作失败: ${extractErrorMessage(error)}`),
-                }
-              )
-            }
-          />
-        </div>
-
-        <div className="credential-meta-grid">
-          <div>
-            <div className="text-[0.72rem] font-medium text-base-content/50">订阅等级</div>
-            <div className="font-semibold">{loadingBalance ? <Loading size="sm" /> : subscriptionLabel(credential, balance)}</div>
-          </div>
-          <div>
-            <div className="text-[0.72rem] font-medium text-base-content/50">优先级</div>
-            {editingPriority ? (
-              <Join className="mt-1">
-                <Input bordered size="xs" className="join-item w-20" type="number" min={0} value={priorityValue} onChange={(event) => setPriorityValue(event.target.value)} />
-                <Button type="button" color="primary" size="xs" className="join-item" onClick={savePriority}>保存</Button>
-                <Button type="button" color="ghost" size="xs" className="join-item" onClick={() => setEditingPriority(false)}>取消</Button>
-              </Join>
-            ) : (
-              <Button type="button" color="ghost" size="xs" className="h-auto min-h-0 px-1 font-semibold" onClick={() => setEditingPriority(true)}>
-                {credential.priority}
-              </Button>
-            )}
-          </div>
-          <div>
-            <div className="text-[0.72rem] font-medium text-base-content/50">失败 / 刷新失败</div>
-            <div className={credential.failureCount || credential.refreshFailureCount ? 'font-semibold text-error' : 'font-semibold'}>
-              {credential.failureCount} / {credential.refreshFailureCount}
-            </div>
-          </div>
-          <div>
-            <div className="text-[0.72rem] font-medium text-base-content/50">成功请求</div>
-            <div className="font-semibold">{formatNumber(credential.successCount)}</div>
-          </div>
-          <div>
-            <div className="text-[0.72rem] font-medium text-base-content/50">近期错误率</div>
-            <div className={recentErrorRate > 0 ? 'font-semibold text-error' : 'font-semibold'}>{(recentErrorRate * 100).toFixed(1)}%</div>
-          </div>
-          <div>
-            <div className="text-[0.72rem] font-medium text-base-content/50">耗时 EWMA</div>
-            <div className="font-semibold">{credential.latencyEwmaMs == null ? '未知' : `${Math.round(credential.latencyEwmaMs)}ms`}</div>
-          </div>
-          <div>
-            <div className="text-[0.72rem] font-medium text-base-content/50">调度评分 / 选中</div>
-            <div className="font-semibold">{schedulerScore.toFixed(2)} / {schedulerSelectionCount}</div>
-          </div>
-          <div>
-            <div className="text-[0.72rem] font-medium text-base-content/50">近期调度</div>
-            <div className="font-semibold">
-              {recentSelection60s}/60s
-              <span className="ml-1 text-xs text-base-content/50">
-                10s {recentSelection10s} / 5m {recentSelection5m}
-              </span>
-            </div>
-          </div>
-          <div>
-            <div className="text-[0.72rem] font-medium text-base-content/50">调度压力</div>
-            <div className={schedulerSelectionPressure > 1 ? 'font-semibold text-warning' : 'font-semibold'}>
-              {schedulerSelectionPressure.toFixed(2)}
-            </div>
-          </div>
-          <div>
-            <div className="text-[0.72rem] font-medium text-base-content/50">最近使用</div>
-            <div className="font-semibold">{formatLastUsed(credential.lastUsedAt)}</div>
-          </div>
-          {credential.lastErrorReason && (
-            <div className="col-span-full">
-              <div className="text-[0.72rem] font-medium text-base-content/50">
-                最近瞬态错误{lastTransientErrorAgo ? `(${lastTransientErrorAgo})` : ''}
-              </div>
-              <div className="truncate font-semibold" title={credential.lastErrorReason}>{credential.lastErrorKind || 'unknown'}: {credential.lastErrorReason}</div>
-            </div>
-          )}
-          <div>
-            <div className="text-[0.72rem] font-medium text-base-content/50">创建时间</div>
-            <div className="font-semibold">{formatDate(credential.createdAt)}</div>
-          </div>
-          <div>
-            <div className="text-[0.72rem] font-medium text-base-content/50">更新时间</div>
-            <div className="font-semibold">{formatDate(credential.updatedAt)}</div>
-          </div>
-          <div>
-            <div className="text-[0.72rem] font-medium text-base-content/50">本地估算成本</div>
-            <div className="font-semibold">{formatUsd(credential.estimatedCostUsd)}</div>
-          </div>
-          <div>
-            <div className="text-[0.72rem] font-medium text-base-content/50">额度</div>
-            {loadingBalance ? (
-              <Loading size="sm" className="mt-1" />
-            ) : accountInfo ? (
-              <>
-                <div className="font-semibold">{formatQuota(accountInfo.currentUsage)}/{formatQuota(accountInfo.usageLimit)}</div>
-                <div className="text-xs text-base-content/50">{formatDate(accountInfo.checkedAt)}</div>
-              </>
-            ) : (
-              <div className="font-semibold text-base-content/50">未知</div>
-            )}
-          </div>
-          <div className="col-span-full">
-            <div className="text-[0.72rem] font-medium text-base-content/50">代理</div>
-            <Button type="button" color="ghost" size="xs" className="h-auto min-h-0 px-1 font-semibold" onClick={() => setEditingProxy(true)}>
-              <Router className="h-3.5 w-3.5" />
-              {credential.effectiveProxyUrl ? `${credential.proxyResourceName || sourceLabel(credential.effectiveProxySource)} · ${credential.effectiveProxyUrl}` : sourceLabel(credential.effectiveProxySource)}
-            </Button>
-          </div>
-        </div>
-
-        <div className="credential-actions">
-          <Button type="button" color="ghost" size="xs" onClick={() => onTest(credential)}>
-            <Wand2 className="h-3.5 w-3.5" />
-            测试
-          </Button>
-          <Button type="button" color="ghost" size="xs" onClick={() => onQueryBalance(credential.id)} disabled={loadingBalance} title="查询订阅、额度和用量并更新卡片">
-            {loadingBalance ? <Loading size="xs" /> : <Wallet className="h-3.5 w-3.5" />}
-            {loadingBalance ? '查询中' : '查询信息'}
-          </Button>
-          <Button type="button" color="ghost" size="xs" onClick={handleForceRefresh} disabled={credential.authMethod === 'api_key'}>
-            <RefreshCw className="h-3.5 w-3.5" />
-            刷新 Token
-          </Button>
-          <Button
-            type="button"
-            color="ghost"
-            size="xs"
-            onClick={() =>
-              resetFailure.mutate(credential.id, {
-                onSuccess: (res) => toast.success(res.message),
-                onError: (error) => toast.error(`操作失败: ${extractErrorMessage(error)}`),
-              })
-            }
-          >
-            <RotateCcw className="h-3.5 w-3.5" />
-            恢复异常
-          </Button>
-          <Button
-            type="button"
-            color="ghost"
-            size="xs"
-            onClick={() =>
-              setWarmup.mutate(
-                { id: credential.id, warmupRemaining: credential.warmupRemaining > 0 ? 0 : Math.max(1, warmupTarget) },
-                {
-                  onSuccess: () => toast.success(credential.warmupRemaining > 0 ? '已关闭预热' : '已开启预热'),
-                  onError: (error) => toast.error(`预热设置失败: ${extractErrorMessage(error)}`),
-                }
-              )
-            }
-          >
-            <ChevronDown className="h-3.5 w-3.5" />
-            {credential.warmupRemaining > 0 ? '关闭预热' : '开启预热'}
-          </Button>
-          <Button
-            type="button"
-            color="ghost"
-            size="xs"
-            onClick={() => {
-              if (!confirm(`确定清理凭据 #${credential.id} 的当前并发占用吗？`)) return
-              clearInFlight.mutate(
-                { id: credential.id },
-                {
-                  onSuccess: (res) => toast.success(res.message),
-                  onError: (error) => toast.error(`清理失败: ${extractErrorMessage(error)}`),
-                }
-              )
-            }}
-          >
-            清理并发
-          </Button>
-          <Button type="button" color="ghost" size="xs" className="text-error hover:bg-error/10" onClick={handleDelete} disabled={!credential.disabled}>
-            <Trash2 className="h-3.5 w-3.5" />
-            删除
-          </Button>
-        </div>
-      </Card.Body>
-      <ModalShell open={editingProxy} title={`绑定代理：${credentialLabel(credential)}`} width="max-w-2xl" onClose={() => setEditingProxy(false)}>
-        <div className="space-y-3">
-          <button
-            type="button"
-            className={`w-full rounded-box border p-3 text-left text-sm transition ${proxyResourceId ? 'border-base-300 bg-base-100 hover:bg-base-200' : 'border-primary bg-primary/5'}`}
-            onClick={() => setProxyResourceId('')}
-          >
-            <div className="flex items-center justify-between gap-3">
-              <span className="font-semibold">不绑定代理资源</span>
-              {!proxyResourceId && <Badge tone="primary">已选</Badge>}
-            </div>
-            <div className="mt-1 text-xs text-base-content/60">清除凭据上的代理资源绑定，并同时清除旧的直接代理配置。</div>
-          </button>
-
-          {proxyResources.isLoading ? (
-            <LoadingState text="加载代理资源..." />
-          ) : proxyResourceOptions.length === 0 ? (
-            <EmptyState text="暂无代理资源，请先在代理页新增" />
-          ) : (
-            <div className="max-h-80 space-y-2 overflow-y-auto">
-              {proxyResourceOptions.map((resource) => {
-                const selected = proxyResourceId === String(resource.id)
-                return (
-                  <button
-                    key={resource.id}
-                    type="button"
-                    className={`w-full rounded-box border p-3 text-left text-sm transition ${
-                      selected ? 'border-primary bg-primary/5' : resource.enabled ? 'border-base-300 bg-base-100 hover:bg-base-200' : 'border-error/25 bg-error/5 opacity-80 hover:bg-error/10'
-                    }`}
-                    onClick={() => setProxyResourceId(String(resource.id))}
-                  >
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      <span className="font-semibold">{resource.name}</span>
-                      <Badge>#{resource.id}</Badge>
-                      <Badge tone={resource.enabled ? 'success' : 'error'}>{resource.enabled ? '启用' : '已禁用'}</Badge>
-                      {selected && <Badge tone="primary">已选</Badge>}
-                    </div>
-                    <div className="mt-1 truncate text-xs text-base-content/60">{resource.proxyUrl}</div>
-                  </button>
-                )
-              })}
-            </div>
-          )}
-
-          <Modal.Actions>
-            <Button type="button" color="ghost" size="sm" onClick={() => setEditingProxy(false)} disabled={setCredentialProxy.isPending}>
-              取消
-            </Button>
-            <Button type="button" color="primary" size="sm" onClick={saveProxy} disabled={setCredentialProxy.isPending}>
-              {setCredentialProxy.isPending && <Loading size="sm" />}
-              保存绑定
-            </Button>
-          </Modal.Actions>
-        </div>
-      </ModalShell>
-    </Card>
-  )
-}
-
 export function CredentialsPanel() {
+  // State
   const [page, setPage] = useState(1)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
+  const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set())
   const [balanceMap, setBalanceMap] = useState<Map<number, BalanceResponse>>(new Map())
   const [loadingBalanceIds, setLoadingBalanceIds] = useState<Set<number>>(new Set())
   const [testingCredential, setTestingCredential] = useState<CredentialStatusItem | null>(null)
@@ -497,8 +69,11 @@ export function CredentialsPanel() {
   const [subscriptionFilter, setSubscriptionFilter] = useState('all')
   const [proxyFilter, setProxyFilter] = useState('all')
   const [batchRefreshing, setBatchRefreshing] = useState(false)
+  const [showFilters, setShowFilters] = useState(false)
   const cancelVerifyRef = useRef(false)
-  const itemsPerPage = 12
+  const itemsPerPage = 15
+
+  // Hooks
   const queryClient = useQueryClient()
   const credentials = useCredentialsPage({
     page,
@@ -516,12 +91,16 @@ export function CredentialsPanel() {
   const setLoadBalancing = useSetLoadBalancingMode()
   const deleteCredential = useDeleteCredential()
   const resetFailure = useResetFailure()
+
+  // Derived state
   const currentCredentials = useMemo(() => credentials.data?.credentials || [], [credentials.data?.credentials])
   const importDuplicateCheckCredentials = allCredentials.data?.credentials || currentCredentials
   const totalPages = credentials.data?.totalPages || 0
   const selectedDisabledCount = Array.from(selectedIds).filter((id) => currentCredentials.find((item) => item.id === id)?.disabled).length
   const disabledCredentialCount = Math.max((credentials.data?.total || 0) - (credentials.data?.available || 0), 0)
+  const hasActiveFilters = statusFilter !== 'all' || authFilter !== 'all' || subscriptionFilter !== 'all' || proxyFilter !== 'all'
 
+  // Effects
   useEffect(() => {
     setSelectedIds(new Set())
   }, [page])
@@ -532,9 +111,12 @@ export function CredentialsPanel() {
   }, [queryText, statusFilter, authFilter, subscriptionFilter, proxyFilter])
 
   useEffect(() => {
-    if (credentials.data && page > Math.max(credentials.data.totalPages, 1)) setPage(Math.max(credentials.data.totalPages, 1))
+    if (credentials.data && page > Math.max(credentials.data.totalPages, 1)) {
+      setPage(Math.max(credentials.data.totalPages, 1))
+    }
   }, [credentials.data, page])
 
+  // Handlers
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ['credentials'] })
     queryClient.invalidateQueries({ queryKey: ['credentials-page'] })
@@ -547,6 +129,39 @@ export function CredentialsPanel() {
       else next.add(id)
       return next
     })
+  }
+
+  const toggleExpand = (id: number) => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const selectAll = () => {
+    if (selectedIds.size === currentCredentials.length) {
+      setSelectedIds(new Set())
+    } else {
+      setSelectedIds(new Set(currentCredentials.map((c) => c.id)))
+    }
+  }
+
+  const expandAll = () => {
+    if (expandedIds.size === currentCredentials.length) {
+      setExpandedIds(new Set())
+    } else {
+      setExpandedIds(new Set(currentCredentials.map((c) => c.id)))
+    }
+  }
+
+  const clearFilters = () => {
+    setQueryText('')
+    setStatusFilter('all')
+    setAuthFilter('all')
+    setSubscriptionFilter('all')
+    setProxyFilter('all')
   }
 
   const fetchBalanceForCredential = async (id: number) => {
@@ -726,151 +341,243 @@ export function CredentialsPanel() {
     })
   }
 
-  if (credentials.isLoading) return <LoadingState />
-  if (credentials.error) return <ErrorState text={extractErrorMessage(credentials.error)} />
+  // Loading and error states
+  if (credentials.isLoading) return <LoadingState text="加载凭据列表..." />
+  if (credentials.error) return <ErrorState message={extractErrorMessage(credentials.error)} />
 
   return (
     <div className="space-y-4">
+      {/* Stats Grid */}
       <div className="metric-grid">
-        <StatCard title="凭据总数" value={formatNumber(credentials.data?.total || 0)} />
-        <StatCard title="可用凭据" value={formatNumber(credentials.data?.available || 0)} tone="success" />
-        <StatCard title="当前活跃" value={`#${credentials.data?.currentId || '-'}`} desc={loadBalancing.data?.mode === 'priority' ? '优先级模式' : loadBalancing.data?.mode === 'balanced' ? '均衡负载模式' : '健康均衡模式'} tone="info" />
-        <StatCard title="调度容量" value={`${credentials.data?.globalInFlightRequests || 0}/${credentials.data?.globalMaxConcurrentRequests || '不限'}`} desc={`全局并发 · 排队 ${credentials.data?.queuedRequests || 0}/${credentials.data?.maxQueuedRequests || '不限'}`} tone="info" />
-        <StatCard title="单凭据并发" value={runtimeConfig.data?.credentialMaxConcurrentRequests || '不限'} desc="每个凭据同时处理请求上限" tone="info" />
-        <StatCard title="已禁用" value={formatNumber(disabledCredentialCount)} tone={disabledCredentialCount ? 'warning' : 'default'} />
+        <StatCard
+          title="凭据总数"
+          value={formatNumber(credentials.data?.total || 0)}
+          icon={<Server className="h-5 w-5" />}
+        />
+        <StatCard
+          title="可用凭据"
+          value={formatNumber(credentials.data?.available || 0)}
+          tone="success"
+        />
+        <StatCard
+          title="当前活跃"
+          value={`#${credentials.data?.currentId || '-'}`}
+          desc={loadBalancing.data?.mode === 'priority' ? '优先级模式' : loadBalancing.data?.mode === 'balanced' ? '均衡负载' : '健康均衡'}
+          tone="primary"
+        />
+        <StatCard
+          title="调度容量"
+          value={`${credentials.data?.globalInFlightRequests || 0}/${credentials.data?.globalMaxConcurrentRequests || '∞'}`}
+          desc={`排队 ${credentials.data?.queuedRequests || 0}`}
+          tone="info"
+        />
+        <StatCard
+          title="单凭据并发"
+          value={runtimeConfig.data?.credentialMaxConcurrentRequests || '不限'}
+          tone="info"
+        />
+        <StatCard
+          title="已禁用"
+          value={formatNumber(disabledCredentialCount)}
+          tone={disabledCredentialCount ? 'warning' : 'default'}
+        />
       </div>
 
+      {/* Main Section */}
       <SectionCard
-        title="凭据管理"
+        title="凭据列表"
+        description={`共 ${credentials.data?.filteredTotal ?? credentials.data?.total ?? 0} 个凭据`}
         actions={
-          <>
-            <Select bordered size="sm" value={loadBalancing.data?.mode || 'priority'} disabled={setLoadBalancing.isPending || loadBalancing.isLoading} onChange={(event) => setLoadBalancingMode(event.target.value as LoadBalancingMode)}>
-              <Select.Option value="priority">优先级模式</Select.Option>
-              <Select.Option value="balanced">均衡负载模式</Select.Option>
-              <Select.Option value="health_balanced">健康均衡模式</Select.Option>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Select
+              bordered
+              size="sm"
+              value={loadBalancing.data?.mode || 'priority'}
+              disabled={setLoadBalancing.isPending || loadBalancing.isLoading}
+              onChange={(e) => setLoadBalancingMode(e.target.value as LoadBalancingMode)}
+              className="w-32"
+            >
+              <Select.Option value="priority">优先级</Select.Option>
+              <Select.Option value="balanced">均衡负载</Select.Option>
+              <Select.Option value="health_balanced">健康均衡</Select.Option>
             </Select>
             <Button type="button" variant="outline" size="sm" onClick={() => credentials.refetch()}>
               <RefreshCw className="h-4 w-4" />
-              刷新列表
-            </Button>
-            <Button type="button" variant="outline" size="sm" onClick={() => queryCurrentPageInfo(false)} disabled={queryingInfo || currentCredentials.length === 0}>
-              {queryingInfo ? <Loading size="xs" /> : <Wallet className="h-4 w-4" />}
-              {queryingInfo ? '查询中...' : '查询本页信息'}
-            </Button>
-            <Button type="button" variant="outline" size="sm" onClick={() => queryCurrentPageInfo(true)} disabled={queryingInfo || currentCredentials.every((item) => item.disabled)}>
-              <Wallet className="h-4 w-4" />
-              仅查启用信息
             </Button>
             <Button type="button" variant="outline" size="sm" onClick={() => setKamOpen(true)}>
               <FileUp className="h-4 w-4" />
-              KAM 导入
+              <span className="hidden sm:inline">KAM</span>
             </Button>
             <Button type="button" variant="outline" size="sm" onClick={() => setBatchOpen(true)}>
               <Upload className="h-4 w-4" />
-              批量导入
+              <span className="hidden sm:inline">导入</span>
             </Button>
             <Button type="button" variant="outline" size="sm" onClick={() => setExportOpen(true)}>
               <Download className="h-4 w-4" />
-              导出
+              <span className="hidden sm:inline">导出</span>
             </Button>
             <Button type="button" color="primary" size="sm" onClick={() => setAddOpen(true)}>
               <Plus className="h-4 w-4" />
-              添加凭据
+              添加
             </Button>
-          </>
+          </div>
         }
       >
-        <div className="mb-3 grid gap-2 md:grid-cols-2 xl:grid-cols-6">
-          <div className="relative md:col-span-2">
-            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-base-content/40" />
-            <Input
-              bordered
-              size="sm"
-              className="w-full pl-9"
-              value={queryText}
-              onChange={(event) => setQueryText(event.target.value)}
-              placeholder="搜索邮箱、ID、订阅、代理、错误"
-            />
+        {/* Search and Filters */}
+        <div className="mb-4 space-y-3">
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <div className="relative flex-1">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-base-content/40" />
+              <Input
+                bordered
+                size="sm"
+                className="w-full pl-9"
+                value={queryText}
+                onChange={(e) => setQueryText(e.target.value)}
+                placeholder="搜索邮箱、ID、订阅、代理、错误..."
+              />
+            </div>
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className={hasActiveFilters ? 'border-primary text-primary' : ''}
+                onClick={() => setShowFilters(!showFilters)}
+              >
+                <Filter className="h-4 w-4" />
+                筛选
+                {hasActiveFilters && <Badge tone="primary" size="xs">{[statusFilter, authFilter, subscriptionFilter, proxyFilter].filter(f => f !== 'all').length}</Badge>}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => queryCurrentPageInfo(false)}
+                disabled={queryingInfo || currentCredentials.length === 0}
+              >
+                {queryingInfo ? <Loading size="xs" /> : <Wallet className="h-4 w-4" />}
+                <span className="hidden sm:inline">查询信息</span>
+              </Button>
+            </div>
           </div>
-          <Select bordered size="sm" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
-            <Select.Option value="all">全部状态</Select.Option>
-            <Select.Option value="enabled">启用</Select.Option>
-            <Select.Option value="disabled">已禁用</Select.Option>
-            <Select.Option value="current">当前活跃</Select.Option>
-            <Select.Option value="cooldown">冷却中</Select.Option>
-            <Select.Option value="rate_limited">限流中</Select.Option>
-            <Select.Option value="proxy_blocked">代理不可用</Select.Option>
-            <Select.Option value="error">有错误</Select.Option>
-            <Select.Option value="unknown_subscription">未知订阅</Select.Option>
-          </Select>
-          <Select bordered size="sm" value={authFilter} onChange={(event) => setAuthFilter(event.target.value)}>
-            <Select.Option value="all">全部认证</Select.Option>
-            <Select.Option value="social">Social</Select.Option>
-            <Select.Option value="idc">IdC</Select.Option>
-            <Select.Option value="api_key">API Key</Select.Option>
-          </Select>
-          <Select bordered size="sm" value={subscriptionFilter} onChange={(event) => setSubscriptionFilter(event.target.value)}>
-            <Select.Option value="all">全部订阅</Select.Option>
-            <Select.Option value="pro_plus">Pro+</Select.Option>
-            <Select.Option value="pro">Pro</Select.Option>
-            <Select.Option value="trial">试用</Select.Option>
-            <Select.Option value="free">Free</Select.Option>
-            <Select.Option value="unknown">未知</Select.Option>
-          </Select>
-          <Select bordered size="sm" value={proxyFilter} onChange={(event) => setProxyFilter(event.target.value)}>
-            <Select.Option value="all">全部代理</Select.Option>
-            {(proxyResources.data?.resources || []).map((resource) => (
-              <Select.Option key={resource.id} value={String(resource.id)}>
-                {resource.enabled ? '' : '已禁用 · '}{resource.name}
-              </Select.Option>
-            ))}
-          </Select>
+
+          {/* Filter Panel */}
+          {showFilters && (
+            <div className="animate-slide-down rounded-lg border border-base-300/60 bg-base-200/50 p-3">
+              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                <Select bordered size="sm" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+                  <Select.Option value="all">全部状态</Select.Option>
+                  <Select.Option value="enabled">启用</Select.Option>
+                  <Select.Option value="disabled">已禁用</Select.Option>
+                  <Select.Option value="current">当前活跃</Select.Option>
+                  <Select.Option value="cooldown">冷却中</Select.Option>
+                  <Select.Option value="rate_limited">限流中</Select.Option>
+                  <Select.Option value="error">有错误</Select.Option>
+                </Select>
+                <Select bordered size="sm" value={authFilter} onChange={(e) => setAuthFilter(e.target.value)}>
+                  <Select.Option value="all">全部认证</Select.Option>
+                  <Select.Option value="social">Social</Select.Option>
+                  <Select.Option value="idc">IdC</Select.Option>
+                  <Select.Option value="api_key">API Key</Select.Option>
+                </Select>
+                <Select bordered size="sm" value={subscriptionFilter} onChange={(e) => setSubscriptionFilter(e.target.value)}>
+                  <Select.Option value="all">全部订阅</Select.Option>
+                  <Select.Option value="pro_plus">Pro+</Select.Option>
+                  <Select.Option value="pro">Pro</Select.Option>
+                  <Select.Option value="trial">试用</Select.Option>
+                  <Select.Option value="free">Free</Select.Option>
+                </Select>
+                <Select bordered size="sm" value={proxyFilter} onChange={(e) => setProxyFilter(e.target.value)}>
+                  <Select.Option value="all">全部代理</Select.Option>
+                  {(proxyResources.data?.resources || []).map((r) => (
+                    <Select.Option key={r.id} value={String(r.id)}>{r.name}</Select.Option>
+                  ))}
+                </Select>
+              </div>
+              {hasActiveFilters && (
+                <div className="mt-2 flex justify-end">
+                  <Button type="button" color="ghost" size="xs" onClick={clearFilters}>
+                    <X className="h-3.5 w-3.5" /> 清除筛选
+                  </Button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
+        {/* Batch Actions */}
         {selectedIds.size > 0 && (
-          <div className="mb-3 flex flex-wrap items-center gap-2 rounded-box border border-base-300 bg-base-200 px-2.5 py-2">
-            <Badge tone="primary">已选择 {selectedIds.size} 个</Badge>
+          <div className="mb-4 flex flex-wrap items-center gap-2 rounded-lg border border-primary/30 bg-primary/5 p-2">
+            <Badge tone="primary">已选 {selectedIds.size}</Badge>
             <Button type="button" variant="outline" size="xs" onClick={batchVerify}>
-              <CheckCircle2 className="h-3.5 w-3.5" />
-              批量验活
+              <CheckCircle2 className="h-3.5 w-3.5" /> 验活
             </Button>
             <Button type="button" variant="outline" size="xs" onClick={batchForceRefresh} disabled={batchRefreshing}>
               {batchRefreshing ? <Loading size="xs" /> : <RefreshCw className="h-3.5 w-3.5" />}
-              批量刷新 Token
+              刷新Token
             </Button>
             <Button type="button" variant="outline" size="xs" onClick={batchResetFailure}>
-              <RotateCcw className="h-3.5 w-3.5" />
-              恢复异常
+              <RotateCcw className="h-3.5 w-3.5" /> 恢复异常
             </Button>
             <Button type="button" color="error" variant="outline" size="xs" onClick={batchDelete} disabled={selectedDisabledCount === 0}>
-              <Trash2 className="h-3.5 w-3.5" />
-              批量删除
+              <Trash2 className="h-3.5 w-3.5" /> 删除
             </Button>
             <Button type="button" color="ghost" size="xs" onClick={() => setSelectedIds(new Set())}>
-              取消选择
+              取消
             </Button>
           </div>
         )}
 
-        {disabledCredentialCount > 0 && (
-          <div className="mb-3 flex justify-end">
-            <Button type="button" color="error" variant="outline" size="sm" onClick={clearAllDisabled}>
-              <Trash2 className="h-4 w-4" />
-              清除已禁用
+        {/* Quick Actions */}
+        <div className="mb-3 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Checkbox
+              size="xs"
+              checked={selectedIds.size === currentCredentials.length && currentCredentials.length > 0}
+              indeterminate={selectedIds.size > 0 && selectedIds.size < currentCredentials.length}
+              onChange={selectAll}
+            />
+            <span className="text-xs text-base-content/50">
+              {selectedIds.size > 0 ? `已选 ${selectedIds.size}` : '全选'}
+            </span>
+            <Button type="button" color="ghost" size="xs" onClick={expandAll}>
+              {expandedIds.size === currentCredentials.length ? '全部收起' : '全部展开'}
             </Button>
           </div>
-        )}
+          {disabledCredentialCount > 0 && (
+            <Button type="button" color="error" variant="outline" size="xs" onClick={clearAllDisabled}>
+              <Trash2 className="h-3.5 w-3.5" /> 清除已禁用 ({disabledCredentialCount})
+            </Button>
+          )}
+        </div>
 
+        {/* Credential List */}
         {currentCredentials.length === 0 ? (
-          <EmptyState text={(credentials.data?.filteredTotal || credentials.data?.total || 0) === 0 ? '暂无匹配凭据' : '当前页暂无凭据'} />
+          <EmptyState
+            icon={<Server className="h-12 w-12" />}
+            title="暂无凭据"
+            description={hasActiveFilters ? '没有匹配当前筛选条件的凭据' : '点击添加按钮创建第一个凭据'}
+            action={
+              hasActiveFilters ? (
+                <Button type="button" variant="outline" size="sm" onClick={clearFilters}>清除筛选</Button>
+              ) : (
+                <Button type="button" color="primary" size="sm" onClick={() => setAddOpen(true)}>
+                  <Plus className="h-4 w-4" /> 添加凭据
+                </Button>
+              )
+            }
+          />
         ) : (
-          <div className="grid gap-3 lg:grid-cols-2 xl:grid-cols-3">
+          <div className="credential-grid">
             {currentCredentials.map((credential) => (
               <CredentialCard
                 key={credential.id}
                 credential={credential}
                 selected={selectedIds.has(credential.id)}
+                expanded={expandedIds.has(credential.id)}
                 onToggleSelect={() => toggleSelect(credential.id)}
+                onToggleExpand={() => toggleExpand(credential.id)}
                 onQueryBalance={queryCredentialBalance}
                 onTest={setTestingCredential}
                 balance={balanceMap.get(credential.id)}
@@ -880,19 +587,35 @@ export function CredentialsPanel() {
           </div>
         )}
 
+        {/* Pagination */}
         {totalPages > 1 && (
-          <div className="mt-4 flex items-center justify-center gap-3">
-            <Button type="button" variant="outline" size="sm" disabled={page <= 1} onClick={() => setPage((value) => Math.max(1, value - 1))}>
-              上一页
+          <div className="mt-4 flex items-center justify-center gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={page <= 1}
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+            >
+              <ChevronLeft className="h-4 w-4" />
             </Button>
-            <span className="text-sm text-base-content/60">第 {page} / {totalPages} 页（共 {credentials.data?.filteredTotal ?? credentials.data?.total ?? 0} 个匹配凭据）</span>
-            <Button type="button" variant="outline" size="sm" disabled={page >= totalPages} onClick={() => setPage((value) => Math.min(totalPages, value + 1))}>
-              下一页
+            <span className="min-w-[120px] text-center text-sm text-base-content/60">
+              {page} / {totalPages}
+            </span>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={page >= totalPages}
+              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+            >
+              <ChevronRight className="h-4 w-4" />
             </Button>
           </div>
         )}
       </SectionCard>
 
+      {/* Modals */}
       <AddCredentialModal open={addOpen} onClose={() => setAddOpen(false)} />
       <CredentialTestModal credential={testingCredential} open={Boolean(testingCredential)} onClose={() => setTestingCredential(null)} />
       <BatchImportModal open={batchOpen} onClose={() => setBatchOpen(false)} existingCredentials={importDuplicateCheckCredentials} onDone={invalidate} />

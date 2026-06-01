@@ -14,6 +14,24 @@ use crate::kiro::model::requests::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadByteBreakdown {
+    pub total_bytes: usize,
+    pub history_bytes: usize,
+    pub current_message_bytes: usize,
+    pub current_content_bytes: usize,
+    pub current_tools_bytes: usize,
+    pub current_tool_results_bytes: usize,
+    pub current_images_bytes: usize,
+    pub history_entries: usize,
+    pub current_tool_count: usize,
+    pub current_tool_result_count: usize,
+    pub current_image_count: usize,
+    pub largest_tool_bytes: usize,
+    pub history_tool_use_count: usize,
+    pub history_tool_result_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PayloadGuardConfig {
     pub enabled: bool,
     pub max_bytes: usize,
@@ -116,26 +134,12 @@ impl PayloadGuardReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PayloadGuardError {
     Serialize(String),
-    Oversized {
-        final_bytes: usize,
-        max_bytes: usize,
-        original_bytes: usize,
-    },
 }
 
 impl std::fmt::Display for PayloadGuardError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PayloadGuardError::Serialize(err) => write!(f, "序列化请求失败: {}", err),
-            PayloadGuardError::Oversized {
-                final_bytes,
-                max_bytes,
-                original_bytes,
-            } => write!(
-                f,
-                "Kiro request payload is too large after trimming: final={} bytes, limit={} bytes, original={} bytes",
-                final_bytes, max_bytes, original_bytes
-            ),
         }
     }
 }
@@ -215,19 +219,72 @@ pub fn guard_kiro_request(
     report.final_bytes = body.len();
     report.still_oversized = size_limit_enabled && report.final_bytes > config.max_bytes;
 
-    if report.still_oversized {
-        return Err(PayloadGuardError::Oversized {
-            final_bytes: report.final_bytes,
-            max_bytes: config.max_bytes,
-            original_bytes: report.original_bytes,
-        });
-    }
-
     Ok((body, report))
+}
+
+pub fn breakdown_kiro_request(
+    request: &KiroRequest,
+    serialized_body: &str,
+) -> PayloadByteBreakdown {
+    let state = &request.conversation_state;
+    let current_user = &state.current_message.user_input_message;
+    let context = &current_user.user_input_message_context;
+
+    PayloadByteBreakdown {
+        total_bytes: serialized_body.len(),
+        history_bytes: json_len(&state.history),
+        current_message_bytes: json_len(&state.current_message),
+        current_content_bytes: current_user.content.len(),
+        current_tools_bytes: json_len(&context.tools),
+        current_tool_results_bytes: json_len(&context.tool_results),
+        current_images_bytes: json_len(&current_user.images),
+        history_entries: state.history.len(),
+        current_tool_count: context.tools.len(),
+        current_tool_result_count: context.tool_results.len(),
+        current_image_count: current_user.images.len(),
+        largest_tool_bytes: context.tools.iter().map(json_len).max().unwrap_or(0),
+        history_tool_use_count: count_history_tool_uses(&state.history),
+        history_tool_result_count: count_history_tool_results(&state.history),
+    }
 }
 
 fn serialize_request(request: &KiroRequest) -> Result<String, PayloadGuardError> {
     serde_json::to_string(request).map_err(|err| PayloadGuardError::Serialize(err.to_string()))
+}
+
+fn json_len<T: serde::Serialize + ?Sized>(value: &T) -> usize {
+    serde_json::to_string(value)
+        .map(|json| json.len())
+        .unwrap_or(0)
+}
+
+fn count_history_tool_uses(history: &[Message]) -> usize {
+    history
+        .iter()
+        .map(|message| match message {
+            Message::Assistant(assistant) => assistant
+                .assistant_response_message
+                .tool_uses
+                .as_ref()
+                .map(Vec::len)
+                .unwrap_or(0),
+            Message::User(_) => 0,
+        })
+        .sum()
+}
+
+fn count_history_tool_results(history: &[Message]) -> usize {
+    history
+        .iter()
+        .map(|message| match message {
+            Message::User(user) => user
+                .user_input_message
+                .user_input_message_context
+                .tool_results
+                .len(),
+            Message::Assistant(_) => 0,
+        })
+        .sum()
 }
 
 fn trim_oldest_history_unit(history: &mut Vec<Message>) {
@@ -511,14 +568,17 @@ mod tests {
         AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
         HistoryUserMessage, KiroImage, UserInputMessage, UserInputMessageContext,
     };
-    use crate::kiro::model::requests::tool::{ToolResult, ToolUseEntry};
+    use crate::kiro::model::requests::tool::{
+        InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
+    };
+
+    const TEST_MODEL: &str = "test-model";
 
     fn request_with_history(history: Vec<Message>) -> KiroRequest {
         KiroRequest {
             conversation_state: ConversationState::new("conv-test")
                 .with_current_message(CurrentMessage::new(UserInputMessage::new(
-                    "current",
-                    "claude-sonnet-4.6",
+                    "current", TEST_MODEL,
                 )))
                 .with_history(history),
             profile_arn: None,
@@ -531,7 +591,7 @@ mod tests {
         for idx in 0..10 {
             history.push(Message::User(HistoryUserMessage::new(
                 format!("user {} {}", idx, "x".repeat(500)),
-                "claude-sonnet-4.6",
+                TEST_MODEL,
             )));
             history.push(Message::Assistant(HistoryAssistantMessage::new(format!(
                 "assistant {} {}",
@@ -565,7 +625,7 @@ mod tests {
             assistant_response_message: AssistantMessage::new("tool call")
                 .with_tool_uses(vec![ToolUseEntry::new("tool-1", "readFile")]),
         };
-        let mut user = HistoryUserMessage::new("result message", "claude-sonnet-4.6");
+        let mut user = HistoryUserMessage::new("result message", TEST_MODEL);
         user.user_input_message.user_input_message_context = UserInputMessageContext::new()
             .with_tool_results(vec![
                 ToolResult::success("tool-1", "valid result"),
@@ -573,7 +633,7 @@ mod tests {
             ]);
 
         let mut request = request_with_history(vec![
-            Message::User(HistoryUserMessage::new("old", "claude-sonnet-4.6")),
+            Message::User(HistoryUserMessage::new("old", TEST_MODEL)),
             Message::Assistant(assistant),
             Message::User(user),
         ]);
@@ -603,18 +663,15 @@ mod tests {
     }
 
     #[test]
-    fn guard_returns_oversized_when_current_message_alone_exceeds_limit() {
+    fn guard_marks_oversized_without_rejecting_current_message() {
         let mut request = KiroRequest {
             conversation_state: ConversationState::new("conv-test").with_current_message(
-                CurrentMessage::new(UserInputMessage::new(
-                    "x".repeat(10_000),
-                    "claude-sonnet-4.6",
-                )),
+                CurrentMessage::new(UserInputMessage::new("x".repeat(10_000), TEST_MODEL)),
             ),
             profile_arn: None,
         };
 
-        let err = guard_kiro_request(
+        let (body, report) = guard_kiro_request(
             &mut request,
             PayloadGuardConfig {
                 enabled: true,
@@ -622,9 +679,12 @@ mod tests {
                 trim_history: true,
             },
         )
-        .expect_err("current message cannot be trimmed");
+        .expect("oversized current message should be passed through to Kiro");
 
-        assert!(matches!(err, PayloadGuardError::Oversized { .. }));
+        assert!(body.len() > 1_000);
+        assert!(report.still_oversized);
+        assert_eq!(report.final_bytes, body.len());
+        assert_eq!(report.trimmed_history_entries, 0);
     }
 
     #[test]
@@ -636,7 +696,7 @@ mod tests {
             },
         };
         let mut request = request_with_history(vec![
-            Message::User(HistoryUserMessage::new("user", "claude-sonnet-4.6")),
+            Message::User(HistoryUserMessage::new("user", TEST_MODEL)),
             Message::Assistant(assistant),
         ]);
         request
@@ -701,7 +761,7 @@ mod tests {
             },
         };
         let mut request = request_with_history(vec![
-            Message::User(HistoryUserMessage::new("user", "claude-sonnet-4.6")),
+            Message::User(HistoryUserMessage::new("user", TEST_MODEL)),
             Message::Assistant(assistant),
         ]);
 
@@ -728,7 +788,7 @@ mod tests {
             assistant_response_message: AssistantMessage::new("tool call")
                 .with_tool_uses(vec![ToolUseEntry::new("tool-1", "readFile")]),
         };
-        let mut user = HistoryUserMessage::new("result message", "claude-sonnet-4.6");
+        let mut user = HistoryUserMessage::new("result message", TEST_MODEL);
         user.user_input_message.user_input_message_context = UserInputMessageContext::new()
             .with_tool_results(vec![ToolResult::success("tool-1", "valid result")]);
         let mut request =
@@ -759,7 +819,7 @@ mod tests {
                 .with_tool_uses(vec![ToolUseEntry::new("tool-1", "readFile")]),
         };
         let mut request = request_with_history(vec![
-            Message::User(HistoryUserMessage::new("read", "claude-sonnet-4.6")),
+            Message::User(HistoryUserMessage::new("read", TEST_MODEL)),
             Message::Assistant(assistant),
         ]);
         request
@@ -805,8 +865,51 @@ mod tests {
     }
 
     #[test]
+    fn payload_breakdown_reports_current_tool_and_history_sizes() {
+        let assistant = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new("tool call")
+                .with_tool_uses(vec![ToolUseEntry::new("tool-1", "readFile")]),
+        };
+        let mut user = HistoryUserMessage::new("result message", TEST_MODEL);
+        user.user_input_message.user_input_message_context = UserInputMessageContext::new()
+            .with_tool_results(vec![ToolResult::success("tool-1", "valid result")]);
+        let mut request = request_with_history(vec![
+            Message::User(HistoryUserMessage::new("read", TEST_MODEL)),
+            Message::Assistant(assistant),
+            Message::User(user),
+        ]);
+        request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context = UserInputMessageContext::new().with_tools(vec![Tool {
+            tool_specification: ToolSpecification {
+                name: "readFile".to_string(),
+                description: "read files".to_string(),
+                input_schema: InputSchema::from_json(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"}
+                    }
+                })),
+            },
+        }]);
+
+        let body = serde_json::to_string(&request).expect("serialize");
+        let breakdown = breakdown_kiro_request(&request, &body);
+
+        assert_eq!(breakdown.total_bytes, body.len());
+        assert_eq!(breakdown.history_entries, 3);
+        assert_eq!(breakdown.current_tool_count, 1);
+        assert_eq!(breakdown.history_tool_use_count, 1);
+        assert_eq!(breakdown.history_tool_result_count, 1);
+        assert!(breakdown.current_tools_bytes > 0);
+        assert!(breakdown.largest_tool_bytes > 0);
+    }
+
+    #[test]
     fn image_history_bytes_are_counted() {
-        let mut user = HistoryUserMessage::new("image", "claude-sonnet-4.6");
+        let mut user = HistoryUserMessage::new("image", TEST_MODEL);
         user.user_input_message.images = vec![KiroImage::from_base64("png", "a".repeat(2048))];
         let mut request = request_with_history(vec![Message::User(user)]);
 

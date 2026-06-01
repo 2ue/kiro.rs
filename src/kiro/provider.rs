@@ -35,6 +35,15 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
 
+fn should_log_upstream_body_size_at_info(body_bytes: usize, config: &Config) -> bool {
+    let near_payload_guard_limit = config.payload_guard_max_bytes > 0
+        && body_bytes > config.payload_guard_max_bytes.saturating_mul(70) / 100;
+    let compression_enabled =
+        config.compression.enabled && config.compression.whitespace_compression;
+
+    near_payload_guard_limit || compression_enabled
+}
+
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
@@ -853,6 +862,29 @@ impl KiroProvider {
             endpoint.transform_api_body(request_body, &rctx),
             config.compression.enabled && config.compression.whitespace_compression,
         );
+        if should_log_upstream_body_size_at_info(body.len(), &config) {
+            tracing::info!(
+                endpoint = endpoint.name(),
+                credential_id = ctx.id,
+                credential_label = %credential_label,
+                upstream_body_bytes = body.len(),
+                pre_endpoint_body_bytes = request_body.len(),
+                compression_enabled = config.compression.enabled
+                    && config.compression.whitespace_compression,
+                "Kiro upstream request body size"
+            );
+        } else {
+            tracing::debug!(
+                endpoint = endpoint.name(),
+                credential_id = ctx.id,
+                credential_label = %credential_label,
+                upstream_body_bytes = body.len(),
+                pre_endpoint_body_bytes = request_body.len(),
+                compression_enabled = config.compression.enabled
+                    && config.compression.whitespace_compression,
+                "Kiro upstream request body size"
+            );
+        }
         let base = self
             .client_for(&ctx.credentials)
             .map_err(|e| {
@@ -1530,6 +1562,41 @@ impl KiroProvider {
                 endpoint.transform_api_body(request_body, &rctx),
                 config.compression.enabled && config.compression.whitespace_compression,
             );
+            if should_log_upstream_body_size_at_info(body.len(), &config) {
+                tracing::info!(
+                    request_id,
+                    api_type,
+                    endpoint = endpoint.name(),
+                    credential_id = ctx.id,
+                    credential_label = %credential_label,
+                    attempt = attempt + 1,
+                    max_retries,
+                    model = model.as_deref(),
+                    conversation_id = conversation_id.as_deref(),
+                    upstream_body_bytes = body.len(),
+                    pre_endpoint_body_bytes = request_body.len(),
+                    compression_enabled = config.compression.enabled
+                        && config.compression.whitespace_compression,
+                    "Kiro upstream request body size"
+                );
+            } else {
+                tracing::debug!(
+                    request_id,
+                    api_type,
+                    endpoint = endpoint.name(),
+                    credential_id = ctx.id,
+                    credential_label = %credential_label,
+                    attempt = attempt + 1,
+                    max_retries,
+                    model = model.as_deref(),
+                    conversation_id = conversation_id.as_deref(),
+                    upstream_body_bytes = body.len(),
+                    pre_endpoint_body_bytes = request_body.len(),
+                    compression_enabled = config.compression.enabled
+                        && config.compression.whitespace_compression,
+                    "Kiro upstream request body size"
+                );
+            }
 
             let client = match self.client_for(&ctx.credentials) {
                 Ok(client) => client,
