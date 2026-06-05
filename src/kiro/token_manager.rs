@@ -742,8 +742,11 @@ pub struct CredentialEntrySnapshot {
     pub oldest_in_flight_age_secs: u64,
     /// 最近活跃并发占用距离现在的秒数。
     pub newest_in_flight_idle_secs: u64,
-    /// 单凭据最大并发请求数。0 表示不限制。
+    /// 当前生效的单凭据最大并发请求数。0 表示不限制。
     pub max_concurrent_requests: u32,
+    /// 凭据级最大并发覆盖值。None 表示继承全局；Some(0) 表示该凭据不限并发。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_requests_override: Option<u32>,
     /// 并发占用 lease 自动回收阈值。0 表示关闭自动回收。
     pub in_flight_lease_max_secs: u64,
     /// 预热剩余请求数。
@@ -1529,15 +1532,42 @@ impl MultiTokenManager {
         }
     }
 
+    fn effective_max_concurrent_requests(
+        entry: &CredentialEntry,
+        global_max_concurrent_requests: u32,
+    ) -> u32 {
+        entry
+            .credentials
+            .max_concurrent_requests
+            .unwrap_or(global_max_concurrent_requests)
+    }
+
     fn entry_has_concurrency_capacity(
         entry: &CredentialEntry,
-        max_concurrent_requests: u32,
+        global_max_concurrent_requests: u32,
     ) -> bool {
+        let max_concurrent_requests =
+            Self::effective_max_concurrent_requests(entry, global_max_concurrent_requests);
         max_concurrent_requests == 0 || entry.in_flight_requests < max_concurrent_requests
     }
 
     fn max_concurrent_requests(&self) -> u32 {
         self.config.lock().credential_max_concurrent_requests
+    }
+
+    fn effective_max_concurrent_requests_for_id(
+        &self,
+        id: u64,
+        global_max_concurrent_requests: u32,
+    ) -> u32 {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| {
+                Self::effective_max_concurrent_requests(entry, global_max_concurrent_requests)
+            })
+            .unwrap_or(global_max_concurrent_requests)
     }
 
     fn global_max_concurrent_requests(&self) -> u32 {
@@ -1619,7 +1649,10 @@ impl MultiTokenManager {
         selection_pressure: f64,
     ) -> f64 {
         let config = self.config.lock();
-        let max_concurrent = config.credential_max_concurrent_requests;
+        let max_concurrent = Self::effective_max_concurrent_requests(
+            entry,
+            config.credential_max_concurrent_requests,
+        );
         let load = if max_concurrent > 0 {
             entry.in_flight_requests as f64 / max_concurrent as f64
         } else {
@@ -1800,9 +1833,6 @@ impl MultiTokenManager {
         now: Instant,
         max_concurrent_requests: u32,
     ) -> usize {
-        if max_concurrent_requests == 0 {
-            return 0;
-        }
         entries
             .iter()
             .filter(|entry| {
@@ -1845,6 +1875,8 @@ impl MultiTokenManager {
     fn acquire_in_flight_slot(&self, id: u64) -> anyhow::Result<Option<InFlightLeaseGuard>> {
         self.cleanup_expired_in_flight_leases_result()?;
         let max_concurrent_requests = self.max_concurrent_requests();
+        let effective_max_concurrent_requests =
+            self.effective_max_concurrent_requests_for_id(id, max_concurrent_requests);
         let global_max_concurrent_requests = self.global_max_concurrent_requests();
         let now = Instant::now();
 
@@ -1863,7 +1895,7 @@ impl MultiTokenManager {
                         .acquire_dispatch_lease(
                             id,
                             lease_id,
-                            max_concurrent_requests,
+                            effective_max_concurrent_requests,
                             global_max_concurrent_requests,
                             max_age,
                             InFlightKind::Api.as_str(),
@@ -4767,7 +4799,11 @@ impl MultiTokenManager {
                         in_flight_requests: e.in_flight_requests,
                         oldest_in_flight_age_secs,
                         newest_in_flight_idle_secs,
-                        max_concurrent_requests,
+                        max_concurrent_requests: Self::effective_max_concurrent_requests(
+                            e,
+                            max_concurrent_requests,
+                        ),
+                        max_concurrent_requests_override: e.credentials.max_concurrent_requests,
                         in_flight_lease_max_secs: lease_max_age
                             .map(|duration| duration.as_secs())
                             .unwrap_or(0),
@@ -4920,6 +4956,42 @@ impl MultiTokenManager {
         self.select_highest_priority();
         self.notify_dispatch_state_changed();
         self.publish_credentials_changed("credential_priority_updated");
+        Ok(())
+    }
+
+    /// 设置凭据级最大并发覆盖（Admin API）。
+    ///
+    /// `None` 表示继承全局 `credentialMaxConcurrentRequests`；
+    /// `Some(0)` 表示该凭据不限并发；
+    /// `Some(n)` 表示该凭据最多同时处理 n 个请求。
+    pub fn set_credential_max_concurrent_requests(
+        &self,
+        id: u64,
+        max_concurrent_requests: Option<u32>,
+    ) -> anyhow::Result<()> {
+        let credential = {
+            let entries = self.entries.lock();
+            let entry = entries
+                .iter()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            let mut credential = Self::credential_from_entry(entry);
+            credential.max_concurrent_requests = max_concurrent_requests;
+            credential
+        };
+        self.persist_credential_value(&credential)?;
+
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.max_concurrent_requests = credential.max_concurrent_requests;
+        }
+
+        self.notify_dispatch_state_changed();
+        self.publish_credentials_changed("credential_concurrency_updated");
         Ok(())
     }
 
@@ -6151,6 +6223,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_bound_session_falls_back_when_bound_credential_is_full() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.credential_max_concurrent_requests = 1;
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let empty = HashSet::new();
+
+        let mut bound = manager
+            .acquire_context_for_session(None, Some("sticky-full"), &empty)
+            .await
+            .unwrap();
+        manager.report_success_for_session(bound.id, Some("sticky-full"));
+
+        let mut fallback = manager
+            .acquire_context_for_session(None, Some("sticky-full"), &empty)
+            .await
+            .unwrap();
+
+        assert_ne!(
+            bound.id, fallback.id,
+            "同一 sticky 会话绑定账号并发已满时，应临时调度到其他可用账号，而不是等待绑定账号"
+        );
+        assert!(fallback.fallback_from_sticky);
+        assert!(!fallback.sticky_bound);
+
+        fallback.release_in_flight();
+        bound.release_in_flight();
+
+        let rebound = manager
+            .acquire_context_for_session(None, Some("sticky-full"), &empty)
+            .await
+            .unwrap();
+        assert_eq!(
+            rebound.id, bound.id,
+            "并发释放后 sticky 会话应回到原绑定账号，保持粘性"
+        );
+    }
+
+    #[tokio::test]
     async fn test_transient_failure_cools_down_without_disabling_credential() {
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
@@ -7024,6 +7144,67 @@ mod tests {
             .expect("等待请求应成功获取凭据");
 
         assert_eq!(second.id, first.id);
+        second.release_in_flight();
+    }
+
+    #[tokio::test]
+    async fn test_credential_concurrency_override_limits_when_global_unlimited() {
+        let mut config = Config::default();
+        config.credential_max_concurrent_requests = 0;
+
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("t1".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        cred.max_concurrent_requests = Some(1);
+
+        let manager =
+            Arc::new(MultiTokenManager::new(config, vec![cred], None, None, false).unwrap());
+        let mut first = manager.acquire_context(None).await.unwrap();
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.entries[0].max_concurrent_requests, 1);
+        assert_eq!(
+            snapshot.entries[0].max_concurrent_requests_override,
+            Some(1)
+        );
+
+        let waiting_manager = manager.clone();
+        let waiting = tokio::spawn(async move { waiting_manager.acquire_context(None).await });
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        assert!(
+            !waiting.is_finished(),
+            "账号级并发覆盖为 1 时，即使全局不限，也应排队等待"
+        );
+
+        first.release_in_flight();
+        let mut second = tokio::time::timeout(StdDuration::from_secs(1), waiting)
+            .await
+            .expect("释放账号级并发槽后等待请求应恢复")
+            .expect("等待任务不应 panic")
+            .expect("等待请求应成功获取凭据");
+        second.release_in_flight();
+    }
+
+    #[tokio::test]
+    async fn test_credential_concurrency_override_zero_bypasses_global_limit() {
+        let mut config = Config::default();
+        config.credential_max_concurrent_requests = 1;
+
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("t1".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        cred.max_concurrent_requests = Some(0);
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        let mut first = manager.acquire_context(None).await.unwrap();
+        let mut second = manager.acquire_context(None).await.unwrap();
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.entries[0].in_flight_requests, 2);
+        assert_eq!(snapshot.entries[0].max_concurrent_requests, 0);
+        assert_eq!(
+            snapshot.entries[0].max_concurrent_requests_override,
+            Some(0)
+        );
+        first.release_in_flight();
         second.release_in_flight();
     }
 

@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useRef } from 'react'
 import { LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, BarChart3, Settings, DollarSign, Download, FileClock, RefreshCw, Router, Search, FileCheck2 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { storage } from '@/lib/storage'
+import { maskAdminApiKey, storage } from '@/lib/storage'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -53,6 +53,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
   const [activeTab, setActiveTab] = useState<'credentials' | 'validation' | 'proxies' | 'usage' | 'pricing' | 'audit' | 'config'>('credentials')
+  const [adminApiKeySnapshot, setAdminApiKeySnapshot] = useState(() => storage.getApiKey() || '')
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
@@ -79,6 +80,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { data: proxyResourcesData } = useProxyResources()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
   const runtimeConfig = useRuntimeConfig()
+  const maskedAdminApiKey = maskAdminApiKey(adminApiKeySnapshot)
 
   // 计算分页
   const totalPages = data?.totalPages || 0
@@ -109,6 +111,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setCurrentPage(1)
     setSelectedIds(new Set())
   }, [queryText, statusFilter, authFilter, subscriptionFilter, proxyFilter])
+
+  useEffect(() => {
+    const handleAdminKeyUpdated = () => {
+      setAdminApiKeySnapshot(storage.getApiKey() || '')
+    }
+    window.addEventListener('kiro-admin-key-updated', handleAdminKeyUpdated)
+    return () => window.removeEventListener('kiro-admin-key-updated', handleAdminKeyUpdated)
+  }, [])
 
   // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
   useEffect(() => {
@@ -620,7 +630,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
         <div className="container flex h-14 items-center justify-between px-4 md:px-8">
           <div className="flex items-center gap-2">
             <Server className="h-5 w-5" />
-            <span className="font-semibold">Kiro Admin</span>
+            <div className="leading-tight">
+              <div className="font-semibold">Kiro Admin</div>
+              <div className="hidden text-[11px] text-muted-foreground sm:block">
+                <span className="font-mono">adminApiKey</span>
+                <span className="mx-1">:</span>
+                <span className="font-mono">{maskedAdminApiKey}</span>
+              </div>
+            </div>
           </div>
           <div className="flex items-center gap-2">
             <Button

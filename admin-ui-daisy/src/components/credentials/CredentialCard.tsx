@@ -1,6 +1,7 @@
 import {
   ChevronDown,
   ChevronUp,
+  Gauge,
   MoreHorizontal,
   RefreshCw,
   RotateCcw,
@@ -24,6 +25,7 @@ import {
   useResetFailure,
   useRuntimeConfig,
   useSetCredentialProxy,
+  useSetCredentialConcurrency,
   useSetDisabled,
   useSetPriority,
   useSetWarmup,
@@ -69,6 +71,16 @@ function sourceLabel(source?: CredentialStatusItem['effectiveProxySource']) {
   return labels[source || ''] || '未配置'
 }
 
+function concurrencyLimitLabel(credential: CredentialStatusItem) {
+  const effective = credential.maxConcurrentRequests > 0 ? `${credential.maxConcurrentRequests}` : '不限'
+  if (typeof credential.maxConcurrentRequestsOverride === 'number') {
+    return credential.maxConcurrentRequestsOverride > 0
+      ? `账号覆盖：${credential.maxConcurrentRequestsOverride}`
+      : '账号覆盖：不限'
+  }
+  return `继承全局：${effective}`
+}
+
 // ============================================================================
 // Credential Card Component
 // ============================================================================
@@ -98,12 +110,19 @@ export function CredentialCard({
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
   const [editingProxy, setEditingProxy] = useState(false)
+  const [editingConcurrency, setEditingConcurrency] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [proxyResourceId, setProxyResourceId] = useState(credential.proxyResourceId ? String(credential.proxyResourceId) : '')
+  const [concurrencyValue, setConcurrencyValue] = useState(
+    typeof credential.maxConcurrentRequestsOverride === 'number'
+      ? String(credential.maxConcurrentRequestsOverride)
+      : ''
+  )
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
   const setCredentialProxy = useSetCredentialProxy()
+  const setCredentialConcurrency = useSetCredentialConcurrency()
   const proxyResources = useProxyResources()
   const proxyResourceOptions = proxyResources.data?.resources || []
   const resetFailure = useResetFailure()
@@ -128,6 +147,14 @@ export function CredentialCard({
   useEffect(() => {
     setProxyResourceId(credential.proxyResourceId ? String(credential.proxyResourceId) : '')
   }, [credential.id, credential.proxyResourceId])
+
+  useEffect(() => {
+    setConcurrencyValue(
+      typeof credential.maxConcurrentRequestsOverride === 'number'
+        ? String(credential.maxConcurrentRequestsOverride)
+        : ''
+    )
+  }, [credential.id, credential.maxConcurrentRequestsOverride])
 
   const savePriority = () => {
     const priority = Number(priorityValue)
@@ -159,6 +186,29 @@ export function CredentialCard({
           setEditingProxy(false)
         },
         onError: (error) => toast.error(`代理设置失败: ${extractErrorMessage(error)}`),
+      }
+    )
+  }
+
+  const saveConcurrency = () => {
+    const trimmed = concurrencyValue.trim()
+    let maxConcurrentRequests: number | null = null
+    if (trimmed) {
+      const parsed = Number(trimmed)
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        toast.error('账号并发限制必须是非负整数')
+        return
+      }
+      maxConcurrentRequests = parsed
+    }
+    setCredentialConcurrency.mutate(
+      { id: credential.id, request: { maxConcurrentRequests } },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setEditingConcurrency(false)
+        },
+        onError: (error) => toast.error(`并发限制设置失败: ${extractErrorMessage(error)}`),
       }
     )
   }
@@ -212,6 +262,9 @@ export function CredentialCard({
               <Badge size="xs">{authLabel(credential.authMethod)}</Badge>
               <Badge size="xs">{loadingBalance ? '...' : subscriptionLabel(credential, balance)}</Badge>
               {credential.hasProxy && <Badge tone="info" size="xs">代理</Badge>}
+              {typeof credential.maxConcurrentRequestsOverride === 'number' && (
+                <Badge tone="info" size="xs">并发覆盖</Badge>
+              )}
               {!credential.disabled && credential.cooledDown && (
                 <Badge tone="warning" size="xs">冷却 {credential.cooldownRemainingSecs}s</Badge>
               )}
@@ -279,13 +332,18 @@ export function CredentialCard({
                 loadingBalance ? <Loading size="xs" /> : accountInfo ? `${formatQuota(accountInfo.currentUsage)}/${formatQuota(accountInfo.usageLimit)}` : '未知'
               } />
               <MetaItem label="估算成本" value={formatUsd(credential.estimatedCostUsd)} />
-              {credential.maxConcurrentRequests > 0 && (
-                <MetaItem
-                  label="并发"
-                  value={`${credential.inFlightRequests}/${credential.maxConcurrentRequests}`}
-                  error={credential.inFlightRequests >= credential.maxConcurrentRequests}
-                />
-              )}
+              <MetaItem
+                label="并发"
+                value={
+                  <button type="button" className="flex items-center gap-1 text-primary hover:underline" onClick={() => setEditingConcurrency(true)}>
+                    <Gauge className="h-3 w-3" />
+                    {credential.inFlightRequests}
+                    {credential.maxConcurrentRequests > 0 ? `/${credential.maxConcurrentRequests}` : ' / 不限'}
+                    <span className="text-xs text-base-content/45">· {concurrencyLimitLabel(credential)}</span>
+                  </button>
+                }
+                error={credential.maxConcurrentRequests > 0 && credential.inFlightRequests >= credential.maxConcurrentRequests}
+              />
               {credential.warmupRemaining > 0 && (
                 <MetaItem label="预热剩余" value={credential.warmupRemaining} />
               )}
@@ -365,6 +423,72 @@ export function CredentialCard({
           </div>
         )}
       </Card.Body>
+
+      <ModalShell open={editingConcurrency} title={`并发限制：${credentialLabel(credential)}`} width="max-w-lg" onClose={() => setEditingConcurrency(false)}>
+        <div className="space-y-3">
+          <div className="rounded-lg border border-base-300 bg-base-200/60 p-3 text-sm">
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-base-content/60">当前生效</span>
+              <span className="font-semibold">
+                {credential.maxConcurrentRequests > 0 ? `${credential.maxConcurrentRequests} 并发` : '不限并发'}
+              </span>
+            </div>
+            <div className="mt-1 text-xs text-base-content/55">
+              {typeof credential.maxConcurrentRequestsOverride === 'number'
+                ? '当前账号已覆盖全局配置。'
+                : '当前账号继承全局配置。'}
+            </div>
+          </div>
+          <label className="block">
+            <span className="text-sm font-semibold">账号级最大并发</span>
+            <Input
+              bordered
+              size="sm"
+              type="number"
+              min={0}
+              className="mt-2"
+              value={concurrencyValue}
+              placeholder="留空继承全局，0 表示不限"
+              disabled={setCredentialConcurrency.isPending}
+              onChange={(event) => setConcurrencyValue(event.target.value)}
+            />
+            <span className="mt-1 block text-xs text-base-content/55">
+              留空表示继承全局“单凭据最大并发请求数”；填 0 表示该账号不限并发；填正整数表示该账号自己的并发上限。
+            </span>
+          </label>
+
+          <Modal.Actions>
+            <Button type="button" color="ghost" size="sm" onClick={() => setEditingConcurrency(false)} disabled={setCredentialConcurrency.isPending}>
+              取消
+            </Button>
+            <Button
+              type="button"
+              color="ghost"
+              size="sm"
+              disabled={setCredentialConcurrency.isPending || typeof credential.maxConcurrentRequestsOverride !== 'number'}
+              onClick={() => {
+                setConcurrencyValue('')
+                setCredentialConcurrency.mutate(
+                  { id: credential.id, request: { maxConcurrentRequests: null } },
+                  {
+                    onSuccess: (res) => {
+                      toast.success(res.message)
+                      setEditingConcurrency(false)
+                    },
+                    onError: (error) => toast.error(`并发限制设置失败: ${extractErrorMessage(error)}`),
+                  }
+                )
+              }}
+            >
+              继承全局
+            </Button>
+            <Button type="button" color="primary" size="sm" onClick={saveConcurrency} disabled={setCredentialConcurrency.isPending}>
+              {setCredentialConcurrency.isPending && <Loading size="xs" />}
+              保存
+            </Button>
+          </Modal.Actions>
+        </div>
+      </ModalShell>
 
       {/* Proxy Edit Modal */}
       <ModalShell open={editingProxy} title={`绑定代理：${credentialLabel(credential)}`} width="max-w-xl" onClose={() => setEditingProxy(false)}>

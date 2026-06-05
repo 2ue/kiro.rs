@@ -124,6 +124,9 @@ export function normalizeCredentialImportItem(value: unknown): AddCredentialRequ
     clientSecret: authMethod === 'api_key' ? undefined : clientSecret,
     email: stringField(normalized.email) ?? stringField(normalized.nickname),
     priority: numberField(normalized.priority),
+    maxConcurrentRequests:
+      numberField(normalized.maxConcurrentRequests) ??
+      numberField(nested?.maxConcurrentRequests),
     authRegion,
     apiRegion,
     machineId: stringField(normalized.machineId) ?? stringField(nested?.machineId),

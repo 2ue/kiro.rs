@@ -11,7 +11,7 @@ import { CredentialsPanel } from '@/components/CredentialsPanel'
 import { PricingPanel } from '@/components/PricingPanel'
 import { ProxyPanel } from '@/components/ProxyPanel'
 import { UsagePanel } from '@/components/UsagePanel'
-import { storage } from '@/lib/storage'
+import { maskAdminApiKey, storage } from '@/lib/storage'
 import type { TabKey, ThemeMode } from '@/types/ui'
 import { pageConfig } from '@/types/ui'
 
@@ -35,13 +35,23 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [isRefreshing, setIsRefreshing] = useState(false)
+  const [adminApiKeySnapshot, setAdminApiKeySnapshot] = useState(() => storage.getApiKey() || '')
   const queryClient = useQueryClient()
+  const maskedAdminApiKey = maskAdminApiKey(adminApiKeySnapshot)
 
   // Apply theme
   useEffect(() => {
     document.documentElement.dataset.theme = theme
     localStorage.setItem('kiro-theme', theme)
   }, [theme])
+
+  useEffect(() => {
+    const handleAdminKeyUpdated = () => {
+      setAdminApiKeySnapshot(storage.getApiKey() || '')
+    }
+    window.addEventListener('kiro-admin-key-updated', handleAdminKeyUpdated)
+    return () => window.removeEventListener('kiro-admin-key-updated', handleAdminKeyUpdated)
+  }, [])
 
   const handleLogout = () => {
     storage.removeApiKey()
@@ -103,6 +113,9 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
           </Button>
           <div className="min-w-0 flex-1">
             <h1 className="truncate text-sm font-semibold">{currentPage.title}</h1>
+            <p className="truncate text-[0.68rem] text-base-content/45">
+              adminApiKey: {maskedAdminApiKey}
+            </p>
           </div>
         </div>
 
@@ -116,6 +129,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             onLogout={handleLogout}
             onRefresh={handleRefresh}
             isRefreshing={isRefreshing}
+            adminApiKeyLabel={maskedAdminApiKey}
           />
         </div>
 

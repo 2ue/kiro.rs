@@ -433,6 +433,7 @@ async fn main() {
                 kiro_provider.clone(),
                 postgres_store.clone(),
                 redis_store.clone(),
+                api_key.clone(),
             );
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);

@@ -10,14 +10,15 @@ use serde_json::json;
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, ClearInFlightRequest,
-    CreateProxyResourceRequest, CredentialAccountInfo, CredentialInfoRefreshItem,
-    CredentialInfoRefreshResponse, CredentialStatusItem, CredentialValidationGroup,
-    CredentialValidationInfo, CredentialValidationItem, CredentialValidationResponse,
-    CredentialsPageResponse, CredentialsStatusResponse, LoadBalancingModeResponse,
-    ManualModelResponse, ProxyResourceResponse, ProxyResourcesResponse,
-    RefreshCredentialInfoRequest, RuntimeConfigResponse, SetCredentialProxyRequest,
-    SetLoadBalancingModeRequest, SetWarmupRequest, TestCredentialRequest, TestCredentialResponse,
+    AccessKeysResponse, AddCredentialRequest, AddCredentialResponse, BalanceResponse,
+    ClearInFlightRequest, CreateProxyResourceRequest, CredentialAccountInfo,
+    CredentialInfoRefreshItem, CredentialInfoRefreshResponse, CredentialStatusItem,
+    CredentialValidationGroup, CredentialValidationInfo, CredentialValidationItem,
+    CredentialValidationResponse, CredentialsPageResponse, CredentialsStatusResponse,
+    LoadBalancingModeResponse, ManualModelResponse, ProxyResourceResponse, ProxyResourcesResponse,
+    RefreshCredentialInfoRequest, RuntimeConfigResponse, SetCredentialConcurrencyRequest,
+    SetCredentialProxyRequest, SetLoadBalancingModeRequest, SetWarmupRequest,
+    TestCredentialRequest, TestCredentialResponse, UpdateAdminApiKeyRequest,
     UpdateProxyResourceRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
     ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
 };
@@ -76,6 +77,43 @@ fn balance_cache_key(id: u64) -> String {
     format!("balance:{}", id)
 }
 
+fn mask_secret(value: &str) -> String {
+    if value.is_empty() {
+        return "未配置".to_string();
+    }
+    if value.len() <= 10 {
+        let head = value.chars().take(2).collect::<String>();
+        let tail = value
+            .chars()
+            .rev()
+            .take(2)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        return format!("{}...{}", head, tail);
+    }
+    let head = value.chars().take(6).collect::<String>();
+    let tail = value
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{}...{}", head, tail)
+}
+
+fn access_keys_response(request_api_key: &str, admin_api_key: &str) -> AccessKeysResponse {
+    AccessKeysResponse {
+        request_api_key: request_api_key.to_string(),
+        masked_request_api_key: mask_secret(request_api_key),
+        admin_api_key: admin_api_key.to_string(),
+        masked_admin_api_key: mask_secret(admin_api_key),
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CredentialsBackupExport {
@@ -91,6 +129,7 @@ pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
     postgres_store: Arc<PostgresStore>,
     redis_store: Arc<RedisStore>,
+    request_api_key: String,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
     usage_recorder: Arc<UsageRecorder>,
@@ -111,11 +150,13 @@ impl AdminService {
         kiro_provider: Arc<KiroProvider>,
         postgres_store: Arc<PostgresStore>,
         redis_store: Arc<RedisStore>,
+        request_api_key: impl Into<String>,
     ) -> Self {
         Self {
             token_manager,
             postgres_store,
             redis_store,
+            request_api_key: request_api_key.into(),
             known_endpoints: known_endpoints.into_iter().collect(),
             usage_recorder,
             prompt_cache,
@@ -132,6 +173,46 @@ impl AdminService {
                 tracing::warn!("清理 Redis 账号信息缓存失败: {}", err);
             }
         });
+    }
+
+    pub fn get_access_keys(&self, admin_api_key: &str) -> AccessKeysResponse {
+        access_keys_response(&self.request_api_key, admin_api_key)
+    }
+
+    pub fn update_admin_api_key(
+        &self,
+        req: UpdateAdminApiKeyRequest,
+    ) -> Result<AccessKeysResponse, AdminServiceError> {
+        let next_admin_api_key = req.admin_api_key.trim();
+        if next_admin_api_key.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "adminApiKey 不能为空".to_string(),
+            ));
+        }
+        if next_admin_api_key.len() < 8 {
+            return Err(AdminServiceError::InvalidCredential(
+                "adminApiKey 至少需要 8 个字符".to_string(),
+            ));
+        }
+
+        let next_admin_api_key = next_admin_api_key.to_string();
+        self.token_manager
+            .update_runtime_config(|config| {
+                config.admin_api_key = Some(next_admin_api_key.clone());
+            })
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        self.audit(
+            "update_admin_api_key",
+            "security_keys",
+            Some("adminApiKey".to_string()),
+            true,
+            None,
+            json!({
+                "maskedAdminApiKey": mask_secret(&next_admin_api_key),
+            }),
+        );
+
+        Ok(self.get_access_keys(&next_admin_api_key))
     }
 
     fn credential_lookup(&self) -> HashMap<u64, CredentialStatusItem> {
@@ -182,6 +263,7 @@ impl AdminService {
             client_id: req.client_id,
             client_secret: req.client_secret,
             priority: req.priority,
+            max_concurrent_requests: req.max_concurrent_requests,
             region: req.region,
             auth_region: req.auth_region,
             api_region: req.api_region,
@@ -388,6 +470,7 @@ impl AdminService {
                     oldest_in_flight_age_secs: entry.oldest_in_flight_age_secs,
                     newest_in_flight_idle_secs: entry.newest_in_flight_idle_secs,
                     max_concurrent_requests: entry.max_concurrent_requests,
+                    max_concurrent_requests_override: entry.max_concurrent_requests_override,
                     in_flight_lease_max_secs: entry.in_flight_lease_max_secs,
                     warmup_remaining: entry.warmup_remaining,
                     transient_failure_streak: entry.transient_failure_streak,
@@ -470,6 +553,26 @@ impl AdminService {
             true,
             None,
             json!({ "priority": priority }),
+        );
+        Ok(())
+    }
+
+    /// 设置凭据级最大并发覆盖
+    pub fn set_credential_concurrency(
+        &self,
+        id: u64,
+        req: SetCredentialConcurrencyRequest,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_credential_max_concurrent_requests(id, req.max_concurrent_requests)
+            .map_err(|e| self.classify_error(e, id))?;
+        self.audit(
+            "set_credential_concurrency",
+            "credential",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({ "maxConcurrentRequests": req.max_concurrent_requests }),
         );
         Ok(())
     }
@@ -938,6 +1041,7 @@ impl AdminService {
             client_id: req.client_id,
             client_secret: req.client_secret,
             priority: req.priority,
+            max_concurrent_requests: req.max_concurrent_requests,
             region: req.region,
             auth_region: req.auth_region,
             api_region: req.api_region,

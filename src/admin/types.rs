@@ -164,8 +164,11 @@ pub struct CredentialStatusItem {
     pub oldest_in_flight_age_secs: u64,
     /// 最近活跃并发占用距离现在的秒数。
     pub newest_in_flight_idle_secs: u64,
-    /// 单凭据最大并发请求数。0 表示不限制。
+    /// 当前生效的单凭据最大并发请求数。0 表示不限制。
     pub max_concurrent_requests: u32,
+    /// 凭据级最大并发覆盖值。None 表示继承全局；Some(0) 表示该账号不限并发。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_requests_override: Option<u32>,
     /// 并发占用自动回收阈值。0 表示关闭。
     pub in_flight_lease_max_secs: u64,
     /// 预热剩余请求数。
@@ -240,6 +243,15 @@ pub struct SetWarmupRequest {
     pub warmup_remaining: u32,
 }
 
+/// 修改凭据级最大并发请求数覆盖。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialConcurrencyRequest {
+    /// None 表示继承全局；Some(0) 表示该账号不限并发；Some(n) 表示该账号最多 n 并发。
+    #[serde(default)]
+    pub max_concurrent_requests: Option<u32>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClearInFlightRequest {
@@ -268,6 +280,10 @@ pub struct AddCredentialRequest {
     /// 优先级（可选，默认 0）
     #[serde(default)]
     pub priority: u32,
+
+    /// 凭据级最大并发覆盖。None 表示继承全局，0 表示该账号不限并发。
+    #[serde(default)]
+    pub max_concurrent_requests: Option<u32>,
 
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
@@ -552,6 +568,25 @@ pub struct LoadBalancingModeResponse {
 pub struct SetLoadBalancingModeRequest {
     /// 模式（"priority"、"balanced" 或 "health_balanced"）
     pub mode: String,
+}
+
+// ============ 访问密钥 ============
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccessKeysResponse {
+    /// 下游客户端调用 /v1/messages 等接口时使用的请求 Key。
+    pub request_api_key: String,
+    pub masked_request_api_key: String,
+    /// 管理后台登录和 /api/admin 认证使用的 Key。
+    pub admin_api_key: String,
+    pub masked_admin_api_key: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateAdminApiKeyRequest {
+    pub admin_api_key: String,
 }
 
 // ============ 运行时全局配置 ============

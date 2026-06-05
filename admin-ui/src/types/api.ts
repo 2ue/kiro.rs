@@ -66,6 +66,7 @@ export interface CredentialStatusItem {
   oldestInFlightAgeSecs: number
   newestInFlightIdleSecs: number
   maxConcurrentRequests: number
+  maxConcurrentRequestsOverride?: number
   inFlightLeaseMaxSecs: number
   warmupRemaining: number
   transientFailureStreak?: number
@@ -210,6 +211,10 @@ export interface SetWarmupRequest {
   warmupRemaining: number
 }
 
+export interface SetCredentialConcurrencyRequest {
+  maxConcurrentRequests?: number | null
+}
+
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken?: string
@@ -218,6 +223,7 @@ export interface AddCredentialRequest {
   clientSecret?: string
   email?: string
   priority?: number
+  maxConcurrentRequests?: number | null
   authRegion?: string
   apiRegion?: string
   machineId?: string
@@ -556,6 +562,17 @@ export interface RuntimeConfig {
 }
 
 export type UpdateRuntimeConfigRequest = RuntimeConfig
+
+export interface AccessKeysResponse {
+  requestApiKey: string
+  maskedRequestApiKey: string
+  adminApiKey: string
+  maskedAdminApiKey: string
+}
+
+export interface UpdateAdminApiKeyRequest {
+  adminApiKey: string
+}
 
 export type LoadBalancingMode = 'priority' | 'balanced' | 'health_balanced'
 

@@ -1,7 +1,7 @@
 import { Command, KeyRound, Sparkles } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Alert, Button, Card, Form, Input, Join } from 'react-daisyui'
-import { storage } from '@/lib/storage'
+import { ADMIN_API_KEY_FIELD, storage } from '@/lib/storage'
 import { validateAdminApiKey } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 
@@ -12,7 +12,7 @@ const features = [
 ]
 
 export function LoginPage({ initialError = '', onLogin }: { initialError?: string; onLogin: () => void }) {
-  const [apiKey, setApiKey] = useState(storage.getApiKey() || '')
+  const [adminApiKey, setAdminApiKey] = useState(storage.getApiKey() || '')
   const [error, setError] = useState(initialError)
   const [submitting, setSubmitting] = useState(false)
 
@@ -22,9 +22,9 @@ export function LoginPage({ initialError = '', onLogin }: { initialError?: strin
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault()
-    const trimmed = apiKey.trim()
+    const trimmed = adminApiKey.trim()
     if (!trimmed) {
-      setError('请输入后台 API Key')
+      setError(`请输入管理后台 Key（${ADMIN_API_KEY_FIELD}）`)
       return
     }
     setSubmitting(true)
@@ -100,13 +100,15 @@ export function LoginPage({ initialError = '', onLogin }: { initialError?: strin
             <div className="mb-8">
               <h2 className="text-2xl font-bold tracking-tight">欢迎回来</h2>
               <p className="mt-2 text-sm text-base-content/60">
-                输入管理员 API Key 进入控制台
+                输入启动配置里的管理后台 Key（{ADMIN_API_KEY_FIELD}）进入控制台
               </p>
             </div>
 
             <Form className="space-y-5" onSubmit={handleSubmit}>
               <div className="space-y-2">
-                <label className="text-sm font-medium text-base-content/70">API Key</label>
+                <label className="text-sm font-medium text-base-content/70">
+                  管理后台 Key（{ADMIN_API_KEY_FIELD}）
+                </label>
                 <Join className="w-full">
                   <Button
                     type="button"
@@ -118,14 +120,17 @@ export function LoginPage({ initialError = '', onLogin }: { initialError?: strin
                     bordered
                     type="password"
                     className="join-item w-full"
-                    value={apiKey}
+                    value={adminApiKey}
                     onChange={(event) => {
-                      setApiKey(event.target.value)
+                      setAdminApiKey(event.target.value)
                       setError('')
                     }}
                     placeholder="sk-admin-..."
                   />
                 </Join>
+                <p className="text-xs leading-5 text-base-content/50">
+                  对应配置字段 <span className="font-mono">{ADMIN_API_KEY_FIELD}</span>，请求时作为 <span className="font-mono">x-api-key</span> 发送；它不是 Kiro 凭据的 API Key。
+                </p>
               </div>
 
               {error && (
@@ -138,7 +143,7 @@ export function LoginPage({ initialError = '', onLogin }: { initialError?: strin
                 type="submit"
                 color="primary"
                 className="w-full"
-                disabled={submitting || !apiKey.trim()}
+                disabled={submitting || !adminApiKey.trim()}
               >
                 {submitting ? '验证中...' : '进入控制台'}
               </Button>

@@ -77,6 +77,13 @@ struct ApiCallResponse {
     started_at: Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialAuthFailureDecision {
+    ForceRefreshRetry,
+    Retry { excluded_current: bool },
+    Exhausted,
+}
+
 /// 非流式调用完成上报器。
 ///
 /// 非流式响应头返回后，body 读取和事件解析仍可能失败或被取消。
@@ -391,6 +398,13 @@ mod tests {
         assert_eq!(
             KiroProvider::detect_risk_control_error(
                 reqwest::StatusCode::FORBIDDEN,
+                r#"{"message":"Your User ID temporarily is suspended. We've locked your account as a security precaution.","reason":null}"#
+            ),
+            Some(CredentialRiskControlReason::TemporarilySuspended)
+        );
+        assert_eq!(
+            KiroProvider::detect_risk_control_error(
+                reqwest::StatusCode::FORBIDDEN,
                 r#"{"__type":"AccountSuspendedException","message":"Account suspended"}"#
             ),
             Some(CredentialRiskControlReason::AccountSuspended)
@@ -405,7 +419,21 @@ mod tests {
         assert_eq!(
             KiroProvider::detect_risk_control_error(
                 reqwest::StatusCode::FORBIDDEN,
+                r#"{"message":"We've locked your account as a security precaution."}"#
+            ),
+            Some(CredentialRiskControlReason::AccountLocked)
+        );
+        assert_eq!(
+            KiroProvider::detect_risk_control_error(
+                reqwest::StatusCode::FORBIDDEN,
                 r#"{"message":"The bearer token included in the request is invalid"}"#
+            ),
+            None
+        );
+        assert_eq!(
+            KiroProvider::detect_risk_control_error(
+                reqwest::StatusCode::FORBIDDEN,
+                r#"{"message":"User is not authorized to make this call.","reason":null}"#
             ),
             None
         );
@@ -790,6 +818,82 @@ impl KiroProvider {
         }
     }
 
+    async fn handle_credential_auth_failure(
+        &self,
+        call_scope: &str,
+        status: reqwest::StatusCode,
+        body: &str,
+        ctx: &CallContext,
+        endpoint: &dyn KiroEndpoint,
+        credential_label: &str,
+        model: Option<&str>,
+        session_id: Option<&str>,
+        excluded_ids: &mut HashSet<u64>,
+        force_refreshed: &mut HashSet<u64>,
+    ) -> anyhow::Result<CredentialAuthFailureDecision> {
+        self.token_manager.report_transient_failure_kind(
+            ctx.id,
+            model,
+            TransientFailureKind::Auth,
+            None,
+            format!("auth_error {} {}", status, body),
+        )?;
+
+        // token 被上游失效时，先给当前凭据一次强制刷新机会；这类问题不应直接禁用账号。
+        if endpoint.is_bearer_token_invalid(body) && !force_refreshed.contains(&ctx.id) {
+            force_refreshed.insert(ctx.id);
+            tracing::info!(
+                credential_id = ctx.id,
+                credential_label = %credential_label,
+                call_scope,
+                "凭据 token 疑似被上游失效，尝试强制刷新"
+            );
+            if self
+                .token_manager
+                .force_refresh_token_for(ctx.id)
+                .await
+                .is_ok()
+            {
+                tracing::info!(
+                    credential_id = ctx.id,
+                    credential_label = %credential_label,
+                    call_scope,
+                    "凭据 token 强制刷新成功，重试请求"
+                );
+                return Ok(CredentialAuthFailureDecision::ForceRefreshRetry);
+            }
+            tracing::warn!(
+                credential_id = ctx.id,
+                credential_label = %credential_label,
+                call_scope,
+                "凭据 token 强制刷新失败，计入失败"
+            );
+        }
+
+        let has_available = self.token_manager.report_failure(ctx.id);
+        if let Some(session_id) = session_id {
+            self.token_manager
+                .unbind_session_if_bound_to(session_id, ctx.id);
+        }
+
+        if !has_available {
+            return Ok(CredentialAuthFailureDecision::Exhausted);
+        }
+
+        let excluded_current =
+            if self
+                .token_manager
+                .has_alternate_usable_credential(model, excluded_ids, ctx.id)
+            {
+                excluded_ids.insert(ctx.id);
+                true
+            } else {
+                false
+            };
+
+        Ok(CredentialAuthFailureDecision::Retry { excluded_current })
+    }
+
     fn finish_attempt(&self, ctx: &mut CallContext) {
         ctx.release_in_flight();
     }
@@ -1072,10 +1176,15 @@ impl KiroProvider {
             Self::max_retry_attempts(total_credentials, &self.token_manager.runtime_config());
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
+        let mut excluded_ids: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let mut ctx = match self.token_manager.acquire_context(None).await {
+            let mut ctx = match self
+                .token_manager
+                .acquire_context_for_session(None, None, &excluded_ids)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -1308,59 +1417,31 @@ impl KiroProvider {
                     status,
                     body
                 );
-                if let Err(err) = self.token_manager.report_transient_failure_kind(
-                    ctx.id,
-                    None,
-                    TransientFailureKind::Auth,
-                    None,
-                    format!("auth_error {} {}", status, body),
-                ) {
-                    self.finish_attempt(&mut ctx);
-                    anyhow::bail!(
-                        "MCP 请求失败（{}，调度状态写入失败）: {}",
-                        credential_context,
-                        err
-                    );
-                }
-                // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
-                if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
-                    force_refreshed.insert(ctx.id);
-                    tracing::info!(
-                        credential_id = ctx.id,
-                        credential_label = %credential_label,
-                        "MCP 凭据 token 疑似被上游失效，尝试强制刷新"
-                    );
-                    if self
-                        .token_manager
-                        .force_refresh_token_for(ctx.id)
-                        .await
-                        .is_ok()
-                    {
-                        tracing::info!(
-                            credential_id = ctx.id,
-                            credential_label = %credential_label,
-                            "MCP 凭据 token 强制刷新成功，重试请求"
-                        );
-                        self.finish_attempt(&mut ctx);
-                        continue;
-                    }
-                    tracing::warn!(
-                        credential_id = ctx.id,
-                        credential_label = %credential_label,
-                        "MCP 凭据 token 强制刷新失败，计入失败"
-                    );
-                }
-
-                let has_available = self.token_manager.report_failure(ctx.id);
-                if !has_available {
-                    self.finish_attempt(&mut ctx);
-                    anyhow::bail!(
-                        "MCP 请求失败（{}，所有凭据已用尽）: {} {}",
-                        credential_context,
+                let decision = match self
+                    .handle_credential_auth_failure(
+                        "MCP",
                         status,
-                        body
-                    );
-                }
+                        &body,
+                        &ctx,
+                        endpoint.as_ref(),
+                        &credential_label,
+                        None,
+                        None,
+                        &mut excluded_ids,
+                        &mut force_refreshed,
+                    )
+                    .await
+                {
+                    Ok(decision) => decision,
+                    Err(err) => {
+                        self.finish_attempt(&mut ctx);
+                        anyhow::bail!(
+                            "MCP 请求失败（{}，调度状态写入失败）: {}",
+                            credential_context,
+                            err
+                        );
+                    }
+                };
                 last_error = Some(anyhow::anyhow!(
                     "MCP 请求失败（{}）: {} {}",
                     credential_context,
@@ -1368,6 +1449,14 @@ impl KiroProvider {
                     body
                 ));
                 self.finish_attempt(&mut ctx);
+                if matches!(decision, CredentialAuthFailureDecision::Exhausted) {
+                    anyhow::bail!(
+                        "MCP 请求失败（{}，所有凭据已用尽）: {} {}",
+                        credential_context,
+                        status,
+                        body
+                    );
+                }
                 continue;
             }
 
@@ -2046,52 +2135,26 @@ impl KiroProvider {
                     status,
                     body
                 );
-                if let Err(err) = self.token_manager.report_transient_failure_kind(
-                    ctx.id,
-                    model.as_deref(),
-                    TransientFailureKind::Auth,
-                    None,
-                    format!("auth_error {} {}", status, body),
-                ) {
-                    let final_message = format!(
-                        "{} API 请求失败（{}，调度状态写入失败）: {}",
-                        api_type, credential_context, err
-                    );
-                    Self::push_attempt(
-                        &mut attempts,
-                        attempt,
-                        ctx.id,
+                let decision = match self
+                    .handle_credential_auth_failure(
+                        api_type,
+                        status,
+                        &body,
+                        &ctx,
+                        endpoint.as_ref(),
                         &credential_label,
-                        Some(status),
-                        "fail",
-                        Some("scheduler_state_error"),
-                        Some(final_message.clone()),
-                        attempt_started_at,
                         model.as_deref(),
-                    );
-                    Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
-                    self.finish_attempt(&mut ctx);
-                    return Err(Self::traced_error(final_message, &attempts));
-                }
-
-                // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
-                if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
-                    force_refreshed.insert(ctx.id);
-                    tracing::info!(
-                        credential_id = ctx.id,
-                        credential_label = %credential_label,
-                        "凭据 token 疑似被上游失效，尝试强制刷新"
-                    );
-                    if self
-                        .token_manager
-                        .force_refresh_token_for(ctx.id)
-                        .await
-                        .is_ok()
-                    {
-                        tracing::info!(
-                            credential_id = ctx.id,
-                            credential_label = %credential_label,
-                            "凭据 token 强制刷新成功，重试请求"
+                        conversation_id.as_deref(),
+                        &mut excluded_ids,
+                        &mut force_refreshed,
+                    )
+                    .await
+                {
+                    Ok(decision) => decision,
+                    Err(err) => {
+                        let final_message = format!(
+                            "{} API 请求失败（{}，调度状态写入失败）: {}",
+                            api_type, credential_context, err
                         );
                         Self::push_attempt(
                             &mut attempts,
@@ -2099,30 +2162,36 @@ impl KiroProvider {
                             ctx.id,
                             &credential_label,
                             Some(status),
-                            "force_refresh_and_retry",
-                            Some("auth_error"),
-                            Some(message.clone()),
+                            "fail",
+                            Some("scheduler_state_error"),
+                            Some(final_message.clone()),
                             attempt_started_at,
                             model.as_deref(),
                         );
+                        Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
                         self.finish_attempt(&mut ctx);
-                        continue;
+                        return Err(Self::traced_error(final_message, &attempts));
                     }
-                    tracing::warn!(
-                        credential_id = ctx.id,
-                        credential_label = %credential_label,
-                        "凭据 token 强制刷新失败，计入失败"
+                };
+
+                if matches!(decision, CredentialAuthFailureDecision::ForceRefreshRetry) {
+                    Self::push_attempt(
+                        &mut attempts,
+                        attempt,
+                        ctx.id,
+                        &credential_label,
+                        Some(status),
+                        "force_refresh_and_retry",
+                        Some("auth_error"),
+                        Some(message.clone()),
+                        attempt_started_at,
+                        model.as_deref(),
                     );
+                    self.finish_attempt(&mut ctx);
+                    continue;
                 }
 
-                let has_available = self.token_manager.report_failure(ctx.id);
-                if !has_available {
-                    if let Some(session_id) = conversation_id.as_deref() {
-                        self.token_manager
-                            .unbind_session_if_bound_to(session_id, ctx.id);
-                    }
-                }
-                if !has_available {
+                if matches!(decision, CredentialAuthFailureDecision::Exhausted) {
                     let final_message = format!(
                         "{} API 请求失败（{}，所有凭据已用尽）: {} {}",
                         api_type, credential_context, status, body
@@ -2144,13 +2213,24 @@ impl KiroProvider {
                     return Err(Self::traced_error(final_message, &attempts));
                 }
 
+                let action = match decision {
+                    CredentialAuthFailureDecision::Retry {
+                        excluded_current: true,
+                    } => "failure_count_exclude_and_retry",
+                    CredentialAuthFailureDecision::Retry {
+                        excluded_current: false,
+                    } => "failure_count_and_retry",
+                    CredentialAuthFailureDecision::ForceRefreshRetry
+                    | CredentialAuthFailureDecision::Exhausted => unreachable!(),
+                };
+
                 Self::push_attempt(
                     &mut attempts,
                     attempt,
                     ctx.id,
                     &credential_label,
                     Some(status),
-                    "failure_count_and_retry",
+                    action,
                     Some("credential_failure"),
                     Some(message.clone()),
                     attempt_started_at,
@@ -2424,6 +2504,8 @@ impl KiroProvider {
         if body.contains("TEMPORARILY_SUSPENDED")
             || lower.contains("temporarily suspended")
             || lower.contains("temporary suspended")
+            || lower.contains("temporarily is suspended")
+            || lower.contains("is temporarily suspended")
         {
             return Some(CredentialRiskControlReason::TemporarilySuspended);
         }
@@ -2434,6 +2516,7 @@ impl KiroProvider {
             || lower.contains("account suspended")
             || lower.contains("permanently suspended")
             || lower.contains("user is suspended")
+            || lower.contains("user id is suspended")
         {
             return Some(CredentialRiskControlReason::AccountSuspended);
         }
@@ -2441,6 +2524,7 @@ impl KiroProvider {
         if lower.contains("account locked")
             || lower.contains("user locked")
             || lower.contains("locked account")
+            || lower.contains("locked your account")
         {
             return Some(CredentialRiskControlReason::AccountLocked);
         }

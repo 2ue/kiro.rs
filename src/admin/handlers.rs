@@ -14,10 +14,11 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, AdminErrorResponse, ClearInFlightRequest, CreateProxyResourceRequest,
-        ExportCredentialsQuery, RefreshCredentialInfoRequest, SetCredentialProxyRequest,
-        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SetWarmupRequest,
-        SuccessResponse, TestCredentialRequest, UpdateProxyResourceRequest,
-        UpdateRuntimeConfigRequest, UpsertManualModelRequest, ValidateExistingCredentialsRequest,
+        ExportCredentialsQuery, RefreshCredentialInfoRequest, SetCredentialConcurrencyRequest,
+        SetCredentialProxyRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
+        SetPriorityRequest, SetWarmupRequest, SuccessResponse, TestCredentialRequest,
+        UpdateAdminApiKeyRequest, UpdateProxyResourceRequest, UpdateRuntimeConfigRequest,
+        UpsertManualModelRequest, ValidateExistingCredentialsRequest,
         ValidateExternalCredentialsRequest,
     },
 };
@@ -208,6 +209,19 @@ pub async fn set_credential_priority(
             id, payload.priority
         )))
         .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/concurrency
+/// 设置凭据级最大并发覆盖
+pub async fn set_credential_concurrency(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetCredentialConcurrencyRequest>,
+) -> impl IntoResponse {
+    match state.service.set_credential_concurrency(id, payload) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 并发限制已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -450,6 +464,31 @@ pub async fn set_load_balancing_mode(
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
         Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/security/keys
+/// 获取页面可复制的请求 Key 和当前后台登录 Key。
+pub async fn get_access_keys(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(
+        state
+            .service
+            .get_access_keys(&state.current_admin_api_key()),
+    )
+}
+
+/// PUT /api/admin/security/admin-key
+/// 修改后台登录 Key。成功后当前进程的 Admin API 认证立即切到新 Key。
+pub async fn update_admin_api_key(
+    State(state): State<AdminState>,
+    Json(payload): Json<UpdateAdminApiKeyRequest>,
+) -> impl IntoResponse {
+    match state.service.update_admin_api_key(payload) {
+        Ok(response) => {
+            state.set_admin_api_key(response.admin_api_key.clone());
+            Json(response).into_response()
+        }
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

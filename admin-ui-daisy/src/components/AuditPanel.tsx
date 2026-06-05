@@ -12,6 +12,7 @@ function actionLabel(action: string): string {
     delete_credential: '删除凭据',
     set_credential_disabled: '设置启用状态',
     set_credential_priority: '设置优先级',
+    set_credential_concurrency: '设置账号并发',
     reset_credential: '重置凭据',
     force_refresh_token: '强制刷新 Token',
     set_credential_warmup: '设置预热次数',

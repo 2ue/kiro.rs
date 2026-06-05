@@ -54,7 +54,7 @@ export default function App() {
     const handleAuthFailed = () => {
       storage.removeApiKey()
       queryClient.clear()
-      setAuthError('登录已失效，请重新输入后台 API Key')
+      setAuthError('登录已失效，请重新输入管理后台 Key（adminApiKey）')
       setLoggedIn(false)
     }
 

@@ -13,8 +13,8 @@ function isAdminAuthFailure(status?: number) {
 }
 
 api.interceptors.request.use((config) => {
-  const apiKey = storage.getApiKey()
-  if (apiKey) config.headers['x-api-key'] = apiKey
+  const adminApiKey = storage.getApiKey()
+  if (adminApiKey) config.headers['x-api-key'] = adminApiKey
   return config
 })
 
@@ -28,10 +28,10 @@ api.interceptors.response.use(
   }
 )
 
-export async function validateAdminApiKey(apiKey: string): Promise<void> {
+export async function validateAdminApiKey(adminApiKey: string): Promise<void> {
   await axios.get('/api/admin/config/load-balancing', {
     headers: {
-      'x-api-key': apiKey,
+      'x-api-key': adminApiKey,
     },
   })
 }

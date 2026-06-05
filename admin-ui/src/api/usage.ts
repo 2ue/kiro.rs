@@ -27,9 +27,9 @@ function isAdminAuthFailure(status?: number) {
 }
 
 api.interceptors.request.use((config) => {
-  const apiKey = storage.getApiKey()
-  if (apiKey) {
-    config.headers['x-api-key'] = apiKey
+  const adminApiKey = storage.getApiKey()
+  if (adminApiKey) {
+    config.headers['x-api-key'] = adminApiKey
   }
   return config
 })

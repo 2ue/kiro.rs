@@ -1,4 +1,4 @@
-import { BadgeInfo, Gauge, Save, Shield, Sparkles, Trash2, Wand2, Zap } from 'lucide-react'
+import { BadgeInfo, Copy, Eye, EyeOff, Gauge, KeyRound, Save, Shield, Sparkles, Trash2, Wand2, Zap } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { Alert, Button, Card, Collapse, Input, Join, Loading, Select, Tabs, Toggle } from 'react-daisyui'
@@ -17,8 +17,11 @@ import {
   toWhole,
 } from '@/lib/runtime-config-defaults'
 import { extractErrorMessage } from '@/lib/utils'
+import { getAccessKeys, updateAdminApiKey } from '@/api/credentials'
 import { useRuntimeConfig, useUpdateRuntimeConfig } from '@/hooks/use-credentials'
+import { storage } from '@/lib/storage'
 import type {
+  AccessKeysResponse,
   CompatProfile,
   ReportedUsageFieldMode,
   ReportedUsageFieldPolicy,
@@ -44,6 +47,7 @@ function NumberField({
   title,
   description,
   value,
+  disabled,
   min,
   max,
   step,
@@ -53,6 +57,7 @@ function NumberField({
   title: string
   description: string
   value: number
+  disabled?: boolean
   min?: number
   max?: number
   step?: number
@@ -72,6 +77,7 @@ function NumberField({
           max={max}
           step={step}
           inputMode={step ? 'decimal' : 'numeric'}
+          disabled={disabled}
           onChange={(event) => onChange(numberValue(event.target.value, min ?? 0))}
         />
         <span className="join-item unit-addon min-w-20">{suffix}</span>
@@ -130,6 +136,215 @@ function ConfigGroup({
         <div className="grid gap-3 border-t border-base-300/70 pt-3 md:grid-cols-2">{children}</div>
       </Collapse.Content>
     </Collapse>
+  )
+}
+
+function ImpactGroupHeader({
+  label,
+  title,
+  description,
+  muted = false,
+}: {
+  label: string
+  title: string
+  description: string
+  muted?: boolean
+}) {
+  return (
+    <div className={`rounded-box border px-3 py-2.5 md:col-span-2 ${muted ? 'bg-base-200/70 text-base-content/55' : 'bg-base-100'}`}>
+      <div className="mb-1 flex flex-wrap items-center gap-2">
+        <span className="rounded border border-base-300 bg-base-200 px-2 py-0.5 text-[0.68rem] font-semibold text-base-content/60">
+          {label}
+        </span>
+        <span className="text-sm font-semibold">{title}</span>
+      </div>
+      <p className="text-xs leading-5 text-base-content/60">{description}</p>
+    </div>
+  )
+}
+
+function AccessKeysPanel() {
+  const [keys, setKeys] = useState<AccessKeysResponse | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [showRequestKey, setShowRequestKey] = useState(false)
+  const [showAdminKey, setShowAdminKey] = useState(false)
+  const [nextAdminApiKey, setNextAdminApiKey] = useState('')
+
+  const loadKeys = async () => {
+    setLoading(true)
+    try {
+      setKeys(await getAccessKeys())
+    } catch (error) {
+      toast.error(`读取访问密钥失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    void loadKeys()
+  }, [])
+
+  const copy = async (label: string, value?: string) => {
+    if (!value) {
+      toast.error(`${label} 为空，无法复制`)
+      return
+    }
+    try {
+      await navigator.clipboard.writeText(value)
+      toast.success(`${label} 已复制`)
+    } catch (error) {
+      toast.error(`复制 ${label} 失败: ${extractErrorMessage(error)}`)
+    }
+  }
+
+  const saveAdminApiKey = async () => {
+    const adminApiKey = nextAdminApiKey.trim()
+    if (!adminApiKey) {
+      toast.error('请输入新的登录 Key（adminApiKey）')
+      return
+    }
+    if (adminApiKey.length < 8) {
+      toast.error('登录 Key 至少需要 8 个字符')
+      return
+    }
+    setSaving(true)
+    try {
+      const response = await updateAdminApiKey({ adminApiKey })
+      storage.setApiKey(response.adminApiKey)
+      window.dispatchEvent(new CustomEvent('kiro-admin-key-updated'))
+      setKeys(response)
+      setNextAdminApiKey('')
+      toast.success('登录 Key 已更新，后续后台请求会使用新 Key')
+    } catch (error) {
+      toast.error(`更新登录 Key 失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const requestApiKeyValue = showRequestKey ? keys?.requestApiKey : keys?.maskedRequestApiKey
+  const adminApiKeyValue = showAdminKey ? keys?.adminApiKey : keys?.maskedAdminApiKey
+
+  return (
+    <ConfigGroup
+      icon={<KeyRound className="h-4 w-4" />}
+      title="接入与登录 Key"
+      description="请求 Key 给客户端调用模型接口使用；登录 Key 就是打开管理后台时输入的密码，可在登录后直接修改。"
+    >
+      <div className="rounded-box border border-base-300 bg-base-100 p-3">
+        <div className="mb-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="text-sm font-semibold">请求调用 Key</div>
+            <span className="rounded border border-base-300 bg-base-200 px-2 py-0.5 text-[0.68rem] font-semibold text-base-content/60">
+              apiKey
+            </span>
+            <span className="rounded border border-success/25 bg-success/10 px-2 py-0.5 text-[0.68rem] font-semibold text-success">
+              给客户端用
+            </span>
+          </div>
+          <div className="mt-1 text-xs leading-4 text-base-content/60">
+            用于调用 /v1/messages、/cc/v1/messages 等模型接口，可复制到 x-api-key 或 Authorization: Bearer。
+          </div>
+        </div>
+
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <Input
+            bordered
+            readOnly
+            size="sm"
+            aria-label="请求调用 Key"
+            className="min-w-0 font-mono text-xs"
+            value={loading ? '加载中...' : requestApiKeyValue || '未配置'}
+          />
+          <div className="flex gap-2 sm:shrink-0">
+            <Button
+              type="button"
+              size="sm"
+              className="flex-1 sm:flex-none"
+              onClick={() => setShowRequestKey((value) => !value)}
+              title={showRequestKey ? '隐藏请求 Key' : '显示完整请求 Key'}
+            >
+              {showRequestKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+              {showRequestKey ? '隐藏' : '显示'}
+            </Button>
+            <Button type="button" size="sm" className="flex-1 sm:flex-none" onClick={() => copy('请求 Key', keys?.requestApiKey)}>
+              <Copy className="h-4 w-4" />
+              复制请求 Key
+            </Button>
+          </div>
+        </div>
+      </div>
+
+      <div className="rounded-box border border-base-300 bg-base-100 p-3">
+        <div className="mb-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="text-sm font-semibold">后台登录 Key</div>
+            <span className="rounded border border-base-300 bg-base-200 px-2 py-0.5 text-[0.68rem] font-semibold text-base-content/60">
+              adminApiKey
+            </span>
+            <span className="rounded border border-info/25 bg-info/10 px-2 py-0.5 text-[0.68rem] font-semibold text-info">
+              登录密码
+            </span>
+          </div>
+          <div className="mt-1 text-xs leading-4 text-base-content/60">
+            这是登录页输入的密码，也用于所有 /api/admin 后台接口。修改成功后，当前浏览器会自动切换到新 Key。
+          </div>
+        </div>
+
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <Input
+            bordered
+            readOnly
+            size="sm"
+            aria-label="当前后台登录 Key"
+            className="min-w-0 font-mono text-xs"
+            value={loading ? '加载中...' : adminApiKeyValue || '未配置'}
+          />
+          <div className="flex gap-2 sm:shrink-0">
+            <Button
+              type="button"
+              size="sm"
+              className="flex-1 sm:flex-none"
+              onClick={() => setShowAdminKey((value) => !value)}
+              title={showAdminKey ? '隐藏登录 Key' : '显示完整登录 Key'}
+            >
+              {showAdminKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+              {showAdminKey ? '隐藏' : '显示'}
+            </Button>
+            <Button type="button" size="sm" className="flex-1 sm:flex-none" onClick={() => copy('登录 Key', keys?.adminApiKey)}>
+              <Copy className="h-4 w-4" />
+              复制登录 Key
+            </Button>
+          </div>
+        </div>
+
+        <div className="mt-4 border-t border-base-300 pt-3">
+          <div className="mb-2">
+            <div className="text-sm font-semibold">修改登录 Key</div>
+            <div className="mt-1 text-xs leading-4 text-base-content/60">
+              保存后旧登录 Key 立即失效；当前页面会自动写入新 Key，不需要重新登录。
+            </div>
+          </div>
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <Input
+              bordered
+              type="password"
+              size="sm"
+              className="min-w-0"
+              value={nextAdminApiKey}
+              placeholder="输入新的登录 Key（至少 8 个字符）"
+              disabled={saving}
+              onChange={(event) => setNextAdminApiKey(event.target.value)}
+            />
+            <Button type="button" color="primary" size="sm" className="shrink-0" disabled={saving || !nextAdminApiKey.trim()} onClick={saveAdminApiKey}>
+              {saving ? '保存中...' : '保存登录 Key'}
+            </Button>
+          </div>
+        </div>
+      </div>
+    </ConfigGroup>
   )
 }
 
@@ -401,6 +616,9 @@ export function ConfigPanel() {
     })
   }
 
+  const payloadSizeLimitEnabled = draft.payloadGuardEnabled && draft.payloadGuardMaxBytes > 0
+  const payloadShapingBranchEnabled = payloadSizeLimitEnabled && draft.payloadShaping.enabled
+
   if (config.isLoading) return <div className="py-10 text-center text-base-content/60">加载中...</div>
   if (config.error) return <ErrorState text={extractErrorMessage(config.error)} />
 
@@ -410,6 +628,8 @@ export function ConfigPanel() {
       description="这些配置会写入 PgSQL 并对后续新请求热加载生效；监听地址、密钥、数据库连接和代理客户端等启动期配置仍需要改启动配置后重启。"
     >
       <div className="space-y-4">
+        <AccessKeysPanel />
+
         <div className="sticky top-[4.25rem] z-30 flex flex-col gap-2 rounded-box border border-base-300 bg-base-100/95 p-2 shadow-sm backdrop-blur sm:flex-row sm:items-center sm:justify-between">
           <div className="min-w-0 text-xs leading-5 text-base-content/60">
             修改运行时配置后点击保存，新请求会热加载生效。
@@ -479,29 +699,63 @@ export function ConfigPanel() {
               <NumberField title="预热总流量上限" description="已有非预热账号可用时，所有预热账号合计最多承接的真实请求比例。" value={draft.credentialWarmupMaxSelectionPercent} min={0} max={100} suffix="%" onChange={(credentialWarmupMaxSelectionPercent) => setDraft((prev) => ({ ...prev, credentialWarmupMaxSelectionPercent }))} />
             </ConfigGroup>
 
-            <ConfigGroup icon={<Wand2 className="h-4 w-4" />} title="请求压缩" description="控制发往上游前是否压缩请求内容。默认关闭总开关；如需开启，建议只使用空白压缩。">
+            <ConfigGroup
+              icon={<Wand2 className="h-4 w-4" />}
+              title="请求压缩与 Payload 防护"
+              description="区分每次请求都会执行的全局处理，以及只有超过本地 JSON body 字节阈值后才会触发的条件分支。"
+            >
+              <ImpactGroupHeader
+                label="全局影响"
+                title="每次请求发送上游前都会检查"
+                description="这些配置不等待上游 400，也不依赖超预算判断。请求压缩开启后每次生效；Payload 防护开启后每次都会做协议修复和 body 字节统计。"
+              />
               <ToggleField title="启用请求压缩" description="控制是否对上游请求做压缩处理。关闭时不会改变请求内容。" checked={draft.compressionEnabled} onChange={(compressionEnabled) => setDraft((prev) => ({ ...prev, compressionEnabled }))} />
               <ToggleField title="仅压缩空白字符" description="控制压缩时是否只处理多余空白。这是当前推荐的低风险压缩方式。" checked={draft.whitespaceCompression} disabled={!draft.compressionEnabled} onChange={(whitespaceCompression) => setDraft((prev) => ({ ...prev, whitespaceCompression }))} />
               <ToggleField title="启用 Kiro Payload 防护" description="发送上游前按真实 JSON 字节数检查请求，并修复空 toolUses、孤立 tool_result 等 Kiro 容易拒绝的形态。" checked={draft.payloadGuardEnabled} onChange={(payloadGuardEnabled) => setDraft((prev) => ({ ...prev, payloadGuardEnabled }))} />
-              <ToggleField title="超限裁剪旧历史" description="请求超过最大字节数时，优先裁剪最旧历史；关闭后只做协议修复，仍超限会标记后透传给 Kiro。" checked={draft.payloadGuardTrimHistory} disabled={!draft.payloadGuardEnabled} onChange={(payloadGuardTrimHistory) => setDraft((prev) => ({ ...prev, payloadGuardTrimHistory }))} />
-              <NumberField title="Kiro Payload 最大字节数" description="按最终发送到 Kiro 的 JSON body 字节数计算。默认 460800 字节；填 0 表示不限制大小，但仍执行 payload 协议修复。" value={draft.payloadGuardMaxBytes} min={0} suffix="bytes" onChange={(payloadGuardMaxBytes) => setDraft((prev) => ({ ...prev, payloadGuardMaxBytes }))} />
-              <ToggleField title="启用 Payload 内容整形" description="只在请求超过本地预算后生效，默认只处理旧历史、历史 thinking、历史 WebFetch 和工具定义描述。" checked={draft.payloadShaping.enabled} disabled={!draft.payloadGuardEnabled} onChange={(enabled) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, enabled } }))} />
-              <ToggleField title="截断历史工具结果" description="只截断历史 tool_result，保留头尾和省略说明；当前合法 tool_result 默认不截断。" checked={draft.payloadShaping.truncateHistoricalToolResults} disabled={!draft.payloadGuardEnabled || !draft.payloadShaping.enabled} onChange={(truncateHistoricalToolResults) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, truncateHistoricalToolResults } }))} />
-              <NumberField title="历史工具结果保留字符" description="单个历史 tool_result 的通用头尾保留预算。WebFetch 会先走专项去噪。" value={draft.payloadShaping.historicalToolResultMaxChars} min={0} suffix="chars" onChange={(historicalToolResultMaxChars) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, historicalToolResultMaxChars } }))} />
-              <ToggleField title="移除历史 thinking" description="只移除旧 assistant 历史里的 thinking 标签内容，不处理当前请求内容。" checked={draft.payloadShaping.discardHistoricalThinking} disabled={!draft.payloadGuardEnabled || !draft.payloadShaping.enabled} onChange={(discardHistoricalThinking) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, discardHistoricalThinking } }))} />
-              <ToggleField title="压缩工具定义描述" description="压缩 tools 的 description 和 JSON Schema 注释，不删除 type、properties、required、enum。" checked={draft.payloadShaping.compressToolDefinitions} disabled={!draft.payloadGuardEnabled || !draft.payloadShaping.enabled} onChange={(compressToolDefinitions) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, compressToolDefinitions } }))} />
-              <NumberField title="工具定义预算" description="当前请求 tools 的 JSON 字节预算，超过后压缩描述和 schema 注释。填 0 表示关闭该预算压缩。" value={draft.payloadShaping.toolDefinitionsBudgetBytes} min={0} suffix="bytes" onChange={(toolDefinitionsBudgetBytes) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, toolDefinitionsBudgetBytes } }))} />
-              <ToggleField title="WebFetch 历史去噪" description="对历史 WebFetch 工具结果移除 data image、重复行和明显噪声。" checked={draft.payloadShaping.webFetchTrimEnabled} disabled={!draft.payloadGuardEnabled || !draft.payloadShaping.enabled} onChange={(webFetchTrimEnabled) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, webFetchTrimEnabled } }))} />
-              <NumberField title="WebFetch 正文预算" description="历史 WebFetch 正文去噪后的字符预算。填 0 表示关闭该项正文裁剪。" value={draft.payloadShaping.webFetchBodyMaxChars} min={0} suffix="chars" onChange={(webFetchBodyMaxChars) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, webFetchBodyMaxChars } }))} />
-              <ToggleField title="自动适配当前内容预算" description="开启后，历史裁剪后仍超出 Kiro Payload 最大字节数时，会按下方预算裁剪当前 tool_result、当前文本、当前 document，并按体积丢弃当前图片；默认关闭。" checked={draft.payloadShaping.fitCurrentPayloadToBudget} disabled={!draft.payloadGuardEnabled || !draft.payloadShaping.enabled} onChange={(fitCurrentPayloadToBudget) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, fitCurrentPayloadToBudget } }))} />
-              <ToggleField title="截断当前工具结果" description="当前合法 tool_result 也可能非常大。开启后仅在历史裁剪后仍超预算时按头尾保留截断；自动适配当前内容预算打开时也会启用。" checked={draft.payloadShaping.truncateCurrentToolResults} disabled={!draft.payloadGuardEnabled || !draft.payloadShaping.enabled} onChange={(truncateCurrentToolResults) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, truncateCurrentToolResults } }))} />
-              <NumberField title="当前工具结果保留字符" description="单个当前 tool_result 的头尾保留预算。开启当前工具结果截断后使用。" value={draft.payloadShaping.currentToolResultMaxChars} min={0} suffix="chars" onChange={(currentToolResultMaxChars) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, currentToolResultMaxChars } }))} />
-              <ToggleField title="截断当前用户文本" description="开启后仅在仍超预算时截断当前 user content；包含 document 标签时会保留文档块结构，并只裁剪文档外侧文本。" checked={draft.payloadShaping.truncateCurrentUserContent} disabled={!draft.payloadGuardEnabled || !draft.payloadShaping.enabled} onChange={(truncateCurrentUserContent) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, truncateCurrentUserContent } }))} />
-              <NumberField title="当前用户文本保留字符" description="当前纯文本 user content 的头尾保留预算。开启当前用户文本截断后使用。" value={draft.payloadShaping.currentUserContentMaxChars} min={0} suffix="chars" onChange={(currentUserContentMaxChars) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, currentUserContentMaxChars } }))} />
-              <ToggleField title="截断当前文档" description="开启后仅在仍超预算时截断当前 <document> 块正文，并保留 document 开闭标签；适合 PDF 文本过大场景。" checked={draft.payloadShaping.truncateCurrentDocuments} disabled={!draft.payloadGuardEnabled || !draft.payloadShaping.enabled} onChange={(truncateCurrentDocuments) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, truncateCurrentDocuments } }))} />
-              <NumberField title="当前文档保留字符" description="单个当前 document 正文的头尾保留预算。开启当前文档截断后使用。" value={draft.payloadShaping.currentDocumentMaxChars} min={0} suffix="chars" onChange={(currentDocumentMaxChars) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, currentDocumentMaxChars } }))} />
-              <ToggleField title="丢弃当前图片" description="图片不会本地重编码压缩。开启后仅在仍超预算时按体积从大到小丢弃，并在文本中追加代理省略说明。" checked={draft.payloadShaping.truncateCurrentImages} disabled={!draft.payloadGuardEnabled || !draft.payloadShaping.enabled} onChange={(truncateCurrentImages) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, truncateCurrentImages } }))} />
-              <NumberField title="当前图片 JSON 预算" description="当前 images 数组允许保留的 JSON 字节数。开启当前图片丢弃后使用。" value={draft.payloadShaping.currentImagesMaxBytes} min={0} suffix="bytes" onChange={(currentImagesMaxBytes) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, currentImagesMaxBytes } }))} />
+              <ImpactGroupHeader
+                label="条件阈值"
+                title="控制后续条件分支是否有机会触发"
+                description="payloadGuardMaxBytes 是本地超预算阈值，不是模型上下文窗口。填 0 表示关闭所有按大小触发的内容整形、历史裁剪和当前内容兜底裁剪，但仍保留上面的每次请求协议修复。"
+              />
+              <NumberField title="Kiro Payload 超预算阈值" description="按最终发送到 Kiro 的 JSON body 字节数计算。默认 460800 bytes；填 0 时下方所有“条件分支”和“兜底分支”配置都不会触发。" value={draft.payloadGuardMaxBytes} min={0} suffix="bytes" onChange={(payloadGuardMaxBytes) => setDraft((prev) => ({ ...prev, payloadGuardMaxBytes }))} />
+              <ImpactGroupHeader
+                label="条件分支"
+                title="仅当请求体超过上方阈值时执行"
+                description={
+                  payloadSizeLimitEnabled
+                    ? '这些配置只有在本地序列化后的 Kiro JSON body 大于 payloadGuardMaxBytes 时才会运行；小请求不会被截断或整形。'
+                    : '当前 payloadGuardMaxBytes 为 0 或 Payload 防护关闭，因此这些按大小触发的历史整形和历史裁剪不会运行。'
+                }
+                muted={!payloadSizeLimitEnabled}
+              />
+              <ToggleField title="超限裁剪旧历史" description="请求超过超预算阈值后，优先裁剪最旧历史；关闭后不会裁 history，仍超限会继续透传给 Kiro。" checked={draft.payloadGuardTrimHistory} disabled={!payloadSizeLimitEnabled} onChange={(payloadGuardTrimHistory) => setDraft((prev) => ({ ...prev, payloadGuardTrimHistory }))} />
+              <ToggleField title="启用 Payload 内容整形" description="只在请求超过超预算阈值后生效，默认只处理旧历史、历史 thinking、历史 WebFetch 和工具定义描述。" checked={draft.payloadShaping.enabled} disabled={!payloadSizeLimitEnabled} onChange={(enabled) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, enabled } }))} />
+              <ToggleField title="截断历史工具结果" description="只截断历史 tool_result，保留头尾和省略说明；当前合法 tool_result 默认不截断。" checked={draft.payloadShaping.truncateHistoricalToolResults} disabled={!payloadShapingBranchEnabled} onChange={(truncateHistoricalToolResults) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, truncateHistoricalToolResults } }))} />
+              <NumberField title="历史工具结果保留字符" description="单个历史 tool_result 的通用头尾保留预算。默认 8000 字符；WebFetch 会先走专项去噪。" value={draft.payloadShaping.historicalToolResultMaxChars} disabled={!payloadShapingBranchEnabled} min={0} suffix="chars" onChange={(historicalToolResultMaxChars) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, historicalToolResultMaxChars } }))} />
+              <ToggleField title="移除历史 thinking" description="只移除旧 assistant 历史里的 thinking 标签内容，不处理当前请求内容。" checked={draft.payloadShaping.discardHistoricalThinking} disabled={!payloadShapingBranchEnabled} onChange={(discardHistoricalThinking) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, discardHistoricalThinking } }))} />
+              <ToggleField title="压缩工具定义描述" description="压缩当前请求 tools 的 description 和 JSON Schema 注释字段，不删除 type、properties、required、enum 等语义字段。" checked={draft.payloadShaping.compressToolDefinitions} disabled={!payloadShapingBranchEnabled} onChange={(compressToolDefinitions) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, compressToolDefinitions } }))} />
+              <NumberField title="工具定义预算" description="当前请求 tools 的 JSON 字节预算。超过后压缩描述和 schema 注释；默认 20000 bytes，填 0 表示关闭该预算压缩。" value={draft.payloadShaping.toolDefinitionsBudgetBytes} disabled={!payloadShapingBranchEnabled} min={0} suffix="bytes" onChange={(toolDefinitionsBudgetBytes) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, toolDefinitionsBudgetBytes } }))} />
+              <ToggleField title="WebFetch 历史去噪" description="对历史 WebFetch 工具结果移除 data image、重复行和明显噪声，默认正文预算 12000 字符。" checked={draft.payloadShaping.webFetchTrimEnabled} disabled={!payloadShapingBranchEnabled} onChange={(webFetchTrimEnabled) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, webFetchTrimEnabled } }))} />
+              <NumberField title="WebFetch 正文预算" description="历史 WebFetch 正文去噪后的字符预算。填 0 表示关闭该项正文裁剪。" value={draft.payloadShaping.webFetchBodyMaxChars} disabled={!payloadShapingBranchEnabled} min={0} suffix="chars" onChange={(webFetchBodyMaxChars) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, webFetchBodyMaxChars } }))} />
+              <ImpactGroupHeader
+                label="兜底分支"
+                title="历史处理后仍超预算时才可能执行"
+                description={
+                  payloadShapingBranchEnabled
+                    ? '这些配置属于最后兜底：只有历史整形和历史裁剪之后，body 仍然大于 payloadGuardMaxBytes 时才会处理当前消息、当前 tool_result、当前 document 或当前图片。'
+                    : '当前超预算条件或 Payload 内容整形未启用，因此这些当前内容兜底配置不会运行。'
+                }
+                muted={!payloadShapingBranchEnabled}
+              />
+              <ToggleField title="自动适配当前内容预算" description="开启后，历史裁剪后仍超出 Kiro Payload 最大字节数时，会按下方预算裁剪当前 tool_result、当前文本、当前 document，并按体积丢弃当前图片；默认关闭。" checked={draft.payloadShaping.fitCurrentPayloadToBudget} disabled={!payloadShapingBranchEnabled} onChange={(fitCurrentPayloadToBudget) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, fitCurrentPayloadToBudget } }))} />
+              <ToggleField title="截断当前工具结果" description="当前合法 tool_result 也可能非常大。开启后仅在历史裁剪后仍超预算时按头尾保留截断；自动适配当前内容预算打开时也会启用。" checked={draft.payloadShaping.truncateCurrentToolResults} disabled={!payloadShapingBranchEnabled} onChange={(truncateCurrentToolResults) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, truncateCurrentToolResults } }))} />
+              <NumberField title="当前工具结果保留字符" description="单个当前 tool_result 的头尾保留预算。开启当前工具结果截断后使用；默认 80000 字符。" value={draft.payloadShaping.currentToolResultMaxChars} disabled={!payloadShapingBranchEnabled} min={0} suffix="chars" onChange={(currentToolResultMaxChars) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, currentToolResultMaxChars } }))} />
+              <ToggleField title="截断当前用户文本" description="开启后仅在仍超预算时截断当前 user content；包含 document 标签时会保留文档块结构，并只裁剪文档外侧文本。" checked={draft.payloadShaping.truncateCurrentUserContent} disabled={!payloadShapingBranchEnabled} onChange={(truncateCurrentUserContent) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, truncateCurrentUserContent } }))} />
+              <NumberField title="当前用户文本保留字符" description="当前纯文本 user content 的头尾保留预算。开启当前用户文本截断后使用；默认 120000 字符。" value={draft.payloadShaping.currentUserContentMaxChars} disabled={!payloadShapingBranchEnabled} min={0} suffix="chars" onChange={(currentUserContentMaxChars) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, currentUserContentMaxChars } }))} />
+              <ToggleField title="截断当前文档" description="开启后仅在仍超预算时截断当前 document 块正文，并保留 document 开闭标签；适合 PDF 文本过大场景。" checked={draft.payloadShaping.truncateCurrentDocuments} disabled={!payloadShapingBranchEnabled} onChange={(truncateCurrentDocuments) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, truncateCurrentDocuments } }))} />
+              <NumberField title="当前文档保留字符" description="单个当前 document 正文的头尾保留预算。开启当前文档截断后使用；默认 80000 字符。" value={draft.payloadShaping.currentDocumentMaxChars} disabled={!payloadShapingBranchEnabled} min={0} suffix="chars" onChange={(currentDocumentMaxChars) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, currentDocumentMaxChars } }))} />
+              <ToggleField title="丢弃当前图片" description="图片不会本地重编码压缩。开启后仅在仍超预算时按体积从大到小丢弃，并在文本中追加代理省略说明，默认关闭。" checked={draft.payloadShaping.truncateCurrentImages} disabled={!payloadShapingBranchEnabled} onChange={(truncateCurrentImages) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, truncateCurrentImages } }))} />
+              <NumberField title="当前图片 JSON 预算" description="当前 images 数组允许保留的 JSON 字节数。开启当前图片丢弃后使用；默认 180000 bytes。" value={draft.payloadShaping.currentImagesMaxBytes} disabled={!payloadShapingBranchEnabled} min={0} suffix="bytes" onChange={(currentImagesMaxBytes) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, currentImagesMaxBytes } }))} />
             </ConfigGroup>
           </>
         )}

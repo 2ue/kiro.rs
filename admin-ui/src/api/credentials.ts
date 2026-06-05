@@ -8,14 +8,17 @@ import type {
   CredentialInfoRefreshResponse,
   SuccessResponse,
   SetDisabledRequest,
+  SetCredentialConcurrencyRequest,
   SetPriorityRequest,
   SetWarmupRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  AccessKeysResponse,
   TestCredentialRequest,
   TestCredentialResponse,
   SetCredentialProxyRequest,
   RuntimeConfig,
+  UpdateAdminApiKeyRequest,
   UpdateRuntimeConfigRequest,
   CredentialExportFormat,
   LoadBalancingMode,
@@ -40,11 +43,11 @@ function isAdminAuthFailure(status?: number) {
   return status === 401 || status === 403
 }
 
-// 请求拦截器添加 API Key
+// 请求拦截器添加管理后台 Key（adminApiKey），后端通过 x-api-key 校验。
 api.interceptors.request.use((config) => {
-  const apiKey = storage.getApiKey()
-  if (apiKey) {
-    config.headers['x-api-key'] = apiKey
+  const adminApiKey = storage.getApiKey()
+  if (adminApiKey) {
+    config.headers['x-api-key'] = adminApiKey
   }
   return config
 })
@@ -59,10 +62,10 @@ api.interceptors.response.use(
   }
 )
 
-export async function validateAdminApiKey(apiKey: string): Promise<void> {
+export async function validateAdminApiKey(adminApiKey: string): Promise<void> {
   await axios.get('/api/admin/config/load-balancing', {
     headers: {
-      'x-api-key': apiKey,
+      'x-api-key': adminApiKey,
     },
   })
 }
@@ -104,6 +107,14 @@ export async function setCredentialPriority(
     `/credentials/${id}/priority`,
     { priority } as SetPriorityRequest
   )
+  return data
+}
+
+export async function setCredentialConcurrency(
+  id: number,
+  req: SetCredentialConcurrencyRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/concurrency`, req)
   return data
 }
 
@@ -260,6 +271,18 @@ export async function updateRuntimeConfig(
   req: UpdateRuntimeConfigRequest
 ): Promise<RuntimeConfig> {
   const { data } = await api.put<RuntimeConfig>('/config/runtime', req)
+  return data
+}
+
+export async function getAccessKeys(): Promise<AccessKeysResponse> {
+  const { data } = await api.get<AccessKeysResponse>('/security/keys')
+  return data
+}
+
+export async function updateAdminApiKey(
+  req: UpdateAdminApiKeyRequest
+): Promise<AccessKeysResponse> {
+  const { data } = await api.put<AccessKeysResponse>('/security/admin-key', req)
   return data
 }
 

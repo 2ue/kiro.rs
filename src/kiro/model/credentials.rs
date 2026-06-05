@@ -59,6 +59,14 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "is_zero")]
     pub priority: u32,
 
+    /// 凭据级最大并发请求数覆盖。
+    ///
+    /// `None` 表示继承全局 `credentialMaxConcurrentRequests`；
+    /// `Some(0)` 表示该凭据不限制并发；
+    /// `Some(n)` 表示该凭据最多同时处理 n 个请求。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_requests: Option<u32>,
+
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     #[serde(skip_serializing_if = "Option::is_none")]

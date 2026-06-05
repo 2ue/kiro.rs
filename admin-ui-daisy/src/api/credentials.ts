@@ -10,7 +10,9 @@ import type {
   CredentialsPageResponse,
   CredentialsStatusResponse,
   CreateProxyResourceRequest,
+  AccessKeysResponse,
   RuntimeConfig,
+  SetCredentialConcurrencyRequest,
   SetDisabledRequest,
   SetCredentialProxyRequest,
   SetPriorityRequest,
@@ -23,6 +25,7 @@ import type {
   CredentialValidationResponse,
   ProxyResource,
   ProxyResourcesResponse,
+  UpdateAdminApiKeyRequest,
   UpdateProxyResourceRequest,
   UpdateRuntimeConfigRequest,
   LoadBalancingMode,
@@ -45,6 +48,11 @@ export async function setCredentialDisabled(id: number, disabled: boolean): Prom
 
 export async function setCredentialPriority(id: number, priority: number): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/priority`, { priority } as SetPriorityRequest)
+  return data
+}
+
+export async function setCredentialConcurrency(id: number, req: SetCredentialConcurrencyRequest): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/concurrency`, req)
   return data
 }
 
@@ -150,6 +158,16 @@ export async function getRuntimeConfig(): Promise<RuntimeConfig> {
 
 export async function updateRuntimeConfig(req: UpdateRuntimeConfigRequest): Promise<RuntimeConfig> {
   const { data } = await api.put<RuntimeConfig>('/config/runtime', req)
+  return data
+}
+
+export async function getAccessKeys(): Promise<AccessKeysResponse> {
+  const { data } = await api.get<AccessKeysResponse>('/security/keys')
+  return data
+}
+
+export async function updateAdminApiKey(req: UpdateAdminApiKeyRequest): Promise<AccessKeysResponse> {
+  const { data } = await api.put<AccessKeysResponse>('/security/admin-key', req)
   return data
 }
 
