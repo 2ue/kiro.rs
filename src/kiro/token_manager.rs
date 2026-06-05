@@ -5568,6 +5568,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    const SONNET_MODEL: &str = "claude-sonnet-4.5";
+
     async fn test_redis_store() -> Option<Arc<RedisStore>> {
         let url = std::env::var("KIRO_RS_TEST_REDIS_URL").ok()?;
         let mut config = Config::default();
@@ -7765,6 +7767,363 @@ mod tests {
             .unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "pro-token");
+    }
+
+    #[tokio::test]
+    async fn test_sonnet_model_can_use_free_credentials() {
+        let mut free = KiroCredentials::default();
+        free.priority = 0;
+        free.subscription_title = Some("Free".to_string());
+        free.access_token = Some("free-token".to_string());
+        free.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let mut pro = KiroCredentials::default();
+        pro.priority = 1;
+        pro.subscription_title = Some("Pro".to_string());
+        pro.access_token = Some("pro-token".to_string());
+        pro.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![free, pro], None, None, false).unwrap();
+
+        let mut ctx = manager.acquire_context(Some(SONNET_MODEL)).await.unwrap();
+        assert_eq!(ctx.id, 1);
+        assert_eq!(ctx.token, "free-token");
+        ctx.release_in_flight();
+    }
+
+    #[tokio::test]
+    async fn test_sonnet_bound_session_falls_back_when_bound_credential_is_full() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.credential_max_concurrent_requests = 1;
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.subscription_title = Some("Free".to_string());
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.subscription_title = Some("Free".to_string());
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        let empty = HashSet::new();
+
+        let mut bound = manager
+            .acquire_context_for_session(Some(SONNET_MODEL), Some("sonnet-sticky-full"), &empty)
+            .await
+            .unwrap();
+        manager.report_success_for_session(bound.id, Some("sonnet-sticky-full"));
+
+        let mut fallback = manager
+            .acquire_context_for_session(Some(SONNET_MODEL), Some("sonnet-sticky-full"), &empty)
+            .await
+            .unwrap();
+
+        assert_ne!(bound.id, fallback.id);
+        assert!(fallback.fallback_from_sticky);
+        assert!(!fallback.sticky_bound);
+
+        fallback.release_in_flight();
+        bound.release_in_flight();
+
+        let mut rebound = manager
+            .acquire_context_for_session(Some(SONNET_MODEL), Some("sonnet-sticky-full"), &empty)
+            .await
+            .unwrap();
+        assert_eq!(rebound.id, bound.id);
+        rebound.release_in_flight();
+    }
+
+    #[tokio::test]
+    async fn test_sonnet_rate_limiter_prefers_other_dispatchable_credential() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.credential_rpm = Some(60);
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.subscription_title = Some("Free".to_string());
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.subscription_title = Some("Free".to_string());
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        let mut first = manager.acquire_context(Some(SONNET_MODEL)).await.unwrap();
+        let mut second = manager.acquire_context(Some(SONNET_MODEL)).await.unwrap();
+
+        assert_ne!(first.id, second.id);
+        first.release_in_flight();
+        second.release_in_flight();
+    }
+
+    #[tokio::test]
+    async fn test_sonnet_rate_limit_cooldown_skips_limited_credential() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.credential_rate_limit_cooldown_secs = 60;
+        config.credential_max_cooldown_secs = 60;
+        config.credential_cooldown_jitter_percent = 0;
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.subscription_title = Some("Free".to_string());
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.subscription_title = Some("Free".to_string());
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        assert!(
+            manager
+                .report_transient_failure_kind(
+                    1,
+                    Some(SONNET_MODEL),
+                    TransientFailureKind::RateLimit,
+                    None,
+                    "429 Too Many Requests"
+                )
+                .unwrap()
+        );
+
+        let mut ctx = manager.acquire_context(Some(SONNET_MODEL)).await.unwrap();
+        assert_eq!(ctx.id, 2);
+        ctx.release_in_flight();
+    }
+
+    #[tokio::test]
+    async fn test_sonnet_pool_uses_available_credentials_when_one_is_cooldown_and_sticky_is_full() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.credential_max_concurrent_requests = 1;
+        config.credential_auth_error_cooldown_secs = 60;
+        config.credential_max_cooldown_secs = 60;
+        config.credential_cooldown_jitter_percent = 0;
+
+        let credentials = (1..=4)
+            .map(|idx| {
+                let mut cred = KiroCredentials::default();
+                cred.subscription_title = Some("Free".to_string());
+                cred.access_token = Some(format!("t{idx}"));
+                cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+                cred
+            })
+            .collect();
+
+        let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+        let empty = HashSet::new();
+
+        assert!(
+            manager
+                .report_transient_failure_kind(
+                    1,
+                    Some(SONNET_MODEL),
+                    TransientFailureKind::Auth,
+                    None,
+                    "403 Forbidden user is not authorized"
+                )
+                .unwrap()
+        );
+
+        let mut bound = manager
+            .acquire_context_for_session(Some(SONNET_MODEL), Some("sonnet-pool-session"), &empty)
+            .await
+            .unwrap();
+        assert_ne!(bound.id, 1);
+        manager.report_success_for_session(bound.id, Some("sonnet-pool-session"));
+
+        let mut fallback = manager
+            .acquire_context_for_session(Some(SONNET_MODEL), Some("sonnet-pool-session"), &empty)
+            .await
+            .unwrap();
+        assert_ne!(fallback.id, 1);
+        assert_ne!(fallback.id, bound.id);
+        assert!(fallback.fallback_from_sticky);
+        assert!(!fallback.sticky_bound);
+
+        let mut unbound = manager.acquire_context(Some(SONNET_MODEL)).await.unwrap();
+        assert_ne!(unbound.id, 1);
+        assert_ne!(unbound.id, bound.id);
+        assert_ne!(unbound.id, fallback.id);
+
+        unbound.release_in_flight();
+        fallback.release_in_flight();
+        bound.release_in_flight();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_sonnet_high_concurrency_dispatch_respects_limits_and_spreads_load() {
+        const CREDENTIAL_COUNT: usize = 24;
+        const COOLED_DOWN_CREDENTIALS: u64 = 4;
+        const AVAILABLE_CREDENTIALS: usize = CREDENTIAL_COUNT - COOLED_DOWN_CREDENTIALS as usize;
+        const REQUEST_COUNT: usize = 600;
+        const PER_CREDENTIAL_LIMIT: u32 = 3;
+        const GLOBAL_LIMIT: u32 = 48;
+
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.credential_max_concurrent_requests = PER_CREDENTIAL_LIMIT;
+        config.dispatch_global_max_concurrent_requests = GLOBAL_LIMIT;
+        config.dispatch_max_queued_requests = REQUEST_COUNT as u32;
+        config.credential_dispatch_max_wait_secs = 5;
+        config.credential_rate_limit_cooldown_secs = 30;
+        config.credential_auth_error_cooldown_secs = 30;
+        config.credential_max_cooldown_secs = 30;
+        config.credential_cooldown_jitter_percent = 0;
+
+        let credentials = (1..=CREDENTIAL_COUNT)
+            .map(|idx| {
+                let mut cred = KiroCredentials::default();
+                cred.subscription_title = Some("Free".to_string());
+                cred.email = Some(format!("sonnet-free-{idx}@example.test"));
+                cred.access_token = Some(format!("t{idx}"));
+                cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+                cred
+            })
+            .collect();
+        let manager =
+            Arc::new(MultiTokenManager::new(config, credentials, None, None, false).unwrap());
+
+        for id in 1..=COOLED_DOWN_CREDENTIALS {
+            let kind = if id % 2 == 0 {
+                TransientFailureKind::RateLimit
+            } else {
+                TransientFailureKind::Auth
+            };
+            assert!(
+                manager
+                    .report_transient_failure_kind(
+                        id,
+                        Some(SONNET_MODEL),
+                        kind,
+                        None,
+                        "preload high-concurrency cooldown"
+                    )
+                    .unwrap()
+            );
+        }
+
+        let start = Arc::new(tokio::sync::Barrier::new(REQUEST_COUNT + 1));
+        let mut handles = Vec::with_capacity(REQUEST_COUNT);
+
+        for idx in 0..REQUEST_COUNT {
+            let manager = manager.clone();
+            let start = start.clone();
+            handles.push(tokio::spawn(async move {
+                start.wait().await;
+                let mut ctx = manager.acquire_context(Some(SONNET_MODEL)).await.unwrap();
+                assert!(
+                    ctx.id > COOLED_DOWN_CREDENTIALS,
+                    "冷却凭据不应被调度，实际选中 #{}",
+                    ctx.id
+                );
+
+                let snapshot = manager.snapshot();
+                assert!(
+                    snapshot.global_in_flight_requests <= GLOBAL_LIMIT,
+                    "全局并发超限: {} > {}",
+                    snapshot.global_in_flight_requests,
+                    GLOBAL_LIMIT
+                );
+                assert!(
+                    snapshot.queued_requests <= REQUEST_COUNT as u32,
+                    "等待队列超出测试配置: {}",
+                    snapshot.queued_requests
+                );
+                for entry in &snapshot.entries {
+                    if entry.id <= COOLED_DOWN_CREDENTIALS {
+                        assert_eq!(
+                            entry.in_flight_requests, 0,
+                            "冷却凭据 #{} 不应持有 in-flight",
+                            entry.id
+                        );
+                    }
+                    if entry.max_concurrent_requests > 0 {
+                        assert!(
+                            entry.in_flight_requests <= entry.max_concurrent_requests,
+                            "凭据 #{} 并发超限: {} > {}",
+                            entry.id,
+                            entry.in_flight_requests,
+                            entry.max_concurrent_requests
+                        );
+                    }
+                }
+
+                tokio::time::sleep(StdDuration::from_millis(3 + (idx % 7) as u64)).await;
+                manager.report_success(ctx.id);
+                let id = ctx.id;
+                ctx.release_in_flight();
+                id
+            }));
+        }
+
+        let started_at = Instant::now();
+        start.wait().await;
+
+        let mut selection_counts: HashMap<u64, usize> = HashMap::new();
+        for handle in handles {
+            let selected_id = tokio::time::timeout(StdDuration::from_secs(10), handle)
+                .await
+                .expect("高并发调度任务不应超时")
+                .expect("高并发调度任务不应 panic");
+            *selection_counts.entry(selected_id).or_insert(0) += 1;
+        }
+
+        let elapsed = started_at.elapsed();
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.global_in_flight_requests, 0);
+        assert_eq!(snapshot.queued_requests, 0);
+        assert_eq!(
+            selection_counts.len(),
+            AVAILABLE_CREDENTIALS,
+            "所有非冷却凭据都应在高并发下被使用，实际分布: {:?}",
+            selection_counts
+        );
+        assert!(
+            selection_counts
+                .keys()
+                .all(|id| *id > COOLED_DOWN_CREDENTIALS),
+            "冷却凭据不应出现在最终调度分布中: {:?}",
+            selection_counts
+        );
+
+        let min_selected = selection_counts.values().copied().min().unwrap_or(0);
+        let max_selected = selection_counts.values().copied().max().unwrap_or(0);
+        let mut distribution: Vec<_> = selection_counts
+            .iter()
+            .map(|(id, count)| (*id, *count))
+            .collect();
+        distribution.sort_by_key(|(id, _)| *id);
+        println!(
+            "sonnet high concurrency dispatch: requests={}, total_credentials={}, cooled_down={}, used_credentials={}, global_limit={}, per_credential_limit={}, elapsed_ms={}, min_selected={}, max_selected={}, distribution={:?}",
+            REQUEST_COUNT,
+            CREDENTIAL_COUNT,
+            COOLED_DOWN_CREDENTIALS,
+            selection_counts.len(),
+            GLOBAL_LIMIT,
+            PER_CREDENTIAL_LIMIT,
+            elapsed.as_millis(),
+            min_selected,
+            max_selected,
+            distribution
+        );
+        assert!(
+            max_selected <= min_selected * 2 + 10,
+            "balanced 高并发分布过度倾斜: min={}, max={}, elapsed={:?}, counts={:?}",
+            min_selected,
+            max_selected,
+            elapsed,
+            selection_counts
+        );
     }
 
     #[test]

@@ -4,6 +4,57 @@
 
 本文用于记录 `kiro.rs` 当前凭据调度系统在高频请求、账号 429、粘性会话、并发限制、冷却退避方面的背景、原因分析和无歧义落地方案。本文应当能够脱离当前对话独立阅读。
 
+## 0. 快速结论
+
+如果现网已经出现账号 429、请求集中到少数账号、sticky 账号反复承压等问题，优先使用下面这套保守配置：
+
+```json
+{
+  "loadBalancingMode": "health_balanced",
+  "credentialMaxConcurrentRequests": 1,
+  "credentialRpm": 6,
+  "credentialRateLimitCooldownSecs": 90,
+  "credentialCooldownBackoffMultiplier": 2.0,
+  "credentialCooldownJitterPercent": 30,
+  "credentialProbationSecs": 120,
+  "credentialMaxCooldownSecs": 900,
+  "credentialDispatchMaxWaitSecs": 60,
+  "dispatchMaxQueuedRequests": 100
+}
+```
+
+同时设置全局并发：
+
+```text
+dispatchGlobalMaxConcurrentRequests = min(可用账号数, 20)
+```
+
+这套配置的目标不是最大吞吐，而是先保护账号，降低 429 和风控概率。后续再根据成功率、排队时间、429 数量逐步放大 `credentialRpm` 或 `dispatchGlobalMaxConcurrentRequests`。
+
+关键判断：
+
+1. `credentialMaxConcurrentRequests` 是并发限制，只限制“同一瞬间有几个请求正在跑”。
+2. `credentialRpm` 才是频率保护，用来避免“短请求高频打同一个账号”。
+3. 429 不应永久禁用账号，应冷却、降速、降低权重，并尽快调度到其他账号。
+4. sticky 应当是软粘性。优先用原账号，但账号满载、限速、冷却、错误率升高时必须 fallback。
+5. 当前代码已经具备基础冷却、RPM、并发、sticky fallback 和普通 `401/403` 换号能力；还缺少 429 当前链路立即换号、token bucket、自适应降速和模型级限流。
+
+配置选择表：
+
+| 目标 | 推荐模式 | 单账号并发 | 单账号 RPM | 429 基础冷却 | 全局并发 |
+| --- | --- | ---: | ---: | ---: | --- |
+| 账号保护优先 | `health_balanced` | `1` | `6` | `90s` | `min(账号数, 20)` |
+| 稳定和吞吐平衡 | `health_balanced` | `1` | `10` | `60s` | `min(账号数, 30)` |
+| 吞吐优先 | `health_balanced` | `2` | `20` | `45s` | `min(账号数 * 2, 50)` |
+
+现网观察指标：
+
+1. 单账号 `429` 次数是否下降。
+2. 请求链路中是否仍集中命中同一账号。
+3. `recent_error_rate` 和最近瞬态错误是否持续升高。
+4. `in_flight_requests` 是否长期接近上限。
+5. 排队等待是否频繁超过 `credentialDispatchMaxWaitSecs`。
+
 ## 1. 背景
 
 系统通过多个 Kiro 账号凭据向上游发起 Claude Code / Anthropic 兼容请求。生产使用中出现了以下问题：
@@ -601,6 +652,15 @@ proxy_cooldown_until
 dispatchGlobalMaxConcurrentRequests = min(可用账号数, 20)
 ```
 
+执行后观察至少 30 到 60 分钟，再决定是否放大吞吐。建议按下面顺序调整：
+
+1. 如果 429 明显下降、排队等待很少，先把 `dispatchGlobalMaxConcurrentRequests` 每次增加 5。
+2. 如果全局并发增加后仍稳定，再把 `credentialRpm` 从 `6` 调到 `8` 或 `10`。
+3. 不建议优先把 `credentialMaxConcurrentRequests` 从 `1` 调到 `2`。对 Claude Code 长会话和流式请求来说，单账号并发升高更容易把同一账号打满。
+4. 如果 429 回升，先回退 `credentialRpm`，再回退全局并发。
+5. 如果排队等待过多但没有 429，说明账号池容量不足或全局并发过低，可以增加全局并发或补充账号。
+6. 如果 429 多但排队很少，说明单账号频率过高，应降低 `credentialRpm` 或增加 429 冷却时间。
+
 ### 7.2 下一次代码迭代优先级
 
 优先做：
@@ -640,7 +700,7 @@ Sticky 越强，账号越容易承压不均；平均调度越强，会话连续�
 
 429 通常是限流或高峰，不代表账号永久不可用。正确做法是冷却、降速、降低权重，而不是永久禁用。
 
-## 9. 当前发版包含的相关能力
+## 9. 当前版本包含的相关能力
 
 当前代码已经包含以下与调度稳定性相关的能力：
 

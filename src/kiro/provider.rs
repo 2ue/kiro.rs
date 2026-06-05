@@ -831,15 +831,8 @@ impl KiroProvider {
         excluded_ids: &mut HashSet<u64>,
         force_refreshed: &mut HashSet<u64>,
     ) -> anyhow::Result<CredentialAuthFailureDecision> {
-        self.token_manager.report_transient_failure_kind(
-            ctx.id,
-            model,
-            TransientFailureKind::Auth,
-            None,
-            format!("auth_error {} {}", status, body),
-        )?;
-
-        // token 被上游失效时，先给当前凭据一次强制刷新机会；这类问题不应直接禁用账号。
+        // token 被上游失效时，先给当前凭据一次强制刷新机会；刷新成功不写入 Auth 冷却，
+        // 否则下一轮调度可能跳过刚刷新成功的账号。
         if endpoint.is_bearer_token_invalid(body) && !force_refreshed.contains(&ctx.id) {
             force_refreshed.insert(ctx.id);
             tracing::info!(
@@ -869,6 +862,14 @@ impl KiroProvider {
                 "凭据 token 强制刷新失败，计入失败"
             );
         }
+
+        self.token_manager.report_transient_failure_kind(
+            ctx.id,
+            model,
+            TransientFailureKind::Auth,
+            None,
+            format!("auth_error {} {}", status, body),
+        )?;
 
         let has_available = self.token_manager.report_failure(ctx.id);
         if let Some(session_id) = session_id {
