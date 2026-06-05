@@ -175,6 +175,15 @@ impl ModelCapabilitiesCatalog {
             .filter(|tokens| *tokens > 0)
     }
 
+    pub fn supports_prompt_caching_for(&self, model: &str) -> Option<bool> {
+        let model = normalize_model_id(model);
+        self.inner
+            .read()
+            .models
+            .get(&model)
+            .and_then(|item| item.supports_prompt_caching)
+    }
+
     pub fn resolve_model(&self, requested_model: &str) -> ModelResolution {
         let inner = self.inner.read();
         let models = inner.models.keys().cloned().collect::<Vec<_>>();

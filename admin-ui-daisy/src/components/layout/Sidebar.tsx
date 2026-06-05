@@ -16,6 +16,9 @@ import type { TabKey } from '@/types/ui'
 interface SidebarProps {
   activeTab: TabKey
   onTabChange: (tab: TabKey) => void
+  collapsed?: boolean
+  embedded?: boolean
+  onCollapsedChange?: (collapsed: boolean) => void
 }
 
 const navItems: Array<{ key: TabKey; label: string; icon: React.ReactNode; description: string }> = [
@@ -28,13 +31,26 @@ const navItems: Array<{ key: TabKey; label: string; icon: React.ReactNode; descr
   { key: 'config', label: '配置', icon: <Settings className="h-5 w-5" />, description: '运行时参数设置' },
 ]
 
-export function Sidebar({ activeTab, onTabChange }: SidebarProps) {
-  const [collapsed, setCollapsed] = useState(false)
+export function Sidebar({
+  activeTab,
+  onTabChange,
+  collapsed: controlledCollapsed,
+  embedded,
+  onCollapsedChange,
+}: SidebarProps) {
+  const [localCollapsed, setLocalCollapsed] = useState(false)
+  const collapsed = embedded ? false : controlledCollapsed ?? localCollapsed
+
+  const toggleCollapsed = () => {
+    const next = !collapsed
+    if (onCollapsedChange) onCollapsedChange(next)
+    else setLocalCollapsed(next)
+  }
 
   return (
     <aside
-      className={`sidebar-shell fixed left-0 top-0 z-40 flex h-screen flex-col border-r border-base-300 bg-base-100 transition-all duration-200 ${
-        collapsed ? 'w-16' : 'w-56'
+      className={`sidebar-shell flex flex-col border-r border-base-300 bg-base-100 transition-all duration-200 ${
+        embedded ? 'h-full w-64' : `fixed left-0 top-0 z-40 h-screen ${collapsed ? 'w-16' : 'w-56'}`
       }`}
     >
       {/* Logo */}
@@ -47,17 +63,19 @@ export function Sidebar({ activeTab, onTabChange }: SidebarProps) {
             <span className="whitespace-nowrap text-sm font-bold tracking-tight">Kiro Admin</span>
           )}
         </div>
-        <Button
-          type="button"
-          color="ghost"
-          size="xs"
-          shape="circle"
-          className="shrink-0"
-          onClick={() => setCollapsed(!collapsed)}
-          aria-label={collapsed ? '展开侧边栏' : '收起侧边栏'}
-        >
-          {collapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronLeft className="h-4 w-4" />}
-        </Button>
+        {!embedded && (
+          <Button
+            type="button"
+            color="ghost"
+            size="xs"
+            shape="circle"
+            className="shrink-0"
+            onClick={toggleCollapsed}
+            aria-label={collapsed ? '展开侧边栏' : '收起侧边栏'}
+          >
+            {collapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronLeft className="h-4 w-4" />}
+          </Button>
+        )}
       </div>
 
       {/* Navigation */}
@@ -71,7 +89,7 @@ export function Sidebar({ activeTab, onTabChange }: SidebarProps) {
                 onClick={() => onTabChange(item.key)}
                 className={`nav-item group flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-all ${
                   isActive
-                    ? 'bg-primary/10 text-primary shadow-sm'
+                    ? 'active bg-primary/10 text-primary shadow-sm'
                     : 'text-base-content/70 hover:bg-base-200 hover:text-base-content'
                 }`}
               >

@@ -12,7 +12,9 @@ use std::{
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
-use crate::model::config::{CompatProfile, Config, PromptCacheSimulationMode, ReportedUsageConfig};
+use crate::model::config::{
+    CompatProfile, Config, PayloadShapingConfig, PromptCacheSimulationMode, ReportedUsageConfig,
+};
 use crate::token;
 use anyhow::Error;
 use axum::{
@@ -83,6 +85,8 @@ struct RequestUsageContext {
     reported_cache_usage_policy: Option<super::cache::ReportedCacheUsagePolicy>,
     simulated_usage: Option<super::cache::CacheSimulation>,
     simulated_source: Option<UsageSource>,
+    payload_breakdown: Option<PayloadByteBreakdown>,
+    payload_guard_report: Option<PayloadGuardReport>,
     started_at: Instant,
 }
 
@@ -117,6 +121,7 @@ struct RequestRuntimeConfig {
     payload_guard_enabled: bool,
     payload_guard_max_bytes: usize,
     payload_guard_trim_history: bool,
+    payload_shaping: PayloadShapingConfig,
 }
 
 impl RequestRuntimeConfig {
@@ -135,6 +140,7 @@ impl RequestRuntimeConfig {
             payload_guard_enabled: state.payload_guard_enabled,
             payload_guard_max_bytes: state.payload_guard_max_bytes,
             payload_guard_trim_history: state.payload_guard_trim_history,
+            payload_shaping: state.payload_shaping,
         }
     }
 
@@ -163,6 +169,7 @@ impl RequestRuntimeConfig {
             payload_guard_enabled: config.payload_guard_enabled,
             payload_guard_max_bytes: config.payload_guard_max_bytes,
             payload_guard_trim_history: config.payload_guard_trim_history,
+            payload_shaping: config.payload_shaping,
         }
     }
 
@@ -171,6 +178,7 @@ impl RequestRuntimeConfig {
             enabled: self.payload_guard_enabled,
             max_bytes: self.payload_guard_max_bytes,
             trim_history: self.payload_guard_trim_history,
+            shaping: self.payload_shaping,
         }
     }
 }
@@ -223,6 +231,16 @@ impl RequestUsageContext {
             fallback_from_sticky,
             credential_attempts,
         }
+    }
+
+    fn with_payload_diagnostics(
+        mut self,
+        breakdown: PayloadByteBreakdown,
+        report: PayloadGuardReport,
+    ) -> Self {
+        self.payload_breakdown = Some(breakdown);
+        self.payload_guard_report = Some(report);
+        self
     }
 
     fn attach_provider_error_credential(
@@ -572,6 +590,23 @@ impl CredentialUsageContext {
                 .unwrap_or(&self.request.model),
             usage,
         );
+        let include_payload_diagnostics =
+            should_persist_payload_diagnostics(status, self.request.payload_guard_report.as_ref());
+        let payload_breakdown = if include_payload_diagnostics {
+            self.request
+                .payload_breakdown
+                .and_then(|breakdown| serde_json::to_value(breakdown).ok())
+        } else {
+            None
+        };
+        let payload_guard_report = if include_payload_diagnostics {
+            self.request
+                .payload_guard_report
+                .as_ref()
+                .and_then(|report| serde_json::to_value(report).ok())
+        } else {
+            None
+        };
         self.request.recorder.record(UsageRecord {
             id: self.request.request_id.clone(),
             created_at: Utc::now().to_rfc3339(),
@@ -605,8 +640,25 @@ impl CredentialUsageContext {
             error_type,
             error_message,
             error_detail,
+            payload_breakdown,
+            payload_guard_report,
         });
     }
+}
+
+fn should_persist_payload_diagnostics(
+    status: UsageRecordStatus,
+    report: Option<&PayloadGuardReport>,
+) -> bool {
+    if status != UsageRecordStatus::Success {
+        return true;
+    }
+    let Some(report) = report else {
+        return false;
+    };
+    report.was_modified()
+        || report.still_oversized
+        || (report.max_bytes > 0 && report.final_bytes > report.max_bytes.saturating_mul(70) / 100)
 }
 
 #[derive(Clone)]
@@ -1053,11 +1105,20 @@ fn prepare_usage_context(
     stable_conversation_id: Option<String>,
     input_tokens: i32,
 ) -> RequestUsageContext {
+    let prompt_cache_model = model_resolution
+        .as_ref()
+        .and_then(|resolution| resolution.upstream_model.as_deref())
+        .unwrap_or(&payload.model);
+    let prompt_cache_supported = state
+        .model_capabilities
+        .supports_prompt_caching_for(prompt_cache_model)
+        .unwrap_or(true);
     let prompt_cache_profile = match state.prompt_cache_simulation_mode {
         PromptCacheSimulationMode::Disabled => None,
-        PromptCacheSimulationMode::HighCache => state
+        PromptCacheSimulationMode::HighCache if prompt_cache_supported => state
             .prompt_cache
-            .build_high_cache_profile(payload, input_tokens),
+            .build_high_cache_profile_for_model(payload, input_tokens, prompt_cache_model),
+        PromptCacheSimulationMode::HighCache => None,
     };
     let (simulated_usage, simulated_source) = build_simulated_usage(
         state,
@@ -1120,6 +1181,8 @@ fn prepare_usage_context(
         reported_cache_usage_policy,
         simulated_usage,
         simulated_source,
+        payload_breakdown: None,
+        payload_guard_report: None,
         started_at: Instant::now(),
     }
 }
@@ -1482,6 +1545,22 @@ fn log_payload_guard_report(
             removed_orphan_tool_results = report.removed_orphan_tool_results,
             textified_orphan_tool_results = report.textified_orphan_tool_results,
             removed_orphan_tool_uses = report.removed_orphan_tool_uses,
+            truncated_history_tool_results = report.truncated_history_tool_results,
+            truncated_history_tool_result_chars = report.truncated_history_tool_result_chars,
+            removed_history_thinking_blocks = report.removed_history_thinking_blocks,
+            removed_history_thinking_chars = report.removed_history_thinking_chars,
+            trimmed_web_fetch_blocks = report.trimmed_web_fetch_blocks,
+            trimmed_web_fetch_chars = report.trimmed_web_fetch_chars,
+            compressed_tool_definitions = report.compressed_tool_definitions,
+            compressed_tool_definition_bytes = report.compressed_tool_definition_bytes,
+            truncated_current_tool_results = report.truncated_current_tool_results,
+            truncated_current_tool_result_chars = report.truncated_current_tool_result_chars,
+            truncated_current_documents = report.truncated_current_documents,
+            truncated_current_document_chars = report.truncated_current_document_chars,
+            truncated_current_user_content = report.truncated_current_user_content,
+            truncated_current_user_content_chars = report.truncated_current_user_content_chars,
+            dropped_current_images = report.dropped_current_images,
+            dropped_current_image_bytes = report.dropped_current_image_bytes,
             still_oversized = report.still_oversized,
             "Kiro payload guard applied before upstream call"
         );
@@ -1542,11 +1621,15 @@ fn log_payload_byte_breakdown(
         current_tools_bytes = breakdown.current_tools_bytes,
         current_tool_results_bytes = breakdown.current_tool_results_bytes,
         current_images_bytes = breakdown.current_images_bytes,
+        history_tool_results_bytes = breakdown.history_tool_results_bytes,
+        history_images_bytes = breakdown.history_images_bytes,
         history_entries = breakdown.history_entries,
         current_tool_count = breakdown.current_tool_count,
         current_tool_result_count = breakdown.current_tool_result_count,
         current_image_count = breakdown.current_image_count,
         largest_tool_bytes = breakdown.largest_tool_bytes,
+        largest_history_tool_result_bytes = breakdown.largest_history_tool_result_bytes,
+        largest_current_tool_result_bytes = breakdown.largest_current_tool_result_bytes,
         history_tool_use_count = breakdown.history_tool_use_count,
         history_tool_result_count = breakdown.history_tool_result_count,
         still_oversized = report.still_oversized,
@@ -1720,10 +1803,9 @@ async fn post_messages_inner(
         model_resolution.upstream_model.as_deref(),
         Some(&conversation_id),
     );
-    let payload_breakdown = should_log_payload_byte_breakdown(&payload_guard_report)
-        .then(|| breakdown_kiro_request(&kiro_request, &request_body));
+    let payload_breakdown = breakdown_kiro_request(&kiro_request, &request_body);
     log_payload_byte_breakdown(
-        payload_breakdown,
+        should_log_payload_byte_breakdown(&payload_guard_report).then_some(payload_breakdown),
         &payload_guard_report,
         endpoint,
         &payload.model,
@@ -1761,7 +1843,8 @@ async fn post_messages_inner(
         Some(conversation_id),
         prompt_cache_scope_conversation_id(state.prompt_cache_simulation_mode, &payload),
         input_tokens,
-    );
+    )
+    .with_payload_diagnostics(payload_breakdown, payload_guard_report.clone());
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -2602,10 +2685,9 @@ pub async fn post_messages_cc(
         model_resolution.upstream_model.as_deref(),
         Some(&conversation_id),
     );
-    let payload_breakdown = should_log_payload_byte_breakdown(&payload_guard_report)
-        .then(|| breakdown_kiro_request(&kiro_request, &request_body));
+    let payload_breakdown = breakdown_kiro_request(&kiro_request, &request_body);
     log_payload_byte_breakdown(
-        payload_breakdown,
+        should_log_payload_byte_breakdown(&payload_guard_report).then_some(payload_breakdown),
         &payload_guard_report,
         "/cc/v1/messages",
         &payload.model,
@@ -2643,7 +2725,8 @@ pub async fn post_messages_cc(
         Some(conversation_id),
         prompt_cache_scope_conversation_id(state.prompt_cache_simulation_mode, &payload),
         input_tokens,
-    );
+    )
+    .with_payload_diagnostics(payload_breakdown, payload_guard_report.clone());
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -2913,6 +2996,8 @@ mod tests {
             ),
             simulated_usage: None,
             simulated_source: Some(UsageSource::LocalPromptCache),
+            payload_breakdown: None,
+            payload_guard_report: None,
             started_at: Instant::now(),
         };
         let usage = CacheUsage {
@@ -2990,6 +3075,8 @@ mod tests {
             ),
             simulated_usage: None,
             simulated_source: Some(UsageSource::LocalPromptCache),
+            payload_breakdown: None,
+            payload_guard_report: None,
             started_at: Instant::now(),
         };
         let cc_context = RequestUsageContext {
@@ -3132,6 +3219,8 @@ mod tests {
             reported_cache_usage_policy: None,
             simulated_usage: None,
             simulated_source: None,
+            payload_breakdown: None,
+            payload_guard_report: None,
             started_at: Instant::now(),
         };
         usage_context
@@ -3225,6 +3314,8 @@ mod tests {
             reported_cache_usage_policy: None,
             simulated_usage: None,
             simulated_source: Some(UsageSource::LocalPromptCache),
+            payload_breakdown: None,
+            payload_guard_report: None,
             started_at: Instant::now(),
         }
         .attach_credential(Some(1), None, false, false, Vec::new());
@@ -3305,6 +3396,8 @@ mod tests {
                 amplification: None,
             }),
             simulated_source: Some(UsageSource::LocalPromptCache),
+            payload_breakdown: None,
+            payload_guard_report: None,
             started_at: Instant::now(),
         }
         .attach_credential(Some(1), None, false, false, Vec::new());

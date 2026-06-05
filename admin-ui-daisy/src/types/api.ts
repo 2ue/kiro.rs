@@ -342,6 +342,8 @@ export interface UsageRecord {
   errorType?: string
   errorMessage?: string
   errorDetail?: string
+  payloadBreakdown?: unknown
+  payloadGuardReport?: unknown
 }
 
 export interface UsageRecordsResult {
@@ -464,6 +466,30 @@ export interface ReportedUsageConfig {
   pathOverrides: Record<string, ReportedUsagePathPolicy>
 }
 
+export interface PayloadShapingConfig {
+  enabled: boolean
+  truncateHistoricalToolResults: boolean
+  historicalToolResultMaxChars: number
+  historicalToolResultHeadLines: number
+  historicalToolResultTailLines: number
+  discardHistoricalThinking: boolean
+  compressToolDefinitions: boolean
+  toolDefinitionsBudgetBytes: number
+  toolDescriptionMaxChars: number
+  toolSchemaAnnotationMaxChars: number
+  webFetchTrimEnabled: boolean
+  webFetchBodyMaxChars: number
+  fitCurrentPayloadToBudget: boolean
+  truncateCurrentToolResults: boolean
+  currentToolResultMaxChars: number
+  truncateCurrentUserContent: boolean
+  currentUserContentMaxChars: number
+  truncateCurrentDocuments: boolean
+  currentDocumentMaxChars: number
+  truncateCurrentImages: boolean
+  currentImagesMaxBytes: number
+}
+
 export interface RuntimeConfig {
   credentialRpm: number
   credentialMaxConcurrentRequests: number
@@ -479,6 +505,7 @@ export interface RuntimeConfig {
   credentialProbationSecs: number
   credentialMaxCooldownSecs: number
   credentialDispatchMaxWaitSecs: number
+  credentialRetryMaxAttempts: number
   credentialInFlightLeaseMaxSecs: number
   dispatchGlobalMaxConcurrentRequests: number
   dispatchMaxQueuedRequests: number
@@ -499,6 +526,7 @@ export interface RuntimeConfig {
   payloadGuardEnabled: boolean
   payloadGuardMaxBytes: number
   payloadGuardTrimHistory: boolean
+  payloadShaping: PayloadShapingConfig
   promptCacheTargetReadRatio: number
   promptCacheTokenScale: number
   promptCacheMaxSimulatedInputTokens: number

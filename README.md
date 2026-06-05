@@ -216,8 +216,25 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `compression.enabled` | boolean | `false` | 是否启用上游请求压缩；默认关闭 |
 | `compression.whitespaceCompression` | boolean | `true` | 启用 compression 后是否只做 JSON whitespace 压缩；默认只开启该低风险压缩 |
 | `payloadGuardEnabled` | boolean | `true` | 是否启用发送 Kiro 上游前的最终 payload 防护 |
-| `payloadGuardMaxBytes` | number | `460800` | Kiro 上游请求 JSON body 最大字节数，按最终发送的 JSON 字节数计算；`0` 表示不限制大小但仍执行 payload 协议修复 |
-| `payloadGuardTrimHistory` | boolean | `true` | payload 超限时是否允许裁剪最旧历史；关闭后只做协议修复，仍超限会直接返回客户端错误 |
+| `payloadGuardMaxBytes` | number | `460800` | 本地 payload 经验预算，按最终发送的 Kiro JSON body 字节数计算；它不是模型上下文上限。`0` 表示不按大小整形或裁剪，但仍执行 payload 协议修复 |
+| `payloadGuardTrimHistory` | boolean | `true` | payload 超出本地预算时是否允许裁剪最旧历史；关闭后只做协议修复，仍超预算会标记后透传给 Kiro |
+| `payloadShaping.enabled` | boolean | `true` | 超出本地预算时是否先执行低风险内容整形 |
+| `payloadShaping.truncateHistoricalToolResults` | boolean | `true` | 是否对历史 `tool_result` 做头尾保留截断；当前合法 `tool_result` 不受影响 |
+| `payloadShaping.historicalToolResultMaxChars` | number | `8000` | 单个普通历史 `tool_result` 最多保留字符数 |
+| `payloadShaping.discardHistoricalThinking` | boolean | `true` | 是否移除旧 assistant 历史中的 `<thinking>` 块 |
+| `payloadShaping.compressToolDefinitions` | boolean | `true` | 是否压缩工具描述和 JSON Schema 注释字段；不会删除 `type`、`properties`、`required`、`enum` |
+| `payloadShaping.toolDefinitionsBudgetBytes` | number | `20000` | 当前 tools 定义超过多少 JSON 字节后开始压缩描述和注释；`0` 表示关闭工具定义预算压缩 |
+| `payloadShaping.webFetchTrimEnabled` | boolean | `true` | 是否对历史 WebFetch 内容移除 data image、重复行和明显噪声 |
+| `payloadShaping.webFetchBodyMaxChars` | number | `12000` | 历史 WebFetch 正文去噪后的字符预算 |
+| `payloadShaping.fitCurrentPayloadToBudget` | boolean | `false` | 是否在历史裁剪后仍超预算时自动启用当前 tool_result、当前文本、当前 document 和当前图片兜底裁剪 |
+| `payloadShaping.truncateCurrentToolResults` | boolean | `false` | 是否允许在仍超预算时截断当前合法 `tool_result`；默认关闭 |
+| `payloadShaping.currentToolResultMaxChars` | number | `80000` | 单个当前 `tool_result` 的头尾保留字符预算 |
+| `payloadShaping.truncateCurrentUserContent` | boolean | `false` | 是否允许在仍超预算时截断当前 user content；包含 document 标签时会保留文档块并只裁文档外侧文本 |
+| `payloadShaping.currentUserContentMaxChars` | number | `120000` | 当前纯文本 user content 的头尾保留字符预算 |
+| `payloadShaping.truncateCurrentDocuments` | boolean | `false` | 是否允许在仍超预算时截断当前 `<document>` 块正文，并保留 document 标签 |
+| `payloadShaping.currentDocumentMaxChars` | number | `80000` | 单个当前 document 正文的头尾保留字符预算 |
+| `payloadShaping.truncateCurrentImages` | boolean | `false` | 是否允许在仍超预算时丢弃当前图片；图片不会本地重编码压缩 |
+| `payloadShaping.currentImagesMaxBytes` | number | `180000` | 当前 images 数组允许保留的 JSON 字节预算 |
 | `compatProfile` | string | `claude-code` | 兼容 profile：`claude-code` 优先真实 Claude Code CLI 可用性；`anthropic-strict` 减少代理改写和调试特征；`debug` 等同 `claude-code` 但默认暴露代理 warning |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `promptCacheTargetReadRatio` | number | `0.98` | `/v1/messages`、`/cc/v1/messages`、`/ha/v1/messages`、`/na/v1/messages` high-cache 的目标 cache read 中心比例；`/na` 默认只保留真实上游 cache usage，不用本地模拟补足 cache usage |
@@ -249,11 +266,32 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
    "adminApiKey": "sk-admin-your-secret-key",
    "payloadGuardEnabled": true,
    "payloadGuardMaxBytes": 460800,
-   "payloadGuardTrimHistory": true
+   "payloadGuardTrimHistory": true,
+   "payloadShaping": {
+      "enabled": true,
+      "truncateHistoricalToolResults": true,
+      "historicalToolResultMaxChars": 8000,
+      "discardHistoricalThinking": true,
+      "compressToolDefinitions": true,
+      "toolDefinitionsBudgetBytes": 20000,
+      "webFetchTrimEnabled": true,
+      "webFetchBodyMaxChars": 12000,
+      "fitCurrentPayloadToBudget": false,
+      "truncateCurrentToolResults": false,
+      "currentToolResultMaxChars": 80000,
+      "truncateCurrentUserContent": false,
+      "currentUserContentMaxChars": 120000,
+      "truncateCurrentDocuments": false,
+      "currentDocumentMaxChars": 80000,
+      "truncateCurrentImages": false,
+      "currentImagesMaxBytes": 180000
+   }
 }
 ```
 
 未写出的字段会使用内置默认值。首次启动导入 PgSQL 后，也可以在后台配置页热更新调度、payload 防护、高缓存模拟和路径级 usage 上报策略。
+
+`payloadShaping` 默认不会截断当前 user message、当前合法 `tool_result`、当前 PDF/document 或当前图片。如果显式打开 `fitCurrentPayloadToBudget` 或具体当前内容截断项，服务会在历史整形和旧历史裁剪后仍超出 `payloadGuardMaxBytes` 时，按最终序列化后的 Kiro JSON body 字节数循环收缩当前内容，直到低于配置预算或没有可继续处理的内容。若仍超出预算，服务会记录 `still_oversized=true` 并继续请求 Kiro，让上游返回真实错误。
 
 缓存模式由路径固定选择：
 
@@ -261,6 +299,8 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 - `/cc/v1/messages`：high-cache，与 `/v1/messages` 使用同一套底层缓存模拟；默认只通过 `reportedUsage.pathOverrides["/cc"]` 改写下游 input 和 cache write 上报。
 - `/ha/v1/messages`：high-cache，与 `/v1/messages` 使用同一套底层缓存模拟；默认只通过 `reportedUsage.pathOverrides["/ha"]` 改写下游 input 上报。后续如果要改 writer，需要单独改 `/ha` 覆盖项。
 - `/na/v1/messages`：high-cache 路由；`reportedUsage.pathOverrides["/na"]` 默认关闭本地模拟 cache usage 补足，只保留真实上游 cache usage。
+
+本地高缓存模拟按实际解析后的上游模型判断 prompt cache 能力和最小缓存长度。Anthropic prompt caching 支持 active Claude 模型；Haiku 不是无缓存模型，但 Haiku 4.5 的最小可缓存长度是 4096 tokens，Haiku 3.5 是 2048 tokens。低于模型最小长度时本地不会模拟 cache creation/read。
 
 路径级 usage 上报策略支持这些字段：
 

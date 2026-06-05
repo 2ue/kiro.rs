@@ -1,4 +1,5 @@
 import type {
+  PayloadShapingConfig,
   ReportedUsageConfig,
   ReportedUsageFieldMode,
   ReportedUsageFieldPolicy,
@@ -53,6 +54,32 @@ export function defaultReportedUsage(): ReportedUsageConfig {
   }
 }
 
+export function defaultPayloadShaping(): PayloadShapingConfig {
+  return {
+    enabled: true,
+    truncateHistoricalToolResults: true,
+    historicalToolResultMaxChars: 8000,
+    historicalToolResultHeadLines: 80,
+    historicalToolResultTailLines: 40,
+    discardHistoricalThinking: true,
+    compressToolDefinitions: true,
+    toolDefinitionsBudgetBytes: 20000,
+    toolDescriptionMaxChars: 4000,
+    toolSchemaAnnotationMaxChars: 1000,
+    webFetchTrimEnabled: true,
+    webFetchBodyMaxChars: 12000,
+    fitCurrentPayloadToBudget: false,
+    truncateCurrentToolResults: false,
+    currentToolResultMaxChars: 80000,
+    truncateCurrentUserContent: false,
+    currentUserContentMaxChars: 120000,
+    truncateCurrentDocuments: false,
+    currentDocumentMaxChars: 80000,
+    truncateCurrentImages: false,
+    currentImagesMaxBytes: 180000,
+  }
+}
+
 export const emptyRuntimeConfig: RuntimeConfig = {
   credentialRpm: 0,
   credentialMaxConcurrentRequests: 0,
@@ -68,6 +95,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   credentialProbationSecs: 30,
   credentialMaxCooldownSecs: 300,
   credentialDispatchMaxWaitSecs: 120,
+  credentialRetryMaxAttempts: 0,
   credentialInFlightLeaseMaxSecs: 900,
   dispatchGlobalMaxConcurrentRequests: 0,
   dispatchMaxQueuedRequests: 0,
@@ -88,6 +116,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   payloadGuardEnabled: true,
   payloadGuardMaxBytes: 460800,
   payloadGuardTrimHistory: true,
+  payloadShaping: defaultPayloadShaping(),
   promptCacheTargetReadRatio: 0.98,
   promptCacheTokenScale: 1.6,
   promptCacheMaxSimulatedInputTokens: 300000,
@@ -176,5 +205,22 @@ export function normalizeReportedUsage(config: ReportedUsageConfig): ReportedUsa
   return {
     default: normalizePathPolicy(config.default),
     pathOverrides,
+  }
+}
+
+export function normalizePayloadShaping(config: PayloadShapingConfig): PayloadShapingConfig {
+  return {
+    ...config,
+    historicalToolResultMaxChars: toWhole(config.historicalToolResultMaxChars),
+    historicalToolResultHeadLines: toWhole(config.historicalToolResultHeadLines),
+    historicalToolResultTailLines: toWhole(config.historicalToolResultTailLines),
+    toolDefinitionsBudgetBytes: toWhole(config.toolDefinitionsBudgetBytes),
+    toolDescriptionMaxChars: toWhole(config.toolDescriptionMaxChars),
+    toolSchemaAnnotationMaxChars: toWhole(config.toolSchemaAnnotationMaxChars),
+    webFetchBodyMaxChars: toWhole(config.webFetchBodyMaxChars),
+    currentToolResultMaxChars: toWhole(config.currentToolResultMaxChars),
+    currentUserContentMaxChars: toWhole(config.currentUserContentMaxChars),
+    currentDocumentMaxChars: toWhole(config.currentDocumentMaxChars),
+    currentImagesMaxBytes: toWhole(config.currentImagesMaxBytes),
   }
 }

@@ -13,7 +13,8 @@ use crate::token;
 const DEFAULT_PROMPT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const HOUR_PROMPT_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_MIN_CACHEABLE_TOKENS: i32 = 1024;
-const OPUS_MIN_CACHEABLE_TOKENS: i32 = 4096;
+const EXTENDED_MIN_CACHEABLE_TOKENS: i32 = 4096;
+const HAIKU_3_MIN_CACHEABLE_TOKENS: i32 = 2048;
 const TARGET_READ_RATIO_SPREAD: f64 = 0.03;
 
 #[derive(Debug, Clone, Eq)]
@@ -98,7 +99,7 @@ impl PromptCacheTracker {
         req: &MessagesRequest,
         total_input_tokens: i32,
     ) -> Option<PromptCacheProfile> {
-        self.build_profile_with_policy(req, total_input_tokens, false)
+        self.build_profile_with_policy(req, total_input_tokens, false, &req.model)
     }
 
     pub fn build_high_cache_profile(
@@ -106,7 +107,16 @@ impl PromptCacheTracker {
         req: &MessagesRequest,
         total_input_tokens: i32,
     ) -> Option<PromptCacheProfile> {
-        self.build_profile_with_policy(req, total_input_tokens, true)
+        self.build_high_cache_profile_for_model(req, total_input_tokens, &req.model)
+    }
+
+    pub fn build_high_cache_profile_for_model(
+        &self,
+        req: &MessagesRequest,
+        total_input_tokens: i32,
+        cache_model: &str,
+    ) -> Option<PromptCacheProfile> {
+        self.build_profile_with_policy(req, total_input_tokens, true, cache_model)
     }
 
     fn build_profile_with_policy(
@@ -114,6 +124,7 @@ impl PromptCacheTracker {
         req: &MessagesRequest,
         total_input_tokens: i32,
         synthesize_stable_prefix: bool,
+        cache_model: &str,
     ) -> Option<PromptCacheProfile> {
         let blocks = flatten_cache_blocks(req);
         if blocks.is_empty() {
@@ -168,7 +179,7 @@ impl PromptCacheTracker {
             breakpoints,
             lookup_points,
             total_input_tokens: total_input_tokens.max(cumulative_tokens),
-            model: req.model.clone(),
+            model: cache_model.to_string(),
         })
     }
 
@@ -540,8 +551,24 @@ fn prune_expired_locked(
 }
 
 fn min_cacheable_tokens_for_model(model: &str) -> i32 {
-    if model.to_lowercase().contains("opus") {
-        OPUS_MIN_CACHEABLE_TOKENS
+    let model = model.to_lowercase().replace('_', "-");
+    if model.contains("haiku") {
+        if model.contains("3-5") || model.contains("3.5") {
+            HAIKU_3_MIN_CACHEABLE_TOKENS
+        } else {
+            EXTENDED_MIN_CACHEABLE_TOKENS
+        }
+    } else if model.contains("opus")
+        && (model == "opus"
+            || model == "opusplan"
+            || model.contains("4-5")
+            || model.contains("4.5")
+            || model.contains("4-6")
+            || model.contains("4.6")
+            || model.contains("4-7")
+            || model.contains("4.7"))
+    {
+        EXTENDED_MIN_CACHEABLE_TOKENS
     } else {
         DEFAULT_MIN_CACHEABLE_TOKENS
     }
@@ -720,6 +747,51 @@ mod tests {
         tracker.update(Some(scope.clone()), Some(&profile), 0.95);
         let second = tracker.compute(Some(scope), Some(&profile), 0.95);
         assert!(second.cache_read_input_tokens > 0);
+    }
+
+    #[test]
+    fn min_cacheable_tokens_are_model_specific() {
+        assert_eq!(
+            min_cacheable_tokens_for_model("claude-haiku-4-5-20251001"),
+            4096
+        );
+        assert_eq!(min_cacheable_tokens_for_model("claude-haiku-4.5"), 4096);
+        assert_eq!(min_cacheable_tokens_for_model("claude-haiku-3.5"), 2048);
+        assert_eq!(
+            min_cacheable_tokens_for_model("claude-sonnet-4-5-20250929"),
+            1024
+        );
+        assert_eq!(min_cacheable_tokens_for_model("claude-opus-4-7"), 4096);
+    }
+
+    #[test]
+    fn high_cache_profile_uses_resolved_upstream_model_threshold() {
+        let tracker = PromptCacheTracker::default();
+        let mut req = request(long_text());
+        req.model = "haiku".to_string();
+        let profile = tracker
+            .build_high_cache_profile_for_model(&req, 3_500, "claude-haiku-4-5-20251001")
+            .expect("high-cache should still build a profile for supported Haiku");
+        let scope = PromptCacheScope {
+            credential_id: 1,
+            conversation_id: "haiku-threshold-session".to_string(),
+            model: "claude-haiku-4-5-20251001".to_string(),
+        };
+
+        let short = tracker.compute(Some(scope.clone()), Some(&profile), 0.95);
+        assert_eq!(
+            short.cache_creation_input_tokens, 0,
+            "Haiku 4.5 must not simulate cache below its 4096 token minimum"
+        );
+
+        let profile = tracker
+            .build_high_cache_profile_for_model(&req, 8_000, "claude-haiku-4-5-20251001")
+            .expect("high-cache should build a profile for a longer Haiku request");
+        let long = tracker.compute(Some(scope), Some(&profile), 0.95);
+        assert!(
+            long.cache_creation_input_tokens >= 4096,
+            "Haiku 4.5 should simulate cache only once the request clears the official minimum"
+        );
     }
 
     #[test]

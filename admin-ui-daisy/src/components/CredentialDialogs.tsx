@@ -115,6 +115,9 @@ export function AddCredentialModal({
         priority,
         machineId: form.machineId.trim() || undefined,
         proxyResourceId: form.proxyResourceId ? Number(form.proxyResourceId) : undefined,
+        proxyUrl: form.proxyUrl.trim() || undefined,
+        proxyUsername: form.proxyUsername.trim() || undefined,
+        proxyPassword: form.proxyPassword.trim() || undefined,
         endpoint: form.endpoint.trim() || undefined,
       },
       {
@@ -191,6 +194,15 @@ export function AddCredentialModal({
                 </Select.Option>
               ))}
             </Select>
+          </FieldLabel>
+          <FieldLabel title="独立代理 URL" description="可选。只对该凭据生效；如果同时选择代理资源，后端会按项目现有优先级处理。">
+            <Input bordered size="sm" value={form.proxyUrl} onChange={(event) => update('proxyUrl', event.target.value)} placeholder="socks5h://127.0.0.1:1080" />
+          </FieldLabel>
+          <FieldLabel title="代理用户名">
+            <Input bordered size="sm" value={form.proxyUsername} onChange={(event) => update('proxyUsername', event.target.value)} />
+          </FieldLabel>
+          <FieldLabel title="代理密码">
+            <Input bordered size="sm" type="password" value={form.proxyPassword} onChange={(event) => update('proxyPassword', event.target.value)} />
           </FieldLabel>
         </div>
         <Modal.Actions>

@@ -29,11 +29,8 @@ use crate::kiro::token_manager::{
 use crate::model::config::{Config, TlsBackend};
 use parking_lot::Mutex;
 
-/// 每个凭据的最大重试次数
-const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
-
-/// 总重试次数硬上限（避免无限重试）
-const MAX_TOTAL_RETRIES: usize = 9;
+/// 自动模式下的小账号池最少尝试次数，保持既有 1-3 个账号时最多 9 次的行为。
+const MIN_AUTO_RETRY_ATTEMPTS: usize = 9;
 
 fn should_log_upstream_body_size_at_info(body_bytes: usize, config: &Config) -> bool {
     let near_payload_guard_limit = config.payload_guard_max_bytes > 0
@@ -564,6 +561,23 @@ mod tests {
         ));
         assert!(!KiroProvider::is_event_stream_content_type("text/plain"));
     }
+
+    #[test]
+    fn auto_retry_attempts_cover_large_credential_pool() {
+        let config = Config::default();
+
+        assert_eq!(KiroProvider::test_max_retry_attempts(1, &config), 9);
+        assert_eq!(KiroProvider::test_max_retry_attempts(3, &config), 9);
+        assert_eq!(KiroProvider::test_max_retry_attempts(25, &config), 25);
+    }
+
+    #[test]
+    fn configured_retry_attempts_override_auto_pool_size() {
+        let mut config = Config::default();
+        config.credential_retry_max_attempts = 12;
+
+        assert_eq!(KiroProvider::test_max_retry_attempts(25, &config), 12);
+    }
 }
 
 impl KiroProvider {
@@ -1054,7 +1068,8 @@ impl KiroProvider {
     /// 内部方法：带重试逻辑的 MCP API 调用
     async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let max_retries =
+            Self::max_retry_attempts(total_credentials, &self.token_manager.runtime_config());
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
 
@@ -1456,9 +1471,9 @@ impl KiroProvider {
     /// 内部方法：带重试逻辑的 API 调用
     ///
     /// 重试策略：
-    /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
-    /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
-    /// - 硬上限 9 次，避免无限重试
+    /// - `credentialRetryMaxAttempts > 0` 时使用显式上限
+    /// - 默认 `0` 自动按凭据池规模放大，小账号池保持最多 9 次，大账号池至少覆盖一轮凭据
+    /// - 每个凭据触发瞬态错误后会进入临时冷却，后续调度优先换其他凭据
     async fn call_api_with_retry(
         &self,
         request_body: &str,
@@ -1466,7 +1481,8 @@ impl KiroProvider {
         request_id: Option<&str>,
     ) -> anyhow::Result<ApiCallResponse> {
         let total_credentials = self.token_manager.total_count();
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let max_retries =
+            Self::max_retry_attempts(total_credentials, &self.token_manager.runtime_config());
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
@@ -2347,6 +2363,20 @@ impl KiroProvider {
     #[cfg(test)]
     pub(crate) fn test_extract_conversation_id_from_request(request_body: &str) -> Option<String> {
         Self::extract_conversation_id_from_request(request_body)
+    }
+
+    fn max_retry_attempts(total_credentials: usize, config: &Config) -> usize {
+        let configured = config.credential_retry_max_attempts as usize;
+        if configured > 0 {
+            return configured.max(1);
+        }
+
+        total_credentials.max(1).max(MIN_AUTO_RETRY_ATTEMPTS)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_max_retry_attempts(total_credentials: usize, config: &Config) -> usize {
+        Self::max_retry_attempts(total_credentials, config)
     }
 
     fn retry_delay(attempt: usize) -> Duration {

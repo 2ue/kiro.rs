@@ -3,7 +3,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::anthropic::pricing::ModelPricing;
-use crate::model::config::{CompatProfile, CompressionConfig, ReportedUsageConfig};
+use crate::model::config::{
+    CompatProfile, CompressionConfig, PayloadShapingConfig, PayloadShapingConfigPatch,
+    ReportedUsageConfig,
+};
 
 // ============ 凭据状态 ============
 
@@ -570,6 +573,7 @@ pub struct RuntimeConfigResponse {
     pub credential_probation_secs: u64,
     pub credential_max_cooldown_secs: u64,
     pub credential_dispatch_max_wait_secs: u64,
+    pub credential_retry_max_attempts: u32,
     pub credential_in_flight_lease_max_secs: u64,
     pub dispatch_global_max_concurrent_requests: u32,
     pub dispatch_max_queued_requests: u32,
@@ -590,6 +594,7 @@ pub struct RuntimeConfigResponse {
     pub payload_guard_enabled: bool,
     pub payload_guard_max_bytes: u64,
     pub payload_guard_trim_history: bool,
+    pub payload_shaping: PayloadShapingConfig,
     pub prompt_cache_target_read_ratio: f64,
     pub prompt_cache_token_scale: f64,
     pub prompt_cache_max_simulated_input_tokens: i32,
@@ -632,6 +637,8 @@ pub struct UpdateRuntimeConfigRequest {
     #[serde(default)]
     pub credential_dispatch_max_wait_secs: Option<u64>,
     #[serde(default)]
+    pub credential_retry_max_attempts: Option<u32>,
+    #[serde(default)]
     pub credential_in_flight_lease_max_secs: Option<u64>,
     #[serde(default)]
     pub dispatch_global_max_concurrent_requests: Option<u32>,
@@ -669,6 +676,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub payload_guard_max_bytes: Option<u64>,
     #[serde(default)]
     pub payload_guard_trim_history: Option<bool>,
+    #[serde(default)]
+    pub payload_shaping: Option<PayloadShapingConfigPatch>,
     #[serde(default)]
     pub prompt_cache_target_read_ratio: Option<f64>,
     #[serde(default)]

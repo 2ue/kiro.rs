@@ -66,6 +66,15 @@ function formatAttemptChain(record: UsageRecord): string {
     .join(' > ')
 }
 
+function formatJsonBlock(value: unknown): string {
+  if (!value) return '-'
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return String(value)
+  }
+}
+
 function UsageMetric({
   label,
   value,
@@ -403,6 +412,17 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
               {record.errorDetail || record.errorMessage || '-'}
             </pre>
           </div>
+          {Boolean(record.payloadBreakdown || record.payloadGuardReport) && (
+            <div>
+              <div className="mb-2 text-sm font-medium">Payload 诊断</div>
+              <pre className="max-h-96 overflow-auto rounded-box border border-base-300 bg-base-200 p-3 text-xs whitespace-pre-wrap break-words">
+                {formatJsonBlock({
+                  breakdown: record.payloadBreakdown || null,
+                  guard: record.payloadGuardReport || null,
+                })}
+              </pre>
+            </div>
+          )}
         </div>
       )}
     </ModalShell>

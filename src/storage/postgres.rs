@@ -2516,6 +2516,8 @@ mod tests {
             error_type: None,
             error_message: None,
             error_detail: None,
+            payload_breakdown: None,
+            payload_guard_report: None,
         }
     }
 

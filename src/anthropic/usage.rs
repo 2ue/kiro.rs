@@ -118,6 +118,10 @@ pub struct UsageRecord {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_breakdown: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_guard_report: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -872,6 +876,8 @@ mod tests {
             error_type: None,
             error_message: None,
             error_detail: None,
+            payload_breakdown: None,
+            payload_guard_report: None,
         }
     }
 

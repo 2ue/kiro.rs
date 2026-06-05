@@ -1435,6 +1435,7 @@ impl AdminService {
             credential_probation_secs: config.credential_probation_secs,
             credential_max_cooldown_secs: config.credential_max_cooldown_secs,
             credential_dispatch_max_wait_secs: config.credential_dispatch_max_wait_secs,
+            credential_retry_max_attempts: config.credential_retry_max_attempts,
             credential_in_flight_lease_max_secs: config.credential_in_flight_lease_max_secs,
             dispatch_global_max_concurrent_requests: config.dispatch_global_max_concurrent_requests,
             dispatch_max_queued_requests: config.dispatch_max_queued_requests,
@@ -1455,6 +1456,7 @@ impl AdminService {
             payload_guard_enabled: config.payload_guard_enabled,
             payload_guard_max_bytes: config.payload_guard_max_bytes as u64,
             payload_guard_trim_history: config.payload_guard_trim_history,
+            payload_shaping: config.payload_shaping,
             prompt_cache_target_read_ratio: config.prompt_cache_target_read_ratio,
             prompt_cache_token_scale: config.prompt_cache_token_scale,
             prompt_cache_max_simulated_input_tokens: config.prompt_cache_max_simulated_input_tokens,
@@ -1478,6 +1480,9 @@ impl AdminService {
         let credential_dispatch_max_wait_secs = req
             .credential_dispatch_max_wait_secs
             .unwrap_or(current_config.credential_dispatch_max_wait_secs);
+        let credential_retry_max_attempts = req
+            .credential_retry_max_attempts
+            .unwrap_or(current_config.credential_retry_max_attempts);
         let credential_in_flight_lease_max_secs = req
             .credential_in_flight_lease_max_secs
             .unwrap_or(current_config.credential_in_flight_lease_max_secs);
@@ -1560,6 +1565,10 @@ impl AdminService {
         let payload_guard_trim_history = req
             .payload_guard_trim_history
             .unwrap_or(current_config.payload_guard_trim_history);
+        let payload_shaping = req
+            .payload_shaping
+            .map(|patch| patch.apply_to(current_config.payload_shaping))
+            .unwrap_or(current_config.payload_shaping);
         let prompt_cache_token_scale = req
             .prompt_cache_token_scale
             .unwrap_or(current_config.prompt_cache_token_scale);
@@ -1626,6 +1635,11 @@ impl AdminService {
         if credential_cooldown_jitter_percent > 100 {
             return Err(AdminServiceError::InvalidCredential(
                 "credentialCooldownJitterPercent 不能大于 100".to_string(),
+            ));
+        }
+        if credential_retry_max_attempts > 10_000 {
+            return Err(AdminServiceError::InvalidCredential(
+                "credentialRetryMaxAttempts 不能大于 10000".to_string(),
             ));
         }
         if !scheduler_error_ewma_alpha.is_finite()
@@ -1741,6 +1755,7 @@ impl AdminService {
                 config.credential_probation_secs = credential_probation_secs;
                 config.credential_max_cooldown_secs = req.credential_max_cooldown_secs;
                 config.credential_dispatch_max_wait_secs = credential_dispatch_max_wait_secs;
+                config.credential_retry_max_attempts = credential_retry_max_attempts;
                 config.credential_in_flight_lease_max_secs = credential_in_flight_lease_max_secs;
                 config.dispatch_global_max_concurrent_requests =
                     dispatch_global_max_concurrent_requests;
@@ -1761,6 +1776,7 @@ impl AdminService {
                 config.payload_guard_enabled = payload_guard_enabled;
                 config.payload_guard_max_bytes = payload_guard_max_bytes;
                 config.payload_guard_trim_history = payload_guard_trim_history;
+                config.payload_shaping = payload_shaping;
                 config.prompt_cache_target_read_ratio = prompt_cache_target_read_ratio;
                 config.prompt_cache_token_scale = prompt_cache_token_scale;
                 config.prompt_cache_max_simulated_input_tokens =

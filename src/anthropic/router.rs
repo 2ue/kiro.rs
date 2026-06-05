@@ -10,7 +10,9 @@ use axum::{
 };
 
 use crate::kiro::provider::KiroProvider;
-use crate::model::config::{CompatProfile, PromptCacheSimulationMode, ReportedUsageConfig};
+use crate::model::config::{
+    CompatProfile, PayloadShapingConfig, PromptCacheSimulationMode, ReportedUsageConfig,
+};
 
 use super::{
     handlers::{
@@ -71,6 +73,7 @@ pub fn create_router_with_provider(
     payload_guard_enabled: bool,
     payload_guard_max_bytes: usize,
     payload_guard_trim_history: bool,
+    payload_shaping: PayloadShapingConfig,
 ) -> Router {
     let mut base_state = AppState::new(
         api_key,
@@ -94,6 +97,7 @@ pub fn create_router_with_provider(
         payload_guard_enabled,
         payload_guard_max_bytes,
         payload_guard_trim_history,
+        payload_shaping,
     )
     .with_pricing_catalog(pricing_catalog)
     .with_model_capabilities(model_capabilities);

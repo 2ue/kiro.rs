@@ -658,7 +658,7 @@ Admin 页面不应该只显示余额，因为余额是账号级，而高缓存�
 4. canonical JSON 剔除 `cache_control`。
 5. 忽略 Claude Code billing header。
 6. 支持 TTL 5m/1h。
-7. 支持最小 cacheable tokens：Sonnet/Haiku 1024，Opus 4096。
+7. 支持模型级最小 cacheable tokens：Sonnet 4/4.5/4.6、Opus 4/4.1/4.8 按 1024；Haiku 4.5 和 Opus 4.5/4.6/4.7 按 4096；Haiku 3.5 按 2048。阈值按实际解析后的上游模型判断，而不是按 `/ha` 路径或请求别名判断。
 8. cacheable cap 默认 85%。
 9. cache key 使用 `credentialId + conversationId + model`。
 10. 上游成功后 update，失败不 update。

@@ -47,6 +47,193 @@ pub struct CompressionConfig {
     pub whitespace_compression: bool,
 }
 
+/// Kiro payload shaping 配置。
+///
+/// 该配置只处理旧历史和可安全压缩的冗余内容；默认不截断当前用户消息、
+/// 当前合法 tool_result、当前 document/PDF 或当前图片。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PayloadShapingConfig {
+    #[serde(default = "default_payload_shaping_enabled")]
+    pub enabled: bool,
+
+    #[serde(default = "default_true")]
+    pub truncate_historical_tool_results: bool,
+
+    #[serde(default = "default_historical_tool_result_max_chars")]
+    pub historical_tool_result_max_chars: usize,
+
+    #[serde(default = "default_historical_tool_result_head_lines")]
+    pub historical_tool_result_head_lines: usize,
+
+    #[serde(default = "default_historical_tool_result_tail_lines")]
+    pub historical_tool_result_tail_lines: usize,
+
+    #[serde(default = "default_true")]
+    pub discard_historical_thinking: bool,
+
+    #[serde(default = "default_true")]
+    pub compress_tool_definitions: bool,
+
+    #[serde(default = "default_tool_definitions_budget_bytes")]
+    pub tool_definitions_budget_bytes: usize,
+
+    #[serde(default = "default_tool_description_max_chars")]
+    pub tool_description_max_chars: usize,
+
+    #[serde(default = "default_tool_schema_annotation_max_chars")]
+    pub tool_schema_annotation_max_chars: usize,
+
+    #[serde(default = "default_true")]
+    pub web_fetch_trim_enabled: bool,
+
+    #[serde(default = "default_web_fetch_body_max_chars")]
+    pub web_fetch_body_max_chars: usize,
+
+    #[serde(default)]
+    pub fit_current_payload_to_budget: bool,
+
+    #[serde(default)]
+    pub truncate_current_tool_results: bool,
+
+    #[serde(default = "default_current_tool_result_max_chars")]
+    pub current_tool_result_max_chars: usize,
+
+    #[serde(default)]
+    pub truncate_current_user_content: bool,
+
+    #[serde(default = "default_current_user_content_max_chars")]
+    pub current_user_content_max_chars: usize,
+
+    #[serde(default)]
+    pub truncate_current_documents: bool,
+
+    #[serde(default = "default_current_document_max_chars")]
+    pub current_document_max_chars: usize,
+
+    #[serde(default)]
+    pub truncate_current_images: bool,
+
+    #[serde(default = "default_current_images_max_bytes")]
+    pub current_images_max_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PayloadShapingConfigPatch {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub truncate_historical_tool_results: Option<bool>,
+    #[serde(default)]
+    pub historical_tool_result_max_chars: Option<usize>,
+    #[serde(default)]
+    pub historical_tool_result_head_lines: Option<usize>,
+    #[serde(default)]
+    pub historical_tool_result_tail_lines: Option<usize>,
+    #[serde(default)]
+    pub discard_historical_thinking: Option<bool>,
+    #[serde(default)]
+    pub compress_tool_definitions: Option<bool>,
+    #[serde(default)]
+    pub tool_definitions_budget_bytes: Option<usize>,
+    #[serde(default)]
+    pub tool_description_max_chars: Option<usize>,
+    #[serde(default)]
+    pub tool_schema_annotation_max_chars: Option<usize>,
+    #[serde(default)]
+    pub web_fetch_trim_enabled: Option<bool>,
+    #[serde(default)]
+    pub web_fetch_body_max_chars: Option<usize>,
+    #[serde(default)]
+    pub fit_current_payload_to_budget: Option<bool>,
+    #[serde(default)]
+    pub truncate_current_tool_results: Option<bool>,
+    #[serde(default)]
+    pub current_tool_result_max_chars: Option<usize>,
+    #[serde(default)]
+    pub truncate_current_user_content: Option<bool>,
+    #[serde(default)]
+    pub current_user_content_max_chars: Option<usize>,
+    #[serde(default)]
+    pub truncate_current_documents: Option<bool>,
+    #[serde(default)]
+    pub current_document_max_chars: Option<usize>,
+    #[serde(default)]
+    pub truncate_current_images: Option<bool>,
+    #[serde(default)]
+    pub current_images_max_bytes: Option<usize>,
+}
+
+impl PayloadShapingConfigPatch {
+    pub fn apply_to(self, mut config: PayloadShapingConfig) -> PayloadShapingConfig {
+        if let Some(value) = self.enabled {
+            config.enabled = value;
+        }
+        if let Some(value) = self.truncate_historical_tool_results {
+            config.truncate_historical_tool_results = value;
+        }
+        if let Some(value) = self.historical_tool_result_max_chars {
+            config.historical_tool_result_max_chars = value;
+        }
+        if let Some(value) = self.historical_tool_result_head_lines {
+            config.historical_tool_result_head_lines = value;
+        }
+        if let Some(value) = self.historical_tool_result_tail_lines {
+            config.historical_tool_result_tail_lines = value;
+        }
+        if let Some(value) = self.discard_historical_thinking {
+            config.discard_historical_thinking = value;
+        }
+        if let Some(value) = self.compress_tool_definitions {
+            config.compress_tool_definitions = value;
+        }
+        if let Some(value) = self.tool_definitions_budget_bytes {
+            config.tool_definitions_budget_bytes = value;
+        }
+        if let Some(value) = self.tool_description_max_chars {
+            config.tool_description_max_chars = value;
+        }
+        if let Some(value) = self.tool_schema_annotation_max_chars {
+            config.tool_schema_annotation_max_chars = value;
+        }
+        if let Some(value) = self.web_fetch_trim_enabled {
+            config.web_fetch_trim_enabled = value;
+        }
+        if let Some(value) = self.web_fetch_body_max_chars {
+            config.web_fetch_body_max_chars = value;
+        }
+        if let Some(value) = self.fit_current_payload_to_budget {
+            config.fit_current_payload_to_budget = value;
+        }
+        if let Some(value) = self.truncate_current_tool_results {
+            config.truncate_current_tool_results = value;
+        }
+        if let Some(value) = self.current_tool_result_max_chars {
+            config.current_tool_result_max_chars = value;
+        }
+        if let Some(value) = self.truncate_current_user_content {
+            config.truncate_current_user_content = value;
+        }
+        if let Some(value) = self.current_user_content_max_chars {
+            config.current_user_content_max_chars = value;
+        }
+        if let Some(value) = self.truncate_current_documents {
+            config.truncate_current_documents = value;
+        }
+        if let Some(value) = self.current_document_max_chars {
+            config.current_document_max_chars = value;
+        }
+        if let Some(value) = self.truncate_current_images {
+            config.truncate_current_images = value;
+        }
+        if let Some(value) = self.current_images_max_bytes {
+            config.current_images_max_bytes = value;
+        }
+        config
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ReportedUsageFieldMode {
@@ -314,6 +501,34 @@ impl Default for CompressionConfig {
     }
 }
 
+impl Default for PayloadShapingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_payload_shaping_enabled(),
+            truncate_historical_tool_results: true,
+            historical_tool_result_max_chars: default_historical_tool_result_max_chars(),
+            historical_tool_result_head_lines: default_historical_tool_result_head_lines(),
+            historical_tool_result_tail_lines: default_historical_tool_result_tail_lines(),
+            discard_historical_thinking: true,
+            compress_tool_definitions: true,
+            tool_definitions_budget_bytes: default_tool_definitions_budget_bytes(),
+            tool_description_max_chars: default_tool_description_max_chars(),
+            tool_schema_annotation_max_chars: default_tool_schema_annotation_max_chars(),
+            web_fetch_trim_enabled: true,
+            web_fetch_body_max_chars: default_web_fetch_body_max_chars(),
+            fit_current_payload_to_budget: false,
+            truncate_current_tool_results: false,
+            current_tool_result_max_chars: default_current_tool_result_max_chars(),
+            truncate_current_user_content: false,
+            current_user_content_max_chars: default_current_user_content_max_chars(),
+            truncate_current_documents: false,
+            current_document_max_chars: default_current_document_max_chars(),
+            truncate_current_images: false,
+            current_images_max_bytes: default_current_images_max_bytes(),
+        }
+    }
+}
+
 /// Anthropic compatibility profile.
 ///
 /// `claude-code` keeps the pragmatic rewrites needed by Claude Code CLI and
@@ -532,6 +747,13 @@ pub struct Config {
     #[serde(default = "default_credential_dispatch_max_wait_secs")]
     pub credential_dispatch_max_wait_secs: u64,
 
+    /// 单次上游调用最多尝试多少个凭据/重试轮次。
+    ///
+    /// `0` 表示自动：按当前凭据数量放大，至少覆盖一轮可用凭据；
+    /// `>0` 表示显式上限，用于限制单次请求在大凭据池下的最长故障转移时间。
+    #[serde(default)]
+    pub credential_retry_max_attempts: u32,
+
     /// 并发占用 lease 的最大存活秒数。
     ///
     /// `0` 表示不自动回收；`>0` 时，调度前会清理超过该时间仍未释放的占用，
@@ -563,6 +785,10 @@ pub struct Config {
     #[serde(default)]
     pub compression: CompressionConfig,
 
+    /// Kiro payload shaping 配置。默认只压缩旧历史和明显冗余，不截断当前输入。
+    #[serde(default)]
+    pub payload_shaping: PayloadShapingConfig,
+
     /// 发送 Kiro 上游前启用最终 payload 防护。
     ///
     /// 防护在 Anthropic -> Kiro 转换之后运行，按真实 JSON 字节数裁剪旧历史，
@@ -574,7 +800,8 @@ pub struct Config {
     #[serde(default = "default_payload_guard_max_bytes")]
     pub payload_guard_max_bytes: usize,
 
-    /// payload 超限时是否允许裁剪最旧历史。关闭后只执行轻量协议修复并直接报错。
+    /// payload 超限时是否允许裁剪最旧历史。关闭后只执行轻量协议修复；
+    /// 仍超预算的请求会标记 `still_oversized` 并继续透传给 Kiro。
     #[serde(default = "default_payload_guard_trim_history")]
     pub payload_guard_trim_history: bool,
 
@@ -830,6 +1057,54 @@ fn default_scheduler_top_k() -> u32 {
     3
 }
 
+fn default_payload_shaping_enabled() -> bool {
+    true
+}
+
+fn default_historical_tool_result_max_chars() -> usize {
+    8_000
+}
+
+fn default_historical_tool_result_head_lines() -> usize {
+    80
+}
+
+fn default_historical_tool_result_tail_lines() -> usize {
+    40
+}
+
+fn default_tool_definitions_budget_bytes() -> usize {
+    20_000
+}
+
+fn default_tool_description_max_chars() -> usize {
+    4_000
+}
+
+fn default_tool_schema_annotation_max_chars() -> usize {
+    1_000
+}
+
+fn default_web_fetch_body_max_chars() -> usize {
+    12_000
+}
+
+fn default_current_tool_result_max_chars() -> usize {
+    80_000
+}
+
+fn default_current_user_content_max_chars() -> usize {
+    120_000
+}
+
+fn default_current_document_max_chars() -> usize {
+    80_000
+}
+
+fn default_current_images_max_bytes() -> usize {
+    180_000
+}
+
 fn default_payload_guard_enabled() -> bool {
     true
 }
@@ -982,6 +1257,7 @@ impl Default for Config {
             credential_probation_secs: default_credential_probation_secs(),
             credential_max_cooldown_secs: default_credential_max_cooldown_secs(),
             credential_dispatch_max_wait_secs: default_credential_dispatch_max_wait_secs(),
+            credential_retry_max_attempts: 0,
             credential_in_flight_lease_max_secs: default_credential_in_flight_lease_max_secs(),
             dispatch_global_max_concurrent_requests: 0,
             dispatch_max_queued_requests: 0,
@@ -990,6 +1266,7 @@ impl Default for Config {
             credential_warmup_max_selection_percent:
                 default_credential_warmup_max_selection_percent(),
             compression: CompressionConfig::default(),
+            payload_shaping: PayloadShapingConfig::default(),
             payload_guard_enabled: default_payload_guard_enabled(),
             payload_guard_max_bytes: default_payload_guard_max_bytes(),
             payload_guard_trim_history: default_payload_guard_trim_history(),
@@ -1106,6 +1383,7 @@ mod tests {
         assert_eq!(config.credential_probation_secs, 30);
         assert_eq!(config.credential_max_cooldown_secs, 300);
         assert_eq!(config.credential_dispatch_max_wait_secs, 120);
+        assert_eq!(config.credential_retry_max_attempts, 0);
         assert_eq!(config.credential_in_flight_lease_max_secs, 900);
         assert_eq!(config.dispatch_global_max_concurrent_requests, 0);
         assert_eq!(config.dispatch_max_queued_requests, 0);
@@ -1115,6 +1393,17 @@ mod tests {
         assert!(config.payload_guard_enabled);
         assert_eq!(config.payload_guard_max_bytes, 450 * 1024);
         assert!(config.payload_guard_trim_history);
+        assert!(config.payload_shaping.enabled);
+        assert!(config.payload_shaping.truncate_historical_tool_results);
+        assert_eq!(
+            config.payload_shaping.historical_tool_result_max_chars,
+            8_000
+        );
+        assert_eq!(config.payload_shaping.tool_definitions_budget_bytes, 20_000);
+        assert_eq!(config.payload_shaping.web_fetch_body_max_chars, 12_000);
+        assert!(!config.payload_shaping.fit_current_payload_to_budget);
+        assert!(!config.payload_shaping.truncate_current_user_content);
+        assert!(!config.payload_shaping.truncate_current_tool_results);
         assert_eq!(config.scheduler_selection_pressure_weight, 25.0);
         assert_eq!(config.scheduler_total_selection_weight, 0.0);
         assert_eq!(config.scheduler_top_k, 3);
@@ -1240,6 +1529,48 @@ mod tests {
         assert_eq!(config.prompt_cache_cap_jitter_min_tokens, 5_000);
         assert_eq!(config.prompt_cache_cap_jitter_max_tokens, 20_000);
         assert_eq!(config.prompt_cache_scale_min_input_tokens, 10_000);
+    }
+
+    #[test]
+    fn payload_shaping_patch_preserves_unspecified_fields() {
+        let base = PayloadShapingConfig {
+            enabled: true,
+            truncate_historical_tool_results: true,
+            historical_tool_result_max_chars: 12_345,
+            historical_tool_result_head_lines: 12,
+            historical_tool_result_tail_lines: 6,
+            discard_historical_thinking: true,
+            compress_tool_definitions: true,
+            tool_definitions_budget_bytes: 44_000,
+            tool_description_max_chars: 3_333,
+            tool_schema_annotation_max_chars: 444,
+            web_fetch_trim_enabled: true,
+            web_fetch_body_max_chars: 8_888,
+            fit_current_payload_to_budget: false,
+            truncate_current_tool_results: false,
+            current_tool_result_max_chars: 77_000,
+            truncate_current_user_content: false,
+            current_user_content_max_chars: 88_000,
+            truncate_current_documents: false,
+            current_document_max_chars: 99_000,
+            truncate_current_images: false,
+            current_images_max_bytes: 111_000,
+        };
+
+        let patch: PayloadShapingConfigPatch = serde_json::from_value(serde_json::json!({
+            "fitCurrentPayloadToBudget": true,
+            "currentUserContentMaxChars": 4096,
+            "compressToolDefinitions": false
+        }))
+        .expect("patch");
+        let merged = patch.apply_to(base);
+
+        assert!(merged.fit_current_payload_to_budget);
+        assert_eq!(merged.current_user_content_max_chars, 4_096);
+        assert!(!merged.compress_tool_definitions);
+        assert_eq!(merged.historical_tool_result_max_chars, 12_345);
+        assert_eq!(merged.tool_definitions_budget_bytes, 44_000);
+        assert_eq!(merged.current_images_max_bytes, 111_000);
     }
 
     #[test]

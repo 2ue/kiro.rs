@@ -10,10 +10,17 @@ use std::collections::HashSet;
 use crate::kiro::model::requests::{
     conversation::{Message, UserInputMessage, UserMessage},
     kiro::KiroRequest,
-    tool::ToolResult,
+    tool::{Tool, ToolResult},
 };
+use crate::model::config::PayloadShapingConfig;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+const CURRENT_FIT_MIN_TEXT_CHARS: usize = 512;
+const CURRENT_FIT_MAX_ITERATIONS: usize = 64;
+const CURRENT_FIT_OVERHEAD_BYTES: usize = 512;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PayloadByteBreakdown {
     pub total_bytes: usize,
     pub history_bytes: usize,
@@ -22,11 +29,15 @@ pub struct PayloadByteBreakdown {
     pub current_tools_bytes: usize,
     pub current_tool_results_bytes: usize,
     pub current_images_bytes: usize,
+    pub history_tool_results_bytes: usize,
+    pub history_images_bytes: usize,
     pub history_entries: usize,
     pub current_tool_count: usize,
     pub current_tool_result_count: usize,
     pub current_image_count: usize,
     pub largest_tool_bytes: usize,
+    pub largest_history_tool_result_bytes: usize,
+    pub largest_current_tool_result_bytes: usize,
     pub history_tool_use_count: usize,
     pub history_tool_result_count: usize,
 }
@@ -36,9 +47,11 @@ pub struct PayloadGuardConfig {
     pub enabled: bool,
     pub max_bytes: usize,
     pub trim_history: bool,
+    pub shaping: PayloadShapingConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PayloadGuardReport {
     pub enabled: bool,
     pub max_bytes: usize,
@@ -52,6 +65,22 @@ pub struct PayloadGuardReport {
     pub removed_orphan_tool_results: usize,
     pub textified_orphan_tool_results: usize,
     pub removed_orphan_tool_uses: usize,
+    pub truncated_history_tool_results: usize,
+    pub truncated_history_tool_result_chars: usize,
+    pub removed_history_thinking_blocks: usize,
+    pub removed_history_thinking_chars: usize,
+    pub trimmed_web_fetch_blocks: usize,
+    pub trimmed_web_fetch_chars: usize,
+    pub compressed_tool_definitions: usize,
+    pub compressed_tool_definition_bytes: usize,
+    pub truncated_current_tool_results: usize,
+    pub truncated_current_tool_result_chars: usize,
+    pub truncated_current_documents: usize,
+    pub truncated_current_document_chars: usize,
+    pub truncated_current_user_content: usize,
+    pub truncated_current_user_content_chars: usize,
+    pub dropped_current_images: usize,
+    pub dropped_current_image_bytes: usize,
     pub still_oversized: bool,
 }
 
@@ -70,6 +99,22 @@ impl PayloadGuardReport {
             removed_orphan_tool_results: 0,
             textified_orphan_tool_results: 0,
             removed_orphan_tool_uses: 0,
+            truncated_history_tool_results: 0,
+            truncated_history_tool_result_chars: 0,
+            removed_history_thinking_blocks: 0,
+            removed_history_thinking_chars: 0,
+            trimmed_web_fetch_blocks: 0,
+            trimmed_web_fetch_chars: 0,
+            compressed_tool_definitions: 0,
+            compressed_tool_definition_bytes: 0,
+            truncated_current_tool_results: 0,
+            truncated_current_tool_result_chars: 0,
+            truncated_current_documents: 0,
+            truncated_current_document_chars: 0,
+            truncated_current_user_content: 0,
+            truncated_current_user_content_chars: 0,
+            dropped_current_images: 0,
+            dropped_current_image_bytes: 0,
             still_oversized: false,
         }
     }
@@ -81,6 +126,14 @@ impl PayloadGuardReport {
             || self.removed_orphan_tool_results > 0
             || self.textified_orphan_tool_results > 0
             || self.removed_orphan_tool_uses > 0
+            || self.truncated_history_tool_results > 0
+            || self.removed_history_thinking_blocks > 0
+            || self.trimmed_web_fetch_blocks > 0
+            || self.compressed_tool_definitions > 0
+            || self.truncated_current_tool_results > 0
+            || self.truncated_current_documents > 0
+            || self.truncated_current_user_content > 0
+            || self.dropped_current_images > 0
     }
 
     pub fn warning_header_fragment(&self) -> Option<String> {
@@ -122,6 +175,54 @@ impl PayloadGuardReport {
             parts.push(format!(
                 "payload-orphan-tool-uses={}",
                 self.removed_orphan_tool_uses
+            ));
+        }
+        if self.truncated_history_tool_results > 0 {
+            parts.push(format!(
+                "payload-history-tool-results-truncated={}",
+                self.truncated_history_tool_results
+            ));
+        }
+        if self.removed_history_thinking_blocks > 0 {
+            parts.push(format!(
+                "payload-history-thinking-blocks={}",
+                self.removed_history_thinking_blocks
+            ));
+        }
+        if self.trimmed_web_fetch_blocks > 0 {
+            parts.push(format!(
+                "payload-web-fetch-trimmed={}",
+                self.trimmed_web_fetch_blocks
+            ));
+        }
+        if self.compressed_tool_definitions > 0 {
+            parts.push(format!(
+                "payload-tools-compressed={}",
+                self.compressed_tool_definitions
+            ));
+        }
+        if self.truncated_current_tool_results > 0 {
+            parts.push(format!(
+                "payload-current-tool-results-truncated={}",
+                self.truncated_current_tool_results
+            ));
+        }
+        if self.truncated_current_documents > 0 {
+            parts.push(format!(
+                "payload-current-documents-truncated={}",
+                self.truncated_current_documents
+            ));
+        }
+        if self.truncated_current_user_content > 0 {
+            parts.push(format!(
+                "payload-current-content-truncated={}",
+                self.truncated_current_user_content
+            ));
+        }
+        if self.dropped_current_images > 0 {
+            parts.push(format!(
+                "payload-current-images-dropped={}",
+                self.dropped_current_images
             ));
         }
         if self.still_oversized {
@@ -173,6 +274,22 @@ pub fn guard_kiro_request(
         removed_orphan_tool_results: 0,
         textified_orphan_tool_results: 0,
         removed_orphan_tool_uses: 0,
+        truncated_history_tool_results: 0,
+        truncated_history_tool_result_chars: 0,
+        removed_history_thinking_blocks: 0,
+        removed_history_thinking_chars: 0,
+        trimmed_web_fetch_blocks: 0,
+        trimmed_web_fetch_chars: 0,
+        compressed_tool_definitions: 0,
+        compressed_tool_definition_bytes: 0,
+        truncated_current_tool_results: 0,
+        truncated_current_tool_result_chars: 0,
+        truncated_current_documents: 0,
+        truncated_current_document_chars: 0,
+        truncated_current_user_content: 0,
+        truncated_current_user_content_chars: 0,
+        dropped_current_images: 0,
+        dropped_current_image_bytes: 0,
         still_oversized: false,
     };
 
@@ -187,6 +304,28 @@ pub fn guard_kiro_request(
 
     let mut body = serialize_request(request)?;
     report.final_bytes = body.len();
+
+    if size_limit_enabled && report.final_bytes > config.max_bytes && config.shaping.enabled {
+        let shaping = apply_payload_shaping(request, config.shaping);
+        report.truncated_history_tool_results += shaping.truncated_history_tool_results;
+        report.truncated_history_tool_result_chars += shaping.truncated_history_tool_result_chars;
+        report.removed_history_thinking_blocks += shaping.removed_history_thinking_blocks;
+        report.removed_history_thinking_chars += shaping.removed_history_thinking_chars;
+        report.trimmed_web_fetch_blocks += shaping.trimmed_web_fetch_blocks;
+        report.trimmed_web_fetch_chars += shaping.trimmed_web_fetch_chars;
+        report.compressed_tool_definitions += shaping.compressed_tool_definitions;
+        report.compressed_tool_definition_bytes += shaping.compressed_tool_definition_bytes;
+
+        if shaping.was_modified() {
+            let repair = repair_request(request);
+            report.removed_empty_tool_uses += repair.removed_empty_tool_uses;
+            report.removed_orphan_tool_results += repair.removed_orphan_tool_results;
+            report.textified_orphan_tool_results += repair.textified_orphan_tool_results;
+            report.removed_orphan_tool_uses += repair.removed_orphan_tool_uses;
+            body = serialize_request(request)?;
+            report.final_bytes = body.len();
+        }
+    }
 
     if size_limit_enabled && config.trim_history {
         while report.final_bytes > config.max_bytes
@@ -215,6 +354,31 @@ pub fn guard_kiro_request(
         }
     }
 
+    if size_limit_enabled
+        && report.final_bytes > config.max_bytes
+        && config.shaping.enabled
+        && current_payload_shaping_enabled(config.shaping)
+    {
+        let (new_body, current_stats) = apply_current_payload_shaping_until_fit(
+            request,
+            config.shaping,
+            config.max_bytes,
+            body,
+        )?;
+        report.truncated_current_tool_results += current_stats.truncated_current_tool_results;
+        report.truncated_current_tool_result_chars +=
+            current_stats.truncated_current_tool_result_chars;
+        report.truncated_current_documents += current_stats.truncated_current_documents;
+        report.truncated_current_document_chars += current_stats.truncated_current_document_chars;
+        report.truncated_current_user_content += current_stats.truncated_current_user_content;
+        report.truncated_current_user_content_chars +=
+            current_stats.truncated_current_user_content_chars;
+        report.dropped_current_images += current_stats.dropped_current_images;
+        report.dropped_current_image_bytes += current_stats.dropped_current_image_bytes;
+        body = new_body;
+        report.final_bytes = body.len();
+    }
+
     report.final_history_entries = request.conversation_state.history.len();
     report.final_bytes = body.len();
     report.still_oversized = size_limit_enabled && report.final_bytes > config.max_bytes;
@@ -238,11 +402,20 @@ pub fn breakdown_kiro_request(
         current_tools_bytes: json_len(&context.tools),
         current_tool_results_bytes: json_len(&context.tool_results),
         current_images_bytes: json_len(&current_user.images),
+        history_tool_results_bytes: history_tool_results_bytes(&state.history),
+        history_images_bytes: history_images_bytes(&state.history),
         history_entries: state.history.len(),
         current_tool_count: context.tools.len(),
         current_tool_result_count: context.tool_results.len(),
         current_image_count: current_user.images.len(),
         largest_tool_bytes: context.tools.iter().map(json_len).max().unwrap_or(0),
+        largest_history_tool_result_bytes: largest_history_tool_result_bytes(&state.history),
+        largest_current_tool_result_bytes: context
+            .tool_results
+            .iter()
+            .map(json_len)
+            .max()
+            .unwrap_or(0),
         history_tool_use_count: count_history_tool_uses(&state.history),
         history_tool_result_count: count_history_tool_results(&state.history),
     }
@@ -285,6 +458,1092 @@ fn count_history_tool_results(history: &[Message]) -> usize {
             Message::Assistant(_) => 0,
         })
         .sum()
+}
+
+fn history_tool_results_bytes(history: &[Message]) -> usize {
+    history
+        .iter()
+        .map(|message| match message {
+            Message::User(user) => json_len(
+                &user
+                    .user_input_message
+                    .user_input_message_context
+                    .tool_results,
+            ),
+            Message::Assistant(_) => 0,
+        })
+        .sum()
+}
+
+fn largest_history_tool_result_bytes(history: &[Message]) -> usize {
+    history
+        .iter()
+        .filter_map(|message| match message {
+            Message::User(user) => Some(
+                user.user_input_message
+                    .user_input_message_context
+                    .tool_results
+                    .iter()
+                    .map(json_len)
+                    .max()
+                    .unwrap_or(0),
+            ),
+            Message::Assistant(_) => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn history_images_bytes(history: &[Message]) -> usize {
+    history
+        .iter()
+        .map(|message| match message {
+            Message::User(user) => json_len(&user.user_input_message.images),
+            Message::Assistant(_) => 0,
+        })
+        .sum()
+}
+
+#[derive(Default)]
+struct ShapingStats {
+    truncated_history_tool_results: usize,
+    truncated_history_tool_result_chars: usize,
+    removed_history_thinking_blocks: usize,
+    removed_history_thinking_chars: usize,
+    trimmed_web_fetch_blocks: usize,
+    trimmed_web_fetch_chars: usize,
+    compressed_tool_definitions: usize,
+    compressed_tool_definition_bytes: usize,
+}
+
+impl ShapingStats {
+    fn was_modified(&self) -> bool {
+        self.truncated_history_tool_results > 0
+            || self.removed_history_thinking_blocks > 0
+            || self.trimmed_web_fetch_blocks > 0
+            || self.compressed_tool_definitions > 0
+    }
+}
+
+fn apply_payload_shaping(request: &mut KiroRequest, config: PayloadShapingConfig) -> ShapingStats {
+    let mut stats = ShapingStats::default();
+
+    if config.truncate_historical_tool_results {
+        let result = truncate_history_tool_results(
+            &mut request.conversation_state.history,
+            config.historical_tool_result_max_chars,
+            config.historical_tool_result_head_lines,
+            config.historical_tool_result_tail_lines,
+        );
+        stats.truncated_history_tool_results += result.0;
+        stats.truncated_history_tool_result_chars += result.1;
+    }
+
+    if config.web_fetch_trim_enabled {
+        let result = trim_history_web_fetch_content(
+            &mut request.conversation_state.history,
+            config.web_fetch_body_max_chars,
+        );
+        stats.trimmed_web_fetch_blocks += result.0;
+        stats.trimmed_web_fetch_chars += result.1;
+    }
+
+    if config.discard_historical_thinking {
+        let result = discard_history_thinking(&mut request.conversation_state.history);
+        stats.removed_history_thinking_blocks += result.0;
+        stats.removed_history_thinking_chars += result.1;
+    }
+
+    if config.compress_tool_definitions && config.tool_definitions_budget_bytes > 0 {
+        let before = json_len(
+            &request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tools,
+        );
+        if before > config.tool_definitions_budget_bytes {
+            let compressed = compress_tool_definitions(
+                &mut request
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .user_input_message_context
+                    .tools,
+                config.tool_definitions_budget_bytes,
+                config.tool_description_max_chars,
+                config.tool_schema_annotation_max_chars,
+            );
+            let after = json_len(
+                &request
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .user_input_message_context
+                    .tools,
+            );
+            if compressed > 0 || after < before {
+                stats.compressed_tool_definitions += compressed;
+                stats.compressed_tool_definition_bytes += before.saturating_sub(after);
+            }
+        }
+    }
+
+    stats
+}
+
+fn truncate_history_tool_results(
+    history: &mut [Message],
+    max_chars: usize,
+    head_lines: usize,
+    tail_lines: usize,
+) -> (usize, usize) {
+    if max_chars == 0 {
+        return (0, 0);
+    }
+
+    let mut truncated = 0usize;
+    let mut omitted_chars = 0usize;
+    for message in history {
+        let Message::User(user) = message else {
+            continue;
+        };
+        for result in &mut user
+            .user_input_message
+            .user_input_message_context
+            .tool_results
+        {
+            for item in &mut result.content {
+                let Some(value) = item.get_mut("text") else {
+                    continue;
+                };
+                let Some(text) = value.as_str() else {
+                    continue;
+                };
+                if looks_like_web_fetch_text(text) {
+                    continue;
+                }
+                if text.chars().count() <= max_chars {
+                    continue;
+                }
+                let original_chars = text.chars().count();
+                let replacement = truncate_text_head_tail(
+                    text,
+                    max_chars,
+                    head_lines,
+                    tail_lines,
+                    "historical tool result",
+                );
+                let replacement_chars = replacement.chars().count();
+                *value = serde_json::Value::String(replacement);
+                truncated += 1;
+                omitted_chars += original_chars.saturating_sub(replacement_chars);
+            }
+        }
+    }
+    (truncated, omitted_chars)
+}
+
+fn looks_like_web_fetch_text(text: &str) -> bool {
+    web_fetch_body_range(text).is_some()
+}
+
+fn truncate_text_head_tail(
+    text: &str,
+    max_chars: usize,
+    head_lines: usize,
+    tail_lines: usize,
+    label: &str,
+) -> String {
+    let original_chars = text.chars().count();
+    if original_chars <= max_chars {
+        return text.to_string();
+    }
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut head = Vec::new();
+    let mut tail = Vec::new();
+    let mut used_chars = 0usize;
+    let soft_budget = max_chars.saturating_sub(256).max(max_chars / 2);
+    let head_budget = soft_budget.saturating_mul(2) / 3;
+    let tail_budget = soft_budget.saturating_sub(head_budget);
+
+    for line in lines.iter().take(head_lines) {
+        let line_chars = line.chars().count().saturating_add(1);
+        if !head.is_empty() && used_chars.saturating_add(line_chars) > head_budget {
+            break;
+        }
+        used_chars += line_chars;
+        head.push(*line);
+    }
+
+    let mut tail_chars = 0usize;
+    for line in lines.iter().rev().take(tail_lines) {
+        let line_chars = line.chars().count().saturating_add(1);
+        if !tail.is_empty() && tail_chars.saturating_add(line_chars) > tail_budget {
+            break;
+        }
+        tail_chars += line_chars;
+        tail.push(*line);
+    }
+    tail.reverse();
+
+    if head.is_empty() && tail.is_empty() {
+        return format!(
+            "[{} truncated by proxy: original_chars={}, preserved=0_chars]",
+            label, original_chars
+        );
+    }
+
+    let mut out = String::new();
+    if !head.is_empty() {
+        out.push_str(&head.join("\n"));
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "\n[{} truncated by proxy: original_chars={}, preserved=head:{}_lines,tail:{}_lines]\n\n",
+        label,
+        original_chars,
+        head.len(),
+        tail.len()
+    ));
+    if !tail.is_empty() {
+        out.push_str(&tail.join("\n"));
+    }
+
+    fit_truncated_text_with_marker(&out, text, max_chars, label, original_chars)
+}
+
+fn safe_truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    text.chars().take(max_chars).collect()
+}
+
+fn fit_truncated_text_with_marker(
+    candidate: &str,
+    original: &str,
+    max_chars: usize,
+    label: &str,
+    original_chars: usize,
+) -> String {
+    if candidate.chars().count() <= max_chars {
+        return candidate.to_string();
+    }
+
+    let marker = format!(
+        "\n\n[{} truncated by proxy: original_chars={}, preserved=head_tail_chars]\n\n",
+        label, original_chars
+    );
+    let marker_chars = marker.chars().count();
+    if marker_chars >= max_chars {
+        return safe_truncate_chars(&marker, max_chars);
+    }
+
+    let text_budget = max_chars.saturating_sub(marker_chars);
+    let head_budget = text_budget.saturating_mul(2) / 3;
+    let tail_budget = text_budget.saturating_sub(head_budget);
+    let head = original.chars().take(head_budget).collect::<String>();
+    let tail = original
+        .chars()
+        .rev()
+        .take(tail_budget)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    let mut out = String::with_capacity(max_chars);
+    out.push_str(&head);
+    out.push_str(&marker);
+    out.push_str(&tail);
+    if out.chars().count() > max_chars {
+        safe_truncate_chars(&out, max_chars)
+    } else {
+        out
+    }
+}
+
+fn discard_history_thinking(history: &mut [Message]) -> (usize, usize) {
+    let mut blocks = 0usize;
+    let mut chars = 0usize;
+    for message in history {
+        let Message::Assistant(assistant) = message else {
+            continue;
+        };
+        let (cleaned, removed_blocks, removed_chars) =
+            remove_tagged_blocks(&assistant.assistant_response_message.content, "thinking");
+        if removed_blocks > 0 {
+            assistant.assistant_response_message.content = cleaned;
+            blocks += removed_blocks;
+            chars += removed_chars;
+        }
+    }
+    (blocks, chars)
+}
+
+fn remove_tagged_blocks(text: &str, tag: &str) -> (String, usize, usize) {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let mut remaining = text;
+    let mut output = String::with_capacity(text.len());
+    let mut blocks = 0usize;
+    let mut removed_chars = 0usize;
+
+    while let Some(start) = remaining.find(&open) {
+        output.push_str(&remaining[..start]);
+        let after_open = start + open.len();
+        if let Some(close_offset) = remaining[after_open..].find(&close) {
+            let end = after_open + close_offset + close.len();
+            removed_chars += remaining[start..end].chars().count();
+            blocks += 1;
+            remaining = &remaining[end..];
+        } else {
+            removed_chars += remaining[start..].chars().count();
+            blocks += 1;
+            remaining = "";
+            break;
+        }
+    }
+    output.push_str(remaining);
+    (collapse_excess_blank_lines(&output), blocks, removed_chars)
+}
+
+fn collapse_excess_blank_lines(text: &str) -> String {
+    let mut output = String::new();
+    let mut blank_count = 0usize;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            blank_count += 1;
+            if blank_count <= 2 {
+                output.push('\n');
+            }
+        } else {
+            blank_count = 0;
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    output.trim().to_string()
+}
+
+fn trim_history_web_fetch_content(history: &mut [Message], max_chars: usize) -> (usize, usize) {
+    if max_chars == 0 {
+        return (0, 0);
+    }
+
+    let mut blocks = 0usize;
+    let mut chars = 0usize;
+    for message in history {
+        let Message::User(user) = message else {
+            continue;
+        };
+        let (trimmed, omitted, changed) =
+            trim_web_fetch_text(&user.user_input_message.content, max_chars);
+        if changed {
+            user.user_input_message.content = trimmed;
+            blocks += 1;
+            chars += omitted;
+        }
+        for result in &mut user
+            .user_input_message
+            .user_input_message_context
+            .tool_results
+        {
+            for item in &mut result.content {
+                let Some(value) = item.get_mut("text") else {
+                    continue;
+                };
+                let Some(text) = value.as_str() else {
+                    continue;
+                };
+                let (trimmed, omitted, changed) = trim_web_fetch_text(text, max_chars);
+                if changed {
+                    *value = serde_json::Value::String(trimmed);
+                    blocks += 1;
+                    chars += omitted;
+                }
+            }
+        }
+    }
+    (blocks, chars)
+}
+
+fn trim_web_fetch_text(text: &str, max_chars: usize) -> (String, usize, bool) {
+    let Some((body_start, body_end, separator)) = web_fetch_body_range(text) else {
+        return (text.to_string(), 0, false);
+    };
+
+    let body = &text[body_start..body_end];
+    if body.chars().count() <= max_chars {
+        return (text.to_string(), 0, false);
+    }
+    let compact = compact_web_fetch_body(body, max_chars);
+    if compact.chars().count() >= body.chars().count().saturating_sub(1_000) {
+        return (text.to_string(), 0, false);
+    }
+
+    let omitted = body.chars().count().saturating_sub(compact.chars().count());
+    let mut output = String::with_capacity(text.len().saturating_sub(omitted));
+    output.push_str(&text[..body_start]);
+    output.push_str(&compact);
+    output.push_str("\n\n[Proxy note: web page navigation, repeated links, and image data were trimmed before upstream processing.]");
+    output.push_str(separator);
+    output.push_str(&text[body_end + separator.len()..]);
+    (output, omitted, true)
+}
+
+fn web_fetch_body_range(text: &str) -> Option<(usize, usize, &'static str)> {
+    let markers = ["Web page content:\n---\n", "Web page content:\r\n---\r\n"];
+    let (marker_start, marker) = markers
+        .iter()
+        .filter_map(|marker| text.find(marker).map(|idx| (idx, *marker)))
+        .min_by_key(|(idx, _)| *idx)?;
+
+    let body_start = marker_start + marker.len();
+    let rest = &text[body_start..];
+    let separators = ["\n---\n\n", "\n---\n", "\r\n---\r\n\r\n", "\r\n---\r\n"];
+    let (body_end_rel, separator) = separators
+        .iter()
+        .filter_map(|separator| rest.rfind(separator).map(|idx| (idx, *separator)))
+        .max_by_key(|(idx, _)| *idx)?;
+
+    Some((body_start, body_start + body_end_rel, separator))
+}
+
+fn compact_web_fetch_body(body: &str, max_chars: usize) -> String {
+    let mut kept = Vec::new();
+    let mut seen = HashSet::new();
+    let mut chars = 0usize;
+    let mut blank = false;
+    for raw_line in body.lines() {
+        let mut line = raw_line.trim();
+        if line.starts_with("![") && line.contains("](data:image/") {
+            continue;
+        }
+        if line.is_empty() {
+            if blank {
+                continue;
+            }
+            blank = true;
+        } else {
+            blank = false;
+        }
+        if line.len() > 500 {
+            line = safe_prefix_by_bytes(line, 500);
+        }
+        let normalized = line.to_ascii_lowercase();
+        if !normalized.is_empty() && !seen.insert(normalized) {
+            continue;
+        }
+        let line_chars = line.chars().count().saturating_add(1);
+        if chars.saturating_add(line_chars) > max_chars {
+            break;
+        }
+        chars += line_chars;
+        kept.push(line.to_string());
+    }
+    kept.join("\n")
+}
+
+fn safe_prefix_by_bytes(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = 0usize;
+    for (idx, ch) in text.char_indices() {
+        let next = idx + ch.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    &text[..end]
+}
+
+fn compress_tool_definitions(
+    tools: &mut [Tool],
+    budget_bytes: usize,
+    description_max_chars: usize,
+    annotation_max_chars: usize,
+) -> usize {
+    if tools.is_empty() {
+        return 0;
+    }
+
+    let adaptive_description_max = if budget_bytes > 0 {
+        description_max_chars.min((budget_bytes / tools.len()).max(256))
+    } else {
+        description_max_chars
+    };
+
+    let mut changed = 0usize;
+    for tool in tools.iter_mut() {
+        let spec = &mut tool.tool_specification;
+        if truncate_string_field(
+            &mut spec.description,
+            adaptive_description_max,
+            "tool description",
+        ) {
+            changed += 1;
+        }
+        if truncate_schema_annotations(&mut spec.input_schema.json, annotation_max_chars) > 0 {
+            changed += 1;
+        }
+    }
+
+    if budget_bytes > 0 && json_len(tools) > budget_bytes {
+        let hard_description_max = adaptive_description_max.min(512);
+        for tool in tools.iter_mut() {
+            let spec = &mut tool.tool_specification;
+            if truncate_string_field(
+                &mut spec.description,
+                hard_description_max,
+                "tool description",
+            ) {
+                changed += 1;
+            }
+        }
+    }
+
+    changed
+}
+
+fn truncate_string_field(value: &mut String, max_chars: usize, label: &str) -> bool {
+    if max_chars == 0 || value.chars().count() <= max_chars {
+        return false;
+    }
+    let original_chars = value.chars().count();
+    let keep = max_chars.saturating_sub(96).max(max_chars / 2);
+    let prefix: String = value.chars().take(keep).collect();
+    *value = format!(
+        "{}\n[{} truncated by proxy: original_chars={}]",
+        prefix, label, original_chars
+    );
+    true
+}
+
+fn truncate_schema_annotations(value: &mut serde_json::Value, max_chars: usize) -> usize {
+    if max_chars == 0 {
+        return 0;
+    }
+
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut changed = 0usize;
+            for key in ["description", "title", "$comment", "examples"] {
+                if let Some(item) = map.get_mut(key) {
+                    changed += truncate_annotation_value(item, max_chars);
+                }
+            }
+            for item in map.values_mut() {
+                changed += truncate_schema_annotations(item, max_chars);
+            }
+            changed
+        }
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .map(|item| truncate_schema_annotations(item, max_chars))
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn truncate_annotation_value(value: &mut serde_json::Value, max_chars: usize) -> usize {
+    match value {
+        serde_json::Value::String(text) => {
+            let mut owned = std::mem::take(text);
+            let changed = truncate_string_field(&mut owned, max_chars, "schema annotation");
+            *text = owned;
+            usize::from(changed)
+        }
+        serde_json::Value::Array(items) => {
+            let before = items.len();
+            if items.len() > 3 {
+                items.truncate(3);
+            }
+            let nested: usize = items
+                .iter_mut()
+                .map(|item| truncate_annotation_value(item, max_chars))
+                .sum();
+            nested + usize::from(items.len() != before)
+        }
+        serde_json::Value::Object(_) => truncate_schema_annotations(value, max_chars),
+        _ => 0,
+    }
+}
+
+#[derive(Default)]
+struct CurrentShapingStats {
+    truncated_current_tool_results: usize,
+    truncated_current_tool_result_chars: usize,
+    truncated_current_documents: usize,
+    truncated_current_document_chars: usize,
+    truncated_current_user_content: usize,
+    truncated_current_user_content_chars: usize,
+    dropped_current_images: usize,
+    dropped_current_image_bytes: usize,
+}
+
+fn current_payload_shaping_enabled(config: PayloadShapingConfig) -> bool {
+    config.fit_current_payload_to_budget
+        || config.truncate_current_tool_results
+        || config.truncate_current_user_content
+        || config.truncate_current_documents
+        || config.truncate_current_images
+}
+
+fn apply_current_payload_shaping_until_fit(
+    request: &mut KiroRequest,
+    config: PayloadShapingConfig,
+    max_bytes: usize,
+    body: String,
+) -> Result<(String, CurrentShapingStats), PayloadGuardError> {
+    let mut body = body;
+    let mut stats = CurrentShapingStats::default();
+
+    if body.len() <= max_bytes {
+        return Ok((body, stats));
+    }
+
+    let mut tool_budget = normalize_current_text_budget(config.current_tool_result_max_chars);
+    let mut document_budget = normalize_current_text_budget(config.current_document_max_chars);
+    let mut user_content_budget =
+        normalize_current_text_budget(config.current_user_content_max_chars);
+
+    let truncate_tool_results =
+        config.fit_current_payload_to_budget || config.truncate_current_tool_results;
+    let truncate_documents =
+        config.fit_current_payload_to_budget || config.truncate_current_documents;
+    let truncate_user_content =
+        config.fit_current_payload_to_budget || config.truncate_current_user_content;
+    let truncate_images = config.fit_current_payload_to_budget || config.truncate_current_images;
+
+    if truncate_tool_results {
+        let changed = truncate_current_tool_results(request, tool_budget);
+        stats.truncated_current_tool_results += changed.0;
+        stats.truncated_current_tool_result_chars += changed.1;
+    }
+    if truncate_documents {
+        let changed = truncate_current_documents(
+            &mut request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            document_budget,
+        );
+        stats.truncated_current_documents += changed.0;
+        stats.truncated_current_document_chars += changed.1;
+    }
+    if truncate_user_content {
+        let changed = truncate_current_user_content(
+            &mut request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            user_content_budget,
+        );
+        stats.truncated_current_user_content += changed.0;
+        stats.truncated_current_user_content_chars += changed.1;
+    }
+    if truncate_images {
+        let changed = drop_current_images_to_budget(
+            &mut request
+                .conversation_state
+                .current_message
+                .user_input_message,
+            config.current_images_max_bytes,
+        );
+        stats.dropped_current_images += changed.0;
+        stats.dropped_current_image_bytes += changed.1;
+    }
+
+    body = serialize_request(request)?;
+
+    let mut iterations = 0usize;
+    while body.len() > max_bytes && iterations < CURRENT_FIT_MAX_ITERATIONS {
+        iterations += 1;
+        let before_len = body.len();
+        let mut changed = false;
+
+        if truncate_tool_results
+            && tool_budget.is_some_and(|budget| budget > CURRENT_FIT_MIN_TEXT_CHARS)
+        {
+            tool_budget = next_fit_budget(tool_budget, body.len(), max_bytes);
+            let result = truncate_current_tool_results(request, tool_budget);
+            if result.0 > 0 {
+                stats.truncated_current_tool_results += result.0;
+                stats.truncated_current_tool_result_chars += result.1;
+                changed = true;
+            }
+        }
+
+        if !changed
+            && truncate_documents
+            && document_budget.is_some_and(|budget| budget > CURRENT_FIT_MIN_TEXT_CHARS)
+        {
+            document_budget = next_fit_budget(document_budget, body.len(), max_bytes);
+            let result = truncate_current_documents(
+                &mut request
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .content,
+                document_budget,
+            );
+            if result.0 > 0 {
+                stats.truncated_current_documents += result.0;
+                stats.truncated_current_document_chars += result.1;
+                changed = true;
+            }
+        }
+
+        if !changed
+            && truncate_user_content
+            && user_content_budget.is_some_and(|budget| budget > CURRENT_FIT_MIN_TEXT_CHARS)
+        {
+            user_content_budget = next_fit_budget(user_content_budget, body.len(), max_bytes);
+            let result = truncate_current_user_content(
+                &mut request
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .content,
+                user_content_budget,
+            );
+            if result.0 > 0 {
+                stats.truncated_current_user_content += result.0;
+                stats.truncated_current_user_content_chars += result.1;
+                changed = true;
+            }
+        }
+
+        if !changed && truncate_images {
+            let result = drop_largest_current_image(
+                &mut request
+                    .conversation_state
+                    .current_message
+                    .user_input_message,
+            );
+            if result.0 > 0 {
+                stats.dropped_current_images += result.0;
+                stats.dropped_current_image_bytes += result.1;
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+
+        body = serialize_request(request)?;
+        if body.len() >= before_len {
+            break;
+        }
+    }
+
+    Ok((body, stats))
+}
+
+fn normalize_current_text_budget(max_chars: usize) -> Option<usize> {
+    (max_chars > 0).then(|| max_chars.max(CURRENT_FIT_MIN_TEXT_CHARS))
+}
+
+fn next_fit_budget(
+    current_budget: Option<usize>,
+    current_bytes: usize,
+    target_bytes: usize,
+) -> Option<usize> {
+    let budget = current_budget?;
+    if budget <= CURRENT_FIT_MIN_TEXT_CHARS {
+        return Some(CURRENT_FIT_MIN_TEXT_CHARS);
+    }
+    let overage = current_bytes
+        .saturating_sub(target_bytes)
+        .saturating_add(CURRENT_FIT_OVERHEAD_BYTES);
+    let reduction = overage
+        .max(budget / 4)
+        .min(budget - CURRENT_FIT_MIN_TEXT_CHARS);
+    Some(
+        budget
+            .saturating_sub(reduction)
+            .max(CURRENT_FIT_MIN_TEXT_CHARS),
+    )
+}
+
+fn truncate_current_tool_results(
+    request: &mut KiroRequest,
+    max_chars: Option<usize>,
+) -> (usize, usize) {
+    let Some(max_chars) = max_chars else {
+        return (0, 0);
+    };
+
+    let mut truncated = 0usize;
+    let mut omitted_chars = 0usize;
+    for result in &mut request
+        .conversation_state
+        .current_message
+        .user_input_message
+        .user_input_message_context
+        .tool_results
+    {
+        for item in &mut result.content {
+            let Some(value) = item.get_mut("text") else {
+                continue;
+            };
+            let Some(text) = value.as_str() else {
+                continue;
+            };
+            if text.chars().count() <= max_chars {
+                continue;
+            }
+            let original_chars = text.chars().count();
+            let replacement =
+                truncate_text_head_tail(text, max_chars, 120, 80, "current tool result");
+            let replacement_chars = replacement.chars().count();
+            *value = serde_json::Value::String(replacement);
+            truncated += 1;
+            omitted_chars += original_chars.saturating_sub(replacement_chars);
+        }
+    }
+    (truncated, omitted_chars)
+}
+
+fn truncate_current_documents(content: &mut String, max_chars: Option<usize>) -> (usize, usize) {
+    let Some(max_chars) = max_chars else {
+        return (0, 0);
+    };
+
+    let original = content.clone();
+    let mut remaining = original.as_str();
+    let mut output = String::with_capacity(original.len());
+    let mut truncated = 0usize;
+    let mut omitted_chars = 0usize;
+
+    while let Some(open_rel) = remaining.find("<document") {
+        let open_idx = open_rel;
+        output.push_str(&remaining[..open_idx]);
+        let after_open = &remaining[open_idx..];
+        let Some(tag_end_rel) = after_open.find('>') else {
+            output.push_str(after_open);
+            *content = output;
+            return (truncated, omitted_chars);
+        };
+        let tag_end = open_idx + tag_end_rel + 1;
+        output.push_str(&remaining[open_idx..tag_end]);
+        let body_start = tag_end;
+        let after_tag = &remaining[body_start..];
+        let Some(close_rel) = after_tag.find("</document>") else {
+            output.push_str(after_tag);
+            *content = output;
+            return (truncated, omitted_chars);
+        };
+        let body = &after_tag[..close_rel];
+        if body.chars().count() > max_chars {
+            let replacement = truncate_text_head_tail(body, max_chars, 120, 80, "current document");
+            omitted_chars += body
+                .chars()
+                .count()
+                .saturating_sub(replacement.chars().count());
+            output.push_str(&replacement);
+            truncated += 1;
+        } else {
+            output.push_str(body);
+        }
+        output.push_str("</document>");
+        remaining = &after_tag[close_rel + "</document>".len()..];
+    }
+
+    output.push_str(remaining);
+    if truncated > 0 {
+        *content = output;
+    }
+    (truncated, omitted_chars)
+}
+
+fn truncate_current_user_content(content: &mut String, max_chars: Option<usize>) -> (usize, usize) {
+    let Some(max_chars) = max_chars else {
+        return (0, 0);
+    };
+    if contains_document_block(content) {
+        return truncate_text_outside_document_blocks(content, max_chars);
+    }
+    let original_chars = content.chars().count();
+    if original_chars <= max_chars {
+        return (0, 0);
+    }
+    let replacement = truncate_text_head_tail(content, max_chars, 160, 100, "current user content");
+    let replacement_chars = replacement.chars().count();
+    *content = replacement;
+    (1, original_chars.saturating_sub(replacement_chars))
+}
+
+fn truncate_text_outside_document_blocks(content: &mut String, max_chars: usize) -> (usize, usize) {
+    let original = content.clone();
+    let document_ranges = document_block_ranges(&original);
+    if document_ranges.is_empty() {
+        return (0, 0);
+    }
+
+    let mut outside_chars = 0usize;
+    let mut cursor = 0usize;
+    for (start, end) in &document_ranges {
+        outside_chars += original[cursor..*start].chars().count();
+        cursor = *end;
+    }
+    outside_chars += original[cursor..].chars().count();
+
+    if outside_chars <= max_chars {
+        return (0, 0);
+    }
+
+    let marker = format!(
+        "\n[current user content outside documents truncated by proxy: original_chars={}, preserved=head_tail_chars]\n",
+        outside_chars
+    );
+    let marker_chars = marker.chars().count();
+    let text_budget = max_chars.saturating_sub(marker_chars);
+    let head_budget = text_budget.saturating_mul(2) / 3;
+    let tail_budget = text_budget.saturating_sub(head_budget);
+    let skip_start = head_budget;
+    let skip_end = outside_chars.saturating_sub(tail_budget);
+
+    let mut output = String::with_capacity(original.len().min(max_chars + 4096));
+    let mut outside_pos = 0usize;
+    let mut marker_inserted = false;
+    cursor = 0;
+    for (start, end) in document_ranges {
+        append_truncated_outside_document_text(
+            &original[cursor..start],
+            &mut output,
+            &mut outside_pos,
+            skip_start,
+            skip_end,
+            &marker,
+            &mut marker_inserted,
+        );
+        output.push_str(&original[start..end]);
+        cursor = end;
+    }
+    append_truncated_outside_document_text(
+        &original[cursor..],
+        &mut output,
+        &mut outside_pos,
+        skip_start,
+        skip_end,
+        &marker,
+        &mut marker_inserted,
+    );
+
+    if !marker_inserted || output == original {
+        return (0, 0);
+    }
+
+    let replacement_outside_chars = head_budget
+        .saturating_add(tail_budget)
+        .saturating_add(marker_chars);
+    *content = output;
+    (1, outside_chars.saturating_sub(replacement_outside_chars))
+}
+
+fn append_truncated_outside_document_text(
+    segment: &str,
+    output: &mut String,
+    outside_pos: &mut usize,
+    skip_start: usize,
+    skip_end: usize,
+    marker: &str,
+    marker_inserted: &mut bool,
+) {
+    for ch in segment.chars() {
+        let pos = *outside_pos;
+        *outside_pos += 1;
+        if pos < skip_start || pos >= skip_end {
+            output.push(ch);
+        } else if !*marker_inserted {
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str(marker);
+            *marker_inserted = true;
+        }
+    }
+}
+
+fn document_block_ranges(content: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(open_rel) = content[search_from..].find("<document") {
+        let open = search_from + open_rel;
+        let Some(tag_end_rel) = content[open..].find('>') else {
+            break;
+        };
+        let body_start = open + tag_end_rel + 1;
+        let Some(close_rel) = content[body_start..].find("</document>") else {
+            break;
+        };
+        let end = body_start + close_rel + "</document>".len();
+        ranges.push((open, end));
+        search_from = end;
+    }
+    ranges
+}
+
+fn contains_document_block(content: &str) -> bool {
+    content.contains("<document") && content.contains("</document>")
+}
+
+fn drop_current_images_to_budget(user: &mut UserInputMessage, max_bytes: usize) -> (usize, usize) {
+    let mut dropped = 0usize;
+    let mut dropped_bytes = 0usize;
+    while !user.images.is_empty() && json_len(&user.images) > max_bytes {
+        let result = drop_largest_current_image(user);
+        if result.0 == 0 {
+            break;
+        }
+        dropped += result.0;
+        dropped_bytes += result.1;
+    }
+    if dropped > 0 {
+        append_text(
+            &mut user.content,
+            &format!(
+                "[current images omitted by proxy: count={}, removed_json_bytes={}]",
+                dropped, dropped_bytes
+            ),
+        );
+    }
+    (dropped, dropped_bytes)
+}
+
+fn drop_largest_current_image(user: &mut UserInputMessage) -> (usize, usize) {
+    let Some((idx, bytes)) = user
+        .images
+        .iter()
+        .enumerate()
+        .map(|(idx, image)| (idx, json_len(image)))
+        .max_by_key(|(_, bytes)| *bytes)
+    else {
+        return (0, 0);
+    };
+    user.images.remove(idx);
+    if user.images.is_empty() {
+        append_text(
+            &mut user.content,
+            &format!(
+                "[current image omitted by proxy: removed_json_bytes={}]",
+                bytes
+            ),
+        );
+    }
+    (1, bytes)
 }
 
 fn trim_oldest_history_unit(history: &mut Vec<Message>) {
@@ -585,6 +1844,44 @@ mod tests {
         }
     }
 
+    fn guard_config(max_bytes: usize) -> PayloadGuardConfig {
+        PayloadGuardConfig {
+            enabled: true,
+            max_bytes,
+            trim_history: true,
+            shaping: PayloadShapingConfig::default(),
+        }
+    }
+
+    fn shaping_config(shaping: PayloadShapingConfig) -> PayloadGuardConfig {
+        PayloadGuardConfig {
+            enabled: true,
+            max_bytes: 1,
+            trim_history: false,
+            shaping,
+        }
+    }
+
+    fn guard_config_with_shaping(
+        max_bytes: usize,
+        trim_history: bool,
+        shaping: PayloadShapingConfig,
+    ) -> PayloadGuardConfig {
+        PayloadGuardConfig {
+            enabled: true,
+            max_bytes,
+            trim_history,
+            shaping,
+        }
+    }
+
+    fn tool_result_text(result: &ToolResult) -> &str {
+        result.content[0]
+            .get("text")
+            .and_then(|value| value.as_str())
+            .expect("tool result text")
+    }
+
     #[test]
     fn guard_trims_old_history_until_under_limit() {
         let mut history = Vec::new();
@@ -600,15 +1897,8 @@ mod tests {
             ))));
         }
         let mut request = request_with_history(history);
-        let (body, report) = guard_kiro_request(
-            &mut request,
-            PayloadGuardConfig {
-                enabled: true,
-                max_bytes: 5_000,
-                trim_history: true,
-            },
-        )
-        .expect("guard should trim");
+        let (body, report) =
+            guard_kiro_request(&mut request, guard_config(5_000)).expect("guard should trim");
 
         assert!(body.len() <= 5_000);
         assert!(report.trimmed_history_entries > 0);
@@ -638,15 +1928,8 @@ mod tests {
             Message::User(user),
         ]);
 
-        let (_body, report) = guard_kiro_request(
-            &mut request,
-            PayloadGuardConfig {
-                enabled: true,
-                max_bytes: usize::MAX,
-                trim_history: true,
-            },
-        )
-        .expect("guard should repair");
+        let (_body, report) = guard_kiro_request(&mut request, guard_config(usize::MAX))
+            .expect("guard should repair");
 
         assert_eq!(report.removed_orphan_tool_results, 1);
         let Message::User(user) = &request.conversation_state.history[2] else {
@@ -671,15 +1954,8 @@ mod tests {
             profile_arn: None,
         };
 
-        let (body, report) = guard_kiro_request(
-            &mut request,
-            PayloadGuardConfig {
-                enabled: true,
-                max_bytes: 1_000,
-                trim_history: true,
-            },
-        )
-        .expect("oversized current message should be passed through to Kiro");
+        let (body, report) = guard_kiro_request(&mut request, guard_config(1_000))
+            .expect("oversized current message should be passed through to Kiro");
 
         assert!(body.len() > 1_000);
         assert!(report.still_oversized);
@@ -711,6 +1987,7 @@ mod tests {
                 enabled: true,
                 max_bytes: 0,
                 trim_history: true,
+                shaping: PayloadShapingConfig::default(),
             },
         )
         .expect("zero max bytes should disable only size limiting");
@@ -743,6 +2020,22 @@ mod tests {
             removed_orphan_tool_results: 1,
             textified_orphan_tool_results: 1,
             removed_orphan_tool_uses: 1,
+            truncated_history_tool_results: 1,
+            truncated_history_tool_result_chars: 10,
+            removed_history_thinking_blocks: 1,
+            removed_history_thinking_chars: 10,
+            trimmed_web_fetch_blocks: 1,
+            trimmed_web_fetch_chars: 10,
+            compressed_tool_definitions: 1,
+            compressed_tool_definition_bytes: 10,
+            truncated_current_tool_results: 1,
+            truncated_current_tool_result_chars: 10,
+            truncated_current_documents: 1,
+            truncated_current_document_chars: 10,
+            truncated_current_user_content: 1,
+            truncated_current_user_content_chars: 10,
+            dropped_current_images: 1,
+            dropped_current_image_bytes: 10,
             still_oversized: false,
         };
 
@@ -750,6 +2043,12 @@ mod tests {
         assert!(header.contains("payload-trimmed-history=2"));
         assert!(header.contains("payload-empty-tool-uses=1"));
         assert!(header.contains("payload-textified-tool-results=1"));
+        assert!(header.contains("payload-history-tool-results-truncated=1"));
+        assert!(header.contains("payload-tools-compressed=1"));
+        assert!(header.contains("payload-current-tool-results-truncated=1"));
+        assert!(header.contains("payload-current-documents-truncated=1"));
+        assert!(header.contains("payload-current-content-truncated=1"));
+        assert!(header.contains("payload-current-images-dropped=1"));
     }
 
     #[test]
@@ -765,15 +2064,8 @@ mod tests {
             Message::Assistant(assistant),
         ]);
 
-        let (_body, report) = guard_kiro_request(
-            &mut request,
-            PayloadGuardConfig {
-                enabled: true,
-                max_bytes: usize::MAX,
-                trim_history: true,
-            },
-        )
-        .expect("guard");
+        let (_body, report) =
+            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert_eq!(report.removed_empty_tool_uses, 1);
         let Message::Assistant(assistant) = &request.conversation_state.history[1] else {
@@ -794,15 +2086,8 @@ mod tests {
         let mut request =
             request_with_history(vec![Message::Assistant(assistant), Message::User(user)]);
 
-        let (_body, report) = guard_kiro_request(
-            &mut request,
-            PayloadGuardConfig {
-                enabled: true,
-                max_bytes: usize::MAX,
-                trim_history: true,
-            },
-        )
-        .expect("guard");
+        let (_body, report) =
+            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert_eq!(report.aligned_leading_entries, 1);
         assert_eq!(report.removed_orphan_tool_results, 1);
@@ -829,15 +2114,8 @@ mod tests {
             .user_input_message_context = UserInputMessageContext::new()
             .with_tool_results(vec![ToolResult::success("tool-1", "valid result")]);
 
-        let (_body, report) = guard_kiro_request(
-            &mut request,
-            PayloadGuardConfig {
-                enabled: true,
-                max_bytes: usize::MAX,
-                trim_history: true,
-            },
-        )
-        .expect("guard");
+        let (_body, report) =
+            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert_eq!(report.removed_orphan_tool_uses, 0);
         assert_eq!(report.removed_orphan_tool_results, 0);
@@ -865,6 +2143,626 @@ mod tests {
     }
 
     #[test]
+    fn payload_shaping_truncates_history_tool_results_but_preserves_current_results() {
+        let old_assistant = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new("old tool call")
+                .with_tool_uses(vec![ToolUseEntry::new("old-tool", "readFile")]),
+        };
+        let mut old_result = HistoryUserMessage::new("old result", TEST_MODEL);
+        old_result.user_input_message.user_input_message_context = UserInputMessageContext::new()
+            .with_tool_results(vec![ToolResult::success("old-tool", "old\n".repeat(5_000))]);
+        let current_assistant = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new("current tool call")
+                .with_tool_uses(vec![ToolUseEntry::new("current-tool", "readFile")]),
+        };
+        let current_result = "current\n".repeat(5_000);
+        let mut request = request_with_history(vec![
+            Message::User(HistoryUserMessage::new("read old", TEST_MODEL)),
+            Message::Assistant(old_assistant),
+            Message::User(old_result),
+            Message::Assistant(current_assistant),
+        ]);
+        request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context =
+            UserInputMessageContext::new().with_tool_results(vec![ToolResult::success(
+                "current-tool",
+                current_result.clone(),
+            )]);
+
+        let (_body, report) = guard_kiro_request(
+            &mut request,
+            shaping_config(PayloadShapingConfig {
+                historical_tool_result_max_chars: 1_000,
+                historical_tool_result_head_lines: 8,
+                historical_tool_result_tail_lines: 4,
+                discard_historical_thinking: false,
+                compress_tool_definitions: false,
+                web_fetch_trim_enabled: false,
+                ..PayloadShapingConfig::default()
+            }),
+        )
+        .expect("guard");
+
+        assert_eq!(report.truncated_history_tool_results, 1);
+        let Message::User(user) = &request.conversation_state.history[2] else {
+            panic!("expected historical user");
+        };
+        let historical_text = tool_result_text(
+            &user
+                .user_input_message
+                .user_input_message_context
+                .tool_results[0],
+        );
+        assert!(historical_text.chars().count() <= 1_000);
+        assert!(historical_text.contains("historical tool result truncated by proxy"));
+
+        let current_text = tool_result_text(
+            &request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tool_results[0],
+        );
+        assert_eq!(current_text, current_result);
+    }
+
+    #[test]
+    fn payload_shaping_truncates_current_tool_results_when_enabled() {
+        let assistant = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new("current tool call")
+                .with_tool_uses(vec![ToolUseEntry::new("current-tool", "readFile")]),
+        };
+        let mut request = request_with_history(vec![
+            Message::User(HistoryUserMessage::new("read", TEST_MODEL)),
+            Message::Assistant(assistant),
+        ]);
+        request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context =
+            UserInputMessageContext::new().with_tool_results(vec![ToolResult::success(
+                "current-tool",
+                "current result\n".repeat(5_000),
+            )]);
+
+        let (body, report) = guard_kiro_request(
+            &mut request,
+            guard_config_with_shaping(
+                6_000,
+                false,
+                PayloadShapingConfig {
+                    truncate_historical_tool_results: false,
+                    discard_historical_thinking: false,
+                    compress_tool_definitions: false,
+                    web_fetch_trim_enabled: false,
+                    truncate_current_tool_results: true,
+                    current_tool_result_max_chars: 1_000,
+                    ..PayloadShapingConfig::default()
+                },
+            ),
+        )
+        .expect("guard");
+
+        assert!(body.len() <= 6_000);
+        assert!(!report.still_oversized);
+        assert!(report.truncated_current_tool_results > 0);
+        let current_text = tool_result_text(
+            &request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tool_results[0],
+        );
+        assert!(current_text.chars().count() <= 1_000);
+        assert!(current_text.contains("current tool result truncated by proxy"));
+    }
+
+    #[test]
+    fn payload_shaping_truncates_current_user_content_when_enabled() {
+        let mut request = request_with_history(Vec::new());
+        request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content = "current message ".repeat(5_000);
+
+        let (body, report) = guard_kiro_request(
+            &mut request,
+            guard_config_with_shaping(
+                5_000,
+                false,
+                PayloadShapingConfig {
+                    truncate_historical_tool_results: false,
+                    discard_historical_thinking: false,
+                    compress_tool_definitions: false,
+                    web_fetch_trim_enabled: false,
+                    truncate_current_user_content: true,
+                    current_user_content_max_chars: 1_200,
+                    ..PayloadShapingConfig::default()
+                },
+            ),
+        )
+        .expect("guard");
+
+        assert!(body.len() <= 5_000);
+        assert!(!report.still_oversized);
+        assert!(report.truncated_current_user_content > 0);
+        assert!(
+            request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content
+                .contains("current user content truncated by proxy")
+        );
+    }
+
+    #[test]
+    fn payload_shaping_truncates_current_documents_without_breaking_tags() {
+        let mut request = request_with_history(Vec::new());
+        request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content = format!(
+            "before\n<document media_type=\"application/pdf\">\n{}\n</document>\nafter",
+            "pdf body ".repeat(5_000)
+        );
+
+        let (body, report) = guard_kiro_request(
+            &mut request,
+            guard_config_with_shaping(
+                6_000,
+                false,
+                PayloadShapingConfig {
+                    truncate_historical_tool_results: false,
+                    discard_historical_thinking: false,
+                    compress_tool_definitions: false,
+                    web_fetch_trim_enabled: false,
+                    truncate_current_documents: true,
+                    truncate_current_user_content: true,
+                    current_document_max_chars: 1_200,
+                    current_user_content_max_chars: 1_200,
+                    ..PayloadShapingConfig::default()
+                },
+            ),
+        )
+        .expect("guard");
+
+        let content = &request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+        assert!(body.len() <= 6_000);
+        assert!(!report.still_oversized);
+        assert!(report.truncated_current_documents > 0);
+        assert_eq!(report.truncated_current_user_content, 0);
+        assert!(content.contains("<document media_type=\"application/pdf\">"));
+        assert!(content.contains("</document>"));
+        assert!(content.contains("current document truncated by proxy"));
+    }
+
+    #[test]
+    fn payload_shaping_drops_current_images_only_when_enabled() {
+        let mut request = request_with_history(Vec::new());
+        request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .images = vec![
+            KiroImage::from_base64("png", "a".repeat(12_000)),
+            KiroImage::from_base64("jpeg", "b".repeat(12_000)),
+        ];
+
+        let (body, report) = guard_kiro_request(
+            &mut request,
+            guard_config_with_shaping(
+                5_000,
+                false,
+                PayloadShapingConfig {
+                    truncate_historical_tool_results: false,
+                    discard_historical_thinking: false,
+                    compress_tool_definitions: false,
+                    web_fetch_trim_enabled: false,
+                    truncate_current_images: true,
+                    current_images_max_bytes: 1,
+                    ..PayloadShapingConfig::default()
+                },
+            ),
+        )
+        .expect("guard");
+
+        assert!(body.len() <= 5_000);
+        assert!(!report.still_oversized);
+        assert_eq!(report.dropped_current_images, 2);
+        assert!(
+            request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .images
+                .is_empty()
+        );
+        assert!(
+            request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content
+                .contains("current image omitted by proxy")
+        );
+    }
+
+    #[test]
+    fn payload_shaping_fit_current_payload_to_budget_enables_current_trimming() {
+        let mut request = request_with_history(vec![
+            Message::User(HistoryUserMessage::new("old user", TEST_MODEL)),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: AssistantMessage::new("current tool call")
+                    .with_tool_uses(vec![ToolUseEntry::new("current-tool", "readFile")]),
+            }),
+        ]);
+        request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content = format!(
+            "before\n<document media_type=\"application/pdf\">\n{}\n</document>\n{}",
+            "pdf body ".repeat(5_000),
+            "current message ".repeat(5_000)
+        );
+        request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context =
+            UserInputMessageContext::new().with_tool_results(vec![ToolResult::success(
+                "current-tool",
+                "current result\n".repeat(5_000),
+            )]);
+
+        let (body, report) = guard_kiro_request(
+            &mut request,
+            guard_config_with_shaping(
+                9_000,
+                false,
+                PayloadShapingConfig {
+                    truncate_historical_tool_results: false,
+                    discard_historical_thinking: false,
+                    compress_tool_definitions: false,
+                    web_fetch_trim_enabled: false,
+                    fit_current_payload_to_budget: true,
+                    current_tool_result_max_chars: 2_000,
+                    current_document_max_chars: 2_000,
+                    current_user_content_max_chars: 2_000,
+                    ..PayloadShapingConfig::default()
+                },
+            ),
+        )
+        .expect("guard");
+
+        assert!(body.len() <= 9_000, "final body was {} bytes", body.len());
+        assert!(!report.still_oversized);
+        assert!(report.truncated_current_tool_results > 0);
+        assert!(report.truncated_current_documents > 0);
+        let content = &request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+        assert!(content.contains("<document media_type=\"application/pdf\">"));
+        assert!(content.contains("</document>"));
+        assert!(content.contains("current document truncated by proxy"));
+        assert!(
+            tool_result_text(
+                &request
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .user_input_message_context
+                    .tool_results[0]
+            )
+            .contains("current tool result truncated by proxy")
+        );
+    }
+
+    #[test]
+    fn payload_shaping_does_not_trim_current_payload_when_fit_disabled() {
+        let mut request = request_with_history(Vec::new());
+        let original = "current message ".repeat(5_000);
+        request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content = original.clone();
+
+        let (_body, report) = guard_kiro_request(
+            &mut request,
+            guard_config_with_shaping(
+                5_000,
+                false,
+                PayloadShapingConfig {
+                    truncate_historical_tool_results: false,
+                    discard_historical_thinking: false,
+                    compress_tool_definitions: false,
+                    web_fetch_trim_enabled: false,
+                    ..PayloadShapingConfig::default()
+                },
+            ),
+        )
+        .expect("guard");
+
+        assert!(report.still_oversized);
+        assert_eq!(report.truncated_current_user_content, 0);
+        assert_eq!(
+            request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            original
+        );
+    }
+
+    #[test]
+    fn payload_shaping_discards_only_historical_thinking_blocks() {
+        let assistant = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new(
+                "visible\n<thinking>hidden chain</thinking>\nanswer",
+            ),
+        };
+        let mut request = request_with_history(vec![
+            Message::User(HistoryUserMessage::new("question", TEST_MODEL)),
+            Message::Assistant(assistant),
+        ]);
+
+        let (_body, report) = guard_kiro_request(
+            &mut request,
+            shaping_config(PayloadShapingConfig {
+                truncate_historical_tool_results: false,
+                compress_tool_definitions: false,
+                web_fetch_trim_enabled: false,
+                ..PayloadShapingConfig::default()
+            }),
+        )
+        .expect("guard");
+
+        assert_eq!(report.removed_history_thinking_blocks, 1);
+        let Message::Assistant(assistant) = &request.conversation_state.history[1] else {
+            panic!("expected assistant");
+        };
+        assert_eq!(
+            assistant.assistant_response_message.content,
+            "visible\n\nanswer"
+        );
+    }
+
+    #[test]
+    fn payload_shaping_trims_web_fetch_history_before_generic_tool_result_truncation() {
+        let assistant = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new("web fetch")
+                .with_tool_uses(vec![ToolUseEntry::new("web-1", "WebFetch")]),
+        };
+        let body = (0..250)
+            .map(|idx| format!("line-{idx} {}", "content".repeat(20)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let web_fetch_result = format!(
+            "Fetched https://example.test\n\nWeb page content:\n---\n{}\n---\n\nmetadata",
+            body
+        );
+        let mut user = HistoryUserMessage::new("web result", TEST_MODEL);
+        user.user_input_message.user_input_message_context = UserInputMessageContext::new()
+            .with_tool_results(vec![ToolResult::success("web-1", web_fetch_result)]);
+        let mut request = request_with_history(vec![
+            Message::User(HistoryUserMessage::new("fetch", TEST_MODEL)),
+            Message::Assistant(assistant),
+            Message::User(user),
+        ]);
+
+        let (_body, report) = guard_kiro_request(
+            &mut request,
+            shaping_config(PayloadShapingConfig {
+                historical_tool_result_max_chars: 1_000,
+                historical_tool_result_head_lines: 4,
+                historical_tool_result_tail_lines: 2,
+                web_fetch_body_max_chars: 3_000,
+                discard_historical_thinking: false,
+                compress_tool_definitions: false,
+                ..PayloadShapingConfig::default()
+            }),
+        )
+        .expect("guard");
+
+        assert_eq!(report.trimmed_web_fetch_blocks, 1);
+        assert_eq!(report.truncated_history_tool_results, 0);
+        let Message::User(user) = &request.conversation_state.history[2] else {
+            panic!("expected historical user");
+        };
+        let text = tool_result_text(
+            &user
+                .user_input_message
+                .user_input_message_context
+                .tool_results[0],
+        );
+        assert!(text.contains("Proxy note: web page navigation"));
+        assert!(text.chars().count() > 1_000);
+        assert!(text.chars().count() < 4_000);
+    }
+
+    #[test]
+    fn incomplete_web_fetch_history_falls_back_to_generic_tool_result_truncation() {
+        let assistant = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new("web fetch")
+                .with_tool_uses(vec![ToolUseEntry::new("web-1", "WebFetch")]),
+        };
+        let malformed_web_fetch = format!(
+            "Fetched https://example.test\n\nWeb page content:\n---\n{}",
+            "body ".repeat(5_000)
+        );
+        let mut user = HistoryUserMessage::new("web result", TEST_MODEL);
+        user.user_input_message.user_input_message_context = UserInputMessageContext::new()
+            .with_tool_results(vec![ToolResult::success("web-1", malformed_web_fetch)]);
+        let mut request = request_with_history(vec![
+            Message::User(HistoryUserMessage::new("fetch", TEST_MODEL)),
+            Message::Assistant(assistant),
+            Message::User(user),
+        ]);
+
+        let (_body, report) = guard_kiro_request(
+            &mut request,
+            shaping_config(PayloadShapingConfig {
+                historical_tool_result_max_chars: 1_000,
+                web_fetch_body_max_chars: 3_000,
+                discard_historical_thinking: false,
+                compress_tool_definitions: false,
+                ..PayloadShapingConfig::default()
+            }),
+        )
+        .expect("guard");
+
+        assert_eq!(report.trimmed_web_fetch_blocks, 0);
+        assert_eq!(report.truncated_history_tool_results, 1);
+        let Message::User(user) = &request.conversation_state.history[2] else {
+            panic!("expected historical user");
+        };
+        let text = tool_result_text(
+            &user
+                .user_input_message
+                .user_input_message_context
+                .tool_results[0],
+        );
+        assert!(text.chars().count() <= 1_000);
+    }
+
+    #[test]
+    fn payload_shaping_compresses_current_tool_definitions_without_removing_tools() {
+        let mut request = request_with_history(Vec::new());
+        request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context = UserInputMessageContext::new().with_tools(vec![Tool {
+            tool_specification: ToolSpecification {
+                name: "largeTool".to_string(),
+                description: "description ".repeat(1_000),
+                input_schema: InputSchema::from_json(serde_json::json!({
+                    "type": "object",
+                    "description": "root ".repeat(500),
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "path ".repeat(500),
+                            "examples": [
+                                "example ".repeat(500),
+                                "example ".repeat(500),
+                                "example ".repeat(500),
+                                "example ".repeat(500)
+                            ]
+                        }
+                    }
+                })),
+            },
+        }]);
+
+        let (_body, report) = guard_kiro_request(
+            &mut request,
+            shaping_config(PayloadShapingConfig {
+                truncate_historical_tool_results: false,
+                discard_historical_thinking: false,
+                web_fetch_trim_enabled: false,
+                tool_definitions_budget_bytes: 1_024,
+                tool_description_max_chars: 256,
+                tool_schema_annotation_max_chars: 128,
+                ..PayloadShapingConfig::default()
+            }),
+        )
+        .expect("guard");
+
+        assert!(report.compressed_tool_definitions > 0);
+        assert!(report.compressed_tool_definition_bytes > 0);
+        let tools = &request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].tool_specification.name, "largeTool");
+        assert!(
+            tools[0]
+                .tool_specification
+                .description
+                .contains("tool description truncated by proxy")
+        );
+        assert!(
+            serde_json::to_string(&tools[0].tool_specification.input_schema)
+                .expect("schema")
+                .contains("schema annotation truncated by proxy")
+        );
+    }
+
+    #[test]
+    fn payload_shaping_tool_definition_budget_zero_disables_tool_compression() {
+        let mut request = request_with_history(Vec::new());
+        let description = "description ".repeat(1_000);
+        request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context = UserInputMessageContext::new().with_tools(vec![Tool {
+            tool_specification: ToolSpecification {
+                name: "largeTool".to_string(),
+                description: description.clone(),
+                input_schema: InputSchema::from_json(serde_json::json!({
+                    "type": "object",
+                    "description": "root ".repeat(500),
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "path ".repeat(500)
+                        }
+                    }
+                })),
+            },
+        }]);
+
+        let (_body, report) = guard_kiro_request(
+            &mut request,
+            shaping_config(PayloadShapingConfig {
+                truncate_historical_tool_results: false,
+                discard_historical_thinking: false,
+                web_fetch_trim_enabled: false,
+                tool_definitions_budget_bytes: 0,
+                tool_description_max_chars: 256,
+                tool_schema_annotation_max_chars: 128,
+                ..PayloadShapingConfig::default()
+            }),
+        )
+        .expect("guard");
+
+        assert_eq!(report.compressed_tool_definitions, 0);
+        assert_eq!(
+            request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tools[0]
+                .tool_specification
+                .description,
+            description
+        );
+    }
+
+    #[test]
     fn payload_breakdown_reports_current_tool_and_history_sizes() {
         let assistant = HistoryAssistantMessage {
             assistant_response_message: AssistantMessage::new("tool call")
@@ -882,18 +2780,20 @@ mod tests {
             .conversation_state
             .current_message
             .user_input_message
-            .user_input_message_context = UserInputMessageContext::new().with_tools(vec![Tool {
-            tool_specification: ToolSpecification {
-                name: "readFile".to_string(),
-                description: "read files".to_string(),
-                input_schema: InputSchema::from_json(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"}
-                    }
-                })),
-            },
-        }]);
+            .user_input_message_context = UserInputMessageContext::new()
+            .with_tools(vec![Tool {
+                tool_specification: ToolSpecification {
+                    name: "readFile".to_string(),
+                    description: "read files".to_string(),
+                    input_schema: InputSchema::from_json(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"}
+                        }
+                    })),
+                },
+            }])
+            .with_tool_results(vec![ToolResult::success("tool-current", "current result")]);
 
         let body = serde_json::to_string(&request).expect("serialize");
         let breakdown = breakdown_kiro_request(&request, &body);
@@ -904,7 +2804,11 @@ mod tests {
         assert_eq!(breakdown.history_tool_use_count, 1);
         assert_eq!(breakdown.history_tool_result_count, 1);
         assert!(breakdown.current_tools_bytes > 0);
+        assert!(breakdown.current_tool_results_bytes > 0);
+        assert!(breakdown.history_tool_results_bytes > 0);
         assert!(breakdown.largest_tool_bytes > 0);
+        assert!(breakdown.largest_history_tool_result_bytes > 0);
+        assert!(breakdown.largest_current_tool_result_bytes > 0);
     }
 
     #[test]
@@ -913,15 +2817,8 @@ mod tests {
         user.user_input_message.images = vec![KiroImage::from_base64("png", "a".repeat(2048))];
         let mut request = request_with_history(vec![Message::User(user)]);
 
-        let (_body, report) = guard_kiro_request(
-            &mut request,
-            PayloadGuardConfig {
-                enabled: true,
-                max_bytes: usize::MAX,
-                trim_history: true,
-            },
-        )
-        .expect("guard");
+        let (_body, report) =
+            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert!(report.original_bytes > 2048);
     }

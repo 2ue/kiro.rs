@@ -130,6 +130,15 @@ function formatAttemptChain(record: UsageRecord): string {
     .join(' > ')
 }
 
+function formatJsonBlock(value: unknown): string {
+  if (!value) return '-'
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return String(value)
+  }
+}
+
 export function UsageRecordsPanel() {
   const [searchText, setSearchText] = useState('')
   const [model, setModel] = useState('')
@@ -721,6 +730,17 @@ export function UsageRecordsPanel() {
                   {selectedRecord.errorDetail || selectedRecord.errorMessage || '-'}
                 </pre>
               </div>
+              {Boolean(selectedRecord.payloadBreakdown || selectedRecord.payloadGuardReport) && (
+                <div>
+                  <div className="mb-2 text-sm font-medium">Payload 诊断</div>
+                  <pre className="max-h-[360px] overflow-auto rounded-md border bg-muted p-3 text-xs whitespace-pre-wrap break-words">
+                    {formatJsonBlock({
+                      breakdown: selectedRecord.payloadBreakdown || null,
+                      guard: selectedRecord.payloadGuardReport || null,
+                    })}
+                  </pre>
+                </div>
+              )}
             </div>
           )}
         </DialogContent>

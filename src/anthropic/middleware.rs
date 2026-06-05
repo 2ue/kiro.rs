@@ -12,7 +12,9 @@ use axum::{
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
-use crate::model::config::{CompatProfile, PromptCacheSimulationMode, ReportedUsageConfig};
+use crate::model::config::{
+    CompatProfile, PayloadShapingConfig, PromptCacheSimulationMode, ReportedUsageConfig,
+};
 
 use super::{
     envelope, model_capabilities::ModelCapabilitiesCatalog, pricing::PricingCatalog,
@@ -63,6 +65,8 @@ pub struct AppState {
     pub payload_guard_max_bytes: usize,
     /// payload 超限时是否裁剪旧历史
     pub payload_guard_trim_history: bool,
+    /// payload shaping 配置
+    pub payload_shaping: PayloadShapingConfig,
 }
 
 impl AppState {
@@ -98,6 +102,7 @@ impl AppState {
             payload_guard_enabled: true,
             payload_guard_max_bytes: 450 * 1024,
             payload_guard_trim_history: true,
+            payload_shaping: PayloadShapingConfig::default(),
         }
     }
 
@@ -145,10 +150,12 @@ impl AppState {
         enabled: bool,
         max_bytes: usize,
         trim_history: bool,
+        payload_shaping: PayloadShapingConfig,
     ) -> Self {
         self.payload_guard_enabled = enabled;
         self.payload_guard_max_bytes = max_bytes;
         self.payload_guard_trim_history = trim_history;
+        self.payload_shaping = payload_shaping;
         self
     }
 

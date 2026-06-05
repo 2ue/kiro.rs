@@ -163,7 +163,26 @@ KIRO_RS_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强
   "adminApiKey": "sk-admin-change-me",
   "payloadGuardEnabled": true,
   "payloadGuardMaxBytes": 460800,
-  "payloadGuardTrimHistory": true
+  "payloadGuardTrimHistory": true,
+  "payloadShaping": {
+    "enabled": true,
+    "truncateHistoricalToolResults": true,
+    "historicalToolResultMaxChars": 8000,
+    "discardHistoricalThinking": true,
+    "compressToolDefinitions": true,
+    "toolDefinitionsBudgetBytes": 20000,
+    "webFetchTrimEnabled": true,
+    "webFetchBodyMaxChars": 12000,
+    "fitCurrentPayloadToBudget": false,
+    "truncateCurrentToolResults": false,
+    "currentToolResultMaxChars": 80000,
+    "truncateCurrentUserContent": false,
+    "currentUserContentMaxChars": 120000,
+    "truncateCurrentDocuments": false,
+    "currentDocumentMaxChars": 80000,
+    "truncateCurrentImages": false,
+    "currentImagesMaxBytes": 180000
+  }
 }
 ```
 
@@ -270,8 +289,24 @@ KIRO_RS_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强
 | 字段名 | 建议值 | 控制什么 |
 | --- | --- | --- |
 | `payloadGuardEnabled` | `true` | 是否在发送 Kiro 上游前按最终 JSON 字节数检查请求体。 |
-| `payloadGuardMaxBytes` | `460800` | Kiro 上游请求 JSON body 最大字节数；`0` 表示不限制大小但仍执行 payload 协议修复。 |
-| `payloadGuardTrimHistory` | `true` | 请求体超限时是否裁剪最旧历史；关闭后只做协议修复，仍超限会直接返回客户端错误。 |
+| `payloadGuardMaxBytes` | `460800` | 本地 payload 经验预算，不是模型上下文上限；`0` 表示不按大小整形或裁剪，但仍执行 payload 协议修复。 |
+| `payloadGuardTrimHistory` | `true` | 请求体超出本地预算时是否裁剪最旧历史；关闭后仍超预算会标记后透传给 Kiro。 |
+| `payloadShaping.enabled` | `true` | 超出本地预算时先执行历史内容和 tools 低风险整形。 |
+| `payloadShaping.truncateHistoricalToolResults` | `true` | 对普通历史 `tool_result` 做头尾保留截断；默认上限 `8000` 字符。 |
+| `payloadShaping.discardHistoricalThinking` | `true` | 移除旧 assistant 历史中的 `<thinking>` 块。 |
+| `payloadShaping.compressToolDefinitions` | `true` | tools 超过 `20000` JSON 字节后压缩描述和 schema 注释，不删除结构语义字段；`toolDefinitionsBudgetBytes=0` 表示关闭工具定义预算压缩。 |
+| `payloadShaping.webFetchTrimEnabled` | `true` | 对历史 WebFetch 内容去噪；默认正文预算 `12000` 字符。 |
+| `payloadShaping.fitCurrentPayloadToBudget` | `false` | 是否在历史裁剪后仍超预算时自动启用当前 tool_result、当前文本、当前 document 和当前图片兜底裁剪。 |
+| `payloadShaping.truncateCurrentToolResults` | `false` | 是否允许在仍超预算时截断当前合法 `tool_result`；默认关闭。 |
+| `payloadShaping.currentToolResultMaxChars` | `80000` | 单个当前 `tool_result` 的头尾保留字符预算。 |
+| `payloadShaping.truncateCurrentUserContent` | `false` | 是否允许在仍超预算时截断当前 user content；包含 document 标签时会保留文档块并只裁文档外侧文本。 |
+| `payloadShaping.currentUserContentMaxChars` | `120000` | 当前纯文本 user content 的头尾保留字符预算。 |
+| `payloadShaping.truncateCurrentDocuments` | `false` | 是否允许在仍超预算时截断当前 `<document>` 块正文，并保留 document 标签。 |
+| `payloadShaping.currentDocumentMaxChars` | `80000` | 单个当前 document 正文的头尾保留字符预算。 |
+| `payloadShaping.truncateCurrentImages` | `false` | 是否允许在仍超预算时丢弃当前图片；图片不会本地重编码压缩。 |
+| `payloadShaping.currentImagesMaxBytes` | `180000` | 当前 images 数组允许保留的 JSON 字节预算。 |
+
+默认不会截断当前 user message、当前合法 `tool_result`、当前 PDF/document 或当前图片。如果显式打开 `fitCurrentPayloadToBudget` 或具体当前内容截断项，服务会在历史整形和旧历史裁剪后仍超出 `payloadGuardMaxBytes` 时，按最终序列化后的 Kiro JSON body 字节数循环收缩当前内容，直到低于配置预算或没有可继续处理的内容。若仍超出预算，服务记录 `still_oversized=true` 并透传请求，由 Kiro 返回真实错误。
 
 ### 路径缓存行为
 
@@ -301,6 +336,8 @@ KIRO_RS_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强
 | `mode: "sample-max"` | input 可用 | 把字段采样到 `maxTokens` 以内，数值自然浮动，不固定到上限。 |
 | `mode: "sample-target"` | cache write 可用 | 按 `targetTokens` 和 `normalMaxMultiplier` 生成自然分布。 |
 | `moveDeltaToCacheRead` | input 建议 `true` | input 被压低的差值转入 cache read，只改变下游上报外观。 |
+
+本地高缓存模拟按实际解析后的上游模型判断 prompt cache 能力和最小缓存长度。Anthropic prompt caching 支持 active Claude 模型；Haiku 不是无缓存模型，但 Haiku 4.5 的最小可缓存长度是 4096 tokens，Haiku 3.5 是 2048 tokens。低于模型最小长度时本地不会模拟 cache creation/read。
 
 ### Usage 记录和模型价格
 

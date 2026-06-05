@@ -9,7 +9,31 @@
   "port": 8990,
   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
   "adminApiKey": "sk-admin-your-secret-key",
+  "credentialRetryMaxAttempts": 0,
   "payloadGuardEnabled": true,
   "payloadGuardMaxBytes": 460800,
-  "payloadGuardTrimHistory": true
+  "payloadGuardTrimHistory": true,
+  "payloadShaping": {
+    "enabled": true,
+    "truncateHistoricalToolResults": true,
+    "historicalToolResultMaxChars": 8000,
+    "historicalToolResultHeadLines": 80,
+    "historicalToolResultTailLines": 40,
+    "discardHistoricalThinking": true,
+    "compressToolDefinitions": true,
+    "toolDefinitionsBudgetBytes": 20000,
+    "toolDescriptionMaxChars": 4000,
+    "toolSchemaAnnotationMaxChars": 1000,
+    "webFetchTrimEnabled": true,
+    "webFetchBodyMaxChars": 12000,
+    "fitCurrentPayloadToBudget": false,
+    "truncateCurrentToolResults": false,
+    "currentToolResultMaxChars": 80000,
+    "truncateCurrentUserContent": false,
+    "currentUserContentMaxChars": 120000,
+    "truncateCurrentDocuments": false,
+    "currentDocumentMaxChars": 80000,
+    "truncateCurrentImages": false,
+    "currentImagesMaxBytes": 180000
+  }
 }

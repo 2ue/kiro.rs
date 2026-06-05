@@ -10,6 +10,7 @@ import { useRuntimeConfig, useUpdateRuntimeConfig } from '@/hooks/use-credential
 import { extractErrorMessage } from '@/lib/utils'
 import type {
   CompatProfile,
+  PayloadShapingConfig,
   ReportedUsageConfig,
   ReportedUsageFieldMode,
   ReportedUsageFieldPolicy,
@@ -68,6 +69,30 @@ const defaultReportedUsage = (): ReportedUsageConfig => ({
   },
 })
 
+const defaultPayloadShaping = (): PayloadShapingConfig => ({
+  enabled: true,
+  truncateHistoricalToolResults: true,
+  historicalToolResultMaxChars: 8000,
+  historicalToolResultHeadLines: 80,
+  historicalToolResultTailLines: 40,
+  discardHistoricalThinking: true,
+  compressToolDefinitions: true,
+  toolDefinitionsBudgetBytes: 20000,
+  toolDescriptionMaxChars: 4000,
+  toolSchemaAnnotationMaxChars: 1000,
+  webFetchTrimEnabled: true,
+  webFetchBodyMaxChars: 12000,
+  fitCurrentPayloadToBudget: false,
+  truncateCurrentToolResults: false,
+  currentToolResultMaxChars: 80000,
+  truncateCurrentUserContent: false,
+  currentUserContentMaxChars: 120000,
+  truncateCurrentDocuments: false,
+  currentDocumentMaxChars: 80000,
+  truncateCurrentImages: false,
+  currentImagesMaxBytes: 180000,
+})
+
 const emptyConfig: RuntimeConfig = {
   credentialRpm: 0,
   credentialMaxConcurrentRequests: 0,
@@ -83,6 +108,7 @@ const emptyConfig: RuntimeConfig = {
   credentialProbationSecs: 30,
   credentialMaxCooldownSecs: 300,
   credentialDispatchMaxWaitSecs: 120,
+  credentialRetryMaxAttempts: 0,
   credentialInFlightLeaseMaxSecs: 900,
   dispatchGlobalMaxConcurrentRequests: 0,
   dispatchMaxQueuedRequests: 0,
@@ -103,6 +129,7 @@ const emptyConfig: RuntimeConfig = {
   payloadGuardEnabled: true,
   payloadGuardMaxBytes: 460800,
   payloadGuardTrimHistory: true,
+  payloadShaping: defaultPayloadShaping(),
   promptCacheTargetReadRatio: 0.98,
   promptCacheTokenScale: 1.6,
   promptCacheMaxSimulatedInputTokens: 300000,
@@ -545,6 +572,23 @@ function normalizeReportedUsage(config: ReportedUsageConfig): ReportedUsageConfi
   }
 }
 
+function normalizePayloadShaping(config: PayloadShapingConfig): PayloadShapingConfig {
+  return {
+    ...config,
+    historicalToolResultMaxChars: toWhole(config.historicalToolResultMaxChars),
+    historicalToolResultHeadLines: toWhole(config.historicalToolResultHeadLines),
+    historicalToolResultTailLines: toWhole(config.historicalToolResultTailLines),
+    toolDefinitionsBudgetBytes: toWhole(config.toolDefinitionsBudgetBytes),
+    toolDescriptionMaxChars: toWhole(config.toolDescriptionMaxChars),
+    toolSchemaAnnotationMaxChars: toWhole(config.toolSchemaAnnotationMaxChars),
+    webFetchBodyMaxChars: toWhole(config.webFetchBodyMaxChars),
+    currentToolResultMaxChars: toWhole(config.currentToolResultMaxChars),
+    currentUserContentMaxChars: toWhole(config.currentUserContentMaxChars),
+    currentDocumentMaxChars: toWhole(config.currentDocumentMaxChars),
+    currentImagesMaxBytes: toWhole(config.currentImagesMaxBytes),
+  }
+}
+
 function fieldNeedsMax(policy: ReportedUsageFieldPolicy): boolean {
   return policy.mode === 'sample-max'
 }
@@ -560,7 +604,14 @@ export function RuntimeConfigPanel() {
 
   useEffect(() => {
     if (config.data) {
-      setDraft(config.data)
+      setDraft({
+        ...emptyConfig,
+        ...config.data,
+        payloadShaping: {
+          ...defaultPayloadShaping(),
+          ...config.data.payloadShaping,
+        },
+      })
     }
   }, [config.data])
 
@@ -581,6 +632,7 @@ export function RuntimeConfigPanel() {
       credentialProbationSecs: toWhole(draft.credentialProbationSecs),
       credentialMaxCooldownSecs: toWhole(draft.credentialMaxCooldownSecs, 1),
       credentialDispatchMaxWaitSecs: toWhole(draft.credentialDispatchMaxWaitSecs),
+      credentialRetryMaxAttempts: toWhole(draft.credentialRetryMaxAttempts),
       credentialInFlightLeaseMaxSecs: toWhole(draft.credentialInFlightLeaseMaxSecs),
       dispatchGlobalMaxConcurrentRequests: toWhole(draft.dispatchGlobalMaxConcurrentRequests),
       dispatchMaxQueuedRequests: toWhole(draft.dispatchMaxQueuedRequests),
@@ -597,6 +649,7 @@ export function RuntimeConfigPanel() {
       schedulerTotalSelectionWeight: Math.max(0, Number(draft.schedulerTotalSelectionWeight.toFixed(4))),
       schedulerTopK: toWhole(draft.schedulerTopK, 1, 100),
       payloadGuardMaxBytes: toWhole(draft.payloadGuardMaxBytes),
+      payloadShaping: normalizePayloadShaping(draft.payloadShaping),
       promptCacheTargetReadRatio: toRatio(draft.promptCacheTargetReadRatio),
       promptCacheTokenScale: toScale(draft.promptCacheTokenScale),
       promptCacheMaxSimulatedInputTokens: toWhole(draft.promptCacheMaxSimulatedInputTokens),
@@ -727,6 +780,16 @@ export function RuntimeConfigPanel() {
               }
             />
             <NumberField
+              title="单请求最大重试次数"
+              description="控制一次上游调用最多尝试多少个凭据/轮次。填 0 表示自动：小账号池保持最多 9 次，大账号池至少覆盖一轮账号。"
+              value={draft.credentialRetryMaxAttempts}
+              min={0}
+              suffix="次"
+              onChange={(credentialRetryMaxAttempts) =>
+                setDraft((prev) => ({ ...prev, credentialRetryMaxAttempts }))
+              }
+            />
+            <NumberField
               title="异常并发自动回收"
               description="控制单个并发占用超过多久未活跃时自动释放。填 0 表示关闭；建议大于正常长请求耗时，避免异常路径把账号永久占满。"
               value={draft.credentialInFlightLeaseMaxSecs}
@@ -827,7 +890,7 @@ export function RuntimeConfigPanel() {
             />
             <ToggleField
               title="超限裁剪旧历史"
-              description="请求超过最大字节数时，优先裁剪最旧历史；关闭后只做协议修复，仍超限会直接返回客户端错误。"
+              description="请求超过最大字节数时，优先裁剪最旧历史；关闭后只做协议修复，仍超限会标记后透传给 Kiro。"
               checked={draft.payloadGuardTrimHistory}
               disabled={!draft.payloadGuardEnabled}
               onCheckedChange={(payloadGuardTrimHistory) =>
@@ -842,6 +905,217 @@ export function RuntimeConfigPanel() {
               suffix="bytes"
               onChange={(payloadGuardMaxBytes) =>
                 setDraft((prev) => ({ ...prev, payloadGuardMaxBytes }))
+              }
+            />
+            <ToggleField
+              title="启用 Payload 内容整形"
+              description="只在请求超过本地 payload 预算后生效，默认只处理旧历史、历史 thinking、历史 WebFetch 和工具定义描述。"
+              checked={draft.payloadShaping.enabled}
+              disabled={!draft.payloadGuardEnabled}
+              onCheckedChange={(enabled) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  payloadShaping: { ...prev.payloadShaping, enabled },
+                }))
+              }
+            />
+            <ToggleField
+              title="截断历史工具结果"
+              description="只截断历史 tool_result，保留头尾和省略说明；当前合法 tool_result 默认不截断。"
+              checked={draft.payloadShaping.truncateHistoricalToolResults}
+              disabled={!draft.payloadGuardEnabled || !draft.payloadShaping.enabled}
+              onCheckedChange={(truncateHistoricalToolResults) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  payloadShaping: { ...prev.payloadShaping, truncateHistoricalToolResults },
+                }))
+              }
+            />
+            <NumberField
+              title="历史工具结果保留字符"
+              description="单个历史 tool_result 的通用头尾保留预算。默认 8000 字符；WebFetch 会先走专项去噪。"
+              value={draft.payloadShaping.historicalToolResultMaxChars}
+              min={0}
+              suffix="chars"
+              onChange={(historicalToolResultMaxChars) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  payloadShaping: { ...prev.payloadShaping, historicalToolResultMaxChars },
+                }))
+              }
+            />
+            <ToggleField
+              title="移除历史 thinking"
+              description="只移除旧 assistant 历史里的 thinking 标签内容，不处理当前请求内容。"
+              checked={draft.payloadShaping.discardHistoricalThinking}
+              disabled={!draft.payloadGuardEnabled || !draft.payloadShaping.enabled}
+              onCheckedChange={(discardHistoricalThinking) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  payloadShaping: { ...prev.payloadShaping, discardHistoricalThinking },
+                }))
+              }
+            />
+            <ToggleField
+              title="压缩工具定义描述"
+              description="压缩当前请求 tools 的 description 和 JSON Schema 注释字段，不删除 type、properties、required、enum 等语义字段。"
+              checked={draft.payloadShaping.compressToolDefinitions}
+              disabled={!draft.payloadGuardEnabled || !draft.payloadShaping.enabled}
+              onCheckedChange={(compressToolDefinitions) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  payloadShaping: { ...prev.payloadShaping, compressToolDefinitions },
+                }))
+              }
+            />
+            <NumberField
+              title="工具定义预算"
+              description="当前请求 tools 的 JSON 字节预算。超过后压缩描述和 schema 注释；默认 20000 bytes，填 0 表示关闭该预算压缩。"
+              value={draft.payloadShaping.toolDefinitionsBudgetBytes}
+              min={0}
+              suffix="bytes"
+              onChange={(toolDefinitionsBudgetBytes) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  payloadShaping: { ...prev.payloadShaping, toolDefinitionsBudgetBytes },
+                }))
+              }
+            />
+            <ToggleField
+              title="WebFetch 历史去噪"
+              description="对历史 WebFetch 工具结果移除 data image、重复行和明显噪声，默认正文预算 12000 字符。"
+              checked={draft.payloadShaping.webFetchTrimEnabled}
+              disabled={!draft.payloadGuardEnabled || !draft.payloadShaping.enabled}
+              onCheckedChange={(webFetchTrimEnabled) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  payloadShaping: { ...prev.payloadShaping, webFetchTrimEnabled },
+                }))
+              }
+            />
+            <NumberField
+              title="WebFetch 正文预算"
+              description="历史 WebFetch 正文去噪后的字符预算。填 0 表示关闭该项正文裁剪。"
+              value={draft.payloadShaping.webFetchBodyMaxChars}
+              min={0}
+              suffix="chars"
+              onChange={(webFetchBodyMaxChars) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  payloadShaping: { ...prev.payloadShaping, webFetchBodyMaxChars },
+                }))
+              }
+            />
+            <ToggleField
+              title="自动适配当前内容预算"
+              description="开启后，历史裁剪后仍超出 Kiro Payload 最大字节数时，会按下方预算裁剪当前 tool_result、当前文本、当前 document，并按体积丢弃当前图片；默认关闭。"
+              checked={draft.payloadShaping.fitCurrentPayloadToBudget}
+              disabled={!draft.payloadGuardEnabled || !draft.payloadShaping.enabled}
+              onCheckedChange={(fitCurrentPayloadToBudget) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  payloadShaping: { ...prev.payloadShaping, fitCurrentPayloadToBudget },
+                }))
+              }
+            />
+            <ToggleField
+              title="截断当前工具结果"
+              description="当前合法 tool_result 也可能非常大。开启后仅在历史裁剪后仍超预算时按头尾保留截断；自动适配当前内容预算打开时也会启用。"
+              checked={draft.payloadShaping.truncateCurrentToolResults}
+              disabled={!draft.payloadGuardEnabled || !draft.payloadShaping.enabled}
+              onCheckedChange={(truncateCurrentToolResults) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  payloadShaping: { ...prev.payloadShaping, truncateCurrentToolResults },
+                }))
+              }
+            />
+            <NumberField
+              title="当前工具结果保留字符"
+              description="单个当前 tool_result 的头尾保留预算。开启当前工具结果截断后使用；默认 80000 字符。"
+              value={draft.payloadShaping.currentToolResultMaxChars}
+              min={0}
+              suffix="chars"
+              onChange={(currentToolResultMaxChars) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  payloadShaping: { ...prev.payloadShaping, currentToolResultMaxChars },
+                }))
+              }
+            />
+            <ToggleField
+              title="截断当前用户文本"
+              description="开启后仅在仍超预算时截断当前 user content；包含 document 标签时会保留文档块结构，并只裁剪文档外侧文本。"
+              checked={draft.payloadShaping.truncateCurrentUserContent}
+              disabled={!draft.payloadGuardEnabled || !draft.payloadShaping.enabled}
+              onCheckedChange={(truncateCurrentUserContent) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  payloadShaping: { ...prev.payloadShaping, truncateCurrentUserContent },
+                }))
+              }
+            />
+            <NumberField
+              title="当前用户文本保留字符"
+              description="当前纯文本 user content 的头尾保留预算。开启当前用户文本截断后使用；默认 120000 字符。"
+              value={draft.payloadShaping.currentUserContentMaxChars}
+              min={0}
+              suffix="chars"
+              onChange={(currentUserContentMaxChars) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  payloadShaping: { ...prev.payloadShaping, currentUserContentMaxChars },
+                }))
+              }
+            />
+            <ToggleField
+              title="截断当前文档"
+              description="开启后仅在仍超预算时截断当前 <document> 块正文，并保留 document 开闭标签；适合 PDF 文本过大场景。"
+              checked={draft.payloadShaping.truncateCurrentDocuments}
+              disabled={!draft.payloadGuardEnabled || !draft.payloadShaping.enabled}
+              onCheckedChange={(truncateCurrentDocuments) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  payloadShaping: { ...prev.payloadShaping, truncateCurrentDocuments },
+                }))
+              }
+            />
+            <NumberField
+              title="当前文档保留字符"
+              description="单个当前 document 正文的头尾保留预算。开启当前文档截断后使用；默认 80000 字符。"
+              value={draft.payloadShaping.currentDocumentMaxChars}
+              min={0}
+              suffix="chars"
+              onChange={(currentDocumentMaxChars) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  payloadShaping: { ...prev.payloadShaping, currentDocumentMaxChars },
+                }))
+              }
+            />
+            <ToggleField
+              title="丢弃当前图片"
+              description="图片不会本地重编码压缩。开启后仅在仍超预算时按体积从大到小丢弃，并在文本中追加代理省略说明，默认关闭。"
+              checked={draft.payloadShaping.truncateCurrentImages}
+              disabled={!draft.payloadGuardEnabled || !draft.payloadShaping.enabled}
+              onCheckedChange={(truncateCurrentImages) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  payloadShaping: { ...prev.payloadShaping, truncateCurrentImages },
+                }))
+              }
+            />
+            <NumberField
+              title="当前图片 JSON 预算"
+              description="当前 images 数组允许保留的 JSON 字节数。开启当前图片丢弃后使用；默认 180000 bytes。"
+              value={draft.payloadShaping.currentImagesMaxBytes}
+              min={0}
+              suffix="bytes"
+              onChange={(currentImagesMaxBytes) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  payloadShaping: { ...prev.payloadShaping, currentImagesMaxBytes },
+                }))
               }
             />
           </ConfigSection>

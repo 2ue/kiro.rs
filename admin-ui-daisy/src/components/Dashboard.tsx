@@ -33,6 +33,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
   const [activeTab, setActiveTab] = useState<TabKey>('credentials')
   const [theme, setTheme] = useState<ThemeMode>(getStoredTheme)
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [isRefreshing, setIsRefreshing] = useState(false)
   const queryClient = useQueryClient()
 
@@ -65,7 +66,12 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     <div className="min-h-screen bg-base-200">
       {/* Desktop Sidebar */}
       <div className="hidden lg:block">
-        <Sidebar activeTab={activeTab} onTabChange={handleTabChange} />
+        <Sidebar
+          activeTab={activeTab}
+          collapsed={sidebarCollapsed}
+          onCollapsedChange={setSidebarCollapsed}
+          onTabChange={handleTabChange}
+        />
       </div>
 
       {/* Mobile Drawer */}
@@ -74,7 +80,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         onClickOverlay={() => setMobileMenuOpen(false)}
         side={
           <div className="h-full w-64 bg-base-100">
-            <Sidebar activeTab={activeTab} onTabChange={handleTabChange} />
+            <Sidebar activeTab={activeTab} embedded onTabChange={handleTabChange} />
           </div>
         }
         className="lg:hidden"
@@ -83,7 +89,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
       </Drawer>
 
       {/* Main Content */}
-      <div className="lg:pl-56">
+      <div className={`transition-[padding-left] duration-200 ${sidebarCollapsed ? 'lg:pl-16' : 'lg:pl-56'}`}>
         {/* Mobile Header */}
         <div className="sticky top-0 z-30 flex h-14 items-center gap-3 border-b border-base-300 bg-base-100/80 px-4 backdrop-blur-lg lg:hidden">
           <Button
@@ -114,7 +120,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         </div>
 
         {/* Page Content */}
-        <main className="mx-auto max-w-[var(--page-max)] p-4 lg:p-6">
+        <main className="mx-auto max-w-[var(--page-max)] p-4 pb-20 lg:p-6">
           {activeTab === 'credentials' && <CredentialsPanel />}
           {activeTab === 'validation' && <AccountValidationPanel />}
           {activeTab === 'proxies' && <ProxyPanel />}
