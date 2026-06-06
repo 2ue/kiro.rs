@@ -18,7 +18,7 @@ use super::{
         SetCredentialProxyRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
         SetPriorityRequest, SetWarmupRequest, SuccessResponse, TestCredentialRequest,
         UpdateAdminApiKeyRequest, UpdateProxyResourceRequest, UpdateRuntimeConfigRequest,
-        UpsertManualModelRequest, ValidateExistingCredentialsRequest,
+        UpsertManualModelRequest, UsageCleanupRequest, ValidateExistingCredentialsRequest,
         ValidateExternalCredentialsRequest,
     },
 };
@@ -656,6 +656,42 @@ pub async fn get_usage_writer_stats(State(state): State<AdminState>) -> impl Int
 pub async fn clear_usage_records(State(state): State<AdminState>) -> impl IntoResponse {
     state.service.clear_usage_records();
     Json(SuccessResponse::new("Usage 记录已清空"))
+}
+
+/// POST /api/admin/usage-records/cleanup/preview
+/// 预估手动分批清理会影响的 usage 记录数量。
+pub async fn preview_usage_cleanup(
+    State(state): State<AdminState>,
+    Json(request): Json<UsageCleanupRequest>,
+) -> impl IntoResponse {
+    match state.service.preview_usage_cleanup(request) {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/usage-records/cleanup/start
+/// 启动一次手动后台分批清理任务。
+pub async fn start_usage_cleanup(
+    State(state): State<AdminState>,
+    Json(request): Json<UsageCleanupRequest>,
+) -> impl IntoResponse {
+    match state.service.start_usage_cleanup(request) {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/usage-records/cleanup/status
+/// 获取当前手动 usage 清理任务状态。
+pub async fn get_usage_cleanup_status(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_usage_cleanup_status())
+}
+
+/// POST /api/admin/usage-records/cleanup/cancel
+/// 请求取消当前手动 usage 清理任务。
+pub async fn cancel_usage_cleanup(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.cancel_usage_cleanup())
 }
 
 /// GET /api/admin/audit-logs

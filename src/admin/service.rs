@@ -2,9 +2,11 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration as StdDuration;
 
-use chrono::Utc;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -20,7 +22,9 @@ use super::types::{
     SetCredentialProxyRequest, SetLoadBalancingModeRequest, SetWarmupRequest,
     TestCredentialRequest, TestCredentialResponse, UpdateAdminApiKeyRequest,
     UpdateProxyResourceRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
-    ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
+    UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse, UsageCleanupRequest,
+    UsageCleanupStatusResponse, ValidateExistingCredentialsRequest,
+    ValidateExternalCredentialsRequest,
 };
 use crate::anthropic::{
     model_capabilities::{
@@ -54,6 +58,8 @@ const BALANCE_CACHE_TTL_SECS: i64 = 300;
 const DEFAULT_CREDENTIALS_PAGE_LIMIT: usize = 12;
 const MAX_CREDENTIALS_PAGE_LIMIT: usize = 500;
 const MAX_MANUAL_MODEL_ID_LEN: usize = 160;
+const USAGE_CLEANUP_DEFAULT_MAX_BATCHES: usize = 10_000;
+const USAGE_CLEANUP_MAX_BATCHES: usize = 10_000;
 
 #[derive(Debug, Clone, Default)]
 pub struct CredentialListQuery {
@@ -137,6 +143,50 @@ pub struct AdminService {
     pricing_catalog: Arc<PricingCatalog>,
     model_capabilities: Arc<ModelCapabilitiesCatalog>,
     kiro_provider: Arc<KiroProvider>,
+    usage_cleanup: Arc<Mutex<UsageCleanupRuntime>>,
+}
+
+#[derive(Debug, Clone)]
+struct UsageCleanupPlan {
+    mode: UsageCleanupMode,
+    cutoff: DateTime<Utc>,
+    batch_size: usize,
+    max_batches: usize,
+    pause_ms_between_batches: u64,
+}
+
+#[derive(Debug)]
+struct UsageCleanupRuntime {
+    status: UsageCleanupStatusResponse,
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+impl Default for UsageCleanupRuntime {
+    fn default() -> Self {
+        Self {
+            status: UsageCleanupStatusResponse {
+                job_id: None,
+                status: UsageCleanupJobStatus::Idle,
+                mode: None,
+                cutoff_at: None,
+                batch_size: 0,
+                max_batches: 0,
+                pause_ms_between_batches: 0,
+                matched_rows: None,
+                remaining_rows: None,
+                processed_rows: 0,
+                last_batch_rows: 0,
+                batches: 0,
+                cancel_requested: false,
+                stop_reason: None,
+                started_at: None,
+                updated_at: None,
+                finished_at: None,
+                last_error: None,
+            },
+            cancel: None,
+        }
+    }
 }
 
 impl AdminService {
@@ -163,6 +213,7 @@ impl AdminService {
             pricing_catalog,
             model_capabilities,
             kiro_provider,
+            usage_cleanup: Arc::new(Mutex::new(UsageCleanupRuntime::default())),
         }
     }
 
@@ -1524,6 +1575,130 @@ impl AdminService {
         );
     }
 
+    pub fn preview_usage_cleanup(
+        &self,
+        request: UsageCleanupRequest,
+    ) -> Result<UsageCleanupPreviewResponse, AdminServiceError> {
+        let plan = normalize_usage_cleanup_request(request)?;
+        let store = PostgresUsageStore::new(self.postgres_store.clone());
+        let preview = block_on_admin_store(async move {
+            match plan.mode {
+                UsageCleanupMode::SoftDelete => {
+                    store.preview_soft_delete_cleanup(plan.cutoff).await
+                }
+                UsageCleanupMode::HardDelete => {
+                    store.preview_hard_delete_cleanup(plan.cutoff).await
+                }
+            }
+        })
+        .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+
+        Ok(UsageCleanupPreviewResponse {
+            mode: plan.mode,
+            cutoff_at: plan.cutoff.to_rfc3339(),
+            matched_rows: preview.matched_rows,
+            oldest_created_at: preview.oldest_created_at.map(|value| value.to_rfc3339()),
+            newest_created_at: preview.newest_created_at.map(|value| value.to_rfc3339()),
+        })
+    }
+
+    pub fn start_usage_cleanup(
+        &self,
+        request: UsageCleanupRequest,
+    ) -> Result<UsageCleanupStatusResponse, AdminServiceError> {
+        let plan = normalize_usage_cleanup_request(request)?;
+        let store = PostgresUsageStore::new(self.postgres_store.clone());
+        let preview = block_on_admin_store({
+            let store = store.clone();
+            let plan = plan.clone();
+            async move {
+                match plan.mode {
+                    UsageCleanupMode::SoftDelete => {
+                        store.preview_soft_delete_cleanup(plan.cutoff).await
+                    }
+                    UsageCleanupMode::HardDelete => {
+                        store.preview_hard_delete_cleanup(plan.cutoff).await
+                    }
+                }
+            }
+        })
+        .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+
+        let now = Utc::now();
+        let job_id = format!("usage-cleanup-{}", now.timestamp_millis());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let status = UsageCleanupStatusResponse {
+            job_id: Some(job_id.clone()),
+            status: UsageCleanupJobStatus::Running,
+            mode: Some(plan.mode),
+            cutoff_at: Some(plan.cutoff.to_rfc3339()),
+            batch_size: plan.batch_size,
+            max_batches: plan.max_batches,
+            pause_ms_between_batches: plan.pause_ms_between_batches,
+            matched_rows: Some(preview.matched_rows),
+            remaining_rows: Some(preview.matched_rows),
+            processed_rows: 0,
+            last_batch_rows: 0,
+            batches: 0,
+            cancel_requested: false,
+            stop_reason: None,
+            started_at: Some(now.to_rfc3339()),
+            updated_at: Some(now.to_rfc3339()),
+            finished_at: None,
+            last_error: None,
+        };
+
+        {
+            let mut runtime = self.usage_cleanup.lock();
+            if runtime.status.status == UsageCleanupJobStatus::Running {
+                return Err(AdminServiceError::Conflict(
+                    "已有 usage 清理任务正在运行".to_string(),
+                ));
+            }
+            runtime.status = status;
+            runtime.cancel = Some(cancel.clone());
+        }
+
+        self.audit(
+            "start_usage_cleanup",
+            "usage_record",
+            None,
+            true,
+            None,
+            json!({
+                "jobId": job_id,
+                "mode": plan.mode,
+                "cutoffAt": plan.cutoff.to_rfc3339(),
+                "batchSize": plan.batch_size,
+                "maxBatches": plan.max_batches,
+                "matchedRows": preview.matched_rows,
+            }),
+        );
+
+        let cleanup_state = self.usage_cleanup.clone();
+        tokio::spawn(async move {
+            run_usage_cleanup_job(job_id, store, cleanup_state, cancel, plan).await;
+        });
+
+        Ok(self.get_usage_cleanup_status())
+    }
+
+    pub fn get_usage_cleanup_status(&self) -> UsageCleanupStatusResponse {
+        self.usage_cleanup.lock().status.clone()
+    }
+
+    pub fn cancel_usage_cleanup(&self) -> UsageCleanupStatusResponse {
+        let mut runtime = self.usage_cleanup.lock();
+        if runtime.status.status == UsageCleanupJobStatus::Running {
+            if let Some(cancel) = &runtime.cancel {
+                cancel.store(true, Ordering::Release);
+            }
+            runtime.status.cancel_requested = true;
+            runtime.status.updated_at = Some(Utc::now().to_rfc3339());
+        }
+        runtime.status.clone()
+    }
+
     pub fn get_audit_logs(&self, page: usize, limit: usize) -> AdminAuditLogPage {
         let store = self.postgres_store.clone();
         block_on_admin_store(async move { store.query_admin_audit_logs(page, limit).await })
@@ -2621,6 +2796,308 @@ fn build_validation_response(items: Vec<CredentialValidationItem>) -> Credential
 
 fn email_key(email: &str) -> String {
     email.trim().to_lowercase()
+}
+
+fn normalize_usage_cleanup_request(
+    request: UsageCleanupRequest,
+) -> Result<UsageCleanupPlan, AdminServiceError> {
+    let cutoff = if let Some(value) = request
+        .cutoff_before
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        DateTime::parse_from_rfc3339(value)
+            .map_err(|err| {
+                AdminServiceError::InvalidCredential(format!(
+                    "cutoffBefore 不是有效 RFC3339 时间: {}",
+                    err
+                ))
+            })?
+            .with_timezone(&Utc)
+    } else {
+        let days = request.older_than_days.unwrap_or(7);
+        if days == 0 {
+            return Err(AdminServiceError::InvalidCredential(
+                "olderThanDays 必须大于 0".to_string(),
+            ));
+        }
+        if days > 3650 {
+            return Err(AdminServiceError::InvalidCredential(
+                "olderThanDays 不能超过 3650".to_string(),
+            ));
+        }
+        Utc::now() - ChronoDuration::days(days as i64)
+    };
+
+    if cutoff >= Utc::now() {
+        return Err(AdminServiceError::InvalidCredential(
+            "cutoffBefore 必须早于当前时间".to_string(),
+        ));
+    }
+
+    let batch_size = request.batch_size.unwrap_or(1000);
+    if batch_size == 0 || batch_size > 5000 {
+        return Err(AdminServiceError::InvalidCredential(
+            "batchSize 必须在 1..=5000 之间".to_string(),
+        ));
+    }
+
+    let max_batches = request
+        .max_batches
+        .filter(|value| *value > 0)
+        .unwrap_or(USAGE_CLEANUP_DEFAULT_MAX_BATCHES);
+    if max_batches > USAGE_CLEANUP_MAX_BATCHES {
+        return Err(AdminServiceError::InvalidCredential(
+            "maxBatches 必须在 1..=10000 之间".to_string(),
+        ));
+    }
+
+    let pause_ms_between_batches = request.pause_ms_between_batches.unwrap_or(100);
+    if pause_ms_between_batches > 10_000 {
+        return Err(AdminServiceError::InvalidCredential(
+            "pauseMsBetweenBatches 不能超过 10000".to_string(),
+        ));
+    }
+
+    Ok(UsageCleanupPlan {
+        mode: request.mode,
+        cutoff,
+        batch_size,
+        max_batches,
+        pause_ms_between_batches,
+    })
+}
+
+async fn run_usage_cleanup_job(
+    job_id: String,
+    store: PostgresUsageStore,
+    cleanup_state: Arc<Mutex<UsageCleanupRuntime>>,
+    cancel: Arc<AtomicBool>,
+    plan: UsageCleanupPlan,
+) {
+    let mut processed_rows = 0u64;
+    let mut batches = 0usize;
+
+    let (final_status, stop_reason, last_error) = loop {
+        if cancel.load(Ordering::Acquire) {
+            break (
+                UsageCleanupJobStatus::Cancelled,
+                Some("cancel_requested".to_string()),
+                None,
+            );
+        }
+        if batches >= plan.max_batches {
+            break (
+                UsageCleanupJobStatus::Completed,
+                Some("max_batches_reached".to_string()),
+                None,
+            );
+        }
+
+        let batch_result = match plan.mode {
+            UsageCleanupMode::SoftDelete => {
+                store
+                    .soft_delete_cleanup_batch(plan.cutoff, plan.batch_size)
+                    .await
+            }
+            UsageCleanupMode::HardDelete => {
+                store
+                    .hard_delete_cleanup_batch(plan.cutoff, plan.batch_size)
+                    .await
+            }
+        };
+
+        let batch_rows = match batch_result {
+            Ok(rows) => rows,
+            Err(err) => {
+                break (
+                    UsageCleanupJobStatus::Failed,
+                    Some("batch_failed".to_string()),
+                    Some(err.to_string()),
+                );
+            }
+        };
+
+        if batch_rows == 0 {
+            break (
+                UsageCleanupJobStatus::Completed,
+                Some("no_more_rows".to_string()),
+                None,
+            );
+        }
+
+        batches += 1;
+        processed_rows = processed_rows.saturating_add(batch_rows);
+        update_usage_cleanup_progress(
+            &cleanup_state,
+            &job_id,
+            UsageCleanupJobStatus::Running,
+            processed_rows,
+            batch_rows,
+            batches,
+            None,
+            None,
+            None,
+        );
+
+        if batch_rows < plan.batch_size as u64 {
+            break (
+                UsageCleanupJobStatus::Completed,
+                Some("no_more_rows".to_string()),
+                None,
+            );
+        }
+
+        if plan.pause_ms_between_batches > 0 {
+            tokio::time::sleep(StdDuration::from_millis(plan.pause_ms_between_batches)).await;
+        }
+    };
+
+    let remaining_rows = match plan.mode {
+        UsageCleanupMode::SoftDelete => store
+            .preview_soft_delete_cleanup(plan.cutoff)
+            .await
+            .map(|preview| preview.matched_rows)
+            .ok(),
+        UsageCleanupMode::HardDelete => store
+            .preview_hard_delete_cleanup(plan.cutoff)
+            .await
+            .map(|preview| preview.matched_rows)
+            .ok(),
+    };
+
+    update_usage_cleanup_progress(
+        &cleanup_state,
+        &job_id,
+        final_status,
+        processed_rows,
+        0,
+        batches,
+        remaining_rows,
+        stop_reason,
+        last_error,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_usage_cleanup_progress(
+    cleanup_state: &Arc<Mutex<UsageCleanupRuntime>>,
+    job_id: &str,
+    status: UsageCleanupJobStatus,
+    processed_rows: u64,
+    last_batch_rows: u64,
+    batches: usize,
+    remaining_rows: Option<u64>,
+    stop_reason: Option<String>,
+    last_error: Option<String>,
+) {
+    let now = Utc::now().to_rfc3339();
+    let mut runtime = cleanup_state.lock();
+    if runtime.status.job_id.as_deref() != Some(job_id) {
+        return;
+    }
+    runtime.status.status = status;
+    runtime.status.processed_rows = processed_rows;
+    runtime.status.last_batch_rows = last_batch_rows;
+    runtime.status.batches = batches;
+    runtime.status.updated_at = Some(now.clone());
+    if let Some(remaining_rows) = remaining_rows {
+        runtime.status.remaining_rows = Some(remaining_rows);
+    } else if let Some(matched_rows) = runtime.status.matched_rows {
+        runtime.status.remaining_rows = Some(matched_rows.saturating_sub(processed_rows));
+    }
+    if stop_reason.is_some() {
+        runtime.status.stop_reason = stop_reason;
+    }
+    if last_error.is_some() {
+        runtime.status.last_error = last_error;
+    }
+    if status != UsageCleanupJobStatus::Running {
+        runtime.status.finished_at = Some(now);
+        runtime.cancel = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cleanup_request() -> UsageCleanupRequest {
+        UsageCleanupRequest {
+            mode: UsageCleanupMode::SoftDelete,
+            older_than_days: None,
+            cutoff_before: None,
+            batch_size: None,
+            max_batches: None,
+            pause_ms_between_batches: None,
+        }
+    }
+
+    #[test]
+    fn usage_cleanup_request_uses_safe_manual_defaults() {
+        let before = Utc::now();
+        let plan = normalize_usage_cleanup_request(cleanup_request()).expect("valid request");
+        let after = Utc::now();
+
+        assert_eq!(plan.mode, UsageCleanupMode::SoftDelete);
+        assert_eq!(plan.batch_size, 1000);
+        assert_eq!(plan.max_batches, USAGE_CLEANUP_DEFAULT_MAX_BATCHES);
+        assert_eq!(plan.pause_ms_between_batches, 100);
+        assert!(plan.cutoff >= before - ChronoDuration::days(7) - ChronoDuration::seconds(1));
+        assert!(plan.cutoff <= after - ChronoDuration::days(7) + ChronoDuration::seconds(1));
+    }
+
+    #[test]
+    fn usage_cleanup_request_cutoff_before_overrides_days() {
+        let cutoff = Utc::now() - ChronoDuration::days(30);
+        let mut request = cleanup_request();
+        request.mode = UsageCleanupMode::HardDelete;
+        request.older_than_days = Some(1);
+        request.cutoff_before = Some(cutoff.to_rfc3339());
+        request.batch_size = Some(5000);
+        request.max_batches = Some(10_000);
+        request.pause_ms_between_batches = Some(0);
+
+        let plan = normalize_usage_cleanup_request(request).expect("valid request");
+
+        assert_eq!(plan.mode, UsageCleanupMode::HardDelete);
+        assert_eq!(plan.cutoff, cutoff);
+        assert_eq!(plan.batch_size, 5000);
+        assert_eq!(plan.max_batches, 10_000);
+        assert_eq!(plan.pause_ms_between_batches, 0);
+    }
+
+    #[test]
+    fn usage_cleanup_request_rejects_unsafe_bounds() {
+        let mut zero_days = cleanup_request();
+        zero_days.older_than_days = Some(0);
+        assert!(matches!(
+            normalize_usage_cleanup_request(zero_days),
+            Err(AdminServiceError::InvalidCredential(_))
+        ));
+
+        let mut large_batch = cleanup_request();
+        large_batch.batch_size = Some(5001);
+        assert!(matches!(
+            normalize_usage_cleanup_request(large_batch),
+            Err(AdminServiceError::InvalidCredential(_))
+        ));
+
+        let mut too_many_batches = cleanup_request();
+        too_many_batches.max_batches = Some(USAGE_CLEANUP_MAX_BATCHES + 1);
+        assert!(matches!(
+            normalize_usage_cleanup_request(too_many_batches),
+            Err(AdminServiceError::InvalidCredential(_))
+        ));
+
+        let mut future_cutoff = cleanup_request();
+        future_cutoff.cutoff_before = Some((Utc::now() + ChronoDuration::minutes(1)).to_rfc3339());
+        assert!(matches!(
+            normalize_usage_cleanup_request(future_cutoff),
+            Err(AdminServiceError::InvalidCredential(_))
+        ));
+    }
 }
 
 fn block_on_admin_store<T>(

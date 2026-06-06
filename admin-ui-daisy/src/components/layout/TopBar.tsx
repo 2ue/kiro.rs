@@ -11,7 +11,6 @@ interface TopBarProps {
   onRefresh?: () => void
   isRefreshing?: boolean
   actions?: React.ReactNode
-  adminApiKeyLabel?: string
 }
 
 const themes: Array<{ key: ThemeMode; label: string; icon: React.ReactNode; colors: string }> = [
@@ -32,7 +31,6 @@ export function TopBar({
   onRefresh,
   isRefreshing,
   actions,
-  adminApiKeyLabel,
 }: TopBarProps) {
   const currentTheme = themes.find((t) => t.key === theme) || themes[0]
 
@@ -42,19 +40,7 @@ export function TopBar({
         {/* Title */}
         <div className="min-w-0 flex-1">
           <h1 className="truncate text-lg font-semibold tracking-tight">{title}</h1>
-          {(subtitle || adminApiKeyLabel) && (
-            <p className="truncate text-xs text-base-content/50">
-              {subtitle}
-              {adminApiKeyLabel && (
-                <>
-                  {subtitle ? <span className="mx-2 text-base-content/25">|</span> : null}
-                  <span className="font-mono">adminApiKey</span>
-                  <span className="mx-1">:</span>
-                  <span className="font-mono">{adminApiKeyLabel}</span>
-                </>
-              )}
-            </p>
-          )}
+          {subtitle && <p className="truncate text-xs text-base-content/50">{subtitle}</p>}
         </div>
 
         {/* Actions */}

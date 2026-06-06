@@ -11,7 +11,8 @@ import { CredentialsPanel } from '@/components/CredentialsPanel'
 import { PricingPanel } from '@/components/PricingPanel'
 import { ProxyPanel } from '@/components/ProxyPanel'
 import { UsagePanel } from '@/components/UsagePanel'
-import { maskAdminApiKey, storage } from '@/lib/storage'
+import { UsageDashboardPanel } from '@/components/UsageDashboardPanel'
+import { storage } from '@/lib/storage'
 import type { TabKey, ThemeMode } from '@/types/ui'
 import { pageConfig } from '@/types/ui'
 
@@ -30,28 +31,18 @@ function getStoredTheme(): ThemeMode {
 }
 
 export function Dashboard({ onLogout }: { onLogout: () => void }) {
-  const [activeTab, setActiveTab] = useState<TabKey>('credentials')
+  const [activeTab, setActiveTab] = useState<TabKey>('dashboard')
   const [theme, setTheme] = useState<ThemeMode>(getStoredTheme)
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [isRefreshing, setIsRefreshing] = useState(false)
-  const [adminApiKeySnapshot, setAdminApiKeySnapshot] = useState(() => storage.getApiKey() || '')
   const queryClient = useQueryClient()
-  const maskedAdminApiKey = maskAdminApiKey(adminApiKeySnapshot)
 
   // Apply theme
   useEffect(() => {
     document.documentElement.dataset.theme = theme
     localStorage.setItem('kiro-theme', theme)
   }, [theme])
-
-  useEffect(() => {
-    const handleAdminKeyUpdated = () => {
-      setAdminApiKeySnapshot(storage.getApiKey() || '')
-    }
-    window.addEventListener('kiro-admin-key-updated', handleAdminKeyUpdated)
-    return () => window.removeEventListener('kiro-admin-key-updated', handleAdminKeyUpdated)
-  }, [])
 
   const handleLogout = () => {
     storage.removeApiKey()
@@ -113,9 +104,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
           </Button>
           <div className="min-w-0 flex-1">
             <h1 className="truncate text-sm font-semibold">{currentPage.title}</h1>
-            <p className="truncate text-[0.68rem] text-base-content/45">
-              adminApiKey: {maskedAdminApiKey}
-            </p>
+            {currentPage.subtitle && <p className="truncate text-[0.68rem] text-base-content/45">{currentPage.subtitle}</p>}
           </div>
         </div>
 
@@ -129,12 +118,12 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             onLogout={handleLogout}
             onRefresh={handleRefresh}
             isRefreshing={isRefreshing}
-            adminApiKeyLabel={maskedAdminApiKey}
           />
         </div>
 
         {/* Page Content */}
         <main className="mx-auto max-w-[var(--page-max)] p-4 pb-20 lg:p-6">
+          {activeTab === 'dashboard' && <UsageDashboardPanel />}
           {activeTab === 'credentials' && <CredentialsPanel />}
           {activeTab === 'validation' && <AccountValidationPanel />}
           {activeTab === 'proxies' && <ProxyPanel />}

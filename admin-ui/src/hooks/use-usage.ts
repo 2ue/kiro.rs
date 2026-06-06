@@ -1,19 +1,23 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   clearUsageRecords,
+  cancelUsageCleanup,
   deleteManualModel,
   getAuditLogsPage,
+  getUsageCleanupStatus,
   getModelCapabilities,
   getModelPricing,
   getUsageDashboard,
   getUsageRecords,
   getUsageRecordsPage,
   getUsageSummary,
+  previewUsageCleanup,
+  startUsageCleanup,
   syncModelPricing,
   syncModelCapabilities,
   upsertManualModel,
 } from '@/api/usage'
-import type { AdminAuditLogPageQuery, UpsertManualModelRequest, UsageRecordsPageQuery, UsageRecordsQuery } from '@/types/api'
+import type { AdminAuditLogPageQuery, UpsertManualModelRequest, UsageCleanupRequest, UsageRecordsPageQuery, UsageRecordsQuery } from '@/types/api'
 
 export function useUsageRecords(query: UsageRecordsQuery) {
   return useQuery({
@@ -58,6 +62,41 @@ export function useClearUsageRecords() {
       queryClient.invalidateQueries({ queryKey: ['usage-summary'] })
       queryClient.invalidateQueries({ queryKey: ['usage-dashboard'] })
     },
+  })
+}
+
+export function useUsageCleanupStatus() {
+  return useQuery({
+    queryKey: ['usage-cleanup-status'],
+    queryFn: getUsageCleanupStatus,
+    refetchInterval: (query) => query.state.data?.status === 'running' ? 2000 : 10000,
+  })
+}
+
+export function usePreviewUsageCleanup() {
+  return useMutation({
+    mutationFn: (payload: UsageCleanupRequest) => previewUsageCleanup(payload),
+  })
+}
+
+export function useStartUsageCleanup() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: UsageCleanupRequest) => startUsageCleanup(payload),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['usage-cleanup-status'] })
+      queryClient.invalidateQueries({ queryKey: ['usage-records-page'] })
+      queryClient.invalidateQueries({ queryKey: ['usage-summary'] })
+      queryClient.invalidateQueries({ queryKey: ['usage-dashboard'] })
+    },
+  })
+}
+
+export function useCancelUsageCleanup() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: cancelUsageCleanup,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['usage-cleanup-status'] }),
   })
 }
 

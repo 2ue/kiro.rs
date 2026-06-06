@@ -7,15 +7,16 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, clear_credential_in_flight, clear_usage_records, create_proxy_resource,
-        delete_credential, delete_manual_model, delete_proxy_resource, export_credentials,
-        force_refresh_token, get_access_keys, get_all_credentials, get_audit_logs,
-        get_credential_balance, get_credential_info, get_credentials_page, get_load_balancing_mode,
-        get_model_capabilities, get_model_pricing, get_proxy_resources, get_runtime_config,
-        get_usage_dashboard, get_usage_records, get_usage_records_page, get_usage_summary,
-        get_usage_writer_stats, refresh_credentials_info, reset_failure_count,
-        set_credential_concurrency, set_credential_disabled, set_credential_priority,
-        set_credential_proxy, set_credential_warmup, set_load_balancing_mode,
+        add_credential, cancel_usage_cleanup, clear_credential_in_flight, clear_usage_records,
+        create_proxy_resource, delete_credential, delete_manual_model, delete_proxy_resource,
+        export_credentials, force_refresh_token, get_access_keys, get_all_credentials,
+        get_audit_logs, get_credential_balance, get_credential_info, get_credentials_page,
+        get_load_balancing_mode, get_model_capabilities, get_model_pricing, get_proxy_resources,
+        get_runtime_config, get_usage_cleanup_status, get_usage_dashboard, get_usage_records,
+        get_usage_records_page, get_usage_summary, get_usage_writer_stats, preview_usage_cleanup,
+        refresh_credentials_info, reset_failure_count, set_credential_concurrency,
+        set_credential_disabled, set_credential_priority, set_credential_proxy,
+        set_credential_warmup, set_load_balancing_mode, start_usage_cleanup,
         sync_model_capabilities, sync_model_pricing, test_credential, update_admin_api_key,
         update_proxy_resource, update_runtime_config, upsert_manual_model,
         validate_existing_credentials, validate_external_credentials,
@@ -90,6 +91,16 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/usage-records", get(get_usage_records))
         .route("/usage-records-paged", get(get_usage_records_page))
         .route("/usage-records/clear", post(clear_usage_records))
+        .route(
+            "/usage-records/cleanup/preview",
+            post(preview_usage_cleanup),
+        )
+        .route("/usage-records/cleanup/start", post(start_usage_cleanup))
+        .route(
+            "/usage-records/cleanup/status",
+            get(get_usage_cleanup_status),
+        )
+        .route("/usage-records/cleanup/cancel", post(cancel_usage_cleanup))
         .route("/usage-summary", get(get_usage_summary))
         .route("/usage-dashboard", get(get_usage_dashboard))
         .route("/usage-writer-stats", get(get_usage_writer_stats))

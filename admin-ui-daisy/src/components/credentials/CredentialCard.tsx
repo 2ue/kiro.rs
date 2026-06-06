@@ -237,7 +237,7 @@ export function CredentialCard({
   }
 
   return (
-    <Card className={`credential-card ${credential.isCurrent ? 'is-current' : ''} ${credential.disabled ? 'is-disabled' : ''}`}>
+    <Card className={`credential-card relative overflow-visible ${credential.isCurrent ? 'is-current' : ''} ${credential.disabled ? 'is-disabled' : ''}`}>
       <Card.Body className="gap-0 p-0">
         {/* Compact Header - Always Visible */}
         <div className="flex items-center gap-3 p-3">
@@ -399,13 +399,13 @@ export function CredentialCard({
               >
                 <RotateCcw className="h-3.5 w-3.5" /> 恢复异常
               </Button>
-              <Dropdown end>
+              <Dropdown end className="relative z-40">
                 <Dropdown.Toggle button={false}>
                   <Button type="button" color="ghost" size="xs">
                     <MoreHorizontal className="h-3.5 w-3.5" />
                   </Button>
                 </Dropdown.Toggle>
-                <Dropdown.Menu className="w-40 rounded-lg border border-base-300 bg-base-100 p-1 shadow-lg">
+                <Dropdown.Menu className="z-[80] w-40 rounded-lg border border-base-300 bg-base-100 p-1 shadow-xl">
                   <Dropdown.Item onClick={() => setWarmup.mutate(
                     { id: credential.id, warmupRemaining: credential.warmupRemaining > 0 ? 0 : Math.max(1, warmupTarget) },
                     {

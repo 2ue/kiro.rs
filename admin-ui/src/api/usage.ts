@@ -9,6 +9,9 @@ import type {
   ModelPricingStatus,
   UpsertManualModelRequest,
   UsageDashboardResponse,
+  UsageCleanupPreviewResponse,
+  UsageCleanupRequest,
+  UsageCleanupStatusResponse,
   UsageRecordsPageQuery,
   UsageRecordsPageResult,
   UsageRecordsQuery,
@@ -77,6 +80,26 @@ export async function getUsageDashboard(timezone = 'Asia/Shanghai'): Promise<Usa
 
 export async function clearUsageRecords(): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>('/usage-records/clear')
+  return data
+}
+
+export async function previewUsageCleanup(payload: UsageCleanupRequest): Promise<UsageCleanupPreviewResponse> {
+  const { data } = await api.post<UsageCleanupPreviewResponse>('/usage-records/cleanup/preview', payload)
+  return data
+}
+
+export async function startUsageCleanup(payload: UsageCleanupRequest): Promise<UsageCleanupStatusResponse> {
+  const { data } = await api.post<UsageCleanupStatusResponse>('/usage-records/cleanup/start', payload)
+  return data
+}
+
+export async function getUsageCleanupStatus(): Promise<UsageCleanupStatusResponse> {
+  const { data } = await api.get<UsageCleanupStatusResponse>('/usage-records/cleanup/status')
+  return data
+}
+
+export async function cancelUsageCleanup(): Promise<UsageCleanupStatusResponse> {
+  const { data } = await api.post<UsageCleanupStatusResponse>('/usage-records/cleanup/cancel')
   return data
 }
 

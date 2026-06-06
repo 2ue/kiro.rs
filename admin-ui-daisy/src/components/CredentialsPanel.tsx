@@ -473,7 +473,9 @@ export function CredentialsPanel() {
                   <Select.Option value="current">当前活跃</Select.Option>
                   <Select.Option value="cooldown">冷却中</Select.Option>
                   <Select.Option value="rate_limited">限流中</Select.Option>
+                  <Select.Option value="proxy_blocked">代理不可用</Select.Option>
                   <Select.Option value="error">有错误</Select.Option>
+                  <Select.Option value="unknown_subscription">未知订阅</Select.Option>
                 </Select>
                 <Select bordered size="sm" value={authFilter} onChange={(e) => setAuthFilter(e.target.value)}>
                   <Select.Option value="all">全部认证</Select.Option>
@@ -487,6 +489,7 @@ export function CredentialsPanel() {
                   <Select.Option value="pro">Pro</Select.Option>
                   <Select.Option value="trial">试用</Select.Option>
                   <Select.Option value="free">Free</Select.Option>
+                  <Select.Option value="unknown">未知</Select.Option>
                 </Select>
                 <Select bordered size="sm" value={proxyFilter} onChange={(e) => setProxyFilter(e.target.value)}>
                   <Select.Option value="all">全部代理</Select.Option>

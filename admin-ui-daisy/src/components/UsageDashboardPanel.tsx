@@ -13,10 +13,10 @@ import {
   ShieldAlert,
   Zap,
 } from 'lucide-react'
-import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Button } from 'react-daisyui'
+import { Badge, EmptyState, ErrorState, LoadingState } from '@/components/ui'
 import { useUsageDashboard } from '@/hooks/use-usage'
+import { formatDate, formatNumber, formatPercent, formatUsd } from '@/lib/format'
 import { extractErrorMessage } from '@/lib/utils'
 import type {
   UsageBreakdownItem,
@@ -28,7 +28,7 @@ import type {
 const DASHBOARD_TIMEZONE = 'Asia/Shanghai'
 const AUTO_REFRESH_SECONDS = 10
 
-type DashboardTone = 'default' | 'success' | 'warning' | 'info'
+type DashboardTone = 'default' | 'success' | 'warning' | 'error' | 'info' | 'primary'
 type RankDimension = 'models' | 'credentials' | 'endpoints' | 'errors'
 
 const rankDimensions: Array<{ key: RankDimension; label: string }> = [
@@ -38,57 +38,77 @@ const rankDimensions: Array<{ key: RankDimension; label: string }> = [
   { key: 'errors', label: '错误' },
 ]
 
-function formatNumber(value: number | undefined | null): string {
-  if (!Number.isFinite(value ?? Number.NaN)) return '0'
-  return new Intl.NumberFormat('zh-CN').format(value as number)
-}
-
-function formatPercent(value: number | undefined | null): string {
-  if (!Number.isFinite(value ?? Number.NaN)) return '-'
-  return `${((value as number) * 100).toFixed(1)}%`
-}
-
-function formatUsd(value: number | undefined | null): string {
-  if (!Number.isFinite(value ?? Number.NaN)) return '-'
-  const number = value as number
-  return new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    minimumFractionDigits: number >= 1 ? 2 : 6,
-    maximumFractionDigits: number >= 1 ? 2 : 6,
-  }).format(number)
-}
-
-function formatDate(value?: string): string {
-  if (!value) return '-'
-  return new Date(value).toLocaleString('zh-CN', {
-    hour12: false,
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-  })
+const toneClass: Record<DashboardTone, { text: string; soft: string; border: string; bar: string }> = {
+  default: {
+    text: 'text-base-content',
+    soft: 'bg-base-200/70',
+    border: 'border-base-300/60',
+    bar: 'bg-base-content/35',
+  },
+  success: {
+    text: 'text-success',
+    soft: 'bg-success/10',
+    border: 'border-success/20',
+    bar: 'bg-success',
+  },
+  warning: {
+    text: 'text-warning',
+    soft: 'bg-warning/10',
+    border: 'border-warning/25',
+    bar: 'bg-warning',
+  },
+  error: {
+    text: 'text-error',
+    soft: 'bg-error/10',
+    border: 'border-error/25',
+    bar: 'bg-error',
+  },
+  info: {
+    text: 'text-info',
+    soft: 'bg-info/10',
+    border: 'border-info/20',
+    bar: 'bg-info',
+  },
+  primary: {
+    text: 'text-primary',
+    soft: 'bg-primary/10',
+    border: 'border-primary/20',
+    bar: 'bg-primary',
+  },
 }
 
 function activeWindow(windows: UsageDashboardWindow[], key: string): UsageDashboardWindow | undefined {
   return windows.find((window) => window.key === key) || windows[0]
 }
 
-function toneText(tone: DashboardTone): string {
-  if (tone === 'success') return 'text-green-600 dark:text-green-400'
-  if (tone === 'warning') return 'text-yellow-600 dark:text-yellow-400'
-  if (tone === 'info') return 'text-blue-600 dark:text-blue-400'
-  return 'text-foreground'
+function Panel({
+  title,
+  subtitle,
+  actions,
+  children,
+  className = '',
+}: {
+  title: string
+  subtitle?: ReactNode
+  actions?: ReactNode
+  children: ReactNode
+  className?: string
+}) {
+  return (
+    <section className={`section-card overflow-hidden rounded-box ${className}`}>
+      <div className="flex flex-col gap-1.5 border-b border-base-300/60 px-3 py-2.5 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
+          <h2 className="truncate text-sm font-semibold tracking-tight">{title}</h2>
+          {subtitle && <div className="text-[0.68rem] leading-4 text-base-content/50">{subtitle}</div>}
+        </div>
+        {actions && <div className="flex shrink-0 flex-wrap items-center gap-1.5">{actions}</div>}
+      </div>
+      {children}
+    </section>
+  )
 }
 
-function toneBar(tone: DashboardTone): string {
-  if (tone === 'success') return 'bg-green-500'
-  if (tone === 'warning') return 'bg-yellow-500'
-  if (tone === 'info') return 'bg-blue-500'
-  return 'bg-primary'
-}
-
-function MetricCard({
+function MetricTile({
   title,
   value,
   desc,
@@ -101,42 +121,20 @@ function MetricCard({
   icon: ReactNode
   tone?: DashboardTone
 }) {
-  return (
-    <Card>
-      <CardContent className="flex items-start justify-between gap-3 p-4">
-        <div className="min-w-0">
-          <div className="text-xs font-medium text-muted-foreground">{title}</div>
-          <div className={`mt-1 truncate text-2xl font-semibold ${toneText(tone)}`}>{value}</div>
-          {desc && <div className="mt-1 truncate text-xs text-muted-foreground">{desc}</div>}
-        </div>
-        <div className="shrink-0 text-muted-foreground">{icon}</div>
-      </CardContent>
-    </Card>
-  )
-}
+  const styles = toneClass[tone]
 
-function Panel({
-  title,
-  subtitle,
-  actions,
-  children,
-}: {
-  title: string
-  subtitle?: ReactNode
-  actions?: ReactNode
-  children: ReactNode
-}) {
   return (
-    <Card className="overflow-hidden">
-      <CardHeader className="flex flex-col gap-1.5 space-y-0 border-b p-4 sm:flex-row sm:items-center sm:justify-between">
+    <div className={`relative overflow-hidden rounded-box border bg-base-100 p-3 shadow-sm ${styles.border}`}>
+      <div className={`absolute inset-x-0 top-0 h-0.5 ${styles.bar}`} />
+      <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
-          <CardTitle className="truncate text-sm">{title}</CardTitle>
-          {subtitle && <div className="text-xs text-muted-foreground">{subtitle}</div>}
+          <div className="text-[0.64rem] font-semibold uppercase text-base-content/45">{title}</div>
+          <div className={`mt-1 truncate text-xl font-bold leading-6 ${styles.text}`}>{value}</div>
+          {desc && <div className="mt-0.5 truncate text-[0.66rem] text-base-content/50">{desc}</div>}
         </div>
-        {actions && <div className="flex shrink-0 flex-wrap items-center gap-2">{actions}</div>}
-      </CardHeader>
-      <CardContent className="p-4">{children}</CardContent>
-    </Card>
+        <div className={`rounded-md border p-1.5 ${styles.soft} ${styles.border}`}>{icon}</div>
+      </div>
+    </div>
   )
 }
 
@@ -150,26 +148,28 @@ function DashboardToolbar({
   onWindowChange: (key: string) => void
 }) {
   return (
-    <div className="rounded-lg border bg-card px-4 py-3 shadow-sm">
+    <div className="rounded-box border border-base-300/60 bg-base-100 px-4 py-3 shadow-sm">
       <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-sm font-semibold">{selectedWindow.label}</span>
-            <Badge variant="outline">{data.timezone}</Badge>
-            <Badge variant="secondary">自动刷新 {AUTO_REFRESH_SECONDS}s</Badge>
+            <Badge tone="neutral">{data.timezone}</Badge>
+            <Badge tone="secondary">自动刷新 {AUTO_REFRESH_SECONDS}s</Badge>
           </div>
-          <div className="mt-1 text-xs text-muted-foreground">
+          <div className="mt-1 text-xs text-base-content/50">
             {formatDate(selectedWindow.from)} - {formatDate(selectedWindow.to)} · 生成 {formatDate(data.generatedAt)}
           </div>
         </div>
 
-        <div className="flex flex-wrap gap-2">
+        <div className="join overflow-x-auto rounded-box">
           {data.windows.map((window) => (
             <Button
               key={window.key}
               type="button"
+              className="join-item shrink-0"
               size="sm"
-              variant={window.key === selectedWindow.key ? 'default' : 'outline'}
+              color={window.key === selectedWindow.key ? 'primary' : 'ghost'}
+              variant={window.key === selectedWindow.key ? undefined : 'outline'}
               onClick={() => onWindowChange(window.key)}
             >
               {window.label}
@@ -191,11 +191,11 @@ function SeriesChart({ title, points }: { title: string; points: UsageSeriesPoin
     <Panel
       title={title}
       subtitle={`${formatNumber(totalRequests)} 请求 · ${formatUsd(totalCost)}`}
-      actions={<Badge variant={totalErrors > 0 ? 'warning' : 'success'}>{totalErrors > 0 ? `错误 ${formatNumber(totalErrors)}` : '无错误'}</Badge>}
+      actions={totalErrors > 0 ? <Badge tone="warning">错误 {formatNumber(totalErrors)}</Badge> : <Badge tone="success">无错误</Badge>}
     >
-      <div className="overflow-x-auto">
+      <div className="overflow-x-auto px-3 py-3">
         {points.length === 0 ? (
-          <div className="flex h-32 items-center justify-center text-sm text-muted-foreground">暂无数据</div>
+          <div className="flex h-32 items-center justify-center text-sm text-base-content/45">暂无数据</div>
         ) : (
           <div className="flex h-32 min-w-[520px] items-end gap-1.5">
             {points.map((point) => {
@@ -206,13 +206,13 @@ function SeriesChart({ title, points }: { title: string; points: UsageSeriesPoin
               return (
                 <div key={point.key} className="group flex min-w-0 flex-1 flex-col items-center gap-1">
                   <div
-                    className="relative w-full overflow-hidden rounded-t bg-blue-500/75 transition-colors group-hover:bg-blue-500"
+                    className="relative w-full overflow-hidden rounded-t bg-primary/75 transition-colors group-hover:bg-primary"
                     style={{ height }}
                     title={`${point.label}: ${formatNumber(point.requests)} 请求 / ${formatNumber(point.errorRequests)} 错误 / ${formatUsd(point.totalEstimatedCostUsd)}`}
                   >
-                    {errorHeight > 0 && <div className="absolute inset-x-0 bottom-0 bg-yellow-500" style={{ height: errorHeight }} />}
+                    {errorHeight > 0 && <div className="absolute inset-x-0 bottom-0 bg-warning" style={{ height: errorHeight }} />}
                   </div>
-                  <span className="w-full truncate text-center text-[10px] text-muted-foreground">{point.label}</span>
+                  <span className="w-full truncate text-center text-[0.65rem] text-base-content/45">{point.label}</span>
                 </div>
               )
             })}
@@ -227,24 +227,25 @@ function SignalRow({
   label,
   value,
   ratio,
-  tone = 'info',
+  tone = 'primary',
 }: {
   label: string
   value: ReactNode
   ratio?: number
   tone?: DashboardTone
 }) {
+  const styles = toneClass[tone]
   const width = Number.isFinite(ratio ?? Number.NaN) ? Math.min(100, Math.max(0, (ratio as number) * 100)) : 0
 
   return (
     <div className="space-y-1.5">
-      <div className="flex items-center justify-between gap-2 text-sm">
-        <span className="truncate font-medium">{label}</span>
-        <span className="shrink-0 font-mono text-xs text-muted-foreground">{value}</span>
+      <div className="flex items-center justify-between gap-2 text-xs">
+        <span className="truncate font-medium text-base-content/75">{label}</span>
+        <span className="shrink-0 font-mono text-xs text-base-content/55">{value}</span>
       </div>
       {ratio !== undefined && (
-        <div className="h-1.5 overflow-hidden rounded-full bg-secondary">
-          <div className={`h-full rounded-full ${toneBar(tone)}`} style={{ width: `${width}%` }} />
+        <div className="h-1.5 overflow-hidden rounded-full bg-base-300/60">
+          <div className={`h-full rounded-full ${styles.bar}`} style={{ width: `${width}%` }} />
         </div>
       )}
     </div>
@@ -258,15 +259,15 @@ function BreakdownPanel({
   emptyText,
 }: {
   title: string
-  subtitle: string
+  subtitle?: string
   items: UsageBreakdownItem[]
   emptyText: string
 }) {
   return (
     <Panel title={title} subtitle={subtitle}>
-      <div className="space-y-3">
+      <div className="space-y-3 p-3">
         {items.length === 0 ? (
-          <div className="rounded-md border border-dashed p-3 text-sm text-muted-foreground">{emptyText}</div>
+          <div className="rounded-box border border-dashed border-base-300 p-3 text-sm text-base-content/45">{emptyText}</div>
         ) : (
           items.slice(0, 6).map((item) => (
             <SignalRow
@@ -274,7 +275,7 @@ function BreakdownPanel({
               label={item.label}
               value={`${formatNumber(item.requests)} · ${formatPercent(item.ratio)}`}
               ratio={item.ratio}
-              tone={item.key === 'success' ? 'success' : item.key.includes('timeout') || item.key.includes('error') ? 'warning' : 'info'}
+              tone={item.key === 'success' ? 'success' : item.key.includes('timeout') || item.key.includes('error') ? 'warning' : 'primary'}
             />
           ))
         )}
@@ -296,27 +297,27 @@ function ErrorFocusPanel({
     <Panel
       title="异常摘要"
       subtitle="只展示需要排障的错误聚合，完整明细到用量记录页筛选"
-      actions={<Badge variant={totalErrors > 0 ? 'warning' : 'success'}>{totalErrors > 0 ? `${formatNumber(totalErrors)} 错误` : '正常'}</Badge>}
+      actions={totalErrors > 0 ? <Badge tone="warning">{formatNumber(totalErrors)} 错误</Badge> : <Badge tone="success">正常</Badge>}
     >
-      <div className="space-y-3">
+      <div className="space-y-3 p-3">
         {visibleItems.length === 0 ? (
-          <div className="flex items-center gap-2 rounded-md border border-green-500/20 bg-green-500/5 p-3 text-sm text-green-600 dark:text-green-400">
+          <div className="flex items-center gap-2 rounded-box border border-success/20 bg-success/5 p-3 text-sm text-success">
             <CheckCircle2 className="h-4 w-4 shrink-0" />
             当前窗口没有错误聚合。
           </div>
         ) : (
           visibleItems.map((item, index) => (
-            <div key={`${item.key}-${index}`} className="rounded-md border border-yellow-500/20 bg-yellow-500/5 p-3">
+            <div key={`${item.key}-${index}`} className="rounded-box border border-warning/20 bg-warning/5 p-3">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
-                  <div className="truncate text-sm font-semibold text-yellow-700 dark:text-yellow-400" title={item.label || item.key}>
+                  <div className="truncate text-xs font-semibold text-warning" title={item.label || item.key}>
                     {item.label || item.key}
                   </div>
-                  {item.label && <div className="truncate font-mono text-[11px] text-muted-foreground">{item.key}</div>}
+                  {item.label && <div className="truncate font-mono text-[0.62rem] text-base-content/45">{item.key}</div>}
                 </div>
-                <Badge variant="warning">{formatNumber(item.requests)}</Badge>
+                <Badge tone="warning">{formatNumber(item.requests)}</Badge>
               </div>
-              <div className="mt-2 grid grid-cols-3 gap-2 text-[11px] text-muted-foreground">
+              <div className="mt-2 grid grid-cols-3 gap-1.5 text-[0.62rem] text-base-content/50">
                 <span className="truncate">输入 {formatNumber(item.totalInputTokens)}</span>
                 <span className="truncate">输出 {formatNumber(item.totalOutputTokens)}</span>
                 <span className="truncate text-right">{formatUsd(item.totalEstimatedCostUsd)}</span>
@@ -351,13 +352,15 @@ function DimensionRankPanel({
       title="维度排行"
       subtitle="保留后端 Top 聚合，切换维度查看，不占用总览主视图空间"
       actions={
-        <div className="flex flex-wrap gap-2">
+        <div className="join rounded-box">
           {rankDimensions.map((dimension) => (
             <Button
               key={dimension.key}
               type="button"
-              size="sm"
-              variant={dimension.key === activeKey ? 'default' : 'outline'}
+              className="join-item"
+              size="xs"
+              color={dimension.key === activeKey ? 'primary' : 'ghost'}
+              variant={dimension.key === activeKey ? undefined : 'outline'}
               onClick={() => onActiveKeyChange(dimension.key)}
             >
               {dimension.label}
@@ -366,30 +369,30 @@ function DimensionRankPanel({
         </div>
       }
     >
-      <div className="divide-y">
+      <div className="divide-y divide-base-300/60">
         {items.length === 0 ? (
-          <div className="py-3 text-sm text-muted-foreground">暂无排行数据。</div>
+          <div className="p-3 text-sm text-base-content/45">暂无排行数据。</div>
         ) : (
           items.map((item, index) => (
-            <div key={`${activeKey}-${item.key}-${index}`} className="grid gap-2 py-2.5 md:grid-cols-[minmax(0,1fr)_220px] md:items-center">
+            <div key={`${activeKey}-${item.key}-${index}`} className="grid gap-2 px-3 py-2.5 md:grid-cols-[minmax(0,1fr)_220px] md:items-center">
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
-                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded bg-muted font-mono text-[11px] font-semibold text-muted-foreground">
+                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded bg-base-200 font-mono text-[0.62rem] font-semibold text-base-content/45">
                     {index + 1}
                   </span>
-                  <span className="truncate text-sm font-semibold" title={item.label || item.key}>
+                  <span className="truncate text-xs font-semibold" title={item.label || item.key}>
                     {item.label || item.key}
                   </span>
-                  {item.errorRequests > 0 && <Badge variant="warning">错 {formatNumber(item.errorRequests)}</Badge>}
+                  {item.errorRequests > 0 && <Badge tone="warning" size="xs">错 {formatNumber(item.errorRequests)}</Badge>}
                 </div>
-                {item.label && <div className="mt-0.5 truncate pl-7 font-mono text-[11px] text-muted-foreground">{item.key}</div>}
+                {item.label && <div className="mt-0.5 truncate pl-7 font-mono text-[0.62rem] text-base-content/45">{item.key}</div>}
                 <div className="mt-1.5 pl-7">
-                  <div className="h-1.5 overflow-hidden rounded-full bg-secondary">
+                  <div className="h-1.5 overflow-hidden rounded-full bg-base-300/60">
                     <div className="h-full rounded-full bg-primary" style={{ width: `${totalRequests > 0 ? Math.min(100, (item.requests / totalRequests) * 100) : 0}%` }} />
                   </div>
                 </div>
               </div>
-              <div className="grid grid-cols-4 gap-2 text-right text-[11px] text-muted-foreground">
+              <div className="grid grid-cols-4 gap-1.5 text-right text-[0.62rem] text-base-content/50">
                 <span className="truncate">请求 {formatNumber(item.requests)}</span>
                 <span className="truncate">输入 {formatNumber(item.totalInputTokens)}</span>
                 <span className="truncate">输出 {formatNumber(item.totalOutputTokens)}</span>
@@ -422,7 +425,7 @@ function OperationsPanel({
 }) {
   return (
     <Panel title="运行信号" subtitle="这些指标更适合总览页判断配置和调度是否异常">
-      <div className="grid gap-3 md:grid-cols-2">
+      <div className="grid gap-3 p-3 md:grid-cols-2">
         <SignalRow label="计价覆盖" value={formatPercent(pricedRatio)} ratio={pricedRatio} tone={pricedRatio < 1 ? 'warning' : 'success'} />
         <SignalRow label="流式占比" value={formatPercent(streamRatio)} ratio={streamRatio} tone="info" />
         <SignalRow label="缓存读取率" value={formatPercent(cacheReadRatio)} ratio={cacheReadRatio} tone="success" />
@@ -433,7 +436,7 @@ function OperationsPanel({
           tone={fallbackFromStickyRequests > 0 ? 'warning' : 'default'}
         />
         <SignalRow label="模拟用量" value={formatNumber(simulatedRequests)} tone={simulatedRequests > 0 ? 'warning' : 'default'} />
-        <SignalRow label="上游元数据" value={formatNumber(upstreamMetadataRequests)} tone="info" />
+        <SignalRow label="上游元数据" value={formatNumber(upstreamMetadataRequests)} tone="primary" />
       </div>
     </Panel>
   )
@@ -450,21 +453,15 @@ export function UsageDashboardPanel() {
   )
 
   if (dashboard.isLoading) {
-    return <div className="py-12 text-center text-sm text-muted-foreground">正在加载用量总览...</div>
+    return <LoadingState text="正在加载总览..." />
   }
 
   if (dashboard.error) {
-    return (
-      <Card>
-        <CardContent className="p-4 text-sm text-destructive">
-          用量总览加载失败：{extractErrorMessage(dashboard.error)}
-        </CardContent>
-      </Card>
-    )
+    return <ErrorState title="总览加载失败" message={extractErrorMessage(dashboard.error)} />
   }
 
   if (!data || !selectedWindow) {
-    return <div className="py-12 text-center text-sm text-muted-foreground">暂无用量数据</div>
+    return <EmptyState title="暂无总览数据" description="当前还没有可聚合的请求记录。" />
   }
 
   const summary = selectedWindow.summary
@@ -475,15 +472,55 @@ export function UsageDashboardPanel() {
 
   return (
     <div className="space-y-4">
-      <DashboardToolbar data={data} selectedWindow={selectedWindow} onWindowChange={setSelectedWindowKey} />
+      <DashboardToolbar
+        data={data}
+        selectedWindow={selectedWindow}
+        onWindowChange={setSelectedWindowKey}
+      />
 
-      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6">
-        <MetricCard title="请求健康" value={formatNumber(summary.totalRequests)} desc={`成功 ${formatNumber(summary.successRequests)} / 错误 ${formatNumber(summary.errorRequests)}`} icon={<Activity className="h-5 w-5" />} tone={summary.errorRequests > 0 ? 'warning' : 'info'} />
-        <MetricCard title="错误率" value={formatPercent(summary.errorRate)} desc={summary.errorRequests > 0 ? '需要查看异常摘要' : '当前窗口无错误'} icon={summary.errorRequests > 0 ? <ShieldAlert className="h-5 w-5" /> : <CheckCircle2 className="h-5 w-5" />} tone={summary.errorRate > 0 ? 'warning' : 'success'} />
-        <MetricCard title="耗时" value={`${Math.round(summary.averageDurationMs)}ms`} desc={`P95 ${formatNumber(summary.p95DurationMs)}ms`} icon={<Clock3 className="h-5 w-5" />} tone={latencyTone} />
-        <MetricCard title="估算费用" value={formatUsd(summary.totalEstimatedCostUsd)} desc={`计价覆盖 ${formatPercent(pricedRatio)}`} icon={<DollarSign className="h-5 w-5" />} tone={pricedRatio < 1 && summary.totalRequests > 0 ? 'warning' : 'info'} />
-        <MetricCard title="Token" value={formatNumber(totalTokens)} desc={`输入 ${formatNumber(summary.totalInputTokens)} / 输出 ${formatNumber(summary.totalOutputTokens)}`} icon={<BarChart3 className="h-5 w-5" />} />
-        <MetricCard title="缓存读取" value={formatPercent(summary.cacheReadRatio)} desc={`读取 ${formatNumber(summary.totalCacheReadInputTokens)}`} icon={<Database className="h-5 w-5" />} tone="success" />
+      <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-6">
+        <MetricTile
+          title="请求健康"
+          value={formatNumber(summary.totalRequests)}
+          desc={`成功 ${formatNumber(summary.successRequests)} / 错误 ${formatNumber(summary.errorRequests)}`}
+          icon={<Activity className="h-5 w-5" />}
+          tone={summary.errorRequests > 0 ? 'warning' : 'info'}
+        />
+        <MetricTile
+          title="错误率"
+          value={formatPercent(summary.errorRate)}
+          desc={summary.errorRequests > 0 ? '需要查看异常摘要' : '当前窗口无错误'}
+          icon={summary.errorRequests > 0 ? <ShieldAlert className="h-5 w-5" /> : <CheckCircle2 className="h-5 w-5" />}
+          tone={summary.errorRate > 0 ? 'warning' : 'success'}
+        />
+        <MetricTile
+          title="耗时"
+          value={`${Math.round(summary.averageDurationMs)}ms`}
+          desc={`P95 ${formatNumber(summary.p95DurationMs)}ms`}
+          icon={<Clock3 className="h-5 w-5" />}
+          tone={latencyTone}
+        />
+        <MetricTile
+          title="估算费用"
+          value={formatUsd(summary.totalEstimatedCostUsd)}
+          desc={`计价覆盖 ${formatPercent(pricedRatio)}`}
+          icon={<DollarSign className="h-5 w-5" />}
+          tone={pricedRatio < 1 && summary.totalRequests > 0 ? 'warning' : 'info'}
+        />
+        <MetricTile
+          title="Token"
+          value={formatNumber(totalTokens)}
+          desc={`输入 ${formatNumber(summary.totalInputTokens)} / 输出 ${formatNumber(summary.totalOutputTokens)}`}
+          icon={<BarChart3 className="h-5 w-5" />}
+          tone="primary"
+        />
+        <MetricTile
+          title="缓存读取"
+          value={formatPercent(summary.cacheReadRatio)}
+          desc={`读取 ${formatNumber(summary.totalCacheReadInputTokens)}`}
+          icon={<Database className="h-5 w-5" />}
+          tone="success"
+        />
       </div>
 
       <div className="grid gap-3 xl:grid-cols-2">
@@ -511,22 +548,22 @@ export function UsageDashboardPanel() {
 
       <DimensionRankPanel top={data.top} activeKey={rankDimension} onActiveKeyChange={setRankDimension} />
 
-      <div className="rounded-lg border bg-card px-3 py-2.5 text-xs text-muted-foreground">
+      <div className="rounded-box border border-base-300/60 bg-base-100 px-3 py-2.5 text-xs text-base-content/50">
         <div className="flex flex-wrap items-center gap-2">
-          <Gauge className="h-4 w-4" />
-          <span>总览保留 Top 维度聚合；单条请求链路和更精确筛选请在“Usage”页查看。</span>
-          <LineChart className="h-4 w-4" />
-          <span>页面数据每 {AUTO_REFRESH_SECONDS} 秒自动刷新。</span>
+          <Gauge className="h-4 w-4 text-base-content/35" />
+          <span>总览保留 Top 维度聚合；单条请求链路和更精确筛选请在“用量”页查看。</span>
+          <LineChart className="h-4 w-4 text-base-content/35" />
+          <span>页面数据每 {AUTO_REFRESH_SECONDS} 秒自动刷新，顶部刷新按钮会刷新当前后台的所有查询缓存。</span>
           {summary.errorRequests > 0 && (
             <>
-              <AlertTriangle className="h-4 w-4 text-yellow-600 dark:text-yellow-400" />
-              <span className="text-yellow-700 dark:text-yellow-400">当前窗口存在错误请求，优先查看异常摘要和用量详情。</span>
+              <AlertTriangle className="h-4 w-4 text-warning" />
+              <span className="text-warning">当前窗口存在错误请求，优先查看异常摘要和用量详情。</span>
             </>
           )}
           {summary.fallbackFromStickyRequests > 0 && (
             <>
-              <Zap className="h-4 w-4 text-yellow-600 dark:text-yellow-400" />
-              <span className="text-yellow-700 dark:text-yellow-400">检测到 Sticky 回退，说明粘度命中的账号不可用或并发不可用。</span>
+              <Zap className="h-4 w-4 text-warning" />
+              <span className="text-warning">检测到 Sticky 回退，说明粘度命中的账号不可用或并发不可用。</span>
             </>
           )}
         </div>

@@ -5,6 +5,7 @@ import {
   DollarSign,
   FileCheck2,
   FileClock,
+  LayoutDashboard,
   Router,
   Server,
   Settings,
@@ -22,6 +23,7 @@ interface SidebarProps {
 }
 
 const navItems: Array<{ key: TabKey; label: string; icon: React.ReactNode; description: string }> = [
+  { key: 'dashboard', label: '总览', icon: <LayoutDashboard className="h-5 w-5" />, description: '聚合趋势和 Top 统计' },
   { key: 'credentials', label: '凭据', icon: <Server className="h-5 w-5" />, description: '管理 API 凭据和账号' },
   { key: 'validation', label: '校验', icon: <FileCheck2 className="h-5 w-5" />, description: '账号订阅状态校验' },
   { key: 'proxies', label: '代理', icon: <Router className="h-5 w-5" />, description: '代理资源配置' },

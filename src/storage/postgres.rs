@@ -1688,6 +1688,13 @@ pub struct PostgresUsageStore {
     store: Arc<PostgresStore>,
 }
 
+#[derive(Debug, Clone)]
+pub struct UsageCleanupPreview {
+    pub matched_rows: u64,
+    pub oldest_created_at: Option<DateTime<Utc>>,
+    pub newest_created_at: Option<DateTime<Utc>>,
+}
+
 impl PostgresUsageStore {
     pub fn new(store: Arc<PostgresStore>) -> Self {
         Self { store }
@@ -1821,6 +1828,103 @@ impl PostgresUsageStore {
             .execute(self.store.pool())
             .await?;
         Ok(())
+    }
+
+    pub async fn preview_soft_delete_cleanup(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> anyhow::Result<UsageCleanupPreview> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*)::bigint AS matched_rows,
+                MIN(created_at) AS oldest_created_at,
+                MAX(created_at) AS newest_created_at
+            FROM usage_records
+            WHERE deleted_at IS NULL
+              AND created_at < $1
+            "#,
+        )
+        .bind(cutoff)
+        .fetch_one(self.store.pool())
+        .await?;
+        cleanup_preview_from_row(row)
+    }
+
+    pub async fn preview_hard_delete_cleanup(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> anyhow::Result<UsageCleanupPreview> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*)::bigint AS matched_rows,
+                MIN(created_at) AS oldest_created_at,
+                MAX(created_at) AS newest_created_at
+            FROM usage_records
+            WHERE deleted_at IS NOT NULL
+              AND deleted_at < $1
+            "#,
+        )
+        .bind(cutoff)
+        .fetch_one(self.store.pool())
+        .await?;
+        cleanup_preview_from_row(row)
+    }
+
+    pub async fn soft_delete_cleanup_batch(
+        &self,
+        cutoff: DateTime<Utc>,
+        batch_size: usize,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            r#"
+            WITH victims AS (
+                SELECT id
+                FROM usage_records
+                WHERE deleted_at IS NULL
+                  AND created_at < $1
+                ORDER BY created_at ASC, id ASC
+                LIMIT $2
+            )
+            UPDATE usage_records AS u
+            SET deleted_at = now(), updated_at = now()
+            FROM victims AS v
+            WHERE u.id = v.id
+            "#,
+        )
+        .bind(cutoff)
+        .bind(usize_to_i64(batch_size))
+        .execute(self.store.pool())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn hard_delete_cleanup_batch(
+        &self,
+        cutoff: DateTime<Utc>,
+        batch_size: usize,
+    ) -> anyhow::Result<u64> {
+        let result = sqlx::query(
+            r#"
+            WITH victims AS (
+                SELECT id
+                FROM usage_records
+                WHERE deleted_at IS NOT NULL
+                  AND deleted_at < $1
+                ORDER BY deleted_at ASC, id ASC
+                LIMIT $2
+            )
+            DELETE FROM usage_records AS u
+            USING victims AS v
+            WHERE u.id = v.id
+            "#,
+        )
+        .bind(cutoff)
+        .bind(usize_to_i64(batch_size))
+        .execute(self.store.pool())
+        .await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn summary(&self, high_cache_threshold: i32) -> anyhow::Result<UsageSummary> {
@@ -2298,6 +2402,15 @@ impl PostgresUsageStore {
     }
 }
 
+fn cleanup_preview_from_row(row: PgRow) -> anyhow::Result<UsageCleanupPreview> {
+    let matched_rows = row_i64_to_u64(&row, "matched_rows")?;
+    Ok(UsageCleanupPreview {
+        matched_rows,
+        oldest_created_at: row.try_get("oldest_created_at")?,
+        newest_created_at: row.try_get("newest_created_at")?,
+    })
+}
+
 #[derive(Clone, Copy)]
 enum DashboardBreakdownColumn {
     Status,
@@ -2460,6 +2573,11 @@ fn push_dashboard_windows_cte(
 fn row_i64_to_usize(row: &PgRow, column: &str) -> anyhow::Result<usize> {
     let value: i64 = row.try_get(column)?;
     Ok(value.max(0) as usize)
+}
+
+fn row_i64_to_u64(row: &PgRow, column: &str) -> anyhow::Result<u64> {
+    let value: i64 = row.try_get(column)?;
+    Ok(value.max(0) as u64)
 }
 
 fn dashboard_window_from_row(row: PgRow) -> anyhow::Result<UsageDashboardWindow> {
@@ -2870,6 +2988,7 @@ CREATE INDEX IF NOT EXISTS idx_usage_records_credential_created ON usage_records
 CREATE INDEX IF NOT EXISTS idx_usage_records_model_created ON usage_records (model, created_at DESC) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_usage_records_status_created ON usage_records (status, created_at DESC) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_usage_records_conversation ON usage_records (conversation_id) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_usage_records_deleted_at ON usage_records (deleted_at ASC, id ASC) WHERE deleted_at IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS model_pricing (
     model TEXT PRIMARY KEY,

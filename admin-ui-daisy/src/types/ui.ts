@@ -1,8 +1,9 @@
-export type TabKey = 'credentials' | 'validation' | 'proxies' | 'usage' | 'pricing' | 'audit' | 'config'
+export type TabKey = 'dashboard' | 'credentials' | 'validation' | 'proxies' | 'usage' | 'pricing' | 'audit' | 'config'
 
 export type ThemeMode = 'kiroLight' | 'kiroDark' | 'kiroOcean' | 'kiroForest' | 'kiroPurple' | 'kiroSunset'
 
 export const pageConfig: Record<TabKey, { title: string; subtitle: string }> = {
+  dashboard: { title: '总览', subtitle: '查看请求聚合、趋势、错误率和 Top 维度统计' },
   credentials: { title: '凭据管理', subtitle: '管理 API 凭据、账号状态和调度配置' },
   validation: { title: '账号校验', subtitle: '批量校验账号订阅状态和额度' },
   proxies: { title: '代理资源', subtitle: '配置和管理代理服务器资源' },

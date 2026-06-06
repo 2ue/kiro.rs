@@ -260,6 +260,99 @@ pub struct ClearInFlightRequest {
     pub min_idle_secs: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageCleanupMode {
+    /// 软删除 created_at 早于 cutoff 的可见明细，页面和当前统计口径不再包含这些记录。
+    SoftDelete,
+    /// 硬删除 deleted_at 早于 cutoff 的已软删除明细，真正降低表体积。
+    HardDelete,
+}
+
+impl Default for UsageCleanupMode {
+    fn default() -> Self {
+        Self::SoftDelete
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageCleanupJobStatus {
+    Idle,
+    Running,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageCleanupRequest {
+    /// 清理模式；默认 soft_delete。
+    #[serde(default)]
+    pub mode: UsageCleanupMode,
+    /// 清理多少天之前的数据；soft_delete 对应 created_at，hard_delete 对应 deleted_at。
+    #[serde(default)]
+    pub older_than_days: Option<u32>,
+    /// 自定义 cutoff，优先级高于 older_than_days。
+    #[serde(default)]
+    pub cutoff_before: Option<String>,
+    /// 每批处理行数，默认 1000。
+    #[serde(default)]
+    pub batch_size: Option<usize>,
+    /// 内部安全批次上限；不传或传 0 时默认 10000，页面默认不暴露这个参数。
+    #[serde(default)]
+    pub max_batches: Option<usize>,
+    /// 批次之间暂停毫秒数，默认 100。
+    #[serde(default)]
+    pub pause_ms_between_batches: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageCleanupPreviewResponse {
+    pub mode: UsageCleanupMode,
+    pub cutoff_at: String,
+    pub matched_rows: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub newest_created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageCleanupStatusResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    pub status: UsageCleanupJobStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<UsageCleanupMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cutoff_at: Option<String>,
+    pub batch_size: usize,
+    pub max_batches: usize,
+    pub pause_ms_between_batches: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_rows: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining_rows: Option<u64>,
+    pub processed_rows: u64,
+    pub last_batch_rows: u64,
+    pub batches: usize,
+    pub cancel_requested: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
 /// 添加凭据请求
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]

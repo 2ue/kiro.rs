@@ -186,6 +186,47 @@ export interface SuccessResponse {
   message: string
 }
 
+export type UsageCleanupMode = 'soft_delete' | 'hard_delete'
+export type UsageCleanupJobStatus = 'idle' | 'running' | 'completed' | 'cancelled' | 'failed'
+
+export interface UsageCleanupRequest {
+  mode?: UsageCleanupMode
+  olderThanDays?: number
+  cutoffBefore?: string
+  batchSize?: number
+  maxBatches?: number
+  pauseMsBetweenBatches?: number
+}
+
+export interface UsageCleanupPreviewResponse {
+  mode: UsageCleanupMode
+  cutoffAt: string
+  matchedRows: number
+  oldestCreatedAt?: string
+  newestCreatedAt?: string
+}
+
+export interface UsageCleanupStatusResponse {
+  jobId?: string
+  status: UsageCleanupJobStatus
+  mode?: UsageCleanupMode
+  cutoffAt?: string
+  batchSize: number
+  maxBatches: number
+  pauseMsBetweenBatches: number
+  matchedRows?: number
+  remainingRows?: number
+  processedRows: number
+  lastBatchRows: number
+  batches: number
+  cancelRequested: boolean
+  stopReason?: string
+  startedAt?: string
+  updatedAt?: string
+  finishedAt?: string
+  lastError?: string
+}
+
 export interface SetDisabledRequest {
   disabled: boolean
 }
