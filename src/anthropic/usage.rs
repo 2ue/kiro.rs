@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration as StdDuration;
 
-use chrono::{DateTime, Utc};
+use chrono::{
+    DateTime, Datelike, Duration as ChronoDuration, FixedOffset, NaiveDate, TimeZone, Timelike, Utc,
+};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -17,6 +19,7 @@ const MAX_QUERY_LIMIT: usize = 1000;
 const USAGE_WRITER_QUEUE_CAPACITY: usize = 4096;
 const USAGE_WRITER_MAX_ATTEMPTS: u32 = 3;
 pub const REALTIME_USAGE_WINDOW_SECS: u32 = 60;
+pub const DEFAULT_USAGE_DASHBOARD_TIMEZONE: &str = "Asia/Shanghai";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -259,6 +262,287 @@ pub struct UsageSummary {
     pub realtime: UsageRealtimeStats,
     pub top_credentials: Vec<UsageAggregate>,
     pub top_conversations: Vec<UsageAggregate>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDashboardResponse {
+    pub generated_at: String,
+    pub timezone: String,
+    pub windows: Vec<UsageDashboardWindow>,
+    pub series: UsageDashboardSeries,
+    pub top: UsageDashboardTop,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDashboardWindow {
+    pub key: String,
+    pub label: String,
+    pub from: String,
+    pub to: String,
+    pub summary: UsageDashboardSummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDashboardSummary {
+    pub total_requests: usize,
+    pub success_requests: usize,
+    pub error_requests: usize,
+    pub error_rate: f64,
+    pub stream_requests: usize,
+    pub non_stream_requests: usize,
+    pub high_cache_requests: usize,
+    pub total_input_tokens: i64,
+    pub billable_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cache_read_input_tokens: i64,
+    pub total_cache_creation_input_tokens: i64,
+    pub cache_read_ratio: f64,
+    pub total_estimated_cost_usd: f64,
+    pub priced_requests: usize,
+    pub unpriced_requests: usize,
+    pub average_duration_ms: f64,
+    pub p95_duration_ms: u64,
+    pub sticky_bound_requests: usize,
+    pub fallback_from_sticky_requests: usize,
+    pub simulated_requests: usize,
+    pub upstream_metadata_requests: usize,
+    pub status_breakdown: Vec<UsageBreakdownItem>,
+    pub usage_source_breakdown: Vec<UsageBreakdownItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageBreakdownItem {
+    pub key: String,
+    pub label: String,
+    pub requests: usize,
+    pub ratio: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDashboardSeries {
+    pub hourly_24h: Vec<UsageSeriesPoint>,
+    pub daily_7d: Vec<UsageSeriesPoint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSeriesPoint {
+    pub key: String,
+    pub label: String,
+    pub from: String,
+    pub to: String,
+    pub requests: usize,
+    pub success_requests: usize,
+    pub error_requests: usize,
+    pub total_input_tokens: i64,
+    pub billable_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_estimated_cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDashboardTop {
+    pub window_key: String,
+    pub models: Vec<UsageTopAggregate>,
+    pub credentials: Vec<UsageTopAggregate>,
+    pub endpoints: Vec<UsageTopAggregate>,
+    pub errors: Vec<UsageTopAggregate>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageTopAggregate {
+    pub key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub requests: usize,
+    pub error_requests: usize,
+    pub total_input_tokens: i64,
+    pub billable_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub total_cache_read_input_tokens: i64,
+    pub total_cache_creation_input_tokens: i64,
+    pub total_estimated_cost_usd: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct UsageDashboardWindowSpec {
+    pub key: String,
+    pub label: String,
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+}
+
+pub fn usage_dashboard_timezone(value: Option<&str>) -> (String, FixedOffset) {
+    let raw = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_USAGE_DASHBOARD_TIMEZONE);
+
+    match raw {
+        DEFAULT_USAGE_DASHBOARD_TIMEZONE | "Asia/Beijing" | "Asia/Chongqing" | "CST" => (
+            DEFAULT_USAGE_DASHBOARD_TIMEZONE.to_string(),
+            east_offset(8 * 3600),
+        ),
+        "UTC" | "Etc/UTC" | "Z" => ("UTC".to_string(), east_offset(0)),
+        _ => parse_fixed_offset(raw)
+            .map(|offset| (raw.to_string(), offset))
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    timezone = raw,
+                    fallback = DEFAULT_USAGE_DASHBOARD_TIMEZONE,
+                    "未知 usage dashboard 时区，回退到默认时区"
+                );
+                (
+                    DEFAULT_USAGE_DASHBOARD_TIMEZONE.to_string(),
+                    east_offset(8 * 3600),
+                )
+            }),
+    }
+}
+
+pub fn usage_dashboard_windows(
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+) -> Vec<UsageDashboardWindowSpec> {
+    let local_now = now.with_timezone(&offset);
+    let today_start = local_midnight_utc(offset, local_now.date_naive());
+    let yesterday_start = today_start - ChronoDuration::days(1);
+    let month_start = local_month_start_utc(offset, local_now.date_naive());
+
+    vec![
+        dashboard_window("today", "今天", today_start, now),
+        dashboard_window(
+            "last24h",
+            "最近24小时",
+            now - ChronoDuration::hours(24),
+            now,
+        ),
+        dashboard_window("yesterday", "昨天", yesterday_start, today_start),
+        dashboard_window("last7d", "最近7天", now - ChronoDuration::days(7), now),
+        dashboard_window("last30d", "最近30天", now - ChronoDuration::days(30), now),
+        dashboard_window("thisMonth", "本月", month_start, now),
+    ]
+}
+
+pub fn usage_dashboard_hourly_windows(
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+) -> Vec<UsageDashboardWindowSpec> {
+    let local_now = now.with_timezone(&offset);
+    let current_hour = offset
+        .with_ymd_and_hms(
+            local_now.year(),
+            local_now.month(),
+            local_now.day(),
+            local_now.hour(),
+            0,
+            0,
+        )
+        .single()
+        .unwrap_or(local_now)
+        .with_timezone(&Utc);
+    let first_hour = current_hour - ChronoDuration::hours(23);
+
+    (0..24)
+        .map(|idx| {
+            let from = first_hour + ChronoDuration::hours(idx);
+            let natural_to = from + ChronoDuration::hours(1);
+            let to = natural_to.min(now);
+            let local_from = from.with_timezone(&offset);
+            dashboard_window(
+                format!("h{}", idx + 1),
+                local_from.format("%m-%d %H:00").to_string(),
+                from,
+                to,
+            )
+        })
+        .collect()
+}
+
+pub fn usage_dashboard_daily_windows(
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+) -> Vec<UsageDashboardWindowSpec> {
+    let local_now = now.with_timezone(&offset);
+    let today_start = local_midnight_utc(offset, local_now.date_naive());
+    let first_day = today_start - ChronoDuration::days(6);
+
+    (0..7)
+        .map(|idx| {
+            let from = first_day + ChronoDuration::days(idx);
+            let natural_to = from + ChronoDuration::days(1);
+            let to = natural_to.min(now);
+            let local_from = from.with_timezone(&offset);
+            dashboard_window(
+                format!("d{}", idx + 1),
+                local_from.format("%m-%d").to_string(),
+                from,
+                to,
+            )
+        })
+        .collect()
+}
+
+fn dashboard_window(
+    key: impl Into<String>,
+    label: impl Into<String>,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> UsageDashboardWindowSpec {
+    UsageDashboardWindowSpec {
+        key: key.into(),
+        label: label.into(),
+        from,
+        to,
+    }
+}
+
+fn east_offset(seconds: i32) -> FixedOffset {
+    FixedOffset::east_opt(seconds).expect("valid fixed offset")
+}
+
+fn local_midnight_utc(offset: FixedOffset, date: NaiveDate) -> DateTime<Utc> {
+    offset
+        .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
+        .single()
+        .expect("fixed offset local midnight")
+        .with_timezone(&Utc)
+}
+
+fn local_month_start_utc(offset: FixedOffset, date: NaiveDate) -> DateTime<Utc> {
+    let first_day =
+        NaiveDate::from_ymd_opt(date.year(), date.month(), 1).expect("valid month start date");
+    local_midnight_utc(offset, first_day)
+}
+
+fn parse_fixed_offset(value: &str) -> Option<FixedOffset> {
+    let value = value
+        .strip_prefix("UTC")
+        .or_else(|| value.strip_prefix("GMT"))
+        .unwrap_or(value);
+    if value.is_empty() {
+        return Some(east_offset(0));
+    }
+
+    let (sign, rest) = match value.as_bytes().first().copied() {
+        Some(b'+') => (1, &value[1..]),
+        Some(b'-') => (-1, &value[1..]),
+        _ => return None,
+    };
+    let mut parts = rest.split(':');
+    let hours: i32 = parts.next()?.parse().ok()?;
+    let minutes: i32 = parts.next().unwrap_or("0").parse().ok()?;
+    if parts.next().is_some() || hours > 23 || minutes > 59 {
+        return None;
+    }
+    FixedOffset::east_opt(sign * (hours * 3600 + minutes * 60))
 }
 
 #[derive(Debug, Clone, Serialize)]

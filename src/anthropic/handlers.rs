@@ -13,7 +13,8 @@ use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::model::config::{
-    CompatProfile, Config, PayloadShapingConfig, PromptCacheSimulationMode, ReportedUsageConfig,
+    CompatProfile, Config, PayloadGuardMode, PayloadShapingConfig, PromptCacheSimulationMode,
+    ReportedUsageConfig,
 };
 use crate::token;
 use anyhow::Error;
@@ -119,6 +120,7 @@ struct RequestRuntimeConfig {
     compat_profile: CompatProfile,
     expose_proxy_warnings: bool,
     payload_guard_enabled: bool,
+    payload_guard_mode: PayloadGuardMode,
     payload_guard_max_bytes: usize,
     payload_guard_trim_history: bool,
     payload_shaping: PayloadShapingConfig,
@@ -138,6 +140,7 @@ impl RequestRuntimeConfig {
             compat_profile: state.compat_profile,
             expose_proxy_warnings: state.expose_proxy_warnings,
             payload_guard_enabled: state.payload_guard_enabled,
+            payload_guard_mode: state.payload_guard_mode,
             payload_guard_max_bytes: state.payload_guard_max_bytes,
             payload_guard_trim_history: state.payload_guard_trim_history,
             payload_shaping: state.payload_shaping,
@@ -167,6 +170,7 @@ impl RequestRuntimeConfig {
             compat_profile: config.compat_profile,
             expose_proxy_warnings: config.expose_proxy_warnings || config.compat_profile.is_debug(),
             payload_guard_enabled: config.payload_guard_enabled,
+            payload_guard_mode: config.payload_guard_mode,
             payload_guard_max_bytes: config.payload_guard_max_bytes,
             payload_guard_trim_history: config.payload_guard_trim_history,
             payload_shaping: config.payload_shaping,
@@ -180,6 +184,84 @@ impl RequestRuntimeConfig {
             trim_history: self.payload_guard_trim_history,
             shaping: self.payload_shaping,
         }
+    }
+
+    fn initial_payload_guard_config(&self) -> PayloadGuardConfig {
+        match self.payload_guard_mode {
+            PayloadGuardMode::Preemptive => self.payload_guard_config(),
+            PayloadGuardMode::OnTooLong => PayloadGuardConfig {
+                enabled: self.payload_guard_enabled,
+                max_bytes: 0,
+                trim_history: false,
+                shaping: self.payload_shaping,
+            },
+        }
+    }
+
+    fn too_long_retry_enabled(&self) -> bool {
+        self.payload_guard_mode == PayloadGuardMode::OnTooLong
+            && self.payload_guard_enabled
+            && self.payload_guard_max_bytes > 0
+    }
+}
+
+#[derive(Clone)]
+struct PayloadTooLongRetryRequest {
+    request: KiroRequest,
+    config: PayloadGuardConfig,
+    endpoint: &'static str,
+    requested_model: String,
+    upstream_model: Option<String>,
+    conversation_id: String,
+    conversion_warnings: Option<String>,
+}
+
+impl PayloadTooLongRetryRequest {
+    fn new(
+        request: KiroRequest,
+        runtime_config: &RequestRuntimeConfig,
+        endpoint: &'static str,
+        requested_model: &str,
+        upstream_model: Option<&str>,
+        conversation_id: &str,
+        conversion_warnings: Option<String>,
+    ) -> Option<Self> {
+        runtime_config.too_long_retry_enabled().then(|| Self {
+            request,
+            config: runtime_config.payload_guard_config(),
+            endpoint,
+            requested_model: requested_model.to_string(),
+            upstream_model: upstream_model.map(str::to_string),
+            conversation_id: conversation_id.to_string(),
+            conversion_warnings,
+        })
+    }
+
+    fn build_retry_body(
+        self,
+        usage_context: &mut RequestUsageContext,
+    ) -> Result<(String, Option<String>), PayloadGuardError> {
+        let mut request = self.request;
+        let (request_body, report) = guard_kiro_request(&mut request, self.config)?;
+        log_payload_guard_report(
+            &report,
+            self.endpoint,
+            &self.requested_model,
+            self.upstream_model.as_deref(),
+            Some(&self.conversation_id),
+        );
+        let breakdown = breakdown_kiro_request(&request, &request_body);
+        log_payload_byte_breakdown(
+            should_log_payload_byte_breakdown(&report).then_some(breakdown),
+            &report,
+            self.endpoint,
+            &self.requested_model,
+            self.upstream_model.as_deref(),
+            Some(&self.conversation_id),
+        );
+        usage_context.set_payload_diagnostics(breakdown, report.clone());
+        let warnings_header = merge_warning_headers(self.conversion_warnings, Some(&report));
+        Ok((request_body, warnings_header))
     }
 }
 
@@ -238,9 +320,17 @@ impl RequestUsageContext {
         breakdown: PayloadByteBreakdown,
         report: PayloadGuardReport,
     ) -> Self {
+        self.set_payload_diagnostics(breakdown, report);
+        self
+    }
+
+    fn set_payload_diagnostics(
+        &mut self,
+        breakdown: PayloadByteBreakdown,
+        report: PayloadGuardReport,
+    ) {
         self.payload_breakdown = Some(breakdown);
         self.payload_guard_report = Some(report);
-        self
     }
 
     fn attach_provider_error_credential(
@@ -1301,12 +1391,9 @@ fn map_provider_error(
     let err_str = err.to_string();
 
     // Kiro 上游的 content length 阈值与模型上下文窗口不是同一层限制。
-    if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+    if is_upstream_payload_too_long_error(&err_str) {
         let message = "Kiro upstream rejected the request because input content length exceeded its request threshold. This limit is separate from the model context window. Reduce oversized tools, system prompt, documents, images, tool results, or conversation history.";
-        log_provider_warning_with_hint(
-            &err_str,
-            "上游拒绝请求：输入内容长度超过接口阈值（不应重试）",
-        );
+        log_provider_warning_with_hint(&err_str, "上游拒绝请求：输入内容长度超过接口阈值");
         return if let Some(request_id) = request_id {
             envelope::error_response_with_id(
                 StatusCode::BAD_REQUEST,
@@ -1319,10 +1406,9 @@ fn map_provider_error(
         };
     }
 
-    // 单次输入太长（请求体或上游内部 content length 超出接口阈值）
-    if err_str.contains("Input is too long") {
-        let message = "Kiro upstream rejected the request because the input is too long for its request threshold. This is separate from the model context window. Reduce oversized messages, tools, documents, images, or tool results.";
-        log_provider_warning_with_hint(&err_str, "上游拒绝请求：输入过长（不应重试）");
+    if is_upstream_context_window_full_error(&err_str) {
+        let message = "Kiro upstream rejected the request because the context window is full. Reduce conversation history, system prompt, tools, documents, images, or tool results.";
+        log_provider_warning_with_hint(&err_str, "上游拒绝请求：上下文窗口已满");
         return if let Some(request_id) = request_id {
             envelope::error_response_with_id(
                 StatusCode::BAD_REQUEST,
@@ -1335,7 +1421,7 @@ fn map_provider_error(
         };
     }
 
-    if err_str.contains("Improperly formed request") || err_str.contains("IMPROPERLY_FORMED") {
+    if is_upstream_improperly_formed_error(&err_str) {
         log_provider_warning_with_hint(
             &err_str,
             "上游拒绝请求：Kiro payload 形态不合法（不应切换账号重试）",
@@ -1419,6 +1505,59 @@ fn map_provider_error(
             format!("上游 API 调用失败: {}", err),
         )
     }
+}
+
+fn is_upstream_payload_too_long_error(value: &str) -> bool {
+    if value.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+        return true;
+    }
+
+    let lower = value.to_ascii_lowercase();
+    lower.contains("input is too long")
+        || lower.contains("payload is too large")
+        || lower.contains("request payload is too large")
+        || lower.contains("request body is too large")
+        || lower.contains("content length exceeded")
+        || lower.contains("content length exceeds")
+        || lower.contains("input content length exceeded")
+}
+
+fn is_upstream_context_window_full_error(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("context window is full") && lower.contains("reduce conversation history")
+}
+
+fn is_upstream_improperly_formed_error(value: &str) -> bool {
+    value.contains("IMPROPERLY_FORMED")
+        || value
+            .to_ascii_lowercase()
+            .contains("improperly formed request")
+}
+
+fn is_upstream_too_long_error(value: &str) -> bool {
+    is_upstream_payload_too_long_error(value) || is_upstream_context_window_full_error(value)
+}
+
+fn should_retry_payload_guard_after_error(
+    value: &str,
+    attempted_body_bytes: usize,
+    retry_max_bytes: usize,
+) -> bool {
+    is_upstream_too_long_error(value)
+        || (retry_max_bytes > 0
+            && attempted_body_bytes > retry_max_bytes
+            && is_upstream_improperly_formed_error(value))
+}
+
+fn merge_credential_attempts(
+    mut prefix: Vec<KiroCredentialAttempt>,
+    attempts: Vec<KiroCredentialAttempt>,
+) -> Vec<KiroCredentialAttempt> {
+    if prefix.is_empty() {
+        return attempts;
+    }
+    prefix.extend(attempts);
+    prefix
 }
 
 fn retry_after_secs_from_error(value: &str) -> Option<u64> {
@@ -1791,11 +1930,24 @@ async fn post_messages_inner(
     };
     let conversation_id = kiro_request.conversation_state.conversation_id.clone();
 
-    let (request_body, payload_guard_report) =
-        match guard_kiro_request(&mut kiro_request, runtime_config.payload_guard_config()) {
-            Ok(result) => result,
-            Err(err) => return payload_guard_error_response(err),
-        };
+    let too_long_retry = PayloadTooLongRetryRequest::new(
+        kiro_request.clone(),
+        &runtime_config,
+        endpoint,
+        &payload.model,
+        model_resolution.upstream_model.as_deref(),
+        &conversation_id,
+        should_expose_proxy_warnings(&runtime_config)
+            .then(|| conversion_result.warnings.encode_header())
+            .flatten(),
+    );
+    let (request_body, payload_guard_report) = match guard_kiro_request(
+        &mut kiro_request,
+        runtime_config.initial_payload_guard_config(),
+    ) {
+        Ok(result) => result,
+        Err(err) => return payload_guard_error_response(err),
+    };
     log_payload_guard_report(
         &payload_guard_report,
         endpoint,
@@ -1877,6 +2029,7 @@ async fn post_messages_inner(
             tool_name_map,
             usage_context,
             warnings_header,
+            too_long_retry,
         )
         .await
     } else {
@@ -1891,6 +2044,7 @@ async fn post_messages_inner(
             tool_name_map,
             usage_context,
             warnings_header,
+            too_long_retry,
         )
         .await
     }
@@ -1908,9 +2062,13 @@ async fn handle_stream_request(
     tool_name_map: HashMap<String, String>,
     usage_context: RequestUsageContext,
     warnings_header: Option<String>,
+    too_long_retry: Option<PayloadTooLongRetryRequest>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
+    let mut usage_context = usage_context;
+    let mut warnings_header = warnings_header;
     let request_id = usage_context.request_id.clone();
+    let mut retry_attempt_prefix: Vec<KiroCredentialAttempt> = Vec::new();
     let response = match provider
         .call_api_stream_with_request_id(request_body, Some(&request_id))
         .await
@@ -1920,14 +2078,72 @@ async fn handle_stream_request(
             let message = e.to_string();
             let attempts = KiroProvider::attempts_from_error(&e);
             log_provider_call_failure(&message);
-            usage_context
-                .attach_provider_error_credential(&provider, &message, attempts)
-                .record_failure(UsageRecordStatus::Error, "api_error", message);
-            return map_provider_error(e, Some(&request_id), Some(provider.as_ref()));
+            if let Some(retry) = too_long_retry.filter(|retry| {
+                should_retry_payload_guard_after_error(
+                    &message,
+                    request_body.len(),
+                    retry.config.max_bytes,
+                )
+            }) {
+                tracing::warn!(
+                    request_id,
+                    "Kiro stream request rejected as too long; applying configured payload guard and retrying once"
+                );
+                retry_attempt_prefix = attempts.clone();
+                let (retry_body, retry_warnings_header) =
+                    match retry.build_retry_body(&mut usage_context) {
+                        Ok(result) => result,
+                        Err(err) => {
+                            usage_context
+                            .attach_provider_error_credential(&provider, &message, attempts)
+                            .record_failure(
+                                UsageRecordStatus::Error,
+                                "payload_guard_error",
+                                format!(
+                                    "payload guard retry failed after upstream too-long error: {}",
+                                    err
+                                ),
+                            );
+                            return payload_guard_error_response(err);
+                        }
+                    };
+                warnings_header = retry_warnings_header;
+                match provider
+                    .call_api_stream_with_request_id(&retry_body, Some(&request_id))
+                    .await
+                {
+                    Ok(resp) => resp,
+                    Err(retry_error) => {
+                        let retry_message = retry_error.to_string();
+                        let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
+                        let all_attempts =
+                            merge_credential_attempts(retry_attempt_prefix.clone(), retry_attempts);
+                        log_provider_call_failure(&retry_message);
+                        usage_context
+                            .attach_provider_error_credential(
+                                &provider,
+                                &retry_message,
+                                all_attempts,
+                            )
+                            .record_failure(UsageRecordStatus::Error, "api_error", retry_message);
+                        return map_provider_error(
+                            retry_error,
+                            Some(&request_id),
+                            Some(provider.as_ref()),
+                        );
+                    }
+                }
+            } else {
+                usage_context
+                    .attach_provider_error_credential(&provider, &message, attempts)
+                    .record_failure(UsageRecordStatus::Error, "api_error", message);
+                return map_provider_error(e, Some(&request_id), Some(provider.as_ref()));
+            }
         }
     };
     let (response, completion) = response.into_parts();
-    let credential_attempts = completion.attempts().to_vec();
+    let credential_attempts =
+        merge_credential_attempts(retry_attempt_prefix, completion.attempts().to_vec());
     let credential_usage = prepare_credential_usage_context(
         usage_context,
         &provider,
@@ -2165,9 +2381,13 @@ async fn handle_non_stream_request(
     tool_name_map: HashMap<String, String>,
     usage_context: RequestUsageContext,
     warnings_header: Option<String>,
+    too_long_retry: Option<PayloadTooLongRetryRequest>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
+    let mut usage_context = usage_context;
+    let mut warnings_header = warnings_header;
     let request_id = usage_context.request_id.clone();
+    let mut retry_attempt_prefix: Vec<KiroCredentialAttempt> = Vec::new();
     let api_response = match provider
         .call_api_with_context_with_request_id(request_body, Some(&request_id))
         .await
@@ -2177,13 +2397,71 @@ async fn handle_non_stream_request(
             let message = e.to_string();
             let attempts = KiroProvider::attempts_from_error(&e);
             log_provider_call_failure(&message);
-            usage_context
-                .attach_provider_error_credential(&provider, &message, attempts)
-                .record_failure(UsageRecordStatus::Error, "api_error", message);
-            return map_provider_error(e, Some(&request_id), Some(provider.as_ref()));
+            if let Some(retry) = too_long_retry.filter(|retry| {
+                should_retry_payload_guard_after_error(
+                    &message,
+                    request_body.len(),
+                    retry.config.max_bytes,
+                )
+            }) {
+                tracing::warn!(
+                    request_id,
+                    "Kiro non-stream request rejected as too long; applying configured payload guard and retrying once"
+                );
+                retry_attempt_prefix = attempts.clone();
+                let (retry_body, retry_warnings_header) =
+                    match retry.build_retry_body(&mut usage_context) {
+                        Ok(result) => result,
+                        Err(err) => {
+                            usage_context
+                            .attach_provider_error_credential(&provider, &message, attempts)
+                            .record_failure(
+                                UsageRecordStatus::Error,
+                                "payload_guard_error",
+                                format!(
+                                    "payload guard retry failed after upstream too-long error: {}",
+                                    err
+                                ),
+                            );
+                            return payload_guard_error_response(err);
+                        }
+                    };
+                warnings_header = retry_warnings_header;
+                match provider
+                    .call_api_with_context_with_request_id(&retry_body, Some(&request_id))
+                    .await
+                {
+                    Ok(resp) => resp,
+                    Err(retry_error) => {
+                        let retry_message = retry_error.to_string();
+                        let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
+                        let all_attempts =
+                            merge_credential_attempts(retry_attempt_prefix.clone(), retry_attempts);
+                        log_provider_call_failure(&retry_message);
+                        usage_context
+                            .attach_provider_error_credential(
+                                &provider,
+                                &retry_message,
+                                all_attempts,
+                            )
+                            .record_failure(UsageRecordStatus::Error, "api_error", retry_message);
+                        return map_provider_error(
+                            retry_error,
+                            Some(&request_id),
+                            Some(provider.as_ref()),
+                        );
+                    }
+                }
+            } else {
+                usage_context
+                    .attach_provider_error_credential(&provider, &message, attempts)
+                    .record_failure(UsageRecordStatus::Error, "api_error", message);
+                return map_provider_error(e, Some(&request_id), Some(provider.as_ref()));
+            }
         }
     };
-    let credential_attempts = api_response.attempts().to_vec();
+    let credential_attempts =
+        merge_credential_attempts(retry_attempt_prefix, api_response.attempts().to_vec());
     let credential_usage = prepare_credential_usage_context(
         usage_context,
         &provider,
@@ -2673,11 +2951,24 @@ pub async fn post_messages_cc(
     };
     let conversation_id = kiro_request.conversation_state.conversation_id.clone();
 
-    let (request_body, payload_guard_report) =
-        match guard_kiro_request(&mut kiro_request, runtime_config.payload_guard_config()) {
-            Ok(result) => result,
-            Err(err) => return payload_guard_error_response(err),
-        };
+    let too_long_retry = PayloadTooLongRetryRequest::new(
+        kiro_request.clone(),
+        &runtime_config,
+        "/cc/v1/messages",
+        &payload.model,
+        model_resolution.upstream_model.as_deref(),
+        &conversation_id,
+        should_expose_proxy_warnings(&runtime_config)
+            .then(|| conversion_result.warnings.encode_header())
+            .flatten(),
+    );
+    let (request_body, payload_guard_report) = match guard_kiro_request(
+        &mut kiro_request,
+        runtime_config.initial_payload_guard_config(),
+    ) {
+        Ok(result) => result,
+        Err(err) => return payload_guard_error_response(err),
+    };
     log_payload_guard_report(
         &payload_guard_report,
         "/cc/v1/messages",
@@ -2759,6 +3050,7 @@ pub async fn post_messages_cc(
             tool_name_map,
             usage_context,
             warnings_header,
+            too_long_retry,
         )
         .await
     } else {
@@ -2773,6 +3065,7 @@ pub async fn post_messages_cc(
             tool_name_map,
             usage_context,
             warnings_header,
+            too_long_retry,
         )
         .await
     }
@@ -2805,6 +3098,85 @@ mod tests {
             output_config: None,
             metadata: None,
         }
+    }
+
+    fn runtime_config_for_payload_guard(
+        mode: PayloadGuardMode,
+        enabled: bool,
+        max_bytes: usize,
+    ) -> RequestRuntimeConfig {
+        RequestRuntimeConfig {
+            extract_thinking: true,
+            prompt_cache_target_read_ratio: 0.98,
+            prompt_cache_token_scale: 1.0,
+            prompt_cache_max_simulated_input_tokens: 0,
+            prompt_cache_cap_jitter_min_tokens: 0,
+            prompt_cache_cap_jitter_max_tokens: 0,
+            prompt_cache_scale_min_input_tokens: 0,
+            reported_usage: ReportedUsageConfig::default(),
+            compat_profile: CompatProfile::ClaudeCode,
+            expose_proxy_warnings: false,
+            payload_guard_enabled: enabled,
+            payload_guard_mode: mode,
+            payload_guard_max_bytes: max_bytes,
+            payload_guard_trim_history: true,
+            payload_shaping: PayloadShapingConfig::default(),
+        }
+    }
+
+    #[test]
+    fn on_too_long_initial_guard_repairs_without_size_trimming() {
+        let runtime_config =
+            runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
+
+        let initial = runtime_config.initial_payload_guard_config();
+
+        assert!(initial.enabled);
+        assert_eq!(initial.max_bytes, 0);
+        assert!(!initial.trim_history);
+        assert!(runtime_config.too_long_retry_enabled());
+        assert_eq!(runtime_config.payload_guard_config().max_bytes, 460_800);
+        assert!(runtime_config.payload_guard_config().trim_history);
+    }
+
+    #[test]
+    fn on_too_long_retry_requires_enabled_guard_and_positive_limit() {
+        assert!(
+            !runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, false, 460_800)
+                .too_long_retry_enabled()
+        );
+        assert!(
+            !runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 0)
+                .too_long_retry_enabled()
+        );
+        assert!(
+            !runtime_config_for_payload_guard(PayloadGuardMode::Preemptive, true, 460_800)
+                .too_long_retry_enabled()
+        );
+    }
+
+    #[test]
+    fn payload_guard_retry_treats_large_improper_request_as_possible_size_error() {
+        assert!(should_retry_payload_guard_after_error(
+            r#"400 Bad Request {"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#,
+            100,
+            460_800,
+        ));
+        assert!(should_retry_payload_guard_after_error(
+            r#"400 Bad Request {"message":"Improperly formed request.","reason":null}"#,
+            700_000,
+            460_800,
+        ));
+        assert!(!should_retry_payload_guard_after_error(
+            r#"400 Bad Request {"message":"Improperly formed request.","reason":null}"#,
+            100_000,
+            460_800,
+        ));
+        assert!(!should_retry_payload_guard_after_error(
+            r#"400 Bad Request {"message":"Improperly formed request.","reason":null}"#,
+            700_000,
+            0,
+        ));
     }
 
     #[test]

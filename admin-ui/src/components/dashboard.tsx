@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
-import { LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, BarChart3, Settings, DollarSign, Download, FileClock, RefreshCw, Router, Search, FileCheck2 } from 'lucide-react'
+import { LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, BarChart3, Settings, DollarSign, Download, FileClock, RefreshCw, Router, Search, FileCheck2, LayoutDashboard } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { maskAdminApiKey, storage } from '@/lib/storage'
@@ -14,6 +14,7 @@ import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { CredentialTestDialog } from '@/components/credential-test-dialog'
 import { UsageRecordsPanel } from '@/components/usage-records-panel'
+import { UsageDashboardPanel } from '@/components/usage-dashboard-panel'
 import { RuntimeConfigPanel } from '@/components/runtime-config-panel'
 import { ModelPricingPanel } from '@/components/model-pricing-panel'
 import { AuditLogsPanel } from '@/components/audit-logs-panel'
@@ -52,7 +53,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [proxyFilter, setProxyFilter] = useState('all')
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
-  const [activeTab, setActiveTab] = useState<'credentials' | 'validation' | 'proxies' | 'usage' | 'pricing' | 'audit' | 'config'>('credentials')
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'credentials' | 'validation' | 'proxies' | 'usage' | 'pricing' | 'audit' | 'config'>('credentials')
   const [adminApiKeySnapshot, setAdminApiKeySnapshot] = useState(() => storage.getApiKey() || '')
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
@@ -641,6 +642,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
           </div>
           <div className="flex items-center gap-2">
             <Button
+              variant={activeTab === 'dashboard' ? 'secondary' : 'ghost'}
+              size="sm"
+              onClick={() => setActiveTab('dashboard')}
+            >
+              <LayoutDashboard className="h-4 w-4" />
+              总览
+            </Button>
+            <Button
               variant={activeTab === 'credentials' ? 'secondary' : 'ghost'}
               size="sm"
               onClick={() => setActiveTab('credentials')}
@@ -719,7 +728,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
       {/* 主内容 */}
       <main className="container mx-auto px-4 md:px-8 py-6">
-        {activeTab === 'usage' ? (
+        {activeTab === 'dashboard' ? (
+          <UsageDashboardPanel />
+        ) : activeTab === 'usage' ? (
           <UsageRecordsPanel />
         ) : activeTab === 'validation' ? (
           <AccountValidationPanel />

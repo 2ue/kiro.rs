@@ -25,7 +25,7 @@ const navItems: Array<{ key: TabKey; label: string; icon: React.ReactNode; descr
   { key: 'credentials', label: '凭据', icon: <Server className="h-5 w-5" />, description: '管理 API 凭据和账号' },
   { key: 'validation', label: '校验', icon: <FileCheck2 className="h-5 w-5" />, description: '账号订阅状态校验' },
   { key: 'proxies', label: '代理', icon: <Router className="h-5 w-5" />, description: '代理资源配置' },
-  { key: 'usage', label: '用量', icon: <BarChart3 className="h-5 w-5" />, description: '使用记录和统计' },
+  { key: 'usage', label: '用量', icon: <BarChart3 className="h-5 w-5" />, description: '总览和请求列表' },
   { key: 'pricing', label: '价格', icon: <DollarSign className="h-5 w-5" />, description: '模型价格配置' },
   { key: 'audit', label: '审计', icon: <FileClock className="h-5 w-5" />, description: '操作日志记录' },
   { key: 'config', label: '配置', icon: <Settings className="h-5 w-5" />, description: '运行时参数设置' },

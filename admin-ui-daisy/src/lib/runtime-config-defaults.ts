@@ -114,6 +114,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   compressionEnabled: false,
   whitespaceCompression: true,
   payloadGuardEnabled: true,
+  payloadGuardMode: 'preemptive',
   payloadGuardMaxBytes: 460800,
   payloadGuardTrimHistory: true,
   payloadShaping: defaultPayloadShaping(),

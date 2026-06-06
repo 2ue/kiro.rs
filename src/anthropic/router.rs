@@ -11,7 +11,8 @@ use axum::{
 
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
-    CompatProfile, PayloadShapingConfig, PromptCacheSimulationMode, ReportedUsageConfig,
+    CompatProfile, PayloadGuardMode, PayloadShapingConfig, PromptCacheSimulationMode,
+    ReportedUsageConfig,
 };
 
 use super::{
@@ -71,6 +72,7 @@ pub fn create_router_with_provider(
     compat_profile: CompatProfile,
     expose_proxy_warnings: bool,
     payload_guard_enabled: bool,
+    payload_guard_mode: PayloadGuardMode,
     payload_guard_max_bytes: usize,
     payload_guard_trim_history: bool,
     payload_shaping: PayloadShapingConfig,
@@ -95,6 +97,7 @@ pub fn create_router_with_provider(
     .with_reported_usage(reported_usage)
     .with_payload_guard(
         payload_guard_enabled,
+        payload_guard_mode,
         payload_guard_max_bytes,
         payload_guard_trim_history,
         payload_shaping,

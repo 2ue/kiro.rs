@@ -406,6 +406,96 @@ export interface UsageSummary {
   topConversations: UsageAggregate[]
 }
 
+export interface UsageDashboardResponse {
+  generatedAt: string
+  timezone: string
+  windows: UsageDashboardWindow[]
+  series: UsageDashboardSeries
+  top: UsageDashboardTop
+}
+
+export interface UsageDashboardWindow {
+  key: string
+  label: string
+  from: string
+  to: string
+  summary: UsageDashboardSummary
+}
+
+export interface UsageDashboardSummary {
+  totalRequests: number
+  successRequests: number
+  errorRequests: number
+  errorRate: number
+  streamRequests: number
+  nonStreamRequests: number
+  highCacheRequests: number
+  totalInputTokens: number
+  billableInputTokens: number
+  totalOutputTokens: number
+  totalCacheReadInputTokens: number
+  totalCacheCreationInputTokens: number
+  cacheReadRatio: number
+  totalEstimatedCostUsd: number
+  pricedRequests: number
+  unpricedRequests: number
+  averageDurationMs: number
+  p95DurationMs: number
+  stickyBoundRequests: number
+  fallbackFromStickyRequests: number
+  simulatedRequests: number
+  upstreamMetadataRequests: number
+  statusBreakdown: UsageBreakdownItem[]
+  usageSourceBreakdown: UsageBreakdownItem[]
+}
+
+export interface UsageBreakdownItem {
+  key: string
+  label: string
+  requests: number
+  ratio: number
+}
+
+export interface UsageDashboardSeries {
+  hourly24h: UsageSeriesPoint[]
+  daily7d: UsageSeriesPoint[]
+}
+
+export interface UsageSeriesPoint {
+  key: string
+  label: string
+  from: string
+  to: string
+  requests: number
+  successRequests: number
+  errorRequests: number
+  totalInputTokens: number
+  billableInputTokens: number
+  totalOutputTokens: number
+  totalEstimatedCostUsd: number
+}
+
+export interface UsageDashboardTop {
+  windowKey: string
+  models: UsageTopAggregate[]
+  credentials: UsageTopAggregate[]
+  endpoints: UsageTopAggregate[]
+  errors: UsageTopAggregate[]
+}
+
+export interface UsageTopAggregate {
+  key: string
+  label?: string
+  requests: number
+  errorRequests: number
+  totalInputTokens: number
+  billableInputTokens: number
+  totalOutputTokens: number
+  totalCacheReadInputTokens: number
+  totalCacheCreationInputTokens: number
+  totalEstimatedCostUsd: number
+}
+
 export interface UsageRecordsQuery {
   limit?: number
   q?: string
@@ -448,6 +538,7 @@ export interface AdminAuditLogPageQuery {
 }
 
 export type CompatProfile = 'claude-code' | 'anthropic-strict' | 'debug'
+export type PayloadGuardMode = 'preemptive' | 'on_too_long'
 
 export type ReportedUsageFieldMode = 'raw' | 'preserve' | 'sample-max' | 'sample-target'
 
@@ -530,6 +621,7 @@ export interface RuntimeConfig {
   compressionEnabled: boolean
   whitespaceCompression: boolean
   payloadGuardEnabled: boolean
+  payloadGuardMode: PayloadGuardMode
   payloadGuardMaxBytes: number
   payloadGuardTrimHistory: boolean
   payloadShaping: PayloadShapingConfig

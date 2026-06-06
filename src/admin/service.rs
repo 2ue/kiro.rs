@@ -30,8 +30,8 @@ use crate::anthropic::{
     pricing::{PricingCatalog, PricingStatus},
     prompt_cache::PromptCacheTracker,
     usage::{
-        UsageRecordQuery, UsageRecorder, UsageRecorderStats, UsageRecordsPageResult,
-        UsageRecordsResult, UsageSummary,
+        UsageDashboardResponse, UsageRecordQuery, UsageRecorder, UsageRecorderStats,
+        UsageRecordsPageResult, UsageRecordsResult, UsageSummary,
     },
 };
 use crate::kiro::model::credentials::KiroCredentials;
@@ -45,7 +45,7 @@ use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::storage::postgres::{
     AdminAuditLogPage, CreateProxyResourceRow, CredentialAccountInfoRow, PostgresStore,
-    ProxyResourceRow, UpdateProxyResourceRow,
+    PostgresUsageStore, ProxyResourceRow, UpdateProxyResourceRow,
 };
 use crate::storage::redis_cache::RedisStore;
 
@@ -1288,6 +1288,23 @@ impl AdminService {
         self.usage_recorder.summary(high_cache_threshold)
     }
 
+    /// 获取 PgSQL 聚合的 usage 仪表盘数据。
+    ///
+    /// 该接口不走 UsageRecorder 的内存记录兜底，避免仪表盘统计受进程内缓存大小影响。
+    pub fn get_usage_dashboard(
+        &self,
+        timezone: Option<String>,
+    ) -> Result<UsageDashboardResponse, AdminServiceError> {
+        let high_cache_threshold = self.token_manager.runtime_config().high_cache_threshold;
+        let usage_store = PostgresUsageStore::new(self.postgres_store.clone());
+        block_on_admin_store(async move {
+            usage_store
+                .dashboard(timezone.as_deref(), high_cache_threshold)
+                .await
+        })
+        .map_err(|err| AdminServiceError::InternalError(err.to_string()))
+    }
+
     /// 获取 usage 持久化 writer 状态。该状态只用于观测，不参与调度。
     pub fn get_usage_writer_stats(&self) -> UsageRecorderStats {
         self.usage_recorder.writer_stats()
@@ -1558,6 +1575,7 @@ impl AdminService {
             compression_enabled: config.compression.enabled,
             whitespace_compression: config.compression.whitespace_compression,
             payload_guard_enabled: config.payload_guard_enabled,
+            payload_guard_mode: config.payload_guard_mode,
             payload_guard_max_bytes: config.payload_guard_max_bytes as u64,
             payload_guard_trim_history: config.payload_guard_trim_history,
             payload_shaping: config.payload_shaping,
@@ -1662,6 +1680,9 @@ impl AdminService {
         let payload_guard_enabled = req
             .payload_guard_enabled
             .unwrap_or(current_config.payload_guard_enabled);
+        let payload_guard_mode = req
+            .payload_guard_mode
+            .unwrap_or(current_config.payload_guard_mode);
         let payload_guard_max_bytes = req
             .payload_guard_max_bytes
             .and_then(|value| usize::try_from(value).ok())
@@ -1878,6 +1899,7 @@ impl AdminService {
                 config.scheduler_top_k = scheduler_top_k;
                 config.compression = compression.clone();
                 config.payload_guard_enabled = payload_guard_enabled;
+                config.payload_guard_mode = payload_guard_mode;
                 config.payload_guard_max_bytes = payload_guard_max_bytes;
                 config.payload_guard_trim_history = payload_guard_trim_history;
                 config.payload_shaping = payload_shaping;

@@ -1,4 +1,4 @@
-import { Eye, Trash2, X } from 'lucide-react'
+import { Eye, LayoutGrid, List, Trash2, X } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { Button, Card, Input, Select, Table } from 'react-daisyui'
@@ -103,6 +103,7 @@ export function UsagePanel() {
   const [streamMode, setStreamMode] = useState<'all' | 'stream' | 'non_stream'>('all')
   const [minCacheRead, setMinCacheRead] = useState('')
   const [selectedRecord, setSelectedRecord] = useState<UsageRecord | null>(null)
+  const [recordView, setRecordView] = useState<'cards' | 'table'>('cards')
   const [page, setPage] = useState(1)
   const limit = 20
 
@@ -194,6 +195,28 @@ export function UsagePanel() {
         description="错误详情和账号切换链路可点击查看。"
         actions={
           <>
+            <div className="join">
+              <Button
+                type="button"
+                className="join-item"
+                color={recordView === 'cards' ? 'primary' : 'ghost'}
+                size="sm"
+                onClick={() => setRecordView('cards')}
+              >
+                <LayoutGrid className="h-4 w-4" />
+                卡片
+              </Button>
+              <Button
+                type="button"
+                className="join-item"
+                color={recordView === 'table' ? 'primary' : 'ghost'}
+                size="sm"
+                onClick={() => setRecordView('table')}
+              >
+                <List className="h-4 w-4" />
+                列表
+              </Button>
+            </div>
             <Button type="button" variant="outline" size="sm" onClick={resetFilters} disabled={!hasFilters}>
               <X className="h-4 w-4" />
               重置
@@ -240,6 +263,102 @@ export function UsagePanel() {
           <ErrorState text={extractErrorMessage(records.error)} />
         ) : pageRecords.length === 0 ? (
           <EmptyState text={page === 1 ? '暂无记录' : '当前页暂无记录'} />
+        ) : recordView === 'table' ? (
+          <div className="table-panel">
+            <Table size="sm" className="data-table min-w-[1120px]">
+              <Table.Head>
+                <span>时间 / 状态</span>
+                <span>模型 / Endpoint</span>
+                <span>账号</span>
+                <span>Token</span>
+                <span>缓存</span>
+                <span>费用 / 耗时</span>
+                <span>调用链路</span>
+                <span className="text-right">操作</span>
+              </Table.Head>
+              <Table.Body>
+                {pageRecords.map((record) => {
+                  const label = typeof record.credentialId === 'number' ? credentialLabels.get(record.credentialId) || record.credentialLabel : record.credentialLabel
+                  const rowReadRatio = ratio(record.cacheReadInputTokens, record.totalInputTokens)
+                  const rowCachedRatio = ratio(record.cacheReadInputTokens + record.cacheCreationInputTokens, record.totalInputTokens)
+                  const attemptChain = formatAttemptChain(record)
+                  return (
+                    <Table.Row key={record.id}>
+                      <span>
+                        <div className="font-medium text-base-content/75">{formatDate(record.createdAt)}</div>
+                        <div className="mt-1 flex flex-wrap items-center gap-1">
+                          <Badge tone={statusTone(record.status)}>{statusLabel(record.status)}</Badge>
+                          <Badge tone={record.stream ? 'secondary' : 'neutral'}>{record.stream ? 'stream' : 'non-stream'}</Badge>
+                        </div>
+                      </span>
+                      <span className="min-w-0">
+                        <div className="max-w-[260px] truncate font-semibold" title={record.model || '-'}>
+                          {record.model || '-'}
+                        </div>
+                        <div className="mt-1 flex max-w-[260px] flex-wrap items-center gap-1">
+                          <Badge>{record.endpoint || '-'}</Badge>
+                          {record.stickyBound && <Badge tone="secondary">sticky</Badge>}
+                          {record.fallbackFromSticky && <Badge tone="warning">fallback</Badge>}
+                        </div>
+                      </span>
+                      <span>
+                        <div className="font-semibold">#{record.credentialId ?? '-'}</div>
+                        {label && <div className="max-w-[180px] truncate text-xs text-base-content/55" title={label}>{label}</div>}
+                      </span>
+                      <span className="font-mono text-xs">
+                        <div>输入 {formatNumber(record.totalInputTokens)}</div>
+                        <div className="text-base-content/55">计费 {formatNumber(record.billableInputTokens)}</div>
+                        <div className="text-base-content/55">输出 {formatNumber(record.outputTokens)}</div>
+                      </span>
+                      <span className="font-mono text-xs">
+                        <div className="text-success">读 {formatNumber(record.cacheReadInputTokens)}</div>
+                        <div className="text-info">写 {formatNumber(record.cacheCreationInputTokens)}</div>
+                        <div className="text-base-content/55">{formatPercent(rowReadRatio)} / {formatPercent(rowCachedRatio)}</div>
+                        <div className="mt-1"><Badge tone={record.simulated ? 'warning' : 'secondary'}>{sourceLabel(record.usageSource)}</Badge></div>
+                      </span>
+                      <span>
+                        <div className="font-semibold">{formatUsd(record.estimatedCostUsd || 0)}</div>
+                        <div className="text-xs text-base-content/55">{formatNumber(record.durationMs)}ms</div>
+                        <div className="max-w-[160px] truncate text-xs text-base-content/55" title={record.pricingModel || ''}>
+                          {record.pricingAvailable ? record.pricingModel || 'priced' : 'unpriced'}
+                        </div>
+                      </span>
+                      <span>
+                        {attemptChain ? (
+                          <button
+                            type="button"
+                            className="max-w-[220px] truncate text-left text-xs font-medium text-primary hover:underline"
+                            title={attemptChain}
+                            onClick={() => setSelectedRecord(record)}
+                          >
+                            {attemptChain}
+                          </button>
+                        ) : (
+                          <span className="text-xs text-base-content/40">-</span>
+                        )}
+                        {record.errorMessage && (
+                          <button
+                            type="button"
+                            className="mt-1 block max-w-[220px] truncate text-left text-xs text-error hover:underline"
+                            title={record.errorDetail || record.errorMessage}
+                            onClick={() => setSelectedRecord(record)}
+                          >
+                            {record.errorMessage}
+                          </button>
+                        )}
+                      </span>
+                      <span className="text-right">
+                        <Button type="button" variant="outline" size="xs" onClick={() => setSelectedRecord(record)} title="查看详情">
+                          <Eye className="h-3.5 w-3.5" />
+                          详情
+                        </Button>
+                      </span>
+                    </Table.Row>
+                  )
+                })}
+              </Table.Body>
+            </Table>
+          </div>
         ) : (
           <div className="usage-record-list">
             {pageRecords.map((record) => {

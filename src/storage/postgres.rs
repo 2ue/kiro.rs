@@ -16,9 +16,12 @@ use crate::anthropic::pricing::{
     MANUAL_PRICING_SOURCE, ModelPriceItem, ModelPricing, PricingStatus,
 };
 use crate::anthropic::usage::{
-    CredentialCostSummary, REALTIME_USAGE_WINDOW_SECS, UsageAggregate, UsageRealtimeStats,
-    UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult, UsageRecordsResult,
-    UsageSummary,
+    CredentialCostSummary, REALTIME_USAGE_WINDOW_SECS, UsageAggregate, UsageBreakdownItem,
+    UsageDashboardResponse, UsageDashboardSeries, UsageDashboardSummary, UsageDashboardTop,
+    UsageDashboardWindow, UsageDashboardWindowSpec, UsageRealtimeStats, UsageRecord,
+    UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult, UsageRecordsResult,
+    UsageSeriesPoint, UsageSummary, UsageTopAggregate, usage_dashboard_daily_windows,
+    usage_dashboard_hourly_windows, usage_dashboard_timezone, usage_dashboard_windows,
 };
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
@@ -1885,6 +1888,308 @@ impl PostgresUsageStore {
         })
     }
 
+    pub async fn dashboard(
+        &self,
+        timezone: Option<&str>,
+        high_cache_threshold: i32,
+    ) -> anyhow::Result<UsageDashboardResponse> {
+        let now = Utc::now();
+        let (timezone, offset) = usage_dashboard_timezone(timezone);
+        let window_specs = usage_dashboard_windows(now, offset);
+        let mut windows = self
+            .dashboard_windows(&window_specs, high_cache_threshold)
+            .await?;
+        let mut status_breakdown = self
+            .dashboard_breakdown(&window_specs, DashboardBreakdownColumn::Status)
+            .await?;
+        let mut usage_source_breakdown = self
+            .dashboard_breakdown(&window_specs, DashboardBreakdownColumn::UsageSource)
+            .await?;
+
+        for window in &mut windows {
+            window.summary.status_breakdown =
+                status_breakdown.remove(&window.key).unwrap_or_default();
+            window.summary.usage_source_breakdown = usage_source_breakdown
+                .remove(&window.key)
+                .unwrap_or_default();
+        }
+
+        let hourly_specs = usage_dashboard_hourly_windows(now, offset);
+        let daily_specs = usage_dashboard_daily_windows(now, offset);
+        let top_window = window_specs
+            .iter()
+            .find(|window| window.key == "last24h")
+            .unwrap_or_else(|| {
+                window_specs
+                    .first()
+                    .expect("usage dashboard has at least one window")
+            });
+
+        Ok(UsageDashboardResponse {
+            generated_at: now.to_rfc3339(),
+            timezone,
+            windows,
+            series: UsageDashboardSeries {
+                hourly_24h: self.dashboard_series(&hourly_specs).await?,
+                daily_7d: self.dashboard_series(&daily_specs).await?,
+            },
+            top: UsageDashboardTop {
+                window_key: top_window.key.clone(),
+                models: self
+                    .dashboard_top_aggregates(
+                        top_window.from,
+                        top_window.to,
+                        DashboardTopGroup::Model,
+                    )
+                    .await?,
+                credentials: self
+                    .dashboard_top_aggregates(
+                        top_window.from,
+                        top_window.to,
+                        DashboardTopGroup::Credential,
+                    )
+                    .await?,
+                endpoints: self
+                    .dashboard_top_aggregates(
+                        top_window.from,
+                        top_window.to,
+                        DashboardTopGroup::Endpoint,
+                    )
+                    .await?,
+                errors: self
+                    .dashboard_top_aggregates(
+                        top_window.from,
+                        top_window.to,
+                        DashboardTopGroup::Error,
+                    )
+                    .await?,
+            },
+        })
+    }
+
+    async fn dashboard_windows(
+        &self,
+        specs: &[UsageDashboardWindowSpec],
+        high_cache_threshold: i32,
+    ) -> anyhow::Result<Vec<UsageDashboardWindow>> {
+        if specs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut builder = QueryBuilder::<Postgres>::new("");
+        push_dashboard_windows_cte(&mut builder, specs);
+        builder.push(
+            r#"
+            SELECT
+                w.key,
+                w.label,
+                w.from_at,
+                w.to_at,
+                COUNT(r.id)::bigint AS total_requests,
+                COUNT(r.id) FILTER (WHERE r.status = 'success')::bigint AS success_requests,
+                COUNT(r.id) FILTER (WHERE r.status <> 'success')::bigint AS error_requests,
+                COUNT(r.id) FILTER (WHERE r.stream)::bigint AS stream_requests,
+                COUNT(r.id) FILTER (WHERE NOT r.stream)::bigint AS non_stream_requests,
+                COUNT(r.id) FILTER (WHERE r.cache_read_input_tokens >=
+            "#,
+        );
+        builder.push_bind(high_cache_threshold);
+        builder.push(
+            r#"
+                )::bigint AS high_cache_requests,
+                COALESCE(SUM(r.total_input_tokens), 0)::bigint AS total_input_tokens,
+                COALESCE(SUM(r.billable_input_tokens), 0)::bigint AS billable_input_tokens,
+                COALESCE(SUM(r.output_tokens), 0)::bigint AS total_output_tokens,
+                COALESCE(SUM(r.cache_read_input_tokens), 0)::bigint AS total_cache_read_input_tokens,
+                COALESCE(SUM(r.cache_creation_input_tokens), 0)::bigint AS total_cache_creation_input_tokens,
+                COALESCE(SUM(r.estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
+                COUNT(r.id) FILTER (WHERE r.pricing_available)::bigint AS priced_requests,
+                COUNT(r.id) FILTER (WHERE NOT r.pricing_available)::bigint AS unpriced_requests,
+                COALESCE(AVG(r.duration_ms) FILTER (WHERE r.id IS NOT NULL), 0)::double precision AS average_duration_ms,
+                COALESCE(
+                    percentile_disc(0.95) WITHIN GROUP (ORDER BY r.duration_ms)
+                        FILTER (WHERE r.id IS NOT NULL),
+                    0
+                )::bigint AS p95_duration_ms,
+                COUNT(r.id) FILTER (WHERE r.sticky_bound)::bigint AS sticky_bound_requests,
+                COUNT(r.id) FILTER (WHERE r.fallback_from_sticky)::bigint AS fallback_from_sticky_requests,
+                COUNT(r.id) FILTER (WHERE r.simulated)::bigint AS simulated_requests,
+                COUNT(r.id) FILTER (WHERE r.usage_source = 'upstream_metadata')::bigint AS upstream_metadata_requests
+            FROM windows w
+            LEFT JOIN usage_records r
+                ON r.deleted_at IS NULL
+                AND r.created_at >= w.from_at
+                AND r.created_at < w.to_at
+            GROUP BY w.key, w.label, w.from_at, w.to_at, w.ord
+            ORDER BY w.ord
+            "#,
+        );
+
+        let rows = builder.build().fetch_all(self.store.pool()).await?;
+        rows.into_iter()
+            .map(dashboard_window_from_row)
+            .collect::<anyhow::Result<Vec<_>>>()
+    }
+
+    async fn dashboard_breakdown(
+        &self,
+        specs: &[UsageDashboardWindowSpec],
+        column: DashboardBreakdownColumn,
+    ) -> anyhow::Result<HashMap<String, Vec<UsageBreakdownItem>>> {
+        if specs.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let totals: HashMap<String, usize> = self
+            .dashboard_window_totals(specs)
+            .await?
+            .into_iter()
+            .collect();
+        let item_expr = column.sql_expr();
+        let mut builder = QueryBuilder::<Postgres>::new("");
+        push_dashboard_windows_cte(&mut builder, specs);
+        builder.push("SELECT w.key AS window_key, ");
+        builder.push(item_expr);
+        builder.push(
+            r#" AS item_key, COUNT(r.id)::bigint AS requests
+            FROM windows w
+            JOIN usage_records r
+                ON r.deleted_at IS NULL
+                AND r.created_at >= w.from_at
+                AND r.created_at < w.to_at
+            GROUP BY w.key, w.ord, "#,
+        );
+        builder.push(item_expr);
+        builder.push(" ORDER BY w.ord, requests DESC, item_key");
+
+        let rows = builder.build().fetch_all(self.store.pool()).await?;
+        let mut grouped: HashMap<String, Vec<UsageBreakdownItem>> = HashMap::new();
+        for row in rows {
+            let window_key: String = row.try_get("window_key")?;
+            let item_key: String = row.try_get("item_key")?;
+            let requests = row_i64_to_usize(&row, "requests")?;
+            let total_requests = totals.get(&window_key).copied().unwrap_or_default();
+            grouped
+                .entry(window_key)
+                .or_default()
+                .push(UsageBreakdownItem {
+                    label: column.label(&item_key),
+                    key: item_key,
+                    requests,
+                    ratio: usage_ratio(requests, total_requests),
+                });
+        }
+        Ok(grouped)
+    }
+
+    async fn dashboard_window_totals(
+        &self,
+        specs: &[UsageDashboardWindowSpec],
+    ) -> anyhow::Result<Vec<(String, usize)>> {
+        let mut builder = QueryBuilder::<Postgres>::new("");
+        push_dashboard_windows_cte(&mut builder, specs);
+        builder.push(
+            r#"
+            SELECT w.key, COUNT(r.id)::bigint AS total_requests
+            FROM windows w
+            LEFT JOIN usage_records r
+                ON r.deleted_at IS NULL
+                AND r.created_at >= w.from_at
+                AND r.created_at < w.to_at
+            GROUP BY w.key, w.ord
+            ORDER BY w.ord
+            "#,
+        );
+        let rows = builder.build().fetch_all(self.store.pool()).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("key")?,
+                    row_i64_to_usize(&row, "total_requests")?,
+                ))
+            })
+            .collect()
+    }
+
+    async fn dashboard_series(
+        &self,
+        specs: &[UsageDashboardWindowSpec],
+    ) -> anyhow::Result<Vec<UsageSeriesPoint>> {
+        if specs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut builder = QueryBuilder::<Postgres>::new("");
+        push_dashboard_windows_cte(&mut builder, specs);
+        builder.push(
+            r#"
+            SELECT
+                w.key,
+                w.label,
+                w.from_at,
+                w.to_at,
+                COUNT(r.id)::bigint AS requests,
+                COUNT(r.id) FILTER (WHERE r.status = 'success')::bigint AS success_requests,
+                COUNT(r.id) FILTER (WHERE r.status <> 'success')::bigint AS error_requests,
+                COALESCE(SUM(r.total_input_tokens), 0)::bigint AS total_input_tokens,
+                COALESCE(SUM(r.billable_input_tokens), 0)::bigint AS billable_input_tokens,
+                COALESCE(SUM(r.output_tokens), 0)::bigint AS total_output_tokens,
+                COALESCE(SUM(r.estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd
+            FROM windows w
+            LEFT JOIN usage_records r
+                ON r.deleted_at IS NULL
+                AND r.created_at >= w.from_at
+                AND r.created_at < w.to_at
+            GROUP BY w.key, w.label, w.from_at, w.to_at, w.ord
+            ORDER BY w.ord
+            "#,
+        );
+        let rows = builder.build().fetch_all(self.store.pool()).await?;
+        rows.into_iter()
+            .map(series_point_from_row)
+            .collect::<anyhow::Result<Vec<_>>>()
+    }
+
+    async fn dashboard_top_aggregates(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        group: DashboardTopGroup,
+    ) -> anyhow::Result<Vec<UsageTopAggregate>> {
+        let mut builder = QueryBuilder::<Postgres>::new("SELECT ");
+        builder.push(group.key_expr());
+        builder.push(" AS key, ");
+        builder.push(group.label_expr());
+        builder.push(
+            r#" AS label,
+                COUNT(*)::bigint AS requests,
+                COUNT(*) FILTER (WHERE r.status <> 'success')::bigint AS error_requests,
+                COALESCE(SUM(r.total_input_tokens), 0)::bigint AS total_input_tokens,
+                COALESCE(SUM(r.billable_input_tokens), 0)::bigint AS billable_input_tokens,
+                COALESCE(SUM(r.output_tokens), 0)::bigint AS total_output_tokens,
+                COALESCE(SUM(r.cache_read_input_tokens), 0)::bigint AS total_cache_read_input_tokens,
+                COALESCE(SUM(r.cache_creation_input_tokens), 0)::bigint AS total_cache_creation_input_tokens,
+                COALESCE(SUM(r.estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd
+            FROM usage_records r
+            WHERE r.deleted_at IS NULL
+                AND r.created_at >= "#,
+        );
+        builder.push_bind(from);
+        builder.push(" AND r.created_at < ");
+        builder.push_bind(to);
+        builder.push(group.extra_where());
+        builder.push(" GROUP BY ");
+        builder.push(group.key_expr());
+        builder.push(
+            " ORDER BY total_estimated_cost_usd DESC, requests DESC, total_input_tokens DESC LIMIT 10",
+        );
+
+        let rows = builder.build().fetch_all(self.store.pool()).await?;
+        rows.into_iter()
+            .map(usage_top_aggregate_from_row)
+            .collect::<anyhow::Result<Vec<_>>>()
+    }
+
     pub async fn credential_cost_summary(
         &self,
     ) -> anyhow::Result<HashMap<u64, CredentialCostSummary>> {
@@ -1993,6 +2298,63 @@ impl PostgresUsageStore {
     }
 }
 
+#[derive(Clone, Copy)]
+enum DashboardBreakdownColumn {
+    Status,
+    UsageSource,
+}
+
+impl DashboardBreakdownColumn {
+    fn sql_expr(self) -> &'static str {
+        match self {
+            Self::Status => "r.status",
+            Self::UsageSource => "r.usage_source",
+        }
+    }
+
+    fn label(self, value: &str) -> String {
+        match self {
+            Self::Status => usage_status_label(value),
+            Self::UsageSource => usage_source_label(value),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DashboardTopGroup {
+    Model,
+    Credential,
+    Endpoint,
+    Error,
+}
+
+impl DashboardTopGroup {
+    fn key_expr(self) -> &'static str {
+        match self {
+            Self::Model => "COALESCE(NULLIF(r.model, ''), 'unknown')",
+            Self::Credential => "r.credential_id::text",
+            Self::Endpoint => "COALESCE(NULLIF(r.endpoint, ''), 'unknown')",
+            Self::Error => "COALESCE(NULLIF(r.error_type, ''), r.status, 'error')",
+        }
+    }
+
+    fn label_expr(self) -> &'static str {
+        match self {
+            Self::Credential => "MAX(NULLIF(r.credential_label, ''))",
+            Self::Error => "MAX(NULLIF(r.error_message, ''))",
+            _ => "NULL::text",
+        }
+    }
+
+    fn extra_where(self) -> &'static str {
+        match self {
+            Self::Credential => " AND r.credential_id IS NOT NULL",
+            Self::Error => " AND r.status <> 'success'",
+            _ => "",
+        }
+    }
+}
+
 fn normalize_query_limit(limit: usize) -> usize {
     if limit == 0 { 100 } else { limit.min(1000) }
 }
@@ -2071,9 +2433,94 @@ fn push_usage_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &UsageRec
     }
 }
 
+fn push_dashboard_windows_cte(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    specs: &[UsageDashboardWindowSpec],
+) {
+    builder.push("WITH windows(key, label, from_at, to_at, ord) AS (VALUES ");
+    for (index, spec) in specs.iter().enumerate() {
+        if index > 0 {
+            builder.push(", ");
+        }
+        builder.push("(");
+        builder.push_bind(spec.key.clone());
+        builder.push("::text, ");
+        builder.push_bind(spec.label.clone());
+        builder.push("::text, ");
+        builder.push_bind(spec.from);
+        builder.push("::timestamptz, ");
+        builder.push_bind(spec.to);
+        builder.push("::timestamptz, ");
+        builder.push_bind(usize_to_i64(index));
+        builder.push("::bigint)");
+    }
+    builder.push(") ");
+}
+
 fn row_i64_to_usize(row: &PgRow, column: &str) -> anyhow::Result<usize> {
     let value: i64 = row.try_get(column)?;
     Ok(value.max(0) as usize)
+}
+
+fn dashboard_window_from_row(row: PgRow) -> anyhow::Result<UsageDashboardWindow> {
+    let from: DateTime<Utc> = row.try_get("from_at")?;
+    let to: DateTime<Utc> = row.try_get("to_at")?;
+    let total_requests = row_i64_to_usize(&row, "total_requests")?;
+    let error_requests = row_i64_to_usize(&row, "error_requests")?;
+    let total_input_tokens: i64 = row.try_get("total_input_tokens")?;
+    let total_cache_read_input_tokens: i64 = row.try_get("total_cache_read_input_tokens")?;
+    let p95_duration_ms: i64 = row.try_get("p95_duration_ms")?;
+
+    Ok(UsageDashboardWindow {
+        key: row.try_get("key")?,
+        label: row.try_get("label")?,
+        from: from.to_rfc3339(),
+        to: to.to_rfc3339(),
+        summary: UsageDashboardSummary {
+            total_requests,
+            success_requests: row_i64_to_usize(&row, "success_requests")?,
+            error_requests,
+            error_rate: usage_ratio(error_requests, total_requests),
+            stream_requests: row_i64_to_usize(&row, "stream_requests")?,
+            non_stream_requests: row_i64_to_usize(&row, "non_stream_requests")?,
+            high_cache_requests: row_i64_to_usize(&row, "high_cache_requests")?,
+            total_input_tokens,
+            billable_input_tokens: row.try_get("billable_input_tokens")?,
+            total_output_tokens: row.try_get("total_output_tokens")?,
+            total_cache_read_input_tokens,
+            total_cache_creation_input_tokens: row.try_get("total_cache_creation_input_tokens")?,
+            cache_read_ratio: token_ratio(total_cache_read_input_tokens, total_input_tokens),
+            total_estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
+            priced_requests: row_i64_to_usize(&row, "priced_requests")?,
+            unpriced_requests: row_i64_to_usize(&row, "unpriced_requests")?,
+            average_duration_ms: row.try_get("average_duration_ms")?,
+            p95_duration_ms: p95_duration_ms.max(0) as u64,
+            sticky_bound_requests: row_i64_to_usize(&row, "sticky_bound_requests")?,
+            fallback_from_sticky_requests: row_i64_to_usize(&row, "fallback_from_sticky_requests")?,
+            simulated_requests: row_i64_to_usize(&row, "simulated_requests")?,
+            upstream_metadata_requests: row_i64_to_usize(&row, "upstream_metadata_requests")?,
+            status_breakdown: Vec::new(),
+            usage_source_breakdown: Vec::new(),
+        },
+    })
+}
+
+fn series_point_from_row(row: PgRow) -> anyhow::Result<UsageSeriesPoint> {
+    let from: DateTime<Utc> = row.try_get("from_at")?;
+    let to: DateTime<Utc> = row.try_get("to_at")?;
+    Ok(UsageSeriesPoint {
+        key: row.try_get("key")?,
+        label: row.try_get("label")?,
+        from: from.to_rfc3339(),
+        to: to.to_rfc3339(),
+        requests: row_i64_to_usize(&row, "requests")?,
+        success_requests: row_i64_to_usize(&row, "success_requests")?,
+        error_requests: row_i64_to_usize(&row, "error_requests")?,
+        total_input_tokens: row.try_get("total_input_tokens")?,
+        billable_input_tokens: row.try_get("billable_input_tokens")?,
+        total_output_tokens: row.try_get("total_output_tokens")?,
+        total_estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
+    })
 }
 
 fn usage_aggregate_from_row(row: PgRow) -> anyhow::Result<UsageAggregate> {
@@ -2085,6 +2532,61 @@ fn usage_aggregate_from_row(row: PgRow) -> anyhow::Result<UsageAggregate> {
         cache_creation_input_tokens: row.try_get("cache_creation_input_tokens")?,
         estimated_cost_usd: row.try_get("estimated_cost_usd")?,
     })
+}
+
+fn usage_top_aggregate_from_row(row: PgRow) -> anyhow::Result<UsageTopAggregate> {
+    Ok(UsageTopAggregate {
+        key: row.try_get("key")?,
+        label: row.try_get("label")?,
+        requests: row_i64_to_usize(&row, "requests")?,
+        error_requests: row_i64_to_usize(&row, "error_requests")?,
+        total_input_tokens: row.try_get("total_input_tokens")?,
+        billable_input_tokens: row.try_get("billable_input_tokens")?,
+        total_output_tokens: row.try_get("total_output_tokens")?,
+        total_cache_read_input_tokens: row.try_get("total_cache_read_input_tokens")?,
+        total_cache_creation_input_tokens: row.try_get("total_cache_creation_input_tokens")?,
+        total_estimated_cost_usd: row.try_get("total_estimated_cost_usd")?,
+    })
+}
+
+fn usage_ratio(part: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        part as f64 / total as f64
+    }
+}
+
+fn token_ratio(part: i64, total: i64) -> f64 {
+    if total <= 0 {
+        0.0
+    } else {
+        part.max(0) as f64 / total as f64
+    }
+}
+
+fn usage_status_label(value: &str) -> String {
+    match value {
+        "success" => "成功",
+        "error" => "错误",
+        "stream_error" => "流错误",
+        "upstream_timeout" => "上游超时",
+        "client_dropped" => "客户端断开",
+        _ => value,
+    }
+    .to_string()
+}
+
+fn usage_source_label(value: &str) -> String {
+    match value {
+        "upstream_metadata" => "上游 metadata",
+        "local_prompt_cache" => "本地 prompt cache",
+        "context_estimate" => "上下文估算",
+        "request_estimate" => "请求估算",
+        "none" => "无缓存",
+        _ => value,
+    }
+    .to_string()
 }
 
 fn runtime_state_from_row(row: &PgRow) -> anyhow::Result<CredentialRuntimeStateRow> {
@@ -2745,6 +3247,25 @@ mod tests {
         assert_eq!(summary.realtime.billable_tpm, 60.0);
         assert_eq!(summary.top_credentials[0].key, "7");
         assert_eq!(summary.top_conversations.len(), 2);
+
+        let dashboard = usage_store
+            .dashboard(Some("Asia/Shanghai"), 15)
+            .await
+            .unwrap();
+        let today = dashboard
+            .windows
+            .iter()
+            .find(|window| window.key == "today")
+            .unwrap();
+        assert_eq!(today.summary.total_requests, 2);
+        assert_eq!(today.summary.error_requests, 1);
+        assert_eq!(today.summary.high_cache_requests, 1);
+        assert_eq!(today.summary.status_breakdown.len(), 2);
+        assert_eq!(dashboard.series.hourly_24h.len(), 24);
+        assert_eq!(dashboard.series.daily_7d.len(), 7);
+        assert_eq!(dashboard.top.models.len(), 2);
+        assert_eq!(dashboard.top.credentials[0].key, "7");
+        assert_eq!(dashboard.top.errors[0].requests, 1);
 
         let cost_summary = usage_store.credential_cost_summary().await.unwrap();
         let cost_summary = cost_summary.get(&7).unwrap();

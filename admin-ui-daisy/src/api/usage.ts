@@ -7,6 +7,7 @@ import type {
   ModelPricingStatus,
   SuccessResponse,
   UpsertManualModelRequest,
+  UsageDashboardResponse,
   UsageRecordsPageQuery,
   UsageRecordsPageResult,
   UsageRecordsQuery,
@@ -26,6 +27,13 @@ export async function getUsageRecordsPage(query: UsageRecordsPageQuery): Promise
 
 export async function getUsageSummary(): Promise<UsageSummary> {
   const { data } = await api.get<UsageSummary>('/usage-summary')
+  return data
+}
+
+export async function getUsageDashboard(timezone = 'Asia/Shanghai'): Promise<UsageDashboardResponse> {
+  const { data } = await api.get<UsageDashboardResponse>('/usage-dashboard', {
+    params: { timezone },
+  })
   return data
 }
 

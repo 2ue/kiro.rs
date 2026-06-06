@@ -405,6 +405,7 @@ async fn main() {
         config.compat_profile,
         config.expose_proxy_warnings,
         config.payload_guard_enabled,
+        config.payload_guard_mode,
         config.payload_guard_max_bytes,
         config.payload_guard_trim_history,
         config.payload_shaping,
@@ -487,6 +488,7 @@ async fn main() {
         tracing::info!("  GET  /api/admin/usage-records");
         tracing::info!("  GET  /api/admin/usage-records-paged");
         tracing::info!("  GET  /api/admin/usage-summary");
+        tracing::info!("  GET  /api/admin/usage-dashboard");
         tracing::info!("  GET  /api/admin/model-pricing");
         tracing::info!("  POST /api/admin/model-pricing/sync");
         tracing::info!("  POST /api/admin/credentials/:index/disabled");

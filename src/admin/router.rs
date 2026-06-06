@@ -12,13 +12,13 @@ use super::{
         force_refresh_token, get_access_keys, get_all_credentials, get_audit_logs,
         get_credential_balance, get_credential_info, get_credentials_page, get_load_balancing_mode,
         get_model_capabilities, get_model_pricing, get_proxy_resources, get_runtime_config,
-        get_usage_records, get_usage_records_page, get_usage_summary, get_usage_writer_stats,
-        refresh_credentials_info, reset_failure_count, set_credential_concurrency,
-        set_credential_disabled, set_credential_priority, set_credential_proxy,
-        set_credential_warmup, set_load_balancing_mode, sync_model_capabilities,
-        sync_model_pricing, test_credential, update_admin_api_key, update_proxy_resource,
-        update_runtime_config, upsert_manual_model, validate_existing_credentials,
-        validate_external_credentials,
+        get_usage_dashboard, get_usage_records, get_usage_records_page, get_usage_summary,
+        get_usage_writer_stats, refresh_credentials_info, reset_failure_count,
+        set_credential_concurrency, set_credential_disabled, set_credential_priority,
+        set_credential_proxy, set_credential_warmup, set_load_balancing_mode,
+        sync_model_capabilities, sync_model_pricing, test_credential, update_admin_api_key,
+        update_proxy_resource, update_runtime_config, upsert_manual_model,
+        validate_existing_credentials, validate_external_credentials,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -91,6 +91,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/usage-records-paged", get(get_usage_records_page))
         .route("/usage-records/clear", post(clear_usage_records))
         .route("/usage-summary", get(get_usage_summary))
+        .route("/usage-dashboard", get(get_usage_dashboard))
         .route("/usage-writer-stats", get(get_usage_writer_stats))
         .route("/audit-logs", get(get_audit_logs))
         .route(

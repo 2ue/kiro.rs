@@ -5,6 +5,7 @@ import {
   getAuditLogsPage,
   getModelCapabilities,
   getModelPricing,
+  getUsageDashboard,
   getUsageRecords,
   getUsageRecordsPage,
   getUsageSummary,
@@ -39,6 +40,14 @@ export function useUsageSummary() {
   })
 }
 
+export function useUsageDashboard(timezone = 'Asia/Shanghai') {
+  return useQuery({
+    queryKey: ['usage-dashboard', timezone],
+    queryFn: () => getUsageDashboard(timezone),
+    refetchInterval: 10000,
+  })
+}
+
 export function useClearUsageRecords() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -47,6 +56,7 @@ export function useClearUsageRecords() {
       queryClient.invalidateQueries({ queryKey: ['usage-records'] })
       queryClient.invalidateQueries({ queryKey: ['usage-records-page'] })
       queryClient.invalidateQueries({ queryKey: ['usage-summary'] })
+      queryClient.invalidateQueries({ queryKey: ['usage-dashboard'] })
     },
   })
 }

@@ -82,6 +82,12 @@ pub struct UsageRecordsPageQueryParams {
     pub until: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDashboardQueryParams {
+    pub timezone: Option<String>,
+}
+
 impl UsageRecordsQueryParams {
     fn into_query(self) -> Result<UsageRecordQuery, String> {
         Ok(UsageRecordQuery {
@@ -625,6 +631,18 @@ pub async fn get_usage_records_page(
 /// 获取请求级 usage 汇总
 pub async fn get_usage_summary(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.get_usage_summary())
+}
+
+/// GET /api/admin/usage-dashboard
+/// 获取 PgSQL 聚合的 usage 仪表盘数据。
+pub async fn get_usage_dashboard(
+    State(state): State<AdminState>,
+    Query(params): Query<UsageDashboardQueryParams>,
+) -> impl IntoResponse {
+    match state.service.get_usage_dashboard(params.timezone) {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
 /// GET /api/admin/usage-writer-stats

@@ -335,11 +335,21 @@ export function CredentialCard({
               <MetaItem
                 label="并发"
                 value={
-                  <button type="button" className="flex items-center gap-1 text-primary hover:underline" onClick={() => setEditingConcurrency(true)}>
-                    <Gauge className="h-3 w-3" />
-                    {credential.inFlightRequests}
-                    {credential.maxConcurrentRequests > 0 ? `/${credential.maxConcurrentRequests}` : ' / 不限'}
-                    <span className="text-xs text-base-content/45">· {concurrencyLimitLabel(credential)}</span>
+                  <button
+                    type="button"
+                    className="group block min-w-0 text-left text-primary hover:underline"
+                    onClick={() => setEditingConcurrency(true)}
+                  >
+                    <span className="flex min-w-0 items-center gap-1 font-semibold leading-5">
+                      <Gauge className="h-3 w-3 shrink-0" />
+                      <span className="whitespace-nowrap">
+                        {credential.inFlightRequests}
+                        {credential.maxConcurrentRequests > 0 ? `/${credential.maxConcurrentRequests}` : ' / 不限'}
+                      </span>
+                    </span>
+                    <span className="mt-0.5 block truncate text-xs font-medium leading-4 text-base-content/45 group-hover:text-primary">
+                      {concurrencyLimitLabel(credential)}
+                    </span>
                   </button>
                 }
                 error={credential.maxConcurrentRequests > 0 && credential.inFlightRequests >= credential.maxConcurrentRequests}

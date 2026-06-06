@@ -13,7 +13,8 @@ use axum::{
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
-    CompatProfile, PayloadShapingConfig, PromptCacheSimulationMode, ReportedUsageConfig,
+    CompatProfile, PayloadGuardMode, PayloadShapingConfig, PromptCacheSimulationMode,
+    ReportedUsageConfig,
 };
 
 use super::{
@@ -61,6 +62,8 @@ pub struct AppState {
     pub expose_proxy_warnings: bool,
     /// 是否启用发送 Kiro 上游前的最终 payload 防护
     pub payload_guard_enabled: bool,
+    /// payload guard 大小裁剪触发模式
+    pub payload_guard_mode: PayloadGuardMode,
     /// Kiro 上游请求 JSON body 最大字节数
     pub payload_guard_max_bytes: usize,
     /// payload 超限时是否裁剪旧历史
@@ -100,6 +103,7 @@ impl AppState {
             compat_profile,
             expose_proxy_warnings: expose_proxy_warnings || compat_profile.is_debug(),
             payload_guard_enabled: true,
+            payload_guard_mode: PayloadGuardMode::Preemptive,
             payload_guard_max_bytes: 450 * 1024,
             payload_guard_trim_history: true,
             payload_shaping: PayloadShapingConfig::default(),
@@ -148,11 +152,13 @@ impl AppState {
     pub fn with_payload_guard(
         mut self,
         enabled: bool,
+        mode: PayloadGuardMode,
         max_bytes: usize,
         trim_history: bool,
         payload_shaping: PayloadShapingConfig,
     ) -> Self {
         self.payload_guard_enabled = enabled;
+        self.payload_guard_mode = mode;
         self.payload_guard_max_bytes = max_bytes;
         self.payload_guard_trim_history = trim_history;
         self.payload_shaping = payload_shaping;

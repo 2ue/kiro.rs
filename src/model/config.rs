@@ -563,6 +563,24 @@ impl CompatProfile {
     }
 }
 
+/// Kiro payload guard 的大小裁剪触发模式。
+///
+/// `preemptive` 保持原有行为：发送上游前只要超过 `payloadGuardMaxBytes`
+/// 就执行配置的内容整形和裁剪。`on_too_long` 首次请求只做协议修复；
+/// 只有上游返回输入过长类错误后，才按 `payloadGuardMaxBytes` 裁剪并重试一次。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PayloadGuardMode {
+    Preemptive,
+    OnTooLong,
+}
+
+impl Default for PayloadGuardMode {
+    fn default() -> Self {
+        Self::Preemptive
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PostgresConfig {
@@ -795,6 +813,10 @@ pub struct Config {
     /// 并修复 Kiro 容易返回 `400 Improperly formed request` 的工具配对边界。
     #[serde(default = "default_payload_guard_enabled")]
     pub payload_guard_enabled: bool,
+
+    /// payload guard 大小裁剪触发模式。
+    #[serde(default = "default_payload_guard_mode")]
+    pub payload_guard_mode: PayloadGuardMode,
 
     /// Kiro 上游请求 JSON body 最大字节数。默认使用保守阈值 450 KiB；`0` 表示不限制大小但仍执行协议修复。
     #[serde(default = "default_payload_guard_max_bytes")]
@@ -1109,6 +1131,10 @@ fn default_payload_guard_enabled() -> bool {
     true
 }
 
+fn default_payload_guard_mode() -> PayloadGuardMode {
+    PayloadGuardMode::Preemptive
+}
+
 fn default_payload_guard_max_bytes() -> usize {
     450 * 1024
 }
@@ -1268,6 +1294,7 @@ impl Default for Config {
             compression: CompressionConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
             payload_guard_enabled: default_payload_guard_enabled(),
+            payload_guard_mode: default_payload_guard_mode(),
             payload_guard_max_bytes: default_payload_guard_max_bytes(),
             payload_guard_trim_history: default_payload_guard_trim_history(),
             load_balancing_mode: default_load_balancing_mode(),
@@ -1391,6 +1418,7 @@ mod tests {
         assert_eq!(config.credential_warmup_selection_percent, 5);
         assert_eq!(config.credential_warmup_max_selection_percent, 50);
         assert!(config.payload_guard_enabled);
+        assert_eq!(config.payload_guard_mode, PayloadGuardMode::Preemptive);
         assert_eq!(config.payload_guard_max_bytes, 450 * 1024);
         assert!(config.payload_guard_trim_history);
         assert!(config.payload_shaping.enabled);

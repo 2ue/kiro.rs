@@ -23,6 +23,7 @@ import { storage } from '@/lib/storage'
 import type {
   AccessKeysResponse,
   CompatProfile,
+  PayloadGuardMode,
   ReportedUsageFieldMode,
   ReportedUsageFieldPolicy,
   ReportedUsagePathPolicy,
@@ -618,6 +619,16 @@ export function ConfigPanel() {
 
   const payloadSizeLimitEnabled = draft.payloadGuardEnabled && draft.payloadGuardMaxBytes > 0
   const payloadShapingBranchEnabled = payloadSizeLimitEnabled && draft.payloadShaping.enabled
+  const payloadGuardMode = draft.payloadGuardMode ?? 'preemptive'
+  const payloadGuardRetryMode = payloadGuardMode === 'on_too_long'
+  const payloadConditionTitle = payloadGuardRetryMode
+    ? '仅在上游返回输入过长后重试时执行'
+    : '仅当发送前请求体超过上方阈值时执行'
+  const payloadConditionDescription = payloadSizeLimitEnabled
+    ? payloadGuardRetryMode
+      ? '第一次上游请求只做协议修复和字节统计；只有返回输入过长类错误时，才按 payloadGuardMaxBytes 裁剪并重试一次。'
+      : '这些配置会在发送上游前判断最终 Kiro JSON body 是否大于 payloadGuardMaxBytes；小请求不会被截断或整形。'
+    : '当前 payloadGuardMaxBytes 为 0 或 Payload 防护关闭，因此这些按大小触发的历史整形、历史裁剪和错误后裁剪重试都不会运行。'
 
   if (config.isLoading) return <div className="py-10 text-center text-base-content/60">加载中...</div>
   if (config.error) return <ErrorState text={extractErrorMessage(config.error)} />
@@ -702,7 +713,7 @@ export function ConfigPanel() {
             <ConfigGroup
               icon={<Wand2 className="h-4 w-4" />}
               title="请求压缩与 Payload 防护"
-              description="区分每次请求都会执行的全局处理，以及只有超过本地 JSON body 字节阈值后才会触发的条件分支。"
+              description="区分每次请求都会执行的全局处理，以及按配置触发的大小裁剪、历史裁剪和兜底处理。"
             >
               <ImpactGroupHeader
                 label="全局影响"
@@ -711,25 +722,27 @@ export function ConfigPanel() {
               />
               <ToggleField title="启用请求压缩" description="控制是否对上游请求做压缩处理。关闭时不会改变请求内容。" checked={draft.compressionEnabled} onChange={(compressionEnabled) => setDraft((prev) => ({ ...prev, compressionEnabled }))} />
               <ToggleField title="仅压缩空白字符" description="控制压缩时是否只处理多余空白。这是当前推荐的低风险压缩方式。" checked={draft.whitespaceCompression} disabled={!draft.compressionEnabled} onChange={(whitespaceCompression) => setDraft((prev) => ({ ...prev, whitespaceCompression }))} />
-              <ToggleField title="启用 Kiro Payload 防护" description="发送上游前按真实 JSON 字节数检查请求，并修复空 toolUses、孤立 tool_result 等 Kiro 容易拒绝的形态。" checked={draft.payloadGuardEnabled} onChange={(payloadGuardEnabled) => setDraft((prev) => ({ ...prev, payloadGuardEnabled }))} />
+              <ToggleField title="启用 Kiro Payload 防护" description="按真实 Kiro JSON 字节数统计请求，并修复空 toolUses、孤立 tool_result 等 Kiro 容易拒绝的形态。" checked={draft.payloadGuardEnabled} onChange={(payloadGuardEnabled) => setDraft((prev) => ({ ...prev, payloadGuardEnabled }))} />
+              <FieldLabel title="大小裁剪触发模式" description="发送前预裁剪保持当前行为；上游过长后裁剪重试会先原样请求，只在输入过长类 400 后按阈值裁剪并重试一次。">
+                <Select bordered size="sm" className="w-full" value={payloadGuardMode} disabled={!draft.payloadGuardEnabled} onChange={(event) => setDraft((prev) => ({ ...prev, payloadGuardMode: event.target.value as PayloadGuardMode }))}>
+                  <Select.Option value="preemptive">发送前预裁剪</Select.Option>
+                  <Select.Option value="on_too_long">上游过长后裁剪重试</Select.Option>
+                </Select>
+              </FieldLabel>
               <ImpactGroupHeader
                 label="条件阈值"
                 title="控制后续条件分支是否有机会触发"
-                description="payloadGuardMaxBytes 是本地超预算阈值，不是模型上下文窗口。填 0 表示关闭所有按大小触发的内容整形、历史裁剪和当前内容兜底裁剪，但仍保留上面的每次请求协议修复。"
+                description="payloadGuardMaxBytes 是本地裁剪目标阈值，不是模型上下文窗口。填 0 表示关闭所有按大小触发的内容整形、历史裁剪、当前内容兜底裁剪和错误后裁剪重试，但仍保留上面的协议修复。"
               />
-              <NumberField title="Kiro Payload 超预算阈值" description="按最终发送到 Kiro 的 JSON body 字节数计算。默认 460800 bytes；填 0 时下方所有“条件分支”和“兜底分支”配置都不会触发。" value={draft.payloadGuardMaxBytes} min={0} suffix="bytes" onChange={(payloadGuardMaxBytes) => setDraft((prev) => ({ ...prev, payloadGuardMaxBytes }))} />
+              <NumberField title="Kiro Payload 裁剪目标阈值" description="按最终发送到 Kiro 的 JSON body 字节数计算。默认 460800 bytes；填 0 时下方所有“条件分支”和“兜底分支”配置都不会触发。" value={draft.payloadGuardMaxBytes} min={0} suffix="bytes" onChange={(payloadGuardMaxBytes) => setDraft((prev) => ({ ...prev, payloadGuardMaxBytes }))} />
               <ImpactGroupHeader
                 label="条件分支"
-                title="仅当请求体超过上方阈值时执行"
-                description={
-                  payloadSizeLimitEnabled
-                    ? '这些配置只有在本地序列化后的 Kiro JSON body 大于 payloadGuardMaxBytes 时才会运行；小请求不会被截断或整形。'
-                    : '当前 payloadGuardMaxBytes 为 0 或 Payload 防护关闭，因此这些按大小触发的历史整形和历史裁剪不会运行。'
-                }
+                title={payloadConditionTitle}
+                description={payloadConditionDescription}
                 muted={!payloadSizeLimitEnabled}
               />
-              <ToggleField title="超限裁剪旧历史" description="请求超过超预算阈值后，优先裁剪最旧历史；关闭后不会裁 history，仍超限会继续透传给 Kiro。" checked={draft.payloadGuardTrimHistory} disabled={!payloadSizeLimitEnabled} onChange={(payloadGuardTrimHistory) => setDraft((prev) => ({ ...prev, payloadGuardTrimHistory }))} />
-              <ToggleField title="启用 Payload 内容整形" description="只在请求超过超预算阈值后生效，默认只处理旧历史、历史 thinking、历史 WebFetch 和工具定义描述。" checked={draft.payloadShaping.enabled} disabled={!payloadSizeLimitEnabled} onChange={(enabled) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, enabled } }))} />
+              <ToggleField title="超限裁剪旧历史" description="按当前模式触发大小裁剪时，优先裁剪最旧历史；关闭后不会裁 history，仍超限会继续透传给 Kiro。" checked={draft.payloadGuardTrimHistory} disabled={!payloadSizeLimitEnabled} onChange={(payloadGuardTrimHistory) => setDraft((prev) => ({ ...prev, payloadGuardTrimHistory }))} />
+              <ToggleField title="启用 Payload 内容整形" description="按当前模式触发大小裁剪时生效，默认只处理旧历史、历史 thinking、历史 WebFetch 和工具定义描述。" checked={draft.payloadShaping.enabled} disabled={!payloadSizeLimitEnabled} onChange={(enabled) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, enabled } }))} />
               <ToggleField title="截断历史工具结果" description="只截断历史 tool_result，保留头尾和省略说明；当前合法 tool_result 默认不截断。" checked={draft.payloadShaping.truncateHistoricalToolResults} disabled={!payloadShapingBranchEnabled} onChange={(truncateHistoricalToolResults) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, truncateHistoricalToolResults } }))} />
               <NumberField title="历史工具结果保留字符" description="单个历史 tool_result 的通用头尾保留预算。默认 8000 字符；WebFetch 会先走专项去噪。" value={draft.payloadShaping.historicalToolResultMaxChars} disabled={!payloadShapingBranchEnabled} min={0} suffix="chars" onChange={(historicalToolResultMaxChars) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, historicalToolResultMaxChars } }))} />
               <ToggleField title="移除历史 thinking" description="只移除旧 assistant 历史里的 thinking 标签内容，不处理当前请求内容。" checked={draft.payloadShaping.discardHistoricalThinking} disabled={!payloadShapingBranchEnabled} onChange={(discardHistoricalThinking) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, discardHistoricalThinking } }))} />

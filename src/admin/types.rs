@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::anthropic::pricing::ModelPricing;
 use crate::model::config::{
-    CompatProfile, CompressionConfig, PayloadShapingConfig, PayloadShapingConfigPatch,
-    ReportedUsageConfig,
+    CompatProfile, CompressionConfig, PayloadGuardMode, PayloadShapingConfig,
+    PayloadShapingConfigPatch, ReportedUsageConfig,
 };
 
 // ============ 凭据状态 ============
@@ -627,6 +627,7 @@ pub struct RuntimeConfigResponse {
     pub compression_enabled: bool,
     pub whitespace_compression: bool,
     pub payload_guard_enabled: bool,
+    pub payload_guard_mode: PayloadGuardMode,
     pub payload_guard_max_bytes: u64,
     pub payload_guard_trim_history: bool,
     pub payload_shaping: PayloadShapingConfig,
@@ -707,6 +708,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub whitespace_compression: bool,
     #[serde(default)]
     pub payload_guard_enabled: Option<bool>,
+    #[serde(default)]
+    pub payload_guard_mode: Option<PayloadGuardMode>,
     #[serde(default)]
     pub payload_guard_max_bytes: Option<u64>,
     #[serde(default)]
