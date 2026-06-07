@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::anthropic::types::Model;
 use crate::kiro::model::available_models::KiroAvailableModel;
-use crate::model::config::ModelResolutionMode;
+use crate::model::config::{ModelMappingConfig, ModelMappingRuleKind, ModelResolutionMode};
 
 pub const SEED_SOURCE: &str = "kiro-upstream-seed";
 pub const KIRO_SOURCE: &str = "kiro-list-available-models";
@@ -154,10 +154,11 @@ impl ModelCapabilitiesCatalog {
             if models.contains_key(&model.id) {
                 continue;
             }
-            if resolve_model_with_catalog(&model.id, &upstream_ids)
-                .upstream_model
-                .is_some()
-            {
+            let resolution = resolve_model_with_catalog(&model.id, &upstream_ids);
+            if !matches!(
+                resolution.source,
+                ModelResolutionSource::Unsupported | ModelResolutionSource::PassThrough
+            ) {
                 models.insert(model.id.clone(), model);
             }
         }
@@ -185,14 +186,25 @@ impl ModelCapabilitiesCatalog {
             .and_then(|item| item.supports_prompt_caching)
     }
 
+    #[cfg(test)]
     pub fn resolve_model(&self, requested_model: &str) -> ModelResolution {
         self.resolve_model_with_mode(requested_model, ModelResolutionMode::Compatible)
     }
 
+    #[cfg(test)]
     pub fn resolve_model_with_mode(
         &self,
         requested_model: &str,
         mode: ModelResolutionMode,
+    ) -> ModelResolution {
+        self.resolve_model_with_mapping(requested_model, mode, &ModelMappingConfig::default())
+    }
+
+    pub fn resolve_model_with_mapping(
+        &self,
+        requested_model: &str,
+        mode: ModelResolutionMode,
+        model_mapping: &ModelMappingConfig,
     ) -> ModelResolution {
         let inner = self.inner.read();
         let models = inner.models.keys().cloned().collect::<Vec<_>>();
@@ -202,7 +214,12 @@ impl ModelCapabilitiesCatalog {
             .filter(|item| is_manual_source(item.source.as_deref()))
             .map(|item| item.model.clone())
             .collect::<std::collections::HashSet<_>>();
-        let mut resolution = resolve_model_with_catalog_and_mode(requested_model, &models, mode);
+        let mut resolution = resolve_model_with_catalog_mapping_and_mode(
+            requested_model,
+            &models,
+            mode,
+            model_mapping,
+        );
         if let Some(upstream_model) = resolution.upstream_model.as_deref() {
             if manual_models.contains(upstream_model) {
                 resolution.source = ModelResolutionSource::Manual;
@@ -312,6 +329,7 @@ pub enum ModelResolutionSource {
     Manual,
     Alias,
     FamilyNormalized,
+    PassThrough,
     Unsupported,
 }
 
@@ -322,6 +340,7 @@ impl ModelResolutionSource {
             Self::Manual => "manual",
             Self::Alias => "alias",
             Self::FamilyNormalized => "family_normalized",
+            Self::PassThrough => "pass_through",
             Self::Unsupported => "unsupported",
         }
     }
@@ -372,6 +391,15 @@ impl ModelResolution {
             upstream_model: None,
             source: ModelResolutionSource::Unsupported,
             note: None,
+        }
+    }
+
+    pub fn pass_through(requested_model: String) -> Self {
+        Self {
+            requested_model: requested_model.clone(),
+            upstream_model: Some(requested_model),
+            source: ModelResolutionSource::PassThrough,
+            note: Some("no mapping rule matched; passing requested model through".to_string()),
         }
     }
 
@@ -530,10 +558,25 @@ pub fn resolve_model_with_catalog_and_mode(
     upstream_models: &[String],
     mode: ModelResolutionMode,
 ) -> ModelResolution {
+    resolve_model_with_catalog_mapping_and_mode(
+        requested_model,
+        upstream_models,
+        mode,
+        &ModelMappingConfig::default(),
+    )
+}
+
+pub fn resolve_model_with_catalog_mapping_and_mode(
+    requested_model: &str,
+    upstream_models: &[String],
+    mode: ModelResolutionMode,
+    model_mapping: &ModelMappingConfig,
+) -> ModelResolution {
     let requested = normalize_model_id(requested_model);
     if requested.is_empty() {
         return ModelResolution::unsupported(requested);
     }
+    let model_mapping = model_mapping.clone().normalized();
 
     let mut available: std::collections::HashSet<String> = upstream_models
         .iter()
@@ -552,6 +595,14 @@ pub fn resolve_model_with_catalog_and_mode(
         return ModelResolution::unsupported(requested);
     }
 
+    if !model_mapping.enabled {
+        return ModelResolution::pass_through(requested);
+    }
+
+    if !model_mapping.auto_generate_rules && model_mapping.rules.is_empty() {
+        return ModelResolution::pass_through(requested);
+    }
+
     let one_m_base = strip_model_1m_suffix(&requested);
     if one_m_base != requested && available.contains(&one_m_base) {
         return ModelResolution::resolved(requested, one_m_base, ModelResolutionSource::Alias);
@@ -565,20 +616,65 @@ pub fn resolve_model_with_catalog_and_mode(
         return ModelResolution::resolved(requested, base, ModelResolutionSource::Alias);
     }
 
-    if let Some(alias) = explicit_model_alias_candidates(&base)
-        .and_then(|candidates| pick_available(&available, &candidates))
-    {
-        return ModelResolution::resolved(requested, alias, ModelResolutionSource::Alias);
+    if let Some(target) = pick_configured_mapping_rule(
+        &model_mapping,
+        &requested,
+        &base,
+        &[ModelMappingRuleKind::VersionEquivalent],
+    ) {
+        return ModelResolution::resolved(requested, target, ModelResolutionSource::Alias);
     }
 
-    if let Some(candidate) = explicit_model_alias_families(&base)
-        .and_then(|families| pick_family_available(&available, &families))
+    if let Some(candidate) = model_mapping
+        .auto_generate_rules
+        .then(|| pick_version_equivalent_available(&available, &base, requested_thinking))
+        .flatten()
     {
         return ModelResolution::resolved(requested, candidate, ModelResolutionSource::Alias);
     }
 
+    if let Some(target) = pick_configured_mapping_rule(
+        &model_mapping,
+        &requested,
+        &base,
+        &[ModelMappingRuleKind::Alias],
+    ) {
+        return ModelResolution::resolved(requested, target, ModelResolutionSource::Alias);
+    }
+
+    if let Some(candidate) = explicit_model_alias_families(&base)
+        .and_then(|families| pick_family_available(&available, &families))
+        .filter(|_| model_mapping.auto_generate_rules)
+    {
+        return ModelResolution::resolved(requested, candidate, ModelResolutionSource::Alias);
+    }
+
+    if let Some(alias) = explicit_model_alias_candidates(&base)
+        .and_then(|candidates| pick_available(&available, &candidates))
+        .filter(|_| model_mapping.auto_generate_rules)
+    {
+        return ModelResolution::resolved(requested, alias, ModelResolutionSource::Alias);
+    }
+
     if !mode.allows_family_fallback() {
-        return ModelResolution::unsupported(requested);
+        return ModelResolution::pass_through(requested);
+    }
+
+    if let Some(target) = pick_configured_mapping_rule(
+        &model_mapping,
+        &requested,
+        &base,
+        &[ModelMappingRuleKind::Fallback],
+    ) {
+        return ModelResolution::resolved(
+            requested,
+            target,
+            ModelResolutionSource::FamilyNormalized,
+        );
+    }
+
+    if is_explicit_claude_minor_version(&base) || !model_mapping.auto_generate_rules {
+        return ModelResolution::pass_through(requested);
     }
 
     if let Some(candidate) = family_model_candidates(&base)
@@ -601,7 +697,7 @@ pub fn resolve_model_with_catalog_and_mode(
         );
     }
 
-    ModelResolution::unsupported(requested)
+    ModelResolution::pass_through(requested)
 }
 
 fn explicit_model_alias_candidates(model: &str) -> Option<Vec<&'static str>> {
@@ -700,6 +796,140 @@ fn explicit_model_alias_candidates(model: &str) -> Option<Vec<&'static str>> {
         ]),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClaudeMinorVersion {
+    family: &'static str,
+    major: u32,
+    minor: u32,
+    uses_dot_minor: bool,
+    has_date_suffix: bool,
+}
+
+fn is_explicit_claude_minor_version(model: &str) -> bool {
+    parse_claude_minor_version(model).is_some()
+}
+
+fn pick_configured_mapping_rule(
+    model_mapping: &ModelMappingConfig,
+    requested: &str,
+    base: &str,
+    kinds: &[ModelMappingRuleKind],
+) -> Option<String> {
+    model_mapping
+        .rules
+        .iter()
+        .find(|rule| {
+            rule.enabled
+                && kinds.contains(&rule.kind)
+                && (rule.source == requested || rule.source == base)
+        })
+        .map(|rule| rule.target.clone())
+}
+
+fn pick_version_equivalent_available(
+    available: &std::collections::HashSet<String>,
+    requested_base: &str,
+    requested_thinking: bool,
+) -> Option<String> {
+    let requested_version = parse_claude_minor_version(requested_base)?;
+    let mut candidates = available
+        .iter()
+        .filter_map(|candidate| {
+            let candidate_version = parse_claude_minor_version(candidate)?;
+            (candidate_version.family == requested_version.family
+                && candidate_version.major == requested_version.major
+                && candidate_version.minor == requested_version.minor)
+                .then(|| (candidate.clone(), candidate_version))
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.sort_by(|(a, a_version), (b, b_version)| {
+        version_equivalent_score(a, *a_version, requested_thinking)
+            .cmp(&version_equivalent_score(b, *b_version, requested_thinking))
+            .then_with(|| a.cmp(b))
+    });
+    candidates.pop().map(|(candidate, _)| candidate)
+}
+
+fn version_equivalent_score(
+    model: &str,
+    version: ClaudeMinorVersion,
+    requested_thinking: bool,
+) -> (bool, bool, bool, bool) {
+    let candidate_thinking = model.ends_with("-thinking");
+    (
+        candidate_thinking == requested_thinking,
+        !version.has_date_suffix,
+        version.uses_dot_minor,
+        !candidate_thinking,
+    )
+}
+
+fn parse_claude_minor_version(model: &str) -> Option<ClaudeMinorVersion> {
+    let (base, _) = strip_model_compat_suffixes(model);
+    for family in ["opus", "sonnet", "haiku"] {
+        let prefix = format!("claude-{}-", family);
+        if let Some(rest) = base.strip_prefix(&prefix) {
+            return parse_claude_minor_version_rest(family, rest);
+        }
+    }
+    None
+}
+
+fn parse_claude_minor_version_rest(family: &'static str, rest: &str) -> Option<ClaudeMinorVersion> {
+    let (major, rest) = take_leading_u32(rest)?;
+    if let Some(rest) = rest.strip_prefix('.') {
+        let (minor, rest) = take_leading_u32(rest)?;
+        return Some(ClaudeMinorVersion {
+            family,
+            major,
+            minor,
+            uses_dot_minor: true,
+            has_date_suffix: has_date_suffix(rest),
+        });
+    }
+
+    let rest = rest.strip_prefix('-')?;
+    let minor_digits = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if minor_digits.is_empty() || minor_digits.len() > 3 {
+        return None;
+    }
+    let minor = minor_digits.parse::<u32>().ok()?;
+    let rest = &rest[minor_digits.len()..];
+    Some(ClaudeMinorVersion {
+        family,
+        major,
+        minor,
+        uses_dot_minor: false,
+        has_date_suffix: has_date_suffix(rest),
+    })
+}
+
+fn take_leading_u32(value: &str) -> Option<(u32, &str)> {
+    let digits = value
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        return None;
+    }
+    let number = digits.parse::<u32>().ok()?;
+    Some((number, &value[digits.len()..]))
+}
+
+fn has_date_suffix(rest: &str) -> bool {
+    let Some(rest) = rest.strip_prefix('-') else {
+        return false;
+    };
+    let digits = rest.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    digits >= 6
 }
 
 fn explicit_model_alias_families(model: &str) -> Option<Vec<&'static str>> {
@@ -1120,15 +1350,15 @@ mod tests {
     }
 
     #[test]
-    fn resolver_rejects_unknown_family_without_fallback() {
+    fn resolver_passes_unknown_family_through_without_mapping_match() {
         let models = seed_model_capabilities()
             .into_iter()
             .map(|item| item.model)
             .collect::<Vec<_>>();
 
         let result = resolve_model_with_catalog("gpt-4o", &models);
-        assert_eq!(result.source, ModelResolutionSource::Unsupported);
-        assert!(result.upstream_model.is_none());
+        assert_eq!(result.source, ModelResolutionSource::PassThrough);
+        assert_eq!(result.upstream_model.as_deref(), Some("gpt-4o"));
     }
 
     #[test]
@@ -1149,6 +1379,176 @@ mod tests {
             alternate.upstream_model.as_deref(),
             Some("claude-opus-4-7-thinking")
         );
+    }
+
+    #[test]
+    fn resolver_matches_synced_dot_minor_model_from_dash_request() {
+        let models = vec!["claude-opus-4.5".to_string(), "claude-opus-4.8".to_string()];
+
+        let result = resolve_model_with_catalog("claude-opus-4-8", &models);
+
+        assert_eq!(result.source, ModelResolutionSource::Alias);
+        assert_eq!(result.upstream_model.as_deref(), Some("claude-opus-4.8"));
+    }
+
+    #[test]
+    fn resolver_matches_future_synced_minor_versions_without_hardcoded_branches() {
+        let models = vec![
+            "claude-opus-4.5".to_string(),
+            "claude-opus-4.9".to_string(),
+            "claude-sonnet-4.10".to_string(),
+        ];
+
+        let opus = resolve_model_with_catalog("claude-opus-4-9", &models);
+        assert_eq!(opus.source, ModelResolutionSource::Alias);
+        assert_eq!(opus.upstream_model.as_deref(), Some("claude-opus-4.9"));
+
+        let sonnet = resolve_model_with_catalog("claude-sonnet-4-10", &models);
+        assert_eq!(sonnet.source, ModelResolutionSource::Alias);
+        assert_eq!(sonnet.upstream_model.as_deref(), Some("claude-sonnet-4.10"));
+    }
+
+    #[test]
+    fn resolver_aliases_pick_highest_synced_family_model_before_static_candidates() {
+        let models = vec![
+            "claude-opus-4.7".to_string(),
+            "claude-opus-4.8".to_string(),
+            "claude-sonnet-4.6".to_string(),
+        ];
+
+        let opus = resolve_model_with_catalog("opus", &models);
+        assert_eq!(opus.source, ModelResolutionSource::Alias);
+        assert_eq!(opus.upstream_model.as_deref(), Some("claude-opus-4.8"));
+
+        let default = resolve_model_with_catalog("default", &models);
+        assert_eq!(default.source, ModelResolutionSource::Alias);
+        assert_eq!(default.upstream_model.as_deref(), Some("claude-opus-4.8"));
+    }
+
+    #[test]
+    fn resolver_preserves_thinking_preference_for_version_equivalent_models() {
+        let models = vec![
+            "claude-opus-4.8".to_string(),
+            "claude-opus-4.8-thinking".to_string(),
+        ];
+
+        let result = resolve_model_with_catalog("claude-opus-4-8-thinking[1m]", &models);
+
+        assert_eq!(result.source, ModelResolutionSource::Alias);
+        assert_eq!(
+            result.upstream_model.as_deref(),
+            Some("claude-opus-4.8-thinking")
+        );
+    }
+
+    #[test]
+    fn resolver_does_not_downgrade_explicit_minor_versions_to_older_family_models() {
+        let models = vec!["claude-opus-4.5".to_string(), "claude-opus-4.6".to_string()];
+
+        let result = resolve_model_with_catalog("claude-opus-4-8", &models);
+
+        assert_eq!(result.source, ModelResolutionSource::PassThrough);
+        assert_eq!(result.upstream_model.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn exact_only_still_requires_literal_upstream_model_ids() {
+        let models = vec!["claude-opus-4.8".to_string()];
+
+        let result = resolve_model_with_catalog_and_mode(
+            "claude-opus-4-8",
+            &models,
+            ModelResolutionMode::ExactOnly,
+        );
+
+        assert_eq!(result.source, ModelResolutionSource::Unsupported);
+        assert!(result.upstream_model.is_none());
+    }
+
+    #[test]
+    fn disabled_mapping_passes_unmatched_models_through_without_auto_rules() {
+        let models = vec!["claude-opus-4.8".to_string()];
+        let mapping = ModelMappingConfig {
+            enabled: false,
+            auto_generate_rules: false,
+            rules: vec![],
+        };
+
+        let result = resolve_model_with_catalog_mapping_and_mode(
+            "claude-opus-4-8",
+            &models,
+            ModelResolutionMode::Compatible,
+            &mapping,
+        );
+
+        assert_eq!(result.source, ModelResolutionSource::PassThrough);
+        assert_eq!(result.upstream_model.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn enabled_mapping_without_rules_or_auto_generation_only_keeps_exact_matches() {
+        let models = vec!["claude-opus-4.8".to_string()];
+        let mapping = ModelMappingConfig {
+            enabled: true,
+            auto_generate_rules: false,
+            rules: vec![],
+        };
+
+        let exact = resolve_model_with_catalog_mapping_and_mode(
+            "claude-opus-4.8",
+            &models,
+            ModelResolutionMode::Compatible,
+            &mapping,
+        );
+        assert_eq!(exact.source, ModelResolutionSource::ExactUpstream);
+        assert_eq!(exact.upstream_model.as_deref(), Some("claude-opus-4.8"));
+
+        let dashed = resolve_model_with_catalog_mapping_and_mode(
+            "claude-opus-4-8",
+            &models,
+            ModelResolutionMode::Compatible,
+            &mapping,
+        );
+        assert_eq!(dashed.source, ModelResolutionSource::PassThrough);
+        assert_eq!(dashed.upstream_model.as_deref(), Some("claude-opus-4-8"));
+
+        let suffixed = resolve_model_with_catalog_mapping_and_mode(
+            "claude-opus-4.8[1m]",
+            &models,
+            ModelResolutionMode::Compatible,
+            &mapping,
+        );
+        assert_eq!(suffixed.source, ModelResolutionSource::PassThrough);
+        assert_eq!(
+            suffixed.upstream_model.as_deref(),
+            Some("claude-opus-4.8[1m]")
+        );
+    }
+
+    #[test]
+    fn configured_mapping_rule_overrides_auto_fallback_rules() {
+        let models = vec!["claude-opus-4.8".to_string()];
+        let mapping = ModelMappingConfig {
+            enabled: true,
+            auto_generate_rules: false,
+            rules: vec![crate::model::config::ModelMappingRule {
+                enabled: true,
+                source: "opus".to_string(),
+                target: "claude-opus-4.8".to_string(),
+                kind: ModelMappingRuleKind::Fallback,
+                note: None,
+            }],
+        };
+
+        let result = resolve_model_with_catalog_mapping_and_mode(
+            "opus",
+            &models,
+            ModelResolutionMode::Compatible,
+            &mapping,
+        );
+
+        assert_eq!(result.source, ModelResolutionSource::FamilyNormalized);
+        assert_eq!(result.upstream_model.as_deref(), Some("claude-opus-4.8"));
     }
 
     #[test]
@@ -1244,8 +1644,11 @@ mod tests {
             &models,
             ModelResolutionMode::AliasOnly,
         );
-        assert_eq!(alias_only.source, ModelResolutionSource::Unsupported);
-        assert!(alias_only.upstream_model.is_none());
+        assert_eq!(alias_only.source, ModelResolutionSource::PassThrough);
+        assert_eq!(
+            alias_only.upstream_model.as_deref(),
+            Some("claude-sonnet-5-20270101")
+        );
     }
 
     #[test]

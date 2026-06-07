@@ -604,12 +604,27 @@ export interface AdminAuditLogPageQuery {
 
 export type CompatProfile = 'claude-code' | 'anthropic-strict' | 'debug'
 export type ModelResolutionMode = 'compatible' | 'alias_only' | 'exact_only'
+export type ModelMappingRuleKind = 'version_equivalent' | 'alias' | 'fallback'
 export type PayloadGuardMode = 'preemptive' | 'on_too_long'
 export type ExternalPoolAuthType = 'bearer' | 'x_api_key'
 export type ExternalPoolUsageProjectionMode = 'pass_through' | 'current_path_policy'
 export type ExternalPoolAutoDisablePolicy = 'inherit' | 'disabled' | 'enabled'
 
 export type ReportedUsageFieldMode = 'raw' | 'preserve' | 'sample-max' | 'sample-target'
+
+export interface ModelMappingRule {
+  enabled: boolean
+  source: string
+  target: string
+  kind: ModelMappingRuleKind
+  note?: string | null
+}
+
+export interface ModelMappingConfig {
+  enabled: boolean
+  autoGenerateRules: boolean
+  rules: ModelMappingRule[]
+}
 
 export interface ReportedUsageFieldPolicy {
   mode: ReportedUsageFieldMode
@@ -660,6 +675,8 @@ export interface ExternalPoolsConfig {
   externalPoolsEnabled: boolean
   externalPoolGlobalMaxConcurrentRequests: number
   externalPoolMaxQueuedRequests: number
+  externalPoolCapacityMode: 'fail_fast' | 'wait'
+  externalPoolDispatchMaxWaitSecs: number
   externalPoolRetryMaxAttempts: number
   externalDirectPolicyEnabled: boolean
   directExternalOnLocalMaintenance: boolean
@@ -682,6 +699,7 @@ export interface ExternalPoolsConfig {
   externalPoolAutoDisableOnQuotaExhausted: boolean
   externalPoolAutoDisableOnMisconfiguredEndpoint: boolean
   externalPoolAutoDisableFailureThreshold: number
+  externalPoolAutoDisableWindowSecs: number
   externalPoolAutoDisableDurationSecs: number
   externalPoolRateLimitCooldownSecs: number
   externalPoolServerErrorCooldownSecs: number
@@ -815,6 +833,7 @@ export interface RuntimeConfig {
   highCacheThreshold: number
   compatProfile: CompatProfile
   modelResolutionMode: ModelResolutionMode
+  modelMapping: ModelMappingConfig
   extractThinking: boolean
   exposeProxyWarnings: boolean
 }

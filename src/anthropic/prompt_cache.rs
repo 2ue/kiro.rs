@@ -102,6 +102,7 @@ impl PromptCacheTracker {
         self.build_profile_with_policy(req, total_input_tokens, false, &req.model)
     }
 
+    #[cfg(test)]
     pub fn build_high_cache_profile(
         &self,
         req: &MessagesRequest,

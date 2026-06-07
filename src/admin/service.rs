@@ -41,6 +41,7 @@ use crate::anthropic::{
 use crate::external_pool::{
     CreateExternalPoolRequest, ExternalPool, ExternalPoolManager, ExternalPoolTestResponse,
     ExternalPoolsStatusResponse, SetExternalPoolEnabledRequest, UpdateExternalPoolRequest,
+    external_pool_models_url,
 };
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::events::Event;
@@ -363,8 +364,7 @@ impl AdminService {
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
             .ok_or(AdminServiceError::NotFound { id })?;
         block_on_admin_store(async move {
-            let base_url = pool.base_url.trim_end_matches('/');
-            let url = format!("{}/v1/models", base_url);
+            let url = external_pool_models_url(&pool.base_url)?;
             let client = reqwest::Client::builder()
                 .timeout(StdDuration::from_secs(15))
                 .build()?;
@@ -1122,9 +1122,11 @@ impl AdminService {
         }
 
         let runtime_config = self.token_manager.runtime_config();
-        let model_resolution = self
-            .model_capabilities
-            .resolve_model_with_mode(model, runtime_config.model_resolution_mode);
+        let model_resolution = self.model_capabilities.resolve_model_with_mapping(
+            model,
+            runtime_config.model_resolution_mode,
+            &runtime_config.model_mapping,
+        );
         if model_resolution.source == ModelResolutionSource::Unsupported {
             return Err(AdminServiceError::InvalidCredential(format!(
                 "不支持的测试模型: {}",
@@ -1944,6 +1946,7 @@ impl AdminService {
             high_cache_threshold: config.high_cache_threshold,
             compat_profile: config.compat_profile,
             model_resolution_mode: config.model_resolution_mode,
+            model_mapping: config.model_mapping.clone().normalized(),
             extract_thinking: config.extract_thinking,
             expose_proxy_warnings: config.expose_proxy_warnings,
         }
@@ -2081,6 +2084,11 @@ impl AdminService {
         let model_resolution_mode = req
             .model_resolution_mode
             .unwrap_or(current_config.model_resolution_mode);
+        let model_mapping = req
+            .model_mapping
+            .clone()
+            .unwrap_or_else(|| current_config.model_mapping.clone())
+            .normalized();
         let extract_thinking = req
             .extract_thinking
             .unwrap_or(current_config.extract_thinking);
@@ -2280,6 +2288,7 @@ impl AdminService {
                 config.high_cache_threshold = high_cache_threshold;
                 config.compat_profile = compat_profile;
                 config.model_resolution_mode = model_resolution_mode;
+                config.model_mapping = model_mapping;
                 config.extract_thinking = extract_thinking;
                 config.expose_proxy_warnings = expose_proxy_warnings;
             })
@@ -2672,6 +2681,9 @@ fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), St
     if config.external_pool_max_queued_requests > 100_000 {
         return Err("externalPoolMaxQueuedRequests 不能大于 100000".to_string());
     }
+    if config.external_pool_dispatch_max_wait_secs > 86_400 {
+        return Err("externalPoolDispatchMaxWaitSecs 不能大于 86400".to_string());
+    }
     if config.external_pool_retry_max_attempts > 10_000 {
         return Err("externalPoolRetryMaxAttempts 不能大于 10000".to_string());
     }
@@ -2716,6 +2728,11 @@ fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), St
         || config.external_pool_auto_disable_failure_threshold > 10_000
     {
         return Err("externalPoolAutoDisableFailureThreshold 必须在 1 到 10000 之间".to_string());
+    }
+    if config.external_pool_auto_disable_window_secs == 0
+        || config.external_pool_auto_disable_window_secs > 24 * 60 * 60
+    {
+        return Err("externalPoolAutoDisableWindowSecs 必须在 1 到 86400 之间".to_string());
     }
     if config.external_pool_auto_disable_duration_secs > 365 * 24 * 60 * 60 {
         return Err("externalPoolAutoDisableDurationSecs 不能超过 365 天".to_string());

@@ -80,6 +80,7 @@ export function ExternalPoolsPanel() {
           directExternalPathRules: splitRules(pathRulesText),
           externalPoolGlobalMaxConcurrentRequests: whole(configDraft.externalPoolGlobalMaxConcurrentRequests),
           externalPoolMaxQueuedRequests: whole(configDraft.externalPoolMaxQueuedRequests),
+          externalPoolDispatchMaxWaitSecs: whole(configDraft.externalPoolDispatchMaxWaitSecs),
           externalPoolRetryMaxAttempts: whole(configDraft.externalPoolRetryMaxAttempts),
           localPoolCircuitWindowSecs: whole(configDraft.localPoolCircuitWindowSecs, 1),
           localPoolCircuitOpenAfterFailures: whole(configDraft.localPoolCircuitOpenAfterFailures, 1),
@@ -87,6 +88,7 @@ export function ExternalPoolsPanel() {
           localPoolCircuitOpenSecs: whole(configDraft.localPoolCircuitOpenSecs, 1),
           localPoolCircuitHalfOpenMaxProbes: whole(configDraft.localPoolCircuitHalfOpenMaxProbes, 1),
           externalPoolAutoDisableFailureThreshold: whole(configDraft.externalPoolAutoDisableFailureThreshold, 1),
+          externalPoolAutoDisableWindowSecs: whole(configDraft.externalPoolAutoDisableWindowSecs, 1),
           externalPoolAutoDisableDurationSecs: whole(configDraft.externalPoolAutoDisableDurationSecs),
           externalPoolRateLimitCooldownSecs: whole(configDraft.externalPoolRateLimitCooldownSecs, 1),
           externalPoolServerErrorCooldownSecs: whole(configDraft.externalPoolServerErrorCooldownSecs, 1),
@@ -169,6 +171,7 @@ export function ExternalPoolsPanel() {
   const fallbackActive = externalEnabled
   const directPolicyActive = externalEnabled && configDraft.externalDirectPolicyEnabled
   const autoDisableActive = externalEnabled && configDraft.externalPoolAutoDisableEnabled
+  const waitModeActive = externalEnabled && configDraft.externalPoolCapacityMode === 'wait'
 
   return (
     <div className="space-y-5">
@@ -187,10 +190,16 @@ export function ExternalPoolsPanel() {
           <PolicyBlock
             title="外部池调度参数"
             active={externalEnabled}
-            description="只在备用号池启用后生效，用于限制外部池自身的并发、重试和错误冷却。"
+            description="只在备用号池启用后生效。容量模式为等待时，会使用外部池独立排队；0 表示对应上限不限制。"
           >
             <div className="grid gap-3 md:grid-cols-4">
+              <SelectBox disabled={!externalEnabled} label="满并发处理" value={configDraft.externalPoolCapacityMode} onChange={(externalPoolCapacityMode) => setConfigDraft((prev) => ({ ...prev, externalPoolCapacityMode: externalPoolCapacityMode as ExternalPoolsConfig['externalPoolCapacityMode'] }))}>
+                <option value="fail_fast">立即失败</option>
+                <option value="wait">等待容量</option>
+              </SelectBox>
               <NumberBox disabled={!externalEnabled} label="外部池全局并发" value={configDraft.externalPoolGlobalMaxConcurrentRequests} onChange={(externalPoolGlobalMaxConcurrentRequests) => setConfigDraft((prev) => ({ ...prev, externalPoolGlobalMaxConcurrentRequests }))} />
+              <NumberBox disabled={!waitModeActive} label="外部池排队上限（0 不限制）" value={configDraft.externalPoolMaxQueuedRequests} onChange={(externalPoolMaxQueuedRequests) => setConfigDraft((prev) => ({ ...prev, externalPoolMaxQueuedRequests }))} />
+              <NumberBox disabled={!waitModeActive} label="最大等待秒数（0 不超时）" value={configDraft.externalPoolDispatchMaxWaitSecs} onChange={(externalPoolDispatchMaxWaitSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolDispatchMaxWaitSecs }))} />
               <NumberBox disabled={!externalEnabled} label="外部池最大重试" value={configDraft.externalPoolRetryMaxAttempts} onChange={(externalPoolRetryMaxAttempts) => setConfigDraft((prev) => ({ ...prev, externalPoolRetryMaxAttempts }))} />
               <NumberBox disabled={!externalEnabled} label="429 冷却秒数" value={configDraft.externalPoolRateLimitCooldownSecs} min={1} onChange={(externalPoolRateLimitCooldownSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolRateLimitCooldownSecs }))} />
               <NumberBox disabled={!externalEnabled} label="5xx 冷却秒数" value={configDraft.externalPoolServerErrorCooldownSecs} min={1} onChange={(externalPoolServerErrorCooldownSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolServerErrorCooldownSecs }))} />
@@ -240,6 +249,7 @@ export function ExternalPoolsPanel() {
               <ToggleRow disabled={!autoDisableActive} label="额度耗尽自动禁用" checked={configDraft.externalPoolAutoDisableOnQuotaExhausted} onChange={(externalPoolAutoDisableOnQuotaExhausted) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableOnQuotaExhausted }))} />
               <ToggleRow disabled={!autoDisableActive} label="配置错误自动禁用" checked={configDraft.externalPoolAutoDisableOnMisconfiguredEndpoint} onChange={(externalPoolAutoDisableOnMisconfiguredEndpoint) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableOnMisconfiguredEndpoint }))} />
               <NumberBox disabled={!autoDisableActive} label="自动禁用阈值" value={configDraft.externalPoolAutoDisableFailureThreshold} min={1} onChange={(externalPoolAutoDisableFailureThreshold) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableFailureThreshold }))} />
+              <NumberBox disabled={!autoDisableActive} label="自动禁用统计窗口秒数" value={configDraft.externalPoolAutoDisableWindowSecs} min={1} onChange={(externalPoolAutoDisableWindowSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableWindowSecs }))} />
               <NumberBox disabled={!autoDisableActive} label="自动禁用秒数（0 手动恢复）" value={configDraft.externalPoolAutoDisableDurationSecs} onChange={(externalPoolAutoDisableDurationSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableDurationSecs }))} />
             </div>
           </PolicyBlock>
@@ -250,7 +260,6 @@ export function ExternalPoolsPanel() {
             description="当前版本不会使用这些字段。页面保留展示但禁止编辑，避免误以为会影响调度。"
           >
             <div className="grid gap-3 md:grid-cols-4">
-              <NumberBox disabled label="外部池排队上限（保留）" value={configDraft.externalPoolMaxQueuedRequests} onChange={(externalPoolMaxQueuedRequests) => setConfigDraft((prev) => ({ ...prev, externalPoolMaxQueuedRequests }))} />
               <ToggleRow disabled label="本地池熔断字段（保留）" checked={configDraft.localPoolCircuitEnabled} onChange={(localPoolCircuitEnabled) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitEnabled }))} />
               <NumberBox disabled label="熔断窗口秒数（保留）" value={configDraft.localPoolCircuitWindowSecs} min={1} onChange={(localPoolCircuitWindowSecs) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitWindowSecs }))} />
               <NumberBox disabled label="熔断失败阈值（保留）" value={configDraft.localPoolCircuitOpenAfterFailures} min={1} onChange={(localPoolCircuitOpenAfterFailures) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitOpenAfterFailures }))} />
@@ -267,7 +276,7 @@ export function ExternalPoolsPanel() {
           <Input bordered placeholder="名称" value={form.name} onChange={(event) => setForm((prev) => ({ ...prev, name: event.target.value }))} />
           <Input bordered className="md:col-span-2" placeholder="Base URL" value={form.baseUrl} onChange={(event) => setForm((prev) => ({ ...prev, baseUrl: event.target.value }))} />
           <Input bordered placeholder="请求 Key" value={form.apiKey} onChange={(event) => setForm((prev) => ({ ...prev, apiKey: event.target.value }))} />
-          <Input bordered type="number" placeholder="并发" value={form.maxConcurrentRequests} onChange={(event) => setForm((prev) => ({ ...prev, maxConcurrentRequests: Number(event.target.value) }))} />
+          <Input bordered type="number" placeholder="单池最大并发" value={form.maxConcurrentRequests} onChange={(event) => setForm((prev) => ({ ...prev, maxConcurrentRequests: Number(event.target.value) }))} />
           <Button color="primary" onClick={submitPool}><Plus className="h-4 w-4" />添加</Button>
           <select className="select select-bordered select-sm" value={form.usageProjectionMode} onChange={(event) => setForm((prev) => ({ ...prev, usageProjectionMode: event.target.value as CreateExternalPoolRequest['usageProjectionMode'] }))}>
             <option value="pass_through">严格透传 usage</option>
@@ -298,7 +307,7 @@ export function ExternalPoolsPanel() {
                   <Input bordered placeholder="名称" value={editForm.name || ''} onChange={(event) => setEditForm((prev) => ({ ...prev, name: event.target.value }))} />
                   <Input bordered className="md:col-span-2" placeholder="Base URL" value={editForm.baseUrl || ''} onChange={(event) => setEditForm((prev) => ({ ...prev, baseUrl: event.target.value }))} />
                   <Input bordered placeholder="新 Key（留空不改）" value={editForm.apiKey || ''} onChange={(event) => setEditForm((prev) => ({ ...prev, apiKey: event.target.value }))} />
-                  <Input bordered type="number" placeholder="并发" value={editForm.maxConcurrentRequests ?? 10} onChange={(event) => setEditForm((prev) => ({ ...prev, maxConcurrentRequests: Number(event.target.value) }))} />
+                  <Input bordered type="number" placeholder="单池最大并发" value={editForm.maxConcurrentRequests ?? 10} onChange={(event) => setEditForm((prev) => ({ ...prev, maxConcurrentRequests: Number(event.target.value) }))} />
                   <Input bordered type="number" placeholder="优先级" value={editForm.priority ?? 100} onChange={(event) => setEditForm((prev) => ({ ...prev, priority: Number(event.target.value) }))} />
                   <select className="select select-bordered select-sm" value={editForm.usageProjectionMode} onChange={(event) => setEditForm((prev) => ({ ...prev, usageProjectionMode: event.target.value as UpdateExternalPoolRequest['usageProjectionMode'] }))}>
                     <option value="pass_through">严格透传 usage</option>
@@ -391,6 +400,17 @@ function NumberBox({ label, value, min = 0, disabled = false, onChange }: { labe
     <label className={`space-y-1 text-sm ${disabled ? 'cursor-not-allowed opacity-60' : ''}`}>
       <span className="text-base-content/60">{label}</span>
       <Input bordered type="number" min={min} value={value} disabled={disabled} onChange={(event) => onChange(Number(event.target.value))} />
+    </label>
+  )
+}
+
+function SelectBox({ label, value, disabled = false, onChange, children }: { label: string; value: string; disabled?: boolean; onChange: (value: string) => void; children: ReactNode }) {
+  return (
+    <label className={`space-y-1 text-sm ${disabled ? 'cursor-not-allowed opacity-60' : ''}`}>
+      <span className="text-base-content/60">{label}</span>
+      <select className="select select-bordered w-full" value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)}>
+        {children}
+      </select>
     </label>
   )
 }

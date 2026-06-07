@@ -85,6 +85,8 @@ export function defaultExternalPoolsConfig() {
     externalPoolsEnabled: false,
     externalPoolGlobalMaxConcurrentRequests: 0,
     externalPoolMaxQueuedRequests: 0,
+    externalPoolCapacityMode: 'fail_fast' as const,
+    externalPoolDispatchMaxWaitSecs: 30,
     externalPoolRetryMaxAttempts: 0,
     externalDirectPolicyEnabled: false,
     directExternalOnLocalMaintenance: false,
@@ -107,11 +109,20 @@ export function defaultExternalPoolsConfig() {
     externalPoolAutoDisableOnQuotaExhausted: false,
     externalPoolAutoDisableOnMisconfiguredEndpoint: false,
     externalPoolAutoDisableFailureThreshold: 1,
+    externalPoolAutoDisableWindowSecs: 60,
     externalPoolAutoDisableDurationSecs: 0,
     externalPoolRateLimitCooldownSecs: 30,
     externalPoolServerErrorCooldownSecs: 10,
     externalPoolNetworkErrorCooldownSecs: 10,
     externalPoolProtocolErrorCooldownSecs: 10,
+  }
+}
+
+export function defaultModelMappingConfig() {
+  return {
+    enabled: true,
+    autoGenerateRules: true,
+    rules: [],
   }
 }
 
@@ -167,6 +178,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   highCacheThreshold: 10000,
   compatProfile: 'claude-code',
   modelResolutionMode: 'compatible',
+  modelMapping: defaultModelMappingConfig(),
   extractThinking: true,
   exposeProxyWarnings: false,
 }

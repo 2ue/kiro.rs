@@ -12,7 +12,7 @@ use axum::{
 use crate::external_pool::ExternalPoolManager;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
-    CompatProfile, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
+    CompatProfile, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
     PromptCacheSimulationMode, ReportedUsageConfig,
 };
 
@@ -72,6 +72,7 @@ pub fn create_router_with_provider(
     reported_usage: ReportedUsageConfig,
     compat_profile: CompatProfile,
     model_resolution_mode: ModelResolutionMode,
+    model_mapping: ModelMappingConfig,
     expose_proxy_warnings: bool,
     payload_guard_enabled: bool,
     payload_guard_mode: PayloadGuardMode,
@@ -99,6 +100,7 @@ pub fn create_router_with_provider(
     )
     .with_reported_usage(reported_usage)
     .with_model_resolution_mode(model_resolution_mode)
+    .with_model_mapping(model_mapping)
     .with_payload_guard(
         payload_guard_enabled,
         payload_guard_mode,

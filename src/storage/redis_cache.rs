@@ -1023,6 +1023,54 @@ impl RedisStore {
         Ok(removed > 0)
     }
 
+    pub async fn touch_external_pool_lease(
+        &self,
+        pool_id: u64,
+        lease_id: u64,
+        ttl_secs: usize,
+    ) -> anyhow::Result<bool> {
+        let keys = external_pool_in_flight_keys(pool_id);
+        let global_keys = external_pool_global_in_flight_keys();
+        let lease_id = lease_id.to_string();
+        let now = now_ms();
+        let script = r#"
+            local lease_id = ARGV[1]
+            local now = tonumber(ARGV[2])
+            local ttl_secs = tonumber(ARGV[3])
+
+            if not redis.call('ZSCORE', KEYS[2], lease_id) then
+                return 0
+            end
+            if not redis.call('ZSCORE', KEYS[4], lease_id) then
+                return 0
+            end
+
+            redis.call('ZADD', KEYS[1], now, lease_id)
+            redis.call('ZADD', KEYS[3], now, lease_id)
+            if ttl_secs > 0 then
+                redis.call('EXPIRE', KEYS[1], ttl_secs)
+                redis.call('EXPIRE', KEYS[2], ttl_secs)
+                redis.call('EXPIRE', KEYS[3], ttl_secs)
+                redis.call('EXPIRE', KEYS[4], ttl_secs)
+            end
+            return 1
+        "#;
+        let mut manager = self.manager.clone();
+        let touched: i64 = redis::cmd("EVAL")
+            .arg(script)
+            .arg(4)
+            .arg(self.key(&keys.last_seen))
+            .arg(self.key(&keys.acquired))
+            .arg(self.key(&global_keys.last_seen))
+            .arg(self.key(&global_keys.acquired))
+            .arg(lease_id)
+            .arg(now)
+            .arg(ttl_secs.max(1))
+            .query_async(&mut manager)
+            .await?;
+        Ok(touched == 1)
+    }
+
     pub async fn external_pool_capacity_state(
         &self,
         pool_id: u64,
@@ -1421,6 +1469,52 @@ impl RedisStore {
         Ok(())
     }
 
+    pub async fn try_enter_external_pool_dispatch_queue(
+        &self,
+        max_queued: u32,
+    ) -> anyhow::Result<bool> {
+        let script = r#"
+            local max_queued = tonumber(ARGV[1])
+            local count = tonumber(redis.call('GET', KEYS[1]) or '0')
+            if max_queued > 0 and count >= max_queued then
+                return 0
+            end
+            redis.call('INCR', KEYS[1])
+            redis.call('EXPIRE', KEYS[1], ARGV[2])
+            return 1
+        "#;
+        let mut manager = self.manager.clone();
+        let admitted: i64 = redis::cmd("EVAL")
+            .arg(script)
+            .arg(1)
+            .arg(self.key(external_pool_global_queue_key()))
+            .arg(max_queued)
+            .arg(3600)
+            .query_async(&mut manager)
+            .await?;
+        Ok(admitted == 1)
+    }
+
+    pub async fn leave_external_pool_dispatch_queue(&self) -> anyhow::Result<()> {
+        let script = r#"
+            local count = tonumber(redis.call('GET', KEYS[1]) or '0')
+            if count <= 1 then
+                redis.call('DEL', KEYS[1])
+            else
+                redis.call('DECR', KEYS[1])
+            end
+            return 1
+        "#;
+        let mut manager = self.manager.clone();
+        let _: i64 = redis::cmd("EVAL")
+            .arg(script)
+            .arg(1)
+            .arg(self.key(external_pool_global_queue_key()))
+            .query_async(&mut manager)
+            .await?;
+        Ok(())
+    }
+
     pub async fn acquire_refresh_lock(
         &self,
         credential_id: u64,
@@ -1479,6 +1573,10 @@ fn scheduler_rate_limit_key(credential_id: u64) -> String {
 
 fn scheduler_global_queue_key() -> &'static str {
     "scheduler:global:queued"
+}
+
+fn external_pool_global_queue_key() -> &'static str {
+    "external_pool:global:queued"
 }
 
 fn scheduler_refresh_lock_key(credential_id: u64) -> String {

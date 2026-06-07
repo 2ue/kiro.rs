@@ -410,6 +410,7 @@ async fn main() {
         config.reported_usage.clone(),
         config.compat_profile,
         config.model_resolution_mode,
+        config.model_mapping.clone().normalized(),
         config.expose_proxy_warnings,
         config.payload_guard_enabled,
         config.payload_guard_mode,

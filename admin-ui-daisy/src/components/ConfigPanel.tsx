@@ -4,6 +4,7 @@ import { toast } from 'sonner'
 import { Alert, Button, Card, Collapse, Input, Join, Loading, Select, Tabs, Toggle } from 'react-daisyui'
 import { ErrorState, FieldLabel, SectionCard } from '@/components/common'
 import {
+  defaultModelMappingConfig,
   defaultPayloadShaping,
   defaultExternalPoolsConfig,
   emptyRuntimeConfig,
@@ -20,10 +21,14 @@ import {
 import { extractErrorMessage } from '@/lib/utils'
 import { getAccessKeys, updateAdminApiKey } from '@/api/credentials'
 import { useRuntimeConfig, useUpdateRuntimeConfig } from '@/hooks/use-credentials'
+import { useModelCapabilities } from '@/hooks/use-usage'
 import { storage } from '@/lib/storage'
 import type {
   AccessKeysResponse,
   CompatProfile,
+  ModelCapabilitiesStatus,
+  ModelMappingConfig,
+  ModelMappingRule,
   ModelResolutionMode,
   PayloadGuardMode,
   ReportedUsageFieldMode,
@@ -40,6 +45,87 @@ const configTabs: Array<{ key: ConfigTab; label: string; description: string }> 
   { key: 'usage', label: '路径上报', description: '按路径改写 input、output、cache read/write' },
   { key: 'compat', label: '兼容诊断', description: '协议兼容、调试头、后台统计' },
 ]
+
+function normalizeModelMapping(config?: Partial<ModelMappingConfig> | null): ModelMappingConfig {
+  return {
+    ...defaultModelMappingConfig(),
+    ...(config || {}),
+    rules: (config?.rules || [])
+      .map((rule) => ({
+        enabled: rule.enabled !== false,
+        source: rule.source.trim().toLowerCase(),
+        target: rule.target.trim().toLowerCase(),
+        kind: rule.kind || 'alias',
+        note: rule.note?.trim() || null,
+      }))
+      .filter((rule) => rule.source && rule.target),
+  }
+}
+
+function versionEquivalentSource(model: string): string | null {
+  const match = model.match(/^claude-(opus|sonnet|haiku)-(\d+)([.-])(\d{1,3})(-\d{6,})?(-thinking)?$/)
+  if (!match) return null
+  const [, family, major, separator, minor, , thinking = ''] = match
+  return separator === '.'
+    ? `claude-${family}-${major}-${minor}${thinking}`
+    : `claude-${family}-${major}.${minor}${thinking}`
+}
+
+function modelVersionNumbers(model: string): number[] {
+  return (model.match(/\d+/g) || []).map((part) => Number(part))
+}
+
+function compareModelId(a: string, b: string): number {
+  const av = modelVersionNumbers(a)
+  const bv = modelVersionNumbers(b)
+  const len = Math.max(av.length, bv.length)
+  for (let index = 0; index < len; index += 1) {
+    const delta = (av[index] || 0) - (bv[index] || 0)
+    if (delta !== 0) return delta
+  }
+  if (a.endsWith('-thinking') !== b.endsWith('-thinking')) return a.endsWith('-thinking') ? -1 : 1
+  return a.localeCompare(b)
+}
+
+function addModelRule(rules: ModelMappingRule[], rule: ModelMappingRule) {
+  const source = rule.source.trim().toLowerCase()
+  const target = rule.target.trim().toLowerCase()
+  if (!source || !target || source === target) return
+  if (rules.some((item) => item.source === source && item.target === target && item.kind === rule.kind)) return
+  rules.push({ ...rule, source, target, enabled: rule.enabled !== false })
+}
+
+function generateDefaultModelMappingRules(status?: ModelCapabilitiesStatus): ModelMappingRule[] {
+  const models = (status?.models || []).map((item) => item.model.trim().toLowerCase()).filter(Boolean)
+  const rules: ModelMappingRule[] = []
+  for (const model of models) {
+    const source = versionEquivalentSource(model)
+    if (source) {
+      addModelRule(rules, {
+        enabled: true,
+        source,
+        target: model,
+        kind: 'version_equivalent',
+        note: '由当前上游模型列表生成的 dash/dot 小版本等价映射',
+      })
+    }
+  }
+  const pickFamily = (family: 'opus' | 'sonnet' | 'haiku') => {
+    const sorted = models
+      .filter((model) => model === family || model.startsWith(`claude-${family}`))
+      .sort(compareModelId)
+    return sorted[sorted.length - 1]
+  }
+  const opus = pickFamily('opus')
+  const sonnet = pickFamily('sonnet')
+  const haiku = pickFamily('haiku')
+  for (const source of ['opus', 'opusplan', 'best', 'default', 'auto']) {
+    if (opus) addModelRule(rules, { enabled: true, source, target: opus, kind: 'alias', note: '由当前上游 Opus 模型生成的默认别名' })
+  }
+  if (sonnet) addModelRule(rules, { enabled: true, source: 'sonnet', target: sonnet, kind: 'alias', note: '由当前上游 Sonnet 模型生成的默认别名' })
+  if (haiku) addModelRule(rules, { enabled: true, source: 'haiku', target: haiku, kind: 'alias', note: '由当前上游 Haiku 模型生成的默认别名' })
+  return rules
+}
 
 function numberValue(value: string, fallback: number): number {
   const parsed = Number(value)
@@ -635,6 +721,7 @@ function ReportedUsagePathEditor({
 export function ConfigPanel() {
   const config = useRuntimeConfig()
   const updateConfig = useUpdateRuntimeConfig()
+  const modelCapabilities = useModelCapabilities()
   const [draft, setDraft] = useState<RuntimeConfig>(emptyRuntimeConfig)
   const [activeTab, setActiveTab] = useState<ConfigTab>('dispatch')
 
@@ -651,6 +738,7 @@ export function ConfigPanel() {
           ...defaultExternalPoolsConfig(),
           ...config.data.externalPools,
         },
+        modelMapping: normalizeModelMapping(config.data.modelMapping),
       })
     }
   }, [config.data])
@@ -697,11 +785,13 @@ export function ConfigPanel() {
       promptCacheCapJitterMaxTokens: toWhole(draft.promptCacheCapJitterMaxTokens),
       promptCacheScaleMinInputTokens: toWhole(draft.promptCacheScaleMinInputTokens),
       reportedUsage: normalizeReportedUsage(draft.reportedUsage),
+      modelMapping: normalizeModelMapping(draft.modelMapping),
       externalPools: {
         ...defaultExternalPoolsConfig(),
         ...draft.externalPools,
         externalPoolGlobalMaxConcurrentRequests: toWhole(draft.externalPools.externalPoolGlobalMaxConcurrentRequests),
         externalPoolMaxQueuedRequests: toWhole(draft.externalPools.externalPoolMaxQueuedRequests),
+        externalPoolDispatchMaxWaitSecs: toWhole(draft.externalPools.externalPoolDispatchMaxWaitSecs),
         externalPoolRetryMaxAttempts: toWhole(draft.externalPools.externalPoolRetryMaxAttempts),
         localPoolCircuitWindowSecs: toWhole(draft.externalPools.localPoolCircuitWindowSecs, 1),
         localPoolCircuitOpenAfterFailures: toWhole(draft.externalPools.localPoolCircuitOpenAfterFailures, 1),
@@ -709,6 +799,7 @@ export function ConfigPanel() {
         localPoolCircuitOpenSecs: toWhole(draft.externalPools.localPoolCircuitOpenSecs, 1),
         localPoolCircuitHalfOpenMaxProbes: toWhole(draft.externalPools.localPoolCircuitHalfOpenMaxProbes, 1),
         externalPoolAutoDisableFailureThreshold: toWhole(draft.externalPools.externalPoolAutoDisableFailureThreshold, 1),
+        externalPoolAutoDisableWindowSecs: toWhole(draft.externalPools.externalPoolAutoDisableWindowSecs, 1),
         externalPoolAutoDisableDurationSecs: toWhole(draft.externalPools.externalPoolAutoDisableDurationSecs),
         externalPoolRateLimitCooldownSecs: toWhole(draft.externalPools.externalPoolRateLimitCooldownSecs, 1),
         externalPoolServerErrorCooldownSecs: toWhole(draft.externalPools.externalPoolServerErrorCooldownSecs, 1),
@@ -735,6 +826,7 @@ export function ConfigPanel() {
   const payloadShapingBranchEnabled = payloadSizeLimitEnabled && draft.payloadShaping.enabled
   const payloadGuardMode = draft.payloadGuardMode ?? 'preemptive'
   const payloadGuardRetryMode = payloadGuardMode === 'on_too_long'
+  const defaultModelMappingRules = generateDefaultModelMappingRules(modelCapabilities.data)
   const payloadConditionTitle = payloadGuardRetryMode
     ? '仅在上游返回输入过长后重试时执行'
     : '仅当发送前请求体超过上方阈值时执行'
@@ -995,6 +1087,42 @@ export function ConfigPanel() {
                   <Select.Option value="alias_only">仅精确与显式别名</Select.Option>
                   <Select.Option value="exact_only">仅模型目录精确 ID</Select.Option>
                 </Select>
+              </FieldLabel>
+              <FieldLabel title="模型映射与兜底规则" description="精确匹配后按版本等价、别名、兜底规则解析；关闭映射或关闭自动生成并清空规则时，未命中的模型直接透传给上游。">
+                <div className="space-y-3">
+                  <div className="grid gap-3 lg:grid-cols-2">
+                    <ToggleField title="启用模型映射" description="关闭后不做本地映射或兜底。" checked={draft.modelMapping.enabled} onChange={(enabled) => setDraft((prev) => ({ ...prev, modelMapping: { ...prev.modelMapping, enabled } }))} />
+                    <ToggleField title="自动生成规则" description="按当前上游模型列表启用 dash/dot 小版本等价和常用别名。" checked={draft.modelMapping.autoGenerateRules} onChange={(autoGenerateRules) => setDraft((prev) => ({ ...prev, modelMapping: { ...prev.modelMapping, autoGenerateRules } }))} />
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <Button size="sm" variant="outline" disabled={modelCapabilities.isLoading} onClick={() => {
+                      if (!defaultModelMappingRules.length) {
+                        toast.error('当前模型能力列表为空，无法生成默认规则')
+                        return
+                      }
+                      setDraft((prev) => ({ ...prev, modelMapping: { ...prev.modelMapping, enabled: true, autoGenerateRules: true, rules: defaultModelMappingRules } }))
+                      toast.success(`已填充 ${defaultModelMappingRules.length} 条默认模型映射规则`)
+                    }}>
+                      <Wand2 className="h-4 w-4" />
+                      填充默认规则
+                    </Button>
+                  </div>
+                  <textarea
+                    className="textarea textarea-bordered min-h-40 w-full font-mono text-xs"
+                    value={JSON.stringify(draft.modelMapping.rules, null, 2)}
+                    onChange={(event) => {
+                      try {
+                        const rules = JSON.parse(event.target.value)
+                        if (Array.isArray(rules)) {
+                          setDraft((prev) => ({ ...prev, modelMapping: { ...prev.modelMapping, rules } }))
+                        }
+                      } catch {
+                        // 保持输入态，保存前不会应用非法 JSON。
+                      }
+                    }}
+                  />
+                  <div className="text-xs text-base-content/60">当前规则 {draft.modelMapping.rules.length} 条；可生成默认规则 {defaultModelMappingRules.length} 条。</div>
+                </div>
               </FieldLabel>
               <ToggleField title="提取 Thinking 内容块" description="非流式响应里是否把 <thinking> 标签解析成独立 thinking 内容块。" checked={draft.extractThinking} onChange={(extractThinking) => setDraft((prev) => ({ ...prev, extractThinking }))} />
               <ToggleField title="暴露代理改写告警" description="是否通过 x-kiro-rs-warnings 响应头展示代理侧动作，方便排查兼容问题。" checked={draft.exposeProxyWarnings} onChange={(exposeProxyWarnings) => setDraft((prev) => ({ ...prev, exposeProxyWarnings }))} />

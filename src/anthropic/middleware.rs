@@ -14,7 +14,7 @@ use crate::common::auth;
 use crate::external_pool::ExternalPoolManager;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
-    CompatProfile, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
+    CompatProfile, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
     PromptCacheSimulationMode, ReportedUsageConfig,
 };
 
@@ -61,6 +61,8 @@ pub struct AppState {
     pub compat_profile: CompatProfile,
     /// 请求模型解析策略
     pub model_resolution_mode: ModelResolutionMode,
+    /// 模型映射和兜底规则
+    pub model_mapping: ModelMappingConfig,
     /// 是否在响应头中暴露代理改写动作
     pub expose_proxy_warnings: bool,
     /// 是否启用发送 Kiro 上游前的最终 payload 防护
@@ -107,6 +109,7 @@ impl AppState {
             reported_usage: ReportedUsageConfig::default(),
             compat_profile,
             model_resolution_mode: ModelResolutionMode::Compatible,
+            model_mapping: ModelMappingConfig::default(),
             expose_proxy_warnings: expose_proxy_warnings || compat_profile.is_debug(),
             payload_guard_enabled: true,
             payload_guard_mode: PayloadGuardMode::Preemptive,
@@ -153,6 +156,11 @@ impl AppState {
 
     pub fn with_model_resolution_mode(mut self, mode: ModelResolutionMode) -> Self {
         self.model_resolution_mode = mode;
+        self
+    }
+
+    pub fn with_model_mapping(mut self, model_mapping: ModelMappingConfig) -> Self {
+        self.model_mapping = model_mapping.normalized();
         self
     }
 

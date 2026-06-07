@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::anthropic::pricing::ModelPricing;
 use crate::model::config::{
-    CompatProfile, CompressionConfig, ExternalPoolsConfig, ModelResolutionMode, PayloadGuardMode,
-    PayloadShapingConfig, PayloadShapingConfigPatch, ReportedUsageConfig,
+    CompatProfile, CompressionConfig, ExternalPoolsConfig, ModelMappingConfig, ModelResolutionMode,
+    PayloadGuardMode, PayloadShapingConfig, PayloadShapingConfigPatch, ReportedUsageConfig,
 };
 
 // ============ 凭据状态 ============
@@ -749,6 +749,7 @@ pub struct RuntimeConfigResponse {
     pub high_cache_threshold: i32,
     pub compat_profile: CompatProfile,
     pub model_resolution_mode: ModelResolutionMode,
+    pub model_mapping: ModelMappingConfig,
     pub extract_thinking: bool,
     pub expose_proxy_warnings: bool,
 }
@@ -847,6 +848,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub compat_profile: Option<CompatProfile>,
     #[serde(default)]
     pub model_resolution_mode: Option<ModelResolutionMode>,
+    #[serde(default)]
+    pub model_mapping: Option<ModelMappingConfig>,
     #[serde(default)]
     pub extract_thinking: Option<bool>,
     #[serde(default)]

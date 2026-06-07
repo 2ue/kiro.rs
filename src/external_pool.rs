@@ -15,8 +15,8 @@ use futures::StreamExt;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::Mutex;
-use tokio::time::Instant;
+use tokio::sync::{Mutex, Notify};
+use tokio::time::{Instant, timeout};
 
 use crate::{
     anthropic::{
@@ -28,12 +28,13 @@ use crate::{
             UsageSource,
         },
     },
-    model::config::{ExternalPoolsConfig, ReportedUsageConfig},
+    model::config::{ExternalPoolCapacityMode, ExternalPoolsConfig, ReportedUsageConfig},
     storage::{postgres::PostgresStore, redis_cache::RedisStore},
     token,
 };
 
 const DEFAULT_EXTERNAL_POOL_REQUEST_TIMEOUT_SECS: u64 = 180;
+const EXTERNAL_POOL_LEASE_TOUCH_INTERVAL_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -287,12 +288,24 @@ pub struct ExternalPoolManager {
     redis: Arc<RedisStore>,
     client: reqwest::Client,
     local_state: Arc<Mutex<HashMap<u64, PoolRuntimeState>>>,
+    capacity_notify: Arc<Notify>,
 }
 
 struct ExternalPoolLease {
     manager: ExternalPoolManager,
     pool_id: u64,
     lease_id: u64,
+}
+
+impl ExternalPoolLease {
+    fn touch(&self) {
+        let manager = self.manager.clone();
+        let pool_id = self.pool_id;
+        let lease_id = self.lease_id;
+        tokio::spawn(async move {
+            manager.touch_pool(pool_id, lease_id).await;
+        });
+    }
 }
 
 impl Drop for ExternalPoolLease {
@@ -303,6 +316,37 @@ impl Drop for ExternalPoolLease {
         tokio::spawn(async move {
             manager.release_pool(pool_id, lease_id).await;
         });
+    }
+}
+
+struct ExternalPoolQueueGuard {
+    manager: ExternalPoolManager,
+    released: bool,
+}
+
+impl ExternalPoolQueueGuard {
+    fn new(manager: ExternalPoolManager) -> Self {
+        Self {
+            manager,
+            released: false,
+        }
+    }
+
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        let manager = self.manager.clone();
+        tokio::spawn(async move {
+            manager.leave_external_pool_queue().await;
+        });
+    }
+}
+
+impl Drop for ExternalPoolQueueGuard {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -321,6 +365,36 @@ struct ExternalPoolError {
 struct ExternalPoolCooldownState {
     until: DateTime<Utc>,
     reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolCapacityWaitReason {
+    Full,
+    Cooldown,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PoolAvailabilitySnapshot {
+    eligible_pools: usize,
+    available_pools: usize,
+    temporary_unavailable_pools: usize,
+    wait_reason: Option<PoolCapacityWaitReason>,
+    wait_for: Option<Duration>,
+}
+
+impl PoolAvailabilitySnapshot {
+    fn has_eligible_pool(&self) -> bool {
+        self.eligible_pools > 0
+    }
+
+    fn has_temporary_unavailable_pool(&self) -> bool {
+        self.temporary_unavailable_pools > 0
+    }
+}
+
+enum ExternalCapacityDecision {
+    Retry,
+    Respond(Response),
 }
 
 fn default_true() -> bool {
@@ -359,6 +433,7 @@ impl ExternalPoolManager {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             local_state: Arc::new(Mutex::new(HashMap::new())),
+            capacity_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -369,10 +444,15 @@ impl ExternalPoolManager {
         let pools = self.postgres.list_external_pools(true).await?;
         let mut statuses = Vec::with_capacity(pools.len());
         for pool in pools {
-            let (in_flight, cooldown_remaining_secs, cooldown_reason) =
+            let (in_flight, global_in_flight, cooldown_remaining_secs, cooldown_reason) =
                 self.pool_runtime_snapshot(pool.id).await;
-            let skipped_reason =
-                self.skip_reason(&pool, in_flight, cooldown_remaining_secs, config);
+            let skipped_reason = self.skip_reason(
+                &pool,
+                in_flight,
+                global_in_flight,
+                cooldown_remaining_secs,
+                config,
+            );
             statuses.push(ExternalPoolStatus {
                 dispatchable: skipped_reason.is_none(),
                 pool,
@@ -390,6 +470,20 @@ impl ExternalPoolManager {
             return false;
         }
         self.select_pool(&HashSet::new(), config).await.is_some()
+    }
+
+    pub async fn has_eligible_pool(&self, config: &ExternalPoolsConfig) -> bool {
+        self.pool_availability_snapshot(&HashSet::new(), config)
+            .await
+            .has_eligible_pool()
+    }
+
+    pub async fn has_waitable_pool(&self, config: &ExternalPoolsConfig) -> bool {
+        let snapshot = self
+            .pool_availability_snapshot(&HashSet::new(), config)
+            .await;
+        snapshot.has_eligible_pool()
+            && (snapshot.available_pools > 0 || snapshot.has_temporary_unavailable_pool())
     }
 
     pub fn direct_policy_reason(
@@ -462,25 +556,62 @@ impl ExternalPoolManager {
         let mut excluded = HashSet::new();
         let mut attempts = Vec::new();
         let mut last_error: Option<(ExternalPool, ExternalPoolError)> = None;
+        let mut queue_guard: Option<ExternalPoolQueueGuard> = None;
+        let mut wait_started_at: Option<Instant> = None;
+        let mut attempt_index = 0usize;
 
-        for attempt_index in 0..max_attempts {
+        while attempt_index < max_attempts {
             let Some(pool) = self.select_pool(&excluded, &config).await else {
+                let snapshot = self.pool_availability_snapshot(&excluded, &config).await;
+                if snapshot.has_temporary_unavailable_pool() {
+                    match self
+                        .handle_capacity_unavailable(
+                            &route,
+                            attempts.clone(),
+                            &config,
+                            snapshot.wait_reason.unwrap_or(PoolCapacityWaitReason::Full),
+                            snapshot.wait_for,
+                            &mut queue_guard,
+                            &mut wait_started_at,
+                        )
+                        .await
+                    {
+                        ExternalCapacityDecision::Retry => continue,
+                        ExternalCapacityDecision::Respond(response) => return response,
+                    }
+                }
                 break;
             };
             let pool_id = pool.id;
             let lease = match self.acquire_pool(&pool, &config).await {
                 Some(lease) => lease,
                 None => {
-                    excluded.insert(pool_id);
-                    continue;
+                    match self
+                        .handle_capacity_unavailable(
+                            &route,
+                            attempts.clone(),
+                            &config,
+                            PoolCapacityWaitReason::Full,
+                            None,
+                            &mut queue_guard,
+                            &mut wait_started_at,
+                        )
+                        .await
+                    {
+                        ExternalCapacityDecision::Retry => continue,
+                        ExternalCapacityDecision::Respond(response) => return response,
+                    }
                 }
             };
+            drop(queue_guard.take());
             let started = std::time::Instant::now();
+            let current_attempt = attempt_index.saturating_add(1) as u32;
+            attempt_index = attempt_index.saturating_add(1);
             let result = self.forward_once(&pool, &route, lease, &config).await;
             match result {
                 Ok(response) => {
                     attempts.push(ExternalPoolAttempt {
-                        attempt: attempt_index.saturating_add(1) as u32,
+                        attempt: current_attempt,
                         pool_id,
                         pool_name: pool.name.clone(),
                         status: Some(response.status().as_u16()),
@@ -489,13 +620,21 @@ impl ExternalPoolManager {
                         error_type: None,
                         error_message: None,
                     });
+                    if route.payload.stream {
+                        return self.wrap_external_stream_usage_record(
+                            response,
+                            route.clone(),
+                            pool,
+                            attempts.clone(),
+                        );
+                    }
                     self.record_external_success(&route, &pool, attempts.clone());
                     return response;
                 }
                 Err(err) => {
                     let action = if err.retryable { "retry_next" } else { "fail" };
                     attempts.push(ExternalPoolAttempt {
-                        attempt: attempt_index.saturating_add(1) as u32,
+                        attempt: current_attempt,
                         pool_id,
                         pool_name: pool.name.clone(),
                         status: err.status.map(|status| status.as_u16()),
@@ -593,82 +732,147 @@ impl ExternalPoolManager {
         let response_headers = response.headers().clone();
         let status = response.status();
         if route.payload.stream {
+            if success_response_headers_look_like_html(&response_headers) {
+                return Err(success_protocol_error(
+                    &response_headers,
+                    None,
+                    config,
+                    "external pool returned an HTML response for a streaming request",
+                ));
+            }
             let body_stream = response.bytes_stream();
             let usage_projection_mode = pool.usage_projection_mode;
             let reported_usage = route.reported_usage.clone();
             let endpoint = route.endpoint;
-            let stream = futures::stream::unfold(
-                (body_stream, Vec::<u8>::new(), Some(lease), false),
-                move |(mut body_stream, mut buffer, lease, finished)| {
-                    let reported_usage = reported_usage.clone();
-                    async move {
+            let stream = if usage_projection_mode == ExternalPoolUsageProjectionMode::PassThrough {
+                let stream = futures::stream::unfold(
+                    (body_stream, Some(lease), Instant::now(), false),
+                    move |(mut body_stream, lease, mut last_touch_at, finished)| async move {
                         if finished {
                             return None;
                         }
                         loop {
-                            match body_stream.next().await {
-                                Some(Ok(chunk)) => {
-                                    buffer.extend_from_slice(&chunk);
-                                    let projected = drain_projected_sse_events(
-                                        &mut buffer,
-                                        usage_projection_mode,
-                                        &reported_usage,
-                                        endpoint,
-                                    );
-                                    if !projected.is_empty() {
-                                        return Some((
-                                            Ok(Bytes::from(projected)),
-                                            (body_stream, buffer, lease, false),
-                                        ));
-                                    }
-                                }
-                                Some(Err(err)) => {
-                                    return Some((
-                                        Err(std::io::Error::new(
-                                            std::io::ErrorKind::Other,
-                                            format!("external stream read error: {}", err),
-                                        )),
-                                        (body_stream, buffer, lease, false),
-                                    ));
-                                }
-                                None => {
-                                    let tail = if buffer.is_empty() {
-                                        Vec::new()
-                                    } else {
-                                        maybe_project_sse_event(
-                                            &buffer,
-                                            usage_projection_mode,
-                                            &reported_usage,
-                                            endpoint,
-                                        )
+                            tokio::select! {
+                                chunk = body_stream.next() => {
+                                    return match chunk {
+                                        Some(Ok(chunk)) => Some((Ok(chunk), (body_stream, lease, last_touch_at, false))),
+                                        Some(Err(err)) => {
+                                            drop(lease);
+                                            Some((
+                                                Err(std::io::Error::new(
+                                                    std::io::ErrorKind::Other,
+                                                    format!("external stream read error: {}", err),
+                                                )),
+                                                (body_stream, None, last_touch_at, true),
+                                            ))
+                                        }
+                                        None => {
+                                            drop(lease);
+                                            None
+                                        }
                                     };
-                                    drop(lease);
-                                    if tail.is_empty() {
-                                        return None;
+                                }
+                                _ = tokio::time::sleep_until(external_pool_lease_touch_deadline(last_touch_at)) => {
+                                    if let Some(lease) = lease.as_ref() {
+                                        lease.touch();
                                     }
-                                    return Some((
-                                        Ok(Bytes::from(tail)),
-                                        (body_stream, Vec::new(), None, true),
-                                    ));
+                                    last_touch_at = Instant::now();
                                 }
                             }
                         }
-                    }
-                },
-            );
+                    },
+                );
+                Body::from_stream(stream)
+            } else {
+                let stream = futures::stream::unfold(
+                    (
+                        body_stream,
+                        Vec::<u8>::new(),
+                        Some(lease),
+                        Instant::now(),
+                        false,
+                    ),
+                    move |(mut body_stream, mut buffer, lease, mut last_touch_at, finished)| {
+                        let reported_usage = reported_usage.clone();
+                        async move {
+                            if finished {
+                                return None;
+                            }
+                            loop {
+                                tokio::select! {
+                                    chunk = body_stream.next() => {
+                                        match chunk {
+                                            Some(Ok(chunk)) => {
+                                                buffer.extend_from_slice(&chunk);
+                                                let projected = drain_projected_sse_events(
+                                                    &mut buffer,
+                                                    usage_projection_mode,
+                                                    &reported_usage,
+                                                    endpoint,
+                                                );
+                                                if !projected.is_empty() {
+                                                    return Some((
+                                                        Ok(Bytes::from(projected)),
+                                                        (body_stream, buffer, lease, last_touch_at, false),
+                                                    ));
+                                                }
+                                            }
+                                            Some(Err(err)) => {
+                                                drop(lease);
+                                                return Some((
+                                                    Err(std::io::Error::new(
+                                                        std::io::ErrorKind::Other,
+                                                        format!("external stream read error: {}", err),
+                                                    )),
+                                                    (body_stream, Vec::new(), None, last_touch_at, true),
+                                                ));
+                                            }
+                                            None => {
+                                                let tail = if buffer.is_empty() {
+                                                    Vec::new()
+                                                } else {
+                                                    maybe_project_sse_event(
+                                                        &buffer,
+                                                        usage_projection_mode,
+                                                        &reported_usage,
+                                                        endpoint,
+                                                    )
+                                                };
+                                                drop(lease);
+                                                if tail.is_empty() {
+                                                    return None;
+                                                }
+                                                return Some((
+                                                    Ok(Bytes::from(tail)),
+                                                    (body_stream, Vec::new(), None, last_touch_at, true),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    _ = tokio::time::sleep_until(external_pool_lease_touch_deadline(last_touch_at)) => {
+                                        if let Some(lease) = lease.as_ref() {
+                                            lease.touch();
+                                        }
+                                        last_touch_at = Instant::now();
+                                    }
+                                }
+                            }
+                        }
+                    },
+                );
+                Body::from_stream(stream)
+            };
             let mut builder = Response::builder().status(status);
             apply_forwarded_response_headers(&mut builder, &response_headers, &route.request_id);
-            builder
-                .body(Body::from_stream(stream))
-                .map_err(|err| ExternalPoolError {
-                    status: None,
-                    message: format!("build external stream response failed: {}", err),
-                    retryable: false,
-                    auto_disable_reason: None,
-                    cooldown: None,
-                    response_body: None,
-                    response_headers: HeaderMap::new(),
-                })
+            builder.body(stream).map_err(|err| ExternalPoolError {
+                status: None,
+                message: format!("build external stream response failed: {}", err),
+                retryable: false,
+                auto_disable_reason: None,
+                cooldown: None,
+                response_body: None,
+                response_headers: HeaderMap::new(),
+            })
         } else {
             let bytes = response.bytes().await.map_err(|err| ExternalPoolError {
                 status: None,
@@ -682,6 +886,14 @@ impl ExternalPoolManager {
                 response_body: None,
                 response_headers: HeaderMap::new(),
             })?;
+            if success_response_looks_like_html(&response_headers, &bytes) {
+                return Err(success_protocol_error(
+                    &response_headers,
+                    Some(&bytes),
+                    config,
+                    "external pool returned an HTML response for a non-streaming request",
+                ));
+            }
             drop(lease);
             let body = maybe_project_non_stream_usage(
                 bytes,
@@ -716,9 +928,16 @@ impl ExternalPoolManager {
             if excluded.contains(&pool.id) {
                 continue;
             }
-            let (in_flight, cooldown_remaining_secs, _) = self.pool_runtime_snapshot(pool.id).await;
+            let (in_flight, global_in_flight, cooldown_remaining_secs, _) =
+                self.pool_runtime_snapshot(pool.id).await;
             if self
-                .skip_reason(&pool, in_flight, cooldown_remaining_secs, config)
+                .skip_reason(
+                    &pool,
+                    in_flight,
+                    global_in_flight,
+                    cooldown_remaining_secs,
+                    config,
+                )
                 .is_none()
             {
                 candidates.push((pool, in_flight));
@@ -752,10 +971,197 @@ impl ExternalPoolManager {
         best.into_iter().nth(idx).map(|(pool, _)| pool)
     }
 
+    async fn pool_availability_snapshot(
+        &self,
+        excluded: &HashSet<u64>,
+        config: &ExternalPoolsConfig,
+    ) -> PoolAvailabilitySnapshot {
+        if !config.external_pools_enabled {
+            return PoolAvailabilitySnapshot::default();
+        }
+        let Ok(pools) = self.postgres.list_external_pools(false).await else {
+            return PoolAvailabilitySnapshot::default();
+        };
+        let mut snapshot = PoolAvailabilitySnapshot::default();
+        for pool in pools {
+            if excluded.contains(&pool.id) {
+                continue;
+            }
+            if !pool.enabled || pool.is_auto_disabled_now() {
+                continue;
+            }
+            snapshot.eligible_pools += 1;
+            let (in_flight, global_in_flight, cooldown_remaining_secs, _) =
+                self.pool_runtime_snapshot(pool.id).await;
+            match self.skip_reason(
+                &pool,
+                in_flight,
+                global_in_flight,
+                cooldown_remaining_secs,
+                config,
+            ) {
+                None => snapshot.available_pools += 1,
+                Some(reason)
+                    if reason == "pool_concurrency_full" || reason == "global_concurrency_full" =>
+                {
+                    snapshot.temporary_unavailable_pools += 1;
+                    if snapshot.wait_reason.is_none() {
+                        snapshot.wait_reason = Some(PoolCapacityWaitReason::Full);
+                    }
+                }
+                Some(reason) if reason == "cooldown" => {
+                    snapshot.temporary_unavailable_pools += 1;
+                    snapshot
+                        .wait_reason
+                        .get_or_insert(PoolCapacityWaitReason::Cooldown);
+                    let wait_for = Duration::from_secs(cooldown_remaining_secs.max(1));
+                    snapshot.wait_for = Some(
+                        snapshot
+                            .wait_for
+                            .map(|existing| existing.min(wait_for))
+                            .unwrap_or(wait_for),
+                    );
+                }
+                _ => {}
+            }
+        }
+        snapshot
+    }
+
+    async fn handle_capacity_unavailable(
+        &self,
+        route: &ExternalRouteRequest,
+        attempts: Vec<ExternalPoolAttempt>,
+        config: &ExternalPoolsConfig,
+        reason: PoolCapacityWaitReason,
+        wait_for: Option<Duration>,
+        queue_guard: &mut Option<ExternalPoolQueueGuard>,
+        wait_started_at: &mut Option<Instant>,
+    ) -> ExternalCapacityDecision {
+        if config.external_pool_capacity_mode != ExternalPoolCapacityMode::Wait {
+            let (error_type, message) = external_capacity_error(reason);
+            self.record_external_failure(route, None, attempts, error_type, message);
+            return ExternalCapacityDecision::Respond(external_pool_scheduler_error_response(
+                route,
+                StatusCode::SERVICE_UNAVAILABLE,
+                error_type,
+                message,
+            ));
+        }
+
+        let started = *wait_started_at.get_or_insert_with(Instant::now);
+        let max_wait = if config.external_pool_dispatch_max_wait_secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(
+                config.external_pool_dispatch_max_wait_secs,
+            ))
+        };
+        if let Some(max_wait) = max_wait {
+            if started.elapsed() >= max_wait {
+                let message = format!(
+                    "External fallback pool capacity wait timed out after {} seconds",
+                    max_wait.as_secs()
+                );
+                self.record_external_failure(
+                    route,
+                    None,
+                    attempts,
+                    "external_pool_wait_timeout",
+                    &message,
+                );
+                return ExternalCapacityDecision::Respond(external_pool_scheduler_error_response(
+                    route,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "external_pool_wait_timeout",
+                    message,
+                ));
+            }
+        }
+
+        if queue_guard.is_none() {
+            match self
+                .enter_external_pool_queue(config.external_pool_max_queued_requests)
+                .await
+            {
+                Ok(Some(guard)) => *queue_guard = Some(guard),
+                Ok(None) => {
+                    let message = "External fallback pool dispatch queue is full";
+                    self.record_external_failure(
+                        route,
+                        None,
+                        attempts,
+                        "external_pool_queue_full",
+                        message,
+                    );
+                    return ExternalCapacityDecision::Respond(
+                        external_pool_scheduler_error_response(
+                            route,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "external_pool_queue_full",
+                            message,
+                        ),
+                    );
+                }
+                Err(err) => {
+                    let message =
+                        format!("External fallback pool dispatch queue unavailable: {}", err);
+                    self.record_external_failure(
+                        route,
+                        None,
+                        attempts,
+                        "external_pool_queue_error",
+                        &message,
+                    );
+                    return ExternalCapacityDecision::Respond(
+                        external_pool_scheduler_error_response(
+                            route,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "external_pool_queue_error",
+                            message,
+                        ),
+                    );
+                }
+            }
+        }
+
+        let mut wakeup = wait_for
+            .unwrap_or_else(|| Duration::from_secs(1))
+            .min(Duration::from_secs(1));
+        if let Some(max_wait) = max_wait {
+            let remaining = max_wait.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                let message = format!(
+                    "External fallback pool capacity wait timed out after {} seconds",
+                    max_wait.as_secs()
+                );
+                self.record_external_failure(
+                    route,
+                    None,
+                    attempts,
+                    "external_pool_wait_timeout",
+                    &message,
+                );
+                return ExternalCapacityDecision::Respond(external_pool_scheduler_error_response(
+                    route,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "external_pool_wait_timeout",
+                    message,
+                ));
+            }
+            wakeup = wakeup.min(remaining);
+        }
+        if !wakeup.is_zero() {
+            let _ = timeout(wakeup, self.capacity_notify.notified()).await;
+        }
+        ExternalCapacityDecision::Retry
+    }
+
     fn skip_reason(
         &self,
         pool: &ExternalPool,
         in_flight: u32,
+        global_in_flight: u32,
         cooldown_remaining_secs: u64,
         config: &ExternalPoolsConfig,
     ) -> Option<String> {
@@ -775,6 +1181,10 @@ impl ExternalPoolManager {
         if in_flight >= per_pool_max {
             return Some("pool_concurrency_full".to_string());
         }
+        let global_max = config.external_pool_global_max_concurrent_requests;
+        if global_max > 0 && global_in_flight >= global_max {
+            return Some("global_concurrency_full".to_string());
+        }
         None
     }
 
@@ -783,7 +1193,7 @@ impl ExternalPoolManager {
         pool: &ExternalPool,
         config: &ExternalPoolsConfig,
     ) -> Option<ExternalPoolLease> {
-        let (_, cooldown_remaining_secs, _) = self.pool_runtime_snapshot(pool.id).await;
+        let (_, _, cooldown_remaining_secs, _) = self.pool_runtime_snapshot(pool.id).await;
         if cooldown_remaining_secs > 0 {
             return None;
         }
@@ -821,6 +1231,28 @@ impl ExternalPoolManager {
         }
     }
 
+    async fn enter_external_pool_queue(
+        &self,
+        max_queued: u32,
+    ) -> anyhow::Result<Option<ExternalPoolQueueGuard>> {
+        if self
+            .redis
+            .try_enter_external_pool_dispatch_queue(max_queued)
+            .await?
+        {
+            Ok(Some(ExternalPoolQueueGuard::new(self.clone())))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn leave_external_pool_queue(&self) {
+        if let Err(err) = self.redis.leave_external_pool_dispatch_queue().await {
+            tracing::warn!("释放外部池 Redis 调度排队占位失败: {}", err);
+        }
+        self.capacity_notify.notify_waiters();
+    }
+
     async fn release_pool(&self, pool_id: u64, lease_id: u64) {
         match self
             .redis
@@ -837,6 +1269,31 @@ impl ExternalPoolManager {
                 pool_id,
                 lease_id,
                 "释放外部池 Redis 并发 lease 失败: {}",
+                err
+            ),
+        }
+        self.capacity_notify.notify_waiters();
+    }
+
+    async fn touch_pool(&self, pool_id: u64, lease_id: u64) {
+        let ttl_secs = DEFAULT_EXTERNAL_POOL_REQUEST_TIMEOUT_SECS
+            .saturating_mul(4)
+            .max(60) as usize;
+        match self
+            .redis
+            .touch_external_pool_lease(pool_id, lease_id, ttl_secs)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!(
+                pool_id,
+                lease_id,
+                "外部池 Redis 并发 lease touch 时已不存在"
+            ),
+            Err(err) => tracing::warn!(
+                pool_id,
+                lease_id,
+                "续期外部池 Redis 并发 lease 失败: {}",
                 err
             ),
         }
@@ -866,8 +1323,8 @@ impl ExternalPoolManager {
         }
     }
 
-    async fn pool_runtime_snapshot(&self, pool_id: u64) -> (u32, u64, Option<String>) {
-        let in_flight = self
+    async fn pool_runtime_snapshot(&self, pool_id: u64) -> (u32, u32, u64, Option<String>) {
+        let capacity_state = self
             .redis
             .external_pool_capacity_state(
                 pool_id,
@@ -876,11 +1333,12 @@ impl ExternalPoolManager {
                 )),
             )
             .await
-            .map(|state| state.pool_in_flight_requests)
             .unwrap_or_else(|err| {
                 tracing::warn!(pool_id, "读取外部池 Redis 并发状态失败: {}", err);
-                0
+                Default::default()
             });
+        let in_flight = capacity_state.pool_in_flight_requests;
+        let global_in_flight = capacity_state.global_in_flight_requests;
         if let Ok(Some(cooldown)) = self
             .redis
             .get_json::<ExternalPoolCooldownState>(format!("external_pool:{}:cooldown", pool_id))
@@ -890,6 +1348,7 @@ impl ExternalPoolManager {
             if cooldown.until > now {
                 return (
                     in_flight,
+                    global_in_flight,
                     (cooldown.until - now).num_seconds().max(1) as u64,
                     cooldown.reason,
                 );
@@ -914,7 +1373,12 @@ impl ExternalPoolManager {
             entry.cooldown_until = None;
             entry.cooldown_reason = None;
         }
-        (in_flight, remaining, entry.cooldown_reason.clone())
+        (
+            in_flight,
+            global_in_flight,
+            remaining,
+            entry.cooldown_reason.clone(),
+        )
     }
 
     async fn auto_disable_pool_if_configured(
@@ -935,7 +1399,10 @@ impl ExternalPoolManager {
             let key = format!("external_pool:{}:auto_disable_failures:{}", pool.id, reason);
             let count = self
                 .redis
-                .incr_with_ttl(key, config.local_pool_circuit_window_secs.max(1) as usize)
+                .incr_with_ttl(
+                    key,
+                    config.external_pool_auto_disable_window_secs.max(1) as usize,
+                )
                 .await
                 .unwrap_or_else(|err| {
                     tracing::warn!(
@@ -999,6 +1466,51 @@ impl ExternalPoolManager {
             Some(error_message.to_string()),
             Some(error_detail),
         );
+    }
+
+    fn wrap_external_stream_usage_record(
+        &self,
+        response: Response,
+        route: ExternalRouteRequest,
+        pool: ExternalPool,
+        attempts: Vec<ExternalPoolAttempt>,
+    ) -> Response {
+        let (parts, body) = response.into_parts();
+        let data_stream = body.into_data_stream();
+        let guard = ExternalStreamUsageGuard {
+            manager: self.clone(),
+            route,
+            pool,
+            attempts,
+            completed: false,
+        };
+        let stream = futures::stream::unfold(
+            (data_stream, Some(guard)),
+            |(mut data_stream, mut guard)| async move {
+                match data_stream.next().await {
+                    Some(Ok(chunk)) => Some((Ok(chunk), (data_stream, guard))),
+                    Some(Err(err)) => {
+                        if let Some(mut guard) = guard.take() {
+                            guard.record_stream_error(&err.to_string());
+                        }
+                        Some((
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("external stream response failed: {}", err),
+                            )),
+                            (data_stream, None),
+                        ))
+                    }
+                    None => {
+                        if let Some(mut guard) = guard.take() {
+                            guard.record_success();
+                        }
+                        None
+                    }
+                }
+            },
+        );
+        Response::from_parts(parts, Body::from_stream(stream))
     }
 
     fn record_external(
@@ -1070,6 +1582,64 @@ impl ExternalPoolManager {
     }
 }
 
+struct ExternalStreamUsageGuard {
+    manager: ExternalPoolManager,
+    route: ExternalRouteRequest,
+    pool: ExternalPool,
+    attempts: Vec<ExternalPoolAttempt>,
+    completed: bool,
+}
+
+impl ExternalStreamUsageGuard {
+    fn record_success(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.manager
+            .record_external_success(&self.route, &self.pool, self.attempts.clone());
+        self.completed = true;
+    }
+
+    fn record_stream_error(&mut self, message: &str) {
+        if self.completed {
+            return;
+        }
+        self.manager.record_external(
+            &self.route,
+            Some(&self.pool),
+            self.attempts.clone(),
+            UsageRecordStatus::StreamError,
+            Some("stream_error".to_string()),
+            Some(message.to_string()),
+            Some(format!("stream_error: {}", message)),
+        );
+        self.completed = true;
+    }
+
+    fn record_client_dropped(&mut self) {
+        if self.completed {
+            return;
+        }
+        let message = "external stream body dropped before completion";
+        self.manager.record_external(
+            &self.route,
+            Some(&self.pool),
+            self.attempts.clone(),
+            UsageRecordStatus::ClientDropped,
+            Some("client_dropped".to_string()),
+            Some(message.to_string()),
+            Some(format!("client_dropped: {}", message)),
+        );
+        self.completed = true;
+    }
+}
+
+impl Drop for ExternalStreamUsageGuard {
+    fn drop(&mut self) {
+        self.record_client_dropped();
+    }
+}
+
 fn pool_auto_disable_policy_enabled(
     policy: ExternalPoolAutoDisablePolicy,
     config: &ExternalPoolsConfig,
@@ -1100,18 +1670,28 @@ fn load_score(in_flight: u32, max: u32) -> u64 {
     ((in_flight as u64) * 1_000_000) / max
 }
 
+fn external_pool_lease_touch_deadline(last_touch_at: Instant) -> Instant {
+    last_touch_at + Duration::from_secs(EXTERNAL_POOL_LEASE_TOUCH_INTERVAL_SECS)
+}
+
+pub(crate) fn external_pool_models_url(base_url: &str) -> Result<Url, url::ParseError> {
+    let mut base = base_url.trim().trim_end_matches('/').to_string();
+    if base_url_ends_with_v1(&base) {
+        base.push_str("/models");
+    } else {
+        base.push_str("/v1/models");
+    }
+    Url::parse(&base)
+}
+
 fn external_pool_url(
     pool: &ExternalPool,
     endpoint: &str,
     config: &ExternalPoolsConfig,
 ) -> Result<Url, ExternalPoolError> {
     let mut base = pool.base_url.trim().trim_end_matches('/').to_string();
-    let path = if pool.preserve_path {
-        endpoint
-    } else {
-        "/v1/messages"
-    };
-    base.push_str(path);
+    let path = external_pool_target_path(&base, endpoint, pool.preserve_path);
+    base.push_str(&path);
     Url::parse(&base).map_err(|err| ExternalPoolError {
         status: None,
         message: format!("external pool URL is invalid: {}", err),
@@ -1124,6 +1704,51 @@ fn external_pool_url(
         response_body: None,
         response_headers: HeaderMap::new(),
     })
+}
+
+fn external_pool_target_path(base: &str, endpoint: &str, preserve_path: bool) -> String {
+    let base_has_v1 = base_url_ends_with_v1(base);
+    if !preserve_path {
+        return if base_has_v1 {
+            "/messages".to_string()
+        } else {
+            "/v1/messages".to_string()
+        };
+    }
+
+    let endpoint = if endpoint.starts_with('/') {
+        endpoint.to_string()
+    } else {
+        format!("/{endpoint}")
+    };
+    if base_has_v1 && (endpoint == "/v1" || endpoint.starts_with("/v1/")) {
+        let stripped = endpoint.trim_start_matches("/v1");
+        if stripped.is_empty() {
+            "/".to_string()
+        } else {
+            stripped.to_string()
+        }
+    } else {
+        endpoint
+    }
+}
+
+fn base_url_ends_with_v1(base: &str) -> bool {
+    Url::parse(base)
+        .ok()
+        .map(|url| {
+            url.path()
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .is_some_and(|segment| segment.eq_ignore_ascii_case("v1"))
+        })
+        .unwrap_or_else(|| {
+            base.trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .is_some_and(|segment| segment.eq_ignore_ascii_case("v1"))
+        })
 }
 
 fn forward_headers(
@@ -1204,6 +1829,64 @@ fn should_forward_response_header(name: &HeaderName) -> bool {
     )
 }
 
+fn success_response_headers_look_like_html(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_ascii_lowercase().contains("text/html"))
+        .unwrap_or(false)
+}
+
+fn success_response_looks_like_html(headers: &HeaderMap, body: &[u8]) -> bool {
+    if success_response_headers_look_like_html(headers) {
+        return true;
+    }
+    let trimmed = body
+        .iter()
+        .copied()
+        .skip_while(|byte| byte.is_ascii_whitespace())
+        .take(64)
+        .collect::<Vec<_>>();
+    let prefix = String::from_utf8_lossy(&trimmed).to_ascii_lowercase();
+    prefix.starts_with("<!doctype html") || prefix.starts_with("<html")
+}
+
+fn success_protocol_error(
+    headers: &HeaderMap,
+    body: Option<&Bytes>,
+    config: &ExternalPoolsConfig,
+    context: &str,
+) -> ExternalPoolError {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown");
+    let body_prefix = body
+        .map(|bytes| {
+            String::from_utf8_lossy(&bytes[..bytes.len().min(120)])
+                .replace('\n', " ")
+                .replace('\r', " ")
+        })
+        .unwrap_or_default();
+    let message = if body_prefix.is_empty() {
+        format!("{context}; content-type={content_type}")
+    } else {
+        format!("{context}; content-type={content_type}; body_prefix={body_prefix}")
+    };
+    ExternalPoolError {
+        status: Some(StatusCode::BAD_GATEWAY),
+        message,
+        retryable: true,
+        auto_disable_reason: Some("misconfigured_endpoint".to_string()),
+        cooldown: Some((
+            Duration::from_secs(config.external_pool_protocol_error_cooldown_secs.max(1)),
+            "misconfigured_endpoint".to_string(),
+        )),
+        response_body: None,
+        response_headers: HeaderMap::new(),
+    }
+}
+
 fn apply_forwarded_response_headers(
     builder: &mut axum::http::response::Builder,
     headers: &HeaderMap,
@@ -1222,6 +1905,28 @@ fn apply_forwarded_response_headers(
 
 fn external_pool_error_response(route: &ExternalRouteRequest, err: &ExternalPoolError) -> Response {
     external_pool_error_response_with_request_id(&route.request_id, err)
+}
+
+fn external_capacity_error(reason: PoolCapacityWaitReason) -> (&'static str, &'static str) {
+    match reason {
+        PoolCapacityWaitReason::Full => (
+            "external_pool_capacity_full",
+            "External fallback pool concurrency is full",
+        ),
+        PoolCapacityWaitReason::Cooldown => (
+            "external_pool_cooldown",
+            "External fallback pools are temporarily cooling down",
+        ),
+    }
+}
+
+fn external_pool_scheduler_error_response(
+    route: &ExternalRouteRequest,
+    status: StatusCode,
+    code: &str,
+    message: impl Into<String>,
+) -> Response {
+    envelope::error_response_with_id(status, code, message.into(), &route.request_id)
 }
 
 fn external_pool_error_response_with_request_id(
@@ -1656,6 +2361,212 @@ mod tests {
             .await
             .expect("read external final retryable body");
         assert_eq!(actual, body);
+    }
+
+    #[tokio::test]
+    async fn external_capacity_scheduler_error_uses_request_id_and_error_type() {
+        let route = ExternalRouteRequest {
+            raw_body: Bytes::new(),
+            headers: HeaderMap::new(),
+            endpoint: "/v1/messages",
+            payload: MessagesRequest {
+                model: "claude-sonnet-4-5-20250929".to_string(),
+                max_tokens: 8,
+                messages: Vec::new(),
+                stream: false,
+                system: None,
+                tools: None,
+                tool_choice: None,
+                thinking: None,
+                output_config: None,
+                metadata: None,
+            },
+            route_subtype: UsageRouteSubtype::ExternalDirectPolicy,
+            fallback_reason: None,
+            direct_policy_reason: None,
+            local_attempted: false,
+            local_preflight: None,
+            local_attempts: Vec::new(),
+            reported_usage: ReportedUsageConfig::default(),
+            request_id: "req_external_capacity".to_string(),
+            recorder: Arc::new(crate::anthropic::usage::UsageRecorder::new(1)),
+            started_at: Instant::now(),
+        };
+
+        let (error_type, message) = external_capacity_error(PoolCapacityWaitReason::Full);
+        let response = external_pool_scheduler_error_response(
+            &route,
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_type,
+            message,
+        );
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get("request-id").unwrap(),
+            "req_external_capacity"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read scheduler error body");
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "external_pool_capacity_full");
+        assert_eq!(
+            body["error"]["message"],
+            "External fallback pool concurrency is full"
+        );
+    }
+
+    #[test]
+    fn successful_external_html_response_is_protocol_error() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html"));
+        let body = Bytes::from_static(br#"<!doctype html><html><body>admin</body></html>"#);
+
+        assert!(success_response_looks_like_html(&headers, &body));
+        let err = success_protocol_error(
+            &headers,
+            Some(&body),
+            &ExternalPoolsConfig::default(),
+            "external pool returned an HTML response",
+        );
+
+        assert!(err.retryable);
+        assert_eq!(err.status, Some(StatusCode::BAD_GATEWAY));
+        assert_eq!(
+            err.auto_disable_reason.as_deref(),
+            Some("misconfigured_endpoint")
+        );
+        assert_eq!(
+            error_type_for_external_error(&err),
+            "misconfigured_endpoint"
+        );
+    }
+
+    fn test_pool(base_url: &str, preserve_path: bool) -> ExternalPool {
+        let now = Utc::now();
+        ExternalPool {
+            id: 1,
+            name: "test".to_string(),
+            base_url: base_url.to_string(),
+            api_key: Some("sk-test".to_string()),
+            masked_api_key: None,
+            auth_type: ExternalPoolAuthType::Bearer,
+            enabled: true,
+            priority: 10,
+            max_concurrent_requests: 10,
+            usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
+            auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
+            auto_disabled: false,
+            auto_disabled_reason: None,
+            auto_disabled_at: None,
+            auto_disabled_until: None,
+            auto_disabled_last_error: None,
+            preserve_path,
+            notes: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn external_pool_url_adds_single_v1_for_standard_message_path() {
+        let config = ExternalPoolsConfig::default();
+        let cases = [
+            (
+                "http://pool.example.com",
+                "http://pool.example.com/v1/messages",
+            ),
+            (
+                "http://pool.example.com/",
+                "http://pool.example.com/v1/messages",
+            ),
+            (
+                "http://pool.example.com/v1",
+                "http://pool.example.com/v1/messages",
+            ),
+            (
+                "http://pool.example.com/v1/",
+                "http://pool.example.com/v1/messages",
+            ),
+            (
+                "http://pool.example.com/api",
+                "http://pool.example.com/api/v1/messages",
+            ),
+            (
+                "http://pool.example.com/api/v1",
+                "http://pool.example.com/api/v1/messages",
+            ),
+        ];
+
+        for (base_url, expected) in cases {
+            let actual = external_pool_url(&test_pool(base_url, false), "/cc/v1/messages", &config)
+                .expect("valid external pool url");
+            assert_eq!(actual.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn external_pool_url_preserves_path_without_duplicating_v1() {
+        let config = ExternalPoolsConfig::default();
+        let base_v1 = external_pool_url(
+            &test_pool("http://pool.example.com/v1", true),
+            "/v1/messages",
+            &config,
+        )
+        .expect("valid external pool url");
+        assert_eq!(base_v1.as_str(), "http://pool.example.com/v1/messages");
+
+        let cc_path = external_pool_url(
+            &test_pool("http://pool.example.com", true),
+            "/cc/v1/messages",
+            &config,
+        )
+        .expect("valid external pool url");
+        assert_eq!(cc_path.as_str(), "http://pool.example.com/cc/v1/messages");
+    }
+
+    #[test]
+    fn external_pool_models_url_adds_single_v1() {
+        let cases = [
+            (
+                "http://pool.example.com",
+                "http://pool.example.com/v1/models",
+            ),
+            (
+                "http://pool.example.com/",
+                "http://pool.example.com/v1/models",
+            ),
+            (
+                "http://pool.example.com/v1",
+                "http://pool.example.com/v1/models",
+            ),
+            (
+                "http://pool.example.com/v1/",
+                "http://pool.example.com/v1/models",
+            ),
+            (
+                "http://pool.example.com/api",
+                "http://pool.example.com/api/v1/models",
+            ),
+            (
+                "http://pool.example.com/api/v1",
+                "http://pool.example.com/api/v1/models",
+            ),
+        ];
+
+        for (base_url, expected) in cases {
+            let actual = external_pool_models_url(base_url).expect("valid models url");
+            assert_eq!(actual.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn external_pool_auto_disable_window_has_own_default() {
+        let config = ExternalPoolsConfig::default();
+
+        assert_eq!(config.external_pool_auto_disable_window_secs, 60);
+        assert_eq!(config.local_pool_circuit_window_secs, 60);
     }
 
     #[test]

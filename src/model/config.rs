@@ -597,6 +597,89 @@ impl ModelResolutionMode {
     }
 }
 
+/// 模型映射规则类型。
+///
+/// `version_equivalent` 表示同一上游小版本的不同写法，例如
+/// `claude-opus-4-8` -> `claude-opus-4.8`。`alias` 表示短别名或显式别名，
+/// 例如 `sonnet` -> 当前可用 Sonnet。`fallback` 表示兜底规则，只在精确和
+/// 版本等价都没有命中后生效。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelMappingRuleKind {
+    VersionEquivalent,
+    Alias,
+    Fallback,
+}
+
+impl Default for ModelMappingRuleKind {
+    fn default() -> Self {
+        Self::Alias
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelMappingRule {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub target: String,
+    #[serde(default)]
+    pub kind: ModelMappingRuleKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl ModelMappingRule {
+    pub fn normalized(mut self) -> Option<Self> {
+        self.source = self.source.trim().to_ascii_lowercase();
+        self.target = self.target.trim().to_ascii_lowercase();
+        self.note = self
+            .note
+            .and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()));
+        (!self.source.is_empty() && !self.target.is_empty()).then_some(self)
+    }
+}
+
+/// 模型映射配置。
+///
+/// 解析顺序固定为：上游模型列表精确匹配 -> 版本等价 -> 显式别名 ->
+/// 兜底规则 -> 透传。关闭 `enabled`，或关闭自动规则且规则列表为空时，
+/// 未精确匹配的模型会直接透传给上游，不再在本地做隐式降级。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelMappingConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub auto_generate_rules: bool,
+    #[serde(default)]
+    pub rules: Vec<ModelMappingRule>,
+}
+
+impl Default for ModelMappingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_generate_rules: true,
+            rules: Vec::new(),
+        }
+    }
+}
+
+impl ModelMappingConfig {
+    pub fn normalized(mut self) -> Self {
+        self.rules = self
+            .rules
+            .into_iter()
+            .filter_map(ModelMappingRule::normalized)
+            .collect();
+        self
+    }
+}
+
 /// Kiro payload guard 的大小裁剪触发模式。
 ///
 /// `preemptive` 保持原有行为：发送上游前只要超过 `payloadGuardMaxBytes`
@@ -615,6 +698,23 @@ impl Default for PayloadGuardMode {
     }
 }
 
+/// 外部备用号池并发满时的处理模式。
+///
+/// `fail_fast` 保持历史行为：当前没有外部池并发槽时立即返回调度不可用。
+/// `wait` 会进入外部池独立等待队列，直到拿到外部池槽位或超过配置等待时间。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalPoolCapacityMode {
+    FailFast,
+    Wait,
+}
+
+impl Default for ExternalPoolCapacityMode {
+    fn default() -> Self {
+        Self::FailFast
+    }
+}
+
 /// 外部备用号池全局策略配置。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -625,6 +725,10 @@ pub struct ExternalPoolsConfig {
     pub external_pool_global_max_concurrent_requests: u32,
     #[serde(default)]
     pub external_pool_max_queued_requests: u32,
+    #[serde(default)]
+    pub external_pool_capacity_mode: ExternalPoolCapacityMode,
+    #[serde(default = "default_external_pool_dispatch_max_wait_secs")]
+    pub external_pool_dispatch_max_wait_secs: u64,
     #[serde(default)]
     pub external_pool_retry_max_attempts: u32,
     #[serde(default)]
@@ -669,6 +773,8 @@ pub struct ExternalPoolsConfig {
     pub external_pool_auto_disable_on_misconfigured_endpoint: bool,
     #[serde(default = "default_external_pool_auto_disable_failure_threshold")]
     pub external_pool_auto_disable_failure_threshold: u32,
+    #[serde(default = "default_external_pool_auto_disable_window_secs")]
+    pub external_pool_auto_disable_window_secs: u64,
     #[serde(default)]
     pub external_pool_auto_disable_duration_secs: u64,
     #[serde(default = "default_external_pool_rate_limit_cooldown_secs")]
@@ -687,6 +793,8 @@ impl Default for ExternalPoolsConfig {
             external_pools_enabled: false,
             external_pool_global_max_concurrent_requests: 0,
             external_pool_max_queued_requests: 0,
+            external_pool_capacity_mode: ExternalPoolCapacityMode::default(),
+            external_pool_dispatch_max_wait_secs: default_external_pool_dispatch_max_wait_secs(),
             external_pool_retry_max_attempts: 0,
             external_direct_policy_enabled: false,
             direct_external_on_local_maintenance: false,
@@ -713,6 +821,8 @@ impl Default for ExternalPoolsConfig {
             external_pool_auto_disable_on_misconfigured_endpoint: false,
             external_pool_auto_disable_failure_threshold:
                 default_external_pool_auto_disable_failure_threshold(),
+            external_pool_auto_disable_window_secs: default_external_pool_auto_disable_window_secs(
+            ),
             external_pool_auto_disable_duration_secs: 0,
             external_pool_rate_limit_cooldown_secs: default_external_pool_rate_limit_cooldown_secs(
             ),
@@ -1022,6 +1132,10 @@ pub struct Config {
     /// 是否允许在发送上游前映射为当前 Kiro 可用模型。
     #[serde(default = "default_model_resolution_mode")]
     pub model_resolution_mode: ModelResolutionMode,
+
+    /// 模型映射和兜底规则配置。
+    #[serde(default)]
+    pub model_mapping: ModelMappingConfig,
 
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
@@ -1379,6 +1493,14 @@ fn default_external_pool_auto_disable_failure_threshold() -> u32 {
     1
 }
 
+fn default_external_pool_auto_disable_window_secs() -> u64 {
+    60
+}
+
+fn default_external_pool_dispatch_max_wait_secs() -> u64 {
+    30
+}
+
 fn default_external_pool_rate_limit_cooldown_secs() -> u64 {
     30
 }
@@ -1509,6 +1631,7 @@ impl Default for Config {
             scheduler_top_k: default_scheduler_top_k(),
             compat_profile: default_compat_profile(),
             model_resolution_mode: default_model_resolution_mode(),
+            model_mapping: ModelMappingConfig::default(),
             extract_thinking: default_extract_thinking(),
             prompt_cache_target_read_ratio: default_prompt_cache_target_read_ratio(),
             prompt_cache_token_scale: default_prompt_cache_token_scale(),
@@ -1637,6 +1760,16 @@ mod tests {
         assert_eq!(config.scheduler_selection_pressure_weight, 25.0);
         assert_eq!(config.scheduler_total_selection_weight, 0.0);
         assert_eq!(config.scheduler_top_k, 3);
+        assert!(!config.external_pools.external_pools_enabled);
+        assert_eq!(
+            config.external_pools.external_pool_capacity_mode,
+            ExternalPoolCapacityMode::FailFast
+        );
+        assert_eq!(
+            config.external_pools.external_pool_dispatch_max_wait_secs,
+            30
+        );
+        assert_eq!(config.external_pools.external_pool_max_queued_requests, 0);
         assert!(!config.compression.enabled);
         assert!(config.compression.whitespace_compression);
         assert_eq!(
@@ -1692,6 +1825,53 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.compat_profile, CompatProfile::AnthropicStrict);
+    }
+
+    #[test]
+    fn external_pool_capacity_mode_deserializes_with_compatible_defaults() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "apiKey": "sk-test",
+                "externalPools": {
+                    "externalPoolsEnabled": true,
+                    "externalPoolMaxQueuedRequests": 25
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(config.external_pools.external_pools_enabled);
+        assert_eq!(
+            config.external_pools.external_pool_capacity_mode,
+            ExternalPoolCapacityMode::FailFast
+        );
+        assert_eq!(
+            config.external_pools.external_pool_dispatch_max_wait_secs,
+            30
+        );
+        assert_eq!(config.external_pools.external_pool_max_queued_requests, 25);
+
+        let wait_config: Config = serde_json::from_str(
+            r#"{
+                "apiKey": "sk-test",
+                "externalPools": {
+                    "externalPoolCapacityMode": "wait",
+                    "externalPoolDispatchMaxWaitSecs": 3
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            wait_config.external_pools.external_pool_capacity_mode,
+            ExternalPoolCapacityMode::Wait
+        );
+        assert_eq!(
+            wait_config
+                .external_pools
+                .external_pool_dispatch_max_wait_secs,
+            3
+        );
     }
 
     #[test]

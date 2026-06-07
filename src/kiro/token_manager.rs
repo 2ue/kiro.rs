@@ -2672,6 +2672,7 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    #[cfg(test)]
     pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
         self.acquire_context_for_session(model, None, &HashSet::new())
             .await

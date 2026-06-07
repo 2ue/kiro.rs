@@ -13,8 +13,9 @@ use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::model::config::{
-    CompatProfile, Config, ExternalPoolsConfig, ModelResolutionMode, PayloadGuardMode,
-    PayloadShapingConfig, PromptCacheSimulationMode, ReportedUsageConfig,
+    CompatProfile, Config, ExternalPoolCapacityMode, ExternalPoolsConfig, ModelMappingConfig,
+    ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig, PromptCacheSimulationMode,
+    ReportedUsageConfig,
 };
 use crate::token;
 use anyhow::Error;
@@ -134,6 +135,7 @@ struct RequestRuntimeConfig {
     reported_usage: ReportedUsageConfig,
     compat_profile: CompatProfile,
     model_resolution_mode: ModelResolutionMode,
+    model_mapping: ModelMappingConfig,
     expose_proxy_warnings: bool,
     payload_guard_enabled: bool,
     payload_guard_mode: PayloadGuardMode,
@@ -155,6 +157,7 @@ impl RequestRuntimeConfig {
             reported_usage: state.reported_usage.clone(),
             compat_profile: state.compat_profile,
             model_resolution_mode: state.model_resolution_mode,
+            model_mapping: state.model_mapping.clone().normalized(),
             expose_proxy_warnings: state.expose_proxy_warnings,
             payload_guard_enabled: state.payload_guard_enabled,
             payload_guard_mode: state.payload_guard_mode,
@@ -186,6 +189,7 @@ impl RequestRuntimeConfig {
             reported_usage: config.reported_usage.normalized(),
             compat_profile: config.compat_profile,
             model_resolution_mode: config.model_resolution_mode,
+            model_mapping: config.model_mapping.clone().normalized(),
             expose_proxy_warnings: config.expose_proxy_warnings || config.compat_profile.is_debug(),
             payload_guard_enabled: config.payload_guard_enabled,
             payload_guard_mode: config.payload_guard_mode,
@@ -327,8 +331,14 @@ fn build_external_fallback_context(
 
 impl ExternalFallbackContext {
     async fn should_fail_fast_local(&self) -> bool {
-        self.config.local_pool_preflight_enabled
-            && self.manager.has_available_pool(&self.config).await
+        if !self.config.local_pool_preflight_enabled {
+            return false;
+        }
+        if self.manager.has_available_pool(&self.config).await {
+            return true;
+        }
+        self.config.external_pool_capacity_mode == ExternalPoolCapacityMode::Wait
+            && self.manager.has_waitable_pool(&self.config).await
     }
 
     async fn direct_policy_response(&self, request_id: &str) -> Option<Response> {
@@ -364,7 +374,7 @@ impl ExternalFallbackContext {
             &local_attempts,
             &self.config,
         )?;
-        if !self.manager.has_available_pool(&self.config).await {
+        if !self.manager.has_eligible_pool(&self.config).await {
             return None;
         }
         let local_preflight = Some(json!({
@@ -1858,9 +1868,11 @@ fn resolve_request_model(
     endpoint: &'static str,
     payload: &MessagesRequest,
 ) -> Result<ModelResolution, Response> {
-    let resolution = state
-        .model_capabilities
-        .resolve_model_with_mode(&payload.model, runtime_config.model_resolution_mode);
+    let resolution = state.model_capabilities.resolve_model_with_mapping(
+        &payload.model,
+        runtime_config.model_resolution_mode,
+        &runtime_config.model_mapping,
+    );
     if resolution.source == ModelResolutionSource::Unsupported {
         tracing::warn!(
             endpoint,
@@ -3591,6 +3603,7 @@ mod tests {
             reported_usage: ReportedUsageConfig::default(),
             compat_profile: CompatProfile::ClaudeCode,
             model_resolution_mode: ModelResolutionMode::Compatible,
+            model_mapping: ModelMappingConfig::default(),
             expose_proxy_warnings: false,
             payload_guard_enabled: enabled,
             payload_guard_mode: mode,

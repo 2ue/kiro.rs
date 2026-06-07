@@ -45,6 +45,16 @@
 
 1. 外部池流式响应在拿到上游响应头后即返回下游，并记录外部池尝试成功；并发 lease 会随 stream 结束或连接关闭释放。若上游在响应头之后发生流式读取错误，该错误会传播给下游连接，但当前不会二次回写 usage record 为失败。该限制只影响 usage 观测精度，不影响外部池并发释放、换池决策或本地凭据调度。
 
+数据保护与备份硬约束：
+
+1. 本地 Kiro 凭据和外部备用号池配置都属于生产核心数据，后续任何升级、发版、迁移、默认配置填充、模型映射规则生成，都不能覆盖、删除或重建这两类数据。
+2. 当前存储边界是三套独立数据：运行配置写入 `runtime_config`，本地凭据写入 `credentials`，外部备用号池写入 `external_upstream_pools`。修改 `runtime_config` 时不能隐式改写 `credentials` 或 `external_upstream_pools`。
+3. 后续代码变更必须保持凭据保存的非破坏性语义：`save_credentials()` 只能 upsert 传入凭据，不能因为当前进程内存快照缺少某些 ID 就软删除或覆盖数据库里的其他凭据。
+4. 外部池更新必须保持局部更新语义：编辑某个外部池只能更新该 `id` 对应行；空 `apiKey` 更新请求必须表示保留原 key，不能把密钥写空。
+5. 发版、部署、迁移前必须备份 `credentials`、`external_upstream_pools`、`runtime_config`。如果使用 PgSQL，最低要求是导出这三张表；如果使用 docker volume，还需要保留对应数据库 volume 快照。
+6. 管理后台“填充默认规则”只能填充或更新模型映射规则，不允许清空凭据列表、不允许清空外部池列表、不允许重置外部池启用状态、自动禁用状态、并发配置和密钥。
+7. 若后续需要引入新的初始化逻辑，必须采用“数据库已有数据优先”的策略：只有目标表为空时才允许从文件或默认值 bootstrap；数据库已有数据时，文件配置只能作为缺失字段补默认，不能作为覆盖源。
+
 第一版验证结果：
 
 - `cargo test --locked --no-default-features`：439 个 Rust 测试通过。
@@ -219,6 +229,7 @@
   "externalPoolAutoDisableOnQuotaExhausted": false,
   "externalPoolAutoDisableOnMisconfiguredEndpoint": false,
   "externalPoolAutoDisableFailureThreshold": 1,
+  "externalPoolAutoDisableWindowSecs": 60,
   "externalPoolAutoDisableDurationSecs": 0
 }
 ```
@@ -231,6 +242,7 @@
 - `externalPoolAutoDisableOnQuotaExhausted=false`：额度耗尽默认不自动禁用，因为有些外部池额度会按周期恢复；开启后可自动禁用。
 - `externalPoolAutoDisableOnMisconfiguredEndpoint=false`：baseUrl、路径、认证方式明显配置错误时默认不自动禁用，避免临时网络或外部池升级误伤。
 - `externalPoolAutoDisableFailureThreshold=1`：满足自动禁用条件的连续失败次数阈值。认证、安全锁这类确定性错误建议 1 次即可。
+- `externalPoolAutoDisableWindowSecs=60`：自动禁用失败计数统计窗口。只有同一外部池、同一错误原因在该窗口内累计到阈值，才会触发自动禁用。该字段独立于本地池熔断保留字段。
 - `externalPoolAutoDisableDurationSecs=0`：`0` 表示自动禁用后不自动恢复，需要管理员手动解除；大于 0 表示禁用到指定秒数后自动恢复。
 
 调度过滤必须同时满足：
@@ -1086,6 +1098,7 @@ fn should_fallback(kind: LocalPoolFailureKind, config: &ExternalPoolConfig) -> b
   "externalPoolAutoDisableOnQuotaExhausted": false,
   "externalPoolAutoDisableOnMisconfiguredEndpoint": false,
   "externalPoolAutoDisableFailureThreshold": 1,
+  "externalPoolAutoDisableWindowSecs": 60,
   "externalPoolAutoDisableDurationSecs": 0
 }
 ```
@@ -1161,6 +1174,8 @@ fn should_fallback(kind: LocalPoolFailureKind, config: &ExternalPoolConfig) -> b
   - 外部池 baseUrl、路径、认证方式明显配置错误时是否自动禁用，默认关闭。
 - `externalPoolAutoDisableFailureThreshold`
   - 满足自动禁用错误条件的连续失败次数阈值，默认 `1`。
+- `externalPoolAutoDisableWindowSecs`
+  - 自动禁用失败计数统计窗口，默认 `60s`。该字段独立于本地池 circuit 保留字段。
 - `externalPoolAutoDisableDurationSecs`
   - 自动禁用持续时间。`0` 表示直到管理员手动解除。
 
@@ -1520,9 +1535,9 @@ external_pool:{id}:auto_disable_failures:{reason}
 
 - `last_seen/acquired/kind` 是 Redis lease 的三组状态，单池和全局各一份。
 - 单池 `maxConcurrentRequests` 和全局 `externalPoolGlobalMaxConcurrentRequests` 都通过 Redis Lua 原子判断与占用。
-- 流式外部池请求会把 lease 持有到 stream 结束或客户端断开。
+- 流式外部池请求会把 lease 持有到 stream 结束或客户端断开，并在请求存活期间周期性续租，避免长流式请求被过期清理后错误释放并发槽。
 - cooldown 写入 `external_pool:{id}:cooldown`，同时保留进程内 fallback 状态；多实例以 Redis 为准。
-- 自动禁用失败计数使用 `external_pool:{id}:auto_disable_failures:{reason}`，自动禁用最终状态写入 PgSQL。
+- 自动禁用失败计数使用 `external_pool:{id}:auto_disable_failures:{reason}`，TTL 使用 `externalPoolAutoDisableWindowSecs`，自动禁用最终状态写入 PgSQL。
 - 第一版没有实现外部池 session 粘性绑定；外部池之间按优先级和 in-flight 占比均衡。
 
 如果需要页面展示长期统计，可以定期或请求结束时写 PgSQL 观测字段，但并发 lease 不建议使用 PgSQL 字段实现。
@@ -1949,6 +1964,7 @@ external_pool_attempt pool_id=3 status=200 action=success
   "externalPoolAutoDisableOnQuotaExhausted": false,
   "externalPoolAutoDisableOnMisconfiguredEndpoint": false,
   "externalPoolAutoDisableFailureThreshold": 1,
+  "externalPoolAutoDisableWindowSecs": 60,
   "externalPoolAutoDisableDurationSecs": 0,
   "externalPoolRateLimitCooldownSecs": 30,
   "externalPoolServerErrorCooldownSecs": 10,

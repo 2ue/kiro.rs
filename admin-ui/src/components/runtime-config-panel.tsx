@@ -8,11 +8,16 @@ import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { getAccessKeys, updateAdminApiKey } from '@/api/credentials'
 import { useRuntimeConfig, useUpdateRuntimeConfig } from '@/hooks/use-credentials'
+import { useModelCapabilities } from '@/hooks/use-usage'
 import { storage } from '@/lib/storage'
 import { extractErrorMessage } from '@/lib/utils'
 import type {
   AccessKeysResponse,
   CompatProfile,
+  ModelCapabilitiesStatus,
+  ModelMappingConfig,
+  ModelMappingRule,
+  ModelMappingRuleKind,
   ModelResolutionMode,
   PayloadGuardMode,
   PayloadShapingConfig,
@@ -102,6 +107,8 @@ export const defaultExternalPoolsConfig = () => ({
   externalPoolsEnabled: false,
   externalPoolGlobalMaxConcurrentRequests: 0,
   externalPoolMaxQueuedRequests: 0,
+  externalPoolCapacityMode: 'fail_fast' as const,
+  externalPoolDispatchMaxWaitSecs: 30,
   externalPoolRetryMaxAttempts: 0,
   externalDirectPolicyEnabled: false,
   directExternalOnLocalMaintenance: false,
@@ -124,12 +131,103 @@ export const defaultExternalPoolsConfig = () => ({
   externalPoolAutoDisableOnQuotaExhausted: false,
   externalPoolAutoDisableOnMisconfiguredEndpoint: false,
   externalPoolAutoDisableFailureThreshold: 1,
+  externalPoolAutoDisableWindowSecs: 60,
   externalPoolAutoDisableDurationSecs: 0,
   externalPoolRateLimitCooldownSecs: 30,
   externalPoolServerErrorCooldownSecs: 10,
   externalPoolNetworkErrorCooldownSecs: 10,
   externalPoolProtocolErrorCooldownSecs: 10,
 })
+
+const defaultModelMappingConfig = (): ModelMappingConfig => ({
+  enabled: true,
+  autoGenerateRules: true,
+  rules: [],
+})
+
+function normalizeModelMapping(config?: Partial<ModelMappingConfig> | null): ModelMappingConfig {
+  return {
+    ...defaultModelMappingConfig(),
+    ...(config || {}),
+    rules: (config?.rules || [])
+      .map((rule) => ({
+        enabled: rule.enabled !== false,
+        source: rule.source.trim().toLowerCase(),
+        target: rule.target.trim().toLowerCase(),
+        kind: rule.kind || 'alias',
+        note: rule.note?.trim() || null,
+      }))
+      .filter((rule) => rule.source && rule.target),
+  }
+}
+
+function modelVersionNumbers(model: string): number[] {
+  return (model.match(/\d+/g) || []).map((part) => Number(part))
+}
+
+function compareModelId(a: string, b: string): number {
+  const av = modelVersionNumbers(a)
+  const bv = modelVersionNumbers(b)
+  const len = Math.max(av.length, bv.length)
+  for (let index = 0; index < len; index += 1) {
+    const delta = (av[index] || 0) - (bv[index] || 0)
+    if (delta !== 0) return delta
+  }
+  if (a.endsWith('-thinking') !== b.endsWith('-thinking')) return a.endsWith('-thinking') ? -1 : 1
+  return a.localeCompare(b)
+}
+
+function addModelRule(rules: ModelMappingRule[], rule: ModelMappingRule) {
+  const source = rule.source.trim().toLowerCase()
+  const target = rule.target.trim().toLowerCase()
+  if (!source || !target || source === target) return
+  if (rules.some((item) => item.source === source && item.target === target && item.kind === rule.kind)) return
+  rules.push({ ...rule, source, target, enabled: rule.enabled !== false })
+}
+
+function versionEquivalentSource(model: string): string | null {
+  const match = model.match(/^claude-(opus|sonnet|haiku)-(\d+)([.-])(\d{1,3})(-\d{6,})?(-thinking)?$/)
+  if (!match) return null
+  const [, family, major, separator, minor, , thinking = ''] = match
+  return separator === '.'
+    ? `claude-${family}-${major}-${minor}${thinking}`
+    : `claude-${family}-${major}.${minor}${thinking}`
+}
+
+function generateDefaultModelMappingRules(status?: ModelCapabilitiesStatus): ModelMappingRule[] {
+  const models = (status?.models || []).map((item) => item.model.trim().toLowerCase()).filter(Boolean)
+  const rules: ModelMappingRule[] = []
+  for (const model of models) {
+    const source = versionEquivalentSource(model)
+    if (source) {
+      addModelRule(rules, {
+        enabled: true,
+        source,
+        target: model,
+        kind: 'version_equivalent',
+        note: '由当前上游模型列表生成的 dash/dot 小版本等价映射',
+      })
+    }
+  }
+
+  const pickFamily = (family: 'opus' | 'sonnet' | 'haiku') =>
+    {
+      const sorted = models
+      .filter((model) => model === family || model.startsWith(`claude-${family}`))
+      .sort(compareModelId)
+      return sorted[sorted.length - 1]
+    }
+
+  const opus = pickFamily('opus')
+  const sonnet = pickFamily('sonnet')
+  const haiku = pickFamily('haiku')
+  for (const source of ['opus', 'opusplan', 'best', 'default', 'auto']) {
+    if (opus) addModelRule(rules, { enabled: true, source, target: opus, kind: 'alias', note: '由当前上游 Opus 模型生成的默认别名' })
+  }
+  if (sonnet) addModelRule(rules, { enabled: true, source: 'sonnet', target: sonnet, kind: 'alias', note: '由当前上游 Sonnet 模型生成的默认别名' })
+  if (haiku) addModelRule(rules, { enabled: true, source: 'haiku', target: haiku, kind: 'alias', note: '由当前上游 Haiku 模型生成的默认别名' })
+  return rules
+}
 
 const emptyConfig: RuntimeConfig = {
   proxyUrl: null,
@@ -183,6 +281,7 @@ const emptyConfig: RuntimeConfig = {
   highCacheThreshold: 10000,
   compatProfile: 'claude-code',
   modelResolutionMode: 'compatible',
+  modelMapping: defaultModelMappingConfig(),
   extractThinking: true,
   exposeProxyWarnings: false,
 }
@@ -660,6 +759,119 @@ function ModelResolutionSelectField({ value, onChange }: ModelResolutionSelectFi
   )
 }
 
+interface ModelMappingRulesFieldProps {
+  value: ModelMappingConfig
+  defaultRules: ModelMappingRule[]
+  capabilitiesLoading: boolean
+  onChange: (value: ModelMappingConfig) => void
+}
+
+function ModelMappingRulesField({
+  value,
+  defaultRules,
+  capabilitiesLoading,
+  onChange,
+}: ModelMappingRulesFieldProps) {
+  const updateRule = (index: number, patch: Partial<ModelMappingRule>) => {
+    const rules = value.rules.map((rule, ruleIndex) =>
+      ruleIndex === index ? { ...rule, ...patch } : rule
+    )
+    onChange({ ...value, rules })
+  }
+  const addRule = () => {
+    onChange({
+      ...value,
+      rules: [
+        ...value.rules,
+        { enabled: true, source: '', target: '', kind: 'fallback', note: '' },
+      ],
+    })
+  }
+  const removeRule = (index: number) => {
+    onChange({ ...value, rules: value.rules.filter((_, ruleIndex) => ruleIndex !== index) })
+  }
+  const fillDefaultRules = () => {
+    if (!defaultRules.length) {
+      toast.error('当前模型能力列表为空，无法生成默认规则')
+      return
+    }
+    onChange({ ...value, enabled: true, autoGenerateRules: true, rules: defaultRules })
+    toast.success(`已填充 ${defaultRules.length} 条默认模型映射规则`)
+  }
+
+  return (
+    <div className="rounded-md border bg-background p-4">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+        <div>
+          <div className="text-sm font-medium">模型映射与兜底规则</div>
+          <div className="mt-1 text-xs leading-5 text-muted-foreground">
+            请求会先精确匹配上游模型 ID；未命中时按版本等价、显式别名、兜底规则执行。关闭映射或清空规则并关闭自动生成后，未命中的模型会透传给上游。
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Button type="button" variant="outline" size="sm" disabled={capabilitiesLoading} onClick={fillDefaultRules}>
+            <Wand2 className="mr-2 h-4 w-4" />
+            填充默认规则
+          </Button>
+          <Button type="button" variant="outline" size="sm" onClick={addRule}>添加规则</Button>
+        </div>
+      </div>
+      <div className="mt-4 grid gap-3 md:grid-cols-2">
+        <ToggleField
+          title="启用模型映射"
+          description="关闭后只保留上游模型精确匹配；其他模型名直接透传，不做本地映射或兜底。"
+          checked={value.enabled}
+          onCheckedChange={(enabled) => onChange({ ...value, enabled })}
+        />
+        <ToggleField
+          title="自动生成规则"
+          description="开启后会按当前上游模型列表自动启用 dash/dot 小版本等价和常用别名；手动规则仍可覆盖补充。"
+          checked={value.autoGenerateRules}
+          onCheckedChange={(autoGenerateRules) => onChange({ ...value, autoGenerateRules })}
+          disabled={!value.enabled}
+        />
+      </div>
+      <div className="mt-4 rounded-md border">
+        <div className="grid grid-cols-[72px_1fr_1fr_150px_44px] gap-2 border-b bg-muted/40 px-3 py-2 text-xs font-medium text-muted-foreground">
+          <span>启用</span>
+          <span>请求模型</span>
+          <span>目标上游模型</span>
+          <span>类型</span>
+          <span />
+        </div>
+        {value.rules.length === 0 ? (
+          <div className="px-3 py-4 text-sm text-muted-foreground">暂无手动规则。开启自动生成时仍会按当前上游模型列表生成默认映射。</div>
+        ) : (
+          value.rules.map((rule, index) => (
+            <div key={`${rule.source}-${rule.target}-${index}`} className="grid grid-cols-[72px_1fr_1fr_150px_44px] gap-2 border-b px-3 py-2 last:border-b-0">
+              <div className="flex items-center">
+                <Switch checked={rule.enabled} onCheckedChange={(enabled) => updateRule(index, { enabled })} />
+              </div>
+              <Input value={rule.source} placeholder="claude-opus-4-8" onChange={(event) => updateRule(index, { source: event.target.value })} />
+              <Input value={rule.target} placeholder="claude-opus-4.8" onChange={(event) => updateRule(index, { target: event.target.value })} />
+              <select
+                className="h-10 rounded-md border border-input bg-background px-3 py-2 text-sm"
+                value={rule.kind}
+                onChange={(event) => updateRule(index, { kind: event.target.value as ModelMappingRuleKind })}
+              >
+                <option value="version_equivalent">版本等价</option>
+                <option value="alias">别名</option>
+                <option value="fallback">兜底</option>
+              </select>
+              <Button type="button" variant="ghost" size="icon" onClick={() => removeRule(index)}>
+                <Trash2 className="h-4 w-4" />
+              </Button>
+            </div>
+          ))
+        )}
+      </div>
+      <div className="mt-3 text-xs text-muted-foreground">
+        当前手动规则 {value.rules.length} 条；可生成默认规则 {defaultRules.length} 条。保存后新请求热加载生效。
+      </div>
+    </div>
+  )
+}
+
 interface PolicyNumberInputProps {
   title: string
   description: string
@@ -974,6 +1186,7 @@ function fieldNeedsTarget(policy: ReportedUsageFieldPolicy): boolean {
 export function RuntimeConfigPanel() {
   const config = useRuntimeConfig()
   const updateConfig = useUpdateRuntimeConfig()
+  const modelCapabilities = useModelCapabilities()
   const [draft, setDraft] = useState<RuntimeConfig>(emptyConfig)
 
   useEffect(() => {
@@ -989,6 +1202,7 @@ export function RuntimeConfigPanel() {
           ...defaultExternalPoolsConfig(),
           ...config.data.externalPools,
         },
+        modelMapping: normalizeModelMapping(config.data.modelMapping),
       })
     }
   }, [config.data])
@@ -1035,11 +1249,13 @@ export function RuntimeConfigPanel() {
       promptCacheCapJitterMaxTokens: toWhole(draft.promptCacheCapJitterMaxTokens),
       promptCacheScaleMinInputTokens: toWhole(draft.promptCacheScaleMinInputTokens),
       reportedUsage: normalizeReportedUsage(draft.reportedUsage),
+      modelMapping: normalizeModelMapping(draft.modelMapping),
       externalPools: {
         ...defaultExternalPoolsConfig(),
         ...draft.externalPools,
         externalPoolGlobalMaxConcurrentRequests: toWhole(draft.externalPools.externalPoolGlobalMaxConcurrentRequests),
         externalPoolMaxQueuedRequests: toWhole(draft.externalPools.externalPoolMaxQueuedRequests),
+        externalPoolDispatchMaxWaitSecs: toWhole(draft.externalPools.externalPoolDispatchMaxWaitSecs),
         externalPoolRetryMaxAttempts: toWhole(draft.externalPools.externalPoolRetryMaxAttempts),
         localPoolCircuitWindowSecs: toWhole(draft.externalPools.localPoolCircuitWindowSecs, 1),
         localPoolCircuitOpenAfterFailures: toWhole(draft.externalPools.localPoolCircuitOpenAfterFailures, 1),
@@ -1047,6 +1263,7 @@ export function RuntimeConfigPanel() {
         localPoolCircuitOpenSecs: toWhole(draft.externalPools.localPoolCircuitOpenSecs, 1),
         localPoolCircuitHalfOpenMaxProbes: toWhole(draft.externalPools.localPoolCircuitHalfOpenMaxProbes, 1),
         externalPoolAutoDisableFailureThreshold: toWhole(draft.externalPools.externalPoolAutoDisableFailureThreshold, 1),
+        externalPoolAutoDisableWindowSecs: toWhole(draft.externalPools.externalPoolAutoDisableWindowSecs, 1),
         externalPoolAutoDisableDurationSecs: toWhole(draft.externalPools.externalPoolAutoDisableDurationSecs),
         externalPoolRateLimitCooldownSecs: toWhole(draft.externalPools.externalPoolRateLimitCooldownSecs, 1),
         externalPoolServerErrorCooldownSecs: toWhole(draft.externalPools.externalPoolServerErrorCooldownSecs, 1),
@@ -1085,6 +1302,7 @@ export function RuntimeConfigPanel() {
   const payloadShapingBranchEnabled = payloadSizeLimitEnabled && draft.payloadShaping.enabled
   const payloadGuardMode = draft.payloadGuardMode ?? 'preemptive'
   const payloadGuardRetryMode = payloadGuardMode === 'on_too_long'
+  const defaultModelMappingRules = generateDefaultModelMappingRules(modelCapabilities.data)
   const payloadConditionTitle = payloadGuardRetryMode
     ? '仅在上游返回输入过长后重试时执行'
     : '仅当发送前请求体超过上方阈值时执行'
@@ -1781,6 +1999,12 @@ export function RuntimeConfigPanel() {
               onChange={(modelResolutionMode) =>
                 setDraft((prev) => ({ ...prev, modelResolutionMode }))
               }
+            />
+            <ModelMappingRulesField
+              value={draft.modelMapping}
+              defaultRules={defaultModelMappingRules}
+              capabilitiesLoading={modelCapabilities.isLoading}
+              onChange={(modelMapping) => setDraft((prev) => ({ ...prev, modelMapping }))}
             />
             <ToggleField
               title="提取 Thinking 内容块"

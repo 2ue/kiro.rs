@@ -774,6 +774,8 @@ pub struct ProxyWarnings {
     pub orphan_tool_uses: u32,
     /// 历史中重复出现的 tool_result（已配对过）被跳过
     pub duplicate_tool_results: u32,
+    /// user 消息只有 tool_result 且文本为空时补了 Kiro content 占位
+    pub tool_result_content_placeholders: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -808,6 +810,12 @@ impl ProxyWarnings {
             parts.push(format!(
                 "duplicate-tool-result={}",
                 self.duplicate_tool_results
+            ));
+        }
+        if self.tool_result_content_placeholders > 0 {
+            parts.push(format!(
+                "tool-result-content-placeholder={}",
+                self.tool_result_content_placeholders
             ));
         }
         if parts.is_empty() {
@@ -1100,6 +1108,10 @@ fn convert_request_with_model_id(
     let mut content = text_content;
     if !options.is_strict() {
         append_orphan_tool_result_texts(&mut content, &orphan_tool_result_texts);
+    }
+    if content.trim().is_empty() && !context.tool_results.is_empty() {
+        content = " ".to_string();
+        warnings.tool_result_content_placeholders += 1;
     }
 
     let mut user_input = UserInputMessage::new(content, &model_id)
@@ -2075,7 +2087,10 @@ fn merge_user_messages(
         all_tool_results.extend(tool_results);
     }
 
-    let content = content_parts.join("\n");
+    let mut content = content_parts.join("\n");
+    if content.trim().is_empty() && !all_tool_results.is_empty() {
+        content = " ".to_string();
+    }
     // 保留文本内容，即使有工具结果也不丢弃用户文本
     let mut user_msg = UserMessage::new(&content, model_id);
 
@@ -2918,6 +2933,119 @@ mod tests {
         assert!(
             tools.iter().any(|t| t.tool_specification.name == "read"),
             "tools 列表应包含 'read' 工具的占位符定义"
+        );
+    }
+
+    #[test]
+    fn current_tool_result_only_message_gets_content_placeholder() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Read the file"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tool-1", "name": "read", "input": {"path": "/test.txt"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "file content"}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let current = &result.conversation_state.current_message.user_input_message;
+
+        assert_eq!(current.content, " ");
+        assert_eq!(current.user_input_message_context.tool_results.len(), 1);
+        assert_eq!(result.warnings.tool_result_content_placeholders, 1);
+    }
+
+    #[test]
+    fn history_tool_result_only_message_gets_content_placeholder() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Read the file"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tool-1", "name": "read", "input": {"path": "/test.txt"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "file content"}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("The file contains content."),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("Continue"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let tool_result_user = result
+            .conversation_state
+            .history
+            .iter()
+            .find_map(|message| match message {
+                Message::User(user)
+                    if !user
+                        .user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .is_empty() =>
+                {
+                    Some(&user.user_input_message)
+                }
+                _ => None,
+            })
+            .expect("history should contain the tool_result user message");
+
+        assert_eq!(tool_result_user.content, " ");
+        assert_eq!(
+            tool_result_user
+                .user_input_message_context
+                .tool_results
+                .len(),
+            1
         );
     }
 
