@@ -23,6 +23,10 @@ use crate::anthropic::usage::{
     UsageSeriesPoint, UsageSummary, UsageTopAggregate, usage_dashboard_daily_windows,
     usage_dashboard_hourly_windows, usage_dashboard_timezone, usage_dashboard_windows,
 };
+use crate::external_pool::{
+    CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
+    ExternalPoolUsageProjectionMode, UpdateExternalPoolRequest, mask_external_pool_key,
+};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
@@ -332,6 +336,261 @@ impl PostgresStore {
         if self.load_runtime_config().await?.is_none() {
             self.save_runtime_config(file_config).await?;
         }
+        Ok(())
+    }
+
+    pub async fn list_external_pools(
+        &self,
+        mask_secrets: bool,
+    ) -> anyhow::Result<Vec<ExternalPool>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, name, base_url, api_key, auth_type, enabled, priority,
+                   max_concurrent_requests, usage_projection_mode, auto_disable_policy,
+                   auto_disabled, auto_disabled_reason, auto_disabled_at,
+                   auto_disabled_until, auto_disabled_last_error, preserve_path, notes,
+                   created_at, updated_at
+            FROM external_upstream_pools
+            WHERE deleted_at IS NULL
+            ORDER BY priority ASC, id ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| external_pool_from_row(row, mask_secrets))
+            .collect()
+    }
+
+    pub async fn get_external_pool(
+        &self,
+        id: u64,
+        mask_secrets: bool,
+    ) -> anyhow::Result<Option<ExternalPool>> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, name, base_url, api_key, auth_type, enabled, priority,
+                   max_concurrent_requests, usage_projection_mode, auto_disable_policy,
+                   auto_disabled, auto_disabled_reason, auto_disabled_at,
+                   auto_disabled_until, auto_disabled_last_error, preserve_path, notes,
+                   created_at, updated_at
+            FROM external_upstream_pools
+            WHERE id = $1 AND deleted_at IS NULL
+            "#,
+        )
+        .bind(id as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| external_pool_from_row(row, mask_secrets))
+            .transpose()
+    }
+
+    pub async fn create_external_pool(
+        &self,
+        request: CreateExternalPoolRequest,
+    ) -> anyhow::Result<ExternalPool> {
+        validate_external_pool_input(
+            &request.name,
+            &request.base_url,
+            request.max_concurrent_requests,
+        )?;
+        let row = sqlx::query(
+            r#"
+            INSERT INTO external_upstream_pools (
+                name, base_url, api_key, auth_type, enabled, priority,
+                max_concurrent_requests, usage_projection_mode, auto_disable_policy,
+                preserve_path, notes, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
+            RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
+                      max_concurrent_requests, usage_projection_mode, auto_disable_policy,
+                      auto_disabled, auto_disabled_reason, auto_disabled_at,
+                      auto_disabled_until, auto_disabled_last_error, preserve_path, notes,
+                      created_at, updated_at
+            "#,
+        )
+        .bind(request.name.trim())
+        .bind(request.base_url.trim().trim_end_matches('/'))
+        .bind(request.api_key.trim())
+        .bind(request.auth_type.as_str())
+        .bind(request.enabled)
+        .bind(request.priority)
+        .bind(request.max_concurrent_requests as i32)
+        .bind(request.usage_projection_mode.as_str())
+        .bind(request.auto_disable_policy.as_str())
+        .bind(request.preserve_path)
+        .bind(request.notes.map(|notes| notes.trim().to_string()))
+        .fetch_one(&self.pool)
+        .await?;
+        external_pool_from_row(row, true)
+    }
+
+    pub async fn update_external_pool(
+        &self,
+        id: u64,
+        request: UpdateExternalPoolRequest,
+    ) -> anyhow::Result<Option<ExternalPool>> {
+        let Some(current) = self.get_external_pool(id, false).await? else {
+            return Ok(None);
+        };
+        let name = request.name.unwrap_or(current.name).trim().to_string();
+        let base_url = request
+            .base_url
+            .unwrap_or(current.base_url)
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+        let api_key = request
+            .api_key
+            .filter(|value| !value.trim().is_empty())
+            .or(current.api_key)
+            .unwrap_or_default();
+        let auth_type = request.auth_type.unwrap_or(current.auth_type);
+        let enabled = request.enabled.unwrap_or(current.enabled);
+        let priority = request.priority.unwrap_or(current.priority);
+        let max_concurrent_requests = request
+            .max_concurrent_requests
+            .unwrap_or(current.max_concurrent_requests);
+        let usage_projection_mode = request
+            .usage_projection_mode
+            .unwrap_or(current.usage_projection_mode);
+        let auto_disable_policy = request
+            .auto_disable_policy
+            .unwrap_or(current.auto_disable_policy);
+        let preserve_path = request.preserve_path.unwrap_or(current.preserve_path);
+        let notes = request.notes.or(current.notes);
+        validate_external_pool_input(&name, &base_url, max_concurrent_requests)?;
+        let row = sqlx::query(
+            r#"
+            UPDATE external_upstream_pools
+            SET name = $2,
+                base_url = $3,
+                api_key = $4,
+                auth_type = $5,
+                enabled = $6,
+                priority = $7,
+                max_concurrent_requests = $8,
+                usage_projection_mode = $9,
+                auto_disable_policy = $10,
+                preserve_path = $11,
+                notes = $12,
+                updated_at = now()
+            WHERE id = $1 AND deleted_at IS NULL
+            RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
+                      max_concurrent_requests, usage_projection_mode, auto_disable_policy,
+                      auto_disabled, auto_disabled_reason, auto_disabled_at,
+                      auto_disabled_until, auto_disabled_last_error, preserve_path, notes,
+                      created_at, updated_at
+            "#,
+        )
+        .bind(id as i64)
+        .bind(name)
+        .bind(base_url)
+        .bind(api_key.trim())
+        .bind(auth_type.as_str())
+        .bind(enabled)
+        .bind(priority)
+        .bind(max_concurrent_requests as i32)
+        .bind(usage_projection_mode.as_str())
+        .bind(auto_disable_policy.as_str())
+        .bind(preserve_path)
+        .bind(notes)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(Some(external_pool_from_row(row, true)?))
+    }
+
+    pub async fn set_external_pool_enabled(
+        &self,
+        id: u64,
+        enabled: bool,
+    ) -> anyhow::Result<Option<ExternalPool>> {
+        let row = sqlx::query(
+            r#"
+            UPDATE external_upstream_pools
+            SET enabled = $2, updated_at = now()
+            WHERE id = $1 AND deleted_at IS NULL
+            RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
+                      max_concurrent_requests, usage_projection_mode, auto_disable_policy,
+                      auto_disabled, auto_disabled_reason, auto_disabled_at,
+                      auto_disabled_until, auto_disabled_last_error, preserve_path, notes,
+                      created_at, updated_at
+            "#,
+        )
+        .bind(id as i64)
+        .bind(enabled)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| external_pool_from_row(row, true)).transpose()
+    }
+
+    pub async fn soft_delete_external_pool(&self, id: u64) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE external_upstream_pools SET deleted_at = now(), updated_at = now() WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(id as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn clear_external_pool_auto_disabled(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<Option<ExternalPool>> {
+        let row = sqlx::query(
+            r#"
+            UPDATE external_upstream_pools
+            SET auto_disabled = false,
+                auto_disabled_reason = NULL,
+                auto_disabled_at = NULL,
+                auto_disabled_until = NULL,
+                auto_disabled_last_error = NULL,
+                updated_at = now()
+            WHERE id = $1 AND deleted_at IS NULL
+            RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
+                      max_concurrent_requests, usage_projection_mode, auto_disable_policy,
+                      auto_disabled, auto_disabled_reason, auto_disabled_at,
+                      auto_disabled_until, auto_disabled_last_error, preserve_path, notes,
+                      created_at, updated_at
+            "#,
+        )
+        .bind(id as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| external_pool_from_row(row, true)).transpose()
+    }
+
+    pub async fn auto_disable_external_pool(
+        &self,
+        id: u64,
+        reason: &str,
+        last_error: &str,
+        duration_secs: u64,
+    ) -> anyhow::Result<()> {
+        let until = if duration_secs == 0 {
+            None
+        } else {
+            Some(Utc::now() + chrono::Duration::seconds(duration_secs as i64))
+        };
+        sqlx::query(
+            r#"
+            UPDATE external_upstream_pools
+            SET auto_disabled = true,
+                auto_disabled_reason = $2,
+                auto_disabled_at = now(),
+                auto_disabled_until = $3,
+                auto_disabled_last_error = $4,
+                updated_at = now()
+            WHERE id = $1 AND deleted_at IS NULL
+            "#,
+        )
+        .bind(id as i64)
+        .bind(reason)
+        .bind(until)
+        .bind(last_error)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -2720,6 +2979,58 @@ fn runtime_state_from_row(row: &PgRow) -> anyhow::Result<CredentialRuntimeStateR
     })
 }
 
+fn external_pool_from_row(row: PgRow, mask_secrets: bool) -> anyhow::Result<ExternalPool> {
+    let id: i64 = row.try_get("id")?;
+    let api_key: String = row.try_get("api_key")?;
+    let auth_type: String = row.try_get("auth_type")?;
+    let usage_projection_mode: String = row.try_get("usage_projection_mode")?;
+    let auto_disable_policy: String = row.try_get("auto_disable_policy")?;
+    let max_concurrent_requests: i32 = row.try_get("max_concurrent_requests")?;
+    Ok(ExternalPool {
+        id: id.max(0) as u64,
+        name: row.try_get("name")?,
+        base_url: row.try_get("base_url")?,
+        api_key: (!mask_secrets).then_some(api_key.clone()),
+        masked_api_key: Some(mask_external_pool_key(&api_key)),
+        auth_type: ExternalPoolAuthType::parse(&auth_type),
+        enabled: row.try_get("enabled")?,
+        priority: row.try_get("priority")?,
+        max_concurrent_requests: max_concurrent_requests.max(1) as u32,
+        usage_projection_mode: ExternalPoolUsageProjectionMode::parse(&usage_projection_mode),
+        auto_disable_policy: ExternalPoolAutoDisablePolicy::parse(&auto_disable_policy),
+        auto_disabled: row.try_get("auto_disabled")?,
+        auto_disabled_reason: row.try_get("auto_disabled_reason")?,
+        auto_disabled_at: row.try_get("auto_disabled_at")?,
+        auto_disabled_until: row.try_get("auto_disabled_until")?,
+        auto_disabled_last_error: row.try_get("auto_disabled_last_error")?,
+        preserve_path: row.try_get("preserve_path")?,
+        notes: row.try_get("notes")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn validate_external_pool_input(
+    name: &str,
+    base_url: &str,
+    max_concurrent_requests: u32,
+) -> anyhow::Result<()> {
+    if name.trim().is_empty() {
+        anyhow::bail!("外部池名称不能为空");
+    }
+    if base_url.trim().is_empty() {
+        anyhow::bail!("外部池 baseUrl 不能为空");
+    }
+    let parsed = url::Url::parse(base_url.trim())?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        anyhow::bail!("外部池 baseUrl 只支持 http/https");
+    }
+    if max_concurrent_requests == 0 {
+        anyhow::bail!("外部池 maxConcurrentRequests 必须大于 0");
+    }
+    Ok(())
+}
+
 async fn upsert_last_used_at(
     tx: &mut Transaction<'_, Postgres>,
     credential_id: u64,
@@ -2912,6 +3223,85 @@ ALTER TABLE proxy_resources
 
 CREATE INDEX IF NOT EXISTS idx_proxy_resources_active
     ON proxy_resources (id)
+    WHERE deleted_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS external_upstream_pools (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    api_key TEXT NOT NULL,
+    auth_type TEXT NOT NULL DEFAULT 'bearer',
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    priority INTEGER NOT NULL DEFAULT 100,
+    max_concurrent_requests INTEGER NOT NULL DEFAULT 10,
+    usage_projection_mode TEXT NOT NULL DEFAULT 'pass_through',
+    auto_disable_policy TEXT NOT NULL DEFAULT 'inherit',
+    auto_disabled BOOLEAN NOT NULL DEFAULT false,
+    auto_disabled_reason TEXT,
+    auto_disabled_at TIMESTAMPTZ,
+    auto_disabled_until TIMESTAMPTZ,
+    auto_disabled_last_error TEXT,
+    preserve_path BOOLEAN NOT NULL DEFAULT true,
+    notes TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ
+);
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS auth_type TEXT NOT NULL DEFAULT 'bearer';
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT true;
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS priority INTEGER NOT NULL DEFAULT 100;
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS max_concurrent_requests INTEGER NOT NULL DEFAULT 10;
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS usage_projection_mode TEXT NOT NULL DEFAULT 'pass_through';
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS auto_disable_policy TEXT NOT NULL DEFAULT 'inherit';
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS auto_disabled BOOLEAN NOT NULL DEFAULT false;
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS auto_disabled_reason TEXT;
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS auto_disabled_at TIMESTAMPTZ;
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS auto_disabled_until TIMESTAMPTZ;
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS auto_disabled_last_error TEXT;
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS preserve_path BOOLEAN NOT NULL DEFAULT true;
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS notes TEXT;
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_external_upstream_pools_active_priority
+    ON external_upstream_pools (priority ASC, id ASC)
+    WHERE deleted_at IS NULL AND enabled = true;
+
+CREATE INDEX IF NOT EXISTS idx_external_upstream_pools_auto_disabled
+    ON external_upstream_pools (auto_disabled, auto_disabled_until)
     WHERE deleted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS credential_stats (
@@ -3133,6 +3523,16 @@ mod tests {
             simulated: true,
             sticky_bound: true,
             fallback_from_sticky: false,
+            route_kind: None,
+            route_subtype: None,
+            fallback_reason: None,
+            direct_policy_reason: None,
+            local_attempted: None,
+            local_preflight: None,
+            external_pool_id: None,
+            external_pool_name: None,
+            external_attempts: Vec::new(),
+            usage_projection_applied: None,
             credential_attempts: Vec::new(),
             error_type: None,
             error_message: None,

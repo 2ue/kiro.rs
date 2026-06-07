@@ -7,19 +7,22 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, cancel_usage_cleanup, clear_credential_in_flight, clear_usage_records,
-        create_proxy_resource, delete_credential, delete_manual_model, delete_proxy_resource,
-        export_credentials, force_refresh_token, get_access_keys, get_all_credentials,
-        get_audit_logs, get_credential_balance, get_credential_info, get_credentials_page,
+        add_credential, cancel_usage_cleanup, clear_credential_in_flight,
+        clear_external_pool_auto_disabled, clear_usage_records, create_external_pool,
+        create_proxy_resource, delete_credential, delete_external_pool, delete_manual_model,
+        delete_proxy_resource, export_credentials, force_refresh_token, get_access_keys,
+        get_all_credentials, get_audit_logs, get_credential_balance, get_credential_info,
+        get_credentials_page, get_external_pool_status, get_external_pools,
         get_load_balancing_mode, get_model_capabilities, get_model_pricing, get_proxy_resources,
         get_runtime_config, get_usage_cleanup_status, get_usage_dashboard, get_usage_records,
         get_usage_records_page, get_usage_summary, get_usage_writer_stats, preview_usage_cleanup,
         refresh_credentials_info, reset_failure_count, set_credential_concurrency,
         set_credential_disabled, set_credential_priority, set_credential_proxy,
-        set_credential_warmup, set_load_balancing_mode, start_usage_cleanup,
-        sync_model_capabilities, sync_model_pricing, test_credential, update_admin_api_key,
-        update_proxy_resource, update_runtime_config, upsert_manual_model,
-        validate_existing_credentials, validate_external_credentials,
+        set_credential_warmup, set_external_pool_enabled, set_load_balancing_mode,
+        start_usage_cleanup, sync_model_capabilities, sync_model_pricing, test_credential,
+        test_external_pool, update_admin_api_key, update_external_pool, update_proxy_resource,
+        update_runtime_config, upsert_manual_model, validate_existing_credentials,
+        validate_external_credentials,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -88,6 +91,24 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/proxy-resources/{id}",
             put(update_proxy_resource).delete(delete_proxy_resource),
         )
+        .route(
+            "/external-pools",
+            get(get_external_pools).post(create_external_pool),
+        )
+        .route("/external-pools/status", get(get_external_pool_status))
+        .route(
+            "/external-pools/{id}",
+            put(update_external_pool).delete(delete_external_pool),
+        )
+        .route(
+            "/external-pools/{id}/enabled",
+            post(set_external_pool_enabled),
+        )
+        .route(
+            "/external-pools/{id}/auto-disabled/clear",
+            post(clear_external_pool_auto_disabled),
+        )
+        .route("/external-pools/{id}/test", post(test_external_pool))
         .route("/usage-records", get(get_usage_records))
         .route("/usage-records-paged", get(get_usage_records_page))
         .route("/usage-records/clear", post(clear_usage_records))

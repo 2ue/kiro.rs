@@ -13,8 +13,8 @@ use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::model::config::{
-    CompatProfile, Config, PayloadGuardMode, PayloadShapingConfig, PromptCacheSimulationMode,
-    ReportedUsageConfig,
+    CompatProfile, Config, ExternalPoolsConfig, ModelResolutionMode, PayloadGuardMode,
+    PayloadShapingConfig, PromptCacheSimulationMode, ReportedUsageConfig,
 };
 use crate::token;
 use anyhow::Error;
@@ -52,8 +52,11 @@ use super::types::{
     CountTokensRequest, CountTokensResponse, MessagesRequest, ModelsResponse, OutputConfig,
     Thinking,
 };
-use super::usage::{UsageRecord, UsageRecordStatus, UsageSource};
+use super::usage::{
+    UsageRecord, UsageRecordStatus, UsageRouteKind, UsageRouteSubtype, UsageSource,
+};
 use super::websearch;
+use crate::external_pool::{ExternalPoolManager, ExternalRouteRequest};
 use crate::kiro::call_trace::KiroCredentialAttempt;
 use crate::kiro::provider::{KiroProvider, KiroStreamCompletion};
 
@@ -92,6 +95,18 @@ struct RequestUsageContext {
 }
 
 #[derive(Clone)]
+struct ExternalFallbackContext {
+    manager: Arc<ExternalPoolManager>,
+    config: ExternalPoolsConfig,
+    raw_body: Bytes,
+    headers: HeaderMap,
+    endpoint: &'static str,
+    payload: MessagesRequest,
+    reported_usage: ReportedUsageConfig,
+    recorder: Arc<super::usage::UsageRecorder>,
+}
+
+#[derive(Clone)]
 struct CredentialUsageContext {
     request: RequestUsageContext,
     credential_id: Option<u64>,
@@ -118,6 +133,7 @@ struct RequestRuntimeConfig {
     prompt_cache_scale_min_input_tokens: i32,
     reported_usage: ReportedUsageConfig,
     compat_profile: CompatProfile,
+    model_resolution_mode: ModelResolutionMode,
     expose_proxy_warnings: bool,
     payload_guard_enabled: bool,
     payload_guard_mode: PayloadGuardMode,
@@ -138,6 +154,7 @@ impl RequestRuntimeConfig {
             prompt_cache_scale_min_input_tokens: state.prompt_cache_scale_min_input_tokens,
             reported_usage: state.reported_usage.clone(),
             compat_profile: state.compat_profile,
+            model_resolution_mode: state.model_resolution_mode,
             expose_proxy_warnings: state.expose_proxy_warnings,
             payload_guard_enabled: state.payload_guard_enabled,
             payload_guard_mode: state.payload_guard_mode,
@@ -168,6 +185,7 @@ impl RequestRuntimeConfig {
             prompt_cache_scale_min_input_tokens: config.prompt_cache_scale_min_input_tokens.max(0),
             reported_usage: config.reported_usage.normalized(),
             compat_profile: config.compat_profile,
+            model_resolution_mode: config.model_resolution_mode,
             expose_proxy_warnings: config.expose_proxy_warnings || config.compat_profile.is_debug(),
             payload_guard_enabled: config.payload_guard_enabled,
             payload_guard_mode: config.payload_guard_mode,
@@ -270,6 +288,236 @@ fn request_runtime_config(state: &AppState, provider: &KiroProvider) -> RequestR
         &provider.runtime_config(),
         RequestRuntimeConfig::from_app_state(state),
     )
+}
+
+fn parse_messages_payload(raw_body: &Bytes) -> Result<MessagesRequest, Response> {
+    serde_json::from_slice::<MessagesRequest>(raw_body).map_err(|err| {
+        envelope::error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!("Invalid JSON body: {}", err),
+        )
+    })
+}
+
+fn build_external_fallback_context(
+    state: &AppState,
+    provider: &KiroProvider,
+    runtime_config: &RequestRuntimeConfig,
+    endpoint: &'static str,
+    raw_body: Bytes,
+    headers: HeaderMap,
+    payload: &MessagesRequest,
+) -> Option<ExternalFallbackContext> {
+    let manager = state.external_pool_manager.clone()?;
+    let config = provider.runtime_config().external_pools;
+    config
+        .external_pools_enabled
+        .then_some(ExternalFallbackContext {
+            manager,
+            config,
+            raw_body,
+            headers,
+            endpoint,
+            payload: payload.clone(),
+            reported_usage: runtime_config.reported_usage.clone(),
+            recorder: state.usage_recorder.clone(),
+        })
+}
+
+impl ExternalFallbackContext {
+    async fn should_fail_fast_local(&self) -> bool {
+        self.config.local_pool_preflight_enabled
+            && self.manager.has_available_pool(&self.config).await
+    }
+
+    async fn direct_policy_response(&self, request_id: &str) -> Option<Response> {
+        let reason =
+            self.manager
+                .direct_policy_reason(&self.config, self.endpoint, &self.payload.model)?;
+        Some(
+            self.manager
+                .forward_with_failover(
+                    self.config.clone(),
+                    self.route_request(
+                        request_id.to_string(),
+                        UsageRouteSubtype::ExternalDirectPolicy,
+                        None,
+                        Some(reason),
+                        false,
+                        None,
+                        Vec::new(),
+                    ),
+                )
+                .await,
+        )
+    }
+
+    async fn fallback_after_local_error(
+        &self,
+        request_id: &str,
+        error_message: &str,
+        local_attempts: Vec<KiroCredentialAttempt>,
+    ) -> Option<Response> {
+        let reason = classify_local_error_for_external_fallback(
+            error_message,
+            &local_attempts,
+            &self.config,
+        )?;
+        if !self.manager.has_available_pool(&self.config).await {
+            return None;
+        }
+        let local_preflight = Some(json!({
+            "reason": reason.clone(),
+            "error": error_message,
+            "attemptCount": local_attempts.len(),
+        }));
+        let route_subtype = if local_attempts.is_empty() {
+            UsageRouteSubtype::ExternalFallbackPreflight
+        } else {
+            UsageRouteSubtype::ExternalFallbackAfterLocalAttempts
+        };
+        Some(
+            self.manager
+                .forward_with_failover(
+                    self.config.clone(),
+                    self.route_request(
+                        request_id.to_string(),
+                        route_subtype,
+                        Some(reason),
+                        None,
+                        true,
+                        local_preflight,
+                        local_attempts,
+                    ),
+                )
+                .await,
+        )
+    }
+
+    fn route_request(
+        &self,
+        request_id: String,
+        route_subtype: UsageRouteSubtype,
+        fallback_reason: Option<String>,
+        direct_policy_reason: Option<String>,
+        local_attempted: bool,
+        local_preflight: Option<serde_json::Value>,
+        local_attempts: Vec<KiroCredentialAttempt>,
+    ) -> ExternalRouteRequest {
+        ExternalRouteRequest {
+            raw_body: self.raw_body.clone(),
+            headers: self.headers.clone(),
+            endpoint: self.endpoint,
+            payload: self.payload.clone(),
+            route_subtype,
+            fallback_reason,
+            direct_policy_reason,
+            local_attempted,
+            local_preflight,
+            local_attempts,
+            reported_usage: self.reported_usage.clone(),
+            request_id,
+            recorder: self.recorder.clone(),
+            started_at: Instant::now(),
+        }
+    }
+}
+
+fn classify_local_error_for_external_fallback(
+    message: &str,
+    attempts: &[KiroCredentialAttempt],
+    config: &ExternalPoolsConfig,
+) -> Option<String> {
+    let lower = message.to_ascii_lowercase();
+    if is_request_error_that_must_not_fallback(&lower, attempts) {
+        return None;
+    }
+    if config.fallback_on_unsupported_model
+        && (lower.contains("没有支持当前模型")
+            || lower.contains("模型不支持")
+            || lower.contains("unsupported model"))
+    {
+        return Some("unsupported_model".to_string());
+    }
+    if config.fallback_on_local_capacity_exhausted
+        && (lower.contains("本地凭据调度容量暂不可用")
+            || lower.contains("凭据调度等待队列已满")
+            || lower.contains("排队等待超时")
+            || lower.contains("并发槽位已满")
+            || lower.contains("临时可调度: 0")
+            || lower.contains("max_concurrent_requests"))
+    {
+        return Some("local_capacity_exhausted".to_string());
+    }
+    if config.fallback_on_local_transient_exhausted
+        && (lower.contains("临时冷却")
+            || lower.contains("429")
+            || lower.contains("too many")
+            || lower.contains("rate limit")
+            || lower.contains("server_error")
+            || lower.contains("transient")
+            || lower.contains("network")
+            || lower.contains("send_error")
+            || lower.contains("stream_error")
+            || lower.contains("502")
+            || lower.contains("503")
+            || lower.contains("504"))
+    {
+        return Some("local_transient_exhausted".to_string());
+    }
+    if config.fallback_on_no_available_credentials
+        && (lower.contains("所有凭据")
+            || lower.contains("所有可用凭据")
+            || lower.contains("所有凭据已用尽")
+            || lower.contains("无可用凭据")
+            || lower.contains("quota_exhausted")
+            || lower.contains("risk_control")
+            || lower.contains("credential_failure"))
+    {
+        return Some("no_available_credentials".to_string());
+    }
+    let last_error_type = attempts
+        .last()
+        .and_then(|attempt| attempt.error_type.as_deref())
+        .unwrap_or_default();
+    match last_error_type {
+        "transient_error" | "send_error" | "server_error" | "non_eventstream"
+            if config.fallback_on_local_transient_exhausted =>
+        {
+            Some("local_transient_exhausted".to_string())
+        }
+        "quota_exhausted" | "risk_control" | "credential_failure"
+            if config.fallback_on_no_available_credentials =>
+        {
+            Some("no_available_credentials".to_string())
+        }
+        _ => None,
+    }
+}
+
+fn is_request_error_that_must_not_fallback(
+    lower_message: &str,
+    attempts: &[KiroCredentialAttempt],
+) -> bool {
+    if lower_message.contains("bad request")
+        || lower_message.contains("invalid_request")
+        || lower_message.contains("content_length_exceeds_threshold")
+        || lower_message.contains("input is too long")
+        || lower_message.contains("context window is full")
+        || lower_message.contains("improperly formed")
+        || lower_message.contains("json schema is invalid")
+        || lower_message.contains("invalid json")
+        || lower_message.contains("tool schema")
+    {
+        return true;
+    }
+    attempts.iter().any(|attempt| {
+        matches!(
+            attempt.error_type.as_deref(),
+            Some("bad_request") | Some("client_error") | Some("invalid_request_error")
+        ) || attempt.status == Some(400)
+    })
 }
 
 impl CredentialErrorHint {
@@ -727,6 +975,20 @@ impl CredentialUsageContext {
             sticky_bound: self.sticky_bound,
             fallback_from_sticky: self.fallback_from_sticky,
             credential_attempts: self.credential_attempts.clone(),
+            route_kind: Some(UsageRouteKind::LocalCredential),
+            route_subtype: Some(if status == UsageRecordStatus::Success {
+                UsageRouteSubtype::LocalSuccess
+            } else {
+                UsageRouteSubtype::LocalErrorNoFallback
+            }),
+            fallback_reason: None,
+            direct_policy_reason: None,
+            local_attempted: Some(true),
+            local_preflight: None,
+            external_pool_id: None,
+            external_pool_name: None,
+            external_attempts: Vec::new(),
+            usage_projection_applied: None,
             error_type,
             error_message,
             error_detail,
@@ -1592,10 +1854,21 @@ fn conversion_error_response(e: &ConversionError) -> Response {
 
 fn resolve_request_model(
     state: &AppState,
+    runtime_config: &RequestRuntimeConfig,
+    endpoint: &'static str,
     payload: &MessagesRequest,
 ) -> Result<ModelResolution, Response> {
-    let resolution = state.model_capabilities.resolve_model(&payload.model);
+    let resolution = state
+        .model_capabilities
+        .resolve_model_with_mode(&payload.model, runtime_config.model_resolution_mode);
     if resolution.source == ModelResolutionSource::Unsupported {
+        tracing::warn!(
+            endpoint,
+            requested_model = %payload.model,
+            model_resolution_mode = %runtime_config.model_resolution_mode.as_str(),
+            resolution = %resolution.source.as_str(),
+            "请求模型解析失败"
+        );
         return Err(envelope::error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
@@ -1607,22 +1880,16 @@ fn resolve_request_model(
     }
 
     if let Some(upstream_model) = resolution.upstream_model.as_deref() {
-        if resolution.is_remapped() {
-            tracing::info!(
-                requested_model = %resolution.requested_model,
-                upstream_model = %upstream_model,
-                resolution = %resolution.source.as_str(),
-                note = ?resolution.note,
-                "请求模型已映射为 Kiro 上游模型"
-            );
-        } else {
-            tracing::debug!(
-                requested_model = %resolution.requested_model,
-                upstream_model = %upstream_model,
-                resolution = %resolution.source.as_str(),
-                "请求模型精确匹配 Kiro 上游模型"
-            );
-        }
+        tracing::info!(
+            endpoint,
+            requested_model = %resolution.requested_model,
+            upstream_model = %upstream_model,
+            model_resolution_mode = %runtime_config.model_resolution_mode.as_str(),
+            resolution = %resolution.source.as_str(),
+            remapped = resolution.is_remapped(),
+            note = ?resolution.note,
+            "请求模型解析完成"
+        );
     }
 
     Ok(resolution)
@@ -1809,9 +2076,13 @@ pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn post_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
-    JsonExtractor(payload): JsonExtractor<MessagesRequest>,
+    raw_body: Bytes,
 ) -> Response {
-    post_messages_inner(state, headers, payload, "/v1/messages").await
+    let payload = match parse_messages_payload(&raw_body) {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+    post_messages_inner(state, headers, raw_body, payload, "/v1/messages").await
 }
 
 /// POST /na/v1/messages
@@ -1820,9 +2091,13 @@ pub async fn post_messages(
 pub async fn post_messages_real_cache_usage(
     State(state): State<AppState>,
     headers: HeaderMap,
-    JsonExtractor(payload): JsonExtractor<MessagesRequest>,
+    raw_body: Bytes,
 ) -> Response {
-    post_messages_inner(state, headers, payload, "/na/v1/messages").await
+    let payload = match parse_messages_payload(&raw_body) {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+    post_messages_inner(state, headers, raw_body, payload, "/na/v1/messages").await
 }
 
 /// POST /ha/v1/messages
@@ -1831,14 +2106,19 @@ pub async fn post_messages_real_cache_usage(
 pub async fn post_messages_ha(
     State(state): State<AppState>,
     headers: HeaderMap,
-    JsonExtractor(payload): JsonExtractor<MessagesRequest>,
+    raw_body: Bytes,
 ) -> Response {
-    post_messages_inner(state, headers, payload, "/ha/v1/messages").await
+    let payload = match parse_messages_payload(&raw_body) {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+    post_messages_inner(state, headers, raw_body, payload, "/ha/v1/messages").await
 }
 
 async fn post_messages_inner(
     state: AppState,
     headers: HeaderMap,
+    raw_body: Bytes,
     mut payload: MessagesRequest,
     endpoint: &'static str,
 ) -> Response {
@@ -1863,6 +2143,21 @@ async fn post_messages_inner(
         }
     };
     let runtime_config = request_runtime_config(&state, &provider);
+    let external_fallback = build_external_fallback_context(
+        &state,
+        &provider,
+        &runtime_config,
+        endpoint,
+        raw_body,
+        headers.clone(),
+        &payload,
+    );
+    if let Some(external) = external_fallback.as_ref() {
+        let request_id = envelope::request_id();
+        if let Some(response) = external.direct_policy_response(&request_id).await {
+            return response;
+        }
+    }
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
@@ -1894,17 +2189,43 @@ async fn post_messages_inner(
             payload.tools.clone(),
         ) as i32;
 
-        let _model_resolution = match resolve_request_model(&state, &payload) {
-            Ok(resolution) => resolution,
-            Err(response) => return response,
-        };
+        let _model_resolution =
+            match resolve_request_model(&state, &runtime_config, endpoint, &payload) {
+                Ok(resolution) => resolution,
+                Err(response) => {
+                    if let Some(external_response) = maybe_forward_external_after_local_error(
+                        external_fallback.as_ref(),
+                        &envelope::request_id(),
+                        &format!("模型不支持: {}", payload.model),
+                        Vec::new(),
+                    )
+                    .await
+                    {
+                        return external_response;
+                    }
+                    return response;
+                }
+            };
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
-    let model_resolution = match resolve_request_model(&state, &payload) {
+    let model_resolution = match resolve_request_model(&state, &runtime_config, endpoint, &payload)
+    {
         Ok(resolution) => resolution,
-        Err(response) => return response,
+        Err(response) => {
+            if let Some(external_response) = maybe_forward_external_after_local_error(
+                external_fallback.as_ref(),
+                &envelope::request_id(),
+                &format!("模型不支持: {}", payload.model),
+                Vec::new(),
+            )
+            .await
+            {
+                return external_response;
+            }
+            return response;
+        }
     };
 
     // 转换请求
@@ -2030,6 +2351,7 @@ async fn post_messages_inner(
             usage_context,
             warnings_header,
             too_long_retry,
+            external_fallback,
         )
         .await
     } else {
@@ -2045,9 +2367,57 @@ async fn post_messages_inner(
             usage_context,
             warnings_header,
             too_long_retry,
+            external_fallback,
         )
         .await
     }
+}
+
+async fn call_api_stream_maybe_fail_fast(
+    provider: &Arc<KiroProvider>,
+    request_body: &str,
+    request_id: Option<&str>,
+    external_fallback: Option<&ExternalFallbackContext>,
+) -> anyhow::Result<crate::kiro::provider::KiroStreamResponse> {
+    if let Some(external) = external_fallback {
+        if external.should_fail_fast_local().await {
+            return provider
+                .call_api_stream_with_request_id_fail_fast(request_body, request_id)
+                .await;
+        }
+    }
+    provider
+        .call_api_stream_with_request_id(request_body, request_id)
+        .await
+}
+
+async fn call_api_maybe_fail_fast(
+    provider: &Arc<KiroProvider>,
+    request_body: &str,
+    request_id: Option<&str>,
+    external_fallback: Option<&ExternalFallbackContext>,
+) -> anyhow::Result<crate::kiro::provider::KiroApiResponse> {
+    if let Some(external) = external_fallback {
+        if external.should_fail_fast_local().await {
+            return provider
+                .call_api_with_context_with_request_id_fail_fast(request_body, request_id)
+                .await;
+        }
+    }
+    provider
+        .call_api_with_context_with_request_id(request_body, request_id)
+        .await
+}
+
+async fn maybe_forward_external_after_local_error(
+    external_fallback: Option<&ExternalFallbackContext>,
+    request_id: &str,
+    message: &str,
+    attempts: Vec<KiroCredentialAttempt>,
+) -> Option<Response> {
+    external_fallback?
+        .fallback_after_local_error(request_id, message, attempts)
+        .await
 }
 
 /// 处理流式请求
@@ -2063,15 +2433,20 @@ async fn handle_stream_request(
     usage_context: RequestUsageContext,
     warnings_header: Option<String>,
     too_long_retry: Option<PayloadTooLongRetryRequest>,
+    external_fallback: Option<ExternalFallbackContext>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let mut usage_context = usage_context;
     let mut warnings_header = warnings_header;
     let request_id = usage_context.request_id.clone();
     let mut retry_attempt_prefix: Vec<KiroCredentialAttempt> = Vec::new();
-    let response = match provider
-        .call_api_stream_with_request_id(request_body, Some(&request_id))
-        .await
+    let response = match call_api_stream_maybe_fail_fast(
+        &provider,
+        request_body,
+        Some(&request_id),
+        external_fallback.as_ref(),
+    )
+    .await
     {
         Ok(resp) => resp,
         Err(e) => {
@@ -2108,9 +2483,13 @@ async fn handle_stream_request(
                         }
                     };
                 warnings_header = retry_warnings_header;
-                match provider
-                    .call_api_stream_with_request_id(&retry_body, Some(&request_id))
-                    .await
+                match call_api_stream_maybe_fail_fast(
+                    &provider,
+                    &retry_body,
+                    Some(&request_id),
+                    external_fallback.as_ref(),
+                )
+                .await
                 {
                     Ok(resp) => resp,
                     Err(retry_error) => {
@@ -2119,6 +2498,16 @@ async fn handle_stream_request(
                         let all_attempts =
                             merge_credential_attempts(retry_attempt_prefix.clone(), retry_attempts);
                         log_provider_call_failure(&retry_message);
+                        if let Some(response) = maybe_forward_external_after_local_error(
+                            external_fallback.as_ref(),
+                            &request_id,
+                            &retry_message,
+                            all_attempts.clone(),
+                        )
+                        .await
+                        {
+                            return response;
+                        }
                         usage_context
                             .attach_provider_error_credential(
                                 &provider,
@@ -2134,6 +2523,16 @@ async fn handle_stream_request(
                     }
                 }
             } else {
+                if let Some(response) = maybe_forward_external_after_local_error(
+                    external_fallback.as_ref(),
+                    &request_id,
+                    &message,
+                    attempts.clone(),
+                )
+                .await
+                {
+                    return response;
+                }
                 usage_context
                     .attach_provider_error_credential(&provider, &message, attempts)
                     .record_failure(UsageRecordStatus::Error, "api_error", message);
@@ -2382,15 +2781,20 @@ async fn handle_non_stream_request(
     usage_context: RequestUsageContext,
     warnings_header: Option<String>,
     too_long_retry: Option<PayloadTooLongRetryRequest>,
+    external_fallback: Option<ExternalFallbackContext>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let mut usage_context = usage_context;
     let mut warnings_header = warnings_header;
     let request_id = usage_context.request_id.clone();
     let mut retry_attempt_prefix: Vec<KiroCredentialAttempt> = Vec::new();
-    let api_response = match provider
-        .call_api_with_context_with_request_id(request_body, Some(&request_id))
-        .await
+    let api_response = match call_api_maybe_fail_fast(
+        &provider,
+        request_body,
+        Some(&request_id),
+        external_fallback.as_ref(),
+    )
+    .await
     {
         Ok(resp) => resp,
         Err(e) => {
@@ -2427,9 +2831,13 @@ async fn handle_non_stream_request(
                         }
                     };
                 warnings_header = retry_warnings_header;
-                match provider
-                    .call_api_with_context_with_request_id(&retry_body, Some(&request_id))
-                    .await
+                match call_api_maybe_fail_fast(
+                    &provider,
+                    &retry_body,
+                    Some(&request_id),
+                    external_fallback.as_ref(),
+                )
+                .await
                 {
                     Ok(resp) => resp,
                     Err(retry_error) => {
@@ -2438,6 +2846,16 @@ async fn handle_non_stream_request(
                         let all_attempts =
                             merge_credential_attempts(retry_attempt_prefix.clone(), retry_attempts);
                         log_provider_call_failure(&retry_message);
+                        if let Some(response) = maybe_forward_external_after_local_error(
+                            external_fallback.as_ref(),
+                            &request_id,
+                            &retry_message,
+                            all_attempts.clone(),
+                        )
+                        .await
+                        {
+                            return response;
+                        }
                         usage_context
                             .attach_provider_error_credential(
                                 &provider,
@@ -2453,6 +2871,16 @@ async fn handle_non_stream_request(
                     }
                 }
             } else {
+                if let Some(response) = maybe_forward_external_after_local_error(
+                    external_fallback.as_ref(),
+                    &request_id,
+                    &message,
+                    attempts.clone(),
+                )
+                .await
+                {
+                    return response;
+                }
                 usage_context
                     .attach_provider_error_credential(&provider, &message, attempts)
                     .record_failure(UsageRecordStatus::Error, "api_error", message);
@@ -2861,8 +3289,12 @@ pub async fn count_tokens(
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     headers: HeaderMap,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    raw_body: Bytes,
 ) -> Response {
+    let mut payload = match parse_messages_payload(&raw_body) {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
@@ -2884,6 +3316,21 @@ pub async fn post_messages_cc(
         }
     };
     let runtime_config = request_runtime_config(&state, &provider);
+    let external_fallback = build_external_fallback_context(
+        &state,
+        &provider,
+        &runtime_config,
+        "/cc/v1/messages",
+        raw_body,
+        headers.clone(),
+        &payload,
+    );
+    if let Some(external) = external_fallback.as_ref() {
+        let request_id = envelope::request_id();
+        if let Some(response) = external.direct_policy_response(&request_id).await {
+            return response;
+        }
+    }
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
@@ -2915,18 +3362,44 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
-        let _model_resolution = match resolve_request_model(&state, &payload) {
-            Ok(resolution) => resolution,
-            Err(response) => return response,
-        };
+        let _model_resolution =
+            match resolve_request_model(&state, &runtime_config, "/cc/v1/messages", &payload) {
+                Ok(resolution) => resolution,
+                Err(response) => {
+                    if let Some(external_response) = maybe_forward_external_after_local_error(
+                        external_fallback.as_ref(),
+                        &envelope::request_id(),
+                        &format!("模型不支持: {}", payload.model),
+                        Vec::new(),
+                    )
+                    .await
+                    {
+                        return external_response;
+                    }
+                    return response;
+                }
+            };
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
-    let model_resolution = match resolve_request_model(&state, &payload) {
-        Ok(resolution) => resolution,
-        Err(response) => return response,
-    };
+    let model_resolution =
+        match resolve_request_model(&state, &runtime_config, "/cc/v1/messages", &payload) {
+            Ok(resolution) => resolution,
+            Err(response) => {
+                if let Some(external_response) = maybe_forward_external_after_local_error(
+                    external_fallback.as_ref(),
+                    &envelope::request_id(),
+                    &format!("模型不支持: {}", payload.model),
+                    Vec::new(),
+                )
+                .await
+                {
+                    return external_response;
+                }
+                return response;
+            }
+        };
 
     // 转换请求
     let conversion_result = match convert_request_with_resolved_model(
@@ -3051,6 +3524,7 @@ pub async fn post_messages_cc(
             usage_context,
             warnings_header,
             too_long_retry,
+            external_fallback,
         )
         .await
     } else {
@@ -3066,6 +3540,7 @@ pub async fn post_messages_cc(
             usage_context,
             warnings_header,
             too_long_retry,
+            external_fallback,
         )
         .await
     }
@@ -3115,6 +3590,7 @@ mod tests {
             prompt_cache_scale_min_input_tokens: 0,
             reported_usage: ReportedUsageConfig::default(),
             compat_profile: CompatProfile::ClaudeCode,
+            model_resolution_mode: ModelResolutionMode::Compatible,
             expose_proxy_warnings: false,
             payload_guard_enabled: enabled,
             payload_guard_mode: mode,
@@ -4081,6 +4557,80 @@ mod tests {
         assert!(!should_expose_proxy_warnings(
             &RequestRuntimeConfig::from_app_state(&state)
         ));
+    }
+
+    #[test]
+    fn external_fallback_classifier_rejects_request_errors() {
+        let config = ExternalPoolsConfig::default();
+
+        assert_eq!(
+            classify_local_error_for_external_fallback(
+                r#"400 Bad Request {"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#,
+                &[],
+                &config,
+            ),
+            None
+        );
+        assert_eq!(
+            classify_local_error_for_external_fallback(
+                "JSON schema is invalid for tool input_schema",
+                &[],
+                &config,
+            ),
+            None
+        );
+
+        let attempts = vec![KiroCredentialAttempt::new(
+            0,
+            1,
+            None,
+            Some(StatusCode::BAD_REQUEST),
+            "fail",
+            Some("client_error"),
+            Some("bad request"),
+            10,
+        )];
+        assert_eq!(
+            classify_local_error_for_external_fallback("429 Too Many Requests", &attempts, &config),
+            None
+        );
+    }
+
+    #[test]
+    fn external_fallback_classifier_allows_capacity_and_transient_errors() {
+        let config = ExternalPoolsConfig::default();
+
+        assert_eq!(
+            classify_local_error_for_external_fallback(
+                "本地凭据调度容量暂不可用，并发槽位已满",
+                &[],
+                &config,
+            )
+            .as_deref(),
+            Some("local_capacity_exhausted")
+        );
+        assert_eq!(
+            classify_local_error_for_external_fallback("429 Too Many Requests", &[], &config)
+                .as_deref(),
+            Some("local_transient_exhausted")
+        );
+    }
+
+    #[test]
+    fn external_fallback_classifier_gates_unsupported_model() {
+        let mut config = ExternalPoolsConfig::default();
+        config.fallback_on_unsupported_model = false;
+        assert_eq!(
+            classify_local_error_for_external_fallback("模型不支持: claude-future", &[], &config,),
+            None
+        );
+
+        config.fallback_on_unsupported_model = true;
+        assert_eq!(
+            classify_local_error_for_external_fallback("模型不支持: claude-future", &[], &config,)
+                .as_deref(),
+            Some("unsupported_model")
+        );
     }
 
     #[test]

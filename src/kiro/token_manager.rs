@@ -706,6 +706,12 @@ pub struct CredentialEntrySnapshot {
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// 凭据级直接代理账号。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_username: Option<String>,
+    /// 凭据级直接代理密码。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_password: Option<String>,
     /// 绑定的代理/家宽资源 ID。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_resource_id: Option<u64>,
@@ -869,6 +875,18 @@ pub struct CallContext {
     pub fallback_from_sticky: bool,
     /// 本次调度占用的并发 lease；Admin 手动测试等未跟踪调用为 None。
     in_flight_lease: Option<InFlightLeaseGuard>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcquireMode {
+    WaitForCapacity,
+    FailFastOnCapacity,
+}
+
+impl AcquireMode {
+    fn is_fail_fast(self) -> bool {
+        matches!(self, Self::FailFastOnCapacity)
+    }
 }
 
 impl CallContext {
@@ -2684,6 +2702,27 @@ impl MultiTokenManager {
         session_id: Option<&str>,
         excluded_ids: &HashSet<u64>,
     ) -> anyhow::Result<CallContext> {
+        self.acquire_context_for_session_with_mode(
+            model,
+            session_id,
+            excluded_ids,
+            AcquireMode::WaitForCapacity,
+        )
+        .await
+    }
+
+    /// 获取 API 调用上下文，可选择在本地容量不足时立即返回。
+    ///
+    /// `FailFastOnCapacity` 仅用于外部备用池预检：如果无法立即拿到本地凭据并发
+    /// lease，不进入本地等待队列，让上层可以直接路由到外部池。默认调用仍应使用
+    /// [`Self::acquire_context_for_session`]，保持原有等待/排队语义。
+    pub async fn acquire_context_for_session_with_mode(
+        &self,
+        model: Option<&str>,
+        session_id: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        acquire_mode: AcquireMode,
+    ) -> anyhow::Result<CallContext> {
         enum AcquireDecision {
             Selected(u64, KiroCredentials, bool, bool),
             WaitForDispatch {
@@ -2915,6 +2954,19 @@ impl MultiTokenManager {
                     max_concurrent_requests,
                     wait_for,
                 } => {
+                    if acquire_mode.is_fail_fast() {
+                        let retry_after_secs = wait_for
+                            .map(|duration| duration.as_secs().saturating_add(1))
+                            .unwrap_or(1)
+                            .max(1);
+                        anyhow::bail!(
+                            "本地凭据调度容量暂不可用（可用: {}/{}, 临时可调度: 0, max_concurrent_requests={}, retry_after_secs={}）",
+                            available,
+                            total,
+                            max_concurrent_requests,
+                            retry_after_secs
+                        );
+                    }
                     if queue_guard.is_none() {
                         queue_guard = self.try_enter_dispatch_queue()?;
                         if queue_guard.is_none() {
@@ -2959,6 +3011,13 @@ impl MultiTokenManager {
             };
 
             let Some(in_flight_lease) = self.acquire_in_flight_slot(id)? else {
+                if acquire_mode.is_fail_fast() {
+                    anyhow::bail!(
+                        "本地凭据调度容量暂不可用（选中凭据 #{} 后并发槽位已满，max_concurrent_requests={}）",
+                        id,
+                        self.max_concurrent_requests()
+                    );
+                }
                 if queue_guard.is_none() {
                     queue_guard = self.try_enter_dispatch_queue()?;
                     if queue_guard.is_none() {
@@ -4776,6 +4835,8 @@ impl MultiTokenManager {
                         last_used_at: e.last_used_at.clone(),
                         has_proxy: effective_proxy_url.is_some(),
                         proxy_url: e.credentials.proxy_url.clone(),
+                        proxy_username: e.credentials.proxy_username.clone(),
+                        proxy_password: e.credentials.proxy_password.clone(),
                         proxy_resource_id,
                         proxy_resource_name,
                         effective_proxy_url,

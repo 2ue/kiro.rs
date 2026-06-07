@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { BadgeInfo, Copy, Eye, EyeOff, Gauge, KeyRound, Save, Shield, Sparkles, Trash2, Wand2, Zap } from 'lucide-react'
+import { BadgeInfo, Copy, Eye, EyeOff, Gauge, KeyRound, Router, Save, Shield, Sparkles, Trash2, Wand2, Zap } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
@@ -13,6 +13,7 @@ import { extractErrorMessage } from '@/lib/utils'
 import type {
   AccessKeysResponse,
   CompatProfile,
+  ModelResolutionMode,
   PayloadGuardMode,
   PayloadShapingConfig,
   ReportedUsageConfig,
@@ -97,7 +98,43 @@ const defaultPayloadShaping = (): PayloadShapingConfig => ({
   currentImagesMaxBytes: 180000,
 })
 
+export const defaultExternalPoolsConfig = () => ({
+  externalPoolsEnabled: false,
+  externalPoolGlobalMaxConcurrentRequests: 0,
+  externalPoolMaxQueuedRequests: 0,
+  externalPoolRetryMaxAttempts: 0,
+  externalDirectPolicyEnabled: false,
+  directExternalOnLocalMaintenance: false,
+  directExternalModelRules: [],
+  directExternalPathRules: [],
+  fallbackOnLocalCapacityExhausted: true,
+  fallbackOnNoAvailableCredentials: true,
+  fallbackOnLocalTransientExhausted: true,
+  fallbackOnUnsupportedModel: false,
+  localPoolPreflightEnabled: true,
+  localPoolCircuitEnabled: false,
+  localPoolCircuitWindowSecs: 60,
+  localPoolCircuitOpenAfterFailures: 3,
+  localPoolCircuitRequireDistinctCredentials: 2,
+  localPoolCircuitOpenSecs: 30,
+  localPoolCircuitHalfOpenMaxProbes: 1,
+  externalPoolAutoDisableEnabled: false,
+  externalPoolAutoDisableOnAuthError: true,
+  externalPoolAutoDisableOnSecurityLock: true,
+  externalPoolAutoDisableOnQuotaExhausted: false,
+  externalPoolAutoDisableOnMisconfiguredEndpoint: false,
+  externalPoolAutoDisableFailureThreshold: 1,
+  externalPoolAutoDisableDurationSecs: 0,
+  externalPoolRateLimitCooldownSecs: 30,
+  externalPoolServerErrorCooldownSecs: 10,
+  externalPoolNetworkErrorCooldownSecs: 10,
+  externalPoolProtocolErrorCooldownSecs: 10,
+})
+
 const emptyConfig: RuntimeConfig = {
+  proxyUrl: null,
+  proxyUsername: null,
+  proxyPassword: null,
   credentialRpm: 0,
   credentialMaxConcurrentRequests: 0,
   credentialTransientCooldownSecs: 10,
@@ -142,8 +179,10 @@ const emptyConfig: RuntimeConfig = {
   promptCacheCapJitterMaxTokens: 24000,
   promptCacheScaleMinInputTokens: 20000,
   reportedUsage: defaultReportedUsage(),
+  externalPools: defaultExternalPoolsConfig(),
   highCacheThreshold: 10000,
   compatProfile: 'claude-code',
+  modelResolutionMode: 'compatible',
   extractThinking: true,
   exposeProxyWarnings: false,
 }
@@ -242,6 +281,90 @@ function ConfigSection({ icon, title, description, children }: ConfigSectionProp
       </div>
       <div className="grid gap-4 md:grid-cols-2">{children}</div>
     </section>
+  )
+}
+
+function maskSecret(value?: string | null): string {
+  if (!value) return '-'
+  return '*'.repeat(Math.min(Math.max(value.length, 6), 16))
+}
+
+function ReadOnlySecretField({
+  label,
+  value,
+  visible,
+  onToggle,
+}: {
+  label: string
+  value?: string | null
+  visible: boolean
+  onToggle: () => void
+}) {
+  return (
+    <div>
+      <div className="mb-2 text-sm font-medium">{label}</div>
+      <div className="flex gap-2">
+        <Input
+          readOnly
+          className="min-w-0 font-mono text-xs"
+          value={visible ? value || '-' : maskSecret(value)}
+        />
+        <Button
+          type="button"
+          variant="outline"
+          className="shrink-0"
+          onClick={onToggle}
+          title={visible ? `隐藏${label}` : `显示${label}`}
+        >
+          {visible ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+          {visible ? '隐藏' : '显示'}
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+function StartupProxyPanel({ config }: { config: RuntimeConfig }) {
+  const [showProxyUsername, setShowProxyUsername] = useState(false)
+  const [showProxyPassword, setShowProxyPassword] = useState(false)
+  const hasGlobalProxy = Boolean(config.proxyUrl)
+
+  return (
+    <ConfigSection
+      icon={<Router className="h-4 w-4" />}
+      title="全局代理（启动期配置，只读）"
+      description="这里展示启动配置里的全局代理。它会作为未配置凭据直连代理、也未绑定代理资源时的默认代理；修改需要改启动配置并重启服务。"
+    >
+      <div className="rounded-md border bg-background p-4 md:col-span-2">
+        <div className="mb-4 flex flex-wrap items-center gap-2">
+          <span className="text-sm font-semibold">当前状态</span>
+          <span className={`rounded-md border px-2 py-0.5 text-[11px] font-medium ${hasGlobalProxy ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'bg-muted text-muted-foreground'}`}>
+            {hasGlobalProxy ? '已配置全局代理' : '未配置全局代理'}
+          </span>
+          <span className="rounded-md border bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground">
+            只读
+          </span>
+        </div>
+        <div className="grid gap-4 md:grid-cols-2">
+          <div className="md:col-span-2">
+            <div className="mb-2 text-sm font-medium">代理 URL</div>
+            <Input readOnly className="font-mono text-xs" value={config.proxyUrl || '-'} />
+          </div>
+          <ReadOnlySecretField
+            label="代理用户名"
+            value={config.proxyUsername}
+            visible={showProxyUsername}
+            onToggle={() => setShowProxyUsername((value) => !value)}
+          />
+          <ReadOnlySecretField
+            label="代理密码"
+            value={config.proxyPassword}
+            visible={showProxyPassword}
+            onToggle={() => setShowProxyPassword((value) => !value)}
+          />
+        </div>
+      </div>
+    </ConfigSection>
   )
 }
 
@@ -505,6 +628,33 @@ function SelectField({ title, description, value, onChange }: SelectFieldProps) 
         <option value="claude-code">Claude Code 兼容</option>
         <option value="anthropic-strict">Anthropic 严格模式</option>
         <option value="debug">调试模式</option>
+      </select>
+    </label>
+  )
+}
+
+interface ModelResolutionSelectFieldProps {
+  value: ModelResolutionMode
+  onChange: (value: ModelResolutionMode) => void
+}
+
+function ModelResolutionSelectField({ value, onChange }: ModelResolutionSelectFieldProps) {
+  return (
+    <label className="block rounded-md border bg-background p-4">
+      <div className="mb-3">
+        <div className="text-sm font-medium">模型解析策略</div>
+        <div className="mt-1 text-xs leading-5 text-muted-foreground">
+          默认兼容解析会保留 sonnet、opus、default 等短模型名和同族自动归一化；更严格模式只影响请求发上游前的模型名解析，不改变凭据调度。
+        </div>
+      </div>
+      <select
+        className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+        value={value}
+        onChange={(event) => onChange(event.target.value as ModelResolutionMode)}
+      >
+        <option value="compatible">默认兼容解析</option>
+        <option value="alias_only">仅精确与显式别名</option>
+        <option value="exact_only">仅模型目录精确 ID</option>
       </select>
     </label>
   )
@@ -835,6 +985,10 @@ export function RuntimeConfigPanel() {
           ...defaultPayloadShaping(),
           ...config.data.payloadShaping,
         },
+        externalPools: {
+          ...defaultExternalPoolsConfig(),
+          ...config.data.externalPools,
+        },
       })
     }
   }, [config.data])
@@ -881,6 +1035,24 @@ export function RuntimeConfigPanel() {
       promptCacheCapJitterMaxTokens: toWhole(draft.promptCacheCapJitterMaxTokens),
       promptCacheScaleMinInputTokens: toWhole(draft.promptCacheScaleMinInputTokens),
       reportedUsage: normalizeReportedUsage(draft.reportedUsage),
+      externalPools: {
+        ...defaultExternalPoolsConfig(),
+        ...draft.externalPools,
+        externalPoolGlobalMaxConcurrentRequests: toWhole(draft.externalPools.externalPoolGlobalMaxConcurrentRequests),
+        externalPoolMaxQueuedRequests: toWhole(draft.externalPools.externalPoolMaxQueuedRequests),
+        externalPoolRetryMaxAttempts: toWhole(draft.externalPools.externalPoolRetryMaxAttempts),
+        localPoolCircuitWindowSecs: toWhole(draft.externalPools.localPoolCircuitWindowSecs, 1),
+        localPoolCircuitOpenAfterFailures: toWhole(draft.externalPools.localPoolCircuitOpenAfterFailures, 1),
+        localPoolCircuitRequireDistinctCredentials: toWhole(draft.externalPools.localPoolCircuitRequireDistinctCredentials),
+        localPoolCircuitOpenSecs: toWhole(draft.externalPools.localPoolCircuitOpenSecs, 1),
+        localPoolCircuitHalfOpenMaxProbes: toWhole(draft.externalPools.localPoolCircuitHalfOpenMaxProbes, 1),
+        externalPoolAutoDisableFailureThreshold: toWhole(draft.externalPools.externalPoolAutoDisableFailureThreshold, 1),
+        externalPoolAutoDisableDurationSecs: toWhole(draft.externalPools.externalPoolAutoDisableDurationSecs),
+        externalPoolRateLimitCooldownSecs: toWhole(draft.externalPools.externalPoolRateLimitCooldownSecs, 1),
+        externalPoolServerErrorCooldownSecs: toWhole(draft.externalPools.externalPoolServerErrorCooldownSecs, 1),
+        externalPoolNetworkErrorCooldownSecs: toWhole(draft.externalPools.externalPoolNetworkErrorCooldownSecs, 1),
+        externalPoolProtocolErrorCooldownSecs: toWhole(draft.externalPools.externalPoolProtocolErrorCooldownSecs, 1),
+      },
       highCacheThreshold: toWhole(draft.highCacheThreshold),
     }
     if (next.credentialTransientCooldownSecs > next.credentialMaxCooldownSecs) {
@@ -899,7 +1071,11 @@ export function RuntimeConfigPanel() {
       toast.error('Kiro Payload 最大字节数必须为 0 或不小于 65536')
       return
     }
-    updateConfig.mutate(next, {
+    const editableConfig = { ...next }
+    delete editableConfig.proxyUrl
+    delete editableConfig.proxyUsername
+    delete editableConfig.proxyPassword
+    updateConfig.mutate(editableConfig, {
       onSuccess: () => toast.success('配置已更新'),
       onError: (error) => toast.error(`更新失败: ${extractErrorMessage(error)}`),
     })
@@ -943,6 +1119,7 @@ export function RuntimeConfigPanel() {
         </CardHeader>
         <CardContent className="space-y-6">
           <AccessKeysPanel />
+          <StartupProxyPanel config={draft} />
 
           <div className="sticky top-16 z-30 -mx-2 flex flex-col gap-2 rounded-lg border bg-background/95 p-2 shadow-sm backdrop-blur supports-[backdrop-filter]:bg-background/80 sm:flex-row sm:items-center sm:justify-between">
             <div className="min-w-0 text-sm text-muted-foreground">
@@ -1598,6 +1775,12 @@ export function RuntimeConfigPanel() {
               description="控制请求转换策略。Claude Code 兼容适合日常 CLI 使用；Anthropic 严格模式会减少代理侧改写；调试模式会默认暴露代理改写告警头。"
               value={draft.compatProfile}
               onChange={(compatProfile) => setDraft((prev) => ({ ...prev, compatProfile }))}
+            />
+            <ModelResolutionSelectField
+              value={draft.modelResolutionMode}
+              onChange={(modelResolutionMode) =>
+                setDraft((prev) => ({ ...prev, modelResolutionMode }))
+              }
             />
             <ToggleField
               title="提取 Thinking 内容块"

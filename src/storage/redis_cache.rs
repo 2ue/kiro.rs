@@ -60,6 +60,12 @@ pub struct SchedulerGlobalCapacityState {
     pub queued_requests: u32,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExternalPoolCapacityState {
+    pub pool_in_flight_requests: u32,
+    pub global_in_flight_requests: u32,
+}
+
 #[derive(Clone)]
 pub struct RedisStore {
     client: redis::Client,
@@ -176,6 +182,29 @@ impl RedisStore {
         let mut manager = self.manager.clone();
         let _: () = manager.del(self.key(key)).await?;
         Ok(())
+    }
+
+    pub async fn incr_with_ttl(
+        &self,
+        key: impl AsRef<str>,
+        ttl_secs: usize,
+    ) -> anyhow::Result<u64> {
+        let script = r#"
+            local value = redis.call('INCR', KEYS[1])
+            if value == 1 then
+                redis.call('EXPIRE', KEYS[1], ARGV[1])
+            end
+            return value
+        "#;
+        let mut manager = self.manager.clone();
+        let value: u64 = redis::cmd("EVAL")
+            .arg(script)
+            .arg(1)
+            .arg(self.key(key))
+            .arg(ttl_secs.max(1))
+            .query_async(&mut manager)
+            .await?;
+        Ok(value)
     }
 
     pub async fn set_nx_ex(
@@ -729,6 +758,14 @@ impl RedisStore {
         Ok(id)
     }
 
+    pub async fn next_external_pool_lease_id(&self) -> anyhow::Result<u64> {
+        let mut manager = self.manager.clone();
+        let id: u64 = manager
+            .incr(self.key("external_pool:inflight:lease_sequence"), 1u64)
+            .await?;
+        Ok(id)
+    }
+
     #[allow(dead_code)]
     pub async fn acquire_in_flight_lease(
         &self,
@@ -841,6 +878,87 @@ impl RedisStore {
         }
     }
 
+    pub async fn acquire_external_pool_lease(
+        &self,
+        pool_id: u64,
+        lease_id: u64,
+        max_concurrent_requests: u32,
+        global_max_concurrent_requests: u32,
+        max_age: Option<StdDuration>,
+    ) -> anyhow::Result<Option<usize>> {
+        let now = now_ms();
+        let max_age_ms = max_age.map(|age| age.as_millis() as i64).unwrap_or(0);
+        let ttl_secs = max_age
+            .map(|age| age.as_secs().saturating_mul(2).max(60) as i64)
+            .unwrap_or(0);
+        let script = r#"
+            local now = tonumber(ARGV[1])
+            local max_age_ms = tonumber(ARGV[2])
+            local max_count = tonumber(ARGV[3])
+            local global_max_count = tonumber(ARGV[4])
+            local lease_id = ARGV[5]
+            local ttl_secs = tonumber(ARGV[6])
+
+            if max_age_ms > 0 then
+                local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now - max_age_ms)
+                for _, member in ipairs(expired) do
+                    redis.call('ZREM', KEYS[1], member)
+                    redis.call('ZREM', KEYS[2], member)
+                end
+                local global_expired = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', now - max_age_ms)
+                for _, member in ipairs(global_expired) do
+                    redis.call('ZREM', KEYS[3], member)
+                    redis.call('ZREM', KEYS[4], member)
+                end
+            end
+
+            local count = redis.call('ZCARD', KEYS[1])
+            if max_count > 0 and count >= max_count then
+                return {0, count}
+            end
+
+            local global_count = redis.call('ZCARD', KEYS[3])
+            if global_max_count > 0 and global_count >= global_max_count then
+                return {0, global_count}
+            end
+
+            redis.call('ZADD', KEYS[1], now, lease_id)
+            redis.call('ZADD', KEYS[2], now, lease_id)
+            redis.call('ZADD', KEYS[3], now, lease_id)
+            redis.call('ZADD', KEYS[4], now, lease_id)
+            if ttl_secs > 0 then
+                redis.call('EXPIRE', KEYS[1], ttl_secs)
+                redis.call('EXPIRE', KEYS[2], ttl_secs)
+                redis.call('EXPIRE', KEYS[3], ttl_secs)
+                redis.call('EXPIRE', KEYS[4], ttl_secs)
+            end
+            return {1, count + 1}
+        "#;
+        let keys = external_pool_in_flight_keys(pool_id);
+        let global_keys = external_pool_global_in_flight_keys();
+        let mut manager = self.manager.clone();
+        let result: Vec<i64> = redis::cmd("EVAL")
+            .arg(script)
+            .arg(4)
+            .arg(self.key(&keys.last_seen))
+            .arg(self.key(&keys.acquired))
+            .arg(self.key(&global_keys.last_seen))
+            .arg(self.key(&global_keys.acquired))
+            .arg(now)
+            .arg(max_age_ms)
+            .arg(max_concurrent_requests)
+            .arg(global_max_concurrent_requests)
+            .arg(lease_id.to_string())
+            .arg(ttl_secs)
+            .query_async(&mut manager)
+            .await?;
+        if result.first().copied().unwrap_or(0) == 1 {
+            Ok(Some(result.get(1).copied().unwrap_or(1).max(0) as usize))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub async fn release_in_flight_lease(
         &self,
         credential_id: u64,
@@ -874,6 +992,79 @@ impl RedisStore {
             .await
             .map(|(a, b, c, d, e, f)| a + b + c + d + e + f)?;
         Ok(removed > 0)
+    }
+
+    pub async fn release_external_pool_lease(
+        &self,
+        pool_id: u64,
+        lease_id: u64,
+    ) -> anyhow::Result<bool> {
+        let keys = external_pool_in_flight_keys(pool_id);
+        let global_keys = external_pool_global_in_flight_keys();
+        let lease_id = lease_id.to_string();
+        let mut manager = self.manager.clone();
+        let removed: i64 = redis::pipe()
+            .atomic()
+            .cmd("ZREM")
+            .arg(self.key(&keys.last_seen))
+            .arg(&lease_id)
+            .cmd("ZREM")
+            .arg(self.key(&keys.acquired))
+            .arg(&lease_id)
+            .cmd("ZREM")
+            .arg(self.key(&global_keys.last_seen))
+            .arg(&lease_id)
+            .cmd("ZREM")
+            .arg(self.key(&global_keys.acquired))
+            .arg(&lease_id)
+            .query_async::<(i64, i64, i64, i64)>(&mut manager)
+            .await
+            .map(|(a, b, c, d)| a + b + c + d)?;
+        Ok(removed > 0)
+    }
+
+    pub async fn external_pool_capacity_state(
+        &self,
+        pool_id: u64,
+        max_age: Option<StdDuration>,
+    ) -> anyhow::Result<ExternalPoolCapacityState> {
+        let now = now_ms();
+        let max_age_ms = max_age.map(|age| age.as_millis() as i64).unwrap_or(0);
+        let script = r#"
+            local now = tonumber(ARGV[1])
+            local max_age_ms = tonumber(ARGV[2])
+            if max_age_ms > 0 then
+                local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now - max_age_ms)
+                for _, member in ipairs(expired) do
+                    redis.call('ZREM', KEYS[1], member)
+                    redis.call('ZREM', KEYS[2], member)
+                end
+                local global_expired = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', now - max_age_ms)
+                for _, member in ipairs(global_expired) do
+                    redis.call('ZREM', KEYS[3], member)
+                    redis.call('ZREM', KEYS[4], member)
+                end
+            end
+            return {redis.call('ZCARD', KEYS[1]), redis.call('ZCARD', KEYS[3])}
+        "#;
+        let keys = external_pool_in_flight_keys(pool_id);
+        let global_keys = external_pool_global_in_flight_keys();
+        let mut manager = self.manager.clone();
+        let result: Vec<i64> = redis::cmd("EVAL")
+            .arg(script)
+            .arg(4)
+            .arg(self.key(&keys.last_seen))
+            .arg(self.key(&keys.acquired))
+            .arg(self.key(&global_keys.last_seen))
+            .arg(self.key(&global_keys.acquired))
+            .arg(now)
+            .arg(max_age_ms)
+            .query_async(&mut manager)
+            .await?;
+        Ok(ExternalPoolCapacityState {
+            pool_in_flight_requests: result.first().copied().unwrap_or(0).max(0) as u32,
+            global_in_flight_requests: result.get(1).copied().unwrap_or(0).max(0) as u32,
+        })
     }
 
     pub async fn touch_in_flight_lease(
@@ -1313,6 +1504,22 @@ fn global_in_flight_keys() -> InFlightKeys {
         last_seen: "scheduler:global:inflight:last_seen".to_string(),
         acquired: "scheduler:global:inflight:acquired".to_string(),
         kind: "scheduler:global:inflight:kind".to_string(),
+    }
+}
+
+fn external_pool_in_flight_keys(pool_id: u64) -> InFlightKeys {
+    InFlightKeys {
+        last_seen: format!("external_pool:inflight:{}:last_seen", pool_id),
+        acquired: format!("external_pool:inflight:{}:acquired", pool_id),
+        kind: format!("external_pool:inflight:{}:kind", pool_id),
+    }
+}
+
+fn external_pool_global_in_flight_keys() -> InFlightKeys {
+    InFlightKeys {
+        last_seen: "external_pool:global:inflight:last_seen".to_string(),
+        acquired: "external_pool:global:inflight:acquired".to_string(),
+        kind: "external_pool:global:inflight:kind".to_string(),
     }
 }
 

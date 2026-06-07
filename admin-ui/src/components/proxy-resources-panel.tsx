@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
-import { Edit3, Plus, RefreshCw, Trash2 } from 'lucide-react'
+import { Edit3, Eye, EyeOff, Plus, RefreshCw, Trash2 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -51,10 +51,55 @@ function formFromResource(resource: ProxyResource): ProxyForm {
     name: resource.name,
     proxyUrl: resource.proxyUrl,
     proxyUsername: resource.proxyUsername || '',
-    proxyPassword: '',
+    proxyPassword: resource.proxyPassword || '',
     notes: resource.notes || '',
     enabled: resource.enabled,
   }
+}
+
+function maskSecret(value?: string | null): string {
+  if (!value) return '-'
+  return '*'.repeat(Math.min(Math.max(value.length, 6), 16))
+}
+
+function SecretInput({
+  value,
+  onChange,
+  visible,
+  onToggle,
+  disabled,
+  placeholder,
+}: {
+  value: string
+  onChange: (value: string) => void
+  visible: boolean
+  onToggle: () => void
+  disabled?: boolean
+  placeholder?: string
+}) {
+  return (
+    <div className="relative">
+      <Input
+        className="pr-10"
+        type={visible ? 'text' : 'password'}
+        value={value}
+        placeholder={placeholder}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.value)}
+      />
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className="absolute right-1 top-1 h-8 w-8"
+        onClick={onToggle}
+        disabled={disabled}
+        title={visible ? '隐藏' : '显示'}
+      >
+        {visible ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+      </Button>
+    </div>
+  )
 }
 
 function formatDateTime(value: string | null): string {
@@ -134,6 +179,8 @@ function ProxyEditorDialog({
   const [form, setForm] = useState(() => resource ? formFromResource(resource) : emptyForm())
   const [selectedCredentialIds, setSelectedCredentialIds] = useState<Set<number>>(new Set())
   const [bindingReady, setBindingReady] = useState(false)
+  const [showProxyUsername, setShowProxyUsername] = useState(false)
+  const [showProxyPassword, setShowProxyPassword] = useState(false)
   const create = useCreateProxyResource()
   const update = useUpdateProxyResource()
   const setCredentialProxy = useSetCredentialProxy()
@@ -147,6 +194,8 @@ function ProxyEditorDialog({
     setForm(resource ? formFromResource(resource) : emptyForm())
     setSelectedCredentialIds(new Set())
     setBindingReady(false)
+    setShowProxyUsername(false)
+    setShowProxyPassword(false)
     credentials.refetch().then((result) => {
       if (cancelled || result.error || !result.data) return
       const nextCredentials = result.data.credentials || []
@@ -227,6 +276,7 @@ function ProxyEditorDialog({
       enabled: form.enabled,
       notes: form.notes.trim() || undefined,
       clearUsername: isEditing && !form.proxyUsername.trim(),
+      clearPassword: isEditing && !form.proxyPassword.trim(),
       clearNotes: isEditing && !form.notes.trim(),
     }
 
@@ -270,12 +320,22 @@ function ProxyEditorDialog({
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">用户名</label>
-              <Input value={form.proxyUsername} onChange={(e) => set('proxyUsername', e.target.value)} />
+              <SecretInput
+                value={form.proxyUsername}
+                onChange={(value) => set('proxyUsername', value)}
+                visible={showProxyUsername}
+                onToggle={() => setShowProxyUsername((value) => !value)}
+              />
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">密码</label>
-              <Input type="password" value={form.proxyPassword} onChange={(e) => set('proxyPassword', e.target.value)} />
-              {isEditing && <p className="text-xs text-muted-foreground">留空表示不修改密码</p>}
+              <SecretInput
+                value={form.proxyPassword}
+                onChange={(value) => set('proxyPassword', value)}
+                visible={showProxyPassword}
+                onToggle={() => setShowProxyPassword((value) => !value)}
+              />
+              {isEditing && <p className="text-xs text-muted-foreground">留空保存会清除当前密码。</p>}
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">备注</label>
@@ -342,6 +402,7 @@ function ProxyResourceCard({
 }) {
   const update = useUpdateProxyResource()
   const remove = useDeleteProxyResource()
+  const [showSecrets, setShowSecrets] = useState(false)
 
   const toggleEnabled = () => {
     update.mutate(
@@ -381,7 +442,15 @@ function ProxyResourceCard({
         <div className="grid gap-2 text-sm md:grid-cols-2">
           <div>
             <span className="text-muted-foreground">用户名：</span>
-            <span className="font-medium">{resource.proxyUsername || '-'}</span>
+            <span className="font-mono font-medium" title={showSecrets ? resource.proxyUsername || undefined : undefined}>
+              {showSecrets ? resource.proxyUsername || '-' : maskSecret(resource.proxyUsername)}
+            </span>
+          </div>
+          <div>
+            <span className="text-muted-foreground">密码：</span>
+            <span className="font-mono font-medium" title={showSecrets ? resource.proxyPassword || undefined : undefined}>
+              {showSecrets ? resource.proxyPassword || '-' : resource.hasPassword ? maskSecret(resource.proxyPassword || '******') : '-'}
+            </span>
           </div>
           <div>
             <span className="text-muted-foreground">绑定凭据：</span>
@@ -403,6 +472,10 @@ function ProxyResourceCard({
           )}
         </div>
         <div className="flex flex-wrap gap-2 border-t pt-3">
+          <Button size="sm" variant="outline" onClick={() => setShowSecrets((value) => !value)}>
+            {showSecrets ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+            {showSecrets ? '隐藏账号密码' : '显示账号密码'}
+          </Button>
           <Button size="sm" variant="outline" onClick={() => onEdit(resource)}>
             <Edit3 className="h-4 w-4" />
             编辑

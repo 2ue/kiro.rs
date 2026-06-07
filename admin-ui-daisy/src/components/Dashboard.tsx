@@ -8,6 +8,7 @@ import { AuditPanel } from '@/components/AuditPanel'
 import { AccountValidationPanel } from '@/components/AccountValidationPanel'
 import { ConfigPanel } from '@/components/ConfigPanel'
 import { CredentialsPanel } from '@/components/CredentialsPanel'
+import { ExternalPoolsPanel } from '@/components/ExternalPoolsPanel'
 import { PricingPanel } from '@/components/PricingPanel'
 import { ProxyPanel } from '@/components/ProxyPanel'
 import { UsagePanel } from '@/components/UsagePanel'
@@ -127,6 +128,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
           {activeTab === 'credentials' && <CredentialsPanel />}
           {activeTab === 'validation' && <AccountValidationPanel />}
           {activeTab === 'proxies' && <ProxyPanel />}
+          {activeTab === 'external' && <ExternalPoolsPanel />}
           {activeTab === 'usage' && <UsagePanel />}
           {activeTab === 'pricing' && <PricingPanel />}
           {activeTab === 'audit' && <AuditPanel />}

@@ -80,7 +80,45 @@ export function defaultPayloadShaping(): PayloadShapingConfig {
   }
 }
 
+export function defaultExternalPoolsConfig() {
+  return {
+    externalPoolsEnabled: false,
+    externalPoolGlobalMaxConcurrentRequests: 0,
+    externalPoolMaxQueuedRequests: 0,
+    externalPoolRetryMaxAttempts: 0,
+    externalDirectPolicyEnabled: false,
+    directExternalOnLocalMaintenance: false,
+    directExternalModelRules: [],
+    directExternalPathRules: [],
+    fallbackOnLocalCapacityExhausted: true,
+    fallbackOnNoAvailableCredentials: true,
+    fallbackOnLocalTransientExhausted: true,
+    fallbackOnUnsupportedModel: false,
+    localPoolPreflightEnabled: true,
+    localPoolCircuitEnabled: false,
+    localPoolCircuitWindowSecs: 60,
+    localPoolCircuitOpenAfterFailures: 3,
+    localPoolCircuitRequireDistinctCredentials: 2,
+    localPoolCircuitOpenSecs: 30,
+    localPoolCircuitHalfOpenMaxProbes: 1,
+    externalPoolAutoDisableEnabled: false,
+    externalPoolAutoDisableOnAuthError: true,
+    externalPoolAutoDisableOnSecurityLock: true,
+    externalPoolAutoDisableOnQuotaExhausted: false,
+    externalPoolAutoDisableOnMisconfiguredEndpoint: false,
+    externalPoolAutoDisableFailureThreshold: 1,
+    externalPoolAutoDisableDurationSecs: 0,
+    externalPoolRateLimitCooldownSecs: 30,
+    externalPoolServerErrorCooldownSecs: 10,
+    externalPoolNetworkErrorCooldownSecs: 10,
+    externalPoolProtocolErrorCooldownSecs: 10,
+  }
+}
+
 export const emptyRuntimeConfig: RuntimeConfig = {
+  proxyUrl: null,
+  proxyUsername: null,
+  proxyPassword: null,
   credentialRpm: 0,
   credentialMaxConcurrentRequests: 0,
   credentialTransientCooldownSecs: 10,
@@ -125,8 +163,10 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   promptCacheCapJitterMaxTokens: 24000,
   promptCacheScaleMinInputTokens: 20000,
   reportedUsage: defaultReportedUsage(),
+  externalPools: defaultExternalPoolsConfig(),
   highCacheThreshold: 10000,
   compatProfile: 'claude-code',
+  modelResolutionMode: 'compatible',
   extractThinking: true,
   exposeProxyWarnings: false,
 }

@@ -563,6 +563,40 @@ impl CompatProfile {
     }
 }
 
+/// 请求模型解析策略。
+///
+/// `compatible` 保持当前 Claude Code 兼容行为：允许 `sonnet`、`opus`、
+/// `default` 等短别名，也允许把同 family 的旧版/未来模型名映射到当前
+/// Kiro 上游可用模型。`alias_only` 只允许精确模型和显式别名，不做
+/// 宽松 family 归一化。`exact_only` 只允许模型能力目录里的精确模型 ID。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelResolutionMode {
+    Compatible,
+    AliasOnly,
+    ExactOnly,
+}
+
+impl Default for ModelResolutionMode {
+    fn default() -> Self {
+        Self::Compatible
+    }
+}
+
+impl ModelResolutionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Compatible => "compatible",
+            Self::AliasOnly => "alias_only",
+            Self::ExactOnly => "exact_only",
+        }
+    }
+
+    pub fn allows_family_fallback(self) -> bool {
+        matches!(self, Self::Compatible)
+    }
+}
+
 /// Kiro payload guard 的大小裁剪触发模式。
 ///
 /// `preemptive` 保持原有行为：发送上游前只要超过 `payloadGuardMaxBytes`
@@ -578,6 +612,117 @@ pub enum PayloadGuardMode {
 impl Default for PayloadGuardMode {
     fn default() -> Self {
         Self::Preemptive
+    }
+}
+
+/// 外部备用号池全局策略配置。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalPoolsConfig {
+    #[serde(default)]
+    pub external_pools_enabled: bool,
+    #[serde(default)]
+    pub external_pool_global_max_concurrent_requests: u32,
+    #[serde(default)]
+    pub external_pool_max_queued_requests: u32,
+    #[serde(default)]
+    pub external_pool_retry_max_attempts: u32,
+    #[serde(default)]
+    pub external_direct_policy_enabled: bool,
+    #[serde(default)]
+    pub direct_external_on_local_maintenance: bool,
+    #[serde(default)]
+    pub direct_external_model_rules: Vec<String>,
+    #[serde(default)]
+    pub direct_external_path_rules: Vec<String>,
+    #[serde(default = "default_true")]
+    pub fallback_on_local_capacity_exhausted: bool,
+    #[serde(default = "default_true")]
+    pub fallback_on_no_available_credentials: bool,
+    #[serde(default = "default_true")]
+    pub fallback_on_local_transient_exhausted: bool,
+    #[serde(default)]
+    pub fallback_on_unsupported_model: bool,
+    #[serde(default = "default_true")]
+    pub local_pool_preflight_enabled: bool,
+    #[serde(default)]
+    pub local_pool_circuit_enabled: bool,
+    #[serde(default = "default_local_pool_circuit_window_secs")]
+    pub local_pool_circuit_window_secs: u64,
+    #[serde(default = "default_local_pool_circuit_open_after_failures")]
+    pub local_pool_circuit_open_after_failures: u32,
+    #[serde(default = "default_local_pool_circuit_require_distinct_credentials")]
+    pub local_pool_circuit_require_distinct_credentials: u32,
+    #[serde(default = "default_local_pool_circuit_open_secs")]
+    pub local_pool_circuit_open_secs: u64,
+    #[serde(default = "default_local_pool_circuit_half_open_max_probes")]
+    pub local_pool_circuit_half_open_max_probes: u32,
+    #[serde(default)]
+    pub external_pool_auto_disable_enabled: bool,
+    #[serde(default = "default_true")]
+    pub external_pool_auto_disable_on_auth_error: bool,
+    #[serde(default = "default_true")]
+    pub external_pool_auto_disable_on_security_lock: bool,
+    #[serde(default)]
+    pub external_pool_auto_disable_on_quota_exhausted: bool,
+    #[serde(default)]
+    pub external_pool_auto_disable_on_misconfigured_endpoint: bool,
+    #[serde(default = "default_external_pool_auto_disable_failure_threshold")]
+    pub external_pool_auto_disable_failure_threshold: u32,
+    #[serde(default)]
+    pub external_pool_auto_disable_duration_secs: u64,
+    #[serde(default = "default_external_pool_rate_limit_cooldown_secs")]
+    pub external_pool_rate_limit_cooldown_secs: u64,
+    #[serde(default = "default_external_pool_server_error_cooldown_secs")]
+    pub external_pool_server_error_cooldown_secs: u64,
+    #[serde(default = "default_external_pool_network_error_cooldown_secs")]
+    pub external_pool_network_error_cooldown_secs: u64,
+    #[serde(default = "default_external_pool_protocol_error_cooldown_secs")]
+    pub external_pool_protocol_error_cooldown_secs: u64,
+}
+
+impl Default for ExternalPoolsConfig {
+    fn default() -> Self {
+        Self {
+            external_pools_enabled: false,
+            external_pool_global_max_concurrent_requests: 0,
+            external_pool_max_queued_requests: 0,
+            external_pool_retry_max_attempts: 0,
+            external_direct_policy_enabled: false,
+            direct_external_on_local_maintenance: false,
+            direct_external_model_rules: Vec::new(),
+            direct_external_path_rules: Vec::new(),
+            fallback_on_local_capacity_exhausted: true,
+            fallback_on_no_available_credentials: true,
+            fallback_on_local_transient_exhausted: true,
+            fallback_on_unsupported_model: false,
+            local_pool_preflight_enabled: true,
+            local_pool_circuit_enabled: false,
+            local_pool_circuit_window_secs: default_local_pool_circuit_window_secs(),
+            local_pool_circuit_open_after_failures: default_local_pool_circuit_open_after_failures(
+            ),
+            local_pool_circuit_require_distinct_credentials:
+                default_local_pool_circuit_require_distinct_credentials(),
+            local_pool_circuit_open_secs: default_local_pool_circuit_open_secs(),
+            local_pool_circuit_half_open_max_probes:
+                default_local_pool_circuit_half_open_max_probes(),
+            external_pool_auto_disable_enabled: false,
+            external_pool_auto_disable_on_auth_error: true,
+            external_pool_auto_disable_on_security_lock: true,
+            external_pool_auto_disable_on_quota_exhausted: false,
+            external_pool_auto_disable_on_misconfigured_endpoint: false,
+            external_pool_auto_disable_failure_threshold:
+                default_external_pool_auto_disable_failure_threshold(),
+            external_pool_auto_disable_duration_secs: 0,
+            external_pool_rate_limit_cooldown_secs: default_external_pool_rate_limit_cooldown_secs(
+            ),
+            external_pool_server_error_cooldown_secs:
+                default_external_pool_server_error_cooldown_secs(),
+            external_pool_network_error_cooldown_secs:
+                default_external_pool_network_error_cooldown_secs(),
+            external_pool_protocol_error_cooldown_secs:
+                default_external_pool_protocol_error_cooldown_secs(),
+        }
     }
 }
 
@@ -871,6 +1016,13 @@ pub struct Config {
     #[serde(default = "default_compat_profile")]
     pub compat_profile: CompatProfile,
 
+    /// 请求模型解析策略（默认 compatible）。
+    ///
+    /// 控制 `sonnet`、`opus`、`default` 等短模型名，以及同 family 自动归一化
+    /// 是否允许在发送上游前映射为当前 Kiro 可用模型。
+    #[serde(default = "default_model_resolution_mode")]
+    pub model_resolution_mode: ModelResolutionMode,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -936,6 +1088,10 @@ pub struct Config {
     /// 仅写头，不会修改响应体，对客户端无副作用。
     #[serde(default = "default_expose_proxy_warnings")]
     pub expose_proxy_warnings: bool,
+
+    /// 外部备用号池和直连/预检 fallback 策略。
+    #[serde(default)]
+    pub external_pools: ExternalPoolsConfig,
 
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
@@ -1147,6 +1303,10 @@ fn default_compat_profile() -> CompatProfile {
     CompatProfile::ClaudeCode
 }
 
+fn default_model_resolution_mode() -> ModelResolutionMode {
+    ModelResolutionMode::Compatible
+}
+
 fn default_extract_thinking() -> bool {
     true
 }
@@ -1193,6 +1353,46 @@ fn default_endpoint() -> String {
 
 fn default_expose_proxy_warnings() -> bool {
     false
+}
+
+fn default_local_pool_circuit_window_secs() -> u64 {
+    60
+}
+
+fn default_local_pool_circuit_open_after_failures() -> u32 {
+    3
+}
+
+fn default_local_pool_circuit_require_distinct_credentials() -> u32 {
+    2
+}
+
+fn default_local_pool_circuit_open_secs() -> u64 {
+    30
+}
+
+fn default_local_pool_circuit_half_open_max_probes() -> u32 {
+    1
+}
+
+fn default_external_pool_auto_disable_failure_threshold() -> u32 {
+    1
+}
+
+fn default_external_pool_rate_limit_cooldown_secs() -> u64 {
+    30
+}
+
+fn default_external_pool_server_error_cooldown_secs() -> u64 {
+    10
+}
+
+fn default_external_pool_network_error_cooldown_secs() -> u64 {
+    10
+}
+
+fn default_external_pool_protocol_error_cooldown_secs() -> u64 {
+    10
 }
 
 fn default_postgres_max_connections() -> u32 {
@@ -1308,6 +1508,7 @@ impl Default for Config {
             scheduler_total_selection_weight: default_scheduler_total_selection_weight(),
             scheduler_top_k: default_scheduler_top_k(),
             compat_profile: default_compat_profile(),
+            model_resolution_mode: default_model_resolution_mode(),
             extract_thinking: default_extract_thinking(),
             prompt_cache_target_read_ratio: default_prompt_cache_target_read_ratio(),
             prompt_cache_token_scale: default_prompt_cache_token_scale(),
@@ -1321,6 +1522,7 @@ impl Default for Config {
             high_cache_threshold: default_high_cache_threshold(),
             default_endpoint: default_endpoint(),
             expose_proxy_warnings: default_expose_proxy_warnings(),
+            external_pools: ExternalPoolsConfig::default(),
             config_path: None,
         }
     }

@@ -45,6 +45,24 @@ function statusTone(status: string): 'success' | 'warning' | 'error' {
   return 'error'
 }
 
+function routeLabel(record: UsageRecord): string {
+  const labels: Record<string, string> = {
+    local_success: '本地成功',
+    local_error_no_fallback: '本地错误',
+    external_fallback_preflight: '预检 fallback',
+    external_fallback_after_local_attempts: '失败后 fallback',
+    external_direct_policy: '外部直连',
+    external_error: '外部错误',
+  }
+  return labels[record.routeSubtype || ''] || (record.routeKind === 'external_pool' ? '外部池' : '本地')
+}
+
+function routeTone(record: UsageRecord): 'neutral' | 'success' | 'warning' | 'error' | 'info' {
+  if (record.routeSubtype === 'external_direct_policy') return 'warning'
+  if (record.routeKind === 'external_pool') return record.status === 'success' ? 'info' : 'error'
+  return record.status === 'success' ? 'success' : 'neutral'
+}
+
 function attemptActionLabel(action: string): string {
   const labels: Record<string, string> = {
     success: '成功',
@@ -68,6 +86,21 @@ function formatAttemptChain(record: UsageRecord): string {
   return (record.credentialAttempts || [])
     .map((attempt) => `#${attempt.credentialId}(${attemptOutcomeLabel(attempt)})`)
     .join(' > ')
+}
+
+function formatExternalAttemptChain(record: UsageRecord): string {
+  return (record.externalAttempts || [])
+    .map((attempt) => `外部池 #${attempt.poolId}(${attempt.status ?? attempt.errorType ?? attempt.action})`)
+    .join(' > ')
+}
+
+function upstreamModel(record: UsageRecord): string {
+  return record.upstreamModel || record.model || '-'
+}
+
+function upstreamModelLabel(record: UsageRecord): string {
+  const source = record.modelResolutionSource ? `（${record.modelResolutionSource}）` : ''
+  return `${upstreamModel(record)}${source}`
 }
 
 function formatJsonBlock(value: unknown): string {
@@ -291,6 +324,8 @@ export function UsagePanel() {
                   const rowReadRatio = ratio(record.cacheReadInputTokens, record.totalInputTokens)
                   const rowCachedRatio = ratio(record.cacheReadInputTokens + record.cacheCreationInputTokens, record.totalInputTokens)
                   const attemptChain = formatAttemptChain(record)
+                  const externalAttemptChain = formatExternalAttemptChain(record)
+                  const isExternal = record.routeKind === 'external_pool'
                   return (
                     <Table.Row key={record.id}>
                       <span>
@@ -298,11 +333,15 @@ export function UsagePanel() {
                         <div className="mt-1 flex flex-wrap items-center gap-1">
                           <Badge tone={statusTone(record.status)}>{statusLabel(record.status)}</Badge>
                           <Badge tone={record.stream ? 'secondary' : 'neutral'}>{record.stream ? 'stream' : 'non-stream'}</Badge>
+                          <Badge tone={routeTone(record)}>{routeLabel(record)}</Badge>
                         </div>
                       </span>
                       <span className="min-w-0">
                         <div className="max-w-[260px] truncate font-semibold" title={record.model || '-'}>
-                          {record.model || '-'}
+                          请求 {record.model || '-'}
+                        </div>
+                        <div className="max-w-[260px] truncate text-xs text-base-content/55" title={upstreamModelLabel(record)}>
+                          上游 {upstreamModelLabel(record)}
                         </div>
                         <div className="mt-1 flex max-w-[260px] flex-wrap items-center gap-1">
                           <Badge>{record.endpoint || '-'}</Badge>
@@ -311,8 +350,9 @@ export function UsagePanel() {
                         </div>
                       </span>
                       <span>
-                        <div className="font-semibold">#{record.credentialId ?? '-'}</div>
+                        <div className="font-semibold">{isExternal ? `外部池 #${record.externalPoolId ?? '-'}` : `#${record.credentialId ?? '-'}`}</div>
                         {label && <div className="max-w-[180px] truncate text-xs text-base-content/55" title={label}>{label}</div>}
+                        {isExternal && record.externalPoolName && <div className="max-w-[180px] truncate text-xs text-base-content/55" title={record.externalPoolName}>{record.externalPoolName}</div>}
                       </span>
                       <span className="font-mono text-xs">
                         <div>输入 {formatNumber(record.totalInputTokens)}</div>
@@ -345,6 +385,16 @@ export function UsagePanel() {
                         ) : (
                           <span className="text-xs text-base-content/40">-</span>
                         )}
+                        {externalAttemptChain && (
+                          <button
+                            type="button"
+                            className="mt-1 block max-w-[220px] truncate text-left text-xs font-medium text-primary hover:underline"
+                            title={externalAttemptChain}
+                            onClick={() => setSelectedRecord(record)}
+                          >
+                            {externalAttemptChain}
+                          </button>
+                        )}
                         {record.errorMessage && (
                           <button
                             type="button"
@@ -375,6 +425,8 @@ export function UsagePanel() {
               const rowReadRatio = ratio(record.cacheReadInputTokens, record.totalInputTokens)
               const rowCachedRatio = ratio(record.cacheReadInputTokens + record.cacheCreationInputTokens, record.totalInputTokens)
               const attemptChain = formatAttemptChain(record)
+              const externalAttemptChain = formatExternalAttemptChain(record)
+              const isExternal = record.routeKind === 'external_pool'
               return (
                 <Card key={record.id} className="usage-record-card">
                   <Card.Body className="gap-2.5 p-3">
@@ -385,10 +437,14 @@ export function UsagePanel() {
                           <Badge tone={statusTone(record.status)}>{statusLabel(record.status)}</Badge>
                           <Badge tone={record.simulated ? 'warning' : 'secondary'}>{sourceLabel(record.usageSource)}</Badge>
                           <Badge tone={record.stream ? 'secondary' : 'neutral'}>{record.stream ? 'stream' : 'non-stream'}</Badge>
+                          <Badge tone={routeTone(record)}>{routeLabel(record)}</Badge>
                         </div>
                         <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
                           <span className="max-w-[360px] truncate text-sm font-semibold" title={record.model || '-'}>
-                            {record.model || '-'}
+                            请求 {record.model || '-'}
+                          </span>
+                          <span className="max-w-[360px] truncate text-xs text-base-content/55" title={upstreamModelLabel(record)}>
+                            上游 {upstreamModelLabel(record)}
                           </span>
                           <Badge>{record.endpoint || '-'}</Badge>
                           {record.stickyBound && <Badge tone="secondary">sticky</Badge>}
@@ -413,9 +469,10 @@ export function UsagePanel() {
 
                     <div className="grid gap-2 text-sm md:grid-cols-2 xl:grid-cols-[220px_1fr]">
                       <div className="min-w-0 rounded-box bg-base-200/60 px-2.5 py-1.5">
-                        <div className="text-xs text-base-content/50">账号</div>
-                        <div className="font-semibold">#{record.credentialId ?? '-'}</div>
+                        <div className="text-xs text-base-content/50">{isExternal ? '外部池' : '账号'}</div>
+                        <div className="font-semibold">{isExternal ? `#${record.externalPoolId ?? '-'}` : `#${record.credentialId ?? '-'}`}</div>
                         {label && <div className="truncate text-xs text-base-content/60" title={label}>{label}</div>}
+                        {isExternal && record.externalPoolName && <div className="truncate text-xs text-base-content/60" title={record.externalPoolName}>{record.externalPoolName}</div>}
                       </div>
                       <div className="min-w-0 rounded-box bg-base-200/60 px-2.5 py-1.5">
                         <div className="text-xs text-base-content/50">会话</div>
@@ -428,6 +485,16 @@ export function UsagePanel() {
                             onClick={() => setSelectedRecord(record)}
                           >
                             调用链路 {attemptChain}
+                          </button>
+                        )}
+                        {externalAttemptChain && (
+                          <button
+                            type="button"
+                            className="mt-1 block max-w-full truncate text-left text-xs font-medium text-primary hover:underline"
+                            title={externalAttemptChain}
+                            onClick={() => setSelectedRecord(record)}
+                          >
+                            外部链路 {externalAttemptChain}
                           </button>
                         )}
                       </div>
@@ -641,15 +708,19 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
           <div className="grid gap-3 text-sm md:grid-cols-2">
             <Detail label="请求 ID" value={record.id} mono />
             <Detail label="时间" value={formatDate(record.createdAt)} />
-            <Detail label="模型" value={record.model || '-'} />
-            {record.upstreamModel && record.upstreamModel !== record.model && (
-              <Detail
-                label="上游模型"
-                value={`${record.upstreamModel}${record.modelResolutionSource ? `（${record.modelResolutionSource}）` : ''}`}
-              />
-            )}
+            <Detail label="请求模型" value={record.model || '-'} />
+            <Detail label="上游模型" value={upstreamModel(record)} />
+            <Detail label="解析来源" value={record.modelResolutionSource || '-'} />
+            {record.modelResolutionNote && <Detail label="解析说明" value={record.modelResolutionNote} />}
             <Detail label="会话" value={record.conversationId || '-'} mono />
             <Detail label="账号" value={`#${record.credentialId ?? '-'} ${record.credentialLabel || ''}`} />
+            <Detail label="路由" value={`${routeLabel(record)} · ${record.routeKind || '-'}${record.routeSubtype ? ` · ${record.routeSubtype}` : ''}`} />
+            {record.routeKind === 'external_pool' && (
+              <Detail label="外部池" value={`#${record.externalPoolId ?? '-'} ${record.externalPoolName || ''}`} />
+            )}
+            {(record.fallbackReason || record.directPolicyReason) && (
+              <Detail label="路由原因" value={record.fallbackReason || record.directPolicyReason || '-'} />
+            )}
             <Detail label="状态" value={statusLabel(record.status)} />
             <Detail label="估算费用" value={`${formatUsd(record.estimatedCostUsd || 0)} ${record.pricingAvailable ? record.pricingModel || 'priced' : 'unpriced'}`} />
           </div>
@@ -677,6 +748,39 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
                           {attempt.model && <div className="max-w-[220px] truncate text-xs text-base-content/60">模型 {attempt.model}</div>}
                         </span>
                         <span>{attempt.statusText || attempt.status || '-'}</span>
+                        <span>{attemptActionLabel(attempt.action)}</span>
+                        <span className="text-right">{formatNumber(attempt.durationMs)}ms</span>
+                        <span><div className="max-w-[320px] truncate" title={attempt.errorMessage || attempt.errorType || ''}>{attempt.errorMessage || attempt.errorType || '-'}</div></span>
+                      </Table.Row>
+                    ))}
+                  </Table.Body>
+                </Table>
+              </div>
+            </div>
+          )}
+          {(record.externalAttempts || []).length > 0 && (
+            <div>
+              <div className="mb-2 text-sm font-medium">外部池链路</div>
+              <div className="mb-2 rounded-box border border-base-300 bg-base-200 px-3 py-2 font-mono text-xs">{formatExternalAttemptChain(record)}</div>
+              <div className="table-panel">
+                <Table size="sm" className="data-table min-w-[760px]">
+                  <Table.Head>
+                    <span>顺序</span>
+                    <span>外部池</span>
+                    <span>状态</span>
+                    <span>动作</span>
+                    <span className="text-right">耗时</span>
+                    <span>错误</span>
+                  </Table.Head>
+                  <Table.Body>
+                    {(record.externalAttempts || []).map((attempt) => (
+                      <Table.Row key={`${attempt.attempt}-${attempt.poolId}-${attempt.durationMs}`}>
+                        <span>{attempt.attempt}</span>
+                        <span>
+                          <div className="font-medium">#{attempt.poolId}</div>
+                          <div className="max-w-[220px] truncate text-xs text-base-content/60">{attempt.poolName}</div>
+                        </span>
+                        <span>{attempt.status || '-'}</span>
                         <span>{attemptActionLabel(attempt.action)}</span>
                         <span className="text-right">{formatNumber(attempt.durationMs)}ms</span>
                         <span><div className="max-w-[320px] truncate" title={attempt.errorMessage || attempt.errorType || ''}>{attempt.errorMessage || attempt.errorType || '-'}</div></span>

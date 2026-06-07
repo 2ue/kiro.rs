@@ -23,8 +23,8 @@ use crate::kiro::machine_id;
 use crate::kiro::model::available_models::{KiroAvailableModel, KiroAvailableModelsResponse};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{
-    CallContext, CredentialRiskControlReason, InFlightKind, InFlightLeaseGuard, ManagerSnapshot,
-    MultiTokenManager, TransientFailureKind,
+    AcquireMode, CallContext, CredentialRiskControlReason, InFlightKind, InFlightLeaseGuard,
+    ManagerSnapshot, MultiTokenManager, TransientFailureKind,
 };
 use crate::model::config::{Config, TlsBackend};
 use parking_lot::Mutex;
@@ -924,8 +924,35 @@ impl KiroProvider {
         request_body: &str,
         request_id: Option<&str>,
     ) -> anyhow::Result<KiroApiResponse> {
+        self.call_api_with_context_with_request_id_and_mode(
+            request_body,
+            request_id,
+            AcquireMode::WaitForCapacity,
+        )
+        .await
+    }
+
+    pub async fn call_api_with_context_with_request_id_fail_fast(
+        &self,
+        request_body: &str,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<KiroApiResponse> {
+        self.call_api_with_context_with_request_id_and_mode(
+            request_body,
+            request_id,
+            AcquireMode::FailFastOnCapacity,
+        )
+        .await
+    }
+
+    async fn call_api_with_context_with_request_id_and_mode(
+        &self,
+        request_body: &str,
+        request_id: Option<&str>,
+        acquire_mode: AcquireMode,
+    ) -> anyhow::Result<KiroApiResponse> {
         let result = self
-            .call_api_with_retry(request_body, false, request_id)
+            .call_api_with_retry(request_body, false, request_id, acquire_mode)
             .await?;
         Ok(KiroApiResponse {
             response: result.response,
@@ -1147,8 +1174,35 @@ impl KiroProvider {
         request_body: &str,
         request_id: Option<&str>,
     ) -> anyhow::Result<KiroStreamResponse> {
+        self.call_api_stream_with_request_id_and_mode(
+            request_body,
+            request_id,
+            AcquireMode::WaitForCapacity,
+        )
+        .await
+    }
+
+    pub async fn call_api_stream_with_request_id_fail_fast(
+        &self,
+        request_body: &str,
+        request_id: Option<&str>,
+    ) -> anyhow::Result<KiroStreamResponse> {
+        self.call_api_stream_with_request_id_and_mode(
+            request_body,
+            request_id,
+            AcquireMode::FailFastOnCapacity,
+        )
+        .await
+    }
+
+    async fn call_api_stream_with_request_id_and_mode(
+        &self,
+        request_body: &str,
+        request_id: Option<&str>,
+        acquire_mode: AcquireMode,
+    ) -> anyhow::Result<KiroStreamResponse> {
         let result = self
-            .call_api_with_retry(request_body, true, request_id)
+            .call_api_with_retry(request_body, true, request_id, acquire_mode)
             .await?;
         Ok(KiroStreamResponse {
             response: result.response,
@@ -1569,6 +1623,7 @@ impl KiroProvider {
         request_body: &str,
         is_stream: bool,
         request_id: Option<&str>,
+        acquire_mode: AcquireMode,
     ) -> anyhow::Result<ApiCallResponse> {
         let total_credentials = self.token_manager.total_count();
         let max_retries =
@@ -1587,10 +1642,11 @@ impl KiroProvider {
             // 获取调用上下文（绑定 index、credentials、token）
             let mut ctx = match self
                 .token_manager
-                .acquire_context_for_session(
+                .acquire_context_for_session_with_mode(
                     model.as_deref(),
                     conversation_id.as_deref(),
                     &excluded_ids,
+                    acquire_mode,
                 )
                 .await
             {

@@ -2,7 +2,55 @@
 
 更新时间：2026-06-07
 
-状态：方案设计文档，尚未实现。
+状态：已完成第一版实现，本文档同时记录原始需求、设计方案和当前落地状态。
+
+## 0. 当前落地状态（2026-06-07）
+
+第一版已在当前项目中落地，核心实现文件如下：
+
+- 外部池模型、调度、透传、重试、自动禁用、usage 投影：`src/external_pool.rs`。
+- Anthropic 入口接入直连/fallback：`src/anthropic/handlers.rs`。
+- 外部池 Admin API：`src/admin/router.rs`、`src/admin/handlers.rs`、`src/admin/service.rs`。
+- 外部池配置结构：`src/model/config.rs`。
+- 外部池持久化：`src/storage/postgres.rs`。
+- 外部池跨实例并发 lease、cooldown 辅助状态：`src/storage/redis_cache.rs`。
+- 旧版管理后台入口和配置页：`admin-ui/src/components/external-pools-panel.tsx`。
+- 新版 Daisy 管理后台入口和配置页：`admin-ui-daisy/src/components/ExternalPoolsPanel.tsx`。
+- Usage 路由/外部池链路展示：`admin-ui/src/components/usage-records-panel.tsx`、`admin-ui-daisy/src/components/UsagePanel.tsx`。
+
+当前第一版明确生效的能力：
+
+1. `externalPoolsEnabled=false` 时完全关闭外部池，不改变本地凭据调度行为。
+2. 显式直连策略支持模型规则、路径规则、本地维护开关，命中后记录为 `external_direct_policy`。
+3. 本地优先；只有本地容量 fail-fast、无可用凭据、瞬态错误耗尽、可选的不支持模型等场景才会 fallback。
+4. 本地容量预检不是长期缓存状态，而是在外部池可用时对本地调度执行 fail-fast acquire；本地可调度时仍走本地凭据。
+5. 不引入 `localPoolFallbackGraceMs`，不会等待一段时间后再 fallback。
+6. 外部池请求保持原始 Anthropic body 透传，不执行本地 Kiro payload guard、模型映射、profileArn 注入、machineId 逻辑。
+7. 外部池响应默认严格透传；单池 `usageProjectionMode=current_path_policy` 时才按当前路径的 `reportedUsage` 策略改写 usage/cache 上报。
+8. 外部池非 2xx 响应先用于换池、冷却、自动禁用判断；如果最终需要把该错误返回给下游，必须透传最后一个外部上游的 status/body/主要响应 header，不能包装成本网关的错误 envelope。
+9. 外部池按优先级和当前 in-flight 占比选择；相同优先级和占用率的候选随机分散。
+10. 外部池并发使用 Redis lease，单池并发和外部池全局并发都能跨实例生效；流式请求会持有 lease 直到 stream 结束或客户端断开。
+11. 外部池错误不会在同一个池重复重试；可重试错误会立即排除当前池并尝试下一个外部池，受 `externalPoolRetryMaxAttempts` 限制。
+12. 本地 400、请求体过长、context full、improper request、tool schema invalid、JSON invalid、tool_use/tool_result 问题不会 fallback 到外部池。
+13. 外部池自动禁用和人工 `enabled` 分离；自动禁用状态持久化在 Postgres，cooldown/in-flight 存 Redis。
+14. Usage record 会记录本地/外部路由类型、路由子类型、fallback/direct 原因、本地尝试链路、外部池尝试链路、最终外部池、是否应用 usage 投影。
+15. 旧版和新版管理后台都有独立 `备用池` 入口，支持策略配置、外部池新增/编辑/启停/删除/测试/清除自动禁用。
+
+当前第一版保留但尚未生效的配置：
+
+1. `externalPoolMaxQueuedRequests`：保留字段。当前实现不做外部池排队等待，因为用户明确不需要 fallback grace 或等待队列；外部池无槽位时直接视为不可调度。
+2. `localPoolCircuitEnabled`、`localPoolCircuitWindowSecs`、`localPoolCircuitOpenAfterFailures`、`localPoolCircuitRequireDistinctCredentials`、`localPoolCircuitOpenSecs`、`localPoolCircuitHalfOpenMaxProbes`：保留字段。当前实现未启用本地池 circuit breaker，默认 `localPoolCircuitEnabled=false`。本地状态预检依赖实际 fail-fast acquire 和 Redis/本地调度状态，不依赖 circuit。
+
+当前第一版已知观测限制：
+
+1. 外部池流式响应在拿到上游响应头后即返回下游，并记录外部池尝试成功；并发 lease 会随 stream 结束或连接关闭释放。若上游在响应头之后发生流式读取错误，该错误会传播给下游连接，但当前不会二次回写 usage record 为失败。该限制只影响 usage 观测精度，不影响外部池并发释放、换池决策或本地凭据调度。
+
+第一版验证结果：
+
+- `cargo test --locked --no-default-features`：439 个 Rust 测试通过。
+- `pnpm --dir admin-ui build`：通过。
+- `pnpm --dir admin-ui-daisy build`：通过。
+- `node tools/check-admin-ui-api-parity.mjs`：通过，两个前端 API 覆盖一致。
 
 ## 1. 背景
 
@@ -407,6 +455,7 @@ struct KiroProviderError {
 8. 不修改 response body。
 9. 只替换认证 header。
 10. 只清理 hop-by-hop header。
+11. 外部池返回非 2xx 时，网关仍可读取响应用于错误分类、冷却、换池和自动禁用；但最终返给下游的错误响应必须保持外部上游原始 status/body/content-type 等主要 header，不能改写成本网关自己的错误 JSON。
 
 唯一允许的响应改写例外是“用量上报投影”。该能力必须由单池 `usageProjectionMode=current_path_policy` 显式开启，并且只允许改写响应里的 usage/cache 上报字段，不能改写正文内容、tool 调用、文本块、stop_reason、id、model 等其他字段。请求侧始终保持原始 body 透传。
 
@@ -999,8 +1048,8 @@ fn should_fallback(kind: LocalPoolFailureKind, config: &ExternalPoolConfig) -> b
   - `inherit`、`disabled` 或 `enabled`。
   - `inherit` 表示使用全局外部池自动禁用策略。
   - `disabled` 表示该池永不被系统自动禁用，只会冷却和记录错误。
-  - `enabled` 表示在全局 `externalPoolAutoDisableEnabled=true` 时，该池强制参与自动禁用策略，不再使用后续可能增加的全局默认池策略。
-  - 全局 `externalPoolAutoDisableEnabled=false` 必须优先，单池 `enabled` 不能绕过全局总开关。
+  - `enabled` 表示该池强制参与自动禁用策略，可以覆盖全局 `externalPoolAutoDisableEnabled=false`。这只影响自动禁用判断，不影响外部池总开关 `externalPoolsEnabled`。
+  - `externalPoolsEnabled=false` 仍是外部池能力总开关；单池 `enabled` 或 `autoDisablePolicy=enabled` 都不能绕过外部池总开关。
 - `preservePath`
   - 默认 `true`，保持当前请求路径。
 - `notes`
@@ -1025,7 +1074,7 @@ fn should_fallback(kind: LocalPoolFailureKind, config: &ExternalPoolConfig) -> b
   "fallbackOnLocalTransientExhausted": true,
   "fallbackOnUnsupportedModel": false,
   "localPoolPreflightEnabled": true,
-  "localPoolCircuitEnabled": true,
+  "localPoolCircuitEnabled": false,
   "localPoolCircuitWindowSecs": 60,
   "localPoolCircuitOpenAfterFailures": 3,
   "localPoolCircuitRequireDistinctCredentials": 2,
@@ -1048,7 +1097,9 @@ fn should_fallback(kind: LocalPoolFailureKind, config: &ExternalPoolConfig) -> b
 - `externalPoolGlobalMaxConcurrentRequests`
   - 外部池整体并发，`0` 表示不限。
 - `externalPoolMaxQueuedRequests`
-  - 外部池等待队列上限，`0` 表示不排队或不限，具体实现需明确。
+  - 第一版保留字段，当前不生效。
+  - 当前实现不做外部池等待队列；外部池无并发槽位时直接视为不可调度并尝试其他外部池或返回外部池不可用。
+  - 保留该字段是为了以后如果明确需要外部池排队，可以不破坏配置结构。
 - `externalPoolRetryMaxAttempts`
   - `0` 表示自动覆盖一轮所有 enabled 外部池。
 - `externalDirectPolicyEnabled`
@@ -1072,7 +1123,8 @@ fn should_fallback(kind: LocalPoolFailureKind, config: &ExternalPoolConfig) -> b
   - 是否启用本地状态预检，默认 `true`。
   - 关闭后只在真实本地调用失败后 fallback，不做 `external_fallback_preflight`。
 - `localPoolCircuitEnabled`
-  - 是否启用本地池按模型/路径的 circuit breaker，默认 `true`。
+  - 第一版保留字段，默认 `false`，当前不生效。
+  - 当前本地状态预检依赖实际 fail-fast acquire 和调度器/Redis 运行态，不依赖 circuit breaker。
 - `localPoolCircuitWindowSecs`
   - 本地池失败统计窗口，建议默认 `60s`。
 - `localPoolCircuitOpenAfterFailures`
@@ -1450,20 +1502,34 @@ CREATE INDEX IF NOT EXISTS idx_external_upstream_pools_auto_disabled
 
 ### 10.2 运行状态
 
-推荐 Redis 管理运行状态：
+第一版 Redis 运行状态使用以下 key：
 
 ```text
-external_pool:{id}:in_flight
-external_pool:{id}:cooldown_until
-external_pool:{id}:stats
-external_pool_session:{conversation_id}
+external_pool:inflight:lease_sequence
+external_pool:inflight:{id}:last_seen
+external_pool:inflight:{id}:acquired
+external_pool:inflight:{id}:kind
+external_pool:global:inflight:last_seen
+external_pool:global:inflight:acquired
+external_pool:global:inflight:kind
+external_pool:{id}:cooldown
+external_pool:{id}:auto_disable_failures:{reason}
 ```
+
+说明：
+
+- `last_seen/acquired/kind` 是 Redis lease 的三组状态，单池和全局各一份。
+- 单池 `maxConcurrentRequests` 和全局 `externalPoolGlobalMaxConcurrentRequests` 都通过 Redis Lua 原子判断与占用。
+- 流式外部池请求会把 lease 持有到 stream 结束或客户端断开。
+- cooldown 写入 `external_pool:{id}:cooldown`，同时保留进程内 fallback 状态；多实例以 Redis 为准。
+- 自动禁用失败计数使用 `external_pool:{id}:auto_disable_failures:{reason}`，自动禁用最终状态写入 PgSQL。
+- 第一版没有实现外部池 session 粘性绑定；外部池之间按优先级和 in-flight 占比均衡。
 
 如果需要页面展示长期统计，可以定期或请求结束时写 PgSQL 观测字段，但并发 lease 不建议使用 PgSQL 字段实现。
 
 ### 10.3 usage_records 扩展
 
-建议新增 usage record 字段：
+第一版已新增 usage record 字段：
 
 - `route_kind`
   - `local_credential`
@@ -1484,7 +1550,7 @@ external_pool_session:{conversation_id}
 
 ## 11. Admin API
 
-建议新增接口：
+第一版已新增接口：
 
 ```text
 GET    /api/admin/external-pools
@@ -1493,12 +1559,11 @@ PUT    /api/admin/external-pools/:id
 DELETE /api/admin/external-pools/:id
 POST   /api/admin/external-pools/:id/enabled
 POST   /api/admin/external-pools/:id/test
-POST   /api/admin/external-pools/:id/cooldown/clear
 POST   /api/admin/external-pools/:id/auto-disabled/clear
 GET    /api/admin/external-pools/status
-GET    /api/admin/config/external-pools
-PUT    /api/admin/config/external-pools
 ```
+
+外部池全局策略通过现有 runtime config 接口读写，即运行时配置对象里的 `externalPools` 字段；第一版没有单独提供 `/config/external-pools` 路由。
 
 API 要求：
 
@@ -1506,7 +1571,7 @@ API 要求：
 - 创建/更新时允许修改 key。
 - 删除建议软删除。
 - `test` 应测试 `/v1/messages` 或 `/v1/models`，具体取决于外部池兼容能力。
-- `status` 返回每个池的 in-flight、cooldown、最近错误、最近成功、成功/失败计数。
+- `status` 返回每个池的 in-flight、cooldown、是否可调度、跳过原因。
 - `auto-disabled/clear` 只解除系统自动禁用，不改变管理员 `enabled` 配置。
 
 ## 12. Admin UI
@@ -1607,7 +1672,7 @@ API 要求：
 - `该池不自动禁用`
   - 对应 `disabled`。
 - `该池允许自动禁用`
-  - 对应 `enabled`。
+  - 对应 `enabled`，可以覆盖全局 `externalPoolAutoDisableEnabled=false`，但不能绕过外部池总开关 `externalPoolsEnabled=false`。
 
 页面状态展示建议：
 
@@ -1840,7 +1905,7 @@ external_pool_attempt pool_id=3 status=200 action=success
 
 ### 16.2 Usage 详情页
 
-Usage 详情页应展示：
+第一版 Usage 详情页已展示：
 
 - 路由类型：本地凭据 / 外部备用号池。
 - 路由子类型：本地成功 / 预检 fallback / 本地失败后 fallback / 策略直连。
@@ -1872,7 +1937,7 @@ Usage 详情页应展示：
   "fallbackOnLocalTransientExhausted": true,
   "fallbackOnUnsupportedModel": false,
   "localPoolPreflightEnabled": true,
-  "localPoolCircuitEnabled": true,
+  "localPoolCircuitEnabled": false,
   "localPoolCircuitWindowSecs": 60,
   "localPoolCircuitOpenAfterFailures": 3,
   "localPoolCircuitRequireDistinctCredentials": 2,
@@ -2032,7 +2097,8 @@ Usage 详情页应展示：
 ### 19.4.2 本地预检状态
 
 - 预检应读取 PgSQL/配置中的凭据启用状态、模型支持、quota/auth/risk 标记。
-- 预检应读取 Redis 中的全局 in-flight、单凭据 in-flight、cooldown、RPM、队列、circuit 状态。
+- 第一版预检通过真实 fail-fast acquire 读取当前调度状态，不使用长期缓存的“本地是否可用”布尔值。
+- 如果后续启用本地池 circuit breaker，预检才需要额外读取 Redis 中的 circuit 状态；当前 circuit 相关字段为保留字段。
 - 容量判断应通过原子 try-acquire 或 fail-fast acquire 验证，不能只靠普通读取。
 - 多实例下，一个实例设置的 cooldown/circuit 应被其他实例预检读取到。
 - sticky 凭据满但其他本地凭据可用时，不应预检 fallback，应选择其他本地凭据。

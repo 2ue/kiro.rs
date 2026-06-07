@@ -21,6 +21,7 @@ import { AuditLogsPanel } from '@/components/audit-logs-panel'
 import { CredentialExportDialog } from '@/components/credential-export-dialog'
 import { ProxyResourcesPanel } from '@/components/proxy-resources-panel'
 import { AccountValidationPanel } from '@/components/account-validation-panel'
+import { ExternalPoolsPanel } from '@/components/external-pools-panel'
 import { useCredentialsPage, useDeleteCredential, useResetFailure, useLoadBalancingMode, useProxyResources, useRuntimeConfig, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialInfo, refreshCredentialInfo, forceRefreshToken, getCredentials, testCredential } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
@@ -53,7 +54,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [proxyFilter, setProxyFilter] = useState('all')
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'credentials' | 'validation' | 'proxies' | 'usage' | 'pricing' | 'audit' | 'config'>('credentials')
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'credentials' | 'validation' | 'proxies' | 'external' | 'usage' | 'pricing' | 'audit' | 'config'>('credentials')
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
@@ -659,6 +660,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
               代理
             </Button>
             <Button
+              variant={activeTab === 'external' ? 'secondary' : 'ghost'}
+              size="sm"
+              onClick={() => setActiveTab('external')}
+            >
+              <Router className="h-4 w-4" />
+              备用池
+            </Button>
+            <Button
               variant={activeTab === 'usage' ? 'secondary' : 'ghost'}
               size="sm"
               onClick={() => setActiveTab('usage')}
@@ -721,6 +730,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <AccountValidationPanel />
         ) : activeTab === 'proxies' ? (
           <ProxyResourcesPanel />
+        ) : activeTab === 'external' ? (
+          <ExternalPoolsPanel />
         ) : activeTab === 'pricing' ? (
           <ModelPricingPanel />
         ) : activeTab === 'audit' ? (

@@ -1,4 +1,4 @@
-import { AlertCircle, CheckCircle2, Download, FileUp, Loader2, Play, RotateCw, XCircle } from 'lucide-react'
+import { AlertCircle, CheckCircle2, Download, Eye, EyeOff, FileUp, Loader2, Play, RotateCw, XCircle } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { Alert, Button, Card, Checkbox, Form, Input, Loading, Modal, Progress, Select, Textarea } from 'react-daisyui'
@@ -17,6 +17,44 @@ import type {
 } from '@/types/api'
 
 type AuthMethod = 'social' | 'idc' | 'api_key'
+
+function SecretInput({
+  value,
+  onChange,
+  visible,
+  onToggle,
+  placeholder,
+}: {
+  value: string
+  onChange: (value: string) => void
+  visible: boolean
+  onToggle: () => void
+  placeholder?: string
+}) {
+  return (
+    <div className="relative">
+      <Input
+        bordered
+        size="sm"
+        className="pr-10"
+        type={visible ? 'text' : 'password'}
+        value={value}
+        placeholder={placeholder}
+        onChange={(event) => onChange(event.target.value)}
+      />
+      <Button
+        type="button"
+        color="ghost"
+        size="xs"
+        className="absolute right-1 top-1 h-7 min-h-0 px-2"
+        onClick={onToggle}
+        title={visible ? '隐藏' : '显示'}
+      >
+        {visible ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+      </Button>
+    </div>
+  )
+}
 
 function initialCredentialForm(): Required<Pick<AddCredentialRequest, 'email' | 'refreshToken' | 'kiroApiKey' | 'authRegion' | 'apiRegion' | 'clientId' | 'clientSecret' | 'machineId' | 'proxyUrl' | 'proxyUsername' | 'proxyPassword' | 'endpoint'>> & { authMethod: AuthMethod; priority: string; proxyResourceId: string } {
   return {
@@ -67,13 +105,19 @@ export function AddCredentialModal({
   onClose: () => void
 }) {
   const [form, setForm] = useState(initialCredentialForm)
+  const [showProxyUsername, setShowProxyUsername] = useState(false)
+  const [showProxyPassword, setShowProxyPassword] = useState(false)
   const add = useAddCredential()
   const proxyResources = useProxyResources()
   const proxyResourceOptions = (proxyResources.data?.resources || []).filter((resource) => resource.enabled)
   const isApiKey = form.authMethod === 'api_key'
 
   useEffect(() => {
-    if (!open) setForm(initialCredentialForm())
+    if (!open) {
+      setForm(initialCredentialForm())
+      setShowProxyUsername(false)
+      setShowProxyPassword(false)
+    }
   }, [open])
 
   const update = (key: keyof typeof form, value: string) => setForm((prev) => ({ ...prev, [key]: value }))
@@ -199,10 +243,20 @@ export function AddCredentialModal({
             <Input bordered size="sm" value={form.proxyUrl} onChange={(event) => update('proxyUrl', event.target.value)} placeholder="socks5h://127.0.0.1:1080" />
           </FieldLabel>
           <FieldLabel title="代理用户名">
-            <Input bordered size="sm" value={form.proxyUsername} onChange={(event) => update('proxyUsername', event.target.value)} />
+            <SecretInput
+              value={form.proxyUsername}
+              onChange={(value) => update('proxyUsername', value)}
+              visible={showProxyUsername}
+              onToggle={() => setShowProxyUsername((value) => !value)}
+            />
           </FieldLabel>
           <FieldLabel title="代理密码">
-            <Input bordered size="sm" type="password" value={form.proxyPassword} onChange={(event) => update('proxyPassword', event.target.value)} />
+            <SecretInput
+              value={form.proxyPassword}
+              onChange={(value) => update('proxyPassword', value)}
+              visible={showProxyPassword}
+              onToggle={() => setShowProxyPassword((value) => !value)}
+            />
           </FieldLabel>
         </div>
         <Modal.Actions>

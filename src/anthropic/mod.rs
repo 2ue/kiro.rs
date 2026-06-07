@@ -35,7 +35,7 @@
 
 pub(crate) mod cache;
 pub(crate) mod converter;
-mod envelope;
+pub(crate) mod envelope;
 mod handlers;
 mod middleware;
 pub(crate) mod model_capabilities;

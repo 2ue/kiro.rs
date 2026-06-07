@@ -38,6 +38,10 @@ use crate::anthropic::{
         UsageRecordsPageResult, UsageRecordsResult, UsageSummary,
     },
 };
+use crate::external_pool::{
+    CreateExternalPoolRequest, ExternalPool, ExternalPoolManager, ExternalPoolTestResponse,
+    ExternalPoolsStatusResponse, SetExternalPoolEnabledRequest, UpdateExternalPoolRequest,
+};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::{
@@ -47,6 +51,7 @@ use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::model::config::ExternalPoolsConfig;
 use crate::storage::postgres::{
     AdminAuditLogPage, CreateProxyResourceRow, CredentialAccountInfoRow, PostgresStore,
     PostgresUsageStore, ProxyResourceRow, UpdateProxyResourceRow,
@@ -143,6 +148,7 @@ pub struct AdminService {
     pricing_catalog: Arc<PricingCatalog>,
     model_capabilities: Arc<ModelCapabilitiesCatalog>,
     kiro_provider: Arc<KiroProvider>,
+    external_pool_manager: Arc<ExternalPoolManager>,
     usage_cleanup: Arc<Mutex<UsageCleanupRuntime>>,
 }
 
@@ -201,6 +207,7 @@ impl AdminService {
         postgres_store: Arc<PostgresStore>,
         redis_store: Arc<RedisStore>,
         request_api_key: impl Into<String>,
+        external_pool_manager: Arc<ExternalPoolManager>,
     ) -> Self {
         Self {
             token_manager,
@@ -213,6 +220,7 @@ impl AdminService {
             pricing_catalog,
             model_capabilities,
             kiro_provider,
+            external_pool_manager,
             usage_cleanup: Arc::new(Mutex::new(UsageCleanupRuntime::default())),
         }
     }
@@ -228,6 +236,169 @@ impl AdminService {
 
     pub fn get_access_keys(&self, admin_api_key: &str) -> AccessKeysResponse {
         access_keys_response(&self.request_api_key, admin_api_key)
+    }
+
+    pub fn list_external_pools(&self) -> Result<Vec<ExternalPool>, AdminServiceError> {
+        let store = self.postgres_store.clone();
+        block_on_admin_store(async move { store.list_external_pools(true).await })
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))
+    }
+
+    pub fn create_external_pool(
+        &self,
+        request: CreateExternalPoolRequest,
+    ) -> Result<ExternalPool, AdminServiceError> {
+        let store = self.postgres_store.clone();
+        let pool = block_on_admin_store(async move { store.create_external_pool(request).await })
+            .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?;
+        self.audit(
+            "create_external_pool",
+            "external_pool",
+            Some(pool.id.to_string()),
+            true,
+            None,
+            json!({ "name": pool.name, "baseUrl": pool.base_url }),
+        );
+        Ok(pool)
+    }
+
+    pub fn update_external_pool(
+        &self,
+        id: u64,
+        request: UpdateExternalPoolRequest,
+    ) -> Result<ExternalPool, AdminServiceError> {
+        let store = self.postgres_store.clone();
+        let pool =
+            block_on_admin_store(async move { store.update_external_pool(id, request).await })
+                .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
+                .ok_or(AdminServiceError::NotFound { id })?;
+        self.audit(
+            "update_external_pool",
+            "external_pool",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({ "name": pool.name, "baseUrl": pool.base_url }),
+        );
+        Ok(pool)
+    }
+
+    pub fn delete_external_pool(&self, id: u64) -> Result<(), AdminServiceError> {
+        let store = self.postgres_store.clone();
+        let deleted =
+            block_on_admin_store(async move { store.soft_delete_external_pool(id).await })
+                .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        if !deleted {
+            return Err(AdminServiceError::NotFound { id });
+        }
+        self.audit(
+            "delete_external_pool",
+            "external_pool",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({}),
+        );
+        Ok(())
+    }
+
+    pub fn set_external_pool_enabled(
+        &self,
+        id: u64,
+        request: SetExternalPoolEnabledRequest,
+    ) -> Result<ExternalPool, AdminServiceError> {
+        let store = self.postgres_store.clone();
+        let pool = block_on_admin_store(async move {
+            store.set_external_pool_enabled(id, request.enabled).await
+        })
+        .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
+        .ok_or(AdminServiceError::NotFound { id })?;
+        self.audit(
+            "set_external_pool_enabled",
+            "external_pool",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({ "enabled": request.enabled }),
+        );
+        Ok(pool)
+    }
+
+    pub fn clear_external_pool_auto_disabled(
+        &self,
+        id: u64,
+    ) -> Result<ExternalPool, AdminServiceError> {
+        let store = self.postgres_store.clone();
+        let pool =
+            block_on_admin_store(async move { store.clear_external_pool_auto_disabled(id).await })
+                .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
+                .ok_or(AdminServiceError::NotFound { id })?;
+        self.audit(
+            "clear_external_pool_auto_disabled",
+            "external_pool",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({}),
+        );
+        Ok(pool)
+    }
+
+    pub fn get_external_pool_status(
+        &self,
+    ) -> Result<ExternalPoolsStatusResponse, AdminServiceError> {
+        let manager = self.external_pool_manager.clone();
+        let config = self.token_manager.runtime_config().external_pools;
+        let pools = block_on_admin_store(async move { manager.status(&config).await })
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        Ok(ExternalPoolsStatusResponse { pools })
+    }
+
+    pub fn test_external_pool(
+        &self,
+        id: u64,
+    ) -> Result<ExternalPoolTestResponse, AdminServiceError> {
+        let store = self.postgres_store.clone();
+        let pool = block_on_admin_store(async move { store.get_external_pool(id, false).await })
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
+            .ok_or(AdminServiceError::NotFound { id })?;
+        block_on_admin_store(async move {
+            let base_url = pool.base_url.trim_end_matches('/');
+            let url = format!("{}/v1/models", base_url);
+            let client = reqwest::Client::builder()
+                .timeout(StdDuration::from_secs(15))
+                .build()?;
+            let mut request = client.get(url);
+            match pool.auth_type {
+                crate::external_pool::ExternalPoolAuthType::Bearer => {
+                    request = request.bearer_auth(pool.api_key.unwrap_or_default());
+                }
+                crate::external_pool::ExternalPoolAuthType::XApiKey => {
+                    request = request.header("x-api-key", pool.api_key.unwrap_or_default());
+                }
+            }
+            let result = request.send().await;
+            Ok::<ExternalPoolTestResponse, anyhow::Error>(match result {
+                Ok(response) => {
+                    let status = response.status();
+                    ExternalPoolTestResponse {
+                        ok: status.is_success(),
+                        status: Some(status.as_u16()),
+                        message: if status.is_success() {
+                            "外部池测试通过".to_string()
+                        } else {
+                            format!("外部池测试失败: {}", status)
+                        },
+                    }
+                }
+                Err(err) => ExternalPoolTestResponse {
+                    ok: false,
+                    status: None,
+                    message: err.to_string(),
+                },
+            })
+        })
+        .map_err(|err| AdminServiceError::InternalError(err.to_string()))
     }
 
     pub fn update_admin_api_key(
@@ -505,6 +676,8 @@ impl AdminService {
                     last_used_at: entry.last_used_at.clone(),
                     has_proxy: entry.has_proxy,
                     proxy_url: entry.proxy_url,
+                    proxy_username: entry.proxy_username,
+                    proxy_password: entry.proxy_password,
                     proxy_resource_id: entry.proxy_resource_id,
                     proxy_resource_name: entry.proxy_resource_name,
                     effective_proxy_url: entry.effective_proxy_url,
@@ -948,16 +1121,19 @@ impl AdminService {
             ));
         }
 
-        let model_resolution = self.model_capabilities.resolve_model(model);
-        let model_id = model_resolution.upstream_model.ok_or_else(|| {
-            AdminServiceError::InvalidCredential(format!("不支持的测试模型: {}", model))
-        })?;
+        let runtime_config = self.token_manager.runtime_config();
+        let model_resolution = self
+            .model_capabilities
+            .resolve_model_with_mode(model, runtime_config.model_resolution_mode);
         if model_resolution.source == ModelResolutionSource::Unsupported {
             return Err(AdminServiceError::InvalidCredential(format!(
                 "不支持的测试模型: {}",
                 model
             )));
         }
+        let model_id = model_resolution.upstream_model.clone().ok_or_else(|| {
+            AdminServiceError::InvalidCredential(format!("不支持的测试模型: {}", model))
+        })?;
 
         let conversation_id = uuid::Uuid::new_v4().to_string();
         let agent_continuation_id = uuid::Uuid::new_v4().to_string();
@@ -1717,6 +1893,9 @@ impl AdminService {
     pub fn get_runtime_config(&self) -> RuntimeConfigResponse {
         let config = self.token_manager.runtime_config();
         RuntimeConfigResponse {
+            proxy_url: config.proxy_url.clone(),
+            proxy_username: config.proxy_username.clone(),
+            proxy_password: config.proxy_password.clone(),
             credential_rpm: config.credential_rpm.unwrap_or(0),
             credential_max_concurrent_requests: config.credential_max_concurrent_requests,
             credential_transient_cooldown_secs: config.credential_transient_cooldown_secs,
@@ -1761,8 +1940,10 @@ impl AdminService {
             prompt_cache_cap_jitter_max_tokens: config.prompt_cache_cap_jitter_max_tokens,
             prompt_cache_scale_min_input_tokens: config.prompt_cache_scale_min_input_tokens,
             reported_usage: config.reported_usage.normalized(),
+            external_pools: config.external_pools.clone(),
             high_cache_threshold: config.high_cache_threshold,
             compat_profile: config.compat_profile,
+            model_resolution_mode: config.model_resolution_mode,
             extract_thinking: config.extract_thinking,
             expose_proxy_warnings: config.expose_proxy_warnings,
         }
@@ -1889,10 +2070,17 @@ impl AdminService {
             .clone()
             .unwrap_or_else(|| current_config.reported_usage.clone())
             .normalized();
+        let external_pools = req
+            .external_pools
+            .clone()
+            .unwrap_or_else(|| current_config.external_pools.clone());
         let high_cache_threshold = req
             .high_cache_threshold
             .unwrap_or(current_config.high_cache_threshold);
         let compat_profile = req.compat_profile.unwrap_or(current_config.compat_profile);
+        let model_resolution_mode = req
+            .model_resolution_mode
+            .unwrap_or(current_config.model_resolution_mode);
         let extract_thinking = req
             .extract_thinking
             .unwrap_or(current_config.extract_thinking);
@@ -2025,6 +2213,8 @@ impl AdminService {
         reported_usage
             .validate()
             .map_err(AdminServiceError::InvalidCredential)?;
+        validate_external_pools_config(&external_pools)
+            .map_err(AdminServiceError::InvalidCredential)?;
         if high_cache_threshold < 0 {
             return Err(AdminServiceError::InvalidCredential(
                 "highCacheThreshold 不能小于 0".to_string(),
@@ -2086,8 +2276,10 @@ impl AdminService {
                 config.prompt_cache_cap_jitter_max_tokens = prompt_cache_cap_jitter_max_tokens;
                 config.prompt_cache_scale_min_input_tokens = prompt_cache_scale_min_input_tokens;
                 config.reported_usage = reported_usage;
+                config.external_pools = external_pools;
                 config.high_cache_threshold = high_cache_threshold;
                 config.compat_profile = compat_profile;
+                config.model_resolution_mode = model_resolution_mode;
                 config.extract_thinking = extract_thinking;
                 config.expose_proxy_warnings = expose_proxy_warnings;
             })
@@ -2473,17 +2665,84 @@ fn validate_proxy_url(value: &str) -> Result<String, AdminServiceError> {
     }
 }
 
+fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), String> {
+    if config.external_pool_global_max_concurrent_requests > 100_000 {
+        return Err("externalPoolGlobalMaxConcurrentRequests 不能大于 100000".to_string());
+    }
+    if config.external_pool_max_queued_requests > 100_000 {
+        return Err("externalPoolMaxQueuedRequests 不能大于 100000".to_string());
+    }
+    if config.external_pool_retry_max_attempts > 10_000 {
+        return Err("externalPoolRetryMaxAttempts 不能大于 10000".to_string());
+    }
+    if config.direct_external_model_rules.len() > 200 {
+        return Err("directExternalModelRules 不能超过 200 条".to_string());
+    }
+    if config.direct_external_path_rules.len() > 200 {
+        return Err("directExternalPathRules 不能超过 200 条".to_string());
+    }
+    if config
+        .direct_external_model_rules
+        .iter()
+        .chain(config.direct_external_path_rules.iter())
+        .any(|rule| rule.len() > 256)
+    {
+        return Err("directExternal 规则单条长度不能超过 256".to_string());
+    }
+    if config.local_pool_circuit_window_secs == 0
+        || config.local_pool_circuit_window_secs > 24 * 60 * 60
+    {
+        return Err("localPoolCircuitWindowSecs 必须在 1 到 86400 之间".to_string());
+    }
+    if config.local_pool_circuit_open_after_failures == 0
+        || config.local_pool_circuit_open_after_failures > 10_000
+    {
+        return Err("localPoolCircuitOpenAfterFailures 必须在 1 到 10000 之间".to_string());
+    }
+    if config.local_pool_circuit_require_distinct_credentials > 10_000 {
+        return Err("localPoolCircuitRequireDistinctCredentials 不能大于 10000".to_string());
+    }
+    if config.local_pool_circuit_open_secs == 0
+        || config.local_pool_circuit_open_secs > 24 * 60 * 60
+    {
+        return Err("localPoolCircuitOpenSecs 必须在 1 到 86400 之间".to_string());
+    }
+    if config.local_pool_circuit_half_open_max_probes == 0
+        || config.local_pool_circuit_half_open_max_probes > 10_000
+    {
+        return Err("localPoolCircuitHalfOpenMaxProbes 必须在 1 到 10000 之间".to_string());
+    }
+    if config.external_pool_auto_disable_failure_threshold == 0
+        || config.external_pool_auto_disable_failure_threshold > 10_000
+    {
+        return Err("externalPoolAutoDisableFailureThreshold 必须在 1 到 10000 之间".to_string());
+    }
+    if config.external_pool_auto_disable_duration_secs > 365 * 24 * 60 * 60 {
+        return Err("externalPoolAutoDisableDurationSecs 不能超过 365 天".to_string());
+    }
+    if config.external_pool_rate_limit_cooldown_secs == 0
+        || config.external_pool_server_error_cooldown_secs == 0
+        || config.external_pool_network_error_cooldown_secs == 0
+        || config.external_pool_protocol_error_cooldown_secs == 0
+    {
+        return Err("外部池错误冷却秒数必须大于 0".to_string());
+    }
+    Ok(())
+}
+
 fn proxy_resource_response(row: ProxyResourceRow) -> ProxyResourceResponse {
+    let has_password = row
+        .proxy_password
+        .as_deref()
+        .map(|value| !value.is_empty())
+        .unwrap_or(false);
     ProxyResourceResponse {
         id: row.id,
         name: row.name,
         proxy_url: row.proxy_url,
         proxy_username: row.proxy_username,
-        has_password: row
-            .proxy_password
-            .as_deref()
-            .map(|value| !value.is_empty())
-            .unwrap_or(false),
+        proxy_password: row.proxy_password,
+        has_password,
         enabled: row.enabled,
         notes: row.notes,
         created_at: row.created_at,

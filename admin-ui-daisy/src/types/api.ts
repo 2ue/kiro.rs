@@ -48,6 +48,8 @@ export interface CredentialStatusItem {
   lastUsedAt: string | null
   hasProxy: boolean
   proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
   proxyResourceId?: number
   proxyResourceName?: string
   effectiveProxyUrl?: string
@@ -289,6 +291,7 @@ export interface ProxyResource {
   name: string
   proxyUrl: string
   proxyUsername?: string | null
+  proxyPassword?: string | null
   hasPassword: boolean
   enabled: boolean
   notes?: string | null
@@ -386,11 +389,32 @@ export interface UsageRecord {
   stickyBound: boolean
   fallbackFromSticky: boolean
   credentialAttempts?: KiroCredentialAttempt[]
+  routeKind?: 'local_credential' | 'external_pool'
+  routeSubtype?: 'local_success' | 'local_error_no_fallback' | 'external_fallback_preflight' | 'external_fallback_after_local_attempts' | 'external_direct_policy' | 'external_error'
+  fallbackReason?: string
+  directPolicyReason?: string
+  localAttempted?: boolean
+  localPreflight?: unknown
+  externalPoolId?: number
+  externalPoolName?: string
+  externalAttempts?: ExternalPoolAttempt[]
+  usageProjectionApplied?: boolean
   errorType?: string
   errorMessage?: string
   errorDetail?: string
   payloadBreakdown?: unknown
   payloadGuardReport?: unknown
+}
+
+export interface ExternalPoolAttempt {
+  attempt: number
+  poolId: number
+  poolName: string
+  status?: number
+  action: string
+  durationMs: number
+  errorType?: string
+  errorMessage?: string
 }
 
 export interface UsageRecordsResult {
@@ -579,7 +603,11 @@ export interface AdminAuditLogPageQuery {
 }
 
 export type CompatProfile = 'claude-code' | 'anthropic-strict' | 'debug'
+export type ModelResolutionMode = 'compatible' | 'alias_only' | 'exact_only'
 export type PayloadGuardMode = 'preemptive' | 'on_too_long'
+export type ExternalPoolAuthType = 'bearer' | 'x_api_key'
+export type ExternalPoolUsageProjectionMode = 'pass_through' | 'current_path_policy'
+export type ExternalPoolAutoDisablePolicy = 'inherit' | 'disabled' | 'enabled'
 
 export type ReportedUsageFieldMode = 'raw' | 'preserve' | 'sample-max' | 'sample-target'
 
@@ -628,7 +656,117 @@ export interface PayloadShapingConfig {
   currentImagesMaxBytes: number
 }
 
+export interface ExternalPoolsConfig {
+  externalPoolsEnabled: boolean
+  externalPoolGlobalMaxConcurrentRequests: number
+  externalPoolMaxQueuedRequests: number
+  externalPoolRetryMaxAttempts: number
+  externalDirectPolicyEnabled: boolean
+  directExternalOnLocalMaintenance: boolean
+  directExternalModelRules: string[]
+  directExternalPathRules: string[]
+  fallbackOnLocalCapacityExhausted: boolean
+  fallbackOnNoAvailableCredentials: boolean
+  fallbackOnLocalTransientExhausted: boolean
+  fallbackOnUnsupportedModel: boolean
+  localPoolPreflightEnabled: boolean
+  localPoolCircuitEnabled: boolean
+  localPoolCircuitWindowSecs: number
+  localPoolCircuitOpenAfterFailures: number
+  localPoolCircuitRequireDistinctCredentials: number
+  localPoolCircuitOpenSecs: number
+  localPoolCircuitHalfOpenMaxProbes: number
+  externalPoolAutoDisableEnabled: boolean
+  externalPoolAutoDisableOnAuthError: boolean
+  externalPoolAutoDisableOnSecurityLock: boolean
+  externalPoolAutoDisableOnQuotaExhausted: boolean
+  externalPoolAutoDisableOnMisconfiguredEndpoint: boolean
+  externalPoolAutoDisableFailureThreshold: number
+  externalPoolAutoDisableDurationSecs: number
+  externalPoolRateLimitCooldownSecs: number
+  externalPoolServerErrorCooldownSecs: number
+  externalPoolNetworkErrorCooldownSecs: number
+  externalPoolProtocolErrorCooldownSecs: number
+}
+
+export interface ExternalPool {
+  id: number
+  name: string
+  baseUrl: string
+  apiKey?: string
+  maskedApiKey?: string
+  authType: ExternalPoolAuthType
+  enabled: boolean
+  priority: number
+  maxConcurrentRequests: number
+  usageProjectionMode: ExternalPoolUsageProjectionMode
+  autoDisablePolicy: ExternalPoolAutoDisablePolicy
+  autoDisabled: boolean
+  autoDisabledReason?: string
+  autoDisabledAt?: string
+  autoDisabledUntil?: string
+  autoDisabledLastError?: string
+  preservePath: boolean
+  notes?: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface ExternalPoolsListResponse {
+  pools: ExternalPool[]
+}
+
+export interface ExternalPoolStatus {
+  pool: ExternalPool
+  inFlight: number
+  cooldownRemainingSecs: number
+  cooldownReason?: string
+  dispatchable: boolean
+  skippedReason?: string
+}
+
+export interface ExternalPoolsStatusResponse {
+  pools: ExternalPoolStatus[]
+}
+
+export interface CreateExternalPoolRequest {
+  name: string
+  baseUrl: string
+  apiKey: string
+  authType?: ExternalPoolAuthType
+  enabled?: boolean
+  priority?: number
+  maxConcurrentRequests?: number
+  usageProjectionMode?: ExternalPoolUsageProjectionMode
+  autoDisablePolicy?: ExternalPoolAutoDisablePolicy
+  preservePath?: boolean
+  notes?: string
+}
+
+export interface UpdateExternalPoolRequest {
+  name?: string
+  baseUrl?: string
+  apiKey?: string
+  authType?: ExternalPoolAuthType
+  enabled?: boolean
+  priority?: number
+  maxConcurrentRequests?: number
+  usageProjectionMode?: ExternalPoolUsageProjectionMode
+  autoDisablePolicy?: ExternalPoolAutoDisablePolicy
+  preservePath?: boolean
+  notes?: string
+}
+
+export interface ExternalPoolTestResponse {
+  ok: boolean
+  status?: number
+  message: string
+}
+
 export interface RuntimeConfig {
+  proxyUrl?: string | null
+  proxyUsername?: string | null
+  proxyPassword?: string | null
   credentialRpm: number
   credentialMaxConcurrentRequests: number
   credentialTransientCooldownSecs: number
@@ -673,8 +811,10 @@ export interface RuntimeConfig {
   promptCacheCapJitterMaxTokens: number
   promptCacheScaleMinInputTokens: number
   reportedUsage: ReportedUsageConfig
+  externalPools: ExternalPoolsConfig
   highCacheThreshold: number
   compatProfile: CompatProfile
+  modelResolutionMode: ModelResolutionMode
   extractThinking: boolean
   exposeProxyWarnings: boolean
 }

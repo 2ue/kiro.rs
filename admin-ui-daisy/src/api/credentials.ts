@@ -29,6 +29,12 @@ import type {
   UpdateProxyResourceRequest,
   UpdateRuntimeConfigRequest,
   LoadBalancingMode,
+  CreateExternalPoolRequest,
+  ExternalPool,
+  ExternalPoolsListResponse,
+  ExternalPoolsStatusResponse,
+  ExternalPoolTestResponse,
+  UpdateExternalPoolRequest,
 } from '@/types/api'
 
 export async function getCredentials(): Promise<CredentialsStatusResponse> {
@@ -168,6 +174,46 @@ export async function getAccessKeys(): Promise<AccessKeysResponse> {
 
 export async function updateAdminApiKey(req: UpdateAdminApiKeyRequest): Promise<AccessKeysResponse> {
   const { data } = await api.put<AccessKeysResponse>('/security/admin-key', req)
+  return data
+}
+
+export async function getExternalPools(): Promise<ExternalPoolsListResponse> {
+  const { data } = await api.get<ExternalPoolsListResponse>('/external-pools')
+  return data
+}
+
+export async function getExternalPoolsStatus(): Promise<ExternalPoolsStatusResponse> {
+  const { data } = await api.get<ExternalPoolsStatusResponse>('/external-pools/status')
+  return data
+}
+
+export async function createExternalPool(req: CreateExternalPoolRequest): Promise<ExternalPool> {
+  const { data } = await api.post<ExternalPool>('/external-pools', req)
+  return data
+}
+
+export async function updateExternalPool(id: number, req: UpdateExternalPoolRequest): Promise<ExternalPool> {
+  const { data } = await api.put<ExternalPool>(`/external-pools/${id}`, req)
+  return data
+}
+
+export async function deleteExternalPool(id: number): Promise<SuccessResponse> {
+  const { data } = await api.delete<SuccessResponse>(`/external-pools/${id}`)
+  return data
+}
+
+export async function setExternalPoolEnabled(id: number, enabled: boolean): Promise<ExternalPool> {
+  const { data } = await api.post<ExternalPool>(`/external-pools/${id}/enabled`, { enabled })
+  return data
+}
+
+export async function clearExternalPoolAutoDisabled(id: number): Promise<ExternalPool> {
+  const { data } = await api.post<ExternalPool>(`/external-pools/${id}/auto-disabled/clear`)
+  return data
+}
+
+export async function testExternalPool(id: number): Promise<ExternalPoolTestResponse> {
+  const { data } = await api.post<ExternalPoolTestResponse>(`/external-pools/${id}/test`)
   return data
 }
 

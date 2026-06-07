@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::anthropic::pricing::ModelPricing;
 use crate::model::config::{
-    CompatProfile, CompressionConfig, PayloadGuardMode, PayloadShapingConfig,
-    PayloadShapingConfigPatch, ReportedUsageConfig,
+    CompatProfile, CompressionConfig, ExternalPoolsConfig, ModelResolutionMode, PayloadGuardMode,
+    PayloadShapingConfig, PayloadShapingConfigPatch, ReportedUsageConfig,
 };
 
 // ============ 凭据状态 ============
@@ -129,6 +129,12 @@ pub struct CredentialStatusItem {
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// 凭据级直接代理账号。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_username: Option<String>,
+    /// 凭据级直接代理密码。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_password: Option<String>,
     /// 绑定的代理/家宽资源 ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_resource_id: Option<u64>,
@@ -443,6 +449,8 @@ pub struct ProxyResourceResponse {
     pub name: String,
     pub proxy_url: String,
     pub proxy_username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_password: Option<String>,
     pub has_password: bool,
     pub enabled: bool,
     pub notes: Option<String>,
@@ -687,6 +695,12 @@ pub struct UpdateAdminApiKeyRequest {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeConfigResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_password: Option<String>,
     pub credential_rpm: u32,
     pub credential_max_concurrent_requests: u32,
     pub credential_transient_cooldown_secs: u64,
@@ -731,8 +745,10 @@ pub struct RuntimeConfigResponse {
     pub prompt_cache_cap_jitter_max_tokens: i32,
     pub prompt_cache_scale_min_input_tokens: i32,
     pub reported_usage: ReportedUsageConfig,
+    pub external_pools: ExternalPoolsConfig,
     pub high_cache_threshold: i32,
     pub compat_profile: CompatProfile,
+    pub model_resolution_mode: ModelResolutionMode,
     pub extract_thinking: bool,
     pub expose_proxy_warnings: bool,
 }
@@ -824,9 +840,13 @@ pub struct UpdateRuntimeConfigRequest {
     #[serde(default)]
     pub reported_usage: Option<ReportedUsageConfig>,
     #[serde(default)]
+    pub external_pools: Option<ExternalPoolsConfig>,
+    #[serde(default)]
     pub high_cache_threshold: Option<i32>,
     #[serde(default)]
     pub compat_profile: Option<CompatProfile>,
+    #[serde(default)]
+    pub model_resolution_mode: Option<ModelResolutionMode>,
     #[serde(default)]
     pub extract_thinking: Option<bool>,
     #[serde(default)]

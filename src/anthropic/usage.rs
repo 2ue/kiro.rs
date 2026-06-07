@@ -31,6 +31,40 @@ pub enum UsageRecordStatus {
     ClientDropped,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageRouteKind {
+    LocalCredential,
+    ExternalPool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageRouteSubtype {
+    LocalSuccess,
+    LocalErrorNoFallback,
+    ExternalFallbackPreflight,
+    ExternalFallbackAfterLocalAttempts,
+    ExternalDirectPolicy,
+    ExternalError,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalPoolAttempt {
+    pub attempt: u32,
+    pub pool_id: u64,
+    pub pool_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    pub action: String,
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
 impl UsageRecordStatus {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
@@ -114,6 +148,26 @@ pub struct UsageRecord {
     pub fallback_from_sticky: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub credential_attempts: Vec<KiroCredentialAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_kind: Option<UsageRouteKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_subtype: Option<UsageRouteSubtype>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_policy_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_attempted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_preflight: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_pool_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_pool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_attempts: Vec<ExternalPoolAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_projection_applied: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1157,6 +1211,16 @@ mod tests {
             sticky_bound: false,
             fallback_from_sticky: false,
             credential_attempts: Vec::new(),
+            route_kind: None,
+            route_subtype: None,
+            fallback_reason: None,
+            direct_policy_reason: None,
+            local_attempted: None,
+            local_preflight: None,
+            external_pool_id: None,
+            external_pool_name: None,
+            external_attempts: Vec::new(),
+            usage_projection_applied: None,
             error_type: None,
             error_message: None,
             error_detail: None,

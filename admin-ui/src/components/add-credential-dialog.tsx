@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
+import { Eye, EyeOff } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -20,6 +21,46 @@ interface AddCredentialDialogProps {
 
 type AuthMethod = 'social' | 'idc' | 'api_key'
 
+function SecretInput({
+  value,
+  onChange,
+  visible,
+  onToggle,
+  disabled,
+  placeholder,
+}: {
+  value: string
+  onChange: (value: string) => void
+  visible: boolean
+  onToggle: () => void
+  disabled?: boolean
+  placeholder?: string
+}) {
+  return (
+    <div className="relative">
+      <Input
+        className="pr-10"
+        type={visible ? 'text' : 'password'}
+        value={value}
+        placeholder={placeholder}
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.value)}
+      />
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className="absolute right-1 top-1 h-8 w-8"
+        onClick={onToggle}
+        disabled={disabled}
+        title={visible ? '隐藏' : '显示'}
+      >
+        {visible ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+      </Button>
+    </div>
+  )
+}
+
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
   const [kiroApiKey, setKiroApiKey] = useState('')
@@ -32,6 +73,11 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [priority, setPriority] = useState('0')
   const [machineId, setMachineId] = useState('')
   const [proxyResourceId, setProxyResourceId] = useState('')
+  const [proxyUrl, setProxyUrl] = useState('')
+  const [proxyUsername, setProxyUsername] = useState('')
+  const [proxyPassword, setProxyPassword] = useState('')
+  const [showProxyUsername, setShowProxyUsername] = useState(false)
+  const [showProxyPassword, setShowProxyPassword] = useState(false)
   const [endpoint, setEndpoint] = useState('')
 
   const { mutate, isPending } = useAddCredential()
@@ -50,6 +96,11 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setPriority('0')
     setMachineId('')
     setProxyResourceId('')
+    setProxyUrl('')
+    setProxyUsername('')
+    setProxyPassword('')
+    setShowProxyUsername(false)
+    setShowProxyPassword(false)
     setEndpoint('')
   }
 
@@ -66,6 +117,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     email?: string
     priority?: number
     machineId?: string
+    proxyUrl?: string
+    proxyUsername?: string
+    proxyPassword?: string
     proxyResourceId?: number | null
     endpoint?: string
   }) => {
@@ -80,6 +134,11 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setPriority(String(credential.priority ?? 0))
     setMachineId(credential.machineId || '')
     setProxyResourceId(credential.proxyResourceId ? String(credential.proxyResourceId) : '')
+    setProxyUrl(credential.proxyUrl || '')
+    setProxyUsername(credential.proxyUsername || '')
+    setProxyPassword(credential.proxyPassword || '')
+    setShowProxyUsername(false)
+    setShowProxyPassword(false)
     setEndpoint(credential.endpoint || '')
   }
 
@@ -131,6 +190,13 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       toast.error('优先级必须是非负整数')
       return
     }
+    const directProxyUrl = proxyUrl.trim()
+    const directProxyUsername = proxyUsername.trim()
+    const directProxyPassword = proxyPassword.trim()
+    if (!proxyResourceId && !directProxyUrl && (directProxyUsername || directProxyPassword)) {
+      toast.error('直接代理 URL 为空时不能单独保存代理账号或密码')
+      return
+    }
 
     mutate(
       {
@@ -145,6 +211,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         priority: parsedPriority,
         machineId: machineId.trim() || undefined,
         proxyResourceId: proxyResourceId ? Number(proxyResourceId) : undefined,
+        proxyUrl: proxyResourceId ? undefined : directProxyUrl || undefined,
+        proxyUsername: proxyResourceId ? undefined : directProxyUsername || undefined,
+        proxyPassword: proxyResourceId ? undefined : directProxyPassword || undefined,
         endpoint: endpoint.trim() || undefined,
       },
       {
@@ -382,6 +451,51 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               <p className="text-xs text-muted-foreground">
                 新增凭据会立即验证 Token，只能选择已启用的代理资源；不选择则使用全局代理或直连配置。
               </p>
+            </div>
+
+            <div className={`space-y-3 rounded-md border p-3 ${proxyResourceId ? 'bg-muted/30 opacity-70' : 'bg-background'}`}>
+              <div>
+                <div className="text-sm font-medium">凭据直连代理</div>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  不绑定代理资源时生效；选择代理资源时这些字段不会随新增请求提交。
+                </p>
+              </div>
+              <div className="space-y-2">
+                <label htmlFor="proxyUrl" className="text-sm font-medium">
+                  代理 URL
+                </label>
+                <Input
+                  id="proxyUrl"
+                  placeholder="socks5h://127.0.0.1:1080"
+                  value={proxyUrl}
+                  onChange={(event) => setProxyUrl(event.target.value)}
+                  disabled={isPending || Boolean(proxyResourceId)}
+                />
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">代理用户名</label>
+                  <SecretInput
+                    value={proxyUsername}
+                    onChange={setProxyUsername}
+                    visible={showProxyUsername}
+                    onToggle={() => setShowProxyUsername((value) => !value)}
+                    disabled={isPending || Boolean(proxyResourceId)}
+                    placeholder="可选"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">代理密码</label>
+                  <SecretInput
+                    value={proxyPassword}
+                    onChange={setProxyPassword}
+                    visible={showProxyPassword}
+                    onToggle={() => setShowProxyPassword((value) => !value)}
+                    disabled={isPending || Boolean(proxyResourceId)}
+                    placeholder="可选"
+                  />
+                </div>
+              </div>
             </div>
           </div>
 

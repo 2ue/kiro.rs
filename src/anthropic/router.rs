@@ -9,10 +9,11 @@ use axum::{
     routing::{get, post},
 };
 
+use crate::external_pool::ExternalPoolManager;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
-    CompatProfile, PayloadGuardMode, PayloadShapingConfig, PromptCacheSimulationMode,
-    ReportedUsageConfig,
+    CompatProfile, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
+    PromptCacheSimulationMode, ReportedUsageConfig,
 };
 
 use super::{
@@ -70,12 +71,14 @@ pub fn create_router_with_provider(
     prompt_cache_scale_min_input_tokens: i32,
     reported_usage: ReportedUsageConfig,
     compat_profile: CompatProfile,
+    model_resolution_mode: ModelResolutionMode,
     expose_proxy_warnings: bool,
     payload_guard_enabled: bool,
     payload_guard_mode: PayloadGuardMode,
     payload_guard_max_bytes: usize,
     payload_guard_trim_history: bool,
     payload_shaping: PayloadShapingConfig,
+    external_pool_manager: Option<Arc<ExternalPoolManager>>,
 ) -> Router {
     let mut base_state = AppState::new(
         api_key,
@@ -95,6 +98,7 @@ pub fn create_router_with_provider(
         prompt_cache_scale_min_input_tokens,
     )
     .with_reported_usage(reported_usage)
+    .with_model_resolution_mode(model_resolution_mode)
     .with_payload_guard(
         payload_guard_enabled,
         payload_guard_mode,
@@ -106,6 +110,9 @@ pub fn create_router_with_provider(
     .with_model_capabilities(model_capabilities);
     if let Some(provider) = kiro_provider {
         base_state = base_state.with_kiro_provider(provider);
+    }
+    if let Some(manager) = external_pool_manager {
+        base_state = base_state.with_external_pool_manager(manager);
     }
 
     let (v1_state, na_v1_state, cc_v1_state, ha_v1_state) = route_prompt_cache_states(base_state);

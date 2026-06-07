@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::anthropic::types::Model;
 use crate::kiro::model::available_models::KiroAvailableModel;
+use crate::model::config::ModelResolutionMode;
 
 pub const SEED_SOURCE: &str = "kiro-upstream-seed";
 pub const KIRO_SOURCE: &str = "kiro-list-available-models";
@@ -185,6 +186,14 @@ impl ModelCapabilitiesCatalog {
     }
 
     pub fn resolve_model(&self, requested_model: &str) -> ModelResolution {
+        self.resolve_model_with_mode(requested_model, ModelResolutionMode::Compatible)
+    }
+
+    pub fn resolve_model_with_mode(
+        &self,
+        requested_model: &str,
+        mode: ModelResolutionMode,
+    ) -> ModelResolution {
         let inner = self.inner.read();
         let models = inner.models.keys().cloned().collect::<Vec<_>>();
         let manual_models = inner
@@ -193,7 +202,7 @@ impl ModelCapabilitiesCatalog {
             .filter(|item| is_manual_source(item.source.as_deref()))
             .map(|item| item.model.clone())
             .collect::<std::collections::HashSet<_>>();
-        let mut resolution = resolve_model_with_catalog(requested_model, &models);
+        let mut resolution = resolve_model_with_catalog_and_mode(requested_model, &models, mode);
         if let Some(upstream_model) = resolution.upstream_model.as_deref() {
             if manual_models.contains(upstream_model) {
                 resolution.source = ModelResolutionSource::Manual;
@@ -509,6 +518,18 @@ pub fn resolve_model_with_catalog(
     requested_model: &str,
     upstream_models: &[String],
 ) -> ModelResolution {
+    resolve_model_with_catalog_and_mode(
+        requested_model,
+        upstream_models,
+        ModelResolutionMode::Compatible,
+    )
+}
+
+pub fn resolve_model_with_catalog_and_mode(
+    requested_model: &str,
+    upstream_models: &[String],
+    mode: ModelResolutionMode,
+) -> ModelResolution {
     let requested = normalize_model_id(requested_model);
     if requested.is_empty() {
         return ModelResolution::unsupported(requested);
@@ -525,6 +546,10 @@ pub fn resolve_model_with_catalog(
 
     if available.contains(&requested) {
         return ModelResolution::exact(requested);
+    }
+
+    if mode == ModelResolutionMode::ExactOnly {
+        return ModelResolution::unsupported(requested);
     }
 
     let one_m_base = strip_model_1m_suffix(&requested);
@@ -550,6 +575,10 @@ pub fn resolve_model_with_catalog(
         .and_then(|families| pick_family_available(&available, &families))
     {
         return ModelResolution::resolved(requested, candidate, ModelResolutionSource::Alias);
+    }
+
+    if !mode.allows_family_fallback() {
+        return ModelResolution::unsupported(requested);
     }
 
     if let Some(candidate) = family_model_candidates(&base)
@@ -1167,6 +1196,56 @@ mod tests {
         let haiku = resolve_model_with_catalog("haiku", &models);
         assert_eq!(haiku.source, ModelResolutionSource::Alias);
         assert_eq!(haiku.upstream_model.as_deref(), Some("claude-haiku-4.5"));
+    }
+
+    #[test]
+    fn model_resolution_modes_keep_compatible_default_behavior() {
+        let models = vec!["claude-sonnet-4.6".to_string()];
+
+        let compatible =
+            resolve_model_with_catalog_and_mode("sonnet", &models, ModelResolutionMode::Compatible);
+        assert_eq!(compatible.source, ModelResolutionSource::Alias);
+        assert_eq!(
+            compatible.upstream_model.as_deref(),
+            Some("claude-sonnet-4.6")
+        );
+
+        let alias_only =
+            resolve_model_with_catalog_and_mode("sonnet", &models, ModelResolutionMode::AliasOnly);
+        assert_eq!(alias_only.source, ModelResolutionSource::Alias);
+        assert_eq!(
+            alias_only.upstream_model.as_deref(),
+            Some("claude-sonnet-4.6")
+        );
+
+        let exact_only =
+            resolve_model_with_catalog_and_mode("sonnet", &models, ModelResolutionMode::ExactOnly);
+        assert_eq!(exact_only.source, ModelResolutionSource::Unsupported);
+        assert!(exact_only.upstream_model.is_none());
+    }
+
+    #[test]
+    fn alias_only_rejects_family_normalized_future_model_names() {
+        let models = vec!["claude-sonnet-4.6".to_string()];
+
+        let compatible = resolve_model_with_catalog_and_mode(
+            "claude-sonnet-5-20270101",
+            &models,
+            ModelResolutionMode::Compatible,
+        );
+        assert_eq!(compatible.source, ModelResolutionSource::FamilyNormalized);
+        assert_eq!(
+            compatible.upstream_model.as_deref(),
+            Some("claude-sonnet-4.6")
+        );
+
+        let alias_only = resolve_model_with_catalog_and_mode(
+            "claude-sonnet-5-20270101",
+            &models,
+            ModelResolutionMode::AliasOnly,
+        );
+        assert_eq!(alias_only.source, ModelResolutionSource::Unsupported);
+        assert!(alias_only.upstream_model.is_none());
     }
 
     #[test]

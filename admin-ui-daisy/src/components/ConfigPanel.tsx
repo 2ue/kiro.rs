@@ -1,10 +1,11 @@
-import { BadgeInfo, Copy, Eye, EyeOff, Gauge, KeyRound, Save, Shield, Sparkles, Trash2, Wand2, Zap } from 'lucide-react'
+import { BadgeInfo, Copy, Eye, EyeOff, Gauge, KeyRound, Router, Save, Shield, Sparkles, Trash2, Wand2, Zap } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { Alert, Button, Card, Collapse, Input, Join, Loading, Select, Tabs, Toggle } from 'react-daisyui'
 import { ErrorState, FieldLabel, SectionCard } from '@/components/common'
 import {
   defaultPayloadShaping,
+  defaultExternalPoolsConfig,
   emptyRuntimeConfig,
   fieldNeedsMax,
   fieldNeedsTarget,
@@ -23,6 +24,7 @@ import { storage } from '@/lib/storage'
 import type {
   AccessKeysResponse,
   CompatProfile,
+  ModelResolutionMode,
   PayloadGuardMode,
   ReportedUsageFieldMode,
   ReportedUsageFieldPolicy,
@@ -137,6 +139,92 @@ function ConfigGroup({
         <div className="grid gap-3 border-t border-base-300/70 pt-3 md:grid-cols-2">{children}</div>
       </Collapse.Content>
     </Collapse>
+  )
+}
+
+function maskSecret(value?: string | null): string {
+  if (!value) return '-'
+  return '*'.repeat(Math.min(Math.max(value.length, 6), 16))
+}
+
+function ReadOnlySecretField({
+  label,
+  value,
+  visible,
+  onToggle,
+}: {
+  label: string
+  value?: string | null
+  visible: boolean
+  onToggle: () => void
+}) {
+  return (
+    <div>
+      <div className="mb-2 text-sm font-semibold">{label}</div>
+      <div className="flex gap-2">
+        <Input
+          bordered
+          readOnly
+          size="sm"
+          className="min-w-0 font-mono text-xs"
+          value={visible ? value || '-' : maskSecret(value)}
+        />
+        <Button
+          type="button"
+          size="sm"
+          className="shrink-0"
+          onClick={onToggle}
+          title={visible ? `隐藏${label}` : `显示${label}`}
+        >
+          {visible ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+          {visible ? '隐藏' : '显示'}
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+function StartupProxyPanel({ config }: { config: RuntimeConfig }) {
+  const [showProxyUsername, setShowProxyUsername] = useState(false)
+  const [showProxyPassword, setShowProxyPassword] = useState(false)
+  const hasGlobalProxy = Boolean(config.proxyUrl)
+
+  return (
+    <ConfigGroup
+      icon={<Router className="h-4 w-4" />}
+      title="全局代理（启动期配置，只读）"
+      description="这里展示启动配置里的全局代理。它会作为未配置凭据直连代理、也未绑定代理资源时的默认代理；修改需要改启动配置并重启服务。"
+    >
+      <div className="rounded-box border border-base-300 bg-base-100 p-3 md:col-span-2">
+        <div className="mb-3 flex flex-wrap items-center gap-2">
+          <span className="text-sm font-semibold">当前状态</span>
+          <span className={`rounded border px-2 py-0.5 text-[0.68rem] font-semibold ${hasGlobalProxy ? 'border-success/25 bg-success/10 text-success' : 'border-base-300 bg-base-200 text-base-content/60'}`}>
+            {hasGlobalProxy ? '已配置全局代理' : '未配置全局代理'}
+          </span>
+          <span className="rounded border border-base-300 bg-base-200 px-2 py-0.5 text-[0.68rem] font-semibold text-base-content/60">
+            只读
+          </span>
+        </div>
+        <div className="grid gap-3 md:grid-cols-2">
+          <div className="md:col-span-2">
+            <div className="mb-2 text-sm font-semibold">代理 URL</div>
+            <Input bordered readOnly size="sm" className="font-mono text-xs" value={config.proxyUrl || '-'} />
+          </div>
+          <ReadOnlySecretField
+            label="代理用户名"
+            value={config.proxyUsername}
+            visible={showProxyUsername}
+            onToggle={() => setShowProxyUsername((value) => !value)}
+          />
+          <ReadOnlySecretField
+            label="代理密码"
+            value={config.proxyPassword}
+            visible={showProxyPassword}
+            onToggle={() => setShowProxyPassword((value) => !value)}
+          />
+        </div>
+      </div>
+    </ConfigGroup>
   )
 }
 
@@ -559,6 +647,10 @@ export function ConfigPanel() {
           ...defaultPayloadShaping(),
           ...config.data.payloadShaping,
         },
+        externalPools: {
+          ...defaultExternalPoolsConfig(),
+          ...config.data.externalPools,
+        },
       })
     }
   }, [config.data])
@@ -605,13 +697,35 @@ export function ConfigPanel() {
       promptCacheCapJitterMaxTokens: toWhole(draft.promptCacheCapJitterMaxTokens),
       promptCacheScaleMinInputTokens: toWhole(draft.promptCacheScaleMinInputTokens),
       reportedUsage: normalizeReportedUsage(draft.reportedUsage),
+      externalPools: {
+        ...defaultExternalPoolsConfig(),
+        ...draft.externalPools,
+        externalPoolGlobalMaxConcurrentRequests: toWhole(draft.externalPools.externalPoolGlobalMaxConcurrentRequests),
+        externalPoolMaxQueuedRequests: toWhole(draft.externalPools.externalPoolMaxQueuedRequests),
+        externalPoolRetryMaxAttempts: toWhole(draft.externalPools.externalPoolRetryMaxAttempts),
+        localPoolCircuitWindowSecs: toWhole(draft.externalPools.localPoolCircuitWindowSecs, 1),
+        localPoolCircuitOpenAfterFailures: toWhole(draft.externalPools.localPoolCircuitOpenAfterFailures, 1),
+        localPoolCircuitRequireDistinctCredentials: toWhole(draft.externalPools.localPoolCircuitRequireDistinctCredentials),
+        localPoolCircuitOpenSecs: toWhole(draft.externalPools.localPoolCircuitOpenSecs, 1),
+        localPoolCircuitHalfOpenMaxProbes: toWhole(draft.externalPools.localPoolCircuitHalfOpenMaxProbes, 1),
+        externalPoolAutoDisableFailureThreshold: toWhole(draft.externalPools.externalPoolAutoDisableFailureThreshold, 1),
+        externalPoolAutoDisableDurationSecs: toWhole(draft.externalPools.externalPoolAutoDisableDurationSecs),
+        externalPoolRateLimitCooldownSecs: toWhole(draft.externalPools.externalPoolRateLimitCooldownSecs, 1),
+        externalPoolServerErrorCooldownSecs: toWhole(draft.externalPools.externalPoolServerErrorCooldownSecs, 1),
+        externalPoolNetworkErrorCooldownSecs: toWhole(draft.externalPools.externalPoolNetworkErrorCooldownSecs, 1),
+        externalPoolProtocolErrorCooldownSecs: toWhole(draft.externalPools.externalPoolProtocolErrorCooldownSecs, 1),
+      },
       highCacheThreshold: toWhole(draft.highCacheThreshold),
     }
     if (next.credentialTransientCooldownSecs > next.credentialMaxCooldownSecs) return toast.error('临时冷却秒数不能大于最大冷却秒数')
     if ([next.credentialRateLimitCooldownSecs, next.credentialServerErrorCooldownSecs, next.credentialNetworkErrorCooldownSecs, next.credentialStreamErrorCooldownSecs, next.credentialProtocolErrorCooldownSecs, next.credentialAuthErrorCooldownSecs].some((value) => value > next.credentialMaxCooldownSecs)) return toast.error('错误类型基础冷却秒数不能大于最大冷却秒数')
     if (next.promptCacheCapJitterMinTokens > next.promptCacheCapJitterMaxTokens) return toast.error('触顶扣减下限不能大于上限')
     if (next.payloadGuardEnabled && next.payloadGuardMaxBytes > 0 && next.payloadGuardMaxBytes < 65536) return toast.error('Kiro Payload 最大字节数必须为 0 或不小于 65536')
-    updateConfig.mutate(next, {
+    const editableConfig = { ...next }
+    delete editableConfig.proxyUrl
+    delete editableConfig.proxyUsername
+    delete editableConfig.proxyPassword
+    updateConfig.mutate(editableConfig, {
       onSuccess: () => toast.success('配置已更新'),
       onError: (error) => toast.error(`更新失败: ${extractErrorMessage(error)}`),
     })
@@ -640,6 +754,7 @@ export function ConfigPanel() {
     >
       <div className="space-y-4">
         <AccessKeysPanel />
+        <StartupProxyPanel config={draft} />
 
         <div className="sticky top-[4.25rem] z-30 flex flex-col gap-2 rounded-box border border-base-300 bg-base-100/95 p-2 shadow-sm backdrop-blur sm:flex-row sm:items-center sm:justify-between">
           <div className="min-w-0 text-xs leading-5 text-base-content/60">
@@ -872,6 +987,13 @@ export function ConfigPanel() {
                   <Select.Option value="claude-code">Claude Code 兼容</Select.Option>
                   <Select.Option value="anthropic-strict">Anthropic 严格模式</Select.Option>
                   <Select.Option value="debug">调试模式</Select.Option>
+                </Select>
+              </FieldLabel>
+              <FieldLabel title="模型解析策略" description="默认兼容解析会保留 sonnet、opus、default 等短模型名和同族自动归一化；更严格模式只影响请求发上游前的模型名解析，不改变凭据调度。">
+                <Select bordered size="sm" value={draft.modelResolutionMode} onChange={(event) => setDraft((prev) => ({ ...prev, modelResolutionMode: event.target.value as ModelResolutionMode }))}>
+                  <Select.Option value="compatible">默认兼容解析</Select.Option>
+                  <Select.Option value="alias_only">仅精确与显式别名</Select.Option>
+                  <Select.Option value="exact_only">仅模型目录精确 ID</Select.Option>
                 </Select>
               </FieldLabel>
               <ToggleField title="提取 Thinking 内容块" description="非流式响应里是否把 <thinking> 标签解析成独立 thinking 内容块。" checked={draft.extractThinking} onChange={(extractThinking) => setDraft((prev) => ({ ...prev, extractThinking }))} />

@@ -23,6 +23,9 @@ use super::{
     },
 };
 use crate::anthropic::usage::{UsageRecordQuery, UsageRecordStatus, UsageSource};
+use crate::external_pool::{
+    CreateExternalPoolRequest, SetExternalPoolEnabledRequest, UpdateExternalPoolRequest,
+};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -482,6 +485,82 @@ pub async fn get_access_keys(State(state): State<AdminState>) -> impl IntoRespon
             .service
             .get_access_keys(&state.current_admin_api_key()),
     )
+}
+
+pub async fn get_external_pools(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.list_external_pools() {
+        Ok(pools) => Json(serde_json::json!({ "pools": pools })).into_response(),
+        Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
+    }
+}
+
+pub async fn create_external_pool(
+    State(state): State<AdminState>,
+    Json(payload): Json<CreateExternalPoolRequest>,
+) -> impl IntoResponse {
+    match state.service.create_external_pool(payload) {
+        Ok(pool) => Json(pool).into_response(),
+        Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
+    }
+}
+
+pub async fn update_external_pool(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<UpdateExternalPoolRequest>,
+) -> impl IntoResponse {
+    match state.service.update_external_pool(id, payload) {
+        Ok(pool) => Json(pool).into_response(),
+        Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
+    }
+}
+
+pub async fn delete_external_pool(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.delete_external_pool(id) {
+        Ok(()) => Json(SuccessResponse::new("外部池已删除")).into_response(),
+        Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
+    }
+}
+
+pub async fn set_external_pool_enabled(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetExternalPoolEnabledRequest>,
+) -> impl IntoResponse {
+    match state.service.set_external_pool_enabled(id, payload) {
+        Ok(pool) => Json(pool).into_response(),
+        Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
+    }
+}
+
+pub async fn clear_external_pool_auto_disabled(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.clear_external_pool_auto_disabled(id) {
+        Ok(pool) => Json(pool).into_response(),
+        Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
+    }
+}
+
+pub async fn get_external_pool_status(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.get_external_pool_status() {
+        Ok(status) => Json(status).into_response(),
+        Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
+    }
+}
+
+pub async fn test_external_pool(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.test_external_pool(id) {
+        Ok(result) => Json(result).into_response(),
+        Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
+    }
 }
 
 /// PUT /api/admin/security/admin-key

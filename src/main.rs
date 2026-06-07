@@ -2,6 +2,7 @@ mod admin;
 mod admin_ui;
 mod anthropic;
 mod common;
+mod external_pool;
 mod http_client;
 mod kiro;
 mod model;
@@ -28,6 +29,7 @@ use axum::{
 };
 use chrono::Utc;
 use clap::Parser;
+use external_pool::ExternalPoolManager;
 use futures::StreamExt;
 use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
@@ -326,6 +328,10 @@ async fn main() {
         config.default_endpoint.clone(),
     );
     let kiro_provider = Arc::new(kiro_provider);
+    let external_pool_manager = Arc::new(ExternalPoolManager::new(
+        postgres_store.clone(),
+        redis_store.clone(),
+    ));
     {
         let model_capabilities = model_capabilities.clone();
         let postgres_store = postgres_store.clone();
@@ -403,12 +409,14 @@ async fn main() {
         config.prompt_cache_scale_min_input_tokens,
         config.reported_usage.clone(),
         config.compat_profile,
+        config.model_resolution_mode,
         config.expose_proxy_warnings,
         config.payload_guard_enabled,
         config.payload_guard_mode,
         config.payload_guard_max_bytes,
         config.payload_guard_trim_history,
         config.payload_shaping,
+        Some(external_pool_manager.clone()),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -435,6 +443,7 @@ async fn main() {
                 postgres_store.clone(),
                 redis_store.clone(),
                 api_key.clone(),
+                external_pool_manager.clone(),
             );
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);

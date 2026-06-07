@@ -11,10 +11,11 @@ use axum::{
 };
 
 use crate::common::auth;
+use crate::external_pool::ExternalPoolManager;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
-    CompatProfile, PayloadGuardMode, PayloadShapingConfig, PromptCacheSimulationMode,
-    ReportedUsageConfig,
+    CompatProfile, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
+    PromptCacheSimulationMode, ReportedUsageConfig,
 };
 
 use super::{
@@ -58,6 +59,8 @@ pub struct AppState {
     pub reported_usage: ReportedUsageConfig,
     /// Anthropic compatibility profile
     pub compat_profile: CompatProfile,
+    /// 请求模型解析策略
+    pub model_resolution_mode: ModelResolutionMode,
     /// 是否在响应头中暴露代理改写动作
     pub expose_proxy_warnings: bool,
     /// 是否启用发送 Kiro 上游前的最终 payload 防护
@@ -70,6 +73,8 @@ pub struct AppState {
     pub payload_guard_trim_history: bool,
     /// payload shaping 配置
     pub payload_shaping: PayloadShapingConfig,
+    /// 外部备用号池管理器。
+    pub external_pool_manager: Option<Arc<ExternalPoolManager>>,
 }
 
 impl AppState {
@@ -101,12 +106,14 @@ impl AppState {
             prompt_cache_scale_min_input_tokens: 0,
             reported_usage: ReportedUsageConfig::default(),
             compat_profile,
+            model_resolution_mode: ModelResolutionMode::Compatible,
             expose_proxy_warnings: expose_proxy_warnings || compat_profile.is_debug(),
             payload_guard_enabled: true,
             payload_guard_mode: PayloadGuardMode::Preemptive,
             payload_guard_max_bytes: 450 * 1024,
             payload_guard_trim_history: true,
             payload_shaping: PayloadShapingConfig::default(),
+            external_pool_manager: None,
         }
     }
 
@@ -144,6 +151,11 @@ impl AppState {
         self
     }
 
+    pub fn with_model_resolution_mode(mut self, mode: ModelResolutionMode) -> Self {
+        self.model_resolution_mode = mode;
+        self
+    }
+
     pub fn with_prompt_cache_simulation_mode(mut self, mode: PromptCacheSimulationMode) -> Self {
         self.prompt_cache_simulation_mode = mode;
         self
@@ -168,6 +180,14 @@ impl AppState {
     /// 设置 KiroProvider
     pub fn with_kiro_provider(mut self, provider: Arc<KiroProvider>) -> Self {
         self.kiro_provider = Some(provider);
+        self
+    }
+
+    pub fn with_external_pool_manager(
+        mut self,
+        external_pool_manager: Arc<ExternalPoolManager>,
+    ) -> Self {
+        self.external_pool_manager = Some(external_pool_manager);
         self
     }
 }

@@ -97,6 +97,40 @@ function statusLabel(status: string): string {
   }
 }
 
+function routeLabel(record: UsageRecord): string {
+  switch (record.routeSubtype) {
+    case 'external_direct_policy':
+      return '外部直连'
+    case 'external_fallback_preflight':
+      return '预检 fallback'
+    case 'external_fallback_after_local_attempts':
+      return '失败后 fallback'
+    case 'external_error':
+      return '外部错误'
+    case 'local_error_no_fallback':
+      return '本地错误'
+    case 'local_success':
+      return '本地成功'
+    default:
+      return record.routeKind === 'external_pool' ? '外部池' : '本地'
+  }
+}
+
+function routeVariant(record: UsageRecord): 'success' | 'secondary' | 'outline' | 'warning' | 'destructive' {
+  if (record.routeSubtype === 'external_direct_policy') return 'warning'
+  if (record.routeKind === 'external_pool') return record.status === 'success' ? 'success' : 'destructive'
+  return 'outline'
+}
+
+function upstreamModel(record: UsageRecord): string {
+  return record.upstreamModel || record.model || '-'
+}
+
+function upstreamModelLabel(record: UsageRecord): string {
+  const source = record.modelResolutionSource ? `（${record.modelResolutionSource}）` : ''
+  return `${upstreamModel(record)}${source}`
+}
+
 function attemptActionLabel(action: string): string {
   switch (action) {
     case 'success':
@@ -131,6 +165,12 @@ function formatAttemptChain(record: UsageRecord): string {
   const attempts = record.credentialAttempts || []
   return attempts
     .map((attempt) => `#${attempt.credentialId}(${attemptOutcomeLabel(attempt)})`)
+    .join(' > ')
+}
+
+function formatExternalAttemptChain(record: UsageRecord): string {
+  return (record.externalAttempts || [])
+    .map((attempt) => `外部池 #${attempt.poolId}(${attempt.status ?? attempt.errorType ?? attempt.action})`)
     .join(' > ')
 }
 
@@ -510,15 +550,24 @@ export function UsageRecordsPanel() {
                       record.totalInputTokens
                     )
                     const attemptChain = formatAttemptChain(record)
+                    const externalAttemptChain = formatExternalAttemptChain(record)
+                    const isExternal = record.routeKind === 'external_pool'
 
                     return (
                     <tr key={record.id} className="border-b last:border-0">
                       <td className="px-3 py-2 whitespace-nowrap">{formatDate(record.createdAt)}</td>
                       <td className="px-3 py-2">
-                        <div className="font-medium">#{record.credentialId ?? '-'}</div>
+                        <div className="font-medium">
+                          {isExternal ? `外部池 #${record.externalPoolId ?? '-'}` : `#${record.credentialId ?? '-'}`}
+                        </div>
                         {credentialLabel && (
                           <div className="max-w-[240px] truncate text-xs text-muted-foreground" title={credentialLabel}>
                             {credentialLabel}
+                          </div>
+                        )}
+                        {isExternal && record.externalPoolName && (
+                          <div className="max-w-[240px] truncate text-xs text-muted-foreground" title={record.externalPoolName}>
+                            {record.externalPoolName}
                           </div>
                         )}
                         {attemptChain && (
@@ -531,10 +580,23 @@ export function UsageRecordsPanel() {
                             链路 {attemptChain}
                           </button>
                         )}
+                        {externalAttemptChain && (
+                          <button
+                            type="button"
+                            className="mt-1 block max-w-[260px] truncate text-left text-xs text-muted-foreground underline-offset-2 hover:underline"
+                            onClick={() => setSelectedRecord(record)}
+                            title={externalAttemptChain}
+                          >
+                            外部 {externalAttemptChain}
+                          </button>
+                        )}
                       </td>
                       <td className="px-3 py-2">
-                        <div className="max-w-[260px] truncate font-medium" title={record.model}>
-                          {record.model || '-'}
+                        <div className="max-w-[260px] truncate font-medium" title={record.model || '-'}>
+                          请求 {record.model || '-'}
+                        </div>
+                        <div className="max-w-[260px] truncate text-xs text-muted-foreground" title={upstreamModelLabel(record)}>
+                          上游 {upstreamModelLabel(record)}
                         </div>
                         <div className="mt-1 flex flex-wrap gap-1">
                           <Badge variant="outline">{record.endpoint || '-'}</Badge>
@@ -552,6 +614,11 @@ export function UsageRecordsPanel() {
                         <Badge variant={record.simulated ? 'warning' : 'secondary'}>
                           {sourceLabel(record.usageSource)}
                         </Badge>
+                        <div className="mt-1">
+                          <Badge variant={routeVariant(record)} title={record.routeSubtype || record.routeKind || ''}>
+                            {routeLabel(record)}
+                          </Badge>
+                        </div>
                       </td>
                       <td className="px-3 py-2">
                         <Badge variant={statusVariant(record.status)} title={record.status}>
@@ -648,12 +715,18 @@ export function UsageRecordsPanel() {
                   <div>{formatDate(selectedRecord.createdAt)}</div>
                 </div>
                 <div>
-                  <div className="text-xs text-muted-foreground">模型</div>
+                  <div className="text-xs text-muted-foreground">请求模型</div>
                   <div className="break-all">{selectedRecord.model || '-'}</div>
-                  {selectedRecord.upstreamModel && selectedRecord.upstreamModel !== selectedRecord.model && (
-                    <div className="mt-1 text-xs text-muted-foreground">
-                      上游模型：{selectedRecord.upstreamModel}
-                      {selectedRecord.modelResolutionSource ? `（${selectedRecord.modelResolutionSource}）` : ''}
+                </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">上游模型</div>
+                  <div className="break-all">{upstreamModel(selectedRecord)}</div>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    解析来源：{selectedRecord.modelResolutionSource || '-'}
+                  </div>
+                  {selectedRecord.modelResolutionNote && (
+                    <div className="mt-1 break-all text-xs text-muted-foreground">
+                      {selectedRecord.modelResolutionNote}
                     </div>
                   )}
                 </div>
@@ -667,6 +740,29 @@ export function UsageRecordsPanel() {
                     #{selectedRecord.credentialId ?? '-'} {selectedRecord.credentialLabel || ''}
                   </div>
                 </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">路由</div>
+                  <div>{routeLabel(selectedRecord)}</div>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    {selectedRecord.routeKind || '-'} {selectedRecord.routeSubtype ? `· ${selectedRecord.routeSubtype}` : ''}
+                  </div>
+                </div>
+                {selectedRecord.routeKind === 'external_pool' && (
+                  <div>
+                    <div className="text-xs text-muted-foreground">外部池</div>
+                    <div>
+                      #{selectedRecord.externalPoolId ?? '-'} {selectedRecord.externalPoolName || ''}
+                    </div>
+                  </div>
+                )}
+                {(selectedRecord.fallbackReason || selectedRecord.directPolicyReason) && (
+                  <div>
+                    <div className="text-xs text-muted-foreground">路由原因</div>
+                    <div className="break-all">
+                      {selectedRecord.fallbackReason || selectedRecord.directPolicyReason}
+                    </div>
+                  </div>
+                )}
                 <div>
                   <div className="text-xs text-muted-foreground">状态</div>
                   <div>{statusLabel(selectedRecord.status)}</div>
@@ -719,6 +815,49 @@ export function UsageRecordsPanel() {
                               )}
                             </td>
                             <td className="px-3 py-2">{attempt.statusText || attempt.status || '-'}</td>
+                            <td className="px-3 py-2">{attemptActionLabel(attempt.action)}</td>
+                            <td className="px-3 py-2 text-right">{formatNumber(attempt.durationMs)}ms</td>
+                            <td className="px-3 py-2">
+                              <div className="max-w-[280px] truncate" title={attempt.errorMessage || attempt.errorType || ''}>
+                                {attempt.errorMessage || attempt.errorType || '-'}
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+              {(selectedRecord.externalAttempts || []).length > 0 && (
+                <div>
+                  <div className="mb-2 text-sm font-medium">外部池链路</div>
+                  <div className="mb-2 rounded-md border bg-muted px-3 py-2 font-mono text-xs">
+                    {formatExternalAttemptChain(selectedRecord)}
+                  </div>
+                  <div className="overflow-x-auto rounded-md border">
+                    <table className="w-full min-w-[760px] text-xs">
+                      <thead className="bg-muted text-muted-foreground">
+                        <tr className="text-left">
+                          <th className="px-3 py-2 font-medium">顺序</th>
+                          <th className="px-3 py-2 font-medium">外部池</th>
+                          <th className="px-3 py-2 font-medium">状态</th>
+                          <th className="px-3 py-2 font-medium">动作</th>
+                          <th className="px-3 py-2 font-medium text-right">耗时</th>
+                          <th className="px-3 py-2 font-medium">错误</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {(selectedRecord.externalAttempts || []).map((attempt) => (
+                          <tr key={`${attempt.attempt}-${attempt.poolId}-${attempt.durationMs}`} className="border-t">
+                            <td className="px-3 py-2">{attempt.attempt}</td>
+                            <td className="px-3 py-2">
+                              <div className="font-medium">#{attempt.poolId}</div>
+                              <div className="max-w-[220px] truncate text-muted-foreground" title={attempt.poolName}>
+                                {attempt.poolName}
+                              </div>
+                            </td>
+                            <td className="px-3 py-2">{attempt.status || '-'}</td>
                             <td className="px-3 py-2">{attemptActionLabel(attempt.action)}</td>
                             <td className="px-3 py-2 text-right">{formatNumber(attempt.durationMs)}ms</td>
                             <td className="px-3 py-2">
