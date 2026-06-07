@@ -1,9 +1,9 @@
 import { type ReactNode, useEffect, useMemo, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { FlaskConical, Pencil, Plus, Power, RefreshCw, RotateCcw, Save, Trash2, X } from 'lucide-react'
+import { CheckCircle2, FlaskConical, Loader2, Pencil, Play, Plus, Power, RefreshCw, RotateCcw, RotateCw, Save, Trash2, X, XCircle } from 'lucide-react'
 import { toast } from 'sonner'
-import { Button, Input, Toggle, Textarea } from 'react-daisyui'
-import { Badge, EmptyState, SectionCard } from '@/components/common'
+import { Button, Card, Input, Select, Toggle, Textarea } from 'react-daisyui'
+import { Badge, EmptyState, FieldLabel, ModalShell, SectionCard } from '@/components/common'
 import {
   clearExternalPoolAutoDisabled,
   createExternalPool,
@@ -17,8 +17,10 @@ import {
 } from '@/api/credentials'
 import { defaultExternalPoolsConfig } from '@/lib/runtime-config-defaults'
 import { useRuntimeConfig } from '@/hooks/use-credentials'
+import { useModelCapabilities } from '@/hooks/use-usage'
 import { extractErrorMessage } from '@/lib/utils'
-import type { CreateExternalPoolRequest, ExternalPool, ExternalPoolsConfig, UpdateExternalPoolRequest } from '@/types/api'
+import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, TEST_MODELS } from '@/lib/test-models'
+import type { CreateExternalPoolRequest, ExternalPool, ExternalPoolsConfig, ExternalPoolTestResponse, UpdateExternalPoolRequest } from '@/types/api'
 
 const splitRules = (value: string) => value.split('\n').map((item) => item.trim()).filter(Boolean)
 const joinRules = (value: string[] = []) => value.join('\n')
@@ -34,6 +36,7 @@ export function ExternalPoolsPanel() {
   const [modelRulesText, setModelRulesText] = useState('')
   const [pathRulesText, setPathRulesText] = useState('')
   const [editingPoolId, setEditingPoolId] = useState<number | null>(null)
+  const [testingPool, setTestingPool] = useState<ExternalPool | null>(null)
   const [editForm, setEditForm] = useState<UpdateExternalPoolRequest>({})
   const [form, setForm] = useState<CreateExternalPoolRequest>({
     name: '',
@@ -45,7 +48,7 @@ export function ExternalPoolsPanel() {
     maxConcurrentRequests: 10,
     usageProjectionMode: 'pass_through',
     autoDisablePolicy: 'inherit',
-    preservePath: true,
+    preservePath: false,
     notes: '',
   })
 
@@ -280,7 +283,7 @@ export function ExternalPoolsPanel() {
           <Button color="primary" onClick={submitPool}><Plus className="h-4 w-4" />添加</Button>
           <select className="select select-bordered select-sm" value={form.usageProjectionMode} onChange={(event) => setForm((prev) => ({ ...prev, usageProjectionMode: event.target.value as CreateExternalPoolRequest['usageProjectionMode'] }))}>
             <option value="pass_through">严格透传 usage</option>
-            <option value="current_path_policy">按当前路径整形 usage</option>
+            <option value="current_path_policy">按原请求路径整形缓存上报</option>
           </select>
           <select className="select select-bordered select-sm" value={form.authType} onChange={(event) => setForm((prev) => ({ ...prev, authType: event.target.value as CreateExternalPoolRequest['authType'] }))}>
             <option value="bearer">Authorization Bearer</option>
@@ -291,7 +294,9 @@ export function ExternalPoolsPanel() {
             <option value="enabled">强制允许自动禁用</option>
             <option value="disabled">禁用自动禁用</option>
           </select>
-          <label className="flex items-center gap-2 text-sm"><Toggle checked={Boolean(form.preservePath)} onChange={(event) => setForm((prev) => ({ ...prev, preservePath: event.target.checked }))} />保留请求路径</label>
+          <div className="rounded-box border border-base-300 bg-base-200/60 px-3 py-2 text-xs text-base-content/60">
+            备用池请求固定走自身 /v1/messages；原请求路径只用于缓存上报整形
+          </div>
           <Input bordered className="md:col-span-3" placeholder="备注" value={form.notes} onChange={(event) => setForm((prev) => ({ ...prev, notes: event.target.value }))} />
         </div>
       </SectionCard>
@@ -311,7 +316,7 @@ export function ExternalPoolsPanel() {
                   <Input bordered type="number" placeholder="优先级" value={editForm.priority ?? 100} onChange={(event) => setEditForm((prev) => ({ ...prev, priority: Number(event.target.value) }))} />
                   <select className="select select-bordered select-sm" value={editForm.usageProjectionMode} onChange={(event) => setEditForm((prev) => ({ ...prev, usageProjectionMode: event.target.value as UpdateExternalPoolRequest['usageProjectionMode'] }))}>
                     <option value="pass_through">严格透传 usage</option>
-                    <option value="current_path_policy">按当前路径整形 usage</option>
+                    <option value="current_path_policy">按原请求路径整形缓存上报</option>
                   </select>
                   <select className="select select-bordered select-sm" value={editForm.authType} onChange={(event) => setEditForm((prev) => ({ ...prev, authType: event.target.value as UpdateExternalPoolRequest['authType'] }))}>
                     <option value="bearer">Authorization Bearer</option>
@@ -323,7 +328,9 @@ export function ExternalPoolsPanel() {
                     <option value="disabled">禁用自动禁用</option>
                   </select>
                   <label className="flex items-center gap-2 text-sm"><Toggle checked={Boolean(editForm.enabled)} onChange={(event) => setEditForm((prev) => ({ ...prev, enabled: event.target.checked }))} />启用</label>
-                  <label className="flex items-center gap-2 text-sm"><Toggle checked={Boolean(editForm.preservePath)} onChange={(event) => setEditForm((prev) => ({ ...prev, preservePath: event.target.checked }))} />保留路径</label>
+                  <div className="rounded-box border border-base-300 bg-base-200/60 px-3 py-2 text-xs text-base-content/60">
+                    请求固定走备用池 /v1/messages
+                  </div>
                   <Input bordered className="md:col-span-2" placeholder="备注" value={editForm.notes || ''} onChange={(event) => setEditForm((prev) => ({ ...prev, notes: event.target.value }))} />
                   <div className="flex gap-2 md:col-span-6">
                     <Button size="sm" color="primary" onClick={savePoolEdit}><Save className="h-4 w-4" />保存</Button>
@@ -339,12 +346,12 @@ export function ExternalPoolsPanel() {
                     <Badge tone={runtime?.dispatchable ? 'info' : 'neutral'}>{runtime?.dispatchable ? '可调度' : runtime?.skippedReason || '不可调度'}</Badge>
                   </div>
                   <div className="text-sm text-base-content/70">{pool.baseUrl} · {pool.maskedApiKey || '未显示 Key'} · 并发 {runtime?.inFlight ?? 0}/{pool.maxConcurrentRequests} · 优先级 {pool.priority}</div>
-                  <div className="text-xs text-base-content/50">usage: {pool.usageProjectionMode} · auth: {pool.authType} · path: {pool.preservePath ? '保留' : '转 /v1/messages'} {runtime?.cooldownRemainingSecs ? `· 冷却 ${runtime.cooldownRemainingSecs}s` : ''}</div>
+                  <div className="text-xs text-base-content/50">usage: {pool.usageProjectionMode} · auth: {pool.authType} · request: /v1/messages {runtime?.cooldownRemainingSecs ? `· 冷却 ${runtime.cooldownRemainingSecs}s` : ''}</div>
                   {pool.autoDisabledLastError && <div className="text-xs text-error">{pool.autoDisabledLastError}</div>}
                 </div>
                 <div className="flex flex-wrap gap-2">
                   <Button size="sm" color="ghost" onClick={() => startEdit(pool)}><Pencil className="h-4 w-4" />编辑</Button>
-                  <Button size="sm" color="ghost" onClick={() => mutatePool(() => testExternalPool(pool.id), '外部池测试完成')}><FlaskConical className="h-4 w-4" />测试</Button>
+                  <Button size="sm" color="ghost" onClick={() => setTestingPool(pool)}><FlaskConical className="h-4 w-4" />测试</Button>
                   <Button size="sm" color="ghost" onClick={() => mutatePool(() => setExternalPoolEnabled(pool.id, !pool.enabled), pool.enabled ? '已停用' : '已启用')}><Power className="h-4 w-4" />{pool.enabled ? '停用' : '启用'}</Button>
                   <Button size="sm" color="ghost" onClick={() => mutatePool(() => clearExternalPoolAutoDisabled(pool.id), '自动禁用状态已清除')}><RotateCcw className="h-4 w-4" />清除禁用</Button>
                   <Button size="sm" color="ghost" onClick={() => status.refetch()}><RefreshCw className="h-4 w-4" />刷新</Button>
@@ -357,7 +364,185 @@ export function ExternalPoolsPanel() {
         })}
         {!pools.isLoading && !pools.data?.pools.length && <EmptyState text="暂无外部备用号池" />}
       </div>
+      <ExternalPoolTestModal
+        pool={testingPool}
+        open={Boolean(testingPool)}
+        onClose={() => setTestingPool(null)}
+        onDone={invalidate}
+      />
     </div>
+  )
+}
+
+function ExternalPoolTestModal({
+  pool,
+  open,
+  onClose,
+  onDone,
+}: {
+  pool: ExternalPool | null
+  open: boolean
+  onClose: () => void
+  onDone: () => void
+}) {
+  const modelCapabilities = useModelCapabilities()
+  const [model, setModel] = useState(DEFAULT_TEST_MODEL)
+  const [prompt, setPrompt] = useState(DEFAULT_TEST_PROMPT)
+  const [result, setResult] = useState<ExternalPoolTestResponse | null>(null)
+  const [error, setError] = useState('')
+  const [running, setRunning] = useState(false)
+
+  const modelOptions = useMemo(() => {
+    const seen = new Set<string>()
+    const options: { id: string; label: string }[] = []
+    const push = (id: string, label: string) => {
+      const key = id.trim()
+      if (!key || seen.has(key)) return
+      seen.add(key)
+      options.push({ id: key, label })
+    }
+    TEST_MODELS.forEach((item) => push(item.id, item.label))
+    ;[...(modelCapabilities.data?.models || [])]
+      .sort((left, right) => left.model.localeCompare(right.model))
+      .forEach((item) => push(item.model, item.displayName || item.model))
+    return options
+  }, [modelCapabilities.data?.models])
+  const selectedModelLabel = useMemo(
+    () => modelOptions.find((option) => option.id === model)?.label || model,
+    [model, modelOptions]
+  )
+
+  useEffect(() => {
+    if (!open) return
+    setModel(DEFAULT_TEST_MODEL)
+    setPrompt(DEFAULT_TEST_PROMPT)
+    setResult(null)
+    setError('')
+    setRunning(false)
+  }, [open, pool?.id])
+
+  const run = async () => {
+    if (!pool) return
+    const trimmedModel = model.trim()
+    const trimmedPrompt = prompt.trim() || DEFAULT_TEST_PROMPT
+    if (!trimmedModel) {
+      toast.error('请选择或输入测试模型')
+      return
+    }
+    setRunning(true)
+    setResult(null)
+    setError('')
+    try {
+      const response = await testExternalPool(pool.id, {
+        model: trimmedModel,
+        prompt: trimmedPrompt,
+      })
+      setResult(response)
+      if (response.ok) {
+        toast.success(response.message || '外部池模型调用测试通过')
+      } else {
+        toast.error(response.message || '外部池模型调用测试失败')
+      }
+      onDone()
+    } catch (err) {
+      setError(extractErrorMessage(err))
+    } finally {
+      setRunning(false)
+    }
+  }
+
+  return (
+    <ModalShell
+      open={open}
+      title="测试外部备用池"
+      width="max-w-3xl"
+      onClose={onClose}
+      footer={
+        <>
+          <Button type="button" size="sm" color="ghost" onClick={onClose} disabled={running}>
+            关闭
+          </Button>
+          <Button type="button" size="sm" color="primary" onClick={run} disabled={!pool || running}>
+            {running ? <Loader2 className="h-4 w-4 animate-spin" /> : result || error ? <RotateCw className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+            {result || error ? '重试' : '开始测试'}
+          </Button>
+        </>
+      }
+    >
+      {pool && (
+        <div className="space-y-4">
+          <Card bordered className="bg-base-200">
+            <Card.Body className="p-4">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-lg font-semibold">#{pool.id} {pool.name}</span>
+                <Badge tone="neutral">{pool.authType}</Badge>
+                <Badge tone={pool.enabled ? 'success' : 'error'}>{pool.enabled ? '启用' : '已禁用'}</Badge>
+              </div>
+              <div className="mt-2 break-all text-sm text-base-content/60">{pool.baseUrl}</div>
+            </Card.Body>
+          </Card>
+
+          <div className="grid gap-3 sm:grid-cols-[1fr_220px]">
+            <FieldLabel title="测试模型">
+              <Select bordered size="sm" value={model} disabled={running} onChange={(event) => setModel(event.target.value)}>
+                {modelOptions.map((option) => (
+                  <Select.Option key={option.id} value={option.id}>
+                    {option.label}
+                  </Select.Option>
+                ))}
+              </Select>
+            </FieldLabel>
+            <FieldLabel title="测试消息">
+              <Input bordered value={prompt} disabled={running} onChange={(event) => setPrompt(event.target.value)} />
+            </FieldLabel>
+          </div>
+
+          <div className="rounded-box bg-neutral p-4 font-mono text-sm text-neutral-content">
+            <div className="space-y-1">
+              <div><span className="text-info">外部池：</span><span> #{pool.id} {pool.name}</span></div>
+              <div><span className="text-info">使用模型：</span><span> {model}</span></div>
+              <div><span className="text-neutral-content/60">发送测试消息：</span><span> "{prompt.trim() || DEFAULT_TEST_PROMPT}"</span></div>
+            </div>
+            <div className="mt-4 border-t border-neutral-content/20 pt-4">
+              {running && (
+                <div className="flex items-center gap-2 text-info">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  正在等待外部池模型响应...
+                </div>
+              )}
+              {result && (
+                <div className={result.ok ? 'space-y-3 text-success' : 'space-y-3 text-error'}>
+                  <div>
+                    {result.ok ? <CheckCircle2 className="mr-2 inline h-4 w-4" /> : <XCircle className="mr-2 inline h-4 w-4" />}
+                    {result.message}
+                  </div>
+                  <div className="text-neutral-content/60">HTTP 状态：{result.status ?? '-'}</div>
+                  {result.model && <div className="text-neutral-content/60">返回模型：{result.model}</div>}
+                  {result.response && (
+                    <div>
+                      <div className="mb-1 text-warning">响应：</div>
+                      <div className="whitespace-pre-wrap break-words">{result.response}</div>
+                    </div>
+                  )}
+                </div>
+              )}
+              {error && (
+                <div className="space-y-2 text-error">
+                  <div><XCircle className="mr-2 inline h-4 w-4" />测试失败</div>
+                  <div className="whitespace-pre-wrap break-words">{error}</div>
+                </div>
+              )}
+              {!running && !result && !error && <div className="text-neutral-content/60">等待开始测试</div>}
+            </div>
+          </div>
+
+          <div className="flex flex-wrap justify-between gap-3 text-sm text-base-content/60">
+            <span>测试模型：{selectedModelLabel}</span>
+            <span>提示词："{prompt.trim() || DEFAULT_TEST_PROMPT}"</span>
+          </div>
+        </div>
+      )}
+    </ModalShell>
   )
 }
 

@@ -13,17 +13,19 @@ use serde_json::json;
 use super::error::AdminServiceError;
 use super::types::{
     AccessKeysResponse, AddCredentialRequest, AddCredentialResponse, BalanceResponse,
-    ClearInFlightRequest, CreateProxyResourceRequest, CredentialAccountInfo,
-    CredentialInfoRefreshItem, CredentialInfoRefreshResponse, CredentialStatusItem,
-    CredentialValidationGroup, CredentialValidationInfo, CredentialValidationItem,
-    CredentialValidationResponse, CredentialsPageResponse, CredentialsStatusResponse,
+    BatchCredentialImportDefaults, BatchCredentialImportDuplicateMode, BatchCredentialImportItem,
+    BatchCredentialImportRequest, BatchCredentialImportResponse, ClearInFlightRequest,
+    CreateProxyResourceRequest, CredentialAccountInfo, CredentialInfoRefreshItem,
+    CredentialInfoRefreshResponse, CredentialStatusItem, CredentialValidationGroup,
+    CredentialValidationInfo, CredentialValidationItem, CredentialValidationResponse,
+    CredentialsPageResponse, CredentialsStatusResponse, ExternalPoolTestRequest,
     LoadBalancingModeResponse, ManualModelResponse, ProxyResourceResponse, ProxyResourcesResponse,
     RefreshCredentialInfoRequest, RuntimeConfigResponse, SetCredentialConcurrencyRequest,
     SetCredentialProxyRequest, SetLoadBalancingModeRequest, SetWarmupRequest,
     TestCredentialRequest, TestCredentialResponse, UpdateAdminApiKeyRequest,
-    UpdateProxyResourceRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
-    UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse, UsageCleanupRequest,
-    UsageCleanupStatusResponse, ValidateExistingCredentialsRequest,
+    UpdateCredentialAuthRequest, UpdateProxyResourceRequest, UpdateRuntimeConfigRequest,
+    UpsertManualModelRequest, UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse,
+    UsageCleanupRequest, UsageCleanupStatusResponse, ValidateExistingCredentialsRequest,
     ValidateExternalCredentialsRequest,
 };
 use crate::anthropic::{
@@ -41,7 +43,7 @@ use crate::anthropic::{
 use crate::external_pool::{
     CreateExternalPoolRequest, ExternalPool, ExternalPoolManager, ExternalPoolTestResponse,
     ExternalPoolsStatusResponse, SetExternalPoolEnabledRequest, UpdateExternalPoolRequest,
-    external_pool_models_url,
+    external_pool_messages_url, external_pool_models_url,
 };
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::events::Event;
@@ -51,7 +53,7 @@ use crate::kiro::model::requests::{
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{CredentialAuthUpdate, MultiTokenManager};
 use crate::model::config::ExternalPoolsConfig;
 use crate::storage::postgres::{
     AdminAuditLogPage, CreateProxyResourceRow, CredentialAccountInfoRow, PostgresStore,
@@ -358,17 +360,43 @@ impl AdminService {
     pub fn test_external_pool(
         &self,
         id: u64,
+        req: Option<ExternalPoolTestRequest>,
     ) -> Result<ExternalPoolTestResponse, AdminServiceError> {
         let store = self.postgres_store.clone();
         let pool = block_on_admin_store(async move { store.get_external_pool(id, false).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
             .ok_or(AdminServiceError::NotFound { id })?;
         block_on_admin_store(async move {
-            let url = external_pool_models_url(&pool.base_url)?;
+            let model = req
+                .as_ref()
+                .map(|req| req.model.trim().to_string())
+                .filter(|model| !model.is_empty());
+            let url = if model.is_some() {
+                external_pool_messages_url(&pool.base_url)?
+            } else {
+                external_pool_models_url(&pool.base_url)?
+            };
             let client = reqwest::Client::builder()
                 .timeout(StdDuration::from_secs(15))
                 .build()?;
-            let mut request = client.get(url);
+            let mut request = if let Some(model) = model.as_deref() {
+                let prompt = req
+                    .as_ref()
+                    .and_then(|req| req.prompt.as_deref())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("hi");
+                client.post(url).json(&json!({
+                    "model": model,
+                    "max_tokens": 32,
+                    "messages": [
+                        {"role": "user", "content": prompt}
+                    ],
+                    "stream": false
+                }))
+            } else {
+                client.get(url)
+            };
             match pool.auth_type {
                 crate::external_pool::ExternalPoolAuthType::Bearer => {
                     request = request.bearer_auth(pool.api_key.unwrap_or_default());
@@ -381,20 +409,39 @@ impl AdminService {
             Ok::<ExternalPoolTestResponse, anyhow::Error>(match result {
                 Ok(response) => {
                     let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    let response_text = if status.is_success() {
+                        extract_external_pool_test_response_text(&body)
+                    } else {
+                        None
+                    };
                     ExternalPoolTestResponse {
                         ok: status.is_success(),
                         status: Some(status.as_u16()),
                         message: if status.is_success() {
-                            "外部池测试通过".to_string()
+                            if model.is_some() {
+                                "外部池模型调用测试通过".to_string()
+                            } else {
+                                "外部池模型列表测试通过".to_string()
+                            }
                         } else {
-                            format!("外部池测试失败: {}", status)
+                            let suffix = body.chars().take(300).collect::<String>();
+                            if suffix.is_empty() {
+                                format!("外部池测试失败: {}", status)
+                            } else {
+                                format!("外部池测试失败: {}; {}", status, suffix)
+                            }
                         },
+                        model,
+                        response: response_text,
                     }
                 }
                 Err(err) => ExternalPoolTestResponse {
                     ok: false,
                     status: None,
                     message: err.to_string(),
+                    model,
+                    response: None,
                 },
             })
         })
@@ -1243,55 +1290,21 @@ impl AdminService {
         &self,
         req: AddCredentialRequest,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
-        // 校验端点名：未指定则默认合法，指定则必须已注册
-        if let Some(ref name) = req.endpoint {
-            if !self.known_endpoints.contains(name) {
-                let mut known: Vec<&str> =
-                    self.known_endpoints.iter().map(|s| s.as_str()).collect();
-                known.sort();
-                return Err(AdminServiceError::InvalidCredential(format!(
-                    "未知端点 \"{}\"，已注册端点: {:?}",
-                    name, known
-                )));
-            }
-        }
-
-        // 构建凭据对象
         let email = req.email.clone();
-        let new_cred = KiroCredentials {
-            id: None,
-            created_at: None,
-            updated_at: None,
-            access_token: None,
-            refresh_token: req.refresh_token,
-            profile_arn: None,
-            expires_at: None,
-            auth_method: Some(req.auth_method),
-            client_id: req.client_id,
-            client_secret: req.client_secret,
-            priority: req.priority,
-            max_concurrent_requests: req.max_concurrent_requests,
-            region: req.region,
-            auth_region: req.auth_region,
-            api_region: req.api_region,
-            machine_id: req.machine_id,
-            email: req.email,
-            subscription_title: None, // 将在首次获取使用额度时自动更新
-            proxy_url: req.proxy_url,
-            proxy_username: req.proxy_username,
-            proxy_password: req.proxy_password,
-            proxy_resource_id: req.proxy_resource_id,
-            disabled: false, // 新添加的凭据默认启用
-            kiro_api_key: req.kiro_api_key,
-            endpoint: req.endpoint,
-        };
+        let warmup_remaining = req.warmup_remaining;
+        let disabled = req.disabled.unwrap_or(false);
+        let new_cred = self.credential_from_request(req, disabled)?;
 
-        // 调用 token_manager 添加凭据
         let credential_id = self
             .token_manager
             .add_credential(new_cred)
             .await
             .map_err(|e| self.classify_add_error(e))?;
+        if let Some(warmup_remaining) = warmup_remaining {
+            self.token_manager
+                .set_warmup_remaining(credential_id, warmup_remaining)
+                .map_err(|e| self.classify_error(e, credential_id))?;
+        }
 
         // 主动获取订阅等级并保存账号信息快照，避免首次请求时 Free 账号绕过 Opus 模型过滤
         if let Err(e) = self.get_balance(credential_id).await {
@@ -1311,6 +1324,132 @@ impl AdminService {
             message: format!("凭据添加成功，ID: {}", credential_id),
             credential_id,
             email,
+        })
+    }
+
+    pub fn update_credential_auth(
+        &self,
+        id: u64,
+        req: UpdateCredentialAuthRequest,
+    ) -> Result<(), AdminServiceError> {
+        if let Some(ref name) = req.endpoint {
+            if !name.trim().is_empty() && !self.known_endpoints.contains(name) {
+                let mut known: Vec<&str> =
+                    self.known_endpoints.iter().map(|s| s.as_str()).collect();
+                known.sort();
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "未知端点 \"{}\"，已注册端点: {:?}",
+                    name, known
+                )));
+            }
+        }
+
+        let reset_runtime_state = req.reset_runtime_state;
+        let update = CredentialAuthUpdate {
+            refresh_token: req.refresh_token,
+            auth_method: req.auth_method,
+            client_id: req.client_id,
+            client_secret: req.client_secret,
+            kiro_api_key: req.kiro_api_key,
+            auth_region: req.auth_region,
+            api_region: req.api_region,
+            machine_id: req.machine_id,
+            email: req.email,
+            endpoint: req.endpoint,
+        };
+        self.token_manager
+            .update_credential_auth(id, update, reset_runtime_state)
+            .map_err(|e| self.classify_error(e, id))?;
+        self.invalidate_balance_cache(id);
+        self.audit(
+            "update_credential_auth",
+            "credential",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({ "resetRuntimeState": reset_runtime_state }),
+        );
+        Ok(())
+    }
+
+    pub async fn batch_import_credentials(
+        &self,
+        req: BatchCredentialImportRequest,
+    ) -> Result<BatchCredentialImportResponse, AdminServiceError> {
+        if req.credentials.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "没有可导入的凭据".to_string(),
+            ));
+        }
+        if req.credentials.len() > MAX_CREDENTIALS_PAGE_LIMIT {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "单次最多导入 {} 个凭据",
+                MAX_CREDENTIALS_PAGE_LIMIT
+            )));
+        }
+
+        let total = req.credentials.len();
+        let mut items = Vec::with_capacity(total);
+        for (index, credential) in req.credentials.into_iter().enumerate() {
+            let import_index = index + 1;
+            let credential = apply_batch_import_defaults(credential, &req.defaults);
+            let email = credential.email.clone();
+            match self.add_credential(credential).await {
+                Ok(response) => items.push(BatchCredentialImportItem {
+                    index: import_index,
+                    ok: true,
+                    skipped: false,
+                    credential_id: Some(response.credential_id),
+                    email: response.email.or(email),
+                    error: None,
+                }),
+                Err(err)
+                    if req.duplicate_mode == BatchCredentialImportDuplicateMode::Skip
+                        && is_duplicate_credential_error(&err) =>
+                {
+                    items.push(BatchCredentialImportItem {
+                        index: import_index,
+                        ok: true,
+                        skipped: true,
+                        credential_id: None,
+                        email,
+                        error: Some(err.to_string()),
+                    });
+                }
+                Err(err) => {
+                    let message = err.to_string();
+                    items.push(BatchCredentialImportItem {
+                        index: import_index,
+                        ok: false,
+                        skipped: false,
+                        credential_id: None,
+                        email,
+                        error: Some(message.clone()),
+                    });
+                    if !req.continue_on_error {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let success = items.iter().filter(|item| item.ok && !item.skipped).count();
+        let skipped = items.iter().filter(|item| item.skipped).count();
+        let failed = items.iter().filter(|item| !item.ok).count();
+        self.audit(
+            "batch_import_credentials",
+            "credential",
+            None,
+            failed == 0,
+            (failed > 0).then(|| format!("{} 条导入失败", failed)),
+            json!({ "total": total, "success": success, "skipped": skipped, "failed": failed }),
+        );
+        Ok(BatchCredentialImportResponse {
+            total,
+            success,
+            skipped,
+            failed,
+            items,
         })
     }
 
@@ -2766,6 +2905,93 @@ fn proxy_resource_response(row: ProxyResourceRow) -> ProxyResourceResponse {
         updated_at: row.updated_at,
         credential_count: row.credential_count,
     }
+}
+
+fn apply_batch_import_defaults(
+    mut credential: AddCredentialRequest,
+    defaults: &BatchCredentialImportDefaults,
+) -> AddCredentialRequest {
+    if credential.disabled.is_none() {
+        credential.disabled = defaults.disabled;
+    }
+    if credential.priority == 0 {
+        if let Some(priority) = defaults.priority {
+            credential.priority = priority;
+        }
+    }
+    if credential.max_concurrent_requests.is_none() {
+        if let Some(max_concurrent_requests) = defaults.max_concurrent_requests {
+            credential.max_concurrent_requests = max_concurrent_requests;
+        }
+    }
+    if credential.auth_region.as_deref().is_none_or(str::is_empty) {
+        credential.auth_region = defaults.auth_region.clone();
+    }
+    if credential.api_region.as_deref().is_none_or(str::is_empty) {
+        credential.api_region = defaults.api_region.clone();
+    }
+    if credential.proxy_url.as_deref().is_none_or(str::is_empty) {
+        credential.proxy_url = defaults.proxy_url.clone();
+    }
+    if credential
+        .proxy_username
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        credential.proxy_username = defaults.proxy_username.clone();
+    }
+    if credential
+        .proxy_password
+        .as_deref()
+        .is_none_or(str::is_empty)
+    {
+        credential.proxy_password = defaults.proxy_password.clone();
+    }
+    if credential.proxy_resource_id.is_none() {
+        if let Some(proxy_resource_id) = defaults.proxy_resource_id {
+            credential.proxy_resource_id = proxy_resource_id;
+        }
+    }
+    if credential.endpoint.as_deref().is_none_or(str::is_empty) {
+        credential.endpoint = defaults.endpoint.clone();
+    }
+    if credential.warmup_remaining.is_none() {
+        credential.warmup_remaining = defaults.warmup_remaining;
+    }
+    credential
+}
+
+fn is_duplicate_credential_error(err: &AdminServiceError) -> bool {
+    let message = err.to_string();
+    message.contains("凭据已存在")
+        || message.contains("kiroApiKey 重复")
+        || message.contains("refreshToken 重复")
+}
+
+fn extract_external_pool_test_response_text(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    value
+        .get("content")
+        .and_then(|content| content.as_array())
+        .and_then(|items| {
+            items.iter().find_map(|item| {
+                item.get("text")
+                    .and_then(|text| text.as_str())
+                    .map(|text| text.trim().to_string())
+                    .filter(|text| !text.is_empty())
+            })
+        })
+        .or_else(|| {
+            value
+                .get("choices")
+                .and_then(|choices| choices.as_array())
+                .and_then(|choices| choices.first())
+                .and_then(|choice| choice.get("message"))
+                .and_then(|message| message.get("content"))
+                .and_then(|content| content.as_str())
+                .map(|text| text.trim().to_string())
+                .filter(|text| !text.is_empty())
+        })
 }
 
 fn account_info_from_row(row: &CredentialAccountInfoRow) -> CredentialAccountInfo {

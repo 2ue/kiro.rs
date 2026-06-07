@@ -258,6 +258,35 @@ pub struct SetCredentialConcurrencyRequest {
     pub max_concurrent_requests: Option<u32>,
 }
 
+/// 只更新凭据认证相关字段，不修改调度参数、代理、统计和运行态。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCredentialAuthRequest {
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub auth_method: Option<String>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    #[serde(default)]
+    pub kiro_api_key: Option<String>,
+    #[serde(default)]
+    pub auth_region: Option<String>,
+    #[serde(default)]
+    pub api_region: Option<String>,
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// 更新认证材料后是否清理冷却、失败计数等运行态。默认 false，避免影响其他数据。
+    #[serde(default)]
+    pub reset_runtime_state: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClearInFlightRequest {
@@ -384,6 +413,14 @@ pub struct AddCredentialRequest {
     #[serde(default)]
     pub max_concurrent_requests: Option<u32>,
 
+    /// 新增后是否禁用启动。默认 false。
+    #[serde(default)]
+    pub disabled: Option<bool>,
+
+    /// 新增后预热剩余请求数；不传时使用运行配置 credentialWarmupRequests。
+    #[serde(default)]
+    pub warmup_remaining: Option<u32>,
+
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     pub region: Option<String>,
@@ -438,6 +475,82 @@ pub struct AddCredentialResponse {
     /// 用户邮箱（如果获取成功）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchCredentialImportDefaults {
+    #[serde(default)]
+    pub disabled: Option<bool>,
+    #[serde(default)]
+    pub priority: Option<u32>,
+    #[serde(default)]
+    pub max_concurrent_requests: Option<Option<u32>>,
+    #[serde(default)]
+    pub auth_region: Option<String>,
+    #[serde(default)]
+    pub api_region: Option<String>,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    #[serde(default)]
+    pub proxy_username: Option<String>,
+    #[serde(default)]
+    pub proxy_password: Option<String>,
+    #[serde(default)]
+    pub proxy_resource_id: Option<Option<u64>>,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub warmup_remaining: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchCredentialImportDuplicateMode {
+    Skip,
+    Error,
+}
+
+impl Default for BatchCredentialImportDuplicateMode {
+    fn default() -> Self {
+        Self::Skip
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchCredentialImportRequest {
+    #[serde(default)]
+    pub defaults: BatchCredentialImportDefaults,
+    #[serde(default)]
+    pub duplicate_mode: BatchCredentialImportDuplicateMode,
+    #[serde(default)]
+    pub continue_on_error: bool,
+    pub credentials: Vec<AddCredentialRequest>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchCredentialImportItem {
+    pub index: usize,
+    pub ok: bool,
+    pub skipped: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchCredentialImportResponse {
+    pub total: usize,
+    pub success: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub items: Vec<BatchCredentialImportItem>,
 }
 
 // ============ 代理/家宽资源 ============
@@ -501,6 +614,14 @@ pub struct SetCredentialProxyRequest {
     pub proxy_url: Option<String>,
     pub proxy_username: Option<String>,
     pub proxy_password: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalPoolTestRequest {
+    pub model: String,
+    #[serde(default)]
+    pub prompt: Option<String>,
 }
 
 fn default_proxy_resource_enabled() -> bool {

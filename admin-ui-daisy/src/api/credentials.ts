@@ -33,6 +33,7 @@ import type {
   ExternalPool,
   ExternalPoolsListResponse,
   ExternalPoolsStatusResponse,
+  ExternalPoolTestRequest,
   ExternalPoolTestResponse,
   UpdateExternalPoolRequest,
 } from '@/types/api'
@@ -212,8 +213,8 @@ export async function clearExternalPoolAutoDisabled(id: number): Promise<Externa
   return data
 }
 
-export async function testExternalPool(id: number): Promise<ExternalPoolTestResponse> {
-  const { data } = await api.post<ExternalPoolTestResponse>(`/external-pools/${id}/test`)
+export async function testExternalPool(id: number, req?: ExternalPoolTestRequest): Promise<ExternalPoolTestResponse> {
+  const { data } = await api.post<ExternalPoolTestResponse>(`/external-pools/${id}/test`, req)
   return data
 }
 

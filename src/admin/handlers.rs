@@ -13,13 +13,14 @@ use serde::Deserialize;
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, AdminErrorResponse, ClearInFlightRequest, CreateProxyResourceRequest,
-        ExportCredentialsQuery, RefreshCredentialInfoRequest, SetCredentialConcurrencyRequest,
+        AddCredentialRequest, AdminErrorResponse, BatchCredentialImportRequest,
+        ClearInFlightRequest, CreateProxyResourceRequest, ExportCredentialsQuery,
+        ExternalPoolTestRequest, RefreshCredentialInfoRequest, SetCredentialConcurrencyRequest,
         SetCredentialProxyRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
         SetPriorityRequest, SetWarmupRequest, SuccessResponse, TestCredentialRequest,
-        UpdateAdminApiKeyRequest, UpdateProxyResourceRequest, UpdateRuntimeConfigRequest,
-        UpsertManualModelRequest, UsageCleanupRequest, ValidateExistingCredentialsRequest,
-        ValidateExternalCredentialsRequest,
+        UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
+        UpdateRuntimeConfigRequest, UpsertManualModelRequest, UsageCleanupRequest,
+        ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
     },
 };
 use crate::anthropic::usage::{UsageRecordQuery, UsageRecordStatus, UsageSource};
@@ -430,6 +431,27 @@ pub async fn add_credential(
     }
 }
 
+pub async fn batch_import_credentials(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchCredentialImportRequest>,
+) -> impl IntoResponse {
+    match state.service.batch_import_credentials(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+pub async fn update_credential_auth(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<UpdateCredentialAuthRequest>,
+) -> impl IntoResponse {
+    match state.service.update_credential_auth(id, payload) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 认证信息已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// DELETE /api/admin/credentials/:id
 /// 删除凭据
 pub async fn delete_credential(
@@ -556,8 +578,12 @@ pub async fn get_external_pool_status(State(state): State<AdminState>) -> impl I
 pub async fn test_external_pool(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
+    payload: Option<Json<ExternalPoolTestRequest>>,
 ) -> impl IntoResponse {
-    match state.service.test_external_pool(id) {
+    match state
+        .service
+        .test_external_pool(id, payload.map(|Json(payload)| payload))
+    {
         Ok(result) => Json(result).into_response(),
         Err(err) => (err.status_code(), Json(err.into_response())).into_response(),
     }

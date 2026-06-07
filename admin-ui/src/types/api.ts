@@ -794,6 +794,13 @@ export interface ExternalPoolTestResponse {
   ok: boolean
   status?: number
   message: string
+  model?: string
+  response?: string
+}
+
+export interface ExternalPoolTestRequest {
+  model: string
+  prompt?: string
 }
 
 export interface RuntimeConfig {

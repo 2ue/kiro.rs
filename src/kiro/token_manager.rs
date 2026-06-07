@@ -95,6 +95,73 @@ pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::R
     Ok(())
 }
 
+fn trimmed_optional(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn apply_optional_string(target: &mut Option<String>, value: Option<String>) {
+    if let Some(value) = value {
+        *target = trimmed_optional(value);
+    }
+}
+
+fn apply_credential_auth_update(credential: &mut KiroCredentials, update: CredentialAuthUpdate) {
+    let mut clear_access_token = false;
+
+    if let Some(api_key) = update.kiro_api_key {
+        credential.kiro_api_key = trimmed_optional(api_key);
+        credential.refresh_token = None;
+        credential.client_id = None;
+        credential.client_secret = None;
+        credential.auth_method = Some("api_key".to_string());
+        clear_access_token = true;
+    }
+
+    if let Some(refresh_token) = update.refresh_token {
+        credential.refresh_token = trimmed_optional(refresh_token);
+        credential.kiro_api_key = None;
+        if credential
+            .auth_method
+            .as_deref()
+            .is_none_or(|method| method.eq_ignore_ascii_case("api_key"))
+        {
+            credential.auth_method = Some("social".to_string());
+        }
+        clear_access_token = true;
+    }
+
+    if let Some(auth_method) = update.auth_method {
+        if let Some(auth_method) = trimmed_optional(auth_method) {
+            credential.auth_method = Some(auth_method);
+            clear_access_token = true;
+        }
+    }
+    if update.client_id.is_some() {
+        apply_optional_string(&mut credential.client_id, update.client_id);
+        clear_access_token = true;
+    }
+    if update.client_secret.is_some() {
+        apply_optional_string(&mut credential.client_secret, update.client_secret);
+        clear_access_token = true;
+    }
+    if update.auth_region.is_some() {
+        apply_optional_string(&mut credential.auth_region, update.auth_region);
+        clear_access_token = true;
+    }
+    apply_optional_string(&mut credential.api_region, update.api_region);
+    apply_optional_string(&mut credential.machine_id, update.machine_id);
+    apply_optional_string(&mut credential.email, update.email);
+    apply_optional_string(&mut credential.endpoint, update.endpoint);
+
+    if clear_access_token {
+        credential.access_token = None;
+        credential.expires_at = None;
+        credential.profile_arn = None;
+        credential.subscription_title = None;
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ProxyResourceRuntime {
     id: u64,
@@ -484,6 +551,20 @@ pub(crate) enum InFlightKind {
     Stream,
     Mcp,
     Test,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CredentialAuthUpdate {
+    pub refresh_token: Option<String>,
+    pub auth_method: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub kiro_api_key: Option<String>,
+    pub auth_region: Option<String>,
+    pub api_region: Option<String>,
+    pub machine_id: Option<String>,
+    pub email: Option<String>,
+    pub endpoint: Option<String>,
 }
 
 impl InFlightKind {
@@ -5057,6 +5138,104 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    pub fn update_credential_auth(
+        &self,
+        id: u64,
+        update: CredentialAuthUpdate,
+        reset_runtime_state: bool,
+    ) -> anyhow::Result<()> {
+        let mut credential = {
+            let entries = self.entries.lock();
+            let entry = entries
+                .iter()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            Self::credential_from_entry(entry)
+        };
+
+        apply_credential_auth_update(&mut credential, update);
+        credential.canonicalize_auth_method();
+        if credential.is_api_key_credential() {
+            let api_key = credential
+                .kiro_api_key
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?;
+            if api_key.trim().is_empty() {
+                anyhow::bail!("kiroApiKey 为空");
+            }
+        } else {
+            validate_refresh_token(&credential)?;
+        }
+
+        {
+            let entries = self.entries.lock();
+            if credential.is_api_key_credential() {
+                let new_hash = credential.kiro_api_key.as_deref().map(sha256_hex);
+                if let Some(new_hash) = new_hash.as_deref() {
+                    let duplicate = entries.iter().any(|entry| {
+                        entry.id != id
+                            && entry
+                                .credentials
+                                .kiro_api_key
+                                .as_deref()
+                                .map(sha256_hex)
+                                .as_deref()
+                                == Some(new_hash)
+                    });
+                    if duplicate {
+                        anyhow::bail!("凭据已存在（kiroApiKey 重复）");
+                    }
+                }
+            } else {
+                let new_hash = credential.refresh_token.as_deref().map(sha256_hex);
+                if let Some(new_hash) = new_hash.as_deref() {
+                    let duplicate = entries.iter().any(|entry| {
+                        entry.id != id
+                            && entry
+                                .credentials
+                                .refresh_token
+                                .as_deref()
+                                .map(sha256_hex)
+                                .as_deref()
+                                == Some(new_hash)
+                    });
+                    if duplicate {
+                        anyhow::bail!("凭据已存在（refreshToken 重复）");
+                    }
+                }
+            }
+        }
+
+        self.persist_credential_value(&credential)?;
+
+        let runtime_state = {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials = credential;
+            if reset_runtime_state {
+                entry.failure_count = 0;
+                entry.refresh_failure_count = 0;
+                entry.cooldown_until = None;
+                entry.cooldown_reason = None;
+                entry.rate_limit_available_at = None;
+                entry.health = SchedulerHealthState::default();
+                entry.selection_events.clear();
+            }
+            reset_runtime_state.then(|| Self::runtime_state_from_entry(entry))
+        };
+        if let Some(runtime_state) = runtime_state {
+            self.persist_runtime_state_value(id, &runtime_state)?;
+            self.clear_scheduler_state_for_credential(id, false);
+        }
+
+        self.publish_credentials_changed("credential_auth_updated");
+        self.notify_dispatch_state_changed();
+        Ok(())
+    }
+
     /// 重置凭据失败计数并重新启用（Admin API）
     pub fn reset_and_enable(&self, id: u64) -> anyhow::Result<()> {
         let (credential, runtime_state) = {
@@ -5296,9 +5475,10 @@ impl MultiTokenManager {
             ));
         }
 
+        let initial_disabled = new_cred.disabled;
         let warmup_remaining = self.runtime_config().credential_warmup_requests;
         let new_id = if let Some(store) = &self.postgres_store {
-            validated_cred.disabled = false;
+            validated_cred.disabled = initial_disabled;
             let inserted = store.insert_credential(&validated_cred).await?;
             let id = inserted
                 .id
@@ -5321,8 +5501,8 @@ impl MultiTokenManager {
                 credentials: validated_cred,
                 failure_count: 0,
                 refresh_failure_count: 0,
-                disabled: false,
-                disabled_reason: None,
+                disabled: initial_disabled,
+                disabled_reason: initial_disabled.then_some(DisabledReason::Manual),
                 success_count: 0,
                 total_selection_count: 0,
                 last_used_at: None,

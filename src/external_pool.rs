@@ -256,6 +256,10 @@ pub struct ExternalPoolTestResponse {
     pub ok: bool,
     pub status: Option<u16>,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1684,15 +1688,22 @@ pub(crate) fn external_pool_models_url(base_url: &str) -> Result<Url, url::Parse
     Url::parse(&base)
 }
 
+pub(crate) fn external_pool_messages_url(base_url: &str) -> Result<Url, url::ParseError> {
+    let mut base = base_url.trim().trim_end_matches('/').to_string();
+    if base_url_ends_with_v1(&base) {
+        base.push_str("/messages");
+    } else {
+        base.push_str("/v1/messages");
+    }
+    Url::parse(&base)
+}
+
 fn external_pool_url(
     pool: &ExternalPool,
-    endpoint: &str,
+    _endpoint: &str,
     config: &ExternalPoolsConfig,
 ) -> Result<Url, ExternalPoolError> {
-    let mut base = pool.base_url.trim().trim_end_matches('/').to_string();
-    let path = external_pool_target_path(&base, endpoint, pool.preserve_path);
-    base.push_str(&path);
-    Url::parse(&base).map_err(|err| ExternalPoolError {
+    external_pool_messages_url(&pool.base_url).map_err(|err| ExternalPoolError {
         status: None,
         message: format!("external pool URL is invalid: {}", err),
         retryable: true,
@@ -1704,33 +1715,6 @@ fn external_pool_url(
         response_body: None,
         response_headers: HeaderMap::new(),
     })
-}
-
-fn external_pool_target_path(base: &str, endpoint: &str, preserve_path: bool) -> String {
-    let base_has_v1 = base_url_ends_with_v1(base);
-    if !preserve_path {
-        return if base_has_v1 {
-            "/messages".to_string()
-        } else {
-            "/v1/messages".to_string()
-        };
-    }
-
-    let endpoint = if endpoint.starts_with('/') {
-        endpoint.to_string()
-    } else {
-        format!("/{endpoint}")
-    };
-    if base_has_v1 && (endpoint == "/v1" || endpoint.starts_with("/v1/")) {
-        let stripped = endpoint.trim_start_matches("/v1");
-        if stripped.is_empty() {
-            "/".to_string()
-        } else {
-            stripped.to_string()
-        }
-    } else {
-        endpoint
-    }
 }
 
 fn base_url_ends_with_v1(base: &str) -> bool {
@@ -2507,7 +2491,7 @@ mod tests {
     }
 
     #[test]
-    fn external_pool_url_preserves_path_without_duplicating_v1() {
+    fn external_pool_url_uses_pool_messages_path_even_when_preserve_path_is_true() {
         let config = ExternalPoolsConfig::default();
         let base_v1 = external_pool_url(
             &test_pool("http://pool.example.com/v1", true),
@@ -2523,7 +2507,7 @@ mod tests {
             &config,
         )
         .expect("valid external pool url");
-        assert_eq!(cc_path.as_str(), "http://pool.example.com/cc/v1/messages");
+        assert_eq!(cc_path.as_str(), "http://pool.example.com/v1/messages");
     }
 
     #[test]
