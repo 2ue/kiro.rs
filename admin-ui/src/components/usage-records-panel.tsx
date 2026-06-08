@@ -19,7 +19,7 @@ import {
   useUsageSummary,
 } from '@/hooks/use-usage'
 import { extractErrorMessage } from '@/lib/utils'
-import type { UsageCleanupMode, UsageCleanupRequest, UsageRecord, UsageRecordsPageQuery, UsageRecordStatus, UsageSource } from '@/types/api'
+import type { ExternalPoolUsageSnapshot, UsageCleanupMode, UsageCleanupRequest, UsageRecord, UsageRecordsPageQuery, UsageRecordStatus, UsageSource } from '@/types/api'
 
 function formatNumber(value: number): string {
   return new Intl.NumberFormat('zh-CN').format(value)
@@ -114,6 +114,16 @@ function routeLabel(record: UsageRecord): string {
     default:
       return record.routeKind === 'external_pool' ? '外部池' : '本地'
   }
+}
+
+function formatUsageSnapshot(snapshot?: ExternalPoolUsageSnapshot): string {
+  if (!snapshot) return '-'
+  return [
+    `in ${formatNumber(snapshot.inputTokens)}`,
+    `out ${formatNumber(snapshot.outputTokens)}`,
+    `read ${formatNumber(snapshot.cacheReadInputTokens)}`,
+    `create ${formatNumber(snapshot.cacheCreationInputTokens)}`,
+  ].join(' / ')
 }
 
 function routeVariant(record: UsageRecord): 'success' | 'secondary' | 'outline' | 'warning' | 'destructive' {
@@ -779,6 +789,38 @@ export function UsageRecordsPanel() {
                   </div>
                 </div>
               </div>
+              {selectedRecord.externalPoolBilling && (
+                <div className="rounded-md border bg-muted/30 p-3 text-sm">
+                  <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                    <div className="font-medium">外部池成本保护</div>
+                    <Badge variant={selectedRecord.externalPoolBilling.costFloorApplied ? 'warning' : 'success'}>
+                      {selectedRecord.externalPoolBilling.costFloorApplied ? '已保底补差' : '未触发补差'}
+                    </Badge>
+                  </div>
+                  <div className="grid gap-3 md:grid-cols-2">
+                    <div>
+                      <div className="text-xs text-muted-foreground">渠道 raw usage / 成本</div>
+                      <div className="break-all font-mono text-xs">{formatUsageSnapshot(selectedRecord.externalPoolBilling.rawUsage)}</div>
+                      <div className="mt-1 font-medium">{formatUsd(selectedRecord.externalPoolBilling.rawCostUsd || 0)}</div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-muted-foreground">返回 reported usage / 成本</div>
+                      <div className="break-all font-mono text-xs">{formatUsageSnapshot(selectedRecord.externalPoolBilling.reportedUsage)}</div>
+                      <div className="mt-1 font-medium">{formatUsd(selectedRecord.externalPoolBilling.reportedCostUsd || 0)}</div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-muted-foreground">最终计费 / 补差</div>
+                      <div className="font-medium">{formatUsd(selectedRecord.externalPoolBilling.billableCostUsd || 0)}</div>
+                      <div className="text-xs text-muted-foreground">补差 {formatUsd(selectedRecord.externalPoolBilling.costFloorDeltaUsd || 0)}</div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-muted-foreground">计价模型 / 整形模式</div>
+                      <div className="break-all">{selectedRecord.externalPoolBilling.pricingAvailable ? selectedRecord.externalPoolBilling.pricingModel || 'priced' : 'unpriced'}</div>
+                      <div className="text-xs text-muted-foreground">{selectedRecord.externalPoolBilling.usageProjectionMode}</div>
+                    </div>
+                  </div>
+                </div>
+              )}
               {(selectedRecord.credentialAttempts || []).length > 0 && (
                 <div>
                   <div className="mb-2 text-sm font-medium">调用链路</div>
@@ -961,7 +1003,7 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
   const start = () => {
     const cutoffLabel = mode === 'hard_delete' ? '删除时间' : '创建时间'
     const confirmed = confirm(
-      `确定开始${cleanupModeLabel(mode)}？\n\n范围：${cutoffLabel}早于 ${parsedOlderThanDays} 天\n每批：${formatNumber(parsedBatchSize)} 条\n系统会持续分批执行，直到没有更多匹配记录或达到内部安全上限 ${formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批。\n\n清理后当前统计和 Dashboard 会随保留明细变化。`
+      `确定开始${cleanupModeLabel(mode)}？\n\n范围：${cutoffLabel}早于 ${parsedOlderThanDays} 天\n每批：${formatNumber(parsedBatchSize)} 条\n系统会持续分批执行，直到没有更多匹配记录或达到内部安全上限 ${formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批。\n\n清理只影响使用记录明细列表，已累计的顶部统计和 Dashboard rollup 会保留。`
     )
     if (!confirmed) return
 
@@ -992,7 +1034,7 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
         </DialogHeader>
         <div className="space-y-4 text-sm">
           <div className="rounded-md border border-yellow-500/30 bg-yellow-500/10 p-3 text-yellow-700 dark:text-yellow-300">
-            这是手动单次任务，不会定时执行。你只需要设置清理范围和每批数量，系统会自动分批清到没有更多匹配记录；后端保留 {formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批安全上限。当前顶部统计和 Dashboard 仍按未清理的原始明细计算；执行清理后，历史统计会随保留明细变化。
+            这是手动单次任务，不会定时执行。你只需要设置清理范围和每批数量，系统会自动分批清到没有更多匹配记录；后端保留 {formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批安全上限。清理只影响使用记录明细列表，已累计的顶部统计和 Dashboard rollup 会保留。
           </div>
 
           <div className="grid gap-3 md:grid-cols-2">

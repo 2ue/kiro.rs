@@ -104,6 +104,7 @@ struct ExternalFallbackContext {
     endpoint: &'static str,
     payload: MessagesRequest,
     reported_usage: ReportedUsageConfig,
+    pricing_catalog: Arc<super::pricing::PricingCatalog>,
     recorder: Arc<super::usage::UsageRecorder>,
 }
 
@@ -325,6 +326,7 @@ fn build_external_fallback_context(
             endpoint,
             payload: payload.clone(),
             reported_usage: runtime_config.reported_usage.clone(),
+            pricing_catalog: state.pricing_catalog.clone(),
             recorder: state.usage_recorder.clone(),
         })
 }
@@ -427,6 +429,7 @@ impl ExternalFallbackContext {
             local_preflight,
             local_attempts,
             reported_usage: self.reported_usage.clone(),
+            pricing_catalog: self.pricing_catalog.clone(),
             request_id,
             recorder: self.recorder.clone(),
             started_at: Instant::now(),
@@ -999,6 +1002,7 @@ impl CredentialUsageContext {
             external_pool_name: None,
             external_attempts: Vec::new(),
             usage_projection_applied: None,
+            external_pool_billing: None,
             error_type,
             error_message,
             error_detail,

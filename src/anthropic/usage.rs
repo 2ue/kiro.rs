@@ -65,6 +65,35 @@ pub struct ExternalPoolAttempt {
     pub error_message: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalPoolUsageSnapshot {
+    pub total_input_tokens: i32,
+    pub input_tokens: i32,
+    pub billable_input_tokens: i32,
+    pub output_tokens: i32,
+    pub cache_read_input_tokens: i32,
+    pub cache_creation_input_tokens: i32,
+    pub cache_creation_5m_input_tokens: i32,
+    pub cache_creation_1h_input_tokens: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalPoolBilling {
+    pub raw_usage: ExternalPoolUsageSnapshot,
+    pub reported_usage: ExternalPoolUsageSnapshot,
+    pub raw_cost_usd: f64,
+    pub reported_cost_usd: f64,
+    pub billable_cost_usd: f64,
+    pub cost_floor_delta_usd: f64,
+    pub cost_floor_applied: bool,
+    pub pricing_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_model: Option<String>,
+    pub usage_projection_mode: String,
+}
+
 impl UsageRecordStatus {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
@@ -168,6 +197,8 @@ pub struct UsageRecord {
     pub external_attempts: Vec<ExternalPoolAttempt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_projection_applied: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_pool_billing: Option<ExternalPoolBilling>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -313,9 +344,23 @@ pub struct UsageSummary {
     pub local_prompt_cache_creation_input_tokens: i64,
     pub simulated_requests: usize,
     pub upstream_metadata_requests: usize,
+    pub external_pool_billing: UsageExternalPoolBillingSummary,
     pub realtime: UsageRealtimeStats,
     pub top_credentials: Vec<UsageAggregate>,
     pub top_conversations: Vec<UsageAggregate>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageExternalPoolBillingSummary {
+    pub requests: usize,
+    pub priced_requests: usize,
+    pub unpriced_requests: usize,
+    pub cost_floor_applied_requests: usize,
+    pub raw_cost_usd: f64,
+    pub reported_cost_usd: f64,
+    pub billable_cost_usd: f64,
+    pub cost_floor_delta_usd: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -363,6 +408,7 @@ pub struct UsageDashboardSummary {
     pub fallback_from_sticky_requests: usize,
     pub simulated_requests: usize,
     pub upstream_metadata_requests: usize,
+    pub external_pool_billing: UsageExternalPoolBillingSummary,
     pub status_breakdown: Vec<UsageBreakdownItem>,
     pub usage_source_breakdown: Vec<UsageBreakdownItem>,
 }
@@ -825,6 +871,7 @@ impl UsageRecorder {
             local_prompt_cache_creation_input_tokens: 0,
             simulated_requests: 0,
             upstream_metadata_requests: 0,
+            external_pool_billing: UsageExternalPoolBillingSummary::default(),
             realtime: UsageRealtimeStats::empty(REALTIME_USAGE_WINDOW_SECS),
             top_credentials: Vec::new(),
             top_conversations: Vec::new(),
@@ -852,6 +899,26 @@ impl UsageRecorder {
             }
             if record.usage_source == UsageSource::UpstreamMetadata {
                 summary.upstream_metadata_requests += 1;
+            }
+            if record.route_kind == Some(UsageRouteKind::ExternalPool) {
+                summary.external_pool_billing.requests += 1;
+                if let Some(billing) = &record.external_pool_billing {
+                    if billing.pricing_available {
+                        summary.external_pool_billing.priced_requests += 1;
+                    } else {
+                        summary.external_pool_billing.unpriced_requests += 1;
+                    }
+                    if billing.cost_floor_applied {
+                        summary.external_pool_billing.cost_floor_applied_requests += 1;
+                    }
+                    summary.external_pool_billing.raw_cost_usd += billing.raw_cost_usd;
+                    summary.external_pool_billing.reported_cost_usd += billing.reported_cost_usd;
+                    summary.external_pool_billing.billable_cost_usd += billing.billable_cost_usd;
+                    summary.external_pool_billing.cost_floor_delta_usd +=
+                        billing.cost_floor_delta_usd;
+                } else {
+                    summary.external_pool_billing.unpriced_requests += 1;
+                }
             }
             summary.total_input_tokens += record.total_input_tokens as i64;
             summary.total_output_tokens += record.output_tokens as i64;
@@ -1221,6 +1288,7 @@ mod tests {
             external_pool_name: None,
             external_attempts: Vec::new(),
             usage_projection_applied: None,
+            external_pool_billing: None,
             error_type: None,
             error_message: None,
             error_detail: None,

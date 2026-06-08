@@ -414,11 +414,36 @@ export interface UsageRecord {
   externalPoolName?: string
   externalAttempts?: ExternalPoolAttempt[]
   usageProjectionApplied?: boolean
+  externalPoolBilling?: ExternalPoolBilling
   errorType?: string
   errorMessage?: string
   errorDetail?: string
   payloadBreakdown?: unknown
   payloadGuardReport?: unknown
+}
+
+export interface ExternalPoolUsageSnapshot {
+  totalInputTokens: number
+  inputTokens: number
+  billableInputTokens: number
+  outputTokens: number
+  cacheReadInputTokens: number
+  cacheCreationInputTokens: number
+  cacheCreation5mInputTokens: number
+  cacheCreation1hInputTokens: number
+}
+
+export interface ExternalPoolBilling {
+  rawUsage: ExternalPoolUsageSnapshot
+  reportedUsage: ExternalPoolUsageSnapshot
+  rawCostUsd: number
+  reportedCostUsd: number
+  billableCostUsd: number
+  costFloorDeltaUsd: number
+  costFloorApplied: boolean
+  pricingAvailable: boolean
+  pricingModel?: string
+  usageProjectionMode: string
 }
 
 export interface ExternalPoolAttempt {
@@ -481,9 +506,21 @@ export interface UsageSummary {
   localPromptCacheCreationInputTokens: number
   simulatedRequests: number
   upstreamMetadataRequests: number
+  externalPoolBilling?: UsageExternalPoolBillingSummary
   realtime: UsageRealtimeStats
   topCredentials: UsageAggregate[]
   topConversations: UsageAggregate[]
+}
+
+export interface UsageExternalPoolBillingSummary {
+  requests: number
+  pricedRequests: number
+  unpricedRequests: number
+  costFloorAppliedRequests: number
+  rawCostUsd: number
+  reportedCostUsd: number
+  billableCostUsd: number
+  costFloorDeltaUsd: number
 }
 
 export interface UsageDashboardResponse {
@@ -525,6 +562,7 @@ export interface UsageDashboardSummary {
   fallbackFromStickyRequests: number
   simulatedRequests: number
   upstreamMetadataRequests: number
+  externalPoolBilling?: UsageExternalPoolBillingSummary
   statusBreakdown: UsageBreakdownItem[]
   usageSourceBreakdown: UsageBreakdownItem[]
 }

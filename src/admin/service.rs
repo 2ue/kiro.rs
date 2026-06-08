@@ -2883,6 +2883,9 @@ fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), St
     {
         return Err("外部池错误冷却秒数必须大于 0".to_string());
     }
+    if config.external_pool_usage_projection_uplift_percent > 200 {
+        return Err("externalPoolUsageProjectionUpliftPercent 不能大于 200".to_string());
+    }
     Ok(())
 }
 

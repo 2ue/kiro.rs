@@ -785,6 +785,8 @@ pub struct ExternalPoolsConfig {
     pub external_pool_network_error_cooldown_secs: u64,
     #[serde(default = "default_external_pool_protocol_error_cooldown_secs")]
     pub external_pool_protocol_error_cooldown_secs: u64,
+    #[serde(default = "default_external_pool_usage_projection_uplift_percent")]
+    pub external_pool_usage_projection_uplift_percent: u32,
 }
 
 impl Default for ExternalPoolsConfig {
@@ -832,6 +834,8 @@ impl Default for ExternalPoolsConfig {
                 default_external_pool_network_error_cooldown_secs(),
             external_pool_protocol_error_cooldown_secs:
                 default_external_pool_protocol_error_cooldown_secs(),
+            external_pool_usage_projection_uplift_percent:
+                default_external_pool_usage_projection_uplift_percent(),
         }
     }
 }
@@ -1515,6 +1519,10 @@ fn default_external_pool_network_error_cooldown_secs() -> u64 {
 
 fn default_external_pool_protocol_error_cooldown_secs() -> u64 {
     10
+}
+
+fn default_external_pool_usage_projection_uplift_percent() -> u32 {
+    25
 }
 
 fn default_postgres_max_connections() -> u32 {

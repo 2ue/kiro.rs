@@ -21,6 +21,7 @@ import { extractErrorMessage } from '@/lib/utils'
 import type {
   UsageBreakdownItem,
   UsageDashboardWindow,
+  UsageExternalPoolBillingSummary,
   UsageSeriesPoint,
   UsageTopAggregate,
 } from '@/types/api'
@@ -30,6 +31,24 @@ const AUTO_REFRESH_SECONDS = 10
 
 type DashboardTone = 'default' | 'success' | 'warning' | 'info'
 type RankDimension = 'models' | 'credentials' | 'endpoints' | 'errors'
+
+const EMPTY_EXTERNAL_POOL_BILLING: UsageExternalPoolBillingSummary = {
+  requests: 0,
+  pricedRequests: 0,
+  unpricedRequests: 0,
+  costFloorAppliedRequests: 0,
+  rawCostUsd: 0,
+  reportedCostUsd: 0,
+  billableCostUsd: 0,
+  costFloorDeltaUsd: 0,
+}
+
+const EMPTY_TOP = {
+  models: [] as UsageTopAggregate[],
+  credentials: [] as UsageTopAggregate[],
+  endpoints: [] as UsageTopAggregate[],
+  errors: [] as UsageTopAggregate[],
+}
 
 const rankDimensions: Array<{ key: RankDimension; label: string }> = [
   { key: 'models', label: '模型' },
@@ -343,7 +362,7 @@ function DimensionRankPanel({
   activeKey: RankDimension
   onActiveKeyChange: (key: RankDimension) => void
 }) {
-  const items = top[activeKey]
+  const items = top[activeKey] || []
   const totalRequests = items.reduce((sum, item) => sum + item.requests, 0)
 
   return (
@@ -439,6 +458,53 @@ function OperationsPanel({
   )
 }
 
+function ExternalPoolBillingPanel({ billing }: { billing: UsageExternalPoolBillingSummary }) {
+  const floorRatio = billing.rawCostUsd > 0 ? billing.costFloorDeltaUsd / billing.rawCostUsd : 0
+  const reportedGap = billing.reportedCostUsd - billing.rawCostUsd
+  const hasRisk = billing.costFloorDeltaUsd > 0
+
+  return (
+    <Panel
+      title="备用池成本保护"
+      subtitle="按外部池原始 usage 与整形后 usage 分别计价，最终费用不低于可计算渠道成本"
+      actions={<Badge variant={hasRisk ? 'warning' : 'success'}>{hasRisk ? `补差 ${formatUsd(billing.costFloorDeltaUsd)}` : '无补差'}</Badge>}
+    >
+      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <div className="rounded-md border bg-muted/30 p-3">
+          <div className="text-xs text-muted-foreground">外部池请求</div>
+          <div className="mt-1 text-lg font-semibold">{formatNumber(billing.requests)}</div>
+          <div className="mt-1 text-xs text-muted-foreground">可计价 {formatNumber(billing.pricedRequests)} / 未计价 {formatNumber(billing.unpricedRequests)}</div>
+        </div>
+        <div className="rounded-md border bg-muted/30 p-3">
+          <div className="text-xs text-muted-foreground">渠道原始成本</div>
+          <div className="mt-1 text-lg font-semibold">{formatUsd(billing.rawCostUsd)}</div>
+          <div className="mt-1 text-xs text-muted-foreground">按备用池 raw usage 估算</div>
+        </div>
+        <div className="rounded-md border bg-muted/30 p-3">
+          <div className="text-xs text-muted-foreground">整形展示成本</div>
+          <div className="mt-1 text-lg font-semibold">{formatUsd(billing.reportedCostUsd)}</div>
+          <div className={`mt-1 text-xs ${reportedGap < 0 ? 'text-yellow-600 dark:text-yellow-400' : 'text-muted-foreground'}`}>
+            对比渠道 {reportedGap >= 0 ? '+' : ''}{formatUsd(reportedGap)}
+          </div>
+        </div>
+        <div className="rounded-md border bg-muted/30 p-3">
+          <div className="text-xs text-muted-foreground">最终计费</div>
+          <div className="mt-1 text-lg font-semibold">{formatUsd(billing.billableCostUsd)}</div>
+          <div className="mt-1 text-xs text-muted-foreground">保底触发 {formatNumber(billing.costFloorAppliedRequests)} 次</div>
+        </div>
+      </div>
+      <div className="mt-3">
+        <SignalRow
+          label="保底补差占渠道成本"
+          value={`${formatUsd(billing.costFloorDeltaUsd)} · ${formatPercent(floorRatio)}`}
+          ratio={floorRatio}
+          tone={hasRisk ? 'warning' : 'success'}
+        />
+      </div>
+    </Panel>
+  )
+}
+
 export function UsageDashboardPanel() {
   const dashboard = useUsageDashboard(DASHBOARD_TIMEZONE)
   const [selectedWindowKey, setSelectedWindowKey] = useState('today')
@@ -468,6 +534,9 @@ export function UsageDashboardPanel() {
   }
 
   const summary = selectedWindow.summary
+  const top = data.top || EMPTY_TOP
+  const series = data.series || { hourly24h: [], daily7d: [] }
+  const externalPoolBilling = summary.externalPoolBilling || EMPTY_EXTERNAL_POOL_BILLING
   const pricedRatio = summary.totalRequests > 0 ? summary.pricedRequests / summary.totalRequests : 0
   const streamRatio = summary.totalRequests > 0 ? summary.streamRequests / summary.totalRequests : 0
   const totalTokens = summary.totalInputTokens + summary.totalOutputTokens
@@ -487,8 +556,8 @@ export function UsageDashboardPanel() {
       </div>
 
       <div className="grid gap-3 xl:grid-cols-2">
-        <SeriesChart title="最近 24 小时请求趋势" points={data.series.hourly24h} />
-        <SeriesChart title="最近 7 天请求趋势" points={data.series.daily7d} />
+        <SeriesChart title="最近 24 小时请求趋势" points={series.hourly24h || []} />
+        <SeriesChart title="最近 7 天请求趋势" points={series.daily7d || []} />
       </div>
 
       <div className="grid gap-3 xl:grid-cols-[1.1fr_0.9fr]">
@@ -501,15 +570,17 @@ export function UsageDashboardPanel() {
           simulatedRequests={summary.simulatedRequests}
           upstreamMetadataRequests={summary.upstreamMetadataRequests}
         />
-        <ErrorFocusPanel totalErrors={summary.errorRequests} items={data.top.errors} />
+        <ErrorFocusPanel totalErrors={summary.errorRequests} items={top.errors || []} />
       </div>
+
+      <ExternalPoolBillingPanel billing={externalPoolBilling} />
 
       <div className="grid gap-3 xl:grid-cols-2">
-        <BreakdownPanel title="状态分布" subtitle="判断成功、上游超时、客户端错误等整体占比" items={summary.statusBreakdown} emptyText="暂无状态样本。" />
-        <BreakdownPanel title="用量来源" subtitle="判断真实上游、缓存模拟、补录等来源占比" items={summary.usageSourceBreakdown} emptyText="暂无来源样本。" />
+        <BreakdownPanel title="状态分布" subtitle="判断成功、上游超时、客户端错误等整体占比" items={summary.statusBreakdown || []} emptyText="暂无状态样本。" />
+        <BreakdownPanel title="用量来源" subtitle="判断真实上游、缓存模拟、补录等来源占比" items={summary.usageSourceBreakdown || []} emptyText="暂无来源样本。" />
       </div>
 
-      <DimensionRankPanel top={data.top} activeKey={rankDimension} onActiveKeyChange={setRankDimension} />
+      <DimensionRankPanel top={top} activeKey={rankDimension} onActiveKeyChange={setRankDimension} />
 
       <div className="rounded-lg border bg-card px-3 py-2.5 text-xs text-muted-foreground">
         <div className="flex flex-wrap items-center gap-2">

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{
@@ -18,10 +18,11 @@ use crate::anthropic::pricing::{
 use crate::anthropic::usage::{
     CredentialCostSummary, REALTIME_USAGE_WINDOW_SECS, UsageAggregate, UsageBreakdownItem,
     UsageDashboardResponse, UsageDashboardSeries, UsageDashboardSummary, UsageDashboardTop,
-    UsageDashboardWindow, UsageDashboardWindowSpec, UsageRealtimeStats, UsageRecord,
-    UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult, UsageRecordsResult,
-    UsageSeriesPoint, UsageSummary, UsageTopAggregate, usage_dashboard_daily_windows,
-    usage_dashboard_hourly_windows, usage_dashboard_timezone, usage_dashboard_windows,
+    UsageDashboardWindow, UsageDashboardWindowSpec, UsageExternalPoolBillingSummary,
+    UsageRealtimeStats, UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult,
+    UsageRecordsResult, UsageRouteKind, UsageSeriesPoint, UsageSource, UsageSummary,
+    UsageTopAggregate, usage_dashboard_daily_windows, usage_dashboard_hourly_windows,
+    usage_dashboard_timezone, usage_dashboard_windows,
 };
 use crate::external_pool::{
     CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
@@ -1964,6 +1965,15 @@ impl PostgresUsageStore {
         let created_at = chrono::DateTime::parse_from_rfc3339(&record.created_at)
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now());
+        let mut tx = self.store.pool().begin().await?;
+        let old_record = sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT data FROM usage_records WHERE id = $1",
+        )
+        .bind(&record.id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(serde_json::from_value::<UsageRecord>)
+        .transpose()?;
         sqlx::query(
             r#"
             INSERT INTO usage_records (
@@ -2042,8 +2052,13 @@ impl PostgresUsageStore {
         .bind(&record.error_message)
         .bind(&record.error_detail)
         .bind(value)
-        .execute(self.store.pool())
+        .execute(&mut *tx)
         .await?;
+        if let Some(old_record) = old_record {
+            apply_usage_rollup_delta(&mut tx, &old_record, -1).await?;
+        }
+        apply_usage_rollup_delta(&mut tx, &record, 1).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2190,29 +2205,59 @@ impl PostgresUsageStore {
         let row = sqlx::query(
             r#"
             SELECT
-                COUNT(*)::bigint AS total_requests,
-                COUNT(*) FILTER (WHERE status = 'success')::bigint AS success_requests,
-                COUNT(*) FILTER (WHERE status <> 'success')::bigint AS error_requests,
-                COUNT(*) FILTER (WHERE cache_read_input_tokens >= $1)::bigint AS high_cache_requests,
-                COALESCE(SUM(total_input_tokens), 0)::bigint AS total_input_tokens,
-                COALESCE(SUM(output_tokens), 0)::bigint AS total_output_tokens,
-                COALESCE(SUM(cache_read_input_tokens), 0)::bigint AS total_cache_read_input_tokens,
-                COALESCE(SUM(cache_creation_input_tokens), 0)::bigint AS total_cache_creation_input_tokens,
-                COALESCE(SUM(estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
-                COUNT(*) FILTER (WHERE pricing_available)::bigint AS priced_requests,
-                COUNT(*) FILTER (WHERE NOT pricing_available)::bigint AS unpriced_requests,
-                COUNT(*) FILTER (WHERE usage_source = 'local_prompt_cache')::bigint AS local_prompt_cache_requests,
-                COALESCE(SUM(total_input_tokens) FILTER (WHERE usage_source = 'local_prompt_cache'), 0)::bigint AS local_prompt_cache_input_tokens,
-                COALESCE(SUM(cache_read_input_tokens) FILTER (WHERE usage_source = 'local_prompt_cache'), 0)::bigint AS local_prompt_cache_read_input_tokens,
-                COALESCE(SUM(cache_creation_input_tokens) FILTER (WHERE usage_source = 'local_prompt_cache'), 0)::bigint AS local_prompt_cache_creation_input_tokens,
-                COUNT(*) FILTER (WHERE simulated)::bigint AS simulated_requests,
-                COUNT(*) FILTER (WHERE usage_source = 'upstream_metadata')::bigint AS upstream_metadata_requests,
-                COUNT(*) FILTER (WHERE created_at >= now() - interval '60 seconds')::bigint AS realtime_requests,
-                COALESCE(SUM(total_input_tokens) FILTER (WHERE created_at >= now() - interval '60 seconds'), 0)::bigint AS realtime_input_tokens,
-                COALESCE(SUM(output_tokens) FILTER (WHERE created_at >= now() - interval '60 seconds'), 0)::bigint AS realtime_output_tokens,
-                COALESCE(SUM(billable_input_tokens) FILTER (WHERE created_at >= now() - interval '60 seconds'), 0)::bigint AS realtime_billable_input_tokens
-            FROM usage_records
-            WHERE deleted_at IS NULL
+                COALESCE(t.requests, 0)::bigint AS total_requests,
+                COALESCE(t.success_requests, 0)::bigint AS success_requests,
+                COALESCE(t.error_requests, 0)::bigint AS error_requests,
+                COALESCE((
+                    SELECT SUM(requests)
+                    FROM usage_cache_read_totals
+                    WHERE cache_read_input_tokens >= $1
+                ), 0)::bigint AS high_cache_requests,
+                COALESCE(t.total_input_tokens, 0)::bigint AS total_input_tokens,
+                COALESCE(t.total_output_tokens, 0)::bigint AS total_output_tokens,
+                COALESCE(t.total_cache_read_input_tokens, 0)::bigint AS total_cache_read_input_tokens,
+                COALESCE(t.total_cache_creation_input_tokens, 0)::bigint AS total_cache_creation_input_tokens,
+                COALESCE(t.total_estimated_cost_usd, 0)::double precision AS total_estimated_cost_usd,
+                COALESCE(t.priced_requests, 0)::bigint AS priced_requests,
+                COALESCE(t.unpriced_requests, 0)::bigint AS unpriced_requests,
+                COALESCE(t.local_prompt_cache_requests, 0)::bigint AS local_prompt_cache_requests,
+                COALESCE(t.local_prompt_cache_input_tokens, 0)::bigint AS local_prompt_cache_input_tokens,
+                COALESCE(t.local_prompt_cache_read_input_tokens, 0)::bigint AS local_prompt_cache_read_input_tokens,
+                COALESCE(t.local_prompt_cache_creation_input_tokens, 0)::bigint AS local_prompt_cache_creation_input_tokens,
+                COALESCE(t.simulated_requests, 0)::bigint AS simulated_requests,
+                COALESCE(t.upstream_metadata_requests, 0)::bigint AS upstream_metadata_requests,
+                COALESCE(t.external_pool_requests, 0)::bigint AS external_pool_requests,
+                COALESCE(t.external_pool_priced_requests, 0)::bigint AS external_pool_priced_requests,
+                COALESCE(t.external_pool_unpriced_requests, 0)::bigint AS external_pool_unpriced_requests,
+                COALESCE(t.external_pool_cost_floor_applied_requests, 0)::bigint AS external_pool_cost_floor_applied_requests,
+                COALESCE(t.external_pool_raw_cost_usd, 0)::double precision AS external_pool_raw_cost_usd,
+                COALESCE(t.external_pool_reported_cost_usd, 0)::double precision AS external_pool_reported_cost_usd,
+                COALESCE(t.external_pool_billable_cost_usd, 0)::double precision AS external_pool_billable_cost_usd,
+                COALESCE(t.external_pool_cost_floor_delta_usd, 0)::double precision AS external_pool_cost_floor_delta_usd,
+                COUNT(r.id) FILTER (WHERE r.created_at >= now() - interval '60 seconds')::bigint AS realtime_requests,
+                COALESCE(SUM(r.total_input_tokens) FILTER (WHERE r.created_at >= now() - interval '60 seconds'), 0)::bigint AS realtime_input_tokens,
+                COALESCE(SUM(r.output_tokens) FILTER (WHERE r.created_at >= now() - interval '60 seconds'), 0)::bigint AS realtime_output_tokens,
+                COALESCE(SUM(r.billable_input_tokens) FILTER (WHERE r.created_at >= now() - interval '60 seconds'), 0)::bigint AS realtime_billable_input_tokens
+            FROM (SELECT 1) AS anchor
+            LEFT JOIN usage_rollup_totals t
+              ON t.dimension = 'global'
+             AND t.dimension_key = 'all'
+            LEFT JOIN usage_records r
+              ON r.deleted_at IS NULL
+             AND r.created_at >= now() - interval '60 seconds'
+            GROUP BY t.requests, t.success_requests, t.error_requests,
+                     t.total_input_tokens, t.total_output_tokens,
+                     t.total_cache_read_input_tokens, t.total_cache_creation_input_tokens,
+                     t.total_estimated_cost_usd, t.priced_requests, t.unpriced_requests,
+                     t.local_prompt_cache_requests, t.local_prompt_cache_input_tokens,
+                     t.local_prompt_cache_read_input_tokens,
+                     t.local_prompt_cache_creation_input_tokens,
+                     t.simulated_requests, t.upstream_metadata_requests,
+                     t.external_pool_requests, t.external_pool_priced_requests,
+                     t.external_pool_unpriced_requests,
+                     t.external_pool_cost_floor_applied_requests,
+                     t.external_pool_raw_cost_usd, t.external_pool_reported_cost_usd,
+                     t.external_pool_billable_cost_usd, t.external_pool_cost_floor_delta_usd
             "#,
         )
         .bind(high_cache_threshold)
@@ -2239,6 +2284,19 @@ impl PostgresUsageStore {
                 .try_get("local_prompt_cache_creation_input_tokens")?,
             simulated_requests: row_i64_to_usize(&row, "simulated_requests")?,
             upstream_metadata_requests: row_i64_to_usize(&row, "upstream_metadata_requests")?,
+            external_pool_billing: UsageExternalPoolBillingSummary {
+                requests: row_i64_to_usize(&row, "external_pool_requests")?,
+                priced_requests: row_i64_to_usize(&row, "external_pool_priced_requests")?,
+                unpriced_requests: row_i64_to_usize(&row, "external_pool_unpriced_requests")?,
+                cost_floor_applied_requests: row_i64_to_usize(
+                    &row,
+                    "external_pool_cost_floor_applied_requests",
+                )?,
+                raw_cost_usd: row.try_get("external_pool_raw_cost_usd")?,
+                reported_cost_usd: row.try_get("external_pool_reported_cost_usd")?,
+                billable_cost_usd: row.try_get("external_pool_billable_cost_usd")?,
+                cost_floor_delta_usd: row.try_get("external_pool_cost_floor_delta_usd")?,
+            },
             realtime: UsageRealtimeStats::from_totals(
                 REALTIME_USAGE_WINDOW_SECS,
                 row_i64_to_usize(&row, "realtime_requests")?,
@@ -2348,41 +2406,75 @@ impl PostgresUsageStore {
                 w.label,
                 w.from_at,
                 w.to_at,
-                COUNT(r.id)::bigint AS total_requests,
-                COUNT(r.id) FILTER (WHERE r.status = 'success')::bigint AS success_requests,
-                COUNT(r.id) FILTER (WHERE r.status <> 'success')::bigint AS error_requests,
-                COUNT(r.id) FILTER (WHERE r.stream)::bigint AS stream_requests,
-                COUNT(r.id) FILTER (WHERE NOT r.stream)::bigint AS non_stream_requests,
-                COUNT(r.id) FILTER (WHERE r.cache_read_input_tokens >=
+                COALESCE(SUM(b.requests), 0)::bigint AS total_requests,
+                COALESCE(SUM(b.success_requests), 0)::bigint AS success_requests,
+                COALESCE(SUM(b.error_requests), 0)::bigint AS error_requests,
+                COALESCE(SUM(b.stream_requests), 0)::bigint AS stream_requests,
+                COALESCE(SUM(b.non_stream_requests), 0)::bigint AS non_stream_requests,
+                COALESCE((
+                    SELECT SUM(c.requests)
+                    FROM usage_cache_read_rollup_time_buckets c
+                    WHERE c.bucket_start >= w.from_at
+                      AND c.bucket_start < w.to_at
+                      AND c.cache_read_input_tokens >=
             "#,
         );
         builder.push_bind(high_cache_threshold);
         builder.push(
             r#"
-                )::bigint AS high_cache_requests,
-                COALESCE(SUM(r.total_input_tokens), 0)::bigint AS total_input_tokens,
-                COALESCE(SUM(r.billable_input_tokens), 0)::bigint AS billable_input_tokens,
-                COALESCE(SUM(r.output_tokens), 0)::bigint AS total_output_tokens,
-                COALESCE(SUM(r.cache_read_input_tokens), 0)::bigint AS total_cache_read_input_tokens,
-                COALESCE(SUM(r.cache_creation_input_tokens), 0)::bigint AS total_cache_creation_input_tokens,
-                COALESCE(SUM(r.estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
-                COUNT(r.id) FILTER (WHERE r.pricing_available)::bigint AS priced_requests,
-                COUNT(r.id) FILTER (WHERE NOT r.pricing_available)::bigint AS unpriced_requests,
-                COALESCE(AVG(r.duration_ms) FILTER (WHERE r.id IS NOT NULL), 0)::double precision AS average_duration_ms,
-                COALESCE(
-                    percentile_disc(0.95) WITHIN GROUP (ORDER BY r.duration_ms)
-                        FILTER (WHERE r.id IS NOT NULL),
-                    0
-                )::bigint AS p95_duration_ms,
-                COUNT(r.id) FILTER (WHERE r.sticky_bound)::bigint AS sticky_bound_requests,
-                COUNT(r.id) FILTER (WHERE r.fallback_from_sticky)::bigint AS fallback_from_sticky_requests,
-                COUNT(r.id) FILTER (WHERE r.simulated)::bigint AS simulated_requests,
-                COUNT(r.id) FILTER (WHERE r.usage_source = 'upstream_metadata')::bigint AS upstream_metadata_requests
+                ), 0)::bigint AS high_cache_requests,
+                COALESCE(SUM(b.total_input_tokens), 0)::bigint AS total_input_tokens,
+                COALESCE(SUM(b.billable_input_tokens), 0)::bigint AS billable_input_tokens,
+                COALESCE(SUM(b.total_output_tokens), 0)::bigint AS total_output_tokens,
+                COALESCE(SUM(b.total_cache_read_input_tokens), 0)::bigint AS total_cache_read_input_tokens,
+                COALESCE(SUM(b.total_cache_creation_input_tokens), 0)::bigint AS total_cache_creation_input_tokens,
+                COALESCE(SUM(b.total_estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
+                COALESCE(SUM(b.priced_requests), 0)::bigint AS priced_requests,
+                COALESCE(SUM(b.unpriced_requests), 0)::bigint AS unpriced_requests,
+                CASE
+                    WHEN COALESCE(SUM(b.duration_ms_count), 0) > 0
+                    THEN COALESCE(SUM(b.duration_ms_sum), 0)::double precision
+                         / SUM(b.duration_ms_count)::double precision
+                    ELSE 0
+                END AS average_duration_ms,
+                COALESCE((
+                    SELECT ranked.duration_ms
+                    FROM (
+                        SELECT
+                            grouped.duration_ms,
+                            SUM(grouped.requests) OVER (ORDER BY grouped.duration_ms) AS cumulative_requests,
+                            SUM(grouped.requests) OVER () AS total_requests
+                        FROM (
+                            SELECT d.duration_ms, SUM(d.requests)::bigint AS requests
+                            FROM usage_duration_rollup_time_buckets d
+                            WHERE d.bucket_start >= w.from_at
+                              AND d.bucket_start < w.to_at
+                            GROUP BY d.duration_ms
+                        ) grouped
+                    ) ranked
+                    WHERE ranked.total_requests > 0
+                      AND ranked.cumulative_requests >= CEIL(ranked.total_requests::double precision * 0.95)::bigint
+                    ORDER BY ranked.duration_ms
+                    LIMIT 1
+                ), 0)::bigint AS p95_duration_ms,
+                COALESCE(SUM(b.sticky_bound_requests), 0)::bigint AS sticky_bound_requests,
+                COALESCE(SUM(b.fallback_from_sticky_requests), 0)::bigint AS fallback_from_sticky_requests,
+                COALESCE(SUM(b.simulated_requests), 0)::bigint AS simulated_requests,
+                COALESCE(SUM(b.upstream_metadata_requests), 0)::bigint AS upstream_metadata_requests,
+                COALESCE(SUM(b.external_pool_requests), 0)::bigint AS external_pool_requests,
+                COALESCE(SUM(b.external_pool_priced_requests), 0)::bigint AS external_pool_priced_requests,
+                COALESCE(SUM(b.external_pool_unpriced_requests), 0)::bigint AS external_pool_unpriced_requests,
+                COALESCE(SUM(b.external_pool_cost_floor_applied_requests), 0)::bigint AS external_pool_cost_floor_applied_requests,
+                COALESCE(SUM(b.external_pool_raw_cost_usd), 0)::double precision AS external_pool_raw_cost_usd,
+                COALESCE(SUM(b.external_pool_reported_cost_usd), 0)::double precision AS external_pool_reported_cost_usd,
+                COALESCE(SUM(b.external_pool_billable_cost_usd), 0)::double precision AS external_pool_billable_cost_usd,
+                COALESCE(SUM(b.external_pool_cost_floor_delta_usd), 0)::double precision AS external_pool_cost_floor_delta_usd
             FROM windows w
-            LEFT JOIN usage_records r
-                ON r.deleted_at IS NULL
-                AND r.created_at >= w.from_at
-                AND r.created_at < w.to_at
+            LEFT JOIN usage_rollup_time_buckets b
+                ON b.dimension = 'global'
+                AND b.dimension_key = 'all'
+                AND b.bucket_start >= w.from_at
+                AND b.bucket_start < w.to_at
             GROUP BY w.key, w.label, w.from_at, w.to_at, w.ord
             ORDER BY w.ord
             "#,
@@ -2408,21 +2500,26 @@ impl PostgresUsageStore {
             .await?
             .into_iter()
             .collect();
-        let item_expr = column.sql_expr();
+        let item_dimension = column.rollup_dimension();
         let mut builder = QueryBuilder::<Postgres>::new("");
         push_dashboard_windows_cte(&mut builder, specs);
-        builder.push("SELECT w.key AS window_key, ");
-        builder.push(item_expr);
         builder.push(
-            r#" AS item_key, COUNT(r.id)::bigint AS requests
+            r#"SELECT w.key AS window_key,
+                   b.dimension_key AS item_key,
+                   SUM(b.requests)::bigint AS requests
             FROM windows w
-            JOIN usage_records r
-                ON r.deleted_at IS NULL
-                AND r.created_at >= w.from_at
-                AND r.created_at < w.to_at
-            GROUP BY w.key, w.ord, "#,
+            JOIN usage_rollup_time_buckets b
+              ON b.dimension = "#,
         );
-        builder.push(item_expr);
+        builder.push_bind(item_dimension);
+        builder.push(
+            r#"
+             AND b.bucket_start >= w.from_at
+             AND b.bucket_start < w.to_at
+            GROUP BY w.key, w.ord, b.dimension_key
+            HAVING SUM(b.requests) > 0
+            "#,
+        );
         builder.push(" ORDER BY w.ord, requests DESC, item_key");
 
         let rows = builder.build().fetch_all(self.store.pool()).await?;
@@ -2453,12 +2550,13 @@ impl PostgresUsageStore {
         push_dashboard_windows_cte(&mut builder, specs);
         builder.push(
             r#"
-            SELECT w.key, COUNT(r.id)::bigint AS total_requests
+            SELECT w.key, COALESCE(SUM(b.requests), 0)::bigint AS total_requests
             FROM windows w
-            LEFT JOIN usage_records r
-                ON r.deleted_at IS NULL
-                AND r.created_at >= w.from_at
-                AND r.created_at < w.to_at
+            LEFT JOIN usage_rollup_time_buckets b
+                ON b.dimension = 'global'
+                AND b.dimension_key = 'all'
+                AND b.bucket_start >= w.from_at
+                AND b.bucket_start < w.to_at
             GROUP BY w.key, w.ord
             ORDER BY w.ord
             "#,
@@ -2491,18 +2589,19 @@ impl PostgresUsageStore {
                 w.label,
                 w.from_at,
                 w.to_at,
-                COUNT(r.id)::bigint AS requests,
-                COUNT(r.id) FILTER (WHERE r.status = 'success')::bigint AS success_requests,
-                COUNT(r.id) FILTER (WHERE r.status <> 'success')::bigint AS error_requests,
-                COALESCE(SUM(r.total_input_tokens), 0)::bigint AS total_input_tokens,
-                COALESCE(SUM(r.billable_input_tokens), 0)::bigint AS billable_input_tokens,
-                COALESCE(SUM(r.output_tokens), 0)::bigint AS total_output_tokens,
-                COALESCE(SUM(r.estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd
+                COALESCE(SUM(b.requests), 0)::bigint AS requests,
+                COALESCE(SUM(b.success_requests), 0)::bigint AS success_requests,
+                COALESCE(SUM(b.error_requests), 0)::bigint AS error_requests,
+                COALESCE(SUM(b.total_input_tokens), 0)::bigint AS total_input_tokens,
+                COALESCE(SUM(b.billable_input_tokens), 0)::bigint AS billable_input_tokens,
+                COALESCE(SUM(b.total_output_tokens), 0)::bigint AS total_output_tokens,
+                COALESCE(SUM(b.total_estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd
             FROM windows w
-            LEFT JOIN usage_records r
-                ON r.deleted_at IS NULL
-                AND r.created_at >= w.from_at
-                AND r.created_at < w.to_at
+            LEFT JOIN usage_rollup_time_buckets b
+                ON b.dimension = 'global'
+                AND b.dimension_key = 'all'
+                AND b.bucket_start >= w.from_at
+                AND b.bucket_start < w.to_at
             GROUP BY w.key, w.label, w.from_at, w.to_at, w.ord
             ORDER BY w.ord
             "#,
@@ -2519,30 +2618,29 @@ impl PostgresUsageStore {
         to: DateTime<Utc>,
         group: DashboardTopGroup,
     ) -> anyhow::Result<Vec<UsageTopAggregate>> {
-        let mut builder = QueryBuilder::<Postgres>::new("SELECT ");
-        builder.push(group.key_expr());
-        builder.push(" AS key, ");
-        builder.push(group.label_expr());
-        builder.push(
-            r#" AS label,
-                COUNT(*)::bigint AS requests,
-                COUNT(*) FILTER (WHERE r.status <> 'success')::bigint AS error_requests,
-                COALESCE(SUM(r.total_input_tokens), 0)::bigint AS total_input_tokens,
-                COALESCE(SUM(r.billable_input_tokens), 0)::bigint AS billable_input_tokens,
-                COALESCE(SUM(r.output_tokens), 0)::bigint AS total_output_tokens,
-                COALESCE(SUM(r.cache_read_input_tokens), 0)::bigint AS total_cache_read_input_tokens,
-                COALESCE(SUM(r.cache_creation_input_tokens), 0)::bigint AS total_cache_creation_input_tokens,
-                COALESCE(SUM(r.estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd
-            FROM usage_records r
-            WHERE r.deleted_at IS NULL
-                AND r.created_at >= "#,
+        let mut builder = QueryBuilder::<Postgres>::new(
+            r#"
+            SELECT
+                b.dimension_key AS key,
+                MAX(NULLIF(b.dimension_label, '')) AS label,
+                SUM(b.requests)::bigint AS requests,
+                SUM(b.error_requests)::bigint AS error_requests,
+                COALESCE(SUM(b.total_input_tokens), 0)::bigint AS total_input_tokens,
+                COALESCE(SUM(b.billable_input_tokens), 0)::bigint AS billable_input_tokens,
+                COALESCE(SUM(b.total_output_tokens), 0)::bigint AS total_output_tokens,
+                COALESCE(SUM(b.total_cache_read_input_tokens), 0)::bigint AS total_cache_read_input_tokens,
+                COALESCE(SUM(b.total_cache_creation_input_tokens), 0)::bigint AS total_cache_creation_input_tokens,
+                COALESCE(SUM(b.total_estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd
+            FROM usage_rollup_time_buckets b
+            WHERE b.dimension = "#,
         );
+        builder.push_bind(group.rollup_dimension());
+        builder.push(" AND b.bucket_start >= ");
         builder.push_bind(from);
-        builder.push(" AND r.created_at < ");
+        builder.push(" AND b.bucket_start < ");
         builder.push_bind(to);
-        builder.push(group.extra_where());
-        builder.push(" GROUP BY ");
-        builder.push(group.key_expr());
+        builder.push(group.rollup_extra_where());
+        builder.push(" GROUP BY b.dimension_key HAVING SUM(b.requests) > 0 ");
         builder.push(
             " ORDER BY total_estimated_cost_usd DESC, requests DESC, total_input_tokens DESC LIMIT 10",
         );
@@ -2560,12 +2658,11 @@ impl PostgresUsageStore {
             r#"
             SELECT
                 credential_id,
-                COALESCE(SUM(estimated_cost_usd), 0)::double precision AS estimated_cost_usd,
-                COUNT(*) FILTER (WHERE pricing_available)::bigint AS priced_requests,
-                COUNT(*) FILTER (WHERE NOT pricing_available)::bigint AS unpriced_requests
-            FROM usage_records
-            WHERE credential_id IS NOT NULL AND deleted_at IS NULL
-            GROUP BY credential_id
+                estimated_cost_usd,
+                priced_requests,
+                unpriced_requests
+            FROM usage_credential_cost_summary
+            WHERE requests > 0
             "#,
         )
         .fetch_all(self.store.pool())
@@ -2590,15 +2687,14 @@ impl PostgresUsageStore {
         let rows = sqlx::query(
             r#"
             SELECT
-                credential_id::text AS key,
-                MAX(credential_label) AS label,
-                COUNT(*)::bigint AS requests,
-                COALESCE(SUM(cache_read_input_tokens), 0)::bigint AS cache_read_input_tokens,
-                COALESCE(SUM(cache_creation_input_tokens), 0)::bigint AS cache_creation_input_tokens,
-                COALESCE(SUM(estimated_cost_usd), 0)::double precision AS estimated_cost_usd
-            FROM usage_records
-            WHERE credential_id IS NOT NULL AND deleted_at IS NULL
-            GROUP BY credential_id
+                dimension_key AS key,
+                NULLIF(dimension_label, '') AS label,
+                requests,
+                total_cache_read_input_tokens AS cache_read_input_tokens,
+                total_cache_creation_input_tokens AS cache_creation_input_tokens,
+                total_estimated_cost_usd AS estimated_cost_usd
+            FROM usage_rollup_totals
+            WHERE dimension = 'credential' AND requests > 0
             ORDER BY estimated_cost_usd DESC, requests DESC, cache_read_input_tokens DESC
             LIMIT 10
             "#,
@@ -2612,15 +2708,14 @@ impl PostgresUsageStore {
         let rows = sqlx::query(
             r#"
             SELECT
-                conversation_id AS key,
-                NULL::text AS label,
-                COUNT(*)::bigint AS requests,
-                COALESCE(SUM(cache_read_input_tokens), 0)::bigint AS cache_read_input_tokens,
-                COALESCE(SUM(cache_creation_input_tokens), 0)::bigint AS cache_creation_input_tokens,
-                COALESCE(SUM(estimated_cost_usd), 0)::double precision AS estimated_cost_usd
-            FROM usage_records
-            WHERE conversation_id IS NOT NULL AND deleted_at IS NULL
-            GROUP BY conversation_id
+                dimension_key AS key,
+                NULLIF(dimension_label, '') AS label,
+                requests,
+                total_cache_read_input_tokens AS cache_read_input_tokens,
+                total_cache_creation_input_tokens AS cache_creation_input_tokens,
+                total_estimated_cost_usd AS estimated_cost_usd
+            FROM usage_rollup_totals
+            WHERE dimension = 'conversation' AND requests > 0
             ORDER BY estimated_cost_usd DESC, requests DESC, cache_read_input_tokens DESC
             LIMIT 10
             "#,
@@ -2671,16 +2766,619 @@ fn cleanup_preview_from_row(row: PgRow) -> anyhow::Result<UsageCleanupPreview> {
 }
 
 #[derive(Clone, Copy)]
+struct UsageRollupMetrics {
+    requests: i64,
+    success_requests: i64,
+    error_requests: i64,
+    stream_requests: i64,
+    non_stream_requests: i64,
+    priced_requests: i64,
+    unpriced_requests: i64,
+    local_prompt_cache_requests: i64,
+    simulated_requests: i64,
+    upstream_metadata_requests: i64,
+    sticky_bound_requests: i64,
+    fallback_from_sticky_requests: i64,
+    total_input_tokens: i64,
+    billable_input_tokens: i64,
+    total_output_tokens: i64,
+    total_cache_read_input_tokens: i64,
+    total_cache_creation_input_tokens: i64,
+    local_prompt_cache_input_tokens: i64,
+    local_prompt_cache_read_input_tokens: i64,
+    local_prompt_cache_creation_input_tokens: i64,
+    total_estimated_cost_usd: f64,
+    external_pool_requests: i64,
+    external_pool_priced_requests: i64,
+    external_pool_unpriced_requests: i64,
+    external_pool_cost_floor_applied_requests: i64,
+    external_pool_raw_cost_usd: f64,
+    external_pool_reported_cost_usd: f64,
+    external_pool_billable_cost_usd: f64,
+    external_pool_cost_floor_delta_usd: f64,
+    duration_ms_sum: i64,
+    duration_ms_count: i64,
+    duration_ms_max: i64,
+}
+
+impl UsageRollupMetrics {
+    fn from_record(record: &UsageRecord, direction: i64) -> Self {
+        let sign = if direction < 0 { -1 } else { 1 };
+        let success = record.status == UsageRecordStatus::Success;
+        let local_prompt_cache = record.usage_source == UsageSource::LocalPromptCache;
+        let upstream_metadata = record.usage_source == UsageSource::UpstreamMetadata;
+        let external_pool = record.route_kind == Some(UsageRouteKind::ExternalPool);
+        let external_billing = record.external_pool_billing.as_ref();
+        let external_priced =
+            external_pool && external_billing.is_some_and(|billing| billing.pricing_available);
+        Self {
+            requests: sign,
+            success_requests: signed_bool(success, sign),
+            error_requests: signed_bool(!success, sign),
+            stream_requests: signed_bool(record.stream, sign),
+            non_stream_requests: signed_bool(!record.stream, sign),
+            priced_requests: signed_bool(record.pricing_available, sign),
+            unpriced_requests: signed_bool(!record.pricing_available, sign),
+            local_prompt_cache_requests: signed_bool(local_prompt_cache, sign),
+            simulated_requests: signed_bool(record.simulated, sign),
+            upstream_metadata_requests: signed_bool(upstream_metadata, sign),
+            sticky_bound_requests: signed_bool(record.sticky_bound, sign),
+            fallback_from_sticky_requests: signed_bool(record.fallback_from_sticky, sign),
+            total_input_tokens: signed_i32(record.total_input_tokens, sign),
+            billable_input_tokens: signed_i32(record.billable_input_tokens, sign),
+            total_output_tokens: signed_i32(record.output_tokens, sign),
+            total_cache_read_input_tokens: signed_i32(record.cache_read_input_tokens, sign),
+            total_cache_creation_input_tokens: signed_i32(record.cache_creation_input_tokens, sign),
+            local_prompt_cache_input_tokens: if local_prompt_cache {
+                signed_i32(record.total_input_tokens, sign)
+            } else {
+                0
+            },
+            local_prompt_cache_read_input_tokens: if local_prompt_cache {
+                signed_i32(record.cache_read_input_tokens, sign)
+            } else {
+                0
+            },
+            local_prompt_cache_creation_input_tokens: if local_prompt_cache {
+                signed_i32(record.cache_creation_input_tokens, sign)
+            } else {
+                0
+            },
+            total_estimated_cost_usd: record.estimated_cost_usd * sign as f64,
+            external_pool_requests: signed_bool(external_pool, sign),
+            external_pool_priced_requests: signed_bool(external_priced, sign),
+            external_pool_unpriced_requests: signed_bool(external_pool && !external_priced, sign),
+            external_pool_cost_floor_applied_requests: signed_bool(
+                external_billing.is_some_and(|billing| billing.cost_floor_applied),
+                sign,
+            ),
+            external_pool_raw_cost_usd: external_billing
+                .map(|billing| billing.raw_cost_usd * sign as f64)
+                .unwrap_or(0.0),
+            external_pool_reported_cost_usd: external_billing
+                .map(|billing| billing.reported_cost_usd * sign as f64)
+                .unwrap_or(0.0),
+            external_pool_billable_cost_usd: external_billing
+                .map(|billing| billing.billable_cost_usd * sign as f64)
+                .unwrap_or(0.0),
+            external_pool_cost_floor_delta_usd: external_billing
+                .map(|billing| billing.cost_floor_delta_usd * sign as f64)
+                .unwrap_or(0.0),
+            duration_ms_sum: (record.duration_ms.min(i64::MAX as u64) as i64) * sign,
+            duration_ms_count: sign,
+            duration_ms_max: if sign > 0 {
+                record.duration_ms.min(i64::MAX as u64) as i64
+            } else {
+                0
+            },
+        }
+    }
+}
+
+struct UsageRollupDimension {
+    dimension: &'static str,
+    key: String,
+    label: Option<String>,
+    include_time_bucket: bool,
+}
+
+async fn apply_usage_rollup_delta(
+    tx: &mut Transaction<'_, Postgres>,
+    record: &UsageRecord,
+    direction: i64,
+) -> anyhow::Result<()> {
+    let direction = if direction < 0 { -1 } else { 1 };
+    let metrics = UsageRollupMetrics::from_record(record, direction);
+    let created_at = parse_usage_created_at(record);
+    let bucket_start = usage_rollup_bucket_start(created_at);
+    let dimensions = usage_rollup_dimensions(record);
+
+    for dimension in dimensions {
+        upsert_usage_rollup_total(tx, &dimension, metrics).await?;
+        if dimension.include_time_bucket {
+            upsert_usage_rollup_time_bucket(tx, bucket_start, &dimension, metrics).await?;
+        }
+    }
+
+    let cache_read = record.cache_read_input_tokens.max(0);
+    upsert_usage_cache_read_total(tx, cache_read, direction).await?;
+    upsert_usage_cache_read_time_bucket(tx, bucket_start, cache_read, direction).await?;
+    upsert_usage_duration_time_bucket(
+        tx,
+        bucket_start,
+        record.duration_ms.min(i32::MAX as u64) as i32,
+        direction,
+    )
+    .await?;
+
+    if let Some(credential_id) = record.credential_id {
+        upsert_credential_usage_summary(tx, credential_id, record, direction).await?;
+    }
+
+    Ok(())
+}
+
+fn usage_rollup_dimensions(record: &UsageRecord) -> Vec<UsageRollupDimension> {
+    let status = usage_status_value(record.status).to_string();
+    let source = usage_source_value(record.usage_source).to_string();
+    let model = non_empty_or_unknown(&record.model);
+    let endpoint = non_empty_or_unknown(&record.endpoint);
+    let mut dimensions = vec![
+        UsageRollupDimension {
+            dimension: "global",
+            key: "all".to_string(),
+            label: None,
+            include_time_bucket: true,
+        },
+        UsageRollupDimension {
+            dimension: "status",
+            key: status,
+            label: None,
+            include_time_bucket: true,
+        },
+        UsageRollupDimension {
+            dimension: "usage_source",
+            key: source,
+            label: None,
+            include_time_bucket: true,
+        },
+        UsageRollupDimension {
+            dimension: "model",
+            key: model,
+            label: None,
+            include_time_bucket: true,
+        },
+        UsageRollupDimension {
+            dimension: "endpoint",
+            key: endpoint,
+            label: None,
+            include_time_bucket: true,
+        },
+    ];
+
+    if let Some(credential_id) = record.credential_id {
+        dimensions.push(UsageRollupDimension {
+            dimension: "credential",
+            key: credential_id.to_string(),
+            label: record
+                .credential_label
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            include_time_bucket: true,
+        });
+    }
+
+    if let Some(external_pool_id) = record.external_pool_id {
+        dimensions.push(UsageRollupDimension {
+            dimension: "external_pool",
+            key: external_pool_id.to_string(),
+            label: record
+                .external_pool_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            include_time_bucket: true,
+        });
+    }
+
+    if let Some(conversation_id) = record
+        .conversation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        dimensions.push(UsageRollupDimension {
+            dimension: "conversation",
+            key: conversation_id.to_string(),
+            label: None,
+            include_time_bucket: false,
+        });
+    }
+
+    if record.status != UsageRecordStatus::Success {
+        dimensions.push(UsageRollupDimension {
+            dimension: "error",
+            key: record
+                .error_type
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(usage_status_value(record.status))
+                .to_string(),
+            label: record
+                .error_message
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            include_time_bucket: true,
+        });
+    }
+
+    dimensions
+}
+
+async fn upsert_usage_rollup_total(
+    tx: &mut Transaction<'_, Postgres>,
+    dimension: &UsageRollupDimension,
+    metrics: UsageRollupMetrics,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO usage_rollup_totals (
+            dimension, dimension_key, dimension_label, requests, success_requests,
+            error_requests, stream_requests, non_stream_requests, priced_requests,
+            unpriced_requests, local_prompt_cache_requests, simulated_requests,
+            upstream_metadata_requests, sticky_bound_requests, fallback_from_sticky_requests,
+            total_input_tokens, billable_input_tokens, total_output_tokens,
+            total_cache_read_input_tokens, total_cache_creation_input_tokens,
+            local_prompt_cache_input_tokens, local_prompt_cache_read_input_tokens,
+            local_prompt_cache_creation_input_tokens, total_estimated_cost_usd,
+            external_pool_requests, external_pool_priced_requests,
+            external_pool_unpriced_requests, external_pool_cost_floor_applied_requests,
+            external_pool_raw_cost_usd, external_pool_reported_cost_usd,
+            external_pool_billable_cost_usd, external_pool_cost_floor_delta_usd,
+            duration_ms_sum, duration_ms_count, duration_ms_max, updated_at
+        )
+        VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+            $11, $12, $13, $14, $15, $16, $17, $18,
+            $19, $20, $21, $22, $23, $24, $25, $26,
+            $27, $28, $29, $30, $31, $32, $33, $34,
+            $35, now()
+        )
+        ON CONFLICT (dimension, dimension_key) DO UPDATE
+        SET dimension_label = COALESCE(EXCLUDED.dimension_label, usage_rollup_totals.dimension_label),
+            requests = usage_rollup_totals.requests + EXCLUDED.requests,
+            success_requests = usage_rollup_totals.success_requests + EXCLUDED.success_requests,
+            error_requests = usage_rollup_totals.error_requests + EXCLUDED.error_requests,
+            stream_requests = usage_rollup_totals.stream_requests + EXCLUDED.stream_requests,
+            non_stream_requests = usage_rollup_totals.non_stream_requests + EXCLUDED.non_stream_requests,
+            priced_requests = usage_rollup_totals.priced_requests + EXCLUDED.priced_requests,
+            unpriced_requests = usage_rollup_totals.unpriced_requests + EXCLUDED.unpriced_requests,
+            local_prompt_cache_requests = usage_rollup_totals.local_prompt_cache_requests + EXCLUDED.local_prompt_cache_requests,
+            simulated_requests = usage_rollup_totals.simulated_requests + EXCLUDED.simulated_requests,
+            upstream_metadata_requests = usage_rollup_totals.upstream_metadata_requests + EXCLUDED.upstream_metadata_requests,
+            sticky_bound_requests = usage_rollup_totals.sticky_bound_requests + EXCLUDED.sticky_bound_requests,
+            fallback_from_sticky_requests = usage_rollup_totals.fallback_from_sticky_requests + EXCLUDED.fallback_from_sticky_requests,
+            total_input_tokens = usage_rollup_totals.total_input_tokens + EXCLUDED.total_input_tokens,
+            billable_input_tokens = usage_rollup_totals.billable_input_tokens + EXCLUDED.billable_input_tokens,
+            total_output_tokens = usage_rollup_totals.total_output_tokens + EXCLUDED.total_output_tokens,
+            total_cache_read_input_tokens = usage_rollup_totals.total_cache_read_input_tokens + EXCLUDED.total_cache_read_input_tokens,
+            total_cache_creation_input_tokens = usage_rollup_totals.total_cache_creation_input_tokens + EXCLUDED.total_cache_creation_input_tokens,
+            local_prompt_cache_input_tokens = usage_rollup_totals.local_prompt_cache_input_tokens + EXCLUDED.local_prompt_cache_input_tokens,
+            local_prompt_cache_read_input_tokens = usage_rollup_totals.local_prompt_cache_read_input_tokens + EXCLUDED.local_prompt_cache_read_input_tokens,
+            local_prompt_cache_creation_input_tokens = usage_rollup_totals.local_prompt_cache_creation_input_tokens + EXCLUDED.local_prompt_cache_creation_input_tokens,
+            total_estimated_cost_usd = usage_rollup_totals.total_estimated_cost_usd + EXCLUDED.total_estimated_cost_usd,
+            external_pool_requests = usage_rollup_totals.external_pool_requests + EXCLUDED.external_pool_requests,
+            external_pool_priced_requests = usage_rollup_totals.external_pool_priced_requests + EXCLUDED.external_pool_priced_requests,
+            external_pool_unpriced_requests = usage_rollup_totals.external_pool_unpriced_requests + EXCLUDED.external_pool_unpriced_requests,
+            external_pool_cost_floor_applied_requests = usage_rollup_totals.external_pool_cost_floor_applied_requests + EXCLUDED.external_pool_cost_floor_applied_requests,
+            external_pool_raw_cost_usd = usage_rollup_totals.external_pool_raw_cost_usd + EXCLUDED.external_pool_raw_cost_usd,
+            external_pool_reported_cost_usd = usage_rollup_totals.external_pool_reported_cost_usd + EXCLUDED.external_pool_reported_cost_usd,
+            external_pool_billable_cost_usd = usage_rollup_totals.external_pool_billable_cost_usd + EXCLUDED.external_pool_billable_cost_usd,
+            external_pool_cost_floor_delta_usd = usage_rollup_totals.external_pool_cost_floor_delta_usd + EXCLUDED.external_pool_cost_floor_delta_usd,
+            duration_ms_sum = usage_rollup_totals.duration_ms_sum + EXCLUDED.duration_ms_sum,
+            duration_ms_count = usage_rollup_totals.duration_ms_count + EXCLUDED.duration_ms_count,
+            duration_ms_max = GREATEST(usage_rollup_totals.duration_ms_max, EXCLUDED.duration_ms_max),
+            updated_at = now()
+        "#,
+    )
+    .bind(dimension.dimension)
+    .bind(&dimension.key)
+    .bind(&dimension.label)
+    .bind(metrics.requests)
+    .bind(metrics.success_requests)
+    .bind(metrics.error_requests)
+    .bind(metrics.stream_requests)
+    .bind(metrics.non_stream_requests)
+    .bind(metrics.priced_requests)
+    .bind(metrics.unpriced_requests)
+    .bind(metrics.local_prompt_cache_requests)
+    .bind(metrics.simulated_requests)
+    .bind(metrics.upstream_metadata_requests)
+    .bind(metrics.sticky_bound_requests)
+    .bind(metrics.fallback_from_sticky_requests)
+    .bind(metrics.total_input_tokens)
+    .bind(metrics.billable_input_tokens)
+    .bind(metrics.total_output_tokens)
+    .bind(metrics.total_cache_read_input_tokens)
+    .bind(metrics.total_cache_creation_input_tokens)
+    .bind(metrics.local_prompt_cache_input_tokens)
+    .bind(metrics.local_prompt_cache_read_input_tokens)
+    .bind(metrics.local_prompt_cache_creation_input_tokens)
+    .bind(metrics.total_estimated_cost_usd)
+    .bind(metrics.external_pool_requests)
+    .bind(metrics.external_pool_priced_requests)
+    .bind(metrics.external_pool_unpriced_requests)
+    .bind(metrics.external_pool_cost_floor_applied_requests)
+    .bind(metrics.external_pool_raw_cost_usd)
+    .bind(metrics.external_pool_reported_cost_usd)
+    .bind(metrics.external_pool_billable_cost_usd)
+    .bind(metrics.external_pool_cost_floor_delta_usd)
+    .bind(metrics.duration_ms_sum)
+    .bind(metrics.duration_ms_count)
+    .bind(metrics.duration_ms_max)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn upsert_usage_rollup_time_bucket(
+    tx: &mut Transaction<'_, Postgres>,
+    bucket_start: DateTime<Utc>,
+    dimension: &UsageRollupDimension,
+    metrics: UsageRollupMetrics,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO usage_rollup_time_buckets (
+            bucket_start, dimension, dimension_key, dimension_label, requests,
+            success_requests, error_requests, stream_requests, non_stream_requests,
+            priced_requests, unpriced_requests, local_prompt_cache_requests,
+            simulated_requests, upstream_metadata_requests, sticky_bound_requests,
+            fallback_from_sticky_requests, total_input_tokens, billable_input_tokens,
+            total_output_tokens, total_cache_read_input_tokens,
+            total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
+            local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
+            total_estimated_cost_usd, external_pool_requests,
+            external_pool_priced_requests, external_pool_unpriced_requests,
+            external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
+            external_pool_reported_cost_usd, external_pool_billable_cost_usd,
+            external_pool_cost_floor_delta_usd, duration_ms_sum, duration_ms_count,
+            duration_ms_max, updated_at
+        )
+        VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+            $11, $12, $13, $14, $15, $16, $17, $18,
+            $19, $20, $21, $22, $23, $24, $25, $26,
+            $27, $28, $29, $30, $31, $32, $33, $34,
+            $35, $36, now()
+        )
+        ON CONFLICT (bucket_start, dimension, dimension_key) DO UPDATE
+        SET dimension_label = COALESCE(EXCLUDED.dimension_label, usage_rollup_time_buckets.dimension_label),
+            requests = usage_rollup_time_buckets.requests + EXCLUDED.requests,
+            success_requests = usage_rollup_time_buckets.success_requests + EXCLUDED.success_requests,
+            error_requests = usage_rollup_time_buckets.error_requests + EXCLUDED.error_requests,
+            stream_requests = usage_rollup_time_buckets.stream_requests + EXCLUDED.stream_requests,
+            non_stream_requests = usage_rollup_time_buckets.non_stream_requests + EXCLUDED.non_stream_requests,
+            priced_requests = usage_rollup_time_buckets.priced_requests + EXCLUDED.priced_requests,
+            unpriced_requests = usage_rollup_time_buckets.unpriced_requests + EXCLUDED.unpriced_requests,
+            local_prompt_cache_requests = usage_rollup_time_buckets.local_prompt_cache_requests + EXCLUDED.local_prompt_cache_requests,
+            simulated_requests = usage_rollup_time_buckets.simulated_requests + EXCLUDED.simulated_requests,
+            upstream_metadata_requests = usage_rollup_time_buckets.upstream_metadata_requests + EXCLUDED.upstream_metadata_requests,
+            sticky_bound_requests = usage_rollup_time_buckets.sticky_bound_requests + EXCLUDED.sticky_bound_requests,
+            fallback_from_sticky_requests = usage_rollup_time_buckets.fallback_from_sticky_requests + EXCLUDED.fallback_from_sticky_requests,
+            total_input_tokens = usage_rollup_time_buckets.total_input_tokens + EXCLUDED.total_input_tokens,
+            billable_input_tokens = usage_rollup_time_buckets.billable_input_tokens + EXCLUDED.billable_input_tokens,
+            total_output_tokens = usage_rollup_time_buckets.total_output_tokens + EXCLUDED.total_output_tokens,
+            total_cache_read_input_tokens = usage_rollup_time_buckets.total_cache_read_input_tokens + EXCLUDED.total_cache_read_input_tokens,
+            total_cache_creation_input_tokens = usage_rollup_time_buckets.total_cache_creation_input_tokens + EXCLUDED.total_cache_creation_input_tokens,
+            local_prompt_cache_input_tokens = usage_rollup_time_buckets.local_prompt_cache_input_tokens + EXCLUDED.local_prompt_cache_input_tokens,
+            local_prompt_cache_read_input_tokens = usage_rollup_time_buckets.local_prompt_cache_read_input_tokens + EXCLUDED.local_prompt_cache_read_input_tokens,
+            local_prompt_cache_creation_input_tokens = usage_rollup_time_buckets.local_prompt_cache_creation_input_tokens + EXCLUDED.local_prompt_cache_creation_input_tokens,
+            total_estimated_cost_usd = usage_rollup_time_buckets.total_estimated_cost_usd + EXCLUDED.total_estimated_cost_usd,
+            external_pool_requests = usage_rollup_time_buckets.external_pool_requests + EXCLUDED.external_pool_requests,
+            external_pool_priced_requests = usage_rollup_time_buckets.external_pool_priced_requests + EXCLUDED.external_pool_priced_requests,
+            external_pool_unpriced_requests = usage_rollup_time_buckets.external_pool_unpriced_requests + EXCLUDED.external_pool_unpriced_requests,
+            external_pool_cost_floor_applied_requests = usage_rollup_time_buckets.external_pool_cost_floor_applied_requests + EXCLUDED.external_pool_cost_floor_applied_requests,
+            external_pool_raw_cost_usd = usage_rollup_time_buckets.external_pool_raw_cost_usd + EXCLUDED.external_pool_raw_cost_usd,
+            external_pool_reported_cost_usd = usage_rollup_time_buckets.external_pool_reported_cost_usd + EXCLUDED.external_pool_reported_cost_usd,
+            external_pool_billable_cost_usd = usage_rollup_time_buckets.external_pool_billable_cost_usd + EXCLUDED.external_pool_billable_cost_usd,
+            external_pool_cost_floor_delta_usd = usage_rollup_time_buckets.external_pool_cost_floor_delta_usd + EXCLUDED.external_pool_cost_floor_delta_usd,
+            duration_ms_sum = usage_rollup_time_buckets.duration_ms_sum + EXCLUDED.duration_ms_sum,
+            duration_ms_count = usage_rollup_time_buckets.duration_ms_count + EXCLUDED.duration_ms_count,
+            duration_ms_max = GREATEST(usage_rollup_time_buckets.duration_ms_max, EXCLUDED.duration_ms_max),
+            updated_at = now()
+        "#,
+    )
+    .bind(bucket_start)
+    .bind(dimension.dimension)
+    .bind(&dimension.key)
+    .bind(&dimension.label)
+    .bind(metrics.requests)
+    .bind(metrics.success_requests)
+    .bind(metrics.error_requests)
+    .bind(metrics.stream_requests)
+    .bind(metrics.non_stream_requests)
+    .bind(metrics.priced_requests)
+    .bind(metrics.unpriced_requests)
+    .bind(metrics.local_prompt_cache_requests)
+    .bind(metrics.simulated_requests)
+    .bind(metrics.upstream_metadata_requests)
+    .bind(metrics.sticky_bound_requests)
+    .bind(metrics.fallback_from_sticky_requests)
+    .bind(metrics.total_input_tokens)
+    .bind(metrics.billable_input_tokens)
+    .bind(metrics.total_output_tokens)
+    .bind(metrics.total_cache_read_input_tokens)
+    .bind(metrics.total_cache_creation_input_tokens)
+    .bind(metrics.local_prompt_cache_input_tokens)
+    .bind(metrics.local_prompt_cache_read_input_tokens)
+    .bind(metrics.local_prompt_cache_creation_input_tokens)
+    .bind(metrics.total_estimated_cost_usd)
+    .bind(metrics.external_pool_requests)
+    .bind(metrics.external_pool_priced_requests)
+    .bind(metrics.external_pool_unpriced_requests)
+    .bind(metrics.external_pool_cost_floor_applied_requests)
+    .bind(metrics.external_pool_raw_cost_usd)
+    .bind(metrics.external_pool_reported_cost_usd)
+    .bind(metrics.external_pool_billable_cost_usd)
+    .bind(metrics.external_pool_cost_floor_delta_usd)
+    .bind(metrics.duration_ms_sum)
+    .bind(metrics.duration_ms_count)
+    .bind(metrics.duration_ms_max)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn upsert_usage_cache_read_total(
+    tx: &mut Transaction<'_, Postgres>,
+    cache_read_input_tokens: i32,
+    direction: i64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO usage_cache_read_totals (cache_read_input_tokens, requests, updated_at)
+        VALUES ($1, $2, now())
+        ON CONFLICT (cache_read_input_tokens) DO UPDATE
+        SET requests = usage_cache_read_totals.requests + EXCLUDED.requests,
+            updated_at = now()
+        "#,
+    )
+    .bind(cache_read_input_tokens)
+    .bind(direction)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn upsert_usage_cache_read_time_bucket(
+    tx: &mut Transaction<'_, Postgres>,
+    bucket_start: DateTime<Utc>,
+    cache_read_input_tokens: i32,
+    direction: i64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO usage_cache_read_rollup_time_buckets (
+            bucket_start, cache_read_input_tokens, requests, updated_at
+        )
+        VALUES ($1, $2, $3, now())
+        ON CONFLICT (bucket_start, cache_read_input_tokens) DO UPDATE
+        SET requests = usage_cache_read_rollup_time_buckets.requests + EXCLUDED.requests,
+            updated_at = now()
+        "#,
+    )
+    .bind(bucket_start)
+    .bind(cache_read_input_tokens)
+    .bind(direction)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn upsert_usage_duration_time_bucket(
+    tx: &mut Transaction<'_, Postgres>,
+    bucket_start: DateTime<Utc>,
+    duration_ms: i32,
+    direction: i64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO usage_duration_rollup_time_buckets (
+            bucket_start, duration_ms, requests, updated_at
+        )
+        VALUES ($1, $2, $3, now())
+        ON CONFLICT (bucket_start, duration_ms) DO UPDATE
+        SET requests = usage_duration_rollup_time_buckets.requests + EXCLUDED.requests,
+            updated_at = now()
+        "#,
+    )
+    .bind(bucket_start)
+    .bind(duration_ms)
+    .bind(direction)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn upsert_credential_usage_summary(
+    tx: &mut Transaction<'_, Postgres>,
+    credential_id: u64,
+    record: &UsageRecord,
+    direction: i64,
+) -> anyhow::Result<()> {
+    let sign = if direction < 0 { -1 } else { 1 };
+    sqlx::query(
+        r#"
+        INSERT INTO usage_credential_cost_summary (
+            credential_id, requests, estimated_cost_usd, priced_requests,
+            unpriced_requests, updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, now())
+        ON CONFLICT (credential_id) DO UPDATE
+        SET requests = usage_credential_cost_summary.requests + EXCLUDED.requests,
+            estimated_cost_usd = usage_credential_cost_summary.estimated_cost_usd + EXCLUDED.estimated_cost_usd,
+            priced_requests = usage_credential_cost_summary.priced_requests + EXCLUDED.priced_requests,
+            unpriced_requests = usage_credential_cost_summary.unpriced_requests + EXCLUDED.unpriced_requests,
+            updated_at = now()
+        "#,
+    )
+    .bind(credential_id as i64)
+    .bind(sign)
+    .bind(record.estimated_cost_usd * sign as f64)
+    .bind(signed_bool(record.pricing_available, sign))
+    .bind(signed_bool(!record.pricing_available, sign))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn parse_usage_created_at(record: &UsageRecord) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(&record.created_at)
+        .map(|created_at| created_at.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now())
+}
+
+fn usage_rollup_bucket_start(created_at: DateTime<Utc>) -> DateTime<Utc> {
+    created_at
+        .with_nanosecond(0)
+        .expect("valid nanosecond truncation")
+}
+
+fn non_empty_or_unknown(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        "unknown".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn signed_bool(value: bool, sign: i64) -> i64 {
+    if value { sign } else { 0 }
+}
+
+fn signed_i32(value: i32, sign: i64) -> i64 {
+    value as i64 * sign
+}
+
+#[derive(Clone, Copy)]
 enum DashboardBreakdownColumn {
     Status,
     UsageSource,
 }
 
 impl DashboardBreakdownColumn {
-    fn sql_expr(self) -> &'static str {
+    fn rollup_dimension(self) -> &'static str {
         match self {
-            Self::Status => "r.status",
-            Self::UsageSource => "r.usage_source",
+            Self::Status => "status",
+            Self::UsageSource => "usage_source",
         }
     }
 
@@ -2701,27 +3399,17 @@ enum DashboardTopGroup {
 }
 
 impl DashboardTopGroup {
-    fn key_expr(self) -> &'static str {
+    fn rollup_dimension(self) -> &'static str {
         match self {
-            Self::Model => "COALESCE(NULLIF(r.model, ''), 'unknown')",
-            Self::Credential => "r.credential_id::text",
-            Self::Endpoint => "COALESCE(NULLIF(r.endpoint, ''), 'unknown')",
-            Self::Error => "COALESCE(NULLIF(r.error_type, ''), r.status, 'error')",
+            Self::Model => "model",
+            Self::Credential => "credential",
+            Self::Endpoint => "endpoint",
+            Self::Error => "error",
         }
     }
 
-    fn label_expr(self) -> &'static str {
+    fn rollup_extra_where(self) -> &'static str {
         match self {
-            Self::Credential => "MAX(NULLIF(r.credential_label, ''))",
-            Self::Error => "MAX(NULLIF(r.error_message, ''))",
-            _ => "NULL::text",
-        }
-    }
-
-    fn extra_where(self) -> &'static str {
-        match self {
-            Self::Credential => " AND r.credential_id IS NOT NULL",
-            Self::Error => " AND r.status <> 'success'",
             _ => "",
         }
     }
@@ -2876,6 +3564,19 @@ fn dashboard_window_from_row(row: PgRow) -> anyhow::Result<UsageDashboardWindow>
             fallback_from_sticky_requests: row_i64_to_usize(&row, "fallback_from_sticky_requests")?,
             simulated_requests: row_i64_to_usize(&row, "simulated_requests")?,
             upstream_metadata_requests: row_i64_to_usize(&row, "upstream_metadata_requests")?,
+            external_pool_billing: UsageExternalPoolBillingSummary {
+                requests: row_i64_to_usize(&row, "external_pool_requests")?,
+                priced_requests: row_i64_to_usize(&row, "external_pool_priced_requests")?,
+                unpriced_requests: row_i64_to_usize(&row, "external_pool_unpriced_requests")?,
+                cost_floor_applied_requests: row_i64_to_usize(
+                    &row,
+                    "external_pool_cost_floor_applied_requests",
+                )?,
+                raw_cost_usd: row.try_get("external_pool_raw_cost_usd")?,
+                reported_cost_usd: row.try_get("external_pool_reported_cost_usd")?,
+                billable_cost_usd: row.try_get("external_pool_billable_cost_usd")?,
+                cost_floor_delta_usd: row.try_get("external_pool_cost_floor_delta_usd")?,
+            },
             status_breakdown: Vec::new(),
             usage_source_breakdown: Vec::new(),
         },
@@ -3380,6 +4081,354 @@ CREATE INDEX IF NOT EXISTS idx_usage_records_status_created ON usage_records (st
 CREATE INDEX IF NOT EXISTS idx_usage_records_conversation ON usage_records (conversation_id) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_usage_records_deleted_at ON usage_records (deleted_at ASC, id ASC) WHERE deleted_at IS NOT NULL;
 
+CREATE TABLE IF NOT EXISTS usage_rollup_totals (
+    dimension TEXT NOT NULL,
+    dimension_key TEXT NOT NULL,
+    dimension_label TEXT,
+    requests BIGINT NOT NULL DEFAULT 0,
+    success_requests BIGINT NOT NULL DEFAULT 0,
+    error_requests BIGINT NOT NULL DEFAULT 0,
+    stream_requests BIGINT NOT NULL DEFAULT 0,
+    non_stream_requests BIGINT NOT NULL DEFAULT 0,
+    priced_requests BIGINT NOT NULL DEFAULT 0,
+    unpriced_requests BIGINT NOT NULL DEFAULT 0,
+    local_prompt_cache_requests BIGINT NOT NULL DEFAULT 0,
+    simulated_requests BIGINT NOT NULL DEFAULT 0,
+    upstream_metadata_requests BIGINT NOT NULL DEFAULT 0,
+    sticky_bound_requests BIGINT NOT NULL DEFAULT 0,
+    fallback_from_sticky_requests BIGINT NOT NULL DEFAULT 0,
+    total_input_tokens BIGINT NOT NULL DEFAULT 0,
+    billable_input_tokens BIGINT NOT NULL DEFAULT 0,
+    total_output_tokens BIGINT NOT NULL DEFAULT 0,
+    total_cache_read_input_tokens BIGINT NOT NULL DEFAULT 0,
+    total_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
+    local_prompt_cache_input_tokens BIGINT NOT NULL DEFAULT 0,
+    local_prompt_cache_read_input_tokens BIGINT NOT NULL DEFAULT 0,
+    local_prompt_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
+    total_estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    external_pool_requests BIGINT NOT NULL DEFAULT 0,
+    external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
+    external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
+    external_pool_cost_floor_applied_requests BIGINT NOT NULL DEFAULT 0,
+    external_pool_raw_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    external_pool_reported_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    external_pool_billable_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    external_pool_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    duration_ms_sum BIGINT NOT NULL DEFAULT 0,
+    duration_ms_count BIGINT NOT NULL DEFAULT 0,
+    duration_ms_max BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (dimension, dimension_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_rollup_totals_dimension_cost
+    ON usage_rollup_totals (dimension, total_estimated_cost_usd DESC, requests DESC);
+
+ALTER TABLE usage_rollup_totals
+    ADD COLUMN IF NOT EXISTS external_pool_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS external_pool_cost_floor_applied_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS external_pool_raw_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS external_pool_reported_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS external_pool_billable_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS external_pool_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS usage_rollup_time_buckets (
+    bucket_start TIMESTAMPTZ NOT NULL,
+    dimension TEXT NOT NULL,
+    dimension_key TEXT NOT NULL,
+    dimension_label TEXT,
+    requests BIGINT NOT NULL DEFAULT 0,
+    success_requests BIGINT NOT NULL DEFAULT 0,
+    error_requests BIGINT NOT NULL DEFAULT 0,
+    stream_requests BIGINT NOT NULL DEFAULT 0,
+    non_stream_requests BIGINT NOT NULL DEFAULT 0,
+    priced_requests BIGINT NOT NULL DEFAULT 0,
+    unpriced_requests BIGINT NOT NULL DEFAULT 0,
+    local_prompt_cache_requests BIGINT NOT NULL DEFAULT 0,
+    simulated_requests BIGINT NOT NULL DEFAULT 0,
+    upstream_metadata_requests BIGINT NOT NULL DEFAULT 0,
+    sticky_bound_requests BIGINT NOT NULL DEFAULT 0,
+    fallback_from_sticky_requests BIGINT NOT NULL DEFAULT 0,
+    total_input_tokens BIGINT NOT NULL DEFAULT 0,
+    billable_input_tokens BIGINT NOT NULL DEFAULT 0,
+    total_output_tokens BIGINT NOT NULL DEFAULT 0,
+    total_cache_read_input_tokens BIGINT NOT NULL DEFAULT 0,
+    total_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
+    local_prompt_cache_input_tokens BIGINT NOT NULL DEFAULT 0,
+    local_prompt_cache_read_input_tokens BIGINT NOT NULL DEFAULT 0,
+    local_prompt_cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
+    total_estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    external_pool_requests BIGINT NOT NULL DEFAULT 0,
+    external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
+    external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
+    external_pool_cost_floor_applied_requests BIGINT NOT NULL DEFAULT 0,
+    external_pool_raw_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    external_pool_reported_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    external_pool_billable_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    external_pool_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    duration_ms_sum BIGINT NOT NULL DEFAULT 0,
+    duration_ms_count BIGINT NOT NULL DEFAULT 0,
+    duration_ms_max BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (bucket_start, dimension, dimension_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_rollup_time_dimension_bucket
+    ON usage_rollup_time_buckets (dimension, bucket_start);
+
+CREATE INDEX IF NOT EXISTS idx_usage_rollup_time_dimension_key_bucket
+    ON usage_rollup_time_buckets (dimension, dimension_key, bucket_start);
+
+ALTER TABLE usage_rollup_time_buckets
+    ADD COLUMN IF NOT EXISTS external_pool_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS external_pool_priced_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS external_pool_cost_floor_applied_requests BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS external_pool_raw_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS external_pool_reported_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS external_pool_billable_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS external_pool_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS usage_cache_read_totals (
+    cache_read_input_tokens INTEGER NOT NULL PRIMARY KEY,
+    requests BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS usage_cache_read_rollup_time_buckets (
+    bucket_start TIMESTAMPTZ NOT NULL,
+    cache_read_input_tokens INTEGER NOT NULL,
+    requests BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (bucket_start, cache_read_input_tokens)
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_cache_read_rollup_time_bucket
+    ON usage_cache_read_rollup_time_buckets (bucket_start, cache_read_input_tokens);
+
+CREATE TABLE IF NOT EXISTS usage_duration_rollup_time_buckets (
+    bucket_start TIMESTAMPTZ NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    requests BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (bucket_start, duration_ms)
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_duration_rollup_time_bucket
+    ON usage_duration_rollup_time_buckets (bucket_start, duration_ms);
+
+CREATE TABLE IF NOT EXISTS usage_credential_cost_summary (
+    credential_id BIGINT NOT NULL PRIMARY KEY,
+    requests BIGINT NOT NULL DEFAULT 0,
+    estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    priced_requests BIGINT NOT NULL DEFAULT 0,
+    unpriced_requests BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_credential_cost_summary_cost
+    ON usage_credential_cost_summary (estimated_cost_usd DESC, requests DESC);
+
+INSERT INTO usage_rollup_totals (
+    dimension, dimension_key, dimension_label, requests, success_requests, error_requests,
+    stream_requests, non_stream_requests, priced_requests, unpriced_requests,
+    local_prompt_cache_requests, simulated_requests, upstream_metadata_requests,
+    sticky_bound_requests, fallback_from_sticky_requests, total_input_tokens,
+    billable_input_tokens, total_output_tokens, total_cache_read_input_tokens,
+    total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
+    local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
+    total_estimated_cost_usd, external_pool_requests, external_pool_priced_requests,
+    external_pool_unpriced_requests, external_pool_cost_floor_applied_requests,
+    external_pool_raw_cost_usd, external_pool_reported_cost_usd,
+    external_pool_billable_cost_usd, external_pool_cost_floor_delta_usd,
+    duration_ms_sum, duration_ms_count, duration_ms_max
+)
+SELECT
+    d.dimension,
+    d.dimension_key,
+    MAX(d.dimension_label),
+    COUNT(*)::bigint,
+    COUNT(*) FILTER (WHERE r.status = 'success')::bigint,
+    COUNT(*) FILTER (WHERE r.status <> 'success')::bigint,
+    COUNT(*) FILTER (WHERE r.stream)::bigint,
+    COUNT(*) FILTER (WHERE NOT r.stream)::bigint,
+    COUNT(*) FILTER (WHERE r.pricing_available)::bigint,
+    COUNT(*) FILTER (WHERE NOT r.pricing_available)::bigint,
+    COUNT(*) FILTER (WHERE r.usage_source = 'local_prompt_cache')::bigint,
+    COUNT(*) FILTER (WHERE r.simulated)::bigint,
+    COUNT(*) FILTER (WHERE r.usage_source = 'upstream_metadata')::bigint,
+    COUNT(*) FILTER (WHERE r.sticky_bound)::bigint,
+    COUNT(*) FILTER (WHERE r.fallback_from_sticky)::bigint,
+    COALESCE(SUM(r.total_input_tokens), 0)::bigint,
+    COALESCE(SUM(r.billable_input_tokens), 0)::bigint,
+    COALESCE(SUM(r.output_tokens), 0)::bigint,
+    COALESCE(SUM(r.cache_read_input_tokens), 0)::bigint,
+    COALESCE(SUM(r.cache_creation_input_tokens), 0)::bigint,
+    COALESCE(SUM(r.total_input_tokens) FILTER (WHERE r.usage_source = 'local_prompt_cache'), 0)::bigint,
+    COALESCE(SUM(r.cache_read_input_tokens) FILTER (WHERE r.usage_source = 'local_prompt_cache'), 0)::bigint,
+    COALESCE(SUM(r.cache_creation_input_tokens) FILTER (WHERE r.usage_source = 'local_prompt_cache'), 0)::bigint,
+    COALESCE(SUM(r.estimated_cost_usd), 0)::double precision,
+    COUNT(*) FILTER (WHERE r.data->>'routeKind' = 'external_pool')::bigint,
+    COUNT(*) FILTER (
+        WHERE r.data->>'routeKind' = 'external_pool'
+          AND r.data #>> '{externalPoolBilling,pricingAvailable}' = 'true'
+    )::bigint,
+    COUNT(*) FILTER (
+        WHERE r.data->>'routeKind' = 'external_pool'
+          AND COALESCE(r.data #>> '{externalPoolBilling,pricingAvailable}', 'false') <> 'true'
+    )::bigint,
+    COUNT(*) FILTER (
+        WHERE r.data->>'routeKind' = 'external_pool'
+          AND r.data #>> '{externalPoolBilling,costFloorApplied}' = 'true'
+    )::bigint,
+    COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,rawCostUsd}', '')::double precision), 0)::double precision,
+    COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,reportedCostUsd}', '')::double precision), 0)::double precision,
+    COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,billableCostUsd}', '')::double precision), 0)::double precision,
+    COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,costFloorDeltaUsd}', '')::double precision), 0)::double precision,
+    COALESCE(SUM(r.duration_ms), 0)::bigint,
+    COUNT(*)::bigint,
+    COALESCE(MAX(r.duration_ms), 0)::bigint
+FROM usage_records r
+CROSS JOIN LATERAL (
+    VALUES
+        ('global', 'all', NULL::text),
+        ('status', r.status, NULL::text),
+        ('usage_source', r.usage_source, NULL::text),
+        ('model', COALESCE(NULLIF(r.model, ''), 'unknown'), NULL::text),
+        ('endpoint', COALESCE(NULLIF(r.endpoint, ''), 'unknown'), NULL::text),
+        ('credential', r.credential_id::text, NULLIF(r.credential_label, '')),
+        ('external_pool', r.data->>'externalPoolId', NULLIF(r.data->>'externalPoolName', '')),
+        ('conversation', r.conversation_id, NULL::text),
+        ('error',
+            CASE WHEN r.status <> 'success'
+                 THEN COALESCE(NULLIF(r.error_type, ''), r.status, 'error')
+            END,
+            CASE WHEN r.status <> 'success' THEN NULLIF(r.error_message, '') END)
+) AS d(dimension, dimension_key, dimension_label)
+WHERE r.deleted_at IS NULL
+  AND d.dimension_key IS NOT NULL
+GROUP BY d.dimension, d.dimension_key
+ON CONFLICT (dimension, dimension_key) DO NOTHING;
+
+INSERT INTO usage_rollup_time_buckets (
+    bucket_start, dimension, dimension_key, dimension_label, requests, success_requests,
+    error_requests, stream_requests, non_stream_requests, priced_requests, unpriced_requests,
+    local_prompt_cache_requests, simulated_requests, upstream_metadata_requests,
+    sticky_bound_requests, fallback_from_sticky_requests, total_input_tokens,
+    billable_input_tokens, total_output_tokens, total_cache_read_input_tokens,
+    total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
+    local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
+    total_estimated_cost_usd, external_pool_requests, external_pool_priced_requests,
+    external_pool_unpriced_requests, external_pool_cost_floor_applied_requests,
+    external_pool_raw_cost_usd, external_pool_reported_cost_usd,
+    external_pool_billable_cost_usd, external_pool_cost_floor_delta_usd,
+    duration_ms_sum, duration_ms_count, duration_ms_max
+)
+SELECT
+    date_trunc('second', r.created_at) AS bucket_start,
+    d.dimension,
+    d.dimension_key,
+    MAX(d.dimension_label),
+    COUNT(*)::bigint,
+    COUNT(*) FILTER (WHERE r.status = 'success')::bigint,
+    COUNT(*) FILTER (WHERE r.status <> 'success')::bigint,
+    COUNT(*) FILTER (WHERE r.stream)::bigint,
+    COUNT(*) FILTER (WHERE NOT r.stream)::bigint,
+    COUNT(*) FILTER (WHERE r.pricing_available)::bigint,
+    COUNT(*) FILTER (WHERE NOT r.pricing_available)::bigint,
+    COUNT(*) FILTER (WHERE r.usage_source = 'local_prompt_cache')::bigint,
+    COUNT(*) FILTER (WHERE r.simulated)::bigint,
+    COUNT(*) FILTER (WHERE r.usage_source = 'upstream_metadata')::bigint,
+    COUNT(*) FILTER (WHERE r.sticky_bound)::bigint,
+    COUNT(*) FILTER (WHERE r.fallback_from_sticky)::bigint,
+    COALESCE(SUM(r.total_input_tokens), 0)::bigint,
+    COALESCE(SUM(r.billable_input_tokens), 0)::bigint,
+    COALESCE(SUM(r.output_tokens), 0)::bigint,
+    COALESCE(SUM(r.cache_read_input_tokens), 0)::bigint,
+    COALESCE(SUM(r.cache_creation_input_tokens), 0)::bigint,
+    COALESCE(SUM(r.total_input_tokens) FILTER (WHERE r.usage_source = 'local_prompt_cache'), 0)::bigint,
+    COALESCE(SUM(r.cache_read_input_tokens) FILTER (WHERE r.usage_source = 'local_prompt_cache'), 0)::bigint,
+    COALESCE(SUM(r.cache_creation_input_tokens) FILTER (WHERE r.usage_source = 'local_prompt_cache'), 0)::bigint,
+    COALESCE(SUM(r.estimated_cost_usd), 0)::double precision,
+    COUNT(*) FILTER (WHERE r.data->>'routeKind' = 'external_pool')::bigint,
+    COUNT(*) FILTER (
+        WHERE r.data->>'routeKind' = 'external_pool'
+          AND r.data #>> '{externalPoolBilling,pricingAvailable}' = 'true'
+    )::bigint,
+    COUNT(*) FILTER (
+        WHERE r.data->>'routeKind' = 'external_pool'
+          AND COALESCE(r.data #>> '{externalPoolBilling,pricingAvailable}', 'false') <> 'true'
+    )::bigint,
+    COUNT(*) FILTER (
+        WHERE r.data->>'routeKind' = 'external_pool'
+          AND r.data #>> '{externalPoolBilling,costFloorApplied}' = 'true'
+    )::bigint,
+    COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,rawCostUsd}', '')::double precision), 0)::double precision,
+    COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,reportedCostUsd}', '')::double precision), 0)::double precision,
+    COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,billableCostUsd}', '')::double precision), 0)::double precision,
+    COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,costFloorDeltaUsd}', '')::double precision), 0)::double precision,
+    COALESCE(SUM(r.duration_ms), 0)::bigint,
+    COUNT(*)::bigint,
+    COALESCE(MAX(r.duration_ms), 0)::bigint
+FROM usage_records r
+CROSS JOIN LATERAL (
+    VALUES
+        ('global', 'all', NULL::text),
+        ('status', r.status, NULL::text),
+        ('usage_source', r.usage_source, NULL::text),
+        ('model', COALESCE(NULLIF(r.model, ''), 'unknown'), NULL::text),
+        ('endpoint', COALESCE(NULLIF(r.endpoint, ''), 'unknown'), NULL::text),
+        ('credential', r.credential_id::text, NULLIF(r.credential_label, '')),
+        ('external_pool', r.data->>'externalPoolId', NULLIF(r.data->>'externalPoolName', '')),
+        ('error',
+            CASE WHEN r.status <> 'success'
+                 THEN COALESCE(NULLIF(r.error_type, ''), r.status, 'error')
+            END,
+            CASE WHEN r.status <> 'success' THEN NULLIF(r.error_message, '') END)
+) AS d(dimension, dimension_key, dimension_label)
+WHERE r.deleted_at IS NULL
+  AND d.dimension_key IS NOT NULL
+GROUP BY date_trunc('second', r.created_at), d.dimension, d.dimension_key
+ON CONFLICT (bucket_start, dimension, dimension_key) DO NOTHING;
+
+INSERT INTO usage_cache_read_totals (cache_read_input_tokens, requests)
+SELECT GREATEST(cache_read_input_tokens, 0), COUNT(*)::bigint
+FROM usage_records
+WHERE deleted_at IS NULL
+GROUP BY GREATEST(cache_read_input_tokens, 0)
+ON CONFLICT (cache_read_input_tokens) DO NOTHING;
+
+INSERT INTO usage_cache_read_rollup_time_buckets (bucket_start, cache_read_input_tokens, requests)
+SELECT date_trunc('second', created_at), GREATEST(cache_read_input_tokens, 0), COUNT(*)::bigint
+FROM usage_records
+WHERE deleted_at IS NULL
+GROUP BY date_trunc('second', created_at), GREATEST(cache_read_input_tokens, 0)
+ON CONFLICT (bucket_start, cache_read_input_tokens) DO NOTHING;
+
+INSERT INTO usage_duration_rollup_time_buckets (bucket_start, duration_ms, requests)
+SELECT date_trunc('second', created_at), LEAST(GREATEST(duration_ms, 0), 2147483647)::integer, COUNT(*)::bigint
+FROM usage_records
+WHERE deleted_at IS NULL
+GROUP BY date_trunc('second', created_at), LEAST(GREATEST(duration_ms, 0), 2147483647)::integer
+ON CONFLICT (bucket_start, duration_ms) DO NOTHING;
+
+INSERT INTO usage_credential_cost_summary (
+    credential_id, requests, estimated_cost_usd, priced_requests, unpriced_requests
+)
+SELECT
+    credential_id,
+    COUNT(*)::bigint,
+    COALESCE(SUM(estimated_cost_usd), 0)::double precision,
+    COUNT(*) FILTER (WHERE pricing_available)::bigint,
+    COUNT(*) FILTER (WHERE NOT pricing_available)::bigint
+FROM usage_records
+WHERE credential_id IS NOT NULL
+  AND deleted_at IS NULL
+GROUP BY credential_id
+ON CONFLICT (credential_id) DO NOTHING;
+
 CREATE TABLE IF NOT EXISTS model_pricing (
     model TEXT PRIMARY KEY,
     input_cost_per_token DOUBLE PRECISION NOT NULL,
@@ -3465,7 +4514,10 @@ mod tests {
 
     use super::*;
     use crate::anthropic::pricing::{ModelPriceItem, ModelPricing};
-    use crate::anthropic::usage::{UsageRecordStatus, UsageSource};
+    use crate::anthropic::usage::{
+        ExternalPoolBilling, ExternalPoolUsageSnapshot, UsageRecordStatus, UsageRouteKind,
+        UsageRouteSubtype, UsageSource,
+    };
     use crate::model::config::{ReportedUsageFieldPolicy, ReportedUsagePathPolicy};
 
     fn test_config() -> Option<Config> {
@@ -3480,6 +4532,12 @@ mod tests {
         for statement in [
             "TRUNCATE TABLE admin_audit_logs",
             "TRUNCATE TABLE credential_events",
+            "TRUNCATE TABLE usage_credential_cost_summary",
+            "TRUNCATE TABLE usage_duration_rollup_time_buckets",
+            "TRUNCATE TABLE usage_cache_read_rollup_time_buckets",
+            "TRUNCATE TABLE usage_cache_read_totals",
+            "TRUNCATE TABLE usage_rollup_time_buckets",
+            "TRUNCATE TABLE usage_rollup_totals",
             "TRUNCATE TABLE usage_records",
             "TRUNCATE TABLE model_pricing_sync_status",
             "TRUNCATE TABLE model_pricing",
@@ -3533,6 +4591,101 @@ mod tests {
             external_pool_name: None,
             external_attempts: Vec::new(),
             usage_projection_applied: None,
+            external_pool_billing: None,
+            credential_attempts: Vec::new(),
+            error_type: None,
+            error_message: None,
+            error_detail: None,
+            payload_breakdown: None,
+            payload_guard_report: None,
+        }
+    }
+
+    fn external_usage_snapshot(
+        input_tokens: i32,
+        output_tokens: i32,
+        cache_read_input_tokens: i32,
+        cache_creation_input_tokens: i32,
+    ) -> ExternalPoolUsageSnapshot {
+        ExternalPoolUsageSnapshot {
+            total_input_tokens: input_tokens
+                .saturating_add(cache_read_input_tokens)
+                .saturating_add(cache_creation_input_tokens),
+            input_tokens,
+            billable_input_tokens: input_tokens.saturating_add(cache_creation_input_tokens),
+            output_tokens,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+            cache_creation_5m_input_tokens: cache_creation_input_tokens,
+            cache_creation_1h_input_tokens: 0,
+        }
+    }
+
+    fn external_usage_record(
+        id: &str,
+        raw_cost_usd: f64,
+        reported_cost_usd: f64,
+        floor_applied: bool,
+    ) -> UsageRecord {
+        let raw_usage = external_usage_snapshot(10_000, 100, 0, 2_000);
+        let reported_usage = if floor_applied {
+            external_usage_snapshot(200, 100, 9_800, 2_000)
+        } else {
+            external_usage_snapshot(12_000, 100, 0, 0)
+        };
+        let billable_cost_usd = raw_cost_usd.max(reported_cost_usd);
+        let cost_floor_delta_usd = (billable_cost_usd - reported_cost_usd).max(0.0);
+        UsageRecord {
+            id: id.to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            endpoint: "/cc/v1/messages".to_string(),
+            stream: id.ends_with('0'),
+            model: "claude-sonnet-4-5".to_string(),
+            upstream_model: Some("claude-sonnet-4-5".to_string()),
+            model_resolution_source: Some("exact".to_string()),
+            model_resolution_note: None,
+            conversation_id: Some(format!("external-session-{}", id)),
+            credential_id: None,
+            credential_label: None,
+            status: UsageRecordStatus::Success,
+            usage_source: UsageSource::UpstreamMetadata,
+            total_input_tokens: reported_usage.total_input_tokens,
+            compat_input_tokens: reported_usage.input_tokens,
+            billable_input_tokens: reported_usage.billable_input_tokens,
+            output_tokens: reported_usage.output_tokens,
+            cache_read_input_tokens: reported_usage.cache_read_input_tokens,
+            cache_creation_input_tokens: reported_usage.cache_creation_input_tokens,
+            cache_creation_5m_input_tokens: reported_usage.cache_creation_5m_input_tokens,
+            cache_creation_1h_input_tokens: reported_usage.cache_creation_1h_input_tokens,
+            estimated_cost_usd: billable_cost_usd,
+            pricing_available: true,
+            pricing_model: Some("claude-sonnet-4-5".to_string()),
+            duration_ms: 50,
+            simulated: false,
+            sticky_bound: false,
+            fallback_from_sticky: false,
+            route_kind: Some(UsageRouteKind::ExternalPool),
+            route_subtype: Some(UsageRouteSubtype::ExternalFallbackAfterLocalAttempts),
+            fallback_reason: Some("local_transient_exhausted".to_string()),
+            direct_policy_reason: None,
+            local_attempted: Some(true),
+            local_preflight: None,
+            external_pool_id: Some(42),
+            external_pool_name: Some("backup-a".to_string()),
+            external_attempts: Vec::new(),
+            usage_projection_applied: Some(true),
+            external_pool_billing: Some(ExternalPoolBilling {
+                raw_usage,
+                reported_usage,
+                raw_cost_usd,
+                reported_cost_usd,
+                billable_cost_usd,
+                cost_floor_delta_usd,
+                cost_floor_applied: floor_applied,
+                pricing_available: true,
+                pricing_model: Some("claude-sonnet-4-5".to_string()),
+                usage_projection_mode: "current_path_policy".to_string(),
+            }),
             credential_attempts: Vec::new(),
             error_type: None,
             error_message: None,
@@ -3794,7 +4947,16 @@ mod tests {
 
         usage_store.clear().await.unwrap();
         let cleared_summary = usage_store.summary(15).await.unwrap();
-        assert_eq!(cleared_summary.total_requests, 0);
+        assert_eq!(cleared_summary.total_requests, 2);
+        assert_eq!(cleared_summary.success_requests, 1);
+        assert_eq!(cleared_summary.error_requests, 1);
+        let cleared_page = usage_store
+            .query(UsageRecordQuery {
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(cleared_page.total, 0);
         let soft_deleted_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM usage_records WHERE deleted_at IS NOT NULL")
                 .fetch_one(store.pool())
@@ -3813,6 +4975,9 @@ mod tests {
             .unwrap();
         assert_eq!(restored.total, 1);
         assert_eq!(restored.records[0].id, "usage-1");
+        let restored_summary = usage_store.summary(15).await.unwrap();
+        assert_eq!(restored_summary.total_requests, 2);
+        assert_eq!(restored_summary.high_cache_requests, 2);
 
         let status = PricingStatus {
             available: true,
@@ -4028,6 +5193,83 @@ mod tests {
             .await
             .unwrap_err();
         assert!(duplicate.to_string().contains("kiroApiKey 重复"));
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_rolls_up_external_pool_billing_for_large_samples_and_keeps_after_cleanup() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(Arc::new(store.clone()));
+
+        for index in 0..1000 {
+            let floor_applied = index % 2 == 0;
+            let (raw_cost, reported_cost) = if floor_applied {
+                (0.010, 0.006)
+            } else {
+                (0.005, 0.007)
+            };
+            usage_store
+                .record(external_usage_record(
+                    &format!("external-usage-{index:04}"),
+                    raw_cost,
+                    reported_cost,
+                    floor_applied,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let summary = usage_store.summary(1_000).await.unwrap();
+        assert_eq!(summary.external_pool_billing.requests, 1000);
+        assert_eq!(summary.external_pool_billing.priced_requests, 1000);
+        assert_eq!(summary.external_pool_billing.unpriced_requests, 0);
+        assert_eq!(
+            summary.external_pool_billing.cost_floor_applied_requests,
+            500
+        );
+        assert!((summary.external_pool_billing.raw_cost_usd - 7.5).abs() < 0.000001);
+        assert!((summary.external_pool_billing.reported_cost_usd - 6.5).abs() < 0.000001);
+        assert!((summary.external_pool_billing.billable_cost_usd - 8.5).abs() < 0.000001);
+        assert!((summary.external_pool_billing.cost_floor_delta_usd - 2.0).abs() < 0.000001);
+        assert!((summary.total_estimated_cost_usd - 8.5).abs() < 0.000001);
+
+        let dashboard = usage_store
+            .dashboard(Some("Asia/Shanghai"), 1_000)
+            .await
+            .unwrap();
+        let today = dashboard
+            .windows
+            .iter()
+            .find(|window| window.key == "today")
+            .unwrap();
+        assert_eq!(today.summary.external_pool_billing.requests, 1000);
+        assert_eq!(
+            today
+                .summary
+                .external_pool_billing
+                .cost_floor_applied_requests,
+            500
+        );
+        assert!((today.summary.external_pool_billing.billable_cost_usd - 8.5).abs() < 0.000001);
+
+        usage_store.clear().await.unwrap();
+        let cleared_page = usage_store
+            .query(UsageRecordQuery {
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(cleared_page.total, 0);
+        let cleared_summary = usage_store.summary(1_000).await.unwrap();
+        assert_eq!(cleared_summary.external_pool_billing.requests, 1000);
+        assert!((cleared_summary.external_pool_billing.billable_cost_usd - 8.5).abs() < 0.000001);
 
         store.drop_test_schema().await.unwrap();
     }
