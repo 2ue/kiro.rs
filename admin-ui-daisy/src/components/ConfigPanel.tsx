@@ -7,10 +7,12 @@ import {
   defaultModelMappingConfig,
   defaultPayloadShaping,
   defaultExternalPoolsConfig,
+  defaultPromptCacheCreationControl,
   emptyRuntimeConfig,
   fieldNeedsMax,
   fieldNeedsTarget,
   normalizePayloadShaping,
+  normalizePromptCacheCreationControl,
   normalizeReportedUsage,
   pathPolicy,
   reportedUsageModeDescription,
@@ -738,6 +740,10 @@ export function ConfigPanel() {
           ...defaultExternalPoolsConfig(),
           ...config.data.externalPools,
         },
+        promptCacheCreationControl: {
+          ...defaultPromptCacheCreationControl(),
+          ...config.data.promptCacheCreationControl,
+        },
         modelMapping: normalizeModelMapping(config.data.modelMapping),
       })
     }
@@ -784,6 +790,7 @@ export function ConfigPanel() {
       promptCacheCapJitterMinTokens: toWhole(draft.promptCacheCapJitterMinTokens),
       promptCacheCapJitterMaxTokens: toWhole(draft.promptCacheCapJitterMaxTokens),
       promptCacheScaleMinInputTokens: toWhole(draft.promptCacheScaleMinInputTokens),
+      promptCacheCreationControl: normalizePromptCacheCreationControl(draft.promptCacheCreationControl),
       reportedUsage: normalizeReportedUsage(draft.reportedUsage),
       modelMapping: normalizeModelMapping(draft.modelMapping),
       externalPools: {
@@ -981,14 +988,33 @@ export function ConfigPanel() {
         )}
 
         {activeTab === 'cache' && (
-          <ConfigGroup icon={<Zap className="h-4 w-4" />} title="高缓存模拟" description="控制 /v1/messages 和 /cc/v1/messages 的本地高缓存 usage 模拟。只影响下游看到的统计和后台记录，不影响 count_tokens 计算接口。">
-            <NumberField title="缓存读取目标比例" description="cache_read_input_tokens 大致占输入的目标比例。常用值 0.95 到 0.99。" value={draft.promptCacheTargetReadRatio} min={0} max={0.99} step={0.01} suffix="比例" onChange={(promptCacheTargetReadRatio) => setDraft((prev) => ({ ...prev, promptCacheTargetReadRatio }))} />
-            <NumberField title="高缓存输入放大倍数" description="控制高缓存模拟时 total input 的放大程度。只影响缓存计算，不代表 input 上报一定放大。" value={draft.promptCacheTokenScale} min={1} max={3} step={0.1} suffix="倍" onChange={(promptCacheTokenScale) => setDraft((prev) => ({ ...prev, promptCacheTokenScale }))} />
-            <NumberField title="模拟输入上限" description="高缓存模拟后 total input 的最高值。填 0 表示不设置上限。" value={draft.promptCacheMaxSimulatedInputTokens} min={0} suffix="tokens" onChange={(promptCacheMaxSimulatedInputTokens) => setDraft((prev) => ({ ...prev, promptCacheMaxSimulatedInputTokens }))} />
-            <NumberField title="放大启用门槛" description="基础输入达到多少 tokens 后才启用输入放大。" value={draft.promptCacheScaleMinInputTokens} min={0} suffix="tokens" onChange={(promptCacheScaleMinInputTokens) => setDraft((prev) => ({ ...prev, promptCacheScaleMinInputTokens }))} />
-            <NumberField title="触顶扣减下限" description="模拟输入达到上限时，最少从上限扣掉多少 tokens。" value={draft.promptCacheCapJitterMinTokens} min={0} suffix="tokens" onChange={(promptCacheCapJitterMinTokens) => setDraft((prev) => ({ ...prev, promptCacheCapJitterMinTokens }))} />
-            <NumberField title="触顶扣减上限" description="模拟输入达到上限时，最多从上限扣掉多少 tokens。" value={draft.promptCacheCapJitterMaxTokens} min={0} suffix="tokens" onChange={(promptCacheCapJitterMaxTokens) => setDraft((prev) => ({ ...prev, promptCacheCapJitterMaxTokens }))} />
-          </ConfigGroup>
+          <>
+            <ConfigGroup icon={<Zap className="h-4 w-4" />} title="高缓存模拟" description="控制 /v1/messages 和 /cc/v1/messages 的本地高缓存 usage 模拟。只影响下游看到的统计和后台记录，不影响 count_tokens 计算接口。">
+              <NumberField title="缓存读取目标比例" description="cache_read_input_tokens 大致占输入的目标比例。常用值 0.95 到 0.99。" value={draft.promptCacheTargetReadRatio} min={0} max={0.99} step={0.01} suffix="比例" onChange={(promptCacheTargetReadRatio) => setDraft((prev) => ({ ...prev, promptCacheTargetReadRatio }))} />
+              <NumberField title="高缓存输入放大倍数" description="控制高缓存模拟时 total input 的放大程度。只影响缓存计算，不代表 input 上报一定放大。" value={draft.promptCacheTokenScale} min={1} max={3} step={0.1} suffix="倍" onChange={(promptCacheTokenScale) => setDraft((prev) => ({ ...prev, promptCacheTokenScale }))} />
+              <NumberField title="模拟输入上限" description="高缓存模拟后 total input 的最高值。填 0 表示不设置上限。" value={draft.promptCacheMaxSimulatedInputTokens} min={0} suffix="tokens" onChange={(promptCacheMaxSimulatedInputTokens) => setDraft((prev) => ({ ...prev, promptCacheMaxSimulatedInputTokens }))} />
+              <NumberField title="放大启用门槛" description="基础输入达到多少 tokens 后才启用输入放大。" value={draft.promptCacheScaleMinInputTokens} min={0} suffix="tokens" onChange={(promptCacheScaleMinInputTokens) => setDraft((prev) => ({ ...prev, promptCacheScaleMinInputTokens }))} />
+              <NumberField title="触顶扣减下限" description="模拟输入达到上限时，最少从上限扣掉多少 tokens。" value={draft.promptCacheCapJitterMinTokens} min={0} suffix="tokens" onChange={(promptCacheCapJitterMinTokens) => setDraft((prev) => ({ ...prev, promptCacheCapJitterMinTokens }))} />
+              <NumberField title="触顶扣减上限" description="模拟输入达到上限时，最多从上限扣掉多少 tokens。" value={draft.promptCacheCapJitterMaxTokens} min={0} suffix="tokens" onChange={(promptCacheCapJitterMaxTokens) => setDraft((prev) => ({ ...prev, promptCacheCapJitterMaxTokens }))} />
+            </ConfigGroup>
+
+            <ConfigGroup icon={<Gauge className="h-4 w-4" />} title="缓存创建频次控制" description="只限制最终上报的 cache_creation_input_tokens 出现频次；不改变本地缓存命中计算、上游请求或 cache read 字段策略。">
+              <ToggleField title="启用缓存创建频次控制" description="关闭时完全保持旧行为。开启后仅对本地 high-cache 模拟 usage 生效，真实上游 metadata 不受影响。" checked={draft.promptCacheCreationControl.enabled} onChange={(enabled) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, enabled } }))} />
+              <FieldLabel title="控制维度" description="凭据 + 会话 + 模型最贴近真实账号缓存隔离；会话 + 模型会跨凭据共享频次状态，适合减少调度换号后的重复 creation 上报。">
+                <Select bordered size="sm" className="w-full" value={draft.promptCacheCreationControl.scopeMode} disabled={!draft.promptCacheCreationControl.enabled} onChange={(event) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, scopeMode: event.target.value as 'credential_conversation_model' | 'conversation_model' } }))}>
+                  <Select.Option value="credential_conversation_model">凭据 + 会话 + 模型</Select.Option>
+                  <Select.Option value="conversation_model">会话 + 模型</Select.Option>
+                </Select>
+              </FieldLabel>
+              <NumberField title="最小成功请求间隔" description="同一控制维度下，两次 cache creation 之间至少间隔多少次成功请求。填 0 表示不按请求次数限制。" value={draft.promptCacheCreationControl.minSuccessfulRequestsBetweenCreation} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="次" onChange={(minSuccessfulRequestsBetweenCreation) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, minSuccessfulRequestsBetweenCreation } }))} />
+              <NumberField title="最小时间间隔" description="同一控制维度下，两次 cache creation 之间至少间隔多少秒。填 0 表示不按时间限制。" value={draft.promptCacheCreationControl.minCreationIntervalSecs} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="秒" onChange={(minCreationIntervalSecs) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, minCreationIntervalSecs } }))} />
+              <NumberField title="最小累计增量" description="被抑制的 creation 累计到多少 tokens 后才允许下一次创建上报。填 0 表示不按增量限制。" value={draft.promptCacheCreationControl.minCreationDeltaTokens} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="tokens" onChange={(minCreationDeltaTokens) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, minCreationDeltaTokens } }))} />
+              <NumberField title="单次创建上限" description="一次响应最多上报多少 cache creation tokens。超出部分会回到 input_tokens，填 0 表示不限制。" value={draft.promptCacheCreationControl.maxCreationTokensPerEvent} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="tokens" onChange={(maxCreationTokensPerEvent) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, maxCreationTokensPerEvent } }))} />
+              <NumberField title="额度窗口长度" description="在这个时间窗口内累计控制 cache creation 额度。填 0 表示关闭窗口额度控制。" value={draft.promptCacheCreationControl.creationBudgetWindowSecs} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="秒" onChange={(creationBudgetWindowSecs) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, creationBudgetWindowSecs } }))} />
+              <NumberField title="窗口创建额度" description="单个额度窗口内最多允许上报多少 cache creation tokens。填 0 表示不限制。" value={draft.promptCacheCreationControl.maxCreationTokensPerWindow} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="tokens" onChange={(maxCreationTokensPerWindow) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, maxCreationTokensPerWindow } }))} />
+              <NumberField title="状态空闲过期" description="同一控制维度长时间没有请求后清理控制器状态。填 0 表示不按空闲时间清理。" value={draft.promptCacheCreationControl.expireAfterIdleSecs} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="秒" onChange={(expireAfterIdleSecs) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, expireAfterIdleSecs } }))} />
+            </ConfigGroup>
+          </>
         )}
 
         {activeTab === 'usage' && (

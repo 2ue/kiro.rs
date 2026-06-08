@@ -492,6 +492,126 @@ impl ReportedUsageConfig {
     }
 }
 
+/// 本地 prompt-cache creation 上报频次控制的状态维度。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheCreationControlScopeMode {
+    /// 同一凭据、会话、模型独立控制，默认值，最贴近真实账号缓存隔离。
+    CredentialConversationModel,
+    /// 同一会话、模型共享控制，跨凭据调度时也会降低重复 creation 上报频次。
+    ConversationModel,
+}
+
+impl Default for PromptCacheCreationControlScopeMode {
+    fn default() -> Self {
+        Self::CredentialConversationModel
+    }
+}
+
+/// 本地 prompt-cache creation 上报频次控制。
+///
+/// 该配置不改变 `PromptCacheTracker` 的缓存命中/创建计算，只在最终 usage
+/// 上报前限制 `cache_creation_input_tokens` 出现频次。被抑制的 creation
+/// 默认回到 `input_tokens`，避免只因为隐藏 creation 就降低总输入口径。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptCacheCreationControlConfig {
+    /// 总开关。默认关闭，保证升级后行为不变。
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// 状态维度。默认按凭据/会话/模型隔离，也可按会话/模型跨凭据共享。
+    #[serde(default)]
+    pub scope_mode: PromptCacheCreationControlScopeMode,
+
+    /// 同一控制维度下，两次 creation 之间至少间隔多少次成功请求。
+    #[serde(default = "default_prompt_cache_creation_min_successes_between")]
+    pub min_successful_requests_between_creation: u32,
+
+    /// 同一控制维度下，两次 creation 之间至少间隔多少秒。0 表示不限制。
+    #[serde(default = "default_prompt_cache_creation_min_interval_secs")]
+    pub min_creation_interval_secs: u64,
+
+    /// 被抑制的 creation 累计到多少 tokens 后才允许下一次 creation。0 表示不限制。
+    #[serde(default = "default_prompt_cache_creation_min_delta_tokens")]
+    pub min_creation_delta_tokens: i32,
+
+    /// 单次最多允许上报多少 creation tokens。0 表示不限制。
+    #[serde(default = "default_prompt_cache_creation_max_tokens_per_event")]
+    pub max_creation_tokens_per_event: i32,
+
+    /// creation 额度窗口长度。0 表示关闭窗口额度控制。
+    #[serde(default = "default_prompt_cache_creation_budget_window_secs")]
+    pub creation_budget_window_secs: u64,
+
+    /// 单个额度窗口内最多允许上报多少 creation tokens。0 表示不限制。
+    #[serde(default = "default_prompt_cache_creation_max_tokens_per_window")]
+    pub max_creation_tokens_per_window: i32,
+
+    /// 控制器状态空闲多久后过期。0 表示不按空闲时间清理。
+    #[serde(default = "default_prompt_cache_creation_expire_after_idle_secs")]
+    pub expire_after_idle_secs: u64,
+}
+
+impl Default for PromptCacheCreationControlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            scope_mode: PromptCacheCreationControlScopeMode::default(),
+            min_successful_requests_between_creation:
+                default_prompt_cache_creation_min_successes_between(),
+            min_creation_interval_secs: default_prompt_cache_creation_min_interval_secs(),
+            min_creation_delta_tokens: default_prompt_cache_creation_min_delta_tokens(),
+            max_creation_tokens_per_event: default_prompt_cache_creation_max_tokens_per_event(),
+            creation_budget_window_secs: default_prompt_cache_creation_budget_window_secs(),
+            max_creation_tokens_per_window: default_prompt_cache_creation_max_tokens_per_window(),
+            expire_after_idle_secs: default_prompt_cache_creation_expire_after_idle_secs(),
+        }
+    }
+}
+
+impl PromptCacheCreationControlConfig {
+    pub fn normalized(self) -> Self {
+        Self {
+            enabled: self.enabled,
+            scope_mode: self.scope_mode,
+            min_successful_requests_between_creation: self.min_successful_requests_between_creation,
+            min_creation_interval_secs: self.min_creation_interval_secs,
+            min_creation_delta_tokens: self.min_creation_delta_tokens.max(0),
+            max_creation_tokens_per_event: self.max_creation_tokens_per_event.max(0),
+            creation_budget_window_secs: self.creation_budget_window_secs,
+            max_creation_tokens_per_window: self.max_creation_tokens_per_window.max(0),
+            expire_after_idle_secs: self.expire_after_idle_secs,
+        }
+    }
+
+    pub fn validate(self) -> Result<(), String> {
+        let config = self.normalized();
+        if config.min_successful_requests_between_creation > 10_000 {
+            return Err(
+                "promptCacheCreationControl.minSuccessfulRequestsBetweenCreation 不能大于 10000"
+                    .to_string(),
+            );
+        }
+        if config.min_creation_interval_secs > 7 * 24 * 60 * 60 {
+            return Err(
+                "promptCacheCreationControl.minCreationIntervalSecs 不能大于 604800".to_string(),
+            );
+        }
+        if config.creation_budget_window_secs > 7 * 24 * 60 * 60 {
+            return Err(
+                "promptCacheCreationControl.creationBudgetWindowSecs 不能大于 604800".to_string(),
+            );
+        }
+        if config.expire_after_idle_secs > 30 * 24 * 60 * 60 {
+            return Err(
+                "promptCacheCreationControl.expireAfterIdleSecs 不能大于 2592000".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Default for CompressionConfig {
     fn default() -> Self {
         Self {
@@ -1180,6 +1300,10 @@ pub struct Config {
     #[serde(default = "default_prompt_cache_scale_min_input_tokens")]
     pub prompt_cache_scale_min_input_tokens: i32,
 
+    /// 本地 prompt-cache creation 上报频次控制。
+    #[serde(default)]
+    pub prompt_cache_creation_control: PromptCacheCreationControlConfig,
+
     /// 下游 usage 上报投影配置。
     ///
     /// 默认策略先应用，再按路径前缀使用最长匹配覆盖；只影响 response usage
@@ -1457,6 +1581,34 @@ fn default_prompt_cache_scale_min_input_tokens() -> i32 {
     20_000
 }
 
+fn default_prompt_cache_creation_min_successes_between() -> u32 {
+    3
+}
+
+fn default_prompt_cache_creation_min_interval_secs() -> u64 {
+    60
+}
+
+fn default_prompt_cache_creation_min_delta_tokens() -> i32 {
+    12_000
+}
+
+fn default_prompt_cache_creation_max_tokens_per_event() -> i32 {
+    30_000
+}
+
+fn default_prompt_cache_creation_budget_window_secs() -> u64 {
+    300
+}
+
+fn default_prompt_cache_creation_max_tokens_per_window() -> i32 {
+    120_000
+}
+
+fn default_prompt_cache_creation_expire_after_idle_secs() -> u64 {
+    3_600
+}
+
 fn default_usage_record_limit() -> usize {
     5000
 }
@@ -1648,6 +1800,7 @@ impl Default for Config {
             prompt_cache_cap_jitter_min_tokens: default_prompt_cache_cap_jitter_min_tokens(),
             prompt_cache_cap_jitter_max_tokens: default_prompt_cache_cap_jitter_max_tokens(),
             prompt_cache_scale_min_input_tokens: default_prompt_cache_scale_min_input_tokens(),
+            prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
             reported_usage: ReportedUsageConfig::default(),
             usage_record_limit: default_usage_record_limit(),
             high_cache_threshold: default_high_cache_threshold(),

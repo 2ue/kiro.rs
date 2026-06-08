@@ -35,6 +35,7 @@ use crate::anthropic::{
     },
     pricing::{PricingCatalog, PricingStatus},
     prompt_cache::PromptCacheTracker,
+    prompt_cache_creation_control::PromptCacheCreationController,
     usage::{
         UsageDashboardResponse, UsageRecordQuery, UsageRecorder, UsageRecorderStats,
         UsageRecordsPageResult, UsageRecordsResult, UsageSummary,
@@ -148,6 +149,7 @@ pub struct AdminService {
     known_endpoints: HashSet<String>,
     usage_recorder: Arc<UsageRecorder>,
     prompt_cache: Arc<PromptCacheTracker>,
+    prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
     pricing_catalog: Arc<PricingCatalog>,
     model_capabilities: Arc<ModelCapabilitiesCatalog>,
     kiro_provider: Arc<KiroProvider>,
@@ -204,6 +206,7 @@ impl AdminService {
         known_endpoints: impl IntoIterator<Item = String>,
         usage_recorder: Arc<UsageRecorder>,
         prompt_cache: Arc<PromptCacheTracker>,
+        prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
         pricing_catalog: Arc<PricingCatalog>,
         model_capabilities: Arc<ModelCapabilitiesCatalog>,
         kiro_provider: Arc<KiroProvider>,
@@ -220,6 +223,7 @@ impl AdminService {
             known_endpoints: known_endpoints.into_iter().collect(),
             usage_recorder,
             prompt_cache,
+            prompt_cache_creation_controller,
             pricing_catalog,
             model_capabilities,
             kiro_provider,
@@ -794,6 +798,7 @@ impl AdminService {
         self.invalidate_balance_cache(id);
         if disabled {
             self.prompt_cache.clear_credential(id);
+            self.prompt_cache_creation_controller.clear_credential(id);
         }
 
         // 只有禁用的是当前凭据时才尝试切换到下一个
@@ -1620,6 +1625,7 @@ impl AdminService {
             .delete_credential(id)
             .map_err(|e| self.classify_delete_error(e, id))?;
         self.prompt_cache.clear_credential(id);
+        self.prompt_cache_creation_controller.clear_credential(id);
 
         // 清理已删除凭据的账号信息缓存
         self.invalidate_balance_cache(id);
@@ -2080,6 +2086,7 @@ impl AdminService {
             prompt_cache_cap_jitter_min_tokens: config.prompt_cache_cap_jitter_min_tokens,
             prompt_cache_cap_jitter_max_tokens: config.prompt_cache_cap_jitter_max_tokens,
             prompt_cache_scale_min_input_tokens: config.prompt_cache_scale_min_input_tokens,
+            prompt_cache_creation_control: config.prompt_cache_creation_control.normalized(),
             reported_usage: config.reported_usage.normalized(),
             external_pools: config.external_pools.clone(),
             high_cache_threshold: config.high_cache_threshold,
@@ -2207,6 +2214,10 @@ impl AdminService {
         let prompt_cache_scale_min_input_tokens = req
             .prompt_cache_scale_min_input_tokens
             .unwrap_or(current_config.prompt_cache_scale_min_input_tokens);
+        let prompt_cache_creation_control = req
+            .prompt_cache_creation_control
+            .unwrap_or(current_config.prompt_cache_creation_control)
+            .normalized();
         let reported_usage = req
             .reported_usage
             .clone()
@@ -2360,6 +2371,9 @@ impl AdminService {
         reported_usage
             .validate()
             .map_err(AdminServiceError::InvalidCredential)?;
+        prompt_cache_creation_control
+            .validate()
+            .map_err(AdminServiceError::InvalidCredential)?;
         validate_external_pools_config(&external_pools)
             .map_err(AdminServiceError::InvalidCredential)?;
         if high_cache_threshold < 0 {
@@ -2422,6 +2436,7 @@ impl AdminService {
                 config.prompt_cache_cap_jitter_min_tokens = prompt_cache_cap_jitter_min_tokens;
                 config.prompt_cache_cap_jitter_max_tokens = prompt_cache_cap_jitter_max_tokens;
                 config.prompt_cache_scale_min_input_tokens = prompt_cache_scale_min_input_tokens;
+                config.prompt_cache_creation_control = prompt_cache_creation_control;
                 config.reported_usage = reported_usage;
                 config.external_pools = external_pools;
                 config.high_cache_threshold = high_cache_threshold;

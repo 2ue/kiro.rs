@@ -42,6 +42,7 @@ pub(crate) mod model_capabilities;
 pub(crate) mod payload_guard;
 pub(crate) mod pricing;
 pub(crate) mod prompt_cache;
+pub(crate) mod prompt_cache_creation_control;
 mod router;
 mod stream;
 pub mod types;

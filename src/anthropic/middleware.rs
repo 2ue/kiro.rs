@@ -15,12 +15,13 @@ use crate::external_pool::ExternalPoolManager;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
     CompatProfile, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
-    PromptCacheSimulationMode, ReportedUsageConfig,
+    PromptCacheCreationControlConfig, PromptCacheSimulationMode, ReportedUsageConfig,
 };
 
 use super::{
     envelope, model_capabilities::ModelCapabilitiesCatalog, pricing::PricingCatalog,
-    prompt_cache::PromptCacheTracker, usage::UsageRecorder,
+    prompt_cache::PromptCacheTracker, prompt_cache_creation_control::PromptCacheCreationController,
+    usage::UsageRecorder,
 };
 
 /// 应用共享状态
@@ -41,6 +42,8 @@ pub struct AppState {
     pub model_capabilities: Arc<ModelCapabilitiesCatalog>,
     /// 本地 prompt-cache tracker
     pub prompt_cache: Arc<PromptCacheTracker>,
+    /// 本地 prompt-cache creation 上报频次控制器
+    pub prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
     /// 本地 prompt-cache usage 模拟模式
     pub prompt_cache_simulation_mode: PromptCacheSimulationMode,
     /// 本地 prompt-cache 模拟目标 cache read 比例
@@ -55,6 +58,8 @@ pub struct AppState {
     pub prompt_cache_cap_jitter_max_tokens: i32,
     /// high-cache 模拟启用 scale 的最小基础输入
     pub prompt_cache_scale_min_input_tokens: i32,
+    /// 本地 prompt-cache creation 上报频次控制配置
+    pub prompt_cache_creation_control: PromptCacheCreationControlConfig,
     /// 下游 usage 上报投影配置
     pub reported_usage: ReportedUsageConfig,
     /// Anthropic compatibility profile
@@ -86,6 +91,7 @@ impl AppState {
         extract_thinking: bool,
         usage_recorder: Arc<UsageRecorder>,
         prompt_cache: Arc<PromptCacheTracker>,
+        prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
         prompt_cache_simulation_mode: PromptCacheSimulationMode,
         prompt_cache_target_read_ratio: f64,
         compat_profile: CompatProfile,
@@ -99,6 +105,7 @@ impl AppState {
             pricing_catalog: Arc::new(PricingCatalog::new()),
             model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
             prompt_cache,
+            prompt_cache_creation_controller,
             prompt_cache_simulation_mode,
             prompt_cache_target_read_ratio: prompt_cache_target_read_ratio.clamp(0.0, 0.99),
             prompt_cache_token_scale: 1.0,
@@ -106,6 +113,7 @@ impl AppState {
             prompt_cache_cap_jitter_min_tokens: 0,
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
+            prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
             reported_usage: ReportedUsageConfig::default(),
             compat_profile,
             model_resolution_mode: ModelResolutionMode::Compatible,
@@ -118,6 +126,14 @@ impl AppState {
             payload_shaping: PayloadShapingConfig::default(),
             external_pool_manager: None,
         }
+    }
+
+    pub fn with_prompt_cache_creation_control(
+        mut self,
+        config: PromptCacheCreationControlConfig,
+    ) -> Self {
+        self.prompt_cache_creation_control = config.normalized();
+        self
     }
 
     pub fn with_prompt_cache_amplification(

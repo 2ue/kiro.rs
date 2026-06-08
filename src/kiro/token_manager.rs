@@ -2820,6 +2820,8 @@ impl MultiTokenManager {
         let mut attempt_count = 0;
         let dispatch_wait_started_at = Instant::now();
         let mut queue_guard: Option<DispatchQueueGuard> = None;
+        let mut local_excluded_ids = excluded_ids.clone();
+        let mut slot_race_excluded_count = 0usize;
 
         loop {
             self.refresh_scheduler_state_from_redis()?;
@@ -2834,8 +2836,8 @@ impl MultiTokenManager {
 
             let decision = {
                 let existing_bound_id = session_id.and_then(|sid| self.bound_credential_id(sid));
-                let bound_hit =
-                    session_id.and_then(|sid| self.get_bound_credential(sid, model, excluded_ids));
+                let bound_hit = session_id
+                    .and_then(|sid| self.get_bound_credential(sid, model, &local_excluded_ids));
 
                 if let Some(hit) = bound_hit {
                     AcquireDecision::Selected(hit.0, hit.1, true, false)
@@ -2843,7 +2845,8 @@ impl MultiTokenManager {
                     let fallback_from_sticky = existing_bound_id.is_some();
                     {
                         // 根据负载均衡策略选择；priority 模式也会在同优先级账号之间优先低并发。
-                        let mut best = self.select_next_credential_excluding(model, excluded_ids);
+                        let mut best =
+                            self.select_next_credential_excluding(model, &local_excluded_ids);
 
                         // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                         if best.is_none() {
@@ -2876,7 +2879,8 @@ impl MultiTokenManager {
                                     self.save_runtime_state_for(healed_id);
                                 }
                                 self.publish_credentials_changed("auto_heal_too_many_failures");
-                                best = self.select_next_credential_excluding(model, excluded_ids);
+                                best = self
+                                    .select_next_credential_excluding(model, &local_excluded_ids);
                             }
                         }
 
@@ -2913,7 +2917,7 @@ impl MultiTokenManager {
                                 entries
                                     .iter()
                                     .filter(|e| {
-                                        !excluded_ids.contains(&e.id)
+                                        !local_excluded_ids.contains(&e.id)
                                             && Self::credential_is_dispatchable(
                                                 &proxy_resources,
                                                 e,
@@ -2927,11 +2931,19 @@ impl MultiTokenManager {
                             let excluded_usable = entries
                                 .iter()
                                 .filter(|e| {
-                                    excluded_ids.contains(&e.id)
+                                    local_excluded_ids.contains(&e.id)
                                         && Self::credential_is_usable_for_model(e, model)
                                 })
                                 .count();
                             if usable > 0 && excluded_usable >= usable {
+                                if acquire_mode.is_fail_fast() && slot_race_excluded_count > 0 {
+                                    anyhow::bail!(
+                                        "本地凭据调度容量暂不可用（本次请求因并发槽竞争临时排除了所有可用凭据，可用: {}/{}, max_concurrent_requests={}）",
+                                        available,
+                                        total,
+                                        self.max_concurrent_requests()
+                                    );
+                                }
                                 anyhow::bail!(
                                     "本次请求临时排除了所有可用凭据（可用: {}/{}, 临时排除: {}）",
                                     available,
@@ -2956,7 +2968,7 @@ impl MultiTokenManager {
                                             &proxy_resources,
                                             e,
                                             model,
-                                            excluded_ids,
+                                            &local_excluded_ids,
                                         )
                                     })
                                     .count();
@@ -2967,7 +2979,7 @@ impl MultiTokenManager {
                                             &proxy_resources,
                                             e,
                                             model,
-                                            excluded_ids,
+                                            &local_excluded_ids,
                                         ) && Self::entry_cooldown_remaining(e, now).is_some()
                                     })
                                     .count();
@@ -2975,7 +2987,7 @@ impl MultiTokenManager {
                                     &entries,
                                     &proxy_resources,
                                     model,
-                                    excluded_ids,
+                                    &local_excluded_ids,
                                     now,
                                 );
                                 if dispatch_candidate_count > 0
@@ -2997,7 +3009,7 @@ impl MultiTokenManager {
                                     &entries,
                                     &proxy_resources,
                                     model,
-                                    excluded_ids,
+                                    &local_excluded_ids,
                                     now,
                                     max_concurrent_requests,
                                 );
@@ -3094,11 +3106,15 @@ impl MultiTokenManager {
 
             let Some(in_flight_lease) = self.acquire_in_flight_slot(id)? else {
                 if acquire_mode.is_fail_fast() {
-                    anyhow::bail!(
-                        "本地凭据调度容量暂不可用（选中凭据 #{} 后并发槽位已满，max_concurrent_requests={}）",
-                        id,
-                        self.max_concurrent_requests()
+                    local_excluded_ids.insert(id);
+                    attempt_count += 1;
+                    slot_race_excluded_count += 1;
+                    tracing::debug!(
+                        credential_id = id,
+                        excluded_count = local_excluded_ids.len(),
+                        "fail-fast 预检选中凭据后并发槽已满，本次请求临时排除并重选"
                     );
+                    continue;
                 }
                 if queue_guard.is_none() {
                     queue_guard = self.try_enter_dispatch_queue()?;
@@ -7388,6 +7404,46 @@ mod tests {
             .expect("等待请求应成功获取凭据");
 
         assert_eq!(second.id, first.id);
+        second.release_in_flight();
+    }
+
+    #[tokio::test]
+    async fn test_fail_fast_slot_race_reselects_other_available_credential() {
+        let mut config = Config::default();
+        config.credential_max_concurrent_requests = 1;
+
+        let mut first_cred = KiroCredentials::default();
+        first_cred.access_token = Some("t1".to_string());
+        first_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        first_cred.priority = 0;
+
+        let mut second_cred = KiroCredentials::default();
+        second_cred.access_token = Some("t2".to_string());
+        second_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        second_cred.priority = 0;
+
+        let manager =
+            MultiTokenManager::new(config, vec![first_cred, second_cred], None, None, false)
+                .unwrap();
+        let mut first = manager.acquire_context(None).await.unwrap();
+        assert_eq!(first.id, 1);
+
+        let mut second = manager
+            .acquire_context_for_session_with_mode(
+                None,
+                None,
+                &HashSet::new(),
+                AcquireMode::FailFastOnCapacity,
+            )
+            .await
+            .expect("fail-fast should reselect another credential when the selected slot is full");
+
+        assert_eq!(second.id, 2);
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.entries[0].in_flight_requests, 1);
+        assert_eq!(snapshot.entries[1].in_flight_requests, 1);
+
+        first.release_in_flight();
         second.release_in_flight();
     }
 

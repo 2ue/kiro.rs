@@ -577,6 +577,8 @@ pub struct StreamContext {
     reported_cache_usage_policy: Option<super::cache::ReportedCacheUsagePolicy>,
     /// 最近一次最终 usage，用于请求级记录。
     final_usage: Option<super::cache::CacheUsage>,
+    /// 最近一次最终下游上报 usage，用于请求级记录。
+    final_reported_usage: Option<super::cache::CacheUsage>,
 }
 
 impl StreamContext {
@@ -638,6 +640,7 @@ impl StreamContext {
             simulation_mode,
             reported_cache_usage_policy: None,
             final_usage: None,
+            final_reported_usage: None,
         }
     }
 
@@ -674,14 +677,20 @@ impl StreamContext {
     }
 
     /// 生成 message_start 事件
-    pub fn create_message_start_event(&self) -> serde_json::Value {
+    pub fn create_message_start_event_with_reported_usage_mapper<F>(
+        &self,
+        usage_mapper: F,
+    ) -> serde_json::Value
+    where
+        F: FnOnce(super::cache::CacheUsage) -> super::cache::CacheUsage,
+    {
         let usage = super::cache::build_usage_with_simulation(
             None,
             self.input_tokens,
             1,
             self.simulated_usage,
         );
-        let usage = self.reported_usage_for_downstream(usage).to_json();
+        let usage = usage_mapper(self.reported_usage_for_downstream(usage)).to_json();
         json!({
             "type": "message_start",
             "message": {
@@ -701,11 +710,22 @@ impl StreamContext {
     ///
     /// 当 thinking 启用时，不在初始化时创建文本块，而是等到实际收到内容时再创建。
     /// 这样可以确保 thinking 块（索引 0）在文本块（索引 1）之前。
+    #[cfg(test)]
     pub fn generate_initial_events(&mut self) -> Vec<SseEvent> {
+        self.generate_initial_events_with_reported_usage_mapper(|reported_usage| reported_usage)
+    }
+
+    pub fn generate_initial_events_with_reported_usage_mapper<F>(
+        &mut self,
+        usage_mapper: F,
+    ) -> Vec<SseEvent>
+    where
+        F: FnOnce(super::cache::CacheUsage) -> super::cache::CacheUsage,
+    {
         let mut events = Vec::new();
 
         // message_start
-        let msg_start = self.create_message_start_event();
+        let msg_start = self.create_message_start_event_with_reported_usage_mapper(usage_mapper);
         if let Some(event) = self.state_manager.handle_message_start(msg_start) {
             events.push(event);
         }
@@ -850,6 +870,10 @@ impl StreamContext {
 
     pub fn final_usage(&self) -> Option<super::cache::CacheUsage> {
         self.final_usage
+    }
+
+    pub fn final_reported_usage(&self) -> Option<super::cache::CacheUsage> {
+        self.final_reported_usage
     }
 
     pub fn metadata_usage(&self) -> Option<&MetadataTokenUsage> {
@@ -1373,6 +1397,23 @@ impl StreamContext {
 
     /// 生成最终事件序列
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
+        self.generate_final_events_with_reported_usage_mapper(|_, reported_usage, _, _| {
+            reported_usage
+        })
+    }
+
+    pub fn generate_final_events_with_reported_usage_mapper<F>(
+        &mut self,
+        usage_mapper: F,
+    ) -> Vec<SseEvent>
+    where
+        F: FnOnce(
+            super::cache::CacheUsage,
+            super::cache::CacheUsage,
+            Option<&MetadataTokenUsage>,
+            bool,
+        ) -> super::cache::CacheUsage,
+    {
         let mut events = Vec::new();
 
         if self.native_reasoning_seen {
@@ -1488,6 +1529,15 @@ impl StreamContext {
         );
         self.final_usage = Some(final_usage);
         let reported_usage = self.reported_usage_for_downstream(final_usage);
+        let context_estimated =
+            self.metadata_usage.is_none() && self.context_input_tokens.is_some();
+        let reported_usage = usage_mapper(
+            final_usage,
+            reported_usage,
+            self.metadata_usage.as_ref(),
+            context_estimated,
+        );
+        self.final_reported_usage = Some(reported_usage);
 
         // 生成最终事件
         events.extend(

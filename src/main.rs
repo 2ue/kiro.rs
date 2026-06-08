@@ -246,6 +246,9 @@ async fn main() {
         Arc::new(PostgresUsageStore::new(postgres_store.clone())),
     ));
     let prompt_cache = Arc::new(anthropic::prompt_cache::PromptCacheTracker::default());
+    let prompt_cache_creation_controller = Arc::new(
+        anthropic::prompt_cache_creation_control::PromptCacheCreationController::default(),
+    );
     let pricing_catalog = Arc::new(anthropic::pricing::PricingCatalog::new());
     match postgres_store.load_pricing_status().await {
         Ok(Some(status)) => {
@@ -399,6 +402,7 @@ async fn main() {
         config.extract_thinking,
         usage_recorder.clone(),
         prompt_cache.clone(),
+        prompt_cache_creation_controller.clone(),
         pricing_catalog.clone(),
         model_capabilities.clone(),
         config.prompt_cache_target_read_ratio,
@@ -407,6 +411,7 @@ async fn main() {
         config.prompt_cache_cap_jitter_min_tokens,
         config.prompt_cache_cap_jitter_max_tokens,
         config.prompt_cache_scale_min_input_tokens,
+        config.prompt_cache_creation_control.normalized(),
         config.reported_usage.clone(),
         config.compat_profile,
         config.model_resolution_mode,
@@ -438,6 +443,7 @@ async fn main() {
                 endpoint_names.clone(),
                 usage_recorder.clone(),
                 prompt_cache.clone(),
+                prompt_cache_creation_controller.clone(),
                 pricing_catalog.clone(),
                 model_capabilities.clone(),
                 kiro_provider.clone(),

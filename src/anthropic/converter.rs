@@ -62,6 +62,19 @@ fn normalize_schema_object(obj: &mut serde_json::Map<String, serde_json::Value>,
             .or_insert_with(|| serde_json::Value::Array(vec![example]));
     }
 
+    if obj
+        .get("$id")
+        .is_some_and(|value| value.as_str().is_some_and(|text| text.trim().is_empty()))
+    {
+        obj.remove("$id");
+    }
+    if obj
+        .get("$anchor")
+        .is_some_and(|value| value.as_str().is_some_and(|text| text.trim().is_empty()))
+    {
+        obj.remove("$anchor");
+    }
+
     if let Some(definitions) = obj.remove("definitions") {
         obj.entry("$defs".to_string()).or_insert(definitions);
     }
@@ -145,6 +158,19 @@ fn normalize_schema_object(obj: &mut serde_json::Map<String, serde_json::Value>,
         if !value.as_f64().is_some_and(|number| number > 0.0) {
             obj.remove("multipleOf");
         }
+    }
+
+    if obj
+        .get("format")
+        .is_some_and(|value| value.as_str().is_some_and(|text| text.trim().is_empty()))
+    {
+        obj.remove("format");
+    }
+    if obj
+        .get("pattern")
+        .is_some_and(|value| value.as_str().is_some_and(|text| text.trim().is_empty()))
+    {
+        obj.remove("pattern");
     }
 }
 
@@ -1189,14 +1215,19 @@ fn process_message_content(
                             }
                         }
                         "tool_result" => {
-                            if let Some(tool_use_id) = block.tool_use_id {
+                            if let Some(tool_use_id) = block
+                                .tool_use_id
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|id| !id.is_empty())
+                            {
                                 let result_content = extract_tool_result_content(&block.content);
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
-                                    ToolResult::error(&tool_use_id, result_content)
+                                    ToolResult::error(tool_use_id, result_content)
                                 } else {
-                                    ToolResult::success(&tool_use_id, result_content)
+                                    ToolResult::success(tool_use_id, result_content)
                                 };
                                 result.status =
                                     Some(if is_error { "error" } else { "success" }.to_string());
@@ -1511,12 +1542,22 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
             for item in arr {
                 if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                     parts.push(text.to_string());
+                } else if !item.is_null() {
+                    parts.push(item.to_string());
                 }
             }
             parts.join("\n")
         }
         Some(v) => v.to_string(),
         None => String::new(),
+    }
+}
+
+fn normalize_tool_use_input(input: serde_json::Value) -> serde_json::Value {
+    match input {
+        serde_json::Value::Object(_) => input,
+        serde_json::Value::Null => serde_json::json!({}),
+        other => serde_json::json!({ "value": other }),
     }
 }
 
@@ -2148,11 +2189,26 @@ fn convert_assistant_message(
                             }
                         }
                         "tool_use" => {
-                            if let (Some(id), Some(name)) = (block.id, block.name) {
-                                let input = block.input.unwrap_or(serde_json::json!({}));
-                                let mapped_name = map_tool_name(&name, tool_name_map);
-                                tool_uses
-                                    .push(ToolUseEntry::new(id, mapped_name).with_input(input));
+                            if let (Some(id), Some(name)) = (
+                                block
+                                    .id
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|id| !id.is_empty()),
+                                block
+                                    .name
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|name| !name.is_empty()),
+                            ) {
+                                let input = normalize_tool_use_input(
+                                    block.input.unwrap_or(serde_json::json!({})),
+                                );
+                                let mapped_name = map_tool_name(name, tool_name_map);
+                                tool_uses.push(
+                                    ToolUseEntry::new(id.to_string(), mapped_name)
+                                        .with_input(input),
+                                );
                             }
                         }
                         _ => {}
@@ -2570,6 +2626,8 @@ mod tests {
             "$schema": "http://json-schema.org/draft-07/schema#",
             "$vocabulary": {"https://json-schema.org/draft/2020-12/vocab/core": true},
             "type": "object",
+            "$id": "",
+            "$anchor": " ",
             "nullable": true,
             "additionalProperties": false,
             "x-mcp-source": "test",
@@ -2588,6 +2646,8 @@ mod tests {
                 "bad": null,
                 "constant": true,
                 "title": {"text": "not a valid title"},
+                "emptyPattern": {"type": "string", "pattern": ""},
+                "emptyFormat": {"type": "string", "format": " "},
                 "bounded": {
                     "type": "number",
                     "minimum": "zero",
@@ -2609,6 +2669,8 @@ mod tests {
         assert!(normalized.get("discriminator").is_none());
         assert!(normalized.get("xml").is_none());
         assert!(normalized.get("externalDocs").is_none());
+        assert!(normalized.get("$id").is_none());
+        assert!(normalized.get("$anchor").is_none());
 
         let props = &normalized["properties"];
         assert_eq!(props["path"], serde_json::json!({"type": "string"}));
@@ -2634,6 +2696,8 @@ mod tests {
         assert_eq!(props["bad"], serde_json::json!({}));
         assert_eq!(props["constant"], serde_json::json!(true));
         assert!(props["title"].get("title").is_none());
+        assert!(props["emptyPattern"].get("pattern").is_none());
+        assert!(props["emptyFormat"].get("format").is_none());
         assert!(props["bounded"].get("minimum").is_none());
         assert_eq!(props["bounded"]["maximum"], serde_json::json!(10));
         assert!(props["bounded"].get("multipleOf").is_none());
@@ -3699,6 +3763,83 @@ mod tests {
             tool_name_map.get(&tool_uses[0].name),
             Some(&"read_file".to_string())
         );
+    }
+
+    #[test]
+    fn test_convert_assistant_message_ignores_empty_tool_use_identity() {
+        let msg = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "tool_use", "id": "   ", "name": "read_file", "input": {"path": "/test.txt"}},
+                {"type": "tool_use", "id": "toolu_valid", "name": "   ", "input": {"path": "/test.txt"}},
+                {"type": "tool_use", "id": "toolu_ok", "name": "read_file", "input": {"path": "/test.txt"}}
+            ]),
+        };
+
+        let mut tool_name_map = HashMap::new();
+        let result = convert_assistant_message(&msg, &mut tool_name_map).expect("convert");
+        let tool_uses = result
+            .assistant_response_message
+            .tool_uses
+            .expect("valid tool use should remain");
+
+        assert_eq!(tool_uses.len(), 1);
+        assert_eq!(tool_uses[0].tool_use_id, "toolu_ok");
+    }
+
+    #[test]
+    fn test_convert_assistant_message_wraps_non_object_tool_input() {
+        let msg = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "tool_use", "id": "toolu_scalar", "name": "run", "input": "raw input"}
+            ]),
+        };
+
+        let mut tool_name_map = HashMap::new();
+        let result = convert_assistant_message(&msg, &mut tool_name_map).expect("convert");
+        let tool_uses = result
+            .assistant_response_message
+            .tool_uses
+            .expect("tool use should remain");
+
+        assert_eq!(
+            tool_uses[0].input,
+            serde_json::json!({"value": "raw input"})
+        );
+    }
+
+    #[test]
+    fn test_process_message_content_ignores_empty_tool_result_id() {
+        let content = serde_json::json!([
+            {"type": "tool_result", "tool_use_id": " ", "content": "ignored"},
+            {"type": "tool_result", "tool_use_id": "toolu_ok", "content": "kept"}
+        ]);
+
+        let (_, _, tool_results) = process_message_content(&content).expect("process");
+
+        assert_eq!(tool_results.len(), 1);
+        assert_eq!(tool_results[0].tool_use_id, "toolu_ok");
+    }
+
+    #[test]
+    fn test_process_message_content_preserves_non_text_tool_result_items() {
+        let content = serde_json::json!([
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_ok",
+                "content": [
+                    {"type": "text", "text": "plain"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}}
+                ]
+            }
+        ]);
+
+        let (_, _, tool_results) = process_message_content(&content).expect("process");
+        let text = kiro_tool_result_to_text(&tool_results[0]).expect("text");
+
+        assert!(text.contains("plain"));
+        assert!(text.contains("\"image\""));
     }
 
     #[test]

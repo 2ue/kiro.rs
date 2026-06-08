@@ -685,6 +685,18 @@ export interface ReportedUsageConfig {
   pathOverrides: Record<string, ReportedUsagePathPolicy>
 }
 
+export interface PromptCacheCreationControlConfig {
+  enabled: boolean
+  scopeMode: 'credential_conversation_model' | 'conversation_model'
+  minSuccessfulRequestsBetweenCreation: number
+  minCreationIntervalSecs: number
+  minCreationDeltaTokens: number
+  maxCreationTokensPerEvent: number
+  creationBudgetWindowSecs: number
+  maxCreationTokensPerWindow: number
+  expireAfterIdleSecs: number
+}
+
 export interface PayloadShapingConfig {
   enabled: boolean
   truncateHistoricalToolResults: boolean
@@ -873,6 +885,7 @@ export interface RuntimeConfig {
   promptCacheCapJitterMinTokens: number
   promptCacheCapJitterMaxTokens: number
   promptCacheScaleMinInputTokens: number
+  promptCacheCreationControl: PromptCacheCreationControlConfig
   reportedUsage: ReportedUsageConfig
   externalPools: ExternalPoolsConfig
   highCacheThreshold: number

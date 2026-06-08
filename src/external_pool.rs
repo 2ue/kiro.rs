@@ -392,6 +392,19 @@ enum PoolCapacityWaitReason {
     Cooldown,
 }
 
+#[derive(Debug, Clone)]
+struct PoolAcquireUnavailable {
+    reason: PoolCapacityWaitReason,
+    wait_for: Option<Duration>,
+    exclude_pool_for_reselect: bool,
+    detail: &'static str,
+}
+
+enum PoolAcquireResult {
+    Acquired(ExternalPoolLease),
+    Unavailable(PoolAcquireUnavailable),
+}
+
 #[derive(Debug, Clone, Default)]
 struct PoolAvailabilitySnapshot {
     eligible_pools: usize,
@@ -603,15 +616,29 @@ impl ExternalPoolManager {
             };
             let pool_id = pool.id;
             let lease = match self.acquire_pool(&pool, &config).await {
-                Some(lease) => lease,
-                None => {
+                PoolAcquireResult::Acquired(lease) => lease,
+                PoolAcquireResult::Unavailable(unavailable) => {
+                    tracing::debug!(
+                        pool_id,
+                        reason = ?unavailable.reason,
+                        detail = unavailable.detail,
+                        exclude_pool_for_reselect = unavailable.exclude_pool_for_reselect,
+                        "外部池选中后并发 lease 未占用，本次请求尝试重选或按配置等待"
+                    );
+                    if unavailable.exclude_pool_for_reselect {
+                        excluded.insert(pool_id);
+                        if self.select_pool(&excluded, &config).await.is_some() {
+                            continue;
+                        }
+                        excluded.remove(&pool_id);
+                    }
                     match self
                         .handle_capacity_unavailable(
                             &route,
                             attempts.clone(),
                             &config,
-                            PoolCapacityWaitReason::Full,
-                            None,
+                            unavailable.reason,
+                            unavailable.wait_for,
                             &mut queue_guard,
                             &mut wait_started_at,
                         )
@@ -1198,16 +1225,26 @@ impl ExternalPoolManager {
         &self,
         pool: &ExternalPool,
         config: &ExternalPoolsConfig,
-    ) -> Option<ExternalPoolLease> {
+    ) -> PoolAcquireResult {
         let (_, _, cooldown_remaining_secs, _) = self.pool_runtime_snapshot(pool.id).await;
         if cooldown_remaining_secs > 0 {
-            return None;
+            return PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
+                reason: PoolCapacityWaitReason::Cooldown,
+                wait_for: Some(Duration::from_secs(cooldown_remaining_secs.max(1))),
+                exclude_pool_for_reselect: true,
+                detail: "cooldown_before_acquire",
+            });
         }
         let lease_id = match self.redis.next_external_pool_lease_id().await {
             Ok(lease_id) => lease_id,
             Err(err) => {
                 tracing::warn!(pool_id = pool.id, "生成外部池 Redis lease ID 失败: {}", err);
-                return None;
+                return PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
+                    reason: PoolCapacityWaitReason::Full,
+                    wait_for: Some(Duration::from_secs(1)),
+                    exclude_pool_for_reselect: false,
+                    detail: "lease_id_error",
+                });
             }
         };
         let max_age = Some(Duration::from_secs(
@@ -1224,15 +1261,57 @@ impl ExternalPoolManager {
             )
             .await
         {
-            Ok(Some(_)) => Some(ExternalPoolLease {
+            Ok(Some(_)) => PoolAcquireResult::Acquired(ExternalPoolLease {
                 manager: self.clone(),
                 pool_id: pool.id,
                 lease_id,
             }),
-            Ok(None) => None,
+            Ok(None) => {
+                let (in_flight, global_in_flight, cooldown_remaining_secs, _) =
+                    self.pool_runtime_snapshot(pool.id).await;
+                let skip_reason = self.skip_reason(
+                    pool,
+                    in_flight,
+                    global_in_flight,
+                    cooldown_remaining_secs,
+                    config,
+                );
+                let unavailable = match skip_reason.as_deref() {
+                    Some("cooldown") => PoolAcquireUnavailable {
+                        reason: PoolCapacityWaitReason::Cooldown,
+                        wait_for: Some(Duration::from_secs(cooldown_remaining_secs.max(1))),
+                        exclude_pool_for_reselect: true,
+                        detail: "cooldown_after_acquire_race",
+                    },
+                    Some("global_concurrency_full") => PoolAcquireUnavailable {
+                        reason: PoolCapacityWaitReason::Full,
+                        wait_for: None,
+                        exclude_pool_for_reselect: false,
+                        detail: "global_concurrency_full_after_acquire_race",
+                    },
+                    Some("pool_concurrency_full") => PoolAcquireUnavailable {
+                        reason: PoolCapacityWaitReason::Full,
+                        wait_for: None,
+                        exclude_pool_for_reselect: true,
+                        detail: "pool_concurrency_full_after_acquire_race",
+                    },
+                    _ => PoolAcquireUnavailable {
+                        reason: PoolCapacityWaitReason::Full,
+                        wait_for: Some(Duration::from_secs(1)),
+                        exclude_pool_for_reselect: true,
+                        detail: "lease_acquire_race",
+                    },
+                };
+                PoolAcquireResult::Unavailable(unavailable)
+            }
             Err(err) => {
                 tracing::warn!(pool_id = pool.id, "占用外部池 Redis 并发槽失败: {}", err);
-                None
+                PoolAcquireResult::Unavailable(PoolAcquireUnavailable {
+                    reason: PoolCapacityWaitReason::Full,
+                    wait_for: Some(Duration::from_secs(1)),
+                    exclude_pool_for_reselect: false,
+                    detail: "lease_acquire_error",
+                })
             }
         }
     }
@@ -2871,6 +2950,7 @@ mod tests {
             ExternalPoolUsageProjectionMode::PassThrough,
             &ReportedUsageConfig::default(),
             "/cc/v1/messages",
+            0,
         );
 
         assert_eq!(projected.body, body);
@@ -2890,6 +2970,7 @@ mod tests {
             ExternalPoolUsageProjectionMode::CurrentPathPolicy,
             &ReportedUsageConfig::default(),
             "/cc/v1/messages",
+            0,
         );
 
         let value: serde_json::Value =
@@ -2920,6 +3001,7 @@ mod tests {
             ExternalPoolUsageProjectionMode::PassThrough,
             &ReportedUsageConfig::default(),
             "/cc/v1/messages",
+            0,
         );
         let route = test_route("claude-sonnet-4-5");
         let pool = test_pool("http://pool.example.com", false);
@@ -2942,6 +3024,7 @@ mod tests {
             ExternalPoolUsageProjectionMode::CurrentPathPolicy,
             &ReportedUsageConfig::default(),
             "/cc/v1/messages",
+            0,
         );
         let route = test_route("claude-sonnet-4-5");
         let mut pool = test_pool("http://pool.example.com", false);
@@ -2973,6 +3056,7 @@ data: [DONE]
             ExternalPoolUsageProjectionMode::CurrentPathPolicy,
             &ReportedUsageConfig::default(),
             "/cc/v1/messages",
+            0,
             None,
         );
         let text = String::from_utf8(projected).expect("utf8");
@@ -2994,6 +3078,7 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
             ExternalPoolUsageProjectionMode::CurrentPathPolicy,
             &ReportedUsageConfig::default(),
             "/cc/v1/messages",
+            0,
             Some(&capture),
         );
         let capture = *capture.lock();

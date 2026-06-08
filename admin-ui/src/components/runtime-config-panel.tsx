@@ -21,6 +21,7 @@ import type {
   ModelResolutionMode,
   PayloadGuardMode,
   PayloadShapingConfig,
+  PromptCacheCreationControlConfig,
   ReportedUsageConfig,
   ReportedUsageFieldMode,
   ReportedUsageFieldPolicy,
@@ -101,6 +102,18 @@ const defaultPayloadShaping = (): PayloadShapingConfig => ({
   currentDocumentMaxChars: 80000,
   truncateCurrentImages: false,
   currentImagesMaxBytes: 180000,
+})
+
+const defaultPromptCacheCreationControl = (): PromptCacheCreationControlConfig => ({
+  enabled: false,
+  scopeMode: 'credential_conversation_model',
+  minSuccessfulRequestsBetweenCreation: 3,
+  minCreationIntervalSecs: 60,
+  minCreationDeltaTokens: 12000,
+  maxCreationTokensPerEvent: 30000,
+  creationBudgetWindowSecs: 300,
+  maxCreationTokensPerWindow: 120000,
+  expireAfterIdleSecs: 3600,
 })
 
 export const defaultExternalPoolsConfig = () => ({
@@ -276,6 +289,7 @@ const emptyConfig: RuntimeConfig = {
   promptCacheCapJitterMinTokens: 12000,
   promptCacheCapJitterMaxTokens: 24000,
   promptCacheScaleMinInputTokens: 20000,
+  promptCacheCreationControl: defaultPromptCacheCreationControl(),
   reportedUsage: defaultReportedUsage(),
   externalPools: defaultExternalPoolsConfig(),
   highCacheThreshold: 10000,
@@ -1158,6 +1172,26 @@ function normalizeReportedUsage(config: ReportedUsageConfig): ReportedUsageConfi
   }
 }
 
+function normalizePromptCacheCreationControl(
+  config: PromptCacheCreationControlConfig
+): PromptCacheCreationControlConfig {
+  return {
+    ...defaultPromptCacheCreationControl(),
+    ...config,
+    scopeMode:
+      config.scopeMode === 'conversation_model'
+        ? 'conversation_model'
+        : 'credential_conversation_model',
+    minSuccessfulRequestsBetweenCreation: toWhole(config.minSuccessfulRequestsBetweenCreation),
+    minCreationIntervalSecs: toWhole(config.minCreationIntervalSecs),
+    minCreationDeltaTokens: toWhole(config.minCreationDeltaTokens),
+    maxCreationTokensPerEvent: toWhole(config.maxCreationTokensPerEvent),
+    creationBudgetWindowSecs: toWhole(config.creationBudgetWindowSecs),
+    maxCreationTokensPerWindow: toWhole(config.maxCreationTokensPerWindow),
+    expireAfterIdleSecs: toWhole(config.expireAfterIdleSecs),
+  }
+}
+
 function normalizePayloadShaping(config: PayloadShapingConfig): PayloadShapingConfig {
   return {
     ...config,
@@ -1201,6 +1235,10 @@ export function RuntimeConfigPanel() {
         externalPools: {
           ...defaultExternalPoolsConfig(),
           ...config.data.externalPools,
+        },
+        promptCacheCreationControl: {
+          ...defaultPromptCacheCreationControl(),
+          ...config.data.promptCacheCreationControl,
         },
         modelMapping: normalizeModelMapping(config.data.modelMapping),
       })
@@ -1248,6 +1286,7 @@ export function RuntimeConfigPanel() {
       promptCacheCapJitterMinTokens: toWhole(draft.promptCacheCapJitterMinTokens),
       promptCacheCapJitterMaxTokens: toWhole(draft.promptCacheCapJitterMaxTokens),
       promptCacheScaleMinInputTokens: toWhole(draft.promptCacheScaleMinInputTokens),
+      promptCacheCreationControl: normalizePromptCacheCreationControl(draft.promptCacheCreationControl),
       reportedUsage: normalizeReportedUsage(draft.reportedUsage),
       modelMapping: normalizeModelMapping(draft.modelMapping),
       externalPools: {
@@ -1876,6 +1915,152 @@ export function RuntimeConfigPanel() {
               suffix="tokens"
               onChange={(promptCacheCapJitterMaxTokens) =>
                 setDraft((prev) => ({ ...prev, promptCacheCapJitterMaxTokens }))
+              }
+            />
+          </ConfigSection>
+
+          <ConfigSection
+            icon={<Gauge className="h-4 w-4" />}
+            title="缓存创建频次控制"
+            description="只限制最终上报的 cache_creation_input_tokens 出现频次；不改变本地缓存命中计算、上游请求或 cache read 字段策略。"
+          >
+            <ToggleField
+              title="启用缓存创建频次控制"
+              description="关闭时完全保持旧行为。开启后仅对本地 high-cache 模拟 usage 生效，真实上游 metadata 不受影响。"
+              checked={draft.promptCacheCreationControl.enabled}
+              onCheckedChange={(enabled) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  promptCacheCreationControl: { ...prev.promptCacheCreationControl, enabled },
+                }))
+              }
+            />
+            <label className="block rounded-md border bg-background p-4">
+              <div className="mb-3">
+                <div className="text-sm font-medium">控制维度</div>
+                <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                  凭据 + 会话 + 模型最贴近真实账号缓存隔离；会话 + 模型会跨凭据共享频次状态，适合减少调度换号后的重复 creation 上报。
+                </div>
+              </div>
+              <select
+                className="h-10 w-full rounded-md border bg-background px-3 text-sm"
+                value={draft.promptCacheCreationControl.scopeMode}
+                disabled={!draft.promptCacheCreationControl.enabled}
+                onChange={(event) =>
+                  setDraft((prev) => ({
+                    ...prev,
+                    promptCacheCreationControl: {
+                      ...prev.promptCacheCreationControl,
+                      scopeMode: event.target.value as
+                        | 'credential_conversation_model'
+                        | 'conversation_model',
+                    },
+                  }))
+                }
+              >
+                <option value="credential_conversation_model">凭据 + 会话 + 模型</option>
+                <option value="conversation_model">会话 + 模型</option>
+              </select>
+            </label>
+            <NumberField
+              title="最小成功请求间隔"
+              description="同一控制维度下，两次 cache creation 之间至少间隔多少次成功请求。填 0 表示不按请求次数限制。"
+              value={draft.promptCacheCreationControl.minSuccessfulRequestsBetweenCreation}
+              disabled={!draft.promptCacheCreationControl.enabled}
+              min={0}
+              suffix="次"
+              onChange={(minSuccessfulRequestsBetweenCreation) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  promptCacheCreationControl: {
+                    ...prev.promptCacheCreationControl,
+                    minSuccessfulRequestsBetweenCreation,
+                  },
+                }))
+              }
+            />
+            <NumberField
+              title="最小时间间隔"
+              description="同一控制维度下，两次 cache creation 之间至少间隔多少秒。填 0 表示不按时间限制。"
+              value={draft.promptCacheCreationControl.minCreationIntervalSecs}
+              disabled={!draft.promptCacheCreationControl.enabled}
+              min={0}
+              suffix="秒"
+              onChange={(minCreationIntervalSecs) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  promptCacheCreationControl: { ...prev.promptCacheCreationControl, minCreationIntervalSecs },
+                }))
+              }
+            />
+            <NumberField
+              title="最小累计增量"
+              description="被抑制的 creation 累计到多少 tokens 后才允许下一次创建上报。填 0 表示不按增量限制。"
+              value={draft.promptCacheCreationControl.minCreationDeltaTokens}
+              disabled={!draft.promptCacheCreationControl.enabled}
+              min={0}
+              suffix="tokens"
+              onChange={(minCreationDeltaTokens) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  promptCacheCreationControl: { ...prev.promptCacheCreationControl, minCreationDeltaTokens },
+                }))
+              }
+            />
+            <NumberField
+              title="单次创建上限"
+              description="一次响应最多上报多少 cache creation tokens。超出部分会回到 input_tokens，填 0 表示不限制。"
+              value={draft.promptCacheCreationControl.maxCreationTokensPerEvent}
+              disabled={!draft.promptCacheCreationControl.enabled}
+              min={0}
+              suffix="tokens"
+              onChange={(maxCreationTokensPerEvent) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  promptCacheCreationControl: { ...prev.promptCacheCreationControl, maxCreationTokensPerEvent },
+                }))
+              }
+            />
+            <NumberField
+              title="额度窗口长度"
+              description="在这个时间窗口内累计控制 cache creation 额度。填 0 表示关闭窗口额度控制。"
+              value={draft.promptCacheCreationControl.creationBudgetWindowSecs}
+              disabled={!draft.promptCacheCreationControl.enabled}
+              min={0}
+              suffix="秒"
+              onChange={(creationBudgetWindowSecs) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  promptCacheCreationControl: { ...prev.promptCacheCreationControl, creationBudgetWindowSecs },
+                }))
+              }
+            />
+            <NumberField
+              title="窗口创建额度"
+              description="单个额度窗口内最多允许上报多少 cache creation tokens。填 0 表示不限制。"
+              value={draft.promptCacheCreationControl.maxCreationTokensPerWindow}
+              disabled={!draft.promptCacheCreationControl.enabled}
+              min={0}
+              suffix="tokens"
+              onChange={(maxCreationTokensPerWindow) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  promptCacheCreationControl: { ...prev.promptCacheCreationControl, maxCreationTokensPerWindow },
+                }))
+              }
+            />
+            <NumberField
+              title="状态空闲过期"
+              description="同一控制维度长时间没有请求后清理控制器状态。填 0 表示不按空闲时间清理。"
+              value={draft.promptCacheCreationControl.expireAfterIdleSecs}
+              disabled={!draft.promptCacheCreationControl.enabled}
+              min={0}
+              suffix="秒"
+              onChange={(expireAfterIdleSecs) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  promptCacheCreationControl: { ...prev.promptCacheCreationControl, expireAfterIdleSecs },
+                }))
               }
             />
           </ConfigSection>

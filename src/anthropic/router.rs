@@ -13,7 +13,7 @@ use crate::external_pool::ExternalPoolManager;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
     CompatProfile, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
-    PromptCacheSimulationMode, ReportedUsageConfig,
+    PromptCacheCreationControlConfig, PromptCacheSimulationMode, ReportedUsageConfig,
 };
 
 use super::{
@@ -25,6 +25,7 @@ use super::{
     model_capabilities::ModelCapabilitiesCatalog,
     pricing::PricingCatalog,
     prompt_cache::PromptCacheTracker,
+    prompt_cache_creation_control::PromptCacheCreationController,
     usage::UsageRecorder,
 };
 
@@ -61,6 +62,7 @@ pub fn create_router_with_provider(
     extract_thinking: bool,
     usage_recorder: Arc<UsageRecorder>,
     prompt_cache: Arc<PromptCacheTracker>,
+    prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
     pricing_catalog: Arc<PricingCatalog>,
     model_capabilities: Arc<ModelCapabilitiesCatalog>,
     prompt_cache_target_read_ratio: f64,
@@ -69,6 +71,7 @@ pub fn create_router_with_provider(
     prompt_cache_cap_jitter_min_tokens: i32,
     prompt_cache_cap_jitter_max_tokens: i32,
     prompt_cache_scale_min_input_tokens: i32,
+    prompt_cache_creation_control: PromptCacheCreationControlConfig,
     reported_usage: ReportedUsageConfig,
     compat_profile: CompatProfile,
     model_resolution_mode: ModelResolutionMode,
@@ -86,6 +89,7 @@ pub fn create_router_with_provider(
         extract_thinking,
         usage_recorder,
         prompt_cache,
+        prompt_cache_creation_controller,
         PromptCacheSimulationMode::HighCache,
         prompt_cache_target_read_ratio,
         compat_profile,
@@ -98,6 +102,7 @@ pub fn create_router_with_provider(
         prompt_cache_cap_jitter_max_tokens,
         prompt_cache_scale_min_input_tokens,
     )
+    .with_prompt_cache_creation_control(prompt_cache_creation_control)
     .with_reported_usage(reported_usage)
     .with_model_resolution_mode(model_resolution_mode)
     .with_model_mapping(model_mapping)
@@ -198,6 +203,7 @@ mod tests {
             true,
             Arc::new(UsageRecorder::new(10)),
             Arc::new(PromptCacheTracker::default()),
+            Arc::new(PromptCacheCreationController::default()),
             mode,
             0.98,
             CompatProfile::ClaudeCode,

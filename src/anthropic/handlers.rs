@@ -14,8 +14,8 @@ use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::model::config::{
     CompatProfile, Config, ExternalPoolCapacityMode, ExternalPoolsConfig, ModelMappingConfig,
-    ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig, PromptCacheSimulationMode,
-    ReportedUsageConfig,
+    ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
+    PromptCacheSimulationMode, ReportedUsageConfig,
 };
 use crate::token;
 use anyhow::Error;
@@ -67,6 +67,8 @@ const MAX_REMOTE_MULTIMODAL_BYTES: usize = 20 * 1024 * 1024;
 struct RequestUsageContext {
     recorder: Arc<super::usage::UsageRecorder>,
     prompt_cache: Arc<super::prompt_cache::PromptCacheTracker>,
+    prompt_cache_creation_controller:
+        Arc<super::prompt_cache_creation_control::PromptCacheCreationController>,
     pricing_catalog: Arc<super::pricing::PricingCatalog>,
     request_id: String,
     endpoint: &'static str,
@@ -87,6 +89,7 @@ struct RequestUsageContext {
     prompt_cache_cap_jitter_min_tokens: i32,
     prompt_cache_cap_jitter_max_tokens: i32,
     prompt_cache_scale_min_input_tokens: i32,
+    prompt_cache_creation_control: PromptCacheCreationControlConfig,
     reported_cache_usage_policy: Option<super::cache::ReportedCacheUsagePolicy>,
     simulated_usage: Option<super::cache::CacheSimulation>,
     simulated_source: Option<UsageSource>,
@@ -133,6 +136,7 @@ struct RequestRuntimeConfig {
     prompt_cache_cap_jitter_min_tokens: i32,
     prompt_cache_cap_jitter_max_tokens: i32,
     prompt_cache_scale_min_input_tokens: i32,
+    prompt_cache_creation_control: PromptCacheCreationControlConfig,
     reported_usage: ReportedUsageConfig,
     compat_profile: CompatProfile,
     model_resolution_mode: ModelResolutionMode,
@@ -155,6 +159,7 @@ impl RequestRuntimeConfig {
             prompt_cache_cap_jitter_min_tokens: state.prompt_cache_cap_jitter_min_tokens,
             prompt_cache_cap_jitter_max_tokens: state.prompt_cache_cap_jitter_max_tokens,
             prompt_cache_scale_min_input_tokens: state.prompt_cache_scale_min_input_tokens,
+            prompt_cache_creation_control: state.prompt_cache_creation_control,
             reported_usage: state.reported_usage.clone(),
             compat_profile: state.compat_profile,
             model_resolution_mode: state.model_resolution_mode,
@@ -187,6 +192,7 @@ impl RequestRuntimeConfig {
             prompt_cache_cap_jitter_min_tokens: config.prompt_cache_cap_jitter_min_tokens.max(0),
             prompt_cache_cap_jitter_max_tokens: config.prompt_cache_cap_jitter_max_tokens.max(0),
             prompt_cache_scale_min_input_tokens: config.prompt_cache_scale_min_input_tokens.max(0),
+            prompt_cache_creation_control: config.prompt_cache_creation_control.normalized(),
             reported_usage: config.reported_usage.normalized(),
             compat_profile: config.compat_profile,
             model_resolution_mode: config.model_resolution_mode,
@@ -800,6 +806,57 @@ impl CredentialUsageContext {
         }
     }
 
+    fn final_reported_usage_for_success(
+        &self,
+        usage: super::cache::CacheUsage,
+        usage_source: UsageSource,
+    ) -> super::cache::CacheUsage {
+        let reported_usage = self
+            .request
+            .reported_usage_for_downstream(usage, usage_source);
+        self.apply_creation_frequency_control(reported_usage, usage_source)
+    }
+
+    fn apply_creation_frequency_control(
+        &self,
+        reported_usage: super::cache::CacheUsage,
+        usage_source: UsageSource,
+    ) -> super::cache::CacheUsage {
+        if usage_source != UsageSource::LocalPromptCache
+            || self.request.simulation_mode != PromptCacheSimulationMode::HighCache
+        {
+            return reported_usage;
+        }
+
+        let scope = self.scope();
+        self.request.prompt_cache_creation_controller.apply_success(
+            scope.as_ref(),
+            self.request.prompt_cache_creation_control,
+            reported_usage,
+        )
+    }
+
+    fn preview_creation_frequency_control(
+        &self,
+        reported_usage: super::cache::CacheUsage,
+        usage_source: UsageSource,
+    ) -> super::cache::CacheUsage {
+        if usage_source != UsageSource::LocalPromptCache
+            || self.request.simulation_mode != PromptCacheSimulationMode::HighCache
+        {
+            return reported_usage;
+        }
+
+        let scope = self.scope();
+        self.request
+            .prompt_cache_creation_controller
+            .preview_success(
+                scope.as_ref(),
+                self.request.prompt_cache_creation_control,
+                reported_usage,
+            )
+    }
+
     fn uses_local_prompt_cache_fallback(
         &self,
         metadata_usage: Option<&crate::kiro::model::events::MetadataTokenUsage>,
@@ -818,12 +875,10 @@ impl CredentialUsageContext {
         let metadata_usage = ctx.metadata_usage();
         let context_estimated = metadata_usage.is_none() && ctx.context_input_tokens_seen();
         let usage_source = self.usage_source(&usage, metadata_usage, context_estimated);
-        self.record_success(
-            self.request
-                .reported_usage_for_downstream(usage, usage_source),
-            usage_source,
-            context_estimated,
-        );
+        let reported_usage = ctx
+            .final_reported_usage()
+            .unwrap_or_else(|| self.final_reported_usage_for_success(usage, usage_source));
+        self.record_success(reported_usage, usage_source, context_estimated);
     }
 
     fn record_stream_failure_from_context(
@@ -1507,6 +1562,7 @@ fn prepare_usage_context(
     RequestUsageContext {
         recorder: state.usage_recorder.clone(),
         prompt_cache: state.prompt_cache.clone(),
+        prompt_cache_creation_controller: state.prompt_cache_creation_controller.clone(),
         pricing_catalog: state.pricing_catalog.clone(),
         request_id,
         endpoint,
@@ -1544,6 +1600,7 @@ fn prepare_usage_context(
         prompt_cache_cap_jitter_min_tokens: runtime_config.prompt_cache_cap_jitter_min_tokens,
         prompt_cache_cap_jitter_max_tokens: runtime_config.prompt_cache_cap_jitter_max_tokens,
         prompt_cache_scale_min_input_tokens: runtime_config.prompt_cache_scale_min_input_tokens,
+        prompt_cache_creation_control: runtime_config.prompt_cache_creation_control,
         reported_cache_usage_policy,
         simulated_usage,
         simulated_source,
@@ -2582,7 +2639,10 @@ async fn handle_stream_request(
     ctx.set_reported_cache_usage_policy(credential_usage.request.reported_cache_usage_policy());
 
     // 生成初始事件
-    let initial_events = ctx.generate_initial_events();
+    let initial_events = ctx.generate_initial_events_with_reported_usage_mapper(|reported_usage| {
+        credential_usage
+            .preview_creation_frequency_control(reported_usage, UsageSource::LocalPromptCache)
+    });
 
     // 创建 SSE 流
     let response_request_id = credential_usage.request.request_id.clone();
@@ -2726,7 +2786,25 @@ fn create_sse_stream(
                             }
                             let had_stream_error = ctx.has_stream_error();
                             let error_detail = ctx.stream_error_detail();
-                            let final_events = ctx.generate_final_events();
+                            let final_events = if had_stream_error {
+                                ctx.generate_final_events()
+                            } else {
+                                ctx.generate_final_events_with_reported_usage_mapper(
+                                    |final_usage, reported_usage, metadata_usage, context_estimated| {
+                                        let usage_source = usage_guard.context().usage_source(
+                                            &final_usage,
+                                            metadata_usage,
+                                            context_estimated,
+                                        );
+                                        usage_guard
+                                            .context()
+                                            .apply_creation_frequency_control(
+                                                reported_usage,
+                                                usage_source,
+                                            )
+                                    },
+                                )
+                            };
                             if had_stream_error {
                                 usage_guard.context().record_stream_failure_from_context(
                                     UsageRecordStatus::StreamError,
@@ -3186,9 +3264,7 @@ async fn handle_non_stream_request(
     let context_estimated = !has_metadata && context_input_tokens.is_some();
     let usage_source =
         credential_usage.usage_source(&usage, metadata_usage.as_ref(), context_estimated);
-    let reported_usage = credential_usage
-        .request
-        .reported_usage_for_downstream(usage, usage_source);
+    let reported_usage = credential_usage.final_reported_usage_for_success(usage, usage_source);
     credential_usage.record_success(reported_usage, usage_source, context_estimated);
     completion.report_success();
 
@@ -3568,6 +3644,7 @@ mod tests {
     use crate::anthropic::cache::{self, CacheUsage};
     use crate::anthropic::pricing::PricingCatalog;
     use crate::anthropic::prompt_cache::PromptCacheTracker;
+    use crate::anthropic::prompt_cache_creation_control::PromptCacheCreationController;
     use crate::anthropic::types::{Message, SystemMessage};
     use crate::anthropic::usage::UsageRecorder;
     use crate::kiro::model::events::MetadataTokenUsage;
@@ -3604,6 +3681,7 @@ mod tests {
             prompt_cache_cap_jitter_min_tokens: 0,
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
+            prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
             reported_usage: ReportedUsageConfig::default(),
             compat_profile: CompatProfile::ClaudeCode,
             model_resolution_mode: ModelResolutionMode::Compatible,
@@ -3833,6 +3911,7 @@ mod tests {
         let usage_context = RequestUsageContext {
             recorder: usage_recorder,
             prompt_cache,
+            prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_reported_limit".to_string(),
             endpoint: "/cc/v1/messages",
@@ -3853,6 +3932,7 @@ mod tests {
             prompt_cache_cap_jitter_min_tokens: 0,
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
+            prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
             reported_cache_usage_policy: reported_cache_usage_policy(
                 "/cc/v1/messages",
                 PromptCacheSimulationMode::HighCache,
@@ -3912,6 +3992,7 @@ mod tests {
         let v1_context = RequestUsageContext {
             recorder: usage_recorder.clone(),
             prompt_cache: prompt_cache.clone(),
+            prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_v1_policy".to_string(),
             endpoint: "/v1/messages",
@@ -3932,6 +4013,7 @@ mod tests {
             prompt_cache_cap_jitter_min_tokens: 0,
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
+            prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
             reported_cache_usage_policy: reported_cache_usage_policy(
                 "/v1/messages",
                 PromptCacheSimulationMode::HighCache,
@@ -4061,6 +4143,7 @@ mod tests {
         let usage_context = RequestUsageContext {
             recorder: usage_recorder.clone(),
             prompt_cache,
+            prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_error_hint".to_string(),
             endpoint: "/v1/messages",
@@ -4081,6 +4164,7 @@ mod tests {
             prompt_cache_cap_jitter_min_tokens: 0,
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
+            prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
             reported_cache_usage_policy: None,
             simulated_usage: None,
             simulated_source: None,
@@ -4156,6 +4240,7 @@ mod tests {
         let usage_context = RequestUsageContext {
             recorder: usage_recorder,
             prompt_cache: prompt_cache.clone(),
+            prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_test".to_string(),
             endpoint: "/v1/messages",
@@ -4176,6 +4261,7 @@ mod tests {
             prompt_cache_cap_jitter_min_tokens: 0,
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
+            prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
             reported_cache_usage_policy: None,
             simulated_usage: None,
             simulated_source: Some(UsageSource::LocalPromptCache),
@@ -4231,6 +4317,7 @@ mod tests {
         let usage_context = RequestUsageContext {
             recorder: usage_recorder,
             prompt_cache: prompt_cache.clone(),
+            prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_high_cache".to_string(),
             endpoint: "/v1/messages",
@@ -4251,6 +4338,7 @@ mod tests {
             prompt_cache_cap_jitter_min_tokens: 0,
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
+            prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
             reported_cache_usage_policy: None,
             simulated_usage: Some(cache::CacheSimulation {
                 cache_creation_input_tokens: 3968,
@@ -4303,6 +4391,7 @@ mod tests {
             true,
             usage_recorder,
             prompt_cache,
+            Arc::new(PromptCacheCreationController::default()),
             PromptCacheSimulationMode::HighCache,
             0.95,
             CompatProfile::ClaudeCode,
@@ -4421,6 +4510,7 @@ mod tests {
             true,
             usage_recorder,
             prompt_cache.clone(),
+            Arc::new(PromptCacheCreationController::default()),
             PromptCacheSimulationMode::Disabled,
             0.95,
             CompatProfile::ClaudeCode,
@@ -4480,6 +4570,7 @@ mod tests {
             true,
             usage_recorder,
             prompt_cache,
+            Arc::new(PromptCacheCreationController::default()),
             PromptCacheSimulationMode::Disabled,
             0.95,
             CompatProfile::ClaudeCode,
@@ -4565,6 +4656,7 @@ mod tests {
             true,
             usage_recorder,
             prompt_cache,
+            Arc::new(PromptCacheCreationController::default()),
             PromptCacheSimulationMode::Disabled,
             0.85,
             CompatProfile::AnthropicStrict,

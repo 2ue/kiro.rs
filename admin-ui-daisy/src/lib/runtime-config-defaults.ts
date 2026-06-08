@@ -1,5 +1,6 @@
 import type {
   PayloadShapingConfig,
+  PromptCacheCreationControlConfig,
   ReportedUsageConfig,
   ReportedUsageFieldMode,
   ReportedUsageFieldPolicy,
@@ -77,6 +78,20 @@ export function defaultPayloadShaping(): PayloadShapingConfig {
     currentDocumentMaxChars: 80000,
     truncateCurrentImages: false,
     currentImagesMaxBytes: 180000,
+  }
+}
+
+export function defaultPromptCacheCreationControl(): PromptCacheCreationControlConfig {
+  return {
+    enabled: false,
+    scopeMode: 'credential_conversation_model',
+    minSuccessfulRequestsBetweenCreation: 3,
+    minCreationIntervalSecs: 60,
+    minCreationDeltaTokens: 12000,
+    maxCreationTokensPerEvent: 30000,
+    creationBudgetWindowSecs: 300,
+    maxCreationTokensPerWindow: 120000,
+    expireAfterIdleSecs: 3600,
   }
 }
 
@@ -173,6 +188,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   promptCacheCapJitterMinTokens: 12000,
   promptCacheCapJitterMaxTokens: 24000,
   promptCacheScaleMinInputTokens: 20000,
+  promptCacheCreationControl: defaultPromptCacheCreationControl(),
   reportedUsage: defaultReportedUsage(),
   externalPools: defaultExternalPoolsConfig(),
   highCacheThreshold: 10000,
@@ -258,6 +274,26 @@ export function normalizeReportedUsage(config: ReportedUsageConfig): ReportedUsa
   return {
     default: normalizePathPolicy(config.default),
     pathOverrides,
+  }
+}
+
+export function normalizePromptCacheCreationControl(
+  config: PromptCacheCreationControlConfig
+): PromptCacheCreationControlConfig {
+  return {
+    ...defaultPromptCacheCreationControl(),
+    ...config,
+    scopeMode:
+      config.scopeMode === 'conversation_model'
+        ? 'conversation_model'
+        : 'credential_conversation_model',
+    minSuccessfulRequestsBetweenCreation: toWhole(config.minSuccessfulRequestsBetweenCreation),
+    minCreationIntervalSecs: toWhole(config.minCreationIntervalSecs),
+    minCreationDeltaTokens: toWhole(config.minCreationDeltaTokens),
+    maxCreationTokensPerEvent: toWhole(config.maxCreationTokensPerEvent),
+    creationBudgetWindowSecs: toWhole(config.creationBudgetWindowSecs),
+    maxCreationTokensPerWindow: toWhole(config.maxCreationTokensPerWindow),
+    expireAfterIdleSecs: toWhole(config.expireAfterIdleSecs),
   }
 }
 

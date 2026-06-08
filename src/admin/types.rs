@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::anthropic::pricing::ModelPricing;
 use crate::model::config::{
     CompatProfile, CompressionConfig, ExternalPoolsConfig, ModelMappingConfig, ModelResolutionMode,
-    PayloadGuardMode, PayloadShapingConfig, PayloadShapingConfigPatch, ReportedUsageConfig,
+    PayloadGuardMode, PayloadShapingConfig, PayloadShapingConfigPatch,
+    PromptCacheCreationControlConfig, ReportedUsageConfig,
 };
 
 // ============ 凭据状态 ============
@@ -865,6 +866,7 @@ pub struct RuntimeConfigResponse {
     pub prompt_cache_cap_jitter_min_tokens: i32,
     pub prompt_cache_cap_jitter_max_tokens: i32,
     pub prompt_cache_scale_min_input_tokens: i32,
+    pub prompt_cache_creation_control: PromptCacheCreationControlConfig,
     pub reported_usage: ReportedUsageConfig,
     pub external_pools: ExternalPoolsConfig,
     pub high_cache_threshold: i32,
@@ -959,6 +961,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub prompt_cache_cap_jitter_max_tokens: Option<i32>,
     #[serde(default)]
     pub prompt_cache_scale_min_input_tokens: Option<i32>,
+    #[serde(default)]
+    pub prompt_cache_creation_control: Option<PromptCacheCreationControlConfig>,
     #[serde(default)]
     pub reported_usage: Option<ReportedUsageConfig>,
     #[serde(default)]
