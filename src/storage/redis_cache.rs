@@ -20,6 +20,8 @@ pub struct SchedulerSessionBinding {
 pub struct SchedulerCooldownState {
     pub until_ms: i64,
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -50,8 +52,16 @@ pub struct SchedulerInFlightLease {
 pub struct SchedulerCredentialState {
     pub cooldown: Option<SchedulerCooldownState>,
     pub health: SchedulerHealthState,
+    pub model_states: Vec<SchedulerModelState>,
     pub rate_limit_available_at_ms: Option<i64>,
     pub in_flight_leases: Vec<SchedulerInFlightLease>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SchedulerModelState {
+    pub model: String,
+    pub cooldown: Option<SchedulerCooldownState>,
+    pub health: SchedulerHealthState,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -438,6 +448,7 @@ impl RedisStore {
         let state = SchedulerCooldownState {
             until_ms: now + duration.as_millis() as i64,
             reason,
+            model: None,
         };
         let encoded = serde_json::to_string(&state)?;
         let ttl_ms = (state.until_ms - now).max(1);
@@ -487,12 +498,27 @@ impl RedisStore {
     }
 
     pub async fn clear_scheduler_cooldown(&self, credential_id: u64) -> anyhow::Result<()> {
-        self.del(scheduler_cooldown_key(credential_id)).await
+        let mut manager = self.manager.clone();
+        let index_key = scheduler_model_index_key(credential_id);
+        let models: HashMap<String, String> = manager
+            .hgetall(self.key(&index_key))
+            .await
+            .unwrap_or_default();
+        let mut pipe = redis::pipe();
+        pipe.cmd("DEL")
+            .arg(self.key(scheduler_cooldown_key(credential_id)));
+        for hash in models.keys() {
+            pipe.cmd("DEL")
+                .arg(self.key(scheduler_model_cooldown_key(credential_id, hash)));
+        }
+        let _: () = pipe.query_async(&mut manager).await?;
+        Ok(())
     }
 
     pub async fn record_scheduler_transient_failure(
         &self,
         credential_id: u64,
+        model: Option<&str>,
         kind: &str,
         reason: &str,
         retry_after: Option<StdDuration>,
@@ -507,6 +533,16 @@ impl RedisStore {
         let retry_after_ms = retry_after
             .map(|duration| duration.as_millis().max(1) as i64)
             .unwrap_or(-1);
+        let model = model.map(str::trim).filter(|value| !value.is_empty());
+        let model_hash = model.map(scheduler_model_hash);
+        let cooldown_key = match model_hash.as_deref() {
+            Some(hash) => scheduler_model_cooldown_key(credential_id, hash),
+            None => scheduler_cooldown_key(credential_id),
+        };
+        let health_key = match model_hash.as_deref() {
+            Some(hash) => scheduler_model_health_key(credential_id, hash),
+            None => scheduler_health_key(credential_id),
+        };
         let script = r#"
             local now = tonumber(ARGV[1])
             local kind = ARGV[2]
@@ -519,6 +555,8 @@ impl RedisStore {
             local probation_ms = tonumber(ARGV[9])
             local alpha = tonumber(ARGV[10])
             local health_ttl = tonumber(ARGV[11])
+            local model = ARGV[12]
+            local model_hash = ARGV[13]
 
             local health = {}
             local health_raw = redis.call('GET', KEYS[2])
@@ -544,6 +582,7 @@ impl RedisStore {
             local candidate_until = now + duration_ms
 
             local cooldown = {until_ms = candidate_until, reason = reason}
+            if model ~= '' then cooldown['model'] = model end
             local cooldown_raw = redis.call('GET', KEYS[1])
             if cooldown_raw then
                 local ok, parsed = pcall(cjson.decode, cooldown_raw)
@@ -558,15 +597,20 @@ impl RedisStore {
             local cooldown_encoded = cjson.encode(cooldown)
             redis.call('SET', KEYS[2], health_encoded, 'EX', health_ttl)
             redis.call('SET', KEYS[1], cooldown_encoded, 'PX', math.max(1, tonumber(cooldown['until_ms']) - now))
+            if model ~= '' then
+                redis.call('HSET', KEYS[3], model_hash, model)
+                redis.call('EXPIRE', KEYS[3], health_ttl)
+            end
             return {cooldown_encoded, health_encoded}
         "#;
         let health_ttl_secs = 30 * 24 * 60 * 60;
         let mut manager = self.manager.clone();
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(script)
-            .arg(2)
-            .arg(self.key(scheduler_cooldown_key(credential_id)))
-            .arg(self.key(scheduler_health_key(credential_id)))
+            .arg(3)
+            .arg(self.key(cooldown_key))
+            .arg(self.key(health_key))
+            .arg(self.key(scheduler_model_index_key(credential_id)))
             .arg(now)
             .arg(kind)
             .arg(reason)
@@ -578,6 +622,8 @@ impl RedisStore {
             .arg(probation.as_millis() as i64)
             .arg(ewma_alpha.clamp(0.01, 1.0))
             .arg(health_ttl_secs)
+            .arg(model.unwrap_or(""))
+            .arg(model_hash.as_deref().unwrap_or(""))
             .query_async(&mut manager)
             .await?;
         let cooldown = serde_json::from_str(
@@ -596,13 +642,22 @@ impl RedisStore {
     pub async fn record_scheduler_success(
         &self,
         credential_id: u64,
+        model: Option<&str>,
         latency: Option<StdDuration>,
         ewma_alpha: f64,
     ) -> anyhow::Result<SchedulerHealthState> {
+        let model = model.map(str::trim).filter(|value| !value.is_empty());
+        let model_hash = model.map(scheduler_model_hash);
+        let health_key = match model_hash.as_deref() {
+            Some(hash) => scheduler_model_health_key(credential_id, hash),
+            None => scheduler_health_key(credential_id),
+        };
         let script = r#"
             local alpha = tonumber(ARGV[1])
             local latency_ms = tonumber(ARGV[2])
             local ttl = tonumber(ARGV[3])
+            local model = ARGV[4]
+            local model_hash = ARGV[5]
             local health = {}
             local raw = redis.call('GET', KEYS[1])
             if raw then
@@ -622,6 +677,10 @@ impl RedisStore {
             end
             local encoded = cjson.encode(health)
             redis.call('SET', KEYS[1], encoded, 'EX', ttl)
+            if model ~= '' then
+                redis.call('HSET', KEYS[2], model_hash, model)
+                redis.call('EXPIRE', KEYS[2], ttl)
+            end
             return encoded
         "#;
         let latency_ms = latency
@@ -630,11 +689,14 @@ impl RedisStore {
         let mut manager = self.manager.clone();
         let encoded: String = redis::cmd("EVAL")
             .arg(script)
-            .arg(1)
-            .arg(self.key(scheduler_health_key(credential_id)))
+            .arg(2)
+            .arg(self.key(health_key))
+            .arg(self.key(scheduler_model_index_key(credential_id)))
             .arg(ewma_alpha.clamp(0.01, 1.0))
             .arg(latency_ms)
             .arg(30 * 24 * 60 * 60)
+            .arg(model.unwrap_or(""))
+            .arg(model_hash.as_deref().unwrap_or(""))
             .query_async(&mut manager)
             .await?;
         Ok(serde_json::from_str(&encoded)?)
@@ -688,14 +750,26 @@ impl RedisStore {
 
     pub async fn clear_scheduler_health(&self, credential_id: u64) -> anyhow::Result<()> {
         let mut manager = self.manager.clone();
-        let _: (i64, i64) = redis::pipe()
-            .atomic()
+        let index_key = scheduler_model_index_key(credential_id);
+        let models: HashMap<String, String> = manager
+            .hgetall(self.key(&index_key))
+            .await
+            .unwrap_or_default();
+        let mut pipe = redis::pipe();
+        pipe.atomic()
             .cmd("DEL")
             .arg(self.key(scheduler_health_key(credential_id)))
             .cmd("DEL")
             .arg(self.key(scheduler_selection_window_key(credential_id)))
-            .query_async(&mut manager)
-            .await?;
+            .cmd("DEL")
+            .arg(self.key(&index_key));
+        for hash in models.keys() {
+            pipe.cmd("DEL")
+                .arg(self.key(scheduler_model_health_key(credential_id, hash)))
+                .cmd("DEL")
+                .arg(self.key(scheduler_model_cooldown_key(credential_id, hash)));
+        }
+        let _: () = pipe.query_async(&mut manager).await?;
         Ok(())
     }
 
@@ -1321,15 +1395,18 @@ impl RedisStore {
                 .cmd("ZCOUNT")
                 .arg(self.key(scheduler_selection_window_key(*credential_id)))
                 .arg(query_now - 5 * 60_000)
-                .arg("+inf");
+                .arg("+inf")
+                .cmd("HGETALL")
+                .arg(self.key(scheduler_model_index_key(*credential_id)));
         }
 
         let mut manager = self.manager.clone();
         let values: Vec<redis::Value> = pipe.query_async(&mut manager).await?;
         let now = now_ms();
         let mut keys_to_delete = Vec::new();
+        let mut indexed_models: Vec<(u64, String, String)> = Vec::new();
         for (index, credential_id) in credential_ids.iter().enumerate() {
-            let base = index * 9;
+            let base = index * 10;
             let cooldown_raw: Option<String> = redis::from_redis_value(&values[base])?;
             let health_raw: Option<String> = redis::from_redis_value(&values[base + 1])?;
             let rate_raw: Option<String> = redis::from_redis_value(&values[base + 2])?;
@@ -1339,6 +1416,12 @@ impl RedisStore {
             let recent_10s: i64 = redis::from_redis_value(&values[base + 6])?;
             let recent_60s: i64 = redis::from_redis_value(&values[base + 7])?;
             let recent_5m: i64 = redis::from_redis_value(&values[base + 8])?;
+            let model_index: HashMap<String, String> = redis::from_redis_value(&values[base + 9])?;
+            for (hash, model) in model_index {
+                if !hash.is_empty() && !model.trim().is_empty() {
+                    indexed_models.push((*credential_id, hash, model));
+                }
+            }
 
             let cooldown = cooldown_raw
                 .as_deref()
@@ -1394,10 +1477,52 @@ impl RedisStore {
                 SchedulerCredentialState {
                     cooldown,
                     health,
+                    model_states: Vec::new(),
                     rate_limit_available_at_ms,
                     in_flight_leases,
                 },
             );
+        }
+        if !indexed_models.is_empty() {
+            let mut model_pipe = redis::pipe();
+            for (credential_id, hash, _) in &indexed_models {
+                model_pipe
+                    .cmd("GET")
+                    .arg(self.key(scheduler_model_cooldown_key(*credential_id, hash)))
+                    .cmd("GET")
+                    .arg(self.key(scheduler_model_health_key(*credential_id, hash)));
+            }
+            let model_values: Vec<redis::Value> = model_pipe.query_async(&mut manager).await?;
+            for (index, (credential_id, hash, model)) in indexed_models.into_iter().enumerate() {
+                let base = index * 2;
+                let cooldown_raw: Option<String> = redis::from_redis_value(&model_values[base])?;
+                let health_raw: Option<String> = redis::from_redis_value(&model_values[base + 1])?;
+                let cooldown = cooldown_raw
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<SchedulerCooldownState>(raw).ok())
+                    .and_then(|mut state| {
+                        if state.until_ms <= now {
+                            keys_to_delete.push(scheduler_model_cooldown_key(credential_id, &hash));
+                            None
+                        } else {
+                            if state.model.is_none() {
+                                state.model = Some(model.clone());
+                            }
+                            Some(state)
+                        }
+                    });
+                let health = health_raw
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<SchedulerHealthState>(raw).ok())
+                    .unwrap_or_default();
+                if let Some(state) = states.get_mut(&credential_id) {
+                    state.model_states.push(SchedulerModelState {
+                        model,
+                        cooldown,
+                        health,
+                    });
+                }
+            }
         }
         if !keys_to_delete.is_empty() {
             let mut manager = self.manager.clone();
@@ -1561,6 +1686,24 @@ fn scheduler_cooldown_key(credential_id: u64) -> String {
 
 fn scheduler_health_key(credential_id: u64) -> String {
     format!("scheduler:health:{}", credential_id)
+}
+
+fn scheduler_model_hash(model: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(model.trim().to_ascii_lowercase().as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn scheduler_model_index_key(credential_id: u64) -> String {
+    format!("scheduler:models:{}", credential_id)
+}
+
+fn scheduler_model_cooldown_key(credential_id: u64, model_hash: &str) -> String {
+    format!("scheduler:cooldown:{}:model:{}", credential_id, model_hash)
+}
+
+fn scheduler_model_health_key(credential_id: u64, model_hash: &str) -> String {
+    format!("scheduler:health:{}:model:{}", credential_id, model_hash)
 }
 
 fn scheduler_selection_window_key(credential_id: u64) -> String {
@@ -1817,6 +1960,7 @@ mod tests {
         let (_, failure_health) = store
             .record_scheduler_transient_failure(
                 3,
+                None,
                 "rate_limit",
                 "429",
                 None,
@@ -1832,11 +1976,59 @@ mod tests {
         assert_eq!(failure_health.transient_failure_streak, 1);
         assert!(failure_health.recent_error_rate > 0.0);
         let success_health = store
-            .record_scheduler_success(3, Some(StdDuration::from_millis(120)), 0.2)
+            .record_scheduler_success(3, None, Some(StdDuration::from_millis(120)), 0.2)
             .await
             .unwrap();
         assert_eq!(success_health.transient_failure_streak, 0);
         assert_eq!(success_health.latency_ewma_ms, Some(120.0));
+
+        store.clear_scheduler_health(4).await.unwrap();
+        store.clear_scheduler_cooldown(4).await.unwrap();
+        let (model_cooldown, model_failure_health) = store
+            .record_scheduler_transient_failure(
+                4,
+                Some("claude-opus-4.8"),
+                "rate_limit",
+                "429 opus",
+                Some(StdDuration::from_secs(10)),
+                StdDuration::from_secs(1),
+                StdDuration::from_secs(30),
+                2.0,
+                1.0,
+                StdDuration::from_secs(5),
+                0.2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(model_cooldown.model.as_deref(), Some("claude-opus-4.8"));
+        assert_eq!(model_failure_health.transient_failure_streak, 1);
+        let model_states = store.scheduler_state_for_credentials(&[4]).await.unwrap();
+        let credential_state = model_states.get(&4).unwrap();
+        assert!(credential_state.cooldown.is_none());
+        let opus_state = credential_state
+            .model_states
+            .iter()
+            .find(|state| state.model == "claude-opus-4.8")
+            .unwrap();
+        assert_eq!(
+            opus_state
+                .cooldown
+                .as_ref()
+                .and_then(|cooldown| cooldown.reason.as_deref()),
+            Some("429 opus")
+        );
+        let model_success_health = store
+            .record_scheduler_success(
+                4,
+                Some("claude-opus-4.8"),
+                Some(StdDuration::from_millis(88)),
+                0.2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(model_success_health.transient_failure_streak, 0);
+        assert!(store.get_scheduler_cooldown(4).await.unwrap().is_none());
+
         let selected_once = store.record_scheduler_selection(3).await.unwrap();
         assert_eq!(selected_once.selection_count, 1);
         assert_eq!(selected_once.recent_selection_count_10s, 1);
@@ -1856,6 +2048,7 @@ mod tests {
             2
         );
         store.clear_scheduler_health(3).await.unwrap();
+        store.clear_scheduler_health(4).await.unwrap();
     }
 
     #[tokio::test]

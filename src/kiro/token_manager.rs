@@ -523,6 +523,8 @@ struct CredentialEntry {
     cooldown_until: Option<Instant>,
     /// 临时冷却原因，便于诊断。
     cooldown_reason: Option<String>,
+    /// 按真实上游模型维度同步的 Redis 冷却镜像。
+    model_cooldowns: HashMap<String, CredentialModelCooldown>,
     /// 下一次本地限流允许发送请求的时间，不持久化。
     rate_limit_available_at: Option<Instant>,
     /// 当前正在使用该凭据的请求数，不持久化。
@@ -533,8 +535,17 @@ struct CredentialEntry {
     warmup_remaining: u32,
     /// 近期上游健康状态；Redis 部署下在调度前同步。
     health: SchedulerHealthState,
+    /// 按真实上游模型维度同步的 Redis 健康状态镜像。
+    model_health: HashMap<String, SchedulerHealthState>,
     /// 本进程内的近期调度选中事件；无 Redis 时用于计算短窗口调度压力。
     selection_events: VecDeque<Instant>,
+}
+
+#[derive(Debug, Clone)]
+struct CredentialModelCooldown {
+    model: String,
+    until: Instant,
+    reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -819,6 +830,9 @@ pub struct CredentialEntrySnapshot {
     /// 临时冷却原因。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cooldown_reason: Option<String>,
+    /// 当前所有活动冷却项，包含全局冷却和模型专属冷却。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cooldowns: Vec<CredentialCooldownSnapshot>,
     /// 是否因本地速率限制暂不可用。
     pub rate_limited: bool,
     /// 本地速率限制剩余秒数。
@@ -868,6 +882,16 @@ pub struct CredentialEntrySnapshot {
     pub scheduler_selection_pressure: f64,
     /// 当前健康评分；越低越优先，仅健康均衡模式有实际决策意义。
     pub scheduler_score: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialCooldownSnapshot {
+    pub model: Option<String>,
+    pub global: bool,
+    pub remaining_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -1353,11 +1377,13 @@ impl MultiTokenManager {
                     last_used_at: None,
                     cooldown_until: None,
                     cooldown_reason: None,
+                    model_cooldowns: HashMap::new(),
                     rate_limit_available_at: None,
                     in_flight_requests: 0,
                     in_flight_leases: Vec::new(),
                     warmup_remaining: 0,
                     health: SchedulerHealthState::default(),
+                    model_health: HashMap::new(),
                     selection_events: VecDeque::new(),
                 }
             })
@@ -1541,10 +1567,108 @@ impl MultiTokenManager {
         true
     }
 
-    fn entry_cooldown_remaining(entry: &CredentialEntry, now: Instant) -> Option<StdDuration> {
+    fn model_state_key(model: &str) -> String {
+        model.trim().to_ascii_lowercase()
+    }
+
+    fn entry_global_cooldown_remaining(
+        entry: &CredentialEntry,
+        now: Instant,
+    ) -> Option<StdDuration> {
         entry
             .cooldown_until
             .and_then(|until| until.checked_duration_since(now))
+    }
+
+    fn entry_model_cooldown<'a>(
+        entry: &'a CredentialEntry,
+        model: Option<&str>,
+    ) -> Option<&'a CredentialModelCooldown> {
+        model
+            .map(Self::model_state_key)
+            .and_then(|key| entry.model_cooldowns.get(&key))
+    }
+
+    fn entry_model_cooldown_remaining(
+        entry: &CredentialEntry,
+        model: Option<&str>,
+        now: Instant,
+    ) -> Option<StdDuration> {
+        Self::entry_model_cooldown(entry, model)
+            .and_then(|cooldown| cooldown.until.checked_duration_since(now))
+    }
+
+    fn entry_cooldown_remaining(
+        entry: &CredentialEntry,
+        model: Option<&str>,
+        now: Instant,
+    ) -> Option<StdDuration> {
+        match (
+            Self::entry_global_cooldown_remaining(entry, now),
+            Self::entry_model_cooldown_remaining(entry, model, now),
+        ) {
+            (Some(global), Some(model)) => Some(global.max(model)),
+            (Some(global), None) => Some(global),
+            (None, Some(model)) => Some(model),
+            (None, None) => None,
+        }
+    }
+
+    fn entry_any_cooldown_remaining(entry: &CredentialEntry, now: Instant) -> Option<StdDuration> {
+        entry
+            .model_cooldowns
+            .values()
+            .filter_map(|cooldown| cooldown.until.checked_duration_since(now))
+            .chain(Self::entry_global_cooldown_remaining(entry, now))
+            .max()
+    }
+
+    fn entry_cooldown_snapshots(
+        entry: &CredentialEntry,
+        now: Instant,
+    ) -> Vec<CredentialCooldownSnapshot> {
+        let mut cooldowns = Vec::new();
+        if let Some(remaining) = Self::entry_global_cooldown_remaining(entry, now) {
+            cooldowns.push(CredentialCooldownSnapshot {
+                model: None,
+                global: true,
+                remaining_secs: remaining.as_secs().saturating_add(1),
+                reason: entry.cooldown_reason.clone(),
+            });
+        }
+        let mut model_cooldowns: Vec<_> = entry.model_cooldowns.values().collect();
+        model_cooldowns.sort_by(|left, right| left.model.cmp(&right.model));
+        for cooldown in model_cooldowns {
+            if let Some(remaining) = cooldown.until.checked_duration_since(now) {
+                cooldowns.push(CredentialCooldownSnapshot {
+                    model: Some(cooldown.model.clone()),
+                    global: false,
+                    remaining_secs: remaining.as_secs().saturating_add(1),
+                    reason: cooldown.reason.clone(),
+                });
+            }
+        }
+        cooldowns
+    }
+
+    fn entry_effective_health<'a>(
+        entry: &'a CredentialEntry,
+        model: Option<&str>,
+    ) -> &'a SchedulerHealthState {
+        model
+            .map(Self::model_state_key)
+            .and_then(|key| entry.model_health.get(&key))
+            .unwrap_or(&entry.health)
+    }
+
+    fn entry_effective_health_mut<'a>(
+        entry: &'a mut CredentialEntry,
+        model: Option<&str>,
+    ) -> &'a mut SchedulerHealthState {
+        match model.map(Self::model_state_key) {
+            Some(key) => entry.model_health.entry(key).or_default(),
+            None => &mut entry.health,
+        }
     }
 
     fn entry_rate_limit_remaining(entry: &CredentialEntry, now: Instant) -> Option<StdDuration> {
@@ -1562,7 +1686,7 @@ impl MultiTokenManager {
     ) -> bool {
         Self::credential_is_usable_for_model(entry, model)
             && Self::credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
-            && Self::entry_cooldown_remaining(entry, now).is_none()
+            && Self::entry_cooldown_remaining(entry, model, now).is_none()
             && Self::entry_rate_limit_remaining(entry, now).is_none()
             && Self::entry_has_concurrency_capacity(entry, max_concurrent_requests)
     }
@@ -1575,7 +1699,7 @@ impl MultiTokenManager {
     ) -> bool {
         Self::credential_is_usable_for_model(entry, model)
             && Self::credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
-            && Self::entry_cooldown_remaining(entry, now).is_none()
+            && Self::entry_cooldown_remaining(entry, model, now).is_none()
             && Self::entry_rate_limit_remaining(entry, now).is_none()
     }
 
@@ -1752,6 +1876,7 @@ impl MultiTokenManager {
     fn scheduler_score(
         &self,
         entry: &CredentialEntry,
+        model: Option<&str>,
         now_ms: i64,
         selection_pressure: f64,
     ) -> f64 {
@@ -1765,15 +1890,14 @@ impl MultiTokenManager {
         } else {
             entry.in_flight_requests as f64
         };
-        let probation = entry
-            .health
+        let health = Self::entry_effective_health(entry, model);
+        let probation = health
             .probation_until_ms
             .is_some_and(|until_ms| until_ms > now_ms) as u8 as f64;
         entry.credentials.priority as f64 * config.scheduler_priority_weight.max(0.0)
             + load * config.scheduler_load_weight.max(0.0)
-            + entry.health.recent_error_rate.clamp(0.0, 1.0)
-                * config.scheduler_error_weight.max(0.0)
-            + entry.health.latency_ewma_ms.unwrap_or(0.0).max(0.0)
+            + health.recent_error_rate.clamp(0.0, 1.0) * config.scheduler_error_weight.max(0.0)
+            + health.latency_ewma_ms.unwrap_or(0.0).max(0.0)
                 * config.scheduler_latency_weight.max(0.0)
             + probation * config.scheduler_probation_weight.max(0.0)
             + selection_pressure.max(0.0) * config.scheduler_selection_pressure_weight.max(0.0)
@@ -1919,7 +2043,7 @@ impl MultiTokenManager {
             })
             .filter_map(|entry| {
                 match (
-                    Self::entry_cooldown_remaining(entry, now),
+                    Self::entry_cooldown_remaining(entry, model, now),
                     Self::entry_rate_limit_remaining(entry, now),
                 ) {
                     (Some(a), Some(b)) => Some(a.max(b)),
@@ -1944,7 +2068,7 @@ impl MultiTokenManager {
             .iter()
             .filter(|entry| {
                 Self::credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids)
-                    && Self::entry_cooldown_remaining(entry, now).is_none()
+                    && Self::entry_cooldown_remaining(entry, model, now).is_none()
                     && Self::entry_rate_limit_remaining(entry, now).is_none()
                     && !Self::entry_has_concurrency_capacity(entry, max_concurrent_requests)
             })
@@ -2397,7 +2521,7 @@ impl MultiTokenManager {
                     ready
                 };
                 let entry =
-                    self.select_health_weighted(candidates, Utc::now().timestamp_millis())?;
+                    self.select_health_weighted(candidates, model, Utc::now().timestamp_millis())?;
 
                 Some((entry.id, entry.credentials.clone()))
             }
@@ -2435,6 +2559,7 @@ impl MultiTokenManager {
     fn select_health_weighted<'a>(
         &self,
         candidates: Vec<&'a CredentialEntry>,
+        model: Option<&str>,
         now_ms: i64,
     ) -> Option<&'a CredentialEntry> {
         let mut scored: Vec<(&CredentialEntry, f64)> = candidates
@@ -2442,7 +2567,7 @@ impl MultiTokenManager {
             .copied()
             .map(|entry| {
                 let pressure = Self::selection_pressure_for_candidates(entry, &candidates);
-                (entry, self.scheduler_score(entry, now_ms, pressure))
+                (entry, self.scheduler_score(entry, model, now_ms, pressure))
             })
             .collect();
         scored.sort_by(|(left_entry, left), (right_entry, right)| {
@@ -2997,7 +3122,7 @@ impl MultiTokenManager {
                                             e,
                                             model,
                                             &local_excluded_ids,
-                                        ) && Self::entry_cooldown_remaining(e, now).is_some()
+                                        ) && Self::entry_cooldown_remaining(e, model, now).is_some()
                                     })
                                     .count();
                                 let wait_for = self.min_dispatch_wait(
@@ -3620,11 +3745,13 @@ impl MultiTokenManager {
                 last_used_at: None,
                 cooldown_until: None,
                 cooldown_reason: None,
+                model_cooldowns: HashMap::new(),
                 rate_limit_available_at: None,
                 in_flight_requests: 0,
                 in_flight_leases: Vec::new(),
                 warmup_remaining: 0,
                 health: SchedulerHealthState::default(),
+                model_health: HashMap::new(),
                 selection_events: VecDeque::new(),
             });
             changed = true;
@@ -4039,6 +4166,24 @@ impl MultiTokenManager {
                 .as_ref()
                 .and_then(|cooldown| instant_from_epoch_ms(cooldown.until_ms, now_ms, now));
             entry.cooldown_reason = state.cooldown.and_then(|cooldown| cooldown.reason);
+            entry.model_cooldowns.clear();
+            entry.model_health.clear();
+            for model_state in state.model_states {
+                let key = Self::model_state_key(&model_state.model);
+                if let Some(cooldown) = model_state.cooldown {
+                    if let Some(until) = instant_from_epoch_ms(cooldown.until_ms, now_ms, now) {
+                        entry.model_cooldowns.insert(
+                            key.clone(),
+                            CredentialModelCooldown {
+                                model: model_state.model.clone(),
+                                until,
+                                reason: cooldown.reason,
+                            },
+                        );
+                    }
+                }
+                entry.model_health.insert(key, model_state.health);
+            }
             entry.rate_limit_available_at = state
                 .rate_limit_available_at_ms
                 .and_then(|until_ms| instant_from_epoch_ms(until_ms, now_ms, now));
@@ -4100,8 +4245,10 @@ impl MultiTokenManager {
             if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
                 entry.cooldown_until = None;
                 entry.cooldown_reason = None;
+                entry.model_cooldowns.clear();
                 entry.rate_limit_available_at = None;
                 entry.health = SchedulerHealthState::default();
+                entry.model_health.clear();
                 if clear_in_flight {
                     entry.in_flight_requests = 0;
                     entry.in_flight_leases.clear();
@@ -4134,10 +4281,15 @@ impl MultiTokenManager {
     /// * `id` - 凭据 ID（来自 CallContext）
     #[allow(dead_code)]
     pub fn report_success(&self, id: u64) {
-        self.report_success_with_latency(id, None);
+        self.report_success_with_latency(id, None, None);
     }
 
-    pub fn report_success_with_latency(&self, id: u64, latency: Option<StdDuration>) {
+    pub fn report_success_with_latency(
+        &self,
+        id: u64,
+        model: Option<&str>,
+        latency: Option<StdDuration>,
+    ) {
         let mut last_used_at: Option<String> = None;
         let alpha = self
             .config
@@ -4155,18 +4307,20 @@ impl MultiTokenManager {
                 entry.success_count += 1;
                 let now = Utc::now().to_rfc3339();
                 entry.last_used_at = Some(now.clone());
-                entry.health.recent_error_rate *= 1.0 - alpha;
-                entry.health.transient_failure_streak =
-                    entry.health.transient_failure_streak.saturating_sub(1);
-                if let Some(latency) = latency {
-                    let latency_ms = latency.as_millis() as f64;
-                    entry.health.latency_ewma_ms = Some(
-                        entry
-                            .health
-                            .latency_ewma_ms
-                            .map(|previous| previous + alpha * (latency_ms - previous))
-                            .unwrap_or(latency_ms),
-                    );
+                {
+                    let health = Self::entry_effective_health_mut(entry, model);
+                    health.recent_error_rate *= 1.0 - alpha;
+                    health.transient_failure_streak =
+                        health.transient_failure_streak.saturating_sub(1);
+                    if let Some(latency) = latency {
+                        let latency_ms = latency.as_millis() as f64;
+                        health.latency_ewma_ms = Some(
+                            health
+                                .latency_ewma_ms
+                                .map(|previous| previous + alpha * (latency_ms - previous))
+                                .unwrap_or(latency_ms),
+                        );
+                    }
                 }
                 last_used_at = Some(now);
                 tracing::debug!(
@@ -4181,13 +4335,23 @@ impl MultiTokenManager {
         }
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
+            let model_for_redis = model.map(str::to_string);
+            let model_for_entry = model_for_redis.clone();
             match block_on_storage("记录 Redis 调度成功健康状态", async move {
-                redis.record_scheduler_success(id, latency, alpha).await
+                redis
+                    .record_scheduler_success(id, model_for_redis.as_deref(), latency, alpha)
+                    .await
             }) {
                 Ok(health) => {
                     let mut entries = self.entries.lock();
                     if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
-                        entry.health = health;
+                        if let Some(model) = model_for_entry.as_deref() {
+                            entry
+                                .model_health
+                                .insert(Self::model_state_key(model), health);
+                        } else {
+                            entry.health = health;
+                        }
                     }
                 }
                 Err(err) => tracing::warn!(
@@ -4248,10 +4412,12 @@ impl MultiTokenManager {
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
             let reason_for_redis = reason.clone();
+            let model_for_redis = model.map(str::to_string);
             match block_on_storage("写入 Redis 凭据临时冷却与健康状态", async move {
                 redis
                     .record_scheduler_transient_failure(
                         id,
+                        model_for_redis.as_deref(),
                         kind.as_str(),
                         &reason_for_redis,
                         retry_after,
@@ -4267,13 +4433,32 @@ impl MultiTokenManager {
                 Ok((cooldown, health)) => {
                     let mut entries = self.entries.lock();
                     if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
-                        entry.cooldown_until = instant_from_epoch_ms(
-                            cooldown.until_ms,
-                            Utc::now().timestamp_millis(),
-                            Instant::now(),
-                        );
-                        entry.cooldown_reason = cooldown.reason;
-                        entry.health = health;
+                        if let Some(model) = model {
+                            if let Some(until) = instant_from_epoch_ms(
+                                cooldown.until_ms,
+                                Utc::now().timestamp_millis(),
+                                Instant::now(),
+                            ) {
+                                let key = Self::model_state_key(model);
+                                entry.model_cooldowns.insert(
+                                    key.clone(),
+                                    CredentialModelCooldown {
+                                        model: model.to_string(),
+                                        until,
+                                        reason: cooldown.reason,
+                                    },
+                                );
+                                entry.model_health.insert(key, health);
+                            }
+                        } else {
+                            entry.cooldown_until = instant_from_epoch_ms(
+                                cooldown.until_ms,
+                                Utc::now().timestamp_millis(),
+                                Instant::now(),
+                            );
+                            entry.cooldown_reason = cooldown.reason;
+                            entry.health = health;
+                        }
                         entry.last_used_at = Some(Utc::now().to_rfc3339());
                     }
                 }
@@ -4282,31 +4467,52 @@ impl MultiTokenManager {
         } else {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
-                entry.health.transient_failure_streak =
-                    entry.health.transient_failure_streak.saturating_add(1);
-                entry.health.recent_error_rate += alpha * (1.0 - entry.health.recent_error_rate);
-                entry.health.last_error_kind = Some(kind.as_str().to_string());
-                entry.health.last_error_reason = Some(reason.clone());
-                entry.health.last_error_at_ms = Some(now_ms);
+                let streak = {
+                    let health = Self::entry_effective_health_mut(entry, model);
+                    health.transient_failure_streak =
+                        health.transient_failure_streak.saturating_add(1);
+                    health.recent_error_rate += alpha * (1.0 - health.recent_error_rate);
+                    health.last_error_kind = Some(kind.as_str().to_string());
+                    health.last_error_reason = Some(reason.clone());
+                    health.last_error_at_ms = Some(now_ms);
+                    health.transient_failure_streak
+                };
                 let duration = Self::local_cooldown_duration(
                     retry_after,
                     base,
                     max,
                     multiplier,
                     jitter,
-                    entry.health.transient_failure_streak,
+                    streak,
                 );
                 let until = now + duration;
-                if entry.cooldown_until.is_none_or(|existing| until > existing) {
+                if let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) {
+                    let key = Self::model_state_key(model);
+                    let should_update = entry
+                        .model_cooldowns
+                        .get(&key)
+                        .is_none_or(|existing| until > existing.until);
+                    if should_update {
+                        entry.model_cooldowns.insert(
+                            key,
+                            CredentialModelCooldown {
+                                model: model.to_string(),
+                                until,
+                                reason: Some(reason.clone()),
+                            },
+                        );
+                    }
+                } else if entry.cooldown_until.is_none_or(|existing| until > existing) {
                     entry.cooldown_until = Some(until);
                     entry.cooldown_reason = Some(reason.clone());
                 }
-                entry.health.probation_until_ms =
-                    Some(
-                        entry.health.probation_until_ms.unwrap_or(0).max(
-                            now_ms + duration.as_millis() as i64 + probation.as_millis() as i64,
-                        ),
-                    );
+                let health = Self::entry_effective_health_mut(entry, model);
+                health.probation_until_ms = Some(
+                    health
+                        .probation_until_ms
+                        .unwrap_or(0)
+                        .max(now_ms + duration.as_millis() as i64 + probation.as_millis() as i64),
+                );
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
             }
         }
@@ -4316,7 +4522,7 @@ impl MultiTokenManager {
             entries
                 .iter()
                 .find(|entry| entry.id == id)
-                .and_then(|entry| Self::entry_cooldown_remaining(entry, Instant::now()))
+                .and_then(|entry| Self::entry_cooldown_remaining(entry, model, Instant::now()))
                 .unwrap_or(base)
         };
 
@@ -4350,16 +4556,17 @@ impl MultiTokenManager {
     /// 报告指定会话在该凭据上的 API 调用成功，并清理 sticky 软失败计数。
     #[allow(dead_code)]
     pub fn report_success_for_session(&self, id: u64, session_id: Option<&str>) {
-        self.report_success_for_session_with_latency(id, session_id, None);
+        self.report_success_for_session_with_latency(id, None, session_id, None);
     }
 
     pub fn report_success_for_session_with_latency(
         &self,
         id: u64,
+        model: Option<&str>,
         session_id: Option<&str>,
         latency: Option<StdDuration>,
     ) {
-        self.report_success_with_latency(id, latency);
+        self.report_success_with_latency(id, model, latency);
         if let Some(sid) = session_id {
             self.clear_session_soft_failure(sid, id);
         }
@@ -4959,15 +5166,14 @@ impl MultiTokenManager {
                         refresh_failure_count: e.refresh_failure_count,
                         disabled_reason: e.disabled_reason.map(|r| r.as_str().to_string()),
                         endpoint: e.credentials.endpoint.clone(),
-                        cooled_down: Self::entry_cooldown_remaining(e, now).is_some(),
-                        cooldown_remaining_secs: Self::entry_cooldown_remaining(e, now)
+                        cooled_down: Self::entry_any_cooldown_remaining(e, now).is_some(),
+                        cooldown_remaining_secs: Self::entry_any_cooldown_remaining(e, now)
                             .map(|duration| duration.as_secs().saturating_add(1))
                             .unwrap_or(0),
-                        cooldown_reason: if Self::entry_cooldown_remaining(e, now).is_some() {
-                            e.cooldown_reason.clone()
-                        } else {
-                            None
-                        },
+                        cooldown_reason: Self::entry_cooldown_snapshots(e, now)
+                            .into_iter()
+                            .find_map(|cooldown| cooldown.reason),
+                        cooldowns: Self::entry_cooldown_snapshots(e, now),
                         rate_limited: Self::entry_rate_limit_remaining(e, now).is_some(),
                         rate_limit_remaining_secs: Self::entry_rate_limit_remaining(e, now)
                             .map(|duration| duration.as_secs().saturating_add(1))
@@ -5010,6 +5216,7 @@ impl MultiTokenManager {
                         ),
                         scheduler_score: self.scheduler_score(
                             e,
+                            None,
                             now_ms,
                             Self::selection_pressure_for_candidates(e, &score_candidates),
                         ),
@@ -5084,11 +5291,13 @@ impl MultiTokenManager {
                 entry.disabled_reason = None;
                 entry.cooldown_until = None;
                 entry.cooldown_reason = None;
+                entry.model_cooldowns.clear();
                 entry.rate_limit_available_at = None;
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
                 entry.cooldown_until = None;
                 entry.cooldown_reason = None;
+                entry.model_cooldowns.clear();
                 entry.rate_limit_available_at = None;
             }
         }
@@ -5253,8 +5462,10 @@ impl MultiTokenManager {
                 entry.refresh_failure_count = 0;
                 entry.cooldown_until = None;
                 entry.cooldown_reason = None;
+                entry.model_cooldowns.clear();
                 entry.rate_limit_available_at = None;
                 entry.health = SchedulerHealthState::default();
+                entry.model_health.clear();
                 entry.selection_events.clear();
             }
             reset_runtime_state.then(|| Self::runtime_state_from_entry(entry))
@@ -5306,6 +5517,7 @@ impl MultiTokenManager {
             entry.disabled_reason = None;
             entry.cooldown_until = None;
             entry.cooldown_reason = None;
+            entry.model_cooldowns.clear();
             entry.rate_limit_available_at = None;
         }
         self.select_highest_priority();
@@ -5541,11 +5753,13 @@ impl MultiTokenManager {
                 last_used_at: None,
                 cooldown_until: None,
                 cooldown_reason: None,
+                model_cooldowns: HashMap::new(),
                 rate_limit_available_at: None,
                 in_flight_requests: 0,
                 in_flight_leases: Vec::new(),
                 warmup_remaining,
                 health: SchedulerHealthState::default(),
+                model_health: HashMap::new(),
                 selection_events: VecDeque::new(),
             });
         }
@@ -6463,6 +6677,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_model_specific_cooldown_only_blocks_same_model() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut cred1 = KiroCredentials::default();
+        cred1.access_token = Some("t1".to_string());
+        cred1.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        let mut cred2 = KiroCredentials::default();
+        cred2.access_token = Some("t2".to_string());
+        cred2.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+        manager
+            .report_transient_failure_kind(
+                1,
+                Some("claude-opus-4.8"),
+                TransientFailureKind::RateLimit,
+                Some(StdDuration::from_secs(60)),
+                "429",
+            )
+            .unwrap();
+
+        let mut sonnet = manager
+            .acquire_context_for_session(Some("claude-sonnet-4.6"), None, &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(sonnet.id, 1);
+        sonnet.release_in_flight();
+
+        let mut opus = manager
+            .acquire_context_for_session(Some("claude-opus-4.8"), None, &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(opus.id, 2);
+        opus.release_in_flight();
+
+        let snapshot = manager.snapshot();
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert!(entry.cooled_down);
+        assert_eq!(entry.cooldowns.len(), 1);
+        assert_eq!(entry.cooldowns[0].model.as_deref(), Some("claude-opus-4.8"));
+    }
+
+    #[tokio::test]
     async fn test_acquire_context_excluded_bound_session_can_fallback() {
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
@@ -6684,7 +6943,7 @@ mod tests {
                 "stream idle timeout",
             )
             .unwrap();
-        manager.report_success_with_latency(1, Some(StdDuration::from_millis(120)));
+        manager.report_success_with_latency(1, None, Some(StdDuration::from_millis(120)));
 
         let entry = &manager.snapshot().entries[0];
         assert!(entry.cooled_down);

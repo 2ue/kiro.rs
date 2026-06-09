@@ -87,6 +87,7 @@ struct ApiCallResponse {
     credential_id: u64,
     in_flight_lease: Option<InFlightLeaseGuard>,
     session_id: Option<String>,
+    model: Option<String>,
     sticky_bound: bool,
     fallback_from_sticky: bool,
     attempts: Vec<KiroCredentialAttempt>,
@@ -109,6 +110,7 @@ pub struct KiroApiCompletion {
     credential_id: u64,
     in_flight_lease: Mutex<Option<InFlightLeaseGuard>>,
     session_id: Option<String>,
+    model: Option<String>,
     sticky_bound: bool,
     fallback_from_sticky: bool,
     attempts: Vec<KiroCredentialAttempt>,
@@ -122,6 +124,7 @@ impl KiroApiCompletion {
         credential_id: u64,
         in_flight_lease: Option<InFlightLeaseGuard>,
         session_id: Option<String>,
+        model: Option<String>,
         sticky_bound: bool,
         fallback_from_sticky: bool,
         attempts: Vec<KiroCredentialAttempt>,
@@ -132,6 +135,7 @@ impl KiroApiCompletion {
             credential_id,
             in_flight_lease: Mutex::new(in_flight_lease),
             session_id,
+            model,
             sticky_bound,
             fallback_from_sticky,
             attempts,
@@ -147,6 +151,7 @@ impl KiroApiCompletion {
         if self.in_flight_lease.lock().take().is_some() {
             self.token_manager.report_success_for_session_with_latency(
                 self.credential_id,
+                self.model.as_deref(),
                 self.session_id.as_deref(),
                 Some(self.started_at.elapsed()),
             );
@@ -217,6 +222,7 @@ pub struct KiroStreamCompletion {
     credential_id: u64,
     in_flight_lease: Mutex<Option<InFlightLeaseGuard>>,
     session_id: Option<String>,
+    model: Option<String>,
     sticky_bound: bool,
     fallback_from_sticky: bool,
     attempts: Vec<KiroCredentialAttempt>,
@@ -230,6 +236,7 @@ impl KiroStreamCompletion {
         credential_id: u64,
         in_flight_lease: Option<InFlightLeaseGuard>,
         session_id: Option<String>,
+        model: Option<String>,
         sticky_bound: bool,
         fallback_from_sticky: bool,
         attempts: Vec<KiroCredentialAttempt>,
@@ -240,6 +247,7 @@ impl KiroStreamCompletion {
             credential_id,
             in_flight_lease: Mutex::new(in_flight_lease),
             session_id,
+            model,
             sticky_bound,
             fallback_from_sticky,
             attempts,
@@ -255,6 +263,7 @@ impl KiroStreamCompletion {
         }
         self.token_manager.report_success_for_session_with_latency(
             self.credential_id,
+            self.model.as_deref(),
             self.session_id.as_deref(),
             Some(self.started_at.elapsed()),
         );
@@ -283,7 +292,7 @@ impl KiroStreamCompletion {
         let reason = reason.into();
         if let Err(err) = self.token_manager.report_transient_failure_kind(
             self.credential_id,
-            None,
+            self.model.as_deref(),
             TransientFailureKind::Stream,
             None,
             format!("stream_error {}", reason),
@@ -468,6 +477,7 @@ mod tests {
             1,
             None,
             Some("session".into()),
+            Some("claude-sonnet-4.5".into()),
             false,
             false,
             Vec::new(),
@@ -494,6 +504,7 @@ mod tests {
             1,
             None,
             Some("session".into()),
+            Some("claude-sonnet-4.5".into()),
             false,
             false,
             Vec::new(),
@@ -520,6 +531,7 @@ mod tests {
             1,
             None,
             Some("session".into()),
+            Some("claude-sonnet-4.5".into()),
             false,
             false,
             Vec::new(),
@@ -551,6 +563,7 @@ mod tests {
                 1,
                 lease,
                 Some("session".into()),
+                Some("claude-sonnet-4.5".into()),
                 false,
                 false,
                 Vec::new(),
@@ -578,6 +591,7 @@ mod tests {
             1,
             lease,
             Some("session".into()),
+            Some("claude-sonnet-4.5".into()),
             false,
             false,
             Vec::new(),
@@ -991,6 +1005,7 @@ impl KiroProvider {
                 result.credential_id,
                 result.in_flight_lease,
                 result.session_id,
+                result.model,
                 result.sticky_bound,
                 result.fallback_from_sticky,
                 result.attempts,
@@ -1087,6 +1102,7 @@ impl KiroProvider {
                     self.token_manager.clone(),
                     ctx.id,
                     ctx.take_in_flight_lease(),
+                    None,
                     None,
                     false,
                     false,
@@ -1255,6 +1271,7 @@ impl KiroProvider {
                 result.credential_id,
                 result.in_flight_lease,
                 result.session_id,
+                result.model,
                 result.sticky_bound,
                 result.fallback_from_sticky,
                 result.attempts,
@@ -1391,8 +1408,11 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
-                self.token_manager
-                    .report_success_with_latency(ctx.id, Some(attempt_started_at.elapsed()));
+                self.token_manager.report_success_with_latency(
+                    ctx.id,
+                    None,
+                    Some(attempt_started_at.elapsed()),
+                );
                 self.finish_attempt(&mut ctx);
                 return Ok(response);
             }
@@ -2004,6 +2024,7 @@ impl KiroProvider {
                     credential_id: ctx.id,
                     in_flight_lease: ctx.take_in_flight_lease(),
                     session_id: conversation_id.clone(),
+                    model: model.clone(),
                     sticky_bound: ctx.sticky_bound,
                     fallback_from_sticky: ctx.fallback_from_sticky,
                     attempts: {

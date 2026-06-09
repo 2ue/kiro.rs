@@ -5,7 +5,7 @@ use std::{
     convert::Infallible,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -103,6 +103,7 @@ struct RequestUsageContext {
     local_preflight: Option<serde_json::Value>,
     external_attempts: Vec<ExternalPoolAttempt>,
     started_at: Instant,
+    first_token_latency_ms: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -525,6 +526,7 @@ impl ExternalFallbackContext {
             request_id,
             recorder: self.recorder.clone(),
             started_at: Instant::now(),
+            first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -648,6 +650,23 @@ impl CredentialErrorHint {
 }
 
 impl RequestUsageContext {
+    fn first_token_latency_ms(&self) -> Option<u64> {
+        let value = self.first_token_latency_ms.load(Ordering::Acquire);
+        (value > 0).then_some(value)
+    }
+
+    fn mark_first_token_if_output(&self, events: &[SseEvent]) {
+        if events.iter().any(is_first_token_output_event) {
+            let elapsed = self.started_at.elapsed().as_millis().max(1) as u64;
+            let _ = self.first_token_latency_ms.compare_exchange(
+                0,
+                elapsed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+
     fn cache_amplification(&self) -> Option<super::cache::CacheAmplification> {
         if self.simulation_mode != PromptCacheSimulationMode::HighCache {
             return None;
@@ -768,6 +787,43 @@ impl RequestUsageContext {
                 )
             })
             .unwrap_or(usage)
+    }
+}
+
+fn is_first_token_output_event(event: &SseEvent) -> bool {
+    match event.event.as_str() {
+        "content_block_delta" => {
+            let Some(delta) = event.data.get("delta").and_then(|value| value.as_object()) else {
+                return false;
+            };
+            match delta.get("type").and_then(|value| value.as_str()) {
+                Some("text_delta") => delta
+                    .get("text")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|text| !text.is_empty()),
+                Some("thinking_delta") => delta
+                    .get("thinking")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|thinking| !thinking.is_empty()),
+                Some("input_json_delta") => delta
+                    .get("partial_json")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|json| !json.is_empty()),
+                _ => false,
+            }
+        }
+        "content_block_start" => event
+            .data
+            .get("content_block")
+            .and_then(|value| value.get("type"))
+            .and_then(|value| value.as_str())
+            .is_some_and(|block_type| {
+                matches!(
+                    block_type,
+                    "tool_use" | "server_tool_use" | "redacted_thinking"
+                )
+            }),
+        _ => false,
     }
 }
 
@@ -1153,6 +1209,7 @@ impl CredentialUsageContext {
             pricing_available: pricing.available,
             pricing_model: Some(pricing.model),
             duration_ms: self.request.started_at.elapsed().as_millis() as u64,
+            first_token_latency_ms: self.request.first_token_latency_ms(),
             simulated: usage_source.is_simulated(),
             sticky_bound: self.sticky_bound,
             fallback_from_sticky: self.fallback_from_sticky,
@@ -1727,6 +1784,7 @@ fn prepare_usage_context(
         local_preflight: None,
         external_attempts: Vec::new(),
         started_at: Instant::now(),
+        first_token_latency_ms: Arc::new(AtomicU64::new(0)),
     }
 }
 
@@ -3045,6 +3103,10 @@ fn create_sse_stream(
                             }
 
                             // 转换为 SSE 字节流
+                            usage_guard
+                                .context()
+                                .request
+                                .mark_first_token_if_output(&events);
                             let bytes: Vec<Result<Bytes, Infallible>> = events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -3062,6 +3124,10 @@ fn create_sse_stream(
                             ctx.record_stream_error("api_error", format!("upstream stream read error: {}", e));
                             let error_detail = ctx.stream_error_detail();
                             let final_events = ctx.generate_final_events();
+                            usage_guard
+                                .context()
+                                .request
+                                .mark_first_token_if_output(&final_events);
                             usage_guard.context().record_stream_failure_from_context(
                                 UsageRecordStatus::StreamError,
                                 ctx.final_usage(),
@@ -3108,6 +3174,10 @@ fn create_sse_stream(
                                     },
                                 )
                             };
+                            usage_guard
+                                .context()
+                                .request
+                                .mark_first_token_if_output(&final_events);
                             if had_stream_error {
                                 usage_guard.context().record_stream_failure_from_context(
                                     UsageRecordStatus::StreamError,
@@ -3137,6 +3207,10 @@ fn create_sse_stream(
                     ctx.record_stream_error("api_error", "upstream stream idle timeout");
                     let error_detail = ctx.stream_error_detail();
                     let final_events = ctx.generate_final_events();
+                    usage_guard
+                        .context()
+                        .request
+                        .mark_first_token_if_output(&final_events);
                     usage_guard.context().record_stream_failure_from_context(
                         UsageRecordStatus::UpstreamTimeout,
                         ctx.final_usage(),
@@ -4415,6 +4489,7 @@ mod tests {
             local_preflight: None,
             external_attempts: Vec::new(),
             started_at: Instant::now(),
+            first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         };
         let usage = CacheUsage {
             total_input_tokens: 100_000,
@@ -4443,6 +4518,38 @@ mod tests {
         let upstream_metadata =
             usage_context.reported_usage_for_downstream(usage, UsageSource::UpstreamMetadata);
         assert_eq!(upstream_metadata.cache_creation_input_tokens, 50_000);
+    }
+
+    #[test]
+    fn first_token_detection_ignores_initial_empty_blocks() {
+        assert!(!is_first_token_output_event(&SseEvent::new(
+            "message_start",
+            json!({"type": "message_start"})
+        )));
+        assert!(!is_first_token_output_event(&SseEvent::new(
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            })
+        )));
+        assert!(is_first_token_output_event(&SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "hello"}
+            })
+        )));
+        assert!(is_first_token_output_event(&SseEvent::new(
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {"type": "tool_use", "id": "toolu_1", "name": "read", "input": {}}
+            })
+        )));
     }
 
     #[test]
@@ -4500,6 +4607,7 @@ mod tests {
             local_preflight: None,
             external_attempts: Vec::new(),
             started_at: Instant::now(),
+            first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         };
         let cc_context = RequestUsageContext {
             endpoint: "/cc/v1/messages",
@@ -4650,6 +4758,7 @@ mod tests {
             local_preflight: None,
             external_attempts: Vec::new(),
             started_at: Instant::now(),
+            first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         };
         usage_context
             .attach_credential(Some(hint.id), hint.label, false, false, Vec::new())
@@ -4751,6 +4860,7 @@ mod tests {
             local_preflight: None,
             external_attempts: Vec::new(),
             started_at: Instant::now(),
+            first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         }
         .attach_credential(Some(1), None, false, false, Vec::new());
         let usage = CacheUsage {
@@ -4839,6 +4949,7 @@ mod tests {
             local_preflight: None,
             external_attempts: Vec::new(),
             started_at: Instant::now(),
+            first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         }
         .attach_credential(Some(1), None, false, false, Vec::new());
         let metadata = MetadataTokenUsage {

@@ -447,7 +447,12 @@ export function UsagePanel() {
                       </span>
                       <span>
                         <div className="font-semibold">{formatUsd(record.estimatedCostUsd || 0)}</div>
-                        <div className="text-xs text-base-content/55">{formatNumber(record.durationMs)}ms</div>
+                        <div className="text-xs text-base-content/55">
+                          {formatNumber(record.durationMs)}ms
+                          <span className="ml-1">
+                            / 首字 {typeof record.firstTokenLatencyMs === 'number' ? `${formatNumber(record.firstTokenLatencyMs)}ms` : '-'}
+                          </span>
+                        </div>
                         <div className="max-w-[160px] truncate text-xs text-base-content/55" title={record.pricingModel || ''}>
                           {record.pricingAvailable ? record.pricingModel || 'priced' : 'unpriced'}
                         </div>
@@ -542,7 +547,9 @@ export function UsagePanel() {
                         </div>
                         <div className="text-right">
                           <div className="font-semibold">{formatNumber(record.durationMs)}ms</div>
-                          <div className="text-xs text-base-content/50">耗时</div>
+                          <div className="text-xs text-base-content/50">
+                            首字 {typeof record.firstTokenLatencyMs === 'number' ? `${formatNumber(record.firstTokenLatencyMs)}ms` : '-'}
+                          </div>
                         </div>
                         <Button type="button" variant="outline" size="xs" onClick={() => setSelectedRecord(record)} title="查看 usage 口径和详情">
                           <Info className="h-3.5 w-3.5" />
@@ -806,6 +813,10 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
             )}
             <Detail label="状态" value={statusLabel(record.status)} />
             <Detail label="估算费用" value={`${formatUsd(record.estimatedCostUsd || 0)} ${record.pricingAvailable ? record.pricingModel || 'priced' : 'unpriced'}`} />
+            <Detail
+              label="首字 token"
+              value={typeof record.firstTokenLatencyMs === 'number' ? `${formatNumber(record.firstTokenLatencyMs)}ms` : '-'}
+            />
           </div>
           <div className="rounded-box border border-base-300 bg-base-200/50 p-3 text-sm">
             <div className="mb-2 flex items-center gap-2">

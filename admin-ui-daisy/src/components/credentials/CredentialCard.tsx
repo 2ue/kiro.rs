@@ -346,7 +346,15 @@ export function CredentialCard({
                 <Badge tone="info" size="xs">并发覆盖</Badge>
               )}
               {!credential.disabled && credential.cooledDown && (
-                <Badge tone="warning" size="xs">冷却 {credential.cooldownRemainingSecs}s</Badge>
+                <Badge
+                  tone="warning"
+                  size="xs"
+                  title={(credential.cooldowns || [])
+                    .map((item) => `${item.global ? '全部模型' : item.model || '-'} ${item.remainingSecs}s${item.reason ? ` ${item.reason}` : ''}`)
+                    .join('\n')}
+                >
+                  冷却 {credential.cooldownRemainingSecs}s
+                </Badge>
               )}
               {!credential.disabled && credential.rateLimited && (
                 <Badge tone="warning" size="xs">限流</Badge>
@@ -430,13 +438,34 @@ export function CredentialCard({
               {credential.inProbation && (
                 <MetaItem label="观察期" value={`${probationRemainingSecs}s`} />
               )}
-              <MetaItem label="代理" value={
-                <button type="button" className="flex items-center gap-1 text-primary hover:underline" onClick={() => setEditingProxy(true)}>
-                  <Router className="h-3 w-3" />
-                  {credential.proxyResourceName || sourceLabel(credential.effectiveProxySource)}
-                </button>
-              } />
+              <MetaItem
+                label="代理"
+                value={
+                  <button
+                    type="button"
+                    className="flex items-center gap-1 text-primary hover:underline"
+                    onClick={() => setEditingProxy(true)}
+                  >
+                    <Router className="h-3 w-3" />
+                    {credential.proxyResourceName || sourceLabel(credential.effectiveProxySource)}
+                  </button>
+                }
+              />
             </div>
+
+            {credential.cooldowns && credential.cooldowns.length > 0 && (
+              <div className="mt-3 flex flex-wrap gap-1.5 text-xs text-base-content/60">
+                {credential.cooldowns.map((cooldown) => (
+                  <span
+                    key={`${cooldown.global ? 'global' : cooldown.model}-${cooldown.remainingSecs}`}
+                    className="rounded-box border border-base-300 bg-base-100 px-2 py-1"
+                    title={cooldown.reason || undefined}
+                  >
+                    {cooldown.global ? '全部模型' : cooldown.model || '-'} · 冷却 {cooldown.remainingSecs}s
+                  </span>
+                ))}
+              </div>
+            )}
 
             {credential.effectiveProxyUrl && (
               <div className="mt-3 rounded-lg border border-base-300 bg-base-100 p-2.5">

@@ -60,6 +60,7 @@ export interface CredentialStatusItem {
   cooledDown: boolean
   cooldownRemainingSecs: number
   cooldownReason?: string
+  cooldowns?: CredentialCooldown[]
   rateLimited: boolean
   rateLimitRemainingSecs: number
   inFlightRequests: number
@@ -86,6 +87,13 @@ export interface CredentialStatusItem {
   estimatedCostUsd: number
   pricedRequests: number
   unpricedRequests: number
+}
+
+export interface CredentialCooldown {
+  model?: string
+  global: boolean
+  remainingSecs: number
+  reason?: string
 }
 
 export interface CredentialAccountInfo {
@@ -385,6 +393,7 @@ export interface UsageRecord {
   pricingAvailable: boolean
   pricingModel?: string
   durationMs: number
+  firstTokenLatencyMs?: number
   simulated: boolean
   stickyBound: boolean
   fallbackFromSticky: boolean

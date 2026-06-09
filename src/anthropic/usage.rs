@@ -209,6 +209,8 @@ pub struct UsageRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pricing_model: Option<String>,
     pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_latency_ms: Option<u64>,
     pub simulated: bool,
     pub sticky_bound: bool,
     pub fallback_from_sticky: bool,
@@ -1332,6 +1334,7 @@ mod tests {
             pricing_available: true,
             pricing_model: Some("claude-sonnet-4-5".to_string()),
             duration_ms: 10,
+            first_token_latency_ms: None,
             simulated: source.is_simulated(),
             sticky_bound: false,
             fallback_from_sticky: false,

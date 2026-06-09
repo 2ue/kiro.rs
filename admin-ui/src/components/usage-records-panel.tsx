@@ -632,7 +632,7 @@ export function UsageRecordsPanel() {
                     <th className="px-3 py-2 font-medium text-right">缓存率</th>
                     <th className="px-3 py-2 font-medium text-right">上报输出</th>
                     <th className="px-3 py-2 font-medium text-right">费用</th>
-                    <th className="px-3 py-2 font-medium text-right">耗时</th>
+                    <th className="px-3 py-2 font-medium text-right">耗时 / 首字</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -761,6 +761,9 @@ export function UsageRecordsPanel() {
                             <Info className="h-4 w-4" />
                           </Button>
                         </div>
+                        <div className="text-xs text-muted-foreground">
+                          首字 {typeof record.firstTokenLatencyMs === 'number' ? `${formatNumber(record.firstTokenLatencyMs)}ms` : '-'}
+                        </div>
                       </td>
                     </tr>
                     )
@@ -873,6 +876,14 @@ export function UsageRecordsPanel() {
                         ? selectedRecord.pricingModel || 'priced'
                         : 'unpriced'}
                     </span>
+                  </div>
+                </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">首字 token</div>
+                  <div>
+                    {typeof selectedRecord.firstTokenLatencyMs === 'number'
+                      ? `${formatNumber(selectedRecord.firstTokenLatencyMs)}ms`
+                      : '-'}
                   </div>
                 </div>
               </div>

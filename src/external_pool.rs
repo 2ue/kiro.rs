@@ -1,6 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -303,6 +306,7 @@ pub struct ExternalRouteRequest {
     pub request_id: String,
     pub recorder: Arc<crate::anthropic::usage::UsageRecorder>,
     pub started_at: Instant,
+    pub first_token_latency_ms: Arc<AtomicU64>,
 }
 
 struct ExternalForwardResponse {
@@ -1774,7 +1778,12 @@ impl ExternalPoolManager {
             (data_stream, Some(guard)),
             |(mut data_stream, mut guard)| async move {
                 match data_stream.next().await {
-                    Some(Ok(chunk)) => Some((Ok(chunk), (data_stream, guard))),
+                    Some(Ok(chunk)) => {
+                        if let Some(guard_ref) = guard.as_ref() {
+                            guard_ref.mark_first_token_if_output(&chunk);
+                        }
+                        Some((Ok(chunk), (data_stream, guard)))
+                    }
                     Some(Err(err)) => {
                         if let Some(mut guard) = guard.take() {
                             guard.record_stream_error(&err.to_string());
@@ -1892,6 +1901,10 @@ impl ExternalPoolManager {
             pricing_available,
             pricing_model,
             duration_ms: route.started_at.elapsed().as_millis() as u64,
+            first_token_latency_ms: {
+                let value = route.first_token_latency_ms.load(Ordering::Acquire);
+                (value > 0).then_some(value)
+            },
             simulated: usage_source.is_simulated(),
             sticky_bound: false,
             fallback_from_sticky: false,
@@ -1929,6 +1942,19 @@ struct ExternalStreamUsageGuard {
 }
 
 impl ExternalStreamUsageGuard {
+    fn mark_first_token_if_output(&self, chunk: &Bytes) {
+        if !external_stream_chunk_has_first_output(chunk) {
+            return;
+        }
+        let elapsed = self.route.started_at.elapsed().as_millis().max(1) as u64;
+        let _ = self.route.first_token_latency_ms.compare_exchange(
+            0,
+            elapsed,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
     fn record_success(&mut self) {
         if self.completed {
             return;
@@ -1982,6 +2008,17 @@ impl ExternalStreamUsageGuard {
         );
         self.completed = true;
     }
+}
+
+fn external_stream_chunk_has_first_output(chunk: &Bytes) -> bool {
+    let Ok(text) = std::str::from_utf8(chunk.as_ref()) else {
+        return false;
+    };
+    text.contains("content_block_delta")
+        || (text.contains("content_block_start")
+            && (text.contains("tool_use")
+                || text.contains("server_tool_use")
+                || text.contains("redacted_thinking")))
 }
 
 impl Drop for ExternalStreamUsageGuard {
@@ -3321,6 +3358,7 @@ mod tests {
             request_id: "req_external_capacity".to_string(),
             recorder: Arc::new(crate::anthropic::usage::UsageRecorder::new(1)),
             started_at: Instant::now(),
+            first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         };
 
         let (error_type, message) = external_capacity_error(PoolCapacityWaitReason::Full);
@@ -3426,6 +3464,7 @@ mod tests {
             request_id: "req_external_billing".to_string(),
             recorder: Arc::new(crate::anthropic::usage::UsageRecorder::new(1)),
             started_at: Instant::now(),
+            first_token_latency_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 

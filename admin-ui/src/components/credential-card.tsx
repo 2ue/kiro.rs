@@ -447,7 +447,14 @@ export function CredentialCard({
                   <Badge variant="outline">{credential.disabledReason}</Badge>
                 )}
                 {!credential.disabled && credential.cooledDown && (
-                  <Badge variant="outline">冷却 {credential.cooldownRemainingSecs}s</Badge>
+                  <Badge
+                    variant="outline"
+                    title={(credential.cooldowns || [])
+                      .map((item) => `${item.global ? '全部模型' : item.model || '-'} ${item.remainingSecs}s${item.reason ? ` ${item.reason}` : ''}`)
+                      .join('\n')}
+                  >
+                    冷却 {credential.cooldownRemainingSecs}s
+                  </Badge>
                 )}
                 {!credential.disabled && credential.rateLimited && (
                   <Badge variant="outline">限流 {credential.rateLimitRemainingSecs}s</Badge>
@@ -663,6 +670,19 @@ export function CredentialCard({
                   <span className="ml-1 text-xs text-muted-foreground">
                     {credential.cooldownReason}
                   </span>
+                )}
+                {credential.cooldowns && credential.cooldowns.length > 0 && (
+                  <div className="mt-1 flex flex-wrap gap-1 text-xs text-muted-foreground">
+                    {credential.cooldowns.map((cooldown) => (
+                      <span
+                        key={`${cooldown.global ? 'global' : cooldown.model}-${cooldown.remainingSecs}`}
+                        className="rounded border px-1.5 py-0.5"
+                        title={cooldown.reason || undefined}
+                      >
+                        {cooldown.global ? '全部模型' : cooldown.model || '-'} · {cooldown.remainingSecs}s
+                      </span>
+                    ))}
+                  </div>
                 )}
               </div>
             )}
