@@ -783,6 +783,7 @@ export function ConfigPanel() {
       schedulerTotalSelectionWeight: Math.max(0, Number(draft.schedulerTotalSelectionWeight.toFixed(4))),
       schedulerTopK: toWhole(draft.schedulerTopK, 1, 100),
       payloadGuardMaxBytes: toWhole(draft.payloadGuardMaxBytes),
+      payloadGuardSafetyMarginBytes: toWhole(draft.payloadGuardSafetyMarginBytes),
       payloadShaping: normalizePayloadShaping(draft.payloadShaping),
       promptCacheTargetReadRatio: toRatio(draft.promptCacheTargetReadRatio),
       promptCacheTokenScale: toScale(draft.promptCacheTokenScale),
@@ -812,6 +813,12 @@ export function ConfigPanel() {
         externalPoolServerErrorCooldownSecs: toWhole(draft.externalPools.externalPoolServerErrorCooldownSecs, 1),
         externalPoolNetworkErrorCooldownSecs: toWhole(draft.externalPools.externalPoolNetworkErrorCooldownSecs, 1),
         externalPoolProtocolErrorCooldownSecs: toWhole(draft.externalPools.externalPoolProtocolErrorCooldownSecs, 1),
+        externalPoolRequestTimeoutSecs: toWhole(draft.externalPools.externalPoolRequestTimeoutSecs),
+        externalPoolStreamRequestTimeoutSecs: toWhole(draft.externalPools.externalPoolStreamRequestTimeoutSecs),
+        externalPoolStreamIdleTimeoutSecs: toWhole(draft.externalPools.externalPoolStreamIdleTimeoutSecs),
+        externalPoolUsageProjectionUpliftPercent: toWhole(draft.externalPools.externalPoolUsageProjectionUpliftPercent),
+        externalPoolUsageProjectionOutputUpliftMinTokens: toWhole(draft.externalPools.externalPoolUsageProjectionOutputUpliftMinTokens),
+        externalPoolUsageProjectionOutputUpliftPercent: toWhole(draft.externalPools.externalPoolUsageProjectionOutputUpliftPercent),
       },
       highCacheThreshold: toWhole(draft.highCacheThreshold),
     }
@@ -819,6 +826,7 @@ export function ConfigPanel() {
     if ([next.credentialRateLimitCooldownSecs, next.credentialServerErrorCooldownSecs, next.credentialNetworkErrorCooldownSecs, next.credentialStreamErrorCooldownSecs, next.credentialProtocolErrorCooldownSecs, next.credentialAuthErrorCooldownSecs].some((value) => value > next.credentialMaxCooldownSecs)) return toast.error('错误类型基础冷却秒数不能大于最大冷却秒数')
     if (next.promptCacheCapJitterMinTokens > next.promptCacheCapJitterMaxTokens) return toast.error('触顶扣减下限不能大于上限')
     if (next.payloadGuardEnabled && next.payloadGuardMaxBytes > 0 && next.payloadGuardMaxBytes < 65536) return toast.error('Kiro Payload 最大字节数必须为 0 或不小于 65536')
+    if (next.payloadGuardEnabled && next.payloadGuardMaxBytes > 0 && next.payloadGuardMaxBytes - next.payloadGuardSafetyMarginBytes < 65536) return toast.error('Payload 安全余量不能让实际裁剪目标小于 65536')
     const editableConfig = { ...next }
     delete editableConfig.proxyUrl
     delete editableConfig.proxyUsername
@@ -949,6 +957,7 @@ export function ConfigPanel() {
                 description="payloadGuardMaxBytes 是本地裁剪目标阈值，不是模型上下文窗口。填 0 表示关闭所有按大小触发的内容整形、历史裁剪、当前内容兜底裁剪和错误后裁剪重试，但仍保留上面的协议修复。"
               />
               <NumberField title="Kiro Payload 裁剪目标阈值" description="按最终发送到 Kiro 的 JSON body 字节数计算。默认 460800 bytes；填 0 时下方所有“条件分支”和“兜底分支”配置都不会触发。" value={draft.payloadGuardMaxBytes} min={0} suffix="bytes" onChange={(payloadGuardMaxBytes) => setDraft((prev) => ({ ...prev, payloadGuardMaxBytes }))} />
+              <NumberField title="Payload 安全余量" description="实际裁剪目标会从上面的阈值中扣除该余量。默认 32768 bytes；用于避免 provider 层追加字段后贴近 Kiro 请求体上限。" value={draft.payloadGuardSafetyMarginBytes} min={0} suffix="bytes" disabled={!payloadSizeLimitEnabled} onChange={(payloadGuardSafetyMarginBytes) => setDraft((prev) => ({ ...prev, payloadGuardSafetyMarginBytes }))} />
               <ImpactGroupHeader
                 label="条件分支"
                 title={payloadConditionTitle}

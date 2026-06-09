@@ -113,6 +113,12 @@ export function ExternalPoolsPanel() {
           externalPoolServerErrorCooldownSecs: whole(configDraft.externalPoolServerErrorCooldownSecs, 1),
           externalPoolNetworkErrorCooldownSecs: whole(configDraft.externalPoolNetworkErrorCooldownSecs, 1),
           externalPoolProtocolErrorCooldownSecs: whole(configDraft.externalPoolProtocolErrorCooldownSecs, 1),
+          externalPoolRequestTimeoutSecs: whole(configDraft.externalPoolRequestTimeoutSecs),
+          externalPoolStreamRequestTimeoutSecs: whole(configDraft.externalPoolStreamRequestTimeoutSecs),
+          externalPoolStreamIdleTimeoutSecs: whole(configDraft.externalPoolStreamIdleTimeoutSecs),
+          externalPoolUsageProjectionUpliftPercent: whole(configDraft.externalPoolUsageProjectionUpliftPercent),
+          externalPoolUsageProjectionOutputUpliftMinTokens: whole(configDraft.externalPoolUsageProjectionOutputUpliftMinTokens),
+          externalPoolUsageProjectionOutputUpliftPercent: whole(configDraft.externalPoolUsageProjectionOutputUpliftPercent),
         },
       })
       toast.success('备用号池策略已保存')
@@ -237,7 +243,25 @@ export function ExternalPoolsPanel() {
               <NumberBox disabled={!externalEnabled} label="5xx 冷却秒数" value={configDraft.externalPoolServerErrorCooldownSecs} min={1} onChange={(externalPoolServerErrorCooldownSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolServerErrorCooldownSecs }))} />
               <NumberBox disabled={!externalEnabled} label="网络错误冷却秒数" value={configDraft.externalPoolNetworkErrorCooldownSecs} min={1} onChange={(externalPoolNetworkErrorCooldownSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolNetworkErrorCooldownSecs }))} />
               <NumberBox disabled={!externalEnabled} label="协议/认证冷却秒数" value={configDraft.externalPoolProtocolErrorCooldownSecs} min={1} onChange={(externalPoolProtocolErrorCooldownSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolProtocolErrorCooldownSecs }))} />
+              <NumberBox disabled={!externalEnabled} label="非流式总超时秒数（0 不限制）" value={configDraft.externalPoolRequestTimeoutSecs} onChange={(externalPoolRequestTimeoutSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolRequestTimeoutSecs }))} />
+              <NumberBox disabled={!externalEnabled} label="流式总超时秒数（0 不限制）" value={configDraft.externalPoolStreamRequestTimeoutSecs} onChange={(externalPoolStreamRequestTimeoutSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolStreamRequestTimeoutSecs }))} />
+              <NumberBox disabled={!externalEnabled} label="流式空闲超时秒数（0 不限制）" value={configDraft.externalPoolStreamIdleTimeoutSecs} onChange={(externalPoolStreamIdleTimeoutSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolStreamIdleTimeoutSecs }))} />
             </div>
+          </PolicyBlock>
+
+          <PolicyBlock
+            title="外部池 usage 上报补偿"
+            active={externalEnabled && (configDraft.externalPoolUsageProjectionUpliftPercent > 0 || (configDraft.externalPoolUsageProjectionOutputUpliftPercent > 0 && configDraft.externalPoolUsageProjectionOutputUpliftMinTokens > 0))}
+            description="只影响配置为“按原请求路径整形缓存上报”的外部池。缓存读写放大会改写 cache read/write；输出放大会在 output_tokens 达到阈值后改写最终返回下游的 output_tokens。"
+          >
+            <div className="grid gap-4 md:grid-cols-3">
+              <NumberBox disabled={!externalEnabled} label="缓存读写放大百分比" value={configDraft.externalPoolUsageProjectionUpliftPercent} onChange={(externalPoolUsageProjectionUpliftPercent) => setConfigDraft((prev) => ({ ...prev, externalPoolUsageProjectionUpliftPercent }))} />
+              <NumberBox disabled={!externalEnabled} label="输出放大启用阈值" value={configDraft.externalPoolUsageProjectionOutputUpliftMinTokens} onChange={(externalPoolUsageProjectionOutputUpliftMinTokens) => setConfigDraft((prev) => ({ ...prev, externalPoolUsageProjectionOutputUpliftMinTokens }))} />
+              <NumberBox disabled={!externalEnabled || configDraft.externalPoolUsageProjectionOutputUpliftMinTokens <= 0} label="输出放大百分比" value={configDraft.externalPoolUsageProjectionOutputUpliftPercent} onChange={(externalPoolUsageProjectionOutputUpliftPercent) => setConfigDraft((prev) => ({ ...prev, externalPoolUsageProjectionOutputUpliftPercent }))} />
+            </div>
+            <p className="mt-3 text-xs leading-5 text-muted-foreground">
+              输出阈值或输出放大百分比为 0 时关闭输出补偿。比如阈值 1000、百分比 50 表示 output_tokens 达到 1000 后，最终上报 output_tokens 变为原值的 150%。
+            </p>
           </PolicyBlock>
 
           <PolicyBlock
@@ -280,6 +304,7 @@ export function ExternalPoolsPanel() {
               <Toggle disabled={!autoDisableActive} label="安全锁定自动禁用" checked={configDraft.externalPoolAutoDisableOnSecurityLock} onChange={(externalPoolAutoDisableOnSecurityLock) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableOnSecurityLock }))} />
               <Toggle disabled={!autoDisableActive} label="额度耗尽自动禁用" checked={configDraft.externalPoolAutoDisableOnQuotaExhausted} onChange={(externalPoolAutoDisableOnQuotaExhausted) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableOnQuotaExhausted }))} />
               <Toggle disabled={!autoDisableActive} label="配置错误自动禁用" checked={configDraft.externalPoolAutoDisableOnMisconfiguredEndpoint} onChange={(externalPoolAutoDisableOnMisconfiguredEndpoint) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableOnMisconfiguredEndpoint }))} />
+              <Toggle disabled={!autoDisableActive} label="通道禁用自动禁用" checked={configDraft.externalPoolAutoDisableOnChannelDisabled} onChange={(externalPoolAutoDisableOnChannelDisabled) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableOnChannelDisabled }))} />
               <NumberBox disabled={!autoDisableActive} label="自动禁用阈值" value={configDraft.externalPoolAutoDisableFailureThreshold} min={1} onChange={(externalPoolAutoDisableFailureThreshold) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableFailureThreshold }))} />
               <NumberBox disabled={!autoDisableActive} label="自动禁用统计窗口秒数" value={configDraft.externalPoolAutoDisableWindowSecs} min={1} onChange={(externalPoolAutoDisableWindowSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableWindowSecs }))} />
               <NumberBox disabled={!autoDisableActive} label="自动禁用秒数（0 手动恢复）" value={configDraft.externalPoolAutoDisableDurationSecs} onChange={(externalPoolAutoDisableDurationSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableDurationSecs }))} />

@@ -905,8 +905,20 @@ pub struct ExternalPoolsConfig {
     pub external_pool_network_error_cooldown_secs: u64,
     #[serde(default = "default_external_pool_protocol_error_cooldown_secs")]
     pub external_pool_protocol_error_cooldown_secs: u64,
+    #[serde(default = "default_external_pool_request_timeout_secs")]
+    pub external_pool_request_timeout_secs: u64,
+    #[serde(default)]
+    pub external_pool_stream_request_timeout_secs: u64,
+    #[serde(default = "default_external_pool_stream_idle_timeout_secs")]
+    pub external_pool_stream_idle_timeout_secs: u64,
+    #[serde(default = "default_true")]
+    pub external_pool_auto_disable_on_channel_disabled: bool,
     #[serde(default = "default_external_pool_usage_projection_uplift_percent")]
     pub external_pool_usage_projection_uplift_percent: u32,
+    #[serde(default)]
+    pub external_pool_usage_projection_output_uplift_min_tokens: i32,
+    #[serde(default)]
+    pub external_pool_usage_projection_output_uplift_percent: u32,
 }
 
 impl Default for ExternalPoolsConfig {
@@ -954,8 +966,15 @@ impl Default for ExternalPoolsConfig {
                 default_external_pool_network_error_cooldown_secs(),
             external_pool_protocol_error_cooldown_secs:
                 default_external_pool_protocol_error_cooldown_secs(),
+            external_pool_request_timeout_secs: default_external_pool_request_timeout_secs(),
+            external_pool_stream_request_timeout_secs: 0,
+            external_pool_stream_idle_timeout_secs: default_external_pool_stream_idle_timeout_secs(
+            ),
+            external_pool_auto_disable_on_channel_disabled: true,
             external_pool_usage_projection_uplift_percent:
                 default_external_pool_usage_projection_uplift_percent(),
+            external_pool_usage_projection_output_uplift_min_tokens: 0,
+            external_pool_usage_projection_output_uplift_percent: 0,
         }
     }
 }
@@ -1200,6 +1219,14 @@ pub struct Config {
     /// Kiro 上游请求 JSON body 最大字节数。默认使用保守阈值 450 KiB；`0` 表示不限制大小但仍执行协议修复。
     #[serde(default = "default_payload_guard_max_bytes")]
     pub payload_guard_max_bytes: usize,
+
+    /// payload guard 的安全余量字节数。
+    ///
+    /// 当 `payloadGuardMaxBytes > 0` 时，实际裁剪目标为
+    /// `payloadGuardMaxBytes - payloadGuardSafetyMarginBytes`，避免 provider
+    /// 层追加 endpoint/profile 等字段后贴近 Kiro 的真实请求体上限。
+    #[serde(default = "default_payload_guard_safety_margin_bytes")]
+    pub payload_guard_safety_margin_bytes: usize,
 
     /// payload 超限时是否允许裁剪最旧历史。关闭后只执行轻量协议修复；
     /// 仍超预算的请求会标记 `still_oversized` 并继续透传给 Kiro。
@@ -1537,6 +1564,10 @@ fn default_payload_guard_max_bytes() -> usize {
     450 * 1024
 }
 
+fn default_payload_guard_safety_margin_bytes() -> usize {
+    32 * 1024
+}
+
 fn default_payload_guard_trim_history() -> bool {
     true
 }
@@ -1673,6 +1704,14 @@ fn default_external_pool_protocol_error_cooldown_secs() -> u64 {
     10
 }
 
+fn default_external_pool_request_timeout_secs() -> u64 {
+    180
+}
+
+fn default_external_pool_stream_idle_timeout_secs() -> u64 {
+    180
+}
+
 fn default_external_pool_usage_projection_uplift_percent() -> u32 {
     25
 }
@@ -1778,6 +1817,7 @@ impl Default for Config {
             payload_guard_enabled: default_payload_guard_enabled(),
             payload_guard_mode: default_payload_guard_mode(),
             payload_guard_max_bytes: default_payload_guard_max_bytes(),
+            payload_guard_safety_margin_bytes: default_payload_guard_safety_margin_bytes(),
             payload_guard_trim_history: default_payload_guard_trim_history(),
             load_balancing_mode: default_load_balancing_mode(),
             scheduler_error_ewma_alpha: default_scheduler_error_ewma_alpha(),
@@ -1906,6 +1946,7 @@ mod tests {
         assert!(config.payload_guard_enabled);
         assert_eq!(config.payload_guard_mode, PayloadGuardMode::Preemptive);
         assert_eq!(config.payload_guard_max_bytes, 450 * 1024);
+        assert_eq!(config.payload_guard_safety_margin_bytes, 32 * 1024);
         assert!(config.payload_guard_trim_history);
         assert!(config.payload_shaping.enabled);
         assert!(config.payload_shaping.truncate_historical_tool_results);
@@ -2009,6 +2050,25 @@ mod tests {
         assert_eq!(
             config.external_pools.external_pool_dispatch_max_wait_secs,
             30
+        );
+        assert_eq!(
+            config.external_pools.external_pool_request_timeout_secs,
+            180
+        );
+        assert_eq!(
+            config
+                .external_pools
+                .external_pool_stream_request_timeout_secs,
+            0
+        );
+        assert_eq!(
+            config.external_pools.external_pool_stream_idle_timeout_secs,
+            180
+        );
+        assert!(
+            config
+                .external_pools
+                .external_pool_auto_disable_on_channel_disabled
         );
         assert_eq!(config.external_pools.external_pool_max_queued_requests, 25);
 

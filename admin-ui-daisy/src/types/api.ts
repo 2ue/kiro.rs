@@ -764,6 +764,13 @@ export interface ExternalPoolsConfig {
   externalPoolServerErrorCooldownSecs: number
   externalPoolNetworkErrorCooldownSecs: number
   externalPoolProtocolErrorCooldownSecs: number
+  externalPoolRequestTimeoutSecs: number
+  externalPoolStreamRequestTimeoutSecs: number
+  externalPoolStreamIdleTimeoutSecs: number
+  externalPoolAutoDisableOnChannelDisabled: boolean
+  externalPoolUsageProjectionUpliftPercent: number
+  externalPoolUsageProjectionOutputUpliftMinTokens: number
+  externalPoolUsageProjectionOutputUpliftPercent: number
 }
 
 export interface ExternalPool {
@@ -886,6 +893,7 @@ export interface RuntimeConfig {
   payloadGuardEnabled: boolean
   payloadGuardMode: PayloadGuardMode
   payloadGuardMaxBytes: number
+  payloadGuardSafetyMarginBytes: number
   payloadGuardTrimHistory: boolean
   payloadShaping: PayloadShapingConfig
   promptCacheTargetReadRatio: number

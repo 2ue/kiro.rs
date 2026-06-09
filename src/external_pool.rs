@@ -338,6 +338,8 @@ struct ExternalUsageProjectionContext {
     prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
     prompt_cache_creation_control: PromptCacheCreationControlConfig,
     uplift_percent: u32,
+    output_uplift_min_tokens: i32,
+    output_uplift_percent: u32,
     state: Arc<SyncMutex<ExternalUsageProjectionState>>,
 }
 
@@ -505,9 +507,6 @@ impl ExternalPoolManager {
             postgres,
             redis,
             client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(
-                    DEFAULT_EXTERNAL_POOL_REQUEST_TIMEOUT_SECS,
-                ))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             local_state: Arc::new(Mutex::new(HashMap::new())),
@@ -807,11 +806,22 @@ impl ExternalPoolManager {
                 HeaderValue::from_static("application/json"),
             );
         }
-        let request = self
+        let mut request = self
             .client
             .post(url)
             .headers(headers)
             .body(route.raw_body.clone());
+        if route.payload.stream {
+            if config.external_pool_stream_request_timeout_secs > 0 {
+                request = request.timeout(Duration::from_secs(
+                    config.external_pool_stream_request_timeout_secs,
+                ));
+            }
+        } else if config.external_pool_request_timeout_secs > 0 {
+            request = request.timeout(Duration::from_secs(
+                config.external_pool_request_timeout_secs,
+            ));
+        }
         let response = request.send().await.map_err(|err| ExternalPoolError {
             status: None,
             message: format!("external pool request send failed: {}", err),
@@ -847,7 +857,11 @@ impl ExternalPoolManager {
                 route,
                 pool,
                 config.external_pool_usage_projection_uplift_percent,
+                config.external_pool_usage_projection_output_uplift_min_tokens,
+                config.external_pool_usage_projection_output_uplift_percent,
             );
+            let stream_idle_timeout = (config.external_pool_stream_idle_timeout_secs > 0)
+                .then(|| Duration::from_secs(config.external_pool_stream_idle_timeout_secs));
             let stream_usage_projection = projection_context.clone();
             let usage_capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
             let stream_usage_capture = usage_capture.clone();
@@ -857,9 +871,17 @@ impl ExternalPoolManager {
                     Vec::<u8>::new(),
                     Some(lease),
                     Instant::now(),
+                    Instant::now(),
                     false,
                 ),
-                move |(mut body_stream, mut buffer, lease, mut last_touch_at, finished)| {
+                move |(
+                    mut body_stream,
+                    mut buffer,
+                    lease,
+                    mut last_touch_at,
+                    mut last_chunk_at,
+                    finished,
+                )| {
                     let projection_context = projection_context.clone();
                     let usage_capture = usage_capture.clone();
                     async move {
@@ -871,6 +893,7 @@ impl ExternalPoolManager {
                                 chunk = body_stream.next() => {
                                     match chunk {
                                         Some(Ok(chunk)) => {
+                                            last_chunk_at = Instant::now();
                                             buffer.extend_from_slice(&chunk);
                                             let projected = drain_projected_sse_events(
                                                 &mut buffer,
@@ -880,7 +903,14 @@ impl ExternalPoolManager {
                                             if !projected.is_empty() {
                                                 return Some((
                                                     Ok(Bytes::from(projected)),
-                                                    (body_stream, buffer, lease, last_touch_at, false),
+                                                    (
+                                                        body_stream,
+                                                        buffer,
+                                                        lease,
+                                                        last_touch_at,
+                                                        last_chunk_at,
+                                                        false,
+                                                    ),
                                                 ));
                                             }
                                         }
@@ -891,7 +921,14 @@ impl ExternalPoolManager {
                                                     "external stream read error: {}",
                                                     err
                                                 ))),
-                                                (body_stream, Vec::new(), None, last_touch_at, true),
+                                                (
+                                                    body_stream,
+                                                    Vec::new(),
+                                                    None,
+                                                    last_touch_at,
+                                                    last_chunk_at,
+                                                    true,
+                                                ),
                                             ));
                                         }
                                         None => {
@@ -910,7 +947,14 @@ impl ExternalPoolManager {
                                             }
                                             return Some((
                                                 Ok(Bytes::from(tail)),
-                                                (body_stream, Vec::new(), None, last_touch_at, true),
+                                                (
+                                                    body_stream,
+                                                    Vec::new(),
+                                                    None,
+                                                    last_touch_at,
+                                                    last_chunk_at,
+                                                    true,
+                                                ),
                                             ));
                                         }
                                     }
@@ -920,6 +964,26 @@ impl ExternalPoolManager {
                                         lease.touch();
                                     }
                                     last_touch_at = Instant::now();
+                                }
+                                _ = external_pool_stream_idle_deadline(last_chunk_at, stream_idle_timeout) => {
+                                    drop(lease);
+                                    let seconds = stream_idle_timeout
+                                        .map(|timeout| timeout.as_secs())
+                                        .unwrap_or_default();
+                                    return Some((
+                                        Err(std::io::Error::other(format!(
+                                            "external pool stream idle timeout after {} seconds",
+                                            seconds
+                                        ))),
+                                        (
+                                            body_stream,
+                                            Vec::new(),
+                                            None,
+                                            last_touch_at,
+                                            last_chunk_at,
+                                            true,
+                                        ),
+                                    ));
                                 }
                             }
                         }
@@ -970,6 +1034,8 @@ impl ExternalPoolManager {
                 route,
                 pool,
                 config.external_pool_usage_projection_uplift_percent,
+                config.external_pool_usage_projection_output_uplift_min_tokens,
+                config.external_pool_usage_projection_output_uplift_percent,
             );
             let projected = maybe_project_non_stream_usage(bytes, projection_context.as_ref());
             let billing = external_pool_billing_from_capture(route, pool, projected.usage_capture);
@@ -1876,6 +1942,17 @@ fn external_pool_lease_touch_deadline(last_touch_at: Instant) -> Instant {
     last_touch_at + Duration::from_secs(EXTERNAL_POOL_LEASE_TOUCH_INTERVAL_SECS)
 }
 
+async fn external_pool_stream_idle_deadline(
+    last_chunk_at: Instant,
+    idle_timeout: Option<Duration>,
+) {
+    if let Some(idle_timeout) = idle_timeout {
+        tokio::time::sleep_until(last_chunk_at + idle_timeout).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
 pub(crate) fn external_pool_models_url(base_url: &str) -> Result<Url, url::ParseError> {
     let mut base = base_url.trim().trim_end_matches('/').to_string();
     if base_url_ends_with_v1(&base) {
@@ -2144,6 +2221,83 @@ fn classify_external_error(
 ) -> ExternalPoolError {
     let message = String::from_utf8_lossy(&body).to_string();
     let lower = message.to_ascii_lowercase();
+    if lower.contains("too many requests")
+        || lower.contains("service_request_rate_exceeded")
+        || lower.contains("rate limit")
+        || lower.contains("ratelimit")
+    {
+        return ExternalPoolError {
+            status: Some(status),
+            message,
+            retryable: true,
+            auto_disable_reason: None,
+            cooldown: Some((
+                Duration::from_secs(config.external_pool_rate_limit_cooldown_secs.max(1)),
+                "rate_limit".to_string(),
+            )),
+            response_body: Some(body),
+            response_headers: headers,
+        };
+    }
+    if lower.contains("database is locked") || lower.contains("sqlite_busy") {
+        return ExternalPoolError {
+            status: Some(status),
+            message,
+            retryable: true,
+            auto_disable_reason: None,
+            cooldown: Some((
+                Duration::from_secs(config.external_pool_server_error_cooldown_secs.max(1)),
+                "database_busy".to_string(),
+            )),
+            response_body: Some(body),
+            response_headers: headers,
+        };
+    }
+    if lower.contains("invalid token") {
+        return ExternalPoolError {
+            status: Some(status),
+            message,
+            retryable: true,
+            auto_disable_reason: Some("auth_error".to_string()),
+            cooldown: Some((
+                Duration::from_secs(config.external_pool_protocol_error_cooldown_secs.max(1)),
+                "auth_error".to_string(),
+            )),
+            response_body: Some(body),
+            response_headers: headers,
+        };
+    }
+    if lower.contains("channel affinity") && lower.contains("disabled") {
+        return ExternalPoolError {
+            status: Some(status),
+            message,
+            retryable: true,
+            auto_disable_reason: Some("channel_disabled".to_string()),
+            cooldown: Some((
+                Duration::from_secs(config.external_pool_protocol_error_cooldown_secs.max(1)),
+                "channel_disabled".to_string(),
+            )),
+            response_body: Some(body),
+            response_headers: headers,
+        };
+    }
+    if lower.contains("model_not_found")
+        || lower.contains("failed to get available channel for model")
+        || lower.contains("no available channel")
+    {
+        return ExternalPoolError {
+            status: Some(status),
+            message,
+            retryable: true,
+            auto_disable_reason: None,
+            cooldown: Some((
+                Duration::from_secs(config.external_pool_server_error_cooldown_secs.max(1)),
+                "model_unavailable".to_string(),
+            )),
+            response_body: Some(body),
+            response_headers: headers,
+        };
+    }
     if status == StatusCode::BAD_REQUEST {
         return ExternalPoolError {
             status: Some(status),
@@ -2237,6 +2391,7 @@ fn auto_disable_reason_enabled(config: &ExternalPoolsConfig, reason: &str) -> bo
         "security_lock" => config.external_pool_auto_disable_on_security_lock,
         "quota_exhausted" => config.external_pool_auto_disable_on_quota_exhausted,
         "misconfigured_endpoint" => config.external_pool_auto_disable_on_misconfigured_endpoint,
+        "channel_disabled" => config.external_pool_auto_disable_on_channel_disabled,
         _ => false,
     }
 }
@@ -2244,6 +2399,20 @@ fn auto_disable_reason_enabled(config: &ExternalPoolsConfig, reason: &str) -> bo
 fn error_type_for_external_error(err: &ExternalPoolError) -> String {
     if let Some(reason) = err.auto_disable_reason.as_deref() {
         return reason.to_string();
+    }
+    if let Some((_, reason)) = err.cooldown.as_ref() {
+        if reason == "rate_limit"
+            || reason == "database_busy"
+            || reason == "model_unavailable"
+            || reason == "server_error"
+            || reason.starts_with("network_error")
+        {
+            return reason
+                .split_whitespace()
+                .next()
+                .unwrap_or("external_pool_error")
+                .to_string();
+        }
     }
     match err.status {
         Some(StatusCode::TOO_MANY_REQUESTS) => "rate_limit",
@@ -2487,7 +2656,12 @@ fn project_usage_value(
         projection.prompt_cache_creation_control,
         reported,
     );
-    let projected = shaped.with_external_pool_usage_uplift(projection.uplift_percent);
+    let projected = shaped
+        .with_external_pool_usage_uplift(projection.uplift_percent)
+        .with_external_pool_output_uplift(
+            projection.output_uplift_min_tokens,
+            projection.output_uplift_percent,
+        );
     let projected_json = projected.to_json();
     let Some(obj) = usage.as_object_mut() else {
         return None;
@@ -2506,6 +2680,7 @@ fn project_usage_value(
 
 trait ExternalPoolUsageUplift {
     fn with_external_pool_usage_uplift(self, percent: u32) -> Self;
+    fn with_external_pool_output_uplift(self, min_tokens: i32, percent: u32) -> Self;
 }
 
 impl ExternalPoolUsageUplift for CacheUsage {
@@ -2537,6 +2712,19 @@ impl ExternalPoolUsageUplift for CacheUsage {
             cache_read_input_tokens,
             cache_creation_5m_input_tokens,
             cache_creation_1h_input_tokens,
+        }
+    }
+
+    fn with_external_pool_output_uplift(self, min_tokens: i32, percent: u32) -> Self {
+        let percent = percent.min(200);
+        let min_tokens = min_tokens.max(0);
+        if percent == 0 || min_tokens == 0 || self.output_tokens < min_tokens {
+            return self;
+        }
+
+        Self {
+            output_tokens: uplift_tokens(self.output_tokens.max(0), percent),
+            ..self
         }
     }
 }
@@ -2685,6 +2873,8 @@ fn build_external_usage_projection_context(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
     uplift_percent: u32,
+    output_uplift_min_tokens: i32,
+    output_uplift_percent: u32,
 ) -> Option<ExternalUsageProjectionContext> {
     if pool.usage_projection_mode != ExternalPoolUsageProjectionMode::CurrentPathPolicy {
         return None;
@@ -2743,6 +2933,8 @@ fn build_external_usage_projection_context(
         prompt_cache_creation_controller: route.prompt_cache_creation_controller.clone(),
         prompt_cache_creation_control: route.prompt_cache_creation_control,
         uplift_percent,
+        output_uplift_min_tokens: output_uplift_min_tokens.max(0),
+        output_uplift_percent: output_uplift_percent.min(200),
         state: Arc::new(SyncMutex::new(ExternalUsageProjectionState::default())),
     })
 }
@@ -2942,6 +3134,64 @@ mod tests {
         assert_eq!(actual, body);
     }
 
+    #[test]
+    fn external_pool_error_classifies_nested_rate_limit_body() {
+        let err = classify_external_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Bytes::from_static(br#"{"error":"SERVICE_REQUEST_RATE_EXCEEDED: Too many requests"}"#),
+            HeaderMap::new(),
+            &ExternalPoolsConfig::default(),
+        );
+
+        assert!(err.retryable);
+        assert_eq!(error_type_for_external_error(&err), "rate_limit");
+        assert!(err.auto_disable_reason.is_none());
+    }
+
+    #[test]
+    fn external_pool_error_classifies_database_busy_without_auto_disable() {
+        let err = classify_external_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Bytes::from_static(br#"database is locked (SQLITE_BUSY)"#),
+            HeaderMap::new(),
+            &ExternalPoolsConfig::default(),
+        );
+
+        assert!(err.retryable);
+        assert_eq!(error_type_for_external_error(&err), "database_busy");
+        assert!(err.auto_disable_reason.is_none());
+    }
+
+    #[test]
+    fn external_pool_error_classifies_channel_disabled_for_optional_auto_disable() {
+        let config = ExternalPoolsConfig::default();
+        let err = classify_external_error(
+            StatusCode::BAD_GATEWAY,
+            Bytes::from_static(br#"channel affinity has been disabled"#),
+            HeaderMap::new(),
+            &config,
+        );
+
+        assert!(err.retryable);
+        assert_eq!(err.auto_disable_reason.as_deref(), Some("channel_disabled"));
+        assert_eq!(error_type_for_external_error(&err), "channel_disabled");
+        assert!(auto_disable_reason_enabled(&config, "channel_disabled"));
+    }
+
+    #[test]
+    fn external_pool_error_classifies_model_unavailable_as_retryable() {
+        let err = classify_external_error(
+            StatusCode::BAD_REQUEST,
+            Bytes::from_static(br#"{"error":{"code":"model_not_found"}}"#),
+            HeaderMap::new(),
+            &ExternalPoolsConfig::default(),
+        );
+
+        assert!(err.retryable);
+        assert_eq!(error_type_for_external_error(&err), "model_unavailable");
+        assert!(err.auto_disable_reason.is_none());
+    }
+
     #[tokio::test]
     async fn external_capacity_scheduler_error_uses_request_id_and_error_type() {
         let route = ExternalRouteRequest {
@@ -3123,7 +3373,23 @@ mod tests {
         pool: &ExternalPool,
         uplift_percent: u32,
     ) -> Option<ExternalUsageProjectionContext> {
-        build_external_usage_projection_context(route, pool, uplift_percent)
+        projection_context_with_output_uplift(route, pool, uplift_percent, 0, 0)
+    }
+
+    fn projection_context_with_output_uplift(
+        route: &ExternalRouteRequest,
+        pool: &ExternalPool,
+        uplift_percent: u32,
+        output_uplift_min_tokens: i32,
+        output_uplift_percent: u32,
+    ) -> Option<ExternalUsageProjectionContext> {
+        build_external_usage_projection_context(
+            route,
+            pool,
+            uplift_percent,
+            output_uplift_min_tokens,
+            output_uplift_percent,
+        )
     }
 
     #[test]
@@ -3364,6 +3630,65 @@ mod tests {
     }
 
     #[test]
+    fn usage_projection_output_uplift_only_applies_above_threshold() {
+        let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":800,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
+        );
+        let mut route = test_route("claude-sonnet-4-5");
+        route.endpoint = "/v1/messages";
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+
+        let projection =
+            projection_context_with_output_uplift(&route, &pool, 0, 1_000, 50).expect("projection");
+        let projected = maybe_project_non_stream_usage(body, Some(&projection));
+        let shaped = projected.usage_capture.shaped.expect("shaped usage");
+        let reported = projected.usage_capture.reported.expect("reported usage");
+
+        assert_eq!(shaped.output_tokens, 800);
+        assert_eq!(reported.output_tokens, 800);
+    }
+
+    #[test]
+    fn usage_projection_output_uplift_changes_only_final_reported_usage() {
+        let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1200,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
+        );
+        let mut route = test_route("claude-sonnet-4-5");
+        route.endpoint = "/v1/messages";
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+
+        let projection =
+            projection_context_with_output_uplift(&route, &pool, 0, 1_000, 50).expect("projection");
+        let projected = maybe_project_non_stream_usage(body, Some(&projection));
+        let value: serde_json::Value =
+            serde_json::from_slice(&projected.body).expect("projected json");
+        let usage = value.get("usage").expect("usage object");
+        let shaped = projected.usage_capture.shaped.expect("shaped usage");
+        let reported = projected.usage_capture.reported.expect("reported usage");
+
+        assert_eq!(shaped.output_tokens, 1200);
+        assert_eq!(reported.output_tokens, uplift_tokens(1200, 50));
+        assert_eq!(
+            usage
+                .get("output_tokens")
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default(),
+            uplift_tokens(1200, 50) as i64
+        );
+        assert_eq!(reported.input_tokens, shaped.input_tokens);
+        assert_eq!(
+            reported.cache_read_input_tokens,
+            shaped.cache_read_input_tokens
+        );
+        assert_eq!(
+            reported.cache_creation_input_tokens,
+            shaped.cache_creation_input_tokens
+        );
+    }
+
+    #[test]
     fn usage_projection_uses_resolved_model_without_mutating_payload_model() {
         let body = Bytes::from_static(
             br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
@@ -3519,6 +3844,34 @@ mod tests {
     }
 
     #[test]
+    fn external_pool_billing_uses_output_uplift_as_final_reported_cost() {
+        let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":1000,"output_tokens":1200,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        );
+        let mut route = test_route("claude-sonnet-4-5");
+        route.endpoint = "/v1/messages";
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+        let projection =
+            projection_context_with_output_uplift(&route, &pool, 0, 1_000, 50).expect("projection");
+
+        let projected = maybe_project_non_stream_usage(body, Some(&projection));
+        let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+            .expect("billing");
+
+        assert!(billing.pricing_available);
+        assert_eq!(billing.raw_usage.output_tokens, 1200);
+        assert_eq!(billing.shaped_usage.output_tokens, 1200);
+        assert_eq!(
+            billing.reported_usage.output_tokens,
+            uplift_tokens(1200, 50)
+        );
+        assert!(billing.uplifted_cost_usd > billing.shaped_cost_usd);
+        assert!((billing.reported_cost_usd - billing.uplifted_cost_usd).abs() < f64::EPSILON);
+        assert!((billing.billable_cost_usd - billing.uplifted_cost_usd).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn sse_usage_projection_preserves_delimiters_and_done_events() {
         let event = br#"event: message_delta
 data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}
@@ -3558,6 +3911,30 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
         assert!(reported.input_tokens <= 96);
         assert!(reported.cache_read_input_tokens > 0);
         assert!(reported.cache_creation_input_tokens > 0);
+    }
+
+    #[test]
+    fn sse_usage_projection_applies_output_uplift_to_reported_usage() {
+        let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1200,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}
+
+"#;
+        let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+        let mut route = test_route("claude-sonnet-4-5");
+        route.endpoint = "/v1/messages";
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+        let projection =
+            projection_context_with_output_uplift(&route, &pool, 0, 1_000, 50).expect("projection");
+        let projected = maybe_project_sse_event(event, Some(&projection), Some(&capture));
+        let text = std::str::from_utf8(&projected).expect("projected sse");
+        assert!(text.contains(r#""output_tokens":1800"#));
+
+        let capture = *capture.lock();
+        let shaped = capture.shaped.expect("shaped usage");
+        let reported = capture.reported.expect("reported usage");
+        assert_eq!(shaped.output_tokens, 1200);
+        assert_eq!(reported.output_tokens, uplift_tokens(1200, 50));
     }
 
     #[test]

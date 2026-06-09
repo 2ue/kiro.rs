@@ -80,6 +80,7 @@ pub fn create_router_with_provider(
     payload_guard_enabled: bool,
     payload_guard_mode: PayloadGuardMode,
     payload_guard_max_bytes: usize,
+    payload_guard_safety_margin_bytes: usize,
     payload_guard_trim_history: bool,
     payload_shaping: PayloadShapingConfig,
     external_pool_manager: Option<Arc<ExternalPoolManager>>,
@@ -110,6 +111,7 @@ pub fn create_router_with_provider(
         payload_guard_enabled,
         payload_guard_mode,
         payload_guard_max_bytes,
+        payload_guard_safety_margin_bytes,
         payload_guard_trim_history,
         payload_shaping,
     )

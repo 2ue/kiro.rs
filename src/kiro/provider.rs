@@ -32,9 +32,25 @@ use parking_lot::Mutex;
 /// 自动模式下的小账号池最少尝试次数，保持既有 1-3 个账号时最多 9 次的行为。
 const MIN_AUTO_RETRY_ATTEMPTS: usize = 9;
 
+fn effective_payload_guard_limit_for_logging(config: &Config) -> usize {
+    const MIN_EFFECTIVE_LIMIT_BYTES: usize = 64 * 1024;
+    let max_bytes = config.payload_guard_max_bytes;
+    if max_bytes == 0 || config.payload_guard_safety_margin_bytes == 0 {
+        return max_bytes;
+    }
+    if max_bytes <= MIN_EFFECTIVE_LIMIT_BYTES {
+        return max_bytes;
+    }
+    let margin = config
+        .payload_guard_safety_margin_bytes
+        .min(max_bytes.saturating_sub(MIN_EFFECTIVE_LIMIT_BYTES));
+    max_bytes.saturating_sub(margin)
+}
+
 fn should_log_upstream_body_size_at_info(body_bytes: usize, config: &Config) -> bool {
-    let near_payload_guard_limit = config.payload_guard_max_bytes > 0
-        && body_bytes > config.payload_guard_max_bytes.saturating_mul(70) / 100;
+    let payload_guard_limit = effective_payload_guard_limit_for_logging(config);
+    let near_payload_guard_limit =
+        payload_guard_limit > 0 && body_bytes > payload_guard_limit.saturating_mul(70) / 100;
     let compression_enabled =
         config.compression.enabled && config.compression.whitespace_compression;
 

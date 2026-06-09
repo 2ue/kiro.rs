@@ -157,6 +157,7 @@ struct RequestRuntimeConfig {
     payload_guard_enabled: bool,
     payload_guard_mode: PayloadGuardMode,
     payload_guard_max_bytes: usize,
+    payload_guard_safety_margin_bytes: usize,
     payload_guard_trim_history: bool,
     payload_shaping: PayloadShapingConfig,
 }
@@ -180,6 +181,7 @@ impl RequestRuntimeConfig {
             payload_guard_enabled: state.payload_guard_enabled,
             payload_guard_mode: state.payload_guard_mode,
             payload_guard_max_bytes: state.payload_guard_max_bytes,
+            payload_guard_safety_margin_bytes: state.payload_guard_safety_margin_bytes,
             payload_guard_trim_history: state.payload_guard_trim_history,
             payload_shaping: state.payload_shaping,
         }
@@ -213,15 +215,31 @@ impl RequestRuntimeConfig {
             payload_guard_enabled: config.payload_guard_enabled,
             payload_guard_mode: config.payload_guard_mode,
             payload_guard_max_bytes: config.payload_guard_max_bytes,
+            payload_guard_safety_margin_bytes: config.payload_guard_safety_margin_bytes,
             payload_guard_trim_history: config.payload_guard_trim_history,
             payload_shaping: config.payload_shaping,
         }
     }
 
+    fn effective_payload_guard_max_bytes(&self) -> usize {
+        const MIN_EFFECTIVE_LIMIT_BYTES: usize = 64 * 1024;
+        let max_bytes = self.payload_guard_max_bytes;
+        if max_bytes == 0 || self.payload_guard_safety_margin_bytes == 0 {
+            return max_bytes;
+        }
+        if max_bytes <= MIN_EFFECTIVE_LIMIT_BYTES {
+            return max_bytes;
+        }
+        let margin = self
+            .payload_guard_safety_margin_bytes
+            .min(max_bytes.saturating_sub(MIN_EFFECTIVE_LIMIT_BYTES));
+        max_bytes.saturating_sub(margin)
+    }
+
     fn payload_guard_config(&self) -> PayloadGuardConfig {
         PayloadGuardConfig {
             enabled: self.payload_guard_enabled,
-            max_bytes: self.payload_guard_max_bytes,
+            max_bytes: self.effective_payload_guard_max_bytes(),
             trim_history: self.payload_guard_trim_history,
             shaping: self.payload_shaping,
         }
@@ -3758,6 +3776,7 @@ mod tests {
             payload_guard_enabled: enabled,
             payload_guard_mode: mode,
             payload_guard_max_bytes: max_bytes,
+            payload_guard_safety_margin_bytes: 0,
             payload_guard_trim_history: true,
             payload_shaping: PayloadShapingConfig::default(),
         }
@@ -3776,6 +3795,18 @@ mod tests {
         assert!(runtime_config.too_long_retry_enabled());
         assert_eq!(runtime_config.payload_guard_config().max_bytes, 460_800);
         assert!(runtime_config.payload_guard_config().trim_history);
+    }
+
+    #[test]
+    fn payload_guard_safety_margin_reduces_effective_size_target() {
+        let mut runtime_config =
+            runtime_config_for_payload_guard(PayloadGuardMode::Preemptive, true, 460_800);
+        runtime_config.payload_guard_safety_margin_bytes = 32 * 1024;
+
+        assert_eq!(runtime_config.payload_guard_config().max_bytes, 428_032);
+
+        runtime_config.payload_guard_max_bytes = 0;
+        assert_eq!(runtime_config.payload_guard_config().max_bytes, 0);
     }
 
     #[test]

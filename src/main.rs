@@ -420,6 +420,7 @@ async fn main() {
         config.payload_guard_enabled,
         config.payload_guard_mode,
         config.payload_guard_max_bytes,
+        config.payload_guard_safety_margin_bytes,
         config.payload_guard_trim_history,
         config.payload_shaping,
         Some(external_pool_manager.clone()),

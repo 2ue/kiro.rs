@@ -2078,6 +2078,7 @@ impl AdminService {
             payload_guard_enabled: config.payload_guard_enabled,
             payload_guard_mode: config.payload_guard_mode,
             payload_guard_max_bytes: config.payload_guard_max_bytes as u64,
+            payload_guard_safety_margin_bytes: config.payload_guard_safety_margin_bytes as u64,
             payload_guard_trim_history: config.payload_guard_trim_history,
             payload_shaping: config.payload_shaping,
             prompt_cache_target_read_ratio: config.prompt_cache_target_read_ratio,
@@ -2192,6 +2193,10 @@ impl AdminService {
             .payload_guard_max_bytes
             .and_then(|value| usize::try_from(value).ok())
             .unwrap_or(current_config.payload_guard_max_bytes);
+        let payload_guard_safety_margin_bytes = req
+            .payload_guard_safety_margin_bytes
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(current_config.payload_guard_safety_margin_bytes);
         let payload_guard_trim_history = req
             .payload_guard_trim_history
             .unwrap_or(current_config.payload_guard_trim_history);
@@ -2341,6 +2346,14 @@ impl AdminService {
                 "payloadGuardMaxBytes 启用时必须为 0 或不小于 65536".to_string(),
             ));
         }
+        if payload_guard_enabled
+            && payload_guard_max_bytes > 0
+            && payload_guard_max_bytes.saturating_sub(payload_guard_safety_margin_bytes) < 64 * 1024
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "payloadGuardSafetyMarginBytes 不能让实际裁剪目标小于 65536".to_string(),
+            ));
+        }
         if !(1.0..=3.0).contains(&prompt_cache_token_scale) || !prompt_cache_token_scale.is_finite()
         {
             return Err(AdminServiceError::InvalidCredential(
@@ -2427,6 +2440,7 @@ impl AdminService {
                 config.payload_guard_enabled = payload_guard_enabled;
                 config.payload_guard_mode = payload_guard_mode;
                 config.payload_guard_max_bytes = payload_guard_max_bytes;
+                config.payload_guard_safety_margin_bytes = payload_guard_safety_margin_bytes;
                 config.payload_guard_trim_history = payload_guard_trim_history;
                 config.payload_shaping = payload_shaping;
                 config.prompt_cache_target_read_ratio = prompt_cache_target_read_ratio;
@@ -2898,8 +2912,23 @@ fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), St
     {
         return Err("外部池错误冷却秒数必须大于 0".to_string());
     }
+    if config.external_pool_request_timeout_secs > 86_400 {
+        return Err("externalPoolRequestTimeoutSecs 不能大于 86400".to_string());
+    }
+    if config.external_pool_stream_request_timeout_secs > 86_400 {
+        return Err("externalPoolStreamRequestTimeoutSecs 不能大于 86400".to_string());
+    }
+    if config.external_pool_stream_idle_timeout_secs > 86_400 {
+        return Err("externalPoolStreamIdleTimeoutSecs 不能大于 86400".to_string());
+    }
     if config.external_pool_usage_projection_uplift_percent > 200 {
         return Err("externalPoolUsageProjectionUpliftPercent 不能大于 200".to_string());
+    }
+    if config.external_pool_usage_projection_output_uplift_min_tokens < 0 {
+        return Err("externalPoolUsageProjectionOutputUpliftMinTokens 不能小于 0".to_string());
+    }
+    if config.external_pool_usage_projection_output_uplift_percent > 200 {
+        return Err("externalPoolUsageProjectionOutputUpliftPercent 不能大于 200".to_string());
     }
     Ok(())
 }

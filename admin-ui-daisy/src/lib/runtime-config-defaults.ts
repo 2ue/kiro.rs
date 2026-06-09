@@ -130,6 +130,13 @@ export function defaultExternalPoolsConfig() {
     externalPoolServerErrorCooldownSecs: 10,
     externalPoolNetworkErrorCooldownSecs: 10,
     externalPoolProtocolErrorCooldownSecs: 10,
+    externalPoolRequestTimeoutSecs: 180,
+    externalPoolStreamRequestTimeoutSecs: 0,
+    externalPoolStreamIdleTimeoutSecs: 180,
+    externalPoolAutoDisableOnChannelDisabled: true,
+    externalPoolUsageProjectionUpliftPercent: 25,
+    externalPoolUsageProjectionOutputUpliftMinTokens: 0,
+    externalPoolUsageProjectionOutputUpliftPercent: 0,
   }
 }
 
@@ -180,6 +187,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   payloadGuardEnabled: true,
   payloadGuardMode: 'preemptive',
   payloadGuardMaxBytes: 460800,
+  payloadGuardSafetyMarginBytes: 32768,
   payloadGuardTrimHistory: true,
   payloadShaping: defaultPayloadShaping(),
   promptCacheTargetReadRatio: 0.98,

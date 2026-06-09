@@ -76,6 +76,8 @@ pub struct AppState {
     pub payload_guard_mode: PayloadGuardMode,
     /// Kiro 上游请求 JSON body 最大字节数
     pub payload_guard_max_bytes: usize,
+    /// payload guard 安全余量字节数
+    pub payload_guard_safety_margin_bytes: usize,
     /// payload 超限时是否裁剪旧历史
     pub payload_guard_trim_history: bool,
     /// payload shaping 配置
@@ -122,6 +124,7 @@ impl AppState {
             payload_guard_enabled: true,
             payload_guard_mode: PayloadGuardMode::Preemptive,
             payload_guard_max_bytes: 450 * 1024,
+            payload_guard_safety_margin_bytes: 32 * 1024,
             payload_guard_trim_history: true,
             payload_shaping: PayloadShapingConfig::default(),
             external_pool_manager: None,
@@ -190,12 +193,14 @@ impl AppState {
         enabled: bool,
         mode: PayloadGuardMode,
         max_bytes: usize,
+        safety_margin_bytes: usize,
         trim_history: bool,
         payload_shaping: PayloadShapingConfig,
     ) -> Self {
         self.payload_guard_enabled = enabled;
         self.payload_guard_mode = mode;
         self.payload_guard_max_bytes = max_bytes;
+        self.payload_guard_safety_margin_bytes = safety_margin_bytes;
         self.payload_guard_trim_history = trim_history;
         self.payload_shaping = payload_shaping;
         self

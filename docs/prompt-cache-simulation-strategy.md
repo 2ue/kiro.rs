@@ -8,7 +8,7 @@
 
 1. 本地 prompt-cache tracker：在本进程内模拟 Anthropic prompt cache 的创建和读取，用来生成 `cache_creation_input_tokens`、`cache_read_input_tokens` 等 usage 字段。
 2. 路径级 usage 上报投影：按入口路径把已经计算出的 usage 投影成下游看到的 usage，例如 `/cc` 默认压低 `input_tokens` 并把差值转入 `cache_read_input_tokens`。
-3. 外部备用池 usage 整形：外部池请求和非 usage 正文默认透传；只有单个外部池设置 `usageProjectionMode=current_path_policy` 时，才会忽略外部池自身返回的 cache read / cache creation，按本地凭证同一套 prompt-cache 规则重建 usage，再按当前入口路径的 `reportedUsage` 策略投影，并额外对 cache read / cache creation 做上浮。
+3. 外部备用池 usage 整形：外部池请求和非 usage 正文默认透传；只有单个外部池设置 `usageProjectionMode=current_path_policy` 时，才会忽略外部池自身返回的 cache read / cache creation，按本地凭证同一套 prompt-cache 规则重建 usage，再按当前入口路径的 `reportedUsage` 策略投影，并额外对 cache read / cache creation 做上浮；如果配置了输出补偿，还会在 `output_tokens` 达到阈值后对最终上报的输出做百分比放大。
 
 最重要的边界：
 
@@ -17,7 +17,7 @@
 - `promptCacheCreationControl` 只限制最终上报的 `cache_creation_input_tokens` 出现频次，不改变 tracker 是否已经创建缓存，也不改变 `cache_read_input_tokens` 的命中计算。
 - 真实上游 metadata 里已经有非零 cache read/write 时，真实 metadata 优先，不用本地模拟覆盖。
 - 真实上游 metadata 存在但 cache read/write 都为 0 时，在 high-cache 模式下可以用本地模拟补足 cache usage。
-- 外部池 `pass_through` 是严格透传 usage；`current_path_policy` 才会改写 usage，并且不会信任外部池自身 cache 字段。
+- 外部池 `pass_through` 是严格透传 usage；`current_path_policy` 才会改写 usage，并且不会信任外部池自身 cache 字段。输出补偿也只在 `current_path_policy` 下生效。
 
 ## 代码入口
 
@@ -30,7 +30,7 @@
 - `src/anthropic/stream.rs`：流式响应的首尾 usage 生成和最终 usage 投影。
 - `src/anthropic/router.rs`：把 `/v1`、`/cc/v1`、`/ha/v1`、`/na/v1` 消息路径固定为 high-cache 模式。
 - `src/model/config.rs`：运行时配置结构和默认值。
-- `src/external_pool.rs`：外部备用池 usage 透传/投影、cache 上浮和成本保底记录。
+- `src/external_pool.rs`：外部备用池 usage 透传/投影、cache 上浮、输出补偿和成本差值记录。
 
 ## 请求生命周期
 
@@ -208,7 +208,9 @@ credential_id + conversation_id + model
   },
   "highCacheThreshold": 10000,
   "externalPools": {
-    "externalPoolUsageProjectionUpliftPercent": 25
+    "externalPoolUsageProjectionUpliftPercent": 25,
+    "externalPoolUsageProjectionOutputUpliftMinTokens": 0,
+    "externalPoolUsageProjectionOutputUpliftPercent": 0
   }
 }
 ```
@@ -347,37 +349,47 @@ credential_id + conversation_id + model
 可选值：
 
 - `pass_through`：严格透传外部池返回的 `usage`，不改写。
-- `current_path_policy`：只改写响应里的 `usage` 字段；忽略外部池自身 cache 字段，按本地凭证规则重建 prompt-cache usage，按当前入口路径命中的 `reportedUsage` 策略投影，再对 cache read / cache creation 做上浮。
+- `current_path_policy`：只改写响应里的 `usage` 字段；忽略外部池自身 cache 字段，按本地凭证规则重建 prompt-cache usage，按当前入口路径命中的 `reportedUsage` 策略投影，再对 cache read / cache creation 做上浮；如果配置了输出补偿，还会对达到阈值的 `output_tokens` 做最终上报放大。
 
 全局字段：
 
 ```json
 {
   "externalPools": {
-    "externalPoolUsageProjectionUpliftPercent": 25
+    "externalPoolUsageProjectionUpliftPercent": 25,
+    "externalPoolUsageProjectionOutputUpliftMinTokens": 0,
+    "externalPoolUsageProjectionOutputUpliftPercent": 0
   }
 }
 ```
 
-`externalPoolUsageProjectionUpliftPercent` 默认 `25`，最大按代码限制为 `200`。它只在外部池 `usageProjectionMode=current_path_policy` 时参与 usage 字段整形。
+`externalPoolUsageProjectionUpliftPercent` 默认 `25`，最大按代码限制为 `200`。它只在外部池 `usageProjectionMode=current_path_policy` 时参与 cache read / cache creation 字段整形。
+
+`externalPoolUsageProjectionOutputUpliftMinTokens` 默认 `0`，表示输出补偿关闭。设置为正数后，只有 `output_tokens >= 该阈值` 才会触发输出补偿。
+
+`externalPoolUsageProjectionOutputUpliftPercent` 默认 `0`，表示输出补偿关闭，最大按代码限制为 `200`。比如阈值 `1000`、百分比 `50` 表示 `output_tokens >= 1000` 时，最终上报给下游的 `output_tokens = ceil(output_tokens * 1.5)`。
 
 当前上浮算法：
 
 1. 先按本地凭证规则计算 usage：同一外部池、同一会话、同一解析后模型，首轮通常 creation，成功后 tracker 更新，后续相同/增长前缀可 read；如果模型不支持 prompt cache 或内容低于门槛，则无 cache。
 2. 再按当前入口路径的 `reportedUsage` 投影。例如 `/cc` 默认把上报输入压到约 96 tokens 以内，并把差值转入 cache read；cache creation 采样到约 3000 tokens。
 3. `promptCacheCreationControl` 对外部池同样生效，用来控制 creation 出现频次。该控制基于上浮前的本地规则结果，避免外部池 25% 上浮污染普通凭证频次状态。
-4. 最后对投影后的 `cache_read_input_tokens` 和 `cache_creation_input_tokens` 按 `ceil(base * (100 + percent) / 100)` 上浮。
-5. `input_tokens` 和 `output_tokens` 不因为上浮而增加。
-6. `total_input_tokens` 重算为 `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`。
-7. creation 的 5m/1h breakdown 按投影后原比例重分配；如果没有原比例，默认放到 5m。
+4. 对投影后的 `cache_read_input_tokens` 和 `cache_creation_input_tokens` 按 `ceil(base * (100 + percent) / 100)` 上浮。
+5. `total_input_tokens` 重算为 `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`。
+6. creation 的 5m/1h breakdown 按投影后原比例重分配；如果没有原比例，默认放到 5m。
+7. 如果配置了输出补偿，且上浮后的 `output_tokens` 达到 `externalPoolUsageProjectionOutputUpliftMinTokens`，再按 `ceil(output_tokens * (100 + externalPoolUsageProjectionOutputUpliftPercent) / 100)` 放大最终上报输出。
+8. 输出补偿只改 `output_tokens`，不改 `input_tokens`、`cache_read_input_tokens`、`cache_creation_input_tokens`。
 
 成本记录：
 
-- 外部池使用记录会保存 raw usage 和 reported usage。raw usage 是外部池原始返回；reported usage 是返回给下游的最终 usage。
-- raw cost 和 reported cost 都按系统价格表估算。
-- `billable_cost_usd = max(raw_cost_usd, reported_cost_usd)`。
-- 如果投影后成本低于 raw 成本，记录 `cost_floor_applied=true` 和差额。
-- 这只是后台记录和费用估算保底；如果 `usageProjectionMode=current_path_policy` 已经改写了响应体，下游实际看到的是 reported usage，不会额外看到成本保底字段。
+- 外部池使用记录会保存 raw usage、shaped usage 和 reported usage。
+- raw usage 是外部池原始返回。
+- shaped usage 是按路径和缓存策略整形后、还没有做 cache/output 上浮的 usage。
+- reported usage 是最终返回给下游的 usage，也就是 cache 上浮和输出补偿之后的 usage。
+- raw cost、shaped cost、uplifted/reported cost 都按系统价格表估算。
+- `billable_cost_usd` 当前等于最终上报成本，作为兼容字段保留。
+- `profit_usd = uplifted_cost_usd - raw_cost_usd`。如果为负，说明按系统价格表估算仍低于外部池原始 usage 成本。
+- `cost_floor_applied` / `cost_floor_delta_usd` 是兼容字段，用来标记最终上报成本低于 raw 成本的风险；当前不会再额外把 billable cost 强行提升到 raw。
 
 ## 推荐配置示例
 
@@ -466,12 +478,14 @@ credential_id + conversation_id + model
 ```json
 {
   "externalPools": {
-    "externalPoolUsageProjectionUpliftPercent": 25
+    "externalPoolUsageProjectionUpliftPercent": 25,
+    "externalPoolUsageProjectionOutputUpliftMinTokens": 1000,
+    "externalPoolUsageProjectionOutputUpliftPercent": 25
   }
 }
 ```
 
-适合希望外部池返回给下游时也呈现当前系统路径级 cache 特征，同时尽量避免整形后长期低于渠道 raw usage 成本的场景。
+适合希望外部池返回给下游时也呈现当前系统路径级 cache 特征，同时对较长输出做最终上报补偿，尽量避免整形后长期低于渠道 raw usage 成本的场景。
 
 ## 常见现象解释
 
@@ -514,9 +528,9 @@ total_input_tokens = input_tokens + cache_read_input_tokens + cache_creation_inp
 
 `input_tokens` 表示下游兼容口径里的未缓存输入；`total_input_tokens` 表示完整输入口径。
 
-### 为什么外部池整形后成本仍有保底
+### 为什么外部池整形后仍可能显示亏损
 
-外部池 `current_path_policy` 可能把 usage 改成更像本系统路径特征，理论上可能让 reported cost 低于外部池 raw usage 估算成本。系统会在 usage record 的外部池 billing 中记录 raw cost、reported cost，并用 `max(raw, reported)` 作为内部 billable cost。
+外部池 `current_path_policy` 可能把 usage 改成更像本系统路径特征，理论上可能让最终上报成本低于外部池 raw usage 估算成本。系统会在 usage record 的外部池 billing 中记录 raw cost、shaped cost、uplifted/reported cost 和 profit。`profit_usd < 0` 时页面应按亏损展示；输出补偿就是为了让较长输出场景下的最终上报成本更接近或高于 raw 成本。
 
 ## 已知限制和风险
 
@@ -525,7 +539,7 @@ total_input_tokens = input_tokens + cache_read_input_tokens + cache_creation_inp
 3. prompt-cache tracker scope 仍包含 credential id；本地凭据调度换号会降低真实 cache read 连续性。creation 频次控制默认按 `conversation_model` 跨凭据共享，只影响上报 creation 频次。
 4. `promptCacheCreationControl` 只隐藏/限制 creation 上报，不会让没有 read 的请求凭空 read。
 5. 外部池 `current_path_policy` 只改写 usage 字段，不改正文、tool、message id、stop reason 等内容。
-6. 外部池成本保底依赖价格目录；没有价格时无法可靠比较 raw/reported 成本。
+6. 外部池成本差值依赖价格目录；没有价格时无法可靠比较 raw/reported 成本。
 7. 当前 Opus 4.8 的本地模拟最小可缓存 token 门槛未在 `min_cacheable_tokens_for_model` 中按 Opus 4.6/4.7 一样特判。
 
 ## 排查建议
@@ -536,7 +550,7 @@ total_input_tokens = input_tokens + cache_read_input_tokens + cache_creation_inp
 - `cacheReadInputTokens` / `cacheCreationInputTokens`：判断 read/write 体量。
 - `routeKind` / `routeSubtype`：确认是本地凭据还是外部池 fallback/direct。
 - `externalPoolBilling.rawUsage` / `reportedUsage`：外部池是否发生 usage 投影。
-- `externalPoolBilling.costFloorApplied`：整形后是否低于 raw 成本并触发保底。
+- `externalPoolBilling.costFloorApplied`：兼容字段，表示最终上报成本是否低于 raw 成本。
 
 如果用户反馈“每轮都创建缓存”：
 

@@ -150,6 +150,13 @@ export const defaultExternalPoolsConfig = () => ({
   externalPoolServerErrorCooldownSecs: 10,
   externalPoolNetworkErrorCooldownSecs: 10,
   externalPoolProtocolErrorCooldownSecs: 10,
+  externalPoolRequestTimeoutSecs: 180,
+  externalPoolStreamRequestTimeoutSecs: 0,
+  externalPoolStreamIdleTimeoutSecs: 180,
+  externalPoolAutoDisableOnChannelDisabled: true,
+  externalPoolUsageProjectionUpliftPercent: 25,
+  externalPoolUsageProjectionOutputUpliftMinTokens: 0,
+  externalPoolUsageProjectionOutputUpliftPercent: 0,
 })
 
 const defaultModelMappingConfig = (): ModelMappingConfig => ({
@@ -281,6 +288,7 @@ const emptyConfig: RuntimeConfig = {
   payloadGuardEnabled: true,
   payloadGuardMode: 'preemptive',
   payloadGuardMaxBytes: 460800,
+  payloadGuardSafetyMarginBytes: 32768,
   payloadGuardTrimHistory: true,
   payloadShaping: defaultPayloadShaping(),
   promptCacheTargetReadRatio: 0.98,
@@ -1278,7 +1286,6 @@ export function RuntimeConfigPanel() {
       schedulerSelectionPressureWeight: Math.max(0, Number(draft.schedulerSelectionPressureWeight.toFixed(2))),
       schedulerTotalSelectionWeight: Math.max(0, Number(draft.schedulerTotalSelectionWeight.toFixed(4))),
       schedulerTopK: toWhole(draft.schedulerTopK, 1, 100),
-      payloadGuardMaxBytes: toWhole(draft.payloadGuardMaxBytes),
       payloadShaping: normalizePayloadShaping(draft.payloadShaping),
       promptCacheTargetReadRatio: toRatio(draft.promptCacheTargetReadRatio),
       promptCacheTokenScale: toScale(draft.promptCacheTokenScale),
@@ -1289,6 +1296,8 @@ export function RuntimeConfigPanel() {
       promptCacheCreationControl: normalizePromptCacheCreationControl(draft.promptCacheCreationControl),
       reportedUsage: normalizeReportedUsage(draft.reportedUsage),
       modelMapping: normalizeModelMapping(draft.modelMapping),
+      payloadGuardMaxBytes: toWhole(draft.payloadGuardMaxBytes),
+      payloadGuardSafetyMarginBytes: toWhole(draft.payloadGuardSafetyMarginBytes),
       externalPools: {
         ...defaultExternalPoolsConfig(),
         ...draft.externalPools,
@@ -1308,6 +1317,12 @@ export function RuntimeConfigPanel() {
         externalPoolServerErrorCooldownSecs: toWhole(draft.externalPools.externalPoolServerErrorCooldownSecs, 1),
         externalPoolNetworkErrorCooldownSecs: toWhole(draft.externalPools.externalPoolNetworkErrorCooldownSecs, 1),
         externalPoolProtocolErrorCooldownSecs: toWhole(draft.externalPools.externalPoolProtocolErrorCooldownSecs, 1),
+        externalPoolRequestTimeoutSecs: toWhole(draft.externalPools.externalPoolRequestTimeoutSecs),
+        externalPoolStreamRequestTimeoutSecs: toWhole(draft.externalPools.externalPoolStreamRequestTimeoutSecs),
+        externalPoolStreamIdleTimeoutSecs: toWhole(draft.externalPools.externalPoolStreamIdleTimeoutSecs),
+        externalPoolUsageProjectionUpliftPercent: toWhole(draft.externalPools.externalPoolUsageProjectionUpliftPercent),
+        externalPoolUsageProjectionOutputUpliftMinTokens: toWhole(draft.externalPools.externalPoolUsageProjectionOutputUpliftMinTokens),
+        externalPoolUsageProjectionOutputUpliftPercent: toWhole(draft.externalPools.externalPoolUsageProjectionOutputUpliftPercent),
       },
       highCacheThreshold: toWhole(draft.highCacheThreshold),
     }
@@ -1325,6 +1340,10 @@ export function RuntimeConfigPanel() {
     }
     if (next.payloadGuardEnabled && next.payloadGuardMaxBytes > 0 && next.payloadGuardMaxBytes < 65536) {
       toast.error('Kiro Payload 最大字节数必须为 0 或不小于 65536')
+      return
+    }
+    if (next.payloadGuardEnabled && next.payloadGuardMaxBytes > 0 && next.payloadGuardMaxBytes - next.payloadGuardSafetyMarginBytes < 65536) {
+      toast.error('Payload 安全余量不能让实际裁剪目标小于 65536')
       return
     }
     const editableConfig = { ...next }
@@ -1601,6 +1620,17 @@ export function RuntimeConfigPanel() {
               suffix="bytes"
               onChange={(payloadGuardMaxBytes) =>
                 setDraft((prev) => ({ ...prev, payloadGuardMaxBytes }))
+              }
+            />
+            <NumberField
+              title="Payload 安全余量"
+              description="实际裁剪目标会从上面的阈值中扣除该余量。默认 32768 bytes；用于避免 provider 层追加字段后贴近 Kiro 请求体上限。"
+              value={draft.payloadGuardSafetyMarginBytes}
+              min={0}
+              suffix="bytes"
+              disabled={!payloadSizeLimitEnabled}
+              onChange={(payloadGuardSafetyMarginBytes) =>
+                setDraft((prev) => ({ ...prev, payloadGuardSafetyMarginBytes }))
               }
             />
             <ImpactGroupHeader
