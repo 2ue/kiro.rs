@@ -21,22 +21,31 @@ use tokio::time::{Instant, timeout};
 
 use crate::{
     anthropic::{
-        cache::{CacheUsage, RawUsage, ReportedCacheUsagePolicy},
+        cache::{
+            CacheAmplification, CacheSimulation, CacheUsage, RawUsage, ReportedCacheUsagePolicy,
+        },
         envelope,
+        model_capabilities::ModelCapabilitiesCatalog,
         pricing::PricingCatalog,
+        prompt_cache::{PromptCacheProfile, PromptCacheScope, PromptCacheTracker},
+        prompt_cache_creation_control::PromptCacheCreationController,
         types::MessagesRequest,
         usage::{
             ExternalPoolAttempt, ExternalPoolBilling, ExternalPoolUsageSnapshot, UsageRecord,
             UsageRecordStatus, UsageRouteKind, UsageRouteSubtype, UsageSource,
         },
     },
-    model::config::{ExternalPoolCapacityMode, ExternalPoolsConfig, ReportedUsageConfig},
+    model::config::{
+        ExternalPoolCapacityMode, ExternalPoolsConfig, PromptCacheCreationControlConfig,
+        ReportedUsageConfig,
+    },
     storage::{postgres::PostgresStore, redis_cache::RedisStore},
     token,
 };
 
 const DEFAULT_EXTERNAL_POOL_REQUEST_TIMEOUT_SECS: u64 = 180;
 const EXTERNAL_POOL_LEASE_TOUCH_INTERVAL_SECS: u64 = 30;
+const EXTERNAL_POOL_PROMPT_CACHE_CREDENTIAL_ID_OFFSET: u64 = 1_u64 << 63;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -270,6 +279,9 @@ pub struct ExternalRouteRequest {
     pub headers: HeaderMap,
     pub endpoint: &'static str,
     pub payload: MessagesRequest,
+    pub upstream_model: Option<String>,
+    pub model_resolution_source: Option<String>,
+    pub model_resolution_note: Option<String>,
     pub route_subtype: UsageRouteSubtype,
     pub fallback_reason: Option<String>,
     pub direct_policy_reason: Option<String>,
@@ -277,6 +289,16 @@ pub struct ExternalRouteRequest {
     pub local_preflight: Option<serde_json::Value>,
     pub local_attempts: Vec<crate::kiro::call_trace::KiroCredentialAttempt>,
     pub reported_usage: ReportedUsageConfig,
+    pub prompt_cache: Arc<PromptCacheTracker>,
+    pub prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
+    pub prompt_cache_target_read_ratio: f64,
+    pub prompt_cache_token_scale: f64,
+    pub prompt_cache_max_simulated_input_tokens: i32,
+    pub prompt_cache_cap_jitter_min_tokens: i32,
+    pub prompt_cache_cap_jitter_max_tokens: i32,
+    pub prompt_cache_scale_min_input_tokens: i32,
+    pub prompt_cache_creation_control: PromptCacheCreationControlConfig,
+    pub model_capabilities: Arc<ModelCapabilitiesCatalog>,
     pub pricing_catalog: Arc<PricingCatalog>,
     pub request_id: String,
     pub recorder: Arc<crate::anthropic::usage::UsageRecorder>,
@@ -287,12 +309,36 @@ struct ExternalForwardResponse {
     response: Response,
     billing: Option<ExternalPoolBilling>,
     stream_usage_capture: Option<Arc<SyncMutex<ExternalUsageCapture>>>,
+    stream_usage_projection: Option<ExternalUsageProjectionContext>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 struct ExternalUsageCapture {
     raw: Option<CacheUsage>,
+    shaped: Option<CacheUsage>,
     reported: Option<CacheUsage>,
+    projected: bool,
+}
+
+#[derive(Debug, Default)]
+struct ExternalUsageProjectionState {
+    committed_controlled_usage: Option<CacheUsage>,
+}
+
+#[derive(Clone)]
+struct ExternalUsageProjectionContext {
+    mode: ExternalPoolUsageProjectionMode,
+    raw_input_tokens: i32,
+    simulated_usage: Option<CacheSimulation>,
+    reported_policy: Option<ReportedCacheUsagePolicy>,
+    scope: Option<PromptCacheScope>,
+    prompt_cache: Arc<PromptCacheTracker>,
+    prompt_cache_profile: Option<PromptCacheProfile>,
+    prompt_cache_target_read_ratio: f64,
+    prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
+    prompt_cache_creation_control: PromptCacheCreationControlConfig,
+    uplift_percent: u32,
+    state: Arc<SyncMutex<ExternalUsageProjectionState>>,
 }
 
 #[derive(Debug, Clone)]
@@ -673,7 +719,11 @@ impl ExternalPoolManager {
                             pool,
                             attempts.clone(),
                             forwarded.stream_usage_capture,
+                            forwarded.stream_usage_projection,
                         );
+                    }
+                    if let Some(projection) = forwarded.stream_usage_projection.as_ref() {
+                        projection.record_success();
                     }
                     self.record_external_success(
                         &route,
@@ -793,11 +843,12 @@ impl ExternalPoolManager {
                 ));
             }
             let body_stream = response.bytes_stream();
-            let usage_projection_mode = pool.usage_projection_mode;
-            let reported_usage = route.reported_usage.clone();
-            let endpoint = route.endpoint;
-            let usage_projection_uplift_percent =
-                config.external_pool_usage_projection_uplift_percent;
+            let projection_context = build_external_usage_projection_context(
+                route,
+                pool,
+                config.external_pool_usage_projection_uplift_percent,
+            );
+            let stream_usage_projection = projection_context.clone();
             let usage_capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
             let stream_usage_capture = usage_capture.clone();
             let stream = futures::stream::unfold(
@@ -809,7 +860,7 @@ impl ExternalPoolManager {
                     false,
                 ),
                 move |(mut body_stream, mut buffer, lease, mut last_touch_at, finished)| {
-                    let reported_usage = reported_usage.clone();
+                    let projection_context = projection_context.clone();
                     let usage_capture = usage_capture.clone();
                     async move {
                         if finished {
@@ -823,10 +874,7 @@ impl ExternalPoolManager {
                                             buffer.extend_from_slice(&chunk);
                                             let projected = drain_projected_sse_events(
                                                 &mut buffer,
-                                                usage_projection_mode,
-                                                &reported_usage,
-                                                endpoint,
-                                                usage_projection_uplift_percent,
+                                                projection_context.as_ref(),
                                                 Some(&usage_capture),
                                             );
                                             if !projected.is_empty() {
@@ -852,10 +900,7 @@ impl ExternalPoolManager {
                                             } else {
                                                 maybe_project_sse_event(
                                                     &buffer,
-                                                    usage_projection_mode,
-                                                    &reported_usage,
-                                                    endpoint,
-                                                    usage_projection_uplift_percent,
+                                                    projection_context.as_ref(),
                                                     Some(&usage_capture),
                                                 )
                                             };
@@ -897,6 +942,7 @@ impl ExternalPoolManager {
                 response,
                 billing: None,
                 stream_usage_capture: Some(stream_usage_capture),
+                stream_usage_projection,
             })
         } else {
             let bytes = response.bytes().await.map_err(|err| ExternalPoolError {
@@ -920,13 +966,12 @@ impl ExternalPoolManager {
                 ));
             }
             drop(lease);
-            let projected = maybe_project_non_stream_usage(
-                bytes,
-                pool.usage_projection_mode,
-                &route.reported_usage,
-                route.endpoint,
+            let projection_context = build_external_usage_projection_context(
+                route,
+                pool,
                 config.external_pool_usage_projection_uplift_percent,
             );
+            let projected = maybe_project_non_stream_usage(bytes, projection_context.as_ref());
             let billing = external_pool_billing_from_capture(route, pool, projected.usage_capture);
             let mut builder = Response::builder().status(status);
             apply_forwarded_response_headers(&mut builder, &response_headers, &route.request_id);
@@ -946,6 +991,7 @@ impl ExternalPoolManager {
                 response,
                 billing,
                 stream_usage_capture: None,
+                stream_usage_projection: projection_context,
             })
         }
     }
@@ -1563,6 +1609,7 @@ impl ExternalPoolManager {
         pool: ExternalPool,
         attempts: Vec<ExternalPoolAttempt>,
         usage_capture: Option<Arc<SyncMutex<ExternalUsageCapture>>>,
+        usage_projection: Option<ExternalUsageProjectionContext>,
     ) -> Response {
         let (parts, body) = response.into_parts();
         let data_stream = body.into_data_stream();
@@ -1572,6 +1619,7 @@ impl ExternalPoolManager {
             pool,
             attempts,
             usage_capture,
+            usage_projection,
             completed: false,
         };
         let stream = futures::stream::unfold(
@@ -1624,9 +1672,7 @@ impl ExternalPoolManager {
             .as_ref()
             .filter(|_| status == UsageRecordStatus::Success)
             .map(|billing| billing.reported_usage);
-        let input_tokens = usage
-            .map(|usage| usage.total_input_tokens)
-            .unwrap_or(request_input_tokens);
+        let input_tokens = request_input_tokens;
         let compat_input_tokens = usage
             .map(|usage| usage.input_tokens)
             .unwrap_or(request_input_tokens);
@@ -1660,7 +1706,12 @@ impl ExternalPoolManager {
             .as_ref()
             .filter(|_| status == UsageRecordStatus::Success)
             .and_then(|billing| billing.pricing_model.clone());
-        let usage_source = if usage.is_some() {
+        let usage_source = if billing
+            .as_ref()
+            .is_some_and(|billing| billing.usage_projection_applied)
+        {
+            UsageSource::LocalPromptCache
+        } else if usage.is_some() {
             UsageSource::UpstreamMetadata
         } else {
             UsageSource::RequestEstimate
@@ -1671,9 +1722,9 @@ impl ExternalPoolManager {
             endpoint: route.endpoint.to_string(),
             stream: route.payload.stream,
             model: route.payload.model.clone(),
-            upstream_model: None,
-            model_resolution_source: None,
-            model_resolution_note: None,
+            upstream_model: route.upstream_model.clone(),
+            model_resolution_source: route.model_resolution_source.clone(),
+            model_resolution_note: route.model_resolution_note.clone(),
             conversation_id: crate::anthropic::converter::extract_stable_conversation_id(
                 &route.payload,
             ),
@@ -1693,7 +1744,7 @@ impl ExternalPoolManager {
             pricing_available,
             pricing_model,
             duration_ms: route.started_at.elapsed().as_millis() as u64,
-            simulated: false,
+            simulated: usage_source.is_simulated(),
             sticky_bound: false,
             fallback_from_sticky: false,
             credential_attempts: route.local_attempts.clone(),
@@ -1706,9 +1757,9 @@ impl ExternalPoolManager {
             external_pool_id: pool.map(|pool| pool.id),
             external_pool_name: pool.map(|pool| pool.name.clone()),
             external_attempts: attempts,
-            usage_projection_applied: Some(pool.is_some_and(|pool| {
-                pool.usage_projection_mode == ExternalPoolUsageProjectionMode::CurrentPathPolicy
-            })),
+            usage_projection_applied: billing
+                .as_ref()
+                .map(|billing| billing.usage_projection_applied),
             external_pool_billing: billing,
             error_type,
             error_message,
@@ -1725,6 +1776,7 @@ struct ExternalStreamUsageGuard {
     pool: ExternalPool,
     attempts: Vec<ExternalPoolAttempt>,
     usage_capture: Option<Arc<SyncMutex<ExternalUsageCapture>>>,
+    usage_projection: Option<ExternalUsageProjectionContext>,
     completed: bool,
 }
 
@@ -1736,6 +1788,9 @@ impl ExternalStreamUsageGuard {
         let billing = self.usage_capture.as_ref().and_then(|capture| {
             external_pool_billing_from_capture_ref(&self.route, &self.pool, capture)
         });
+        if let Some(projection) = self.usage_projection.as_ref() {
+            projection.record_success();
+        }
         self.manager.record_external_success(
             &self.route,
             &self.pool,
@@ -2206,10 +2261,7 @@ struct ProjectedNonStreamBody {
 
 fn maybe_project_non_stream_usage(
     bytes: Bytes,
-    mode: ExternalPoolUsageProjectionMode,
-    reported_usage: &ReportedUsageConfig,
-    endpoint: &str,
-    uplift_percent: u32,
+    projection: Option<&ExternalUsageProjectionContext>,
 ) -> ProjectedNonStreamBody {
     let mut usage_capture = ExternalUsageCapture::default();
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -2228,10 +2280,12 @@ fn maybe_project_non_stream_usage(
     usage_capture.raw = raw_usage;
     usage_capture.reported = raw_usage;
 
-    if mode == ExternalPoolUsageProjectionMode::CurrentPathPolicy
-        && project_usage_value(usage, reported_usage, endpoint, uplift_percent)
-    {
-        usage_capture.reported = cache_usage_from_value(usage).or(raw_usage);
+    if let Some(projected) = project_usage_value(usage, projection) {
+        usage_capture.shaped = Some(projected.shaped);
+        usage_capture.reported = cache_usage_from_value(usage)
+            .or(Some(projected.reported))
+            .or(raw_usage);
+        usage_capture.projected = true;
         let body = serde_json::to_vec(&value).map(Bytes::from).unwrap_or(bytes);
         return ProjectedNonStreamBody {
             body,
@@ -2247,10 +2301,7 @@ fn maybe_project_non_stream_usage(
 
 fn maybe_project_sse_event(
     event: &[u8],
-    mode: ExternalPoolUsageProjectionMode,
-    reported_usage: &ReportedUsageConfig,
-    endpoint: &str,
-    uplift_percent: u32,
+    projection: Option<&ExternalUsageProjectionContext>,
     capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
 ) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(event) else {
@@ -2281,14 +2332,18 @@ fn maybe_project_sse_event(
             continue;
         };
         let raw_usage = cache_usage_from_value(usage);
-        update_external_usage_capture(capture, raw_usage, raw_usage);
-        let projected = mode == ExternalPoolUsageProjectionMode::CurrentPathPolicy
-            && project_usage_value(usage, reported_usage, endpoint, uplift_percent);
-        if !projected {
+        let Some(projected_usage) = project_usage_value(usage, projection) else {
+            update_external_usage_capture(capture, raw_usage, raw_usage, raw_usage, false);
             out.extend_from_slice(line.as_bytes());
             continue;
-        }
-        update_external_usage_capture(capture, None, cache_usage_from_value(usage).or(raw_usage));
+        };
+        update_external_usage_capture(
+            capture,
+            raw_usage,
+            Some(projected_usage.shaped),
+            Some(projected_usage.reported),
+            true,
+        );
         changed = true;
         out.extend_from_slice(b"data:");
         out.extend_from_slice(leading_ws.as_bytes());
@@ -2304,24 +2359,14 @@ fn maybe_project_sse_event(
 
 fn drain_projected_sse_events(
     buffer: &mut Vec<u8>,
-    mode: ExternalPoolUsageProjectionMode,
-    reported_usage: &ReportedUsageConfig,
-    endpoint: &str,
-    uplift_percent: u32,
+    projection: Option<&ExternalUsageProjectionContext>,
     capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     while let Some((idx, delimiter_len)) = find_sse_event_delimiter(buffer) {
         let end = idx + delimiter_len;
         let event = buffer.drain(..end).collect::<Vec<u8>>();
-        out.extend(maybe_project_sse_event(
-            &event,
-            mode,
-            reported_usage,
-            endpoint,
-            uplift_percent,
-            capture,
-        ));
+        out.extend(maybe_project_sse_event(&event, projection, capture));
     }
     out
 }
@@ -2329,17 +2374,58 @@ fn drain_projected_sse_events(
 fn update_external_usage_capture(
     capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
     raw: Option<CacheUsage>,
+    shaped: Option<CacheUsage>,
     reported: Option<CacheUsage>,
+    projected: bool,
 ) {
     let Some(capture) = capture else {
         return;
     };
     let mut capture = capture.lock();
-    if raw.is_some() {
-        capture.raw = raw;
+    if let Some(raw) = raw {
+        capture.raw = Some(merge_external_usage(capture.raw, raw));
     }
-    if reported.is_some() {
-        capture.reported = reported;
+    if let Some(shaped) = shaped {
+        capture.shaped = Some(merge_external_usage(capture.shaped, shaped));
+    }
+    if let Some(reported) = reported {
+        capture.reported = Some(merge_external_usage(capture.reported, reported));
+    }
+    if projected {
+        capture.projected = true;
+    }
+}
+
+fn merge_external_usage(existing: Option<CacheUsage>, incoming: CacheUsage) -> CacheUsage {
+    let Some(existing) = existing else {
+        return incoming;
+    };
+    let input_tokens = existing.input_tokens.max(incoming.input_tokens);
+    let output_tokens = existing.output_tokens.max(incoming.output_tokens);
+    let cache_read_input_tokens = existing
+        .cache_read_input_tokens
+        .max(incoming.cache_read_input_tokens);
+    let cache_creation_input_tokens = existing
+        .cache_creation_input_tokens
+        .max(incoming.cache_creation_input_tokens);
+    let cache_creation_5m_input_tokens = existing
+        .cache_creation_5m_input_tokens
+        .max(incoming.cache_creation_5m_input_tokens)
+        .min(cache_creation_input_tokens);
+    let cache_creation_1h_input_tokens = existing
+        .cache_creation_1h_input_tokens
+        .max(incoming.cache_creation_1h_input_tokens)
+        .min(cache_creation_input_tokens.saturating_sub(cache_creation_5m_input_tokens));
+    CacheUsage {
+        total_input_tokens: input_tokens
+            .saturating_add(cache_read_input_tokens)
+            .saturating_add(cache_creation_input_tokens),
+        input_tokens,
+        output_tokens,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
+        cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens,
     }
 }
 
@@ -2360,83 +2446,82 @@ fn find_sse_event_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProjectedExternalUsage {
+    shaped: CacheUsage,
+    reported: CacheUsage,
+}
+
 fn project_usage_value(
     usage: &mut serde_json::Value,
-    reported_usage: &ReportedUsageConfig,
-    endpoint: &str,
-    uplift_percent: u32,
-) -> bool {
-    let Some(cache_usage) = cache_usage_from_value(usage) else {
-        return false;
-    };
-    let raw = RawUsage {
-        input_tokens: usage_i32(usage, "input_tokens"),
-        output_tokens: usage_i32(usage, "output_tokens"),
-        cache_creation_input_tokens: usage_i32(usage, "cache_creation_input_tokens"),
-        cache_read_input_tokens: usage_i32(usage, "cache_read_input_tokens"),
-        cache_creation_5m_input_tokens: usage_i32(usage, "cache_creation_5m_input_tokens"),
-        cache_creation_1h_input_tokens: usage_i32(usage, "cache_creation_1h_input_tokens"),
-    };
-    let Some(policy) = ReportedCacheUsagePolicy::from_path_policy(
-        reported_usage.policy_for_path(endpoint),
-        fastrand::u64(..),
-    ) else {
-        return false;
-    };
-    let projected = cache_usage
-        .with_reported_cache_usage_policy_and_raw(policy, raw)
-        .with_external_pool_usage_uplift(cache_usage, uplift_percent);
+    projection: Option<&ExternalUsageProjectionContext>,
+) -> Option<ProjectedExternalUsage> {
+    let projection = projection?;
+    if projection.mode != ExternalPoolUsageProjectionMode::CurrentPathPolicy {
+        return None;
+    }
+    let output_tokens = usage_i32(usage, "output_tokens");
+    let computed = projection
+        .simulated_usage
+        .map(|simulation| {
+            CacheSimulation::to_usage(simulation, projection.raw_input_tokens, output_tokens)
+        })
+        .unwrap_or_else(|| CacheUsage {
+            total_input_tokens: projection.raw_input_tokens,
+            input_tokens: projection.raw_input_tokens,
+            output_tokens,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        });
+    let raw_usage = RawUsage::uncached(projection.raw_input_tokens, output_tokens);
+    let reported = projection
+        .reported_policy
+        .clone()
+        .map(|policy| computed.with_reported_cache_usage_policy_and_raw(policy, raw_usage))
+        .unwrap_or(computed);
+    projection.mark_committed(reported);
+    let shaped = projection.prompt_cache_creation_controller.preview_success(
+        projection.scope.as_ref(),
+        projection.prompt_cache_creation_control,
+        reported,
+    );
+    let projected = shaped.with_external_pool_usage_uplift(projection.uplift_percent);
     let projected_json = projected.to_json();
     let Some(obj) = usage.as_object_mut() else {
-        return false;
+        return None;
     };
     let Some(projected_obj) = projected_json.as_object() else {
-        return false;
+        return None;
     };
     for (key, value) in projected_obj {
         obj.insert(key.clone(), value.clone());
     }
-    true
+    Some(ProjectedExternalUsage {
+        shaped,
+        reported: projected,
+    })
 }
 
 trait ExternalPoolUsageUplift {
-    fn with_external_pool_usage_uplift(self, raw: CacheUsage, percent: u32) -> Self;
+    fn with_external_pool_usage_uplift(self, percent: u32) -> Self;
 }
 
 impl ExternalPoolUsageUplift for CacheUsage {
-    fn with_external_pool_usage_uplift(self, raw: CacheUsage, percent: u32) -> Self {
+    fn with_external_pool_usage_uplift(self, percent: u32) -> Self {
         let percent = percent.min(200);
         if percent == 0 {
             return self;
         }
 
-        let cache_read_input_tokens = uplift_tokens(
-            self.cache_read_input_tokens
-                .max(raw.cache_read_input_tokens)
-                .max(0),
-            percent,
-        );
-        let cache_creation_base = self
-            .cache_creation_input_tokens
-            .max(raw.cache_creation_input_tokens)
-            .max(0);
-        let cache_creation_input_tokens = uplift_tokens(cache_creation_base, percent);
-        let (base_creation_5m, base_creation_1h) =
-            if raw.cache_creation_input_tokens > self.cache_creation_input_tokens {
-                (
-                    raw.cache_creation_5m_input_tokens,
-                    raw.cache_creation_1h_input_tokens,
-                )
-            } else {
-                (
-                    self.cache_creation_5m_input_tokens,
-                    self.cache_creation_1h_input_tokens,
-                )
-            };
+        let cache_read_input_tokens = uplift_tokens(self.cache_read_input_tokens.max(0), percent);
+        let cache_creation_input_tokens =
+            uplift_tokens(self.cache_creation_input_tokens.max(0), percent);
         let (cache_creation_5m_input_tokens, cache_creation_1h_input_tokens) =
             uplift_cache_creation_breakdown(
-                base_creation_5m,
-                base_creation_1h,
+                self.cache_creation_5m_input_tokens,
+                self.cache_creation_1h_input_tokens,
                 cache_creation_input_tokens,
             );
 
@@ -2521,7 +2606,15 @@ fn external_pool_billing_from_capture(
 ) -> Option<ExternalPoolBilling> {
     let raw = capture.raw?;
     let reported = capture.reported.or(capture.raw)?;
-    Some(external_pool_billing(route, pool, raw, reported))
+    let shaped = capture.shaped.or(capture.reported).or(capture.raw)?;
+    Some(external_pool_billing(
+        route,
+        pool,
+        raw,
+        shaped,
+        reported,
+        capture.projected,
+    ))
 }
 
 fn external_pool_billing_from_capture_ref(
@@ -2536,17 +2629,28 @@ fn external_pool_billing(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
     raw_usage: CacheUsage,
+    shaped_usage: CacheUsage,
     reported_usage: CacheUsage,
+    usage_projection_applied: bool,
 ) -> ExternalPoolBilling {
-    let raw_estimate = route
-        .pricing_catalog
-        .estimate(&route.payload.model, raw_usage);
+    let pricing_model = route
+        .upstream_model
+        .as_deref()
+        .unwrap_or(&route.payload.model);
+    let raw_estimate = route.pricing_catalog.estimate(pricing_model, raw_usage);
+    let shaped_estimate = route.pricing_catalog.estimate(pricing_model, shaped_usage);
     let reported_estimate = route
         .pricing_catalog
-        .estimate(&route.payload.model, reported_usage);
-    let pricing_available = raw_estimate.available && reported_estimate.available;
+        .estimate(pricing_model, reported_usage);
+    let pricing_available =
+        raw_estimate.available && shaped_estimate.available && reported_estimate.available;
     let raw_cost_usd = if pricing_available {
         raw_estimate.cost_usd
+    } else {
+        0.0
+    };
+    let shaped_cost_usd = if pricing_available {
+        shaped_estimate.cost_usd
     } else {
         0.0
     };
@@ -2555,20 +2659,155 @@ fn external_pool_billing(
     } else {
         0.0
     };
-    let billable_cost_usd = raw_cost_usd.max(reported_cost_usd);
-    let cost_floor_delta_usd = (billable_cost_usd - reported_cost_usd).max(0.0);
+    let uplifted_cost_usd = reported_cost_usd;
+    let profit_usd = uplifted_cost_usd - raw_cost_usd;
 
     ExternalPoolBilling {
         raw_usage: external_usage_snapshot(raw_usage),
+        shaped_usage: external_usage_snapshot(shaped_usage),
         reported_usage: external_usage_snapshot(reported_usage),
+        usage_projection_applied,
         raw_cost_usd,
+        shaped_cost_usd,
+        uplifted_cost_usd,
+        profit_usd,
         reported_cost_usd,
-        billable_cost_usd,
-        cost_floor_delta_usd,
-        cost_floor_applied: pricing_available && raw_cost_usd > reported_cost_usd,
+        billable_cost_usd: uplifted_cost_usd,
+        cost_floor_delta_usd: (raw_cost_usd - uplifted_cost_usd).max(0.0),
+        cost_floor_applied: pricing_available && uplifted_cost_usd < raw_cost_usd,
         pricing_available,
         pricing_model: Some(reported_estimate.model),
         usage_projection_mode: pool.usage_projection_mode.as_str().to_string(),
+    }
+}
+
+fn build_external_usage_projection_context(
+    route: &ExternalRouteRequest,
+    pool: &ExternalPool,
+    uplift_percent: u32,
+) -> Option<ExternalUsageProjectionContext> {
+    if pool.usage_projection_mode != ExternalPoolUsageProjectionMode::CurrentPathPolicy {
+        return None;
+    }
+
+    let model = route
+        .upstream_model
+        .clone()
+        .unwrap_or_else(|| route.payload.model.clone());
+    let prompt_cache_supported = route
+        .model_capabilities
+        .supports_prompt_caching_for(&model)
+        .unwrap_or(true);
+
+    let raw_input_tokens = count_external_route_input_tokens(&route.payload);
+    let (scope, profile, simulated_usage) = if prompt_cache_supported {
+        let profile = route.prompt_cache.build_high_cache_profile_for_model(
+            &route.payload,
+            raw_input_tokens,
+            &model,
+        );
+        let scope = external_prompt_cache_scope(route, pool, &model);
+        let prompt_usage = route.prompt_cache.compute(
+            scope.clone(),
+            profile.as_ref(),
+            route.prompt_cache_target_read_ratio,
+        );
+        let simulated_usage = profile.as_ref().and_then(|profile| {
+            CacheSimulation::from_prompt_cache_with_ratio_and_amplification(
+                prompt_usage,
+                route.prompt_cache_target_read_ratio,
+                external_cache_amplification(route, profile),
+            )
+        });
+        (scope, profile, simulated_usage)
+    } else {
+        (None, None, None)
+    };
+    let reported_policy = ReportedCacheUsagePolicy::from_path_policy(
+        route.reported_usage.policy_for_path(route.endpoint),
+        profile
+            .as_ref()
+            .map(|profile| profile.cache_jitter_seed())
+            .unwrap_or(0)
+            ^ fastrand::u64(..),
+    );
+    Some(ExternalUsageProjectionContext {
+        mode: pool.usage_projection_mode,
+        raw_input_tokens,
+        simulated_usage,
+        reported_policy,
+        scope,
+        prompt_cache: route.prompt_cache.clone(),
+        prompt_cache_profile: profile,
+        prompt_cache_target_read_ratio: route.prompt_cache_target_read_ratio,
+        prompt_cache_creation_controller: route.prompt_cache_creation_controller.clone(),
+        prompt_cache_creation_control: route.prompt_cache_creation_control,
+        uplift_percent,
+        state: Arc::new(SyncMutex::new(ExternalUsageProjectionState::default())),
+    })
+}
+
+fn count_external_route_input_tokens(payload: &MessagesRequest) -> i32 {
+    token::count_all_tokens(
+        payload.model.clone(),
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
+    ) as i32
+}
+
+fn external_prompt_cache_scope(
+    route: &ExternalRouteRequest,
+    pool: &ExternalPool,
+    model: &str,
+) -> Option<PromptCacheScope> {
+    Some(PromptCacheScope {
+        credential_id: external_pool_prompt_cache_credential_id(pool.id),
+        conversation_id: crate::anthropic::converter::extract_stable_conversation_id(
+            &route.payload,
+        )?,
+        model: model.to_string(),
+    })
+}
+
+fn external_pool_prompt_cache_credential_id(pool_id: u64) -> u64 {
+    EXTERNAL_POOL_PROMPT_CACHE_CREDENTIAL_ID_OFFSET.saturating_add(pool_id)
+}
+
+fn external_cache_amplification(
+    route: &ExternalRouteRequest,
+    profile: &PromptCacheProfile,
+) -> Option<CacheAmplification> {
+    Some(CacheAmplification::new(
+        route.prompt_cache_token_scale,
+        route.prompt_cache_max_simulated_input_tokens,
+        route.prompt_cache_cap_jitter_min_tokens,
+        route.prompt_cache_cap_jitter_max_tokens,
+        route.prompt_cache_scale_min_input_tokens,
+        profile.cache_jitter_seed(),
+    ))
+}
+
+impl ExternalUsageProjectionContext {
+    fn mark_committed(&self, usage: CacheUsage) {
+        let mut state = self.state.lock();
+        state.committed_controlled_usage = Some(usage);
+    }
+
+    fn record_success(&self) {
+        let Some(usage) = self.state.lock().committed_controlled_usage else {
+            return;
+        };
+        let _ = self.prompt_cache_creation_controller.apply_success(
+            self.scope.as_ref(),
+            self.prompt_cache_creation_control,
+            usage,
+        );
+        self.prompt_cache.update(
+            self.scope.clone(),
+            self.prompt_cache_profile.as_ref(),
+            self.prompt_cache_target_read_ratio,
+        );
     }
 }
 
@@ -2596,6 +2835,7 @@ fn usage_i32(value: &serde_json::Value, key: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::anthropic::types::{Message, Metadata, SystemMessage};
 
     #[test]
     fn pool_auto_disable_policy_can_override_global_switch() {
@@ -2720,6 +2960,9 @@ mod tests {
                 output_config: None,
                 metadata: None,
             },
+            upstream_model: None,
+            model_resolution_source: None,
+            model_resolution_note: None,
             route_subtype: UsageRouteSubtype::ExternalDirectPolicy,
             fallback_reason: None,
             direct_policy_reason: None,
@@ -2727,6 +2970,16 @@ mod tests {
             local_preflight: None,
             local_attempts: Vec::new(),
             reported_usage: ReportedUsageConfig::default(),
+            prompt_cache: Arc::new(PromptCacheTracker::default()),
+            prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+            prompt_cache_target_read_ratio: 0.98,
+            prompt_cache_token_scale: 1.6,
+            prompt_cache_max_simulated_input_tokens: 300_000,
+            prompt_cache_cap_jitter_min_tokens: 12_000,
+            prompt_cache_cap_jitter_max_tokens: 24_000,
+            prompt_cache_scale_min_input_tokens: 20_000,
+            prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+            model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_external_capacity".to_string(),
             recorder: Arc::new(crate::anthropic::usage::UsageRecorder::new(1)),
@@ -2814,18 +3067,10 @@ mod tests {
             raw_body: Bytes::new(),
             headers: HeaderMap::new(),
             endpoint: "/cc/v1/messages",
-            payload: MessagesRequest {
-                model: model.to_string(),
-                max_tokens: 8,
-                messages: Vec::new(),
-                stream: false,
-                system: None,
-                tools: None,
-                tool_choice: None,
-                thinking: None,
-                output_config: None,
-                metadata: None,
-            },
+            payload: test_payload(model),
+            upstream_model: Some(model.to_string()),
+            model_resolution_source: Some("exact_upstream".to_string()),
+            model_resolution_note: None,
             route_subtype: UsageRouteSubtype::ExternalDirectPolicy,
             fallback_reason: None,
             direct_policy_reason: None,
@@ -2833,11 +3078,52 @@ mod tests {
             local_preflight: None,
             local_attempts: Vec::new(),
             reported_usage: ReportedUsageConfig::default(),
+            prompt_cache: Arc::new(PromptCacheTracker::default()),
+            prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+            prompt_cache_target_read_ratio: 0.98,
+            prompt_cache_token_scale: 1.6,
+            prompt_cache_max_simulated_input_tokens: 300_000,
+            prompt_cache_cap_jitter_min_tokens: 12_000,
+            prompt_cache_cap_jitter_max_tokens: 24_000,
+            prompt_cache_scale_min_input_tokens: 20_000,
+            prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+            model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_external_billing".to_string(),
             recorder: Arc::new(crate::anthropic::usage::UsageRecorder::new(1)),
             started_at: Instant::now(),
         }
+    }
+
+    fn test_payload(model: &str) -> MessagesRequest {
+        MessagesRequest {
+            model: model.to_string(),
+            max_tokens: 8,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: "You are a careful coding assistant. ".repeat(180),
+                cache_control: None,
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: Some(Metadata {
+                user_id: Some("user_test_account__session_external-projection-session".to_string()),
+            }),
+        }
+    }
+
+    fn projection_context(
+        route: &ExternalRouteRequest,
+        pool: &ExternalPool,
+        uplift_percent: u32,
+    ) -> Option<ExternalUsageProjectionContext> {
+        build_external_usage_projection_context(route, pool, uplift_percent)
     }
 
     #[test]
@@ -2945,13 +3231,7 @@ mod tests {
         let body = Bytes::from_static(
             br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
         );
-        let projected = maybe_project_non_stream_usage(
-            body.clone(),
-            ExternalPoolUsageProjectionMode::PassThrough,
-            &ReportedUsageConfig::default(),
-            "/cc/v1/messages",
-            0,
-        );
+        let projected = maybe_project_non_stream_usage(body.clone(), None);
 
         assert_eq!(projected.body, body);
         assert_eq!(
@@ -2965,13 +3245,11 @@ mod tests {
         let body = Bytes::from_static(
             br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
         );
-        let projected = maybe_project_non_stream_usage(
-            body.clone(),
-            ExternalPoolUsageProjectionMode::CurrentPathPolicy,
-            &ReportedUsageConfig::default(),
-            "/cc/v1/messages",
-            0,
-        );
+        let route = test_route("claude-sonnet-4-5");
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+        let projection = projection_context(&route, &pool, 0);
+        let projected = maybe_project_non_stream_usage(body.clone(), projection.as_ref());
 
         let value: serde_json::Value =
             serde_json::from_slice(&projected.body).expect("projected json");
@@ -2989,6 +3267,211 @@ mod tests {
                 .unwrap_or_default()
                 > 0
         );
+        assert!(
+            usage
+                .get("cache_creation_input_tokens")
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default()
+                > 0
+        );
+    }
+
+    #[test]
+    fn usage_projection_ignores_external_cache_when_local_policy_has_no_cache() {
+        let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":7,"cache_creation_input_tokens":50000,"cache_read_input_tokens":25000}}"#,
+        );
+        let route = test_route("deepseek-3.2");
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+        let projection = projection_context(&route, &pool, 25).expect("projection");
+        let projected = maybe_project_non_stream_usage(body.clone(), Some(&projection));
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&projected.body).expect("projected json");
+        let usage = value.get("usage").expect("usage object");
+        assert_eq!(
+            usage
+                .get("input_tokens")
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default(),
+            count_external_route_input_tokens(&route.payload) as i64
+        );
+        assert_eq!(
+            usage
+                .get("cache_creation_input_tokens")
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default(),
+            0
+        );
+        assert_eq!(
+            usage
+                .get("cache_read_input_tokens")
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default(),
+            0
+        );
+        assert!(projected.usage_capture.projected);
+        assert_eq!(
+            projected
+                .usage_capture
+                .raw
+                .expect("raw")
+                .cache_creation_input_tokens,
+            50_000
+        );
+        assert_eq!(
+            projected
+                .usage_capture
+                .reported
+                .expect("reported")
+                .cache_creation_input_tokens,
+            0
+        );
+    }
+
+    #[test]
+    fn usage_projection_applies_external_pool_uplift_after_path_policy() {
+        let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
+        );
+        let mut route = test_route("claude-sonnet-4-5");
+        route.endpoint = "/v1/messages";
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+
+        let no_uplift_projection = projection_context(&route, &pool, 0).expect("projection");
+        let no_uplift = maybe_project_non_stream_usage(body.clone(), Some(&no_uplift_projection));
+        let with_uplift_projection = projection_context(&route, &pool, 25).expect("projection");
+        let with_uplift = maybe_project_non_stream_usage(body, Some(&with_uplift_projection));
+
+        let no_uplift_usage = no_uplift.usage_capture.reported.expect("no uplift usage");
+        let with_uplift_shaped = with_uplift
+            .usage_capture
+            .shaped
+            .expect("with uplift shaped usage");
+        let with_uplift_usage = with_uplift.usage_capture.reported.expect("uplift usage");
+        assert_eq!(with_uplift_shaped, no_uplift_usage);
+        assert_eq!(with_uplift_usage.input_tokens, no_uplift_usage.input_tokens);
+        assert_eq!(
+            with_uplift_usage.cache_creation_input_tokens,
+            uplift_tokens(no_uplift_usage.cache_creation_input_tokens, 25)
+        );
+        assert_eq!(
+            with_uplift_usage.cache_read_input_tokens,
+            uplift_tokens(no_uplift_usage.cache_read_input_tokens, 25)
+        );
+    }
+
+    #[test]
+    fn usage_projection_uses_resolved_model_without_mutating_payload_model() {
+        let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        );
+        let mut route = test_route("sonnet");
+        route.endpoint = "/v1/messages";
+        route.upstream_model = Some("claude-sonnet-4-5".to_string());
+        route.model_resolution_source = Some("alias".to_string());
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+
+        let projection = projection_context(&route, &pool, 0).expect("projection");
+        let projected = maybe_project_non_stream_usage(body, Some(&projection));
+        let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
+            .expect("billing");
+
+        assert_eq!(route.payload.model, "sonnet");
+        assert_eq!(billing.pricing_model.as_deref(), Some("claude-sonnet-4-5"));
+        assert!(billing.pricing_available);
+    }
+
+    #[test]
+    fn usage_projection_updates_external_pool_cache_after_success() {
+        let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
+        );
+        let mut route = test_route("claude-sonnet-4-5");
+        route.endpoint = "/v1/messages";
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+
+        let first_projection = projection_context(&route, &pool, 0).expect("first projection");
+        let first = maybe_project_non_stream_usage(body.clone(), Some(&first_projection));
+        let first_value: serde_json::Value =
+            serde_json::from_slice(&first.body).expect("first projected json");
+        let first_usage = first_value.get("usage").expect("first usage");
+        assert_eq!(
+            first_usage
+                .get("cache_read_input_tokens")
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default(),
+            0
+        );
+        assert!(
+            first_usage
+                .get("cache_creation_input_tokens")
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default()
+                > 0
+        );
+        first_projection.record_success();
+
+        let second_projection = projection_context(&route, &pool, 0).expect("second projection");
+        let second = maybe_project_non_stream_usage(body, Some(&second_projection));
+        let second_value: serde_json::Value =
+            serde_json::from_slice(&second.body).expect("second projected json");
+        let second_usage = second_value.get("usage").expect("second usage");
+        assert!(
+            second_usage
+                .get("cache_read_input_tokens")
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default()
+                > 0
+        );
+    }
+
+    #[test]
+    fn usage_projection_ignores_external_raw_cache_when_local_policy_reads() {
+        let raw_creation_body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":80000,"cache_read_input_tokens":0}}"#,
+        );
+        let mut route = test_route("claude-sonnet-4-5");
+        route.endpoint = "/v1/messages";
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+
+        let first_projection = projection_context(&route, &pool, 0).expect("first projection");
+        let first =
+            maybe_project_non_stream_usage(raw_creation_body.clone(), Some(&first_projection));
+        let first_value: serde_json::Value =
+            serde_json::from_slice(&first.body).expect("first projected json");
+        let first_usage = first_value.get("usage").expect("first usage");
+        assert!(
+            first_usage
+                .get("cache_creation_input_tokens")
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default()
+                > 0
+        );
+        first_projection.record_success();
+
+        let second_projection = projection_context(&route, &pool, 0).expect("second projection");
+        let second = maybe_project_non_stream_usage(raw_creation_body, Some(&second_projection));
+        let second_value: serde_json::Value =
+            serde_json::from_slice(&second.body).expect("second projected json");
+        let second_usage = second_value.get("usage").expect("second usage");
+        let second_creation = second_usage
+            .get("cache_creation_input_tokens")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default();
+        let second_read = second_usage
+            .get("cache_read_input_tokens")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default();
+
+        assert_eq!(second_creation, 0);
+        assert!(second_read > 0);
+        assert_ne!(second_creation, 80_000);
     }
 
     #[test]
@@ -2996,13 +3479,7 @@ mod tests {
         let body = Bytes::from_static(
             br#"{"type":"message","usage":{"input_tokens":1000,"output_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
         );
-        let projected = maybe_project_non_stream_usage(
-            body,
-            ExternalPoolUsageProjectionMode::PassThrough,
-            &ReportedUsageConfig::default(),
-            "/cc/v1/messages",
-            0,
-        );
+        let projected = maybe_project_non_stream_usage(body, None);
         let route = test_route("claude-sonnet-4-5");
         let pool = test_pool("http://pool.example.com", false);
         let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
@@ -3010,35 +3487,33 @@ mod tests {
 
         assert!(billing.pricing_available);
         assert!(!billing.cost_floor_applied);
+        assert!((billing.raw_cost_usd - billing.shaped_cost_usd).abs() < f64::EPSILON);
+        assert!((billing.raw_cost_usd - billing.uplifted_cost_usd).abs() < f64::EPSILON);
+        assert!(billing.profit_usd.abs() < f64::EPSILON);
         assert!((billing.raw_cost_usd - billing.reported_cost_usd).abs() < f64::EPSILON);
         assert!((billing.billable_cost_usd - billing.reported_cost_usd).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn external_pool_billing_floors_projected_usage_to_raw_cost() {
+    fn external_pool_billing_tracks_raw_shaped_uplifted_costs() {
         let body = Bytes::from_static(
             br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
-        );
-        let projected = maybe_project_non_stream_usage(
-            body,
-            ExternalPoolUsageProjectionMode::CurrentPathPolicy,
-            &ReportedUsageConfig::default(),
-            "/cc/v1/messages",
-            0,
         );
         let route = test_route("claude-sonnet-4-5");
         let mut pool = test_pool("http://pool.example.com", false);
         pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+        let projection = projection_context(&route, &pool, 25);
+        let projected = maybe_project_non_stream_usage(body, projection.as_ref());
         let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
             .expect("billing");
 
         assert!(billing.pricing_available);
-        assert!(billing.cost_floor_applied);
-        assert!(billing.raw_cost_usd > billing.reported_cost_usd);
-        assert!((billing.billable_cost_usd - billing.raw_cost_usd).abs() < f64::EPSILON);
+        assert!(billing.raw_cost_usd > billing.shaped_cost_usd);
+        assert!(billing.uplifted_cost_usd > billing.shaped_cost_usd);
+        assert!((billing.reported_cost_usd - billing.uplifted_cost_usd).abs() < f64::EPSILON);
+        assert!((billing.billable_cost_usd - billing.uplifted_cost_usd).abs() < f64::EPSILON);
         assert!(
-            (billing.cost_floor_delta_usd - (billing.raw_cost_usd - billing.reported_cost_usd))
-                .abs()
+            (billing.profit_usd - (billing.uplifted_cost_usd - billing.raw_cost_usd)).abs()
                 < 0.000000001
         );
     }
@@ -3051,14 +3526,11 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
 data: [DONE]
 
 "#;
-        let projected = maybe_project_sse_event(
-            event,
-            ExternalPoolUsageProjectionMode::CurrentPathPolicy,
-            &ReportedUsageConfig::default(),
-            "/cc/v1/messages",
-            0,
-            None,
-        );
+        let route = test_route("claude-sonnet-4-5");
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+        let projection = projection_context(&route, &pool, 0);
+        let projected = maybe_project_sse_event(event, projection.as_ref(), None);
         let text = String::from_utf8(projected).expect("utf8");
 
         assert!(text.contains("data: [DONE]"));
@@ -3073,14 +3545,11 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
 
 "#;
         let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
-        let _projected = maybe_project_sse_event(
-            event,
-            ExternalPoolUsageProjectionMode::CurrentPathPolicy,
-            &ReportedUsageConfig::default(),
-            "/cc/v1/messages",
-            0,
-            Some(&capture),
-        );
+        let route = test_route("claude-sonnet-4-5");
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+        let projection = projection_context(&route, &pool, 0);
+        let _projected = maybe_project_sse_event(event, projection.as_ref(), Some(&capture));
         let capture = *capture.lock();
         let raw = capture.raw.expect("raw usage");
         let reported = capture.reported.expect("reported usage");
@@ -3088,6 +3557,7 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
         assert_eq!(raw.input_tokens, 100000);
         assert!(reported.input_tokens <= 96);
         assert!(reported.cache_read_input_tokens > 0);
+        assert!(reported.cache_creation_input_tokens > 0);
     }
 
     #[test]

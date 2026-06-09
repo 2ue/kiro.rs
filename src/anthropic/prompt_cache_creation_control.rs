@@ -330,7 +330,10 @@ mod tests {
     #[test]
     fn disabled_controller_preserves_usage() {
         let controller = PromptCacheCreationController::default();
-        let config = PromptCacheCreationControlConfig::default();
+        let config = PromptCacheCreationControlConfig {
+            enabled: false,
+            ..PromptCacheCreationControlConfig::default()
+        };
         let original = usage(20_000);
 
         let adjusted = controller.apply_success(Some(&scope()), config, original);
@@ -353,6 +356,21 @@ mod tests {
         assert_eq!(second.cache_creation_5m_input_tokens, 0);
         assert_eq!(second.input_tokens, 22_000);
         assert_eq!(second.total_input_tokens, 22_000);
+    }
+
+    #[test]
+    fn default_config_controls_immediate_repeated_creation() {
+        let controller = PromptCacheCreationController::default();
+        let config = PromptCacheCreationControlConfig::default();
+        let scope = scope();
+
+        let first = controller.apply_success(Some(&scope), config, usage(20_000));
+        let second = controller.apply_success(Some(&scope), config, usage(12_000));
+
+        assert!(config.enabled);
+        assert_eq!(first.cache_creation_input_tokens, 20_000);
+        assert_eq!(second.cache_creation_input_tokens, 0);
+        assert_eq!(second.input_tokens, 22_000);
     }
 
     #[test]

@@ -5,12 +5,19 @@ import { Dashboard } from '@/components/Dashboard'
 import { storage } from '@/lib/storage'
 import { validateAdminApiKey } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
+import { getStoredTheme } from '@/types/ui'
 
 export default function App() {
   const queryClient = useQueryClient()
   const [loggedIn, setLoggedIn] = useState(false)
   const [checkingAuth, setCheckingAuth] = useState(true)
   const [authError, setAuthError] = useState('')
+
+  useEffect(() => {
+    const theme = getStoredTheme()
+    document.documentElement.dataset.theme = theme
+    localStorage.setItem('kiro-theme', theme)
+  }, [])
 
   useEffect(() => {
     let cancelled = false

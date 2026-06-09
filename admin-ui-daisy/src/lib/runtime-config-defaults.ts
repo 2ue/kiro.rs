@@ -83,8 +83,8 @@ export function defaultPayloadShaping(): PayloadShapingConfig {
 
 export function defaultPromptCacheCreationControl(): PromptCacheCreationControlConfig {
   return {
-    enabled: false,
-    scopeMode: 'credential_conversation_model',
+    enabled: true,
+    scopeMode: 'conversation_model',
     minSuccessfulRequestsBetweenCreation: 3,
     minCreationIntervalSecs: 60,
     minCreationDeltaTokens: 12000,
@@ -284,9 +284,9 @@ export function normalizePromptCacheCreationControl(
     ...defaultPromptCacheCreationControl(),
     ...config,
     scopeMode:
-      config.scopeMode === 'conversation_model'
-        ? 'conversation_model'
-        : 'credential_conversation_model',
+      config.scopeMode === 'credential_conversation_model'
+        ? 'credential_conversation_model'
+        : 'conversation_model',
     minSuccessfulRequestsBetweenCreation: toWhole(config.minSuccessfulRequestsBetweenCreation),
     minCreationIntervalSecs: toWhole(config.minCreationIntervalSecs),
     minCreationDeltaTokens: toWhole(config.minCreationDeltaTokens),

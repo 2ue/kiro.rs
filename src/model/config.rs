@@ -496,15 +496,15 @@ impl ReportedUsageConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptCacheCreationControlScopeMode {
-    /// 同一凭据、会话、模型独立控制，默认值，最贴近真实账号缓存隔离。
+    /// 同一凭据、会话、模型独立控制，最贴近真实账号缓存隔离。
     CredentialConversationModel,
-    /// 同一会话、模型共享控制，跨凭据调度时也会降低重复 creation 上报频次。
+    /// 同一会话、模型共享控制，默认值；跨凭据调度时也会降低重复 creation 上报频次。
     ConversationModel,
 }
 
 impl Default for PromptCacheCreationControlScopeMode {
     fn default() -> Self {
-        Self::CredentialConversationModel
+        Self::ConversationModel
     }
 }
 
@@ -516,11 +516,11 @@ impl Default for PromptCacheCreationControlScopeMode {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptCacheCreationControlConfig {
-    /// 总开关。默认关闭，保证升级后行为不变。
+    /// 总开关。默认开启，用来抑制连续会话里过于频繁的本地模拟 cache creation 上报。
     #[serde(default)]
     pub enabled: bool,
 
-    /// 状态维度。默认按凭据/会话/模型隔离，也可按会话/模型跨凭据共享。
+    /// 状态维度。默认按会话/模型跨凭据共享，也可按凭据/会话/模型隔离。
     #[serde(default)]
     pub scope_mode: PromptCacheCreationControlScopeMode,
 
@@ -556,7 +556,7 @@ pub struct PromptCacheCreationControlConfig {
 impl Default for PromptCacheCreationControlConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             scope_mode: PromptCacheCreationControlScopeMode::default(),
             min_successful_requests_between_creation:
                 default_prompt_cache_creation_min_successes_between(),

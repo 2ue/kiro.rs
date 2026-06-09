@@ -41,12 +41,12 @@ function invalidateCredentialCaches(queryClient: ReturnType<typeof useQueryClien
   else queryClient.invalidateQueries({ queryKey: ['credential-balance'] })
 }
 
-export function useCredentials(options: { enabled?: boolean } = {}) {
+export function useCredentials(options: { enabled?: boolean; refetchInterval?: number | false } = {}) {
   return useQuery({
     queryKey: ['credentials'],
     queryFn: getCredentials,
     enabled: options.enabled ?? true,
-    refetchInterval: 30000,
+    refetchInterval: options.refetchInterval ?? 30000,
   })
 }
 

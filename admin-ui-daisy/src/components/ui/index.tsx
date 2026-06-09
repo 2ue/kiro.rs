@@ -17,12 +17,12 @@ interface StatCardProps {
 
 const toneStyles: Record<string, { text: string; accent: string; bg: string; icon: string }> = {
   default: { text: 'text-base-content', accent: 'bg-base-content/20', bg: 'bg-base-100', icon: 'text-base-content/40' },
-  success: { text: 'text-success', accent: 'bg-success', bg: 'bg-success/5', icon: 'text-success' },
-  warning: { text: 'text-warning', accent: 'bg-warning', bg: 'bg-warning/5', icon: 'text-warning' },
-  error: { text: 'text-error', accent: 'bg-error', bg: 'bg-error/5', icon: 'text-error' },
-  info: { text: 'text-info', accent: 'bg-info', bg: 'bg-info/5', icon: 'text-info' },
-  primary: { text: 'text-primary', accent: 'bg-primary', bg: 'bg-primary/5', icon: 'text-primary' },
-  secondary: { text: 'text-secondary', accent: 'bg-secondary', bg: 'bg-secondary/5', icon: 'text-secondary' },
+  success: { text: 'text-success', accent: 'bg-success/80', bg: 'bg-base-100', icon: 'text-success' },
+  warning: { text: 'text-warning', accent: 'bg-warning/80', bg: 'bg-base-100', icon: 'text-warning' },
+  error: { text: 'text-error', accent: 'bg-error/80', bg: 'bg-base-100', icon: 'text-error' },
+  info: { text: 'text-info', accent: 'bg-info/70', bg: 'bg-base-100', icon: 'text-info' },
+  primary: { text: 'text-primary', accent: 'bg-primary/75', bg: 'bg-base-100', icon: 'text-primary' },
+  secondary: { text: 'text-primary', accent: 'bg-primary/45', bg: 'bg-base-100', icon: 'text-primary' },
 }
 
 export function StatCard({ title, value, desc, icon, tone = 'default', trend }: StatCardProps) {
@@ -120,23 +120,23 @@ interface BadgeProps {
   dot?: boolean
 }
 
-const badgeColors: Record<string, string> = {
-  neutral: 'ghost',
-  primary: 'primary',
-  secondary: 'secondary',
-  success: 'success',
-  warning: 'warning',
-  error: 'error',
-  info: 'info',
-  accent: 'accent',
+const badgeToneClass: Record<string, string> = {
+  neutral: '!border-base-300 !bg-base-100 text-base-content/55',
+  primary: '!border-base-300 !bg-base-100 text-primary',
+  secondary: '!border-base-300 !bg-base-100 text-base-content/60',
+  success: '!border-base-300 !bg-base-100 text-success',
+  warning: '!border-base-300 !bg-base-100 text-warning',
+  error: '!border-base-300 !bg-base-100 text-error',
+  info: '!border-base-300 !bg-base-100 text-info',
+  accent: '!border-base-300 !bg-base-100 text-primary',
 }
 
 export function Badge({ children, tone = 'neutral', size = 'sm', title, dot }: BadgeProps) {
   return (
     <DaisyBadge
       size={size}
-      color={badgeColors[tone] as never}
-      className={`gap-1 border-0 font-medium ${size === 'xs' ? 'h-4 px-1.5 text-[0.62rem]' : 'h-5 px-2 text-[0.68rem]'}`}
+      color="ghost"
+      className={`gap-1 border font-medium ${badgeToneClass[tone]} ${size === 'xs' ? 'h-4 px-1.5 text-[0.62rem]' : 'h-5 px-2 text-[0.68rem]'}`}
       title={title}
     >
       {dot && <span className={`h-1.5 w-1.5 rounded-full bg-current`} />}

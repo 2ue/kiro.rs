@@ -65,7 +65,7 @@ pub struct ExternalPoolAttempt {
     pub error_message: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalPoolUsageSnapshot {
     pub total_input_tokens: i32,
@@ -82,16 +82,52 @@ pub struct ExternalPoolUsageSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct ExternalPoolBilling {
     pub raw_usage: ExternalPoolUsageSnapshot,
+    #[serde(default)]
+    pub shaped_usage: ExternalPoolUsageSnapshot,
     pub reported_usage: ExternalPoolUsageSnapshot,
+    #[serde(default)]
+    pub usage_projection_applied: bool,
     pub raw_cost_usd: f64,
+    #[serde(default)]
+    pub shaped_cost_usd: f64,
+    #[serde(default)]
+    pub uplifted_cost_usd: f64,
+    #[serde(default)]
+    pub profit_usd: f64,
+    #[serde(default)]
     pub reported_cost_usd: f64,
+    #[serde(default)]
     pub billable_cost_usd: f64,
+    #[serde(default)]
     pub cost_floor_delta_usd: f64,
+    #[serde(default)]
     pub cost_floor_applied: bool,
     pub pricing_available: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_model: Option<String>,
     pub usage_projection_mode: String,
+}
+
+impl ExternalPoolBilling {
+    pub fn effective_shaped_cost_usd(&self) -> f64 {
+        if self.pricing_available && self.shaped_cost_usd == 0.0 && self.reported_cost_usd > 0.0 {
+            self.reported_cost_usd
+        } else {
+            self.shaped_cost_usd
+        }
+    }
+
+    pub fn effective_uplifted_cost_usd(&self) -> f64 {
+        if self.pricing_available && self.uplifted_cost_usd == 0.0 && self.reported_cost_usd > 0.0 {
+            self.reported_cost_usd
+        } else {
+            self.uplifted_cost_usd
+        }
+    }
+
+    pub fn effective_profit_usd(&self) -> f64 {
+        self.effective_uplifted_cost_usd() - self.raw_cost_usd
+    }
 }
 
 impl UsageRecordStatus {
@@ -218,6 +254,7 @@ pub struct UsageRecordQuery {
     pub q: Option<String>,
     pub conversation_id: Option<String>,
     pub credential_id: Option<u64>,
+    pub external_pool_id: Option<u64>,
     pub model: Option<String>,
     pub status: Option<UsageRecordStatus>,
     pub source: Option<UsageSource>,
@@ -234,6 +271,7 @@ impl Default for UsageRecordQuery {
             q: None,
             conversation_id: None,
             credential_id: None,
+            external_pool_id: None,
             model: None,
             status: None,
             source: None,
@@ -358,6 +396,9 @@ pub struct UsageExternalPoolBillingSummary {
     pub unpriced_requests: usize,
     pub cost_floor_applied_requests: usize,
     pub raw_cost_usd: f64,
+    pub shaped_cost_usd: f64,
+    pub uplifted_cost_usd: f64,
+    pub profit_usd: f64,
     pub reported_cost_usd: f64,
     pub billable_cost_usd: f64,
     pub cost_floor_delta_usd: f64,
@@ -912,6 +953,11 @@ impl UsageRecorder {
                         summary.external_pool_billing.cost_floor_applied_requests += 1;
                     }
                     summary.external_pool_billing.raw_cost_usd += billing.raw_cost_usd;
+                    summary.external_pool_billing.shaped_cost_usd +=
+                        billing.effective_shaped_cost_usd();
+                    summary.external_pool_billing.uplifted_cost_usd +=
+                        billing.effective_uplifted_cost_usd();
+                    summary.external_pool_billing.profit_usd += billing.effective_profit_usd();
                     summary.external_pool_billing.reported_cost_usd += billing.reported_cost_usd;
                     summary.external_pool_billing.billable_cost_usd += billing.billable_cost_usd;
                     summary.external_pool_billing.cost_floor_delta_usd +=
@@ -1118,6 +1164,11 @@ fn record_matches(record: &UsageRecord, query: &UsageRecordQuery) -> bool {
             return false;
         }
     }
+    if let Some(external_pool_id) = query.external_pool_id {
+        if record.external_pool_id != Some(external_pool_id) {
+            return false;
+        }
+    }
     if let Some(model) = &query.model {
         if &record.model != model && record.upstream_model.as_ref() != Some(model) {
             return false;
@@ -1171,6 +1222,7 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
     let status = usage_status_value(record.status);
     let source = usage_source_value(record.usage_source);
     let credential_id = record.credential_id.map(|id| id.to_string());
+    let external_pool_id = record.external_pool_id.map(|id| id.to_string());
     let estimated_cost = record.estimated_cost_usd.to_string();
     let attempt_chain = summarize_attempts(&record.credential_attempts);
 
@@ -1183,6 +1235,8 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
         record.model_resolution_source.as_deref(),
         record.model_resolution_note.as_deref(),
         record.conversation_id.as_deref(),
+        external_pool_id.as_deref(),
+        record.external_pool_name.as_deref(),
         record.credential_label.as_deref(),
         Some(status),
         Some(source),

@@ -507,9 +507,10 @@ export function CredentialCard({
 
             {/* Error Info */}
             {credential.lastErrorReason && (
-              <div className="mt-3 rounded-lg border border-error/20 bg-error/5 p-2 text-xs">
+              <div className="mt-3 rounded-lg border border-base-300 bg-base-100 p-2 text-xs">
+                <span className="mr-1 inline-block h-3 w-1 rounded-full bg-error align-[-1px]" />
                 <span className="font-semibold text-error">最近错误{lastTransientErrorAgo ? ` (${lastTransientErrorAgo})` : ''}：</span>
-                <span className="text-error/80">{credential.lastErrorKind}: {credential.lastErrorReason}</span>
+                <span className="text-base-content/70">{credential.lastErrorKind}: {credential.lastErrorReason}</span>
               </div>
             )}
 

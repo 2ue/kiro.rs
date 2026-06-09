@@ -435,8 +435,13 @@ export interface ExternalPoolUsageSnapshot {
 
 export interface ExternalPoolBilling {
   rawUsage: ExternalPoolUsageSnapshot
+  shapedUsage?: ExternalPoolUsageSnapshot
   reportedUsage: ExternalPoolUsageSnapshot
+  usageProjectionApplied: boolean
   rawCostUsd: number
+  shapedCostUsd?: number
+  upliftedCostUsd?: number
+  profitUsd?: number
   reportedCostUsd: number
   billableCostUsd: number
   costFloorDeltaUsd: number
@@ -518,6 +523,9 @@ export interface UsageExternalPoolBillingSummary {
   unpricedRequests: number
   costFloorAppliedRequests: number
   rawCostUsd: number
+  shapedCostUsd?: number
+  upliftedCostUsd?: number
+  profitUsd?: number
   reportedCostUsd: number
   billableCostUsd: number
   costFloorDeltaUsd: number
@@ -619,6 +627,7 @@ export interface UsageRecordsQuery {
   q?: string
   conversationId?: string
   credentialId?: number
+  externalPoolId?: number
   model?: string
   status?: UsageRecordStatus
   source?: UsageSource

@@ -106,7 +106,19 @@ struct ExternalFallbackContext {
     headers: HeaderMap,
     endpoint: &'static str,
     payload: MessagesRequest,
+    model_resolution: Option<ModelResolution>,
     reported_usage: ReportedUsageConfig,
+    prompt_cache: Arc<super::prompt_cache::PromptCacheTracker>,
+    prompt_cache_creation_controller:
+        Arc<super::prompt_cache_creation_control::PromptCacheCreationController>,
+    prompt_cache_target_read_ratio: f64,
+    prompt_cache_token_scale: f64,
+    prompt_cache_max_simulated_input_tokens: i32,
+    prompt_cache_cap_jitter_min_tokens: i32,
+    prompt_cache_cap_jitter_max_tokens: i32,
+    prompt_cache_scale_min_input_tokens: i32,
+    prompt_cache_creation_control: PromptCacheCreationControlConfig,
+    model_capabilities: Arc<super::model_capabilities::ModelCapabilitiesCatalog>,
     pricing_catalog: Arc<super::pricing::PricingCatalog>,
     recorder: Arc<super::usage::UsageRecorder>,
 }
@@ -331,7 +343,19 @@ fn build_external_fallback_context(
             headers,
             endpoint,
             payload: payload.clone(),
+            model_resolution: None,
             reported_usage: runtime_config.reported_usage.clone(),
+            prompt_cache: state.prompt_cache.clone(),
+            prompt_cache_creation_controller: state.prompt_cache_creation_controller.clone(),
+            prompt_cache_target_read_ratio: runtime_config.prompt_cache_target_read_ratio,
+            prompt_cache_token_scale: runtime_config.prompt_cache_token_scale,
+            prompt_cache_max_simulated_input_tokens: runtime_config
+                .prompt_cache_max_simulated_input_tokens,
+            prompt_cache_cap_jitter_min_tokens: runtime_config.prompt_cache_cap_jitter_min_tokens,
+            prompt_cache_cap_jitter_max_tokens: runtime_config.prompt_cache_cap_jitter_max_tokens,
+            prompt_cache_scale_min_input_tokens: runtime_config.prompt_cache_scale_min_input_tokens,
+            prompt_cache_creation_control: runtime_config.prompt_cache_creation_control,
+            model_capabilities: state.model_capabilities.clone(),
             pricing_catalog: state.pricing_catalog.clone(),
             recorder: state.usage_recorder.clone(),
         })
@@ -428,6 +452,18 @@ impl ExternalFallbackContext {
             headers: self.headers.clone(),
             endpoint: self.endpoint,
             payload: self.payload.clone(),
+            upstream_model: self
+                .model_resolution
+                .as_ref()
+                .and_then(|resolution| resolution.upstream_model.clone()),
+            model_resolution_source: self
+                .model_resolution
+                .as_ref()
+                .map(|resolution| resolution.source.as_str().to_string()),
+            model_resolution_note: self
+                .model_resolution
+                .as_ref()
+                .and_then(|resolution| resolution.note.clone()),
             route_subtype,
             fallback_reason,
             direct_policy_reason,
@@ -435,6 +471,16 @@ impl ExternalFallbackContext {
             local_preflight,
             local_attempts,
             reported_usage: self.reported_usage.clone(),
+            prompt_cache: self.prompt_cache.clone(),
+            prompt_cache_creation_controller: self.prompt_cache_creation_controller.clone(),
+            prompt_cache_target_read_ratio: self.prompt_cache_target_read_ratio,
+            prompt_cache_token_scale: self.prompt_cache_token_scale,
+            prompt_cache_max_simulated_input_tokens: self.prompt_cache_max_simulated_input_tokens,
+            prompt_cache_cap_jitter_min_tokens: self.prompt_cache_cap_jitter_min_tokens,
+            prompt_cache_cap_jitter_max_tokens: self.prompt_cache_cap_jitter_max_tokens,
+            prompt_cache_scale_min_input_tokens: self.prompt_cache_scale_min_input_tokens,
+            prompt_cache_creation_control: self.prompt_cache_creation_control,
+            model_capabilities: self.model_capabilities.clone(),
             pricing_catalog: self.pricing_catalog.clone(),
             request_id,
             recorder: self.recorder.clone(),
@@ -449,15 +495,11 @@ fn classify_local_error_for_external_fallback(
     config: &ExternalPoolsConfig,
 ) -> Option<String> {
     let lower = message.to_ascii_lowercase();
+    if config.fallback_on_unsupported_model && is_unsupported_model_error(&lower, attempts) {
+        return Some("unsupported_model".to_string());
+    }
     if is_request_error_that_must_not_fallback(&lower, attempts) {
         return None;
-    }
-    if config.fallback_on_unsupported_model
-        && (lower.contains("没有支持当前模型")
-            || lower.contains("模型不支持")
-            || lower.contains("unsupported model"))
-    {
-        return Some("unsupported_model".to_string());
     }
     if config.fallback_on_local_capacity_exhausted
         && (lower.contains("本地凭据调度容量暂不可用")
@@ -513,6 +555,26 @@ fn classify_local_error_for_external_fallback(
         }
         _ => None,
     }
+}
+
+fn is_unsupported_model_error(lower_message: &str, attempts: &[KiroCredentialAttempt]) -> bool {
+    if lower_message.contains("invalid_model_id")
+        || lower_message.contains("invalid model")
+        || lower_message.contains("model_not_found")
+        || lower_message.contains("model not found")
+        || lower_message.contains("unsupported model")
+        || lower_message.contains("模型不支持")
+        || lower_message.contains("没有支持当前模型")
+    {
+        return true;
+    }
+
+    attempts.iter().any(|attempt| {
+        matches!(
+            attempt.error_type.as_deref(),
+            Some("unsupported_model") | Some("invalid_model") | Some("invalid_model_id")
+        )
+    })
 }
 
 fn is_request_error_that_must_not_fallback(
@@ -1027,7 +1089,7 @@ impl CredentialUsageContext {
             credential_label: self.credential_label.clone(),
             status,
             usage_source,
-            total_input_tokens: usage.total_input_tokens,
+            total_input_tokens: self.request.input_tokens,
             compat_input_tokens: usage.input_tokens,
             billable_input_tokens: usage.billable_input_tokens(),
             output_tokens: usage.output_tokens,
@@ -2216,7 +2278,7 @@ async fn post_messages_inner(
         }
     };
     let runtime_config = request_runtime_config(&state, &provider);
-    let external_fallback = build_external_fallback_context(
+    let mut external_fallback = build_external_fallback_context(
         &state,
         &provider,
         &runtime_config,
@@ -2300,6 +2362,9 @@ async fn post_messages_inner(
             return response;
         }
     };
+    if let Some(external) = external_fallback.as_mut() {
+        external.model_resolution = Some(model_resolution.clone());
+    }
 
     // 转换请求
     let conversion_result = match convert_request_with_resolved_model(
@@ -3408,7 +3473,7 @@ pub async fn post_messages_cc(
         }
     };
     let runtime_config = request_runtime_config(&state, &provider);
-    let external_fallback = build_external_fallback_context(
+    let mut external_fallback = build_external_fallback_context(
         &state,
         &provider,
         &runtime_config,
@@ -3492,6 +3557,9 @@ pub async fn post_messages_cc(
                 return response;
             }
         };
+    if let Some(external) = external_fallback.as_mut() {
+        external.model_resolution = Some(model_resolution.clone());
+    }
 
     // 转换请求
     let conversion_result = match convert_request_with_resolved_model(
@@ -4738,6 +4806,24 @@ mod tests {
         assert_eq!(
             classify_local_error_for_external_fallback("模型不支持: claude-future", &[], &config,)
                 .as_deref(),
+            Some("unsupported_model")
+        );
+        assert_eq!(
+            classify_local_error_for_external_fallback(
+                r#"非流式 API 请求失败: 400 Bad Request {"message":"Invalid model. Please select a different model to continue.","reason":"INVALID_MODEL_ID"}"#,
+                &[KiroCredentialAttempt::new(
+                    0,
+                    1,
+                    None,
+                    Some(StatusCode::BAD_REQUEST),
+                    "fail",
+                    Some("client_error"),
+                    Some("bad request"),
+                    10,
+                )],
+                &config,
+            )
+            .as_deref(),
             Some("unsupported_model")
         );
     }

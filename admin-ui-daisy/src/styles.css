@@ -17,14 +17,6 @@
   --page-max: 1400px;
 }
 
-html[data-theme='kiroDark'],
-html[data-theme='kiroOcean'],
-html[data-theme='kiroForest'],
-html[data-theme='kiroPurple'],
-html[data-theme='kiroSunset'] {
-  color-scheme: dark;
-}
-
 html {
   scrollbar-gutter: stable;
 }
@@ -82,12 +74,12 @@ button, input, textarea, select {
   transition: all 0.15s ease;
 }
 
-.btn-primary, .btn-secondary, .btn-accent {
-  box-shadow: 0 1px 2px oklch(var(--n) / 0.1), inset 0 1px 0 oklch(1 0 0 / 0.1);
+.btn-primary {
+  box-shadow: 0 1px 2px oklch(var(--n) / 0.1);
 }
 
-.btn-primary:hover, .btn-secondary:hover, .btn-accent:hover {
-  box-shadow: 0 2px 4px oklch(var(--n) / 0.15), inset 0 1px 0 oklch(1 0 0 / 0.1);
+.btn-primary:hover {
+  box-shadow: 0 2px 4px oklch(var(--n) / 0.14);
 }
 
 .btn-outline {
@@ -170,7 +162,7 @@ button, input, textarea, select {
    ============================================================================ */
 
 .sidebar-shell {
-  background: linear-gradient(180deg, oklch(var(--b1)) 0%, oklch(var(--b2) / 0.5) 100%);
+  background: oklch(var(--b1) / 0.98);
 }
 
 .nav-item {
@@ -200,7 +192,7 @@ button, input, textarea, select {
    ============================================================================ */
 
 .top-bar {
-  background: linear-gradient(180deg, oklch(var(--b1) / 0.95) 0%, oklch(var(--b1) / 0.9) 100%);
+  background: oklch(var(--b1) / 0.92);
 }
 
 /* ============================================================================

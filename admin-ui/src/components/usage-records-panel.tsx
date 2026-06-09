@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useState } from 'react'
-import { DollarSign, Eye, RefreshCw, Trash2, X } from 'lucide-react'
+import { useQuery } from '@tanstack/react-query'
+import { DollarSign, Info, RefreshCw, Trash2, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { useAutoRefreshPreference } from '@/hooks/use-auto-refresh'
 import { useCredentials } from '@/hooks/use-credentials'
 import {
   useClearUsageRecords,
@@ -18,8 +20,25 @@ import {
   useUsageRecordsPage,
   useUsageSummary,
 } from '@/hooks/use-usage'
+import { getExternalPools } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { ExternalPoolUsageSnapshot, UsageCleanupMode, UsageCleanupRequest, UsageRecord, UsageRecordsPageQuery, UsageRecordStatus, UsageSource } from '@/types/api'
+
+const USAGE_AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:usage'
+
+type BillingDeltaTone = 'loss' | 'profit' | 'even'
+
+function billingDeltaTone(delta: number): BillingDeltaTone {
+  if (delta < 0) return 'loss'
+  if (delta > 0) return 'profit'
+  return 'even'
+}
+
+function billingDeltaTextClass(tone: BillingDeltaTone): string {
+  if (tone === 'loss') return 'text-kiro-error'
+  if (tone === 'profit') return 'text-kiro-warning'
+  return 'text-muted-foreground'
+}
 
 function formatNumber(value: number): string {
   return new Intl.NumberFormat('zh-CN').format(value)
@@ -119,10 +138,10 @@ function routeLabel(record: UsageRecord): string {
 function formatUsageSnapshot(snapshot?: ExternalPoolUsageSnapshot): string {
   if (!snapshot) return '-'
   return [
-    `in ${formatNumber(snapshot.inputTokens)}`,
-    `out ${formatNumber(snapshot.outputTokens)}`,
-    `read ${formatNumber(snapshot.cacheReadInputTokens)}`,
-    `create ${formatNumber(snapshot.cacheCreationInputTokens)}`,
+    `输入 ${formatNumber(snapshot.inputTokens)}`,
+    `输出 ${formatNumber(snapshot.outputTokens)}`,
+    `读 ${formatNumber(snapshot.cacheReadInputTokens)}`,
+    `写 ${formatNumber(snapshot.cacheCreationInputTokens)}`,
   ].join(' / ')
 }
 
@@ -193,11 +212,36 @@ function formatJsonBlock(value: unknown): string {
   }
 }
 
+function UsageMetric({
+  label,
+  value,
+  tone = 'default',
+}: {
+  label: string
+  value: string
+  tone?: 'default' | 'success' | 'info'
+}) {
+  const toneClass =
+    tone === 'success'
+      ? 'text-kiro-success'
+      : tone === 'info'
+        ? 'text-primary'
+        : 'text-foreground'
+  return (
+    <div className="rounded-md border bg-card px-2.5 py-1.5">
+      <div className="text-[0.68rem] font-medium text-muted-foreground">{label}</div>
+      <div className={`mt-0.5 truncate font-mono text-[0.82rem] font-semibold ${toneClass}`}>
+        {value}
+      </div>
+    </div>
+  )
+}
+
 export function UsageRecordsPanel() {
   const [searchText, setSearchText] = useState('')
   const [model, setModel] = useState('')
   const [conversationId, setConversationId] = useState('')
-  const [credentialId, setCredentialId] = useState('')
+  const [routeTarget, setRouteTarget] = useState('')
   const [status, setStatus] = useState<UsageRecordStatus | ''>('')
   const [source, setSource] = useState<UsageSource | ''>('')
   const [streamMode, setStreamMode] = useState<'all' | 'stream' | 'non_stream'>('all')
@@ -206,6 +250,7 @@ export function UsageRecordsPanel() {
   const [cleanupOpen, setCleanupOpen] = useState(false)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 20
+  const autoRefresh = useAutoRefreshPreference(USAGE_AUTO_REFRESH_KEY)
 
   const query = useMemo<UsageRecordsPageQuery>(() => {
     const next: UsageRecordsPageQuery = { page: currentPage, limit: itemsPerPage }
@@ -218,9 +263,11 @@ export function UsageRecordsPanel() {
     if (conversationId.trim()) {
       next.conversationId = conversationId.trim()
     }
-    const parsedCredentialId = Number(credentialId)
-    if (credentialId.trim() && Number.isFinite(parsedCredentialId)) {
-      next.credentialId = parsedCredentialId
+    const [routeType, routeId] = routeTarget.split(':')
+    const parsedRouteId = Number(routeId)
+    if (routeTarget && Number.isFinite(parsedRouteId)) {
+      if (routeType === 'credential') next.credentialId = parsedRouteId
+      if (routeType === 'external') next.externalPoolId = parsedRouteId
     }
     if (source) {
       next.source = source
@@ -236,18 +283,19 @@ export function UsageRecordsPanel() {
       next.minCacheRead = parsedMinCacheRead
     }
     return next
-  }, [conversationId, credentialId, currentPage, minCacheRead, model, searchText, source, status, streamMode])
+  }, [conversationId, currentPage, minCacheRead, model, routeTarget, searchText, source, status, streamMode])
 
-  const summary = useUsageSummary()
-  const records = useUsageRecordsPage(query)
-  const modelPricing = useModelPricing()
+  const summary = useUsageSummary(autoRefresh.refetchInterval)
+  const records = useUsageRecordsPage(query, autoRefresh.refetchInterval)
+  const modelPricing = useModelPricing(autoRefresh.refetchInterval)
   const syncPricing = useSyncModelPricing()
-  const credentials = useCredentials()
+  const credentials = useCredentials({ refetchInterval: autoRefresh.refetchInterval })
+  const externalPools = useQuery({ queryKey: ['external-pools'], queryFn: getExternalPools, refetchInterval: autoRefresh.refetchInterval })
   const clearRecords = useClearUsageRecords()
 
   useEffect(() => {
     setCurrentPage(1)
-  }, [conversationId, credentialId, minCacheRead, model, searchText, source, status, streamMode])
+  }, [conversationId, minCacheRead, model, routeTarget, searchText, source, status, streamMode])
 
   const credentialLabels = useMemo(() => {
     const labels = new Map<number, string>()
@@ -285,7 +333,7 @@ export function UsageRecordsPanel() {
     searchText.trim() ||
     model.trim() ||
     conversationId.trim() ||
-    credentialId.trim() ||
+    routeTarget ||
     status ||
     source ||
     streamMode !== 'all' ||
@@ -296,7 +344,7 @@ export function UsageRecordsPanel() {
     setSearchText('')
     setModel('')
     setConversationId('')
-    setCredentialId('')
+    setRouteTarget('')
     setStatus('')
     setSource('')
     setStreamMode('all')
@@ -359,7 +407,7 @@ export function UsageRecordsPanel() {
           <CardContent>
             <div className="text-2xl font-bold">{formatNumber(realtime?.totalTpm || 0)}</div>
             <div className="text-xs text-muted-foreground">
-              计费 {formatNumber(realtime?.billableTpm || 0)}
+              按上报输入 + 上报输出统计
             </div>
           </CardContent>
         </Card>
@@ -368,7 +416,7 @@ export function UsageRecordsPanel() {
             <CardTitle className="text-sm font-medium text-muted-foreground">高缓存请求</CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold text-green-600">{formatNumber(summaryData?.highCacheRequests || 0)}</div>
+            <div className="text-2xl font-bold text-kiro-success">{formatNumber(summaryData?.highCacheRequests || 0)}</div>
           </CardContent>
         </Card>
         <Card>
@@ -440,12 +488,31 @@ export function UsageRecordsPanel() {
             onChange={(event) => setConversationId(event.target.value)}
             placeholder="会话 ID"
           />
-          <Input
-            value={credentialId}
-            onChange={(event) => setCredentialId(event.target.value)}
-            placeholder="账号 ID"
-            inputMode="numeric"
-          />
+          <select
+            value={routeTarget}
+            onChange={(event) => setRouteTarget(event.target.value)}
+            className="h-10 rounded-md border border-input bg-background px-3 py-2 text-sm"
+          >
+            <option value="">全部账号/外部池</option>
+            {(credentials.data?.credentials || []).length > 0 && (
+              <optgroup label="账号凭证">
+                {(credentials.data?.credentials || []).map((credential) => (
+                  <option key={`credential:${credential.id}`} value={`credential:${credential.id}`}>
+                    #{credential.id} {credential.email || credential.maskedApiKey || '未命名凭据'}
+                  </option>
+                ))}
+              </optgroup>
+            )}
+            {(externalPools.data?.pools || []).length > 0 && (
+              <optgroup label="外部池">
+                {(externalPools.data?.pools || []).map((pool) => (
+                  <option key={`external:${pool.id}`} value={`external:${pool.id}`}>
+                    #{pool.id} {pool.name}
+                  </option>
+                ))}
+              </optgroup>
+            )}
+          </select>
           <select
             value={status}
             onChange={(event) => setStatus(event.target.value as UsageRecordStatus | '')}
@@ -486,7 +553,26 @@ export function UsageRecordsPanel() {
             inputMode="numeric"
           />
         </div>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+            <input
+              type="checkbox"
+              className="h-4 w-4"
+              checked={autoRefresh.enabled}
+              onChange={(event) => autoRefresh.setEnabled(event.target.checked)}
+            />
+            自动刷新
+          </label>
+          <Input
+            type="number"
+            min={5}
+            max={3600}
+            className="h-8 w-20"
+            value={autoRefresh.intervalSeconds}
+            disabled={!autoRefresh.enabled}
+            onChange={(event) => autoRefresh.setIntervalSeconds(Number(event.target.value))}
+          />
+          <span className="text-xs text-muted-foreground">秒</span>
           <Button variant="outline" size="sm" onClick={handleResetFilters} disabled={!hasFilters}>
             <X className="h-4 w-4" />
             重置
@@ -527,7 +613,7 @@ export function UsageRecordsPanel() {
             <div className="py-8 text-center text-muted-foreground">当前页暂无记录</div>
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[1720px] text-sm">
+              <table className="w-full min-w-[1560px] text-sm">
                 <thead>
                   <tr className="border-b text-left text-muted-foreground">
                     <th className="px-3 py-2 font-medium">时间</th>
@@ -536,14 +622,12 @@ export function UsageRecordsPanel() {
                     <th className="px-3 py-2 font-medium">会话</th>
                     <th className="px-3 py-2 font-medium">来源</th>
                     <th className="px-3 py-2 font-medium">状态</th>
-                    <th className="px-3 py-2 font-medium text-right">总输入</th>
                     <th className="px-3 py-2 font-medium text-right">上报输入</th>
-                    <th className="px-3 py-2 font-medium text-right">计费输入</th>
-                    <th className="px-3 py-2 font-medium text-right">缓存读取</th>
-                    <th className="px-3 py-2 font-medium text-right">缓存写入</th>
+                    <th className="px-3 py-2 font-medium text-right">上报缓存读取</th>
+                    <th className="px-3 py-2 font-medium text-right">上报缓存写入</th>
                     <th className="px-3 py-2 font-medium text-right">读取率</th>
                     <th className="px-3 py-2 font-medium text-right">缓存率</th>
-                    <th className="px-3 py-2 font-medium text-right">输出</th>
+                    <th className="px-3 py-2 font-medium text-right">上报输出</th>
                     <th className="px-3 py-2 font-medium text-right">费用</th>
                     <th className="px-3 py-2 font-medium text-right">耗时</th>
                   </tr>
@@ -554,10 +638,14 @@ export function UsageRecordsPanel() {
                       typeof record.credentialId === 'number'
                         ? credentialLabels.get(record.credentialId) || record.credentialLabel
                         : record.credentialLabel
-                    const readRatio = ratio(record.cacheReadInputTokens, record.totalInputTokens)
+                    const reportedInputTotal =
+                      record.compatInputTokens +
+                      record.cacheReadInputTokens +
+                      record.cacheCreationInputTokens
+                    const readRatio = ratio(record.cacheReadInputTokens, reportedInputTotal)
                     const cachedRatio = ratio(
                       record.cacheReadInputTokens + record.cacheCreationInputTokens,
-                      record.totalInputTokens
+                      reportedInputTotal
                     )
                     const attemptChain = formatAttemptChain(record)
                     const externalAttemptChain = formatExternalAttemptChain(record)
@@ -645,9 +733,7 @@ export function UsageRecordsPanel() {
                           </button>
                         )}
                       </td>
-                      <td className="px-3 py-2 text-right">{formatNumber(record.totalInputTokens)}</td>
                       <td className="px-3 py-2 text-right">{formatNumber(record.compatInputTokens)}</td>
-                      <td className="px-3 py-2 text-right">{formatNumber(record.billableInputTokens)}</td>
                       <td className="px-3 py-2 text-right">{formatNumber(record.cacheReadInputTokens)}</td>
                       <td className="px-3 py-2 text-right">{formatNumber(record.cacheCreationInputTokens)}</td>
                       <td className="px-3 py-2 text-right">{formatPercent(readRatio)}</td>
@@ -662,17 +748,15 @@ export function UsageRecordsPanel() {
                       <td className="px-3 py-2 text-right">
                         <div className="flex items-center justify-end gap-2">
                           <span>{formatNumber(record.durationMs)}ms</span>
-                          {(record.errorMessage || record.errorDetail || attemptChain) && (
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              className="h-7 w-7"
-                              onClick={() => setSelectedRecord(record)}
-                              title="查看详情"
-                            >
-                              <Eye className="h-4 w-4" />
-                            </Button>
-                          )}
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-7 w-7"
+                            onClick={() => setSelectedRecord(record)}
+                            title="查看 usage 口径和详情"
+                          >
+                            <Info className="h-4 w-4" />
+                          </Button>
                         </div>
                       </td>
                     </tr>
@@ -789,37 +873,74 @@ export function UsageRecordsPanel() {
                   </div>
                 </div>
               </div>
-              {selectedRecord.externalPoolBilling && (
-                <div className="rounded-md border bg-muted/30 p-3 text-sm">
-                  <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                    <div className="font-medium">外部池成本保护</div>
-                    <Badge variant={selectedRecord.externalPoolBilling.costFloorApplied ? 'warning' : 'success'}>
-                      {selectedRecord.externalPoolBilling.costFloorApplied ? '已保底补差' : '未触发补差'}
-                    </Badge>
-                  </div>
-                  <div className="grid gap-3 md:grid-cols-2">
-                    <div>
-                      <div className="text-xs text-muted-foreground">渠道 raw usage / 成本</div>
-                      <div className="break-all font-mono text-xs">{formatUsageSnapshot(selectedRecord.externalPoolBilling.rawUsage)}</div>
-                      <div className="mt-1 font-medium">{formatUsd(selectedRecord.externalPoolBilling.rawCostUsd || 0)}</div>
-                    </div>
-                    <div>
-                      <div className="text-xs text-muted-foreground">返回 reported usage / 成本</div>
-                      <div className="break-all font-mono text-xs">{formatUsageSnapshot(selectedRecord.externalPoolBilling.reportedUsage)}</div>
-                      <div className="mt-1 font-medium">{formatUsd(selectedRecord.externalPoolBilling.reportedCostUsd || 0)}</div>
-                    </div>
-                    <div>
-                      <div className="text-xs text-muted-foreground">最终计费 / 补差</div>
-                      <div className="font-medium">{formatUsd(selectedRecord.externalPoolBilling.billableCostUsd || 0)}</div>
-                      <div className="text-xs text-muted-foreground">补差 {formatUsd(selectedRecord.externalPoolBilling.costFloorDeltaUsd || 0)}</div>
-                    </div>
-                    <div>
-                      <div className="text-xs text-muted-foreground">计价模型 / 整形模式</div>
-                      <div className="break-all">{selectedRecord.externalPoolBilling.pricingAvailable ? selectedRecord.externalPoolBilling.pricingModel || 'priced' : 'unpriced'}</div>
-                      <div className="text-xs text-muted-foreground">{selectedRecord.externalPoolBilling.usageProjectionMode}</div>
-                    </div>
-                  </div>
+              <div className="rounded-md border bg-muted/30 p-3 text-sm">
+                <div className="mb-2 flex flex-wrap items-center gap-2">
+                  <div className="font-medium">Usage 口径</div>
+                  <span className="text-xs text-muted-foreground">
+                    主列表只展示下游响应上报字段；实际输入和内部成本口径仅用于诊断。
+                  </span>
                 </div>
+                <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-6">
+                  <UsageMetric label="用户实际输入" value={formatNumber(selectedRecord.totalInputTokens)} />
+                  <UsageMetric label="上报输入" value={formatNumber(selectedRecord.compatInputTokens)} />
+                  <UsageMetric label="上报缓存写入" value={formatNumber(selectedRecord.cacheCreationInputTokens)} tone="info" />
+                  <UsageMetric label="上报缓存读取" value={formatNumber(selectedRecord.cacheReadInputTokens)} tone="success" />
+                  <UsageMetric label="上报输出" value={formatNumber(selectedRecord.outputTokens)} />
+                  <UsageMetric label="内部成本输入" value={formatNumber(selectedRecord.billableInputTokens)} />
+                </div>
+                <div className="mt-2 text-xs leading-5 text-muted-foreground">
+                  内部成本输入 = 上报输入 + 上报缓存写入，仅用于本系统费用估算和历史兼容，不是 Anthropic/Kiro 响应里的独立字段。
+                </div>
+              </div>
+              {selectedRecord.externalPoolBilling && (
+                (() => {
+                  const billing = selectedRecord.externalPoolBilling
+                  const shapedCost = billing.shapedCostUsd ?? billing.reportedCostUsd ?? 0
+                  const upliftedCost = billing.upliftedCostUsd ?? billing.reportedCostUsd ?? billing.billableCostUsd ?? 0
+                  const profit = billing.profitUsd ?? (upliftedCost - (billing.rawCostUsd || 0))
+                  const deltaTone = billingDeltaTone(profit)
+                  const hasLoss = deltaTone === 'loss'
+                  const hasProfit = deltaTone === 'profit'
+                  return (
+                    <div className="rounded-md border bg-muted/30 p-3 text-sm">
+                      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                        <div className="font-medium">外部池计费拆分</div>
+                        <Badge variant={hasLoss ? 'destructive' : hasProfit ? 'warning' : 'success'}>
+                          {hasLoss ? `亏损 ${formatUsd(Math.abs(profit))}` : hasProfit ? `盈利 ${formatUsd(profit)}` : '持平'}
+                        </Badge>
+                      </div>
+                      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                        <div>
+                          <div className="text-xs text-muted-foreground">原始成本</div>
+                          <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.rawUsage)}</div>
+                          <div className="mt-1 font-medium">{formatUsd(billing.rawCostUsd || 0)}</div>
+                          <div className="text-xs text-muted-foreground">外部池原始返回 usage 估算</div>
+                        </div>
+                        <div>
+                          <div className="text-xs text-muted-foreground">整形后计费</div>
+                          <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.shapedUsage || billing.reportedUsage)}</div>
+                          <div className="mt-1 font-medium">{formatUsd(shapedCost)}</div>
+                          <div className="text-xs text-muted-foreground">按当前路径缓存策略整形，未放大</div>
+                        </div>
+                        <div>
+                          <div className="text-xs text-muted-foreground">整形后放大计费</div>
+                          <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.reportedUsage)}</div>
+                          <div className="mt-1 font-medium">{formatUsd(upliftedCost)}</div>
+                          <div className={`text-xs ${billingDeltaTextClass(deltaTone)}`}>
+                            盈利 = 放大后 - 原始：{profit >= 0 ? '+' : ''}{formatUsd(profit)}
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-xs text-muted-foreground">计价模型 / 整形模式</div>
+                          <div className="break-all">{billing.pricingAvailable ? billing.pricingModel || 'priced' : 'unpriced'}</div>
+                          <div className="text-xs text-muted-foreground">
+                            {billing.usageProjectionMode} · {billing.usageProjectionApplied ? '已按当前路径整形' : '未整形/透传'}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )
+                })()
               )}
               {(selectedRecord.credentialAttempts || []).length > 0 && (
                 <div>
@@ -1033,7 +1154,7 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
           <DialogTitle>分批清理 Usage 记录</DialogTitle>
         </DialogHeader>
         <div className="space-y-4 text-sm">
-          <div className="rounded-md border border-yellow-500/30 bg-yellow-500/10 p-3 text-yellow-700 dark:text-yellow-300">
+          <div className="rounded-md border border-kiro-warning-soft bg-kiro-warning-soft p-3 text-kiro-warning">
             这是手动单次任务，不会定时执行。你只需要设置清理范围和每批数量，系统会自动分批清到没有更多匹配记录；后端保留 {formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批安全上限。清理只影响使用记录明细列表，已累计的顶部统计和 Dashboard rollup 会保留。
           </div>
 

@@ -286,7 +286,7 @@ function StartupProxyPanel({ config }: { config: RuntimeConfig }) {
       <div className="rounded-box border border-base-300 bg-base-100 p-3 md:col-span-2">
         <div className="mb-3 flex flex-wrap items-center gap-2">
           <span className="text-sm font-semibold">当前状态</span>
-          <span className={`rounded border px-2 py-0.5 text-[0.68rem] font-semibold ${hasGlobalProxy ? 'border-success/25 bg-success/10 text-success' : 'border-base-300 bg-base-200 text-base-content/60'}`}>
+          <span className={`rounded border px-2 py-0.5 text-[0.68rem] font-semibold ${hasGlobalProxy ? 'border-base-300 bg-base-100 text-success' : 'border-base-300 bg-base-200 text-base-content/60'}`}>
             {hasGlobalProxy ? '已配置全局代理' : '未配置全局代理'}
           </span>
           <span className="rounded border border-base-300 bg-base-200 px-2 py-0.5 text-[0.68rem] font-semibold text-base-content/60">
@@ -417,7 +417,7 @@ function AccessKeysPanel() {
             <span className="rounded border border-base-300 bg-base-200 px-2 py-0.5 text-[0.68rem] font-semibold text-base-content/60">
               apiKey
             </span>
-            <span className="rounded border border-success/25 bg-success/10 px-2 py-0.5 text-[0.68rem] font-semibold text-success">
+            <span className="rounded border border-base-300 bg-base-100 px-2 py-0.5 text-[0.68rem] font-semibold text-success">
               给客户端用
             </span>
           </div>
@@ -1000,7 +1000,7 @@ export function ConfigPanel() {
 
             <ConfigGroup icon={<Gauge className="h-4 w-4" />} title="缓存创建频次控制" description="只限制最终上报的 cache_creation_input_tokens 出现频次；不改变本地缓存命中计算、上游请求或 cache read 字段策略。">
               <ToggleField title="启用缓存创建频次控制" description="关闭时完全保持旧行为。开启后仅对本地 high-cache 模拟 usage 生效，真实上游 metadata 不受影响。" checked={draft.promptCacheCreationControl.enabled} onChange={(enabled) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, enabled } }))} />
-              <FieldLabel title="控制维度" description="凭据 + 会话 + 模型最贴近真实账号缓存隔离；会话 + 模型会跨凭据共享频次状态，适合减少调度换号后的重复 creation 上报。">
+              <FieldLabel title="控制维度" description="会话 + 模型会跨凭据共享频次状态，默认更适合减少调度换号后的重复 creation 上报；凭据 + 会话 + 模型更贴近真实账号缓存隔离。">
                 <Select bordered size="sm" className="w-full" value={draft.promptCacheCreationControl.scopeMode} disabled={!draft.promptCacheCreationControl.enabled} onChange={(event) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, scopeMode: event.target.value as 'credential_conversation_model' | 'conversation_model' } }))}>
                   <Select.Option value="credential_conversation_model">凭据 + 会话 + 模型</Select.Option>
                   <Select.Option value="conversation_model">会话 + 模型</Select.Option>

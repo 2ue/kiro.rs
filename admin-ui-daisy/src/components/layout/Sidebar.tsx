@@ -59,7 +59,7 @@ export function Sidebar({
       {/* Logo */}
       <div className="flex h-14 items-center justify-between border-b border-base-300 px-3">
         <div className="flex items-center gap-2 overflow-hidden">
-          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-primary to-secondary text-primary-content shadow-md">
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-content shadow-sm">
             <Server className="h-4 w-4" />
           </div>
           {!collapsed && (
@@ -129,7 +129,7 @@ export function Sidebar({
       {/* Footer */}
       <div className="border-t border-base-300 p-2">
         {!collapsed && (
-          <div className="rounded-lg bg-gradient-to-r from-primary/5 to-secondary/5 p-3">
+          <div className="rounded-lg border border-base-300/60 bg-base-200/70 p-3">
             <div className="text-[0.68rem] font-medium text-base-content/60">Kiro Admin Console</div>
             <div className="mt-0.5 text-[0.62rem] text-base-content/40">v2.0.0 · DaisyUI</div>
           </div>

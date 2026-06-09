@@ -16,6 +16,8 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
+import { useAutoRefreshPreference } from '@/hooks/use-auto-refresh'
 import { useUsageDashboard } from '@/hooks/use-usage'
 import { extractErrorMessage } from '@/lib/utils'
 import type {
@@ -27,10 +29,11 @@ import type {
 } from '@/types/api'
 
 const DASHBOARD_TIMEZONE = 'Asia/Shanghai'
-const AUTO_REFRESH_SECONDS = 10
+const DASHBOARD_AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:dashboard'
 
-type DashboardTone = 'default' | 'success' | 'warning' | 'info'
+type DashboardTone = 'default' | 'success' | 'warning' | 'error' | 'info'
 type RankDimension = 'models' | 'credentials' | 'endpoints' | 'errors'
+type BillingDeltaTone = 'loss' | 'profit' | 'even'
 
 const EMPTY_EXTERNAL_POOL_BILLING: UsageExternalPoolBillingSummary = {
   requests: 0,
@@ -38,6 +41,9 @@ const EMPTY_EXTERNAL_POOL_BILLING: UsageExternalPoolBillingSummary = {
   unpricedRequests: 0,
   costFloorAppliedRequests: 0,
   rawCostUsd: 0,
+  shapedCostUsd: 0,
+  upliftedCostUsd: 0,
+  profitUsd: 0,
   reportedCostUsd: 0,
   billableCostUsd: 0,
   costFloorDeltaUsd: 0,
@@ -93,17 +99,31 @@ function activeWindow(windows: UsageDashboardWindow[], key: string): UsageDashbo
   return windows.find((window) => window.key === key) || windows[0]
 }
 
+function billingDeltaTone(delta: number): BillingDeltaTone {
+  if (delta < 0) return 'loss'
+  if (delta > 0) return 'profit'
+  return 'even'
+}
+
+function billingDeltaTextClass(tone: BillingDeltaTone): string {
+  if (tone === 'loss') return 'text-kiro-error'
+  if (tone === 'profit') return 'text-kiro-warning'
+  return 'text-muted-foreground'
+}
+
 function toneText(tone: DashboardTone): string {
-  if (tone === 'success') return 'text-green-600 dark:text-green-400'
-  if (tone === 'warning') return 'text-yellow-600 dark:text-yellow-400'
-  if (tone === 'info') return 'text-blue-600 dark:text-blue-400'
+  if (tone === 'success') return 'text-kiro-success'
+  if (tone === 'warning') return 'text-kiro-warning'
+  if (tone === 'error') return 'text-kiro-error'
+  if (tone === 'info') return 'text-kiro-info'
   return 'text-foreground'
 }
 
 function toneBar(tone: DashboardTone): string {
-  if (tone === 'success') return 'bg-green-500'
-  if (tone === 'warning') return 'bg-yellow-500'
-  if (tone === 'info') return 'bg-blue-500'
+  if (tone === 'success') return 'bg-kiro-success'
+  if (tone === 'warning') return 'bg-kiro-warning'
+  if (tone === 'error') return 'bg-kiro-error'
+  if (tone === 'info') return 'bg-kiro-info'
   return 'bg-primary'
 }
 
@@ -163,10 +183,18 @@ function DashboardToolbar({
   data,
   selectedWindow,
   onWindowChange,
+  autoRefreshEnabled,
+  autoRefreshSeconds,
+  onAutoRefreshEnabledChange,
+  onAutoRefreshSecondsChange,
 }: {
   data: NonNullable<ReturnType<typeof useUsageDashboard>['data']>
   selectedWindow: UsageDashboardWindow
   onWindowChange: (key: string) => void
+  autoRefreshEnabled: boolean
+  autoRefreshSeconds: number
+  onAutoRefreshEnabledChange: (enabled: boolean) => void
+  onAutoRefreshSecondsChange: (seconds: number) => void
 }) {
   return (
     <div className="rounded-lg border bg-card px-4 py-3 shadow-sm">
@@ -175,25 +203,50 @@ function DashboardToolbar({
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-sm font-semibold">{selectedWindow.label}</span>
             <Badge variant="outline">{data.timezone}</Badge>
-            <Badge variant="secondary">自动刷新 {AUTO_REFRESH_SECONDS}s</Badge>
+            <Badge variant={autoRefreshEnabled ? 'secondary' : 'outline'}>
+              {autoRefreshEnabled ? `自动刷新 ${autoRefreshSeconds}s` : '自动刷新关闭'}
+            </Badge>
           </div>
           <div className="mt-1 text-xs text-muted-foreground">
             {formatDate(selectedWindow.from)} - {formatDate(selectedWindow.to)} · 生成 {formatDate(data.generatedAt)}
           </div>
         </div>
 
-        <div className="flex flex-wrap gap-2">
-          {data.windows.map((window) => (
-            <Button
-              key={window.key}
-              type="button"
-              size="sm"
-              variant={window.key === selectedWindow.key ? 'default' : 'outline'}
-              onClick={() => onWindowChange(window.key)}
-            >
-              {window.label}
-            </Button>
-          ))}
+        <div className="flex flex-col gap-2 xl:items-end">
+          <div className="flex flex-wrap gap-2">
+            {data.windows.map((window) => (
+              <Button
+                key={window.key}
+                type="button"
+                size="sm"
+                variant={window.key === selectedWindow.key ? 'default' : 'outline'}
+                onClick={() => onWindowChange(window.key)}
+              >
+                {window.label}
+              </Button>
+            ))}
+          </div>
+          <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+            <label className="flex cursor-pointer items-center gap-2">
+              <input
+                type="checkbox"
+                className="h-4 w-4"
+                checked={autoRefreshEnabled}
+                onChange={(event) => onAutoRefreshEnabledChange(event.target.checked)}
+              />
+              自动刷新
+            </label>
+            <Input
+              type="number"
+              min={5}
+              max={3600}
+              className="h-8 w-20"
+              value={autoRefreshSeconds}
+              disabled={!autoRefreshEnabled}
+              onChange={(event) => onAutoRefreshSecondsChange(Number(event.target.value))}
+            />
+            <span>秒</span>
+          </div>
         </div>
       </div>
     </div>
@@ -210,7 +263,7 @@ function SeriesChart({ title, points }: { title: string; points: UsageSeriesPoin
     <Panel
       title={title}
       subtitle={`${formatNumber(totalRequests)} 请求 · ${formatUsd(totalCost)}`}
-      actions={<Badge variant={totalErrors > 0 ? 'warning' : 'success'}>{totalErrors > 0 ? `错误 ${formatNumber(totalErrors)}` : '无错误'}</Badge>}
+      actions={<Badge variant={totalErrors > 0 ? 'destructive' : 'success'}>{totalErrors > 0 ? `错误 ${formatNumber(totalErrors)}` : '无错误'}</Badge>}
     >
       <div className="overflow-x-auto">
         {points.length === 0 ? (
@@ -225,11 +278,11 @@ function SeriesChart({ title, points }: { title: string; points: UsageSeriesPoin
               return (
                 <div key={point.key} className="group flex min-w-0 flex-1 flex-col items-center gap-1">
                   <div
-                    className="relative w-full overflow-hidden rounded-t bg-blue-500/75 transition-colors group-hover:bg-blue-500"
+                    className="relative w-full overflow-hidden rounded-t bg-primary/70 transition-colors group-hover:bg-primary"
                     style={{ height }}
                     title={`${point.label}: ${formatNumber(point.requests)} 请求 / ${formatNumber(point.errorRequests)} 错误 / ${formatUsd(point.totalEstimatedCostUsd)}`}
                   >
-                    {errorHeight > 0 && <div className="absolute inset-x-0 bottom-0 bg-yellow-500" style={{ height: errorHeight }} />}
+                    {errorHeight > 0 && <div className="absolute inset-x-0 bottom-0 bg-kiro-error" style={{ height: errorHeight }} />}
                   </div>
                   <span className="w-full truncate text-center text-[10px] text-muted-foreground">{point.label}</span>
                 </div>
@@ -293,7 +346,7 @@ function BreakdownPanel({
               label={item.label}
               value={`${formatNumber(item.requests)} · ${formatPercent(item.ratio)}`}
               ratio={item.ratio}
-              tone={item.key === 'success' ? 'success' : item.key.includes('timeout') || item.key.includes('error') ? 'warning' : 'info'}
+              tone={item.key === 'success' ? 'success' : item.key.includes('timeout') || item.key.includes('error') ? 'error' : 'info'}
             />
           ))
         )}
@@ -315,25 +368,25 @@ function ErrorFocusPanel({
     <Panel
       title="异常摘要"
       subtitle="只展示需要排障的错误聚合，完整明细到用量记录页筛选"
-      actions={<Badge variant={totalErrors > 0 ? 'warning' : 'success'}>{totalErrors > 0 ? `${formatNumber(totalErrors)} 错误` : '正常'}</Badge>}
+      actions={<Badge variant={totalErrors > 0 ? 'destructive' : 'success'}>{totalErrors > 0 ? `${formatNumber(totalErrors)} 错误` : '正常'}</Badge>}
     >
       <div className="space-y-3">
         {visibleItems.length === 0 ? (
-          <div className="flex items-center gap-2 rounded-md border border-green-500/20 bg-green-500/5 p-3 text-sm text-green-600 dark:text-green-400">
+          <div className="flex items-center gap-2 rounded-md border border-kiro-success-soft bg-kiro-success-soft p-3 text-sm text-kiro-success">
             <CheckCircle2 className="h-4 w-4 shrink-0" />
             当前窗口没有错误聚合。
           </div>
         ) : (
           visibleItems.map((item, index) => (
-            <div key={`${item.key}-${index}`} className="rounded-md border border-yellow-500/20 bg-yellow-500/5 p-3">
+            <div key={`${item.key}-${index}`} className="rounded-md border border-kiro-error-soft bg-kiro-error-soft p-3">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
-                  <div className="truncate text-sm font-semibold text-yellow-700 dark:text-yellow-400" title={item.label || item.key}>
+                  <div className="truncate text-sm font-semibold text-kiro-error" title={item.label || item.key}>
                     {item.label || item.key}
                   </div>
                   {item.label && <div className="truncate font-mono text-[11px] text-muted-foreground">{item.key}</div>}
                 </div>
-                <Badge variant="warning">{formatNumber(item.requests)}</Badge>
+                <Badge variant="destructive">{formatNumber(item.requests)}</Badge>
               </div>
               <div className="mt-2 grid grid-cols-3 gap-2 text-[11px] text-muted-foreground">
                 <span className="truncate">输入 {formatNumber(item.totalInputTokens)}</span>
@@ -399,7 +452,7 @@ function DimensionRankPanel({
                   <span className="truncate text-sm font-semibold" title={item.label || item.key}>
                     {item.label || item.key}
                   </span>
-                  {item.errorRequests > 0 && <Badge variant="warning">错 {formatNumber(item.errorRequests)}</Badge>}
+                  {item.errorRequests > 0 && <Badge variant="destructive">错 {formatNumber(item.errorRequests)}</Badge>}
                 </div>
                 {item.label && <div className="mt-0.5 truncate pl-7 font-mono text-[11px] text-muted-foreground">{item.key}</div>}
                 <div className="mt-1.5 pl-7">
@@ -442,7 +495,7 @@ function OperationsPanel({
   return (
     <Panel title="运行信号" subtitle="这些指标更适合总览页判断配置和调度是否异常">
       <div className="grid gap-3 md:grid-cols-2">
-        <SignalRow label="计价覆盖" value={formatPercent(pricedRatio)} ratio={pricedRatio} tone={pricedRatio < 1 ? 'warning' : 'success'} />
+        <SignalRow label="计价覆盖" value={formatPercent(pricedRatio)} ratio={pricedRatio} tone={pricedRatio < 1 ? 'error' : 'success'} />
         <SignalRow label="流式占比" value={formatPercent(streamRatio)} ratio={streamRatio} tone="info" />
         <SignalRow label="缓存读取率" value={formatPercent(cacheReadRatio)} ratio={cacheReadRatio} tone="success" />
         <SignalRow
@@ -451,7 +504,7 @@ function OperationsPanel({
           ratio={stickyBoundRequests > 0 ? fallbackFromStickyRequests / stickyBoundRequests : 0}
           tone={fallbackFromStickyRequests > 0 ? 'warning' : 'default'}
         />
-        <SignalRow label="模拟用量" value={formatNumber(simulatedRequests)} tone={simulatedRequests > 0 ? 'warning' : 'default'} />
+        <SignalRow label="模拟用量" value={formatNumber(simulatedRequests)} tone={simulatedRequests > 0 ? 'info' : 'default'} />
         <SignalRow label="上游元数据" value={formatNumber(upstreamMetadataRequests)} tone="info" />
       </div>
     </Panel>
@@ -459,15 +512,23 @@ function OperationsPanel({
 }
 
 function ExternalPoolBillingPanel({ billing }: { billing: UsageExternalPoolBillingSummary }) {
-  const floorRatio = billing.rawCostUsd > 0 ? billing.costFloorDeltaUsd / billing.rawCostUsd : 0
-  const reportedGap = billing.reportedCostUsd - billing.rawCostUsd
-  const hasRisk = billing.costFloorDeltaUsd > 0
+  const shapedCost = billing.shapedCostUsd ?? billing.reportedCostUsd ?? 0
+  const upliftedCost = billing.upliftedCostUsd ?? billing.reportedCostUsd ?? billing.billableCostUsd ?? 0
+  const profit = billing.profitUsd ?? (upliftedCost - (billing.rawCostUsd || 0))
+  const profitRatio = billing.rawCostUsd > 0 ? profit / billing.rawCostUsd : 0
+  const deltaTone = billingDeltaTone(profit)
+  const hasLoss = deltaTone === 'loss'
+  const hasProfit = deltaTone === 'profit'
 
   return (
     <Panel
-      title="备用池成本保护"
-      subtitle="按外部池原始 usage 与整形后 usage 分别计价，最终费用不低于可计算渠道成本"
-      actions={<Badge variant={hasRisk ? 'warning' : 'success'}>{hasRisk ? `补差 ${formatUsd(billing.costFloorDeltaUsd)}` : '无补差'}</Badge>}
+      title="备用池计费拆分"
+      subtitle="原始成本来自外部池原始 usage；最终上报使用整形并放大后的 usage；盈利按放大后计费减原始成本计算"
+      actions={
+        <Badge variant={hasLoss ? 'destructive' : hasProfit ? 'warning' : 'success'}>
+          {hasLoss ? `亏损 ${formatUsd(Math.abs(profit))}` : hasProfit ? `盈利 ${formatUsd(profit)}` : '持平'}
+        </Badge>
+      }
     >
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
         <div className="rounded-md border bg-muted/30 p-3">
@@ -476,29 +537,29 @@ function ExternalPoolBillingPanel({ billing }: { billing: UsageExternalPoolBilli
           <div className="mt-1 text-xs text-muted-foreground">可计价 {formatNumber(billing.pricedRequests)} / 未计价 {formatNumber(billing.unpricedRequests)}</div>
         </div>
         <div className="rounded-md border bg-muted/30 p-3">
-          <div className="text-xs text-muted-foreground">渠道原始成本</div>
+          <div className="text-xs text-muted-foreground">原始成本</div>
           <div className="mt-1 text-lg font-semibold">{formatUsd(billing.rawCostUsd)}</div>
           <div className="mt-1 text-xs text-muted-foreground">按备用池 raw usage 估算</div>
         </div>
         <div className="rounded-md border bg-muted/30 p-3">
-          <div className="text-xs text-muted-foreground">整形展示成本</div>
-          <div className="mt-1 text-lg font-semibold">{formatUsd(billing.reportedCostUsd)}</div>
-          <div className={`mt-1 text-xs ${reportedGap < 0 ? 'text-yellow-600 dark:text-yellow-400' : 'text-muted-foreground'}`}>
-            对比渠道 {reportedGap >= 0 ? '+' : ''}{formatUsd(reportedGap)}
-          </div>
+          <div className="text-xs text-muted-foreground">整形后计费</div>
+          <div className="mt-1 text-lg font-semibold">{formatUsd(shapedCost)}</div>
+          <div className="mt-1 text-xs text-muted-foreground">路径缓存整形后，未放大</div>
         </div>
         <div className="rounded-md border bg-muted/30 p-3">
-          <div className="text-xs text-muted-foreground">最终计费</div>
-          <div className="mt-1 text-lg font-semibold">{formatUsd(billing.billableCostUsd)}</div>
-          <div className="mt-1 text-xs text-muted-foreground">保底触发 {formatNumber(billing.costFloorAppliedRequests)} 次</div>
+          <div className="text-xs text-muted-foreground">整形后放大计费</div>
+          <div className="mt-1 text-lg font-semibold">{formatUsd(upliftedCost)}</div>
+          <div className={`mt-1 text-xs ${billingDeltaTextClass(deltaTone)}`}>
+            盈利 = 放大后 - 原始：{profit >= 0 ? '+' : ''}{formatUsd(profit)}
+          </div>
         </div>
       </div>
       <div className="mt-3">
         <SignalRow
-          label="保底补差占渠道成本"
-          value={`${formatUsd(billing.costFloorDeltaUsd)} · ${formatPercent(floorRatio)}`}
-          ratio={floorRatio}
-          tone={hasRisk ? 'warning' : 'success'}
+          label="盈利占原始成本"
+          value={`${profit >= 0 ? '+' : ''}${formatUsd(profit)} · ${formatPercent(profitRatio)}`}
+          ratio={Math.abs(profitRatio)}
+          tone={hasLoss ? 'error' : 'success'}
         />
       </div>
     </Panel>
@@ -506,7 +567,8 @@ function ExternalPoolBillingPanel({ billing }: { billing: UsageExternalPoolBilli
 }
 
 export function UsageDashboardPanel() {
-  const dashboard = useUsageDashboard(DASHBOARD_TIMEZONE)
+  const autoRefresh = useAutoRefreshPreference(DASHBOARD_AUTO_REFRESH_KEY)
+  const dashboard = useUsageDashboard(DASHBOARD_TIMEZONE, autoRefresh.refetchInterval)
   const [selectedWindowKey, setSelectedWindowKey] = useState('today')
   const [rankDimension, setRankDimension] = useState<RankDimension>('credentials')
   const data = dashboard.data
@@ -544,13 +606,21 @@ export function UsageDashboardPanel() {
 
   return (
     <div className="space-y-4">
-      <DashboardToolbar data={data} selectedWindow={selectedWindow} onWindowChange={setSelectedWindowKey} />
+      <DashboardToolbar
+        data={data}
+        selectedWindow={selectedWindow}
+        onWindowChange={setSelectedWindowKey}
+        autoRefreshEnabled={autoRefresh.enabled}
+        autoRefreshSeconds={autoRefresh.intervalSeconds}
+        onAutoRefreshEnabledChange={autoRefresh.setEnabled}
+        onAutoRefreshSecondsChange={autoRefresh.setIntervalSeconds}
+      />
 
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6">
-        <MetricCard title="请求健康" value={formatNumber(summary.totalRequests)} desc={`成功 ${formatNumber(summary.successRequests)} / 错误 ${formatNumber(summary.errorRequests)}`} icon={<Activity className="h-5 w-5" />} tone={summary.errorRequests > 0 ? 'warning' : 'info'} />
-        <MetricCard title="错误率" value={formatPercent(summary.errorRate)} desc={summary.errorRequests > 0 ? '需要查看异常摘要' : '当前窗口无错误'} icon={summary.errorRequests > 0 ? <ShieldAlert className="h-5 w-5" /> : <CheckCircle2 className="h-5 w-5" />} tone={summary.errorRate > 0 ? 'warning' : 'success'} />
+        <MetricCard title="请求健康" value={formatNumber(summary.totalRequests)} desc={`成功 ${formatNumber(summary.successRequests)} / 错误 ${formatNumber(summary.errorRequests)}`} icon={<Activity className="h-5 w-5" />} tone={summary.errorRequests > 0 ? 'error' : 'info'} />
+        <MetricCard title="错误率" value={formatPercent(summary.errorRate)} desc={summary.errorRequests > 0 ? '需要查看异常摘要' : '当前窗口无错误'} icon={summary.errorRequests > 0 ? <ShieldAlert className="h-5 w-5" /> : <CheckCircle2 className="h-5 w-5" />} tone={summary.errorRate > 0 ? 'error' : 'success'} />
         <MetricCard title="耗时" value={`${Math.round(summary.averageDurationMs)}ms`} desc={`P95 ${formatNumber(summary.p95DurationMs)}ms`} icon={<Clock3 className="h-5 w-5" />} tone={latencyTone} />
-        <MetricCard title="估算费用" value={formatUsd(summary.totalEstimatedCostUsd)} desc={`计价覆盖 ${formatPercent(pricedRatio)}`} icon={<DollarSign className="h-5 w-5" />} tone={pricedRatio < 1 && summary.totalRequests > 0 ? 'warning' : 'info'} />
+        <MetricCard title="估算费用" value={formatUsd(summary.totalEstimatedCostUsd)} desc={`计价覆盖 ${formatPercent(pricedRatio)}`} icon={<DollarSign className="h-5 w-5" />} tone={pricedRatio < 1 && summary.totalRequests > 0 ? 'error' : 'info'} />
         <MetricCard title="Token" value={formatNumber(totalTokens)} desc={`输入 ${formatNumber(summary.totalInputTokens)} / 输出 ${formatNumber(summary.totalOutputTokens)}`} icon={<BarChart3 className="h-5 w-5" />} />
         <MetricCard title="缓存读取" value={formatPercent(summary.cacheReadRatio)} desc={`读取 ${formatNumber(summary.totalCacheReadInputTokens)}`} icon={<Database className="h-5 w-5" />} tone="success" />
       </div>
@@ -587,17 +657,17 @@ export function UsageDashboardPanel() {
           <Gauge className="h-4 w-4" />
           <span>总览保留 Top 维度聚合；单条请求链路和更精确筛选请在“Usage”页查看。</span>
           <LineChart className="h-4 w-4" />
-          <span>页面数据每 {AUTO_REFRESH_SECONDS} 秒自动刷新。</span>
+          <span>{autoRefresh.enabled ? `页面数据每 ${autoRefresh.intervalSeconds} 秒自动刷新。` : '自动刷新已关闭。'}</span>
           {summary.errorRequests > 0 && (
             <>
-              <AlertTriangle className="h-4 w-4 text-yellow-600 dark:text-yellow-400" />
-              <span className="text-yellow-700 dark:text-yellow-400">当前窗口存在错误请求，优先查看异常摘要和用量详情。</span>
+              <AlertTriangle className="h-4 w-4 text-kiro-error" />
+              <span className="text-kiro-error">当前窗口存在错误请求，优先查看异常摘要和用量详情。</span>
             </>
           )}
           {summary.fallbackFromStickyRequests > 0 && (
             <>
-              <Zap className="h-4 w-4 text-yellow-600 dark:text-yellow-400" />
-              <span className="text-yellow-700 dark:text-yellow-400">检测到 Sticky 回退，说明粘度命中的账号不可用或并发不可用。</span>
+              <Zap className="h-4 w-4 text-kiro-warning" />
+              <span className="text-kiro-warning">检测到 Sticky 回退，说明粘度命中的账号不可用或并发不可用。</span>
             </>
           )}
         </div>

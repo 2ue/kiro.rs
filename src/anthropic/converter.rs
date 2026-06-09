@@ -2,7 +2,10 @@
 //!
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use sha2::{Digest, Sha256};
@@ -1399,7 +1402,7 @@ fn extract_text_from_pdf_bytes(bytes: &[u8]) -> Option<String> {
     }
 
     // 优先使用 pdf-extract（支持压缩流、字体编码、布局）
-    match std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(bytes)) {
+    match extract_pdf_text_with_panic_guard(bytes) {
         Ok(Ok(text)) => {
             let trimmed = text.trim();
             if !trimmed.is_empty() {
@@ -1416,6 +1419,49 @@ fn extract_text_from_pdf_bytes(bytes: &[u8]) -> Option<String> {
     }
 
     extract_text_from_pdf_bytes_fallback(bytes)
+}
+
+fn extract_pdf_text_with_panic_guard(
+    bytes: &[u8],
+) -> Result<Result<String, pdf_extract::OutputError>, ()> {
+    let _guard = pdf_extract_panic_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous_hook = std::panic::take_hook();
+    let previous_hook_slot = Arc::new(Mutex::new(Some(previous_hook)));
+    let hook_slot = Arc::clone(&previous_hook_slot);
+    std::panic::set_hook(Box::new(move |info| {
+        if is_pdf_extract_panic(info) {
+            return;
+        }
+        if let Some(hook) = hook_slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            hook(info);
+        }
+    }));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pdf_extract::extract_text_from_mem(bytes)
+    }));
+    let previous_hook = previous_hook_slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+        .unwrap_or_else(|| Box::new(|_| {}));
+    std::panic::set_hook(previous_hook);
+    result.map_err(|_| ())
+}
+
+fn is_pdf_extract_panic(info: &std::panic::PanicHookInfo<'_>) -> bool {
+    info.location()
+        .is_some_and(|location| location.file().contains("pdf-extract"))
+}
+
+fn pdf_extract_panic_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 /// 简易 PDF 文本抽取兜底：仅处理未压缩的 `(...) Tj` / `TJ` 形态。

@@ -8,7 +8,7 @@
 
 1. 本地 prompt-cache tracker：在本进程内模拟 Anthropic prompt cache 的创建和读取，用来生成 `cache_creation_input_tokens`、`cache_read_input_tokens` 等 usage 字段。
 2. 路径级 usage 上报投影：按入口路径把已经计算出的 usage 投影成下游看到的 usage，例如 `/cc` 默认压低 `input_tokens` 并把差值转入 `cache_read_input_tokens`。
-3. 外部备用池 usage 整形：外部池请求和正文默认透传；只有单个外部池设置 `usageProjectionMode=current_path_policy` 时，才会按当前入口路径的 `reportedUsage` 策略改写外部池返回体里的 `usage` 字段，并额外对 cache read / cache creation 做上浮。
+3. 外部备用池 usage 整形：外部池请求和非 usage 正文默认透传；只有单个外部池设置 `usageProjectionMode=current_path_policy` 时，才会忽略外部池自身返回的 cache read / cache creation，按本地凭证同一套 prompt-cache 规则重建 usage，再按当前入口路径的 `reportedUsage` 策略投影，并额外对 cache read / cache creation 做上浮。
 
 最重要的边界：
 
@@ -17,7 +17,7 @@
 - `promptCacheCreationControl` 只限制最终上报的 `cache_creation_input_tokens` 出现频次，不改变 tracker 是否已经创建缓存，也不改变 `cache_read_input_tokens` 的命中计算。
 - 真实上游 metadata 里已经有非零 cache read/write 时，真实 metadata 优先，不用本地模拟覆盖。
 - 真实上游 metadata 存在但 cache read/write 都为 0 时，在 high-cache 模式下可以用本地模拟补足 cache usage。
-- 外部池 `pass_through` 是严格透传 usage；`current_path_policy` 才会改写 usage。
+- 外部池 `pass_through` 是严格透传 usage；`current_path_policy` 才会改写 usage，并且不会信任外部池自身 cache 字段。
 
 ## 代码入口
 
@@ -140,8 +140,8 @@ credential_id + conversation_id + model
   "promptCacheCapJitterMaxTokens": 24000,
   "promptCacheScaleMinInputTokens": 20000,
   "promptCacheCreationControl": {
-    "enabled": false,
-    "scopeMode": "credential_conversation_model",
+    "enabled": true,
+    "scopeMode": "conversation_model",
     "minSuccessfulRequestsBetweenCreation": 3,
     "minCreationIntervalSecs": 60,
     "minCreationDeltaTokens": 12000,
@@ -266,7 +266,7 @@ credential_id + conversation_id + model
 
 ### `promptCacheCreationControl`
 
-默认：关闭。
+默认：开启。
 
 作用：控制本地模拟最终上报的 `cache_creation_input_tokens` 出现频次。它不改变本地 tracker 是否创建缓存，也不改变是否能够产生 cache read。
 
@@ -274,8 +274,8 @@ credential_id + conversation_id + model
 
 | 字段 | 默认 | 作用 |
 | --- | ---: | --- |
-| `enabled` | `false` | 总开关。关闭时保持旧行为。 |
-| `scopeMode` | `credential_conversation_model` | 控制频次状态维度。 |
+| `enabled` | `true` | 总开关。开启时降低连续对话每轮都出现 cache creation 的概率；关闭时保持旧行为。 |
+| `scopeMode` | `conversation_model` | 控制频次状态维度。 |
 | `minSuccessfulRequestsBetweenCreation` | `3` | 同一维度下，两次 creation 上报之间至少间隔多少次成功请求。 |
 | `minCreationIntervalSecs` | `60` | 同一维度下，两次 creation 上报之间至少间隔多少秒。 |
 | `minCreationDeltaTokens` | `12000` | 被抑制的 creation 累计到多少 tokens 后才允许下一次 creation。 |
@@ -286,8 +286,8 @@ credential_id + conversation_id + model
 
 `scopeMode` 可选：
 
-- `credential_conversation_model`：按凭据 + 会话 + 模型控制。最贴近真实账号缓存隔离，默认值。
-- `conversation_model`：按会话 + 模型控制。跨凭据共享 creation 频次状态，适合减少调度换号后的重复 creation 上报。
+- `conversation_model`：按会话 + 模型控制。默认值；跨凭据共享 creation 频次状态，适合减少调度换号后的重复 creation 上报。
+- `credential_conversation_model`：按凭据 + 会话 + 模型控制。最贴近真实账号缓存隔离，但调度换号后可能对同一会话再次上报 creation。
 
 当 creation 被抑制时：
 
@@ -334,7 +334,7 @@ credential_id + conversation_id + model
 
 - 请求固定发到外部池自己的 `/v1/messages`。
 - 原始入口路径只用于决定 usage 投影策略，不用于拼接外部池请求路径。
-- 外部池请求体和响应正文默认透传，不参与本地 prompt-cache tracker。
+- 外部池请求体和非 usage 响应正文默认透传。`pass_through` 不参与本地 prompt-cache tracker；`current_path_policy` 会把外部池看成一个普通凭证账号参与本地 prompt-cache tracker，用于决定何时 creation、何时 read、何时无 cache。
 
 单个外部池字段：
 
@@ -347,7 +347,7 @@ credential_id + conversation_id + model
 可选值：
 
 - `pass_through`：严格透传外部池返回的 `usage`，不改写。
-- `current_path_policy`：只改写响应里的 `usage` 字段；按当前入口路径命中的 `reportedUsage` 策略投影，再对 cache read / cache creation 做上浮。
+- `current_path_policy`：只改写响应里的 `usage` 字段；忽略外部池自身 cache 字段，按本地凭证规则重建 prompt-cache usage，按当前入口路径命中的 `reportedUsage` 策略投影，再对 cache read / cache creation 做上浮。
 
 全局字段：
 
@@ -363,16 +363,17 @@ credential_id + conversation_id + model
 
 当前上浮算法：
 
-1. 对 `cache_read_input_tokens` 使用 `max(projected.cache_read, raw.cache_read)` 作为基础。
-2. 对 `cache_creation_input_tokens` 使用 `max(projected.cache_creation, raw.cache_creation)` 作为基础。
-3. 按 `ceil(base * (100 + percent) / 100)` 上浮。
-4. `input_tokens` 和 `output_tokens` 不因为上浮而增加。
-5. `total_input_tokens` 重算为 `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`。
-6. creation 的 5m/1h breakdown 按 raw 或 projected 的原比例重分配；如果没有原比例，默认放到 5m。
+1. 先按本地凭证规则计算 usage：同一外部池、同一会话、同一解析后模型，首轮通常 creation，成功后 tracker 更新，后续相同/增长前缀可 read；如果模型不支持 prompt cache 或内容低于门槛，则无 cache。
+2. 再按当前入口路径的 `reportedUsage` 投影。例如 `/cc` 默认把上报输入压到约 96 tokens 以内，并把差值转入 cache read；cache creation 采样到约 3000 tokens。
+3. `promptCacheCreationControl` 对外部池同样生效，用来控制 creation 出现频次。该控制基于上浮前的本地规则结果，避免外部池 25% 上浮污染普通凭证频次状态。
+4. 最后对投影后的 `cache_read_input_tokens` 和 `cache_creation_input_tokens` 按 `ceil(base * (100 + percent) / 100)` 上浮。
+5. `input_tokens` 和 `output_tokens` 不因为上浮而增加。
+6. `total_input_tokens` 重算为 `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`。
+7. creation 的 5m/1h breakdown 按投影后原比例重分配；如果没有原比例，默认放到 5m。
 
 成本记录：
 
-- 外部池使用记录会保存 raw usage 和 reported usage。
+- 外部池使用记录会保存 raw usage 和 reported usage。raw usage 是外部池原始返回；reported usage 是返回给下游的最终 usage。
 - raw cost 和 reported cost 都按系统价格表估算。
 - `billable_cost_usd = max(raw_cost_usd, reported_cost_usd)`。
 - 如果投影后成本低于 raw 成本，记录 `cost_floor_applied=true` 和差额。
@@ -393,7 +394,7 @@ credential_id + conversation_id + model
   "promptCacheCapJitterMaxTokens": 24000,
   "promptCacheScaleMinInputTokens": 20000,
   "promptCacheCreationControl": {
-    "enabled": false
+    "enabled": true
   }
 }
 ```
@@ -480,9 +481,9 @@ credential_id + conversation_id + model
 
 ### 为什么换账号后又 creation
 
-默认 cache scope 包含 `credential_id`。调度换凭据后，本地缓存隔离，新的凭据 scope 下没有旧 fingerprint，所以可能 creation。
+本地 prompt-cache tracker 的 cache scope 包含 `credential_id`。调度换凭据后，本地缓存隔离，新的凭据 scope 下没有旧 fingerprint，所以可能 creation。
 
-如果只是想减少“上报 creation 的频率”，不要改 tracker scope，可以开启：
+如果只是想减少“上报 creation 的频率”，不要改 tracker scope，默认使用：
 
 ```json
 {
@@ -493,7 +494,7 @@ credential_id + conversation_id + model
 }
 ```
 
-它只控制最终上报频次，不改变实际本地 cache read 计算。
+它只控制最终上报频次，不改变实际本地 cache read 计算。若明确希望按真实账号缓存隔离上报 creation，可把 `scopeMode` 改为 `credential_conversation_model`。
 
 ### 为什么有真实上游 metadata 时本地配置好像没生效
 
@@ -521,7 +522,7 @@ total_input_tokens = input_tokens + cache_read_input_tokens + cache_creation_inp
 
 1. 本地 prompt cache tracker 是进程内状态。服务重启会清空；多实例负载均衡下，不同实例之间不会共享 fingerprint。
 2. creation 频次控制器也是进程内状态。重启或多实例切换会导致频次状态重置。
-3. 默认 tracker scope 包含 credential id；本地凭据调度换号会降低 cache read 连续性，但这更接近真实账号隔离。
+3. prompt-cache tracker scope 仍包含 credential id；本地凭据调度换号会降低真实 cache read 连续性。creation 频次控制默认按 `conversation_model` 跨凭据共享，只影响上报 creation 频次。
 4. `promptCacheCreationControl` 只隐藏/限制 creation 上报，不会让没有 read 的请求凭空 read。
 5. 外部池 `current_path_policy` 只改写 usage 字段，不改正文、tool、message id、stop reason 等内容。
 6. 外部池成本保底依赖价格目录；没有价格时无法可靠比较 raw/reported 成本。

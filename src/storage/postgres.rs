@@ -2231,6 +2231,9 @@ impl PostgresUsageStore {
                 COALESCE(t.external_pool_unpriced_requests, 0)::bigint AS external_pool_unpriced_requests,
                 COALESCE(t.external_pool_cost_floor_applied_requests, 0)::bigint AS external_pool_cost_floor_applied_requests,
                 COALESCE(t.external_pool_raw_cost_usd, 0)::double precision AS external_pool_raw_cost_usd,
+                COALESCE(t.external_pool_shaped_cost_usd, 0)::double precision AS external_pool_shaped_cost_usd,
+                COALESCE(t.external_pool_uplifted_cost_usd, 0)::double precision AS external_pool_uplifted_cost_usd,
+                COALESCE(t.external_pool_profit_usd, 0)::double precision AS external_pool_profit_usd,
                 COALESCE(t.external_pool_reported_cost_usd, 0)::double precision AS external_pool_reported_cost_usd,
                 COALESCE(t.external_pool_billable_cost_usd, 0)::double precision AS external_pool_billable_cost_usd,
                 COALESCE(t.external_pool_cost_floor_delta_usd, 0)::double precision AS external_pool_cost_floor_delta_usd,
@@ -2256,8 +2259,10 @@ impl PostgresUsageStore {
                      t.external_pool_requests, t.external_pool_priced_requests,
                      t.external_pool_unpriced_requests,
                      t.external_pool_cost_floor_applied_requests,
-                     t.external_pool_raw_cost_usd, t.external_pool_reported_cost_usd,
-                     t.external_pool_billable_cost_usd, t.external_pool_cost_floor_delta_usd
+                     t.external_pool_raw_cost_usd, t.external_pool_shaped_cost_usd,
+                     t.external_pool_uplifted_cost_usd, t.external_pool_profit_usd,
+                     t.external_pool_reported_cost_usd, t.external_pool_billable_cost_usd,
+                     t.external_pool_cost_floor_delta_usd
             "#,
         )
         .bind(high_cache_threshold)
@@ -2293,6 +2298,9 @@ impl PostgresUsageStore {
                     "external_pool_cost_floor_applied_requests",
                 )?,
                 raw_cost_usd: row.try_get("external_pool_raw_cost_usd")?,
+                shaped_cost_usd: row.try_get("external_pool_shaped_cost_usd")?,
+                uplifted_cost_usd: row.try_get("external_pool_uplifted_cost_usd")?,
+                profit_usd: row.try_get("external_pool_profit_usd")?,
                 reported_cost_usd: row.try_get("external_pool_reported_cost_usd")?,
                 billable_cost_usd: row.try_get("external_pool_billable_cost_usd")?,
                 cost_floor_delta_usd: row.try_get("external_pool_cost_floor_delta_usd")?,
@@ -2466,6 +2474,9 @@ impl PostgresUsageStore {
                 COALESCE(SUM(b.external_pool_unpriced_requests), 0)::bigint AS external_pool_unpriced_requests,
                 COALESCE(SUM(b.external_pool_cost_floor_applied_requests), 0)::bigint AS external_pool_cost_floor_applied_requests,
                 COALESCE(SUM(b.external_pool_raw_cost_usd), 0)::double precision AS external_pool_raw_cost_usd,
+                COALESCE(SUM(b.external_pool_shaped_cost_usd), 0)::double precision AS external_pool_shaped_cost_usd,
+                COALESCE(SUM(b.external_pool_uplifted_cost_usd), 0)::double precision AS external_pool_uplifted_cost_usd,
+                COALESCE(SUM(b.external_pool_profit_usd), 0)::double precision AS external_pool_profit_usd,
                 COALESCE(SUM(b.external_pool_reported_cost_usd), 0)::double precision AS external_pool_reported_cost_usd,
                 COALESCE(SUM(b.external_pool_billable_cost_usd), 0)::double precision AS external_pool_billable_cost_usd,
                 COALESCE(SUM(b.external_pool_cost_floor_delta_usd), 0)::double precision AS external_pool_cost_floor_delta_usd
@@ -2793,6 +2804,9 @@ struct UsageRollupMetrics {
     external_pool_unpriced_requests: i64,
     external_pool_cost_floor_applied_requests: i64,
     external_pool_raw_cost_usd: f64,
+    external_pool_shaped_cost_usd: f64,
+    external_pool_uplifted_cost_usd: f64,
+    external_pool_profit_usd: f64,
     external_pool_reported_cost_usd: f64,
     external_pool_billable_cost_usd: f64,
     external_pool_cost_floor_delta_usd: f64,
@@ -2854,6 +2868,15 @@ impl UsageRollupMetrics {
             ),
             external_pool_raw_cost_usd: external_billing
                 .map(|billing| billing.raw_cost_usd * sign as f64)
+                .unwrap_or(0.0),
+            external_pool_shaped_cost_usd: external_billing
+                .map(|billing| billing.effective_shaped_cost_usd() * sign as f64)
+                .unwrap_or(0.0),
+            external_pool_uplifted_cost_usd: external_billing
+                .map(|billing| billing.effective_uplifted_cost_usd() * sign as f64)
+                .unwrap_or(0.0),
+            external_pool_profit_usd: external_billing
+                .map(|billing| billing.effective_profit_usd() * sign as f64)
                 .unwrap_or(0.0),
             external_pool_reported_cost_usd: external_billing
                 .map(|billing| billing.reported_cost_usd * sign as f64)
@@ -3039,8 +3062,10 @@ async fn upsert_usage_rollup_total(
             local_prompt_cache_creation_input_tokens, total_estimated_cost_usd,
             external_pool_requests, external_pool_priced_requests,
             external_pool_unpriced_requests, external_pool_cost_floor_applied_requests,
-            external_pool_raw_cost_usd, external_pool_reported_cost_usd,
-            external_pool_billable_cost_usd, external_pool_cost_floor_delta_usd,
+            external_pool_raw_cost_usd, external_pool_shaped_cost_usd,
+            external_pool_uplifted_cost_usd, external_pool_profit_usd,
+            external_pool_reported_cost_usd, external_pool_billable_cost_usd,
+            external_pool_cost_floor_delta_usd,
             duration_ms_sum, duration_ms_count, duration_ms_max, updated_at
         )
         VALUES (
@@ -3048,7 +3073,7 @@ async fn upsert_usage_rollup_total(
             $11, $12, $13, $14, $15, $16, $17, $18,
             $19, $20, $21, $22, $23, $24, $25, $26,
             $27, $28, $29, $30, $31, $32, $33, $34,
-            $35, now()
+            $35, $36, $37, $38, now()
         )
         ON CONFLICT (dimension, dimension_key) DO UPDATE
         SET dimension_label = COALESCE(EXCLUDED.dimension_label, usage_rollup_totals.dimension_label),
@@ -3078,6 +3103,9 @@ async fn upsert_usage_rollup_total(
             external_pool_unpriced_requests = usage_rollup_totals.external_pool_unpriced_requests + EXCLUDED.external_pool_unpriced_requests,
             external_pool_cost_floor_applied_requests = usage_rollup_totals.external_pool_cost_floor_applied_requests + EXCLUDED.external_pool_cost_floor_applied_requests,
             external_pool_raw_cost_usd = usage_rollup_totals.external_pool_raw_cost_usd + EXCLUDED.external_pool_raw_cost_usd,
+            external_pool_shaped_cost_usd = usage_rollup_totals.external_pool_shaped_cost_usd + EXCLUDED.external_pool_shaped_cost_usd,
+            external_pool_uplifted_cost_usd = usage_rollup_totals.external_pool_uplifted_cost_usd + EXCLUDED.external_pool_uplifted_cost_usd,
+            external_pool_profit_usd = usage_rollup_totals.external_pool_profit_usd + EXCLUDED.external_pool_profit_usd,
             external_pool_reported_cost_usd = usage_rollup_totals.external_pool_reported_cost_usd + EXCLUDED.external_pool_reported_cost_usd,
             external_pool_billable_cost_usd = usage_rollup_totals.external_pool_billable_cost_usd + EXCLUDED.external_pool_billable_cost_usd,
             external_pool_cost_floor_delta_usd = usage_rollup_totals.external_pool_cost_floor_delta_usd + EXCLUDED.external_pool_cost_floor_delta_usd,
@@ -3116,6 +3144,9 @@ async fn upsert_usage_rollup_total(
     .bind(metrics.external_pool_unpriced_requests)
     .bind(metrics.external_pool_cost_floor_applied_requests)
     .bind(metrics.external_pool_raw_cost_usd)
+    .bind(metrics.external_pool_shaped_cost_usd)
+    .bind(metrics.external_pool_uplifted_cost_usd)
+    .bind(metrics.external_pool_profit_usd)
     .bind(metrics.external_pool_reported_cost_usd)
     .bind(metrics.external_pool_billable_cost_usd)
     .bind(metrics.external_pool_cost_floor_delta_usd)
@@ -3147,8 +3178,10 @@ async fn upsert_usage_rollup_time_bucket(
             total_estimated_cost_usd, external_pool_requests,
             external_pool_priced_requests, external_pool_unpriced_requests,
             external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
-            external_pool_reported_cost_usd, external_pool_billable_cost_usd,
-            external_pool_cost_floor_delta_usd, duration_ms_sum, duration_ms_count,
+            external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
+            external_pool_profit_usd, external_pool_reported_cost_usd,
+            external_pool_billable_cost_usd, external_pool_cost_floor_delta_usd,
+            duration_ms_sum, duration_ms_count,
             duration_ms_max, updated_at
         )
         VALUES (
@@ -3156,7 +3189,7 @@ async fn upsert_usage_rollup_time_bucket(
             $11, $12, $13, $14, $15, $16, $17, $18,
             $19, $20, $21, $22, $23, $24, $25, $26,
             $27, $28, $29, $30, $31, $32, $33, $34,
-            $35, $36, now()
+            $35, $36, $37, $38, $39, now()
         )
         ON CONFLICT (bucket_start, dimension, dimension_key) DO UPDATE
         SET dimension_label = COALESCE(EXCLUDED.dimension_label, usage_rollup_time_buckets.dimension_label),
@@ -3186,6 +3219,9 @@ async fn upsert_usage_rollup_time_bucket(
             external_pool_unpriced_requests = usage_rollup_time_buckets.external_pool_unpriced_requests + EXCLUDED.external_pool_unpriced_requests,
             external_pool_cost_floor_applied_requests = usage_rollup_time_buckets.external_pool_cost_floor_applied_requests + EXCLUDED.external_pool_cost_floor_applied_requests,
             external_pool_raw_cost_usd = usage_rollup_time_buckets.external_pool_raw_cost_usd + EXCLUDED.external_pool_raw_cost_usd,
+            external_pool_shaped_cost_usd = usage_rollup_time_buckets.external_pool_shaped_cost_usd + EXCLUDED.external_pool_shaped_cost_usd,
+            external_pool_uplifted_cost_usd = usage_rollup_time_buckets.external_pool_uplifted_cost_usd + EXCLUDED.external_pool_uplifted_cost_usd,
+            external_pool_profit_usd = usage_rollup_time_buckets.external_pool_profit_usd + EXCLUDED.external_pool_profit_usd,
             external_pool_reported_cost_usd = usage_rollup_time_buckets.external_pool_reported_cost_usd + EXCLUDED.external_pool_reported_cost_usd,
             external_pool_billable_cost_usd = usage_rollup_time_buckets.external_pool_billable_cost_usd + EXCLUDED.external_pool_billable_cost_usd,
             external_pool_cost_floor_delta_usd = usage_rollup_time_buckets.external_pool_cost_floor_delta_usd + EXCLUDED.external_pool_cost_floor_delta_usd,
@@ -3225,6 +3261,9 @@ async fn upsert_usage_rollup_time_bucket(
     .bind(metrics.external_pool_unpriced_requests)
     .bind(metrics.external_pool_cost_floor_applied_requests)
     .bind(metrics.external_pool_raw_cost_usd)
+    .bind(metrics.external_pool_shaped_cost_usd)
+    .bind(metrics.external_pool_uplifted_cost_usd)
+    .bind(metrics.external_pool_profit_usd)
     .bind(metrics.external_pool_reported_cost_usd)
     .bind(metrics.external_pool_billable_cost_usd)
     .bind(metrics.external_pool_cost_floor_delta_usd)
@@ -3443,6 +3482,8 @@ fn push_usage_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &UsageRec
             "error_detail",
             "pricing_model",
             "credential_id::text",
+            "data->>'externalPoolId'",
+            "data->>'externalPoolName'",
             "estimated_cost_usd::text",
             "data::text",
         ];
@@ -3462,6 +3503,10 @@ fn push_usage_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &UsageRec
     if let Some(credential_id) = query.credential_id {
         builder.push(" AND credential_id = ");
         builder.push_bind(credential_id as i64);
+    }
+    if let Some(external_pool_id) = query.external_pool_id {
+        builder.push(" AND data->>'externalPoolId' = ");
+        builder.push_bind(external_pool_id.to_string());
     }
     if let Some(model) = &query.model {
         builder.push(" AND model = ");
@@ -3573,6 +3618,9 @@ fn dashboard_window_from_row(row: PgRow) -> anyhow::Result<UsageDashboardWindow>
                     "external_pool_cost_floor_applied_requests",
                 )?,
                 raw_cost_usd: row.try_get("external_pool_raw_cost_usd")?,
+                shaped_cost_usd: row.try_get("external_pool_shaped_cost_usd")?,
+                uplifted_cost_usd: row.try_get("external_pool_uplifted_cost_usd")?,
+                profit_usd: row.try_get("external_pool_profit_usd")?,
                 reported_cost_usd: row.try_get("external_pool_reported_cost_usd")?,
                 billable_cost_usd: row.try_get("external_pool_billable_cost_usd")?,
                 cost_floor_delta_usd: row.try_get("external_pool_cost_floor_delta_usd")?,
@@ -4111,6 +4159,9 @@ CREATE TABLE IF NOT EXISTS usage_rollup_totals (
     external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
     external_pool_cost_floor_applied_requests BIGINT NOT NULL DEFAULT 0,
     external_pool_raw_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    external_pool_shaped_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    external_pool_uplifted_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    external_pool_profit_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     external_pool_reported_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     external_pool_billable_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     external_pool_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
@@ -4130,6 +4181,9 @@ ALTER TABLE usage_rollup_totals
     ADD COLUMN IF NOT EXISTS external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_cost_floor_applied_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_raw_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS external_pool_shaped_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS external_pool_uplifted_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS external_pool_profit_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_reported_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_billable_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0;
@@ -4165,6 +4219,9 @@ CREATE TABLE IF NOT EXISTS usage_rollup_time_buckets (
     external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
     external_pool_cost_floor_applied_requests BIGINT NOT NULL DEFAULT 0,
     external_pool_raw_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    external_pool_shaped_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    external_pool_uplifted_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    external_pool_profit_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     external_pool_reported_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     external_pool_billable_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     external_pool_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
@@ -4187,9 +4244,32 @@ ALTER TABLE usage_rollup_time_buckets
     ADD COLUMN IF NOT EXISTS external_pool_unpriced_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_cost_floor_applied_requests BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_raw_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS external_pool_shaped_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS external_pool_uplifted_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS external_pool_profit_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_reported_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_billable_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS external_pool_cost_floor_delta_usd DOUBLE PRECISION NOT NULL DEFAULT 0;
+
+UPDATE usage_rollup_totals
+SET external_pool_shaped_cost_usd = external_pool_reported_cost_usd,
+    external_pool_uplifted_cost_usd = external_pool_reported_cost_usd,
+    external_pool_profit_usd = external_pool_reported_cost_usd - external_pool_raw_cost_usd
+WHERE external_pool_requests > 0
+  AND external_pool_reported_cost_usd <> 0
+  AND external_pool_shaped_cost_usd = 0
+  AND external_pool_uplifted_cost_usd = 0
+  AND external_pool_profit_usd = 0;
+
+UPDATE usage_rollup_time_buckets
+SET external_pool_shaped_cost_usd = external_pool_reported_cost_usd,
+    external_pool_uplifted_cost_usd = external_pool_reported_cost_usd,
+    external_pool_profit_usd = external_pool_reported_cost_usd - external_pool_raw_cost_usd
+WHERE external_pool_requests > 0
+  AND external_pool_reported_cost_usd <> 0
+  AND external_pool_shaped_cost_usd = 0
+  AND external_pool_uplifted_cost_usd = 0
+  AND external_pool_profit_usd = 0;
 
 CREATE TABLE IF NOT EXISTS usage_cache_read_totals (
     cache_read_input_tokens INTEGER NOT NULL PRIMARY KEY,
@@ -4241,8 +4321,10 @@ INSERT INTO usage_rollup_totals (
     local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
     total_estimated_cost_usd, external_pool_requests, external_pool_priced_requests,
     external_pool_unpriced_requests, external_pool_cost_floor_applied_requests,
-    external_pool_raw_cost_usd, external_pool_reported_cost_usd,
-    external_pool_billable_cost_usd, external_pool_cost_floor_delta_usd,
+    external_pool_raw_cost_usd, external_pool_shaped_cost_usd,
+    external_pool_uplifted_cost_usd, external_pool_profit_usd,
+    external_pool_reported_cost_usd, external_pool_billable_cost_usd,
+    external_pool_cost_floor_delta_usd,
     duration_ms_sum, duration_ms_count, duration_ms_max
 )
 SELECT
@@ -4284,6 +4366,24 @@ SELECT
           AND r.data #>> '{externalPoolBilling,costFloorApplied}' = 'true'
     )::bigint,
     COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,rawCostUsd}', '')::double precision), 0)::double precision,
+    COALESCE(SUM(COALESCE(
+        NULLIF(r.data #>> '{externalPoolBilling,shapedCostUsd}', '')::double precision,
+        NULLIF(r.data #>> '{externalPoolBilling,reportedCostUsd}', '')::double precision,
+        0
+    )), 0)::double precision,
+    COALESCE(SUM(COALESCE(
+        NULLIF(r.data #>> '{externalPoolBilling,upliftedCostUsd}', '')::double precision,
+        NULLIF(r.data #>> '{externalPoolBilling,reportedCostUsd}', '')::double precision,
+        0
+    )), 0)::double precision,
+    COALESCE(SUM(COALESCE(
+        NULLIF(r.data #>> '{externalPoolBilling,profitUsd}', '')::double precision,
+        COALESCE(
+            NULLIF(r.data #>> '{externalPoolBilling,upliftedCostUsd}', '')::double precision,
+            NULLIF(r.data #>> '{externalPoolBilling,reportedCostUsd}', '')::double precision,
+            0
+        ) - COALESCE(NULLIF(r.data #>> '{externalPoolBilling,rawCostUsd}', '')::double precision, 0)
+    )), 0)::double precision,
     COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,reportedCostUsd}', '')::double precision), 0)::double precision,
     COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,billableCostUsd}', '')::double precision), 0)::double precision,
     COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,costFloorDeltaUsd}', '')::double precision), 0)::double precision,
@@ -4322,8 +4422,10 @@ INSERT INTO usage_rollup_time_buckets (
     local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
     total_estimated_cost_usd, external_pool_requests, external_pool_priced_requests,
     external_pool_unpriced_requests, external_pool_cost_floor_applied_requests,
-    external_pool_raw_cost_usd, external_pool_reported_cost_usd,
-    external_pool_billable_cost_usd, external_pool_cost_floor_delta_usd,
+    external_pool_raw_cost_usd, external_pool_shaped_cost_usd,
+    external_pool_uplifted_cost_usd, external_pool_profit_usd,
+    external_pool_reported_cost_usd, external_pool_billable_cost_usd,
+    external_pool_cost_floor_delta_usd,
     duration_ms_sum, duration_ms_count, duration_ms_max
 )
 SELECT
@@ -4366,6 +4468,24 @@ SELECT
           AND r.data #>> '{externalPoolBilling,costFloorApplied}' = 'true'
     )::bigint,
     COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,rawCostUsd}', '')::double precision), 0)::double precision,
+    COALESCE(SUM(COALESCE(
+        NULLIF(r.data #>> '{externalPoolBilling,shapedCostUsd}', '')::double precision,
+        NULLIF(r.data #>> '{externalPoolBilling,reportedCostUsd}', '')::double precision,
+        0
+    )), 0)::double precision,
+    COALESCE(SUM(COALESCE(
+        NULLIF(r.data #>> '{externalPoolBilling,upliftedCostUsd}', '')::double precision,
+        NULLIF(r.data #>> '{externalPoolBilling,reportedCostUsd}', '')::double precision,
+        0
+    )), 0)::double precision,
+    COALESCE(SUM(COALESCE(
+        NULLIF(r.data #>> '{externalPoolBilling,profitUsd}', '')::double precision,
+        COALESCE(
+            NULLIF(r.data #>> '{externalPoolBilling,upliftedCostUsd}', '')::double precision,
+            NULLIF(r.data #>> '{externalPoolBilling,reportedCostUsd}', '')::double precision,
+            0
+        ) - COALESCE(NULLIF(r.data #>> '{externalPoolBilling,rawCostUsd}', '')::double precision, 0)
+    )), 0)::double precision,
     COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,reportedCostUsd}', '')::double precision), 0)::double precision,
     COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,billableCostUsd}', '')::double precision), 0)::double precision,
     COALESCE(SUM(NULLIF(r.data #>> '{externalPoolBilling,costFloorDeltaUsd}', '')::double precision), 0)::double precision,
@@ -4624,17 +4744,21 @@ mod tests {
     fn external_usage_record(
         id: &str,
         raw_cost_usd: f64,
-        reported_cost_usd: f64,
-        floor_applied: bool,
+        shaped_cost_usd: f64,
+        uplifted_cost_usd: f64,
     ) -> UsageRecord {
         let raw_usage = external_usage_snapshot(10_000, 100, 0, 2_000);
-        let reported_usage = if floor_applied {
+        let shaped_usage = if shaped_cost_usd < raw_cost_usd {
             external_usage_snapshot(200, 100, 9_800, 2_000)
         } else {
             external_usage_snapshot(12_000, 100, 0, 0)
         };
-        let billable_cost_usd = raw_cost_usd.max(reported_cost_usd);
-        let cost_floor_delta_usd = (billable_cost_usd - reported_cost_usd).max(0.0);
+        let reported_usage = if uplifted_cost_usd >= shaped_cost_usd {
+            external_usage_snapshot(250, 100, 12_250, 2_000)
+        } else {
+            shaped_usage
+        };
+        let profit_usd = uplifted_cost_usd - raw_cost_usd;
         UsageRecord {
             id: id.to_string(),
             created_at: Utc::now().to_rfc3339(),
@@ -4657,7 +4781,7 @@ mod tests {
             cache_creation_input_tokens: reported_usage.cache_creation_input_tokens,
             cache_creation_5m_input_tokens: reported_usage.cache_creation_5m_input_tokens,
             cache_creation_1h_input_tokens: reported_usage.cache_creation_1h_input_tokens,
-            estimated_cost_usd: billable_cost_usd,
+            estimated_cost_usd: uplifted_cost_usd,
             pricing_available: true,
             pricing_model: Some("claude-sonnet-4-5".to_string()),
             duration_ms: 50,
@@ -4676,12 +4800,17 @@ mod tests {
             usage_projection_applied: Some(true),
             external_pool_billing: Some(ExternalPoolBilling {
                 raw_usage,
+                shaped_usage,
                 reported_usage,
+                usage_projection_applied: true,
                 raw_cost_usd,
-                reported_cost_usd,
-                billable_cost_usd,
-                cost_floor_delta_usd,
-                cost_floor_applied: floor_applied,
+                shaped_cost_usd,
+                uplifted_cost_usd,
+                profit_usd,
+                reported_cost_usd: uplifted_cost_usd,
+                billable_cost_usd: uplifted_cost_usd,
+                cost_floor_delta_usd: (raw_cost_usd - uplifted_cost_usd).max(0.0),
+                cost_floor_applied: uplifted_cost_usd < raw_cost_usd,
                 pricing_available: true,
                 pricing_model: Some("claude-sonnet-4-5".to_string()),
                 usage_projection_mode: "current_path_policy".to_string(),
@@ -5209,18 +5338,17 @@ mod tests {
         let usage_store = PostgresUsageStore::new(Arc::new(store.clone()));
 
         for index in 0..1000 {
-            let floor_applied = index % 2 == 0;
-            let (raw_cost, reported_cost) = if floor_applied {
-                (0.010, 0.006)
+            let (raw_cost, shaped_cost, uplifted_cost) = if index % 2 == 0 {
+                (0.010, 0.006, 0.008)
             } else {
-                (0.005, 0.007)
+                (0.005, 0.007, 0.009)
             };
             usage_store
                 .record(external_usage_record(
                     &format!("external-usage-{index:04}"),
                     raw_cost,
-                    reported_cost,
-                    floor_applied,
+                    shaped_cost,
+                    uplifted_cost,
                 ))
                 .await
                 .unwrap();
@@ -5235,9 +5363,12 @@ mod tests {
             500
         );
         assert!((summary.external_pool_billing.raw_cost_usd - 7.5).abs() < 0.000001);
-        assert!((summary.external_pool_billing.reported_cost_usd - 6.5).abs() < 0.000001);
+        assert!((summary.external_pool_billing.shaped_cost_usd - 6.5).abs() < 0.000001);
+        assert!((summary.external_pool_billing.uplifted_cost_usd - 8.5).abs() < 0.000001);
+        assert!((summary.external_pool_billing.profit_usd - 1.0).abs() < 0.000001);
+        assert!((summary.external_pool_billing.reported_cost_usd - 8.5).abs() < 0.000001);
         assert!((summary.external_pool_billing.billable_cost_usd - 8.5).abs() < 0.000001);
-        assert!((summary.external_pool_billing.cost_floor_delta_usd - 2.0).abs() < 0.000001);
+        assert!((summary.external_pool_billing.cost_floor_delta_usd - 1.0).abs() < 0.000001);
         assert!((summary.total_estimated_cost_usd - 8.5).abs() < 0.000001);
 
         let dashboard = usage_store
@@ -5258,6 +5389,7 @@ mod tests {
             500
         );
         assert!((today.summary.external_pool_billing.billable_cost_usd - 8.5).abs() < 0.000001);
+        assert!((today.summary.external_pool_billing.profit_usd - 1.0).abs() < 0.000001);
 
         usage_store.clear().await.unwrap();
         let cleared_page = usage_store
@@ -5270,6 +5402,7 @@ mod tests {
         let cleared_summary = usage_store.summary(1_000).await.unwrap();
         assert_eq!(cleared_summary.external_pool_billing.requests, 1000);
         assert!((cleared_summary.external_pool_billing.billable_cost_usd - 8.5).abs() < 0.000001);
+        assert!((cleared_summary.external_pool_billing.profit_usd - 1.0).abs() < 0.000001);
 
         store.drop_test_schema().await.unwrap();
     }

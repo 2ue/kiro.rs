@@ -1,6 +1,43 @@
 export type TabKey = 'dashboard' | 'credentials' | 'validation' | 'proxies' | 'external' | 'usage' | 'pricing' | 'audit' | 'config'
 
-export type ThemeMode = 'kiroLight' | 'kiroDark' | 'kiroOcean' | 'kiroForest' | 'kiroPurple' | 'kiroSunset'
+export type ThemeMode = 'kiroOfficial' | 'kiroLavender' | 'kiroFocus'
+
+export const DEFAULT_THEME: ThemeMode = 'kiroOfficial'
+
+export const themeOptions: Array<{
+  key: ThemeMode
+  label: string
+  description: string
+  swatch: string
+}> = [
+  {
+    key: 'kiroOfficial',
+    label: '官方紫',
+    description: 'Kiro 官方紫，默认品牌主题',
+    swatch: '#9046FF',
+  },
+  {
+    key: 'kiroLavender',
+    label: '柔和紫',
+    description: '低饱和紫调，适合长时间查看',
+    swatch: '#7C3AED',
+  },
+  {
+    key: 'kiroFocus',
+    label: '深紫',
+    description: '更强对比的紫色强调',
+    swatch: '#6D28D9',
+  },
+]
+
+export function isThemeMode(value: string | null | undefined): value is ThemeMode {
+  return value === 'kiroOfficial' || value === 'kiroLavender' || value === 'kiroFocus'
+}
+
+export function getStoredTheme(): ThemeMode {
+  const stored = localStorage.getItem('kiro-theme')
+  return isThemeMode(stored) ? stored : DEFAULT_THEME
+}
 
 export const pageConfig: Record<TabKey, { title: string; subtitle: string }> = {
   dashboard: { title: '总览', subtitle: '查看请求聚合、趋势、错误率和 Top 维度统计' },

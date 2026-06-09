@@ -46,6 +46,7 @@ function invalidateCredentialCaches(queryClient: ReturnType<typeof useQueryClien
 
 interface UseCredentialsOptions {
   enabled?: boolean
+  refetchInterval?: number | false
 }
 
 // 查询凭据列表
@@ -54,7 +55,7 @@ export function useCredentials(options: UseCredentialsOptions = {}) {
     queryKey: ['credentials'],
     queryFn: getCredentials,
     enabled: options.enabled ?? true,
-    refetchInterval: 30000, // 每 30 秒刷新一次
+    refetchInterval: options.refetchInterval ?? 30000, // 每 30 秒刷新一次
   })
 }
 

@@ -105,8 +105,8 @@ const defaultPayloadShaping = (): PayloadShapingConfig => ({
 })
 
 const defaultPromptCacheCreationControl = (): PromptCacheCreationControlConfig => ({
-  enabled: false,
-  scopeMode: 'credential_conversation_model',
+  enabled: true,
+  scopeMode: 'conversation_model',
   minSuccessfulRequestsBetweenCreation: 3,
   minCreationIntervalSecs: 60,
   minCreationDeltaTokens: 12000,
@@ -1179,9 +1179,9 @@ function normalizePromptCacheCreationControl(
     ...defaultPromptCacheCreationControl(),
     ...config,
     scopeMode:
-      config.scopeMode === 'conversation_model'
-        ? 'conversation_model'
-        : 'credential_conversation_model',
+      config.scopeMode === 'credential_conversation_model'
+        ? 'credential_conversation_model'
+        : 'conversation_model',
     minSuccessfulRequestsBetweenCreation: toWhole(config.minSuccessfulRequestsBetweenCreation),
     minCreationIntervalSecs: toWhole(config.minCreationIntervalSecs),
     minCreationDeltaTokens: toWhole(config.minCreationDeltaTokens),
@@ -1939,7 +1939,7 @@ export function RuntimeConfigPanel() {
               <div className="mb-3">
                 <div className="text-sm font-medium">控制维度</div>
                 <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                  凭据 + 会话 + 模型最贴近真实账号缓存隔离；会话 + 模型会跨凭据共享频次状态，适合减少调度换号后的重复 creation 上报。
+                  会话 + 模型会跨凭据共享频次状态，默认更适合减少调度换号后的重复 creation 上报；凭据 + 会话 + 模型更贴近真实账号缓存隔离。
                 </div>
               </div>
               <select

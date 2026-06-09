@@ -42,30 +42,27 @@ export function LoginPage({ initialError = '', onLogin }: { initialError?: strin
   }
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-base-200 via-base-100 to-base-200">
+    <main className="min-h-screen bg-base-200">
       <div className="mx-auto flex min-h-screen w-full max-w-5xl items-center justify-center px-4 py-8">
-        <Card className="grid w-full overflow-hidden border border-base-300/50 bg-base-100 shadow-2xl lg:grid-cols-[1fr_400px]">
+        <Card className="grid w-full overflow-hidden border border-base-300/70 bg-base-100 shadow-xl lg:grid-cols-[1fr_400px]">
           {/* Left Panel - Branding */}
-          <section className="relative hidden overflow-hidden bg-gradient-to-br from-primary via-primary/90 to-secondary p-8 text-primary-content lg:block">
-            <div className="absolute -right-20 -top-20 h-64 w-64 rounded-full bg-white/5" />
-            <div className="absolute -bottom-32 -left-32 h-96 w-96 rounded-full bg-white/5" />
-
-            <div className="relative flex h-full flex-col justify-between">
+          <section className="hidden border-r border-base-300 bg-base-200/50 p-8 lg:block">
+            <div className="flex h-full flex-col justify-between">
               <div>
                 <div className="flex items-center gap-3">
-                  <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-white/10 backdrop-blur">
+                  <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-primary text-primary-content shadow-sm">
                     <Command className="h-5 w-5" />
                   </div>
                   <span className="text-xl font-bold tracking-tight">Kiro Admin</span>
                 </div>
 
-                <h1 className="mt-12 text-3xl font-bold leading-tight">
+                <h1 className="mt-12 text-3xl font-bold leading-tight text-base-content">
                   凭据、缓存、计费
                   <br />
-                  <span className="text-white/80">统一管理后台</span>
+                  <span className="text-base-content/65">统一管理后台</span>
                 </h1>
 
-                <p className="mt-4 max-w-sm text-sm leading-relaxed text-white/70">
+                <p className="mt-4 max-w-sm text-sm leading-relaxed text-base-content/55">
                   新版控制台采用现代化设计，提供更直观的凭据管理、实时监控和配置能力。
                 </p>
               </div>
@@ -74,12 +71,12 @@ export function LoginPage({ initialError = '', onLogin }: { initialError?: strin
                 {features.map((feature) => (
                   <div
                     key={feature.title}
-                    className="flex items-center gap-3 rounded-xl bg-white/10 p-3 backdrop-blur"
+                    className="flex items-center gap-3 rounded-xl border border-base-300 bg-base-100 p-3 shadow-sm"
                   >
-                    <Sparkles className="h-4 w-4 shrink-0" />
+                    <Sparkles className="h-4 w-4 shrink-0 text-primary" />
                     <div>
                       <div className="text-sm font-semibold">{feature.title}</div>
-                      <div className="text-xs text-white/60">{feature.desc}</div>
+                      <div className="text-xs text-base-content/50">{feature.desc}</div>
                     </div>
                   </div>
                 ))}
@@ -91,7 +88,7 @@ export function LoginPage({ initialError = '', onLogin }: { initialError?: strin
           <section className="p-6 sm:p-8">
             {/* Mobile Logo */}
             <div className="mb-8 flex items-center gap-3 lg:hidden">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-primary to-secondary text-primary-content">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-primary text-primary-content">
                 <Command className="h-5 w-5" />
               </div>
               <span className="text-xl font-bold">Kiro Admin</span>

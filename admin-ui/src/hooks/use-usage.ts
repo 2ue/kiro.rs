@@ -19,36 +19,38 @@ import {
 } from '@/api/usage'
 import type { AdminAuditLogPageQuery, UpsertManualModelRequest, UsageCleanupRequest, UsageRecordsPageQuery, UsageRecordsQuery } from '@/types/api'
 
-export function useUsageRecords(query: UsageRecordsQuery) {
+type RefetchInterval = number | false
+
+export function useUsageRecords(query: UsageRecordsQuery, refetchInterval: RefetchInterval = false) {
   return useQuery({
     queryKey: ['usage-records', query],
     queryFn: () => getUsageRecords(query),
-    refetchInterval: 10000,
+    refetchInterval,
   })
 }
 
-export function useUsageRecordsPage(query: UsageRecordsPageQuery) {
+export function useUsageRecordsPage(query: UsageRecordsPageQuery, refetchInterval: RefetchInterval = false) {
   return useQuery({
     queryKey: ['usage-records-page', query],
     queryFn: () => getUsageRecordsPage(query),
-    refetchInterval: 10000,
+    refetchInterval,
     placeholderData: (previousData) => previousData,
   })
 }
 
-export function useUsageSummary() {
+export function useUsageSummary(refetchInterval: RefetchInterval = false) {
   return useQuery({
     queryKey: ['usage-summary'],
     queryFn: getUsageSummary,
-    refetchInterval: 10000,
+    refetchInterval,
   })
 }
 
-export function useUsageDashboard(timezone = 'Asia/Shanghai') {
+export function useUsageDashboard(timezone = 'Asia/Shanghai', refetchInterval: RefetchInterval = false) {
   return useQuery({
     queryKey: ['usage-dashboard', timezone],
     queryFn: () => getUsageDashboard(timezone),
-    refetchInterval: 10000,
+    refetchInterval,
   })
 }
 
@@ -109,11 +111,11 @@ export function useAuditLogsPage(query: AdminAuditLogPageQuery) {
   })
 }
 
-export function useModelPricing() {
+export function useModelPricing(refetchInterval: RefetchInterval = 60000) {
   return useQuery({
     queryKey: ['model-pricing'],
     queryFn: getModelPricing,
-    refetchInterval: 60000,
+    refetchInterval,
   })
 }
 

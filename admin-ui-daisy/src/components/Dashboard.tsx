@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { Menu } from 'lucide-react'
-import { Button, Drawer } from 'react-daisyui'
+import { Button, Drawer, Select } from 'react-daisyui'
 import { Sidebar } from '@/components/layout/Sidebar'
 import { TopBar } from '@/components/layout/TopBar'
 import { AuditPanel } from '@/components/AuditPanel'
@@ -15,21 +15,7 @@ import { UsagePanel } from '@/components/UsagePanel'
 import { UsageDashboardPanel } from '@/components/UsageDashboardPanel'
 import { storage } from '@/lib/storage'
 import type { TabKey, ThemeMode } from '@/types/ui'
-import { pageConfig } from '@/types/ui'
-
-const DEFAULT_THEME: ThemeMode = 'kiroLight'
-
-function getStoredTheme(): ThemeMode {
-  const stored = localStorage.getItem('kiro-theme')
-  if (stored && ['kiroLight', 'kiroDark', 'kiroOcean', 'kiroForest', 'kiroPurple', 'kiroSunset'].includes(stored)) {
-    return stored as ThemeMode
-  }
-  // Check system preference
-  if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
-    return 'kiroDark'
-  }
-  return DEFAULT_THEME
-}
+import { getStoredTheme, pageConfig, themeOptions } from '@/types/ui'
 
 export function Dashboard({ onLogout }: { onLogout: () => void }) {
   const [activeTab, setActiveTab] = useState<TabKey>('dashboard')
@@ -138,16 +124,18 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
 
       {/* Mobile Bottom Actions */}
       <div className="fixed bottom-0 left-0 right-0 z-30 flex items-center justify-between border-t border-base-300 bg-base-100/95 px-4 py-2 backdrop-blur-lg lg:hidden">
-        <div className="flex items-center gap-2">
-          <Button
-            type="button"
-            color="ghost"
-            size="sm"
-            onClick={() => setTheme(theme === 'kiroDark' ? 'kiroLight' : 'kiroDark')}
-          >
-            {theme === 'kiroDark' ? '浅色' : '深色'}
-          </Button>
-        </div>
+        <Select
+          size="sm"
+          value={theme}
+          className="w-28"
+          onChange={(event) => setTheme(event.target.value as ThemeMode)}
+        >
+          {themeOptions.map((option) => (
+            <option key={option.key} value={option.key}>
+              {option.label}
+            </option>
+          ))}
+        </Select>
         <Button type="button" color="ghost" size="sm" className="text-error" onClick={handleLogout}>
           退出
         </Button>

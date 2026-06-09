@@ -154,7 +154,7 @@ export function AccountValidationPanel() {
           </>
         }
       >
-        <div className="flex items-start gap-2 rounded-box border border-warning/30 bg-warning/10 p-3 text-sm">
+        <div className="flex items-start gap-2 rounded-box border border-base-300 bg-base-100 p-3 text-sm text-base-content/70">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
           <div>掉级判断基于上次保存的信息和本次强制查询结果；首次查询没有历史快照时会标记为未知。</div>
         </div>

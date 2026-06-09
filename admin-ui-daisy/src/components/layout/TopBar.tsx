@@ -1,6 +1,6 @@
-import { LogOut, Moon, Palette, RefreshCw, Sun } from 'lucide-react'
+import { LogOut, Paintbrush, RefreshCw } from 'lucide-react'
 import { Button, Dropdown } from 'react-daisyui'
-import type { ThemeMode } from '@/types/ui'
+import { themeOptions, type ThemeMode } from '@/types/ui'
 
 interface TopBarProps {
   title: string
@@ -13,15 +13,6 @@ interface TopBarProps {
   actions?: React.ReactNode
 }
 
-const themes: Array<{ key: ThemeMode; label: string; icon: React.ReactNode; colors: string }> = [
-  { key: 'kiroLight', label: '浅色', icon: <Sun className="h-4 w-4" />, colors: 'from-blue-500 to-teal-500' },
-  { key: 'kiroDark', label: '深色', icon: <Moon className="h-4 w-4" />, colors: 'from-blue-400 to-teal-400' },
-  { key: 'kiroOcean', label: '海洋', icon: <Palette className="h-4 w-4" />, colors: 'from-cyan-500 to-blue-600' },
-  { key: 'kiroForest', label: '森林', icon: <Palette className="h-4 w-4" />, colors: 'from-emerald-500 to-green-600' },
-  { key: 'kiroPurple', label: '紫罗兰', icon: <Palette className="h-4 w-4" />, colors: 'from-violet-500 to-purple-600' },
-  { key: 'kiroSunset', label: '日落', icon: <Palette className="h-4 w-4" />, colors: 'from-orange-500 to-rose-500' },
-]
-
 export function TopBar({
   title,
   subtitle,
@@ -32,7 +23,7 @@ export function TopBar({
   isRefreshing,
   actions,
 }: TopBarProps) {
-  const currentTheme = themes.find((t) => t.key === theme) || themes[0]
+  const currentTheme = themeOptions.find((t) => t.key === theme) || themeOptions[0]
 
   return (
     <header className="top-bar sticky top-0 z-30 border-b border-base-300 bg-base-100/80 backdrop-blur-lg">
@@ -65,12 +56,12 @@ export function TopBar({
           <Dropdown end>
             <Dropdown.Toggle button={false}>
               <Button type="button" color="ghost" size="sm" className="gap-1.5">
-                <div className={`h-4 w-4 rounded-full bg-gradient-to-br ${currentTheme.colors}`} />
+                <Paintbrush className="h-4 w-4 text-base-content/55" />
                 <span className="hidden sm:inline">{currentTheme.label}</span>
               </Button>
             </Dropdown.Toggle>
-            <Dropdown.Menu className="mt-2 w-48 rounded-xl border border-base-300 bg-base-100 p-2 shadow-xl">
-              {themes.map((t) => (
+            <Dropdown.Menu className="mt-2 w-56 rounded-box border border-base-300 bg-base-100 p-2 shadow-xl">
+              {themeOptions.map((t) => (
                 <Dropdown.Item key={t.key} onClick={() => onThemeChange(t.key)}>
                   <button
                     type="button"
@@ -78,8 +69,14 @@ export function TopBar({
                       theme === t.key ? 'bg-primary/10 text-primary' : 'hover:bg-base-200'
                     }`}
                   >
-                    <div className={`h-5 w-5 rounded-full bg-gradient-to-br ${t.colors}`} />
-                    <span className="flex-1">{t.label}</span>
+                    <span
+                      className="h-4 w-4 shrink-0 rounded-full border border-base-content/10"
+                      style={{ backgroundColor: t.swatch }}
+                    />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate">{t.label}</span>
+                      <span className="block truncate text-[0.62rem] text-base-content/45">{t.description}</span>
+                    </span>
                     {theme === t.key && <span className="h-1.5 w-1.5 rounded-full bg-primary" />}
                   </button>
                 </Dropdown.Item>
