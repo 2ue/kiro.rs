@@ -79,6 +79,19 @@ pub struct CredentialListQuery {
     pub proxy_resource_id: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CredentialStatusBuildOptions {
+    include_account_info: bool,
+    include_cost_summary: bool,
+}
+
+impl CredentialStatusBuildOptions {
+    const LIGHT: Self = Self {
+        include_account_info: false,
+        include_cost_summary: false,
+    };
+}
+
 /// 缓存的账号信息条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedBalance {
@@ -489,7 +502,8 @@ impl AdminService {
     }
 
     fn credential_lookup(&self) -> HashMap<u64, CredentialStatusItem> {
-        let (_, _, _, _, _, _, _, credentials) = self.credential_status_items();
+        let (_, _, _, _, _, _, _, credentials) =
+            self.credential_status_items(CredentialStatusBuildOptions::LIGHT);
         credentials
             .into_iter()
             .map(|credential| (credential.id, credential))
@@ -497,7 +511,8 @@ impl AdminService {
     }
 
     fn credential_lookup_by_email(&self) -> HashMap<String, CredentialStatusItem> {
-        let (_, _, _, _, _, _, _, credentials) = self.credential_status_items();
+        let (_, _, _, _, _, _, _, credentials) =
+            self.credential_status_items(CredentialStatusBuildOptions::LIGHT);
         credentials
             .into_iter()
             .filter_map(|credential| {
@@ -611,7 +626,7 @@ impl AdminService {
             global_max_concurrent_requests,
             max_queued_requests,
             credentials,
-        ) = self.credential_status_items();
+        ) = self.credential_status_items(CredentialStatusBuildOptions::LIGHT);
 
         CredentialsStatusResponse {
             total,
@@ -643,7 +658,7 @@ impl AdminService {
             global_max_concurrent_requests,
             max_queued_requests,
             credentials,
-        ) = self.credential_status_items();
+        ) = self.credential_status_items(CredentialStatusBuildOptions::LIGHT);
         let filtered: Vec<_> = credentials
             .into_iter()
             .filter(|credential| credential_matches_query(credential, &query))
@@ -676,6 +691,7 @@ impl AdminService {
 
     fn credential_status_items(
         &self,
+        options: CredentialStatusBuildOptions,
     ) -> (
         usize,
         usize,
@@ -688,24 +704,36 @@ impl AdminService {
     ) {
         let snapshot = self.token_manager.snapshot();
         let default_endpoint = self.token_manager.runtime_config().default_endpoint;
-        let cost_summary = self.usage_recorder.credential_cost_summary();
-        let account_info = match block_on_admin_store({
-            let store = self.postgres_store.clone();
-            async move { store.load_credential_account_info().await }
-        }) {
-            Ok(info) => info,
-            Err(err) => {
-                tracing::warn!("加载凭据账号信息快照失败: {}", err);
-                Default::default()
+        let cost_summary = options
+            .include_cost_summary
+            .then(|| self.usage_recorder.credential_cost_summary());
+        let account_info = if options.include_account_info {
+            match block_on_admin_store({
+                let store = self.postgres_store.clone();
+                async move { store.load_credential_account_info().await }
+            }) {
+                Ok(info) => Some(info),
+                Err(err) => {
+                    tracing::warn!("加载凭据账号信息快照失败: {}", err);
+                    None
+                }
             }
+        } else {
+            None
         };
 
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
             .into_iter()
             .map(|entry| {
-                let cost = cost_summary.get(&entry.id).copied().unwrap_or_default();
-                let info = account_info.get(&entry.id).map(account_info_from_row);
+                let cost = cost_summary
+                    .as_ref()
+                    .and_then(|summary| summary.get(&entry.id).copied())
+                    .unwrap_or_default();
+                let info = account_info
+                    .as_ref()
+                    .and_then(|info| info.get(&entry.id))
+                    .map(account_info_from_row);
                 CredentialStatusItem {
                     id: entry.id,
                     created_at: entry.created_at,
@@ -771,8 +799,7 @@ impl AdminService {
             })
             .collect();
 
-        // 按优先级排序（数字越小优先级越高）
-        credentials.sort_by_key(|c| c.priority);
+        sort_credentials_for_admin_display(&mut credentials);
 
         (
             snapshot.total,
@@ -988,7 +1015,8 @@ impl AdminService {
             .scope
             .unwrap_or_else(|| "all".to_string())
             .to_lowercase();
-        let (_, _, _, _, _, _, _, credentials) = self.credential_status_items();
+        let (_, _, _, _, _, _, _, credentials) =
+            self.credential_status_items(CredentialStatusBuildOptions::LIGHT);
         let candidates: Vec<_> = credentials
             .into_iter()
             .filter(|credential| {
@@ -2855,6 +2883,9 @@ fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), St
     if config.external_pool_retry_max_attempts > 10_000 {
         return Err("externalPoolRetryMaxAttempts 不能大于 10000".to_string());
     }
+    if config.external_pool_local_rescue_max_wait_secs > 300 {
+        return Err("externalPoolLocalRescueMaxWaitSecs 不能大于 300".to_string());
+    }
     if config.direct_external_model_rules.len() > 200 {
         return Err("directExternalModelRules 不能超过 200 条".to_string());
     }
@@ -3051,6 +3082,20 @@ fn account_info_from_row(row: &CredentialAccountInfoRow) -> CredentialAccountInf
         next_reset_at: row.next_reset_at,
         checked_at: row.checked_at.clone(),
     }
+}
+
+fn sort_credentials_for_admin_display(credentials: &mut [CredentialStatusItem]) {
+    credentials.sort_by(|a, b| {
+        a.disabled
+            .cmp(&b.disabled)
+            .then_with(|| match (&a.created_at, &b.created_at) {
+                (Some(a_created), Some(b_created)) => b_created.cmp(a_created),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
+            .then_with(|| b.id.cmp(&a.id))
+    });
 }
 
 fn credential_matches_query(

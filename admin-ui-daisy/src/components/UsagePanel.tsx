@@ -68,6 +68,7 @@ function routeLabel(record: UsageRecord): string {
   const labels: Record<string, string> = {
     local_success: '本地成功',
     local_error_no_fallback: '本地错误',
+    local_rescue_after_external: '备用池后回本地',
     external_fallback_preflight: '预检 fallback',
     external_fallback_after_local_attempts: '失败后 fallback',
     external_direct_policy: '外部直连',
@@ -78,6 +79,7 @@ function routeLabel(record: UsageRecord): string {
 
 function routeTone(record: UsageRecord): 'neutral' | 'success' | 'warning' | 'error' | 'info' {
   if (record.routeSubtype === 'external_direct_policy') return 'warning'
+  if (record.routeSubtype === 'local_rescue_after_external') return 'info'
   if (record.routeKind === 'external_pool') return record.status === 'success' ? 'info' : 'error'
   return record.status === 'success' ? 'success' : 'neutral'
 }
@@ -170,7 +172,7 @@ export function UsagePanel() {
   const [minCacheRead, setMinCacheRead] = useState('')
   const [selectedRecord, setSelectedRecord] = useState<UsageRecord | null>(null)
   const [cleanupOpen, setCleanupOpen] = useState(false)
-  const [recordView, setRecordView] = useState<'cards' | 'table'>('cards')
+  const [recordView, setRecordView] = useState<'cards' | 'table'>('table')
   const [page, setPage] = useState(1)
   const limit = 20
   const autoRefresh = useAutoRefreshPreference(USAGE_AUTO_REFRESH_KEY)

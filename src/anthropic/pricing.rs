@@ -181,11 +181,28 @@ impl PricingCatalog {
                 available: true,
                 cost_usd: pricing.estimate(usage),
             },
-            None => PricingEstimate {
-                model: fallback_model,
-                available: false,
-                cost_usd: 0.0,
-            },
+            None => {
+                let builtin_prices = fallback_prices();
+                if let Some((model, pricing)) = pricing_candidates.iter().find_map(|candidate| {
+                    builtin_prices
+                        .get(candidate)
+                        .copied()
+                        .filter(|pricing| pricing.is_usable())
+                        .map(|pricing| (candidate.clone(), pricing))
+                }) {
+                    PricingEstimate {
+                        model,
+                        available: true,
+                        cost_usd: pricing.estimate(usage),
+                    }
+                } else {
+                    PricingEstimate {
+                        model: fallback_model,
+                        available: false,
+                        cost_usd: 0.0,
+                    }
+                }
+            }
         }
     }
 
@@ -591,6 +608,44 @@ mod tests {
     #[test]
     fn fallback_pricing_estimates_cache_tokens() {
         let catalog = PricingCatalog::new();
+        let usage = CacheUsage {
+            total_input_tokens: 100_000,
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_creation_input_tokens: 3_000,
+            cache_read_input_tokens: 96_990,
+            cache_creation_5m_input_tokens: 3_000,
+            cache_creation_1h_input_tokens: 0,
+        };
+
+        let estimate = catalog.estimate("claude-sonnet-4-6", usage);
+
+        assert!(estimate.available);
+        assert!(estimate.cost_usd > 0.0);
+        assert_eq!(estimate.model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn persisted_remote_pricing_keeps_builtin_estimate_fallback() {
+        let catalog = PricingCatalog::new();
+        catalog.load_persisted_status(PricingStatus {
+            available: true,
+            source: LITELLM_SOURCE.to_string(),
+            source_url: DEFAULT_PRICING_SOURCE_URL.to_string(),
+            model_count: 1,
+            last_synced_at: Some("2026-06-09T00:00:00Z".to_string()),
+            last_error: None,
+            models: vec![ModelPriceItem {
+                model: "claude-sonnet-4-5".to_string(),
+                pricing: ModelPricing {
+                    input_cost_per_token: 0.000003,
+                    output_cost_per_token: 0.000015,
+                    cache_creation_input_token_cost: 0.00000375,
+                    cache_read_input_token_cost: 0.0000003,
+                },
+                source: Some(LITELLM_SOURCE.to_string()),
+            }],
+        });
         let usage = CacheUsage {
             total_input_tokens: 100_000,
             input_tokens: 10,

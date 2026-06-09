@@ -312,6 +312,56 @@ struct ExternalForwardResponse {
     stream_usage_projection: Option<ExternalUsageProjectionContext>,
 }
 
+pub enum ExternalPoolForwardOutcome {
+    Response(Response),
+    FinalError(ExternalPoolFinalError),
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternalPoolFinalError {
+    pub status: StatusCode,
+    pub response_error_type: String,
+    pub route_error_type: String,
+    pub message: String,
+    pub retryable: bool,
+    pub attempts: Vec<ExternalPoolAttempt>,
+    pub pool_id: Option<u64>,
+    pub pool_name: Option<String>,
+}
+
+impl ExternalPoolFinalError {
+    pub fn into_response(self, request_id: &str) -> Response {
+        envelope::error_response_with_id(
+            self.status,
+            self.response_error_type,
+            self.message,
+            request_id,
+        )
+    }
+
+    pub fn is_rate_limit(&self) -> bool {
+        self.status == StatusCode::TOO_MANY_REQUESTS
+            || self.route_error_type == "rate_limit"
+            || self
+                .message
+                .to_ascii_lowercase()
+                .contains("too many requests")
+            || self
+                .message
+                .to_ascii_lowercase()
+                .contains("service_request_rate_exceeded")
+    }
+
+    pub fn is_timeout_like(&self) -> bool {
+        let lower = self.message.to_ascii_lowercase();
+        self.status == StatusCode::REQUEST_TIMEOUT
+            || self.status == StatusCode::GATEWAY_TIMEOUT
+            || lower.contains("timeout")
+            || lower.contains("timed out")
+            || lower.contains("deadline")
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct ExternalUsageCapture {
     raw: Option<CacheUsage>,
@@ -425,7 +475,6 @@ struct ExternalPoolError {
     auto_disable_reason: Option<String>,
     cooldown: Option<(Duration, String)>,
     response_body: Option<Bytes>,
-    response_headers: HeaderMap,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -597,20 +646,36 @@ impl ExternalPoolManager {
         config: ExternalPoolsConfig,
         route: ExternalRouteRequest,
     ) -> Response {
+        let request_id = route.request_id.clone();
+        match self.forward_with_failover_result(config, route).await {
+            ExternalPoolForwardOutcome::Response(response) => response,
+            ExternalPoolForwardOutcome::FinalError(err) => err.into_response(&request_id),
+        }
+    }
+
+    pub async fn forward_with_failover_result(
+        &self,
+        config: ExternalPoolsConfig,
+        route: ExternalRouteRequest,
+    ) -> ExternalPoolForwardOutcome {
         if !config.external_pools_enabled {
             self.record_external_failure(
                 &route,
                 None,
                 Vec::new(),
                 "external_pool_disabled",
-                "external pools are disabled",
+                "request route is disabled",
             );
-            return envelope::error_response_with_id(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "external_pool_unavailable",
-                "external pools are disabled",
-                &route.request_id,
-            );
+            return ExternalPoolForwardOutcome::FinalError(ExternalPoolFinalError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                response_error_type: "service_unavailable".to_string(),
+                route_error_type: "external_pool_unavailable".to_string(),
+                message: "request route is disabled".to_string(),
+                retryable: false,
+                attempts: Vec::new(),
+                pool_id: None,
+                pool_name: None,
+            });
         }
 
         let enabled_count = self
@@ -654,7 +719,9 @@ impl ExternalPoolManager {
                         .await
                     {
                         ExternalCapacityDecision::Retry => continue,
-                        ExternalCapacityDecision::Respond(response) => return response,
+                        ExternalCapacityDecision::Respond(response) => {
+                            return ExternalPoolForwardOutcome::Response(response);
+                        }
                     }
                 }
                 break;
@@ -690,7 +757,9 @@ impl ExternalPoolManager {
                         .await
                     {
                         ExternalCapacityDecision::Retry => continue,
-                        ExternalCapacityDecision::Respond(response) => return response,
+                        ExternalCapacityDecision::Respond(response) => {
+                            return ExternalPoolForwardOutcome::Response(response);
+                        }
                     }
                 }
             };
@@ -712,13 +781,15 @@ impl ExternalPoolManager {
                         error_message: None,
                     });
                     if route.payload.stream {
-                        return self.wrap_external_stream_usage_record(
-                            forwarded.response,
-                            route.clone(),
-                            pool,
-                            attempts.clone(),
-                            forwarded.stream_usage_capture,
-                            forwarded.stream_usage_projection,
+                        return ExternalPoolForwardOutcome::Response(
+                            self.wrap_external_stream_usage_record(
+                                forwarded.response,
+                                route.clone(),
+                                pool,
+                                attempts.clone(),
+                                forwarded.stream_usage_capture,
+                                forwarded.stream_usage_projection,
+                            ),
                         );
                     }
                     if let Some(projection) = forwarded.stream_usage_projection.as_ref() {
@@ -730,7 +801,7 @@ impl ExternalPoolManager {
                         attempts.clone(),
                         forwarded.billing,
                     );
-                    return forwarded.response;
+                    return ExternalPoolForwardOutcome::Response(forwarded.response);
                 }
                 Err(err) => {
                     let action = if err.retryable { "retry_next" } else { "fail" };
@@ -761,34 +832,50 @@ impl ExternalPoolManager {
                     self.record_external_failure(
                         &route,
                         Some(&pool),
-                        attempts,
+                        attempts.clone(),
                         &error_type,
                         &err.message,
                     );
-                    return external_pool_error_response(&route, &err);
+                    return ExternalPoolForwardOutcome::FinalError(
+                        external_final_error_from_error(Some(&pool), attempts, &err),
+                    );
                 }
             }
         }
 
         if let Some((pool, err)) = last_error {
             let error_type = error_type_for_external_error(&err);
-            self.record_external_failure(&route, Some(&pool), attempts, &error_type, &err.message);
-            return external_pool_error_response(&route, &err);
+            self.record_external_failure(
+                &route,
+                Some(&pool),
+                attempts.clone(),
+                &error_type,
+                &err.message,
+            );
+            return ExternalPoolForwardOutcome::FinalError(external_final_error_from_error(
+                Some(&pool),
+                attempts,
+                &err,
+            ));
         }
 
         self.record_external_failure(
             &route,
             None,
-            attempts,
+            attempts.clone(),
             "external_pool_unavailable",
             "No available external fallback pools",
         );
-        envelope::error_response_with_id(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "external_pool_unavailable",
-            "No available external fallback pools",
-            &route.request_id,
-        )
+        ExternalPoolForwardOutcome::FinalError(ExternalPoolFinalError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            response_error_type: "service_unavailable".to_string(),
+            route_error_type: "external_pool_unavailable".to_string(),
+            message: "No available external fallback pools".to_string(),
+            retryable: false,
+            attempts,
+            pool_id: None,
+            pool_name: None,
+        })
     }
 
     async fn forward_once(
@@ -824,7 +911,7 @@ impl ExternalPoolManager {
         }
         let response = request.send().await.map_err(|err| ExternalPoolError {
             status: None,
-            message: format!("external pool request send failed: {}", err),
+            message: format!("model endpoint request send failed: {}", err),
             retryable: true,
             auto_disable_reason: None,
             cooldown: Some((
@@ -832,7 +919,6 @@ impl ExternalPoolManager {
                 format!("network_error {}", err),
             )),
             response_body: None,
-            response_headers: HeaderMap::new(),
         })?;
 
         let status = response.status();
@@ -849,7 +935,7 @@ impl ExternalPoolManager {
                     &response_headers,
                     None,
                     config,
-                    "external pool returned an HTML response for a streaming request",
+                    "model endpoint returned an HTML response for a streaming request",
                 ));
             }
             let body_stream = response.bytes_stream();
@@ -972,7 +1058,7 @@ impl ExternalPoolManager {
                                         .unwrap_or_default();
                                     return Some((
                                         Err(std::io::Error::other(format!(
-                                            "external pool stream idle timeout after {} seconds",
+                                            "model endpoint stream idle timeout after {} seconds",
                                             seconds
                                         ))),
                                         (
@@ -1000,7 +1086,6 @@ impl ExternalPoolManager {
                 auto_disable_reason: None,
                 cooldown: None,
                 response_body: None,
-                response_headers: HeaderMap::new(),
             })?;
             Ok(ExternalForwardResponse {
                 response,
@@ -1011,7 +1096,7 @@ impl ExternalPoolManager {
         } else {
             let bytes = response.bytes().await.map_err(|err| ExternalPoolError {
                 status: None,
-                message: format!("external pool response read failed: {}", err),
+                message: format!("model endpoint response read failed: {}", err),
                 retryable: true,
                 auto_disable_reason: None,
                 cooldown: Some((
@@ -1019,14 +1104,13 @@ impl ExternalPoolManager {
                     format!("network_error {}", err),
                 )),
                 response_body: None,
-                response_headers: HeaderMap::new(),
             })?;
             if success_response_looks_like_html(&response_headers, &bytes) {
                 return Err(success_protocol_error(
                     &response_headers,
                     Some(&bytes),
                     config,
-                    "external pool returned an HTML response for a non-streaming request",
+                    "model endpoint returned an HTML response for a non-streaming request",
                 ));
             }
             drop(lease);
@@ -1051,7 +1135,6 @@ impl ExternalPoolManager {
                         auto_disable_reason: None,
                         cooldown: None,
                         response_body: None,
-                        response_headers: HeaderMap::new(),
                     })?;
             Ok(ExternalForwardResponse {
                 response,
@@ -1205,7 +1288,7 @@ impl ExternalPoolManager {
         if let Some(max_wait) = max_wait {
             if started.elapsed() >= max_wait {
                 let message = format!(
-                    "External fallback pool capacity wait timed out after {} seconds",
+                    "Request capacity wait timed out after {} seconds",
                     max_wait.as_secs()
                 );
                 self.record_external_failure(
@@ -1231,7 +1314,7 @@ impl ExternalPoolManager {
             {
                 Ok(Some(guard)) => *queue_guard = Some(guard),
                 Ok(None) => {
-                    let message = "External fallback pool dispatch queue is full";
+                    let message = "Request dispatch queue is full";
                     self.record_external_failure(
                         route,
                         None,
@@ -1249,8 +1332,7 @@ impl ExternalPoolManager {
                     );
                 }
                 Err(err) => {
-                    let message =
-                        format!("External fallback pool dispatch queue unavailable: {}", err);
+                    let message = format!("Request dispatch queue unavailable: {}", err);
                     self.record_external_failure(
                         route,
                         None,
@@ -1277,7 +1359,7 @@ impl ExternalPoolManager {
             let remaining = max_wait.saturating_sub(started.elapsed());
             if remaining.is_zero() {
                 let message = format!(
-                    "External fallback pool capacity wait timed out after {} seconds",
+                    "Request capacity wait timed out after {} seconds",
                     max_wait.as_secs()
                 );
                 self.record_external_failure(
@@ -1980,7 +2062,7 @@ fn external_pool_url(
 ) -> Result<Url, ExternalPoolError> {
     external_pool_messages_url(&pool.base_url).map_err(|err| ExternalPoolError {
         status: None,
-        message: format!("external pool URL is invalid: {}", err),
+        message: format!("model endpoint URL is invalid: {}", err),
         retryable: true,
         auto_disable_reason: Some("misconfigured_endpoint".to_string()),
         cooldown: Some((
@@ -1988,7 +2070,6 @@ fn external_pool_url(
             "misconfigured_endpoint".to_string(),
         )),
         response_body: None,
-        response_headers: HeaderMap::new(),
     })
 }
 
@@ -2026,12 +2107,11 @@ fn forward_headers(
             let value = HeaderValue::from_str(&format!("Bearer {}", key)).map_err(|err| {
                 ExternalPoolError {
                     status: None,
-                    message: format!("external pool auth header invalid: {}", err),
+                    message: format!("model endpoint auth header invalid: {}", err),
                     retryable: true,
                     auto_disable_reason: Some("auth_error".to_string()),
                     cooldown: Some((Duration::from_secs(10), "auth_error".to_string())),
                     response_body: None,
-                    response_headers: HeaderMap::new(),
                 }
             })?;
             out.insert(header::AUTHORIZATION, value);
@@ -2040,12 +2120,11 @@ fn forward_headers(
             let key = pool.api_key.as_deref().unwrap_or_default();
             let value = HeaderValue::from_str(key).map_err(|err| ExternalPoolError {
                 status: None,
-                message: format!("external pool x-api-key invalid: {}", err),
+                message: format!("model endpoint x-api-key invalid: {}", err),
                 retryable: true,
                 auto_disable_reason: Some("auth_error".to_string()),
                 cooldown: Some((Duration::from_secs(10), "auth_error".to_string())),
                 response_body: None,
-                response_headers: HeaderMap::new(),
             })?;
             out.insert(HeaderName::from_static("x-api-key"), value);
         }
@@ -2142,7 +2221,6 @@ fn success_protocol_error(
             "misconfigured_endpoint".to_string(),
         )),
         response_body: None,
-        response_headers: HeaderMap::new(),
     }
 }
 
@@ -2162,19 +2240,35 @@ fn apply_forwarded_response_headers(
     envelope::insert_request_id_headers(out, request_id);
 }
 
-fn external_pool_error_response(route: &ExternalRouteRequest, err: &ExternalPoolError) -> Response {
-    external_pool_error_response_with_request_id(&route.request_id, err)
+fn external_final_error_from_error(
+    pool: Option<&ExternalPool>,
+    attempts: Vec<ExternalPoolAttempt>,
+    err: &ExternalPoolError,
+) -> ExternalPoolFinalError {
+    let message = err
+        .response_body
+        .as_ref()
+        .map(|body| String::from_utf8_lossy(body).to_string())
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| err.message.clone());
+    ExternalPoolFinalError {
+        status: err.status.unwrap_or(StatusCode::BAD_GATEWAY),
+        response_error_type: anthropic_error_type_for_external_error(err).to_string(),
+        route_error_type: error_type_for_external_error(err),
+        message,
+        retryable: err.retryable,
+        attempts,
+        pool_id: pool.map(|pool| pool.id),
+        pool_name: pool.map(|pool| pool.name.clone()),
+    }
 }
 
 fn external_capacity_error(reason: PoolCapacityWaitReason) -> (&'static str, &'static str) {
     match reason {
-        PoolCapacityWaitReason::Full => (
-            "external_pool_capacity_full",
-            "External fallback pool concurrency is full",
-        ),
+        PoolCapacityWaitReason::Full => ("external_pool_capacity_full", "Request capacity is full"),
         PoolCapacityWaitReason::Cooldown => (
             "external_pool_cooldown",
-            "External fallback pools are temporarily cooling down",
+            "Request capacity is temporarily cooling down",
         ),
     }
 }
@@ -2188,35 +2282,10 @@ fn external_pool_scheduler_error_response(
     envelope::error_response_with_id(status, code, message.into(), &route.request_id)
 }
 
-fn external_pool_error_response_with_request_id(
-    request_id: &str,
-    err: &ExternalPoolError,
-) -> Response {
-    if let (Some(status), Some(body)) = (err.status, err.response_body.clone()) {
-        let mut builder = Response::builder().status(status);
-        apply_forwarded_response_headers(&mut builder, &err.response_headers, request_id);
-        return builder.body(Body::from(body)).unwrap_or_else(|build_err| {
-            envelope::error_response_with_id(
-                StatusCode::BAD_GATEWAY,
-                "external_pool_error",
-                format!("build external pool error response failed: {}", build_err),
-                request_id,
-            )
-        });
-    }
-
-    envelope::error_response_with_id(
-        err.status.unwrap_or(StatusCode::BAD_GATEWAY),
-        "external_pool_error",
-        err.message.clone(),
-        request_id,
-    )
-}
-
 fn classify_external_error(
     status: StatusCode,
     body: Bytes,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     config: &ExternalPoolsConfig,
 ) -> ExternalPoolError {
     let message = String::from_utf8_lossy(&body).to_string();
@@ -2236,7 +2305,6 @@ fn classify_external_error(
                 "rate_limit".to_string(),
             )),
             response_body: Some(body),
-            response_headers: headers,
         };
     }
     if lower.contains("database is locked") || lower.contains("sqlite_busy") {
@@ -2250,7 +2318,6 @@ fn classify_external_error(
                 "database_busy".to_string(),
             )),
             response_body: Some(body),
-            response_headers: headers,
         };
     }
     if lower.contains("invalid token") {
@@ -2264,7 +2331,6 @@ fn classify_external_error(
                 "auth_error".to_string(),
             )),
             response_body: Some(body),
-            response_headers: headers,
         };
     }
     if lower.contains("channel affinity") && lower.contains("disabled") {
@@ -2278,7 +2344,6 @@ fn classify_external_error(
                 "channel_disabled".to_string(),
             )),
             response_body: Some(body),
-            response_headers: headers,
         };
     }
     if lower.contains("model_not_found")
@@ -2295,7 +2360,6 @@ fn classify_external_error(
                 "model_unavailable".to_string(),
             )),
             response_body: Some(body),
-            response_headers: headers,
         };
     }
     if status == StatusCode::BAD_REQUEST {
@@ -2306,7 +2370,6 @@ fn classify_external_error(
             auto_disable_reason: None,
             cooldown: None,
             response_body: Some(body),
-            response_headers: headers,
         };
     }
     if status == StatusCode::TOO_MANY_REQUESTS {
@@ -2320,7 +2383,6 @@ fn classify_external_error(
                 "rate_limit".to_string(),
             )),
             response_body: Some(body),
-            response_headers: headers,
         };
     }
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
@@ -2343,7 +2405,6 @@ fn classify_external_error(
                 reason.to_string(),
             )),
             response_body: Some(body),
-            response_headers: headers,
         };
     }
     if status.as_u16() == 402 || lower.contains("quota") || lower.contains("insufficient credits") {
@@ -2357,7 +2418,6 @@ fn classify_external_error(
                 "quota_exhausted".to_string(),
             )),
             response_body: Some(body),
-            response_headers: headers,
         };
     }
     if status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT {
@@ -2371,7 +2431,6 @@ fn classify_external_error(
                 "server_error".to_string(),
             )),
             response_body: Some(body),
-            response_headers: headers,
         };
     }
     ExternalPoolError {
@@ -2381,7 +2440,6 @@ fn classify_external_error(
         auto_disable_reason: None,
         cooldown: None,
         response_body: Some(body),
-        response_headers: headers,
     }
 }
 
@@ -2421,6 +2479,25 @@ fn error_type_for_external_error(err: &ExternalPoolError) -> String {
         _ => "external_pool_error",
     }
     .to_string()
+}
+
+fn anthropic_error_type_for_external_error(err: &ExternalPoolError) -> &'static str {
+    match err.status {
+        Some(StatusCode::BAD_REQUEST) => "invalid_request_error",
+        Some(StatusCode::UNAUTHORIZED) => "authentication_error",
+        Some(StatusCode::FORBIDDEN) => "permission_error",
+        Some(StatusCode::TOO_MANY_REQUESTS) => "rate_limit_error",
+        Some(status) if status.is_server_error() || status == StatusCode::REQUEST_TIMEOUT => {
+            "api_error"
+        }
+        _ => match error_type_for_external_error(err).as_str() {
+            "rate_limit" => "rate_limit_error",
+            "bad_request" => "invalid_request_error",
+            "auth_error" => "authentication_error",
+            "security_lock" => "permission_error",
+            _ => "api_error",
+        },
+    }
 }
 
 struct ProjectedNonStreamBody {
@@ -3055,7 +3132,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_pool_error_response_passes_through_upstream_error_body() {
+    async fn external_pool_error_response_wraps_raw_error_body_as_message() {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::CONTENT_TYPE,
@@ -3076,19 +3153,16 @@ mod tests {
             headers,
             &ExternalPoolsConfig::default(),
         );
-        let response = external_pool_error_response_with_request_id("req_gateway", &err);
+        let response =
+            external_final_error_from_error(None, Vec::new(), &err).into_response("req_gateway");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
-            response.headers().get(header::CONTENT_TYPE).unwrap(),
-            "application/json"
-        );
-        assert_eq!(
             response
                 .headers()
-                .get(HeaderName::from_static("anthropic-request-id"))
+                .get(HeaderName::from_static("request-id"))
                 .unwrap(),
-            "req_upstream"
+            "req_gateway"
         );
         assert_eq!(
             response
@@ -3102,11 +3176,17 @@ mod tests {
         let actual = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("read external error body");
-        assert_eq!(actual, body);
+        let value: serde_json::Value = serde_json::from_slice(&actual).expect("json envelope");
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            value["error"]["message"].as_str(),
+            Some(String::from_utf8_lossy(&body).as_ref())
+        );
+        assert_eq!(value["request_id"], "req_gateway");
     }
 
     #[tokio::test]
-    async fn external_pool_retryable_final_error_keeps_upstream_response_shape() {
+    async fn external_pool_retryable_final_error_uses_gateway_error_envelope() {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::CONTENT_TYPE,
@@ -3125,13 +3205,20 @@ mod tests {
         assert!(err.retryable);
         assert_eq!(error_type_for_external_error(&err), "rate_limit");
 
-        let response = external_pool_error_response_with_request_id("req_gateway", &err);
+        let response =
+            external_final_error_from_error(None, Vec::new(), &err).into_response("req_gateway");
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         let actual = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("read external final retryable body");
-        assert_eq!(actual, body);
+        let value: serde_json::Value = serde_json::from_slice(&actual).expect("json envelope");
+        assert_eq!(value["error"]["type"], "rate_limit_error");
+        assert_eq!(
+            value["error"]["message"].as_str(),
+            Some(String::from_utf8_lossy(&body).as_ref())
+        );
+        assert_eq!(value["request_id"], "req_gateway");
     }
 
     #[test]
@@ -3254,10 +3341,7 @@ mod tests {
             .expect("read scheduler error body");
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["type"], "external_pool_capacity_full");
-        assert_eq!(
-            body["error"]["message"],
-            "External fallback pool concurrency is full"
-        );
+        assert_eq!(body["error"]["message"], "Request capacity is full");
     }
 
     #[test]
@@ -3271,7 +3355,7 @@ mod tests {
             &headers,
             Some(&body),
             &ExternalPoolsConfig::default(),
-            "external pool returned an HTML response",
+            "model endpoint returned an HTML response",
         );
 
         assert!(err.retryable);

@@ -101,6 +101,7 @@ export function ExternalPoolsPanel() {
           externalPoolMaxQueuedRequests: whole(configDraft.externalPoolMaxQueuedRequests),
           externalPoolDispatchMaxWaitSecs: whole(configDraft.externalPoolDispatchMaxWaitSecs),
           externalPoolRetryMaxAttempts: whole(configDraft.externalPoolRetryMaxAttempts),
+          externalPoolLocalRescueMaxWaitSecs: whole(configDraft.externalPoolLocalRescueMaxWaitSecs),
           localPoolCircuitWindowSecs: whole(configDraft.localPoolCircuitWindowSecs, 1),
           localPoolCircuitOpenAfterFailures: whole(configDraft.localPoolCircuitOpenAfterFailures, 1),
           localPoolCircuitRequireDistinctCredentials: whole(configDraft.localPoolCircuitRequireDistinctCredentials),
@@ -200,10 +201,49 @@ export function ExternalPoolsPanel() {
   }
 
   const externalEnabled = configDraft.externalPoolsEnabled
-  const fallbackActive = externalEnabled
+  const fallbackActive = externalEnabled && (
+    configDraft.localPoolPreflightEnabled
+    || configDraft.fallbackOnLocalCapacityExhausted
+    || configDraft.fallbackOnNoAvailableCredentials
+    || configDraft.fallbackOnLocalTransientExhausted
+    || configDraft.fallbackOnUnsupportedModel
+  )
   const directPolicyActive = externalEnabled && configDraft.externalDirectPolicyEnabled
   const autoDisableActive = externalEnabled && configDraft.externalPoolAutoDisableEnabled
   const waitModeActive = externalEnabled && configDraft.externalPoolCapacityMode === 'wait'
+  const localRescueActive = externalEnabled && configDraft.externalPoolLocalRescueEnabled
+  const cacheUpliftActive = externalEnabled && configDraft.externalPoolUsageProjectionUpliftPercent > 0
+  const outputUpliftActive = externalEnabled
+    && configDraft.externalPoolUsageProjectionOutputUpliftMinTokens > 0
+    && configDraft.externalPoolUsageProjectionOutputUpliftPercent > 0
+  const usageCompensationActive = cacheUpliftActive || outputUpliftActive
+  const currentPathPoolCount = pools.data?.pools.filter((pool) => pool.usageProjectionMode === 'current_path_policy').length ?? 0
+  const poolStatuses = status.data?.pools ?? []
+  const totalPools = pools.data?.pools.length ?? poolStatuses.length
+  const dispatchablePools = poolStatuses.filter((item) => item.dispatchable).length
+  const totalInFlight = poolStatuses.reduce((sum, item) => sum + item.inFlight, 0)
+  const totalCapacity = poolStatuses.reduce((sum, item) => sum + item.pool.maxConcurrentRequests, 0)
+
+  const setCacheUpliftEnabled = (enabled: boolean) => {
+    setConfigDraft((prev) => ({
+      ...prev,
+      externalPoolUsageProjectionUpliftPercent: enabled
+        ? (prev.externalPoolUsageProjectionUpliftPercent || 25)
+        : 0,
+    }))
+  }
+
+  const setOutputUpliftEnabled = (enabled: boolean) => {
+    setConfigDraft((prev) => ({
+      ...prev,
+      externalPoolUsageProjectionOutputUpliftMinTokens: enabled
+        ? (prev.externalPoolUsageProjectionOutputUpliftMinTokens || 1000)
+        : 0,
+      externalPoolUsageProjectionOutputUpliftPercent: enabled
+        ? (prev.externalPoolUsageProjectionOutputUpliftPercent || 25)
+        : 0,
+    }))
+  }
 
   return (
     <div className="space-y-6">
@@ -211,14 +251,22 @@ export function ExternalPoolsPanel() {
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <Power className="h-5 w-5" />
-            备用号池调度策略
+            备用号池配置
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-5">
+          <div className="grid gap-3 md:grid-cols-5">
+            <SummaryItem label="备用池" value={externalEnabled ? '已启用' : '已关闭'} />
+            <SummaryItem label="入口策略" value={fallbackActive || directPolicyActive ? '已配置' : '未配置'} />
+            <SummaryItem label="可调度外部池" value={`${dispatchablePools}/${totalPools}`} />
+            <SummaryItem label="外部池并发" value={`${totalInFlight}/${totalCapacity || 0}`} />
+            <SummaryItem label="按路径整形池" value={`${currentPathPoolCount} 个`} />
+          </div>
+
           <PolicyBlock
-            title="总开关"
+            title="1. 是否启用备用池"
             active={externalEnabled}
-            description="关闭后所有备用池调度、直连、fallback、自动禁用配置都不生效，请求只走本地凭证。"
+            description="关闭后不会进入任何外部池，请求只走本地凭证。"
           >
             <div className="grid gap-4 md:grid-cols-2">
               <Toggle label="启用备用号池" checked={configDraft.externalPoolsEnabled} onChange={(externalPoolsEnabled) => setConfigDraft((prev) => ({ ...prev, externalPoolsEnabled }))} />
@@ -226,105 +274,122 @@ export function ExternalPoolsPanel() {
           </PolicyBlock>
 
           <PolicyBlock
-            title="外部池调度参数"
+            title="2. 什么时候进入备用池"
             active={externalEnabled}
-            description="只在备用号池启用后生效。容量模式为等待时，会使用外部池独立排队；0 表示对应上限不限制。"
+            description="fallback 是本地凭证不可用后再转外部池；显式直连是命中规则后直接走外部池。"
           >
-            <div className="grid gap-4 md:grid-cols-4">
-              <SelectBox disabled={!externalEnabled} label="满并发处理" value={configDraft.externalPoolCapacityMode} onChange={(externalPoolCapacityMode) => setConfigDraft((prev) => ({ ...prev, externalPoolCapacityMode: externalPoolCapacityMode as ExternalPoolsConfig['externalPoolCapacityMode'] }))}>
-                <option value="fail_fast">立即失败</option>
-                <option value="wait">等待容量</option>
-              </SelectBox>
-              <NumberBox disabled={!externalEnabled} label="外部池全局并发" value={configDraft.externalPoolGlobalMaxConcurrentRequests} onChange={(externalPoolGlobalMaxConcurrentRequests) => setConfigDraft((prev) => ({ ...prev, externalPoolGlobalMaxConcurrentRequests }))} />
-              <NumberBox disabled={!waitModeActive} label="外部池排队上限（0 不限制）" value={configDraft.externalPoolMaxQueuedRequests} onChange={(externalPoolMaxQueuedRequests) => setConfigDraft((prev) => ({ ...prev, externalPoolMaxQueuedRequests }))} />
-              <NumberBox disabled={!waitModeActive} label="最大等待秒数（0 不超时）" value={configDraft.externalPoolDispatchMaxWaitSecs} onChange={(externalPoolDispatchMaxWaitSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolDispatchMaxWaitSecs }))} />
-              <NumberBox disabled={!externalEnabled} label="外部池最大重试" value={configDraft.externalPoolRetryMaxAttempts} onChange={(externalPoolRetryMaxAttempts) => setConfigDraft((prev) => ({ ...prev, externalPoolRetryMaxAttempts }))} />
-              <NumberBox disabled={!externalEnabled} label="429 冷却秒数" value={configDraft.externalPoolRateLimitCooldownSecs} min={1} onChange={(externalPoolRateLimitCooldownSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolRateLimitCooldownSecs }))} />
-              <NumberBox disabled={!externalEnabled} label="5xx 冷却秒数" value={configDraft.externalPoolServerErrorCooldownSecs} min={1} onChange={(externalPoolServerErrorCooldownSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolServerErrorCooldownSecs }))} />
-              <NumberBox disabled={!externalEnabled} label="网络错误冷却秒数" value={configDraft.externalPoolNetworkErrorCooldownSecs} min={1} onChange={(externalPoolNetworkErrorCooldownSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolNetworkErrorCooldownSecs }))} />
-              <NumberBox disabled={!externalEnabled} label="协议/认证冷却秒数" value={configDraft.externalPoolProtocolErrorCooldownSecs} min={1} onChange={(externalPoolProtocolErrorCooldownSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolProtocolErrorCooldownSecs }))} />
-              <NumberBox disabled={!externalEnabled} label="非流式总超时秒数（0 不限制）" value={configDraft.externalPoolRequestTimeoutSecs} onChange={(externalPoolRequestTimeoutSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolRequestTimeoutSecs }))} />
-              <NumberBox disabled={!externalEnabled} label="流式总超时秒数（0 不限制）" value={configDraft.externalPoolStreamRequestTimeoutSecs} onChange={(externalPoolStreamRequestTimeoutSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolStreamRequestTimeoutSecs }))} />
-              <NumberBox disabled={!externalEnabled} label="流式空闲超时秒数（0 不限制）" value={configDraft.externalPoolStreamIdleTimeoutSecs} onChange={(externalPoolStreamIdleTimeoutSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolStreamIdleTimeoutSecs }))} />
+            <div className="grid gap-4 lg:grid-cols-2">
+              <FormSection title="本地优先 fallback" description="先调度本地凭证，只有下面情况出现时才转外部池。">
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <Toggle disabled={!externalEnabled} label="本地容量预检" checked={configDraft.localPoolPreflightEnabled} onChange={(localPoolPreflightEnabled) => setConfigDraft((prev) => ({ ...prev, localPoolPreflightEnabled }))} />
+                  <Toggle disabled={!externalEnabled} label="容量不足 fallback" checked={configDraft.fallbackOnLocalCapacityExhausted} onChange={(fallbackOnLocalCapacityExhausted) => setConfigDraft((prev) => ({ ...prev, fallbackOnLocalCapacityExhausted }))} />
+                  <Toggle disabled={!externalEnabled} label="无可用凭据 fallback" checked={configDraft.fallbackOnNoAvailableCredentials} onChange={(fallbackOnNoAvailableCredentials) => setConfigDraft((prev) => ({ ...prev, fallbackOnNoAvailableCredentials }))} />
+                  <Toggle disabled={!externalEnabled} label="瞬态错误耗尽 fallback" checked={configDraft.fallbackOnLocalTransientExhausted} onChange={(fallbackOnLocalTransientExhausted) => setConfigDraft((prev) => ({ ...prev, fallbackOnLocalTransientExhausted }))} />
+                  <Toggle disabled={!externalEnabled} label="模型不支持 fallback" checked={configDraft.fallbackOnUnsupportedModel} onChange={(fallbackOnUnsupportedModel) => setConfigDraft((prev) => ({ ...prev, fallbackOnUnsupportedModel }))} />
+                </div>
+              </FormSection>
+
+              <FormSection title="显式直连" description="命中规则后绕过本地凭证，直接进入外部池。">
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <Toggle disabled={!externalEnabled} label="启用显式直连" checked={configDraft.externalDirectPolicyEnabled} onChange={(externalDirectPolicyEnabled) => setConfigDraft((prev) => ({ ...prev, externalDirectPolicyEnabled }))} />
+                  <Toggle disabled={!directPolicyActive} label="本地维护时直连" checked={configDraft.directExternalOnLocalMaintenance} onChange={(directExternalOnLocalMaintenance) => setConfigDraft((prev) => ({ ...prev, directExternalOnLocalMaintenance }))} />
+                </div>
+                <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                  <TextArea disabled={!directPolicyActive} label="直连模型规则" value={modelRulesText} onChange={setModelRulesText} />
+                  <TextArea disabled={!directPolicyActive} label="直连路径规则" value={pathRulesText} onChange={setPathRulesText} />
+                </div>
+              </FormSection>
             </div>
           </PolicyBlock>
 
           <PolicyBlock
-            title="外部池 usage 上报补偿"
-            active={externalEnabled && (configDraft.externalPoolUsageProjectionUpliftPercent > 0 || (configDraft.externalPoolUsageProjectionOutputUpliftPercent > 0 && configDraft.externalPoolUsageProjectionOutputUpliftMinTokens > 0))}
-            description="只影响配置为“按原请求路径整形缓存上报”的外部池。缓存读写放大会改写 cache read/write；输出放大会在 output_tokens 达到阈值后改写最终返回下游的 output_tokens。"
+            title="3. 进入备用池后怎么调度"
+            active={externalEnabled}
+            description="控制外部池自己的并发、排队、重试和超时。单个外部池还可以单独设置并发。"
           >
-            <div className="grid gap-4 md:grid-cols-3">
-              <NumberBox disabled={!externalEnabled} label="缓存读写放大百分比" value={configDraft.externalPoolUsageProjectionUpliftPercent} onChange={(externalPoolUsageProjectionUpliftPercent) => setConfigDraft((prev) => ({ ...prev, externalPoolUsageProjectionUpliftPercent }))} />
-              <NumberBox disabled={!externalEnabled} label="输出放大启用阈值" value={configDraft.externalPoolUsageProjectionOutputUpliftMinTokens} onChange={(externalPoolUsageProjectionOutputUpliftMinTokens) => setConfigDraft((prev) => ({ ...prev, externalPoolUsageProjectionOutputUpliftMinTokens }))} />
-              <NumberBox disabled={!externalEnabled || configDraft.externalPoolUsageProjectionOutputUpliftMinTokens <= 0} label="输出放大百分比" value={configDraft.externalPoolUsageProjectionOutputUpliftPercent} onChange={(externalPoolUsageProjectionOutputUpliftPercent) => setConfigDraft((prev) => ({ ...prev, externalPoolUsageProjectionOutputUpliftPercent }))} />
+            <div className="space-y-4">
+              <FormSection title="容量与排队" description={waitModeActive ? '外部池满并发时会等待容量。' : '外部池满并发时不会排队。'}>
+                <div className="grid gap-3 md:grid-cols-4">
+                  <SelectBox disabled={!externalEnabled} label="满并发处理" value={configDraft.externalPoolCapacityMode} onChange={(externalPoolCapacityMode) => setConfigDraft((prev) => ({ ...prev, externalPoolCapacityMode: externalPoolCapacityMode as ExternalPoolsConfig['externalPoolCapacityMode'] }))}>
+                    <option value="fail_fast">立即失败</option>
+                    <option value="wait">等待容量</option>
+                  </SelectBox>
+                  <NumberBox disabled={!externalEnabled} label="全局并发上限" value={configDraft.externalPoolGlobalMaxConcurrentRequests} onChange={(externalPoolGlobalMaxConcurrentRequests) => setConfigDraft((prev) => ({ ...prev, externalPoolGlobalMaxConcurrentRequests }))} />
+                  <NumberBox disabled={!waitModeActive} label="排队上限" value={configDraft.externalPoolMaxQueuedRequests} onChange={(externalPoolMaxQueuedRequests) => setConfigDraft((prev) => ({ ...prev, externalPoolMaxQueuedRequests }))} />
+                  <NumberBox disabled={!waitModeActive} label="最大等待秒数" value={configDraft.externalPoolDispatchMaxWaitSecs} onChange={(externalPoolDispatchMaxWaitSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolDispatchMaxWaitSecs }))} />
+                  <NumberBox disabled={!externalEnabled} label="最大重试次数" value={configDraft.externalPoolRetryMaxAttempts} onChange={(externalPoolRetryMaxAttempts) => setConfigDraft((prev) => ({ ...prev, externalPoolRetryMaxAttempts }))} />
+                </div>
+              </FormSection>
+
+              <FormSection title="冷却与超时" description="冷却用于临时避开出错外部池；流式空闲超时用于防止长时间无输出。">
+                <div className="grid gap-3 md:grid-cols-4">
+                  <NumberBox disabled={!externalEnabled} label="429 冷却秒数" value={configDraft.externalPoolRateLimitCooldownSecs} min={1} onChange={(externalPoolRateLimitCooldownSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolRateLimitCooldownSecs }))} />
+                  <NumberBox disabled={!externalEnabled} label="5xx 冷却秒数" value={configDraft.externalPoolServerErrorCooldownSecs} min={1} onChange={(externalPoolServerErrorCooldownSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolServerErrorCooldownSecs }))} />
+                  <NumberBox disabled={!externalEnabled} label="网络错误冷却秒数" value={configDraft.externalPoolNetworkErrorCooldownSecs} min={1} onChange={(externalPoolNetworkErrorCooldownSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolNetworkErrorCooldownSecs }))} />
+                  <NumberBox disabled={!externalEnabled} label="协议/认证冷却秒数" value={configDraft.externalPoolProtocolErrorCooldownSecs} min={1} onChange={(externalPoolProtocolErrorCooldownSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolProtocolErrorCooldownSecs }))} />
+                  <NumberBox disabled={!externalEnabled} label="非流式总超时" value={configDraft.externalPoolRequestTimeoutSecs} onChange={(externalPoolRequestTimeoutSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolRequestTimeoutSecs }))} />
+                  <NumberBox disabled={!externalEnabled} label="流式总超时" value={configDraft.externalPoolStreamRequestTimeoutSecs} onChange={(externalPoolStreamRequestTimeoutSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolStreamRequestTimeoutSecs }))} />
+                  <NumberBox disabled={!externalEnabled} label="流式空闲超时" value={configDraft.externalPoolStreamIdleTimeoutSecs} onChange={(externalPoolStreamIdleTimeoutSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolStreamIdleTimeoutSecs }))} />
+                </div>
+              </FormSection>
+
+              <FormSection title="备用池失败后回本地" description="仅对本地失败后 fallback 到备用池的请求生效。命中后只回本地尝试一次，并禁止再次进入备用池。">
+                <div className="grid gap-3 md:grid-cols-4">
+                  <Toggle disabled={!externalEnabled} label="启用回本地" checked={configDraft.externalPoolLocalRescueEnabled} onChange={(externalPoolLocalRescueEnabled) => setConfigDraft((prev) => ({ ...prev, externalPoolLocalRescueEnabled }))} />
+                  <Toggle disabled={!localRescueActive} label="429 时回本地" checked={configDraft.externalPoolLocalRescueOnRateLimit} onChange={(externalPoolLocalRescueOnRateLimit) => setConfigDraft((prev) => ({ ...prev, externalPoolLocalRescueOnRateLimit }))} />
+                  <Toggle disabled={!localRescueActive} label="超时时回本地" checked={configDraft.externalPoolLocalRescueOnTimeout} onChange={(externalPoolLocalRescueOnTimeout) => setConfigDraft((prev) => ({ ...prev, externalPoolLocalRescueOnTimeout }))} />
+                  <NumberBox disabled={!localRescueActive} label="回本地最多等待" description="0 表示只立刻探测可用本地槽位；默认 15 秒。" value={configDraft.externalPoolLocalRescueMaxWaitSecs} onChange={(externalPoolLocalRescueMaxWaitSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolLocalRescueMaxWaitSecs }))} />
+                </div>
+              </FormSection>
             </div>
-            <p className="mt-3 text-xs leading-5 text-muted-foreground">
-              输出阈值或输出放大百分比为 0 时关闭输出补偿。比如阈值 1000、百分比 50 表示 output_tokens 达到 1000 后，最终上报 output_tokens 变为原值的 150%。
-            </p>
           </PolicyBlock>
 
           <PolicyBlock
-            title="本地优先 fallback"
-            active={fallbackActive}
-            description="备用号池启用后才生效；正常情况下先调度本地凭证，只有本地容量或可用性不足时才转到外部池。"
-          >
-            <div className="grid gap-4 md:grid-cols-4">
-              <Toggle disabled={!externalEnabled} label="本地容量预检 fail-fast" checked={configDraft.localPoolPreflightEnabled} onChange={(localPoolPreflightEnabled) => setConfigDraft((prev) => ({ ...prev, localPoolPreflightEnabled }))} />
-              <Toggle disabled={!externalEnabled} label="本地容量不足 fallback" checked={configDraft.fallbackOnLocalCapacityExhausted} onChange={(fallbackOnLocalCapacityExhausted) => setConfigDraft((prev) => ({ ...prev, fallbackOnLocalCapacityExhausted }))} />
-              <Toggle disabled={!externalEnabled} label="无可用凭据 fallback" checked={configDraft.fallbackOnNoAvailableCredentials} onChange={(fallbackOnNoAvailableCredentials) => setConfigDraft((prev) => ({ ...prev, fallbackOnNoAvailableCredentials }))} />
-              <Toggle disabled={!externalEnabled} label="本地瞬态耗尽 fallback" checked={configDraft.fallbackOnLocalTransientExhausted} onChange={(fallbackOnLocalTransientExhausted) => setConfigDraft((prev) => ({ ...prev, fallbackOnLocalTransientExhausted }))} />
-              <Toggle disabled={!externalEnabled} label="不支持模型 fallback" checked={configDraft.fallbackOnUnsupportedModel} onChange={(fallbackOnUnsupportedModel) => setConfigDraft((prev) => ({ ...prev, fallbackOnUnsupportedModel }))} />
-            </div>
-          </PolicyBlock>
-
-          <PolicyBlock
-            title="显式直连策略"
-            active={directPolicyActive}
-            description="这是主动绕过本地凭证的策略；关闭后维护态直连、模型规则和路径规则都不生效。"
-          >
-            <div className="grid gap-4 md:grid-cols-2">
-              <Toggle disabled={!externalEnabled} label="显式直连策略" checked={configDraft.externalDirectPolicyEnabled} onChange={(externalDirectPolicyEnabled) => setConfigDraft((prev) => ({ ...prev, externalDirectPolicyEnabled }))} />
-              <Toggle disabled={!directPolicyActive} label="本地维护直连外部池" checked={configDraft.directExternalOnLocalMaintenance} onChange={(directExternalOnLocalMaintenance) => setConfigDraft((prev) => ({ ...prev, directExternalOnLocalMaintenance }))} />
-            </div>
-            <div className="mt-4 grid gap-4 md:grid-cols-2">
-              <TextArea disabled={!directPolicyActive} label="直连模型规则，每行一条" value={modelRulesText} onChange={setModelRulesText} />
-              <TextArea disabled={!directPolicyActive} label="直连路径规则，每行一条" value={pathRulesText} onChange={setPathRulesText} />
-            </div>
-          </PolicyBlock>
-
-          <PolicyBlock
-            title="自动禁用外部池"
+            title="4. 外部池异常后怎么处理"
             active={autoDisableActive}
-            description="只控制外部池自身的自动禁用。单个外部池可在列表里继承、强制启用或禁用该全局策略。"
+            description="自动禁用只作用于外部池本身；单个外部池可选择继承、强制启用或关闭。"
           >
-            <div className="grid gap-4 md:grid-cols-4">
-              <Toggle disabled={!externalEnabled} label="自动禁用外部池" checked={configDraft.externalPoolAutoDisableEnabled} onChange={(externalPoolAutoDisableEnabled) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableEnabled }))} />
-              <Toggle disabled={!autoDisableActive} label="认证错误自动禁用" checked={configDraft.externalPoolAutoDisableOnAuthError} onChange={(externalPoolAutoDisableOnAuthError) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableOnAuthError }))} />
-              <Toggle disabled={!autoDisableActive} label="安全锁定自动禁用" checked={configDraft.externalPoolAutoDisableOnSecurityLock} onChange={(externalPoolAutoDisableOnSecurityLock) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableOnSecurityLock }))} />
-              <Toggle disabled={!autoDisableActive} label="额度耗尽自动禁用" checked={configDraft.externalPoolAutoDisableOnQuotaExhausted} onChange={(externalPoolAutoDisableOnQuotaExhausted) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableOnQuotaExhausted }))} />
-              <Toggle disabled={!autoDisableActive} label="配置错误自动禁用" checked={configDraft.externalPoolAutoDisableOnMisconfiguredEndpoint} onChange={(externalPoolAutoDisableOnMisconfiguredEndpoint) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableOnMisconfiguredEndpoint }))} />
-              <Toggle disabled={!autoDisableActive} label="通道禁用自动禁用" checked={configDraft.externalPoolAutoDisableOnChannelDisabled} onChange={(externalPoolAutoDisableOnChannelDisabled) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableOnChannelDisabled }))} />
-              <NumberBox disabled={!autoDisableActive} label="自动禁用阈值" value={configDraft.externalPoolAutoDisableFailureThreshold} min={1} onChange={(externalPoolAutoDisableFailureThreshold) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableFailureThreshold }))} />
-              <NumberBox disabled={!autoDisableActive} label="自动禁用统计窗口秒数" value={configDraft.externalPoolAutoDisableWindowSecs} min={1} onChange={(externalPoolAutoDisableWindowSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableWindowSecs }))} />
-              <NumberBox disabled={!autoDisableActive} label="自动禁用秒数（0 手动恢复）" value={configDraft.externalPoolAutoDisableDurationSecs} onChange={(externalPoolAutoDisableDurationSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableDurationSecs }))} />
+            <div className="grid gap-3 md:grid-cols-4">
+              <Toggle disabled={!externalEnabled} label="启用自动禁用" checked={configDraft.externalPoolAutoDisableEnabled} onChange={(externalPoolAutoDisableEnabled) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableEnabled }))} />
+              <Toggle disabled={!autoDisableActive} label="认证错误" checked={configDraft.externalPoolAutoDisableOnAuthError} onChange={(externalPoolAutoDisableOnAuthError) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableOnAuthError }))} />
+              <Toggle disabled={!autoDisableActive} label="安全锁定" checked={configDraft.externalPoolAutoDisableOnSecurityLock} onChange={(externalPoolAutoDisableOnSecurityLock) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableOnSecurityLock }))} />
+              <Toggle disabled={!autoDisableActive} label="额度耗尽" checked={configDraft.externalPoolAutoDisableOnQuotaExhausted} onChange={(externalPoolAutoDisableOnQuotaExhausted) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableOnQuotaExhausted }))} />
+              <Toggle disabled={!autoDisableActive} label="配置错误" checked={configDraft.externalPoolAutoDisableOnMisconfiguredEndpoint} onChange={(externalPoolAutoDisableOnMisconfiguredEndpoint) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableOnMisconfiguredEndpoint }))} />
+              <Toggle disabled={!autoDisableActive} label="通道禁用" checked={configDraft.externalPoolAutoDisableOnChannelDisabled} onChange={(externalPoolAutoDisableOnChannelDisabled) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableOnChannelDisabled }))} />
+              <NumberBox disabled={!autoDisableActive} label="触发阈值" value={configDraft.externalPoolAutoDisableFailureThreshold} min={1} onChange={(externalPoolAutoDisableFailureThreshold) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableFailureThreshold }))} />
+              <NumberBox disabled={!autoDisableActive} label="统计窗口秒数" value={configDraft.externalPoolAutoDisableWindowSecs} min={1} onChange={(externalPoolAutoDisableWindowSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableWindowSecs }))} />
+              <NumberBox disabled={!autoDisableActive} label="禁用秒数" value={configDraft.externalPoolAutoDisableDurationSecs} onChange={(externalPoolAutoDisableDurationSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableDurationSecs }))} />
             </div>
           </PolicyBlock>
 
           <PolicyBlock
-            title="保留字段"
-            active={false}
-            description="当前版本不会使用这些字段。页面保留展示但禁止编辑，避免误以为会影响调度。"
+            title="5. 返回给下游的 usage"
+            active={externalEnabled && usageCompensationActive}
+            description="只影响选择“按路径整形”的外部池。本地凭证和“严格透传”的外部池不会受影响。"
           >
-            <div className="grid gap-4 md:grid-cols-4">
-              <Toggle disabled label="本地池熔断字段（保留）" checked={configDraft.localPoolCircuitEnabled} onChange={(localPoolCircuitEnabled) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitEnabled }))} />
-              <NumberBox disabled label="熔断窗口秒数（保留）" value={configDraft.localPoolCircuitWindowSecs} min={1} onChange={(localPoolCircuitWindowSecs) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitWindowSecs }))} />
-              <NumberBox disabled label="熔断失败阈值（保留）" value={configDraft.localPoolCircuitOpenAfterFailures} min={1} onChange={(localPoolCircuitOpenAfterFailures) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitOpenAfterFailures }))} />
-              <NumberBox disabled label="熔断账号数（保留）" value={configDraft.localPoolCircuitRequireDistinctCredentials} onChange={(localPoolCircuitRequireDistinctCredentials) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitRequireDistinctCredentials }))} />
-              <NumberBox disabled label="熔断开启秒数（保留）" value={configDraft.localPoolCircuitOpenSecs} min={1} onChange={(localPoolCircuitOpenSecs) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitOpenSecs }))} />
-              <NumberBox disabled label="半开探测数（保留）" value={configDraft.localPoolCircuitHalfOpenMaxProbes} min={1} onChange={(localPoolCircuitHalfOpenMaxProbes) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitHalfOpenMaxProbes }))} />
+            <div className="space-y-4">
+              <HintBox>
+                生效条件：请求进入外部池，并且该外部池的 Usage 模式为“按路径整形”。如果外部池是“严格透传”，下面配置不会改写 usage。
+              </HintBox>
+              <div className="grid gap-4 lg:grid-cols-2">
+                <FormSection title="缓存读写补偿" description="按路径整形后，对上报的 cache read/write token 做补偿。">
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <Toggle disabled={!externalEnabled} label="启用缓存补偿" checked={cacheUpliftActive} onChange={setCacheUpliftEnabled} />
+                    <NumberBox disabled={!cacheUpliftActive} label="放大百分比" value={configDraft.externalPoolUsageProjectionUpliftPercent} onChange={(externalPoolUsageProjectionUpliftPercent) => setConfigDraft((prev) => ({ ...prev, externalPoolUsageProjectionUpliftPercent }))} />
+                  </div>
+                </FormSection>
+
+                <FormSection title="输出 token 补偿" description="当输出达到阈值后，放大最终上报给下游的 output_tokens。">
+                  <div className="grid gap-3 sm:grid-cols-3">
+                    <Toggle disabled={!externalEnabled} label="启用输出补偿" checked={outputUpliftActive} onChange={setOutputUpliftEnabled} />
+                    <NumberBox disabled={!outputUpliftActive} label="输出阈值" value={configDraft.externalPoolUsageProjectionOutputUpliftMinTokens} onChange={(externalPoolUsageProjectionOutputUpliftMinTokens) => setConfigDraft((prev) => ({ ...prev, externalPoolUsageProjectionOutputUpliftMinTokens }))} />
+                    <NumberBox disabled={!outputUpliftActive} label="放大百分比" value={configDraft.externalPoolUsageProjectionOutputUpliftPercent} onChange={(externalPoolUsageProjectionOutputUpliftPercent) => setConfigDraft((prev) => ({ ...prev, externalPoolUsageProjectionOutputUpliftPercent }))} />
+                  </div>
+                </FormSection>
+              </div>
             </div>
           </PolicyBlock>
+
           <Button onClick={saveConfig} disabled={savingConfig || runtimeConfig.isLoading}>
             <Save className="mr-2 h-4 w-4" />
             保存策略
@@ -339,32 +404,56 @@ export function ExternalPoolsPanel() {
             添加外部池
           </CardTitle>
         </CardHeader>
-        <CardContent className="grid gap-3 md:grid-cols-6">
-          <Input placeholder="名称" value={form.name} onChange={(event) => setForm((prev) => ({ ...prev, name: event.target.value }))} />
-          <Input className="md:col-span-2" placeholder="Base URL，例如 https://pool.example.com" value={form.baseUrl} onChange={(event) => setForm((prev) => ({ ...prev, baseUrl: event.target.value }))} />
-          <Input placeholder="请求 Key" value={form.apiKey} onChange={(event) => setForm((prev) => ({ ...prev, apiKey: event.target.value }))} />
-          <Input type="number" placeholder="单池最大并发" value={form.maxConcurrentRequests} onChange={(event) => setForm((prev) => ({ ...prev, maxConcurrentRequests: Number(event.target.value) }))} />
-          <Button onClick={submitPool}>
-            <Plus className="mr-2 h-4 w-4" />
-            添加
-          </Button>
-          <select className="h-10 rounded-md border bg-background px-3 text-sm" value={form.usageProjectionMode} onChange={(event) => setForm((prev) => ({ ...prev, usageProjectionMode: event.target.value as CreateExternalPoolRequest['usageProjectionMode'] }))}>
-            <option value="pass_through">严格透传 usage</option>
-            <option value="current_path_policy">按原请求路径整形缓存上报</option>
-          </select>
-          <select className="h-10 rounded-md border bg-background px-3 text-sm" value={form.authType} onChange={(event) => setForm((prev) => ({ ...prev, authType: event.target.value as CreateExternalPoolRequest['authType'] }))}>
-            <option value="bearer">Authorization Bearer</option>
-            <option value="x_api_key">x-api-key</option>
-          </select>
-          <select className="h-10 rounded-md border bg-background px-3 text-sm" value={form.autoDisablePolicy} onChange={(event) => setForm((prev) => ({ ...prev, autoDisablePolicy: event.target.value as CreateExternalPoolRequest['autoDisablePolicy'] }))}>
-            <option value="inherit">继承全局自动禁用</option>
-            <option value="enabled">强制允许自动禁用</option>
-            <option value="disabled">禁用自动禁用</option>
-          </select>
-          <div className="rounded-md border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-            备用池请求固定走自身 /v1/messages；原请求路径只用于缓存上报整形
+        <CardContent className="space-y-5">
+          <FormSection title="基础信息" description="外部池请求会使用这里的 Base URL 和 Key。">
+            <div className="grid gap-3 md:grid-cols-2">
+              <TextBox label="名称" value={form.name} onChange={(name) => setForm((prev) => ({ ...prev, name }))} />
+              <TextBox label="Base URL" description="填写到域名或 /v1 均可，系统会调用外部池的 /v1/messages。" value={form.baseUrl} onChange={(baseUrl) => setForm((prev) => ({ ...prev, baseUrl }))} />
+              <TextBox label="请求 Key" value={form.apiKey} onChange={(apiKey) => setForm((prev) => ({ ...prev, apiKey }))} />
+              <SelectBox label="认证方式" value={form.authType || 'bearer'} onChange={(authType) => setForm((prev) => ({ ...prev, authType: authType as CreateExternalPoolRequest['authType'] }))}>
+                <option value="bearer">Authorization Bearer</option>
+                <option value="x_api_key">x-api-key</option>
+              </SelectBox>
+            </div>
+          </FormSection>
+
+          <div className="grid gap-4 lg:grid-cols-2">
+            <FormSection title="调度能力" description="单池最大并发只限制这个外部池；优先级数字越小越靠前。">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <NumberBox label="单池最大并发" value={form.maxConcurrentRequests ?? 10} min={1} onChange={(maxConcurrentRequests) => setForm((prev) => ({ ...prev, maxConcurrentRequests }))} />
+                <NumberBox label="优先级" value={form.priority ?? 100} onChange={(priority) => setForm((prev) => ({ ...prev, priority }))} />
+                <Toggle label="启用外部池" checked={Boolean(form.enabled)} onChange={(enabled) => setForm((prev) => ({ ...prev, enabled }))} />
+              </div>
+            </FormSection>
+
+            <FormSection title="Usage 上报" description="严格透传不会改 usage；按路径整形会应用全局 usage 补偿。">
+              <div className="space-y-3">
+                <SelectBox label="Usage 模式" value={form.usageProjectionMode || 'pass_through'} onChange={(usageProjectionMode) => setForm((prev) => ({ ...prev, usageProjectionMode: usageProjectionMode as CreateExternalPoolRequest['usageProjectionMode'] }))}>
+                  <option value="pass_through">严格透传 usage</option>
+                  <option value="current_path_policy">按路径整形 usage</option>
+                </SelectBox>
+                <HintBox>{usageProjectionDescription(form.usageProjectionMode)}</HintBox>
+              </div>
+            </FormSection>
           </div>
-          <Input className="md:col-span-2" placeholder="备注" value={form.notes} onChange={(event) => setForm((prev) => ({ ...prev, notes: event.target.value }))} />
+
+          <FormSection title="错误处理和备注" description="自动禁用策略只控制这个外部池是否继承全局自动禁用。">
+            <div className="grid gap-3 md:grid-cols-2">
+              <SelectBox label="自动禁用策略" value={form.autoDisablePolicy || 'inherit'} onChange={(autoDisablePolicy) => setForm((prev) => ({ ...prev, autoDisablePolicy: autoDisablePolicy as CreateExternalPoolRequest['autoDisablePolicy'] }))}>
+                <option value="inherit">继承全局自动禁用</option>
+                <option value="enabled">强制启用自动禁用</option>
+                <option value="disabled">禁用自动禁用</option>
+              </SelectBox>
+              <TextBox label="备注" value={form.notes || ''} onChange={(notes) => setForm((prev) => ({ ...prev, notes }))} />
+            </div>
+          </FormSection>
+
+          <div className="flex justify-end">
+            <Button onClick={submitPool}>
+              <Plus className="mr-2 h-4 w-4" />
+              添加外部池
+            </Button>
+          </div>
         </CardContent>
       </Card>
 
@@ -376,34 +465,51 @@ export function ExternalPoolsPanel() {
             <Card key={pool.id}>
               <CardContent className="space-y-4 p-5">
                 {editing ? (
-                  <div className="grid gap-3 md:grid-cols-6">
-                    <Input placeholder="名称" value={editForm.name || ''} onChange={(event) => setEditForm((prev) => ({ ...prev, name: event.target.value }))} />
-                    <Input className="md:col-span-2" placeholder="Base URL" value={editForm.baseUrl || ''} onChange={(event) => setEditForm((prev) => ({ ...prev, baseUrl: event.target.value }))} />
-                    <Input placeholder="新 Key（留空不改）" value={editForm.apiKey || ''} onChange={(event) => setEditForm((prev) => ({ ...prev, apiKey: event.target.value }))} />
-                    <Input type="number" placeholder="单池最大并发" value={editForm.maxConcurrentRequests ?? 10} onChange={(event) => setEditForm((prev) => ({ ...prev, maxConcurrentRequests: Number(event.target.value) }))} />
-                    <Input type="number" placeholder="优先级" value={editForm.priority ?? 100} onChange={(event) => setEditForm((prev) => ({ ...prev, priority: Number(event.target.value) }))} />
-                    <select className="h-10 rounded-md border bg-background px-3 text-sm" value={editForm.usageProjectionMode} onChange={(event) => setEditForm((prev) => ({ ...prev, usageProjectionMode: event.target.value as UpdateExternalPoolRequest['usageProjectionMode'] }))}>
-                      <option value="pass_through">严格透传 usage</option>
-                      <option value="current_path_policy">按原请求路径整形缓存上报</option>
-                    </select>
-                    <select className="h-10 rounded-md border bg-background px-3 text-sm" value={editForm.authType} onChange={(event) => setEditForm((prev) => ({ ...prev, authType: event.target.value as UpdateExternalPoolRequest['authType'] }))}>
-                      <option value="bearer">Authorization Bearer</option>
-                      <option value="x_api_key">x-api-key</option>
-                    </select>
-                    <select className="h-10 rounded-md border bg-background px-3 text-sm" value={editForm.autoDisablePolicy} onChange={(event) => setEditForm((prev) => ({ ...prev, autoDisablePolicy: event.target.value as UpdateExternalPoolRequest['autoDisablePolicy'] }))}>
-                      <option value="inherit">继承全局自动禁用</option>
-                      <option value="enabled">强制允许自动禁用</option>
-                      <option value="disabled">禁用自动禁用</option>
-                    </select>
-                    <label className="flex items-center gap-2 text-sm">
-                      <Switch checked={Boolean(editForm.enabled)} onCheckedChange={(enabled) => setEditForm((prev) => ({ ...prev, enabled }))} />
-                      启用
-                    </label>
-                    <div className="rounded-md border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-                      请求固定走备用池 /v1/messages
+                  <div className="space-y-4">
+                    <FormSection title="基础信息">
+                      <div className="grid gap-3 md:grid-cols-2">
+                        <TextBox label="名称" value={editForm.name || ''} onChange={(name) => setEditForm((prev) => ({ ...prev, name }))} />
+                        <TextBox label="Base URL" value={editForm.baseUrl || ''} onChange={(baseUrl) => setEditForm((prev) => ({ ...prev, baseUrl }))} />
+                        <TextBox label="新 Key" description="留空表示不修改当前 Key。" value={editForm.apiKey || ''} onChange={(apiKey) => setEditForm((prev) => ({ ...prev, apiKey }))} />
+                        <SelectBox label="认证方式" value={editForm.authType || 'bearer'} onChange={(authType) => setEditForm((prev) => ({ ...prev, authType: authType as UpdateExternalPoolRequest['authType'] }))}>
+                          <option value="bearer">Authorization Bearer</option>
+                          <option value="x_api_key">x-api-key</option>
+                        </SelectBox>
+                      </div>
+                    </FormSection>
+
+                    <div className="grid gap-4 lg:grid-cols-2">
+                      <FormSection title="调度能力">
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <NumberBox label="单池最大并发" value={editForm.maxConcurrentRequests ?? 10} min={1} onChange={(maxConcurrentRequests) => setEditForm((prev) => ({ ...prev, maxConcurrentRequests }))} />
+                          <NumberBox label="优先级" value={editForm.priority ?? 100} onChange={(priority) => setEditForm((prev) => ({ ...prev, priority }))} />
+                          <Toggle label="启用外部池" checked={Boolean(editForm.enabled)} onChange={(enabled) => setEditForm((prev) => ({ ...prev, enabled }))} />
+                        </div>
+                      </FormSection>
+
+                      <FormSection title="Usage 上报">
+                        <div className="space-y-3">
+                          <SelectBox label="Usage 模式" value={editForm.usageProjectionMode || 'pass_through'} onChange={(usageProjectionMode) => setEditForm((prev) => ({ ...prev, usageProjectionMode: usageProjectionMode as UpdateExternalPoolRequest['usageProjectionMode'] }))}>
+                            <option value="pass_through">严格透传 usage</option>
+                            <option value="current_path_policy">按路径整形 usage</option>
+                          </SelectBox>
+                          <HintBox>{usageProjectionDescription(editForm.usageProjectionMode || 'pass_through')}</HintBox>
+                        </div>
+                      </FormSection>
                     </div>
-                    <Input className="md:col-span-2" placeholder="备注" value={editForm.notes || ''} onChange={(event) => setEditForm((prev) => ({ ...prev, notes: event.target.value }))} />
-                    <div className="flex gap-2 md:col-span-6">
+
+                    <FormSection title="错误处理和备注">
+                      <div className="grid gap-3 md:grid-cols-2">
+                        <SelectBox label="自动禁用策略" value={editForm.autoDisablePolicy || 'inherit'} onChange={(autoDisablePolicy) => setEditForm((prev) => ({ ...prev, autoDisablePolicy: autoDisablePolicy as UpdateExternalPoolRequest['autoDisablePolicy'] }))}>
+                          <option value="inherit">继承全局自动禁用</option>
+                          <option value="enabled">强制启用自动禁用</option>
+                          <option value="disabled">禁用自动禁用</option>
+                        </SelectBox>
+                        <TextBox label="备注" value={editForm.notes || ''} onChange={(notes) => setEditForm((prev) => ({ ...prev, notes }))} />
+                      </div>
+                    </FormSection>
+
+                    <div className="flex gap-2">
                       <Button size="sm" onClick={savePoolEdit}><Save className="mr-2 h-4 w-4" />保存</Button>
                       <Button variant="outline" size="sm" onClick={() => { setEditingPoolId(null); setEditForm({}) }}><X className="mr-2 h-4 w-4" />取消</Button>
                     </div>
@@ -418,7 +524,7 @@ export function ExternalPoolsPanel() {
                     <Badge variant={runtime?.dispatchable ? 'outline' : 'secondary'}>{runtime?.dispatchable ? '可调度' : runtime?.skippedReason || '不可调度'}</Badge>
                   </div>
                   <div className="text-sm text-muted-foreground">{pool.baseUrl} · {pool.maskedApiKey || '未显示 Key'} · 并发 {runtime?.inFlight ?? 0}/{pool.maxConcurrentRequests} · 优先级 {pool.priority}</div>
-                  <div className="text-xs text-muted-foreground">usage: {pool.usageProjectionMode} · auth: {pool.authType} · request: /v1/messages {runtime?.cooldownRemainingSecs ? `· 冷却 ${runtime.cooldownRemainingSecs}s` : ''}</div>
+                  <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · auth: {authLabel(pool.authType)} · request: /v1/messages {runtime?.cooldownRemainingSecs ? `· 冷却 ${runtime.cooldownRemainingSecs}s` : ''}</div>
                   {pool.autoDisabledLastError && <div className="text-xs text-destructive">{pool.autoDisabledLastError}</div>}
                   </div>
                   <div className="flex flex-wrap gap-2">
@@ -678,6 +784,35 @@ function PolicyBlock({
   )
 }
 
+function SummaryItem({ label, value }: { label: string; value: ReactNode }) {
+  return (
+    <div className="rounded-lg border bg-muted/20 p-3">
+      <div className="text-xs text-muted-foreground">{label}</div>
+      <div className="mt-1 text-sm font-semibold">{value}</div>
+    </div>
+  )
+}
+
+function FormSection({ title, description, children }: { title: string; description?: string; children: ReactNode }) {
+  return (
+    <section className="rounded-lg border bg-muted/10 p-3">
+      <div className="mb-3">
+        <div className="text-sm font-medium">{title}</div>
+        {description && <p className="mt-1 text-xs leading-5 text-muted-foreground">{description}</p>}
+      </div>
+      {children}
+    </section>
+  )
+}
+
+function HintBox({ children }: { children: ReactNode }) {
+  return (
+    <div className="rounded-md border bg-muted/30 px-3 py-2 text-xs leading-5 text-muted-foreground">
+      {children}
+    </div>
+  )
+}
+
 function Toggle({ label, checked, onChange, disabled = false }: { label: string; checked: boolean; onChange: (value: boolean) => void; disabled?: boolean }) {
   return (
     <label className={`flex items-center justify-between gap-3 rounded-md border p-3 text-sm ${disabled ? 'cursor-not-allowed bg-muted/40 opacity-60' : ''}`}>
@@ -687,11 +822,34 @@ function Toggle({ label, checked, onChange, disabled = false }: { label: string;
   )
 }
 
-function NumberBox({ label, value, min = 0, disabled = false, onChange }: { label: string; value: number; min?: number; disabled?: boolean; onChange: (value: number) => void }) {
+function TextBox({
+  label,
+  description,
+  value,
+  disabled = false,
+  onChange,
+}: {
+  label: string
+  description?: string
+  value: string
+  disabled?: boolean
+  onChange: (value: string) => void
+}) {
+  return (
+    <label className={`space-y-1 text-sm ${disabled ? 'cursor-not-allowed opacity-60' : ''}`}>
+      <span className="text-muted-foreground">{label}</span>
+      <Input value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)} />
+      {description && <span className="block text-xs leading-4 text-muted-foreground">{description}</span>}
+    </label>
+  )
+}
+
+function NumberBox({ label, description, value, min = 0, disabled = false, onChange }: { label: string; description?: string; value: number; min?: number; disabled?: boolean; onChange: (value: number) => void }) {
   return (
     <label className={`space-y-1 text-sm ${disabled ? 'cursor-not-allowed opacity-60' : ''}`}>
       <span className="text-muted-foreground">{label}</span>
       <Input type="number" min={min} value={value} disabled={disabled} onChange={(event) => onChange(Number(event.target.value))} />
+      {description && <span className="block text-xs leading-4 text-muted-foreground">{description}</span>}
     </label>
   )
 }
@@ -714,4 +872,29 @@ function TextArea({ label, value, disabled = false, onChange }: { label: string;
       <textarea className="min-h-24 w-full rounded-md border bg-background px-3 py-2 text-sm" value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)} />
     </label>
   )
+}
+
+function usageProjectionDescription(mode: ExternalPool['usageProjectionMode'] | undefined) {
+  if (mode === 'current_path_policy') {
+    return '按当前请求路径重新整理 usage，并应用全局 usage 补偿。适合希望外部池返回特征和本地路径一致的场景。'
+  }
+  return '严格透传外部池返回的 usage，不应用缓存补偿和输出补偿。适合只把外部池当作直接上游。'
+}
+
+function poolUsageSummary(pool: ExternalPool, config: ExternalPoolsConfig) {
+  if (pool.usageProjectionMode !== 'current_path_policy') {
+    return 'Usage: 严格透传'
+  }
+  const parts = ['Usage: 按路径整形']
+  if (config.externalPoolUsageProjectionUpliftPercent > 0) {
+    parts.push(`缓存 +${config.externalPoolUsageProjectionUpliftPercent}%`)
+  }
+  if (config.externalPoolUsageProjectionOutputUpliftMinTokens > 0 && config.externalPoolUsageProjectionOutputUpliftPercent > 0) {
+    parts.push(`输出 >= ${config.externalPoolUsageProjectionOutputUpliftMinTokens} 后 +${config.externalPoolUsageProjectionOutputUpliftPercent}%`)
+  }
+  return parts.join(' · ')
+}
+
+function authLabel(authType: ExternalPool['authType']) {
+  return authType === 'x_api_key' ? 'x-api-key' : 'Bearer'
 }

@@ -54,10 +54,13 @@ use super::types::{
     Thinking,
 };
 use super::usage::{
-    UsageRecord, UsageRecordStatus, UsageRouteKind, UsageRouteSubtype, UsageSource,
+    ExternalPoolAttempt, UsageRecord, UsageRecordStatus, UsageRouteKind, UsageRouteSubtype,
+    UsageSource,
 };
 use super::websearch;
-use crate::external_pool::{ExternalPoolManager, ExternalRouteRequest};
+use crate::external_pool::{
+    ExternalPoolFinalError, ExternalPoolForwardOutcome, ExternalPoolManager, ExternalRouteRequest,
+};
 use crate::kiro::call_trace::KiroCredentialAttempt;
 use crate::kiro::provider::{KiroProvider, KiroStreamCompletion};
 
@@ -95,6 +98,10 @@ struct RequestUsageContext {
     simulated_source: Option<UsageSource>,
     payload_breakdown: Option<PayloadByteBreakdown>,
     payload_guard_report: Option<PayloadGuardReport>,
+    route_subtype_override: Option<UsageRouteSubtype>,
+    fallback_reason: Option<String>,
+    local_preflight: Option<serde_json::Value>,
+    external_attempts: Vec<ExternalPoolAttempt>,
     started_at: Instant,
 }
 
@@ -419,6 +426,21 @@ impl ExternalFallbackContext {
         error_message: &str,
         local_attempts: Vec<KiroCredentialAttempt>,
     ) -> Option<Response> {
+        match self
+            .fallback_after_local_error_outcome(request_id, error_message, local_attempts)
+            .await?
+        {
+            ExternalPoolForwardOutcome::Response(response) => Some(response),
+            ExternalPoolForwardOutcome::FinalError(err) => Some(err.into_response(request_id)),
+        }
+    }
+
+    async fn fallback_after_local_error_outcome(
+        &self,
+        request_id: &str,
+        error_message: &str,
+        local_attempts: Vec<KiroCredentialAttempt>,
+    ) -> Option<ExternalPoolForwardOutcome> {
         let reason = classify_local_error_for_external_fallback(
             error_message,
             &local_attempts,
@@ -439,7 +461,7 @@ impl ExternalFallbackContext {
         };
         Some(
             self.manager
-                .forward_with_failover(
+                .forward_with_failover_result(
                     self.config.clone(),
                     self.route_request(
                         request_id.to_string(),
@@ -680,6 +702,18 @@ impl RequestUsageContext {
         self.payload_guard_report = Some(report);
     }
 
+    fn mark_local_rescue_after_external(
+        &mut self,
+        reason: impl Into<String>,
+        local_preflight: Option<serde_json::Value>,
+        external_attempts: Vec<ExternalPoolAttempt>,
+    ) {
+        self.route_subtype_override = Some(UsageRouteSubtype::LocalRescueAfterExternal);
+        self.fallback_reason = Some(reason.into());
+        self.local_preflight = local_preflight;
+        self.external_attempts = external_attempts;
+    }
+
     fn attach_provider_error_credential(
         self,
         provider: &crate::kiro::provider::KiroProvider,
@@ -803,10 +837,10 @@ fn log_provider_call_failure(message: &str) {
             credential_id = hint.id,
             credential_label = %hint.display_label(),
             error = %message,
-            "上游 API 调用失败"
+            "模型请求失败"
         );
     } else {
-        tracing::warn!(error = %message, "上游 API 调用失败");
+        tracing::warn!(error = %message, "模型请求失败");
     }
 }
 
@@ -830,13 +864,13 @@ fn log_provider_rate_limit_with_hint(message: &str, retry_after_secs: u64) {
             credential_label = %hint.display_label(),
             error = %message,
             retry_after_secs,
-            "上游或本地凭据调度临时不可用，返回 429"
+            "模型请求或本地凭据调度临时不可用，返回 429"
         );
     } else {
         tracing::warn!(
             error = %message,
             retry_after_secs,
-            "上游或本地凭据调度临时不可用，返回 429"
+            "模型请求或本地凭据调度临时不可用，返回 429"
         );
     }
 }
@@ -1124,18 +1158,20 @@ impl CredentialUsageContext {
             fallback_from_sticky: self.fallback_from_sticky,
             credential_attempts: self.credential_attempts.clone(),
             route_kind: Some(UsageRouteKind::LocalCredential),
-            route_subtype: Some(if status == UsageRecordStatus::Success {
-                UsageRouteSubtype::LocalSuccess
-            } else {
-                UsageRouteSubtype::LocalErrorNoFallback
-            }),
-            fallback_reason: None,
+            route_subtype: Some(self.request.route_subtype_override.unwrap_or_else(|| {
+                if status == UsageRecordStatus::Success {
+                    UsageRouteSubtype::LocalSuccess
+                } else {
+                    UsageRouteSubtype::LocalErrorNoFallback
+                }
+            })),
+            fallback_reason: self.request.fallback_reason.clone(),
             direct_policy_reason: None,
             local_attempted: Some(true),
-            local_preflight: None,
+            local_preflight: self.request.local_preflight.clone(),
             external_pool_id: None,
             external_pool_name: None,
-            external_attempts: Vec::new(),
+            external_attempts: self.request.external_attempts.clone(),
             usage_projection_applied: None,
             external_pool_billing: None,
             error_type,
@@ -1686,6 +1722,10 @@ fn prepare_usage_context(
         simulated_source,
         payload_breakdown: None,
         payload_guard_report: None,
+        route_subtype_override: None,
+        fallback_reason: None,
+        local_preflight: None,
+        external_attempts: Vec::new(),
         started_at: Instant::now(),
     }
 }
@@ -1803,10 +1843,10 @@ fn map_provider_error(
 ) -> Response {
     let err_str = err.to_string();
 
-    // Kiro 上游的 content length 阈值与模型上下文窗口不是同一层限制。
+    // Provider content length thresholds and model context windows are different limits.
     if is_upstream_payload_too_long_error(&err_str) {
-        let message = "Kiro upstream rejected the request because input content length exceeded its request threshold. This limit is separate from the model context window. Reduce oversized tools, system prompt, documents, images, tool results, or conversation history.";
-        log_provider_warning_with_hint(&err_str, "上游拒绝请求：输入内容长度超过接口阈值");
+        let message = "Request input content length exceeded the request threshold. This limit is separate from the model context window. Reduce oversized tools, system prompt, documents, images, tool results, or conversation history.";
+        log_provider_warning_with_hint(&err_str, "请求被拒绝：输入内容长度超过接口阈值");
         return if let Some(request_id) = request_id {
             envelope::error_response_with_id(
                 StatusCode::BAD_REQUEST,
@@ -1820,8 +1860,8 @@ fn map_provider_error(
     }
 
     if is_upstream_context_window_full_error(&err_str) {
-        let message = "Kiro upstream rejected the request because the context window is full. Reduce conversation history, system prompt, tools, documents, images, or tool results.";
-        log_provider_warning_with_hint(&err_str, "上游拒绝请求：上下文窗口已满");
+        let message = "Context window is full. Reduce conversation history, system prompt, tools, documents, images, or tool results.";
+        log_provider_warning_with_hint(&err_str, "请求被拒绝：上下文窗口已满");
         return if let Some(request_id) = request_id {
             envelope::error_response_with_id(
                 StatusCode::BAD_REQUEST,
@@ -1837,9 +1877,9 @@ fn map_provider_error(
     if is_upstream_improperly_formed_error(&err_str) {
         log_provider_warning_with_hint(
             &err_str,
-            "上游拒绝请求：Kiro payload 形态不合法（不应切换账号重试）",
+            "请求被拒绝：Kiro payload 形态不合法（不应切换账号重试）",
         );
-        let message = "Kiro rejected the converted request as improperly formed. Check model mapping, tool_use/tool_result pairing, tool schema, multimodal sources, and payload size.";
+        let message = "Converted request is improperly formed. Check model mapping, tool_use/tool_result pairing, tool schema, multimodal sources, and payload size.";
         return if let Some(request_id) = request_id {
             envelope::error_response_with_id(
                 StatusCode::BAD_REQUEST,
@@ -1865,7 +1905,7 @@ fn map_provider_error(
             .unwrap_or_else(|| cooldown_retry_after_secs(provider, 1));
         log_provider_rate_limit_with_hint(&err_str, retry_after_secs);
         let message = format!(
-            "Upstream temporarily rate limited. Retry after {} seconds.",
+            "Too many requests. Retry after {} seconds.",
             retry_after_secs
         );
         return if let Some(request_id) = request_id {
@@ -1905,18 +1945,9 @@ fn map_provider_error(
 
     log_provider_error_with_hint(&err_str, "Kiro API 调用失败");
     if let Some(request_id) = request_id {
-        envelope::error_response_with_id(
-            StatusCode::BAD_GATEWAY,
-            "api_error",
-            format!("上游 API 调用失败: {}", err),
-            request_id,
-        )
+        envelope::error_response_with_id(StatusCode::BAD_GATEWAY, "api_error", err_str, request_id)
     } else {
-        envelope::error_response(
-            StatusCode::BAD_GATEWAY,
-            "api_error",
-            format!("上游 API 调用失败: {}", err),
-        )
+        envelope::error_response(StatusCode::BAD_GATEWAY, "api_error", err_str)
     }
 }
 
@@ -2576,6 +2607,47 @@ async fn maybe_forward_external_after_local_error(
         .await
 }
 
+async fn maybe_external_fallback_after_local_error_outcome(
+    external_fallback: Option<&ExternalFallbackContext>,
+    request_id: &str,
+    message: &str,
+    attempts: Vec<KiroCredentialAttempt>,
+) -> Option<ExternalPoolForwardOutcome> {
+    external_fallback?
+        .fallback_after_local_error_outcome(request_id, message, attempts)
+        .await
+}
+
+fn local_rescue_reason_after_external_error(
+    config: &ExternalPoolsConfig,
+    err: &ExternalPoolFinalError,
+) -> Option<&'static str> {
+    if !config.external_pool_local_rescue_enabled {
+        return None;
+    }
+    if config.external_pool_local_rescue_on_rate_limit && err.is_rate_limit() {
+        return Some("external_rate_limit");
+    }
+    if config.external_pool_local_rescue_on_timeout && err.is_timeout_like() {
+        return Some("external_timeout");
+    }
+    None
+}
+
+fn external_rescue_preflight(reason: &str, err: &ExternalPoolFinalError) -> serde_json::Value {
+    json!({
+        "reason": reason,
+        "externalStatus": err.status.as_u16(),
+        "externalErrorType": err.route_error_type,
+        "externalResponseErrorType": err.response_error_type,
+        "externalRetryable": err.retryable,
+        "externalPoolId": err.pool_id,
+        "externalPoolName": err.pool_name,
+        "externalAttemptCount": err.attempts.len(),
+        "externalError": err.message,
+    })
+}
+
 /// 处理流式请求
 async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -2654,7 +2726,7 @@ async fn handle_stream_request(
                         let all_attempts =
                             merge_credential_attempts(retry_attempt_prefix.clone(), retry_attempts);
                         log_provider_call_failure(&retry_message);
-                        if let Some(response) = maybe_forward_external_after_local_error(
+                        if let Some(outcome) = maybe_external_fallback_after_local_error_outcome(
                             external_fallback.as_ref(),
                             &request_id,
                             &retry_message,
@@ -2662,24 +2734,103 @@ async fn handle_stream_request(
                         )
                         .await
                         {
-                            return response;
+                            match outcome {
+                                ExternalPoolForwardOutcome::Response(response) => return response,
+                                ExternalPoolForwardOutcome::FinalError(err) => {
+                                    if let Some(external) = external_fallback.as_ref() {
+                                        if let Some(reason) =
+                                            local_rescue_reason_after_external_error(
+                                                &external.config,
+                                                &err,
+                                            )
+                                        {
+                                            tracing::warn!(
+                                                request_id,
+                                                reason,
+                                                max_wait_secs = external
+                                                    .config
+                                                    .external_pool_local_rescue_max_wait_secs,
+                                                "external fallback failed with a rescuable error; retrying local credentials once"
+                                            );
+                                            usage_context.mark_local_rescue_after_external(
+                                                reason,
+                                                Some(external_rescue_preflight(reason, &err)),
+                                                err.attempts.clone(),
+                                            );
+                                            retry_attempt_prefix = all_attempts.clone();
+                                            match provider
+                                                .call_api_stream_with_request_id_max_wait(
+                                                    &retry_body,
+                                                    Some(&request_id),
+                                                    Duration::from_secs(
+                                                        external
+                                                            .config
+                                                            .external_pool_local_rescue_max_wait_secs,
+                                                    ),
+                                                )
+                                                .await
+                                            {
+                                                Ok(resp) => resp,
+                                                Err(rescue_error) => {
+                                                    let rescue_message = rescue_error.to_string();
+                                                    let rescue_attempts =
+                                                        KiroProvider::attempts_from_error(
+                                                            &rescue_error,
+                                                        );
+                                                    let all_attempts =
+                                                        merge_credential_attempts(
+                                                            retry_attempt_prefix.clone(),
+                                                            rescue_attempts,
+                                                        );
+                                                    log_provider_call_failure(&rescue_message);
+                                                    usage_context
+                                                        .attach_provider_error_credential(
+                                                            &provider,
+                                                            &rescue_message,
+                                                            all_attempts,
+                                                        )
+                                                        .record_failure(
+                                                            UsageRecordStatus::Error,
+                                                            "api_error",
+                                                            rescue_message,
+                                                        );
+                                                    return map_provider_error(
+                                                        rescue_error,
+                                                        Some(&request_id),
+                                                        Some(provider.as_ref()),
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            return err.into_response(&request_id);
+                                        }
+                                    } else {
+                                        return err.into_response(&request_id);
+                                    }
+                                }
+                            }
+                        } else {
+                            usage_context
+                                .attach_provider_error_credential(
+                                    &provider,
+                                    &retry_message,
+                                    all_attempts,
+                                )
+                                .record_failure(
+                                    UsageRecordStatus::Error,
+                                    "api_error",
+                                    retry_message,
+                                );
+                            return map_provider_error(
+                                retry_error,
+                                Some(&request_id),
+                                Some(provider.as_ref()),
+                            );
                         }
-                        usage_context
-                            .attach_provider_error_credential(
-                                &provider,
-                                &retry_message,
-                                all_attempts,
-                            )
-                            .record_failure(UsageRecordStatus::Error, "api_error", retry_message);
-                        return map_provider_error(
-                            retry_error,
-                            Some(&request_id),
-                            Some(provider.as_ref()),
-                        );
                     }
                 }
             } else {
-                if let Some(response) = maybe_forward_external_after_local_error(
+                if let Some(outcome) = maybe_external_fallback_after_local_error_outcome(
                     external_fallback.as_ref(),
                     &request_id,
                     &message,
@@ -2687,12 +2838,81 @@ async fn handle_stream_request(
                 )
                 .await
                 {
-                    return response;
+                    match outcome {
+                        ExternalPoolForwardOutcome::Response(response) => return response,
+                        ExternalPoolForwardOutcome::FinalError(err) => {
+                            if let Some(external) = external_fallback.as_ref() {
+                                if let Some(reason) =
+                                    local_rescue_reason_after_external_error(&external.config, &err)
+                                {
+                                    tracing::warn!(
+                                        request_id,
+                                        reason,
+                                        max_wait_secs = external
+                                            .config
+                                            .external_pool_local_rescue_max_wait_secs,
+                                        "external fallback failed with a rescuable error; retrying local credentials once"
+                                    );
+                                    usage_context.mark_local_rescue_after_external(
+                                        reason,
+                                        Some(external_rescue_preflight(reason, &err)),
+                                        err.attempts.clone(),
+                                    );
+                                    retry_attempt_prefix = attempts.clone();
+                                    match provider
+                                        .call_api_stream_with_request_id_max_wait(
+                                            request_body,
+                                            Some(&request_id),
+                                            Duration::from_secs(
+                                                external
+                                                    .config
+                                                    .external_pool_local_rescue_max_wait_secs,
+                                            ),
+                                        )
+                                        .await
+                                    {
+                                        Ok(resp) => resp,
+                                        Err(rescue_error) => {
+                                            let rescue_message = rescue_error.to_string();
+                                            let rescue_attempts =
+                                                KiroProvider::attempts_from_error(&rescue_error);
+                                            let all_attempts = merge_credential_attempts(
+                                                retry_attempt_prefix.clone(),
+                                                rescue_attempts,
+                                            );
+                                            log_provider_call_failure(&rescue_message);
+                                            usage_context
+                                                .attach_provider_error_credential(
+                                                    &provider,
+                                                    &rescue_message,
+                                                    all_attempts,
+                                                )
+                                                .record_failure(
+                                                    UsageRecordStatus::Error,
+                                                    "api_error",
+                                                    rescue_message,
+                                                );
+                                            return map_provider_error(
+                                                rescue_error,
+                                                Some(&request_id),
+                                                Some(provider.as_ref()),
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    return err.into_response(&request_id);
+                                }
+                            } else {
+                                return err.into_response(&request_id);
+                            }
+                        }
+                    }
+                } else {
+                    usage_context
+                        .attach_provider_error_credential(&provider, &message, attempts)
+                        .record_failure(UsageRecordStatus::Error, "api_error", message);
+                    return map_provider_error(e, Some(&request_id), Some(provider.as_ref()));
                 }
-                usage_context
-                    .attach_provider_error_credential(&provider, &message, attempts)
-                    .record_failure(UsageRecordStatus::Error, "api_error", message);
-                return map_provider_error(e, Some(&request_id), Some(provider.as_ref()));
             }
         }
     };
@@ -3023,7 +3243,7 @@ async fn handle_non_stream_request(
                         let all_attempts =
                             merge_credential_attempts(retry_attempt_prefix.clone(), retry_attempts);
                         log_provider_call_failure(&retry_message);
-                        if let Some(response) = maybe_forward_external_after_local_error(
+                        if let Some(outcome) = maybe_external_fallback_after_local_error_outcome(
                             external_fallback.as_ref(),
                             &request_id,
                             &retry_message,
@@ -3031,24 +3251,103 @@ async fn handle_non_stream_request(
                         )
                         .await
                         {
-                            return response;
+                            match outcome {
+                                ExternalPoolForwardOutcome::Response(response) => return response,
+                                ExternalPoolForwardOutcome::FinalError(err) => {
+                                    if let Some(external) = external_fallback.as_ref() {
+                                        if let Some(reason) =
+                                            local_rescue_reason_after_external_error(
+                                                &external.config,
+                                                &err,
+                                            )
+                                        {
+                                            tracing::warn!(
+                                                request_id,
+                                                reason,
+                                                max_wait_secs = external
+                                                    .config
+                                                    .external_pool_local_rescue_max_wait_secs,
+                                                "external fallback failed with a rescuable error; retrying local credentials once"
+                                            );
+                                            usage_context.mark_local_rescue_after_external(
+                                                reason,
+                                                Some(external_rescue_preflight(reason, &err)),
+                                                err.attempts.clone(),
+                                            );
+                                            retry_attempt_prefix = all_attempts.clone();
+                                            match provider
+                                                .call_api_with_context_with_request_id_max_wait(
+                                                    &retry_body,
+                                                    Some(&request_id),
+                                                    Duration::from_secs(
+                                                        external
+                                                            .config
+                                                            .external_pool_local_rescue_max_wait_secs,
+                                                    ),
+                                                )
+                                                .await
+                                            {
+                                                Ok(resp) => resp,
+                                                Err(rescue_error) => {
+                                                    let rescue_message = rescue_error.to_string();
+                                                    let rescue_attempts =
+                                                        KiroProvider::attempts_from_error(
+                                                            &rescue_error,
+                                                        );
+                                                    let all_attempts =
+                                                        merge_credential_attempts(
+                                                            retry_attempt_prefix.clone(),
+                                                            rescue_attempts,
+                                                        );
+                                                    log_provider_call_failure(&rescue_message);
+                                                    usage_context
+                                                        .attach_provider_error_credential(
+                                                            &provider,
+                                                            &rescue_message,
+                                                            all_attempts,
+                                                        )
+                                                        .record_failure(
+                                                            UsageRecordStatus::Error,
+                                                            "api_error",
+                                                            rescue_message,
+                                                        );
+                                                    return map_provider_error(
+                                                        rescue_error,
+                                                        Some(&request_id),
+                                                        Some(provider.as_ref()),
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            return err.into_response(&request_id);
+                                        }
+                                    } else {
+                                        return err.into_response(&request_id);
+                                    }
+                                }
+                            }
+                        } else {
+                            usage_context
+                                .attach_provider_error_credential(
+                                    &provider,
+                                    &retry_message,
+                                    all_attempts,
+                                )
+                                .record_failure(
+                                    UsageRecordStatus::Error,
+                                    "api_error",
+                                    retry_message,
+                                );
+                            return map_provider_error(
+                                retry_error,
+                                Some(&request_id),
+                                Some(provider.as_ref()),
+                            );
                         }
-                        usage_context
-                            .attach_provider_error_credential(
-                                &provider,
-                                &retry_message,
-                                all_attempts,
-                            )
-                            .record_failure(UsageRecordStatus::Error, "api_error", retry_message);
-                        return map_provider_error(
-                            retry_error,
-                            Some(&request_id),
-                            Some(provider.as_ref()),
-                        );
                     }
                 }
             } else {
-                if let Some(response) = maybe_forward_external_after_local_error(
+                if let Some(outcome) = maybe_external_fallback_after_local_error_outcome(
                     external_fallback.as_ref(),
                     &request_id,
                     &message,
@@ -3056,12 +3355,81 @@ async fn handle_non_stream_request(
                 )
                 .await
                 {
-                    return response;
+                    match outcome {
+                        ExternalPoolForwardOutcome::Response(response) => return response,
+                        ExternalPoolForwardOutcome::FinalError(err) => {
+                            if let Some(external) = external_fallback.as_ref() {
+                                if let Some(reason) =
+                                    local_rescue_reason_after_external_error(&external.config, &err)
+                                {
+                                    tracing::warn!(
+                                        request_id,
+                                        reason,
+                                        max_wait_secs = external
+                                            .config
+                                            .external_pool_local_rescue_max_wait_secs,
+                                        "external fallback failed with a rescuable error; retrying local credentials once"
+                                    );
+                                    usage_context.mark_local_rescue_after_external(
+                                        reason,
+                                        Some(external_rescue_preflight(reason, &err)),
+                                        err.attempts.clone(),
+                                    );
+                                    retry_attempt_prefix = attempts.clone();
+                                    match provider
+                                        .call_api_with_context_with_request_id_max_wait(
+                                            request_body,
+                                            Some(&request_id),
+                                            Duration::from_secs(
+                                                external
+                                                    .config
+                                                    .external_pool_local_rescue_max_wait_secs,
+                                            ),
+                                        )
+                                        .await
+                                    {
+                                        Ok(resp) => resp,
+                                        Err(rescue_error) => {
+                                            let rescue_message = rescue_error.to_string();
+                                            let rescue_attempts =
+                                                KiroProvider::attempts_from_error(&rescue_error);
+                                            let all_attempts = merge_credential_attempts(
+                                                retry_attempt_prefix.clone(),
+                                                rescue_attempts,
+                                            );
+                                            log_provider_call_failure(&rescue_message);
+                                            usage_context
+                                                .attach_provider_error_credential(
+                                                    &provider,
+                                                    &rescue_message,
+                                                    all_attempts,
+                                                )
+                                                .record_failure(
+                                                    UsageRecordStatus::Error,
+                                                    "api_error",
+                                                    rescue_message,
+                                                );
+                                            return map_provider_error(
+                                                rescue_error,
+                                                Some(&request_id),
+                                                Some(provider.as_ref()),
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    return err.into_response(&request_id);
+                                }
+                            } else {
+                                return err.into_response(&request_id);
+                            }
+                        }
+                    }
+                } else {
+                    usage_context
+                        .attach_provider_error_credential(&provider, &message, attempts)
+                        .record_failure(UsageRecordStatus::Error, "api_error", message);
+                    return map_provider_error(e, Some(&request_id), Some(provider.as_ref()));
                 }
-                usage_context
-                    .attach_provider_error_credential(&provider, &message, attempts)
-                    .record_failure(UsageRecordStatus::Error, "api_error", message);
-                return map_provider_error(e, Some(&request_id), Some(provider.as_ref()));
             }
         }
     };
@@ -4042,6 +4410,10 @@ mod tests {
             simulated_source: Some(UsageSource::LocalPromptCache),
             payload_breakdown: None,
             payload_guard_report: None,
+            route_subtype_override: None,
+            fallback_reason: None,
+            local_preflight: None,
+            external_attempts: Vec::new(),
             started_at: Instant::now(),
         };
         let usage = CacheUsage {
@@ -4123,6 +4495,10 @@ mod tests {
             simulated_source: Some(UsageSource::LocalPromptCache),
             payload_breakdown: None,
             payload_guard_report: None,
+            route_subtype_override: None,
+            fallback_reason: None,
+            local_preflight: None,
+            external_attempts: Vec::new(),
             started_at: Instant::now(),
         };
         let cc_context = RequestUsageContext {
@@ -4269,6 +4645,10 @@ mod tests {
             simulated_source: None,
             payload_breakdown: None,
             payload_guard_report: None,
+            route_subtype_override: None,
+            fallback_reason: None,
+            local_preflight: None,
+            external_attempts: Vec::new(),
             started_at: Instant::now(),
         };
         usage_context
@@ -4366,6 +4746,10 @@ mod tests {
             simulated_source: Some(UsageSource::LocalPromptCache),
             payload_breakdown: None,
             payload_guard_report: None,
+            route_subtype_override: None,
+            fallback_reason: None,
+            local_preflight: None,
+            external_attempts: Vec::new(),
             started_at: Instant::now(),
         }
         .attach_credential(Some(1), None, false, false, Vec::new());
@@ -4450,6 +4834,10 @@ mod tests {
             simulated_source: Some(UsageSource::LocalPromptCache),
             payload_breakdown: None,
             payload_guard_report: None,
+            route_subtype_override: None,
+            fallback_reason: None,
+            local_preflight: None,
+            external_attempts: Vec::new(),
             started_at: Instant::now(),
         }
         .attach_credential(Some(1), None, false, false, Vec::new());
@@ -4856,6 +5244,71 @@ mod tests {
             )
             .as_deref(),
             Some("unsupported_model")
+        );
+    }
+
+    #[test]
+    fn external_local_rescue_classifier_respects_error_type_and_toggles() {
+        let config = ExternalPoolsConfig::default();
+        let rate_limit = ExternalPoolFinalError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            response_error_type: "rate_limit_error".to_string(),
+            route_error_type: "rate_limit".to_string(),
+            message:
+                r#"{"message":"Too many requests, please wait before trying again.","reason":"SERVICE_REQUEST_RATE_EXCEEDED"}"#
+                    .to_string(),
+            retryable: true,
+            attempts: Vec::new(),
+            pool_id: Some(1),
+            pool_name: Some("backup".to_string()),
+        };
+        assert_eq!(
+            local_rescue_reason_after_external_error(&config, &rate_limit),
+            Some("external_rate_limit")
+        );
+
+        let timeout = ExternalPoolFinalError {
+            status: StatusCode::BAD_GATEWAY,
+            response_error_type: "api_error".to_string(),
+            route_error_type: "network_error".to_string(),
+            message: "stream idle timeout".to_string(),
+            retryable: true,
+            attempts: Vec::new(),
+            pool_id: Some(1),
+            pool_name: Some("backup".to_string()),
+        };
+        assert_eq!(
+            local_rescue_reason_after_external_error(&config, &timeout),
+            Some("external_timeout")
+        );
+
+        let bad_request = ExternalPoolFinalError {
+            status: StatusCode::BAD_REQUEST,
+            response_error_type: "invalid_request_error".to_string(),
+            route_error_type: "client_error".to_string(),
+            message: "Improperly formed request".to_string(),
+            retryable: false,
+            attempts: Vec::new(),
+            pool_id: Some(1),
+            pool_name: Some("backup".to_string()),
+        };
+        assert_eq!(
+            local_rescue_reason_after_external_error(&config, &bad_request),
+            None
+        );
+
+        let mut disabled = config.clone();
+        disabled.external_pool_local_rescue_enabled = false;
+        assert_eq!(
+            local_rescue_reason_after_external_error(&disabled, &rate_limit),
+            None
+        );
+
+        let mut no_rate_limit = config;
+        no_rate_limit.external_pool_local_rescue_on_rate_limit = false;
+        assert_eq!(
+            local_rescue_reason_after_external_error(&no_rate_limit, &rate_limit),
+            None
         );
     }
 

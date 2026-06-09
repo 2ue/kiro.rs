@@ -263,6 +263,25 @@ impl ModelCapabilitiesCatalog {
                 .collect();
         }
         let mut inner = self.inner.write();
+        if !using_seed_fallback && !contains_claude_model_id(merged.keys().map(String::as_str)) {
+            let previous_claude_models = inner
+                .models
+                .values()
+                .filter(|item| is_claude_model_id(&item.model))
+                .cloned()
+                .collect::<Vec<_>>();
+            let fallback_claude_models = if previous_claude_models.is_empty() {
+                seed_model_capabilities()
+                    .into_iter()
+                    .filter(|item| is_claude_model_id(&item.model))
+                    .collect::<Vec<_>>()
+            } else {
+                previous_claude_models
+            };
+            for item in fallback_claude_models {
+                merged.entry(item.model.clone()).or_insert(item);
+            }
+        }
         let manual_models = inner
             .models
             .values()
@@ -1069,6 +1088,16 @@ fn model_matches_family(model: &str, family: &str) -> bool {
     model == family || model.starts_with(&format!("claude-{}", family))
 }
 
+fn contains_claude_model_id<'a>(models: impl IntoIterator<Item = &'a str>) -> bool {
+    models.into_iter().any(is_claude_model_id)
+}
+
+fn is_claude_model_id(model: &str) -> bool {
+    ["claude-opus-", "claude-sonnet-", "claude-haiku-"]
+        .into_iter()
+        .any(|prefix| model.starts_with(prefix))
+}
+
 fn family_candidate_key(model: &str) -> (bool, bool, Vec<u32>, bool) {
     let versions = model_version_numbers(model);
     (
@@ -1271,6 +1300,42 @@ mod tests {
             .find(|model| model.id == "claude-sonnet-4-9-20270101")
             .unwrap();
         assert_eq!(synced.max_tokens, 128_000);
+    }
+
+    #[test]
+    fn sync_from_kiro_models_preserves_claude_alias_targets_when_sync_omits_all_claude_models() {
+        let catalog = ModelCapabilitiesCatalog::new();
+        let status = catalog.sync_from_kiro_models(vec![KiroAvailableModel {
+            model_id: "deepseek-3.2".to_string(),
+            model_name: Some("Deepseek v3.2".to_string()),
+            token_limits: Some(KiroModelTokenLimits {
+                max_input_tokens: Some(164_000),
+                max_output_tokens: Some(64_000),
+            }),
+            ..Default::default()
+        }]);
+
+        assert_eq!(status.source, KIRO_SOURCE);
+        assert!(
+            status
+                .models
+                .iter()
+                .any(|model| model.model == "deepseek-3.2")
+        );
+        assert!(
+            status
+                .models
+                .iter()
+                .any(|model| model.model.contains("sonnet"))
+        );
+        let sonnet = catalog.resolve_model("sonnet");
+        assert_eq!(sonnet.source, ModelResolutionSource::Alias);
+        assert!(
+            sonnet
+                .upstream_model
+                .as_deref()
+                .is_some_and(|model| model.starts_with("claude-sonnet-"))
+        );
     }
 
     #[test]
@@ -1596,6 +1661,26 @@ mod tests {
         let haiku = resolve_model_with_catalog("haiku", &models);
         assert_eq!(haiku.source, ModelResolutionSource::Alias);
         assert_eq!(haiku.upstream_model.as_deref(), Some("claude-haiku-4.5"));
+    }
+
+    #[test]
+    fn resolver_maps_sonnet_alias_to_synced_dot_45_when_alias_absent() {
+        let models = vec![
+            "auto".to_string(),
+            "claude-haiku-4.5".to_string(),
+            "claude-sonnet-4".to_string(),
+            "claude-sonnet-4.5".to_string(),
+            "deepseek-3.2".to_string(),
+            "glm-5".to_string(),
+            "minimax-m2.1".to_string(),
+            "minimax-m2.5".to_string(),
+            "qwen3-coder-next".to_string(),
+        ];
+
+        let sonnet = resolve_model_with_catalog("sonnet", &models);
+
+        assert_eq!(sonnet.source, ModelResolutionSource::Alias);
+        assert_eq!(sonnet.upstream_model.as_deref(), Some("claude-sonnet-4.5"));
     }
 
     #[test]

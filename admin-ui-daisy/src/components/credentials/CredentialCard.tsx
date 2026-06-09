@@ -1,6 +1,4 @@
 import {
-  ChevronDown,
-  ChevronUp,
   Eye,
   EyeOff,
   Gauge,
@@ -137,9 +135,7 @@ function maskSecret(value?: string | null): string {
 interface CredentialCardProps {
   credential: CredentialStatusItem
   selected: boolean
-  expanded: boolean
   onToggleSelect: () => void
-  onToggleExpand: () => void
   onQueryBalance: (id: number) => void
   onTest: (credential: CredentialStatusItem) => void
   balance?: BalanceResponse
@@ -149,9 +145,7 @@ interface CredentialCardProps {
 export function CredentialCard({
   credential,
   selected,
-  expanded,
   onToggleSelect,
-  onToggleExpand,
   onQueryBalance,
   onTest,
   balance,
@@ -333,11 +327,7 @@ export function CredentialCard({
         <div className="flex items-center gap-3 p-3">
           <Checkbox size="xs" checked={selected} onChange={onToggleSelect} />
 
-          <button
-            type="button"
-            className="min-w-0 flex-1 text-left"
-            onClick={onToggleExpand}
-          >
+          <div className="min-w-0 flex-1 text-left">
             <div className="flex items-center gap-2">
               <span className="truncate text-sm font-semibold" title={credentialLabel(credential)}>
                 {credentialLabel(credential)}
@@ -365,7 +355,7 @@ export function CredentialCard({
                 <Badge tone="error" size="xs">错误 {transientFailureStreak}</Badge>
               )}
             </div>
-          </button>
+          </div>
 
           <div className="flex shrink-0 items-center gap-1">
             <Toggle
@@ -383,21 +373,11 @@ export function CredentialCard({
                 )
               }
             />
-            <Button
-              type="button"
-              color="ghost"
-              size="xs"
-              shape="square"
-              onClick={onToggleExpand}
-            >
-              {expanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
-            </Button>
           </div>
         </div>
 
-        {/* Expanded Details */}
-        {expanded && (
-          <div className="animate-slide-down border-t border-base-300/50 bg-base-200/30 p-3">
+        {/* Details */}
+        <div className="border-t border-base-300/50 bg-base-200/30 p-3">
             {/* Stats Grid */}
             <div className="credential-meta-grid">
               <MetaItem label="优先级" value={
@@ -568,8 +548,7 @@ export function CredentialCard({
                 </Dropdown.Menu>
               </Dropdown>
             </div>
-          </div>
-        )}
+        </div>
       </Card.Body>
 
       <ModalShell open={editingConcurrency} title={`并发限制：${credentialLabel(credential)}`} width="max-w-lg" onClose={() => setEditingConcurrency(false)}>

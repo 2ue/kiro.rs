@@ -18,7 +18,7 @@ import {
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { Button, Checkbox, Collapse, Input, Loading, Select } from 'react-daisyui'
+import { Button, Checkbox, Input, Loading, Select } from 'react-daisyui'
 import { forceRefreshToken, getCredentialInfo, getCredentials, refreshCredentialInfo, testCredential } from '@/api/credentials'
 import { Badge, EmptyState, ErrorState, LoadingState, SectionCard, StatCard } from '@/components/ui'
 import { CredentialCard } from '@/components/credentials'
@@ -50,7 +50,6 @@ export function CredentialsPanel() {
   // State
   const [page, setPage] = useState(1)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
-  const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set())
   const [balanceMap, setBalanceMap] = useState<Map<number, BalanceResponse>>(new Map())
   const [loadingBalanceIds, setLoadingBalanceIds] = useState<Set<number>>(new Set())
   const [testingCredential, setTestingCredential] = useState<CredentialStatusItem | null>(null)
@@ -131,28 +130,11 @@ export function CredentialsPanel() {
     })
   }
 
-  const toggleExpand = (id: number) => {
-    setExpandedIds((prev) => {
-      const next = new Set(prev)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
-      return next
-    })
-  }
-
   const selectAll = () => {
     if (selectedIds.size === currentCredentials.length) {
       setSelectedIds(new Set())
     } else {
       setSelectedIds(new Set(currentCredentials.map((c) => c.id)))
-    }
-  }
-
-  const expandAll = () => {
-    if (expandedIds.size === currentCredentials.length) {
-      setExpandedIds(new Set())
-    } else {
-      setExpandedIds(new Set(currentCredentials.map((c) => c.id)))
     }
   }
 
@@ -544,9 +526,6 @@ export function CredentialsPanel() {
             <span className="text-xs text-base-content/50">
               {selectedIds.size > 0 ? `已选 ${selectedIds.size}` : '全选'}
             </span>
-            <Button type="button" color="ghost" size="xs" onClick={expandAll}>
-              {expandedIds.size === currentCredentials.length ? '全部收起' : '全部展开'}
-            </Button>
           </div>
           {disabledCredentialCount > 0 && (
             <Button type="button" color="error" variant="outline" size="xs" onClick={clearAllDisabled}>
@@ -578,9 +557,7 @@ export function CredentialsPanel() {
                 key={credential.id}
                 credential={credential}
                 selected={selectedIds.has(credential.id)}
-                expanded={expandedIds.has(credential.id)}
                 onToggleSelect={() => toggleSelect(credential.id)}
-                onToggleExpand={() => toggleExpand(credential.id)}
                 onQueryBalance={queryCredentialBalance}
                 onTest={setTestingCredential}
                 balance={balanceMap.get(credential.id)}

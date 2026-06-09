@@ -961,6 +961,20 @@ impl KiroProvider {
         .await
     }
 
+    pub async fn call_api_with_context_with_request_id_max_wait(
+        &self,
+        request_body: &str,
+        request_id: Option<&str>,
+        max_wait: Duration,
+    ) -> anyhow::Result<KiroApiResponse> {
+        self.call_api_with_context_with_request_id_and_mode(
+            request_body,
+            request_id,
+            AcquireMode::WaitForCapacityMax(max_wait),
+        )
+        .await
+    }
+
     async fn call_api_with_context_with_request_id_and_mode(
         &self,
         request_body: &str,
@@ -1207,6 +1221,20 @@ impl KiroProvider {
             request_body,
             request_id,
             AcquireMode::FailFastOnCapacity,
+        )
+        .await
+    }
+
+    pub async fn call_api_stream_with_request_id_max_wait(
+        &self,
+        request_body: &str,
+        request_id: Option<&str>,
+        max_wait: Duration,
+    ) -> anyhow::Result<KiroStreamResponse> {
+        self.call_api_stream_with_request_id_and_mode(
+            request_body,
+            request_id,
+            AcquireMode::WaitForCapacityMax(max_wait),
         )
         .await
     }

@@ -869,6 +869,14 @@ pub struct ExternalPoolsConfig {
     pub fallback_on_unsupported_model: bool,
     #[serde(default = "default_true")]
     pub local_pool_preflight_enabled: bool,
+    #[serde(default = "default_true")]
+    pub external_pool_local_rescue_enabled: bool,
+    #[serde(default = "default_true")]
+    pub external_pool_local_rescue_on_rate_limit: bool,
+    #[serde(default = "default_true")]
+    pub external_pool_local_rescue_on_timeout: bool,
+    #[serde(default = "default_external_pool_local_rescue_max_wait_secs")]
+    pub external_pool_local_rescue_max_wait_secs: u64,
     #[serde(default)]
     pub local_pool_circuit_enabled: bool,
     #[serde(default = "default_local_pool_circuit_window_secs")]
@@ -939,6 +947,11 @@ impl Default for ExternalPoolsConfig {
             fallback_on_local_transient_exhausted: true,
             fallback_on_unsupported_model: false,
             local_pool_preflight_enabled: true,
+            external_pool_local_rescue_enabled: true,
+            external_pool_local_rescue_on_rate_limit: true,
+            external_pool_local_rescue_on_timeout: true,
+            external_pool_local_rescue_max_wait_secs:
+                default_external_pool_local_rescue_max_wait_secs(),
             local_pool_circuit_enabled: false,
             local_pool_circuit_window_secs: default_local_pool_circuit_window_secs(),
             local_pool_circuit_open_after_failures: default_local_pool_circuit_open_after_failures(
@@ -1688,6 +1701,10 @@ fn default_external_pool_dispatch_max_wait_secs() -> u64 {
     30
 }
 
+fn default_external_pool_local_rescue_max_wait_secs() -> u64 {
+    15
+}
+
 fn default_external_pool_rate_limit_cooldown_secs() -> u64 {
     30
 }
@@ -2064,6 +2081,19 @@ mod tests {
         assert_eq!(
             config.external_pools.external_pool_stream_idle_timeout_secs,
             180
+        );
+        assert!(config.external_pools.external_pool_local_rescue_enabled);
+        assert!(
+            config
+                .external_pools
+                .external_pool_local_rescue_on_rate_limit
+        );
+        assert!(config.external_pools.external_pool_local_rescue_on_timeout);
+        assert_eq!(
+            config
+                .external_pools
+                .external_pool_local_rescue_max_wait_secs,
+            15
         );
         assert!(
             config

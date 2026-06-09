@@ -43,6 +43,7 @@ pub enum UsageRouteKind {
 pub enum UsageRouteSubtype {
     LocalSuccess,
     LocalErrorNoFallback,
+    LocalRescueAfterExternal,
     ExternalFallbackPreflight,
     ExternalFallbackAfterLocalAttempts,
     ExternalDirectPolicy,
@@ -749,6 +750,9 @@ impl UsageRecorder {
     pub fn record(&self, record: UsageRecord) {
         {
             let mut records = self.records.lock();
+            if let Some(index) = records.iter().position(|existing| existing.id == record.id) {
+                records.remove(index);
+            }
             records.push_back(record.clone());
             while records.len() > self.limit {
                 records.pop_front();

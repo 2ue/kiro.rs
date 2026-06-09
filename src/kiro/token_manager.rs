@@ -962,11 +962,19 @@ pub struct CallContext {
 pub enum AcquireMode {
     WaitForCapacity,
     FailFastOnCapacity,
+    WaitForCapacityMax(StdDuration),
 }
 
 impl AcquireMode {
     fn is_fail_fast(self) -> bool {
         matches!(self, Self::FailFastOnCapacity)
+    }
+
+    fn max_wait_override(self) -> Option<StdDuration> {
+        match self {
+            Self::WaitForCapacityMax(duration) => Some(duration),
+            _ => None,
+        }
     }
 }
 
@@ -2271,23 +2279,32 @@ impl MultiTokenManager {
         }
     }
 
-    fn dispatch_max_wait(&self) -> Option<StdDuration> {
+    fn dispatch_max_wait(&self, acquire_mode: AcquireMode) -> Option<StdDuration> {
+        if let Some(max_wait) = acquire_mode.max_wait_override() {
+            return Some(max_wait);
+        }
         let secs = self.config.lock().credential_dispatch_max_wait_secs;
         (secs > 0).then(|| StdDuration::from_secs(secs))
     }
 
     fn dispatch_wait_exceeded(
         &self,
+        acquire_mode: AcquireMode,
         started_at: Instant,
         now: Instant,
     ) -> Option<(StdDuration, StdDuration)> {
-        let max_wait = self.dispatch_max_wait()?;
+        let max_wait = self.dispatch_max_wait(acquire_mode)?;
         let waited = now.saturating_duration_since(started_at);
         (waited >= max_wait).then_some((waited, max_wait))
     }
 
-    fn dispatch_wait_remaining(&self, started_at: Instant, now: Instant) -> Option<StdDuration> {
-        let max_wait = self.dispatch_max_wait()?;
+    fn dispatch_wait_remaining(
+        &self,
+        acquire_mode: AcquireMode,
+        started_at: Instant,
+        now: Instant,
+    ) -> Option<StdDuration> {
+        let max_wait = self.dispatch_max_wait(acquire_mode)?;
         Some(max_wait.saturating_sub(now.saturating_duration_since(started_at)))
     }
 
@@ -3076,7 +3093,7 @@ impl MultiTokenManager {
                         .map(|duration| duration.as_secs().saturating_add(1))
                         .unwrap_or(0);
                     if let Some((waited, max_wait)) =
-                        self.dispatch_wait_exceeded(dispatch_wait_started_at, now)
+                        self.dispatch_wait_exceeded(acquire_mode, dispatch_wait_started_at, now)
                     {
                         anyhow::bail!(
                             "凭据调度排队等待超时（可用: {}/{}, 临时可调度: 0, max_concurrent_requests={}, waited_secs={}, max_wait_secs={}, retry_after_secs={}）",
@@ -3097,7 +3114,7 @@ impl MultiTokenManager {
                     );
                     self.wait_for_dispatch_capacity(
                         wait_for,
-                        self.dispatch_wait_remaining(dispatch_wait_started_at, now),
+                        self.dispatch_wait_remaining(acquire_mode, dispatch_wait_started_at, now),
                     )
                     .await;
                     continue;
@@ -3128,7 +3145,7 @@ impl MultiTokenManager {
                 }
                 let now = Instant::now();
                 if let Some((waited, max_wait)) =
-                    self.dispatch_wait_exceeded(dispatch_wait_started_at, now)
+                    self.dispatch_wait_exceeded(acquire_mode, dispatch_wait_started_at, now)
                 {
                     anyhow::bail!(
                         "凭据调度排队等待超时（可用: {}/{}, 临时可调度: 0, max_concurrent_requests={}, waited_secs={}, max_wait_secs={}, retry_after_secs=1）",
@@ -3145,7 +3162,7 @@ impl MultiTokenManager {
                 );
                 self.wait_for_dispatch_capacity(
                     None,
-                    self.dispatch_wait_remaining(dispatch_wait_started_at, now),
+                    self.dispatch_wait_remaining(acquire_mode, dispatch_wait_started_at, now),
                 )
                 .await;
                 continue;

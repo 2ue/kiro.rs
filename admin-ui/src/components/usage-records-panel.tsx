@@ -124,6 +124,8 @@ function routeLabel(record: UsageRecord): string {
       return '预检 fallback'
     case 'external_fallback_after_local_attempts':
       return '失败后 fallback'
+    case 'local_rescue_after_external':
+      return '备用池后回本地'
     case 'external_error':
       return '外部错误'
     case 'local_error_no_fallback':
@@ -147,6 +149,7 @@ function formatUsageSnapshot(snapshot?: ExternalPoolUsageSnapshot): string {
 
 function routeVariant(record: UsageRecord): 'success' | 'secondary' | 'outline' | 'warning' | 'destructive' {
   if (record.routeSubtype === 'external_direct_policy') return 'warning'
+  if (record.routeSubtype === 'local_rescue_after_external') return 'secondary'
   if (record.routeKind === 'external_pool') return record.status === 'success' ? 'success' : 'destructive'
   return 'outline'
 }
