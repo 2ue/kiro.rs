@@ -3100,6 +3100,16 @@ impl MultiTokenManager {
                                     total
                                 );
                             }
+                            if usable > 0 && dispatchable > 0 {
+                                tracing::debug!(
+                                    available,
+                                    total,
+                                    usable,
+                                    dispatchable,
+                                    "调度候选在重检时恢复可用，重新选择凭据"
+                                );
+                                continue;
+                            }
                             if usable > 0 && dispatchable == 0 {
                                 let now = Instant::now();
                                 let max_concurrent_requests = self.max_concurrent_requests();
@@ -6085,6 +6095,14 @@ mod tests {
         }
     }
 
+    fn test_access_token_credential(token: &str, subscription_title: &str) -> KiroCredentials {
+        let mut credential = KiroCredentials::default();
+        credential.subscription_title = Some(subscription_title.to_string());
+        credential.access_token = Some(token.to_string());
+        credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        credential
+    }
+
     #[test]
     fn test_is_token_expired_with_expired_token() {
         let mut credentials = KiroCredentials::default();
@@ -6719,6 +6737,152 @@ mod tests {
         assert!(entry.cooled_down);
         assert_eq!(entry.cooldowns.len(), 1);
         assert_eq!(entry.cooldowns[0].model.as_deref(), Some("claude-opus-4.8"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_model_scoped_429_high_concurrency_disabled_and_model_filters() {
+        const OPUS_MODEL: &str = "claude-opus-4.8";
+        const CREDENTIAL_COUNT: usize = 12;
+        const REQUESTS_PER_MODEL: usize = 120;
+        const PER_CREDENTIAL_LIMIT: u32 = 2;
+        const GLOBAL_LIMIT: u32 = 12;
+
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.credential_max_concurrent_requests = PER_CREDENTIAL_LIMIT;
+        config.dispatch_global_max_concurrent_requests = GLOBAL_LIMIT;
+        config.dispatch_max_queued_requests = (REQUESTS_PER_MODEL * 2) as u32;
+        config.credential_dispatch_max_wait_secs = 5;
+        config.credential_rate_limit_cooldown_secs = 30;
+        config.credential_max_cooldown_secs = 30;
+        config.credential_cooldown_jitter_percent = 0;
+
+        let mut credentials = (1..=CREDENTIAL_COUNT)
+            .map(|idx| {
+                let subscription = if idx % 2 == 0 { "Pro" } else { "Free" };
+                test_access_token_credential(&format!("token-{idx}"), subscription)
+            })
+            .collect::<Vec<_>>();
+        credentials[10].disabled = true;
+        credentials[11].disabled = true;
+
+        let manager =
+            Arc::new(MultiTokenManager::new(config, credentials, None, None, false).unwrap());
+
+        for id in [2_u64, 4, 6] {
+            manager
+                .report_transient_failure_kind(
+                    id,
+                    Some(OPUS_MODEL),
+                    TransientFailureKind::RateLimit,
+                    Some(StdDuration::from_secs(30)),
+                    "429 opus high concurrency",
+                )
+                .unwrap();
+        }
+
+        let start = Arc::new(tokio::sync::Barrier::new(REQUESTS_PER_MODEL * 2 + 1));
+        let selected_sonnet = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let selected_opus = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let mut handles = Vec::with_capacity(REQUESTS_PER_MODEL * 2);
+
+        for idx in 0..REQUESTS_PER_MODEL {
+            let manager = manager.clone();
+            let start = start.clone();
+            let selected_sonnet = selected_sonnet.clone();
+            handles.push(tokio::spawn(async move {
+                start.wait().await;
+                let mut ctx = manager.acquire_context(Some(SONNET_MODEL)).await.unwrap();
+                let snapshot = manager.snapshot();
+                assert!(
+                    snapshot.global_in_flight_requests <= GLOBAL_LIMIT,
+                    "全局并发超限: {} > {}",
+                    snapshot.global_in_flight_requests,
+                    GLOBAL_LIMIT
+                );
+                for entry in &snapshot.entries {
+                    assert!(
+                        entry.in_flight_requests <= entry.max_concurrent_requests,
+                        "凭据 #{} 并发超限: {} > {}",
+                        entry.id,
+                        entry.in_flight_requests,
+                        entry.max_concurrent_requests
+                    );
+                }
+                tokio::time::sleep(StdDuration::from_millis(2 + (idx % 5) as u64)).await;
+                let id = ctx.id;
+                manager.report_success_with_latency(id, Some(SONNET_MODEL), None);
+                ctx.release_in_flight();
+                selected_sonnet.lock().unwrap().push(id);
+            }));
+        }
+
+        for idx in 0..REQUESTS_PER_MODEL {
+            let manager = manager.clone();
+            let start = start.clone();
+            let selected_opus = selected_opus.clone();
+            handles.push(tokio::spawn(async move {
+                start.wait().await;
+                let mut ctx = manager.acquire_context(Some(OPUS_MODEL)).await.unwrap();
+                assert!(
+                    matches!(ctx.id, 8 | 10),
+                    "opus 只能调度未冷却且支持 opus 的 Pro 凭据，实际 #{}",
+                    ctx.id
+                );
+                tokio::time::sleep(StdDuration::from_millis(2 + (idx % 5) as u64)).await;
+                let id = ctx.id;
+                manager.report_success_with_latency(id, Some(OPUS_MODEL), None);
+                ctx.release_in_flight();
+                selected_opus.lock().unwrap().push(id);
+            }));
+        }
+
+        start.wait().await;
+        for handle in handles {
+            tokio::time::timeout(StdDuration::from_secs(10), handle)
+                .await
+                .expect("混合模型高并发调度不应超时")
+                .expect("混合模型高并发调度不应 panic");
+        }
+
+        let sonnet_ids = selected_sonnet.lock().unwrap().clone();
+        let opus_ids = selected_opus.lock().unwrap().clone();
+        assert_eq!(sonnet_ids.len(), REQUESTS_PER_MODEL);
+        assert_eq!(opus_ids.len(), REQUESTS_PER_MODEL);
+        assert!(
+            [2_u64, 4, 6].iter().any(|id| sonnet_ids.contains(id)),
+            "sonnet 应允许使用仅 opus 模型冷却的凭据，实际分布: {:?}",
+            sonnet_ids
+        );
+        assert!(
+            opus_ids.iter().all(|id| matches!(*id, 8 | 10)),
+            "opus 不应使用 Free、禁用或 opus 冷却凭据，实际分布: {:?}",
+            opus_ids
+        );
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.global_in_flight_requests, 0);
+        assert_eq!(snapshot.queued_requests, 0);
+        for id in [2_u64, 4, 6] {
+            let entry = snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .unwrap();
+            assert!(entry.cooldowns.iter().any(|cooldown| {
+                !cooldown.global && cooldown.model.as_deref() == Some(OPUS_MODEL)
+            }));
+        }
+        for id in [11_u64, 12] {
+            assert!(
+                snapshot
+                    .entries
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .unwrap()
+                    .disabled
+            );
+        }
     }
 
     #[tokio::test]
