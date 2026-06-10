@@ -45,7 +45,8 @@ use super::middleware::AppState;
 use super::model_capabilities::{ModelResolution, ModelResolutionSource};
 use super::payload_guard::{
     PayloadByteBreakdown, PayloadGuardConfig, PayloadGuardError, PayloadGuardReport,
-    breakdown_kiro_request, guard_kiro_request,
+    breakdown_anthropic_messages_request, breakdown_kiro_request, guard_anthropic_messages_request,
+    guard_kiro_request,
 };
 use super::prompt_cache::{PromptCacheProfile, PromptCacheScope};
 use super::stream::{SseEvent, StreamContext};
@@ -129,6 +130,9 @@ struct ExternalFallbackContext {
     model_capabilities: Arc<super::model_capabilities::ModelCapabilitiesCatalog>,
     pricing_catalog: Arc<super::pricing::PricingCatalog>,
     recorder: Arc<super::usage::UsageRecorder>,
+    payload_guard_external_enabled: bool,
+    payload_guard_initial_config: PayloadGuardConfig,
+    payload_guard_retry_config: Option<PayloadGuardConfig>,
 }
 
 #[derive(Clone)]
@@ -167,6 +171,7 @@ struct RequestRuntimeConfig {
     payload_guard_max_bytes: usize,
     payload_guard_safety_margin_bytes: usize,
     payload_guard_trim_history: bool,
+    payload_guard_external_enabled: bool,
     payload_shaping: PayloadShapingConfig,
 }
 
@@ -191,6 +196,7 @@ impl RequestRuntimeConfig {
             payload_guard_max_bytes: state.payload_guard_max_bytes,
             payload_guard_safety_margin_bytes: state.payload_guard_safety_margin_bytes,
             payload_guard_trim_history: state.payload_guard_trim_history,
+            payload_guard_external_enabled: state.payload_guard_external_enabled,
             payload_shaping: state.payload_shaping,
         }
     }
@@ -225,6 +231,7 @@ impl RequestRuntimeConfig {
             payload_guard_max_bytes: config.payload_guard_max_bytes,
             payload_guard_safety_margin_bytes: config.payload_guard_safety_margin_bytes,
             payload_guard_trim_history: config.payload_guard_trim_history,
+            payload_guard_external_enabled: config.payload_guard_external_enabled,
             payload_shaping: config.payload_shaping,
         }
     }
@@ -384,6 +391,11 @@ fn build_external_fallback_context(
             model_capabilities: state.model_capabilities.clone(),
             pricing_catalog: state.pricing_catalog.clone(),
             recorder: state.usage_recorder.clone(),
+            payload_guard_external_enabled: runtime_config.payload_guard_external_enabled,
+            payload_guard_initial_config: runtime_config.initial_payload_guard_config(),
+            payload_guard_retry_config: runtime_config
+                .too_long_retry_enabled()
+                .then(|| runtime_config.payload_guard_config()),
         })
 }
 
@@ -508,11 +520,12 @@ impl ExternalFallbackContext {
         local_preflight: Option<serde_json::Value>,
         local_attempts: Vec<KiroCredentialAttempt>,
     ) -> ExternalRouteRequest {
+        let guarded_payload = self.guarded_route_payload();
         ExternalRouteRequest {
-            raw_body: self.raw_body.clone(),
+            raw_body: guarded_payload.raw_body,
             headers: self.headers.clone(),
             endpoint: self.endpoint,
-            payload: self.payload.clone(),
+            payload: guarded_payload.payload,
             upstream_model: self
                 .model_resolution
                 .as_ref()
@@ -547,8 +560,98 @@ impl ExternalFallbackContext {
             recorder: self.recorder.clone(),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            payload_breakdown: guarded_payload.payload_breakdown,
+            payload_guard_report: guarded_payload.payload_guard_report,
+            payload_guard_retry_config: guarded_payload.payload_guard_retry_config,
         }
     }
+
+    fn guarded_route_payload(&self) -> GuardedExternalRoutePayload {
+        let retry_config = self
+            .payload_guard_external_enabled
+            .then_some(())
+            .and(self.payload_guard_retry_config);
+        if !self.payload_guard_external_enabled {
+            return GuardedExternalRoutePayload {
+                raw_body: self.raw_body.clone(),
+                payload: self.payload.clone(),
+                payload_breakdown: None,
+                payload_guard_report: None,
+                payload_guard_retry_config: None,
+            };
+        }
+
+        let mut payload = self.payload.clone();
+        let guard_config = self.payload_guard_initial_config;
+        match guard_anthropic_messages_request(&mut payload, guard_config, self.raw_body.len()) {
+            Ok((body, report)) => {
+                let should_send_serialized = report.was_modified()
+                    || (guard_config.max_bytes > 0
+                        && self.raw_body.len() > guard_config.max_bytes
+                        && body.len() <= self.raw_body.len());
+                let raw_body = if should_send_serialized {
+                    Bytes::from(body)
+                } else {
+                    self.raw_body.clone()
+                };
+                let total_bytes = raw_body.len();
+                let breakdown = breakdown_anthropic_messages_request(&payload, total_bytes);
+                let include_diagnostics = should_log_payload_byte_breakdown(&report)
+                    || (guard_config.max_bytes > 0 && self.raw_body.len() > guard_config.max_bytes);
+                if include_diagnostics {
+                    log_payload_guard_report(
+                        &report,
+                        self.endpoint,
+                        &self.payload.model,
+                        self.model_resolution
+                            .as_ref()
+                            .and_then(|resolution| resolution.upstream_model.as_deref()),
+                        extract_stable_conversation_id(&payload).as_deref(),
+                    );
+                    log_payload_byte_breakdown(
+                        Some(breakdown),
+                        &report,
+                        self.endpoint,
+                        &self.payload.model,
+                        self.model_resolution
+                            .as_ref()
+                            .and_then(|resolution| resolution.upstream_model.as_deref()),
+                        extract_stable_conversation_id(&payload).as_deref(),
+                    );
+                }
+                GuardedExternalRoutePayload {
+                    raw_body,
+                    payload,
+                    payload_breakdown: include_diagnostics.then_some(breakdown),
+                    payload_guard_report: include_diagnostics.then_some(report),
+                    payload_guard_retry_config: retry_config,
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    endpoint = self.endpoint,
+                    model = %self.payload.model,
+                    "external pool payload guard failed; forwarding original request body"
+                );
+                GuardedExternalRoutePayload {
+                    raw_body: self.raw_body.clone(),
+                    payload: self.payload.clone(),
+                    payload_breakdown: None,
+                    payload_guard_report: None,
+                    payload_guard_retry_config: None,
+                }
+            }
+        }
+    }
+}
+
+struct GuardedExternalRoutePayload {
+    raw_body: Bytes,
+    payload: MessagesRequest,
+    payload_breakdown: Option<PayloadByteBreakdown>,
+    payload_guard_report: Option<PayloadGuardReport>,
+    payload_guard_retry_config: Option<PayloadGuardConfig>,
 }
 
 fn classify_local_error_for_external_fallback(
@@ -4243,6 +4346,7 @@ mod tests {
             payload_guard_max_bytes: max_bytes,
             payload_guard_safety_margin_bytes: 0,
             payload_guard_trim_history: true,
+            payload_guard_external_enabled: true,
             payload_shaping: PayloadShapingConfig::default(),
         }
     }

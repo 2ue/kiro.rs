@@ -29,6 +29,10 @@ use crate::{
         },
         envelope,
         model_capabilities::ModelCapabilitiesCatalog,
+        payload_guard::{
+            PayloadByteBreakdown, PayloadGuardConfig, PayloadGuardReport,
+            breakdown_anthropic_messages_request, guard_anthropic_messages_request,
+        },
         pricing::PricingCatalog,
         prompt_cache::{PromptCacheProfile, PromptCacheScope, PromptCacheTracker},
         prompt_cache_creation_control::PromptCacheCreationController,
@@ -243,7 +247,7 @@ pub struct SetExternalPoolEnabledRequest {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalPoolStatus {
     pub pool: ExternalPool,
@@ -255,13 +259,13 @@ pub struct ExternalPoolStatus {
     pub skipped_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalPoolsListResponse {
     pub pools: Vec<ExternalPool>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalPoolsStatusResponse {
     pub pools: Vec<ExternalPoolStatus>,
@@ -310,6 +314,9 @@ pub struct ExternalRouteRequest {
     pub recorder: Arc<crate::anthropic::usage::UsageRecorder>,
     pub started_at: Instant,
     pub first_token_latency_ms: Arc<AtomicU64>,
+    pub payload_breakdown: Option<PayloadByteBreakdown>,
+    pub payload_guard_report: Option<PayloadGuardReport>,
+    pub payload_guard_retry_config: Option<PayloadGuardConfig>,
 }
 
 struct ExternalForwardResponse {
@@ -714,6 +721,7 @@ impl ExternalPoolManager {
         config: ExternalPoolsConfig,
         route: ExternalRouteRequest,
     ) -> ExternalPoolForwardOutcome {
+        let mut route = route;
         if !config.external_pools_enabled {
             self.record_external_failure(
                 &route,
@@ -749,7 +757,8 @@ impl ExternalPoolManager {
             enabled_count.max(1)
         } else {
             config.external_pool_retry_max_attempts as usize
-        };
+        }
+        .saturating_add(usize::from(route.payload_guard_retry_config.is_some()));
 
         let mut excluded = HashSet::new();
         let mut attempts = Vec::new();
@@ -871,6 +880,17 @@ impl ExternalPoolManager {
                         error_type: Some(error_type_for_external_error(&err).to_string()),
                         error_message: Some(err.message.clone()),
                     });
+                    if should_retry_external_payload_guard(&route, &err) {
+                        if let Some(retry_route) = external_payload_guard_retry_route(&route) {
+                            if let Some(last) = attempts.last_mut() {
+                                last.action = "payload_guard_retry".to_string();
+                            }
+                            route = retry_route;
+                            excluded.clear();
+                            last_error = None;
+                            continue;
+                        }
+                    }
                     if let Some((duration, reason)) = &err.cooldown {
                         self.mark_pool_cooldown(pool_id, *duration, reason.clone())
                             .await;
@@ -1950,8 +1970,14 @@ impl ExternalPoolManager {
             error_type,
             error_message,
             error_detail,
-            payload_breakdown: None,
-            payload_guard_report: None,
+            payload_breakdown: route
+                .payload_breakdown
+                .as_ref()
+                .and_then(|breakdown| serde_json::to_value(breakdown).ok()),
+            payload_guard_report: route
+                .payload_guard_report
+                .as_ref()
+                .and_then(|report| serde_json::to_value(report).ok()),
         });
     }
 }
@@ -2528,6 +2554,59 @@ fn classify_external_error(
         cooldown: None,
         response_body: Some(body),
     }
+}
+
+fn should_retry_external_payload_guard(
+    route: &ExternalRouteRequest,
+    err: &ExternalPoolError,
+) -> bool {
+    if route.payload_guard_retry_config.is_none() {
+        return false;
+    }
+    if err.status != Some(StatusCode::BAD_REQUEST) {
+        return false;
+    }
+    external_payload_too_long_message(&err.message)
+        || err
+            .response_body
+            .as_ref()
+            .is_some_and(|body| external_payload_too_long_message(&String::from_utf8_lossy(body)))
+}
+
+fn external_payload_too_long_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("context window is full")
+        || lower.contains("input is too long")
+        || lower.contains("content_length_exceeds_threshold")
+        || lower.contains("request payload is too large")
+        || lower.contains("payload is too large")
+}
+
+fn external_payload_guard_retry_route(
+    route: &ExternalRouteRequest,
+) -> Option<ExternalRouteRequest> {
+    let config = route.payload_guard_retry_config?;
+    let mut payload = route.payload.clone();
+    let (body, report) =
+        match guard_anthropic_messages_request(&mut payload, config, route.raw_body.len()) {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::warn!(
+                    request_id = %route.request_id,
+                    error = %err,
+                    "external pool payload guard retry failed to build trimmed request"
+                );
+                return None;
+            }
+        };
+    let breakdown = breakdown_anthropic_messages_request(&payload, body.len());
+    let mut next = route.clone();
+    next.raw_body = Bytes::from(body);
+    next.payload = payload;
+    next.payload_breakdown = Some(breakdown);
+    next.payload_guard_report = Some(report);
+    next.payload_guard_retry_config = None;
+    Some(next)
 }
 
 fn auto_disable_reason_enabled(config: &ExternalPoolsConfig, reason: &str) -> bool {
@@ -3366,6 +3445,60 @@ mod tests {
         assert!(err.auto_disable_reason.is_none());
     }
 
+    #[test]
+    fn external_payload_guard_retry_route_trims_and_disables_second_retry() {
+        let mut route = test_route("claude-sonnet-4-6");
+        let mut messages = Vec::new();
+        for idx in 0..32 {
+            messages.push(Message {
+                role: "user".to_string(),
+                content: serde_json::json!(format!("history {} {}", idx, "x".repeat(700))),
+            });
+            messages.push(Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!([{
+                    "type": "text",
+                    "text": format!("answer {} {}", idx, "y".repeat(500)),
+                }]),
+            });
+        }
+        messages.push(Message {
+            role: "user".to_string(),
+            content: serde_json::json!("current question"),
+        });
+        route.payload.messages = messages;
+        let body = serde_json::to_string(&route.payload).expect("serialize route payload");
+        route.raw_body = Bytes::from(body);
+        route.payload_guard_retry_config = Some(PayloadGuardConfig {
+            enabled: true,
+            max_bytes: 8_000,
+            trim_history: true,
+            shaping: crate::model::config::PayloadShapingConfig::default(),
+        });
+        let err = classify_external_error(
+            StatusCode::BAD_REQUEST,
+            Bytes::from_static(br#"{"error":{"message":"Context window is full"}}"#),
+            HeaderMap::new(),
+            &ExternalPoolsConfig::default(),
+        );
+
+        assert!(should_retry_external_payload_guard(&route, &err));
+        let retry_route = external_payload_guard_retry_route(&route).expect("retry route");
+
+        assert!(retry_route.raw_body.len() <= 8_000);
+        assert!(retry_route.payload_guard_retry_config.is_none());
+        assert!(
+            retry_route
+                .payload_guard_report
+                .as_ref()
+                .is_some_and(|report| report.trimmed_history_entries > 0)
+        );
+        assert_eq!(
+            retry_route.payload.messages.last().unwrap().content,
+            serde_json::json!("current question")
+        );
+    }
+
     #[tokio::test]
     async fn external_capacity_scheduler_error_uses_request_id_and_error_type() {
         let route = ExternalRouteRequest {
@@ -3409,6 +3542,9 @@ mod tests {
             recorder: Arc::new(crate::anthropic::usage::UsageRecorder::new(1)),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            payload_breakdown: None,
+            payload_guard_report: None,
+            payload_guard_retry_config: None,
         };
 
         let (error_type, message) = external_capacity_error(PoolCapacityWaitReason::Full);
@@ -3514,6 +3650,9 @@ mod tests {
             recorder: Arc::new(crate::anthropic::usage::UsageRecorder::new(1)),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            payload_breakdown: None,
+            payload_guard_report: None,
+            payload_guard_retry_config: None,
         }
     }
 

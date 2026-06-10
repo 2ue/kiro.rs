@@ -1,6 +1,6 @@
 import { type ReactNode, useEffect, useMemo, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { CheckCircle2, FlaskConical, Loader2, Pencil, Play, Plus, Power, RefreshCw, RotateCcw, RotateCw, Save, Trash2, X, XCircle } from 'lucide-react'
+import { CheckCircle2, FlaskConical, Loader2, Pencil, Play, Plus, Power, RefreshCw, RotateCcw, RotateCw, Save, Trash2, XCircle } from 'lucide-react'
 import { toast } from 'sonner'
 import {
   clearExternalPoolAutoDisabled,
@@ -36,6 +36,45 @@ const splitRules = (value: string) => value.split('\n').map((item) => item.trim(
 const joinRules = (value: string[] = []) => value.join('\n')
 const whole = (value: number, min = 0) => Math.max(min, Math.floor(Number.isFinite(value) ? value : min))
 
+type ExternalPoolFormDraft = {
+  name: string
+  baseUrl: string
+  apiKey: string
+  authType: NonNullable<CreateExternalPoolRequest['authType']>
+  enabled: boolean
+  priority: number
+  maxConcurrentRequests: number
+  usageProjectionMode: NonNullable<CreateExternalPoolRequest['usageProjectionMode']>
+  autoDisablePolicy: NonNullable<CreateExternalPoolRequest['autoDisablePolicy']>
+  notes: string
+}
+
+const defaultPoolForm = (): ExternalPoolFormDraft => ({
+  name: '',
+  baseUrl: '',
+  apiKey: '',
+  authType: 'bearer',
+  enabled: false,
+  priority: 100,
+  maxConcurrentRequests: 10,
+  usageProjectionMode: 'pass_through',
+  autoDisablePolicy: 'inherit',
+  notes: '',
+})
+
+const poolFormFromPool = (pool: ExternalPool): ExternalPoolFormDraft => ({
+  name: pool.name,
+  baseUrl: pool.baseUrl,
+  apiKey: '',
+  authType: pool.authType,
+  enabled: pool.enabled,
+  priority: pool.priority,
+  maxConcurrentRequests: pool.maxConcurrentRequests,
+  usageProjectionMode: pool.usageProjectionMode,
+  autoDisablePolicy: pool.autoDisablePolicy,
+  notes: pool.notes || '',
+})
+
 export function ExternalPoolsPanel() {
   const queryClient = useQueryClient()
   const runtimeConfig = useRuntimeConfig()
@@ -45,22 +84,12 @@ export function ExternalPoolsPanel() {
   const [configDraft, setConfigDraft] = useState<ExternalPoolsConfig>(defaultExternalPoolsConfig())
   const [modelRulesText, setModelRulesText] = useState('')
   const [pathRulesText, setPathRulesText] = useState('')
-  const [editingPoolId, setEditingPoolId] = useState<number | null>(null)
+  const [createOpen, setCreateOpen] = useState(false)
+  const [editingPool, setEditingPool] = useState<ExternalPool | null>(null)
   const [testingPool, setTestingPool] = useState<ExternalPool | null>(null)
-  const [editForm, setEditForm] = useState<UpdateExternalPoolRequest>({})
-  const [form, setForm] = useState<CreateExternalPoolRequest>({
-    name: '',
-    baseUrl: '',
-    apiKey: '',
-    authType: 'bearer',
-    enabled: true,
-    priority: 100,
-    maxConcurrentRequests: 10,
-    usageProjectionMode: 'pass_through',
-    autoDisablePolicy: 'inherit',
-    preservePath: false,
-    notes: '',
-  })
+  const [savingPool, setSavingPool] = useState(false)
+  const [createForm, setCreateForm] = useState<ExternalPoolFormDraft>(() => defaultPoolForm())
+  const [editForm, setEditForm] = useState<ExternalPoolFormDraft>(() => defaultPoolForm())
 
   useEffect(() => {
     const externalPools = {
@@ -132,60 +161,62 @@ export function ExternalPoolsPanel() {
   }
 
   const submitPool = async () => {
-    if (!form.name.trim() || !form.baseUrl.trim() || !form.apiKey.trim()) {
+    if (savingPool) return
+    if (!createForm.name.trim() || !createForm.baseUrl.trim() || !createForm.apiKey.trim()) {
       toast.error('名称、Base URL 和 Key 必填')
       return
     }
+    setSavingPool(true)
     try {
       await createExternalPool({
-        ...form,
-        priority: whole(form.priority ?? 100),
-        maxConcurrentRequests: whole(form.maxConcurrentRequests ?? 10, 1),
+        ...createForm,
+        name: createForm.name.trim(),
+        baseUrl: createForm.baseUrl.trim(),
+        apiKey: createForm.apiKey.trim(),
+        priority: whole(createForm.priority ?? 100),
+        maxConcurrentRequests: whole(createForm.maxConcurrentRequests ?? 10, 1),
       })
       toast.success('外部池已添加')
-      setForm((prev) => ({ ...prev, name: '', baseUrl: '', apiKey: '', notes: '' }))
+      setCreateOpen(false)
+      setCreateForm(defaultPoolForm())
       invalidate()
     } catch (error) {
       toast.error(extractErrorMessage(error))
+    } finally {
+      setSavingPool(false)
     }
   }
 
   const startEdit = (pool: ExternalPool) => {
-    setEditingPoolId(pool.id)
-    setEditForm({
-      name: pool.name,
-      baseUrl: pool.baseUrl,
-      apiKey: '',
-      authType: pool.authType,
-      enabled: pool.enabled,
-      priority: pool.priority,
-      maxConcurrentRequests: pool.maxConcurrentRequests,
-      usageProjectionMode: pool.usageProjectionMode,
-      autoDisablePolicy: pool.autoDisablePolicy,
-      preservePath: pool.preservePath,
-      notes: pool.notes || '',
-    })
+    setEditingPool(pool)
+    setEditForm(poolFormFromPool(pool))
   }
 
   const savePoolEdit = async () => {
-    if (!editingPoolId) return
+    if (!editingPool || savingPool) return
     if (!editForm.name?.trim() || !editForm.baseUrl?.trim()) {
       toast.error('名称和 Base URL 必填')
       return
     }
+    setSavingPool(true)
     try {
-      await updateExternalPool(editingPoolId, {
+      const payload: UpdateExternalPoolRequest = {
         ...editForm,
+        name: editForm.name.trim(),
+        baseUrl: editForm.baseUrl.trim(),
         apiKey: editForm.apiKey?.trim() ? editForm.apiKey.trim() : undefined,
         priority: whole(editForm.priority ?? 100),
         maxConcurrentRequests: whole(editForm.maxConcurrentRequests ?? 10, 1),
-      })
+      }
+      await updateExternalPool(editingPool.id, payload)
       toast.success('外部池已更新')
-      setEditingPoolId(null)
-      setEditForm({})
+      setEditingPool(null)
+      setEditForm(defaultPoolForm())
       invalidate()
     } catch (error) {
       toast.error(extractErrorMessage(error))
+    } finally {
+      setSavingPool(false)
     }
   }
 
@@ -404,124 +435,23 @@ export function ExternalPoolsPanel() {
         </CardContent>
       </Card>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Plus className="h-5 w-5" />
-            添加外部池
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-5">
-          <FormSection title="基础信息" description="外部池请求会使用这里的 Base URL 和 Key。">
-            <div className="grid gap-3 md:grid-cols-2">
-              <TextBox label="名称" value={form.name} onChange={(name) => setForm((prev) => ({ ...prev, name }))} />
-              <TextBox label="Base URL" description="填写到域名或 /v1 均可，系统会调用外部池的 /v1/messages。" value={form.baseUrl} onChange={(baseUrl) => setForm((prev) => ({ ...prev, baseUrl }))} />
-              <TextBox label="请求 Key" value={form.apiKey} onChange={(apiKey) => setForm((prev) => ({ ...prev, apiKey }))} />
-              <SelectBox label="认证方式" value={form.authType || 'bearer'} onChange={(authType) => setForm((prev) => ({ ...prev, authType: authType as CreateExternalPoolRequest['authType'] }))}>
-                <option value="bearer">Authorization Bearer</option>
-                <option value="x_api_key">x-api-key</option>
-              </SelectBox>
-            </div>
-          </FormSection>
-
-          <div className="grid gap-4 lg:grid-cols-2">
-            <FormSection title="调度能力" description="单池最大并发只限制这个外部池；优先级数字越小越靠前。">
-              <div className="grid gap-3 sm:grid-cols-2">
-                <NumberBox label="单池最大并发" value={form.maxConcurrentRequests ?? 10} min={1} onChange={(maxConcurrentRequests) => setForm((prev) => ({ ...prev, maxConcurrentRequests }))} />
-                <NumberBox label="优先级" value={form.priority ?? 100} onChange={(priority) => setForm((prev) => ({ ...prev, priority }))} />
-                <Toggle label="启用外部池" checked={Boolean(form.enabled)} onChange={(enabled) => setForm((prev) => ({ ...prev, enabled }))} />
-              </div>
-            </FormSection>
-
-            <FormSection title="Usage 上报" description="严格透传不会改 usage；按路径整形会应用全局 usage 补偿。">
-              <div className="space-y-3">
-                <SelectBox label="Usage 模式" value={form.usageProjectionMode || 'pass_through'} onChange={(usageProjectionMode) => setForm((prev) => ({ ...prev, usageProjectionMode: usageProjectionMode as CreateExternalPoolRequest['usageProjectionMode'] }))}>
-                  <option value="pass_through">严格透传 usage</option>
-                  <option value="current_path_policy">按路径整形 usage</option>
-                </SelectBox>
-                <HintBox>{usageProjectionDescription(form.usageProjectionMode)}</HintBox>
-              </div>
-            </FormSection>
-          </div>
-
-          <FormSection title="错误处理和备注" description="自动禁用策略只控制这个外部池是否继承全局自动禁用。">
-            <div className="grid gap-3 md:grid-cols-2">
-              <SelectBox label="自动禁用策略" value={form.autoDisablePolicy || 'inherit'} onChange={(autoDisablePolicy) => setForm((prev) => ({ ...prev, autoDisablePolicy: autoDisablePolicy as CreateExternalPoolRequest['autoDisablePolicy'] }))}>
-                <option value="inherit">继承全局自动禁用</option>
-                <option value="enabled">强制启用自动禁用</option>
-                <option value="disabled">禁用自动禁用</option>
-              </SelectBox>
-              <TextBox label="备注" value={form.notes || ''} onChange={(notes) => setForm((prev) => ({ ...prev, notes }))} />
-            </div>
-          </FormSection>
-
-          <div className="flex justify-end">
-            <Button onClick={submitPool}>
-              <Plus className="mr-2 h-4 w-4" />
-              添加外部池
-            </Button>
-          </div>
-        </CardContent>
-      </Card>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-semibold">外部池列表</h2>
+          <p className="text-sm text-muted-foreground">单池配置只影响对应外部池；全局调度、冷却、补偿策略在上方统一保存。</p>
+        </div>
+        <Button onClick={() => { setCreateForm(defaultPoolForm()); setCreateOpen(true) }}>
+          <Plus className="mr-2 h-4 w-4" />
+          添加外部池
+        </Button>
+      </div>
 
       <div className="grid gap-4">
         {pools.data?.pools.map((pool) => {
           const runtime = statusMap.get(pool.id)
-          const editing = editingPoolId === pool.id
           return (
             <Card key={pool.id}>
               <CardContent className="space-y-4 p-5">
-                {editing ? (
-                  <div className="space-y-4">
-                    <FormSection title="基础信息">
-                      <div className="grid gap-3 md:grid-cols-2">
-                        <TextBox label="名称" value={editForm.name || ''} onChange={(name) => setEditForm((prev) => ({ ...prev, name }))} />
-                        <TextBox label="Base URL" value={editForm.baseUrl || ''} onChange={(baseUrl) => setEditForm((prev) => ({ ...prev, baseUrl }))} />
-                        <TextBox label="新 Key" description="留空表示不修改当前 Key。" value={editForm.apiKey || ''} onChange={(apiKey) => setEditForm((prev) => ({ ...prev, apiKey }))} />
-                        <SelectBox label="认证方式" value={editForm.authType || 'bearer'} onChange={(authType) => setEditForm((prev) => ({ ...prev, authType: authType as UpdateExternalPoolRequest['authType'] }))}>
-                          <option value="bearer">Authorization Bearer</option>
-                          <option value="x_api_key">x-api-key</option>
-                        </SelectBox>
-                      </div>
-                    </FormSection>
-
-                    <div className="grid gap-4 lg:grid-cols-2">
-                      <FormSection title="调度能力">
-                        <div className="grid gap-3 sm:grid-cols-2">
-                          <NumberBox label="单池最大并发" value={editForm.maxConcurrentRequests ?? 10} min={1} onChange={(maxConcurrentRequests) => setEditForm((prev) => ({ ...prev, maxConcurrentRequests }))} />
-                          <NumberBox label="优先级" value={editForm.priority ?? 100} onChange={(priority) => setEditForm((prev) => ({ ...prev, priority }))} />
-                          <Toggle label="启用外部池" checked={Boolean(editForm.enabled)} onChange={(enabled) => setEditForm((prev) => ({ ...prev, enabled }))} />
-                        </div>
-                      </FormSection>
-
-                      <FormSection title="Usage 上报">
-                        <div className="space-y-3">
-                          <SelectBox label="Usage 模式" value={editForm.usageProjectionMode || 'pass_through'} onChange={(usageProjectionMode) => setEditForm((prev) => ({ ...prev, usageProjectionMode: usageProjectionMode as UpdateExternalPoolRequest['usageProjectionMode'] }))}>
-                            <option value="pass_through">严格透传 usage</option>
-                            <option value="current_path_policy">按路径整形 usage</option>
-                          </SelectBox>
-                          <HintBox>{usageProjectionDescription(editForm.usageProjectionMode || 'pass_through')}</HintBox>
-                        </div>
-                      </FormSection>
-                    </div>
-
-                    <FormSection title="错误处理和备注">
-                      <div className="grid gap-3 md:grid-cols-2">
-                        <SelectBox label="自动禁用策略" value={editForm.autoDisablePolicy || 'inherit'} onChange={(autoDisablePolicy) => setEditForm((prev) => ({ ...prev, autoDisablePolicy: autoDisablePolicy as UpdateExternalPoolRequest['autoDisablePolicy'] }))}>
-                          <option value="inherit">继承全局自动禁用</option>
-                          <option value="enabled">强制启用自动禁用</option>
-                          <option value="disabled">禁用自动禁用</option>
-                        </SelectBox>
-                        <TextBox label="备注" value={editForm.notes || ''} onChange={(notes) => setEditForm((prev) => ({ ...prev, notes }))} />
-                      </div>
-                    </FormSection>
-
-                    <div className="flex gap-2">
-                      <Button size="sm" onClick={savePoolEdit}><Save className="mr-2 h-4 w-4" />保存</Button>
-                      <Button variant="outline" size="sm" onClick={() => { setEditingPoolId(null); setEditForm({}) }}><X className="mr-2 h-4 w-4" />取消</Button>
-                    </div>
-                  </div>
-                ) : (
                 <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
                   <div className="space-y-2">
                   <div className="flex flex-wrap items-center gap-2">
@@ -555,7 +485,6 @@ export function ExternalPoolsPanel() {
                   </Button>
                   </div>
                 </div>
-                )}
               </CardContent>
             </Card>
           )
@@ -564,6 +493,35 @@ export function ExternalPoolsPanel() {
           <Card><CardContent className="p-8 text-center text-muted-foreground">暂无外部备用号池</CardContent></Card>
         )}
       </div>
+      <ExternalPoolFormDialog
+        mode="create"
+        open={createOpen}
+        draft={createForm}
+        saving={savingPool}
+        onDraftChange={setCreateForm}
+        onOpenChange={(open) => {
+          if (savingPool) return
+          setCreateOpen(open)
+          if (!open) setCreateForm(defaultPoolForm())
+        }}
+        onSubmit={submitPool}
+      />
+      <ExternalPoolFormDialog
+        mode="edit"
+        pool={editingPool}
+        open={Boolean(editingPool)}
+        draft={editForm}
+        saving={savingPool}
+        onDraftChange={setEditForm}
+        onOpenChange={(open) => {
+          if (savingPool) return
+          if (!open) {
+            setEditingPool(null)
+            setEditForm(defaultPoolForm())
+          }
+        }}
+        onSubmit={savePoolEdit}
+      />
       <ExternalPoolTestDialog
         pool={testingPool}
         open={Boolean(testingPool)}
@@ -573,6 +531,100 @@ export function ExternalPoolsPanel() {
         onDone={invalidate}
       />
     </div>
+  )
+}
+
+function ExternalPoolFormDialog({
+  mode,
+  pool,
+  open,
+  draft,
+  saving,
+  onDraftChange,
+  onOpenChange,
+  onSubmit,
+}: {
+  mode: 'create' | 'edit'
+  pool?: ExternalPool | null
+  open: boolean
+  draft: ExternalPoolFormDraft
+  saving: boolean
+  onDraftChange: (value: ExternalPoolFormDraft | ((prev: ExternalPoolFormDraft) => ExternalPoolFormDraft)) => void
+  onOpenChange: (open: boolean) => void
+  onSubmit: () => void
+}) {
+  const isEdit = mode === 'edit'
+  const title = isEdit ? `编辑外部池${pool ? ` #${pool.id}` : ''}` : '添加外部池'
+  const keyLabel = isEdit ? '新请求 Key' : '请求 Key'
+  const keyDescription = isEdit ? `留空表示不修改当前 Key。当前：${pool?.maskedApiKey || '未显示 Key'}` : '外部池的请求密钥，保存后只显示脱敏值。'
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-h-[88vh] overflow-y-auto sm:max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4">
+          <FormSection title="连接信息" description="系统会使用这里的 Base URL 和 Key 调用外部池自己的 /v1/messages。">
+            <div className="grid gap-3 md:grid-cols-2">
+              <TextBox label="名称" value={draft.name} disabled={saving} onChange={(name) => onDraftChange((prev) => ({ ...prev, name }))} />
+              <SelectBox label="认证方式" value={draft.authType} disabled={saving} onChange={(authType) => onDraftChange((prev) => ({ ...prev, authType: authType as ExternalPoolFormDraft['authType'] }))}>
+                <option value="bearer">Authorization: Bearer &lt;key&gt;</option>
+                <option value="x_api_key">x-api-key: &lt;key&gt;</option>
+              </SelectBox>
+              <TextBox className="md:col-span-2" label="Base URL" description="填写到域名或 /v1 均可；不要填写 /cc，外部池请求路径固定为 /v1/messages。" value={draft.baseUrl} disabled={saving} onChange={(baseUrl) => onDraftChange((prev) => ({ ...prev, baseUrl }))} />
+              <TextBox className="md:col-span-2" label={keyLabel} description={keyDescription} value={draft.apiKey} disabled={saving} onChange={(apiKey) => onDraftChange((prev) => ({ ...prev, apiKey }))} />
+            </div>
+          </FormSection>
+
+          <div className="grid gap-4 lg:grid-cols-2">
+            <FormSection title="调度设置" description="这些设置只影响当前外部池，不改变备用池全局排队和冷却策略。">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <NumberBox label="单池最大并发" description="当前外部池同时处理的最大请求数。" value={draft.maxConcurrentRequests} min={1} disabled={saving} onChange={(maxConcurrentRequests) => onDraftChange((prev) => ({ ...prev, maxConcurrentRequests }))} />
+                <NumberBox label="优先级" description="数字越小越靠前；同优先级再按容量和状态分配。" value={draft.priority} disabled={saving} onChange={(priority) => onDraftChange((prev) => ({ ...prev, priority }))} />
+                <Toggle label={isEdit ? '启用外部池' : '创建后立即启用'} checked={Boolean(draft.enabled)} disabled={saving} onChange={(enabled) => onDraftChange((prev) => ({ ...prev, enabled }))} />
+              </div>
+            </FormSection>
+
+            <FormSection title="Usage 与成本" description="只控制当前外部池返回给下游的 usage 口径。">
+              <div className="space-y-3">
+                <SelectBox label="Usage 上报模式" value={draft.usageProjectionMode} disabled={saving} onChange={(usageProjectionMode) => onDraftChange((prev) => ({ ...prev, usageProjectionMode: usageProjectionMode as ExternalPoolFormDraft['usageProjectionMode'] }))}>
+                  <option value="pass_through">严格透传：不改外部池 usage</option>
+                  <option value="current_path_policy">按当前路径整形：重写 usage 并应用全局补偿</option>
+                </SelectBox>
+                <HintBox>{usageProjectionDescription(draft.usageProjectionMode)}</HintBox>
+              </div>
+            </FormSection>
+          </div>
+
+          <FormSection title="错误处理和备注" description="自动禁用策略只决定当前外部池是否继承全局自动禁用规则。">
+            <div className="grid gap-3 md:grid-cols-2">
+              <SelectBox label="自动禁用策略" value={draft.autoDisablePolicy} disabled={saving} onChange={(autoDisablePolicy) => onDraftChange((prev) => ({ ...prev, autoDisablePolicy: autoDisablePolicy as ExternalPoolFormDraft['autoDisablePolicy'] }))}>
+                <option value="inherit">继承全局自动禁用</option>
+                <option value="enabled">单独启用自动禁用</option>
+                <option value="disabled">关闭自动禁用</option>
+              </SelectBox>
+              <TextBox label="备注" value={draft.notes} disabled={saving} onChange={(notes) => onDraftChange((prev) => ({ ...prev, notes }))} />
+            </div>
+          </FormSection>
+
+          {!isEdit && !draft.enabled && (
+            <HintBox>
+              当前选择为创建后不立即启用。保存后可以先在列表里测试连接，再手动启用参与调度。
+            </HintBox>
+          )}
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={saving}>
+            取消
+          </Button>
+          <Button onClick={onSubmit} disabled={saving}>
+            {saving ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : isEdit ? <Save className="mr-2 h-4 w-4" /> : <Plus className="mr-2 h-4 w-4" />}
+            {isEdit ? '保存外部池' : '添加外部池'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -834,16 +886,18 @@ function TextBox({
   description,
   value,
   disabled = false,
+  className = '',
   onChange,
 }: {
   label: string
   description?: string
   value: string
   disabled?: boolean
+  className?: string
   onChange: (value: string) => void
 }) {
   return (
-    <label className={`space-y-1 text-sm ${disabled ? 'cursor-not-allowed opacity-60' : ''}`}>
+    <label className={`space-y-1 text-sm ${className} ${disabled ? 'cursor-not-allowed opacity-60' : ''}`}>
       <span className="text-muted-foreground">{label}</span>
       <Input value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)} />
       {description && <span className="block text-xs leading-4 text-muted-foreground">{description}</span>}

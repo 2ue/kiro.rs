@@ -241,9 +241,10 @@ async fn main() {
     }
 
     let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
-    let usage_recorder = Arc::new(anthropic::usage::UsageRecorder::with_postgres(
+    let usage_recorder = Arc::new(anthropic::usage::UsageRecorder::with_postgres_and_redis(
         config.usage_record_limit,
         Arc::new(PostgresUsageStore::new(postgres_store.clone())),
+        Some(redis_store.clone()),
     ));
     let prompt_cache = Arc::new(anthropic::prompt_cache::PromptCacheTracker::default());
     let prompt_cache_creation_controller = Arc::new(
@@ -422,6 +423,7 @@ async fn main() {
         config.payload_guard_max_bytes,
         config.payload_guard_safety_margin_bytes,
         config.payload_guard_trim_history,
+        config.payload_guard_external_enabled,
         config.payload_shaping,
         Some(external_pool_manager.clone()),
     );

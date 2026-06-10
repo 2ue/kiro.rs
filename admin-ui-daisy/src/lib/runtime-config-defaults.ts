@@ -193,6 +193,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   payloadGuardMaxBytes: 460800,
   payloadGuardSafetyMarginBytes: 32768,
   payloadGuardTrimHistory: true,
+  payloadGuardExternalEnabled: true,
   payloadShaping: defaultPayloadShaping(),
   promptCacheTargetReadRatio: 0.98,
   promptCacheTokenScale: 1.6,

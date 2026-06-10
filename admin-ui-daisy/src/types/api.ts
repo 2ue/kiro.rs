@@ -908,6 +908,7 @@ export interface RuntimeConfig {
   payloadGuardMaxBytes: number
   payloadGuardSafetyMarginBytes: number
   payloadGuardTrimHistory: boolean
+  payloadGuardExternalEnabled: boolean
   payloadShaping: PayloadShapingConfig
   promptCacheTargetReadRatio: number
   promptCacheTokenScale: number

@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::kiro::call_trace::{KiroCredentialAttempt, summarize_attempts};
 use crate::storage::postgres::PostgresUsageStore;
+use crate::storage::redis_cache::RedisStore;
 
 const DEFAULT_QUERY_LIMIT: usize = 100;
 const DEFAULT_PAGE_QUERY_LIMIT: usize = 20;
@@ -286,14 +287,14 @@ impl Default for UsageRecordQuery {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageRecordsResult {
     pub total: usize,
     pub records: Vec<UsageRecord>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageRecordsPageResult {
     pub page: usize,
@@ -302,7 +303,7 @@ pub struct UsageRecordsPageResult {
     pub records: Vec<UsageRecord>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageAggregate {
     pub key: String,
@@ -314,7 +315,7 @@ pub struct UsageAggregate {
     pub estimated_cost_usd: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageRealtimeStats {
     pub window_seconds: u32,
@@ -365,7 +366,7 @@ impl UsageRealtimeStats {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageSummary {
     pub total_requests: usize,
@@ -391,7 +392,7 @@ pub struct UsageSummary {
     pub top_conversations: Vec<UsageAggregate>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageExternalPoolBillingSummary {
     pub requests: usize,
@@ -407,7 +408,7 @@ pub struct UsageExternalPoolBillingSummary {
     pub cost_floor_delta_usd: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageDashboardResponse {
     pub generated_at: String,
@@ -417,7 +418,7 @@ pub struct UsageDashboardResponse {
     pub top: UsageDashboardTop,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageDashboardWindow {
     pub key: String,
@@ -427,7 +428,7 @@ pub struct UsageDashboardWindow {
     pub summary: UsageDashboardSummary,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageDashboardSummary {
     pub total_requests: usize,
@@ -457,7 +458,7 @@ pub struct UsageDashboardSummary {
     pub usage_source_breakdown: Vec<UsageBreakdownItem>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageBreakdownItem {
     pub key: String,
@@ -466,14 +467,14 @@ pub struct UsageBreakdownItem {
     pub ratio: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageDashboardSeries {
     pub hourly_24h: Vec<UsageSeriesPoint>,
     pub daily_7d: Vec<UsageSeriesPoint>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageSeriesPoint {
     pub key: String,
@@ -489,7 +490,7 @@ pub struct UsageSeriesPoint {
     pub total_estimated_cost_usd: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageDashboardTop {
     pub window_key: String,
@@ -499,7 +500,7 @@ pub struct UsageDashboardTop {
     pub errors: Vec<UsageTopAggregate>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageTopAggregate {
     pub key: String,
@@ -705,6 +706,7 @@ pub struct UsageRecorder {
     records: Mutex<VecDeque<UsageRecord>>,
     limit: usize,
     postgres_store: Option<Arc<PostgresUsageStore>>,
+    redis_store: Option<Arc<RedisStore>>,
     writer_tx: Option<mpsc::Sender<UsageRecord>>,
     dropped_persist_records: AtomicU64,
 }
@@ -724,12 +726,17 @@ impl UsageRecorder {
             records: Mutex::new(VecDeque::with_capacity(limit.min(1024))),
             limit,
             postgres_store: None,
+            redis_store: None,
             writer_tx: None,
             dropped_persist_records: AtomicU64::new(0),
         }
     }
 
-    pub fn with_postgres(limit: usize, postgres_store: Arc<PostgresUsageStore>) -> Self {
+    pub fn with_postgres_and_redis(
+        limit: usize,
+        postgres_store: Arc<PostgresUsageStore>,
+        redis_store: Option<Arc<RedisStore>>,
+    ) -> Self {
         let writer_tx = if tokio::runtime::Handle::try_current().is_ok() {
             let (tx, rx) = mpsc::channel(USAGE_WRITER_QUEUE_CAPACITY);
             tokio::spawn(usage_writer_loop(postgres_store.clone(), rx));
@@ -744,6 +751,7 @@ impl UsageRecorder {
             records: Mutex::new(VecDeque::with_capacity(limit.max(1).min(1024))),
             limit: limit.max(1),
             postgres_store: Some(postgres_store),
+            redis_store,
             writer_tx,
             dropped_persist_records: AtomicU64::new(0),
         }
@@ -761,6 +769,8 @@ impl UsageRecorder {
             }
         }
 
+        self.record_usage_redis(record.clone());
+
         if let Some(tx) = &self.writer_tx {
             match tx.try_send(record.clone()) {
                 Ok(()) => {}
@@ -774,6 +784,24 @@ impl UsageRecorder {
             }
         } else {
             self.persist_usage_sync(record);
+        }
+    }
+
+    fn record_usage_redis(&self, record: UsageRecord) {
+        let Some(redis) = &self.redis_store else {
+            return;
+        };
+        let redis = redis.clone();
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(async move {
+                if let Err(err) = redis.record_usage_summary(&record).await {
+                    tracing::warn!("写入 Redis usage summary 失败: {}", err);
+                }
+            });
+        } else if let Err(err) =
+            block_on_usage_store(async move { redis.record_usage_summary(&record).await })
+        {
+            tracing::warn!("写入 Redis usage summary 失败: {}", err);
         }
     }
 
@@ -842,6 +870,20 @@ impl UsageRecorder {
         page: usize,
         limit: usize,
     ) -> UsageRecordsPageResult {
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            let redis_query = query.clone();
+            match block_on_usage_store(async move {
+                redis.usage_records_page(redis_query, page, limit).await
+            }) {
+                Ok(Some(result)) => return result,
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!("分页查询 Redis usage records 失败，回退 PgSQL: {}", err)
+                }
+            }
+        }
+
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
             let query_for_fallback = query.clone();
@@ -887,6 +929,16 @@ impl UsageRecorder {
     }
 
     pub fn summary(&self, high_cache_threshold: i32) -> UsageSummary {
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            match block_on_usage_store(
+                async move { redis.usage_summary(high_cache_threshold).await },
+            ) {
+                Ok(Some(summary)) => return summary,
+                Ok(None) => {}
+                Err(err) => tracing::warn!("读取 Redis usage summary 失败，回退 PgSQL: {}", err),
+            }
+        }
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
             return block_on_usage_store(async move { store.summary(high_cache_threshold).await })
@@ -896,6 +948,38 @@ impl UsageRecorder {
                 });
         }
         self.summary_memory(high_cache_threshold)
+    }
+
+    pub fn dashboard(
+        &self,
+        timezone: Option<&str>,
+        high_cache_threshold: i32,
+    ) -> anyhow::Result<UsageDashboardResponse> {
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            let timezone = timezone.map(str::to_string);
+            match block_on_usage_store(async move {
+                redis
+                    .usage_dashboard(timezone.as_deref(), high_cache_threshold)
+                    .await
+            }) {
+                Ok(Some(dashboard)) => return Ok(dashboard),
+                Ok(None) => {}
+                Err(err) => tracing::warn!("读取 Redis usage dashboard 失败，回退 PgSQL: {}", err),
+            }
+        }
+
+        if let Some(store) = &self.postgres_store {
+            let store = store.clone();
+            let timezone = timezone.map(str::to_string);
+            return block_on_usage_store(async move {
+                store
+                    .dashboard(timezone.as_deref(), high_cache_threshold)
+                    .await
+            });
+        }
+
+        anyhow::bail!("usage dashboard 需要 Redis 或 PgSQL 聚合存储")
     }
 
     fn summary_memory(&self, high_cache_threshold: i32) -> UsageSummary {
@@ -1081,6 +1165,13 @@ impl UsageRecorder {
 
     pub fn clear(&self) {
         self.records.lock().clear();
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            if let Err(err) = block_on_usage_store(async move { redis.clear_usage_summary().await })
+            {
+                tracing::warn!("清空 Redis usage summary 失败: {}", err);
+            }
+        }
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
             if let Err(err) = block_on_usage_store(async move { store.clear().await }) {

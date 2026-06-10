@@ -80,6 +80,8 @@ pub struct AppState {
     pub payload_guard_safety_margin_bytes: usize,
     /// payload 超限时是否裁剪旧历史
     pub payload_guard_trim_history: bool,
+    /// 外部备用池是否复用同一套 payload guard / shaping 配置
+    pub payload_guard_external_enabled: bool,
     /// payload shaping 配置
     pub payload_shaping: PayloadShapingConfig,
     /// 外部备用号池管理器。
@@ -126,6 +128,7 @@ impl AppState {
             payload_guard_max_bytes: 450 * 1024,
             payload_guard_safety_margin_bytes: 32 * 1024,
             payload_guard_trim_history: true,
+            payload_guard_external_enabled: true,
             payload_shaping: PayloadShapingConfig::default(),
             external_pool_manager: None,
         }
@@ -195,6 +198,7 @@ impl AppState {
         max_bytes: usize,
         safety_margin_bytes: usize,
         trim_history: bool,
+        external_enabled: bool,
         payload_shaping: PayloadShapingConfig,
     ) -> Self {
         self.payload_guard_enabled = enabled;
@@ -202,6 +206,7 @@ impl AppState {
         self.payload_guard_max_bytes = max_bytes;
         self.payload_guard_safety_margin_bytes = safety_margin_bytes;
         self.payload_guard_trim_history = trim_history;
+        self.payload_guard_external_enabled = external_enabled;
         self.payload_shaping = payload_shaping;
         self
     }

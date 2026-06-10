@@ -945,6 +945,7 @@ export function ConfigPanel() {
               <ToggleField title="启用请求压缩" description="控制是否对上游请求做压缩处理。关闭时不会改变请求内容。" checked={draft.compressionEnabled} onChange={(compressionEnabled) => setDraft((prev) => ({ ...prev, compressionEnabled }))} />
               <ToggleField title="仅压缩空白字符" description="控制压缩时是否只处理多余空白。这是当前推荐的低风险压缩方式。" checked={draft.whitespaceCompression} disabled={!draft.compressionEnabled} onChange={(whitespaceCompression) => setDraft((prev) => ({ ...prev, whitespaceCompression }))} />
               <ToggleField title="启用 Kiro Payload 防护" description="按真实 Kiro JSON 字节数统计请求，并修复空 toolUses、孤立 tool_result 等 Kiro 容易拒绝的形态。" checked={draft.payloadGuardEnabled} onChange={(payloadGuardEnabled) => setDraft((prev) => ({ ...prev, payloadGuardEnabled }))} />
+              <ToggleField title="备用池也应用 Payload 整形" description="开启后，备用池请求会复用本页同一套阈值、模式和内容整形规则；关闭时备用池保持原始 Anthropic 请求体透传。" checked={draft.payloadGuardExternalEnabled} disabled={!draft.payloadGuardEnabled} onChange={(payloadGuardExternalEnabled) => setDraft((prev) => ({ ...prev, payloadGuardExternalEnabled }))} />
               <FieldLabel title="大小裁剪触发模式" description="发送前预裁剪保持当前行为；上游过长后裁剪重试会先原样请求，只在输入过长类 400 后按阈值裁剪并重试一次。">
                 <Select bordered size="sm" className="w-full" value={payloadGuardMode} disabled={!draft.payloadGuardEnabled} onChange={(event) => setDraft((prev) => ({ ...prev, payloadGuardMode: event.target.value as PayloadGuardMode }))}>
                   <Select.Option value="preemptive">发送前预裁剪</Select.Option>

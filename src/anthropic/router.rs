@@ -82,6 +82,7 @@ pub fn create_router_with_provider(
     payload_guard_max_bytes: usize,
     payload_guard_safety_margin_bytes: usize,
     payload_guard_trim_history: bool,
+    payload_guard_external_enabled: bool,
     payload_shaping: PayloadShapingConfig,
     external_pool_manager: Option<Arc<ExternalPoolManager>>,
 ) -> Router {
@@ -113,6 +114,7 @@ pub fn create_router_with_provider(
         payload_guard_max_bytes,
         payload_guard_safety_margin_bytes,
         payload_guard_trim_history,
+        payload_guard_external_enabled,
         payload_shaping,
     )
     .with_pricing_catalog(pricing_catalog)

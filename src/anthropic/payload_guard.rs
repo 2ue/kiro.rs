@@ -7,6 +7,9 @@
 
 use std::collections::HashSet;
 
+use crate::anthropic::types::{
+    Message as AnthropicMessage, MessagesRequest, Tool as AnthropicTool,
+};
 use crate::kiro::model::requests::{
     conversation::{Message, UserInputMessage, UserMessage},
     kiro::KiroRequest,
@@ -14,6 +17,7 @@ use crate::kiro::model::requests::{
 };
 use crate::model::config::PayloadShapingConfig;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 const CURRENT_FIT_MIN_TEXT_CHARS: usize = 512;
 const CURRENT_FIT_MAX_ITERATIONS: usize = 64;
@@ -421,7 +425,222 @@ pub fn breakdown_kiro_request(
     }
 }
 
+pub fn guard_anthropic_messages_request(
+    request: &mut MessagesRequest,
+    config: PayloadGuardConfig,
+    original_body_bytes: usize,
+) -> Result<(String, PayloadGuardReport), PayloadGuardError> {
+    let mut body = serialize_anthropic_request(request)?;
+    let original_history_entries = request.messages.len().saturating_sub(1);
+
+    if !config.enabled {
+        return Ok((
+            body,
+            PayloadGuardReport::disabled(original_body_bytes, original_history_entries),
+        ));
+    }
+
+    let size_limit_enabled = config.max_bytes > 0;
+    let mut report = new_payload_guard_report(
+        config.max_bytes,
+        original_body_bytes,
+        original_history_entries,
+    );
+    let mut final_bytes = if size_limit_enabled && original_body_bytes > config.max_bytes {
+        body.len()
+    } else {
+        original_body_bytes
+    };
+    report.final_bytes = final_bytes;
+
+    if size_limit_enabled && final_bytes > config.max_bytes && config.shaping.enabled {
+        let shaping = apply_anthropic_payload_shaping(request, config.shaping);
+        report.truncated_history_tool_results += shaping.truncated_history_tool_results;
+        report.truncated_history_tool_result_chars += shaping.truncated_history_tool_result_chars;
+        report.removed_history_thinking_blocks += shaping.removed_history_thinking_blocks;
+        report.removed_history_thinking_chars += shaping.removed_history_thinking_chars;
+        report.trimmed_web_fetch_blocks += shaping.trimmed_web_fetch_blocks;
+        report.trimmed_web_fetch_chars += shaping.trimmed_web_fetch_chars;
+        report.compressed_tool_definitions += shaping.compressed_tool_definitions;
+        report.compressed_tool_definition_bytes += shaping.compressed_tool_definition_bytes;
+
+        if shaping.was_modified() {
+            let repair = repair_anthropic_messages(request);
+            report.aligned_leading_entries += repair.aligned_leading_entries;
+            report.removed_orphan_tool_results += repair.removed_orphan_tool_results;
+            report.textified_orphan_tool_results += repair.textified_orphan_tool_results;
+            report.removed_orphan_tool_uses += repair.removed_orphan_tool_uses;
+            body = serialize_anthropic_request(request)?;
+            final_bytes = body.len();
+            report.final_bytes = final_bytes;
+        }
+    }
+
+    if size_limit_enabled && config.trim_history {
+        while final_bytes > config.max_bytes && request.messages.len() > 1 {
+            let before = request.messages.len();
+            trim_oldest_anthropic_history_unit(&mut request.messages);
+            let after_trim = request.messages.len();
+            report.trimmed_history_entries += before.saturating_sub(after_trim);
+
+            let repair = repair_anthropic_messages(request);
+            report.aligned_leading_entries += repair.aligned_leading_entries;
+            report.removed_orphan_tool_results += repair.removed_orphan_tool_results;
+            report.textified_orphan_tool_results += repair.textified_orphan_tool_results;
+            report.removed_orphan_tool_uses += repair.removed_orphan_tool_uses;
+
+            body = serialize_anthropic_request(request)?;
+            let new_size = body.len();
+            if new_size >= final_bytes && after_trim == before {
+                break;
+            }
+            final_bytes = new_size;
+            report.final_bytes = final_bytes;
+        }
+    }
+
+    if size_limit_enabled
+        && final_bytes > config.max_bytes
+        && config.shaping.enabled
+        && current_payload_shaping_enabled(config.shaping)
+    {
+        let (new_body, current_stats) = apply_anthropic_current_payload_shaping_until_fit(
+            request,
+            config.shaping,
+            config.max_bytes,
+            body,
+        )?;
+        report.truncated_current_tool_results += current_stats.truncated_current_tool_results;
+        report.truncated_current_tool_result_chars +=
+            current_stats.truncated_current_tool_result_chars;
+        report.truncated_current_documents += current_stats.truncated_current_documents;
+        report.truncated_current_document_chars += current_stats.truncated_current_document_chars;
+        report.truncated_current_user_content += current_stats.truncated_current_user_content;
+        report.truncated_current_user_content_chars +=
+            current_stats.truncated_current_user_content_chars;
+        report.dropped_current_images += current_stats.dropped_current_images;
+        report.dropped_current_image_bytes += current_stats.dropped_current_image_bytes;
+        body = new_body;
+        final_bytes = body.len();
+        report.final_bytes = final_bytes;
+    }
+
+    report.final_history_entries = request.messages.len().saturating_sub(1);
+    report.still_oversized = size_limit_enabled && final_bytes > config.max_bytes;
+    Ok((body, report))
+}
+
+pub fn breakdown_anthropic_messages_request(
+    request: &MessagesRequest,
+    total_bytes: usize,
+) -> PayloadByteBreakdown {
+    let history_end = request.messages.len().saturating_sub(1);
+    let current_message = request.messages.last();
+
+    PayloadByteBreakdown {
+        total_bytes,
+        history_bytes: json_len(&request.messages[..history_end]),
+        current_message_bytes: current_message.map(json_len).unwrap_or(0),
+        current_content_bytes: current_message
+            .map(|message| json_len(&message.content))
+            .unwrap_or(0),
+        current_tools_bytes: json_len(&request.tools),
+        current_tool_results_bytes: current_message
+            .map(|message| content_tool_results_bytes(&message.content))
+            .unwrap_or(0),
+        current_images_bytes: current_message
+            .map(|message| content_images_bytes(&message.content))
+            .unwrap_or(0),
+        history_tool_results_bytes: request.messages[..history_end]
+            .iter()
+            .map(|message| content_tool_results_bytes(&message.content))
+            .sum(),
+        history_images_bytes: request.messages[..history_end]
+            .iter()
+            .map(|message| content_images_bytes(&message.content))
+            .sum(),
+        history_entries: history_end,
+        current_tool_count: request.tools.as_ref().map(Vec::len).unwrap_or(0),
+        current_tool_result_count: current_message
+            .map(|message| count_content_blocks_by_type(&message.content, "tool_result"))
+            .unwrap_or(0),
+        current_image_count: current_message
+            .map(|message| count_content_blocks_by_type(&message.content, "image"))
+            .unwrap_or(0),
+        largest_tool_bytes: request
+            .tools
+            .as_ref()
+            .and_then(|tools| tools.iter().map(json_len).max())
+            .unwrap_or(0),
+        largest_history_tool_result_bytes: request.messages[..history_end]
+            .iter()
+            .flat_map(|message| content_blocks_by_type(&message.content, "tool_result"))
+            .map(json_len)
+            .max()
+            .unwrap_or(0),
+        largest_current_tool_result_bytes: current_message
+            .map(|message| {
+                content_blocks_by_type(&message.content, "tool_result")
+                    .into_iter()
+                    .map(json_len)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0),
+        history_tool_use_count: request.messages[..history_end]
+            .iter()
+            .map(|message| count_content_blocks_by_type(&message.content, "tool_use"))
+            .sum(),
+        history_tool_result_count: request.messages[..history_end]
+            .iter()
+            .map(|message| count_content_blocks_by_type(&message.content, "tool_result"))
+            .sum(),
+    }
+}
+
+fn new_payload_guard_report(
+    max_bytes: usize,
+    original_bytes: usize,
+    original_history_entries: usize,
+) -> PayloadGuardReport {
+    PayloadGuardReport {
+        enabled: true,
+        max_bytes,
+        original_bytes,
+        final_bytes: original_bytes,
+        original_history_entries,
+        final_history_entries: original_history_entries,
+        trimmed_history_entries: 0,
+        aligned_leading_entries: 0,
+        removed_empty_tool_uses: 0,
+        removed_orphan_tool_results: 0,
+        textified_orphan_tool_results: 0,
+        removed_orphan_tool_uses: 0,
+        truncated_history_tool_results: 0,
+        truncated_history_tool_result_chars: 0,
+        removed_history_thinking_blocks: 0,
+        removed_history_thinking_chars: 0,
+        trimmed_web_fetch_blocks: 0,
+        trimmed_web_fetch_chars: 0,
+        compressed_tool_definitions: 0,
+        compressed_tool_definition_bytes: 0,
+        truncated_current_tool_results: 0,
+        truncated_current_tool_result_chars: 0,
+        truncated_current_documents: 0,
+        truncated_current_document_chars: 0,
+        truncated_current_user_content: 0,
+        truncated_current_user_content_chars: 0,
+        dropped_current_images: 0,
+        dropped_current_image_bytes: 0,
+        still_oversized: false,
+    }
+}
+
 fn serialize_request(request: &KiroRequest) -> Result<String, PayloadGuardError> {
+    serde_json::to_string(request).map_err(|err| PayloadGuardError::Serialize(err.to_string()))
+}
+
+fn serialize_anthropic_request(request: &MessagesRequest) -> Result<String, PayloadGuardError> {
     serde_json::to_string(request).map_err(|err| PayloadGuardError::Serialize(err.to_string()))
 }
 
@@ -429,6 +648,54 @@ fn json_len<T: serde::Serialize + ?Sized>(value: &T) -> usize {
     serde_json::to_string(value)
         .map(|json| json.len())
         .unwrap_or(0)
+}
+
+fn content_blocks(content: &Value) -> Option<&Vec<Value>> {
+    content.as_array()
+}
+
+fn content_blocks_mut(content: &mut Value) -> Option<&mut Vec<Value>> {
+    content.as_array_mut()
+}
+
+fn block_type(block: &Value) -> Option<&str> {
+    block.get("type").and_then(Value::as_str)
+}
+
+fn content_blocks_by_type<'a>(content: &'a Value, expected_type: &str) -> Vec<&'a Value> {
+    content_blocks(content)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|block| block_type(block) == Some(expected_type))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn count_content_blocks_by_type(content: &Value, expected_type: &str) -> usize {
+    content_blocks(content)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|block| block_type(block) == Some(expected_type))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn content_tool_results_bytes(content: &Value) -> usize {
+    content_blocks_by_type(content, "tool_result")
+        .into_iter()
+        .map(json_len)
+        .sum()
+}
+
+fn content_images_bytes(content: &Value) -> usize {
+    content_blocks_by_type(content, "image")
+        .into_iter()
+        .map(json_len)
+        .sum()
 }
 
 fn count_history_tool_uses(history: &[Message]) -> usize {
@@ -591,6 +858,516 @@ fn apply_payload_shaping(request: &mut KiroRequest, config: PayloadShapingConfig
     }
 
     stats
+}
+
+fn apply_anthropic_payload_shaping(
+    request: &mut MessagesRequest,
+    config: PayloadShapingConfig,
+) -> ShapingStats {
+    let mut stats = ShapingStats::default();
+    let history_end = request.messages.len().saturating_sub(1);
+
+    if config.truncate_historical_tool_results {
+        let result = truncate_anthropic_history_tool_results(
+            &mut request.messages[..history_end],
+            config.historical_tool_result_max_chars,
+            config.historical_tool_result_head_lines,
+            config.historical_tool_result_tail_lines,
+        );
+        stats.truncated_history_tool_results += result.0;
+        stats.truncated_history_tool_result_chars += result.1;
+    }
+
+    if config.web_fetch_trim_enabled {
+        let result = trim_anthropic_history_web_fetch_content(
+            &mut request.messages[..history_end],
+            config.web_fetch_body_max_chars,
+        );
+        stats.trimmed_web_fetch_blocks += result.0;
+        stats.trimmed_web_fetch_chars += result.1;
+    }
+
+    if config.discard_historical_thinking {
+        let result = discard_anthropic_history_thinking(&mut request.messages[..history_end]);
+        stats.removed_history_thinking_blocks += result.0;
+        stats.removed_history_thinking_chars += result.1;
+    }
+
+    if config.compress_tool_definitions && config.tool_definitions_budget_bytes > 0 {
+        if let Some(tools) = request.tools.as_mut() {
+            let before = json_len(tools);
+            if before > config.tool_definitions_budget_bytes {
+                let compressed = compress_anthropic_tool_definitions(
+                    tools,
+                    config.tool_definitions_budget_bytes,
+                    config.tool_description_max_chars,
+                    config.tool_schema_annotation_max_chars,
+                );
+                let after = json_len(tools);
+                if compressed > 0 || after < before {
+                    stats.compressed_tool_definitions += compressed;
+                    stats.compressed_tool_definition_bytes += before.saturating_sub(after);
+                }
+            }
+        }
+    }
+
+    stats
+}
+
+fn truncate_anthropic_history_tool_results(
+    messages: &mut [AnthropicMessage],
+    max_chars: usize,
+    head_lines: usize,
+    tail_lines: usize,
+) -> (usize, usize) {
+    if max_chars == 0 {
+        return (0, 0);
+    }
+
+    let mut truncated = 0usize;
+    let mut omitted_chars = 0usize;
+    for message in messages {
+        if message.role != "user" {
+            continue;
+        }
+        let Some(blocks) = content_blocks_mut(&mut message.content) else {
+            continue;
+        };
+        for block in blocks {
+            if block_type(block) != Some("tool_result") {
+                continue;
+            }
+            let result = truncate_anthropic_tool_result_block(
+                block,
+                max_chars,
+                head_lines,
+                tail_lines,
+                "historical tool result",
+                true,
+            );
+            truncated += result.0;
+            omitted_chars += result.1;
+        }
+    }
+    (truncated, omitted_chars)
+}
+
+fn trim_anthropic_history_web_fetch_content(
+    messages: &mut [AnthropicMessage],
+    max_chars: usize,
+) -> (usize, usize) {
+    if max_chars == 0 {
+        return (0, 0);
+    }
+    let mut blocks_trimmed = 0usize;
+    let mut omitted_chars = 0usize;
+    for message in messages {
+        let Some(blocks) = content_blocks_mut(&mut message.content) else {
+            continue;
+        };
+        for block in blocks {
+            if block_type(block) != Some("tool_result") {
+                continue;
+            }
+            let result = trim_anthropic_tool_result_web_fetch_block(block, max_chars);
+            blocks_trimmed += result.0;
+            omitted_chars += result.1;
+        }
+    }
+    (blocks_trimmed, omitted_chars)
+}
+
+fn discard_anthropic_history_thinking(messages: &mut [AnthropicMessage]) -> (usize, usize) {
+    let mut removed_blocks = 0usize;
+    let mut removed_chars = 0usize;
+    for message in messages {
+        if message.role != "assistant" {
+            continue;
+        }
+        if let Some(text) = message.content.as_str() {
+            let (cleaned, blocks, chars) = remove_tagged_blocks(text, "thinking");
+            if blocks > 0 {
+                message.content = Value::String(cleaned);
+                removed_blocks += blocks;
+                removed_chars += chars;
+            }
+            continue;
+        }
+        let Some(blocks) = content_blocks_mut(&mut message.content) else {
+            continue;
+        };
+        let before = blocks.len();
+        let mut chars = 0usize;
+        blocks.retain(|block| {
+            let is_thinking = matches!(
+                block_type(block),
+                Some("thinking") | Some("redacted_thinking")
+            ) || block.get("thinking").is_some()
+                || block.get("signature").is_some();
+            if is_thinking {
+                chars += json_len(block);
+            }
+            !is_thinking
+        });
+        let removed = before.saturating_sub(blocks.len());
+        if removed > 0 && blocks.is_empty() {
+            blocks.push(serde_json::json!({"type": "text", "text": " "}));
+        }
+        removed_blocks += removed;
+        removed_chars += chars;
+    }
+    (removed_blocks, removed_chars)
+}
+
+fn compress_anthropic_tool_definitions(
+    tools: &mut [AnthropicTool],
+    budget_bytes: usize,
+    description_max_chars: usize,
+    annotation_max_chars: usize,
+) -> usize {
+    if tools.is_empty() {
+        return 0;
+    }
+
+    let adaptive_description_max = if budget_bytes > 0 {
+        description_max_chars.min((budget_bytes / tools.len()).max(256))
+    } else {
+        description_max_chars
+    };
+
+    let mut changed = 0usize;
+    for tool in tools.iter_mut() {
+        if truncate_string_field(
+            &mut tool.description,
+            adaptive_description_max,
+            "tool description",
+        ) {
+            changed += 1;
+        }
+        let mut schema = serde_json::to_value(&tool.input_schema).unwrap_or(Value::Null);
+        let schema_changes = truncate_schema_annotations(&mut schema, annotation_max_chars);
+        if schema_changes > 0 {
+            if let Ok(next_schema) = serde_json::from_value(schema) {
+                tool.input_schema = next_schema;
+                changed += schema_changes;
+            }
+        }
+    }
+
+    if budget_bytes > 0 && json_len(tools) > budget_bytes {
+        let hard_description_max = adaptive_description_max.min(512);
+        for tool in tools.iter_mut() {
+            if truncate_string_field(
+                &mut tool.description,
+                hard_description_max,
+                "tool description",
+            ) {
+                changed += 1;
+            }
+        }
+    }
+
+    changed
+}
+
+fn truncate_anthropic_tool_result_block(
+    block: &mut Value,
+    max_chars: usize,
+    head_lines: usize,
+    tail_lines: usize,
+    label: &str,
+    skip_web_fetch: bool,
+) -> (usize, usize) {
+    let Some(content) = block.get_mut("content") else {
+        return (0, 0);
+    };
+    truncate_anthropic_content_texts(
+        content,
+        max_chars,
+        head_lines,
+        tail_lines,
+        label,
+        skip_web_fetch,
+    )
+}
+
+fn truncate_anthropic_content_texts(
+    value: &mut Value,
+    max_chars: usize,
+    head_lines: usize,
+    tail_lines: usize,
+    label: &str,
+    skip_web_fetch: bool,
+) -> (usize, usize) {
+    if max_chars == 0 {
+        return (0, 0);
+    }
+    if let Some(text) = value.as_str().map(str::to_string) {
+        if skip_web_fetch && looks_like_web_fetch_text(&text) {
+            return (0, 0);
+        }
+        let original_chars = text.chars().count();
+        if original_chars <= max_chars {
+            return (0, 0);
+        }
+        let replacement = truncate_text_head_tail(&text, max_chars, head_lines, tail_lines, label);
+        let replacement_chars = replacement.chars().count();
+        *value = Value::String(replacement);
+        return (1, original_chars.saturating_sub(replacement_chars));
+    }
+    if let Some(items) = value.as_array_mut() {
+        let mut truncated = 0usize;
+        let mut omitted = 0usize;
+        for item in items {
+            if let Some(text) = item.as_str().map(str::to_string) {
+                if skip_web_fetch && looks_like_web_fetch_text(&text) {
+                    continue;
+                }
+                let original_chars = text.chars().count();
+                if original_chars > max_chars {
+                    let replacement =
+                        truncate_text_head_tail(&text, max_chars, head_lines, tail_lines, label);
+                    let replacement_chars = replacement.chars().count();
+                    *item = Value::String(replacement);
+                    truncated += 1;
+                    omitted += original_chars.saturating_sub(replacement_chars);
+                }
+                continue;
+            }
+            let Some(text_value) = item.get_mut("text") else {
+                continue;
+            };
+            let result = truncate_anthropic_content_texts(
+                text_value,
+                max_chars,
+                head_lines,
+                tail_lines,
+                label,
+                skip_web_fetch,
+            );
+            truncated += result.0;
+            omitted += result.1;
+        }
+        return (truncated, omitted);
+    }
+    (0, 0)
+}
+
+fn trim_anthropic_tool_result_web_fetch_block(
+    block: &mut Value,
+    max_chars: usize,
+) -> (usize, usize) {
+    let Some(content) = block.get_mut("content") else {
+        return (0, 0);
+    };
+    trim_anthropic_web_fetch_texts(content, max_chars)
+}
+
+fn trim_anthropic_web_fetch_texts(value: &mut Value, max_chars: usize) -> (usize, usize) {
+    if let Some(text) = value.as_str().map(str::to_string) {
+        let (trimmed, omitted, changed) = trim_web_fetch_text(&text, max_chars);
+        if changed {
+            *value = Value::String(trimmed);
+            return (1, omitted);
+        }
+        return (0, 0);
+    }
+    if let Some(items) = value.as_array_mut() {
+        let mut trimmed = 0usize;
+        let mut omitted = 0usize;
+        for item in items {
+            if let Some(text) = item.as_str().map(str::to_string) {
+                let (replacement, chars, changed) = trim_web_fetch_text(&text, max_chars);
+                if changed {
+                    *item = Value::String(replacement);
+                    trimmed += 1;
+                    omitted += chars;
+                }
+                continue;
+            }
+            let Some(text_value) = item.get_mut("text") else {
+                continue;
+            };
+            let result = trim_anthropic_web_fetch_texts(text_value, max_chars);
+            trimmed += result.0;
+            omitted += result.1;
+        }
+        return (trimmed, omitted);
+    }
+    (0, 0)
+}
+
+#[derive(Default)]
+struct AnthropicRepairStats {
+    aligned_leading_entries: usize,
+    removed_orphan_tool_results: usize,
+    textified_orphan_tool_results: usize,
+    removed_orphan_tool_uses: usize,
+}
+
+fn repair_anthropic_messages(request: &mut MessagesRequest) -> AnthropicRepairStats {
+    let mut stats = AnthropicRepairStats::default();
+    stats.aligned_leading_entries += align_anthropic_messages_to_user(&mut request.messages);
+    let result = textify_orphan_anthropic_tool_results(&mut request.messages);
+    stats.removed_orphan_tool_results += result.0;
+    stats.textified_orphan_tool_results += result.1;
+    stats.removed_orphan_tool_uses += remove_unpaired_anthropic_tool_uses(&mut request.messages);
+    stats
+}
+
+fn align_anthropic_messages_to_user(messages: &mut Vec<AnthropicMessage>) -> usize {
+    let mut removed = 0usize;
+    while messages.len() > 1
+        && messages
+            .first()
+            .is_some_and(|message| message.role == "assistant")
+    {
+        messages.remove(0);
+        removed += 1;
+    }
+    removed
+}
+
+fn textify_orphan_anthropic_tool_results(messages: &mut [AnthropicMessage]) -> (usize, usize) {
+    let mut removed = 0usize;
+    let mut textified = 0usize;
+    for idx in 0..messages.len() {
+        if messages[idx].role != "user" {
+            continue;
+        }
+        let valid_ids = if idx > 0 && messages[idx - 1].role == "assistant" {
+            anthropic_tool_use_ids(&messages[idx - 1].content)
+        } else {
+            HashSet::new()
+        };
+        let Some(blocks) = content_blocks_mut(&mut messages[idx].content) else {
+            continue;
+        };
+        for block in blocks {
+            if block_type(block) != Some("tool_result") {
+                continue;
+            }
+            let id = block
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !valid_ids.contains(id) {
+                let text = anthropic_tool_result_to_text(block);
+                *block = serde_json::json!({
+                    "type": "text",
+                    "text": format!("[trimmed orphan tool_result {}]\n{}", id, text),
+                });
+                removed += 1;
+                textified += 1;
+            }
+        }
+    }
+    (removed, textified)
+}
+
+fn remove_unpaired_anthropic_tool_uses(messages: &mut [AnthropicMessage]) -> usize {
+    let mut removed = 0usize;
+    for idx in 0..messages.len() {
+        if messages[idx].role != "assistant" {
+            continue;
+        }
+        let paired_ids = messages
+            .get(idx + 1)
+            .filter(|message| message.role == "user")
+            .map(|message| anthropic_tool_result_ids(&message.content))
+            .unwrap_or_default();
+        let Some(blocks) = content_blocks_mut(&mut messages[idx].content) else {
+            continue;
+        };
+        let before = blocks.len();
+        blocks.retain(|block| {
+            if block_type(block) != Some("tool_use") {
+                return true;
+            }
+            block
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| paired_ids.contains(id))
+        });
+        let delta = before.saturating_sub(blocks.len());
+        removed += delta;
+        if delta > 0 && blocks.is_empty() {
+            blocks.push(serde_json::json!({"type": "text", "text": " "}));
+        }
+    }
+    removed
+}
+
+fn anthropic_tool_use_ids(content: &Value) -> HashSet<String> {
+    content_blocks(content)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|block| block_type(block) == Some("tool_use"))
+                .filter_map(|block| block.get("id").and_then(Value::as_str))
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn anthropic_tool_result_ids(content: &Value) -> HashSet<String> {
+    content_blocks(content)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|block| block_type(block) == Some("tool_result"))
+                .filter_map(|block| block.get("tool_use_id").and_then(Value::as_str))
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn anthropic_tool_result_to_text(block: &Value) -> String {
+    let Some(content) = block.get("content") else {
+        return block.to_string();
+    };
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+    if let Some(items) = content.as_array() {
+        let mut parts = Vec::new();
+        for item in items {
+            if let Some(text) = item.as_str() {
+                parts.push(text.to_string());
+            } else if let Some(text) = item.get("text").and_then(Value::as_str) {
+                parts.push(text.to_string());
+            } else if !item.is_null() {
+                parts.push(item.to_string());
+            }
+        }
+        return parts.join("\n");
+    }
+    content.to_string()
+}
+
+fn trim_oldest_anthropic_history_unit(messages: &mut Vec<AnthropicMessage>) {
+    if messages.len() <= 1 {
+        return;
+    }
+    if messages.len() >= 3
+        && messages
+            .first()
+            .is_some_and(|message| message.role == "assistant")
+        && messages.get(1).is_some_and(|message| {
+            message.role == "user" && has_anthropic_tool_result(&message.content)
+        })
+    {
+        messages.drain(0..2);
+        return;
+    }
+    messages.remove(0);
+}
+
+fn has_anthropic_tool_result(content: &Value) -> bool {
+    count_content_blocks_by_type(content, "tool_result") > 0
 }
 
 fn truncate_history_tool_results(
@@ -1277,6 +2054,315 @@ fn next_fit_budget(
     )
 }
 
+fn apply_anthropic_current_payload_shaping_until_fit(
+    request: &mut MessagesRequest,
+    config: PayloadShapingConfig,
+    max_bytes: usize,
+    body: String,
+) -> Result<(String, CurrentShapingStats), PayloadGuardError> {
+    let mut body = body;
+    let mut stats = CurrentShapingStats::default();
+
+    if body.len() <= max_bytes {
+        return Ok((body, stats));
+    }
+
+    let mut tool_budget = normalize_current_text_budget(config.current_tool_result_max_chars);
+    let mut document_budget = normalize_current_text_budget(config.current_document_max_chars);
+    let mut user_content_budget =
+        normalize_current_text_budget(config.current_user_content_max_chars);
+
+    let truncate_tool_results =
+        config.fit_current_payload_to_budget || config.truncate_current_tool_results;
+    let truncate_documents =
+        config.fit_current_payload_to_budget || config.truncate_current_documents;
+    let truncate_user_content =
+        config.fit_current_payload_to_budget || config.truncate_current_user_content;
+    let truncate_images = config.fit_current_payload_to_budget || config.truncate_current_images;
+
+    if truncate_tool_results {
+        let changed = truncate_anthropic_current_tool_results(request, tool_budget);
+        stats.truncated_current_tool_results += changed.0;
+        stats.truncated_current_tool_result_chars += changed.1;
+    }
+    if truncate_documents {
+        let changed = truncate_anthropic_current_documents(request, document_budget);
+        stats.truncated_current_documents += changed.0;
+        stats.truncated_current_document_chars += changed.1;
+    }
+    if truncate_user_content {
+        let changed = truncate_anthropic_current_user_content(request, user_content_budget);
+        stats.truncated_current_user_content += changed.0;
+        stats.truncated_current_user_content_chars += changed.1;
+    }
+    if truncate_images {
+        let changed =
+            drop_anthropic_current_images_to_budget(request, config.current_images_max_bytes);
+        stats.dropped_current_images += changed.0;
+        stats.dropped_current_image_bytes += changed.1;
+    }
+
+    body = serialize_anthropic_request(request)?;
+
+    let mut iterations = 0usize;
+    while body.len() > max_bytes && iterations < CURRENT_FIT_MAX_ITERATIONS {
+        iterations += 1;
+        let before_len = body.len();
+        let mut changed = false;
+
+        if truncate_tool_results
+            && tool_budget.is_some_and(|budget| budget > CURRENT_FIT_MIN_TEXT_CHARS)
+        {
+            tool_budget = next_fit_budget(tool_budget, body.len(), max_bytes);
+            let result = truncate_anthropic_current_tool_results(request, tool_budget);
+            if result.0 > 0 {
+                stats.truncated_current_tool_results += result.0;
+                stats.truncated_current_tool_result_chars += result.1;
+                changed = true;
+            }
+        }
+
+        if !changed
+            && truncate_documents
+            && document_budget.is_some_and(|budget| budget > CURRENT_FIT_MIN_TEXT_CHARS)
+        {
+            document_budget = next_fit_budget(document_budget, body.len(), max_bytes);
+            let result = truncate_anthropic_current_documents(request, document_budget);
+            if result.0 > 0 {
+                stats.truncated_current_documents += result.0;
+                stats.truncated_current_document_chars += result.1;
+                changed = true;
+            }
+        }
+
+        if !changed
+            && truncate_user_content
+            && user_content_budget.is_some_and(|budget| budget > CURRENT_FIT_MIN_TEXT_CHARS)
+        {
+            user_content_budget = next_fit_budget(user_content_budget, body.len(), max_bytes);
+            let result = truncate_anthropic_current_user_content(request, user_content_budget);
+            if result.0 > 0 {
+                stats.truncated_current_user_content += result.0;
+                stats.truncated_current_user_content_chars += result.1;
+                changed = true;
+            }
+        }
+
+        if !changed && truncate_images {
+            let result = drop_largest_anthropic_current_image(request);
+            if result.0 > 0 {
+                stats.dropped_current_images += result.0;
+                stats.dropped_current_image_bytes += result.1;
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+
+        body = serialize_anthropic_request(request)?;
+        if body.len() >= before_len {
+            break;
+        }
+    }
+
+    Ok((body, stats))
+}
+
+fn truncate_anthropic_current_tool_results(
+    request: &mut MessagesRequest,
+    max_chars: Option<usize>,
+) -> (usize, usize) {
+    let Some(max_chars) = max_chars else {
+        return (0, 0);
+    };
+    let Some(message) = request.messages.last_mut() else {
+        return (0, 0);
+    };
+    let Some(blocks) = content_blocks_mut(&mut message.content) else {
+        return (0, 0);
+    };
+    let mut truncated = 0usize;
+    let mut omitted = 0usize;
+    for block in blocks {
+        if block_type(block) != Some("tool_result") {
+            continue;
+        }
+        let result = truncate_anthropic_tool_result_block(
+            block,
+            max_chars,
+            120,
+            80,
+            "current tool result",
+            false,
+        );
+        truncated += result.0;
+        omitted += result.1;
+    }
+    (truncated, omitted)
+}
+
+fn truncate_anthropic_current_documents(
+    request: &mut MessagesRequest,
+    max_chars: Option<usize>,
+) -> (usize, usize) {
+    let Some(max_chars) = max_chars else {
+        return (0, 0);
+    };
+    let Some(message) = request.messages.last_mut() else {
+        return (0, 0);
+    };
+    let Some(blocks) = content_blocks_mut(&mut message.content) else {
+        return (0, 0);
+    };
+    let mut truncated = 0usize;
+    let mut omitted = 0usize;
+    for block in blocks {
+        if block_type(block) != Some("document") {
+            continue;
+        }
+        for path in [["text"].as_slice(), ["source", "text"].as_slice()] {
+            let Some(value) = nested_value_mut(block, path) else {
+                continue;
+            };
+            let result = truncate_anthropic_content_texts(
+                value,
+                max_chars,
+                120,
+                80,
+                "current document",
+                false,
+            );
+            truncated += result.0;
+            omitted += result.1;
+        }
+    }
+    (truncated, omitted)
+}
+
+fn truncate_anthropic_current_user_content(
+    request: &mut MessagesRequest,
+    max_chars: Option<usize>,
+) -> (usize, usize) {
+    let Some(max_chars) = max_chars else {
+        return (0, 0);
+    };
+    let Some(message) = request.messages.last_mut() else {
+        return (0, 0);
+    };
+    if let Some(text) = message.content.as_str().map(str::to_string) {
+        let original_chars = text.chars().count();
+        if original_chars <= max_chars {
+            return (0, 0);
+        }
+        let replacement =
+            truncate_text_head_tail(&text, max_chars, 160, 100, "current user content");
+        let replacement_chars = replacement.chars().count();
+        message.content = Value::String(replacement);
+        return (1, original_chars.saturating_sub(replacement_chars));
+    }
+    let Some(blocks) = content_blocks_mut(&mut message.content) else {
+        return (0, 0);
+    };
+    let mut truncated = 0usize;
+    let mut omitted = 0usize;
+    for block in blocks {
+        if block_type(block) != Some("text") {
+            continue;
+        }
+        let Some(value) = block.get_mut("text") else {
+            continue;
+        };
+        let result = truncate_anthropic_content_texts(
+            value,
+            max_chars,
+            160,
+            100,
+            "current user content",
+            false,
+        );
+        truncated += result.0;
+        omitted += result.1;
+    }
+    (truncated, omitted)
+}
+
+fn drop_anthropic_current_images_to_budget(
+    request: &mut MessagesRequest,
+    max_bytes: usize,
+) -> (usize, usize) {
+    let mut dropped = 0usize;
+    let mut dropped_bytes = 0usize;
+    while current_anthropic_images_bytes(request) > max_bytes {
+        let result = drop_largest_anthropic_current_image(request);
+        if result.0 == 0 {
+            break;
+        }
+        dropped += result.0;
+        dropped_bytes += result.1;
+    }
+    if dropped > 0 {
+        append_anthropic_current_text(
+            request,
+            &format!(
+                "[current images omitted by proxy: count={}, removed_json_bytes={}]",
+                dropped, dropped_bytes
+            ),
+        );
+    }
+    (dropped, dropped_bytes)
+}
+
+fn current_anthropic_images_bytes(request: &MessagesRequest) -> usize {
+    request
+        .messages
+        .last()
+        .map(|message| content_images_bytes(&message.content))
+        .unwrap_or(0)
+}
+
+fn drop_largest_anthropic_current_image(request: &mut MessagesRequest) -> (usize, usize) {
+    let Some(message) = request.messages.last_mut() else {
+        return (0, 0);
+    };
+    let Some(blocks) = content_blocks_mut(&mut message.content) else {
+        return (0, 0);
+    };
+    let Some((idx, bytes)) = blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| block_type(block) == Some("image"))
+        .map(|(idx, block)| (idx, json_len(block)))
+        .max_by_key(|(_, bytes)| *bytes)
+    else {
+        return (0, 0);
+    };
+    blocks.remove(idx);
+    (1, bytes)
+}
+
+fn append_anthropic_current_text(request: &mut MessagesRequest, text: &str) {
+    let Some(message) = request.messages.last_mut() else {
+        return;
+    };
+    if let Some(existing) = message.content.as_str().map(str::to_string) {
+        message.content = Value::String(format!("{}\n\n{}", existing, text));
+        return;
+    }
+    if let Some(blocks) = content_blocks_mut(&mut message.content) {
+        blocks.push(serde_json::json!({"type": "text", "text": text}));
+    }
+}
+
+fn nested_value_mut<'a>(value: &'a mut Value, path: &[&str]) -> Option<&'a mut Value> {
+    let mut current = value;
+    for key in path {
+        current = current.get_mut(*key)?;
+    }
+    Some(current)
+}
+
 fn truncate_current_tool_results(
     request: &mut KiroRequest,
     max_chars: Option<usize>,
@@ -1862,6 +2948,28 @@ mod tests {
         }
     }
 
+    fn anthropic_message(role: &str, content: Value) -> AnthropicMessage {
+        AnthropicMessage {
+            role: role.to_string(),
+            content,
+        }
+    }
+
+    fn anthropic_request(messages: Vec<AnthropicMessage>) -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 128,
+            messages,
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
     fn guard_config_with_shaping(
         max_bytes: usize,
         trim_history: bool,
@@ -1907,6 +3015,49 @@ mod tests {
             request.conversation_state.history.first(),
             Some(Message::User(_))
         ));
+    }
+
+    #[test]
+    fn anthropic_guard_trims_old_history_until_under_limit() {
+        let mut messages = Vec::new();
+        for idx in 0..24 {
+            messages.push(anthropic_message(
+                "user",
+                serde_json::json!(format!("history {} {}", idx, "x".repeat(600))),
+            ));
+            messages.push(anthropic_message(
+                "assistant",
+                serde_json::json!([{
+                    "type": "text",
+                    "text": format!("answer {} {}", idx, "y".repeat(400)),
+                }]),
+            ));
+        }
+        messages.push(anthropic_message(
+            "user",
+            serde_json::json!("current question"),
+        ));
+        let mut request = anthropic_request(messages);
+        let original = serde_json::to_string(&request).unwrap();
+
+        let (body, report) =
+            guard_anthropic_messages_request(&mut request, guard_config(8_000), original.len())
+                .expect("external guard should trim");
+
+        assert!(body.len() <= 8_000, "body len was {}", body.len());
+        assert!(report.trimmed_history_entries > 0);
+        assert!(!report.still_oversized);
+        assert_eq!(
+            request.messages.last().unwrap().content,
+            serde_json::json!("current question")
+        );
+
+        let breakdown = breakdown_anthropic_messages_request(&request, body.len());
+        assert_eq!(breakdown.total_bytes, body.len());
+        assert_eq!(
+            breakdown.history_entries,
+            request.messages.len().saturating_sub(1)
+        );
     }
 
     #[test]

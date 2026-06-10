@@ -1245,6 +1245,14 @@ pub struct Config {
     #[serde(default = "default_payload_guard_trim_history")]
     pub payload_guard_trim_history: bool,
 
+    /// 外部备用池请求是否复用同一套 payload guard / shaping 配置。
+    ///
+    /// 开启后，外部池转发 Anthropic 请求前也会按 `payloadGuardMode`、
+    /// `payloadGuardMaxBytes` 和 `payloadShaping` 处理超长上下文；不会为外部池复制
+    /// 第二套阈值或裁剪规则。关闭后外部池保持原始请求体透传。
+    #[serde(default = "default_payload_guard_external_enabled")]
+    pub payload_guard_external_enabled: bool,
+
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
@@ -1584,6 +1592,10 @@ fn default_payload_guard_trim_history() -> bool {
     true
 }
 
+fn default_payload_guard_external_enabled() -> bool {
+    true
+}
+
 fn default_compat_profile() -> CompatProfile {
     CompatProfile::ClaudeCode
 }
@@ -1831,6 +1843,7 @@ impl Default for Config {
             payload_guard_max_bytes: default_payload_guard_max_bytes(),
             payload_guard_safety_margin_bytes: default_payload_guard_safety_margin_bytes(),
             payload_guard_trim_history: default_payload_guard_trim_history(),
+            payload_guard_external_enabled: default_payload_guard_external_enabled(),
             load_balancing_mode: default_load_balancing_mode(),
             scheduler_error_ewma_alpha: default_scheduler_error_ewma_alpha(),
             scheduler_priority_weight: default_scheduler_priority_weight(),
@@ -1960,6 +1973,7 @@ mod tests {
         assert_eq!(config.payload_guard_max_bytes, 450 * 1024);
         assert_eq!(config.payload_guard_safety_margin_bytes, 32 * 1024);
         assert!(config.payload_guard_trim_history);
+        assert!(config.payload_guard_external_enabled);
         assert!(config.payload_shaping.enabled);
         assert!(config.payload_shaping.truncate_historical_tool_results);
         assert_eq!(

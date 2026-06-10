@@ -7,7 +7,7 @@ use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 
 use super::error::AdminServiceError;
@@ -69,6 +69,8 @@ const MAX_CREDENTIALS_PAGE_LIMIT: usize = 500;
 const MAX_MANUAL_MODEL_ID_LEN: usize = 160;
 const USAGE_CLEANUP_DEFAULT_MAX_BATCHES: usize = 10_000;
 const USAGE_CLEANUP_MAX_BATCHES: usize = 10_000;
+const ADMIN_USAGE_CACHE_TTL_SECS: usize = 2;
+const ADMIN_EXTERNAL_POOL_STATUS_CACHE_TTL_SECS: usize = 2;
 
 #[derive(Debug, Clone, Default)]
 pub struct CredentialListQuery {
@@ -103,6 +105,30 @@ struct CachedBalance {
 
 fn balance_cache_key(id: u64) -> String {
     format!("balance:{}", id)
+}
+
+fn admin_usage_summary_cache_key(high_cache_threshold: i32) -> String {
+    format!("admin_cache:usage:summary:{}", high_cache_threshold)
+}
+
+fn admin_usage_dashboard_cache_key(timezone: Option<&str>, high_cache_threshold: i32) -> String {
+    let timezone = timezone
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("default")
+        .replace(':', "_");
+    format!(
+        "admin_cache:usage:dashboard:{}:{}",
+        timezone, high_cache_threshold
+    )
+}
+
+fn admin_external_pool_status_cache_key() -> &'static str {
+    "admin_cache:external_pools:status"
+}
+
+fn admin_external_pool_list_cache_key() -> &'static str {
+    "admin_cache:external_pools:list"
 }
 
 fn mask_secret(value: &str) -> String {
@@ -254,14 +280,66 @@ impl AdminService {
         });
     }
 
+    fn read_admin_cache<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
+        let redis = self.redis_store.clone();
+        let key = key.to_string();
+        match block_on_admin_store(async move { redis.get_json::<T>(key).await }) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!("读取 Redis Admin 缓存失败: {}", err);
+                None
+            }
+        }
+    }
+
+    fn write_admin_cache<T>(&self, key: String, value: T, ttl_secs: usize)
+    where
+        T: Serialize + Send + Sync + 'static,
+    {
+        let redis = self.redis_store.clone();
+        tokio::spawn(async move {
+            if let Err(err) = redis.set_json(key, &value, ttl_secs).await {
+                tracing::warn!("写入 Redis Admin 缓存失败: {}", err);
+            }
+        });
+    }
+
+    fn invalidate_admin_cache_pattern(&self, pattern: &'static str) {
+        let redis = self.redis_store.clone();
+        tokio::spawn(async move {
+            if let Err(err) = redis.del_pattern(pattern).await {
+                tracing::warn!("清理 Redis Admin 缓存失败: {}", err);
+            }
+        });
+    }
+
+    fn invalidate_usage_admin_cache(&self) {
+        self.invalidate_admin_cache_pattern("admin_cache:usage:*");
+    }
+
+    fn invalidate_external_pool_admin_cache(&self) {
+        self.invalidate_admin_cache_pattern("admin_cache:external_pools:*");
+    }
+
     pub fn get_access_keys(&self, admin_api_key: &str) -> AccessKeysResponse {
         access_keys_response(&self.request_api_key, admin_api_key)
     }
 
     pub fn list_external_pools(&self) -> Result<Vec<ExternalPool>, AdminServiceError> {
+        let cache_key = admin_external_pool_list_cache_key();
+        if let Some(cached) = self.read_admin_cache::<Vec<ExternalPool>>(cache_key) {
+            return Ok(cached);
+        }
+
         let store = self.postgres_store.clone();
-        block_on_admin_store(async move { store.list_external_pools(true).await })
-            .map_err(|err| AdminServiceError::InternalError(err.to_string()))
+        let pools = block_on_admin_store(async move { store.list_external_pools(true).await })
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        self.write_admin_cache(
+            cache_key.to_string(),
+            pools.clone(),
+            ADMIN_EXTERNAL_POOL_STATUS_CACHE_TTL_SECS,
+        );
+        Ok(pools)
     }
 
     pub fn create_external_pool(
@@ -279,6 +357,7 @@ impl AdminService {
             None,
             json!({ "name": pool.name, "baseUrl": pool.base_url }),
         );
+        self.invalidate_external_pool_admin_cache();
         Ok(pool)
     }
 
@@ -300,6 +379,7 @@ impl AdminService {
             None,
             json!({ "name": pool.name, "baseUrl": pool.base_url }),
         );
+        self.invalidate_external_pool_admin_cache();
         Ok(pool)
     }
 
@@ -319,6 +399,7 @@ impl AdminService {
             None,
             json!({}),
         );
+        self.invalidate_external_pool_admin_cache();
         Ok(())
     }
 
@@ -341,6 +422,7 @@ impl AdminService {
             None,
             json!({ "enabled": request.enabled }),
         );
+        self.invalidate_external_pool_admin_cache();
         Ok(pool)
     }
 
@@ -361,17 +443,29 @@ impl AdminService {
             None,
             json!({}),
         );
+        self.invalidate_external_pool_admin_cache();
         Ok(pool)
     }
 
     pub fn get_external_pool_status(
         &self,
     ) -> Result<ExternalPoolsStatusResponse, AdminServiceError> {
+        let cache_key = admin_external_pool_status_cache_key();
+        if let Some(cached) = self.read_admin_cache::<ExternalPoolsStatusResponse>(cache_key) {
+            return Ok(cached);
+        }
+
         let manager = self.external_pool_manager.clone();
         let config = self.token_manager.runtime_config().external_pools;
         let pools = block_on_admin_store(async move { manager.status(&config).await })
             .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
-        Ok(ExternalPoolsStatusResponse { pools })
+        let response = ExternalPoolsStatusResponse { pools };
+        self.write_admin_cache(
+            cache_key.to_string(),
+            response.clone(),
+            ADMIN_EXTERNAL_POOL_STATUS_CACHE_TTL_SECS,
+        );
+        Ok(response)
     }
 
     pub fn test_external_pool(
@@ -1687,24 +1781,35 @@ impl AdminService {
     /// 获取 usage 汇总。
     pub fn get_usage_summary(&self) -> UsageSummary {
         let high_cache_threshold = self.token_manager.runtime_config().high_cache_threshold;
-        self.usage_recorder.summary(high_cache_threshold)
+        let cache_key = admin_usage_summary_cache_key(high_cache_threshold);
+        if let Some(cached) = self.read_admin_cache::<UsageSummary>(&cache_key) {
+            return cached;
+        }
+
+        let summary = self.usage_recorder.summary(high_cache_threshold);
+        self.write_admin_cache(cache_key, summary.clone(), ADMIN_USAGE_CACHE_TTL_SECS);
+        summary
     }
 
-    /// 获取 PgSQL 聚合的 usage 仪表盘数据。
+    /// 获取 Redis-first 聚合的 usage 仪表盘数据。
     ///
-    /// 该接口不走 UsageRecorder 的内存记录兜底，避免仪表盘统计受进程内缓存大小影响。
+    /// Redis 为空或未初始化时回退 PgSQL rollup，避免冷启动没有历史窗口数据。
     pub fn get_usage_dashboard(
         &self,
         timezone: Option<String>,
     ) -> Result<UsageDashboardResponse, AdminServiceError> {
         let high_cache_threshold = self.token_manager.runtime_config().high_cache_threshold;
-        let usage_store = PostgresUsageStore::new(self.postgres_store.clone());
-        block_on_admin_store(async move {
-            usage_store
-                .dashboard(timezone.as_deref(), high_cache_threshold)
-                .await
-        })
-        .map_err(|err| AdminServiceError::InternalError(err.to_string()))
+        let cache_key = admin_usage_dashboard_cache_key(timezone.as_deref(), high_cache_threshold);
+        if let Some(cached) = self.read_admin_cache::<UsageDashboardResponse>(&cache_key) {
+            return Ok(cached);
+        }
+
+        let dashboard = self
+            .usage_recorder
+            .dashboard(timezone.as_deref(), high_cache_threshold)
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?;
+        self.write_admin_cache(cache_key, dashboard.clone(), ADMIN_USAGE_CACHE_TTL_SECS);
+        Ok(dashboard)
     }
 
     /// 获取 usage 持久化 writer 状态。该状态只用于观测，不参与调度。
@@ -1916,6 +2021,7 @@ impl AdminService {
     /// 清空 usage 记录。
     pub fn clear_usage_records(&self) {
         self.usage_recorder.clear();
+        self.invalidate_usage_admin_cache();
         self.audit(
             "clear_usage_records",
             "usage_record",
@@ -2108,6 +2214,7 @@ impl AdminService {
             payload_guard_max_bytes: config.payload_guard_max_bytes as u64,
             payload_guard_safety_margin_bytes: config.payload_guard_safety_margin_bytes as u64,
             payload_guard_trim_history: config.payload_guard_trim_history,
+            payload_guard_external_enabled: config.payload_guard_external_enabled,
             payload_shaping: config.payload_shaping,
             prompt_cache_target_read_ratio: config.prompt_cache_target_read_ratio,
             prompt_cache_token_scale: config.prompt_cache_token_scale,
@@ -2228,6 +2335,9 @@ impl AdminService {
         let payload_guard_trim_history = req
             .payload_guard_trim_history
             .unwrap_or(current_config.payload_guard_trim_history);
+        let payload_guard_external_enabled = req
+            .payload_guard_external_enabled
+            .unwrap_or(current_config.payload_guard_external_enabled);
         let payload_shaping = req
             .payload_shaping
             .map(|patch| patch.apply_to(current_config.payload_shaping))
@@ -2470,6 +2580,7 @@ impl AdminService {
                 config.payload_guard_max_bytes = payload_guard_max_bytes;
                 config.payload_guard_safety_margin_bytes = payload_guard_safety_margin_bytes;
                 config.payload_guard_trim_history = payload_guard_trim_history;
+                config.payload_guard_external_enabled = payload_guard_external_enabled;
                 config.payload_shaping = payload_shaping;
                 config.prompt_cache_target_read_ratio = prompt_cache_target_read_ratio;
                 config.prompt_cache_token_scale = prompt_cache_token_scale;
@@ -2497,6 +2608,7 @@ impl AdminService {
             None,
             json!({}),
         );
+        self.invalidate_external_pool_admin_cache();
 
         Ok(self.get_runtime_config())
     }

@@ -294,6 +294,7 @@ const emptyConfig: RuntimeConfig = {
   payloadGuardMaxBytes: 460800,
   payloadGuardSafetyMarginBytes: 32768,
   payloadGuardTrimHistory: true,
+  payloadGuardExternalEnabled: true,
   payloadShaping: defaultPayloadShaping(),
   promptCacheTargetReadRatio: 0.98,
   promptCacheTokenScale: 1.6,
@@ -1587,6 +1588,15 @@ export function RuntimeConfigPanel() {
               checked={draft.payloadGuardEnabled}
               onCheckedChange={(payloadGuardEnabled) =>
                 setDraft((prev) => ({ ...prev, payloadGuardEnabled }))
+              }
+            />
+            <ToggleField
+              title="备用池也应用 Payload 整形"
+              description="开启后，备用池请求会复用本页同一套阈值、模式和内容整形规则；关闭时备用池保持原始 Anthropic 请求体透传。"
+              checked={draft.payloadGuardExternalEnabled}
+              disabled={!draft.payloadGuardEnabled}
+              onCheckedChange={(payloadGuardExternalEnabled) =>
+                setDraft((prev) => ({ ...prev, payloadGuardExternalEnabled }))
               }
             />
             <label className="block rounded-md border bg-background p-4">

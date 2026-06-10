@@ -939,6 +939,10 @@ pub struct MultiTokenManager {
     load_balancing_mode: Mutex<String>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
+    /// 最近一次从 Redis 全量同步调度状态的时间，用于避免每个请求重复拉取所有凭据状态。
+    last_scheduler_redis_sync_at: Mutex<Option<Instant>>,
+    /// 最近一次执行 Redis 超时 lease 清理的时间。清理是全局操作，不能放在请求热路径每轮执行。
+    last_scheduler_redis_cleanup_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
     /// 会话粘性绑定：conversationId -> credential id
@@ -959,6 +963,8 @@ const MAX_SESSION_BINDINGS: usize = 10_000;
 const MAX_SESSION_SOFT_FAILURES: u32 = 2;
 /// 并发排队等待的周期性唤醒间隔，避免极端竞态下丢失通知后永久睡眠。
 const CONCURRENCY_WAIT_WAKEUP_SECS: u64 = 30;
+const SCHEDULER_REDIS_SYNC_MIN_INTERVAL: StdDuration = StdDuration::from_millis(250);
+const SCHEDULER_REDIS_CLEANUP_MIN_INTERVAL: StdDuration = StdDuration::from_secs(5);
 const SELECTION_WINDOW_10S: StdDuration = StdDuration::from_secs(10);
 const SELECTION_WINDOW_60S: StdDuration = StdDuration::from_secs(60);
 const SELECTION_WINDOW_5M: StdDuration = StdDuration::from_secs(5 * 60);
@@ -1459,6 +1465,8 @@ impl MultiTokenManager {
             proxy_resources: Arc::new(Mutex::new(proxy_resources)),
             load_balancing_mode: Mutex::new(load_balancing_mode),
             last_stats_save_at: Mutex::new(None),
+            last_scheduler_redis_sync_at: Mutex::new(None),
+            last_scheduler_redis_cleanup_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             session_bindings: Mutex::new(HashMap::new()),
             in_flight_notify: Arc::new(Notify::new()),
@@ -1478,7 +1486,7 @@ impl MultiTokenManager {
         // 加载持久化的统计数据（success_count, last_used_at）
         manager.load_stats();
         manager.load_runtime_state();
-        manager.refresh_scheduler_state_from_redis_best_effort();
+        manager.refresh_scheduler_state_from_redis_force_best_effort();
 
         Ok(manager)
     }
@@ -2104,7 +2112,7 @@ impl MultiTokenManager {
     }
 
     fn acquire_in_flight_slot(&self, id: u64) -> anyhow::Result<Option<InFlightLeaseGuard>> {
-        self.cleanup_expired_in_flight_leases_result()?;
+        self.cleanup_expired_in_flight_leases_throttled()?;
         let max_concurrent_requests = self.max_concurrent_requests();
         let effective_max_concurrent_requests =
             self.effective_max_concurrent_requests_for_id(id, max_concurrent_requests);
@@ -2244,8 +2252,8 @@ impl MultiTokenManager {
                     "清理超时未释放的 Redis 凭据并发占用 lease"
                 );
                 self.notify_dispatch_state_changed();
+                self.refresh_scheduler_state_from_redis_force()?;
             }
-            self.refresh_scheduler_state_from_redis()?;
             return Ok(cleaned);
         }
         let now = Instant::now();
@@ -2278,6 +2286,31 @@ impl MultiTokenManager {
         Ok(cleaned)
     }
 
+    fn cleanup_expired_in_flight_leases_throttled(&self) -> anyhow::Result<usize> {
+        if self.redis_store.is_none() {
+            return self.cleanup_expired_in_flight_leases_result();
+        }
+
+        let now = Instant::now();
+        {
+            let mut last_cleanup_at = self.last_scheduler_redis_cleanup_at.lock();
+            if last_cleanup_at.is_some_and(|last| {
+                now.saturating_duration_since(last) < SCHEDULER_REDIS_CLEANUP_MIN_INTERVAL
+            }) {
+                return Ok(0);
+            }
+            *last_cleanup_at = Some(now);
+        }
+
+        match self.cleanup_expired_in_flight_leases_result() {
+            Ok(cleaned) => Ok(cleaned),
+            Err(err) => {
+                *self.last_scheduler_redis_cleanup_at.lock() = None;
+                Err(err)
+            }
+        }
+    }
+
     pub fn clear_in_flight_leases(
         &self,
         credential_id: u64,
@@ -2289,7 +2322,7 @@ impl MultiTokenManager {
                 redis.clear_in_flight_leases(credential_id, min_idle).await
             }) {
                 Ok(cleared) => {
-                    self.refresh_scheduler_state_from_redis_best_effort();
+                    self.refresh_scheduler_state_from_redis_force_best_effort();
                     if cleared > 0 {
                         self.notify_dispatch_state_changed();
                     }
@@ -2967,7 +3000,7 @@ impl MultiTokenManager {
 
         loop {
             self.refresh_scheduler_state_from_redis()?;
-            self.cleanup_expired_in_flight_leases_result()?;
+            self.cleanup_expired_in_flight_leases_throttled()?;
             if attempt_count >= max_attempts {
                 anyhow::bail!(
                     "所有凭据均无法获取有效 Token（可用: {}/{}）",
@@ -4140,6 +4173,31 @@ impl MultiTokenManager {
     }
 
     fn refresh_scheduler_state_from_redis(&self) -> anyhow::Result<()> {
+        if self.redis_store.is_none() {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        {
+            let mut last_sync_at = self.last_scheduler_redis_sync_at.lock();
+            if last_sync_at.is_some_and(|last| {
+                now.saturating_duration_since(last) < SCHEDULER_REDIS_SYNC_MIN_INTERVAL
+            }) {
+                return Ok(());
+            }
+            *last_sync_at = Some(now);
+        }
+
+        match self.refresh_scheduler_state_from_redis_force() {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                *self.last_scheduler_redis_sync_at.lock() = None;
+                Err(err)
+            }
+        }
+    }
+
+    fn refresh_scheduler_state_from_redis_force(&self) -> anyhow::Result<()> {
         let Some(redis) = &self.redis_store else {
             return Ok(());
         };
@@ -4156,11 +4214,18 @@ impl MultiTokenManager {
             redis.scheduler_state_for_credentials(&ids).await
         })?;
         self.apply_scheduler_states(states);
+        *self.last_scheduler_redis_sync_at.lock() = Some(Instant::now());
         Ok(())
     }
 
     fn refresh_scheduler_state_from_redis_best_effort(&self) {
         if let Err(err) = self.refresh_scheduler_state_from_redis() {
+            tracing::warn!("从 Redis 同步调度运行态失败: {}", err);
+        }
+    }
+
+    fn refresh_scheduler_state_from_redis_force_best_effort(&self) {
+        if let Err(err) = self.refresh_scheduler_state_from_redis_force() {
             tracing::warn!("从 Redis 同步调度运行态失败: {}", err);
         }
     }

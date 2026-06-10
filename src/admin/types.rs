@@ -860,6 +860,7 @@ pub struct RuntimeConfigResponse {
     pub payload_guard_max_bytes: u64,
     pub payload_guard_safety_margin_bytes: u64,
     pub payload_guard_trim_history: bool,
+    pub payload_guard_external_enabled: bool,
     pub payload_shaping: PayloadShapingConfig,
     pub prompt_cache_target_read_ratio: f64,
     pub prompt_cache_token_scale: f64,
@@ -950,6 +951,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub payload_guard_safety_margin_bytes: Option<u64>,
     #[serde(default)]
     pub payload_guard_trim_history: Option<bool>,
+    #[serde(default)]
+    pub payload_guard_external_enabled: Option<bool>,
     #[serde(default)]
     pub payload_shaping: Option<PayloadShapingConfigPatch>,
     #[serde(default)]

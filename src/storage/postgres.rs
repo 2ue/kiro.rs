@@ -2328,11 +2328,23 @@ impl PostgresUsageStore {
         let mut windows = self
             .dashboard_windows(&window_specs, high_cache_threshold)
             .await?;
+        let window_totals: HashMap<String, usize> = windows
+            .iter()
+            .map(|window| (window.key.clone(), window.summary.total_requests))
+            .collect();
         let mut status_breakdown = self
-            .dashboard_breakdown(&window_specs, DashboardBreakdownColumn::Status)
+            .dashboard_breakdown(
+                &window_specs,
+                &window_totals,
+                DashboardBreakdownColumn::Status,
+            )
             .await?;
         let mut usage_source_breakdown = self
-            .dashboard_breakdown(&window_specs, DashboardBreakdownColumn::UsageSource)
+            .dashboard_breakdown(
+                &window_specs,
+                &window_totals,
+                DashboardBreakdownColumn::UsageSource,
+            )
             .await?;
 
         for window in &mut windows {
@@ -2345,15 +2357,6 @@ impl PostgresUsageStore {
 
         let hourly_specs = usage_dashboard_hourly_windows(now, offset);
         let daily_specs = usage_dashboard_daily_windows(now, offset);
-        let top_window = window_specs
-            .iter()
-            .find(|window| window.key == "last24h")
-            .unwrap_or_else(|| {
-                window_specs
-                    .first()
-                    .expect("usage dashboard has at least one window")
-            });
-
         Ok(UsageDashboardResponse {
             generated_at: now.to_rfc3339(),
             timezone,
@@ -2363,34 +2366,18 @@ impl PostgresUsageStore {
                 daily_7d: self.dashboard_series(&daily_specs).await?,
             },
             top: UsageDashboardTop {
-                window_key: top_window.key.clone(),
+                window_key: "lifetime".to_string(),
                 models: self
-                    .dashboard_top_aggregates(
-                        top_window.from,
-                        top_window.to,
-                        DashboardTopGroup::Model,
-                    )
+                    .dashboard_top_aggregates(DashboardTopGroup::Model)
                     .await?,
                 credentials: self
-                    .dashboard_top_aggregates(
-                        top_window.from,
-                        top_window.to,
-                        DashboardTopGroup::Credential,
-                    )
+                    .dashboard_top_aggregates(DashboardTopGroup::Credential)
                     .await?,
                 endpoints: self
-                    .dashboard_top_aggregates(
-                        top_window.from,
-                        top_window.to,
-                        DashboardTopGroup::Endpoint,
-                    )
+                    .dashboard_top_aggregates(DashboardTopGroup::Endpoint)
                     .await?,
                 errors: self
-                    .dashboard_top_aggregates(
-                        top_window.from,
-                        top_window.to,
-                        DashboardTopGroup::Error,
-                    )
+                    .dashboard_top_aggregates(DashboardTopGroup::Error)
                     .await?,
             },
         })
@@ -2409,6 +2396,7 @@ impl PostgresUsageStore {
         push_dashboard_windows_cte(&mut builder, specs);
         builder.push(
             r#"
+            , rollup AS (
             SELECT
                 w.key,
                 w.label,
@@ -2419,18 +2407,6 @@ impl PostgresUsageStore {
                 COALESCE(SUM(b.error_requests), 0)::bigint AS error_requests,
                 COALESCE(SUM(b.stream_requests), 0)::bigint AS stream_requests,
                 COALESCE(SUM(b.non_stream_requests), 0)::bigint AS non_stream_requests,
-                COALESCE((
-                    SELECT SUM(c.requests)
-                    FROM usage_cache_read_rollup_time_buckets c
-                    WHERE c.bucket_start >= w.from_at
-                      AND c.bucket_start < w.to_at
-                      AND c.cache_read_input_tokens >=
-            "#,
-        );
-        builder.push_bind(high_cache_threshold);
-        builder.push(
-            r#"
-                ), 0)::bigint AS high_cache_requests,
                 COALESCE(SUM(b.total_input_tokens), 0)::bigint AS total_input_tokens,
                 COALESCE(SUM(b.billable_input_tokens), 0)::bigint AS billable_input_tokens,
                 COALESCE(SUM(b.total_output_tokens), 0)::bigint AS total_output_tokens,
@@ -2445,26 +2421,7 @@ impl PostgresUsageStore {
                          / SUM(b.duration_ms_count)::double precision
                     ELSE 0
                 END AS average_duration_ms,
-                COALESCE((
-                    SELECT ranked.duration_ms
-                    FROM (
-                        SELECT
-                            grouped.duration_ms,
-                            SUM(grouped.requests) OVER (ORDER BY grouped.duration_ms) AS cumulative_requests,
-                            SUM(grouped.requests) OVER () AS total_requests
-                        FROM (
-                            SELECT d.duration_ms, SUM(d.requests)::bigint AS requests
-                            FROM usage_duration_rollup_time_buckets d
-                            WHERE d.bucket_start >= w.from_at
-                              AND d.bucket_start < w.to_at
-                            GROUP BY d.duration_ms
-                        ) grouped
-                    ) ranked
-                    WHERE ranked.total_requests > 0
-                      AND ranked.cumulative_requests >= CEIL(ranked.total_requests::double precision * 0.95)::bigint
-                    ORDER BY ranked.duration_ms
-                    LIMIT 1
-                ), 0)::bigint AS p95_duration_ms,
+                COALESCE(MAX(b.duration_ms_max), 0)::bigint AS p95_duration_ms,
                 COALESCE(SUM(b.sticky_bound_requests), 0)::bigint AS sticky_bound_requests,
                 COALESCE(SUM(b.fallback_from_sticky_requests), 0)::bigint AS fallback_from_sticky_requests,
                 COALESCE(SUM(b.simulated_requests), 0)::bigint AS simulated_requests,
@@ -2487,6 +2444,61 @@ impl PostgresUsageStore {
                 AND b.bucket_start >= w.from_at
                 AND b.bucket_start < w.to_at
             GROUP BY w.key, w.label, w.from_at, w.to_at, w.ord
+            ), high_cache AS (
+            SELECT
+                w.key,
+                COALESCE(SUM(c.requests), 0)::bigint AS high_cache_requests
+            FROM windows w
+            LEFT JOIN usage_cache_read_rollup_time_buckets c
+                ON c.bucket_start >= w.from_at
+                AND c.bucket_start < w.to_at
+                AND c.cache_read_input_tokens >=
+            "#,
+        );
+        builder.push_bind(high_cache_threshold);
+        builder.push(
+            r#"
+            GROUP BY w.key
+            )
+            SELECT
+                r.key,
+                r.label,
+                r.from_at,
+                r.to_at,
+                r.total_requests,
+                r.success_requests,
+                r.error_requests,
+                r.stream_requests,
+                r.non_stream_requests,
+                COALESCE(h.high_cache_requests, 0)::bigint AS high_cache_requests,
+                r.total_input_tokens,
+                r.billable_input_tokens,
+                r.total_output_tokens,
+                r.total_cache_read_input_tokens,
+                r.total_cache_creation_input_tokens,
+                r.total_estimated_cost_usd,
+                r.priced_requests,
+                r.unpriced_requests,
+                r.average_duration_ms,
+                r.p95_duration_ms,
+                r.sticky_bound_requests,
+                r.fallback_from_sticky_requests,
+                r.simulated_requests,
+                r.upstream_metadata_requests,
+                r.external_pool_requests,
+                r.external_pool_priced_requests,
+                r.external_pool_unpriced_requests,
+                r.external_pool_cost_floor_applied_requests,
+                r.external_pool_raw_cost_usd,
+                r.external_pool_shaped_cost_usd,
+                r.external_pool_uplifted_cost_usd,
+                r.external_pool_profit_usd,
+                r.external_pool_reported_cost_usd,
+                r.external_pool_billable_cost_usd,
+                r.external_pool_cost_floor_delta_usd
+            FROM rollup r
+            LEFT JOIN high_cache h ON h.key = r.key
+            JOIN windows w ON w.key = r.key
             ORDER BY w.ord
             "#,
         );
@@ -2500,17 +2512,13 @@ impl PostgresUsageStore {
     async fn dashboard_breakdown(
         &self,
         specs: &[UsageDashboardWindowSpec],
+        totals: &HashMap<String, usize>,
         column: DashboardBreakdownColumn,
     ) -> anyhow::Result<HashMap<String, Vec<UsageBreakdownItem>>> {
         if specs.is_empty() {
             return Ok(HashMap::new());
         }
 
-        let totals: HashMap<String, usize> = self
-            .dashboard_window_totals(specs)
-            .await?
-            .into_iter()
-            .collect();
         let item_dimension = column.rollup_dimension();
         let mut builder = QueryBuilder::<Postgres>::new("");
         push_dashboard_windows_cte(&mut builder, specs);
@@ -2551,36 +2559,6 @@ impl PostgresUsageStore {
                 });
         }
         Ok(grouped)
-    }
-
-    async fn dashboard_window_totals(
-        &self,
-        specs: &[UsageDashboardWindowSpec],
-    ) -> anyhow::Result<Vec<(String, usize)>> {
-        let mut builder = QueryBuilder::<Postgres>::new("");
-        push_dashboard_windows_cte(&mut builder, specs);
-        builder.push(
-            r#"
-            SELECT w.key, COALESCE(SUM(b.requests), 0)::bigint AS total_requests
-            FROM windows w
-            LEFT JOIN usage_rollup_time_buckets b
-                ON b.dimension = 'global'
-                AND b.dimension_key = 'all'
-                AND b.bucket_start >= w.from_at
-                AND b.bucket_start < w.to_at
-            GROUP BY w.key, w.ord
-            ORDER BY w.ord
-            "#,
-        );
-        let rows = builder.build().fetch_all(self.store.pool()).await?;
-        rows.into_iter()
-            .map(|row| {
-                Ok((
-                    row.try_get("key")?,
-                    row_i64_to_usize(&row, "total_requests")?,
-                ))
-            })
-            .collect()
     }
 
     async fn dashboard_series(
@@ -2625,33 +2603,27 @@ impl PostgresUsageStore {
 
     async fn dashboard_top_aggregates(
         &self,
-        from: DateTime<Utc>,
-        to: DateTime<Utc>,
         group: DashboardTopGroup,
     ) -> anyhow::Result<Vec<UsageTopAggregate>> {
         let mut builder = QueryBuilder::<Postgres>::new(
             r#"
             SELECT
-                b.dimension_key AS key,
-                MAX(NULLIF(b.dimension_label, '')) AS label,
-                SUM(b.requests)::bigint AS requests,
-                SUM(b.error_requests)::bigint AS error_requests,
-                COALESCE(SUM(b.total_input_tokens), 0)::bigint AS total_input_tokens,
-                COALESCE(SUM(b.billable_input_tokens), 0)::bigint AS billable_input_tokens,
-                COALESCE(SUM(b.total_output_tokens), 0)::bigint AS total_output_tokens,
-                COALESCE(SUM(b.total_cache_read_input_tokens), 0)::bigint AS total_cache_read_input_tokens,
-                COALESCE(SUM(b.total_cache_creation_input_tokens), 0)::bigint AS total_cache_creation_input_tokens,
-                COALESCE(SUM(b.total_estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd
-            FROM usage_rollup_time_buckets b
-            WHERE b.dimension = "#,
+                dimension_key AS key,
+                NULLIF(dimension_label, '') AS label,
+                requests::bigint AS requests,
+                error_requests::bigint AS error_requests,
+                total_input_tokens::bigint AS total_input_tokens,
+                billable_input_tokens::bigint AS billable_input_tokens,
+                total_output_tokens::bigint AS total_output_tokens,
+                total_cache_read_input_tokens::bigint AS total_cache_read_input_tokens,
+                total_cache_creation_input_tokens::bigint AS total_cache_creation_input_tokens,
+                total_estimated_cost_usd::double precision AS total_estimated_cost_usd
+            FROM usage_rollup_totals
+            WHERE dimension = "#,
         );
         builder.push_bind(group.rollup_dimension());
-        builder.push(" AND b.bucket_start >= ");
-        builder.push_bind(from);
-        builder.push(" AND b.bucket_start < ");
-        builder.push_bind(to);
         builder.push(group.rollup_extra_where());
-        builder.push(" GROUP BY b.dimension_key HAVING SUM(b.requests) > 0 ");
+        builder.push(" AND requests > 0 ");
         builder.push(
             " ORDER BY total_estimated_cost_usd DESC, requests DESC, total_input_tokens DESC LIMIT 10",
         );
