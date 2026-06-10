@@ -273,8 +273,10 @@ export interface AddCredentialRequest {
   clientId?: string
   clientSecret?: string
   email?: string
+  profileArn?: string
   priority?: number
   maxConcurrentRequests?: number | null
+  region?: string
   authRegion?: string
   apiRegion?: string
   machineId?: string

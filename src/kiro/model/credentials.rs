@@ -27,31 +27,31 @@ pub struct KiroCredentials {
     pub updated_at: Option<String>,
 
     /// 访问令牌
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", alias = "access_token")]
     pub access_token: Option<String>,
 
     /// 刷新令牌
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", alias = "refresh_token")]
     pub refresh_token: Option<String>,
 
     /// Profile ARN
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", alias = "profile_arn")]
     pub profile_arn: Option<String>,
 
     /// 过期时间 (RFC3339 格式)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", alias = "expires_at")]
     pub expires_at: Option<String>,
 
     /// 认证方式 (social / idc)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", alias = "auth_method")]
     pub auth_method: Option<String>,
 
     /// OIDC Client ID (IdC 认证需要)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", alias = "client_id")]
     pub client_id: Option<String>,
 
     /// OIDC Client Secret (IdC 认证需要)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", alias = "client_secret")]
     pub client_secret: Option<String>,
 
     /// 凭据优先级（数字越小优先级越高，默认为 0）
@@ -73,16 +73,16 @@ pub struct KiroCredentials {
     pub region: Option<String>,
 
     /// 凭据级 Auth Region（用于 Token 刷新）
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", alias = "auth_region")]
     pub auth_region: Option<String>,
 
     /// 凭据级 API Region（用于 API 请求）
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", alias = "api_region")]
     pub api_region: Option<String>,
 
     /// 凭据级 Machine ID 配置（可选）
     /// 未配置时回退到 config.json 的 machineId；都未配置时由 refreshToken 派生
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", alias = "machine_id")]
     pub machine_id: Option<String>,
 
     /// 用户邮箱（从 Anthropic API 获取）
@@ -328,6 +328,43 @@ mod tests {
         assert_eq!(creds.profile_arn, Some("arn:aws:test".to_string()));
         assert_eq!(creds.expires_at, Some("2024-01-01T00:00:00Z".to_string()));
         assert_eq!(creds.auth_method, Some("social".to_string()));
+    }
+
+    #[test]
+    fn test_from_json_accepts_snake_case_import_fields() {
+        let json = r#"{
+            "access_token": "test_access",
+            "refresh_token": "test_refresh",
+            "profile_arn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE",
+            "expires_at": "2026-06-10T15:53:19.000Z",
+            "auth_method": "idc",
+            "client_id": "fake-client-id",
+            "client_secret": "fake-client-secret",
+            "region": "us-east-1",
+            "auth_region": "us-west-2",
+            "api_region": "eu-west-1",
+            "machine_id": "fake-machine-id"
+        }"#;
+
+        let creds = KiroCredentials::from_json(json).unwrap();
+
+        assert_eq!(creds.access_token.as_deref(), Some("test_access"));
+        assert_eq!(creds.refresh_token.as_deref(), Some("test_refresh"));
+        assert_eq!(
+            creds.profile_arn.as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE")
+        );
+        assert_eq!(
+            creds.expires_at.as_deref(),
+            Some("2026-06-10T15:53:19.000Z")
+        );
+        assert_eq!(creds.auth_method.as_deref(), Some("idc"));
+        assert_eq!(creds.client_id.as_deref(), Some("fake-client-id"));
+        assert_eq!(creds.client_secret.as_deref(), Some("fake-client-secret"));
+        assert_eq!(creds.region.as_deref(), Some("us-east-1"));
+        assert_eq!(creds.auth_region.as_deref(), Some("us-west-2"));
+        assert_eq!(creds.api_region.as_deref(), Some("eu-west-1"));
+        assert_eq!(creds.machine_id.as_deref(), Some("fake-machine-id"));
     }
 
     #[test]

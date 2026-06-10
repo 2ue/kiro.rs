@@ -56,11 +56,13 @@ function SecretInput({
   )
 }
 
-function initialCredentialForm(): Required<Pick<AddCredentialRequest, 'email' | 'refreshToken' | 'kiroApiKey' | 'authRegion' | 'apiRegion' | 'clientId' | 'clientSecret' | 'machineId' | 'proxyUrl' | 'proxyUsername' | 'proxyPassword' | 'endpoint'>> & { authMethod: AuthMethod; priority: string; proxyResourceId: string } {
+function initialCredentialForm(): Required<Pick<AddCredentialRequest, 'email' | 'refreshToken' | 'kiroApiKey' | 'profileArn' | 'region' | 'authRegion' | 'apiRegion' | 'clientId' | 'clientSecret' | 'machineId' | 'proxyUrl' | 'proxyUsername' | 'proxyPassword' | 'endpoint'>> & { authMethod: AuthMethod; priority: string; proxyResourceId: string } {
   return {
     authMethod: 'social',
     refreshToken: '',
     kiroApiKey: '',
+    profileArn: '',
+    region: '',
     authRegion: '',
     apiRegion: '',
     clientId: '',
@@ -82,6 +84,8 @@ function formFromCredential(credential: AddCredentialRequest) {
     authMethod: credential.authMethod || (credential.kiroApiKey ? 'api_key' : credential.clientId && credential.clientSecret ? 'idc' : 'social'),
     refreshToken: credential.refreshToken || '',
     kiroApiKey: credential.kiroApiKey || '',
+    profileArn: credential.profileArn || '',
+    region: credential.region || '',
     authRegion: credential.authRegion || '',
     apiRegion: credential.apiRegion || '',
     clientId: credential.clientId || '',
@@ -151,6 +155,8 @@ export function AddCredentialModal({
         authMethod: form.authMethod,
         refreshToken: isApiKey ? undefined : form.refreshToken.trim(),
         kiroApiKey: isApiKey ? form.kiroApiKey.trim() : undefined,
+        profileArn: form.profileArn.trim() || undefined,
+        region: form.region.trim() || undefined,
         authRegion: form.authRegion.trim() || undefined,
         apiRegion: form.apiRegion.trim() || undefined,
         clientId: isApiKey ? undefined : form.clientId.trim() || undefined,
@@ -588,7 +594,9 @@ export function BatchImportModal({
           kiroApiKey: isApiKeyCred ? cred.kiroApiKey?.trim() : undefined,
           refreshToken: isApiKeyCred ? undefined : cred.refreshToken?.trim(),
           email: cred.email?.trim() || undefined,
+          profileArn: cred.profileArn?.trim() || undefined,
           priority: cred.priority || 0,
+          region: cred.region?.trim() || undefined,
           authRegion: cred.authRegion?.trim() || undefined,
           apiRegion: cred.apiRegion?.trim() || undefined,
           clientId: isApiKeyCred ? undefined : clientId,
@@ -808,7 +816,10 @@ export function KamImportModal({
           refreshToken: token,
           authMethod,
           email: account.email?.trim() || undefined,
+          profileArn: account.credentials.profileArn?.trim() || undefined,
+          region: account.credentials.region?.trim() || undefined,
           authRegion: account.credentials.region?.trim() || undefined,
+          apiRegion: account.credentials.apiRegion?.trim() || undefined,
           clientId,
           clientSecret,
           machineId: account.machineId?.trim() || undefined,

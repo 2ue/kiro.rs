@@ -65,6 +65,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [refreshToken, setRefreshToken] = useState('')
   const [kiroApiKey, setKiroApiKey] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
+  const [profileArn, setProfileArn] = useState('')
+  const [region, setRegion] = useState('')
   const [authRegion, setAuthRegion] = useState('')
   const [apiRegion, setApiRegion] = useState('')
   const [clientId, setClientId] = useState('')
@@ -88,6 +90,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setRefreshToken('')
     setKiroApiKey('')
     setAuthMethod('social')
+    setProfileArn('')
+    setRegion('')
     setAuthRegion('')
     setApiRegion('')
     setClientId('')
@@ -110,6 +114,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     authMethod?: 'social' | 'idc' | 'api_key'
     refreshToken?: string
     kiroApiKey?: string
+    profileArn?: string
+    region?: string
     authRegion?: string
     apiRegion?: string
     clientId?: string
@@ -126,6 +132,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setAuthMethod(credential.authMethod || (credential.kiroApiKey ? 'api_key' : credential.clientId && credential.clientSecret ? 'idc' : 'social'))
     setRefreshToken(credential.refreshToken || '')
     setKiroApiKey(credential.kiroApiKey || '')
+    setProfileArn(credential.profileArn || '')
+    setRegion(credential.region || '')
     setAuthRegion(credential.authRegion || '')
     setApiRegion(credential.apiRegion || '')
     setClientId(credential.clientId || '')
@@ -203,6 +211,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         authMethod,
         refreshToken: isApiKey ? undefined : refreshToken.trim(),
         kiroApiKey: isApiKey ? kiroApiKey.trim() : undefined,
+        profileArn: profileArn.trim() || undefined,
+        region: region.trim() || undefined,
         authRegion: authRegion.trim() || undefined,
         apiRegion: apiRegion.trim() || undefined,
         clientId: isApiKey ? undefined : clientId.trim() || undefined,

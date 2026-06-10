@@ -69,11 +69,12 @@ export function normalizeCredentialImportItem(value: unknown): AddCredentialRequ
   const kiroApiKey = stringField(normalized.kiroApiKey) ?? stringField(normalized.apiKey)
   const clientId = stringField(normalized.clientId) ?? stringField(nested?.clientId)
   const clientSecret = stringField(normalized.clientSecret) ?? stringField(nested?.clientSecret)
+  const profileArn = stringField(normalized.profileArn) ?? stringField(nested?.profileArn)
+  const region = stringField(normalized.region) ?? stringField(nested?.region)
   const authRegion =
     stringField(normalized.authRegion) ??
     stringField(nested?.authRegion) ??
-    stringField(normalized.region) ??
-    stringField(nested?.region)
+    region
   const apiRegion = stringField(normalized.apiRegion) ?? stringField(nested?.apiRegion)
   const rawAuthMethod = authMethodField(normalized.authMethod) ?? authMethodField(nested?.authMethod)
   const authMethod: AddCredentialRequest['authMethod'] = kiroApiKey
@@ -93,8 +94,10 @@ export function normalizeCredentialImportItem(value: unknown): AddCredentialRequ
     clientId: authMethod === 'api_key' ? undefined : clientId,
     clientSecret: authMethod === 'api_key' ? undefined : clientSecret,
     email: stringField(normalized.email) ?? stringField(normalized.nickname),
+    profileArn,
     priority: numberField(normalized.priority),
     maxConcurrentRequests: numberField(normalized.maxConcurrentRequests) ?? numberField(nested?.maxConcurrentRequests),
+    region,
     authRegion,
     apiRegion,
     machineId: stringField(normalized.machineId) ?? stringField(nested?.machineId),

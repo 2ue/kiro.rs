@@ -394,24 +394,31 @@ pub struct UsageCleanupStatusResponse {
 #[serde(rename_all = "camelCase")]
 pub struct AddCredentialRequest {
     /// 刷新令牌（OAuth 凭据必填，API Key 凭据不需要）
+    #[serde(alias = "refresh_token")]
     pub refresh_token: Option<String>,
 
     /// 认证方式（可选，默认 social）
-    #[serde(default = "default_auth_method")]
+    #[serde(default = "default_auth_method", alias = "auth_method")]
     pub auth_method: String,
 
     /// OIDC Client ID（IdC 认证需要）
+    #[serde(alias = "client_id")]
     pub client_id: Option<String>,
 
     /// OIDC Client Secret（IdC 认证需要）
+    #[serde(alias = "client_secret")]
     pub client_secret: Option<String>,
+
+    /// Profile ARN（IdC 凭据可选，用于 Amazon Q / CodeWhisperer profile）
+    #[serde(alias = "profile_arn")]
+    pub profile_arn: Option<String>,
 
     /// 优先级（可选，默认 0）
     #[serde(default)]
     pub priority: u32,
 
     /// 凭据级最大并发覆盖。None 表示继承全局，0 表示该账号不限并发。
-    #[serde(default)]
+    #[serde(default, alias = "max_concurrent_requests")]
     pub max_concurrent_requests: Option<u32>,
 
     /// 新增后是否禁用启动。默认 false。
@@ -427,33 +434,40 @@ pub struct AddCredentialRequest {
     pub region: Option<String>,
 
     /// 凭据级 Auth Region（用于 Token 刷新）
+    #[serde(alias = "auth_region")]
     pub auth_region: Option<String>,
 
     /// 凭据级 API Region（用于 API 请求）
+    #[serde(alias = "api_region")]
     pub api_region: Option<String>,
 
     /// 凭据级 Machine ID（可选，64 位字符串）
     /// 未配置时回退到 config.json 的 machineId
+    #[serde(alias = "machine_id")]
     pub machine_id: Option<String>,
 
     /// 用户邮箱（可选，用于前端显示）
     pub email: Option<String>,
 
     /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）
+    #[serde(alias = "proxy_url")]
     pub proxy_url: Option<String>,
 
     /// 凭据级代理认证用户名（可选）
+    #[serde(alias = "proxy_username")]
     pub proxy_username: Option<String>,
 
     /// 凭据级代理认证密码（可选）
+    #[serde(alias = "proxy_password")]
     pub proxy_password: Option<String>,
 
     /// 绑定的代理/家宽资源 ID（可选）
+    #[serde(alias = "proxy_resource_id")]
     pub proxy_resource_id: Option<u64>,
 
     /// Kiro API Key（API Key 凭据必填，格式: ksk_xxxxxxxx）
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", alias = "kiro_api_key")]
     pub kiro_api_key: Option<String>,
 
     /// 端点名称（可选，未配置时使用 config.defaultEndpoint）
@@ -1137,5 +1151,74 @@ impl AdminErrorResponse {
 
     pub fn internal_error(message: impl Into<String>) -> Self {
         Self::new("internal_error", message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_credential_request_accepts_snake_case_import_fields() {
+        let json = serde_json::json!({
+            "refresh_token": "fake-refresh-token",
+            "auth_method": "idc",
+            "client_id": "fake-client-id",
+            "client_secret": "fake-client-secret",
+            "profile_arn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE",
+            "region": "us-east-1",
+            "auth_region": "us-west-2",
+            "api_region": "eu-west-1",
+            "machine_id": "fake-machine-id",
+            "max_concurrent_requests": 3
+        });
+
+        let req: AddCredentialRequest = serde_json::from_value(json).unwrap();
+
+        assert_eq!(req.refresh_token.as_deref(), Some("fake-refresh-token"));
+        assert_eq!(req.auth_method, "idc");
+        assert_eq!(req.client_id.as_deref(), Some("fake-client-id"));
+        assert_eq!(req.client_secret.as_deref(), Some("fake-client-secret"));
+        assert_eq!(
+            req.profile_arn.as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE")
+        );
+        assert_eq!(req.region.as_deref(), Some("us-east-1"));
+        assert_eq!(req.auth_region.as_deref(), Some("us-west-2"));
+        assert_eq!(req.api_region.as_deref(), Some("eu-west-1"));
+        assert_eq!(req.machine_id.as_deref(), Some("fake-machine-id"));
+        assert_eq!(req.max_concurrent_requests, Some(3));
+    }
+
+    #[test]
+    fn add_credential_request_accepts_camel_case_import_fields() {
+        let json = serde_json::json!({
+            "refreshToken": "fake-refresh-token",
+            "authMethod": "idc",
+            "clientId": "fake-client-id",
+            "clientSecret": "fake-client-secret",
+            "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE",
+            "region": "us-east-1",
+            "authRegion": "us-west-2",
+            "apiRegion": "eu-west-1",
+            "machineId": "fake-machine-id",
+            "maxConcurrentRequests": 3
+        });
+
+        let req: AddCredentialRequest = serde_json::from_value(json).unwrap();
+
+        assert_eq!(req.refresh_token.as_deref(), Some("fake-refresh-token"));
+        assert_eq!(req.auth_method, "idc");
+        assert_eq!(req.client_id.as_deref(), Some("fake-client-id"));
+        assert_eq!(req.client_secret.as_deref(), Some("fake-client-secret"));
+        assert_eq!(
+            req.profile_arn.as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE")
+        );
+        assert_eq!(req.region.as_deref(), Some("us-east-1"));
+        assert_eq!(req.auth_region.as_deref(), Some("us-west-2"));
+        assert_eq!(req.api_region.as_deref(), Some("eu-west-1"));
+        assert_eq!(req.machine_id.as_deref(), Some("fake-machine-id"));
+        assert_eq!(req.max_concurrent_requests, Some(3));
     }
 }
