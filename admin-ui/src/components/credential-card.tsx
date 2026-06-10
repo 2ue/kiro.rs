@@ -116,6 +116,19 @@ function sourceLabel(source?: CredentialStatusItem['effectiveProxySource']) {
   return '未配置代理'
 }
 
+function proxySummary(credential: CredentialStatusItem): string {
+  const label = sourceLabel(credential.effectiveProxySource)
+  if (
+    credential.proxyResourceName &&
+    (credential.effectiveProxySource === 'resource' ||
+      credential.effectiveProxySource === 'resource_disabled' ||
+      credential.effectiveProxySource === 'resource_missing')
+  ) {
+    return `${label}：${credential.proxyResourceName}`
+  }
+  return label
+}
+
 function concurrencyLimitLabel(credential: CredentialStatusItem): string {
   const effective = credential.maxConcurrentRequests > 0 ? `${credential.maxConcurrentRequests}` : '不限'
   if (typeof credential.maxConcurrentRequestsOverride === 'number') {
@@ -166,11 +179,6 @@ function SecretInput({
   )
 }
 
-function maskSecret(value?: string | null): string {
-  if (!value) return '-'
-  return '*'.repeat(Math.min(Math.max(value.length, 6), 16))
-}
-
 export function CredentialCard({
   credential,
   onQueryBalance,
@@ -190,8 +198,6 @@ export function CredentialCard({
   const [proxyPassword, setProxyPassword] = useState(credential.proxyPassword || '')
   const [showProxyUsername, setShowProxyUsername] = useState(false)
   const [showProxyPassword, setShowProxyPassword] = useState(false)
-  const [showProxyAuthUsername, setShowProxyAuthUsername] = useState(false)
-  const [showProxyAuthPassword, setShowProxyAuthPassword] = useState(false)
   const [concurrencyValue, setConcurrencyValue] = useState(
     typeof credential.maxConcurrentRequestsOverride === 'number'
       ? String(credential.maxConcurrentRequestsOverride)
@@ -211,9 +217,6 @@ export function CredentialCard({
   const proxyResources = useProxyResources()
   const runtimeConfig = useRuntimeConfig()
   const proxyResourceOptions = proxyResources.data?.resources || []
-  const selectedProxyResource = credential.proxyResourceId
-    ? proxyResourceOptions.find((resource) => resource.id === credential.proxyResourceId)
-    : undefined
   const displayName = credential.email || credential.maskedApiKey || `凭据 #${credential.id}`
   const warmupTarget = Math.max(0, runtimeConfig.data?.credentialWarmupRequests ?? 3)
   const accountInfo = balance || credential.accountInfo
@@ -228,32 +231,33 @@ export function CredentialCard({
   const recentSelection5m = numberOrZero(credential.recentSchedulerSelectionCount5m)
   const schedulerSelectionPressure = numberOrZero(credential.schedulerSelectionPressure)
   const lastTransientErrorAgo = formatApproxElapsedMs(credential.lastErrorAtMs)
-  const displayProxyUsername =
-    credential.effectiveProxySource === 'resource' || credential.effectiveProxySource === 'resource_disabled'
-      ? selectedProxyResource?.proxyUsername
-      : credential.effectiveProxySource === 'global'
-        ? runtimeConfig.data?.proxyUsername
-        : credential.proxyUsername
-  const displayProxyPassword =
-    credential.effectiveProxySource === 'resource' || credential.effectiveProxySource === 'resource_disabled'
-      ? selectedProxyResource?.proxyPassword
-      : credential.effectiveProxySource === 'global'
-        ? runtimeConfig.data?.proxyPassword
-        : credential.proxyPassword
 
-  useEffect(() => {
-    setPriorityValue(String(credential.priority))
-  }, [credential.priority])
-
-  useEffect(() => {
+  const resetProxyDraft = () => {
     setProxyResourceId(credential.proxyResourceId ? String(credential.proxyResourceId) : '')
     setProxyUrl(credential.proxyUrl || '')
     setProxyUsername(credential.proxyUsername || '')
     setProxyPassword(credential.proxyPassword || '')
     setShowProxyUsername(false)
     setShowProxyPassword(false)
-    setShowProxyAuthUsername(false)
-    setShowProxyAuthPassword(false)
+  }
+
+  const openProxyEditor = () => {
+    resetProxyDraft()
+    setEditingProxy(true)
+  }
+
+  const closeProxyEditor = () => {
+    if (setCredentialProxy.isPending) return
+    resetProxyDraft()
+    setEditingProxy(false)
+  }
+
+  useEffect(() => {
+    setPriorityValue(String(credential.priority))
+  }, [credential.priority])
+
+  useEffect(() => {
+    resetProxyDraft()
   }, [credential.id, credential.proxyResourceId, credential.proxyUrl, credential.proxyUsername, credential.proxyPassword])
 
   useEffect(() => {
@@ -493,9 +497,6 @@ export function CredentialCard({
                 )}
                 {credential.hasProxy && (
                   <Badge variant="outline">代理</Badge>
-                )}
-                {credential.proxyResourceName && (
-                  <Badge variant="outline">{credential.proxyResourceName}</Badge>
                 )}
                 {typeof credential.maxConcurrentRequestsOverride === 'number' && (
                   <Badge variant="outline">并发覆盖</Badge>
@@ -742,64 +743,13 @@ export function CredentialCard({
               <button
                 type="button"
                 className="ml-1 inline-flex max-w-full items-center gap-1 truncate font-medium hover:underline"
-                onClick={() => setEditingProxy(true)}
+                onClick={openProxyEditor}
+                title="配置该凭据的代理"
               >
                 <Router className="h-3.5 w-3.5 shrink-0" />
-                <span className="truncate">
-                  {credential.effectiveProxyUrl
-                    ? `${credential.proxyResourceName || sourceLabel(credential.effectiveProxySource)} · ${credential.effectiveProxyUrl}`
-                    : sourceLabel(credential.effectiveProxySource)}
-                </span>
+                <span className="truncate">{proxySummary(credential)}</span>
               </button>
             </div>
-            {credential.effectiveProxyUrl && (
-              <div className="col-span-2 rounded-md border bg-muted/20 p-3">
-                <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                  <span className="text-sm font-medium">代理认证信息</span>
-                  <span className="text-xs text-muted-foreground">
-                    {credential.proxyResourceName || sourceLabel(credential.effectiveProxySource)}
-                  </span>
-                </div>
-                <div className="grid gap-2 md:grid-cols-2">
-                  <div className="min-w-0">
-                    <div className="mb-1 text-xs text-muted-foreground">账号</div>
-                    <div className="flex min-w-0 items-center gap-2">
-                      <span className="min-w-0 truncate font-mono text-xs font-medium" title={showProxyAuthUsername ? displayProxyUsername || undefined : undefined}>
-                        {showProxyAuthUsername ? displayProxyUsername || '-' : maskSecret(displayProxyUsername)}
-                      </span>
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="ghost"
-                        className="h-7 shrink-0 px-2"
-                        onClick={() => setShowProxyAuthUsername((value) => !value)}
-                        title={showProxyAuthUsername ? '隐藏代理账号' : '显示代理账号'}
-                      >
-                        {showProxyAuthUsername ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-                      </Button>
-                    </div>
-                  </div>
-                  <div className="min-w-0">
-                    <div className="mb-1 text-xs text-muted-foreground">密码</div>
-                    <div className="flex min-w-0 items-center gap-2">
-                      <span className="min-w-0 truncate font-mono text-xs font-medium" title={showProxyAuthPassword ? displayProxyPassword || undefined : undefined}>
-                        {showProxyAuthPassword ? displayProxyPassword || '-' : maskSecret(displayProxyPassword)}
-                      </span>
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="ghost"
-                        className="h-7 shrink-0 px-2"
-                        onClick={() => setShowProxyAuthPassword((value) => !value)}
-                        title={showProxyAuthPassword ? '隐藏代理密码' : '显示代理密码'}
-                      >
-                        {showProxyAuthPassword ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-                      </Button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            )}
             {credential.hasProfileArn && (
               <div className="col-span-2">
                 <Badge variant="secondary">有 Profile ARN</Badge>
@@ -914,7 +864,16 @@ export function CredentialCard({
         </CardContent>
       </Card>
 
-      <Dialog open={editingProxy} onOpenChange={setEditingProxy}>
+      <Dialog
+        open={editingProxy}
+        onOpenChange={(open) => {
+          if (open) {
+            openProxyEditor()
+          } else {
+            closeProxyEditor()
+          }
+        }}
+      >
         <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto">
           <DialogHeader>
             <DialogTitle>绑定代理：{displayName}</DialogTitle>
@@ -1020,7 +979,7 @@ export function CredentialCard({
           </div>
 
           <DialogFooter>
-            <Button variant="outline" onClick={() => setEditingProxy(false)} disabled={setCredentialProxy.isPending}>
+            <Button variant="outline" onClick={closeProxyEditor} disabled={setCredentialProxy.isPending}>
               取消
             </Button>
             <Button onClick={handleProxySave} disabled={setCredentialProxy.isPending}>

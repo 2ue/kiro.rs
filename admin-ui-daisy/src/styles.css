@@ -341,6 +341,23 @@ button, input, textarea, select {
   font-size: 0.8rem;
 }
 
+.credential-section-title {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: oklch(var(--bc) / 0.48);
+  letter-spacing: 0;
+}
+
+.credential-section-title::after {
+  content: '';
+  height: 1px;
+  flex: 1;
+  background: oklch(var(--b3) / 0.5);
+}
+
 @media (min-width: 640px) {
   .credential-meta-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));

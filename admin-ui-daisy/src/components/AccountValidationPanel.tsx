@@ -171,7 +171,7 @@ export function AccountValidationPanel() {
         }
       >
         <div className="space-y-2">
-          <Textarea bordered className="min-h-52 font-mono text-xs" value={raw} onChange={(event) => setRaw(event.target.value)} placeholder="粘贴 KAM JSON、credentials 数组或 JSONL" />
+          <Textarea bordered className="min-h-52 w-full font-mono text-xs" value={raw} onChange={(event) => setRaw(event.target.value)} placeholder="粘贴 KAM JSON、credentials 数组或 JSONL" />
           <div className="flex items-center justify-between text-xs text-base-content/60">
             <span>已解析 {parsedCount} 条可校验凭据</span>
             <span className="inline-flex items-center gap-1">
