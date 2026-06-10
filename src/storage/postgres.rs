@@ -18,11 +18,11 @@ use crate::anthropic::pricing::{
 use crate::anthropic::usage::{
     CredentialCostSummary, REALTIME_USAGE_WINDOW_SECS, UsageAggregate, UsageBreakdownItem,
     UsageDashboardResponse, UsageDashboardSeries, UsageDashboardSummary, UsageDashboardTop,
-    UsageDashboardWindow, UsageDashboardWindowSpec, UsageExternalPoolBillingSummary,
-    UsageRealtimeStats, UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult,
-    UsageRecordsResult, UsageRouteKind, UsageSeriesPoint, UsageSource, UsageSummary,
-    UsageTopAggregate, usage_dashboard_daily_windows, usage_dashboard_hourly_windows,
-    usage_dashboard_timezone, usage_dashboard_windows,
+    UsageDashboardWindow, UsageDashboardWindowSpec, UsageExternalPoolBillingByPool,
+    UsageExternalPoolBillingSummary, UsageRealtimeStats, UsageRecord, UsageRecordQuery,
+    UsageRecordStatus, UsageRecordsPageResult, UsageRecordsResult, UsageRouteKind,
+    UsageSeriesPoint, UsageSource, UsageSummary, UsageTopAggregate, usage_dashboard_daily_windows,
+    usage_dashboard_hourly_windows, usage_dashboard_timezone, usage_dashboard_windows,
 };
 use crate::external_pool::{
     CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
@@ -2346,11 +2346,17 @@ impl PostgresUsageStore {
                 DashboardBreakdownColumn::UsageSource,
             )
             .await?;
+        let mut external_pool_billing_by_pool = self
+            .dashboard_external_pool_billing_by_pool(&window_specs)
+            .await?;
 
         for window in &mut windows {
             window.summary.status_breakdown =
                 status_breakdown.remove(&window.key).unwrap_or_default();
             window.summary.usage_source_breakdown = usage_source_breakdown
+                .remove(&window.key)
+                .unwrap_or_default();
+            window.summary.external_pool_billing_by_pool = external_pool_billing_by_pool
                 .remove(&window.key)
                 .unwrap_or_default();
         }
@@ -2599,6 +2605,78 @@ impl PostgresUsageStore {
         rows.into_iter()
             .map(series_point_from_row)
             .collect::<anyhow::Result<Vec<_>>>()
+    }
+
+    async fn dashboard_external_pool_billing_by_pool(
+        &self,
+        specs: &[UsageDashboardWindowSpec],
+    ) -> anyhow::Result<HashMap<String, Vec<UsageExternalPoolBillingByPool>>> {
+        if specs.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut builder = QueryBuilder::<Postgres>::new("");
+        push_dashboard_windows_cte(&mut builder, specs);
+        builder.push(
+            r#"
+            SELECT
+                w.key AS window_key,
+                b.dimension_key AS pool_id,
+                NULLIF(MAX(b.dimension_label), '') AS pool_name,
+                COALESCE(SUM(b.external_pool_requests), 0)::bigint AS requests,
+                COALESCE(SUM(b.external_pool_priced_requests), 0)::bigint AS priced_requests,
+                COALESCE(SUM(b.external_pool_unpriced_requests), 0)::bigint AS unpriced_requests,
+                COALESCE(SUM(b.external_pool_cost_floor_applied_requests), 0)::bigint AS cost_floor_applied_requests,
+                COALESCE(SUM(b.external_pool_raw_cost_usd), 0)::double precision AS raw_cost_usd,
+                COALESCE(SUM(b.external_pool_shaped_cost_usd), 0)::double precision AS shaped_cost_usd,
+                COALESCE(SUM(b.external_pool_uplifted_cost_usd), 0)::double precision AS uplifted_cost_usd,
+                COALESCE(SUM(b.external_pool_profit_usd), 0)::double precision AS profit_usd,
+                COALESCE(SUM(b.external_pool_reported_cost_usd), 0)::double precision AS reported_cost_usd,
+                COALESCE(SUM(b.external_pool_billable_cost_usd), 0)::double precision AS billable_cost_usd,
+                COALESCE(SUM(b.external_pool_cost_floor_delta_usd), 0)::double precision AS cost_floor_delta_usd
+            FROM windows w
+            JOIN usage_rollup_time_buckets b
+              ON b.dimension = 'external_pool'
+             AND b.bucket_start >= w.from_at
+             AND b.bucket_start < w.to_at
+            GROUP BY w.key, w.ord, b.dimension_key
+            HAVING COALESCE(SUM(b.external_pool_requests), 0) > 0
+            ORDER BY w.ord, uplifted_cost_usd DESC, requests DESC, pool_id
+            "#,
+        );
+
+        let rows = builder.build().fetch_all(self.store.pool()).await?;
+        let mut grouped: HashMap<String, Vec<UsageExternalPoolBillingByPool>> = HashMap::new();
+        for row in rows {
+            let window_key: String = row.try_get("window_key")?;
+            let pool_key: String = row.try_get("pool_id")?;
+            let pool_name = row
+                .try_get::<Option<String>, _>("pool_name")?
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| format!("#{}", pool_key));
+            grouped
+                .entry(window_key)
+                .or_default()
+                .push(UsageExternalPoolBillingByPool {
+                    pool_id: pool_key.parse::<u64>().unwrap_or(0),
+                    pool_name,
+                    requests: row_i64_to_usize(&row, "requests")?,
+                    priced_requests: row_i64_to_usize(&row, "priced_requests")?,
+                    unpriced_requests: row_i64_to_usize(&row, "unpriced_requests")?,
+                    cost_floor_applied_requests: row_i64_to_usize(
+                        &row,
+                        "cost_floor_applied_requests",
+                    )?,
+                    raw_cost_usd: row.try_get("raw_cost_usd")?,
+                    shaped_cost_usd: row.try_get("shaped_cost_usd")?,
+                    uplifted_cost_usd: row.try_get("uplifted_cost_usd")?,
+                    profit_usd: row.try_get("profit_usd")?,
+                    reported_cost_usd: row.try_get("reported_cost_usd")?,
+                    billable_cost_usd: row.try_get("billable_cost_usd")?,
+                    cost_floor_delta_usd: row.try_get("cost_floor_delta_usd")?,
+                });
+        }
+        Ok(grouped)
     }
 
     async fn dashboard_top_aggregates(
@@ -3597,6 +3675,7 @@ fn dashboard_window_from_row(row: PgRow) -> anyhow::Result<UsageDashboardWindow>
                 billable_cost_usd: row.try_get("external_pool_billable_cost_usd")?,
                 cost_floor_delta_usd: row.try_get("external_pool_cost_floor_delta_usd")?,
             },
+            external_pool_billing_by_pool: Vec::new(),
             status_breakdown: Vec::new(),
             usage_source_breakdown: Vec::new(),
         },

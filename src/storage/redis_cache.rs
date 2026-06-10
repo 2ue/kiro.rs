@@ -10,10 +10,11 @@ use sha2::{Digest, Sha256};
 use crate::anthropic::usage::{
     REALTIME_USAGE_WINDOW_SECS, UsageAggregate, UsageBreakdownItem, UsageDashboardResponse,
     UsageDashboardSeries, UsageDashboardSummary, UsageDashboardTop, UsageDashboardWindow,
-    UsageDashboardWindowSpec, UsageExternalPoolBillingSummary, UsageRealtimeStats, UsageRecord,
-    UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult, UsageRouteKind, UsageSeriesPoint,
-    UsageSource, UsageSummary, UsageTopAggregate, usage_dashboard_daily_windows,
-    usage_dashboard_hourly_windows, usage_dashboard_timezone, usage_dashboard_windows,
+    UsageDashboardWindowSpec, UsageExternalPoolBillingByPool, UsageExternalPoolBillingSummary,
+    UsageRealtimeStats, UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult,
+    UsageRouteKind, UsageSeriesPoint, UsageSource, UsageSummary, UsageTopAggregate,
+    usage_dashboard_daily_windows, usage_dashboard_hourly_windows, usage_dashboard_timezone,
+    usage_dashboard_windows,
 };
 use crate::model::config::Config;
 
@@ -93,6 +94,12 @@ pub struct LocalPoolCircuitState {
     pub distinct_credentials: u32,
 }
 
+#[derive(Debug, Clone)]
+struct RedisExternalPoolIndexItem {
+    id: String,
+    label: String,
+}
+
 #[derive(Clone)]
 pub struct RedisStore {
     client: redis::Client,
@@ -111,6 +118,7 @@ const USAGE_DASHBOARD_TOP_MODELS_KEY: &str = "usage:dashboard:top:models";
 const USAGE_DASHBOARD_TOP_CREDENTIALS_KEY: &str = "usage:dashboard:top:credentials";
 const USAGE_DASHBOARD_TOP_ENDPOINTS_KEY: &str = "usage:dashboard:top:endpoints";
 const USAGE_DASHBOARD_TOP_ERRORS_KEY: &str = "usage:dashboard:top:errors";
+const USAGE_DASHBOARD_TOP_EXTERNAL_POOLS_KEY: &str = "usage:dashboard:top:external_pools";
 const USAGE_RECORDS_INDEX_KEY: &str = "usage:records:index";
 const USAGE_RECORDS_TTL_SECS: usize = 35 * 24 * 60 * 60;
 const USAGE_RECORDS_MAX_CACHED: usize = 100_000;
@@ -520,6 +528,15 @@ impl RedisStore {
             record,
             |key| self.key(usage_dashboard_top_metrics_key("endpoint", key)),
         );
+        append_usage_dashboard_top_aggregate(
+            &mut pipe,
+            &self.key(USAGE_DASHBOARD_TOP_EXTERNAL_POOLS_KEY),
+            "external_pool",
+            record.external_pool_id.map(|id| id.to_string()),
+            record.external_pool_name.clone(),
+            record,
+            |key| self.key(usage_dashboard_top_metrics_key("external_pool", key)),
+        );
         if record.status != UsageRecordStatus::Success {
             append_usage_dashboard_top_aggregate(
                 &mut pipe,
@@ -772,10 +789,11 @@ impl RedisStore {
         let now = Utc::now();
         let (timezone, offset) = usage_dashboard_timezone(timezone);
         let window_specs = usage_dashboard_windows(now, offset);
+        let external_pool_index = self.dashboard_external_pool_index().await?;
         let mut windows = Vec::with_capacity(window_specs.len());
         for spec in &window_specs {
             windows.push(
-                self.dashboard_window_from_redis(spec, high_cache_threshold)
+                self.dashboard_window_from_redis(spec, high_cache_threshold, &external_pool_index)
                     .await?,
             );
         }
@@ -798,14 +816,10 @@ impl RedisStore {
                 .await?,
         };
 
-        let has_dashboard_data = windows
+        let has_window_data = windows
             .iter()
-            .any(|window| window.summary.total_requests > 0)
-            || !top.models.is_empty()
-            || !top.credentials.is_empty()
-            || !top.endpoints.is_empty()
-            || !top.errors.is_empty();
-        if lifetime_requests > 0 && !has_dashboard_data {
+            .any(|window| window.summary.total_requests > 0);
+        if lifetime_requests > 0 && !has_window_data {
             return Ok(None);
         }
 
@@ -892,6 +906,7 @@ impl RedisStore {
         &self,
         spec: &UsageDashboardWindowSpec,
         high_cache_threshold: i32,
+        external_pool_index: &[RedisExternalPoolIndexItem],
     ) -> anyhow::Result<UsageDashboardWindow> {
         let totals = self.dashboard_bucket_sum("global", "all", spec).await?;
         let high_cache_requests = self
@@ -916,6 +931,9 @@ impl RedisStore {
                 usage_source_label,
                 total_requests,
             )
+            .await?;
+        summary.external_pool_billing_by_pool = self
+            .dashboard_external_pool_billing_by_pool(spec, external_pool_index)
             .await?;
 
         Ok(UsageDashboardWindow {
@@ -999,6 +1017,98 @@ impl RedisStore {
             });
         }
         items.sort_by_key(|item| std::cmp::Reverse(item.requests));
+        Ok(items)
+    }
+
+    async fn dashboard_external_pool_index(
+        &self,
+    ) -> anyhow::Result<Vec<RedisExternalPoolIndexItem>> {
+        let mut manager = self.manager.clone();
+        let pool_ids: Vec<String> = manager
+            .zrevrange(self.key(USAGE_DASHBOARD_TOP_EXTERNAL_POOLS_KEY), 0, -1)
+            .await?;
+        if pool_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut pipe = redis::pipe();
+        for pool_id in pool_ids {
+            pipe.cmd("HGETALL")
+                .arg(self.key(usage_dashboard_top_metrics_key("external_pool", &pool_id)));
+        }
+        let metrics_list: Vec<HashMap<String, String>> = pipe.query_async(&mut manager).await?;
+        Ok(metrics_list
+            .into_iter()
+            .map(|metrics| {
+                let id = metrics.get("key").cloned().unwrap_or_default();
+                let label = metrics
+                    .get("label")
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| format!("#{}", id));
+                RedisExternalPoolIndexItem { id, label }
+            })
+            .filter(|item| !item.id.trim().is_empty())
+            .collect())
+    }
+
+    async fn dashboard_external_pool_billing_by_pool(
+        &self,
+        spec: &UsageDashboardWindowSpec,
+        external_pool_index: &[RedisExternalPoolIndexItem],
+    ) -> anyhow::Result<Vec<UsageExternalPoolBillingByPool>> {
+        let epochs = usage_dashboard_hour_epochs(spec.from, spec.to);
+        if external_pool_index.is_empty() || epochs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut pipe = redis::pipe();
+        for pool in external_pool_index {
+            for epoch in &epochs {
+                pipe.cmd("HGETALL").arg(self.key(usage_dashboard_bucket_key(
+                    "external_pool",
+                    &pool.id,
+                    *epoch,
+                )));
+            }
+        }
+        let mut manager = self.manager.clone();
+        let buckets: Vec<HashMap<String, String>> = pipe.query_async(&mut manager).await?;
+        let mut items = Vec::with_capacity(external_pool_index.len());
+        for (pool_index, pool) in external_pool_index.iter().enumerate() {
+            let start = pool_index * epochs.len();
+            let end = start + epochs.len();
+            let totals = sum_usage_hashes(buckets[start..end].iter().cloned());
+            let requests = usage_usize(&totals, "external_pool_requests");
+            if requests == 0 {
+                continue;
+            }
+            items.push(UsageExternalPoolBillingByPool {
+                pool_id: pool.id.parse::<u64>().unwrap_or(0),
+                pool_name: pool.label.clone(),
+                requests,
+                priced_requests: usage_usize(&totals, "external_pool_priced_requests"),
+                unpriced_requests: usage_usize(&totals, "external_pool_unpriced_requests"),
+                cost_floor_applied_requests: usage_usize(
+                    &totals,
+                    "external_pool_cost_floor_applied_requests",
+                ),
+                raw_cost_usd: usage_f64(&totals, "external_pool_raw_cost_usd"),
+                shaped_cost_usd: usage_f64(&totals, "external_pool_shaped_cost_usd"),
+                uplifted_cost_usd: usage_f64(&totals, "external_pool_uplifted_cost_usd"),
+                profit_usd: usage_f64(&totals, "external_pool_profit_usd"),
+                reported_cost_usd: usage_f64(&totals, "external_pool_reported_cost_usd"),
+                billable_cost_usd: usage_f64(&totals, "external_pool_billable_cost_usd"),
+                cost_floor_delta_usd: usage_f64(&totals, "external_pool_cost_floor_delta_usd"),
+            });
+        }
+        items.sort_by(|left, right| {
+            right
+                .uplifted_cost_usd
+                .partial_cmp(&left.uplifted_cost_usd)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| right.requests.cmp(&left.requests))
+                .then_with(|| left.pool_id.cmp(&right.pool_id))
+        });
         Ok(items)
     }
 
@@ -2761,6 +2871,17 @@ fn append_usage_dashboard_rollups(
         )),
         record,
     );
+    if let Some(external_pool_id) = record.external_pool_id {
+        append_usage_dashboard_bucket_aggregate(
+            pipe,
+            &store.key(usage_dashboard_bucket_key(
+                "external_pool",
+                &external_pool_id.to_string(),
+                hour_epoch,
+            )),
+            record,
+        );
+    }
 
     let cache_read_key = store.key(usage_dashboard_cache_read_bucket_key(hour_epoch));
     pipe.cmd("HINCRBY")
@@ -3102,6 +3223,7 @@ fn dashboard_summary_from_values(
             billable_cost_usd: usage_f64(values, "external_pool_billable_cost_usd"),
             cost_floor_delta_usd: usage_f64(values, "external_pool_cost_floor_delta_usd"),
         },
+        external_pool_billing_by_pool: Vec::new(),
         status_breakdown: Vec::new(),
         usage_source_breakdown: Vec::new(),
     }
@@ -3466,6 +3588,9 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
+    use crate::anthropic::usage::{
+        ExternalPoolBilling, ExternalPoolUsageSnapshot, UsageRouteSubtype,
+    };
     use crate::model::config::Config;
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3587,6 +3712,37 @@ mod tests {
             0.10,
             20,
         );
+        let mut external = usage_record(
+            "redis-usage-external",
+            UsageRecordStatus::Success,
+            UsageSource::UpstreamMetadata,
+            0,
+            0.42,
+            30,
+        );
+        external.route_kind = Some(UsageRouteKind::ExternalPool);
+        external.route_subtype = Some(UsageRouteSubtype::ExternalFallbackAfterLocalAttempts);
+        external.credential_id = None;
+        external.credential_label = None;
+        external.external_pool_id = Some(42);
+        external.external_pool_name = Some("backup-a".to_string());
+        external.external_pool_billing = Some(ExternalPoolBilling {
+            raw_usage: ExternalPoolUsageSnapshot::default(),
+            shaped_usage: ExternalPoolUsageSnapshot::default(),
+            reported_usage: ExternalPoolUsageSnapshot::default(),
+            usage_projection_applied: true,
+            raw_cost_usd: 0.10,
+            shaped_cost_usd: 0.20,
+            uplifted_cost_usd: 0.42,
+            profit_usd: 0.32,
+            reported_cost_usd: 0.42,
+            billable_cost_usd: 0.42,
+            cost_floor_delta_usd: 0.0,
+            cost_floor_applied: false,
+            pricing_available: true,
+            pricing_model: Some("claude-sonnet-4-5".to_string()),
+            usage_projection_mode: "current_path_policy".to_string(),
+        });
         let error = usage_record(
             "redis-usage-error",
             UsageRecordStatus::Error,
@@ -3597,15 +3753,16 @@ mod tests {
         );
 
         store.record_usage_summary(&success).await.unwrap();
+        store.record_usage_summary(&external).await.unwrap();
         store.record_usage_summary(&error).await.unwrap();
         store.record_usage_summary(&error).await.unwrap();
 
         let summary = store.usage_summary(500).await.unwrap().unwrap();
-        assert_eq!(summary.total_requests, 2);
-        assert_eq!(summary.success_requests, 1);
+        assert_eq!(summary.total_requests, 3);
+        assert_eq!(summary.success_requests, 2);
         assert_eq!(summary.error_requests, 1);
         assert_eq!(summary.high_cache_requests, 1);
-        assert_eq!(summary.total_input_tokens, 200);
+        assert_eq!(summary.total_input_tokens, 300);
         assert_eq!(summary.top_credentials.len(), 2);
 
         let dashboard = store
@@ -3618,11 +3775,26 @@ mod tests {
             .iter()
             .find(|window| window.key == "last24h")
             .unwrap();
-        assert_eq!(last24h.summary.total_requests, 2);
-        assert_eq!(last24h.summary.success_requests, 1);
+        assert_eq!(last24h.summary.total_requests, 3);
+        assert_eq!(last24h.summary.success_requests, 2);
         assert_eq!(last24h.summary.error_requests, 1);
         assert_eq!(last24h.summary.high_cache_requests, 1);
         assert_eq!(last24h.summary.p95_duration_ms, 50);
+        assert_eq!(last24h.summary.external_pool_billing.requests, 1);
+        assert_eq!(last24h.summary.external_pool_billing.raw_cost_usd, 0.10);
+        assert_eq!(
+            last24h.summary.external_pool_billing.uplifted_cost_usd,
+            0.42
+        );
+        assert_eq!(last24h.summary.external_pool_billing.profit_usd, 0.32);
+        assert_eq!(last24h.summary.external_pool_billing_by_pool.len(), 1);
+        let pool_billing = &last24h.summary.external_pool_billing_by_pool[0];
+        assert_eq!(pool_billing.pool_id, 42);
+        assert_eq!(pool_billing.pool_name, "backup-a");
+        assert_eq!(pool_billing.requests, 1);
+        assert_eq!(pool_billing.raw_cost_usd, 0.10);
+        assert_eq!(pool_billing.uplifted_cost_usd, 0.42);
+        assert_eq!(pool_billing.profit_usd, 0.32);
         assert_eq!(last24h.summary.status_breakdown.len(), 2);
         assert!(
             last24h
@@ -3631,7 +3803,7 @@ mod tests {
                 .iter()
                 .any(|item| item.key == "local_prompt_cache")
         );
-        assert_eq!(dashboard.top.models[0].requests, 2);
+        assert_eq!(dashboard.top.models[0].requests, 3);
         assert_eq!(dashboard.top.errors[0].key, "rate_limit");
         assert!(
             dashboard
@@ -3646,7 +3818,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(records.records.len(), 2);
+        assert_eq!(records.records.len(), 3);
         assert!(!records.has_next);
 
         let filtered = store

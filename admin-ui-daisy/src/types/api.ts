@@ -527,6 +527,11 @@ export interface UsageExternalPoolBillingSummary {
   costFloorDeltaUsd: number
 }
 
+export interface UsageExternalPoolBillingByPool extends UsageExternalPoolBillingSummary {
+  poolId: number
+  poolName: string
+}
+
 export interface UsageDashboardResponse {
   generatedAt: string
   timezone: string
@@ -567,6 +572,7 @@ export interface UsageDashboardSummary {
   simulatedRequests: number
   upstreamMetadataRequests: number
   externalPoolBilling?: UsageExternalPoolBillingSummary
+  externalPoolBillingByPool?: UsageExternalPoolBillingByPool[]
   statusBreakdown: UsageBreakdownItem[]
   usageSourceBreakdown: UsageBreakdownItem[]
 }

@@ -23,6 +23,7 @@ import { extractErrorMessage } from '@/lib/utils'
 import type {
   UsageBreakdownItem,
   UsageDashboardWindow,
+  UsageExternalPoolBillingByPool,
   UsageExternalPoolBillingSummary,
   UsageSeriesPoint,
   UsageTopAggregate,
@@ -511,7 +512,13 @@ function OperationsPanel({
   )
 }
 
-function ExternalPoolBillingPanel({ billing }: { billing: UsageExternalPoolBillingSummary }) {
+function ExternalPoolBillingPanel({
+  billing,
+  billingByPool,
+}: {
+  billing: UsageExternalPoolBillingSummary
+  billingByPool: UsageExternalPoolBillingByPool[]
+}) {
   const shapedCost = billing.shapedCostUsd ?? billing.reportedCostUsd ?? 0
   const upliftedCost = billing.upliftedCostUsd ?? billing.reportedCostUsd ?? billing.billableCostUsd ?? 0
   const profit = billing.profitUsd ?? (upliftedCost - (billing.rawCostUsd || 0))
@@ -519,6 +526,7 @@ function ExternalPoolBillingPanel({ billing }: { billing: UsageExternalPoolBilli
   const deltaTone = billingDeltaTone(profit)
   const hasLoss = deltaTone === 'loss'
   const hasProfit = deltaTone === 'profit'
+  const visiblePools = billingByPool.filter((pool) => pool.requests > 0).slice(0, 20)
 
   return (
     <Panel
@@ -562,6 +570,57 @@ function ExternalPoolBillingPanel({ billing }: { billing: UsageExternalPoolBilli
           tone={hasLoss ? 'error' : 'success'}
         />
       </div>
+      <div className="mt-4 border-t pt-4">
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <div className="text-xs font-semibold text-muted-foreground">分号池成本与盈亏</div>
+          <div className="text-[0.68rem] text-muted-foreground">按当前时间窗口聚合</div>
+        </div>
+        {visiblePools.length === 0 ? (
+          <div className="rounded-md border border-dashed p-3 text-sm text-muted-foreground">
+            当前窗口没有备用池计费样本。
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[780px] text-xs">
+              <thead className="border-b text-muted-foreground">
+                <tr>
+                  <th className="py-2 text-left font-medium">号池</th>
+                  <th className="py-2 text-right font-medium">请求</th>
+                  <th className="py-2 text-right font-medium">原始成本</th>
+                  <th className="py-2 text-right font-medium">整形后</th>
+                  <th className="py-2 text-right font-medium">放大后</th>
+                  <th className="py-2 text-right font-medium">盈亏</th>
+                  <th className="py-2 text-right font-medium">未计价</th>
+                  <th className="py-2 text-right font-medium">兜底</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y">
+                {visiblePools.map((pool) => {
+                  const poolProfit = pool.profitUsd ?? ((pool.upliftedCostUsd ?? pool.reportedCostUsd ?? 0) - pool.rawCostUsd)
+                  const poolTone = billingDeltaTone(poolProfit)
+                  return (
+                    <tr key={pool.poolId}>
+                      <td className="py-2">
+                        <div className="max-w-[240px] truncate font-medium" title={pool.poolName}>{pool.poolName}</div>
+                        <div className="font-mono text-[0.65rem] text-muted-foreground">#{pool.poolId}</div>
+                      </td>
+                      <td className="py-2 text-right font-mono">{formatNumber(pool.requests)}</td>
+                      <td className="py-2 text-right font-mono">{formatUsd(pool.rawCostUsd)}</td>
+                      <td className="py-2 text-right font-mono">{formatUsd(pool.shapedCostUsd ?? pool.reportedCostUsd)}</td>
+                      <td className="py-2 text-right font-mono">{formatUsd(pool.upliftedCostUsd ?? pool.reportedCostUsd)}</td>
+                      <td className={`py-2 text-right font-mono ${billingDeltaTextClass(poolTone)}`}>
+                        {poolProfit >= 0 ? '+' : ''}{formatUsd(poolProfit)}
+                      </td>
+                      <td className="py-2 text-right font-mono">{formatNumber(pool.unpricedRequests)}</td>
+                      <td className="py-2 text-right font-mono">{formatNumber(pool.costFloorAppliedRequests)}</td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
     </Panel>
   )
 }
@@ -599,6 +658,7 @@ export function UsageDashboardPanel() {
   const top = data.top || EMPTY_TOP
   const series = data.series || { hourly24h: [], daily7d: [] }
   const externalPoolBilling = summary.externalPoolBilling || EMPTY_EXTERNAL_POOL_BILLING
+  const externalPoolBillingByPool = summary.externalPoolBillingByPool || []
   const pricedRatio = summary.totalRequests > 0 ? summary.pricedRequests / summary.totalRequests : 0
   const streamRatio = summary.totalRequests > 0 ? summary.streamRequests / summary.totalRequests : 0
   const totalTokens = summary.totalInputTokens + summary.totalOutputTokens
@@ -643,7 +703,7 @@ export function UsageDashboardPanel() {
         <ErrorFocusPanel totalErrors={summary.errorRequests} items={top.errors || []} />
       </div>
 
-      <ExternalPoolBillingPanel billing={externalPoolBilling} />
+      <ExternalPoolBillingPanel billing={externalPoolBilling} billingByPool={externalPoolBillingByPool} />
 
       <div className="grid gap-3 xl:grid-cols-2">
         <BreakdownPanel title="状态分布" subtitle="判断成功、上游超时、客户端错误等整体占比" items={summary.statusBreakdown || []} emptyText="暂无状态样本。" />

@@ -408,6 +408,24 @@ pub struct UsageExternalPoolBillingSummary {
     pub cost_floor_delta_usd: f64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageExternalPoolBillingByPool {
+    pub pool_id: u64,
+    pub pool_name: String,
+    pub requests: usize,
+    pub priced_requests: usize,
+    pub unpriced_requests: usize,
+    pub cost_floor_applied_requests: usize,
+    pub raw_cost_usd: f64,
+    pub shaped_cost_usd: f64,
+    pub uplifted_cost_usd: f64,
+    pub profit_usd: f64,
+    pub reported_cost_usd: f64,
+    pub billable_cost_usd: f64,
+    pub cost_floor_delta_usd: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageDashboardResponse {
@@ -454,6 +472,8 @@ pub struct UsageDashboardSummary {
     pub simulated_requests: usize,
     pub upstream_metadata_requests: usize,
     pub external_pool_billing: UsageExternalPoolBillingSummary,
+    #[serde(default)]
+    pub external_pool_billing_by_pool: Vec<UsageExternalPoolBillingByPool>,
     pub status_breakdown: Vec<UsageBreakdownItem>,
     pub usage_source_breakdown: Vec<UsageBreakdownItem>,
 }
