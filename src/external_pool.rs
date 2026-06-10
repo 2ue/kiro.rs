@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -19,7 +19,7 @@ use parking_lot::Mutex as SyncMutex;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Notify;
 use tokio::time::{Instant, timeout};
 
 use crate::{
@@ -42,7 +42,10 @@ use crate::{
         ExternalPoolCapacityMode, ExternalPoolsConfig, PromptCacheCreationControlConfig,
         ReportedUsageConfig,
     },
-    storage::{postgres::PostgresStore, redis_cache::RedisStore},
+    storage::{
+        postgres::PostgresStore,
+        redis_cache::{LocalPoolCircuitState, RedisStore},
+    },
     token,
 };
 
@@ -364,6 +367,16 @@ impl ExternalPoolFinalError {
             || lower.contains("timed out")
             || lower.contains("deadline")
     }
+
+    pub fn is_capacity_like(&self) -> bool {
+        matches!(
+            self.route_error_type.as_str(),
+            "external_pool_capacity_full"
+                | "external_pool_queue_full"
+                | "external_pool_wait_timeout"
+                | "external_pool_cooldown"
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -397,18 +410,11 @@ struct ExternalUsageProjectionContext {
     state: Arc<SyncMutex<ExternalUsageProjectionState>>,
 }
 
-#[derive(Debug, Clone)]
-struct PoolRuntimeState {
-    cooldown_until: Option<DateTime<Utc>>,
-    cooldown_reason: Option<String>,
-}
-
 #[derive(Clone)]
 pub struct ExternalPoolManager {
     postgres: Arc<PostgresStore>,
     redis: Arc<RedisStore>,
     client: reqwest::Client,
-    local_state: Arc<Mutex<HashMap<u64, PoolRuntimeState>>>,
     capacity_notify: Arc<Notify>,
 }
 
@@ -527,7 +533,7 @@ impl PoolAvailabilitySnapshot {
 
 enum ExternalCapacityDecision {
     Retry,
-    Respond(Response),
+    FinalError(ExternalPoolFinalError),
 }
 
 fn default_true() -> bool {
@@ -562,7 +568,6 @@ impl ExternalPoolManager {
             client: reqwest::Client::builder()
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
-            local_state: Arc::new(Mutex::new(HashMap::new())),
             capacity_notify: Arc::new(Notify::new()),
         }
     }
@@ -608,15 +613,60 @@ impl ExternalPoolManager {
             .has_eligible_pool()
     }
 
-    pub async fn has_waitable_pool(&self, config: &ExternalPoolsConfig) -> bool {
-        let snapshot = self
-            .pool_availability_snapshot(&HashSet::new(), config)
-            .await;
-        snapshot.has_eligible_pool()
-            && (snapshot.available_pools > 0 || snapshot.has_temporary_unavailable_pool())
+    pub async fn record_local_pool_failure(
+        &self,
+        config: &ExternalPoolsConfig,
+        credential_id: Option<u64>,
+        reason: &str,
+    ) -> Option<LocalPoolCircuitState> {
+        if !config.local_pool_circuit_enabled {
+            return None;
+        }
+        match self
+            .redis
+            .record_local_pool_circuit_failure(
+                credential_id,
+                reason,
+                Duration::from_secs(config.local_pool_circuit_window_secs.max(1)),
+                config.local_pool_circuit_open_after_failures.max(1),
+                config
+                    .local_pool_circuit_require_distinct_credentials
+                    .max(1),
+                Duration::from_secs(config.local_pool_circuit_open_secs.max(1)),
+            )
+            .await
+        {
+            Ok(state) => Some(state),
+            Err(err) => {
+                tracing::warn!("记录本地凭据池熔断失败状态到 Redis 失败: {}", err);
+                None
+            }
+        }
     }
 
-    pub fn direct_policy_reason(
+    pub async fn local_pool_circuit_state(
+        &self,
+        config: &ExternalPoolsConfig,
+    ) -> LocalPoolCircuitState {
+        if !config.local_pool_circuit_enabled {
+            return LocalPoolCircuitState::default();
+        }
+        match self
+            .redis
+            .local_pool_circuit_state(Duration::from_secs(
+                config.local_pool_circuit_window_secs.max(1),
+            ))
+            .await
+        {
+            Ok(state) => state,
+            Err(err) => {
+                tracing::warn!("读取本地凭据池 Redis 熔断状态失败: {}", err);
+                LocalPoolCircuitState::default()
+            }
+        }
+    }
+
+    pub async fn direct_policy_reason(
         &self,
         config: &ExternalPoolsConfig,
         endpoint: &str,
@@ -625,8 +675,10 @@ impl ExternalPoolManager {
         if !config.external_pools_enabled || !config.external_direct_policy_enabled {
             return None;
         }
-        if config.direct_external_on_local_maintenance {
-            return Some("local_maintenance".to_string());
+        if config.direct_external_on_local_maintenance
+            && self.local_pool_circuit_state(config).await.open
+        {
+            return Some("local_pool_circuit_open".to_string());
         }
         if config
             .direct_external_model_rules
@@ -723,8 +775,8 @@ impl ExternalPoolManager {
                         .await
                     {
                         ExternalCapacityDecision::Retry => continue,
-                        ExternalCapacityDecision::Respond(response) => {
-                            return ExternalPoolForwardOutcome::Response(response);
+                        ExternalCapacityDecision::FinalError(err) => {
+                            return ExternalPoolForwardOutcome::FinalError(err);
                         }
                     }
                 }
@@ -761,8 +813,8 @@ impl ExternalPoolManager {
                         .await
                     {
                         ExternalCapacityDecision::Retry => continue,
-                        ExternalCapacityDecision::Respond(response) => {
-                            return ExternalPoolForwardOutcome::Response(response);
+                        ExternalCapacityDecision::FinalError(err) => {
+                            return ExternalPoolForwardOutcome::FinalError(err);
                         }
                     }
                 }
@@ -913,16 +965,19 @@ impl ExternalPoolManager {
                 config.external_pool_request_timeout_secs,
             ));
         }
-        let response = request.send().await.map_err(|err| ExternalPoolError {
-            status: None,
-            message: format!("model endpoint request send failed: {}", err),
-            retryable: true,
-            auto_disable_reason: None,
-            cooldown: Some((
-                Duration::from_secs(config.external_pool_network_error_cooldown_secs.max(1)),
-                format!("network_error {}", err),
-            )),
-            response_body: None,
+        let response = request.send().await.map_err(|err| {
+            tracing::warn!(pool_id = pool.id, error = %err, "external pool request send failed");
+            ExternalPoolError {
+                status: None,
+                message: sanitized_external_network_error("request send failed", &err),
+                retryable: true,
+                auto_disable_reason: None,
+                cooldown: Some((
+                    Duration::from_secs(config.external_pool_network_error_cooldown_secs.max(1)),
+                    "network_error".to_string(),
+                )),
+                response_body: None,
+            }
         })?;
 
         let status = response.status();
@@ -1005,12 +1060,12 @@ impl ExternalPoolManager {
                                             }
                                         }
                                         Some(Err(err)) => {
+                                            tracing::warn!(error = %err, "external pool stream read failed");
                                             drop(lease);
                                             return Some((
-                                                Err(std::io::Error::other(format!(
-                                                    "external stream read error: {}",
-                                                    err
-                                                ))),
+                                                Err(std::io::Error::other(
+                                                    "external stream read error".to_string(),
+                                                )),
                                                 (
                                                     body_stream,
                                                     Vec::new(),
@@ -1098,16 +1153,19 @@ impl ExternalPoolManager {
                 stream_usage_projection,
             })
         } else {
-            let bytes = response.bytes().await.map_err(|err| ExternalPoolError {
-                status: None,
-                message: format!("model endpoint response read failed: {}", err),
-                retryable: true,
-                auto_disable_reason: None,
-                cooldown: Some((
-                    Duration::from_secs(config.external_pool_network_error_cooldown_secs.max(1)),
-                    format!("network_error {}", err),
-                )),
-                response_body: None,
+            let bytes = response.bytes().await.map_err(|err| {
+                tracing::warn!(pool_id = pool.id, error = %err, "external pool response read failed");
+                ExternalPoolError {
+                    status: None,
+                    message: sanitized_external_network_error("response read failed", &err),
+                    retryable: true,
+                    auto_disable_reason: None,
+                    cooldown: Some((
+                        Duration::from_secs(config.external_pool_network_error_cooldown_secs.max(1)),
+                        "network_error".to_string(),
+                    )),
+                    response_body: None,
+                }
             })?;
             if success_response_looks_like_html(&response_headers, &bytes) {
                 return Err(success_protocol_error(
@@ -1273,8 +1331,7 @@ impl ExternalPoolManager {
         if config.external_pool_capacity_mode != ExternalPoolCapacityMode::Wait {
             let (error_type, message) = external_capacity_error(reason);
             self.record_external_failure(route, None, attempts, error_type, message);
-            return ExternalCapacityDecision::Respond(external_pool_scheduler_error_response(
-                route,
+            return ExternalCapacityDecision::FinalError(external_capacity_final_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 error_type,
                 message,
@@ -1302,8 +1359,7 @@ impl ExternalPoolManager {
                     "external_pool_wait_timeout",
                     &message,
                 );
-                return ExternalCapacityDecision::Respond(external_pool_scheduler_error_response(
-                    route,
+                return ExternalCapacityDecision::FinalError(external_capacity_final_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "external_pool_wait_timeout",
                     message,
@@ -1326,14 +1382,11 @@ impl ExternalPoolManager {
                         "external_pool_queue_full",
                         message,
                     );
-                    return ExternalCapacityDecision::Respond(
-                        external_pool_scheduler_error_response(
-                            route,
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "external_pool_queue_full",
-                            message,
-                        ),
-                    );
+                    return ExternalCapacityDecision::FinalError(external_capacity_final_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "external_pool_queue_full",
+                        message,
+                    ));
                 }
                 Err(err) => {
                     let message = format!("Request dispatch queue unavailable: {}", err);
@@ -1344,14 +1397,11 @@ impl ExternalPoolManager {
                         "external_pool_queue_error",
                         &message,
                     );
-                    return ExternalCapacityDecision::Respond(
-                        external_pool_scheduler_error_response(
-                            route,
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "external_pool_queue_error",
-                            message,
-                        ),
-                    );
+                    return ExternalCapacityDecision::FinalError(external_capacity_final_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "external_pool_queue_error",
+                        message,
+                    ));
                 }
             }
         }
@@ -1373,8 +1423,7 @@ impl ExternalPoolManager {
                     "external_pool_wait_timeout",
                     &message,
                 );
-                return ExternalCapacityDecision::Respond(external_pool_scheduler_error_response(
-                    route,
+                return ExternalCapacityDecision::FinalError(external_capacity_final_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "external_pool_wait_timeout",
                     message,
@@ -1584,15 +1633,6 @@ impl ExternalPoolManager {
 
     async fn mark_pool_cooldown(&self, pool_id: u64, duration: Duration, reason: String) {
         let until = Utc::now() + chrono::Duration::from_std(duration).unwrap_or_default();
-        {
-            let mut state = self.local_state.lock().await;
-            let entry = state.entry(pool_id).or_insert(PoolRuntimeState {
-                cooldown_until: None,
-                cooldown_reason: None,
-            });
-            entry.cooldown_until = Some(until);
-            entry.cooldown_reason = Some(reason.clone());
-        }
         if let Err(err) = self
             .redis
             .set_json(
@@ -1622,46 +1662,30 @@ impl ExternalPoolManager {
             });
         let in_flight = capacity_state.pool_in_flight_requests;
         let global_in_flight = capacity_state.global_in_flight_requests;
-        if let Ok(Some(cooldown)) = self
+        match self
             .redis
             .get_json::<ExternalPoolCooldownState>(format!("external_pool:{}:cooldown", pool_id))
             .await
         {
-            let now = Utc::now();
-            if cooldown.until > now {
-                return (
-                    in_flight,
-                    global_in_flight,
-                    (cooldown.until - now).num_seconds().max(1) as u64,
-                    cooldown.reason,
-                );
+            Ok(Some(cooldown)) => {
+                let now = Utc::now();
+                if cooldown.until > now {
+                    return (
+                        in_flight,
+                        global_in_flight,
+                        (cooldown.until - now).num_seconds().max(1) as u64,
+                        cooldown.reason,
+                    );
+                }
+                let _ = self
+                    .redis
+                    .del(format!("external_pool:{}:cooldown", pool_id))
+                    .await;
             }
-            let _ = self
-                .redis
-                .del(format!("external_pool:{}:cooldown", pool_id))
-                .await;
+            Ok(None) => {}
+            Err(err) => tracing::warn!(pool_id, "读取外部池 Redis cooldown 失败: {}", err),
         }
-        let mut state = self.local_state.lock().await;
-        let entry = state.entry(pool_id).or_insert(PoolRuntimeState {
-            cooldown_until: None,
-            cooldown_reason: None,
-        });
-        let now = Utc::now();
-        let remaining = entry
-            .cooldown_until
-            .filter(|until| *until > now)
-            .map(|until| (until - now).num_seconds().max(1) as u64)
-            .unwrap_or(0);
-        if remaining == 0 {
-            entry.cooldown_until = None;
-            entry.cooldown_reason = None;
-        }
-        (
-            in_flight,
-            global_in_flight,
-            remaining,
-            entry.cooldown_reason.clone(),
-        )
+        (in_flight, global_in_flight, 0, None)
     }
 
     async fn auto_disable_pool_if_configured(
@@ -1785,13 +1809,14 @@ impl ExternalPoolManager {
                         Some((Ok(chunk), (data_stream, guard)))
                     }
                     Some(Err(err)) => {
+                        tracing::warn!(error = %err, "external stream response failed");
                         if let Some(mut guard) = guard.take() {
-                            guard.record_stream_error(&err.to_string());
+                            guard.record_stream_error("external stream response failed");
                         }
                         Some((
                             Err(std::io::Error::new(
                                 std::io::ErrorKind::Other,
-                                format!("external stream response failed: {}", err),
+                                "external stream response failed".to_string(),
                             )),
                             (data_stream, None),
                         ))
@@ -2226,6 +2251,23 @@ fn success_response_looks_like_html(headers: &HeaderMap, body: &[u8]) -> bool {
     prefix.starts_with("<!doctype html") || prefix.starts_with("<html")
 }
 
+fn sanitized_external_network_error(context: &str, err: &reqwest::Error) -> String {
+    let kind = if err.is_timeout() {
+        "timeout"
+    } else if err.is_connect() {
+        "connection error"
+    } else if err.is_body() {
+        "body error"
+    } else if err.is_decode() {
+        "decode error"
+    } else if err.is_request() {
+        "request error"
+    } else {
+        "network error"
+    };
+    format!("{context}: {kind}")
+}
+
 fn success_protocol_error(
     headers: &HeaderMap,
     body: Option<&Bytes>,
@@ -2310,13 +2352,21 @@ fn external_capacity_error(reason: PoolCapacityWaitReason) -> (&'static str, &'s
     }
 }
 
-fn external_pool_scheduler_error_response(
-    route: &ExternalRouteRequest,
+fn external_capacity_final_error(
     status: StatusCode,
     code: &str,
     message: impl Into<String>,
-) -> Response {
-    envelope::error_response_with_id(status, code, message.into(), &route.request_id)
+) -> ExternalPoolFinalError {
+    ExternalPoolFinalError {
+        status,
+        response_error_type: code.to_string(),
+        route_error_type: code.to_string(),
+        message: message.into(),
+        retryable: true,
+        attempts: Vec::new(),
+        pool_id: None,
+        pool_name: None,
+    }
 }
 
 fn classify_external_error(
@@ -3362,12 +3412,11 @@ mod tests {
         };
 
         let (error_type, message) = external_capacity_error(PoolCapacityWaitReason::Full);
-        let response = external_pool_scheduler_error_response(
-            &route,
-            StatusCode::SERVICE_UNAVAILABLE,
-            error_type,
-            message,
-        );
+        let err =
+            external_capacity_final_error(StatusCode::SERVICE_UNAVAILABLE, error_type, message);
+        assert!(err.is_capacity_like());
+        assert_eq!(err.route_error_type, "external_pool_capacity_full");
+        let response = err.into_response(&route.request_id);
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(

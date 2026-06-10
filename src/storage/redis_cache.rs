@@ -76,6 +76,15 @@ pub struct ExternalPoolCapacityState {
     pub global_in_flight_requests: u32,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalPoolCircuitState {
+    pub open: bool,
+    pub open_until_ms: Option<i64>,
+    pub reason: Option<String>,
+    pub recent_failures: u32,
+    pub distinct_credentials: u32,
+}
+
 #[derive(Clone)]
 pub struct RedisStore {
     client: redis::Client,
@@ -1189,6 +1198,190 @@ impl RedisStore {
         })
     }
 
+    pub async fn record_local_pool_circuit_failure(
+        &self,
+        credential_id: Option<u64>,
+        reason: &str,
+        window: StdDuration,
+        open_after_failures: u32,
+        require_distinct_credentials: u32,
+        open_for: StdDuration,
+    ) -> anyhow::Result<LocalPoolCircuitState> {
+        let now = now_ms();
+        let window_ms = window.as_millis().max(1) as i64;
+        let open_for_ms = open_for.as_millis().max(1) as i64;
+        let credential_member = credential_id
+            .map(|id| format!("credential:{}", id))
+            .unwrap_or_else(|| "unknown".to_string());
+        let script = r#"
+            local now = tonumber(ARGV[1])
+            local window_ms = tonumber(ARGV[2])
+            local credential = ARGV[3]
+            local reason = ARGV[4]
+            local open_after = tonumber(ARGV[5])
+            local required_distinct = tonumber(ARGV[6])
+            local open_for_ms = tonumber(ARGV[7])
+            local ttl_secs = tonumber(ARGV[8])
+
+            redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - window_ms)
+            local seq = redis.call('INCR', KEYS[2])
+            redis.call('PEXPIRE', KEYS[2], (ttl_secs * 1000))
+            redis.call('ZADD', KEYS[1], now, 'failure:' .. tostring(seq) .. ':' .. credential)
+            redis.call('ZADD', KEYS[1], now, credential)
+
+            local failure_members = redis.call('ZRANGEBYSCORE', KEYS[1], now - window_ms + 1, now)
+            local failures = 0
+            local distinct_credentials = {}
+            for _, member in ipairs(failure_members) do
+                if string.sub(member, 1, 8) == 'failure:' then
+                    failures = failures + 1
+                else
+                    distinct_credentials[member] = true
+                end
+            end
+            local distinct = 0
+            for _, _ in pairs(distinct_credentials) do
+                distinct = distinct + 1
+            end
+            local open_until = tonumber(redis.call('GET', KEYS[3]) or '0')
+            local reported_reason = ''
+            local opened = 0
+            if open_until > now then
+                opened = 1
+                reported_reason = redis.call('GET', KEYS[4]) or reason
+            elseif failures >= open_after and distinct >= required_distinct then
+                open_until = now + open_for_ms
+                redis.call('SET', KEYS[3], open_until, 'PX', open_for_ms)
+                redis.call('SET', KEYS[4], reason, 'PX', open_for_ms)
+                opened = 1
+                reported_reason = reason
+            else
+                open_until = 0
+            end
+
+            redis.call('EXPIRE', KEYS[1], ttl_secs)
+            return {opened, open_until, reported_reason, failures, distinct}
+        "#;
+        let ttl_secs = window.as_secs().saturating_add(open_for.as_secs()).max(1) as usize;
+        let mut manager = self.manager.clone();
+        let result: Vec<redis::Value> = redis::cmd("EVAL")
+            .arg(script)
+            .arg(4)
+            .arg(self.key(local_pool_circuit_failures_key()))
+            .arg(self.key(local_pool_circuit_sequence_key()))
+            .arg(self.key(local_pool_circuit_open_until_key()))
+            .arg(self.key(local_pool_circuit_reason_key()))
+            .arg(now)
+            .arg(window_ms)
+            .arg(credential_member)
+            .arg(reason)
+            .arg(open_after_failures.max(1))
+            .arg(require_distinct_credentials.max(1))
+            .arg(open_for_ms)
+            .arg(ttl_secs)
+            .query_async(&mut manager)
+            .await?;
+        Ok(LocalPoolCircuitState {
+            open: redis::from_redis_value::<i64>(result.first().unwrap_or(&redis::Value::Nil))
+                .unwrap_or(0)
+                == 1,
+            open_until_ms: redis::from_redis_value::<i64>(
+                result.get(1).unwrap_or(&redis::Value::Nil),
+            )
+            .ok()
+            .filter(|value| *value > now),
+            reason: redis::from_redis_value::<String>(result.get(2).unwrap_or(&redis::Value::Nil))
+                .ok()
+                .filter(|value| !value.is_empty()),
+            recent_failures: redis::from_redis_value::<i64>(
+                result.get(3).unwrap_or(&redis::Value::Nil),
+            )
+            .unwrap_or(0)
+            .max(0) as u32,
+            distinct_credentials: redis::from_redis_value::<i64>(
+                result.get(4).unwrap_or(&redis::Value::Nil),
+            )
+            .unwrap_or(0)
+            .max(0) as u32,
+        })
+    }
+
+    pub async fn local_pool_circuit_state(
+        &self,
+        window: StdDuration,
+    ) -> anyhow::Result<LocalPoolCircuitState> {
+        let now = now_ms();
+        let window_ms = window.as_millis().max(1) as i64;
+        let mut manager = self.manager.clone();
+        let script = r#"
+            local now = tonumber(ARGV[1])
+            redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - tonumber(ARGV[2]))
+
+            local members = redis.call('ZRANGE', KEYS[1], 0, -1)
+            local failures = 0
+            local distinct_credentials = {}
+            for _, member in ipairs(members) do
+                if string.sub(member, 1, 8) == 'failure:' then
+                    failures = failures + 1
+                else
+                    distinct_credentials[member] = true
+                end
+            end
+            local distinct = 0
+            for _, _ in pairs(distinct_credentials) do
+                distinct = distinct + 1
+            end
+
+            return {
+                redis.call('GET', KEYS[2]) or false,
+                redis.call('GET', KEYS[3]) or false,
+                failures,
+                distinct
+            }
+        "#;
+        let result: Vec<redis::Value> = redis::cmd("EVAL")
+            .arg(script)
+            .arg(3)
+            .arg(self.key(local_pool_circuit_failures_key()))
+            .arg(self.key(local_pool_circuit_open_until_key()))
+            .arg(self.key(local_pool_circuit_reason_key()))
+            .arg(now)
+            .arg(window_ms)
+            .query_async(&mut manager)
+            .await?;
+        let open_until =
+            redis::from_redis_value::<Option<i64>>(result.first().unwrap_or(&redis::Value::Nil))
+                .unwrap_or(None);
+        let reason =
+            redis::from_redis_value::<Option<String>>(result.get(1).unwrap_or(&redis::Value::Nil))
+                .unwrap_or(None);
+        let recent_failures =
+            redis::from_redis_value::<i64>(result.get(2).unwrap_or(&redis::Value::Nil))
+                .unwrap_or(0);
+        let distinct = redis::from_redis_value::<i64>(result.get(3).unwrap_or(&redis::Value::Nil))
+            .unwrap_or(0);
+        let open_until_ms = open_until.filter(|until| *until > now);
+        if open_until.is_some() && open_until_ms.is_none() {
+            let _: () = redis::pipe()
+                .cmd("DEL")
+                .arg(self.key(local_pool_circuit_open_until_key()))
+                .cmd("DEL")
+                .arg(self.key(local_pool_circuit_reason_key()))
+                .query_async(&mut manager)
+                .await
+                .unwrap_or(());
+        }
+        let open = open_until_ms.is_some();
+        let reason = if open { reason } else { None };
+        Ok(LocalPoolCircuitState {
+            open,
+            open_until_ms,
+            reason,
+            recent_failures: recent_failures.max(0) as u32,
+            distinct_credentials: distinct.max(0) as u32,
+        })
+    }
+
     pub async fn touch_in_flight_lease(
         &self,
         credential_id: u64,
@@ -1722,6 +1915,22 @@ fn external_pool_global_queue_key() -> &'static str {
     "external_pool:global:queued"
 }
 
+fn local_pool_circuit_failures_key() -> &'static str {
+    "local_pool:circuit:failures"
+}
+
+fn local_pool_circuit_sequence_key() -> &'static str {
+    "local_pool:circuit:sequence"
+}
+
+fn local_pool_circuit_open_until_key() -> &'static str {
+    "local_pool:circuit:open_until"
+}
+
+fn local_pool_circuit_reason_key() -> &'static str {
+    "local_pool:circuit:reason"
+}
+
 fn scheduler_refresh_lock_key(credential_id: u64) -> String {
     format!("scheduler:refresh_lock:{}", credential_id)
 }
@@ -2049,6 +2258,78 @@ mod tests {
         );
         store.clear_scheduler_health(3).await.unwrap();
         store.clear_scheduler_health(4).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn redis_local_pool_circuit_uses_sliding_window_and_distinct_credentials() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+
+        let store = RedisStore::connect(&config).await.unwrap();
+        let window = StdDuration::from_millis(80);
+        let open_for = StdDuration::from_secs(2);
+
+        let state = store.local_pool_circuit_state(window).await.unwrap();
+        assert!(!state.open);
+        assert_eq!(state.recent_failures, 0);
+        assert_eq!(state.distinct_credentials, 0);
+
+        let state = store
+            .record_local_pool_circuit_failure(
+                Some(1),
+                "local_transient_exhausted",
+                window,
+                3,
+                2,
+                open_for,
+            )
+            .await
+            .unwrap();
+        assert!(!state.open);
+        assert_eq!(state.recent_failures, 1);
+        assert_eq!(state.distinct_credentials, 1);
+        assert_eq!(state.reason, None);
+
+        let state = store
+            .record_local_pool_circuit_failure(
+                Some(1),
+                "local_transient_exhausted",
+                window,
+                3,
+                2,
+                open_for,
+            )
+            .await
+            .unwrap();
+        assert!(!state.open);
+        assert_eq!(state.recent_failures, 2);
+        assert_eq!(state.distinct_credentials, 1);
+
+        let state = store
+            .record_local_pool_circuit_failure(
+                Some(2),
+                "local_transient_exhausted",
+                window,
+                3,
+                2,
+                open_for,
+            )
+            .await
+            .unwrap();
+        assert!(state.open);
+        assert!(state.open_until_ms.is_some());
+        assert_eq!(state.recent_failures, 3);
+        assert_eq!(state.distinct_credentials, 2);
+        assert_eq!(state.reason.as_deref(), Some("local_transient_exhausted"));
+
+        tokio::time::sleep(StdDuration::from_millis(110)).await;
+        let state = store.local_pool_circuit_state(window).await.unwrap();
+        assert!(state.open);
+        assert_eq!(state.recent_failures, 0);
+        assert_eq!(state.distinct_credentials, 0);
+        assert_eq!(state.reason.as_deref(), Some("local_transient_exhausted"));
     }
 
     #[tokio::test]

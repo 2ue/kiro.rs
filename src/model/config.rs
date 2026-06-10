@@ -875,6 +875,8 @@ pub struct ExternalPoolsConfig {
     pub external_pool_local_rescue_on_rate_limit: bool,
     #[serde(default = "default_true")]
     pub external_pool_local_rescue_on_timeout: bool,
+    #[serde(default = "default_true")]
+    pub external_pool_local_rescue_on_capacity: bool,
     #[serde(default = "default_external_pool_local_rescue_max_wait_secs")]
     pub external_pool_local_rescue_max_wait_secs: u64,
     #[serde(default)]
@@ -887,8 +889,6 @@ pub struct ExternalPoolsConfig {
     pub local_pool_circuit_require_distinct_credentials: u32,
     #[serde(default = "default_local_pool_circuit_open_secs")]
     pub local_pool_circuit_open_secs: u64,
-    #[serde(default = "default_local_pool_circuit_half_open_max_probes")]
-    pub local_pool_circuit_half_open_max_probes: u32,
     #[serde(default)]
     pub external_pool_auto_disable_enabled: bool,
     #[serde(default = "default_true")]
@@ -950,6 +950,7 @@ impl Default for ExternalPoolsConfig {
             external_pool_local_rescue_enabled: true,
             external_pool_local_rescue_on_rate_limit: true,
             external_pool_local_rescue_on_timeout: true,
+            external_pool_local_rescue_on_capacity: true,
             external_pool_local_rescue_max_wait_secs:
                 default_external_pool_local_rescue_max_wait_secs(),
             local_pool_circuit_enabled: false,
@@ -959,8 +960,6 @@ impl Default for ExternalPoolsConfig {
             local_pool_circuit_require_distinct_credentials:
                 default_local_pool_circuit_require_distinct_credentials(),
             local_pool_circuit_open_secs: default_local_pool_circuit_open_secs(),
-            local_pool_circuit_half_open_max_probes:
-                default_local_pool_circuit_half_open_max_probes(),
             external_pool_auto_disable_enabled: false,
             external_pool_auto_disable_on_auth_error: true,
             external_pool_auto_disable_on_security_lock: true,
@@ -1685,10 +1684,6 @@ fn default_local_pool_circuit_open_secs() -> u64 {
     30
 }
 
-fn default_local_pool_circuit_half_open_max_probes() -> u32 {
-    1
-}
-
 fn default_external_pool_auto_disable_failure_threshold() -> u32 {
     1
 }
@@ -2089,6 +2084,7 @@ mod tests {
                 .external_pool_local_rescue_on_rate_limit
         );
         assert!(config.external_pools.external_pool_local_rescue_on_timeout);
+        assert!(config.external_pools.external_pool_local_rescue_on_capacity);
         assert_eq!(
             config
                 .external_pools

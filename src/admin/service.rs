@@ -2918,11 +2918,6 @@ fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), St
     {
         return Err("localPoolCircuitOpenSecs 必须在 1 到 86400 之间".to_string());
     }
-    if config.local_pool_circuit_half_open_max_probes == 0
-        || config.local_pool_circuit_half_open_max_probes > 10_000
-    {
-        return Err("localPoolCircuitHalfOpenMaxProbes 必须在 1 到 10000 之间".to_string());
-    }
     if config.external_pool_auto_disable_failure_threshold == 0
         || config.external_pool_auto_disable_failure_threshold > 10_000
     {

@@ -12,6 +12,7 @@ use crate::anthropic::types::{
 };
 use crate::http_client::{ProxyConfig, build_client};
 use crate::model::config::TlsBackend;
+use serde_json::Value;
 use std::sync::OnceLock;
 
 /// Count Tokens API 配置
@@ -198,17 +199,10 @@ fn count_all_tokens_local(
         }
     }
 
-    // 用户消息
+    // 消息内容。Anthropic content blocks may carry large text outside the
+    // top-level `text` field, especially tool_result.content and tool_use.input.
     for msg in &messages {
-        if let serde_json::Value::String(s) = &msg.content {
-            total += count_tokens(s);
-        } else if let serde_json::Value::Array(arr) = &msg.content {
-            for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    total += count_tokens(text);
-                }
-            }
-        }
+        total += count_message_content_tokens(&msg.content);
     }
 
     // 工具定义
@@ -222,6 +216,141 @@ fn count_all_tokens_local(
     }
 
     total.max(1)
+}
+
+fn count_message_content_tokens(content: &Value) -> u64 {
+    match content {
+        Value::String(text) => count_tokens(text),
+        Value::Array(items) => items.iter().map(count_content_block_tokens).sum(),
+        other => count_json_value_tokens(other),
+    }
+}
+
+fn count_content_block_tokens(block: &Value) -> u64 {
+    let block_type = block.get("type").and_then(Value::as_str);
+    match block_type {
+        Some("text") => block
+            .get("text")
+            .and_then(Value::as_str)
+            .map(count_tokens)
+            .unwrap_or_default(),
+        Some("tool_result") => {
+            let mut total = block
+                .get("content")
+                .map(count_tool_result_content_tokens)
+                .unwrap_or_default();
+            if let Some(tool_use_id) = block.get("tool_use_id").and_then(Value::as_str) {
+                total += count_tokens(tool_use_id);
+            }
+            if block.get("is_error").and_then(Value::as_bool) == Some(true) {
+                total += count_tokens("error");
+            }
+            total
+        }
+        Some("tool_use") => {
+            let mut total = 0;
+            if let Some(name) = block.get("name").and_then(Value::as_str) {
+                total += count_tokens(name);
+            }
+            if let Some(id) = block.get("id").and_then(Value::as_str) {
+                total += count_tokens(id);
+            }
+            if let Some(input) = block.get("input") {
+                total += count_json_value_tokens(input);
+            }
+            total
+        }
+        Some("document") => count_document_block_tokens(block),
+        Some("image") => count_image_block_tokens(block),
+        Some("thinking") | Some("redacted_thinking") => block
+            .get("thinking")
+            .and_then(Value::as_str)
+            .map(count_tokens)
+            .unwrap_or_default(),
+        _ => count_json_value_tokens(block),
+    }
+}
+
+fn count_tool_result_content_tokens(content: &Value) -> u64 {
+    match content {
+        Value::String(text) => count_tokens(text),
+        Value::Array(items) => items.iter().map(count_content_block_tokens).sum(),
+        other => count_json_value_tokens(other),
+    }
+}
+
+fn count_document_block_tokens(block: &Value) -> u64 {
+    let Some(source) = block.get("source") else {
+        return count_json_value_tokens(block);
+    };
+    let source_type = source.get("type").and_then(Value::as_str);
+    match source_type {
+        Some("text") => {
+            let mut total = source
+                .get("data")
+                .and_then(Value::as_str)
+                .map(count_tokens)
+                .unwrap_or_default();
+            if let Some(media_type) = source.get("media_type").and_then(Value::as_str) {
+                total += count_tokens(media_type);
+            }
+            total
+        }
+        Some("base64") => {
+            // Base64 documents are sent inline, so count the payload instead of
+            // dropping it. This is an estimate, not a tokenizer.
+            let mut total = source
+                .get("data")
+                .and_then(Value::as_str)
+                .map(count_tokens)
+                .unwrap_or_default();
+            if let Some(media_type) = source.get("media_type").and_then(Value::as_str) {
+                total += count_tokens(media_type);
+            }
+            total
+        }
+        Some("url") => source
+            .get("url")
+            .and_then(Value::as_str)
+            .map(count_tokens)
+            .unwrap_or_default(),
+        _ => count_json_value_tokens(source),
+    }
+}
+
+fn count_image_block_tokens(block: &Value) -> u64 {
+    let Some(source) = block.get("source") else {
+        return count_json_value_tokens(block);
+    };
+    let source_type = source.get("type").and_then(Value::as_str);
+    match source_type {
+        Some("base64") => source
+            .get("data")
+            .and_then(Value::as_str)
+            .map(|data| {
+                // Roughly align image base64 with request-size pressure. This is
+                // not image token pricing, but it avoids treating inline images as free.
+                count_tokens(data)
+            })
+            .unwrap_or_default(),
+        Some("url") => source
+            .get("url")
+            .and_then(Value::as_str)
+            .map(count_tokens)
+            .unwrap_or_default(),
+        _ => count_json_value_tokens(source),
+    }
+}
+
+fn count_json_value_tokens(value: &Value) -> u64 {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => count_tokens(&value.to_string()),
+        Value::String(text) => count_tokens(text),
+        Value::Array(items) => items.iter().map(count_json_value_tokens).sum(),
+        Value::Object(_) => serde_json::to_string(value)
+            .map(|text| count_tokens(&text))
+            .unwrap_or_default(),
+    }
 }
 
 /// 估算输出 tokens
@@ -242,4 +371,89 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
     }
 
     total.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::anthropic::types::Message;
+    use serde_json::json;
+
+    fn estimate(messages: Vec<Message>) -> u64 {
+        count_all_tokens_local(None, messages, None)
+    }
+
+    #[test]
+    fn local_count_includes_tool_result_content() {
+        let long_result = "TOOL-RESULT ".repeat(1_000);
+        let tokens = estimate(vec![
+            Message {
+                role: "assistant".to_string(),
+                content: json!([{
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "read_file",
+                    "input": {"path": "/tmp/huge.txt"}
+                }]),
+            },
+            Message {
+                role: "user".to_string(),
+                content: json!([{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": long_result
+                }]),
+            },
+        ]);
+
+        assert!(tokens > 2_000, "tool_result content should be counted");
+    }
+
+    #[test]
+    fn local_count_includes_nested_tool_result_text_blocks() {
+        let tokens = estimate(vec![Message {
+            role: "user".to_string(),
+            content: json!([{
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": [
+                    {"type": "text", "text": "nested tool result ".repeat(200)},
+                    {"type": "text", "text": "second block ".repeat(200)}
+                ]
+            }]),
+        }]);
+
+        assert!(
+            tokens > 1_000,
+            "nested tool_result blocks should be counted"
+        );
+    }
+
+    #[test]
+    fn local_count_includes_tool_use_input_and_document_text() {
+        let tokens = estimate(vec![Message {
+            role: "user".to_string(),
+            content: json!([
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "write_file",
+                    "input": {"content": "generated content ".repeat(300)}
+                },
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "text",
+                        "media_type": "text/plain",
+                        "data": "document body ".repeat(300)
+                    }
+                }
+            ]),
+        }]);
+
+        assert!(
+            tokens > 2_000,
+            "tool input and document text should be counted"
+        );
+    }
 }

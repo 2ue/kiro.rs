@@ -1,10 +1,10 @@
 # 外部备用号池接入与故障转移设计文档
 
-更新时间：2026-06-07
+更新时间：2026-06-10
 
 状态：已完成第一版实现，本文档同时记录原始需求、设计方案和当前落地状态。
 
-## 0. 当前落地状态（2026-06-07）
+## 0. 当前落地状态（2026-06-10）
 
 第一版已在当前项目中落地，核心实现文件如下：
 
@@ -21,7 +21,7 @@
 当前第一版明确生效的能力：
 
 1. `externalPoolsEnabled=false` 时完全关闭外部池，不改变本地凭据调度行为。
-2. 显式直连策略支持模型规则、路径规则、本地维护开关，命中后记录为 `external_direct_policy`。
+2. 显式直连策略支持模型规则、路径规则、本地 Redis 熔断开关，命中后记录为 `external_direct_policy`。
 3. 本地优先；只有本地容量 fail-fast、无可用凭据、瞬态错误耗尽、可选的不支持模型等场景才会 fallback。
 4. 本地容量预检不是长期缓存状态，而是在外部池可用时对本地调度执行 fail-fast acquire；本地可调度时仍走本地凭据。
 5. 不引入 `localPoolFallbackGraceMs`，不会等待一段时间后再 fallback。
@@ -32,18 +32,19 @@
 10. 外部池并发使用 Redis lease，单池并发和外部池全局并发都能跨实例生效；流式请求会持有 lease 直到 stream 结束或客户端断开。
 11. 外部池错误不会在同一个池重复重试；可重试错误会立即排除当前池并尝试下一个外部池，受 `externalPoolRetryMaxAttempts` 限制。
 12. 本地 400、请求体过长、context full、improper request、tool schema invalid、JSON invalid、tool_use/tool_result 问题不会 fallback 到外部池。
-13. 外部池自动禁用和人工 `enabled` 分离；自动禁用状态持久化在 Postgres，cooldown/in-flight 存 Redis。
+13. 外部池自动禁用和人工 `enabled` 分离；自动禁用状态持久化在 Postgres，cooldown/in-flight/本地池熔断状态存 Redis。
 14. Usage record 会记录本地/外部路由类型、路由子类型、fallback/direct 原因、本地尝试链路、外部池尝试链路、最终外部池、是否应用 usage 投影。
 15. 旧版和新版管理后台都有独立 `备用池` 入口，支持策略配置、外部池新增/编辑/启停/删除/测试/清除自动禁用。
 
-当前第一版保留但尚未生效的配置：
+当前已落地的调度补充：
 
-1. `externalPoolMaxQueuedRequests`：保留字段。当前实现不做外部池排队等待，因为用户明确不需要 fallback grace 或等待队列；外部池无槽位时直接视为不可调度。
-2. `localPoolCircuitEnabled`、`localPoolCircuitWindowSecs`、`localPoolCircuitOpenAfterFailures`、`localPoolCircuitRequireDistinctCredentials`、`localPoolCircuitOpenSecs`、`localPoolCircuitHalfOpenMaxProbes`：保留字段。当前实现未启用本地池 circuit breaker，默认 `localPoolCircuitEnabled=false`。本地状态预检依赖实际 fail-fast acquire 和 Redis/本地调度状态，不依赖 circuit。
+1. `externalPoolCapacityMode=wait` 时，外部池满并发会进入独立等待队列，受 `externalPoolMaxQueuedRequests` 和 `externalPoolDispatchMaxWaitSecs` 控制。
+2. fallback 到外部池后，如果外部池最终失败属于 429、超时、容量满、队列满、等待超时或 cooldown，并且开启对应回本地开关，会再尝试本地凭据一次，避免备用池短暂不可用时直接把错误返回给下游。
+3. 本地池熔断使用 Redis 记录本地可重试失败，按 `localPoolCircuitWindowSecs` 滑动窗口、`localPoolCircuitOpenAfterFailures` 失败次数、`localPoolCircuitRequireDistinctCredentials` 涉及凭据数打开熔断，持续 `localPoolCircuitOpenSecs`。只有 `externalDirectPolicyEnabled=true`、`directExternalOnLocalMaintenance=true` 且 Redis 熔断打开时，才会触发“本地熔断时直连外部池”。
 
 当前第一版已知观测限制：
 
-1. 外部池流式响应在拿到上游响应头后即返回下游，并记录外部池尝试成功；并发 lease 会随 stream 结束或连接关闭释放。若上游在响应头之后发生流式读取错误，该错误会传播给下游连接，但当前不会二次回写 usage record 为失败。该限制只影响 usage 观测精度，不影响外部池并发释放、换池决策或本地凭据调度。
+1. 外部池流式响应在拿到上游响应头后即返回下游，并记录外部池尝试成功；并发 lease 会随 stream 结束或连接关闭释放。若上游在响应头之后发生流式读取错误，该错误会传播给下游连接，不能再安全切换到其他外部池或本地凭据，否则会产生重复/断裂的流式响应。该限制只影响响应头之后的故障恢复，不影响外部池并发释放、换池决策或本地凭据调度。
 
 数据保护与备份硬约束：
 
@@ -1076,6 +1077,8 @@ fn should_fallback(kind: LocalPoolFailureKind, config: &ExternalPoolConfig) -> b
   "externalPoolsEnabled": true,
   "externalPoolGlobalMaxConcurrentRequests": 0,
   "externalPoolMaxQueuedRequests": 0,
+  "externalPoolCapacityMode": "fail_fast",
+  "externalPoolDispatchMaxWaitSecs": 30,
   "externalPoolRetryMaxAttempts": 0,
   "externalDirectPolicyEnabled": false,
   "directExternalOnLocalMaintenance": false,
@@ -1086,12 +1089,16 @@ fn should_fallback(kind: LocalPoolFailureKind, config: &ExternalPoolConfig) -> b
   "fallbackOnLocalTransientExhausted": true,
   "fallbackOnUnsupportedModel": false,
   "localPoolPreflightEnabled": true,
+  "externalPoolLocalRescueEnabled": true,
+  "externalPoolLocalRescueOnRateLimit": true,
+  "externalPoolLocalRescueOnTimeout": true,
+  "externalPoolLocalRescueOnCapacity": true,
+  "externalPoolLocalRescueMaxWaitSecs": 15,
   "localPoolCircuitEnabled": false,
   "localPoolCircuitWindowSecs": 60,
   "localPoolCircuitOpenAfterFailures": 3,
   "localPoolCircuitRequireDistinctCredentials": 2,
   "localPoolCircuitOpenSecs": 30,
-  "localPoolCircuitHalfOpenMaxProbes": 1,
   "externalPoolAutoDisableEnabled": false,
   "externalPoolAutoDisableOnAuthError": true,
   "externalPoolAutoDisableOnSecurityLock": true,
@@ -1110,16 +1117,18 @@ fn should_fallback(kind: LocalPoolFailureKind, config: &ExternalPoolConfig) -> b
 - `externalPoolGlobalMaxConcurrentRequests`
   - 外部池整体并发，`0` 表示不限。
 - `externalPoolMaxQueuedRequests`
-  - 第一版保留字段，当前不生效。
-  - 当前实现不做外部池等待队列；外部池无并发槽位时直接视为不可调度并尝试其他外部池或返回外部池不可用。
-  - 保留该字段是为了以后如果明确需要外部池排队，可以不破坏配置结构。
+  - 外部池等待队列上限。仅 `externalPoolCapacityMode=wait` 时生效，`0` 表示不限制队列长度。
+- `externalPoolCapacityMode`
+  - 外部池满并发处理模式：`fail_fast` 立即失败或 `wait` 等待容量。
+- `externalPoolDispatchMaxWaitSecs`
+  - 外部池等待容量的最长时间，`0` 表示不设置超时。
 - `externalPoolRetryMaxAttempts`
   - `0` 表示自动覆盖一轮所有 enabled 外部池。
 - `externalDirectPolicyEnabled`
   - 显式直连外部池策略总开关，默认 `false`。
   - 关闭时，模型/路径/维护模式等直连规则全部不生效。
 - `directExternalOnLocalMaintenance`
-  - 本地池维护模式。开启后允许请求直接走外部池，记录为 `external_direct_policy`。
+  - 本地熔断时直连。开启后，只有 Redis 本地池熔断打开时才允许请求直接走外部池，记录为 `external_direct_policy`。
 - `directExternalModelRules`
   - 指定模型直接走外部池的规则列表。
 - `directExternalPathRules`
@@ -1135,9 +1144,19 @@ fn should_fallback(kind: LocalPoolFailureKind, config: &ExternalPoolConfig) -> b
 - `localPoolPreflightEnabled`
   - 是否启用本地状态预检，默认 `true`。
   - 关闭后只在真实本地调用失败后 fallback，不做 `external_fallback_preflight`。
+- `externalPoolLocalRescueEnabled`
+  - 备用池失败后是否允许回本地探测一次，默认 `true`。
+- `externalPoolLocalRescueOnRateLimit`
+  - 备用池最终 429 时是否回本地。
+- `externalPoolLocalRescueOnTimeout`
+  - 备用池最终超时/网络超时/stream idle timeout 时是否回本地。
+- `externalPoolLocalRescueOnCapacity`
+  - 备用池满并发、队列满、等待超时、cooldown 时是否回本地。
+- `externalPoolLocalRescueMaxWaitSecs`
+  - 回本地时最多等待本地凭据槽位的时间。`0` 表示只做一次立即探测，不等待。
 - `localPoolCircuitEnabled`
-  - 第一版保留字段，默认 `false`，当前不生效。
-  - 当前本地状态预检依赖实际 fail-fast acquire 和调度器/Redis 运行态，不依赖 circuit breaker。
+  - 本地池熔断总开关，默认 `false`。开启后只记录本地可重试失败，不记录客户端请求错误。
+  - 熔断打开后，若同时开启 `externalDirectPolicyEnabled` 和 `directExternalOnLocalMaintenance`，请求可直接进入外部池。
 - `localPoolCircuitWindowSecs`
   - 本地池失败统计窗口，建议默认 `60s`。
 - `localPoolCircuitOpenAfterFailures`
@@ -1146,8 +1165,6 @@ fn should_fallback(kind: LocalPoolFailureKind, config: &ExternalPoolConfig) -> b
   - 触发本地池 circuit 至少需要涉及多少个不同本地凭据，建议默认 `2`，避免单个坏账号影响整个池。
 - `localPoolCircuitOpenSecs`
   - circuit 打开持续时间，建议默认 `30s`。
-- `localPoolCircuitHalfOpenMaxProbes`
-  - half-open 阶段允许多少个请求试探本地池，建议默认 `1`。
 
 本地池 circuit 只能统计本地池级可重试失败，例如 429、408、5xx、网络错误、协议错误、认证/风控类凭据不可用。以下错误不能计入 circuit：
 
@@ -1942,6 +1959,8 @@ external_pool_attempt pool_id=3 status=200 action=success
   "externalPoolsEnabled": false,
   "externalPoolGlobalMaxConcurrentRequests": 0,
   "externalPoolMaxQueuedRequests": 0,
+  "externalPoolCapacityMode": "fail_fast",
+  "externalPoolDispatchMaxWaitSecs": 30,
   "externalPoolRetryMaxAttempts": 0,
   "externalDirectPolicyEnabled": false,
   "directExternalOnLocalMaintenance": false,
@@ -1952,12 +1971,16 @@ external_pool_attempt pool_id=3 status=200 action=success
   "fallbackOnLocalTransientExhausted": true,
   "fallbackOnUnsupportedModel": false,
   "localPoolPreflightEnabled": true,
+  "externalPoolLocalRescueEnabled": true,
+  "externalPoolLocalRescueOnRateLimit": true,
+  "externalPoolLocalRescueOnTimeout": true,
+  "externalPoolLocalRescueOnCapacity": true,
+  "externalPoolLocalRescueMaxWaitSecs": 15,
   "localPoolCircuitEnabled": false,
   "localPoolCircuitWindowSecs": 60,
   "localPoolCircuitOpenAfterFailures": 3,
   "localPoolCircuitRequireDistinctCredentials": 2,
   "localPoolCircuitOpenSecs": 30,
-  "localPoolCircuitHalfOpenMaxProbes": 1,
   "externalPoolAutoDisableEnabled": false,
   "externalPoolAutoDisableOnAuthError": true,
   "externalPoolAutoDisableOnSecurityLock": true,

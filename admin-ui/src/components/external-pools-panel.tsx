@@ -106,7 +106,6 @@ export function ExternalPoolsPanel() {
           localPoolCircuitOpenAfterFailures: whole(configDraft.localPoolCircuitOpenAfterFailures, 1),
           localPoolCircuitRequireDistinctCredentials: whole(configDraft.localPoolCircuitRequireDistinctCredentials),
           localPoolCircuitOpenSecs: whole(configDraft.localPoolCircuitOpenSecs, 1),
-          localPoolCircuitHalfOpenMaxProbes: whole(configDraft.localPoolCircuitHalfOpenMaxProbes, 1),
           externalPoolAutoDisableFailureThreshold: whole(configDraft.externalPoolAutoDisableFailureThreshold, 1),
           externalPoolAutoDisableWindowSecs: whole(configDraft.externalPoolAutoDisableWindowSecs, 1),
           externalPoolAutoDisableDurationSecs: whole(configDraft.externalPoolAutoDisableDurationSecs),
@@ -292,11 +291,18 @@ export function ExternalPoolsPanel() {
               <FormSection title="显式直连" description="命中规则后绕过本地凭证，直接进入外部池。">
                 <div className="grid gap-3 sm:grid-cols-2">
                   <Toggle disabled={!externalEnabled} label="启用显式直连" checked={configDraft.externalDirectPolicyEnabled} onChange={(externalDirectPolicyEnabled) => setConfigDraft((prev) => ({ ...prev, externalDirectPolicyEnabled }))} />
-                  <Toggle disabled={!directPolicyActive} label="本地维护时直连" checked={configDraft.directExternalOnLocalMaintenance} onChange={(directExternalOnLocalMaintenance) => setConfigDraft((prev) => ({ ...prev, directExternalOnLocalMaintenance }))} />
+                  <Toggle disabled={!directPolicyActive} label="本地熔断时直连" checked={configDraft.directExternalOnLocalMaintenance} onChange={(directExternalOnLocalMaintenance) => setConfigDraft((prev) => ({ ...prev, directExternalOnLocalMaintenance }))} />
                 </div>
                 <div className="mt-3 grid gap-3 sm:grid-cols-2">
                   <TextArea disabled={!directPolicyActive} label="直连模型规则" value={modelRulesText} onChange={setModelRulesText} />
                   <TextArea disabled={!directPolicyActive} label="直连路径规则" value={pathRulesText} onChange={setPathRulesText} />
+                </div>
+                <div className="mt-3 grid gap-3 md:grid-cols-5">
+                  <Toggle disabled={!directPolicyActive} label="启用本地熔断" checked={configDraft.localPoolCircuitEnabled} onChange={(localPoolCircuitEnabled) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitEnabled }))} />
+                  <NumberBox disabled={!directPolicyActive || !configDraft.localPoolCircuitEnabled} label="熔断窗口秒数" value={configDraft.localPoolCircuitWindowSecs} min={1} onChange={(localPoolCircuitWindowSecs) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitWindowSecs }))} />
+                  <NumberBox disabled={!directPolicyActive || !configDraft.localPoolCircuitEnabled} label="失败次数阈值" value={configDraft.localPoolCircuitOpenAfterFailures} min={1} onChange={(localPoolCircuitOpenAfterFailures) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitOpenAfterFailures }))} />
+                  <NumberBox disabled={!directPolicyActive || !configDraft.localPoolCircuitEnabled} label="涉及凭证数" value={configDraft.localPoolCircuitRequireDistinctCredentials} min={1} onChange={(localPoolCircuitRequireDistinctCredentials) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitRequireDistinctCredentials }))} />
+                  <NumberBox disabled={!directPolicyActive || !configDraft.localPoolCircuitEnabled} label="熔断秒数" value={configDraft.localPoolCircuitOpenSecs} min={1} onChange={(localPoolCircuitOpenSecs) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitOpenSecs }))} />
                 </div>
               </FormSection>
             </div>
@@ -308,7 +314,7 @@ export function ExternalPoolsPanel() {
             description="控制外部池自己的并发、排队、重试和超时。单个外部池还可以单独设置并发。"
           >
             <div className="space-y-4">
-              <FormSection title="容量与排队" description={waitModeActive ? '外部池满并发时会等待容量。' : '外部池满并发时不会排队。'}>
+              <FormSection title="容量与排队" description={waitModeActive ? '外部池满并发时会等待容量；fallback 请求等待失败后可按回本地策略再探测本地。' : '外部池满并发时不会排队；fallback 请求可按回本地策略再探测本地。'}>
                 <div className="grid gap-3 md:grid-cols-4">
                   <SelectBox disabled={!externalEnabled} label="满并发处理" value={configDraft.externalPoolCapacityMode} onChange={(externalPoolCapacityMode) => setConfigDraft((prev) => ({ ...prev, externalPoolCapacityMode: externalPoolCapacityMode as ExternalPoolsConfig['externalPoolCapacityMode'] }))}>
                     <option value="fail_fast">立即失败</option>
@@ -338,6 +344,7 @@ export function ExternalPoolsPanel() {
                   <Toggle disabled={!externalEnabled} label="启用回本地" checked={configDraft.externalPoolLocalRescueEnabled} onChange={(externalPoolLocalRescueEnabled) => setConfigDraft((prev) => ({ ...prev, externalPoolLocalRescueEnabled }))} />
                   <Toggle disabled={!localRescueActive} label="429 时回本地" checked={configDraft.externalPoolLocalRescueOnRateLimit} onChange={(externalPoolLocalRescueOnRateLimit) => setConfigDraft((prev) => ({ ...prev, externalPoolLocalRescueOnRateLimit }))} />
                   <Toggle disabled={!localRescueActive} label="超时时回本地" checked={configDraft.externalPoolLocalRescueOnTimeout} onChange={(externalPoolLocalRescueOnTimeout) => setConfigDraft((prev) => ({ ...prev, externalPoolLocalRescueOnTimeout }))} />
+                  <Toggle disabled={!localRescueActive} label="容量失败回本地" checked={configDraft.externalPoolLocalRescueOnCapacity} onChange={(externalPoolLocalRescueOnCapacity) => setConfigDraft((prev) => ({ ...prev, externalPoolLocalRescueOnCapacity }))} />
                   <NumberBox disabled={!localRescueActive} label="回本地最多等待" description="0 表示只立刻探测可用本地槽位；默认 15 秒。" value={configDraft.externalPoolLocalRescueMaxWaitSecs} onChange={(externalPoolLocalRescueMaxWaitSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolLocalRescueMaxWaitSecs }))} />
                 </div>
               </FormSection>

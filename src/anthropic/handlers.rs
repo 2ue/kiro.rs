@@ -1,7 +1,7 @@
 //! Anthropic API Handler 函数
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     sync::{
         Arc,
@@ -13,8 +13,8 @@ use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::model::config::{
-    CompatProfile, Config, ExternalPoolCapacityMode, ExternalPoolsConfig, ModelMappingConfig,
-    ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
+    CompatProfile, Config, ExternalPoolsConfig, ModelMappingConfig, ModelResolutionMode,
+    PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
     PromptCacheSimulationMode, ReportedUsageConfig,
 };
 use crate::token;
@@ -392,17 +392,14 @@ impl ExternalFallbackContext {
         if !self.config.local_pool_preflight_enabled {
             return false;
         }
-        if self.manager.has_available_pool(&self.config).await {
-            return true;
-        }
-        self.config.external_pool_capacity_mode == ExternalPoolCapacityMode::Wait
-            && self.manager.has_waitable_pool(&self.config).await
+        self.manager.has_available_pool(&self.config).await
     }
 
     async fn direct_policy_response(&self, request_id: &str) -> Option<Response> {
-        let reason =
-            self.manager
-                .direct_policy_reason(&self.config, self.endpoint, &self.payload.model)?;
+        let reason = self
+            .manager
+            .direct_policy_reason(&self.config, self.endpoint, &self.payload.model)
+            .await?;
         Some(
             self.manager
                 .forward_with_failover(
@@ -447,6 +444,29 @@ impl ExternalFallbackContext {
             &local_attempts,
             &self.config,
         )?;
+        if self.config.local_pool_circuit_enabled {
+            let mut seen_credentials = HashSet::new();
+            let mut recorded = false;
+            for attempt in &local_attempts {
+                if seen_credentials.insert(attempt.credential_id) {
+                    recorded = true;
+                    let _ = self
+                        .manager
+                        .record_local_pool_failure(
+                            &self.config,
+                            Some(attempt.credential_id),
+                            &reason,
+                        )
+                        .await;
+                }
+            }
+            if !recorded {
+                let _ = self
+                    .manager
+                    .record_local_pool_failure(&self.config, None, &reason)
+                    .await;
+            }
+        }
         if !self.manager.has_eligible_pool(&self.config).await {
             return None;
         }
@@ -2688,6 +2708,9 @@ fn local_rescue_reason_after_external_error(
     }
     if config.external_pool_local_rescue_on_timeout && err.is_timeout_like() {
         return Some("external_timeout");
+    }
+    if config.external_pool_local_rescue_on_capacity && err.is_capacity_like() {
+        return Some("external_capacity");
     }
     None
 }
@@ -5393,6 +5416,21 @@ mod tests {
             Some("external_timeout")
         );
 
+        let capacity = ExternalPoolFinalError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            response_error_type: "api_error".to_string(),
+            route_error_type: "external_pool_capacity_full".to_string(),
+            message: "Request capacity is full".to_string(),
+            retryable: true,
+            attempts: Vec::new(),
+            pool_id: None,
+            pool_name: None,
+        };
+        assert_eq!(
+            local_rescue_reason_after_external_error(&config, &capacity),
+            Some("external_capacity")
+        );
+
         let bad_request = ExternalPoolFinalError {
             status: StatusCode::BAD_REQUEST,
             response_error_type: "invalid_request_error".to_string(),
@@ -5419,6 +5457,13 @@ mod tests {
         no_rate_limit.external_pool_local_rescue_on_rate_limit = false;
         assert_eq!(
             local_rescue_reason_after_external_error(&no_rate_limit, &rate_limit),
+            None
+        );
+
+        let mut no_capacity = no_rate_limit;
+        no_capacity.external_pool_local_rescue_on_capacity = false;
+        assert_eq!(
+            local_rescue_reason_after_external_error(&no_capacity, &capacity),
             None
         );
     }

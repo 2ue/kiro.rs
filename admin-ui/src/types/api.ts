@@ -773,13 +773,13 @@ export interface ExternalPoolsConfig {
   externalPoolLocalRescueEnabled: boolean
   externalPoolLocalRescueOnRateLimit: boolean
   externalPoolLocalRescueOnTimeout: boolean
+  externalPoolLocalRescueOnCapacity: boolean
   externalPoolLocalRescueMaxWaitSecs: number
   localPoolCircuitEnabled: boolean
   localPoolCircuitWindowSecs: number
   localPoolCircuitOpenAfterFailures: number
   localPoolCircuitRequireDistinctCredentials: number
   localPoolCircuitOpenSecs: number
-  localPoolCircuitHalfOpenMaxProbes: number
   externalPoolAutoDisableEnabled: boolean
   externalPoolAutoDisableOnAuthError: boolean
   externalPoolAutoDisableOnSecurityLock: boolean
