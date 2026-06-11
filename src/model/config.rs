@@ -1001,6 +1001,8 @@ pub struct PostgresConfig {
     pub max_connections: u32,
     #[serde(default = "default_true")]
     pub migrate_on_start: bool,
+    #[serde(default)]
+    pub compress_usage_rollups_on_start: bool,
 }
 
 impl Default for PostgresConfig {
@@ -1009,6 +1011,7 @@ impl Default for PostgresConfig {
             url: None,
             max_connections: default_postgres_max_connections(),
             migrate_on_start: true,
+            compress_usage_rollups_on_start: false,
         }
     }
 }
@@ -1918,6 +1921,16 @@ impl Config {
                 self.postgres.url = Some(url);
             }
         }
+        if let Ok(value) = std::env::var("KIRO_RS_POSTGRES_MIGRATE_ON_START") {
+            if let Some(parsed) = parse_env_bool(&value) {
+                self.postgres.migrate_on_start = parsed;
+            }
+        }
+        if let Ok(value) = std::env::var("KIRO_RS_POSTGRES_COMPRESS_USAGE_ROLLUPS_ON_START") {
+            if let Some(parsed) = parse_env_bool(&value) {
+                self.postgres.compress_usage_rollups_on_start = parsed;
+            }
+        }
         if let Ok(url) = std::env::var("KIRO_RS_REDIS_URL") {
             if !url.trim().is_empty() {
                 self.redis.url = Some(url);
@@ -1928,6 +1941,14 @@ impl Config {
     /// 设置运行时配置路径元数据。数据库加载的配置没有对应文件路径。
     pub(crate) fn set_config_path_for_runtime(&mut self, path: Option<PathBuf>) {
         self.config_path = path;
+    }
+}
+
+fn parse_env_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "y" | "on" => Some(true),
+        "0" | "false" | "no" | "n" | "off" => Some(false),
+        _ => None,
     }
 }
 
@@ -1950,6 +1971,8 @@ mod tests {
         let config = Config::default();
 
         assert_eq!(config.postgres.max_connections, 10);
+        assert!(config.postgres.migrate_on_start);
+        assert!(!config.postgres.compress_usage_rollups_on_start);
         assert_eq!(config.redis.key_prefix, "kiro_rs:local");
         assert_eq!(config.credential_rpm, None);
         assert_eq!(config.credential_max_concurrent_requests, 0);
@@ -2029,6 +2052,16 @@ mod tests {
                 .policy_for_path("/na/v1/messages")
                 .enabled
         );
+    }
+
+    #[test]
+    fn parse_env_bool_accepts_common_values() {
+        assert_eq!(parse_env_bool("true"), Some(true));
+        assert_eq!(parse_env_bool("1"), Some(true));
+        assert_eq!(parse_env_bool("YES"), Some(true));
+        assert_eq!(parse_env_bool("off"), Some(false));
+        assert_eq!(parse_env_bool("0"), Some(false));
+        assert_eq!(parse_env_bool("maybe"), None);
     }
 
     #[test]

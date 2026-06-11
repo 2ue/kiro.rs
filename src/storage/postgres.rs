@@ -176,7 +176,9 @@ impl PostgresStore {
             test_schema: None,
         };
         if config.postgres.migrate_on_start {
-            store.migrate().await?;
+            store
+                .migrate_with_options(config.postgres.compress_usage_rollups_on_start)
+                .await?;
         }
         Ok(store)
     }
@@ -213,7 +215,7 @@ impl PostgresStore {
             pool,
             test_schema: Some(schema),
         };
-        store.migrate().await?;
+        store.migrate_with_options(false).await?;
         Ok(store)
     }
 
@@ -237,7 +239,7 @@ impl PostgresStore {
         Ok(())
     }
 
-    pub async fn migrate(&self) -> anyhow::Result<()> {
+    pub async fn migrate_with_options(&self, compress_usage_rollups: bool) -> anyhow::Result<()> {
         const MIGRATION_LOCK_ID: i64 = 4_950_531_234_001;
         let mut conn = self.pool.acquire().await?;
         sqlx::query("SELECT pg_advisory_lock($1)")
@@ -259,12 +261,14 @@ impl PostgresStore {
             .await?;
 
             execute_sql_statements(&mut conn, SCHEMA_SQL).await?;
-            run_versioned_migration(
-                &mut conn,
-                "usage-rollup-hour-bucket-compression-v1",
-                USAGE_ROLLUP_HOUR_BUCKET_COMPRESSION_SQL,
-            )
-            .await?;
+            if compress_usage_rollups {
+                run_versioned_migration(
+                    &mut conn,
+                    "usage-rollup-hour-bucket-compression-v1",
+                    USAGE_ROLLUP_HOUR_BUCKET_COMPRESSION_SQL,
+                )
+                .await?;
+            }
 
             sqlx::query(
                 r#"
@@ -289,6 +293,11 @@ impl PostgresStore {
         migration_result?;
         unlock_result?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub async fn compress_usage_rollups_to_hour_buckets(&self) -> anyhow::Result<()> {
+        self.migrate_with_options(true).await
     }
 
     pub async fn load_runtime_config(&self) -> anyhow::Result<Option<Config>> {
@@ -5093,7 +5102,30 @@ mod tests {
             .unwrap();
         }
 
-        store.migrate().await.unwrap();
+        store.migrate_with_options(false).await.unwrap();
+        let default_rows: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)::bigint
+            FROM usage_rollup_time_buckets
+            WHERE dimension = 'global' AND dimension_key = 'all'
+            "#,
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(default_rows, 2);
+        let default_applied: Option<String> =
+            sqlx::query_scalar("SELECT checksum FROM schema_migrations WHERE version = $1")
+                .bind("usage-rollup-hour-bucket-compression-v1")
+                .fetch_optional(store.pool())
+                .await
+                .unwrap();
+        assert!(default_applied.is_none());
+
+        store
+            .compress_usage_rollups_to_hour_buckets()
+            .await
+            .unwrap();
 
         let row = sqlx::query(
             r#"
