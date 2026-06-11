@@ -328,6 +328,7 @@ pub struct UsageCleanupRequest {
     #[serde(default)]
     pub mode: UsageCleanupMode,
     /// 清理多少天之前的数据；soft_delete 对应 created_at，hard_delete 对应 deleted_at。
+    /// 传 0 表示以任务启动时刻为 cutoff，清理当时之前的全部匹配记录。
     #[serde(default)]
     pub older_than_days: Option<u32>,
     /// 自定义 cutoff，优先级高于 older_than_days。

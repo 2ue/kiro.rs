@@ -5,7 +5,7 @@ use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{
-    PgPool, Postgres, QueryBuilder, Row, Transaction,
+    Connection, PgPool, Postgres, QueryBuilder, Row, Transaction,
     postgres::{PgPoolOptions, PgRow},
 };
 
@@ -258,12 +258,13 @@ impl PostgresStore {
             .execute(&mut *conn)
             .await?;
 
-            for statement in SCHEMA_SQL.split(";") {
-                let statement = statement.trim();
-                if !statement.is_empty() {
-                    sqlx::query(statement).execute(&mut *conn).await?;
-                }
-            }
+            execute_sql_statements(&mut conn, SCHEMA_SQL).await?;
+            run_versioned_migration(
+                &mut conn,
+                "usage-rollup-hour-bucket-compression-v1",
+                USAGE_ROLLUP_HOUR_BUCKET_COMPRESSION_SQL,
+            )
+            .await?;
 
             sqlx::query(
                 r#"
@@ -1894,6 +1895,66 @@ impl PostgresStore {
     }
 }
 
+async fn execute_sql_statements(
+    conn: &mut sqlx::pool::PoolConnection<Postgres>,
+    sql: &str,
+) -> anyhow::Result<()> {
+    for statement in sql.split(";") {
+        let statement = statement.trim();
+        if !statement.is_empty() {
+            sqlx::query(statement).execute(&mut **conn).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn run_versioned_migration(
+    conn: &mut sqlx::pool::PoolConnection<Postgres>,
+    version: &str,
+    sql: &str,
+) -> anyhow::Result<()> {
+    let checksum = sha256_hex(sql);
+    let applied_checksum: Option<String> =
+        sqlx::query_scalar("SELECT checksum FROM schema_migrations WHERE version = $1")
+            .bind(version)
+            .fetch_optional(&mut **conn)
+            .await?;
+    if let Some(applied_checksum) = applied_checksum {
+        if applied_checksum != checksum {
+            anyhow::bail!("schema migration {version} checksum mismatch");
+        }
+        return Ok(());
+    }
+
+    let mut tx = conn.begin().await?;
+    execute_sql_statements_in_tx(&mut tx, sql).await?;
+    sqlx::query(
+        r#"
+        INSERT INTO schema_migrations (version, checksum, applied_at)
+        VALUES ($1, $2, now())
+        "#,
+    )
+    .bind(version)
+    .bind(checksum)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn execute_sql_statements_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    sql: &str,
+) -> anyhow::Result<()> {
+    for statement in sql.split(";") {
+        let statement = statement.trim();
+        if !statement.is_empty() {
+            sqlx::query(statement).execute(&mut **tx).await?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CredentialStatsRow {
     pub success_count: u64,
@@ -3436,6 +3497,10 @@ fn parse_usage_created_at(record: &UsageRecord) -> DateTime<Utc> {
 
 fn usage_rollup_bucket_start(created_at: DateTime<Utc>) -> DateTime<Utc> {
     created_at
+        .with_minute(0)
+        .expect("valid minute truncation")
+        .with_second(0)
+        .expect("valid second truncation")
         .with_nanosecond(0)
         .expect("valid nanosecond truncation")
 }
@@ -4460,6 +4525,7 @@ CROSS JOIN LATERAL (
 ) AS d(dimension, dimension_key, dimension_label)
 WHERE r.deleted_at IS NULL
   AND d.dimension_key IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM usage_rollup_totals)
 GROUP BY d.dimension, d.dimension_key
 ON CONFLICT (dimension, dimension_key) DO NOTHING;
 
@@ -4480,7 +4546,7 @@ INSERT INTO usage_rollup_time_buckets (
     duration_ms_sum, duration_ms_count, duration_ms_max
 )
 SELECT
-    date_trunc('second', r.created_at) AS bucket_start,
+    date_trunc('hour', r.created_at) AS bucket_start,
     d.dimension,
     d.dimension_key,
     MAX(d.dimension_label),
@@ -4561,28 +4627,32 @@ CROSS JOIN LATERAL (
 ) AS d(dimension, dimension_key, dimension_label)
 WHERE r.deleted_at IS NULL
   AND d.dimension_key IS NOT NULL
-GROUP BY date_trunc('second', r.created_at), d.dimension, d.dimension_key
+  AND NOT EXISTS (SELECT 1 FROM usage_rollup_time_buckets)
+GROUP BY date_trunc('hour', r.created_at), d.dimension, d.dimension_key
 ON CONFLICT (bucket_start, dimension, dimension_key) DO NOTHING;
 
 INSERT INTO usage_cache_read_totals (cache_read_input_tokens, requests)
 SELECT GREATEST(cache_read_input_tokens, 0), COUNT(*)::bigint
 FROM usage_records
 WHERE deleted_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM usage_cache_read_totals)
 GROUP BY GREATEST(cache_read_input_tokens, 0)
 ON CONFLICT (cache_read_input_tokens) DO NOTHING;
 
 INSERT INTO usage_cache_read_rollup_time_buckets (bucket_start, cache_read_input_tokens, requests)
-SELECT date_trunc('second', created_at), GREATEST(cache_read_input_tokens, 0), COUNT(*)::bigint
+SELECT date_trunc('hour', created_at), GREATEST(cache_read_input_tokens, 0), COUNT(*)::bigint
 FROM usage_records
 WHERE deleted_at IS NULL
-GROUP BY date_trunc('second', created_at), GREATEST(cache_read_input_tokens, 0)
+  AND NOT EXISTS (SELECT 1 FROM usage_cache_read_rollup_time_buckets)
+GROUP BY date_trunc('hour', created_at), GREATEST(cache_read_input_tokens, 0)
 ON CONFLICT (bucket_start, cache_read_input_tokens) DO NOTHING;
 
 INSERT INTO usage_duration_rollup_time_buckets (bucket_start, duration_ms, requests)
-SELECT date_trunc('second', created_at), LEAST(GREATEST(duration_ms, 0), 2147483647)::integer, COUNT(*)::bigint
+SELECT date_trunc('hour', created_at), LEAST(GREATEST(duration_ms, 0), 2147483647)::integer, COUNT(*)::bigint
 FROM usage_records
 WHERE deleted_at IS NULL
-GROUP BY date_trunc('second', created_at), LEAST(GREATEST(duration_ms, 0), 2147483647)::integer
+  AND NOT EXISTS (SELECT 1 FROM usage_duration_rollup_time_buckets)
+GROUP BY date_trunc('hour', created_at), LEAST(GREATEST(duration_ms, 0), 2147483647)::integer
 ON CONFLICT (bucket_start, duration_ms) DO NOTHING;
 
 INSERT INTO usage_credential_cost_summary (
@@ -4597,6 +4667,7 @@ SELECT
 FROM usage_records
 WHERE credential_id IS NOT NULL
   AND deleted_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM usage_credential_cost_summary)
 GROUP BY credential_id
 ON CONFLICT (credential_id) DO NOTHING;
 
@@ -4676,6 +4747,124 @@ CREATE INDEX IF NOT EXISTS idx_credential_events_credential_created
     ON credential_events (credential_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_credential_events_type_created
     ON credential_events (event_type, created_at DESC);
+"#;
+
+const USAGE_ROLLUP_HOUR_BUCKET_COMPRESSION_SQL: &str = r#"
+CREATE TEMP TABLE usage_rollup_time_buckets_hourly ON COMMIT DROP AS
+SELECT
+    date_trunc('hour', bucket_start) AS bucket_start,
+    dimension,
+    dimension_key,
+    NULLIF(MAX(NULLIF(dimension_label, '')), '') AS dimension_label,
+    COALESCE(SUM(requests), 0)::bigint AS requests,
+    COALESCE(SUM(success_requests), 0)::bigint AS success_requests,
+    COALESCE(SUM(error_requests), 0)::bigint AS error_requests,
+    COALESCE(SUM(stream_requests), 0)::bigint AS stream_requests,
+    COALESCE(SUM(non_stream_requests), 0)::bigint AS non_stream_requests,
+    COALESCE(SUM(priced_requests), 0)::bigint AS priced_requests,
+    COALESCE(SUM(unpriced_requests), 0)::bigint AS unpriced_requests,
+    COALESCE(SUM(local_prompt_cache_requests), 0)::bigint AS local_prompt_cache_requests,
+    COALESCE(SUM(simulated_requests), 0)::bigint AS simulated_requests,
+    COALESCE(SUM(upstream_metadata_requests), 0)::bigint AS upstream_metadata_requests,
+    COALESCE(SUM(sticky_bound_requests), 0)::bigint AS sticky_bound_requests,
+    COALESCE(SUM(fallback_from_sticky_requests), 0)::bigint AS fallback_from_sticky_requests,
+    COALESCE(SUM(total_input_tokens), 0)::bigint AS total_input_tokens,
+    COALESCE(SUM(billable_input_tokens), 0)::bigint AS billable_input_tokens,
+    COALESCE(SUM(total_output_tokens), 0)::bigint AS total_output_tokens,
+    COALESCE(SUM(total_cache_read_input_tokens), 0)::bigint AS total_cache_read_input_tokens,
+    COALESCE(SUM(total_cache_creation_input_tokens), 0)::bigint AS total_cache_creation_input_tokens,
+    COALESCE(SUM(local_prompt_cache_input_tokens), 0)::bigint AS local_prompt_cache_input_tokens,
+    COALESCE(SUM(local_prompt_cache_read_input_tokens), 0)::bigint AS local_prompt_cache_read_input_tokens,
+    COALESCE(SUM(local_prompt_cache_creation_input_tokens), 0)::bigint AS local_prompt_cache_creation_input_tokens,
+    COALESCE(SUM(total_estimated_cost_usd), 0)::double precision AS total_estimated_cost_usd,
+    COALESCE(SUM(external_pool_requests), 0)::bigint AS external_pool_requests,
+    COALESCE(SUM(external_pool_priced_requests), 0)::bigint AS external_pool_priced_requests,
+    COALESCE(SUM(external_pool_unpriced_requests), 0)::bigint AS external_pool_unpriced_requests,
+    COALESCE(SUM(external_pool_cost_floor_applied_requests), 0)::bigint AS external_pool_cost_floor_applied_requests,
+    COALESCE(SUM(external_pool_raw_cost_usd), 0)::double precision AS external_pool_raw_cost_usd,
+    COALESCE(SUM(external_pool_shaped_cost_usd), 0)::double precision AS external_pool_shaped_cost_usd,
+    COALESCE(SUM(external_pool_uplifted_cost_usd), 0)::double precision AS external_pool_uplifted_cost_usd,
+    COALESCE(SUM(external_pool_profit_usd), 0)::double precision AS external_pool_profit_usd,
+    COALESCE(SUM(external_pool_reported_cost_usd), 0)::double precision AS external_pool_reported_cost_usd,
+    COALESCE(SUM(external_pool_billable_cost_usd), 0)::double precision AS external_pool_billable_cost_usd,
+    COALESCE(SUM(external_pool_cost_floor_delta_usd), 0)::double precision AS external_pool_cost_floor_delta_usd,
+    COALESCE(SUM(duration_ms_sum), 0)::bigint AS duration_ms_sum,
+    COALESCE(SUM(duration_ms_count), 0)::bigint AS duration_ms_count,
+    COALESCE(MAX(duration_ms_max), 0)::bigint AS duration_ms_max,
+    COALESCE(MAX(updated_at), now()) AS updated_at
+FROM usage_rollup_time_buckets
+GROUP BY date_trunc('hour', bucket_start), dimension, dimension_key;
+
+TRUNCATE TABLE usage_rollup_time_buckets;
+
+INSERT INTO usage_rollup_time_buckets (
+    bucket_start, dimension, dimension_key, dimension_label, requests,
+    success_requests, error_requests, stream_requests, non_stream_requests,
+    priced_requests, unpriced_requests, local_prompt_cache_requests,
+    simulated_requests, upstream_metadata_requests, sticky_bound_requests,
+    fallback_from_sticky_requests, total_input_tokens, billable_input_tokens,
+    total_output_tokens, total_cache_read_input_tokens,
+    total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
+    local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
+    total_estimated_cost_usd, external_pool_requests,
+    external_pool_priced_requests, external_pool_unpriced_requests,
+    external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
+    external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
+    external_pool_profit_usd, external_pool_reported_cost_usd,
+    external_pool_billable_cost_usd, external_pool_cost_floor_delta_usd,
+    duration_ms_sum, duration_ms_count, duration_ms_max, updated_at
+)
+SELECT
+    bucket_start, dimension, dimension_key, dimension_label, requests,
+    success_requests, error_requests, stream_requests, non_stream_requests,
+    priced_requests, unpriced_requests, local_prompt_cache_requests,
+    simulated_requests, upstream_metadata_requests, sticky_bound_requests,
+    fallback_from_sticky_requests, total_input_tokens, billable_input_tokens,
+    total_output_tokens, total_cache_read_input_tokens,
+    total_cache_creation_input_tokens, local_prompt_cache_input_tokens,
+    local_prompt_cache_read_input_tokens, local_prompt_cache_creation_input_tokens,
+    total_estimated_cost_usd, external_pool_requests,
+    external_pool_priced_requests, external_pool_unpriced_requests,
+    external_pool_cost_floor_applied_requests, external_pool_raw_cost_usd,
+    external_pool_shaped_cost_usd, external_pool_uplifted_cost_usd,
+    external_pool_profit_usd, external_pool_reported_cost_usd,
+    external_pool_billable_cost_usd, external_pool_cost_floor_delta_usd,
+    duration_ms_sum, duration_ms_count, duration_ms_max, updated_at
+FROM usage_rollup_time_buckets_hourly;
+
+CREATE TEMP TABLE usage_cache_read_rollup_time_buckets_hourly ON COMMIT DROP AS
+SELECT
+    date_trunc('hour', bucket_start) AS bucket_start,
+    cache_read_input_tokens,
+    COALESCE(SUM(requests), 0)::bigint AS requests,
+    COALESCE(MAX(updated_at), now()) AS updated_at
+FROM usage_cache_read_rollup_time_buckets
+GROUP BY date_trunc('hour', bucket_start), cache_read_input_tokens;
+
+TRUNCATE TABLE usage_cache_read_rollup_time_buckets;
+
+INSERT INTO usage_cache_read_rollup_time_buckets (
+    bucket_start, cache_read_input_tokens, requests, updated_at
+)
+SELECT bucket_start, cache_read_input_tokens, requests, updated_at
+FROM usage_cache_read_rollup_time_buckets_hourly;
+
+CREATE TEMP TABLE usage_duration_rollup_time_buckets_hourly ON COMMIT DROP AS
+SELECT
+    date_trunc('hour', bucket_start) AS bucket_start,
+    duration_ms,
+    COALESCE(SUM(requests), 0)::bigint AS requests,
+    COALESCE(MAX(updated_at), now()) AS updated_at
+FROM usage_duration_rollup_time_buckets
+GROUP BY date_trunc('hour', bucket_start), duration_ms;
+
+TRUNCATE TABLE usage_duration_rollup_time_buckets;
+
+INSERT INTO usage_duration_rollup_time_buckets (
+    bucket_start, duration_ms, requests, updated_at
+)
+SELECT bucket_start, duration_ms, requests, updated_at
+FROM usage_duration_rollup_time_buckets_hourly;
 "#;
 
 #[cfg(test)]
@@ -4771,6 +4960,200 @@ mod tests {
             payload_breakdown: None,
             payload_guard_report: None,
         }
+    }
+
+    #[test]
+    fn usage_rollup_bucket_start_truncates_to_hour() {
+        let created_at = DateTime::parse_from_rfc3339("2026-06-11T01:23:45.678Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let bucket_start = usage_rollup_bucket_start(created_at);
+        let expected = DateTime::parse_from_rfc3339("2026-06-11T01:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(bucket_start, expected);
+    }
+
+    #[tokio::test]
+    async fn postgres_usage_rollup_writes_hour_buckets() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        let usage_store = PostgresUsageStore::new(Arc::new(store.clone()));
+
+        let mut first = usage_record("hour-bucket-1", 10);
+        first.created_at = "2026-06-11T01:10:35Z".to_string();
+        let mut second = usage_record("hour-bucket-2", 20);
+        second.created_at = "2026-06-11T01:59:59Z".to_string();
+        usage_store.record(first).await.unwrap();
+        usage_store.record(second).await.unwrap();
+
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*)::bigint AS rows,
+                   MIN(bucket_start) AS bucket_start,
+                   SUM(requests)::bigint AS requests
+            FROM usage_rollup_time_buckets
+            WHERE dimension = 'global' AND dimension_key = 'all'
+            "#,
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        let rows: i64 = row.try_get("rows").unwrap();
+        let bucket_start: DateTime<Utc> = row.try_get("bucket_start").unwrap();
+        let requests: i64 = row.try_get("requests").unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(
+            bucket_start,
+            DateTime::parse_from_rfc3339("2026-06-11T01:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
+        assert_eq!(requests, 2);
+
+        let cache_bucket_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT bucket_start)::bigint FROM usage_cache_read_rollup_time_buckets",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(cache_bucket_count, 1);
+
+        store.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_migration_compresses_second_rollup_buckets_to_hours() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 PgSQL 集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return;
+        };
+
+        let store = PostgresStore::connect_test(&config).await.unwrap();
+        clean(&store).await;
+        sqlx::query(
+            "DELETE FROM schema_migrations WHERE version = 'usage-rollup-hour-bucket-compression-v1'",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        for (created_at, requests) in [
+            ("2026-06-11T01:10:35Z", 1i64),
+            ("2026-06-11T01:42:05Z", 2i64),
+        ] {
+            let bucket_start = DateTime::parse_from_rfc3339(created_at)
+                .unwrap()
+                .with_timezone(&Utc);
+            sqlx::query(
+                r#"
+                INSERT INTO usage_rollup_time_buckets (
+                    bucket_start, dimension, dimension_key, requests,
+                    duration_ms_sum, duration_ms_count, duration_ms_max
+                )
+                VALUES ($1, 'global', 'all', $2, $3, $2, $4)
+                "#,
+            )
+            .bind(bucket_start)
+            .bind(requests)
+            .bind(requests * 100)
+            .bind(requests * 100)
+            .execute(store.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                r#"
+                INSERT INTO usage_cache_read_rollup_time_buckets (
+                    bucket_start, cache_read_input_tokens, requests
+                )
+                VALUES ($1, 1000, $2)
+                "#,
+            )
+            .bind(bucket_start)
+            .bind(requests)
+            .execute(store.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                r#"
+                INSERT INTO usage_duration_rollup_time_buckets (
+                    bucket_start, duration_ms, requests
+                )
+                VALUES ($1, 250, $2)
+                "#,
+            )
+            .bind(bucket_start)
+            .bind(requests)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+
+        store.migrate().await.unwrap();
+
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*)::bigint AS rows,
+                   MIN(bucket_start) AS bucket_start,
+                   SUM(requests)::bigint AS requests,
+                   SUM(duration_ms_sum)::bigint AS duration_ms_sum,
+                   MAX(duration_ms_max)::bigint AS duration_ms_max
+            FROM usage_rollup_time_buckets
+            WHERE dimension = 'global' AND dimension_key = 'all'
+            "#,
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        let rows: i64 = row.try_get("rows").unwrap();
+        let bucket_start: DateTime<Utc> = row.try_get("bucket_start").unwrap();
+        let requests: i64 = row.try_get("requests").unwrap();
+        let duration_ms_sum: i64 = row.try_get("duration_ms_sum").unwrap();
+        let duration_ms_max: i64 = row.try_get("duration_ms_max").unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(
+            bucket_start,
+            DateTime::parse_from_rfc3339("2026-06-11T01:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
+        assert_eq!(requests, 3);
+        assert_eq!(duration_ms_sum, 300);
+        assert_eq!(duration_ms_max, 200);
+
+        let cache_requests: i64 = sqlx::query_scalar(
+            "SELECT SUM(requests)::bigint FROM usage_cache_read_rollup_time_buckets",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(cache_requests, 3);
+        let cache_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM usage_cache_read_rollup_time_buckets")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(cache_rows, 1);
+
+        let duration_requests: i64 = sqlx::query_scalar(
+            "SELECT SUM(requests)::bigint FROM usage_duration_rollup_time_buckets",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(duration_requests, 3);
+        let duration_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM usage_duration_rollup_time_buckets")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(duration_rows, 1);
+
+        store.drop_test_schema().await.unwrap();
     }
 
     fn external_usage_snapshot(

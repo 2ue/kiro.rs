@@ -125,7 +125,7 @@ const badgeToneClass: Record<string, string> = {
   primary: '!border-base-300 !bg-base-100 text-primary',
   secondary: '!border-base-300 !bg-base-100 text-base-content/60',
   success: '!border-base-300 !bg-base-100 text-success',
-  warning: '!border-base-300 !bg-base-100 text-warning',
+  warning: '!border-warning !bg-warning text-white',
   error: '!border-base-300 !bg-base-100 text-error',
   info: '!border-base-300 !bg-base-100 text-info',
   accent: '!border-base-300 !bg-base-100 text-primary',

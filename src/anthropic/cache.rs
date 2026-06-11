@@ -346,6 +346,17 @@ impl ReportedCacheUsagePolicy {
         })
     }
 
+    pub fn should_rewrite_local_prompt_cache_usage(&self, usage: CacheUsage) -> bool {
+        if !self.reports_local_prompt_cache() || !usage.has_prompt_cache() {
+            return false;
+        }
+
+        let input = self.policy.input.normalized();
+        matches!(input.mode, ReportedUsageFieldMode::SampleMax)
+            && input.max_tokens > 0
+            && usage.input_tokens > input.max_tokens
+    }
+
     fn reports_local_prompt_cache(&self) -> bool {
         self.policy.enabled
     }

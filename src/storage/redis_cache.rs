@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
@@ -100,6 +100,46 @@ struct RedisExternalPoolIndexItem {
     label: String,
 }
 
+#[derive(Debug, Default)]
+struct DashboardBucketCache {
+    buckets: HashMap<String, HashMap<String, String>>,
+}
+
+impl DashboardBucketCache {
+    fn sum_bucket(
+        &self,
+        dimension: &str,
+        key: &str,
+        spec: &UsageDashboardWindowSpec,
+    ) -> HashMap<String, String> {
+        let epochs = usage_dashboard_hour_epochs(spec.from, spec.to);
+        sum_usage_hash_refs(epochs.iter().filter_map(|epoch| {
+            self.buckets
+                .get(&usage_dashboard_bucket_key(dimension, key, *epoch))
+        }))
+    }
+
+    fn high_cache_requests(
+        &self,
+        spec: &UsageDashboardWindowSpec,
+        high_cache_threshold: i32,
+    ) -> usize {
+        usage_dashboard_hour_epochs(spec.from, spec.to)
+            .iter()
+            .filter_map(|epoch| {
+                self.buckets
+                    .get(&usage_dashboard_cache_read_bucket_key(*epoch))
+            })
+            .flat_map(|bucket| bucket.iter())
+            .filter_map(|(tokens, requests)| {
+                let tokens = tokens.parse::<i32>().ok()?;
+                let requests = requests.parse::<usize>().ok()?;
+                (tokens >= high_cache_threshold).then_some(requests)
+            })
+            .sum()
+    }
+}
+
 #[derive(Clone)]
 pub struct RedisStore {
     client: redis::Client,
@@ -147,6 +187,143 @@ impl RedisStore {
             manager,
             key_prefix: config.redis.key_prefix.trim_end_matches(':').to_string(),
         })
+    }
+
+    async fn dashboard_bucket_cache(
+        &self,
+        window_specs: &[UsageDashboardWindowSpec],
+        hourly_specs: &[UsageDashboardWindowSpec],
+        daily_specs: &[UsageDashboardWindowSpec],
+        external_pool_index: &[RedisExternalPoolIndexItem],
+    ) -> anyhow::Result<DashboardBucketCache> {
+        let mut suffixes = Vec::new();
+        let mut seen = HashSet::new();
+        for spec in window_specs {
+            collect_dashboard_window_bucket_keys(
+                &mut suffixes,
+                &mut seen,
+                spec,
+                external_pool_index,
+            );
+        }
+        for spec in hourly_specs.iter().chain(daily_specs.iter()) {
+            collect_dashboard_global_bucket_keys(&mut suffixes, &mut seen, spec);
+        }
+        if suffixes.is_empty() {
+            return Ok(DashboardBucketCache::default());
+        }
+
+        let mut pipe = redis::pipe();
+        for suffix in &suffixes {
+            pipe.cmd("HGETALL").arg(self.key(suffix));
+        }
+        let mut manager = self.manager.clone();
+        let buckets: Vec<HashMap<String, String>> = pipe.query_async(&mut manager).await?;
+        let buckets = suffixes
+            .into_iter()
+            .zip(buckets)
+            .filter(|(_, bucket)| !bucket.is_empty())
+            .collect();
+        Ok(DashboardBucketCache { buckets })
+    }
+
+    fn dashboard_breakdown_from_cache(
+        &self,
+        spec: &UsageDashboardWindowSpec,
+        dimension: &str,
+        keys: &[&str],
+        label: fn(&str) -> String,
+        total_requests: usize,
+        cache: &DashboardBucketCache,
+    ) -> Vec<UsageBreakdownItem> {
+        let mut items = Vec::with_capacity(keys.len());
+        for key in keys {
+            let totals = cache.sum_bucket(dimension, key, spec);
+            let requests = usage_usize(&totals, "total_requests");
+            if requests == 0 {
+                continue;
+            }
+            items.push(UsageBreakdownItem {
+                key: (*key).to_string(),
+                label: label(key),
+                requests,
+                ratio: usage_ratio(requests, total_requests),
+            });
+        }
+        items.sort_by_key(|item| std::cmp::Reverse(item.requests));
+        items
+    }
+
+    fn dashboard_external_pool_billing_by_pool_from_cache(
+        &self,
+        spec: &UsageDashboardWindowSpec,
+        external_pool_index: &[RedisExternalPoolIndexItem],
+        cache: &DashboardBucketCache,
+    ) -> Vec<UsageExternalPoolBillingByPool> {
+        if external_pool_index.is_empty() {
+            return Vec::new();
+        }
+
+        let mut items = Vec::with_capacity(external_pool_index.len());
+        for pool in external_pool_index {
+            let totals = cache.sum_bucket("external_pool", &pool.id, spec);
+            let requests = usage_usize(&totals, "external_pool_requests");
+            if requests == 0 {
+                continue;
+            }
+            items.push(UsageExternalPoolBillingByPool {
+                pool_id: pool.id.parse::<u64>().unwrap_or(0),
+                pool_name: pool.label.clone(),
+                requests,
+                priced_requests: usage_usize(&totals, "external_pool_priced_requests"),
+                unpriced_requests: usage_usize(&totals, "external_pool_unpriced_requests"),
+                cost_floor_applied_requests: usage_usize(
+                    &totals,
+                    "external_pool_cost_floor_applied_requests",
+                ),
+                raw_cost_usd: usage_f64(&totals, "external_pool_raw_cost_usd"),
+                shaped_cost_usd: usage_f64(&totals, "external_pool_shaped_cost_usd"),
+                uplifted_cost_usd: usage_f64(&totals, "external_pool_uplifted_cost_usd"),
+                profit_usd: usage_f64(&totals, "external_pool_profit_usd"),
+                reported_cost_usd: usage_f64(&totals, "external_pool_reported_cost_usd"),
+                billable_cost_usd: usage_f64(&totals, "external_pool_billable_cost_usd"),
+                cost_floor_delta_usd: usage_f64(&totals, "external_pool_cost_floor_delta_usd"),
+            });
+        }
+        items.sort_by(|left, right| {
+            right
+                .uplifted_cost_usd
+                .partial_cmp(&left.uplifted_cost_usd)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| right.requests.cmp(&left.requests))
+                .then_with(|| left.pool_id.cmp(&right.pool_id))
+        });
+        items
+    }
+
+    fn dashboard_series_from_cache(
+        &self,
+        specs: &[UsageDashboardWindowSpec],
+        cache: &DashboardBucketCache,
+    ) -> Vec<UsageSeriesPoint> {
+        let mut points = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let totals = cache.sum_bucket("global", "all", spec);
+            points.push(UsageSeriesPoint {
+                key: spec.key.clone(),
+                label: spec.label.clone(),
+                from: spec.from.to_rfc3339(),
+                to: spec.to.to_rfc3339(),
+                requests: usage_usize(&totals, "total_requests"),
+                success_requests: usage_usize(&totals, "success_requests"),
+                error_requests: usage_usize(&totals, "error_requests"),
+                total_input_tokens: usage_i64(&totals, "total_input_tokens"),
+                billable_input_tokens: usage_i64(&totals, "billable_input_tokens"),
+                total_output_tokens: usage_i64(&totals, "total_output_tokens"),
+                total_estimated_cost_usd: usage_f64(&totals, "total_estimated_cost_usd"),
+            });
+        }
+        points
     }
 
     pub fn key(&self, suffix: impl AsRef<str>) -> String {
@@ -789,17 +966,34 @@ impl RedisStore {
         let now = Utc::now();
         let (timezone, offset) = usage_dashboard_timezone(timezone);
         let window_specs = usage_dashboard_windows(now, offset);
-        let external_pool_index = self.dashboard_external_pool_index().await?;
-        let mut windows = Vec::with_capacity(window_specs.len());
-        for spec in &window_specs {
-            windows.push(
-                self.dashboard_window_from_redis(spec, high_cache_threshold, &external_pool_index)
-                    .await?,
-            );
-        }
-
         let hourly_specs = usage_dashboard_hourly_windows(now, offset);
         let daily_specs = usage_dashboard_daily_windows(now, offset);
+        let external_pool_index = self.dashboard_external_pool_index().await?;
+        let bucket_cache = self
+            .dashboard_bucket_cache(
+                &window_specs,
+                &hourly_specs,
+                &daily_specs,
+                &external_pool_index,
+            )
+            .await?;
+        let mut windows = Vec::with_capacity(window_specs.len());
+        for spec in &window_specs {
+            windows.push(self.dashboard_window_from_cache(
+                spec,
+                high_cache_threshold,
+                &external_pool_index,
+                &bucket_cache,
+            ));
+        }
+
+        let has_window_data = windows
+            .iter()
+            .any(|window| window.summary.total_requests > 0);
+        if lifetime_requests > 0 && !has_window_data {
+            return Ok(None);
+        }
+
         let top = UsageDashboardTop {
             window_key: "lifetime".to_string(),
             models: self
@@ -816,20 +1010,13 @@ impl RedisStore {
                 .await?,
         };
 
-        let has_window_data = windows
-            .iter()
-            .any(|window| window.summary.total_requests > 0);
-        if lifetime_requests > 0 && !has_window_data {
-            return Ok(None);
-        }
-
         Ok(Some(UsageDashboardResponse {
             generated_at: now.to_rfc3339(),
             timezone,
             windows,
             series: UsageDashboardSeries {
-                hourly_24h: self.dashboard_series_from_redis(&hourly_specs).await?,
-                daily_7d: self.dashboard_series_from_redis(&daily_specs).await?,
+                hourly_24h: self.dashboard_series_from_cache(&hourly_specs, &bucket_cache),
+                daily_7d: self.dashboard_series_from_cache(&daily_specs, &bucket_cache),
             },
             top,
         }))
@@ -879,11 +1066,18 @@ impl RedisStore {
     ) -> anyhow::Result<Vec<UsageAggregate>> {
         let mut manager = self.manager.clone();
         let keys: Vec<String> = manager.zrevrange(self.key(index_key), 0, 9).await?;
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut pipe = redis::pipe();
+        for key in &keys {
+            pipe.cmd("HGETALL")
+                .arg(self.key(usage_top_metrics_key(dimension, key)));
+        }
+        let metrics_list: Vec<HashMap<String, String>> = pipe.query_async(&mut manager).await?;
         let mut items = Vec::with_capacity(keys.len());
-        for key in keys {
-            let metrics: HashMap<String, String> = manager
-                .hgetall(self.key(usage_top_metrics_key(dimension, &key)))
-                .await?;
+        for (key, metrics) in keys.into_iter().zip(metrics_list) {
             if metrics.is_empty() {
                 continue;
             }
@@ -902,122 +1096,43 @@ impl RedisStore {
         Ok(items)
     }
 
-    async fn dashboard_window_from_redis(
+    fn dashboard_window_from_cache(
         &self,
         spec: &UsageDashboardWindowSpec,
         high_cache_threshold: i32,
         external_pool_index: &[RedisExternalPoolIndexItem],
-    ) -> anyhow::Result<UsageDashboardWindow> {
-        let totals = self.dashboard_bucket_sum("global", "all", spec).await?;
-        let high_cache_requests = self
-            .dashboard_high_cache_requests(spec, high_cache_threshold)
-            .await?;
+        cache: &DashboardBucketCache,
+    ) -> UsageDashboardWindow {
+        let totals = cache.sum_bucket("global", "all", spec);
+        let high_cache_requests = cache.high_cache_requests(spec, high_cache_threshold);
         let total_requests = usage_usize(&totals, "total_requests");
         let mut summary = dashboard_summary_from_values(&totals, high_cache_requests);
-        summary.status_breakdown = self
-            .dashboard_breakdown(
-                spec,
-                "status",
-                &USAGE_STATUS_VALUES,
-                usage_status_label,
-                total_requests,
-            )
-            .await?;
-        summary.usage_source_breakdown = self
-            .dashboard_breakdown(
-                spec,
-                "usage_source",
-                &USAGE_SOURCE_VALUES,
-                usage_source_label,
-                total_requests,
-            )
-            .await?;
+        summary.status_breakdown = self.dashboard_breakdown_from_cache(
+            spec,
+            "status",
+            &USAGE_STATUS_VALUES,
+            usage_status_label,
+            total_requests,
+            cache,
+        );
+        summary.usage_source_breakdown = self.dashboard_breakdown_from_cache(
+            spec,
+            "usage_source",
+            &USAGE_SOURCE_VALUES,
+            usage_source_label,
+            total_requests,
+            cache,
+        );
         summary.external_pool_billing_by_pool = self
-            .dashboard_external_pool_billing_by_pool(spec, external_pool_index)
-            .await?;
+            .dashboard_external_pool_billing_by_pool_from_cache(spec, external_pool_index, cache);
 
-        Ok(UsageDashboardWindow {
+        UsageDashboardWindow {
             key: spec.key.clone(),
             label: spec.label.clone(),
             from: spec.from.to_rfc3339(),
             to: spec.to.to_rfc3339(),
             summary,
-        })
-    }
-
-    async fn dashboard_bucket_sum(
-        &self,
-        dimension: &str,
-        key: &str,
-        spec: &UsageDashboardWindowSpec,
-    ) -> anyhow::Result<HashMap<String, String>> {
-        let epochs = usage_dashboard_hour_epochs(spec.from, spec.to);
-        if epochs.is_empty() {
-            return Ok(HashMap::new());
         }
-
-        let mut pipe = redis::pipe();
-        for epoch in epochs {
-            pipe.cmd("HGETALL")
-                .arg(self.key(usage_dashboard_bucket_key(dimension, key, epoch)));
-        }
-        let mut manager = self.manager.clone();
-        let buckets: Vec<HashMap<String, String>> = pipe.query_async(&mut manager).await?;
-        Ok(sum_usage_hashes(buckets.into_iter()))
-    }
-
-    async fn dashboard_high_cache_requests(
-        &self,
-        spec: &UsageDashboardWindowSpec,
-        high_cache_threshold: i32,
-    ) -> anyhow::Result<usize> {
-        let epochs = usage_dashboard_hour_epochs(spec.from, spec.to);
-        if epochs.is_empty() {
-            return Ok(0);
-        }
-
-        let mut pipe = redis::pipe();
-        for epoch in epochs {
-            pipe.cmd("HGETALL")
-                .arg(self.key(usage_dashboard_cache_read_bucket_key(epoch)));
-        }
-        let mut manager = self.manager.clone();
-        let buckets: Vec<HashMap<String, String>> = pipe.query_async(&mut manager).await?;
-        Ok(buckets
-            .iter()
-            .flat_map(|bucket| bucket.iter())
-            .filter_map(|(tokens, requests)| {
-                let tokens = tokens.parse::<i32>().ok()?;
-                let requests = requests.parse::<usize>().ok()?;
-                (tokens >= high_cache_threshold).then_some(requests)
-            })
-            .sum())
-    }
-
-    async fn dashboard_breakdown(
-        &self,
-        spec: &UsageDashboardWindowSpec,
-        dimension: &str,
-        keys: &[&str],
-        label: fn(&str) -> String,
-        total_requests: usize,
-    ) -> anyhow::Result<Vec<UsageBreakdownItem>> {
-        let mut items = Vec::with_capacity(keys.len());
-        for key in keys {
-            let totals = self.dashboard_bucket_sum(dimension, key, spec).await?;
-            let requests = usage_usize(&totals, "total_requests");
-            if requests == 0 {
-                continue;
-            }
-            items.push(UsageBreakdownItem {
-                key: (*key).to_string(),
-                label: label(key),
-                requests,
-                ratio: usage_ratio(requests, total_requests),
-            });
-        }
-        items.sort_by_key(|item| std::cmp::Reverse(item.requests));
-        Ok(items)
     }
 
     async fn dashboard_external_pool_index(
@@ -1051,91 +1166,6 @@ impl RedisStore {
             .collect())
     }
 
-    async fn dashboard_external_pool_billing_by_pool(
-        &self,
-        spec: &UsageDashboardWindowSpec,
-        external_pool_index: &[RedisExternalPoolIndexItem],
-    ) -> anyhow::Result<Vec<UsageExternalPoolBillingByPool>> {
-        let epochs = usage_dashboard_hour_epochs(spec.from, spec.to);
-        if external_pool_index.is_empty() || epochs.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut pipe = redis::pipe();
-        for pool in external_pool_index {
-            for epoch in &epochs {
-                pipe.cmd("HGETALL").arg(self.key(usage_dashboard_bucket_key(
-                    "external_pool",
-                    &pool.id,
-                    *epoch,
-                )));
-            }
-        }
-        let mut manager = self.manager.clone();
-        let buckets: Vec<HashMap<String, String>> = pipe.query_async(&mut manager).await?;
-        let mut items = Vec::with_capacity(external_pool_index.len());
-        for (pool_index, pool) in external_pool_index.iter().enumerate() {
-            let start = pool_index * epochs.len();
-            let end = start + epochs.len();
-            let totals = sum_usage_hashes(buckets[start..end].iter().cloned());
-            let requests = usage_usize(&totals, "external_pool_requests");
-            if requests == 0 {
-                continue;
-            }
-            items.push(UsageExternalPoolBillingByPool {
-                pool_id: pool.id.parse::<u64>().unwrap_or(0),
-                pool_name: pool.label.clone(),
-                requests,
-                priced_requests: usage_usize(&totals, "external_pool_priced_requests"),
-                unpriced_requests: usage_usize(&totals, "external_pool_unpriced_requests"),
-                cost_floor_applied_requests: usage_usize(
-                    &totals,
-                    "external_pool_cost_floor_applied_requests",
-                ),
-                raw_cost_usd: usage_f64(&totals, "external_pool_raw_cost_usd"),
-                shaped_cost_usd: usage_f64(&totals, "external_pool_shaped_cost_usd"),
-                uplifted_cost_usd: usage_f64(&totals, "external_pool_uplifted_cost_usd"),
-                profit_usd: usage_f64(&totals, "external_pool_profit_usd"),
-                reported_cost_usd: usage_f64(&totals, "external_pool_reported_cost_usd"),
-                billable_cost_usd: usage_f64(&totals, "external_pool_billable_cost_usd"),
-                cost_floor_delta_usd: usage_f64(&totals, "external_pool_cost_floor_delta_usd"),
-            });
-        }
-        items.sort_by(|left, right| {
-            right
-                .uplifted_cost_usd
-                .partial_cmp(&left.uplifted_cost_usd)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| right.requests.cmp(&left.requests))
-                .then_with(|| left.pool_id.cmp(&right.pool_id))
-        });
-        Ok(items)
-    }
-
-    async fn dashboard_series_from_redis(
-        &self,
-        specs: &[UsageDashboardWindowSpec],
-    ) -> anyhow::Result<Vec<UsageSeriesPoint>> {
-        let mut points = Vec::with_capacity(specs.len());
-        for spec in specs {
-            let totals = self.dashboard_bucket_sum("global", "all", spec).await?;
-            points.push(UsageSeriesPoint {
-                key: spec.key.clone(),
-                label: spec.label.clone(),
-                from: spec.from.to_rfc3339(),
-                to: spec.to.to_rfc3339(),
-                requests: usage_usize(&totals, "total_requests"),
-                success_requests: usage_usize(&totals, "success_requests"),
-                error_requests: usage_usize(&totals, "error_requests"),
-                total_input_tokens: usage_i64(&totals, "total_input_tokens"),
-                billable_input_tokens: usage_i64(&totals, "billable_input_tokens"),
-                total_output_tokens: usage_i64(&totals, "total_output_tokens"),
-                total_estimated_cost_usd: usage_f64(&totals, "total_estimated_cost_usd"),
-            });
-        }
-        Ok(points)
-    }
-
     async fn dashboard_top_aggregates(
         &self,
         index_key: &str,
@@ -1143,11 +1173,18 @@ impl RedisStore {
     ) -> anyhow::Result<Vec<UsageTopAggregate>> {
         let mut manager = self.manager.clone();
         let keys: Vec<String> = manager.zrevrange(self.key(index_key), 0, 9).await?;
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut pipe = redis::pipe();
+        for key in &keys {
+            pipe.cmd("HGETALL")
+                .arg(self.key(usage_dashboard_top_metrics_key(dimension, key)));
+        }
+        let metrics_list: Vec<HashMap<String, String>> = pipe.query_async(&mut manager).await?;
         let mut items = Vec::with_capacity(keys.len());
-        for key in keys {
-            let metrics: HashMap<String, String> = manager
-                .hgetall(self.key(usage_dashboard_top_metrics_key(dimension, &key)))
-                .await?;
+        for (key, metrics) in keys.into_iter().zip(metrics_list) {
             if metrics.is_empty() {
                 continue;
             }
@@ -3229,26 +3266,87 @@ fn dashboard_summary_from_values(
     }
 }
 
-fn sum_usage_hashes(
-    buckets: impl Iterator<Item = HashMap<String, String>>,
+fn sum_usage_hash_refs<'a>(
+    buckets: impl Iterator<Item = &'a HashMap<String, String>>,
 ) -> HashMap<String, String> {
     let mut totals: HashMap<String, String> = HashMap::new();
     for bucket in buckets {
         for (key, value) in bucket {
             if key == "duration_ms_max" {
-                let current = usage_i64(&totals, &key);
+                let current = usage_i64(&totals, key);
                 let candidate = value.parse::<i64>().unwrap_or(0).max(0);
-                totals.insert(key, current.max(candidate).to_string());
-            } else if usage_hash_field_is_float(&key) {
-                let next = usage_f64(&totals, &key) + value.parse::<f64>().unwrap_or(0.0);
-                totals.insert(key, next.to_string());
+                totals.insert(key.clone(), current.max(candidate).to_string());
+            } else if usage_hash_field_is_float(key) {
+                let next = usage_f64(&totals, key) + value.parse::<f64>().unwrap_or(0.0);
+                totals.insert(key.clone(), next.to_string());
             } else {
-                let next = usage_i64(&totals, &key) + value.parse::<i64>().unwrap_or(0);
-                totals.insert(key, next.max(0).to_string());
+                let next = usage_i64(&totals, key) + value.parse::<i64>().unwrap_or(0);
+                totals.insert(key.clone(), next.max(0).to_string());
             }
         }
     }
     totals
+}
+
+fn collect_dashboard_window_bucket_keys(
+    suffixes: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    spec: &UsageDashboardWindowSpec,
+    external_pool_index: &[RedisExternalPoolIndexItem],
+) {
+    for epoch in usage_dashboard_hour_epochs(spec.from, spec.to) {
+        push_dashboard_bucket_suffix(
+            suffixes,
+            seen,
+            usage_dashboard_bucket_key("global", "all", epoch),
+        );
+        push_dashboard_bucket_suffix(suffixes, seen, usage_dashboard_cache_read_bucket_key(epoch));
+        for status in USAGE_STATUS_VALUES {
+            push_dashboard_bucket_suffix(
+                suffixes,
+                seen,
+                usage_dashboard_bucket_key("status", status, epoch),
+            );
+        }
+        for source in USAGE_SOURCE_VALUES {
+            push_dashboard_bucket_suffix(
+                suffixes,
+                seen,
+                usage_dashboard_bucket_key("usage_source", source, epoch),
+            );
+        }
+        for pool in external_pool_index {
+            push_dashboard_bucket_suffix(
+                suffixes,
+                seen,
+                usage_dashboard_bucket_key("external_pool", &pool.id, epoch),
+            );
+        }
+    }
+}
+
+fn collect_dashboard_global_bucket_keys(
+    suffixes: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    spec: &UsageDashboardWindowSpec,
+) {
+    for epoch in usage_dashboard_hour_epochs(spec.from, spec.to) {
+        push_dashboard_bucket_suffix(
+            suffixes,
+            seen,
+            usage_dashboard_bucket_key("global", "all", epoch),
+        );
+    }
+}
+
+fn push_dashboard_bucket_suffix(
+    suffixes: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    suffix: String,
+) {
+    if seen.insert(suffix.clone()) {
+        suffixes.push(suffix);
+    }
 }
 
 fn usage_hash_field_is_float(key: &str) -> bool {
@@ -3672,6 +3770,13 @@ mod tests {
         }
     }
 
+    fn assert_f64_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 0.000_000_001,
+            "expected {expected}, got {actual}"
+        );
+    }
+
     #[tokio::test]
     async fn redis_json_round_trip_and_delete() {
         let Some(config) = test_config() else {
@@ -3781,20 +3886,20 @@ mod tests {
         assert_eq!(last24h.summary.high_cache_requests, 1);
         assert_eq!(last24h.summary.p95_duration_ms, 50);
         assert_eq!(last24h.summary.external_pool_billing.requests, 1);
-        assert_eq!(last24h.summary.external_pool_billing.raw_cost_usd, 0.10);
-        assert_eq!(
+        assert_f64_close(last24h.summary.external_pool_billing.raw_cost_usd, 0.10);
+        assert_f64_close(
             last24h.summary.external_pool_billing.uplifted_cost_usd,
-            0.42
+            0.42,
         );
-        assert_eq!(last24h.summary.external_pool_billing.profit_usd, 0.32);
+        assert_f64_close(last24h.summary.external_pool_billing.profit_usd, 0.32);
         assert_eq!(last24h.summary.external_pool_billing_by_pool.len(), 1);
         let pool_billing = &last24h.summary.external_pool_billing_by_pool[0];
         assert_eq!(pool_billing.pool_id, 42);
         assert_eq!(pool_billing.pool_name, "backup-a");
         assert_eq!(pool_billing.requests, 1);
-        assert_eq!(pool_billing.raw_cost_usd, 0.10);
-        assert_eq!(pool_billing.uplifted_cost_usd, 0.42);
-        assert_eq!(pool_billing.profit_usd, 0.32);
+        assert_f64_close(pool_billing.raw_cost_usd, 0.10);
+        assert_f64_close(pool_billing.uplifted_cost_usd, 0.42);
+        assert_f64_close(pool_billing.profit_usd, 0.32);
         assert_eq!(last24h.summary.status_breakdown.len(), 2);
         assert!(
             last24h
@@ -3810,7 +3915,7 @@ mod tests {
                 .series
                 .hourly_24h
                 .iter()
-                .any(|point| point.requests == 2)
+                .any(|point| point.requests == 3)
         );
 
         let records = store
@@ -3852,6 +3957,36 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn redis_usage_dashboard_stale_summary_without_window_buckets_returns_none() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+
+        let store = RedisStore::connect(&config).await.unwrap();
+        store.clear_usage_summary().await.unwrap();
+
+        let mut manager = store.manager.clone();
+        let inserted: i64 = redis::cmd("HSET")
+            .arg(store.key(USAGE_SUMMARY_TOTALS_KEY))
+            .arg("total_requests")
+            .arg(12i64)
+            .query_async(&mut manager)
+            .await
+            .unwrap();
+        assert_eq!(inserted, 1);
+
+        assert!(
+            store
+                .usage_dashboard(Some("UTC"), 500)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store.clear_usage_summary().await.unwrap();
     }
 
     #[tokio::test]

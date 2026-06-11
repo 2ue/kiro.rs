@@ -36,6 +36,12 @@ function billingDeltaTextClass(tone: BillingDeltaTone): string {
   return 'text-base-content/55'
 }
 
+function formatLatency(value?: number): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '-'
+  if (value < 1000) return `${formatNumber(Math.round(value))}ms`
+  return `${(value / 1000).toFixed(2)}s`
+}
+
 function sourceLabel(source: UsageSource): string {
   const labels: Record<UsageSource, string> = {
     upstream_metadata: '上游 metadata',
@@ -117,6 +123,18 @@ function formatAttemptChain(record: UsageRecord): string {
   return (record.credentialAttempts || [])
     .map((attempt) => `#${attempt.credentialId}(${attemptOutcomeLabel(attempt)})`)
     .join(' > ')
+}
+
+function formatAttemptSummary(record: UsageRecord): string {
+  const attempts = record.credentialAttempts || []
+  if (attempts.length === 0) return '无本地尝试'
+
+  const uniqueCredentialIds = new Set(attempts.map((attempt) => attempt.credentialId))
+  if (attempts.length === 1) {
+    return record.fallbackFromSticky ? '本地尝试 1 次 · sticky换号' : '本地尝试 1 次'
+  }
+  if (uniqueCredentialIds.size <= 1) return `本地尝试 ${attempts.length} 次 · 同账号重试 ${attempts.length - 1} 次`
+  return `本地尝试 ${attempts.length} 次 · 切换 ${uniqueCredentialIds.size} 个账号`
 }
 
 function formatExternalAttemptChain(record: UsageRecord): string {
@@ -405,6 +423,7 @@ export function UsagePanel() {
                   const rowReadRatio = ratio(record.cacheReadInputTokens, reportedInputTotal)
                   const rowCachedRatio = ratio(record.cacheReadInputTokens + record.cacheCreationInputTokens, reportedInputTotal)
                   const attemptChain = formatAttemptChain(record)
+                  const attemptSummary = formatAttemptSummary(record)
                   const externalAttemptChain = formatExternalAttemptChain(record)
                   const isExternal = record.routeKind === 'external_pool'
                   return (
@@ -427,7 +446,14 @@ export function UsagePanel() {
                         <div className="mt-1 flex max-w-[260px] flex-wrap items-center gap-1">
                           <Badge>{record.endpoint || '-'}</Badge>
                           {record.stickyBound && <Badge tone="secondary">sticky</Badge>}
-                          {record.fallbackFromSticky && <Badge tone="warning">fallback</Badge>}
+                          {record.fallbackFromSticky && (
+                            <Badge
+                              tone="warning"
+                              title="Sticky 绑定账号不可用或当时无法承接，调度回退到其他本地账号；调用链路展示实际上游尝试。"
+                            >
+                              sticky回退
+                            </Badge>
+                          )}
                         </div>
                       </span>
                       <span>
@@ -450,7 +476,7 @@ export function UsagePanel() {
                         <div className="text-xs text-base-content/55">
                           {formatNumber(record.durationMs)}ms
                           <span className="ml-1">
-                            / 首字 {typeof record.firstTokenLatencyMs === 'number' ? `${formatNumber(record.firstTokenLatencyMs)}ms` : '-'}
+                            / 首字 {formatLatency(record.firstTokenLatencyMs)}
                           </span>
                         </div>
                         <div className="max-w-[160px] truncate text-xs text-base-content/55" title={record.pricingModel || ''}>
@@ -462,10 +488,10 @@ export function UsagePanel() {
                           <button
                             type="button"
                             className="max-w-[220px] truncate text-left text-xs font-medium text-primary hover:underline"
-                            title={attemptChain}
+                            title={`${attemptSummary} · ${attemptChain}`}
                             onClick={() => setSelectedRecord(record)}
                           >
-                            {attemptChain}
+                            {attemptSummary}
                           </button>
                         ) : (
                           <span className="text-xs text-base-content/40">-</span>
@@ -514,6 +540,7 @@ export function UsagePanel() {
               const rowReadRatio = ratio(record.cacheReadInputTokens, reportedInputTotal)
               const rowCachedRatio = ratio(record.cacheReadInputTokens + record.cacheCreationInputTokens, reportedInputTotal)
               const attemptChain = formatAttemptChain(record)
+              const attemptSummary = formatAttemptSummary(record)
               const externalAttemptChain = formatExternalAttemptChain(record)
               const isExternal = record.routeKind === 'external_pool'
               return (
@@ -537,7 +564,14 @@ export function UsagePanel() {
                           </span>
                           <Badge>{record.endpoint || '-'}</Badge>
                           {record.stickyBound && <Badge tone="secondary">sticky</Badge>}
-                          {record.fallbackFromSticky && <Badge tone="warning">fallback</Badge>}
+                          {record.fallbackFromSticky && (
+                            <Badge
+                              tone="warning"
+                              title="Sticky 绑定账号不可用或当时无法承接，调度回退到其他本地账号；调用链路展示实际上游尝试。"
+                            >
+                              sticky回退
+                            </Badge>
+                          )}
                         </div>
                       </div>
                       <div className="flex shrink-0 flex-wrap items-center gap-2 text-sm">
@@ -548,7 +582,7 @@ export function UsagePanel() {
                         <div className="text-right">
                           <div className="font-semibold">{formatNumber(record.durationMs)}ms</div>
                           <div className="text-xs text-base-content/50">
-                            首字 {typeof record.firstTokenLatencyMs === 'number' ? `${formatNumber(record.firstTokenLatencyMs)}ms` : '-'}
+                            首字 {formatLatency(record.firstTokenLatencyMs)}
                           </div>
                         </div>
                         <Button type="button" variant="outline" size="xs" onClick={() => setSelectedRecord(record)} title="查看 usage 口径和详情">
@@ -572,10 +606,10 @@ export function UsagePanel() {
                           <button
                             type="button"
                             className="mt-1 max-w-full truncate text-left text-xs font-medium text-primary hover:underline"
-                            title={attemptChain}
+                            title={`${attemptSummary} · ${attemptChain}`}
                             onClick={() => setSelectedRecord(record)}
                           >
-                            调用链路 {attemptChain}
+                            调用链路 {attemptSummary}
                           </button>
                         )}
                         {externalAttemptChain && (
@@ -670,9 +704,14 @@ function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: () => vo
   const startCleanup = useStartUsageCleanup()
   const cancelCleanup = useCancelUsageCleanup()
 
-  const parsedOlderThanDays = parseCleanupInteger(olderThanDays, 7, 1)
+  const parsedOlderThanDays = parseCleanupInteger(olderThanDays, 7, 0)
   const parsedBatchSize = parseCleanupInteger(batchSize, 1000, 1)
   const parsedPauseMs = parseCleanupInteger(pauseMs, 100, 0)
+  const cleanupRangeText = (cutoffLabel: string) => (
+    parsedOlderThanDays === 0
+      ? `${cutoffLabel}早于任务启动时刻（清理当时之前全部匹配记录）`
+      : `${cutoffLabel}早于 ${parsedOlderThanDays} 天`
+  )
   const payload = (): UsageCleanupRequest => ({
     mode,
     olderThanDays: parsedOlderThanDays,
@@ -695,7 +734,7 @@ function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: () => vo
   const start = () => {
     const cutoffLabel = mode === 'hard_delete' ? '删除时间' : '创建时间'
     const confirmed = confirm(
-      `确定开始${cleanupModeLabel(mode)}？\n\n范围：${cutoffLabel}早于 ${parsedOlderThanDays} 天\n每批：${formatNumber(parsedBatchSize)} 条\n系统会持续分批执行，直到没有更多匹配记录或达到内部安全上限 ${formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批。\n\n清理只影响使用记录明细列表，已累计的顶部统计和 Dashboard rollup 会保留。`
+      `确定开始${cleanupModeLabel(mode)}？\n\n范围：${cleanupRangeText(cutoffLabel)}\n每批：${formatNumber(parsedBatchSize)} 条\n系统会持续分批执行，直到没有更多匹配记录或达到内部安全上限 ${formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批。\n\n清理只影响使用记录明细列表，已累计的顶部统计和 Dashboard rollup 会保留。`
     )
     if (!confirmed) return
 
@@ -734,10 +773,14 @@ function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: () => vo
               <Select.Option value="hard_delete">硬删除已软删记录</Select.Option>
             </Select>
           </label>
-          <label className="form-control">
-            <span className="label-text mb-1 text-xs text-base-content/55">{mode === 'hard_delete' ? '删除时间早于多少天' : '创建时间早于多少天'}</span>
+          <div className="form-control">
+            <span className="label-text mb-1 flex items-center justify-between gap-2 text-xs text-base-content/55">
+              <span>{mode === 'hard_delete' ? '删除时间早于多少天' : '创建时间早于多少天'}</span>
+              <Button type="button" variant="outline" size="xs" onClick={() => setOlderThanDays('0')}>全部历史</Button>
+            </span>
             <Input bordered size="sm" value={olderThanDays} onChange={(event) => setOlderThanDays(event.target.value)} inputMode="numeric" />
-          </label>
+            <span className="mt-1 text-[0.68rem] text-base-content/45">填 0 表示以任务启动时刻为 cutoff，清理当时之前全部匹配记录。</span>
+          </div>
           <label className="form-control">
             <span className="label-text mb-1 text-xs text-base-content/55">每批数量</span>
             <Input bordered size="sm" value={batchSize} onChange={(event) => setBatchSize(event.target.value)} inputMode="numeric" />
@@ -815,7 +858,7 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
             <Detail label="估算费用" value={`${formatUsd(record.estimatedCostUsd || 0)} ${record.pricingAvailable ? record.pricingModel || 'priced' : 'unpriced'}`} />
             <Detail
               label="首字 token"
-              value={typeof record.firstTokenLatencyMs === 'number' ? `${formatNumber(record.firstTokenLatencyMs)}ms` : '-'}
+              value={formatLatency(record.firstTokenLatencyMs)}
             />
           </div>
           <div className="rounded-box border border-base-300 bg-base-200/50 p-3 text-sm">
@@ -887,7 +930,10 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
           )}
           {(record.credentialAttempts || []).length > 0 && (
             <div>
-              <div className="mb-2 text-sm font-medium">调用链路</div>
+              <div className="mb-2 flex flex-wrap items-center gap-2 text-sm">
+                <span className="font-medium">调用链路</span>
+                <Badge tone="secondary">{formatAttemptSummary(record)}</Badge>
+              </div>
               <div className="mb-2 rounded-box border border-base-300 bg-base-200 px-3 py-2 font-mono text-xs">{formatAttemptChain(record)}</div>
               <div className="table-panel">
                 <Table size="sm" className="data-table min-w-[760px]">
@@ -910,7 +956,7 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
                         </span>
                         <span>{attempt.statusText || attempt.status || '-'}</span>
                         <span>{attemptActionLabel(attempt.action)}</span>
-                        <span className="text-right">{formatNumber(attempt.durationMs)}ms</span>
+                        <span className="text-right">{formatLatency(attempt.durationMs)}</span>
                         <span><div className="max-w-[320px] truncate" title={attempt.errorMessage || attempt.errorType || ''}>{attempt.errorMessage || attempt.errorType || '-'}</div></span>
                       </Table.Row>
                     ))}
@@ -943,7 +989,7 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
                         </span>
                         <span>{attempt.status || '-'}</span>
                         <span>{attemptActionLabel(attempt.action)}</span>
-                        <span className="text-right">{formatNumber(attempt.durationMs)}ms</span>
+                        <span className="text-right">{formatLatency(attempt.durationMs)}</span>
                         <span><div className="max-w-[320px] truncate" title={attempt.errorMessage || attempt.errorType || ''}>{attempt.errorMessage || attempt.errorType || '-'}</div></span>
                       </Table.Row>
                     ))}

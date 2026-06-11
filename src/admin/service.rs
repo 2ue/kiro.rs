@@ -92,6 +92,11 @@ impl CredentialStatusBuildOptions {
         include_account_info: false,
         include_cost_summary: false,
     };
+
+    const WITH_COST_SUMMARY: Self = Self {
+        include_account_info: false,
+        include_cost_summary: true,
+    };
 }
 
 /// 缓存的账号信息条目（含时间戳）
@@ -720,7 +725,7 @@ impl AdminService {
             global_max_concurrent_requests,
             max_queued_requests,
             credentials,
-        ) = self.credential_status_items(CredentialStatusBuildOptions::LIGHT);
+        ) = self.credential_status_items(CredentialStatusBuildOptions::WITH_COST_SUMMARY);
 
         CredentialsStatusResponse {
             total,
@@ -752,7 +757,7 @@ impl AdminService {
             global_max_concurrent_requests,
             max_queued_requests,
             credentials,
-        ) = self.credential_status_items(CredentialStatusBuildOptions::LIGHT);
+        ) = self.credential_status_items(CredentialStatusBuildOptions::WITH_COST_SUMMARY);
         let filtered: Vec<_> = credentials
             .into_iter()
             .filter(|credential| credential_matches_query(credential, &query))
@@ -3502,6 +3507,7 @@ fn email_key(email: &str) -> String {
 fn normalize_usage_cleanup_request(
     request: UsageCleanupRequest,
 ) -> Result<UsageCleanupPlan, AdminServiceError> {
+    let now = Utc::now();
     let cutoff = if let Some(value) = request
         .cutoff_before
         .as_deref()
@@ -3518,20 +3524,15 @@ fn normalize_usage_cleanup_request(
             .with_timezone(&Utc)
     } else {
         let days = request.older_than_days.unwrap_or(7);
-        if days == 0 {
-            return Err(AdminServiceError::InvalidCredential(
-                "olderThanDays 必须大于 0".to_string(),
-            ));
-        }
         if days > 3650 {
             return Err(AdminServiceError::InvalidCredential(
                 "olderThanDays 不能超过 3650".to_string(),
             ));
         }
-        Utc::now() - ChronoDuration::days(days as i64)
+        now - ChronoDuration::days(days as i64)
     };
 
-    if cutoff >= Utc::now() {
+    if cutoff > now {
         return Err(AdminServiceError::InvalidCredential(
             "cutoffBefore 必须早于当前时间".to_string(),
         ));
@@ -3770,14 +3771,19 @@ mod tests {
     }
 
     #[test]
-    fn usage_cleanup_request_rejects_unsafe_bounds() {
+    fn usage_cleanup_request_zero_days_uses_execution_cutoff() {
         let mut zero_days = cleanup_request();
         zero_days.older_than_days = Some(0);
-        assert!(matches!(
-            normalize_usage_cleanup_request(zero_days),
-            Err(AdminServiceError::InvalidCredential(_))
-        ));
+        let before = Utc::now();
+        let plan = normalize_usage_cleanup_request(zero_days).expect("valid zero-day cleanup");
+        let after = Utc::now();
 
+        assert!(plan.cutoff >= before);
+        assert!(plan.cutoff <= after);
+    }
+
+    #[test]
+    fn usage_cleanup_request_rejects_unsafe_bounds() {
         let mut large_batch = cleanup_request();
         large_batch.batch_size = Some(5001);
         assert!(matches!(

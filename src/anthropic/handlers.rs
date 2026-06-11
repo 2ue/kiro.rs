@@ -911,6 +911,31 @@ impl RequestUsageContext {
             })
             .unwrap_or(usage)
     }
+
+    fn ensure_reported_usage_for_record(
+        &self,
+        usage: super::cache::CacheUsage,
+        usage_source: UsageSource,
+    ) -> super::cache::CacheUsage {
+        if usage_source != UsageSource::LocalPromptCache
+            || self.simulation_mode != PromptCacheSimulationMode::HighCache
+        {
+            return usage;
+        }
+
+        let Some(policy) = self.reported_cache_usage_policy.clone() else {
+            return usage;
+        };
+
+        if policy.should_rewrite_local_prompt_cache_usage(usage) {
+            usage.with_reported_cache_usage_policy_and_raw(
+                policy,
+                super::cache::RawUsage::uncached(self.input_tokens, usage.output_tokens),
+            )
+        } else {
+            usage
+        }
+    }
 }
 
 fn is_first_token_output_event(event: &SseEvent) -> bool {
@@ -1174,6 +1199,16 @@ impl CredentialUsageContext {
         self.record_success(reported_usage, usage_source, context_estimated);
     }
 
+    fn final_reported_usage_for_stream(
+        &self,
+        final_usage: super::cache::CacheUsage,
+        metadata_usage: Option<&crate::kiro::model::events::MetadataTokenUsage>,
+        context_estimated: bool,
+    ) -> super::cache::CacheUsage {
+        let usage_source = self.usage_source(&final_usage, metadata_usage, context_estimated);
+        self.final_reported_usage_for_success(final_usage, usage_source)
+    }
+
     fn record_stream_failure_from_context(
         &self,
         status: UsageRecordStatus,
@@ -1215,6 +1250,9 @@ impl CredentialUsageContext {
         usage_source: UsageSource,
         _context_estimated: bool,
     ) {
+        let usage = self
+            .request
+            .ensure_reported_usage_for_record(usage, usage_source);
         self.record(
             UsageRecordStatus::Success,
             usage,
@@ -3285,18 +3323,12 @@ fn create_sse_stream(
                                 ctx.generate_final_events()
                             } else {
                                 ctx.generate_final_events_with_reported_usage_mapper(
-                                    |final_usage, reported_usage, metadata_usage, context_estimated| {
-                                        let usage_source = usage_guard.context().usage_source(
-                                            &final_usage,
+                                    |final_usage, _reported_usage, metadata_usage, context_estimated| {
+                                        usage_guard.context().final_reported_usage_for_stream(
+                                            final_usage,
                                             metadata_usage,
                                             context_estimated,
-                                        );
-                                        usage_guard
-                                            .context()
-                                            .apply_creation_frequency_control(
-                                                reported_usage,
-                                                usage_source,
-                                            )
+                                        )
                                     },
                                 )
                             };
@@ -4300,7 +4332,7 @@ mod tests {
     use crate::anthropic::prompt_cache::PromptCacheTracker;
     use crate::anthropic::prompt_cache_creation_control::PromptCacheCreationController;
     use crate::anthropic::types::{Message, SystemMessage};
-    use crate::anthropic::usage::UsageRecorder;
+    use crate::anthropic::usage::{UsageRecordQuery, UsageRecorder};
     use crate::kiro::model::events::MetadataTokenUsage;
     use serde_json::json;
 
@@ -4577,7 +4609,7 @@ mod tests {
         let prompt_cache = Arc::new(PromptCacheTracker::default());
         let usage_recorder = Arc::new(UsageRecorder::new(10));
         let usage_context = RequestUsageContext {
-            recorder: usage_recorder,
+            recorder: usage_recorder.clone(),
             prompt_cache,
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -4645,6 +4677,99 @@ mod tests {
         let upstream_metadata =
             usage_context.reported_usage_for_downstream(usage, UsageSource::UpstreamMetadata);
         assert_eq!(upstream_metadata.cache_creation_input_tokens, 50_000);
+    }
+
+    #[test]
+    fn cc_local_prompt_cache_stream_reported_usage_caps_prod_like_input() {
+        let reported_usage_config = ReportedUsageConfig::default();
+        let request_input_tokens = 17_241;
+        let usage_recorder = Arc::new(UsageRecorder::new(10));
+        let usage_context = RequestUsageContext {
+            recorder: usage_recorder.clone(),
+            prompt_cache: Arc::new(PromptCacheTracker::default()),
+            prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+            pricing_catalog: Arc::new(PricingCatalog::new()),
+            request_id: "req_prod_like_cc_reported_usage".to_string(),
+            endpoint: "/cc/v1/messages",
+            stream: true,
+            model: "claude-opus-4-6".to_string(),
+            upstream_model: Some("claude-opus-4.6".to_string()),
+            model_resolution_source: None,
+            model_resolution_note: None,
+            conversation_id: Some("conversation-prod-like".to_string()),
+            prompt_cache_scope_conversation_id: Some("conversation-prod-like".to_string()),
+            input_tokens: request_input_tokens,
+            context_window_tokens: 200_000,
+            prompt_cache_profile: None,
+            simulation_mode: PromptCacheSimulationMode::HighCache,
+            prompt_cache_target_read_ratio: 0.99,
+            prompt_cache_token_scale: 2.0,
+            prompt_cache_max_simulated_input_tokens: 300_000,
+            prompt_cache_cap_jitter_min_tokens: 0,
+            prompt_cache_cap_jitter_max_tokens: 0,
+            prompt_cache_scale_min_input_tokens: 20_000,
+            prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+            reported_cache_usage_policy: reported_cache_usage_policy(
+                "/cc/v1/messages",
+                PromptCacheSimulationMode::HighCache,
+                &reported_usage_config,
+                7,
+            ),
+            simulated_usage: Some(cache::CacheSimulation {
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 36_109,
+                cache_creation_5m_input_tokens: 0,
+                cache_creation_1h_input_tokens: 0,
+                target_cache_ratio: Some(0.99),
+                amplification: None,
+            }),
+            simulated_source: Some(UsageSource::LocalPromptCache),
+            payload_breakdown: None,
+            payload_guard_report: None,
+            route_subtype_override: None,
+            fallback_reason: None,
+            local_preflight: None,
+            external_attempts: Vec::new(),
+            started_at: Instant::now(),
+            first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+        };
+        let credential_usage =
+            usage_context.attach_credential(Some(131), None, false, false, Vec::new());
+        let prod_like_usage = CacheUsage {
+            total_input_tokens: 57_499,
+            input_tokens: 21_390,
+            output_tokens: 6,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 36_109,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+
+        let reported =
+            credential_usage.final_reported_usage_for_stream(prod_like_usage, None, true);
+
+        assert!((1..=96).contains(&reported.input_tokens));
+        assert_eq!(reported.output_tokens, 6);
+        assert_eq!(reported.cache_creation_input_tokens, 0);
+        assert_eq!(
+            reported.cache_read_input_tokens,
+            prod_like_usage
+                .cache_read_input_tokens
+                .saturating_add(request_input_tokens.saturating_sub(reported.input_tokens))
+        );
+
+        credential_usage.record_success(prod_like_usage, UsageSource::LocalPromptCache, true);
+        let records = usage_recorder.query(UsageRecordQuery::default());
+        assert_eq!(records.total, 1);
+        let record = records.records.first().expect("usage record should exist");
+        assert!((1..=96).contains(&record.compat_input_tokens));
+        assert_eq!(record.output_tokens, 6);
+        assert_eq!(
+            record.cache_read_input_tokens,
+            prod_like_usage
+                .cache_read_input_tokens
+                .saturating_add(request_input_tokens.saturating_sub(record.compat_input_tokens))
+        );
     }
 
     #[test]

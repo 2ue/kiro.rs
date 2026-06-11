@@ -44,6 +44,12 @@ function formatNumber(value: number): string {
   return new Intl.NumberFormat('zh-CN').format(value)
 }
 
+function formatLatency(value?: number): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '-'
+  if (value < 1000) return `${formatNumber(Math.round(value))}ms`
+  return `${(value / 1000).toFixed(2)}s`
+}
+
 function formatPercent(value: number): string {
   if (!Number.isFinite(value)) return '-'
   return `${(value * 100).toFixed(1)}%`
@@ -198,6 +204,18 @@ function formatAttemptChain(record: UsageRecord): string {
   return attempts
     .map((attempt) => `#${attempt.credentialId}(${attemptOutcomeLabel(attempt)})`)
     .join(' > ')
+}
+
+function formatAttemptSummary(record: UsageRecord): string {
+  const attempts = record.credentialAttempts || []
+  if (attempts.length === 0) return '无本地尝试'
+
+  const uniqueCredentialIds = new Set(attempts.map((attempt) => attempt.credentialId))
+  if (attempts.length === 1) {
+    return record.fallbackFromSticky ? '本地尝试 1 次 · sticky换号' : '本地尝试 1 次'
+  }
+  if (uniqueCredentialIds.size <= 1) return `本地尝试 ${attempts.length} 次 · 同账号重试 ${attempts.length - 1} 次`
+  return `本地尝试 ${attempts.length} 次 · 切换 ${uniqueCredentialIds.size} 个账号`
 }
 
 function formatExternalAttemptChain(record: UsageRecord): string {
@@ -651,6 +669,7 @@ export function UsageRecordsPanel() {
                       reportedInputTotal
                     )
                     const attemptChain = formatAttemptChain(record)
+                    const attemptSummary = formatAttemptSummary(record)
                     const externalAttemptChain = formatExternalAttemptChain(record)
                     const isExternal = record.routeKind === 'external_pool'
 
@@ -676,9 +695,9 @@ export function UsageRecordsPanel() {
                             type="button"
                             className="mt-1 block max-w-[260px] truncate text-left text-xs text-muted-foreground underline-offset-2 hover:underline"
                             onClick={() => setSelectedRecord(record)}
-                            title={attemptChain}
+                            title={`${attemptSummary} · ${attemptChain}`}
                           >
-                            链路 {attemptChain}
+                            链路 {attemptSummary}
                           </button>
                         )}
                         {externalAttemptChain && (
@@ -708,7 +727,14 @@ export function UsageRecordsPanel() {
                         <div className="max-w-[220px] truncate">{record.conversationId || '-'}</div>
                         <div className="mt-1 flex flex-wrap gap-1">
                           {record.stickyBound && <Badge variant="secondary">sticky</Badge>}
-                          {record.fallbackFromSticky && <Badge variant="warning">fallback</Badge>}
+                          {record.fallbackFromSticky && (
+                            <Badge
+                              variant="warning"
+                              title="Sticky 绑定账号不可用或当时无法承接，调度回退到其他本地账号；调用链路展示实际上游尝试。"
+                            >
+                              sticky回退
+                            </Badge>
+                          )}
                         </div>
                       </td>
                       <td className="px-3 py-2">
@@ -762,7 +788,7 @@ export function UsageRecordsPanel() {
                           </Button>
                         </div>
                         <div className="text-xs text-muted-foreground">
-                          首字 {typeof record.firstTokenLatencyMs === 'number' ? `${formatNumber(record.firstTokenLatencyMs)}ms` : '-'}
+                          首字 {formatLatency(record.firstTokenLatencyMs)}
                         </div>
                       </td>
                     </tr>
@@ -880,11 +906,7 @@ export function UsageRecordsPanel() {
                 </div>
                 <div>
                   <div className="text-xs text-muted-foreground">首字 token</div>
-                  <div>
-                    {typeof selectedRecord.firstTokenLatencyMs === 'number'
-                      ? `${formatNumber(selectedRecord.firstTokenLatencyMs)}ms`
-                      : '-'}
-                  </div>
+                  <div>{formatLatency(selectedRecord.firstTokenLatencyMs)}</div>
                 </div>
               </div>
               <div className="rounded-md border bg-muted/30 p-3 text-sm">
@@ -958,7 +980,10 @@ export function UsageRecordsPanel() {
               )}
               {(selectedRecord.credentialAttempts || []).length > 0 && (
                 <div>
-                  <div className="mb-2 text-sm font-medium">调用链路</div>
+                  <div className="mb-2 flex flex-wrap items-center gap-2 text-sm">
+                    <span className="font-medium">调用链路</span>
+                    <Badge variant="secondary">{formatAttemptSummary(selectedRecord)}</Badge>
+                  </div>
                   <div className="mb-2 rounded-md border bg-muted px-3 py-2 font-mono text-xs">
                     {formatAttemptChain(selectedRecord)}
                   </div>
@@ -993,7 +1018,7 @@ export function UsageRecordsPanel() {
                             </td>
                             <td className="px-3 py-2">{attempt.statusText || attempt.status || '-'}</td>
                             <td className="px-3 py-2">{attemptActionLabel(attempt.action)}</td>
-                            <td className="px-3 py-2 text-right">{formatNumber(attempt.durationMs)}ms</td>
+                            <td className="px-3 py-2 text-right">{formatLatency(attempt.durationMs)}</td>
                             <td className="px-3 py-2">
                               <div className="max-w-[280px] truncate" title={attempt.errorMessage || attempt.errorType || ''}>
                                 {attempt.errorMessage || attempt.errorType || '-'}
@@ -1036,7 +1061,7 @@ export function UsageRecordsPanel() {
                             </td>
                             <td className="px-3 py-2">{attempt.status || '-'}</td>
                             <td className="px-3 py-2">{attemptActionLabel(attempt.action)}</td>
-                            <td className="px-3 py-2 text-right">{formatNumber(attempt.durationMs)}ms</td>
+                            <td className="px-3 py-2 text-right">{formatLatency(attempt.durationMs)}</td>
                             <td className="px-3 py-2">
                               <div className="max-w-[280px] truncate" title={attempt.errorMessage || attempt.errorType || ''}>
                                 {attempt.errorMessage || attempt.errorType || '-'}
@@ -1113,9 +1138,14 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
   const startCleanup = useStartUsageCleanup()
   const cancelCleanup = useCancelUsageCleanup()
 
-  const parsedOlderThanDays = parseCleanupInteger(olderThanDays, 7, 1)
+  const parsedOlderThanDays = parseCleanupInteger(olderThanDays, 7, 0)
   const parsedBatchSize = parseCleanupInteger(batchSize, 1000, 1)
   const parsedPauseMs = parseCleanupInteger(pauseMs, 100, 0)
+  const cleanupRangeText = (cutoffLabel: string) => (
+    parsedOlderThanDays === 0
+      ? `${cutoffLabel}早于任务启动时刻（清理当时之前全部匹配记录）`
+      : `${cutoffLabel}早于 ${parsedOlderThanDays} 天`
+  )
   const payload = (): UsageCleanupRequest => ({
     mode,
     olderThanDays: parsedOlderThanDays,
@@ -1138,7 +1168,7 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
   const start = () => {
     const cutoffLabel = mode === 'hard_delete' ? '删除时间' : '创建时间'
     const confirmed = confirm(
-      `确定开始${cleanupModeLabel(mode)}？\n\n范围：${cutoffLabel}早于 ${parsedOlderThanDays} 天\n每批：${formatNumber(parsedBatchSize)} 条\n系统会持续分批执行，直到没有更多匹配记录或达到内部安全上限 ${formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批。\n\n清理只影响使用记录明细列表，已累计的顶部统计和 Dashboard rollup 会保留。`
+      `确定开始${cleanupModeLabel(mode)}？\n\n范围：${cleanupRangeText(cutoffLabel)}\n每批：${formatNumber(parsedBatchSize)} 条\n系统会持续分批执行，直到没有更多匹配记录或达到内部安全上限 ${formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批。\n\n清理只影响使用记录明细列表，已累计的顶部统计和 Dashboard rollup 会保留。`
     )
     if (!confirmed) return
 
@@ -1180,10 +1210,14 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
                 <option value="hard_delete">硬删除已软删记录</option>
               </select>
             </label>
-            <label className="space-y-1">
-              <span className="text-xs text-muted-foreground">{mode === 'hard_delete' ? '删除时间早于多少天' : '创建时间早于多少天'}</span>
+            <div className="space-y-1">
+              <span className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                <span>{mode === 'hard_delete' ? '删除时间早于多少天' : '创建时间早于多少天'}</span>
+                <Button type="button" variant="outline" size="sm" className="h-7 px-2 text-xs" onClick={() => setOlderThanDays('0')}>全部历史</Button>
+              </span>
               <Input value={olderThanDays} onChange={(event) => setOlderThanDays(event.target.value)} inputMode="numeric" />
-            </label>
+              <span className="block text-[0.68rem] text-muted-foreground">填 0 表示以任务启动时刻为 cutoff，清理当时之前全部匹配记录。</span>
+            </div>
             <label className="space-y-1">
               <span className="text-xs text-muted-foreground">每批数量</span>
               <Input value={batchSize} onChange={(event) => setBatchSize(event.target.value)} inputMode="numeric" />
