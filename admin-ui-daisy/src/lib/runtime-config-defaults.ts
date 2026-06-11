@@ -37,6 +37,9 @@ export function pathPolicy(
 ): ReportedUsagePathPolicy {
   return {
     enabled,
+    finalCacheReadMaxTokens: 700000,
+    finalCacheReadJitterMinTokens: 0,
+    finalCacheReadJitterMaxTokens: 0,
     input,
     output: rawFieldPolicy(),
     cacheRead: preserveFieldPolicy(),
@@ -263,8 +266,21 @@ function normalizeFieldPolicy(policy: ReportedUsageFieldPolicy): ReportedUsageFi
 }
 
 function normalizePathPolicy(policy: ReportedUsagePathPolicy): ReportedUsagePathPolicy {
+  const finalCacheReadMaxTokens = toWhole(policy.finalCacheReadMaxTokens ?? 700000)
+  const finalCacheReadJitterMaxTokens =
+    finalCacheReadMaxTokens > 0
+      ? toWhole(policy.finalCacheReadJitterMaxTokens ?? 0, 0, finalCacheReadMaxTokens)
+      : 0
+  const finalCacheReadJitterMinTokens = toWhole(
+    policy.finalCacheReadJitterMinTokens ?? 0,
+    0,
+    finalCacheReadJitterMaxTokens
+  )
   return {
     ...policy,
+    finalCacheReadMaxTokens,
+    finalCacheReadJitterMinTokens,
+    finalCacheReadJitterMaxTokens,
     input: normalizeFieldPolicy(policy.input),
     output: normalizeFieldPolicy(policy.output),
     cacheRead: normalizeFieldPolicy(policy.cacheRead),

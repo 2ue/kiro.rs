@@ -362,6 +362,21 @@ pub struct ReportedUsagePathPolicy {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
+    /// 最终下游上报的 cache_read_input_tokens 上限。
+    ///
+    /// 该限制在 input 差值转入 cache read 之后执行，只向下裁剪，不会抬高小值。
+    /// 0 表示关闭最终守护。
+    #[serde(default = "default_final_cache_read_max_tokens")]
+    pub final_cache_read_max_tokens: i32,
+
+    /// 读取缓存最终上限的确定性扣减下限。
+    #[serde(default)]
+    pub final_cache_read_jitter_min_tokens: i32,
+
+    /// 读取缓存最终上限的确定性扣减上限。
+    #[serde(default)]
+    pub final_cache_read_jitter_max_tokens: i32,
+
     #[serde(default)]
     pub input: ReportedUsageFieldPolicy,
 
@@ -379,6 +394,9 @@ impl Default for ReportedUsagePathPolicy {
     fn default() -> Self {
         Self {
             enabled: true,
+            final_cache_read_max_tokens: default_final_cache_read_max_tokens(),
+            final_cache_read_jitter_min_tokens: 0,
+            final_cache_read_jitter_max_tokens: 0,
             input: ReportedUsageFieldPolicy::raw(),
             output: ReportedUsageFieldPolicy::raw(),
             cache_read: ReportedUsageFieldPolicy::preserve(),
@@ -396,8 +414,24 @@ impl ReportedUsagePathPolicy {
     }
 
     pub fn normalized(&self) -> Self {
+        let final_cache_read_max_tokens = self.final_cache_read_max_tokens.max(0);
+        let mut final_cache_read_jitter_min_tokens = self
+            .final_cache_read_jitter_min_tokens
+            .max(0)
+            .min(final_cache_read_max_tokens);
+        let final_cache_read_jitter_max_tokens = self
+            .final_cache_read_jitter_max_tokens
+            .max(0)
+            .min(final_cache_read_max_tokens);
+        if final_cache_read_jitter_min_tokens > final_cache_read_jitter_max_tokens {
+            final_cache_read_jitter_min_tokens = final_cache_read_jitter_max_tokens;
+        }
+
         Self {
             enabled: self.enabled,
+            final_cache_read_max_tokens,
+            final_cache_read_jitter_min_tokens,
+            final_cache_read_jitter_max_tokens,
             input: self.input.normalized(),
             output: self.output.normalized(),
             cache_read: self.cache_read.normalized(),
@@ -411,6 +445,31 @@ impl ReportedUsagePathPolicy {
         self.cache_read.validate(&format!("{} cacheRead", label))?;
         self.cache_creation
             .validate(&format!("{} cacheCreation", label))?;
+        if self.final_cache_read_max_tokens < 0 {
+            return Err(format!("{} finalCacheReadMaxTokens 不能小于 0", label));
+        }
+        if self.final_cache_read_jitter_min_tokens < 0
+            || self.final_cache_read_jitter_max_tokens < 0
+        {
+            return Err(format!(
+                "{} finalCacheReadJitterMinTokens 和 finalCacheReadJitterMaxTokens 不能小于 0",
+                label
+            ));
+        }
+        if self.final_cache_read_jitter_min_tokens > self.final_cache_read_jitter_max_tokens {
+            return Err(format!(
+                "{} finalCacheReadJitterMinTokens 不能大于 finalCacheReadJitterMaxTokens",
+                label
+            ));
+        }
+        if self.final_cache_read_max_tokens > 0
+            && self.final_cache_read_jitter_max_tokens > self.final_cache_read_max_tokens
+        {
+            return Err(format!(
+                "{} finalCacheReadJitterMaxTokens 不能大于 finalCacheReadMaxTokens",
+                label
+            ));
+        }
         Ok(())
     }
 }
@@ -1755,6 +1814,10 @@ fn default_reported_usage_normal_max_multiplier() -> f64 {
     1.1
 }
 
+fn default_final_cache_read_max_tokens() -> i32 {
+    700_000
+}
+
 fn normalize_reported_usage_normal_max_multiplier(value: f64) -> f64 {
     if value.is_finite() && value >= 1.0 {
         value.min(10.0)
@@ -2175,10 +2238,14 @@ mod tests {
                 "apiKey": "sk-test",
                 "reportedUsage": {
                     "default": {
+                        "finalCacheReadMaxTokens": 800000,
                         "input": { "mode": "raw" }
                     },
                     "pathOverrides": {
                         "cc": {
+                            "finalCacheReadMaxTokens": 300000,
+                            "finalCacheReadJitterMinTokens": 8000,
+                            "finalCacheReadJitterMaxTokens": 24000,
                             "input": {
                                 "mode": "sample-max",
                                 "maxTokens": 64,
@@ -2203,7 +2270,17 @@ mod tests {
                 .mode,
             ReportedUsageFieldMode::Raw
         );
+        assert_eq!(
+            config
+                .reported_usage
+                .policy_for_path("/v1/messages")
+                .final_cache_read_max_tokens,
+            800_000
+        );
         let policy = config.reported_usage.policy_for_path("/cc/v1/messages");
+        assert_eq!(policy.final_cache_read_max_tokens, 300_000);
+        assert_eq!(policy.final_cache_read_jitter_min_tokens, 8_000);
+        assert_eq!(policy.final_cache_read_jitter_max_tokens, 24_000);
         assert_eq!(policy.input.mode, ReportedUsageFieldMode::SampleMax);
         assert_eq!(policy.input.max_tokens, 64);
         assert!(policy.input.move_delta_to_cache_read);
@@ -2294,6 +2371,12 @@ mod tests {
         );
         assert_eq!(
             reported_usage
+                .policy_for_path("/v1/messages")
+                .final_cache_read_max_tokens,
+            700_000
+        );
+        assert_eq!(
+            reported_usage
                 .policy_for_path("/cc/v1/messages")
                 .input
                 .max_tokens,
@@ -2316,6 +2399,9 @@ mod tests {
         let default_policy = config.reported_usage.policy_for_path("/v1/messages");
         assert_eq!(default_policy.input.mode, ReportedUsageFieldMode::Raw);
         assert_eq!(default_policy.output.mode, ReportedUsageFieldMode::Raw);
+        assert_eq!(default_policy.final_cache_read_max_tokens, 700_000);
+        assert_eq!(default_policy.final_cache_read_jitter_min_tokens, 0);
+        assert_eq!(default_policy.final_cache_read_jitter_max_tokens, 0);
         assert_eq!(
             default_policy.cache_read.mode,
             ReportedUsageFieldMode::Preserve
@@ -2326,6 +2412,7 @@ mod tests {
         );
 
         let cc_policy = config.reported_usage.policy_for_path("/cc/v1/messages");
+        assert_eq!(cc_policy.final_cache_read_max_tokens, 700_000);
         assert_eq!(cc_policy.input.mode, ReportedUsageFieldMode::SampleMax);
         assert_eq!(cc_policy.input.max_tokens, 96);
         assert!(cc_policy.input.move_delta_to_cache_read);

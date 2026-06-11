@@ -65,6 +65,9 @@ const pathPolicy = (
   cacheCreation: ReportedUsageFieldPolicy = preserveFieldPolicy()
 ): ReportedUsagePathPolicy => ({
   enabled,
+  finalCacheReadMaxTokens: 700000,
+  finalCacheReadJitterMinTokens: 0,
+  finalCacheReadJitterMaxTokens: 0,
   input,
   output: rawFieldPolicy(),
   cacheRead: preserveFieldPolicy(),
@@ -1088,33 +1091,67 @@ function ReportedUsagePathEditor({
         </div>
       )}
       {value.enabled && (
-        <div className="grid gap-4 lg:grid-cols-2">
-          <ReportedUsageFieldEditor
-            title="输入字段改写（input_tokens）"
-            description="控制给下游和后台记录的 input_tokens。原始值表示请求输入是多少就报多少；保留计算值表示使用 high-cache 计算后的 input；采样可把 input 压到几十以内并把差值计入缓存读取。"
-            value={value.input}
-            allowMoveDelta
-            onChange={(input) => onChange({ ...value, input })}
-          />
-          <ReportedUsageFieldEditor
-            title="输出字段改写（output_tokens）"
-            description="控制给下游和后台记录的 output_tokens。默认建议使用原始值，避免本地模拟影响客户端对输出量的判断。"
-            value={value.output}
-            onChange={(output) => onChange({ ...value, output })}
-          />
-          <ReportedUsageFieldEditor
-            title="缓存读取字段改写（cache_read_input_tokens）"
-            description="控制计算完成后给下游和后台记录的 cache_read_input_tokens。保留计算值表示保留 high-cache/上游 metadata/估算后的读缓存值。"
-            value={value.cacheRead}
-            onChange={(cacheRead) => onChange({ ...value, cacheRead })}
-          />
-          <ReportedUsageFieldEditor
-            title="缓存写入字段改写（cache_creation_input_tokens）"
-            description="控制计算完成后给下游和后台记录的 cache_creation_input_tokens。/cc 可设置目标值 3000，实际会自然浮动。"
-            value={value.cacheCreation}
-            onChange={(cacheCreation) => onChange({ ...value, cacheCreation })}
-          />
-        </div>
+        <>
+          <div className="grid gap-4 lg:grid-cols-2">
+            <ReportedUsageFieldEditor
+              title="输入字段改写（input_tokens）"
+              description="控制给下游和后台记录的 input_tokens。原始值表示请求输入是多少就报多少；保留计算值表示使用 high-cache 计算后的 input；采样可把 input 压到几十以内并把差值计入缓存读取。"
+              value={value.input}
+              allowMoveDelta
+              onChange={(input) => onChange({ ...value, input })}
+            />
+            <ReportedUsageFieldEditor
+              title="输出字段改写（output_tokens）"
+              description="控制给下游和后台记录的 output_tokens。默认建议使用原始值，避免本地模拟影响客户端对输出量的判断。"
+              value={value.output}
+              onChange={(output) => onChange({ ...value, output })}
+            />
+            <ReportedUsageFieldEditor
+              title="缓存读取字段改写（cache_read_input_tokens）"
+              description="控制计算完成后给下游和后台记录的 cache_read_input_tokens。保留计算值表示保留 high-cache/上游 metadata/估算后的读缓存值。"
+              value={value.cacheRead}
+              onChange={(cacheRead) => onChange({ ...value, cacheRead })}
+            />
+            <ReportedUsageFieldEditor
+              title="缓存写入字段改写（cache_creation_input_tokens）"
+              description="控制计算完成后给下游和后台记录的 cache_creation_input_tokens。/cc 可设置目标值 3000，实际会自然浮动。"
+              value={value.cacheCreation}
+              onChange={(cacheCreation) => onChange({ ...value, cacheCreation })}
+            />
+          </div>
+          <div className="mt-4 grid gap-3 lg:grid-cols-3">
+            <PolicyNumberInput
+              title="读取缓存最终上限"
+              description="在 input 差值转入 cache_read_input_tokens 后执行，超出时只向下裁剪。填 0 表示关闭最终守护。"
+              value={value.finalCacheReadMaxTokens ?? 700000}
+              min={0}
+              suffix="tokens"
+              onChange={(finalCacheReadMaxTokens) =>
+                onChange({ ...value, finalCacheReadMaxTokens })
+              }
+            />
+            <PolicyNumberInput
+              title="最终上限扣减下限"
+              description="达到最终上限时，从上限扣减的最小 token 数。默认 0 表示不做波动。"
+              value={value.finalCacheReadJitterMinTokens ?? 0}
+              min={0}
+              suffix="tokens"
+              onChange={(finalCacheReadJitterMinTokens) =>
+                onChange({ ...value, finalCacheReadJitterMinTokens })
+              }
+            />
+            <PolicyNumberInput
+              title="最终上限扣减上限"
+              description="达到最终上限时，从上限扣减的最大 token 数；不会超过读取缓存最终上限。"
+              value={value.finalCacheReadJitterMaxTokens ?? 0}
+              min={0}
+              suffix="tokens"
+              onChange={(finalCacheReadJitterMaxTokens) =>
+                onChange({ ...value, finalCacheReadJitterMaxTokens })
+              }
+            />
+          </div>
+        </>
       )}
     </div>
   )
@@ -1156,8 +1193,21 @@ function normalizeFieldPolicy(policy: ReportedUsageFieldPolicy): ReportedUsageFi
 }
 
 function normalizePathPolicy(policy: ReportedUsagePathPolicy): ReportedUsagePathPolicy {
+  const finalCacheReadMaxTokens = toWhole(policy.finalCacheReadMaxTokens ?? 700000)
+  const finalCacheReadJitterMaxTokens =
+    finalCacheReadMaxTokens > 0
+      ? toWhole(policy.finalCacheReadJitterMaxTokens ?? 0, 0, finalCacheReadMaxTokens)
+      : 0
+  const finalCacheReadJitterMinTokens = toWhole(
+    policy.finalCacheReadJitterMinTokens ?? 0,
+    0,
+    finalCacheReadJitterMaxTokens
+  )
   return {
     ...policy,
+    finalCacheReadMaxTokens,
+    finalCacheReadJitterMinTokens,
+    finalCacheReadJitterMaxTokens,
     input: normalizeFieldPolicy(policy.input),
     output: normalizeFieldPolicy(policy.output),
     cacheRead: normalizeFieldPolicy(policy.cacheRead),

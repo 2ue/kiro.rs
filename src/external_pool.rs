@@ -2905,6 +2905,11 @@ fn project_usage_value(
             projection.output_uplift_min_tokens,
             projection.output_uplift_percent,
         );
+    let projected = projection
+        .reported_policy
+        .clone()
+        .map(|policy| policy.apply_final_cache_read_guard(projected))
+        .unwrap_or(projected);
     let projected_json = projected.to_json();
     let Some(obj) = usage.as_object_mut() else {
         return None;
@@ -3271,6 +3276,7 @@ fn usage_i32(value: &serde_json::Value, key: &str) -> i32 {
 mod tests {
     use super::*;
     use crate::anthropic::types::{Message, Metadata, SystemMessage};
+    use crate::model::config::{ReportedUsageFieldPolicy, ReportedUsagePathPolicy};
 
     #[test]
     fn pool_auto_disable_policy_can_override_global_switch() {
@@ -3937,6 +3943,37 @@ mod tests {
         assert_eq!(
             with_uplift_usage.cache_read_input_tokens,
             uplift_tokens(no_uplift_usage.cache_read_input_tokens, 25)
+        );
+    }
+
+    #[test]
+    fn usage_projection_final_cache_read_guard_runs_after_external_pool_uplift() {
+        let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
+        );
+        let mut route = test_route("claude-sonnet-4-5");
+        route.reported_usage.path_overrides.insert(
+            "/cc".to_string(),
+            ReportedUsagePathPolicy {
+                final_cache_read_max_tokens: 100,
+                input: ReportedUsageFieldPolicy::sample_input_max(1),
+                ..ReportedUsagePathPolicy::default()
+            },
+        );
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+
+        let projection = projection_context(&route, &pool, 200).expect("projection");
+        let projected = maybe_project_non_stream_usage(body, Some(&projection));
+        let reported = projected.usage_capture.reported.expect("reported usage");
+
+        assert_eq!(reported.cache_read_input_tokens, 100);
+        assert_eq!(
+            reported.total_input_tokens,
+            reported
+                .input_tokens
+                .saturating_add(reported.cache_read_input_tokens)
+                .saturating_add(reported.cache_creation_input_tokens)
         );
     }
 

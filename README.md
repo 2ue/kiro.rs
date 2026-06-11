@@ -246,6 +246,9 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `promptCacheScaleMinInputTokens` | number | `20000` | 基础输入达到该门槛后才启用 high-cache token scale，避免短测试请求被放大 |
 | `reportedUsage.default` | object | input/output 原始值，cache read/write 保留计算值 | 控制所有路径的默认 usage 上报方式，只影响响应和后台 usage record，不影响 reader 计算、本地缓存 tracker 或上游请求 |
 | `reportedUsage.pathOverrides` | object | `/na`、`/cc`、`/ha` | 按路径前缀独立覆盖默认 usage 上报策略，最长前缀优先；例如 `/cc` 会匹配 `/cc/v1/messages`，`/ha` 和 `/na` 不会继承 `/cc` 的 writer 配置 |
+| `reportedUsage.*.finalCacheReadMaxTokens` | number | `700000` | 每个路径策略最终上报的 `cache_read_input_tokens` 上限；在 input 差值转入 cache read 后执行，0 表示关闭 |
+| `reportedUsage.*.finalCacheReadJitterMinTokens` | number | `0` | 最终读取缓存上限的确定性扣减下限 |
+| `reportedUsage.*.finalCacheReadJitterMaxTokens` | number | `0` | 最终读取缓存上限的确定性扣减上限 |
 | `usageRecordLimit` | number | `5000` | 内存中保留的最近 usage 记录数量；完整 usage 记录写入 PgSQL |
 | `highCacheThreshold` | number | `10000` | Admin 统计高缓存请求的 cache read 阈值 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
@@ -309,6 +312,8 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 - `output`：控制 `output_tokens`。默认建议 `raw`，也就是直接使用上游返回的原始输出。
 - `cacheRead`：控制 `cache_read_input_tokens`。默认建议 `preserve`。
 - `cacheCreation`：控制 `cache_creation_input_tokens`。`/cc` 默认使用 `sample-target`，`targetTokens` 为 `3000`，`normalMaxMultiplier` 为 `1.2`。
+
+每个路径策略还会在所有字段改写完成后应用 `finalCacheReadMaxTokens`，默认把最终 `cache_read_input_tokens` 限制在 `700000` 以内。`finalCacheReadJitterMinTokens` / `finalCacheReadJitterMaxTokens` 可让触顶值在上限以下确定性波动；守护只会向下裁剪，不会抬高原本较小的读取缓存值。
 
 ### credentials.json
 

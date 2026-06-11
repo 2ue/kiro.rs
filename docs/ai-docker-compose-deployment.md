@@ -334,6 +334,8 @@ KIRO_RS_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强
 | `promptCacheScaleMinInputTokens` | `20000` | 控制基础输入达到多少 token 后才启用放大。 |
 | `reportedUsage.default` | input/output 原始值，cache read/write 保留计算值 | 控制所有路径的默认 input、output、cache read、cache write 上报方式。 |
 | `reportedUsage.pathOverrides` | `/na`、`/cc`、`/ha` | 控制路径前缀覆盖策略。每个前缀独立配置，最长前缀优先。 |
+| `finalCacheReadMaxTokens` | `700000` | 单个路径最终上报的 `cache_read_input_tokens` 上限，在 input 差值转入 cache read 后兜底裁剪。 |
+| `finalCacheReadJitterMinTokens` / `finalCacheReadJitterMaxTokens` | `0` | 最终读取缓存上限的确定性扣减范围，默认不波动。 |
 | `mode: "preserve"` | 默认用于 cache read/write | 保留本地 high-cache 计算后的字段值。 |
 | `mode: "raw"` | 默认用于 input/output | 使用请求和上游响应的原始字段值，不使用本地 high-cache 放大后的值。 |
 | `mode: "sample-max"` | input 可用 | 把字段采样到 `maxTokens` 以内，数值自然浮动，不固定到上限。 |

@@ -153,6 +153,9 @@ credential_id + conversation_id + model
   "reportedUsage": {
     "default": {
       "enabled": true,
+      "finalCacheReadMaxTokens": 700000,
+      "finalCacheReadJitterMinTokens": 0,
+      "finalCacheReadJitterMaxTokens": 0,
       "input": {
         "mode": "raw",
         "maxTokens": 0,
@@ -185,6 +188,9 @@ credential_id + conversation_id + model
     "pathOverrides": {
       "/na": {
         "enabled": false,
+        "finalCacheReadMaxTokens": 700000,
+        "finalCacheReadJitterMinTokens": 0,
+        "finalCacheReadJitterMaxTokens": 0,
         "input": { "mode": "raw", "maxTokens": 0, "targetTokens": 0, "normalMaxMultiplier": 1.1, "moveDeltaToCacheRead": false },
         "output": { "mode": "raw", "maxTokens": 0, "targetTokens": 0, "normalMaxMultiplier": 1.1, "moveDeltaToCacheRead": false },
         "cacheRead": { "mode": "preserve", "maxTokens": 0, "targetTokens": 0, "normalMaxMultiplier": 1.1, "moveDeltaToCacheRead": false },
@@ -192,6 +198,9 @@ credential_id + conversation_id + model
       },
       "/cc": {
         "enabled": true,
+        "finalCacheReadMaxTokens": 700000,
+        "finalCacheReadJitterMinTokens": 0,
+        "finalCacheReadJitterMaxTokens": 0,
         "input": { "mode": "sample-max", "maxTokens": 96, "targetTokens": 0, "normalMaxMultiplier": 1.1, "moveDeltaToCacheRead": true },
         "output": { "mode": "raw", "maxTokens": 0, "targetTokens": 0, "normalMaxMultiplier": 1.1, "moveDeltaToCacheRead": false },
         "cacheRead": { "mode": "preserve", "maxTokens": 0, "targetTokens": 0, "normalMaxMultiplier": 1.1, "moveDeltaToCacheRead": false },
@@ -199,6 +208,9 @@ credential_id + conversation_id + model
       },
       "/ha": {
         "enabled": true,
+        "finalCacheReadMaxTokens": 700000,
+        "finalCacheReadJitterMinTokens": 0,
+        "finalCacheReadJitterMaxTokens": 0,
         "input": { "mode": "sample-max", "maxTokens": 96, "targetTokens": 0, "normalMaxMultiplier": 1.1, "moveDeltaToCacheRead": true },
         "output": { "mode": "raw", "maxTokens": 0, "targetTokens": 0, "normalMaxMultiplier": 1.1, "moveDeltaToCacheRead": false },
         "cacheRead": { "mode": "preserve", "maxTokens": 0, "targetTokens": 0, "normalMaxMultiplier": 1.1, "moveDeltaToCacheRead": false },
@@ -323,6 +335,13 @@ credential_id + conversation_id + model
 - 当 input 被 sample 降低时，把降低的差值转入 `cache_read_input_tokens`。
 - `/cc` 和 `/ha` 默认开启这个效果，所以它们可以展示“低 input + 高 cache read”的形态。
 
+`finalCacheReadMaxTokens`：
+
+- 每个路径策略的最终读取缓存守护，默认 `700000`。
+- 在 `moveDeltaToCacheRead` 已经把 input 差值转入 `cache_read_input_tokens` 之后执行。
+- 只会向下裁剪超限的 `cache_read_input_tokens`，不会抬高原本较小的值。
+- `finalCacheReadJitterMinTokens` / `finalCacheReadJitterMaxTokens` 可配置最终上限以下的确定性扣减范围，默认 `0..0` 表示不波动。
+
 默认路径效果：
 
 - `/v1/messages`：默认策略，input/output 用 raw，cache read/write 保留本地计算。
@@ -363,7 +382,7 @@ credential_id + conversation_id + model
 }
 ```
 
-`externalPoolUsageProjectionUpliftPercent` 默认 `25`，最大按代码限制为 `200`。它只在外部池 `usageProjectionMode=current_path_policy` 时参与 cache read / cache creation 字段整形。
+`externalPoolUsageProjectionUpliftPercent` 默认 `25`，最大按代码限制为 `200`。它只在外部池 `usageProjectionMode=current_path_policy` 时参与 cache read / cache creation 字段整形；上浮完成后仍会再次应用 `finalCacheReadMaxTokens`，保证最终返回给下游的读取缓存不超过路径策略上限。
 
 `externalPoolUsageProjectionOutputUpliftMinTokens` 默认 `0`，表示输出补偿关闭。设置为正数后，只有 `output_tokens >= 该阈值` 才会触发输出补偿。
 

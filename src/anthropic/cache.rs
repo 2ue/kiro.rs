@@ -132,6 +132,7 @@ impl CacheUsage {
             }
         }
 
+        usage = policy.apply_final_cache_read_guard(usage);
         usage.total_input_tokens = usage.reported_total_input_tokens();
         usage
     }
@@ -352,9 +353,10 @@ impl ReportedCacheUsagePolicy {
         }
 
         let input = self.policy.input.normalized();
-        matches!(input.mode, ReportedUsageFieldMode::SampleMax)
+        let rewrites_input = matches!(input.mode, ReportedUsageFieldMode::SampleMax)
             && input.max_tokens > 0
-            && usage.input_tokens > input.max_tokens
+            && usage.input_tokens > input.max_tokens;
+        rewrites_input || self.should_cap_final_cache_read(usage)
     }
 
     fn reports_local_prompt_cache(&self) -> bool {
@@ -396,6 +398,12 @@ impl ReportedCacheUsagePolicy {
 
     fn input_moves_delta_to_cache_read(&self) -> bool {
         self.policy.input.move_delta_to_cache_read
+    }
+
+    fn should_cap_final_cache_read(&self, usage: CacheUsage) -> bool {
+        self.final_cache_read_effective_cap(usage)
+            .map(|cap| usage.cache_read_input_tokens.max(0) > cap)
+            .unwrap_or(false)
     }
 
     fn field_base_value(
@@ -477,6 +485,52 @@ impl ReportedCacheUsagePolicy {
         )
     }
 
+    pub fn apply_final_cache_read_guard(&self, mut usage: CacheUsage) -> CacheUsage {
+        if !self.reports_local_prompt_cache() {
+            return usage;
+        }
+        let Some(cap) = self.final_cache_read_effective_cap(usage) else {
+            return usage;
+        };
+        usage.cache_read_input_tokens = usage.cache_read_input_tokens.max(0).min(cap);
+        usage.total_input_tokens = usage.reported_total_input_tokens();
+        usage
+    }
+
+    fn final_cache_read_effective_cap(&self, usage: CacheUsage) -> Option<i32> {
+        let max_tokens = self.policy.final_cache_read_max_tokens.max(0);
+        if max_tokens <= 0 {
+            return None;
+        }
+
+        let jitter_min = self
+            .policy
+            .final_cache_read_jitter_min_tokens
+            .max(0)
+            .min(max_tokens);
+        let jitter_max = self
+            .policy
+            .final_cache_read_jitter_max_tokens
+            .max(0)
+            .min(max_tokens);
+        let (jitter_min, jitter_max) = if jitter_min <= jitter_max {
+            (jitter_min, jitter_max)
+        } else {
+            (jitter_max, jitter_min)
+        };
+
+        let jitter = if jitter_max > 0 {
+            sample_zero_based_range(
+                splitmix64(self.random_for_usage(usage) ^ 0x4d52_8db9_f7a6_2b3c),
+                jitter_min,
+                jitter_max,
+            )
+        } else {
+            0
+        };
+        Some(max_tokens.saturating_sub(jitter))
+    }
+
     fn sample_field(
         &self,
         field: ReportedUsageFieldPolicy,
@@ -530,6 +584,9 @@ impl ReportedCacheUsagePolicy {
             self.policy.cache_read.target_tokens,
             self.policy.cache_creation.max_tokens,
             self.policy.cache_creation.target_tokens,
+            self.policy.final_cache_read_max_tokens,
+            self.policy.final_cache_read_jitter_min_tokens,
+            self.policy.final_cache_read_jitter_max_tokens,
             usage.total_input_tokens,
             usage.input_tokens,
             usage.cache_creation_input_tokens,
@@ -557,6 +614,13 @@ fn sample_in_range(random: u64, low: i32, high: i32, effective_max: i32) -> i32 
     }
 
     let span = (high - low + 1) as u64;
+    low + (random % span) as i32
+}
+
+fn sample_zero_based_range(random: u64, low: i32, high: i32) -> i32 {
+    let low = low.max(0);
+    let high = high.max(low);
+    let span = (i64::from(high) - i64::from(low) + 1) as u64;
     low + (random % span) as i32
 }
 
@@ -1352,6 +1416,129 @@ mod tests {
         assert_eq!(reported.cache_read_input_tokens, 142_500);
         assert_eq!(reported.cache_creation_input_tokens, 0);
         assert_eq!(reported.total_input_tokens, 242_500);
+    }
+
+    #[test]
+    fn reported_usage_policy_caps_final_cache_read_after_input_delta() {
+        let usage = CacheUsage {
+            total_input_tokens: 940_913,
+            input_tokens: 662_673,
+            output_tokens: 45,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 278_240,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let raw = RawUsage::uncached(662_673, 45);
+        let policy = ReportedCacheUsagePolicy::from_path_policy(
+            ReportedUsagePathPolicy {
+                final_cache_read_max_tokens: 300_000,
+                input: ReportedUsageFieldPolicy::sample_input_max(96),
+                ..ReportedUsagePathPolicy::default()
+            },
+            71,
+        )
+        .unwrap();
+
+        let reported = usage.with_reported_cache_usage_policy_and_raw(policy, raw);
+
+        assert!((1..=96).contains(&reported.input_tokens));
+        assert_eq!(reported.cache_read_input_tokens, 300_000);
+        assert_eq!(
+            reported.total_input_tokens,
+            reported.reported_total_input_tokens()
+        );
+    }
+
+    #[test]
+    fn reported_usage_policy_applies_deterministic_final_cache_read_jitter() {
+        let usage = CacheUsage {
+            total_input_tokens: 940_913,
+            input_tokens: 662_673,
+            output_tokens: 45,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 278_240,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let raw = RawUsage::uncached(662_673, 45);
+        let policy = ReportedCacheUsagePolicy::from_path_policy(
+            ReportedUsagePathPolicy {
+                final_cache_read_max_tokens: 300_000,
+                final_cache_read_jitter_min_tokens: 8_000,
+                final_cache_read_jitter_max_tokens: 24_000,
+                input: ReportedUsageFieldPolicy::sample_input_max(96),
+                ..ReportedUsagePathPolicy::default()
+            },
+            71,
+        )
+        .unwrap();
+
+        let reported = usage.with_reported_cache_usage_policy_and_raw(policy.clone(), raw);
+        let again = usage.with_reported_cache_usage_policy_and_raw(policy, raw);
+
+        assert!((276_000..=292_000).contains(&reported.cache_read_input_tokens));
+        assert_eq!(
+            reported.cache_read_input_tokens,
+            again.cache_read_input_tokens
+        );
+        assert_eq!(reported.input_tokens, again.input_tokens);
+        assert_eq!(
+            reported.total_input_tokens,
+            reported.reported_total_input_tokens()
+        );
+    }
+
+    #[test]
+    fn reported_usage_policy_final_cache_read_guard_does_not_inflate_small_values() {
+        let usage = CacheUsage {
+            total_input_tokens: 200_050,
+            input_tokens: 50,
+            output_tokens: 9,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 200_000,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let raw = RawUsage::uncached(50, 9);
+        let policy = ReportedCacheUsagePolicy::from_path_policy(
+            ReportedUsagePathPolicy {
+                final_cache_read_max_tokens: 300_000,
+                final_cache_read_jitter_min_tokens: 8_000,
+                final_cache_read_jitter_max_tokens: 24_000,
+                ..ReportedUsagePathPolicy::default()
+            },
+            71,
+        )
+        .unwrap();
+
+        let reported = usage.with_reported_cache_usage_policy_and_raw(policy, raw);
+
+        assert_eq!(reported.cache_read_input_tokens, 200_000);
+        assert_eq!(reported.total_input_tokens, 200_050);
+    }
+
+    #[test]
+    fn reported_usage_policy_rewrites_records_when_only_final_cache_read_guard_applies() {
+        let usage = CacheUsage {
+            total_input_tokens: 1_250_010,
+            input_tokens: 10,
+            output_tokens: 9,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 1_250_000,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let policy = ReportedCacheUsagePolicy::from_path_policy(
+            ReportedUsagePathPolicy {
+                final_cache_read_max_tokens: 1_000_000,
+                ..ReportedUsagePathPolicy::default()
+            },
+            0,
+        )
+        .unwrap();
+
+        assert!(policy.should_rewrite_local_prompt_cache_usage(usage));
     }
 
     #[test]

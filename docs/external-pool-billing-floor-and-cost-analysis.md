@@ -99,7 +99,8 @@
 2. 忽略外部池 cache 字段，按本地 prompt-cache 规则和当前入口路径策略生成 `shapedUsage`。
 3. 对 `shapedUsage.cache_read_input_tokens` 和 `shapedUsage.cache_creation_input_tokens` 应用 cache 上浮。
 4. 如果 `output_tokens` 达到阈值，对 `output_tokens` 应用输出上浮。
-5. 第 3、4 步后的 usage 写回响应体和 SSE 事件，保存为 `reportedUsage`。
+5. 重新应用当前路径的 `finalCacheReadMaxTokens`，避免 cache 上浮把最终读取缓存推过路径上限。
+6. 第 3、4、5 步后的 usage 写回响应体和 SSE 事件，保存为 `reportedUsage`。
 
 ### 1. UsageRecord 增加外部池账务快照
 

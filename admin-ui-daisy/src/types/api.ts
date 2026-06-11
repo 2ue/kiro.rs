@@ -700,6 +700,9 @@ export interface ReportedUsageFieldPolicy {
 
 export interface ReportedUsagePathPolicy {
   enabled: boolean
+  finalCacheReadMaxTokens: number
+  finalCacheReadJitterMinTokens: number
+  finalCacheReadJitterMaxTokens: number
   input: ReportedUsageFieldPolicy
   output: ReportedUsageFieldPolicy
   cacheRead: ReportedUsageFieldPolicy
