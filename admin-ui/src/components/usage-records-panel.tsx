@@ -385,6 +385,8 @@ export function UsageRecordsPanel() {
   const summaryData = summary.data
   const pageRecords = records.data?.records || []
   const hasNextPage = Boolean(records.data?.hasNext)
+  const recordsPage = records.data?.page
+  const pageTransitionPending = recordsPage !== undefined && (records.isPlaceholderData || (records.isFetching && recordsPage !== currentPage))
   const localReadRatio = ratio(
     summaryData?.localPromptCacheReadInputTokens || 0,
     summaryData?.localPromptCacheInputTokens || 0
@@ -798,13 +800,13 @@ export function UsageRecordsPanel() {
               </table>
             </div>
           )}
-          {(currentPage > 1 || hasNextPage) && (
+          {(currentPage > 1 || hasNextPage || pageTransitionPending) && (
             <div className="mt-4 flex items-center justify-center gap-4">
               <Button
                 variant="outline"
                 size="sm"
                 onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
-                disabled={currentPage === 1}
+                disabled={currentPage === 1 || pageTransitionPending}
               >
                 上一页
               </Button>
@@ -815,7 +817,7 @@ export function UsageRecordsPanel() {
                 variant="outline"
                 size="sm"
                 onClick={() => setCurrentPage(p => p + 1)}
-                disabled={!hasNextPage}
+                disabled={!hasNextPage || pageTransitionPending}
               >
                 下一页
               </Button>

@@ -79,6 +79,88 @@ pub struct CredentialListQuery {
     pub auth_method: Option<String>,
     pub subscription: Option<String>,
     pub proxy_resource_id: Option<u64>,
+    pub sort_by: Option<String>,
+    pub sort_order: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialSortBy {
+    Default,
+    Id,
+    CreatedAt,
+    UpdatedAt,
+    Priority,
+    LastUsedAt,
+    SuccessCount,
+    FailureCount,
+    RefreshFailureCount,
+    EstimatedCost,
+    UsagePercentage,
+    RemainingQuota,
+    InFlightRequests,
+    SchedulerScore,
+}
+
+impl CredentialSortBy {
+    fn parse(value: Option<&str>) -> Self {
+        match value
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "id" => Self::Id,
+            "created_at" | "created-at" | "createdat" => Self::CreatedAt,
+            "updated_at" | "updated-at" | "updatedat" => Self::UpdatedAt,
+            "priority" => Self::Priority,
+            "last_used_at" | "last-used-at" | "lastusedat" => Self::LastUsedAt,
+            "success_count" | "success-count" | "successcount" => Self::SuccessCount,
+            "failure_count" | "failure-count" | "failurecount" => Self::FailureCount,
+            "refresh_failure_count" | "refresh-failure-count" | "refreshfailurecount" => {
+                Self::RefreshFailureCount
+            }
+            "estimated_cost" | "estimated-cost" | "estimatedcost" | "cost" => Self::EstimatedCost,
+            "usage_percentage" | "usage-percentage" | "usagepercentage" | "usage" => {
+                Self::UsagePercentage
+            }
+            "remaining_quota" | "remaining-quota" | "remainingquota" | "remaining" => {
+                Self::RemainingQuota
+            }
+            "in_flight_requests" | "in-flight-requests" | "inflightrequests" | "in_flight" => {
+                Self::InFlightRequests
+            }
+            "scheduler_score" | "scheduler-score" | "schedulerscore" => Self::SchedulerScore,
+            _ => Self::Default,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialSortOrder {
+    Asc,
+    Desc,
+}
+
+impl CredentialSortOrder {
+    fn parse(value: Option<&str>, sort_by: CredentialSortBy) -> Self {
+        match value
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "asc" | "ascending" => Self::Asc,
+            "desc" | "descending" => Self::Desc,
+            _ => default_sort_order(sort_by),
+        }
+    }
+
+    fn apply(self, ordering: std::cmp::Ordering) -> std::cmp::Ordering {
+        match self {
+            Self::Asc => ordering,
+            Self::Desc => ordering.reverse(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -93,8 +175,8 @@ impl CredentialStatusBuildOptions {
         include_cost_summary: false,
     };
 
-    const WITH_COST_SUMMARY: Self = Self {
-        include_account_info: false,
+    const WITH_ACCOUNT_INFO_AND_COST_SUMMARY: Self = Self {
+        include_account_info: true,
         include_cost_summary: true,
     };
 }
@@ -725,7 +807,9 @@ impl AdminService {
             global_max_concurrent_requests,
             max_queued_requests,
             credentials,
-        ) = self.credential_status_items(CredentialStatusBuildOptions::WITH_COST_SUMMARY);
+        ) = self.credential_status_items(
+            CredentialStatusBuildOptions::WITH_ACCOUNT_INFO_AND_COST_SUMMARY,
+        );
 
         CredentialsStatusResponse {
             total,
@@ -757,11 +841,14 @@ impl AdminService {
             global_max_concurrent_requests,
             max_queued_requests,
             credentials,
-        ) = self.credential_status_items(CredentialStatusBuildOptions::WITH_COST_SUMMARY);
-        let filtered: Vec<_> = credentials
+        ) = self.credential_status_items(
+            CredentialStatusBuildOptions::WITH_ACCOUNT_INFO_AND_COST_SUMMARY,
+        );
+        let mut filtered: Vec<_> = credentials
             .into_iter()
             .filter(|credential| credential_matches_query(credential, &query))
             .collect();
+        sort_credentials_for_admin_display_with_query(&mut filtered, &query);
         let filtered_total = filtered.len();
         let filtered_available = filtered
             .iter()
@@ -3196,18 +3283,126 @@ fn account_info_from_row(row: &CredentialAccountInfoRow) -> CredentialAccountInf
     }
 }
 
+fn default_sort_order(sort_by: CredentialSortBy) -> CredentialSortOrder {
+    match sort_by {
+        CredentialSortBy::Priority | CredentialSortBy::SchedulerScore => CredentialSortOrder::Asc,
+        _ => CredentialSortOrder::Desc,
+    }
+}
+
 fn sort_credentials_for_admin_display(credentials: &mut [CredentialStatusItem]) {
+    credentials.sort_by(compare_credentials_default);
+}
+
+fn sort_credentials_for_admin_display_with_query(
+    credentials: &mut [CredentialStatusItem],
+    query: &CredentialListQuery,
+) {
+    let sort_by = CredentialSortBy::parse(query.sort_by.as_deref());
+    if sort_by == CredentialSortBy::Default {
+        sort_credentials_for_admin_display(credentials);
+        return;
+    }
+
+    let sort_order = CredentialSortOrder::parse(query.sort_order.as_deref(), sort_by);
     credentials.sort_by(|a, b| {
-        a.disabled
-            .cmp(&b.disabled)
-            .then_with(|| match (&a.created_at, &b.created_at) {
-                (Some(a_created), Some(b_created)) => b_created.cmp(a_created),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => std::cmp::Ordering::Equal,
-            })
-            .then_with(|| b.id.cmp(&a.id))
+        compare_credentials_by(a, b, sort_by, sort_order)
+            .then_with(|| compare_credentials_default(a, b))
     });
+}
+
+fn compare_credentials_default(
+    a: &CredentialStatusItem,
+    b: &CredentialStatusItem,
+) -> std::cmp::Ordering {
+    a.disabled
+        .cmp(&b.disabled)
+        .then_with(|| {
+            compare_option_ord_desc_some_first(a.created_at.as_ref(), b.created_at.as_ref())
+        })
+        .then_with(|| b.id.cmp(&a.id))
+}
+
+fn compare_credentials_by(
+    a: &CredentialStatusItem,
+    b: &CredentialStatusItem,
+    sort_by: CredentialSortBy,
+    sort_order: CredentialSortOrder,
+) -> std::cmp::Ordering {
+    match sort_by {
+        CredentialSortBy::Default => compare_credentials_default(a, b),
+        CredentialSortBy::Id => sort_order.apply(a.id.cmp(&b.id)),
+        CredentialSortBy::CreatedAt => {
+            compare_option_ord_some_first(a.created_at.as_ref(), b.created_at.as_ref(), sort_order)
+        }
+        CredentialSortBy::UpdatedAt => {
+            compare_option_ord_some_first(a.updated_at.as_ref(), b.updated_at.as_ref(), sort_order)
+        }
+        CredentialSortBy::Priority => sort_order.apply(a.priority.cmp(&b.priority)),
+        CredentialSortBy::LastUsedAt => compare_option_ord_some_first(
+            a.last_used_at.as_ref(),
+            b.last_used_at.as_ref(),
+            sort_order,
+        ),
+        CredentialSortBy::SuccessCount => sort_order.apply(a.success_count.cmp(&b.success_count)),
+        CredentialSortBy::FailureCount => sort_order.apply(a.failure_count.cmp(&b.failure_count)),
+        CredentialSortBy::RefreshFailureCount => {
+            sort_order.apply(a.refresh_failure_count.cmp(&b.refresh_failure_count))
+        }
+        CredentialSortBy::EstimatedCost => {
+            compare_f64(a.estimated_cost_usd, b.estimated_cost_usd, sort_order)
+        }
+        CredentialSortBy::UsagePercentage => compare_option_f64_some_first(
+            a.account_info.as_ref().map(|info| info.usage_percentage),
+            b.account_info.as_ref().map(|info| info.usage_percentage),
+            sort_order,
+        ),
+        CredentialSortBy::RemainingQuota => compare_option_f64_some_first(
+            a.account_info.as_ref().map(|info| info.remaining),
+            b.account_info.as_ref().map(|info| info.remaining),
+            sort_order,
+        ),
+        CredentialSortBy::InFlightRequests => {
+            sort_order.apply(a.in_flight_requests.cmp(&b.in_flight_requests))
+        }
+        CredentialSortBy::SchedulerScore => {
+            compare_f64(a.scheduler_score, b.scheduler_score, sort_order)
+        }
+    }
+}
+
+fn compare_option_ord_desc_some_first<T: Ord>(a: Option<&T>, b: Option<&T>) -> std::cmp::Ordering {
+    compare_option_ord_some_first(a, b, CredentialSortOrder::Desc)
+}
+
+fn compare_option_ord_some_first<T: Ord>(
+    a: Option<&T>,
+    b: Option<&T>,
+    sort_order: CredentialSortOrder,
+) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => sort_order.apply(a.cmp(b)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn compare_option_f64_some_first(
+    a: Option<f64>,
+    b: Option<f64>,
+    sort_order: CredentialSortOrder,
+) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => compare_f64(a, b, sort_order),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn compare_f64(a: f64, b: f64, sort_order: CredentialSortOrder) -> std::cmp::Ordering {
+    sort_order.apply(a.total_cmp(&b))
 }
 
 fn credential_matches_query(
@@ -3734,6 +3929,132 @@ mod tests {
             max_batches: None,
             pause_ms_between_batches: None,
         }
+    }
+
+    #[test]
+    fn credential_admin_list_options_include_account_info_snapshot() {
+        let options = CredentialStatusBuildOptions::WITH_ACCOUNT_INFO_AND_COST_SUMMARY;
+
+        assert!(options.include_account_info);
+        assert!(options.include_cost_summary);
+    }
+
+    fn credential_item(
+        id: u64,
+        disabled: bool,
+        created_at: Option<&str>,
+        success_count: u64,
+        estimated_cost_usd: f64,
+        usage_percentage: Option<f64>,
+    ) -> CredentialStatusItem {
+        CredentialStatusItem {
+            id,
+            created_at: created_at.map(str::to_string),
+            updated_at: None,
+            priority: id as u32,
+            disabled,
+            failure_count: 0,
+            is_current: false,
+            expires_at: None,
+            auth_method: None,
+            has_profile_arn: false,
+            refresh_token_hash: None,
+            api_key_hash: None,
+            masked_api_key: None,
+            email: Some(format!("user{}@example.com", id)),
+            subscription_title: None,
+            account_info: usage_percentage.map(|usage_percentage| CredentialAccountInfo {
+                subscription_title: Some("Kiro Pro".to_string()),
+                current_usage: usage_percentage,
+                usage_limit: 100.0,
+                remaining: 100.0 - usage_percentage,
+                usage_percentage,
+                next_reset_at: None,
+                checked_at: "2026-01-01T00:00:00Z".to_string(),
+            }),
+            success_count,
+            last_used_at: None,
+            has_proxy: false,
+            proxy_url: None,
+            proxy_username: None,
+            proxy_password: None,
+            proxy_resource_id: None,
+            proxy_resource_name: None,
+            effective_proxy_url: None,
+            effective_proxy_source: "none".to_string(),
+            refresh_failure_count: 0,
+            disabled_reason: None,
+            endpoint: "ide".to_string(),
+            cooled_down: false,
+            cooldown_remaining_secs: 0,
+            cooldown_reason: None,
+            rate_limited: false,
+            rate_limit_remaining_secs: 0,
+            in_flight_requests: 0,
+            oldest_in_flight_age_secs: 0,
+            newest_in_flight_idle_secs: 0,
+            max_concurrent_requests: 0,
+            max_concurrent_requests_override: None,
+            in_flight_lease_max_secs: 0,
+            warmup_remaining: 0,
+            transient_failure_streak: 0,
+            recent_error_rate: 0.0,
+            latency_ewma_ms: None,
+            last_error_kind: None,
+            last_error_reason: None,
+            last_error_at_ms: None,
+            in_probation: false,
+            probation_remaining_secs: 0,
+            scheduler_selection_count: 0,
+            recent_scheduler_selection_count_10s: 0,
+            recent_scheduler_selection_count_60s: 0,
+            recent_scheduler_selection_count_5m: 0,
+            scheduler_selection_pressure: 0.0,
+            scheduler_score: 0.0,
+            estimated_cost_usd,
+            priced_requests: 0,
+            unpriced_requests: 0,
+        }
+    }
+
+    #[test]
+    fn credential_default_sort_keeps_enabled_then_newest_created() {
+        let mut credentials = vec![
+            credential_item(1, false, Some("2026-01-01T00:00:00Z"), 0, 0.0, None),
+            credential_item(2, true, Some("2026-01-03T00:00:00Z"), 0, 0.0, None),
+            credential_item(3, false, Some("2026-01-02T00:00:00Z"), 0, 0.0, None),
+            credential_item(4, false, None, 0, 0.0, None),
+        ];
+
+        sort_credentials_for_admin_display(&mut credentials);
+
+        let ids: Vec<u64> = credentials
+            .into_iter()
+            .map(|credential| credential.id)
+            .collect();
+        assert_eq!(ids, vec![3, 1, 4, 2]);
+    }
+
+    #[test]
+    fn credential_custom_sort_runs_before_pagination_order() {
+        let mut credentials = vec![
+            credential_item(1, false, Some("2026-01-01T00:00:00Z"), 10, 0.2, Some(20.0)),
+            credential_item(2, false, Some("2026-01-02T00:00:00Z"), 30, 0.1, Some(90.0)),
+            credential_item(3, true, Some("2026-01-03T00:00:00Z"), 20, 0.3, None),
+        ];
+        let query = CredentialListQuery {
+            sort_by: Some("success_count".to_string()),
+            sort_order: Some("desc".to_string()),
+            ..Default::default()
+        };
+
+        sort_credentials_for_admin_display_with_query(&mut credentials, &query);
+
+        let ids: Vec<u64> = credentials
+            .into_iter()
+            .map(|credential| credential.id)
+            .collect();
+        assert_eq!(ids, vec![2, 3, 1]);
     }
 
     #[test]

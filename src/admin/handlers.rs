@@ -38,6 +38,8 @@ pub struct CredentialsPageQueryParams {
     pub auth_method: Option<String>,
     pub subscription: Option<String>,
     pub proxy_resource_id: Option<u64>,
+    pub sort_by: Option<String>,
+    pub sort_order: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,6 +192,8 @@ pub async fn get_credentials_page(
             auth_method: non_blank(params.auth_method),
             subscription: non_blank(params.subscription),
             proxy_resource_id: params.proxy_resource_id,
+            sort_by: non_blank(params.sort_by),
+            sort_order: non_blank(params.sort_order),
         },
     ))
 }

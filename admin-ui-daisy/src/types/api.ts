@@ -17,6 +17,24 @@ export interface CredentialsPageResponse extends CredentialsStatusResponse {
   filteredAvailable: number
 }
 
+export type CredentialSortBy =
+  | 'default'
+  | 'id'
+  | 'created_at'
+  | 'updated_at'
+  | 'priority'
+  | 'last_used_at'
+  | 'success_count'
+  | 'failure_count'
+  | 'refresh_failure_count'
+  | 'estimated_cost'
+  | 'usage_percentage'
+  | 'remaining_quota'
+  | 'in_flight_requests'
+  | 'scheduler_score'
+
+export type CredentialSortOrder = 'asc' | 'desc'
+
 export interface CredentialsPageQuery {
   page: number
   limit: number
@@ -25,6 +43,8 @@ export interface CredentialsPageQuery {
   authMethod?: string
   subscription?: string
   proxyResourceId?: number
+  sortBy?: CredentialSortBy
+  sortOrder?: CredentialSortOrder
 }
 
 export interface CredentialStatusItem {

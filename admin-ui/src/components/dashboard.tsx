@@ -26,7 +26,24 @@ import { useCredentialsPage, useDeleteCredential, useResetFailure, useLoadBalanc
 import { getCredentialInfo, refreshCredentialInfo, forceRefreshToken, getCredentials, testCredential } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
-import type { BalanceResponse, CredentialStatusItem, LoadBalancingMode } from '@/types/api'
+import type { BalanceResponse, CredentialSortBy, CredentialSortOrder, CredentialStatusItem, LoadBalancingMode } from '@/types/api'
+
+const credentialSortOptions: Array<{ value: CredentialSortBy; label: string }> = [
+  { value: 'default', label: '默认排序' },
+  { value: 'created_at', label: '创建时间' },
+  { value: 'updated_at', label: '更新时间' },
+  { value: 'priority', label: '优先级' },
+  { value: 'last_used_at', label: '最后使用' },
+  { value: 'success_count', label: '成功次数' },
+  { value: 'failure_count', label: '失败次数' },
+  { value: 'refresh_failure_count', label: '刷新失败' },
+  { value: 'estimated_cost', label: '本地成本' },
+  { value: 'usage_percentage', label: '额度使用率' },
+  { value: 'remaining_quota', label: '剩余额度' },
+  { value: 'in_flight_requests', label: '并发占用' },
+  { value: 'scheduler_score', label: '调度评分' },
+  { value: 'id', label: 'ID' },
+]
 
 interface DashboardProps {
   onLogout: () => void
@@ -52,6 +69,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [authFilter, setAuthFilter] = useState('all')
   const [subscriptionFilter, setSubscriptionFilter] = useState('all')
   const [proxyFilter, setProxyFilter] = useState('all')
+  const [sortBy, setSortBy] = useState<CredentialSortBy>('default')
+  const [sortOrder, setSortOrder] = useState<CredentialSortOrder>('desc')
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
   const [activeTab, setActiveTab] = useState<'dashboard' | 'credentials' | 'validation' | 'proxies' | 'external' | 'usage' | 'pricing' | 'audit' | 'config'>('credentials')
@@ -66,7 +85,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   })
 
   const queryClient = useQueryClient()
-  const { data, isLoading, error, refetch } = useCredentialsPage({
+  const { data, isLoading, error, refetch, isFetching, isPlaceholderData } = useCredentialsPage({
     page: currentPage,
     limit: itemsPerPage,
     q: queryText.trim() || undefined,
@@ -74,6 +93,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
     authMethod: authFilter !== 'all' ? authFilter : undefined,
     subscription: subscriptionFilter !== 'all' ? subscriptionFilter : undefined,
     proxyResourceId: proxyFilter !== 'all' ? Number(proxyFilter) : undefined,
+    sortBy: sortBy !== 'default' ? sortBy : undefined,
+    sortOrder: sortBy !== 'default' ? sortOrder : undefined,
   })
   const { mutate: deleteCredential } = useDeleteCredential()
   const { mutate: resetFailure } = useResetFailure()
@@ -84,6 +105,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   // 计算分页
   const totalPages = data?.totalPages || 0
+  const credentialsPage = data?.page
+  const pageTransitionPending = credentialsPage !== undefined && (isPlaceholderData || (isFetching && credentialsPage !== currentPage))
   const currentCredentials = useMemo(() => data?.credentials || [], [data?.credentials])
   const disabledCredentialCount = Math.max((data?.total || 0) - (data?.available || 0), 0)
   const selectedDisabledCount = Array.from(selectedIds).filter(id => {
@@ -110,7 +133,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   useEffect(() => {
     setCurrentPage(1)
     setSelectedIds(new Set())
-  }, [queryText, statusFilter, authFilter, subscriptionFilter, proxyFilter])
+  }, [queryText, statusFilter, authFilter, subscriptionFilter, proxyFilter, sortBy, sortOrder])
 
   // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
   useEffect(() => {
@@ -908,7 +931,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </Button>
             </div>
           </div>
-          <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-6">
+          <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-8">
             <div className="relative md:col-span-2">
               <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
               <Input
@@ -918,6 +941,26 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 placeholder="搜索邮箱、ID、订阅、代理、错误"
               />
             </div>
+            <select
+              className="h-10 rounded-md border bg-background px-3 text-sm"
+              value={sortBy}
+              onChange={event => setSortBy(event.target.value as CredentialSortBy)}
+              title="排序字段"
+            >
+              {credentialSortOptions.map(option => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+            <select
+              className="h-10 rounded-md border bg-background px-3 text-sm disabled:opacity-60"
+              value={sortOrder}
+              disabled={sortBy === 'default'}
+              onChange={event => setSortOrder(event.target.value as CredentialSortOrder)}
+              title="排序方向"
+            >
+              <option value="desc">降序</option>
+              <option value="asc">升序</option>
+            </select>
             <select
               className="h-10 rounded-md border bg-background px-3 text-sm"
               value={statusFilter}
@@ -998,7 +1041,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     variant="outline"
                     size="sm"
                     onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
-                    disabled={currentPage === 1}
+                    disabled={currentPage === 1 || pageTransitionPending}
                   >
                     上一页
                   </Button>
@@ -1009,7 +1052,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     variant="outline"
                     size="sm"
                     onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
-                    disabled={currentPage === totalPages}
+                    disabled={currentPage === totalPages || pageTransitionPending}
                   >
                     下一页
                   </Button>

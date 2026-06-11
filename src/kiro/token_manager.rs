@@ -657,6 +657,20 @@ impl DisabledReason {
             _ => None,
         }
     }
+
+    fn label(self) -> &'static str {
+        match self {
+            DisabledReason::Manual => "手动禁用",
+            DisabledReason::TooManyFailures => "连续 API 调用失败",
+            DisabledReason::TooManyRefreshFailures => "连续 Token 刷新失败",
+            DisabledReason::QuotaExceeded => "额度耗尽",
+            DisabledReason::InvalidRefreshToken => "refreshToken 失效",
+            DisabledReason::InvalidConfig => "凭据配置无效",
+            DisabledReason::TemporarilySuspended => "临时风控/暂停",
+            DisabledReason::AccountSuspended => "账号暂停/封禁",
+            DisabledReason::AccountLocked => "账号锁定",
+        }
+    }
 }
 
 /// 上游明确返回的账号风控/暂停状态。
@@ -738,6 +752,36 @@ fn block_on_storage<T>(
     .map_err(|err| anyhow::anyhow!("{}失败: {}", operation, err))
 }
 
+fn spawn_best_effort_storage_task(
+    operation: &'static str,
+    future: impl Future<Output = anyhow::Result<()>> + Send + 'static,
+) {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::spawn(async move {
+            if let Err(err) = future.await {
+                tracing::warn!("{}失败: {}", operation, err);
+            }
+        });
+        return;
+    }
+
+    if let Err(err) = std::thread::Builder::new()
+        .name(format!("kiro-{}", operation))
+        .spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(anyhow::Error::from)
+                .and_then(|runtime| runtime.block_on(future));
+            if let Err(err) = result {
+                tracing::warn!("{}失败: {}", operation, err);
+            }
+        })
+    {
+        tracing::warn!("{}任务启动失败: {}", operation, err);
+    }
+}
+
 fn instant_from_epoch_ms(target_ms: i64, now_ms: i64, now: Instant) -> Option<Instant> {
     (target_ms > now_ms).then(|| now + StdDuration::from_millis((target_ms - now_ms) as u64))
 }
@@ -748,6 +792,23 @@ fn instant_from_elapsed_epoch_ms(target_ms: i64, now_ms: i64, now: Instant) -> I
     } else {
         now.checked_sub(StdDuration::from_millis((now_ms - target_ms) as u64))
             .unwrap_or(now)
+    }
+}
+
+fn truncate_for_audit(value: &str, max_chars: usize) -> String {
+    let mut truncated = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        truncated.push_str("...");
+    }
+    truncated
+}
+
+fn merge_json_object(base: &mut serde_json::Value, extra: serde_json::Value) {
+    let (Some(base), serde_json::Value::Object(extra)) = (base.as_object_mut(), extra) else {
+        return;
+    };
+    for (key, value) in extra {
+        base.insert(key, value);
     }
 }
 
@@ -1397,6 +1458,7 @@ impl MultiTokenManager {
 
         // 校验 API Key 凭据配置完整性：authMethod=api_key 时必须提供 kiroApiKey
         let mut entries = entries;
+        let mut invalid_config_credential_ids = Vec::new();
         for entry in &mut entries {
             if entry.credentials.kiro_api_key.is_none()
                 && entry
@@ -1412,6 +1474,7 @@ impl MultiTokenManager {
                 );
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::InvalidConfig);
+                invalid_config_credential_ids.push(entry.id);
             }
         }
 
@@ -1487,6 +1550,18 @@ impl MultiTokenManager {
         manager.load_stats();
         manager.load_runtime_state();
         manager.refresh_scheduler_state_from_redis_force_best_effort();
+        for id in invalid_config_credential_ids {
+            manager.record_scheduler_credential_audit(
+                "auto_disable_credential",
+                id,
+                DisabledReason::InvalidConfig,
+                "startup_invalid_config",
+                "凭据配置无效，启动时已自动禁用",
+                serde_json::json!({
+                    "configError": "api_key_auth_without_kiro_api_key",
+                }),
+            );
+        }
 
         Ok(manager)
     }
@@ -1494,6 +1569,103 @@ impl MultiTokenManager {
     /// 获取当前运行时配置快照。
     pub fn runtime_config(&self) -> Config {
         self.config.lock().clone()
+    }
+
+    fn credential_audit_label(entry: &CredentialEntry) -> String {
+        let prefix = format!("#{}", entry.id);
+        let label = entry
+            .credentials
+            .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| entry.credentials.kiro_api_key.as_deref().map(mask_api_key))
+            .or_else(|| entry.credentials.endpoint.clone());
+
+        match label {
+            Some(label) if label.starts_with(&prefix) => label,
+            Some(label) => format!("{} {}", prefix, label),
+            None => prefix,
+        }
+    }
+
+    fn record_scheduler_credential_audit(
+        &self,
+        action: &'static str,
+        id: u64,
+        reason: DisabledReason,
+        trigger: &'static str,
+        message: &'static str,
+        extra_detail: serde_json::Value,
+    ) {
+        let Some(store) = self.postgres_store.clone() else {
+            return;
+        };
+
+        let current_id = *self.current_id.lock();
+        let (
+            label,
+            auth_method,
+            endpoint,
+            disabled,
+            failure_count,
+            refresh_failure_count,
+            available,
+        ) = {
+            let entries = self.entries.lock();
+            let available = entries.iter().filter(|entry| !entry.disabled).count();
+            match entries.iter().find(|entry| entry.id == id) {
+                Some(entry) => (
+                    Self::credential_audit_label(entry),
+                    entry.credentials.auth_method.clone(),
+                    entry.credentials.endpoint.clone(),
+                    entry.disabled,
+                    entry.failure_count,
+                    entry.refresh_failure_count,
+                    available,
+                ),
+                None => (format!("#{}", id), None, None, false, 0, 0, available),
+            }
+        };
+
+        let mut detail = serde_json::json!({
+            "credentialId": id,
+            "credentialLabel": label,
+            "reason": reason.as_str(),
+            "reasonLabel": reason.label(),
+            "trigger": trigger,
+            "message": message,
+            "disabled": disabled,
+            "failureCount": failure_count,
+            "refreshFailureCount": refresh_failure_count,
+            "maxFailures": MAX_FAILURES_PER_CREDENTIAL,
+            "availableCredentials": available,
+            "currentCredentialId": current_id,
+            "source": "scheduler",
+        });
+        if let Some(auth_method) = auth_method {
+            detail["authMethod"] = serde_json::Value::String(auth_method);
+        }
+        if let Some(endpoint) = endpoint {
+            detail["endpoint"] = serde_json::Value::String(endpoint);
+        }
+        merge_json_object(&mut detail, extra_detail);
+
+        let object_id = id.to_string();
+        spawn_best_effort_storage_task("记录调度审计日志", async move {
+            store
+                .record_admin_audit_log(
+                    "system-scheduler",
+                    action,
+                    "credential",
+                    Some(&object_id),
+                    true,
+                    None,
+                    detail,
+                )
+                .await
+        });
     }
 
     /// 更新当前运行时配置并写入 PgSQL。
@@ -3052,6 +3224,16 @@ impl MultiTokenManager {
                                         );
                                     }
                                     self.save_runtime_state_for(healed_id);
+                                    self.record_scheduler_credential_audit(
+                                        "auto_enable_credential",
+                                        healed_id,
+                                        DisabledReason::TooManyFailures,
+                                        "auto_heal_all_too_many_failures",
+                                        "所有可调度凭据均因连续失败自动禁用，调度器已自动恢复该凭据",
+                                        serde_json::json!({
+                                            "previousReason": DisabledReason::TooManyFailures.as_str(),
+                                        }),
+                                    );
                                 }
                                 self.publish_credentials_changed("auto_heal_too_many_failures");
                                 best = self
@@ -4733,6 +4915,16 @@ impl MultiTokenManager {
             self.save_runtime_state_for(id);
             self.persist_last_used_at(id, &last_used_at);
         }
+        if disabled {
+            self.record_scheduler_credential_audit(
+                "auto_disable_credential",
+                id,
+                DisabledReason::TooManyFailures,
+                "api_failure_threshold",
+                "连续 API 调用失败达到阈值，已自动禁用凭据",
+                serde_json::json!({}),
+            );
+        }
         let result = {
             let entries = self.entries.lock();
             entries.iter().any(|e| !e.disabled)
@@ -4815,6 +5007,16 @@ impl MultiTokenManager {
             self.save_runtime_state_for(id);
             self.persist_last_used_at(id, &last_used_at);
         }
+        self.record_scheduler_credential_audit(
+            "auto_disable_credential",
+            id,
+            DisabledReason::QuotaExceeded,
+            "upstream_quota_exhausted",
+            "上游返回额度耗尽，已自动禁用凭据并切换调度",
+            serde_json::json!({
+                "failureCountSetTo": MAX_FAILURES_PER_CREDENTIAL,
+            }),
+        );
         self.publish_credentials_changed("credential_quota_exhausted");
         self.notify_dispatch_state_changed();
         result
@@ -4831,6 +5033,7 @@ impl MultiTokenManager {
         detail: impl Into<String>,
     ) -> bool {
         let detail = detail.into();
+        let detail_summary = truncate_for_audit(&detail, 500);
         let disabled_reason = reason.disabled_reason();
         let last_used_at: String;
         let result = {
@@ -4910,7 +5113,7 @@ impl MultiTokenManager {
                 "reason": event_reason,
                 "detail": detail,
             });
-            if let Err(err) = block_on_storage("记录凭据风控事件到 PgSQL", async move {
+            spawn_best_effort_storage_task("记录凭据风控事件到 PgSQL", async move {
                 store
                     .record_credential_event(
                         Some(id),
@@ -4919,10 +5122,20 @@ impl MultiTokenManager {
                         detail_value,
                     )
                     .await
-            }) {
-                tracing::warn!("记录凭据风控事件失败: {}", err);
-            }
+            });
         }
+        self.record_scheduler_credential_audit(
+            "auto_disable_credential",
+            id,
+            disabled_reason,
+            "upstream_risk_controlled",
+            "上游返回风控、暂停或锁定状态，已自动禁用凭据并切换调度",
+            serde_json::json!({
+                "riskReason": reason.event_reason(),
+                "upstreamErrorSummary": detail_summary,
+                "failureCountSetTo": MAX_FAILURES_PER_CREDENTIAL,
+            }),
+        );
         self.publish_credentials_changed("credential_risk_controlled");
         self.notify_dispatch_state_changed();
         result
@@ -5017,6 +5230,16 @@ impl MultiTokenManager {
             self.save_runtime_state_for(id);
             self.persist_last_used_at(id, &last_used_at);
         }
+        if disabled {
+            self.record_scheduler_credential_audit(
+                "auto_disable_credential",
+                id,
+                DisabledReason::TooManyRefreshFailures,
+                "token_refresh_failure_threshold",
+                "连续 Token 刷新失败达到阈值，已自动禁用凭据",
+                serde_json::json!({}),
+            );
+        }
         let result = {
             let entries = self.entries.lock();
             entries.iter().any(|e| !e.disabled)
@@ -5097,6 +5320,16 @@ impl MultiTokenManager {
             self.save_runtime_state_for(id);
             self.persist_last_used_at(id, &last_used_at);
         }
+        self.record_scheduler_credential_audit(
+            "auto_disable_credential",
+            id,
+            DisabledReason::InvalidRefreshToken,
+            "refresh_token_invalid_grant",
+            "refreshToken 永久失效，已自动禁用凭据并切换调度",
+            serde_json::json!({
+                "upstreamReason": "invalid_grant",
+            }),
+        );
         self.publish_credentials_changed("credential_refresh_token_invalid");
         self.notify_dispatch_state_changed();
         result

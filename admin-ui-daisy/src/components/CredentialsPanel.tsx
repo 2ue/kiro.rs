@@ -44,7 +44,24 @@ import {
   useRuntimeConfig,
   useSetLoadBalancingMode,
 } from '@/hooks/use-credentials'
-import type { BalanceResponse, CredentialStatusItem, LoadBalancingMode } from '@/types/api'
+import type { BalanceResponse, CredentialSortBy, CredentialSortOrder, CredentialStatusItem, LoadBalancingMode } from '@/types/api'
+
+const credentialSortOptions: Array<{ value: CredentialSortBy; label: string }> = [
+  { value: 'default', label: '默认排序' },
+  { value: 'created_at', label: '创建时间' },
+  { value: 'updated_at', label: '更新时间' },
+  { value: 'priority', label: '优先级' },
+  { value: 'last_used_at', label: '最后使用' },
+  { value: 'success_count', label: '成功次数' },
+  { value: 'failure_count', label: '失败次数' },
+  { value: 'refresh_failure_count', label: '刷新失败' },
+  { value: 'estimated_cost', label: '本地成本' },
+  { value: 'usage_percentage', label: '额度使用率' },
+  { value: 'remaining_quota', label: '剩余额度' },
+  { value: 'in_flight_requests', label: '并发占用' },
+  { value: 'scheduler_score', label: '调度评分' },
+  { value: 'id', label: 'ID' },
+]
 
 export function CredentialsPanel() {
   // State
@@ -67,6 +84,8 @@ export function CredentialsPanel() {
   const [authFilter, setAuthFilter] = useState('all')
   const [subscriptionFilter, setSubscriptionFilter] = useState('all')
   const [proxyFilter, setProxyFilter] = useState('all')
+  const [sortBy, setSortBy] = useState<CredentialSortBy>('default')
+  const [sortOrder, setSortOrder] = useState<CredentialSortOrder>('desc')
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [showFilters, setShowFilters] = useState(false)
   const cancelVerifyRef = useRef(false)
@@ -82,6 +101,8 @@ export function CredentialsPanel() {
     authMethod: authFilter !== 'all' ? authFilter : undefined,
     subscription: subscriptionFilter !== 'all' ? subscriptionFilter : undefined,
     proxyResourceId: proxyFilter !== 'all' ? Number(proxyFilter) : undefined,
+    sortBy: sortBy !== 'default' ? sortBy : undefined,
+    sortOrder: sortBy !== 'default' ? sortOrder : undefined,
   })
   const allCredentials = useCredentials({ enabled: batchOpen || kamOpen })
   const proxyResources = useProxyResources()
@@ -95,6 +116,8 @@ export function CredentialsPanel() {
   const currentCredentials = useMemo(() => credentials.data?.credentials || [], [credentials.data?.credentials])
   const importDuplicateCheckCredentials = allCredentials.data?.credentials || currentCredentials
   const totalPages = credentials.data?.totalPages || 0
+  const credentialsPage = credentials.data?.page
+  const pageTransitionPending = credentialsPage !== undefined && (credentials.isPlaceholderData || (credentials.isFetching && credentialsPage !== page))
   const selectedDisabledCount = Array.from(selectedIds).filter((id) => currentCredentials.find((item) => item.id === id)?.disabled).length
   const disabledCredentialCount = Math.max((credentials.data?.total || 0) - (credentials.data?.available || 0), 0)
   const hasActiveFilters = statusFilter !== 'all' || authFilter !== 'all' || subscriptionFilter !== 'all' || proxyFilter !== 'all'
@@ -107,7 +130,7 @@ export function CredentialsPanel() {
   useEffect(() => {
     setPage(1)
     setSelectedIds(new Set())
-  }, [queryText, statusFilter, authFilter, subscriptionFilter, proxyFilter])
+  }, [queryText, statusFilter, authFilter, subscriptionFilter, proxyFilter, sortBy, sortOrder])
 
   useEffect(() => {
     if (credentials.data && page > Math.max(credentials.data.totalPages, 1)) {
@@ -419,6 +442,15 @@ export function CredentialsPanel() {
                 placeholder="搜索邮箱、ID、订阅、代理、错误..."
               />
             </div>
+            <Select bordered size="sm" className="sm:w-40" value={sortBy} onChange={(e) => setSortBy(e.target.value as CredentialSortBy)}>
+              {credentialSortOptions.map((option) => (
+                <Select.Option key={option.value} value={option.value}>{option.label}</Select.Option>
+              ))}
+            </Select>
+            <Select bordered size="sm" className="sm:w-28" value={sortOrder} disabled={sortBy === 'default'} onChange={(e) => setSortOrder(e.target.value as CredentialSortOrder)}>
+              <Select.Option value="desc">降序</Select.Option>
+              <Select.Option value="asc">升序</Select.Option>
+            </Select>
             <div className="flex gap-2">
               <Button
                 type="button"
@@ -574,7 +606,7 @@ export function CredentialsPanel() {
               type="button"
               variant="outline"
               size="sm"
-              disabled={page <= 1}
+              disabled={page <= 1 || pageTransitionPending}
               onClick={() => setPage((p) => Math.max(1, p - 1))}
             >
               <ChevronLeft className="h-4 w-4" />
@@ -586,7 +618,7 @@ export function CredentialsPanel() {
               type="button"
               variant="outline"
               size="sm"
-              disabled={page >= totalPages}
+              disabled={page >= totalPages || pageTransitionPending}
               onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
             >
               <ChevronRight className="h-4 w-4" />

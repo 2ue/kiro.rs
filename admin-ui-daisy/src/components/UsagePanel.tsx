@@ -234,6 +234,8 @@ export function UsagePanel() {
   const hasFilters = Boolean(searchText || model || conversationId || routeTarget || status || source || streamMode !== 'all' || minCacheRead)
   const pageRecords = records.data?.records || []
   const hasNext = Boolean(records.data?.hasNext)
+  const recordsPage = records.data?.page
+  const pageTransitionPending = recordsPage !== undefined && (records.isPlaceholderData || (records.isFetching && recordsPage !== page))
   const summaryData = summary.data
   const readRatio = ratio(summaryData?.localPromptCacheReadInputTokens || 0, summaryData?.localPromptCacheInputTokens || 0)
   const cachedRatio = ratio(
@@ -652,13 +654,13 @@ export function UsagePanel() {
           </div>
         )}
 
-        {(page > 1 || hasNext) && (
+        {(page > 1 || hasNext || pageTransitionPending) && (
           <div className="mt-4 flex items-center justify-center gap-3">
-            <Button type="button" variant="outline" size="sm" disabled={page === 1} onClick={() => setPage((value) => Math.max(1, value - 1))}>
+            <Button type="button" variant="outline" size="sm" disabled={page === 1 || pageTransitionPending} onClick={() => setPage((value) => Math.max(1, value - 1))}>
               上一页
             </Button>
             <span className="text-sm text-base-content/60">第 {page} 页，每页 {limit} 条</span>
-            <Button type="button" variant="outline" size="sm" disabled={!hasNext} onClick={() => setPage((value) => value + 1)}>
+            <Button type="button" variant="outline" size="sm" disabled={!hasNext || pageTransitionPending} onClick={() => setPage((value) => value + 1)}>
               下一页
             </Button>
           </div>

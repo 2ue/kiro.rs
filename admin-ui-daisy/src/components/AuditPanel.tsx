@@ -50,6 +50,8 @@ export function AuditPanel() {
   const logs = useAuditLogsPage(query)
   const records = logs.data?.records || []
   const hasNext = Boolean(logs.data?.hasNext)
+  const recordsPage = logs.data?.page
+  const pageTransitionPending = recordsPage !== undefined && (logs.isPlaceholderData || (logs.isFetching && recordsPage !== page))
 
   return (
     <div className="space-y-4">
@@ -104,13 +106,13 @@ export function AuditPanel() {
             </Table>
           </div>
         )}
-        {(page > 1 || hasNext) && (
+        {(page > 1 || hasNext || pageTransitionPending) && (
           <div className="mt-4 flex items-center justify-center gap-3">
-            <Button type="button" variant="outline" size="sm" disabled={page === 1} onClick={() => setPage((value) => Math.max(1, value - 1))}>
+            <Button type="button" variant="outline" size="sm" disabled={page === 1 || pageTransitionPending} onClick={() => setPage((value) => Math.max(1, value - 1))}>
               上一页
             </Button>
             <span className="text-sm text-base-content/60">第 {page} 页，每页 {limit} 条</span>
-            <Button type="button" variant="outline" size="sm" disabled={!hasNext} onClick={() => setPage((value) => value + 1)}>
+            <Button type="button" variant="outline" size="sm" disabled={!hasNext || pageTransitionPending} onClick={() => setPage((value) => value + 1)}>
               下一页
             </Button>
           </div>
