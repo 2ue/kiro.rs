@@ -4,6 +4,8 @@ import type {
   AddCredentialRequest,
   AddCredentialResponse,
   BalanceResponse,
+  BatchUpdateCredentialsRequest,
+  BatchUpdateCredentialsResponse,
   CredentialInfoRefreshResponse,
   CredentialExportFormat,
   CredentialsPageQuery,
@@ -13,6 +15,7 @@ import type {
   AccessKeysResponse,
   RuntimeConfig,
   SetCredentialConcurrencyRequest,
+  SetCredentialRegionsRequest,
   SetDisabledRequest,
   SetCredentialProxyRequest,
   SetPriorityRequest,
@@ -60,6 +63,16 @@ export async function setCredentialPriority(id: number, priority: number): Promi
 
 export async function setCredentialConcurrency(id: number, req: SetCredentialConcurrencyRequest): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/concurrency`, req)
+  return data
+}
+
+export async function setCredentialRegions(id: number, req: SetCredentialRegionsRequest): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/regions`, req)
+  return data
+}
+
+export async function batchUpdateCredentials(req: BatchUpdateCredentialsRequest): Promise<BatchUpdateCredentialsResponse> {
+  const { data } = await api.post<BatchUpdateCredentialsResponse>('/credentials/batch-update', req)
   return data
 }
 

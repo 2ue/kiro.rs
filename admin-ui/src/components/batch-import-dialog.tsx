@@ -9,7 +9,12 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
-import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
+import { useCredentials, useAddCredential, useDeleteCredential, useProxyResources } from '@/hooks/use-credentials'
+import {
+  CredentialParameterDefaultsPanel,
+  initialParameterDefaults,
+  mergeCredentialDefaults,
+} from '@/components/credential-parameter-defaults'
 import { getCredentialBalance, setCredentialDisabled, testCredential } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
@@ -22,6 +27,7 @@ interface BatchImportDialogProps {
 }
 
 type CredentialInput = AddCredentialRequest & { region?: string }
+type ImportVerificationMode = 'model_and_subscription' | 'subscription_only'
 
 interface VerificationResult {
   index: number
@@ -36,18 +42,47 @@ interface VerificationResult {
   rollbackError?: string
 }
 
+async function verifyImportedCredential(
+  credentialId: number,
+  mode: ImportVerificationMode
+): Promise<{ model: string; response: string }> {
+  if (mode === 'subscription_only') {
+    const info = await getCredentialBalance(credentialId)
+    return {
+      model: '订阅查询',
+      response: `订阅: ${info.subscriptionTitle || '未知'}，用量 ${info.currentUsage}/${info.usageLimit}`,
+    }
+  }
 
+  const testResult = await testCredential(credentialId, {
+    model: DEFAULT_TEST_MODEL,
+    prompt: DEFAULT_TEST_PROMPT,
+  })
+  try {
+    await getCredentialBalance(credentialId)
+  } catch (error) {
+    toast.warning(`凭据 #${credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
+  }
+  return {
+    model: testModelLabel(testResult.model),
+    response: testResult.response,
+  }
+}
 
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
+  const [verificationMode, setVerificationMode] = useState<ImportVerificationMode>('model_and_subscription')
   const [importing, setImporting] = useState(false)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
   const [results, setResults] = useState<VerificationResult[]>([])
+  const [defaults, setDefaults] = useState(initialParameterDefaults)
 
   const { data: existingCredentials } = useCredentials({ enabled: open })
   const { mutateAsync: addCredential } = useAddCredential()
   const { mutateAsync: deleteCredential } = useDeleteCredential()
+  const proxyResources = useProxyResources()
+  const proxyResourceOptions = (proxyResources.data?.resources || []).filter(resource => resource.enabled)
 
   const rollbackCredential = async (id: number): Promise<{ success: boolean; error?: string }> => {
     try {
@@ -75,6 +110,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
+    setDefaults(initialParameterDefaults())
+    setVerificationMode('model_and_subscription')
   }
 
   const appendCredentialsToInput = (credentials: AddCredentialRequest[]) => {
@@ -126,6 +163,13 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
     if (credentials.length === 0) {
       toast.error('没有可导入的凭据')
+      return
+    }
+
+    try {
+      credentials = credentials.map(credential => mergeCredentialDefaults(credential, defaults))
+    } catch (error) {
+      toast.error(extractErrorMessage(error))
       return
     }
 
@@ -262,6 +306,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               email: cred.email?.trim() || undefined,
               profileArn: cred.profileArn?.trim() || undefined,
               priority: cred.priority || 0,
+              maxConcurrentRequests: cred.maxConcurrentRequests ?? undefined,
               region: cred.region?.trim() || undefined,
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
@@ -278,16 +323,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             // 延迟 1 秒
             await new Promise(resolve => setTimeout(resolve, 1000))
 
-            // 验活成功后查询账号信息，用于持久化账号快照。
-            const testResult = await testCredential(addedCred.credentialId, {
-              model: DEFAULT_TEST_MODEL,
-              prompt: DEFAULT_TEST_PROMPT,
-            })
-            try {
-              await getCredentialBalance(addedCred.credentialId)
-            } catch (error) {
-              toast.warning(`凭据 #${addedCred.credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
-            }
+            const verification = await verifyImportedCredential(addedCred.credentialId, verificationMode)
 
             successCount++
             existingApiKeyHashes.add(credHash)
@@ -297,8 +333,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               newResults[i] = {
                 ...newResults[i],
                 status: 'verified',
-                model: testModelLabel(testResult.model),
-                response: testResult.response,
+                model: verification.model,
+                response: verification.response,
                 email: addedCred.email || cred.email || undefined,
                 credentialId: addedCred.credentialId
               }
@@ -330,6 +366,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             clientId,
             clientSecret,
             priority: cred.priority || 0,
+            maxConcurrentRequests: cred.maxConcurrentRequests ?? undefined,
             machineId: cred.machineId?.trim() || undefined,
             proxyUrl: cred.proxyUrl?.trim() || undefined,
             proxyUsername: cred.proxyUsername?.trim() || undefined,
@@ -343,16 +380,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           // 延迟 1 秒
           await new Promise(resolve => setTimeout(resolve, 1000))
 
-          // 验活成功后查询账号信息，用于持久化账号快照。
-          const testResult = await testCredential(addedCred.credentialId, {
-            model: DEFAULT_TEST_MODEL,
-            prompt: DEFAULT_TEST_PROMPT,
-          })
-          try {
-            await getCredentialBalance(addedCred.credentialId)
-          } catch (error) {
-            toast.warning(`凭据 #${addedCred.credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
-          }
+          const verification = await verifyImportedCredential(addedCred.credentialId, verificationMode)
 
           // 验活成功
           successCount++
@@ -363,8 +391,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             newResults[i] = {
               ...newResults[i],
               status: 'verified',
-              model: testModelLabel(testResult.model),
-              response: testResult.response,
+              model: verification.model,
+              response: verification.response,
               email: addedCred.email || cred.email || undefined,
               credentialId: addedCred.credentialId
             }
@@ -522,6 +550,33 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             />
             <p className="text-xs text-muted-foreground">
               支持单选或多选文件。导入时自动验活，失败的凭据会被排除。
+            </p>
+          </div>
+
+          <CredentialParameterDefaultsPanel
+            defaults={defaults}
+            onChange={setDefaults}
+            proxyResources={proxyResourceOptions}
+            disabled={importing}
+            title="导入默认参数"
+          />
+
+          <div className="rounded-md border bg-muted/20 p-3">
+            <label htmlFor="batchImportVerificationMode" className="text-sm font-semibold">
+              验活方式
+            </label>
+            <select
+              id="batchImportVerificationMode"
+              value={verificationMode}
+              onChange={(event) => setVerificationMode(event.target.value as ImportVerificationMode)}
+              disabled={importing}
+              className="mt-2 flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <option value="model_and_subscription">测试模型 + 查询订阅</option>
+              <option value="subscription_only">只查询订阅（不请求模型）</option>
+            </select>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+              只查询订阅时不会发送模型测试请求；订阅查询失败的凭据仍会按验活失败回滚。
             </p>
           </div>
 

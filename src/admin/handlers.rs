@@ -14,13 +14,14 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, AdminErrorResponse, BatchCredentialImportRequest,
-        ClearInFlightRequest, CreateProxyResourceRequest, ExportCredentialsQuery,
-        ExternalPoolTestRequest, RefreshCredentialInfoRequest, SetCredentialConcurrencyRequest,
-        SetCredentialProxyRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
-        SetPriorityRequest, SetWarmupRequest, SuccessResponse, TestCredentialRequest,
-        UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
-        UpdateRuntimeConfigRequest, UpsertManualModelRequest, UsageCleanupRequest,
-        ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
+        BatchUpdateCredentialsRequest, ClearInFlightRequest, CreateProxyResourceRequest,
+        ExportCredentialsQuery, ExternalPoolTestRequest, RefreshCredentialInfoRequest,
+        SetCredentialConcurrencyRequest, SetCredentialProxyRequest, SetCredentialRegionsRequest,
+        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SetWarmupRequest,
+        SuccessResponse, TestCredentialRequest, UpdateAdminApiKeyRequest,
+        UpdateCredentialAuthRequest, UpdateProxyResourceRequest, UpdateRuntimeConfigRequest,
+        UpsertManualModelRequest, UsageCleanupRequest, ValidateExistingCredentialsRequest,
+        ValidateExternalCredentialsRequest,
     },
 };
 use crate::anthropic::usage::{UsageRecordQuery, UsageRecordStatus, UsageSource};
@@ -244,6 +245,19 @@ pub async fn set_credential_concurrency(
     }
 }
 
+/// POST /api/admin/credentials/:id/regions
+/// 设置凭据级 Region 覆盖
+pub async fn set_credential_regions(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetCredentialRegionsRequest>,
+) -> impl IntoResponse {
+    match state.service.set_credential_regions(id, payload) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} Region 已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials/:id/warmup
 /// 设置凭据预热剩余请求数
 pub async fn set_credential_warmup(
@@ -444,6 +458,16 @@ pub async fn batch_import_credentials(
     Json(payload): Json<BatchCredentialImportRequest>,
 ) -> impl IntoResponse {
     match state.service.batch_import_credentials(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+pub async fn batch_update_credentials(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchUpdateCredentialsRequest>,
+) -> impl IntoResponse {
+    match state.service.batch_update_credentials(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

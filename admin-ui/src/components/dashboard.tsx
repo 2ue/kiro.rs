@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
-import { LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, BarChart3, Settings, DollarSign, Download, FileClock, RefreshCw, Router, Search, FileCheck2, LayoutDashboard } from 'lucide-react'
+import { LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, BarChart3, Settings, DollarSign, Download, FileClock, RefreshCw, Router, Search, FileCheck2, LayoutDashboard, SlidersHorizontal } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -10,6 +10,7 @@ import { Input } from '@/components/ui/input'
 import { CredentialCard } from '@/components/credential-card'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
+import { BatchEditCredentialsDialog } from '@/components/batch-edit-credentials-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { CredentialTestDialog } from '@/components/credential-test-dialog'
@@ -54,6 +55,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [testDialogOpen, setTestDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
+  const [batchEditDialogOpen, setBatchEditDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
   const [exportDialogOpen, setExportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
@@ -847,6 +849,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     <CheckCircle2 className="h-4 w-4 mr-2" />
                     批量验活
                   </Button>
+                  <Button onClick={() => setBatchEditDialogOpen(true)} size="sm" variant="outline">
+                    <SlidersHorizontal className="h-4 w-4 mr-2" />
+                    批量修改
+                  </Button>
                   <Button
                     onClick={handleBatchForceRefresh}
                     size="sm"
@@ -1082,6 +1088,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <BatchImportDialog
         open={batchImportDialogOpen}
         onOpenChange={setBatchImportDialogOpen}
+      />
+
+      <BatchEditCredentialsDialog
+        open={batchEditDialogOpen}
+        ids={Array.from(selectedIds)}
+        onOpenChange={setBatchEditDialogOpen}
+        onDone={() => {
+          deselectAll()
+          refetch()
+        }}
       />
 
       {/* KAM 账号导入对话框 */}

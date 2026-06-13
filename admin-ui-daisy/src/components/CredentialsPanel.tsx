@@ -24,6 +24,7 @@ import { Badge, EmptyState, ErrorState, LoadingState, SectionCard, StatCard } fr
 import { CredentialCard } from '@/components/credentials'
 import {
   AddCredentialModal,
+  BatchEditCredentialsModal,
   BatchImportModal,
   BatchVerifyModal,
   CredentialExportModal,
@@ -72,6 +73,7 @@ export function CredentialsPanel() {
   const [testingCredential, setTestingCredential] = useState<CredentialStatusItem | null>(null)
   const [addOpen, setAddOpen] = useState(false)
   const [batchOpen, setBatchOpen] = useState(false)
+  const [batchEditOpen, setBatchEditOpen] = useState(false)
   const [kamOpen, setKamOpen] = useState(false)
   const [exportOpen, setExportOpen] = useState(false)
   const [verifyOpen, setVerifyOpen] = useState(false)
@@ -530,6 +532,9 @@ export function CredentialsPanel() {
             <Button type="button" variant="outline" size="xs" onClick={batchVerify}>
               <CheckCircle2 className="h-3.5 w-3.5" /> 验活
             </Button>
+            <Button type="button" variant="outline" size="xs" onClick={() => setBatchEditOpen(true)}>
+              <Filter className="h-3.5 w-3.5" /> 批量修改
+            </Button>
             <Button type="button" variant="outline" size="xs" onClick={batchForceRefresh} disabled={batchRefreshing}>
               {batchRefreshing ? <Loading size="xs" /> : <RefreshCw className="h-3.5 w-3.5" />}
               刷新Token
@@ -630,6 +635,15 @@ export function CredentialsPanel() {
       {/* Modals */}
       <AddCredentialModal open={addOpen} onClose={() => setAddOpen(false)} />
       <CredentialTestModal credential={testingCredential} open={Boolean(testingCredential)} onClose={() => setTestingCredential(null)} />
+      <BatchEditCredentialsModal
+        open={batchEditOpen}
+        ids={Array.from(selectedIds)}
+        onClose={() => setBatchEditOpen(false)}
+        onDone={() => {
+          invalidate()
+          setSelectedIds(new Set())
+        }}
+      />
       <BatchImportModal open={batchOpen} onClose={() => setBatchOpen(false)} existingCredentials={importDuplicateCheckCredentials} onDone={invalidate} />
       <KamImportModal open={kamOpen} onClose={() => setKamOpen(false)} existingCredentials={importDuplicateCheckCredentials} onDone={invalidate} />
       <CredentialExportModal open={exportOpen} onClose={() => setExportOpen(false)} />

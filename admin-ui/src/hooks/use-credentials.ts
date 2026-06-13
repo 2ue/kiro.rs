@@ -1,5 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
+  batchUpdateCredentials,
   getCredentials,
   getCredentialsPage,
   getProxyResources,
@@ -9,6 +10,7 @@ import {
   setCredentialDisabled,
   setCredentialPriority,
   setCredentialConcurrency,
+  setCredentialRegions,
   setCredentialWarmup,
   setCredentialProxy,
   clearCredentialInFlight,
@@ -25,10 +27,12 @@ import {
 } from '@/api/credentials'
 import type {
   AddCredentialRequest,
+  BatchUpdateCredentialsRequest,
   CreateProxyResourceRequest,
   CredentialsPageQuery,
   SetCredentialConcurrencyRequest,
   SetCredentialProxyRequest,
+  SetCredentialRegionsRequest,
   TestCredentialRequest,
   UpdateProxyResourceRequest,
   UpdateRuntimeConfigRequest,
@@ -137,6 +141,28 @@ export function useSetCredentialProxy() {
     onSuccess: (_data, variables) => {
       queryClient.invalidateQueries({ queryKey: ['proxy-resources'] })
       invalidateCredentialCaches(queryClient, variables.id)
+    },
+  })
+}
+
+export function useSetCredentialRegions() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, request }: { id: number; request: SetCredentialRegionsRequest }) =>
+      setCredentialRegions(id, request),
+    onSuccess: (_data, variables) => {
+      invalidateCredentialCaches(queryClient, variables.id)
+    },
+  })
+}
+
+export function useBatchUpdateCredentials() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: BatchUpdateCredentialsRequest) => batchUpdateCredentials(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['proxy-resources'] })
+      invalidateCredentialCaches(queryClient)
     },
   })
 }

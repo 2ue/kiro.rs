@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, PlayCircle, Router, Gauge, Eye, EyeOff } from 'lucide-react'
+import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, PlayCircle, Router, Gauge, Globe, Eye, EyeOff } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -27,6 +27,7 @@ import {
   useForceRefreshToken,
   useProxyResources,
   useRuntimeConfig,
+  useSetCredentialRegions,
   useSetCredentialProxy,
   useSetCredentialConcurrency,
 } from '@/hooks/use-credentials'
@@ -189,9 +190,13 @@ export function CredentialCard({
   loadingBalance,
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
+  const [editingRegions, setEditingRegions] = useState(false)
   const [editingProxy, setEditingProxy] = useState(false)
   const [editingConcurrency, setEditingConcurrency] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
+  const [regionValue, setRegionValue] = useState(credential.region || '')
+  const [authRegionValue, setAuthRegionValue] = useState(credential.authRegion || '')
+  const [apiRegionValue, setApiRegionValue] = useState(credential.apiRegion || '')
   const [proxyResourceId, setProxyResourceId] = useState(credential.proxyResourceId ? String(credential.proxyResourceId) : '')
   const [proxyUrl, setProxyUrl] = useState(credential.proxyUrl || '')
   const [proxyUsername, setProxyUsername] = useState(credential.proxyUsername || '')
@@ -214,6 +219,7 @@ export function CredentialCard({
   const clearInFlight = useClearInFlight()
   const setCredentialProxy = useSetCredentialProxy()
   const setCredentialConcurrency = useSetCredentialConcurrency()
+  const setCredentialRegions = useSetCredentialRegions()
   const proxyResources = useProxyResources()
   const runtimeConfig = useRuntimeConfig()
   const proxyResourceOptions = proxyResources.data?.resources || []
@@ -252,9 +258,53 @@ export function CredentialCard({
     setEditingProxy(false)
   }
 
+  const openRegionsEditor = () => {
+    setRegionValue(credential.region || '')
+    setAuthRegionValue(credential.authRegion || '')
+    setApiRegionValue(credential.apiRegion || '')
+    setEditingRegions(true)
+  }
+
+  const closeRegionsEditor = () => {
+    if (setCredentialRegions.isPending) return
+    setRegionValue(credential.region || '')
+    setAuthRegionValue(credential.authRegion || '')
+    setApiRegionValue(credential.apiRegion || '')
+    setEditingRegions(false)
+  }
+
+  const handleRegionValueChange = (value: string) => {
+    setRegionValue(value)
+    if (value.trim() && !authRegionValue.trim()) {
+      setAuthRegionValue(value)
+    }
+  }
+
+  const setProxyResourceDraft = (value: string) => {
+    setProxyResourceId(value)
+    if (value) {
+      setProxyUrl('')
+      setProxyUsername('')
+      setProxyPassword('')
+    }
+  }
+
+  const setDirectProxyDraft = (setter: (value: string) => void, value: string) => {
+    setter(value)
+    if (value.trim()) {
+      setProxyResourceId('')
+    }
+  }
+
   useEffect(() => {
     setPriorityValue(String(credential.priority))
   }, [credential.priority])
+
+  useEffect(() => {
+    setRegionValue(credential.region || '')
+    setAuthRegionValue(credential.authRegion || '')
+    setApiRegionValue(credential.apiRegion || '')
+  }, [credential.id, credential.region, credential.authRegion, credential.apiRegion])
 
   useEffect(() => {
     resetProxyDraft()
@@ -297,6 +347,28 @@ export function CredentialCard({
         },
         onError: (err) => {
           toast.error('操作失败: ' + extractErrorMessage(err))
+        },
+      }
+    )
+  }
+
+  const handleRegionsSave = () => {
+    setCredentialRegions.mutate(
+      {
+        id: credential.id,
+        request: {
+          region: regionValue.trim() || null,
+          authRegion: authRegionValue.trim() || null,
+          apiRegion: apiRegionValue.trim() || null,
+        },
+      },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setEditingRegions(false)
+        },
+        onError: (err) => {
+          toast.error('Region 设置失败: ' + extractErrorMessage(err))
         },
       }
     )
@@ -495,6 +567,11 @@ export function CredentialCard({
                 {credential.endpoint && (
                   <Badge variant="outline">{credential.endpoint}</Badge>
                 )}
+                {(credential.effectiveAuthRegion || credential.effectiveApiRegion) && (
+                  <Badge variant="outline">
+                    {credential.effectiveAuthRegion || credential.effectiveApiRegion}
+                  </Badge>
+                )}
                 {credential.hasProxy && (
                   <Badge variant="outline">代理</Badge>
                 )}
@@ -605,6 +682,23 @@ export function CredentialCard({
                 <Gauge className="h-3.5 w-3.5" />
                 {concurrencyLimitLabel(credential)}
               </button>
+            </div>
+            <div className="col-span-2">
+              <span className="text-muted-foreground">Region：</span>
+              <button
+                type="button"
+                className="ml-1 inline-flex max-w-full items-center gap-1 truncate font-medium hover:underline"
+                onClick={openRegionsEditor}
+                title="配置该凭据的 Region"
+              >
+                <Globe className="h-3.5 w-3.5 shrink-0" />
+                <span className="truncate">
+                  Auth {credential.effectiveAuthRegion || '默认'} · API {credential.effectiveApiRegion || '默认'}
+                </span>
+              </button>
+              {(credential.region || credential.authRegion || credential.apiRegion) && (
+                <span className="ml-1 text-xs text-muted-foreground">账号覆盖</span>
+              )}
             </div>
             <div>
               <span className="text-muted-foreground">近期错误率：</span>
@@ -865,6 +959,100 @@ export function CredentialCard({
       </Card>
 
       <Dialog
+        open={editingRegions}
+        onOpenChange={(open) => {
+          if (open) {
+            openRegionsEditor()
+          } else {
+            closeRegionsEditor()
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Region 设置：{displayName}</DialogTitle>
+            <DialogDescription>
+              `us-east-1` 这类值是 AWS 区域。Auth Region 用于刷新 Token，API Region 用于请求 Kiro API；清空字段表示回退全局配置。
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div className="rounded-md border bg-muted/30 p-3 text-sm">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-muted-foreground">当前生效 Auth Region</span>
+                <span className="font-mono font-medium">{credential.effectiveAuthRegion || '默认'}</span>
+              </div>
+              <div className="mt-1 flex items-center justify-between gap-3">
+                <span className="text-muted-foreground">当前生效 API Region</span>
+                <span className="font-mono font-medium">{credential.effectiveApiRegion || '默认'}</span>
+              </div>
+            </div>
+            <label className="block">
+              <span className="text-sm font-medium">Region 兼容字段</span>
+              <Input
+                className="mt-2 font-mono"
+                value={regionValue}
+                placeholder="us-east-1"
+                disabled={setCredentialRegions.isPending}
+                onChange={(event) => handleRegionValueChange(event.target.value)}
+              />
+            </label>
+            <label className="block">
+              <span className="text-sm font-medium">Auth Region</span>
+              <Input
+                className="mt-2 font-mono"
+                value={authRegionValue}
+                placeholder="us-east-1"
+                disabled={setCredentialRegions.isPending}
+                onChange={(event) => setAuthRegionValue(event.target.value)}
+              />
+            </label>
+            <label className="block">
+              <span className="text-sm font-medium">API Region</span>
+              <Input
+                className="mt-2 font-mono"
+                value={apiRegionValue}
+                placeholder="us-east-1"
+                disabled={setCredentialRegions.isPending}
+                onChange={(event) => setApiRegionValue(event.target.value)}
+              />
+            </label>
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={closeRegionsEditor} disabled={setCredentialRegions.isPending}>
+              取消
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setRegionValue('')
+                setAuthRegionValue('')
+                setApiRegionValue('')
+                setCredentialRegions.mutate(
+                  { id: credential.id, request: { region: null, authRegion: null, apiRegion: null } },
+                  {
+                    onSuccess: (res) => {
+                      toast.success(res.message)
+                      setEditingRegions(false)
+                    },
+                    onError: (err) => toast.error('Region 设置失败: ' + extractErrorMessage(err)),
+                  }
+                )
+              }}
+              disabled={setCredentialRegions.isPending || (!credential.region && !credential.authRegion && !credential.apiRegion)}
+            >
+              继承全局
+            </Button>
+            <Button onClick={handleRegionsSave} disabled={setCredentialRegions.isPending}>
+              {setCredentialRegions.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+              保存
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
         open={editingProxy}
         onOpenChange={(open) => {
           if (open) {
@@ -886,7 +1074,7 @@ export function CredentialCard({
             <button
               type="button"
               className={`w-full rounded-md border p-3 text-left text-sm transition ${proxyResourceId ? 'hover:bg-muted/50' : 'border-primary bg-primary/5'}`}
-              onClick={() => setProxyResourceId('')}
+              onClick={() => setProxyResourceDraft('')}
             >
               <div className="flex items-center justify-between gap-3">
                 <span className="font-medium">不绑定代理资源</span>
@@ -910,7 +1098,7 @@ export function CredentialCard({
                     value={proxyUrl}
                     placeholder="socks5h://127.0.0.1:1080"
                     disabled={setCredentialProxy.isPending || Boolean(proxyResourceId)}
-                    onChange={(event) => setProxyUrl(event.target.value)}
+                    onChange={(event) => setDirectProxyDraft(setProxyUrl, event.target.value)}
                   />
                 </label>
                 <label className="block">
@@ -918,7 +1106,7 @@ export function CredentialCard({
                   <div className="mt-2">
                     <SecretInput
                       value={proxyUsername}
-                      onChange={setProxyUsername}
+                      onChange={(value) => setDirectProxyDraft(setProxyUsername, value)}
                       visible={showProxyUsername}
                       onToggle={() => setShowProxyUsername((value) => !value)}
                       disabled={setCredentialProxy.isPending || Boolean(proxyResourceId)}
@@ -931,7 +1119,7 @@ export function CredentialCard({
                   <div className="mt-2">
                     <SecretInput
                       value={proxyPassword}
-                      onChange={setProxyPassword}
+                      onChange={(value) => setDirectProxyDraft(setProxyPassword, value)}
                       visible={showProxyPassword}
                       onToggle={() => setShowProxyPassword((value) => !value)}
                       disabled={setCredentialProxy.isPending || Boolean(proxyResourceId)}
@@ -962,7 +1150,7 @@ export function CredentialCard({
                       className={`w-full rounded-md border p-3 text-left text-sm transition ${
                         selected ? 'border-primary bg-primary/5' : resource.enabled ? 'hover:bg-muted/50' : 'border-red-200 bg-red-50 opacity-80 hover:bg-red-100 dark:border-red-900 dark:bg-red-950/30'
                       }`}
-                      onClick={() => setProxyResourceId(String(resource.id))}
+                      onClick={() => setProxyResourceDraft(String(resource.id))}
                     >
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="font-medium">{resource.name}</span>

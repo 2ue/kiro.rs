@@ -57,6 +57,11 @@ export interface CredentialStatusItem {
   isCurrent: boolean
   expiresAt: string | null
   authMethod: string | null
+  region?: string
+  authRegion?: string
+  apiRegion?: string
+  effectiveAuthRegion: string
+  effectiveApiRegion: string
   hasProfileArn: boolean
   email?: string
   refreshTokenHash?: string
@@ -271,6 +276,32 @@ export interface SetWarmupRequest {
 
 export interface SetCredentialConcurrencyRequest {
   maxConcurrentRequests?: number | null
+}
+
+export interface SetCredentialRegionsRequest {
+  region?: string | null
+  authRegion?: string | null
+  apiRegion?: string | null
+}
+
+export interface BatchUpdateCredentialsRequest {
+  ids: number[]
+  regions?: SetCredentialRegionsRequest
+  concurrency?: SetCredentialConcurrencyRequest
+  proxy?: SetCredentialProxyRequest
+}
+
+export interface BatchUpdateCredentialItem {
+  id: number
+  ok: boolean
+  error?: string
+}
+
+export interface BatchUpdateCredentialsResponse {
+  total: number
+  success: number
+  failed: number
+  items: BatchUpdateCredentialItem[]
 }
 
 export interface AddCredentialRequest {

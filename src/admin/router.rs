@@ -7,21 +7,21 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, batch_import_credentials, cancel_usage_cleanup, clear_credential_in_flight,
-        clear_external_pool_auto_disabled, clear_usage_records, create_external_pool,
-        create_proxy_resource, delete_credential, delete_external_pool, delete_manual_model,
-        delete_proxy_resource, export_credentials, force_refresh_token, get_access_keys,
-        get_all_credentials, get_audit_logs, get_credential_balance, get_credential_info,
-        get_credentials_page, get_external_pool_status, get_external_pools,
+        add_credential, batch_import_credentials, batch_update_credentials, cancel_usage_cleanup,
+        clear_credential_in_flight, clear_external_pool_auto_disabled, clear_usage_records,
+        create_external_pool, create_proxy_resource, delete_credential, delete_external_pool,
+        delete_manual_model, delete_proxy_resource, export_credentials, force_refresh_token,
+        get_access_keys, get_all_credentials, get_audit_logs, get_credential_balance,
+        get_credential_info, get_credentials_page, get_external_pool_status, get_external_pools,
         get_load_balancing_mode, get_model_capabilities, get_model_pricing, get_proxy_resources,
         get_runtime_config, get_usage_cleanup_status, get_usage_dashboard, get_usage_records,
         get_usage_records_page, get_usage_summary, get_usage_writer_stats, preview_usage_cleanup,
         refresh_credentials_info, reset_failure_count, set_credential_concurrency,
         set_credential_disabled, set_credential_priority, set_credential_proxy,
-        set_credential_warmup, set_external_pool_enabled, set_load_balancing_mode,
-        start_usage_cleanup, sync_model_capabilities, sync_model_pricing, test_credential,
-        test_external_pool, update_admin_api_key, update_credential_auth, update_external_pool,
-        update_proxy_resource, update_runtime_config, upsert_manual_model,
+        set_credential_regions, set_credential_warmup, set_external_pool_enabled,
+        set_load_balancing_mode, start_usage_cleanup, sync_model_capabilities, sync_model_pricing,
+        test_credential, test_external_pool, update_admin_api_key, update_credential_auth,
+        update_external_pool, update_proxy_resource, update_runtime_config, upsert_manual_model,
         validate_existing_credentials, validate_external_credentials,
     },
     middleware::{AdminState, admin_auth_middleware},
@@ -55,6 +55,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_all_credentials).post(add_credential),
         )
         .route("/credentials/import", post(batch_import_credentials))
+        .route("/credentials/batch-update", post(batch_update_credentials))
         .route("/credentials/export", get(export_credentials))
         .route("/credentials-paged", get(get_credentials_page))
         .route("/credentials/{id}", delete(delete_credential))
@@ -65,6 +66,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/credentials/{id}/concurrency",
             post(set_credential_concurrency),
         )
+        .route("/credentials/{id}/regions", post(set_credential_regions))
         .route("/credentials/{id}/warmup", post(set_credential_warmup))
         .route(
             "/credentials/{id}/in-flight/clear",

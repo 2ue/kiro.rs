@@ -73,6 +73,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [clientSecret, setClientSecret] = useState('')
   const [email, setEmail] = useState('')
   const [priority, setPriority] = useState('0')
+  const [maxConcurrentRequests, setMaxConcurrentRequests] = useState('')
   const [machineId, setMachineId] = useState('')
   const [proxyResourceId, setProxyResourceId] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
@@ -98,6 +99,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setClientSecret('')
     setEmail('')
     setPriority('0')
+    setMaxConcurrentRequests('')
     setMachineId('')
     setProxyResourceId('')
     setProxyUrl('')
@@ -122,6 +124,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     clientSecret?: string
     email?: string
     priority?: number
+    maxConcurrentRequests?: number | null
     machineId?: string
     proxyUrl?: string
     proxyUsername?: string
@@ -140,14 +143,60 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setClientSecret(credential.clientSecret || '')
     setEmail(credential.email || '')
     setPriority(String(credential.priority ?? 0))
+    setMaxConcurrentRequests(typeof credential.maxConcurrentRequests === 'number' ? String(credential.maxConcurrentRequests) : '')
     setMachineId(credential.machineId || '')
-    setProxyResourceId(credential.proxyResourceId ? String(credential.proxyResourceId) : '')
-    setProxyUrl(credential.proxyUrl || '')
-    setProxyUsername(credential.proxyUsername || '')
-    setProxyPassword(credential.proxyPassword || '')
+    if (credential.proxyResourceId) {
+      setProxyResourceId(String(credential.proxyResourceId))
+      setProxyUrl('')
+      setProxyUsername('')
+      setProxyPassword('')
+    } else {
+      setProxyResourceId('')
+      setProxyUrl(credential.proxyUrl || '')
+      setProxyUsername(credential.proxyUsername || '')
+      setProxyPassword(credential.proxyPassword || '')
+    }
     setShowProxyUsername(false)
     setShowProxyPassword(false)
     setEndpoint(credential.endpoint || '')
+  }
+
+  const handleAuthMethodChange = (nextAuthMethod: AuthMethod) => {
+    setAuthMethod(nextAuthMethod)
+    if (nextAuthMethod === 'api_key') {
+      setRefreshToken('')
+      setClientId('')
+      setClientSecret('')
+      return
+    }
+    setKiroApiKey('')
+    if (nextAuthMethod !== 'idc') {
+      setClientId('')
+      setClientSecret('')
+    }
+  }
+
+  const handleRegionChange = (value: string) => {
+    setRegion(value)
+    if (value.trim() && !authRegion.trim()) {
+      setAuthRegion(value)
+    }
+  }
+
+  const handleProxyResourceChange = (value: string) => {
+    setProxyResourceId(value)
+    if (value) {
+      setProxyUrl('')
+      setProxyUsername('')
+      setProxyPassword('')
+    }
+  }
+
+  const setDirectProxyDraft = (setter: (value: string) => void, value: string) => {
+    setter(value)
+    if (value.trim()) {
+      setProxyResourceId('')
+    }
   }
 
   const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -198,6 +247,15 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       toast.error('优先级必须是非负整数')
       return
     }
+    let parsedMaxConcurrentRequests: number | undefined
+    if (maxConcurrentRequests.trim()) {
+      const parsed = Number(maxConcurrentRequests)
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        toast.error('账号并发覆盖必须是非负整数')
+        return
+      }
+      parsedMaxConcurrentRequests = parsed
+    }
     const directProxyUrl = proxyUrl.trim()
     const directProxyUsername = proxyUsername.trim()
     const directProxyPassword = proxyPassword.trim()
@@ -219,6 +277,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         clientSecret: isApiKey ? undefined : clientSecret.trim() || undefined,
         email: email.trim() || undefined,
         priority: parsedPriority,
+        maxConcurrentRequests: parsedMaxConcurrentRequests,
         machineId: machineId.trim() || undefined,
         proxyResourceId: proxyResourceId ? Number(proxyResourceId) : undefined,
         proxyUrl: proxyResourceId ? undefined : directProxyUrl || undefined,
@@ -270,7 +329,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               <select
                 id="authMethod"
                 value={authMethod}
-                onChange={(e) => setAuthMethod(e.target.value as AuthMethod)}
+                onChange={(e) => handleAuthMethodChange(e.target.value as AuthMethod)}
                 disabled={isPending}
                 className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
               >
@@ -332,7 +391,17 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
             {/* Region 配置 */}
             <div className="space-y-2">
               <label className="text-sm font-medium">Region 配置</label>
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                <div>
+                  <Input
+                    id="region"
+                    placeholder="Region 兼容字段"
+                    value={region}
+                    onChange={(e) => handleRegionChange(e.target.value)}
+                    disabled={isPending}
+                    className="font-mono"
+                  />
+                </div>
                 <div>
                   <Input
                     id="authRegion"
@@ -340,6 +409,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     value={authRegion}
                     onChange={(e) => setAuthRegion(e.target.value)}
                     disabled={isPending}
+                    className="font-mono"
                   />
                 </div>
                 <div>
@@ -349,11 +419,12 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     value={apiRegion}
                     onChange={(e) => setApiRegion(e.target.value)}
                     disabled={isPending}
+                    className="font-mono"
                   />
                 </div>
               </div>
               <p className="text-xs text-muted-foreground">
-                均可留空使用全局配置。Auth Region 用于 Token 刷新，API Region 用于 API 请求
+                `us-east-1` 这类值是 AWS 区域。Region 是兼容字段；Auth Region 用于 Token 刷新，API Region 用于 API 请求，均可留空使用全局配置。
               </p>
             </div>
 
@@ -407,6 +478,24 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               </p>
             </div>
 
+            <div className="space-y-2">
+              <label htmlFor="maxConcurrentRequests" className="text-sm font-medium">
+                账号并发覆盖
+              </label>
+              <Input
+                id="maxConcurrentRequests"
+                type="number"
+                min="0"
+                placeholder="留空继承全局，0 表示不限"
+                value={maxConcurrentRequests}
+                onChange={(e) => setMaxConcurrentRequests(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                只作用于当前凭据；留空时继承全局单凭据并发配置。
+              </p>
+            </div>
+
             {/* Machine ID */}
             <div className="space-y-2">
               <label htmlFor="machineId" className="text-sm font-medium">
@@ -447,7 +536,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               <select
                 id="proxyResourceId"
                 value={proxyResourceId}
-                onChange={(e) => setProxyResourceId(e.target.value)}
+                onChange={(e) => handleProxyResourceChange(e.target.value)}
                 disabled={isPending}
                 className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
               >
@@ -459,7 +548,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 ))}
               </select>
               <p className="text-xs text-muted-foreground">
-                新增凭据会立即验证 Token，只能选择已启用的代理资源；不选择则使用全局代理或直连配置。
+                新增凭据会立即验证 Token，只能选择已启用的代理资源；选择资源会清空直连代理，填写直连代理会自动取消资源。
               </p>
             </div>
 
@@ -478,7 +567,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   id="proxyUrl"
                   placeholder="socks5h://127.0.0.1:1080"
                   value={proxyUrl}
-                  onChange={(event) => setProxyUrl(event.target.value)}
+                  onChange={(event) => setDirectProxyDraft(setProxyUrl, event.target.value)}
                   disabled={isPending || Boolean(proxyResourceId)}
                 />
               </div>
@@ -487,7 +576,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   <label className="text-sm font-medium">代理用户名</label>
                   <SecretInput
                     value={proxyUsername}
-                    onChange={setProxyUsername}
+                    onChange={(value) => setDirectProxyDraft(setProxyUsername, value)}
                     visible={showProxyUsername}
                     onToggle={() => setShowProxyUsername((value) => !value)}
                     disabled={isPending || Boolean(proxyResourceId)}
@@ -498,7 +587,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   <label className="text-sm font-medium">代理密码</label>
                   <SecretInput
                     value={proxyPassword}
-                    onChange={setProxyPassword}
+                    onChange={(value) => setDirectProxyDraft(setProxyPassword, value)}
                     visible={showProxyPassword}
                     onToggle={() => setShowProxyPassword((value) => !value)}
                     disabled={isPending || Boolean(proxyResourceId)}

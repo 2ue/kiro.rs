@@ -1,6 +1,6 @@
 //! Admin API 类型定义
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::anthropic::pricing::ModelPricing;
 use crate::model::config::{
@@ -106,6 +106,19 @@ pub struct CredentialStatusItem {
     pub expires_at: Option<String>,
     /// 认证方式
     pub auth_method: Option<String>,
+    /// 凭据级兼容 Region（主要作为 Auth Region 的旧字段/回退字段）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// 凭据级 Auth Region 覆盖值。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_region: Option<String>,
+    /// 凭据级 API Region 覆盖值。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_region: Option<String>,
+    /// 实际生效的 Auth Region。
+    pub effective_auth_region: String,
+    /// 实际生效的 API Region。
+    pub effective_api_region: String,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
     /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据，用于前端去重）
@@ -251,12 +264,36 @@ pub struct SetWarmupRequest {
 }
 
 /// 修改凭据级最大并发请求数覆盖。
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetCredentialConcurrencyRequest {
     /// None 表示继承全局；Some(0) 表示该账号不限并发；Some(n) 表示该账号最多 n 并发。
     #[serde(default)]
     pub max_concurrent_requests: Option<u32>,
+}
+
+/// 修改凭据 Region 覆盖值。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialRegionsRequest {
+    /// 凭据级兼容 Region；主要作为 Auth Region 回退字段。空字符串表示清空覆盖。
+    #[serde(default, deserialize_with = "deserialize_optional_string_update")]
+    pub region: Option<Option<String>>,
+    /// 凭据级 Auth Region。空字符串表示清空覆盖。
+    #[serde(default, deserialize_with = "deserialize_optional_string_update")]
+    pub auth_region: Option<Option<String>>,
+    /// 凭据级 API Region。空字符串表示清空覆盖。
+    #[serde(default, deserialize_with = "deserialize_optional_string_update")]
+    pub api_region: Option<Option<String>>,
+}
+
+fn deserialize_optional_string_update<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 /// 只更新凭据认证相关字段，不修改调度参数、代理、统计和运行态。
@@ -273,6 +310,8 @@ pub struct UpdateCredentialAuthRequest {
     pub client_secret: Option<String>,
     #[serde(default)]
     pub kiro_api_key: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
     #[serde(default)]
     pub auth_region: Option<String>,
     #[serde(default)]
@@ -623,13 +662,43 @@ pub struct UpdateProxyResourceRequest {
     pub clear_notes: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetCredentialProxyRequest {
     pub proxy_resource_id: Option<u64>,
     pub proxy_url: Option<String>,
     pub proxy_username: Option<String>,
     pub proxy_password: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchUpdateCredentialsRequest {
+    pub ids: Vec<u64>,
+    #[serde(default)]
+    pub regions: Option<SetCredentialRegionsRequest>,
+    #[serde(default)]
+    pub concurrency: Option<SetCredentialConcurrencyRequest>,
+    #[serde(default)]
+    pub proxy: Option<SetCredentialProxyRequest>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchUpdateCredentialItem {
+    pub id: u64,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchUpdateCredentialsResponse {
+    pub total: usize,
+    pub success: usize,
+    pub failed: usize,
+    pub items: Vec<BatchUpdateCredentialItem>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

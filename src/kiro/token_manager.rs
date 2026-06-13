@@ -145,6 +145,10 @@ fn apply_credential_auth_update(credential: &mut KiroCredentials, update: Creden
         apply_optional_string(&mut credential.client_secret, update.client_secret);
         clear_access_token = true;
     }
+    if update.region.is_some() {
+        apply_optional_string(&mut credential.region, update.region);
+        clear_access_token = true;
+    }
     if update.auth_region.is_some() {
         apply_optional_string(&mut credential.auth_region, update.auth_region);
         clear_access_token = true;
@@ -571,6 +575,7 @@ pub struct CredentialAuthUpdate {
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
     pub kiro_api_key: Option<String>,
+    pub region: Option<String>,
     pub auth_region: Option<String>,
     pub api_region: Option<String>,
     pub machine_id: Option<String>,
@@ -834,6 +839,19 @@ pub struct CredentialEntrySnapshot {
     pub failure_count: u32,
     /// 认证方式
     pub auth_method: Option<String>,
+    /// 凭据级兼容 Region（主要作为 Auth Region 的旧字段/回退字段）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// 凭据级 Auth Region 覆盖值。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_region: Option<String>,
+    /// 凭据级 API Region 覆盖值。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_region: Option<String>,
+    /// 实际生效的 Auth Region。
+    pub effective_auth_region: String,
+    /// 实际生效的 API Region。
+    pub effective_api_region: String,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
     /// Token 过期时间
@@ -5437,6 +5455,17 @@ impl MultiTokenManager {
                                 }
                             })
                         },
+                        region: e.credentials.region.clone(),
+                        auth_region: e.credentials.auth_region.clone(),
+                        api_region: e.credentials.api_region.clone(),
+                        effective_auth_region: e
+                            .credentials
+                            .effective_auth_region(&config)
+                            .to_string(),
+                        effective_api_region: e
+                            .credentials
+                            .effective_api_region(&config)
+                            .to_string(),
                         has_profile_arn: e.credentials.profile_arn.is_some(),
                         expires_at: if e.credentials.is_api_key_credential() {
                             None // API Key 凭据本地不维护过期时间（服务端策略未知）
@@ -5685,6 +5714,66 @@ impl MultiTokenManager {
 
         self.notify_dispatch_state_changed();
         self.publish_credentials_changed("credential_concurrency_updated");
+        Ok(())
+    }
+
+    /// 设置凭据 Region 覆盖值（Admin API）。
+    ///
+    /// `region` 是旧兼容字段，主要作为 Auth Region 回退；`auth_region`
+    /// 控制 token 刷新；`api_region` 控制 q.{region}.amazonaws.com 请求。
+    pub fn set_credential_regions(
+        &self,
+        id: u64,
+        region: Option<Option<String>>,
+        auth_region: Option<Option<String>>,
+        api_region: Option<Option<String>>,
+    ) -> anyhow::Result<()> {
+        let credential = {
+            let entries = self.entries.lock();
+            let entry = entries
+                .iter()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            let mut credential = Self::credential_from_entry(entry);
+            let region_changed = region.is_some() || auth_region.is_some() || api_region.is_some();
+            if let Some(value) = region {
+                credential.region = value;
+            }
+            if let Some(value) = auth_region {
+                credential.auth_region = value;
+            }
+            if let Some(value) = api_region {
+                credential.api_region = value;
+            }
+            if region_changed && !credential.is_api_key_credential() {
+                credential.access_token = None;
+                credential.expires_at = None;
+                credential.profile_arn = None;
+                credential.subscription_title = None;
+            }
+            credential
+        };
+        self.persist_credential_value(&credential)?;
+
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.region = credential.region;
+            entry.credentials.auth_region = credential.auth_region;
+            entry.credentials.api_region = credential.api_region;
+            if !entry.credentials.is_api_key_credential() {
+                entry.credentials.access_token = None;
+                entry.credentials.expires_at = None;
+                entry.credentials.profile_arn = None;
+                entry.credentials.subscription_title = None;
+            }
+        }
+
+        self.publish_credentials_changed("credential_regions_updated");
+        self.notify_dispatch_state_changed();
         Ok(())
     }
 

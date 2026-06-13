@@ -14,15 +14,16 @@ use super::error::AdminServiceError;
 use super::types::{
     AccessKeysResponse, AddCredentialRequest, AddCredentialResponse, BalanceResponse,
     BatchCredentialImportDefaults, BatchCredentialImportDuplicateMode, BatchCredentialImportItem,
-    BatchCredentialImportRequest, BatchCredentialImportResponse, ClearInFlightRequest,
+    BatchCredentialImportRequest, BatchCredentialImportResponse, BatchUpdateCredentialItem,
+    BatchUpdateCredentialsRequest, BatchUpdateCredentialsResponse, ClearInFlightRequest,
     CreateProxyResourceRequest, CredentialAccountInfo, CredentialInfoRefreshItem,
     CredentialInfoRefreshResponse, CredentialStatusItem, CredentialValidationGroup,
     CredentialValidationInfo, CredentialValidationItem, CredentialValidationResponse,
     CredentialsPageResponse, CredentialsStatusResponse, ExternalPoolTestRequest,
     LoadBalancingModeResponse, ManualModelResponse, ProxyResourceResponse, ProxyResourcesResponse,
     RefreshCredentialInfoRequest, RuntimeConfigResponse, SetCredentialConcurrencyRequest,
-    SetCredentialProxyRequest, SetLoadBalancingModeRequest, SetWarmupRequest,
-    TestCredentialRequest, TestCredentialResponse, UpdateAdminApiKeyRequest,
+    SetCredentialProxyRequest, SetCredentialRegionsRequest, SetLoadBalancingModeRequest,
+    SetWarmupRequest, TestCredentialRequest, TestCredentialResponse, UpdateAdminApiKeyRequest,
     UpdateCredentialAuthRequest, UpdateProxyResourceRequest, UpdateRuntimeConfigRequest,
     UpsertManualModelRequest, UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse,
     UsageCleanupRequest, UsageCleanupStatusResponse, ValidateExistingCredentialsRequest,
@@ -930,6 +931,11 @@ impl AdminService {
                     is_current: entry.id == snapshot.current_id,
                     expires_at: entry.expires_at,
                     auth_method: entry.auth_method,
+                    region: entry.region,
+                    auth_region: entry.auth_region,
+                    api_region: entry.api_region,
+                    effective_auth_region: entry.effective_auth_region,
+                    effective_api_region: entry.effective_api_region,
                     has_profile_arn: entry.has_profile_arn,
                     refresh_token_hash: entry.refresh_token_hash,
                     api_key_hash: entry.api_key_hash,
@@ -1062,6 +1068,33 @@ impl AdminService {
             true,
             None,
             json!({ "maxConcurrentRequests": req.max_concurrent_requests }),
+        );
+        Ok(())
+    }
+
+    pub fn set_credential_regions(
+        &self,
+        id: u64,
+        req: SetCredentialRegionsRequest,
+    ) -> Result<(), AdminServiceError> {
+        let region = normalize_optional_update(req.region);
+        let auth_region = normalize_optional_update(req.auth_region);
+        let api_region = normalize_optional_update(req.api_region);
+        self.token_manager
+            .set_credential_regions(id, region.clone(), auth_region.clone(), api_region.clone())
+            .map_err(|e| self.classify_error(e, id))?;
+        self.invalidate_balance_cache(id);
+        self.audit(
+            "set_credential_regions",
+            "credential",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({
+                "region": region,
+                "authRegion": auth_region,
+                "apiRegion": api_region,
+            }),
         );
         Ok(())
     }
@@ -1570,6 +1603,7 @@ impl AdminService {
             client_id: req.client_id,
             client_secret: req.client_secret,
             kiro_api_key: req.kiro_api_key,
+            region: req.region,
             auth_region: req.auth_region,
             api_region: req.api_region,
             machine_id: req.machine_id,
@@ -1801,17 +1835,7 @@ impl AdminService {
         id: u64,
         req: SetCredentialProxyRequest,
     ) -> Result<(), AdminServiceError> {
-        let proxy_url = match req.proxy_url {
-            Some(value) => {
-                let value = required_trimmed(value, "代理 URL")?;
-                if value.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT) {
-                    Some(KiroCredentials::PROXY_DIRECT.to_string())
-                } else {
-                    Some(validate_proxy_url(&value)?)
-                }
-            }
-            None => None,
-        };
+        let proxy_url = normalize_proxy_url(req.proxy_url)?;
         self.token_manager
             .set_credential_proxy(
                 id,
@@ -1831,6 +1855,133 @@ impl AdminService {
             json!({ "proxyResourceId": req.proxy_resource_id }),
         );
         Ok(())
+    }
+
+    pub fn batch_update_credentials(
+        &self,
+        req: BatchUpdateCredentialsRequest,
+    ) -> Result<BatchUpdateCredentialsResponse, AdminServiceError> {
+        if req.ids.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "没有选择要修改的凭据".to_string(),
+            ));
+        }
+        if req.ids.len() > MAX_CREDENTIALS_PAGE_LIMIT {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "单次最多修改 {} 个凭据",
+                MAX_CREDENTIALS_PAGE_LIMIT
+            )));
+        }
+        if req.regions.is_none() && req.concurrency.is_none() && req.proxy.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "没有选择任何要修改的字段".to_string(),
+            ));
+        }
+
+        let mut seen = HashSet::new();
+        let ids: Vec<u64> = req.ids.into_iter().filter(|id| seen.insert(*id)).collect();
+        let regions = req.regions.map(|regions| {
+            (
+                normalize_optional_update(regions.region),
+                normalize_optional_update(regions.auth_region),
+                normalize_optional_update(regions.api_region),
+            )
+        });
+        let concurrency = req.concurrency.map(|value| value.max_concurrent_requests);
+        let proxy = match req.proxy {
+            Some(proxy) => Some((
+                proxy.proxy_resource_id,
+                normalize_proxy_url(proxy.proxy_url)?,
+                optional_trimmed(proxy.proxy_username),
+                optional_trimmed(proxy.proxy_password),
+            )),
+            None => None,
+        };
+
+        let mut items = Vec::with_capacity(ids.len());
+        let mut success = 0usize;
+        for id in ids {
+            let mut error: Option<String> = None;
+
+            if let Some((region, auth_region, api_region)) = &regions {
+                if let Err(err) = self
+                    .token_manager
+                    .set_credential_regions(
+                        id,
+                        region.clone(),
+                        auth_region.clone(),
+                        api_region.clone(),
+                    )
+                    .map_err(|e| self.classify_error(e, id))
+                {
+                    error = Some(err.to_string());
+                }
+            }
+
+            if error.is_none() {
+                if let Some(max_concurrent_requests) = concurrency {
+                    if let Err(err) = self
+                        .token_manager
+                        .set_credential_max_concurrent_requests(id, max_concurrent_requests)
+                        .map_err(|e| self.classify_error(e, id))
+                    {
+                        error = Some(err.to_string());
+                    }
+                }
+            }
+
+            if error.is_none() {
+                if let Some((proxy_resource_id, proxy_url, proxy_username, proxy_password)) = &proxy
+                {
+                    if let Err(err) = self
+                        .token_manager
+                        .set_credential_proxy(
+                            id,
+                            *proxy_resource_id,
+                            proxy_url.clone(),
+                            proxy_username.clone(),
+                            proxy_password.clone(),
+                        )
+                        .map_err(|e| self.classify_error(e, id))
+                    {
+                        error = Some(err.to_string());
+                    }
+                }
+            }
+
+            if error.is_none() {
+                self.invalidate_balance_cache(id);
+                success += 1;
+            }
+            items.push(BatchUpdateCredentialItem {
+                id,
+                ok: error.is_none(),
+                error,
+            });
+        }
+
+        let failed = items.len().saturating_sub(success);
+        self.audit(
+            "batch_update_credentials",
+            "credential",
+            None,
+            failed == 0,
+            (failed > 0).then(|| format!("{} 个凭据修改失败", failed)),
+            json!({
+                "total": items.len(),
+                "success": success,
+                "failed": failed,
+                "regions": regions.is_some(),
+                "concurrency": concurrency.is_some(),
+                "proxy": proxy.is_some(),
+            }),
+        );
+        Ok(BatchUpdateCredentialsResponse {
+            total: items.len(),
+            success,
+            failed,
+            items,
+        })
     }
 
     /// 删除凭据
@@ -3059,6 +3210,31 @@ fn optional_trimmed(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn normalize_optional_update(value: Option<Option<String>>) -> Option<Option<String>> {
+    value.map(|value| {
+        value.and_then(|value| {
+            let value = value.trim().to_string();
+            (!value.is_empty()).then_some(value)
+        })
+    })
+}
+
+fn normalize_proxy_url(value: Option<String>) -> Result<Option<String>, AdminServiceError> {
+    match value {
+        Some(value) => {
+            let value = value.trim();
+            if value.is_empty() {
+                Ok(None)
+            } else if value.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT) {
+                Ok(Some(KiroCredentials::PROXY_DIRECT.to_string()))
+            } else {
+                validate_proxy_url(value).map(Some)
+            }
+        }
+        None => Ok(None),
+    }
+}
+
 fn validate_proxy_url(value: &str) -> Result<String, AdminServiceError> {
     let parsed = url::Url::parse(value).map_err(|_| {
         AdminServiceError::InvalidCredential(
@@ -3957,6 +4133,11 @@ mod tests {
             is_current: false,
             expires_at: None,
             auth_method: None,
+            region: None,
+            auth_region: None,
+            api_region: None,
+            effective_auth_region: "us-east-1".to_string(),
+            effective_api_region: "us-east-1".to_string(),
             has_profile_arn: false,
             refresh_token_hash: None,
             api_key_hash: None,

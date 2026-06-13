@@ -13,10 +13,13 @@ import type {
   SetWarmupRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  BatchUpdateCredentialsRequest,
+  BatchUpdateCredentialsResponse,
   AccessKeysResponse,
   TestCredentialRequest,
   TestCredentialResponse,
   SetCredentialProxyRequest,
+  SetCredentialRegionsRequest,
   RuntimeConfig,
   UpdateAdminApiKeyRequest,
   UpdateRuntimeConfigRequest,
@@ -122,6 +125,21 @@ export async function setCredentialConcurrency(
   req: SetCredentialConcurrencyRequest
 ): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/concurrency`, req)
+  return data
+}
+
+export async function setCredentialRegions(
+  id: number,
+  req: SetCredentialRegionsRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/regions`, req)
+  return data
+}
+
+export async function batchUpdateCredentials(
+  req: BatchUpdateCredentialsRequest
+): Promise<BatchUpdateCredentialsResponse> {
+  const { data } = await api.post<BatchUpdateCredentialsResponse>('/credentials/batch-update', req)
   return data
 }
 

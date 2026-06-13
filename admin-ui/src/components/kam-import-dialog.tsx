@@ -9,11 +9,18 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
-import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
+import { useCredentials, useAddCredential, useDeleteCredential, useProxyResources } from '@/hooks/use-credentials'
+import {
+  CredentialParameterDefaultsPanel,
+  initialParameterDefaults,
+  mergeCredentialDefaults,
+  optionalTrimmed,
+} from '@/components/credential-parameter-defaults'
 import { getCredentialBalance, setCredentialDisabled, testCredential } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
 import { camelizeKeys } from '@/lib/object-keys'
+import type { AddCredentialRequest } from '@/types/api'
 
 interface KamImportDialogProps {
   open: boolean
@@ -52,7 +59,34 @@ interface VerificationResult {
   rollbackError?: string
 }
 
+type ImportVerificationMode = 'model_and_subscription' | 'subscription_only'
 
+async function verifyImportedCredential(
+  credentialId: number,
+  mode: ImportVerificationMode
+): Promise<{ model: string; response: string }> {
+  if (mode === 'subscription_only') {
+    const info = await getCredentialBalance(credentialId)
+    return {
+      model: '订阅查询',
+      response: `订阅: ${info.subscriptionTitle || '未知'}，用量 ${info.currentUsage}/${info.usageLimit}`,
+    }
+  }
+
+  const testResult = await testCredential(credentialId, {
+    model: DEFAULT_TEST_MODEL,
+    prompt: DEFAULT_TEST_PROMPT,
+  })
+  try {
+    await getCredentialBalance(credentialId)
+  } catch (error) {
+    toast.warning(`凭据 #${credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
+  }
+  return {
+    model: testModelLabel(testResult.model),
+    response: testResult.response,
+  }
+}
 
 // 兼容 KAM 1.8.3 新版平铺格式，统一转换为旧格式（credentials 嵌套结构）
 function normalizeKamAccount(item: unknown): unknown {
@@ -174,15 +208,19 @@ async function parseKamFiles(files: File[]): Promise<{ accounts: KamAccount[]; e
 
 export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
+  const [verificationMode, setVerificationMode] = useState<ImportVerificationMode>('model_and_subscription')
   const [importing, setImporting] = useState(false)
   const [skipErrorAccounts, setSkipErrorAccounts] = useState(true)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
   const [results, setResults] = useState<VerificationResult[]>([])
+  const [defaults, setDefaults] = useState(initialParameterDefaults)
 
   const { data: existingCredentials } = useCredentials({ enabled: open })
   const { mutateAsync: addCredential } = useAddCredential()
   const { mutateAsync: deleteCredential } = useDeleteCredential()
+  const proxyResources = useProxyResources()
+  const proxyResourceOptions = (proxyResources.data?.resources || []).filter(resource => resource.enabled)
 
   const rollbackCredential = async (id: number): Promise<{ success: boolean; error?: string }> => {
     try {
@@ -203,6 +241,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
+    setDefaults(initialParameterDefaults())
+    setVerificationMode('model_and_subscription')
   }
 
   const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -338,32 +378,26 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
           }
 
-          const addedCred = await addCredential({
+          const accountRegion = optionalTrimmed(cred.region) || optionalTrimmed(defaults.region)
+          const baseCredential: AddCredentialRequest = {
             refreshToken: token,
             authMethod,
             email: account.email?.trim() || undefined,
             profileArn: cred.profileArn?.trim() || undefined,
             region: cred.region?.trim() || undefined,
-            authRegion: cred.region?.trim() || undefined,
+            authRegion: optionalTrimmed(defaults.authRegion) || accountRegion,
             apiRegion: cred.apiRegion?.trim() || undefined,
             clientId,
             clientSecret,
             machineId: account.machineId?.trim() || undefined,
-          })
+          }
+          const addedCred = await addCredential(mergeCredentialDefaults(baseCredential, { ...defaults, authRegion: '' }))
 
           addedCredId = addedCred.credentialId
 
           await new Promise(resolve => setTimeout(resolve, 1000))
 
-          const testResult = await testCredential(addedCred.credentialId, {
-            model: DEFAULT_TEST_MODEL,
-            prompt: DEFAULT_TEST_PROMPT,
-          })
-          try {
-            await getCredentialBalance(addedCred.credentialId)
-          } catch (error) {
-            toast.warning(`凭据 #${addedCred.credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
-          }
+          const verification = await verifyImportedCredential(addedCred.credentialId, verificationMode)
 
           successCount++
           existingTokenHashes.add(tokenHash)
@@ -373,8 +407,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             next[i] = {
               ...next[i],
               status: 'verified',
-              model: testModelLabel(testResult.model),
-              response: testResult.response,
+              model: verification.model,
+              response: verification.response,
               email: addedCred.email || account.email,
               credentialId: addedCred.credentialId,
             }
@@ -531,6 +565,33 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             />
             <p className="text-xs text-muted-foreground">
               支持单选或多选文件，每个文件可包含单个账号或多个账号。
+            </p>
+          </div>
+
+          <CredentialParameterDefaultsPanel
+            defaults={defaults}
+            onChange={setDefaults}
+            proxyResources={proxyResourceOptions}
+            disabled={importing}
+            title="KAM 导入默认参数"
+          />
+
+          <div className="rounded-md border bg-muted/20 p-3">
+            <label htmlFor="kamImportVerificationMode" className="text-sm font-semibold">
+              验活方式
+            </label>
+            <select
+              id="kamImportVerificationMode"
+              value={verificationMode}
+              onChange={(event) => setVerificationMode(event.target.value as ImportVerificationMode)}
+              disabled={importing}
+              className="mt-2 flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <option value="model_and_subscription">测试模型 + 查询订阅</option>
+              <option value="subscription_only">只查询订阅（不请求模型）</option>
+            </select>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+              只查询订阅时不会发送模型测试请求；订阅查询失败的凭据仍会按验活失败回滚。
             </p>
           </div>
 

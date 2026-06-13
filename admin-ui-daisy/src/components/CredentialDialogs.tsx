@@ -8,11 +8,13 @@ import { parseCredentialImportFiles, parseCredentialImportText } from '@/lib/cre
 import { parseKamFiles, parseKamJson, type KamAccount } from '@/lib/kam-import'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, TEST_MODELS, testModelLabel } from '@/lib/test-models'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
-import { useAddCredential, useDeleteCredential, useProxyResources, useTestCredential } from '@/hooks/use-credentials'
+import { useAddCredential, useBatchUpdateCredentials, useDeleteCredential, useProxyResources, useTestCredential } from '@/hooks/use-credentials'
 import type {
   AddCredentialRequest,
+  BatchUpdateCredentialsRequest,
   CredentialExportFormat,
   CredentialStatusItem,
+  ProxyResource,
   TestCredentialResponse,
 } from '@/types/api'
 
@@ -24,12 +26,14 @@ function SecretInput({
   visible,
   onToggle,
   placeholder,
+  disabled,
 }: {
   value: string
   onChange: (value: string) => void
   visible: boolean
   onToggle: () => void
   placeholder?: string
+  disabled?: boolean
 }) {
   return (
     <div className="relative">
@@ -40,6 +44,7 @@ function SecretInput({
         type={visible ? 'text' : 'password'}
         value={value}
         placeholder={placeholder}
+        disabled={disabled}
         onChange={(event) => onChange(event.target.value)}
       />
       <Button
@@ -48,6 +53,7 @@ function SecretInput({
         size="xs"
         className="absolute right-1 top-1 h-7 min-h-0 px-2"
         onClick={onToggle}
+        disabled={disabled}
         title={visible ? '隐藏' : '显示'}
       >
         {visible ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
@@ -56,7 +62,7 @@ function SecretInput({
   )
 }
 
-function initialCredentialForm(): Required<Pick<AddCredentialRequest, 'email' | 'refreshToken' | 'kiroApiKey' | 'profileArn' | 'region' | 'authRegion' | 'apiRegion' | 'clientId' | 'clientSecret' | 'machineId' | 'proxyUrl' | 'proxyUsername' | 'proxyPassword' | 'endpoint'>> & { authMethod: AuthMethod; priority: string; proxyResourceId: string } {
+function initialCredentialForm(): Required<Pick<AddCredentialRequest, 'email' | 'refreshToken' | 'kiroApiKey' | 'profileArn' | 'region' | 'authRegion' | 'apiRegion' | 'clientId' | 'clientSecret' | 'machineId' | 'proxyUrl' | 'proxyUsername' | 'proxyPassword' | 'endpoint'>> & { authMethod: AuthMethod; priority: string; maxConcurrentRequests: string; proxyResourceId: string } {
   return {
     authMethod: 'social',
     refreshToken: '',
@@ -69,6 +75,7 @@ function initialCredentialForm(): Required<Pick<AddCredentialRequest, 'email' | 
     clientSecret: '',
     email: '',
     priority: '0',
+    maxConcurrentRequests: '',
     machineId: '',
     proxyUrl: '',
     proxyUsername: '',
@@ -92,6 +99,7 @@ function formFromCredential(credential: AddCredentialRequest) {
     clientSecret: credential.clientSecret || '',
     email: credential.email || '',
     priority: String(credential.priority ?? 0),
+    maxConcurrentRequests: typeof credential.maxConcurrentRequests === 'number' ? String(credential.maxConcurrentRequests) : '',
     machineId: credential.machineId || '',
     proxyUrl: credential.proxyUrl || '',
     proxyUsername: credential.proxyUsername || '',
@@ -99,6 +107,238 @@ function formFromCredential(credential: AddCredentialRequest) {
     proxyResourceId: credential.proxyResourceId ? String(credential.proxyResourceId) : '',
     endpoint: credential.endpoint || '',
   }
+}
+
+interface CredentialParameterDefaults {
+  priority: string
+  maxConcurrentRequests: string
+  region: string
+  authRegion: string
+  apiRegion: string
+  machineId: string
+  endpoint: string
+  proxyResourceId: string
+  proxyUrl: string
+  proxyUsername: string
+  proxyPassword: string
+}
+
+type ImportVerificationMode = 'model_and_subscription' | 'subscription_only'
+
+function initialParameterDefaults(): CredentialParameterDefaults {
+  return {
+    priority: '',
+    maxConcurrentRequests: '',
+    region: '',
+    authRegion: '',
+    apiRegion: '',
+    machineId: '',
+    endpoint: '',
+    proxyResourceId: '',
+    proxyUrl: '',
+    proxyUsername: '',
+    proxyPassword: '',
+  }
+}
+
+function optionalTrimmed(value?: string | null) {
+  const trimmed = value?.trim()
+  return trimmed ? trimmed : undefined
+}
+
+function parseOptionalNonNegativeInteger(value: string, label: string): number | undefined {
+  const trimmed = value.trim()
+  if (!trimmed) return undefined
+  const parsed = Number(trimmed)
+  if (!Number.isInteger(parsed) || parsed < 0) throw new Error(`${label}必须是非负整数`)
+  return parsed
+}
+
+async function verifyImportedCredential(
+  credentialId: number,
+  mode: ImportVerificationMode
+): Promise<{ model: string; response: string }> {
+  if (mode === 'subscription_only') {
+    const info = await getCredentialBalance(credentialId)
+    return {
+      model: '订阅查询',
+      response: `订阅: ${info.subscriptionTitle || '未知'}，用量 ${info.currentUsage}/${info.usageLimit}`,
+    }
+  }
+
+  const tested = await testCredential(credentialId, { model: DEFAULT_TEST_MODEL, prompt: DEFAULT_TEST_PROMPT })
+  try {
+    await getCredentialBalance(credentialId)
+  } catch (error) {
+    toast.warning(`凭据 #${credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
+  }
+  return {
+    model: testModelLabel(tested.model),
+    response: tested.response,
+  }
+}
+
+function ImportVerificationModeSelect({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: ImportVerificationMode
+  onChange: (value: ImportVerificationMode) => void
+  disabled?: boolean
+}) {
+  return (
+    <div className="rounded-lg border border-base-300 bg-base-200/40 p-3">
+      <FieldLabel title="验活方式" description="只查询订阅时不会发送模型测试请求；订阅查询失败的凭据仍会按验活失败回滚。">
+        <Select bordered size="sm" value={value} disabled={disabled} onChange={(event) => onChange(event.target.value as ImportVerificationMode)}>
+          <Select.Option value="model_and_subscription">测试模型 + 查询订阅</Select.Option>
+          <Select.Option value="subscription_only">只查询订阅（不请求模型）</Select.Option>
+        </Select>
+      </FieldLabel>
+    </div>
+  )
+}
+
+function clearDirectProxyDraft<T extends { proxyUrl: string; proxyUsername: string; proxyPassword: string }>(values: T): T {
+  return { ...values, proxyUrl: '', proxyUsername: '', proxyPassword: '' }
+}
+
+function clearProxyResourceDraft<T extends { proxyResourceId: string }>(values: T): T {
+  return { ...values, proxyResourceId: '' }
+}
+
+function mergeCredentialDefaults(credential: AddCredentialRequest, defaults: CredentialParameterDefaults): AddCredentialRequest {
+  const defaultProxyResourceId = parseOptionalNonNegativeInteger(defaults.proxyResourceId, '代理资源 ID')
+  const credentialHasDirectProxy = Boolean(
+    optionalTrimmed(credential.proxyUrl) ||
+    optionalTrimmed(credential.proxyUsername) ||
+    optionalTrimmed(credential.proxyPassword)
+  )
+  const proxyResourceId =
+    typeof credential.proxyResourceId !== 'undefined'
+      ? credential.proxyResourceId
+      : credentialHasDirectProxy
+        ? undefined
+        : defaultProxyResourceId
+  const useProxyResource = typeof proxyResourceId === 'number'
+  return {
+    ...credential,
+    priority: credential.priority ?? parseOptionalNonNegativeInteger(defaults.priority, '默认优先级'),
+    maxConcurrentRequests: typeof credential.maxConcurrentRequests === 'undefined'
+      ? parseOptionalNonNegativeInteger(defaults.maxConcurrentRequests, '默认账号并发')
+      : credential.maxConcurrentRequests,
+    region: optionalTrimmed(credential.region) || optionalTrimmed(defaults.region),
+    authRegion: optionalTrimmed(credential.authRegion) || optionalTrimmed(defaults.authRegion),
+    apiRegion: optionalTrimmed(credential.apiRegion) || optionalTrimmed(defaults.apiRegion),
+    machineId: optionalTrimmed(credential.machineId) || optionalTrimmed(defaults.machineId),
+    endpoint: optionalTrimmed(credential.endpoint) || optionalTrimmed(defaults.endpoint),
+    proxyResourceId,
+    proxyUrl: optionalTrimmed(credential.proxyUrl) || (useProxyResource ? undefined : optionalTrimmed(defaults.proxyUrl)),
+    proxyUsername: optionalTrimmed(credential.proxyUsername) || (useProxyResource ? undefined : optionalTrimmed(defaults.proxyUsername)),
+    proxyPassword: optionalTrimmed(credential.proxyPassword) || (useProxyResource ? undefined : optionalTrimmed(defaults.proxyPassword)),
+  }
+}
+
+function CredentialParameterDefaultsPanel({
+  defaults,
+  onChange,
+  proxyResources,
+  disabled,
+  title = '默认参数',
+}: {
+  defaults: CredentialParameterDefaults
+  onChange: (defaults: CredentialParameterDefaults) => void
+  proxyResources: ProxyResource[]
+  disabled?: boolean
+  title?: string
+}) {
+  const [showProxyUsername, setShowProxyUsername] = useState(false)
+  const [showProxyPassword, setShowProxyPassword] = useState(false)
+  const update = (key: keyof CredentialParameterDefaults, value: string) => {
+    if (key === 'proxyResourceId' && value) {
+      onChange(clearDirectProxyDraft({ ...defaults, proxyResourceId: value }))
+      return
+    }
+    if ((key === 'proxyUrl' || key === 'proxyUsername' || key === 'proxyPassword') && value.trim()) {
+      onChange(clearProxyResourceDraft({ ...defaults, [key]: value }))
+      return
+    }
+    if (key === 'region' && value.trim() && !defaults.authRegion.trim()) {
+      onChange({ ...defaults, region: value, authRegion: value })
+      return
+    }
+    onChange({ ...defaults, [key]: value })
+  }
+  const proxyLocked = Boolean(defaults.proxyResourceId)
+  return (
+    <div className="rounded-lg border border-base-300 bg-base-200/40 p-3">
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <div>
+          <div className="text-sm font-semibold">{title}</div>
+          <div className="mt-1 text-xs text-base-content/55">只填充每条凭据里缺失的字段；导入 JSON 中已有的字段会保留。</div>
+        </div>
+        <Button type="button" color="ghost" size="xs" disabled={disabled} onClick={() => onChange(initialParameterDefaults())}>
+          清空
+        </Button>
+      </div>
+      <div className="form-grid">
+        <FieldLabel title="默认优先级" description="留空时使用凭据自身值或 0">
+          <Input bordered size="sm" type="number" min={0} value={defaults.priority} disabled={disabled} onChange={(event) => update('priority', event.target.value)} />
+        </FieldLabel>
+        <FieldLabel title="默认账号并发" description="留空继承全局，0 表示不限">
+          <Input bordered size="sm" type="number" min={0} value={defaults.maxConcurrentRequests} disabled={disabled} onChange={(event) => update('maxConcurrentRequests', event.target.value)} />
+        </FieldLabel>
+        <FieldLabel title="Region 兼容字段" description="未设置 Auth Region 时作为 token 刷新回退">
+          <Input bordered size="sm" className="font-mono" value={defaults.region} disabled={disabled} onChange={(event) => update('region', event.target.value)} placeholder="us-east-1" />
+        </FieldLabel>
+        <FieldLabel title="Auth Region" description="token 刷新区域">
+          <Input bordered size="sm" className="font-mono" value={defaults.authRegion} disabled={disabled} onChange={(event) => update('authRegion', event.target.value)} placeholder="us-east-1" />
+        </FieldLabel>
+        <FieldLabel title="API Region" description="API 请求区域">
+          <Input bordered size="sm" className="font-mono" value={defaults.apiRegion} disabled={disabled} onChange={(event) => update('apiRegion', event.target.value)} placeholder="us-east-1" />
+        </FieldLabel>
+        <FieldLabel title="Machine ID" description="留空使用全局配置或自动派生">
+          <Input bordered size="sm" value={defaults.machineId} disabled={disabled} onChange={(event) => update('machineId', event.target.value)} />
+        </FieldLabel>
+        <FieldLabel title="端点" description="留空使用全局 defaultEndpoint">
+          <Input bordered size="sm" value={defaults.endpoint} disabled={disabled} onChange={(event) => update('endpoint', event.target.value)} placeholder="ide / cli" />
+        </FieldLabel>
+        <FieldLabel title="代理资源" description="选择代理资源会清空直连代理；填写直连代理会自动取消资源">
+          <Select bordered size="sm" value={defaults.proxyResourceId} disabled={disabled} onChange={(event) => update('proxyResourceId', event.target.value)}>
+            <Select.Option value="">不绑定</Select.Option>
+            {proxyResources.map((resource) => (
+              <Select.Option key={resource.id} value={String(resource.id)}>
+                {resource.name}
+              </Select.Option>
+            ))}
+          </Select>
+        </FieldLabel>
+        <FieldLabel title="独立代理 URL" description={proxyLocked ? '已选择代理资源，输入前请先取消资源' : '可填 direct 或完整代理 URL；填写后会取消代理资源'}>
+          <Input bordered size="sm" value={defaults.proxyUrl} disabled={disabled || proxyLocked} onChange={(event) => update('proxyUrl', event.target.value)} placeholder="socks5h://127.0.0.1:1080" />
+        </FieldLabel>
+        <FieldLabel title="代理用户名">
+          <SecretInput
+            value={defaults.proxyUsername}
+            onChange={(value) => update('proxyUsername', value)}
+            visible={showProxyUsername}
+            onToggle={() => setShowProxyUsername((value) => !value)}
+            disabled={disabled || proxyLocked}
+            placeholder="可选"
+          />
+        </FieldLabel>
+        <FieldLabel title="代理密码">
+          <SecretInput
+            value={defaults.proxyPassword}
+            onChange={(value) => update('proxyPassword', value)}
+            visible={showProxyPassword}
+            onToggle={() => setShowProxyPassword((value) => !value)}
+            disabled={disabled || proxyLocked}
+            placeholder="可选"
+          />
+        </FieldLabel>
+      </div>
+    </div>
+  )
 }
 
 export function AddCredentialModal({
@@ -124,7 +364,29 @@ export function AddCredentialModal({
     }
   }, [open])
 
-  const update = (key: keyof typeof form, value: string) => setForm((prev) => ({ ...prev, [key]: value }))
+  const update = (key: keyof typeof form, value: string) => setForm((prev) => {
+    if (key === 'authMethod') {
+      const authMethod = value as AuthMethod
+      return {
+        ...prev,
+        authMethod,
+        refreshToken: authMethod === 'api_key' ? '' : prev.refreshToken,
+        kiroApiKey: authMethod === 'api_key' ? prev.kiroApiKey : '',
+        clientId: authMethod === 'idc' ? prev.clientId : '',
+        clientSecret: authMethod === 'idc' ? prev.clientSecret : '',
+      }
+    }
+    if (key === 'region' && value.trim() && !prev.authRegion.trim()) {
+      return { ...prev, region: value, authRegion: value }
+    }
+    if (key === 'proxyResourceId' && value) {
+      return clearDirectProxyDraft({ ...prev, proxyResourceId: value })
+    }
+    if ((key === 'proxyUrl' || key === 'proxyUsername' || key === 'proxyPassword') && value.trim()) {
+      return clearProxyResourceDraft({ ...prev, [key]: value })
+    }
+    return { ...prev, [key]: value }
+  })
 
   const handleFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files || [])
@@ -149,6 +411,12 @@ export function AddCredentialModal({
     }
     const priority = Number(form.priority)
     if (!Number.isInteger(priority) || priority < 0) return toast.error('优先级必须是非负整数')
+    let maxConcurrentRequests: number | undefined
+    try {
+      maxConcurrentRequests = parseOptionalNonNegativeInteger(form.maxConcurrentRequests, '账号并发覆盖')
+    } catch (error) {
+      return toast.error(extractErrorMessage(error))
+    }
 
     add.mutate(
       {
@@ -163,6 +431,7 @@ export function AddCredentialModal({
         clientSecret: isApiKey ? undefined : form.clientSecret.trim() || undefined,
         email: form.email.trim() || undefined,
         priority,
+        maxConcurrentRequests,
         machineId: form.machineId.trim() || undefined,
         proxyResourceId: form.proxyResourceId ? Number(form.proxyResourceId) : undefined,
         proxyUrl: form.proxyUrl.trim() || undefined,
@@ -220,14 +489,20 @@ export function AddCredentialModal({
               </FieldLabel>
             </>
           )}
+          <FieldLabel title="Region 兼容字段" description="留空使用全局配置；未设置 Auth Region 时作为 token 刷新回退">
+            <Input bordered size="sm" className="font-mono" value={form.region} onChange={(event) => update('region', event.target.value)} placeholder="us-east-1" />
+          </FieldLabel>
           <FieldLabel title="Auth Region" description="留空使用全局配置">
-            <Input bordered size="sm" value={form.authRegion} onChange={(event) => update('authRegion', event.target.value)} />
+            <Input bordered size="sm" className="font-mono" value={form.authRegion} onChange={(event) => update('authRegion', event.target.value)} placeholder="us-east-1" />
           </FieldLabel>
           <FieldLabel title="API Region" description="留空使用全局配置">
-            <Input bordered size="sm" value={form.apiRegion} onChange={(event) => update('apiRegion', event.target.value)} />
+            <Input bordered size="sm" className="font-mono" value={form.apiRegion} onChange={(event) => update('apiRegion', event.target.value)} placeholder="us-east-1" />
           </FieldLabel>
           <FieldLabel title="优先级" description="数字越小优先级越高">
             <Input bordered size="sm" type="number" min={0} value={form.priority} onChange={(event) => update('priority', event.target.value)} />
+          </FieldLabel>
+          <FieldLabel title="账号并发覆盖" description="留空继承全局，0 表示该账号不限并发">
+            <Input bordered size="sm" type="number" min={0} value={form.maxConcurrentRequests} onChange={(event) => update('maxConcurrentRequests', event.target.value)} />
           </FieldLabel>
           <FieldLabel title="Machine ID" description="留空使用配置中字段或自动派生">
             <Input bordered size="sm" value={form.machineId} onChange={(event) => update('machineId', event.target.value)} />
@@ -235,7 +510,7 @@ export function AddCredentialModal({
           <FieldLabel title="端点" description="留空使用全局 defaultEndpoint">
             <Input bordered size="sm" value={form.endpoint} onChange={(event) => update('endpoint', event.target.value)} placeholder="ide / cli" />
           </FieldLabel>
-          <FieldLabel title="代理资源" description="新增凭据会立即验证 Token，只能选择已启用的代理资源">
+          <FieldLabel title="代理资源" description="选择代理资源会清空直连代理；填写直连代理会自动取消资源">
             <Select bordered size="sm" value={form.proxyResourceId} onChange={(event) => update('proxyResourceId', event.target.value)}>
               <Select.Option value="">不绑定</Select.Option>
               {proxyResourceOptions.map((resource) => (
@@ -245,8 +520,8 @@ export function AddCredentialModal({
               ))}
             </Select>
           </FieldLabel>
-          <FieldLabel title="独立代理 URL" description="可选。只对该凭据生效；如果同时选择代理资源，后端会按项目现有优先级处理。">
-            <Input bordered size="sm" value={form.proxyUrl} onChange={(event) => update('proxyUrl', event.target.value)} placeholder="socks5h://127.0.0.1:1080" />
+          <FieldLabel title="独立代理 URL" description={form.proxyResourceId ? '已选择代理资源，输入前请先取消资源' : '可填 direct 或完整代理 URL；填写后会取消代理资源'}>
+            <Input bordered size="sm" value={form.proxyUrl} onChange={(event) => update('proxyUrl', event.target.value)} disabled={Boolean(form.proxyResourceId)} placeholder="socks5h://127.0.0.1:1080" />
           </FieldLabel>
           <FieldLabel title="代理用户名">
             <SecretInput
@@ -254,6 +529,7 @@ export function AddCredentialModal({
               onChange={(value) => update('proxyUsername', value)}
               visible={showProxyUsername}
               onToggle={() => setShowProxyUsername((value) => !value)}
+              disabled={Boolean(form.proxyResourceId)}
             />
           </FieldLabel>
           <FieldLabel title="代理密码">
@@ -262,6 +538,7 @@ export function AddCredentialModal({
               onChange={(value) => update('proxyPassword', value)}
               visible={showProxyPassword}
               onToggle={() => setShowProxyPassword((value) => !value)}
+              disabled={Boolean(form.proxyResourceId)}
             />
           </FieldLabel>
         </div>
@@ -486,12 +763,18 @@ export function BatchImportModal({
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState('')
   const [results, setResults] = useState<VerificationResult[]>([])
+  const [defaults, setDefaults] = useState<CredentialParameterDefaults>(initialParameterDefaults)
+  const [verificationMode, setVerificationMode] = useState<ImportVerificationMode>('model_and_subscription')
+  const proxyResources = useProxyResources()
+  const proxyResourceOptions = (proxyResources.data?.resources || []).filter((resource) => resource.enabled)
 
   const reset = () => {
     setJsonInput('')
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
+    setDefaults(initialParameterDefaults())
+    setVerificationMode('model_and_subscription')
   }
 
   const appendCredentials = (credentials: AddCredentialRequest[]) => {
@@ -532,6 +815,12 @@ export function BatchImportModal({
       }
     }
     if (!credentials.length) return toast.error('没有可导入的凭据')
+    try {
+      credentials = credentials.map((credential) => mergeCredentialDefaults(credential, defaults))
+    } catch (error) {
+      toast.error(extractErrorMessage(error))
+      return
+    }
 
     setImporting(true)
     setProgress({ current: 0, total: credentials.length })
@@ -596,6 +885,7 @@ export function BatchImportModal({
           email: cred.email?.trim() || undefined,
           profileArn: cred.profileArn?.trim() || undefined,
           priority: cred.priority || 0,
+          maxConcurrentRequests: cred.maxConcurrentRequests ?? undefined,
           region: cred.region?.trim() || undefined,
           authRegion: cred.authRegion?.trim() || undefined,
           apiRegion: cred.apiRegion?.trim() || undefined,
@@ -610,19 +900,14 @@ export function BatchImportModal({
         })
         addedId = added.credentialId
         await new Promise((resolve) => setTimeout(resolve, 1000))
-        const tested = await testCredential(added.credentialId, { model: DEFAULT_TEST_MODEL, prompt: DEFAULT_TEST_PROMPT })
-        try {
-          await getCredentialBalance(added.credentialId)
-        } catch (error) {
-          toast.warning(`凭据 #${added.credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
-        }
+        const verification = await verifyImportedCredential(added.credentialId, verificationMode)
         successCount += 1
         if (isApiKeyCred) existingApiKeyHashes.add(hash)
         else existingOauthHashes.add(hash)
         setResults((prev) =>
           prev.map((item, i) =>
             i === index
-              ? { ...item, status: 'verified', model: testModelLabel(tested.model), response: tested.response, email: added.email || cred.email, credentialId: added.credentialId }
+              ? { ...item, status: 'verified', model: verification.model, response: verification.response, email: added.email || cred.email, credentialId: added.credentialId }
               : item
           )
         )
@@ -674,6 +959,18 @@ export function BatchImportModal({
             <input type="file" accept=".json,.jsonl,.txt,application/json" multiple className="hidden" onChange={handleFile} disabled={importing} />
           </Button>
         </div>
+        {results.length === 0 && (
+          <CredentialParameterDefaultsPanel
+            title="导入默认参数"
+            defaults={defaults}
+            onChange={setDefaults}
+            proxyResources={proxyResourceOptions}
+            disabled={importing}
+          />
+        )}
+        {results.length === 0 && (
+          <ImportVerificationModeSelect value={verificationMode} onChange={setVerificationMode} disabled={importing} />
+        )}
         <Textarea
           bordered
           size="sm"
@@ -722,6 +1019,10 @@ export function KamImportModal({
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState('')
   const [results, setResults] = useState<VerificationResult[]>([])
+  const [defaults, setDefaults] = useState<CredentialParameterDefaults>(initialParameterDefaults)
+  const [verificationMode, setVerificationMode] = useState<ImportVerificationMode>('model_and_subscription')
+  const proxyResources = useProxyResources()
+  const proxyResourceOptions = (proxyResources.data?.resources || []).filter((resource) => resource.enabled)
 
   const preview = useMemo(() => {
     if (!jsonInput.trim()) return { accounts: [] as KamAccount[], error: '' }
@@ -737,6 +1038,8 @@ export function KamImportModal({
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
+    setDefaults(initialParameterDefaults())
+    setVerificationMode('model_and_subscription')
   }
 
   const handleFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -772,6 +1075,12 @@ export function KamImportModal({
       }
     }
     if (!accounts.length) return toast.error('没有可导入的账号')
+    try {
+      mergeCredentialDefaults({}, defaults)
+    } catch (error) {
+      toast.error(extractErrorMessage(error))
+      return
+    }
 
     setImporting(true)
     setProgress({ current: 0, total: accounts.length })
@@ -812,32 +1121,29 @@ export function KamImportModal({
         const clientSecret = account.credentials.clientSecret?.trim() || undefined
         const authMethod = clientId && clientSecret ? 'idc' : 'social'
         if (authMethod === 'social' && (clientId || clientSecret)) throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
-        const added = await addCredential({
+        const accountRegion = account.credentials.region?.trim() || undefined
+        const baseCredential: AddCredentialRequest = {
           refreshToken: token,
           authMethod,
           email: account.email?.trim() || undefined,
           profileArn: account.credentials.profileArn?.trim() || undefined,
-          region: account.credentials.region?.trim() || undefined,
-          authRegion: account.credentials.region?.trim() || undefined,
+          region: accountRegion,
+          authRegion: optionalTrimmed(defaults.authRegion) || accountRegion,
           apiRegion: account.credentials.apiRegion?.trim() || undefined,
           clientId,
           clientSecret,
           machineId: account.machineId?.trim() || undefined,
-        })
+        }
+        const added = await addCredential(mergeCredentialDefaults(baseCredential, { ...defaults, authRegion: '' }))
         addedId = added.credentialId
         await new Promise((resolve) => setTimeout(resolve, 1000))
-        const tested = await testCredential(added.credentialId, { model: DEFAULT_TEST_MODEL, prompt: DEFAULT_TEST_PROMPT })
-        try {
-          await getCredentialBalance(added.credentialId)
-        } catch (error) {
-          toast.warning(`凭据 #${added.credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
-        }
+        const verification = await verifyImportedCredential(added.credentialId, verificationMode)
         successCount += 1
         existingTokenHashes.add(tokenHash)
         setResults((prev) =>
           prev.map((item, i) =>
             i === index
-              ? { ...item, status: 'verified', model: testModelLabel(tested.model), response: tested.response, email: added.email || account.email, credentialId: added.credentialId }
+              ? { ...item, status: 'verified', model: verification.model, response: verification.response, email: added.email || account.email, credentialId: added.credentialId }
               : item
           )
         )
@@ -890,6 +1196,18 @@ export function KamImportModal({
             <input type="file" accept=".json,.jsonl,.txt,application/json" multiple className="hidden" onChange={handleFile} disabled={importing} />
           </Button>
         </div>
+        {results.length === 0 && (
+          <CredentialParameterDefaultsPanel
+            title="KAM 导入默认参数"
+            defaults={defaults}
+            onChange={setDefaults}
+            proxyResources={proxyResourceOptions}
+            disabled={importing}
+          />
+        )}
+        {results.length === 0 && (
+          <ImportVerificationModeSelect value={verificationMode} onChange={setVerificationMode} disabled={importing} />
+        )}
         <Textarea
           bordered
           size="sm"
@@ -927,6 +1245,246 @@ export function KamImportModal({
               重试失败账号
             </Button>
           )}
+        </Modal.Actions>
+      </div>
+    </ModalShell>
+  )
+}
+
+function optionalRegionUpdate(enabled: boolean, value: string): string | null | undefined {
+  if (!enabled) return undefined
+  const trimmed = value.trim()
+  return trimmed ? trimmed : null
+}
+
+export function BatchEditCredentialsModal({
+  open,
+  ids,
+  onClose,
+  onDone,
+}: {
+  open: boolean
+  ids: number[]
+  onClose: () => void
+  onDone: () => void
+}) {
+  const [updateRegions, setUpdateRegions] = useState(false)
+  const [updateRegion, setUpdateRegion] = useState(false)
+  const [updateAuthRegion, setUpdateAuthRegion] = useState(false)
+  const [updateApiRegion, setUpdateApiRegion] = useState(false)
+  const [regionValue, setRegionValue] = useState('')
+  const [authRegionValue, setAuthRegionValue] = useState('')
+  const [apiRegionValue, setApiRegionValue] = useState('')
+  const [updateConcurrency, setUpdateConcurrency] = useState(false)
+  const [concurrencyValue, setConcurrencyValue] = useState('')
+  const [updateProxy, setUpdateProxy] = useState(false)
+  const [proxyResourceId, setProxyResourceId] = useState('')
+  const [proxyUrl, setProxyUrl] = useState('')
+  const [proxyUsername, setProxyUsername] = useState('')
+  const [proxyPassword, setProxyPassword] = useState('')
+  const [showProxyUsername, setShowProxyUsername] = useState(false)
+  const [showProxyPassword, setShowProxyPassword] = useState(false)
+  const batchUpdate = useBatchUpdateCredentials()
+  const proxyResources = useProxyResources()
+  const proxyResourceOptions = (proxyResources.data?.resources || []).filter((resource) => resource.enabled)
+  const proxyLocked = Boolean(proxyResourceId)
+
+  const setRegionsEnabled = (enabled: boolean) => {
+    setUpdateRegions(enabled)
+    setUpdateAuthRegion(enabled)
+    setUpdateApiRegion(enabled)
+    if (!enabled) {
+      setUpdateRegion(false)
+      setRegionValue('')
+      setAuthRegionValue('')
+      setApiRegionValue('')
+    }
+  }
+
+  const setProxyResourceDraft = (value: string) => {
+    setProxyResourceId(value)
+    if (value) {
+      setProxyUrl('')
+      setProxyUsername('')
+      setProxyPassword('')
+    }
+  }
+
+  const setDirectProxyDraft = (key: 'url' | 'username' | 'password', value: string) => {
+    if (value.trim()) setProxyResourceId('')
+    if (key === 'url') setProxyUrl(value)
+    if (key === 'username') setProxyUsername(value)
+    if (key === 'password') setProxyPassword(value)
+  }
+
+  useEffect(() => {
+    if (!open) {
+      setUpdateRegions(false)
+      setUpdateRegion(false)
+      setUpdateAuthRegion(false)
+      setUpdateApiRegion(false)
+      setRegionValue('')
+      setAuthRegionValue('')
+      setApiRegionValue('')
+      setUpdateConcurrency(false)
+      setConcurrencyValue('')
+      setUpdateProxy(false)
+      setProxyResourceId('')
+      setProxyUrl('')
+      setProxyUsername('')
+      setProxyPassword('')
+      setShowProxyUsername(false)
+      setShowProxyPassword(false)
+    }
+  }, [open])
+
+  const submit = () => {
+    if (!ids.length) return toast.error('请先选择要修改的凭据')
+    if (!updateRegions && !updateConcurrency && !updateProxy) return toast.error('请选择至少一组要修改的参数')
+
+    const request: BatchUpdateCredentialsRequest = { ids }
+    if (updateRegions) {
+      const regions = {
+        region: optionalRegionUpdate(updateRegion, regionValue),
+        authRegion: optionalRegionUpdate(updateAuthRegion, authRegionValue),
+        apiRegion: optionalRegionUpdate(updateApiRegion, apiRegionValue),
+      }
+      if (typeof regions.region === 'undefined' && typeof regions.authRegion === 'undefined' && typeof regions.apiRegion === 'undefined') {
+        return toast.error('请选择至少一个 Region 字段')
+      }
+      request.regions = regions
+    }
+
+    if (updateConcurrency) {
+      try {
+        request.concurrency = {
+          maxConcurrentRequests: concurrencyValue.trim() ? parseOptionalNonNegativeInteger(concurrencyValue, '账号并发覆盖') : null,
+        }
+      } catch (error) {
+        return toast.error(extractErrorMessage(error))
+      }
+    }
+
+    if (updateProxy) {
+      const resourceId = proxyResourceId ? Number(proxyResourceId) : null
+      request.proxy = {
+        proxyResourceId: resourceId,
+        proxyUrl: resourceId ? undefined : optionalTrimmed(proxyUrl),
+        proxyUsername: resourceId ? undefined : optionalTrimmed(proxyUsername),
+        proxyPassword: resourceId ? undefined : optionalTrimmed(proxyPassword),
+      }
+    }
+
+    batchUpdate.mutate(request, {
+      onSuccess: (response) => {
+        if (response.failed === 0) toast.success(`成功修改 ${response.success}/${response.total} 个凭据`)
+        else toast.warning(`批量修改完成：成功 ${response.success} 个，失败 ${response.failed} 个`)
+        onDone()
+        onClose()
+      },
+      onError: (error) => toast.error(`批量修改失败: ${extractErrorMessage(error)}`),
+    })
+  }
+
+  return (
+    <ModalShell open={open} title={`批量修改 ${ids.length} 个凭据`} width="max-w-3xl" onClose={() => { if (!batchUpdate.isPending) onClose() }}>
+      <div className="space-y-4">
+        <div className={`rounded-lg border p-3 ${updateRegions ? 'border-primary/40 bg-primary/5' : 'border-base-300 bg-base-200/40'}`}>
+          <Form.Label className="mb-3 flex w-fit cursor-pointer items-center gap-2">
+            <Checkbox size="sm" checked={updateRegions} disabled={batchUpdate.isPending} onChange={(event) => setRegionsEnabled(event.target.checked)} />
+            <span className="text-sm font-semibold">修改 Region</span>
+          </Form.Label>
+          <div className="grid gap-3 md:grid-cols-3">
+            <FieldLabel title="Region 兼容字段" description="空值表示清空该覆盖">
+              <div className="space-y-2">
+                <Form.Label className="flex w-fit cursor-pointer items-center gap-2 text-xs">
+                  <Checkbox size="xs" checked={updateRegion} disabled={!updateRegions || batchUpdate.isPending} onChange={(event) => setUpdateRegion(event.target.checked)} />
+                  修改此字段
+                </Form.Label>
+                <Input bordered size="sm" className="font-mono" value={regionValue} disabled={!updateRegions || !updateRegion || batchUpdate.isPending} onChange={(event) => setRegionValue(event.target.value)} placeholder="us-east-1" />
+              </div>
+            </FieldLabel>
+            <FieldLabel title="Auth Region" description="空值表示清空该覆盖">
+              <div className="space-y-2">
+                <Form.Label className="flex w-fit cursor-pointer items-center gap-2 text-xs">
+                  <Checkbox size="xs" checked={updateAuthRegion} disabled={!updateRegions || batchUpdate.isPending} onChange={(event) => setUpdateAuthRegion(event.target.checked)} />
+                  修改此字段
+                </Form.Label>
+                <Input bordered size="sm" className="font-mono" value={authRegionValue} disabled={!updateRegions || !updateAuthRegion || batchUpdate.isPending} onChange={(event) => setAuthRegionValue(event.target.value)} placeholder="us-east-1" />
+              </div>
+            </FieldLabel>
+            <FieldLabel title="API Region" description="空值表示清空该覆盖">
+              <div className="space-y-2">
+                <Form.Label className="flex w-fit cursor-pointer items-center gap-2 text-xs">
+                  <Checkbox size="xs" checked={updateApiRegion} disabled={!updateRegions || batchUpdate.isPending} onChange={(event) => setUpdateApiRegion(event.target.checked)} />
+                  修改此字段
+                </Form.Label>
+                <Input bordered size="sm" className="font-mono" value={apiRegionValue} disabled={!updateRegions || !updateApiRegion || batchUpdate.isPending} onChange={(event) => setApiRegionValue(event.target.value)} placeholder="us-east-1" />
+              </div>
+            </FieldLabel>
+          </div>
+        </div>
+
+        <div className={`rounded-lg border p-3 ${updateConcurrency ? 'border-primary/40 bg-primary/5' : 'border-base-300 bg-base-200/40'}`}>
+          <Form.Label className="mb-3 flex w-fit cursor-pointer items-center gap-2">
+            <Checkbox size="sm" checked={updateConcurrency} disabled={batchUpdate.isPending} onChange={(event) => setUpdateConcurrency(event.target.checked)} />
+            <span className="text-sm font-semibold">修改账号并发覆盖</span>
+          </Form.Label>
+          <FieldLabel title="账号级最大并发" description="留空改为继承全局，0 表示不限并发">
+            <Input bordered size="sm" type="number" min={0} value={concurrencyValue} disabled={!updateConcurrency || batchUpdate.isPending} onChange={(event) => setConcurrencyValue(event.target.value)} />
+          </FieldLabel>
+        </div>
+
+        <div className={`rounded-lg border p-3 ${updateProxy ? 'border-primary/40 bg-primary/5' : 'border-base-300 bg-base-200/40'}`}>
+          <Form.Label className="mb-3 flex w-fit cursor-pointer items-center gap-2">
+            <Checkbox size="sm" checked={updateProxy} disabled={batchUpdate.isPending} onChange={(event) => setUpdateProxy(event.target.checked)} />
+            <span className="text-sm font-semibold">修改代理</span>
+          </Form.Label>
+          <div className="form-grid">
+            <FieldLabel title="代理资源" description="选择资源会清空凭据直连代理；不选且 URL 为空会清空凭据级代理">
+              <Select bordered size="sm" value={proxyResourceId} disabled={!updateProxy || batchUpdate.isPending} onChange={(event) => setProxyResourceDraft(event.target.value)}>
+                <Select.Option value="">不绑定</Select.Option>
+                {proxyResourceOptions.map((resource) => (
+                  <Select.Option key={resource.id} value={String(resource.id)}>
+                    {resource.name}
+                  </Select.Option>
+                ))}
+              </Select>
+            </FieldLabel>
+            <FieldLabel title="独立代理 URL" description={proxyLocked ? '已选择代理资源，保存时会清空直连代理' : '可填 direct 或完整代理 URL'}>
+              <Input bordered size="sm" value={proxyUrl} disabled={!updateProxy || proxyLocked || batchUpdate.isPending} onChange={(event) => setDirectProxyDraft('url', event.target.value)} placeholder="socks5h://127.0.0.1:1080" />
+            </FieldLabel>
+            <FieldLabel title="代理用户名">
+              <SecretInput
+                value={proxyUsername}
+                onChange={(value) => setDirectProxyDraft('username', value)}
+                visible={showProxyUsername}
+                onToggle={() => setShowProxyUsername((value) => !value)}
+                disabled={!updateProxy || proxyLocked || batchUpdate.isPending}
+                placeholder="可选"
+              />
+            </FieldLabel>
+            <FieldLabel title="代理密码">
+              <SecretInput
+                value={proxyPassword}
+                onChange={(value) => setDirectProxyDraft('password', value)}
+                visible={showProxyPassword}
+                onToggle={() => setShowProxyPassword((value) => !value)}
+                disabled={!updateProxy || proxyLocked || batchUpdate.isPending}
+                placeholder="可选"
+              />
+            </FieldLabel>
+          </div>
+        </div>
+
+        <Modal.Actions>
+          <Button type="button" color="ghost" size="sm" onClick={onClose} disabled={batchUpdate.isPending}>
+            取消
+          </Button>
+          <Button type="button" color="primary" size="sm" onClick={submit} disabled={batchUpdate.isPending || ids.length === 0}>
+            {batchUpdate.isPending && <Loading size="xs" />}
+            保存批量修改
+          </Button>
         </Modal.Actions>
       </div>
     </ModalShell>
