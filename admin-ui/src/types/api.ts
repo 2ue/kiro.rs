@@ -142,10 +142,30 @@ export interface BalanceResponse {
   usageLimit: number
   remaining: number
   usagePercentage: number
+  creditLimit: number
+  creditRemaining: number
+  creditBase: number
+  creditBonus: number
   nextResetAt: number | null
 }
 
 export type CredentialInfoResponse = BalanceResponse
+
+export interface CredentialCreditSummaryResponse {
+  totalCredentials: number
+  enabledCredentials: number
+  disabledCredentials: number
+  knownCredentials: number
+  unknownCredentials: number
+  totalCreditLimit: number
+  totalCreditRemaining: number
+  totalCurrentUsage: number
+  enabledCreditLimit: number
+  enabledCreditRemaining: number
+  disabledCreditLimit: number
+  disabledCreditRemaining: number
+  lastCheckedAt: string | null
+}
 
 export interface RefreshCredentialInfoRequest {
   ids: number[]

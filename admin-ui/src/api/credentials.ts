@@ -5,6 +5,7 @@ import type {
   CredentialsPageQuery,
   CredentialsPageResponse,
   BalanceResponse,
+  CredentialCreditSummaryResponse,
   CredentialInfoRefreshResponse,
   SuccessResponse,
   SetDisabledRequest,
@@ -191,6 +192,11 @@ export async function getCredentialInfo(id: number, force = true): Promise<Balan
   const { data } = await api.get<BalanceResponse>(`/credentials/${id}/info`, {
     params: { force },
   })
+  return data
+}
+
+export async function getCredentialCreditSummary(): Promise<CredentialCreditSummaryResponse> {
+  const { data } = await api.get<CredentialCreditSummaryResponse>('/credentials/credit-summary')
   return data
 }
 
