@@ -256,6 +256,7 @@ pub struct UsageRecord {
 pub struct UsageRecordQuery {
     pub limit: usize,
     pub q: Option<String>,
+    pub endpoint: Option<String>,
     pub conversation_id: Option<String>,
     pub credential_id: Option<u64>,
     pub external_pool_id: Option<u64>,
@@ -273,6 +274,7 @@ impl Default for UsageRecordQuery {
         Self {
             limit: DEFAULT_QUERY_LIMIT,
             q: None,
+            endpoint: None,
             conversation_id: None,
             credential_id: None,
             external_pool_id: None,
@@ -1268,6 +1270,12 @@ fn normalize_page(page: usize) -> usize {
 fn record_matches(record: &UsageRecord, query: &UsageRecordQuery) -> bool {
     if let Some(q) = &query.q {
         if !record_matches_search(record, q) {
+            return false;
+        }
+    }
+    if let Some(endpoint) = &query.endpoint {
+        let endpoint = endpoint.trim().to_ascii_lowercase();
+        if !endpoint.is_empty() && !record.endpoint.to_ascii_lowercase().contains(&endpoint) {
             return false;
         }
     }

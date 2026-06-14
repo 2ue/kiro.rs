@@ -31,6 +31,15 @@ export function formatQuota(value: number | undefined | null): string {
   }).format(num)
 }
 
+export function formatCredits(value: number | undefined | null): string {
+  if (!Number.isFinite(value ?? Number.NaN)) return '-'
+  return new Intl.NumberFormat('zh-CN', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 20,
+    useGrouping: true,
+  }).format(value as number)
+}
+
 export function formatPricePerMillion(value: number): string {
   if (!Number.isFinite(value)) return '-'
   return `$${(value * 1_000_000).toFixed(2)}/M`

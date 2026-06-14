@@ -969,11 +969,8 @@ impl ExternalPoolManager {
                 HeaderValue::from_static("application/json"),
             );
         }
-        let mut request = self
-            .client
-            .post(url)
-            .headers(headers)
-            .body(route.raw_body.clone());
+        let outbound_body = external_pool_outbound_body(route);
+        let mut request = self.client.post(url).headers(headers).body(outbound_body);
         if route.payload.stream {
             if config.external_pool_stream_request_timeout_secs > 0 {
                 request = request.timeout(Duration::from_secs(
@@ -2220,6 +2217,25 @@ fn forward_headers(
     Ok(out)
 }
 
+fn external_pool_outbound_body(route: &ExternalRouteRequest) -> Bytes {
+    normalize_external_pool_thinking_body(&route.raw_body).unwrap_or_else(|| route.raw_body.clone())
+}
+
+fn normalize_external_pool_thinking_body(raw_body: &Bytes) -> Option<Bytes> {
+    let mut value = serde_json::from_slice::<serde_json::Value>(raw_body).ok()?;
+    let thinking = value.get_mut("thinking")?.as_object_mut()?;
+    let thinking_type = thinking
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(thinking_type.as_str(), "adaptive" | "disabled") {
+        return None;
+    }
+    thinking.remove("budget_tokens")?;
+    serde_json::to_vec(&value).ok().map(Bytes::from)
+}
+
 fn should_forward_header(name: &HeaderName) -> bool {
     let lower = name.as_str().to_ascii_lowercase();
     !matches!(
@@ -2801,7 +2817,11 @@ fn update_external_usage_capture(
         capture.shaped = Some(merge_external_usage(capture.shaped, shaped));
     }
     if let Some(reported) = reported {
-        capture.reported = Some(merge_external_usage(capture.reported, reported));
+        capture.reported = if projected {
+            Some(reported)
+        } else {
+            Some(merge_external_usage(capture.reported, reported))
+        };
     }
     if projected {
         capture.projected = true;
@@ -2899,6 +2919,14 @@ fn project_usage_value(
         projection.prompt_cache_creation_control,
         reported,
     );
+    let shaped = projection
+        .reported_policy
+        .clone()
+        .map(|policy| {
+            let shaped = policy.apply_final_input_guard(shaped);
+            policy.apply_final_cache_read_guard(shaped)
+        })
+        .unwrap_or(shaped);
     let projected = shaped
         .with_external_pool_usage_uplift(projection.uplift_percent)
         .with_external_pool_output_uplift(
@@ -3685,6 +3713,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn external_pool_outbound_body_strips_budget_tokens_for_adaptive_thinking() {
+        let mut route = test_route("claude-opus-4-7-thinking");
+        route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-opus-4-7-thinking","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"adaptive","budget_tokens":20000},"output_config":{"effort":"xhigh"}}"#,
+        );
+
+        let outbound = external_pool_outbound_body(&route);
+        let value: serde_json::Value =
+            serde_json::from_slice(&outbound).expect("parse outbound body");
+
+        assert_eq!(value["thinking"]["type"], "adaptive");
+        assert!(value["thinking"].get("budget_tokens").is_none());
+        assert_eq!(value["output_config"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn external_pool_outbound_body_strips_budget_tokens_for_disabled_thinking() {
+        let mut route = test_route("claude-opus-4-7");
+        route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-opus-4-7","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"disabled","budget_tokens":20000}}"#,
+        );
+
+        let outbound = external_pool_outbound_body(&route);
+        let value: serde_json::Value =
+            serde_json::from_slice(&outbound).expect("parse outbound body");
+
+        assert_eq!(value["thinking"]["type"], "disabled");
+        assert!(value["thinking"].get("budget_tokens").is_none());
+    }
+
+    #[test]
+    fn external_pool_outbound_body_preserves_enabled_budget_tokens() {
+        let mut route = test_route("claude-sonnet-4-6-thinking");
+        route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-6-thinking","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"enabled","budget_tokens":12345}}"#,
+        );
+
+        let outbound = external_pool_outbound_body(&route);
+        let value: serde_json::Value =
+            serde_json::from_slice(&outbound).expect("parse outbound body");
+
+        assert_eq!(value["thinking"]["type"], "enabled");
+        assert_eq!(value["thinking"]["budget_tokens"], 12345);
+    }
+
     fn projection_context(
         route: &ExternalRouteRequest,
         pool: &ExternalPool,
@@ -3707,6 +3781,16 @@ mod tests {
             output_uplift_min_tokens,
             output_uplift_percent,
         )
+    }
+
+    fn event_usage_i64(event: &str, key: &str) -> i64 {
+        event
+            .lines()
+            .find_map(|line| line.trim_start().strip_prefix("data:"))
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(json.trim()).ok())
+            .and_then(|value| value.get("usage").and_then(|usage| usage.get(key)).cloned())
+            .and_then(|value| value.as_i64())
+            .expect("usage field")
     }
 
     #[test]
@@ -3975,6 +4059,105 @@ mod tests {
                 .saturating_add(reported.cache_read_input_tokens)
                 .saturating_add(reported.cache_creation_input_tokens)
         );
+    }
+
+    #[test]
+    fn usage_projection_final_input_guard_reapplies_path_input_limit_after_uplift() {
+        let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
+        );
+        let mut route = test_route("claude-sonnet-4-5");
+        route.reported_usage.path_overrides.insert(
+            "/v1".to_string(),
+            ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy::sample_input_max(96),
+                ..ReportedUsagePathPolicy::default()
+            },
+        );
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+
+        let projection = projection_context(&route, &pool, 200).expect("projection");
+        let projected = maybe_project_non_stream_usage(body, Some(&projection));
+        let reported = projected.usage_capture.reported.expect("reported usage");
+
+        assert!((1..=96).contains(&reported.input_tokens));
+        assert!(reported.cache_read_input_tokens > 0);
+        assert_eq!(
+            reported.total_input_tokens,
+            reported
+                .input_tokens
+                .saturating_add(reported.cache_read_input_tokens)
+                .saturating_add(reported.cache_creation_input_tokens)
+        );
+    }
+
+    #[test]
+    fn usage_projection_final_input_guard_leaves_compliant_input_unchanged() {
+        let policy = ReportedCacheUsagePolicy::from_path_policy(
+            ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy::sample_input_max(96),
+                ..ReportedUsagePathPolicy::default()
+            },
+            42,
+        )
+        .expect("policy");
+        let usage = CacheUsage {
+            total_input_tokens: 50_000,
+            input_tokens: 42,
+            output_tokens: 1,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 49_958,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+
+        let guarded = policy.apply_final_input_guard(usage);
+
+        assert_eq!(guarded.input_tokens, 42);
+        assert_eq!(guarded.cache_read_input_tokens, 49_958);
+        assert_eq!(guarded.total_input_tokens, 50_000);
+    }
+
+    #[test]
+    fn usage_projection_stream_capture_uses_latest_projected_reported_usage() {
+        let mut route = test_route("claude-sonnet-4-5");
+        route.reported_usage.path_overrides.insert(
+            "/v1".to_string(),
+            ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy::sample_input_max(96),
+                ..ReportedUsagePathPolicy::default()
+            },
+        );
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+        let projection = projection_context(&route, &pool, 0).expect("projection");
+        let capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
+            reported: Some(CacheUsage {
+                total_input_tokens: 120_000,
+                input_tokens: 10_000,
+                output_tokens: 1,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 110_000,
+                cache_creation_5m_input_tokens: 0,
+                cache_creation_1h_input_tokens: 0,
+            }),
+            ..ExternalUsageCapture::default()
+        }));
+
+        let event =
+            br#"data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":120000}}
+
+"#;
+
+        let out = maybe_project_sse_event(event, Some(&projection), Some(&capture));
+        let text = std::str::from_utf8(&out).expect("event text");
+        let event_input = event_usage_i64(text, "input_tokens");
+        let reported = capture.lock().reported.expect("reported usage");
+
+        assert!((1..=96).contains(&event_input));
+        assert_eq!(reported.input_tokens as i64, event_input);
+        assert!(reported.input_tokens < 10_000);
     }
 
     #[test]

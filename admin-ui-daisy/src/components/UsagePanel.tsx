@@ -182,6 +182,7 @@ function UsageMetric({
 export function UsagePanel() {
   const [searchText, setSearchText] = useState('')
   const [model, setModel] = useState('')
+  const [endpoint, setEndpoint] = useState('')
   const [conversationId, setConversationId] = useState('')
   const [routeTarget, setRouteTarget] = useState('')
   const [status, setStatus] = useState<UsageRecordStatus | ''>('')
@@ -199,6 +200,7 @@ export function UsagePanel() {
     const next: UsageRecordsPageQuery = { page, limit }
     if (searchText.trim()) next.q = searchText.trim()
     if (model.trim()) next.model = model.trim()
+    if (endpoint.trim()) next.endpoint = endpoint.trim()
     if (conversationId.trim()) next.conversationId = conversationId.trim()
     const [routeType, routeId] = routeTarget.split(':')
     const parsedRouteId = Number(routeId)
@@ -211,7 +213,7 @@ export function UsagePanel() {
     if (streamMode !== 'all') next.stream = streamMode === 'stream'
     if (minCacheRead.trim() && Number.isFinite(Number(minCacheRead))) next.minCacheRead = Number(minCacheRead)
     return next
-  }, [conversationId, minCacheRead, model, page, routeTarget, searchText, source, status, streamMode])
+  }, [conversationId, endpoint, minCacheRead, model, page, routeTarget, searchText, source, status, streamMode])
 
   const summary = useUsageSummary(autoRefresh.refetchInterval)
   const records = useUsageRecordsPage(query, autoRefresh.refetchInterval)
@@ -221,7 +223,7 @@ export function UsagePanel() {
 
   useEffect(() => {
     setPage(1)
-  }, [conversationId, minCacheRead, model, routeTarget, searchText, source, status, streamMode])
+  }, [conversationId, endpoint, minCacheRead, model, routeTarget, searchText, source, status, streamMode])
 
   const credentialLabels = useMemo(() => {
     const labels = new Map<number, string>()
@@ -231,7 +233,7 @@ export function UsagePanel() {
     return labels
   }, [credentials.data?.credentials])
 
-  const hasFilters = Boolean(searchText || model || conversationId || routeTarget || status || source || streamMode !== 'all' || minCacheRead)
+  const hasFilters = Boolean(searchText || model || endpoint || conversationId || routeTarget || status || source || streamMode !== 'all' || minCacheRead)
   const pageRecords = records.data?.records || []
   const hasNext = Boolean(records.data?.hasNext)
   const recordsPage = records.data?.page
@@ -249,6 +251,7 @@ export function UsagePanel() {
   const resetFilters = () => {
     setSearchText('')
     setModel('')
+    setEndpoint('')
     setConversationId('')
     setRouteTarget('')
     setStatus('')
@@ -348,8 +351,9 @@ export function UsagePanel() {
         }
       >
         <div className="mb-3 grid gap-2 md:grid-cols-2 xl:grid-cols-4">
-          <Input bordered size="sm" className="xl:col-span-2" value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="搜索模型、账号、会话、错误" />
+          <Input bordered size="sm" className="xl:col-span-2" value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="搜索模型、账号、会话、路径、错误" />
           <Input bordered size="sm" value={model} onChange={(event) => setModel(event.target.value)} placeholder="模型" />
+          <Input bordered size="sm" value={endpoint} onChange={(event) => setEndpoint(event.target.value)} placeholder="请求路径，如 /cc/v1/messages" />
           <Input bordered size="sm" value={conversationId} onChange={(event) => setConversationId(event.target.value)} placeholder="会话 ID" />
           <select className="select select-bordered select-sm" value={routeTarget} onChange={(event) => setRouteTarget(event.target.value)}>
             <option value="">全部账号/外部池</option>

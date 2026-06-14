@@ -16,18 +16,18 @@ use super::types::{
     BatchCredentialImportDefaults, BatchCredentialImportDuplicateMode, BatchCredentialImportItem,
     BatchCredentialImportRequest, BatchCredentialImportResponse, BatchUpdateCredentialItem,
     BatchUpdateCredentialsRequest, BatchUpdateCredentialsResponse, ClearInFlightRequest,
-    CreateProxyResourceRequest, CredentialAccountInfo, CredentialInfoRefreshItem,
-    CredentialInfoRefreshResponse, CredentialStatusItem, CredentialValidationGroup,
-    CredentialValidationInfo, CredentialValidationItem, CredentialValidationResponse,
-    CredentialsPageResponse, CredentialsStatusResponse, ExternalPoolTestRequest,
-    LoadBalancingModeResponse, ManualModelResponse, ProxyResourceResponse, ProxyResourcesResponse,
-    RefreshCredentialInfoRequest, RuntimeConfigResponse, SetCredentialConcurrencyRequest,
-    SetCredentialProxyRequest, SetCredentialRegionsRequest, SetLoadBalancingModeRequest,
-    SetWarmupRequest, TestCredentialRequest, TestCredentialResponse, UpdateAdminApiKeyRequest,
-    UpdateCredentialAuthRequest, UpdateProxyResourceRequest, UpdateRuntimeConfigRequest,
-    UpsertManualModelRequest, UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse,
-    UsageCleanupRequest, UsageCleanupStatusResponse, ValidateExistingCredentialsRequest,
-    ValidateExternalCredentialsRequest,
+    CreateProxyResourceRequest, CredentialAccountInfo, CredentialCreditSummaryResponse,
+    CredentialInfoRefreshItem, CredentialInfoRefreshResponse, CredentialStatusItem,
+    CredentialValidationGroup, CredentialValidationInfo, CredentialValidationItem,
+    CredentialValidationResponse, CredentialsPageResponse, CredentialsStatusResponse,
+    ExternalPoolTestRequest, LoadBalancingModeResponse, ManualModelResponse, ProxyResourceResponse,
+    ProxyResourcesResponse, RefreshCredentialInfoRequest, RuntimeConfigResponse,
+    SetCredentialConcurrencyRequest, SetCredentialProxyRequest, SetCredentialRegionsRequest,
+    SetLoadBalancingModeRequest, SetWarmupRequest, TestCredentialRequest, TestCredentialResponse,
+    UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
+    UpdateRuntimeConfigRequest, UpsertManualModelRequest, UsageCleanupJobStatus, UsageCleanupMode,
+    UsageCleanupPreviewResponse, UsageCleanupRequest, UsageCleanupStatusResponse,
+    ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
 };
 use crate::anthropic::{
     model_capabilities::{
@@ -189,6 +189,121 @@ struct CachedBalance {
     cached_at: f64,
     /// 缓存的账号信息数据
     data: BalanceResponse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialCreditTier {
+    Free,
+    Pro,
+    ProPlus,
+    Power,
+    ProMax,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CredentialCreditSnapshot {
+    limit: f64,
+    remaining: f64,
+    base: f64,
+    bonus: f64,
+}
+
+fn credit_snapshot_for_subscription(
+    subscription_title: Option<&str>,
+    current_usage: f64,
+) -> CredentialCreditSnapshot {
+    let Some(title) = subscription_title
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+    else {
+        return CredentialCreditSnapshot {
+            limit: 0.0,
+            remaining: 0.0,
+            base: 0.0,
+            bonus: 0.0,
+        };
+    };
+    let tier = credential_credit_tier(Some(title));
+    let Some(tier) = tier else {
+        return CredentialCreditSnapshot {
+            limit: 0.0,
+            remaining: 0.0,
+            base: 0.0,
+            bonus: 0.0,
+        };
+    };
+    let base = credential_credit_base(tier);
+    let bonus = if matches!(
+        tier,
+        CredentialCreditTier::Free | CredentialCreditTier::Power
+    ) {
+        0.0
+    } else {
+        10_000.0
+    };
+    let limit = base + bonus;
+    CredentialCreditSnapshot {
+        limit,
+        remaining: (limit - current_usage).max(0.0),
+        base,
+        bonus,
+    }
+}
+
+fn credit_snapshot_from_persisted_fields(
+    subscription_title: Option<&str>,
+    current_usage: f64,
+    credit_limit: f64,
+    credit_remaining: f64,
+    credit_base: f64,
+    credit_bonus: f64,
+) -> CredentialCreditSnapshot {
+    if credit_limit > 0.0 || credit_remaining > 0.0 || credit_base > 0.0 || credit_bonus > 0.0 {
+        return CredentialCreditSnapshot {
+            limit: credit_limit,
+            remaining: credit_remaining,
+            base: credit_base,
+            bonus: credit_bonus,
+        };
+    }
+    credit_snapshot_for_subscription(subscription_title, current_usage)
+}
+
+fn credential_credit_base(tier: CredentialCreditTier) -> f64 {
+    match tier {
+        CredentialCreditTier::Free => 0.0,
+        CredentialCreditTier::Pro => 1_000.0,
+        CredentialCreditTier::ProPlus => 2_000.0,
+        CredentialCreditTier::Power => 10_000.0,
+        CredentialCreditTier::ProMax => 5_000.0,
+    }
+}
+
+fn credential_credit_tier(subscription_title: Option<&str>) -> Option<CredentialCreditTier> {
+    let title = subscription_title?.trim().to_ascii_lowercase();
+    if title.is_empty() {
+        return None;
+    }
+    let compact: String = title
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect();
+    if title.contains("free") {
+        return Some(CredentialCreditTier::Free);
+    }
+    if title.contains("power") {
+        return Some(CredentialCreditTier::Power);
+    }
+    if compact.contains("promax") {
+        return Some(CredentialCreditTier::ProMax);
+    }
+    if title.contains("pro+") || compact.contains("proplus") {
+        return Some(CredentialCreditTier::ProPlus);
+    }
+    if compact.contains("pro") {
+        return Some(CredentialCreditTier::Pro);
+    }
+    None
 }
 
 fn balance_cache_key(id: u64) -> String {
@@ -876,6 +991,74 @@ impl AdminService {
         }
     }
 
+    pub async fn get_credential_credit_summary(
+        &self,
+    ) -> Result<CredentialCreditSummaryResponse, AdminServiceError> {
+        let account_info = self
+            .postgres_store
+            .load_credential_account_info()
+            .await
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        let (_, _, _, _, _, _, _, credentials) =
+            self.credential_status_items(CredentialStatusBuildOptions::LIGHT);
+
+        let total_credentials = credentials.len();
+        let enabled_credentials = credentials
+            .iter()
+            .filter(|credential| !credential.disabled)
+            .count();
+        let disabled_credentials = total_credentials.saturating_sub(enabled_credentials);
+        let mut known_credentials = 0;
+        let mut total_credit_limit = 0.0;
+        let mut total_credit_remaining = 0.0;
+        let mut total_current_usage = 0.0;
+        let mut enabled_credit_limit = 0.0;
+        let mut enabled_credit_remaining = 0.0;
+        let mut disabled_credit_limit = 0.0;
+        let mut disabled_credit_remaining = 0.0;
+        let mut last_checked_at: Option<String> = None;
+
+        for credential in &credentials {
+            let Some(info) = account_info.get(&credential.id).map(account_info_from_row) else {
+                continue;
+            };
+            known_credentials += 1;
+            total_credit_limit += info.credit_limit;
+            total_credit_remaining += info.credit_remaining;
+            total_current_usage += info.current_usage;
+            if credential.disabled {
+                disabled_credit_limit += info.credit_limit;
+                disabled_credit_remaining += info.credit_remaining;
+            } else {
+                enabled_credit_limit += info.credit_limit;
+                enabled_credit_remaining += info.credit_remaining;
+            }
+            if last_checked_at
+                .as_ref()
+                .map(|current| info.checked_at > *current)
+                .unwrap_or(true)
+            {
+                last_checked_at = Some(info.checked_at.clone());
+            }
+        }
+
+        Ok(CredentialCreditSummaryResponse {
+            total_credentials,
+            enabled_credentials,
+            disabled_credentials,
+            known_credentials,
+            unknown_credentials: total_credentials.saturating_sub(known_credentials),
+            total_credit_limit,
+            total_credit_remaining,
+            total_current_usage,
+            enabled_credit_limit,
+            enabled_credit_remaining,
+            disabled_credit_limit,
+            disabled_credit_remaining,
+            last_checked_at,
+        })
+    }
+
     fn credential_status_items(
         &self,
         options: CredentialStatusBuildOptions,
@@ -1131,14 +1314,15 @@ impl AdminService {
                 let now = Utc::now().timestamp() as f64;
                 if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
                     tracing::debug!("凭据 #{} 账号信息命中 Redis 缓存", id);
-                    self.save_account_info_snapshot(&cached.data).await?;
-                    return Ok(cached.data);
+                    let cached_data = normalize_balance_credit_snapshot(&cached.data);
+                    self.save_account_info_snapshot(&cached_data).await?;
+                    return Ok(cached_data);
                 }
             }
         }
 
         // 缓存未命中或已过期，从上游获取
-        let balance = self.fetch_balance(id).await?;
+        let balance = normalize_balance_credit_snapshot(&self.fetch_balance(id).await?);
         self.save_account_info_snapshot(&balance).await?;
 
         let cached = CachedBalance {
@@ -1499,6 +1683,7 @@ impl AdminService {
         } else {
             0.0
         };
+        let credit = credit_snapshot_for_subscription(usage.subscription_title(), current_usage);
 
         Ok(BalanceResponse {
             id,
@@ -1508,6 +1693,10 @@ impl AdminService {
             usage_limit,
             remaining,
             usage_percentage,
+            credit_limit: credit.limit,
+            credit_remaining: credit.remaining,
+            credit_base: credit.base,
+            credit_bonus: credit.bonus,
             next_reset_at: usage.next_date_reset,
         })
     }
@@ -1516,12 +1705,17 @@ impl AdminService {
         &self,
         balance: &BalanceResponse,
     ) -> Result<(), AdminServiceError> {
+        let balance = normalize_balance_credit_snapshot(balance);
         let info = CredentialAccountInfoRow {
             subscription_title: balance.subscription_title.clone(),
             current_usage: balance.current_usage,
             usage_limit: balance.usage_limit,
             remaining: balance.remaining,
             usage_percentage: balance.usage_percentage,
+            credit_limit: balance.credit_limit,
+            credit_remaining: balance.credit_remaining,
+            credit_base: balance.credit_base,
+            credit_bonus: balance.credit_bonus,
             next_reset_at: balance.next_reset_at,
             checked_at: balance.checked_at.clone(),
         };
@@ -3448,14 +3642,51 @@ fn extract_external_pool_test_response_text(body: &str) -> Option<String> {
 }
 
 fn account_info_from_row(row: &CredentialAccountInfoRow) -> CredentialAccountInfo {
+    let credit = credit_snapshot_from_persisted_fields(
+        row.subscription_title.as_deref(),
+        row.current_usage,
+        row.credit_limit,
+        row.credit_remaining,
+        row.credit_base,
+        row.credit_bonus,
+    );
     CredentialAccountInfo {
         subscription_title: row.subscription_title.clone(),
         current_usage: row.current_usage,
         usage_limit: row.usage_limit,
         remaining: row.remaining,
         usage_percentage: row.usage_percentage,
+        credit_limit: credit.limit,
+        credit_remaining: credit.remaining,
+        credit_base: credit.base,
+        credit_bonus: credit.bonus,
         next_reset_at: row.next_reset_at,
         checked_at: row.checked_at.clone(),
+    }
+}
+
+fn normalize_balance_credit_snapshot(balance: &BalanceResponse) -> BalanceResponse {
+    let credit = credit_snapshot_from_persisted_fields(
+        balance.subscription_title.as_deref(),
+        balance.current_usage,
+        balance.credit_limit,
+        balance.credit_remaining,
+        balance.credit_base,
+        balance.credit_bonus,
+    );
+    BalanceResponse {
+        id: balance.id,
+        checked_at: balance.checked_at.clone(),
+        subscription_title: balance.subscription_title.clone(),
+        current_usage: balance.current_usage,
+        usage_limit: balance.usage_limit,
+        remaining: balance.remaining,
+        usage_percentage: balance.usage_percentage,
+        credit_limit: credit.limit,
+        credit_remaining: credit.remaining,
+        credit_base: credit.base,
+        credit_bonus: credit.bonus,
+        next_reset_at: balance.next_reset_at,
     }
 }
 
@@ -4150,6 +4381,10 @@ mod tests {
                 usage_limit: 100.0,
                 remaining: 100.0 - usage_percentage,
                 usage_percentage,
+                credit_limit: 11_000.0,
+                credit_remaining: (11_000.0 - usage_percentage).max(0.0),
+                credit_base: 1_000.0,
+                credit_bonus: 10_000.0,
                 next_reset_at: None,
                 checked_at: "2026-01-01T00:00:00Z".to_string(),
             }),

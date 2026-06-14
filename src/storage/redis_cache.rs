@@ -3444,6 +3444,12 @@ fn usage_record_matches_query(record: &UsageRecord, query: &UsageRecordQuery) ->
             return false;
         }
     }
+    if let Some(endpoint) = query.endpoint.as_deref() {
+        let endpoint = endpoint.trim().to_ascii_lowercase();
+        if !endpoint.is_empty() && !record.endpoint.to_ascii_lowercase().contains(&endpoint) {
+            return false;
+        }
+    }
     if let Some(conversation_id) = query.conversation_id.as_deref() {
         if record.conversation_id.as_deref() != Some(conversation_id) {
             return false;

@@ -692,7 +692,21 @@ pub fn resolve_model_with_catalog_mapping_and_mode(
         );
     }
 
-    if is_explicit_claude_minor_version(&base) || !model_mapping.auto_generate_rules {
+    if is_explicit_claude_minor_version(&base) {
+        if let Some(candidate) = compatible_explicit_claude_model_candidates(&base)
+            .and_then(|candidates| pick_available(&available, &candidates))
+            .filter(|_| model_mapping.auto_generate_rules)
+        {
+            return ModelResolution::resolved(
+                requested,
+                candidate,
+                ModelResolutionSource::FamilyNormalized,
+            );
+        }
+        return ModelResolution::pass_through(requested);
+    }
+
+    if !model_mapping.auto_generate_rules {
         return ModelResolution::pass_through(requested);
     }
 
@@ -812,6 +826,26 @@ fn explicit_model_alias_candidates(model: &str) -> Option<Vec<&'static str>> {
             "claude-haiku-4.5",
             "claude-haiku-4-5-20251001",
             "haiku",
+        ]),
+        _ => None,
+    }
+}
+
+fn compatible_explicit_claude_model_candidates(model: &str) -> Option<Vec<&'static str>> {
+    match model {
+        "claude-sonnet-4-6" | "claude-sonnet-4.6" => Some(vec![
+            "claude-sonnet-4.6",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4.5",
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4",
+        ]),
+        "claude-sonnet-4-6-thinking" | "claude-sonnet-4.6-thinking" => Some(vec![
+            "claude-sonnet-4-6-thinking",
+            "claude-sonnet-4.6-thinking",
+            "claude-sonnet-4-5-20250929-thinking",
+            "claude-sonnet-4.5",
+            "claude-sonnet-4-5-20250929",
         ]),
         _ => None,
     }
@@ -1514,6 +1548,26 @@ mod tests {
 
         assert_eq!(result.source, ModelResolutionSource::PassThrough);
         assert_eq!(result.upstream_model.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn resolver_maps_claude_code_sonnet_46_to_available_sonnet_for_free_pool() {
+        let models = vec![
+            "auto".to_string(),
+            "claude-haiku-4.5".to_string(),
+            "claude-sonnet-4".to_string(),
+            "claude-sonnet-4.5".to_string(),
+            "deepseek-3.2".to_string(),
+            "glm-5".to_string(),
+        ];
+
+        let dashed = resolve_model_with_catalog("claude-sonnet-4-6", &models);
+        assert_eq!(dashed.source, ModelResolutionSource::FamilyNormalized);
+        assert_eq!(dashed.upstream_model.as_deref(), Some("claude-sonnet-4.5"));
+
+        let dotted = resolve_model_with_catalog("claude-sonnet-4.6", &models);
+        assert_eq!(dotted.source, ModelResolutionSource::FamilyNormalized);
+        assert_eq!(dotted.upstream_model.as_deref(), Some("claude-sonnet-4.5"));
     }
 
     #[test]

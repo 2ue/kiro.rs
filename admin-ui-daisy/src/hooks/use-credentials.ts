@@ -8,6 +8,7 @@ import {
   deleteProxyResource,
   forceRefreshToken,
   getCredentialBalance,
+  getCredentialCreditSummary,
   getCredentials,
   getCredentialsPage,
   getLoadBalancingMode,
@@ -41,6 +42,7 @@ import type {
 function invalidateCredentialCaches(queryClient: ReturnType<typeof useQueryClient>, id?: number) {
   queryClient.invalidateQueries({ queryKey: ['credentials'] })
   queryClient.invalidateQueries({ queryKey: ['credentials-page'] })
+  queryClient.invalidateQueries({ queryKey: ['credential-credit-summary'] })
   if (typeof id === 'number') queryClient.invalidateQueries({ queryKey: ['credential-balance', id] })
   else queryClient.invalidateQueries({ queryKey: ['credential-balance'] })
 }
@@ -69,6 +71,14 @@ export function useCredentialBalance(id: number | null) {
     queryFn: () => getCredentialBalance(id!),
     enabled: id !== null,
     retry: false,
+  })
+}
+
+export function useCredentialCreditSummary() {
+  return useQuery({
+    queryKey: ['credential-credit-summary'],
+    queryFn: getCredentialCreditSummary,
+    refetchInterval: 30000,
   })
 }
 

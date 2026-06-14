@@ -1048,7 +1048,8 @@ impl PostgresStore {
         let rows = sqlx::query(
             r#"
             SELECT credential_id, subscription_title, current_usage, usage_limit,
-                   remaining, usage_percentage, next_reset_at, checked_at
+                   remaining, usage_percentage, credit_limit, credit_remaining,
+                   credit_base, credit_bonus, next_reset_at, checked_at
             FROM credential_account_info
             "#,
         )
@@ -1067,6 +1068,10 @@ impl PostgresStore {
                     usage_limit: row.try_get("usage_limit")?,
                     remaining: row.try_get("remaining")?,
                     usage_percentage: row.try_get("usage_percentage")?,
+                    credit_limit: row.try_get("credit_limit")?,
+                    credit_remaining: row.try_get("credit_remaining")?,
+                    credit_base: row.try_get("credit_base")?,
+                    credit_bonus: row.try_get("credit_bonus")?,
                     next_reset_at: row.try_get("next_reset_at")?,
                     checked_at: checked_at.to_rfc3339(),
                 },
@@ -1087,15 +1092,20 @@ impl PostgresStore {
             r#"
             INSERT INTO credential_account_info (
                 credential_id, subscription_title, current_usage, usage_limit,
-                remaining, usage_percentage, next_reset_at, checked_at, updated_at
+                remaining, usage_percentage, credit_limit, credit_remaining,
+                credit_base, credit_bonus, next_reset_at, checked_at, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
             ON CONFLICT (credential_id) DO UPDATE
             SET subscription_title = EXCLUDED.subscription_title,
                 current_usage = EXCLUDED.current_usage,
                 usage_limit = EXCLUDED.usage_limit,
                 remaining = EXCLUDED.remaining,
                 usage_percentage = EXCLUDED.usage_percentage,
+                credit_limit = EXCLUDED.credit_limit,
+                credit_remaining = EXCLUDED.credit_remaining,
+                credit_base = EXCLUDED.credit_base,
+                credit_bonus = EXCLUDED.credit_bonus,
                 next_reset_at = EXCLUDED.next_reset_at,
                 checked_at = EXCLUDED.checked_at,
                 updated_at = now()
@@ -1107,6 +1117,10 @@ impl PostgresStore {
         .bind(info.usage_limit)
         .bind(info.remaining)
         .bind(info.usage_percentage)
+        .bind(info.credit_limit)
+        .bind(info.credit_remaining)
+        .bind(info.credit_base)
+        .bind(info.credit_bonus)
         .bind(info.next_reset_at)
         .bind(checked_at)
         .execute(&self.pool)
@@ -1986,6 +2000,10 @@ pub struct CredentialAccountInfoRow {
     pub usage_limit: f64,
     pub remaining: f64,
     pub usage_percentage: f64,
+    pub credit_limit: f64,
+    pub credit_remaining: f64,
+    pub credit_base: f64,
+    pub credit_bonus: f64,
     pub next_reset_at: Option<f64>,
     pub checked_at: String,
 }
@@ -3620,6 +3638,15 @@ fn push_usage_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &UsageRec
         }
         builder.push(")");
     }
+    if let Some(endpoint) = query
+        .endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+    {
+        builder.push(" AND endpoint ILIKE ");
+        builder.push_bind(format!("%{}%", endpoint));
+    }
     if let Some(conversation_id) = &query.conversation_id {
         builder.push(" AND conversation_id = ");
         builder.push_bind(conversation_id.clone());
@@ -4205,10 +4232,23 @@ CREATE TABLE IF NOT EXISTS credential_account_info (
     usage_limit DOUBLE PRECISION NOT NULL DEFAULT 0,
     remaining DOUBLE PRECISION NOT NULL DEFAULT 0,
     usage_percentage DOUBLE PRECISION NOT NULL DEFAULT 0,
+    credit_limit DOUBLE PRECISION NOT NULL DEFAULT 0,
+    credit_remaining DOUBLE PRECISION NOT NULL DEFAULT 0,
+    credit_base DOUBLE PRECISION NOT NULL DEFAULT 0,
+    credit_bonus DOUBLE PRECISION NOT NULL DEFAULT 0,
     next_reset_at DOUBLE PRECISION,
     checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE credential_account_info
+    ADD COLUMN IF NOT EXISTS credit_limit DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE credential_account_info
+    ADD COLUMN IF NOT EXISTS credit_remaining DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE credential_account_info
+    ADD COLUMN IF NOT EXISTS credit_base DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE credential_account_info
+    ADD COLUMN IF NOT EXISTS credit_bonus DOUBLE PRECISION NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS usage_records (
     id TEXT PRIMARY KEY,
@@ -5346,6 +5386,10 @@ mod tests {
                     usage_limit: 1000.0,
                     remaining: 910.0,
                     usage_percentage: 9.0,
+                    credit_limit: 11_000.0,
+                    credit_remaining: 10_910.0,
+                    credit_base: 1_000.0,
+                    credit_bonus: 10_000.0,
                     next_reset_at: Some(1_780_000_000.0),
                     checked_at: Utc::now().to_rfc3339(),
                 },

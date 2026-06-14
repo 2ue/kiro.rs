@@ -28,6 +28,18 @@ pub struct CredentialAccountInfo {
     pub remaining: f64,
     /// 使用百分比
     pub usage_percentage: f64,
+    /// 按本系统订阅规则计算的总积分。
+    #[serde(default)]
+    pub credit_limit: f64,
+    /// 按本系统订阅规则计算的剩余积分。
+    #[serde(default)]
+    pub credit_remaining: f64,
+    /// 订阅基础积分。
+    #[serde(default)]
+    pub credit_base: f64,
+    /// 非 free/power 订阅额外积分。
+    #[serde(default)]
+    pub credit_bonus: f64,
     /// 下次重置时间（Unix 时间戳）
     pub next_reset_at: Option<f64>,
     /// 上次查询时间（RFC3339 格式）
@@ -759,8 +771,38 @@ pub struct BalanceResponse {
     pub remaining: f64,
     /// 使用百分比
     pub usage_percentage: f64,
+    /// 按本系统订阅规则计算的总积分。
+    #[serde(default)]
+    pub credit_limit: f64,
+    /// 按本系统订阅规则计算的剩余积分。
+    #[serde(default)]
+    pub credit_remaining: f64,
+    /// 订阅基础积分。
+    #[serde(default)]
+    pub credit_base: f64,
+    /// 非 free/power 订阅额外积分。
+    #[serde(default)]
+    pub credit_bonus: f64,
     /// 下次重置时间（Unix 时间戳）
     pub next_reset_at: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialCreditSummaryResponse {
+    pub total_credentials: usize,
+    pub enabled_credentials: usize,
+    pub disabled_credentials: usize,
+    pub known_credentials: usize,
+    pub unknown_credentials: usize,
+    pub total_credit_limit: f64,
+    pub total_credit_remaining: f64,
+    pub total_current_usage: f64,
+    pub enabled_credit_limit: f64,
+    pub enabled_credit_remaining: f64,
+    pub disabled_credit_limit: f64,
+    pub disabled_credit_remaining: f64,
+    pub last_checked_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

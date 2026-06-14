@@ -32,11 +32,12 @@ import {
   KamImportModal,
   type VerifyResult,
 } from '@/components/CredentialDialogs'
-import { formatNumber } from '@/lib/format'
+import { formatCredits, formatFullDate, formatNumber } from '@/lib/format'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
 import { extractErrorMessage } from '@/lib/utils'
 import {
   useCredentials,
+  useCredentialCreditSummary,
   useCredentialsPage,
   useDeleteCredential,
   useLoadBalancingMode,
@@ -107,6 +108,7 @@ export function CredentialsPanel() {
     sortOrder: sortBy !== 'default' ? sortOrder : undefined,
   })
   const allCredentials = useCredentials({ enabled: batchOpen || kamOpen })
+  const creditSummary = useCredentialCreditSummary()
   const proxyResources = useProxyResources()
   const loadBalancing = useLoadBalancingMode()
   const runtimeConfig = useRuntimeConfig()
@@ -144,6 +146,7 @@ export function CredentialsPanel() {
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ['credentials'] })
     queryClient.invalidateQueries({ queryKey: ['credentials-page'] })
+    queryClient.invalidateQueries({ queryKey: ['credential-credit-summary'] })
   }
 
   const toggleSelect = (id: number) => {
@@ -225,6 +228,41 @@ export function CredentialsPanel() {
         ids.forEach((id) => next.delete(id))
         return next
       })
+    }
+  }
+
+  const updateAllCreditInfo = async () => {
+    setQueryingInfo(true)
+    try {
+      const all = await getCredentials()
+      const ids = all.credentials.map((item) => item.id)
+      if (!ids.length) return toast.error('没有可查询信息的凭据')
+      setLoadingBalanceIds(new Set(ids))
+      let success = 0
+      let failed = 0
+      for (const id of ids) {
+        try {
+          const info = await getCredentialInfo(id, true)
+          success += 1
+          setBalanceMap((prev) => new Map(prev).set(id, info))
+        } catch {
+          failed += 1
+        }
+        setLoadingBalanceIds((prev) => {
+          const next = new Set(prev)
+          next.delete(id)
+          return next
+        })
+      }
+      invalidate()
+      queryClient.invalidateQueries({ queryKey: ['credential-credit-summary'] })
+      if (failed === 0) toast.success(`积分统计已更新：成功 ${success}/${ids.length}`)
+      else toast.warning(`积分统计更新完成：成功 ${success} 个，失败 ${failed} 个`)
+    } catch (error) {
+      toast.error(`更新积分统计失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setQueryingInfo(false)
+      setLoadingBalanceIds(new Set())
     }
   }
 
@@ -354,6 +392,51 @@ export function CredentialsPanel() {
 
   return (
     <div className="space-y-4">
+      <div className="rounded-lg border border-base-300/60 bg-base-100 p-3">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <Wallet className="h-4 w-4 text-primary" />
+              <h2 className="text-sm font-semibold">积分统计</h2>
+              {creditSummary.isFetching && <Loading size="xs" />}
+            </div>
+          </div>
+          <Button type="button" color="primary" size="sm" onClick={updateAllCreditInfo} disabled={queryingInfo}>
+            {queryingInfo ? <Loading size="xs" /> : <RefreshCw className="h-4 w-4" />}
+            更新积分统计
+          </Button>
+        </div>
+        <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
+          <div className="rounded-lg bg-base-200/55 px-3 py-2">
+            <div className="text-[0.7rem] font-semibold text-base-content/50">统计总分</div>
+            <div className="mt-0.5 break-all text-lg font-bold text-primary">{formatCredits(creditSummary.data?.totalCreditLimit)}</div>
+          </div>
+          <div className="rounded-lg bg-base-200/55 px-3 py-2">
+            <div className="text-[0.7rem] font-semibold text-base-content/50">剩余积分</div>
+            <div className="mt-0.5 break-all text-lg font-bold text-success">{formatCredits(creditSummary.data?.totalCreditRemaining)}</div>
+          </div>
+          <div className="rounded-lg bg-base-200/55 px-3 py-2">
+            <div className="text-[0.7rem] font-semibold text-base-content/50">启用 / 禁用剩余</div>
+            <div className="mt-0.5 break-all text-sm font-semibold">
+              {formatCredits(creditSummary.data?.enabledCreditRemaining)} / {formatCredits(creditSummary.data?.disabledCreditRemaining)}
+            </div>
+          </div>
+          <div className="rounded-lg bg-base-200/55 px-3 py-2">
+            <div className="text-[0.7rem] font-semibold text-base-content/50">已固化凭据</div>
+            <div className="mt-0.5 text-sm font-semibold">
+              {formatNumber(creditSummary.data?.knownCredentials || 0)} / {formatNumber(creditSummary.data?.totalCredentials || 0)}
+            </div>
+            {Boolean(creditSummary.data?.unknownCredentials) && (
+              <div className="mt-0.5 text-xs text-warning">未固化 {formatNumber(creditSummary.data?.unknownCredentials || 0)} 个</div>
+            )}
+          </div>
+          <div className="rounded-lg bg-base-200/55 px-3 py-2">
+            <div className="text-[0.7rem] font-semibold text-base-content/50">最近查询</div>
+            <div className="mt-0.5 text-sm font-semibold">{creditSummary.data?.lastCheckedAt ? formatFullDate(creditSummary.data.lastCheckedAt) : '未查询'}</div>
+          </div>
+        </div>
+      </div>
+
       {/* Stats Grid */}
       <div className="metric-grid">
         <StatCard

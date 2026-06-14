@@ -497,6 +497,57 @@ impl ReportedCacheUsagePolicy {
         usage
     }
 
+    pub fn apply_final_input_guard(&self, mut usage: CacheUsage) -> CacheUsage {
+        if !self.reports_local_prompt_cache() || !usage.has_prompt_cache() {
+            return usage;
+        }
+
+        let current_input = usage.input_tokens.max(0);
+        if current_input <= 0 {
+            return usage;
+        }
+        if !self.should_cap_final_input(current_input) {
+            return usage;
+        }
+
+        let Some(reported_input) = self.sample_input(usage, current_input) else {
+            return usage;
+        };
+        let input_delta = current_input.saturating_sub(reported_input);
+        usage.input_tokens = reported_input;
+        if input_delta > 0 && self.input_moves_delta_to_cache_read() {
+            usage.cache_read_input_tokens = usage
+                .cache_read_input_tokens
+                .max(0)
+                .saturating_add(input_delta);
+        }
+        usage.total_input_tokens = usage.reported_total_input_tokens();
+        usage
+    }
+
+    fn should_cap_final_input(&self, current_input: i32) -> bool {
+        if current_input <= 0 {
+            return false;
+        }
+        let field = self.policy.input.normalized();
+        match field.mode {
+            ReportedUsageFieldMode::SampleMax => {
+                let max_tokens = field.max_tokens.max(0);
+                max_tokens > 0 && current_input > max_tokens
+            }
+            ReportedUsageFieldMode::SampleTarget => {
+                let policy = ReportedCacheCreationPolicy {
+                    target_tokens: field.target_tokens.max(0),
+                    normal_max_multiplier: field.normal_max_multiplier,
+                    seed: self.seed,
+                };
+                let max_tokens = policy.normal_max_tokens();
+                max_tokens > 0 && current_input > max_tokens
+            }
+            ReportedUsageFieldMode::Raw | ReportedUsageFieldMode::Preserve => false,
+        }
+    }
+
     fn final_cache_read_effective_cap(&self, usage: CacheUsage) -> Option<i32> {
         let max_tokens = self.policy.final_cache_read_max_tokens.max(0);
         if max_tokens <= 0 {

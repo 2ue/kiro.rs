@@ -61,6 +61,7 @@ pub struct AuditLogsQueryParams {
 pub struct UsageRecordsQueryParams {
     pub limit: Option<usize>,
     pub q: Option<String>,
+    pub endpoint: Option<String>,
     pub conversation_id: Option<String>,
     pub credential_id: Option<u64>,
     pub external_pool_id: Option<u64>,
@@ -79,6 +80,7 @@ pub struct UsageRecordsPageQueryParams {
     pub page: Option<usize>,
     pub limit: Option<usize>,
     pub q: Option<String>,
+    pub endpoint: Option<String>,
     pub conversation_id: Option<String>,
     pub credential_id: Option<u64>,
     pub external_pool_id: Option<u64>,
@@ -102,6 +104,7 @@ impl UsageRecordsQueryParams {
         Ok(UsageRecordQuery {
             limit: self.limit.unwrap_or_default(),
             q: non_blank(self.q),
+            endpoint: non_blank(self.endpoint),
             conversation_id: non_blank(self.conversation_id),
             credential_id: self.credential_id,
             external_pool_id: self.external_pool_id,
@@ -123,6 +126,7 @@ impl UsageRecordsPageQueryParams {
         let query = UsageRecordQuery {
             limit,
             q: non_blank(self.q),
+            endpoint: non_blank(self.endpoint),
             conversation_id: non_blank(self.conversation_id),
             credential_id: self.credential_id,
             external_pool_id: self.external_pool_id,
@@ -197,6 +201,15 @@ pub async fn get_credentials_page(
             sort_order: non_blank(params.sort_order),
         },
     ))
+}
+
+/// GET /api/admin/credentials/credit-summary
+/// 获取已固化凭据积分统计，不触发上游查询
+pub async fn get_credential_credit_summary(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.get_credential_credit_summary().await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
 /// POST /api/admin/credentials/:id/disabled
@@ -859,6 +872,7 @@ mod tests {
             model: Some("".to_string()),
             status: Some("".to_string()),
             source: Some("   ".to_string()),
+            endpoint: Some("   ".to_string()),
             stream: Some(true),
             min_cache_read: Some(10_000),
             since: None,
@@ -874,6 +888,7 @@ mod tests {
         assert_eq!(query.model, None);
         assert_eq!(query.status, None);
         assert_eq!(query.source, None);
+        assert_eq!(query.endpoint, None);
         assert_eq!(query.stream, Some(true));
         assert_eq!(query.min_cache_read, Some(10_000));
     }
@@ -889,6 +904,7 @@ mod tests {
             model: None,
             status: Some("ok".to_string()),
             source: None,
+            endpoint: None,
             stream: None,
             min_cache_read: None,
             since: None,
@@ -907,6 +923,7 @@ mod tests {
             model: None,
             status: None,
             source: Some("cache".to_string()),
+            endpoint: None,
             stream: None,
             min_cache_read: None,
             since: None,
@@ -925,6 +942,7 @@ mod tests {
             model: None,
             status: None,
             source: None,
+            endpoint: None,
             stream: None,
             min_cache_read: None,
             since: Some("not-a-time".to_string()),
@@ -947,6 +965,7 @@ mod tests {
             model: None,
             status: None,
             source: None,
+            endpoint: Some("/ha".to_string()),
             stream: None,
             min_cache_read: None,
             since: None,
@@ -960,5 +979,6 @@ mod tests {
         assert_eq!(query.limit, 50);
         assert_eq!(query.q.as_deref(), Some("sonnet"));
         assert_eq!(query.conversation_id.as_deref(), Some("session-a"));
+        assert_eq!(query.endpoint.as_deref(), Some("/ha"));
     }
 }

@@ -1,6 +1,6 @@
 //! Anthropic API 类型定义
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, ser::SerializeStruct};
 use std::collections::HashMap;
 
 // === 错误响应 ===
@@ -76,7 +76,7 @@ pub struct ModelsResponse {
 const MAX_BUDGET_TOKENS: i32 = 24576;
 
 /// Thinking 配置
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Thinking {
     #[serde(rename = "type")]
     pub thinking_type: String,
@@ -94,6 +94,25 @@ impl Thinking {
     }
 }
 
+impl Serialize for Thinking {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let field_count = if self.thinking_type == "enabled" {
+            2
+        } else {
+            1
+        };
+        let mut state = serializer.serialize_struct("Thinking", field_count)?;
+        state.serialize_field("type", &self.thinking_type)?;
+        if self.thinking_type == "enabled" {
+            state.serialize_field("budget_tokens", &self.budget_tokens)?;
+        }
+        state.end()
+    }
+}
+
 fn default_budget_tokens() -> i32 {
     20000
 }
@@ -103,6 +122,50 @@ where
 {
     let value = i32::deserialize(deserializer)?;
     Ok(value.min(MAX_BUDGET_TOKENS))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thinking_enabled_serializes_budget_tokens() {
+        let thinking = Thinking {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: 1234,
+        };
+
+        let json = serde_json::to_string(&thinking).expect("serialize thinking");
+
+        assert!(json.contains(r#""type":"enabled""#));
+        assert!(json.contains(r#""budget_tokens":1234"#));
+    }
+
+    #[test]
+    fn thinking_adaptive_skips_budget_tokens_on_serialize() {
+        let thinking = Thinking {
+            thinking_type: "adaptive".to_string(),
+            budget_tokens: 1234,
+        };
+
+        let json = serde_json::to_string(&thinking).expect("serialize thinking");
+
+        assert!(json.contains(r#""type":"adaptive""#));
+        assert!(!json.contains("budget_tokens"));
+    }
+
+    #[test]
+    fn thinking_disabled_skips_budget_tokens_on_serialize() {
+        let thinking = Thinking {
+            thinking_type: "disabled".to_string(),
+            budget_tokens: 1234,
+        };
+
+        let json = serde_json::to_string(&thinking).expect("serialize thinking");
+
+        assert!(json.contains(r#""type":"disabled""#));
+        assert!(!json.contains("budget_tokens"));
+    }
 }
 
 /// OutputConfig 配置

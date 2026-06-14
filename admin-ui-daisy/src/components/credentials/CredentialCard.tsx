@@ -16,7 +16,7 @@ import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { Button, Card, Checkbox, Dropdown, Input, Loading, Modal, Toggle } from 'react-daisyui'
 import { Badge, EmptyState, LoadingState, ModalShell } from '@/components/ui'
-import { formatApproxElapsedMs, formatFullDate, formatLastUsed, formatNumber, formatQuota, formatUsd } from '@/lib/format'
+import { formatApproxElapsedMs, formatCredits, formatFullDate, formatLastUsed, formatNumber, formatQuota, formatUsd } from '@/lib/format'
 import { extractErrorMessage } from '@/lib/utils'
 import {
   useClearInFlight,
@@ -568,6 +568,11 @@ export function CredentialCard({
                 label="额度"
                 value={loadingBalance ? <Loading size="xs" /> : accountInfo ? `${formatQuota(accountInfo.currentUsage)}/${formatQuota(accountInfo.usageLimit)}` : '未知'}
                 detail={quotaDetail}
+              />
+              <MetaItem
+                label="积分"
+                value={loadingBalance ? <Loading size="xs" /> : accountInfo ? `${formatCredits(accountInfo.creditRemaining)}/${formatCredits(accountInfo.creditLimit)}` : '未知'}
+                detail={accountInfo ? `基础 ${formatCredits(accountInfo.creditBase)} · 额外 ${formatCredits(accountInfo.creditBonus)}` : undefined}
               />
               <MetaItem label="估算成本" value={formatUsd(credential.estimatedCostUsd)} />
               {hasPricingCoverage && (
