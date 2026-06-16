@@ -18,13 +18,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, build_client, send_with_response_header_timeout};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
+use crate::kiro::protocol::{is_external_idp_credentials, resolve_profile_arn};
 use crate::model::config::Config;
 use crate::storage::postgres::{
     CredentialRuntimeStateRow, CredentialStatsRow, PostgresStore, ProxyResourceRow,
@@ -112,6 +113,7 @@ fn apply_credential_auth_update(credential: &mut KiroCredentials, update: Creden
     if let Some(api_key) = update.kiro_api_key {
         credential.kiro_api_key = trimmed_optional(api_key);
         credential.refresh_token = None;
+        credential.provider = None;
         credential.client_id = None;
         credential.client_secret = None;
         credential.auth_method = Some("api_key".to_string());
@@ -136,6 +138,9 @@ fn apply_credential_auth_update(credential: &mut KiroCredentials, update: Creden
             credential.auth_method = Some(auth_method);
             clear_access_token = true;
         }
+    }
+    if update.provider.is_some() {
+        apply_optional_string(&mut credential.provider, update.provider);
     }
     if update.client_id.is_some() {
         apply_optional_string(&mut credential.client_id, update.client_id);
@@ -238,10 +243,9 @@ pub(crate) async fn refresh_token(
         }
     });
 
-    if auth_method.eq_ignore_ascii_case("idc")
-        || auth_method.eq_ignore_ascii_case("builder-id")
-        || auth_method.eq_ignore_ascii_case("iam")
-    {
+    let mut refresh_credentials = credentials.clone();
+    refresh_credentials.auth_method = Some(auth_method.to_string());
+    if refresh_credentials.is_idc_refresh_credential() {
         refresh_idc_token(credentials, config, proxy).await
     } else {
         refresh_social_token(credentials, config, proxy).await
@@ -452,17 +456,16 @@ pub(crate) async fn get_usage_limits(
         host
     );
 
-    // profileArn 是可选的
-    if let Some(profile_arn) = &credentials.profile_arn {
-        url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
+    if let Some(profile_arn) = resolve_profile_arn(credentials, config) {
+        url.push_str(&format!(
+            "&profileArn={}",
+            urlencoding::encode(&profile_arn)
+        ));
     }
 
     // 构建 User-Agent headers
-    let user_agent = format!(
-        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
-        os_name, node_version, kiro_version, machine_id
-    );
-    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+    let user_agent = usage_limits_user_agent(os_name, node_version, kiro_version, &machine_id);
+    let amz_user_agent = usage_limits_amz_user_agent(kiro_version, &machine_id);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
@@ -479,8 +482,13 @@ pub(crate) async fn get_usage_limits(
     if credentials.is_api_key_credential() {
         request = request.header("tokentype", "API_KEY");
     }
+    if is_external_idp_credentials(credentials) {
+        request = request.header("TokenType", "EXTERNAL_IDP");
+    }
 
-    let response = request.send().await?;
+    let response =
+        send_with_response_header_timeout(request, config.kiro_upstream_response_timeout_secs)
+            .await?;
 
     let status = response.status();
     if !status.is_success() {
@@ -497,6 +505,22 @@ pub(crate) async fn get_usage_limits(
 
     let data: UsageLimitsResponse = response.json().await?;
     Ok(data)
+}
+
+fn usage_limits_user_agent(
+    os_name: &str,
+    node_version: &str,
+    kiro_version: &str,
+    machine_id: &str,
+) -> String {
+    format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        os_name, node_version, kiro_version, machine_id
+    )
+}
+
+fn usage_limits_amz_user_agent(kiro_version: &str, machine_id: &str) -> String {
+    format!("aws-sdk-js/1.0.0 KiroIDE {} {}", kiro_version, machine_id)
 }
 
 // ============================================================================
@@ -572,6 +596,7 @@ pub(crate) enum InFlightKind {
 pub struct CredentialAuthUpdate {
     pub refresh_token: Option<String>,
     pub auth_method: Option<String>,
+    pub provider: Option<String>,
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
     pub kiro_api_key: Option<String>,
@@ -839,6 +864,8 @@ pub struct CredentialEntrySnapshot {
     pub failure_count: u32,
     /// 认证方式
     pub auth_method: Option<String>,
+    /// 上游身份提供方
+    pub provider: Option<String>,
     /// 凭据级兼容 Region（主要作为 Auth Region 的旧字段/回退字段）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
@@ -5450,11 +5477,17 @@ impl MultiTokenManager {
                                     || m.eq_ignore_ascii_case("iam")
                                 {
                                     "idc".to_string()
+                                } else if m.eq_ignore_ascii_case("external-idp")
+                                    || m.eq_ignore_ascii_case("externalidp")
+                                    || m.eq_ignore_ascii_case("enterprise")
+                                {
+                                    "external_idp".to_string()
                                 } else {
                                     m.to_string()
                                 }
                             })
                         },
+                        provider: e.credentials.provider.clone(),
                         region: e.credentials.region.clone(),
                         auth_region: e.credentials.auth_region.clone(),
                         api_region: e.credentials.api_region.clone(),
@@ -5874,6 +5907,37 @@ impl MultiTokenManager {
 
         self.publish_credentials_changed("credential_auth_updated");
         self.notify_dispatch_state_changed();
+        Ok(())
+    }
+
+    pub fn update_credential_profile_arn(
+        &self,
+        id: u64,
+        profile_arn: Option<String>,
+    ) -> anyhow::Result<()> {
+        let profile_arn = profile_arn
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let credential = {
+            let entries = self.entries.lock();
+            let entry = entries
+                .iter()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            let mut credential = Self::credential_from_entry(entry);
+            credential.profile_arn = profile_arn;
+            credential
+        };
+        self.persist_credential_value(&credential)?;
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.profile_arn = credential.profile_arn.clone();
+        }
+        self.publish_credentials_changed("credential_profile_arn_updated");
         Ok(())
     }
 
@@ -6556,6 +6620,18 @@ mod tests {
         assert_eq!(
             result,
             "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        );
+    }
+
+    #[test]
+    fn usage_limits_user_agents_match_kiro_rest_shape() {
+        assert_eq!(
+            usage_limits_amz_user_agent("0.12.155", "machine"),
+            "aws-sdk-js/1.0.0 KiroIDE 0.12.155 machine"
+        );
+        assert_eq!(
+            usage_limits_user_agent("macos#23.4.0", "22.22.0", "0.12.155", "machine"),
+            "aws-sdk-js/1.0.0 ua/2.1 os/macos#23.4.0 lang/js md/nodejs#22.22.0 api/codewhispererruntime#1.0.0 m/N,E KiroIDE-0.12.155-machine"
         );
     }
 

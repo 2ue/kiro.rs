@@ -742,6 +742,26 @@ impl CompatProfile {
     }
 }
 
+/// Kiro IDE `x-amzn-kiro-agent-mode` header strategy.
+///
+/// `vibe` preserves the current Kiro IDE / Claude Code compatible behavior.
+/// `spec` forces the alternate Kiro planning-oriented mode. `auto` derives the
+/// mode from credential protocol metadata: IdC, Enterprise/external IdP and API
+/// key credentials stay on `vibe`; social/provider credentials use `spec`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KiroAgentModeStrategy {
+    Vibe,
+    Spec,
+    Auto,
+}
+
+impl Default for KiroAgentModeStrategy {
+    fn default() -> Self {
+        Self::Vibe
+    }
+}
+
 /// 请求模型解析策略。
 ///
 /// `compatible` 保持当前 Claude Code 兼容行为：允许 `sonnet`、`opus`、
@@ -1237,6 +1257,14 @@ pub struct Config {
     #[serde(default = "default_credential_dispatch_max_wait_secs")]
     pub credential_dispatch_max_wait_secs: u64,
 
+    /// Kiro 上游响应头最长等待秒数。
+    ///
+    /// 只限制请求发出到拿到响应头的阶段；响应头之后的流式 body 读取仍由
+    /// Anthropic SSE 层的上游 idle timeout 控制，避免长输出被整段请求超时误杀。
+    /// `0` 表示关闭该额外保护，仅使用底层 HTTP client 的全局超时。
+    #[serde(default = "default_kiro_upstream_response_timeout_secs")]
+    pub kiro_upstream_response_timeout_secs: u64,
+
     /// 单次上游调用最多尝试多少个凭据/重试轮次。
     ///
     /// `0` 表示自动：按当前凭据数量放大，至少覆盖一轮可用凭据；
@@ -1358,6 +1386,10 @@ pub struct Config {
     /// Anthropic 兼容 profile（默认 claude-code）。
     #[serde(default = "default_compat_profile")]
     pub compat_profile: CompatProfile,
+
+    /// Kiro IDE agent-mode header 策略（默认 vibe，保持现有成功链路）。
+    #[serde(default = "default_kiro_agent_mode_strategy")]
+    pub kiro_agent_mode_strategy: KiroAgentModeStrategy,
 
     /// 请求模型解析策略（默认 compatible）。
     ///
@@ -1534,6 +1566,10 @@ fn default_credential_dispatch_max_wait_secs() -> u64 {
     120
 }
 
+fn default_kiro_upstream_response_timeout_secs() -> u64 {
+    180
+}
+
 fn default_credential_in_flight_lease_max_secs() -> u64 {
     900
 }
@@ -1660,6 +1696,10 @@ fn default_payload_guard_external_enabled() -> bool {
 
 fn default_compat_profile() -> CompatProfile {
     CompatProfile::ClaudeCode
+}
+
+fn default_kiro_agent_mode_strategy() -> KiroAgentModeStrategy {
+    KiroAgentModeStrategy::Vibe
 }
 
 fn default_model_resolution_mode() -> ModelResolutionMode {
@@ -1894,6 +1934,7 @@ impl Default for Config {
             credential_probation_secs: default_credential_probation_secs(),
             credential_max_cooldown_secs: default_credential_max_cooldown_secs(),
             credential_dispatch_max_wait_secs: default_credential_dispatch_max_wait_secs(),
+            kiro_upstream_response_timeout_secs: default_kiro_upstream_response_timeout_secs(),
             credential_retry_max_attempts: 0,
             credential_in_flight_lease_max_secs: default_credential_in_flight_lease_max_secs(),
             dispatch_global_max_concurrent_requests: 0,
@@ -1921,6 +1962,7 @@ impl Default for Config {
             scheduler_total_selection_weight: default_scheduler_total_selection_weight(),
             scheduler_top_k: default_scheduler_top_k(),
             compat_profile: default_compat_profile(),
+            kiro_agent_mode_strategy: default_kiro_agent_mode_strategy(),
             model_resolution_mode: default_model_resolution_mode(),
             model_mapping: ModelMappingConfig::default(),
             extract_thinking: default_extract_thinking(),
@@ -2025,6 +2067,14 @@ mod tests {
     }
 
     #[test]
+    fn default_kiro_agent_mode_strategy_preserves_vibe() {
+        assert_eq!(
+            Config::default().kiro_agent_mode_strategy,
+            KiroAgentModeStrategy::Vibe
+        );
+    }
+
+    #[test]
     fn default_prompt_cache_target_read_ratio_is_98_percent() {
         assert_eq!(Config::default().prompt_cache_target_read_ratio, 0.98);
     }
@@ -2047,6 +2097,7 @@ mod tests {
         assert_eq!(config.credential_probation_secs, 30);
         assert_eq!(config.credential_max_cooldown_secs, 300);
         assert_eq!(config.credential_dispatch_max_wait_secs, 120);
+        assert_eq!(config.kiro_upstream_response_timeout_secs, 180);
         assert_eq!(config.credential_retry_max_attempts, 0);
         assert_eq!(config.credential_in_flight_lease_max_secs, 900);
         assert_eq!(config.dispatch_global_max_concurrent_requests, 0);
@@ -2143,12 +2194,14 @@ mod tests {
         let config: Config = serde_json::from_str(
             r#"{
                 "apiKey": "sk-test",
-                "compatProfile": "anthropic-strict"
+                "compatProfile": "anthropic-strict",
+                "kiroAgentModeStrategy": "auto"
             }"#,
         )
         .unwrap();
 
         assert_eq!(config.compat_profile, CompatProfile::AnthropicStrict);
+        assert_eq!(config.kiro_agent_mode_strategy, KiroAgentModeStrategy::Auto);
     }
 
     #[test]

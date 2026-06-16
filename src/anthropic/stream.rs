@@ -2,9 +2,10 @@
 //!
 //! 实现 Kiro → Anthropic 流式响应转换和 SSE 状态管理
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::json;
+use uuid::Uuid;
 
 use crate::kiro::model::events::{Event, MetadataTokenUsage};
 use crate::model::config::PromptCacheSimulationMode;
@@ -171,6 +172,560 @@ fn find_real_thinking_start_tag(buffer: &str) -> Option<usize> {
     }
 
     None
+}
+
+/// 检查 `name_pos`（指向标签名首字母）的前面是否构成合法的开标签起始，
+/// 兼容裸写法 `<tag` 和带命名空间前缀的写法 `<prefix:tag`。
+fn open_tag_lt_pos(buffer: &str, name_pos: usize) -> Option<usize> {
+    let bytes = buffer.as_bytes();
+    if name_pos == 0 {
+        return None;
+    }
+    let prev = bytes[name_pos - 1];
+    if prev == b'<' {
+        return Some(name_pos - 1);
+    }
+    if prev == b':' {
+        let i = name_pos - 1;
+        let mut j = i;
+        while j > 0 && {
+            let c = bytes[j - 1];
+            c.is_ascii_alphanumeric() || c == b'_'
+        } {
+            j -= 1;
+        }
+        if j < i && j > 0 && bytes[j - 1] == b'<' {
+            return Some(j - 1);
+        }
+    }
+    None
+}
+
+/// 查找未被引用字符包裹的 invoke 开标签，返回指向 `<` 的字节位置。
+fn find_invoke_start(buffer: &str) -> Option<usize> {
+    let mut search = 0;
+    while let Some(rel) = buffer[search..].find("invoke") {
+        let name_pos = search + rel;
+        if let Some(lt) = open_tag_lt_pos(buffer, name_pos) {
+            let after = name_pos + "invoke".len();
+            let next_ok = buffer.as_bytes().get(after).map_or(true, |c| {
+                c.is_ascii_whitespace() || *c == b'>' || *c == b'/'
+            });
+            let has_quote_before = lt > 0 && is_quote_char(buffer, lt - 1);
+            if next_ok && !has_quote_before {
+                return Some(lt);
+            }
+        }
+        search = name_pos + "invoke".len();
+    }
+    None
+}
+
+fn find_invoke_block_end(buffer: &str, start: usize) -> Option<usize> {
+    let boundary = find_next_invoke_open(buffer, start).unwrap_or(buffer.len());
+    find_last_invoke_close(buffer, start, boundary)
+}
+
+fn find_next_invoke_open(buffer: &str, start: usize) -> Option<usize> {
+    let after_open = match buffer[start..].find('>') {
+        Some(rel) => start + rel + 1,
+        None => return None,
+    };
+    let region = &buffer[after_open..];
+    let mut search = 0usize;
+    while let Some(rel) = region[search..].find("invoke") {
+        let name_pos = search + rel;
+        if let Some(lt) = open_tag_lt_pos(region, name_pos) {
+            let after = name_pos + "invoke".len();
+            let next_ok = region.as_bytes().get(after).map_or(true, |c| {
+                c.is_ascii_whitespace() || *c == b'>' || *c == b'/'
+            });
+            if next_ok {
+                return Some(after_open + lt);
+            }
+        }
+        search = name_pos + "invoke".len();
+    }
+    None
+}
+
+fn find_last_invoke_close(buffer: &str, from: usize, boundary: usize) -> Option<usize> {
+    let region_end = boundary.min(buffer.len());
+    if from >= region_end {
+        return None;
+    }
+    let region = &buffer[from..region_end];
+    let bytes = region.as_bytes();
+    let mut search = 0usize;
+    let mut last: Option<usize> = None;
+    while let Some(rel) = region[search..].find("invoke>") {
+        let name_pos = search + rel;
+        if name_pos >= 2 && &region[name_pos - 2..name_pos] == "</" {
+            last = Some(from + name_pos + "invoke>".len());
+        } else if name_pos >= 1 && bytes[name_pos - 1] == b':' {
+            let mut j = name_pos - 1;
+            while j > 0 && {
+                let c = bytes[j - 1];
+                c.is_ascii_alphanumeric() || c == b'_'
+            } {
+                j -= 1;
+            }
+            if j >= 2 && &region[j - 2..j] == "</" {
+                last = Some(from + name_pos + "invoke>".len());
+            }
+        }
+        search = name_pos + "invoke>".len();
+    }
+    last
+}
+
+fn extract_name_attr(tag: &str) -> Option<String> {
+    let needle = "name=\"";
+    let rel = tag.find(needle)?;
+    let start = rel + needle.len();
+    let end_rel = tag[start..].find('"')?;
+    Some(tag[start..start + end_rel].to_string())
+}
+
+fn restore_xml_parameter_value(raw: &str) -> serde_json::Value {
+    let trimmed = raw.trim();
+    if trimmed == "true" {
+        serde_json::Value::Bool(true)
+    } else if trimmed == "false" {
+        serde_json::Value::Bool(false)
+    } else if trimmed == "null" {
+        serde_json::Value::Null
+    } else if !trimmed.is_empty()
+        && trimmed
+            .strip_prefix('-')
+            .unwrap_or(trimmed)
+            .chars()
+            .all(|ch| ch.is_ascii_digit())
+    {
+        trimmed
+            .parse::<i64>()
+            .map(|n| serde_json::Value::Number(n.into()))
+            .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
+    } else if looks_like_float(trimmed) {
+        trimmed
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(serde_json::Value::Number)
+            .unwrap_or_else(|| serde_json::Value::String(raw.to_string()))
+    } else {
+        serde_json::Value::String(raw.to_string())
+    }
+}
+
+fn looks_like_float(value: &str) -> bool {
+    if !value.contains('.') {
+        return false;
+    }
+    let value = value.strip_prefix('-').unwrap_or(value);
+    let mut parts = value.split('.');
+    let before = parts.next().unwrap_or_default();
+    let after = parts.next().unwrap_or_default();
+    parts.next().is_none()
+        && (!before.is_empty() || !after.is_empty())
+        && before.chars().all(|ch| ch.is_ascii_digit())
+        && after.chars().all(|ch| ch.is_ascii_digit())
+}
+
+/// 解析一个完整 invoke 块，抠出 (tool_name, input_json_string)。
+fn parse_invoke_block(block: &str) -> Option<(String, String)> {
+    let open_end = block.find('>')?;
+    let open_tag = &block[..=open_end];
+    let tool_name = extract_name_attr(open_tag)?;
+    if tool_name.is_empty() {
+        return None;
+    }
+
+    let mut map = serde_json::Map::new();
+    let body = &block[open_end + 1..];
+    let mut cursor = 0usize;
+    while let Some(rel) = body[cursor..].find("parameter name=\"") {
+        let name_kw = cursor + rel;
+        if open_tag_lt_pos(body, name_kw).is_none() {
+            cursor = name_kw + "parameter".len();
+            continue;
+        }
+        let tag_gt = match body[name_kw..].find('>') {
+            Some(r) => name_kw + r,
+            None => break,
+        };
+        let param_open_tag = &body[name_kw..tag_gt + 1];
+        let key = match extract_name_attr(param_open_tag) {
+            Some(k) => k,
+            None => {
+                cursor = tag_gt + 1;
+                continue;
+            }
+        };
+        let val_start = tag_gt + 1;
+        let (close_start, close_end) = match find_param_close(body, val_start) {
+            Some(pair) => pair,
+            None => break,
+        };
+        let value = &body[val_start..close_start];
+        map.insert(key, restore_xml_parameter_value(value));
+        cursor = close_end;
+    }
+
+    serde_json::to_string(&serde_json::Value::Object(map))
+        .ok()
+        .map(|input| (tool_name, input))
+}
+
+fn find_param_close(body: &str, from: usize) -> Option<(usize, usize)> {
+    let boundary = find_next_param_open(body, from).unwrap_or(body.len());
+    let region = &body[from..boundary];
+    let kw = "parameter>";
+    let mut last: Option<(usize, usize)> = None;
+    let mut search = 0usize;
+    let bytes = region.as_bytes();
+    while let Some(rel) = region[search..].find(kw) {
+        let name_pos = search + rel;
+        if name_pos >= 2 && &region[name_pos - 2..name_pos] == "</" {
+            last = Some((from + name_pos - 2, from + name_pos + kw.len()));
+        } else if name_pos >= 1 && bytes[name_pos - 1] == b':' {
+            let mut j = name_pos - 1;
+            while j > 0 && {
+                let c = bytes[j - 1];
+                c.is_ascii_alphanumeric() || c == b'_'
+            } {
+                j -= 1;
+            }
+            if j >= 2 && &region[j - 2..j] == "</" {
+                last = Some((from + j - 2, from + name_pos + kw.len()));
+            }
+        }
+        search = name_pos + kw.len();
+    }
+    last
+}
+
+fn find_next_param_open(body: &str, from: usize) -> Option<usize> {
+    let mut search = from;
+    while let Some(rel) = body[search..].find("parameter name=\"") {
+        let kw_pos = search + rel;
+        if let Some(lt) = open_tag_lt_pos(body, kw_pos) {
+            return Some(lt);
+        }
+        search = kw_pos + "parameter".len();
+    }
+    None
+}
+
+const STRAY_INVOKE_TOKENS: &[&str] = &["call", "count", "card"];
+const REPEAT_GUARD_TRIP_THRESHOLD: u32 = 32;
+
+fn collapse_stray_token_floods(text: &str) -> std::borrow::Cow<'_, str> {
+    let mut last_line = "";
+    let mut run: u32 = 0;
+    let mut cut_at: Option<usize> = None;
+    let mut offset = 0usize;
+    for segment in text.split_inclusive('\n') {
+        let line = segment.trim();
+        if STRAY_INVOKE_TOKENS.contains(&line) {
+            if line == last_line {
+                run += 1;
+            } else {
+                last_line = line;
+                run = 1;
+            }
+            if run >= REPEAT_GUARD_TRIP_THRESHOLD {
+                cut_at = Some(offset);
+                break;
+            }
+        } else if !line.is_empty() {
+            last_line = line;
+            run = 0;
+        }
+        offset += segment.len();
+    }
+    match cut_at {
+        Some(pos) => std::borrow::Cow::Owned(text[..pos].to_string()),
+        None => std::borrow::Cow::Borrowed(text),
+    }
+}
+
+fn strip_trailing_stray_tokens(before: &str) -> &str {
+    let mut end = before.len();
+    loop {
+        let bytes = before.as_bytes();
+        let mut e = end;
+        while e > 0 && (bytes[e - 1] == b'\n' || bytes[e - 1] == b'\r') {
+            e -= 1;
+        }
+        let line_start = before[..e].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let last_line = before[line_start..e].trim();
+        if STRAY_INVOKE_TOKENS.contains(&last_line) {
+            end = line_start;
+            if end == 0 {
+                return "";
+            }
+        } else {
+            break;
+        }
+    }
+    &before[..end]
+}
+
+fn strip_trailing_function_calls_open(before: &str) -> Option<&str> {
+    let trimmed = before.trim_end_matches([' ', '\t', '\r', '\n']);
+    if !trimmed.ends_with('>') {
+        return None;
+    }
+    let lt = trimmed.rfind('<')?;
+    let tag = &trimmed[lt..];
+    if is_function_calls_open_tag(tag) {
+        Some(&before[..lt])
+    } else {
+        None
+    }
+}
+
+fn strip_trailing_tool_prefixes(before: &str) -> &str {
+    let mut current = before;
+    loop {
+        let stripped = strip_trailing_stray_tokens(current);
+        if stripped.len() != current.len() {
+            current = stripped;
+            continue;
+        }
+        if let Some(stripped) = strip_trailing_function_calls_open(current) {
+            current = stripped;
+            continue;
+        }
+        return current;
+    }
+}
+
+fn is_function_calls_open_tag(tag: &str) -> bool {
+    let Some(inner) = tag.strip_prefix('<').and_then(|s| s.strip_suffix('>')) else {
+        return false;
+    };
+    if inner.starts_with('/') {
+        return false;
+    }
+    let name = inner.split_whitespace().next().unwrap_or_default();
+    name == "function_calls" || name.ends_with(":function_calls")
+}
+
+fn leading_function_calls_close_len(rest: &str) -> usize {
+    let leading_ws = rest.len() - rest.trim_start().len();
+    let s = &rest[leading_ws..];
+    let Some(end) = s.find('>') else {
+        return 0;
+    };
+    let tag = &s[..=end];
+    let Some(inner) = tag.strip_prefix("</").and_then(|v| v.strip_suffix('>')) else {
+        return 0;
+    };
+    if inner == "function_calls" || inner.ends_with(":function_calls") {
+        let mut total = leading_ws + end + 1;
+        while rest
+            .as_bytes()
+            .get(total)
+            .is_some_and(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            total += 1;
+        }
+        total
+    } else {
+        0
+    }
+}
+
+fn strip_leading_function_calls_close(rest: &str) -> &str {
+    let len = leading_function_calls_close_len(rest);
+    &rest[len..]
+}
+
+fn invoke_looks_like_real_leak(before: &str) -> bool {
+    let trimmed = before.trim_end_matches([' ', '\t']);
+    trimmed.is_empty() || trimmed.ends_with('\n') || trimmed.ends_with('\r')
+}
+
+fn advance_code_fence_state(open: &mut bool, partial: &mut String, text: &str) {
+    for ch in text.chars() {
+        if ch == '\n' {
+            if partial.trim_start().starts_with("```") {
+                *open = !*open;
+            }
+            partial.clear();
+        } else {
+            partial.push(ch);
+        }
+    }
+}
+
+fn fence_open_after(open: bool, partial: &str, text: &str) -> bool {
+    let mut o = open;
+    let mut p = partial.to_string();
+    advance_code_fence_state(&mut o, &mut p, text);
+    o
+}
+
+fn partial_invoke_tag_suffix_len(buf: &str) -> usize {
+    if let Some(lt) = buf.rfind('<') {
+        if !buf[lt..].contains('>') {
+            return buf.len() - lt;
+        }
+    }
+    0
+}
+
+fn trailing_tool_protocol_tail_len(buf: &str) -> usize {
+    let mut keep = partial_invoke_tag_suffix_len(buf);
+
+    let trimmed_end = buf.trim_end_matches([' ', '\t', '\r', '\n']);
+    let trailing_ws = buf.len() - trimmed_end.len();
+    if let Some(line_start) = trimmed_end.rfind('\n').map(|p| p + 1).or(Some(0)) {
+        let line = trimmed_end[line_start..].trim();
+        if STRAY_INVOKE_TOKENS.contains(&line) {
+            keep = keep.max(buf.len() - line_start);
+        }
+    }
+
+    if let Some(pos) = find_trailing_function_calls_open(buf) {
+        keep = keep.max(buf.len() - pos);
+    }
+
+    keep.max(trailing_ws.min(buf.len()))
+}
+
+fn find_trailing_function_calls_open(buf: &str) -> Option<usize> {
+    let mut search = 0usize;
+    let mut last = None;
+    while let Some(rel) = buf[search..].find("function_calls") {
+        let name_pos = search + rel;
+        if let Some(lt) = open_tag_lt_pos(buf, name_pos) {
+            let after = name_pos + "function_calls".len();
+            let next_ok = buf.as_bytes().get(after).map_or(true, |c| {
+                c.is_ascii_whitespace() || *c == b'>' || *c == b'/'
+            });
+            if next_ok {
+                last = Some(lt);
+            }
+        }
+        search = name_pos + "function_calls".len();
+    }
+    let lt = last?;
+    let tail = &buf[lt..];
+    if tail.contains("</function_calls>") || tail.contains("</antml:function_calls>") {
+        return None;
+    }
+    if tail.contains("<invoke") {
+        return None;
+    }
+    Some(lt)
+}
+
+fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonical_json).collect())
+        }
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort();
+            let mut out = serde_json::Map::new();
+            for key in keys {
+                if let Some(value) = map.get(key) {
+                    out.insert(key.clone(), canonical_json(value));
+                }
+            }
+            serde_json::Value::Object(out)
+        }
+        _ => value.clone(),
+    }
+}
+
+pub(crate) fn tool_use_signature(name: &str, input: &serde_json::Value) -> String {
+    format!(
+        "{}|{}",
+        name,
+        serde_json::to_string(&canonical_json(input)).unwrap_or_else(|_| "null".to_string())
+    )
+}
+
+fn tool_use_signature_from_json_str(name: &str, input_json: &str) -> String {
+    let input = if input_json.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(input_json).unwrap_or_else(|_| serde_json::json!({}))
+    };
+    tool_use_signature(name, &input)
+}
+
+/// 一次性把完整 assistant 文本里的字面 `<invoke>` 恢复成 Anthropic content blocks。
+pub(crate) fn extract_invoke_content_blocks(
+    text: &str,
+    known_tool_names: &HashSet<String>,
+    tool_name_map: &HashMap<String, String>,
+) -> Vec<serde_json::Value> {
+    let collapsed = collapse_stray_token_floods(text);
+    let text: &str = &collapsed;
+    let mut blocks = Vec::new();
+    let mut pending_text = String::new();
+    let mut fence_open = false;
+    let mut fence_partial = String::new();
+
+    fn push_text(blocks: &mut Vec<serde_json::Value>, pending: &mut String) {
+        if !pending.is_empty() {
+            blocks.push(json!({"type": "text", "text": std::mem::take(pending)}));
+        }
+    }
+
+    let mut rest = text;
+    loop {
+        let Some(start) = find_invoke_start(rest) else {
+            pending_text.push_str(rest);
+            break;
+        };
+        let Some(end) = find_invoke_block_end(rest, start) else {
+            pending_text.push_str(rest);
+            break;
+        };
+
+        let before = &rest[..start];
+        let stripped_before = strip_trailing_tool_prefixes(before);
+        let fence_after_before = fence_open_after(fence_open, &fence_partial, stripped_before);
+        let parsed = parse_invoke_block(&rest[start..end]);
+        let name_known = parsed
+            .as_ref()
+            .map(|(name, _)| known_tool_names.contains(name))
+            .unwrap_or(false);
+
+        if invoke_looks_like_real_leak(stripped_before) && !fence_after_before && name_known {
+            if !stripped_before.is_empty() {
+                advance_code_fence_state(&mut fence_open, &mut fence_partial, stripped_before);
+                pending_text.push_str(stripped_before);
+            }
+            push_text(&mut blocks, &mut pending_text);
+            let (name, input_json) = parsed.expect("parsed is Some when name_known");
+            let input: serde_json::Value =
+                serde_json::from_str(&input_json).unwrap_or_else(|_| json!({}));
+            let name = tool_name_map.get(&name).cloned().unwrap_or(name);
+            let tool_use_id = format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
+            blocks.push(json!({
+                "type": "tool_use",
+                "id": tool_use_id,
+                "name": name,
+                "input": input,
+            }));
+        } else {
+            let chunk = &rest[..end];
+            advance_code_fence_state(&mut fence_open, &mut fence_partial, chunk);
+            pending_text.push_str(chunk);
+        }
+        rest = strip_leading_function_calls_close(&rest[end..]);
+    }
+
+    push_text(&mut blocks, &mut pending_text);
+    blocks
 }
 
 /// 从完整文本中提取 thinking 块（用于非流式响应）
@@ -540,14 +1095,28 @@ pub struct StreamContext {
     pub output_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
+    /// 工具输入 JSON 片段累计，用于 stop 时生成稳定去重签名。
+    tool_input_buffers: HashMap<String, String>,
+    /// 从文本泄漏中恢复出的工具调用，延迟到流末尾发出，以便和后续结构化 toolUseEvent 去重。
+    pending_leaked_tools: Vec<(String, String, String)>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
     pub tool_name_map: HashMap<String, String>,
+    /// 本次请求声明的工具名集合。字面 `<invoke>` 只有命中该集合才会恢复成 tool_use。
+    pub known_tool_names: HashSet<String>,
+    /// 已发出的工具调用签名，用于结构化 toolUseEvent 与文本泄漏恢复之间去重。
+    seen_tool_sigs: HashSet<String>,
+    /// 代码围栏状态；围栏内的 `<invoke>` 视为正文展示，不恢复。
+    code_fence_open: bool,
+    /// 围栏检测的未完成行缓冲。
+    fence_scan_partial: String,
     /// thinking 是否启用
     pub thinking_enabled: bool,
     /// 是否把 XML `<thinking>` 文本提取为 unsigned thinking block
     pub extract_xml_thinking: bool,
     /// thinking 内容缓冲区
     pub thinking_buffer: String,
+    /// 字面 `<invoke>` 跨 chunk 嗅探缓冲区。
+    invoke_sniff_buffer: String,
     /// 是否在 thinking 块内
     pub in_thinking_block: bool,
     /// thinking 块是否已提取完成
@@ -579,6 +1148,12 @@ pub struct StreamContext {
     final_usage: Option<super::cache::CacheUsage>,
     /// 最近一次最终下游上报 usage，用于请求级记录。
     final_reported_usage: Option<super::cache::CacheUsage>,
+    /// stray token 复读熔断：最近一行。
+    repeat_guard_last_line: String,
+    /// stray token 复读熔断：连续次数。
+    repeat_guard_run: u32,
+    /// stray token 复读熔断：触发后本轮剩余文本丢弃。
+    repeat_guard_tripped: bool,
 }
 
 impl StreamContext {
@@ -590,18 +1165,36 @@ impl StreamContext {
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
     ) -> Self {
-        Self::new_with_simulation(
+        Self::new_with_thinking_with_known_tools(
+            model,
+            input_tokens,
+            thinking_enabled,
+            tool_name_map,
+            HashSet::new(),
+        )
+    }
+
+    pub fn new_with_thinking_with_known_tools(
+        model: impl Into<String>,
+        input_tokens: i32,
+        thinking_enabled: bool,
+        tool_name_map: HashMap<String, String>,
+        known_tool_names: HashSet<String>,
+    ) -> Self {
+        Self::new_with_simulation_with_known_tools(
             model,
             input_tokens,
             DEFAULT_CONTEXT_WINDOW_TOKENS,
             thinking_enabled,
             true,
             tool_name_map,
+            known_tool_names,
             None,
             PromptCacheSimulationMode::Disabled,
         )
     }
 
+    #[allow(dead_code)]
     pub fn new_with_simulation(
         model: impl Into<String>,
         input_tokens: i32,
@@ -609,6 +1202,30 @@ impl StreamContext {
         thinking_enabled: bool,
         extract_xml_thinking: bool,
         tool_name_map: HashMap<String, String>,
+        simulated_usage: Option<super::cache::CacheSimulation>,
+        simulation_mode: PromptCacheSimulationMode,
+    ) -> Self {
+        Self::new_with_simulation_with_known_tools(
+            model,
+            input_tokens,
+            context_window_tokens,
+            thinking_enabled,
+            extract_xml_thinking,
+            tool_name_map,
+            HashSet::new(),
+            simulated_usage,
+            simulation_mode,
+        )
+    }
+
+    pub fn new_with_simulation_with_known_tools(
+        model: impl Into<String>,
+        input_tokens: i32,
+        context_window_tokens: i32,
+        thinking_enabled: bool,
+        extract_xml_thinking: bool,
+        tool_name_map: HashMap<String, String>,
+        known_tool_names: HashSet<String>,
         simulated_usage: Option<super::cache::CacheSimulation>,
         simulation_mode: PromptCacheSimulationMode,
     ) -> Self {
@@ -622,10 +1239,17 @@ impl StreamContext {
             metadata_usage: None,
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
+            tool_input_buffers: HashMap::new(),
+            pending_leaked_tools: Vec::new(),
             tool_name_map,
+            known_tool_names,
+            seen_tool_sigs: HashSet::new(),
+            code_fence_open: false,
+            fence_scan_partial: String::new(),
             thinking_enabled,
             extract_xml_thinking,
             thinking_buffer: String::new(),
+            invoke_sniff_buffer: String::new(),
             in_thinking_block: false,
             thinking_extracted: false,
             thinking_block_index: None,
@@ -641,6 +1265,9 @@ impl StreamContext {
             reported_cache_usage_policy: None,
             final_usage: None,
             final_reported_usage: None,
+            repeat_guard_last_line: String::new(),
+            repeat_guard_run: 0,
+            repeat_guard_tripped: false,
         }
     }
 
@@ -1148,13 +1775,228 @@ impl StreamContext {
         events
     }
 
-    /// 创建 text_delta 事件
-    ///
-    /// 如果文本块尚未创建，会先创建文本块。
-    /// 当发生 tool_use 时，状态机会自动关闭当前文本块；后续文本会自动创建新的文本块继续输出。
-    ///
-    /// 返回值包含可能的 content_block_start 事件和 content_block_delta 事件。
+    /// 创建 text_delta 事件（带字面 `<invoke>` 嗅探的统一明文出口）。
     fn create_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        self.invoke_sniff_buffer.push_str(text);
+        self.drain_invoke_sniff_buffer(false)
+    }
+
+    const MAX_INVOKE_HOLD_BYTES: usize = 262_144;
+
+    fn drain_invoke_sniff_buffer(&mut self, flush: bool) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        let mut buf = std::mem::take(&mut self.invoke_sniff_buffer);
+
+        loop {
+            match find_invoke_start(&buf) {
+                Some(start) => match find_invoke_block_end(&buf, start) {
+                    Some(end) => {
+                        let before = strip_trailing_tool_prefixes(&buf[..start]);
+                        let fence_after_before = fence_open_after(
+                            self.code_fence_open,
+                            &self.fence_scan_partial,
+                            before,
+                        );
+                        let parsed = parse_invoke_block(&buf[start..end]);
+                        let name_known = parsed
+                            .as_ref()
+                            .map(|(name, _)| self.known_tool_names.contains(name))
+                            .unwrap_or(false);
+
+                        if invoke_looks_like_real_leak(before) && !fence_after_before && name_known
+                        {
+                            if !before.is_empty() {
+                                events.extend(self.emit_text_delta_raw(before));
+                            }
+                            let (name, input_json) = parsed.expect("parsed is Some when known");
+                            events.extend(self.queue_leaked_tool_use(name, input_json));
+                            let close_len = leading_function_calls_close_len(&buf[end..]);
+                            buf = buf[end + close_len..].to_string();
+                        } else {
+                            events.extend(self.emit_text_delta_raw(&buf[..end]));
+                            buf = buf[end..].to_string();
+                        }
+                        continue;
+                    }
+                    None => {
+                        let before = strip_trailing_tool_prefixes(&buf[..start]);
+                        let fence_after_before = fence_open_after(
+                            self.code_fence_open,
+                            &self.fence_scan_partial,
+                            before,
+                        );
+                        if !invoke_looks_like_real_leak(before) || fence_after_before {
+                            if !buf.is_empty() {
+                                events.extend(self.emit_text_delta_raw(&buf));
+                            }
+                            break;
+                        }
+                        if start > 0 && !before.is_empty() {
+                            events.extend(self.emit_text_delta_raw(before));
+                        }
+                        let remainder = buf[start..].to_string();
+                        if flush || remainder.len() > Self::MAX_INVOKE_HOLD_BYTES {
+                            events.extend(self.emit_text_delta_raw(&remainder));
+                        } else {
+                            self.invoke_sniff_buffer = remainder;
+                        }
+                        break;
+                    }
+                },
+                None => {
+                    if flush {
+                        if !buf.is_empty() {
+                            events.extend(self.emit_text_delta_raw(&buf));
+                        }
+                    } else {
+                        let keep = trailing_tool_protocol_tail_len(&buf);
+                        let split = buf.len().saturating_sub(keep);
+                        let safe = find_char_boundary(&buf, split);
+                        if safe > 0 {
+                            events.extend(self.emit_text_delta_raw(&buf[..safe]));
+                        }
+                        self.invoke_sniff_buffer = buf[safe..].to_string();
+                    }
+                    break;
+                }
+            }
+        }
+
+        events
+    }
+
+    fn queue_leaked_tool_use(&mut self, parsed_name: String, input_json: String) -> Vec<SseEvent> {
+        let output_name = self
+            .tool_name_map
+            .get(&parsed_name)
+            .cloned()
+            .unwrap_or(parsed_name);
+        let sig = tool_use_signature_from_json_str(&output_name, &input_json);
+        if self.seen_tool_sigs.contains(&sig) {
+            tracing::debug!(tool = %output_name, "跳过重复的字面 invoke 工具调用");
+            return Vec::new();
+        }
+        if self
+            .pending_leaked_tools
+            .iter()
+            .any(|(_, _, pending_sig)| pending_sig == &sig)
+        {
+            return Vec::new();
+        }
+        self.pending_leaked_tools
+            .push((output_name, input_json, sig));
+        Vec::new()
+    }
+
+    fn emit_queued_leaked_tool_uses(&mut self) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        let pending = std::mem::take(&mut self.pending_leaked_tools);
+        for (output_name, input_json, sig) in pending {
+            if self.seen_tool_sigs.contains(&sig) {
+                tracing::debug!(tool = %output_name, "流末尾跳过重复的泄漏 tool_use");
+                continue;
+            }
+            events.extend(self.emit_synthesized_tool_use(output_name, input_json, sig));
+        }
+        events
+    }
+
+    fn emit_synthesized_tool_use(
+        &mut self,
+        output_name: String,
+        input_json: String,
+        sig: String,
+    ) -> Vec<SseEvent> {
+        self.seen_tool_sigs.insert(sig);
+
+        let mut events = Vec::new();
+        self.state_manager.set_has_tool_use(true);
+        let block_index = self.state_manager.next_block_index();
+        let tool_use_id = format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
+        self.tool_block_indices
+            .insert(tool_use_id.clone(), block_index);
+        events.extend(self.state_manager.handle_content_block_start(
+            block_index,
+            "tool_use",
+            json!({
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": output_name,
+                    "input": {}
+                }
+            }),
+        ));
+        if !input_json.is_empty() {
+            if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+                block_index,
+                json!({
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": input_json
+                    }
+                }),
+            ) {
+                events.push(delta_event);
+            }
+        }
+        if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
+            events.push(stop_event);
+        }
+        events
+    }
+
+    fn repeat_guard_filter(&mut self, text: &str) -> String {
+        if self.repeat_guard_tripped {
+            return String::new();
+        }
+
+        let mut kept = String::new();
+        for segment in text.split_inclusive('\n') {
+            let line = segment.trim();
+            if STRAY_INVOKE_TOKENS.contains(&line) {
+                if line == self.repeat_guard_last_line {
+                    self.repeat_guard_run += 1;
+                } else {
+                    self.repeat_guard_last_line = line.to_string();
+                    self.repeat_guard_run = 1;
+                }
+                if self.repeat_guard_run >= REPEAT_GUARD_TRIP_THRESHOLD {
+                    self.repeat_guard_tripped = true;
+                    return kept;
+                }
+                kept.push_str(segment);
+            } else {
+                if !line.is_empty() {
+                    self.repeat_guard_last_line = line.to_string();
+                    self.repeat_guard_run = 0;
+                }
+                kept.push_str(segment);
+            }
+        }
+        kept
+    }
+
+    /// 原始 text_delta 发送逻辑；调用前必须已经完成 invoke 嗅探。
+    fn emit_text_delta_raw(&mut self, text: &str) -> Vec<SseEvent> {
+        let kept = self.repeat_guard_filter(text);
+        if kept.is_empty() {
+            return Vec::new();
+        }
+        let text = kept.as_str();
+        let mut fence_open = self.code_fence_open;
+        let mut fence_partial = std::mem::take(&mut self.fence_scan_partial);
+        advance_code_fence_state(&mut fence_open, &mut fence_partial, text);
+        self.code_fence_open = fence_open;
+        self.fence_scan_partial = fence_partial;
+
         let mut events = Vec::new();
 
         // 如果当前 text_block_index 指向的块已经被关闭（例如 tool_use 开始时自动 stop），
@@ -1349,6 +2191,13 @@ impl StreamContext {
             .cloned()
             .unwrap_or_else(|| tool_use.name.clone());
 
+        if !tool_use.input.is_empty() {
+            self.tool_input_buffers
+                .entry(tool_use.tool_use_id.clone())
+                .or_default()
+                .push_str(&tool_use.input);
+        }
+
         // 发送 content_block_start
         let start_events = self.state_manager.handle_content_block_start(
             block_index,
@@ -1387,6 +2236,12 @@ impl StreamContext {
 
         // 如果是完整的工具调用（stop=true），发送 content_block_stop
         if tool_use.stop {
+            let full_input = self
+                .tool_input_buffers
+                .remove(&tool_use.tool_use_id)
+                .unwrap_or_else(|| tool_use.input.clone());
+            let sig = tool_use_signature_from_json_str(&original_name, &full_input);
+            self.seen_tool_sigs.insert(sig);
             if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
                 events.push(stop_event);
             }
@@ -1502,6 +2357,11 @@ impl StreamContext {
             self.state_manager.set_stop_reason("max_tokens");
             events.extend(self.create_text_delta_events(" "));
         }
+
+        if !self.invoke_sniff_buffer.is_empty() {
+            events.extend(self.drain_invoke_sniff_buffer(true));
+        }
+        events.extend(self.emit_queued_leaked_tool_uses());
 
         // 优先使用 metadataEvent 的准确 token usage；缺失时回退到 contextUsageEvent 估算值。
         let final_input_tokens = self
@@ -2362,6 +3222,445 @@ mod tests {
             .filter(|e| e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta")
             .map(|e| e.data["delta"]["text"].as_str().unwrap_or(""))
             .collect()
+    }
+
+    fn invoke_test_tools() -> HashSet<String> {
+        [
+            "exec_command",
+            "write_file",
+            "apply_patch",
+            "tool_a",
+            "tool_b",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
+    fn collect_tool_uses(events: &[SseEvent]) -> Vec<(String, String)> {
+        let mut result = Vec::new();
+        for start in events.iter().filter(|e| {
+            e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
+        }) {
+            let index = start.data["index"].as_i64();
+            let name = start.data["content_block"]["name"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let input = events
+                .iter()
+                .filter(|e| {
+                    e.event == "content_block_delta"
+                        && e.data["index"].as_i64() == index
+                        && e.data["delta"]["type"] == "input_json_delta"
+                })
+                .map(|e| e.data["delta"]["partial_json"].as_str().unwrap_or(""))
+                .collect::<String>();
+            result.push((name, input));
+        }
+        result
+    }
+
+    #[test]
+    fn test_stream_recovers_single_bare_literal_invoke() {
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            invoke_test_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(
+            "<invoke name=\"exec_command\"><parameter name=\"cmd\">pwd</parameter></invoke>",
+        ));
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert_eq!(tools.len(), 1, "bare invoke should be recovered: {tools:?}");
+        assert_eq!(tools[0].0, "exec_command");
+        let parsed: serde_json::Value = serde_json::from_str(&tools[0].1).unwrap();
+        assert_eq!(parsed["cmd"], "pwd");
+        assert!(!collect_text_content(&all).contains("<invoke"));
+    }
+
+    #[test]
+    fn test_stream_recovers_split_literal_invoke() {
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            invoke_test_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response("准备执行。\ncount\n<function_calls>\n<inv"));
+        all.extend(ctx.process_assistant_response("oke name=\"exec_command\">"));
+        all.extend(ctx.process_assistant_response(
+            "<parameter name=\"cmd\">ls</parameter></invoke>\n</function_calls>",
+        ));
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert_eq!(
+            tools.len(),
+            1,
+            "literal invoke should become one tool_use: {tools:?}"
+        );
+        assert_eq!(tools[0].0, "exec_command");
+        let parsed: serde_json::Value = serde_json::from_str(&tools[0].1).unwrap();
+        assert_eq!(parsed["cmd"], "ls");
+
+        let text = collect_text_content(&all);
+        assert!(text.contains("准备执行。"));
+        assert!(!text.contains("<invoke"));
+        assert!(!text.contains("function_calls"));
+        assert!(!text.contains("count\n<"));
+    }
+
+    #[test]
+    fn test_stream_recovers_sequential_literal_invokes() {
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            invoke_test_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(
+            "<invoke name=\"tool_a\"><parameter name=\"x\">1</parameter></invoke><invoke name=\"tool_b\"><parameter name=\"y\">2</parameter></invoke>",
+        ));
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert_eq!(
+            tools.len(),
+            2,
+            "sequential invokes should become two tool_uses: {tools:?}"
+        );
+        assert_eq!(tools[0].0, "tool_a");
+        assert_eq!(tools[1].0, "tool_b");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&tools[0].1).unwrap()["x"],
+            1
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&tools[1].1).unwrap()["y"],
+            2
+        );
+    }
+
+    #[test]
+    fn test_stream_recovers_large_multiline_literal_invoke_split_by_lines() {
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            invoke_test_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let patch = (0..48)
+            .map(|i| format!("+ patch line {i:02} keeps multiline body intact"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let full = format!(
+            "<invoke name=\"apply_patch\"><parameter name=\"patch\">{}</parameter></invoke>",
+            patch
+        );
+
+        let mut all = Vec::new();
+        for line in full.split_inclusive('\n') {
+            all.extend(ctx.process_assistant_response(line));
+        }
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert_eq!(
+            tools.len(),
+            1,
+            "multiline split invoke should remain held until closed: {tools:?}"
+        );
+        assert_eq!(tools[0].0, "apply_patch");
+        let parsed: serde_json::Value = serde_json::from_str(&tools[0].1).unwrap();
+        assert_eq!(parsed["patch"], patch);
+    }
+
+    #[test]
+    fn test_stream_recovers_parameter_values_containing_literal_close_tags() {
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            invoke_test_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let patch =
+            "*** Begin Patch\n- keep literal </parameter>\n+ keep literal </invoke>\n*** End Patch";
+        let payload = format!(
+            "<invoke name=\"apply_patch\"><parameter name=\"patch\">{}</parameter></invoke>",
+            patch
+        );
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(&payload));
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert_eq!(
+            tools.len(),
+            1,
+            "literal close tags inside values should not split"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&tools[0].1).unwrap();
+        assert_eq!(parsed["patch"], patch);
+    }
+
+    #[test]
+    fn test_stream_dedupes_leaked_invoke_against_later_structured_tool_use() {
+        use crate::kiro::model::events::ToolUseEvent;
+
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            invoke_test_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(
+            "count\n<invoke name=\"exec_command\"><parameter name=\"cmd\">ls</parameter></invoke>",
+        ));
+        all.extend(ctx.process_tool_use(&ToolUseEvent {
+            name: "exec_command".to_string(),
+            tool_use_id: "toolu_structured".to_string(),
+            input: r#"{"cmd":"ls"}"#.to_string(),
+            stop: true,
+        }));
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert_eq!(
+            tools.len(),
+            1,
+            "leaked and structured duplicates must collapse: {tools:?}"
+        );
+        assert_eq!(tools[0].0, "exec_command");
+    }
+
+    #[test]
+    fn test_stream_maps_short_leaked_tool_name_back_to_original() {
+        let original = "mcp__very_long_server_name__tool_with_name_that_exceeds_kiro_limit";
+        let short = "mcpVeryLongServerNameToolWithNameThatExceedsKiroLiHash12345678";
+        let mut map = HashMap::new();
+        map.insert(short.to_string(), original.to_string());
+        let known = [short.to_string(), original.to_string()]
+            .into_iter()
+            .collect::<HashSet<_>>();
+
+        let mut ctx =
+            StreamContext::new_with_thinking_with_known_tools("test-model", 1, false, map, known);
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(&format!(
+            "count\n<invoke name=\"{}\"><parameter name=\"query\">needle</parameter></invoke>",
+            short
+        )));
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].0, original);
+        let parsed: serde_json::Value = serde_json::from_str(&tools[0].1).unwrap();
+        assert_eq!(parsed["query"], "needle");
+    }
+
+    #[test]
+    fn test_stream_does_not_recover_unknown_or_fenced_invoke() {
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            invoke_test_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(
+            "```\n<invoke name=\"exec_command\"><parameter name=\"cmd\">rm</parameter></invoke>\n```\n",
+        ));
+        all.extend(ctx.process_assistant_response(
+            "count\n<invoke name=\"unknown_tool\"><parameter name=\"x\">1</parameter></invoke>",
+        ));
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert!(
+            tools.is_empty(),
+            "fenced/unknown invoke must remain text: {tools:?}"
+        );
+        let text = collect_text_content(&all);
+        assert!(text.contains("<invoke name=\"exec_command\">"));
+        assert!(text.contains("unknown_tool"));
+    }
+
+    #[test]
+    fn test_stream_does_not_recover_with_empty_known_tool_table() {
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            HashSet::new(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(
+            "count\n<invoke name=\"exec_command\"><parameter name=\"cmd\">rm</parameter></invoke>",
+        ));
+        all.extend(ctx.generate_final_events());
+
+        assert!(collect_tool_uses(&all).is_empty());
+        let text = collect_text_content(&all);
+        assert!(text.contains("<invoke name=\"exec_command\">"));
+        assert!(text.contains("rm"));
+    }
+
+    #[test]
+    fn test_stream_does_not_recover_markdown_list_or_blockquote_invokes() {
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            invoke_test_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(
+            "- <invoke name=\"exec_command\"><parameter name=\"cmd\">rm -rf /</parameter></invoke>\n",
+        ));
+        all.extend(ctx.process_assistant_response(
+            "> <invoke name=\"exec_command\"><parameter name=\"cmd\">rm -rf /tmp</parameter></invoke>",
+        ));
+        all.extend(ctx.generate_final_events());
+
+        assert!(collect_tool_uses(&all).is_empty());
+        let text = collect_text_content(&all);
+        assert!(text.contains("rm -rf /"));
+        assert!(text.contains("rm -rf /tmp"));
+    }
+
+    #[test]
+    fn test_stream_flushes_unclosed_line_start_invoke_as_text() {
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            invoke_test_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(
+            "<invoke name=\"exec_command\"><parameter name=\"cmd\">ls",
+        ));
+        all.extend(ctx.generate_final_events());
+
+        assert!(collect_tool_uses(&all).is_empty());
+        let text = collect_text_content(&all);
+        assert!(text.contains("<invoke name=\"exec_command\">"));
+        assert!(text.contains("ls"));
+    }
+
+    #[test]
+    fn test_stream_stray_token_repeat_guard_drops_flood_tail() {
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            invoke_test_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(
+            ctx.process_assistant_response(&format!("{}SHOULD_NOT_APPEAR", "count\n".repeat(40))),
+        );
+        all.extend(ctx.generate_final_events());
+
+        let text = collect_text_content(&all);
+        assert!(
+            !text.contains("SHOULD_NOT_APPEAR"),
+            "repeat guard should drop text after a stray-token flood: {text:?}"
+        );
+        assert!(
+            text.lines().filter(|line| line.trim() == "count").count()
+                < REPEAT_GUARD_TRIP_THRESHOLD as usize,
+            "guard should stop before emitting the threshold line: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_extract_invoke_content_blocks_restores_typed_params() {
+        let blocks = extract_invoke_content_blocks(
+            "count\n<invoke name=\"exec_command\"><parameter name=\"flag\">true</parameter><parameter name=\"n\">42</parameter><parameter name=\"cmd\">echo hi</parameter></invoke>",
+            &invoke_test_tools(),
+            &HashMap::new(),
+        );
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["input"]["flag"], true);
+        assert_eq!(blocks[0]["input"]["n"], 42);
+        assert_eq!(blocks[0]["input"]["cmd"], "echo hi");
+    }
+
+    #[test]
+    fn test_extract_invoke_content_blocks_maps_short_name_and_keeps_text_order() {
+        let mut map = HashMap::new();
+        map.insert(
+            "shortTool".to_string(),
+            "mcp__server__short_tool".to_string(),
+        );
+        let known = ["shortTool".to_string()]
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let blocks = extract_invoke_content_blocks(
+            "before\ncall\n<function_calls>\n<invoke name=\"shortTool\"><parameter name=\"x\">y</parameter></invoke>\n</function_calls>\nafter",
+            &known,
+            &map,
+        );
+
+        assert_eq!(
+            blocks.len(),
+            3,
+            "text/tool/text blocks expected: {blocks:?}"
+        );
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "before\n");
+        assert_eq!(blocks[1]["type"], "tool_use");
+        assert_eq!(blocks[1]["name"], "mcp__server__short_tool");
+        assert_eq!(blocks[1]["input"]["x"], "y");
+        assert_eq!(blocks[2]["type"], "text");
+        assert_eq!(blocks[2]["text"], "after");
     }
 
     #[test]

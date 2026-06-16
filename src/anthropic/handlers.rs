@@ -62,6 +62,7 @@ use super::websearch;
 use crate::external_pool::{
     ExternalPoolFinalError, ExternalPoolForwardOutcome, ExternalPoolManager, ExternalRouteRequest,
 };
+use crate::http_client::response_bytes_with_body_timeout;
 use crate::kiro::call_trace::KiroCredentialAttempt;
 use crate::kiro::provider::{KiroProvider, KiroStreamCompletion};
 
@@ -2733,6 +2734,7 @@ async fn post_messages_inner(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
+    let known_tool_names = conversion_result.known_tool_names;
     let warnings_header = if should_expose_proxy_warnings(&runtime_config) {
         merge_warning_headers(
             conversion_result.warnings.encode_header(),
@@ -2754,6 +2756,7 @@ async fn post_messages_inner(
             thinking_enabled,
             extract_xml_thinking,
             tool_name_map,
+            known_tool_names,
             usage_context,
             warnings_header,
             too_long_retry,
@@ -2770,6 +2773,7 @@ async fn post_messages_inner(
             input_tokens,
             extract_thinking,
             tool_name_map,
+            known_tool_names,
             usage_context,
             warnings_header,
             too_long_retry,
@@ -2880,6 +2884,7 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     extract_xml_thinking: bool,
     tool_name_map: HashMap<String, String>,
+    known_tool_names: HashSet<String>,
     usage_context: RequestUsageContext,
     warnings_header: Option<String>,
     too_long_retry: Option<PayloadTooLongRetryRequest>,
@@ -3151,13 +3156,14 @@ async fn handle_stream_request(
     );
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_simulation(
+    let mut ctx = StreamContext::new_with_simulation_with_known_tools(
         model,
         input_tokens,
         context_window_tokens,
         thinking_enabled,
         extract_xml_thinking,
         tool_name_map,
+        known_tool_names,
         credential_usage.request.simulated_usage,
         credential_usage.request.simulation_mode,
     );
@@ -3407,6 +3413,7 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: HashMap<String, String>,
+    known_tool_names: HashSet<String>,
     usage_context: RequestUsageContext,
     warnings_header: Option<String>,
     too_long_retry: Option<PayloadTooLongRetryRequest>,
@@ -3678,7 +3685,14 @@ async fn handle_non_stream_request(
     let (response, completion) = api_response.into_parts();
 
     // 读取响应体
-    let body_bytes = match response.bytes().await {
+    let body_bytes = match response_bytes_with_body_timeout(
+        response,
+        provider
+            .runtime_config()
+            .kiro_upstream_response_timeout_secs,
+    )
+    .await
+    {
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!("读取响应体失败: {}", e);
@@ -3713,6 +3727,7 @@ async fn handle_non_stream_request(
     let mut native_thinking_content = String::new();
     let mut native_thinking_signature: Option<String> = None;
     let mut redacted_thinking: Option<String> = None;
+    let mut seen_tool_sigs: HashSet<String> = HashSet::new();
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -3770,13 +3785,24 @@ async fn handle_non_stream_request(
                                     .get(&tool_use.name)
                                     .cloned()
                                     .unwrap_or_else(|| tool_use.name.clone());
-
-                                tool_uses.push(json!({
-                                    "type": "tool_use",
-                                    "id": tool_use.tool_use_id,
-                                    "name": original_name,
-                                    "input": input
-                                }));
+                                let sig = crate::anthropic::stream::tool_use_signature(
+                                    &original_name,
+                                    &input,
+                                );
+                                if seen_tool_sigs.insert(sig) {
+                                    tool_uses.push(json!({
+                                        "type": "tool_use",
+                                        "id": tool_use.tool_use_id,
+                                        "name": original_name,
+                                        "input": input
+                                    }));
+                                } else {
+                                    tracing::debug!(
+                                        tool = %original_name,
+                                        tool_use_id = %tool_use.tool_use_id,
+                                        "重复的结构化 tool_use 已跳过"
+                                    );
+                                }
                             }
                         }
                         Event::ContextUsage(context_usage) => {
@@ -3867,6 +3893,31 @@ async fn handle_non_stream_request(
 
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
+    let mut append_recovered_blocks = |text: &str, content: &mut Vec<serde_json::Value>| {
+        if text.is_empty() {
+            return;
+        }
+        for block in
+            super::stream::extract_invoke_content_blocks(text, &known_tool_names, &tool_name_map)
+        {
+            if block["type"] == "tool_use" {
+                let name = block["name"].as_str().unwrap_or("");
+                let input = block["input"].clone();
+                let sig = crate::anthropic::stream::tool_use_signature(name, &input);
+                if seen_tool_sigs.insert(sig) {
+                    content.push(block);
+                } else {
+                    tracing::debug!(tool = %name, "重复的泄漏 tool_use 已跳过");
+                }
+            } else if block["type"] == "text" {
+                if block["text"].as_str().is_some_and(|text| !text.is_empty()) {
+                    content.push(block);
+                }
+            } else {
+                content.push(block);
+            }
+        }
+    };
 
     if thinking_enabled && redacted_thinking.is_some() {
         content.push(json!({
@@ -3884,12 +3935,7 @@ async fn handle_non_stream_request(
             }
         }
         content.push(thinking_block);
-        if !text_content.is_empty() {
-            content.push(json!({
-                "type": "text",
-                "text": text_content
-            }));
-        }
+        append_recovered_blocks(&text_content, &mut content);
     } else if thinking_enabled {
         // 从完整文本中提取 thinking 块
         let (thinking, remaining_text) =
@@ -3902,17 +3948,9 @@ async fn handle_non_stream_request(
             }));
         }
 
-        if !remaining_text.is_empty() {
-            content.push(json!({
-                "type": "text",
-                "text": remaining_text
-            }));
-        }
+        append_recovered_blocks(&remaining_text, &mut content);
     } else if !text_content.is_empty() {
-        content.push(json!({
-            "type": "text",
-            "text": text_content
-        }));
+        append_recovered_blocks(&text_content, &mut content);
     }
 
     content.extend(tool_uses);
@@ -4278,6 +4316,7 @@ pub async fn post_messages_cc(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
+    let known_tool_names = conversion_result.known_tool_names;
     let warnings_header = if should_expose_proxy_warnings(&runtime_config) {
         merge_warning_headers(
             conversion_result.warnings.encode_header(),
@@ -4299,6 +4338,7 @@ pub async fn post_messages_cc(
             thinking_enabled,
             extract_xml_thinking,
             tool_name_map,
+            known_tool_names,
             usage_context,
             warnings_header,
             too_long_retry,
@@ -4315,6 +4355,7 @@ pub async fn post_messages_cc(
             input_tokens,
             extract_thinking,
             tool_name_map,
+            known_tool_names,
             usage_context,
             warnings_header,
             too_long_retry,

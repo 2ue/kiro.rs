@@ -4,9 +4,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::anthropic::pricing::ModelPricing;
 use crate::model::config::{
-    CompatProfile, CompressionConfig, ExternalPoolsConfig, ModelMappingConfig, ModelResolutionMode,
-    PayloadGuardMode, PayloadShapingConfig, PayloadShapingConfigPatch,
-    PromptCacheCreationControlConfig, ReportedUsageConfig,
+    CompatProfile, CompressionConfig, ExternalPoolsConfig, KiroAgentModeStrategy,
+    ModelMappingConfig, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
+    PayloadShapingConfigPatch, PromptCacheCreationControlConfig, ReportedUsageConfig,
 };
 
 // ============ 凭据状态 ============
@@ -118,6 +118,9 @@ pub struct CredentialStatusItem {
     pub expires_at: Option<String>,
     /// 认证方式
     pub auth_method: Option<String>,
+    /// 上游身份提供方
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// 凭据级兼容 Region（主要作为 Auth Region 的旧字段/回退字段）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
@@ -317,6 +320,8 @@ pub struct UpdateCredentialAuthRequest {
     #[serde(default)]
     pub auth_method: Option<String>,
     #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
     pub client_id: Option<String>,
     #[serde(default)]
     pub client_secret: Option<String>,
@@ -453,6 +458,10 @@ pub struct AddCredentialRequest {
     #[serde(default = "default_auth_method", alias = "auth_method")]
     pub auth_method: String,
 
+    /// 上游身份提供方（BuilderId / Enterprise / ExternalIdp / Github / Google 等）
+    #[serde(default)]
+    pub provider: Option<String>,
+
     /// OIDC Client ID（IdC 认证需要）
     #[serde(alias = "client_id")]
     pub client_id: Option<String>,
@@ -553,6 +562,8 @@ pub struct BatchCredentialImportDefaults {
     pub priority: Option<u32>,
     #[serde(default)]
     pub max_concurrent_requests: Option<Option<u32>>,
+    #[serde(default)]
+    pub provider: Option<String>,
     #[serde(default)]
     pub auth_region: Option<String>,
     #[serde(default)]
@@ -963,6 +974,7 @@ pub struct RuntimeConfigResponse {
     pub credential_probation_secs: u64,
     pub credential_max_cooldown_secs: u64,
     pub credential_dispatch_max_wait_secs: u64,
+    pub kiro_upstream_response_timeout_secs: u64,
     pub credential_retry_max_attempts: u32,
     pub credential_in_flight_lease_max_secs: u64,
     pub dispatch_global_max_concurrent_requests: u32,
@@ -999,6 +1011,7 @@ pub struct RuntimeConfigResponse {
     pub external_pools: ExternalPoolsConfig,
     pub high_cache_threshold: i32,
     pub compat_profile: CompatProfile,
+    pub kiro_agent_mode_strategy: KiroAgentModeStrategy,
     pub model_resolution_mode: ModelResolutionMode,
     pub model_mapping: ModelMappingConfig,
     pub extract_thinking: bool,
@@ -1033,6 +1046,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub credential_max_cooldown_secs: u64,
     #[serde(default)]
     pub credential_dispatch_max_wait_secs: Option<u64>,
+    #[serde(default)]
+    pub kiro_upstream_response_timeout_secs: Option<u64>,
     #[serde(default)]
     pub credential_retry_max_attempts: Option<u32>,
     #[serde(default)]
@@ -1103,6 +1118,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub high_cache_threshold: Option<i32>,
     #[serde(default)]
     pub compat_profile: Option<CompatProfile>,
+    #[serde(default)]
+    pub kiro_agent_mode_strategy: Option<KiroAgentModeStrategy>,
     #[serde(default)]
     pub model_resolution_mode: Option<ModelResolutionMode>,
     #[serde(default)]

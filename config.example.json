@@ -9,6 +9,7 @@
   "port": 8990,
   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
   "adminApiKey": "sk-admin-your-secret-key",
+  "kiroUpstreamResponseTimeoutSecs": 180,
   "credentialRetryMaxAttempts": 0,
   "payloadGuardEnabled": true,
   "payloadGuardMaxBytes": 460800,
@@ -36,5 +37,6 @@
     "currentDocumentMaxChars": 80000,
     "truncateCurrentImages": false,
     "currentImagesMaxBytes": 180000
-  }
+  },
+  "kiroAgentModeStrategy": "vibe"
 }

@@ -47,6 +47,7 @@ use crate::external_pool::{
     ExternalPoolsStatusResponse, SetExternalPoolEnabledRequest, UpdateExternalPoolRequest,
     external_pool_messages_url, external_pool_models_url,
 };
+use crate::http_client::response_bytes_with_body_timeout;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::{
@@ -845,6 +846,7 @@ impl AdminService {
             profile_arn: req.profile_arn,
             expires_at: None,
             auth_method: Some(req.auth_method),
+            provider: req.provider,
             client_id: req.client_id,
             client_secret: req.client_secret,
             priority: req.priority,
@@ -1114,6 +1116,7 @@ impl AdminService {
                     is_current: entry.id == snapshot.current_id,
                     expires_at: entry.expires_at,
                     auth_method: entry.auth_method,
+                    provider: entry.provider,
                     region: entry.region,
                     auth_region: entry.auth_region,
                     api_region: entry.api_region,
@@ -1643,7 +1646,12 @@ impl AdminService {
             .map_err(|e| self.classify_test_error(e, id))?;
         let credential_id = api_response.credential_id();
         let (response, completion) = api_response.into_parts();
-        let body_bytes = match response.bytes().await {
+        let body_bytes = match response_bytes_with_body_timeout(
+            response,
+            runtime_config.kiro_upstream_response_timeout_secs,
+        )
+        .await
+        {
             Ok(bytes) => bytes,
             Err(e) => {
                 completion.release();
@@ -1794,6 +1802,7 @@ impl AdminService {
         let update = CredentialAuthUpdate {
             refresh_token: req.refresh_token,
             auth_method: req.auth_method,
+            provider: req.provider,
             client_id: req.client_id,
             client_secret: req.client_secret,
             kiro_api_key: req.kiro_api_key,
@@ -2628,6 +2637,7 @@ impl AdminService {
             credential_probation_secs: config.credential_probation_secs,
             credential_max_cooldown_secs: config.credential_max_cooldown_secs,
             credential_dispatch_max_wait_secs: config.credential_dispatch_max_wait_secs,
+            kiro_upstream_response_timeout_secs: config.kiro_upstream_response_timeout_secs,
             credential_retry_max_attempts: config.credential_retry_max_attempts,
             credential_in_flight_lease_max_secs: config.credential_in_flight_lease_max_secs,
             dispatch_global_max_concurrent_requests: config.dispatch_global_max_concurrent_requests,
@@ -2664,6 +2674,7 @@ impl AdminService {
             external_pools: config.external_pools.clone(),
             high_cache_threshold: config.high_cache_threshold,
             compat_profile: config.compat_profile,
+            kiro_agent_mode_strategy: config.kiro_agent_mode_strategy,
             model_resolution_mode: config.model_resolution_mode,
             model_mapping: config.model_mapping.clone().normalized(),
             extract_thinking: config.extract_thinking,
@@ -2680,6 +2691,9 @@ impl AdminService {
         let credential_dispatch_max_wait_secs = req
             .credential_dispatch_max_wait_secs
             .unwrap_or(current_config.credential_dispatch_max_wait_secs);
+        let kiro_upstream_response_timeout_secs = req
+            .kiro_upstream_response_timeout_secs
+            .unwrap_or(current_config.kiro_upstream_response_timeout_secs);
         let credential_retry_max_attempts = req
             .credential_retry_max_attempts
             .unwrap_or(current_config.credential_retry_max_attempts);
@@ -2811,6 +2825,9 @@ impl AdminService {
             .high_cache_threshold
             .unwrap_or(current_config.high_cache_threshold);
         let compat_profile = req.compat_profile.unwrap_or(current_config.compat_profile);
+        let kiro_agent_mode_strategy = req
+            .kiro_agent_mode_strategy
+            .unwrap_or(current_config.kiro_agent_mode_strategy);
         let model_resolution_mode = req
             .model_resolution_mode
             .unwrap_or(current_config.model_resolution_mode);
@@ -2866,6 +2883,11 @@ impl AdminService {
         if credential_retry_max_attempts > 10_000 {
             return Err(AdminServiceError::InvalidCredential(
                 "credentialRetryMaxAttempts 不能大于 10000".to_string(),
+            ));
+        }
+        if kiro_upstream_response_timeout_secs > 86_400 {
+            return Err(AdminServiceError::InvalidCredential(
+                "kiroUpstreamResponseTimeoutSecs 不能大于 86400".to_string(),
             ));
         }
         if !scheduler_error_ewma_alpha.is_finite()
@@ -2994,6 +3016,7 @@ impl AdminService {
                 config.credential_probation_secs = credential_probation_secs;
                 config.credential_max_cooldown_secs = req.credential_max_cooldown_secs;
                 config.credential_dispatch_max_wait_secs = credential_dispatch_max_wait_secs;
+                config.kiro_upstream_response_timeout_secs = kiro_upstream_response_timeout_secs;
                 config.credential_retry_max_attempts = credential_retry_max_attempts;
                 config.credential_in_flight_lease_max_secs = credential_in_flight_lease_max_secs;
                 config.dispatch_global_max_concurrent_requests =
@@ -3031,6 +3054,7 @@ impl AdminService {
                 config.external_pools = external_pools;
                 config.high_cache_threshold = high_cache_threshold;
                 config.compat_profile = compat_profile;
+                config.kiro_agent_mode_strategy = kiro_agent_mode_strategy;
                 config.model_resolution_mode = model_resolution_mode;
                 config.model_mapping = model_mapping;
                 config.extract_thinking = extract_thinking;
@@ -3570,6 +3594,9 @@ fn apply_batch_import_defaults(
         if let Some(max_concurrent_requests) = defaults.max_concurrent_requests {
             credential.max_concurrent_requests = max_concurrent_requests;
         }
+    }
+    if credential.provider.as_deref().is_none_or(str::is_empty) {
+        credential.provider = defaults.provider.clone();
     }
     if credential.auth_region.as_deref().is_none_or(str::is_empty) {
         credential.auth_region = defaults.auth_region.clone();
@@ -4364,6 +4391,7 @@ mod tests {
             is_current: false,
             expires_at: None,
             auth_method: None,
+            provider: None,
             region: None,
             auth_region: None,
             api_region: None,

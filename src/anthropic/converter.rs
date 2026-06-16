@@ -753,6 +753,11 @@ pub struct ConversionResult {
     pub conversation_state: ConversationState,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
+    /// 本次请求声明并实际发给上游的工具名集合，包含原始名和因长度限制生成的短名。
+    ///
+    /// 仅用于下游响应容错：当上游把工具调用泄漏为字面 `<invoke>` 文本时，只有工具名命中
+    /// 这个集合才允许恢复成结构化 `tool_use`，避免误执行正文中展示的 XML。
+    pub known_tool_names: std::collections::HashSet<String>,
     /// 代理对入参的隐式改写汇总（兜底动作的统计），用于可选的 `x-kiro-rs-warnings` 响应头。
     pub warnings: ProxyWarnings,
 }
@@ -1038,17 +1043,11 @@ fn convert_request_with_model_id(
         return Err(ConversionError::EmptyMessages);
     }
 
-    // 2.5. 预处理 prefill：如果末尾是 assistant，静默丢弃并截断到最后一条 user
-    // Claude 4.x 已弃用 assistant prefill，Kiro API 也不支持
+    // 2.5. 预处理 prefill：如果末尾不是 user，静默丢弃尾部 prefill 并截断到最后一条 user
+    // Claude 4.x 已弃用 assistant prefill，Kiro API 也不接受 assistant 作为最终消息
     let messages: &[_] = if req.messages.last().is_some_and(|m| m.role != "user") {
-        if options.is_strict() {
-            return Err(ConversionError::UnsupportedContent(
-                "assistant prefill is not supported by this Kiro-backed Anthropic adapter"
-                    .to_string(),
-            ));
-        }
         warnings.prefill_dropped += 1;
-        tracing::info!("检测到末尾 assistant 消息（prefill），静默丢弃");
+        tracing::info!("检测到末尾非 user 消息（prefill），静默丢弃");
         let last_user_idx = req
             .messages
             .iter()
@@ -1076,6 +1075,13 @@ fn convert_request_with_model_id(
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
     let mut tools = convert_tools(&req.tools, &req.tool_choice, &mut tool_name_map);
+    let mut known_tool_names: std::collections::HashSet<String> = tools
+        .iter()
+        .map(|tool| tool.tool_specification.name.clone())
+        .collect();
+    for original_name in tool_name_map.values() {
+        known_tool_names.insert(original_name.clone());
+    }
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
     let mut history = build_history(req, messages, &model_id, &mut tool_name_map, options)?;
@@ -1119,6 +1125,7 @@ fn convert_request_with_model_id(
                     tool_name
                 )));
             }
+            known_tool_names.insert(tool_name.clone());
             tools.push(create_placeholder_tool(&tool_name));
         }
     }
@@ -1167,6 +1174,7 @@ fn convert_request_with_model_id(
     Ok(ConversionResult {
         conversation_state,
         tool_name_map,
+        known_tool_names,
         warnings,
     })
 }
@@ -3396,7 +3404,7 @@ mod tests {
     }
 
     #[test]
-    fn test_anthropic_strict_rejects_prefill_instead_of_dropping_it() {
+    fn test_anthropic_strict_drops_prefill_like_claude_code() {
         use super::super::types::Message as AnthropicMessage;
 
         let req = MessagesRequest {
@@ -3421,16 +3429,24 @@ mod tests {
             metadata: None,
         };
 
-        let err = convert_request_with_options(
+        let result = convert_request_with_options(
             &req,
             ConverterOptions {
                 compat_profile: CompatProfile::AnthropicStrict,
                 ..ConverterOptions::default()
             },
         )
-        .expect_err("strict profile should reject prefill");
+        .expect("strict profile should still sanitize terminal prefill");
 
-        assert!(err.to_string().contains("assistant prefill"));
+        assert_eq!(result.warnings.prefill_dropped, 1);
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            "Hello"
+        );
     }
 
     fn test_tool(name: &str) -> super::super::types::Tool {

@@ -14,6 +14,7 @@ use uuid::Uuid;
 use super::envelope;
 use super::stream::SseEvent;
 use super::types::MessagesRequest;
+use crate::http_client::response_text_with_body_timeout;
 
 /// MCP 请求
 #[derive(Debug, Serialize)]
@@ -518,7 +519,13 @@ async fn call_mcp_api(
 
     let response = provider.call_mcp(&request_body).await?;
 
-    let body = response.text().await?;
+    let body = response_text_with_body_timeout(
+        response,
+        provider
+            .runtime_config()
+            .kiro_upstream_response_timeout_secs,
+    )
+    .await?;
     tracing::debug!("MCP response: {}", body);
 
     let mcp_response: McpResponse = serde_json::from_str(&body)?;

@@ -14,6 +14,7 @@ import { extractErrorMessage } from '@/lib/utils'
 import type {
   AccessKeysResponse,
   CompatProfile,
+  KiroAgentModeStrategy,
   ModelCapabilitiesStatus,
   ModelMappingConfig,
   ModelMappingRule,
@@ -274,6 +275,7 @@ const emptyConfig: RuntimeConfig = {
   credentialProbationSecs: 30,
   credentialMaxCooldownSecs: 300,
   credentialDispatchMaxWaitSecs: 120,
+  kiroUpstreamResponseTimeoutSecs: 180,
   credentialRetryMaxAttempts: 0,
   credentialInFlightLeaseMaxSecs: 900,
   dispatchGlobalMaxConcurrentRequests: 0,
@@ -310,6 +312,7 @@ const emptyConfig: RuntimeConfig = {
   externalPools: defaultExternalPoolsConfig(),
   highCacheThreshold: 10000,
   compatProfile: 'claude-code',
+  kiroAgentModeStrategy: 'vibe',
   modelResolutionMode: 'compatible',
   modelMapping: defaultModelMappingConfig(),
   extractThinking: true,
@@ -765,6 +768,33 @@ function SelectField({ title, description, value, onChange }: SelectFieldProps) 
 interface ModelResolutionSelectFieldProps {
   value: ModelResolutionMode
   onChange: (value: ModelResolutionMode) => void
+}
+
+interface KiroAgentModeSelectFieldProps {
+  value: KiroAgentModeStrategy
+  onChange: (value: KiroAgentModeStrategy) => void
+}
+
+function KiroAgentModeSelectField({ value, onChange }: KiroAgentModeSelectFieldProps) {
+  return (
+    <label className="block rounded-md border bg-background p-4">
+      <div className="mb-3">
+        <div className="text-sm font-medium">Kiro Agent Mode</div>
+        <div className="mt-1 text-xs leading-5 text-muted-foreground">
+          控制发往 Kiro IDE 上游的 x-amzn-kiro-agent-mode。vibe 保持当前 Claude Code 成功链路；spec 强制规格模式；auto 会按账号协议自动选择。
+        </div>
+      </div>
+      <select
+        className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+        value={value}
+        onChange={(event) => onChange(event.target.value as KiroAgentModeStrategy)}
+      >
+        <option value="vibe">vibe（默认兼容）</option>
+        <option value="spec">spec（强制规格模式）</option>
+        <option value="auto">auto（按账号协议自动）</option>
+      </select>
+    </label>
+  )
 }
 
 function ModelResolutionSelectField({ value, onChange }: ModelResolutionSelectFieldProps) {
@@ -1325,6 +1355,7 @@ export function RuntimeConfigPanel() {
       credentialProbationSecs: toWhole(draft.credentialProbationSecs),
       credentialMaxCooldownSecs: toWhole(draft.credentialMaxCooldownSecs, 1),
       credentialDispatchMaxWaitSecs: toWhole(draft.credentialDispatchMaxWaitSecs),
+      kiroUpstreamResponseTimeoutSecs: toWhole(draft.kiroUpstreamResponseTimeoutSecs),
       credentialRetryMaxAttempts: toWhole(draft.credentialRetryMaxAttempts),
       credentialInFlightLeaseMaxSecs: toWhole(draft.credentialInFlightLeaseMaxSecs),
       dispatchGlobalMaxConcurrentRequests: toWhole(draft.dispatchGlobalMaxConcurrentRequests),
@@ -1524,6 +1555,16 @@ export function RuntimeConfigPanel() {
               suffix="秒"
               onChange={(credentialDispatchMaxWaitSecs) =>
                 setDraft((prev) => ({ ...prev, credentialDispatchMaxWaitSecs }))
+              }
+            />
+            <NumberField
+              title="Kiro 上游响应头超时"
+              description="限制请求发出后等待 Kiro 上游返回响应头的最长时间，不影响后续流式输出。填 0 表示只用底层 HTTP client 超时。"
+              value={draft.kiroUpstreamResponseTimeoutSecs}
+              min={0}
+              suffix="秒"
+              onChange={(kiroUpstreamResponseTimeoutSecs) =>
+                setDraft((prev) => ({ ...prev, kiroUpstreamResponseTimeoutSecs }))
               }
             />
             <NumberField
@@ -2272,6 +2313,12 @@ export function RuntimeConfigPanel() {
               description="控制请求转换策略。Claude Code 兼容适合日常 CLI 使用；Anthropic 严格模式会减少代理侧改写；调试模式会默认暴露代理改写告警头。"
               value={draft.compatProfile}
               onChange={(compatProfile) => setDraft((prev) => ({ ...prev, compatProfile }))}
+            />
+            <KiroAgentModeSelectField
+              value={draft.kiroAgentModeStrategy}
+              onChange={(kiroAgentModeStrategy) =>
+                setDraft((prev) => ({ ...prev, kiroAgentModeStrategy }))
+              }
             />
             <ModelResolutionSelectField
               value={draft.modelResolutionMode}

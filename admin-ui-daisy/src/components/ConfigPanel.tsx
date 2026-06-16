@@ -28,6 +28,7 @@ import { storage } from '@/lib/storage'
 import type {
   AccessKeysResponse,
   CompatProfile,
+  KiroAgentModeStrategy,
   ModelCapabilitiesStatus,
   ModelMappingConfig,
   ModelMappingRule,
@@ -800,6 +801,7 @@ export function ConfigPanel() {
       credentialProbationSecs: toWhole(draft.credentialProbationSecs),
       credentialMaxCooldownSecs: toWhole(draft.credentialMaxCooldownSecs, 1),
       credentialDispatchMaxWaitSecs: toWhole(draft.credentialDispatchMaxWaitSecs),
+      kiroUpstreamResponseTimeoutSecs: toWhole(draft.kiroUpstreamResponseTimeoutSecs),
       credentialRetryMaxAttempts: toWhole(draft.credentialRetryMaxAttempts),
       credentialInFlightLeaseMaxSecs: toWhole(draft.credentialInFlightLeaseMaxSecs),
       dispatchGlobalMaxConcurrentRequests: toWhole(draft.dispatchGlobalMaxConcurrentRequests),
@@ -942,6 +944,7 @@ export function ConfigPanel() {
               <NumberField title="恢复观察窗口" description="冷却结束后仍降低该凭据的调度权重，成功后逐步恢复。" value={draft.credentialProbationSecs} min={0} suffix="秒" onChange={(credentialProbationSecs) => setDraft((prev) => ({ ...prev, credentialProbationSecs }))} />
               <NumberField title="最大冷却秒数" description="控制单个凭据最长冷却时间。" value={draft.credentialMaxCooldownSecs} min={1} suffix="秒" onChange={(credentialMaxCooldownSecs) => setDraft((prev) => ({ ...prev, credentialMaxCooldownSecs }))} />
               <NumberField title="单请求最长排队等待" description="所有可用凭据都处于冷却、限速或并发占满时最多等待多久。填 0 表示不限制。" value={draft.credentialDispatchMaxWaitSecs} min={0} suffix="秒" onChange={(credentialDispatchMaxWaitSecs) => setDraft((prev) => ({ ...prev, credentialDispatchMaxWaitSecs }))} />
+              <NumberField title="Kiro 上游响应头超时" description="请求发出后等待 Kiro 上游返回响应头的最长时间，不影响后续流式输出。填 0 表示只用底层 HTTP client 超时。" value={draft.kiroUpstreamResponseTimeoutSecs} min={0} suffix="秒" onChange={(kiroUpstreamResponseTimeoutSecs) => setDraft((prev) => ({ ...prev, kiroUpstreamResponseTimeoutSecs }))} />
               <NumberField title="单请求最大重试次数" description="一次上游调用最多尝试多少个凭据/轮次。填 0 表示自动：小账号池最多 9 次，大账号池至少覆盖一轮账号。" value={draft.credentialRetryMaxAttempts} min={0} suffix="次" onChange={(credentialRetryMaxAttempts) => setDraft((prev) => ({ ...prev, credentialRetryMaxAttempts }))} />
               <NumberField title="异常并发自动回收" description="单个并发占用超过多久未活跃时自动释放。填 0 表示关闭。" value={draft.credentialInFlightLeaseMaxSecs} min={0} suffix="秒" onChange={(credentialInFlightLeaseMaxSecs) => setDraft((prev) => ({ ...prev, credentialInFlightLeaseMaxSecs }))} />
               <NumberField title="全局最大并发请求数" description="控制所有凭据合计可同时处理的请求数。填 0 表示不限制。" value={draft.dispatchGlobalMaxConcurrentRequests} min={0} suffix="并发" onChange={(dispatchGlobalMaxConcurrentRequests) => setDraft((prev) => ({ ...prev, dispatchGlobalMaxConcurrentRequests }))} />
@@ -1149,6 +1152,13 @@ export function ConfigPanel() {
                   <Select.Option value="claude-code">Claude Code 兼容</Select.Option>
                   <Select.Option value="anthropic-strict">Anthropic 严格模式</Select.Option>
                   <Select.Option value="debug">调试模式</Select.Option>
+                </Select>
+              </FieldLabel>
+              <FieldLabel title="Kiro Agent Mode" description="控制发往 Kiro IDE 上游的 x-amzn-kiro-agent-mode。vibe 保持当前 Claude Code 成功链路；spec 强制规格模式；auto 会按账号协议自动选择。">
+                <Select bordered size="sm" value={draft.kiroAgentModeStrategy} onChange={(event) => setDraft((prev) => ({ ...prev, kiroAgentModeStrategy: event.target.value as KiroAgentModeStrategy }))}>
+                  <Select.Option value="vibe">vibe（默认兼容）</Select.Option>
+                  <Select.Option value="spec">spec（强制规格模式）</Select.Option>
+                  <Select.Option value="auto">auto（按账号协议自动）</Select.Option>
                 </Select>
               </FieldLabel>
               <FieldLabel title="模型解析策略" description="默认兼容解析会保留 sonnet、opus、default 等短模型名和同族自动归一化；更严格模式只影响请求发上游前的模型名解析，不改变凭据调度。">

@@ -237,6 +237,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `payloadShaping.truncateCurrentImages` | boolean | `false` | 是否允许在仍超预算时丢弃当前图片；图片不会本地重编码压缩 |
 | `payloadShaping.currentImagesMaxBytes` | number | `180000` | 当前 images 数组允许保留的 JSON 字节预算 |
 | `compatProfile` | string | `claude-code` | 兼容 profile：`claude-code` 优先真实 Claude Code CLI 可用性；`anthropic-strict` 减少代理改写和调试特征；`debug` 等同 `claude-code` 但默认暴露代理 warning |
+| `kiroAgentModeStrategy` | string | `vibe` | Kiro IDE `x-amzn-kiro-agent-mode` 策略：`vibe` 保持当前成功链路，`spec` 强制规格模式，`auto` 按账号协议自动判定 |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `promptCacheTargetReadRatio` | number | `0.98` | `/v1/messages`、`/cc/v1/messages`、`/ha/v1/messages`、`/na/v1/messages` high-cache 的目标 cache read 中心比例；`/na` 默认只保留真实上游 cache usage，不用本地模拟补足 cache usage |
 | `promptCacheTokenScale` | number | `1.6` | `/v1/messages`、`/cc/v1/messages`、`/ha/v1/messages`、`/na/v1/messages` high-cache 模拟专用的 total input 放大倍数，只影响本地模拟 cache usage |

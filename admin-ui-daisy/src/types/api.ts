@@ -743,6 +743,7 @@ export interface AdminAuditLogPageQuery {
 }
 
 export type CompatProfile = 'claude-code' | 'anthropic-strict' | 'debug'
+export type KiroAgentModeStrategy = 'vibe' | 'spec' | 'auto'
 export type ModelResolutionMode = 'compatible' | 'alias_only' | 'exact_only'
 export type ModelMappingRuleKind = 'version_equivalent' | 'alias' | 'fallback'
 export type PayloadGuardMode = 'preemptive' | 'on_too_long'
@@ -972,6 +973,7 @@ export interface RuntimeConfig {
   credentialProbationSecs: number
   credentialMaxCooldownSecs: number
   credentialDispatchMaxWaitSecs: number
+  kiroUpstreamResponseTimeoutSecs: number
   credentialRetryMaxAttempts: number
   credentialInFlightLeaseMaxSecs: number
   dispatchGlobalMaxConcurrentRequests: number
@@ -1008,6 +1010,7 @@ export interface RuntimeConfig {
   externalPools: ExternalPoolsConfig
   highCacheThreshold: number
   compatProfile: CompatProfile
+  kiroAgentModeStrategy: KiroAgentModeStrategy
   modelResolutionMode: ModelResolutionMode
   modelMapping: ModelMappingConfig
   extractThinking: boolean

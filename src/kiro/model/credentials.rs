@@ -42,9 +42,13 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none", alias = "expires_at")]
     pub expires_at: Option<String>,
 
-    /// 认证方式 (social / idc)
+    /// 认证方式 (social / idc / external_idp / api_key)
     #[serde(skip_serializing_if = "Option::is_none", alias = "auth_method")]
     pub auth_method: Option<String>,
+
+    /// 上游身份提供方（BuilderId / Enterprise / ExternalIdp / Github / Google 等）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 
     /// OIDC Client ID (IdC 认证需要)
     #[serde(skip_serializing_if = "Option::is_none", alias = "client_id")]
@@ -138,13 +142,21 @@ fn is_zero(value: &u32) -> bool {
     *value == 0
 }
 
+fn compact_protocol_value(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
 fn canonicalize_auth_method_value(value: &str) -> &str {
-    if value.eq_ignore_ascii_case("builder-id") || value.eq_ignore_ascii_case("iam") {
-        "idc"
-    } else if value.eq_ignore_ascii_case("api_key") || value.eq_ignore_ascii_case("apikey") {
-        "api_key"
-    } else {
-        value
+    match compact_protocol_value(value).as_str() {
+        "builderid" | "iam" | "idc" => "idc",
+        "apikey" => "api_key",
+        "externalidp" | "enterprise" | "iamsso" | "awsidc" | "internal" => "external_idp",
+        "social" => "social",
+        _ => value,
     }
 }
 
@@ -291,8 +303,32 @@ impl KiroCredentials {
             || self
                 .auth_method
                 .as_deref()
-                .map(|m| m.eq_ignore_ascii_case("api_key") || m.eq_ignore_ascii_case("apikey"))
+                .map(|m| compact_protocol_value(m) == "apikey")
                 .unwrap_or(false)
+    }
+
+    /// 检查是否应使用 AWS SSO OIDC refresh token 协议刷新。
+    ///
+    /// Enterprise / external IdP 与 Builder ID 一样走 OIDC 刷新，但请求 Kiro API
+    /// 时仍保留 external_idp 语义以附加 TokenType。
+    pub fn is_idc_refresh_credential(&self) -> bool {
+        if self.is_api_key_credential() {
+            return false;
+        }
+
+        self.auth_method.as_deref().is_some_and(|m| {
+            matches!(
+                compact_protocol_value(m).as_str(),
+                "idc"
+                    | "builderid"
+                    | "iam"
+                    | "externalidp"
+                    | "enterprise"
+                    | "iamsso"
+                    | "awsidc"
+                    | "internal"
+            )
+        }) || (self.client_id.is_some() && self.client_secret.is_some())
     }
 }
 
@@ -338,6 +374,7 @@ mod tests {
             "profile_arn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE",
             "expires_at": "2026-06-10T15:53:19.000Z",
             "auth_method": "idc",
+            "provider": "Enterprise",
             "client_id": "fake-client-id",
             "client_secret": "fake-client-secret",
             "region": "us-east-1",
@@ -359,6 +396,7 @@ mod tests {
             Some("2026-06-10T15:53:19.000Z")
         );
         assert_eq!(creds.auth_method.as_deref(), Some("idc"));
+        assert_eq!(creds.provider.as_deref(), Some("Enterprise"));
         assert_eq!(creds.client_id.as_deref(), Some("fake-client-id"));
         assert_eq!(creds.client_secret.as_deref(), Some("fake-client-secret"));
         assert_eq!(creds.region.as_deref(), Some("us-east-1"));
@@ -384,12 +422,14 @@ mod tests {
             id: None,
             access_token: Some("token".to_string()),
             auth_method: Some("social".to_string()),
+            provider: Some("Github".to_string()),
             ..Default::default()
         };
 
         let json = creds.to_pretty_json().unwrap();
         assert!(json.contains("accessToken"));
         assert!(json.contains("authMethod"));
+        assert!(json.contains("provider"));
         assert!(!json.contains("refreshToken"));
         // priority 为 0 时不序列化
         assert!(!json.contains("priority"));
@@ -415,6 +455,64 @@ mod tests {
         let json = r#"{"refreshToken": "test", "priority": 5}"#;
         let creds = KiroCredentials::from_json(json).unwrap();
         assert_eq!(creds.priority, 5);
+    }
+
+    #[test]
+    fn test_external_idp_auth_method_is_preserved_for_protocol_headers() {
+        let json = r#"{
+            "refreshToken": "test_refresh",
+            "authMethod": "Enterprise",
+            "clientId": "client123",
+            "clientSecret": "secret456",
+            "provider": "Enterprise"
+        }"#;
+        let mut creds = KiroCredentials::from_json(json).unwrap();
+        creds.canonicalize_auth_method();
+        assert_eq!(creds.auth_method.as_deref(), Some("external_idp"));
+        assert_eq!(creds.provider.as_deref(), Some("Enterprise"));
+        assert!(creds.is_idc_refresh_credential());
+    }
+
+    #[test]
+    fn test_external_idp_alias_auth_methods_are_canonicalized() {
+        for auth_method in [
+            "external-idp",
+            "external IDP",
+            "externalidp",
+            "iam_sso",
+            "IAMSSO",
+            "aws-idc",
+            "AWS_IDC",
+            "Internal",
+        ] {
+            let mut creds = KiroCredentials {
+                auth_method: Some(auth_method.to_string()),
+                refresh_token: Some("test_refresh".to_string()),
+                client_id: Some("client123".to_string()),
+                client_secret: Some("secret456".to_string()),
+                ..Default::default()
+            };
+
+            creds.canonicalize_auth_method();
+            assert_eq!(creds.auth_method.as_deref(), Some("external_idp"));
+            assert!(creds.is_idc_refresh_credential());
+        }
+    }
+
+    #[test]
+    fn test_api_key_auth_method_canonicalization_does_not_trip_oidc_refresh() {
+        let mut creds = KiroCredentials {
+            auth_method: Some("API KEY".to_string()),
+            kiro_api_key: Some("ksk_test_key".to_string()),
+            provider: Some("Enterprise".to_string()),
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/STALE".to_string()),
+            ..Default::default()
+        };
+
+        creds.canonicalize_auth_method();
+        assert_eq!(creds.auth_method.as_deref(), Some("api_key"));
+        assert!(creds.is_api_key_credential());
+        assert!(!creds.is_idc_refresh_credential());
     }
 
     #[test]

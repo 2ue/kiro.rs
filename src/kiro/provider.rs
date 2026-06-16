@@ -7,7 +7,7 @@
 
 use chrono::Utc;
 use reqwest::Client;
-use reqwest::header::{CONTENT_TYPE, HeaderMap};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc,
@@ -16,12 +16,18 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{
+    ProxyConfig, build_client, response_text_with_body_timeout, send_with_response_header_timeout,
+};
 use crate::kiro::call_trace::{KiroCallError, KiroCredentialAttempt, summarize_attempts};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::{KiroAvailableModel, KiroAvailableModelsResponse};
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::protocol::{
+    extract_first_profile_arn, is_external_idp_credentials, is_placeholder_profile_arn,
+    resolve_profile_arn,
+};
 use crate::kiro::token_manager::{
     AcquireMode, CallContext, CredentialRiskControlReason, InFlightKind, InFlightLeaseGuard,
     ManagerSnapshot, MultiTokenManager, TransientFailureKind,
@@ -31,6 +37,10 @@ use parking_lot::Mutex;
 
 /// 自动模式下的小账号池最少尝试次数，保持既有 1-3 个账号时最多 9 次的行为。
 const MIN_AUTO_RETRY_ATTEMPTS: usize = 9;
+
+/// Kiro provider 不设置 reqwest 整请求总超时：流式正文由 Anthropic SSE idle timeout 管控，
+/// 请求头和非流式 body 分别由专门的 timeout helper 管控。
+const KIRO_CLIENT_TOTAL_TIMEOUT_SECS: u64 = 0;
 
 fn effective_payload_guard_limit_for_logging(config: &Config) -> usize {
     const MIN_EFFECTIVE_LIMIT_BYTES: usize = 64 * 1024;
@@ -429,6 +439,13 @@ mod tests {
         );
         assert_eq!(
             KiroProvider::detect_risk_control_error(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"message":"Due to suspicious activity, we are imposing temporary limits on your account."}"#
+            ),
+            Some(CredentialRiskControlReason::TemporarilySuspended)
+        );
+        assert_eq!(
+            KiroProvider::detect_risk_control_error(
                 reqwest::StatusCode::FORBIDDEN,
                 r#"{"__type":"AccountSuspendedException","message":"Account suspended"}"#
             ),
@@ -462,6 +479,89 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn classifies_bad_request_protocol_reasons() {
+        assert_eq!(
+            KiroProvider::classify_bad_request_reason(
+                r#"{"message":"assistant-prefill final message is not supported; last message must be user"}"#
+            ),
+            "assistant_prefill_bad_request"
+        );
+        assert_eq!(
+            KiroProvider::classify_bad_request_reason(
+                r#"{"message":"profileArn is required for this request"}"#
+            ),
+            "profile_arn_bad_request"
+        );
+        assert_eq!(
+            KiroProvider::classify_bad_request_reason(
+                r#"{"message":"The request body is improperly formed"}"#
+            ),
+            "malformed_request"
+        );
+        assert_eq!(
+            KiroProvider::classify_bad_request_reason(r#"{"message":"unknown model"}"#),
+            "bad_request"
+        );
+    }
+
+    #[test]
+    fn list_available_profiles_headers_attach_external_idp_token_type() {
+        let credentials = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            ..Default::default()
+        };
+        let headers = KiroProvider::list_available_profiles_headers(
+            &credentials,
+            "token",
+            &Config::default(),
+            "machine",
+            "codewhisperer.us-east-1.amazonaws.com",
+        )
+        .unwrap();
+
+        assert_eq!(
+            headers.get("TokenType").and_then(|v| v.to_str().ok()),
+            Some("EXTERNAL_IDP")
+        );
+        assert_eq!(
+            headers.get("Authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer token")
+        );
+        assert_eq!(
+            headers.get("host").and_then(|v| v.to_str().ok()),
+            Some("codewhisperer.us-east-1.amazonaws.com")
+        );
+        let expected_x_amz_user_agent = format!(
+            "aws-sdk-js/1.0.34 KiroIDE {} machine",
+            Config::default().kiro_version
+        );
+        assert_eq!(
+            headers
+                .get("x-amz-user-agent")
+                .and_then(|v| v.to_str().ok()),
+            Some(expected_x_amz_user_agent.as_str())
+        );
+    }
+
+    #[test]
+    fn list_available_profiles_headers_do_not_attach_token_type_for_social() {
+        let credentials = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            ..Default::default()
+        };
+        let headers = KiroProvider::list_available_profiles_headers(
+            &credentials,
+            "token",
+            &Config::default(),
+            "machine",
+            "codewhisperer.us-east-1.amazonaws.com",
+        )
+        .unwrap();
+
+        assert!(headers.get("TokenType").is_none());
     }
 
     #[test]
@@ -660,7 +760,8 @@ impl KiroProvider {
         let tls_backend = token_manager.runtime_config().tls_backend;
         // 预热：构建全局代理对应的 Client
         let initial_client =
-            build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
+            build_client(proxy.as_ref(), KIRO_CLIENT_TOTAL_TIMEOUT_SECS, tls_backend)
+                .expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
         cache.insert(proxy.clone(), initial_client);
 
@@ -681,7 +782,11 @@ impl KiroProvider {
         if let Some(client) = cache.get(&effective) {
             return Ok(client.clone());
         }
-        let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
+        let client = build_client(
+            effective.as_ref(),
+            KIRO_CLIENT_TOTAL_TIMEOUT_SECS,
+            self.tls_backend,
+        )?;
         cache.insert(effective, client.clone());
         Ok(client)
     }
@@ -807,6 +912,181 @@ impl KiroProvider {
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
+    }
+
+    fn codewhisperer_host_for_region(region: &str) -> &'static str {
+        if region.starts_with("eu-") {
+            "codewhisperer.eu-central-1.amazonaws.com"
+        } else {
+            "codewhisperer.us-east-1.amazonaws.com"
+        }
+    }
+
+    fn list_available_profiles_headers(
+        credentials: &KiroCredentials,
+        token: &str,
+        config: &Config,
+        machine_id: &str,
+        host: &str,
+    ) -> anyhow::Result<HeaderMap> {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            "Authorization",
+            HeaderValue::from_str(&format!("Bearer {}", token))?,
+        );
+        headers.insert(
+            "x-amz-user-agent",
+            HeaderValue::from_str(&format!(
+                "aws-sdk-js/1.0.34 KiroIDE {} {}",
+                config.kiro_version, machine_id
+            ))?,
+        );
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_str(&format!(
+                "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.34 m/E KiroIDE-{}-{}",
+                config.system_version, config.node_version, config.kiro_version, machine_id
+            ))?,
+        );
+        headers.insert("host", HeaderValue::from_str(host)?);
+        headers.insert(
+            "amz-sdk-invocation-id",
+            HeaderValue::from_str(&uuid::Uuid::new_v4().to_string())?,
+        );
+        headers.insert(
+            "amz-sdk-request",
+            HeaderValue::from_static("attempt=1; max=1"),
+        );
+        headers.insert("Connection", HeaderValue::from_static("close"));
+
+        if is_external_idp_credentials(credentials) {
+            headers.insert("TokenType", HeaderValue::from_static("EXTERNAL_IDP"));
+        }
+
+        Ok(headers)
+    }
+
+    async fn fetch_enterprise_profile_arn_for_context(
+        &self,
+        ctx: &CallContext,
+        config: &Config,
+        machine_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        if !is_external_idp_credentials(&ctx.credentials) {
+            return Ok(None);
+        }
+        if ctx
+            .credentials
+            .profile_arn
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|arn| !arn.is_empty() && !is_placeholder_profile_arn(arn))
+        {
+            return Ok(ctx.credentials.profile_arn.clone());
+        }
+
+        let region = ctx.credentials.effective_api_region(config);
+        let host = Self::codewhisperer_host_for_region(region);
+        let url = format!("https://{}/ListAvailableProfiles", host);
+        let client = self.client_for(&ctx.credentials)?;
+        let request = client
+            .post(&url)
+            .headers(Self::list_available_profiles_headers(
+                &ctx.credentials,
+                &ctx.token,
+                config,
+                machine_id,
+                host,
+            )?)
+            .body("{}");
+        let response =
+            send_with_response_header_timeout(request, config.kiro_upstream_response_timeout_secs)
+                .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response_text_with_body_timeout(
+                response,
+                config.kiro_upstream_response_timeout_secs,
+            )
+            .await
+            .unwrap_or_else(|err| format!("<failed to read response body: {}>", err));
+            if status.as_u16() == 403 {
+                tracing::warn!(
+                    credential_id = ctx.id,
+                    "ListAvailableProfiles 返回 403，继续使用 Enterprise fallback profileArn: {}",
+                    body
+                );
+                return Ok(resolve_profile_arn(&ctx.credentials, config));
+            }
+            anyhow::bail!("ListAvailableProfiles 失败: {} {}", status, body);
+        }
+
+        let body =
+            response_text_with_body_timeout(response, config.kiro_upstream_response_timeout_secs)
+                .await?;
+
+        Ok(extract_first_profile_arn(&body))
+    }
+
+    async fn ensure_profile_arn_for_context(
+        &self,
+        ctx: &mut CallContext,
+        config: &Config,
+        machine_id: &str,
+    ) {
+        if !is_external_idp_credentials(&ctx.credentials) {
+            return;
+        }
+        let existing = ctx
+            .credentials
+            .profile_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|arn| !arn.is_empty() && !is_placeholder_profile_arn(arn));
+        if existing.is_some() {
+            return;
+        }
+
+        match self
+            .fetch_enterprise_profile_arn_for_context(ctx, config, machine_id)
+            .await
+        {
+            Ok(Some(profile_arn)) => {
+                ctx.credentials.profile_arn = Some(profile_arn.clone());
+                if let Err(err) = self
+                    .token_manager
+                    .update_credential_profile_arn(ctx.id, Some(profile_arn.clone()))
+                {
+                    tracing::warn!(
+                        credential_id = ctx.id,
+                        profile_arn = %profile_arn,
+                        "Enterprise profileArn 已解析但持久化失败: {}",
+                        err
+                    );
+                } else {
+                    tracing::info!(
+                        credential_id = ctx.id,
+                        profile_arn = %profile_arn,
+                        "Enterprise profileArn 已解析并持久化"
+                    );
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    credential_id = ctx.id,
+                    "ListAvailableProfiles 未返回可用 profileArn，继续使用 fallback profileArn"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    credential_id = ctx.id,
+                    "Enterprise profileArn 自愈失败，继续使用 fallback profileArn: {}",
+                    err
+                );
+            }
+        }
     }
 
     fn maybe_exclude_after_soft_failure(
@@ -1033,6 +1313,8 @@ impl KiroProvider {
 
         let config = self.token_manager.runtime_config();
         let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
+        self.ensure_profile_arn_for_context(&mut ctx, &config, &machine_id)
+            .await;
         let endpoint = self.endpoint_for(&ctx.credentials).map_err(|e| {
             anyhow::anyhow!(
                 "非流式 API 凭据 endpoint 解析失败（{}）: {}",
@@ -1091,9 +1373,12 @@ impl KiroProvider {
             .header("Connection", "close");
         let request = endpoint.decorate_api(base, &rctx);
 
-        let response = request.send().await.map_err(|e| {
-            anyhow::anyhow!("非流式 API 请求发送失败（{}）: {}", credential_context, e)
-        })?;
+        let response =
+            send_with_response_header_timeout(request, config.kiro_upstream_response_timeout_secs)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("非流式 API 请求发送失败（{}）: {}", credential_context, e)
+                })?;
         let status = response.status();
         if status.is_success() {
             return Ok(KiroApiResponse {
@@ -1112,7 +1397,10 @@ impl KiroProvider {
             });
         }
 
-        let body = response.text().await.unwrap_or_default();
+        let body =
+            response_text_with_body_timeout(response, config.kiro_upstream_response_timeout_secs)
+                .await
+                .unwrap_or_else(|err| format!("<failed to read response body: {}>", err));
         anyhow::bail!(
             "非流式 API 请求失败（{}）: {} {}",
             credential_context,
@@ -1145,15 +1433,16 @@ impl KiroProvider {
                     continue;
                 }
             };
-            match self.list_available_models_for_context(&ctx).await {
+            let ctx_id = ctx.id;
+            match self.list_available_models_for_context(ctx).await {
                 Ok(models) if !models.is_empty() => return Ok(models),
                 Ok(_) => {
                     last_error = Some(anyhow::anyhow!("凭据 #{} 返回空模型列表", id));
                 }
                 Err(err) => {
-                    let label = self.credential_log_label(ctx.id);
+                    let label = self.credential_log_label(ctx_id);
                     tracing::warn!(
-                        credential_id = ctx.id,
+                        credential_id = ctx_id,
                         credential_label = %label,
                         "同步 Kiro 模型能力失败: {}",
                         err
@@ -1168,10 +1457,12 @@ impl KiroProvider {
 
     async fn list_available_models_for_context(
         &self,
-        ctx: &CallContext,
+        mut ctx: CallContext,
     ) -> anyhow::Result<Vec<KiroAvailableModel>> {
         let config = self.token_manager.runtime_config();
         let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
+        self.ensure_profile_arn_for_context(&mut ctx, &config, &machine_id)
+            .await;
         let endpoint = self.endpoint_for(&ctx.credentials)?;
         let client = self.client_for(&ctx.credentials)?;
         let rctx = RequestContext {
@@ -1186,9 +1477,17 @@ impl KiroProvider {
         for _ in 0..20 {
             let url = endpoint.models_url(&rctx, next_token.as_deref());
             let request = endpoint.decorate_models(client.get(&url), &rctx);
-            let response = request.send().await?;
+            let response = send_with_response_header_timeout(
+                request,
+                config.kiro_upstream_response_timeout_secs,
+            )
+            .await?;
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = response_text_with_body_timeout(
+                response,
+                config.kiro_upstream_response_timeout_secs,
+            )
+            .await?;
             if !status.is_success() {
                 anyhow::bail!("ListAvailableModels 失败: {} {}", status, body);
             }
@@ -1314,6 +1613,8 @@ impl KiroProvider {
 
             let config = self.token_manager.runtime_config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
+            self.ensure_profile_arn_for_context(&mut ctx, &config, &machine_id)
+                .await;
 
             let endpoint = match self.endpoint_for(&ctx.credentials) {
                 Ok(e) => e,
@@ -1364,7 +1665,12 @@ impl KiroProvider {
                 .header("Connection", "close");
             let request = endpoint.decorate_mcp(base, &rctx);
 
-            let response = match request.send().await {
+            let response = match send_with_response_header_timeout(
+                request,
+                config.kiro_upstream_response_timeout_secs,
+            )
+            .await
+            {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
@@ -1418,7 +1724,12 @@ impl KiroProvider {
             }
 
             // 失败响应
-            let body = response.text().await.unwrap_or_default();
+            let body = response_text_with_body_timeout(
+                response,
+                config.kiro_upstream_response_timeout_secs,
+            )
+            .await
+            .unwrap_or_else(|err| format!("<failed to read response body: {}>", err));
 
             if let Some(risk_reason) = Self::detect_risk_control_error(status, &body) {
                 tracing::error!(
@@ -1515,10 +1826,12 @@ impl KiroProvider {
 
             // 400 Bad Request
             if status.as_u16() == 400 {
+                let bad_request_reason = Self::classify_bad_request_reason(&body);
                 self.finish_attempt(&mut ctx);
                 anyhow::bail!(
-                    "MCP 请求失败（{}）: {} {}",
+                    "MCP 请求失败（{}，{}）: {} {}",
                     credential_context,
+                    Self::bad_request_reason_label(bad_request_reason),
                     status,
                     body
                 );
@@ -1738,6 +2051,8 @@ impl KiroProvider {
 
             let config = self.token_manager.runtime_config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
+            self.ensure_profile_arn_for_context(&mut ctx, &config, &machine_id)
+                .await;
 
             let endpoint = match self.endpoint_for(&ctx.credentials) {
                 Ok(e) => e,
@@ -1855,7 +2170,12 @@ impl KiroProvider {
                 .header("Connection", "close");
             let request = endpoint.decorate_api(base, &rctx);
 
-            let response = match request.send().await {
+            let response = match send_with_response_header_timeout(
+                request,
+                config.kiro_upstream_response_timeout_secs,
+            )
+            .await
+            {
                 Ok(resp) => resp,
                 Err(e) => {
                     let message = format!(
@@ -1933,7 +2253,12 @@ impl KiroProvider {
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("")
                         .to_string();
-                    let body = response.text().await.unwrap_or_default();
+                    let body = response_text_with_body_timeout(
+                        response,
+                        config.kiro_upstream_response_timeout_secs,
+                    )
+                    .await
+                    .unwrap_or_else(|err| format!("<failed to read response body: {}>", err));
                     let exception = Self::extract_aws_exception(&body);
 
                     tracing::warn!(
@@ -2048,7 +2373,12 @@ impl KiroProvider {
             }
 
             // 失败响应：读取 body 用于日志/错误信息
-            let body = response.text().await.unwrap_or_default();
+            let body = response_text_with_body_timeout(
+                response,
+                config.kiro_upstream_response_timeout_secs,
+            )
+            .await
+            .unwrap_or_else(|err| format!("<failed to read response body: {}>", err));
 
             if let Some(risk_reason) = Self::detect_risk_control_error(status, &body) {
                 let message = format!(
@@ -2220,9 +2550,14 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
+                let bad_request_reason = Self::classify_bad_request_reason(&body);
                 let message = format!(
-                    "{} API 请求失败（{}）: {} {}",
-                    api_type, credential_context, status, body
+                    "{} API 请求失败（{}，{}）: {} {}",
+                    api_type,
+                    credential_context,
+                    Self::bad_request_reason_label(bad_request_reason),
+                    status,
+                    body
                 );
                 Self::push_attempt(
                     &mut attempts,
@@ -2231,7 +2566,7 @@ impl KiroProvider {
                     &credential_label,
                     Some(status),
                     "fail",
-                    Some("bad_request"),
+                    Some(bad_request_reason),
                     Some(message.clone()),
                     attempt_started_at,
                     model.as_deref(),
@@ -2628,6 +2963,9 @@ impl KiroProvider {
             || lower.contains("temporary suspended")
             || lower.contains("temporarily is suspended")
             || lower.contains("is temporarily suspended")
+            || (status.as_u16() == 429
+                && lower.contains("suspicious activity")
+                && lower.contains("temporary limits"))
         {
             return Some(CredentialRiskControlReason::TemporarilySuspended);
         }
@@ -2681,6 +3019,42 @@ impl KiroProvider {
         }
 
         None
+    }
+
+    fn classify_bad_request_reason(body: &str) -> &'static str {
+        let lower = body.to_ascii_lowercase();
+        if lower.contains("assistant-prefill")
+            || lower.contains("assistant prefill")
+            || lower.contains("last message must be user")
+        {
+            return "assistant_prefill_bad_request";
+        }
+        if lower.contains("profilearn")
+            || lower.contains("profile arn")
+            || lower.contains("profile_arn")
+        {
+            return "profile_arn_bad_request";
+        }
+        if lower.contains("improperly formed")
+            || lower.contains("malformed")
+            || lower.contains("invalid request body")
+        {
+            return "malformed_request";
+        }
+        "bad_request"
+    }
+
+    fn bad_request_reason_label(reason: &str) -> &'static str {
+        match reason {
+            "assistant_prefill_bad_request" => {
+                "assistant prefill 协议错误，请检查消息尾部是否仍包含 assistant"
+            }
+            "profile_arn_bad_request" => {
+                "profileArn 协议错误，请检查 authMethod/provider/profileArn 解析结果"
+            }
+            "malformed_request" => "请求体结构错误，请检查 Anthropic 到 Kiro 的 payload 转换",
+            _ => "请求参数错误",
+        }
     }
 
     fn is_event_stream_response(response: &reqwest::Response) -> bool {
