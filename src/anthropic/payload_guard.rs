@@ -5,7 +5,11 @@
 //! conversion, measures the actual JSON payload bytes, and trims old history
 //! entries while preserving Kiro history invariants.
 
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    io::{self, Write},
+    time::{Duration, Instant},
+};
 
 use crate::anthropic::types::{
     Message as AnthropicMessage, MessagesRequest, Tool as AnthropicTool,
@@ -22,6 +26,7 @@ use serde_json::Value;
 const CURRENT_FIT_MIN_TEXT_CHARS: usize = 512;
 const CURRENT_FIT_MAX_ITERATIONS: usize = 64;
 const CURRENT_FIT_OVERHEAD_BYTES: usize = 512;
+const PAYLOAD_GUARD_SLOW_LOG_THRESHOLD: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -253,7 +258,17 @@ pub fn guard_kiro_request(
     request: &mut KiroRequest,
     config: PayloadGuardConfig,
 ) -> Result<(String, PayloadGuardReport), PayloadGuardError> {
+    let guard_started_at = Instant::now();
+    let mut serialize_elapsed = Duration::ZERO;
+    let mut repair_elapsed = Duration::ZERO;
+    let mut shaping_elapsed = Duration::ZERO;
+    let mut trim_elapsed = Duration::ZERO;
+    let mut current_shaping_elapsed = Duration::ZERO;
+    let mut history_trim_iterations = 0usize;
+
+    let serialize_started_at = Instant::now();
     let original_body = serialize_request(request)?;
+    serialize_elapsed += serialize_started_at.elapsed();
     let original_bytes = original_body.len();
     let original_history_entries = request.conversation_state.history.len();
 
@@ -297,6 +312,7 @@ pub fn guard_kiro_request(
         still_oversized: false,
     };
 
+    let repair_started_at = Instant::now();
     report.aligned_leading_entries +=
         align_history_to_user(&mut request.conversation_state.history);
 
@@ -305,11 +321,15 @@ pub fn guard_kiro_request(
     report.removed_orphan_tool_results += initial_repair.removed_orphan_tool_results;
     report.textified_orphan_tool_results += initial_repair.textified_orphan_tool_results;
     report.removed_orphan_tool_uses += initial_repair.removed_orphan_tool_uses;
+    repair_elapsed += repair_started_at.elapsed();
 
+    let serialize_started_at = Instant::now();
     let mut body = serialize_request(request)?;
+    serialize_elapsed += serialize_started_at.elapsed();
     report.final_bytes = body.len();
 
     if size_limit_enabled && report.final_bytes > config.max_bytes && config.shaping.enabled {
+        let shaping_started_at = Instant::now();
         let shaping = apply_payload_shaping(request, config.shaping);
         report.truncated_history_tool_results += shaping.truncated_history_tool_results;
         report.truncated_history_tool_result_chars += shaping.truncated_history_tool_result_chars;
@@ -321,20 +341,27 @@ pub fn guard_kiro_request(
         report.compressed_tool_definition_bytes += shaping.compressed_tool_definition_bytes;
 
         if shaping.was_modified() {
+            let repair_started_at = Instant::now();
             let repair = repair_request(request);
             report.removed_empty_tool_uses += repair.removed_empty_tool_uses;
             report.removed_orphan_tool_results += repair.removed_orphan_tool_results;
             report.textified_orphan_tool_results += repair.textified_orphan_tool_results;
             report.removed_orphan_tool_uses += repair.removed_orphan_tool_uses;
+            repair_elapsed += repair_started_at.elapsed();
+            let serialize_started_at = Instant::now();
             body = serialize_request(request)?;
+            serialize_elapsed += serialize_started_at.elapsed();
             report.final_bytes = body.len();
         }
+        shaping_elapsed += shaping_started_at.elapsed();
     }
 
     if size_limit_enabled && config.trim_history {
+        let trim_started_at = Instant::now();
         while report.final_bytes > config.max_bytes
             && !request.conversation_state.history.is_empty()
         {
+            history_trim_iterations += 1;
             let before = request.conversation_state.history.len();
             trim_oldest_history_unit(&mut request.conversation_state.history);
             let after_trim = request.conversation_state.history.len();
@@ -349,13 +376,16 @@ pub fn guard_kiro_request(
             report.textified_orphan_tool_results += repair.textified_orphan_tool_results;
             report.removed_orphan_tool_uses += repair.removed_orphan_tool_uses;
 
+            let serialize_started_at = Instant::now();
             body = serialize_request(request)?;
+            serialize_elapsed += serialize_started_at.elapsed();
             let new_size = body.len();
             if new_size >= report.final_bytes && after_trim == before {
                 break;
             }
             report.final_bytes = new_size;
         }
+        trim_elapsed += trim_started_at.elapsed();
     }
 
     if size_limit_enabled
@@ -363,6 +393,7 @@ pub fn guard_kiro_request(
         && config.shaping.enabled
         && current_payload_shaping_enabled(config.shaping)
     {
+        let current_started_at = Instant::now();
         let (new_body, current_stats) = apply_current_payload_shaping_until_fit(
             request,
             config.shaping,
@@ -381,11 +412,24 @@ pub fn guard_kiro_request(
         report.dropped_current_image_bytes += current_stats.dropped_current_image_bytes;
         body = new_body;
         report.final_bytes = body.len();
+        current_shaping_elapsed += current_started_at.elapsed();
     }
 
     report.final_history_entries = request.conversation_state.history.len();
     report.final_bytes = body.len();
     report.still_oversized = size_limit_enabled && report.final_bytes > config.max_bytes;
+
+    log_payload_guard_timing(
+        "kiro",
+        guard_started_at.elapsed(),
+        serialize_elapsed,
+        repair_elapsed,
+        shaping_elapsed,
+        trim_elapsed,
+        current_shaping_elapsed,
+        history_trim_iterations,
+        &report,
+    );
 
     Ok((body, report))
 }
@@ -430,7 +474,17 @@ pub fn guard_anthropic_messages_request(
     config: PayloadGuardConfig,
     original_body_bytes: usize,
 ) -> Result<(String, PayloadGuardReport), PayloadGuardError> {
+    let guard_started_at = Instant::now();
+    let mut serialize_elapsed = Duration::ZERO;
+    let mut repair_elapsed = Duration::ZERO;
+    let mut shaping_elapsed = Duration::ZERO;
+    let mut trim_elapsed = Duration::ZERO;
+    let mut current_shaping_elapsed = Duration::ZERO;
+    let mut history_trim_iterations = 0usize;
+
+    let serialize_started_at = Instant::now();
     let mut body = serialize_anthropic_request(request)?;
+    serialize_elapsed += serialize_started_at.elapsed();
     let original_history_entries = request.messages.len().saturating_sub(1);
 
     if !config.enabled {
@@ -454,6 +508,7 @@ pub fn guard_anthropic_messages_request(
     report.final_bytes = final_bytes;
 
     if size_limit_enabled && final_bytes > config.max_bytes && config.shaping.enabled {
+        let shaping_started_at = Instant::now();
         let shaping = apply_anthropic_payload_shaping(request, config.shaping);
         report.truncated_history_tool_results += shaping.truncated_history_tool_results;
         report.truncated_history_tool_result_chars += shaping.truncated_history_tool_result_chars;
@@ -465,19 +520,26 @@ pub fn guard_anthropic_messages_request(
         report.compressed_tool_definition_bytes += shaping.compressed_tool_definition_bytes;
 
         if shaping.was_modified() {
+            let repair_started_at = Instant::now();
             let repair = repair_anthropic_messages(request);
             report.aligned_leading_entries += repair.aligned_leading_entries;
             report.removed_orphan_tool_results += repair.removed_orphan_tool_results;
             report.textified_orphan_tool_results += repair.textified_orphan_tool_results;
             report.removed_orphan_tool_uses += repair.removed_orphan_tool_uses;
+            repair_elapsed += repair_started_at.elapsed();
+            let serialize_started_at = Instant::now();
             body = serialize_anthropic_request(request)?;
+            serialize_elapsed += serialize_started_at.elapsed();
             final_bytes = body.len();
             report.final_bytes = final_bytes;
         }
+        shaping_elapsed += shaping_started_at.elapsed();
     }
 
     if size_limit_enabled && config.trim_history {
+        let trim_started_at = Instant::now();
         while final_bytes > config.max_bytes && request.messages.len() > 1 {
+            history_trim_iterations += 1;
             let before = request.messages.len();
             trim_oldest_anthropic_history_unit(&mut request.messages);
             let after_trim = request.messages.len();
@@ -489,7 +551,9 @@ pub fn guard_anthropic_messages_request(
             report.textified_orphan_tool_results += repair.textified_orphan_tool_results;
             report.removed_orphan_tool_uses += repair.removed_orphan_tool_uses;
 
+            let serialize_started_at = Instant::now();
             body = serialize_anthropic_request(request)?;
+            serialize_elapsed += serialize_started_at.elapsed();
             let new_size = body.len();
             if new_size >= final_bytes && after_trim == before {
                 break;
@@ -497,6 +561,7 @@ pub fn guard_anthropic_messages_request(
             final_bytes = new_size;
             report.final_bytes = final_bytes;
         }
+        trim_elapsed += trim_started_at.elapsed();
     }
 
     if size_limit_enabled
@@ -504,6 +569,7 @@ pub fn guard_anthropic_messages_request(
         && config.shaping.enabled
         && current_payload_shaping_enabled(config.shaping)
     {
+        let current_started_at = Instant::now();
         let (new_body, current_stats) = apply_anthropic_current_payload_shaping_until_fit(
             request,
             config.shaping,
@@ -523,10 +589,22 @@ pub fn guard_anthropic_messages_request(
         body = new_body;
         final_bytes = body.len();
         report.final_bytes = final_bytes;
+        current_shaping_elapsed += current_started_at.elapsed();
     }
 
     report.final_history_entries = request.messages.len().saturating_sub(1);
     report.still_oversized = size_limit_enabled && final_bytes > config.max_bytes;
+    log_payload_guard_timing(
+        "anthropic",
+        guard_started_at.elapsed(),
+        serialize_elapsed,
+        repair_elapsed,
+        shaping_elapsed,
+        trim_elapsed,
+        current_shaping_elapsed,
+        history_trim_iterations,
+        &report,
+    );
     Ok((body, report))
 }
 
@@ -644,10 +722,70 @@ fn serialize_anthropic_request(request: &MessagesRequest) -> Result<String, Payl
     serde_json::to_string(request).map_err(|err| PayloadGuardError::Serialize(err.to_string()))
 }
 
+#[derive(Default)]
+struct CountingWriter {
+    bytes: usize,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn json_len<T: serde::Serialize + ?Sized>(value: &T) -> usize {
-    serde_json::to_string(value)
-        .map(|json| json.len())
+    let mut writer = CountingWriter::default();
+    serde_json::to_writer(&mut writer, value)
+        .map(|_| writer.bytes)
         .unwrap_or(0)
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_payload_guard_timing(
+    payload_kind: &'static str,
+    total_elapsed: Duration,
+    serialize_elapsed: Duration,
+    repair_elapsed: Duration,
+    shaping_elapsed: Duration,
+    trim_elapsed: Duration,
+    current_shaping_elapsed: Duration,
+    history_trim_iterations: usize,
+    report: &PayloadGuardReport,
+) {
+    if !report.enabled {
+        return;
+    }
+
+    if total_elapsed >= PAYLOAD_GUARD_SLOW_LOG_THRESHOLD
+        || report.was_modified()
+        || report.still_oversized
+    {
+        tracing::debug!(
+            payload_kind,
+            total_ms = duration_ms(total_elapsed),
+            serialize_ms = duration_ms(serialize_elapsed),
+            repair_ms = duration_ms(repair_elapsed),
+            shaping_ms = duration_ms(shaping_elapsed),
+            history_trim_ms = duration_ms(trim_elapsed),
+            current_shaping_ms = duration_ms(current_shaping_elapsed),
+            history_trim_iterations,
+            original_bytes = report.original_bytes,
+            final_bytes = report.final_bytes,
+            max_bytes = report.max_bytes,
+            modified = report.was_modified(),
+            still_oversized = report.still_oversized,
+            "payload guard timing"
+        );
+    }
 }
 
 fn content_blocks(content: &Value) -> Option<&Vec<Value>> {
@@ -3200,6 +3338,22 @@ mod tests {
         assert!(header.contains("payload-current-documents-truncated=1"));
         assert!(header.contains("payload-current-content-truncated=1"));
         assert!(header.contains("payload-current-images-dropped=1"));
+    }
+
+    #[test]
+    fn json_len_matches_serde_json_string_length() {
+        let value = serde_json::json!({
+            "alpha": [1, 2, 3],
+            "beta": {
+                "nested": true,
+                "text": "payload length check"
+            }
+        });
+
+        assert_eq!(
+            json_len(&value),
+            serde_json::to_string(&value).unwrap().len()
+        );
     }
 
     #[test]

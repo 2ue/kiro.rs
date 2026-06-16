@@ -149,6 +149,7 @@ pub struct RedisStore {
 
 const USAGE_SUMMARY_TOTALS_KEY: &str = "usage:summary:totals";
 const USAGE_SUMMARY_CACHE_READ_KEY: &str = "usage:summary:cache_read";
+const USAGE_SUMMARY_CACHE_READ_INDEX_KEY: &str = "usage:summary:cache_read:index";
 const USAGE_SUMMARY_TOP_CREDENTIALS_KEY: &str = "usage:summary:top:credentials";
 const USAGE_SUMMARY_TOP_CONVERSATIONS_KEY: &str = "usage:summary:top:conversations";
 const USAGE_REALTIME_BUCKET_TTL_SECS: usize = REALTIME_USAGE_WINDOW_SECS as usize * 3;
@@ -540,6 +541,8 @@ impl RedisStore {
         let realtime_key = usage_realtime_bucket_key(created_at.timestamp());
         let totals_key = self.key(USAGE_SUMMARY_TOTALS_KEY);
         let cache_read_key = self.key(USAGE_SUMMARY_CACHE_READ_KEY);
+        let cache_read_index_key = self.key(USAGE_SUMMARY_CACHE_READ_INDEX_KEY);
+        let cache_read_bucket = record.cache_read_input_tokens.to_string();
         let realtime_key = self.key(realtime_key);
 
         let mut pipe = redis::pipe();
@@ -638,8 +641,12 @@ impl RedisStore {
             })
             .cmd("HINCRBY")
             .arg(&cache_read_key)
-            .arg(record.cache_read_input_tokens.to_string())
+            .arg(&cache_read_bucket)
             .arg(1i64)
+            .cmd("ZADD")
+            .arg(&cache_read_index_key)
+            .arg(record.cache_read_input_tokens)
+            .arg(&cache_read_bucket)
             .cmd("HINCRBY")
             .arg(&realtime_key)
             .arg("requests")
@@ -881,17 +888,7 @@ impl RedisStore {
             return Ok(None);
         }
 
-        let cache_read_totals: HashMap<String, String> = manager
-            .hgetall(self.key(USAGE_SUMMARY_CACHE_READ_KEY))
-            .await?;
-        let high_cache_requests = cache_read_totals
-            .iter()
-            .filter_map(|(tokens, requests)| {
-                let tokens = tokens.parse::<i32>().ok()?;
-                let requests = requests.parse::<usize>().ok()?;
-                (tokens >= high_cache_threshold).then_some(requests)
-            })
-            .sum();
+        let high_cache_requests = self.high_cache_requests(high_cache_threshold).await?;
 
         let realtime = self.usage_realtime_stats().await?;
         let top_credentials = self
@@ -948,6 +945,98 @@ impl RedisStore {
             top_credentials,
             top_conversations,
         }))
+    }
+
+    async fn high_cache_requests(&self, high_cache_threshold: i32) -> anyhow::Result<usize> {
+        let mut manager = self.manager.clone();
+        let cache_read_key = self.key(USAGE_SUMMARY_CACHE_READ_KEY);
+        let cache_read_index_key = self.key(USAGE_SUMMARY_CACHE_READ_INDEX_KEY);
+        let indexed_bucket_count = self
+            .ensure_usage_summary_cache_read_index(
+                &mut manager,
+                &cache_read_key,
+                &cache_read_index_key,
+            )
+            .await?;
+        if indexed_bucket_count == 0 {
+            return Ok(0);
+        }
+
+        let started_at = std::time::Instant::now();
+        let cache_read_buckets: Vec<String> = redis::cmd("ZRANGEBYSCORE")
+            .arg(&cache_read_index_key)
+            .arg(high_cache_threshold)
+            .arg("+inf")
+            .query_async(&mut manager)
+            .await?;
+        if cache_read_buckets.is_empty() {
+            return Ok(0);
+        }
+        let request_counts: Vec<Option<usize>> = redis::cmd("HMGET")
+            .arg(&cache_read_key)
+            .arg(&cache_read_buckets)
+            .query_async(&mut manager)
+            .await?;
+        let high_cache_requests = request_counts.into_iter().flatten().sum();
+
+        let elapsed_ms = started_at.elapsed().as_millis();
+        if elapsed_ms >= 10 {
+            tracing::debug!(
+                high_cache_threshold,
+                cache_read_buckets = cache_read_buckets.len(),
+                indexed_cache_read_buckets = indexed_bucket_count,
+                elapsed_ms = elapsed_ms.min(u128::from(u64::MAX)) as u64,
+                "Redis usage high-cache summary read"
+            );
+        }
+        Ok(high_cache_requests)
+    }
+
+    async fn ensure_usage_summary_cache_read_index(
+        &self,
+        manager: &mut ConnectionManager,
+        cache_read_key: &str,
+        cache_read_index_key: &str,
+    ) -> anyhow::Result<usize> {
+        let cache_read_bucket_count: usize = manager.hlen(cache_read_key).await?;
+        if cache_read_bucket_count == 0 {
+            let _: () = manager.del(cache_read_index_key).await?;
+            return Ok(0);
+        }
+
+        let indexed_bucket_count: usize = manager.zcard(cache_read_index_key).await?;
+        if indexed_bucket_count == cache_read_bucket_count {
+            return Ok(indexed_bucket_count);
+        }
+
+        let started_at = std::time::Instant::now();
+        let cache_read_totals: HashMap<String, String> = manager.hgetall(cache_read_key).await?;
+        let mut pipe = redis::pipe();
+        pipe.atomic().cmd("DEL").arg(cache_read_index_key);
+        let mut rebuilt_bucket_count = 0usize;
+        for tokens in cache_read_totals.keys() {
+            let Ok(score) = tokens.parse::<i32>() else {
+                continue;
+            };
+            rebuilt_bucket_count += 1;
+            pipe.cmd("ZADD")
+                .arg(cache_read_index_key)
+                .arg(score)
+                .arg(tokens);
+        }
+        let _: () = pipe.query_async(manager).await?;
+
+        let elapsed_ms = started_at.elapsed().as_millis();
+        if elapsed_ms >= 10 || indexed_bucket_count > 0 {
+            tracing::debug!(
+                cache_read_buckets = cache_read_bucket_count,
+                indexed_cache_read_buckets = indexed_bucket_count,
+                rebuilt_cache_read_buckets = rebuilt_bucket_count,
+                elapsed_ms = elapsed_ms.min(u128::from(u64::MAX)) as u64,
+                "Redis usage cache-read index rebuilt"
+            );
+        }
+        Ok(rebuilt_bucket_count)
     }
 
     pub async fn usage_dashboard(
@@ -3963,6 +4052,53 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn redis_usage_summary_rebuilds_cache_read_index_for_existing_hash_data() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+
+        let store = RedisStore::connect(&config).await.unwrap();
+        store.clear_usage_summary().await.unwrap();
+
+        let totals_key = store.key(USAGE_SUMMARY_TOTALS_KEY);
+        let cache_read_key = store.key(USAGE_SUMMARY_CACHE_READ_KEY);
+        let cache_read_index_key = store.key(USAGE_SUMMARY_CACHE_READ_INDEX_KEY);
+        let mut manager = store.manager.clone();
+        let _: () = redis::pipe()
+            .atomic()
+            .cmd("HSET")
+            .arg(&totals_key)
+            .arg("total_requests")
+            .arg(6i64)
+            .cmd("HSET")
+            .arg(&cache_read_key)
+            .arg("0")
+            .arg(1i64)
+            .arg("500")
+            .arg(2i64)
+            .arg("1000")
+            .arg(3i64)
+            .cmd("DEL")
+            .arg(&cache_read_index_key)
+            .query_async(&mut manager)
+            .await
+            .unwrap();
+
+        let summary = store.usage_summary(500).await.unwrap().unwrap();
+        assert_eq!(summary.total_requests, 6);
+        assert_eq!(summary.high_cache_requests, 5);
+
+        let mut manager = store.manager.clone();
+        let indexed: usize = manager.zcard(&cache_read_index_key).await.unwrap();
+        assert_eq!(indexed, 3);
+        let summary = store.usage_summary(1000).await.unwrap().unwrap();
+        assert_eq!(summary.high_cache_requests, 3);
+
+        store.clear_usage_summary().await.unwrap();
     }
 
     #[tokio::test]
