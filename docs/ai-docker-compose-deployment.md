@@ -162,6 +162,7 @@ KIRO_RS_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强
   "host": "0.0.0.0",
   "port": 8990,
   "apiKey": "sk-kiro-rs-change-me",
+  "apiKeys": [],
   "adminApiKey": "sk-admin-change-me",
   "payloadGuardEnabled": true,
   "payloadGuardMaxBytes": 460800,
@@ -256,7 +257,8 @@ KIRO_RS_PORT=9022 KIRO_RS_VERSION=0.0.19 KIRO_RS_POSTGRES_PASSWORD='替换成强
 | --- | --- | --- |
 | `host` | Docker 中用 `0.0.0.0` | 控制服务监听地址。 |
 | `port` | `8990` | 控制容器内服务端口。 |
-| `apiKey` | 强随机字符串 | 控制调用 `/v1`、`/cc/v1`、`/ha/v1`、`/na/v1` API 时使用的客户端密钥。 |
+| `apiKey` | 强随机字符串 | 主客户端密钥，控制调用 `/v1`、`/cc/v1`、`/ha/v1`、`/na/v1` API。历史兼容字段。 |
+| `apiKeys` | `[]` 或额外强随机字符串数组 | 额外客户端密钥列表；实际生效集合为 `apiKey + apiKeys`，管理后台设置页可新增、替换、删除。 |
 | `adminApiKey` | 强随机字符串 | 控制管理后台和 `/api/admin/*` 的认证密钥。 |
 | `tlsBackend` | `rustls` | 控制 HTTP 客户端 TLS 实现。Docker 镜像推荐 `rustls`。 |
 

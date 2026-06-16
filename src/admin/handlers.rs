@@ -15,12 +15,13 @@ use super::{
     types::{
         AddCredentialRequest, AdminErrorResponse, BatchCredentialImportRequest,
         BatchUpdateCredentialsRequest, ClearInFlightRequest, CreateProxyResourceRequest,
-        ExportCredentialsQuery, ExternalPoolTestRequest, RefreshCredentialInfoRequest,
-        SetCredentialConcurrencyRequest, SetCredentialProxyRequest, SetCredentialRegionsRequest,
-        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SetWarmupRequest,
-        SuccessResponse, TestCredentialRequest, UpdateAdminApiKeyRequest,
-        UpdateCredentialAuthRequest, UpdateProxyResourceRequest, UpdateRuntimeConfigRequest,
-        UpsertManualModelRequest, UsageCleanupRequest, ValidateExistingCredentialsRequest,
+        CreateRequestApiKeyRequest, ExportCredentialsQuery, ExternalPoolTestRequest,
+        RefreshCredentialInfoRequest, SetCredentialConcurrencyRequest, SetCredentialProxyRequest,
+        SetCredentialRegionsRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
+        SetPriorityRequest, SetWarmupRequest, SuccessResponse, TestCredentialRequest,
+        UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
+        UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
+        UsageCleanupRequest, ValidateExistingCredentialsRequest,
         ValidateExternalCredentialsRequest,
     },
 };
@@ -552,6 +553,52 @@ pub async fn get_access_keys(State(state): State<AdminState>) -> impl IntoRespon
             .service
             .get_access_keys(&state.current_admin_api_key()),
     )
+}
+
+/// POST /api/admin/security/request-keys
+/// 新增一个客户端调用 API Key。未传 apiKey 时由服务端生成。
+pub async fn create_request_api_key(
+    State(state): State<AdminState>,
+    Json(payload): Json<CreateRequestApiKeyRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .create_request_api_key(payload, &state.current_admin_api_key())
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/security/request-keys/:id
+/// 替换一个客户端调用 API Key。
+pub async fn update_request_api_key(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateRequestApiKeyRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .update_request_api_key(&id, payload, &state.current_admin_api_key())
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// DELETE /api/admin/security/request-keys/:id
+/// 删除一个客户端调用 API Key。最后一个 Key 不允许删除。
+pub async fn delete_request_api_key(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .delete_request_api_key(&id, &state.current_admin_api_key())
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
 pub async fn get_external_pools(State(state): State<AdminState>) -> impl IntoResponse {

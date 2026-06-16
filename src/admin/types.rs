@@ -938,9 +938,34 @@ pub struct AccessKeysResponse {
     /// 下游客户端调用 /v1/messages 等接口时使用的请求 Key。
     pub request_api_key: String,
     pub masked_request_api_key: String,
+    /// 下游客户端调用 API Key 列表。`requestApiKey` 为兼容旧前端保留，等于这里的第一项。
+    pub request_api_keys: Vec<RequestApiKeyItem>,
     /// 管理后台登录和 /api/admin 认证使用的 Key。
     pub admin_api_key: String,
     pub masked_admin_api_key: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestApiKeyItem {
+    pub id: String,
+    pub api_key: String,
+    pub masked_api_key: String,
+    pub primary: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateRequestApiKeyRequest {
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateRequestApiKeyRequest {
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

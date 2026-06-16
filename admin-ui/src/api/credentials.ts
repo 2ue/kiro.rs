@@ -23,6 +23,8 @@ import type {
   SetCredentialRegionsRequest,
   RuntimeConfig,
   UpdateAdminApiKeyRequest,
+  CreateRequestApiKeyRequest,
+  UpdateRequestApiKeyRequest,
   UpdateRuntimeConfigRequest,
   CredentialExportFormat,
   LoadBalancingMode,
@@ -314,6 +316,26 @@ export async function updateAdminApiKey(
   req: UpdateAdminApiKeyRequest
 ): Promise<AccessKeysResponse> {
   const { data } = await api.put<AccessKeysResponse>('/security/admin-key', req)
+  return data
+}
+
+export async function createRequestApiKey(
+  req: CreateRequestApiKeyRequest = {}
+): Promise<AccessKeysResponse> {
+  const { data } = await api.post<AccessKeysResponse>('/security/request-keys', req)
+  return data
+}
+
+export async function updateRequestApiKey(
+  id: string,
+  req: UpdateRequestApiKeyRequest
+): Promise<AccessKeysResponse> {
+  const { data } = await api.put<AccessKeysResponse>(`/security/request-keys/${id}`, req)
+  return data
+}
+
+export async function deleteRequestApiKey(id: string): Promise<AccessKeysResponse> {
+  const { data } = await api.delete<AccessKeysResponse>(`/security/request-keys/${id}`)
   return data
 }
 

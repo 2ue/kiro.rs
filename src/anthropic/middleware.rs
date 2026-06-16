@@ -11,6 +11,7 @@ use axum::{
 };
 
 use crate::common::auth;
+use crate::common::auth::RequestApiKeyStore;
 use crate::external_pool::ExternalPoolManager;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
@@ -27,8 +28,8 @@ use super::{
 /// 应用共享状态
 #[derive(Clone)]
 pub struct AppState {
-    /// API 密钥
-    pub api_key: String,
+    /// 客户端请求 API Key 内存索引。
+    pub request_api_keys: Arc<RequestApiKeyStore>,
     /// Kiro Provider（可选，用于实际 API 调用）
     /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
     pub kiro_provider: Option<Arc<KiroProvider>>,
@@ -91,7 +92,7 @@ pub struct AppState {
 impl AppState {
     /// 创建新的应用状态
     pub fn new(
-        api_key: impl Into<String>,
+        request_api_keys: Arc<RequestApiKeyStore>,
         extract_thinking: bool,
         usage_recorder: Arc<UsageRecorder>,
         prompt_cache: Arc<PromptCacheTracker>,
@@ -102,7 +103,7 @@ impl AppState {
         expose_proxy_warnings: bool,
     ) -> Self {
         Self {
-            api_key: api_key.into(),
+            request_api_keys,
             kiro_provider: None,
             extract_thinking,
             usage_recorder,
@@ -233,7 +234,7 @@ pub async fn auth_middleware(
     next: Next,
 ) -> Response {
     match auth::extract_api_key(&request) {
-        Some(key) if auth::constant_time_eq(&key, &state.api_key) => {
+        Some(key) if state.request_api_keys.contains(&key) => {
             let mut response = next.run(request).await;
             if !response.headers().contains_key("request-id") {
                 let request_id = envelope::request_id();

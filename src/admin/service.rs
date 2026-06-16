@@ -5,10 +5,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration as StdDuration;
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use super::error::AdminServiceError;
 use super::types::{
@@ -16,18 +18,20 @@ use super::types::{
     BatchCredentialImportDefaults, BatchCredentialImportDuplicateMode, BatchCredentialImportItem,
     BatchCredentialImportRequest, BatchCredentialImportResponse, BatchUpdateCredentialItem,
     BatchUpdateCredentialsRequest, BatchUpdateCredentialsResponse, ClearInFlightRequest,
-    CreateProxyResourceRequest, CredentialAccountInfo, CredentialCreditSummaryResponse,
-    CredentialInfoRefreshItem, CredentialInfoRefreshResponse, CredentialStatusItem,
-    CredentialValidationGroup, CredentialValidationInfo, CredentialValidationItem,
-    CredentialValidationResponse, CredentialsPageResponse, CredentialsStatusResponse,
-    ExternalPoolTestRequest, LoadBalancingModeResponse, ManualModelResponse, ProxyResourceResponse,
-    ProxyResourcesResponse, RefreshCredentialInfoRequest, RuntimeConfigResponse,
+    CreateProxyResourceRequest, CreateRequestApiKeyRequest, CredentialAccountInfo,
+    CredentialCreditSummaryResponse, CredentialInfoRefreshItem, CredentialInfoRefreshResponse,
+    CredentialStatusItem, CredentialValidationGroup, CredentialValidationInfo,
+    CredentialValidationItem, CredentialValidationResponse, CredentialsPageResponse,
+    CredentialsStatusResponse, ExternalPoolTestRequest, LoadBalancingModeResponse,
+    ManualModelResponse, ProxyResourceResponse, ProxyResourcesResponse,
+    RefreshCredentialInfoRequest, RequestApiKeyItem, RuntimeConfigResponse,
     SetCredentialConcurrencyRequest, SetCredentialProxyRequest, SetCredentialRegionsRequest,
     SetLoadBalancingModeRequest, SetWarmupRequest, TestCredentialRequest, TestCredentialResponse,
     UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
-    UpdateRuntimeConfigRequest, UpsertManualModelRequest, UsageCleanupJobStatus, UsageCleanupMode,
-    UsageCleanupPreviewResponse, UsageCleanupRequest, UsageCleanupStatusResponse,
-    ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
+    UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
+    UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse, UsageCleanupRequest,
+    UsageCleanupStatusResponse, ValidateExistingCredentialsRequest,
+    ValidateExternalCredentialsRequest,
 };
 use crate::anthropic::{
     model_capabilities::{
@@ -42,6 +46,7 @@ use crate::anthropic::{
         UsageRecordsPageResult, UsageRecordsResult, UsageSummary,
     },
 };
+use crate::common::auth::RequestApiKeyStore;
 use crate::external_pool::{
     CreateExternalPoolRequest, ExternalPool, ExternalPoolManager, ExternalPoolTestResponse,
     ExternalPoolsStatusResponse, SetExternalPoolEnabledRequest, UpdateExternalPoolRequest,
@@ -363,13 +368,54 @@ fn mask_secret(value: &str) -> String {
     format!("{}...{}", head, tail)
 }
 
-fn access_keys_response(request_api_key: &str, admin_api_key: &str) -> AccessKeysResponse {
+fn request_api_key_id(key: &str) -> String {
+    hex::encode(Sha256::digest(key.as_bytes()))
+}
+
+fn request_api_key_items(keys: &[String]) -> Vec<RequestApiKeyItem> {
+    keys.iter()
+        .enumerate()
+        .map(|(index, key)| RequestApiKeyItem {
+            id: request_api_key_id(key),
+            api_key: key.clone(),
+            masked_api_key: mask_secret(key),
+            primary: index == 0,
+        })
+        .collect()
+}
+
+fn access_keys_response(request_api_keys: &[String], admin_api_key: &str) -> AccessKeysResponse {
+    let primary = request_api_keys.first().cloned().unwrap_or_default();
     AccessKeysResponse {
-        request_api_key: request_api_key.to_string(),
-        masked_request_api_key: mask_secret(request_api_key),
+        request_api_key: primary.clone(),
+        masked_request_api_key: mask_secret(&primary),
+        request_api_keys: request_api_key_items(request_api_keys),
         admin_api_key: admin_api_key.to_string(),
         masked_admin_api_key: mask_secret(admin_api_key),
     }
+}
+
+fn generate_request_api_key() -> String {
+    let mut bytes = [0u8; 32];
+    bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    format!("sk-kiro-rs-{}", URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn remove_request_api_key_by_id(
+    keys: &mut Vec<String>,
+    key_id: &str,
+) -> Result<String, AdminServiceError> {
+    let index = keys
+        .iter()
+        .position(|key| request_api_key_id(key) == key_id)
+        .ok_or_else(|| AdminServiceError::InvalidCredential("调用 API Key 不存在".to_string()))?;
+    if keys.len() <= 1 {
+        return Err(AdminServiceError::Conflict(
+            "至少需要保留一个调用 API Key".to_string(),
+        ));
+    }
+    Ok(keys.remove(index))
 }
 
 #[derive(Debug, Serialize)]
@@ -387,7 +433,7 @@ pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
     postgres_store: Arc<PostgresStore>,
     redis_store: Arc<RedisStore>,
-    request_api_key: String,
+    request_api_key_store: Arc<RequestApiKeyStore>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
     usage_recorder: Arc<UsageRecorder>,
@@ -455,14 +501,14 @@ impl AdminService {
         kiro_provider: Arc<KiroProvider>,
         postgres_store: Arc<PostgresStore>,
         redis_store: Arc<RedisStore>,
-        request_api_key: impl Into<String>,
+        request_api_key_store: Arc<RequestApiKeyStore>,
         external_pool_manager: Arc<ExternalPoolManager>,
     ) -> Self {
         Self {
             token_manager,
             postgres_store,
             redis_store,
-            request_api_key: request_api_key.into(),
+            request_api_key_store,
             known_endpoints: known_endpoints.into_iter().collect(),
             usage_recorder,
             prompt_cache,
@@ -526,7 +572,136 @@ impl AdminService {
     }
 
     pub fn get_access_keys(&self, admin_api_key: &str) -> AccessKeysResponse {
-        access_keys_response(&self.request_api_key, admin_api_key)
+        access_keys_response(
+            &self.token_manager.runtime_config().request_api_keys(),
+            admin_api_key,
+        )
+    }
+
+    fn persist_request_api_keys(
+        &self,
+        keys: Vec<String>,
+        action: &'static str,
+        detail: serde_json::Value,
+    ) -> Result<(), AdminServiceError> {
+        if keys.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少需要保留一个调用 API Key".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .update_runtime_config(|config| {
+                config.set_request_api_keys(keys.clone());
+            })
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        self.request_api_key_store.replace_keys(keys);
+        self.audit(
+            action,
+            "security_keys",
+            Some("apiKeys".to_string()),
+            true,
+            None,
+            detail,
+        );
+        Ok(())
+    }
+
+    pub fn create_request_api_key(
+        &self,
+        req: CreateRequestApiKeyRequest,
+        admin_api_key: &str,
+    ) -> Result<AccessKeysResponse, AdminServiceError> {
+        let next_key = req
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(generate_request_api_key);
+        if next_key.len() < 8 {
+            return Err(AdminServiceError::InvalidCredential(
+                "调用 API Key 至少需要 8 个字符".to_string(),
+            ));
+        }
+
+        let mut keys = self.token_manager.runtime_config().request_api_keys();
+        if keys.iter().any(|key| key == &next_key) {
+            return Err(AdminServiceError::Conflict(
+                "调用 API Key 已存在".to_string(),
+            ));
+        }
+        keys.push(next_key.clone());
+        self.persist_request_api_keys(
+            keys,
+            "create_request_api_key",
+            json!({
+                "keyId": request_api_key_id(&next_key),
+                "maskedApiKey": mask_secret(&next_key),
+            }),
+        )?;
+        Ok(self.get_access_keys(admin_api_key))
+    }
+
+    pub fn update_request_api_key(
+        &self,
+        key_id: &str,
+        req: UpdateRequestApiKeyRequest,
+        admin_api_key: &str,
+    ) -> Result<AccessKeysResponse, AdminServiceError> {
+        let next_key = req
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| {
+                AdminServiceError::InvalidCredential("调用 API Key 不能为空".to_string())
+            })?
+            .to_string();
+        if next_key.len() < 8 {
+            return Err(AdminServiceError::InvalidCredential(
+                "调用 API Key 至少需要 8 个字符".to_string(),
+            ));
+        }
+
+        let mut keys = self.token_manager.runtime_config().request_api_keys();
+        let index = keys
+            .iter()
+            .position(|key| request_api_key_id(key) == key_id)
+            .ok_or_else(|| {
+                AdminServiceError::InvalidCredential("调用 API Key 不存在".to_string())
+            })?;
+        if keys
+            .iter()
+            .enumerate()
+            .any(|(existing_index, key)| existing_index != index && key == &next_key)
+        {
+            return Err(AdminServiceError::Conflict(
+                "调用 API Key 已存在".to_string(),
+            ));
+        }
+        keys[index] = next_key.clone();
+        self.persist_request_api_keys(
+            keys,
+            "update_request_api_key",
+            json!({
+                "keyId": key_id,
+                "nextKeyId": request_api_key_id(&next_key),
+                "maskedApiKey": mask_secret(&next_key),
+            }),
+        )?;
+        Ok(self.get_access_keys(admin_api_key))
+    }
+
+    pub fn delete_request_api_key(
+        &self,
+        key_id: &str,
+        admin_api_key: &str,
+    ) -> Result<AccessKeysResponse, AdminServiceError> {
+        let mut keys = self.token_manager.runtime_config().request_api_keys();
+        remove_request_api_key_by_id(&mut keys, key_id)?;
+        self.persist_request_api_keys(keys, "delete_request_api_key", json!({ "keyId": key_id }))?;
+        Ok(self.get_access_keys(admin_api_key))
     }
 
     pub fn list_external_pools(&self) -> Result<Vec<ExternalPool>, AdminServiceError> {
@@ -4569,6 +4744,39 @@ mod tests {
             normalize_usage_cleanup_request(future_cutoff),
             Err(AdminServiceError::InvalidCredential(_))
         ));
+    }
+
+    #[test]
+    fn remove_request_api_key_by_id_removes_requested_key() {
+        let mut keys = vec!["sk-one".to_string(), "sk-two".to_string()];
+
+        let removed = remove_request_api_key_by_id(&mut keys, &request_api_key_id("sk-one"))
+            .expect("key should be removed");
+
+        assert_eq!(removed, "sk-one");
+        assert_eq!(keys, vec!["sk-two".to_string()]);
+    }
+
+    #[test]
+    fn remove_request_api_key_by_id_rejects_missing_key() {
+        let mut keys = vec!["sk-one".to_string(), "sk-two".to_string()];
+
+        let err = remove_request_api_key_by_id(&mut keys, &request_api_key_id("sk-missing"))
+            .expect_err("missing key should fail");
+
+        assert!(matches!(err, AdminServiceError::InvalidCredential(_)));
+        assert_eq!(keys, vec!["sk-one".to_string(), "sk-two".to_string()]);
+    }
+
+    #[test]
+    fn remove_request_api_key_by_id_rejects_removing_last_key() {
+        let mut keys = vec!["sk-one".to_string()];
+
+        let err = remove_request_api_key_by_id(&mut keys, &request_api_key_id("sk-one"))
+            .expect_err("last key should not be removable");
+
+        assert!(matches!(err, AdminServiceError::Conflict(_)));
+        assert_eq!(keys, vec!["sk-one".to_string()]);
     }
 }
 

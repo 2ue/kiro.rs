@@ -9,6 +9,7 @@ use axum::{
     routing::{get, post},
 };
 
+use crate::common::auth::RequestApiKeyStore;
 use crate::external_pool::ExternalPoolManager;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
@@ -57,7 +58,7 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// 创建带有 KiroProvider 的 Anthropic API 路由
 #[allow(clippy::too_many_arguments)]
 pub fn create_router_with_provider(
-    api_key: impl Into<String>,
+    request_api_keys: Arc<RequestApiKeyStore>,
     kiro_provider: Option<Arc<KiroProvider>>,
     extract_thinking: bool,
     usage_recorder: Arc<UsageRecorder>,
@@ -87,7 +88,7 @@ pub fn create_router_with_provider(
     external_pool_manager: Option<Arc<ExternalPoolManager>>,
 ) -> Router {
     let mut base_state = AppState::new(
-        api_key,
+        request_api_keys,
         extract_thinking,
         usage_recorder,
         prompt_cache,
@@ -203,7 +204,7 @@ mod tests {
 
     fn base_state(mode: PromptCacheSimulationMode) -> AppState {
         AppState::new(
-            "test-key",
+            Arc::new(RequestApiKeyStore::new(["test-key"])),
             true,
             Arc::new(UsageRecorder::new(10)),
             Arc::new(PromptCacheTracker::default()),

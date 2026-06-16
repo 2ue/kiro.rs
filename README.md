@@ -91,6 +91,7 @@ cargo build --release
    "host": "127.0.0.1",
    "port": 8990,
    "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
+   "apiKeys": [],
    "region": "us-east-1"
 }
 ```
@@ -183,7 +184,8 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 |------|------|--------|------|
 | `host` | string | `127.0.0.1` | 服务监听地址 |
 | `port` | number | `8080` | 服务监听端口 |
-| `apiKey` | string | - | 自定义 API Key（用于客户端认证，必配） |
+| `apiKey` | string | - | 主客户端 API Key（用于调用 `/v1`、`/cc/v1`、`/ha/v1`、`/na/v1`，历史兼容字段） |
+| `apiKeys` | string[] | `[]` | 额外客户端 API Key 列表；实际生效集合为 `apiKey + apiKeys` 去空去重，管理后台可新增、替换、删除 |
 | `region` | string | `us-east-1` | AWS 区域 |
 | `authRegion` | string | - | Auth Region（用于 Token 刷新），未配置时回退到 region |
 | `apiRegion` | string | - | API Region（用于 API 请求），未配置时回退到 region |
@@ -268,6 +270,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
    "host": "127.0.0.1",
    "port": 8990,
    "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
+   "apiKeys": [],
    "adminApiKey": "sk-admin-your-secret-key",
    "payloadGuardEnabled": true,
    "payloadGuardMaxBytes": 460800,

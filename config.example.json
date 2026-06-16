@@ -8,6 +8,7 @@
   "host": "127.0.0.1",
   "port": 8990,
   "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
+  "apiKeys": [],
   "adminApiKey": "sk-admin-your-secret-key",
   "kiroUpstreamResponseTimeoutSecs": 180,
   "credentialRetryMaxAttempts": 0,

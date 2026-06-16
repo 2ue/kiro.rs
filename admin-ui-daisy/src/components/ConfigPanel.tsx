@@ -1,4 +1,4 @@
-import { BadgeInfo, Copy, Eye, EyeOff, Gauge, KeyRound, Router, Save, Shield, Sparkles, Trash2, Wand2, Zap } from 'lucide-react'
+import { BadgeInfo, Copy, Edit3, Eye, EyeOff, Gauge, KeyRound, Plus, Router, Save, Shield, Sparkles, Trash2, Wand2, X, Zap } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { Alert, Button, Card, Collapse, Input, Join, Loading, Select, Tabs, Toggle } from 'react-daisyui'
@@ -21,7 +21,7 @@ import {
   toWhole,
 } from '@/lib/runtime-config-defaults'
 import { extractErrorMessage } from '@/lib/utils'
-import { getAccessKeys, updateAdminApiKey } from '@/api/credentials'
+import { createRequestApiKey, deleteRequestApiKey, getAccessKeys, updateAdminApiKey, updateRequestApiKey } from '@/api/credentials'
 import { useRuntimeConfig, useUpdateRuntimeConfig } from '@/hooks/use-credentials'
 import { useModelCapabilities } from '@/hooks/use-usage'
 import { storage } from '@/lib/storage'
@@ -37,6 +37,7 @@ import type {
   ReportedUsageFieldMode,
   ReportedUsageFieldPolicy,
   ReportedUsagePathPolicy,
+  RequestApiKeyItem,
   RuntimeConfig,
 } from '@/types/api'
 
@@ -341,12 +342,40 @@ function ImpactGroupHeader({
   )
 }
 
+function accessKeyItems(response: AccessKeysResponse | null): RequestApiKeyItem[] {
+  if (!response) return []
+  if (response.requestApiKeys?.length) return response.requestApiKeys
+  if (!response.requestApiKey) return []
+  return [{ id: 'legacy-primary', apiKey: response.requestApiKey, maskedApiKey: response.maskedRequestApiKey, primary: true }]
+}
+
+const REQUEST_API_KEY_PREFIX = 'sk-kiro-rs-'
+
+function generateLocalRequestApiKey(): string {
+  const bytes = new Uint8Array(32)
+  const cryptoApi = globalThis.crypto
+  if (cryptoApi?.getRandomValues) {
+    cryptoApi.getRandomValues(bytes)
+  } else {
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = Math.floor(Math.random() * 256)
+    }
+  }
+  const binary = Array.from(bytes, (byte) => String.fromCharCode(byte)).join('')
+  return `${REQUEST_API_KEY_PREFIX}${btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')}`
+}
+
 function AccessKeysPanel() {
   const [keys, setKeys] = useState<AccessKeysResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
-  const [showRequestKey, setShowRequestKey] = useState(false)
   const [showAdminKey, setShowAdminKey] = useState(false)
+  const [creating, setCreating] = useState(false)
+  const [processingKeyId, setProcessingKeyId] = useState<string | null>(null)
+  const [manualRequestApiKey, setManualRequestApiKey] = useState('')
+  const [visibleRequestKeyIds, setVisibleRequestKeyIds] = useState<Set<string>>(new Set())
+  const [editingRequestKeyId, setEditingRequestKeyId] = useState<string | null>(null)
+  const [requestKeyDraft, setRequestKeyDraft] = useState('')
   const [nextAdminApiKey, setNextAdminApiKey] = useState('')
 
   const loadKeys = async () => {
@@ -392,7 +421,7 @@ function AccessKeysPanel() {
       const response = await updateAdminApiKey({ adminApiKey })
       storage.setApiKey(response.adminApiKey)
       window.dispatchEvent(new CustomEvent('kiro-admin-key-updated'))
-      setKeys(response)
+      setKeysAndResetDrafts(response)
       setNextAdminApiKey('')
       toast.success('登录 Key 已更新，后续后台请求会使用新 Key')
     } catch (error) {
@@ -402,60 +431,230 @@ function AccessKeysPanel() {
     }
   }
 
-  const requestApiKeyValue = showRequestKey ? keys?.requestApiKey : keys?.maskedRequestApiKey
+  const requestKeys = accessKeyItems(keys)
   const adminApiKeyValue = showAdminKey ? keys?.adminApiKey : keys?.maskedAdminApiKey
+
+  const setKeysAndResetDrafts = (response: AccessKeysResponse) => {
+    setKeys(response)
+    setEditingRequestKeyId(null)
+    setRequestKeyDraft('')
+    setVisibleRequestKeyIds((prev) => {
+      const valid = new Set(accessKeyItems(response).map((item) => item.id))
+      return new Set(Array.from(prev).filter((id) => valid.has(id)))
+    })
+  }
+
+  const generateRequestKey = async () => {
+    setCreating(true)
+    try {
+      const before = new Set(requestKeys.map((item) => item.id))
+      const response = await createRequestApiKey({})
+      setKeysAndResetDrafts(response)
+      const created = accessKeyItems(response).find((item) => !before.has(item.id))
+      if (created) {
+        setVisibleRequestKeyIds((prev) => new Set(prev).add(created.id))
+        await copy('新请求 Key', created.apiKey)
+      }
+      toast.success('请求 Key 已生成并立即生效')
+    } catch (error) {
+      toast.error(`生成请求 Key 失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  const addManualRequestKey = async () => {
+    const apiKey = manualRequestApiKey.trim()
+    if (!apiKey) return toast.error('请输入要新增的请求 Key')
+    if (apiKey.length < 8) return toast.error('请求 Key 至少需要 8 个字符')
+    setCreating(true)
+    try {
+      const response = await createRequestApiKey({ apiKey })
+      setKeysAndResetDrafts(response)
+      setManualRequestApiKey('')
+      toast.success('请求 Key 已新增并立即生效')
+    } catch (error) {
+      toast.error(`新增请求 Key 失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  const startEditRequestKey = (item: RequestApiKeyItem) => {
+    setEditingRequestKeyId(item.id)
+    setRequestKeyDraft(item.apiKey)
+  }
+
+  const cancelEditRequestKey = () => {
+    setEditingRequestKeyId(null)
+    setRequestKeyDraft('')
+  }
+
+  const saveEditedRequestKey = async (item: RequestApiKeyItem) => {
+    const apiKey = requestKeyDraft.trim()
+    if (!apiKey) return toast.error('请输入新的请求 Key')
+    if (apiKey.length < 8) return toast.error('请求 Key 至少需要 8 个字符')
+    if (apiKey === item.apiKey) {
+      cancelEditRequestKey()
+      return
+    }
+    setProcessingKeyId(item.id)
+    try {
+      const response = await updateRequestApiKey(item.id, { apiKey })
+      setKeysAndResetDrafts(response)
+      toast.success('请求 Key 已保存，旧 Key 立即失效')
+    } catch (error) {
+      toast.error(`保存请求 Key 失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setProcessingKeyId(null)
+    }
+  }
+
+  const removeRequestKey = async (item: RequestApiKeyItem) => {
+    if (requestKeys.length <= 1) return toast.error('至少需要保留一个请求 Key')
+    if (!window.confirm(`确认删除 ${item.maskedApiKey}？删除后使用该 Key 的客户端会立即 401。`)) return
+    setProcessingKeyId(item.id)
+    try {
+      const response = await deleteRequestApiKey(item.id)
+      setKeysAndResetDrafts(response)
+      toast.success('请求 Key 已删除')
+    } catch (error) {
+      toast.error(`删除请求 Key 失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setProcessingKeyId(null)
+    }
+  }
+
+  const toggleRequestKeyVisible = (id: string) => {
+    setVisibleRequestKeyIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
 
   return (
     <ConfigGroup
       icon={<KeyRound className="h-4 w-4" />}
       title="接入与登录 Key"
-      description="请求 Key 给客户端调用模型接口使用；登录 Key 就是打开管理后台时输入的密码，可在登录后直接修改。"
+      description="请求 Key 可配置多个，供客户端调用模型接口；登录 Key 仍只有一个，用于进入管理后台。"
     >
-      <div className="rounded-box border border-base-300 bg-base-100 p-3">
+      <div className="rounded-box border border-base-300 bg-base-100 p-3 md:col-span-2">
         <div className="mb-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="text-sm font-semibold">请求调用 Key</div>
-            <span className="rounded border border-base-300 bg-base-200 px-2 py-0.5 text-[0.68rem] font-semibold text-base-content/60">
-              apiKey
-            </span>
-            <span className="rounded border border-base-300 bg-base-100 px-2 py-0.5 text-[0.68rem] font-semibold text-success">
-              给客户端用
-            </span>
-          </div>
-          <div className="mt-1 text-xs leading-4 text-base-content/60">
-            用于调用 /v1/messages、/cc/v1/messages 等模型接口，可复制到 x-api-key 或 Authorization: Bearer。
+          <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="text-sm font-semibold">请求调用 Key</div>
+                <span className="rounded border border-base-300 bg-base-200 px-2 py-0.5 text-[0.68rem] font-semibold text-base-content/60">
+                  apiKey / apiKeys
+                </span>
+                <span className="rounded border border-base-300 bg-base-100 px-2 py-0.5 text-[0.68rem] font-semibold text-success">
+                  {requestKeys.length} 个可用
+                </span>
+              </div>
+              <div className="mt-1 text-xs leading-4 text-base-content/60">
+                用于调用 /v1/messages、/cc/v1/messages 等模型接口，可复制到 x-api-key 或 Authorization: Bearer。新增、编辑、删除后立即生效。
+              </div>
+            </div>
+            <Button type="button" color="primary" size="sm" className="shrink-0" disabled={loading || creating} onClick={generateRequestKey}>
+              {creating ? <Loading size="xs" /> : <Wand2 className="h-4 w-4" />}
+              随机生成并新增
+            </Button>
           </div>
         </div>
 
-        <div className="flex flex-col gap-2 sm:flex-row">
+        <div className="mb-3 grid gap-2 md:grid-cols-[minmax(0,1fr)_auto_auto]">
           <Input
             bordered
-            readOnly
             size="sm"
-            aria-label="请求调用 Key"
-            className="min-w-0 font-mono text-xs"
-            value={loading ? '加载中...' : requestApiKeyValue || '未配置'}
+            className="w-full min-w-0 font-mono text-xs"
+            value={manualRequestApiKey}
+            placeholder="手动输入要新增的请求 Key"
+            disabled={loading || creating}
+            onChange={(event) => setManualRequestApiKey(event.target.value)}
           />
-          <div className="flex gap-2 sm:shrink-0">
-            <Button
-              type="button"
-              size="sm"
-              className="flex-1 sm:flex-none"
-              onClick={() => setShowRequestKey((value) => !value)}
-              title={showRequestKey ? '隐藏请求 Key' : '显示完整请求 Key'}
-            >
-              {showRequestKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-              {showRequestKey ? '隐藏' : '显示'}
-            </Button>
-            <Button type="button" size="sm" className="flex-1 sm:flex-none" onClick={() => copy('请求 Key', keys?.requestApiKey)}>
-              <Copy className="h-4 w-4" />
-              复制请求 Key
-            </Button>
-          </div>
+          <Button type="button" variant="outline" size="sm" className="shrink-0" disabled={loading || creating} onClick={() => setManualRequestApiKey(generateLocalRequestApiKey())}>
+            <Wand2 className="h-4 w-4" />
+            随机生成
+          </Button>
+          <Button type="button" size="sm" className="shrink-0" disabled={loading || creating || !manualRequestApiKey.trim()} onClick={addManualRequestKey}>
+            <Plus className="h-4 w-4" />
+            新增 Key
+          </Button>
+        </div>
+
+        <div className="space-y-2">
+          {loading && <div className="rounded-box border border-base-300 bg-base-200/60 p-3 text-sm text-base-content/60">加载中...</div>}
+          {!loading && requestKeys.length === 0 && <ErrorState title="未配置请求 Key" message="请先生成或手动新增一个请求 Key。" />}
+          {!loading && requestKeys.map((item) => {
+            const visible = visibleRequestKeyIds.has(item.id)
+            const busy = processingKeyId === item.id
+            const editing = editingRequestKeyId === item.id
+            return (
+              <div key={item.id} className="rounded-box border border-base-300 bg-base-200/45 p-3">
+                <div className="mb-2 flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                  <div className="flex min-w-0 flex-wrap items-center gap-2">
+                    <span className="text-sm font-semibold">请求 Key</span>
+                    {item.primary && <span className="rounded border border-primary/25 bg-primary/10 px-2 py-0.5 text-[0.68rem] font-semibold text-primary">主 Key</span>}
+                    <span className="font-mono text-[0.68rem] text-base-content/50">{item.id.slice(0, 12)}</span>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <Button type="button" size="xs" disabled={busy || editing} onClick={() => toggleRequestKeyVisible(item.id)} title={visible ? '隐藏请求 Key' : '显示完整请求 Key'}>
+                      {visible ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                      {visible ? '隐藏' : '显示'}
+                    </Button>
+                    <Button type="button" size="xs" disabled={busy || editing} onClick={() => copy('请求 Key', item.apiKey)}>
+                      <Copy className="h-3.5 w-3.5" />
+                      复制
+                    </Button>
+                    {!editing && (
+                      <Button type="button" color="ghost" size="xs" disabled={busy || Boolean(editingRequestKeyId)} onClick={() => startEditRequestKey(item)}>
+                        <Edit3 className="h-3.5 w-3.5" />
+                        编辑
+                      </Button>
+                    )}
+                    <Button type="button" color="error" variant="outline" size="xs" disabled={busy || editing || requestKeys.length <= 1} onClick={() => removeRequestKey(item)}>
+                      <Trash2 className="h-3.5 w-3.5" />
+                      删除
+                    </Button>
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <Input
+                    bordered
+                    readOnly={!editing}
+                    size="sm"
+                    aria-label="请求调用 Key"
+                    className="w-full min-w-0 font-mono text-xs"
+                    value={editing ? requestKeyDraft : visible ? item.apiKey : item.maskedApiKey}
+                    disabled={busy}
+                    onChange={(event) => setRequestKeyDraft(event.target.value)}
+                  />
+                  {editing && (
+                    <div className="flex flex-wrap justify-end gap-2">
+                      <Button type="button" variant="outline" size="sm" disabled={busy} onClick={() => setRequestKeyDraft(generateLocalRequestApiKey())}>
+                        <Wand2 className="h-4 w-4" />
+                        随机生成
+                      </Button>
+                      <Button type="button" color="primary" size="sm" disabled={busy || !requestKeyDraft.trim()} onClick={() => saveEditedRequestKey(item)}>
+                        {busy ? <Loading size="xs" /> : <Save className="h-4 w-4" />}
+                        保存
+                      </Button>
+                      <Button type="button" variant="outline" size="sm" disabled={busy} onClick={cancelEditRequestKey}>
+                        <X className="h-4 w-4" />
+                        取消
+                      </Button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )
+          })}
         </div>
       </div>
 
-      <div className="rounded-box border border-base-300 bg-base-100 p-3">
+      <div className="rounded-box border border-base-300 bg-base-100 p-3 md:col-span-2">
         <div className="mb-3">
           <div className="flex flex-wrap items-center gap-2">
             <div className="text-sm font-semibold">后台登录 Key</div>
@@ -477,7 +676,7 @@ function AccessKeysPanel() {
             readOnly
             size="sm"
             aria-label="当前后台登录 Key"
-            className="min-w-0 font-mono text-xs"
+            className="w-full min-w-0 flex-1 font-mono text-xs"
             value={loading ? '加载中...' : adminApiKeyValue || '未配置'}
           />
           <div className="flex gap-2 sm:shrink-0">
@@ -510,7 +709,7 @@ function AccessKeysPanel() {
               bordered
               type="password"
               size="sm"
-              className="min-w-0"
+              className="w-full min-w-0 flex-1"
               value={nextAdminApiKey}
               placeholder="输入新的登录 Key（至少 8 个字符）"
               disabled={saving}

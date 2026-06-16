@@ -1022,8 +1022,24 @@ export type UpdateRuntimeConfigRequest = RuntimeConfig
 export interface AccessKeysResponse {
   requestApiKey: string
   maskedRequestApiKey: string
+  requestApiKeys: RequestApiKeyItem[]
   adminApiKey: string
   maskedAdminApiKey: string
+}
+
+export interface RequestApiKeyItem {
+  id: string
+  apiKey: string
+  maskedApiKey: string
+  primary: boolean
+}
+
+export interface CreateRequestApiKeyRequest {
+  apiKey?: string
+}
+
+export interface UpdateRequestApiKeyRequest {
+  apiKey?: string
 }
 
 export interface UpdateAdminApiKeyRequest {

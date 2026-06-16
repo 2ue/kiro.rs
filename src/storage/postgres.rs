@@ -344,8 +344,17 @@ impl PostgresStore {
         &self,
         file_config: &Config,
     ) -> anyhow::Result<()> {
-        if self.load_runtime_config().await?.is_none() {
-            self.save_runtime_config(file_config).await?;
+        match self.load_runtime_config().await? {
+            None => {
+                let mut config = file_config.clone();
+                config.set_request_api_keys(file_config.request_api_keys());
+                self.save_runtime_config(&config).await?;
+            }
+            Some(mut config) => {
+                if config.fill_missing_access_keys_from(file_config) {
+                    self.save_runtime_config(&config).await?;
+                }
+            }
         }
         Ok(())
     }

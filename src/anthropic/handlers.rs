@@ -5278,7 +5278,7 @@ mod tests {
         let prompt_cache = Arc::new(PromptCacheTracker::default());
         let usage_recorder = Arc::new(UsageRecorder::new(10));
         let state = AppState::new(
-            "test-key",
+            Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
             true,
             usage_recorder,
             prompt_cache,
@@ -5397,7 +5397,7 @@ mod tests {
         let prompt_cache = Arc::new(PromptCacheTracker::default());
         let usage_recorder = Arc::new(UsageRecorder::new(10));
         let state = AppState::new(
-            "test-key",
+            Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
             true,
             usage_recorder,
             prompt_cache.clone(),
@@ -5457,7 +5457,7 @@ mod tests {
         let prompt_cache = Arc::new(PromptCacheTracker::default());
         let usage_recorder = Arc::new(UsageRecorder::new(10));
         let state = AppState::new(
-            "test-key",
+            Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
             true,
             usage_recorder,
             prompt_cache,
@@ -5543,7 +5543,7 @@ mod tests {
         let prompt_cache = Arc::new(PromptCacheTracker::default());
         let usage_recorder = Arc::new(UsageRecorder::new(10));
         let state = AppState::new(
-            "test-key",
+            Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
             true,
             usage_recorder,
             prompt_cache,

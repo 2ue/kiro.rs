@@ -1154,6 +1154,13 @@ pub struct Config {
     #[serde(default)]
     pub api_key: Option<String>,
 
+    /// 额外的客户端调用 API Key。
+    ///
+    /// `apiKey` 保留为历史主 Key；运行时实际允许的调用 Key 为
+    /// `apiKey + apiKeys` 规范化后的集合。
+    #[serde(default)]
+    pub api_keys: Vec<String>,
+
     #[serde(default = "default_system_version")]
     pub system_version: String,
 
@@ -1894,6 +1901,18 @@ fn reported_usage_path_matches(prefix: &str, path: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
+fn normalize_request_api_keys(keys: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for key in keys {
+        let key = key.as_ref().trim();
+        if key.is_empty() || normalized.iter().any(|existing| existing == key) {
+            continue;
+        }
+        normalized.push(key.to_string());
+    }
+    normalized
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -1907,6 +1926,7 @@ impl Default for Config {
             kiro_version: default_kiro_version(),
             machine_id: None,
             api_key: None,
+            api_keys: Vec::new(),
             system_version: default_system_version(),
             node_version: default_node_version(),
             tls_backend: default_tls_backend(),
@@ -2001,6 +2021,62 @@ impl Config {
     /// 优先使用 api_region，未配置时回退到 region
     pub fn effective_api_region(&self) -> &str {
         self.api_region.as_deref().unwrap_or(&self.region)
+    }
+
+    /// 返回规范化后的客户端调用 API Key 列表。
+    ///
+    /// 历史配置只包含 `apiKey`；新配置可以额外包含 `apiKeys`。这里统一去空、trim、去重，
+    /// 并保留原始顺序，保证旧主 key 仍排在第一位。
+    pub fn request_api_keys(&self) -> Vec<String> {
+        normalize_request_api_keys(
+            self.api_key
+                .iter()
+                .chain(self.api_keys.iter())
+                .map(String::as_str),
+        )
+    }
+
+    /// 按兼容格式写回客户端调用 API Key。
+    ///
+    /// 第一个 key 写入历史字段 `apiKey`，其余写入 `apiKeys`，这样旧版本/旧脚本仍能读取主 key。
+    pub fn set_request_api_keys(&mut self, keys: impl IntoIterator<Item = impl AsRef<str>>) {
+        let mut keys =
+            normalize_request_api_keys(keys.into_iter().map(|key| key.as_ref().to_string()));
+        self.api_key = keys.first().cloned();
+        if !keys.is_empty() {
+            keys.remove(0);
+        }
+        self.api_keys = keys;
+    }
+
+    /// 如果数据库 runtime config 缺少客户端调用 Key，则从文件配置补齐一次。
+    pub fn fill_missing_access_keys_from(&mut self, file_config: &Config) -> bool {
+        let mut changed = false;
+        if self.request_api_keys().is_empty() {
+            let file_keys = file_config.request_api_keys();
+            if !file_keys.is_empty() {
+                self.set_request_api_keys(file_keys);
+                changed = true;
+            }
+        }
+        if self
+            .admin_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .is_none()
+        {
+            if let Some(admin_key) = file_config
+                .admin_api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+            {
+                self.admin_api_key = Some(admin_key.to_string());
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// 从文件加载配置
@@ -2202,6 +2278,71 @@ mod tests {
 
         assert_eq!(config.compat_profile, CompatProfile::AnthropicStrict);
         assert_eq!(config.kiro_agent_mode_strategy, KiroAgentModeStrategy::Auto);
+    }
+
+    #[test]
+    fn request_api_keys_support_legacy_single_key() {
+        let config: Config = serde_json::from_str(r#"{"apiKey":" sk-legacy "}"#).unwrap();
+
+        assert_eq!(config.request_api_keys(), vec!["sk-legacy".to_string()]);
+    }
+
+    #[test]
+    fn request_api_keys_merge_and_deduplicate_primary_and_extra_keys() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "apiKey": "sk-primary",
+                "apiKeys": ["sk-extra", "sk-primary", "", " sk-third "]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.request_api_keys(),
+            vec![
+                "sk-primary".to_string(),
+                "sk-extra".to_string(),
+                "sk-third".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn set_request_api_keys_preserves_legacy_primary_field() {
+        let mut config = Config::default();
+        config.set_request_api_keys([" sk-a ", "sk-b", "sk-a"]);
+
+        assert_eq!(config.api_key.as_deref(), Some("sk-a"));
+        assert_eq!(config.api_keys, vec!["sk-b".to_string()]);
+    }
+
+    #[test]
+    fn fill_missing_access_keys_from_file_does_not_override_existing_database_keys() {
+        let mut database = Config::default();
+        database.set_request_api_keys(["sk-db"]);
+        database.admin_api_key = Some("sk-admin-db".to_string());
+        let mut file = Config::default();
+        file.set_request_api_keys(["sk-file"]);
+        file.admin_api_key = Some("sk-admin-file".to_string());
+
+        assert!(!database.fill_missing_access_keys_from(&file));
+        assert_eq!(database.request_api_keys(), vec!["sk-db".to_string()]);
+        assert_eq!(database.admin_api_key.as_deref(), Some("sk-admin-db"));
+    }
+
+    #[test]
+    fn fill_missing_access_keys_from_file_initializes_historical_database_config() {
+        let mut database = Config::default();
+        let mut file = Config::default();
+        file.set_request_api_keys(["sk-file", "sk-extra"]);
+        file.admin_api_key = Some("sk-admin-file".to_string());
+
+        assert!(database.fill_missing_access_keys_from(&file));
+        assert_eq!(
+            database.request_api_keys(),
+            vec!["sk-file".to_string(), "sk-extra".to_string()]
+        );
+        assert_eq!(database.admin_api_key.as_deref(), Some("sk-admin-file"));
     }
 
     #[test]

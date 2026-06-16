@@ -29,6 +29,7 @@ use axum::{
 };
 use chrono::Utc;
 use clap::Parser;
+use common::auth::RequestApiKeyStore;
 use external_pool::ExternalPoolManager;
 use futures::StreamExt;
 use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
@@ -194,11 +195,13 @@ async fn main() {
     let first_credentials = credentials_list.first().cloned().unwrap_or_default();
     tracing::debug!("主凭证: {:?}", first_credentials);
 
-    // 获取 API Key
-    let api_key = config.api_key.clone().unwrap_or_else(|| {
-        tracing::error!("配置文件中未设置 apiKey");
+    // 获取客户端请求 API Key。历史配置使用 apiKey；新配置可额外使用 apiKeys。
+    let request_api_keys = config.request_api_keys();
+    if request_api_keys.is_empty() {
+        tracing::error!("运行配置中未设置 apiKey/apiKeys");
         std::process::exit(1);
-    });
+    }
+    let request_api_key_store = Arc::new(RequestApiKeyStore::new(request_api_keys.clone()));
 
     // 构建代理配置
     let proxy_config = config.proxy_url.as_ref().map(|url| {
@@ -323,6 +326,7 @@ async fn main() {
     spawn_redis_runtime_event_listener(
         redis_store.clone(),
         token_manager.clone(),
+        request_api_key_store.clone(),
         runtime_event_health.clone(),
     );
     let kiro_provider = KiroProvider::with_proxy(
@@ -398,7 +402,7 @@ async fn main() {
 
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let anthropic_app = anthropic::create_router_with_provider(
-        &api_key,
+        request_api_key_store.clone(),
         Some(kiro_provider.clone()),
         config.extract_thinking,
         usage_recorder.clone(),
@@ -452,7 +456,7 @@ async fn main() {
                 kiro_provider.clone(),
                 postgres_store.clone(),
                 redis_store.clone(),
-                api_key.clone(),
+                request_api_key_store.clone(),
                 external_pool_manager.clone(),
             );
             let admin_state = admin::AdminState::new(admin_key, admin_service);
@@ -485,7 +489,10 @@ async fn main() {
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("启动 Anthropic API 端点: {}", addr);
-    tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
+    tracing::info!(
+        count = request_api_key_store.len(),
+        "已加载客户端请求 API Key"
+    );
     tracing::info!("可用 API:");
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/messages (high-cache)");
@@ -651,6 +658,7 @@ async fn console_ui_index_redirect() -> Redirect {
 fn spawn_redis_runtime_event_listener(
     redis_store: Arc<RedisStore>,
     token_manager: Arc<MultiTokenManager>,
+    request_api_key_store: Arc<RequestApiKeyStore>,
     health: Arc<RuntimeEventHealth>,
 ) {
     tokio::spawn(async move {
@@ -684,7 +692,10 @@ fn spawn_redis_runtime_event_listener(
                         health.mark_event();
                         if channel == config_channel {
                             match token_manager.reload_runtime_config_from_postgres() {
-                                Ok(true) => tracing::info!(payload, "已根据 Redis 通知热加载运行配置"),
+                                Ok(true) => {
+                                    request_api_key_store.replace_keys(token_manager.runtime_config().request_api_keys());
+                                    tracing::info!(payload, "已根据 Redis 通知热加载运行配置");
+                                }
                                 Ok(false) => tracing::debug!(payload, "收到运行配置通知，但未执行热加载"),
                                 Err(err) => tracing::warn!(payload, "热加载运行配置失败: {}", err),
                             }
@@ -700,8 +711,10 @@ fn spawn_redis_runtime_event_listener(
                         }
                     }
                     _ = periodic_reload.tick() => {
-                        if let Err(err) = token_manager.reload_runtime_config_from_postgres() {
-                            tracing::warn!("定时热加载运行配置失败: {}", err);
+                        match token_manager.reload_runtime_config_from_postgres() {
+                            Ok(true) => request_api_key_store.replace_keys(token_manager.runtime_config().request_api_keys()),
+                            Ok(false) => {}
+                            Err(err) => tracing::warn!("定时热加载运行配置失败: {}", err),
                         }
                         if let Err(err) = token_manager.reload_credentials_from_postgres() {
                             tracing::warn!("定时同步凭据快照失败: {}", err);
