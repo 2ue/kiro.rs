@@ -25,6 +25,15 @@ pub fn is_placeholder_profile_arn(arn: &str) -> bool {
     arn == KIRO_BUILDER_ID_PLACEHOLDER_ARN
 }
 
+pub fn is_enterprise_fallback_profile_arn(arn: &str) -> bool {
+    arn == enterprise_fallback_profile_arn("us-east-1")
+        || arn == enterprise_fallback_profile_arn("eu-central-1")
+}
+
+pub fn is_real_profile_arn(arn: &str) -> bool {
+    !is_placeholder_profile_arn(arn) && !is_enterprise_fallback_profile_arn(arn)
+}
+
 pub fn enterprise_fallback_profile_arn(region: &str) -> String {
     let region = if region.starts_with("eu-") {
         "eu-central-1"
@@ -80,7 +89,12 @@ pub fn is_social_credentials(credentials: &KiroCredentials) -> bool {
         })
 }
 
-pub fn resolve_profile_arn(credentials: &KiroCredentials, config: &Config) -> Option<String> {
+/// Resolve a profile ARN that is safe to send as an upstream identity selector.
+///
+/// Header/query endpoints such as MCP, ListAvailableModels, and usage APIs must not
+/// receive BuilderId placeholders or Enterprise fallback ARNs. Those values are not
+/// caller-owned real profiles and can make otherwise valid accounts fail with 400/403.
+pub fn resolve_profile_arn(credentials: &KiroCredentials, _config: &Config) -> Option<String> {
     if credentials.is_api_key_credential() {
         return None;
     }
@@ -89,7 +103,37 @@ pub fn resolve_profile_arn(credentials: &KiroCredentials, config: &Config) -> Op
         .profile_arn
         .as_deref()
         .map(str::trim)
-        .filter(|arn| !arn.is_empty() && !is_placeholder_profile_arn(arn))
+        .filter(|arn| !arn.is_empty() && is_real_profile_arn(arn))
+    {
+        return Some(profile_arn.to_string());
+    }
+
+    if is_social_credentials(credentials) {
+        return Some(KIRO_SOCIAL_PROFILE_ARN.to_string());
+    }
+
+    None
+}
+
+/// Resolve the profile ARN for streaming assistant request bodies.
+///
+/// Streaming calls are stricter than header/query APIs: BuilderId/free OAuth flows
+/// still need a body-level `profileArn`, while API-key credentials have no profile
+/// concept. Enterprise/IdC should self-heal to a real ARN first; the region-aware
+/// fallback here is request-body-only and must not be persisted as a real profile.
+pub fn resolve_streaming_profile_arn(
+    credentials: &KiroCredentials,
+    config: &Config,
+) -> Option<String> {
+    if credentials.is_api_key_credential() {
+        return None;
+    }
+
+    if let Some(profile_arn) = credentials
+        .profile_arn
+        .as_deref()
+        .map(str::trim)
+        .filter(|arn| !arn.is_empty())
     {
         return Some(profile_arn.to_string());
     }
@@ -161,22 +205,16 @@ mod tests {
     use crate::model::config::Config;
 
     #[test]
-    fn resolves_external_idp_fallback_by_region() {
+    fn header_profile_skips_external_idp_fallback() {
         let mut credentials = KiroCredentials {
             auth_method: Some("external_idp".to_string()),
             api_region: Some("eu-west-1".to_string()),
             ..Default::default()
         };
-        assert_eq!(
-            resolve_profile_arn(&credentials, &Config::default()).as_deref(),
-            Some("arn:aws:codewhisperer:eu-central-1:610548660232:profile/VNECVYCYYAWN")
-        );
+        assert_eq!(resolve_profile_arn(&credentials, &Config::default()), None);
 
         credentials.api_region = Some("us-east-1".to_string());
-        assert_eq!(
-            resolve_profile_arn(&credentials, &Config::default()).as_deref(),
-            Some("arn:aws:codewhisperer:us-east-1:610548660232:profile/VNECVYCYYAWN")
-        );
+        assert_eq!(resolve_profile_arn(&credentials, &Config::default()), None);
     }
 
     #[test]
@@ -220,8 +258,8 @@ mod tests {
             );
             assert_eq!(
                 resolve_profile_arn(&credentials, &Config::default()).as_deref(),
-                Some("arn:aws:codewhisperer:eu-central-1:610548660232:profile/VNECVYCYYAWN"),
-                "provider alias {provider} should use enterprise fallback, not BuilderId placeholder"
+                None,
+                "provider alias {provider} should not send fallback ARN to header/query APIs"
             );
         }
     }
@@ -253,7 +291,18 @@ mod tests {
     }
 
     #[test]
-    fn resolves_builder_id_placeholder_for_idc_credentials() {
+    fn header_profile_skips_builder_id_placeholder_for_idc_credentials() {
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_profile_arn(&credentials, &Config::default()), None);
+    }
+
+    #[test]
+    fn streaming_profile_keeps_builder_id_placeholder_for_idc_credentials() {
         let credentials = KiroCredentials {
             auth_method: Some("idc".to_string()),
             client_id: Some("client".to_string()),
@@ -261,8 +310,39 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            resolve_profile_arn(&credentials, &Config::default()).as_deref(),
+            resolve_streaming_profile_arn(&credentials, &Config::default()).as_deref(),
             Some(KIRO_BUILDER_ID_PLACEHOLDER_ARN)
+        );
+    }
+
+    #[test]
+    fn streaming_profile_uses_enterprise_fallback_without_persisting_it() {
+        let credentials = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            api_region: Some("eu-west-1".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_streaming_profile_arn(&credentials, &Config::default()).as_deref(),
+            Some("arn:aws:codewhisperer:eu-central-1:610548660232:profile/VNECVYCYYAWN")
+        );
+    }
+
+    #[test]
+    fn persisted_enterprise_fallback_is_not_treated_as_real_header_profile() {
+        let fallback = enterprise_fallback_profile_arn("us-east-1");
+        let credentials = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            provider: Some("Enterprise".to_string()),
+            profile_arn: Some(fallback.clone()),
+            ..Default::default()
+        };
+
+        assert!(is_enterprise_fallback_profile_arn(&fallback));
+        assert_eq!(resolve_profile_arn(&credentials, &Config::default()), None);
+        assert_eq!(
+            resolve_streaming_profile_arn(&credentials, &Config::default()).as_deref(),
+            Some(fallback.as_str())
         );
     }
 

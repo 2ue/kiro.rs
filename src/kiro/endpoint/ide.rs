@@ -10,7 +10,10 @@ use reqwest::RequestBuilder;
 use uuid::Uuid;
 
 use super::{KiroEndpoint, RequestContext};
-use crate::kiro::protocol::{is_external_idp_credentials, resolve_agent_mode, resolve_profile_arn};
+use crate::kiro::protocol::{
+    is_external_idp_credentials, resolve_agent_mode, resolve_profile_arn,
+    resolve_streaming_profile_arn,
+};
 
 /// Kiro IDE 端点名称
 pub const IDE_ENDPOINT_NAME: &str = "ide";
@@ -154,7 +157,10 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
-        inject_profile_arn(body, &resolve_profile_arn(ctx.credentials, ctx.config))
+        inject_profile_arn(
+            body,
+            &resolve_streaming_profile_arn(ctx.credentials, ctx.config),
+        )
     }
 }
 
@@ -176,9 +182,7 @@ mod tests {
     use super::{IdeEndpoint, inject_profile_arn};
     use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
     use crate::kiro::model::credentials::KiroCredentials;
-    use crate::kiro::protocol::{
-        KIRO_BUILDER_ID_PLACEHOLDER_ARN, KIRO_SOCIAL_PROFILE_ARN, enterprise_fallback_profile_arn,
-    };
+    use crate::kiro::protocol::{KIRO_BUILDER_ID_PLACEHOLDER_ARN, KIRO_SOCIAL_PROFILE_ARN};
     use crate::model::config::{Config, KiroAgentModeStrategy};
     use reqwest::Client;
     use serde_json::Value;
@@ -223,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn test_models_url_uses_builder_id_placeholder_for_idc_credentials() {
+    fn test_models_url_skips_builder_id_placeholder_for_idc_credentials() {
         let endpoint = IdeEndpoint::new();
         let credentials = KiroCredentials {
             auth_method: Some("builder-id".to_string()),
@@ -240,8 +244,7 @@ mod tests {
         };
 
         let url = endpoint.models_url(&ctx, Some("next-token"));
-        assert!(url.contains("profileArn="));
-        assert!(url.contains(&urlencoding::encode(KIRO_BUILDER_ID_PLACEHOLDER_ARN).to_string()));
+        assert!(!url.contains("profileArn="));
         assert!(url.contains("nextToken=next-token"));
     }
 
@@ -266,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn test_models_url_uses_enterprise_fallback_for_external_idp_credentials() {
+    fn test_models_url_skips_enterprise_fallback_for_external_idp_credentials() {
         let endpoint = IdeEndpoint::new();
         let credentials = KiroCredentials {
             auth_method: Some("external_idp".to_string()),
@@ -283,9 +286,65 @@ mod tests {
         };
 
         let url = endpoint.models_url(&ctx, None);
-        assert!(url.contains(
-            &urlencoding::encode(&enterprise_fallback_profile_arn("eu-west-1")).to_string()
-        ));
+        assert!(!url.contains("profileArn="));
+    }
+
+    #[test]
+    fn test_streaming_body_keeps_builder_id_placeholder() {
+        let endpoint = IdeEndpoint::new();
+        let credentials = KiroCredentials {
+            auth_method: Some("builder-id".to_string()),
+            client_id: Some("client".to_string()),
+            client_secret: Some("secret".to_string()),
+            ..Default::default()
+        };
+        let config = Config::default();
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine",
+            config: &config,
+        };
+
+        let body = endpoint.transform_api_body(r#"{"conversationState":{}}"#, &ctx);
+        let json: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["profileArn"], KIRO_BUILDER_ID_PLACEHOLDER_ARN);
+    }
+
+    #[test]
+    fn test_streaming_body_uses_enterprise_fallback_without_model_header_leak() {
+        let endpoint = IdeEndpoint::new();
+        let credentials = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            provider: Some("Enterprise".to_string()),
+            api_region: Some("eu-west-1".to_string()),
+            ..Default::default()
+        };
+        let config = Config::default();
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine",
+            config: &config,
+        };
+
+        let body = endpoint.transform_api_body(r#"{"conversationState":{}}"#, &ctx);
+        let json: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            json["profileArn"],
+            "arn:aws:codewhisperer:eu-central-1:610548660232:profile/VNECVYCYYAWN"
+        );
+
+        let models_req = endpoint
+            .decorate_models(Client::new().get("https://example.com"), &ctx)
+            .build()
+            .unwrap();
+        assert!(
+            models_req
+                .headers()
+                .get("x-amzn-kiro-profile-arn")
+                .is_none()
+        );
     }
 
     #[test]

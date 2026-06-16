@@ -25,8 +25,7 @@ use crate::kiro::machine_id;
 use crate::kiro::model::available_models::{KiroAvailableModel, KiroAvailableModelsResponse};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::protocol::{
-    extract_first_profile_arn, is_external_idp_credentials, is_placeholder_profile_arn,
-    resolve_profile_arn,
+    extract_first_profile_arn, is_external_idp_credentials, is_real_profile_arn,
 };
 use crate::kiro::token_manager::{
     AcquireMode, CallContext, CredentialRiskControlReason, InFlightKind, InFlightLeaseGuard,
@@ -981,7 +980,7 @@ impl KiroProvider {
             .profile_arn
             .as_deref()
             .map(str::trim)
-            .is_some_and(|arn| !arn.is_empty() && !is_placeholder_profile_arn(arn))
+            .is_some_and(|arn| !arn.is_empty() && is_real_profile_arn(arn))
         {
             return Ok(ctx.credentials.profile_arn.clone());
         }
@@ -1015,10 +1014,10 @@ impl KiroProvider {
             if status.as_u16() == 403 {
                 tracing::warn!(
                     credential_id = ctx.id,
-                    "ListAvailableProfiles 返回 403，继续使用 Enterprise fallback profileArn: {}",
+                    "ListAvailableProfiles 返回 403，保持本次请求使用流式 fallback，不持久化 profileArn: {}",
                     body
                 );
-                return Ok(resolve_profile_arn(&ctx.credentials, config));
+                return Ok(None);
             }
             anyhow::bail!("ListAvailableProfiles 失败: {} {}", status, body);
         }
@@ -1027,7 +1026,7 @@ impl KiroProvider {
             response_text_with_body_timeout(response, config.kiro_upstream_response_timeout_secs)
                 .await?;
 
-        Ok(extract_first_profile_arn(&body))
+        Ok(extract_first_profile_arn(&body).filter(|arn| is_real_profile_arn(arn)))
     }
 
     async fn ensure_profile_arn_for_context(
@@ -1044,7 +1043,7 @@ impl KiroProvider {
             .profile_arn
             .as_deref()
             .map(str::trim)
-            .filter(|arn| !arn.is_empty() && !is_placeholder_profile_arn(arn));
+            .filter(|arn| !arn.is_empty() && is_real_profile_arn(arn));
         if existing.is_some() {
             return;
         }
