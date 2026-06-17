@@ -2099,7 +2099,7 @@ fn map_provider_error(
             &err_str,
             "请求被拒绝：Kiro payload 形态不合法（不应切换账号重试）",
         );
-        let message = "Converted request is improperly formed. Check model mapping, tool_use/tool_result pairing, tool schema, multimodal sources, and payload size.";
+        let message = "Request body is improperly formed. Check message ordering, tool_use/tool_result pairing, tool schema, multimodal sources, and payload size.";
         return if let Some(request_id) = request_id {
             envelope::error_response_with_id(
                 StatusCode::BAD_REQUEST,
@@ -2352,7 +2352,11 @@ fn log_payload_guard_report(
             trimmed_history_entries = report.trimmed_history_entries,
             aligned_leading_entries = report.aligned_leading_entries,
             removed_empty_tool_uses = report.removed_empty_tool_uses,
+            removed_duplicate_tool_uses = report.removed_duplicate_tool_uses,
+            renamed_duplicate_tool_uses = report.renamed_duplicate_tool_uses,
             removed_orphan_tool_results = report.removed_orphan_tool_results,
+            removed_duplicate_tool_results = report.removed_duplicate_tool_results,
+            textified_duplicate_tool_results = report.textified_duplicate_tool_results,
             textified_orphan_tool_results = report.textified_orphan_tool_results,
             removed_orphan_tool_uses = report.removed_orphan_tool_uses,
             truncated_history_tool_results = report.truncated_history_tool_results,

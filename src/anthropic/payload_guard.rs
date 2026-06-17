@@ -71,7 +71,15 @@ pub struct PayloadGuardReport {
     pub trimmed_history_entries: usize,
     pub aligned_leading_entries: usize,
     pub removed_empty_tool_uses: usize,
+    #[serde(default)]
+    pub removed_duplicate_tool_uses: usize,
+    #[serde(default)]
+    pub renamed_duplicate_tool_uses: usize,
     pub removed_orphan_tool_results: usize,
+    #[serde(default)]
+    pub removed_duplicate_tool_results: usize,
+    #[serde(default)]
+    pub textified_duplicate_tool_results: usize,
     pub textified_orphan_tool_results: usize,
     pub removed_orphan_tool_uses: usize,
     pub truncated_history_tool_results: usize,
@@ -105,7 +113,11 @@ impl PayloadGuardReport {
             trimmed_history_entries: 0,
             aligned_leading_entries: 0,
             removed_empty_tool_uses: 0,
+            removed_duplicate_tool_uses: 0,
+            renamed_duplicate_tool_uses: 0,
             removed_orphan_tool_results: 0,
+            removed_duplicate_tool_results: 0,
+            textified_duplicate_tool_results: 0,
             textified_orphan_tool_results: 0,
             removed_orphan_tool_uses: 0,
             truncated_history_tool_results: 0,
@@ -132,7 +144,11 @@ impl PayloadGuardReport {
         self.trimmed_history_entries > 0
             || self.aligned_leading_entries > 0
             || self.removed_empty_tool_uses > 0
+            || self.removed_duplicate_tool_uses > 0
+            || self.renamed_duplicate_tool_uses > 0
             || self.removed_orphan_tool_results > 0
+            || self.removed_duplicate_tool_results > 0
+            || self.textified_duplicate_tool_results > 0
             || self.textified_orphan_tool_results > 0
             || self.removed_orphan_tool_uses > 0
             || self.truncated_history_tool_results > 0
@@ -168,10 +184,34 @@ impl PayloadGuardReport {
                 self.removed_empty_tool_uses
             ));
         }
+        if self.removed_duplicate_tool_uses > 0 {
+            parts.push(format!(
+                "payload-duplicate-tool-uses={}",
+                self.removed_duplicate_tool_uses
+            ));
+        }
+        if self.renamed_duplicate_tool_uses > 0 {
+            parts.push(format!(
+                "payload-renamed-duplicate-tool-uses={}",
+                self.renamed_duplicate_tool_uses
+            ));
+        }
         if self.removed_orphan_tool_results > 0 {
             parts.push(format!(
                 "payload-orphan-tool-results={}",
                 self.removed_orphan_tool_results
+            ));
+        }
+        if self.removed_duplicate_tool_results > 0 {
+            parts.push(format!(
+                "payload-duplicate-tool-results={}",
+                self.removed_duplicate_tool_results
+            ));
+        }
+        if self.textified_duplicate_tool_results > 0 {
+            parts.push(format!(
+                "payload-textified-duplicate-tool-results={}",
+                self.textified_duplicate_tool_results
             ));
         }
         if self.textified_orphan_tool_results > 0 {
@@ -290,7 +330,11 @@ pub fn guard_kiro_request(
         trimmed_history_entries: 0,
         aligned_leading_entries: 0,
         removed_empty_tool_uses: 0,
+        removed_duplicate_tool_uses: 0,
+        renamed_duplicate_tool_uses: 0,
         removed_orphan_tool_results: 0,
+        removed_duplicate_tool_results: 0,
+        textified_duplicate_tool_results: 0,
         textified_orphan_tool_results: 0,
         removed_orphan_tool_uses: 0,
         truncated_history_tool_results: 0,
@@ -317,10 +361,7 @@ pub fn guard_kiro_request(
         align_history_to_user(&mut request.conversation_state.history);
 
     let initial_repair = repair_request(request);
-    report.removed_empty_tool_uses += initial_repair.removed_empty_tool_uses;
-    report.removed_orphan_tool_results += initial_repair.removed_orphan_tool_results;
-    report.textified_orphan_tool_results += initial_repair.textified_orphan_tool_results;
-    report.removed_orphan_tool_uses += initial_repair.removed_orphan_tool_uses;
+    add_repair_stats_to_report(&mut report, initial_repair);
     repair_elapsed += repair_started_at.elapsed();
 
     let serialize_started_at = Instant::now();
@@ -343,10 +384,7 @@ pub fn guard_kiro_request(
         if shaping.was_modified() {
             let repair_started_at = Instant::now();
             let repair = repair_request(request);
-            report.removed_empty_tool_uses += repair.removed_empty_tool_uses;
-            report.removed_orphan_tool_results += repair.removed_orphan_tool_results;
-            report.textified_orphan_tool_results += repair.textified_orphan_tool_results;
-            report.removed_orphan_tool_uses += repair.removed_orphan_tool_uses;
+            add_repair_stats_to_report(&mut report, repair);
             repair_elapsed += repair_started_at.elapsed();
             let serialize_started_at = Instant::now();
             body = serialize_request(request)?;
@@ -371,10 +409,7 @@ pub fn guard_kiro_request(
             report.aligned_leading_entries += aligned;
 
             let repair = repair_request(request);
-            report.removed_empty_tool_uses += repair.removed_empty_tool_uses;
-            report.removed_orphan_tool_results += repair.removed_orphan_tool_results;
-            report.textified_orphan_tool_results += repair.textified_orphan_tool_results;
-            report.removed_orphan_tool_uses += repair.removed_orphan_tool_uses;
+            add_repair_stats_to_report(&mut report, repair);
 
             let serialize_started_at = Instant::now();
             body = serialize_request(request)?;
@@ -691,7 +726,11 @@ fn new_payload_guard_report(
         trimmed_history_entries: 0,
         aligned_leading_entries: 0,
         removed_empty_tool_uses: 0,
+        removed_duplicate_tool_uses: 0,
+        renamed_duplicate_tool_uses: 0,
         removed_orphan_tool_results: 0,
+        removed_duplicate_tool_results: 0,
+        textified_duplicate_tool_results: 0,
         textified_orphan_tool_results: 0,
         removed_orphan_tool_uses: 0,
         truncated_history_tool_results: 0,
@@ -2822,7 +2861,11 @@ fn align_history_to_user(history: &mut Vec<Message>) -> usize {
 #[derive(Default)]
 struct RepairStats {
     removed_empty_tool_uses: usize,
+    removed_duplicate_tool_uses: usize,
+    renamed_duplicate_tool_uses: usize,
     removed_orphan_tool_results: usize,
+    removed_duplicate_tool_results: usize,
+    textified_duplicate_tool_results: usize,
     textified_orphan_tool_results: usize,
     removed_orphan_tool_uses: usize,
 }
@@ -2833,11 +2876,17 @@ fn repair_request(request: &mut KiroRequest) -> RepairStats {
     let history = &mut conversation_state.history;
 
     stats.removed_empty_tool_uses += strip_empty_tool_uses(history);
+    stats.removed_duplicate_tool_uses += dedupe_tool_uses(history);
+    let current_user = &mut conversation_state.current_message.user_input_message;
+    stats.renamed_duplicate_tool_uses += rename_repeated_tool_use_ids(history, current_user);
+    stats.removed_duplicate_tool_results += dedupe_history_tool_results(history);
     let history_results = repair_orphan_tool_results(history);
     stats.removed_orphan_tool_results += history_results.removed_orphan_tool_results;
     stats.textified_orphan_tool_results += history_results.textified_orphan_tool_results;
 
-    let current_user = &mut conversation_state.current_message.user_input_message;
+    let current_dedupe = dedupe_current_tool_results(current_user);
+    stats.removed_duplicate_tool_results += current_dedupe.removed_duplicate_tool_results;
+    stats.textified_duplicate_tool_results += current_dedupe.textified_duplicate_tool_results;
     let current_results = repair_current_orphan_tool_results(history, current_user);
     stats.removed_orphan_tool_results += current_results.removed_orphan_tool_results;
     stats.textified_orphan_tool_results += current_results.textified_orphan_tool_results;
@@ -2847,6 +2896,17 @@ fn repair_request(request: &mut KiroRequest) -> RepairStats {
         &current_user.user_input_message_context.tool_results,
     );
     stats
+}
+
+fn add_repair_stats_to_report(report: &mut PayloadGuardReport, repair: RepairStats) {
+    report.removed_empty_tool_uses += repair.removed_empty_tool_uses;
+    report.removed_duplicate_tool_uses += repair.removed_duplicate_tool_uses;
+    report.renamed_duplicate_tool_uses += repair.renamed_duplicate_tool_uses;
+    report.removed_orphan_tool_results += repair.removed_orphan_tool_results;
+    report.removed_duplicate_tool_results += repair.removed_duplicate_tool_results;
+    report.textified_duplicate_tool_results += repair.textified_duplicate_tool_results;
+    report.textified_orphan_tool_results += repair.textified_orphan_tool_results;
+    report.removed_orphan_tool_uses += repair.removed_orphan_tool_uses;
 }
 
 fn strip_empty_tool_uses(history: &mut [Message]) -> usize {
@@ -2865,6 +2925,170 @@ fn strip_empty_tool_uses(history: &mut [Message]) -> usize {
         }
     }
     removed
+}
+
+fn dedupe_tool_uses(history: &mut [Message]) -> usize {
+    let mut removed = 0;
+    for message in history {
+        let Message::Assistant(assistant) = message else {
+            continue;
+        };
+        let Some(tool_uses) = &mut assistant.assistant_response_message.tool_uses else {
+            continue;
+        };
+        let original_len = tool_uses.len();
+        let mut seen = HashSet::new();
+        tool_uses.retain(|tool_use| {
+            !tool_use.tool_use_id.trim().is_empty() && seen.insert(tool_use.tool_use_id.clone())
+        });
+        removed += original_len.saturating_sub(tool_uses.len());
+        if tool_uses.is_empty() {
+            assistant.assistant_response_message.tool_uses = None;
+        }
+    }
+    removed
+}
+
+fn rename_repeated_tool_use_ids(
+    history: &mut [Message],
+    current_user: &mut UserInputMessage,
+) -> usize {
+    let mut seen = HashSet::new();
+    let mut renamed = 0;
+
+    for idx in 0..history.len() {
+        let (_before, rest) = history.split_at_mut(idx);
+        let Some((current, after)) = rest.split_first_mut() else {
+            continue;
+        };
+        let Message::Assistant(assistant) = current else {
+            continue;
+        };
+        let Some(tool_uses) = &mut assistant.assistant_response_message.tool_uses else {
+            continue;
+        };
+
+        let mut next_results: Option<&mut Vec<ToolResult>> = if after.is_empty() {
+            Some(&mut current_user.user_input_message_context.tool_results)
+        } else {
+            match after.split_first_mut() {
+                Some((Message::User(user), _)) => Some(
+                    &mut user
+                        .user_input_message
+                        .user_input_message_context
+                        .tool_results,
+                ),
+                _ => None,
+            }
+        };
+
+        for tool_use in tool_uses.iter_mut() {
+            let tool_use_id = tool_use.tool_use_id.trim().to_string();
+            if tool_use_id.is_empty() {
+                continue;
+            }
+            if seen.insert(tool_use_id.clone()) {
+                continue;
+            }
+
+            let new_id = make_unique_duplicate_tool_use_id(&tool_use_id, &seen, idx);
+            if let Some(results) = next_results.as_deref_mut() {
+                rename_matching_tool_results(results, &tool_use_id, &new_id);
+            }
+            tool_use.tool_use_id = new_id.clone();
+            seen.insert(new_id);
+            renamed += 1;
+        }
+    }
+
+    renamed
+}
+
+fn make_unique_duplicate_tool_use_id(
+    original_id: &str,
+    seen: &HashSet<String>,
+    assistant_index: usize,
+) -> String {
+    let mut candidate_index = 1usize;
+    loop {
+        let candidate = format!(
+            "{}__dup{}_{}",
+            original_id, assistant_index, candidate_index
+        );
+        if !seen.contains(&candidate) {
+            return candidate;
+        }
+        candidate_index += 1;
+    }
+}
+
+fn rename_matching_tool_results(results: &mut [ToolResult], old_id: &str, new_id: &str) {
+    for result in results {
+        if result.tool_use_id == old_id {
+            result.tool_use_id = new_id.to_string();
+        }
+    }
+}
+
+fn dedupe_history_tool_results(history: &mut [Message]) -> usize {
+    let mut removed = 0;
+    for message in history {
+        let Message::User(user) = message else {
+            continue;
+        };
+        removed += dedupe_tool_results_keep_first(
+            &mut user
+                .user_input_message
+                .user_input_message_context
+                .tool_results,
+            &mut user.user_input_message.content,
+            false,
+        )
+        .removed_duplicate_tool_results;
+    }
+    removed
+}
+
+fn dedupe_current_tool_results(user: &mut UserInputMessage) -> RepairStats {
+    dedupe_tool_results_keep_first(
+        &mut user.user_input_message_context.tool_results,
+        &mut user.content,
+        true,
+    )
+}
+
+fn dedupe_tool_results_keep_first(
+    results: &mut Vec<ToolResult>,
+    content: &mut String,
+    textify_duplicates: bool,
+) -> RepairStats {
+    let mut stats = RepairStats::default();
+    if results.len() <= 1 {
+        return stats;
+    }
+
+    let original_len = results.len();
+    let mut seen = HashSet::new();
+    let mut duplicate_text = Vec::new();
+    results.retain(|result| {
+        let keep = !result.tool_use_id.trim().is_empty() && seen.insert(result.tool_use_id.clone());
+        if !keep && textify_duplicates {
+            if let Some(text) = tool_result_to_text(result) {
+                duplicate_text.push(format!(
+                    "[duplicate tool result {}]\n{}",
+                    result.tool_use_id, text
+                ));
+            }
+        }
+        keep
+    });
+
+    stats.removed_duplicate_tool_results += original_len.saturating_sub(results.len());
+    stats.textified_duplicate_tool_results += duplicate_text.len();
+    if !duplicate_text.is_empty() {
+        append_text(content, &duplicate_text.join("\n\n"));
+    }
+    stats
 }
 
 fn repair_orphan_tool_results(history: &mut [Message]) -> RepairStats {
@@ -3235,6 +3459,151 @@ mod tests {
     }
 
     #[test]
+    fn guard_renames_repeated_tool_use_ids_and_matching_results() {
+        let assistant_one = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new("first tool call")
+                .with_tool_uses(vec![ToolUseEntry::new("tool-1", "readFile")]),
+        };
+        let mut result_one = HistoryUserMessage::new("first result", TEST_MODEL);
+        result_one.user_input_message.user_input_message_context = UserInputMessageContext::new()
+            .with_tool_results(vec![ToolResult::success("tool-1", "first content")]);
+
+        let assistant_two = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new("second tool call")
+                .with_tool_uses(vec![ToolUseEntry::new("tool-1", "readFile")]),
+        };
+        let mut result_two = HistoryUserMessage::new("second result", TEST_MODEL);
+        result_two.user_input_message.user_input_message_context = UserInputMessageContext::new()
+            .with_tool_results(vec![ToolResult::success("tool-1", "second content")]);
+
+        let mut request = request_with_history(vec![
+            Message::User(HistoryUserMessage::new("read first", TEST_MODEL)),
+            Message::Assistant(assistant_one),
+            Message::User(result_one),
+            Message::Assistant(assistant_two),
+            Message::User(result_two),
+        ]);
+
+        let (_body, report) =
+            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+
+        assert_eq!(report.renamed_duplicate_tool_uses, 1);
+        assert_eq!(report.removed_orphan_tool_uses, 0);
+        assert_eq!(report.removed_orphan_tool_results, 0);
+
+        let Message::Assistant(assistant) = &request.conversation_state.history[3] else {
+            panic!("expected second assistant");
+        };
+        let renamed_id = assistant
+            .assistant_response_message
+            .tool_uses
+            .as_ref()
+            .expect("tool use")
+            .first()
+            .expect("first tool use")
+            .tool_use_id
+            .clone();
+        assert_ne!(renamed_id, "tool-1");
+        let Message::User(user) = &request.conversation_state.history[4] else {
+            panic!("expected second result user");
+        };
+        assert_eq!(
+            user.user_input_message
+                .user_input_message_context
+                .tool_results[0]
+                .tool_use_id,
+            renamed_id
+        );
+    }
+
+    #[test]
+    fn guard_renames_repeated_tool_use_id_for_current_result() {
+        let assistant_one = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new("first tool call")
+                .with_tool_uses(vec![ToolUseEntry::new("tool-1", "readFile")]),
+        };
+        let mut result_one = HistoryUserMessage::new("first result", TEST_MODEL);
+        result_one.user_input_message.user_input_message_context = UserInputMessageContext::new()
+            .with_tool_results(vec![ToolResult::success("tool-1", "first content")]);
+        let assistant_two = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new("current tool call")
+                .with_tool_uses(vec![ToolUseEntry::new("tool-1", "readFile")]),
+        };
+        let mut request = request_with_history(vec![
+            Message::User(HistoryUserMessage::new("read first", TEST_MODEL)),
+            Message::Assistant(assistant_one),
+            Message::User(result_one),
+            Message::Assistant(assistant_two),
+        ]);
+        request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context = UserInputMessageContext::new()
+            .with_tool_results(vec![ToolResult::success("tool-1", "current content")]);
+
+        let (_body, report) =
+            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+
+        assert_eq!(report.renamed_duplicate_tool_uses, 1);
+        let Message::Assistant(assistant) = request.conversation_state.history.last().unwrap()
+        else {
+            panic!("expected last assistant");
+        };
+        let renamed_id = &assistant
+            .assistant_response_message
+            .tool_uses
+            .as_ref()
+            .expect("tool use")[0]
+            .tool_use_id;
+        assert_eq!(
+            &request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tool_results[0]
+                .tool_use_id,
+            renamed_id
+        );
+    }
+
+    #[test]
+    fn guard_textifies_duplicate_current_tool_results() {
+        let assistant = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new("tool call").with_tool_uses(vec![
+                ToolUseEntry::new("tool-1", "readFile"),
+                ToolUseEntry::new("tool-2", "readFile"),
+            ]),
+        };
+        let mut request = request_with_history(vec![
+            Message::User(HistoryUserMessage::new("read", TEST_MODEL)),
+            Message::Assistant(assistant),
+        ]);
+        request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context = UserInputMessageContext::new().with_tool_results(vec![
+            ToolResult::success("tool-1", "first result"),
+            ToolResult::success("tool-1", "duplicate result"),
+            ToolResult::success("tool-2", "second result"),
+        ]);
+
+        let (_body, report) =
+            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+
+        assert_eq!(report.removed_duplicate_tool_results, 1);
+        assert_eq!(report.textified_duplicate_tool_results, 1);
+        let current = &request
+            .conversation_state
+            .current_message
+            .user_input_message;
+        assert_eq!(current.user_input_message_context.tool_results.len(), 2);
+        assert!(current.content.contains("duplicate result"));
+    }
+
+    #[test]
     fn guard_marks_oversized_without_rejecting_current_message() {
         let mut request = KiroRequest {
             conversation_state: ConversationState::new("conv-test").with_current_message(
@@ -3306,7 +3675,11 @@ mod tests {
             trimmed_history_entries: 2,
             aligned_leading_entries: 1,
             removed_empty_tool_uses: 1,
+            removed_duplicate_tool_uses: 1,
+            renamed_duplicate_tool_uses: 1,
             removed_orphan_tool_results: 1,
+            removed_duplicate_tool_results: 1,
+            textified_duplicate_tool_results: 1,
             textified_orphan_tool_results: 1,
             removed_orphan_tool_uses: 1,
             truncated_history_tool_results: 1,
@@ -3331,6 +3704,10 @@ mod tests {
         let header = report.warning_header_fragment().expect("header");
         assert!(header.contains("payload-trimmed-history=2"));
         assert!(header.contains("payload-empty-tool-uses=1"));
+        assert!(header.contains("payload-duplicate-tool-uses=1"));
+        assert!(header.contains("payload-renamed-duplicate-tool-uses=1"));
+        assert!(header.contains("payload-duplicate-tool-results=1"));
+        assert!(header.contains("payload-textified-duplicate-tool-results=1"));
         assert!(header.contains("payload-textified-tool-results=1"));
         assert!(header.contains("payload-history-tool-results-truncated=1"));
         assert!(header.contains("payload-tools-compressed=1"));

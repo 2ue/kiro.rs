@@ -3,7 +3,7 @@
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex, OnceLock},
 };
 
@@ -709,41 +709,30 @@ fn is_native_claude_family_model(model: &str, family: &str) -> bool {
 
 /// 根据模型名称返回对应的上下文窗口大小
 ///
-/// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
-/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// 4.7 同 1M
+/// 这是仅在 Kiro `ListAvailableModels` 能力目录缺失时使用的保守兜底。
+/// 真实请求应优先使用上游目录中的 `maxInputTokens`；同名/同族模型在不同
+/// 账号池中可能是 200K 或 1M，不能仅凭普通别名把 free Sonnet 误抬成 1M。
 pub fn get_context_window_size(model: &str) -> i32 {
-    let base = strip_model_1m_suffix(model);
-    if base == "claude-opus-4-7"
-        || base == "claude-opus-4-7-thinking"
-        || base == "claude-opus-4-6"
-        || base == "claude-opus-4-6-thinking"
-        || base == "claude-sonnet-4-6"
-        || base == "claude-sonnet-4-6-thinking"
-    {
-        return 200_000;
+    let model_lower = model.to_lowercase();
+    let explicit_one_m = model_lower.ends_with("[1m]");
+    let base = strip_model_1m_suffix(&model_lower);
+
+    if base == "auto" {
+        return 1_000_000;
     }
 
-    if base == "auto"
+    if explicit_one_m
         || base == "claude-opus-4.7"
         || base == "claude-opus-4.7-thinking"
         || base == "claude-opus-4.6"
         || base == "claude-opus-4.6-thinking"
         || base == "claude-sonnet-4.6"
+        || base == "claude-sonnet-4.6-thinking"
     {
         return 1_000_000;
     }
 
-    match map_model(model) {
-        Some(mapped)
-            if mapped == "claude-sonnet-4.6"
-                || mapped == "claude-opus-4.6"
-                || mapped == "claude-opus-4.7" =>
-        {
-            1_000_000
-        }
-        _ => 200_000,
-    }
+    200_000
 }
 
 /// 转换结果
@@ -808,8 +797,12 @@ pub struct ProxyWarnings {
     pub orphan_tool_uses: u32,
     /// 历史中重复出现的 tool_result（已配对过）被跳过
     pub duplicate_tool_results: u32,
+    /// 重复 tool_result 被转成普通文本保留的次数
+    pub duplicate_tool_results_textified: u32,
     /// user 消息只有 tool_result 且文本为空时补了 Kiro content 占位
     pub tool_result_content_placeholders: u32,
+    /// user 消息没有文本也没有 tool_result 时补了 Continue 占位
+    pub empty_content_placeholders: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -846,10 +839,22 @@ impl ProxyWarnings {
                 self.duplicate_tool_results
             ));
         }
+        if self.duplicate_tool_results_textified > 0 {
+            parts.push(format!(
+                "duplicate-tool-result-textified={}",
+                self.duplicate_tool_results_textified
+            ));
+        }
         if self.tool_result_content_placeholders > 0 {
             parts.push(format!(
                 "tool-result-content-placeholder={}",
                 self.tool_result_content_placeholders
+            ));
+        }
+        if self.empty_content_placeholders > 0 {
+            parts.push(format!(
+                "empty-content-placeholder={}",
+                self.empty_content_placeholders
             ));
         }
         if parts.is_empty() {
@@ -1145,9 +1150,14 @@ fn convert_request_with_model_id(
     if !options.is_strict() {
         append_orphan_tool_result_texts(&mut content, &orphan_tool_result_texts);
     }
-    if content.trim().is_empty() && !context.tool_results.is_empty() {
-        content = " ".to_string();
-        warnings.tool_result_content_placeholders += 1;
+    if content.trim().is_empty() {
+        if !context.tool_results.is_empty() {
+            content = " ".to_string();
+            warnings.tool_result_content_placeholders += 1;
+        } else {
+            content = "Continue".to_string();
+            warnings.empty_content_placeholders += 1;
+        }
     }
 
     let mut user_input = UserInputMessage::new(content, &model_id)
@@ -1637,23 +1647,23 @@ fn validate_tool_pairing(
 ) {
     use std::collections::HashSet;
 
-    // 1. 收集所有历史中的 tool_use_id
-    let mut all_tool_use_ids: HashSet<String> = HashSet::new();
-    // 2. 收集历史中已经有 tool_result 的 tool_use_id
-    let mut history_tool_result_ids: HashSet<String> = HashSet::new();
+    let current_tool_use_ids = last_assistant_tool_use_ids_for_converter(history);
+    let mut unpaired_tool_use_ids = current_tool_use_ids.clone();
+    let mut all_tool_use_ids = HashSet::new();
+    let mut history_tool_result_ids = HashSet::new();
+    let mut current_paired_tool_use_ids = HashSet::new();
 
-    for msg in history {
-        match msg {
-            Message::Assistant(assistant_msg) => {
-                if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
+    for message in history {
+        match message {
+            Message::Assistant(assistant) => {
+                if let Some(tool_uses) = &assistant.assistant_response_message.tool_uses {
                     for tool_use in tool_uses {
                         all_tool_use_ids.insert(tool_use.tool_use_id.clone());
                     }
                 }
             }
-            Message::User(user_msg) => {
-                // 收集历史 user 消息中的 tool_results
-                for result in &user_msg
+            Message::User(user) => {
+                for result in &user
                     .user_input_message
                     .user_input_message_context
                     .tool_results
@@ -1664,26 +1674,46 @@ fn validate_tool_pairing(
         }
     }
 
-    // 3. 计算真正未配对的 tool_use_ids（排除历史中已配对的）
-    let mut unpaired_tool_use_ids: HashSet<String> = all_tool_use_ids
-        .difference(&history_tool_result_ids)
-        .cloned()
-        .collect();
-
-    // 4. 过滤并验证当前消息的 tool_results
     let mut filtered_results = Vec::new();
     let mut orphan_tool_result_texts = Vec::new();
+    let mut seen_current_results = HashSet::new();
 
     for result in tool_results {
-        if unpaired_tool_use_ids.contains(&result.tool_use_id) {
+        if current_tool_use_ids.contains(&result.tool_use_id)
+            && seen_current_results.insert(result.tool_use_id.clone())
+        {
             // 配对成功
             filtered_results.push(result.clone());
             unpaired_tool_use_ids.remove(&result.tool_use_id);
-        } else if all_tool_use_ids.contains(&result.tool_use_id) {
-            // tool_use 存在但已经在历史中配对过了，这是重复的 tool_result
+            current_paired_tool_use_ids.insert(result.tool_use_id.clone());
+        } else if current_tool_use_ids.contains(&result.tool_use_id) {
+            // 当前消息中同一个 tool_use_id 多次返回，仅保留第一条结构化结果。
             warnings.duplicate_tool_results += 1;
+            if let Some(text) = kiro_tool_result_to_text(result) {
+                warnings.duplicate_tool_results_textified += 1;
+                orphan_tool_result_texts.push(format!(
+                    "[duplicate tool result {}]\n{}",
+                    result.tool_use_id, text
+                ));
+            }
             tracing::warn!(
-                "跳过重复的 tool_result：该 tool_use 已在历史中配对，tool_use_id={}",
+                "跳过重复的当前结构化 tool_result，并在兼容模式下转为普通文本：tool_use_id={}",
+                result.tool_use_id
+            );
+        } else if history_tool_result_ids.contains(&result.tool_use_id)
+            || all_tool_use_ids.contains(&result.tool_use_id)
+        {
+            // 不属于最后一条 assistant 的 tool_result 不能作为当前结构化结果继续发送。
+            warnings.orphan_tool_results += 1;
+            if let Some(text) = kiro_tool_result_to_text(result) {
+                warnings.orphan_tool_results_textified += 1;
+                orphan_tool_result_texts.push(format!(
+                    "[orphan tool result {}]\n{}",
+                    result.tool_use_id, text
+                ));
+            }
+            tracing::warn!(
+                "tool_result 不属于最后一条 assistant tool_use，已从 tool_results 移除并在兼容模式下转为普通文本，tool_use_id={}",
                 result.tool_use_id
             );
         } else {
@@ -1703,7 +1733,11 @@ fn validate_tool_pairing(
         }
     }
 
-    // 5. 检测真正孤立的 tool_use（有 tool_use 但在历史和当前消息中都没有 tool_result）
+    for orphaned_id in unpaired_historical_tool_use_ids(history, &current_paired_tool_use_ids) {
+        unpaired_tool_use_ids.insert(orphaned_id);
+    }
+
+    // 检测真正孤立的 tool_use（有 tool_use 但在历史和当前消息中都没有 tool_result）
     for orphaned_id in &unpaired_tool_use_ids {
         warnings.orphan_tool_uses += 1;
         tracing::warn!(
@@ -1717,6 +1751,58 @@ fn validate_tool_pairing(
         unpaired_tool_use_ids,
         orphan_tool_result_texts,
     )
+}
+
+fn last_assistant_tool_use_ids_for_converter(history: &[Message]) -> HashSet<String> {
+    history
+        .last()
+        .and_then(|message| match message {
+            Message::Assistant(assistant) => {
+                assistant.assistant_response_message.tool_uses.as_ref()
+            }
+            Message::User(_) => None,
+        })
+        .map(|tool_uses| {
+            tool_uses
+                .iter()
+                .map(|tool_use| tool_use.tool_use_id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn unpaired_historical_tool_use_ids(
+    history: &[Message],
+    current_paired_tool_use_ids: &HashSet<String>,
+) -> HashSet<String> {
+    let mut orphaned = HashSet::new();
+    for (idx, message) in history.iter().enumerate() {
+        let Message::Assistant(assistant) = message else {
+            continue;
+        };
+        let Some(tool_uses) = &assistant.assistant_response_message.tool_uses else {
+            continue;
+        };
+        let mut paired_ids = match history.get(idx + 1) {
+            Some(Message::User(user)) => user
+                .user_input_message
+                .user_input_message_context
+                .tool_results
+                .iter()
+                .map(|result| result.tool_use_id.clone())
+                .collect::<HashSet<_>>(),
+            _ => HashSet::new(),
+        };
+        if idx + 1 == history.len() {
+            paired_ids.extend(current_paired_tool_use_ids.iter().cloned());
+        }
+        for tool_use in tool_uses {
+            if !paired_ids.contains(&tool_use.tool_use_id) {
+                orphaned.insert(tool_use.tool_use_id.clone());
+            }
+        }
+    }
+    orphaned
 }
 
 fn kiro_tool_result_to_text(result: &ToolResult) -> Option<String> {
@@ -2545,11 +2631,15 @@ mod tests {
     #[test]
     fn test_context_window_size_for_kiro_auto_and_dash_variants() {
         assert_eq!(get_context_window_size("auto"), 1_000_000);
+        assert_eq!(get_context_window_size("sonnet"), 200_000);
+        assert_eq!(get_context_window_size("opus"), 200_000);
         assert_eq!(get_context_window_size("claude-opus-4.7"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-sonnet-4.6"), 1_000_000);
         assert_eq!(
             get_context_window_size("claude-opus-4.7-thinking[1m]"),
             1_000_000
         );
+        assert_eq!(get_context_window_size("claude-sonnet-4-6[1m]"), 1_000_000);
         assert_eq!(get_context_window_size("claude-opus-4-7"), 200_000);
         assert_eq!(get_context_window_size("claude-sonnet-4-6"), 200_000);
     }
@@ -3094,6 +3184,35 @@ mod tests {
         assert_eq!(current.content, " ");
         assert_eq!(current.user_input_message_context.tool_results.len(), 1);
         assert_eq!(result.warnings.tool_result_content_placeholders, 1);
+    }
+
+    #[test]
+    fn current_empty_user_message_gets_continue_placeholder() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!(""),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let current = &result.conversation_state.current_message.user_input_message;
+
+        assert_eq!(current.content, "Continue");
+        assert!(current.user_input_message_context.tool_results.is_empty());
+        assert_eq!(result.warnings.empty_content_placeholders, 1);
+        assert_eq!(result.warnings.tool_result_content_placeholders, 0);
     }
 
     #[test]
@@ -3779,6 +3898,130 @@ mod tests {
 
         // 重复的 tool_result 应该被过滤掉
         assert!(filtered.is_empty(), "重复的 tool_result 应该被过滤");
+    }
+
+    #[test]
+    fn test_validate_tool_pairing_textifies_duplicate_current_result() {
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+
+        let mut assistant_msg = AssistantMessage::new("I'll read the file.");
+        assistant_msg = assistant_msg.with_tool_uses(vec![
+            ToolUseEntry::new("tool-1", "read")
+                .with_input(serde_json::json!({"path": "/test.txt"})),
+        ]);
+
+        let history = vec![
+            Message::User(HistoryUserMessage::new(
+                "Read the file",
+                "claude-sonnet-4.5",
+            )),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: assistant_msg,
+            }),
+        ];
+
+        let tool_results = vec![
+            ToolResult::success("tool-1", "first result"),
+            ToolResult::success("tool-1", "duplicate result"),
+        ];
+        let mut warnings = ProxyWarnings::default();
+
+        let (filtered, orphaned, textified) =
+            validate_tool_pairing(&history, &tool_results, &mut warnings);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].tool_use_id, "tool-1");
+        assert!(orphaned.is_empty());
+        assert_eq!(textified.len(), 1);
+        assert!(textified[0].contains("duplicate result"));
+        assert_eq!(warnings.duplicate_tool_results, 1);
+        assert_eq!(warnings.duplicate_tool_results_textified, 1);
+    }
+
+    #[test]
+    fn test_validate_tool_pairing_allows_current_result_for_reused_last_tool_use_id() {
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+
+        let mut first_assistant = AssistantMessage::new("First read.");
+        first_assistant = first_assistant.with_tool_uses(vec![
+            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({"path": "/a"})),
+        ]);
+
+        let mut first_result_user = UserMessage::new(" ", "claude-sonnet-4.5");
+        let mut first_ctx = UserInputMessageContext::new();
+        first_ctx = first_ctx.with_tool_results(vec![ToolResult::success("tool-1", "first")]);
+        first_result_user = first_result_user.with_context(first_ctx);
+
+        let mut second_assistant = AssistantMessage::new("Second read.");
+        second_assistant = second_assistant.with_tool_uses(vec![
+            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({"path": "/b"})),
+        ]);
+
+        let history = vec![
+            Message::User(HistoryUserMessage::new("Read A", "claude-sonnet-4.5")),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: first_assistant,
+            }),
+            Message::User(HistoryUserMessage {
+                user_input_message: first_result_user,
+            }),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: second_assistant,
+            }),
+        ];
+
+        let tool_results = vec![ToolResult::success("tool-1", "second")];
+
+        let (filtered, orphaned, orphan_texts) =
+            validate_tool_pairing(&history, &tool_results, &mut ProxyWarnings::default());
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].tool_use_id, "tool-1");
+        assert!(orphaned.is_empty());
+        assert!(orphan_texts.is_empty());
+    }
+
+    #[test]
+    fn test_validate_tool_pairing_textifies_result_for_non_adjacent_tool_use() {
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+
+        let mut first_assistant = AssistantMessage::new("First read.");
+        first_assistant = first_assistant.with_tool_uses(vec![
+            ToolUseEntry::new("tool-1", "read").with_input(serde_json::json!({"path": "/a"})),
+        ]);
+
+        let mut first_result_user = UserMessage::new(" ", "claude-sonnet-4.5");
+        let mut first_ctx = UserInputMessageContext::new();
+        first_ctx = first_ctx.with_tool_results(vec![ToolResult::success("tool-1", "first")]);
+        first_result_user = first_result_user.with_context(first_ctx);
+
+        let mut second_assistant = AssistantMessage::new("Second read.");
+        second_assistant = second_assistant.with_tool_uses(vec![
+            ToolUseEntry::new("tool-2", "read").with_input(serde_json::json!({"path": "/b"})),
+        ]);
+
+        let history = vec![
+            Message::User(HistoryUserMessage::new("Read A", "claude-sonnet-4.5")),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: first_assistant,
+            }),
+            Message::User(HistoryUserMessage {
+                user_input_message: first_result_user,
+            }),
+            Message::Assistant(HistoryAssistantMessage {
+                assistant_response_message: second_assistant,
+            }),
+        ];
+
+        let tool_results = vec![ToolResult::success("tool-1", "stale repeat")];
+
+        let (filtered, orphaned, orphan_texts) =
+            validate_tool_pairing(&history, &tool_results, &mut ProxyWarnings::default());
+
+        assert!(filtered.is_empty());
+        assert!(orphaned.contains("tool-2"));
+        assert_eq!(orphan_texts.len(), 1);
+        assert!(orphan_texts[0].contains("stale repeat"));
     }
 
     #[test]

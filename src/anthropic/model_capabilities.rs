@@ -1337,6 +1337,64 @@ mod tests {
     }
 
     #[test]
+    fn catalog_context_window_for_sonnet_follows_real_upstream_model() {
+        let catalog = ModelCapabilitiesCatalog::new();
+        catalog.sync_from_kiro_models(vec![
+            KiroAvailableModel {
+                model_id: "claude-sonnet-4.5".to_string(),
+                model_name: Some("Claude Sonnet 4.5".to_string()),
+                token_limits: Some(KiroModelTokenLimits {
+                    max_input_tokens: Some(200_000),
+                    max_output_tokens: Some(64_000),
+                }),
+                ..Default::default()
+            },
+            KiroAvailableModel {
+                model_id: "claude-sonnet-4.6".to_string(),
+                model_name: Some("Claude Sonnet 4.6".to_string()),
+                token_limits: Some(KiroModelTokenLimits {
+                    max_input_tokens: Some(1_000_000),
+                    max_output_tokens: Some(64_000),
+                }),
+                ..Default::default()
+            },
+        ]);
+
+        let exact = catalog.resolve_model("claude-sonnet-4.6");
+        assert_eq!(exact.upstream_model.as_deref(), Some("claude-sonnet-4.6"));
+        assert_eq!(
+            exact
+                .upstream_model
+                .as_deref()
+                .and_then(|model| catalog.max_input_tokens_for(model)),
+            Some(1_000_000)
+        );
+
+        let free_catalog = ModelCapabilitiesCatalog::new();
+        free_catalog.sync_from_kiro_models(vec![KiroAvailableModel {
+            model_id: "claude-sonnet-4.5".to_string(),
+            model_name: Some("Claude Sonnet 4.5".to_string()),
+            token_limits: Some(KiroModelTokenLimits {
+                max_input_tokens: Some(200_000),
+                max_output_tokens: Some(64_000),
+            }),
+            ..Default::default()
+        }]);
+        let normalized = free_catalog.resolve_model("claude-sonnet-4-6");
+        assert_eq!(
+            normalized.upstream_model.as_deref(),
+            Some("claude-sonnet-4.5")
+        );
+        assert_eq!(
+            normalized
+                .upstream_model
+                .as_deref()
+                .and_then(|model| free_catalog.max_input_tokens_for(model)),
+            Some(200_000)
+        );
+    }
+
+    #[test]
     fn sync_from_kiro_models_preserves_claude_alias_targets_when_sync_omits_all_claude_models() {
         let catalog = ModelCapabilitiesCatalog::new();
         let status = catalog.sync_from_kiro_models(vec![KiroAvailableModel {

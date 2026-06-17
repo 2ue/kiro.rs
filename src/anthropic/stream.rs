@@ -2668,6 +2668,77 @@ mod tests {
     }
 
     #[test]
+    fn test_context_usage_percentage_uses_catalog_window_for_final_usage() {
+        use crate::kiro::model::events::ContextUsageEvent;
+
+        let mut ctx = StreamContext::new_with_simulation(
+            "claude-sonnet-4.5",
+            1_000,
+            200_000,
+            false,
+            true,
+            HashMap::new(),
+            None,
+            PromptCacheSimulationMode::Disabled,
+        );
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_assistant_response("ok"));
+        all_events.extend(
+            ctx.process_kiro_event(&Event::ContextUsage(ContextUsageEvent {
+                context_usage_percentage: 12.5,
+            })),
+        );
+        all_events.extend(ctx.generate_final_events());
+
+        let message_delta = all_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta should exist");
+        assert_eq!(ctx.context_input_tokens, Some(25_000));
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 25_000);
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn test_context_usage_100_percent_reports_context_window_exceeded() {
+        use crate::kiro::model::events::ContextUsageEvent;
+
+        let mut ctx = StreamContext::new_with_simulation(
+            "claude-sonnet-4.6",
+            1_000,
+            1_000_000,
+            false,
+            true,
+            HashMap::new(),
+            None,
+            PromptCacheSimulationMode::Disabled,
+        );
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_assistant_response("near limit"));
+        all_events.extend(
+            ctx.process_kiro_event(&Event::ContextUsage(ContextUsageEvent {
+                context_usage_percentage: 100.0,
+            })),
+        );
+        all_events.extend(ctx.generate_final_events());
+
+        let message_delta = all_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta should exist");
+        assert_eq!(ctx.context_input_tokens, Some(1_000_000));
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 1_000_000);
+        assert_eq!(
+            message_delta.data["delta"]["stop_reason"],
+            "model_context_window_exceeded"
+        );
+    }
+
+    #[test]
     fn test_code_event_is_forwarded_as_text_content() {
         use crate::kiro::model::events::CodeEvent;
 

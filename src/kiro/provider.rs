@@ -3051,7 +3051,9 @@ impl KiroProvider {
             "profile_arn_bad_request" => {
                 "profileArn 协议错误，请检查 authMethod/provider/profileArn 解析结果"
             }
-            "malformed_request" => "请求体结构错误，请检查 Anthropic 到 Kiro 的 payload 转换",
+            "malformed_request" => {
+                "请求体结构错误，请检查消息顺序、工具调用结果配对、工具 schema、多模态内容或请求体大小"
+            }
             _ => "请求参数错误",
         }
     }
