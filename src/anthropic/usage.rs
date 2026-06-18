@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration as StdDuration;
@@ -19,6 +19,8 @@ const DEFAULT_PAGE_QUERY_LIMIT: usize = 20;
 const MAX_QUERY_LIMIT: usize = 1000;
 const USAGE_WRITER_QUEUE_CAPACITY: usize = 4096;
 const USAGE_WRITER_MAX_ATTEMPTS: u32 = 3;
+const USAGE_DASHBOARD_REDIS_TIMEOUT_SECS: u64 = 2;
+const USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS: u64 = 5;
 pub const REALTIME_USAGE_WINDOW_SECS: u32 = 60;
 pub const DEFAULT_USAGE_DASHBOARD_TIMEZONE: &str = "Asia/Shanghai";
 
@@ -733,6 +735,12 @@ pub struct UsageRecorder {
     dropped_persist_records: AtomicU64,
 }
 
+enum UsageDashboardCacheRead {
+    Hit(UsageDashboardResponse),
+    Empty,
+    Timeout,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CredentialCostSummary {
     pub estimated_cost_usd: f64,
@@ -981,13 +989,29 @@ impl UsageRecorder {
             let redis = redis.clone();
             let timezone = timezone.map(str::to_string);
             match block_on_usage_store(async move {
-                redis
-                    .usage_dashboard(timezone.as_deref(), high_cache_threshold)
-                    .await
+                match tokio::time::timeout(
+                    StdDuration::from_secs(USAGE_DASHBOARD_REDIS_TIMEOUT_SECS),
+                    redis.usage_dashboard(timezone.as_deref(), high_cache_threshold),
+                )
+                .await
+                {
+                    Ok(Ok(Some(dashboard))) => Ok(UsageDashboardCacheRead::Hit(dashboard)),
+                    Ok(Ok(None)) => Ok(UsageDashboardCacheRead::Empty),
+                    Ok(Err(err)) => Err(err),
+                    Err(_) => Ok(UsageDashboardCacheRead::Timeout),
+                }
             }) {
-                Ok(Some(dashboard)) => return Ok(dashboard),
-                Ok(None) => {}
-                Err(err) => tracing::warn!("读取 Redis usage dashboard 失败，回退 PgSQL: {}", err),
+                Ok(UsageDashboardCacheRead::Hit(dashboard)) => return Ok(dashboard),
+                Ok(UsageDashboardCacheRead::Empty) => {}
+                Ok(UsageDashboardCacheRead::Timeout) => {
+                    anyhow::bail!(
+                        "读取 Redis usage dashboard 超过 {} 秒，已中止本次后台查询",
+                        USAGE_DASHBOARD_REDIS_TIMEOUT_SECS
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!("读取 Redis usage dashboard 失败，回退 PgSQL: {}", err)
+                }
             }
         }
 
@@ -995,9 +1019,18 @@ impl UsageRecorder {
             let store = store.clone();
             let timezone = timezone.map(str::to_string);
             return block_on_usage_store(async move {
-                store
-                    .dashboard(timezone.as_deref(), high_cache_threshold)
-                    .await
+                match tokio::time::timeout(
+                    StdDuration::from_secs(USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS),
+                    store.dashboard(timezone.as_deref(), high_cache_threshold),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => anyhow::bail!(
+                        "读取 PgSQL usage dashboard 超过 {} 秒，已中止本次后台查询",
+                        USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS
+                    ),
+                }
             });
         }
 
@@ -1168,12 +1201,58 @@ impl UsageRecorder {
         self.credential_cost_summary_memory()
     }
 
+    pub fn credential_cost_summary_for_ids(
+        &self,
+        ids: &[u64],
+    ) -> HashMap<u64, CredentialCostSummary> {
+        if ids.is_empty() {
+            return HashMap::new();
+        }
+        if let Some(store) = &self.postgres_store {
+            let store = store.clone();
+            let ids = ids.to_vec();
+            let fallback_ids = ids.clone();
+            return block_on_usage_store(async move {
+                store.credential_cost_summary_for_ids(&ids).await
+            })
+            .unwrap_or_else(|err| {
+                tracing::warn!("按 ID 汇总 PgSQL 凭据费用失败，回退内存记录: {}", err);
+                self.credential_cost_summary_memory_for_ids(fallback_ids.as_slice())
+            });
+        }
+        self.credential_cost_summary_memory_for_ids(ids)
+    }
+
     fn credential_cost_summary_memory(&self) -> HashMap<u64, CredentialCostSummary> {
         let mut summaries: HashMap<u64, CredentialCostSummary> = HashMap::new();
         for record in self.records.lock().iter() {
             let Some(credential_id) = record.credential_id else {
                 continue;
             };
+            let entry = summaries.entry(credential_id).or_default();
+            entry.estimated_cost_usd += record.estimated_cost_usd;
+            if record.pricing_available {
+                entry.priced_requests += 1;
+            } else {
+                entry.unpriced_requests += 1;
+            }
+        }
+        summaries
+    }
+
+    fn credential_cost_summary_memory_for_ids(
+        &self,
+        ids: &[u64],
+    ) -> HashMap<u64, CredentialCostSummary> {
+        let wanted: HashSet<u64> = ids.iter().copied().collect();
+        let mut summaries: HashMap<u64, CredentialCostSummary> = HashMap::new();
+        for record in self.records.lock().iter() {
+            let Some(credential_id) = record.credential_id else {
+                continue;
+            };
+            if !wanted.contains(&credential_id) {
+                continue;
+            }
             let entry = summaries.entry(credential_id).or_default();
             entry.estimated_cost_usd += record.estimated_cost_usd;
             if record.pricing_available {

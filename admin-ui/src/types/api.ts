@@ -18,6 +18,30 @@ export interface CredentialsPageResponse extends CredentialsStatusResponse {
   filteredAvailable: number
 }
 
+export interface CredentialListResponse {
+  page: number
+  limit: number
+  total: number
+  available: number
+  filteredTotal: number
+  filteredAvailable: number
+  totalPages: number
+  items: CredentialListItem[]
+}
+
+export interface CredentialSummaryResponse {
+  total: number
+  available: number
+  disabled: number
+  currentId: number | null
+  globalInFlightRequests: number
+  queuedRequests: number
+  globalMaxConcurrentRequests: number
+  maxQueuedRequests: number
+  updatedAt: string
+  runtimeFresh: boolean
+}
+
 export type CredentialSortBy =
   | 'default'
   | 'id'
@@ -46,6 +70,118 @@ export interface CredentialsPageQuery {
   proxyResourceId?: number
   sortBy?: CredentialSortBy
   sortOrder?: CredentialSortOrder
+}
+
+export type CredentialListItem = Pick<
+  CredentialStatusItem,
+  | 'id'
+  | 'createdAt'
+  | 'updatedAt'
+  | 'priority'
+  | 'disabled'
+  | 'disabledReason'
+  | 'authMethod'
+  | 'region'
+  | 'authRegion'
+  | 'apiRegion'
+  | 'effectiveAuthRegion'
+  | 'effectiveApiRegion'
+  | 'hasProfileArn'
+  | 'email'
+  | 'refreshTokenHash'
+  | 'apiKeyHash'
+  | 'maskedApiKey'
+  | 'subscriptionTitle'
+  | 'hasProxy'
+  | 'proxyUrl'
+  | 'proxyUsername'
+  | 'proxyPassword'
+  | 'proxyResourceId'
+  | 'proxyResourceName'
+  | 'effectiveProxyUrl'
+  | 'effectiveProxySource'
+  | 'endpoint'
+  | 'maxConcurrentRequestsOverride'
+  | 'warmupRemaining'
+>
+
+export interface CredentialRuntimeResponse {
+  items: CredentialRuntimeItem[]
+  updatedAt: string
+  fresh: boolean
+}
+
+export interface CredentialAccountInfoListResponse {
+  items: CredentialAccountInfoItem[]
+  updatedAt: string
+  fresh: boolean
+}
+
+export interface CredentialUsageSummaryResponse {
+  items: CredentialUsageSummaryItem[]
+  updatedAt: string
+  fresh: boolean
+}
+
+export type CredentialRuntimeItem = Pick<
+  CredentialStatusItem,
+  | 'id'
+  | 'isCurrent'
+  | 'failureCount'
+  | 'refreshFailureCount'
+  | 'successCount'
+  | 'lastUsedAt'
+  | 'expiresAt'
+  | 'cooledDown'
+  | 'cooldownRemainingSecs'
+  | 'cooldownReason'
+  | 'cooldowns'
+  | 'rateLimited'
+  | 'rateLimitRemainingSecs'
+  | 'inFlightRequests'
+  | 'oldestInFlightAgeSecs'
+  | 'newestInFlightIdleSecs'
+  | 'maxConcurrentRequests'
+  | 'inFlightLeaseMaxSecs'
+  | 'transientFailureStreak'
+  | 'recentErrorRate'
+  | 'latencyEwmaMs'
+  | 'lastErrorKind'
+  | 'lastErrorReason'
+  | 'lastErrorAtMs'
+  | 'inProbation'
+  | 'probationRemainingSecs'
+  | 'schedulerSelectionCount'
+  | 'recentSchedulerSelectionCount10s'
+  | 'recentSchedulerSelectionCount60s'
+  | 'recentSchedulerSelectionCount5m'
+  | 'schedulerSelectionPressure'
+  | 'schedulerScore'
+>
+
+export interface CredentialAccountInfoItem extends CredentialAccountInfo {
+  id: number
+}
+
+export interface CredentialUsageSummaryItem {
+  id: number
+  estimatedCostUsd: number
+  pricedRequests: number
+  unpricedRequests: number
+}
+
+export interface BulkCredentialActionError {
+  id: number
+  message: string
+}
+
+export interface BulkCredentialActionResponse {
+  totalMatched: number
+  totalAttempted: number
+  success: number
+  failed: number
+  skipped: number
+  errors: BulkCredentialActionError[]
 }
 
 // 单个凭据状态
@@ -129,6 +265,10 @@ export interface CredentialAccountInfo {
   usageLimit: number
   remaining: number
   usagePercentage: number
+  creditLimit: number
+  creditRemaining: number
+  creditBase: number
+  creditBonus: number
   nextResetAt: number | null
   checkedAt: string
 }

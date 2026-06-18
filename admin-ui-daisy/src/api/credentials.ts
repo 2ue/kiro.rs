@@ -6,9 +6,17 @@ import type {
   BalanceResponse,
   BatchUpdateCredentialsRequest,
   BatchUpdateCredentialsResponse,
+  BulkCredentialActionResponse,
+  CredentialAccountInfoListResponse,
   CredentialCreditSummaryResponse,
   CredentialInfoRefreshResponse,
   CredentialExportFormat,
+  CredentialListItem,
+  CredentialListResponse,
+  CredentialRuntimeResponse,
+  CredentialSummaryResponse,
+  CredentialStatusItem,
+  CredentialUsageSummaryResponse,
   CredentialsPageQuery,
   CredentialsPageResponse,
   CredentialsStatusResponse,
@@ -44,13 +52,99 @@ import type {
   UpdateExternalPoolRequest,
 } from '@/types/api'
 
+const CREDENTIALS_LIST_PAGE_LIMIT = 500
+
+function credentialListItemToStatus(item: CredentialListItem): CredentialStatusItem {
+  return {
+    ...item,
+    failureCount: 0,
+    isCurrent: false,
+    expiresAt: null,
+    accountInfo: undefined,
+    successCount: 0,
+    lastUsedAt: null,
+    refreshFailureCount: 0,
+    cooledDown: false,
+    cooldownRemainingSecs: 0,
+    cooldowns: [],
+    rateLimited: false,
+    rateLimitRemainingSecs: 0,
+    inFlightRequests: 0,
+    oldestInFlightAgeSecs: 0,
+    newestInFlightIdleSecs: 0,
+    maxConcurrentRequests: item.maxConcurrentRequestsOverride ?? 0,
+    inFlightLeaseMaxSecs: 0,
+    warmupRemaining: item.warmupRemaining ?? 0,
+    transientFailureStreak: 0,
+    recentErrorRate: 0,
+    latencyEwmaMs: null,
+    inProbation: false,
+    probationRemainingSecs: 0,
+    schedulerSelectionCount: 0,
+    recentSchedulerSelectionCount10s: 0,
+    recentSchedulerSelectionCount60s: 0,
+    recentSchedulerSelectionCount5m: 0,
+    schedulerSelectionPressure: 0,
+    schedulerScore: 0,
+    estimatedCostUsd: 0,
+    pricedRequests: 0,
+    unpricedRequests: 0,
+  }
+}
+
 export async function getCredentials(): Promise<CredentialsStatusResponse> {
-  const { data } = await api.get<CredentialsStatusResponse>('/credentials')
-  return data
+  const first = await getCredentialList({ page: 1, limit: CREDENTIALS_LIST_PAGE_LIMIT })
+  const items = [...first.items]
+  for (let page = 2; page <= first.totalPages; page += 1) {
+    const next = await getCredentialList({ page, limit: CREDENTIALS_LIST_PAGE_LIMIT })
+    items.push(...next.items)
+  }
+
+  return {
+    total: first.total,
+    available: first.available,
+    currentId: 0,
+    globalInFlightRequests: 0,
+    queuedRequests: 0,
+    globalMaxConcurrentRequests: 0,
+    maxQueuedRequests: 0,
+    credentials: items.map(credentialListItemToStatus),
+  }
 }
 
 export async function getCredentialsPage(query: CredentialsPageQuery): Promise<CredentialsPageResponse> {
   const { data } = await api.get<CredentialsPageResponse>('/credentials-paged', { params: query })
+  return data
+}
+
+export async function getCredentialList(query: CredentialsPageQuery): Promise<CredentialListResponse> {
+  const { data } = await api.get<CredentialListResponse>('/credentials/list', { params: query })
+  return data
+}
+
+export async function getCredentialSummary(): Promise<CredentialSummaryResponse> {
+  const { data } = await api.get<CredentialSummaryResponse>('/credentials/summary')
+  return data
+}
+
+export async function getCredentialRuntime(ids: number[]): Promise<CredentialRuntimeResponse> {
+  const { data } = await api.get<CredentialRuntimeResponse>('/credentials/runtime', {
+    params: { ids: ids.join(',') },
+  })
+  return data
+}
+
+export async function getCredentialAccountInfo(ids: number[]): Promise<CredentialAccountInfoListResponse> {
+  const { data } = await api.get<CredentialAccountInfoListResponse>('/credentials/account-info', {
+    params: { ids: ids.join(',') },
+  })
+  return data
+}
+
+export async function getCredentialUsageSummary(ids: number[]): Promise<CredentialUsageSummaryResponse> {
+  const { data } = await api.get<CredentialUsageSummaryResponse>('/credentials/usage-summary', {
+    params: { ids: ids.join(',') },
+  })
   return data
 }
 
@@ -146,6 +240,11 @@ export async function addCredential(req: AddCredentialRequest): Promise<AddCrede
 
 export async function deleteCredential(id: number): Promise<SuccessResponse> {
   const { data } = await api.delete<SuccessResponse>(`/credentials/${id}`)
+  return data
+}
+
+export async function deleteDisabledCredentials(): Promise<BulkCredentialActionResponse> {
+  const { data } = await api.delete<BulkCredentialActionResponse>('/credentials/disabled')
   return data
 }
 

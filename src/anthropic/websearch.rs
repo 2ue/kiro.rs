@@ -420,10 +420,10 @@ fn generate_websearch_events(
                 "stop_reason": "end_turn"
             },
             "usage": {
+                "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
-                "server_tool_use": {
-                    "web_search_requests": 1
-                }
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0
             }
         }),
     ));
@@ -755,5 +755,36 @@ mod tests {
         assert!(summary.contains("Test Result"));
         assert!(summary.contains("https://example.com"));
         assert!(summary.contains("This is a test snippet"));
+    }
+
+    #[test]
+    fn test_websearch_usage_is_sub2api_compatible() {
+        let events = generate_websearch_events("test-model", "test query", "tool-1", None, 1234);
+
+        let message_start = events
+            .iter()
+            .find(|event| event.event == "message_start")
+            .expect("message_start should exist");
+        let start_usage = &message_start.data["message"]["usage"];
+        assert_eq!(start_usage["input_tokens"], 1234);
+        assert_eq!(start_usage["output_tokens"], 0);
+        assert_eq!(start_usage["cache_creation_input_tokens"], 0);
+        assert_eq!(start_usage["cache_read_input_tokens"], 0);
+        assert!(start_usage.get("server_tool_use").is_none());
+        assert!(start_usage.get("cache_creation_5m_input_tokens").is_none());
+        assert!(start_usage.get("cache_creation_1h_input_tokens").is_none());
+
+        let message_delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta should exist");
+        let final_usage = &message_delta.data["usage"];
+        assert_eq!(final_usage["input_tokens"], 1234);
+        assert!(final_usage["output_tokens"].as_i64().unwrap_or_default() > 0);
+        assert_eq!(final_usage["cache_creation_input_tokens"], 0);
+        assert_eq!(final_usage["cache_read_input_tokens"], 0);
+        assert!(final_usage.get("server_tool_use").is_none());
+        assert!(final_usage.get("cache_creation_5m_input_tokens").is_none());
+        assert!(final_usage.get("cache_creation_1h_input_tokens").is_none());
     }
 }

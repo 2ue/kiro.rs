@@ -17,6 +17,30 @@ export interface CredentialsPageResponse extends CredentialsStatusResponse {
   filteredAvailable: number
 }
 
+export interface CredentialListResponse {
+  page: number
+  limit: number
+  total: number
+  available: number
+  filteredTotal: number
+  filteredAvailable: number
+  totalPages: number
+  items: CredentialListItem[]
+}
+
+export interface CredentialSummaryResponse {
+  total: number
+  available: number
+  disabled: number
+  currentId: number | null
+  globalInFlightRequests: number
+  queuedRequests: number
+  globalMaxConcurrentRequests: number
+  maxQueuedRequests: number
+  updatedAt: string
+  runtimeFresh: boolean
+}
+
 export type CredentialSortBy =
   | 'default'
   | 'id'
@@ -112,6 +136,113 @@ export interface CredentialStatusItem {
   estimatedCostUsd: number
   pricedRequests: number
   unpricedRequests: number
+}
+
+export type CredentialListItem = Pick<
+  CredentialStatusItem,
+  | 'id'
+  | 'createdAt'
+  | 'updatedAt'
+  | 'priority'
+  | 'disabled'
+  | 'authMethod'
+  | 'region'
+  | 'authRegion'
+  | 'apiRegion'
+  | 'effectiveAuthRegion'
+  | 'effectiveApiRegion'
+  | 'hasProfileArn'
+  | 'email'
+  | 'refreshTokenHash'
+  | 'apiKeyHash'
+  | 'maskedApiKey'
+  | 'subscriptionTitle'
+  | 'hasProxy'
+  | 'proxyUrl'
+  | 'proxyUsername'
+  | 'proxyPassword'
+  | 'proxyResourceId'
+  | 'proxyResourceName'
+  | 'effectiveProxyUrl'
+  | 'effectiveProxySource'
+  | 'disabledReason'
+  | 'endpoint'
+  | 'maxConcurrentRequestsOverride'
+  | 'warmupRemaining'
+> & {
+  provider?: string
+}
+
+export type CredentialRuntimeItem = Pick<
+  CredentialStatusItem,
+  | 'id'
+  | 'failureCount'
+  | 'isCurrent'
+  | 'expiresAt'
+  | 'successCount'
+  | 'lastUsedAt'
+  | 'refreshFailureCount'
+  | 'cooledDown'
+  | 'cooldownRemainingSecs'
+  | 'cooldownReason'
+  | 'cooldowns'
+  | 'rateLimited'
+  | 'rateLimitRemainingSecs'
+  | 'inFlightRequests'
+  | 'oldestInFlightAgeSecs'
+  | 'newestInFlightIdleSecs'
+  | 'maxConcurrentRequests'
+  | 'inFlightLeaseMaxSecs'
+  | 'transientFailureStreak'
+  | 'recentErrorRate'
+  | 'latencyEwmaMs'
+  | 'lastErrorKind'
+  | 'lastErrorReason'
+  | 'lastErrorAtMs'
+  | 'inProbation'
+  | 'probationRemainingSecs'
+  | 'schedulerSelectionCount'
+  | 'recentSchedulerSelectionCount10s'
+  | 'recentSchedulerSelectionCount60s'
+  | 'recentSchedulerSelectionCount5m'
+  | 'schedulerSelectionPressure'
+  | 'schedulerScore'
+>
+
+export interface CredentialRuntimeResponse {
+  items: CredentialRuntimeItem[]
+  updatedAt: string
+  fresh: boolean
+}
+
+export type CredentialAccountInfoItem = CredentialAccountInfo & {
+  id: number
+}
+
+export interface CredentialAccountInfoListResponse {
+  items: CredentialAccountInfoItem[]
+  updatedAt: string
+  fresh: boolean
+}
+
+export type CredentialUsageSummaryItem = Pick<
+  CredentialStatusItem,
+  'id' | 'estimatedCostUsd' | 'pricedRequests' | 'unpricedRequests'
+>
+
+export interface CredentialUsageSummaryResponse {
+  items: CredentialUsageSummaryItem[]
+  updatedAt: string
+  fresh: boolean
+}
+
+export interface BulkCredentialActionResponse {
+  totalMatched: number
+  totalAttempted: number
+  success: number
+  failed: number
+  skipped: number
+  errors: Array<{ id: number; message: string }>
 }
 
 export interface CredentialCooldown {

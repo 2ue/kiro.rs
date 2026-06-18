@@ -96,6 +96,206 @@ pub struct CredentialsPageResponse {
     pub credentials: Vec<CredentialStatusItem>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialAccountInfoListResponse {
+    pub items: Vec<CredentialAccountInfoItem>,
+    pub updated_at: String,
+    pub fresh: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialAccountInfoItem {
+    pub id: u64,
+    pub subscription_title: Option<String>,
+    pub current_usage: f64,
+    pub usage_limit: f64,
+    pub remaining: f64,
+    pub usage_percentage: f64,
+    pub credit_limit: f64,
+    pub credit_remaining: f64,
+    pub credit_base: f64,
+    pub credit_bonus: f64,
+    pub next_reset_at: Option<f64>,
+    pub checked_at: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialRuntimeResponse {
+    pub items: Vec<CredentialRuntimeItem>,
+    pub updated_at: String,
+    pub fresh: bool,
+}
+
+/// 高频变化的凭据运行态字段。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialRuntimeItem {
+    pub id: u64,
+    pub is_current: bool,
+    pub failure_count: u32,
+    pub refresh_failure_count: u32,
+    pub success_count: u64,
+    pub last_used_at: Option<String>,
+    pub expires_at: Option<String>,
+    pub cooled_down: bool,
+    pub cooldown_remaining_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cooldowns: Vec<CredentialCooldown>,
+    pub rate_limited: bool,
+    pub rate_limit_remaining_secs: u64,
+    pub in_flight_requests: u32,
+    pub oldest_in_flight_age_secs: u64,
+    pub newest_in_flight_idle_secs: u64,
+    pub max_concurrent_requests: u32,
+    pub in_flight_lease_max_secs: u64,
+    pub transient_failure_streak: u32,
+    pub recent_error_rate: f64,
+    pub latency_ewma_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_reason: Option<String>,
+    pub last_error_at_ms: Option<i64>,
+    pub in_probation: bool,
+    pub probation_remaining_secs: u64,
+    pub scheduler_selection_count: u64,
+    pub recent_scheduler_selection_count_10s: u32,
+    pub recent_scheduler_selection_count_60s: u32,
+    pub recent_scheduler_selection_count_5m: u32,
+    pub scheduler_selection_pressure: f64,
+    pub scheduler_score: f64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialUsageSummaryResponse {
+    pub items: Vec<CredentialUsageSummaryItem>,
+    pub updated_at: String,
+    pub fresh: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialUsageSummaryItem {
+    pub id: u64,
+    pub estimated_cost_usd: f64,
+    pub priced_requests: usize,
+    pub unpriced_requests: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkCredentialActionResponse {
+    pub total_matched: usize,
+    pub total_attempted: usize,
+    pub success: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub errors: Vec<BulkCredentialActionError>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkCredentialActionError {
+    pub id: u64,
+    pub message: String,
+}
+
+/// 轻量凭据列表响应。
+///
+/// 该响应只包含列表首屏和筛选分页需要的基础字段，不携带运行态、账号额度或费用聚合。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialListResponse {
+    pub page: usize,
+    pub limit: usize,
+    pub total: usize,
+    pub available: usize,
+    pub filtered_total: usize,
+    pub filtered_available: usize,
+    pub total_pages: usize,
+    pub items: Vec<CredentialListItem>,
+}
+
+/// 轻量凭据列表项。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialListItem {
+    pub id: u64,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub priority: u32,
+    pub disabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+    pub auth_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_region: Option<String>,
+    pub effective_auth_region: String,
+    pub effective_api_region: String,
+    pub has_profile_arn: bool,
+    pub refresh_token_hash: Option<String>,
+    pub api_key_hash: Option<String>,
+    pub masked_api_key: Option<String>,
+    pub email: Option<String>,
+    pub subscription_title: Option<String>,
+    pub has_proxy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_password: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_resource_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_resource_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_proxy_url: Option<String>,
+    pub effective_proxy_source: String,
+    pub endpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_requests_override: Option<u32>,
+    pub warmup_remaining: u32,
+}
+
+/// 凭据数量与全局调度容量概览。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialSummaryResponse {
+    pub total: usize,
+    pub available: usize,
+    pub disabled: usize,
+    pub current_id: Option<u64>,
+    pub global_in_flight_requests: u32,
+    pub queued_requests: u32,
+    pub global_max_concurrent_requests: u32,
+    pub max_queued_requests: u32,
+    pub updated_at: String,
+    pub runtime_fresh: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialCooldown {
+    pub model: Option<String>,
+    pub global: bool,
+    pub remaining_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// 单个凭据的状态信息
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

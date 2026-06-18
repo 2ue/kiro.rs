@@ -1089,6 +1089,51 @@ impl PostgresStore {
         Ok(info)
     }
 
+    pub async fn load_credential_account_info_for_ids(
+        &self,
+        ids: &[u64],
+    ) -> anyhow::Result<HashMap<u64, CredentialAccountInfoRow>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let credential_ids: Vec<i64> = ids.iter().map(|id| *id as i64).collect();
+        let rows = sqlx::query(
+            r#"
+            SELECT credential_id, subscription_title, current_usage, usage_limit,
+                   remaining, usage_percentage, credit_limit, credit_remaining,
+                   credit_base, credit_bonus, next_reset_at, checked_at
+            FROM credential_account_info
+            WHERE credential_id = ANY($1)
+            "#,
+        )
+        .bind(&credential_ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut info = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let credential_id: i64 = row.try_get("credential_id")?;
+            let checked_at: DateTime<Utc> = row.try_get("checked_at")?;
+            info.insert(
+                credential_id as u64,
+                CredentialAccountInfoRow {
+                    subscription_title: row.try_get("subscription_title")?,
+                    current_usage: row.try_get("current_usage")?,
+                    usage_limit: row.try_get("usage_limit")?,
+                    remaining: row.try_get("remaining")?,
+                    usage_percentage: row.try_get("usage_percentage")?,
+                    credit_limit: row.try_get("credit_limit")?,
+                    credit_remaining: row.try_get("credit_remaining")?,
+                    credit_base: row.try_get("credit_base")?,
+                    credit_bonus: row.try_get("credit_bonus")?,
+                    next_reset_at: row.try_get("next_reset_at")?,
+                    checked_at: checked_at.to_rfc3339(),
+                },
+            );
+        }
+        Ok(info)
+    }
+
     pub async fn save_credential_account_info(
         &self,
         credential_id: u64,
@@ -1154,31 +1199,47 @@ impl PostgresStore {
         credential_id: u64,
         state: &CredentialRuntimeStateRow,
     ) -> anyhow::Result<()> {
+        let snapshot = CredentialRuntimeStateSnapshot {
+            state: state.clone(),
+            updated_at: Utc::now(),
+        };
+        self.save_credential_runtime_state_snapshot(credential_id, &snapshot)
+            .await
+    }
+
+    pub async fn save_credential_runtime_state_snapshot(
+        &self,
+        credential_id: u64,
+        snapshot: &CredentialRuntimeStateSnapshot,
+    ) -> anyhow::Result<()> {
         sqlx::query(
             r#"
             INSERT INTO credential_runtime_state (
                 credential_id, failure_count, refresh_failure_count,
                 disabled_reason, warmup_remaining, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, now())
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (credential_id) DO UPDATE
             SET failure_count = EXCLUDED.failure_count,
                 refresh_failure_count = EXCLUDED.refresh_failure_count,
                 disabled_reason = EXCLUDED.disabled_reason,
                 warmup_remaining = EXCLUDED.warmup_remaining,
-                updated_at = now()
+                updated_at = EXCLUDED.updated_at
+            WHERE credential_runtime_state.updated_at <= EXCLUDED.updated_at
             "#,
         )
         .bind(credential_id as i64)
-        .bind(state.failure_count as i32)
-        .bind(state.refresh_failure_count as i32)
-        .bind(&state.disabled_reason)
-        .bind(state.warmup_remaining as i32)
+        .bind(snapshot.state.failure_count as i32)
+        .bind(snapshot.state.refresh_failure_count as i32)
+        .bind(&snapshot.state.disabled_reason)
+        .bind(snapshot.state.warmup_remaining as i32)
+        .bind(snapshot.updated_at)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn save_credential_stats(
         &self,
         stats: &HashMap<u64, CredentialStatsRow>,
@@ -1189,6 +1250,7 @@ impl PostgresStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn save_credential_stats_for(
         &self,
         credential_id: u64,
@@ -1201,7 +1263,7 @@ impl PostgresStore {
             )
             VALUES ($1, $2, $3, $4, now())
             ON CONFLICT (credential_id) DO UPDATE
-            SET success_count = EXCLUDED.success_count,
+            SET success_count = GREATEST(credential_stats.success_count, EXCLUDED.success_count),
                 selection_count = GREATEST(credential_stats.selection_count, EXCLUDED.selection_count),
                 last_used_at = EXCLUDED.last_used_at,
                 updated_at = now()
@@ -1216,48 +1278,114 @@ impl PostgresStore {
         Ok(())
     }
 
-    pub async fn record_credential_success(
+    pub async fn apply_credential_stats_deltas(
         &self,
-        credential_id: u64,
-        last_used_at: &str,
+        deltas: &HashMap<u64, CredentialStatsDeltaRow>,
     ) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            r#"
-            INSERT INTO credential_stats (credential_id, success_count, last_used_at, updated_at)
-            VALUES ($1, 1, $2, now())
-            ON CONFLICT (credential_id) DO UPDATE
-            SET success_count = credential_stats.success_count + 1,
-                last_used_at = EXCLUDED.last_used_at,
-                updated_at = now()
-            "#,
-        )
-        .bind(credential_id as i64)
-        .bind(last_used_at)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            r#"
-            INSERT INTO credential_runtime_state (
-                credential_id, failure_count, refresh_failure_count,
-                disabled_reason, warmup_remaining, updated_at
-            )
-            VALUES ($1, 0, 0, NULL, 0, now())
-            ON CONFLICT (credential_id) DO UPDATE
-            SET failure_count = 0,
-                refresh_failure_count = 0,
-                disabled_reason = NULL,
-                warmup_remaining = GREATEST(credential_runtime_state.warmup_remaining - 1, 0),
-                updated_at = now()
-            "#,
-        )
-        .bind(credential_id as i64)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
+        let rows: Vec<(i64, i64, i64, Option<String>)> = deltas
+            .iter()
+            .filter(|(_, delta)| {
+                delta.success_delta != 0
+                    || delta.selection_delta != 0
+                    || delta.last_used_at.is_some()
+            })
+            .map(|(credential_id, delta)| {
+                (
+                    *credential_id as i64,
+                    delta.success_delta as i64,
+                    delta.selection_delta as i64,
+                    delta.last_used_at.clone(),
+                )
+            })
+            .collect();
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        for chunk in rows.chunks(1_000) {
+            let now = Utc::now();
+            let mut builder = QueryBuilder::<Postgres>::new(
+                r#"
+                INSERT INTO credential_stats (
+                    credential_id, success_count, selection_count, last_used_at, updated_at
+                )
+                "#,
+            );
+            builder.push_values(
+                chunk.iter(),
+                |mut row, &(credential_id, success_delta, selection_delta, ref last_used_at)| {
+                    row.push_bind(credential_id)
+                        .push_bind(success_delta)
+                        .push_bind(selection_delta)
+                        .push_bind(last_used_at.clone())
+                        .push_bind(now.clone());
+                },
+            );
+            builder.push(
+                r#"
+                ON CONFLICT (credential_id) DO UPDATE
+                SET success_count = credential_stats.success_count + EXCLUDED.success_count,
+                    selection_count = credential_stats.selection_count + EXCLUDED.selection_count,
+                    last_used_at = CASE
+                        WHEN EXCLUDED.last_used_at IS NULL THEN credential_stats.last_used_at
+                        WHEN credential_stats.last_used_at IS NULL THEN EXCLUDED.last_used_at
+                        WHEN EXCLUDED.last_used_at >= credential_stats.last_used_at THEN EXCLUDED.last_used_at
+                        ELSE credential_stats.last_used_at
+                    END,
+                    updated_at = now()
+                "#,
+            );
+            builder.build().execute(&self.pool).await?;
+        }
         Ok(())
     }
 
+    pub async fn apply_credential_runtime_state_snapshots(
+        &self,
+        snapshots: &HashMap<u64, CredentialRuntimeStateSnapshot>,
+    ) -> anyhow::Result<()> {
+        let rows: Vec<(i64, CredentialRuntimeStateSnapshot)> = snapshots
+            .iter()
+            .map(|(credential_id, snapshot)| (*credential_id as i64, snapshot.clone()))
+            .collect();
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        for chunk in rows.chunks(1_000) {
+            let mut builder = QueryBuilder::<Postgres>::new(
+                r#"
+                INSERT INTO credential_runtime_state (
+                    credential_id, failure_count, refresh_failure_count,
+                    disabled_reason, warmup_remaining, updated_at
+                )
+                "#,
+            );
+            builder.push_values(chunk.iter(), |mut row, &(credential_id, ref snapshot)| {
+                row.push_bind(credential_id)
+                    .push_bind(snapshot.state.failure_count as i32)
+                    .push_bind(snapshot.state.refresh_failure_count as i32)
+                    .push_bind(snapshot.state.disabled_reason.clone())
+                    .push_bind(snapshot.state.warmup_remaining as i32)
+                    .push_bind(snapshot.updated_at.clone());
+            });
+            builder.push(
+                r#"
+                ON CONFLICT (credential_id) DO UPDATE
+                SET failure_count = EXCLUDED.failure_count,
+                    refresh_failure_count = EXCLUDED.refresh_failure_count,
+                    disabled_reason = EXCLUDED.disabled_reason,
+                    warmup_remaining = EXCLUDED.warmup_remaining,
+                    updated_at = EXCLUDED.updated_at
+                WHERE credential_runtime_state.updated_at <= EXCLUDED.updated_at
+                "#,
+            );
+            builder.build().execute(&self.pool).await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub async fn record_credential_selection(&self, credential_id: u64) -> anyhow::Result<()> {
         sqlx::query(
             r#"
@@ -1992,6 +2120,19 @@ pub struct CredentialStatsRow {
     pub success_count: u64,
     pub selection_count: u64,
     pub last_used_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CredentialStatsDeltaRow {
+    pub success_delta: u64,
+    pub selection_delta: u64,
+    pub last_used_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CredentialRuntimeStateSnapshot {
+    pub state: CredentialRuntimeStateRow,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2823,6 +2964,44 @@ impl PostgresUsageStore {
             WHERE requests > 0
             "#,
         )
+        .fetch_all(self.store.pool())
+        .await?;
+
+        let mut summaries = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let credential_id: i64 = row.try_get("credential_id")?;
+            summaries.insert(
+                credential_id as u64,
+                CredentialCostSummary {
+                    estimated_cost_usd: row.try_get("estimated_cost_usd")?,
+                    priced_requests: row_i64_to_usize(&row, "priced_requests")?,
+                    unpriced_requests: row_i64_to_usize(&row, "unpriced_requests")?,
+                },
+            );
+        }
+        Ok(summaries)
+    }
+
+    pub async fn credential_cost_summary_for_ids(
+        &self,
+        ids: &[u64],
+    ) -> anyhow::Result<HashMap<u64, CredentialCostSummary>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let credential_ids: Vec<i64> = ids.iter().map(|id| *id as i64).collect();
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                credential_id,
+                estimated_cost_usd,
+                priced_requests,
+                unpriced_requests
+            FROM usage_credential_cost_summary
+            WHERE requests > 0 AND credential_id = ANY($1)
+            "#,
+        )
+        .bind(&credential_ids)
         .fetch_all(self.store.pool())
         .await?;
 

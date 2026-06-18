@@ -34,6 +34,16 @@ impl IdeEndpoint {
         format!("q.{}.amazonaws.com", self.api_region(ctx))
     }
 
+    fn base_url(&self, ctx: &RequestContext<'_>) -> String {
+        ctx.config
+            .kiro_upstream_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|base| !base.is_empty())
+            .map(|base| base.trim_end_matches('/').to_string())
+            .unwrap_or_else(|| format!("https://{}", self.host(ctx)))
+    }
+
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
             "aws-sdk-js/1.0.34 KiroIDE {} {}",
@@ -64,14 +74,11 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!(
-            "https://q.{}.amazonaws.com/generateAssistantResponse",
-            self.api_region(ctx)
-        )
+        format!("{}/generateAssistantResponse", self.base_url(ctx))
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("https://q.{}.amazonaws.com/mcp", self.api_region(ctx))
+        format!("{}/mcp", self.base_url(ctx))
     }
 
     fn models_url(&self, ctx: &RequestContext<'_>, next_token: Option<&str>) -> String {
@@ -83,8 +90,8 @@ impl KiroEndpoint for IdeEndpoint {
             params.push(format!("nextToken={}", urlencoding::encode(next_token)));
         }
         format!(
-            "https://q.{}.amazonaws.com/ListAvailableModels?{}",
-            self.api_region(ctx),
+            "{}/ListAvailableModels?{}",
+            self.base_url(ctx),
             params.join("&")
         )
     }
@@ -451,5 +458,41 @@ mod tests {
         let body = endpoint.transform_api_body(r#"{"conversationState":{}}"#, &ctx);
         let json: Value = serde_json::from_str(&body).unwrap();
         assert!(json.get("profileArn").is_none());
+    }
+
+    #[test]
+    fn test_kiro_upstream_base_url_override_only_changes_target_url() {
+        let endpoint = IdeEndpoint::new();
+        let credentials = KiroCredentials::default();
+        let mut config = Config::default();
+        config.kiro_upstream_base_url = Some("http://127.0.0.1:39090/mock/".to_string());
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine",
+            config: &config,
+        };
+
+        assert_eq!(
+            endpoint.api_url(&ctx),
+            "http://127.0.0.1:39090/mock/generateAssistantResponse"
+        );
+        assert_eq!(endpoint.mcp_url(&ctx), "http://127.0.0.1:39090/mock/mcp");
+        assert!(
+            endpoint
+                .models_url(&ctx, None)
+                .starts_with("http://127.0.0.1:39090/mock/ListAvailableModels?")
+        );
+
+        let req = endpoint
+            .decorate_api(Client::new().post(endpoint.api_url(&ctx)), &ctx)
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.headers()
+                .get("host")
+                .and_then(|value| value.to_str().ok()),
+            Some("q.us-east-1.amazonaws.com")
+        );
     }
 }

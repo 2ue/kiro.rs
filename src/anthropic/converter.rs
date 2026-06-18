@@ -24,6 +24,8 @@ use crate::model::config::{CompatProfile, PromptCacheSimulationMode};
 
 use super::types::{ContentBlock, MessagesRequest};
 
+const TOOL_RESULTS_PROVIDED_PLACEHOLDER: &str = "Tool results provided.";
+
 /// 规范化 JSON Schema，修复 MCP/OpenAPI/Zod 工具定义中常见的兼容性问题。
 ///
 /// 上游按 draft 2020-12 校验工具 `input_schema`，但 Claude Code / MCP 工具定义
@@ -1152,7 +1154,7 @@ fn convert_request_with_model_id(
     }
     if content.trim().is_empty() {
         if !context.tool_results.is_empty() {
-            content = " ".to_string();
+            content = TOOL_RESULTS_PROVIDED_PLACEHOLDER.to_string();
             warnings.tool_result_content_placeholders += 1;
         } else {
             content = "Continue".to_string();
@@ -2270,7 +2272,7 @@ fn merge_user_messages(
 
     let mut content = content_parts.join("\n");
     if content.trim().is_empty() && !all_tool_results.is_empty() {
-        content = " ".to_string();
+        content = TOOL_RESULTS_PROVIDED_PLACEHOLDER.to_string();
     }
     // 保留文本内容，即使有工具结果也不丢弃用户文本
     let mut user_msg = UserMessage::new(&content, model_id);
@@ -3181,7 +3183,7 @@ mod tests {
         let result = convert_request(&req).unwrap();
         let current = &result.conversation_state.current_message.user_input_message;
 
-        assert_eq!(current.content, " ");
+        assert_eq!(current.content, TOOL_RESULTS_PROVIDED_PLACEHOLDER);
         assert_eq!(current.user_input_message_context.tool_results.len(), 1);
         assert_eq!(result.warnings.tool_result_content_placeholders, 1);
     }
@@ -3276,7 +3278,7 @@ mod tests {
             })
             .expect("history should contain the tool_result user message");
 
-        assert_eq!(tool_result_user.content, " ");
+        assert_eq!(tool_result_user.content, TOOL_RESULTS_PROVIDED_PLACEHOLDER);
         assert_eq!(
             tool_result_user
                 .user_input_message_context

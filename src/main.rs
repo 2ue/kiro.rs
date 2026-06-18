@@ -322,6 +322,7 @@ async fn main() {
         std::process::exit(1);
     });
     let token_manager = Arc::new(token_manager);
+    token_manager.spawn_stats_flush_worker();
     let runtime_event_health = Arc::new(RuntimeEventHealth::default());
     spawn_redis_runtime_event_listener(
         redis_store.clone(),
@@ -509,6 +510,11 @@ async fn main() {
     if admin_key_valid {
         tracing::info!("Admin API:");
         tracing::info!("  GET  /api/admin/credentials");
+        tracing::info!("  GET  /api/admin/credentials/list");
+        tracing::info!("  GET  /api/admin/credentials/summary");
+        tracing::info!("  GET  /api/admin/credentials/runtime");
+        tracing::info!("  GET  /api/admin/credentials/account-info");
+        tracing::info!("  GET  /api/admin/credentials/usage-summary");
         tracing::info!("  GET  /api/admin/credentials-paged");
         tracing::info!("  GET  /api/admin/credentials/export");
         tracing::info!("  GET  /api/admin/usage-records");

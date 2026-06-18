@@ -52,6 +52,29 @@ pub struct CredentialInfoQueryParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CredentialsIdsQueryParams {
+    pub ids: Option<String>,
+}
+
+impl CredentialsIdsQueryParams {
+    fn ids(&self) -> Result<Vec<u64>, String> {
+        let Some(ids) = self.ids.as_deref() else {
+            return Ok(Vec::new());
+        };
+        ids.split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| format!("无效凭据 ID: {}", value))
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AuditLogsQueryParams {
     pub page: Option<usize>,
     pub limit: Option<usize>,
@@ -202,6 +225,85 @@ pub async fn get_credentials_page(
             sort_order: non_blank(params.sort_order),
         },
     ))
+}
+
+/// GET /api/admin/credentials-list
+/// 轻量分页获取凭据基础字段
+pub async fn get_credentials_list(
+    State(state): State<AdminState>,
+    Query(params): Query<CredentialsPageQueryParams>,
+) -> impl IntoResponse {
+    Json(state.service.get_credentials_list(
+        params.page.unwrap_or_default(),
+        params.limit.unwrap_or_default(),
+        super::service::CredentialListQuery {
+            q: non_blank(params.q),
+            status: non_blank(params.status),
+            auth_method: non_blank(params.auth_method),
+            subscription: non_blank(params.subscription),
+            proxy_resource_id: params.proxy_resource_id,
+            sort_by: non_blank(params.sort_by),
+            sort_order: non_blank(params.sort_order),
+        },
+    ))
+}
+
+/// GET /api/admin/credentials/summary
+pub async fn get_credentials_summary(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_credentials_summary())
+}
+
+/// GET /api/admin/credentials/runtime
+pub async fn get_credentials_runtime(
+    State(state): State<AdminState>,
+    Query(params): Query<CredentialsIdsQueryParams>,
+) -> impl IntoResponse {
+    match params.ids() {
+        Ok(ids) => Json(state.service.get_credentials_runtime(&ids)).into_response(),
+        Err(message) => (
+            StatusCode::BAD_REQUEST,
+            Json(AdminErrorResponse::invalid_request(message)),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/admin/credentials/account-info
+pub async fn get_credentials_account_info(
+    State(state): State<AdminState>,
+    Query(params): Query<CredentialsIdsQueryParams>,
+) -> impl IntoResponse {
+    match params.ids() {
+        Ok(ids) => Json(state.service.get_credentials_account_info(&ids).await).into_response(),
+        Err(message) => (
+            StatusCode::BAD_REQUEST,
+            Json(AdminErrorResponse::invalid_request(message)),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/admin/credentials/usage-summary
+pub async fn get_credentials_usage_summary(
+    State(state): State<AdminState>,
+    Query(params): Query<CredentialsIdsQueryParams>,
+) -> impl IntoResponse {
+    match params.ids() {
+        Ok(ids) => Json(state.service.get_credentials_usage_summary(&ids)).into_response(),
+        Err(message) => (
+            StatusCode::BAD_REQUEST,
+            Json(AdminErrorResponse::invalid_request(message)),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/admin/credentials/disabled
+pub async fn delete_disabled_credentials(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.delete_disabled_credentials() {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
 /// GET /api/admin/credentials/credit-summary

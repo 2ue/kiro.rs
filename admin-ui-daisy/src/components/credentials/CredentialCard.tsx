@@ -193,6 +193,7 @@ export function CredentialCard({
   const [editingProxy, setEditingProxy] = useState(false)
   const [editingConcurrency, setEditingConcurrency] = useState(false)
   const [editingRegions, setEditingRegions] = useState(false)
+  const [detailsOpen, setDetailsOpen] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [regionValue, setRegionValue] = useState(credential.region || '')
   const [authRegionValue, setAuthRegionValue] = useState(credential.authRegion || '')
@@ -432,7 +433,12 @@ export function CredentialCard({
         <div className="flex items-center gap-3 p-3">
           <Checkbox size="xs" checked={selected} onChange={onToggleSelect} />
 
-          <div className="min-w-0 flex-1 text-left">
+          <button
+            type="button"
+            className="min-w-0 flex-1 text-left"
+            onClick={() => setDetailsOpen((open) => !open)}
+            aria-expanded={detailsOpen}
+          >
             <div className="flex items-center gap-2">
               <span className="truncate text-sm font-semibold" title={credentialLabel(credential)}>
                 {credentialLabel(credential)}
@@ -473,9 +479,12 @@ export function CredentialCard({
                 <Badge tone="error" size="xs">错误 {transientFailureStreak}</Badge>
               )}
             </div>
-          </div>
+          </button>
 
           <div className="flex shrink-0 items-center gap-1">
+            <Button type="button" color="ghost" size="xs" onClick={() => setDetailsOpen((open) => !open)} title={detailsOpen ? '收起详情' : '展开详情'}>
+              {detailsOpen ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+            </Button>
             <Toggle
               color="primary"
               size="xs"
@@ -495,6 +504,7 @@ export function CredentialCard({
         </div>
 
         {/* Details */}
+        {detailsOpen && (
         <div className="border-t border-base-300/50 bg-base-200/30 p-3">
             <div className="credential-section-title">基础</div>
             <div className="credential-meta-grid">
@@ -743,6 +753,7 @@ export function CredentialCard({
               </Dropdown>
             </div>
         </div>
+        )}
       </Card.Body>
 
       <ModalShell open={editingPriority} title={`优先级：${credentialLabel(credential)}`} width="max-w-md" onClose={() => {

@@ -67,6 +67,8 @@ use crate::kiro::call_trace::KiroCredentialAttempt;
 use crate::kiro::provider::{KiroProvider, KiroStreamCompletion};
 
 const MAX_REMOTE_MULTIMODAL_BYTES: usize = 20 * 1024 * 1024;
+const UPSTREAM_INVALID_REQUEST_MESSAGE: &str =
+    "Invalid request. Simplify the message, tools, tool results, files, or images and retry.";
 
 #[derive(Clone)]
 struct RequestUsageContext {
@@ -2099,7 +2101,26 @@ fn map_provider_error(
             &err_str,
             "请求被拒绝：Kiro payload 形态不合法（不应切换账号重试）",
         );
-        let message = "Request body is improperly formed. Check message ordering, tool_use/tool_result pairing, tool schema, multimodal sources, and payload size.";
+        return if let Some(request_id) = request_id {
+            envelope::error_response_with_id(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                UPSTREAM_INVALID_REQUEST_MESSAGE,
+                request_id,
+            )
+        } else {
+            envelope::error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                UPSTREAM_INVALID_REQUEST_MESSAGE,
+            )
+        };
+    }
+
+    if is_upstream_invalid_model_error(&err_str) {
+        log_provider_warning_with_hint(&err_str, "请求被拒绝：上游模型不支持（不应切换账号重试）");
+        let message =
+            "Model is not available from the current upstream. Select a supported model and retry.";
         return if let Some(request_id) = request_id {
             envelope::error_response_with_id(
                 StatusCode::BAD_REQUEST,
@@ -2109,6 +2130,24 @@ fn map_provider_error(
             )
         } else {
             envelope::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message)
+        };
+    }
+
+    if is_upstream_bad_request_error(&err_str) {
+        log_provider_warning_with_hint(&err_str, "请求被上游以 400 拒绝（不应切换账号重试）");
+        return if let Some(request_id) = request_id {
+            envelope::error_response_with_id(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                UPSTREAM_INVALID_REQUEST_MESSAGE,
+                request_id,
+            )
+        } else {
+            envelope::error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                UPSTREAM_INVALID_REQUEST_MESSAGE,
+            )
         };
     }
 
@@ -2198,6 +2237,26 @@ fn is_upstream_improperly_formed_error(value: &str) -> bool {
             .contains("improperly formed request")
 }
 
+fn is_upstream_bad_request_error(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("400 bad request")
+        || lower.contains("bad_request")
+        || lower.contains("assistant-prefill")
+        || lower.contains("assistant prefill")
+        || lower.contains("last message must be user")
+        || lower.contains("请求无效")
+        || lower.contains("请求参数错误")
+}
+
+fn is_upstream_invalid_model_error(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("invalid model")
+        || lower.contains("invalid_model_id")
+        || lower.contains("model not found")
+        || lower.contains("model_not_found")
+        || lower.contains("unsupported model")
+}
+
 fn is_upstream_too_long_error(value: &str) -> bool {
     is_upstream_payload_too_long_error(value) || is_upstream_context_window_full_error(value)
 }
@@ -2284,7 +2343,7 @@ fn resolve_request_model(
     }
 
     if let Some(upstream_model) = resolution.upstream_model.as_deref() {
-        tracing::info!(
+        tracing::debug!(
             endpoint,
             requested_model = %resolution.requested_model,
             upstream_model = %upstream_model,
@@ -2381,7 +2440,7 @@ fn log_payload_guard_report(
     } else if report.max_bytes > 0
         && report.original_bytes > report.max_bytes.saturating_mul(80) / 100
     {
-        tracing::info!(
+        tracing::debug!(
             endpoint,
             requested_model,
             upstream_model,
@@ -2422,7 +2481,7 @@ fn log_payload_byte_breakdown(
         return;
     };
 
-    tracing::info!(
+    tracing::debug!(
         endpoint,
         requested_model,
         upstream_model,
@@ -2530,7 +2589,7 @@ async fn post_messages_inner(
     mut payload: MessagesRequest,
     endpoint: &'static str,
 ) -> Response {
-    tracing::info!(
+    tracing::debug!(
         endpoint = endpoint,
         model = %payload.model,
         max_tokens = %payload.max_tokens,
@@ -2708,7 +2767,26 @@ async fn post_messages_inner(
         );
     };
 
-    tracing::debug!("Kiro request body: {}", request_body);
+    tracing::debug!(
+        endpoint = endpoint,
+        requested_model = %payload.model,
+        upstream_model = ?model_resolution.upstream_model,
+        conversation_id = %conversation_id,
+        request_bytes = request_body.len(),
+        history_entries = payload_breakdown.history_entries,
+        current_tool_count = payload_breakdown.current_tool_count,
+        current_tool_result_count = payload_breakdown.current_tool_result_count,
+        current_image_count = payload_breakdown.current_image_count,
+        "Kiro request prepared"
+    );
+    tracing::trace!(
+        endpoint = endpoint,
+        requested_model = %payload.model,
+        upstream_model = ?model_resolution.upstream_model,
+        conversation_id = %conversation_id,
+        request_body = %request_body,
+        "Kiro request body"
+    );
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
@@ -4002,7 +4080,7 @@ async fn handle_non_stream_request(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": reported_usage.to_json()
+        "usage": reported_usage.to_anthropic_usage_json()
     });
 
     envelope::json_response_with_id(
@@ -4112,7 +4190,7 @@ pub async fn post_messages_cc(
         Ok(payload) => payload,
         Err(response) => return response,
     };
-    tracing::info!(
+    tracing::debug!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
@@ -4290,7 +4368,26 @@ pub async fn post_messages_cc(
         );
     };
 
-    tracing::debug!("Kiro request body: {}", request_body);
+    tracing::debug!(
+        endpoint = "/cc/v1/messages",
+        requested_model = %payload.model,
+        upstream_model = ?model_resolution.upstream_model,
+        conversation_id = %conversation_id,
+        request_bytes = request_body.len(),
+        history_entries = payload_breakdown.history_entries,
+        current_tool_count = payload_breakdown.current_tool_count,
+        current_tool_result_count = payload_breakdown.current_tool_result_count,
+        current_image_count = payload_breakdown.current_image_count,
+        "Kiro request prepared"
+    );
+    tracing::trace!(
+        endpoint = "/cc/v1/messages",
+        requested_model = %payload.model,
+        upstream_model = ?model_resolution.upstream_model,
+        conversation_id = %conversation_id,
+        request_body = %request_body,
+        "Kiro request body"
+    );
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
@@ -5096,6 +5193,58 @@ mod tests {
         assert!(!message.contains("Context window is full"));
     }
 
+    #[tokio::test]
+    async fn malformed_upstream_error_uses_generic_user_message() {
+        let response = map_provider_error(
+            anyhow::anyhow!(
+                "{}",
+                r#"流式 API 请求失败（凭据 #1 test@example.com，请求无效）: 400 Bad Request {"message":"Improperly formed request.","reason":null}"#
+            ),
+            Some("req_test_malformed"),
+            None,
+        );
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        let message = value
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .expect("error message");
+
+        assert_eq!(message, UPSTREAM_INVALID_REQUEST_MESSAGE);
+        assert!(!message.contains("tool_use"));
+        assert!(!message.contains("转换"));
+    }
+
+    #[tokio::test]
+    async fn opaque_400_bad_request_maps_to_invalid_request_not_gateway() {
+        let response = map_provider_error(
+            anyhow::anyhow!(
+                "{}",
+                "流式 API 请求失败（凭据 #6 ***，请求无效）: 400 Bad Request <failed to read response body: error decoding response body>"
+            ),
+            Some("req_test_opaque_bad_request"),
+            None,
+        );
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            value.pointer("/error/type").and_then(|v| v.as_str()),
+            Some("invalid_request_error")
+        );
+        assert_eq!(
+            value.pointer("/error/message").and_then(|v| v.as_str()),
+            Some(UPSTREAM_INVALID_REQUEST_MESSAGE)
+        );
+    }
+
     #[test]
     fn local_prompt_cache_updates_even_when_context_tokens_are_estimated() {
         let prompt_cache = Arc::new(PromptCacheTracker::default());
@@ -5617,6 +5766,59 @@ mod tests {
             classify_local_error_for_external_fallback("429 Too Many Requests", &[], &config)
                 .as_deref(),
             Some("local_transient_exhausted")
+        );
+    }
+
+    #[test]
+    fn external_fallback_classifier_respects_scheduler_fallback_toggles() {
+        let mut config = ExternalPoolsConfig::default();
+
+        config.fallback_on_local_capacity_exhausted = false;
+        assert_eq!(
+            classify_local_error_for_external_fallback(
+                "本地凭据调度容量暂不可用，并发槽位已满",
+                &[],
+                &config,
+            ),
+            None
+        );
+
+        config = ExternalPoolsConfig::default();
+        config.fallback_on_local_transient_exhausted = false;
+        assert_eq!(
+            classify_local_error_for_external_fallback("429 Too Many Requests", &[], &config),
+            None
+        );
+        assert_eq!(
+            classify_local_error_for_external_fallback(
+                "upstream server_error",
+                &[KiroCredentialAttempt::new(
+                    0,
+                    1,
+                    None,
+                    Some(StatusCode::BAD_GATEWAY),
+                    "retry",
+                    Some("server_error"),
+                    Some("502"),
+                    10,
+                )],
+                &config,
+            ),
+            None
+        );
+
+        config = ExternalPoolsConfig::default();
+        config.fallback_on_no_available_credentials = false;
+        assert_eq!(
+            classify_local_error_for_external_fallback("所有凭据均已禁用（0/2）", &[], &config),
+            None
+        );
+
+        config.fallback_on_no_available_credentials = true;
+        assert_eq!(
+            classify_local_error_for_external_fallback("所有凭据均已禁用（0/2）", &[], &config)
+                .as_deref(),
+            Some("no_available_credentials")
         );
     }
 

@@ -37,16 +37,31 @@ import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/t
 import { extractErrorMessage } from '@/lib/utils'
 import {
   useCredentials,
+  useCredentialAccountInfo,
   useCredentialCreditSummary,
-  useCredentialsPage,
+  useCredentialList,
+  useCredentialRuntime,
+  useCredentialSummary,
+  useCredentialUsageSummary,
   useDeleteCredential,
+  useDeleteDisabledCredentials,
   useLoadBalancingMode,
   useProxyResources,
   useResetFailure,
   useRuntimeConfig,
   useSetLoadBalancingMode,
 } from '@/hooks/use-credentials'
-import type { BalanceResponse, CredentialSortBy, CredentialSortOrder, CredentialStatusItem, LoadBalancingMode } from '@/types/api'
+import type {
+  BalanceResponse,
+  CredentialAccountInfo,
+  CredentialListItem,
+  CredentialRuntimeItem,
+  CredentialSortBy,
+  CredentialSortOrder,
+  CredentialStatusItem,
+  CredentialUsageSummaryItem,
+  LoadBalancingMode,
+} from '@/types/api'
 
 const credentialSortOptions: Array<{ value: CredentialSortBy; label: string }> = [
   { value: 'default', label: '默认排序' },
@@ -64,6 +79,73 @@ const credentialSortOptions: Array<{ value: CredentialSortBy; label: string }> =
   { value: 'scheduler_score', label: '调度评分' },
   { value: 'id', label: 'ID' },
 ]
+
+const runtimeOwnedStatusFilters = new Set(['current', 'cooldown', 'rate_limited', 'proxy_blocked', 'error'])
+const runtimeOwnedSorts = new Set<CredentialSortBy>([
+  'last_used_at',
+  'success_count',
+  'failure_count',
+  'refresh_failure_count',
+  'estimated_cost',
+  'usage_percentage',
+  'remaining_quota',
+  'in_flight_requests',
+  'scheduler_score',
+])
+
+function mapById<T extends { id: number }>(items: T[] | undefined): Map<number, T> {
+  return new Map((items || []).map((item) => [item.id, item]))
+}
+
+function accountInfoFromItem(item?: CredentialAccountInfo): CredentialAccountInfo | undefined {
+  return item
+}
+
+function mergeCredentialPlanes(
+  base: CredentialListItem,
+  runtime?: CredentialRuntimeItem,
+  accountInfo?: CredentialAccountInfo,
+  usage?: CredentialUsageSummaryItem
+): CredentialStatusItem {
+  return {
+    ...base,
+    failureCount: runtime?.failureCount ?? 0,
+    isCurrent: runtime?.isCurrent ?? false,
+    expiresAt: runtime?.expiresAt ?? null,
+    accountInfo: accountInfoFromItem(accountInfo),
+    successCount: runtime?.successCount ?? 0,
+    lastUsedAt: runtime?.lastUsedAt ?? null,
+    refreshFailureCount: runtime?.refreshFailureCount ?? 0,
+    cooledDown: runtime?.cooledDown ?? false,
+    cooldownRemainingSecs: runtime?.cooldownRemainingSecs ?? 0,
+    cooldownReason: runtime?.cooldownReason,
+    cooldowns: runtime?.cooldowns ?? [],
+    rateLimited: runtime?.rateLimited ?? false,
+    rateLimitRemainingSecs: runtime?.rateLimitRemainingSecs ?? 0,
+    inFlightRequests: runtime?.inFlightRequests ?? 0,
+    oldestInFlightAgeSecs: runtime?.oldestInFlightAgeSecs ?? 0,
+    newestInFlightIdleSecs: runtime?.newestInFlightIdleSecs ?? 0,
+    maxConcurrentRequests: runtime?.maxConcurrentRequests ?? 0,
+    inFlightLeaseMaxSecs: runtime?.inFlightLeaseMaxSecs ?? 0,
+    transientFailureStreak: runtime?.transientFailureStreak ?? 0,
+    recentErrorRate: runtime?.recentErrorRate ?? 0,
+    latencyEwmaMs: runtime?.latencyEwmaMs ?? null,
+    lastErrorKind: runtime?.lastErrorKind,
+    lastErrorReason: runtime?.lastErrorReason,
+    lastErrorAtMs: runtime?.lastErrorAtMs ?? null,
+    inProbation: runtime?.inProbation ?? false,
+    probationRemainingSecs: runtime?.probationRemainingSecs ?? 0,
+    schedulerSelectionCount: runtime?.schedulerSelectionCount ?? 0,
+    recentSchedulerSelectionCount10s: runtime?.recentSchedulerSelectionCount10s ?? 0,
+    recentSchedulerSelectionCount60s: runtime?.recentSchedulerSelectionCount60s ?? 0,
+    recentSchedulerSelectionCount5m: runtime?.recentSchedulerSelectionCount5m ?? 0,
+    schedulerSelectionPressure: runtime?.schedulerSelectionPressure ?? 0,
+    schedulerScore: runtime?.schedulerScore ?? 0,
+    estimatedCostUsd: usage?.estimatedCostUsd ?? 0,
+    pricedRequests: usage?.pricedRequests ?? 0,
+    unpricedRequests: usage?.unpricedRequests ?? 0,
+  }
+}
 
 export function CredentialsPanel() {
   // State
@@ -96,34 +178,48 @@ export function CredentialsPanel() {
 
   // Hooks
   const queryClient = useQueryClient()
-  const credentials = useCredentialsPage({
+  const listQuery = {
     page,
     limit: itemsPerPage,
     q: queryText.trim() || undefined,
-    status: statusFilter !== 'all' ? statusFilter : undefined,
+    status: statusFilter !== 'all' && !runtimeOwnedStatusFilters.has(statusFilter) ? statusFilter : undefined,
     authMethod: authFilter !== 'all' ? authFilter : undefined,
     subscription: subscriptionFilter !== 'all' ? subscriptionFilter : undefined,
     proxyResourceId: proxyFilter !== 'all' ? Number(proxyFilter) : undefined,
-    sortBy: sortBy !== 'default' ? sortBy : undefined,
-    sortOrder: sortBy !== 'default' ? sortOrder : undefined,
-  })
+    sortBy: sortBy !== 'default' && !runtimeOwnedSorts.has(sortBy) ? sortBy : undefined,
+    sortOrder: sortBy !== 'default' && !runtimeOwnedSorts.has(sortBy) ? sortOrder : undefined,
+  }
+  const credentials = useCredentialList(listQuery)
   const allCredentials = useCredentials({ enabled: batchOpen || kamOpen })
+  const currentCredentialIds = useMemo(() => (credentials.data?.items || []).map((item) => item.id), [credentials.data?.items])
+  const credentialSummary = useCredentialSummary()
+  const credentialRuntime = useCredentialRuntime(currentCredentialIds)
+  const credentialAccountInfo = useCredentialAccountInfo(currentCredentialIds)
+  const credentialUsage = useCredentialUsageSummary(currentCredentialIds)
   const creditSummary = useCredentialCreditSummary()
   const proxyResources = useProxyResources()
   const loadBalancing = useLoadBalancingMode()
   const runtimeConfig = useRuntimeConfig()
   const setLoadBalancing = useSetLoadBalancingMode()
   const deleteCredential = useDeleteCredential()
+  const deleteDisabledCredentials = useDeleteDisabledCredentials()
   const resetFailure = useResetFailure()
 
   // Derived state
-  const currentCredentials = useMemo(() => credentials.data?.credentials || [], [credentials.data?.credentials])
+  const currentCredentials = useMemo(() => {
+    const runtimeById = mapById(credentialRuntime.data?.items)
+    const accountById = mapById(credentialAccountInfo.data?.items)
+    const usageById = mapById(credentialUsage.data?.items)
+    return (credentials.data?.items || []).map((item) =>
+      mergeCredentialPlanes(item, runtimeById.get(item.id), accountById.get(item.id), usageById.get(item.id))
+    )
+  }, [credentialAccountInfo.data?.items, credentialRuntime.data?.items, credentialUsage.data?.items, credentials.data?.items])
   const importDuplicateCheckCredentials = allCredentials.data?.credentials || currentCredentials
   const totalPages = credentials.data?.totalPages || 0
   const credentialsPage = credentials.data?.page
   const pageTransitionPending = credentialsPage !== undefined && (credentials.isPlaceholderData || (credentials.isFetching && credentialsPage !== page))
   const selectedDisabledCount = Array.from(selectedIds).filter((id) => currentCredentials.find((item) => item.id === id)?.disabled).length
-  const disabledCredentialCount = Math.max((credentials.data?.total || 0) - (credentials.data?.available || 0), 0)
+  const disabledCredentialCount = credentialSummary.data?.disabled ?? Math.max((credentials.data?.total || 0) - (credentials.data?.available || 0), 0)
   const hasActiveFilters = statusFilter !== 'all' || authFilter !== 'all' || subscriptionFilter !== 'all' || proxyFilter !== 'all'
 
   // Effects
@@ -145,6 +241,11 @@ export function CredentialsPanel() {
   // Handlers
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    queryClient.invalidateQueries({ queryKey: ['credential-list'] })
+    queryClient.invalidateQueries({ queryKey: ['credential-summary'] })
+    queryClient.invalidateQueries({ queryKey: ['credential-runtime'] })
+    queryClient.invalidateQueries({ queryKey: ['credential-account-info'] })
+    queryClient.invalidateQueries({ queryKey: ['credential-usage-summary'] })
     queryClient.invalidateQueries({ queryKey: ['credentials-page'] })
     queryClient.invalidateQueries({ queryKey: ['credential-credit-summary'] })
   }
@@ -328,28 +429,16 @@ export function CredentialsPanel() {
   }
 
   const clearAllDisabled = async () => {
-    let all
+    if (!disabledCredentialCount) return toast.error('没有可清除的已禁用凭据')
+    if (!confirm(`确定清除所有 ${disabledCredentialCount} 个已禁用凭据吗？此操作无法撤销。`)) return
     try {
-      all = await getCredentials()
+      const result = await deleteDisabledCredentials.mutateAsync()
+      setSelectedIds(new Set())
+      if (result.failed === 0) toast.success(`成功清除所有 ${result.success} 个已禁用凭据`)
+      else toast.warning(`清除已禁用凭据：成功 ${result.success} 个，失败 ${result.failed} 个`)
     } catch (error) {
-      return toast.error(`加载凭据失败: ${extractErrorMessage(error)}`)
+      toast.error(`清除已禁用凭据失败: ${extractErrorMessage(error)}`)
     }
-    const disabled = all.credentials.filter((item) => item.disabled)
-    if (!disabled.length) return toast.error('没有可清除的已禁用凭据')
-    if (!confirm(`确定清除所有 ${disabled.length} 个已禁用凭据吗？此操作无法撤销。`)) return
-    let success = 0
-    let fail = 0
-    for (const item of disabled) {
-      try {
-        await deleteCredential.mutateAsync(item.id)
-        success += 1
-      } catch {
-        fail += 1
-      }
-    }
-    setSelectedIds(new Set())
-    if (fail === 0) toast.success(`成功清除所有 ${success} 个已禁用凭据`)
-    else toast.warning(`清除已禁用凭据：成功 ${success} 个，失败 ${fail} 个`)
   }
 
   const batchVerify = async () => {
@@ -441,24 +530,24 @@ export function CredentialsPanel() {
       <div className="metric-grid">
         <StatCard
           title="凭据总数"
-          value={formatNumber(credentials.data?.total || 0)}
+          value={formatNumber(credentialSummary.data?.total ?? credentials.data?.total ?? 0)}
           icon={<Server className="h-5 w-5" />}
         />
         <StatCard
           title="可用凭据"
-          value={formatNumber(credentials.data?.available || 0)}
+          value={formatNumber(credentialSummary.data?.available ?? credentials.data?.available ?? 0)}
           tone="success"
         />
         <StatCard
           title="当前活跃"
-          value={`#${credentials.data?.currentId || '-'}`}
+          value={`#${credentialSummary.data?.currentId || '-'}`}
           desc={loadBalancing.data?.mode === 'priority' ? '优先级模式' : loadBalancing.data?.mode === 'balanced' ? '均衡负载' : '健康均衡'}
           tone="primary"
         />
         <StatCard
           title="调度容量"
-          value={`${credentials.data?.globalInFlightRequests || 0}/${credentials.data?.globalMaxConcurrentRequests || '∞'}`}
-          desc={`排队 ${credentials.data?.queuedRequests || 0}`}
+          value={`${credentialSummary.data?.globalInFlightRequests || 0}/${credentialSummary.data?.globalMaxConcurrentRequests || '∞'}`}
+          desc={`排队 ${credentialSummary.data?.queuedRequests || 0}`}
           tone="info"
         />
         <StatCard

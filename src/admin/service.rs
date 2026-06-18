@@ -3,13 +3,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::error::AdminServiceError;
@@ -17,14 +17,17 @@ use super::types::{
     AccessKeysResponse, AddCredentialRequest, AddCredentialResponse, BalanceResponse,
     BatchCredentialImportDefaults, BatchCredentialImportDuplicateMode, BatchCredentialImportItem,
     BatchCredentialImportRequest, BatchCredentialImportResponse, BatchUpdateCredentialItem,
-    BatchUpdateCredentialsRequest, BatchUpdateCredentialsResponse, ClearInFlightRequest,
-    CreateProxyResourceRequest, CreateRequestApiKeyRequest, CredentialAccountInfo,
-    CredentialCreditSummaryResponse, CredentialInfoRefreshItem, CredentialInfoRefreshResponse,
-    CredentialStatusItem, CredentialValidationGroup, CredentialValidationInfo,
-    CredentialValidationItem, CredentialValidationResponse, CredentialsPageResponse,
-    CredentialsStatusResponse, ExternalPoolTestRequest, LoadBalancingModeResponse,
-    ManualModelResponse, ProxyResourceResponse, ProxyResourcesResponse,
-    RefreshCredentialInfoRequest, RequestApiKeyItem, RuntimeConfigResponse,
+    BatchUpdateCredentialsRequest, BatchUpdateCredentialsResponse, BulkCredentialActionError,
+    BulkCredentialActionResponse, ClearInFlightRequest, CreateProxyResourceRequest,
+    CreateRequestApiKeyRequest, CredentialAccountInfo, CredentialAccountInfoItem,
+    CredentialAccountInfoListResponse, CredentialCooldown, CredentialCreditSummaryResponse,
+    CredentialInfoRefreshItem, CredentialInfoRefreshResponse, CredentialListItem,
+    CredentialListResponse, CredentialRuntimeItem, CredentialRuntimeResponse, CredentialStatusItem,
+    CredentialSummaryResponse, CredentialUsageSummaryItem, CredentialUsageSummaryResponse,
+    CredentialValidationGroup, CredentialValidationInfo, CredentialValidationItem,
+    CredentialValidationResponse, CredentialsPageResponse, CredentialsStatusResponse,
+    ExternalPoolTestRequest, LoadBalancingModeResponse, ManualModelResponse, ProxyResourceResponse,
+    ProxyResourcesResponse, RefreshCredentialInfoRequest, RequestApiKeyItem, RuntimeConfigResponse,
     SetCredentialConcurrencyRequest, SetCredentialProxyRequest, SetCredentialRegionsRequest,
     SetLoadBalancingModeRequest, SetWarmupRequest, TestCredentialRequest, TestCredentialResponse,
     UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
@@ -61,7 +64,9 @@ use crate::kiro::model::requests::{
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
-use crate::kiro::token_manager::{CredentialAuthUpdate, MultiTokenManager};
+use crate::kiro::token_manager::{
+    CredentialAuthUpdate, CredentialBaseSnapshot, CredentialEntrySnapshot, MultiTokenManager,
+};
 use crate::model::config::ExternalPoolsConfig;
 use crate::storage::postgres::{
     AdminAuditLogPage, CreateProxyResourceRow, CredentialAccountInfoRow, PostgresStore,
@@ -78,6 +83,9 @@ const USAGE_CLEANUP_DEFAULT_MAX_BATCHES: usize = 10_000;
 const USAGE_CLEANUP_MAX_BATCHES: usize = 10_000;
 const ADMIN_USAGE_CACHE_TTL_SECS: usize = 2;
 const ADMIN_EXTERNAL_POOL_STATUS_CACHE_TTL_SECS: usize = 2;
+const ADMIN_CACHE_DEFAULT_LOCAL_TTL_SECS: usize = 2;
+const ADMIN_CACHE_REDIS_READ_TIMEOUT: StdDuration = StdDuration::from_millis(250);
+const ADMIN_CACHE_LOCAL_STALE_TTL_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Default)]
 pub struct CredentialListQuery {
@@ -395,6 +403,16 @@ fn access_keys_response(request_api_keys: &[String], admin_api_key: &str) -> Acc
     }
 }
 
+fn deserialize_admin_cache_value<T: DeserializeOwned>(value: &Value) -> Option<T> {
+    match serde_json::from_value(value.clone()) {
+        Ok(value) => Some(value),
+        Err(err) => {
+            tracing::warn!("反序列化 Admin 本地缓存失败: {}", err);
+            None
+        }
+    }
+}
+
 fn generate_request_api_key() -> String {
     let mut bytes = [0u8; 32];
     bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
@@ -444,6 +462,7 @@ pub struct AdminService {
     kiro_provider: Arc<KiroProvider>,
     external_pool_manager: Arc<ExternalPoolManager>,
     usage_cleanup: Arc<Mutex<UsageCleanupRuntime>>,
+    admin_cache_shadow: Arc<Mutex<HashMap<String, AdminCacheEntry>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -459,6 +478,13 @@ struct UsageCleanupPlan {
 struct UsageCleanupRuntime {
     status: UsageCleanupStatusResponse,
     cancel: Option<Arc<AtomicBool>>,
+}
+
+#[derive(Debug, Clone)]
+struct AdminCacheEntry {
+    value: Value,
+    fresh_until: Instant,
+    stale_until: Instant,
 }
 
 impl Default for UsageCleanupRuntime {
@@ -518,6 +544,7 @@ impl AdminService {
             kiro_provider,
             external_pool_manager,
             usage_cleanup: Arc::new(Mutex::new(UsageCleanupRuntime::default())),
+            admin_cache_shadow: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -531,21 +558,61 @@ impl AdminService {
     }
 
     fn read_admin_cache<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
+        let now = Instant::now();
+        let stale_value = {
+            let mut shadow = self.admin_cache_shadow.lock();
+            match shadow.get(key) {
+                Some(entry) if entry.fresh_until > now => {
+                    return deserialize_admin_cache_value(&entry.value);
+                }
+                Some(entry) if entry.stale_until > now => Some(entry.value.clone()),
+                Some(_) => {
+                    shadow.remove(key);
+                    None
+                }
+                None => None,
+            }
+        };
+
         let redis = self.redis_store.clone();
         let key = key.to_string();
-        match block_on_admin_store(async move { redis.get_json::<T>(key).await }) {
-            Ok(value) => value,
+        let redis_key = key.clone();
+        match block_on_admin_store(async move {
+            tokio::time::timeout(
+                ADMIN_CACHE_REDIS_READ_TIMEOUT,
+                redis.get_json::<Value>(redis_key),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("Redis Admin 缓存读取超时"))?
+        }) {
+            Ok(Some(value)) => {
+                self.write_admin_cache_shadow(
+                    key.clone(),
+                    value.clone(),
+                    ADMIN_CACHE_DEFAULT_LOCAL_TTL_SECS,
+                );
+                deserialize_admin_cache_value(&value)
+            }
+            Ok(None) => stale_value.and_then(|value| deserialize_admin_cache_value(&value)),
             Err(err) => {
                 tracing::warn!("读取 Redis Admin 缓存失败: {}", err);
-                None
+                stale_value.and_then(|value| deserialize_admin_cache_value(&value))
             }
         }
     }
 
     fn write_admin_cache<T>(&self, key: String, value: T, ttl_secs: usize)
     where
-        T: Serialize + Send + Sync + 'static,
+        T: Serialize,
     {
+        let value = match serde_json::to_value(&value) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!("序列化 Admin 缓存失败: {}", err);
+                return;
+            }
+        };
+        self.write_admin_cache_shadow(key.clone(), value.clone(), ttl_secs);
         let redis = self.redis_store.clone();
         tokio::spawn(async move {
             if let Err(err) = redis.set_json(key, &value, ttl_secs).await {
@@ -554,7 +621,29 @@ impl AdminService {
         });
     }
 
+    fn write_admin_cache_shadow(&self, key: String, value: Value, ttl_secs: usize) {
+        let now = Instant::now();
+        let fresh_ttl = StdDuration::from_secs(ttl_secs.max(1) as u64);
+        let stale_ttl = StdDuration::from_secs(ADMIN_CACHE_LOCAL_STALE_TTL_SECS);
+        self.admin_cache_shadow.lock().insert(
+            key,
+            AdminCacheEntry {
+                value,
+                fresh_until: now + fresh_ttl,
+                stale_until: now + fresh_ttl + stale_ttl,
+            },
+        );
+    }
+
     fn invalidate_admin_cache_pattern(&self, pattern: &'static str) {
+        {
+            let mut shadow = self.admin_cache_shadow.lock();
+            if let Some(prefix) = pattern.strip_suffix('*') {
+                shadow.retain(|key, _| !key.starts_with(prefix));
+            } else {
+                shadow.remove(pattern);
+            }
+        }
         let redis = self.redis_store.clone();
         tokio::spawn(async move {
             if let Err(err) = redis.del_pattern(pattern).await {
@@ -1168,6 +1257,134 @@ impl AdminService {
         }
     }
 
+    /// 轻量分页获取凭据基础字段。
+    pub fn get_credentials_list(
+        &self,
+        page: usize,
+        limit: usize,
+        query: CredentialListQuery,
+    ) -> CredentialListResponse {
+        let page = normalize_page(page);
+        let limit = normalize_credentials_limit(limit);
+        let snapshot = self.token_manager.base_snapshot();
+        let default_endpoint = self.token_manager.runtime_config().default_endpoint;
+        let mut filtered: Vec<_> = snapshot
+            .entries
+            .into_iter()
+            .map(|entry| credential_list_item_from_base(entry, &default_endpoint))
+            .filter(|credential| credential_base_matches_query(credential, &query))
+            .collect();
+        sort_credential_list_items_for_admin_display_with_query(&mut filtered, &query);
+        let filtered_total = filtered.len();
+        let filtered_available = filtered
+            .iter()
+            .filter(|credential| !credential.disabled)
+            .count();
+        let total_pages = total_pages(filtered_total, limit);
+        let start = page.saturating_sub(1).saturating_mul(limit);
+        let items = filtered.into_iter().skip(start).take(limit).collect();
+
+        CredentialListResponse {
+            page,
+            limit,
+            total: snapshot.total,
+            available: snapshot.available,
+            filtered_total,
+            filtered_available,
+            total_pages,
+            items,
+        }
+    }
+
+    /// 获取凭据数量和全局调度容量概览。
+    pub fn get_credentials_summary(&self) -> CredentialSummaryResponse {
+        let snapshot = self.token_manager.base_snapshot();
+        CredentialSummaryResponse {
+            total: snapshot.total,
+            available: snapshot.available,
+            disabled: snapshot.total.saturating_sub(snapshot.available),
+            current_id: (snapshot.current_id > 0).then_some(snapshot.current_id),
+            global_in_flight_requests: snapshot.global_in_flight_requests,
+            queued_requests: snapshot.queued_requests,
+            global_max_concurrent_requests: snapshot.global_max_concurrent_requests,
+            max_queued_requests: snapshot.max_queued_requests,
+            updated_at: Utc::now().to_rfc3339(),
+            runtime_fresh: snapshot.runtime_fresh,
+        }
+    }
+
+    pub fn get_credentials_runtime(&self, ids: &[u64]) -> CredentialRuntimeResponse {
+        if ids.is_empty() {
+            return CredentialRuntimeResponse {
+                items: Vec::new(),
+                updated_at: Utc::now().to_rfc3339(),
+                fresh: true,
+            };
+        }
+
+        let snapshot = self.token_manager.runtime_snapshot_for_ids(ids);
+        CredentialRuntimeResponse {
+            items: snapshot
+                .entries
+                .into_iter()
+                .map(|entry| credential_runtime_item_from_snapshot(entry, snapshot.current_id))
+                .collect(),
+            updated_at: Utc::now().to_rfc3339(),
+            fresh: snapshot.runtime_fresh,
+        }
+    }
+
+    pub async fn get_credentials_account_info(
+        &self,
+        ids: &[u64],
+    ) -> CredentialAccountInfoListResponse {
+        let info = if ids.is_empty() {
+            HashMap::new()
+        } else {
+            match block_on_admin_store({
+                let store = self.postgres_store.clone();
+                let ids = ids.to_vec();
+                async move { store.load_credential_account_info_for_ids(&ids).await }
+            }) {
+                Ok(info) => info,
+                Err(err) => {
+                    tracing::warn!("按 ID 加载凭据账号信息失败: {}", err);
+                    HashMap::new()
+                }
+            }
+        };
+        CredentialAccountInfoListResponse {
+            items: ids
+                .iter()
+                .filter_map(|id| {
+                    info.get(id)
+                        .map(|row| credential_account_info_item_from_row(*id, row))
+                })
+                .collect(),
+            updated_at: Utc::now().to_rfc3339(),
+            fresh: true,
+        }
+    }
+
+    pub fn get_credentials_usage_summary(&self, ids: &[u64]) -> CredentialUsageSummaryResponse {
+        let summaries = self.usage_recorder.credential_cost_summary_for_ids(ids);
+        CredentialUsageSummaryResponse {
+            items: ids
+                .iter()
+                .filter_map(|id| {
+                    summaries.get(id).map(|summary| CredentialUsageSummaryItem {
+                        id: *id,
+                        estimated_cost_usd: summary.estimated_cost_usd,
+                        priced_requests: summary.priced_requests,
+                        unpriced_requests: summary.unpriced_requests,
+                    })
+                })
+                .collect(),
+            updated_at: Utc::now().to_rfc3339(),
+            fresh: true,
+        }
+    }
+
     pub async fn get_credential_credit_summary(
         &self,
     ) -> Result<CredentialCreditSummaryResponse, AdminServiceError> {
@@ -1281,74 +1498,16 @@ impl AdminService {
                     .as_ref()
                     .and_then(|info| info.get(&entry.id))
                     .map(account_info_from_row);
-                CredentialStatusItem {
-                    id: entry.id,
-                    created_at: entry.created_at,
-                    updated_at: entry.updated_at,
-                    priority: entry.priority,
-                    disabled: entry.disabled,
-                    failure_count: entry.failure_count,
-                    is_current: entry.id == snapshot.current_id,
-                    expires_at: entry.expires_at,
-                    auth_method: entry.auth_method,
-                    provider: entry.provider,
-                    region: entry.region,
-                    auth_region: entry.auth_region,
-                    api_region: entry.api_region,
-                    effective_auth_region: entry.effective_auth_region,
-                    effective_api_region: entry.effective_api_region,
-                    has_profile_arn: entry.has_profile_arn,
-                    refresh_token_hash: entry.refresh_token_hash,
-                    api_key_hash: entry.api_key_hash,
-                    masked_api_key: entry.masked_api_key,
-                    email: entry.email,
-                    subscription_title: entry.subscription_title,
-                    account_info: info,
-                    success_count: entry.success_count,
-                    last_used_at: entry.last_used_at.clone(),
-                    has_proxy: entry.has_proxy,
-                    proxy_url: entry.proxy_url,
-                    proxy_username: entry.proxy_username,
-                    proxy_password: entry.proxy_password,
-                    proxy_resource_id: entry.proxy_resource_id,
-                    proxy_resource_name: entry.proxy_resource_name,
-                    effective_proxy_url: entry.effective_proxy_url,
-                    effective_proxy_source: entry.effective_proxy_source,
-                    refresh_failure_count: entry.refresh_failure_count,
-                    disabled_reason: entry.disabled_reason,
-                    endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
-                    cooled_down: entry.cooled_down,
-                    cooldown_remaining_secs: entry.cooldown_remaining_secs,
-                    cooldown_reason: entry.cooldown_reason,
-                    rate_limited: entry.rate_limited,
-                    rate_limit_remaining_secs: entry.rate_limit_remaining_secs,
-                    in_flight_requests: entry.in_flight_requests,
-                    oldest_in_flight_age_secs: entry.oldest_in_flight_age_secs,
-                    newest_in_flight_idle_secs: entry.newest_in_flight_idle_secs,
-                    max_concurrent_requests: entry.max_concurrent_requests,
-                    max_concurrent_requests_override: entry.max_concurrent_requests_override,
-                    in_flight_lease_max_secs: entry.in_flight_lease_max_secs,
-                    warmup_remaining: entry.warmup_remaining,
-                    transient_failure_streak: entry.transient_failure_streak,
-                    recent_error_rate: entry.recent_error_rate,
-                    latency_ewma_ms: entry.latency_ewma_ms,
-                    last_error_kind: entry.last_error_kind,
-                    last_error_reason: entry.last_error_reason,
-                    last_error_at_ms: entry.last_error_at_ms,
-                    in_probation: entry.in_probation,
-                    probation_remaining_secs: entry.probation_remaining_secs,
-                    scheduler_selection_count: entry.scheduler_selection_count,
-                    recent_scheduler_selection_count_10s: entry
-                        .recent_scheduler_selection_count_10s,
-                    recent_scheduler_selection_count_60s: entry
-                        .recent_scheduler_selection_count_60s,
-                    recent_scheduler_selection_count_5m: entry.recent_scheduler_selection_count_5m,
-                    scheduler_selection_pressure: entry.scheduler_selection_pressure,
-                    scheduler_score: entry.scheduler_score,
-                    estimated_cost_usd: cost.estimated_cost_usd,
-                    priced_requests: cost.priced_requests,
-                    unpriced_requests: cost.unpriced_requests,
-                }
+                let mut item = credential_status_item_from_snapshot(
+                    entry,
+                    &default_endpoint,
+                    snapshot.current_id,
+                );
+                item.account_info = info;
+                item.estimated_cost_usd = cost.estimated_cost_usd;
+                item.priced_requests = cost.priced_requests;
+                item.unpriced_requests = cost.unpriced_requests;
+                item
             })
             .collect();
 
@@ -2382,6 +2541,61 @@ impl AdminService {
         );
 
         Ok(())
+    }
+
+    /// 服务端一次性删除全部已禁用凭据，避免前端为确认弹窗加载完整重列表。
+    pub fn delete_disabled_credentials(
+        &self,
+    ) -> Result<BulkCredentialActionResponse, AdminServiceError> {
+        let disabled_ids: Vec<u64> = self
+            .token_manager
+            .base_snapshot()
+            .entries
+            .into_iter()
+            .filter(|credential| credential.disabled)
+            .map(|credential| credential.id)
+            .collect();
+
+        let total_matched = disabled_ids.len();
+        let mut success = 0usize;
+        let mut errors = Vec::new();
+
+        for id in disabled_ids {
+            match self.delete_credential(id) {
+                Ok(()) => {
+                    success += 1;
+                }
+                Err(err) => {
+                    errors.push(BulkCredentialActionError {
+                        id,
+                        message: err.to_string(),
+                    });
+                }
+            }
+        }
+
+        let failed = errors.len();
+        self.audit(
+            "delete_disabled_credentials",
+            "credential",
+            None,
+            failed == 0,
+            (failed > 0).then(|| format!("{} 个已禁用凭据删除失败", failed)),
+            json!({
+                "totalMatched": total_matched,
+                "success": success,
+                "failed": failed,
+            }),
+        );
+
+        Ok(BulkCredentialActionResponse {
+            total_matched,
+            total_attempted: total_matched,
+            success,
+            failed,
+            skipped: 0,
+            errors,
+        })
     }
 
     /// 查询请求级 usage 记录。
@@ -3867,6 +4081,191 @@ fn account_info_from_row(row: &CredentialAccountInfoRow) -> CredentialAccountInf
     }
 }
 
+fn credential_status_item_from_snapshot(
+    entry: CredentialEntrySnapshot,
+    default_endpoint: &str,
+    current_id: u64,
+) -> CredentialStatusItem {
+    CredentialStatusItem {
+        id: entry.id,
+        created_at: entry.created_at,
+        updated_at: entry.updated_at,
+        priority: entry.priority,
+        disabled: entry.disabled,
+        failure_count: entry.failure_count,
+        is_current: entry.id == current_id,
+        expires_at: entry.expires_at,
+        auth_method: entry.auth_method,
+        provider: entry.provider,
+        region: entry.region,
+        auth_region: entry.auth_region,
+        api_region: entry.api_region,
+        effective_auth_region: entry.effective_auth_region,
+        effective_api_region: entry.effective_api_region,
+        has_profile_arn: entry.has_profile_arn,
+        refresh_token_hash: entry.refresh_token_hash,
+        api_key_hash: entry.api_key_hash,
+        masked_api_key: entry.masked_api_key,
+        email: entry.email,
+        subscription_title: entry.subscription_title,
+        account_info: None,
+        success_count: entry.success_count,
+        last_used_at: entry.last_used_at,
+        has_proxy: entry.has_proxy,
+        proxy_url: entry.proxy_url,
+        proxy_username: entry.proxy_username,
+        proxy_password: entry.proxy_password,
+        proxy_resource_id: entry.proxy_resource_id,
+        proxy_resource_name: entry.proxy_resource_name,
+        effective_proxy_url: entry.effective_proxy_url,
+        effective_proxy_source: entry.effective_proxy_source,
+        refresh_failure_count: entry.refresh_failure_count,
+        disabled_reason: entry.disabled_reason,
+        endpoint: entry
+            .endpoint
+            .unwrap_or_else(|| default_endpoint.to_string()),
+        cooled_down: entry.cooled_down,
+        cooldown_remaining_secs: entry.cooldown_remaining_secs,
+        cooldown_reason: entry.cooldown_reason,
+        rate_limited: entry.rate_limited,
+        rate_limit_remaining_secs: entry.rate_limit_remaining_secs,
+        in_flight_requests: entry.in_flight_requests,
+        oldest_in_flight_age_secs: entry.oldest_in_flight_age_secs,
+        newest_in_flight_idle_secs: entry.newest_in_flight_idle_secs,
+        max_concurrent_requests: entry.max_concurrent_requests,
+        max_concurrent_requests_override: entry.max_concurrent_requests_override,
+        in_flight_lease_max_secs: entry.in_flight_lease_max_secs,
+        warmup_remaining: entry.warmup_remaining,
+        transient_failure_streak: entry.transient_failure_streak,
+        recent_error_rate: entry.recent_error_rate,
+        latency_ewma_ms: entry.latency_ewma_ms,
+        last_error_kind: entry.last_error_kind,
+        last_error_reason: entry.last_error_reason,
+        last_error_at_ms: entry.last_error_at_ms,
+        in_probation: entry.in_probation,
+        probation_remaining_secs: entry.probation_remaining_secs,
+        scheduler_selection_count: entry.scheduler_selection_count,
+        recent_scheduler_selection_count_10s: entry.recent_scheduler_selection_count_10s,
+        recent_scheduler_selection_count_60s: entry.recent_scheduler_selection_count_60s,
+        recent_scheduler_selection_count_5m: entry.recent_scheduler_selection_count_5m,
+        scheduler_selection_pressure: entry.scheduler_selection_pressure,
+        scheduler_score: entry.scheduler_score,
+        estimated_cost_usd: 0.0,
+        priced_requests: 0,
+        unpriced_requests: 0,
+    }
+}
+
+fn credential_list_item_from_base(
+    credential: CredentialBaseSnapshot,
+    default_endpoint: &str,
+) -> CredentialListItem {
+    CredentialListItem {
+        id: credential.id,
+        created_at: credential.created_at,
+        updated_at: credential.updated_at,
+        priority: credential.priority,
+        disabled: credential.disabled,
+        disabled_reason: credential.disabled_reason,
+        auth_method: credential.auth_method,
+        provider: credential.provider,
+        region: credential.region,
+        auth_region: credential.auth_region,
+        api_region: credential.api_region,
+        effective_auth_region: credential.effective_auth_region,
+        effective_api_region: credential.effective_api_region,
+        has_profile_arn: credential.has_profile_arn,
+        refresh_token_hash: credential.refresh_token_hash,
+        api_key_hash: credential.api_key_hash,
+        masked_api_key: credential.masked_api_key,
+        email: credential.email,
+        subscription_title: credential.subscription_title,
+        has_proxy: credential.has_proxy,
+        proxy_url: credential.proxy_url,
+        proxy_username: credential.proxy_username,
+        proxy_password: credential.proxy_password,
+        proxy_resource_id: credential.proxy_resource_id,
+        proxy_resource_name: credential.proxy_resource_name,
+        effective_proxy_url: credential.effective_proxy_url,
+        effective_proxy_source: credential.effective_proxy_source,
+        endpoint: credential
+            .endpoint
+            .unwrap_or_else(|| default_endpoint.to_string()),
+        max_concurrent_requests_override: credential.max_concurrent_requests_override,
+        warmup_remaining: credential.warmup_remaining,
+    }
+}
+
+fn credential_runtime_item_from_snapshot(
+    credential: CredentialEntrySnapshot,
+    current_id: u64,
+) -> CredentialRuntimeItem {
+    CredentialRuntimeItem {
+        id: credential.id,
+        is_current: credential.id == current_id,
+        failure_count: credential.failure_count,
+        refresh_failure_count: credential.refresh_failure_count,
+        success_count: credential.success_count,
+        last_used_at: credential.last_used_at,
+        expires_at: credential.expires_at,
+        cooled_down: credential.cooled_down,
+        cooldown_remaining_secs: credential.cooldown_remaining_secs,
+        cooldown_reason: credential.cooldown_reason,
+        cooldowns: credential
+            .cooldowns
+            .into_iter()
+            .map(|cooldown| CredentialCooldown {
+                model: cooldown.model,
+                global: cooldown.global,
+                remaining_secs: cooldown.remaining_secs,
+                reason: cooldown.reason,
+            })
+            .collect(),
+        rate_limited: credential.rate_limited,
+        rate_limit_remaining_secs: credential.rate_limit_remaining_secs,
+        in_flight_requests: credential.in_flight_requests,
+        oldest_in_flight_age_secs: credential.oldest_in_flight_age_secs,
+        newest_in_flight_idle_secs: credential.newest_in_flight_idle_secs,
+        max_concurrent_requests: credential.max_concurrent_requests,
+        in_flight_lease_max_secs: credential.in_flight_lease_max_secs,
+        transient_failure_streak: credential.transient_failure_streak,
+        recent_error_rate: credential.recent_error_rate,
+        latency_ewma_ms: credential.latency_ewma_ms,
+        last_error_kind: credential.last_error_kind,
+        last_error_reason: credential.last_error_reason,
+        last_error_at_ms: credential.last_error_at_ms,
+        in_probation: credential.in_probation,
+        probation_remaining_secs: credential.probation_remaining_secs,
+        scheduler_selection_count: credential.scheduler_selection_count,
+        recent_scheduler_selection_count_10s: credential.recent_scheduler_selection_count_10s,
+        recent_scheduler_selection_count_60s: credential.recent_scheduler_selection_count_60s,
+        recent_scheduler_selection_count_5m: credential.recent_scheduler_selection_count_5m,
+        scheduler_selection_pressure: credential.scheduler_selection_pressure,
+        scheduler_score: credential.scheduler_score,
+    }
+}
+
+fn credential_account_info_item_from_row(
+    id: u64,
+    row: &CredentialAccountInfoRow,
+) -> CredentialAccountInfoItem {
+    let info = account_info_from_row(row);
+    CredentialAccountInfoItem {
+        id,
+        subscription_title: info.subscription_title,
+        current_usage: info.current_usage,
+        usage_limit: info.usage_limit,
+        remaining: info.remaining,
+        usage_percentage: info.usage_percentage,
+        credit_limit: info.credit_limit,
+        credit_remaining: info.credit_remaining,
+        credit_base: info.credit_base,
+        credit_bonus: info.credit_bonus,
+        next_reset_at: info.next_reset_at,
+        checked_at: info.checked_at,
+    }
+}
+
 fn normalize_balance_credit_snapshot(balance: &BalanceResponse) -> BalanceResponse {
     let credit = credit_snapshot_from_persisted_fields(
         balance.subscription_title.as_deref(),
@@ -3918,6 +4317,55 @@ fn sort_credentials_for_admin_display_with_query(
         compare_credentials_by(a, b, sort_by, sort_order)
             .then_with(|| compare_credentials_default(a, b))
     });
+}
+
+fn sort_credential_list_items_for_admin_display_with_query(
+    credentials: &mut [CredentialListItem],
+    query: &CredentialListQuery,
+) {
+    let sort_by = CredentialSortBy::parse(query.sort_by.as_deref());
+    if sort_by == CredentialSortBy::Default {
+        credentials.sort_by(compare_credential_list_default);
+        return;
+    }
+
+    let sort_order = CredentialSortOrder::parse(query.sort_order.as_deref(), sort_by);
+    credentials.sort_by(|a, b| {
+        compare_credential_list_by(a, b, sort_by, sort_order)
+            .then_with(|| compare_credential_list_default(a, b))
+    });
+}
+
+fn compare_credential_list_default(
+    a: &CredentialListItem,
+    b: &CredentialListItem,
+) -> std::cmp::Ordering {
+    a.disabled
+        .cmp(&b.disabled)
+        .then_with(|| {
+            compare_option_ord_desc_some_first(a.created_at.as_ref(), b.created_at.as_ref())
+        })
+        .then_with(|| b.id.cmp(&a.id))
+}
+
+fn compare_credential_list_by(
+    a: &CredentialListItem,
+    b: &CredentialListItem,
+    sort_by: CredentialSortBy,
+    sort_order: CredentialSortOrder,
+) -> std::cmp::Ordering {
+    match sort_by {
+        CredentialSortBy::Default => compare_credential_list_default(a, b),
+        CredentialSortBy::Id => sort_order.apply(a.id.cmp(&b.id)),
+        CredentialSortBy::CreatedAt => {
+            compare_option_ord_some_first(a.created_at.as_ref(), b.created_at.as_ref(), sort_order)
+        }
+        CredentialSortBy::UpdatedAt => {
+            compare_option_ord_some_first(a.updated_at.as_ref(), b.updated_at.as_ref(), sort_order)
+        }
+        CredentialSortBy::Priority => sort_order.apply(a.priority.cmp(&b.priority)),
+        _ => compare_credential_list_default(a, b),
+    }
 }
 
 fn compare_credentials_default(
@@ -4092,6 +4540,78 @@ fn credential_matches_query(
     true
 }
 
+fn credential_base_matches_query(
+    credential: &CredentialListItem,
+    query: &CredentialListQuery,
+) -> bool {
+    if let Some(proxy_resource_id) = query.proxy_resource_id {
+        if credential.proxy_resource_id != Some(proxy_resource_id) {
+            return false;
+        }
+    }
+
+    if let Some(auth_method) = query.auth_method.as_deref() {
+        let expected = auth_method.trim().to_lowercase();
+        if !expected.is_empty()
+            && expected != "all"
+            && credential
+                .auth_method
+                .as_deref()
+                .map(|value| value.to_lowercase())
+                .as_deref()
+                != Some(expected.as_str())
+        {
+            return false;
+        }
+    }
+
+    if let Some(status) = query.status.as_deref() {
+        let status = status.trim().to_lowercase();
+        let matched = match status.as_str() {
+            "" | "all" => true,
+            "enabled" => !credential.disabled,
+            "disabled" => credential.disabled,
+            "proxy_blocked" | "proxy-blocked" => matches!(
+                credential.effective_proxy_source.as_str(),
+                "resource_disabled" | "resource_missing"
+            ),
+            "unknown_subscription" | "unknown-subscription" => {
+                subscription_key(credential.subscription_title.as_deref()) == "unknown"
+            }
+            // Runtime-owned statuses are hydrated separately; keep the base list broad.
+            "current" | "cooldown" | "rate_limited" | "rate-limited" | "error" => true,
+            _ => true,
+        };
+        if !matched {
+            return false;
+        }
+    }
+
+    if let Some(subscription) = query.subscription.as_deref() {
+        let expected = subscription.trim().to_lowercase();
+        if !expected.is_empty() && expected != "all" {
+            let key = subscription_key(credential.subscription_title.as_deref());
+            let title_match = credential
+                .subscription_title
+                .as_deref()
+                .map(|value| value.to_lowercase().contains(&expected))
+                .unwrap_or(false);
+            if key != expected && !title_match {
+                return false;
+            }
+        }
+    }
+
+    if let Some(q) = query.q.as_deref() {
+        let q = q.trim().to_lowercase();
+        if !q.is_empty() && !credential_base_search_text(credential).contains(&q) {
+            return false;
+        }
+    }
+
+    true
+}
+
 fn credential_subscription_title(credential: &CredentialStatusItem) -> Option<String> {
     credential
         .account_info
@@ -4118,6 +4638,33 @@ fn credential_search_text(credential: &CredentialStatusItem) -> String {
         credential.last_error_reason.clone(),
         Some(credential.endpoint.clone()),
         credential.auth_method.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ")
+    .to_lowercase()
+}
+
+fn credential_base_search_text(credential: &CredentialListItem) -> String {
+    [
+        Some(credential.id.to_string()),
+        credential.email.clone(),
+        credential.masked_api_key.clone(),
+        credential.refresh_token_hash.clone(),
+        credential.api_key_hash.clone(),
+        credential.subscription_title.clone(),
+        credential.proxy_resource_name.clone(),
+        credential.proxy_url.clone(),
+        credential.effective_proxy_url.clone(),
+        Some(credential.effective_proxy_source.clone()),
+        credential.disabled_reason.clone(),
+        Some(credential.endpoint.clone()),
+        credential.auth_method.clone(),
+        credential.provider.clone(),
+        credential.region.clone(),
+        credential.auth_region.clone(),
+        credential.api_region.clone(),
     ]
     .into_iter()
     .flatten()

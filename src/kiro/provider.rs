@@ -364,12 +364,14 @@ impl KiroStreamResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Instant;
 
     use chrono::{Duration, Utc};
 
     use super::{CredentialRiskControlReason, KiroProvider, KiroStreamCompletion};
+    use crate::kiro::endpoint::{IdeEndpoint, KiroEndpoint};
     use crate::kiro::model::credentials::KiroCredentials;
     use crate::kiro::token_manager::MultiTokenManager;
     use crate::model::config::Config;
@@ -734,6 +736,36 @@ mod tests {
         config.credential_retry_max_attempts = 12;
 
         assert_eq!(KiroProvider::test_max_retry_attempts(25, &config), 12);
+    }
+
+    #[tokio::test]
+    async fn mcp_local_acquire_failure_stops_retry_loop() {
+        let mut config = Config::default();
+        config.credential_retry_max_attempts = 100_000;
+
+        let mut disabled = KiroCredentials::default();
+        disabled.disabled = true;
+        let manager =
+            Arc::new(MultiTokenManager::new(config, vec![disabled], None, None, false).unwrap());
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+        let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            provider.call_mcp("{}"),
+        )
+        .await
+        .expect("本地无可用凭据时 MCP 不应跑满 retry 上限")
+        .err()
+        .unwrap()
+        .to_string();
+
+        assert!(
+            err.contains("所有凭据均已禁用"),
+            "错误应直接来自本地调度失败，实际: {}",
+            err
+        );
     }
 }
 
@@ -1601,8 +1633,15 @@ impl KiroProvider {
             {
                 Ok(c) => c,
                 Err(e) => {
-                    last_error = Some(e);
-                    continue;
+                    if last_error.is_none() {
+                        last_error = Some(e);
+                    } else {
+                        tracing::warn!(
+                            error = %e,
+                            "MCP 获取凭据失败，但保留之前的上游错误"
+                        );
+                    }
+                    break;
                 }
             };
             ctx.mark_in_flight_kind(InFlightKind::Mcp);
@@ -3045,16 +3084,11 @@ impl KiroProvider {
 
     fn bad_request_reason_label(reason: &str) -> &'static str {
         match reason {
-            "assistant_prefill_bad_request" => {
-                "assistant prefill 协议错误，请检查消息尾部是否仍包含 assistant"
-            }
-            "profile_arn_bad_request" => {
-                "profileArn 协议错误，请检查 authMethod/provider/profileArn 解析结果"
-            }
-            "malformed_request" => {
-                "请求体结构错误，请检查消息顺序、工具调用结果配对、工具 schema、多模态内容或请求体大小"
-            }
-            _ => "请求参数错误",
+            "assistant_prefill_bad_request"
+            | "profile_arn_bad_request"
+            | "malformed_request"
+            | "bad_request" => "请求无效",
+            _ => "请求无效",
         }
     }
 

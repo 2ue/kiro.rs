@@ -23,28 +23,70 @@ import { CredentialExportDialog } from '@/components/credential-export-dialog'
 import { ProxyResourcesPanel } from '@/components/proxy-resources-panel'
 import { AccountValidationPanel } from '@/components/account-validation-panel'
 import { ExternalPoolsPanel } from '@/components/external-pools-panel'
-import { useCredentialsPage, useDeleteCredential, useResetFailure, useLoadBalancingMode, useProxyResources, useRuntimeConfig, useSetLoadBalancingMode } from '@/hooks/use-credentials'
-import { getCredentialInfo, refreshCredentialInfo, forceRefreshToken, getCredentials, testCredential } from '@/api/credentials'
+import {
+  useCredentialsAccountInfo,
+  useCredentialsList,
+  useCredentialsRuntime,
+  useCredentialsSummary,
+  useCredentialsUsageSummary,
+  useDeleteCredential,
+  useDeleteDisabledCredentials,
+  useLoadBalancingMode,
+  useProxyResources,
+  useResetFailure,
+  useRuntimeConfig,
+  useSetLoadBalancingMode,
+} from '@/hooks/use-credentials'
+import { getCredentialInfo, refreshCredentialInfo, forceRefreshToken, testCredential } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
-import type { BalanceResponse, CredentialSortBy, CredentialSortOrder, CredentialStatusItem, LoadBalancingMode } from '@/types/api'
+import type { BalanceResponse, CredentialListItem, CredentialSortBy, CredentialSortOrder, CredentialStatusItem, LoadBalancingMode } from '@/types/api'
 
 const credentialSortOptions: Array<{ value: CredentialSortBy; label: string }> = [
   { value: 'default', label: '默认排序' },
   { value: 'created_at', label: '创建时间' },
   { value: 'updated_at', label: '更新时间' },
   { value: 'priority', label: '优先级' },
-  { value: 'last_used_at', label: '最后使用' },
-  { value: 'success_count', label: '成功次数' },
-  { value: 'failure_count', label: '失败次数' },
-  { value: 'refresh_failure_count', label: '刷新失败' },
-  { value: 'estimated_cost', label: '本地成本' },
-  { value: 'usage_percentage', label: '额度使用率' },
-  { value: 'remaining_quota', label: '剩余额度' },
-  { value: 'in_flight_requests', label: '并发占用' },
-  { value: 'scheduler_score', label: '调度评分' },
   { value: 'id', label: 'ID' },
 ]
+
+function credentialFromListItem(item: CredentialListItem): CredentialStatusItem {
+  return {
+    ...item,
+    failureCount: 0,
+    isCurrent: false,
+    expiresAt: null,
+    accountInfo: undefined,
+    successCount: 0,
+    lastUsedAt: null,
+    refreshFailureCount: 0,
+    cooledDown: false,
+    cooldownRemainingSecs: 0,
+    cooldowns: [],
+    rateLimited: false,
+    rateLimitRemainingSecs: 0,
+    inFlightRequests: 0,
+    oldestInFlightAgeSecs: 0,
+    newestInFlightIdleSecs: 0,
+    maxConcurrentRequests: 0,
+    inFlightLeaseMaxSecs: 0,
+    transientFailureStreak: 0,
+    recentErrorRate: 0,
+    latencyEwmaMs: null,
+    lastErrorAtMs: null,
+    inProbation: false,
+    probationRemainingSecs: 0,
+    schedulerSelectionCount: 0,
+    recentSchedulerSelectionCount10s: 0,
+    recentSchedulerSelectionCount60s: 0,
+    recentSchedulerSelectionCount5m: 0,
+    schedulerSelectionPressure: 0,
+    schedulerScore: 0,
+    estimatedCostUsd: 0,
+    pricedRequests: 0,
+    unpricedRequests: 0,
+  }
+}
 
 interface DashboardProps {
   onLogout: () => void
@@ -87,30 +129,100 @@ export function Dashboard({ onLogout }: DashboardProps) {
   })
 
   const queryClient = useQueryClient()
-  const { data, isLoading, error, refetch, isFetching, isPlaceholderData } = useCredentialsPage({
-    page: currentPage,
-    limit: itemsPerPage,
-    q: queryText.trim() || undefined,
-    status: statusFilter !== 'all' ? statusFilter : undefined,
-    authMethod: authFilter !== 'all' ? authFilter : undefined,
-    subscription: subscriptionFilter !== 'all' ? subscriptionFilter : undefined,
-    proxyResourceId: proxyFilter !== 'all' ? Number(proxyFilter) : undefined,
-    sortBy: sortBy !== 'default' ? sortBy : undefined,
-    sortOrder: sortBy !== 'default' ? sortOrder : undefined,
-  })
+  const credentialsQuery = useMemo(
+    () => ({
+      page: currentPage,
+      limit: itemsPerPage,
+      q: queryText.trim() || undefined,
+      status: statusFilter !== 'all' ? statusFilter : undefined,
+      authMethod: authFilter !== 'all' ? authFilter : undefined,
+      subscription: subscriptionFilter !== 'all' ? subscriptionFilter : undefined,
+      proxyResourceId: proxyFilter !== 'all' ? Number(proxyFilter) : undefined,
+      sortBy: sortBy !== 'default' ? sortBy : undefined,
+      sortOrder: sortBy !== 'default' ? sortOrder : undefined,
+    }),
+    [authFilter, currentPage, proxyFilter, queryText, sortBy, sortOrder, statusFilter, subscriptionFilter]
+  )
+  const {
+    data: listData,
+    isLoading: isListLoading,
+    error: listError,
+    refetch: refetchList,
+    isFetching: isListFetching,
+    isPlaceholderData: isListPlaceholderData,
+  } = useCredentialsList(credentialsQuery)
+  const {
+    data: summaryData,
+    isLoading: isSummaryLoading,
+    error: summaryError,
+    refetch: refetchSummary,
+  } = useCredentialsSummary()
+  const visibleCredentialIds = useMemo(
+    () => listData?.items.map((credential) => credential.id) || [],
+    [listData?.items]
+  )
+  const runtimeQuery = useCredentialsRuntime(visibleCredentialIds)
+  const accountInfoQuery = useCredentialsAccountInfo(visibleCredentialIds)
+  const usageSummaryQuery = useCredentialsUsageSummary(visibleCredentialIds)
   const { mutate: deleteCredential } = useDeleteCredential()
+  const deleteDisabled = useDeleteDisabledCredentials()
   const { mutate: resetFailure } = useResetFailure()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { data: proxyResourcesData } = useProxyResources()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
   const runtimeConfig = useRuntimeConfig()
+  const refetch = () => {
+    refetchList()
+    refetchSummary()
+    runtimeQuery.refetch()
+    accountInfoQuery.refetch()
+    usageSummaryQuery.refetch()
+  }
 
   // 计算分页
-  const totalPages = data?.totalPages || 0
-  const credentialsPage = data?.page
-  const pageTransitionPending = credentialsPage !== undefined && (isPlaceholderData || (isFetching && credentialsPage !== currentPage))
-  const currentCredentials = useMemo(() => data?.credentials || [], [data?.credentials])
-  const disabledCredentialCount = Math.max((data?.total || 0) - (data?.available || 0), 0)
+  const totalPages = listData?.totalPages || 0
+  const credentialsPage = listData?.page
+  const isLoading = isListLoading || isSummaryLoading
+  const error = listError || summaryError
+  const pageTransitionPending = credentialsPage !== undefined && (isListPlaceholderData || (isListFetching && credentialsPage !== currentPage))
+  const data = useMemo(() => {
+    if (!listData && !summaryData) {
+      return undefined
+    }
+    return {
+      total: summaryData?.total ?? listData?.total ?? 0,
+      available: summaryData?.available ?? listData?.available ?? 0,
+      currentId: summaryData?.currentId || 0,
+      globalInFlightRequests: summaryData?.globalInFlightRequests ?? 0,
+      queuedRequests: summaryData?.queuedRequests ?? 0,
+      globalMaxConcurrentRequests: summaryData?.globalMaxConcurrentRequests ?? 0,
+      maxQueuedRequests: summaryData?.maxQueuedRequests ?? 0,
+      page: listData?.page ?? currentPage,
+      limit: listData?.limit ?? itemsPerPage,
+      totalPages: listData?.totalPages ?? 0,
+      filteredTotal: listData?.filteredTotal ?? 0,
+      filteredAvailable: listData?.filteredAvailable ?? 0,
+    }
+  }, [currentPage, listData, summaryData])
+  const currentCredentials = useMemo(() => {
+    const runtimeById = new Map((runtimeQuery.data?.items || []).map((item) => [item.id, item]))
+    const accountById = new Map((accountInfoQuery.data?.items || []).map((item) => [item.id, item]))
+    const usageById = new Map((usageSummaryQuery.data?.items || []).map((item) => [item.id, item]))
+    return (listData?.items || []).map((item) => {
+      const runtimeItem = runtimeById.get(item.id)
+      const usageItem = usageById.get(item.id)
+      return {
+        ...credentialFromListItem(item),
+        ...runtimeItem,
+        ...item,
+        accountInfo: accountById.get(item.id),
+        estimatedCostUsd: usageItem?.estimatedCostUsd ?? 0,
+        pricedRequests: usageItem?.pricedRequests ?? 0,
+        unpricedRequests: usageItem?.unpricedRequests ?? 0,
+      }
+    })
+  }, [accountInfoQuery.data?.items, listData?.items, runtimeQuery.data?.items, usageSummaryQuery.data?.items])
+  const disabledCredentialCount = summaryData?.disabled ?? Math.max((data?.total || 0) - (data?.available || 0), 0)
   const selectedDisabledCount = Array.from(selectedIds).filter(id => {
     const credential = currentCredentials.find(c => c.id === id)
     return Boolean(credential?.disabled)
@@ -139,7 +251,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
   useEffect(() => {
-    if (!data?.credentials) {
+    if (!listData?.items) {
       setBalanceMap(new Map())
       setLoadingBalanceIds(new Set())
       return
@@ -169,7 +281,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       })
       return next.size === prev.size ? prev : next
     })
-  }, [currentCredentials, data?.credentials])
+  }, [currentCredentials, listData?.items])
 
   const toggleDarkMode = () => {
     setDarkMode(!darkMode)
@@ -367,54 +479,26 @@ export function Dashboard({ onLogout }: DashboardProps) {
       return
     }
 
-    let allCredentials
-    try {
-      allCredentials = await getCredentials()
-    } catch (error) {
-      toast.error(`加载凭据失败: ${extractErrorMessage(error)}`)
-      return
-    }
-
-    const disabledCredentials = allCredentials.credentials.filter(credential => credential.disabled)
-
-    if (disabledCredentials.length === 0) {
+    if (disabledCredentialCount === 0) {
       toast.error('没有可清除的已禁用凭据')
       return
     }
 
-    if (!confirm(`确定要清除所有 ${disabledCredentials.length} 个已禁用凭据吗？此操作无法撤销。`)) {
+    if (!confirm(`确定要清除所有 ${disabledCredentialCount} 个已禁用凭据吗？此操作无法撤销。`)) {
       return
     }
 
-    let successCount = 0
-    let failCount = 0
-
-    for (const credential of disabledCredentials) {
-      try {
-        await new Promise<void>((resolve, reject) => {
-          deleteCredential(credential.id, {
-            onSuccess: () => {
-              successCount++
-              resolve()
-            },
-            onError: (err) => {
-              failCount++
-              reject(err)
-            }
-          })
-        })
-      } catch (error) {
-        // 错误已在 onError 中处理
+    try {
+      const response = await deleteDisabled.mutateAsync()
+      if (response.failed === 0) {
+        toast.success(`成功清除 ${response.success} 个已禁用凭据`)
+      } else {
+        toast.warning(`清除已禁用凭据：成功 ${response.success} 个，失败 ${response.failed} 个`)
       }
+      deselectAll()
+    } catch (error) {
+      toast.error(`清除已禁用凭据失败: ${extractErrorMessage(error)}`)
     }
-
-    if (failCount === 0) {
-      toast.success(`成功清除所有 ${successCount} 个已禁用凭据`)
-    } else {
-      toast.warning(`清除已禁用凭据：成功 ${successCount} 个，失败 ${failCount} 个`)
-    }
-
-    deselectAll()
   }
 
   const fetchBalanceForCredential = async (id: number) => {
@@ -912,11 +996,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   size="sm"
                   variant="outline"
                   className="text-destructive hover:text-destructive"
-                  disabled={disabledCredentialCount === 0}
+                  disabled={disabledCredentialCount === 0 || deleteDisabled.isPending}
                   title={disabledCredentialCount === 0 ? '没有可清除的已禁用凭据' : undefined}
                 >
-                  <Trash2 className="h-4 w-4 mr-2" />
-                  清除已禁用
+                  <Trash2 className={`h-4 w-4 mr-2 ${deleteDisabled.isPending ? 'animate-pulse' : ''}`} />
+                  {deleteDisabled.isPending ? '清除中...' : '清除已禁用'}
                 </Button>
               )}
               <Button onClick={() => setKamImportDialogOpen(true)} size="sm" variant="outline">
@@ -975,11 +1059,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               <option value="all">全部状态</option>
               <option value="enabled">启用</option>
               <option value="disabled">已禁用</option>
-              <option value="current">当前活跃</option>
-              <option value="cooldown">冷却中</option>
-              <option value="rate_limited">限流中</option>
               <option value="proxy_blocked">代理不可用</option>
-              <option value="error">有错误</option>
               <option value="unknown_subscription">未知订阅</option>
             </select>
             <select

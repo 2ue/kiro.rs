@@ -1311,13 +1311,20 @@ impl StreamContext {
     where
         F: FnOnce(super::cache::CacheUsage) -> super::cache::CacheUsage,
     {
-        let usage = super::cache::build_usage_with_simulation(
-            None,
-            self.input_tokens,
-            1,
-            self.simulated_usage,
-        );
-        let usage = usage_mapper(self.reported_usage_for_downstream(usage)).to_json();
+        // message_start is emitted before final context/metadata usage is known.
+        // Keep input/cache neutral here; the final message_delta carries the
+        // authoritative downstream usage. Some callers only overwrite positive
+        // fields, so early non-zero cache values can become stale.
+        let usage = usage_mapper(super::cache::CacheUsage {
+            total_input_tokens: self.input_tokens,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        })
+        .to_anthropic_usage_json();
         json!({
             "type": "message_start",
             "message": {
@@ -2402,7 +2409,7 @@ impl StreamContext {
         // 生成最终事件
         events.extend(
             self.state_manager
-                .generate_final_events_with_usage(reported_usage.to_json()),
+                .generate_final_events_with_usage(reported_usage.to_anthropic_usage_json()),
         );
         events
     }
@@ -2628,6 +2635,95 @@ mod tests {
             .expect("message_delta should exist");
         assert_eq!(message_delta.data["usage"]["input_tokens"], 100);
         assert_eq!(message_delta.data["usage"]["output_tokens"], 9);
+    }
+
+    #[test]
+    fn test_stream_usage_is_sub2api_compatible() {
+        let mut ctx = StreamContext::new_with_simulation(
+            "test-model",
+            100_000,
+            200_000,
+            false,
+            true,
+            HashMap::new(),
+            Some(crate::anthropic::cache::CacheSimulation {
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 50_000,
+                cache_creation_5m_input_tokens: 0,
+                cache_creation_1h_input_tokens: 0,
+                target_cache_ratio: None,
+                amplification: None,
+            }),
+            PromptCacheSimulationMode::HighCache,
+        );
+        ctx.set_reported_cache_usage_policy(
+            crate::anthropic::cache::ReportedCacheUsagePolicy::new(3_000, 96, 7),
+        );
+
+        let initial_events = ctx.generate_initial_events();
+        let message_start = initial_events
+            .iter()
+            .find(|e| e.event == "message_start")
+            .expect("message_start should exist");
+        let start_usage = &message_start.data["message"]["usage"];
+        assert_eq!(start_usage["input_tokens"], 0);
+        assert_eq!(start_usage["output_tokens"], 0);
+        assert_eq!(start_usage["cache_creation_input_tokens"], 0);
+        assert_eq!(start_usage["cache_read_input_tokens"], 0);
+        assert!(start_usage.get("cache_creation_5m_input_tokens").is_none());
+        assert!(start_usage.get("cache_creation_1h_input_tokens").is_none());
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_assistant_response("hello"));
+        all_events.extend(ctx.generate_final_events());
+
+        let message_delta = all_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("message_delta should exist");
+        let final_usage = &message_delta.data["usage"];
+        let final_input = final_usage["input_tokens"].as_i64().expect("input");
+        let final_output = final_usage["output_tokens"].as_i64().expect("output");
+        let final_cache_creation = final_usage["cache_creation_input_tokens"]
+            .as_i64()
+            .expect("cache creation");
+        let final_cache_read = final_usage["cache_read_input_tokens"]
+            .as_i64()
+            .expect("cache read");
+
+        assert!((1..=96).contains(&final_input));
+        assert!(final_output > 0);
+        assert_eq!(final_usage["cache_creation_input_tokens"], 0);
+        assert!(final_cache_read > 50_000);
+        assert!(final_usage.get("cache_creation_5m_input_tokens").is_none());
+        assert!(final_usage.get("cache_creation_1h_input_tokens").is_none());
+
+        let mut sub2api_input = start_usage["input_tokens"].as_i64().unwrap_or_default();
+        let mut sub2api_output = start_usage["output_tokens"].as_i64().unwrap_or_default();
+        let mut sub2api_cache_creation = start_usage["cache_creation_input_tokens"]
+            .as_i64()
+            .unwrap_or_default();
+        let mut sub2api_cache_read = start_usage["cache_read_input_tokens"]
+            .as_i64()
+            .unwrap_or_default();
+
+        if final_input > 0 {
+            sub2api_input = final_input;
+        }
+        if final_output > 0 {
+            sub2api_output = final_output;
+        }
+        if final_cache_creation > 0 {
+            sub2api_cache_creation = final_cache_creation;
+        }
+        if final_cache_read > 0 {
+            sub2api_cache_read = final_cache_read;
+        }
+
+        assert_eq!(sub2api_input, final_input);
+        assert_eq!(sub2api_output, final_output);
+        assert_eq!(sub2api_cache_creation, final_cache_creation);
+        assert_eq!(sub2api_cache_read, final_cache_read);
     }
 
     #[test]

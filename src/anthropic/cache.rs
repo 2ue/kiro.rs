@@ -23,14 +23,12 @@ pub struct CacheUsage {
 }
 
 impl CacheUsage {
-    pub fn to_json(self) -> serde_json::Value {
+    pub fn to_anthropic_usage_json(self) -> serde_json::Value {
         json!({
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "cache_creation_input_tokens": self.cache_creation_input_tokens,
-            "cache_read_input_tokens": self.cache_read_input_tokens,
-            "cache_creation_5m_input_tokens": self.cache_creation_5m_input_tokens,
-            "cache_creation_1h_input_tokens": self.cache_creation_1h_input_tokens
+            "cache_read_input_tokens": self.cache_read_input_tokens
         })
     }
 
@@ -937,6 +935,7 @@ impl CacheSimulation {
     }
 }
 
+#[cfg(test)]
 pub fn build_usage_with_simulation(
     metadata_usage: Option<&MetadataTokenUsage>,
     total_input_tokens: i32,

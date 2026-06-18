@@ -5,10 +5,16 @@ import {
   clearCredentialInFlight,
   createProxyResource,
   deleteCredential,
+  deleteDisabledCredentials,
   deleteProxyResource,
   forceRefreshToken,
+  getCredentialAccountInfo,
   getCredentialBalance,
   getCredentialCreditSummary,
+  getCredentialList,
+  getCredentialRuntime,
+  getCredentialSummary,
+  getCredentialUsageSummary,
   getCredentials,
   getCredentialsPage,
   getLoadBalancingMode,
@@ -41,6 +47,11 @@ import type {
 
 function invalidateCredentialCaches(queryClient: ReturnType<typeof useQueryClient>, id?: number) {
   queryClient.invalidateQueries({ queryKey: ['credentials'] })
+  queryClient.invalidateQueries({ queryKey: ['credential-list'] })
+  queryClient.invalidateQueries({ queryKey: ['credential-summary'] })
+  queryClient.invalidateQueries({ queryKey: ['credential-runtime'] })
+  queryClient.invalidateQueries({ queryKey: ['credential-account-info'] })
+  queryClient.invalidateQueries({ queryKey: ['credential-usage-summary'] })
   queryClient.invalidateQueries({ queryKey: ['credentials-page'] })
   queryClient.invalidateQueries({ queryKey: ['credential-credit-summary'] })
   if (typeof id === 'number') queryClient.invalidateQueries({ queryKey: ['credential-balance', id] })
@@ -61,6 +72,53 @@ export function useCredentialsPage(query: CredentialsPageQuery) {
     queryKey: ['credentials-page', query],
     queryFn: () => getCredentialsPage(query),
     refetchInterval: 30000,
+    placeholderData: (previousData) => previousData,
+  })
+}
+
+export function useCredentialList(query: CredentialsPageQuery) {
+  return useQuery({
+    queryKey: ['credential-list', query],
+    queryFn: () => getCredentialList(query),
+    refetchInterval: 30000,
+    placeholderData: (previousData) => previousData,
+  })
+}
+
+export function useCredentialSummary() {
+  return useQuery({
+    queryKey: ['credential-summary'],
+    queryFn: getCredentialSummary,
+    refetchInterval: 5000,
+  })
+}
+
+export function useCredentialRuntime(ids: number[]) {
+  return useQuery({
+    queryKey: ['credential-runtime', ids],
+    queryFn: () => getCredentialRuntime(ids),
+    enabled: ids.length > 0,
+    refetchInterval: 5000,
+    placeholderData: (previousData) => previousData,
+  })
+}
+
+export function useCredentialAccountInfo(ids: number[], options: { enabled?: boolean; refetchInterval?: number | false } = {}) {
+  return useQuery({
+    queryKey: ['credential-account-info', ids],
+    queryFn: () => getCredentialAccountInfo(ids),
+    enabled: (options.enabled ?? true) && ids.length > 0,
+    refetchInterval: options.refetchInterval ?? 60000,
+    placeholderData: (previousData) => previousData,
+  })
+}
+
+export function useCredentialUsageSummary(ids: number[], options: { enabled?: boolean; refetchInterval?: number | false } = {}) {
+  return useQuery({
+    queryKey: ['credential-usage-summary', ids],
+    queryFn: () => getCredentialUsageSummary(ids),
+    enabled: (options.enabled ?? true) && ids.length > 0,
+    refetchInterval: options.refetchInterval ?? 30000,
     placeholderData: (previousData) => previousData,
   })
 }
@@ -228,6 +286,14 @@ export function useDeleteCredential() {
   return useMutation({
     mutationFn: (id: number) => deleteCredential(id),
     onSuccess: (_data, id) => invalidateCredentialCaches(queryClient, id),
+  })
+}
+
+export function useDeleteDisabledCredentials() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: deleteDisabledCredentials,
+    onSuccess: () => invalidateCredentialCaches(queryClient),
   })
 }
 

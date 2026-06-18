@@ -1272,6 +1272,14 @@ pub struct Config {
     #[serde(default = "default_kiro_upstream_response_timeout_secs")]
     pub kiro_upstream_response_timeout_secs: u64,
 
+    /// Kiro 上游基础 URL 覆盖。
+    ///
+    /// 默认 `None` 时使用官方 `https://q.{region}.amazonaws.com`。仅用于本地压测、
+    /// staging 或显式内网代理验证；生产不配置时不会改变官方调用协议。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kiro_upstream_base_url: Option<String>,
+
     /// 单次上游调用最多尝试多少个凭据/重试轮次。
     ///
     /// `0` 表示自动：按当前凭据数量放大，至少覆盖一轮可用凭据；
@@ -1955,6 +1963,7 @@ impl Default for Config {
             credential_max_cooldown_secs: default_credential_max_cooldown_secs(),
             credential_dispatch_max_wait_secs: default_credential_dispatch_max_wait_secs(),
             kiro_upstream_response_timeout_secs: default_kiro_upstream_response_timeout_secs(),
+            kiro_upstream_base_url: None,
             credential_retry_max_attempts: 0,
             credential_in_flight_lease_max_secs: default_credential_in_flight_lease_max_secs(),
             dispatch_global_max_concurrent_requests: 0,
@@ -2174,6 +2183,7 @@ mod tests {
         assert_eq!(config.credential_max_cooldown_secs, 300);
         assert_eq!(config.credential_dispatch_max_wait_secs, 120);
         assert_eq!(config.kiro_upstream_response_timeout_secs, 180);
+        assert_eq!(config.kiro_upstream_base_url, None);
         assert_eq!(config.credential_retry_max_attempts, 0);
         assert_eq!(config.credential_in_flight_lease_max_secs, 900);
         assert_eq!(config.dispatch_global_max_concurrent_requests, 0);

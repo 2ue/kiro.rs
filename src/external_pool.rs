@@ -588,7 +588,7 @@ impl ExternalPoolManager {
         for pool in pools {
             let (in_flight, global_in_flight, cooldown_remaining_secs, cooldown_reason) =
                 self.pool_runtime_snapshot(pool.id).await;
-            let skipped_reason = self.skip_reason(
+            let skipped_reason = Self::skip_reason(
                 &pool,
                 in_flight,
                 global_in_flight,
@@ -1237,45 +1237,19 @@ impl ExternalPoolManager {
             }
             let (in_flight, global_in_flight, cooldown_remaining_secs, _) =
                 self.pool_runtime_snapshot(pool.id).await;
-            if self
-                .skip_reason(
-                    &pool,
-                    in_flight,
-                    global_in_flight,
-                    cooldown_remaining_secs,
-                    config,
-                )
-                .is_none()
+            if Self::skip_reason(
+                &pool,
+                in_flight,
+                global_in_flight,
+                cooldown_remaining_secs,
+                config,
+            )
+            .is_none()
             {
                 candidates.push((pool, in_flight));
             }
         }
-        candidates.sort_by(|(a, a_in_flight), (b, b_in_flight)| {
-            let a_load = load_score(*a_in_flight, a.max_concurrent_requests);
-            let b_load = load_score(*b_in_flight, b.max_concurrent_requests);
-            a.priority
-                .cmp(&b.priority)
-                .then_with(|| a_load.cmp(&b_load))
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        let (best_priority, best_load) = candidates.first().map(|(pool, in_flight)| {
-            (
-                pool.priority,
-                load_score(*in_flight, pool.max_concurrent_requests),
-            )
-        })?;
-        let best: Vec<_> = candidates
-            .into_iter()
-            .filter(|(pool, in_flight)| {
-                pool.priority == best_priority
-                    && load_score(*in_flight, pool.max_concurrent_requests) == best_load
-            })
-            .collect();
-        if best.is_empty() {
-            return None;
-        }
-        let idx = fastrand::usize(..best.len());
-        best.into_iter().nth(idx).map(|(pool, _)| pool)
+        select_external_pool_candidate(candidates)
     }
 
     async fn pool_availability_snapshot(
@@ -1300,7 +1274,7 @@ impl ExternalPoolManager {
             snapshot.eligible_pools += 1;
             let (in_flight, global_in_flight, cooldown_remaining_secs, _) =
                 self.pool_runtime_snapshot(pool.id).await;
-            match self.skip_reason(
+            match Self::skip_reason(
                 &pool,
                 in_flight,
                 global_in_flight,
@@ -1455,7 +1429,6 @@ impl ExternalPoolManager {
     }
 
     fn skip_reason(
-        &self,
         pool: &ExternalPool,
         in_flight: u32,
         global_in_flight: u32,
@@ -1533,7 +1506,7 @@ impl ExternalPoolManager {
             Ok(None) => {
                 let (in_flight, global_in_flight, cooldown_remaining_secs, _) =
                     self.pool_runtime_snapshot(pool.id).await;
-                let skip_reason = self.skip_reason(
+                let skip_reason = Self::skip_reason(
                     pool,
                     in_flight,
                     global_in_flight,
@@ -2103,6 +2076,37 @@ fn rule_matches(rule: &str, value: &str) -> bool {
 fn load_score(in_flight: u32, max: u32) -> u64 {
     let max = max.max(1) as u64;
     ((in_flight as u64) * 1_000_000) / max
+}
+
+fn select_external_pool_candidate(
+    mut candidates: Vec<(ExternalPool, u32)>,
+) -> Option<ExternalPool> {
+    candidates.sort_by(|(a, a_in_flight), (b, b_in_flight)| {
+        let a_load = load_score(*a_in_flight, a.max_concurrent_requests);
+        let b_load = load_score(*b_in_flight, b.max_concurrent_requests);
+        a.priority
+            .cmp(&b.priority)
+            .then_with(|| a_load.cmp(&b_load))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let (best_priority, best_load) = candidates.first().map(|(pool, in_flight)| {
+        (
+            pool.priority,
+            load_score(*in_flight, pool.max_concurrent_requests),
+        )
+    })?;
+    let best: Vec<_> = candidates
+        .into_iter()
+        .filter(|(pool, in_flight)| {
+            pool.priority == best_priority
+                && load_score(*in_flight, pool.max_concurrent_requests) == best_load
+        })
+        .collect();
+    if best.is_empty() {
+        return None;
+    }
+    let idx = fastrand::usize(..best.len());
+    best.into_iter().nth(idx).map(|(pool, _)| pool)
 }
 
 fn external_pool_lease_touch_deadline(last_touch_at: Instant) -> Instant {
@@ -2938,7 +2942,7 @@ fn project_usage_value(
         .clone()
         .map(|policy| policy.apply_final_cache_read_guard(projected))
         .unwrap_or(projected);
-    let projected_json = projected.to_json();
+    let projected_json = projected.to_anthropic_usage_json();
     let Some(obj) = usage.as_object_mut() else {
         return None;
     };
@@ -2948,6 +2952,9 @@ fn project_usage_value(
     for (key, value) in projected_obj {
         obj.insert(key.clone(), value.clone());
     }
+    obj.remove("cache_creation_5m_input_tokens");
+    obj.remove("cache_creation_1h_input_tokens");
+    obj.remove("cache_creation");
     Some(ProjectedExternalUsage {
         shaped,
         reported: projected,
@@ -3304,7 +3311,54 @@ fn usage_i32(value: &serde_json::Value, key: &str) -> i32 {
 mod tests {
     use super::*;
     use crate::anthropic::types::{Message, Metadata, SystemMessage};
+    use crate::model::config::Config;
     use crate::model::config::{ReportedUsageFieldPolicy, ReportedUsagePathPolicy};
+
+    fn test_postgres_config() -> Option<Config> {
+        let url = std::env::var("KIRO_RS_TEST_POSTGRES_URL").ok()?;
+        let mut config = Config::default();
+        config.postgres.url = Some(url);
+        config.postgres.max_connections = 2;
+        Some(config)
+    }
+
+    fn test_redis_config() -> Option<Config> {
+        let url = std::env::var("KIRO_RS_TEST_REDIS_URL").ok()?;
+        let mut config = Config::default();
+        config.redis.url = Some(url);
+        config.redis.key_prefix = format!("kiro_rs:test:external_pool:{}", uuid::Uuid::new_v4());
+        Some(config)
+    }
+
+    async fn test_external_pool_manager() -> Option<(ExternalPoolManager, Arc<PostgresStore>)> {
+        let Some(postgres_config) = test_postgres_config() else {
+            eprintln!("跳过外部备用池集成测试：未设置 KIRO_RS_TEST_POSTGRES_URL");
+            return None;
+        };
+        let Some(redis_config) = test_redis_config() else {
+            eprintln!("跳过外部备用池集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return None;
+        };
+        let postgres = Arc::new(PostgresStore::connect_test(&postgres_config).await.unwrap());
+        let redis = Arc::new(RedisStore::connect(&redis_config).await.unwrap());
+        Some((ExternalPoolManager::new(postgres.clone(), redis), postgres))
+    }
+
+    fn create_pool_request(name: &str, priority: i32, enabled: bool) -> CreateExternalPoolRequest {
+        CreateExternalPoolRequest {
+            name: name.to_string(),
+            base_url: format!("https://{}.example.test", name),
+            api_key: format!("sk-{}", name),
+            auth_type: ExternalPoolAuthType::Bearer,
+            enabled,
+            priority,
+            max_concurrent_requests: 1,
+            usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
+            auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
+            preserve_path: true,
+            notes: None,
+        }
+    }
 
     #[test]
     fn pool_auto_disable_policy_can_override_global_switch() {
@@ -3329,6 +3383,229 @@ mod tests {
             ExternalPoolAutoDisablePolicy::Inherit,
             &config
         ));
+    }
+
+    #[test]
+    fn external_pool_skip_reason_respects_enabled_switches_and_capacity() {
+        let mut config = ExternalPoolsConfig::default();
+        config.external_pools_enabled = false;
+        let mut pool = test_pool("https://pool.example.test", true);
+
+        assert_eq!(
+            ExternalPoolManager::skip_reason(&pool, 0, 0, 0, &config).as_deref(),
+            Some("external_pools_disabled")
+        );
+
+        config.external_pools_enabled = true;
+        pool.enabled = false;
+        assert_eq!(
+            ExternalPoolManager::skip_reason(&pool, 0, 0, 0, &config).as_deref(),
+            Some("disabled")
+        );
+
+        pool.enabled = true;
+        assert_eq!(
+            ExternalPoolManager::skip_reason(&pool, 0, 0, 3, &config).as_deref(),
+            Some("cooldown")
+        );
+
+        pool.max_concurrent_requests = 2;
+        assert_eq!(
+            ExternalPoolManager::skip_reason(&pool, 2, 0, 0, &config).as_deref(),
+            Some("pool_concurrency_full")
+        );
+
+        config.external_pool_global_max_concurrent_requests = 4;
+        assert_eq!(
+            ExternalPoolManager::skip_reason(&pool, 0, 4, 0, &config).as_deref(),
+            Some("global_concurrency_full")
+        );
+
+        assert!(ExternalPoolManager::skip_reason(&pool, 0, 3, 0, &config).is_none());
+    }
+
+    #[test]
+    fn external_pool_candidate_selection_handles_multiple_backup_pools() {
+        let mut primary = test_pool("https://primary.example.test", true);
+        primary.id = 11;
+        primary.priority = 1;
+        primary.max_concurrent_requests = 1;
+        let mut secondary = test_pool("https://secondary.example.test", true);
+        secondary.id = 22;
+        secondary.priority = 2;
+        secondary.max_concurrent_requests = 1;
+        let mut tertiary = test_pool("https://tertiary.example.test", true);
+        tertiary.id = 33;
+        tertiary.priority = 3;
+        tertiary.max_concurrent_requests = 1;
+
+        let selected = select_external_pool_candidate(vec![
+            (secondary.clone(), 0),
+            (tertiary.clone(), 0),
+            (primary.clone(), 0),
+        ])
+        .expect("candidate should be selected");
+        assert_eq!(selected.id, primary.id);
+
+        let selected =
+            select_external_pool_candidate(vec![(secondary.clone(), 0), (tertiary.clone(), 0)])
+                .expect("fallback candidate should be selected when primary is excluded/full");
+        assert_eq!(selected.id, secondary.id);
+
+        primary.priority = 1;
+        secondary.priority = 1;
+        primary.max_concurrent_requests = 2;
+        secondary.max_concurrent_requests = 4;
+        let selected =
+            select_external_pool_candidate(vec![(primary.clone(), 1), (secondary.clone(), 1)])
+                .expect("lower same-priority load should be selected");
+        assert_eq!(selected.id, secondary.id);
+    }
+
+    #[tokio::test]
+    async fn external_pool_manager_respects_disabled_switch_and_disabled_pools() {
+        let Some((manager, postgres)) = test_external_pool_manager().await else {
+            return;
+        };
+        let mut config = ExternalPoolsConfig::default();
+        config.external_pools_enabled = false;
+
+        let disabled = postgres
+            .create_external_pool(create_pool_request("external-disabled", 1, false))
+            .await
+            .unwrap();
+        let enabled = postgres
+            .create_external_pool(create_pool_request("external-enabled", 2, true))
+            .await
+            .unwrap();
+
+        assert!(!manager.has_available_pool(&config).await);
+        config.external_pools_enabled = true;
+        let selected = manager
+            .select_pool(&HashSet::new(), &config)
+            .await
+            .expect("enabled external pool should be selected");
+        assert_eq!(selected.id, enabled.id);
+        assert_ne!(selected.id, disabled.id);
+
+        postgres.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_pool_manager_selects_multiple_pools_by_priority_and_capacity() {
+        let Some((manager, postgres)) = test_external_pool_manager().await else {
+            return;
+        };
+        let mut config = ExternalPoolsConfig::default();
+        config.external_pools_enabled = true;
+        config.external_pool_global_max_concurrent_requests = 0;
+
+        let primary = postgres
+            .create_external_pool(create_pool_request("external-primary", 1, true))
+            .await
+            .unwrap();
+        let secondary = postgres
+            .create_external_pool(create_pool_request("external-secondary", 2, true))
+            .await
+            .unwrap();
+        let tertiary = postgres
+            .create_external_pool(create_pool_request("external-tertiary", 3, true))
+            .await
+            .unwrap();
+
+        let first = manager
+            .select_pool(&HashSet::new(), &config)
+            .await
+            .expect("primary pool should be selected first");
+        assert_eq!(first.id, primary.id);
+
+        let first_lease = match manager.acquire_pool(&primary, &config).await {
+            PoolAcquireResult::Acquired(lease) => lease,
+            PoolAcquireResult::Unavailable(_) => panic!("primary pool lease should be acquired"),
+        };
+        let second = manager
+            .select_pool(&HashSet::new(), &config)
+            .await
+            .expect("secondary pool should be selected when primary is full");
+        assert_eq!(second.id, secondary.id);
+
+        let second_lease = match manager.acquire_pool(&secondary, &config).await {
+            PoolAcquireResult::Acquired(lease) => lease,
+            PoolAcquireResult::Unavailable(_) => panic!("secondary pool lease should be acquired"),
+        };
+        let third = manager
+            .select_pool(&HashSet::new(), &config)
+            .await
+            .expect("tertiary pool should be selected when higher-priority pools are full");
+        assert_eq!(third.id, tertiary.id);
+
+        drop(first_lease);
+        drop(second_lease);
+        let mut after_release = None;
+        for _ in 0..20 {
+            if let Some(pool) = manager.select_pool(&HashSet::new(), &config).await {
+                after_release = Some(pool);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let after_release = after_release.expect("primary should be selected again after release");
+        assert_eq!(after_release.id, primary.id);
+
+        postgres.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_pool_manager_distinguishes_global_capacity_from_no_pool() {
+        let Some((manager, postgres)) = test_external_pool_manager().await else {
+            return;
+        };
+        let mut config = ExternalPoolsConfig::default();
+        config.external_pools_enabled = true;
+        config.external_pool_global_max_concurrent_requests = 1;
+
+        let primary = postgres
+            .create_external_pool(create_pool_request("external-global-a", 1, true))
+            .await
+            .unwrap();
+        let secondary = postgres
+            .create_external_pool(create_pool_request("external-global-b", 2, true))
+            .await
+            .unwrap();
+
+        let lease = match manager.acquire_pool(&primary, &config).await {
+            PoolAcquireResult::Acquired(lease) => lease,
+            PoolAcquireResult::Unavailable(_) => panic!("primary pool lease should be acquired"),
+        };
+
+        assert!(
+            manager
+                .select_pool(&HashSet::new(), &config)
+                .await
+                .is_none()
+        );
+        assert!(manager.has_eligible_pool(&config).await);
+        let snapshot = manager
+            .pool_availability_snapshot(&HashSet::new(), &config)
+            .await;
+        assert_eq!(snapshot.eligible_pools, 2);
+        assert_eq!(snapshot.available_pools, 0);
+        assert_eq!(snapshot.temporary_unavailable_pools, 2);
+        assert_eq!(snapshot.wait_reason, Some(PoolCapacityWaitReason::Full));
+
+        drop(lease);
+        let mut selected = None;
+        for _ in 0..20 {
+            if let Some(pool) = manager.select_pool(&HashSet::new(), &config).await {
+                selected = Some(pool);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let selected = selected.expect("pool should become selectable after global lease release");
+        assert!(selected.id == primary.id || selected.id == secondary.id);
+
+        postgres.drop_test_schema().await.unwrap();
     }
 
     #[tokio::test]
@@ -4018,7 +4295,26 @@ mod tests {
             .shaped
             .expect("with uplift shaped usage");
         let with_uplift_usage = with_uplift.usage_capture.reported.expect("uplift usage");
-        assert_eq!(with_uplift_shaped, no_uplift_usage);
+        assert_eq!(
+            with_uplift_shaped.total_input_tokens,
+            no_uplift_usage.total_input_tokens
+        );
+        assert_eq!(
+            with_uplift_shaped.input_tokens,
+            no_uplift_usage.input_tokens
+        );
+        assert_eq!(
+            with_uplift_shaped.output_tokens,
+            no_uplift_usage.output_tokens
+        );
+        assert_eq!(
+            with_uplift_shaped.cache_creation_input_tokens,
+            no_uplift_usage.cache_creation_input_tokens
+        );
+        assert_eq!(
+            with_uplift_shaped.cache_read_input_tokens,
+            no_uplift_usage.cache_read_input_tokens
+        );
         assert_eq!(with_uplift_usage.input_tokens, no_uplift_usage.input_tokens);
         assert_eq!(
             with_uplift_usage.cache_creation_input_tokens,

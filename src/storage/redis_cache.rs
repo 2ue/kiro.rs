@@ -160,6 +160,7 @@ const USAGE_DASHBOARD_TOP_CREDENTIALS_KEY: &str = "usage:dashboard:top:credentia
 const USAGE_DASHBOARD_TOP_ENDPOINTS_KEY: &str = "usage:dashboard:top:endpoints";
 const USAGE_DASHBOARD_TOP_ERRORS_KEY: &str = "usage:dashboard:top:errors";
 const USAGE_DASHBOARD_TOP_EXTERNAL_POOLS_KEY: &str = "usage:dashboard:top:external_pools";
+const USAGE_DASHBOARD_EXTERNAL_POOL_LIMIT: isize = 19;
 const USAGE_RECORDS_INDEX_KEY: &str = "usage:records:index";
 const USAGE_RECORDS_TTL_SECS: usize = 35 * 24 * 60 * 60;
 const USAGE_RECORDS_MAX_CACHED: usize = 100_000;
@@ -1044,6 +1045,7 @@ impl RedisStore {
         timezone: Option<&str>,
         high_cache_threshold: i32,
     ) -> anyhow::Result<Option<UsageDashboardResponse>> {
+        let started_at = std::time::Instant::now();
         let mut manager = self.manager.clone();
         let totals: HashMap<String, String> =
             manager.hgetall(self.key(USAGE_SUMMARY_TOTALS_KEY)).await?;
@@ -1098,6 +1100,21 @@ impl RedisStore {
                 .dashboard_top_aggregates(USAGE_DASHBOARD_TOP_ERRORS_KEY, "error")
                 .await?,
         };
+
+        let elapsed_ms = started_at.elapsed().as_millis();
+        if elapsed_ms >= 250 {
+            tracing::warn!(
+                elapsed_ms = elapsed_ms.min(u128::from(u64::MAX)) as u64,
+                external_pool_count = external_pool_index.len(),
+                "Redis usage dashboard read was slow"
+            );
+        } else {
+            tracing::debug!(
+                elapsed_ms = elapsed_ms.min(u128::from(u64::MAX)) as u64,
+                external_pool_count = external_pool_index.len(),
+                "Redis usage dashboard read"
+            );
+        }
 
         Ok(Some(UsageDashboardResponse {
             generated_at: now.to_rfc3339(),
@@ -1229,7 +1246,11 @@ impl RedisStore {
     ) -> anyhow::Result<Vec<RedisExternalPoolIndexItem>> {
         let mut manager = self.manager.clone();
         let pool_ids: Vec<String> = manager
-            .zrevrange(self.key(USAGE_DASHBOARD_TOP_EXTERNAL_POOLS_KEY), 0, -1)
+            .zrevrange(
+                self.key(USAGE_DASHBOARD_TOP_EXTERNAL_POOLS_KEY),
+                0,
+                USAGE_DASHBOARD_EXTERNAL_POOL_LIMIT,
+            )
             .await?;
         if pool_ids.is_empty() {
             return Ok(Vec::new());

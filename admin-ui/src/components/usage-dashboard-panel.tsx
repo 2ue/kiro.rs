@@ -100,6 +100,12 @@ function activeWindow(windows: UsageDashboardWindow[], key: string): UsageDashbo
   return windows.find((window) => window.key === key) || windows[0]
 }
 
+function errorRateTone(errorRate: number): DashboardTone {
+  if (errorRate >= 0.2) return 'error'
+  if (errorRate > 0) return 'warning'
+  return 'success'
+}
+
 function billingDeltaTone(delta: number): BillingDeltaTone {
   if (delta < 0) return 'loss'
   if (delta > 0) return 'profit'
@@ -677,10 +683,10 @@ export function UsageDashboardPanel() {
       />
 
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6">
-        <MetricCard title="请求健康" value={formatNumber(summary.totalRequests)} desc={`成功 ${formatNumber(summary.successRequests)} / 错误 ${formatNumber(summary.errorRequests)}`} icon={<Activity className="h-5 w-5" />} tone={summary.errorRequests > 0 ? 'error' : 'info'} />
-        <MetricCard title="错误率" value={formatPercent(summary.errorRate)} desc={summary.errorRequests > 0 ? '需要查看异常摘要' : '当前窗口无错误'} icon={summary.errorRequests > 0 ? <ShieldAlert className="h-5 w-5" /> : <CheckCircle2 className="h-5 w-5" />} tone={summary.errorRate > 0 ? 'error' : 'success'} />
+        <MetricCard title="请求健康" value={formatNumber(summary.totalRequests)} desc={`成功 ${formatNumber(summary.successRequests)} / 错误 ${formatNumber(summary.errorRequests)}`} icon={<Activity className="h-5 w-5" />} tone={errorRateTone(summary.errorRate)} />
+        <MetricCard title="错误率" value={formatPercent(summary.errorRate)} desc={summary.errorRequests > 0 ? '需要查看异常摘要' : '当前窗口无错误'} icon={summary.errorRequests > 0 ? <ShieldAlert className="h-5 w-5" /> : <CheckCircle2 className="h-5 w-5" />} tone={errorRateTone(summary.errorRate)} />
         <MetricCard title="耗时" value={`${Math.round(summary.averageDurationMs)}ms`} desc={`P95 ${formatNumber(summary.p95DurationMs)}ms`} icon={<Clock3 className="h-5 w-5" />} tone={latencyTone} />
-        <MetricCard title="估算费用" value={formatUsd(summary.totalEstimatedCostUsd)} desc={`计价覆盖 ${formatPercent(pricedRatio)}`} icon={<DollarSign className="h-5 w-5" />} tone={pricedRatio < 1 && summary.totalRequests > 0 ? 'error' : 'info'} />
+        <MetricCard title="估算费用" value={formatUsd(summary.totalEstimatedCostUsd)} desc={`计价覆盖 ${formatPercent(pricedRatio)}`} icon={<DollarSign className="h-5 w-5" />} tone={pricedRatio < 1 && summary.totalRequests > 0 ? 'warning' : 'info'} />
         <MetricCard title="Token" value={formatNumber(totalTokens)} desc={`输入 ${formatNumber(summary.totalInputTokens)} / 输出 ${formatNumber(summary.totalOutputTokens)}`} icon={<BarChart3 className="h-5 w-5" />} />
         <MetricCard title="缓存读取" value={formatPercent(summary.cacheReadRatio)} desc={`读取 ${formatNumber(summary.totalCacheReadInputTokens)}`} icon={<Database className="h-5 w-5" />} tone="success" />
       </div>
