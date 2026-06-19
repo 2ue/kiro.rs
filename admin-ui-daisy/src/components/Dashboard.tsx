@@ -22,7 +22,6 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
   const [theme, setTheme] = useState<ThemeMode>(getStoredTheme)
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
-  const [isRefreshing, setIsRefreshing] = useState(false)
   const queryClient = useQueryClient()
 
   // Apply theme
@@ -35,12 +34,6 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     storage.removeApiKey()
     queryClient.clear()
     onLogout()
-  }
-
-  const handleRefresh = async () => {
-    setIsRefreshing(true)
-    await queryClient.invalidateQueries()
-    setTimeout(() => setIsRefreshing(false), 500)
   }
 
   const handleTabChange = (tab: TabKey) => {
@@ -103,8 +96,6 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
             theme={theme}
             onThemeChange={setTheme}
             onLogout={handleLogout}
-            onRefresh={handleRefresh}
-            isRefreshing={isRefreshing}
           />
         </div>
 

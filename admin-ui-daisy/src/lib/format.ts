@@ -34,8 +34,8 @@ export function formatQuota(value: number | undefined | null): string {
 export function formatCredits(value: number | undefined | null): string {
   if (!Number.isFinite(value ?? Number.NaN)) return '-'
   return new Intl.NumberFormat('zh-CN', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 20,
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
     useGrouping: true,
   }).format(value as number)
 }

@@ -10,7 +10,6 @@ import { getExternalPools } from '@/api/credentials'
 import { useAutoRefreshPreference } from '@/hooks/use-auto-refresh'
 import { useCredentials } from '@/hooks/use-credentials'
 import {
-  useClearUsageRecords,
   useCancelUsageCleanup,
   usePreviewUsageCleanup,
   useStartUsageCleanup,
@@ -190,6 +189,7 @@ export function UsagePanel() {
   const [streamMode, setStreamMode] = useState<'all' | 'stream' | 'non_stream'>('all')
   const [minCacheRead, setMinCacheRead] = useState('')
   const [selectedRecord, setSelectedRecord] = useState<UsageRecord | null>(null)
+  const [billingRecord, setBillingRecord] = useState<UsageRecord | null>(null)
   const [cleanupOpen, setCleanupOpen] = useState(false)
   const [recordView, setRecordView] = useState<'cards' | 'table'>('table')
   const [page, setPage] = useState(1)
@@ -219,7 +219,6 @@ export function UsagePanel() {
   const records = useUsageRecordsPage(query, autoRefresh.refetchInterval)
   const credentials = useCredentials({ refetchInterval: autoRefresh.refetchInterval })
   const externalPools = useQuery({ queryKey: ['external-pools'], queryFn: getExternalPools, refetchInterval: autoRefresh.refetchInterval })
-  const clearRecords = useClearUsageRecords()
 
   useEffect(() => {
     setPage(1)
@@ -258,14 +257,6 @@ export function UsagePanel() {
     setSource('')
     setStreamMode('all')
     setMinCacheRead('')
-  }
-
-  const clear = () => {
-    if (!confirm('确定清空 Usage 展示记录吗？历史行仍保留用于审计。')) return
-    clearRecords.mutate(undefined, {
-      onSuccess: (res) => toast.success(res.message),
-      onError: (error) => toast.error(`清空失败: ${extractErrorMessage(error)}`),
-    })
   }
 
   return (
@@ -343,10 +334,6 @@ export function UsagePanel() {
               <Trash2 className="h-4 w-4" />
               分批清理
             </Button>
-            <Button type="button" color="error" variant="outline" size="sm" onClick={clear} disabled={clearRecords.isPending}>
-              <Trash2 className="h-4 w-4" />
-              清空
-            </Button>
           </>
         }
       >
@@ -408,14 +395,15 @@ export function UsagePanel() {
           <EmptyState text={page === 1 ? '暂无记录' : '当前页暂无记录'} />
         ) : recordView === 'table' ? (
           <div className="table-panel">
-            <Table size="sm" className="data-table min-w-[1120px]">
+            <Table size="sm" className="data-table min-w-[1180px]">
               <Table.Head>
                 <span>时间 / 状态</span>
                 <span>模型 / Endpoint</span>
                 <span>账号</span>
                 <span>Token</span>
                 <span>缓存</span>
-                <span>费用 / 耗时</span>
+                <span>费用</span>
+                <span>耗时</span>
                 <span>调用链路</span>
                 <span className="text-right">操作</span>
               </Table.Head>
@@ -478,15 +466,19 @@ export function UsagePanel() {
                         <div className="mt-1"><Badge tone={record.simulated ? 'warning' : 'secondary'}>{sourceLabel(record.usageSource)}</Badge></div>
                       </span>
                       <span>
-                        <div className="font-semibold">{formatUsd(record.estimatedCostUsd || 0)}</div>
+                        <button
+                          type="button"
+                          className="font-semibold text-primary underline-offset-2 hover:underline focus:outline-none focus:ring-2 focus:ring-primary/30"
+                          onClick={() => setBillingRecord(record)}
+                          title="查看计费明细"
+                        >
+                          {formatUsd(record.estimatedCostUsd || 0)}
+                        </button>
+                      </span>
+                      <span>
+                        <div className="font-semibold">{formatLatency(record.durationMs)}</div>
                         <div className="text-xs text-base-content/55">
-                          {formatNumber(record.durationMs)}ms
-                          <span className="ml-1">
-                            / 首字 {formatLatency(record.firstTokenLatencyMs)}
-                          </span>
-                        </div>
-                        <div className="max-w-[160px] truncate text-xs text-base-content/55" title={record.pricingModel || ''}>
-                          {record.pricingAvailable ? record.pricingModel || 'priced' : 'unpriced'}
+                          首字 {formatLatency(record.firstTokenLatencyMs)}
                         </div>
                       </span>
                       <span>
@@ -524,10 +516,14 @@ export function UsagePanel() {
                         )}
                       </span>
                       <span className="text-right">
-                        <Button type="button" variant="outline" size="xs" onClick={() => setSelectedRecord(record)} title="查看 usage 口径和详情">
-                          <Info className="h-3.5 w-3.5" />
-                          口径
-                        </Button>
+                        <button
+                          type="button"
+                          className="inline-flex h-7 w-7 items-center justify-center text-base-content/55 transition hover:text-primary focus:outline-none focus:ring-2 focus:ring-primary/30"
+                          onClick={() => setSelectedRecord(record)}
+                          title="查看 usage 口径和详情"
+                        >
+                          <Info className="h-4 w-4" />
+                        </button>
                       </span>
                     </Table.Row>
                   )
@@ -582,19 +578,29 @@ export function UsagePanel() {
                       </div>
                       <div className="flex shrink-0 flex-wrap items-center gap-2 text-sm">
                         <div className="text-right">
-                          <div className="font-semibold">{formatUsd(record.estimatedCostUsd || 0)}</div>
-                          <div className="text-xs text-base-content/50">{record.pricingAvailable ? record.pricingModel || 'priced' : 'unpriced'}</div>
+                          <button
+                            type="button"
+                            className="font-semibold text-primary underline-offset-2 hover:underline focus:outline-none focus:ring-2 focus:ring-primary/30"
+                            onClick={() => setBillingRecord(record)}
+                            title="查看计费明细"
+                          >
+                            {formatUsd(record.estimatedCostUsd || 0)}
+                          </button>
                         </div>
                         <div className="text-right">
-                          <div className="font-semibold">{formatNumber(record.durationMs)}ms</div>
+                          <div className="font-semibold">{formatLatency(record.durationMs)}</div>
                           <div className="text-xs text-base-content/50">
                             首字 {formatLatency(record.firstTokenLatencyMs)}
                           </div>
                         </div>
-                        <Button type="button" variant="outline" size="xs" onClick={() => setSelectedRecord(record)} title="查看 usage 口径和详情">
-                          <Info className="h-3.5 w-3.5" />
-                          口径
-                        </Button>
+                        <button
+                          type="button"
+                          className="inline-flex h-7 w-7 items-center justify-center text-base-content/55 transition hover:text-primary focus:outline-none focus:ring-2 focus:ring-primary/30"
+                          onClick={() => setSelectedRecord(record)}
+                          title="查看 usage 口径和详情"
+                        >
+                          <Info className="h-4 w-4" />
+                        </button>
                       </div>
                     </div>
 
@@ -671,6 +677,7 @@ export function UsagePanel() {
         )}
       </SectionCard>
 
+      <UsageBillingModal record={billingRecord} onClose={() => setBillingRecord(null)} />
       <UsageDetailModal record={selectedRecord} onClose={() => setSelectedRecord(null)} />
       <UsageCleanupModal open={cleanupOpen} onClose={() => setCleanupOpen(false)} />
     </div>
@@ -780,11 +787,8 @@ function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: () => vo
             </Select>
           </label>
           <div className="form-control">
-            <span className="label-text mb-1 flex items-center justify-between gap-2 text-xs text-base-content/55">
-              <span>{mode === 'hard_delete' ? '删除时间早于多少天' : '创建时间早于多少天'}</span>
-              <Button type="button" variant="outline" size="xs" onClick={() => setOlderThanDays('0')}>全部历史</Button>
-            </span>
-            <Input bordered size="sm" value={olderThanDays} onChange={(event) => setOlderThanDays(event.target.value)} inputMode="numeric" />
+            <span className="label-text mb-1 text-xs text-base-content/55">{mode === 'hard_delete' ? '删除时间早于多少天' : '创建时间早于多少天'}</span>
+            <Input bordered size="sm" type="number" min={0} value={olderThanDays} onChange={(event) => setOlderThanDays(event.target.value)} inputMode="numeric" />
             <span className="mt-1 text-[0.68rem] text-base-content/45">填 0 表示以任务启动时刻为 cutoff，清理当时之前全部匹配记录。</span>
           </div>
           <label className="form-control">
@@ -835,6 +839,85 @@ function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: () => vo
           </Button>
         </div>
       </div>
+    </ModalShell>
+  )
+}
+
+function UsageBillingModal({ record, onClose }: { record: UsageRecord | null; onClose: () => void }) {
+  const billing = record?.externalPoolBilling
+  const shapedCost = billing?.shapedCostUsd ?? billing?.reportedCostUsd ?? 0
+  const upliftedCost = billing?.upliftedCostUsd ?? billing?.reportedCostUsd ?? billing?.billableCostUsd ?? 0
+  const profit = billing ? billing.profitUsd ?? (upliftedCost - (billing.rawCostUsd || 0)) : 0
+  const deltaTone = billingDeltaTone(profit)
+
+  return (
+    <ModalShell open={Boolean(record)} title="计费明细" width="max-w-3xl" onClose={onClose}>
+      {record && (
+        <div className="space-y-4">
+          <div className="grid gap-3 text-sm md:grid-cols-2">
+            <Detail label="请求 ID" value={record.id} mono />
+            <Detail label="时间" value={formatDate(record.createdAt)} />
+            <Detail label="请求模型" value={record.model || '-'} />
+            <Detail label="上游模型" value={upstreamModel(record)} />
+            <Detail label="计价模型" value={record.pricingAvailable ? record.pricingModel || 'priced' : 'unpriced'} />
+            <Detail label="计费状态" value={record.pricingAvailable ? '已计价' : '未计价'} />
+            <Detail label="估算费用" value={formatUsd(record.estimatedCostUsd || 0)} />
+            <Detail label="耗时 / 首字" value={`${formatLatency(record.durationMs)} / ${formatLatency(record.firstTokenLatencyMs)}`} />
+          </div>
+
+          <div className="rounded-box border border-base-300 bg-base-200/50 p-3 text-sm">
+            <div className="mb-2 font-medium">本条下游上报 usage</div>
+            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-5">
+              <UsageMetric label="输入" value={formatNumber(record.compatInputTokens)} />
+              <UsageMetric label="缓存写入" value={formatNumber(record.cacheCreationInputTokens)} tone="info" />
+              <UsageMetric label="缓存读取" value={formatNumber(record.cacheReadInputTokens)} tone="success" />
+              <UsageMetric label="输出" value={formatNumber(record.outputTokens)} />
+              <UsageMetric
+                label="总输入"
+                value={formatNumber(record.compatInputTokens + record.cacheCreationInputTokens + record.cacheReadInputTokens)}
+              />
+            </div>
+          </div>
+
+          {billing && (
+            <div className="rounded-box border border-base-300 bg-base-200/50 p-3 text-sm">
+              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                <div className="font-medium">外部池计费拆分</div>
+                <Badge tone={deltaTone === 'loss' ? 'error' : deltaTone === 'profit' ? 'warning' : 'success'}>
+                  {deltaTone === 'loss' ? `亏损 ${formatUsd(Math.abs(profit))}` : deltaTone === 'profit' ? `盈利 ${formatUsd(profit)}` : '持平'}
+                </Badge>
+              </div>
+              <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                <div>
+                  <div className="text-xs text-base-content/55">原始成本</div>
+                  <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.rawUsage)}</div>
+                  <div className="mt-1 font-medium">{formatUsd(billing.rawCostUsd || 0)}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-base-content/55">整形后计费</div>
+                  <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.shapedUsage || billing.reportedUsage)}</div>
+                  <div className="mt-1 font-medium">{formatUsd(shapedCost)}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-base-content/55">放大后计费</div>
+                  <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.reportedUsage)}</div>
+                  <div className="mt-1 font-medium">{formatUsd(upliftedCost)}</div>
+                  <div className={`text-xs ${billingDeltaTextClass(deltaTone)}`}>
+                    盈利 = 放大后 - 原始：{profit >= 0 ? '+' : ''}{formatUsd(profit)}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-xs text-base-content/55">计价模型 / 整形模式</div>
+                  <div className="break-all">{billing.pricingAvailable ? billing.pricingModel || 'priced' : 'unpriced'}</div>
+                  <div className="text-xs text-base-content/55">
+                    {billing.usageProjectionMode} · {billing.usageProjectionApplied ? '已按当前路径整形' : '未整形/透传'}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
     </ModalShell>
   )
 }

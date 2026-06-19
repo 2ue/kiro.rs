@@ -37,7 +37,7 @@ pub struct CredentialAccountInfo {
     /// 订阅基础积分。
     #[serde(default)]
     pub credit_base: f64,
-    /// 非 free/power 订阅额外积分。
+    /// 开启超额后的额外积分。
     #[serde(default)]
     pub credit_bonus: f64,
     /// 下次重置时间（Unix 时间戳）
@@ -265,6 +265,8 @@ pub struct CredentialListItem {
     pub effective_proxy_url: Option<String>,
     pub effective_proxy_source: String,
     pub endpoint: String,
+    /// 当前生效的单凭据最大并发请求数。0 表示不限制。
+    pub max_concurrent_requests: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrent_requests_override: Option<u32>,
     pub warmup_remaining: u32,
@@ -584,7 +586,7 @@ pub struct UsageCleanupRequest {
     #[serde(default)]
     pub mode: UsageCleanupMode,
     /// 清理多少天之前的数据；soft_delete 对应 created_at，hard_delete 对应 deleted_at。
-    /// 传 0 表示以任务启动时刻为 cutoff，清理当时之前的全部匹配记录。
+    /// 0 表示以任务启动时刻为 cutoff，清理当时之前全部匹配记录；最大 3650。
     #[serde(default)]
     pub older_than_days: Option<u32>,
     /// 自定义 cutoff，优先级高于 older_than_days。
@@ -991,7 +993,7 @@ pub struct BalanceResponse {
     /// 订阅基础积分。
     #[serde(default)]
     pub credit_base: f64,
-    /// 非 free/power 订阅额外积分。
+    /// 开启超额后的额外积分。
     #[serde(default)]
     pub credit_bonus: f64,
     /// 下次重置时间（Unix 时间戳）
@@ -1004,8 +1006,6 @@ pub struct CredentialCreditSummaryResponse {
     pub total_credentials: usize,
     pub enabled_credentials: usize,
     pub disabled_credentials: usize,
-    pub known_credentials: usize,
-    pub unknown_credentials: usize,
     pub total_credit_limit: f64,
     pub total_credit_remaining: f64,
     pub total_current_usage: f64,

@@ -1023,6 +1023,7 @@ pub struct CredentialBaseSnapshot {
     pub effective_proxy_url: Option<String>,
     pub effective_proxy_source: String,
     pub endpoint: Option<String>,
+    pub max_concurrent_requests: u32,
     pub max_concurrent_requests_override: Option<u32>,
     pub warmup_remaining: u32,
 }
@@ -1031,6 +1032,19 @@ pub struct CredentialBaseSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct ManagerBaseSnapshot {
     pub entries: Vec<CredentialBaseSnapshot>,
+    pub current_id: u64,
+    pub total: usize,
+    pub available: usize,
+    pub global_in_flight_requests: u32,
+    pub queued_requests: u32,
+    pub global_max_concurrent_requests: u32,
+    pub max_queued_requests: u32,
+    pub runtime_fresh: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagerSummarySnapshot {
     pub current_id: u64,
     pub total: usize,
     pub available: usize,
@@ -1682,6 +1696,10 @@ impl MultiTokenManager {
     /// 获取当前运行时配置快照。
     pub fn runtime_config(&self) -> Config {
         self.config.lock().clone()
+    }
+
+    pub fn current_id(&self) -> u64 {
+        *self.current_id.lock()
     }
 
     fn credential_audit_label(entry: &CredentialEntry) -> String {
@@ -2360,6 +2378,37 @@ impl MultiTokenManager {
             .count()
     }
 
+    fn effective_concurrency_range_for_candidates(
+        entries: &[CredentialEntry],
+        proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
+        model: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        global_max_concurrent_requests: u32,
+    ) -> Option<(u32, u32)> {
+        entries
+            .iter()
+            .filter(|entry| {
+                Self::credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids)
+            })
+            .map(|entry| {
+                Self::effective_max_concurrent_requests(entry, global_max_concurrent_requests)
+            })
+            .fold(None, |range, value| {
+                Some(match range {
+                    Some((min, max)) => (min.min(value), max.max(value)),
+                    None => (value, value),
+                })
+            })
+    }
+
+    fn format_effective_concurrency_range(range: Option<(u32, u32)>) -> String {
+        match range {
+            Some((min, max)) if min == max => min.to_string(),
+            Some((min, max)) => format!("{min}..{max}"),
+            None => "none".to_string(),
+        }
+    }
+
     fn mark_rate_limited_at(&self, id: u64, now: Instant) -> anyhow::Result<()> {
         let Some(interval) = self.rate_limit_interval() else {
             return Ok(());
@@ -2662,8 +2711,14 @@ impl MultiTokenManager {
         let max_queued = self.max_queued_requests();
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
+            let ttl_secs = self
+                .config
+                .lock()
+                .credential_dispatch_max_wait_secs
+                .saturating_add(60)
+                .max(60);
             let admitted = block_on_storage("占用 Redis 调度排队名额", async move {
-                redis.try_enter_dispatch_queue(max_queued).await
+                redis.try_enter_dispatch_queue(max_queued, ttl_secs).await
             })?;
             if !admitted {
                 return Ok(None);
@@ -3279,7 +3334,8 @@ impl MultiTokenManager {
             WaitForDispatch {
                 available: usize,
                 total: usize,
-                max_concurrent_requests: u32,
+                global_credential_max_concurrent_requests: u32,
+                effective_credential_max_concurrent_requests: String,
                 wait_for: Option<StdDuration>,
             },
         }
@@ -3432,6 +3488,16 @@ impl MultiTokenManager {
                             } else {
                                 0
                             };
+                            let effective_concurrency_range =
+                                Self::format_effective_concurrency_range(
+                                    Self::effective_concurrency_range_for_candidates(
+                                        &entries,
+                                        &proxy_resources,
+                                        model,
+                                        &local_excluded_ids,
+                                        max_concurrent_requests,
+                                    ),
+                                );
                             let excluded_usable = entries
                                 .iter()
                                 .filter(|e| {
@@ -3446,10 +3512,11 @@ impl MultiTokenManager {
                             if usable > 0 && excluded_usable >= usable {
                                 if acquire_mode.is_fail_fast() && slot_race_excluded_count > 0 {
                                     anyhow::bail!(
-                                        "本地凭据调度容量暂不可用（本次请求因并发槽竞争临时排除了所有可用凭据，可用: {}/{}, max_concurrent_requests={}）",
+                                        "本地凭据调度容量暂不可用（本次请求因并发槽竞争临时排除了所有可用凭据，可用: {}/{}, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}）",
                                         available,
                                         total,
-                                        max_concurrent_requests
+                                        max_concurrent_requests,
+                                        effective_concurrency_range
                                     );
                                 }
                                 anyhow::bail!(
@@ -3522,10 +3589,11 @@ impl MultiTokenManager {
                                         .unwrap_or(1)
                                         .max(1);
                                     anyhow::bail!(
-                                        "所有可用凭据均处于上游临时冷却（可用: {}/{}, 临时可调度: 0, max_concurrent_requests={}, retry_after_secs={}）",
+                                        "所有可用凭据均处于上游临时冷却（可用: {}/{}, 临时可调度: 0, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}, retry_after_secs={}）",
                                         available,
                                         total,
                                         max_concurrent_requests,
+                                        effective_concurrency_range,
                                         retry_after_secs
                                     );
                                 }
@@ -3544,14 +3612,20 @@ impl MultiTokenManager {
                                     AcquireDecision::WaitForDispatch {
                                         available,
                                         total,
-                                        max_concurrent_requests,
+                                        global_credential_max_concurrent_requests:
+                                            max_concurrent_requests,
+                                        effective_credential_max_concurrent_requests:
+                                            effective_concurrency_range,
                                         wait_for: None,
                                     }
                                 } else {
                                     AcquireDecision::WaitForDispatch {
                                         available,
                                         total,
-                                        max_concurrent_requests,
+                                        global_credential_max_concurrent_requests:
+                                            max_concurrent_requests,
+                                        effective_credential_max_concurrent_requests:
+                                            effective_concurrency_range,
                                         wait_for,
                                     }
                                 }
@@ -3570,7 +3644,8 @@ impl MultiTokenManager {
                 AcquireDecision::WaitForDispatch {
                     available,
                     total,
-                    max_concurrent_requests,
+                    global_credential_max_concurrent_requests,
+                    effective_credential_max_concurrent_requests,
                     wait_for,
                 } => {
                     if acquire_mode.is_fail_fast() {
@@ -3579,10 +3654,11 @@ impl MultiTokenManager {
                             .unwrap_or(1)
                             .max(1);
                         anyhow::bail!(
-                            "本地凭据调度容量暂不可用（可用: {}/{}, 临时可调度: 0, max_concurrent_requests={}, retry_after_secs={}）",
+                            "本地凭据调度容量暂不可用（可用: {}/{}, 临时可调度: 0, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}, retry_after_secs={}）",
                             available,
                             total,
-                            max_concurrent_requests,
+                            global_credential_max_concurrent_requests,
+                            effective_credential_max_concurrent_requests,
                             retry_after_secs
                         );
                     }
@@ -3604,10 +3680,11 @@ impl MultiTokenManager {
                         self.dispatch_wait_exceeded(acquire_mode, dispatch_wait_started_at, now)
                     {
                         anyhow::bail!(
-                            "凭据调度排队等待超时（可用: {}/{}, 临时可调度: 0, max_concurrent_requests={}, waited_secs={}, max_wait_secs={}, retry_after_secs={}）",
+                            "凭据调度排队等待超时（可用: {}/{}, 临时可调度: 0, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}, waited_secs={}, max_wait_secs={}, retry_after_secs={}）",
                             available,
                             total,
-                            max_concurrent_requests,
+                            global_credential_max_concurrent_requests,
+                            effective_credential_max_concurrent_requests,
                             waited.as_secs(),
                             max_wait.as_secs(),
                             retry_after_secs.max(1)
@@ -3616,7 +3693,8 @@ impl MultiTokenManager {
                     tracing::debug!(
                         available,
                         total,
-                        max_concurrent_requests,
+                        global_credential_max_concurrent_requests,
+                        effective_credential_max_concurrent_requests,
                         retry_after_secs,
                         "所有可用凭据暂不可调度，进入排队等待"
                     );
@@ -3655,11 +3733,26 @@ impl MultiTokenManager {
                 if let Some((waited, max_wait)) =
                     self.dispatch_wait_exceeded(acquire_mode, dispatch_wait_started_at, now)
                 {
+                    let global_credential_max_concurrent_requests = self.max_concurrent_requests();
+                    let effective_credential_max_concurrent_requests = {
+                        let entries = self.entries.lock();
+                        let proxy_resources = self.proxy_resources.lock();
+                        Self::format_effective_concurrency_range(
+                            Self::effective_concurrency_range_for_candidates(
+                                &entries,
+                                &proxy_resources,
+                                model,
+                                &local_excluded_ids,
+                                global_credential_max_concurrent_requests,
+                            ),
+                        )
+                    };
                     anyhow::bail!(
-                        "凭据调度排队等待超时（可用: {}/{}, 临时可调度: 0, max_concurrent_requests={}, waited_secs={}, max_wait_secs={}, retry_after_secs=1）",
+                        "凭据调度排队等待超时（可用: {}/{}, 临时可调度: 0, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}, waited_secs={}, max_wait_secs={}, retry_after_secs=1）",
                         self.available_count(),
                         total,
-                        self.max_concurrent_requests(),
+                        global_credential_max_concurrent_requests,
+                        effective_credential_max_concurrent_requests,
                         waited.as_secs(),
                         max_wait.as_secs()
                     );
@@ -4081,6 +4174,10 @@ impl MultiTokenManager {
             effective_proxy_url,
             effective_proxy_source,
             endpoint: entry.credentials.endpoint.clone(),
+            max_concurrent_requests: Self::effective_max_concurrent_requests(
+                entry,
+                config.credential_max_concurrent_requests,
+            ),
             max_concurrent_requests_override: entry.credentials.max_concurrent_requests,
             warmup_remaining: entry.warmup_remaining,
         }
@@ -5944,6 +6041,44 @@ impl MultiTokenManager {
             global_max_concurrent_requests: config.dispatch_global_max_concurrent_requests,
             max_queued_requests: config.dispatch_max_queued_requests,
             runtime_fresh: self.redis_store.is_none(),
+        }
+    }
+
+    /// 获取凭据数量和全局调度容量快照。
+    ///
+    /// 该路径只读计数和全局容量，不构造每个凭据的运行态详情，供 Admin 顶部概览高频轮询使用。
+    pub fn summary_snapshot(&self) -> ManagerSummarySnapshot {
+        let config = self.config.lock().clone();
+        let (current_id, total, available, local_global_in_flight) = {
+            let entries = self.entries.lock();
+            (
+                *self.current_id.lock(),
+                entries.len(),
+                entries.iter().filter(|e| !e.disabled).count(),
+                entries.iter().map(|entry| entry.in_flight_requests).sum(),
+            )
+        };
+        let (global_capacity, runtime_fresh) = if self.redis_store.is_some() {
+            (self.global_capacity_state(), true)
+        } else {
+            (
+                SchedulerGlobalCapacityState {
+                    in_flight_requests: local_global_in_flight,
+                    queued_requests: self.queued_requests.load(Ordering::Acquire),
+                },
+                true,
+            )
+        };
+
+        ManagerSummarySnapshot {
+            current_id,
+            total,
+            available,
+            global_in_flight_requests: global_capacity.in_flight_requests,
+            queued_requests: global_capacity.queued_requests,
+            global_max_concurrent_requests: config.dispatch_global_max_concurrent_requests,
+            max_queued_requests: config.dispatch_max_queued_requests,
+            runtime_fresh,
         }
     }
 
@@ -9213,6 +9348,42 @@ mod tests {
         );
         first.release_in_flight();
         second.release_in_flight();
+    }
+
+    #[tokio::test]
+    async fn test_credential_concurrency_override_exceeds_global_default() {
+        let mut config = Config::default();
+        config.credential_max_concurrent_requests = 5;
+
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("t1".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        cred.max_concurrent_requests = Some(200);
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        let mut leases = Vec::new();
+        for _ in 0..6 {
+            leases.push(manager.acquire_context(None).await.unwrap());
+        }
+
+        let runtime_snapshot = manager.snapshot();
+        assert_eq!(runtime_snapshot.entries[0].in_flight_requests, 6);
+        assert_eq!(runtime_snapshot.entries[0].max_concurrent_requests, 200);
+        assert_eq!(
+            runtime_snapshot.entries[0].max_concurrent_requests_override,
+            Some(200)
+        );
+
+        let base_snapshot = manager.base_snapshot();
+        assert_eq!(base_snapshot.entries[0].max_concurrent_requests, 200);
+        assert_eq!(
+            base_snapshot.entries[0].max_concurrent_requests_override,
+            Some(200)
+        );
+
+        for mut lease in leases {
+            lease.release_in_flight();
+        }
     }
 
     #[tokio::test]

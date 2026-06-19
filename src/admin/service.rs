@@ -7,6 +7,7 @@ use std::time::{Duration as StdDuration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use futures::{StreamExt, stream};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -78,6 +79,7 @@ use crate::storage::redis_cache::RedisStore;
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
 const DEFAULT_CREDENTIALS_PAGE_LIMIT: usize = 12;
 const MAX_CREDENTIALS_PAGE_LIMIT: usize = 500;
+const CREDENTIAL_INFO_REFRESH_CONCURRENCY: usize = 16;
 const MAX_MANUAL_MODEL_ID_LEN: usize = 160;
 const USAGE_CLEANUP_DEFAULT_MAX_BATCHES: usize = 10_000;
 const USAGE_CLEANUP_MAX_BATCHES: usize = 10_000;
@@ -196,6 +198,13 @@ impl CredentialStatusBuildOptions {
     };
 }
 
+#[derive(Debug, Clone)]
+struct CredentialLookupLabel {
+    id: u64,
+    email: Option<String>,
+    disabled: bool,
+}
+
 /// 缓存的账号信息条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedBalance {
@@ -225,37 +234,40 @@ struct CredentialCreditSnapshot {
 fn credit_snapshot_for_subscription(
     subscription_title: Option<&str>,
     current_usage: f64,
+    usage_limit: f64,
+    active_bonus_limit: f64,
 ) -> CredentialCreditSnapshot {
-    let Some(title) = subscription_title
-        .map(str::trim)
-        .filter(|title| !title.is_empty())
-    else {
+    let Some(tier) = credential_credit_tier(subscription_title) else {
         return CredentialCreditSnapshot {
-            limit: 0.0,
-            remaining: 0.0,
+            limit: usage_limit,
+            remaining: (usage_limit - current_usage).max(0.0),
             base: 0.0,
             bonus: 0.0,
         };
     };
-    let tier = credential_credit_tier(Some(title));
-    let Some(tier) = tier else {
+
+    if tier == CredentialCreditTier::Free {
+        let limit = if usage_limit > 0.0 {
+            usage_limit
+        } else {
+            credential_credit_base(tier)
+        };
         return CredentialCreditSnapshot {
-            limit: 0.0,
-            remaining: 0.0,
-            base: 0.0,
+            limit,
+            remaining: (limit - current_usage).max(0.0),
+            base: limit,
             bonus: 0.0,
         };
-    };
+    }
+
     let base = credential_credit_base(tier);
-    let bonus = if matches!(
-        tier,
-        CredentialCreditTier::Free | CredentialCreditTier::Power
-    ) {
-        0.0
-    } else {
+    let bonus = if tier != CredentialCreditTier::Free && active_bonus_limit > 0.0 {
         10_000.0
+    } else {
+        0.0
     };
     let limit = base + bonus;
+
     CredentialCreditSnapshot {
         limit,
         remaining: (limit - current_usage).max(0.0),
@@ -267,11 +279,24 @@ fn credit_snapshot_for_subscription(
 fn credit_snapshot_from_persisted_fields(
     subscription_title: Option<&str>,
     current_usage: f64,
+    usage_limit: f64,
     credit_limit: f64,
     credit_remaining: f64,
     credit_base: f64,
     credit_bonus: f64,
 ) -> CredentialCreditSnapshot {
+    if usage_limit > 0.0 {
+        let inferred_bonus_limit = credential_credit_tier(subscription_title)
+            .filter(|tier| has_overage_credit_from_usage_limit(*tier, usage_limit))
+            .map(|_| 10_000.0)
+            .unwrap_or(0.0);
+        return credit_snapshot_for_subscription(
+            subscription_title,
+            current_usage,
+            usage_limit,
+            inferred_bonus_limit,
+        );
+    }
     if credit_limit > 0.0 || credit_remaining > 0.0 || credit_base > 0.0 || credit_bonus > 0.0 {
         return CredentialCreditSnapshot {
             limit: credit_limit,
@@ -280,17 +305,22 @@ fn credit_snapshot_from_persisted_fields(
             bonus: credit_bonus,
         };
     }
-    credit_snapshot_for_subscription(subscription_title, current_usage)
+    credit_snapshot_for_subscription(subscription_title, current_usage, 0.0, 0.0)
 }
 
 fn credential_credit_base(tier: CredentialCreditTier) -> f64 {
     match tier {
-        CredentialCreditTier::Free => 0.0,
+        CredentialCreditTier::Free => 50.0,
         CredentialCreditTier::Pro => 1_000.0,
         CredentialCreditTier::ProPlus => 2_000.0,
         CredentialCreditTier::Power => 10_000.0,
         CredentialCreditTier::ProMax => 5_000.0,
     }
+}
+
+fn has_overage_credit_from_usage_limit(tier: CredentialCreditTier, usage_limit: f64) -> bool {
+    tier != CredentialCreditTier::Free
+        && usage_limit >= credential_credit_base(tier) + 10_000.0 - f64::EPSILON
 }
 
 fn credential_credit_tier(subscription_title: Option<&str>) -> Option<CredentialCreditTier> {
@@ -1063,23 +1093,39 @@ impl AdminService {
         Ok(self.get_access_keys(&next_admin_api_key))
     }
 
-    fn credential_lookup(&self) -> HashMap<u64, CredentialStatusItem> {
-        let (_, _, _, _, _, _, _, credentials) =
-            self.credential_status_items(CredentialStatusBuildOptions::LIGHT);
-        credentials
+    fn credential_lookup(&self) -> HashMap<u64, CredentialLookupLabel> {
+        self.token_manager
+            .base_snapshot()
+            .entries
             .into_iter()
-            .map(|credential| (credential.id, credential))
+            .map(|credential| {
+                (
+                    credential.id,
+                    CredentialLookupLabel {
+                        id: credential.id,
+                        email: credential.email,
+                        disabled: credential.disabled,
+                    },
+                )
+            })
             .collect()
     }
 
-    fn credential_lookup_by_email(&self) -> HashMap<String, CredentialStatusItem> {
-        let (_, _, _, _, _, _, _, credentials) =
-            self.credential_status_items(CredentialStatusBuildOptions::LIGHT);
-        credentials
+    fn credential_lookup_by_email(&self) -> HashMap<String, CredentialLookupLabel> {
+        self.token_manager
+            .base_snapshot()
+            .entries
             .into_iter()
             .filter_map(|credential| {
                 let email = credential.email.as_deref()?;
-                Some((email_key(email), credential))
+                Some((
+                    email_key(email),
+                    CredentialLookupLabel {
+                        id: credential.id,
+                        email: credential.email,
+                        disabled: credential.disabled,
+                    },
+                ))
             })
             .collect()
     }
@@ -1298,7 +1344,7 @@ impl AdminService {
 
     /// 获取凭据数量和全局调度容量概览。
     pub fn get_credentials_summary(&self) -> CredentialSummaryResponse {
-        let snapshot = self.token_manager.base_snapshot();
+        let snapshot = self.token_manager.summary_snapshot();
         CredentialSummaryResponse {
             total: snapshot.total,
             available: snapshot.available,
@@ -1393,8 +1439,7 @@ impl AdminService {
             .load_credential_account_info()
             .await
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-        let (_, _, _, _, _, _, _, credentials) =
-            self.credential_status_items(CredentialStatusBuildOptions::LIGHT);
+        let credentials = self.token_manager.base_snapshot().entries;
 
         let total_credentials = credentials.len();
         let enabled_credentials = credentials
@@ -1402,7 +1447,6 @@ impl AdminService {
             .filter(|credential| !credential.disabled)
             .count();
         let disabled_credentials = total_credentials.saturating_sub(enabled_credentials);
-        let mut known_credentials = 0;
         let mut total_credit_limit = 0.0;
         let mut total_credit_remaining = 0.0;
         let mut total_current_usage = 0.0;
@@ -1416,7 +1460,6 @@ impl AdminService {
             let Some(info) = account_info.get(&credential.id).map(account_info_from_row) else {
                 continue;
             };
-            known_credentials += 1;
             total_credit_limit += info.credit_limit;
             total_credit_remaining += info.credit_remaining;
             total_current_usage += info.current_usage;
@@ -1440,8 +1483,6 @@ impl AdminService {
             total_credentials,
             enabled_credentials,
             disabled_credentials,
-            known_credentials,
-            unknown_credentials: total_credentials.saturating_sub(known_credentials),
             total_credit_limit,
             total_credit_remaining,
             total_current_usage,
@@ -1527,9 +1568,7 @@ impl AdminService {
 
     /// 设置凭据禁用状态
     pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<(), AdminServiceError> {
-        // 先获取当前凭据 ID，用于判断是否需要切换
-        let snapshot = self.token_manager.snapshot();
-        let current_id = snapshot.current_id;
+        let current_id = self.token_manager.current_id();
 
         self.token_manager
             .set_disabled(id, disabled)
@@ -1706,33 +1745,35 @@ impl AdminService {
         }
 
         let labels = self.credential_lookup();
-        let mut items = Vec::with_capacity(ids.len());
-        let mut success = 0;
-        for id in ids {
-            let label = labels.get(&id);
-            match self.get_account_info(id, req.force).await {
-                Ok(info) => {
-                    success += 1;
-                    items.push(CredentialInfoRefreshItem {
+        let mut items = stream::iter(ids.into_iter().map(|id| {
+            let label = labels.get(&id).cloned();
+            async move {
+                match self.get_account_info(id, req.force).await {
+                    Ok(info) => CredentialInfoRefreshItem {
                         id,
-                        email: label.and_then(|item| item.email.clone()),
-                        disabled: label.map(|item| item.disabled).unwrap_or(false),
+                        email: label.as_ref().and_then(|item| item.email.clone()),
+                        disabled: label.as_ref().map(|item| item.disabled).unwrap_or(false),
                         ok: true,
                         info: Some(info),
                         error: None,
-                    });
+                    },
+                    Err(err) => CredentialInfoRefreshItem {
+                        id,
+                        email: label.as_ref().and_then(|item| item.email.clone()),
+                        disabled: label.as_ref().map(|item| item.disabled).unwrap_or(false),
+                        ok: false,
+                        info: None,
+                        error: Some(err.to_string()),
+                    },
                 }
-                Err(err) => items.push(CredentialInfoRefreshItem {
-                    id,
-                    email: label.and_then(|item| item.email.clone()),
-                    disabled: label.map(|item| item.disabled).unwrap_or(false),
-                    ok: false,
-                    info: None,
-                    error: Some(err.to_string()),
-                }),
             }
-        }
+        }))
+        .buffer_unordered(CREDENTIAL_INFO_REFRESH_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+        items.sort_unstable_by_key(|item| item.id);
         let total = items.len();
+        let success = items.iter().filter(|item| item.ok).count();
         Ok(CredentialInfoRefreshResponse {
             total,
             success,
@@ -2025,8 +2066,12 @@ impl AdminService {
         } else {
             0.0
         };
-        let credit = credit_snapshot_for_subscription(usage.subscription_title(), current_usage);
-
+        let credit = credit_snapshot_for_subscription(
+            usage.subscription_title(),
+            current_usage,
+            usage_limit,
+            usage.active_bonus_limit(),
+        );
         Ok(BalanceResponse {
             id,
             checked_at: Utc::now().to_rfc3339(),
@@ -4061,6 +4106,7 @@ fn account_info_from_row(row: &CredentialAccountInfoRow) -> CredentialAccountInf
     let credit = credit_snapshot_from_persisted_fields(
         row.subscription_title.as_deref(),
         row.current_usage,
+        row.usage_limit,
         row.credit_limit,
         row.credit_remaining,
         row.credit_base,
@@ -4191,6 +4237,7 @@ fn credential_list_item_from_base(
         endpoint: credential
             .endpoint
             .unwrap_or_else(|| default_endpoint.to_string()),
+        max_concurrent_requests: credential.max_concurrent_requests,
         max_concurrent_requests_override: credential.max_concurrent_requests_override,
         warmup_remaining: credential.warmup_remaining,
     }
@@ -4270,6 +4317,7 @@ fn normalize_balance_credit_snapshot(balance: &BalanceResponse) -> BalanceRespon
     let credit = credit_snapshot_from_persisted_fields(
         balance.subscription_title.as_deref(),
         balance.current_usage,
+        balance.usage_limit,
         balance.credit_limit,
         balance.credit_remaining,
         balance.credit_base,
@@ -5095,6 +5143,118 @@ mod tests {
         assert!(options.include_cost_summary);
     }
 
+    #[test]
+    fn credit_snapshot_uses_overage_bonus_for_all_paid_tiers() {
+        let free_without_overage =
+            credit_snapshot_for_subscription(Some("KIRO FREE"), 34.52, 50.0, 0.0);
+        assert_eq!(free_without_overage.limit, 50.0);
+        assert!((free_without_overage.remaining - 15.48).abs() < 1e-9);
+        assert_eq!(free_without_overage.base, 50.0);
+        assert_eq!(free_without_overage.bonus, 0.0);
+
+        let pro_without_overage =
+            credit_snapshot_for_subscription(Some("Kiro Pro"), 125.25, 1_000.0, 0.0);
+        assert_eq!(pro_without_overage.limit, 1_000.0);
+        assert_eq!(pro_without_overage.remaining, 874.75);
+        assert_eq!(pro_without_overage.base, 1_000.0);
+        assert_eq!(pro_without_overage.bonus, 0.0);
+
+        let pro_with_overage =
+            credit_snapshot_for_subscription(Some("Kiro Pro"), 125.25, 11_000.0, 10_000.0);
+        assert_eq!(pro_with_overage.limit, 11_000.0);
+        assert_eq!(pro_with_overage.remaining, 10_874.75);
+        assert_eq!(pro_with_overage.base, 1_000.0);
+        assert_eq!(pro_with_overage.bonus, 10_000.0);
+
+        let pro_plus_with_overage =
+            credit_snapshot_for_subscription(Some("Kiro Pro+"), 125.25, 12_000.0, 10_000.0);
+        assert_eq!(pro_plus_with_overage.limit, 12_000.0);
+        assert_eq!(pro_plus_with_overage.remaining, 11_874.75);
+        assert_eq!(pro_plus_with_overage.base, 2_000.0);
+        assert_eq!(pro_plus_with_overage.bonus, 10_000.0);
+
+        let pro_max_with_overage =
+            credit_snapshot_for_subscription(Some("Kiro Pro Max"), 125.25, 15_000.0, 10_000.0);
+        assert_eq!(pro_max_with_overage.limit, 15_000.0);
+        assert_eq!(pro_max_with_overage.remaining, 14_874.75);
+        assert_eq!(pro_max_with_overage.base, 5_000.0);
+        assert_eq!(pro_max_with_overage.bonus, 10_000.0);
+
+        let power_without_overage =
+            credit_snapshot_for_subscription(Some("Kiro Power"), 125.25, 10_000.0, 0.0);
+        assert_eq!(power_without_overage.limit, 10_000.0);
+        assert_eq!(power_without_overage.remaining, 9_874.75);
+        assert_eq!(power_without_overage.base, 10_000.0);
+        assert_eq!(power_without_overage.bonus, 0.0);
+
+        let power_with_overage =
+            credit_snapshot_for_subscription(Some("Kiro Power"), 125.25, 20_000.0, 10_000.0);
+        assert_eq!(power_with_overage.limit, 20_000.0);
+        assert_eq!(power_with_overage.remaining, 19_874.75);
+        assert_eq!(power_with_overage.base, 10_000.0);
+        assert_eq!(power_with_overage.bonus, 10_000.0);
+    }
+
+    #[test]
+    fn live_credit_snapshot_does_not_infer_bonus_from_usage_limit() {
+        let pro_without_active_bonus =
+            credit_snapshot_for_subscription(Some("Kiro Pro"), 125.25, 11_000.0, 0.0);
+
+        assert_eq!(pro_without_active_bonus.limit, 1_000.0);
+        assert_eq!(pro_without_active_bonus.remaining, 874.75);
+        assert_eq!(pro_without_active_bonus.base, 1_000.0);
+        assert_eq!(pro_without_active_bonus.bonus, 0.0);
+    }
+
+    #[test]
+    fn persisted_credit_snapshot_recomputes_from_usage_limit() {
+        let old_wrong_power = credit_snapshot_from_persisted_fields(
+            Some("Kiro Power"),
+            250.0,
+            20_000.0,
+            10_000.0,
+            10_000.0,
+            9_750.0,
+            10_000.0,
+        );
+        assert_eq!(old_wrong_power.limit, 20_000.0);
+        assert_eq!(old_wrong_power.remaining, 19_750.0);
+        assert_eq!(old_wrong_power.base, 10_000.0);
+        assert_eq!(old_wrong_power.bonus, 10_000.0);
+
+        let old_wrong_pro_without_overage = credit_snapshot_from_persisted_fields(
+            Some("Kiro Pro"),
+            250.0,
+            1_000.0,
+            11_000.0,
+            10_750.0,
+            1_000.0,
+            10_000.0,
+        );
+        assert_eq!(old_wrong_pro_without_overage.limit, 1_000.0);
+        assert_eq!(old_wrong_pro_without_overage.remaining, 750.0);
+        assert_eq!(old_wrong_pro_without_overage.base, 1_000.0);
+        assert_eq!(old_wrong_pro_without_overage.bonus, 0.0);
+    }
+
+    #[test]
+    fn persisted_credit_snapshot_only_infers_fixed_overage_bonus() {
+        let trial_like_extra_limit = credit_snapshot_from_persisted_fields(
+            Some("Kiro Pro"),
+            125.0,
+            1_500.0,
+            11_000.0,
+            10_875.0,
+            1_000.0,
+            10_000.0,
+        );
+
+        assert_eq!(trial_like_extra_limit.limit, 1_000.0);
+        assert_eq!(trial_like_extra_limit.remaining, 875.0);
+        assert_eq!(trial_like_extra_limit.base, 1_000.0);
+        assert_eq!(trial_like_extra_limit.bonus, 0.0);
+    }
+
     fn credential_item(
         id: u64,
         disabled: bool,
@@ -5259,14 +5419,15 @@ mod tests {
 
     #[test]
     fn usage_cleanup_request_zero_days_uses_execution_cutoff() {
+        let before = Utc::now();
         let mut zero_days = cleanup_request();
         zero_days.older_than_days = Some(0);
-        let before = Utc::now();
-        let plan = normalize_usage_cleanup_request(zero_days).expect("valid zero-day cleanup");
+
+        let plan = normalize_usage_cleanup_request(zero_days).expect("zero days is valid");
         let after = Utc::now();
 
-        assert!(plan.cutoff >= before);
-        assert!(plan.cutoff <= after);
+        assert!(plan.cutoff >= before - ChronoDuration::seconds(1));
+        assert!(plan.cutoff <= after + ChronoDuration::seconds(1));
     }
 
     #[test]

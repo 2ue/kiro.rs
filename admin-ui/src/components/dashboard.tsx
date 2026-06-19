@@ -68,7 +68,7 @@ function credentialFromListItem(item: CredentialListItem): CredentialStatusItem 
     inFlightRequests: 0,
     oldestInFlightAgeSecs: 0,
     newestInFlightIdleSecs: 0,
-    maxConcurrentRequests: 0,
+    maxConcurrentRequests: item.maxConcurrentRequests,
     inFlightLeaseMaxSecs: 0,
     transientFailureStreak: 0,
     recentErrorRate: 0,

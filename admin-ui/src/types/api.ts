@@ -101,6 +101,7 @@ export type CredentialListItem = Pick<
   | 'effectiveProxyUrl'
   | 'effectiveProxySource'
   | 'endpoint'
+  | 'maxConcurrentRequests'
   | 'maxConcurrentRequestsOverride'
   | 'warmupRemaining'
 >
@@ -295,8 +296,6 @@ export interface CredentialCreditSummaryResponse {
   totalCredentials: number
   enabledCredentials: number
   disabledCredentials: number
-  knownCredentials: number
-  unknownCredentials: number
   totalCreditLimit: number
   totalCreditRemaining: number
   totalCurrentUsage: number

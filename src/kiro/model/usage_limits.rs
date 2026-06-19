@@ -173,6 +173,20 @@ impl UsageLimitsResponse {
         total
     }
 
+    /// 获取激活的奖励额度总额。
+    pub fn active_bonus_limit(&self) -> f64 {
+        let Some(breakdown) = self.primary_breakdown() else {
+            return 0.0;
+        };
+
+        breakdown
+            .bonuses
+            .iter()
+            .filter(|bonus| bonus.is_active())
+            .map(|bonus| bonus.usage_limit)
+            .sum()
+    }
+
     /// 获取总当前使用量（精确值）
     ///
     /// 累加基础使用量、激活的免费试用使用量和激活的奖励使用量

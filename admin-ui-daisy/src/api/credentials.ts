@@ -72,7 +72,7 @@ function credentialListItemToStatus(item: CredentialListItem): CredentialStatusI
     inFlightRequests: 0,
     oldestInFlightAgeSecs: 0,
     newestInFlightIdleSecs: 0,
-    maxConcurrentRequests: item.maxConcurrentRequestsOverride ?? 0,
+    maxConcurrentRequests: item.maxConcurrentRequests,
     inFlightLeaseMaxSecs: 0,
     warmupRemaining: item.warmupRemaining ?? 0,
     transientFailureStreak: 0,

@@ -307,7 +307,7 @@ pub async fn delete_disabled_credentials(State(state): State<AdminState>) -> imp
 }
 
 /// GET /api/admin/credentials/credit-summary
-/// 获取已固化凭据积分统计，不触发上游查询
+/// 获取本地凭据积分快照统计，不触发上游查询
 pub async fn get_credential_credit_summary(State(state): State<AdminState>) -> impl IntoResponse {
     match state.service.get_credential_credit_summary().await {
         Ok(response) => Json(response).into_response(),

@@ -10,7 +10,6 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/u
 import { useAutoRefreshPreference } from '@/hooks/use-auto-refresh'
 import { useCredentials } from '@/hooks/use-credentials'
 import {
-  useClearUsageRecords,
   useCancelUsageCleanup,
   useModelPricing,
   usePreviewUsageCleanup,
@@ -312,7 +311,6 @@ export function UsageRecordsPanel() {
   const syncPricing = useSyncModelPricing()
   const credentials = useCredentials({ refetchInterval: autoRefresh.refetchInterval })
   const externalPools = useQuery({ queryKey: ['external-pools'], queryFn: getExternalPools, refetchInterval: autoRefresh.refetchInterval })
-  const clearRecords = useClearUsageRecords()
 
   useEffect(() => {
     setCurrentPage(1)
@@ -370,16 +368,6 @@ export function UsageRecordsPanel() {
     setSource('')
     setStreamMode('all')
     setMinCacheRead('')
-  }
-
-  const handleClear = () => {
-    if (!confirm('确定清空 Usage 展示记录吗？此操作会在 PgSQL 中软删除当前记录，历史行仍保留用于审计。')) {
-      return
-    }
-    clearRecords.mutate(undefined, {
-      onSuccess: (res) => toast.success(res.message),
-      onError: (err) => toast.error(`清空失败: ${extractErrorMessage(err)}`),
-    })
   }
 
   const summaryData = summary.data
@@ -608,16 +596,6 @@ export function UsageRecordsPanel() {
             <Trash2 className="h-4 w-4" />
             分批清理
           </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="text-destructive hover:text-destructive"
-            onClick={handleClear}
-            disabled={clearRecords.isPending}
-          >
-            <Trash2 className="h-4 w-4" />
-            清空
-          </Button>
         </div>
       </div>
 
@@ -771,14 +749,18 @@ export function UsageRecordsPanel() {
                       <td className="px-3 py-2 text-right">{formatPercent(cachedRatio)}</td>
                       <td className="px-3 py-2 text-right">{formatNumber(record.outputTokens)}</td>
                       <td className="px-3 py-2 text-right">
-                        <div>{formatUsd(record.estimatedCostUsd || 0)}</div>
-                        <div className="text-xs text-muted-foreground">
-                          {record.pricingAvailable ? record.pricingModel || 'priced' : 'unpriced'}
-                        </div>
+                        <button
+                          type="button"
+                          className="font-medium text-primary underline-offset-2 hover:underline"
+                          onClick={() => setSelectedRecord(record)}
+                          title="查看计费明细"
+                        >
+                          {formatUsd(record.estimatedCostUsd || 0)}
+                        </button>
                       </td>
                       <td className="px-3 py-2 text-right">
                         <div className="flex items-center justify-end gap-2">
-                          <span>{formatNumber(record.durationMs)}ms</span>
+                          <span>{formatLatency(record.durationMs)}</span>
                           <Button
                             variant="ghost"
                             size="icon"
@@ -1213,10 +1195,7 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
               </select>
             </label>
             <div className="space-y-1">
-              <span className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
-                <span>{mode === 'hard_delete' ? '删除时间早于多少天' : '创建时间早于多少天'}</span>
-                <Button type="button" variant="outline" size="sm" className="h-7 px-2 text-xs" onClick={() => setOlderThanDays('0')}>全部历史</Button>
-              </span>
+              <span className="block text-xs text-muted-foreground">{mode === 'hard_delete' ? '删除时间早于多少天' : '创建时间早于多少天'}</span>
               <Input value={olderThanDays} onChange={(event) => setOlderThanDays(event.target.value)} inputMode="numeric" />
               <span className="block text-[0.68rem] text-muted-foreground">填 0 表示以任务启动时刻为 cutoff，清理当时之前全部匹配记录。</span>
             </div>

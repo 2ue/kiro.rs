@@ -2806,7 +2806,11 @@ impl RedisStore {
         })
     }
 
-    pub async fn try_enter_dispatch_queue(&self, max_queued: u32) -> anyhow::Result<bool> {
+    pub async fn try_enter_dispatch_queue(
+        &self,
+        max_queued: u32,
+        ttl_secs: u64,
+    ) -> anyhow::Result<bool> {
         let script = r#"
             local max_queued = tonumber(ARGV[1])
             local count = tonumber(redis.call('GET', KEYS[1]) or '0')
@@ -2823,7 +2827,7 @@ impl RedisStore {
             .arg(1)
             .arg(self.key(scheduler_global_queue_key()))
             .arg(max_queued)
-            .arg(3600)
+            .arg(ttl_secs.max(60))
             .query_async(&mut manager)
             .await?;
         Ok(admitted == 1)

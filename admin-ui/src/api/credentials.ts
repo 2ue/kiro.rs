@@ -103,7 +103,7 @@ function credentialListItemToStatus(item: CredentialListItem): CredentialStatusI
     inFlightRequests: 0,
     oldestInFlightAgeSecs: 0,
     newestInFlightIdleSecs: 0,
-    maxConcurrentRequests: item.maxConcurrentRequestsOverride ?? 0,
+    maxConcurrentRequests: item.maxConcurrentRequests,
     inFlightLeaseMaxSecs: 0,
     warmupRemaining: item.warmupRemaining ?? 0,
     transientFailureStreak: 0,
@@ -165,7 +165,7 @@ export async function getCredentialsPage(
 export async function getCredentialsList(
   query: CredentialsPageQuery
 ): Promise<CredentialListResponse> {
-  const { data } = await api.get<CredentialListResponse>('/credentials-list', {
+  const { data } = await api.get<CredentialListResponse>('/credentials/list', {
     params: query,
   })
   return data

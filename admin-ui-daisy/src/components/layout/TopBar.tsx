@@ -1,4 +1,4 @@
-import { LogOut, Paintbrush, RefreshCw } from 'lucide-react'
+import { LogOut, Paintbrush } from 'lucide-react'
 import { Button, Dropdown } from 'react-daisyui'
 import { themeOptions, type ThemeMode } from '@/types/ui'
 
@@ -8,8 +8,6 @@ interface TopBarProps {
   theme: ThemeMode
   onThemeChange: (theme: ThemeMode) => void
   onLogout: () => void
-  onRefresh?: () => void
-  isRefreshing?: boolean
   actions?: React.ReactNode
 }
 
@@ -19,8 +17,6 @@ export function TopBar({
   theme,
   onThemeChange,
   onLogout,
-  onRefresh,
-  isRefreshing,
   actions,
 }: TopBarProps) {
   const currentTheme = themeOptions.find((t) => t.key === theme) || themeOptions[0]
@@ -37,20 +33,6 @@ export function TopBar({
         {/* Actions */}
         <div className="flex items-center gap-2">
           {actions}
-
-          {onRefresh && (
-            <Button
-              type="button"
-              color="ghost"
-              size="sm"
-              onClick={onRefresh}
-              disabled={isRefreshing}
-              className="gap-1.5"
-            >
-              <RefreshCw className={`h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`} />
-              <span className="hidden sm:inline">刷新</span>
-            </Button>
-          )}
 
           {/* Theme Selector */}
           <Dropdown end>

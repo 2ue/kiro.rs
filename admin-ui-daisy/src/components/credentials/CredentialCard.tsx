@@ -580,9 +580,9 @@ export function CredentialCard({
                 detail={quotaDetail}
               />
               <MetaItem
-                label="积分"
-                value={loadingBalance ? <Loading size="xs" /> : accountInfo ? `${formatCredits(accountInfo.creditRemaining)}/${formatCredits(accountInfo.creditLimit)}` : '未知'}
-                detail={accountInfo ? `基础 ${formatCredits(accountInfo.creditBase)} · 额外 ${formatCredits(accountInfo.creditBonus)}` : undefined}
+                label="剩余积分"
+                value={loadingBalance ? <Loading size="xs" /> : accountInfo ? formatCredits(accountInfo.creditRemaining) : '未知'}
+                detail={accountInfo ? `总额 ${formatCredits(accountInfo.creditLimit)}` : undefined}
               />
               <MetaItem label="估算成本" value={formatUsd(credential.estimatedCostUsd)} />
               {hasPricingCoverage && (
