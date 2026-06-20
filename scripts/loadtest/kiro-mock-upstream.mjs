@@ -145,6 +145,26 @@ function bodyContainsToolResult(body) {
   return raw.includes("tool_result") || raw.includes("toolResult") || raw.includes("toolUseResult") || raw.includes("tool_use_id");
 }
 
+function tokenUsageForScenario(scenario, outputTokens) {
+  if (scenario === "high-cache") {
+    return {
+      uncachedInputTokens: 198789,
+      cacheReadInputTokens: 0,
+      cacheWriteInputTokens: 0,
+      outputTokens,
+      totalTokens: 198789 + outputTokens,
+    };
+  }
+
+  return {
+    uncachedInputTokens: 1234,
+    cacheReadInputTokens: 0,
+    cacheWriteInputTokens: 0,
+    outputTokens,
+    totalTokens: 1234 + outputTokens,
+  };
+}
+
 function logRequest(req, url, scenario, raw, body) {
   if (!LOG_REQUESTS) return;
   const compact = raw ? raw.replace(/\s+/g, " ").slice(0, 500) : "";
@@ -198,13 +218,7 @@ function buildStreamFrames({ body, scenario }) {
         frame: event(
           { eventType: "metadataEvent" },
           {
-            tokenUsage: {
-              uncachedInputTokens: 1234,
-              cacheReadInputTokens: 0,
-              cacheWriteInputTokens: 0,
-              outputTokens: 20,
-              totalTokens: 1254,
-            },
+            tokenUsage: tokenUsageForScenario(scenario, 20),
           }
         ),
       },
@@ -230,13 +244,7 @@ function buildStreamFrames({ body, scenario }) {
     frame: event(
       { eventType: "metadataEvent" },
       {
-        tokenUsage: {
-          uncachedInputTokens: 1234,
-          cacheReadInputTokens: 0,
-          cacheWriteInputTokens: 0,
-          outputTokens: Math.max(1, chunks.join("").length),
-          totalTokens: 1234 + Math.max(1, chunks.join("").length),
-        },
+        tokenUsage: tokenUsageForScenario(scenario, Math.max(1, chunks.join("").length)),
       }
     ),
   });

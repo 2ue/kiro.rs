@@ -1904,6 +1904,10 @@ impl ExternalPoolManager {
             credential_label: None,
             status,
             usage_source,
+            raw_usage: billing
+                .as_ref()
+                .filter(|_| status == UsageRecordStatus::Success)
+                .map(|billing| billing.raw_usage),
             total_input_tokens: input_tokens,
             compat_input_tokens,
             billable_input_tokens,

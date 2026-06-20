@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{
     DateTime, Datelike, Duration as ChronoDuration, FixedOffset, NaiveDate, TimeZone, Timelike, Utc,
@@ -19,6 +19,7 @@ const DEFAULT_PAGE_QUERY_LIMIT: usize = 20;
 const MAX_QUERY_LIMIT: usize = 1000;
 const USAGE_WRITER_QUEUE_CAPACITY: usize = 4096;
 const USAGE_WRITER_MAX_ATTEMPTS: u32 = 3;
+const USAGE_WRITER_BATCH_MAX: usize = 64;
 const USAGE_DASHBOARD_REDIS_TIMEOUT_SECS: u64 = 2;
 const USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS: u64 = 5;
 pub const REALTIME_USAGE_WINDOW_SECS: u32 = 60;
@@ -196,6 +197,8 @@ pub struct UsageRecord {
     pub credential_label: Option<String>,
     pub status: UsageRecordStatus,
     pub usage_source: UsageSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_usage: Option<ExternalPoolUsageSnapshot>,
     pub total_input_tokens: i32,
     pub compat_input_tokens: i32,
     pub billable_input_tokens: i32,
@@ -1283,31 +1286,55 @@ impl UsageRecorder {
 }
 
 async fn usage_writer_loop(store: Arc<PostgresUsageStore>, mut rx: mpsc::Receiver<UsageRecord>) {
-    while let Some(record) = rx.recv().await {
-        let mut attempt = 1;
-        loop {
-            match store.record(record.clone()).await {
-                Ok(()) => break,
-                Err(err) if attempt < USAGE_WRITER_MAX_ATTEMPTS => {
-                    let delay_ms = 100u64.saturating_mul(2u64.saturating_pow(attempt - 1));
-                    tracing::warn!(
-                        request_id = %record.id,
-                        attempt,
-                        "写入 PgSQL usage record 失败，准备重试: {}",
-                        err
-                    );
-                    tokio::time::sleep(StdDuration::from_millis(delay_ms)).await;
-                    attempt += 1;
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        request_id = %record.id,
-                        attempt,
-                        "写入 PgSQL usage record 最终失败，已放弃本条持久化: {}",
-                        err
-                    );
-                    break;
-                }
+    while let Some(first) = rx.recv().await {
+        let mut records = Vec::with_capacity(USAGE_WRITER_BATCH_MAX);
+        records.push(first);
+        while records.len() < USAGE_WRITER_BATCH_MAX {
+            match rx.try_recv() {
+                Ok(record) => records.push(record),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        persist_usage_batch_with_retry(&store, records).await;
+    }
+}
+
+async fn persist_usage_batch_with_retry(
+    store: &Arc<PostgresUsageStore>,
+    records: Vec<UsageRecord>,
+) {
+    let first_request_id = records
+        .first()
+        .map(|record| record.id.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let record_count = records.len();
+    let mut attempt = 1;
+    loop {
+        match store.record_batch(records.clone()).await {
+            Ok(()) => break,
+            Err(err) if attempt < USAGE_WRITER_MAX_ATTEMPTS => {
+                let delay_ms = 100u64.saturating_mul(2u64.saturating_pow(attempt - 1));
+                tracing::warn!(
+                    request_id = %first_request_id,
+                    record_count,
+                    attempt,
+                    "批量写入 PgSQL usage record 失败，准备重试: {}",
+                    err
+                );
+                tokio::time::sleep(StdDuration::from_millis(delay_ms)).await;
+                attempt += 1;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    request_id = %first_request_id,
+                    record_count,
+                    attempt,
+                    "批量写入 PgSQL usage record 最终失败，已放弃本批持久化: {}",
+                    err
+                );
+                break;
             }
         }
     }
@@ -1316,14 +1343,23 @@ async fn usage_writer_loop(store: Arc<PostgresUsageStore>, mut rx: mpsc::Receive
 fn block_on_usage_store<T>(
     future: impl std::future::Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+    let started_at = Instant::now();
+    let result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
         tokio::task::block_in_place(|| handle.block_on(future))
     } else {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
             .block_on(future)
+    };
+    let elapsed = started_at.elapsed();
+    if elapsed >= StdDuration::from_millis(100) {
+        tracing::warn!(
+            elapsed_ms = elapsed.as_millis() as u64,
+            "同步 usage 存储操作耗时较长"
+        );
     }
+    result
 }
 
 fn normalize_limit(limit: usize) -> usize {
@@ -1520,6 +1556,7 @@ mod tests {
             credential_label: Some("test@example.com".to_string()),
             status: UsageRecordStatus::Success,
             usage_source: source,
+            raw_usage: None,
             total_input_tokens: 100,
             compat_input_tokens: 50,
             billable_input_tokens: 50,

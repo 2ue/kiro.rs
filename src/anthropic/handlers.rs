@@ -55,8 +55,8 @@ use super::types::{
     Thinking,
 };
 use super::usage::{
-    ExternalPoolAttempt, UsageRecord, UsageRecordStatus, UsageRouteKind, UsageRouteSubtype,
-    UsageSource,
+    ExternalPoolAttempt, ExternalPoolUsageSnapshot, UsageRecord, UsageRecordStatus, UsageRouteKind,
+    UsageRouteSubtype, UsageSource,
 };
 use super::websearch;
 use crate::external_pool::{
@@ -336,7 +336,7 @@ impl PayloadTooLongRetryRequest {
             self.upstream_model.as_deref(),
             Some(&self.conversation_id),
         );
-        usage_context.set_payload_diagnostics(breakdown, report.clone());
+        usage_context.set_payload_diagnostics(Some(breakdown), report.clone());
         let warnings_header = merge_warning_headers(self.conversion_warnings, Some(&report));
         Ok((request_body, warnings_header))
     }
@@ -597,10 +597,10 @@ impl ExternalFallbackContext {
                 } else {
                     self.raw_body.clone()
                 };
-                let total_bytes = raw_body.len();
-                let breakdown = breakdown_anthropic_messages_request(&payload, total_bytes);
                 let include_diagnostics = should_log_payload_byte_breakdown(&report)
                     || (guard_config.max_bytes > 0 && self.raw_body.len() > guard_config.max_bytes);
+                let breakdown = include_diagnostics
+                    .then(|| breakdown_anthropic_messages_request(&payload, raw_body.len()));
                 if include_diagnostics {
                     log_payload_guard_report(
                         &report,
@@ -612,7 +612,7 @@ impl ExternalFallbackContext {
                         extract_stable_conversation_id(&payload).as_deref(),
                     );
                     log_payload_byte_breakdown(
-                        Some(breakdown),
+                        breakdown,
                         &report,
                         self.endpoint,
                         &self.payload.model,
@@ -625,7 +625,7 @@ impl ExternalFallbackContext {
                 GuardedExternalRoutePayload {
                     raw_body,
                     payload,
-                    payload_breakdown: include_diagnostics.then_some(breakdown),
+                    payload_breakdown: breakdown,
                     payload_guard_report: include_diagnostics.then_some(report),
                     payload_guard_retry_config: retry_config,
                 }
@@ -831,7 +831,7 @@ impl RequestUsageContext {
 
     fn with_payload_diagnostics(
         mut self,
-        breakdown: PayloadByteBreakdown,
+        breakdown: Option<PayloadByteBreakdown>,
         report: PayloadGuardReport,
     ) -> Self {
         self.set_payload_diagnostics(breakdown, report);
@@ -840,10 +840,10 @@ impl RequestUsageContext {
 
     fn set_payload_diagnostics(
         &mut self,
-        breakdown: PayloadByteBreakdown,
+        breakdown: Option<PayloadByteBreakdown>,
         report: PayloadGuardReport,
     ) {
-        self.payload_breakdown = Some(breakdown);
+        self.payload_breakdown = breakdown;
         self.payload_guard_report = Some(report);
     }
 
@@ -998,6 +998,45 @@ fn should_build_local_prompt_cache_usage(simulation_mode: PromptCacheSimulationM
     simulation_mode == PromptCacheSimulationMode::HighCache
 }
 
+fn usage_snapshot(usage: super::cache::CacheUsage) -> ExternalPoolUsageSnapshot {
+    ExternalPoolUsageSnapshot {
+        total_input_tokens: usage.total_input_tokens,
+        input_tokens: usage.input_tokens,
+        billable_input_tokens: usage.billable_input_tokens(),
+        output_tokens: usage.output_tokens,
+        cache_read_input_tokens: usage.cache_read_input_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        cache_creation_5m_input_tokens: usage.cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens: usage.cache_creation_1h_input_tokens,
+    }
+}
+
+fn raw_usage_from_metadata_or_estimate(
+    metadata_usage: Option<&crate::kiro::model::events::MetadataTokenUsage>,
+    input_tokens: i32,
+    output_tokens: i32,
+) -> super::cache::CacheUsage {
+    metadata_usage
+        .map(|usage| super::cache::CacheUsage {
+            total_input_tokens: usage.total_input_tokens(),
+            input_tokens: usage.input_tokens(),
+            output_tokens: usage.output_tokens,
+            cache_creation_input_tokens: usage.cache_write_input_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cache_creation_5m_input_tokens: usage.cache_write_input_tokens,
+            cache_creation_1h_input_tokens: 0,
+        })
+        .unwrap_or(super::cache::CacheUsage {
+            total_input_tokens: input_tokens,
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        })
+}
+
 fn credential_display_label(id: u64, label: Option<&str>) -> String {
     let prefix = format!("#{}", id);
     let Some(label) = label.map(str::trim).filter(|label| !label.is_empty()) else {
@@ -1138,6 +1177,16 @@ impl CredentialUsageContext {
         self.apply_creation_frequency_control(reported_usage, usage_source)
     }
 
+    fn canonical_reported_usage_for_success(
+        &self,
+        usage: super::cache::CacheUsage,
+        usage_source: UsageSource,
+    ) -> super::cache::CacheUsage {
+        let reported_usage = self.final_reported_usage_for_success(usage, usage_source);
+        self.request
+            .ensure_reported_usage_for_record(reported_usage, usage_source)
+    }
+
     fn apply_creation_frequency_control(
         &self,
         reported_usage: super::cache::CacheUsage,
@@ -1198,8 +1247,14 @@ impl CredentialUsageContext {
         let usage_source = self.usage_source(&usage, metadata_usage, context_estimated);
         let reported_usage = ctx
             .final_reported_usage()
-            .unwrap_or_else(|| self.final_reported_usage_for_success(usage, usage_source));
-        self.record_success(reported_usage, usage_source, context_estimated);
+            .unwrap_or_else(|| self.canonical_reported_usage_for_success(usage, usage_source));
+        let raw_usage = raw_usage_from_metadata_or_estimate(
+            metadata_usage,
+            ctx.context_input_tokens
+                .unwrap_or(self.request.input_tokens),
+            usage.output_tokens,
+        );
+        self.record_success_reported(reported_usage, usage_source, Some(raw_usage));
     }
 
     fn final_reported_usage_for_stream(
@@ -1209,7 +1264,7 @@ impl CredentialUsageContext {
         context_estimated: bool,
     ) -> super::cache::CacheUsage {
         let usage_source = self.usage_source(&final_usage, metadata_usage, context_estimated);
-        self.final_reported_usage_for_success(final_usage, usage_source)
+        self.canonical_reported_usage_for_success(final_usage, usage_source)
     }
 
     fn record_stream_failure_from_context(
@@ -1218,7 +1273,7 @@ impl CredentialUsageContext {
         usage: Option<super::cache::CacheUsage>,
         error_detail: Option<(String, String)>,
         metadata_usage: Option<&crate::kiro::model::events::MetadataTokenUsage>,
-        context_estimated: bool,
+        context_input_tokens: Option<i32>,
     ) {
         let usage = usage.unwrap_or(super::cache::CacheUsage {
             total_input_tokens: self.request.input_tokens,
@@ -1229,7 +1284,13 @@ impl CredentialUsageContext {
             cache_creation_5m_input_tokens: 0,
             cache_creation_1h_input_tokens: 0,
         });
+        let context_estimated = metadata_usage.is_none() && context_input_tokens.is_some();
         let source = self.usage_source(&usage, metadata_usage, context_estimated);
+        let raw_usage = raw_usage_from_metadata_or_estimate(
+            metadata_usage,
+            context_input_tokens.unwrap_or(self.request.input_tokens),
+            usage.output_tokens,
+        );
         let (error_type, error_message) = error_detail.unwrap_or_else(|| {
             (
                 "api_error".to_string(),
@@ -1241,25 +1302,38 @@ impl CredentialUsageContext {
             status,
             usage,
             source,
+            Some(raw_usage),
             Some(error_type),
             Some(error_message),
             Some(error_detail),
         );
     }
 
+    #[cfg(test)]
     fn record_success(
         &self,
         usage: super::cache::CacheUsage,
         usage_source: UsageSource,
         _context_estimated: bool,
     ) {
+        let raw_usage = usage;
         let usage = self
             .request
             .ensure_reported_usage_for_record(usage, usage_source);
+        self.record_success_reported(usage, usage_source, Some(raw_usage));
+    }
+
+    fn record_success_reported(
+        &self,
+        usage: super::cache::CacheUsage,
+        usage_source: UsageSource,
+        raw_usage: Option<super::cache::CacheUsage>,
+    ) {
         self.record(
             UsageRecordStatus::Success,
             usage,
             usage_source,
+            raw_usage,
             None,
             None,
             None,
@@ -1300,6 +1374,7 @@ impl CredentialUsageContext {
             status,
             usage,
             UsageSource::None,
+            Some(usage),
             Some(error_type),
             Some(error_message),
             Some(error_detail),
@@ -1319,6 +1394,7 @@ impl CredentialUsageContext {
         status: UsageRecordStatus,
         usage: super::cache::CacheUsage,
         usage_source: UsageSource,
+        raw_usage: Option<super::cache::CacheUsage>,
         error_type: Option<String>,
         error_message: Option<String>,
         error_detail: Option<String>,
@@ -1361,6 +1437,7 @@ impl CredentialUsageContext {
             credential_label: self.credential_label.clone(),
             status,
             usage_source,
+            raw_usage: raw_usage.map(usage_snapshot),
             total_input_tokens: self.request.input_tokens,
             compat_input_tokens: usage.input_tokens,
             billable_input_tokens: usage.billable_input_tokens(),
@@ -2746,9 +2823,10 @@ async fn post_messages_inner(
         model_resolution.upstream_model.as_deref(),
         Some(&conversation_id),
     );
-    let payload_breakdown = breakdown_kiro_request(&kiro_request, &request_body);
+    let payload_breakdown = should_log_payload_byte_breakdown(&payload_guard_report)
+        .then(|| breakdown_kiro_request(&kiro_request, &request_body));
     log_payload_byte_breakdown(
-        should_log_payload_byte_breakdown(&payload_guard_report).then_some(payload_breakdown),
+        payload_breakdown,
         &payload_guard_report,
         endpoint,
         &payload.model,
@@ -2773,10 +2851,10 @@ async fn post_messages_inner(
         upstream_model = ?model_resolution.upstream_model,
         conversation_id = %conversation_id,
         request_bytes = request_body.len(),
-        history_entries = payload_breakdown.history_entries,
-        current_tool_count = payload_breakdown.current_tool_count,
-        current_tool_result_count = payload_breakdown.current_tool_result_count,
-        current_image_count = payload_breakdown.current_image_count,
+        history_entries = payload_guard_report.final_history_entries,
+        current_tool_count = kiro_request.conversation_state.current_message.user_input_message.user_input_message_context.tools.len(),
+        current_tool_result_count = kiro_request.conversation_state.current_message.user_input_message.user_input_message_context.tool_results.len(),
+        current_image_count = kiro_request.conversation_state.current_message.user_input_message.images.len(),
         "Kiro request prepared"
     );
     tracing::trace!(
@@ -3385,7 +3463,7 @@ fn create_sse_stream(
                                 ctx.final_usage(),
                                 error_detail,
                                 ctx.metadata_usage(),
-                                ctx.metadata_usage().is_none() && ctx.context_input_tokens_seen(),
+                                ctx.context_input_tokens,
                             );
                             usage_guard.complete();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -3430,7 +3508,7 @@ fn create_sse_stream(
                                     ctx.final_usage(),
                                     error_detail,
                                     ctx.metadata_usage(),
-                                    ctx.metadata_usage().is_none() && ctx.context_input_tokens_seen(),
+                                    ctx.context_input_tokens,
                                 );
                             } else {
                                 usage_guard.context().record_success_from_stream(&ctx);
@@ -3462,7 +3540,7 @@ fn create_sse_stream(
                         ctx.final_usage(),
                         error_detail,
                         ctx.metadata_usage(),
-                        ctx.metadata_usage().is_none() && ctx.context_input_tokens_seen(),
+                        ctx.context_input_tokens,
                     );
                     usage_guard.complete();
                     let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -4067,8 +4145,13 @@ async fn handle_non_stream_request(
     let context_estimated = !has_metadata && context_input_tokens.is_some();
     let usage_source =
         credential_usage.usage_source(&usage, metadata_usage.as_ref(), context_estimated);
-    let reported_usage = credential_usage.final_reported_usage_for_success(usage, usage_source);
-    credential_usage.record_success(reported_usage, usage_source, context_estimated);
+    let reported_usage = credential_usage.canonical_reported_usage_for_success(usage, usage_source);
+    let raw_usage = raw_usage_from_metadata_or_estimate(
+        metadata_usage.as_ref(),
+        final_input_tokens,
+        output_tokens,
+    );
+    credential_usage.record_success_reported(reported_usage, usage_source, Some(raw_usage));
     completion.report_success();
 
     // 构建 Anthropic 响应
@@ -4347,9 +4430,10 @@ pub async fn post_messages_cc(
         model_resolution.upstream_model.as_deref(),
         Some(&conversation_id),
     );
-    let payload_breakdown = breakdown_kiro_request(&kiro_request, &request_body);
+    let payload_breakdown = should_log_payload_byte_breakdown(&payload_guard_report)
+        .then(|| breakdown_kiro_request(&kiro_request, &request_body));
     log_payload_byte_breakdown(
-        should_log_payload_byte_breakdown(&payload_guard_report).then_some(payload_breakdown),
+        payload_breakdown,
         &payload_guard_report,
         "/cc/v1/messages",
         &payload.model,
@@ -4374,10 +4458,10 @@ pub async fn post_messages_cc(
         upstream_model = ?model_resolution.upstream_model,
         conversation_id = %conversation_id,
         request_bytes = request_body.len(),
-        history_entries = payload_breakdown.history_entries,
-        current_tool_count = payload_breakdown.current_tool_count,
-        current_tool_result_count = payload_breakdown.current_tool_result_count,
-        current_image_count = payload_breakdown.current_image_count,
+        history_entries = payload_guard_report.final_history_entries,
+        current_tool_count = kiro_request.conversation_state.current_message.user_input_message.user_input_message_context.tools.len(),
+        current_tool_result_count = kiro_request.conversation_state.current_message.user_input_message.user_input_message_context.tool_results.len(),
+        current_image_count = kiro_request.conversation_state.current_message.user_input_message.images.len(),
         "Kiro request prepared"
     );
     tracing::trace!(
@@ -4899,19 +4983,36 @@ mod tests {
                 .cache_read_input_tokens
                 .saturating_add(request_input_tokens.saturating_sub(reported.input_tokens))
         );
+        let raw_usage = raw_usage_from_metadata_or_estimate(
+            None,
+            request_input_tokens,
+            prod_like_usage.output_tokens,
+        );
 
-        credential_usage.record_success(prod_like_usage, UsageSource::LocalPromptCache, true);
+        credential_usage.record_success_reported(
+            reported,
+            UsageSource::LocalPromptCache,
+            Some(raw_usage),
+        );
         let records = usage_recorder.query(UsageRecordQuery::default());
         assert_eq!(records.total, 1);
         let record = records.records.first().expect("usage record should exist");
-        assert!((1..=96).contains(&record.compat_input_tokens));
+        assert_eq!(record.compat_input_tokens, reported.input_tokens);
         assert_eq!(record.output_tokens, 6);
         assert_eq!(
-            record.cache_read_input_tokens,
-            prod_like_usage
-                .cache_read_input_tokens
-                .saturating_add(request_input_tokens.saturating_sub(record.compat_input_tokens))
+            record.cache_creation_input_tokens,
+            reported.cache_creation_input_tokens
         );
+        assert_eq!(
+            record.cache_read_input_tokens,
+            reported.cache_read_input_tokens
+        );
+        let raw_usage = record.raw_usage.expect("raw usage should be retained");
+        assert_eq!(raw_usage.total_input_tokens, request_input_tokens);
+        assert_eq!(raw_usage.input_tokens, request_input_tokens);
+        assert_eq!(raw_usage.output_tokens, prod_like_usage.output_tokens);
+        assert_eq!(raw_usage.cache_creation_input_tokens, 0);
+        assert_eq!(raw_usage.cache_read_input_tokens, 0);
     }
 
     #[test]

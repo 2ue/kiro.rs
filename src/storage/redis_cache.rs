@@ -153,7 +153,7 @@ const USAGE_SUMMARY_CACHE_READ_INDEX_KEY: &str = "usage:summary:cache_read:index
 const USAGE_SUMMARY_TOP_CREDENTIALS_KEY: &str = "usage:summary:top:credentials";
 const USAGE_SUMMARY_TOP_CONVERSATIONS_KEY: &str = "usage:summary:top:conversations";
 const USAGE_REALTIME_BUCKET_TTL_SECS: usize = REALTIME_USAGE_WINDOW_SECS as usize * 3;
-const USAGE_SUMMARY_SEEN_TTL_SECS: usize = 35 * 24 * 60 * 60;
+const USAGE_SUMMARY_SEEN_TTL_SECS: usize = 60 * 60;
 const USAGE_DASHBOARD_BUCKET_TTL_SECS: usize = 35 * 24 * 60 * 60;
 const USAGE_DASHBOARD_TOP_MODELS_KEY: &str = "usage:dashboard:top:models";
 const USAGE_DASHBOARD_TOP_CREDENTIALS_KEY: &str = "usage:dashboard:top:credentials";
@@ -164,6 +164,7 @@ const USAGE_DASHBOARD_EXTERNAL_POOL_LIMIT: isize = 19;
 const USAGE_RECORDS_INDEX_KEY: &str = "usage:records:index";
 const USAGE_RECORDS_TTL_SECS: usize = 35 * 24 * 60 * 60;
 const USAGE_RECORDS_MAX_CACHED: usize = 100_000;
+const USAGE_RECORDS_TRIM_BATCH: usize = 512;
 const USAGE_RECORDS_QUERY_SCAN_LIMIT: usize = 5_000;
 const USAGE_DASHBOARD_DURATION_MAX_SCRIPT: &str = r#"
     local current = tonumber(redis.call('HGET', KEYS[1], 'duration_ms_max') or '0')
@@ -756,36 +757,85 @@ impl RedisStore {
         record: &UsageRecord,
         created_at: DateTime<Utc>,
     ) -> anyhow::Result<()> {
+        self.record_usage_record_snapshot_with_limits(
+            record,
+            created_at,
+            USAGE_RECORDS_MAX_CACHED,
+            USAGE_RECORDS_TRIM_BATCH,
+        )
+        .await
+    }
+
+    async fn record_usage_record_snapshot_with_limits(
+        &self,
+        record: &UsageRecord,
+        created_at: DateTime<Utc>,
+        max_cached: usize,
+        trim_batch: usize,
+    ) -> anyhow::Result<()> {
         let member = usage_dimension_hash(&record.id);
         let record_key = self.key(usage_record_key(&member));
         let index_key = self.key(USAGE_RECORDS_INDEX_KEY);
+        let item_key_prefix = self.key("usage:records:item:");
         let encoded = serde_json::to_string(record)?;
         let cutoff_ms = Utc::now()
             .timestamp_millis()
             .saturating_sub((USAGE_RECORDS_TTL_SECS as i64).saturating_mul(1000));
         let mut manager = self.manager.clone();
-        let mut pipe = redis::pipe();
-        pipe.atomic()
-            .cmd("SETEX")
+        let script = r#"
+            local ttl = tonumber(ARGV[1])
+            local member = ARGV[2]
+            local score = tonumber(ARGV[3])
+            local cutoff_ms = tonumber(ARGV[4])
+            local max_cached = tonumber(ARGV[5])
+            local trim_batch = tonumber(ARGV[6])
+            local item_key_prefix = ARGV[7]
+            local encoded = ARGV[8]
+
+            redis.call('SETEX', KEYS[1], ttl, encoded)
+            redis.call('ZADD', KEYS[2], score, member)
+            redis.call('EXPIRE', KEYS[2], ttl)
+
+            local expired = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', cutoff_ms, 'LIMIT', 0, trim_batch)
+            if #expired > 0 then
+                for i, old_member in ipairs(expired) do
+                    redis.call('DEL', item_key_prefix .. old_member)
+                end
+                redis.call('ZREM', KEYS[2], unpack(expired))
+            end
+
+            local overflow = redis.call('ZCARD', KEYS[2]) - max_cached
+            if overflow > 0 then
+                local limit = overflow
+                if limit > trim_batch then
+                    limit = trim_batch
+                end
+                local old_members = redis.call('ZRANGE', KEYS[2], 0, limit - 1)
+                if #old_members > 0 then
+                    for i, old_member in ipairs(old_members) do
+                        redis.call('DEL', item_key_prefix .. old_member)
+                    end
+                    redis.call('ZREM', KEYS[2], unpack(old_members))
+                end
+            end
+
+            return 1
+        "#;
+        let _: i64 = redis::cmd("EVAL")
+            .arg(script)
+            .arg(2)
             .arg(&record_key)
-            .arg(USAGE_RECORDS_TTL_SECS)
-            .arg(encoded)
-            .cmd("ZADD")
             .arg(&index_key)
-            .arg(created_at.timestamp_millis())
+            .arg(USAGE_RECORDS_TTL_SECS)
             .arg(&member)
-            .cmd("EXPIRE")
-            .arg(&index_key)
-            .arg(USAGE_RECORDS_TTL_SECS)
-            .cmd("ZREMRANGEBYSCORE")
-            .arg(&index_key)
-            .arg("-inf")
+            .arg(created_at.timestamp_millis())
             .arg(cutoff_ms)
-            .cmd("ZREMRANGEBYRANK")
-            .arg(&index_key)
-            .arg(0)
-            .arg(-((USAGE_RECORDS_MAX_CACHED as isize) + 1));
-        let _: () = pipe.query_async(&mut manager).await?;
+            .arg(max_cached.max(1))
+            .arg(trim_batch.max(1))
+            .arg(item_key_prefix)
+            .arg(encoded)
+            .query_async(&mut manager)
+            .await?;
         Ok(())
     }
 
@@ -1328,6 +1378,7 @@ impl RedisStore {
         Ok(items)
     }
 
+    #[allow(dead_code)]
     pub async fn get_session_binding(
         &self,
         session_id: &str,
@@ -1895,6 +1946,7 @@ impl RedisStore {
         self.del(scheduler_rate_limit_key(credential_id)).await
     }
 
+    #[allow(dead_code)]
     pub async fn next_in_flight_lease_id(&self) -> anyhow::Result<u64> {
         let mut manager = self.manager.clone();
         let id: u64 = manager
@@ -2018,6 +2070,99 @@ impl RedisStore {
             .await?;
         if result.first().copied().unwrap_or(0) == 1 {
             Ok(Some(result.get(1).copied().unwrap_or(1).max(0) as usize))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn acquire_dispatch_lease_with_new_id(
+        &self,
+        credential_id: u64,
+        max_concurrent_requests: u32,
+        global_max_concurrent_requests: u32,
+        max_age: Option<StdDuration>,
+        kind: &str,
+    ) -> anyhow::Result<Option<(u64, usize)>> {
+        let now = now_ms();
+        let max_age_ms = max_age.map(|age| age.as_millis() as i64).unwrap_or(0);
+        let ttl_secs = max_age
+            .map(|age| age.as_secs().saturating_mul(2).max(60) as i64)
+            .unwrap_or(0);
+        let script = r#"
+            local now = tonumber(ARGV[1])
+            local max_age_ms = tonumber(ARGV[2])
+            local max_count = tonumber(ARGV[3])
+            local global_max_count = tonumber(ARGV[4])
+            local kind = ARGV[5]
+            local ttl_secs = tonumber(ARGV[6])
+
+            if max_age_ms > 0 then
+                local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now - max_age_ms)
+                for _, member in ipairs(expired) do
+                    redis.call('ZREM', KEYS[1], member)
+                    redis.call('ZREM', KEYS[2], member)
+                    redis.call('HDEL', KEYS[3], member)
+                end
+                local global_expired = redis.call('ZRANGEBYSCORE', KEYS[4], '-inf', now - max_age_ms)
+                for _, member in ipairs(global_expired) do
+                    redis.call('ZREM', KEYS[4], member)
+                    redis.call('ZREM', KEYS[5], member)
+                    redis.call('HDEL', KEYS[6], member)
+                end
+            end
+
+            local count = redis.call('ZCARD', KEYS[1])
+            if max_count > 0 and count >= max_count then
+                return {0, 0, count}
+            end
+
+            local global_count = redis.call('ZCARD', KEYS[4])
+            if global_max_count > 0 and global_count >= global_max_count then
+                return {0, 0, global_count}
+            end
+
+            local lease_id = redis.call('INCR', KEYS[7])
+            redis.call('ZADD', KEYS[1], now, lease_id)
+            redis.call('ZADD', KEYS[2], now, lease_id)
+            redis.call('HSET', KEYS[3], lease_id, kind)
+            redis.call('ZADD', KEYS[4], now, lease_id)
+            redis.call('ZADD', KEYS[5], now, lease_id)
+            redis.call('HSET', KEYS[6], lease_id, kind)
+            if ttl_secs > 0 then
+                redis.call('EXPIRE', KEYS[1], ttl_secs)
+                redis.call('EXPIRE', KEYS[2], ttl_secs)
+                redis.call('EXPIRE', KEYS[3], ttl_secs)
+                redis.call('EXPIRE', KEYS[4], ttl_secs)
+                redis.call('EXPIRE', KEYS[5], ttl_secs)
+                redis.call('EXPIRE', KEYS[6], ttl_secs)
+            end
+            return {1, lease_id, count + 1}
+        "#;
+        let keys = in_flight_keys(credential_id);
+        let global_keys = global_in_flight_keys();
+        let mut manager = self.manager.clone();
+        let result: Vec<i64> = redis::cmd("EVAL")
+            .arg(script)
+            .arg(7)
+            .arg(self.key(&keys.last_seen))
+            .arg(self.key(&keys.acquired))
+            .arg(self.key(&keys.kind))
+            .arg(self.key(&global_keys.last_seen))
+            .arg(self.key(&global_keys.acquired))
+            .arg(self.key(&global_keys.kind))
+            .arg(self.key("scheduler:inflight:lease_sequence"))
+            .arg(now)
+            .arg(max_age_ms)
+            .arg(max_concurrent_requests)
+            .arg(global_max_concurrent_requests)
+            .arg(kind)
+            .arg(ttl_secs)
+            .query_async(&mut manager)
+            .await?;
+        if result.first().copied().unwrap_or(0) == 1 {
+            let lease_id = result.get(1).copied().unwrap_or(0).max(0) as u64;
+            let count = result.get(2).copied().unwrap_or(1).max(0) as usize;
+            Ok(Some((lease_id, count)))
         } else {
             Ok(None)
         }
@@ -2790,6 +2935,7 @@ impl RedisStore {
         Ok(states)
     }
 
+    #[allow(dead_code)]
     pub async fn global_capacity_state(&self) -> anyhow::Result<SchedulerGlobalCapacityState> {
         let keys = global_in_flight_keys();
         let mut manager = self.manager.clone();
@@ -3803,6 +3949,7 @@ fn external_pool_global_in_flight_keys() -> InFlightKeys {
 #[cfg(test)]
 mod tests {
     use futures::StreamExt;
+    use redis::AsyncCommands;
     use serde::{Deserialize, Serialize};
 
     use super::*;
@@ -3854,6 +4001,7 @@ mod tests {
             }),
             status,
             usage_source: source,
+            raw_usage: None,
             total_input_tokens: 100,
             compat_input_tokens: 90,
             billable_input_tokens: 95,
@@ -4077,6 +4225,79 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn redis_usage_record_snapshot_trims_orphan_items_with_index() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+
+        let store = RedisStore::connect(&config).await.unwrap();
+        store.clear_usage_summary().await.unwrap();
+        let base = Utc::now();
+
+        for index in 0..5 {
+            let record = usage_record(
+                &format!("redis-usage-trim-{index}"),
+                UsageRecordStatus::Success,
+                UsageSource::UpstreamMetadata,
+                index * 10,
+                0.01,
+                10,
+            );
+            store
+                .record_usage_record_snapshot_with_limits(
+                    &record,
+                    base + ChronoDuration::milliseconds(index as i64),
+                    3,
+                    8,
+                )
+                .await
+                .unwrap();
+        }
+
+        let index_key = store.key(USAGE_RECORDS_INDEX_KEY);
+        let mut manager = store.manager.clone();
+        let indexed: usize = manager.zcard(&index_key).await.unwrap();
+        assert_eq!(indexed, 3);
+
+        for index in 0..2 {
+            let member = usage_dimension_hash(&format!("redis-usage-trim-{index}"));
+            let exists: bool = manager
+                .exists(store.key(usage_record_key(&member)))
+                .await
+                .unwrap();
+            assert!(!exists, "trimmed record item key should be deleted");
+        }
+        for index in 2..5 {
+            let member = usage_dimension_hash(&format!("redis-usage-trim-{index}"));
+            let exists: bool = manager
+                .exists(store.key(usage_record_key(&member)))
+                .await
+                .unwrap();
+            assert!(exists, "cached record item key should remain");
+        }
+
+        let page = store
+            .usage_records_page(UsageRecordQuery::default(), 1, 10)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            page.records
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "redis-usage-trim-4",
+                "redis-usage-trim-3",
+                "redis-usage-trim-2"
+            ]
+        );
+
+        store.clear_usage_summary().await.unwrap();
     }
 
     #[tokio::test]

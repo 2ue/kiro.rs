@@ -382,10 +382,6 @@ pub fn guard_kiro_request(
         report.compressed_tool_definition_bytes += shaping.compressed_tool_definition_bytes;
 
         if shaping.was_modified() {
-            let repair_started_at = Instant::now();
-            let repair = repair_request(request);
-            add_repair_stats_to_report(&mut report, repair);
-            repair_elapsed += repair_started_at.elapsed();
             let serialize_started_at = Instant::now();
             body = serialize_request(request)?;
             serialize_elapsed += serialize_started_at.elapsed();
@@ -555,13 +551,6 @@ pub fn guard_anthropic_messages_request(
         report.compressed_tool_definition_bytes += shaping.compressed_tool_definition_bytes;
 
         if shaping.was_modified() {
-            let repair_started_at = Instant::now();
-            let repair = repair_anthropic_messages(request);
-            report.aligned_leading_entries += repair.aligned_leading_entries;
-            report.removed_orphan_tool_results += repair.removed_orphan_tool_results;
-            report.textified_orphan_tool_results += repair.textified_orphan_tool_results;
-            report.removed_orphan_tool_uses += repair.removed_orphan_tool_uses;
-            repair_elapsed += repair_started_at.elapsed();
             let serialize_started_at = Instant::now();
             body = serialize_anthropic_request(request)?;
             serialize_elapsed += serialize_started_at.elapsed();
@@ -580,11 +569,13 @@ pub fn guard_anthropic_messages_request(
             let after_trim = request.messages.len();
             report.trimmed_history_entries += before.saturating_sub(after_trim);
 
+            let repair_started_at = Instant::now();
             let repair = repair_anthropic_messages(request);
             report.aligned_leading_entries += repair.aligned_leading_entries;
             report.removed_orphan_tool_results += repair.removed_orphan_tool_results;
             report.textified_orphan_tool_results += repair.textified_orphan_tool_results;
             report.removed_orphan_tool_uses += repair.removed_orphan_tool_uses;
+            repair_elapsed += repair_started_at.elapsed();
 
             let serialize_started_at = Instant::now();
             body = serialize_anthropic_request(request)?;
@@ -2850,10 +2841,12 @@ fn starts_with_tool_pair(history: &[Message]) -> bool {
 }
 
 fn align_history_to_user(history: &mut Vec<Message>) -> usize {
-    let mut removed = 0;
-    while matches!(history.first(), Some(Message::Assistant(_))) {
-        history.remove(0);
-        removed += 1;
+    let removed = history
+        .iter()
+        .take_while(|message| matches!(message, Message::Assistant(_)))
+        .count();
+    if removed > 0 {
+        history.drain(0..removed);
     }
     removed
 }

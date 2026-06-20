@@ -3,7 +3,7 @@
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, Mutex, OnceLock},
 };
 
@@ -1649,31 +1649,56 @@ fn validate_tool_pairing(
 ) {
     use std::collections::HashSet;
 
-    let current_tool_use_ids = last_assistant_tool_use_ids_for_converter(history);
-    let mut unpaired_tool_use_ids = current_tool_use_ids.clone();
     let mut all_tool_use_ids = HashSet::new();
     let mut history_tool_result_ids = HashSet::new();
+    let mut current_tool_use_ids = HashSet::new();
+    let mut last_assistant_unpaired_candidates = HashSet::new();
+    let mut unpaired_tool_use_ids = HashSet::new();
     let mut current_paired_tool_use_ids = HashSet::new();
 
+    let mut pending_assistant_tool_use_ids: Option<Vec<String>> = None;
     for message in history {
         match message {
             Message::Assistant(assistant) => {
+                if let Some(ids) = pending_assistant_tool_use_ids.take() {
+                    unpaired_tool_use_ids.extend(ids);
+                }
                 if let Some(tool_uses) = &assistant.assistant_response_message.tool_uses {
+                    let ids = tool_uses
+                        .iter()
+                        .map(|tool_use| tool_use.tool_use_id.clone())
+                        .collect::<Vec<_>>();
                     for tool_use in tool_uses {
                         all_tool_use_ids.insert(tool_use.tool_use_id.clone());
+                    }
+                    if !ids.is_empty() {
+                        pending_assistant_tool_use_ids = Some(ids);
                     }
                 }
             }
             Message::User(user) => {
+                let mut paired_ids = HashSet::new();
                 for result in &user
                     .user_input_message
                     .user_input_message_context
                     .tool_results
                 {
                     history_tool_result_ids.insert(result.tool_use_id.clone());
+                    paired_ids.insert(result.tool_use_id.clone());
+                }
+                if let Some(ids) = pending_assistant_tool_use_ids.take() {
+                    unpaired_tool_use_ids.extend(
+                        ids.into_iter()
+                            .filter(|tool_use_id| !paired_ids.contains(tool_use_id)),
+                    );
                 }
             }
         }
+    }
+    if let Some(ids) = pending_assistant_tool_use_ids.take() {
+        current_tool_use_ids.extend(ids.iter().cloned());
+        last_assistant_unpaired_candidates.extend(ids);
+        unpaired_tool_use_ids.extend(current_tool_use_ids.iter().cloned());
     }
 
     let mut filtered_results = Vec::new();
@@ -1735,8 +1760,13 @@ fn validate_tool_pairing(
         }
     }
 
-    for orphaned_id in unpaired_historical_tool_use_ids(history, &current_paired_tool_use_ids) {
-        unpaired_tool_use_ids.insert(orphaned_id);
+    for paired_id in &current_paired_tool_use_ids {
+        unpaired_tool_use_ids.remove(paired_id);
+    }
+    for orphaned_id in last_assistant_unpaired_candidates {
+        if !current_paired_tool_use_ids.contains(&orphaned_id) {
+            unpaired_tool_use_ids.insert(orphaned_id);
+        }
     }
 
     // 检测真正孤立的 tool_use（有 tool_use 但在历史和当前消息中都没有 tool_result）
@@ -1753,58 +1783,6 @@ fn validate_tool_pairing(
         unpaired_tool_use_ids,
         orphan_tool_result_texts,
     )
-}
-
-fn last_assistant_tool_use_ids_for_converter(history: &[Message]) -> HashSet<String> {
-    history
-        .last()
-        .and_then(|message| match message {
-            Message::Assistant(assistant) => {
-                assistant.assistant_response_message.tool_uses.as_ref()
-            }
-            Message::User(_) => None,
-        })
-        .map(|tool_uses| {
-            tool_uses
-                .iter()
-                .map(|tool_use| tool_use.tool_use_id.clone())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn unpaired_historical_tool_use_ids(
-    history: &[Message],
-    current_paired_tool_use_ids: &HashSet<String>,
-) -> HashSet<String> {
-    let mut orphaned = HashSet::new();
-    for (idx, message) in history.iter().enumerate() {
-        let Message::Assistant(assistant) = message else {
-            continue;
-        };
-        let Some(tool_uses) = &assistant.assistant_response_message.tool_uses else {
-            continue;
-        };
-        let mut paired_ids = match history.get(idx + 1) {
-            Some(Message::User(user)) => user
-                .user_input_message
-                .user_input_message_context
-                .tool_results
-                .iter()
-                .map(|result| result.tool_use_id.clone())
-                .collect::<HashSet<_>>(),
-            _ => HashSet::new(),
-        };
-        if idx + 1 == history.len() {
-            paired_ids.extend(current_paired_tool_use_ids.iter().cloned());
-        }
-        for tool_use in tool_uses {
-            if !paired_ids.contains(&tool_use.tool_use_id) {
-                orphaned.insert(tool_use.tool_use_id.clone());
-            }
-        }
-    }
-    orphaned
 }
 
 fn kiro_tool_result_to_text(result: &ToolResult) -> Option<String> {

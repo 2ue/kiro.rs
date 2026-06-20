@@ -1402,6 +1402,7 @@ impl PostgresStore {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn record_credential_api_failure(
         &self,
         credential_id: u64,
@@ -1442,6 +1443,7 @@ impl PostgresStore {
         Ok(state)
     }
 
+    #[allow(dead_code)]
     pub async fn record_credential_refresh_failure(
         &self,
         credential_id: u64,
@@ -1482,6 +1484,7 @@ impl PostgresStore {
         Ok(state)
     }
 
+    #[allow(dead_code)]
     pub async fn mark_credential_disabled(
         &self,
         credential_id: u64,
@@ -1504,6 +1507,7 @@ impl PostgresStore {
         Ok(state)
     }
 
+    #[allow(dead_code)]
     pub async fn update_credential_last_used_at(
         &self,
         credential_id: u64,
@@ -2199,104 +2203,55 @@ impl PostgresUsageStore {
     }
 
     pub async fn record(&self, record: UsageRecord) -> anyhow::Result<()> {
-        let value = serde_json::to_value(&record)?;
-        let created_at = chrono::DateTime::parse_from_rfc3339(&record.created_at)
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now());
-        let mut tx = self.store.pool().begin().await?;
-        let old_record = sqlx::query_scalar::<_, serde_json::Value>(
-            "SELECT data FROM usage_records WHERE id = $1",
-        )
-        .bind(&record.id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .map(serde_json::from_value::<UsageRecord>)
-        .transpose()?;
-        sqlx::query(
-            r#"
-            INSERT INTO usage_records (
-                id, created_at, endpoint, stream, model, conversation_id, credential_id,
-                credential_label, status, usage_source, total_input_tokens, compat_input_tokens,
-                billable_input_tokens, output_tokens, cache_read_input_tokens,
-                cache_creation_input_tokens, cache_creation_5m_input_tokens,
-                cache_creation_1h_input_tokens, estimated_cost_usd, pricing_available,
-                pricing_model, duration_ms, simulated, sticky_bound, fallback_from_sticky,
-                error_type, error_message, error_detail, data
-            )
-            VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15, $16, $17, $18,
-                $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29
-            )
-            ON CONFLICT (id) DO UPDATE
-            SET created_at = EXCLUDED.created_at,
-                endpoint = EXCLUDED.endpoint,
-                stream = EXCLUDED.stream,
-                model = EXCLUDED.model,
-                conversation_id = EXCLUDED.conversation_id,
-                credential_id = EXCLUDED.credential_id,
-                credential_label = EXCLUDED.credential_label,
-                status = EXCLUDED.status,
-                usage_source = EXCLUDED.usage_source,
-                total_input_tokens = EXCLUDED.total_input_tokens,
-                compat_input_tokens = EXCLUDED.compat_input_tokens,
-                billable_input_tokens = EXCLUDED.billable_input_tokens,
-                output_tokens = EXCLUDED.output_tokens,
-                cache_read_input_tokens = EXCLUDED.cache_read_input_tokens,
-                cache_creation_input_tokens = EXCLUDED.cache_creation_input_tokens,
-                cache_creation_5m_input_tokens = EXCLUDED.cache_creation_5m_input_tokens,
-                cache_creation_1h_input_tokens = EXCLUDED.cache_creation_1h_input_tokens,
-                estimated_cost_usd = EXCLUDED.estimated_cost_usd,
-                pricing_available = EXCLUDED.pricing_available,
-                pricing_model = EXCLUDED.pricing_model,
-                duration_ms = EXCLUDED.duration_ms,
-                simulated = EXCLUDED.simulated,
-                sticky_bound = EXCLUDED.sticky_bound,
-                fallback_from_sticky = EXCLUDED.fallback_from_sticky,
-                error_type = EXCLUDED.error_type,
-                error_message = EXCLUDED.error_message,
-                error_detail = EXCLUDED.error_detail,
-                data = EXCLUDED.data,
-                deleted_at = NULL,
-                updated_at = now()
-            "#,
-        )
-        .bind(&record.id)
-        .bind(created_at)
-        .bind(&record.endpoint)
-        .bind(record.stream)
-        .bind(&record.model)
-        .bind(&record.conversation_id)
-        .bind(record.credential_id.map(|id| id as i64))
-        .bind(&record.credential_label)
-        .bind(usage_status_value(record.status))
-        .bind(usage_source_value(record.usage_source))
-        .bind(record.total_input_tokens)
-        .bind(record.compat_input_tokens)
-        .bind(record.billable_input_tokens)
-        .bind(record.output_tokens)
-        .bind(record.cache_read_input_tokens)
-        .bind(record.cache_creation_input_tokens)
-        .bind(record.cache_creation_5m_input_tokens)
-        .bind(record.cache_creation_1h_input_tokens)
-        .bind(record.estimated_cost_usd)
-        .bind(record.pricing_available)
-        .bind(&record.pricing_model)
-        .bind(record.duration_ms as i64)
-        .bind(record.simulated)
-        .bind(record.sticky_bound)
-        .bind(record.fallback_from_sticky)
-        .bind(&record.error_type)
-        .bind(&record.error_message)
-        .bind(&record.error_detail)
-        .bind(value)
-        .execute(&mut *tx)
-        .await?;
-        if let Some(old_record) = old_record {
-            apply_usage_rollup_delta(&mut tx, &old_record, -1).await?;
+        self.record_batch(vec![record]).await
+    }
+
+    pub async fn record_batch(&self, records: Vec<UsageRecord>) -> anyhow::Result<()> {
+        if records.is_empty() {
+            return Ok(());
         }
-        apply_usage_rollup_delta(&mut tx, &record, 1).await?;
+        let started_at = std::time::Instant::now();
+        let input_count = records.len();
+        let mut records_by_id: HashMap<String, UsageRecord> = HashMap::with_capacity(records.len());
+        for record in records {
+            records_by_id.insert(record.id.clone(), record);
+        }
+        let records: Vec<UsageRecord> = records_by_id.into_values().collect();
+        let ids: Vec<String> = records.iter().map(|record| record.id.clone()).collect();
+        let mut tx = self.store.pool().begin().await?;
+        let old_rows = sqlx::query("SELECT id, data FROM usage_records WHERE id = ANY($1)")
+            .bind(&ids)
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut old_records: HashMap<String, UsageRecord> = HashMap::with_capacity(old_rows.len());
+        for row in old_rows {
+            let id: String = row.try_get("id")?;
+            let value: serde_json::Value = row.try_get("data")?;
+            old_records.insert(id, serde_json::from_value(value)?);
+        }
+
+        for record in &records {
+            upsert_usage_record_in_tx(&mut tx, record).await?;
+        }
+
+        let mut rollups = UsageRollupBatchDelta::default();
+        for old_record in old_records.values() {
+            rollups.add_record(old_record, -1);
+        }
+        for record in &records {
+            rollups.add_record(record, 1);
+        }
+        rollups.apply(&mut tx).await?;
         tx.commit().await?;
+        let elapsed = started_at.elapsed();
+        if elapsed >= std::time::Duration::from_millis(100) {
+            tracing::warn!(
+                input_count,
+                persisted_count = records.len(),
+                elapsed_ms = elapsed.as_millis() as u64,
+                "PgSQL usage 批量写入耗时较长"
+            );
+        }
         Ok(())
     }
 
@@ -3093,6 +3048,97 @@ impl PostgresUsageStore {
     }
 }
 
+async fn upsert_usage_record_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    record: &UsageRecord,
+) -> anyhow::Result<()> {
+    let value = serde_json::to_value(record)?;
+    let created_at = chrono::DateTime::parse_from_rfc3339(&record.created_at)
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now());
+    sqlx::query(
+        r#"
+        INSERT INTO usage_records (
+            id, created_at, endpoint, stream, model, conversation_id, credential_id,
+            credential_label, status, usage_source, total_input_tokens, compat_input_tokens,
+            billable_input_tokens, output_tokens, cache_read_input_tokens,
+            cache_creation_input_tokens, cache_creation_5m_input_tokens,
+            cache_creation_1h_input_tokens, estimated_cost_usd, pricing_available,
+            pricing_model, duration_ms, simulated, sticky_bound, fallback_from_sticky,
+            error_type, error_message, error_detail, data
+        )
+        VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+            $11, $12, $13, $14, $15, $16, $17, $18,
+            $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29
+        )
+        ON CONFLICT (id) DO UPDATE
+        SET created_at = EXCLUDED.created_at,
+            endpoint = EXCLUDED.endpoint,
+            stream = EXCLUDED.stream,
+            model = EXCLUDED.model,
+            conversation_id = EXCLUDED.conversation_id,
+            credential_id = EXCLUDED.credential_id,
+            credential_label = EXCLUDED.credential_label,
+            status = EXCLUDED.status,
+            usage_source = EXCLUDED.usage_source,
+            total_input_tokens = EXCLUDED.total_input_tokens,
+            compat_input_tokens = EXCLUDED.compat_input_tokens,
+            billable_input_tokens = EXCLUDED.billable_input_tokens,
+            output_tokens = EXCLUDED.output_tokens,
+            cache_read_input_tokens = EXCLUDED.cache_read_input_tokens,
+            cache_creation_input_tokens = EXCLUDED.cache_creation_input_tokens,
+            cache_creation_5m_input_tokens = EXCLUDED.cache_creation_5m_input_tokens,
+            cache_creation_1h_input_tokens = EXCLUDED.cache_creation_1h_input_tokens,
+            estimated_cost_usd = EXCLUDED.estimated_cost_usd,
+            pricing_available = EXCLUDED.pricing_available,
+            pricing_model = EXCLUDED.pricing_model,
+            duration_ms = EXCLUDED.duration_ms,
+            simulated = EXCLUDED.simulated,
+            sticky_bound = EXCLUDED.sticky_bound,
+            fallback_from_sticky = EXCLUDED.fallback_from_sticky,
+            error_type = EXCLUDED.error_type,
+            error_message = EXCLUDED.error_message,
+            error_detail = EXCLUDED.error_detail,
+            data = EXCLUDED.data,
+            deleted_at = NULL,
+            updated_at = now()
+        "#,
+    )
+    .bind(&record.id)
+    .bind(created_at)
+    .bind(&record.endpoint)
+    .bind(record.stream)
+    .bind(&record.model)
+    .bind(&record.conversation_id)
+    .bind(record.credential_id.map(|id| id as i64))
+    .bind(&record.credential_label)
+    .bind(usage_status_value(record.status))
+    .bind(usage_source_value(record.usage_source))
+    .bind(record.total_input_tokens)
+    .bind(record.compat_input_tokens)
+    .bind(record.billable_input_tokens)
+    .bind(record.output_tokens)
+    .bind(record.cache_read_input_tokens)
+    .bind(record.cache_creation_input_tokens)
+    .bind(record.cache_creation_5m_input_tokens)
+    .bind(record.cache_creation_1h_input_tokens)
+    .bind(record.estimated_cost_usd)
+    .bind(record.pricing_available)
+    .bind(&record.pricing_model)
+    .bind(record.duration_ms as i64)
+    .bind(record.simulated)
+    .bind(record.sticky_bound)
+    .bind(record.fallback_from_sticky)
+    .bind(&record.error_type)
+    .bind(&record.error_message)
+    .bind(&record.error_detail)
+    .bind(value)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 fn cleanup_preview_from_row(row: PgRow) -> anyhow::Result<UsageCleanupPreview> {
     let matched_rows = row_i64_to_u64(&row, "matched_rows")?;
     Ok(UsageCleanupPreview {
@@ -3102,7 +3148,7 @@ fn cleanup_preview_from_row(row: PgRow) -> anyhow::Result<UsageCleanupPreview> {
     })
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct UsageRollupMetrics {
     requests: i64,
     success_requests: i64,
@@ -3222,6 +3268,46 @@ impl UsageRollupMetrics {
             },
         }
     }
+
+    fn add(&mut self, other: Self) {
+        self.requests += other.requests;
+        self.success_requests += other.success_requests;
+        self.error_requests += other.error_requests;
+        self.stream_requests += other.stream_requests;
+        self.non_stream_requests += other.non_stream_requests;
+        self.priced_requests += other.priced_requests;
+        self.unpriced_requests += other.unpriced_requests;
+        self.local_prompt_cache_requests += other.local_prompt_cache_requests;
+        self.simulated_requests += other.simulated_requests;
+        self.upstream_metadata_requests += other.upstream_metadata_requests;
+        self.sticky_bound_requests += other.sticky_bound_requests;
+        self.fallback_from_sticky_requests += other.fallback_from_sticky_requests;
+        self.total_input_tokens += other.total_input_tokens;
+        self.billable_input_tokens += other.billable_input_tokens;
+        self.total_output_tokens += other.total_output_tokens;
+        self.total_cache_read_input_tokens += other.total_cache_read_input_tokens;
+        self.total_cache_creation_input_tokens += other.total_cache_creation_input_tokens;
+        self.local_prompt_cache_input_tokens += other.local_prompt_cache_input_tokens;
+        self.local_prompt_cache_read_input_tokens += other.local_prompt_cache_read_input_tokens;
+        self.local_prompt_cache_creation_input_tokens +=
+            other.local_prompt_cache_creation_input_tokens;
+        self.total_estimated_cost_usd += other.total_estimated_cost_usd;
+        self.external_pool_requests += other.external_pool_requests;
+        self.external_pool_priced_requests += other.external_pool_priced_requests;
+        self.external_pool_unpriced_requests += other.external_pool_unpriced_requests;
+        self.external_pool_cost_floor_applied_requests +=
+            other.external_pool_cost_floor_applied_requests;
+        self.external_pool_raw_cost_usd += other.external_pool_raw_cost_usd;
+        self.external_pool_shaped_cost_usd += other.external_pool_shaped_cost_usd;
+        self.external_pool_uplifted_cost_usd += other.external_pool_uplifted_cost_usd;
+        self.external_pool_profit_usd += other.external_pool_profit_usd;
+        self.external_pool_reported_cost_usd += other.external_pool_reported_cost_usd;
+        self.external_pool_billable_cost_usd += other.external_pool_billable_cost_usd;
+        self.external_pool_cost_floor_delta_usd += other.external_pool_cost_floor_delta_usd;
+        self.duration_ms_sum += other.duration_ms_sum;
+        self.duration_ms_count += other.duration_ms_count;
+        self.duration_ms_max = self.duration_ms_max.max(other.duration_ms_max);
+    }
 }
 
 struct UsageRollupDimension {
@@ -3231,40 +3317,112 @@ struct UsageRollupDimension {
     include_time_bucket: bool,
 }
 
-async fn apply_usage_rollup_delta(
-    tx: &mut Transaction<'_, Postgres>,
-    record: &UsageRecord,
-    direction: i64,
-) -> anyhow::Result<()> {
-    let direction = if direction < 0 { -1 } else { 1 };
-    let metrics = UsageRollupMetrics::from_record(record, direction);
-    let created_at = parse_usage_created_at(record);
-    let bucket_start = usage_rollup_bucket_start(created_at);
-    let dimensions = usage_rollup_dimensions(record);
+#[derive(Default)]
+struct UsageRollupAggregate {
+    label: Option<String>,
+    metrics: UsageRollupMetrics,
+}
 
-    for dimension in dimensions {
-        upsert_usage_rollup_total(tx, &dimension, metrics).await?;
-        if dimension.include_time_bucket {
-            upsert_usage_rollup_time_bucket(tx, bucket_start, &dimension, metrics).await?;
+impl UsageRollupAggregate {
+    fn add(&mut self, label: Option<String>, metrics: UsageRollupMetrics) {
+        if label.is_some() {
+            self.label = label;
+        }
+        self.metrics.add(metrics);
+    }
+}
+
+#[derive(Default)]
+struct CredentialUsageSummaryDelta {
+    requests: i64,
+    estimated_cost_usd: f64,
+    priced_requests: i64,
+    unpriced_requests: i64,
+}
+
+#[derive(Default)]
+struct UsageRollupBatchDelta {
+    totals: HashMap<(&'static str, String), UsageRollupAggregate>,
+    time_buckets: HashMap<(DateTime<Utc>, &'static str, String), UsageRollupAggregate>,
+    cache_read_totals: HashMap<i32, i64>,
+    cache_read_time_buckets: HashMap<(DateTime<Utc>, i32), i64>,
+    duration_time_buckets: HashMap<(DateTime<Utc>, i32), i64>,
+    credential_summaries: HashMap<u64, CredentialUsageSummaryDelta>,
+}
+
+impl UsageRollupBatchDelta {
+    fn add_record(&mut self, record: &UsageRecord, direction: i64) {
+        let direction = if direction < 0 { -1 } else { 1 };
+        let metrics = UsageRollupMetrics::from_record(record, direction);
+        let created_at = parse_usage_created_at(record);
+        let bucket_start = usage_rollup_bucket_start(created_at);
+        for dimension in usage_rollup_dimensions(record) {
+            self.totals
+                .entry((dimension.dimension, dimension.key.clone()))
+                .or_default()
+                .add(dimension.label.clone(), metrics);
+            if dimension.include_time_bucket {
+                self.time_buckets
+                    .entry((bucket_start, dimension.dimension, dimension.key))
+                    .or_default()
+                    .add(dimension.label, metrics);
+            }
+        }
+
+        let cache_read = record.cache_read_input_tokens.max(0);
+        *self.cache_read_totals.entry(cache_read).or_default() += direction;
+        *self
+            .cache_read_time_buckets
+            .entry((bucket_start, cache_read))
+            .or_default() += direction;
+        *self
+            .duration_time_buckets
+            .entry((bucket_start, record.duration_ms.min(i32::MAX as u64) as i32))
+            .or_default() += direction;
+
+        if let Some(credential_id) = record.credential_id {
+            let summary = self.credential_summaries.entry(credential_id).or_default();
+            summary.requests += direction;
+            summary.estimated_cost_usd += record.estimated_cost_usd * direction as f64;
+            summary.priced_requests += signed_bool(record.pricing_available, direction);
+            summary.unpriced_requests += signed_bool(!record.pricing_available, direction);
         }
     }
 
-    let cache_read = record.cache_read_input_tokens.max(0);
-    upsert_usage_cache_read_total(tx, cache_read, direction).await?;
-    upsert_usage_cache_read_time_bucket(tx, bucket_start, cache_read, direction).await?;
-    upsert_usage_duration_time_bucket(
-        tx,
-        bucket_start,
-        record.duration_ms.min(i32::MAX as u64) as i32,
-        direction,
-    )
-    .await?;
-
-    if let Some(credential_id) = record.credential_id {
-        upsert_credential_usage_summary(tx, credential_id, record, direction).await?;
+    async fn apply(self, tx: &mut Transaction<'_, Postgres>) -> anyhow::Result<()> {
+        for ((dimension, key), aggregate) in self.totals {
+            let dimension = UsageRollupDimension {
+                dimension,
+                key,
+                label: aggregate.label,
+                include_time_bucket: false,
+            };
+            upsert_usage_rollup_total(tx, &dimension, aggregate.metrics).await?;
+        }
+        for ((bucket_start, dimension, key), aggregate) in self.time_buckets {
+            let dimension = UsageRollupDimension {
+                dimension,
+                key,
+                label: aggregate.label,
+                include_time_bucket: true,
+            };
+            upsert_usage_rollup_time_bucket(tx, bucket_start, &dimension, aggregate.metrics)
+                .await?;
+        }
+        for (cache_read, requests) in self.cache_read_totals {
+            upsert_usage_cache_read_total(tx, cache_read, requests).await?;
+        }
+        for ((bucket_start, cache_read), requests) in self.cache_read_time_buckets {
+            upsert_usage_cache_read_time_bucket(tx, bucket_start, cache_read, requests).await?;
+        }
+        for ((bucket_start, duration_ms), requests) in self.duration_time_buckets {
+            upsert_usage_duration_time_bucket(tx, bucket_start, duration_ms, requests).await?;
+        }
+        for (credential_id, delta) in self.credential_summaries {
+            upsert_credential_usage_summary_delta(tx, credential_id, delta).await?;
+        }
+        Ok(())
     }
-
-    Ok(())
 }
 
 fn usage_rollup_dimensions(record: &UsageRecord) -> Vec<UsageRollupDimension> {
@@ -3672,13 +3830,11 @@ async fn upsert_usage_duration_time_bucket(
     Ok(())
 }
 
-async fn upsert_credential_usage_summary(
+async fn upsert_credential_usage_summary_delta(
     tx: &mut Transaction<'_, Postgres>,
     credential_id: u64,
-    record: &UsageRecord,
-    direction: i64,
+    delta: CredentialUsageSummaryDelta,
 ) -> anyhow::Result<()> {
-    let sign = if direction < 0 { -1 } else { 1 };
     sqlx::query(
         r#"
         INSERT INTO usage_credential_cost_summary (
@@ -3695,10 +3851,10 @@ async fn upsert_credential_usage_summary(
         "#,
     )
     .bind(credential_id as i64)
-    .bind(sign)
-    .bind(record.estimated_cost_usd * sign as f64)
-    .bind(signed_bool(record.pricing_available, sign))
-    .bind(signed_bool(!record.pricing_available, sign))
+    .bind(delta.requests)
+    .bind(delta.estimated_cost_usd)
+    .bind(delta.priced_requests)
+    .bind(delta.unpriced_requests)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -4055,6 +4211,7 @@ fn usage_source_label(value: &str) -> String {
     .to_string()
 }
 
+#[allow(dead_code)]
 fn runtime_state_from_row(row: &PgRow) -> anyhow::Result<CredentialRuntimeStateRow> {
     let failure_count: i32 = row.try_get("failure_count")?;
     let refresh_failure_count: i32 = row.try_get("refresh_failure_count")?;
@@ -4120,6 +4277,7 @@ fn validate_external_pool_input(
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn upsert_last_used_at(
     tx: &mut Transaction<'_, Postgres>,
     credential_id: u64,
@@ -4141,6 +4299,7 @@ async fn upsert_last_used_at(
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn persist_credential_disabled_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     credential_id: u64,
@@ -5163,6 +5322,7 @@ mod tests {
             credential_label: Some("alpha@example.com".to_string()),
             status: UsageRecordStatus::Success,
             usage_source: UsageSource::LocalPromptCache,
+            raw_usage: None,
             total_input_tokens: 100,
             compat_input_tokens: 10,
             billable_input_tokens: 10,
@@ -5468,6 +5628,7 @@ mod tests {
             credential_label: None,
             status: UsageRecordStatus::Success,
             usage_source: UsageSource::UpstreamMetadata,
+            raw_usage: Some(raw_usage),
             total_input_tokens: reported_usage.total_input_tokens,
             compat_input_tokens: reported_usage.input_tokens,
             billable_input_tokens: reported_usage.billable_input_tokens,
