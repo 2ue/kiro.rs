@@ -25,6 +25,7 @@ use crate::model::config::{CompatProfile, PromptCacheSimulationMode};
 use super::types::{ContentBlock, MessagesRequest};
 
 const TOOL_RESULTS_PROVIDED_PLACEHOLDER: &str = "Tool results provided.";
+const EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER: &str = "Tool result content was empty.";
 
 /// 规范化 JSON Schema，修复 MCP/OpenAPI/Zod 工具定义中常见的兼容性问题。
 ///
@@ -1244,7 +1245,9 @@ fn process_message_content(
                                 .map(str::trim)
                                 .filter(|id| !id.is_empty())
                             {
-                                let result_content = extract_tool_result_content(&block.content);
+                                let result_content = normalize_tool_result_content(
+                                    extract_tool_result_content(&block.content),
+                                );
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
@@ -1288,12 +1291,13 @@ fn convert_image_source(source: super::types::ImageSource) -> Result<KiroImage, 
             let data = source.data.ok_or_else(|| {
                 ConversionError::UnsupportedContent("base64 image source missing data".to_string())
             })?;
-            let format = get_image_format(&media_type).ok_or_else(|| {
-                ConversionError::UnsupportedContent(format!(
-                    "unsupported image media_type: {}",
-                    media_type
-                ))
-            })?;
+            let format =
+                image_format_from_base64_or_media_type(&media_type, &data).ok_or_else(|| {
+                    ConversionError::UnsupportedContent(format!(
+                        "unsupported image media_type: {}",
+                        media_type
+                    ))
+                })?;
             Ok(KiroImage::from_base64(format, data))
         }
         "url" => {
@@ -1301,12 +1305,13 @@ fn convert_image_source(source: super::types::ImageSource) -> Result<KiroImage, 
                 ConversionError::UnsupportedContent("image URL source missing url".to_string())
             })?;
             if let Some((media_type, data)) = parse_data_url(&url) {
-                let format = get_image_format(&media_type).ok_or_else(|| {
-                    ConversionError::UnsupportedContent(format!(
-                        "unsupported image media_type: {}",
-                        media_type
-                    ))
-                })?;
+                let format = image_format_from_base64_or_media_type(&media_type, &data)
+                    .ok_or_else(|| {
+                        ConversionError::UnsupportedContent(format!(
+                            "unsupported image media_type: {}",
+                            media_type
+                        ))
+                    })?;
                 Ok(KiroImage::from_base64(format, data))
             } else {
                 Err(ConversionError::UnsupportedContent(
@@ -1554,18 +1559,70 @@ fn extract_text_from_pdf_bytes_fallback(bytes: &[u8]) -> Option<String> {
 
 fn parse_data_url(url: &str) -> Option<(String, String)> {
     let data_part = url.strip_prefix("data:")?;
-    let (media_type, data) = data_part.split_once(";base64,")?;
+    let (metadata, data) = data_part.split_once(',')?;
+    if !metadata
+        .split(';')
+        .skip(1)
+        .any(|part| part.trim().eq_ignore_ascii_case("base64"))
+    {
+        return None;
+    }
+    let media_type = metadata
+        .split(';')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
     Some((media_type.to_string(), data.to_string()))
 }
 
 /// 从 media_type 获取图片格式
 fn get_image_format(media_type: &str) -> Option<String> {
-    match media_type {
+    match normalize_media_type(media_type).as_str() {
         "image/jpeg" => Some("jpeg".to_string()),
         "image/png" => Some("png".to_string()),
         "image/gif" => Some("gif".to_string()),
         "image/webp" => Some("webp".to_string()),
         _ => None,
+    }
+}
+
+fn normalize_media_type(media_type: &str) -> String {
+    media_type
+        .split(';')
+        .next()
+        .unwrap_or(media_type)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn image_format_from_base64_or_media_type(media_type: &str, data: &str) -> Option<String> {
+    let declared = get_image_format(media_type);
+    if let Ok(bytes) = BASE64_STANDARD.decode(data) {
+        if let Some(detected) = infer_image_format_from_bytes(&bytes) {
+            if declared.as_deref().is_some_and(|value| value != detected) {
+                tracing::warn!(
+                    declared_media_type = %media_type,
+                    detected_format = detected,
+                    "图片 media_type 与内容字节不一致，已按字节识别结果修正"
+                );
+            }
+            return Some(detected.to_string());
+        }
+    }
+    declared
+}
+
+fn infer_image_format_from_bytes(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
+        Some("png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
     }
 }
 
@@ -1616,6 +1673,14 @@ fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
         }
         Some(v) => v.to_string(),
         None => String::new(),
+    }
+}
+
+fn normalize_tool_result_content(content: String) -> String {
+    if content.trim().is_empty() {
+        EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER.to_string()
+    } else {
+        content
     }
 }
 
@@ -4108,6 +4173,21 @@ mod tests {
     }
 
     #[test]
+    fn test_process_message_content_replaces_empty_tool_result_content() {
+        let content = serde_json::json!([
+            {"type": "tool_result", "tool_use_id": "toolu_ok", "content": []}
+        ]);
+
+        let (_, _, tool_results) = process_message_content(&content).expect("process");
+        let text = tool_results[0].content[0]
+            .get("text")
+            .and_then(|value| value.as_str())
+            .expect("tool result text");
+
+        assert_eq!(text, EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER);
+    }
+
+    #[test]
     fn test_process_message_content_preserves_non_text_tool_result_items() {
         let content = serde_json::json!([
             {
@@ -4125,6 +4205,45 @@ mod tests {
 
         assert!(text.contains("plain"));
         assert!(text.contains("\"image\""));
+    }
+
+    #[test]
+    fn test_base64_image_uses_detected_format_over_declared_media_type() {
+        let jpeg = BASE64_STANDARD.encode([0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x00]);
+        let content = serde_json::json!([
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": jpeg
+                }
+            }
+        ]);
+
+        let (_, images, _) = process_message_content(&content).expect("process");
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, "jpeg");
+    }
+
+    #[test]
+    fn test_data_url_image_uses_detected_format_over_declared_media_type() {
+        let jpeg = BASE64_STANDARD.encode([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
+        let content = serde_json::json!([
+            {
+                "type": "image",
+                "source": {
+                    "type": "url",
+                    "url": format!("data:image/png;charset=utf-8;base64,{}", jpeg)
+                }
+            }
+        ]);
+
+        let (_, images, _) = process_message_content(&content).expect("process");
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, "jpeg");
     }
 
     #[test]
