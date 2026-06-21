@@ -2234,14 +2234,16 @@ fn external_pool_outbound_body(route: &ExternalRouteRequest) -> Bytes {
         },
     };
 
-    if let Some(upstream_model) = route
+    let model = route
         .upstream_model
         .as_deref()
         .map(str::trim)
         .filter(|model| !model.is_empty())
-    {
-        if value.get("model").and_then(|model| model.as_str()) != Some(upstream_model) {
-            value["model"] = serde_json::Value::String(upstream_model.to_string());
+        .or_else(|| value.get("model").and_then(|model| model.as_str()));
+    if let Some(model) = model {
+        let outbound_model = normalize_external_pool_outbound_model(model);
+        if value.get("model").and_then(|model| model.as_str()) != Some(outbound_model.as_str()) {
+            value["model"] = serde_json::Value::String(outbound_model);
         }
     }
     normalize_external_pool_thinking_value(&mut value);
@@ -2249,6 +2251,29 @@ fn external_pool_outbound_body(route: &ExternalRouteRequest) -> Bytes {
     serde_json::to_vec(&value)
         .map(Bytes::from)
         .unwrap_or_else(|_| route.raw_body.clone())
+}
+
+fn normalize_external_pool_outbound_model(model: &str) -> String {
+    let trimmed = model.trim();
+    if !trimmed.starts_with("claude-") || !trimmed.contains('.') {
+        return trimmed.to_string();
+    }
+
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut out = String::with_capacity(trimmed.len());
+    for (idx, ch) in chars.iter().enumerate() {
+        if *ch == '.'
+            && idx > 0
+            && idx + 1 < chars.len()
+            && chars[idx - 1].is_ascii_digit()
+            && chars[idx + 1].is_ascii_digit()
+        {
+            out.push('-');
+        } else {
+            out.push(*ch);
+        }
+    }
+    out
 }
 
 fn normalize_external_pool_thinking_value(value: &mut serde_json::Value) -> bool {
@@ -4055,7 +4080,7 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
-        assert_eq!(value["model"], "claude-sonnet-4.5");
+        assert_eq!(value["model"], "claude-sonnet-4-5");
         assert_eq!(route.payload.model, "claude-sonnet-4-5-20250929");
     }
 
@@ -4083,7 +4108,7 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
-        assert_eq!(value["model"], "claude-sonnet-4.5");
+        assert_eq!(value["model"], "claude-sonnet-4-5");
         assert_eq!(
             value["messages"][0]["content"][0]["source"]["media_type"],
             "image/jpeg"
@@ -4114,10 +4139,41 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
-        assert_eq!(value["model"], "claude-opus-4.5");
+        assert_eq!(value["model"], "claude-opus-4-5");
         assert_eq!(value["thinking"]["type"], "adaptive");
         assert!(value["thinking"].get("budget_tokens").is_none());
         assert_eq!(value["output_config"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn external_pool_outbound_body_normalizes_payload_claude_model_without_mapping() {
+        let route = test_route("claude-haiku-4.5");
+
+        let outbound = external_pool_outbound_body(&route);
+        let value: serde_json::Value =
+            serde_json::from_slice(&outbound).expect("parse outbound body");
+
+        assert_eq!(value["model"], "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn external_pool_outbound_model_normalization_only_changes_claude_numeric_versions() {
+        assert_eq!(
+            normalize_external_pool_outbound_model("claude-opus-4.8"),
+            "claude-opus-4-8"
+        );
+        assert_eq!(
+            normalize_external_pool_outbound_model("claude-opus-4.8-thinking"),
+            "claude-opus-4-8-thinking"
+        );
+        assert_eq!(
+            normalize_external_pool_outbound_model(" claude-sonnet-4.5[1m] "),
+            "claude-sonnet-4-5[1m]"
+        );
+        assert_eq!(
+            normalize_external_pool_outbound_model("deepseek-3.2"),
+            "deepseek-3.2"
+        );
     }
 
     #[test]
