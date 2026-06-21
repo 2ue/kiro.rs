@@ -28,8 +28,8 @@ use crate::kiro::protocol::{
     extract_first_profile_arn, is_external_idp_credentials, is_real_profile_arn,
 };
 use crate::kiro::token_manager::{
-    AcquireMode, CallContext, CredentialRiskControlReason, InFlightKind, InFlightLeaseGuard,
-    ManagerSnapshot, MultiTokenManager, TransientFailureKind,
+    AcquireMode, CallContext, CredentialRiskControlReason, EXTERNAL_CREDENTIAL_CONTEXT_ID,
+    InFlightKind, InFlightLeaseGuard, ManagerSnapshot, MultiTokenManager, TransientFailureKind,
 };
 use crate::model::config::{Config, TlsBackend};
 use parking_lot::Mutex;
@@ -1086,22 +1086,24 @@ impl KiroProvider {
         {
             Ok(Some(profile_arn)) => {
                 ctx.credentials.profile_arn = Some(profile_arn.clone());
-                if let Err(err) = self
-                    .token_manager
-                    .update_credential_profile_arn(ctx.id, Some(profile_arn.clone()))
-                {
-                    tracing::warn!(
-                        credential_id = ctx.id,
-                        profile_arn = %profile_arn,
-                        "Enterprise profileArn 已解析但持久化失败: {}",
-                        err
-                    );
-                } else {
-                    tracing::info!(
-                        credential_id = ctx.id,
-                        profile_arn = %profile_arn,
-                        "Enterprise profileArn 已解析并持久化"
-                    );
+                if ctx.id != EXTERNAL_CREDENTIAL_CONTEXT_ID {
+                    if let Err(err) = self
+                        .token_manager
+                        .update_credential_profile_arn(ctx.id, Some(profile_arn.clone()))
+                    {
+                        tracing::warn!(
+                            credential_id = ctx.id,
+                            profile_arn = %profile_arn,
+                            "Enterprise profileArn 已解析但持久化失败: {}",
+                            err
+                        );
+                    } else {
+                        tracing::info!(
+                            credential_id = ctx.id,
+                            profile_arn = %profile_arn,
+                            "Enterprise profileArn 已解析并持久化"
+                        );
+                    }
                 }
             }
             Ok(None) => {
@@ -1334,13 +1336,46 @@ impl KiroProvider {
         credential_id: u64,
         request_body: &str,
     ) -> anyhow::Result<KiroApiResponse> {
-        let mut ctx = self
+        let ctx = self
             .token_manager
             .acquire_context_for_credential(credential_id)
             .await?;
-        ctx.mark_in_flight_kind(InFlightKind::Test);
         let credential_label = self.credential_log_label(ctx.id);
         let credential_context = format!("凭据 {}", credential_label);
+        self.call_api_with_single_context(ctx, request_body, credential_label, credential_context)
+            .await
+    }
+
+    /// 使用外部临时凭据发送一次非流式 API 请求。
+    ///
+    /// 仅用于 Admin 外部 JSON 验活：不加入凭据池、不参与负载均衡、不累计调度状态。
+    pub async fn call_api_with_external_credentials(
+        &self,
+        credentials: KiroCredentials,
+        request_body: &str,
+    ) -> anyhow::Result<KiroApiResponse> {
+        let ctx = self
+            .token_manager
+            .acquire_context_for_external_credentials(credentials)
+            .await?;
+        self.call_api_with_single_context(
+            ctx,
+            request_body,
+            "external".to_string(),
+            "外部凭据".to_string(),
+        )
+        .await
+    }
+
+    async fn call_api_with_single_context(
+        &self,
+        mut ctx: CallContext,
+        request_body: &str,
+        credential_label: String,
+        credential_context: String,
+    ) -> anyhow::Result<KiroApiResponse> {
+        ctx.mark_in_flight_kind(InFlightKind::Test);
+        let started_at = Instant::now();
 
         let config = self.token_manager.runtime_config();
         let machine_id = machine_id::generate_from_credentials(&ctx.credentials, &config);
@@ -1423,7 +1458,7 @@ impl KiroProvider {
                     false,
                     false,
                     Vec::new(),
-                    Instant::now(),
+                    started_at,
                 ),
             });
         }

@@ -2226,22 +2226,47 @@ fn forward_headers(
 }
 
 fn external_pool_outbound_body(route: &ExternalRouteRequest) -> Bytes {
-    normalize_external_pool_thinking_body(&route.raw_body).unwrap_or_else(|| route.raw_body.clone())
+    let mut value = match serde_json::to_value(&route.payload) {
+        Ok(value) => value,
+        Err(_) => match serde_json::from_slice::<serde_json::Value>(&route.raw_body) {
+            Ok(value) => value,
+            Err(_) => return route.raw_body.clone(),
+        },
+    };
+
+    if let Some(upstream_model) = route
+        .upstream_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        if value.get("model").and_then(|model| model.as_str()) != Some(upstream_model) {
+            value["model"] = serde_json::Value::String(upstream_model.to_string());
+        }
+    }
+    normalize_external_pool_thinking_value(&mut value);
+
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .unwrap_or_else(|_| route.raw_body.clone())
 }
 
-fn normalize_external_pool_thinking_body(raw_body: &Bytes) -> Option<Bytes> {
-    let mut value = serde_json::from_slice::<serde_json::Value>(raw_body).ok()?;
-    let thinking = value.get_mut("thinking")?.as_object_mut()?;
+fn normalize_external_pool_thinking_value(value: &mut serde_json::Value) -> bool {
+    let Some(thinking) = value
+        .get_mut("thinking")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return false;
+    };
     let thinking_type = thinking
         .get("type")
         .and_then(|value| value.as_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
     if !matches!(thinking_type.as_str(), "adaptive" | "disabled") {
-        return None;
+        return false;
     }
-    thinking.remove("budget_tokens")?;
-    serde_json::to_vec(&value).ok().map(Bytes::from)
+    thinking.remove("budget_tokens").is_some()
 }
 
 fn should_forward_header(name: &HeaderName) -> bool {
@@ -3314,7 +3339,7 @@ fn usage_i32(value: &serde_json::Value, key: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anthropic::types::{Message, Metadata, SystemMessage};
+    use crate::anthropic::types::{Message, Metadata, OutputConfig, SystemMessage, Thinking};
     use crate::model::config::Config;
     use crate::model::config::{ReportedUsageFieldPolicy, ReportedUsagePathPolicy};
 
@@ -3997,6 +4022,13 @@ mod tests {
     #[test]
     fn external_pool_outbound_body_strips_budget_tokens_for_adaptive_thinking() {
         let mut route = test_route("claude-opus-4-7-thinking");
+        route.payload.thinking = Some(Thinking {
+            thinking_type: "adaptive".to_string(),
+            budget_tokens: 20000,
+        });
+        route.payload.output_config = Some(OutputConfig {
+            effort: "xhigh".to_string(),
+        });
         route.raw_body = Bytes::from_static(
             br#"{"model":"claude-opus-4-7-thinking","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"adaptive","budget_tokens":20000},"output_config":{"effort":"xhigh"}}"#,
         );
@@ -4011,8 +4043,90 @@ mod tests {
     }
 
     #[test]
+    fn external_pool_outbound_body_applies_resolved_upstream_model() {
+        let mut route = test_route("claude-sonnet-4-5-20250929");
+        route.upstream_model = Some("claude-sonnet-4.5".to_string());
+        route.model_resolution_source = Some("alias".to_string());
+        route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        );
+
+        let outbound = external_pool_outbound_body(&route);
+        let value: serde_json::Value =
+            serde_json::from_slice(&outbound).expect("parse outbound body");
+
+        assert_eq!(value["model"], "claude-sonnet-4.5");
+        assert_eq!(route.payload.model, "claude-sonnet-4-5-20250929");
+    }
+
+    #[test]
+    fn external_pool_outbound_body_uses_normalized_payload_not_stale_raw_body() {
+        let mut route = test_route("claude-sonnet-4-5-20250929");
+        route.upstream_model = Some("claude-sonnet-4.5".to_string());
+        route.model_resolution_source = Some("alias".to_string());
+        route.payload.messages = vec![Message {
+            role: "user".to_string(),
+            content: serde_json::json!([{
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": "/9j/normalized"
+                }
+            }]),
+        }];
+        route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"/9j/stale"}}]}],"stream":true}"#,
+        );
+
+        let outbound = external_pool_outbound_body(&route);
+        let value: serde_json::Value =
+            serde_json::from_slice(&outbound).expect("parse outbound body");
+
+        assert_eq!(value["model"], "claude-sonnet-4.5");
+        assert_eq!(
+            value["messages"][0]["content"][0]["source"]["media_type"],
+            "image/jpeg"
+        );
+        assert_eq!(
+            value["messages"][0]["content"][0]["source"]["data"],
+            "/9j/normalized"
+        );
+    }
+
+    #[test]
+    fn external_pool_outbound_body_applies_model_mapping_and_thinking_normalization() {
+        let mut route = test_route("claude-opus-4-5-20251101");
+        route.upstream_model = Some("claude-opus-4.5".to_string());
+        route.model_resolution_source = Some("alias".to_string());
+        route.payload.thinking = Some(Thinking {
+            thinking_type: "adaptive".to_string(),
+            budget_tokens: 20000,
+        });
+        route.payload.output_config = Some(OutputConfig {
+            effort: "xhigh".to_string(),
+        });
+        route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-opus-4-5-20251101","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"adaptive","budget_tokens":20000},"output_config":{"effort":"xhigh"}}"#,
+        );
+
+        let outbound = external_pool_outbound_body(&route);
+        let value: serde_json::Value =
+            serde_json::from_slice(&outbound).expect("parse outbound body");
+
+        assert_eq!(value["model"], "claude-opus-4.5");
+        assert_eq!(value["thinking"]["type"], "adaptive");
+        assert!(value["thinking"].get("budget_tokens").is_none());
+        assert_eq!(value["output_config"]["effort"], "xhigh");
+    }
+
+    #[test]
     fn external_pool_outbound_body_strips_budget_tokens_for_disabled_thinking() {
         let mut route = test_route("claude-opus-4-7");
+        route.payload.thinking = Some(Thinking {
+            thinking_type: "disabled".to_string(),
+            budget_tokens: 20000,
+        });
         route.raw_body = Bytes::from_static(
             br#"{"model":"claude-opus-4-7","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"disabled","budget_tokens":20000}}"#,
         );
@@ -4028,6 +4142,10 @@ mod tests {
     #[test]
     fn external_pool_outbound_body_preserves_enabled_budget_tokens() {
         let mut route = test_route("claude-sonnet-4-6-thinking");
+        route.payload.thinking = Some(Thinking {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: 12345,
+        });
         route.raw_body = Bytes::from_static(
             br#"{"model":"claude-sonnet-4-6-thinking","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"enabled","budget_tokens":12345}}"#,
         );

@@ -80,6 +80,8 @@ const BALANCE_CACHE_TTL_SECS: i64 = 300;
 const DEFAULT_CREDENTIALS_PAGE_LIMIT: usize = 12;
 const MAX_CREDENTIALS_PAGE_LIMIT: usize = 500;
 const CREDENTIAL_INFO_REFRESH_CONCURRENCY: usize = 16;
+const DEFAULT_VALIDATION_TEST_MODEL: &str = "claude-opus-4-5-20251101";
+const DEFAULT_VALIDATION_TEST_PROMPT: &str = "hi";
 const MAX_MANUAL_MODEL_ID_LEN: usize = 160;
 const USAGE_CLEANUP_DEFAULT_MAX_BATCHES: usize = 10_000;
 const USAGE_CLEANUP_MAX_BATCHES: usize = 10_000;
@@ -1843,6 +1845,16 @@ impl AdminService {
                         subscription_key,
                         subscription_title,
                         error: None,
+                        subscription_checked: true,
+                        usage_checked: true,
+                        liveness_checked: false,
+                        subscription_ok: Some(true),
+                        usage_ok: Some(true),
+                        liveness_ok: None,
+                        usage_error: None,
+                        liveness_error: None,
+                        liveness_model: None,
+                        liveness_response: None,
                         matched_existing_credential_id: None,
                         existing_disabled: None,
                     });
@@ -1859,6 +1871,16 @@ impl AdminService {
                     subscription_key: "failed".to_string(),
                     subscription_title: "查询失败".to_string(),
                     error: Some(err.to_string()),
+                    subscription_checked: true,
+                    usage_checked: true,
+                    liveness_checked: false,
+                    subscription_ok: Some(false),
+                    usage_ok: Some(false),
+                    liveness_ok: None,
+                    usage_error: Some(err.to_string()),
+                    liveness_error: None,
+                    liveness_model: None,
+                    liveness_response: None,
                     matched_existing_credential_id: None,
                     existing_disabled: None,
                 }),
@@ -1872,6 +1894,30 @@ impl AdminService {
         &self,
         req: ValidateExternalCredentialsRequest,
     ) -> Result<CredentialValidationResponse, AdminServiceError> {
+        let query_subscription = req.query_subscription;
+        let query_usage = req.query_usage;
+        let check_liveness = req.check_liveness;
+        if !query_subscription && !query_usage && !check_liveness {
+            return Err(AdminServiceError::InvalidCredential(
+                "请至少选择订阅、用量或验活中的一个校验项".to_string(),
+            ));
+        }
+        let query_account_info = query_subscription || query_usage;
+        let liveness_model = req
+            .liveness_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .unwrap_or(DEFAULT_VALIDATION_TEST_MODEL)
+            .to_string();
+        let liveness_prompt = req
+            .liveness_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())
+            .unwrap_or(DEFAULT_VALIDATION_TEST_PROMPT)
+            .to_string();
+
         if req.credentials.is_empty() {
             return Err(AdminServiceError::InvalidCredential(
                 "请先提供要校验的凭据 JSON".to_string(),
@@ -1907,6 +1953,16 @@ impl AdminService {
                         subscription_key: "failed".to_string(),
                         subscription_title: "解析失败".to_string(),
                         error: Some(err.to_string()),
+                        subscription_checked: query_subscription,
+                        usage_checked: query_usage,
+                        liveness_checked: check_liveness,
+                        subscription_ok: query_subscription.then_some(false),
+                        usage_ok: query_usage.then_some(false),
+                        liveness_ok: check_liveness.then_some(false),
+                        usage_error: None,
+                        liveness_error: None,
+                        liveness_model: check_liveness.then(|| liveness_model.clone()),
+                        liveness_response: None,
                         matched_existing_credential_id: matched.as_ref().map(|item| item.id),
                         existing_disabled: matched.as_ref().map(|item| item.disabled),
                     });
@@ -1914,49 +1970,104 @@ impl AdminService {
                 }
             };
 
-            match self
-                .token_manager
-                .probe_usage_limits_for_credentials(credential)
-                .await
-            {
-                Ok(usage) => {
-                    let current = validation_info_from_usage(&usage);
-                    let subscription_title = current
-                        .subscription_title
-                        .clone()
-                        .unwrap_or_else(|| "未知".to_string());
-                    items.push(CredentialValidationItem {
-                        id: None,
-                        index: Some(index + 1),
-                        email,
-                        disabled: None,
-                        ok: true,
-                        previous: None,
-                        current: Some(current),
-                        change_kind: "external".to_string(),
-                        subscription_key: subscription_key(Some(&subscription_title)),
-                        subscription_title,
-                        error: None,
-                        matched_existing_credential_id: matched.as_ref().map(|item| item.id),
-                        existing_disabled: matched.as_ref().map(|item| item.disabled),
-                    });
+            let mut current: Option<CredentialValidationInfo> = None;
+            let mut usage_error: Option<String> = None;
+            if query_account_info {
+                match self
+                    .token_manager
+                    .probe_usage_limits_for_credentials(credential.clone())
+                    .await
+                {
+                    Ok(usage) => {
+                        current = Some(validation_info_from_usage(&usage));
+                    }
+                    Err(err) => {
+                        usage_error = Some(err.to_string());
+                    }
                 }
-                Err(err) => items.push(CredentialValidationItem {
-                    id: None,
-                    index: Some(index + 1),
-                    email,
-                    disabled: None,
-                    ok: false,
-                    previous: None,
-                    current: None,
-                    change_kind: "failed".to_string(),
-                    subscription_key: "failed".to_string(),
-                    subscription_title: "查询失败".to_string(),
-                    error: Some(err.to_string()),
-                    matched_existing_credential_id: matched.as_ref().map(|item| item.id),
-                    existing_disabled: matched.as_ref().map(|item| item.disabled),
-                }),
             }
+
+            let mut liveness_error: Option<String> = None;
+            let mut liveness_response: Option<String> = None;
+            if check_liveness {
+                match self
+                    .test_external_credential_liveness(
+                        credential,
+                        &liveness_model,
+                        &liveness_prompt,
+                    )
+                    .await
+                {
+                    Ok(response) => {
+                        liveness_response = Some(response);
+                    }
+                    Err(err) => {
+                        liveness_error = Some(err.to_string());
+                    }
+                }
+            }
+
+            let query_ok = !query_account_info || usage_error.is_none();
+            let liveness_ok = !check_liveness || liveness_error.is_none();
+            let ok = query_ok && liveness_ok;
+            let error = validation_error_summary(usage_error.as_deref(), liveness_error.as_deref());
+            let subscription_title = if query_subscription {
+                current
+                    .as_ref()
+                    .and_then(|info| info.subscription_title.clone())
+                    .unwrap_or_else(|| {
+                        if usage_error.is_some() {
+                            "查询失败".to_string()
+                        } else {
+                            "未知".to_string()
+                        }
+                    })
+            } else if query_usage {
+                if usage_error.is_some() {
+                    "查询失败".to_string()
+                } else {
+                    "用量已查询".to_string()
+                }
+            } else if liveness_error.is_some() {
+                "验活失败".to_string()
+            } else {
+                "验活成功".to_string()
+            };
+            let subscription_key = if ok {
+                if query_subscription {
+                    subscription_key(Some(&subscription_title))
+                } else {
+                    "external".to_string()
+                }
+            } else {
+                "failed".to_string()
+            };
+
+            items.push(CredentialValidationItem {
+                id: None,
+                index: Some(index + 1),
+                email,
+                disabled: None,
+                ok,
+                previous: None,
+                current,
+                change_kind: if ok { "external" } else { "failed" }.to_string(),
+                subscription_key,
+                subscription_title,
+                error,
+                subscription_checked: query_subscription,
+                usage_checked: query_usage,
+                liveness_checked: check_liveness,
+                subscription_ok: query_subscription.then_some(query_ok),
+                usage_ok: query_usage.then_some(query_ok),
+                liveness_ok: check_liveness.then_some(liveness_ok),
+                usage_error,
+                liveness_error,
+                liveness_model: check_liveness.then(|| liveness_model.clone()),
+                liveness_response,
+                matched_existing_credential_id: matched.as_ref().map(|item| item.id),
+                existing_disabled: matched.as_ref().map(|item| item.disabled),
+            });
         }
 
         Ok(build_validation_response(items))
@@ -1968,13 +2079,95 @@ impl AdminService {
         id: u64,
         req: TestCredentialRequest,
     ) -> Result<TestCredentialResponse, AdminServiceError> {
-        let model = req.model.trim();
+        let prompt = req
+            .prompt
+            .unwrap_or_else(|| DEFAULT_VALIDATION_TEST_PROMPT.to_string());
+        let (model, model_id, prompt, request_body) =
+            self.build_model_test_request(&req.model, &prompt)?;
+
+        let started_at = std::time::Instant::now();
+        let api_response = self
+            .kiro_provider
+            .call_api_with_credential(id, &request_body)
+            .await
+            .map_err(|e| self.classify_test_error(e, id))?;
+        let runtime_config = self.token_manager.runtime_config();
+        let credential_id = api_response.credential_id();
+        let (response, completion) = api_response.into_parts();
+        let body_bytes = match response_bytes_with_body_timeout(
+            response,
+            runtime_config.kiro_upstream_response_timeout_secs,
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                completion.release();
+                return Err(AdminServiceError::UpstreamError(format!(
+                    "读取测试响应失败: {}",
+                    e
+                )));
+            }
+        };
+        let response_text = parse_model_test_response(&body_bytes)?;
+        completion.release();
+
+        Ok(TestCredentialResponse {
+            success: true,
+            credential_id,
+            model,
+            model_id,
+            prompt,
+            response: response_text,
+            duration_ms: started_at.elapsed().as_millis() as u64,
+        })
+    }
+
+    async fn test_external_credential_liveness(
+        &self,
+        credential: KiroCredentials,
+        model: &str,
+        prompt: &str,
+    ) -> Result<String, AdminServiceError> {
+        let (_, _, _, request_body) = self.build_model_test_request(model, prompt)?;
+        let runtime_config = self.token_manager.runtime_config();
+        let api_response = self
+            .kiro_provider
+            .call_api_with_external_credentials(credential, &request_body)
+            .await
+            .map_err(|e| AdminServiceError::UpstreamError(e.to_string()))?;
+        let (response, completion) = api_response.into_parts();
+        let body_bytes = match response_bytes_with_body_timeout(
+            response,
+            runtime_config.kiro_upstream_response_timeout_secs,
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                completion.release();
+                return Err(AdminServiceError::UpstreamError(format!(
+                    "读取验活响应失败: {}",
+                    e
+                )));
+            }
+        };
+        let response_text = parse_model_test_response(&body_bytes)?;
+        completion.release();
+        Ok(response_text)
+    }
+
+    fn build_model_test_request(
+        &self,
+        model: &str,
+        prompt: &str,
+    ) -> Result<(String, String, String, String), AdminServiceError> {
+        let model = model.trim();
         if model.is_empty() {
             return Err(AdminServiceError::InvalidCredential(
                 "请选择测试模型".to_string(),
             ));
         }
-        let prompt = req.prompt.unwrap_or_else(|| "hi".to_string());
         let prompt = prompt.trim();
         if prompt.is_empty() {
             return Err(AdminServiceError::InvalidCredential(
@@ -2012,42 +2205,12 @@ impl AdminService {
         };
         let request_body = serde_json::to_string(&kiro_request)
             .map_err(|e| AdminServiceError::InternalError(format!("序列化测试请求失败: {}", e)))?;
-
-        let started_at = std::time::Instant::now();
-        let api_response = self
-            .kiro_provider
-            .call_api_with_credential(id, &request_body)
-            .await
-            .map_err(|e| self.classify_test_error(e, id))?;
-        let credential_id = api_response.credential_id();
-        let (response, completion) = api_response.into_parts();
-        let body_bytes = match response_bytes_with_body_timeout(
-            response,
-            runtime_config.kiro_upstream_response_timeout_secs,
-        )
-        .await
-        {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                completion.release();
-                return Err(AdminServiceError::UpstreamError(format!(
-                    "读取测试响应失败: {}",
-                    e
-                )));
-            }
-        };
-        let response_text = parse_model_test_response(&body_bytes)?;
-        completion.release();
-
-        Ok(TestCredentialResponse {
-            success: true,
-            credential_id,
-            model: model.to_string(),
+        Ok((
+            model.to_string(),
             model_id,
-            prompt: prompt.to_string(),
-            response: response_text,
-            duration_ms: started_at.elapsed().as_millis() as u64,
-        })
+            prompt.to_string(),
+            request_body,
+        ))
     }
 
     /// 从上游获取账号信息（无缓存）
@@ -4758,6 +4921,24 @@ fn validation_info_from_usage(usage: &UsageLimitsResponse) -> CredentialValidati
     }
 }
 
+fn validation_error_summary(
+    usage_error: Option<&str>,
+    liveness_error: Option<&str>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(error) = usage_error.filter(|value| !value.trim().is_empty()) {
+        parts.push(format!("查询失败: {}", error));
+    }
+    if let Some(error) = liveness_error.filter(|value| !value.trim().is_empty()) {
+        parts.push(format!("验活失败: {}", error));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("；"))
+    }
+}
+
 fn compare_subscription_change(
     previous: Option<&CredentialValidationInfo>,
     current: Option<&CredentialValidationInfo>,
@@ -4831,6 +5012,7 @@ fn validation_group_title(key: &str) -> String {
         "trial" => "试用".to_string(),
         "free" => "Free".to_string(),
         "unknown" => "未知订阅".to_string(),
+        "external" => "外部校验".to_string(),
         other => other.to_string(),
     }
 }
@@ -4866,6 +5048,7 @@ fn build_validation_response(items: Vec<CredentialValidationItem>) -> Credential
         "pro",
         "trial",
         "free",
+        "external",
         "unknown",
     ];
     let mut groups = Vec::new();

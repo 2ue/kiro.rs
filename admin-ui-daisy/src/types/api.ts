@@ -327,6 +327,11 @@ export interface ValidateExistingCredentialsRequest {
 
 export interface ValidateExternalCredentialsRequest {
   credentials: AddCredentialRequest[]
+  querySubscription?: boolean
+  queryUsage?: boolean
+  checkLiveness?: boolean
+  livenessModel?: string
+  livenessPrompt?: string
 }
 
 export interface CredentialValidationInfo {
@@ -349,6 +354,16 @@ export interface CredentialValidationItem {
   subscriptionKey: string
   subscriptionTitle: string
   error?: string | null
+  subscriptionChecked?: boolean
+  usageChecked?: boolean
+  livenessChecked?: boolean
+  subscriptionOk?: boolean | null
+  usageOk?: boolean | null
+  livenessOk?: boolean | null
+  usageError?: string | null
+  livenessError?: string | null
+  livenessModel?: string | null
+  livenessResponse?: string | null
   matchedExistingCredentialId?: number | null
   existingDisabled?: boolean | null
 }

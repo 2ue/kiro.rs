@@ -1061,6 +1061,21 @@ pub struct ValidateExistingCredentialsRequest {
 pub struct ValidateExternalCredentialsRequest {
     #[serde(default)]
     pub credentials: Vec<AddCredentialRequest>,
+    /// 是否查询订阅标题。默认保持旧行为：查询。
+    #[serde(default = "default_true")]
+    pub query_subscription: bool,
+    /// 是否查询当前用量/额度。默认保持旧行为：查询。
+    #[serde(default = "default_true")]
+    pub query_usage: bool,
+    /// 是否发送一次最小模型请求做验活。默认不发送模型请求。
+    #[serde(default)]
+    pub check_liveness: bool,
+    /// 验活模型；为空时使用管理端默认验活模型。
+    #[serde(default)]
+    pub liveness_model: Option<String>,
+    /// 验活提示词；为空时使用管理端默认提示词。
+    #[serde(default)]
+    pub liveness_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1087,6 +1102,16 @@ pub struct CredentialValidationItem {
     pub subscription_key: String,
     pub subscription_title: String,
     pub error: Option<String>,
+    pub subscription_checked: bool,
+    pub usage_checked: bool,
+    pub liveness_checked: bool,
+    pub subscription_ok: Option<bool>,
+    pub usage_ok: Option<bool>,
+    pub liveness_ok: Option<bool>,
+    pub usage_error: Option<String>,
+    pub liveness_error: Option<String>,
+    pub liveness_model: Option<String>,
+    pub liveness_response: Option<String>,
     pub matched_existing_credential_id: Option<u64>,
     pub existing_disabled: Option<bool>,
 }

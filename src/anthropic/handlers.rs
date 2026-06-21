@@ -403,6 +403,11 @@ fn build_external_fallback_context(
 }
 
 impl ExternalFallbackContext {
+    fn refresh_payload(&mut self, payload: &MessagesRequest) {
+        self.payload = payload.clone();
+        self.raw_body = serialize_messages_request_body(payload);
+    }
+
     async fn should_fail_fast_local(&self) -> bool {
         if !self.config.local_pool_preflight_enabled {
             return false;
@@ -655,6 +660,12 @@ struct GuardedExternalRoutePayload {
     payload_breakdown: Option<PayloadByteBreakdown>,
     payload_guard_report: Option<PayloadGuardReport>,
     payload_guard_retry_config: Option<PayloadGuardConfig>,
+}
+
+fn serialize_messages_request_body(payload: &MessagesRequest) -> Bytes {
+    serde_json::to_vec(payload)
+        .map(Bytes::from)
+        .unwrap_or_default()
 }
 
 fn classify_local_error_for_external_fallback(
@@ -1557,6 +1568,64 @@ async fn materialize_remote_multimodal_sources(
     }
 
     Ok(())
+}
+
+fn normalize_base64_image_media_types(payload: &mut MessagesRequest) -> usize {
+    let mut fixed = 0usize;
+    for message in &mut payload.messages {
+        fixed += normalize_content_base64_image_media_types(&mut message.content);
+    }
+    if fixed > 0 {
+        tracing::warn!(
+            fixed,
+            "base64 image media_type mismatches were corrected before upstream routing"
+        );
+    }
+    fixed
+}
+
+fn normalize_content_base64_image_media_types(content: &mut Value) -> usize {
+    let Value::Array(items) = content else {
+        return 0;
+    };
+
+    let mut fixed = 0usize;
+    for item in items {
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        if obj.get("type").and_then(Value::as_str) != Some("image") {
+            continue;
+        }
+        let Some(source) = obj.get_mut("source").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        if source.get("type").and_then(Value::as_str) != Some("base64") {
+            continue;
+        }
+        let Some(data) = source.get("data").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(bytes) = BASE64_STANDARD.decode(data) else {
+            continue;
+        };
+        let Some(detected_media_type) = infer_image_media_type_from_bytes(&bytes) else {
+            continue;
+        };
+        let declared_media_type = source
+            .get("media_type")
+            .and_then(Value::as_str)
+            .map(normalize_media_type);
+        if declared_media_type.as_deref() == Some(detected_media_type) {
+            continue;
+        }
+        source.insert(
+            "media_type".to_string(),
+            Value::String(detected_media_type.to_string()),
+        );
+        fixed += 1;
+    }
+    fixed
 }
 
 async fn materialize_content_sources(
@@ -2696,12 +2765,6 @@ async fn post_messages_inner(
         headers.clone(),
         &payload,
     );
-    if let Some(external) = external_fallback.as_ref() {
-        let request_id = envelope::request_id();
-        if let Some(response) = external.direct_policy_response(&request_id).await {
-            return response;
-        }
-    }
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
@@ -2713,45 +2776,10 @@ async fn post_messages_inner(
         tracing::warn!("多模态远程 source 处理失败: {}", message);
         return envelope::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message);
     }
+    normalize_base64_image_media_types(&mut payload);
 
-    // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
-        if !websearch_supported_for_profile(runtime_config.compat_profile) {
-            return envelope::error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "web_search server-tool synthesis is disabled in anthropic-strict profile",
-            );
-        }
-        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
-
-        // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
-
-        let _model_resolution =
-            match resolve_request_model(&state, &runtime_config, endpoint, &payload) {
-                Ok(resolution) => resolution,
-                Err(response) => {
-                    if let Some(external_response) = maybe_forward_external_after_local_error(
-                        external_fallback.as_ref(),
-                        &envelope::request_id(),
-                        &format!("模型不支持: {}", payload.model),
-                        Vec::new(),
-                    )
-                    .await
-                    {
-                        return external_response;
-                    }
-                    return response;
-                }
-            };
-
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+    if let Some(external) = external_fallback.as_mut() {
+        external.refresh_payload(&payload);
     }
 
     let model_resolution = match resolve_request_model(&state, &runtime_config, endpoint, &payload)
@@ -2773,6 +2801,34 @@ async fn post_messages_inner(
     };
     if let Some(external) = external_fallback.as_mut() {
         external.model_resolution = Some(model_resolution.clone());
+    }
+    if let Some(external) = external_fallback.as_ref() {
+        let request_id = envelope::request_id();
+        if let Some(response) = external.direct_policy_response(&request_id).await {
+            return response;
+        }
+    }
+
+    // 检查是否为 WebSearch 请求
+    if websearch::has_web_search_tool(&payload) {
+        if !websearch_supported_for_profile(runtime_config.compat_profile) {
+            return envelope::error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "web_search server-tool synthesis is disabled in anthropic-strict profile",
+            );
+        }
+        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
+
+        // 估算输入 tokens
+        let input_tokens = token::count_all_tokens(
+            payload.model.clone(),
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ) as i32;
+
+        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
     // 转换请求
@@ -4303,12 +4359,6 @@ pub async fn post_messages_cc(
         headers.clone(),
         &payload,
     );
-    if let Some(external) = external_fallback.as_ref() {
-        let request_id = envelope::request_id();
-        if let Some(response) = external.direct_policy_response(&request_id).await {
-            return response;
-        }
-    }
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
@@ -4320,45 +4370,10 @@ pub async fn post_messages_cc(
         tracing::warn!("多模态远程 source 处理失败: {}", message);
         return envelope::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message);
     }
+    normalize_base64_image_media_types(&mut payload);
 
-    // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
-        if !websearch_supported_for_profile(runtime_config.compat_profile) {
-            return envelope::error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "web_search server-tool synthesis is disabled in anthropic-strict profile",
-            );
-        }
-        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
-
-        // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
-
-        let _model_resolution =
-            match resolve_request_model(&state, &runtime_config, "/cc/v1/messages", &payload) {
-                Ok(resolution) => resolution,
-                Err(response) => {
-                    if let Some(external_response) = maybe_forward_external_after_local_error(
-                        external_fallback.as_ref(),
-                        &envelope::request_id(),
-                        &format!("模型不支持: {}", payload.model),
-                        Vec::new(),
-                    )
-                    .await
-                    {
-                        return external_response;
-                    }
-                    return response;
-                }
-            };
-
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+    if let Some(external) = external_fallback.as_mut() {
+        external.refresh_payload(&payload);
     }
 
     let model_resolution =
@@ -4380,6 +4395,34 @@ pub async fn post_messages_cc(
         };
     if let Some(external) = external_fallback.as_mut() {
         external.model_resolution = Some(model_resolution.clone());
+    }
+    if let Some(external) = external_fallback.as_ref() {
+        let request_id = envelope::request_id();
+        if let Some(response) = external.direct_policy_response(&request_id).await {
+            return response;
+        }
+    }
+
+    // 检查是否为 WebSearch 请求
+    if websearch::has_web_search_tool(&payload) {
+        if !websearch_supported_for_profile(runtime_config.compat_profile) {
+            return envelope::error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "web_search server-tool synthesis is disabled in anthropic-strict profile",
+            );
+        }
+        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
+
+        // 估算输入 tokens
+        let input_tokens = token::count_all_tokens(
+            payload.model.clone(),
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ) as i32;
+
+        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
     // 转换请求
@@ -4578,6 +4621,28 @@ mod tests {
             output_config: None,
             metadata: None,
         }
+    }
+
+    #[test]
+    fn normalize_base64_image_media_types_uses_detected_bytes() {
+        let jpeg = BASE64_STANDARD.encode([0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x00]);
+        let mut payload = messages_request_for_model("claude-sonnet-4-5-20250929");
+        payload.messages[0].content = json!([{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": jpeg
+            }
+        }]);
+
+        let fixed = normalize_base64_image_media_types(&mut payload);
+
+        assert_eq!(fixed, 1);
+        assert_eq!(
+            payload.messages[0].content[0]["source"]["media_type"],
+            "image/jpeg"
+        );
     }
 
     fn runtime_config_for_payload_guard(

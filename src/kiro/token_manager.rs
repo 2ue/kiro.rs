@@ -1167,6 +1167,7 @@ const CREDENTIAL_STATS_FLUSH_MIN_INTERVAL: StdDuration = StdDuration::from_secs(
 const SELECTION_WINDOW_10S: StdDuration = StdDuration::from_secs(10);
 const SELECTION_WINDOW_60S: StdDuration = StdDuration::from_secs(60);
 const SELECTION_WINDOW_5M: StdDuration = StdDuration::from_secs(5 * 60);
+pub const EXTERNAL_CREDENTIAL_CONTEXT_ID: u64 = 0;
 
 /// API 调用上下文
 ///
@@ -6472,29 +6473,55 @@ impl MultiTokenManager {
     ///
     /// 这个方法用于 Admin 的外部 JSON 订阅校验。它允许使用凭据绑定的代理资源，
     /// 但不会保存 token、不会启用/禁用任何系统凭据，也不会占用调度并发槽。
-    pub async fn probe_usage_limits_for_credentials(
+    pub async fn acquire_context_for_external_credentials(
         &self,
         mut credentials: KiroCredentials,
-    ) -> anyhow::Result<UsageLimitsResponse> {
+    ) -> anyhow::Result<CallContext> {
         credentials.canonicalize_auth_method();
+
+        if credentials.is_api_key_credential() {
+            let credentials = self.resolve_proxy_for_credential(credentials)?;
+            let token = credentials
+                .kiro_api_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?;
+            return Ok(CallContext {
+                id: EXTERNAL_CREDENTIAL_CONTEXT_ID,
+                credentials,
+                token,
+                sticky_bound: false,
+                fallback_from_sticky: false,
+                in_flight_lease: None,
+            });
+        }
+
         let credentials = self.resolve_proxy_for_credential(credentials)?;
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
         let config = self.runtime_config();
-
-        if credentials.is_api_key_credential() {
-            let token = credentials
-                .kiro_api_key
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?;
-            return get_usage_limits(&credentials, &config, token, effective_proxy.as_ref()).await;
-        }
-
         let refreshed = refresh_token(&credentials, &config, effective_proxy.as_ref()).await?;
-        let token = refreshed
-            .access_token
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("Token 刷新成功但未返回 accessToken"))?;
-        get_usage_limits(&refreshed, &config, token, effective_proxy.as_ref()).await
+        self.token_context_from_credentials(EXTERNAL_CREDENTIAL_CONTEXT_ID, refreshed, false)
+    }
+
+    /// 使用一份外部凭据临时查询账号信息，不加入凭据池、不改变调度状态。
+    ///
+    /// 这个方法用于 Admin 的外部 JSON 订阅校验。它允许使用凭据绑定的代理资源，
+    /// 但不会保存 token、不会启用/禁用任何系统凭据，也不会占用调度并发槽。
+    pub async fn probe_usage_limits_for_credentials(
+        &self,
+        credentials: KiroCredentials,
+    ) -> anyhow::Result<UsageLimitsResponse> {
+        let ctx = self
+            .acquire_context_for_external_credentials(credentials)
+            .await?;
+        let effective_proxy = ctx.credentials.effective_proxy(self.proxy.as_ref());
+        let config = self.runtime_config();
+        get_usage_limits(
+            &ctx.credentials,
+            &config,
+            &ctx.token,
+            effective_proxy.as_ref(),
+        )
+        .await
     }
 
     /// 添加新凭据（Admin API）
