@@ -68,7 +68,7 @@ export function Sidebar({
       }`}
     >
       {/* Logo */}
-      <div className="flex h-14 items-center justify-between border-b border-primary/15 px-3">
+      <div className="flex h-16 items-center justify-between border-b border-base-300/70 px-3">
         <div className="flex items-center gap-2 overflow-hidden">
           <div className="brand-mark flex h-8 w-8 shrink-0 items-center justify-center rounded-lg">
             <Server className="h-4 w-4" />
@@ -76,7 +76,7 @@ export function Sidebar({
           {!collapsed && (
             <span className="min-w-0">
               <span className="block whitespace-nowrap text-sm font-bold tracking-tight">Kiro Admin</span>
-              <span className="block truncate text-[0.62rem] font-medium uppercase text-primary/75">Command Console</span>
+              <span className="block truncate text-[0.66rem] font-semibold text-base-content/45">后台控制台</span>
             </span>
           )}
         </div>
@@ -96,8 +96,8 @@ export function Sidebar({
       </div>
 
       {/* Navigation */}
-      <nav className="flex-1 overflow-y-auto p-2">
-        <ul className="space-y-1">
+      <nav className="flex-1 overflow-y-auto px-2 py-3">
+        <ul className="space-y-1.5">
           {navItems.map((item) => {
             const isActive = activeTab === item.key
             const link = (
@@ -116,7 +116,7 @@ export function Sidebar({
                 </span>
                 {!collapsed && (
                   <span className="min-w-0 flex-1">
-                    <span className="block truncate text-sm font-medium">{item.label}</span>
+                    <span className="block truncate text-[0.92rem] font-semibold">{item.label}</span>
                     <span className="block truncate text-[0.68rem] text-base-content/50">{item.description}</span>
                   </span>
                 )}
@@ -142,17 +142,17 @@ export function Sidebar({
       </nav>
 
       {/* Footer */}
-      <div className="border-t border-primary/15 p-2">
+      <div className="border-t border-base-300/70 p-2">
         {!collapsed && (
           <div className="sidebar-footer-card rounded-lg p-3">
             <div className="flex items-center justify-between gap-2">
-              <div className="text-[0.68rem] font-semibold text-base-content/70">Admin Console</div>
-              <span className="rounded bg-success/15 px-1.5 py-0.5 text-[0.58rem] font-bold uppercase text-success">Ready</span>
+              <div className="text-[0.7rem] font-semibold text-base-content/65">服务状态</div>
+              <span className="rounded bg-success/10 px-1.5 py-0.5 text-[0.58rem] font-bold uppercase text-success">Ready</span>
             </div>
             <div className="mt-2 grid grid-cols-3 gap-1">
               <span className="h-1 rounded-full bg-primary/80" />
-              <span className="h-1 rounded-full bg-secondary/75" />
-              <span className="h-1 rounded-full bg-accent/75" />
+              <span className="h-1 rounded-full bg-base-content/70" />
+              <span className="h-1 rounded-full bg-primary/35" />
             </div>
           </div>
         )}

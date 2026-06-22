@@ -1,8 +1,8 @@
 export type TabKey = 'dashboard' | 'credentials' | 'validation' | 'proxies' | 'external' | 'usage' | 'pricing' | 'audit' | 'config'
 
-export type ThemeMode = 'noirGold' | 'auroraCircuit' | 'emberVault'
+export type ThemeMode = 'blackGold'
 
-export const DEFAULT_THEME: ThemeMode = 'noirGold'
+export const DEFAULT_THEME: ThemeMode = 'blackGold'
 
 export const CONSOLE_BASE_PATH = '/console'
 
@@ -47,27 +47,15 @@ export const themeOptions: Array<{
   swatches: string[]
 }> = [
   {
-    key: 'noirGold',
-    label: '黑金简约',
-    description: '纯暗底、金色强调，去掉装饰纹理',
-    swatches: ['#080808', '#11100E', '#E8C160', '#B98D3A'],
-  },
-  {
-    key: 'auroraCircuit',
-    label: '极光电路',
-    description: '青色主轴，紫色与荧光绿做层级',
-    swatches: ['#090B12', '#22D3EE', '#A78BFA', '#A3E635'],
-  },
-  {
-    key: 'emberVault',
-    label: '赤金机房',
-    description: '赤金强调，粉红和薄荷绿区分状态',
-    swatches: ['#0E0A0D', '#FFB020', '#FF5C8A', '#2DD4BF'],
+    key: 'blackGold',
+    label: '浅底黑金',
+    description: '温暖浅底、黑色结构、金色强调',
+    swatches: ['#FFFDF8', '#1C1710', '#B88924', '#D8B15D'],
   },
 ]
 
 export function isThemeMode(value: string | null | undefined): value is ThemeMode {
-  return value === 'noirGold' || value === 'auroraCircuit' || value === 'emberVault'
+  return value === 'blackGold'
 }
 
 export function getStoredTheme(): ThemeMode {

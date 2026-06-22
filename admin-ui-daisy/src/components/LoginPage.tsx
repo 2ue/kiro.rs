@@ -1,4 +1,4 @@
-import { Activity, Command, Database, KeyRound, Route, ShieldCheck } from 'lucide-react'
+import { Activity, Database, KeyRound, Route, ShieldCheck } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Alert, Button, Form, Input, Join } from 'react-daisyui'
 import { storage } from '@/lib/storage'
@@ -6,9 +6,9 @@ import { validateAdminApiKey } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 
 const signalCards = [
-  { title: '查看状态', desc: '掌握整体情况', icon: <Activity className="h-4 w-4" /> },
-  { title: '管理资源', desc: '维护后台资源', icon: <Database className="h-4 w-4" /> },
-  { title: '调整设置', desc: '统一配置入口', icon: <Route className="h-4 w-4" /> },
+  { title: '状态', desc: '查看关键指标', icon: <Activity className="h-4 w-4" /> },
+  { title: '资源', desc: '维护后台资源', icon: <Database className="h-4 w-4" /> },
+  { title: '设置', desc: '调整运行配置', icon: <Route className="h-4 w-4" /> },
 ]
 
 export function LoginPage({ initialError = '', onLogin }: { initialError?: string; onLogin: () => void }) {
@@ -43,29 +43,28 @@ export function LoginPage({ initialError = '', onLogin }: { initialError?: strin
 
   return (
     <main className="auth-shell min-h-screen">
-      <div className="mx-auto flex min-h-screen w-full max-w-6xl items-center justify-center px-4 py-8">
-        <div className="auth-card grid w-full overflow-hidden rounded-box lg:grid-cols-[1.08fr_420px]">
-          {/* Left Panel - Branding */}
-          <section className="auth-visual hidden border-r border-primary/15 p-8 lg:block">
+      <div className="mx-auto flex min-h-screen w-full max-w-5xl items-center justify-center px-4 py-8">
+        <div className="auth-card grid w-full overflow-hidden rounded-box lg:grid-cols-[1fr_410px]">
+          <section className="auth-visual hidden border-r border-base-300/70 p-8 lg:block">
             <div className="flex h-full flex-col justify-between">
               <div>
                 <div className="flex items-center gap-3">
                   <div className="brand-mark flex h-10 w-10 items-center justify-center rounded-xl">
-                    <Command className="h-5 w-5" />
+                    <ShieldCheck className="h-5 w-5" />
                   </div>
                   <span>
                     <span className="block text-xl font-bold tracking-tight">Kiro Admin</span>
-                    <span className="block text-[0.68rem] font-semibold uppercase text-primary/80">Admin Console</span>
+                    <span className="block text-[0.72rem] font-semibold text-base-content/45">后台控制台</span>
                   </span>
                 </div>
 
-                <h1 className="mt-12 text-4xl font-bold leading-tight text-base-content">
+                <h1 className="mt-12 max-w-md text-4xl font-semibold leading-tight text-base-content">
                   管理控制台
                   <br />
-                  <span className="text-primary">简洁、安全、集中</span>
+                  <span className="text-primary">清晰、稳定、可控</span>
                 </h1>
 
-                <p className="mt-4 max-w-sm text-sm leading-relaxed text-base-content/55">
+                <p className="mt-4 max-w-sm text-sm leading-6 text-base-content/60">
                   用于查看状态、管理资源和调整设置。
                 </p>
               </div>
@@ -83,8 +82,8 @@ export function LoginPage({ initialError = '', onLogin }: { initialError?: strin
                 <div className="glass-panel relative overflow-hidden rounded-box p-4">
                   <div className="mb-4 flex items-center justify-between gap-3">
                     <div>
-                      <div className="text-xs font-semibold uppercase text-base-content/45">安全入口</div>
-                      <div className="mt-1 text-lg font-bold">登录凭证</div>
+                      <div className="text-xs font-semibold text-base-content/45">安全入口</div>
+                      <div className="mt-1 text-lg font-semibold">登录凭证</div>
                     </div>
                     <ShieldCheck className="h-6 w-6 text-primary" />
                   </div>
@@ -98,19 +97,17 @@ export function LoginPage({ initialError = '', onLogin }: { initialError?: strin
             </div>
           </section>
 
-          {/* Right Panel - Login Form */}
-          <section className="bg-base-100/35 p-6 sm:p-8">
-            {/* Mobile Logo */}
+          <section className="bg-base-100/70 p-6 sm:p-8">
             <div className="mb-8 flex items-center gap-3 lg:hidden">
               <div className="brand-mark flex h-10 w-10 items-center justify-center rounded-xl">
-                <Command className="h-5 w-5" />
+                <ShieldCheck className="h-5 w-5" />
               </div>
               <span className="text-xl font-bold">Kiro Admin</span>
             </div>
 
             <div className="mb-8">
-              <h2 className="text-2xl font-bold tracking-tight">控制台登录</h2>
-              <p className="mt-2 text-sm text-base-content/60">
+              <h2 className="text-2xl font-semibold tracking-tight">控制台登录</h2>
+              <p className="mt-2 text-sm leading-6 text-base-content/60">
                 输入登录 Key 进入管理控制台
               </p>
             </div>
@@ -123,7 +120,7 @@ export function LoginPage({ initialError = '', onLogin }: { initialError?: strin
                 <Join className="w-full">
                   <Button
                     type="button"
-                    className="join-item cursor-default border-primary/20 bg-base-200/70"
+                    className="join-item cursor-default border-base-300 bg-base-200/80"
                   >
                     <KeyRound className="h-4 w-4 text-base-content/50" />
                   </Button>

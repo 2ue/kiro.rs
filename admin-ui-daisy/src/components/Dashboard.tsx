@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { Menu } from 'lucide-react'
-import { Button, Drawer, Select } from 'react-daisyui'
+import { Button, Drawer } from 'react-daisyui'
 import { Sidebar } from '@/components/layout/Sidebar'
 import { TopBar } from '@/components/layout/TopBar'
 import { AuditPanel } from '@/components/AuditPanel'
@@ -14,21 +14,19 @@ import { ProxyPanel } from '@/components/ProxyPanel'
 import { UsagePanel } from '@/components/UsagePanel'
 import { UsageDashboardPanel } from '@/components/UsageDashboardPanel'
 import { storage } from '@/lib/storage'
-import type { TabKey, ThemeMode } from '@/types/ui'
-import { getConsoleTabPath, getStoredTheme, getTabFromPathname, pageConfig, themeOptions } from '@/types/ui'
+import type { TabKey } from '@/types/ui'
+import { DEFAULT_THEME, getConsoleTabPath, getTabFromPathname, pageConfig } from '@/types/ui'
 
 export function Dashboard({ onLogout }: { onLogout: () => void }) {
   const [activeTab, setActiveTab] = useState<TabKey>(() => getTabFromPathname(window.location.pathname))
-  const [theme, setTheme] = useState<ThemeMode>(getStoredTheme)
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const queryClient = useQueryClient()
 
-  // Apply theme
   useEffect(() => {
-    document.documentElement.dataset.theme = theme
-    localStorage.setItem('kiro-theme', theme)
-  }, [theme])
+    document.documentElement.dataset.theme = DEFAULT_THEME
+    localStorage.setItem('kiro-theme', DEFAULT_THEME)
+  }, [])
 
   useEffect(() => {
     const handlePopState = () => {
@@ -108,8 +106,6 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
           <TopBar
             title={currentPage.title}
             subtitle={currentPage.subtitle}
-            theme={theme}
-            onThemeChange={setTheme}
             onLogout={handleLogout}
           />
         </div>
@@ -129,19 +125,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
       </div>
 
       {/* Mobile Bottom Actions */}
-      <div className="top-bar fixed bottom-0 left-0 right-0 z-30 flex items-center justify-between border-t px-4 py-2 backdrop-blur-lg lg:hidden">
-        <Select
-          size="sm"
-          value={theme}
-          className="w-28"
-          onChange={(event) => setTheme(event.target.value as ThemeMode)}
-        >
-          {themeOptions.map((option) => (
-            <option key={option.key} value={option.key}>
-              {option.label}
-            </option>
-          ))}
-        </Select>
+      <div className="mobile-action-bar fixed bottom-0 left-0 right-0 z-30 flex items-center justify-end border-t px-4 py-2 lg:hidden">
         <Button type="button" color="ghost" size="sm" className="text-error" onClick={handleLogout}>
           退出
         </Button>

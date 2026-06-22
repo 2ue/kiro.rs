@@ -15,32 +15,32 @@ interface StatCardProps {
   trend?: { value: number; label?: string }
 }
 
-const toneStyles: Record<string, { text: string; accent: string; bg: string; icon: string }> = {
-  default: { text: 'text-base-content', accent: 'bg-base-content/20', bg: 'bg-base-100', icon: 'text-base-content/40' },
-  success: { text: 'text-success', accent: 'bg-success/80', bg: 'bg-base-100', icon: 'text-success' },
-  warning: { text: 'text-warning', accent: 'bg-warning/80', bg: 'bg-base-100', icon: 'text-warning' },
-  error: { text: 'text-error', accent: 'bg-error/80', bg: 'bg-base-100', icon: 'text-error' },
-  info: { text: 'text-info', accent: 'bg-info/70', bg: 'bg-base-100', icon: 'text-info' },
-  primary: { text: 'text-primary', accent: 'bg-primary/75', bg: 'bg-base-100', icon: 'text-primary' },
-  secondary: { text: 'text-primary', accent: 'bg-primary/45', bg: 'bg-base-100', icon: 'text-primary' },
+const toneStyles: Record<string, { text: string; accent: string; icon: string }> = {
+  default: { text: 'text-base-content', accent: 'bg-base-content/20', icon: 'text-base-content/40' },
+  success: { text: 'text-success', accent: 'bg-success/75', icon: 'text-success' },
+  warning: { text: 'text-warning', accent: 'bg-warning/75', icon: 'text-warning' },
+  error: { text: 'text-error', accent: 'bg-error/75', icon: 'text-error' },
+  info: { text: 'text-info', accent: 'bg-info/70', icon: 'text-info' },
+  primary: { text: 'text-primary', accent: 'bg-primary/75', icon: 'text-primary' },
+  secondary: { text: 'text-primary', accent: 'bg-primary/45', icon: 'text-primary' },
 }
 
 export function StatCard({ title, value, desc, icon, tone = 'default', trend }: StatCardProps) {
   const styles = toneStyles[tone]
   return (
-    <Card className={`stat-card overflow-hidden ${styles.bg}`}>
-      <Card.Body className="relative gap-1 p-3">
-        <div className={`absolute bottom-3 left-0 top-3 w-1 rounded-r-full ${styles.accent}`} />
+    <Card className="stat-card overflow-hidden">
+      <Card.Body className="relative gap-1 p-4">
+        <div className={`absolute left-0 top-4 h-8 w-1 rounded-r-full ${styles.accent}`} />
         <div className="flex items-start justify-between gap-2">
-          <div className="min-w-0 flex-1 pl-2">
-            <div className="text-[0.7rem] font-semibold uppercase tracking-wide text-base-content/50">{title}</div>
-            <div className={`mt-0.5 truncate text-xl font-bold tracking-tight ${styles.text}`}>{value}</div>
-            {desc && <div className="mt-0.5 truncate text-[0.7rem] text-base-content/50">{desc}</div>}
+          <div className="min-w-0 flex-1 pl-2.5">
+            <div className="text-[0.72rem] font-semibold text-base-content/50">{title}</div>
+            <div className={`mt-1 truncate text-2xl font-semibold tracking-tight ${styles.text}`}>{value}</div>
+            {desc && <div className="mt-1 truncate text-[0.72rem] text-base-content/55">{desc}</div>}
           </div>
-          {icon && <div className={`shrink-0 ${styles.icon}`}>{icon}</div>}
+          {icon && <div className={`shrink-0 rounded-md bg-base-200/70 p-2 ${styles.icon}`}>{icon}</div>}
         </div>
         {trend && (
-          <div className={`mt-1 pl-2 text-[0.68rem] font-medium ${trend.value >= 0 ? 'text-success' : 'text-error'}`}>
+          <div className={`mt-2 pl-2.5 text-[0.7rem] font-medium ${trend.value >= 0 ? 'text-success' : 'text-error'}`}>
             {trend.value >= 0 ? '↑' : '↓'} {Math.abs(trend.value)}% {trend.label}
           </div>
         )}
@@ -66,10 +66,10 @@ export function SectionCard({ title, description, actions, children, className =
   return (
     <Card className={`section-card overflow-hidden ${className}`}>
       {(title || description || actions) && (
-        <div className="section-card-header flex flex-col gap-3 border-b border-base-300/60 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="section-card-header flex flex-col gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between">
           <div className="min-w-0">
-            {title && <h2 className="text-sm font-semibold tracking-tight">{title}</h2>}
-            {description && <p className="mt-0.5 text-xs text-base-content/50">{description}</p>}
+            {title && <h2 className="text-[0.95rem] font-semibold tracking-tight text-base-content">{title}</h2>}
+            {description && <p className="mt-1 text-xs leading-5 text-base-content/55">{description}</p>}
           </div>
           {actions && <div className="flex shrink-0 flex-wrap items-center gap-1.5">{actions}</div>}
         </div>
@@ -121,14 +121,14 @@ interface BadgeProps {
 }
 
 const badgeToneClass: Record<string, string> = {
-  neutral: '!border-base-300 !bg-base-100 text-base-content/55',
-  primary: '!border-base-300 !bg-base-100 text-primary',
-  secondary: '!border-base-300 !bg-base-100 text-base-content/60',
-  success: '!border-base-300 !bg-base-100 text-success',
-  warning: '!border-warning !bg-warning text-white',
-  error: '!border-base-300 !bg-base-100 text-error',
-  info: '!border-base-300 !bg-base-100 text-info',
-  accent: '!border-base-300 !bg-base-100 text-primary',
+  neutral: '!border-base-300 !bg-base-100/80 text-base-content/60',
+  primary: '!border-primary/25 !bg-primary/10 text-primary',
+  secondary: '!border-base-content/15 !bg-base-content/5 text-base-content/70',
+  success: '!border-success/20 !bg-success/10 text-success',
+  warning: '!border-warning/20 !bg-warning/10 text-warning',
+  error: '!border-error/20 !bg-error/10 text-error',
+  info: '!border-info/20 !bg-info/10 text-info',
+  accent: '!border-primary/20 !bg-primary/10 text-primary',
 }
 
 export function Badge({ children, tone = 'neutral', size = 'sm', title, dot }: BadgeProps) {
@@ -136,7 +136,7 @@ export function Badge({ children, tone = 'neutral', size = 'sm', title, dot }: B
     <DaisyBadge
       size={size}
       color="ghost"
-      className={`gap-1 border font-medium ${badgeToneClass[tone]} ${size === 'xs' ? 'h-4 px-1.5 text-[0.62rem]' : 'h-5 px-2 text-[0.68rem]'}`}
+      className={`gap-1 border font-semibold ${badgeToneClass[tone]} ${size === 'xs' ? 'h-4 px-1.5 text-[0.62rem]' : 'h-5 px-2 text-[0.68rem]'}`}
       title={title}
     >
       {dot && <span className={`h-1.5 w-1.5 rounded-full bg-current`} />}
@@ -186,11 +186,11 @@ interface EmptyStateProps {
 export function EmptyState({ icon, title, text, description, action }: EmptyStateProps) {
   const displayTitle = title || text || '暂无数据'
   return (
-    <Card bordered className="border-dashed bg-base-200/40">
+    <Card bordered className="border-dashed bg-base-100/70">
       <Card.Body className="items-center py-12 text-center">
         {icon && <div className="mb-3 text-base-content/30">{icon}</div>}
-        <div className="text-sm font-medium text-base-content/60">{displayTitle}</div>
-        {description && <div className="mt-1 text-xs text-base-content/40">{description}</div>}
+        <div className="text-sm font-semibold text-base-content/65">{displayTitle}</div>
+        {description && <div className="mt-1 text-xs text-base-content/45">{description}</div>}
         {action && <div className="mt-4">{action}</div>}
       </Card.Body>
     </Card>
