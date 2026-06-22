@@ -16,12 +16,12 @@ use super::{
         AddCredentialRequest, AdminErrorResponse, BatchCredentialImportRequest,
         BatchUpdateCredentialsRequest, ClearInFlightRequest, CreateProxyResourceRequest,
         CreateRequestApiKeyRequest, ExportCredentialsQuery, ExternalPoolTestRequest,
-        RefreshCredentialInfoRequest, SetCredentialConcurrencyRequest, SetCredentialProxyRequest,
-        SetCredentialRegionsRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
-        SetPriorityRequest, SetWarmupRequest, SuccessResponse, TestCredentialRequest,
-        UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
-        UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
-        UsageCleanupRequest, ValidateExistingCredentialsRequest,
+        ProxyResourceTestRequest, RefreshCredentialInfoRequest, SetCredentialConcurrencyRequest,
+        SetCredentialProxyRequest, SetCredentialRegionsRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SetWarmupRequest, SuccessResponse,
+        TestCredentialRequest, UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest,
+        UpdateProxyResourceRequest, UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest,
+        UpsertManualModelRequest, UsageCleanupRequest, ValidateExistingCredentialsRequest,
         ValidateExternalCredentialsRequest,
     },
 };
@@ -514,6 +514,31 @@ pub async fn create_proxy_resource(
     Json(payload): Json<CreateProxyResourceRequest>,
 ) -> impl IntoResponse {
     match state.service.create_proxy_resource(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/proxy-resources/test
+/// 测试未保存的代理配置
+pub async fn test_proxy_resource_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<ProxyResourceTestRequest>,
+) -> impl IntoResponse {
+    match state.service.test_proxy_resource_config(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/proxy-resources/:id/test
+/// 测试已保存的代理资源
+pub async fn test_proxy_resource(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<ProxyResourceTestRequest>,
+) -> impl IntoResponse {
+    match state.service.test_proxy_resource(id, payload).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

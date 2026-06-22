@@ -37,6 +37,8 @@ import type {
   CredentialExportFormat,
   LoadBalancingMode,
   ProxyResource,
+  ProxyResourceTestRequest,
+  ProxyResourceTestResponse,
   ProxyResourcesResponse,
   CreateProxyResourceRequest,
   UpdateProxyResourceRequest,
@@ -363,6 +365,21 @@ export async function deleteCredential(id: number): Promise<SuccessResponse> {
 
 export async function getProxyResources(): Promise<ProxyResourcesResponse> {
   const { data } = await api.get<ProxyResourcesResponse>('/proxy-resources')
+  return data
+}
+
+export async function testProxyResourceConfig(
+  req: ProxyResourceTestRequest
+): Promise<ProxyResourceTestResponse> {
+  const { data } = await api.post<ProxyResourceTestResponse>('/proxy-resources/test', req)
+  return data
+}
+
+export async function testProxyResource(
+  id: number,
+  req: ProxyResourceTestRequest = {}
+): Promise<ProxyResourceTestResponse> {
+  const { data } = await api.post<ProxyResourceTestResponse>(`/proxy-resources/${id}/test`, req)
   return data
 }
 

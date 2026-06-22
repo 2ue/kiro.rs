@@ -29,12 +29,122 @@ import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { useModelCapabilities } from '@/hooks/use-usage'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, TEST_MODELS } from '@/lib/test-models'
-import type { CreateExternalPoolRequest, ExternalPool, ExternalPoolsConfig, ExternalPoolTestResponse, UpdateExternalPoolRequest } from '@/types/api'
+import type { CreateExternalPoolRequest, ExternalPool, ExternalPoolModelMappingRule, ExternalPoolsConfig, ExternalPoolTestResponse, UpdateExternalPoolRequest } from '@/types/api'
 import { defaultExternalPoolsConfig } from '@/components/runtime-config-panel'
 
 const splitRules = (value: string) => value.split('\n').map((item) => item.trim()).filter(Boolean)
 const joinRules = (value: string[] = []) => value.join('\n')
 const whole = (value: number, min = 0) => Math.max(min, Math.floor(Number.isFinite(value) ? value : min))
+const DEFAULT_POOL_MODEL_MAPPING_MODE: NonNullable<CreateExternalPoolRequest['modelMappingMode']> = 'processed_mapping'
+
+const parseModelMappingRules = (value: string): ExternalPoolModelMappingRule[] => value
+  .split('\n')
+  .map((line) => line.trim())
+  .filter((line) => line && !line.startsWith('#') && !line.startsWith('//'))
+  .map((line) => line.split(/\s*(?:->|=>|→|=)\s*/, 2))
+  .map(([source, target]) => ({
+    enabled: true,
+    source: source?.trim() || '',
+    target: target?.trim() || '',
+    kind: 'alias' as const,
+  }))
+  .filter((rule) => rule.source && rule.target)
+
+const joinModelMappingRules = (rules: ExternalPoolModelMappingRule[] = []) => rules
+  .filter((rule) => rule.source?.trim() && rule.target?.trim())
+  .map((rule) => `${rule.source.trim()} -> ${rule.target.trim()}`)
+  .join('\n')
+
+type ExternalPoolModelMappingPreset = {
+  label: string
+  source: string
+  target: string
+  tone: 'blue' | 'cyan' | 'emerald' | 'purple' | 'amber' | 'rose'
+}
+
+const DIRECT_MODEL_MAPPING_PRESETS: ExternalPoolModelMappingPreset[] = [
+  { label: 'Sonnet 4 完整ID→4', source: 'claude-sonnet-4-20250514', target: 'claude-sonnet-4', tone: 'blue' },
+  { label: 'Sonnet 4透传', source: 'claude-sonnet-4', target: 'claude-sonnet-4', tone: 'blue' },
+  { label: 'Sonnet 4.5 完整ID→4.5', source: 'claude-sonnet-4-5-20250929', target: 'claude-sonnet-4.5', tone: 'blue' },
+  { label: 'Sonnet 4.5→4.5', source: 'claude-sonnet-4-5', target: 'claude-sonnet-4.5', tone: 'blue' },
+  { label: 'Sonnet 4.5 点号', source: 'claude-sonnet-4.5', target: 'claude-sonnet-4.5', tone: 'blue' },
+  { label: 'Sonnet 4.6→4.6', source: 'claude-sonnet-4-6', target: 'claude-sonnet-4.6', tone: 'cyan' },
+  { label: 'Sonnet 4.6 点号', source: 'claude-sonnet-4.6', target: 'claude-sonnet-4.6', tone: 'cyan' },
+  { label: 'Sonnet 4.7→4.7', source: 'claude-sonnet-4-7', target: 'claude-sonnet-4.7', tone: 'cyan' },
+  { label: 'Sonnet 4.7 点号', source: 'claude-sonnet-4.7', target: 'claude-sonnet-4.7', tone: 'cyan' },
+  { label: 'Sonnet 4.8→4.8', source: 'claude-sonnet-4-8', target: 'claude-sonnet-4.8', tone: 'cyan' },
+  { label: 'Sonnet 4.8 点号', source: 'claude-sonnet-4.8', target: 'claude-sonnet-4.8', tone: 'cyan' },
+  { label: 'Opus 4.5 完整ID→4.5', source: 'claude-opus-4-5-20251101', target: 'claude-opus-4.5', tone: 'purple' },
+  { label: 'Opus 4.5→4.5', source: 'claude-opus-4-5', target: 'claude-opus-4.5', tone: 'purple' },
+  { label: 'Opus 4.5 点号', source: 'claude-opus-4.5', target: 'claude-opus-4.5', tone: 'purple' },
+  { label: 'Opus 4-5 thinking→4.5', source: 'claude-opus-4-5-thinking', target: 'claude-opus-4.5-thinking', tone: 'purple' },
+  { label: 'Opus 4.6→4.6', source: 'claude-opus-4-6', target: 'claude-opus-4.6', tone: 'purple' },
+  { label: 'Opus 4.6 thinking', source: 'claude-opus-4-6-thinking', target: 'claude-opus-4.6-thinking', tone: 'purple' },
+  { label: 'Opus 4.7→4.7', source: 'claude-opus-4-7', target: 'claude-opus-4.7', tone: 'purple' },
+  { label: 'Opus 4.7 点号', source: 'claude-opus-4.7', target: 'claude-opus-4.7', tone: 'purple' },
+  { label: 'Opus 4.8→4.8', source: 'claude-opus-4-8', target: 'claude-opus-4.8', tone: 'purple' },
+  { label: 'Opus 4.8 点号', source: 'claude-opus-4.8', target: 'claude-opus-4.8', tone: 'purple' },
+  { label: 'Opus 4.8 thinking', source: 'claude-opus-4-8-thinking', target: 'claude-opus-4.8-thinking', tone: 'purple' },
+  { label: 'Haiku 4.5 完整ID→4.5', source: 'claude-haiku-4-5-20251001', target: 'claude-haiku-4.5', tone: 'emerald' },
+  { label: 'Haiku 4.5→4.5', source: 'claude-haiku-4-5', target: 'claude-haiku-4.5', tone: 'emerald' },
+  { label: 'Haiku 4.5 点号', source: 'claude-haiku-4.5', target: 'claude-haiku-4.5', tone: 'emerald' },
+  { label: '3.5 Sonnet 完整ID', source: 'claude-3-5-sonnet-20241022', target: 'claude-3.5-sonnet', tone: 'amber' },
+  { label: '3.5 Haiku 完整ID', source: 'claude-3-5-haiku-20241022', target: 'claude-3.5-haiku', tone: 'emerald' },
+]
+
+const PROCESSED_MODEL_MAPPING_PRESETS: ExternalPoolModelMappingPreset[] = [
+  { label: 'Sonnet 4透传', source: 'claude-sonnet-4', target: 'claude-sonnet-4', tone: 'blue' },
+  { label: 'Sonnet 4.5→4-5', source: 'claude-sonnet-4.5', target: 'claude-sonnet-4-5', tone: 'cyan' },
+  { label: 'Sonnet 4-5透传', source: 'claude-sonnet-4-5', target: 'claude-sonnet-4-5', tone: 'cyan' },
+  { label: 'Sonnet 4.6→4-6', source: 'claude-sonnet-4.6', target: 'claude-sonnet-4-6', tone: 'cyan' },
+  { label: 'Sonnet 4-6透传', source: 'claude-sonnet-4-6', target: 'claude-sonnet-4-6', tone: 'cyan' },
+  { label: 'Sonnet 4.7→4-7', source: 'claude-sonnet-4.7', target: 'claude-sonnet-4-7', tone: 'cyan' },
+  { label: 'Sonnet 4.8→4-8', source: 'claude-sonnet-4.8', target: 'claude-sonnet-4-8', tone: 'cyan' },
+  { label: 'Opus 4.5→4-5', source: 'claude-opus-4.5', target: 'claude-opus-4-5', tone: 'purple' },
+  { label: 'Opus 4-5透传', source: 'claude-opus-4-5', target: 'claude-opus-4-5', tone: 'purple' },
+  { label: 'Opus 4.5 thinking→4-5', source: 'claude-opus-4.5-thinking', target: 'claude-opus-4-5-thinking', tone: 'purple' },
+  { label: 'Opus 4-5 thinking', source: 'claude-opus-4-5-thinking', target: 'claude-opus-4-5-thinking', tone: 'purple' },
+  { label: 'Opus 4.6→4-6', source: 'claude-opus-4.6', target: 'claude-opus-4-6', tone: 'purple' },
+  { label: 'Opus 4.6 thinking→4-6', source: 'claude-opus-4.6-thinking', target: 'claude-opus-4-6-thinking', tone: 'purple' },
+  { label: 'Opus 4.7→4-7', source: 'claude-opus-4.7', target: 'claude-opus-4-7', tone: 'purple' },
+  { label: 'Opus 4.8→4-8', source: 'claude-opus-4.8', target: 'claude-opus-4-8', tone: 'purple' },
+  { label: 'Opus 4.8 thinking', source: 'claude-opus-4.8-thinking', target: 'claude-opus-4-8-thinking', tone: 'purple' },
+  { label: 'Haiku 4.5→4-5', source: 'claude-haiku-4.5', target: 'claude-haiku-4-5', tone: 'emerald' },
+  { label: 'Haiku 4-5透传', source: 'claude-haiku-4-5', target: 'claude-haiku-4-5', tone: 'emerald' },
+  { label: '3.5 Sonnet→3-5', source: 'claude-3.5-sonnet', target: 'claude-3-5-sonnet', tone: 'amber' },
+  { label: '3.5 Haiku→3-5', source: 'claude-3.5-haiku', target: 'claude-3-5-haiku', tone: 'emerald' },
+]
+
+const modelMappingPresetsForMode = (mode: ExternalPoolFormDraft['modelMappingMode']) => {
+  if (mode === 'direct_mapping') return DIRECT_MODEL_MAPPING_PRESETS
+  if (mode === 'processed_mapping') return PROCESSED_MODEL_MAPPING_PRESETS
+  return []
+}
+
+const appendModelMappingPreset = (currentText: string, preset: ExternalPoolModelMappingPreset) => {
+  const result = appendModelMappingRules(currentText, [{ enabled: true, source: preset.source, target: preset.target, kind: 'alias' }])
+  return { text: result.text, added: result.added > 0 }
+}
+
+const appendModelMappingPresets = (currentText: string, presets: ExternalPoolModelMappingPreset[]) => {
+  return appendModelMappingRules(currentText, presets.map((preset) => ({ enabled: true, source: preset.source, target: preset.target, kind: 'alias' })))
+}
+
+const appendModelMappingRules = (currentText: string, incomingRules: ExternalPoolModelMappingRule[]) => {
+  const rules = parseModelMappingRules(currentText)
+  const seen = new Set(rules.map((rule) => rule.source.trim().toLowerCase()))
+  let added = 0
+  incomingRules.forEach((rule) => {
+    const source = rule.source?.trim() || ''
+    const target = rule.target?.trim() || ''
+    const key = source.toLowerCase()
+    if (!source || !target || seen.has(key)) return
+    seen.add(key)
+    rules.push({ enabled: true, source, target, kind: 'alias' })
+    added += 1
+  })
+  return { text: joinModelMappingRules(rules), added }
+}
 
 type ExternalPoolFormDraft = {
   name: string
@@ -46,6 +156,9 @@ type ExternalPoolFormDraft = {
   maxConcurrentRequests: number
   usageProjectionMode: NonNullable<CreateExternalPoolRequest['usageProjectionMode']>
   autoDisablePolicy: NonNullable<CreateExternalPoolRequest['autoDisablePolicy']>
+  normalizeModelVersionDots: boolean
+  modelMappingMode: NonNullable<CreateExternalPoolRequest['modelMappingMode']>
+  modelMappingRulesText: string
   notes: string
 }
 
@@ -59,6 +172,9 @@ const defaultPoolForm = (): ExternalPoolFormDraft => ({
   maxConcurrentRequests: 10,
   usageProjectionMode: 'pass_through',
   autoDisablePolicy: 'inherit',
+  normalizeModelVersionDots: false,
+  modelMappingMode: DEFAULT_POOL_MODEL_MAPPING_MODE,
+  modelMappingRulesText: '',
   notes: '',
 })
 
@@ -72,6 +188,9 @@ const poolFormFromPool = (pool: ExternalPool): ExternalPoolFormDraft => ({
   maxConcurrentRequests: pool.maxConcurrentRequests,
   usageProjectionMode: pool.usageProjectionMode,
   autoDisablePolicy: pool.autoDisablePolicy,
+  normalizeModelVersionDots: Boolean(pool.normalizeModelVersionDots),
+  modelMappingMode: pool.modelMappingMode || DEFAULT_POOL_MODEL_MAPPING_MODE,
+  modelMappingRulesText: joinModelMappingRules(pool.modelMappingRules || []),
   notes: pool.notes || '',
 })
 
@@ -168,13 +287,15 @@ export function ExternalPoolsPanel() {
     }
     setSavingPool(true)
     try {
+      const { modelMappingRulesText, ...form } = createForm
       await createExternalPool({
-        ...createForm,
+        ...form,
         name: createForm.name.trim(),
         baseUrl: createForm.baseUrl.trim(),
         apiKey: createForm.apiKey.trim(),
         priority: whole(createForm.priority ?? 100),
         maxConcurrentRequests: whole(createForm.maxConcurrentRequests ?? 10, 1),
+        modelMappingRules: parseModelMappingRules(modelMappingRulesText),
       })
       toast.success('外部池已添加')
       setCreateOpen(false)
@@ -200,13 +321,15 @@ export function ExternalPoolsPanel() {
     }
     setSavingPool(true)
     try {
+      const { modelMappingRulesText, ...form } = editForm
       const payload: UpdateExternalPoolRequest = {
-        ...editForm,
+        ...form,
         name: editForm.name.trim(),
         baseUrl: editForm.baseUrl.trim(),
         apiKey: editForm.apiKey?.trim() ? editForm.apiKey.trim() : undefined,
         priority: whole(editForm.priority ?? 100),
         maxConcurrentRequests: whole(editForm.maxConcurrentRequests ?? 10, 1),
+        modelMappingRules: parseModelMappingRules(modelMappingRulesText),
       }
       await updateExternalPool(editingPool.id, payload)
       toast.success('外部池已更新')
@@ -461,7 +584,7 @@ export function ExternalPoolsPanel() {
                     <Badge variant={runtime?.dispatchable ? 'outline' : 'secondary'}>{runtime?.dispatchable ? '可调度' : runtime?.skippedReason || '不可调度'}</Badge>
                   </div>
                   <div className="text-sm text-muted-foreground">{pool.baseUrl} · {pool.maskedApiKey || '未显示 Key'} · 并发 {runtime?.inFlight ?? 0}/{pool.maxConcurrentRequests} · 优先级 {pool.priority}</div>
-                  <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · auth: {authLabel(pool.authType)} · request: /v1/messages {runtime?.cooldownRemainingSecs ? `· 冷却 ${runtime.cooldownRemainingSecs}s` : ''}</div>
+                  <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · auth: {authLabel(pool.authType)} · model: {poolModelMappingSummary(pool)} · request: /v1/messages {runtime?.cooldownRemainingSecs ? `· 冷却 ${runtime.cooldownRemainingSecs}s` : ''}</div>
                   {pool.autoDisabledLastError && <div className="text-xs text-destructive">{pool.autoDisabledLastError}</div>}
                   </div>
                   <div className="flex flex-wrap gap-2">
@@ -557,6 +680,44 @@ function ExternalPoolFormDialog({
   const title = isEdit ? `编辑外部池${pool ? ` #${pool.id}` : ''}` : '添加外部池'
   const keyLabel = isEdit ? '新请求 Key' : '请求 Key'
   const keyDescription = isEdit ? `留空表示不修改当前 Key。当前：${pool?.maskedApiKey || '未显示 Key'}` : '外部池的请求密钥，保存后只显示脱敏值。'
+  const [quickImportText, setQuickImportText] = useState('')
+  const mappingPresets = useMemo(() => modelMappingPresetsForMode(draft.modelMappingMode), [draft.modelMappingMode])
+  useEffect(() => {
+    if (!open) setQuickImportText('')
+  }, [open])
+  const addMappingPreset = (preset: ExternalPoolModelMappingPreset) => {
+    const result = appendModelMappingPreset(draft.modelMappingRulesText, preset)
+    onDraftChange((prev) => ({ ...prev, modelMappingRulesText: result.text }))
+    if (result.added) {
+      toast.success('模型映射规则已添加')
+    } else {
+      toast.info('该模型映射规则已存在')
+    }
+  }
+  const addAllMappingPresets = () => {
+    const result = appendModelMappingPresets(draft.modelMappingRulesText, mappingPresets)
+    onDraftChange((prev) => ({ ...prev, modelMappingRulesText: result.text }))
+    if (result.added > 0) {
+      toast.success(`已添加 ${result.added} 条模型映射规则`)
+    } else {
+      toast.info('快捷模型映射规则都已存在')
+    }
+  }
+  const importMappingRules = () => {
+    const rules = parseModelMappingRules(quickImportText)
+    if (rules.length === 0) {
+      toast.error('没有可导入的模型映射规则')
+      return
+    }
+    const result = appendModelMappingRules(draft.modelMappingRulesText, rules)
+    onDraftChange((prev) => ({ ...prev, modelMappingRulesText: result.text }))
+    if (result.added > 0) {
+      toast.success(`已导入 ${result.added} 条模型映射规则`)
+      setQuickImportText('')
+    } else {
+      toast.info('导入的模型映射规则都已存在')
+    }
+  }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -583,6 +744,7 @@ function ExternalPoolFormDialog({
                 <NumberBox label="单池最大并发" description="当前外部池同时处理的最大请求数。" value={draft.maxConcurrentRequests} min={1} disabled={saving} onChange={(maxConcurrentRequests) => onDraftChange((prev) => ({ ...prev, maxConcurrentRequests }))} />
                 <NumberBox label="优先级" description="数字越小越靠前；同优先级再按容量和状态分配。" value={draft.priority} disabled={saving} onChange={(priority) => onDraftChange((prev) => ({ ...prev, priority }))} />
                 <Toggle label={isEdit ? '启用外部池' : '创建后立即启用'} checked={Boolean(draft.enabled)} disabled={saving} onChange={(enabled) => onDraftChange((prev) => ({ ...prev, enabled }))} />
+                <Toggle label="兜底点号转横杠" checked={Boolean(draft.normalizeModelVersionDots)} disabled={saving} onChange={(normalizeModelVersionDots) => onDraftChange((prev) => ({ ...prev, normalizeModelVersionDots }))} />
               </div>
             </FormSection>
 
@@ -596,6 +758,40 @@ function ExternalPoolFormDialog({
               </div>
             </FormSection>
           </div>
+
+          <FormSection title="模型映射" description="当前外部池自己的出站模型规则；未命中规则时继续使用兜底转换。">
+            <div className="grid gap-3 md:grid-cols-[240px_1fr]">
+              <div className="space-y-3">
+                <SelectBox label="映射模式" value={draft.modelMappingMode} disabled={saving} onChange={(modelMappingMode) => onDraftChange((prev) => ({ ...prev, modelMappingMode: modelMappingMode as ExternalPoolFormDraft['modelMappingMode'] }))}>
+                  <option value="passthrough">直接透传请求模型</option>
+                  <option value="direct_mapping">按请求模型映射</option>
+                  <option value="processed_mapping">内部处理后映射</option>
+                </SelectBox>
+                <HintBox>{modelMappingDescription(draft.modelMappingMode, draft.normalizeModelVersionDots)}</HintBox>
+              </div>
+              {draft.modelMappingMode !== 'passthrough' && (
+                <div className="space-y-3">
+                  <TextArea
+                    label="映射规则"
+                    description="每行一条：claude-sonnet-4-5-20250929 -> claude-sonnet-4.5"
+                    value={draft.modelMappingRulesText}
+                    disabled={saving}
+                    action={<Button type="button" variant="outline" size="sm" onClick={addAllMappingPresets} disabled={saving || mappingPresets.length === 0}>全部添加</Button>}
+                    onChange={(modelMappingRulesText) => onDraftChange((prev) => ({ ...prev, modelMappingRulesText }))}
+                  />
+                  <ModelMappingPresetTags presets={mappingPresets} disabled={saving} onSelect={addMappingPreset} />
+                  <TextArea
+                    label="快捷导入"
+                    description="粘贴多行 source -> target，点击解析导入后追加到上方规则。"
+                    value={quickImportText}
+                    disabled={saving}
+                    action={<Button type="button" variant="outline" size="sm" onClick={importMappingRules} disabled={saving || !quickImportText.trim()}>解析导入</Button>}
+                    onChange={setQuickImportText}
+                  />
+                </div>
+              )}
+            </div>
+          </FormSection>
 
           <FormSection title="错误处理和备注" description="自动禁用策略只决定当前外部池是否继承全局自动禁用规则。">
             <div className="grid gap-3 md:grid-cols-2">
@@ -926,13 +1122,94 @@ function SelectBox({ label, value, disabled = false, onChange, children }: { lab
   )
 }
 
-function TextArea({ label, value, disabled = false, onChange }: { label: string; value: string; disabled?: boolean; onChange: (value: string) => void }) {
+function TextArea({
+  label,
+  description,
+  value,
+  disabled = false,
+  action,
+  onChange,
+}: {
+  label: string
+  description?: string
+  value: string
+  disabled?: boolean
+  action?: ReactNode
+  onChange: (value: string) => void
+}) {
   return (
-    <label className={`space-y-1 text-sm ${disabled ? 'cursor-not-allowed opacity-60' : ''}`}>
-      <span className="text-muted-foreground">{label}</span>
-      <textarea className="min-h-24 w-full rounded-md border bg-background px-3 py-2 text-sm" value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)} />
-    </label>
+    <div className={`space-y-1 text-sm ${disabled ? 'cursor-not-allowed opacity-60' : ''}`}>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <span className="text-muted-foreground">{label}</span>
+          {description && <span className="mt-1 block text-xs leading-4 text-muted-foreground">{description}</span>}
+        </div>
+        {action}
+      </div>
+      <textarea className="min-h-24 w-full rounded-md border bg-background px-3 py-2 font-mono text-xs" value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)} />
+    </div>
   )
+}
+
+function ModelMappingPresetTags({
+  presets,
+  disabled,
+  onSelect,
+}: {
+  presets: ExternalPoolModelMappingPreset[]
+  disabled?: boolean
+  onSelect: (preset: ExternalPoolModelMappingPreset) => void
+}) {
+  if (presets.length === 0) return null
+  return (
+    <div className="flex flex-wrap gap-2">
+      {presets.map((preset) => (
+        <button
+          key={`${preset.source}->${preset.target}`}
+          type="button"
+          className={`rounded-lg px-3 py-1 text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${modelMappingPresetClass(preset.tone)}`}
+          title={`${preset.source} -> ${preset.target}`}
+          disabled={disabled}
+          onClick={() => onSelect(preset)}
+        >
+          + {preset.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+function modelMappingPresetClass(tone: ExternalPoolModelMappingPreset['tone']) {
+  switch (tone) {
+    case 'cyan':
+      return 'bg-cyan-100 text-cyan-700 hover:bg-cyan-200'
+    case 'emerald':
+      return 'bg-emerald-100 text-emerald-700 hover:bg-emerald-200'
+    case 'purple':
+      return 'bg-purple-100 text-purple-700 hover:bg-purple-200'
+    case 'amber':
+      return 'bg-amber-100 text-amber-700 hover:bg-amber-200'
+    case 'rose':
+      return 'bg-rose-100 text-rose-700 hover:bg-rose-200'
+    case 'blue':
+    default:
+      return 'bg-blue-100 text-blue-700 hover:bg-blue-200'
+  }
+}
+
+function modelMappingDescription(mode: ExternalPool['modelMappingMode'] | undefined, normalizeFallback: boolean) {
+  const fallback = normalizeFallback ? '未命中后按旧逻辑把数字点号转横杠。' : '未命中后按旧逻辑发送内部处理后的模型。'
+  if (mode === 'passthrough') return '直接发送下游请求里的原始模型，不应用映射规则和兜底转换。'
+  if (mode === 'direct_mapping') return `用下游请求模型匹配规则；${fallback}`
+  return `先使用本系统解析后的模型匹配规则；${fallback}`
+}
+
+function poolModelMappingSummary(pool: ExternalPool) {
+  if (pool.modelMappingMode === 'passthrough') return '透传'
+  const count = pool.modelMappingRules?.length || 0
+  const mode = pool.modelMappingMode === 'direct_mapping' ? '请求映射' : '处理后映射'
+  const fallback = pool.normalizeModelVersionDots ? '兜底4.8->4-8' : '兜底原样'
+  return `${mode}${count ? ` ${count}条` : ''} · ${fallback}`
 }
 
 function usageProjectionDescription(mode: ExternalPool['usageProjectionMode'] | undefined) {

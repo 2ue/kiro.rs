@@ -534,6 +534,23 @@ export interface ProxyResourcesResponse {
   resources: ProxyResource[]
 }
 
+export interface ProxyResourceTestRequest {
+  proxyUrl?: string
+  proxyUsername?: string
+  proxyPassword?: string
+  testUrl?: string
+}
+
+export interface ProxyResourceTestResponse {
+  success: boolean
+  message: string
+  proxyUrl: string
+  testUrl: string
+  status?: number | null
+  durationMs: number
+  responsePreview?: string
+}
+
 export interface CreateProxyResourceRequest {
   name: string
   proxyUrl: string
@@ -895,6 +912,15 @@ export type PayloadGuardMode = 'preemptive' | 'on_too_long'
 export type ExternalPoolAuthType = 'bearer' | 'x_api_key'
 export type ExternalPoolUsageProjectionMode = 'pass_through' | 'current_path_policy'
 export type ExternalPoolAutoDisablePolicy = 'inherit' | 'disabled' | 'enabled'
+export type ExternalPoolModelMappingMode = 'passthrough' | 'direct_mapping' | 'processed_mapping'
+
+export interface ExternalPoolModelMappingRule {
+  enabled?: boolean
+  source: string
+  target: string
+  kind?: 'version_equivalent' | 'alias' | 'fallback'
+  note?: string
+}
 
 export type ReportedUsageFieldMode = 'raw' | 'preserve' | 'sample-max' | 'sample-target'
 
@@ -1037,6 +1063,9 @@ export interface ExternalPool {
   autoDisabledUntil?: string
   autoDisabledLastError?: string
   preservePath: boolean
+  normalizeModelVersionDots: boolean
+  modelMappingMode: ExternalPoolModelMappingMode
+  modelMappingRules: ExternalPoolModelMappingRule[]
   notes?: string
   createdAt: string
   updatedAt: string
@@ -1070,6 +1099,9 @@ export interface CreateExternalPoolRequest {
   usageProjectionMode?: ExternalPoolUsageProjectionMode
   autoDisablePolicy?: ExternalPoolAutoDisablePolicy
   preservePath?: boolean
+  normalizeModelVersionDots?: boolean
+  modelMappingMode?: ExternalPoolModelMappingMode
+  modelMappingRules?: ExternalPoolModelMappingRule[]
   notes?: string
 }
 
@@ -1084,6 +1116,9 @@ export interface UpdateExternalPoolRequest {
   usageProjectionMode?: ExternalPoolUsageProjectionMode
   autoDisablePolicy?: ExternalPoolAutoDisablePolicy
   preservePath?: boolean
+  normalizeModelVersionDots?: boolean
+  modelMappingMode?: ExternalPoolModelMappingMode
+  modelMappingRules?: ExternalPoolModelMappingRule[]
   notes?: string
 }
 

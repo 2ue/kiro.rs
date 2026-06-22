@@ -29,6 +29,8 @@ import {
   setLoadBalancingMode,
   getRuntimeConfig,
   updateRuntimeConfig,
+  testProxyResource,
+  testProxyResourceConfig,
 } from '@/api/credentials'
 import type {
   AddCredentialRequest,
@@ -39,6 +41,7 @@ import type {
   SetCredentialProxyRequest,
   SetCredentialRegionsRequest,
   TestCredentialRequest,
+  ProxyResourceTestRequest,
   UpdateProxyResourceRequest,
   UpdateRuntimeConfigRequest,
 } from '@/types/api'
@@ -143,6 +146,15 @@ export function useProxyResources() {
     queryKey: ['proxy-resources'],
     queryFn: getProxyResources,
     refetchInterval: 30000,
+  })
+}
+
+export function useTestProxyResource() {
+  return useMutation({
+    mutationFn: ({ id, request }: { id?: number; request: ProxyResourceTestRequest }) =>
+      typeof id === 'number'
+        ? testProxyResource(id, request)
+        : testProxyResourceConfig(request),
   })
 }
 

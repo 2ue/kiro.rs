@@ -24,7 +24,8 @@ use super::{
         set_credential_proxy, set_credential_regions, set_credential_warmup,
         set_external_pool_enabled, set_load_balancing_mode, start_usage_cleanup,
         sync_model_capabilities, sync_model_pricing, test_credential, test_external_pool,
-        update_admin_api_key, update_credential_auth, update_external_pool, update_proxy_resource,
+        test_proxy_resource, test_proxy_resource_config, update_admin_api_key,
+        update_credential_auth, update_external_pool, update_proxy_resource,
         update_request_api_key, update_runtime_config, upsert_manual_model,
         validate_existing_credentials, validate_external_credentials,
     },
@@ -112,6 +113,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/proxy-resources",
             get(get_proxy_resources).post(create_proxy_resource),
         )
+        .route("/proxy-resources/test", post(test_proxy_resource_config))
+        .route("/proxy-resources/{id}/test", post(test_proxy_resource))
         .route(
             "/proxy-resources/{id}",
             put(update_proxy_resource).delete(delete_proxy_resource),

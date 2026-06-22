@@ -28,7 +28,8 @@ use super::types::{
     CredentialValidationGroup, CredentialValidationInfo, CredentialValidationItem,
     CredentialValidationResponse, CredentialsPageResponse, CredentialsStatusResponse,
     ExternalPoolTestRequest, LoadBalancingModeResponse, ManualModelResponse, ProxyResourceResponse,
-    ProxyResourcesResponse, RefreshCredentialInfoRequest, RequestApiKeyItem, RuntimeConfigResponse,
+    ProxyResourceTestRequest, ProxyResourceTestResponse, ProxyResourcesResponse,
+    RefreshCredentialInfoRequest, RequestApiKeyItem, RuntimeConfigResponse,
     SetCredentialConcurrencyRequest, SetCredentialProxyRequest, SetCredentialRegionsRequest,
     SetLoadBalancingModeRequest, SetWarmupRequest, TestCredentialRequest, TestCredentialResponse,
     UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
@@ -56,7 +57,10 @@ use crate::external_pool::{
     ExternalPoolsStatusResponse, SetExternalPoolEnabledRequest, UpdateExternalPoolRequest,
     external_pool_messages_url, external_pool_models_url,
 };
-use crate::http_client::response_bytes_with_body_timeout;
+use crate::http_client::{
+    ProxyConfig, build_client, response_bytes_with_body_timeout, response_text_with_body_timeout,
+    send_with_response_header_timeout,
+};
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::{
@@ -90,6 +94,9 @@ const ADMIN_EXTERNAL_POOL_STATUS_CACHE_TTL_SECS: usize = 2;
 const ADMIN_CACHE_DEFAULT_LOCAL_TTL_SECS: usize = 2;
 const ADMIN_CACHE_REDIS_READ_TIMEOUT: StdDuration = StdDuration::from_millis(250);
 const ADMIN_CACHE_LOCAL_STALE_TTL_SECS: u64 = 30;
+const DEFAULT_PROXY_TEST_URL: &str = "https://api.ipify.org?format=json";
+const PROXY_TEST_TIMEOUT_SECS: u64 = 12;
+const PROXY_TEST_PREVIEW_CHARS: usize = 300;
 
 #[derive(Debug, Clone, Default)]
 pub struct CredentialListQuery {
@@ -2462,6 +2469,141 @@ impl AdminService {
         })
     }
 
+    pub async fn test_proxy_resource_config(
+        &self,
+        req: ProxyResourceTestRequest,
+    ) -> Result<ProxyResourceTestResponse, AdminServiceError> {
+        let proxy_url = req
+            .proxy_url
+            .as_ref()
+            .map(|value| required_trimmed(value.clone(), "代理 URL"))
+            .transpose()?
+            .ok_or_else(|| AdminServiceError::InvalidCredential("代理 URL 不能为空".to_string()))
+            .and_then(|value| validate_proxy_url(&value))?;
+        self.run_proxy_resource_test(
+            proxy_url,
+            optional_trimmed(req.proxy_username),
+            optional_trimmed(req.proxy_password),
+            req.test_url,
+        )
+        .await
+    }
+
+    pub async fn test_proxy_resource(
+        &self,
+        id: u64,
+        req: ProxyResourceTestRequest,
+    ) -> Result<ProxyResourceTestResponse, AdminServiceError> {
+        let resource = self
+            .postgres_store
+            .get_proxy_resource(id)
+            .await
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))?
+            .ok_or(AdminServiceError::NotFound { id })?;
+
+        self.run_proxy_resource_test(
+            resource.proxy_url,
+            resource.proxy_username,
+            resource.proxy_password,
+            req.test_url,
+        )
+        .await
+    }
+
+    async fn run_proxy_resource_test(
+        &self,
+        proxy_url: String,
+        proxy_username: Option<String>,
+        proxy_password: Option<String>,
+        test_url: Option<String>,
+    ) -> Result<ProxyResourceTestResponse, AdminServiceError> {
+        let test_url = validate_proxy_test_url(test_url)?;
+        let started_at = Instant::now();
+        let proxy = ProxyConfig {
+            url: proxy_url.clone(),
+            username: proxy_username,
+            password: proxy_password,
+        };
+        let duration_ms = || started_at.elapsed().as_millis() as u64;
+        let client = match build_client(
+            Some(&proxy),
+            PROXY_TEST_TIMEOUT_SECS,
+            self.token_manager.runtime_config().tls_backend,
+        ) {
+            Ok(client) => client,
+            Err(err) => {
+                return Ok(ProxyResourceTestResponse {
+                    success: false,
+                    message: format!("代理配置无效: {}", err),
+                    proxy_url,
+                    test_url,
+                    status: None,
+                    duration_ms: duration_ms(),
+                    response_preview: None,
+                });
+            }
+        };
+
+        let response = match send_with_response_header_timeout(
+            client
+                .get(&test_url)
+                .header("user-agent", "kiro-rs-proxy-test/1.0"),
+            PROXY_TEST_TIMEOUT_SECS,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                return Ok(ProxyResourceTestResponse {
+                    success: false,
+                    message: format!("代理连接失败: {}", err),
+                    proxy_url,
+                    test_url,
+                    status: None,
+                    duration_ms: duration_ms(),
+                    response_preview: None,
+                });
+            }
+        };
+
+        let status = response.status();
+        let status_u16 = status.as_u16();
+        let body = match response_text_with_body_timeout(response, PROXY_TEST_TIMEOUT_SECS).await {
+            Ok(body) => body,
+            Err(err) => {
+                return Ok(ProxyResourceTestResponse {
+                    success: false,
+                    message: format!("代理响应读取失败: {}", err),
+                    proxy_url,
+                    test_url,
+                    status: Some(status_u16),
+                    duration_ms: duration_ms(),
+                    response_preview: None,
+                });
+            }
+        };
+        let response_preview = proxy_test_preview(&body);
+        let success = status.is_success();
+        let message = if success {
+            "代理测试通过".to_string()
+        } else {
+            match response_preview.as_deref() {
+                Some(preview) => format!("代理测试失败: HTTP {}; {}", status_u16, preview),
+                None => format!("代理测试失败: HTTP {}", status_u16),
+            }
+        };
+
+        Ok(ProxyResourceTestResponse {
+            success,
+            message,
+            proxy_url,
+            test_url,
+            status: Some(status_u16),
+            duration_ms: duration_ms(),
+            response_preview,
+        })
+    }
+
     pub fn create_proxy_resource(
         &self,
         req: CreateProxyResourceRequest,
@@ -4063,6 +4205,36 @@ fn validate_proxy_url(value: &str) -> Result<String, AdminServiceError> {
             scheme
         ))),
     }
+}
+
+fn validate_proxy_test_url(value: Option<String>) -> Result<String, AdminServiceError> {
+    let value = optional_trimmed(value).unwrap_or_else(|| DEFAULT_PROXY_TEST_URL.to_string());
+    let parsed = url::Url::parse(&value).map_err(|_| {
+        AdminServiceError::InvalidCredential(
+            "代理测试 URL 必须是 http:// 或 https:// 开头的完整地址".to_string(),
+        )
+    })?;
+    if parsed.host_str().is_none() {
+        return Err(AdminServiceError::InvalidCredential(
+            "代理测试 URL 必须包含主机名".to_string(),
+        ));
+    }
+    match parsed.scheme() {
+        "http" | "https" => Ok(value),
+        scheme => Err(AdminServiceError::InvalidCredential(format!(
+            "不支持的代理测试 URL 协议: {}，仅支持 http/https",
+            scheme
+        ))),
+    }
+}
+
+fn proxy_test_preview(body: &str) -> Option<String> {
+    let preview = body
+        .trim()
+        .chars()
+        .take(PROXY_TEST_PREVIEW_CHARS)
+        .collect::<String>();
+    (!preview.is_empty()).then_some(preview)
 }
 
 fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), String> {

@@ -26,10 +26,12 @@ use crate::anthropic::usage::{
 };
 use crate::external_pool::{
     CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
-    ExternalPoolUsageProjectionMode, UpdateExternalPoolRequest, mask_external_pool_key,
+    ExternalPoolModelMappingMode, ExternalPoolUsageProjectionMode, UpdateExternalPoolRequest,
+    mask_external_pool_key, normalize_external_pool_model_mapping_rules,
 };
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
+use crate::model::config::ModelMappingRule;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -368,7 +370,8 @@ impl PostgresStore {
             SELECT id, name, base_url, api_key, auth_type, enabled, priority,
                    max_concurrent_requests, usage_projection_mode, auto_disable_policy,
                    auto_disabled, auto_disabled_reason, auto_disabled_at,
-                   auto_disabled_until, auto_disabled_last_error, preserve_path, notes,
+                   auto_disabled_until, auto_disabled_last_error, preserve_path,
+                   normalize_model_version_dots, model_mapping_mode, model_mapping_rules, notes,
                    created_at, updated_at
             FROM external_upstream_pools
             WHERE deleted_at IS NULL
@@ -392,7 +395,8 @@ impl PostgresStore {
             SELECT id, name, base_url, api_key, auth_type, enabled, priority,
                    max_concurrent_requests, usage_projection_mode, auto_disable_policy,
                    auto_disabled, auto_disabled_reason, auto_disabled_at,
-                   auto_disabled_until, auto_disabled_last_error, preserve_path, notes,
+                   auto_disabled_until, auto_disabled_last_error, preserve_path,
+                   normalize_model_version_dots, model_mapping_mode, model_mapping_rules, notes,
                    created_at, updated_at
             FROM external_upstream_pools
             WHERE id = $1 AND deleted_at IS NULL
@@ -414,18 +418,23 @@ impl PostgresStore {
             &request.base_url,
             request.max_concurrent_requests,
         )?;
+        let model_mapping_rules =
+            normalize_external_pool_model_mapping_rules(request.model_mapping_rules);
+        let model_mapping_rules_value = serde_json::to_value(&model_mapping_rules)?;
         let row = sqlx::query(
             r#"
             INSERT INTO external_upstream_pools (
                 name, base_url, api_key, auth_type, enabled, priority,
                 max_concurrent_requests, usage_projection_mode, auto_disable_policy,
-                preserve_path, notes, updated_at
+                preserve_path, normalize_model_version_dots, model_mapping_mode,
+                model_mapping_rules, notes, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, now())
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
                       max_concurrent_requests, usage_projection_mode, auto_disable_policy,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
-                      auto_disabled_until, auto_disabled_last_error, preserve_path, notes,
+                      auto_disabled_until, auto_disabled_last_error, preserve_path,
+                      normalize_model_version_dots, model_mapping_mode, model_mapping_rules, notes,
                       created_at, updated_at
             "#,
         )
@@ -439,6 +448,9 @@ impl PostgresStore {
         .bind(request.usage_projection_mode.as_str())
         .bind(request.auto_disable_policy.as_str())
         .bind(request.preserve_path)
+        .bind(request.normalize_model_version_dots)
+        .bind(request.model_mapping_mode.as_str())
+        .bind(model_mapping_rules_value)
         .bind(request.notes.map(|notes| notes.trim().to_string()))
         .fetch_one(&self.pool)
         .await?;
@@ -478,6 +490,17 @@ impl PostgresStore {
             .auto_disable_policy
             .unwrap_or(current.auto_disable_policy);
         let preserve_path = request.preserve_path.unwrap_or(current.preserve_path);
+        let normalize_model_version_dots = request
+            .normalize_model_version_dots
+            .unwrap_or(current.normalize_model_version_dots);
+        let model_mapping_mode = request
+            .model_mapping_mode
+            .unwrap_or(current.model_mapping_mode);
+        let model_mapping_rules = request
+            .model_mapping_rules
+            .map(normalize_external_pool_model_mapping_rules)
+            .unwrap_or(current.model_mapping_rules);
+        let model_mapping_rules_value = serde_json::to_value(&model_mapping_rules)?;
         let notes = request.notes.or(current.notes);
         validate_external_pool_input(&name, &base_url, max_concurrent_requests)?;
         let row = sqlx::query(
@@ -493,13 +516,17 @@ impl PostgresStore {
                 usage_projection_mode = $9,
                 auto_disable_policy = $10,
                 preserve_path = $11,
-                notes = $12,
+                normalize_model_version_dots = $12,
+                model_mapping_mode = $13,
+                model_mapping_rules = $14,
+                notes = $15,
                 updated_at = now()
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
                       max_concurrent_requests, usage_projection_mode, auto_disable_policy,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
-                      auto_disabled_until, auto_disabled_last_error, preserve_path, notes,
+                      auto_disabled_until, auto_disabled_last_error, preserve_path,
+                      normalize_model_version_dots, model_mapping_mode, model_mapping_rules, notes,
                       created_at, updated_at
             "#,
         )
@@ -514,6 +541,9 @@ impl PostgresStore {
         .bind(usage_projection_mode.as_str())
         .bind(auto_disable_policy.as_str())
         .bind(preserve_path)
+        .bind(normalize_model_version_dots)
+        .bind(model_mapping_mode.as_str())
+        .bind(model_mapping_rules_value)
         .bind(notes)
         .fetch_one(&self.pool)
         .await?;
@@ -533,7 +563,8 @@ impl PostgresStore {
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
                       max_concurrent_requests, usage_projection_mode, auto_disable_policy,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
-                      auto_disabled_until, auto_disabled_last_error, preserve_path, notes,
+                      auto_disabled_until, auto_disabled_last_error, preserve_path,
+                      normalize_model_version_dots, model_mapping_mode, model_mapping_rules, notes,
                       created_at, updated_at
             "#,
         )
@@ -571,7 +602,8 @@ impl PostgresStore {
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
                       max_concurrent_requests, usage_projection_mode, auto_disable_policy,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
-                      auto_disabled_until, auto_disabled_last_error, preserve_path, notes,
+                      auto_disabled_until, auto_disabled_last_error, preserve_path,
+                      normalize_model_version_dots, model_mapping_mode, model_mapping_rules, notes,
                       created_at, updated_at
             "#,
         )
@@ -4232,6 +4264,11 @@ fn external_pool_from_row(row: PgRow, mask_secrets: bool) -> anyhow::Result<Exte
     let usage_projection_mode: String = row.try_get("usage_projection_mode")?;
     let auto_disable_policy: String = row.try_get("auto_disable_policy")?;
     let max_concurrent_requests: i32 = row.try_get("max_concurrent_requests")?;
+    let model_mapping_mode: String = row.try_get("model_mapping_mode")?;
+    let model_mapping_rules_value: serde_json::Value = row.try_get("model_mapping_rules")?;
+    let model_mapping_rules =
+        serde_json::from_value::<Vec<ModelMappingRule>>(model_mapping_rules_value)
+            .unwrap_or_default();
     Ok(ExternalPool {
         id: id.max(0) as u64,
         name: row.try_get("name")?,
@@ -4250,6 +4287,9 @@ fn external_pool_from_row(row: PgRow, mask_secrets: bool) -> anyhow::Result<Exte
         auto_disabled_until: row.try_get("auto_disabled_until")?,
         auto_disabled_last_error: row.try_get("auto_disabled_last_error")?,
         preserve_path: row.try_get("preserve_path")?,
+        normalize_model_version_dots: row.try_get("normalize_model_version_dots")?,
+        model_mapping_mode: ExternalPoolModelMappingMode::parse(&model_mapping_mode),
+        model_mapping_rules: normalize_external_pool_model_mapping_rules(model_mapping_rules),
         notes: row.try_get("notes")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
@@ -4490,6 +4530,9 @@ CREATE TABLE IF NOT EXISTS external_upstream_pools (
     auto_disabled_until TIMESTAMPTZ,
     auto_disabled_last_error TEXT,
     preserve_path BOOLEAN NOT NULL DEFAULT true,
+    normalize_model_version_dots BOOLEAN NOT NULL DEFAULT false,
+    model_mapping_mode TEXT NOT NULL DEFAULT 'processed_mapping',
+    model_mapping_rules JSONB NOT NULL DEFAULT '[]'::jsonb,
     notes TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -4531,6 +4574,15 @@ ALTER TABLE external_upstream_pools
 
 ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS preserve_path BOOLEAN NOT NULL DEFAULT true;
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS normalize_model_version_dots BOOLEAN NOT NULL DEFAULT false;
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS model_mapping_mode TEXT NOT NULL DEFAULT 'processed_mapping';
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS model_mapping_rules JSONB NOT NULL DEFAULT '[]'::jsonb;
 
 ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS notes TEXT;

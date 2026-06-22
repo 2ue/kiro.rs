@@ -858,6 +858,28 @@ pub struct ProxyResourcesResponse {
     pub resources: Vec<ProxyResourceResponse>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyResourceTestRequest {
+    pub proxy_url: Option<String>,
+    pub proxy_username: Option<String>,
+    pub proxy_password: Option<String>,
+    pub test_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyResourceTestResponse {
+    pub success: bool,
+    pub message: String,
+    pub proxy_url: String,
+    pub test_url: String,
+    pub status: Option<u16>,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_preview: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateProxyResourceRequest {

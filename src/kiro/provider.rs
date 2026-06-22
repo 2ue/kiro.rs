@@ -29,7 +29,8 @@ use crate::kiro::protocol::{
 };
 use crate::kiro::token_manager::{
     AcquireMode, CallContext, CredentialRiskControlReason, EXTERNAL_CREDENTIAL_CONTEXT_ID,
-    InFlightKind, InFlightLeaseGuard, ManagerSnapshot, MultiTokenManager, TransientFailureKind,
+    InFlightKind, InFlightLeaseGuard, LocalPoolRouteState, ManagerSnapshot, MultiTokenManager,
+    TransientFailureKind,
 };
 use crate::model::config::{Config, TlsBackend};
 use parking_lot::Mutex;
@@ -844,6 +845,10 @@ impl KiroProvider {
     /// 获取调度器状态快照，用于错误响应携带当前冷却/容量信息。
     pub fn manager_snapshot(&self) -> ManagerSnapshot {
         self.token_manager.snapshot()
+    }
+
+    pub fn local_pool_route_state(&self, model: Option<&str>) -> LocalPoolRouteState {
+        self.token_manager.local_pool_route_state(model)
     }
 
     fn credential_log_label(&self, id: u64) -> String {

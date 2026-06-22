@@ -1106,6 +1106,53 @@ pub struct ManagerSnapshot {
     pub max_queued_requests: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalPoolRouteStateKind {
+    Ready,
+    NoCredentials,
+    AllDisabled,
+    NoModelCompatible,
+    ProxyBlocked,
+    AllCoolingDown,
+    CapacityFull,
+}
+
+impl LocalPoolRouteStateKind {
+    pub fn should_route_external(self) -> bool {
+        !matches!(self, Self::Ready)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalPoolRouteState {
+    pub kind: LocalPoolRouteStateKind,
+    pub total: usize,
+    pub available: usize,
+    pub model_usable: usize,
+    pub usable: usize,
+    pub dispatchable: usize,
+    pub proxy_blocked: usize,
+    pub cooldown_blocked: usize,
+    pub rate_limit_blocked: usize,
+    pub concurrency_blocked: usize,
+    pub global_in_flight_requests: u32,
+    pub global_max_concurrent_requests: u32,
+    pub global_credential_max_concurrent_requests: u32,
+    pub effective_credential_max_concurrent_requests: String,
+    pub queued_requests: u32,
+    pub max_queued_requests: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedLocalPoolRouteState {
+    state: LocalPoolRouteState,
+    expires_at: Instant,
+}
+
 /// 多凭据 Token 管理器
 ///
 /// 支持多个凭据的管理，实现固定优先级 + 故障转移策略
@@ -1147,6 +1194,8 @@ pub struct MultiTokenManager {
     in_flight_notify: Arc<Notify>,
     next_in_flight_lease_id: AtomicU64,
     queued_requests: Arc<AtomicU32>,
+    /// 短 TTL 派生缓存，只用于避免高并发下本地池预检重复全量扫描。
+    local_pool_route_state_cache: Arc<Mutex<HashMap<String, CachedLocalPoolRouteState>>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -1163,6 +1212,8 @@ const SCHEDULER_REDIS_SYNC_MIN_INTERVAL: StdDuration = StdDuration::from_secs(1)
 const SCHEDULER_REDIS_CLEANUP_MIN_INTERVAL: StdDuration = StdDuration::from_secs(5);
 const SCHEDULER_REDIS_HOT_OP_TIMEOUT: StdDuration = StdDuration::from_millis(75);
 const SCHEDULER_REDIS_DEGRADED_BACKOFF: StdDuration = StdDuration::from_secs(2);
+const LOCAL_POOL_ROUTE_STATE_CACHE_TTL: StdDuration = StdDuration::from_millis(250);
+const LOCAL_POOL_ROUTE_STATE_CACHE_MAX_KEYS: usize = 128;
 const CREDENTIAL_STATS_FLUSH_MIN_INTERVAL: StdDuration = StdDuration::from_secs(5);
 const SELECTION_WINDOW_10S: StdDuration = StdDuration::from_secs(10);
 const SELECTION_WINDOW_60S: StdDuration = StdDuration::from_secs(60);
@@ -1233,6 +1284,7 @@ pub struct InFlightLeaseGuard {
     entries: Arc<Mutex<Vec<CredentialEntry>>>,
     redis_store: Option<Arc<RedisStore>>,
     in_flight_notify: Arc<Notify>,
+    local_pool_route_state_cache: Arc<Mutex<HashMap<String, CachedLocalPoolRouteState>>>,
     credential_id: u64,
     lease_id: u64,
     released: AtomicBool,
@@ -1252,6 +1304,7 @@ impl InFlightLeaseGuard {
         entries: Arc<Mutex<Vec<CredentialEntry>>>,
         redis_store: Option<Arc<RedisStore>>,
         in_flight_notify: Arc<Notify>,
+        local_pool_route_state_cache: Arc<Mutex<HashMap<String, CachedLocalPoolRouteState>>>,
         credential_id: u64,
         lease_id: u64,
     ) -> Self {
@@ -1259,6 +1312,7 @@ impl InFlightLeaseGuard {
             entries,
             redis_store,
             in_flight_notify,
+            local_pool_route_state_cache,
             credential_id,
             lease_id,
             released: AtomicBool::new(false),
@@ -1277,6 +1331,7 @@ impl InFlightLeaseGuard {
         let released_locally =
             release_in_flight_lease_from_entries(&self.entries, self.credential_id, self.lease_id);
         if released_locally {
+            self.local_pool_route_state_cache.lock().clear();
             self.in_flight_notify.notify_waiters();
         }
         if let Some(redis) = &self.redis_store {
@@ -1345,6 +1400,7 @@ struct DispatchQueueGuard {
     redis_store: Option<Arc<RedisStore>>,
     local_queued: Arc<AtomicU32>,
     in_flight_notify: Arc<Notify>,
+    local_pool_route_state_cache: Arc<Mutex<HashMap<String, CachedLocalPoolRouteState>>>,
     redis_admitted: bool,
     released: AtomicBool,
 }
@@ -1354,12 +1410,14 @@ impl DispatchQueueGuard {
         redis_store: Option<Arc<RedisStore>>,
         local_queued: Arc<AtomicU32>,
         in_flight_notify: Arc<Notify>,
+        local_pool_route_state_cache: Arc<Mutex<HashMap<String, CachedLocalPoolRouteState>>>,
         redis_admitted: bool,
     ) -> Self {
         Self {
             redis_store,
             local_queued,
             in_flight_notify,
+            local_pool_route_state_cache,
             redis_admitted,
             released: AtomicBool::new(false),
         }
@@ -1370,6 +1428,7 @@ impl DispatchQueueGuard {
             return;
         }
         self.local_queued.fetch_sub(1, Ordering::AcqRel);
+        self.local_pool_route_state_cache.lock().clear();
         if self.redis_admitted {
             if let Some(redis) = &self.redis_store {
                 let redis = redis.clone();
@@ -1656,6 +1715,7 @@ impl MultiTokenManager {
             in_flight_notify: Arc::new(Notify::new()),
             next_in_flight_lease_id: AtomicU64::new(1),
             queued_requests: Arc::new(AtomicU32::new(0)),
+            local_pool_route_state_cache: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到 PgSQL。
@@ -1812,6 +1872,7 @@ impl MultiTokenManager {
             let mut config = self.config.lock();
             *config = updated;
         }
+        self.invalidate_local_pool_route_state_cache();
         self.update_credential_rpm_from_config();
         self.notify_dispatch_state_changed();
         self.publish_runtime_config_changed(saved_version, "runtime_config_updated");
@@ -1837,6 +1898,7 @@ impl MultiTokenManager {
             *current = config.clone();
         }
         *self.load_balancing_mode.lock() = config.load_balancing_mode.clone();
+        self.invalidate_local_pool_route_state_cache();
         self.update_credential_rpm_from_config();
         self.notify_dispatch_state_changed();
         Ok(true)
@@ -1854,6 +1916,242 @@ impl MultiTokenManager {
     /// 获取可用凭据数量
     pub fn available_count(&self) -> usize {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
+    }
+
+    fn local_pool_route_state_cache_key(model: Option<&str>) -> String {
+        model
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| "*".to_string())
+    }
+
+    fn cached_local_pool_route_state(
+        &self,
+        key: &str,
+        now: Instant,
+    ) -> Option<LocalPoolRouteState> {
+        self.local_pool_route_state_cache
+            .lock()
+            .get(key)
+            .filter(|cached| cached.expires_at > now)
+            .map(|cached| cached.state.clone())
+    }
+
+    fn store_local_pool_route_state_cache(
+        &self,
+        key: String,
+        state: LocalPoolRouteState,
+        now: Instant,
+    ) {
+        let mut cache = self.local_pool_route_state_cache.lock();
+        if cache.len() >= LOCAL_POOL_ROUTE_STATE_CACHE_MAX_KEYS && !cache.contains_key(&key) {
+            cache.retain(|_, cached| cached.expires_at > now);
+            if cache.len() >= LOCAL_POOL_ROUTE_STATE_CACHE_MAX_KEYS {
+                cache.clear();
+            }
+        }
+        cache.insert(
+            key,
+            CachedLocalPoolRouteState {
+                state,
+                expires_at: now + LOCAL_POOL_ROUTE_STATE_CACHE_TTL,
+            },
+        );
+    }
+
+    fn invalidate_local_pool_route_state_cache(&self) {
+        self.local_pool_route_state_cache.lock().clear();
+    }
+
+    pub fn local_pool_route_state(&self, model: Option<&str>) -> LocalPoolRouteState {
+        let cache_key = Self::local_pool_route_state_cache_key(model);
+        let now = Instant::now();
+        if let Some(state) = self.cached_local_pool_route_state(&cache_key, now) {
+            return state;
+        }
+
+        let mut state = self.compute_local_pool_route_state(model);
+        if state.kind.should_route_external() && self.auto_heal_too_many_failures_if_applicable() {
+            state = self.compute_local_pool_route_state(model);
+        }
+        self.store_local_pool_route_state_cache(cache_key, state.clone(), Instant::now());
+        state
+    }
+
+    fn compute_local_pool_route_state(&self, model: Option<&str>) -> LocalPoolRouteState {
+        if let Err(err) = self.refresh_scheduler_state_from_redis() {
+            tracing::warn!("本地池路由预检同步 Redis 调度状态失败: {}", err);
+        }
+        self.cleanup_expired_in_flight_leases_local_first();
+
+        let entries = self.entries.lock();
+        let proxy_resources = self.proxy_resources.lock();
+        let config = self.config.lock().clone();
+        let now = Instant::now();
+        let total = entries.len();
+        let available = entries.iter().filter(|entry| !entry.disabled).count();
+        let max_concurrent_requests = config.credential_max_concurrent_requests;
+        let global_in_flight_requests = entries
+            .iter()
+            .map(|entry| entry.in_flight_requests)
+            .sum::<u32>();
+        let global_has_capacity = Self::global_has_concurrency_capacity(
+            global_in_flight_requests,
+            config.dispatch_global_max_concurrent_requests,
+        );
+        let mut model_usable = 0usize;
+        let mut usable = 0usize;
+        let mut proxy_blocked = 0usize;
+        let mut dispatchable = 0usize;
+        let mut cooldown_blocked = 0usize;
+        let mut rate_limit_blocked = 0usize;
+        let mut concurrency_blocked = 0usize;
+        let mut wait_for: Option<StdDuration> = None;
+        let mut effective_concurrency_range: Option<(u32, u32)> = None;
+
+        for entry in entries.iter() {
+            if !Self::credential_is_usable_for_model(entry, model) {
+                continue;
+            }
+            model_usable += 1;
+
+            if !Self::credential_proxy_is_dispatchable(&entry.credentials, &proxy_resources) {
+                proxy_blocked += 1;
+                continue;
+            }
+
+            usable += 1;
+            let effective_concurrency =
+                Self::effective_max_concurrent_requests(entry, max_concurrent_requests);
+            effective_concurrency_range = Some(match effective_concurrency_range {
+                Some((min, max)) => (
+                    min.min(effective_concurrency),
+                    max.max(effective_concurrency),
+                ),
+                None => (effective_concurrency, effective_concurrency),
+            });
+
+            let cooldown_remaining = Self::entry_cooldown_remaining(entry, model, now);
+            let rate_limit_remaining = Self::entry_rate_limit_remaining(entry, now);
+
+            if let Some(remaining) = cooldown_remaining {
+                cooldown_blocked += 1;
+                let blocking_wait = rate_limit_remaining
+                    .map(|rate_limit| remaining.max(rate_limit))
+                    .unwrap_or(remaining);
+                wait_for =
+                    Some(wait_for.map_or(blocking_wait, |current| current.min(blocking_wait)));
+                continue;
+            }
+            if let Some(remaining) = rate_limit_remaining {
+                rate_limit_blocked += 1;
+                wait_for = Some(wait_for.map_or(remaining, |current| current.min(remaining)));
+                continue;
+            }
+
+            if !global_has_capacity
+                || !Self::entry_has_concurrency_capacity(entry, max_concurrent_requests)
+            {
+                concurrency_blocked += 1;
+                continue;
+            }
+
+            dispatchable += 1;
+        }
+
+        let dispatch_candidate_count = usable;
+        let retry_after_secs = wait_for
+            .map(|duration| duration.as_secs().saturating_add(1))
+            .filter(|value| *value > 0);
+        let effective_credential_max_concurrent_requests =
+            Self::format_effective_concurrency_range(effective_concurrency_range);
+
+        let kind = if total == 0 {
+            LocalPoolRouteStateKind::NoCredentials
+        } else if available == 0 {
+            LocalPoolRouteStateKind::AllDisabled
+        } else if model.is_some() && model_usable == 0 {
+            LocalPoolRouteStateKind::NoModelCompatible
+        } else if model_usable > 0 && usable == 0 && proxy_blocked >= model_usable {
+            LocalPoolRouteStateKind::ProxyBlocked
+        } else if dispatchable > 0 {
+            LocalPoolRouteStateKind::Ready
+        } else if dispatch_candidate_count > 0
+            && cooldown_blocked.saturating_add(rate_limit_blocked) >= dispatch_candidate_count
+        {
+            LocalPoolRouteStateKind::AllCoolingDown
+        } else {
+            LocalPoolRouteStateKind::CapacityFull
+        };
+
+        LocalPoolRouteState {
+            kind,
+            total,
+            available,
+            model_usable,
+            usable,
+            dispatchable,
+            proxy_blocked,
+            cooldown_blocked,
+            rate_limit_blocked,
+            concurrency_blocked,
+            global_in_flight_requests,
+            global_max_concurrent_requests: config.dispatch_global_max_concurrent_requests,
+            global_credential_max_concurrent_requests: max_concurrent_requests,
+            effective_credential_max_concurrent_requests,
+            queued_requests: self.queued_requests.load(Ordering::Relaxed),
+            max_queued_requests: config.dispatch_max_queued_requests,
+            retry_after_secs,
+        }
+    }
+
+    fn auto_heal_too_many_failures_if_applicable(&self) -> bool {
+        let healed_ids = {
+            let mut entries = self.entries.lock();
+            if !entries.iter().any(|entry| {
+                entry.disabled && entry.disabled_reason == Some(DisabledReason::TooManyFailures)
+            }) {
+                return false;
+            }
+
+            tracing::warn!(
+                "所有可调度凭据均不可用且存在连续失败自动禁用凭据，执行自愈：重置失败计数并重新启用"
+            );
+
+            let mut healed_ids = Vec::new();
+            for entry in entries.iter_mut() {
+                if entry.disabled_reason == Some(DisabledReason::TooManyFailures) {
+                    entry.disabled = false;
+                    entry.disabled_reason = None;
+                    entry.failure_count = 0;
+                    healed_ids.push(entry.id);
+                }
+            }
+            healed_ids
+        };
+
+        if healed_ids.is_empty() {
+            return false;
+        }
+
+        for healed_id in healed_ids {
+            self.queue_runtime_state_flush(healed_id, None, Utc::now());
+            self.record_scheduler_credential_audit(
+                "auto_enable_credential",
+                healed_id,
+                DisabledReason::TooManyFailures,
+                "auto_heal_all_too_many_failures",
+                "所有可调度凭据均因连续失败自动禁用，调度器已自动恢复该凭据",
+                serde_json::json!({
+                    "previousReason": DisabledReason::TooManyFailures.as_str(),
+                }),
+            );
+        }
+        self.invalidate_local_pool_route_state_cache();
+        self.notify_dispatch_state_changed();
+        self.publish_credentials_changed("auto_heal_too_many_failures");
+        true
     }
 
     fn is_opus_model(model: Option<&str>) -> bool {
@@ -2574,10 +2872,12 @@ impl MultiTokenManager {
                         max_concurrent_requests,
                         global_max_concurrent_requests,
                     ) {
+                        self.invalidate_local_pool_route_state_cache();
                         return Ok(Some(InFlightLeaseGuard::new(
                             self.entries.clone(),
                             self.redis_store.clone(),
                             self.in_flight_notify.clone(),
+                            self.local_pool_route_state_cache.clone(),
                             id,
                             lease_id,
                         )));
@@ -2607,10 +2907,12 @@ impl MultiTokenManager {
             max_concurrent_requests,
             global_max_concurrent_requests,
         ) {
+            self.invalidate_local_pool_route_state_cache();
             return Ok(Some(InFlightLeaseGuard::new(
                 self.entries.clone(),
                 None,
                 self.in_flight_notify.clone(),
+                self.local_pool_route_state_cache.clone(),
                 id,
                 lease_id,
             )));
@@ -2847,6 +3149,7 @@ impl MultiTokenManager {
         if !self.try_enter_local_dispatch_queue(max_queued) {
             return Ok(None);
         }
+        self.invalidate_local_pool_route_state_cache();
         let mut redis_admitted = false;
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
@@ -2872,6 +3175,7 @@ impl MultiTokenManager {
             self.redis_store.clone(),
             self.queued_requests.clone(),
             self.in_flight_notify.clone(),
+            self.local_pool_route_state_cache.clone(),
             redis_admitted,
         )))
     }
@@ -3448,38 +3752,7 @@ impl MultiTokenManager {
 
                         // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                         if best.is_none() {
-                            let mut healed_ids = Vec::new();
-                            let mut entries = self.entries.lock();
-                            if entries.iter().any(|e| {
-                                e.disabled
-                                    && e.disabled_reason == Some(DisabledReason::TooManyFailures)
-                            }) {
-                                tracing::warn!(
-                                    "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
-                                );
-                                for e in entries.iter_mut() {
-                                    if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
-                                        e.disabled = false;
-                                        e.disabled_reason = None;
-                                        e.failure_count = 0;
-                                        healed_ids.push(e.id);
-                                    }
-                                }
-                                drop(entries);
-                                for healed_id in healed_ids {
-                                    self.queue_runtime_state_flush(healed_id, None, Utc::now());
-                                    self.record_scheduler_credential_audit(
-                                        "auto_enable_credential",
-                                        healed_id,
-                                        DisabledReason::TooManyFailures,
-                                        "auto_heal_all_too_many_failures",
-                                        "所有可调度凭据均因连续失败自动禁用，调度器已自动恢复该凭据",
-                                        serde_json::json!({
-                                            "previousReason": DisabledReason::TooManyFailures.as_str(),
-                                        }),
-                                    );
-                                }
-                                self.publish_credentials_changed("auto_heal_too_many_failures");
+                            if self.auto_heal_too_many_failures_if_applicable() {
                                 best = self
                                     .select_next_credential_excluding(model, &local_excluded_ids);
                             }
@@ -4129,6 +4402,17 @@ impl MultiTokenManager {
         }
     }
 
+    fn preserve_proxy_fields(
+        mut credentials: KiroCredentials,
+        source: &KiroCredentials,
+    ) -> KiroCredentials {
+        credentials.proxy_url = source.proxy_url.clone();
+        credentials.proxy_username = source.proxy_username.clone();
+        credentials.proxy_password = source.proxy_password.clone();
+        credentials.proxy_resource_id = source.proxy_resource_id;
+        credentials
+    }
+
     fn effective_proxy_display_with_resources(
         &self,
         creds: &KiroCredentials,
@@ -4557,6 +4841,7 @@ impl MultiTokenManager {
             self.load_stats();
             self.load_runtime_state();
             self.select_highest_priority();
+            self.invalidate_local_pool_route_state_cache();
         }
         Ok(changed || proxy_changed)
     }
@@ -4588,6 +4873,7 @@ impl MultiTokenManager {
         if changed {
             *current = next;
             tracing::info!("已重新加载 {} 个代理资源", current.len());
+            self.invalidate_local_pool_route_state_cache();
         }
         Ok(changed)
     }
@@ -4603,6 +4889,7 @@ impl MultiTokenManager {
     }
 
     fn publish_runtime_config_changed(&self, version: Option<i64>, reason: &str) {
+        self.invalidate_local_pool_route_state_cache();
         let Some(redis) = &self.redis_store else {
             return;
         };
@@ -4614,6 +4901,7 @@ impl MultiTokenManager {
     }
 
     fn publish_credentials_changed(&self, reason: &str) {
+        self.invalidate_local_pool_route_state_cache();
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
             let reason_owned = reason.to_string();
@@ -5093,6 +5381,8 @@ impl MultiTokenManager {
             entry.in_flight_requests = entry.in_flight_leases.len() as u32;
             entry.health = state.health;
         }
+        drop(entries);
+        self.invalidate_local_pool_route_state_cache();
     }
 
     fn record_scheduler_selection(&self, id: u64) {
@@ -5132,6 +5422,7 @@ impl MultiTokenManager {
                 }
             }
         }
+        self.invalidate_local_pool_route_state_cache();
         let Some(redis) = &self.redis_store else {
             return;
         };
@@ -5349,6 +5640,7 @@ impl MultiTokenManager {
             reason
         );
 
+        self.invalidate_local_pool_route_state_cache();
         let has_alternate = {
             let entries = self.entries.lock();
             let proxy_resources = self.proxy_resources.lock();
@@ -6495,10 +6787,12 @@ impl MultiTokenManager {
             });
         }
 
+        let source_credentials = credentials.clone();
         let credentials = self.resolve_proxy_for_credential(credentials)?;
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
         let config = self.runtime_config();
         let refreshed = refresh_token(&credentials, &config, effective_proxy.as_ref()).await?;
+        let refreshed = Self::preserve_proxy_fields(refreshed, &source_credentials);
         self.token_context_from_credentials(EXTERNAL_CREDENTIAL_CONTEXT_ID, refreshed, false)
     }
 
@@ -8910,6 +9204,177 @@ mod tests {
         first.release_in_flight();
     }
 
+    #[test]
+    fn test_local_pool_route_state_reports_no_credentials_and_all_disabled() {
+        let empty = MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
+        let empty_state = empty.local_pool_route_state(None);
+        assert_eq!(empty_state.kind, LocalPoolRouteStateKind::NoCredentials);
+        assert_eq!(empty_state.total, 0);
+        assert_eq!(empty_state.available, 0);
+
+        let mut disabled = test_access_token_credential("disabled", "Pro");
+        disabled.disabled = true;
+        let disabled_manager =
+            MultiTokenManager::new(Config::default(), vec![disabled], None, None, false).unwrap();
+        let disabled_state = disabled_manager.local_pool_route_state(None);
+        assert_eq!(disabled_state.kind, LocalPoolRouteStateKind::AllDisabled);
+        assert_eq!(disabled_state.total, 1);
+        assert_eq!(disabled_state.available, 0);
+    }
+
+    #[tokio::test]
+    async fn test_local_pool_route_state_reports_capacity_full_without_queueing() {
+        let mut config = Config::default();
+        config.credential_max_concurrent_requests = 1;
+        config.dispatch_max_queued_requests = 10;
+        let manager = MultiTokenManager::new(
+            config,
+            vec![test_access_token_credential("first", "Pro")],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let ready = manager.local_pool_route_state(None);
+        assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
+        assert_eq!(ready.dispatchable, 1);
+
+        let mut ctx = manager.acquire_context(None).await.unwrap();
+        let full = manager.local_pool_route_state(None);
+        assert_eq!(full.kind, LocalPoolRouteStateKind::CapacityFull);
+        assert_eq!(full.dispatchable, 0);
+        assert_eq!(full.concurrency_blocked, 1);
+        assert_eq!(full.queued_requests, 0);
+
+        ctx.release_in_flight();
+        let ready_again = manager.local_pool_route_state(None);
+        assert_eq!(ready_again.kind, LocalPoolRouteStateKind::Ready);
+        assert_eq!(ready_again.dispatchable, 1);
+    }
+
+    #[tokio::test]
+    async fn test_local_pool_route_state_sees_added_credential_after_empty_pool() {
+        let manager = MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
+        let empty_state = manager.local_pool_route_state(None);
+        assert_eq!(empty_state.kind, LocalPoolRouteStateKind::NoCredentials);
+
+        manager
+            .add_credential(api_key_credential("ksk_dynamic_added"))
+            .await
+            .unwrap();
+
+        let ready = manager.local_pool_route_state(None);
+        assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
+        assert_eq!(ready.total, 1);
+        assert_eq!(ready.dispatchable, 1);
+    }
+
+    #[test]
+    fn test_local_pool_route_state_sees_manual_enable_after_all_disabled() {
+        let mut disabled = api_key_credential("ksk_dynamic_disabled");
+        disabled.disabled = true;
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![disabled], None, None, false).unwrap();
+
+        let disabled_state = manager.local_pool_route_state(None);
+        assert_eq!(disabled_state.kind, LocalPoolRouteStateKind::AllDisabled);
+
+        manager.set_disabled(1, false).unwrap();
+
+        let ready = manager.local_pool_route_state(None);
+        assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
+        assert_eq!(ready.available, 1);
+        assert_eq!(ready.dispatchable, 1);
+    }
+
+    #[tokio::test]
+    async fn test_local_pool_route_state_sees_model_compatible_credential_added() {
+        let mut free = api_key_credential("ksk_model_free");
+        free.subscription_title = Some("Free".to_string());
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![free], None, None, false).unwrap();
+
+        let unsupported = manager.local_pool_route_state(Some("claude-opus-4-8"));
+        assert_eq!(unsupported.kind, LocalPoolRouteStateKind::NoModelCompatible);
+
+        let mut pro = api_key_credential("ksk_model_pro");
+        pro.subscription_title = Some("Pro".to_string());
+        manager.add_credential(pro).await.unwrap();
+
+        let ready = manager.local_pool_route_state(Some("claude-opus-4-8"));
+        assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
+        assert_eq!(ready.model_usable, 1);
+        assert_eq!(ready.dispatchable, 1);
+    }
+
+    #[test]
+    fn test_local_pool_route_state_auto_heals_too_many_failures() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![api_key_credential("ksk_auto_heal_preflight")],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(manager.report_failure(1));
+        assert!(manager.report_failure(1));
+        assert!(!manager.report_failure(1));
+        let disabled = manager.snapshot().entries.into_iter().next().unwrap();
+        assert!(disabled.disabled);
+        assert_eq!(
+            disabled.disabled_reason.as_deref(),
+            Some(DisabledReason::TooManyFailures.as_str())
+        );
+
+        let ready = manager.local_pool_route_state(None);
+        assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
+        assert_eq!(ready.available, 1);
+        assert_eq!(ready.dispatchable, 1);
+
+        let healed = manager.snapshot().entries.into_iter().next().unwrap();
+        assert!(!healed.disabled);
+        assert_eq!(healed.failure_count, 0);
+        assert!(healed.disabled_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_local_pool_route_state_proxy_blocked_recovers_after_resource_enabled() {
+        let mut credential = api_key_credential("ksk_proxy_dynamic");
+        credential.proxy_resource_id = Some(7);
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+        manager.proxy_resources.lock().insert(
+            7,
+            ProxyResourceRuntime {
+                id: 7,
+                name: "residential".to_string(),
+                proxy_url: "http://127.0.0.1:8080".to_string(),
+                proxy_username: None,
+                proxy_password: None,
+                enabled: false,
+            },
+        );
+        manager.invalidate_local_pool_route_state_cache();
+
+        let blocked = manager.local_pool_route_state(None);
+        assert_eq!(blocked.kind, LocalPoolRouteStateKind::ProxyBlocked);
+        assert_eq!(blocked.proxy_blocked, 1);
+
+        manager.proxy_resources.lock().get_mut(&7).unwrap().enabled = true;
+        manager.invalidate_local_pool_route_state_cache();
+
+        let ready = manager.local_pool_route_state(None);
+        assert_eq!(ready.kind, LocalPoolRouteStateKind::Ready);
+        assert_eq!(ready.dispatchable, 1);
+
+        let mut ctx = manager.acquire_context(None).await.unwrap();
+        assert_eq!(ctx.id, 1);
+        ctx.release_in_flight();
+    }
+
     #[tokio::test]
     async fn test_concurrency_limiter_skips_disabled_credentials_and_queues_on_only_active() {
         let mut config = Config::default();
@@ -9867,6 +10332,49 @@ mod tests {
         let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
         assert_eq!(entry.effective_proxy_source, "resource_missing");
         assert_eq!(entry.effective_proxy_url, None);
+    }
+
+    #[test]
+    fn test_external_import_refresh_preserves_bound_proxy_resource() {
+        let mut config = Config::default();
+        config.proxy_url = Some("http://global-proxy:8080".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+        manager.proxy_resources.lock().insert(
+            7,
+            ProxyResourceRuntime {
+                id: 7,
+                name: "import-proxy".to_string(),
+                proxy_url: "socks5h://127.0.0.1:1080".to_string(),
+                proxy_username: Some("user".to_string()),
+                proxy_password: Some("pass".to_string()),
+                enabled: true,
+            },
+        );
+
+        let mut source = KiroCredentials::default();
+        source.proxy_resource_id = Some(7);
+        let mut refreshed = KiroCredentials::default();
+        refreshed.access_token = Some("refreshed-token".to_string());
+        refreshed.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let preserved = MultiTokenManager::preserve_proxy_fields(refreshed, &source);
+        assert_eq!(preserved.proxy_resource_id, Some(7));
+
+        let resolved = manager.resolve_proxy_for_credential(preserved).unwrap();
+        assert_eq!(
+            resolved.proxy_url.as_deref(),
+            Some("socks5h://127.0.0.1:1080")
+        );
+        assert_eq!(resolved.proxy_username.as_deref(), Some("user"));
+        assert_eq!(resolved.proxy_password.as_deref(), Some("pass"));
+        assert_eq!(
+            resolved
+                .effective_proxy(manager.proxy.as_ref())
+                .unwrap()
+                .url,
+            "socks5h://127.0.0.1:1080"
+        );
     }
 
     #[tokio::test]

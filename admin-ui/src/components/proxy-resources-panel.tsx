@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
-import { Edit3, Eye, EyeOff, Plus, RefreshCw, Trash2 } from 'lucide-react'
+import { Activity, Edit3, Eye, EyeOff, Plus, RefreshCw, Trash2 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -21,10 +21,11 @@ import {
   useDeleteProxyResource,
   useProxyResources,
   useSetCredentialProxy,
+  useTestProxyResource,
   useUpdateProxyResource,
 } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
-import type { CredentialStatusItem, ProxyResource } from '@/types/api'
+import type { CredentialStatusItem, ProxyResource, ProxyResourceTestResponse } from '@/types/api'
 
 type ProxyForm = {
   name: string
@@ -60,6 +61,27 @@ function formFromResource(resource: ProxyResource): ProxyForm {
 function maskSecret(value?: string | null): string {
   if (!value) return '-'
   return '*'.repeat(Math.min(Math.max(value.length, 6), 16))
+}
+
+function proxyTestRequestFromForm(form: ProxyForm) {
+  return {
+    proxyUrl: form.proxyUrl.trim(),
+    proxyUsername: form.proxyUsername.trim() || undefined,
+    proxyPassword: form.proxyPassword.trim() || undefined,
+  }
+}
+
+function ProxyTestResult({ result }: { result: ProxyResourceTestResponse | null }) {
+  if (!result) return null
+  return (
+    <div className={`rounded-md border p-3 text-xs ${result.success ? 'border-green-300 bg-green-50 text-green-700 dark:border-green-900 dark:bg-green-950/30 dark:text-green-300' : 'border-red-300 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300'}`}>
+      <div className="font-semibold">{result.message}</div>
+      <div className="mt-1 text-muted-foreground">
+        耗时 {result.durationMs}ms{typeof result.status === 'number' ? ` · HTTP ${result.status}` : ''} · {result.testUrl}
+      </div>
+      {result.responsePreview && <div className="mt-1 break-words font-mono text-muted-foreground">{result.responsePreview}</div>}
+    </div>
+  )
 }
 
 function SecretInput({
@@ -184,7 +206,9 @@ function ProxyEditorDialog({
   const create = useCreateProxyResource()
   const update = useUpdateProxyResource()
   const setCredentialProxy = useSetCredentialProxy()
+  const testProxy = useTestProxyResource()
   const credentials = useCredentials({ enabled: open })
+  const [testResult, setTestResult] = useState<ProxyResourceTestResponse | null>(null)
   const isEditing = Boolean(resource)
   const allCredentials = credentials.data?.credentials || []
 
@@ -194,6 +218,7 @@ function ProxyEditorDialog({
     setForm(resource ? formFromResource(resource) : emptyForm())
     setSelectedCredentialIds(new Set())
     setBindingReady(false)
+    setTestResult(null)
     setShowProxyUsername(false)
     setShowProxyPassword(false)
     credentials.refetch().then((result) => {
@@ -298,7 +323,22 @@ function ProxyEditorDialog({
     }
   }
 
-  const pending = create.isPending || update.isPending || setCredentialProxy.isPending
+  const testCurrentProxy = async () => {
+    if (!form.proxyUrl.trim()) {
+      toast.error('请输入代理 URL')
+      return
+    }
+    try {
+      const result = await testProxy.mutateAsync({ request: proxyTestRequestFromForm(form) })
+      setTestResult(result)
+      if (result.success) toast.success(result.message)
+      else toast.error(result.message)
+    } catch (error) {
+      toast.error(`代理测试失败: ${extractErrorMessage(error)}`)
+    }
+  }
+
+  const pending = create.isPending || update.isPending || setCredentialProxy.isPending || testProxy.isPending
 
   return (
     <Dialog open={open} onOpenChange={(nextOpen) => !pending && onOpenChange(nextOpen)}>
@@ -354,6 +394,20 @@ function ProxyEditorDialog({
             </div>
           </div>
 
+          <div className="space-y-3 rounded-md border bg-background p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <div className="text-sm font-medium">代理连通性</div>
+                <div className="text-xs text-muted-foreground">保存前先用当前表单配置测试真实出网。</div>
+              </div>
+              <Button type="button" variant="outline" size="sm" onClick={testCurrentProxy} disabled={pending || !form.proxyUrl.trim()}>
+                <Activity className="h-4 w-4" />
+                {testProxy.isPending ? '测试中...' : '测试代理'}
+              </Button>
+            </div>
+            <ProxyTestResult result={testResult} />
+          </div>
+
           <div className="space-y-2">
             <div className="flex items-center justify-between gap-3">
               <div>
@@ -402,7 +456,9 @@ function ProxyResourceCard({
 }) {
   const update = useUpdateProxyResource()
   const remove = useDeleteProxyResource()
+  const testProxy = useTestProxyResource()
   const [showSecrets, setShowSecrets] = useState(false)
+  const [testResult, setTestResult] = useState<ProxyResourceTestResponse | null>(null)
 
   const toggleEnabled = () => {
     update.mutate(
@@ -420,6 +476,17 @@ function ProxyResourceCard({
       onSuccess: (res) => toast.success(res.message),
       onError: (error) => toast.error(`删除失败: ${extractErrorMessage(error)}`),
     })
+  }
+
+  const testSavedProxy = async () => {
+    try {
+      const result = await testProxy.mutateAsync({ id: resource.id, request: {} })
+      setTestResult(result)
+      if (result.success) toast.success(`代理 #${resource.id} 测试通过`)
+      else toast.error(result.message)
+    } catch (error) {
+      toast.error(`代理测试失败: ${extractErrorMessage(error)}`)
+    }
   }
 
   return (
@@ -471,7 +538,12 @@ function ProxyResourceCard({
             </div>
           )}
         </div>
+        <ProxyTestResult result={testResult} />
         <div className="flex flex-wrap gap-2 border-t pt-3">
+          <Button size="sm" variant="outline" onClick={testSavedProxy} disabled={testProxy.isPending}>
+            <Activity className="h-4 w-4" />
+            {testProxy.isPending ? '测试中...' : '测试'}
+          </Button>
           <Button size="sm" variant="outline" onClick={() => setShowSecrets((value) => !value)}>
             {showSecrets ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
             {showSecrets ? '隐藏账号密码' : '显示账号密码'}

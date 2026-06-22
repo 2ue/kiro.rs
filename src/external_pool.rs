@@ -43,8 +43,8 @@ use crate::{
         },
     },
     model::config::{
-        ExternalPoolCapacityMode, ExternalPoolsConfig, PromptCacheCreationControlConfig,
-        ReportedUsageConfig,
+        ExternalPoolCapacityMode, ExternalPoolsConfig, ModelMappingRule,
+        PromptCacheCreationControlConfig, ReportedUsageConfig,
     },
     storage::{
         postgres::PostgresStore,
@@ -56,6 +56,7 @@ use crate::{
 const DEFAULT_EXTERNAL_POOL_REQUEST_TIMEOUT_SECS: u64 = 180;
 const EXTERNAL_POOL_LEASE_TOUCH_INTERVAL_SECS: u64 = 30;
 const EXTERNAL_POOL_PROMPT_CACHE_CREDENTIAL_ID_OFFSET: u64 = 1_u64 << 63;
+const EXTERNAL_POOL_AVAILABILITY_CACHE_TTL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -147,6 +148,38 @@ impl ExternalPoolAutoDisablePolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalPoolModelMappingMode {
+    Passthrough,
+    DirectMapping,
+    ProcessedMapping,
+}
+
+impl Default for ExternalPoolModelMappingMode {
+    fn default() -> Self {
+        Self::ProcessedMapping
+    }
+}
+
+impl ExternalPoolModelMappingMode {
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "passthrough" | "pass_through" => Self::Passthrough,
+            "direct_mapping" | "direct" => Self::DirectMapping,
+            _ => Self::ProcessedMapping,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Passthrough => "passthrough",
+            Self::DirectMapping => "direct_mapping",
+            Self::ProcessedMapping => "processed_mapping",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalPool {
@@ -173,6 +206,12 @@ pub struct ExternalPool {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_disabled_last_error: Option<String>,
     pub preserve_path: bool,
+    #[serde(default)]
+    pub normalize_model_version_dots: bool,
+    #[serde(default)]
+    pub model_mapping_mode: ExternalPoolModelMappingMode,
+    #[serde(default)]
+    pub model_mapping_rules: Vec<ModelMappingRule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -211,6 +250,12 @@ pub struct CreateExternalPoolRequest {
     #[serde(default = "default_true")]
     pub preserve_path: bool,
     #[serde(default)]
+    pub normalize_model_version_dots: bool,
+    #[serde(default)]
+    pub model_mapping_mode: ExternalPoolModelMappingMode,
+    #[serde(default)]
+    pub model_mapping_rules: Vec<ModelMappingRule>,
+    #[serde(default)]
     pub notes: Option<String>,
 }
 
@@ -237,6 +282,12 @@ pub struct UpdateExternalPoolRequest {
     pub auto_disable_policy: Option<ExternalPoolAutoDisablePolicy>,
     #[serde(default)]
     pub preserve_path: Option<bool>,
+    #[serde(default)]
+    pub normalize_model_version_dots: Option<bool>,
+    #[serde(default)]
+    pub model_mapping_mode: Option<ExternalPoolModelMappingMode>,
+    #[serde(default)]
+    pub model_mapping_rules: Option<Vec<ModelMappingRule>>,
     #[serde(default)]
     pub notes: Option<String>,
 }
@@ -423,6 +474,7 @@ pub struct ExternalPoolManager {
     redis: Arc<RedisStore>,
     client: reqwest::Client,
     capacity_notify: Arc<Notify>,
+    availability_cache: Arc<SyncMutex<Option<CachedPoolAvailabilitySnapshot>>>,
 }
 
 struct ExternalPoolLease {
@@ -528,6 +580,12 @@ struct PoolAvailabilitySnapshot {
     wait_for: Option<Duration>,
 }
 
+#[derive(Debug, Clone)]
+struct CachedPoolAvailabilitySnapshot {
+    snapshot: PoolAvailabilitySnapshot,
+    expires_at: Instant,
+}
+
 impl PoolAvailabilitySnapshot {
     fn has_eligible_pool(&self) -> bool {
         self.eligible_pools > 0
@@ -576,6 +634,7 @@ impl ExternalPoolManager {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             capacity_notify: Arc::new(Notify::new()),
+            availability_cache: Arc::new(SyncMutex::new(None)),
         }
     }
 
@@ -608,10 +667,10 @@ impl ExternalPoolManager {
     }
 
     pub async fn has_available_pool(&self, config: &ExternalPoolsConfig) -> bool {
-        if !config.external_pools_enabled {
-            return false;
-        }
-        self.select_pool(&HashSet::new(), config).await.is_some()
+        self.pool_availability_snapshot(&HashSet::new(), config)
+            .await
+            .available_pools
+            > 0
     }
 
     pub async fn has_eligible_pool(&self, config: &ExternalPoolsConfig) -> bool {
@@ -969,7 +1028,7 @@ impl ExternalPoolManager {
                 HeaderValue::from_static("application/json"),
             );
         }
-        let outbound_body = external_pool_outbound_body(route);
+        let outbound_body = external_pool_outbound_body(route, pool);
         let mut request = self.client.post(url).headers(headers).body(outbound_body);
         if route.payload.stream {
             if config.external_pool_stream_request_timeout_secs > 0 {
@@ -1260,6 +1319,20 @@ impl ExternalPoolManager {
         if !config.external_pools_enabled {
             return PoolAvailabilitySnapshot::default();
         }
+        let cacheable = excluded.is_empty();
+        let now = Instant::now();
+        if cacheable {
+            if let Some(snapshot) = self
+                .availability_cache
+                .lock()
+                .as_ref()
+                .filter(|cached| cached.expires_at > now)
+                .map(|cached| cached.snapshot.clone())
+            {
+                return snapshot;
+            }
+        }
+
         let Ok(pools) = self.postgres.list_external_pools(false).await else {
             return PoolAvailabilitySnapshot::default();
         };
@@ -1305,6 +1378,12 @@ impl ExternalPoolManager {
                 }
                 _ => {}
             }
+        }
+        if cacheable {
+            *self.availability_cache.lock() = Some(CachedPoolAvailabilitySnapshot {
+                snapshot: snapshot.clone(),
+                expires_at: Instant::now() + EXTERNAL_POOL_AVAILABILITY_CACHE_TTL,
+            });
         }
         snapshot
     }
@@ -2225,7 +2304,7 @@ fn forward_headers(
     Ok(out)
 }
 
-fn external_pool_outbound_body(route: &ExternalRouteRequest) -> Bytes {
+fn external_pool_outbound_body(route: &ExternalRouteRequest, pool: &ExternalPool) -> Bytes {
     let mut value = match serde_json::to_value(&route.payload) {
         Ok(value) => value,
         Err(_) => match serde_json::from_slice::<serde_json::Value>(&route.raw_body) {
@@ -2234,14 +2313,7 @@ fn external_pool_outbound_body(route: &ExternalRouteRequest) -> Bytes {
         },
     };
 
-    let model = route
-        .upstream_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .or_else(|| value.get("model").and_then(|model| model.as_str()));
-    if let Some(model) = model {
-        let outbound_model = normalize_external_pool_outbound_model(model);
+    if let Some(outbound_model) = external_pool_outbound_model(route, pool, &value) {
         if value.get("model").and_then(|model| model.as_str()) != Some(outbound_model.as_str()) {
             value["model"] = serde_json::Value::String(outbound_model);
         }
@@ -2251,6 +2323,83 @@ fn external_pool_outbound_body(route: &ExternalRouteRequest) -> Bytes {
     serde_json::to_vec(&value)
         .map(Bytes::from)
         .unwrap_or_else(|_| route.raw_body.clone())
+}
+
+fn external_pool_outbound_model(
+    route: &ExternalRouteRequest,
+    pool: &ExternalPool,
+    value: &serde_json::Value,
+) -> Option<String> {
+    let original_model = value
+        .get("model")
+        .and_then(|model| model.as_str())
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .or_else(|| {
+            let model = route.payload.model.trim();
+            (!model.is_empty()).then_some(model)
+        });
+    let processed_model = route
+        .upstream_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .or(original_model);
+
+    match pool.model_mapping_mode {
+        ExternalPoolModelMappingMode::Passthrough => original_model
+            .map(|model| model.to_string())
+            .or_else(|| external_pool_fallback_outbound_model(processed_model, pool)),
+        ExternalPoolModelMappingMode::DirectMapping => original_model
+            .and_then(|model| external_pool_model_mapping_target(&pool.model_mapping_rules, model))
+            .or_else(|| external_pool_fallback_outbound_model(processed_model, pool)),
+        ExternalPoolModelMappingMode::ProcessedMapping => processed_model
+            .and_then(|model| external_pool_model_mapping_target(&pool.model_mapping_rules, model))
+            .or_else(|| external_pool_fallback_outbound_model(processed_model, pool)),
+    }
+}
+
+fn external_pool_fallback_outbound_model(
+    model: Option<&str>,
+    pool: &ExternalPool,
+) -> Option<String> {
+    let model = model.map(str::trim).filter(|model| !model.is_empty())?;
+    Some(if pool.normalize_model_version_dots {
+        normalize_external_pool_outbound_model(model)
+    } else {
+        model.to_string()
+    })
+}
+
+fn external_pool_model_mapping_target(rules: &[ModelMappingRule], model: &str) -> Option<String> {
+    let source = model.trim().to_ascii_lowercase();
+    if source.is_empty() {
+        return None;
+    }
+    rules.iter().find_map(|rule| {
+        if !rule.enabled || rule.source.trim().to_ascii_lowercase() != source {
+            return None;
+        }
+        let target = rule.target.trim();
+        (!target.is_empty()).then(|| target.to_string())
+    })
+}
+
+pub fn normalize_external_pool_model_mapping_rules(
+    rules: Vec<ModelMappingRule>,
+) -> Vec<ModelMappingRule> {
+    rules
+        .into_iter()
+        .filter_map(|mut rule| {
+            rule.source = rule.source.trim().to_ascii_lowercase();
+            rule.target = rule.target.trim().to_string();
+            rule.note = rule.note.and_then(|value| {
+                let value = value.trim().to_string();
+                (!value.is_empty()).then_some(value)
+            });
+            (!rule.source.is_empty() && !rule.target.is_empty()).then_some(rule)
+        })
+        .collect()
 }
 
 fn normalize_external_pool_outbound_model(model: &str) -> String {
@@ -3410,6 +3559,9 @@ mod tests {
             usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
             auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
             preserve_path: true,
+            normalize_model_version_dots: false,
+            model_mapping_mode: ExternalPoolModelMappingMode::ProcessedMapping,
+            model_mapping_rules: Vec::new(),
             notes: None,
         }
     }
@@ -3978,10 +4130,29 @@ mod tests {
             auto_disabled_until: None,
             auto_disabled_last_error: None,
             preserve_path,
+            normalize_model_version_dots: false,
+            model_mapping_mode: ExternalPoolModelMappingMode::ProcessedMapping,
+            model_mapping_rules: Vec::new(),
             notes: None,
             created_at: now,
             updated_at: now,
         }
+    }
+
+    fn model_rule(source: &str, target: &str) -> ModelMappingRule {
+        ModelMappingRule {
+            enabled: true,
+            source: source.to_string(),
+            target: target.to_string(),
+            kind: Default::default(),
+            note: None,
+        }
+    }
+
+    fn test_pool_with_model_dot_normalization() -> ExternalPool {
+        let mut pool = test_pool("https://example.com/v1", true);
+        pool.normalize_model_version_dots = true;
+        pool
     }
 
     fn test_route(model: &str) -> ExternalRouteRequest {
@@ -4058,7 +4229,8 @@ mod tests {
             br#"{"model":"claude-opus-4-7-thinking","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"adaptive","budget_tokens":20000},"output_config":{"effort":"xhigh"}}"#,
         );
 
-        let outbound = external_pool_outbound_body(&route);
+        let pool = test_pool("https://example.com/v1", true);
+        let outbound = external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
@@ -4076,7 +4248,8 @@ mod tests {
             br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
         );
 
-        let outbound = external_pool_outbound_body(&route);
+        let pool = test_pool_with_model_dot_normalization();
+        let outbound = external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
@@ -4104,7 +4277,8 @@ mod tests {
             br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"/9j/stale"}}]}],"stream":true}"#,
         );
 
-        let outbound = external_pool_outbound_body(&route);
+        let pool = test_pool_with_model_dot_normalization();
+        let outbound = external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
@@ -4135,7 +4309,8 @@ mod tests {
             br#"{"model":"claude-opus-4-5-20251101","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"adaptive","budget_tokens":20000},"output_config":{"effort":"xhigh"}}"#,
         );
 
-        let outbound = external_pool_outbound_body(&route);
+        let pool = test_pool_with_model_dot_normalization();
+        let outbound = external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
@@ -4149,11 +4324,178 @@ mod tests {
     fn external_pool_outbound_body_normalizes_payload_claude_model_without_mapping() {
         let route = test_route("claude-haiku-4.5");
 
-        let outbound = external_pool_outbound_body(&route);
+        let pool = test_pool_with_model_dot_normalization();
+        let outbound = external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
         assert_eq!(value["model"], "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn external_pool_outbound_body_preserves_dot_model_when_pool_normalization_disabled() {
+        let route = test_route("claude-haiku-4.5");
+        let pool = test_pool("https://example.com/v1", true);
+
+        let outbound = external_pool_outbound_body(&route, &pool);
+        let value: serde_json::Value =
+            serde_json::from_slice(&outbound).expect("parse outbound body");
+
+        assert_eq!(value["model"], "claude-haiku-4.5");
+    }
+
+    #[test]
+    fn external_pool_outbound_body_passthrough_uses_original_request_model() {
+        let mut route = test_route("claude-sonnet-4-5-20250929");
+        route.upstream_model = Some("claude-sonnet-4.5".to_string());
+        route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        );
+        let mut pool = test_pool_with_model_dot_normalization();
+        pool.model_mapping_mode = ExternalPoolModelMappingMode::Passthrough;
+        pool.model_mapping_rules = vec![model_rule("claude-sonnet-4-5-20250929", "custom-sonnet")];
+
+        let outbound = external_pool_outbound_body(&route, &pool);
+        let value: serde_json::Value =
+            serde_json::from_slice(&outbound).expect("parse outbound body");
+
+        assert_eq!(value["model"], "claude-sonnet-4-5-20250929");
+    }
+
+    #[test]
+    fn external_pool_outbound_body_direct_mapping_uses_original_model() {
+        let mut route = test_route("claude-sonnet-4-5-20250929");
+        route.upstream_model = Some("claude-sonnet-4.5".to_string());
+        route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        );
+        let mut pool = test_pool_with_model_dot_normalization();
+        pool.model_mapping_mode = ExternalPoolModelMappingMode::DirectMapping;
+        pool.model_mapping_rules =
+            vec![model_rule("claude-sonnet-4-5-20250929", "external-sonnet")];
+
+        let outbound = external_pool_outbound_body(&route, &pool);
+        let value: serde_json::Value =
+            serde_json::from_slice(&outbound).expect("parse outbound body");
+
+        assert_eq!(value["model"], "external-sonnet");
+    }
+
+    #[test]
+    fn external_pool_outbound_body_processed_mapping_uses_upstream_model() {
+        let mut route = test_route("claude-sonnet-4-5-20250929");
+        route.upstream_model = Some("claude-sonnet-4.5".to_string());
+        route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        );
+        let mut pool = test_pool_with_model_dot_normalization();
+        pool.model_mapping_mode = ExternalPoolModelMappingMode::ProcessedMapping;
+        pool.model_mapping_rules = vec![model_rule("claude-sonnet-4.5", "external-sonnet")];
+
+        let outbound = external_pool_outbound_body(&route, &pool);
+        let value: serde_json::Value =
+            serde_json::from_slice(&outbound).expect("parse outbound body");
+
+        assert_eq!(value["model"], "external-sonnet");
+    }
+
+    #[test]
+    fn external_pool_outbound_body_mapping_miss_falls_back_to_existing_conversion() {
+        let mut route = test_route("claude-sonnet-4-5-20250929");
+        route.upstream_model = Some("claude-sonnet-4.5".to_string());
+        route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        );
+        let mut pool = test_pool_with_model_dot_normalization();
+        pool.model_mapping_mode = ExternalPoolModelMappingMode::DirectMapping;
+        pool.model_mapping_rules = vec![model_rule("claude-opus-4.8", "external-opus")];
+
+        let outbound = external_pool_outbound_body(&route, &pool);
+        let value: serde_json::Value =
+            serde_json::from_slice(&outbound).expect("parse outbound body");
+
+        assert_eq!(value["model"], "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn external_pool_outbound_body_mapping_target_is_final() {
+        let mut route = test_route("claude-sonnet-4-5-20250929");
+        route.upstream_model = Some("claude-sonnet-4.5".to_string());
+        route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        );
+        let mut pool = test_pool_with_model_dot_normalization();
+        pool.model_mapping_mode = ExternalPoolModelMappingMode::ProcessedMapping;
+        pool.model_mapping_rules = vec![model_rule("claude-sonnet-4.5", "claude-sonnet-4.5")];
+
+        let outbound = external_pool_outbound_body(&route, &pool);
+        let value: serde_json::Value =
+            serde_json::from_slice(&outbound).expect("parse outbound body");
+
+        assert_eq!(value["model"], "claude-sonnet-4.5");
+    }
+
+    #[test]
+    fn external_pool_mapping_rules_normalize_and_match_on_call_path() {
+        let mut route = test_route("claude-sonnet-4-5-20250929");
+        route.upstream_model = Some("claude-sonnet-4.5".to_string());
+        route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        );
+        let mut pool = test_pool_with_model_dot_normalization();
+        pool.model_mapping_mode = ExternalPoolModelMappingMode::ProcessedMapping;
+        pool.model_mapping_rules = normalize_external_pool_model_mapping_rules(vec![
+            model_rule("  CLAUDE-SONNET-4.5  ", "  CLAUDE-SONNET-4-5  "),
+            model_rule("", "ignored-target"),
+            model_rule("ignored-source", ""),
+        ]);
+
+        let outbound = external_pool_outbound_body(&route, &pool);
+        let value: serde_json::Value =
+            serde_json::from_slice(&outbound).expect("parse outbound body");
+
+        assert_eq!(pool.model_mapping_rules.len(), 1);
+        assert_eq!(pool.model_mapping_rules[0].target, "CLAUDE-SONNET-4-5");
+        assert_eq!(value["model"], "CLAUDE-SONNET-4-5");
+    }
+
+    #[test]
+    fn external_pool_mapping_supports_common_direct_date_to_dot_rule() {
+        let mut route = test_route("claude-opus-4-5-20251101");
+        route.upstream_model = Some("claude-opus-4.5".to_string());
+        route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-opus-4-5-20251101","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        );
+        let mut pool = test_pool_with_model_dot_normalization();
+        pool.model_mapping_mode = ExternalPoolModelMappingMode::DirectMapping;
+        pool.model_mapping_rules = vec![model_rule("claude-opus-4-5-20251101", "claude-opus-4.5")];
+
+        let outbound = external_pool_outbound_body(&route, &pool);
+        let value: serde_json::Value =
+            serde_json::from_slice(&outbound).expect("parse outbound body");
+
+        assert_eq!(value["model"], "claude-opus-4.5");
+    }
+
+    #[test]
+    fn external_pool_mapping_supports_common_processed_thinking_to_dash_rule() {
+        let mut route = test_route("claude-opus-4-8-thinking");
+        route.upstream_model = Some("claude-opus-4.8-thinking".to_string());
+        route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-opus-4-8-thinking","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        );
+        let mut pool = test_pool("https://example.com/v1", true);
+        pool.model_mapping_mode = ExternalPoolModelMappingMode::ProcessedMapping;
+        pool.model_mapping_rules = vec![model_rule(
+            "claude-opus-4.8-thinking",
+            "claude-opus-4-8-thinking",
+        )];
+
+        let outbound = external_pool_outbound_body(&route, &pool);
+        let value: serde_json::Value =
+            serde_json::from_slice(&outbound).expect("parse outbound body");
+
+        assert_eq!(value["model"], "claude-opus-4-8-thinking");
     }
 
     #[test]
@@ -4187,7 +4529,8 @@ mod tests {
             br#"{"model":"claude-opus-4-7","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"disabled","budget_tokens":20000}}"#,
         );
 
-        let outbound = external_pool_outbound_body(&route);
+        let pool = test_pool("https://example.com/v1", true);
+        let outbound = external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
@@ -4206,7 +4549,8 @@ mod tests {
             br#"{"model":"claude-sonnet-4-6-thinking","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":false,"thinking":{"type":"enabled","budget_tokens":12345}}"#,
         );
 
-        let outbound = external_pool_outbound_body(&route);
+        let pool = test_pool("https://example.com/v1", true);
+        let outbound = external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 

@@ -65,6 +65,7 @@ use crate::external_pool::{
 use crate::http_client::response_bytes_with_body_timeout;
 use crate::kiro::call_trace::KiroCredentialAttempt;
 use crate::kiro::provider::{KiroProvider, KiroStreamCompletion};
+use crate::kiro::token_manager::LocalPoolRouteStateKind;
 
 const MAX_REMOTE_MULTIMODAL_BYTES: usize = 20 * 1024 * 1024;
 const UPSTREAM_INVALID_REQUEST_MESSAGE: &str =
@@ -409,7 +410,7 @@ impl ExternalFallbackContext {
     }
 
     async fn should_fail_fast_local(&self) -> bool {
-        if !self.config.local_pool_preflight_enabled {
+        if !local_pool_capacity_fail_fast_enabled(&self.config) {
             return false;
         }
         self.manager.has_available_pool(&self.config).await
@@ -431,6 +432,58 @@ impl ExternalFallbackContext {
                         Some(reason),
                         false,
                         None,
+                        Vec::new(),
+                    ),
+                )
+                .await,
+        )
+    }
+
+    async fn local_pool_preflight_outcome(
+        &self,
+        provider: &KiroProvider,
+        request_id: &str,
+        model: &str,
+    ) -> Option<ExternalPoolForwardOutcome> {
+        if !self.config.local_pool_preflight_enabled {
+            return None;
+        }
+        let state = provider.local_pool_route_state(Some(model));
+        if !state.kind.should_route_external() {
+            return None;
+        }
+        let Some(reason) = local_pool_route_fallback_reason(state.kind, &self.config) else {
+            return None;
+        };
+        if !self.manager.has_eligible_pool(&self.config).await {
+            return None;
+        }
+
+        let reason = reason.to_string();
+        tracing::warn!(
+            request_id,
+            reason = %reason,
+            local_total = state.total,
+            local_available = state.available,
+            local_dispatchable = state.dispatchable,
+            local_usable = state.usable,
+            retry_after_secs = ?state.retry_after_secs,
+            "local credential pool is not immediately schedulable; routing request directly to external pool"
+        );
+        Some(
+            self.manager
+                .forward_with_failover_result(
+                    self.config.clone(),
+                    self.route_request(
+                        request_id.to_string(),
+                        UsageRouteSubtype::ExternalFallbackPreflight,
+                        Some(reason.clone()),
+                        None,
+                        false,
+                        Some(json!({
+                            "reason": reason,
+                            "state": state,
+                        })),
                         Vec::new(),
                     ),
                 )
@@ -651,6 +704,38 @@ impl ExternalFallbackContext {
                 }
             }
         }
+    }
+}
+
+fn local_pool_capacity_fail_fast_enabled(config: &ExternalPoolsConfig) -> bool {
+    config.local_pool_preflight_enabled && config.fallback_on_local_capacity_exhausted
+}
+
+fn local_pool_route_fallback_reason(
+    kind: LocalPoolRouteStateKind,
+    config: &ExternalPoolsConfig,
+) -> Option<&'static str> {
+    match kind {
+        LocalPoolRouteStateKind::Ready => None,
+        LocalPoolRouteStateKind::NoCredentials if config.fallback_on_no_available_credentials => {
+            Some("local_no_credentials")
+        }
+        LocalPoolRouteStateKind::AllDisabled if config.fallback_on_no_available_credentials => {
+            Some("local_all_disabled")
+        }
+        LocalPoolRouteStateKind::ProxyBlocked if config.fallback_on_no_available_credentials => {
+            Some("local_proxy_blocked")
+        }
+        LocalPoolRouteStateKind::NoModelCompatible if config.fallback_on_unsupported_model => {
+            Some("local_no_model_compatible")
+        }
+        LocalPoolRouteStateKind::AllCoolingDown if config.fallback_on_local_transient_exhausted => {
+            Some("local_all_cooling_down")
+        }
+        LocalPoolRouteStateKind::CapacityFull if config.fallback_on_local_capacity_exhausted => {
+            Some("local_capacity_full")
+        }
+        _ => None,
     }
 }
 
@@ -2967,6 +3052,10 @@ async fn post_messages_inner(
             provider,
             &request_body,
             &payload.model,
+            model_resolution
+                .upstream_model
+                .as_deref()
+                .unwrap_or(&payload.model),
             input_tokens,
             usage_context.context_window_tokens,
             thinking_enabled,
@@ -2986,6 +3075,10 @@ async fn post_messages_inner(
             provider,
             &request_body,
             &payload.model,
+            model_resolution
+                .upstream_model
+                .as_deref()
+                .unwrap_or(&payload.model),
             input_tokens,
             extract_thinking,
             tool_name_map,
@@ -3060,7 +3153,11 @@ async fn maybe_external_fallback_after_local_error_outcome(
 fn local_rescue_reason_after_external_error(
     config: &ExternalPoolsConfig,
     err: &ExternalPoolFinalError,
+    local_fallback_reason: Option<&str>,
 ) -> Option<&'static str> {
+    if local_fallback_reason.is_some() {
+        return None;
+    }
     if !config.external_pool_local_rescue_enabled {
         return None;
     }
@@ -3095,6 +3192,7 @@ async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
+    preflight_model: &str,
     input_tokens: i32,
     context_window_tokens: i32,
     thinking_enabled: bool,
@@ -3111,6 +3209,17 @@ async fn handle_stream_request(
     let mut warnings_header = warnings_header;
     let request_id = usage_context.request_id.clone();
     let mut retry_attempt_prefix: Vec<KiroCredentialAttempt> = Vec::new();
+    if let Some(external) = external_fallback.as_ref() {
+        if let Some(outcome) = external
+            .local_pool_preflight_outcome(provider.as_ref(), &request_id, preflight_model)
+            .await
+        {
+            return match outcome {
+                ExternalPoolForwardOutcome::Response(response) => response,
+                ExternalPoolForwardOutcome::FinalError(err) => err.into_response(&request_id),
+            };
+        }
+    }
     let response = match call_api_stream_maybe_fail_fast(
         &provider,
         request_body,
@@ -3181,10 +3290,17 @@ async fn handle_stream_request(
                                 ExternalPoolForwardOutcome::Response(response) => return response,
                                 ExternalPoolForwardOutcome::FinalError(err) => {
                                     if let Some(external) = external_fallback.as_ref() {
+                                        let local_fallback_reason =
+                                            classify_local_error_for_external_fallback(
+                                                &retry_message,
+                                                &all_attempts,
+                                                &external.config,
+                                            );
                                         if let Some(reason) =
                                             local_rescue_reason_after_external_error(
                                                 &external.config,
                                                 &err,
+                                                local_fallback_reason.as_deref(),
                                             )
                                         {
                                             tracing::warn!(
@@ -3285,9 +3401,17 @@ async fn handle_stream_request(
                         ExternalPoolForwardOutcome::Response(response) => return response,
                         ExternalPoolForwardOutcome::FinalError(err) => {
                             if let Some(external) = external_fallback.as_ref() {
-                                if let Some(reason) =
-                                    local_rescue_reason_after_external_error(&external.config, &err)
-                                {
+                                let local_fallback_reason =
+                                    classify_local_error_for_external_fallback(
+                                        &message,
+                                        &attempts,
+                                        &external.config,
+                                    );
+                                if let Some(reason) = local_rescue_reason_after_external_error(
+                                    &external.config,
+                                    &err,
+                                    local_fallback_reason.as_deref(),
+                                ) {
                                     tracing::warn!(
                                         request_id,
                                         reason,
@@ -3626,6 +3750,7 @@ async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
+    preflight_model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: HashMap<String, String>,
@@ -3640,6 +3765,17 @@ async fn handle_non_stream_request(
     let mut warnings_header = warnings_header;
     let request_id = usage_context.request_id.clone();
     let mut retry_attempt_prefix: Vec<KiroCredentialAttempt> = Vec::new();
+    if let Some(external) = external_fallback.as_ref() {
+        if let Some(outcome) = external
+            .local_pool_preflight_outcome(provider.as_ref(), &request_id, preflight_model)
+            .await
+        {
+            return match outcome {
+                ExternalPoolForwardOutcome::Response(response) => response,
+                ExternalPoolForwardOutcome::FinalError(err) => err.into_response(&request_id),
+            };
+        }
+    }
     let api_response = match call_api_maybe_fail_fast(
         &provider,
         request_body,
@@ -3710,10 +3846,17 @@ async fn handle_non_stream_request(
                                 ExternalPoolForwardOutcome::Response(response) => return response,
                                 ExternalPoolForwardOutcome::FinalError(err) => {
                                     if let Some(external) = external_fallback.as_ref() {
+                                        let local_fallback_reason =
+                                            classify_local_error_for_external_fallback(
+                                                &retry_message,
+                                                &all_attempts,
+                                                &external.config,
+                                            );
                                         if let Some(reason) =
                                             local_rescue_reason_after_external_error(
                                                 &external.config,
                                                 &err,
+                                                local_fallback_reason.as_deref(),
                                             )
                                         {
                                             tracing::warn!(
@@ -3814,9 +3957,17 @@ async fn handle_non_stream_request(
                         ExternalPoolForwardOutcome::Response(response) => return response,
                         ExternalPoolForwardOutcome::FinalError(err) => {
                             if let Some(external) = external_fallback.as_ref() {
-                                if let Some(reason) =
-                                    local_rescue_reason_after_external_error(&external.config, &err)
-                                {
+                                let local_fallback_reason =
+                                    classify_local_error_for_external_fallback(
+                                        &message,
+                                        &attempts,
+                                        &external.config,
+                                    );
+                                if let Some(reason) = local_rescue_reason_after_external_error(
+                                    &external.config,
+                                    &err,
+                                    local_fallback_reason.as_deref(),
+                                ) {
                                     tracing::warn!(
                                         request_id,
                                         reason,
@@ -4561,6 +4712,10 @@ pub async fn post_messages_cc(
             provider,
             &request_body,
             &payload.model,
+            model_resolution
+                .upstream_model
+                .as_deref()
+                .unwrap_or(&payload.model),
             input_tokens,
             usage_context.context_window_tokens,
             thinking_enabled,
@@ -4580,6 +4735,10 @@ pub async fn post_messages_cc(
             provider,
             &request_body,
             &payload.model,
+            model_resolution
+                .upstream_model
+                .as_deref()
+                .unwrap_or(&payload.model),
             input_tokens,
             extract_thinking,
             tool_name_map,
@@ -5989,6 +6148,76 @@ mod tests {
     }
 
     #[test]
+    fn local_pool_preflight_reason_respects_scheduler_fallback_toggles() {
+        let mut config = ExternalPoolsConfig::default();
+
+        assert!(local_pool_capacity_fail_fast_enabled(&config));
+        assert_eq!(
+            local_pool_route_fallback_reason(LocalPoolRouteStateKind::NoCredentials, &config),
+            Some("local_no_credentials")
+        );
+        assert_eq!(
+            local_pool_route_fallback_reason(LocalPoolRouteStateKind::AllDisabled, &config),
+            Some("local_all_disabled")
+        );
+        assert_eq!(
+            local_pool_route_fallback_reason(LocalPoolRouteStateKind::ProxyBlocked, &config),
+            Some("local_proxy_blocked")
+        );
+        assert_eq!(
+            local_pool_route_fallback_reason(LocalPoolRouteStateKind::AllCoolingDown, &config),
+            Some("local_all_cooling_down")
+        );
+        assert_eq!(
+            local_pool_route_fallback_reason(LocalPoolRouteStateKind::CapacityFull, &config),
+            Some("local_capacity_full")
+        );
+        assert_eq!(
+            local_pool_route_fallback_reason(LocalPoolRouteStateKind::NoModelCompatible, &config),
+            None
+        );
+
+        config.fallback_on_no_available_credentials = false;
+        assert_eq!(
+            local_pool_route_fallback_reason(LocalPoolRouteStateKind::NoCredentials, &config),
+            None
+        );
+        assert_eq!(
+            local_pool_route_fallback_reason(LocalPoolRouteStateKind::AllDisabled, &config),
+            None
+        );
+        assert_eq!(
+            local_pool_route_fallback_reason(LocalPoolRouteStateKind::ProxyBlocked, &config),
+            None
+        );
+
+        config = ExternalPoolsConfig::default();
+        config.fallback_on_local_transient_exhausted = false;
+        assert_eq!(
+            local_pool_route_fallback_reason(LocalPoolRouteStateKind::AllCoolingDown, &config),
+            None
+        );
+
+        config = ExternalPoolsConfig::default();
+        config.fallback_on_local_capacity_exhausted = false;
+        assert!(!local_pool_capacity_fail_fast_enabled(&config));
+        assert_eq!(
+            local_pool_route_fallback_reason(LocalPoolRouteStateKind::CapacityFull, &config),
+            None
+        );
+
+        config = ExternalPoolsConfig::default();
+        config.fallback_on_unsupported_model = true;
+        assert_eq!(
+            local_pool_route_fallback_reason(LocalPoolRouteStateKind::NoModelCompatible, &config),
+            Some("local_no_model_compatible")
+        );
+
+        config.local_pool_preflight_enabled = false;
+        assert!(!local_pool_capacity_fail_fast_enabled(&config));
+    }
+
+    #[test]
     fn external_fallback_classifier_gates_unsupported_model() {
         let mut config = ExternalPoolsConfig::default();
         config.fallback_on_unsupported_model = false;
@@ -6039,8 +6268,16 @@ mod tests {
             pool_name: Some("backup".to_string()),
         };
         assert_eq!(
-            local_rescue_reason_after_external_error(&config, &rate_limit),
+            local_rescue_reason_after_external_error(&config, &rate_limit, None),
             Some("external_rate_limit")
+        );
+        assert_eq!(
+            local_rescue_reason_after_external_error(
+                &config,
+                &rate_limit,
+                Some("no_available_credentials")
+            ),
+            None
         );
 
         let timeout = ExternalPoolFinalError {
@@ -6054,7 +6291,7 @@ mod tests {
             pool_name: Some("backup".to_string()),
         };
         assert_eq!(
-            local_rescue_reason_after_external_error(&config, &timeout),
+            local_rescue_reason_after_external_error(&config, &timeout, None),
             Some("external_timeout")
         );
 
@@ -6069,7 +6306,7 @@ mod tests {
             pool_name: None,
         };
         assert_eq!(
-            local_rescue_reason_after_external_error(&config, &capacity),
+            local_rescue_reason_after_external_error(&config, &capacity, None),
             Some("external_capacity")
         );
 
@@ -6084,28 +6321,28 @@ mod tests {
             pool_name: Some("backup".to_string()),
         };
         assert_eq!(
-            local_rescue_reason_after_external_error(&config, &bad_request),
+            local_rescue_reason_after_external_error(&config, &bad_request, None),
             None
         );
 
         let mut disabled = config.clone();
         disabled.external_pool_local_rescue_enabled = false;
         assert_eq!(
-            local_rescue_reason_after_external_error(&disabled, &rate_limit),
+            local_rescue_reason_after_external_error(&disabled, &rate_limit, None),
             None
         );
 
         let mut no_rate_limit = config;
         no_rate_limit.external_pool_local_rescue_on_rate_limit = false;
         assert_eq!(
-            local_rescue_reason_after_external_error(&no_rate_limit, &rate_limit),
+            local_rescue_reason_after_external_error(&no_rate_limit, &rate_limit, None),
             None
         );
 
         let mut no_capacity = no_rate_limit;
         no_capacity.external_pool_local_rescue_on_capacity = false;
         assert_eq!(
-            local_rescue_reason_after_external_error(&no_capacity, &capacity),
+            local_rescue_reason_after_external_error(&no_capacity, &capacity, None),
             None
         );
     }
