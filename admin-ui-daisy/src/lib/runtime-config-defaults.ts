@@ -220,13 +220,13 @@ export const emptyRuntimeConfig: RuntimeConfig = {
 export function reportedUsageModeDescription(mode: ReportedUsageFieldMode): string {
   switch (mode) {
     case 'raw':
-      return '原始值表示这个字段不经过本地 high-cache 模拟、放大或路径采样改写。input 使用请求原始 token，output 优先使用上游返回值，缺失时使用本地输出估算。'
+      return '显示服务收到或返回的原始用量，不再额外调整缓存、输入或输出数值。'
     case 'preserve':
-      return '保留计算值表示这个字段使用 high-cache、上游 metadata 或本地估算完成后的缓存计算结果。它不是原始请求值。'
+      return '保留系统已经计算好的展示结果，适合大多数默认场景。'
     case 'sample-max':
-      return '按上限采样改写会把这个字段改写到上限以内，分布偏向较小值，不会固定贴着上限。需要配置“采样上限”。'
+      return '把展示值控制在上限以内，并让数值自然浮动。需要配置“展示上限”。'
     case 'sample-target':
-      return '按目标采样改写会围绕目标值生成自然浮动结果，常规最大值由“目标 tokens × 常规最大倍率”决定，并且不会超过当前可用字段值。'
+      return '让展示值围绕目标值自然浮动，并受最大倍率限制。'
   }
 }
 

@@ -15,10 +15,10 @@ import { UsagePanel } from '@/components/UsagePanel'
 import { UsageDashboardPanel } from '@/components/UsageDashboardPanel'
 import { storage } from '@/lib/storage'
 import type { TabKey, ThemeMode } from '@/types/ui'
-import { getStoredTheme, pageConfig, themeOptions } from '@/types/ui'
+import { getConsoleTabPath, getStoredTheme, getTabFromPathname, pageConfig, themeOptions } from '@/types/ui'
 
 export function Dashboard({ onLogout }: { onLogout: () => void }) {
-  const [activeTab, setActiveTab] = useState<TabKey>('dashboard')
+  const [activeTab, setActiveTab] = useState<TabKey>(() => getTabFromPathname(window.location.pathname))
   const [theme, setTheme] = useState<ThemeMode>(getStoredTheme)
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
@@ -30,6 +30,16 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
     localStorage.setItem('kiro-theme', theme)
   }, [theme])
 
+  useEffect(() => {
+    const handlePopState = () => {
+      setActiveTab(getTabFromPathname(window.location.pathname))
+      setMobileMenuOpen(false)
+    }
+
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
+  }, [])
+
   const handleLogout = () => {
     storage.removeApiKey()
     queryClient.clear()
@@ -37,6 +47,10 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
   }
 
   const handleTabChange = (tab: TabKey) => {
+    const nextPath = getConsoleTabPath(tab)
+    if (window.location.pathname !== nextPath) {
+      window.history.pushState({ tab }, '', nextPath)
+    }
     setActiveTab(tab)
     setMobileMenuOpen(false)
   }
@@ -44,9 +58,10 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
   const currentPage = pageConfig[activeTab]
 
   return (
-    <div className="min-h-screen bg-base-200">
+    <div className="app-shell min-h-screen text-base-content">
+      <div className="command-strip fixed left-0 right-0 top-0 z-50" />
       {/* Desktop Sidebar */}
-      <div className="hidden lg:block">
+      <div className="sidebar-layer hidden lg:block">
         <Sidebar
           activeTab={activeTab}
           collapsed={sidebarCollapsed}
@@ -60,19 +75,19 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         open={mobileMenuOpen}
         onClickOverlay={() => setMobileMenuOpen(false)}
         side={
-          <div className="h-full w-64 bg-base-100">
+          <div className="h-full w-64 bg-base-100/95 backdrop-blur-xl">
             <Sidebar activeTab={activeTab} embedded onTabChange={handleTabChange} />
           </div>
         }
-        className="lg:hidden"
+        className="drawer-layer lg:hidden"
       >
         <div />
       </Drawer>
 
       {/* Main Content */}
-      <div className={`transition-[padding-left] duration-200 ${sidebarCollapsed ? 'lg:pl-16' : 'lg:pl-56'}`}>
+      <div className={`app-content transition-[padding-left] duration-200 ${sidebarCollapsed ? 'lg:pl-16' : 'lg:pl-56'}`}>
         {/* Mobile Header */}
-        <div className="sticky top-0 z-30 flex h-14 items-center gap-3 border-b border-base-300 bg-base-100/80 px-4 backdrop-blur-lg lg:hidden">
+        <div className="top-bar sticky top-0 z-30 flex h-14 items-center gap-3 border-b px-4 backdrop-blur-lg lg:hidden">
           <Button
             type="button"
             color="ghost"
@@ -100,7 +115,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         </div>
 
         {/* Page Content */}
-        <main className="mx-auto max-w-[var(--page-max)] p-4 pb-20 lg:p-6">
+        <main className="relative mx-auto max-w-[var(--page-max)] p-4 pb-20 lg:p-6">
           {activeTab === 'dashboard' && <UsageDashboardPanel />}
           {activeTab === 'credentials' && <CredentialsPanel />}
           {activeTab === 'validation' && <AccountValidationPanel />}
@@ -114,7 +129,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
       </div>
 
       {/* Mobile Bottom Actions */}
-      <div className="fixed bottom-0 left-0 right-0 z-30 flex items-center justify-between border-t border-base-300 bg-base-100/95 px-4 py-2 backdrop-blur-lg lg:hidden">
+      <div className="top-bar fixed bottom-0 left-0 right-0 z-30 flex items-center justify-between border-t px-4 py-2 backdrop-blur-lg lg:hidden">
         <Select
           size="sm"
           value={theme}

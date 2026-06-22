@@ -1,14 +1,14 @@
-import { Command, KeyRound, Sparkles } from 'lucide-react'
+import { Activity, Command, Database, KeyRound, Route, ShieldCheck } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { Alert, Button, Card, Form, Input, Join } from 'react-daisyui'
-import { ADMIN_API_KEY_FIELD, storage } from '@/lib/storage'
+import { Alert, Button, Form, Input, Join } from 'react-daisyui'
+import { storage } from '@/lib/storage'
 import { validateAdminApiKey } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 
-const features = [
-  { title: '凭据调度', desc: '智能负载均衡和故障转移' },
-  { title: 'Usage 追踪', desc: '实时用量统计和费用估算' },
-  { title: '运行配置', desc: '热加载的运行时参数' },
+const signalCards = [
+  { title: '查看状态', desc: '掌握整体情况', icon: <Activity className="h-4 w-4" /> },
+  { title: '管理资源', desc: '维护后台资源', icon: <Database className="h-4 w-4" /> },
+  { title: '调整设置', desc: '统一配置入口', icon: <Route className="h-4 w-4" /> },
 ]
 
 export function LoginPage({ initialError = '', onLogin }: { initialError?: string; onLogin: () => void }) {
@@ -24,7 +24,7 @@ export function LoginPage({ initialError = '', onLogin }: { initialError?: strin
     event.preventDefault()
     const trimmed = adminApiKey.trim()
     if (!trimmed) {
-      setError(`请输入管理后台 Key（${ADMIN_API_KEY_FIELD}）`)
+      setError('请输入登录 Key')
       return
     }
     setSubmitting(true)
@@ -42,74 +42,88 @@ export function LoginPage({ initialError = '', onLogin }: { initialError?: strin
   }
 
   return (
-    <main className="min-h-screen bg-base-200">
-      <div className="mx-auto flex min-h-screen w-full max-w-5xl items-center justify-center px-4 py-8">
-        <Card className="grid w-full overflow-hidden border border-base-300/70 bg-base-100 shadow-xl lg:grid-cols-[1fr_400px]">
+    <main className="auth-shell min-h-screen">
+      <div className="mx-auto flex min-h-screen w-full max-w-6xl items-center justify-center px-4 py-8">
+        <div className="auth-card grid w-full overflow-hidden rounded-box lg:grid-cols-[1.08fr_420px]">
           {/* Left Panel - Branding */}
-          <section className="hidden border-r border-base-300 bg-base-200/50 p-8 lg:block">
+          <section className="auth-visual hidden border-r border-primary/15 p-8 lg:block">
             <div className="flex h-full flex-col justify-between">
               <div>
                 <div className="flex items-center gap-3">
-                  <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-primary text-primary-content shadow-sm">
+                  <div className="brand-mark flex h-10 w-10 items-center justify-center rounded-xl">
                     <Command className="h-5 w-5" />
                   </div>
-                  <span className="text-xl font-bold tracking-tight">Kiro Admin</span>
+                  <span>
+                    <span className="block text-xl font-bold tracking-tight">Kiro Admin</span>
+                    <span className="block text-[0.68rem] font-semibold uppercase text-primary/80">Admin Console</span>
+                  </span>
                 </div>
 
-                <h1 className="mt-12 text-3xl font-bold leading-tight text-base-content">
-                  凭据、缓存、计费
+                <h1 className="mt-12 text-4xl font-bold leading-tight text-base-content">
+                  管理控制台
                   <br />
-                  <span className="text-base-content/65">统一管理后台</span>
+                  <span className="text-primary">简洁、安全、集中</span>
                 </h1>
 
                 <p className="mt-4 max-w-sm text-sm leading-relaxed text-base-content/55">
-                  新版控制台采用现代化设计，提供更直观的凭据管理、实时监控和配置能力。
+                  用于查看状态、管理资源和调整设置。
                 </p>
               </div>
 
-              <div className="space-y-3">
-                {features.map((feature) => (
-                  <div
-                    key={feature.title}
-                    className="flex items-center gap-3 rounded-xl border border-base-300 bg-base-100 p-3 shadow-sm"
-                  >
-                    <Sparkles className="h-4 w-4 shrink-0 text-primary" />
-                    <div>
+              <div className="space-y-4">
+                <div className="grid grid-cols-3 gap-3">
+                  {signalCards.map((feature) => (
+                    <div key={feature.title} className="signal-card rounded-lg p-3">
+                      <div className="mb-3 text-primary">{feature.icon}</div>
                       <div className="text-sm font-semibold">{feature.title}</div>
-                      <div className="text-xs text-base-content/50">{feature.desc}</div>
+                      <div className="text-[0.68rem] text-base-content/45">{feature.desc}</div>
                     </div>
+                  ))}
+                </div>
+                <div className="glass-panel relative overflow-hidden rounded-box p-4">
+                  <div className="mb-4 flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-xs font-semibold uppercase text-base-content/45">安全入口</div>
+                      <div className="mt-1 text-lg font-bold">登录凭证</div>
+                    </div>
+                    <ShieldCheck className="h-6 w-6 text-primary" />
                   </div>
-                ))}
+                  <div className="space-y-2">
+                    <div className="signal-line w-11/12" />
+                    <div className="signal-line signal-line-muted w-8/12" />
+                    <div className="signal-line w-10/12" />
+                  </div>
+                </div>
               </div>
             </div>
           </section>
 
           {/* Right Panel - Login Form */}
-          <section className="p-6 sm:p-8">
+          <section className="bg-base-100/35 p-6 sm:p-8">
             {/* Mobile Logo */}
             <div className="mb-8 flex items-center gap-3 lg:hidden">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-primary text-primary-content">
+              <div className="brand-mark flex h-10 w-10 items-center justify-center rounded-xl">
                 <Command className="h-5 w-5" />
               </div>
               <span className="text-xl font-bold">Kiro Admin</span>
             </div>
 
             <div className="mb-8">
-              <h2 className="text-2xl font-bold tracking-tight">欢迎回来</h2>
+              <h2 className="text-2xl font-bold tracking-tight">控制台登录</h2>
               <p className="mt-2 text-sm text-base-content/60">
-                输入启动配置里的管理后台 Key（{ADMIN_API_KEY_FIELD}）进入控制台
+                输入登录 Key 进入管理控制台
               </p>
             </div>
 
             <Form className="space-y-5" onSubmit={handleSubmit}>
               <div className="space-y-2">
                 <label className="text-sm font-medium text-base-content/70">
-                  管理后台 Key（{ADMIN_API_KEY_FIELD}）
+                  登录 Key
                 </label>
                 <Join className="w-full">
                   <Button
                     type="button"
-                    className="join-item cursor-default border-base-300 bg-base-200"
+                    className="join-item cursor-default border-primary/20 bg-base-200/70"
                   >
                     <KeyRound className="h-4 w-4 text-base-content/50" />
                   </Button>
@@ -122,11 +136,11 @@ export function LoginPage({ initialError = '', onLogin }: { initialError?: strin
                       setAdminApiKey(event.target.value)
                       setError('')
                     }}
-                    placeholder="sk-admin-..."
+                    placeholder="请输入登录 Key"
                   />
                 </Join>
                 <p className="text-xs leading-5 text-base-content/50">
-                  对应配置字段 <span className="font-mono">{ADMIN_API_KEY_FIELD}</span>，请求时作为 <span className="font-mono">x-api-key</span> 发送；它不是 Kiro 凭据的 API Key。
+                  请使用管理员提供的后台登录凭证。
                 </p>
               </div>
 
@@ -147,10 +161,10 @@ export function LoginPage({ initialError = '', onLogin }: { initialError?: strin
             </Form>
 
             <div className="mt-8 text-center text-xs text-base-content/40">
-              Kiro Admin Console v2.0
+              Kiro Admin Console
             </div>
           </section>
-        </Card>
+        </div>
       </div>
     </main>
   )

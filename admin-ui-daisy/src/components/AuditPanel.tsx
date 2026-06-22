@@ -21,7 +21,7 @@ function actionLabel(action: string): string {
     update_runtime_config: '更新运行配置',
     sync_model_pricing: '同步模型价格',
     export_credentials: '导出凭据',
-    clear_usage_records: '清空 Usage 展示',
+    clear_usage_records: '清空用量展示',
   }
   return labels[action] || action
 }
@@ -31,7 +31,7 @@ function objectLabel(type: string): string {
     credential: '凭据',
     runtime_config: '运行配置',
     model_pricing: '模型价格',
-    usage_record: 'Usage',
+    usage_record: '用量记录',
   }
   return labels[type] || type
 }

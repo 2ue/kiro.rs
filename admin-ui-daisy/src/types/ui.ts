@@ -1,37 +1,73 @@
 export type TabKey = 'dashboard' | 'credentials' | 'validation' | 'proxies' | 'external' | 'usage' | 'pricing' | 'audit' | 'config'
 
-export type ThemeMode = 'kiroOfficial' | 'kiroLavender' | 'kiroFocus'
+export type ThemeMode = 'noirGold' | 'auroraCircuit' | 'emberVault'
 
-export const DEFAULT_THEME: ThemeMode = 'kiroOfficial'
+export const DEFAULT_THEME: ThemeMode = 'noirGold'
+
+export const CONSOLE_BASE_PATH = '/console'
+
+export const tabPathSegments: Record<TabKey, string> = {
+  dashboard: 'dashboard',
+  credentials: 'credentials',
+  validation: 'validation',
+  proxies: 'proxies',
+  external: 'external-pools',
+  usage: 'usage',
+  pricing: 'pricing',
+  audit: 'audit',
+  config: 'config',
+}
+
+const segmentToTab = Object.entries(tabPathSegments).reduce<Record<string, TabKey>>((acc, [tab, segment]) => {
+  acc[segment] = tab as TabKey
+  return acc
+}, {
+  external: 'external',
+})
+
+export function getConsoleTabPath(tab: TabKey): string {
+  return `${CONSOLE_BASE_PATH}/${tabPathSegments[tab]}`
+}
+
+export function getTabFromPathname(pathname: string): TabKey {
+  const normalized = pathname.replace(/\/+$/, '') || CONSOLE_BASE_PATH
+  if (normalized === CONSOLE_BASE_PATH) return 'dashboard'
+
+  const prefix = `${CONSOLE_BASE_PATH}/`
+  if (!normalized.startsWith(prefix)) return 'dashboard'
+
+  const [segment] = normalized.slice(prefix.length).split('/')
+  return segmentToTab[segment] ?? 'dashboard'
+}
 
 export const themeOptions: Array<{
   key: ThemeMode
   label: string
   description: string
-  swatch: string
+  swatches: string[]
 }> = [
   {
-    key: 'kiroOfficial',
-    label: '官方紫',
-    description: 'Kiro 官方紫，默认品牌主题',
-    swatch: '#9046FF',
+    key: 'noirGold',
+    label: '黑金简约',
+    description: '纯暗底、金色强调，去掉装饰纹理',
+    swatches: ['#080808', '#11100E', '#E8C160', '#B98D3A'],
   },
   {
-    key: 'kiroLavender',
-    label: '柔和紫',
-    description: '低饱和紫调，适合长时间查看',
-    swatch: '#7C3AED',
+    key: 'auroraCircuit',
+    label: '极光电路',
+    description: '青色主轴，紫色与荧光绿做层级',
+    swatches: ['#090B12', '#22D3EE', '#A78BFA', '#A3E635'],
   },
   {
-    key: 'kiroFocus',
-    label: '深紫',
-    description: '更强对比的紫色强调',
-    swatch: '#6D28D9',
+    key: 'emberVault',
+    label: '赤金机房',
+    description: '赤金强调，粉红和薄荷绿区分状态',
+    swatches: ['#0E0A0D', '#FFB020', '#FF5C8A', '#2DD4BF'],
   },
 ]
 
 export function isThemeMode(value: string | null | undefined): value is ThemeMode {
-  return value === 'kiroOfficial' || value === 'kiroLavender' || value === 'kiroFocus'
+  return value === 'noirGold' || value === 'auroraCircuit' || value === 'emberVault'
 }
 
 export function getStoredTheme(): ThemeMode {
@@ -40,13 +76,13 @@ export function getStoredTheme(): ThemeMode {
 }
 
 export const pageConfig: Record<TabKey, { title: string; subtitle: string }> = {
-  dashboard: { title: '总览', subtitle: '查看请求聚合、趋势、错误率和 Top 维度统计' },
-  credentials: { title: '凭据管理', subtitle: '管理 API 凭据、账号状态和调度配置' },
-  validation: { title: '账号校验', subtitle: '批量校验账号订阅状态和额度' },
-  proxies: { title: '代理资源', subtitle: '配置和管理代理服务器资源' },
-  external: { title: '备用号池', subtitle: '配置外部备用池、直连策略和 fallback 调度' },
-  usage: { title: '用量', subtitle: '查看聚合总览、请求列表和费用估算' },
-  pricing: { title: '模型价格', subtitle: '配置模型定价和计费规则' },
-  audit: { title: '审计日志', subtitle: '查看系统操作日志和变更记录' },
-  config: { title: '运行配置', subtitle: '调整调度、缓存和兼容性参数' },
+  dashboard: { title: '总览', subtitle: '快速了解系统状态和关键变化' },
+  credentials: { title: '凭据管理', subtitle: '维护账号资源，保持服务稳定' },
+  validation: { title: '账号校验', subtitle: '检查账号可用性，减少异常影响' },
+  proxies: { title: '代理资源', subtitle: '维护网络资源和连通状态' },
+  external: { title: '备用号池', subtitle: '维护备用资源，提高服务可用性' },
+  usage: { title: '用量', subtitle: '查看使用情况和成本变化' },
+  pricing: { title: '模型价格', subtitle: '维护价格信息，辅助成本核算' },
+  audit: { title: '审计日志', subtitle: '查看关键操作记录' },
+  config: { title: '运行配置', subtitle: '调整基础设置，控制运行表现' },
 }

@@ -61,7 +61,7 @@ export default function App() {
     const handleAuthFailed = () => {
       storage.removeApiKey()
       queryClient.clear()
-      setAuthError('登录已失效，请重新输入管理后台 Key（adminApiKey）')
+      setAuthError('登录已失效，请重新输入管理后台 Key')
       setLoggedIn(false)
     }
 
@@ -71,8 +71,8 @@ export default function App() {
 
   if (checkingAuth) {
     return (
-      <main className="flex min-h-screen items-center justify-center bg-base-200">
-        <div className="text-center">
+      <main className="auth-shell flex min-h-screen items-center justify-center">
+        <div className="glass-panel relative overflow-hidden rounded-box px-8 py-7 text-center">
           <span className="loading loading-spinner loading-lg text-primary" />
           <p className="mt-4 text-sm text-base-content/60">验证登录状态...</p>
         </div>

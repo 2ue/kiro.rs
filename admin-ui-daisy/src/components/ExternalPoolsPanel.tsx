@@ -54,7 +54,7 @@ type ExternalPoolModelMappingPreset = {
 
 const DIRECT_MODEL_MAPPING_PRESETS: ExternalPoolModelMappingPreset[] = [
   { label: 'Sonnet 4 完整ID→4', source: 'claude-sonnet-4-20250514', target: 'claude-sonnet-4', tone: 'blue' },
-  { label: 'Sonnet 4透传', source: 'claude-sonnet-4', target: 'claude-sonnet-4', tone: 'blue' },
+  { label: 'Sonnet 4 原样', source: 'claude-sonnet-4', target: 'claude-sonnet-4', tone: 'blue' },
   { label: 'Sonnet 4.5 完整ID→4.5', source: 'claude-sonnet-4-5-20250929', target: 'claude-sonnet-4.5', tone: 'blue' },
   { label: 'Sonnet 4.5→4.5', source: 'claude-sonnet-4-5', target: 'claude-sonnet-4.5', tone: 'blue' },
   { label: 'Sonnet 4.5 点号', source: 'claude-sonnet-4.5', target: 'claude-sonnet-4.5', tone: 'blue' },
@@ -83,15 +83,15 @@ const DIRECT_MODEL_MAPPING_PRESETS: ExternalPoolModelMappingPreset[] = [
 ]
 
 const PROCESSED_MODEL_MAPPING_PRESETS: ExternalPoolModelMappingPreset[] = [
-  { label: 'Sonnet 4透传', source: 'claude-sonnet-4', target: 'claude-sonnet-4', tone: 'blue' },
+  { label: 'Sonnet 4 原样', source: 'claude-sonnet-4', target: 'claude-sonnet-4', tone: 'blue' },
   { label: 'Sonnet 4.5→4-5', source: 'claude-sonnet-4.5', target: 'claude-sonnet-4-5', tone: 'cyan' },
-  { label: 'Sonnet 4-5透传', source: 'claude-sonnet-4-5', target: 'claude-sonnet-4-5', tone: 'cyan' },
+  { label: 'Sonnet 4-5 原样', source: 'claude-sonnet-4-5', target: 'claude-sonnet-4-5', tone: 'cyan' },
   { label: 'Sonnet 4.6→4-6', source: 'claude-sonnet-4.6', target: 'claude-sonnet-4-6', tone: 'cyan' },
-  { label: 'Sonnet 4-6透传', source: 'claude-sonnet-4-6', target: 'claude-sonnet-4-6', tone: 'cyan' },
+  { label: 'Sonnet 4-6 原样', source: 'claude-sonnet-4-6', target: 'claude-sonnet-4-6', tone: 'cyan' },
   { label: 'Sonnet 4.7→4-7', source: 'claude-sonnet-4.7', target: 'claude-sonnet-4-7', tone: 'cyan' },
   { label: 'Sonnet 4.8→4-8', source: 'claude-sonnet-4.8', target: 'claude-sonnet-4-8', tone: 'cyan' },
   { label: 'Opus 4.5→4-5', source: 'claude-opus-4.5', target: 'claude-opus-4-5', tone: 'purple' },
-  { label: 'Opus 4-5透传', source: 'claude-opus-4-5', target: 'claude-opus-4-5', tone: 'purple' },
+  { label: 'Opus 4-5 原样', source: 'claude-opus-4-5', target: 'claude-opus-4-5', tone: 'purple' },
   { label: 'Opus 4.5 thinking→4-5', source: 'claude-opus-4.5-thinking', target: 'claude-opus-4-5-thinking', tone: 'purple' },
   { label: 'Opus 4-5 thinking', source: 'claude-opus-4-5-thinking', target: 'claude-opus-4-5-thinking', tone: 'purple' },
   { label: 'Opus 4.6→4-6', source: 'claude-opus-4.6', target: 'claude-opus-4-6', tone: 'purple' },
@@ -100,7 +100,7 @@ const PROCESSED_MODEL_MAPPING_PRESETS: ExternalPoolModelMappingPreset[] = [
   { label: 'Opus 4.8→4-8', source: 'claude-opus-4.8', target: 'claude-opus-4-8', tone: 'purple' },
   { label: 'Opus 4.8 thinking', source: 'claude-opus-4.8-thinking', target: 'claude-opus-4-8-thinking', tone: 'purple' },
   { label: 'Haiku 4.5→4-5', source: 'claude-haiku-4.5', target: 'claude-haiku-4-5', tone: 'emerald' },
-  { label: 'Haiku 4-5透传', source: 'claude-haiku-4-5', target: 'claude-haiku-4-5', tone: 'emerald' },
+  { label: 'Haiku 4-5 原样', source: 'claude-haiku-4-5', target: 'claude-haiku-4-5', tone: 'emerald' },
   { label: '3.5 Sonnet→3-5', source: 'claude-3.5-sonnet', target: 'claude-3-5-sonnet', tone: 'amber' },
   { label: '3.5 Haiku→3-5', source: 'claude-3.5-haiku', target: 'claude-3-5-haiku', tone: 'emerald' },
 ]
@@ -389,7 +389,7 @@ export function ExternalPoolsPanel() {
             <SummaryItem label="入口策略" value={fallbackActive || directPolicyActive ? '已配置' : '未配置'} />
             <SummaryItem label="可调度外部池" value={`${dispatchablePools}/${totalPools}`} />
             <SummaryItem label="外部池并发" value={`${totalInFlight}/${totalCapacity || 0}`} />
-            <SummaryItem label="按路径整形池" value={`${currentPathPoolCount} 个`} />
+            <SummaryItem label="按入口规则池" value={`${currentPathPoolCount} 个`} />
           </div>
 
           <PolicyBlock
@@ -500,26 +500,26 @@ export function ExternalPoolsPanel() {
           </PolicyBlock>
 
           <PolicyBlock
-            title="5. 返回给下游的 usage"
+            title="5. 返回给客户端的用量"
             active={externalEnabled && usageCompensationActive}
-            description="只影响选择“按路径整形”的外部池。本地凭证和“严格透传”的外部池不会受影响。"
+            description="只影响选择“按入口规则展示”的外部池。本地凭据和“保持原样”的外部池不会受影响。"
           >
             <div className="space-y-4">
               <HintBox>
-                生效条件：请求进入外部池，并且该外部池的 Usage 模式为“按路径整形”。如果外部池是“严格透传”，下面配置不会改写 usage。
+                生效条件：请求进入外部池，并且该外部池的用量模式为“按入口规则展示”。如果外部池选择“保持原样”，下面配置不会改动用量展示。
               </HintBox>
               <div className="grid gap-4 lg:grid-cols-2">
-                <FormSection title="缓存读写补偿" description="按路径整形后，对上报的 cache read/write token 做补偿。">
+                <FormSection title="缓存读写补偿" description="按入口规则展示时，对缓存读写用量做补偿。">
                   <div className="grid gap-3 sm:grid-cols-2">
                     <ToggleRow disabled={!externalEnabled} label="启用缓存补偿" checked={cacheUpliftActive} onChange={setCacheUpliftEnabled} />
                     <NumberBox disabled={!cacheUpliftActive} label="放大百分比" suffix="%" value={configDraft.externalPoolUsageProjectionUpliftPercent} onChange={(externalPoolUsageProjectionUpliftPercent) => setConfigDraft((prev) => ({ ...prev, externalPoolUsageProjectionUpliftPercent }))} />
                   </div>
                 </FormSection>
 
-                <FormSection title="输出 token 补偿" description="当输出达到阈值后，放大最终上报给下游的 output_tokens。">
+                <FormSection title="输出用量补偿" description="当输出达到阈值后，放大最终展示给客户端的输出用量。">
                   <div className="grid gap-3 sm:grid-cols-3">
                     <ToggleRow disabled={!externalEnabled} label="启用输出补偿" checked={outputUpliftActive} onChange={setOutputUpliftEnabled} />
-                    <NumberBox disabled={!outputUpliftActive} label="输出阈值" suffix="tokens" value={configDraft.externalPoolUsageProjectionOutputUpliftMinTokens} onChange={(externalPoolUsageProjectionOutputUpliftMinTokens) => setConfigDraft((prev) => ({ ...prev, externalPoolUsageProjectionOutputUpliftMinTokens }))} />
+                    <NumberBox disabled={!outputUpliftActive} label="输出阈值" suffix="Token" value={configDraft.externalPoolUsageProjectionOutputUpliftMinTokens} onChange={(externalPoolUsageProjectionOutputUpliftMinTokens) => setConfigDraft((prev) => ({ ...prev, externalPoolUsageProjectionOutputUpliftMinTokens }))} />
                     <NumberBox disabled={!outputUpliftActive} label="放大百分比" suffix="%" value={configDraft.externalPoolUsageProjectionOutputUpliftPercent} onChange={(externalPoolUsageProjectionOutputUpliftPercent) => setConfigDraft((prev) => ({ ...prev, externalPoolUsageProjectionOutputUpliftPercent }))} />
                   </div>
                 </FormSection>
@@ -553,7 +553,7 @@ export function ExternalPoolsPanel() {
                     <Badge tone={runtime?.dispatchable ? 'info' : 'neutral'}>{runtime?.dispatchable ? '可调度' : runtime?.skippedReason || '不可调度'}</Badge>
                   </div>
                   <div className="text-sm text-base-content/70">{pool.baseUrl} · {pool.maskedApiKey || '未显示 Key'} · 并发 {runtime?.inFlight ?? 0}/{pool.maxConcurrentRequests} · 优先级 {pool.priority}</div>
-                  <div className="text-xs text-base-content/50">{poolUsageSummary(pool, configDraft)} · auth: {authLabel(pool.authType)} · model: {poolModelMappingSummary(pool)} · request: /v1/messages {runtime?.cooldownRemainingSecs ? `· 冷却 ${runtime.cooldownRemainingSecs}s` : ''}</div>
+                  <div className="text-xs text-base-content/50">{poolUsageSummary(pool, configDraft)} · 认证：{authLabel(pool.authType)} · 模型：{poolModelMappingSummary(pool)} {runtime?.cooldownRemainingSecs ? `· 冷却 ${runtime.cooldownRemainingSecs}s` : ''}</div>
                   {pool.autoDisabledLastError && <div className="text-xs text-error">{pool.autoDisabledLastError}</div>}
                 </div>
                 <div className="flex flex-wrap gap-2">
@@ -688,14 +688,14 @@ function ExternalPoolFormModal({
       }
     >
       <div className="space-y-4">
-        <FormSection title="连接信息" description="系统会使用这里的 Base URL 和 Key 调用外部池自己的 /v1/messages。">
+        <FormSection title="连接信息" description="系统会使用这里的服务地址和 Key 连接备用资源。">
           <div className="grid gap-3 md:grid-cols-2">
             <TextBox label="名称" value={draft.name} disabled={saving} onChange={(name) => onDraftChange((prev) => ({ ...prev, name }))} />
             <SelectBox label="认证方式" value={draft.authType} disabled={saving} onChange={(authType) => onDraftChange((prev) => ({ ...prev, authType: authType as ExternalPoolFormDraft['authType'] }))}>
               <option value="bearer">Authorization: Bearer &lt;key&gt;</option>
               <option value="x_api_key">x-api-key: &lt;key&gt;</option>
             </SelectBox>
-            <TextBox className="md:col-span-2" label="Base URL" description="填写到域名或 /v1 均可；不要填写 /cc，外部池请求路径固定为 /v1/messages。" value={draft.baseUrl} disabled={saving} onChange={(baseUrl) => onDraftChange((prev) => ({ ...prev, baseUrl }))} />
+            <TextBox className="md:col-span-2" label="服务地址" description="填写服务地址即可，通常不需要带具体请求路径。" value={draft.baseUrl} disabled={saving} onChange={(baseUrl) => onDraftChange((prev) => ({ ...prev, baseUrl }))} />
             <TextBox className="md:col-span-2" label={keyLabel} description={keyDescription} value={draft.apiKey} disabled={saving} onChange={(apiKey) => onDraftChange((prev) => ({ ...prev, apiKey }))} />
           </div>
         </FormSection>
@@ -710,11 +710,11 @@ function ExternalPoolFormModal({
             </div>
           </FormSection>
 
-          <FormSection title="Usage 与成本" description="只控制当前外部池返回给下游的 usage 口径。">
+          <FormSection title="用量与成本" description="只控制当前外部池返回给客户端的用量展示方式。">
             <div className="space-y-3">
-              <SelectBox label="Usage 上报模式" value={draft.usageProjectionMode} disabled={saving} onChange={(usageProjectionMode) => onDraftChange((prev) => ({ ...prev, usageProjectionMode: usageProjectionMode as ExternalPoolFormDraft['usageProjectionMode'] }))}>
-                <option value="pass_through">严格透传：不改外部池 usage</option>
-                <option value="current_path_policy">按当前路径整形：重写 usage 并应用全局补偿</option>
+              <SelectBox label="用量展示模式" value={draft.usageProjectionMode} disabled={saving} onChange={(usageProjectionMode) => onDraftChange((prev) => ({ ...prev, usageProjectionMode: usageProjectionMode as ExternalPoolFormDraft['usageProjectionMode'] }))}>
+                <option value="pass_through">保持原样：不改备用资源用量</option>
+                <option value="current_path_policy">按入口规则展示：应用全局补偿</option>
               </SelectBox>
               <HintBox>{usageProjectionDescription(draft.usageProjectionMode)}</HintBox>
             </div>
@@ -725,8 +725,8 @@ function ExternalPoolFormModal({
           <div className="grid gap-3 md:grid-cols-[240px_1fr]">
             <div className="space-y-3">
               <SelectBox label="映射模式" value={draft.modelMappingMode} disabled={saving} onChange={(modelMappingMode) => onDraftChange((prev) => ({ ...prev, modelMappingMode: modelMappingMode as ExternalPoolFormDraft['modelMappingMode'] }))}>
-                <option value="passthrough">直接透传请求模型</option>
-                <option value="passthrough_mapping">透传模型优先映射</option>
+                <option value="passthrough">直接使用请求模型</option>
+                <option value="passthrough_mapping">请求模型优先映射</option>
                 <option value="direct_mapping">映射后内部处理</option>
                 <option value="processed_mapping">内部处理后映射</option>
               </SelectBox>
@@ -1167,17 +1167,17 @@ function modelMappingPresetClass(tone: ExternalPoolModelMappingPreset['tone']) {
 
 function modelMappingDescription(mode: ExternalPool['modelMappingMode'] | undefined, normalizeFallback: boolean) {
   const processedFallback = normalizeFallback ? '未命中后使用内部处理模型，并把数字点号转横杠。' : '未命中后使用内部处理模型。'
-  if (mode === 'passthrough') return '直接发送下游请求里的原始模型，不应用映射规则和兜底转换。'
-  if (mode === 'passthrough_mapping') return '用下游原始请求模型匹配规则；未命中时仍原样透传请求模型。'
-  if (mode === 'direct_mapping') return `用下游原始请求模型匹配规则；${processedFallback}`
+  if (mode === 'passthrough') return '直接使用客户端请求里的模型，不应用映射规则和兜底转换。'
+  if (mode === 'passthrough_mapping') return '先用客户端请求模型匹配规则；未命中时仍使用原请求模型。'
+  if (mode === 'direct_mapping') return `用客户端请求模型匹配规则；${processedFallback}`
   return `先使用本系统解析后的模型匹配规则；${processedFallback}`
 }
 
 function poolModelMappingSummary(pool: ExternalPool) {
-  if (pool.modelMappingMode === 'passthrough') return '透传'
+  if (pool.modelMappingMode === 'passthrough') return '原样'
   const count = pool.modelMappingRules?.length || 0
   const mode = pool.modelMappingMode === 'passthrough_mapping'
-    ? '透传+映射'
+    ? '原样+映射'
     : pool.modelMappingMode === 'direct_mapping'
       ? '映射+内部'
       : '内部+映射'
@@ -1187,16 +1187,16 @@ function poolModelMappingSummary(pool: ExternalPool) {
 
 function usageProjectionDescription(mode: ExternalPool['usageProjectionMode'] | undefined) {
   if (mode === 'current_path_policy') {
-    return '按当前请求路径重新整理 usage，并应用全局 usage 补偿。适合希望外部池返回特征和本地路径一致的场景。'
+    return '按当前入口规则整理用量，并应用全局用量补偿。适合希望备用资源展示方式和本地入口一致的场景。'
   }
-  return '严格透传外部池返回的 usage，不应用缓存补偿和输出补偿。适合只把外部池当作直接上游。'
+  return '保持备用资源返回的用量，不应用缓存补偿和输出补偿。适合只做备用连接的场景。'
 }
 
 function poolUsageSummary(pool: ExternalPool, config: ExternalPoolsConfig) {
   if (pool.usageProjectionMode !== 'current_path_policy') {
-    return 'Usage: 严格透传'
+    return '用量：保持原样'
   }
-  const parts = ['Usage: 按路径整形']
+  const parts = ['用量：按入口规则']
   if (config.externalPoolUsageProjectionUpliftPercent > 0) {
     parts.push(`缓存 +${config.externalPoolUsageProjectionUpliftPercent}%`)
   }

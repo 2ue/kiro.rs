@@ -43,8 +43,8 @@ function formatLatency(value?: number): string {
 
 function sourceLabel(source: UsageSource): string {
   const labels: Record<UsageSource, string> = {
-    upstream_metadata: '上游 metadata',
-    local_prompt_cache: '本地 prompt cache',
+    upstream_metadata: '服务返回用量',
+    local_prompt_cache: '本地缓存估算',
     context_estimate: '上下文估算',
     request_estimate: '请求估算',
     none: '无缓存',
@@ -57,7 +57,7 @@ function statusLabel(status: string): string {
     success: '成功',
     error: '错误',
     stream_error: '流错误',
-    upstream_timeout: '上游超时',
+    upstream_timeout: '服务超时',
     client_dropped: '客户端断开',
   }
   return labels[status] || status
@@ -272,10 +272,10 @@ export function UsagePanel() {
         <StatCard
           title="实时 TPM"
           value={formatNumber(realtime?.totalTpm || 0)}
-          desc="按上报输入 + 上报输出统计"
+          desc="按展示输入 + 展示输出统计"
           tone="info"
         />
-        <StatCard title="高缓存请求" value={formatNumber(summaryData?.highCacheRequests || 0)} tone="success" />
+        <StatCard title="缓存命中较高" value={formatNumber(summaryData?.highCacheRequests || 0)} tone="success" />
         <StatCard title="缓存读取" value={formatNumber(summaryData?.totalCacheReadInputTokens || 0)} desc={`本地读取 ${formatPercent(readRatio)} / 总缓存 ${formatPercent(cachedRatio)}`} />
         <StatCard title="估算费用" value={formatUsd(summaryData?.totalEstimatedCostUsd || 0)} desc={`已计价 ${formatPercent(pricedRatio)}`} tone="info" />
       </div>
@@ -340,7 +340,7 @@ export function UsagePanel() {
         <div className="mb-3 grid gap-2 md:grid-cols-2 xl:grid-cols-4">
           <Input bordered size="sm" className="xl:col-span-2" value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="搜索模型、账号、会话、路径、错误" />
           <Input bordered size="sm" value={model} onChange={(event) => setModel(event.target.value)} placeholder="模型" />
-          <Input bordered size="sm" value={endpoint} onChange={(event) => setEndpoint(event.target.value)} placeholder="请求路径，如 /cc/v1/messages" />
+          <Input bordered size="sm" value={endpoint} onChange={(event) => setEndpoint(event.target.value)} placeholder="入口路径，如 /cc/v1/messages" />
           <Input bordered size="sm" value={conversationId} onChange={(event) => setConversationId(event.target.value)} placeholder="会话 ID" />
           <select className="select select-bordered select-sm" value={routeTarget} onChange={(event) => setRouteTarget(event.target.value)}>
             <option value="">全部账号/外部池</option>
@@ -368,13 +368,13 @@ export function UsagePanel() {
             <Select.Option value="success">成功</Select.Option>
             <Select.Option value="error">错误</Select.Option>
             <Select.Option value="stream_error">流错误</Select.Option>
-            <Select.Option value="upstream_timeout">上游超时</Select.Option>
+            <Select.Option value="upstream_timeout">服务超时</Select.Option>
             <Select.Option value="client_dropped">客户端断开</Select.Option>
           </Select>
           <Select bordered size="sm" value={source} onChange={(event) => setSource(event.target.value as UsageSource | '')}>
             <Select.Option value="">全部来源</Select.Option>
-            <Select.Option value="upstream_metadata">上游 metadata</Select.Option>
-            <Select.Option value="local_prompt_cache">本地 prompt cache</Select.Option>
+            <Select.Option value="upstream_metadata">服务返回用量</Select.Option>
+            <Select.Option value="local_prompt_cache">本地缓存估算</Select.Option>
             <Select.Option value="context_estimate">上下文估算</Select.Option>
             <Select.Option value="request_estimate">请求估算</Select.Option>
             <Select.Option value="none">无缓存</Select.Option>
@@ -398,7 +398,7 @@ export function UsagePanel() {
             <Table size="sm" className="data-table min-w-[1180px]">
               <Table.Head>
                 <span>时间 / 状态</span>
-                <span>模型 / Endpoint</span>
+                <span>模型 / 入口</span>
                 <span>账号</span>
                 <span>Token</span>
                 <span>缓存</span>
@@ -435,7 +435,7 @@ export function UsagePanel() {
                           请求 {record.model || '-'}
                         </div>
                         <div className="max-w-[260px] truncate text-xs text-base-content/55" title={upstreamModelLabel(record)}>
-                          上游 {upstreamModelLabel(record)}
+                          实际模型 {upstreamModelLabel(record)}
                         </div>
                         <div className="mt-1 flex max-w-[260px] flex-wrap items-center gap-1">
                           <Badge>{record.endpoint || '-'}</Badge>
@@ -443,7 +443,7 @@ export function UsagePanel() {
                           {record.fallbackFromSticky && (
                             <Badge
                               tone="warning"
-                              title="Sticky 绑定账号不可用或当时无法承接，调度回退到其他本地账号；调用链路展示实际上游尝试。"
+                              title="绑定账号不可用或当时无法承接，调度回退到其他本地账号；调用链路展示实际尝试。"
                             >
                               sticky回退
                             </Badge>
@@ -456,8 +456,8 @@ export function UsagePanel() {
                         {isExternal && record.externalPoolName && <div className="max-w-[180px] truncate text-xs text-base-content/55" title={record.externalPoolName}>{record.externalPoolName}</div>}
                       </span>
                       <span className="font-mono text-xs">
-                        <div>上报输入 {formatNumber(record.compatInputTokens)}</div>
-                        <div className="text-base-content/55">上报输出 {formatNumber(record.outputTokens)}</div>
+                        <div>展示输入 {formatNumber(record.compatInputTokens)}</div>
+                        <div className="text-base-content/55">展示输出 {formatNumber(record.outputTokens)}</div>
                       </span>
                       <span className="font-mono text-xs">
                         <div className="text-success">读 {formatNumber(record.cacheReadInputTokens)}</div>
@@ -520,7 +520,7 @@ export function UsagePanel() {
                           type="button"
                           className="inline-flex h-7 w-7 items-center justify-center text-base-content/55 transition hover:text-primary focus:outline-none focus:ring-2 focus:ring-primary/30"
                           onClick={() => setSelectedRecord(record)}
-                          title="查看 usage 口径和详情"
+                          title="查看用量口径和详情"
                         >
                           <Info className="h-4 w-4" />
                         </button>
@@ -562,14 +562,14 @@ export function UsagePanel() {
                             请求 {record.model || '-'}
                           </span>
                           <span className="max-w-[360px] truncate text-xs text-base-content/55" title={upstreamModelLabel(record)}>
-                            上游 {upstreamModelLabel(record)}
+                            实际模型 {upstreamModelLabel(record)}
                           </span>
                           <Badge>{record.endpoint || '-'}</Badge>
                           {record.stickyBound && <Badge tone="secondary">sticky</Badge>}
                           {record.fallbackFromSticky && (
                             <Badge
                               tone="warning"
-                              title="Sticky 绑定账号不可用或当时无法承接，调度回退到其他本地账号；调用链路展示实际上游尝试。"
+                              title="绑定账号不可用或当时无法承接，调度回退到其他本地账号；调用链路展示实际尝试。"
                             >
                               sticky回退
                             </Badge>
@@ -597,7 +597,7 @@ export function UsagePanel() {
                           type="button"
                           className="inline-flex h-7 w-7 items-center justify-center text-base-content/55 transition hover:text-primary focus:outline-none focus:ring-2 focus:ring-primary/30"
                           onClick={() => setSelectedRecord(record)}
-                          title="查看 usage 口径和详情"
+                          title="查看用量口径和详情"
                         >
                           <Info className="h-4 w-4" />
                         </button>
@@ -638,10 +638,10 @@ export function UsagePanel() {
                     </div>
 
                     <div className="usage-stat-grid">
-                      <UsageMetric label="上报输入" value={formatNumber(record.compatInputTokens)} />
-                      <UsageMetric label="上报缓存写入" value={formatNumber(record.cacheCreationInputTokens)} tone="info" />
-                      <UsageMetric label="上报缓存读取" value={formatNumber(record.cacheReadInputTokens)} tone="success" />
-                      <UsageMetric label="上报输出" value={formatNumber(record.outputTokens)} />
+                      <UsageMetric label="展示输入" value={formatNumber(record.compatInputTokens)} />
+                      <UsageMetric label="展示缓存写入" value={formatNumber(record.cacheCreationInputTokens)} tone="info" />
+                      <UsageMetric label="展示缓存读取" value={formatNumber(record.cacheReadInputTokens)} tone="success" />
+                      <UsageMetric label="展示输出" value={formatNumber(record.outputTokens)} />
                       <UsageMetric label="读取率" value={formatPercent(rowReadRatio)} />
                       <UsageMetric label="缓存率" value={formatPercent(rowCachedRatio)} />
                     </div>
@@ -747,13 +747,13 @@ function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: () => vo
   const start = () => {
     const cutoffLabel = mode === 'hard_delete' ? '删除时间' : '创建时间'
     const confirmed = confirm(
-      `确定开始${cleanupModeLabel(mode)}？\n\n范围：${cleanupRangeText(cutoffLabel)}\n每批：${formatNumber(parsedBatchSize)} 条\n系统会持续分批执行，直到没有更多匹配记录或达到内部安全上限 ${formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批。\n\n清理只影响使用记录明细列表，已累计的顶部统计和 Dashboard rollup 会保留。`
+      `确定开始${cleanupModeLabel(mode)}？\n\n范围：${cleanupRangeText(cutoffLabel)}\n每批：${formatNumber(parsedBatchSize)} 条\n系统会持续分批执行，直到没有更多匹配记录或达到内部安全上限 ${formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批。\n\n清理只影响使用记录明细列表，已累计的顶部统计和总览统计会保留。`
     )
     if (!confirmed) return
 
     startCleanup.mutate(payload(), {
       onSuccess: () => {
-        toast.success('Usage 分批清理已启动')
+        toast.success('用量记录分批清理已启动')
         cleanupStatus.refetch()
       },
       onError: (error) => toast.error(`启动失败: ${extractErrorMessage(error)}`),
@@ -771,11 +771,11 @@ function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: () => vo
   }
 
   return (
-    <ModalShell open={open} title="分批清理 Usage 记录" width="max-w-2xl" onClose={onClose}>
+    <ModalShell open={open} title="分批清理用量记录" width="max-w-2xl" onClose={onClose}>
       <div className="space-y-4 text-sm">
         <div className="rounded-box border border-base-300 bg-base-100 p-3 text-base-content/70">
           <span className="mr-2 inline-block h-3 w-1 rounded-full bg-warning align-[-1px]" />
-          这是手动单次任务，不会定时执行。你只需要设置清理范围和每批数量，系统会自动分批清到没有更多匹配记录；后端保留 {formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批安全上限。清理只影响使用记录明细列表，已累计的顶部统计和 Dashboard rollup 会保留。
+          这是手动单次任务，不会定时执行。你只需要设置清理范围和每批数量，系统会自动分批清到没有更多匹配记录；后端保留 {formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批安全上限。清理只影响使用记录明细列表，已累计的顶部统计和总览统计会保留。
         </div>
 
         <div className="grid gap-3 md:grid-cols-2">
@@ -789,7 +789,7 @@ function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: () => vo
           <div className="form-control">
             <span className="label-text mb-1 text-xs text-base-content/55">{mode === 'hard_delete' ? '删除时间早于多少天' : '创建时间早于多少天'}</span>
             <Input bordered size="sm" type="number" min={0} value={olderThanDays} onChange={(event) => setOlderThanDays(event.target.value)} inputMode="numeric" />
-            <span className="mt-1 text-[0.68rem] text-base-content/45">填 0 表示以任务启动时刻为 cutoff，清理当时之前全部匹配记录。</span>
+            <span className="mt-1 text-[0.68rem] text-base-content/45">填 0 表示以任务启动时刻为截止时间，清理当时之前全部匹配记录。</span>
           </div>
           <label className="form-control">
             <span className="label-text mb-1 text-xs text-base-content/55">每批数量</span>
@@ -805,7 +805,7 @@ function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: () => vo
           <div className="rounded-box border border-base-300 bg-base-200/60 p-3">
             <div className="font-medium">预估：{cleanupModeLabel(preview.mode)}，匹配 {formatNumber(preview.matchedRows)} 条</div>
             <div className="mt-1 text-xs text-base-content/55">
-              cutoff {formatDate(preview.cutoffAt)} · 预计 {formatNumber(estimatedBatches || 0)} 批 · 匹配记录创建时间 {formatDate(preview.oldestCreatedAt)} 至 {formatDate(preview.newestCreatedAt)}
+              截止时间 {formatDate(preview.cutoffAt)} · 预计 {formatNumber(estimatedBatches || 0)} 批 · 匹配记录创建时间 {formatDate(preview.oldestCreatedAt)} 至 {formatDate(preview.newestCreatedAt)}
             </div>
           </div>
         )}
@@ -858,7 +858,7 @@ function UsageBillingModal({ record, onClose }: { record: UsageRecord | null; on
             <Detail label="请求 ID" value={record.id} mono />
             <Detail label="时间" value={formatDate(record.createdAt)} />
             <Detail label="请求模型" value={record.model || '-'} />
-            <Detail label="上游模型" value={upstreamModel(record)} />
+            <Detail label="实际模型" value={upstreamModel(record)} />
             <Detail label="计价模型" value={record.pricingAvailable ? record.pricingModel || 'priced' : 'unpriced'} />
             <Detail label="计费状态" value={record.pricingAvailable ? '已计价' : '未计价'} />
             <Detail label="估算费用" value={formatUsd(record.estimatedCostUsd || 0)} />
@@ -866,7 +866,7 @@ function UsageBillingModal({ record, onClose }: { record: UsageRecord | null; on
           </div>
 
           <div className="rounded-box border border-base-300 bg-base-200/50 p-3 text-sm">
-            <div className="mb-2 font-medium">本条下游上报 usage</div>
+            <div className="mb-2 font-medium">本条返回给客户端的用量</div>
             <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-5">
               <UsageMetric label="输入" value={formatNumber(record.compatInputTokens)} />
               <UsageMetric label="缓存写入" value={formatNumber(record.cacheCreationInputTokens)} tone="info" />
@@ -894,12 +894,12 @@ function UsageBillingModal({ record, onClose }: { record: UsageRecord | null; on
                   <div className="mt-1 font-medium">{formatUsd(billing.rawCostUsd || 0)}</div>
                 </div>
                 <div>
-                  <div className="text-xs text-base-content/55">整形后计费</div>
+                  <div className="text-xs text-base-content/55">展示计费</div>
                   <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.shapedUsage || billing.reportedUsage)}</div>
                   <div className="mt-1 font-medium">{formatUsd(shapedCost)}</div>
                 </div>
                 <div>
-                  <div className="text-xs text-base-content/55">放大后计费</div>
+                  <div className="text-xs text-base-content/55">补偿后计费</div>
                   <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.reportedUsage)}</div>
                   <div className="mt-1 font-medium">{formatUsd(upliftedCost)}</div>
                   <div className={`text-xs ${billingDeltaTextClass(deltaTone)}`}>
@@ -907,11 +907,9 @@ function UsageBillingModal({ record, onClose }: { record: UsageRecord | null; on
                   </div>
                 </div>
                 <div>
-                  <div className="text-xs text-base-content/55">计价模型 / 整形模式</div>
+                  <div className="text-xs text-base-content/55">计价模型 / 用量模式</div>
                   <div className="break-all">{billing.pricingAvailable ? billing.pricingModel || 'priced' : 'unpriced'}</div>
-                  <div className="text-xs text-base-content/55">
-                    {billing.usageProjectionMode} · {billing.usageProjectionApplied ? '已按当前路径整形' : '未整形/透传'}
-                  </div>
+                  <div className="text-xs text-base-content/55">{billing.usageProjectionApplied ? '已按入口规则展示' : '保持原样'}</div>
                 </div>
               </div>
             </div>
@@ -931,7 +929,7 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
             <Detail label="请求 ID" value={record.id} mono />
             <Detail label="时间" value={formatDate(record.createdAt)} />
             <Detail label="请求模型" value={record.model || '-'} />
-            <Detail label="上游模型" value={upstreamModel(record)} />
+            <Detail label="实际模型" value={upstreamModel(record)} />
             <Detail label="解析来源" value={record.modelResolutionSource || '-'} />
             {record.modelResolutionNote && <Detail label="解析说明" value={record.modelResolutionNote} />}
             <Detail label="会话" value={record.conversationId || '-'} mono />
@@ -952,19 +950,19 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
           </div>
           <div className="rounded-box border border-base-300 bg-base-200/50 p-3 text-sm">
             <div className="mb-2 flex items-center gap-2">
-              <div className="font-medium">Usage 口径</div>
-              <span className="text-xs text-base-content/55">主列表只展示下游响应上报字段；实际输入和内部成本口径仅用于诊断。</span>
+              <div className="font-medium">用量口径</div>
+              <span className="text-xs text-base-content/55">主列表只展示返回给客户端的用量；实际输入和成本估算只在详情里查看。</span>
             </div>
             <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-6">
               <UsageMetric label="用户实际输入" value={formatNumber(record.totalInputTokens)} />
-              <UsageMetric label="上报输入" value={formatNumber(record.compatInputTokens)} />
-              <UsageMetric label="上报缓存写入" value={formatNumber(record.cacheCreationInputTokens)} tone="info" />
-              <UsageMetric label="上报缓存读取" value={formatNumber(record.cacheReadInputTokens)} tone="success" />
-              <UsageMetric label="上报输出" value={formatNumber(record.outputTokens)} />
-              <UsageMetric label="内部成本输入" value={formatNumber(record.billableInputTokens)} />
+              <UsageMetric label="展示输入" value={formatNumber(record.compatInputTokens)} />
+              <UsageMetric label="展示缓存写入" value={formatNumber(record.cacheCreationInputTokens)} tone="info" />
+              <UsageMetric label="展示缓存读取" value={formatNumber(record.cacheReadInputTokens)} tone="success" />
+              <UsageMetric label="展示输出" value={formatNumber(record.outputTokens)} />
+              <UsageMetric label="成本估算输入" value={formatNumber(record.billableInputTokens)} />
             </div>
             <div className="mt-2 text-xs leading-5 text-base-content/55">
-              内部成本输入 = 上报输入 + 上报缓存写入，仅用于本系统费用估算和历史兼容，不是 Anthropic/Kiro 响应里的独立字段。
+              成本估算输入 = 展示输入 + 展示缓存写入，仅用于本系统费用估算和历史兼容，不是返回给客户端的独立字段。
             </div>
           </div>
           {record.externalPoolBilling && (
@@ -989,16 +987,16 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
                       <div className="text-xs text-base-content/55">原始成本</div>
                       <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.rawUsage)}</div>
                       <div className="mt-1 font-medium">{formatUsd(billing.rawCostUsd || 0)}</div>
-                      <div className="text-xs text-base-content/55">外部池原始返回 usage 估算</div>
+                      <div className="text-xs text-base-content/55">按备用资源实际消耗估算</div>
                     </div>
                     <div>
-                      <div className="text-xs text-base-content/55">整形后计费</div>
+                      <div className="text-xs text-base-content/55">展示计费</div>
                       <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.shapedUsage || billing.reportedUsage)}</div>
                       <div className="mt-1 font-medium">{formatUsd(shapedCost)}</div>
-                      <div className="text-xs text-base-content/55">按当前路径缓存策略整形，未放大</div>
+                      <div className="text-xs text-base-content/55">按当前入口展示规则计算，未补偿</div>
                     </div>
                     <div>
-                      <div className="text-xs text-base-content/55">整形后放大计费</div>
+                      <div className="text-xs text-base-content/55">补偿后计费</div>
                       <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.reportedUsage)}</div>
                       <div className="mt-1 font-medium">{formatUsd(upliftedCost)}</div>
                       <div className={`text-xs ${billingDeltaTextClass(deltaTone)}`}>
@@ -1006,11 +1004,9 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
                       </div>
                     </div>
                     <div>
-                      <div className="text-xs text-base-content/55">计价模型 / 整形模式</div>
+                      <div className="text-xs text-base-content/55">计价模型 / 用量模式</div>
                       <div className="break-all">{billing.pricingAvailable ? billing.pricingModel || 'priced' : 'unpriced'}</div>
-                      <div className="text-xs text-base-content/55">
-                        {billing.usageProjectionMode} · {billing.usageProjectionApplied ? '已按当前路径整形' : '未整形/透传'}
-                      </div>
+                      <div className="text-xs text-base-content/55">{billing.usageProjectionApplied ? '已按入口规则展示' : '保持原样'}</div>
                     </div>
                   </div>
                 </div>
@@ -1095,7 +1091,7 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
           </div>
           {Boolean(record.payloadBreakdown || record.payloadGuardReport) && (
             <div>
-              <div className="mb-2 text-sm font-medium">Payload 诊断</div>
+              <div className="mb-2 text-sm font-medium">请求内容诊断</div>
               <pre className="max-h-96 overflow-auto rounded-box border border-base-300 bg-base-200 p-3 text-xs whitespace-pre-wrap break-words">
                 {formatJsonBlock({
                   breakdown: record.payloadBreakdown || null,

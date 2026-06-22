@@ -300,7 +300,7 @@ function CredentialParameterDefaultsPanel({
         <FieldLabel title="Machine ID" description="留空使用全局配置或自动派生">
           <Input bordered size="sm" value={defaults.machineId} disabled={disabled} onChange={(event) => update('machineId', event.target.value)} />
         </FieldLabel>
-        <FieldLabel title="端点" description="留空使用全局 defaultEndpoint">
+        <FieldLabel title="端点" description="留空使用全局默认端点">
           <Input bordered size="sm" value={defaults.endpoint} disabled={disabled} onChange={(event) => update('endpoint', event.target.value)} placeholder="ide / cli" />
         </FieldLabel>
         <FieldLabel title="代理资源" description="选择代理资源会清空直连代理；填写直连代理会自动取消资源">
@@ -507,7 +507,7 @@ export function AddCredentialModal({
           <FieldLabel title="Machine ID" description="留空使用配置中字段或自动派生">
             <Input bordered size="sm" value={form.machineId} onChange={(event) => update('machineId', event.target.value)} />
           </FieldLabel>
-          <FieldLabel title="端点" description="留空使用全局 defaultEndpoint">
+        <FieldLabel title="端点" description="留空使用全局默认端点">
             <Input bordered size="sm" value={form.endpoint} onChange={(event) => update('endpoint', event.target.value)} placeholder="ide / cli" />
           </FieldLabel>
           <FieldLabel title="代理资源" description="选择代理资源会清空直连代理；填写直连代理会自动取消资源">

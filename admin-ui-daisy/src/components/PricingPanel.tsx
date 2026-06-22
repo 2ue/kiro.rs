@@ -68,7 +68,7 @@ function sourceTone(source?: string): 'neutral' | 'primary' | 'success' | 'warni
 function sourceLabel(source?: string): string {
   if (!source) return '-'
   if (source === 'manual') return '手动'
-  if (source.includes('kiro')) return '上游'
+  if (source.includes('kiro')) return '服务同步'
   if (source === 'litellm') return '价格源'
   if (source.includes('seed')) return 'Seed'
   if (source === 'built-in') return '内置'
@@ -201,7 +201,7 @@ function ManualModelModal({
   return (
     <ModalShell open={open} title={editing ? `编辑手动模型：${initial?.model}` : '手动添加模型'} width="max-w-4xl" onClose={onClose}>
       <div className="grid gap-3 md:grid-cols-2">
-        <FieldLabel title="模型 ID" description="最终会按这个模型 ID 请求 Kiro 上游。">
+        <FieldLabel title="模型 ID" description="最终会按这个模型 ID 请求 Kiro 服务。">
           <Input bordered size="sm" value={form.model} disabled={editing || upsert.isPending} onChange={(event) => update('model', event.target.value)} placeholder="claude-opus-5-20270101" />
         </FieldLabel>
         <FieldLabel title="显示名">
@@ -331,7 +331,7 @@ export function PricingPanel() {
 
       <SectionCard
         title="Kiro 模型能力目录"
-        description="从 Kiro 上游同步可用模型、上下文窗口、输出上限和缓存能力；手动模型作为补充保留。"
+        description="从 Kiro 同步可用模型、上下文窗口、输出上限和缓存能力；手动模型作为补充保留。"
         actions={
           <>
             <Button type="button" color="primary" size="sm" onClick={openAdd}>

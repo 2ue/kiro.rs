@@ -59,7 +59,7 @@ const EMPTY_TOP = {
 const rankDimensions: Array<{ key: RankDimension; label: string }> = [
   { key: 'models', label: '模型' },
   { key: 'credentials', label: '账号' },
-  { key: 'endpoints', label: 'Endpoint' },
+  { key: 'endpoints', label: '入口' },
   { key: 'errors', label: '错误' },
 ]
 
@@ -161,7 +161,7 @@ function MetricTile({
   const styles = toneClass[tone]
 
   return (
-    <div className="relative overflow-hidden rounded-box border border-base-300/60 bg-base-100 p-3 shadow-sm">
+    <div className="metric-tile relative overflow-hidden rounded-box p-3">
       <div className={`absolute inset-x-0 top-0 h-0.5 ${styles.bar}`} />
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
@@ -169,7 +169,7 @@ function MetricTile({
           <div className={`mt-1 truncate text-xl font-bold leading-6 ${styles.text}`}>{value}</div>
           {desc && <div className="mt-0.5 truncate text-[0.66rem] text-base-content/50">{desc}</div>}
         </div>
-        <div className={`rounded-md border border-base-300/60 bg-base-100 p-1.5 ${styles.text}`}>{icon}</div>
+        <div className={`metric-icon rounded-md border p-1.5 ${styles.text}`}>{icon}</div>
       </div>
     </div>
   )
@@ -193,7 +193,7 @@ function DashboardToolbar({
   onAutoRefreshSecondsChange: (seconds: number) => void
 }) {
   return (
-    <div className="rounded-box border border-base-300/60 bg-base-100 px-4 py-3 shadow-sm">
+    <div className="dashboard-toolbar rounded-box px-4 py-3">
       <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
@@ -276,7 +276,7 @@ function SeriesChart({ title, points }: { title: string; points: UsageSeriesPoin
               return (
                 <div key={point.key} className="group flex min-w-0 flex-1 flex-col items-center gap-1">
                   <div
-                    className="relative w-full overflow-hidden rounded-t bg-primary/45 transition-colors group-hover:bg-primary/65"
+                    className="series-bar relative w-full overflow-hidden rounded-t transition-colors group-hover:brightness-110"
                     style={{ height }}
                     title={`${point.label}: ${formatNumber(point.requests)} 请求 / ${formatNumber(point.errorRequests)} 错误 / ${formatUsd(point.totalEstimatedCostUsd)}`}
                   >
@@ -506,8 +506,8 @@ function OperationsPanel({
           ratio={stickyBoundRequests > 0 ? fallbackFromStickyRequests / stickyBoundRequests : 0}
           tone={fallbackFromStickyRequests > 0 ? 'warning' : 'default'}
         />
-        <SignalRow label="模拟用量" value={formatNumber(simulatedRequests)} tone={simulatedRequests > 0 ? 'info' : 'default'} />
-        <SignalRow label="上游元数据" value={formatNumber(upstreamMetadataRequests)} tone="primary" />
+        <SignalRow label="调整展示" value={formatNumber(simulatedRequests)} tone={simulatedRequests > 0 ? 'info' : 'default'} />
+        <SignalRow label="服务返回用量" value={formatNumber(upstreamMetadataRequests)} tone="primary" />
       </div>
     </Panel>
   )
@@ -532,7 +532,7 @@ function ExternalPoolBillingPanel({
   return (
     <Panel
       title="备用池计费拆分"
-      subtitle="原始成本来自外部池原始 usage；最终上报使用整形并放大后的 usage；盈利按放大后计费减原始成本计算"
+      subtitle="展示备用资源的成本、计费金额和差额，便于判断备用资源是否划算"
       actions={
         <span className={`rounded border px-2 py-0.5 text-[0.68rem] font-semibold ${
           hasLoss
@@ -554,15 +554,15 @@ function ExternalPoolBillingPanel({
         <div className="rounded-box border border-base-300/60 bg-base-200/40 p-3">
           <div className="text-xs text-base-content/55">原始成本</div>
           <div className="mt-1 text-lg font-semibold">{formatUsd(billing.rawCostUsd)}</div>
-          <div className="mt-1 text-xs text-base-content/50">按备用池 raw usage 估算</div>
+          <div className="mt-1 text-xs text-base-content/50">按备用资源实际消耗估算</div>
         </div>
         <div className="rounded-box border border-base-300/60 bg-base-200/40 p-3">
-          <div className="text-xs text-base-content/55">整形后计费</div>
+          <div className="text-xs text-base-content/55">展示计费</div>
           <div className="mt-1 text-lg font-semibold">{formatUsd(shapedCost)}</div>
-          <div className="mt-1 text-xs text-base-content/50">路径缓存整形后，未放大</div>
+          <div className="mt-1 text-xs text-base-content/50">按当前展示规则计算</div>
         </div>
         <div className="rounded-box border border-base-300/60 bg-base-200/40 p-3">
-          <div className="text-xs text-base-content/55">整形后放大计费</div>
+          <div className="text-xs text-base-content/55">补偿后计费</div>
           <div className="mt-1 text-lg font-semibold">{formatUsd(upliftedCost)}</div>
           <div className={`mt-1 text-xs ${billingDeltaTextClass(deltaTone)}`}>
             盈利 = 放大后 - 原始：{profit >= 0 ? '+' : ''}{formatUsd(profit)}
@@ -594,8 +594,8 @@ function ExternalPoolBillingPanel({
                   <th>号池</th>
                   <th className="text-right">请求</th>
                   <th className="text-right">原始成本</th>
-                  <th className="text-right">整形后</th>
-                  <th className="text-right">放大后</th>
+                  <th className="text-right">展示计费</th>
+                  <th className="text-right">补偿后</th>
                   <th className="text-right">盈亏</th>
                   <th className="text-right">未计价</th>
                   <th className="text-right">兜底</th>
@@ -743,13 +743,13 @@ export function UsageDashboardPanel() {
       <ExternalPoolBillingPanel billing={externalPoolBilling} billingByPool={externalPoolBillingByPool} />
 
       <div className="grid gap-3 xl:grid-cols-2">
-        <BreakdownPanel title="状态分布" subtitle="判断成功、上游超时、客户端错误等整体占比" items={summary.statusBreakdown || []} emptyText="暂无状态样本。" />
-        <BreakdownPanel title="用量来源" subtitle="判断真实上游、缓存模拟、补录等来源占比" items={summary.usageSourceBreakdown || []} emptyText="暂无来源样本。" />
+        <BreakdownPanel title="状态分布" subtitle="查看成功、超时、客户端错误等整体占比" items={summary.statusBreakdown || []} emptyText="暂无状态样本。" />
+        <BreakdownPanel title="用量来源" subtitle="查看用量来自服务返回、缓存展示或系统补充的占比" items={summary.usageSourceBreakdown || []} emptyText="暂无来源样本。" />
       </div>
 
       <DimensionRankPanel top={top} activeKey={rankDimension} onActiveKeyChange={setRankDimension} />
 
-      <div className="rounded-box border border-base-300/60 bg-base-100 px-3 py-2.5 text-xs text-base-content/50">
+      <div className="glass-panel relative overflow-hidden rounded-box px-3 py-2.5 text-xs text-base-content/50">
         <div className="flex flex-wrap items-center gap-2">
           <Gauge className="h-4 w-4 text-base-content/35" />
           <span>总览保留 Top 维度聚合；单条请求链路和更精确筛选请在“用量”页查看。</span>
