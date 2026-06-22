@@ -12,4 +12,7 @@ export {
   ErrorState,
   Kbd,
   Divider,
+  Select,
+  ConfirmProvider,
+  useConfirm,
 } from '@/components/ui'

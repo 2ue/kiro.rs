@@ -73,11 +73,11 @@ export default {
       {
         blackGold: {
           'color-scheme': 'light',
-          primary: '#B88924',
+          primary: '#B4862C',
           'primary-content': '#17120A',
           secondary: '#1B1710',
           'secondary-content': '#FFF8E8',
-          accent: '#D8B15D',
+          accent: '#D8B568',
           'accent-content': '#17120A',
           neutral: '#1E1A14',
           'neutral-content': '#FFF8EA',

@@ -2,8 +2,8 @@ import { Info, LayoutGrid, List, Trash2, X } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { Button, Card, Input, Select, Table } from 'react-daisyui'
-import { Badge, EmptyState, ErrorState, LoadingState, ModalShell, SectionCard, StatCard } from '@/components/common'
+import { Button, Card, Input, Table } from 'react-daisyui'
+import { Badge, EmptyState, ErrorState, LoadingState, ModalShell, SectionCard, Select, StatCard, useConfirm } from '@/components/common'
 import { formatDate, formatNumber, formatPercent, formatUsd, ratio } from '@/lib/format'
 import { extractErrorMessage } from '@/lib/utils'
 import { getExternalPools } from '@/api/credentials'
@@ -342,27 +342,19 @@ export function UsagePanel() {
           <Input bordered size="sm" value={model} onChange={(event) => setModel(event.target.value)} placeholder="模型" />
           <Input bordered size="sm" value={endpoint} onChange={(event) => setEndpoint(event.target.value)} placeholder="入口路径，如 /cc/v1/messages" />
           <Input bordered size="sm" value={conversationId} onChange={(event) => setConversationId(event.target.value)} placeholder="会话 ID" />
-          <select className="select select-bordered select-sm" value={routeTarget} onChange={(event) => setRouteTarget(event.target.value)}>
-            <option value="">全部账号/外部池</option>
-            {(credentials.data?.credentials || []).length > 0 && (
-              <optgroup label="账号凭证">
-                {(credentials.data?.credentials || []).map((credential) => (
-                  <option key={`credential:${credential.id}`} value={`credential:${credential.id}`}>
-                    #{credential.id} {credential.email || credential.maskedApiKey || '未命名凭据'}
-                  </option>
-                ))}
-              </optgroup>
-            )}
-            {(externalPools.data?.pools || []).length > 0 && (
-              <optgroup label="外部池">
-                {(externalPools.data?.pools || []).map((pool) => (
-                  <option key={`external:${pool.id}`} value={`external:${pool.id}`}>
-                    #{pool.id} {pool.name}
-                  </option>
-                ))}
-              </optgroup>
-            )}
-          </select>
+          <Select size="sm" value={routeTarget} onChange={(event) => setRouteTarget(event.target.value)}>
+            <Select.Option value="">全部账号/外部池</Select.Option>
+            {(credentials.data?.credentials || []).map((credential) => (
+              <Select.Option key={`credential:${credential.id}`} value={`credential:${credential.id}`}>
+                账号 #{credential.id} {credential.email || credential.maskedApiKey || '未命名凭据'}
+              </Select.Option>
+            ))}
+            {(externalPools.data?.pools || []).map((pool) => (
+              <Select.Option key={`external:${pool.id}`} value={`external:${pool.id}`}>
+                外部池 #{pool.id} {pool.name}
+              </Select.Option>
+            ))}
+          </Select>
           <Select bordered size="sm" value={status} onChange={(event) => setStatus(event.target.value as UsageRecordStatus | '')}>
             <Select.Option value="">全部状态</Select.Option>
             <Select.Option value="success">成功</Select.Option>
@@ -716,6 +708,7 @@ function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: () => vo
   const previewCleanup = usePreviewUsageCleanup()
   const startCleanup = useStartUsageCleanup()
   const cancelCleanup = useCancelUsageCleanup()
+  const confirmDialog = useConfirm()
 
   const parsedOlderThanDays = parseCleanupInteger(olderThanDays, 7, 0)
   const parsedBatchSize = parseCleanupInteger(batchSize, 1000, 1)
@@ -744,11 +737,21 @@ function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: () => vo
     })
   }
 
-  const start = () => {
+  const start = async () => {
     const cutoffLabel = mode === 'hard_delete' ? '删除时间' : '创建时间'
-    const confirmed = confirm(
-      `确定开始${cleanupModeLabel(mode)}？\n\n范围：${cleanupRangeText(cutoffLabel)}\n每批：${formatNumber(parsedBatchSize)} 条\n系统会持续分批执行，直到没有更多匹配记录或达到内部安全上限 ${formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批。\n\n清理只影响使用记录明细列表，已累计的顶部统计和总览统计会保留。`
-    )
+    const confirmed = await confirmDialog({
+      title: `开始${cleanupModeLabel(mode)}`,
+      message: (
+        <div className="space-y-2">
+          <p>范围：{cleanupRangeText(cutoffLabel)}</p>
+          <p>每批：{formatNumber(parsedBatchSize)} 条</p>
+          <p>系统会持续分批执行，直到没有更多匹配记录或达到安全上限 {formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批。</p>
+          <p>清理只影响使用记录明细列表，已累计的顶部统计和总览统计会保留。</p>
+        </div>
+      ),
+      confirmText: '开始清理',
+      tone: 'danger',
+    })
     if (!confirmed) return
 
     startCleanup.mutate(payload(), {

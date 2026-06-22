@@ -1,8 +1,8 @@
 import { BadgeInfo, Copy, Edit3, Eye, EyeOff, Gauge, KeyRound, Plus, Router, Save, Shield, Sparkles, Trash2, Wand2, X, Zap } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import { Alert, Button, Card, Collapse, Input, Join, Loading, Select, Tabs, Toggle } from 'react-daisyui'
-import { ErrorState, FieldLabel, SectionCard } from '@/components/common'
+import { Alert, Button, Card, Input, Join, Loading, Toggle } from 'react-daisyui'
+import { ErrorState, FieldLabel, SectionCard, Select, useConfirm } from '@/components/ui'
 import {
   defaultModelMappingConfig,
   defaultPayloadShaping,
@@ -193,7 +193,7 @@ function ToggleField({
   onChange: (value: boolean) => void
 }) {
   return (
-    <Card bordered className="bg-base-100 shadow-none">
+    <Card bordered className="setting-card shadow-none">
       <Card.Body className="flex-row items-center justify-between gap-3 p-3">
       <div className="min-w-0">
         <div className="text-sm font-semibold">{title}</div>
@@ -217,18 +217,16 @@ function ConfigGroup({
   children: React.ReactNode
 }) {
   return (
-    <Collapse icon="arrow" open className="rounded-box border border-base-300 bg-base-100 shadow-none">
-      <Collapse.Title className="flex items-start gap-2.5 px-3 py-2.5">
-        <span className="rounded-lg border border-base-300 bg-base-200 p-1.5 text-primary">{icon}</span>
-        <span>
+    <section className="config-group">
+      <div className="config-group-header">
+        <span className="config-group-icon">{icon}</span>
+        <span className="min-w-0">
           <span className="block text-sm font-semibold">{title}</span>
-          <span className="mt-0.5 block text-xs leading-4 text-base-content/60">{description}</span>
+          <span className="mt-0.5 block text-xs leading-5 text-base-content/60">{description}</span>
         </span>
-      </Collapse.Title>
-      <Collapse.Content>
-        <div className="grid gap-3 border-t border-base-300/70 pt-3 md:grid-cols-2">{children}</div>
-      </Collapse.Content>
-    </Collapse>
+      </div>
+      <div className="config-group-body grid gap-3 md:grid-cols-2">{children}</div>
+    </section>
   )
 }
 
@@ -377,6 +375,7 @@ function AccessKeysPanel() {
   const [editingRequestKeyId, setEditingRequestKeyId] = useState<string | null>(null)
   const [requestKeyDraft, setRequestKeyDraft] = useState('')
   const [nextAdminApiKey, setNextAdminApiKey] = useState('')
+  const confirmDialog = useConfirm()
 
   const loadKeys = async () => {
     setLoading(true)
@@ -512,7 +511,13 @@ function AccessKeysPanel() {
 
   const removeRequestKey = async (item: RequestApiKeyItem) => {
     if (requestKeys.length <= 1) return toast.error('至少需要保留一个请求 Key')
-    if (!window.confirm(`确认删除 ${item.maskedApiKey}？删除后，使用该 Key 的客户端会立即认证失败。`)) return
+    const confirmed = await confirmDialog({
+      title: '删除请求 Key',
+      message: `确认删除 ${item.maskedApiKey}？删除后，使用该 Key 的客户端会立即认证失败。`,
+      confirmText: '删除',
+      tone: 'danger',
+    })
+    if (!confirmed) return
     setProcessingKeyId(item.id)
     try {
       const response = await deleteRequestApiKey(item.id)
@@ -792,7 +797,7 @@ function ReportedUsageFieldEditor({
   onChange: (value: ReportedUsageFieldPolicy) => void
 }) {
   return (
-    <Card bordered className="bg-base-100 shadow-none">
+    <Card bordered className="setting-card shadow-none">
       <Card.Body className="p-3">
       <div className="mb-2">
         <div className="text-sm font-semibold">{title}</div>
@@ -864,7 +869,7 @@ function ReportedUsagePathEditor({
   onChange: (value: ReportedUsagePathPolicy) => void
 }) {
   return (
-    <Card bordered className="bg-base-200/55 shadow-none">
+    <Card bordered className="setting-card bg-base-200/55 shadow-none">
       <Card.Body className="p-3">
       <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0">
@@ -1098,7 +1103,7 @@ export function ConfigPanel() {
         <AccessKeysPanel />
         <StartupProxyPanel config={draft} />
 
-        <div className="sticky top-[4.25rem] z-30 flex flex-col gap-2 rounded-box border border-base-300 bg-base-100/95 p-2 shadow-sm backdrop-blur sm:flex-row sm:items-center sm:justify-between">
+        <div className="config-save-bar sticky top-[4.25rem] z-30 flex flex-col gap-2 rounded-box p-2 sm:flex-row sm:items-center sm:justify-between">
           <div className="min-w-0 text-xs leading-5 text-base-content/60">
             修改后点击保存，后续新请求会使用新的设置。
           </div>
@@ -1108,23 +1113,21 @@ export function ConfigPanel() {
           </Button>
         </div>
 
-        <Tabs variant="boxed" size="sm" className="config-tabs">
+        <div className="config-tabs" role="tablist" aria-label="配置分类">
           {configTabs.map((tab) => (
-            <Tabs.Tab
+            <button
               key={tab.key}
-              href="#"
-              active={activeTab === tab.key}
-              className="config-tab"
-              onClick={(event) => {
-                event.preventDefault()
-                setActiveTab(tab.key)
-              }}
+              type="button"
+              role="tab"
+              aria-selected={activeTab === tab.key}
+              className={`config-tab ${activeTab === tab.key ? 'is-active' : ''}`}
+              onClick={() => setActiveTab(tab.key)}
             >
-              <span className="font-semibold">{tab.label}</span>
+              <span className="block font-semibold">{tab.label}</span>
               <span className="hidden text-[0.68rem] text-base-content/55 md:block">{tab.description}</span>
-            </Tabs.Tab>
+            </button>
           ))}
-        </Tabs>
+        </div>
 
         {activeTab === 'dispatch' && (
           <>

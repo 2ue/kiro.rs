@@ -2,7 +2,7 @@ import { Activity, Edit3, Eye, EyeOff, Plus, RefreshCw, Trash2 } from 'lucide-re
 import { useEffect, useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { Button, Card, Checkbox, Input, Loading, Modal, Toggle, Textarea } from 'react-daisyui'
-import { Badge, EmptyState, ErrorState, FieldLabel, LoadingState, ModalShell, SectionCard, StatCard } from '@/components/common'
+import { Badge, EmptyState, ErrorState, FieldLabel, LoadingState, ModalShell, SectionCard, StatCard, useConfirm } from '@/components/common'
 import { formatDate } from '@/lib/format'
 import { extractErrorMessage } from '@/lib/utils'
 import {
@@ -386,6 +386,7 @@ function ProxyResourceCard({ resource, onEdit }: { resource: ProxyResource; onEd
   const update = useUpdateProxyResource()
   const remove = useDeleteProxyResource()
   const testProxy = useTestProxyResource()
+  const confirmDialog = useConfirm()
   const [showSecrets, setShowSecrets] = useState(false)
   const [testResult, setTestResult] = useState<ProxyResourceTestResponse | null>(null)
 
@@ -399,8 +400,14 @@ function ProxyResourceCard({ resource, onEdit }: { resource: ProxyResource; onEd
     )
   }
 
-  const deleteResource = () => {
-    if (!confirm(`确定删除代理资源「${resource.name}」吗？如果仍有凭据绑定，后端会拒绝删除。`)) return
+  const deleteResource = async () => {
+    const confirmed = await confirmDialog({
+      title: '删除代理资源',
+      message: `确定删除代理资源「${resource.name}」吗？如果仍有凭据绑定，后端会拒绝删除。`,
+      confirmText: '删除',
+      tone: 'danger',
+    })
+    if (!confirmed) return
     remove.mutate(resource.id, {
       onSuccess: (res) => toast.success(res.message),
       onError: (error) => toast.error(`删除失败: ${extractErrorMessage(error)}`),

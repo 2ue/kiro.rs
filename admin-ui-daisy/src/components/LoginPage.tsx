@@ -65,7 +65,7 @@ export function LoginPage({ initialError = '', onLogin }: { initialError?: strin
                 </h1>
 
                 <p className="mt-4 max-w-sm text-sm leading-6 text-base-content/60">
-                  用于查看状态、管理资源和调整设置。
+                  用于查看状态、维护资源和调整设置。
                 </p>
               </div>
 
@@ -158,7 +158,7 @@ export function LoginPage({ initialError = '', onLogin }: { initialError?: strin
             </Form>
 
             <div className="mt-8 text-center text-xs text-base-content/40">
-              Kiro Admin Console
+              本地管理控制台
             </div>
           </section>
         </div>

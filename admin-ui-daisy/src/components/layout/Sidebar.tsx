@@ -146,13 +146,11 @@ export function Sidebar({
         {!collapsed && (
           <div className="sidebar-footer-card rounded-lg p-3">
             <div className="flex items-center justify-between gap-2">
-              <div className="text-[0.7rem] font-semibold text-base-content/65">服务状态</div>
-              <span className="rounded bg-success/10 px-1.5 py-0.5 text-[0.58rem] font-bold uppercase text-success">Ready</span>
+              <div className="text-[0.7rem] font-semibold text-base-content/65">当前入口</div>
+              <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[0.58rem] font-bold text-primary">/console</span>
             </div>
-            <div className="mt-2 grid grid-cols-3 gap-1">
-              <span className="h-1 rounded-full bg-primary/80" />
-              <span className="h-1 rounded-full bg-base-content/70" />
-              <span className="h-1 rounded-full bg-primary/35" />
+            <div className="mt-2 h-1 rounded-full bg-base-300">
+              <div className="h-full w-2/3 rounded-full bg-primary" />
             </div>
           </div>
         )}

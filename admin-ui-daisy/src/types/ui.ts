@@ -50,7 +50,7 @@ export const themeOptions: Array<{
     key: 'blackGold',
     label: '浅底黑金',
     description: '温暖浅底、黑色结构、金色强调',
-    swatches: ['#FFFDF8', '#1C1710', '#B88924', '#D8B15D'],
+    swatches: ['#FFFDF8', '#1C1710', '#B4862C', '#D8B568'],
   },
 ]
 

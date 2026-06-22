@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { AlertTriangle, Edit3, Plus, RefreshCw, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
 import { Alert as DaisyAlert, Button, Checkbox, Input, Loading, Modal, Table, Textarea, Toggle } from 'react-daisyui'
-import { Badge, EmptyState, ErrorState, FieldLabel, LoadingState, ModalShell, SectionCard, StatCard } from '@/components/common'
+import { Badge, EmptyState, ErrorState, FieldLabel, LoadingState, ModalShell, SectionCard, StatCard, useConfirm } from '@/components/common'
 import { formatCompact, formatDate, formatNumber, formatPricePerMillion } from '@/lib/format'
 import { extractErrorMessage } from '@/lib/utils'
 import {
@@ -279,6 +279,7 @@ export function PricingPanel() {
   const syncCapabilities = useSyncModelCapabilities()
   const deleteManual = useDeleteManualModel()
   const priceMap = useMemo(() => pricingByModel(pricing.data), [pricing.data])
+  const confirmDialog = useConfirm()
 
   const openAdd = () => {
     setEditing(null)
@@ -290,8 +291,14 @@ export function PricingPanel() {
     setManualOpen(true)
   }
 
-  const removeManual = (model: string) => {
-    if (!window.confirm(`确认删除手动模型 ${model}？`)) return
+  const removeManual = async (model: string) => {
+    const confirmed = await confirmDialog({
+      title: '删除手动模型',
+      message: `确认删除手动模型 ${model}？`,
+      confirmText: '删除',
+      tone: 'danger',
+    })
+    if (!confirmed) return
     deleteManual.mutate(model, {
       onSuccess: (response) => toast.success(response.message),
       onError: (error) => toast.error(`删除失败: ${extractErrorMessage(error)}`),

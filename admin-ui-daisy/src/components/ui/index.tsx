@@ -1,6 +1,182 @@
+import { Children, createContext, isValidElement, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { X } from 'lucide-react'
+import { AlertTriangle, Check, ChevronDown, X } from 'lucide-react'
 import { Alert, Badge as DaisyBadge, Button, Card, Loading, Modal } from 'react-daisyui'
+
+// ============================================================================
+// Select - 自定义选择器，避免原生 select 组件
+// ============================================================================
+
+type SelectChangeEvent = { target: { value: string } }
+
+interface SelectOptionProps {
+  value: string
+  disabled?: boolean
+  children: ReactNode
+}
+
+interface SelectRootProps {
+  value?: string
+  disabled?: boolean
+  children: ReactNode
+  className?: string
+  size?: 'xs' | 'sm' | 'md' | 'lg'
+  bordered?: boolean
+  onChange?: (event: SelectChangeEvent) => void
+}
+
+function SelectOption(_props: SelectOptionProps) {
+  return null
+}
+
+function optionText(value: ReactNode): string {
+  if (typeof value === 'string' || typeof value === 'number') return String(value)
+  if (Array.isArray(value)) return value.map(optionText).join('')
+  return ''
+}
+
+function SelectRoot({ value = '', disabled, children, className = '', size = 'md', onChange }: SelectRootProps) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+  const options = Children.toArray(children)
+    .filter(isValidElement<SelectOptionProps>)
+    .map((child) => ({
+      value: String(child.props.value),
+      disabled: child.props.disabled,
+      label: child.props.children,
+      text: optionText(child.props.children),
+    }))
+  const selected = options.find((option) => option.value === String(value)) || options[0]
+
+  useEffect(() => {
+    if (!open) return
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!ref.current?.contains(event.target as Node)) setOpen(false)
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false)
+    }
+    document.addEventListener('pointerdown', handlePointerDown)
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown)
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [open])
+
+  const choose = (nextValue: string, optionDisabled?: boolean) => {
+    if (disabled || optionDisabled) return
+    onChange?.({ target: { value: nextValue } })
+    setOpen(false)
+  }
+
+  return (
+    <div ref={ref} className={`choice-select ${className}`} data-size={size}>
+      <button
+        type="button"
+        className="choice-select-trigger"
+        disabled={disabled}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        title={selected?.text}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <span className="min-w-0 truncate">{selected?.label || '请选择'}</span>
+        <ChevronDown className={`h-4 w-4 shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+      {open && !disabled && (
+        <div className="choice-select-menu" role="listbox">
+          {options.map((option) => {
+            const active = option.value === String(value)
+            return (
+              <button
+                key={option.value}
+                type="button"
+                role="option"
+                aria-selected={active}
+                disabled={option.disabled}
+                className={`choice-select-option ${active ? 'is-active' : ''}`}
+                title={option.text}
+                onClick={() => choose(option.value, option.disabled)}
+              >
+                <span className="min-w-0 truncate">{option.label}</span>
+                {active && <Check className="h-3.5 w-3.5 shrink-0" />}
+              </button>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
+export const Select = Object.assign(SelectRoot, { Option: SelectOption })
+
+// ============================================================================
+// Confirm Dialog - 自定义确认弹窗，避免浏览器 confirm
+// ============================================================================
+
+interface ConfirmOptions {
+  title: string
+  message: ReactNode
+  confirmText?: string
+  cancelText?: string
+  tone?: 'default' | 'danger'
+}
+
+type ConfirmRequest = ConfirmOptions & { resolve: (confirmed: boolean) => void }
+
+const ConfirmContext = createContext<((options: ConfirmOptions) => Promise<boolean>) | null>(null)
+
+export function ConfirmProvider({ children }: { children: ReactNode }) {
+  const [request, setRequest] = useState<ConfirmRequest | null>(null)
+
+  const confirm = useCallback((options: ConfirmOptions) => {
+    return new Promise<boolean>((resolve) => {
+      setRequest({ ...options, resolve })
+    })
+  }, [])
+
+  const close = (confirmed: boolean) => {
+    request?.resolve(confirmed)
+    setRequest(null)
+  }
+
+  return (
+    <ConfirmContext.Provider value={confirm}>
+      {children}
+      <ModalShell
+        open={Boolean(request)}
+        title={request?.title || '确认操作'}
+        width="max-w-md"
+        onClose={() => close(false)}
+        footer={
+          <>
+            <Button type="button" variant="outline" size="sm" onClick={() => close(false)}>
+              {request?.cancelText || '取消'}
+            </Button>
+            <Button type="button" color={request?.tone === 'danger' ? 'error' : 'primary'} size="sm" onClick={() => close(true)}>
+              {request?.confirmText || '确认'}
+            </Button>
+          </>
+        }
+      >
+        <div className="flex gap-3 text-sm leading-6 text-base-content/70">
+          <span className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${request?.tone === 'danger' ? 'bg-error/10 text-error' : 'bg-primary/10 text-primary'}`}>
+            <AlertTriangle className="h-4 w-4" />
+          </span>
+          <div className="min-w-0">{request?.message}</div>
+        </div>
+      </ModalShell>
+    </ConfirmContext.Provider>
+  )
+}
+
+export function useConfirm() {
+  const confirm = useContext(ConfirmContext)
+  if (!confirm) throw new Error('useConfirm must be used inside ConfirmProvider')
+  return confirm
+}
 
 // ============================================================================
 // Stat Card - 统计卡片
@@ -16,7 +192,7 @@ interface StatCardProps {
 }
 
 const toneStyles: Record<string, { text: string; accent: string; icon: string }> = {
-  default: { text: 'text-base-content', accent: 'bg-base-content/20', icon: 'text-base-content/40' },
+  default: { text: 'text-base-content', accent: 'stat-card-accent', icon: 'text-base-content/55' },
   success: { text: 'text-success', accent: 'bg-success/75', icon: 'text-success' },
   warning: { text: 'text-warning', accent: 'bg-warning/75', icon: 'text-warning' },
   error: { text: 'text-error', accent: 'bg-error/75', icon: 'text-error' },
@@ -34,10 +210,10 @@ export function StatCard({ title, value, desc, icon, tone = 'default', trend }: 
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0 flex-1 pl-2.5">
             <div className="text-[0.72rem] font-semibold text-base-content/50">{title}</div>
-            <div className={`mt-1 truncate text-2xl font-semibold tracking-tight ${styles.text}`}>{value}</div>
-            {desc && <div className="mt-1 truncate text-[0.72rem] text-base-content/55">{desc}</div>}
+            <div className={`mt-1 min-w-0 break-words text-2xl font-semibold tracking-tight ${styles.text}`}>{value}</div>
+            {desc && <div className="mt-1 min-w-0 truncate text-[0.72rem] text-base-content/55">{desc}</div>}
           </div>
-          {icon && <div className={`shrink-0 rounded-md bg-base-200/70 p-2 ${styles.icon}`}>{icon}</div>}
+          {icon && <div className={`stat-card-icon shrink-0 rounded-md p-2 ${styles.icon}`}>{icon}</div>}
         </div>
         {trend && (
           <div className={`mt-2 pl-2.5 text-[0.7rem] font-medium ${trend.value >= 0 ? 'text-success' : 'text-error'}`}>
@@ -74,7 +250,7 @@ export function SectionCard({ title, description, actions, children, className =
           {actions && <div className="flex shrink-0 flex-wrap items-center gap-1.5">{actions}</div>}
         </div>
       )}
-      <div className={noPadding ? '' : 'p-4'}>{children}</div>
+      <div className={`section-card-body ${noPadding ? '' : 'p-4'}`}>{children}</div>
     </Card>
   )
 }
@@ -95,7 +271,7 @@ interface ModalShellProps {
 export function ModalShell({ open, title, children, width = 'max-w-3xl', onClose, footer }: ModalShellProps) {
   if (!open) return null
   return (
-    <Modal open backdrop className={`${width} rounded-2xl`}>
+    <Modal open backdrop className={`${width} rounded-box`}>
       <Modal.Header className="flex items-center justify-between gap-4 border-b border-base-300/60 pb-3">
         <h3 className="text-lg font-semibold">{title}</h3>
         <Button type="button" shape="circle" color="ghost" size="sm" onClick={onClose} aria-label="关闭">
@@ -186,7 +362,7 @@ interface EmptyStateProps {
 export function EmptyState({ icon, title, text, description, action }: EmptyStateProps) {
   const displayTitle = title || text || '暂无数据'
   return (
-    <Card bordered className="border-dashed bg-base-100/70">
+    <Card bordered className="setting-card border-dashed bg-base-100/70">
       <Card.Body className="items-center py-12 text-center">
         {icon && <div className="mb-3 text-base-content/30">{icon}</div>}
         <div className="text-sm font-semibold text-base-content/65">{displayTitle}</div>

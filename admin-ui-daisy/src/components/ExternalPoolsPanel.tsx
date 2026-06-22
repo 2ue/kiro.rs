@@ -2,8 +2,8 @@ import { type ReactNode, useEffect, useMemo, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { CheckCircle2, FlaskConical, Loader2, Pencil, Play, Plus, Power, RefreshCw, RotateCcw, RotateCw, Save, Trash2, XCircle } from 'lucide-react'
 import { toast } from 'sonner'
-import { Button, Card, Input, Join, Select, Toggle, Textarea } from 'react-daisyui'
-import { Badge, EmptyState, FieldLabel, ModalShell, SectionCard } from '@/components/common'
+import { Button, Card, Input, Join, Toggle, Textarea } from 'react-daisyui'
+import { Badge, EmptyState, FieldLabel, ModalShell, SectionCard, Select, useConfirm } from '@/components/common'
 import {
   clearExternalPoolAutoDisabled,
   createExternalPool,
@@ -190,6 +190,7 @@ const poolFormFromPool = (pool: ExternalPool): ExternalPoolFormDraft => ({
 
 export function ExternalPoolsPanel() {
   const queryClient = useQueryClient()
+  const confirmDialog = useConfirm()
   const runtimeConfig = useRuntimeConfig()
   const pools = useQuery({ queryKey: ['external-pools'], queryFn: getExternalPools })
   const status = useQuery({ queryKey: ['external-pools-status'], queryFn: getExternalPoolsStatus, refetchInterval: 5000 })
@@ -447,8 +448,8 @@ export function ExternalPoolsPanel() {
               <FormSection title="容量与排队" description={waitModeActive ? '外部池满并发时会等待容量；fallback 请求等待失败后可按回本地策略再探测本地。' : '外部池满并发时不会排队；fallback 请求可按回本地策略再探测本地。'}>
                 <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
                   <SelectBox disabled={!externalEnabled} label="满并发处理" value={configDraft.externalPoolCapacityMode} onChange={(externalPoolCapacityMode) => setConfigDraft((prev) => ({ ...prev, externalPoolCapacityMode: externalPoolCapacityMode as ExternalPoolsConfig['externalPoolCapacityMode'] }))}>
-                    <option value="fail_fast">立即失败</option>
-                    <option value="wait">等待容量</option>
+                    <Select.Option value="fail_fast">立即失败</Select.Option>
+                    <Select.Option value="wait">等待容量</Select.Option>
                   </SelectBox>
                   <NumberBox disabled={!externalEnabled} label="全局并发上限" suffix="并发" value={configDraft.externalPoolGlobalMaxConcurrentRequests} onChange={(externalPoolGlobalMaxConcurrentRequests) => setConfigDraft((prev) => ({ ...prev, externalPoolGlobalMaxConcurrentRequests }))} />
                   <NumberBox disabled={!waitModeActive} label="排队上限" suffix="请求" value={configDraft.externalPoolMaxQueuedRequests} onChange={(externalPoolMaxQueuedRequests) => setConfigDraft((prev) => ({ ...prev, externalPoolMaxQueuedRequests }))} />
@@ -562,7 +563,21 @@ export function ExternalPoolsPanel() {
                   <Button size="sm" color="ghost" onClick={() => mutatePool(() => setExternalPoolEnabled(pool.id, !pool.enabled), pool.enabled ? '已停用' : '已启用')}><Power className="h-4 w-4" />{pool.enabled ? '停用' : '启用'}</Button>
                   <Button size="sm" color="ghost" onClick={() => mutatePool(() => clearExternalPoolAutoDisabled(pool.id), '自动禁用状态已清除')}><RotateCcw className="h-4 w-4" />清除禁用</Button>
                   <Button size="sm" color="ghost" onClick={() => status.refetch()}><RefreshCw className="h-4 w-4" />刷新</Button>
-                  <Button size="sm" color="error" onClick={() => confirm(`删除外部池 ${pool.name}？`) && mutatePool(() => deleteExternalPool(pool.id), '外部池已删除')}><Trash2 className="h-4 w-4" />删除</Button>
+                  <Button
+                    size="sm"
+                    color="error"
+                    onClick={async () => {
+                      const confirmed = await confirmDialog({
+                        title: '删除备用池',
+                        message: `删除外部池 ${pool.name}？`,
+                        confirmText: '删除',
+                        tone: 'danger',
+                      })
+                      if (confirmed) mutatePool(() => deleteExternalPool(pool.id), '外部池已删除')
+                    }}
+                  >
+                    <Trash2 className="h-4 w-4" />删除
+                  </Button>
                 </div>
               </div>
             </SectionCard>
@@ -692,8 +707,8 @@ function ExternalPoolFormModal({
           <div className="grid gap-3 md:grid-cols-2">
             <TextBox label="名称" value={draft.name} disabled={saving} onChange={(name) => onDraftChange((prev) => ({ ...prev, name }))} />
             <SelectBox label="认证方式" value={draft.authType} disabled={saving} onChange={(authType) => onDraftChange((prev) => ({ ...prev, authType: authType as ExternalPoolFormDraft['authType'] }))}>
-              <option value="bearer">Authorization: Bearer &lt;key&gt;</option>
-              <option value="x_api_key">x-api-key: &lt;key&gt;</option>
+              <Select.Option value="bearer">Authorization: Bearer &lt;key&gt;</Select.Option>
+              <Select.Option value="x_api_key">x-api-key: &lt;key&gt;</Select.Option>
             </SelectBox>
             <TextBox className="md:col-span-2" label="服务地址" description="填写服务地址即可，通常不需要带具体请求路径。" value={draft.baseUrl} disabled={saving} onChange={(baseUrl) => onDraftChange((prev) => ({ ...prev, baseUrl }))} />
             <TextBox className="md:col-span-2" label={keyLabel} description={keyDescription} value={draft.apiKey} disabled={saving} onChange={(apiKey) => onDraftChange((prev) => ({ ...prev, apiKey }))} />
@@ -713,8 +728,8 @@ function ExternalPoolFormModal({
           <FormSection title="用量与成本" description="只控制当前外部池返回给客户端的用量展示方式。">
             <div className="space-y-3">
               <SelectBox label="用量展示模式" value={draft.usageProjectionMode} disabled={saving} onChange={(usageProjectionMode) => onDraftChange((prev) => ({ ...prev, usageProjectionMode: usageProjectionMode as ExternalPoolFormDraft['usageProjectionMode'] }))}>
-                <option value="pass_through">保持原样：不改备用资源用量</option>
-                <option value="current_path_policy">按入口规则展示：应用全局补偿</option>
+                <Select.Option value="pass_through">保持原样：不改备用资源用量</Select.Option>
+                <Select.Option value="current_path_policy">按入口规则展示：应用全局补偿</Select.Option>
               </SelectBox>
               <HintBox>{usageProjectionDescription(draft.usageProjectionMode)}</HintBox>
             </div>
@@ -725,10 +740,10 @@ function ExternalPoolFormModal({
           <div className="grid gap-3 md:grid-cols-[240px_1fr]">
             <div className="space-y-3">
               <SelectBox label="映射模式" value={draft.modelMappingMode} disabled={saving} onChange={(modelMappingMode) => onDraftChange((prev) => ({ ...prev, modelMappingMode: modelMappingMode as ExternalPoolFormDraft['modelMappingMode'] }))}>
-                <option value="passthrough">直接使用请求模型</option>
-                <option value="passthrough_mapping">请求模型优先映射</option>
-                <option value="direct_mapping">映射后内部处理</option>
-                <option value="processed_mapping">内部处理后映射</option>
+                <Select.Option value="passthrough">直接使用请求模型</Select.Option>
+                <Select.Option value="passthrough_mapping">请求模型优先映射</Select.Option>
+                <Select.Option value="direct_mapping">映射后内部处理</Select.Option>
+                <Select.Option value="processed_mapping">内部处理后映射</Select.Option>
               </SelectBox>
               <HintBox>{modelMappingDescription(draft.modelMappingMode, draft.normalizeModelVersionDots)}</HintBox>
               {draft.modelMappingMode !== 'passthrough' && (
@@ -762,9 +777,9 @@ function ExternalPoolFormModal({
         <FormSection title="错误处理和备注" description="自动禁用策略只决定当前外部池是否继承全局自动禁用规则。">
           <div className="grid gap-3 md:grid-cols-2">
             <SelectBox label="自动禁用策略" value={draft.autoDisablePolicy} disabled={saving} onChange={(autoDisablePolicy) => onDraftChange((prev) => ({ ...prev, autoDisablePolicy: autoDisablePolicy as ExternalPoolFormDraft['autoDisablePolicy'] }))}>
-              <option value="inherit">继承全局自动禁用</option>
-              <option value="enabled">单独启用自动禁用</option>
-              <option value="disabled">关闭自动禁用</option>
+              <Select.Option value="inherit">继承全局自动禁用</Select.Option>
+              <Select.Option value="enabled">单独启用自动禁用</Select.Option>
+              <Select.Option value="disabled">关闭自动禁用</Select.Option>
             </SelectBox>
             <TextBox label="备注" value={draft.notes} disabled={saving} onChange={(notes) => onDraftChange((prev) => ({ ...prev, notes }))} />
           </div>
@@ -1213,9 +1228,9 @@ function authLabel(authType: ExternalPool['authType']) {
 function SelectBox({ label, value, disabled = false, onChange, children }: { label: string; value: string; disabled?: boolean; onChange: (value: string) => void; children: ReactNode }) {
   return (
     <FieldLabel title={label}>
-      <select className="select select-bordered select-sm w-full" value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)}>
+      <Select size="sm" className="w-full" value={value} disabled={disabled} onChange={(event) => onChange(event.target.value)}>
         {children}
-      </select>
+      </Select>
     </FieldLabel>
   )
 }

@@ -18,9 +18,9 @@ import {
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { Button, Checkbox, Input, Loading, Select } from 'react-daisyui'
+import { Button, Checkbox, Input, Loading } from 'react-daisyui'
 import { forceRefreshToken, getCredentialAccountInfo, getCredentialInfo, getCredentials, refreshCredentialInfo, testCredential } from '@/api/credentials'
-import { Badge, EmptyState, ErrorState, LoadingState, ModalShell, SectionCard, StatCard } from '@/components/ui'
+import { Badge, EmptyState, ErrorState, LoadingState, ModalShell, SectionCard, Select, StatCard, useConfirm } from '@/components/ui'
 import { CredentialCard } from '@/components/credentials'
 import {
   AddCredentialModal,
@@ -189,6 +189,7 @@ export function CredentialsPanel() {
   const [creditDetailRows, setCreditDetailRows] = useState<CreditDetailRow[]>([])
   const cancelVerifyRef = useRef(false)
   const itemsPerPage = 15
+  const confirmDialog = useConfirm()
 
   // Hooks
   const queryClient = useQueryClient()
@@ -441,7 +442,13 @@ export function CredentialsPanel() {
   const batchDelete = async () => {
     const disabledIds = Array.from(selectedIds).filter((id) => currentCredentials.find((item) => item.id === id)?.disabled)
     if (!disabledIds.length) return toast.error('选中的凭据中没有已禁用项')
-    if (!confirm(`确定删除 ${disabledIds.length} 个已禁用凭据吗？此操作无法撤销。`)) return
+    const confirmed = await confirmDialog({
+      title: '删除已禁用凭据',
+      message: `确定删除 ${disabledIds.length} 个已禁用凭据吗？此操作无法撤销。`,
+      confirmText: '删除',
+      tone: 'danger',
+    })
+    if (!confirmed) return
     let success = 0
     let fail = 0
     for (const id of disabledIds) {
@@ -501,7 +508,13 @@ export function CredentialsPanel() {
 
   const clearAllDisabled = async () => {
     if (!disabledCredentialCount) return toast.error('没有可清除的已禁用凭据')
-    if (!confirm(`确定清除所有 ${disabledCredentialCount} 个已禁用凭据吗？此操作无法撤销。`)) return
+    const confirmed = await confirmDialog({
+      title: '清除已禁用凭据',
+      message: `确定清除所有 ${disabledCredentialCount} 个已禁用凭据吗？此操作无法撤销。`,
+      confirmText: '清除',
+      tone: 'danger',
+    })
+    if (!confirmed) return
     try {
       const result = await deleteDisabledCredentials.mutateAsync()
       setSelectedIds(new Set())
@@ -552,7 +565,7 @@ export function CredentialsPanel() {
 
   return (
     <div className="space-y-4">
-      <div className="rounded-lg border border-base-300/60 bg-base-100 p-3">
+      <div className="credit-summary-panel p-3">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
           <div className="min-w-0">
             <div className="flex items-center gap-2">
@@ -569,7 +582,7 @@ export function CredentialsPanel() {
         <div className="mt-3 grid gap-2 sm:grid-cols-2">
           <button
             type="button"
-            className="rounded-lg border border-transparent bg-base-200/55 px-3 py-2 text-left transition hover:border-primary/40 hover:bg-base-200 focus:outline-none focus:ring-2 focus:ring-primary/30"
+            className="rounded-lg border border-transparent bg-base-200/55 px-3 py-2 text-left transition hover:border-primary/40 hover:bg-base-100 focus:outline-none focus:ring-2 focus:ring-primary/30"
             onClick={openCreditDetails}
             title="查看明细"
           >
@@ -579,7 +592,7 @@ export function CredentialsPanel() {
             </div>
             <div className="mt-0.5 break-all text-lg font-bold text-success">{formatCredits(creditSummary.data?.enabledCreditRemaining)}</div>
           </button>
-          <div className="rounded-lg bg-base-200/55 px-3 py-2">
+          <div className="rounded-lg border border-base-300/60 bg-base-200/45 px-3 py-2">
             <div className="text-[0.7rem] font-semibold text-base-content/50">最近查询</div>
             <div className="mt-0.5 text-sm font-semibold">{creditSummary.data?.lastCheckedAt ? formatFullDate(creditSummary.data.lastCheckedAt) : '未查询'}</div>
           </div>
@@ -664,7 +677,7 @@ export function CredentialsPanel() {
         }
       >
         {/* Search and Filters */}
-        <div className="mb-4 space-y-3">
+        <div className="toolbar-panel mb-4 space-y-3 p-3">
           <div className="flex flex-col gap-2 sm:flex-row">
             <div className="relative flex-1">
               <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-base-content/40" />
@@ -713,7 +726,7 @@ export function CredentialsPanel() {
 
           {/* Filter Panel */}
           {showFilters && (
-            <div className="animate-slide-down rounded-lg border border-base-300/60 bg-base-200/50 p-3">
+            <div className="animate-slide-down rounded-lg border border-base-300/60 bg-base-100/65 p-3">
               <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
                 <Select bordered size="sm" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
                   <Select.Option value="all">全部状态</Select.Option>

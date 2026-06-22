@@ -15,7 +15,7 @@ import {
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { Button, Card, Checkbox, Dropdown, Input, Loading, Modal, Toggle } from 'react-daisyui'
-import { Badge, EmptyState, LoadingState, ModalShell } from '@/components/ui'
+import { Badge, EmptyState, LoadingState, ModalShell, useConfirm } from '@/components/ui'
 import { formatApproxElapsedMs, formatCredits, formatFullDate, formatLastUsed, formatNumber, formatQuota, formatUsd } from '@/lib/format'
 import { extractErrorMessage } from '@/lib/utils'
 import {
@@ -224,6 +224,7 @@ export function CredentialCard({
   const clearInFlight = useClearInFlight()
   const forceRefresh = useForceRefreshToken()
   const runtimeConfig = useRuntimeConfig()
+  const confirmDialog = useConfirm()
 
   const warmupTarget = Math.max(0, runtimeConfig.data?.credentialWarmupRequests ?? 3)
   const accountInfo = accountInfoValue(credential, balance)
@@ -430,7 +431,7 @@ export function CredentialCard({
     <Card className={`credential-card relative overflow-visible ${credential.isCurrent ? 'is-current' : ''} ${credential.disabled ? 'is-disabled' : ''}`}>
       <Card.Body className="gap-0 p-0">
         {/* Compact Header - Always Visible */}
-        <div className="flex items-center gap-3 p-3">
+        <div className="credential-card-header flex items-center gap-3 p-3">
           <Checkbox size="xs" checked={selected} onChange={onToggleSelect} />
 
           <button
@@ -505,7 +506,7 @@ export function CredentialCard({
 
         {/* Details */}
         {detailsOpen && (
-        <div className="border-t border-base-300/50 bg-base-200/30 p-3">
+        <div className="credential-details p-3">
             <div className="credential-section-title">基础</div>
             <div className="credential-meta-grid">
               <MetaItem
@@ -728,9 +729,15 @@ export function CredentialCard({
                   <Dropdown.Item
                     className={clearInFlight.isPending || !canClearInFlight ? 'pointer-events-none opacity-50' : undefined}
                     aria-disabled={clearInFlight.isPending || !canClearInFlight}
-                    onClick={() => {
+                    onClick={async () => {
                       if (!canClearInFlight) return
-                      if (!confirm(`确定清理凭据 #${credential.id} 的当前并发占用吗？真实仍在运行的请求可能因此不再计入并发限制。`)) return
+                      const confirmed = await confirmDialog({
+                        title: '清理并发占用',
+                        message: `确定清理凭据 #${credential.id} 的当前并发占用吗？真实仍在运行的请求可能因此不再计入并发限制。`,
+                        confirmText: '清理',
+                        tone: 'danger',
+                      })
+                      if (!confirmed) return
                       clearInFlight.mutate({ id: credential.id }, {
                         onSuccess: (res) => toast.success(res.message),
                         onError: (error) => toast.error(`清理失败: ${extractErrorMessage(error)}`),
@@ -1081,7 +1088,7 @@ export function CredentialCard({
 
 function MetaItem({ label, value, detail, error }: { label: string; value: React.ReactNode; detail?: React.ReactNode; error?: boolean }) {
   return (
-    <div className="min-w-0">
+    <div className="meta-item">
       <div className="text-[0.68rem] font-medium text-base-content/50">{label}</div>
       <div className={`min-w-0 truncate text-sm font-semibold ${error ? 'text-error' : ''}`}>{value}</div>
       {detail && <div className="mt-0.5 truncate text-xs font-medium text-base-content/45" title={typeof detail === 'string' ? detail : undefined}>{detail}</div>}
