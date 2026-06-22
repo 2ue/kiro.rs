@@ -351,13 +351,21 @@ fn request_runtime_config(state: &AppState, provider: &KiroProvider) -> RequestR
 }
 
 fn parse_messages_payload(raw_body: &Bytes) -> Result<MessagesRequest, Response> {
-    serde_json::from_slice::<MessagesRequest>(raw_body).map_err(|err| {
+    let payload = serde_json::from_slice::<MessagesRequest>(raw_body).map_err(|err| {
         envelope::error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             format!("Invalid JSON body: {}", err),
         )
-    })
+    })?;
+    if payload.model.trim().is_empty() {
+        return Err(envelope::error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "model: field is required and cannot be empty",
+        ));
+    }
+    Ok(payload)
 }
 
 fn build_external_fallback_context(
@@ -4779,6 +4787,38 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_messages_payload_rejects_empty_model_before_routing() {
+        for model in ["", "   "] {
+            let body = Bytes::from(
+                json!({
+                    "model": model,
+                    "max_tokens": 16,
+                    "messages": [{"role": "user", "content": "hello"}]
+                })
+                .to_string(),
+            );
+
+            let response = parse_messages_payload(&body).expect_err("empty model rejected");
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read error body");
+            let value: serde_json::Value = serde_json::from_slice(&body).expect("json envelope");
+            assert_eq!(value["error"]["type"], "invalid_request_error");
+            assert_eq!(
+                value["error"]["message"],
+                "model: field is required and cannot be empty"
+            );
+            assert!(
+                value["request_id"]
+                    .as_str()
+                    .is_some_and(|request_id| request_id.starts_with("req_01"))
+            );
         }
     }
 

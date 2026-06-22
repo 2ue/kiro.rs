@@ -916,7 +916,7 @@ export type PayloadGuardMode = 'preemptive' | 'on_too_long'
 export type ExternalPoolAuthType = 'bearer' | 'x_api_key'
 export type ExternalPoolUsageProjectionMode = 'pass_through' | 'current_path_policy'
 export type ExternalPoolAutoDisablePolicy = 'inherit' | 'disabled' | 'enabled'
-export type ExternalPoolModelMappingMode = 'passthrough' | 'direct_mapping' | 'processed_mapping'
+export type ExternalPoolModelMappingMode = 'passthrough' | 'passthrough_mapping' | 'direct_mapping' | 'processed_mapping'
 
 export interface ExternalPoolModelMappingRule {
   enabled?: boolean
@@ -1069,6 +1069,7 @@ export interface ExternalPool {
   preservePath: boolean
   normalizeModelVersionDots: boolean
   modelMappingMode: ExternalPoolModelMappingMode
+  modelMappingRequireMatch: boolean
   modelMappingRules: ExternalPoolModelMappingRule[]
   notes?: string
   createdAt: string
@@ -1105,6 +1106,7 @@ export interface CreateExternalPoolRequest {
   preservePath?: boolean
   normalizeModelVersionDots?: boolean
   modelMappingMode?: ExternalPoolModelMappingMode
+  modelMappingRequireMatch?: boolean
   modelMappingRules?: ExternalPoolModelMappingRule[]
   notes?: string
 }
@@ -1122,6 +1124,7 @@ export interface UpdateExternalPoolRequest {
   preservePath?: boolean
   normalizeModelVersionDots?: boolean
   modelMappingMode?: ExternalPoolModelMappingMode
+  modelMappingRequireMatch?: boolean
   modelMappingRules?: ExternalPoolModelMappingRule[]
   notes?: string
 }

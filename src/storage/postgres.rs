@@ -371,7 +371,8 @@ impl PostgresStore {
                    max_concurrent_requests, usage_projection_mode, auto_disable_policy,
                    auto_disabled, auto_disabled_reason, auto_disabled_at,
                    auto_disabled_until, auto_disabled_last_error, preserve_path,
-                   normalize_model_version_dots, model_mapping_mode, model_mapping_rules, notes,
+                   normalize_model_version_dots, model_mapping_mode,
+                   model_mapping_require_match, model_mapping_rules, notes,
                    created_at, updated_at
             FROM external_upstream_pools
             WHERE deleted_at IS NULL
@@ -396,7 +397,8 @@ impl PostgresStore {
                    max_concurrent_requests, usage_projection_mode, auto_disable_policy,
                    auto_disabled, auto_disabled_reason, auto_disabled_at,
                    auto_disabled_until, auto_disabled_last_error, preserve_path,
-                   normalize_model_version_dots, model_mapping_mode, model_mapping_rules, notes,
+                   normalize_model_version_dots, model_mapping_mode,
+                   model_mapping_require_match, model_mapping_rules, notes,
                    created_at, updated_at
             FROM external_upstream_pools
             WHERE id = $1 AND deleted_at IS NULL
@@ -427,14 +429,15 @@ impl PostgresStore {
                 name, base_url, api_key, auth_type, enabled, priority,
                 max_concurrent_requests, usage_projection_mode, auto_disable_policy,
                 preserve_path, normalize_model_version_dots, model_mapping_mode,
-                model_mapping_rules, notes, updated_at
+                model_mapping_require_match, model_mapping_rules, notes, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, now())
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
                       max_concurrent_requests, usage_projection_mode, auto_disable_policy,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
-                      normalize_model_version_dots, model_mapping_mode, model_mapping_rules, notes,
+                      normalize_model_version_dots, model_mapping_mode,
+                      model_mapping_require_match, model_mapping_rules, notes,
                       created_at, updated_at
             "#,
         )
@@ -450,6 +453,7 @@ impl PostgresStore {
         .bind(request.preserve_path)
         .bind(request.normalize_model_version_dots)
         .bind(request.model_mapping_mode.as_str())
+        .bind(request.model_mapping_require_match)
         .bind(model_mapping_rules_value)
         .bind(request.notes.map(|notes| notes.trim().to_string()))
         .fetch_one(&self.pool)
@@ -496,6 +500,9 @@ impl PostgresStore {
         let model_mapping_mode = request
             .model_mapping_mode
             .unwrap_or(current.model_mapping_mode);
+        let model_mapping_require_match = request
+            .model_mapping_require_match
+            .unwrap_or(current.model_mapping_require_match);
         let model_mapping_rules = request
             .model_mapping_rules
             .map(normalize_external_pool_model_mapping_rules)
@@ -518,15 +525,17 @@ impl PostgresStore {
                 preserve_path = $11,
                 normalize_model_version_dots = $12,
                 model_mapping_mode = $13,
-                model_mapping_rules = $14,
-                notes = $15,
+                model_mapping_require_match = $14,
+                model_mapping_rules = $15,
+                notes = $16,
                 updated_at = now()
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
                       max_concurrent_requests, usage_projection_mode, auto_disable_policy,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
-                      normalize_model_version_dots, model_mapping_mode, model_mapping_rules, notes,
+                      normalize_model_version_dots, model_mapping_mode,
+                      model_mapping_require_match, model_mapping_rules, notes,
                       created_at, updated_at
             "#,
         )
@@ -543,6 +552,7 @@ impl PostgresStore {
         .bind(preserve_path)
         .bind(normalize_model_version_dots)
         .bind(model_mapping_mode.as_str())
+        .bind(model_mapping_require_match)
         .bind(model_mapping_rules_value)
         .bind(notes)
         .fetch_one(&self.pool)
@@ -564,7 +574,8 @@ impl PostgresStore {
                       max_concurrent_requests, usage_projection_mode, auto_disable_policy,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
-                      normalize_model_version_dots, model_mapping_mode, model_mapping_rules, notes,
+                      normalize_model_version_dots, model_mapping_mode,
+                      model_mapping_require_match, model_mapping_rules, notes,
                       created_at, updated_at
             "#,
         )
@@ -603,7 +614,8 @@ impl PostgresStore {
                       max_concurrent_requests, usage_projection_mode, auto_disable_policy,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
-                      normalize_model_version_dots, model_mapping_mode, model_mapping_rules, notes,
+                      normalize_model_version_dots, model_mapping_mode,
+                      model_mapping_require_match, model_mapping_rules, notes,
                       created_at, updated_at
             "#,
         )
@@ -4289,6 +4301,7 @@ fn external_pool_from_row(row: PgRow, mask_secrets: bool) -> anyhow::Result<Exte
         preserve_path: row.try_get("preserve_path")?,
         normalize_model_version_dots: row.try_get("normalize_model_version_dots")?,
         model_mapping_mode: ExternalPoolModelMappingMode::parse(&model_mapping_mode),
+        model_mapping_require_match: row.try_get("model_mapping_require_match").unwrap_or(false),
         model_mapping_rules: normalize_external_pool_model_mapping_rules(model_mapping_rules),
         notes: row.try_get("notes")?,
         created_at: row.try_get("created_at")?,
@@ -4532,6 +4545,7 @@ CREATE TABLE IF NOT EXISTS external_upstream_pools (
     preserve_path BOOLEAN NOT NULL DEFAULT true,
     normalize_model_version_dots BOOLEAN NOT NULL DEFAULT false,
     model_mapping_mode TEXT NOT NULL DEFAULT 'processed_mapping',
+    model_mapping_require_match BOOLEAN NOT NULL DEFAULT false,
     model_mapping_rules JSONB NOT NULL DEFAULT '[]'::jsonb,
     notes TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -4580,6 +4594,9 @@ ALTER TABLE external_upstream_pools
 
 ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS model_mapping_mode TEXT NOT NULL DEFAULT 'processed_mapping';
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS model_mapping_require_match BOOLEAN NOT NULL DEFAULT false;
 
 ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS model_mapping_rules JSONB NOT NULL DEFAULT '[]'::jsonb;

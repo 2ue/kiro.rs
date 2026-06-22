@@ -46,6 +46,10 @@ use crate::{
         ExternalPoolCapacityMode, ExternalPoolsConfig, ModelMappingRule,
         PromptCacheCreationControlConfig, ReportedUsageConfig,
     },
+    model::model_processing::{
+        ModelProcessingConfig, ModelProcessingError, ModelProcessingInput, ModelProcessingMode,
+        process_model,
+    },
     storage::{
         postgres::PostgresStore,
         redis_cache::{LocalPoolCircuitState, RedisStore},
@@ -152,6 +156,7 @@ impl ExternalPoolAutoDisablePolicy {
 #[serde(rename_all = "snake_case")]
 pub enum ExternalPoolModelMappingMode {
     Passthrough,
+    PassthroughMapping,
     DirectMapping,
     ProcessedMapping,
 }
@@ -166,6 +171,9 @@ impl ExternalPoolModelMappingMode {
     pub fn parse(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
             "passthrough" | "pass_through" => Self::Passthrough,
+            "passthrough_mapping" | "pass_through_mapping" | "passthrough_with_mapping" => {
+                Self::PassthroughMapping
+            }
             "direct_mapping" | "direct" => Self::DirectMapping,
             _ => Self::ProcessedMapping,
         }
@@ -174,8 +182,18 @@ impl ExternalPoolModelMappingMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Passthrough => "passthrough",
+            Self::PassthroughMapping => "passthrough_mapping",
             Self::DirectMapping => "direct_mapping",
             Self::ProcessedMapping => "processed_mapping",
+        }
+    }
+
+    fn processing_mode(self) -> ModelProcessingMode {
+        match self {
+            Self::Passthrough => ModelProcessingMode::Passthrough,
+            Self::PassthroughMapping => ModelProcessingMode::PassthroughMapping,
+            Self::DirectMapping => ModelProcessingMode::MappingThenProcessed,
+            Self::ProcessedMapping => ModelProcessingMode::ProcessedThenMapping,
         }
     }
 }
@@ -210,6 +228,8 @@ pub struct ExternalPool {
     pub normalize_model_version_dots: bool,
     #[serde(default)]
     pub model_mapping_mode: ExternalPoolModelMappingMode,
+    #[serde(default)]
+    pub model_mapping_require_match: bool,
     #[serde(default)]
     pub model_mapping_rules: Vec<ModelMappingRule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -254,6 +274,8 @@ pub struct CreateExternalPoolRequest {
     #[serde(default)]
     pub model_mapping_mode: ExternalPoolModelMappingMode,
     #[serde(default)]
+    pub model_mapping_require_match: bool,
+    #[serde(default)]
     pub model_mapping_rules: Vec<ModelMappingRule>,
     #[serde(default)]
     pub notes: Option<String>,
@@ -286,6 +308,8 @@ pub struct UpdateExternalPoolRequest {
     pub normalize_model_version_dots: Option<bool>,
     #[serde(default)]
     pub model_mapping_mode: Option<ExternalPoolModelMappingMode>,
+    #[serde(default)]
+    pub model_mapping_require_match: Option<bool>,
     #[serde(default)]
     pub model_mapping_rules: Option<Vec<ModelMappingRule>>,
     #[serde(default)]
@@ -396,11 +420,30 @@ pub struct ExternalPoolFinalError {
 
 impl ExternalPoolFinalError {
     pub fn into_response(self, request_id: &str) -> Response {
-        envelope::error_response_with_id(
+        let external_error_id = envelope::request_id();
+        tracing::warn!(
+            request_id,
+            external_error_id = %external_error_id,
+            status = self.status.as_u16(),
+            response_error_type = %self.response_error_type,
+            route_error_type = %self.route_error_type,
+            retryable = self.retryable,
+            pool_id = ?self.pool_id,
+            pool_name = ?self.pool_name,
+            attempts = ?self.attempts,
+            external_message = %self.message,
+            "external pool final error"
+        );
+        let message = format!(
+            "外部备用池请求失败，请稍后重试或联系管理员排查。错误ID: {}",
+            external_error_id
+        );
+        envelope::error_response_with_id_and_headers(
             self.status,
             self.response_error_type,
-            self.message,
+            message,
             request_id,
+            [("x-kiro-rs-error-id", external_error_id)],
         )
     }
 
@@ -951,8 +994,13 @@ impl ExternalPoolManager {
                         }
                     }
                     if let Some((duration, reason)) = &err.cooldown {
-                        self.mark_pool_cooldown(pool_id, *duration, reason.clone())
-                            .await;
+                        if reason == "model_mapping_miss" {
+                            // Request-scoped mismatch: skip this pool for the current request, but
+                            // do not cool down the pool globally for other models.
+                        } else {
+                            self.mark_pool_cooldown(pool_id, *duration, reason.clone())
+                                .await;
+                        }
                     }
                     if let Some(reason) = &err.auto_disable_reason {
                         self.auto_disable_pool_if_configured(&pool, &config, reason, &err.message)
@@ -1028,7 +1076,7 @@ impl ExternalPoolManager {
                 HeaderValue::from_static("application/json"),
             );
         }
-        let outbound_body = external_pool_outbound_body(route, pool);
+        let outbound_body = external_pool_outbound_body(route, pool)?;
         let mut request = self.client.post(url).headers(headers).body(outbound_body);
         if route.payload.stream {
             if config.external_pool_stream_request_timeout_secs > 0 {
@@ -2304,32 +2352,35 @@ fn forward_headers(
     Ok(out)
 }
 
-fn external_pool_outbound_body(route: &ExternalRouteRequest, pool: &ExternalPool) -> Bytes {
+fn external_pool_outbound_body(
+    route: &ExternalRouteRequest,
+    pool: &ExternalPool,
+) -> Result<Bytes, ExternalPoolError> {
     let mut value = match serde_json::to_value(&route.payload) {
         Ok(value) => value,
         Err(_) => match serde_json::from_slice::<serde_json::Value>(&route.raw_body) {
             Ok(value) => value,
-            Err(_) => return route.raw_body.clone(),
+            Err(_) => return Ok(route.raw_body.clone()),
         },
     };
 
-    if let Some(outbound_model) = external_pool_outbound_model(route, pool, &value) {
+    if let Some(outbound_model) = external_pool_outbound_model(route, pool, &value)? {
         if value.get("model").and_then(|model| model.as_str()) != Some(outbound_model.as_str()) {
             value["model"] = serde_json::Value::String(outbound_model);
         }
     }
     normalize_external_pool_thinking_value(&mut value);
 
-    serde_json::to_vec(&value)
+    Ok(serde_json::to_vec(&value)
         .map(Bytes::from)
-        .unwrap_or_else(|_| route.raw_body.clone())
+        .unwrap_or_else(|_| route.raw_body.clone()))
 }
 
 fn external_pool_outbound_model(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
     value: &serde_json::Value,
-) -> Option<String> {
+) -> Result<Option<String>, ExternalPoolError> {
     let original_model = value
         .get("model")
         .and_then(|model| model.as_str())
@@ -2345,44 +2396,27 @@ fn external_pool_outbound_model(
         .map(str::trim)
         .filter(|model| !model.is_empty())
         .or(original_model);
-
-    match pool.model_mapping_mode {
-        ExternalPoolModelMappingMode::Passthrough => original_model
-            .map(|model| model.to_string())
-            .or_else(|| external_pool_fallback_outbound_model(processed_model, pool)),
-        ExternalPoolModelMappingMode::DirectMapping => original_model
-            .and_then(|model| external_pool_model_mapping_target(&pool.model_mapping_rules, model))
-            .or_else(|| external_pool_fallback_outbound_model(processed_model, pool)),
-        ExternalPoolModelMappingMode::ProcessedMapping => processed_model
-            .and_then(|model| external_pool_model_mapping_target(&pool.model_mapping_rules, model))
-            .or_else(|| external_pool_fallback_outbound_model(processed_model, pool)),
-    }
-}
-
-fn external_pool_fallback_outbound_model(
-    model: Option<&str>,
-    pool: &ExternalPool,
-) -> Option<String> {
-    let model = model.map(str::trim).filter(|model| !model.is_empty())?;
-    Some(if pool.normalize_model_version_dots {
-        normalize_external_pool_outbound_model(model)
-    } else {
-        model.to_string()
-    })
-}
-
-fn external_pool_model_mapping_target(rules: &[ModelMappingRule], model: &str) -> Option<String> {
-    let source = model.trim().to_ascii_lowercase();
-    if source.is_empty() {
-        return None;
-    }
-    rules.iter().find_map(|rule| {
-        if !rule.enabled || rule.source.trim().to_ascii_lowercase() != source {
-            return None;
-        }
-        let target = rule.target.trim();
-        (!target.is_empty()).then(|| target.to_string())
-    })
+    let fallback_transform = (pool.normalize_model_version_dots
+        && matches!(
+            pool.model_mapping_mode,
+            ExternalPoolModelMappingMode::DirectMapping
+                | ExternalPoolModelMappingMode::ProcessedMapping
+        ))
+    .then_some(normalize_external_pool_outbound_model as fn(&str) -> String);
+    let result = process_model(
+        ModelProcessingInput {
+            original_model,
+            processed_model,
+        },
+        ModelProcessingConfig {
+            mode: pool.model_mapping_mode.processing_mode(),
+            rules: &pool.model_mapping_rules,
+            require_mapping_match: pool.model_mapping_require_match,
+            fallback_transform,
+        },
+    )
+    .map_err(|err| external_pool_model_processing_error(pool, err))?;
+    Ok(Some(result.model))
 }
 
 pub fn normalize_external_pool_model_mapping_rules(
@@ -2549,6 +2583,33 @@ fn success_protocol_error(
             "misconfigured_endpoint".to_string(),
         )),
         response_body: None,
+    }
+}
+
+fn external_pool_model_processing_error(
+    pool: &ExternalPool,
+    err: ModelProcessingError,
+) -> ExternalPoolError {
+    match err {
+        ModelProcessingError::MissingModel => ExternalPoolError {
+            status: Some(StatusCode::BAD_REQUEST),
+            message: format!("external pool #{} model is missing", pool.id),
+            retryable: false,
+            auto_disable_reason: None,
+            cooldown: None,
+            response_body: None,
+        },
+        ModelProcessingError::MappingMiss { model } => ExternalPoolError {
+            status: Some(StatusCode::BAD_GATEWAY),
+            message: format!(
+                "external pool #{} requires model mapping match, but no rule matched model {}",
+                pool.id, model
+            ),
+            retryable: true,
+            auto_disable_reason: None,
+            cooldown: Some((Duration::ZERO, "model_mapping_miss".to_string())),
+            response_body: None,
+        },
     }
 }
 
@@ -2851,6 +2912,7 @@ fn error_type_for_external_error(err: &ExternalPoolError) -> String {
         if reason == "rate_limit"
             || reason == "database_busy"
             || reason == "model_unavailable"
+            || reason == "model_mapping_miss"
             || reason == "server_error"
             || reason.starts_with("network_error")
         {
@@ -3561,6 +3623,7 @@ mod tests {
             preserve_path: true,
             normalize_model_version_dots: false,
             model_mapping_mode: ExternalPoolModelMappingMode::ProcessedMapping,
+            model_mapping_require_match: false,
             model_mapping_rules: Vec::new(),
             notes: None,
         }
@@ -3815,7 +3878,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_pool_error_response_wraps_raw_error_body_as_message() {
+    async fn external_pool_error_response_masks_raw_error_body_with_trace_id() {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::CONTENT_TYPE,
@@ -3854,6 +3917,13 @@ mod tests {
                 .unwrap(),
             "req_gateway"
         );
+        assert!(
+            response
+                .headers()
+                .get(HeaderName::from_static("x-kiro-rs-error-id"))
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|error_id| error_id.starts_with("req_01"))
+        );
         assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
 
         let actual = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -3861,10 +3931,11 @@ mod tests {
             .expect("read external error body");
         let value: serde_json::Value = serde_json::from_slice(&actual).expect("json envelope");
         assert_eq!(value["error"]["type"], "invalid_request_error");
-        assert_eq!(
-            value["error"]["message"].as_str(),
-            Some(String::from_utf8_lossy(&body).as_ref())
-        );
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains("外部备用池请求失败"));
+        assert!(message.contains("错误ID: req_01"));
+        assert!(!message.contains("bad input"));
+        assert!(!message.contains("invalid_request_error"));
         assert_eq!(value["request_id"], "req_gateway");
     }
 
@@ -3892,15 +3963,23 @@ mod tests {
             external_final_error_from_error(None, Vec::new(), &err).into_response("req_gateway");
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            response
+                .headers()
+                .get(HeaderName::from_static("x-kiro-rs-error-id"))
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|error_id| error_id.starts_with("req_01"))
+        );
         let actual = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("read external final retryable body");
         let value: serde_json::Value = serde_json::from_slice(&actual).expect("json envelope");
         assert_eq!(value["error"]["type"], "rate_limit_error");
-        assert_eq!(
-            value["error"]["message"].as_str(),
-            Some(String::from_utf8_lossy(&body).as_ref())
-        );
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains("外部备用池请求失败"));
+        assert!(message.contains("错误ID: req_01"));
+        assert!(!message.contains("slow down"));
+        assert!(!message.contains("rate_limit_error"));
         assert_eq!(value["request_id"], "req_gateway");
     }
 
@@ -4132,6 +4211,7 @@ mod tests {
             preserve_path,
             normalize_model_version_dots: false,
             model_mapping_mode: ExternalPoolModelMappingMode::ProcessedMapping,
+            model_mapping_require_match: false,
             model_mapping_rules: Vec::new(),
             notes: None,
             created_at: now,
@@ -4153,6 +4233,13 @@ mod tests {
         let mut pool = test_pool("https://example.com/v1", true);
         pool.normalize_model_version_dots = true;
         pool
+    }
+
+    fn test_external_pool_outbound_body(
+        route: &ExternalRouteRequest,
+        pool: &ExternalPool,
+    ) -> Bytes {
+        external_pool_outbound_body(route, pool).expect("build external outbound body")
     }
 
     fn test_route(model: &str) -> ExternalRouteRequest {
@@ -4230,7 +4317,7 @@ mod tests {
         );
 
         let pool = test_pool("https://example.com/v1", true);
-        let outbound = external_pool_outbound_body(&route, &pool);
+        let outbound = test_external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
@@ -4249,7 +4336,7 @@ mod tests {
         );
 
         let pool = test_pool_with_model_dot_normalization();
-        let outbound = external_pool_outbound_body(&route, &pool);
+        let outbound = test_external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
@@ -4278,7 +4365,7 @@ mod tests {
         );
 
         let pool = test_pool_with_model_dot_normalization();
-        let outbound = external_pool_outbound_body(&route, &pool);
+        let outbound = test_external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
@@ -4310,7 +4397,7 @@ mod tests {
         );
 
         let pool = test_pool_with_model_dot_normalization();
-        let outbound = external_pool_outbound_body(&route, &pool);
+        let outbound = test_external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
@@ -4325,7 +4412,7 @@ mod tests {
         let route = test_route("claude-haiku-4.5");
 
         let pool = test_pool_with_model_dot_normalization();
-        let outbound = external_pool_outbound_body(&route, &pool);
+        let outbound = test_external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
@@ -4337,7 +4424,7 @@ mod tests {
         let route = test_route("claude-haiku-4.5");
         let pool = test_pool("https://example.com/v1", true);
 
-        let outbound = external_pool_outbound_body(&route, &pool);
+        let outbound = test_external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
@@ -4355,11 +4442,52 @@ mod tests {
         pool.model_mapping_mode = ExternalPoolModelMappingMode::Passthrough;
         pool.model_mapping_rules = vec![model_rule("claude-sonnet-4-5-20250929", "custom-sonnet")];
 
-        let outbound = external_pool_outbound_body(&route, &pool);
+        let outbound = test_external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
         assert_eq!(value["model"], "claude-sonnet-4-5-20250929");
+    }
+
+    #[test]
+    fn external_pool_outbound_body_passthrough_mapping_maps_hit_and_keeps_original_on_miss() {
+        let mut route = test_route("claude-sonnet-4-5-20250929");
+        route.upstream_model = Some("claude-sonnet-4.5".to_string());
+        route.raw_body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-5-20250929","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        );
+        let mut pool = test_pool_with_model_dot_normalization();
+        pool.model_mapping_mode = ExternalPoolModelMappingMode::PassthroughMapping;
+        pool.model_mapping_rules =
+            vec![model_rule("claude-sonnet-4-5-20250929", "external-sonnet")];
+
+        let outbound = test_external_pool_outbound_body(&route, &pool);
+        let value: serde_json::Value =
+            serde_json::from_slice(&outbound).expect("parse outbound body");
+        assert_eq!(value["model"], "external-sonnet");
+
+        pool.model_mapping_rules = vec![model_rule("claude-opus-4-8", "external-opus")];
+        let outbound = test_external_pool_outbound_body(&route, &pool);
+        let value: serde_json::Value =
+            serde_json::from_slice(&outbound).expect("parse outbound body");
+        assert_eq!(value["model"], "claude-sonnet-4-5-20250929");
+    }
+
+    #[test]
+    fn external_pool_outbound_body_require_mapping_match_rejects_miss_before_send() {
+        let mut route = test_route("claude-sonnet-4-5-20250929");
+        route.upstream_model = Some("claude-sonnet-4.5".to_string());
+        let mut pool = test_pool_with_model_dot_normalization();
+        pool.model_mapping_mode = ExternalPoolModelMappingMode::PassthroughMapping;
+        pool.model_mapping_require_match = true;
+        pool.model_mapping_rules = vec![model_rule("claude-opus-4-8", "external-opus")];
+
+        let err = external_pool_outbound_body(&route, &pool).unwrap_err();
+
+        assert!(err.retryable);
+        assert_eq!(err.status, Some(StatusCode::BAD_GATEWAY));
+        assert_eq!(error_type_for_external_error(&err), "model_mapping_miss");
+        assert!(err.message.contains("requires model mapping match"));
     }
 
     #[test]
@@ -4374,7 +4502,7 @@ mod tests {
         pool.model_mapping_rules =
             vec![model_rule("claude-sonnet-4-5-20250929", "external-sonnet")];
 
-        let outbound = external_pool_outbound_body(&route, &pool);
+        let outbound = test_external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
@@ -4392,7 +4520,7 @@ mod tests {
         pool.model_mapping_mode = ExternalPoolModelMappingMode::ProcessedMapping;
         pool.model_mapping_rules = vec![model_rule("claude-sonnet-4.5", "external-sonnet")];
 
-        let outbound = external_pool_outbound_body(&route, &pool);
+        let outbound = test_external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
@@ -4410,7 +4538,7 @@ mod tests {
         pool.model_mapping_mode = ExternalPoolModelMappingMode::DirectMapping;
         pool.model_mapping_rules = vec![model_rule("claude-opus-4.8", "external-opus")];
 
-        let outbound = external_pool_outbound_body(&route, &pool);
+        let outbound = test_external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
@@ -4428,7 +4556,7 @@ mod tests {
         pool.model_mapping_mode = ExternalPoolModelMappingMode::ProcessedMapping;
         pool.model_mapping_rules = vec![model_rule("claude-sonnet-4.5", "claude-sonnet-4.5")];
 
-        let outbound = external_pool_outbound_body(&route, &pool);
+        let outbound = test_external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
@@ -4450,7 +4578,7 @@ mod tests {
             model_rule("ignored-source", ""),
         ]);
 
-        let outbound = external_pool_outbound_body(&route, &pool);
+        let outbound = test_external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
@@ -4470,7 +4598,7 @@ mod tests {
         pool.model_mapping_mode = ExternalPoolModelMappingMode::DirectMapping;
         pool.model_mapping_rules = vec![model_rule("claude-opus-4-5-20251101", "claude-opus-4.5")];
 
-        let outbound = external_pool_outbound_body(&route, &pool);
+        let outbound = test_external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
@@ -4491,7 +4619,7 @@ mod tests {
             "claude-opus-4-8-thinking",
         )];
 
-        let outbound = external_pool_outbound_body(&route, &pool);
+        let outbound = test_external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
@@ -4530,7 +4658,7 @@ mod tests {
         );
 
         let pool = test_pool("https://example.com/v1", true);
-        let outbound = external_pool_outbound_body(&route, &pool);
+        let outbound = test_external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
@@ -4550,7 +4678,7 @@ mod tests {
         );
 
         let pool = test_pool("https://example.com/v1", true);
-        let outbound = external_pool_outbound_body(&route, &pool);
+        let outbound = test_external_pool_outbound_body(&route, &pool);
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 

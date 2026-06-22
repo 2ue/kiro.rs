@@ -116,6 +116,7 @@ const PROCESSED_MODEL_MAPPING_PRESETS: ExternalPoolModelMappingPreset[] = [
 ]
 
 const modelMappingPresetsForMode = (mode: ExternalPoolFormDraft['modelMappingMode']) => {
+  if (mode === 'passthrough_mapping') return DIRECT_MODEL_MAPPING_PRESETS
   if (mode === 'direct_mapping') return DIRECT_MODEL_MAPPING_PRESETS
   if (mode === 'processed_mapping') return PROCESSED_MODEL_MAPPING_PRESETS
   return []
@@ -158,6 +159,7 @@ type ExternalPoolFormDraft = {
   autoDisablePolicy: NonNullable<CreateExternalPoolRequest['autoDisablePolicy']>
   normalizeModelVersionDots: boolean
   modelMappingMode: NonNullable<CreateExternalPoolRequest['modelMappingMode']>
+  modelMappingRequireMatch: boolean
   modelMappingRulesText: string
   notes: string
 }
@@ -174,6 +176,7 @@ const defaultPoolForm = (): ExternalPoolFormDraft => ({
   autoDisablePolicy: 'inherit',
   normalizeModelVersionDots: false,
   modelMappingMode: DEFAULT_POOL_MODEL_MAPPING_MODE,
+  modelMappingRequireMatch: false,
   modelMappingRulesText: '',
   notes: '',
 })
@@ -190,6 +193,7 @@ const poolFormFromPool = (pool: ExternalPool): ExternalPoolFormDraft => ({
   autoDisablePolicy: pool.autoDisablePolicy,
   normalizeModelVersionDots: Boolean(pool.normalizeModelVersionDots),
   modelMappingMode: pool.modelMappingMode || DEFAULT_POOL_MODEL_MAPPING_MODE,
+  modelMappingRequireMatch: Boolean(pool.modelMappingRequireMatch),
   modelMappingRulesText: joinModelMappingRules(pool.modelMappingRules || []),
   notes: pool.notes || '',
 })
@@ -744,7 +748,7 @@ function ExternalPoolFormDialog({
                 <NumberBox label="单池最大并发" description="当前外部池同时处理的最大请求数。" value={draft.maxConcurrentRequests} min={1} disabled={saving} onChange={(maxConcurrentRequests) => onDraftChange((prev) => ({ ...prev, maxConcurrentRequests }))} />
                 <NumberBox label="优先级" description="数字越小越靠前；同优先级再按容量和状态分配。" value={draft.priority} disabled={saving} onChange={(priority) => onDraftChange((prev) => ({ ...prev, priority }))} />
                 <Toggle label={isEdit ? '启用外部池' : '创建后立即启用'} checked={Boolean(draft.enabled)} disabled={saving} onChange={(enabled) => onDraftChange((prev) => ({ ...prev, enabled }))} />
-                <Toggle label="兜底点号转横杠" checked={Boolean(draft.normalizeModelVersionDots)} disabled={saving} onChange={(normalizeModelVersionDots) => onDraftChange((prev) => ({ ...prev, normalizeModelVersionDots }))} />
+                <Toggle label="未命中时点号转横杠" checked={Boolean(draft.normalizeModelVersionDots)} disabled={saving || draft.modelMappingMode === 'passthrough' || draft.modelMappingRequireMatch} onChange={(normalizeModelVersionDots) => onDraftChange((prev) => ({ ...prev, normalizeModelVersionDots }))} />
               </div>
             </FormSection>
 
@@ -759,15 +763,19 @@ function ExternalPoolFormDialog({
             </FormSection>
           </div>
 
-          <FormSection title="模型映射" description="当前外部池自己的出站模型规则；未命中规则时继续使用兜底转换。">
+          <FormSection title="模型处理" description="控制当前外部池出站 model 字段的处理顺序和未命中策略。">
             <div className="grid gap-3 md:grid-cols-[240px_1fr]">
               <div className="space-y-3">
                 <SelectBox label="映射模式" value={draft.modelMappingMode} disabled={saving} onChange={(modelMappingMode) => onDraftChange((prev) => ({ ...prev, modelMappingMode: modelMappingMode as ExternalPoolFormDraft['modelMappingMode'] }))}>
                   <option value="passthrough">直接透传请求模型</option>
-                  <option value="direct_mapping">按请求模型映射</option>
+                  <option value="passthrough_mapping">透传模型优先映射</option>
+                  <option value="direct_mapping">映射后内部处理</option>
                   <option value="processed_mapping">内部处理后映射</option>
                 </SelectBox>
                 <HintBox>{modelMappingDescription(draft.modelMappingMode, draft.normalizeModelVersionDots)}</HintBox>
+                {draft.modelMappingMode !== 'passthrough' && (
+                  <Toggle label="必须命中映射" checked={Boolean(draft.modelMappingRequireMatch)} disabled={saving} onChange={(modelMappingRequireMatch) => onDraftChange((prev) => ({ ...prev, modelMappingRequireMatch }))} />
+                )}
               </div>
               {draft.modelMappingMode !== 'passthrough' && (
                 <div className="space-y-3">
@@ -1198,17 +1206,22 @@ function modelMappingPresetClass(tone: ExternalPoolModelMappingPreset['tone']) {
 }
 
 function modelMappingDescription(mode: ExternalPool['modelMappingMode'] | undefined, normalizeFallback: boolean) {
-  const fallback = normalizeFallback ? '未命中后按旧逻辑把数字点号转横杠。' : '未命中后按旧逻辑发送内部处理后的模型。'
+  const processedFallback = normalizeFallback ? '未命中后使用内部处理模型，并把数字点号转横杠。' : '未命中后使用内部处理模型。'
   if (mode === 'passthrough') return '直接发送下游请求里的原始模型，不应用映射规则和兜底转换。'
-  if (mode === 'direct_mapping') return `用下游请求模型匹配规则；${fallback}`
-  return `先使用本系统解析后的模型匹配规则；${fallback}`
+  if (mode === 'passthrough_mapping') return '用下游原始请求模型匹配规则；未命中时仍原样透传请求模型。'
+  if (mode === 'direct_mapping') return `用下游原始请求模型匹配规则；${processedFallback}`
+  return `先使用本系统解析后的模型匹配规则；${processedFallback}`
 }
 
 function poolModelMappingSummary(pool: ExternalPool) {
   if (pool.modelMappingMode === 'passthrough') return '透传'
   const count = pool.modelMappingRules?.length || 0
-  const mode = pool.modelMappingMode === 'direct_mapping' ? '请求映射' : '处理后映射'
-  const fallback = pool.normalizeModelVersionDots ? '兜底4.8->4-8' : '兜底原样'
+  const mode = pool.modelMappingMode === 'passthrough_mapping'
+    ? '透传+映射'
+    : pool.modelMappingMode === 'direct_mapping'
+      ? '映射+内部'
+      : '内部+映射'
+  const fallback = pool.modelMappingRequireMatch ? '必须命中' : pool.normalizeModelVersionDots ? '未命中4.8->4-8' : '允许未命中'
   return `${mode}${count ? ` ${count}条` : ''} · ${fallback}`
 }
 
