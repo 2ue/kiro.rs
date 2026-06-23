@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   clearUsageRecords,
@@ -17,7 +18,7 @@ import {
   syncModelCapabilities,
   upsertManualModel,
 } from '@/api/usage'
-import type { AdminAuditLogPageQuery, UpsertManualModelRequest, UsageCleanupRequest, UsageRecordsPageQuery, UsageRecordsQuery } from '@/types/api'
+import type { AdminAuditLogPageQuery, UpsertManualModelRequest, UsageCleanupRequest, UsageCleanupStatusResponse, UsageRecordsPageQuery, UsageRecordsQuery } from '@/types/api'
 
 type RefetchInterval = number | false
 
@@ -73,6 +74,25 @@ export function useUsageCleanupStatus() {
     queryFn: getUsageCleanupStatus,
     refetchInterval: (query) => query.state.data?.status === 'running' ? 2000 : 10000,
   })
+}
+
+export function useRefreshUsageQueriesAfterCleanup(status?: UsageCleanupStatusResponse) {
+  const queryClient = useQueryClient()
+  const lastInvalidatedKey = useRef<string | null>(null)
+
+  useEffect(() => {
+    if (!status?.jobId || status.status === 'idle' || status.status === 'running') return
+    if ((status.processedRows || 0) <= 0) return
+
+    const invalidationKey = `${status.jobId}:${status.status}:${status.processedRows}`
+    if (lastInvalidatedKey.current === invalidationKey) return
+    lastInvalidatedKey.current = invalidationKey
+
+    queryClient.invalidateQueries({ queryKey: ['usage-records'] })
+    queryClient.invalidateQueries({ queryKey: ['usage-records-page'] })
+    queryClient.invalidateQueries({ queryKey: ['usage-summary'] })
+    queryClient.invalidateQueries({ queryKey: ['usage-dashboard'] })
+  }, [queryClient, status?.jobId, status?.processedRows, status?.status])
 }
 
 export function usePreviewUsageCleanup() {

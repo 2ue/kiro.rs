@@ -675,14 +675,7 @@ impl AdminService {
     }
 
     fn invalidate_admin_cache_pattern(&self, pattern: &'static str) {
-        {
-            let mut shadow = self.admin_cache_shadow.lock();
-            if let Some(prefix) = pattern.strip_suffix('*') {
-                shadow.retain(|key, _| !key.starts_with(prefix));
-            } else {
-                shadow.remove(pattern);
-            }
-        }
+        invalidate_admin_cache_shadow(&self.admin_cache_shadow, pattern);
         let redis = self.redis_store.clone();
         tokio::spawn(async move {
             if let Err(err) = redis.del_pattern(pattern).await {
@@ -3318,8 +3311,19 @@ impl AdminService {
         );
 
         let cleanup_state = self.usage_cleanup.clone();
+        let redis = self.redis_store.clone();
+        let admin_cache_shadow = self.admin_cache_shadow.clone();
         tokio::spawn(async move {
-            run_usage_cleanup_job(job_id, store, cleanup_state, cancel, plan).await;
+            run_usage_cleanup_job(
+                job_id,
+                store,
+                redis,
+                admin_cache_shadow,
+                cleanup_state,
+                cancel,
+                plan,
+            )
+            .await;
         });
 
         Ok(self.get_usage_cleanup_status())
@@ -5328,6 +5332,8 @@ fn normalize_usage_cleanup_request(
 async fn run_usage_cleanup_job(
     job_id: String,
     store: PostgresUsageStore,
+    redis: Arc<RedisStore>,
+    admin_cache_shadow: Arc<Mutex<HashMap<String, AdminCacheEntry>>>,
     cleanup_state: Arc<Mutex<UsageCleanupRuntime>>,
     cancel: Arc<AtomicBool>,
     plan: UsageCleanupPlan,
@@ -5422,6 +5428,12 @@ async fn run_usage_cleanup_job(
             .map(|preview| preview.matched_rows)
             .ok(),
     };
+    if processed_rows > 0 {
+        invalidate_usage_admin_cache_after_cleanup(&redis, &admin_cache_shadow).await;
+        if let Err(err) = redis.clear_usage_record_snapshots().await {
+            tracing::warn!("清理 Redis usage records snapshot 失败: {}", err);
+        }
+    }
 
     update_usage_cleanup_progress(
         &cleanup_state,
@@ -5434,6 +5446,28 @@ async fn run_usage_cleanup_job(
         stop_reason,
         last_error,
     );
+}
+
+fn invalidate_admin_cache_shadow(
+    admin_cache_shadow: &Arc<Mutex<HashMap<String, AdminCacheEntry>>>,
+    pattern: &str,
+) {
+    let mut shadow = admin_cache_shadow.lock();
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        shadow.retain(|key, _| !key.starts_with(prefix));
+    } else {
+        shadow.remove(pattern);
+    }
+}
+
+async fn invalidate_usage_admin_cache_after_cleanup(
+    redis: &RedisStore,
+    admin_cache_shadow: &Arc<Mutex<HashMap<String, AdminCacheEntry>>>,
+) {
+    invalidate_admin_cache_shadow(admin_cache_shadow, "admin_cache:usage:*");
+    if let Err(err) = redis.del_pattern("admin_cache:usage:*").await {
+        tracing::warn!("清理 Redis Admin usage 缓存失败: {}", err);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

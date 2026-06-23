@@ -424,6 +424,12 @@ impl RedisStore {
         Ok(())
     }
 
+    pub async fn del_count(&self, key: impl AsRef<str>) -> anyhow::Result<usize> {
+        let mut manager = self.manager.clone();
+        let removed: i64 = manager.del(self.key(key)).await?;
+        Ok(removed.max(0) as usize)
+    }
+
     pub async fn del_pattern(&self, pattern: impl AsRef<str>) -> anyhow::Result<usize> {
         let full_pattern = self.key(pattern);
         let mut manager = self.manager.clone();
@@ -1181,10 +1187,19 @@ impl RedisStore {
     pub async fn clear_usage_summary(&self) -> anyhow::Result<usize> {
         let summary_deleted = self.del_pattern("usage:summary:*").await?;
         let dashboard_deleted = self.del_pattern("usage:dashboard:*").await?;
-        let record_deleted = self.del_pattern("usage:records:*").await?;
+        let record_deleted = self.clear_usage_record_snapshots().await?;
         Ok(summary_deleted
             .saturating_add(dashboard_deleted)
             .saturating_add(record_deleted))
+    }
+
+    pub async fn clear_usage_record_snapshots(&self) -> anyhow::Result<usize> {
+        let initial_index_deleted = self.del_count(USAGE_RECORDS_INDEX_KEY).await?;
+        let item_deleted = self.del_pattern("usage:records:item:*").await?;
+        let final_index_deleted = self.del_count(USAGE_RECORDS_INDEX_KEY).await?;
+        Ok(initial_index_deleted
+            .saturating_add(item_deleted)
+            .saturating_add(final_index_deleted))
     }
 
     async fn usage_realtime_stats(&self) -> anyhow::Result<UsageRealtimeStats> {

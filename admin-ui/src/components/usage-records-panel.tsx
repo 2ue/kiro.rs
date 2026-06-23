@@ -13,6 +13,7 @@ import {
   useCancelUsageCleanup,
   useModelPricing,
   usePreviewUsageCleanup,
+  useRefreshUsageQueriesAfterCleanup,
   useStartUsageCleanup,
   useSyncModelPricing,
   useUsageCleanupStatus,
@@ -1144,6 +1145,7 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
   const previewCleanup = usePreviewUsageCleanup()
   const startCleanup = useStartUsageCleanup()
   const cancelCleanup = useCancelUsageCleanup()
+  useRefreshUsageQueriesAfterCleanup(cleanupStatus.data)
 
   const parsedOlderThanDays = parseCleanupInteger(olderThanDays, 7, 0)
   const parsedBatchSize = parseCleanupInteger(batchSize, 1000, 1)

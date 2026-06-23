@@ -12,6 +12,7 @@ import { useCredentials } from '@/hooks/use-credentials'
 import {
   useCancelUsageCleanup,
   usePreviewUsageCleanup,
+  useRefreshUsageQueriesAfterCleanup,
   useStartUsageCleanup,
   useUsageCleanupStatus,
   useUsageRecordsPage,
@@ -731,6 +732,7 @@ function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: () => vo
   const startCleanup = useStartUsageCleanup()
   const cancelCleanup = useCancelUsageCleanup()
   const confirmDialog = useConfirm()
+  useRefreshUsageQueriesAfterCleanup(cleanupStatus.data)
 
   const parsedOlderThanDays = parseCleanupInteger(olderThanDays, 7, 0)
   const parsedBatchSize = parseCleanupInteger(batchSize, 1000, 1)
