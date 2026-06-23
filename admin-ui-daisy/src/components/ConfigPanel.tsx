@@ -1097,6 +1097,7 @@ export function ConfigPanel() {
   const selectedUsageKey = selectedUsagePath === '__default' || draft.reportedUsage.pathOverrides[selectedUsagePath]
     ? selectedUsagePath
     : '__default'
+  const showRuntimeSave = activeTab !== 'access' && activeTab !== 'network'
 
   if (config.isLoading) return <div className="py-10 text-center text-base-content/60">加载中...</div>
   if (config.error) return <ErrorState text={extractErrorMessage(config.error)} />
@@ -1109,13 +1110,6 @@ export function ConfigPanel() {
           <p className="mt-1 max-w-3xl text-sm leading-6 text-base-content/60">
             保存后会影响新的请求；监听地址、数据库连接等启动设置仍需要修改配置文件并重启服务。
           </p>
-        </div>
-        <div className="config-save-bar">
-          <span className="min-w-0 text-xs leading-5 text-base-content/60">修改后点击保存，新请求会使用新的设置。</span>
-          <Button type="button" color="primary" size="sm" className="shrink-0" onClick={save} disabled={updateConfig.isPending}>
-            {updateConfig.isPending ? <Loading size="xs" /> : <Save className="h-4 w-4" />}
-            保存
-          </Button>
         </div>
       </div>
 
@@ -1150,6 +1144,15 @@ export function ConfigPanel() {
                 <p className="mt-1 text-xs leading-5 text-base-content/60">{activeTabMeta.description}</p>
               </div>
             </div>
+            {showRuntimeSave && (
+              <div className="config-save-bar">
+                <span className="min-w-0 text-xs leading-5 text-base-content/60">保存后，新请求会使用这里的设置。</span>
+                <Button type="button" color="primary" size="sm" className="shrink-0" onClick={save} disabled={updateConfig.isPending}>
+                  {updateConfig.isPending ? <Loading size="xs" /> : <Save className="h-4 w-4" />}
+                  保存
+                </Button>
+              </div>
+            )}
           </div>
 
           <div className="config-section-stack">

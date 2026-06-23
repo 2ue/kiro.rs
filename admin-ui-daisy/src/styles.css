@@ -1144,8 +1144,16 @@ select {
 }
 
 .config-content-head {
+  position: sticky;
+  top: 4.25rem;
+  z-index: 25;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
   border-bottom: 1px solid var(--line);
-  padding-bottom: 0.85rem;
+  background: var(--page-bg);
+  padding: 0 0 0.85rem;
 }
 
 .config-content-title {
@@ -1185,6 +1193,10 @@ select {
     flex-direction: column;
   }
 
+  .config-content-head {
+    top: 4rem;
+  }
+
   .config-save-bar {
     width: 100%;
     justify-content: space-between;
@@ -1222,6 +1234,11 @@ select {
 }
 
 @media (max-width: 767px) {
+  .config-content-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
   .config-group-body {
     grid-template-columns: minmax(0, 1fr);
   }
