@@ -4015,6 +4015,8 @@ mod tests {
             pricing_model: Some("claude-sonnet-4-5".to_string()),
             duration_ms,
             first_token_latency_ms: Some(duration_ms / 2),
+            response_latency_ms: Some(duration_ms),
+            latency_trace: None,
             simulated: source.is_simulated(),
             sticky_bound: status == UsageRecordStatus::Success,
             fallback_from_sticky: status != UsageRecordStatus::Success,

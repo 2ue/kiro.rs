@@ -593,6 +593,16 @@ export type UsageSource =
   | 'request_estimate'
   | 'none'
 
+export interface UsageLatencyTrace {
+  payloadGuardMs?: number
+  upstreamHeaderMs?: number
+  firstUpstreamChunkMs?: number
+  firstOutputDeltaMs?: number
+  streamGapToFirstOutputMs?: number
+  chunksBeforeFirstOutput?: number
+  eventsBeforeFirstOutput?: number
+}
+
 export interface KiroCredentialAttempt {
   attempt: number
   credentialId: number
@@ -633,6 +643,8 @@ export interface UsageRecord {
   pricingModel?: string
   durationMs: number
   firstTokenLatencyMs?: number
+  responseLatencyMs?: number
+  latencyTrace?: UsageLatencyTrace
   simulated: boolean
   stickyBound: boolean
   fallbackFromSticky: boolean

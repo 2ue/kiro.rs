@@ -38,8 +38,8 @@ use crate::{
         prompt_cache_creation_control::PromptCacheCreationController,
         types::MessagesRequest,
         usage::{
-            ExternalPoolAttempt, ExternalPoolBilling, ExternalPoolUsageSnapshot, UsageRecord,
-            UsageRecordStatus, UsageRouteKind, UsageRouteSubtype, UsageSource,
+            ExternalPoolAttempt, ExternalPoolBilling, ExternalPoolUsageSnapshot, UsageLatencyTrace,
+            UsageRecord, UsageRecordStatus, UsageRouteKind, UsageRouteSubtype, UsageSource,
         },
     },
     model::config::{
@@ -389,9 +389,74 @@ pub struct ExternalRouteRequest {
     pub recorder: Arc<crate::anthropic::usage::UsageRecorder>,
     pub started_at: Instant,
     pub first_token_latency_ms: Arc<AtomicU64>,
+    pub latency_trace: Arc<ExternalLatencyTraceState>,
     pub payload_breakdown: Option<PayloadByteBreakdown>,
     pub payload_guard_report: Option<PayloadGuardReport>,
     pub payload_guard_retry_config: Option<PayloadGuardConfig>,
+}
+
+#[derive(Debug, Default)]
+pub struct ExternalLatencyTraceState {
+    upstream_header_ms: AtomicU64,
+    first_upstream_chunk_ms: AtomicU64,
+    first_output_delta_ms: AtomicU64,
+    stream_gap_to_first_output_ms: AtomicU64,
+    chunks_before_first_output: AtomicU64,
+    events_before_first_output: AtomicU64,
+}
+
+impl ExternalLatencyTraceState {
+    fn elapsed_ms(started_at: Instant) -> u64 {
+        started_at.elapsed().as_millis().max(1) as u64
+    }
+
+    fn store_once(field: &AtomicU64, value: u64) {
+        if field.load(Ordering::Relaxed) > 0 {
+            return;
+        }
+        let _ = field.compare_exchange(0, value, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    fn mark_upstream_header(&self, started_at: Instant) {
+        Self::store_once(&self.upstream_header_ms, Self::elapsed_ms(started_at));
+    }
+
+    fn mark_first_upstream_chunk(&self, started_at: Instant) {
+        Self::store_once(&self.first_upstream_chunk_ms, Self::elapsed_ms(started_at));
+    }
+
+    fn mark_first_output(&self, elapsed_ms: u64, chunks_before: u32, events_before: u32) {
+        Self::store_once(&self.first_output_delta_ms, elapsed_ms);
+        self.chunks_before_first_output
+            .store(chunks_before as u64, Ordering::Release);
+        self.events_before_first_output
+            .store(events_before as u64, Ordering::Release);
+        if let Some(first_chunk_ms) = load_nonzero(&self.first_upstream_chunk_ms) {
+            self.stream_gap_to_first_output_ms
+                .store(elapsed_ms.saturating_sub(first_chunk_ms), Ordering::Release);
+        }
+    }
+
+    fn snapshot(&self) -> Option<UsageLatencyTrace> {
+        let first_output_delta_ms = load_nonzero(&self.first_output_delta_ms);
+        let trace = UsageLatencyTrace {
+            payload_guard_ms: None,
+            upstream_header_ms: load_nonzero(&self.upstream_header_ms),
+            first_upstream_chunk_ms: load_nonzero(&self.first_upstream_chunk_ms),
+            first_output_delta_ms,
+            stream_gap_to_first_output_ms: load_nonzero(&self.stream_gap_to_first_output_ms),
+            chunks_before_first_output: first_output_delta_ms
+                .map(|_| self.chunks_before_first_output.load(Ordering::Acquire) as u32),
+            events_before_first_output: first_output_delta_ms
+                .map(|_| self.events_before_first_output.load(Ordering::Acquire) as u32),
+        };
+        (!trace.is_empty()).then_some(trace)
+    }
+}
+
+fn load_nonzero(value: &AtomicU64) -> Option<u64> {
+    let value = value.load(Ordering::Acquire);
+    (value > 0).then_some(value)
 }
 
 struct ExternalForwardResponse {
@@ -1121,6 +1186,7 @@ impl ExternalPoolManager {
                     "model endpoint returned an HTML response for a streaming request",
                 ));
             }
+            route.latency_trace.mark_upstream_header(route.started_at);
             let body_stream = response.bytes_stream();
             let projection_context = build_external_usage_projection_context(
                 route,
@@ -1134,6 +1200,8 @@ impl ExternalPoolManager {
             let stream_usage_projection = projection_context.clone();
             let usage_capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
             let stream_usage_capture = usage_capture.clone();
+            let latency_trace = route.latency_trace.clone();
+            let route_started_at = route.started_at;
             let stream = futures::stream::unfold(
                 (
                     body_stream,
@@ -1153,6 +1221,7 @@ impl ExternalPoolManager {
                 )| {
                     let projection_context = projection_context.clone();
                     let usage_capture = usage_capture.clone();
+                    let latency_trace = latency_trace.clone();
                     async move {
                         if finished {
                             return None;
@@ -1162,6 +1231,8 @@ impl ExternalPoolManager {
                                 chunk = body_stream.next() => {
                                     match chunk {
                                         Some(Ok(chunk)) => {
+                                            latency_trace
+                                                .mark_first_upstream_chunk(route_started_at);
                                             last_chunk_at = Instant::now();
                                             buffer.extend_from_slice(&chunk);
                                             let projected = drain_projected_sse_events(
@@ -1299,6 +1370,7 @@ impl ExternalPoolManager {
                     "model endpoint returned an HTML response for a non-streaming request",
                 ));
             }
+            route.latency_trace.mark_upstream_header(route.started_at);
             drop(lease);
             let projection_context = build_external_usage_projection_context(
                 route,
@@ -1913,6 +1985,8 @@ impl ExternalPoolManager {
             attempts,
             usage_capture,
             usage_projection,
+            chunks_before_first_output: 0,
+            events_before_first_output: 0,
             completed: false,
         };
         let stream = futures::stream::unfold(
@@ -1920,7 +1994,7 @@ impl ExternalPoolManager {
             |(mut data_stream, mut guard)| async move {
                 match data_stream.next().await {
                     Some(Ok(chunk)) => {
-                        if let Some(guard_ref) = guard.as_ref() {
+                        if let Some(guard_ref) = guard.as_mut() {
                             guard_ref.mark_first_token_if_output(&chunk);
                         }
                         Some((Ok(chunk), (data_stream, guard)))
@@ -2015,6 +2089,7 @@ impl ExternalPoolManager {
         } else {
             UsageSource::RequestEstimate
         };
+        let duration_ms = route.started_at.elapsed().as_millis() as u64;
         route.recorder.record(UsageRecord {
             id: route.request_id.clone(),
             created_at: Utc::now().to_rfc3339(),
@@ -2046,11 +2121,13 @@ impl ExternalPoolManager {
             estimated_cost_usd,
             pricing_available,
             pricing_model,
-            duration_ms: route.started_at.elapsed().as_millis() as u64,
+            duration_ms,
             first_token_latency_ms: {
                 let value = route.first_token_latency_ms.load(Ordering::Acquire);
                 (value > 0).then_some(value)
             },
+            response_latency_ms: Some(duration_ms),
+            latency_trace: route.latency_trace.snapshot(),
             simulated: usage_source.is_simulated(),
             sticky_bound: false,
             fallback_from_sticky: false,
@@ -2090,21 +2167,39 @@ struct ExternalStreamUsageGuard {
     attempts: Vec<ExternalPoolAttempt>,
     usage_capture: Option<Arc<SyncMutex<ExternalUsageCapture>>>,
     usage_projection: Option<ExternalUsageProjectionContext>,
+    chunks_before_first_output: u32,
+    events_before_first_output: u32,
     completed: bool,
 }
 
 impl ExternalStreamUsageGuard {
-    fn mark_first_token_if_output(&self, chunk: &Bytes) {
+    fn mark_first_token_if_output(&mut self, chunk: &Bytes) {
+        if self.route.first_token_latency_ms.load(Ordering::Relaxed) > 0 {
+            return;
+        }
         if !external_stream_chunk_has_first_output(chunk) {
+            self.chunks_before_first_output = self.chunks_before_first_output.saturating_add(1);
+            self.events_before_first_output = self
+                .events_before_first_output
+                .saturating_add(count_external_stream_events(chunk));
             return;
         }
         let elapsed = self.route.started_at.elapsed().as_millis().max(1) as u64;
-        let _ = self.route.first_token_latency_ms.compare_exchange(
-            0,
-            elapsed,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        if self
+            .route
+            .first_token_latency_ms
+            .compare_exchange(0, elapsed, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let events_before = self
+                .events_before_first_output
+                .saturating_add(count_external_stream_events_before_first_output(chunk));
+            self.route.latency_trace.mark_first_output(
+                elapsed,
+                self.chunks_before_first_output,
+                events_before,
+            );
+        }
     }
 
     fn record_success(&mut self) {
@@ -2163,14 +2258,99 @@ impl ExternalStreamUsageGuard {
 }
 
 fn external_stream_chunk_has_first_output(chunk: &Bytes) -> bool {
-    let Ok(text) = std::str::from_utf8(chunk.as_ref()) else {
-        return false;
+    external_stream_first_output_index(chunk).is_some()
+}
+
+fn external_stream_first_output_index(chunk: &Bytes) -> Option<usize> {
+    let bytes = chunk.as_ref();
+    let mut offset = 0usize;
+    while let Some((idx, delimiter_len)) = find_sse_event_delimiter(&bytes[offset..]) {
+        let event_end = offset + idx + delimiter_len;
+        if std::str::from_utf8(&bytes[offset..event_end])
+            .ok()
+            .is_some_and(external_sse_event_has_first_output)
+        {
+            return Some(offset);
+        }
+        offset = event_end;
+    }
+    None
+}
+
+fn count_external_stream_events(chunk: &Bytes) -> u32 {
+    count_complete_sse_events(chunk.as_ref())
+}
+
+fn count_external_stream_events_before_first_output(chunk: &Bytes) -> u32 {
+    let Some(index) = external_stream_first_output_index(chunk) else {
+        return count_external_stream_events(chunk);
     };
-    text.contains("content_block_delta")
-        || (text.contains("content_block_start")
-            && (text.contains("tool_use")
-                || text.contains("server_tool_use")
-                || text.contains("redacted_thinking")))
+    count_complete_sse_events(&chunk.as_ref()[..index])
+}
+
+fn count_complete_sse_events(bytes: &[u8]) -> u32 {
+    let mut count = 0u32;
+    let mut offset = 0usize;
+    while let Some((idx, delimiter_len)) = find_sse_event_delimiter(&bytes[offset..]) {
+        count = count.saturating_add(1);
+        offset = offset.saturating_add(idx).saturating_add(delimiter_len);
+    }
+    count
+}
+
+fn external_sse_event_has_first_output(event: &str) -> bool {
+    for line in event.lines() {
+        let Some(data) = line.trim_end_matches('\r').strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        if serde_json::from_str::<serde_json::Value>(data)
+            .ok()
+            .is_some_and(|value| external_sse_data_has_first_output(&value))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn external_sse_data_has_first_output(value: &serde_json::Value) -> bool {
+    match value.get("type").and_then(|value| value.as_str()) {
+        Some("content_block_delta") => {
+            let Some(delta) = value.get("delta").and_then(|value| value.as_object()) else {
+                return false;
+            };
+            match delta.get("type").and_then(|value| value.as_str()) {
+                Some("text_delta") => delta
+                    .get("text")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|text| !text.is_empty()),
+                Some("thinking_delta") => delta
+                    .get("thinking")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|thinking| !thinking.is_empty()),
+                Some("input_json_delta") => delta
+                    .get("partial_json")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|partial_json| !partial_json.is_empty()),
+                _ => false,
+            }
+        }
+        Some("content_block_start") => value
+            .get("content_block")
+            .and_then(|value| value.get("type"))
+            .and_then(|value| value.as_str())
+            .is_some_and(|block_type| {
+                matches!(
+                    block_type,
+                    "tool_use" | "server_tool_use" | "redacted_thinking"
+                )
+            }),
+        _ => false,
+    }
 }
 
 impl Drop for ExternalStreamUsageGuard {
@@ -4138,6 +4318,7 @@ mod tests {
             recorder: Arc::new(crate::anthropic::usage::UsageRecorder::new(1)),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            latency_trace: Arc::new(ExternalLatencyTraceState::default()),
             payload_breakdown: None,
             payload_guard_report: None,
             payload_guard_retry_config: None,
@@ -4160,7 +4341,10 @@ mod tests {
             .expect("read scheduler error body");
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["type"], "external_pool_capacity_full");
-        assert_eq!(body["error"]["message"], "Request capacity is full");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("外部备用池请求失败"));
+        assert!(message.contains("错误ID: req_01"));
+        assert!(!message.contains("Request capacity is full"));
     }
 
     #[test]
@@ -4187,6 +4371,73 @@ mod tests {
             error_type_for_external_error(&err),
             "misconfigured_endpoint"
         );
+    }
+
+    #[test]
+    fn external_latency_trace_records_stream_markers_without_changing_first_output_semantics() {
+        let trace = ExternalLatencyTraceState::default();
+        let started_at = Instant::now() - Duration::from_millis(25);
+
+        trace.mark_upstream_header(started_at);
+        trace.mark_first_upstream_chunk(started_at);
+
+        let text_start = Bytes::from_static(
+            b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"text\"}}\n\n",
+        );
+        assert!(!external_stream_chunk_has_first_output(&text_start));
+
+        let output = Bytes::from_static(
+            b"event: ping\ndata: {}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+        );
+        assert!(external_stream_chunk_has_first_output(&output));
+        assert_eq!(count_external_stream_events_before_first_output(&output), 1);
+
+        trace.mark_first_output(50, 1, 2);
+        let snapshot = trace.snapshot().expect("latency trace snapshot");
+        assert!(snapshot.upstream_header_ms.is_some());
+        assert!(snapshot.first_upstream_chunk_ms.is_some());
+        assert_eq!(snapshot.first_output_delta_ms, Some(50));
+        assert_eq!(snapshot.chunks_before_first_output, Some(1));
+        assert_eq!(snapshot.events_before_first_output, Some(2));
+        assert!(snapshot.stream_gap_to_first_output_ms.is_some());
+    }
+
+    #[test]
+    fn external_first_output_parser_uses_sse_json_semantics() {
+        let empty_delta = Bytes::from_static(
+            br#"event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":""}}
+
+"#,
+        );
+        assert!(!external_stream_chunk_has_first_output(&empty_delta));
+
+        let text_then_tool_start = Bytes::from_static(
+            br#"event: content_block_start
+data: {"type":"content_block_start","content_block":{"type":"text"}}
+
+event: content_block_start
+data: {"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_1","name":"read","input":{}}}
+
+"#,
+        );
+        assert!(external_stream_chunk_has_first_output(
+            &text_then_tool_start
+        ));
+        assert_eq!(
+            count_external_stream_events_before_first_output(&text_then_tool_start),
+            1
+        );
+
+        let content_in_payload_string = Bytes::from_static(
+            br#"event: message_delta
+data: {"type":"message_delta","note":"content_block_delta"}
+
+"#,
+        );
+        assert!(!external_stream_chunk_has_first_output(
+            &content_in_payload_string
+        ));
     }
 
     fn test_pool(base_url: &str, preserve_path: bool) -> ExternalPool {
@@ -4273,6 +4524,7 @@ mod tests {
             recorder: Arc::new(crate::anthropic::usage::UsageRecorder::new(1)),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            latency_trace: Arc::new(ExternalLatencyTraceState::default()),
             payload_breakdown: None,
             payload_guard_report: None,
             payload_guard_retry_config: None,

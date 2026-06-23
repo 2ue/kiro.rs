@@ -5,7 +5,7 @@ use std::{
     convert::Infallible,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -55,8 +55,8 @@ use super::types::{
     Thinking,
 };
 use super::usage::{
-    ExternalPoolAttempt, ExternalPoolUsageSnapshot, UsageRecord, UsageRecordStatus, UsageRouteKind,
-    UsageRouteSubtype, UsageSource,
+    ExternalPoolAttempt, ExternalPoolUsageSnapshot, UsageLatencyTrace, UsageRecord,
+    UsageRecordStatus, UsageRouteKind, UsageRouteSubtype, UsageSource,
 };
 use super::websearch;
 use crate::external_pool::{
@@ -70,6 +70,7 @@ use crate::kiro::token_manager::LocalPoolRouteStateKind;
 const MAX_REMOTE_MULTIMODAL_BYTES: usize = 20 * 1024 * 1024;
 const UPSTREAM_INVALID_REQUEST_MESSAGE: &str =
     "Invalid request. Simplify the message, tools, tool results, files, or images and retry.";
+const LATENCY_COUNTER_UNSET: u32 = u32::MAX;
 
 #[derive(Clone)]
 struct RequestUsageContext {
@@ -109,6 +110,48 @@ struct RequestUsageContext {
     external_attempts: Vec<ExternalPoolAttempt>,
     started_at: Instant,
     first_token_latency_ms: Arc<AtomicU64>,
+    latency: RequestLatencyTraceState,
+}
+
+#[derive(Clone)]
+struct RequestLatencyTraceState {
+    payload_guard_ms: Option<u64>,
+    upstream_header_latency_ms: Arc<AtomicU64>,
+    first_upstream_chunk_latency_ms: Arc<AtomicU64>,
+    upstream_chunks_seen: Arc<AtomicU32>,
+    events_seen_before_first_output: Arc<AtomicU32>,
+    chunks_before_first_output: Arc<AtomicU32>,
+    events_before_first_output: Arc<AtomicU32>,
+}
+
+impl RequestLatencyTraceState {
+    fn new() -> Self {
+        Self {
+            payload_guard_ms: None,
+            upstream_header_latency_ms: Arc::new(AtomicU64::new(0)),
+            first_upstream_chunk_latency_ms: Arc::new(AtomicU64::new(0)),
+            upstream_chunks_seen: Arc::new(AtomicU32::new(0)),
+            events_seen_before_first_output: Arc::new(AtomicU32::new(0)),
+            chunks_before_first_output: Arc::new(AtomicU32::new(LATENCY_COUNTER_UNSET)),
+            events_before_first_output: Arc::new(AtomicU32::new(LATENCY_COUNTER_UNSET)),
+        }
+    }
+}
+
+fn load_latency_ms(value: &AtomicU64) -> Option<u64> {
+    let value = value.load(Ordering::Acquire);
+    (value > 0).then_some(value)
+}
+
+fn load_latency_counter(value: &AtomicU32) -> Option<u32> {
+    let value = value.load(Ordering::Acquire);
+    (value != LATENCY_COUNTER_UNSET).then_some(value)
+}
+
+fn saturating_fetch_add_u32(value: &AtomicU32, amount: u32) {
+    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(amount))
+    });
 }
 
 #[derive(Clone)]
@@ -629,6 +672,7 @@ impl ExternalFallbackContext {
             recorder: self.recorder.clone(),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            latency_trace: Arc::new(crate::external_pool::ExternalLatencyTraceState::default()),
             payload_breakdown: guarded_payload.payload_breakdown,
             payload_guard_report: guarded_payload.payload_guard_report,
             payload_guard_retry_config: guarded_payload.payload_guard_retry_config,
@@ -880,21 +924,117 @@ impl CredentialErrorHint {
 }
 
 impl RequestUsageContext {
+    fn elapsed_ms(&self) -> u64 {
+        self.started_at.elapsed().as_millis().max(1) as u64
+    }
+
     fn first_token_latency_ms(&self) -> Option<u64> {
         let value = self.first_token_latency_ms.load(Ordering::Acquire);
         (value > 0).then_some(value)
     }
 
-    fn mark_first_token_if_output(&self, events: &[SseEvent]) {
-        if events.iter().any(is_first_token_output_event) {
-            let elapsed = self.started_at.elapsed().as_millis().max(1) as u64;
-            let _ = self.first_token_latency_ms.compare_exchange(
-                0,
-                elapsed,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+    fn mark_payload_guard_latency(&mut self, elapsed: Duration) {
+        self.latency.payload_guard_ms = Some(elapsed.as_millis().max(1) as u64);
+    }
+
+    fn mark_upstream_header(&self) {
+        let elapsed = self.elapsed_ms();
+        let _ = self.latency.upstream_header_latency_ms.compare_exchange(
+            0,
+            elapsed,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn mark_first_upstream_chunk(&self) {
+        if self.first_token_latency_ms.load(Ordering::Relaxed) > 0 {
+            return;
         }
+        self.latency
+            .upstream_chunks_seen
+            .fetch_add(1, Ordering::Relaxed);
+        if self
+            .latency
+            .first_upstream_chunk_latency_ms
+            .load(Ordering::Relaxed)
+            > 0
+        {
+            return;
+        }
+        let elapsed = self.elapsed_ms();
+        let _ = self
+            .latency
+            .first_upstream_chunk_latency_ms
+            .compare_exchange(0, elapsed, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    fn mark_first_token_if_output(&self, events: &[SseEvent]) {
+        if self.first_token_latency_ms.load(Ordering::Acquire) > 0 {
+            return;
+        }
+
+        let Some(index) = events.iter().position(is_first_token_output_event) else {
+            if !events.is_empty() {
+                saturating_fetch_add_u32(
+                    &self.latency.events_seen_before_first_output,
+                    u32::try_from(events.len()).unwrap_or(u32::MAX),
+                );
+            }
+            return;
+        };
+
+        let elapsed = self.elapsed_ms();
+        if self
+            .first_token_latency_ms
+            .compare_exchange(0, elapsed, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let chunks_before = self
+                .latency
+                .upstream_chunks_seen
+                .load(Ordering::Acquire)
+                .saturating_sub(1);
+            self.latency
+                .chunks_before_first_output
+                .store(chunks_before, Ordering::Release);
+            let previous_events = self
+                .latency
+                .events_seen_before_first_output
+                .load(Ordering::Acquire);
+            let events_before =
+                previous_events.saturating_add(u32::try_from(index).unwrap_or(u32::MAX));
+            self.latency
+                .events_before_first_output
+                .store(events_before, Ordering::Release);
+        }
+    }
+
+    fn latency_trace(&self) -> Option<UsageLatencyTrace> {
+        let upstream_header_ms = load_latency_ms(&self.latency.upstream_header_latency_ms);
+        let first_upstream_chunk_ms =
+            load_latency_ms(&self.latency.first_upstream_chunk_latency_ms);
+        let first_output_delta_ms = self.first_token_latency_ms();
+        let stream_gap_to_first_output_ms = match (first_upstream_chunk_ms, first_output_delta_ms) {
+            (Some(first_chunk), Some(first_output)) => {
+                Some(first_output.saturating_sub(first_chunk))
+            }
+            _ => None,
+        };
+        let trace = UsageLatencyTrace {
+            payload_guard_ms: self.latency.payload_guard_ms,
+            upstream_header_ms,
+            first_upstream_chunk_ms,
+            first_output_delta_ms,
+            stream_gap_to_first_output_ms,
+            chunks_before_first_output: load_latency_counter(
+                &self.latency.chunks_before_first_output,
+            ),
+            events_before_first_output: load_latency_counter(
+                &self.latency.events_before_first_output,
+            ),
+        };
+        (!trace.is_empty()).then_some(trace)
     }
 
     fn cache_amplification(&self) -> Option<super::cache::CacheAmplification> {
@@ -1527,6 +1667,7 @@ impl CredentialUsageContext {
         } else {
             None
         };
+        let duration_ms = self.request.started_at.elapsed().as_millis() as u64;
         self.request.recorder.record(UsageRecord {
             id: self.request.request_id.clone(),
             created_at: Utc::now().to_rfc3339(),
@@ -1553,8 +1694,10 @@ impl CredentialUsageContext {
             estimated_cost_usd: pricing.cost_usd,
             pricing_available: pricing.available,
             pricing_model: Some(pricing.model),
-            duration_ms: self.request.started_at.elapsed().as_millis() as u64,
+            duration_ms,
             first_token_latency_ms: self.request.first_token_latency_ms(),
+            response_latency_ms: Some(duration_ms),
+            latency_trace: self.request.latency_trace(),
             simulated: usage_source.is_simulated(),
             sticky_bound: self.sticky_bound,
             fallback_from_sticky: self.fallback_from_sticky,
@@ -2188,6 +2331,7 @@ fn prepare_usage_context(
         external_attempts: Vec::new(),
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+        latency: RequestLatencyTraceState::new(),
     }
 }
 
@@ -2958,6 +3102,7 @@ async fn post_messages_inner(
             .then(|| conversion_result.warnings.encode_header())
             .flatten(),
     );
+    let payload_guard_started_at = Instant::now();
     let (request_body, payload_guard_report) = match guard_kiro_request(
         &mut kiro_request,
         runtime_config.initial_payload_guard_config(),
@@ -2965,6 +3110,7 @@ async fn post_messages_inner(
         Ok(result) => result,
         Err(err) => return payload_guard_error_response(err),
     };
+    let payload_guard_elapsed = payload_guard_started_at.elapsed();
     log_payload_guard_report(
         &payload_guard_report,
         endpoint,
@@ -3022,7 +3168,7 @@ async fn post_messages_inner(
         payload.messages.clone(),
         payload.tools.clone(),
     ) as i32;
-    let usage_context = prepare_usage_context(
+    let mut usage_context = prepare_usage_context(
         &state,
         runtime_config.clone(),
         endpoint,
@@ -3034,6 +3180,7 @@ async fn post_messages_inner(
         input_tokens,
     )
     .with_payload_diagnostics(payload_breakdown, payload_guard_report.clone());
+    usage_context.mark_payload_guard_latency(payload_guard_elapsed);
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -3491,6 +3638,7 @@ async fn handle_stream_request(
             }
         }
     };
+    usage_context.mark_upstream_header();
     let (response, completion) = response.into_parts();
     let credential_attempts =
         merge_credential_attempts(retry_attempt_prefix, completion.attempts().to_vec());
@@ -3598,6 +3746,10 @@ fn create_sse_stream(
                 chunk_result = body_stream.next() => {
                     match chunk_result {
                         Some(Ok(chunk)) => {
+                            usage_guard
+                                .context()
+                                .request
+                                .mark_first_upstream_chunk();
                             idle_deadline = Instant::now() + Duration::from_secs(UPSTREAM_IDLE_TIMEOUT_SECS);
                             completion.touch();
                             // 解码事件
@@ -4047,6 +4199,7 @@ async fn handle_non_stream_request(
             }
         }
     };
+    usage_context.mark_upstream_header();
     let credential_attempts =
         merge_credential_attempts(retry_attempt_prefix, api_response.attempts().to_vec());
     let credential_usage = prepare_credential_usage_context(
@@ -4618,6 +4771,7 @@ pub async fn post_messages_cc(
             .then(|| conversion_result.warnings.encode_header())
             .flatten(),
     );
+    let payload_guard_started_at = Instant::now();
     let (request_body, payload_guard_report) = match guard_kiro_request(
         &mut kiro_request,
         runtime_config.initial_payload_guard_config(),
@@ -4625,6 +4779,7 @@ pub async fn post_messages_cc(
         Ok(result) => result,
         Err(err) => return payload_guard_error_response(err),
     };
+    let payload_guard_elapsed = payload_guard_started_at.elapsed();
     log_payload_guard_report(
         &payload_guard_report,
         "/cc/v1/messages",
@@ -4682,7 +4837,7 @@ pub async fn post_messages_cc(
         payload.messages.clone(),
         payload.tools.clone(),
     ) as i32;
-    let usage_context = prepare_usage_context(
+    let mut usage_context = prepare_usage_context(
         &state,
         runtime_config.clone(),
         "/cc/v1/messages",
@@ -4694,6 +4849,7 @@ pub async fn post_messages_cc(
         input_tokens,
     )
     .with_payload_diagnostics(payload_breakdown, payload_guard_report.clone());
+    usage_context.mark_payload_guard_latency(payload_guard_elapsed);
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -5139,6 +5295,7 @@ mod tests {
             external_attempts: Vec::new(),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            latency: RequestLatencyTraceState::new(),
         };
         let usage = CacheUsage {
             total_input_tokens: 100_000,
@@ -5222,6 +5379,7 @@ mod tests {
             external_attempts: Vec::new(),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            latency: RequestLatencyTraceState::new(),
         };
         let credential_usage =
             usage_context.attach_credential(Some(131), None, false, false, Vec::new());
@@ -5312,6 +5470,89 @@ mod tests {
     }
 
     #[test]
+    fn local_latency_trace_records_markers_without_changing_first_output_semantics() {
+        let mut usage_context = RequestUsageContext {
+            recorder: Arc::new(UsageRecorder::new(10)),
+            prompt_cache: Arc::new(PromptCacheTracker::default()),
+            prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+            pricing_catalog: Arc::new(PricingCatalog::new()),
+            request_id: "req_latency_trace".to_string(),
+            endpoint: "/cc/v1/messages",
+            stream: true,
+            model: "claude-opus-4-8".to_string(),
+            upstream_model: Some("claude-opus-4.8".to_string()),
+            model_resolution_source: None,
+            model_resolution_note: None,
+            conversation_id: Some("session-latency".to_string()),
+            prompt_cache_scope_conversation_id: Some("session-latency".to_string()),
+            input_tokens: 100,
+            context_window_tokens: 200_000,
+            prompt_cache_profile: None,
+            simulation_mode: PromptCacheSimulationMode::Disabled,
+            prompt_cache_target_read_ratio: 0.95,
+            prompt_cache_token_scale: 1.0,
+            prompt_cache_max_simulated_input_tokens: 0,
+            prompt_cache_cap_jitter_min_tokens: 0,
+            prompt_cache_cap_jitter_max_tokens: 0,
+            prompt_cache_scale_min_input_tokens: 0,
+            prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+            reported_cache_usage_policy: None,
+            simulated_usage: None,
+            simulated_source: None,
+            payload_breakdown: None,
+            payload_guard_report: None,
+            route_subtype_override: None,
+            fallback_reason: None,
+            local_preflight: None,
+            external_attempts: Vec::new(),
+            started_at: Instant::now(),
+            first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            latency: RequestLatencyTraceState::new(),
+        };
+
+        usage_context.mark_payload_guard_latency(Duration::from_millis(3));
+        usage_context.mark_upstream_header();
+        usage_context.mark_first_upstream_chunk();
+        usage_context.mark_first_token_if_output(&[
+            SseEvent::new("message_start", json!({"type": "message_start"})),
+            SseEvent::new(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""}
+                }),
+            ),
+        ]);
+        assert!(usage_context.first_token_latency_ms().is_none());
+
+        usage_context.mark_first_upstream_chunk();
+        usage_context.mark_first_token_if_output(&[
+            SseEvent::new("ping", json!({"type": "ping"})),
+            SseEvent::new(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "hello"}
+                }),
+            ),
+        ]);
+
+        let trace = usage_context.latency_trace().expect("latency trace");
+        assert_eq!(trace.payload_guard_ms, Some(3));
+        assert!(trace.upstream_header_ms.is_some());
+        assert!(trace.first_upstream_chunk_ms.is_some());
+        assert_eq!(
+            trace.first_output_delta_ms,
+            usage_context.first_token_latency_ms()
+        );
+        assert_eq!(trace.chunks_before_first_output, Some(1));
+        assert_eq!(trace.events_before_first_output, Some(3));
+        assert!(trace.stream_gap_to_first_output_ms.is_some());
+    }
+
+    #[test]
     fn path_overrides_independently_control_reported_usage_fields() {
         let reported_usage_config = ReportedUsageConfig::default();
         let usage = CacheUsage {
@@ -5367,6 +5608,7 @@ mod tests {
             external_attempts: Vec::new(),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            latency: RequestLatencyTraceState::new(),
         };
         let cc_context = RequestUsageContext {
             endpoint: "/cc/v1/messages",
@@ -5518,6 +5760,7 @@ mod tests {
             external_attempts: Vec::new(),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            latency: RequestLatencyTraceState::new(),
         };
         usage_context
             .attach_credential(Some(hint.id), hint.label, false, false, Vec::new())
@@ -5672,6 +5915,7 @@ mod tests {
             external_attempts: Vec::new(),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            latency: RequestLatencyTraceState::new(),
         }
         .attach_credential(Some(1), None, false, false, Vec::new());
         let usage = CacheUsage {
@@ -5761,6 +6005,7 @@ mod tests {
             external_attempts: Vec::new(),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            latency: RequestLatencyTraceState::new(),
         }
         .attach_credential(Some(1), None, false, false, Vec::new());
         let metadata = MetadataTokenUsage {

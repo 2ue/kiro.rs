@@ -257,6 +257,28 @@ function UsageMetric({
   )
 }
 
+function LatencyTracePanel({ record }: { record: UsageRecord }) {
+  const trace = record.latencyTrace
+  if (!trace) return null
+
+  const firstOutput = trace.firstOutputDeltaMs ?? record.firstTokenLatencyMs
+  return (
+    <div className="rounded-md border bg-background p-3 text-sm">
+      <div className="mb-2 font-medium">耗时拆解</div>
+      <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+        <UsageMetric label="总耗时" value={formatLatency(record.durationMs)} />
+        <UsageMetric label="请求检查" value={formatLatency(trace.payloadGuardMs)} />
+        <UsageMetric label="上游响应头" value={formatLatency(trace.upstreamHeaderMs)} tone="info" />
+        <UsageMetric label="首个流分片" value={formatLatency(trace.firstUpstreamChunkMs)} />
+        <UsageMetric label="首次输出" value={formatLatency(firstOutput)} tone="success" />
+        <UsageMetric label="分片到输出" value={formatLatency(trace.streamGapToFirstOutputMs)} />
+        <UsageMetric label="输出前分片" value={typeof trace.chunksBeforeFirstOutput === 'number' ? formatNumber(trace.chunksBeforeFirstOutput) : '-'} />
+        <UsageMetric label="输出前事件" value={typeof trace.eventsBeforeFirstOutput === 'number' ? formatNumber(trace.eventsBeforeFirstOutput) : '-'} />
+      </div>
+    </div>
+  )
+}
+
 export function UsageRecordsPanel() {
   const [searchText, setSearchText] = useState('')
   const [model, setModel] = useState('')
@@ -893,6 +915,7 @@ export function UsageRecordsPanel() {
                   <div>{formatLatency(selectedRecord.firstTokenLatencyMs)}</div>
                 </div>
               </div>
+              <LatencyTracePanel record={selectedRecord} />
               <div className="rounded-md border bg-muted/30 p-3 text-sm">
                 <div className="mb-2 flex flex-wrap items-center gap-2">
                   <div className="font-medium">Usage 口径</div>

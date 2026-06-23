@@ -177,6 +177,37 @@ impl UsageSource {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UsageLatencyTrace {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_guard_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_header_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_upstream_chunk_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_output_delta_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_gap_to_first_output_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunks_before_first_output: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events_before_first_output: Option<u32>,
+}
+
+impl UsageLatencyTrace {
+    pub fn is_empty(&self) -> bool {
+        self.payload_guard_ms.is_none()
+            && self.upstream_header_ms.is_none()
+            && self.first_upstream_chunk_ms.is_none()
+            && self.first_output_delta_ms.is_none()
+            && self.stream_gap_to_first_output_ms.is_none()
+            && self.chunks_before_first_output.is_none()
+            && self.events_before_first_output.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UsageRecord {
     pub id: String,
     pub created_at: String,
@@ -217,6 +248,10 @@ pub struct UsageRecord {
     pub duration_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_token_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_trace: Option<UsageLatencyTrace>,
     pub simulated: bool,
     pub sticky_bound: bool,
     pub fallback_from_sticky: bool,
@@ -1570,6 +1605,8 @@ mod tests {
             pricing_model: Some("claude-sonnet-4-5".to_string()),
             duration_ms: 10,
             first_token_latency_ms: None,
+            response_latency_ms: Some(10),
+            latency_trace: None,
             simulated: source.is_simulated(),
             sticky_bound: false,
             fallback_from_sticky: false,
