@@ -1,225 +1,143 @@
-# Admin UI 现代化分析与重构记录
+# Admin UI 现代化重构分析
 
 日期：2026-06-22
 
 ## 结论
 
-当前项目有两个管理后台：
+当前实际改造目标是 `/console` 对应的 `admin-ui-daisy`。这套前端不是常规路由页面体系，而是一个 `Dashboard` 壳层根据 pathname 维护 tab 状态，再把各业务面板直接渲染到同一个 `main` 容器里。
 
-- `/admin`：旧版 `admin-ui`。
-- `/console`：新版 `admin-ui-daisy`，也是当前实际改造目标。
+问题不只是颜色不对，也不是某两个页面不好看。现有实现的根问题是：视觉 token、页面骨架、资源列表、表格、表单分组、弹层和批量操作没有形成统一的后台设计系统。每个页面都在自己实现工具栏、卡片、说明块、表格容器和弹层结构，导致整体像多个局部页面拼在一起。
 
-本次重构聚焦 `/console`。新版后台的业务功能已经比较完整，问题不在功能缺失，而在 UI 视觉系统不统一：默认组件痕迹重、层级弱、页面之间细节不一致、配置页说明偏生硬、登录页和控制台主体不在同一套视觉语言里。
+本次方向是中性浅底后台系统，黑金只做品牌点缀和高亮，不做大面积背景。页面应以白色和浅灰为主，黑色用于结构文字和少量品牌标识，金色只用于主操作、选中态、焦点和关键强调。
 
-最终方向是单一浅底黑金简约风格：浅暖灰页面底、黑色结构文字、金色强调线和主操作，不使用黑色背景，不保留其他主题，也不提供主题切换入口。
+## 当前结构诊断
 
-## 参考方向
+### 应用壳层
 
-本次参考现代后台项目的布局和信息层级，不直接复制模板代码。
+- `admin-ui-daisy/src/App.tsx` 只负责登录态分流。
+- `admin-ui-daisy/src/components/Dashboard.tsx` 维护 `activeTab`，用 `window.history.pushState` 同步 `/console/...` 路径。
+- `admin-ui-daisy/src/types/ui.ts` 定义 `TabKey`、路径片段和页面标题。
+- 所有页面共用一个 `max-width` 和一套 padding，缺少 dashboard、data table、resource grid、settings 等页面类型。
 
-1. shadcn/ui Dashboard Blocks  
-   参考点：紧凑指标卡、清晰工具条、面板化数据区域。
+这会带来一个明显问题：总览页、凭据资源页、表格页和配置中心被同一个内容容器约束，但它们的信息密度和交互模型完全不同。
 
-2. Ant Design Pro  
-   参考点：稳定的侧栏、顶栏、内容区分工，以及企业后台的信息密度。
+### 页面类型
 
-3. Tremor  
-   参考点：数据面板、状态信号、排行和图表的表达方式。
+现有页面大致分为四类：
 
-4. TailAdmin  
-   参考点：Tailwind 后台模板的整体包装、卡片层级和操作栏。
+- 看板型：`UsageDashboardPanel`，包含指标、图表、排行和状态摘要。
+- 数据查询型：`UsagePanel`、`PricingPanel`、`AuditPanel`，以筛选、表格、详情弹层为主。
+- 资源管理型：`CredentialsPanel`、`ProxyPanel`、`ExternalPoolsPanel`，以资源卡片、批量操作、编辑弹层为主。
+- 配置中心型：`ConfigPanel`，大量设置项、说明、保存条和分类切换。
 
-5. Vue Vben Admin  
-   参考点：长期维护型后台的菜单组织和配置页面结构。
+现在这些类型没有共享页面骨架。比如 `UsageDashboardPanel` 自己定义 `Panel`，其他页面使用 `SectionCard`；`ExternalPoolsPanel` 自己定义 `PolicyBlock/FormSection/ToggleRow`；`ConfigPanel` 又定义 `ConfigGroup/ToggleField/NumberField`。结果是页面层级、边距、标题和操作区都不一致。
 
-## 当前 UI 问题
+### 组件体量
 
-1. 主题不够明确  
-   原始 UI 偏默认后台模板感，颜色和组件形态没有形成统一品牌记忆点。上一版深色黑金虽然有方向，但用户明确要求不要黑色背景，因此需要改为浅底黑金。
+前端页面文件普遍过大：
 
-2. 页面表层统一，但组件细节分散  
-   总览、凭据、配置、用量等页面都有各自的卡片、筛选区和小面板。只改 `body` 背景或登录页无法解决整体质感。
+- `CredentialDialogs.tsx` 超过 1600 行。
+- `ConfigPanel.tsx` 超过 1400 行。
+- `ExternalPoolsPanel.tsx` 超过 1200 行。
+- `UsagePanel.tsx`、`CredentialCard.tsx` 都超过 1000 行。
+- `CredentialsPanel.tsx` 接近 1000 行。
 
-3. 配置页默认组件味明显  
-   配置页大量使用默认卡片、折叠面板和 boxed tabs，说明文字虽然必要，但需要更像人能直接理解的配置说明，而不是实现细节说明。
+这说明很多页面已经变成单文件子应用。后续完整重构应该拆出 page shell、summary、toolbar、resource card、detail drawer/modal、settings section 等稳定层，而不是继续在页面文件内部加局部组件。
 
-4. 菜单交互必须保持可靠  
-   左侧菜单应该是真实可点击链接，并在前端切换时同步路由；同时要避免装饰层遮挡菜单点击。
+## 视觉问题
 
-5. 页面文案要讲用途，不讲内部逻辑  
-   配置页面保留必要说明，但说明重点是“这个设置影响什么、什么时候生效、怎么理解”，不是把内部处理链路直接写给用户。
+当前 CSS 仍然把暖色和金色作为基础视觉语言：
 
-## 重构原则
+- `--page-bg: #f4efe6`
+- `--page-bg-2: #ebe2d2`
+- `--surface-solid: #fffdf8`
+- DaisyUI `base-100/base-200/base-300` 也是奶白、米黄、砂色。
+- 侧栏、顶栏、卡片头、配置分组、表格头、登录页视觉区都存在暖色渐变。
 
-1. 单主题  
-   只保留 `blackGold`。不保留黑白主题、不保留其他配色、不提供主题切换器。
+这不符合“黑金不要黑色背景，黑金只是点缀”的要求。新的色系应先建立中性系统色，再在有限位置使用金色。
 
-2. 浅底黑金  
-   背景使用浅暖灰和白色面板，黑色用于结构和文字，金色用于主按钮、焦点、导航激活、指标强调。
+目标色系：
 
-3. 不使用网格背景  
-   页面背景改为干净的线性浅底，不使用网格、暗色底或大面积装饰光斑。
+- 页面背景：`#F6F7F9`
+- 主面板：`#FFFFFF`
+- 次级面板：`#FAFAFB`
+- 悬浮/弱背景：`#F3F4F6`
+- 边框：`#E5E7EB`
+- 强边框：`#D1D5DB`
+- 主文字：`#111827`
+- 次级文字：`#374151`
+- 弱文字：`#6B7280`
+- 品牌黑：`#111111`
+- 金色强调：`#B88A2E`
+- 金色 hover：`#9A6A16`
+- 金色弱背景：`rgba(184, 138, 46, 0.08)`
+- 成功：`#16A34A`
+- 警告：`#D97706`
+- 错误：`#DC2626`
+- 信息：`#2563EB`
 
-4. 先统一视觉系统，再处理页面细节  
-   全局 token、按钮、表单、表格、弹窗、卡片、侧栏、顶栏先统一，业务页面继承同一套视觉语言。
+## 交互问题
 
-5. 不写假版本和假状态  
-   侧栏底部不显示写死版本号。没有后端真实状态数据时，不伪造“服务状态”。
+### 凭据展开
 
-6. 不使用浏览器原生交互控件  
-   下拉选择使用页面内自定义 `button + listbox`；确认操作使用自定义 Modal，不调用浏览器原生 `confirm`。按钮保持平面样式，不做浮雕、抬起或重阴影效果。
+`CredentialCard` 当前在 grid 内部展开详情。展开后单张卡片变高，但同一行其他卡片仍是摘要高度，视觉上像网格被撑坏。更合理的交互有两种：
 
-## 本次代码修改
+- 首选：固定高度摘要卡片，点击后右侧 detail drawer 展示详情和编辑动作。
+- 过渡方案：展开卡片跨整行显示，避免同一行出现一高多矮。
 
-### 单主题与入口
+第一阶段采用过渡方案，先解决网格塌陷和默认信息不足；后续再把详情编辑完全迁移到 drawer。
 
-文件：
+### 配置中心
 
-- `admin-ui-daisy/tailwind.config.ts`
-- `admin-ui-daisy/index.html`
-- `admin-ui-daisy/src/types/ui.ts`
-- `admin-ui-daisy/src/App.tsx`
-- `admin-ui-daisy/src/components/Dashboard.tsx`
+`ConfigPanel` 现在是一个 `SectionCard` 里套访问 Key、只读代理、保存条、tab、多个 `ConfigGroup`。每个 `ToggleField` 又是独立 `Card bordered`，内部再有边框和背景。用户看到的是一堆盒子嵌套盒子。
 
-修改：
+目标结构：
 
-- DaisyUI 只保留 `blackGold` 主题。
-- 默认主题固定为 `blackGold`。
-- 移除控制台内主题切换入口。
-- `/console` 根路径进入总览，子菜单路径按页面映射同步。
-- 移动端和桌面端都使用同一套浅底黑金外壳。
+- 页面本身是 settings layout。
+- 左侧是分类导航，右侧是当前分类内容。
+- 分组内部用行和分隔线，不再每个字段都是小卡片。
+- 说明保留，但写成“作用、影响范围、什么时候生效”，避免晦涩内部实现词。
 
-### 全局视觉系统
+### 原生控件
 
-文件：`admin-ui-daisy/src/styles.css`
+源码里已经没有 `<select>/<option>/<optgroup>`，也没有 `confirm()/alert()/prompt()`。现有自定义 `Select` 和 `ConfirmProvider` 可以继续保留，但需要样式扁平化，并把弹层、下拉菜单视觉统一到新的中性系统。
 
-修改：
+### 菜单切换
 
-- 重建浅底黑金 token：页面底色、surface、边框、文字、金色强调、阴影。
-- 移除黑色背景、网格背景和大面积装饰光斑。
-- 统一按钮、输入框、选择框、文本框、表格、弹窗、滚动条。
-- 主按钮改为平面金色按钮，去掉浮雕渐变、悬浮抬起和按钮阴影。
-- 新增自定义 `Select`，使用页面内 listbox，不渲染原生 `<select>`、`<option>`、`<optgroup>`。
-- 新增 `ConfirmProvider/useConfirm`，危险操作使用自定义确认弹窗，不再调用浏览器 `confirm()`。
-- 新增或重构公共样式：
-  - `.app-shell`
-  - `.auth-shell`
-  - `.top-bar`
-  - `.sidebar-shell`
-  - `.section-card`
-  - `.stat-card`
-  - `.metric-tile`
-  - `.dashboard-toolbar`
-  - `.credential-card`
-  - `.setting-card`
-  - `.config-group`
-  - `.toolbar-panel`
-  - `.credit-summary-panel`
-
-### 布局组件
-
-文件：
-
-- `admin-ui-daisy/src/components/layout/Sidebar.tsx`
-- `admin-ui-daisy/src/components/layout/TopBar.tsx`
-- `admin-ui-daisy/src/components/ui/index.tsx`
-
-修改：
-
-- 侧栏改为浅底黑金导航，激活菜单有金色提示线。
-- 侧栏底部改为真实入口 `/console`，不显示假的版本或状态。
-- 顶栏增加控制台识别和结构化标题区域。
-- 通用 `StatCard`、`SectionCard`、`EmptyState`、`ModalShell` 统一面板质感。
-
-### 登录页
-
-文件：`admin-ui-daisy/src/components/LoginPage.tsx`
-
-修改：
-
-- 登录页改为浅底黑金视觉，不使用黑色背景。
-- 文案只说明入口用途：查看状态、维护资源、调整设置。
-- 不显示写死版本号。
-
-### 凭据页
-
-文件：
-
-- `admin-ui-daisy/src/components/CredentialsPanel.tsx`
-- `admin-ui-daisy/src/components/credentials/CredentialCard.tsx`
-
-修改：
-
-- 积分统计区域改为统一 summary panel。
-- 搜索、筛选、排序和批量操作改为统一 toolbar panel。
-- 凭据卡 header、展开详情和 meta 信息块统一视觉层级。
-- 保留密集信息，但改善可扫描性和 hover 层级。
-
-### 配置页
-
-文件：`admin-ui-daisy/src/components/ConfigPanel.tsx`
-
-修改：
-
-- 配置分组从默认折叠面板改为固定 setting group。
-- 分类 tabs 从 DaisyUI boxed tabs 改为自定义分段按钮。
-- 保存条改为 sticky 浅底黑金操作条。
-- 配置说明保留，但表达以“用途、影响范围、生效方式”为主。
-
-### 原生控件替换范围
-
-文件：
-
-- `admin-ui-daisy/src/components/ui/index.tsx`
-- `admin-ui-daisy/src/components/common.tsx`
-- `admin-ui-daisy/src/main.tsx`
-- `admin-ui-daisy/src/components/CredentialsPanel.tsx`
-- `admin-ui-daisy/src/components/ConfigPanel.tsx`
-- `admin-ui-daisy/src/components/CredentialDialogs.tsx`
-- `admin-ui-daisy/src/components/AccountValidationPanel.tsx`
-- `admin-ui-daisy/src/components/ExternalPoolsPanel.tsx`
-- `admin-ui-daisy/src/components/UsagePanel.tsx`
-- `admin-ui-daisy/src/components/ProxyPanel.tsx`
-- `admin-ui-daisy/src/components/PricingPanel.tsx`
-- `admin-ui-daisy/src/components/credentials/CredentialCard.tsx`
-
-修改：
-
-- 替换所有 `react-daisyui` 的 `Select` 使用。
-- 替换手写 `<select>/<option>/<optgroup>`。
-- 替换所有 `confirm()` 和 `window.confirm()`。
-- 保留普通输入框、数字输入框和复选框，因为它们是表单输入本体，不是浏览器原生弹层或系统下拉。
-
-## 构建与验证要求
-
-前端构建需要使用 Node 22 直接运行 Vite，因为当前环境中 `pnpm exec vite` 可能落到 Node 16，导致 Vite 5 的 `crypto.getRandomValues` 报错。
-
-推荐构建命令：
-
-```bash
-cd admin-ui-daisy
-/Users/yuanfeijie/.volta/tools/image/node/22.22.3/bin/node node_modules/vite/bin/vite.js build
-```
-
-后端嵌入 `admin-ui-daisy/dist`，所以前端构建后还需要重新编译 Rust release，并只重启 9022：
-
-```bash
-SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk \
-PATH=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/yuanfeijie/.cargo/bin:$PATH \
-CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang \
-cargo build --release
-```
-
-```bash
-pid=$(lsof -tiTCP:9022 -sTCP:LISTEN); if [ -n "$pid" ]; then kill $pid; fi
-nohup ./target/release/kiro-rs -c config.json > /tmp/kiro-rs-9022.log 2>&1 &
-```
-
-验证目标：
-
-- `http://127.0.0.1:9022/console`
-- 登录 Key：`admin123`
-- 9022 有新 UI。
-- 9026 不启动、不占用。
-- 左侧菜单可点击，并且路由随菜单变化。
-- 配置页、凭据页、用量页、审计页至少做一次实际打开检查。
+左侧菜单应继续是真实链接，点击后更新路由并切换 tab。实现上 `Sidebar` 已用 `<a href>` 加 `preventDefault`，问题更可能来自覆盖层、z-index 或 dev 端口不一致造成访问的不是最新构建。后续验证必须只使用 9022。
+
+## 重构策略
+
+第一阶段先处理全局基础层：
+
+- 调整 `package.json`，开发和预览端口统一为 9022。
+- 重建 DaisyUI 主题和 CSS token，去掉大面积米黄、暖色渐变、浮雕阴影。
+- 重构侧栏、顶栏、按钮、输入框、表格、弹层、卡片、badge、toolbar、settings group 的基础样式。
+- 给页面配置增加 layout 类型，让 `Dashboard` 根据页面类型决定内容宽度和页面 class。
+- 凭据 grid 默认桌面三列，超宽才四列。
+- 凭据卡片默认展示更多摘要信息，展开时跨整行。
+
+第二阶段迁移页面结构：
+
+- 看板页统一到共享 dashboard panel / metric tile。
+- 数据页统一到 shared table workspace。
+- 资源页统一到 resource grid + selected detail pattern。
+- 设置页改为真正的 settings layout，减少嵌套卡片。
+
+第三阶段拆文件：
+
+- `CredentialsPanel` 拆出 summary、toolbar、grid、batch bar。
+- `CredentialCard` 拆成 summary card、detail content、edit dialogs。
+- `ConfigPanel` 拆成 access、startup proxy、dispatch、cache、usage、compat。
+- `UsagePanel` 拆成 summary、records workspace、detail modals。
+- `ExternalPoolsPanel` 拆成 policy workspace、pool list、pool dialogs。
+
+## 验证要求
+
+- 不启动 9026。
+- 只访问 `http://127.0.0.1:9022/console`。
+- 登录 Key：`admin123`。
+- 前端构建后必须重新构建 Rust release，因为后端嵌入 `admin-ui-daisy/dist`。
+- 检查 `/console/dashboard`、`/console/credentials`、`/console/config`、`/console/usage`、`/console/proxies`、`/console/external-pools`。
+- 检查左侧菜单点击是否切换页面并同步路由。
+- 扫描确认没有原生 select 和浏览器原生弹层调用。

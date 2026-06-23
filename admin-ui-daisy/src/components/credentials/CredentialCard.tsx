@@ -428,7 +428,7 @@ export function CredentialCard({
   }
 
   return (
-    <Card className={`credential-card relative overflow-visible ${credential.isCurrent ? 'is-current' : ''} ${credential.disabled ? 'is-disabled' : ''}`}>
+    <Card className={`credential-card relative overflow-visible ${credential.isCurrent ? 'is-current' : ''} ${credential.disabled ? 'is-disabled' : ''} ${detailsOpen ? 'is-expanded' : ''}`}>
       <Card.Body className="gap-0 p-0">
         {/* Compact Header - Always Visible */}
         <div className="credential-card-header flex items-center gap-3 p-3">
@@ -502,6 +502,22 @@ export function CredentialCard({
               }
             />
           </div>
+        </div>
+
+        <div className="credential-summary-grid">
+          <MetaItem label="优先级" value={credential.priority} />
+          <MetaItem
+            label="并发"
+            value={`${credential.inFlightRequests}${credential.maxConcurrentRequests > 0 ? `/${credential.maxConcurrentRequests}` : ' / 不限'}`}
+            error={credential.maxConcurrentRequests > 0 && credential.inFlightRequests >= credential.maxConcurrentRequests}
+          />
+          <MetaItem label="调度状态" value={dispatchStatus} error={dispatchStatus !== '可调度'} />
+          <MetaItem label="成功请求" value={formatNumber(credential.successCount)} />
+          <MetaItem
+            label="剩余积分"
+            value={loadingBalance ? <Loading size="xs" /> : accountInfo ? formatCredits(accountInfo.creditRemaining) : '未知'}
+          />
+          <MetaItem label="最近使用" value={formatLastUsed(credential.lastUsedAt)} />
         </div>
 
         {/* Details */}
@@ -696,7 +712,7 @@ export function CredentialCard({
                     <MoreHorizontal className="h-3.5 w-3.5" />
                   </Button>
                 </Dropdown.Toggle>
-                <Dropdown.Menu className="z-[80] w-40 rounded-lg border border-base-300 bg-base-100 p-1 shadow-xl">
+                <Dropdown.Menu className="z-[80] w-40 rounded-lg border border-base-300 bg-base-100 p-1">
                   <Dropdown.Item
                     className={setPriority.isPending || credential.priority === 0 ? 'pointer-events-none opacity-50' : undefined}
                     aria-disabled={setPriority.isPending || credential.priority === 0}

@@ -2,6 +2,8 @@ export type TabKey = 'dashboard' | 'credentials' | 'validation' | 'proxies' | 'e
 
 export type ThemeMode = 'blackGold'
 
+export type PageLayout = 'dashboard' | 'resource' | 'data' | 'settings'
+
 export const DEFAULT_THEME: ThemeMode = 'blackGold'
 
 export const CONSOLE_BASE_PATH = '/console'
@@ -48,9 +50,9 @@ export const themeOptions: Array<{
 }> = [
   {
     key: 'blackGold',
-    label: '浅底黑金',
-    description: '温暖浅底、黑色结构、金色强调',
-    swatches: ['#FFFDF8', '#1C1710', '#B4862C', '#D8B568'],
+    label: '中性黑金',
+    description: '浅灰底色、黑色结构、金色点缀',
+    swatches: ['#F6F7F9', '#111827', '#B88A2E', '#FFFFFF'],
   },
 ]
 
@@ -63,14 +65,14 @@ export function getStoredTheme(): ThemeMode {
   return isThemeMode(stored) ? stored : DEFAULT_THEME
 }
 
-export const pageConfig: Record<TabKey, { title: string; subtitle: string }> = {
-  dashboard: { title: '总览', subtitle: '快速了解系统状态和关键变化' },
-  credentials: { title: '凭据管理', subtitle: '维护账号资源，保持服务稳定' },
-  validation: { title: '账号校验', subtitle: '检查账号可用性，减少异常影响' },
-  proxies: { title: '代理资源', subtitle: '维护网络资源和连通状态' },
-  external: { title: '备用号池', subtitle: '维护备用资源，提高服务可用性' },
-  usage: { title: '用量', subtitle: '查看使用情况和成本变化' },
-  pricing: { title: '模型价格', subtitle: '维护价格信息，辅助成本核算' },
-  audit: { title: '审计日志', subtitle: '查看关键操作记录' },
-  config: { title: '运行配置', subtitle: '调整基础设置，控制运行表现' },
+export const pageConfig: Record<TabKey, { title: string; subtitle: string; layout: PageLayout }> = {
+  dashboard: { title: '总览', subtitle: '快速了解系统状态和关键变化', layout: 'dashboard' },
+  credentials: { title: '凭据管理', subtitle: '维护账号资源，保持服务稳定', layout: 'resource' },
+  validation: { title: '账号校验', subtitle: '检查账号可用性，减少异常影响', layout: 'resource' },
+  proxies: { title: '代理资源', subtitle: '维护网络资源和连通状态', layout: 'resource' },
+  external: { title: '备用号池', subtitle: '维护备用资源，提高服务可用性', layout: 'settings' },
+  usage: { title: '用量', subtitle: '查看使用情况和成本变化', layout: 'data' },
+  pricing: { title: '模型价格', subtitle: '维护价格信息，辅助成本核算', layout: 'data' },
+  audit: { title: '审计日志', subtitle: '查看关键操作记录', layout: 'data' },
+  config: { title: '运行配置', subtitle: '调整基础设置，控制运行表现', layout: 'settings' },
 }

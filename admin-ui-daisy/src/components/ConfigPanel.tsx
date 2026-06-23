@@ -193,15 +193,13 @@ function ToggleField({
   onChange: (value: boolean) => void
 }) {
   return (
-    <Card bordered className="setting-card shadow-none">
-      <Card.Body className="flex-row items-center justify-between gap-3 p-3">
+    <div className="setting-card setting-row">
       <div className="min-w-0">
         <div className="text-sm font-semibold">{title}</div>
         <div className="mt-0.5 text-xs leading-4 text-base-content/60">{description}</div>
       </div>
       <Toggle color="primary" size="sm" className="shrink-0" checked={checked} disabled={disabled} onChange={(event) => onChange(event.target.checked)} />
-      </Card.Body>
-    </Card>
+    </div>
   )
 }
 

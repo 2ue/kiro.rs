@@ -2,7 +2,7 @@ import { chromium } from 'playwright'
 import { writeFile, mkdir } from 'node:fs/promises'
 import path from 'node:path'
 
-const baseUrl = process.env.ADMIN_UI_URL || 'http://127.0.0.1:9026'
+const baseUrl = process.env.ADMIN_UI_URL || 'http://127.0.0.1:9022'
 const apiKey = process.env.ADMIN_API_KEY || 'sk-admin-local-debug'
 const outDir = process.env.UI_SMOKE_OUT || '/tmp/kiro-admin-ui-daisy-smoke'
 

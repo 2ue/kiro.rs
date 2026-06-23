@@ -628,7 +628,7 @@ export function CredentialTestModal({
               <Input bordered size="sm" value={prompt} disabled={test.isPending} onChange={(event) => setPrompt(event.target.value)} />
             </FieldLabel>
           </div>
-          <div className="rounded-box bg-neutral p-4 font-mono text-sm text-neutral-content">
+          <div className="rounded-box border border-base-300 bg-base-200 p-4 font-mono text-sm text-base-content">
             {test.isPending && (
               <div className="flex items-center gap-2 text-info">
                 <Loader2 className="h-4 w-4 animate-spin" />
@@ -638,11 +638,11 @@ export function CredentialTestModal({
             {result && (
               <div className="space-y-3">
                 <div className="whitespace-pre-wrap break-words text-success">{result.response}</div>
-                <div className="border-t border-neutral-content/20 pt-3">耗时 {result.durationMs}ms，模型 {testModelLabel(result.model)}</div>
+                <div className="border-t border-base-300 pt-3 text-base-content/60">耗时 {result.durationMs}ms，模型 {testModelLabel(result.model)}</div>
               </div>
             )}
             {error && <div className="whitespace-pre-wrap break-words text-error">{error}</div>}
-            {!test.isPending && !result && !error && <div className="text-neutral-content/60">等待开始测试</div>}
+            {!test.isPending && !result && !error && <div className="text-base-content/55">等待开始测试</div>}
           </div>
           <Modal.Actions>
             <Button type="button" color="ghost" size="sm" onClick={onClose} disabled={test.isPending}>

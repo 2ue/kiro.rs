@@ -111,7 +111,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         </div>
 
         {/* Page Content */}
-        <main className="page-content relative mx-auto max-w-[var(--page-max)] p-4 pb-20 lg:p-6">
+        <main className={`page-content page-content--${currentPage.layout} relative mx-auto p-4 pb-20 lg:p-6`}>
           {activeTab === 'dashboard' && <UsageDashboardPanel />}
           {activeTab === 'credentials' && <CredentialsPanel />}
           {activeTab === 'validation' && <AccountValidationPanel />}

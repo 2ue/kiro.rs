@@ -1,5 +1,5 @@
-import { Children, createContext, isValidElement, useCallback, useContext, useEffect, useRef, useState } from 'react'
-import type { ReactNode } from 'react'
+import { Children, createContext, isValidElement, useCallback, useContext, useEffect, useId, useRef, useState } from 'react'
+import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react'
 import { AlertTriangle, Check, ChevronDown, X } from 'lucide-react'
 import { Alert, Badge as DaisyBadge, Button, Card, Loading, Modal } from 'react-daisyui'
 
@@ -37,6 +37,8 @@ function optionText(value: ReactNode): string {
 
 function SelectRoot({ value = '', disabled, children, className = '', size = 'md', onChange }: SelectRootProps) {
   const [open, setOpen] = useState(false)
+  const [activeIndex, setActiveIndex] = useState(0)
+  const listboxId = useId()
   const ref = useRef<HTMLDivElement>(null)
   const options = Children.toArray(children)
     .filter(isValidElement<SelectOptionProps>)
@@ -46,10 +48,30 @@ function SelectRoot({ value = '', disabled, children, className = '', size = 'md
       label: child.props.children,
       text: optionText(child.props.children),
     }))
-  const selected = options.find((option) => option.value === String(value)) || options[0]
+  const selectedIndex = options.findIndex((option) => option.value === String(value))
+  const selected = selectedIndex >= 0 ? options[selectedIndex] : null
+  const activeOption = options[activeIndex]
+
+  const firstEnabledIndex = () => {
+    const index = options.findIndex((option) => !option.disabled)
+    return index >= 0 ? index : 0
+  }
+
+  const moveActive = (delta: number) => {
+    if (!options.length) return
+    setActiveIndex((current) => {
+      let next = current
+      for (let step = 0; step < options.length; step += 1) {
+        next = (next + delta + options.length) % options.length
+        if (!options[next]?.disabled) return next
+      }
+      return current
+    })
+  }
 
   useEffect(() => {
     if (!open) return
+    setActiveIndex(selectedIndex >= 0 && !options[selectedIndex]?.disabled ? selectedIndex : firstEnabledIndex())
     const handlePointerDown = (event: PointerEvent) => {
       if (!ref.current?.contains(event.target as Node)) setOpen(false)
     }
@@ -62,12 +84,49 @@ function SelectRoot({ value = '', disabled, children, className = '', size = 'md
       document.removeEventListener('pointerdown', handlePointerDown)
       document.removeEventListener('keydown', handleKeyDown)
     }
-  }, [open])
+  }, [open, selectedIndex, options.length])
 
   const choose = (nextValue: string, optionDisabled?: boolean) => {
     if (disabled || optionDisabled) return
     onChange?.({ target: { value: nextValue } })
     setOpen(false)
+  }
+
+  const handleKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
+    if (disabled) return
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault()
+      if (!open) {
+        setOpen(true)
+        setActiveIndex(selectedIndex >= 0 ? selectedIndex : firstEnabledIndex())
+        return
+      }
+      moveActive(event.key === 'ArrowDown' ? 1 : -1)
+      return
+    }
+    if (event.key === 'Home' || event.key === 'End') {
+      event.preventDefault()
+      setOpen(true)
+      if (event.key === 'Home') setActiveIndex(firstEnabledIndex())
+      else {
+        const lastEnabledIndex = options.map((option, index) => ({ option, index })).reverse().find(({ option }) => !option.disabled)?.index
+        setActiveIndex(lastEnabledIndex ?? firstEnabledIndex())
+      }
+      return
+    }
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault()
+      if (!open) {
+        setOpen(true)
+        setActiveIndex(selectedIndex >= 0 ? selectedIndex : firstEnabledIndex())
+        return
+      }
+      if (activeOption) choose(activeOption.value, activeOption.disabled)
+      return
+    }
+    if (event.key === 'Tab') {
+      setOpen(false)
+    }
   }
 
   return (
@@ -78,25 +137,31 @@ function SelectRoot({ value = '', disabled, children, className = '', size = 'md
         disabled={disabled}
         aria-haspopup="listbox"
         aria-expanded={open}
+        aria-controls={open ? listboxId : undefined}
+        aria-activedescendant={open && activeOption ? `${listboxId}-${activeOption.value}` : undefined}
         title={selected?.text}
+        onKeyDown={handleKeyDown}
         onClick={() => setOpen((value) => !value)}
       >
         <span className="min-w-0 truncate">{selected?.label || '请选择'}</span>
         <ChevronDown className={`h-4 w-4 shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} />
       </button>
       {open && !disabled && (
-        <div className="choice-select-menu" role="listbox">
-          {options.map((option) => {
+        <div id={listboxId} className="choice-select-menu" role="listbox">
+          {options.map((option, index) => {
             const active = option.value === String(value)
+            const focused = index === activeIndex
             return (
               <button
                 key={option.value}
+                id={`${listboxId}-${option.value}`}
                 type="button"
                 role="option"
                 aria-selected={active}
                 disabled={option.disabled}
-                className={`choice-select-option ${active ? 'is-active' : ''}`}
+                className={`choice-select-option ${active ? 'is-active' : ''} ${focused ? 'is-focused' : ''}`}
                 title={option.text}
+                onMouseEnter={() => setActiveIndex(index)}
                 onClick={() => choose(option.value, option.disabled)}
               >
                 <span className="min-w-0 truncate">{option.label}</span>

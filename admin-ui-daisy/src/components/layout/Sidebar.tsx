@@ -25,15 +25,15 @@ interface SidebarProps {
 }
 
 const navItems: Array<{ key: TabKey; label: string; icon: ReactNode; description: string }> = [
-  { key: 'dashboard', label: '总览', icon: <LayoutDashboard className="h-5 w-5" />, description: '查看整体状态' },
-  { key: 'credentials', label: '凭据', icon: <Server className="h-5 w-5" />, description: '维护账号资源' },
-  { key: 'validation', label: '校验', icon: <FileCheck2 className="h-5 w-5" />, description: '检查账号可用性' },
-  { key: 'proxies', label: '代理', icon: <Router className="h-5 w-5" />, description: '维护网络资源' },
-  { key: 'external', label: '备用池', icon: <Router className="h-5 w-5" />, description: '维护备用资源' },
-  { key: 'usage', label: '用量', icon: <BarChart3 className="h-5 w-5" />, description: '查看使用情况' },
-  { key: 'pricing', label: '价格', icon: <DollarSign className="h-5 w-5" />, description: '维护成本信息' },
-  { key: 'audit', label: '审计', icon: <FileClock className="h-5 w-5" />, description: '查看操作记录' },
-  { key: 'config', label: '配置', icon: <Settings className="h-5 w-5" />, description: '调整系统设置' },
+  { key: 'dashboard', label: '总览', icon: <LayoutDashboard className="h-5 w-5" />, description: '状态概览' },
+  { key: 'credentials', label: '凭据', icon: <Server className="h-5 w-5" />, description: '账号资源' },
+  { key: 'validation', label: '校验', icon: <FileCheck2 className="h-5 w-5" />, description: '可用性检查' },
+  { key: 'proxies', label: '代理', icon: <Router className="h-5 w-5" />, description: '网络资源' },
+  { key: 'external', label: '备用池', icon: <Router className="h-5 w-5" />, description: '备用资源' },
+  { key: 'usage', label: '用量', icon: <BarChart3 className="h-5 w-5" />, description: '请求与成本' },
+  { key: 'pricing', label: '价格', icon: <DollarSign className="h-5 w-5" />, description: '模型计价' },
+  { key: 'audit', label: '审计', icon: <FileClock className="h-5 w-5" />, description: '操作记录' },
+  { key: 'config', label: '配置', icon: <Settings className="h-5 w-5" />, description: '运行设置' },
 ]
 
 export function Sidebar({
@@ -107,7 +107,7 @@ export function Sidebar({
                 aria-current={isActive ? 'page' : undefined}
                 className={`nav-item group flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left no-underline transition-all ${
                   isActive
-                    ? 'active text-primary shadow-sm'
+                    ? 'active text-primary'
                     : 'text-base-content/70 hover:bg-primary/10 hover:text-base-content'
                 }`}
               >
@@ -145,13 +145,8 @@ export function Sidebar({
       <div className="border-t border-base-300/70 p-2">
         {!collapsed && (
           <div className="sidebar-footer-card rounded-lg p-3">
-            <div className="flex items-center justify-between gap-2">
-              <div className="text-[0.7rem] font-semibold text-base-content/65">当前入口</div>
-              <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[0.58rem] font-bold text-primary">/console</span>
-            </div>
-            <div className="mt-2 h-1 rounded-full bg-base-300">
-              <div className="h-full w-2/3 rounded-full bg-primary" />
-            </div>
+            <div className="text-[0.68rem] font-semibold text-base-content/45">当前入口</div>
+            <div className="mt-1 truncate font-mono text-[0.75rem] font-semibold text-base-content">/console</div>
           </div>
         )}
       </div>
