@@ -68,7 +68,7 @@ export function Sidebar({
       }`}
     >
       {/* Logo */}
-      <div className="flex h-16 items-center justify-between border-b border-base-300/70 px-3">
+      <div className="sidebar-brand-row flex items-center justify-between border-b border-base-300/70 px-3">
         <div className="flex items-center gap-2 overflow-hidden">
           <div className="brand-mark flex h-8 w-8 shrink-0 items-center justify-center rounded-lg">
             <Server className="h-4 w-4" />

@@ -226,25 +226,15 @@ function ToggleField({
 }
 
 function ConfigGroup({
-  icon,
-  title,
-  description,
   children,
 }: {
-  icon: React.ReactNode
-  title: string
-  description: string
+  icon?: React.ReactNode
+  title?: string
+  description?: string
   children: React.ReactNode
 }) {
   return (
     <section className="config-group">
-      <div className="config-group-header">
-        <span className="config-group-icon">{icon}</span>
-        <span className="min-w-0">
-          <span className="block text-sm font-semibold">{title}</span>
-          <span className="mt-0.5 block text-xs leading-5 text-base-content/60">{description}</span>
-        </span>
-      </div>
       <div className="config-group-body">{children}</div>
     </section>
   )
@@ -1023,15 +1013,6 @@ export function ConfigPanel() {
 
   return (
     <div className="config-page">
-      <div className="config-page-head">
-        <div className="min-w-0">
-          <h2 className="text-xl font-semibold tracking-tight">运行时配置</h2>
-          <p className="mt-1 max-w-3xl text-sm leading-6 text-base-content/60">
-            保存后会影响新的请求；监听地址、数据库连接等启动设置仍需要修改配置文件并重启服务。
-          </p>
-        </div>
-      </div>
-
       <div className="config-shell">
         <aside className="config-side-nav" aria-label="配置分类">
           <div className="config-side-nav-list" role="tablist" aria-label="配置分类">

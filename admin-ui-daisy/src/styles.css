@@ -15,6 +15,7 @@
 
   --sidebar-width: 14rem;
   --sidebar-collapsed-width: 4rem;
+  --app-header-height: 5rem;
   --page-max-dashboard: 1520px;
   --page-max-resource: 1600px;
   --page-max-data: 1560px;
@@ -335,6 +336,10 @@ select {
   box-shadow: none;
 }
 
+.sidebar-brand-row {
+  height: var(--app-header-height);
+}
+
 .brand-mark {
   position: relative;
   overflow: hidden;
@@ -406,7 +411,7 @@ select {
 }
 
 .top-bar-inner {
-  min-height: 4rem;
+  height: var(--app-header-height);
 }
 
 .top-bar-title {
@@ -630,26 +635,6 @@ select {
   border: 0;
   background: transparent;
   box-shadow: none;
-}
-
-.config-group-header {
-  display: flex;
-  gap: 0.75rem;
-  align-items: flex-start;
-  padding: 0 0 0.85rem;
-}
-
-.config-group-icon {
-  display: inline-flex;
-  flex: 0 0 auto;
-  align-items: center;
-  justify-content: center;
-  width: 1.85rem;
-  height: 1.85rem;
-  border: 1px solid var(--gold-line);
-  border-radius: 0.45rem;
-  background: transparent;
-  color: var(--gold-strong);
 }
 
 .config-group-body {
@@ -1073,15 +1058,6 @@ select {
   gap: 1.15rem;
 }
 
-.config-page-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 1rem;
-  border-bottom: 1px solid var(--line);
-  padding-bottom: 1rem;
-}
-
 .config-shell {
   display: grid;
   grid-template-columns: minmax(12.5rem, 15rem) minmax(0, 1fr);
@@ -1091,8 +1067,8 @@ select {
 
 .config-side-nav {
   position: sticky;
-  top: 5rem;
-  max-height: calc(100vh - 6rem);
+  top: calc(var(--app-header-height) + 1rem);
+  max-height: calc(100vh - var(--app-header-height) - 2rem);
   overflow: auto;
   border-right: 1px solid var(--line);
   padding-right: 0.75rem;
@@ -1145,7 +1121,7 @@ select {
 
 .config-content-head {
   position: sticky;
-  top: 4.25rem;
+  top: var(--app-header-height);
   z-index: 25;
   display: flex;
   align-items: flex-start;
@@ -1189,10 +1165,6 @@ select {
 }
 
 @media (max-width: 1023px) {
-  .config-page-head {
-    flex-direction: column;
-  }
-
   .config-content-head {
     top: 4rem;
   }
