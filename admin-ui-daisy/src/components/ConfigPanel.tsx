@@ -1,4 +1,4 @@
-import { BadgeInfo, Copy, Edit3, Eye, EyeOff, Gauge, KeyRound, Plus, Router, Save, Shield, Sparkles, Trash2, Wand2, X, Zap } from 'lucide-react'
+import { BadgeInfo, Copy, Edit3, Eye, EyeOff, Gauge, KeyRound, Plus, Save, Shield, Sparkles, Trash2, Wand2, X, Zap } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { Alert, Button, Input, Join, Loading, Toggle } from 'react-daisyui'
@@ -43,7 +43,6 @@ import type {
 
 type ConfigTab =
   | 'access'
-  | 'network'
   | 'limits'
   | 'cooldown'
   | 'scheduler'
@@ -59,7 +58,6 @@ type ConfigTab =
 
 const configTabs: Array<{ key: ConfigTab; label: string; description: string; icon: React.ReactNode }> = [
   { key: 'access', label: '接入与登录', description: '客户端 Key、后台登录密码', icon: <KeyRound className="h-4 w-4" /> },
-  { key: 'network', label: '启动代理', description: '查看服务启动时读取的代理', icon: <Router className="h-4 w-4" /> },
   { key: 'limits', label: '请求容量', description: '并发、排队、重试、超时', icon: <Gauge className="h-4 w-4" /> },
   { key: 'cooldown', label: '错误恢复', description: '不同错误后的暂停策略', icon: <Shield className="h-4 w-4" /> },
   { key: 'scheduler', label: '账号选择', description: '负载、错误、延迟权重', icon: <Gauge className="h-4 w-4" /> },
@@ -249,85 +247,6 @@ function ConfigGroup({
       </div>
       <div className="config-group-body">{children}</div>
     </section>
-  )
-}
-
-function maskSecret(value?: string | null): string {
-  if (!value) return '-'
-  return '*'.repeat(Math.min(Math.max(value.length, 6), 16))
-}
-
-function ReadOnlySecretField({
-  label,
-  value,
-  visible,
-  onToggle,
-}: {
-  label: string
-  value?: string | null
-  visible: boolean
-  onToggle: () => void
-}) {
-  return (
-    <div>
-      <div className="mb-2 text-sm font-semibold">{label}</div>
-      <div className="flex gap-2">
-        <Input
-          bordered
-          readOnly
-          size="sm"
-          className="min-w-0 font-mono text-xs"
-          value={visible ? value || '-' : maskSecret(value)}
-        />
-        <Button
-          type="button"
-          size="sm"
-          className="shrink-0"
-          onClick={onToggle}
-          title={visible ? `隐藏${label}` : `显示${label}`}
-        >
-          {visible ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-          {visible ? '隐藏' : '显示'}
-        </Button>
-      </div>
-    </div>
-  )
-}
-
-function StartupProxyPanel({ config }: { config: RuntimeConfig }) {
-  const [showProxyUsername, setShowProxyUsername] = useState(false)
-  const [showProxyPassword, setShowProxyPassword] = useState(false)
-  const hasGlobalProxy = Boolean(config.proxyUrl)
-
-  return (
-    <ConfigGroup
-      icon={<Router className="h-4 w-4" />}
-      title="全局代理（只读）"
-      description="这里展示服务启动时读取到的全局代理。账号没有单独设置代理时，会使用它；修改需要改配置文件并重启服务。"
-    >
-      <div className="settings-status-line md:col-span-2">
-        <span className="text-sm font-semibold">当前状态</span>
-        <span className={`config-badge ${hasGlobalProxy ? 'is-success' : ''}`}>
-          {hasGlobalProxy ? '已配置全局代理' : '未配置全局代理'}
-        </span>
-        <span className="config-badge">只读</span>
-      </div>
-      <FieldLabel title="代理 URL" description="服务启动时读取到的代理地址。为空表示未启用全局代理。">
-        <Input bordered readOnly size="sm" className="font-mono text-xs" value={config.proxyUrl || '-'} />
-      </FieldLabel>
-      <ReadOnlySecretField
-        label="代理用户名"
-        value={config.proxyUsername}
-        visible={showProxyUsername}
-        onToggle={() => setShowProxyUsername((value) => !value)}
-      />
-      <ReadOnlySecretField
-        label="代理密码"
-        value={config.proxyPassword}
-        visible={showProxyPassword}
-        onToggle={() => setShowProxyPassword((value) => !value)}
-      />
-    </ConfigGroup>
   )
 }
 
@@ -1097,7 +1016,7 @@ export function ConfigPanel() {
   const selectedUsageKey = selectedUsagePath === '__default' || draft.reportedUsage.pathOverrides[selectedUsagePath]
     ? selectedUsagePath
     : '__default'
-  const showRuntimeSave = activeTab !== 'access' && activeTab !== 'network'
+  const showRuntimeSave = activeTab !== 'access'
 
   if (config.isLoading) return <div className="py-10 text-center text-base-content/60">加载中...</div>
   if (config.error) return <ErrorState text={extractErrorMessage(config.error)} />
@@ -1157,8 +1076,6 @@ export function ConfigPanel() {
 
           <div className="config-section-stack">
         {activeTab === 'access' && <AccessKeysPanel />}
-        {activeTab === 'network' && <StartupProxyPanel config={draft} />}
-
         {activeTab === 'limits' && (
           <ConfigGroup icon={<Gauge className="h-4 w-4" />} title="请求容量" description="控制每个账号和全局的承载量，以及请求等待、重试和超时。">
             <NumberField title="单凭据每分钟请求上限" description="控制每个凭据每分钟最多承接多少请求。填 0 表示关闭本地限速。" value={draft.credentialRpm} min={0} suffix="次/分钟" onChange={(credentialRpm) => setDraft((prev) => ({ ...prev, credentialRpm }))} />
