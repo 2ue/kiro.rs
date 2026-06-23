@@ -53,6 +53,32 @@ function subscriptionLabel(credential: CredentialStatusItem, balance?: BalanceRe
   return balance?.subscriptionTitle || credential.accountInfo?.subscriptionTitle || credential.subscriptionTitle || '未知'
 }
 
+type CredentialBadgeTone = 'neutral' | 'primary' | 'secondary' | 'success' | 'warning' | 'error' | 'info' | 'accent'
+
+function subscriptionBadgeMeta(credential: CredentialStatusItem, balance?: BalanceResponse): { label: string; tone: CredentialBadgeTone; title?: string } {
+  const raw = subscriptionLabel(credential, balance)
+  const normalized = raw.toLowerCase().replace(/[_\s-]+/g, ' ')
+  if (!raw || raw === '未知') return { label: '未知套餐', tone: 'secondary' }
+  if (normalized.includes('power')) return { label: 'Power', tone: 'primary', title: raw }
+  if (normalized.includes('pro plus') || normalized.includes('pro+')) return { label: 'Pro+', tone: 'primary', title: raw }
+  if (normalized.includes('pro')) return { label: 'Pro', tone: 'primary', title: raw }
+  if (normalized.includes('free')) return { label: 'Free', tone: 'secondary', title: raw }
+  if (normalized.includes('trial') || normalized.includes('试用')) return { label: 'Trial', tone: 'info', title: raw }
+  return { label: raw, tone: 'neutral', title: raw }
+}
+
+function endpointLabel(endpoint?: string | null) {
+  if (!endpoint) return ''
+  const value = endpoint.trim()
+  if (!value) return ''
+  const lower = value.toLowerCase()
+  if (lower === 'ide') return 'IDE'
+  if (lower === 'idc') return 'IDC'
+  if (lower === 'api_key') return 'API Key'
+  if (lower.includes('power')) return 'Power 入口'
+  return value.replace(/_/g, ' ').toUpperCase()
+}
+
 function accountInfoValue(credential: CredentialStatusItem, balance?: BalanceResponse) {
   return balance || credential.accountInfo
 }
@@ -239,12 +265,15 @@ export function CredentialCard({
   const schedulerSelectionPressure = numberOrZero(credential.schedulerSelectionPressure)
   const lastTransientErrorAgo = formatApproxElapsedMs(credential.lastErrorAtMs)
   const dispatchStatus = dispatchStatusLabel(credential, probationRemainingSecs)
+  const subscriptionMeta = subscriptionBadgeMeta(credential, balance)
+  const endpointMeta = endpointLabel(credential.endpoint)
   const hasFailures = credential.failureCount > 0 || credential.refreshFailureCount > 0
   const hasPricingCoverage = credential.pricedRequests > 0 || credential.unpricedRequests > 0
   const canClearInFlight = credential.inFlightRequests > 0
   const quotaDetail = accountInfo
     ? `检查 ${formatFullDate(accountInfo.checkedAt)}${accountInfo.nextResetAt ? ` · 重置 ${formatResetAt(accountInfo.nextResetAt)}` : ''}`
     : undefined
+  const hasOpenModal = detailsOpen || editingPriority || editingProxy || editingConcurrency || editingRegions || showDeleteConfirm
 
   const resetProxyDraft = () => {
     setProxyResourceId(credential.proxyResourceId ? String(credential.proxyResourceId) : '')
@@ -428,10 +457,10 @@ export function CredentialCard({
   }
 
   return (
-    <Card className={`credential-card relative overflow-visible ${credential.isCurrent ? 'is-current' : ''} ${credential.disabled ? 'is-disabled' : ''} ${detailsOpen ? 'is-expanded' : ''}`}>
+    <Card className={`credential-card relative overflow-visible ${credential.isCurrent ? 'is-current' : ''} ${credential.disabled ? 'is-disabled' : ''} ${detailsOpen ? 'is-expanded' : ''} ${hasOpenModal ? 'has-modal' : ''}`}>
       <Card.Body className="gap-0 p-0">
         {/* Compact Header - Always Visible */}
-        <div className="credential-card-header flex items-center gap-3 p-3">
+        <div className="credential-card-header flex items-start gap-3 p-3">
           <Checkbox size="xs" checked={selected} onChange={onToggleSelect} />
 
           <button
@@ -447,16 +476,16 @@ export function CredentialCard({
               <Badge size="xs">#{credential.id}</Badge>
               {credential.isCurrent && <Badge tone="primary" size="xs" dot>当前</Badge>}
             </div>
-            <div className="mt-1 flex flex-wrap items-center gap-1">
+            <div className="mt-2 flex flex-wrap items-center gap-1.5">
               <Badge tone={credential.disabled ? 'error' : 'success'} size="xs">
                 {credential.disabled ? '禁用' : '启用'}
               </Badge>
               {credential.disabled && credential.disabledReason && (
                 <Badge tone="error" size="xs" title={credential.disabledReason}>{credential.disabledReason}</Badge>
               )}
+              <Badge tone={subscriptionMeta.tone} size="xs" title={subscriptionMeta.title}>{loadingBalance ? '查询中' : subscriptionMeta.label}</Badge>
               <Badge size="xs">{authLabel(credential.authMethod)}</Badge>
-              {credential.endpoint && <Badge size="xs" title={credential.endpoint}>{credential.endpoint}</Badge>}
-              <Badge size="xs">{loadingBalance ? '...' : subscriptionLabel(credential, balance)}</Badge>
+              {endpointMeta && <Badge size="xs" title={`入口：${credential.endpoint}`}>{endpointMeta}</Badge>}
               {credential.hasProfileArn && <Badge tone="secondary" size="xs">Profile ARN</Badge>}
               {credential.hasProxy && <Badge tone="info" size="xs">代理</Badge>}
               {typeof credential.maxConcurrentRequestsOverride === 'number' && (
@@ -482,8 +511,8 @@ export function CredentialCard({
             </div>
           </button>
 
-          <div className="flex shrink-0 items-center gap-1">
-            <Button type="button" color="ghost" size="xs" onClick={() => setDetailsOpen((open) => !open)} title={detailsOpen ? '收起详情' : '展开详情'}>
+          <div className="flex shrink-0 items-center gap-1 pt-0.5">
+            <Button type="button" color="ghost" size="xs" onClick={() => setDetailsOpen((open) => !open)} title={detailsOpen ? '关闭详情' : '查看详情'}>
               {detailsOpen ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
             </Button>
             <Toggle
@@ -504,25 +533,22 @@ export function CredentialCard({
           </div>
         </div>
 
-        <div className="credential-summary-grid">
-          <MetaItem label="优先级" value={credential.priority} />
-          <MetaItem
+        <div className="credential-summary-list">
+          <SummaryItem label="优先级" value={credential.priority} />
+          <SummaryItem
             label="并发"
             value={`${credential.inFlightRequests}${credential.maxConcurrentRequests > 0 ? `/${credential.maxConcurrentRequests}` : ' / 不限'}`}
             error={credential.maxConcurrentRequests > 0 && credential.inFlightRequests >= credential.maxConcurrentRequests}
           />
-          <MetaItem label="调度状态" value={dispatchStatus} error={dispatchStatus !== '可调度'} />
-          <MetaItem label="成功请求" value={formatNumber(credential.successCount)} />
-          <MetaItem
-            label="剩余积分"
-            value={loadingBalance ? <Loading size="xs" /> : accountInfo ? formatCredits(accountInfo.creditRemaining) : '未知'}
-          />
-          <MetaItem label="最近使用" value={formatLastUsed(credential.lastUsedAt)} />
+          <SummaryItem label="调度" value={dispatchStatus} error={dispatchStatus !== '可调度'} />
+          <SummaryItem label="成功请求" value={formatNumber(credential.successCount)} />
+          <SummaryItem label="最近使用" value={formatLastUsed(credential.lastUsedAt)} />
         </div>
 
-        {/* Details */}
-        {detailsOpen && (
-        <div className="credential-details p-3">
+      </Card.Body>
+
+      <ModalShell open={detailsOpen} title={`凭据详情：${credentialLabel(credential)}`} width="max-w-5xl" onClose={() => setDetailsOpen(false)}>
+        <div className="credential-details credential-details-modal">
             <div className="credential-section-title">基础</div>
             <div className="credential-meta-grid">
               <MetaItem
@@ -776,8 +802,7 @@ export function CredentialCard({
               </Dropdown>
             </div>
         </div>
-        )}
-      </Card.Body>
+      </ModalShell>
 
       <ModalShell open={editingPriority} title={`优先级：${credentialLabel(credential)}`} width="max-w-md" onClose={() => {
         setEditingPriority(false)
@@ -1101,6 +1126,17 @@ export function CredentialCard({
 // ============================================================================
 // Meta Item Component
 // ============================================================================
+
+function SummaryItem({ label, value, error }: { label: string; value: React.ReactNode; error?: boolean }) {
+  return (
+    <div className="summary-item">
+      <div className="summary-item-label">{label}</div>
+      <div className={`summary-item-value ${error ? 'text-error' : ''}`} title={typeof value === 'string' ? value : undefined}>
+        {value}
+      </div>
+    </div>
+  )
+}
 
 function MetaItem({ label, value, detail, error }: { label: string; value: React.ReactNode; detail?: React.ReactNode; error?: boolean }) {
   return (
