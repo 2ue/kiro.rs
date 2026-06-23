@@ -404,9 +404,9 @@ select {
 }
 
 .top-bar {
-  border-bottom: 1px solid var(--line);
+  border-bottom: 0;
   background: rgba(255, 255, 255, 0.94);
-  box-shadow: none;
+  box-shadow: inset 0 -1px 0 var(--line);
   backdrop-filter: blur(12px);
 }
 
@@ -934,6 +934,38 @@ select {
   border: 1px solid var(--line);
   background: var(--surface);
   box-shadow: var(--shadow-float);
+}
+
+.modal-box.modal-shell {
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100dvh - 2rem);
+  overflow: hidden;
+  padding: 0;
+}
+
+.modal-shell-header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+  padding: 1rem 1rem 0.85rem;
+}
+
+.modal-shell-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 1rem;
+}
+
+.modal-shell-footer {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--line);
+  background: var(--surface);
+  padding: 0.85rem 1rem 1rem;
 }
 
 /* ============================================================================

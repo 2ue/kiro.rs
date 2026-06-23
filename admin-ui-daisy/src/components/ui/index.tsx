@@ -336,15 +336,15 @@ interface ModalShellProps {
 export function ModalShell({ open, title, children, width = 'max-w-3xl', onClose, footer }: ModalShellProps) {
   if (!open) return null
   return (
-    <Modal open backdrop className={`${width} rounded-box`}>
-      <Modal.Header className="flex items-center justify-between gap-4 border-b border-base-300/60 pb-3">
-        <h3 className="text-lg font-semibold">{title}</h3>
+    <Modal open backdrop className={`${width} modal-shell rounded-box`}>
+      <Modal.Header className="modal-shell-header flex items-center justify-between gap-4">
+        <h3 className="min-w-0 truncate text-base font-semibold tracking-tight">{title}</h3>
         <Button type="button" shape="circle" color="ghost" size="sm" onClick={onClose} aria-label="关闭">
           <X className="h-4 w-4" />
         </Button>
       </Modal.Header>
-      <Modal.Body className="py-4">{children}</Modal.Body>
-      {footer && <Modal.Actions className="border-t border-base-300/60 pt-3">{footer}</Modal.Actions>}
+      <Modal.Body className="modal-shell-body">{children}</Modal.Body>
+      {footer && <Modal.Actions className="modal-shell-footer">{footer}</Modal.Actions>}
     </Modal>
   )
 }

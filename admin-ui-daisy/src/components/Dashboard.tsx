@@ -85,7 +85,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
       {/* Main Content */}
       <div className={`app-content transition-[padding-left] duration-200 ${sidebarCollapsed ? 'lg:pl-16' : 'lg:pl-56'}`}>
         {/* Mobile Header */}
-        <div className="top-bar sticky top-0 z-30 flex h-14 items-center gap-3 border-b px-4 backdrop-blur-lg lg:hidden">
+        <div className="top-bar fixed left-0 right-0 top-0 z-30 flex h-14 items-center gap-3 border-b px-4 backdrop-blur-lg lg:hidden">
           <Button
             type="button"
             color="ghost"
@@ -102,7 +102,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         </div>
 
         {/* Desktop Top Bar */}
-        <div className="hidden lg:block">
+        <div className={`fixed right-0 top-0 z-30 hidden transition-[left] duration-200 lg:block ${sidebarCollapsed ? 'left-16' : 'left-56'}`}>
           <TopBar
             title={currentPage.title}
             subtitle={currentPage.subtitle}
@@ -111,7 +111,7 @@ export function Dashboard({ onLogout }: { onLogout: () => void }) {
         </div>
 
         {/* Page Content */}
-        <main className={`page-content page-content--${currentPage.layout} relative mx-auto p-4 pb-20 lg:p-6`}>
+        <main className={`page-content page-content--${currentPage.layout} relative mx-auto px-4 pb-20 pt-[4.5rem] lg:px-6 lg:pb-6 lg:pt-[calc(var(--app-header-height)+1.5rem)]`}>
           {activeTab === 'dashboard' && <UsageDashboardPanel />}
           {activeTab === 'credentials' && <CredentialsPanel />}
           {activeTab === 'validation' && <AccountValidationPanel />}

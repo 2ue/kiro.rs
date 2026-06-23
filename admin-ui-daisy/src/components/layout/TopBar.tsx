@@ -16,7 +16,7 @@ export function TopBar({
   actions,
 }: TopBarProps) {
   return (
-    <header className="top-bar sticky top-0 z-30">
+    <header className="top-bar">
       <div className="top-bar-inner flex items-center justify-between gap-4 px-4 py-3 lg:px-6">
         <div className="top-bar-title min-w-0 flex-1">
           <div className="min-w-0">
