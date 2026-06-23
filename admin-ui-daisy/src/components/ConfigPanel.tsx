@@ -1,8 +1,8 @@
 import { BadgeInfo, Copy, Edit3, Eye, EyeOff, Gauge, KeyRound, Plus, Router, Save, Shield, Sparkles, Trash2, Wand2, X, Zap } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import { Alert, Button, Card, Input, Join, Loading, Toggle } from 'react-daisyui'
-import { ErrorState, FieldLabel, SectionCard, Select, useConfirm } from '@/components/ui'
+import { Alert, Button, Input, Join, Loading, Toggle } from 'react-daisyui'
+import { ErrorState, FieldLabel, Select, useConfirm } from '@/components/ui'
 import {
   defaultModelMappingConfig,
   defaultPayloadShaping,
@@ -41,13 +41,37 @@ import type {
   RuntimeConfig,
 } from '@/types/api'
 
-type ConfigTab = 'dispatch' | 'cache' | 'usage' | 'compat'
+type ConfigTab =
+  | 'access'
+  | 'network'
+  | 'limits'
+  | 'cooldown'
+  | 'scheduler'
+  | 'warmup'
+  | 'payload'
+  | 'payloadHistory'
+  | 'payloadFallback'
+  | 'cacheRead'
+  | 'cacheCreate'
+  | 'usage'
+  | 'compat'
+  | 'stats'
 
-const configTabs: Array<{ key: ConfigTab; label: string; description: string }> = [
-  { key: 'dispatch', label: '请求调度', description: '请求量、等待、恢复' },
-  { key: 'cache', label: '缓存展示', description: '调整缓存用量展示' },
-  { key: 'usage', label: '用量展示', description: '按入口调整统计方式' },
-  { key: 'compat', label: '兼容与排查', description: '兼容模式、模型规则、统计阈值' },
+const configTabs: Array<{ key: ConfigTab; label: string; description: string; icon: React.ReactNode }> = [
+  { key: 'access', label: '接入与登录', description: '客户端 Key、后台登录密码', icon: <KeyRound className="h-4 w-4" /> },
+  { key: 'network', label: '启动代理', description: '查看服务启动时读取的代理', icon: <Router className="h-4 w-4" /> },
+  { key: 'limits', label: '请求容量', description: '并发、排队、重试、超时', icon: <Gauge className="h-4 w-4" /> },
+  { key: 'cooldown', label: '错误恢复', description: '不同错误后的暂停策略', icon: <Shield className="h-4 w-4" /> },
+  { key: 'scheduler', label: '账号选择', description: '负载、错误、延迟权重', icon: <Gauge className="h-4 w-4" /> },
+  { key: 'warmup', label: '新账号预热', description: '新账号逐步参与请求', icon: <Sparkles className="h-4 w-4" /> },
+  { key: 'payload', label: '大小保护', description: '压缩、阈值和处理时机', icon: <Wand2 className="h-4 w-4" /> },
+  { key: 'payloadHistory', label: '旧内容清理', description: '历史消息、工具和网页内容', icon: <Wand2 className="h-4 w-4" /> },
+  { key: 'payloadFallback', label: '当前内容兜底', description: '当前消息、文档和图片', icon: <Wand2 className="h-4 w-4" /> },
+  { key: 'cacheRead', label: '缓存命中展示', description: '输入和缓存读取展示口径', icon: <Zap className="h-4 w-4" /> },
+  { key: 'cacheCreate', label: '缓存创建频次', description: '缓存写入展示节奏', icon: <Zap className="h-4 w-4" /> },
+  { key: 'usage', label: '用量展示', description: '不同入口的展示规则', icon: <BadgeInfo className="h-4 w-4" /> },
+  { key: 'compat', label: '兼容与模型', description: '兼容模式和模型映射', icon: <Shield className="h-4 w-4" /> },
+  { key: 'stats', label: '后台统计', description: '页面统计判断标准', icon: <Gauge className="h-4 w-4" /> },
 ]
 
 function normalizeModelMapping(config?: Partial<ModelMappingConfig> | null): ModelMappingConfig {
@@ -193,7 +217,7 @@ function ToggleField({
   onChange: (value: boolean) => void
 }) {
   return (
-    <div className="setting-card setting-row">
+    <div className="settings-row">
       <div className="min-w-0">
         <div className="text-sm font-semibold">{title}</div>
         <div className="mt-0.5 text-xs leading-4 text-base-content/60">{description}</div>
@@ -223,7 +247,7 @@ function ConfigGroup({
           <span className="mt-0.5 block text-xs leading-5 text-base-content/60">{description}</span>
         </span>
       </div>
-      <div className="config-group-body grid gap-3 md:grid-cols-2">{children}</div>
+      <div className="config-group-body">{children}</div>
     </section>
   )
 }
@@ -281,35 +305,28 @@ function StartupProxyPanel({ config }: { config: RuntimeConfig }) {
       title="全局代理（只读）"
       description="这里展示服务启动时读取到的全局代理。账号没有单独设置代理时，会使用它；修改需要改配置文件并重启服务。"
     >
-      <div className="rounded-box border border-base-300 bg-base-100 p-3 md:col-span-2">
-        <div className="mb-3 flex flex-wrap items-center gap-2">
-          <span className="text-sm font-semibold">当前状态</span>
-          <span className={`rounded border px-2 py-0.5 text-[0.68rem] font-semibold ${hasGlobalProxy ? 'border-base-300 bg-base-100 text-success' : 'border-base-300 bg-base-200 text-base-content/60'}`}>
-            {hasGlobalProxy ? '已配置全局代理' : '未配置全局代理'}
-          </span>
-          <span className="rounded border border-base-300 bg-base-200 px-2 py-0.5 text-[0.68rem] font-semibold text-base-content/60">
-            只读
-          </span>
-        </div>
-        <div className="grid gap-3 md:grid-cols-2">
-          <div className="md:col-span-2">
-            <div className="mb-2 text-sm font-semibold">代理 URL</div>
-            <Input bordered readOnly size="sm" className="font-mono text-xs" value={config.proxyUrl || '-'} />
-          </div>
-          <ReadOnlySecretField
-            label="代理用户名"
-            value={config.proxyUsername}
-            visible={showProxyUsername}
-            onToggle={() => setShowProxyUsername((value) => !value)}
-          />
-          <ReadOnlySecretField
-            label="代理密码"
-            value={config.proxyPassword}
-            visible={showProxyPassword}
-            onToggle={() => setShowProxyPassword((value) => !value)}
-          />
-        </div>
+      <div className="settings-status-line md:col-span-2">
+        <span className="text-sm font-semibold">当前状态</span>
+        <span className={`config-badge ${hasGlobalProxy ? 'is-success' : ''}`}>
+          {hasGlobalProxy ? '已配置全局代理' : '未配置全局代理'}
+        </span>
+        <span className="config-badge">只读</span>
       </div>
+      <FieldLabel title="代理 URL" description="服务启动时读取到的代理地址。为空表示未启用全局代理。">
+        <Input bordered readOnly size="sm" className="font-mono text-xs" value={config.proxyUrl || '-'} />
+      </FieldLabel>
+      <ReadOnlySecretField
+        label="代理用户名"
+        value={config.proxyUsername}
+        visible={showProxyUsername}
+        onToggle={() => setShowProxyUsername((value) => !value)}
+      />
+      <ReadOnlySecretField
+        label="代理密码"
+        value={config.proxyPassword}
+        visible={showProxyPassword}
+        onToggle={() => setShowProxyPassword((value) => !value)}
+      />
     </ConfigGroup>
   )
 }
@@ -326,11 +343,9 @@ function ImpactGroupHeader({
   muted?: boolean
 }) {
   return (
-    <div className={`rounded-box border px-3 py-2.5 md:col-span-2 ${muted ? 'bg-base-200/70 text-base-content/55' : 'bg-base-100'}`}>
+    <div className={`config-inline-note md:col-span-2 ${muted ? 'is-muted' : ''}`}>
       <div className="mb-1 flex flex-wrap items-center gap-2">
-        <span className="rounded border border-base-300 bg-base-200 px-2 py-0.5 text-[0.68rem] font-semibold text-base-content/60">
-          {label}
-        </span>
+        <span className="config-note-label">{label}</span>
         <span className="text-sm font-semibold">{title}</span>
       </div>
       <p className="text-xs leading-5 text-base-content/60">{description}</p>
@@ -543,31 +558,25 @@ function AccessKeysPanel() {
       title="接入与登录 Key"
       description="请求 Key 可配置多个，供客户端调用模型接口；登录 Key 仍只有一个，用于进入管理后台。"
     >
-      <div className="rounded-box border border-base-300 bg-base-100 p-3 md:col-span-2">
-        <div className="mb-3">
-          <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
-            <div className="min-w-0">
-              <div className="flex flex-wrap items-center gap-2">
-                <div className="text-sm font-semibold">请求调用 Key</div>
-                <span className="rounded border border-base-300 bg-base-200 px-2 py-0.5 text-[0.68rem] font-semibold text-base-content/60">
-                  客户端调用
-                </span>
-                <span className="rounded border border-base-300 bg-base-100 px-2 py-0.5 text-[0.68rem] font-semibold text-success">
-                  {requestKeys.length} 个可用
-                </span>
-              </div>
-              <div className="mt-1 text-xs leading-4 text-base-content/60">
-                给客户端调用模型接口时使用。可以按客户端分配不同 Key，新增、编辑、删除后立即生效。
-              </div>
+      <div className="settings-subsection md:col-span-2">
+        <div className="settings-subsection-header">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="text-sm font-semibold">请求调用 Key</h3>
+              <span className="config-badge">客户端调用</span>
+              <span className="config-badge is-success">{requestKeys.length} 个可用</span>
             </div>
-            <Button type="button" color="primary" size="sm" className="shrink-0" disabled={loading || creating} onClick={generateRequestKey}>
-              {creating ? <Loading size="xs" /> : <Wand2 className="h-4 w-4" />}
-              随机生成并新增
-            </Button>
+            <p className="mt-1 text-xs leading-5 text-base-content/60">
+              给客户端调用模型接口时使用。可以按客户端分配不同 Key，新增、编辑、删除后立即生效。
+            </p>
           </div>
+          <Button type="button" color="primary" size="sm" className="shrink-0" disabled={loading || creating} onClick={generateRequestKey}>
+            {creating ? <Loading size="xs" /> : <Wand2 className="h-4 w-4" />}
+            随机生成并新增
+          </Button>
         </div>
 
-        <div className="mb-3 grid gap-2 md:grid-cols-[minmax(0,1fr)_auto_auto]">
+        <div className="settings-inline-form">
           <Input
             bordered
             size="sm"
@@ -587,19 +596,19 @@ function AccessKeysPanel() {
           </Button>
         </div>
 
-        <div className="space-y-2">
-          {loading && <div className="rounded-box border border-base-300 bg-base-200/60 p-3 text-sm text-base-content/60">加载中...</div>}
+        <div className="settings-list">
+          {loading && <div className="settings-list-row text-sm text-base-content/60">加载中...</div>}
           {!loading && requestKeys.length === 0 && <ErrorState title="未配置请求 Key" message="请先生成或手动新增一个请求 Key。" />}
           {!loading && requestKeys.map((item) => {
             const visible = visibleRequestKeyIds.has(item.id)
             const busy = processingKeyId === item.id
             const editing = editingRequestKeyId === item.id
             return (
-              <div key={item.id} className="rounded-box border border-base-300 bg-base-200/45 p-3">
+              <div key={item.id} className="settings-list-row">
                 <div className="mb-2 flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
                   <div className="flex min-w-0 flex-wrap items-center gap-2">
                     <span className="text-sm font-semibold">请求 Key</span>
-                    {item.primary && <span className="rounded border border-primary/25 bg-primary/10 px-2 py-0.5 text-[0.68rem] font-semibold text-primary">主 Key</span>}
+                    {item.primary && <span className="config-badge is-primary">主 Key</span>}
                     <span className="font-mono text-[0.68rem] text-base-content/50">{item.id.slice(0, 12)}</span>
                   </div>
                   <div className="flex flex-wrap gap-2">
@@ -657,19 +666,17 @@ function AccessKeysPanel() {
         </div>
       </div>
 
-      <div className="rounded-box border border-base-300 bg-base-100 p-3 md:col-span-2">
-        <div className="mb-3">
+      <div className="settings-subsection md:col-span-2">
+        <div className="settings-subsection-header">
+          <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
-            <div className="text-sm font-semibold">后台登录 Key</div>
-            <span className="rounded border border-base-300 bg-base-200 px-2 py-0.5 text-[0.68rem] font-semibold text-base-content/60">
-              管理后台
-            </span>
-            <span className="rounded border border-info/25 bg-info/10 px-2 py-0.5 text-[0.68rem] font-semibold text-info">
-              登录密码
-            </span>
+            <h3 className="text-sm font-semibold">后台登录 Key</h3>
+            <span className="config-badge">管理后台</span>
+            <span className="config-badge is-info">登录密码</span>
           </div>
-          <div className="mt-1 text-xs leading-4 text-base-content/60">
+          <div className="mt-1 text-xs leading-5 text-base-content/60">
             这是登录页输入的密码，也用于管理后台的后续操作。修改成功后，当前浏览器会自动切换到新 Key。
+          </div>
           </div>
         </div>
 
@@ -700,7 +707,7 @@ function AccessKeysPanel() {
           </div>
         </div>
 
-        <div className="mt-4 border-t border-base-300 pt-3">
+        <div className="settings-subsection mt-4">
           <div className="mb-2">
             <div className="text-sm font-semibold">修改登录 Key</div>
             <div className="mt-1 text-xs leading-4 text-base-content/60">
@@ -795,15 +802,14 @@ function ReportedUsageFieldEditor({
   onChange: (value: ReportedUsageFieldPolicy) => void
 }) {
   return (
-    <Card bordered className="setting-card shadow-none">
-      <Card.Body className="p-3">
+    <div className="settings-policy-field">
       <div className="mb-2">
         <div className="text-sm font-semibold">{title}</div>
         <div className="mt-0.5 text-xs leading-4 text-base-content/60">{description}</div>
       </div>
       <div className="space-y-2.5">
         <ModeSelect value={value.mode} disabled={disabled} onChange={(mode) => onChange({ ...value, mode })} />
-        <div className="rounded-box bg-base-200 px-2.5 py-1.5 text-xs leading-4 text-base-content/65">{reportedUsageModeDescription(value.mode)}</div>
+        <div className="settings-note">{reportedUsageModeDescription(value.mode)}</div>
         {fieldNeedsMax(value) && (
           <PolicyNumberInput
             title="展示上限"
@@ -848,8 +854,7 @@ function ReportedUsageFieldEditor({
           />
         )}
       </div>
-      </Card.Body>
-    </Card>
+    </div>
   )
 }
 
@@ -867,8 +872,7 @@ function ReportedUsagePathEditor({
   onChange: (value: ReportedUsagePathPolicy) => void
 }) {
   return (
-    <Card bordered className="setting-card bg-base-200/55 shadow-none">
-      <Card.Body className="p-3">
+    <div className="reported-usage-path">
       <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0">
           <h4 className="text-sm font-semibold">{title}</h4>
@@ -952,8 +956,7 @@ function ReportedUsagePathEditor({
           </div>
         </>
       )}
-      </Card.Body>
-    </Card>
+    </div>
   )
 }
 
@@ -962,7 +965,8 @@ export function ConfigPanel() {
   const updateConfig = useUpdateRuntimeConfig()
   const modelCapabilities = useModelCapabilities()
   const [draft, setDraft] = useState<RuntimeConfig>(emptyRuntimeConfig)
-  const [activeTab, setActiveTab] = useState<ConfigTab>('dispatch')
+  const [activeTab, setActiveTab] = useState<ConfigTab>('access')
+  const [selectedUsagePath, setSelectedUsagePath] = useState('__default')
 
   useEffect(() => {
     if (config.data) {
@@ -1088,70 +1092,101 @@ export function ConfigPanel() {
       ? '第一次会先正常发送；如果返回内容过长错误，再按设置裁剪并重试一次。'
       : '发送前会检查请求大小；只有超过阈值时才会处理内容。'
     : '当前未启用大小阈值，因此下面这些按大小触发的处理不会运行。'
+  const activeTabMeta = configTabs.find((tab) => tab.key === activeTab) ?? configTabs[0]
+  const reportedUsagePaths = Object.keys(draft.reportedUsage.pathOverrides)
+  const selectedUsageKey = selectedUsagePath === '__default' || draft.reportedUsage.pathOverrides[selectedUsagePath]
+    ? selectedUsagePath
+    : '__default'
 
   if (config.isLoading) return <div className="py-10 text-center text-base-content/60">加载中...</div>
   if (config.error) return <ErrorState text={extractErrorMessage(config.error)} />
 
   return (
-    <SectionCard
-      title="运行时配置"
-      description="保存后会影响新的请求；监听地址、数据库连接等启动设置仍需要修改配置文件并重启服务。"
-    >
-      <div className="space-y-4">
-        <AccessKeysPanel />
-        <StartupProxyPanel config={draft} />
-
-        <div className="config-save-bar sticky top-[4.25rem] z-30 flex flex-col gap-2 rounded-box p-2 sm:flex-row sm:items-center sm:justify-between">
-          <div className="min-w-0 text-xs leading-5 text-base-content/60">
-            修改后点击保存，后续新请求会使用新的设置。
-          </div>
+    <div className="config-page">
+      <div className="config-page-head">
+        <div className="min-w-0">
+          <h2 className="text-xl font-semibold tracking-tight">运行时配置</h2>
+          <p className="mt-1 max-w-3xl text-sm leading-6 text-base-content/60">
+            保存后会影响新的请求；监听地址、数据库连接等启动设置仍需要修改配置文件并重启服务。
+          </p>
+        </div>
+        <div className="config-save-bar">
+          <span className="min-w-0 text-xs leading-5 text-base-content/60">修改后点击保存，新请求会使用新的设置。</span>
           <Button type="button" color="primary" size="sm" className="shrink-0" onClick={save} disabled={updateConfig.isPending}>
             {updateConfig.isPending ? <Loading size="xs" /> : <Save className="h-4 w-4" />}
             保存
           </Button>
         </div>
+      </div>
 
-        <div className="config-tabs" role="tablist" aria-label="配置分类">
+      <div className="config-shell">
+        <aside className="config-side-nav" aria-label="配置分类">
+          <div className="config-side-nav-list" role="tablist" aria-label="配置分类">
           {configTabs.map((tab) => (
             <button
               key={tab.key}
               type="button"
               role="tab"
               aria-selected={activeTab === tab.key}
-              className={`config-tab ${activeTab === tab.key ? 'is-active' : ''}`}
+              className={`config-side-nav-item ${activeTab === tab.key ? 'is-active' : ''}`}
               onClick={() => setActiveTab(tab.key)}
             >
-              <span className="block font-semibold">{tab.label}</span>
-              <span className="hidden text-[0.68rem] text-base-content/55 md:block">{tab.description}</span>
+              <span className="config-side-nav-icon">{tab.icon}</span>
+              <span className="min-w-0">
+                <span className="block truncate text-sm font-semibold">{tab.label}</span>
+                <span className="mt-0.5 block truncate text-[0.68rem] text-base-content/55">{tab.description}</span>
+              </span>
             </button>
           ))}
-        </div>
+          </div>
+        </aside>
 
-        {activeTab === 'dispatch' && (
-          <>
-            <ConfigGroup icon={<Gauge className="h-4 w-4" />} title="凭据限速与冷却" description="控制每个账号能承接多少请求，以及出错后暂停多久再使用。">
-              <NumberField title="单凭据每分钟请求上限" description="控制每个凭据每分钟最多承接多少请求。填 0 表示关闭本地限速。" value={draft.credentialRpm} min={0} suffix="次/分钟" onChange={(credentialRpm) => setDraft((prev) => ({ ...prev, credentialRpm }))} />
-              <NumberField title="单凭据最大并发请求数" description="控制同一个凭据同时处理多少个请求。填 0 表示不限制。" value={draft.credentialMaxConcurrentRequests} min={0} suffix="并发" onChange={(credentialMaxConcurrentRequests) => setDraft((prev) => ({ ...prev, credentialMaxConcurrentRequests }))} />
-              <NumberField title="默认暂停时间" description="遇到未细分的临时错误时，账号暂停使用多久。" value={draft.credentialTransientCooldownSecs} min={1} suffix="秒" onChange={(credentialTransientCooldownSecs) => setDraft((prev) => ({ ...prev, credentialTransientCooldownSecs }))} />
-              <NumberField title="限流后暂停" description="遇到限流时，账号暂停使用多久。" value={draft.credentialRateLimitCooldownSecs} min={1} suffix="秒" onChange={(credentialRateLimitCooldownSecs) => setDraft((prev) => ({ ...prev, credentialRateLimitCooldownSecs }))} />
-              <NumberField title="服务繁忙后暂停" description="遇到服务繁忙或超时时，账号暂停使用多久。" value={draft.credentialServerErrorCooldownSecs} min={1} suffix="秒" onChange={(credentialServerErrorCooldownSecs) => setDraft((prev) => ({ ...prev, credentialServerErrorCooldownSecs }))} />
-              <NumberField title="网络错误基础冷却" description="发送失败、连接中断等网络错误首次触发的冷却时长。" value={draft.credentialNetworkErrorCooldownSecs} min={1} suffix="秒" onChange={(credentialNetworkErrorCooldownSecs) => setDraft((prev) => ({ ...prev, credentialNetworkErrorCooldownSecs }))} />
-              <NumberField title="流式中断后暂停" description="流式响应中断或长时间没有内容时，账号暂停使用多久。" value={draft.credentialStreamErrorCooldownSecs} min={1} suffix="秒" onChange={(credentialStreamErrorSecs) => setDraft((prev) => ({ ...prev, credentialStreamErrorCooldownSecs: credentialStreamErrorSecs }))} />
-              <NumberField title="格式异常后暂停" description="遇到可重试的请求格式异常时，账号暂停使用多久。" value={draft.credentialProtocolErrorCooldownSecs} min={1} suffix="秒" onChange={(credentialProtocolErrorCooldownSecs) => setDraft((prev) => ({ ...prev, credentialProtocolErrorCooldownSecs }))} />
-              <NumberField title="授权异常后暂停" description="账号授权异常处理期间，暂停继续使用该账号。" value={draft.credentialAuthErrorCooldownSecs} min={1} suffix="秒" onChange={(credentialAuthErrorCooldownSecs) => setDraft((prev) => ({ ...prev, credentialAuthErrorCooldownSecs }))} />
-              <NumberField title="连续失败延长倍率" description="同一账号连续出错时，用这个倍率逐步延长暂停时间。" value={draft.credentialCooldownBackoffMultiplier} min={1} max={10} step={0.1} suffix="倍" onChange={(credentialCooldownBackoffMultiplier) => setDraft((prev) => ({ ...prev, credentialCooldownBackoffMultiplier }))} />
-              <NumberField title="恢复时间错开比例" description="给恢复时间加一点随机偏移，避免多个账号同时恢复造成波动。" value={draft.credentialCooldownJitterPercent} min={0} max={100} suffix="%" onChange={(credentialCooldownJitterPercent) => setDraft((prev) => ({ ...prev, credentialCooldownJitterPercent }))} />
-              <NumberField title="恢复观察时间" description="账号恢复后先降低使用频率，稳定后再恢复正常。" value={draft.credentialProbationSecs} min={0} suffix="秒" onChange={(credentialProbationSecs) => setDraft((prev) => ({ ...prev, credentialProbationSecs }))} />
-              <NumberField title="最大冷却秒数" description="控制单个凭据最长冷却时间。" value={draft.credentialMaxCooldownSecs} min={1} suffix="秒" onChange={(credentialMaxCooldownSecs) => setDraft((prev) => ({ ...prev, credentialMaxCooldownSecs }))} />
-              <NumberField title="单请求最长排队等待" description="所有可用凭据都处于冷却、限速或并发占满时最多等待多久。填 0 表示不限制。" value={draft.credentialDispatchMaxWaitSecs} min={0} suffix="秒" onChange={(credentialDispatchMaxWaitSecs) => setDraft((prev) => ({ ...prev, credentialDispatchMaxWaitSecs }))} />
-              <NumberField title="开始响应等待时间" description="请求发出后最多等多久开始返回内容。填 0 表示使用默认超时。" value={draft.kiroUpstreamResponseTimeoutSecs} min={0} suffix="秒" onChange={(kiroUpstreamResponseTimeoutSecs) => setDraft((prev) => ({ ...prev, kiroUpstreamResponseTimeoutSecs }))} />
-              <NumberField title="单请求最大重试次数" description="一次请求失败后最多换几个账号再试。填 0 表示由系统自动决定。" value={draft.credentialRetryMaxAttempts} min={0} suffix="次" onChange={(credentialRetryMaxAttempts) => setDraft((prev) => ({ ...prev, credentialRetryMaxAttempts }))} />
-              <NumberField title="异常并发自动回收" description="单个并发占用超过多久未活跃时自动释放。填 0 表示关闭。" value={draft.credentialInFlightLeaseMaxSecs} min={0} suffix="秒" onChange={(credentialInFlightLeaseMaxSecs) => setDraft((prev) => ({ ...prev, credentialInFlightLeaseMaxSecs }))} />
-              <NumberField title="全局最大并发请求数" description="控制所有凭据合计可同时处理的请求数。填 0 表示不限制。" value={draft.dispatchGlobalMaxConcurrentRequests} min={0} suffix="并发" onChange={(dispatchGlobalMaxConcurrentRequests) => setDraft((prev) => ({ ...prev, dispatchGlobalMaxConcurrentRequests }))} />
-              <NumberField title="最大等待队列请求数" description="调度容量已满时允许排队等待的请求数量。填 0 表示不限制。" value={draft.dispatchMaxQueuedRequests} min={0} suffix="请求" onChange={(dispatchMaxQueuedRequests) => setDraft((prev) => ({ ...prev, dispatchMaxQueuedRequests }))} />
-            </ConfigGroup>
+        <section className="config-content">
+          <div className="config-content-head">
+            <div className="config-content-title">
+              <span className="config-content-icon">{activeTabMeta.icon}</span>
+              <div className="min-w-0">
+                <h3 className="text-base font-semibold">{activeTabMeta.label}</h3>
+                <p className="mt-1 text-xs leading-5 text-base-content/60">{activeTabMeta.description}</p>
+              </div>
+            </div>
+          </div>
 
-            <ConfigGroup icon={<Gauge className="h-4 w-4" />} title="账号选择权重" description="决定系统优先使用哪些账号，让请求尽量分散在更稳定的账号上。">
+          <div className="config-section-stack">
+        {activeTab === 'access' && <AccessKeysPanel />}
+        {activeTab === 'network' && <StartupProxyPanel config={draft} />}
+
+        {activeTab === 'limits' && (
+          <ConfigGroup icon={<Gauge className="h-4 w-4" />} title="请求容量" description="控制每个账号和全局的承载量，以及请求等待、重试和超时。">
+            <NumberField title="单凭据每分钟请求上限" description="控制每个凭据每分钟最多承接多少请求。填 0 表示关闭本地限速。" value={draft.credentialRpm} min={0} suffix="次/分钟" onChange={(credentialRpm) => setDraft((prev) => ({ ...prev, credentialRpm }))} />
+            <NumberField title="单凭据最大并发请求数" description="控制同一个凭据同时处理多少个请求。填 0 表示不限制。" value={draft.credentialMaxConcurrentRequests} min={0} suffix="并发" onChange={(credentialMaxConcurrentRequests) => setDraft((prev) => ({ ...prev, credentialMaxConcurrentRequests }))} />
+            <NumberField title="全局最大并发请求数" description="控制所有凭据合计可同时处理的请求数。填 0 表示不限制。" value={draft.dispatchGlobalMaxConcurrentRequests} min={0} suffix="并发" onChange={(dispatchGlobalMaxConcurrentRequests) => setDraft((prev) => ({ ...prev, dispatchGlobalMaxConcurrentRequests }))} />
+            <NumberField title="最大等待队列请求数" description="调度容量已满时允许排队等待的请求数量。填 0 表示不限制。" value={draft.dispatchMaxQueuedRequests} min={0} suffix="请求" onChange={(dispatchMaxQueuedRequests) => setDraft((prev) => ({ ...prev, dispatchMaxQueuedRequests }))} />
+            <NumberField title="单请求最长排队等待" description="所有可用凭据都处于冷却、限速或并发占满时最多等待多久。填 0 表示不限制。" value={draft.credentialDispatchMaxWaitSecs} min={0} suffix="秒" onChange={(credentialDispatchMaxWaitSecs) => setDraft((prev) => ({ ...prev, credentialDispatchMaxWaitSecs }))} />
+            <NumberField title="开始响应等待时间" description="请求发出后最多等多久开始返回内容。填 0 表示使用默认超时。" value={draft.kiroUpstreamResponseTimeoutSecs} min={0} suffix="秒" onChange={(kiroUpstreamResponseTimeoutSecs) => setDraft((prev) => ({ ...prev, kiroUpstreamResponseTimeoutSecs }))} />
+            <NumberField title="单请求最大重试次数" description="一次请求失败后最多换几个账号再试。填 0 表示由系统自动决定。" value={draft.credentialRetryMaxAttempts} min={0} suffix="次" onChange={(credentialRetryMaxAttempts) => setDraft((prev) => ({ ...prev, credentialRetryMaxAttempts }))} />
+            <NumberField title="异常并发自动回收" description="单个并发占用超过多久未活跃时自动释放。填 0 表示关闭。" value={draft.credentialInFlightLeaseMaxSecs} min={0} suffix="秒" onChange={(credentialInFlightLeaseMaxSecs) => setDraft((prev) => ({ ...prev, credentialInFlightLeaseMaxSecs }))} />
+          </ConfigGroup>
+        )}
+
+        {activeTab === 'cooldown' && (
+          <ConfigGroup icon={<Shield className="h-4 w-4" />} title="错误恢复" description="设置账号遇到不同错误后暂停多久，以及连续失败时如何延长暂停时间。">
+            <NumberField title="默认暂停时间" description="遇到未细分的临时错误时，账号暂停使用多久。" value={draft.credentialTransientCooldownSecs} min={1} suffix="秒" onChange={(credentialTransientCooldownSecs) => setDraft((prev) => ({ ...prev, credentialTransientCooldownSecs }))} />
+            <NumberField title="限流后暂停" description="遇到限流时，账号暂停使用多久。" value={draft.credentialRateLimitCooldownSecs} min={1} suffix="秒" onChange={(credentialRateLimitCooldownSecs) => setDraft((prev) => ({ ...prev, credentialRateLimitCooldownSecs }))} />
+            <NumberField title="服务繁忙后暂停" description="遇到服务繁忙或超时时，账号暂停使用多久。" value={draft.credentialServerErrorCooldownSecs} min={1} suffix="秒" onChange={(credentialServerErrorCooldownSecs) => setDraft((prev) => ({ ...prev, credentialServerErrorCooldownSecs }))} />
+            <NumberField title="网络错误基础冷却" description="发送失败、连接中断等网络错误首次触发的冷却时长。" value={draft.credentialNetworkErrorCooldownSecs} min={1} suffix="秒" onChange={(credentialNetworkErrorCooldownSecs) => setDraft((prev) => ({ ...prev, credentialNetworkErrorCooldownSecs }))} />
+            <NumberField title="流式中断后暂停" description="流式响应中断或长时间没有内容时，账号暂停使用多久。" value={draft.credentialStreamErrorCooldownSecs} min={1} suffix="秒" onChange={(credentialStreamErrorSecs) => setDraft((prev) => ({ ...prev, credentialStreamErrorCooldownSecs: credentialStreamErrorSecs }))} />
+            <NumberField title="格式异常后暂停" description="遇到可重试的请求格式异常时，账号暂停使用多久。" value={draft.credentialProtocolErrorCooldownSecs} min={1} suffix="秒" onChange={(credentialProtocolErrorCooldownSecs) => setDraft((prev) => ({ ...prev, credentialProtocolErrorCooldownSecs }))} />
+            <NumberField title="授权异常后暂停" description="账号授权异常处理期间，暂停继续使用该账号。" value={draft.credentialAuthErrorCooldownSecs} min={1} suffix="秒" onChange={(credentialAuthErrorCooldownSecs) => setDraft((prev) => ({ ...prev, credentialAuthErrorCooldownSecs }))} />
+            <NumberField title="连续失败延长倍率" description="同一账号连续出错时，用这个倍率逐步延长暂停时间。" value={draft.credentialCooldownBackoffMultiplier} min={1} max={10} step={0.1} suffix="倍" onChange={(credentialCooldownBackoffMultiplier) => setDraft((prev) => ({ ...prev, credentialCooldownBackoffMultiplier }))} />
+            <NumberField title="恢复时间错开比例" description="给恢复时间加一点随机偏移，避免多个账号同时恢复造成波动。" value={draft.credentialCooldownJitterPercent} min={0} max={100} suffix="%" onChange={(credentialCooldownJitterPercent) => setDraft((prev) => ({ ...prev, credentialCooldownJitterPercent }))} />
+            <NumberField title="恢复观察时间" description="账号恢复后先降低使用频率，稳定后再恢复正常。" value={draft.credentialProbationSecs} min={0} suffix="秒" onChange={(credentialProbationSecs) => setDraft((prev) => ({ ...prev, credentialProbationSecs }))} />
+            <NumberField title="最大冷却秒数" description="控制单个凭据最长冷却时间。" value={draft.credentialMaxCooldownSecs} min={1} suffix="秒" onChange={(credentialMaxCooldownSecs) => setDraft((prev) => ({ ...prev, credentialMaxCooldownSecs }))} />
+          </ConfigGroup>
+        )}
+
+        {activeTab === 'scheduler' && (
+          <ConfigGroup icon={<Gauge className="h-4 w-4" />} title="账号选择权重" description="决定系统优先使用哪些账号，让请求尽量分散在更稳定的账号上。">
               <NumberField title="近期错误敏感度" description="数值越高，最近出现的错误越快影响账号选择。" value={draft.schedulerErrorEwmaAlpha} min={0.01} max={1} step={0.01} suffix="系数" onChange={(schedulerErrorEwmaAlpha) => setDraft((prev) => ({ ...prev, schedulerErrorEwmaAlpha }))} />
               <NumberField title="优先级权重" description="账号优先级对选择结果的影响。" value={draft.schedulerPriorityWeight} min={0} step={0.1} suffix="权重" onChange={(schedulerPriorityWeight) => setDraft((prev) => ({ ...prev, schedulerPriorityWeight }))} />
               <NumberField title="当前负载权重" description="账号当前越忙，是否越少继续分配给它。" value={draft.schedulerLoadWeight} min={0} step={1} suffix="权重" onChange={(schedulerLoadWeight) => setDraft((prev) => ({ ...prev, schedulerLoadWeight }))} />
@@ -1162,17 +1197,21 @@ export function ConfigPanel() {
               <NumberField title="长期使用次数权重" description="根据历史使用次数做轻微均衡。通常保持 0 即可。" value={draft.schedulerTotalSelectionWeight} min={0} step={0.001} suffix="权重" onChange={(schedulerTotalSelectionWeight) => setDraft((prev) => ({ ...prev, schedulerTotalSelectionWeight }))} />
               <NumberField title="候选账号数量" description="每次从排名靠前的几个账号里选择，数值越大越分散。" value={draft.schedulerTopK} min={1} max={100} suffix="个" onChange={(schedulerTopK) => setDraft((prev) => ({ ...prev, schedulerTopK }))} />
             </ConfigGroup>
+        )}
 
+        {activeTab === 'warmup' && (
             <ConfigGroup icon={<Sparkles className="h-4 w-4" />} title="新凭据预热" description="让新账号先少量参与服务，确认稳定后再逐步恢复正常使用。">
               <NumberField title="预热请求数" description="新账号先参与多少次请求后结束预热。填 0 表示不预热。" value={draft.credentialWarmupRequests} min={0} suffix="次" onChange={(credentialWarmupRequests) => setDraft((prev) => ({ ...prev, credentialWarmupRequests }))} />
               <NumberField title="单个预热账号参与比例" description="每个预热账号希望承接的请求比例。" value={draft.credentialWarmupSelectionPercent} min={0} max={100} suffix="%" onChange={(credentialWarmupSelectionPercent) => setDraft((prev) => ({ ...prev, credentialWarmupSelectionPercent }))} />
               <NumberField title="预热账号总占比上限" description="所有预热账号合计最多承接多少请求。" value={draft.credentialWarmupMaxSelectionPercent} min={0} max={100} suffix="%" onChange={(credentialWarmupMaxSelectionPercent) => setDraft((prev) => ({ ...prev, credentialWarmupMaxSelectionPercent }))} />
             </ConfigGroup>
+        )}
 
+        {activeTab === 'payload' && (
             <ConfigGroup
               icon={<Wand2 className="h-4 w-4" />}
-              title="请求压缩与大小保护"
-              description="控制请求过大时如何压缩或裁剪，避免因为内容太长导致失败。"
+              title="请求大小保护"
+              description="设置请求过大时的处理方式、触发阈值和基础压缩开关。"
             >
               <ImpactGroupHeader
                 label="全局影响"
@@ -1202,6 +1241,21 @@ export function ConfigPanel() {
                 description={payloadConditionDescription}
                 muted={!payloadSizeLimitEnabled}
               />
+            </ConfigGroup>
+        )}
+
+        {activeTab === 'payloadHistory' && (
+            <ConfigGroup
+              icon={<Wand2 className="h-4 w-4" />}
+              title="旧内容清理"
+              description="当请求超过阈值时，先处理旧对话、历史工具结果和网页抓取内容。"
+            >
+              <ImpactGroupHeader
+                label="生效条件"
+                title={payloadConditionTitle}
+                description={payloadConditionDescription}
+                muted={!payloadSizeLimitEnabled}
+              />
               <ToggleField title="优先裁剪旧历史" description="内容太长时，优先缩短较早的对话历史，尽量保留当前请求。" checked={draft.payloadGuardTrimHistory} disabled={!payloadSizeLimitEnabled} onChange={(payloadGuardTrimHistory) => setDraft((prev) => ({ ...prev, payloadGuardTrimHistory }))} />
               <ToggleField title="启用内容清理" description="内容太长时，允许系统清理历史内容、工具说明和网页抓取结果。" checked={draft.payloadShaping.enabled} disabled={!payloadSizeLimitEnabled} onChange={(enabled) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, enabled } }))} />
               <ToggleField title="截短历史工具结果" description="历史工具结果很长时，只保留开头和结尾。" checked={draft.payloadShaping.truncateHistoricalToolResults} disabled={!payloadShapingBranchEnabled} onChange={(truncateHistoricalToolResults) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, truncateHistoricalToolResults } }))} />
@@ -1211,6 +1265,15 @@ export function ConfigPanel() {
               <NumberField title="工具说明大小上限" description="工具说明超过这个大小后才会压缩。填 0 表示不按此项压缩。" value={draft.payloadShaping.toolDefinitionsBudgetBytes} disabled={!payloadShapingBranchEnabled} min={0} suffix="字节" onChange={(toolDefinitionsBudgetBytes) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, toolDefinitionsBudgetBytes } }))} />
               <ToggleField title="清理网页抓取历史" description="清理历史网页抓取结果里的图片、重复行和明显噪声。" checked={draft.payloadShaping.webFetchTrimEnabled} disabled={!payloadShapingBranchEnabled} onChange={(webFetchTrimEnabled) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, webFetchTrimEnabled } }))} />
               <NumberField title="网页抓取正文保留字符" description="网页抓取结果清理后最多保留多少字符。填 0 表示不裁剪正文。" value={draft.payloadShaping.webFetchBodyMaxChars} disabled={!payloadShapingBranchEnabled} min={0} suffix="字符" onChange={(webFetchBodyMaxChars) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, webFetchBodyMaxChars } }))} />
+            </ConfigGroup>
+        )}
+
+        {activeTab === 'payloadFallback' && (
+            <ConfigGroup
+              icon={<Wand2 className="h-4 w-4" />}
+              title="当前内容兜底"
+              description="旧内容清理后仍然过大时，再处理当前消息、当前文档和图片。"
+            >
               <ImpactGroupHeader
                 label="兜底分支"
                 title="历史内容处理后仍然太长时执行"
@@ -1231,102 +1294,77 @@ export function ConfigPanel() {
               <ToggleField title="移除当前图片" description="图片太大且请求仍然超限时，可按体积优先移除大图。" checked={draft.payloadShaping.truncateCurrentImages} disabled={!payloadShapingBranchEnabled} onChange={(truncateCurrentImages) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, truncateCurrentImages } }))} />
               <NumberField title="当前图片保留大小" description="当前图片数据最多保留多少字节。" value={draft.payloadShaping.currentImagesMaxBytes} disabled={!payloadShapingBranchEnabled} min={0} suffix="字节" onChange={(currentImagesMaxBytes) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, currentImagesMaxBytes } }))} />
             </ConfigGroup>
-          </>
         )}
 
-        {activeTab === 'cache' && (
-          <>
-            <ConfigGroup icon={<Zap className="h-4 w-4" />} title="缓存命中展示" description="控制页面和响应里展示的缓存用量，让统计更接近预期展示口径。">
-              <NumberField title="缓存读取目标比例" description="希望缓存读取量大约占输入量的比例，常用 0.95 到 0.99。" value={draft.promptCacheTargetReadRatio} min={0} max={0.99} step={0.01} suffix="比例" onChange={(promptCacheTargetReadRatio) => setDraft((prev) => ({ ...prev, promptCacheTargetReadRatio }))} />
-              <NumberField title="输入估算放大倍数" description="用于估算缓存展示时的输入规模，不代表真实请求内容一定变大。" value={draft.promptCacheTokenScale} min={1} max={3} step={0.1} suffix="倍" onChange={(promptCacheTokenScale) => setDraft((prev) => ({ ...prev, promptCacheTokenScale }))} />
-              <NumberField title="输入展示上限" description="估算后的输入量最高显示到多少。填 0 表示不设上限。" value={draft.promptCacheMaxSimulatedInputTokens} min={0} suffix="Token" onChange={(promptCacheMaxSimulatedInputTokens) => setDraft((prev) => ({ ...prev, promptCacheMaxSimulatedInputTokens }))} />
-              <NumberField title="放大启用门槛" description="输入量达到多少后才开始放大估算。" value={draft.promptCacheScaleMinInputTokens} min={0} suffix="Token" onChange={(promptCacheScaleMinInputTokens) => setDraft((prev) => ({ ...prev, promptCacheScaleMinInputTokens }))} />
-              <NumberField title="触顶扣减下限" description="达到上限时，至少从上限扣掉多少，避免数值总是贴边。" value={draft.promptCacheCapJitterMinTokens} min={0} suffix="Token" onChange={(promptCacheCapJitterMinTokens) => setDraft((prev) => ({ ...prev, promptCacheCapJitterMinTokens }))} />
-              <NumberField title="触顶扣减上限" description="达到上限时，最多从上限扣掉多少。" value={draft.promptCacheCapJitterMaxTokens} min={0} suffix="Token" onChange={(promptCacheCapJitterMaxTokens) => setDraft((prev) => ({ ...prev, promptCacheCapJitterMaxTokens }))} />
-            </ConfigGroup>
+        {activeTab === 'cacheRead' && (
+          <ConfigGroup icon={<Zap className="h-4 w-4" />} title="缓存命中展示" description="控制页面和响应里展示的缓存用量，让统计更接近预期展示口径。">
+            <NumberField title="缓存读取目标比例" description="希望缓存读取量大约占输入量的比例，常用 0.95 到 0.99。" value={draft.promptCacheTargetReadRatio} min={0} max={0.99} step={0.01} suffix="比例" onChange={(promptCacheTargetReadRatio) => setDraft((prev) => ({ ...prev, promptCacheTargetReadRatio }))} />
+            <NumberField title="输入估算放大倍数" description="用于估算缓存展示时的输入规模，不代表真实请求内容一定变大。" value={draft.promptCacheTokenScale} min={1} max={3} step={0.1} suffix="倍" onChange={(promptCacheTokenScale) => setDraft((prev) => ({ ...prev, promptCacheTokenScale }))} />
+            <NumberField title="输入展示上限" description="估算后的输入量最高显示到多少。填 0 表示不设上限。" value={draft.promptCacheMaxSimulatedInputTokens} min={0} suffix="Token" onChange={(promptCacheMaxSimulatedInputTokens) => setDraft((prev) => ({ ...prev, promptCacheMaxSimulatedInputTokens }))} />
+            <NumberField title="放大启用门槛" description="输入量达到多少后才开始放大估算。" value={draft.promptCacheScaleMinInputTokens} min={0} suffix="Token" onChange={(promptCacheScaleMinInputTokens) => setDraft((prev) => ({ ...prev, promptCacheScaleMinInputTokens }))} />
+            <NumberField title="触顶扣减下限" description="达到上限时，至少从上限扣掉多少，避免数值总是贴边。" value={draft.promptCacheCapJitterMinTokens} min={0} suffix="Token" onChange={(promptCacheCapJitterMinTokens) => setDraft((prev) => ({ ...prev, promptCacheCapJitterMinTokens }))} />
+            <NumberField title="触顶扣减上限" description="达到上限时，最多从上限扣掉多少。" value={draft.promptCacheCapJitterMaxTokens} min={0} suffix="Token" onChange={(promptCacheCapJitterMaxTokens) => setDraft((prev) => ({ ...prev, promptCacheCapJitterMaxTokens }))} />
+          </ConfigGroup>
+        )}
 
-            <ConfigGroup icon={<Gauge className="h-4 w-4" />} title="缓存创建频次" description="控制缓存创建数值出现的频率，避免展示结果过于频繁或过大。">
-              <ToggleField title="启用缓存创建频次控制" description="开启后，只影响缓存创建数值的展示频率。" checked={draft.promptCacheCreationControl.enabled} onChange={(enabled) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, enabled } }))} />
-              <FieldLabel title="控制维度" description="选择按账号分别控制，还是按同一个会话和模型统一控制。">
-                <Select bordered size="sm" className="w-full" value={draft.promptCacheCreationControl.scopeMode} disabled={!draft.promptCacheCreationControl.enabled} onChange={(event) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, scopeMode: event.target.value as 'credential_conversation_model' | 'conversation_model' } }))}>
-                  <Select.Option value="credential_conversation_model">凭据 + 会话 + 模型</Select.Option>
-                  <Select.Option value="conversation_model">会话 + 模型</Select.Option>
-                </Select>
-              </FieldLabel>
-              <NumberField title="最小成功请求间隔" description="两次缓存创建展示之间至少间隔多少次成功请求。填 0 表示不限制。" value={draft.promptCacheCreationControl.minSuccessfulRequestsBetweenCreation} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="次" onChange={(minSuccessfulRequestsBetweenCreation) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, minSuccessfulRequestsBetweenCreation } }))} />
-              <NumberField title="最小时间间隔" description="两次缓存创建展示之间至少间隔多少秒。填 0 表示不限制。" value={draft.promptCacheCreationControl.minCreationIntervalSecs} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="秒" onChange={(minCreationIntervalSecs) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, minCreationIntervalSecs } }))} />
-              <NumberField title="最小累计增量" description="累计变化达到多少后，才允许下一次展示缓存创建数值。" value={draft.promptCacheCreationControl.minCreationDeltaTokens} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="Token" onChange={(minCreationDeltaTokens) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, minCreationDeltaTokens } }))} />
-              <NumberField title="单次展示上限" description="一次响应最多展示多少缓存创建量。填 0 表示不限制。" value={draft.promptCacheCreationControl.maxCreationTokensPerEvent} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="Token" onChange={(maxCreationTokensPerEvent) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, maxCreationTokensPerEvent } }))} />
-              <NumberField title="额度窗口长度" description="在这个时间窗口内统计缓存创建展示额度。填 0 表示关闭窗口限制。" value={draft.promptCacheCreationControl.creationBudgetWindowSecs} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="秒" onChange={(creationBudgetWindowSecs) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, creationBudgetWindowSecs } }))} />
-              <NumberField title="窗口展示额度" description="单个时间窗口内最多展示多少缓存创建量。填 0 表示不限制。" value={draft.promptCacheCreationControl.maxCreationTokensPerWindow} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="Token" onChange={(maxCreationTokensPerWindow) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, maxCreationTokensPerWindow } }))} />
-              <NumberField title="空闲后清理状态" description="长时间没有请求后清理控制状态。填 0 表示不按空闲时间清理。" value={draft.promptCacheCreationControl.expireAfterIdleSecs} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="秒" onChange={(expireAfterIdleSecs) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, expireAfterIdleSecs } }))} />
-            </ConfigGroup>
-          </>
+        {activeTab === 'cacheCreate' && (
+          <ConfigGroup icon={<Gauge className="h-4 w-4" />} title="缓存创建频次" description="控制缓存创建数值出现的频率，避免展示结果过于频繁或过大。">
+            <ToggleField title="启用缓存创建频次控制" description="开启后，只影响缓存创建数值的展示频率。" checked={draft.promptCacheCreationControl.enabled} onChange={(enabled) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, enabled } }))} />
+            <FieldLabel title="控制维度" description="选择按账号分别控制，还是按同一个会话和模型统一控制。">
+              <Select bordered size="sm" className="w-full" value={draft.promptCacheCreationControl.scopeMode} disabled={!draft.promptCacheCreationControl.enabled} onChange={(event) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, scopeMode: event.target.value as 'credential_conversation_model' | 'conversation_model' } }))}>
+                <Select.Option value="credential_conversation_model">凭据 + 会话 + 模型</Select.Option>
+                <Select.Option value="conversation_model">会话 + 模型</Select.Option>
+              </Select>
+            </FieldLabel>
+            <NumberField title="最小成功请求间隔" description="两次缓存创建展示之间至少间隔多少次成功请求。填 0 表示不限制。" value={draft.promptCacheCreationControl.minSuccessfulRequestsBetweenCreation} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="次" onChange={(minSuccessfulRequestsBetweenCreation) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, minSuccessfulRequestsBetweenCreation } }))} />
+            <NumberField title="最小时间间隔" description="两次缓存创建展示之间至少间隔多少秒。填 0 表示不限制。" value={draft.promptCacheCreationControl.minCreationIntervalSecs} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="秒" onChange={(minCreationIntervalSecs) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, minCreationIntervalSecs } }))} />
+            <NumberField title="最小累计增量" description="累计变化达到多少后，才允许下一次展示缓存创建数值。" value={draft.promptCacheCreationControl.minCreationDeltaTokens} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="Token" onChange={(minCreationDeltaTokens) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, minCreationDeltaTokens } }))} />
+            <NumberField title="单次展示上限" description="一次响应最多展示多少缓存创建量。填 0 表示不限制。" value={draft.promptCacheCreationControl.maxCreationTokensPerEvent} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="Token" onChange={(maxCreationTokensPerEvent) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, maxCreationTokensPerEvent } }))} />
+            <NumberField title="额度窗口长度" description="在这个时间窗口内统计缓存创建展示额度。填 0 表示关闭窗口限制。" value={draft.promptCacheCreationControl.creationBudgetWindowSecs} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="秒" onChange={(creationBudgetWindowSecs) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, creationBudgetWindowSecs } }))} />
+            <NumberField title="窗口展示额度" description="单个时间窗口内最多展示多少缓存创建量。填 0 表示不限制。" value={draft.promptCacheCreationControl.maxCreationTokensPerWindow} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="Token" onChange={(maxCreationTokensPerWindow) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, maxCreationTokensPerWindow } }))} />
+            <NumberField title="空闲后清理状态" description="长时间没有请求后清理控制状态。填 0 表示不按空闲时间清理。" value={draft.promptCacheCreationControl.expireAfterIdleSecs} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="秒" onChange={(expireAfterIdleSecs) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, expireAfterIdleSecs } }))} />
+          </ConfigGroup>
         )}
 
         {activeTab === 'usage' && (
           <ConfigGroup icon={<BadgeInfo className="h-4 w-4" />} title="用量展示规则" description="按不同入口设置看到的输入、输出和缓存用量。只影响展示口径，不改变实际请求内容。">
-            <div className="space-y-3 md:col-span-2">
-              <ReportedUsagePathEditor
-                title="默认展示规则"
-                description="没有匹配到下面的入口规则时，使用这里的默认设置。"
-                value={draft.reportedUsage.default}
-                onChange={(defaultPolicy) => setDraft((prev) => ({ ...prev, reportedUsage: { ...prev.reportedUsage, default: defaultPolicy } }))}
-              />
-              {Object.entries(draft.reportedUsage.pathOverrides).map(([prefix, policy]) => (
-                <div key={prefix} className="space-y-3">
-                  <FieldLabel title="入口前缀" description="只影响匹配这个前缀的入口。不同前缀互相独立。">
-                    <Input
-                      bordered
-                      size="sm"
-                      value={prefix}
-                      onChange={(event) => {
-                        const nextPrefix = event.target.value
-                        setDraft((prev) => {
-                          const pathOverrides = { ...prev.reportedUsage.pathOverrides }
-                          delete pathOverrides[prefix]
-                          pathOverrides[nextPrefix] = policy
-                          return { ...prev, reportedUsage: { ...prev.reportedUsage, pathOverrides } }
-                        })
-                      }}
-                    />
-                  </FieldLabel>
-                  <ReportedUsagePathEditor
-                    title={`${prefix || '/'} 单独规则`}
-                    description="只影响匹配这个入口的用量展示。关闭后使用服务返回值或默认展示规则。"
-                    value={policy}
-                    onDelete={() =>
-                      setDraft((prev) => {
-                        const pathOverrides = { ...prev.reportedUsage.pathOverrides }
-                        delete pathOverrides[prefix]
-                        return { ...prev, reportedUsage: { ...prev.reportedUsage, pathOverrides } }
-                      })
-                    }
-                    onChange={(nextPolicy) =>
-                      setDraft((prev) => ({
-                        ...prev,
-                        reportedUsage: {
-                          ...prev.reportedUsage,
-                          pathOverrides: { ...prev.reportedUsage.pathOverrides, [prefix]: nextPolicy },
-                        },
-                      }))
-                    }
-                  />
-                </div>
-              ))}
-              <div className="flex justify-end">
+            <div className="reported-usage-layout md:col-span-2">
+              <div className="reported-usage-list" role="tablist" aria-label="用量展示规则入口">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={selectedUsageKey === '__default'}
+                  className={`reported-usage-item ${selectedUsageKey === '__default' ? 'is-active' : ''}`}
+                  onClick={() => setSelectedUsagePath('__default')}
+                >
+                  <span className="font-semibold">默认规则</span>
+                  <span>未匹配入口时使用</span>
+                </button>
+                {reportedUsagePaths.map((prefix) => (
+                  <button
+                    key={prefix}
+                    type="button"
+                    role="tab"
+                    aria-selected={selectedUsageKey === prefix}
+                    className={`reported-usage-item ${selectedUsageKey === prefix ? 'is-active' : ''}`}
+                    onClick={() => setSelectedUsagePath(prefix)}
+                  >
+                    <span className="font-semibold">{prefix || '/'}</span>
+                    <span>{draft.reportedUsage.pathOverrides[prefix]?.enabled ? '已启用' : '已关闭'}</span>
+                  </button>
+                ))}
                 <Button
                   type="button"
                   variant="outline"
                   size="sm"
-                  onClick={() =>
+                  onClick={() => {
+                    let index = 1
+                    let prefix = '/new'
+                    while (draft.reportedUsage.pathOverrides[prefix]) {
+                      index += 1
+                      prefix = `/new-${index}`
+                    }
                     setDraft((prev) => {
-                      let index = 1
-                      let prefix = '/new'
-                      while (prev.reportedUsage.pathOverrides[prefix]) {
-                        index += 1
-                        prefix = `/new-${index}`
-                      }
                       return {
                         ...prev,
                         reportedUsage: {
@@ -1335,18 +1373,73 @@ export function ConfigPanel() {
                         },
                       }
                     })
-                  }
+                    setSelectedUsagePath(prefix)
+                  }}
                 >
                   添加入口规则
                 </Button>
+              </div>
+
+              <div className="reported-usage-detail">
+                {selectedUsageKey === '__default' ? (
+                  <ReportedUsagePathEditor
+                    title="默认展示规则"
+                    description="没有匹配到单独入口规则时，使用这里的默认设置。"
+                    value={draft.reportedUsage.default}
+                    onChange={(defaultPolicy) => setDraft((prev) => ({ ...prev, reportedUsage: { ...prev.reportedUsage, default: defaultPolicy } }))}
+                  />
+                ) : (
+                  <div className="space-y-3">
+                    <FieldLabel title="入口前缀" description="只影响匹配这个前缀的入口。不同前缀互相独立。">
+                      <Input
+                        bordered
+                        size="sm"
+                        value={selectedUsageKey}
+                        onChange={(event) => {
+                          const nextPrefix = event.target.value
+                          setDraft((prev) => {
+                            const policy = prev.reportedUsage.pathOverrides[selectedUsageKey]
+                            if (!policy) return prev
+                            const pathOverrides = { ...prev.reportedUsage.pathOverrides }
+                            delete pathOverrides[selectedUsageKey]
+                            pathOverrides[nextPrefix] = policy
+                            return { ...prev, reportedUsage: { ...prev.reportedUsage, pathOverrides } }
+                          })
+                          setSelectedUsagePath(nextPrefix)
+                        }}
+                      />
+                    </FieldLabel>
+                    <ReportedUsagePathEditor
+                      title={`${selectedUsageKey || '/'} 单独规则`}
+                      description="只影响匹配这个入口的用量展示。关闭后使用服务返回值或默认展示规则。"
+                      value={draft.reportedUsage.pathOverrides[selectedUsageKey]}
+                      onDelete={() => {
+                        setDraft((prev) => {
+                          const pathOverrides = { ...prev.reportedUsage.pathOverrides }
+                          delete pathOverrides[selectedUsageKey]
+                          return { ...prev, reportedUsage: { ...prev.reportedUsage, pathOverrides } }
+                        })
+                        setSelectedUsagePath('__default')
+                      }}
+                      onChange={(nextPolicy) =>
+                        setDraft((prev) => ({
+                          ...prev,
+                          reportedUsage: {
+                            ...prev.reportedUsage,
+                            pathOverrides: { ...prev.reportedUsage.pathOverrides, [selectedUsageKey]: nextPolicy },
+                          },
+                        }))
+                      }
+                    />
+                  </div>
+                )}
               </div>
             </div>
           </ConfigGroup>
         )}
 
         {activeTab === 'compat' && (
-          <>
-            <ConfigGroup icon={<Shield className="h-4 w-4" />} title="兼容与排查" description="选择接口兼容方式，以及是否输出排查用信息。">
+            <ConfigGroup icon={<Shield className="h-4 w-4" />} title="兼容与模型" description="选择接口兼容方式，并维护模型名称映射。">
               <FieldLabel title="兼容模式" description="日常使用建议保持兼容模式；严格模式会尽量减少代理侧处理；调试模式会输出更多排查信息。">
                 <Select bordered size="sm" value={draft.compatProfile} onChange={(event) => setDraft((prev) => ({ ...prev, compatProfile: event.target.value as CompatProfile }))}>
                   <Select.Option value="claude-code">Claude Code 兼容</Select.Option>
@@ -1407,18 +1500,21 @@ export function ConfigPanel() {
               <ToggleField title="整理思考内容" description="开启后，会把响应里的思考内容单独整理出来。" checked={draft.extractThinking} onChange={(extractThinking) => setDraft((prev) => ({ ...prev, extractThinking }))} />
               <ToggleField title="显示处理告警" description="开启后，会把排查提示返回给客户端，方便定位兼容问题。" checked={draft.exposeProxyWarnings} onChange={(exposeProxyWarnings) => setDraft((prev) => ({ ...prev, exposeProxyWarnings }))} />
             </ConfigGroup>
+        )}
 
+        {activeTab === 'stats' && (
             <ConfigGroup icon={<Gauge className="h-4 w-4" />} title="后台统计" description="控制页面统计的判断标准，不改变实际请求。">
               <NumberField title="缓存命中判定阈值" description="缓存读取量达到多少时，页面把这次请求算作缓存命中较高的请求。" value={draft.highCacheThreshold} min={0} suffix="Token" onChange={(highCacheThreshold) => setDraft((prev) => ({ ...prev, highCacheThreshold }))} />
             </ConfigGroup>
-          </>
         )}
 
-        <Alert status="info" className="py-2 text-sm">
-          <Shield className="h-4 w-4" />
-          <span>保存前会检查数值范围；保存后，新的请求会使用这些设置。</span>
-        </Alert>
+            <div className="config-footnote">
+              <Shield className="h-4 w-4" />
+              <span>保存前会检查数值范围；保存后，新的请求会使用这些设置。</span>
+            </div>
+          </div>
+        </section>
       </div>
-    </SectionCard>
+    </div>
   )
 }
