@@ -751,6 +751,12 @@ struct PoolAvailabilitySnapshot {
     wait_for: Option<Duration>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PoolSelectionSnapshot {
+    selected_pool: Option<ExternalPool>,
+    availability: PoolAvailabilitySnapshot,
+}
+
 #[derive(Debug, Clone)]
 struct CachedPoolAvailabilitySnapshot {
     snapshot: PoolAvailabilitySnapshot,
@@ -1004,10 +1010,11 @@ impl ExternalPoolManager {
         let mut attempt_index = 0usize;
 
         while attempt_index < max_attempts {
-            let Some(pool) = self.select_pool(&excluded, &config).await else {
-                let snapshot = self
-                    .pool_availability_snapshot_uncached(&excluded, &config)
-                    .await;
+            let selection = self
+                .select_pool_with_availability_uncached(&excluded, &config)
+                .await;
+            let Some(pool) = selection.selected_pool else {
+                let snapshot = selection.availability;
                 if snapshot.has_temporary_unavailable_pool() {
                     match self
                         .handle_capacity_unavailable(
@@ -1541,27 +1548,85 @@ impl ExternalPoolManager {
         excluded: &HashSet<u64>,
         config: &ExternalPoolsConfig,
     ) -> Option<ExternalPool> {
-        let pools = self.postgres.list_external_pools(false).await.ok()?;
-        let mut candidates = Vec::new();
+        self.scan_pool_availability_uncached(excluded, config, true)
+            .await
+            .selected_pool
+    }
+
+    async fn select_pool_with_availability_uncached(
+        &self,
+        excluded: &HashSet<u64>,
+        config: &ExternalPoolsConfig,
+    ) -> PoolSelectionSnapshot {
+        self.scan_pool_availability_uncached(excluded, config, true)
+            .await
+    }
+
+    async fn scan_pool_availability_uncached(
+        &self,
+        excluded: &HashSet<u64>,
+        config: &ExternalPoolsConfig,
+        include_selection: bool,
+    ) -> PoolSelectionSnapshot {
+        if !config.external_pools_enabled {
+            return PoolSelectionSnapshot::default();
+        }
+        let Ok(pools) = self.postgres.list_external_pools(false).await else {
+            return PoolSelectionSnapshot::default();
+        };
+        let mut candidates = include_selection.then(Vec::new);
+        let mut availability = PoolAvailabilitySnapshot::default();
         for pool in pools {
             if excluded.contains(&pool.id) {
                 continue;
             }
+            if !pool.enabled || pool.is_auto_disabled_now() {
+                continue;
+            }
+            availability.eligible_pools += 1;
             let (in_flight, global_in_flight, cooldown_remaining_secs, _) =
                 self.pool_runtime_snapshot(pool.id).await;
-            if Self::skip_reason(
+            match Self::skip_reason(
                 &pool,
                 in_flight,
                 global_in_flight,
                 cooldown_remaining_secs,
                 config,
             )
-            .is_none()
+            .as_deref()
             {
-                candidates.push((pool, in_flight));
+                None => {
+                    availability.available_pools += 1;
+                    if let Some(candidates) = candidates.as_mut() {
+                        candidates.push((pool, in_flight));
+                    }
+                }
+                Some("pool_concurrency_full" | "global_concurrency_full") => {
+                    availability.temporary_unavailable_pools += 1;
+                    if availability.wait_reason.is_none() {
+                        availability.wait_reason = Some(PoolCapacityWaitReason::Full);
+                    }
+                }
+                Some("cooldown") => {
+                    availability.temporary_unavailable_pools += 1;
+                    availability
+                        .wait_reason
+                        .get_or_insert(PoolCapacityWaitReason::Cooldown);
+                    let wait_for = Duration::from_secs(cooldown_remaining_secs.max(1));
+                    availability.wait_for = Some(
+                        availability
+                            .wait_for
+                            .map(|existing| existing.min(wait_for))
+                            .unwrap_or(wait_for),
+                    );
+                }
+                _ => {}
             }
         }
-        select_external_pool_candidate(candidates)
+        PoolSelectionSnapshot {
+            selected_pool: candidates.and_then(select_external_pool_candidate),
+            availability,
+        }
     }
 
     async fn pool_availability_snapshot(
@@ -1570,15 +1635,6 @@ impl ExternalPoolManager {
         config: &ExternalPoolsConfig,
     ) -> PoolAvailabilitySnapshot {
         self.pool_availability_snapshot_inner(excluded, config, true)
-            .await
-    }
-
-    async fn pool_availability_snapshot_uncached(
-        &self,
-        excluded: &HashSet<u64>,
-        config: &ExternalPoolsConfig,
-    ) -> PoolAvailabilitySnapshot {
-        self.pool_availability_snapshot_inner(excluded, config, false)
             .await
     }
 
@@ -1605,52 +1661,10 @@ impl ExternalPoolManager {
             }
         }
 
-        let Ok(pools) = self.postgres.list_external_pools(false).await else {
-            return PoolAvailabilitySnapshot::default();
-        };
-        let mut snapshot = PoolAvailabilitySnapshot::default();
-        for pool in pools {
-            if excluded.contains(&pool.id) {
-                continue;
-            }
-            if !pool.enabled || pool.is_auto_disabled_now() {
-                continue;
-            }
-            snapshot.eligible_pools += 1;
-            let (in_flight, global_in_flight, cooldown_remaining_secs, _) =
-                self.pool_runtime_snapshot(pool.id).await;
-            match Self::skip_reason(
-                &pool,
-                in_flight,
-                global_in_flight,
-                cooldown_remaining_secs,
-                config,
-            ) {
-                None => snapshot.available_pools += 1,
-                Some(reason)
-                    if reason == "pool_concurrency_full" || reason == "global_concurrency_full" =>
-                {
-                    snapshot.temporary_unavailable_pools += 1;
-                    if snapshot.wait_reason.is_none() {
-                        snapshot.wait_reason = Some(PoolCapacityWaitReason::Full);
-                    }
-                }
-                Some(reason) if reason == "cooldown" => {
-                    snapshot.temporary_unavailable_pools += 1;
-                    snapshot
-                        .wait_reason
-                        .get_or_insert(PoolCapacityWaitReason::Cooldown);
-                    let wait_for = Duration::from_secs(cooldown_remaining_secs.max(1));
-                    snapshot.wait_for = Some(
-                        snapshot
-                            .wait_for
-                            .map(|existing| existing.min(wait_for))
-                            .unwrap_or(wait_for),
-                    );
-                }
-                _ => {}
-            }
-        }
+        let snapshot = self
+            .scan_pool_availability_uncached(excluded, config, false)
+            .await
+            .availability;
         if cacheable {
             *self.availability_cache.lock() = Some(CachedPoolAvailabilitySnapshot {
                 snapshot: snapshot.clone(),
@@ -4567,16 +4581,11 @@ mod tests {
             PoolAcquireResult::Acquired(lease) => lease,
             PoolAcquireResult::Unavailable(_) => panic!("pool lease should be acquired"),
         };
-        assert!(
-            manager
-                .select_pool(&HashSet::new(), &config)
-                .await
-                .is_none()
-        );
-
-        let uncached_full = manager
-            .pool_availability_snapshot_uncached(&HashSet::new(), &config)
+        let selection = manager
+            .scan_pool_availability_uncached(&HashSet::new(), &config, true)
             .await;
+        assert!(selection.selected_pool.is_none());
+        let uncached_full = selection.availability;
         assert_eq!(uncached_full.eligible_pools, 1);
         assert_eq!(uncached_full.available_pools, 0);
         assert_eq!(uncached_full.temporary_unavailable_pools, 1);
