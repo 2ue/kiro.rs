@@ -451,6 +451,10 @@ export interface SetCredentialConcurrencyRequest {
   maxConcurrentRequests?: number | null
 }
 
+export interface SetCredentialRpmRequest {
+  rpm?: number | null
+}
+
 export interface SetCredentialRegionsRequest {
   region?: string | null
   authRegion?: string | null

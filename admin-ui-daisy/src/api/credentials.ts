@@ -24,6 +24,7 @@ import type {
   AccessKeysResponse,
   RuntimeConfig,
   SetCredentialConcurrencyRequest,
+  SetCredentialRpmRequest,
   SetCredentialRegionsRequest,
   SetDisabledRequest,
   SetCredentialProxyRequest,
@@ -163,6 +164,11 @@ export async function setCredentialPriority(id: number, priority: number): Promi
 
 export async function setCredentialConcurrency(id: number, req: SetCredentialConcurrencyRequest): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/concurrency`, req)
+  return data
+}
+
+export async function setCredentialRpm(id: number, req: SetCredentialRpmRequest): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/rpm`, req)
   return data
 }
 
