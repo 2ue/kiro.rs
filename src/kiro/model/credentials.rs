@@ -235,6 +235,35 @@ impl KiroCredentials {
     /// 特殊值：显式不使用代理
     pub const PROXY_DIRECT: &'static str = "direct";
 
+    /// 比较会影响认证、调度、代理解析和后台展示的持久化字段。
+    pub fn same_dispatch_config(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.access_token == other.access_token
+            && self.refresh_token == other.refresh_token
+            && self.profile_arn == other.profile_arn
+            && self.expires_at == other.expires_at
+            && self.auth_method == other.auth_method
+            && self.provider == other.provider
+            && self.client_id == other.client_id
+            && self.client_secret == other.client_secret
+            && self.priority == other.priority
+            && self.max_concurrent_requests == other.max_concurrent_requests
+            && self.rpm == other.rpm
+            && self.region == other.region
+            && self.auth_region == other.auth_region
+            && self.api_region == other.api_region
+            && self.machine_id == other.machine_id
+            && self.email == other.email
+            && self.subscription_title == other.subscription_title
+            && self.proxy_url == other.proxy_url
+            && self.proxy_username == other.proxy_username
+            && self.proxy_password == other.proxy_password
+            && self.proxy_resource_id == other.proxy_resource_id
+            && self.disabled == other.disabled
+            && self.kiro_api_key == other.kiro_api_key
+            && self.endpoint == other.endpoint
+    }
+
     /// 获取默认凭证文件路径
     pub fn default_credentials_path() -> &'static str {
         "credentials.json"

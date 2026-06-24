@@ -219,6 +219,20 @@ impl fmt::Display for RefreshTokenInvalidError {
 
 impl std::error::Error for RefreshTokenInvalidError {}
 
+fn is_invalid_grant_response(status: reqwest::StatusCode, body_text: &str) -> bool {
+    if status.as_u16() != 400 {
+        return false;
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body_text) {
+        if value.get("error").and_then(|value| value.as_str()) == Some("invalid_grant") {
+            return true;
+        }
+    }
+
+    body_text.contains("\"invalid_grant\"")
+}
+
 /// 刷新 Token
 pub(crate) async fn refresh_token(
     credentials: &KiroCredentials,
@@ -294,11 +308,8 @@ async fn refresh_social_token(
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
 
-        // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
-        if status.as_u16() == 400
-            && body_text.contains("\"invalid_grant\"")
-            && body_text.contains("Invalid refresh token provided")
-        {
+        // 400 + invalid_grant 表示 refreshToken 已失效；不要按瞬态错误重试。
+        if is_invalid_grant_response(status, &body_text) {
             return Err(RefreshTokenInvalidError {
                 message: format!("Social refreshToken 已失效 (invalid_grant): {}", body_text),
             }
@@ -391,11 +402,8 @@ async fn refresh_idc_token(
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
 
-        // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
-        if status.as_u16() == 400
-            && body_text.contains("\"invalid_grant\"")
-            && body_text.contains("Invalid refresh token provided")
-        {
+        // 400 + invalid_grant 表示 refreshToken 已失效；不要按瞬态错误重试。
+        if is_invalid_grant_response(status, &body_text) {
             return Err(RefreshTokenInvalidError {
                 message: format!("IdC refreshToken 已失效 (invalid_grant): {}", body_text),
             }
@@ -1171,8 +1179,8 @@ pub struct MultiTokenManager {
     entries: Arc<Mutex<Vec<CredentialEntry>>>,
     /// 当前活动凭据 ID
     current_id: Mutex<u64>,
-    /// Token 刷新锁，确保同一时间只有一个刷新操作
-    refresh_lock: TokioMutex<()>,
+    /// Token 刷新锁按凭据隔离，避免单个坏凭据刷新等待阻塞其他凭据。
+    refresh_locks: Mutex<HashMap<u64, Arc<TokioMutex<()>>>>,
     /// PgSQL 存储后端。生产运行必须配置；测试可使用 None 避免依赖外部数据库。
     postgres_store: Option<Arc<PostgresStore>>,
     /// Redis 运行态存储后端。生产用于跨实例调度状态；测试可使用 None 走本地内存。
@@ -1706,7 +1714,7 @@ impl MultiTokenManager {
             proxy,
             entries: Arc::new(Mutex::new(entries)),
             current_id: Mutex::new(initial_id),
-            refresh_lock: TokioMutex::new(()),
+            refresh_locks: Mutex::new(HashMap::new()),
             postgres_store,
             redis_store,
             proxy_resources: Arc::new(Mutex::new(proxy_resources)),
@@ -2144,6 +2152,7 @@ impl MultiTokenManager {
 
         for healed_id in healed_ids {
             self.queue_runtime_state_flush(healed_id, None, Utc::now());
+            self.save_runtime_state_for(healed_id);
             self.record_scheduler_credential_audit(
                 "auto_enable_credential",
                 healed_id,
@@ -2492,6 +2501,22 @@ impl MultiTokenManager {
                 None
             }
         }
+    }
+
+    fn refresh_lock_for_credential(&self, id: u64) -> Arc<TokioMutex<()>> {
+        let mut locks = self.refresh_locks.lock();
+        locks
+            .entry(id)
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone()
+    }
+
+    fn retain_refresh_locks_for_ids(&self, ids: &HashSet<u64>) {
+        self.refresh_locks.lock().retain(|id, _| ids.contains(id));
+    }
+
+    fn remove_refresh_lock_for_credential(&self, id: u64) {
+        self.refresh_locks.lock().remove(&id);
     }
 
     fn local_global_capacity_state(&self) -> SchedulerGlobalCapacityState {
@@ -2876,9 +2901,8 @@ impl MultiTokenManager {
         };
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
-            spawn_best_effort_storage_task("更新 Redis 凭据限流状态", async move {
-                redis.bump_rate_limit_available_at(id, interval).await?;
-                Ok(())
+            let _ = self.block_on_scheduler_redis_hot("更新 Redis 凭据限流状态", async move {
+                redis.bump_rate_limit_available_at(id, interval).await
             });
         }
         Ok(())
@@ -4264,8 +4288,9 @@ impl MultiTokenManager {
         let needs_refresh = is_token_expired(credentials) || is_token_expiring_soon(credentials);
 
         let creds = if needs_refresh {
-            // 获取刷新锁，确保同一时间只有一个刷新操作
-            let _guard = self.refresh_lock.lock().await;
+            // 同一凭据只允许一个刷新任务；不同凭据互不阻塞。
+            let refresh_lock = self.refresh_lock_for_credential(id);
+            let _guard = refresh_lock.lock().await;
 
             // 第二次检查：获取锁后重新读取凭据，因为其他请求可能已经完成刷新
             let current_creds = {
@@ -4839,14 +4864,24 @@ impl MultiTokenManager {
         if entries.len() != before_len {
             changed = true;
         }
+        self.retain_refresh_locks_for_ids(&non_deleted_ids);
         let existing_ids: HashSet<u64> = entries.iter().map(|entry| entry.id).collect();
         for entry in entries.iter_mut() {
             if let Some(credential) = by_id.get(&entry.id) {
                 let mut credential = credential.clone();
                 credential.canonicalize_auth_method();
+                if entry.credentials.disabled != credential.disabled
+                    || !entry.credentials.same_dispatch_config(&credential)
+                {
+                    changed = true;
+                }
                 entry.disabled = credential.disabled;
+                entry.disabled_reason = if credential.disabled {
+                    Some(DisabledReason::Manual)
+                } else {
+                    entry.disabled_reason
+                };
                 entry.credentials = credential;
-                changed = true;
             }
         }
         for (id, mut credential) in by_id {
@@ -4885,13 +4920,15 @@ impl MultiTokenManager {
             entries.sort_by_key(|entry| (entry.credentials.priority, entry.id));
         }
         drop(entries);
+        let runtime_changed = self.load_runtime_state();
         if changed {
             self.load_stats();
-            self.load_runtime_state();
+        }
+        if changed || runtime_changed {
             self.select_highest_priority();
             self.invalidate_local_pool_route_state_cache();
         }
-        Ok(changed || proxy_changed)
+        Ok(changed || runtime_changed || proxy_changed)
     }
 
     pub fn reload_proxy_resources_from_postgres(&self) -> anyhow::Result<bool> {
@@ -5138,9 +5175,9 @@ impl MultiTokenManager {
     }
 
     /// 从 PgSQL 加载凭据运行态（失败计数、禁用原因、预热次数）。
-    fn load_runtime_state(&self) {
+    fn load_runtime_state(&self) -> bool {
         let Some(store) = &self.postgres_store else {
-            return;
+            return false;
         };
         let store = store.clone();
         let states = match block_on_storage("从 PgSQL 加载凭据运行态", async move {
@@ -5149,28 +5186,41 @@ impl MultiTokenManager {
             Ok(states) => states,
             Err(e) => {
                 tracing::warn!("{}", e);
-                return;
+                return false;
             }
         };
 
         let mut entries = self.entries.lock();
+        let mut changed = false;
         for entry in entries.iter_mut() {
             if let Some(state) = states.get(&entry.id) {
+                let next_reason = state
+                    .disabled_reason
+                    .as_deref()
+                    .and_then(DisabledReason::from_str);
+                let next_disabled = entry.credentials.disabled || next_reason.is_some();
+                let next_disabled_reason = if !next_disabled {
+                    None
+                } else if let Some(reason) = next_reason {
+                    Some(reason)
+                } else {
+                    Some(DisabledReason::Manual)
+                };
+
+                changed |= entry.failure_count != state.failure_count
+                    || entry.refresh_failure_count != state.refresh_failure_count
+                    || entry.warmup_remaining != state.warmup_remaining
+                    || entry.disabled != next_disabled
+                    || entry.disabled_reason != next_disabled_reason;
                 entry.failure_count = state.failure_count;
                 entry.refresh_failure_count = state.refresh_failure_count;
                 entry.warmup_remaining = state.warmup_remaining;
-                if let Some(reason) = state
-                    .disabled_reason
-                    .as_deref()
-                    .and_then(DisabledReason::from_str)
-                {
-                    entry.disabled_reason = Some(reason);
-                } else if !entry.disabled {
-                    entry.disabled_reason = None;
-                }
+                entry.disabled = next_disabled;
+                entry.disabled_reason = next_disabled_reason;
             }
         }
         tracing::info!("已从 PgSQL 加载 {} 条凭据运行态", states.len());
+        changed
     }
 
     fn save_runtime_state_for(&self, id: u64) {
@@ -5418,9 +5468,14 @@ impl MultiTokenManager {
                 if Self::rate_limit_interval_for_rpm(Self::effective_rpm(entry, global_rpm))
                     .is_some()
                 {
-                    state
+                    let redis_available_at = state
                         .rate_limit_available_at_ms
-                        .and_then(|until_ms| instant_from_epoch_ms(until_ms, now_ms, now))
+                        .and_then(|until_ms| instant_from_epoch_ms(until_ms, now_ms, now));
+                    match (entry.rate_limit_available_at, redis_available_at) {
+                        (Some(local), Some(redis)) => Some(local.max(redis)),
+                        (Some(local), None) if local > now => Some(local),
+                        (_, redis) => redis,
+                    }
                 } else {
                     None
                 };
@@ -5805,6 +5860,7 @@ impl MultiTokenManager {
         }
         self.queue_runtime_state_flush(id, Some(last_used_at.clone()), Utc::now());
         if disabled {
+            self.save_runtime_state_for(id);
             self.record_scheduler_credential_audit(
                 "auto_disable_credential",
                 id,
@@ -5818,7 +5874,9 @@ impl MultiTokenManager {
             let entries = self.entries.lock();
             entries.iter().any(|e| !e.disabled)
         };
-        self.publish_credentials_changed("credential_failure_reported");
+        if disabled {
+            self.publish_credentials_changed("credential_failure_reported");
+        }
         self.notify_dispatch_state_changed();
         result
     }
@@ -5875,6 +5933,7 @@ impl MultiTokenManager {
         self.unbind_sessions_for_credential(id);
         self.clear_scheduler_state_for_credential(id, false);
         self.queue_runtime_state_flush(id, Some(last_used_at.clone()), Utc::now());
+        self.save_runtime_state_for(id);
         self.record_scheduler_credential_audit(
             "auto_disable_credential",
             id,
@@ -5953,6 +6012,7 @@ impl MultiTokenManager {
         self.unbind_sessions_for_credential(id);
         self.clear_scheduler_state_for_credential(id, false);
         self.queue_runtime_state_flush(id, Some(last_used_at.clone()), Utc::now());
+        self.save_runtime_state_for(id);
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
             let event_reason = reason.event_reason().to_string();
@@ -6061,6 +6121,7 @@ impl MultiTokenManager {
         }
         self.queue_runtime_state_flush(id, Some(last_used_at.clone()), Utc::now());
         if disabled {
+            self.save_runtime_state_for(id);
             self.record_scheduler_credential_audit(
                 "auto_disable_credential",
                 id,
@@ -6074,7 +6135,9 @@ impl MultiTokenManager {
             let entries = self.entries.lock();
             entries.iter().any(|e| !e.disabled)
         };
-        self.publish_credentials_changed("credential_refresh_failure_reported");
+        if disabled {
+            self.publish_credentials_changed("credential_refresh_failure_reported");
+        }
         self.notify_dispatch_state_changed();
         result
     }
@@ -6129,6 +6192,7 @@ impl MultiTokenManager {
         self.unbind_sessions_for_credential(id);
         self.clear_scheduler_state_for_credential(id, false);
         self.queue_runtime_state_flush(id, Some(last_used_at.clone()), Utc::now());
+        self.save_runtime_state_for(id);
         self.record_scheduler_credential_audit(
             "auto_disable_credential",
             id,
@@ -7200,6 +7264,7 @@ impl MultiTokenManager {
         }
         self.unbind_sessions_for_credential(id);
         self.clear_scheduler_state_for_credential(id, true);
+        self.remove_refresh_lock_for_credential(id);
         self.notify_dispatch_state_changed();
 
         // 如果删除后没有任何凭据，将 current_id 重置为 0（与初始化行为保持一致）
@@ -7232,8 +7297,9 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
 
-        // 获取刷新锁防止并发刷新
-        let _guard = self.refresh_lock.lock().await;
+        // 获取该凭据的刷新锁，防止同一账号并发刷新。
+        let refresh_lock = self.refresh_lock_for_credential(id);
+        let _guard = refresh_lock.lock().await;
         let mut redis_refresh_lock: Option<(Arc<RedisStore>, String)> = None;
         let mut redis_lock_failed_open = false;
         if let Some(redis) = &self.redis_store {
@@ -7456,6 +7522,22 @@ mod tests {
         credentials.refresh_token = Some("a".repeat(150));
         let result = validate_refresh_token(&credentials);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_invalid_grant_resource_not_found_is_permanent_refresh_failure() {
+        assert!(is_invalid_grant_response(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":"invalid_grant","error_description":"Resource not found"}"#
+        ));
+        assert!(!is_invalid_grant_response(
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"error":"invalid_grant","error_description":"Resource not found"}"#
+        ));
+        assert!(!is_invalid_grant_response(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":"slow_down"}"#
+        ));
     }
 
     #[test]
