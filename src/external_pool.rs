@@ -466,6 +466,13 @@ struct ExternalForwardResponse {
     stream_usage_projection: Option<ExternalUsageProjectionContext>,
 }
 
+#[derive(Debug, Clone)]
+struct ExternalStreamErrorMask {
+    request_id: String,
+    pool_id: u64,
+    pool_name: String,
+}
+
 pub enum ExternalPoolForwardOutcome {
     Response(Response),
     FinalError(ExternalPoolFinalError),
@@ -486,11 +493,16 @@ pub struct ExternalPoolFinalError {
 impl ExternalPoolFinalError {
     pub fn into_response(self, request_id: &str) -> Response {
         let external_error_id = envelope::request_id();
+        let public_status = self.public_status();
+        let public_error_type = self.public_error_type();
+        let message = self.public_message(&external_error_id);
         tracing::warn!(
             request_id,
             external_error_id = %external_error_id,
             status = self.status.as_u16(),
+            public_status = public_status.as_u16(),
             response_error_type = %self.response_error_type,
+            public_error_type = public_error_type,
             route_error_type = %self.route_error_type,
             retryable = self.retryable,
             pool_id = ?self.pool_id,
@@ -499,17 +511,56 @@ impl ExternalPoolFinalError {
             external_message = %self.message,
             "external pool final error"
         );
-        let message = format!(
-            "外部备用池请求失败，请稍后重试或联系管理员排查。错误ID: {}",
-            external_error_id
-        );
         envelope::error_response_with_id_and_headers(
-            self.status,
-            self.response_error_type,
+            public_status,
+            public_error_type,
             message,
             request_id,
             [("x-kiro-rs-error-id", external_error_id)],
         )
+    }
+
+    fn public_status(&self) -> StatusCode {
+        if self.is_rate_limit() {
+            return StatusCode::TOO_MANY_REQUESTS;
+        }
+        if self.is_public_invalid_request() {
+            return StatusCode::BAD_REQUEST;
+        }
+        if self.status == StatusCode::SERVICE_UNAVAILABLE || self.is_capacity_like() {
+            return StatusCode::SERVICE_UNAVAILABLE;
+        }
+        StatusCode::BAD_GATEWAY
+    }
+
+    fn public_error_type(&self) -> &'static str {
+        if self.is_rate_limit() {
+            return "rate_limit_error";
+        }
+        if self.is_public_invalid_request() {
+            return "invalid_request_error";
+        }
+        "api_error"
+    }
+
+    fn public_message(&self, external_error_id: &str) -> String {
+        let message = if self.is_rate_limit() {
+            "Too many requests. Please retry later."
+        } else if self.is_public_invalid_request() {
+            envelope::PUBLIC_INVALID_REQUEST_MESSAGE
+        } else {
+            envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE
+        };
+        envelope::public_message_with_error_id(message, external_error_id)
+    }
+
+    fn is_public_invalid_request(&self) -> bool {
+        self.status == StatusCode::BAD_REQUEST
+            && !self.retryable
+            && matches!(
+                self.route_error_type.as_str(),
+                "bad_request" | "client_error"
+            )
     }
 
     pub fn is_rate_limit(&self) -> bool {
@@ -545,12 +596,13 @@ impl ExternalPoolFinalError {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct ExternalUsageCapture {
     raw: Option<CacheUsage>,
     shaped: Option<CacheUsage>,
     reported: Option<CacheUsage>,
     projected: bool,
+    stream_error_message: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -1202,6 +1254,11 @@ impl ExternalPoolManager {
             let stream_usage_capture = usage_capture.clone();
             let latency_trace = route.latency_trace.clone();
             let route_started_at = route.started_at;
+            let stream_error_mask = Arc::new(ExternalStreamErrorMask {
+                request_id: route.request_id.clone(),
+                pool_id: pool.id,
+                pool_name: pool.name.clone(),
+            });
             let stream = futures::stream::unfold(
                 (
                     body_stream,
@@ -1222,6 +1279,7 @@ impl ExternalPoolManager {
                     let projection_context = projection_context.clone();
                     let usage_capture = usage_capture.clone();
                     let latency_trace = latency_trace.clone();
+                    let stream_error_mask = stream_error_mask.clone();
                     async move {
                         if finished {
                             return None;
@@ -1239,6 +1297,7 @@ impl ExternalPoolManager {
                                                 &mut buffer,
                                                 projection_context.as_ref(),
                                                 Some(&usage_capture),
+                                                Some(stream_error_mask.as_ref()),
                                             );
                                             if !projected.is_empty() {
                                                 return Some((
@@ -1279,6 +1338,7 @@ impl ExternalPoolManager {
                                                     &buffer,
                                                     projection_context.as_ref(),
                                                     Some(&usage_capture),
+                                                    Some(stream_error_mask.as_ref()),
                                                 )
                                             };
                                             drop(lease);
@@ -1369,6 +1429,9 @@ impl ExternalPoolManager {
                     config,
                     "model endpoint returned an HTML response for a non-streaming request",
                 ));
+            }
+            if success_response_looks_like_error_body(&bytes) {
+                return Err(success_error_body_protocol_error(&bytes, config));
             }
             route.latency_trace.mark_upstream_header(route.started_at);
             drop(lease);
@@ -2206,6 +2269,24 @@ impl ExternalStreamUsageGuard {
         if self.completed {
             return;
         }
+        let stream_error_message = self
+            .usage_capture
+            .as_ref()
+            .and_then(|capture| capture.lock().stream_error_message.clone());
+        if let Some(message) = stream_error_message {
+            self.manager.record_external(
+                &self.route,
+                Some(&self.pool),
+                self.attempts.clone(),
+                UsageRecordStatus::StreamError,
+                Some("stream_error".to_string()),
+                Some(message.clone()),
+                Some(format!("stream_error: {}", message)),
+                None,
+            );
+            self.completed = true;
+            return;
+        }
         let billing = self.usage_capture.as_ref().and_then(|capture| {
             external_pool_billing_from_capture_ref(&self.route, &self.pool, capture)
         });
@@ -2714,6 +2795,24 @@ fn success_response_looks_like_html(headers: &HeaderMap, body: &[u8]) -> bool {
     prefix.starts_with("<!doctype html") || prefix.starts_with("<html")
 }
 
+fn success_response_looks_like_error_body(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    value
+        .get("type")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value == "error")
+        || value.get("error").is_some_and(|error| {
+            error.is_object()
+                && (error.get("message").is_some()
+                    || error
+                        .get("type")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|value| value.ends_with("_error")))
+        })
+}
+
 fn sanitized_external_network_error(context: &str, err: &reqwest::Error) -> String {
     let kind = if err.is_timeout() {
         "timeout"
@@ -2729,6 +2828,23 @@ fn sanitized_external_network_error(context: &str, err: &reqwest::Error) -> Stri
         "network error"
     };
     format!("{context}: {kind}")
+}
+
+fn success_error_body_protocol_error(
+    body: &Bytes,
+    config: &ExternalPoolsConfig,
+) -> ExternalPoolError {
+    ExternalPoolError {
+        status: Some(StatusCode::BAD_GATEWAY),
+        message: "model endpoint returned an error envelope with a success status".to_string(),
+        retryable: true,
+        auto_disable_reason: None,
+        cooldown: Some((
+            Duration::from_secs(config.external_pool_server_error_cooldown_secs.max(1)),
+            "server_error".to_string(),
+        )),
+        response_body: Some(body.clone()),
+    }
 }
 
 fn success_protocol_error(
@@ -3180,7 +3296,12 @@ fn maybe_project_sse_event(
     event: &[u8],
     projection: Option<&ExternalUsageProjectionContext>,
     capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+    stream_error_mask: Option<&ExternalStreamErrorMask>,
 ) -> Vec<u8> {
+    if let Some(masked) = maybe_mask_external_stream_error_event(event, capture, stream_error_mask)
+    {
+        return masked;
+    }
     let Ok(text) = std::str::from_utf8(event) else {
         return event.to_vec();
     };
@@ -3238,12 +3359,125 @@ fn drain_projected_sse_events(
     buffer: &mut Vec<u8>,
     projection: Option<&ExternalUsageProjectionContext>,
     capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+    stream_error_mask: Option<&ExternalStreamErrorMask>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     while let Some((idx, delimiter_len)) = find_sse_event_delimiter(buffer) {
         let end = idx + delimiter_len;
         let event = buffer.drain(..end).collect::<Vec<u8>>();
-        out.extend(maybe_project_sse_event(&event, projection, capture));
+        out.extend(maybe_project_sse_event(
+            &event,
+            projection,
+            capture,
+            stream_error_mask,
+        ));
+    }
+    out
+}
+
+fn maybe_mask_external_stream_error_event(
+    event: &[u8],
+    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+    mask: Option<&ExternalStreamErrorMask>,
+) -> Option<Vec<u8>> {
+    let mask = mask?;
+    let text = std::str::from_utf8(event).ok()?;
+    if !text.contains("error") && !text.contains("Error") {
+        return None;
+    }
+
+    let explicit_error_event = text.lines().any(|line| {
+        line.trim_end_matches('\r')
+            .strip_prefix("event:")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("error"))
+    });
+    let mut has_error_payload = false;
+    for line in text.split_inclusive('\n') {
+        let trimmed_line_end = line.trim_end_matches(['\r', '\n']);
+        let Some(data) = trimmed_line_end.strip_prefix("data:") else {
+            continue;
+        };
+        let data_json = data.trim();
+        if data_json.is_empty() || data_json == "[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(data_json) else {
+            continue;
+        };
+        if external_stream_payload_is_error(explicit_error_event, &value) {
+            has_error_payload = true;
+            break;
+        }
+    }
+
+    if !explicit_error_event && !has_error_payload {
+        return None;
+    }
+
+    let external_error_id = envelope::request_id();
+    let raw_event = compact_external_stream_error_event(text, 2048);
+    if let Some(capture) = capture {
+        let mut capture = capture.lock();
+        if capture.stream_error_message.is_none() {
+            capture.stream_error_message = Some(format!(
+                "masked_stream_error error_id={} raw_event={}",
+                external_error_id, raw_event
+            ));
+        }
+    }
+    tracing::warn!(
+        request_id = %mask.request_id,
+        external_error_id = %external_error_id,
+        pool_id = mask.pool_id,
+        pool_name = %mask.pool_name,
+        raw_event = %raw_event,
+        "external pool stream error event masked"
+    );
+
+    let message = envelope::public_message_with_error_id(
+        envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
+        &external_error_id,
+    );
+    let body = json!({
+        "type": "error",
+        "error": {
+            "type": "api_error",
+            "message": message,
+        },
+        "request_id": mask.request_id,
+    });
+    let data = serde_json::to_string(&body).unwrap_or_else(|_| {
+        format!(
+            r#"{{"type":"error","error":{{"type":"api_error","message":"{}"}},"request_id":"{}"}}"#,
+            message, mask.request_id
+        )
+    });
+    Some(format!("event: error\ndata: {data}\n\n").into_bytes())
+}
+
+fn external_stream_payload_is_error(explicit_error_event: bool, value: &serde_json::Value) -> bool {
+    value
+        .get("type")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value == "error")
+        || (explicit_error_event
+            && value.get("error").is_some_and(|error| {
+                error.is_object() || error.as_str().is_some_and(|value| !value.is_empty())
+            }))
+}
+
+fn compact_external_stream_error_event(raw: &str, max_bytes: usize) -> String {
+    let compact = raw.replace(['\r', '\n'], " ");
+    if compact.len() <= max_bytes {
+        return compact;
+    }
+    let mut out = String::with_capacity(max_bytes + 3);
+    for ch in compact.chars() {
+        if out.len() + ch.len_utf8() > max_bytes {
+            out.push_str("...");
+            break;
+        }
+        out.push(ch);
     }
     out
 }
@@ -3538,7 +3772,7 @@ fn external_pool_billing_from_capture_ref(
     pool: &ExternalPool,
     capture: &Arc<SyncMutex<ExternalUsageCapture>>,
 ) -> Option<ExternalPoolBilling> {
-    external_pool_billing_from_capture(route, pool, *capture.lock())
+    external_pool_billing_from_capture(route, pool, capture.lock().clone())
 }
 
 fn external_pool_billing(
@@ -4112,10 +4346,11 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&actual).expect("json envelope");
         assert_eq!(value["error"]["type"], "invalid_request_error");
         let message = value["error"]["message"].as_str().unwrap();
-        assert!(message.contains("外部备用池请求失败"));
-        assert!(message.contains("错误ID: req_01"));
+        assert!(message.contains(envelope::PUBLIC_INVALID_REQUEST_MESSAGE));
+        assert!(message.contains("error ID: req_01"));
         assert!(!message.contains("bad input"));
         assert!(!message.contains("invalid_request_error"));
+        assert_public_message_hides_internal_routing(message);
         assert_eq!(value["request_id"], "req_gateway");
     }
 
@@ -4156,10 +4391,11 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&actual).expect("json envelope");
         assert_eq!(value["error"]["type"], "rate_limit_error");
         let message = value["error"]["message"].as_str().unwrap();
-        assert!(message.contains("外部备用池请求失败"));
-        assert!(message.contains("错误ID: req_01"));
+        assert!(message.contains("Too many requests"));
+        assert!(message.contains("error ID: req_01"));
         assert!(!message.contains("slow down"));
         assert!(!message.contains("rate_limit_error"));
+        assert_public_message_hides_internal_routing(message);
         assert_eq!(value["request_id"], "req_gateway");
     }
 
@@ -4340,11 +4576,12 @@ mod tests {
             .await
             .expect("read scheduler error body");
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["error"]["type"], "external_pool_capacity_full");
+        assert_eq!(body["error"]["type"], "api_error");
         let message = body["error"]["message"].as_str().unwrap();
-        assert!(message.contains("外部备用池请求失败"));
-        assert!(message.contains("错误ID: req_01"));
+        assert!(message.contains(envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE));
+        assert!(message.contains("error ID: req_01"));
         assert!(!message.contains("Request capacity is full"));
+        assert_public_message_hides_internal_routing(message);
     }
 
     #[test]
@@ -4371,6 +4608,73 @@ mod tests {
             error_type_for_external_error(&err),
             "misconfigured_endpoint"
         );
+    }
+
+    #[test]
+    fn successful_external_error_body_is_treated_as_protocol_error() {
+        let body = Bytes::from_static(
+            br#"{"type":"error","error":{"type":"api_error","message":"raw pool failure"}}"#,
+        );
+
+        assert!(success_response_looks_like_error_body(&body));
+        let err = success_error_body_protocol_error(&body, &ExternalPoolsConfig::default());
+
+        assert!(err.retryable);
+        assert_eq!(err.status, Some(StatusCode::BAD_GATEWAY));
+        assert_eq!(err.response_body.as_deref(), Some(body.as_ref()));
+        assert!(err.message.contains("success status"));
+    }
+
+    #[test]
+    fn external_stream_error_event_is_masked_and_raw_event_is_recorded() {
+        let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+        let mask = ExternalStreamErrorMask {
+            request_id: "req_stream_mask".to_string(),
+            pool_id: 7,
+            pool_name: "pool-a".to_string(),
+        };
+        let event = br#"event: error
+data: {"type":"error","error":{"type":"api_error","message":"raw external promo text"}}
+
+"#;
+
+        let masked = maybe_project_sse_event(event, None, Some(&capture), Some(&mask));
+        let text = std::str::from_utf8(&masked).expect("masked event utf8");
+
+        assert!(text.contains("event: error"));
+        assert!(text.contains(envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE));
+        assert!(text.contains("error ID: req_01"));
+        assert!(text.contains("req_stream_mask"));
+        assert!(!text.contains("raw external promo text"));
+        assert!(!text.contains("pool-a"));
+        assert_public_message_hides_internal_routing(text);
+
+        let recorded = capture
+            .lock()
+            .stream_error_message
+            .clone()
+            .expect("raw stream error recorded");
+        assert!(recorded.contains("raw external promo text"));
+        assert!(recorded.contains("masked_stream_error"));
+    }
+
+    fn assert_public_message_hides_internal_routing(message: &str) {
+        let lower = message.to_ascii_lowercase();
+        for forbidden in [
+            "credential",
+            "external pool",
+            "external_pool",
+            "fallback",
+            "preflight",
+            "备用池",
+            "外部池",
+            "凭据",
+        ] {
+            assert!(
+                !lower.contains(forbidden),
+                "public message leaked internal term {forbidden:?}: {message}"
+            );
+        }
     }
 
     #[test]
@@ -5348,7 +5652,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
 
 "#;
 
-        let out = maybe_project_sse_event(event, Some(&projection), Some(&capture));
+        let out = maybe_project_sse_event(event, Some(&projection), Some(&capture), None);
         let text = std::str::from_utf8(&out).expect("event text");
         let event_input = event_usage_i64(text, "input_tokens");
         let reported = capture.lock().reported.expect("reported usage");
@@ -5612,7 +5916,7 @@ data: [DONE]
         let mut pool = test_pool("http://pool.example.com", false);
         pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
         let projection = projection_context(&route, &pool, 0);
-        let projected = maybe_project_sse_event(event, projection.as_ref(), None);
+        let projected = maybe_project_sse_event(event, projection.as_ref(), None, None);
         let text = String::from_utf8(projected).expect("utf8");
 
         assert!(text.contains("data: [DONE]"));
@@ -5631,8 +5935,8 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
         let mut pool = test_pool("http://pool.example.com", false);
         pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
         let projection = projection_context(&route, &pool, 0);
-        let _projected = maybe_project_sse_event(event, projection.as_ref(), Some(&capture));
-        let capture = *capture.lock();
+        let _projected = maybe_project_sse_event(event, projection.as_ref(), Some(&capture), None);
+        let capture = capture.lock().clone();
         let raw = capture.raw.expect("raw usage");
         let reported = capture.reported.expect("reported usage");
 
@@ -5655,11 +5959,11 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":120
         pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
         let projection =
             projection_context_with_output_uplift(&route, &pool, 0, 1_000, 50).expect("projection");
-        let projected = maybe_project_sse_event(event, Some(&projection), Some(&capture));
+        let projected = maybe_project_sse_event(event, Some(&projection), Some(&capture), None);
         let text = std::str::from_utf8(&projected).expect("projected sse");
         assert!(text.contains(r#""output_tokens":1800"#));
 
-        let capture = *capture.lock();
+        let capture = capture.lock().clone();
         let shaped = capture.shaped.expect("shaped usage");
         let reported = capture.reported.expect("reported usage");
         assert_eq!(shaped.output_tokens, 1200);

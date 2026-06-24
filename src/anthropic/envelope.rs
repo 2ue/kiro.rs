@@ -11,6 +11,23 @@ use super::types::ErrorResponse;
 const ID_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const ID_RANDOM_LEN: usize = 22;
 
+pub(crate) const PUBLIC_TEMPORARY_FAILURE_MESSAGE: &str =
+    "The request could not be completed right now. Please retry later.";
+pub(crate) const PUBLIC_PROCESSING_FAILED_MESSAGE: &str =
+    "Request processing failed. Please retry later.";
+pub(crate) const PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE: &str =
+    "No account is currently available. Please retry later or contact the administrator.";
+pub(crate) const PUBLIC_PROVIDER_NOT_READY_MESSAGE: &str =
+    "Requests cannot be processed right now. Please retry later or contact the administrator.";
+pub(crate) const PUBLIC_MODEL_UNAVAILABLE_MESSAGE: &str =
+    "The requested model is not available. Select a supported model and retry.";
+pub(crate) const PUBLIC_INVALID_REQUEST_MESSAGE: &str =
+    "Invalid request. Simplify the message, tools, tool results, files, or images and retry.";
+
+pub(crate) fn public_message_with_error_id(message: &str, error_id: &str) -> String {
+    format!("{message} If this continues, contact the administrator with error ID: {error_id}")
+}
+
 fn random_anthropic_id(prefix: &str) -> String {
     let mut id = String::with_capacity(prefix.len() + 3 + ID_RANDOM_LEN);
     id.push_str(prefix);

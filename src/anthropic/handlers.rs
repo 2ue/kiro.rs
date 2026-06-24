@@ -69,8 +69,7 @@ use crate::kiro::provider::{KiroProvider, KiroStreamCompletion};
 use crate::kiro::token_manager::LocalPoolRouteStateKind;
 
 const MAX_REMOTE_MULTIMODAL_BYTES: usize = 20 * 1024 * 1024;
-const UPSTREAM_INVALID_REQUEST_MESSAGE: &str =
-    "Invalid request. Simplify the message, tools, tool results, files, or images and retry.";
+const UPSTREAM_INVALID_REQUEST_MESSAGE: &str = envelope::PUBLIC_INVALID_REQUEST_MESSAGE;
 const LATENCY_COUNTER_UNSET: u32 = u32::MAX;
 
 #[derive(Clone)]
@@ -2509,8 +2508,7 @@ fn map_provider_error(
 
     if is_upstream_invalid_model_error(&err_str) {
         log_provider_warning_with_hint(&err_str, "请求被拒绝：上游模型不支持（不应切换账号重试）");
-        let message =
-            "Model is not available from the current upstream. Select a supported model and retry.";
+        let message = envelope::PUBLIC_MODEL_UNAVAILABLE_MESSAGE;
         return if let Some(request_id) = request_id {
             envelope::error_response_with_id(
                 StatusCode::BAD_REQUEST,
@@ -2575,28 +2573,36 @@ fn map_provider_error(
         || err_str.contains("没有支持当前模型的可用凭据")
     {
         log_provider_error_with_hint(&err_str, "没有可调度凭据");
-        let message = format!("No available credentials: {}", err);
         return if let Some(request_id) = request_id {
             envelope::error_response_with_id(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "service_unavailable",
-                message,
+                "api_error",
+                envelope::PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE,
                 request_id,
             )
         } else {
             envelope::error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "service_unavailable",
-                message,
+                "api_error",
+                envelope::PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE,
             )
         };
     }
 
     log_provider_error_with_hint(&err_str, "Kiro API 调用失败");
     if let Some(request_id) = request_id {
-        envelope::error_response_with_id(StatusCode::BAD_GATEWAY, "api_error", err_str, request_id)
+        envelope::error_response_with_id(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+            request_id,
+        )
     } else {
-        envelope::error_response(StatusCode::BAD_GATEWAY, "api_error", err_str)
+        envelope::error_response(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+        )
     }
 }
 
@@ -2746,10 +2752,14 @@ fn retry_after_secs_from_error(value: &str) -> Option<u64> {
 
 fn conversion_error_response(e: &ConversionError) -> Response {
     let (error_type, message) = match e {
-        ConversionError::UnsupportedModel(model) => {
-            ("invalid_request_error", format!("模型不支持: {}", model))
-        }
-        ConversionError::EmptyMessages => ("invalid_request_error", "消息列表为空".to_string()),
+        ConversionError::UnsupportedModel(model) => (
+            "invalid_request_error",
+            format!("The requested model is not available: {}", model),
+        ),
+        ConversionError::EmptyMessages => (
+            "invalid_request_error",
+            "messages: at least one message is required".to_string(),
+        ),
         ConversionError::UnsupportedContent(message) => ("invalid_request_error", message.clone()),
     };
     envelope::error_response(StatusCode::BAD_REQUEST, error_type, message)
@@ -2777,10 +2787,7 @@ fn resolve_request_model(
         return Err(envelope::error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            format!(
-                "模型不支持: {}。请同步 Kiro 模型能力或配置为当前上游支持的模型。",
-                payload.model
-            ),
+            envelope::PUBLIC_MODEL_UNAVAILABLE_MESSAGE,
         ));
     }
 
@@ -2824,7 +2831,11 @@ fn payload_guard_error_response(err: PayloadGuardError) -> Response {
     match err {
         PayloadGuardError::Serialize(message) => {
             tracing::error!("序列化请求失败: {}", message);
-            envelope::error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", message)
+            envelope::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+            )
         }
     }
 }
@@ -3137,8 +3148,8 @@ async fn post_messages_inner(
             tracing::error!("KiroProvider 未配置");
             return envelope::error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "service_unavailable",
-                "Kiro API provider not configured",
+                "api_error",
+                envelope::PUBLIC_PROVIDER_NOT_READY_MESSAGE,
             );
         }
     };
@@ -3202,7 +3213,7 @@ async fn post_messages_inner(
             return envelope::error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                "web_search server-tool synthesis is disabled in anthropic-strict profile",
+                "The web_search tool is not supported for this request.",
             );
         }
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
@@ -4423,7 +4434,7 @@ async fn handle_non_stream_request(
             return envelope::error_response_with_id(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
-                format!("读取响应失败: {}", e),
+                envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
                 &credential_usage.request.request_id,
             );
         }
@@ -4585,7 +4596,7 @@ async fn handle_non_stream_request(
                             return envelope::error_response_with_id(
                                 StatusCode::BAD_REQUEST,
                                 "invalid_request_error",
-                                message,
+                                UPSTREAM_INVALID_REQUEST_MESSAGE,
                                 &credential_usage.request.request_id,
                             );
                         }
@@ -4869,8 +4880,8 @@ pub async fn post_messages_cc(
             tracing::error!("KiroProvider 未配置");
             return envelope::error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "service_unavailable",
-                "Kiro API provider not configured",
+                "api_error",
+                envelope::PUBLIC_PROVIDER_NOT_READY_MESSAGE,
             );
         }
     };
@@ -4934,7 +4945,7 @@ pub async fn post_messages_cc(
             return envelope::error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                "web_search server-tool synthesis is disabled in anthropic-strict profile",
+                "The web_search tool is not supported for this request.",
             );
         }
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
@@ -6100,6 +6111,83 @@ mod tests {
             value.pointer("/error/message").and_then(|v| v.as_str()),
             Some(UPSTREAM_INVALID_REQUEST_MESSAGE)
         );
+    }
+
+    #[tokio::test]
+    async fn no_available_credentials_error_uses_public_account_message() {
+        let response = map_provider_error(
+            anyhow::anyhow!("所有凭据均已禁用（0/26）"),
+            Some("req_no_account"),
+            None,
+        );
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            value.pointer("/error/type").and_then(|v| v.as_str()),
+            Some("api_error")
+        );
+        let message = value
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .expect("error message");
+        assert_eq!(message, envelope::PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE);
+        assert_public_error_message_is_normalized(message);
+        assert!(message.contains("account"));
+        assert!(!message.contains("0/26"));
+        assert_eq!(value["request_id"], "req_no_account");
+    }
+
+    #[tokio::test]
+    async fn generic_provider_error_masks_raw_internal_details() {
+        let response = map_provider_error(
+            anyhow::anyhow!(
+                "流式 API 请求失败（凭据 #37 shadow，请求失败）: 502 Bad Gateway raw upstream body"
+            ),
+            Some("req_generic_provider"),
+            None,
+        );
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            value.pointer("/error/type").and_then(|v| v.as_str()),
+            Some("api_error")
+        );
+        let message = value
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .expect("error message");
+        assert_eq!(message, envelope::PUBLIC_PROCESSING_FAILED_MESSAGE);
+        assert_public_error_message_is_normalized(message);
+        assert!(!message.contains("shadow"));
+        assert_eq!(value["request_id"], "req_generic_provider");
+    }
+
+    fn assert_public_error_message_is_normalized(message: &str) {
+        let lower = message.to_ascii_lowercase();
+        for forbidden in [
+            "credential",
+            "external pool",
+            "external_pool",
+            "fallback",
+            "preflight",
+            "upstream",
+            "备用池",
+            "外部池",
+            "凭据",
+        ] {
+            assert!(
+                !lower.contains(forbidden),
+                "public message leaked internal term {forbidden:?}: {message}"
+            );
+        }
     }
 
     #[test]
