@@ -14,6 +14,7 @@ import {
   setCredentialDisabled,
   setCredentialPriority,
   setCredentialConcurrency,
+  setCredentialRpm,
   setCredentialRegions,
   setCredentialWarmup,
   setCredentialProxy,
@@ -38,6 +39,7 @@ import type {
   CreateProxyResourceRequest,
   CredentialsPageQuery,
   SetCredentialConcurrencyRequest,
+  SetCredentialRpmRequest,
   SetCredentialProxyRequest,
   SetCredentialRegionsRequest,
   TestCredentialRequest,
@@ -255,6 +257,17 @@ export function useSetCredentialConcurrency() {
   return useMutation({
     mutationFn: ({ id, request }: { id: number; request: SetCredentialConcurrencyRequest }) =>
       setCredentialConcurrency(id, request),
+    onSuccess: (_data, variables) => {
+      invalidateCredentialCaches(queryClient, variables.id)
+    },
+  })
+}
+
+export function useSetCredentialRpm() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, request }: { id: number; request: SetCredentialRpmRequest }) =>
+      setCredentialRpm(id, request),
     onSuccess: (_data, variables) => {
       invalidateCredentialCaches(queryClient, variables.id)
     },

@@ -964,6 +964,11 @@ pub struct CredentialEntrySnapshot {
     /// 凭据级最大并发覆盖值。None 表示继承全局；Some(0) 表示该凭据不限并发。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrent_requests_override: Option<u32>,
+    /// 当前生效的凭据每分钟请求数。0 表示不限制。
+    pub rpm: u32,
+    /// 凭据级 RPM 覆盖值。None 表示继承全局；Some(0) 表示该凭据不限 RPM。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpm_override: Option<u32>,
     /// 并发占用 lease 自动回收阈值。0 表示关闭自动回收。
     pub in_flight_lease_max_secs: u64,
     /// 预热剩余请求数。
@@ -1034,6 +1039,8 @@ pub struct CredentialBaseSnapshot {
     pub endpoint: Option<String>,
     pub max_concurrent_requests: u32,
     pub max_concurrent_requests_override: Option<u32>,
+    pub rpm: u32,
+    pub rpm_override: Option<u32>,
     pub warmup_remaining: u32,
 }
 
@@ -2376,6 +2383,19 @@ impl MultiTokenManager {
             .unwrap_or(global_max_concurrent_requests)
     }
 
+    fn effective_rpm(entry: &CredentialEntry, global_rpm: u32) -> u32 {
+        entry.credentials.rpm.unwrap_or(global_rpm)
+    }
+
+    fn rate_limit_interval_for_rpm(rpm: u32) -> Option<StdDuration> {
+        if rpm == 0 {
+            return None;
+        }
+
+        let millis = (60_000u64 / rpm as u64).max(1);
+        Some(StdDuration::from_millis(millis))
+    }
+
     fn entry_has_concurrency_capacity(
         entry: &CredentialEntry,
         global_max_concurrent_requests: u32,
@@ -2536,16 +2556,6 @@ impl MultiTokenManager {
     fn in_flight_lease_max_age(&self) -> Option<StdDuration> {
         let secs = self.config.lock().credential_in_flight_lease_max_secs;
         (secs > 0).then(|| StdDuration::from_secs(secs))
-    }
-
-    fn rate_limit_interval(&self) -> Option<StdDuration> {
-        let rpm = self.config.lock().credential_rpm.unwrap_or(0);
-        if rpm == 0 {
-            return None;
-        }
-
-        let millis = (60_000u64 / rpm as u64).max(1);
-        Some(StdDuration::from_millis(millis))
     }
 
     fn transient_failure_settings(
@@ -2714,26 +2724,55 @@ impl MultiTokenManager {
     }
 
     fn update_credential_rpm_from_config(&self) {
-        if self.rate_limit_interval().is_none() {
-            let ids: Vec<u64> = {
-                let entries = self.entries.lock();
-                entries.iter().map(|entry| entry.id).collect()
-            };
+        let global_rpm = self.config.lock().credential_rpm.unwrap_or(0);
+        let ids: Vec<u64> = {
             let mut entries = self.entries.lock();
-            for entry in entries.iter_mut() {
+            entries
+                .iter_mut()
+                .filter_map(|entry| {
+                    let rpm = Self::effective_rpm(entry, global_rpm);
+                    if Self::rate_limit_interval_for_rpm(rpm).is_some() {
+                        return None;
+                    }
+                    if entry.rate_limit_available_at.is_none() {
+                        return None;
+                    }
+                    let id = entry.id;
+                    entry.rate_limit_available_at = None;
+                    Some(id)
+                })
+                .collect()
+        };
+        if ids.is_empty() {
+            return;
+        }
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            spawn_best_effort_storage_task("清理 Redis 凭据限流状态", async move {
+                for id in ids {
+                    redis.clear_rate_limit(id).await?;
+                }
+                Ok(())
+            });
+        }
+    }
+
+    fn clear_rate_limit_for_credential(&self, id: u64) {
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
                 entry.rate_limit_available_at = None;
             }
-            drop(entries);
-            if let Some(redis) = &self.redis_store {
-                let redis = redis.clone();
-                spawn_best_effort_storage_task("清理 Redis 凭据限流状态", async move {
-                    for id in ids {
-                        redis.clear_rate_limit(id).await?;
-                    }
-                    Ok(())
-                });
-            }
         }
+        self.invalidate_local_pool_route_state_cache();
+        let Some(redis) = &self.redis_store else {
+            return;
+        };
+        let redis = redis.clone();
+        spawn_best_effort_storage_task("清理 Redis 凭据限流状态", async move {
+            redis.clear_rate_limit(id).await?;
+            Ok(())
+        });
     }
 
     fn min_dispatch_wait(
@@ -2817,19 +2856,24 @@ impl MultiTokenManager {
     }
 
     fn mark_rate_limited_at(&self, id: u64, now: Instant) -> anyhow::Result<()> {
-        let Some(interval) = self.rate_limit_interval() else {
-            return Ok(());
-        };
-        {
+        let global_rpm = self.config.lock().credential_rpm.unwrap_or(0);
+        let interval = {
             let mut entries = self.entries.lock();
-            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                let base = entry
-                    .rate_limit_available_at
-                    .filter(|at| *at > now)
-                    .unwrap_or(now);
-                entry.rate_limit_available_at = Some(base + interval);
-            }
-        }
+            let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
+                return Ok(());
+            };
+            let rpm = Self::effective_rpm(entry, global_rpm);
+            let Some(interval) = Self::rate_limit_interval_for_rpm(rpm) else {
+                entry.rate_limit_available_at = None;
+                return Ok(());
+            };
+            let base = entry
+                .rate_limit_available_at
+                .filter(|at| *at > now)
+                .unwrap_or(now);
+            entry.rate_limit_available_at = Some(base + interval);
+            interval
+        };
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
             spawn_best_effort_storage_task("更新 Redis 凭据限流状态", async move {
@@ -4527,6 +4571,8 @@ impl MultiTokenManager {
                 config.credential_max_concurrent_requests,
             ),
             max_concurrent_requests_override: entry.credentials.max_concurrent_requests,
+            rpm: Self::effective_rpm(entry, config.credential_rpm.unwrap_or(0)),
+            rpm_override: entry.credentials.rpm,
             warmup_remaining: entry.warmup_remaining,
         }
     }
@@ -4637,6 +4683,8 @@ impl MultiTokenManager {
                 max_concurrent_requests,
             ),
             max_concurrent_requests_override: entry.credentials.max_concurrent_requests,
+            rpm: Self::effective_rpm(entry, config.credential_rpm.unwrap_or(0)),
+            rpm_override: entry.credentials.rpm,
             in_flight_lease_max_secs: lease_max_age
                 .map(|duration| duration.as_secs())
                 .unwrap_or(0),
@@ -5339,6 +5387,7 @@ impl MultiTokenManager {
     fn apply_scheduler_states(&self, states: HashMap<u64, SchedulerCredentialState>) {
         let now_ms = Utc::now().timestamp_millis();
         let now = Instant::now();
+        let global_rpm = self.config.lock().credential_rpm.unwrap_or(0);
         let mut entries = self.entries.lock();
         for entry in entries.iter_mut() {
             let state = states.get(&entry.id).cloned().unwrap_or_default();
@@ -5365,9 +5414,16 @@ impl MultiTokenManager {
                 }
                 entry.model_health.insert(key, model_state.health);
             }
-            entry.rate_limit_available_at = state
-                .rate_limit_available_at_ms
-                .and_then(|until_ms| instant_from_epoch_ms(until_ms, now_ms, now));
+            entry.rate_limit_available_at =
+                if Self::rate_limit_interval_for_rpm(Self::effective_rpm(entry, global_rpm))
+                    .is_some()
+                {
+                    state
+                        .rate_limit_available_at_ms
+                        .and_then(|until_ms| instant_from_epoch_ms(until_ms, now_ms, now))
+                } else {
+                    None
+                };
             entry.in_flight_leases = state
                 .in_flight_leases
                 .into_iter()
@@ -6474,6 +6530,39 @@ impl MultiTokenManager {
 
         self.notify_dispatch_state_changed();
         self.publish_credentials_changed("credential_concurrency_updated");
+        Ok(())
+    }
+
+    /// 设置凭据级 RPM 覆盖（Admin API）。
+    ///
+    /// `None` 表示继承全局 `credentialRpm`；
+    /// `Some(0)` 表示该凭据不做本地 RPM 限制；
+    /// `Some(n)` 表示该凭据每分钟最多调度 n 次。
+    pub fn set_credential_rpm(&self, id: u64, rpm: Option<u32>) -> anyhow::Result<()> {
+        let credential = {
+            let entries = self.entries.lock();
+            let entry = entries
+                .iter()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            let mut credential = Self::credential_from_entry(entry);
+            credential.rpm = rpm;
+            credential
+        };
+        self.persist_credential_value(&credential)?;
+
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.rpm = credential.rpm;
+        }
+
+        self.clear_rate_limit_for_credential(id);
+        self.notify_dispatch_state_changed();
+        self.publish_credentials_changed("credential_rpm_updated");
         Ok(())
     }
 
@@ -9007,6 +9096,42 @@ mod tests {
         let mut second = manager.acquire_context(None).await.unwrap();
         assert_eq!(second.id, first.id);
         second.release_in_flight();
+    }
+
+    #[tokio::test]
+    async fn test_credential_rpm_override_limits_when_global_unlimited() {
+        let mut config = Config::default();
+        config.credential_rpm = None;
+
+        let mut cred = test_access_token_credential("t1", "Pro");
+        cred.rpm = Some(60);
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        let mut first = manager.acquire_context(None).await.unwrap();
+        first.release_in_flight();
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.entries[0].rpm, 60);
+        assert_eq!(snapshot.entries[0].rpm_override, Some(60));
+        assert!(snapshot.entries[0].rate_limited);
+    }
+
+    #[tokio::test]
+    async fn test_credential_rpm_override_zero_bypasses_global_limit() {
+        let mut config = Config::default();
+        config.credential_rpm = Some(60);
+
+        let mut cred = test_access_token_credential("t1", "Pro");
+        cred.rpm = Some(0);
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        let mut first = manager.acquire_context(None).await.unwrap();
+        first.release_in_flight();
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.entries[0].rpm, 0);
+        assert_eq!(snapshot.entries[0].rpm_override, Some(0));
+        assert!(!snapshot.entries[0].rate_limited);
     }
 
     #[tokio::test]

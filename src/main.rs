@@ -419,6 +419,7 @@ async fn main() {
         config.prompt_cache_scale_min_input_tokens,
         config.prompt_cache_creation_control.normalized(),
         config.reported_usage.clone(),
+        config.defined_cache_routes.clone(),
         config.compat_profile,
         config.model_resolution_mode,
         config.model_mapping.clone().normalized(),

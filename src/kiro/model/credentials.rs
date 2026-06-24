@@ -71,6 +71,14 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrent_requests: Option<u32>,
 
+    /// 凭据级每分钟请求数覆盖。
+    ///
+    /// `None` 表示继承全局 `credentialRpm`；
+    /// `Some(0)` 表示该凭据不做本地 RPM 限制；
+    /// `Some(n)` 表示该凭据每分钟最多调度 n 次。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpm: Option<u32>,
+
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -129,6 +129,7 @@ export function normalizeCredentialImportItem(value: unknown): AddCredentialRequ
     maxConcurrentRequests:
       numberField(normalized.maxConcurrentRequests) ??
       numberField(nested?.maxConcurrentRequests),
+    rpm: numberField(normalized.rpm) ?? numberField(nested?.rpm),
     region,
     authRegion,
     apiRegion,

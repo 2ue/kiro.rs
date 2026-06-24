@@ -17,12 +17,12 @@ use super::{
         BatchUpdateCredentialsRequest, ClearInFlightRequest, CreateProxyResourceRequest,
         CreateRequestApiKeyRequest, ExportCredentialsQuery, ExternalPoolTestRequest,
         ProxyResourceTestRequest, RefreshCredentialInfoRequest, SetCredentialConcurrencyRequest,
-        SetCredentialProxyRequest, SetCredentialRegionsRequest, SetDisabledRequest,
-        SetLoadBalancingModeRequest, SetPriorityRequest, SetWarmupRequest, SuccessResponse,
-        TestCredentialRequest, UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest,
-        UpdateProxyResourceRequest, UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest,
-        UpsertManualModelRequest, UsageCleanupRequest, ValidateExistingCredentialsRequest,
-        ValidateExternalCredentialsRequest,
+        SetCredentialProxyRequest, SetCredentialRegionsRequest, SetCredentialRpmRequest,
+        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SetWarmupRequest,
+        SuccessResponse, TestCredentialRequest, UpdateAdminApiKeyRequest,
+        UpdateCredentialAuthRequest, UpdateProxyResourceRequest, UpdateRequestApiKeyRequest,
+        UpdateRuntimeConfigRequest, UpsertManualModelRequest, UsageCleanupRequest,
+        ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
     },
 };
 use crate::anthropic::usage::{UsageRecordQuery, UsageRecordStatus, UsageSource};
@@ -357,6 +357,19 @@ pub async fn set_credential_concurrency(
 ) -> impl IntoResponse {
     match state.service.set_credential_concurrency(id, payload) {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 并发限制已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/rpm
+/// 设置凭据级 RPM 覆盖
+pub async fn set_credential_rpm(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetCredentialRpmRequest>,
+) -> impl IntoResponse {
+    match state.service.set_credential_rpm(id, payload) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} RPM 限制已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

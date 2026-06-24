@@ -19,8 +19,8 @@ use crate::model::config::{
 
 use super::{
     handlers::{
-        count_tokens, get_models, post_messages, post_messages_cc, post_messages_ha,
-        post_messages_real_cache_usage,
+        count_tokens, count_tokens_dfcache, get_models, get_models_dfcache, post_messages,
+        post_messages_cc, post_messages_dfcache, post_messages_ha, post_messages_real_cache_usage,
     },
     middleware::{AppState, auth_middleware, cors_layer},
     model_capabilities::ModelCapabilitiesCatalog,
@@ -74,6 +74,7 @@ pub fn create_router_with_provider(
     prompt_cache_scale_min_input_tokens: i32,
     prompt_cache_creation_control: PromptCacheCreationControlConfig,
     reported_usage: ReportedUsageConfig,
+    defined_cache_routes: Vec<String>,
     compat_profile: CompatProfile,
     model_resolution_mode: ModelResolutionMode,
     model_mapping: ModelMappingConfig,
@@ -107,6 +108,7 @@ pub fn create_router_with_provider(
     )
     .with_prompt_cache_creation_control(prompt_cache_creation_control)
     .with_reported_usage(reported_usage)
+    .with_defined_cache_routes(defined_cache_routes)
     .with_model_resolution_mode(model_resolution_mode)
     .with_model_mapping(model_mapping)
     .with_payload_guard(
@@ -128,6 +130,7 @@ pub fn create_router_with_provider(
     }
 
     let (v1_state, na_v1_state, cc_v1_state, ha_v1_state) = route_prompt_cache_states(base_state);
+    let define_cache_state = v1_state.clone();
 
     // 需要认证的 /v1 路由（默认 high-cache）
     let v1_routes = Router::new()
@@ -174,11 +177,27 @@ pub fn create_router_with_provider(
         ))
         .with_state(ha_v1_state);
 
+    // 需要认证的 /dfcache/{route}/v1 路由。
+    // route 必须在 definedCacheRoutes 中显式定义，避免未知路径被默认放行。
+    let dfcache_routes = Router::new()
+        .route("/{route}/v1/models", get(get_models_dfcache))
+        .route("/{route}/v1/messages", post(post_messages_dfcache))
+        .route(
+            "/{route}/v1/messages/count_tokens",
+            post(count_tokens_dfcache),
+        )
+        .layer(middleware::from_fn_with_state(
+            define_cache_state.clone(),
+            auth_middleware,
+        ))
+        .with_state(define_cache_state);
+
     Router::new()
         .nest("/v1", v1_routes)
         .nest("/na/v1", na_v1_routes)
         .nest("/cc/v1", cc_v1_routes)
         .nest("/ha/v1", ha_v1_routes)
+        .nest("/dfcache", dfcache_routes)
         .layer(cors_layer())
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
 }

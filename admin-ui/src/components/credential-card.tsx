@@ -30,6 +30,7 @@ import {
   useSetCredentialRegions,
   useSetCredentialProxy,
   useSetCredentialConcurrency,
+  useSetCredentialRpm,
 } from '@/hooks/use-credentials'
 
 interface CredentialCardProps {
@@ -140,6 +141,16 @@ function concurrencyLimitLabel(credential: CredentialStatusItem): string {
   return `继承全局：${effective}`
 }
 
+function rpmLimitLabel(credential: CredentialStatusItem): string {
+  const effective = credential.rpm > 0 ? `${credential.rpm} RPM` : '不限'
+  if (typeof credential.rpmOverride === 'number') {
+    return credential.rpmOverride > 0
+      ? `账号覆盖：${credential.rpmOverride} RPM`
+      : '账号覆盖：不限'
+  }
+  return `继承全局：${effective}`
+}
+
 function SecretInput({
   value,
   onChange,
@@ -193,6 +204,7 @@ export function CredentialCard({
   const [editingRegions, setEditingRegions] = useState(false)
   const [editingProxy, setEditingProxy] = useState(false)
   const [editingConcurrency, setEditingConcurrency] = useState(false)
+  const [editingRpm, setEditingRpm] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [regionValue, setRegionValue] = useState(credential.region || '')
   const [authRegionValue, setAuthRegionValue] = useState(credential.authRegion || '')
@@ -208,6 +220,11 @@ export function CredentialCard({
       ? String(credential.maxConcurrentRequestsOverride)
       : ''
   )
+  const [rpmValue, setRpmValue] = useState(
+    typeof credential.rpmOverride === 'number'
+      ? String(credential.rpmOverride)
+      : ''
+  )
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
@@ -219,6 +236,7 @@ export function CredentialCard({
   const clearInFlight = useClearInFlight()
   const setCredentialProxy = useSetCredentialProxy()
   const setCredentialConcurrency = useSetCredentialConcurrency()
+  const setCredentialRpm = useSetCredentialRpm()
   const setCredentialRegions = useSetCredentialRegions()
   const proxyResources = useProxyResources()
   const runtimeConfig = useRuntimeConfig()
@@ -317,6 +335,14 @@ export function CredentialCard({
         : ''
     )
   }, [credential.id, credential.maxConcurrentRequestsOverride])
+
+  useEffect(() => {
+    setRpmValue(
+      typeof credential.rpmOverride === 'number'
+        ? String(credential.rpmOverride)
+        : ''
+    )
+  }, [credential.id, credential.rpmOverride])
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -427,6 +453,34 @@ export function CredentialCard({
         },
         onError: (err) => {
           toast.error('并发限制设置失败: ' + extractErrorMessage(err))
+        },
+      }
+    )
+  }
+
+  const handleRpmSave = () => {
+    const trimmed = rpmValue.trim()
+    let rpm: number | null = null
+    if (trimmed) {
+      const parsed = Number(trimmed)
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        toast.error('账号 RPM 限制必须是非负整数')
+        return
+      }
+      rpm = parsed
+    }
+    setCredentialRpm.mutate(
+      {
+        id: credential.id,
+        request: { rpm },
+      },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setEditingRpm(false)
+        },
+        onError: (err) => {
+          toast.error('RPM 限制设置失败: ' + extractErrorMessage(err))
         },
       }
     )
@@ -578,6 +632,9 @@ export function CredentialCard({
                 {typeof credential.maxConcurrentRequestsOverride === 'number' && (
                   <Badge variant="outline">并发覆盖</Badge>
                 )}
+                {typeof credential.rpmOverride === 'number' && (
+                  <Badge variant="outline">RPM 覆盖</Badge>
+                )}
               </CardTitle>
             </div>
             <div className="flex items-center gap-2">
@@ -681,6 +738,17 @@ export function CredentialCard({
               >
                 <Gauge className="h-3.5 w-3.5" />
                 {concurrencyLimitLabel(credential)}
+              </button>
+            </div>
+            <div>
+              <span className="text-muted-foreground">RPM 限制：</span>
+              <button
+                type="button"
+                className="ml-1 inline-flex items-center gap-1 font-medium hover:underline"
+                onClick={() => setEditingRpm(true)}
+              >
+                <Gauge className="h-3.5 w-3.5" />
+                {rpmLimitLabel(credential)}
               </button>
             </div>
             <div className="col-span-2">
@@ -1240,6 +1308,74 @@ export function CredentialCard({
             </Button>
             <Button onClick={handleConcurrencySave} disabled={setCredentialConcurrency.isPending}>
               {setCredentialConcurrency.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+              保存
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={editingRpm} onOpenChange={setEditingRpm}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>RPM 限制：{displayName}</DialogTitle>
+            <DialogDescription>
+              留空表示继承全局“单凭据每分钟请求上限”；填 0 表示该账号不限 RPM；填正整数表示该账号自己的每分钟请求上限。
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <div className="rounded-md border bg-muted/30 p-3 text-sm">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-muted-foreground">当前生效</span>
+                <span className="font-medium">
+                  {credential.rpm > 0 ? `${credential.rpm} RPM` : '不限 RPM'}
+                </span>
+              </div>
+              <div className="mt-1 text-xs text-muted-foreground">
+                {typeof credential.rpmOverride === 'number'
+                  ? '当前账号已覆盖全局配置。'
+                  : '当前账号继承全局配置。'}
+              </div>
+            </div>
+            <label className="block">
+              <span className="text-sm font-medium">账号级 RPM</span>
+              <Input
+                className="mt-2"
+                type="number"
+                min="0"
+                value={rpmValue}
+                placeholder="留空继承全局，0 表示不限"
+                disabled={setCredentialRpm.isPending}
+                onChange={(event) => setRpmValue(event.target.value)}
+              />
+            </label>
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditingRpm(false)} disabled={setCredentialRpm.isPending}>
+              取消
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setRpmValue('')
+                setCredentialRpm.mutate(
+                  { id: credential.id, request: { rpm: null } },
+                  {
+                    onSuccess: (res) => {
+                      toast.success(res.message)
+                      setEditingRpm(false)
+                    },
+                    onError: (err) => toast.error('RPM 限制设置失败: ' + extractErrorMessage(err)),
+                  }
+                )
+              }}
+              disabled={setCredentialRpm.isPending || typeof credential.rpmOverride !== 'number'}
+            >
+              继承全局
+            </Button>
+            <Button onClick={handleRpmSave} disabled={setCredentialRpm.isPending}>
+              {setCredentialRpm.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
               保存
             </Button>
           </DialogFooter>

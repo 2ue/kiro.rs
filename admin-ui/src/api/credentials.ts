@@ -17,6 +17,7 @@ import type {
   SuccessResponse,
   SetDisabledRequest,
   SetCredentialConcurrencyRequest,
+  SetCredentialRpmRequest,
   SetPriorityRequest,
   SetWarmupRequest,
   AddCredentialRequest,
@@ -106,6 +107,7 @@ function credentialListItemToStatus(item: CredentialListItem): CredentialStatusI
     oldestInFlightAgeSecs: 0,
     newestInFlightIdleSecs: 0,
     maxConcurrentRequests: item.maxConcurrentRequests,
+    rpm: item.rpm,
     inFlightLeaseMaxSecs: 0,
     warmupRemaining: item.warmupRemaining ?? 0,
     transientFailureStreak: 0,
@@ -233,6 +235,14 @@ export async function setCredentialConcurrency(
   req: SetCredentialConcurrencyRequest
 ): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/concurrency`, req)
+  return data
+}
+
+export async function setCredentialRpm(
+  id: number,
+  req: SetCredentialRpmRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/rpm`, req)
   return data
 }
 

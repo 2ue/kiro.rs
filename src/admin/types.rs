@@ -153,6 +153,7 @@ pub struct CredentialRuntimeItem {
     pub newest_in_flight_idle_secs: u64,
     pub max_concurrent_requests: u32,
     pub in_flight_lease_max_secs: u64,
+    pub rpm: u32,
     pub transient_failure_streak: u32,
     pub recent_error_rate: f64,
     pub latency_ewma_ms: Option<f64>,
@@ -269,6 +270,10 @@ pub struct CredentialListItem {
     pub max_concurrent_requests: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrent_requests_override: Option<u32>,
+    /// 当前生效的凭据每分钟请求数。0 表示不限制。
+    pub rpm: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpm_override: Option<u32>,
     pub warmup_remaining: u32,
 }
 
@@ -406,6 +411,11 @@ pub struct CredentialStatusItem {
     /// 凭据级最大并发覆盖值。None 表示继承全局；Some(0) 表示该账号不限并发。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrent_requests_override: Option<u32>,
+    /// 当前生效的凭据每分钟请求数。0 表示不限制。
+    pub rpm: u32,
+    /// 凭据级 RPM 覆盖值。None 表示继承全局；Some(0) 表示该账号不限 RPM。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpm_override: Option<u32>,
     /// 并发占用自动回收阈值。0 表示关闭。
     pub in_flight_lease_max_secs: u64,
     /// 预热剩余请求数。
@@ -487,6 +497,15 @@ pub struct SetCredentialConcurrencyRequest {
     /// None 表示继承全局；Some(0) 表示该账号不限并发；Some(n) 表示该账号最多 n 并发。
     #[serde(default)]
     pub max_concurrent_requests: Option<u32>,
+}
+
+/// 修改凭据级 RPM 覆盖。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialRpmRequest {
+    /// None 表示继承全局；Some(0) 表示该账号不限 RPM；Some(n) 表示该账号最多 n RPM。
+    #[serde(default)]
+    pub rpm: Option<u32>,
 }
 
 /// 修改凭据 Region 覆盖值。
@@ -684,6 +703,10 @@ pub struct AddCredentialRequest {
     #[serde(default, alias = "max_concurrent_requests")]
     pub max_concurrent_requests: Option<u32>,
 
+    /// 凭据级 RPM 覆盖。None 表示继承全局，0 表示该账号不限 RPM。
+    #[serde(default)]
+    pub rpm: Option<u32>,
+
     /// 新增后是否禁用启动。默认 false。
     #[serde(default)]
     pub disabled: Option<bool>,
@@ -764,6 +787,8 @@ pub struct BatchCredentialImportDefaults {
     pub priority: Option<u32>,
     #[serde(default)]
     pub max_concurrent_requests: Option<Option<u32>>,
+    #[serde(default)]
+    pub rpm: Option<Option<u32>>,
     #[serde(default)]
     pub provider: Option<String>,
     #[serde(default)]
@@ -926,6 +951,8 @@ pub struct BatchUpdateCredentialsRequest {
     pub regions: Option<SetCredentialRegionsRequest>,
     #[serde(default)]
     pub concurrency: Option<SetCredentialConcurrencyRequest>,
+    #[serde(default)]
+    pub rpm: Option<SetCredentialRpmRequest>,
     #[serde(default)]
     pub proxy: Option<SetCredentialProxyRequest>,
 }
@@ -1280,6 +1307,7 @@ pub struct RuntimeConfigResponse {
     pub prompt_cache_scale_min_input_tokens: i32,
     pub prompt_cache_creation_control: PromptCacheCreationControlConfig,
     pub reported_usage: ReportedUsageConfig,
+    pub defined_cache_routes: Vec<String>,
     pub external_pools: ExternalPoolsConfig,
     pub high_cache_threshold: i32,
     pub compat_profile: CompatProfile,
@@ -1384,6 +1412,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub prompt_cache_creation_control: Option<PromptCacheCreationControlConfig>,
     #[serde(default)]
     pub reported_usage: Option<ReportedUsageConfig>,
+    #[serde(default)]
+    pub defined_cache_routes: Option<Vec<String>>,
     #[serde(default)]
     pub external_pools: Option<ExternalPoolsConfig>,
     #[serde(default)]

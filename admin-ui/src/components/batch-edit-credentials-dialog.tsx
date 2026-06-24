@@ -111,6 +111,8 @@ export function BatchEditCredentialsDialog({
   const [apiRegionValue, setApiRegionValue] = useState('')
   const [updateConcurrency, setUpdateConcurrency] = useState(false)
   const [concurrencyValue, setConcurrencyValue] = useState('')
+  const [updateRpm, setUpdateRpm] = useState(false)
+  const [rpmValue, setRpmValue] = useState('')
   const [updateProxy, setUpdateProxy] = useState(false)
   const [proxyResourceId, setProxyResourceId] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
@@ -163,6 +165,8 @@ export function BatchEditCredentialsDialog({
     setApiRegionValue('')
     setUpdateConcurrency(false)
     setConcurrencyValue('')
+    setUpdateRpm(false)
+    setRpmValue('')
     setUpdateProxy(false)
     setProxyResourceId('')
     setProxyUrl('')
@@ -177,7 +181,7 @@ export function BatchEditCredentialsDialog({
       toast.error('请先选择要修改的凭据')
       return
     }
-    if (!updateRegions && !updateConcurrency && !updateProxy) {
+    if (!updateRegions && !updateConcurrency && !updateRpm && !updateProxy) {
       toast.error('请选择至少一组要修改的参数')
       return
     }
@@ -205,6 +209,19 @@ export function BatchEditCredentialsDialog({
         request.concurrency = {
           maxConcurrentRequests: concurrencyValue.trim()
             ? parseOptionalNonNegativeInteger(concurrencyValue, '账号并发覆盖')
+            : null,
+        }
+      } catch (error) {
+        toast.error(extractErrorMessage(error))
+        return
+      }
+    }
+
+    if (updateRpm) {
+      try {
+        request.rpm = {
+          rpm: rpmValue.trim()
+            ? parseOptionalNonNegativeInteger(rpmValue, '账号 RPM 覆盖')
             : null,
         }
       } catch (error) {
@@ -320,6 +337,26 @@ export function BatchEditCredentialsDialog({
                 placeholder="留空改为继承全局，0 表示不限"
                 disabled={!updateConcurrency || batchUpdate.isPending}
                 onChange={(event) => setConcurrencyValue(event.target.value)}
+              />
+            </label>
+          </div>
+
+          <div className={`rounded-md border p-3 ${updateRpm ? 'border-primary bg-primary/5' : 'bg-muted/20'}`}>
+            <ToggleRow
+              checked={updateRpm}
+              disabled={batchUpdate.isPending}
+              label="修改账号 RPM 覆盖"
+              onCheckedChange={setUpdateRpm}
+            />
+            <label className="mt-3 block space-y-2">
+              <span className="text-sm font-medium">账号级 RPM</span>
+              <Input
+                type="number"
+                min="0"
+                value={rpmValue}
+                placeholder="留空改为继承全局，0 表示不限"
+                disabled={!updateRpm || batchUpdate.isPending}
+                onChange={(event) => setRpmValue(event.target.value)}
               />
             </label>
           </div>

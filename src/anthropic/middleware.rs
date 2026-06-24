@@ -17,6 +17,7 @@ use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
     CompatProfile, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
     PromptCacheCreationControlConfig, PromptCacheSimulationMode, ReportedUsageConfig,
+    normalize_defined_cache_routes,
 };
 
 use super::{
@@ -63,6 +64,8 @@ pub struct AppState {
     pub prompt_cache_creation_control: PromptCacheCreationControlConfig,
     /// 下游 usage 上报投影配置
     pub reported_usage: ReportedUsageConfig,
+    /// 已定义的 /dfcache/{name} 自定义 high-cache 路由。
+    pub defined_cache_routes: Vec<String>,
     /// Anthropic compatibility profile
     pub compat_profile: CompatProfile,
     /// 请求模型解析策略
@@ -120,6 +123,7 @@ impl AppState {
             prompt_cache_scale_min_input_tokens: 0,
             prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
             reported_usage: ReportedUsageConfig::default(),
+            defined_cache_routes: Vec::new(),
             compat_profile,
             model_resolution_mode: ModelResolutionMode::Compatible,
             model_mapping: ModelMappingConfig::default(),
@@ -174,6 +178,11 @@ impl AppState {
 
     pub fn with_reported_usage(mut self, reported_usage: ReportedUsageConfig) -> Self {
         self.reported_usage = reported_usage.normalized();
+        self
+    }
+
+    pub fn with_defined_cache_routes(mut self, routes: Vec<String>) -> Self {
+        self.defined_cache_routes = normalize_defined_cache_routes(&routes);
         self
     }
 

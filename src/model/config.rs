@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -1467,6 +1467,14 @@ pub struct Config {
     #[serde(default)]
     pub reported_usage: ReportedUsageConfig,
 
+    /// 自定义 high-cache 路由前缀。
+    ///
+    /// 只允许 `/dfcache/{name}` 形式，实际模型接口为
+    /// `/dfcache/{name}/v1/messages` 等。未列入这里的 `/dfcache/*`
+    /// 路径会直接报错，避免误放开未知路由。
+    #[serde(default)]
+    pub defined_cache_routes: Vec<String>,
+
     /// 请求级 usage record 内存保留上限。
     #[serde(default = "default_usage_record_limit")]
     pub usage_record_limit: usize,
@@ -1909,6 +1917,39 @@ fn reported_usage_path_matches(prefix: &str, path: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
+pub fn normalize_defined_cache_route(route: &str) -> Option<String> {
+    let trimmed = route.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let with_slash = if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{}", trimmed)
+    };
+    let normalized = with_slash.trim_end_matches('/').to_ascii_lowercase();
+    let name = normalized.strip_prefix("/dfcache/")?;
+    if name.is_empty()
+        || name.contains('/')
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return None;
+    }
+    Some(format!("/dfcache/{name}"))
+}
+
+pub fn normalize_defined_cache_routes(routes: &[String]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    routes
+        .iter()
+        .filter_map(|route| normalize_defined_cache_route(route))
+        .filter(|route| seen.insert(route.clone()))
+        .collect()
+}
+
 fn normalize_request_api_keys(keys: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<String> {
     let mut normalized = Vec::new();
     for key in keys {
@@ -2004,6 +2045,7 @@ impl Default for Config {
             prompt_cache_scale_min_input_tokens: default_prompt_cache_scale_min_input_tokens(),
             prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
             reported_usage: ReportedUsageConfig::default(),
+            defined_cache_routes: Vec::new(),
             usage_record_limit: default_usage_record_limit(),
             high_cache_threshold: default_high_cache_threshold(),
             default_endpoint: default_endpoint(),
@@ -2591,6 +2633,27 @@ mod tests {
             96
         );
         assert!(!reported_usage.policy_for_path("/na/v1/messages").enabled);
+    }
+
+    #[test]
+    fn defined_cache_routes_normalize_and_reject_unsafe_paths() {
+        assert_eq!(
+            normalize_defined_cache_route("dfcache/CC"),
+            Some("/dfcache/cc".to_string())
+        );
+        assert_eq!(
+            normalize_defined_cache_routes(&[
+                "/dfcache/aa".to_string(),
+                "/dfcache/aa/".to_string(),
+                "dfcache/bb".to_string(),
+            ]),
+            vec!["/dfcache/aa".to_string(), "/dfcache/bb".to_string()]
+        );
+        assert_eq!(normalize_defined_cache_route("/cc"), None);
+        let legacy_route = ["/define", "cache/aa"].concat();
+        assert_eq!(normalize_defined_cache_route(&legacy_route), None);
+        assert_eq!(normalize_defined_cache_route("/dfcache/a/b"), None);
+        assert_eq!(normalize_defined_cache_route("/dfcache/a?b"), None);
     }
 
     #[test]

@@ -103,6 +103,8 @@ export type CredentialListItem = Pick<
   | 'endpoint'
   | 'maxConcurrentRequests'
   | 'maxConcurrentRequestsOverride'
+  | 'rpm'
+  | 'rpmOverride'
   | 'warmupRemaining'
 >
 
@@ -143,6 +145,7 @@ export type CredentialRuntimeItem = Pick<
   | 'oldestInFlightAgeSecs'
   | 'newestInFlightIdleSecs'
   | 'maxConcurrentRequests'
+  | 'rpm'
   | 'inFlightLeaseMaxSecs'
   | 'transientFailureStreak'
   | 'recentErrorRate'
@@ -232,6 +235,8 @@ export interface CredentialStatusItem {
   newestInFlightIdleSecs: number
   maxConcurrentRequests: number
   maxConcurrentRequestsOverride?: number
+  rpm: number
+  rpmOverride?: number
   inFlightLeaseMaxSecs: number
   warmupRemaining: number
   transientFailureStreak?: number
@@ -450,6 +455,10 @@ export interface SetCredentialConcurrencyRequest {
   maxConcurrentRequests?: number | null
 }
 
+export interface SetCredentialRpmRequest {
+  rpm?: number | null
+}
+
 export interface SetCredentialRegionsRequest {
   region?: string | null
   authRegion?: string | null
@@ -460,6 +469,7 @@ export interface BatchUpdateCredentialsRequest {
   ids: number[]
   regions?: SetCredentialRegionsRequest
   concurrency?: SetCredentialConcurrencyRequest
+  rpm?: SetCredentialRpmRequest
   proxy?: SetCredentialProxyRequest
 }
 
@@ -486,6 +496,7 @@ export interface AddCredentialRequest {
   profileArn?: string
   priority?: number
   maxConcurrentRequests?: number | null
+  rpm?: number | null
   region?: string
   authRegion?: string
   apiRegion?: string
@@ -1206,6 +1217,7 @@ export interface RuntimeConfig {
   promptCacheScaleMinInputTokens: number
   promptCacheCreationControl: PromptCacheCreationControlConfig
   reportedUsage: ReportedUsageConfig
+  definedCacheRoutes: string[]
   externalPools: ExternalPoolsConfig
   highCacheThreshold: number
   compatProfile: CompatProfile

@@ -31,11 +31,11 @@ use super::types::{
     ProxyResourceTestRequest, ProxyResourceTestResponse, ProxyResourcesResponse,
     RefreshCredentialInfoRequest, RequestApiKeyItem, RuntimeConfigResponse,
     SetCredentialConcurrencyRequest, SetCredentialProxyRequest, SetCredentialRegionsRequest,
-    SetLoadBalancingModeRequest, SetWarmupRequest, TestCredentialRequest, TestCredentialResponse,
-    UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
-    UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
-    UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse, UsageCleanupRequest,
-    UsageCleanupStatusResponse, ValidateExistingCredentialsRequest,
+    SetCredentialRpmRequest, SetLoadBalancingModeRequest, SetWarmupRequest, TestCredentialRequest,
+    TestCredentialResponse, UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest,
+    UpdateProxyResourceRequest, UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest,
+    UpsertManualModelRequest, UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse,
+    UsageCleanupRequest, UsageCleanupStatusResponse, ValidateExistingCredentialsRequest,
     ValidateExternalCredentialsRequest,
 };
 use crate::anthropic::{
@@ -72,7 +72,7 @@ use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::{
     CredentialAuthUpdate, CredentialBaseSnapshot, CredentialEntrySnapshot, MultiTokenManager,
 };
-use crate::model::config::ExternalPoolsConfig;
+use crate::model::config::{ExternalPoolsConfig, normalize_defined_cache_routes};
 use crate::storage::postgres::{
     AdminAuditLogPage, CreateProxyResourceRow, CredentialAccountInfoRow, PostgresStore,
     PostgresUsageStore, ProxyResourceRow, UpdateProxyResourceRow,
@@ -1163,6 +1163,7 @@ impl AdminService {
             client_secret: req.client_secret,
             priority: req.priority,
             max_concurrent_requests: req.max_concurrent_requests,
+            rpm: req.rpm,
             region: req.region,
             auth_region: req.auth_region,
             api_region: req.api_region,
@@ -1629,6 +1630,26 @@ impl AdminService {
             true,
             None,
             json!({ "maxConcurrentRequests": req.max_concurrent_requests }),
+        );
+        Ok(())
+    }
+
+    /// 设置凭据级 RPM 覆盖
+    pub fn set_credential_rpm(
+        &self,
+        id: u64,
+        req: SetCredentialRpmRequest,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_credential_rpm(id, req.rpm)
+            .map_err(|e| self.classify_error(e, id))?;
+        self.audit(
+            "set_credential_rpm",
+            "credential",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({ "rpm": req.rpm }),
         );
         Ok(())
     }
@@ -2752,7 +2773,11 @@ impl AdminService {
                 MAX_CREDENTIALS_PAGE_LIMIT
             )));
         }
-        if req.regions.is_none() && req.concurrency.is_none() && req.proxy.is_none() {
+        if req.regions.is_none()
+            && req.concurrency.is_none()
+            && req.rpm.is_none()
+            && req.proxy.is_none()
+        {
             return Err(AdminServiceError::InvalidCredential(
                 "没有选择任何要修改的字段".to_string(),
             ));
@@ -2768,6 +2793,7 @@ impl AdminService {
             )
         });
         let concurrency = req.concurrency.map(|value| value.max_concurrent_requests);
+        let rpm = req.rpm.map(|value| value.rpm);
         let proxy = match req.proxy {
             Some(proxy) => Some((
                 proxy.proxy_resource_id,
@@ -2803,6 +2829,18 @@ impl AdminService {
                     if let Err(err) = self
                         .token_manager
                         .set_credential_max_concurrent_requests(id, max_concurrent_requests)
+                        .map_err(|e| self.classify_error(e, id))
+                    {
+                        error = Some(err.to_string());
+                    }
+                }
+            }
+
+            if error.is_none() {
+                if let Some(rpm) = rpm {
+                    if let Err(err) = self
+                        .token_manager
+                        .set_credential_rpm(id, rpm)
                         .map_err(|e| self.classify_error(e, id))
                     {
                         error = Some(err.to_string());
@@ -3414,6 +3452,7 @@ impl AdminService {
             prompt_cache_scale_min_input_tokens: config.prompt_cache_scale_min_input_tokens,
             prompt_cache_creation_control: config.prompt_cache_creation_control.normalized(),
             reported_usage: config.reported_usage.normalized(),
+            defined_cache_routes: normalize_defined_cache_routes(&config.defined_cache_routes),
             external_pools: config.external_pools.clone(),
             high_cache_threshold: config.high_cache_threshold,
             compat_profile: config.compat_profile,
@@ -3560,6 +3599,23 @@ impl AdminService {
             .clone()
             .unwrap_or_else(|| current_config.reported_usage.clone())
             .normalized();
+        let defined_cache_routes = match req.defined_cache_routes {
+            Some(ref routes) => {
+                let has_invalid = routes.iter().any(|route| {
+                    let trimmed = route.trim();
+                    !trimmed.is_empty()
+                        && crate::model::config::normalize_defined_cache_route(trimmed).is_none()
+                });
+                if has_invalid {
+                    return Err(AdminServiceError::InvalidCredential(
+                        "自定义高缓存路由必须是 /dfcache/{name}，name 只能包含字母、数字、点、下划线或短横线"
+                            .to_string(),
+                    ));
+                }
+                normalize_defined_cache_routes(&routes)
+            }
+            None => normalize_defined_cache_routes(&current_config.defined_cache_routes),
+        };
         let external_pools = req
             .external_pools
             .clone()
@@ -3794,6 +3850,7 @@ impl AdminService {
                 config.prompt_cache_scale_min_input_tokens = prompt_cache_scale_min_input_tokens;
                 config.prompt_cache_creation_control = prompt_cache_creation_control;
                 config.reported_usage = reported_usage;
+                config.defined_cache_routes = defined_cache_routes;
                 config.external_pools = external_pools;
                 config.high_cache_threshold = high_cache_threshold;
                 config.compat_profile = compat_profile;
@@ -4368,6 +4425,11 @@ fn apply_batch_import_defaults(
             credential.max_concurrent_requests = max_concurrent_requests;
         }
     }
+    if credential.rpm.is_none() {
+        if let Some(rpm) = defaults.rpm {
+            credential.rpm = rpm;
+        }
+    }
     if credential.provider.as_deref().is_none_or(str::is_empty) {
         credential.provider = defaults.provider.clone();
     }
@@ -4519,6 +4581,8 @@ fn credential_status_item_from_snapshot(
         newest_in_flight_idle_secs: entry.newest_in_flight_idle_secs,
         max_concurrent_requests: entry.max_concurrent_requests,
         max_concurrent_requests_override: entry.max_concurrent_requests_override,
+        rpm: entry.rpm,
+        rpm_override: entry.rpm_override,
         in_flight_lease_max_secs: entry.in_flight_lease_max_secs,
         warmup_remaining: entry.warmup_remaining,
         transient_failure_streak: entry.transient_failure_streak,
@@ -4578,6 +4642,8 @@ fn credential_list_item_from_base(
             .unwrap_or_else(|| default_endpoint.to_string()),
         max_concurrent_requests: credential.max_concurrent_requests,
         max_concurrent_requests_override: credential.max_concurrent_requests_override,
+        rpm: credential.rpm,
+        rpm_override: credential.rpm_override,
         warmup_remaining: credential.warmup_remaining,
     }
 }
@@ -4613,6 +4679,7 @@ fn credential_runtime_item_from_snapshot(
         oldest_in_flight_age_secs: credential.oldest_in_flight_age_secs,
         newest_in_flight_idle_secs: credential.newest_in_flight_idle_secs,
         max_concurrent_requests: credential.max_concurrent_requests,
+        rpm: credential.rpm,
         in_flight_lease_max_secs: credential.in_flight_lease_max_secs,
         transient_failure_streak: credential.transient_failure_streak,
         recent_error_rate: credential.recent_error_rate,
@@ -5710,6 +5777,8 @@ mod tests {
             newest_in_flight_idle_secs: 0,
             max_concurrent_requests: 0,
             max_concurrent_requests_override: None,
+            rpm: 0,
+            rpm_override: None,
             in_flight_lease_max_secs: 0,
             warmup_remaining: 0,
             transient_failure_streak: 0,

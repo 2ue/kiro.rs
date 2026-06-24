@@ -15,14 +15,15 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::model::config::{
     CompatProfile, Config, ExternalPoolsConfig, ModelMappingConfig, ModelResolutionMode,
     PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
-    PromptCacheSimulationMode, ReportedUsageConfig,
+    PromptCacheSimulationMode, ReportedUsageConfig, normalize_defined_cache_route,
+    normalize_defined_cache_routes,
 };
 use crate::token;
 use anyhow::Error;
 use axum::{
     Json as JsonExtractor,
     body::Body,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
@@ -80,7 +81,7 @@ struct RequestUsageContext {
         Arc<super::prompt_cache_creation_control::PromptCacheCreationController>,
     pricing_catalog: Arc<super::pricing::PricingCatalog>,
     request_id: String,
-    endpoint: &'static str,
+    endpoint: String,
     stream: bool,
     model: String,
     upstream_model: Option<String>,
@@ -160,7 +161,7 @@ struct ExternalFallbackContext {
     config: ExternalPoolsConfig,
     raw_body: Bytes,
     headers: HeaderMap,
-    endpoint: &'static str,
+    endpoint: String,
     payload: MessagesRequest,
     model_resolution: Option<ModelResolution>,
     reported_usage: ReportedUsageConfig,
@@ -330,7 +331,7 @@ impl RequestRuntimeConfig {
 struct PayloadTooLongRetryRequest {
     request: KiroRequest,
     config: PayloadGuardConfig,
-    endpoint: &'static str,
+    endpoint: String,
     requested_model: String,
     upstream_model: Option<String>,
     conversation_id: String,
@@ -341,7 +342,7 @@ impl PayloadTooLongRetryRequest {
     fn new(
         request: KiroRequest,
         runtime_config: &RequestRuntimeConfig,
-        endpoint: &'static str,
+        endpoint: &str,
         requested_model: &str,
         upstream_model: Option<&str>,
         conversation_id: &str,
@@ -350,7 +351,7 @@ impl PayloadTooLongRetryRequest {
         runtime_config.too_long_retry_enabled().then(|| Self {
             request,
             config: runtime_config.payload_guard_config(),
-            endpoint,
+            endpoint: endpoint.to_string(),
             requested_model: requested_model.to_string(),
             upstream_model: upstream_model.map(str::to_string),
             conversation_id: conversation_id.to_string(),
@@ -366,7 +367,7 @@ impl PayloadTooLongRetryRequest {
         let (request_body, report) = guard_kiro_request(&mut request, self.config)?;
         log_payload_guard_report(
             &report,
-            self.endpoint,
+            &self.endpoint,
             &self.requested_model,
             self.upstream_model.as_deref(),
             Some(&self.conversation_id),
@@ -375,7 +376,7 @@ impl PayloadTooLongRetryRequest {
         log_payload_byte_breakdown(
             should_log_payload_byte_breakdown(&report).then_some(breakdown),
             &report,
-            self.endpoint,
+            &self.endpoint,
             &self.requested_model,
             self.upstream_model.as_deref(),
             Some(&self.conversation_id),
@@ -415,7 +416,7 @@ fn build_external_fallback_context(
     state: &AppState,
     provider: &KiroProvider,
     runtime_config: &RequestRuntimeConfig,
-    endpoint: &'static str,
+    endpoint: &str,
     raw_body: Bytes,
     headers: HeaderMap,
     payload: &MessagesRequest,
@@ -429,7 +430,7 @@ fn build_external_fallback_context(
             config,
             raw_body,
             headers,
-            endpoint,
+            endpoint: endpoint.to_string(),
             payload: payload.clone(),
             model_resolution: None,
             reported_usage: runtime_config.reported_usage.clone(),
@@ -470,7 +471,7 @@ impl ExternalFallbackContext {
     async fn direct_policy_response(&self, request_id: &str) -> Option<Response> {
         let reason = self
             .manager
-            .direct_policy_reason(&self.config, self.endpoint, &self.payload.model)
+            .direct_policy_reason(&self.config, &self.endpoint, &self.payload.model)
             .await?;
         Some(
             self.manager
@@ -636,7 +637,7 @@ impl ExternalFallbackContext {
         ExternalRouteRequest {
             raw_body: guarded_payload.raw_body,
             headers: self.headers.clone(),
-            endpoint: self.endpoint,
+            endpoint: self.endpoint.clone(),
             payload: guarded_payload.payload,
             upstream_model: self
                 .model_resolution
@@ -714,7 +715,7 @@ impl ExternalFallbackContext {
                 if include_diagnostics {
                     log_payload_guard_report(
                         &report,
-                        self.endpoint,
+                        &self.endpoint,
                         &self.payload.model,
                         self.model_resolution
                             .as_ref()
@@ -724,7 +725,7 @@ impl ExternalFallbackContext {
                     log_payload_byte_breakdown(
                         breakdown,
                         &report,
-                        self.endpoint,
+                        &self.endpoint,
                         &self.payload.model,
                         self.model_resolution
                             .as_ref()
@@ -2243,7 +2244,7 @@ fn is_blocked_ip(addr: &std::net::IpAddr) -> bool {
 fn prepare_usage_context(
     state: &AppState,
     runtime_config: RequestRuntimeConfig,
-    endpoint: &'static str,
+    endpoint: &str,
     stream: bool,
     payload: &MessagesRequest,
     model_resolution: Option<ModelResolution>,
@@ -2290,7 +2291,7 @@ fn prepare_usage_context(
         prompt_cache_creation_controller: state.prompt_cache_creation_controller.clone(),
         pricing_catalog: state.pricing_catalog.clone(),
         request_id,
-        endpoint,
+        endpoint: endpoint.to_string(),
         stream,
         model: payload.model.clone(),
         upstream_model: model_resolution
@@ -2757,7 +2758,7 @@ fn conversion_error_response(e: &ConversionError) -> Response {
 fn resolve_request_model(
     state: &AppState,
     runtime_config: &RequestRuntimeConfig,
-    endpoint: &'static str,
+    endpoint: &str,
     payload: &MessagesRequest,
 ) -> Result<ModelResolution, Response> {
     let resolution = state.model_capabilities.resolve_model_with_mapping(
@@ -2978,6 +2979,49 @@ pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
+fn resolve_defined_cache_route(state: &AppState, route: &str) -> Result<String, Response> {
+    let candidate = format!("/dfcache/{route}");
+    let Some(prefix) = normalize_defined_cache_route(&candidate) else {
+        return Err(envelope::error_response(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            format!("dfcache route is invalid: {candidate}"),
+        ));
+    };
+    let defined_cache_routes = state
+        .kiro_provider
+        .as_ref()
+        .map(|provider| {
+            normalize_defined_cache_routes(&provider.runtime_config().defined_cache_routes)
+        })
+        .unwrap_or_else(|| state.defined_cache_routes.clone());
+    if !defined_cache_routes.iter().any(|item| item == &prefix) {
+        return Err(envelope::error_response(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            format!("dfcache route is not configured: {prefix}"),
+        ));
+    }
+    Ok(prefix)
+}
+
+/// GET /dfcache/:route/v1/models
+pub async fn get_models_dfcache(
+    State(state): State<AppState>,
+    Path(route): Path<String>,
+) -> Response {
+    if let Err(response) = resolve_defined_cache_route(&state, &route) {
+        return response;
+    }
+
+    let models = state.model_capabilities.anthropic_models();
+    Json(ModelsResponse {
+        object: "list".to_string(),
+        data: models,
+    })
+    .into_response()
+}
+
 /// POST /v1/messages
 ///
 /// 创建消息（对话）
@@ -2990,7 +3034,14 @@ pub async fn post_messages(
         Ok(payload) => payload,
         Err(response) => return response,
     };
-    post_messages_inner(state, headers, raw_body, payload, "/v1/messages").await
+    post_messages_inner(
+        state,
+        headers,
+        raw_body,
+        payload,
+        "/v1/messages".to_string(),
+    )
+    .await
 }
 
 /// POST /na/v1/messages
@@ -3005,7 +3056,14 @@ pub async fn post_messages_real_cache_usage(
         Ok(payload) => payload,
         Err(response) => return response,
     };
-    post_messages_inner(state, headers, raw_body, payload, "/na/v1/messages").await
+    post_messages_inner(
+        state,
+        headers,
+        raw_body,
+        payload,
+        "/na/v1/messages".to_string(),
+    )
+    .await
 }
 
 /// POST /ha/v1/messages
@@ -3020,7 +3078,41 @@ pub async fn post_messages_ha(
         Ok(payload) => payload,
         Err(response) => return response,
     };
-    post_messages_inner(state, headers, raw_body, payload, "/ha/v1/messages").await
+    post_messages_inner(
+        state,
+        headers,
+        raw_body,
+        payload,
+        "/ha/v1/messages".to_string(),
+    )
+    .await
+}
+
+/// POST /dfcache/:route/v1/messages
+///
+/// 自定义 high-cache 路由。必须先在运行配置中定义 `/dfcache/{route}`。
+pub async fn post_messages_dfcache(
+    State(state): State<AppState>,
+    Path(route): Path<String>,
+    headers: HeaderMap,
+    raw_body: Bytes,
+) -> Response {
+    let prefix = match resolve_defined_cache_route(&state, &route) {
+        Ok(prefix) => prefix,
+        Err(response) => return response,
+    };
+    let payload = match parse_messages_payload(&raw_body) {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+    post_messages_inner(
+        state,
+        headers,
+        raw_body,
+        payload,
+        format!("{prefix}/v1/messages"),
+    )
+    .await
 }
 
 async fn post_messages_inner(
@@ -3028,7 +3120,7 @@ async fn post_messages_inner(
     headers: HeaderMap,
     raw_body: Bytes,
     mut payload: MessagesRequest,
-    endpoint: &'static str,
+    endpoint: String,
 ) -> Response {
     tracing::debug!(
         endpoint = endpoint,
@@ -3055,7 +3147,7 @@ async fn post_messages_inner(
         &state,
         &provider,
         &runtime_config,
-        endpoint,
+        &endpoint,
         raw_body,
         headers.clone(),
         &payload,
@@ -3077,7 +3169,7 @@ async fn post_messages_inner(
         external.refresh_payload(&payload);
     }
 
-    let model_resolution = match resolve_request_model(&state, &runtime_config, endpoint, &payload)
+    let model_resolution = match resolve_request_model(&state, &runtime_config, &endpoint, &payload)
     {
         Ok(resolution) => resolution,
         Err(response) => {
@@ -3152,7 +3244,7 @@ async fn post_messages_inner(
     let too_long_retry = PayloadTooLongRetryRequest::new(
         kiro_request.clone(),
         &runtime_config,
-        endpoint,
+        &endpoint,
         &payload.model,
         model_resolution.upstream_model.as_deref(),
         &conversation_id,
@@ -3171,7 +3263,7 @@ async fn post_messages_inner(
     let payload_guard_elapsed = payload_guard_started_at.elapsed();
     log_payload_guard_report(
         &payload_guard_report,
-        endpoint,
+        &endpoint,
         &payload.model,
         model_resolution.upstream_model.as_deref(),
         Some(&conversation_id),
@@ -3181,7 +3273,7 @@ async fn post_messages_inner(
     log_payload_byte_breakdown(
         payload_breakdown,
         &payload_guard_report,
-        endpoint,
+        &endpoint,
         &payload.model,
         model_resolution.upstream_model.as_deref(),
         Some(&conversation_id),
@@ -3229,7 +3321,7 @@ async fn post_messages_inner(
     let mut usage_context = prepare_usage_context(
         &state,
         runtime_config.clone(),
-        endpoint,
+        &endpoint,
         payload.stream,
         &payload,
         Some(model_resolution.clone()),
@@ -3449,12 +3541,12 @@ async fn handle_stream_request(
             let message = e.to_string();
             let attempts = KiroProvider::attempts_from_error(&e);
             log_provider_call_failure(&message);
-            let endpoint = usage_context.endpoint;
+            let endpoint = usage_context.endpoint.clone();
             attach_and_log_tool_use_format_diagnostics(
                 &message,
                 kiro_request,
                 &mut usage_context,
-                endpoint,
+                &endpoint,
                 model,
                 preflight_model,
             );
@@ -3503,12 +3595,12 @@ async fn handle_stream_request(
                         let all_attempts =
                             merge_credential_attempts(retry_attempt_prefix.clone(), retry_attempts);
                         log_provider_call_failure(&retry_message);
-                        let endpoint = usage_context.endpoint;
+                        let endpoint = usage_context.endpoint.clone();
                         attach_and_log_tool_use_format_diagnostics(
                             &retry_message,
                             kiro_request,
                             &mut usage_context,
-                            endpoint,
+                            &endpoint,
                             model,
                             preflight_model,
                         );
@@ -4029,12 +4121,12 @@ async fn handle_non_stream_request(
             let message = e.to_string();
             let attempts = KiroProvider::attempts_from_error(&e);
             log_provider_call_failure(&message);
-            let endpoint = usage_context.endpoint;
+            let endpoint = usage_context.endpoint.clone();
             attach_and_log_tool_use_format_diagnostics(
                 &message,
                 kiro_request,
                 &mut usage_context,
-                endpoint,
+                &endpoint,
                 model,
                 preflight_model,
             );
@@ -4083,12 +4175,12 @@ async fn handle_non_stream_request(
                         let all_attempts =
                             merge_credential_attempts(retry_attempt_prefix.clone(), retry_attempts);
                         log_provider_call_failure(&retry_message);
-                        let endpoint = usage_context.endpoint;
+                        let endpoint = usage_context.endpoint.clone();
                         attach_and_log_tool_use_format_diagnostics(
                             &retry_message,
                             kiro_request,
                             &mut usage_context,
-                            endpoint,
+                            &endpoint,
                             model,
                             preflight_model,
                         );
@@ -4725,6 +4817,29 @@ pub async fn count_tokens(
     })
 }
 
+/// POST /dfcache/:route/v1/messages/count_tokens
+pub async fn count_tokens_dfcache(
+    State(state): State<AppState>,
+    Path(route): Path<String>,
+    JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
+) -> Response {
+    if let Err(response) = resolve_defined_cache_route(&state, &route) {
+        return response;
+    }
+
+    let total_tokens = token::count_all_tokens(
+        payload.model,
+        payload.system,
+        payload.messages,
+        payload.tools,
+    ) as i32;
+
+    Json(CountTokensResponse {
+        input_tokens: total_tokens.max(1) as i32,
+    })
+    .into_response()
+}
+
 /// POST /cc/v1/messages
 ///
 /// Claude Code 兼容端点，与 /v1/messages 的区别在于：
@@ -5100,6 +5215,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn defined_cache_route_requires_explicit_configuration() {
+        let state = AppState::new(
+            Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+            true,
+            Arc::new(UsageRecorder::new(10)),
+            Arc::new(PromptCacheTracker::default()),
+            Arc::new(PromptCacheCreationController::default()),
+            PromptCacheSimulationMode::HighCache,
+            0.98,
+            CompatProfile::ClaudeCode,
+            false,
+        )
+        .with_defined_cache_routes(vec!["/dfcache/cc".to_string()]);
+
+        assert_eq!(
+            resolve_defined_cache_route(&state, "cc").unwrap(),
+            "/dfcache/cc"
+        );
+        assert!(resolve_defined_cache_route(&state, "aa").is_err());
+        assert!(resolve_defined_cache_route(&state, "aa/b").is_err());
+    }
+
     fn runtime_config_for_payload_guard(
         mode: PayloadGuardMode,
         enabled: bool,
@@ -5371,7 +5509,7 @@ mod tests {
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_reported_limit".to_string(),
-            endpoint: "/cc/v1/messages",
+            endpoint: "/cc/v1/messages".to_string(),
             stream: false,
             model: "claude-sonnet-4-6".to_string(),
             upstream_model: None,
@@ -5448,7 +5586,7 @@ mod tests {
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_prod_like_cc_reported_usage".to_string(),
-            endpoint: "/cc/v1/messages",
+            endpoint: "/cc/v1/messages".to_string(),
             stream: true,
             model: "claude-opus-4-6".to_string(),
             upstream_model: Some("claude-opus-4.6".to_string()),
@@ -5588,7 +5726,7 @@ mod tests {
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_latency_trace".to_string(),
-            endpoint: "/cc/v1/messages",
+            endpoint: "/cc/v1/messages".to_string(),
             stream: true,
             model: "claude-opus-4-8".to_string(),
             upstream_model: Some("claude-opus-4.8".to_string()),
@@ -5684,7 +5822,7 @@ mod tests {
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_v1_policy".to_string(),
-            endpoint: "/v1/messages",
+            endpoint: "/v1/messages".to_string(),
             stream: false,
             model: "claude-sonnet-4-6".to_string(),
             upstream_model: None,
@@ -5722,7 +5860,7 @@ mod tests {
             latency: RequestLatencyTraceState::new(),
         };
         let cc_context = RequestUsageContext {
-            endpoint: "/cc/v1/messages",
+            endpoint: "/cc/v1/messages".to_string(),
             request_id: "req_cc_policy".to_string(),
             reported_cache_usage_policy: reported_cache_usage_policy(
                 "/cc/v1/messages",
@@ -5733,7 +5871,7 @@ mod tests {
             ..v1_context.clone()
         };
         let ha_context = RequestUsageContext {
-            endpoint: "/ha/v1/messages",
+            endpoint: "/ha/v1/messages".to_string(),
             request_id: "req_ha_policy".to_string(),
             reported_cache_usage_policy: reported_cache_usage_policy(
                 "/ha/v1/messages",
@@ -5744,7 +5882,7 @@ mod tests {
             ..v1_context.clone()
         };
         let na_context = RequestUsageContext {
-            endpoint: "/na/v1/messages",
+            endpoint: "/na/v1/messages".to_string(),
             request_id: "req_na_policy".to_string(),
             reported_cache_usage_policy: reported_cache_usage_policy(
                 "/na/v1/messages",
@@ -5841,7 +5979,7 @@ mod tests {
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_error_hint".to_string(),
-            endpoint: "/v1/messages",
+            endpoint: "/v1/messages".to_string(),
             stream: false,
             model: "claude-sonnet-4-6".to_string(),
             upstream_model: None,
@@ -5996,7 +6134,7 @@ mod tests {
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_test".to_string(),
-            endpoint: "/v1/messages",
+            endpoint: "/v1/messages".to_string(),
             stream: true,
             model: payload.model.clone(),
             upstream_model: None,
@@ -6079,7 +6217,7 @@ mod tests {
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_high_cache".to_string(),
-            endpoint: "/v1/messages",
+            endpoint: "/v1/messages".to_string(),
             stream: true,
             model: payload.model.clone(),
             upstream_model: None,

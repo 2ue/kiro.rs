@@ -362,7 +362,7 @@ pub struct ExternalPoolTestResponse {
 pub struct ExternalRouteRequest {
     pub raw_body: Bytes,
     pub headers: HeaderMap,
-    pub endpoint: &'static str,
+    pub endpoint: String,
     pub payload: MessagesRequest,
     pub upstream_model: Option<String>,
     pub model_resolution_source: Option<String>,
@@ -1133,7 +1133,7 @@ impl ExternalPoolManager {
         lease: ExternalPoolLease,
         config: &ExternalPoolsConfig,
     ) -> Result<ExternalForwardResponse, ExternalPoolError> {
-        let url = external_pool_url(pool, route.endpoint, config)?;
+        let url = external_pool_url(pool, &route.endpoint, config)?;
         let mut headers = forward_headers(&route.headers, pool)?;
         if !headers.contains_key(header::CONTENT_TYPE) {
             headers.insert(
@@ -3642,7 +3642,7 @@ fn build_external_usage_projection_context(
         (None, None, None)
     };
     let reported_policy = ReportedCacheUsagePolicy::from_path_policy(
-        route.reported_usage.policy_for_path(route.endpoint),
+        route.reported_usage.policy_for_path(&route.endpoint),
         profile
             .as_ref()
             .map(|profile| profile.cache_jitter_seed())
@@ -4280,7 +4280,7 @@ mod tests {
         let route = ExternalRouteRequest {
             raw_body: Bytes::new(),
             headers: HeaderMap::new(),
-            endpoint: "/v1/messages",
+            endpoint: "/v1/messages".to_string(),
             payload: MessagesRequest {
                 model: "claude-sonnet-4-5-20250929".to_string(),
                 max_tokens: 8,
@@ -4497,7 +4497,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
         ExternalRouteRequest {
             raw_body: Bytes::new(),
             headers: HeaderMap::new(),
-            endpoint: "/cc/v1/messages",
+            endpoint: "/cc/v1/messages".to_string(),
             payload: test_payload(model),
             upstream_model: Some(model.to_string()),
             model_resolution_source: Some("exact_upstream".to_string()),
@@ -5182,7 +5182,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
             br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
         );
         let mut route = test_route("claude-sonnet-4-5");
-        route.endpoint = "/v1/messages";
+        route.endpoint = "/v1/messages".to_string();
         let mut pool = test_pool("http://pool.example.com", false);
         pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
@@ -5364,7 +5364,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
             br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":800,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
         );
         let mut route = test_route("claude-sonnet-4-5");
-        route.endpoint = "/v1/messages";
+        route.endpoint = "/v1/messages".to_string();
         let mut pool = test_pool("http://pool.example.com", false);
         pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
@@ -5384,7 +5384,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
             br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1200,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
         );
         let mut route = test_route("claude-sonnet-4-5");
-        route.endpoint = "/v1/messages";
+        route.endpoint = "/v1/messages".to_string();
         let mut pool = test_pool("http://pool.example.com", false);
         pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
@@ -5423,7 +5423,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
             br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
         );
         let mut route = test_route("sonnet");
-        route.endpoint = "/v1/messages";
+        route.endpoint = "/v1/messages".to_string();
         route.upstream_model = Some("claude-sonnet-4-5".to_string());
         route.model_resolution_source = Some("alias".to_string());
         let mut pool = test_pool("http://pool.example.com", false);
@@ -5445,7 +5445,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
             br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
         );
         let mut route = test_route("claude-sonnet-4-5");
-        route.endpoint = "/v1/messages";
+        route.endpoint = "/v1/messages".to_string();
         let mut pool = test_pool("http://pool.example.com", false);
         pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
@@ -5490,7 +5490,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
             br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":80000,"cache_read_input_tokens":0}}"#,
         );
         let mut route = test_route("claude-sonnet-4-5");
-        route.endpoint = "/v1/messages";
+        route.endpoint = "/v1/messages".to_string();
         let mut pool = test_pool("http://pool.example.com", false);
         pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
@@ -5578,7 +5578,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
             br#"{"type":"message","usage":{"input_tokens":1000,"output_tokens":1200,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
         );
         let mut route = test_route("claude-sonnet-4-5");
-        route.endpoint = "/v1/messages";
+        route.endpoint = "/v1/messages".to_string();
         let mut pool = test_pool("http://pool.example.com", false);
         pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
         let projection =
@@ -5650,7 +5650,7 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":120
 "#;
         let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
         let mut route = test_route("claude-sonnet-4-5");
-        route.endpoint = "/v1/messages";
+        route.endpoint = "/v1/messages".to_string();
         let mut pool = test_pool("http://pool.example.com", false);
         pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
         let projection =

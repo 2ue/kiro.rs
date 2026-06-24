@@ -74,6 +74,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [email, setEmail] = useState('')
   const [priority, setPriority] = useState('0')
   const [maxConcurrentRequests, setMaxConcurrentRequests] = useState('')
+  const [rpm, setRpm] = useState('')
   const [machineId, setMachineId] = useState('')
   const [proxyResourceId, setProxyResourceId] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
@@ -100,6 +101,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setEmail('')
     setPriority('0')
     setMaxConcurrentRequests('')
+    setRpm('')
     setMachineId('')
     setProxyResourceId('')
     setProxyUrl('')
@@ -125,6 +127,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     email?: string
     priority?: number
     maxConcurrentRequests?: number | null
+    rpm?: number | null
     machineId?: string
     proxyUrl?: string
     proxyUsername?: string
@@ -144,6 +147,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setEmail(credential.email || '')
     setPriority(String(credential.priority ?? 0))
     setMaxConcurrentRequests(typeof credential.maxConcurrentRequests === 'number' ? String(credential.maxConcurrentRequests) : '')
+    setRpm(typeof credential.rpm === 'number' ? String(credential.rpm) : '')
     setMachineId(credential.machineId || '')
     if (credential.proxyResourceId) {
       setProxyResourceId(String(credential.proxyResourceId))
@@ -256,6 +260,15 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       }
       parsedMaxConcurrentRequests = parsed
     }
+    let parsedRpm: number | undefined
+    if (rpm.trim()) {
+      const parsed = Number(rpm)
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        toast.error('账号 RPM 覆盖必须是非负整数')
+        return
+      }
+      parsedRpm = parsed
+    }
     const directProxyUrl = proxyUrl.trim()
     const directProxyUsername = proxyUsername.trim()
     const directProxyPassword = proxyPassword.trim()
@@ -278,6 +291,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         email: email.trim() || undefined,
         priority: parsedPriority,
         maxConcurrentRequests: parsedMaxConcurrentRequests,
+        rpm: parsedRpm,
         machineId: machineId.trim() || undefined,
         proxyResourceId: proxyResourceId ? Number(proxyResourceId) : undefined,
         proxyUrl: proxyResourceId ? undefined : directProxyUrl || undefined,
@@ -493,6 +507,24 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               />
               <p className="text-xs text-muted-foreground">
                 只作用于当前凭据；留空时继承全局单凭据并发配置。
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <label htmlFor="rpm" className="text-sm font-medium">
+                账号 RPM 覆盖
+              </label>
+              <Input
+                id="rpm"
+                type="number"
+                min="0"
+                placeholder="留空继承全局，0 表示不限"
+                value={rpm}
+                onChange={(e) => setRpm(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                限制当前账号每分钟被分配的请求数。
               </p>
             </div>
 
