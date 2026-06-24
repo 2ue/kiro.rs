@@ -504,6 +504,12 @@ mod tests {
             "malformed_request"
         );
         assert_eq!(
+            KiroProvider::classify_bad_request_reason(
+                r#"{"message":"Invalid tool use format.","reason":"REQUEST_BODY_INVALID"}"#
+            ),
+            "tool_use_format_bad_request"
+        );
+        assert_eq!(
             KiroProvider::classify_bad_request_reason(r#"{"message":"unknown model"}"#),
             "bad_request"
         );
@@ -3113,6 +3119,9 @@ impl KiroProvider {
         {
             return "profile_arn_bad_request";
         }
+        if lower.contains("invalid tool use format") || lower.contains("request_body_invalid") {
+            return "tool_use_format_bad_request";
+        }
         if lower.contains("improperly formed")
             || lower.contains("malformed")
             || lower.contains("invalid request body")
@@ -3126,6 +3135,7 @@ impl KiroProvider {
         match reason {
             "assistant_prefill_bad_request"
             | "profile_arn_bad_request"
+            | "tool_use_format_bad_request"
             | "malformed_request"
             | "bad_request" => "请求无效",
             _ => "请求无效",

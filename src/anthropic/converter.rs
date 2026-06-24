@@ -978,12 +978,13 @@ fn is_valid_uuid(s: &str) -> bool {
 /// 收集历史消息中使用的所有工具名称
 fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
     let mut tool_names = Vec::new();
+    let mut seen_lower = std::collections::HashSet::new();
 
     for msg in history {
         if let Message::Assistant(assistant_msg) = msg {
             if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
                 for tool_use in tool_uses {
-                    if !tool_names.contains(&tool_use.name) {
+                    if seen_lower.insert(tool_use.name.to_ascii_lowercase()) {
                         tool_names.push(tool_use.name.clone());
                     }
                 }
@@ -1120,13 +1121,14 @@ fn convert_request_with_model_id(
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
     // 注意：Kiro 匹配工具名称时忽略大小写，所以这里也需要忽略大小写比较
     let history_tool_names = collect_history_tool_names(&history);
-    let existing_tool_names: std::collections::HashSet<_> = tools
+    let mut existing_tool_names: std::collections::HashSet<_> = tools
         .iter()
         .map(|t| t.tool_specification.name.to_lowercase())
         .collect();
 
     for tool_name in history_tool_names {
-        if !existing_tool_names.contains(&tool_name.to_lowercase()) {
+        let tool_name_lower = tool_name.to_lowercase();
+        if !existing_tool_names.contains(&tool_name_lower) {
             if options.is_strict() {
                 return Err(ConversionError::UnsupportedContent(format!(
                     "tool {} appears in history but is missing from tools",
@@ -1135,6 +1137,7 @@ fn convert_request_with_model_id(
             }
             known_tool_names.insert(tool_name.clone());
             tools.push(create_placeholder_tool(&tool_name));
+            existing_tool_names.insert(tool_name_lower);
         }
     }
 
@@ -2094,42 +2097,55 @@ fn convert_tools(
     let selected_indices = selected_tool_indices(tools, &directive);
     let selected: std::collections::HashSet<_> = selected_indices.into_iter().collect();
 
-    tools
+    let mut seen_tool_names = std::collections::HashSet::new();
+    let mut converted = Vec::new();
+
+    for (_, t) in tools
         .iter()
         .enumerate()
         .filter(|(idx, _)| selected.contains(idx))
-        .map(|t| {
-            let t = t.1;
-            let mut description = t.description.clone();
+    {
+        let mut description = t.description.clone();
 
-            // 对 Write/Edit 工具追加自定义描述后缀
-            let suffix = match t.name.as_str() {
-                "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
-                "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
-                _ => "",
-            };
-            if !suffix.is_empty() {
-                description.push('\n');
-                description.push_str(suffix);
-            }
+        // 对 Write/Edit 工具追加自定义描述后缀
+        let suffix = match t.name.as_str() {
+            "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
+            "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
+            _ => "",
+        };
+        if !suffix.is_empty() {
+            description.push('\n');
+            description.push_str(suffix);
+        }
 
-            // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
-            let description = match description.char_indices().nth(10000) {
-                Some((idx, _)) => description[..idx].to_string(),
-                None => description,
-            };
+        // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
+        let description = match description.char_indices().nth(10000) {
+            Some((idx, _)) => description[..idx].to_string(),
+            None => description,
+        };
 
-            Tool {
-                tool_specification: ToolSpecification {
-                    name: map_tool_name(&t.name, tool_name_map),
-                    description,
-                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(
-                        t.input_schema
-                    ))),
-                },
-            }
-        })
-        .collect()
+        let mapped_name = map_tool_name(&t.name, tool_name_map);
+        if !seen_tool_names.insert(mapped_name.to_ascii_lowercase()) {
+            tracing::warn!(
+                original_tool_name = %t.name,
+                mapped_tool_name = %mapped_name,
+                "跳过重复工具定义，避免 Kiro 工具名冲突"
+            );
+            continue;
+        }
+
+        converted.push(Tool {
+            tool_specification: ToolSpecification {
+                name: mapped_name,
+                description,
+                input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(
+                    t.input_schema
+                ))),
+            },
+        });
+    }
+
+    converted
 }
 
 /// 生成thinking标签前缀
@@ -2737,6 +2753,24 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_history_tool_names_dedupes_case_insensitive() {
+        use crate::kiro::model::requests::tool::ToolUseEntry;
+
+        let mut assistant_msg = AssistantMessage::new("Using tools");
+        assistant_msg = assistant_msg.with_tool_uses(vec![
+            ToolUseEntry::new("tool-1", "Read"),
+            ToolUseEntry::new("tool-2", "read"),
+        ]);
+        let history = vec![Message::Assistant(HistoryAssistantMessage {
+            assistant_response_message: assistant_msg,
+        })];
+
+        let tool_names = collect_history_tool_names(&history);
+
+        assert_eq!(tool_names, vec!["Read".to_string()]);
+    }
+
+    #[test]
     fn test_create_placeholder_tool() {
         let tool = create_placeholder_tool("my_custom_tool");
 
@@ -3187,6 +3221,59 @@ mod tests {
             tools.iter().any(|t| t.tool_specification.name == "read"),
             "tools 列表应包含 'read' 工具的占位符定义"
         );
+    }
+
+    #[test]
+    fn test_duplicate_declared_tools_are_deduped_before_kiro_request() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        let mut schema = std::collections::HashMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+        schema.insert("properties".to_string(), serde_json::json!({}));
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
+            stream: false,
+            system: None,
+            tools: Some(vec![
+                AnthropicTool {
+                    name: "read".to_string(),
+                    description: "A test tool".to_string(),
+                    input_schema: schema.clone(),
+                    tool_type: None,
+                    max_uses: None,
+                    cache_control: None,
+                },
+                AnthropicTool {
+                    name: "read".to_string(),
+                    description: "Duplicate tool".to_string(),
+                    input_schema: schema,
+                    tool_type: None,
+                    max_uses: None,
+                    cache_control: None,
+                },
+            ]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].tool_specification.name, "read");
     }
 
     #[test]

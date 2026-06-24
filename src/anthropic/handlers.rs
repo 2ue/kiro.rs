@@ -45,8 +45,8 @@ use super::middleware::AppState;
 use super::model_capabilities::{ModelResolution, ModelResolutionSource};
 use super::payload_guard::{
     PayloadByteBreakdown, PayloadGuardConfig, PayloadGuardError, PayloadGuardReport,
-    breakdown_anthropic_messages_request, breakdown_kiro_request, guard_anthropic_messages_request,
-    guard_kiro_request,
+    ToolUseFormatDiagnostics, breakdown_anthropic_messages_request, breakdown_kiro_request,
+    diagnose_kiro_tool_use_format, guard_anthropic_messages_request, guard_kiro_request,
 };
 use super::prompt_cache::{PromptCacheProfile, PromptCacheScope};
 use super::stream::{SseEvent, StreamContext};
@@ -1089,6 +1089,12 @@ impl RequestUsageContext {
     ) {
         self.payload_breakdown = breakdown;
         self.payload_guard_report = Some(report);
+    }
+
+    fn attach_tool_use_format_diagnostics(&mut self, diagnostics: ToolUseFormatDiagnostics) {
+        if let Some(report) = self.payload_guard_report.as_mut() {
+            report.tool_use_format_diagnostics = Some(diagnostics);
+        }
     }
 
     fn mark_local_rescue_after_external(
@@ -2620,10 +2626,16 @@ fn is_upstream_improperly_formed_error(value: &str) -> bool {
             .contains("improperly formed request")
 }
 
+fn is_upstream_tool_use_format_error(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("invalid tool use format") || lower.contains("request_body_invalid")
+}
+
 fn is_upstream_bad_request_error(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     lower.contains("400 bad request")
         || lower.contains("bad_request")
+        || lower.contains("request_body_invalid")
         || lower.contains("assistant-prefill")
         || lower.contains("assistant prefill")
         || lower.contains("last message must be user")
@@ -2653,6 +2665,52 @@ fn should_retry_payload_guard_after_error(
         || (retry_max_bytes > 0
             && attempted_body_bytes > retry_max_bytes
             && is_upstream_improperly_formed_error(value))
+}
+
+fn attach_and_log_tool_use_format_diagnostics(
+    message: &str,
+    request: &KiroRequest,
+    usage_context: &mut RequestUsageContext,
+    endpoint: &str,
+    requested_model: &str,
+    upstream_model: &str,
+) {
+    if !is_upstream_tool_use_format_error(message) {
+        return;
+    }
+
+    let diagnostics = diagnose_kiro_tool_use_format(request);
+    usage_context.attach_tool_use_format_diagnostics(diagnostics);
+
+    tracing::debug!(
+        request_id = %usage_context.request_id,
+        endpoint,
+        requested_model,
+        upstream_model,
+        has_tool_payload = diagnostics.has_tool_payload(),
+        history_entries_total = diagnostics.history_entries_total,
+        history_entries_scanned = diagnostics.history_entries_scanned,
+        scan_truncated = diagnostics.scan_truncated,
+        tool_items_scanned = diagnostics.tool_items_scanned,
+        tool_item_scan_truncated = diagnostics.tool_item_scan_truncated,
+        current_tool_count = diagnostics.current_tool_count,
+        current_tool_result_count = diagnostics.current_tool_result_count,
+        history_tool_use_count = diagnostics.history_tool_use_count,
+        history_tool_result_count = diagnostics.history_tool_result_count,
+        last_assistant_tool_use_count = diagnostics.last_assistant_tool_use_count,
+        current_results_matching_last_assistant = diagnostics.current_results_matching_last_assistant,
+        current_results_not_matching_last_assistant = diagnostics.current_results_not_matching_last_assistant,
+        duplicate_current_tool_result_ids = diagnostics.duplicate_current_tool_result_ids,
+        duplicate_history_tool_use_ids = diagnostics.duplicate_history_tool_use_ids,
+        duplicate_history_tool_result_ids = diagnostics.duplicate_history_tool_result_ids,
+        duplicate_tool_names = diagnostics.duplicate_tool_names,
+        empty_tool_names = diagnostics.empty_tool_names,
+        empty_tool_use_ids = diagnostics.empty_tool_use_ids,
+        empty_tool_result_ids = diagnostics.empty_tool_result_ids,
+        non_object_tool_use_inputs = diagnostics.non_object_tool_use_inputs,
+        history_tool_names_missing_from_tools = diagnostics.history_tool_names_missing_from_tools,
+        "Kiro rejected tool-use format; attached redacted request-structure diagnostics"
+    );
 }
 
 fn merge_credential_attempts(
@@ -3206,6 +3264,7 @@ async fn post_messages_inner(
         handle_stream_request(
             provider,
             &request_body,
+            &kiro_request,
             &payload.model,
             model_resolution
                 .upstream_model
@@ -3229,6 +3288,7 @@ async fn post_messages_inner(
         handle_non_stream_request(
             provider,
             &request_body,
+            &kiro_request,
             &payload.model,
             model_resolution
                 .upstream_model
@@ -3346,6 +3406,7 @@ fn external_rescue_preflight(reason: &str, err: &ExternalPoolFinalError) -> serd
 async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
+    kiro_request: &KiroRequest,
     model: &str,
     preflight_model: &str,
     input_tokens: i32,
@@ -3388,6 +3449,15 @@ async fn handle_stream_request(
             let message = e.to_string();
             let attempts = KiroProvider::attempts_from_error(&e);
             log_provider_call_failure(&message);
+            let endpoint = usage_context.endpoint;
+            attach_and_log_tool_use_format_diagnostics(
+                &message,
+                kiro_request,
+                &mut usage_context,
+                endpoint,
+                model,
+                preflight_model,
+            );
             if let Some(retry) = too_long_retry.filter(|retry| {
                 should_retry_payload_guard_after_error(
                     &message,
@@ -3433,6 +3503,15 @@ async fn handle_stream_request(
                         let all_attempts =
                             merge_credential_attempts(retry_attempt_prefix.clone(), retry_attempts);
                         log_provider_call_failure(&retry_message);
+                        let endpoint = usage_context.endpoint;
+                        attach_and_log_tool_use_format_diagnostics(
+                            &retry_message,
+                            kiro_request,
+                            &mut usage_context,
+                            endpoint,
+                            model,
+                            preflight_model,
+                        );
                         if let Some(outcome) = maybe_external_fallback_after_local_error_outcome(
                             external_fallback.as_ref(),
                             &request_id,
@@ -3909,6 +3988,7 @@ use super::converter::get_context_window_size;
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
+    kiro_request: &KiroRequest,
     model: &str,
     preflight_model: &str,
     input_tokens: i32,
@@ -3949,6 +4029,15 @@ async fn handle_non_stream_request(
             let message = e.to_string();
             let attempts = KiroProvider::attempts_from_error(&e);
             log_provider_call_failure(&message);
+            let endpoint = usage_context.endpoint;
+            attach_and_log_tool_use_format_diagnostics(
+                &message,
+                kiro_request,
+                &mut usage_context,
+                endpoint,
+                model,
+                preflight_model,
+            );
             if let Some(retry) = too_long_retry.filter(|retry| {
                 should_retry_payload_guard_after_error(
                     &message,
@@ -3994,6 +4083,15 @@ async fn handle_non_stream_request(
                         let all_attempts =
                             merge_credential_attempts(retry_attempt_prefix.clone(), retry_attempts);
                         log_provider_call_failure(&retry_message);
+                        let endpoint = usage_context.endpoint;
+                        attach_and_log_tool_use_format_diagnostics(
+                            &retry_message,
+                            kiro_request,
+                            &mut usage_context,
+                            endpoint,
+                            model,
+                            preflight_model,
+                        );
                         if let Some(outcome) = maybe_external_fallback_after_local_error_outcome(
                             external_fallback.as_ref(),
                             &request_id,
@@ -4875,6 +4973,7 @@ pub async fn post_messages_cc(
         handle_stream_request(
             provider,
             &request_body,
+            &kiro_request,
             &payload.model,
             model_resolution
                 .upstream_model
@@ -4898,6 +4997,7 @@ pub async fn post_messages_cc(
         handle_non_stream_request(
             provider,
             &request_body,
+            &kiro_request,
             &payload.model,
             model_resolution
                 .upstream_model
@@ -5093,6 +5193,17 @@ mod tests {
             r#"400 Bad Request {"message":"Improperly formed request.","reason":null}"#,
             700_000,
             0,
+        ));
+    }
+
+    #[test]
+    fn request_body_invalid_tool_format_is_bad_request_diagnostic_error() {
+        let message = r#"400 Bad Request {"message":"Invalid tool use format.","reason":"REQUEST_BODY_INVALID"}"#;
+
+        assert!(is_upstream_bad_request_error(message));
+        assert!(is_upstream_tool_use_format_error(message));
+        assert!(!should_retry_payload_guard_after_error(
+            message, 100_000, 460_800,
         ));
     }
 

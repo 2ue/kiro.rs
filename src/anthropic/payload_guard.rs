@@ -28,6 +28,8 @@ const CURRENT_FIT_MAX_ITERATIONS: usize = 64;
 const CURRENT_FIT_OVERHEAD_BYTES: usize = 512;
 const PAYLOAD_GUARD_SLOW_LOG_THRESHOLD: Duration = Duration::from_millis(25);
 const EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER: &str = "Tool result content was empty.";
+const TOOL_FORMAT_DIAGNOSTIC_MAX_HISTORY_ENTRIES: usize = 512;
+const TOOL_FORMAT_DIAGNOSTIC_MAX_ITEMS: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -50,6 +52,41 @@ pub struct PayloadByteBreakdown {
     pub largest_current_tool_result_bytes: usize,
     pub history_tool_use_count: usize,
     pub history_tool_result_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolUseFormatDiagnostics {
+    pub history_entries_total: usize,
+    pub history_entries_scanned: usize,
+    pub scan_truncated: bool,
+    pub tool_items_scanned: usize,
+    pub tool_item_scan_truncated: bool,
+    pub current_tool_count: usize,
+    pub current_tool_result_count: usize,
+    pub history_tool_use_count: usize,
+    pub history_tool_result_count: usize,
+    pub last_assistant_tool_use_count: usize,
+    pub current_results_matching_last_assistant: usize,
+    pub current_results_not_matching_last_assistant: usize,
+    pub duplicate_current_tool_result_ids: usize,
+    pub duplicate_history_tool_use_ids: usize,
+    pub duplicate_history_tool_result_ids: usize,
+    pub duplicate_tool_names: usize,
+    pub empty_tool_names: usize,
+    pub empty_tool_use_ids: usize,
+    pub empty_tool_result_ids: usize,
+    pub non_object_tool_use_inputs: usize,
+    pub history_tool_names_missing_from_tools: usize,
+}
+
+impl ToolUseFormatDiagnostics {
+    pub fn has_tool_payload(&self) -> bool {
+        self.current_tool_count > 0
+            || self.current_tool_result_count > 0
+            || self.history_tool_use_count > 0
+            || self.history_tool_result_count > 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +136,8 @@ pub struct PayloadGuardReport {
     pub truncated_current_user_content_chars: usize,
     pub dropped_current_images: usize,
     pub dropped_current_image_bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_format_diagnostics: Option<ToolUseFormatDiagnostics>,
     pub still_oversized: bool,
 }
 
@@ -137,6 +176,7 @@ impl PayloadGuardReport {
             truncated_current_user_content_chars: 0,
             dropped_current_images: 0,
             dropped_current_image_bytes: 0,
+            tool_use_format_diagnostics: None,
             still_oversized: false,
         }
     }
@@ -354,6 +394,7 @@ pub fn guard_kiro_request(
         truncated_current_user_content_chars: 0,
         dropped_current_images: 0,
         dropped_current_image_bytes: 0,
+        tool_use_format_diagnostics: None,
         still_oversized: false,
     };
 
@@ -514,6 +555,182 @@ pub fn breakdown_kiro_request(
         history_tool_use_count: count_history_tool_uses(&state.history),
         history_tool_result_count: count_history_tool_results(&state.history),
     }
+}
+
+pub fn diagnose_kiro_tool_use_format(request: &KiroRequest) -> ToolUseFormatDiagnostics {
+    let state = &request.conversation_state;
+    let current_user = &state.current_message.user_input_message;
+    let current_context = &current_user.user_input_message_context;
+    let history_entries_total = state.history.len();
+    let scan_start =
+        history_entries_total.saturating_sub(TOOL_FORMAT_DIAGNOSTIC_MAX_HISTORY_ENTRIES);
+    let history_entries_scanned = history_entries_total.saturating_sub(scan_start);
+    let scan_truncated = scan_start > 0;
+    let mut tool_items_scanned = 0usize;
+    let mut tool_item_scan_truncated = false;
+
+    let mut tool_names = HashSet::new();
+    let mut duplicate_tool_names = 0usize;
+    let mut empty_tool_names = 0usize;
+    for tool in &current_context.tools {
+        if !claim_tool_diagnostic_item(&mut tool_items_scanned, &mut tool_item_scan_truncated) {
+            break;
+        }
+        let name = tool.tool_specification.name.trim();
+        if name.is_empty() {
+            empty_tool_names += 1;
+            continue;
+        }
+        if !tool_names.insert(name.to_ascii_lowercase()) {
+            duplicate_tool_names += 1;
+        }
+    }
+
+    let last_assistant_tool_use_ids: HashSet<String> =
+        match state.history.iter().rev().find_map(|message| {
+            if let Message::Assistant(assistant) = message {
+                Some(assistant)
+            } else {
+                None
+            }
+        }) {
+            Some(assistant) => assistant
+                .assistant_response_message
+                .tool_uses
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|tool_use| {
+                    let id = tool_use.tool_use_id.trim();
+                    (!id.is_empty()).then(|| id.to_string())
+                })
+                .collect(),
+            None => HashSet::new(),
+        };
+
+    let mut current_result_ids = HashSet::new();
+    let mut current_results_matching_last_assistant = 0usize;
+    let mut current_results_not_matching_last_assistant = 0usize;
+    let mut duplicate_current_tool_result_ids = 0usize;
+    let mut empty_tool_result_ids = 0usize;
+    for result in &current_context.tool_results {
+        if !claim_tool_diagnostic_item(&mut tool_items_scanned, &mut tool_item_scan_truncated) {
+            break;
+        }
+        let id = result.tool_use_id.trim();
+        if id.is_empty() {
+            empty_tool_result_ids += 1;
+            continue;
+        }
+        if !current_result_ids.insert(id.to_string()) {
+            duplicate_current_tool_result_ids += 1;
+        }
+        if last_assistant_tool_use_ids.contains(id) {
+            current_results_matching_last_assistant += 1;
+        } else {
+            current_results_not_matching_last_assistant += 1;
+        }
+    }
+
+    let mut history_tool_use_ids = HashSet::new();
+    let mut history_tool_result_ids = HashSet::new();
+    let mut history_tool_use_count = 0usize;
+    let mut history_tool_result_count = 0usize;
+    let mut duplicate_history_tool_use_ids = 0usize;
+    let mut duplicate_history_tool_result_ids = 0usize;
+    let mut empty_tool_use_ids = 0usize;
+    let mut non_object_tool_use_inputs = 0usize;
+    let mut history_tool_names_missing_from_tools = 0usize;
+
+    for message in state.history.iter().skip(scan_start) {
+        match message {
+            Message::Assistant(assistant) => {
+                let Some(tool_uses) = &assistant.assistant_response_message.tool_uses else {
+                    continue;
+                };
+                for tool_use in tool_uses {
+                    if !claim_tool_diagnostic_item(
+                        &mut tool_items_scanned,
+                        &mut tool_item_scan_truncated,
+                    ) {
+                        break;
+                    }
+                    history_tool_use_count += 1;
+                    let id = tool_use.tool_use_id.trim();
+                    if id.is_empty() {
+                        empty_tool_use_ids += 1;
+                    } else if !history_tool_use_ids.insert(id.to_string()) {
+                        duplicate_history_tool_use_ids += 1;
+                    }
+
+                    let name = tool_use.name.trim();
+                    if name.is_empty() {
+                        empty_tool_names += 1;
+                    } else if !tool_names.contains(&name.to_ascii_lowercase()) {
+                        history_tool_names_missing_from_tools += 1;
+                    }
+
+                    if !tool_use.input.is_object() {
+                        non_object_tool_use_inputs += 1;
+                    }
+                }
+            }
+            Message::User(user) => {
+                for result in &user
+                    .user_input_message
+                    .user_input_message_context
+                    .tool_results
+                {
+                    if !claim_tool_diagnostic_item(
+                        &mut tool_items_scanned,
+                        &mut tool_item_scan_truncated,
+                    ) {
+                        break;
+                    }
+                    history_tool_result_count += 1;
+                    let id = result.tool_use_id.trim();
+                    if id.is_empty() {
+                        empty_tool_result_ids += 1;
+                    } else if !history_tool_result_ids.insert(id.to_string()) {
+                        duplicate_history_tool_result_ids += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    ToolUseFormatDiagnostics {
+        history_entries_total,
+        history_entries_scanned,
+        scan_truncated,
+        tool_items_scanned,
+        tool_item_scan_truncated,
+        current_tool_count: current_context.tools.len(),
+        current_tool_result_count: current_context.tool_results.len(),
+        history_tool_use_count,
+        history_tool_result_count,
+        last_assistant_tool_use_count: last_assistant_tool_use_ids.len(),
+        current_results_matching_last_assistant,
+        current_results_not_matching_last_assistant,
+        duplicate_current_tool_result_ids,
+        duplicate_history_tool_use_ids,
+        duplicate_history_tool_result_ids,
+        duplicate_tool_names,
+        empty_tool_names,
+        empty_tool_use_ids,
+        empty_tool_result_ids,
+        non_object_tool_use_inputs,
+        history_tool_names_missing_from_tools,
+    }
+}
+
+fn claim_tool_diagnostic_item(scanned: &mut usize, truncated: &mut bool) -> bool {
+    if *scanned >= TOOL_FORMAT_DIAGNOSTIC_MAX_ITEMS {
+        *truncated = true;
+        return false;
+    }
+    *scanned += 1;
+    true
 }
 
 pub fn guard_anthropic_messages_request(
@@ -783,6 +1000,7 @@ fn new_payload_guard_report(
         truncated_current_user_content_chars: 0,
         dropped_current_images: 0,
         dropped_current_image_bytes: 0,
+        tool_use_format_diagnostics: None,
         still_oversized: false,
     }
 }
@@ -3964,6 +4182,84 @@ mod tests {
     }
 
     #[test]
+    fn tool_use_format_diagnostics_counts_structure_without_content() {
+        let first_assistant = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new("first").with_tool_uses(vec![
+                ToolUseEntry::new("tool-old", "missingTool").with_input(serde_json::json!("raw")),
+            ]),
+        };
+
+        let mut first_user = HistoryUserMessage::new("first result", TEST_MODEL);
+        first_user.user_input_message.user_input_message_context = UserInputMessageContext::new()
+            .with_tool_results(vec![ToolResult::success("tool-old", "old result")]);
+
+        let last_assistant = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new("last").with_tool_uses(vec![
+                ToolUseEntry::new("tool-last", "read").with_input(serde_json::json!({})),
+                ToolUseEntry::new(" ", "read").with_input(serde_json::json!({})),
+            ]),
+        };
+
+        let mut current = UserInputMessage::new("current", TEST_MODEL);
+        current.user_input_message_context = UserInputMessageContext::new()
+            .with_tools(vec![
+                Tool {
+                    tool_specification: ToolSpecification {
+                        name: "read".to_string(),
+                        description: "read".to_string(),
+                        input_schema: InputSchema::from_json(serde_json::json!({
+                            "type": "object",
+                            "properties": {}
+                        })),
+                    },
+                },
+                Tool {
+                    tool_specification: ToolSpecification {
+                        name: "READ".to_string(),
+                        description: "duplicate".to_string(),
+                        input_schema: InputSchema::from_json(serde_json::json!({
+                            "type": "object",
+                            "properties": {}
+                        })),
+                    },
+                },
+            ])
+            .with_tool_results(vec![
+                ToolResult::success("tool-last", "kept"),
+                ToolResult::success("tool-old", "not adjacent"),
+                ToolResult::success("tool-last", "duplicate"),
+            ]);
+
+        let request = KiroRequest {
+            conversation_state: ConversationState::new("conv-test")
+                .with_history(vec![
+                    Message::Assistant(first_assistant),
+                    Message::User(first_user),
+                    Message::Assistant(last_assistant),
+                ])
+                .with_current_message(CurrentMessage::new(current)),
+            profile_arn: None,
+        };
+
+        let diagnostics = diagnose_kiro_tool_use_format(&request);
+
+        assert!(diagnostics.has_tool_payload());
+        assert_eq!(diagnostics.tool_items_scanned, 9);
+        assert!(!diagnostics.tool_item_scan_truncated);
+        assert_eq!(diagnostics.current_tool_count, 2);
+        assert_eq!(diagnostics.duplicate_tool_names, 1);
+        assert_eq!(diagnostics.history_tool_use_count, 3);
+        assert_eq!(diagnostics.history_tool_result_count, 1);
+        assert_eq!(diagnostics.last_assistant_tool_use_count, 1);
+        assert_eq!(diagnostics.current_results_matching_last_assistant, 2);
+        assert_eq!(diagnostics.current_results_not_matching_last_assistant, 1);
+        assert_eq!(diagnostics.duplicate_current_tool_result_ids, 1);
+        assert_eq!(diagnostics.empty_tool_use_ids, 1);
+        assert_eq!(diagnostics.non_object_tool_use_inputs, 1);
+        assert_eq!(diagnostics.history_tool_names_missing_from_tools, 1);
+    }
+
+    #[test]
     fn warning_header_fragment_reports_changes() {
         let report = PayloadGuardReport {
             enabled: true,
@@ -3998,6 +4294,7 @@ mod tests {
             truncated_current_user_content_chars: 10,
             dropped_current_images: 1,
             dropped_current_image_bytes: 10,
+            tool_use_format_diagnostics: None,
             still_oversized: false,
         };
 
