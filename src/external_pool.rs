@@ -1005,7 +1005,9 @@ impl ExternalPoolManager {
 
         while attempt_index < max_attempts {
             let Some(pool) = self.select_pool(&excluded, &config).await else {
-                let snapshot = self.pool_availability_snapshot(&excluded, &config).await;
+                let snapshot = self
+                    .pool_availability_snapshot_uncached(&excluded, &config)
+                    .await;
                 if snapshot.has_temporary_unavailable_pool() {
                     match self
                         .handle_capacity_unavailable(
@@ -1024,6 +1026,9 @@ impl ExternalPoolManager {
                             return ExternalPoolForwardOutcome::FinalError(err);
                         }
                     }
+                }
+                if snapshot.available_pools > 0 {
+                    continue;
                 }
                 break;
             };
@@ -1564,10 +1569,29 @@ impl ExternalPoolManager {
         excluded: &HashSet<u64>,
         config: &ExternalPoolsConfig,
     ) -> PoolAvailabilitySnapshot {
+        self.pool_availability_snapshot_inner(excluded, config, true)
+            .await
+    }
+
+    async fn pool_availability_snapshot_uncached(
+        &self,
+        excluded: &HashSet<u64>,
+        config: &ExternalPoolsConfig,
+    ) -> PoolAvailabilitySnapshot {
+        self.pool_availability_snapshot_inner(excluded, config, false)
+            .await
+    }
+
+    async fn pool_availability_snapshot_inner(
+        &self,
+        excluded: &HashSet<u64>,
+        config: &ExternalPoolsConfig,
+        allow_cache: bool,
+    ) -> PoolAvailabilitySnapshot {
         if !config.external_pools_enabled {
             return PoolAvailabilitySnapshot::default();
         }
-        let cacheable = excluded.is_empty();
+        let cacheable = allow_cache && excluded.is_empty();
         let now = Instant::now();
         if cacheable {
             if let Some(snapshot) = self
@@ -4516,6 +4540,52 @@ mod tests {
         let selected = selected.expect("pool should become selectable after global lease release");
         assert!(selected.id == primary.id || selected.id == secondary.id);
 
+        postgres.drop_test_schema().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_pool_manager_uncached_snapshot_detects_full_pool_after_available_cache() {
+        let Some((manager, postgres)) = test_external_pool_manager().await else {
+            return;
+        };
+        let mut config = ExternalPoolsConfig::default();
+        config.external_pools_enabled = true;
+        config.external_pool_global_max_concurrent_requests = 0;
+
+        let pool = postgres
+            .create_external_pool(create_pool_request("external-stale-cache", 1, true))
+            .await
+            .unwrap();
+
+        let cached_available = manager
+            .pool_availability_snapshot(&HashSet::new(), &config)
+            .await;
+        assert_eq!(cached_available.eligible_pools, 1);
+        assert_eq!(cached_available.available_pools, 1);
+
+        let lease = match manager.acquire_pool(&pool, &config).await {
+            PoolAcquireResult::Acquired(lease) => lease,
+            PoolAcquireResult::Unavailable(_) => panic!("pool lease should be acquired"),
+        };
+        assert!(
+            manager
+                .select_pool(&HashSet::new(), &config)
+                .await
+                .is_none()
+        );
+
+        let uncached_full = manager
+            .pool_availability_snapshot_uncached(&HashSet::new(), &config)
+            .await;
+        assert_eq!(uncached_full.eligible_pools, 1);
+        assert_eq!(uncached_full.available_pools, 0);
+        assert_eq!(uncached_full.temporary_unavailable_pools, 1);
+        assert_eq!(
+            uncached_full.wait_reason,
+            Some(PoolCapacityWaitReason::Full)
+        );
+
+        drop(lease);
         postgres.drop_test_schema().await.unwrap();
     }
 
