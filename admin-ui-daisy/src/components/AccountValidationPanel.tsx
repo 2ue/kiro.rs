@@ -196,10 +196,10 @@ export function AccountValidationPanel() {
     if (parsed.credentials.length) {
       appendExternalCredentials(parsed.credentials)
       setSelectedFiles(files.map((file) => file.name))
-      toast.success(`已从 ${files.length} 个文件读取 ${parsed.credentials.length} 条凭据`)
+      toast.success(`已从 ${files.length} 个文件读取 ${parsed.credentials.length} 条账号`)
     }
     if (parsed.errors.length) toast.warning(`部分文件未读取: ${parsed.errors.slice(0, 3).join('；')}`)
-    if (!parsed.credentials.length && !parsed.errors.length) toast.error('没有读取到有效凭据')
+    if (!parsed.credentials.length && !parsed.errors.length) toast.error('没有读取到有效账号')
   }
 
   const updateExternalOption = <K extends keyof ExternalValidationOptions>(key: K, value: ExternalValidationOptions[K]) => {
@@ -215,7 +215,7 @@ export function AccountValidationPanel() {
       return
     }
     if (credentials.length === 0) {
-      toast.error('没有解析到可校验的凭据')
+      toast.error('没有解析到可校验的账号')
       return
     }
     if (!hasExternalAction) {
@@ -244,8 +244,8 @@ export function AccountValidationPanel() {
   return (
     <div className="space-y-4">
       <SectionCard
-        title="系统凭据复查"
-        description="强制查询系统内凭据的订阅、额度和用量，并和上次快照比较。禁用凭据也可以手动复查，不会参与调度。"
+        title="系统账号复查"
+        description="强制查询系统内账号的订阅、额度和用量，并和上次快照比较。禁用账号也可以手动复查，不会参与调度。"
         actions={
           <>
             <Button type="button" variant="outline" size="sm" onClick={() => validateExisting('all')} disabled={loading}>
@@ -321,7 +321,7 @@ export function AccountValidationPanel() {
           </div>
           <Textarea bordered className="min-h-52 w-full font-mono text-xs" value={raw} onChange={(event) => setRaw(event.target.value)} placeholder="粘贴 KAM JSON、credentials 数组或 JSONL" />
           <div className="flex items-center justify-between text-xs text-base-content/60">
-            <span>已解析 {parsedCount} 条可校验凭据</span>
+            <span>已解析 {parsedCount} 条可校验账号</span>
             <span className="inline-flex items-center gap-1">
               <Upload className="h-3.5 w-3.5" />
               {selectedFiles.length ? `已选择 ${selectedFiles.length} 个文件` : '文件内容可直接粘贴到这里'}

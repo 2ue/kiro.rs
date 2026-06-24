@@ -19,7 +19,7 @@ use super::{
         ProxyResourceTestRequest, RefreshCredentialInfoRequest, SetCredentialConcurrencyRequest,
         SetCredentialProxyRequest, SetCredentialRegionsRequest, SetCredentialRpmRequest,
         SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SetWarmupRequest,
-        SuccessResponse, TestCredentialRequest, UpdateAdminApiKeyRequest,
+        SuccessResponse, SystemVersionResponse, TestCredentialRequest, UpdateAdminApiKeyRequest,
         UpdateCredentialAuthRequest, UpdateProxyResourceRequest, UpdateRequestApiKeyRequest,
         UpdateRuntimeConfigRequest, UpsertManualModelRequest, UsageCleanupRequest,
         ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
@@ -121,6 +121,13 @@ pub struct UsageRecordsPageQueryParams {
 #[serde(rename_all = "camelCase")]
 pub struct UsageDashboardQueryParams {
     pub timezone: Option<String>,
+}
+
+/// GET /api/admin/system/version
+pub async fn get_system_version() -> Json<SystemVersionResponse> {
+    Json(SystemVersionResponse {
+        version: env!("CARGO_PKG_VERSION"),
+    })
 }
 
 impl UsageRecordsQueryParams {

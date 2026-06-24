@@ -67,10 +67,10 @@ export function getStoredTheme(): ThemeMode {
 
 export const pageConfig: Record<TabKey, { title: string; subtitle: string; layout: PageLayout }> = {
   dashboard: { title: '总览', subtitle: '快速了解系统状态和关键变化', layout: 'dashboard' },
-  credentials: { title: '凭据管理', subtitle: '维护账号资源，保持服务稳定', layout: 'resource' },
+  credentials: { title: '账号管理', subtitle: '维护本地账号资源，保持服务稳定', layout: 'resource' },
   validation: { title: '账号校验', subtitle: '检查账号可用性，减少异常影响', layout: 'resource' },
   proxies: { title: '代理资源', subtitle: '维护网络资源和连通状态', layout: 'resource' },
-  external: { title: '备用号池', subtitle: '维护备用资源，提高服务可用性', layout: 'settings' },
+  external: { title: '外部账号', subtitle: '维护扩展账号资源，提高服务稳定性', layout: 'settings' },
   usage: { title: '用量', subtitle: '查看使用情况和成本变化', layout: 'data' },
   pricing: { title: '模型价格', subtitle: '维护价格信息，辅助成本核算', layout: 'data' },
   audit: { title: '审计日志', subtitle: '查看关键操作记录', layout: 'data' },

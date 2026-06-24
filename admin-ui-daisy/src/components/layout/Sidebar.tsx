@@ -13,6 +13,7 @@ import {
 import type { MouseEvent, ReactNode } from 'react'
 import { useState } from 'react'
 import { Button, Tooltip } from 'react-daisyui'
+import { useSystemVersion } from '@/hooks/use-credentials'
 import type { TabKey } from '@/types/ui'
 import { getConsoleTabPath } from '@/types/ui'
 
@@ -26,10 +27,10 @@ interface SidebarProps {
 
 const navItems: Array<{ key: TabKey; label: string; icon: ReactNode; description: string }> = [
   { key: 'dashboard', label: '总览', icon: <LayoutDashboard className="h-5 w-5" />, description: '状态概览' },
-  { key: 'credentials', label: '凭据', icon: <Server className="h-5 w-5" />, description: '账号资源' },
+  { key: 'credentials', label: '账号', icon: <Server className="h-5 w-5" />, description: '本地资源' },
   { key: 'validation', label: '校验', icon: <FileCheck2 className="h-5 w-5" />, description: '可用性检查' },
   { key: 'proxies', label: '代理', icon: <Router className="h-5 w-5" />, description: '网络资源' },
-  { key: 'external', label: '备用池', icon: <Router className="h-5 w-5" />, description: '备用资源' },
+  { key: 'external', label: '外部账号', icon: <Router className="h-5 w-5" />, description: '扩展资源' },
   { key: 'usage', label: '用量', icon: <BarChart3 className="h-5 w-5" />, description: '请求与成本' },
   { key: 'pricing', label: '价格', icon: <DollarSign className="h-5 w-5" />, description: '模型计价' },
   { key: 'audit', label: '审计', icon: <FileClock className="h-5 w-5" />, description: '操作记录' },
@@ -44,6 +45,7 @@ export function Sidebar({
   onCollapsedChange,
 }: SidebarProps) {
   const [localCollapsed, setLocalCollapsed] = useState(false)
+  const version = useSystemVersion()
   const collapsed = embedded ? false : controlledCollapsed ?? localCollapsed
 
   const toggleCollapsed = () => {
@@ -145,7 +147,14 @@ export function Sidebar({
       <div className="border-t border-base-300/70 p-2">
         {!collapsed && (
           <div className="sidebar-footer-card rounded-lg p-3">
-            <div className="text-[0.68rem] font-semibold text-base-content/45">当前入口</div>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[0.68rem] font-semibold text-base-content/45">当前入口</span>
+              {version.data?.version && (
+                <span className="rounded-full border border-base-300/70 px-2 py-0.5 font-mono text-[0.65rem] font-semibold text-base-content/55">
+                  v{version.data.version}
+                </span>
+              )}
+            </div>
             <div className="mt-1 truncate font-mono text-[0.75rem] font-semibold text-base-content">/console</div>
           </div>
         )}

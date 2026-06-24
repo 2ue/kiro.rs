@@ -259,7 +259,7 @@ export function ExternalPoolsPanel() {
           externalPoolUsageProjectionOutputUpliftPercent: whole(configDraft.externalPoolUsageProjectionOutputUpliftPercent),
         },
       })
-      toast.success('备用号池策略已保存')
+      toast.success('外部账号策略已保存')
       invalidate()
     } catch (error) {
       toast.error(extractErrorMessage(error))
@@ -283,7 +283,7 @@ export function ExternalPoolsPanel() {
         maxConcurrentRequests: whole(createForm.maxConcurrentRequests ?? 10, 1),
         modelMappingRules: parseModelMappingRules(modelMappingRulesText),
       })
-      toast.success('备用池已添加')
+      toast.success('外部账号已添加')
       setCreateOpen(false)
       setCreateForm(defaultPoolForm())
       invalidate()
@@ -315,7 +315,7 @@ export function ExternalPoolsPanel() {
         modelMappingRules: parseModelMappingRules(modelMappingRulesText),
       }
       await updateExternalPool(editingPool.id, payload)
-      toast.success('备用池已更新')
+      toast.success('外部账号已更新')
       setEditingPool(null)
       setEditForm(defaultPoolForm())
       invalidate()
@@ -383,46 +383,46 @@ export function ExternalPoolsPanel() {
 
   return (
     <div className="space-y-5">
-      <SectionCard title="备用池策略" actions={<Button size="sm" color="primary" loading={savingConfig} onClick={saveConfig}><Save className="h-4 w-4" />保存策略</Button>}>
+      <SectionCard title="外部账号策略" actions={<Button size="sm" color="primary" loading={savingConfig} onClick={saveConfig}><Save className="h-4 w-4" />保存策略</Button>}>
         <div className="space-y-5">
           <div className="grid gap-3 md:grid-cols-5">
-            <SummaryItem label="备用池" value={externalEnabled ? '已启用' : '已关闭'} />
+            <SummaryItem label="外部账号" value={externalEnabled ? '已启用' : '已关闭'} />
             <SummaryItem label="入口策略" value={fallbackActive || directPolicyActive ? '已配置' : '未配置'} />
-            <SummaryItem label="可用备用池" value={`${dispatchablePools}/${totalPools}`} />
-            <SummaryItem label="备用池并发" value={`${totalInFlight}/${totalCapacity || 0}`} />
-            <SummaryItem label="按入口规则池" value={`${currentPathPoolCount} 个`} />
+            <SummaryItem label="可用外部账号" value={`${dispatchablePools}/${totalPools}`} />
+            <SummaryItem label="外部账号并发" value={`${totalInFlight}/${totalCapacity || 0}`} />
+            <SummaryItem label="按入口规则" value={`${currentPathPoolCount} 个`} />
           </div>
 
           <PolicyBlock
-            title="1. 是否启用备用池"
+            title="1. 是否启用外部账号"
             active={externalEnabled}
-            description="关闭后不会进入任何备用池，请求只走本地凭据。"
+            description="关闭后不会进入任何外部账号，请求只走本地账号。"
           >
             <div className="grid gap-3 md:grid-cols-2">
-              <ToggleRow label="启用备用池" checked={configDraft.externalPoolsEnabled} onChange={(externalPoolsEnabled) => setConfigDraft((prev) => ({ ...prev, externalPoolsEnabled }))} />
+              <ToggleRow label="启用外部账号" checked={configDraft.externalPoolsEnabled} onChange={(externalPoolsEnabled) => setConfigDraft((prev) => ({ ...prev, externalPoolsEnabled }))} />
             </div>
           </PolicyBlock>
 
           <PolicyBlock
-            title="2. 什么时候进入备用池"
+            title="2. 什么时候进入外部账号"
             active={externalEnabled}
-            description="默认先使用本地账号；本地不可用或命中指定规则时，再使用备用池。"
+            description="默认先使用本地账号；本地不可用或命中指定规则时，再使用外部账号。"
           >
             <div className="grid gap-4 lg:grid-cols-2">
-              <FormSection title="本地优先" description="先调度本地账号，只有下面情况出现时才转入备用池。">
+              <FormSection title="本地优先" description="先调度本地账号，只有下面情况出现时才转入外部账号。">
                 <div className="grid gap-3 sm:grid-cols-2">
                   <ToggleRow disabled={!externalEnabled} label="本地容量预检" checked={configDraft.localPoolPreflightEnabled} onChange={(localPoolPreflightEnabled) => setConfigDraft((prev) => ({ ...prev, localPoolPreflightEnabled }))} />
-                  <ToggleRow disabled={!externalEnabled} label="容量不足时使用备用" checked={configDraft.fallbackOnLocalCapacityExhausted} onChange={(fallbackOnLocalCapacityExhausted) => setConfigDraft((prev) => ({ ...prev, fallbackOnLocalCapacityExhausted }))} />
-                  <ToggleRow disabled={!externalEnabled} label="没有可用账号时使用备用" checked={configDraft.fallbackOnNoAvailableCredentials} onChange={(fallbackOnNoAvailableCredentials) => setConfigDraft((prev) => ({ ...prev, fallbackOnNoAvailableCredentials }))} />
-                  <ToggleRow disabled={!externalEnabled} label="本地临时错误过多时使用备用" checked={configDraft.fallbackOnLocalTransientExhausted} onChange={(fallbackOnLocalTransientExhausted) => setConfigDraft((prev) => ({ ...prev, fallbackOnLocalTransientExhausted }))} />
-                  <ToggleRow disabled={!externalEnabled} label="模型不支持时使用备用" checked={configDraft.fallbackOnUnsupportedModel} onChange={(fallbackOnUnsupportedModel) => setConfigDraft((prev) => ({ ...prev, fallbackOnUnsupportedModel }))} />
+                  <ToggleRow disabled={!externalEnabled} label="容量不足时使用外部账号" checked={configDraft.fallbackOnLocalCapacityExhausted} onChange={(fallbackOnLocalCapacityExhausted) => setConfigDraft((prev) => ({ ...prev, fallbackOnLocalCapacityExhausted }))} />
+                  <ToggleRow disabled={!externalEnabled} label="没有可用账号时使用外部账号" checked={configDraft.fallbackOnNoAvailableCredentials} onChange={(fallbackOnNoAvailableCredentials) => setConfigDraft((prev) => ({ ...prev, fallbackOnNoAvailableCredentials }))} />
+                  <ToggleRow disabled={!externalEnabled} label="本地临时错误过多时使用外部账号" checked={configDraft.fallbackOnLocalTransientExhausted} onChange={(fallbackOnLocalTransientExhausted) => setConfigDraft((prev) => ({ ...prev, fallbackOnLocalTransientExhausted }))} />
+                  <ToggleRow disabled={!externalEnabled} label="模型不支持时使用外部账号" checked={configDraft.fallbackOnUnsupportedModel} onChange={(fallbackOnUnsupportedModel) => setConfigDraft((prev) => ({ ...prev, fallbackOnUnsupportedModel }))} />
                 </div>
               </FormSection>
 
-              <FormSection title="规则直达备用池" description="命中规则后跳过本地账号，直接进入备用池。">
+              <FormSection title="规则直达外部账号" description="命中规则后跳过本地账号，直接进入外部账号。">
                 <div className="grid gap-3 sm:grid-cols-2">
                   <ToggleRow disabled={!externalEnabled} label="启用规则直达" checked={configDraft.externalDirectPolicyEnabled} onChange={(externalDirectPolicyEnabled) => setConfigDraft((prev) => ({ ...prev, externalDirectPolicyEnabled }))} />
-                  <ToggleRow disabled={!directPolicyActive} label="本地保护暂停时直达备用" checked={configDraft.directExternalOnLocalMaintenance} onChange={(directExternalOnLocalMaintenance) => setConfigDraft((prev) => ({ ...prev, directExternalOnLocalMaintenance }))} />
+                  <ToggleRow disabled={!directPolicyActive} label="本地保护暂停时直达外部账号" checked={configDraft.directExternalOnLocalMaintenance} onChange={(directExternalOnLocalMaintenance) => setConfigDraft((prev) => ({ ...prev, directExternalOnLocalMaintenance }))} />
                 </div>
                 <div className="mt-3 grid gap-3 sm:grid-cols-2">
                   <TextAreaBox disabled={!directPolicyActive} label="直达模型规则" value={modelRulesText} onChange={setModelRulesText} />
@@ -432,7 +432,7 @@ export function ExternalPoolsPanel() {
                   <ToggleRow disabled={!directPolicyActive} label="启用本地保护暂停" checked={configDraft.localPoolCircuitEnabled} onChange={(localPoolCircuitEnabled) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitEnabled }))} />
                   <NumberBox disabled={!directPolicyActive || !configDraft.localPoolCircuitEnabled} label="统计窗口" suffix="秒" value={configDraft.localPoolCircuitWindowSecs} min={1} onChange={(localPoolCircuitWindowSecs) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitWindowSecs }))} />
                   <NumberBox disabled={!directPolicyActive || !configDraft.localPoolCircuitEnabled} label="失败阈值" suffix="次" value={configDraft.localPoolCircuitOpenAfterFailures} min={1} onChange={(localPoolCircuitOpenAfterFailures) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitOpenAfterFailures }))} />
-                  <NumberBox disabled={!directPolicyActive || !configDraft.localPoolCircuitEnabled} label="涉及凭证" suffix="个" value={configDraft.localPoolCircuitRequireDistinctCredentials} min={1} onChange={(localPoolCircuitRequireDistinctCredentials) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitRequireDistinctCredentials }))} />
+                  <NumberBox disabled={!directPolicyActive || !configDraft.localPoolCircuitEnabled} label="涉及账号" suffix="个" value={configDraft.localPoolCircuitRequireDistinctCredentials} min={1} onChange={(localPoolCircuitRequireDistinctCredentials) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitRequireDistinctCredentials }))} />
                   <NumberBox disabled={!directPolicyActive || !configDraft.localPoolCircuitEnabled} label="暂停时长" suffix="秒" value={configDraft.localPoolCircuitOpenSecs} min={1} onChange={(localPoolCircuitOpenSecs) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitOpenSecs }))} />
                 </div>
               </FormSection>
@@ -440,12 +440,12 @@ export function ExternalPoolsPanel() {
           </PolicyBlock>
 
           <PolicyBlock
-            title="3. 进入备用池后怎么调度"
+            title="3. 进入外部账号后怎么调度"
             active={externalEnabled}
-            description="控制备用池自己的并发、排队、重试和超时。单个备用池还可以单独设置并发。"
+            description="控制外部账号自己的并发、排队、重试和超时。单个外部账号还可以单独设置并发。"
           >
             <div className="space-y-4">
-              <FormSection title="容量与排队" description={waitModeActive ? '备用池满并发时会等待容量；从本地转入备用池的请求，等待失败后可再尝试回到本地。' : '备用池满并发时不会排队；从本地转入备用池的请求，可按回本地策略再尝试本地。'}>
+              <FormSection title="容量与排队" description={waitModeActive ? '外部账号满并发时会等待容量；从本地转入外部账号的请求，等待失败后可再尝试回到本地。' : '外部账号满并发时不会排队；从本地转入外部账号的请求，可按回本地策略再尝试本地。'}>
                 <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
                   <SelectBox disabled={!externalEnabled} label="满并发处理" value={configDraft.externalPoolCapacityMode} onChange={(externalPoolCapacityMode) => setConfigDraft((prev) => ({ ...prev, externalPoolCapacityMode: externalPoolCapacityMode as ExternalPoolsConfig['externalPoolCapacityMode'] }))}>
                     <Select.Option value="fail_fast">立即失败</Select.Option>
@@ -458,7 +458,7 @@ export function ExternalPoolsPanel() {
                 </div>
               </FormSection>
 
-              <FormSection title="冷却与超时" description="冷却用于临时避开出错备用池；流式空闲超时用于防止长时间无输出。">
+              <FormSection title="冷却与超时" description="冷却用于临时避开出错外部账号；流式空闲超时用于防止长时间无输出。">
                 <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
                   <NumberBox disabled={!externalEnabled} label="429 冷却" suffix="秒" value={configDraft.externalPoolRateLimitCooldownSecs} min={1} onChange={(externalPoolRateLimitCooldownSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolRateLimitCooldownSecs }))} />
                   <NumberBox disabled={!externalEnabled} label="5xx 冷却" suffix="秒" value={configDraft.externalPoolServerErrorCooldownSecs} min={1} onChange={(externalPoolServerErrorCooldownSecs) => setConfigDraft((prev) => ({ ...prev, externalPoolServerErrorCooldownSecs }))} />
@@ -470,7 +470,7 @@ export function ExternalPoolsPanel() {
                 </div>
               </FormSection>
 
-              <FormSection title="备用池失败后回本地" description="仅对先从本地转入备用池的请求生效。命中后只回本地尝试一次，并禁止再次进入备用池。">
+              <FormSection title="外部账号失败后回本地" description="仅对先从本地转入外部账号的请求生效。命中后只回本地尝试一次，并禁止再次进入外部账号。">
                 <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
                   <ToggleRow disabled={!externalEnabled} label="启用回本地" checked={configDraft.externalPoolLocalRescueEnabled} onChange={(externalPoolLocalRescueEnabled) => setConfigDraft((prev) => ({ ...prev, externalPoolLocalRescueEnabled }))} />
                   <ToggleRow disabled={!localRescueActive} label="429 时回本地" checked={configDraft.externalPoolLocalRescueOnRateLimit} onChange={(externalPoolLocalRescueOnRateLimit) => setConfigDraft((prev) => ({ ...prev, externalPoolLocalRescueOnRateLimit }))} />
@@ -483,9 +483,9 @@ export function ExternalPoolsPanel() {
           </PolicyBlock>
 
           <PolicyBlock
-            title="4. 备用池异常后怎么处理"
+            title="4. 外部账号异常后怎么处理"
             active={autoDisableActive}
-            description="自动禁用只作用于备用池本身；单个备用池可选择继承、强制启用或关闭。"
+            description="自动禁用只作用于外部账号本身；单个外部账号可选择继承、强制启用或关闭。"
           >
             <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
               <ToggleRow disabled={!externalEnabled} label="启用自动禁用" checked={configDraft.externalPoolAutoDisableEnabled} onChange={(externalPoolAutoDisableEnabled) => setConfigDraft((prev) => ({ ...prev, externalPoolAutoDisableEnabled }))} />
@@ -503,11 +503,11 @@ export function ExternalPoolsPanel() {
           <PolicyBlock
             title="5. 返回给客户端的用量"
             active={externalEnabled && usageCompensationActive}
-            description="只影响选择“按入口规则展示”的备用池。本地凭据和“保持原样”的备用池不会受影响。"
+            description="只影响选择“按入口规则展示”的外部账号。本地账号和“保持原样”的外部账号不会受影响。"
           >
             <div className="space-y-4">
               <HintBox>
-                生效条件：请求进入备用池，并且该备用池的用量模式为“按入口规则展示”。如果备用池选择“保持原样”，下面配置不会改动用量展示。
+                生效条件：请求进入外部账号，并且该外部账号的用量模式为“按入口规则展示”。如果外部账号选择“保持原样”，下面配置不会改动用量展示。
               </HintBox>
               <div className="grid gap-4 lg:grid-cols-2">
                 <FormSection title="缓存读写补偿" description="按入口规则展示时，对缓存读写用量做补偿。">
@@ -532,12 +532,12 @@ export function ExternalPoolsPanel() {
 
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h2 className="text-lg font-semibold">备用池列表</h2>
-          <p className="text-sm text-base-content/60">单池配置只影响对应备用池；全局调度、冷却、补偿策略在上方统一保存。</p>
+          <h2 className="text-lg font-semibold">外部账号列表</h2>
+          <p className="text-sm text-base-content/60">单个外部账号配置只影响自身；全局调度、冷却、补偿策略在上方统一保存。</p>
         </div>
         <Button color="primary" onClick={() => { setCreateForm(defaultPoolForm()); setCreateOpen(true) }}>
           <Plus className="h-4 w-4" />
-          添加备用池
+          添加外部账号
         </Button>
       </div>
 
@@ -568,12 +568,12 @@ export function ExternalPoolsPanel() {
                     color="error"
                     onClick={async () => {
                       const confirmed = await confirmDialog({
-                        title: '删除备用池',
-                        message: `删除备用池 ${pool.name}？`,
+                        title: '删除外部账号',
+                        message: `删除外部账号 ${pool.name}？`,
                         confirmText: '删除',
                         tone: 'danger',
                       })
-                      if (confirmed) mutatePool(() => deleteExternalPool(pool.id), '备用池已删除')
+                      if (confirmed) mutatePool(() => deleteExternalPool(pool.id), '外部账号已删除')
                     }}
                   >
                     <Trash2 className="h-4 w-4" />删除
@@ -583,7 +583,7 @@ export function ExternalPoolsPanel() {
             </SectionCard>
           )
         })}
-        {!pools.isLoading && !pools.data?.pools.length && <EmptyState text="暂无备用池" />}
+        {!pools.isLoading && !pools.data?.pools.length && <EmptyState text="暂无外部账号" />}
       </div>
       <ExternalPoolFormModal
         mode="create"
@@ -642,9 +642,9 @@ function ExternalPoolFormModal({
   onSubmit: () => void
 }) {
   const isEdit = mode === 'edit'
-  const title = isEdit ? `编辑备用池${pool ? ` #${pool.id}` : ''}` : '添加备用池'
+  const title = isEdit ? `编辑外部账号${pool ? ` #${pool.id}` : ''}` : '添加外部账号'
   const keyLabel = isEdit ? '新请求 Key' : '请求 Key'
-  const keyDescription = isEdit ? `留空表示不修改当前 Key。当前：${pool?.maskedApiKey || '未显示 Key'}` : '备用池的请求密钥，保存后只显示脱敏值。'
+  const keyDescription = isEdit ? `留空表示不修改当前 Key。当前：${pool?.maskedApiKey || '未显示 Key'}` : '外部账号的请求密钥，保存后只显示脱敏值。'
   const [quickImportText, setQuickImportText] = useState('')
   const mappingPresets = useMemo(() => modelMappingPresetsForMode(draft.modelMappingMode), [draft.modelMappingMode])
   useEffect(() => {
@@ -697,13 +697,13 @@ function ExternalPoolFormModal({
           </Button>
           <Button type="button" size="sm" color="primary" onClick={onSubmit} disabled={saving}>
             {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : isEdit ? <Save className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
-            {isEdit ? '保存备用池' : '添加备用池'}
+            {isEdit ? '保存外部账号' : '添加外部账号'}
           </Button>
         </>
       }
     >
       <div className="space-y-4">
-        <FormSection title="连接信息" description="系统会使用这里的服务地址和 Key 连接备用资源。">
+        <FormSection title="连接信息" description="系统会使用这里的服务地址和 Key 连接外部账号。">
           <div className="grid gap-3 md:grid-cols-2">
             <TextBox label="名称" value={draft.name} disabled={saving} onChange={(name) => onDraftChange((prev) => ({ ...prev, name }))} />
             <SelectBox label="认证方式" value={draft.authType} disabled={saving} onChange={(authType) => onDraftChange((prev) => ({ ...prev, authType: authType as ExternalPoolFormDraft['authType'] }))}>
@@ -716,19 +716,19 @@ function ExternalPoolFormModal({
         </FormSection>
 
         <div className="grid gap-4 lg:grid-cols-2">
-          <FormSection title="调度设置" description="这些设置只影响当前备用池，不改变全局排队和冷却策略。">
+          <FormSection title="调度设置" description="这些设置只影响当前外部账号，不改变全局排队和冷却策略。">
             <div className="grid gap-3 sm:grid-cols-2">
-              <NumberBox label="单池最大并发" description="当前备用池同时处理的最大请求数。" suffix="并发" value={draft.maxConcurrentRequests} min={1} disabled={saving} onChange={(maxConcurrentRequests) => onDraftChange((prev) => ({ ...prev, maxConcurrentRequests }))} />
+              <NumberBox label="单账号最大并发" description="当前外部账号同时处理的最大请求数。" suffix="并发" value={draft.maxConcurrentRequests} min={1} disabled={saving} onChange={(maxConcurrentRequests) => onDraftChange((prev) => ({ ...prev, maxConcurrentRequests }))} />
               <NumberBox label="优先级" description="数字越小越靠前；同优先级再按容量和状态分配。" suffix="值" value={draft.priority} disabled={saving} onChange={(priority) => onDraftChange((prev) => ({ ...prev, priority }))} />
-              <ToggleRow label={isEdit ? '启用备用池' : '创建后立即启用'} checked={Boolean(draft.enabled)} disabled={saving} onChange={(enabled) => onDraftChange((prev) => ({ ...prev, enabled }))} />
+              <ToggleRow label={isEdit ? '启用外部账号' : '创建后立即启用'} checked={Boolean(draft.enabled)} disabled={saving} onChange={(enabled) => onDraftChange((prev) => ({ ...prev, enabled }))} />
               <ToggleRow label="未命中时点号转横杠" checked={Boolean(draft.normalizeModelVersionDots)} disabled={saving || draft.modelMappingMode === 'passthrough' || draft.modelMappingRequireMatch} onChange={(normalizeModelVersionDots) => onDraftChange((prev) => ({ ...prev, normalizeModelVersionDots }))} />
             </div>
           </FormSection>
 
-          <FormSection title="用量与成本" description="只控制当前备用池返回给客户端的用量展示方式。">
+          <FormSection title="用量与成本" description="只控制当前外部账号返回给客户端的用量展示方式。">
             <div className="space-y-3">
               <SelectBox label="用量展示模式" value={draft.usageProjectionMode} disabled={saving} onChange={(usageProjectionMode) => onDraftChange((prev) => ({ ...prev, usageProjectionMode: usageProjectionMode as ExternalPoolFormDraft['usageProjectionMode'] }))}>
-                <Select.Option value="pass_through">保持原样：不改备用资源用量</Select.Option>
+                <Select.Option value="pass_through">保持原样：不改外部账号用量</Select.Option>
                 <Select.Option value="current_path_policy">按入口规则展示：应用全局补偿</Select.Option>
               </SelectBox>
               <HintBox>{usageProjectionDescription(draft.usageProjectionMode)}</HintBox>
@@ -736,7 +736,7 @@ function ExternalPoolFormModal({
           </FormSection>
         </div>
 
-        <FormSection title="模型处理" description="控制当前备用池发出请求时的模型名称处理方式。">
+        <FormSection title="模型处理" description="控制当前外部账号发出请求时的模型名称处理方式。">
           <div className="grid gap-3 md:grid-cols-[240px_1fr]">
             <div className="space-y-3">
               <SelectBox label="映射模式" value={draft.modelMappingMode} disabled={saving} onChange={(modelMappingMode) => onDraftChange((prev) => ({ ...prev, modelMappingMode: modelMappingMode as ExternalPoolFormDraft['modelMappingMode'] }))}>
@@ -774,7 +774,7 @@ function ExternalPoolFormModal({
           </div>
         </FormSection>
 
-        <FormSection title="错误处理和备注" description="自动禁用策略只决定当前备用池是否继承全局自动禁用规则。">
+        <FormSection title="错误处理和备注" description="自动禁用策略只决定当前外部账号是否继承全局自动禁用规则。">
           <div className="grid gap-3 md:grid-cols-2">
             <SelectBox label="自动禁用策略" value={draft.autoDisablePolicy} disabled={saving} onChange={(autoDisablePolicy) => onDraftChange((prev) => ({ ...prev, autoDisablePolicy: autoDisablePolicy as ExternalPoolFormDraft['autoDisablePolicy'] }))}>
               <Select.Option value="inherit">继承全局自动禁用</Select.Option>
@@ -860,9 +860,9 @@ function ExternalPoolTestModal({
       })
       setResult(response)
       if (response.ok) {
-        toast.success(response.message || '备用池模型调用测试通过')
+        toast.success(response.message || '外部账号模型调用测试通过')
       } else {
-        toast.error(response.message || '备用池模型调用测试失败')
+        toast.error(response.message || '外部账号模型调用测试失败')
       }
       onDone()
     } catch (err) {
@@ -875,7 +875,7 @@ function ExternalPoolTestModal({
   return (
     <ModalShell
       open={open}
-      title="测试备用池"
+      title="测试外部账号"
       width="max-w-3xl"
       onClose={onClose}
       footer={
@@ -920,7 +920,7 @@ function ExternalPoolTestModal({
 
           <div className="rounded-box border border-base-300 bg-base-200 p-4 font-mono text-sm text-base-content">
             <div className="space-y-1">
-              <div><span className="text-info">备用池：</span><span> #{pool.id} {pool.name}</span></div>
+              <div><span className="text-info">外部账号：</span><span> #{pool.id} {pool.name}</span></div>
               <div><span className="text-info">使用模型：</span><span> {model}</span></div>
               <div><span className="text-base-content/55">发送测试消息：</span><span> "{prompt.trim() || DEFAULT_TEST_PROMPT}"</span></div>
             </div>
@@ -928,7 +928,7 @@ function ExternalPoolTestModal({
               {running && (
                 <div className="flex items-center gap-2 text-info">
                   <Loader2 className="h-4 w-4 animate-spin" />
-                  正在等待备用池模型响应...
+                  正在等待外部账号模型响应...
                 </div>
               )}
               {result && (
@@ -1202,9 +1202,9 @@ function poolModelMappingSummary(pool: ExternalPool) {
 
 function usageProjectionDescription(mode: ExternalPool['usageProjectionMode'] | undefined) {
   if (mode === 'current_path_policy') {
-    return '按当前入口规则整理用量，并应用全局用量补偿。适合希望备用资源展示方式和本地入口一致的场景。'
+    return '按当前入口规则整理用量，并应用全局用量补偿。适合希望外部账号展示方式和本地入口一致的场景。'
   }
-  return '保持备用资源返回的用量，不应用缓存补偿和输出补偿。适合只做备用连接的场景。'
+  return '保持外部账号返回的用量，不应用缓存补偿和输出补偿。适合只做外部连接的场景。'
 }
 
 function poolUsageSummary(pool: ExternalPool, config: ExternalPoolsConfig) {

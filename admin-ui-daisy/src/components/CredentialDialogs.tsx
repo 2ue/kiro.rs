@@ -170,7 +170,7 @@ async function verifyImportedCredential(
   try {
     await getCredentialBalance(credentialId)
   } catch (error) {
-    toast.warning(`凭据 #${credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
+    toast.warning(`账号 #${credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
   }
   return {
     model: testModelLabel(tested.model),
@@ -189,7 +189,7 @@ function ImportVerificationModeSelect({
 }) {
   return (
     <div className="rounded-lg border border-base-300 bg-base-200/40 p-3">
-      <FieldLabel title="验活方式" description="只查询订阅时不会发送模型测试请求；订阅查询失败的凭据仍会按验活失败回滚。">
+      <FieldLabel title="验活方式" description="只查询订阅时不会发送模型测试请求；订阅查询失败的账号仍会按验活失败回滚。">
         <Select bordered size="sm" value={value} disabled={disabled} onChange={(event) => onChange(event.target.value as ImportVerificationMode)}>
           <Select.Option value="model_and_subscription">测试模型 + 查询订阅</Select.Option>
           <Select.Option value="subscription_only">只查询订阅（不请求模型）</Select.Option>
@@ -275,14 +275,14 @@ function CredentialParameterDefaultsPanel({
       <div className="mb-3 flex items-start justify-between gap-3">
         <div>
           <div className="text-sm font-semibold">{title}</div>
-          <div className="mt-1 text-xs text-base-content/55">只填充每条凭据里缺失的字段；导入 JSON 中已有的字段会保留。</div>
+          <div className="mt-1 text-xs text-base-content/55">只填充每条账号里缺失的字段；导入 JSON 中已有的字段会保留。</div>
         </div>
         <Button type="button" color="ghost" size="xs" disabled={disabled} onClick={() => onChange(initialParameterDefaults())}>
           清空
         </Button>
       </div>
       <div className="form-grid">
-        <FieldLabel title="默认优先级" description="留空时使用凭据自身值或 0">
+        <FieldLabel title="默认优先级" description="留空时使用账号自身值或 0">
           <Input bordered size="sm" type="number" min={0} value={defaults.priority} disabled={disabled} onChange={(event) => update('priority', event.target.value)} />
         </FieldLabel>
         <FieldLabel title="默认账号并发" description="留空继承全局，0 表示不限">
@@ -394,11 +394,11 @@ export function AddCredentialModal({
     if (!files.length) return
     const result = await parseCredentialImportFiles(files)
     if (!result.credentials[0]) {
-      toast.error(result.errors[0] || '文件中没有有效凭据')
+      toast.error(result.errors[0] || '文件中没有有效账号')
       return
     }
     setForm(formFromCredential(result.credentials[0]))
-    toast.success(`已填充第一条凭据${result.credentials.length > 1 ? `，另有 ${result.credentials.length - 1} 条可批量导入` : ''}`)
+    toast.success(`已填充第一条账号${result.credentials.length > 1 ? `，另有 ${result.credentials.length - 1} 条可批量导入` : ''}`)
     if (result.errors.length) toast.warning(`部分文件未读取: ${result.errors.slice(0, 3).join('；')}`)
   }
 
@@ -450,7 +450,7 @@ export function AddCredentialModal({
   }
 
   return (
-    <ModalShell open={open} title="添加凭据" width="max-w-3xl" onClose={onClose}>
+    <ModalShell open={open} title="添加账号" width="max-w-3xl" onClose={onClose}>
       <form className="space-y-4" onSubmit={submit}>
         <div className="flex justify-end">
           <Button tag="label" variant="outline" size="sm">
@@ -557,7 +557,7 @@ export function AddCredentialModal({
 }
 
 function credentialName(credential: CredentialStatusItem) {
-  return credential.email || credential.maskedApiKey || `凭据 #${credential.id}`
+  return credential.email || credential.maskedApiKey || `账号 #${credential.id}`
 }
 
 export function CredentialTestModal({
@@ -593,7 +593,7 @@ export function CredentialTestModal({
       {
         onSuccess: (response) => {
           setResult(response)
-          toast.success(`凭据 #${response.credentialId} 测试完成`)
+          toast.success(`账号 #${response.credentialId} 测试完成`)
         },
         onError: (err) => setError(extractErrorMessage(err)),
       }
@@ -700,7 +700,7 @@ function statusText(result: VerificationResult) {
   if (result.status === 'checking') return '检查重复...'
   if (result.status === 'verifying') return '验活中...'
   if (result.status === 'verified') return '验活成功'
-  if (result.status === 'duplicate') return '重复凭据'
+  if (result.status === 'duplicate') return '重复账号'
   if (result.status === 'skipped') return '已跳过'
   if (result.rollbackStatus === 'success') return '验活失败（已排除）'
   if (result.rollbackStatus === 'failed') return '验活失败（未排除）'
@@ -731,7 +731,7 @@ function ImportResults({ results, current, total, currentProcessing, importing }
             {statusIcon(result.status)}
             <div className="min-w-0 flex-1">
               <div className="flex flex-wrap items-center gap-2">
-                <span className="font-medium">{result.email || `凭据 #${result.index}`}</span>
+                <span className="font-medium">{result.email || `账号 #${result.index}`}</span>
                 <span className="text-xs text-base-content/60">{statusText(result)}</span>
                 {result.credentialId && <Badge>#{result.credentialId}</Badge>}
               </div>
@@ -796,10 +796,10 @@ export function BatchImportModal({
     const result = await parseCredentialImportFiles(files)
     if (result.credentials.length) {
       appendCredentials(result.credentials)
-      toast.success(`已从 ${files.length} 个文件读取 ${result.credentials.length} 条凭据`)
+      toast.success(`已从 ${files.length} 个文件读取 ${result.credentials.length} 条账号`)
     }
     if (result.errors.length) toast.warning(`部分文件未读取: ${result.errors.slice(0, 3).join('；')}`)
-    if (!result.credentials.length && !result.errors.length) toast.error('没有读取到有效凭据')
+    if (!result.credentials.length && !result.errors.length) toast.error('没有读取到有效账号')
   }
 
   const run = async (retryCredentials?: AddCredentialRequest[]) => {
@@ -814,7 +814,7 @@ export function BatchImportModal({
         return
       }
     }
-    if (!credentials.length) return toast.error('没有可导入的凭据')
+    if (!credentials.length) return toast.error('没有可导入的账号')
     try {
       credentials = credentials.map((credential) => mergeCredentialDefaults(credential, defaults))
     } catch (error) {
@@ -835,7 +835,7 @@ export function BatchImportModal({
     for (let index = 0; index < credentials.length; index += 1) {
       const cred = credentials[index]
       const isApiKeyCred = Boolean(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
-      setCurrentProcessing(`正在处理凭据 ${index + 1}/${credentials.length}`)
+      setCurrentProcessing(`正在处理账号 ${index + 1}/${credentials.length}`)
       setResults((prev) => prev.map((item, i) => (i === index ? { ...item, status: 'checking' } : item)))
       let hash = ''
       if (isApiKeyCred) {
@@ -849,7 +849,7 @@ export function BatchImportModal({
         hash = await sha256Hex(apiKey)
         if (existingApiKeyHashes.has(hash)) {
           duplicateCount += 1
-          setResults((prev) => prev.map((item, i) => (i === index ? { ...item, status: 'duplicate', error: '该凭据已存在' } : item)))
+          setResults((prev) => prev.map((item, i) => (i === index ? { ...item, status: 'duplicate', error: '该账号已存在' } : item)))
           setProgress({ current: index + 1, total: credentials.length })
           continue
         }
@@ -864,7 +864,7 @@ export function BatchImportModal({
         hash = await sha256Hex(token)
         if (existingOauthHashes.has(hash)) {
           duplicateCount += 1
-          setResults((prev) => prev.map((item, i) => (i === index ? { ...item, status: 'duplicate', error: '该凭据已存在' } : item)))
+          setResults((prev) => prev.map((item, i) => (i === index ? { ...item, status: 'duplicate', error: '该账号已存在' } : item)))
           setProgress({ current: index + 1, total: credentials.length })
           continue
         }
@@ -931,7 +931,7 @@ export function BatchImportModal({
 
     setImporting(false)
     onDone()
-    if (failCount === 0 && duplicateCount === 0) toast.success(`成功导入并验活 ${successCount} 个凭据`)
+    if (failCount === 0 && duplicateCount === 0) toast.success(`成功导入并验活 ${successCount} 个账号`)
     else toast.info(`验活完成：成功 ${successCount} 个，重复 ${duplicateCount} 个，失败 ${failCount} 个`)
   }
 
@@ -943,14 +943,14 @@ export function BatchImportModal({
 
   const retryFailed = async () => {
     if (!failedCredentials.length) {
-      toast.error('没有可重试的失败凭据')
+      toast.error('没有可重试的失败账号')
       return
     }
     await run(failedCredentials)
   }
 
   return (
-    <ModalShell open={open} title="批量导入凭据（自动验活）" width="max-w-4xl" onClose={() => { if (!importing) { reset(); onClose() } }}>
+    <ModalShell open={open} title="批量导入账号（自动验活）" width="max-w-4xl" onClose={() => { if (!importing) { reset(); onClose() } }}>
       <div className="space-y-4">
         <div className="flex justify-end">
           <Button tag="label" variant="outline" size="sm">
@@ -978,7 +978,7 @@ export function BatchImportModal({
           value={jsonInput}
           onChange={(event) => setJsonInput(event.target.value)}
           disabled={importing}
-          placeholder={'粘贴 JSON / JSONL 格式凭据，或选择一个/多个文件。每个文件可以是单个对象、数组、JSONL 多行，或导出的 credentials/accounts 容器。'}
+          placeholder={'粘贴 JSON / JSONL 格式账号，或选择一个/多个文件。每个文件可以是单个对象、数组、JSONL 多行，或导出的 credentials/accounts 容器。'}
         />
         <ImportResults results={results} current={progress.current} total={progress.total} currentProcessing={currentProcessing} importing={importing} />
         <Modal.Actions>
@@ -1110,7 +1110,7 @@ export function KamImportModal({
       setResults((prev) => prev.map((item, i) => (i === index ? { ...item, status: 'checking' } : item)))
       if (existingTokenHashes.has(tokenHash)) {
         duplicateCount += 1
-        setResults((prev) => prev.map((item, i) => (i === index ? { ...item, status: 'duplicate', error: '该凭据已存在' } : item)))
+        setResults((prev) => prev.map((item, i) => (i === index ? { ...item, status: 'duplicate', error: '该账号已存在' } : item)))
         setProgress({ current: index + 1, total: accounts.length })
         continue
       }
@@ -1339,7 +1339,7 @@ export function BatchEditCredentialsModal({
   }, [open])
 
   const submit = () => {
-    if (!ids.length) return toast.error('请先选择要修改的凭据')
+    if (!ids.length) return toast.error('请先选择要修改的账号')
     if (!updateRegions && !updateConcurrency && !updateProxy) return toast.error('请选择至少一组要修改的参数')
 
     const request: BatchUpdateCredentialsRequest = { ids }
@@ -1377,7 +1377,7 @@ export function BatchEditCredentialsModal({
 
     batchUpdate.mutate(request, {
       onSuccess: (response) => {
-        if (response.failed === 0) toast.success(`成功修改 ${response.success}/${response.total} 个凭据`)
+        if (response.failed === 0) toast.success(`成功修改 ${response.success}/${response.total} 个账号`)
         else toast.warning(`批量修改完成：成功 ${response.success} 个，失败 ${response.failed} 个`)
         onDone()
         onClose()
@@ -1387,7 +1387,7 @@ export function BatchEditCredentialsModal({
   }
 
   return (
-    <ModalShell open={open} title={`批量修改 ${ids.length} 个凭据`} width="max-w-3xl" onClose={() => { if (!batchUpdate.isPending) onClose() }}>
+    <ModalShell open={open} title={`批量修改 ${ids.length} 个账号`} width="max-w-3xl" onClose={() => { if (!batchUpdate.isPending) onClose() }}>
       <div className="space-y-4">
         <div className={`rounded-lg border p-3 ${updateRegions ? 'border-primary/40 bg-primary/5' : 'border-base-300 bg-base-200/40'}`}>
           <Form.Label className="mb-3 flex w-fit cursor-pointer items-center gap-2">
@@ -1441,7 +1441,7 @@ export function BatchEditCredentialsModal({
             <span className="text-sm font-semibold">修改代理</span>
           </Form.Label>
           <div className="form-grid">
-            <FieldLabel title="代理资源" description="选择资源会清空凭据直连代理；不选且 URL 为空会清空凭据级代理">
+            <FieldLabel title="代理资源" description="选择资源会清空账号直连代理；不选且 URL 为空会清空账号级代理">
               <Select bordered size="sm" value={proxyResourceId} disabled={!updateProxy || batchUpdate.isPending} onChange={(event) => setProxyResourceDraft(event.target.value)}>
                 <Select.Option value="">不绑定</Select.Option>
                 {proxyResourceOptions.map((resource) => (
@@ -1531,7 +1531,7 @@ export function BatchVerifyModal({
           {items.map((item) => (
             <div key={item.id} className="border-b border-base-300 p-3 last:border-0">
               <div className="flex justify-between gap-3">
-                <div className="font-medium">凭据 #{item.id}</div>
+                <div className="font-medium">账号 #{item.id}</div>
                 <Badge tone={item.status === 'success' ? 'success' : item.status === 'failed' ? 'error' : item.status === 'verifying' ? 'info' : 'neutral'}>
                   {item.status === 'success' ? '成功' : item.status === 'failed' ? '失败' : item.status === 'verifying' ? '验活中' : '等待'}
                 </Badge>
@@ -1559,9 +1559,9 @@ export function BatchVerifyModal({
 }
 
 const exportFormats: Array<{ value: CredentialExportFormat; label: string; description: string }> = [
-  { value: 'json', label: 'JSON 数组', description: '导出为可直接批量导入的凭据数组。' },
+  { value: 'json', label: 'JSON 数组', description: '导出为可直接批量导入的账号数组。' },
   { value: 'backup-json', label: '备份 JSON', description: '带导出时间和格式标识，适合归档。' },
-  { value: 'jsonl', label: 'JSONL', description: '每行一个凭据，便于脚本处理。' },
+  { value: 'jsonl', label: 'JSONL', description: '每行一个账号，便于脚本处理。' },
 ]
 
 function exportFilename(format: CredentialExportFormat): string {
@@ -1589,7 +1589,7 @@ export function CredentialExportModal({ open, onClose }: { open: boolean; onClos
     try {
       const blob = await exportCredentials(format)
       downloadBlob(blob, exportFilename(format))
-      toast.success('凭据已导出')
+      toast.success('账号已导出')
       onClose()
     } catch (error) {
       toast.error(`导出失败: ${extractErrorMessage(error)}`)
@@ -1599,7 +1599,7 @@ export function CredentialExportModal({ open, onClose }: { open: boolean; onClos
   }
 
   return (
-    <ModalShell open={open} title="导出凭据" width="max-w-xl" onClose={onClose}>
+    <ModalShell open={open} title="导出账号" width="max-w-xl" onClose={onClose}>
       <Alert status="warning" className="mb-3 py-2 text-sm">导出内容包含完整 refreshToken、kiroApiKey、代理等敏感字段。</Alert>
       <div className="space-y-2">
         {exportFormats.map((item) => (

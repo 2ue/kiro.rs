@@ -531,8 +531,8 @@ function ExternalPoolBillingPanel({
 
   return (
     <Panel
-      title="备用池计费拆分"
-      subtitle="展示备用资源的成本、计费金额和差额，便于判断备用资源是否划算"
+      title="外部账号计费拆分"
+      subtitle="展示外部账号的成本、计费金额和差额，便于判断外部账号是否划算"
       actions={
         <span className={`rounded border px-2 py-0.5 text-[0.68rem] font-semibold ${
           hasLoss
@@ -547,14 +547,14 @@ function ExternalPoolBillingPanel({
     >
       <div className="grid gap-3 p-3 md:grid-cols-2 xl:grid-cols-4">
         <div className="rounded-box border border-base-300/60 bg-base-200/40 p-3">
-          <div className="text-xs text-base-content/55">外部池请求</div>
+          <div className="text-xs text-base-content/55">外部账号请求</div>
           <div className="mt-1 text-lg font-semibold">{formatNumber(billing.requests)}</div>
           <div className="mt-1 text-xs text-base-content/50">可计价 {formatNumber(billing.pricedRequests)} / 未计价 {formatNumber(billing.unpricedRequests)}</div>
         </div>
         <div className="rounded-box border border-base-300/60 bg-base-200/40 p-3">
           <div className="text-xs text-base-content/55">原始成本</div>
           <div className="mt-1 text-lg font-semibold">{formatUsd(billing.rawCostUsd)}</div>
-          <div className="mt-1 text-xs text-base-content/50">按备用资源实际消耗估算</div>
+          <div className="mt-1 text-xs text-base-content/50">按外部账号实际消耗估算</div>
         </div>
         <div className="rounded-box border border-base-300/60 bg-base-200/40 p-3">
           <div className="text-xs text-base-content/55">展示计费</div>
@@ -579,19 +579,19 @@ function ExternalPoolBillingPanel({
       </div>
       <div className="border-t border-base-300/60 px-3 py-3">
         <div className="mb-2 flex items-center justify-between gap-2">
-          <div className="text-xs font-semibold text-base-content/70">分号池成本与盈亏</div>
+          <div className="text-xs font-semibold text-base-content/70">外部账号成本与盈亏</div>
           <div className="text-[0.65rem] text-base-content/45">按当前时间窗口聚合</div>
         </div>
         {visiblePools.length === 0 ? (
           <div className="rounded-box border border-dashed border-base-300 p-3 text-sm text-base-content/45">
-            当前窗口没有备用池计费样本。
+            当前窗口没有外部账号计费样本。
           </div>
         ) : (
           <div className="overflow-x-auto">
             <table className="table table-xs">
               <thead>
                 <tr>
-                  <th>号池</th>
+                  <th>外部账号</th>
                   <th className="text-right">请求</th>
                   <th className="text-right">原始成本</th>
                   <th className="text-right">展示计费</th>

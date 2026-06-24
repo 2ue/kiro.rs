@@ -318,13 +318,13 @@ export function CredentialsPanel() {
   const queryCredentialBalance = async (id: number) => {
     const result = await fetchBalanceForCredential(id)
     invalidate()
-    if (result.ok) toast.success(`凭据 #${id} 信息已更新`)
+    if (result.ok) toast.success(`账号 #${id} 信息已更新`)
     else toast.error(`查询信息失败: ${extractErrorMessage(result.error)}`)
   }
 
   const queryCurrentPageInfo = async (enabledOnly = false) => {
     const ids = currentCredentials.filter((item) => !enabledOnly || !item.disabled).map((item) => item.id)
-    if (!ids.length) return toast.error(enabledOnly ? '当前页没有启用凭据可查询' : '当前页没有可查询信息的凭据')
+    if (!ids.length) return toast.error(enabledOnly ? '当前页没有启用账号可查询' : '当前页没有可查询信息的账号')
     setQueryingInfo(true)
     setLoadingBalanceIds((prev) => {
       const next = new Set(prev)
@@ -400,7 +400,7 @@ export function CredentialsPanel() {
       const all = await getCredentials()
       const ids = all.credentials.map((item) => item.id)
       if (!ids.length) {
-        toast.error('没有可查询信息的凭据')
+        toast.error('没有可查询信息的账号')
         return
       }
       setLoadingBalanceIds(new Set(ids))
@@ -441,10 +441,10 @@ export function CredentialsPanel() {
 
   const batchDelete = async () => {
     const disabledIds = Array.from(selectedIds).filter((id) => currentCredentials.find((item) => item.id === id)?.disabled)
-    if (!disabledIds.length) return toast.error('选中的凭据中没有已禁用项')
+    if (!disabledIds.length) return toast.error('选中的账号中没有已禁用项')
     const confirmed = await confirmDialog({
-      title: '删除已禁用凭据',
-      message: `确定删除 ${disabledIds.length} 个已禁用凭据吗？此操作无法撤销。`,
+      title: '删除已禁用账号',
+      message: `确定删除 ${disabledIds.length} 个已禁用账号吗？此操作无法撤销。`,
       confirmText: '删除',
       tone: 'danger',
     })
@@ -460,13 +460,13 @@ export function CredentialsPanel() {
       }
     }
     setSelectedIds(new Set())
-    if (fail === 0) toast.success(`成功删除 ${success} 个已禁用凭据`)
-    else toast.warning(`删除已禁用凭据：成功 ${success} 个，失败 ${fail} 个`)
+    if (fail === 0) toast.success(`成功删除 ${success} 个已禁用账号`)
+    else toast.warning(`删除已禁用账号：成功 ${success} 个，失败 ${fail} 个`)
   }
 
   const batchResetFailure = async () => {
     const ids = Array.from(selectedIds).filter((id) => (currentCredentials.find((item) => item.id === id)?.failureCount || 0) > 0)
-    if (!ids.length) return toast.error('选中的凭据中没有失败的凭据')
+    if (!ids.length) return toast.error('选中的账号中没有失败的账号')
     let success = 0
     let fail = 0
     for (const id of ids) {
@@ -478,7 +478,7 @@ export function CredentialsPanel() {
       }
     }
     setSelectedIds(new Set())
-    if (fail === 0) toast.success(`成功恢复 ${success} 个凭据`)
+    if (fail === 0) toast.success(`成功恢复 ${success} 个账号`)
     else toast.warning(`成功 ${success} 个，失败 ${fail} 个`)
   }
 
@@ -487,7 +487,7 @@ export function CredentialsPanel() {
       const cred = currentCredentials.find((item) => item.id === id)
       return cred && cred.authMethod !== 'api_key'
     })
-    if (!ids.length) return toast.error('选中的凭据中没有可刷新 Token 的 OAuth 凭据')
+    if (!ids.length) return toast.error('选中的账号中没有可刷新 Token 的 OAuth 账号')
     setBatchRefreshing(true)
     let success = 0
     let fail = 0
@@ -502,15 +502,15 @@ export function CredentialsPanel() {
     setBatchRefreshing(false)
     setSelectedIds(new Set())
     invalidate()
-    if (fail === 0) toast.success(`成功刷新 ${success} 个凭据的 Token`)
+    if (fail === 0) toast.success(`成功刷新 ${success} 个账号的 Token`)
     else toast.warning(`刷新 Token：成功 ${success} 个，失败 ${fail} 个`)
   }
 
   const clearAllDisabled = async () => {
-    if (!disabledCredentialCount) return toast.error('没有可清除的已禁用凭据')
+    if (!disabledCredentialCount) return toast.error('没有可清除的已禁用账号')
     const confirmed = await confirmDialog({
-      title: '清除已禁用凭据',
-      message: `确定清除所有 ${disabledCredentialCount} 个已禁用凭据吗？此操作无法撤销。`,
+      title: '清除已禁用账号',
+      message: `确定清除所有 ${disabledCredentialCount} 个已禁用账号吗？此操作无法撤销。`,
       confirmText: '清除',
       tone: 'danger',
     })
@@ -518,16 +518,16 @@ export function CredentialsPanel() {
     try {
       const result = await deleteDisabledCredentials.mutateAsync()
       setSelectedIds(new Set())
-      if (result.failed === 0) toast.success(`成功清除所有 ${result.success} 个已禁用凭据`)
-      else toast.warning(`清除已禁用凭据：成功 ${result.success} 个，失败 ${result.failed} 个`)
+      if (result.failed === 0) toast.success(`成功清除所有 ${result.success} 个已禁用账号`)
+      else toast.warning(`清除已禁用账号：成功 ${result.success} 个，失败 ${result.failed} 个`)
     } catch (error) {
-      toast.error(`清除已禁用凭据失败: ${extractErrorMessage(error)}`)
+      toast.error(`清除已禁用账号失败: ${extractErrorMessage(error)}`)
     }
   }
 
   const batchVerify = async () => {
     const ids = Array.from(selectedIds)
-    if (!ids.length) return toast.error('请先选择要验活的凭据')
+    if (!ids.length) return toast.error('请先选择要验活的账号')
     setVerifying(true)
     cancelVerifyRef.current = false
     setVerifyOpen(true)
@@ -560,7 +560,7 @@ export function CredentialsPanel() {
   }
 
   // Loading and error states
-  if (credentials.isLoading) return <LoadingState text="加载凭据列表..." />
+  if (credentials.isLoading) return <LoadingState text="加载账号列表..." />
   if (credentials.error) return <ErrorState message={extractErrorMessage(credentials.error)} />
 
   return (
@@ -602,12 +602,12 @@ export function CredentialsPanel() {
       {/* Stats Grid */}
       <div className="metric-grid">
         <StatCard
-          title="凭据总数"
+          title="账号总数"
           value={formatNumber(credentialSummary.data?.total ?? credentials.data?.total ?? 0)}
           icon={<Server className="h-5 w-5" />}
         />
         <StatCard
-          title="可用凭据"
+          title="可用账号"
           value={formatNumber(credentialSummary.data?.available ?? credentials.data?.available ?? 0)}
           tone="success"
         />
@@ -624,7 +624,7 @@ export function CredentialsPanel() {
           tone="info"
         />
         <StatCard
-          title="默认单凭据并发"
+          title="默认单账号并发"
           value={defaultCredentialConcurrency || '不限'}
           desc={concurrencyOverrideDesc}
           tone="info"
@@ -638,8 +638,8 @@ export function CredentialsPanel() {
 
       {/* Main Section */}
       <SectionCard
-        title="凭据列表"
-        description={`共 ${credentials.data?.filteredTotal ?? credentials.data?.total ?? 0} 个凭据`}
+        title="账号列表"
+        description={`共 ${credentials.data?.filteredTotal ?? credentials.data?.total ?? 0} 个账号`}
         actions={
           <div className="flex flex-wrap items-center gap-1.5">
             <Select
@@ -821,14 +821,14 @@ export function CredentialsPanel() {
         {currentCredentials.length === 0 ? (
           <EmptyState
             icon={<Server className="h-12 w-12" />}
-            title="暂无凭据"
-            description={hasActiveFilters ? '没有匹配当前筛选条件的凭据' : '点击添加按钮创建第一个凭据'}
+            title="暂无账号"
+            description={hasActiveFilters ? '没有匹配当前筛选条件的账号' : '点击添加按钮创建第一个账号'}
             action={
               hasActiveFilters ? (
                 <Button type="button" variant="outline" size="sm" onClick={clearFilters}>清除筛选</Button>
               ) : (
                 <Button type="button" color="primary" size="sm" onClick={() => setAddOpen(true)}>
-                  <Plus className="h-4 w-4" /> 添加凭据
+                  <Plus className="h-4 w-4" /> 添加账号
                 </Button>
               )
             }
@@ -889,7 +889,7 @@ export function CredentialsPanel() {
                 <thead className="sticky top-0 z-10 bg-base-100">
                   <tr>
                     <th className="w-20">ID</th>
-                    <th>凭据</th>
+                    <th>账号</th>
                     <th className="w-28">订阅</th>
                     <th className="w-28 text-right">剩余</th>
                     <th className="w-28 text-right">总额</th>
@@ -900,7 +900,7 @@ export function CredentialsPanel() {
                   {creditDetailRows.map((row) => (
                     <tr key={row.id}>
                       <td className="font-mono text-xs">#{row.id}</td>
-                      <td className="max-w-[260px] truncate font-medium">{row.email || `凭据 #${row.id}`}</td>
+                      <td className="max-w-[260px] truncate font-medium">{row.email || `账号 #${row.id}`}</td>
                       <td>{row.subscriptionTitle || '未知'}</td>
                       <td className="text-right font-semibold text-success">{formatCredits(row.creditRemaining)}</td>
                       <td className="text-right">{formatCredits(row.creditLimit)}</td>

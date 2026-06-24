@@ -1059,11 +1059,11 @@ export function ConfigPanel() {
         {activeTab === 'access' && <AccessKeysPanel />}
         {activeTab === 'limits' && (
           <ConfigGroup icon={<Gauge className="h-4 w-4" />} title="请求容量" description="控制每个账号和全局的承载量，以及请求等待、重试和超时。">
-            <NumberField title="单凭据每分钟请求上限" description="控制每个凭据每分钟最多承接多少请求。填 0 表示关闭本地限速。" value={draft.credentialRpm} min={0} suffix="次/分钟" onChange={(credentialRpm) => setDraft((prev) => ({ ...prev, credentialRpm }))} />
-            <NumberField title="单凭据最大并发请求数" description="控制同一个凭据同时处理多少个请求。填 0 表示不限制。" value={draft.credentialMaxConcurrentRequests} min={0} suffix="并发" onChange={(credentialMaxConcurrentRequests) => setDraft((prev) => ({ ...prev, credentialMaxConcurrentRequests }))} />
-            <NumberField title="全局最大并发请求数" description="控制所有凭据合计可同时处理的请求数。填 0 表示不限制。" value={draft.dispatchGlobalMaxConcurrentRequests} min={0} suffix="并发" onChange={(dispatchGlobalMaxConcurrentRequests) => setDraft((prev) => ({ ...prev, dispatchGlobalMaxConcurrentRequests }))} />
+            <NumberField title="单账号每分钟请求上限" description="控制每个账号每分钟最多承接多少请求。填 0 表示关闭本地限速。" value={draft.credentialRpm} min={0} suffix="次/分钟" onChange={(credentialRpm) => setDraft((prev) => ({ ...prev, credentialRpm }))} />
+            <NumberField title="单账号最大并发请求数" description="控制同一个账号同时处理多少个请求。填 0 表示不限制。" value={draft.credentialMaxConcurrentRequests} min={0} suffix="并发" onChange={(credentialMaxConcurrentRequests) => setDraft((prev) => ({ ...prev, credentialMaxConcurrentRequests }))} />
+            <NumberField title="全局最大并发请求数" description="控制所有账号合计可同时处理的请求数。填 0 表示不限制。" value={draft.dispatchGlobalMaxConcurrentRequests} min={0} suffix="并发" onChange={(dispatchGlobalMaxConcurrentRequests) => setDraft((prev) => ({ ...prev, dispatchGlobalMaxConcurrentRequests }))} />
             <NumberField title="最大等待队列请求数" description="调度容量已满时允许排队等待的请求数量。填 0 表示不限制。" value={draft.dispatchMaxQueuedRequests} min={0} suffix="请求" onChange={(dispatchMaxQueuedRequests) => setDraft((prev) => ({ ...prev, dispatchMaxQueuedRequests }))} />
-            <NumberField title="单请求最长排队等待" description="所有可用凭据都处于冷却、限速或并发占满时最多等待多久。填 0 表示不限制。" value={draft.credentialDispatchMaxWaitSecs} min={0} suffix="秒" onChange={(credentialDispatchMaxWaitSecs) => setDraft((prev) => ({ ...prev, credentialDispatchMaxWaitSecs }))} />
+            <NumberField title="单请求最长排队等待" description="所有可用账号都处于冷却、限速或并发占满时最多等待多久。填 0 表示不限制。" value={draft.credentialDispatchMaxWaitSecs} min={0} suffix="秒" onChange={(credentialDispatchMaxWaitSecs) => setDraft((prev) => ({ ...prev, credentialDispatchMaxWaitSecs }))} />
             <NumberField title="开始响应等待时间" description="请求发出后最多等多久开始返回内容。填 0 表示使用默认超时。" value={draft.kiroUpstreamResponseTimeoutSecs} min={0} suffix="秒" onChange={(kiroUpstreamResponseTimeoutSecs) => setDraft((prev) => ({ ...prev, kiroUpstreamResponseTimeoutSecs }))} />
             <NumberField title="单请求最大重试次数" description="一次请求失败后最多换几个账号再试。填 0 表示由系统自动决定。" value={draft.credentialRetryMaxAttempts} min={0} suffix="次" onChange={(credentialRetryMaxAttempts) => setDraft((prev) => ({ ...prev, credentialRetryMaxAttempts }))} />
             <NumberField title="异常并发自动回收" description="单个并发占用超过多久未活跃时自动释放。填 0 表示关闭。" value={draft.credentialInFlightLeaseMaxSecs} min={0} suffix="秒" onChange={(credentialInFlightLeaseMaxSecs) => setDraft((prev) => ({ ...prev, credentialInFlightLeaseMaxSecs }))} />
@@ -1082,7 +1082,7 @@ export function ConfigPanel() {
             <NumberField title="连续失败延长倍率" description="同一账号连续出错时，用这个倍率逐步延长暂停时间。" value={draft.credentialCooldownBackoffMultiplier} min={1} max={10} step={0.1} suffix="倍" onChange={(credentialCooldownBackoffMultiplier) => setDraft((prev) => ({ ...prev, credentialCooldownBackoffMultiplier }))} />
             <NumberField title="恢复时间错开比例" description="给恢复时间加一点随机偏移，避免多个账号同时恢复造成波动。" value={draft.credentialCooldownJitterPercent} min={0} max={100} suffix="%" onChange={(credentialCooldownJitterPercent) => setDraft((prev) => ({ ...prev, credentialCooldownJitterPercent }))} />
             <NumberField title="恢复观察时间" description="账号恢复后先降低使用频率，稳定后再恢复正常。" value={draft.credentialProbationSecs} min={0} suffix="秒" onChange={(credentialProbationSecs) => setDraft((prev) => ({ ...prev, credentialProbationSecs }))} />
-            <NumberField title="最大冷却秒数" description="控制单个凭据最长冷却时间。" value={draft.credentialMaxCooldownSecs} min={1} suffix="秒" onChange={(credentialMaxCooldownSecs) => setDraft((prev) => ({ ...prev, credentialMaxCooldownSecs }))} />
+            <NumberField title="最大冷却秒数" description="控制单个账号最长冷却时间。" value={draft.credentialMaxCooldownSecs} min={1} suffix="秒" onChange={(credentialMaxCooldownSecs) => setDraft((prev) => ({ ...prev, credentialMaxCooldownSecs }))} />
           </ConfigGroup>
         )}
 
@@ -1101,7 +1101,7 @@ export function ConfigPanel() {
         )}
 
         {activeTab === 'warmup' && (
-            <ConfigGroup icon={<Sparkles className="h-4 w-4" />} title="新凭据预热" description="让新账号先少量参与服务，确认稳定后再逐步恢复正常使用。">
+            <ConfigGroup icon={<Sparkles className="h-4 w-4" />} title="新账号预热" description="让新账号先少量参与服务，确认稳定后再逐步恢复正常使用。">
               <NumberField title="预热请求数" description="新账号先参与多少次请求后结束预热。填 0 表示不预热。" value={draft.credentialWarmupRequests} min={0} suffix="次" onChange={(credentialWarmupRequests) => setDraft((prev) => ({ ...prev, credentialWarmupRequests }))} />
               <NumberField title="单个预热账号参与比例" description="每个预热账号希望承接的请求比例。" value={draft.credentialWarmupSelectionPercent} min={0} max={100} suffix="%" onChange={(credentialWarmupSelectionPercent) => setDraft((prev) => ({ ...prev, credentialWarmupSelectionPercent }))} />
               <NumberField title="预热账号总占比上限" description="所有预热账号合计最多承接多少请求。" value={draft.credentialWarmupMaxSelectionPercent} min={0} max={100} suffix="%" onChange={(credentialWarmupMaxSelectionPercent) => setDraft((prev) => ({ ...prev, credentialWarmupMaxSelectionPercent }))} />
@@ -1122,7 +1122,7 @@ export function ConfigPanel() {
               <ToggleField title="启用请求压缩" description="开启后会尽量减少请求里的冗余内容；关闭时不改动请求内容。" checked={draft.compressionEnabled} onChange={(compressionEnabled) => setDraft((prev) => ({ ...prev, compressionEnabled }))} />
               <ToggleField title="仅压缩空白字符" description="只处理多余空白，风险较低，适合默认开启。" checked={draft.whitespaceCompression} disabled={!draft.compressionEnabled} onChange={(whitespaceCompression) => setDraft((prev) => ({ ...prev, whitespaceCompression }))} />
               <ToggleField title="启用大小保护" description="统计请求大小，并修正常见的格式问题，减少请求被拒绝的概率。" checked={draft.payloadGuardEnabled} onChange={(payloadGuardEnabled) => setDraft((prev) => ({ ...prev, payloadGuardEnabled }))} />
-              <ToggleField title="备用资源也应用大小保护" description="开启后，备用资源请求也使用同一套大小保护设置。" checked={draft.payloadGuardExternalEnabled} disabled={!draft.payloadGuardEnabled} onChange={(payloadGuardExternalEnabled) => setDraft((prev) => ({ ...prev, payloadGuardExternalEnabled }))} />
+              <ToggleField title="外部账号也应用大小保护" description="开启后，外部账号请求也使用同一套大小保护设置。" checked={draft.payloadGuardExternalEnabled} disabled={!draft.payloadGuardEnabled} onChange={(payloadGuardExternalEnabled) => setDraft((prev) => ({ ...prev, payloadGuardExternalEnabled }))} />
               <FieldLabel title="过大请求处理方式" description="可选择发送前先裁剪，也可以在收到“内容过长”错误后再裁剪并重试。">
                 <Select bordered size="sm" className="w-full" value={payloadGuardMode} disabled={!draft.payloadGuardEnabled} onChange={(event) => setDraft((prev) => ({ ...prev, payloadGuardMode: event.target.value as PayloadGuardMode }))}>
                   <Select.Option value="preemptive">发送前先处理</Select.Option>
@@ -1213,7 +1213,7 @@ export function ConfigPanel() {
             <ToggleField title="启用缓存创建频次控制" description="开启后，只影响缓存创建数值的展示频率。" checked={draft.promptCacheCreationControl.enabled} onChange={(enabled) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, enabled } }))} />
             <FieldLabel title="控制维度" description="选择按账号分别控制，还是按同一个会话和模型统一控制。">
               <Select bordered size="sm" className="w-full" value={draft.promptCacheCreationControl.scopeMode} disabled={!draft.promptCacheCreationControl.enabled} onChange={(event) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, scopeMode: event.target.value as 'credential_conversation_model' | 'conversation_model' } }))}>
-                <Select.Option value="credential_conversation_model">凭据 + 会话 + 模型</Select.Option>
+                <Select.Option value="credential_conversation_model">账号 + 会话 + 模型</Select.Option>
                 <Select.Option value="conversation_model">会话 + 模型</Select.Option>
               </Select>
             </FieldLabel>

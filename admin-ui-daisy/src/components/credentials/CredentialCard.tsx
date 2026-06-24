@@ -4,7 +4,6 @@ import {
   Eye,
   EyeOff,
   Gauge,
-  MoreHorizontal,
   RefreshCw,
   RotateCcw,
   Router,
@@ -14,7 +13,7 @@ import {
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import { Button, Card, Checkbox, Dropdown, Input, Loading, Modal, Toggle } from 'react-daisyui'
+import { Button, Card, Checkbox, Input, Loading, Modal, Toggle } from 'react-daisyui'
 import { Badge, EmptyState, LoadingState, ModalShell, useConfirm } from '@/components/ui'
 import { formatApproxElapsedMs, formatCredits, formatFullDate, formatLastUsed, formatNumber, formatQuota, formatUsd } from '@/lib/format'
 import { extractErrorMessage } from '@/lib/utils'
@@ -39,7 +38,7 @@ import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
 // ============================================================================
 
 function credentialLabel(credential: CredentialStatusItem) {
-  return credential.email || credential.maskedApiKey || `凭据 #${credential.id}`
+  return credential.email || credential.maskedApiKey || `账号 #${credential.id}`
 }
 
 function authLabel(authMethod: string | null) {
@@ -437,7 +436,7 @@ export function CredentialCard({
 
   const handleDelete = () => {
     if (!credential.disabled) {
-      toast.error('请先禁用凭据再删除')
+      toast.error('请先禁用账号再删除')
       return
     }
     deleteCredential.mutate(credential.id, {
@@ -457,7 +456,7 @@ export function CredentialCard({
   }
 
   return (
-    <Card className={`credential-card relative overflow-visible ${credential.isCurrent ? 'is-current' : ''} ${credential.disabled ? 'is-disabled' : ''} ${detailsOpen ? 'is-expanded' : ''} ${hasOpenModal ? 'has-modal' : ''}`}>
+    <Card className={`credential-card relative ${credential.isCurrent ? 'is-current' : ''} ${credential.disabled ? 'is-disabled' : ''} ${detailsOpen ? 'is-expanded' : ''} ${hasOpenModal ? 'has-modal' : ''}`}>
       <Card.Body className="gap-0 p-0">
         {/* Compact Header - Always Visible */}
         <div className="credential-card-header flex items-start gap-3 p-3">
@@ -545,9 +544,110 @@ export function CredentialCard({
           <SummaryItem label="最近使用" value={formatLastUsed(credential.lastUsedAt)} />
         </div>
 
+        <div className="credential-actions">
+          <Button type="button" color="ghost" size="xs" onClick={() => onTest(credential)}>
+            <Wand2 className="h-3.5 w-3.5" /> 测试
+          </Button>
+          <Button type="button" color="ghost" size="xs" onClick={() => onQueryBalance(credential.id)} disabled={loadingBalance}>
+            {loadingBalance ? <Loading size="xs" /> : <Wallet className="h-3.5 w-3.5" />}
+            查询信息
+          </Button>
+          <Button
+            type="button"
+            color="ghost"
+            size="xs"
+            onClick={handleForceRefresh}
+            disabled={forceRefresh.isPending || credential.authMethod === 'api_key'}
+            title={credential.authMethod === 'api_key' ? 'API Key 账号无需刷新 Token' : '强制刷新 Token'}
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${forceRefresh.isPending ? 'animate-spin' : ''}`} /> 刷新Token
+          </Button>
+          <Button
+            type="button"
+            color="ghost"
+            size="xs"
+            disabled={resetFailure.isPending || !hasFailures}
+            onClick={() => resetFailure.mutate(credential.id, {
+              onSuccess: (res) => toast.success(res.message),
+              onError: (error) => toast.error(`操作失败: ${extractErrorMessage(error)}`),
+            })}
+          >
+            <RotateCcw className="h-3.5 w-3.5" /> 恢复异常
+          </Button>
+          <Button
+            type="button"
+            color="ghost"
+            size="xs"
+            disabled={setPriority.isPending || credential.priority === 0}
+            onClick={() => adjustPriority(-1)}
+            title="提高优先级"
+          >
+            <ChevronUp className="h-3.5 w-3.5" /> 优先级
+          </Button>
+          <Button
+            type="button"
+            color="ghost"
+            size="xs"
+            disabled={setPriority.isPending}
+            onClick={() => adjustPriority(1)}
+            title="降低优先级"
+          >
+            <ChevronDown className="h-3.5 w-3.5" /> 优先级
+          </Button>
+          <Button
+            type="button"
+            color="ghost"
+            size="xs"
+            onClick={() => setWarmup.mutate(
+              { id: credential.id, warmupRemaining: credential.warmupRemaining > 0 ? 0 : Math.max(1, warmupTarget) },
+              {
+                onSuccess: () => toast.success(credential.warmupRemaining > 0 ? '已关闭预热' : '已开启预热'),
+                onError: (error) => toast.error(`预热设置失败: ${extractErrorMessage(error)}`),
+              }
+            )}
+          >
+            {credential.warmupRemaining > 0 ? '关闭预热' : '开启预热'}
+          </Button>
+          <Button
+            type="button"
+            color="ghost"
+            size="xs"
+            disabled={clearInFlight.isPending || !canClearInFlight}
+            onClick={async () => {
+              if (!canClearInFlight) return
+              const confirmed = await confirmDialog({
+                title: '清理并发占用',
+                message: `确定清理账号 #${credential.id} 的当前并发占用吗？真实仍在运行的请求可能因此不再计入并发限制。`,
+                confirmText: '清理',
+                tone: 'danger',
+              })
+              if (!confirmed) return
+              clearInFlight.mutate({ id: credential.id }, {
+                onSuccess: (res) => toast.success(res.message),
+                onError: (error) => toast.error(`清理失败: ${extractErrorMessage(error)}`),
+              })
+            }}
+          >
+            清理并发
+          </Button>
+          <Button
+            type="button"
+            color="ghost"
+            size="xs"
+            className="text-error hover:bg-error/10"
+            disabled={!credential.disabled}
+            onClick={() => {
+              if (!credential.disabled) return
+              setShowDeleteConfirm(true)
+            }}
+          >
+            <Trash2 className="h-3.5 w-3.5" /> 删除
+          </Button>
+        </div>
+
       </Card.Body>
 
-      <ModalShell open={detailsOpen} title={`凭据详情：${credentialLabel(credential)}`} width="max-w-5xl" onClose={() => setDetailsOpen(false)}>
+      <ModalShell open={detailsOpen} title={`账号详情：${credentialLabel(credential)}`} width="max-w-5xl" onClose={() => setDetailsOpen(false)}>
         <div className="credential-details credential-details-modal">
             <div className="credential-section-title">基础</div>
             <div className="credential-meta-grid">
@@ -642,12 +742,12 @@ export function CredentialCard({
                     type="button"
                     className="font-mono text-primary hover:underline"
                     onClick={() => setEditingRegions(true)}
-                    title="配置该凭据的 Auth/API Region"
+                    title="配置该账号的 Auth/API Region"
                   >
                     {credential.effectiveAuthRegion || '-'}
                   </button>
                 }
-                detail={credential.authRegion || credential.region ? '凭据覆盖' : '继承全局'}
+                detail={credential.authRegion || credential.region ? '账号覆盖' : '继承全局'}
               />
               <MetaItem
                 label="API Region"
@@ -656,12 +756,12 @@ export function CredentialCard({
                     type="button"
                     className="font-mono text-primary hover:underline"
                     onClick={() => setEditingRegions(true)}
-                    title="配置该凭据的 Auth/API Region"
+                    title="配置该账号的 Auth/API Region"
                   >
                     {credential.effectiveApiRegion || '-'}
                   </button>
                 }
-                detail={credential.apiRegion ? '凭据覆盖' : '继承全局'}
+                detail={credential.apiRegion ? '账号覆盖' : '继承全局'}
               />
               <MetaItem
                 label="代理"
@@ -670,7 +770,7 @@ export function CredentialCard({
                     type="button"
                     className="flex min-w-0 max-w-full items-center gap-1 text-primary hover:underline"
                     onClick={openProxyEditor}
-                    title="配置该凭据的代理"
+                    title="配置该账号的代理"
                   >
                     <Router className="h-3 w-3 shrink-0" />
                     <span className="truncate">{proxySummary(credential)}</span>
@@ -702,105 +802,6 @@ export function CredentialCard({
               </div>
             )}
 
-            <div className="credential-actions">
-              <Button type="button" color="ghost" size="xs" onClick={() => onTest(credential)}>
-                <Wand2 className="h-3.5 w-3.5" /> 测试
-              </Button>
-              <Button type="button" color="ghost" size="xs" onClick={() => onQueryBalance(credential.id)} disabled={loadingBalance}>
-                {loadingBalance ? <Loading size="xs" /> : <Wallet className="h-3.5 w-3.5" />}
-                查询信息
-              </Button>
-              <Button
-                type="button"
-                color="ghost"
-                size="xs"
-                onClick={handleForceRefresh}
-                disabled={forceRefresh.isPending || credential.authMethod === 'api_key'}
-                title={credential.authMethod === 'api_key' ? 'API Key 凭据无需刷新 Token' : '强制刷新 Token'}
-              >
-                <RefreshCw className={`h-3.5 w-3.5 ${forceRefresh.isPending ? 'animate-spin' : ''}`} /> 刷新Token
-              </Button>
-              <Button
-                type="button"
-                color="ghost"
-                size="xs"
-                disabled={resetFailure.isPending || !hasFailures}
-                onClick={() => resetFailure.mutate(credential.id, {
-                  onSuccess: (res) => toast.success(res.message),
-                  onError: (error) => toast.error(`操作失败: ${extractErrorMessage(error)}`),
-                })}
-              >
-                <RotateCcw className="h-3.5 w-3.5" /> 恢复异常
-              </Button>
-              <Dropdown end className="relative z-40">
-                <Dropdown.Toggle button={false}>
-                  <Button type="button" color="ghost" size="xs">
-                    <MoreHorizontal className="h-3.5 w-3.5" />
-                  </Button>
-                </Dropdown.Toggle>
-                <Dropdown.Menu className="z-[80] w-40 rounded-lg border border-base-300 bg-base-100 p-1">
-                  <Dropdown.Item
-                    className={setPriority.isPending || credential.priority === 0 ? 'pointer-events-none opacity-50' : undefined}
-                    aria-disabled={setPriority.isPending || credential.priority === 0}
-                    onClick={() => {
-                      if (setPriority.isPending || credential.priority === 0) return
-                      adjustPriority(-1)
-                    }}
-                  >
-                    <ChevronUp className="h-3.5 w-3.5" /> 提高优先级
-                  </Dropdown.Item>
-                  <Dropdown.Item
-                    className={setPriority.isPending ? 'pointer-events-none opacity-50' : undefined}
-                    aria-disabled={setPriority.isPending}
-                    onClick={() => {
-                      if (setPriority.isPending) return
-                      adjustPriority(1)
-                    }}
-                  >
-                    <ChevronDown className="h-3.5 w-3.5" /> 降低优先级
-                  </Dropdown.Item>
-                  <Dropdown.Item onClick={() => setWarmup.mutate(
-                    { id: credential.id, warmupRemaining: credential.warmupRemaining > 0 ? 0 : Math.max(1, warmupTarget) },
-                    {
-                      onSuccess: () => toast.success(credential.warmupRemaining > 0 ? '已关闭预热' : '已开启预热'),
-                      onError: (error) => toast.error(`预热设置失败: ${extractErrorMessage(error)}`),
-                    }
-                  )}>
-                    {credential.warmupRemaining > 0 ? '关闭预热' : '开启预热'}
-                  </Dropdown.Item>
-                  <Dropdown.Item
-                    className={clearInFlight.isPending || !canClearInFlight ? 'pointer-events-none opacity-50' : undefined}
-                    aria-disabled={clearInFlight.isPending || !canClearInFlight}
-                    onClick={async () => {
-                      if (!canClearInFlight) return
-                      const confirmed = await confirmDialog({
-                        title: '清理并发占用',
-                        message: `确定清理凭据 #${credential.id} 的当前并发占用吗？真实仍在运行的请求可能因此不再计入并发限制。`,
-                        confirmText: '清理',
-                        tone: 'danger',
-                      })
-                      if (!confirmed) return
-                      clearInFlight.mutate({ id: credential.id }, {
-                        onSuccess: (res) => toast.success(res.message),
-                        onError: (error) => toast.error(`清理失败: ${extractErrorMessage(error)}`),
-                      })
-                    }}
-                  >
-                    清理并发
-                  </Dropdown.Item>
-                  <Dropdown.Item
-                    className={`text-error ${!credential.disabled ? 'pointer-events-none opacity-50' : ''}`}
-                    aria-disabled={!credential.disabled}
-                    onClick={() => {
-                      if (!credential.disabled) return
-                      setShowDeleteConfirm(true)
-                    }}
-                  >
-                    <Trash2 className="h-3.5 w-3.5" /> 删除
-                  </Dropdown.Item>
-                </Dropdown.Menu>
-              </Dropdown>
-            </div>
         </div>
       </ModalShell>
 
@@ -951,7 +952,7 @@ export function CredentialCard({
               onChange={(event) => setConcurrencyValue(event.target.value)}
             />
             <span className="mt-1 block text-xs text-base-content/55">
-              留空表示继承全局“单凭据最大并发请求数”；填 0 表示该账号不限并发；填正整数表示该账号自己的并发上限。
+              留空表示继承全局“单账号最大并发请求数”；填 0 表示该账号不限并发；填正整数表示该账号自己的并发上限。
             </span>
           </label>
 
@@ -990,7 +991,7 @@ export function CredentialCard({
 
       <ModalShell
         open={showDeleteConfirm}
-        title={`确认删除凭据 #${credential.id}`}
+        title={`确认删除账号 #${credential.id}`}
         width="max-w-md"
         onClose={() => setShowDeleteConfirm(false)}
         footer={
@@ -1006,10 +1007,10 @@ export function CredentialCard({
         }
       >
         <div className="space-y-2 text-sm">
-          <p>此操作会永久删除该凭据，无法撤销。</p>
+          <p>此操作会永久删除该账号，无法撤销。</p>
           <div className="rounded-lg border border-base-300 bg-base-200/60 p-3">
             <div className="font-semibold">{credentialLabel(credential)}</div>
-            <div className="mt-1 text-xs text-base-content/55">只有已禁用凭据允许删除。</div>
+            <div className="mt-1 text-xs text-base-content/55">只有已禁用账号允许删除。</div>
           </div>
         </div>
       </ModalShell>
@@ -1026,12 +1027,12 @@ export function CredentialCard({
               <span className="font-semibold">不绑定代理资源</span>
               {!proxyResourceId && <Badge tone="primary" size="xs">已选</Badge>}
             </div>
-            <div className="mt-1 text-xs text-base-content/50">不绑定代理资源时可以使用下面的凭据直连代理。</div>
+            <div className="mt-1 text-xs text-base-content/50">不绑定代理资源时可以使用下面的账号直连代理。</div>
           </button>
 
           <div className={`rounded-lg border p-3 ${proxyResourceId ? 'border-base-300 bg-base-200/60 opacity-70' : 'border-base-300 bg-base-100'}`}>
             <div className="mb-3">
-              <div className="text-sm font-semibold">凭据直连代理</div>
+              <div className="text-sm font-semibold">账号直连代理</div>
               <div className="mt-1 text-xs leading-4 text-base-content/55">
                 不绑定代理资源时生效；选择代理资源保存后会清除这些直连代理字段。
               </div>

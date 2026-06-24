@@ -41,6 +41,10 @@ export interface CredentialSummaryResponse {
   runtimeFresh: boolean
 }
 
+export interface SystemVersionResponse {
+  version: string
+}
+
 export type CredentialSortBy =
   | 'default'
   | 'id'

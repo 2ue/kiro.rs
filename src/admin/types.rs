@@ -1196,6 +1196,14 @@ pub struct LoadBalancingModeResponse {
     pub mode: String,
 }
 
+/// 系统版本响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemVersionResponse {
+    /// 当前服务版本，来自 Cargo package version。
+    pub version: &'static str,
+}
+
 /// 设置负载均衡模式请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

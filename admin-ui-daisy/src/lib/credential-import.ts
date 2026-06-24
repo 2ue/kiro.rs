@@ -123,7 +123,7 @@ export async function parseCredentialImportFiles(files: File[]): Promise<Credent
   for (const file of files) {
     try {
       const parsed = parseCredentialImportText(await file.text())
-      if (parsed.length === 0) errors.push(`${file.name}: 未找到有效凭据`)
+      if (parsed.length === 0) errors.push(`${file.name}: 未找到有效账号`)
       else credentials.push(...parsed)
     } catch (error) {
       errors.push(`${file.name}: ${error instanceof Error ? error.message : String(error)}`)

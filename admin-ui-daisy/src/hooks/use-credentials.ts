@@ -20,6 +20,7 @@ import {
   getLoadBalancingMode,
   getProxyResources,
   getRuntimeConfig,
+  getSystemVersion,
   resetCredentialFailure,
   setCredentialDisabled,
   setCredentialConcurrency,
@@ -328,6 +329,14 @@ export function useRuntimeConfig() {
   return useQuery({
     queryKey: ['runtime-config'],
     queryFn: getRuntimeConfig,
+  })
+}
+
+export function useSystemVersion() {
+  return useQuery({
+    queryKey: ['system-version'],
+    queryFn: getSystemVersion,
+    staleTime: 5 * 60 * 1000,
   })
 }
 

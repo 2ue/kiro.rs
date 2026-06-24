@@ -8,19 +8,19 @@ import type { AdminAuditLogRow } from '@/types/api'
 
 function actionLabel(action: string): string {
   const labels: Record<string, string> = {
-    add_credential: '新增凭据',
-    delete_credential: '删除凭据',
+    add_credential: '新增账号',
+    delete_credential: '删除账号',
     set_credential_disabled: '设置启用状态',
     set_credential_priority: '设置优先级',
     set_credential_concurrency: '设置账号并发',
-    reset_credential: '重置凭据',
+    reset_credential: '重置账号',
     force_refresh_token: '强制刷新 Token',
     set_credential_warmup: '设置预热次数',
     clear_credential_in_flight: '清理并发占用',
     set_load_balancing_mode: '切换负载模式',
     update_runtime_config: '更新运行配置',
     sync_model_pricing: '同步模型价格',
-    export_credentials: '导出凭据',
+    export_credentials: '导出账号',
     clear_usage_records: '清空用量展示',
   }
   return labels[action] || action
@@ -28,7 +28,7 @@ function actionLabel(action: string): string {
 
 function objectLabel(type: string): string {
   const labels: Record<string, string> = {
-    credential: '凭据',
+    credential: '账号',
     runtime_config: '运行配置',
     model_pricing: '模型价格',
     usage_record: '用量记录',
@@ -57,7 +57,7 @@ export function AuditPanel() {
     <div className="space-y-4">
       <SectionCard
         title={<span className="flex items-center gap-2"><FileClock className="h-4 w-4" /> 审计日志</span>}
-        description="记录后台关键写操作和导出动作，便于排查配置、凭据和统计数据的变化来源。"
+        description="记录后台关键写操作和导出动作，便于排查配置、账号和统计数据的变化来源。"
       >
         {logs.isLoading ? (
           <LoadingState />

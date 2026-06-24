@@ -109,7 +109,7 @@ function SecretInput({
 }
 
 function credentialLabel(credential: CredentialStatusItem) {
-  return credential.email || credential.maskedApiKey || `凭据 #${credential.id}`
+  return credential.email || credential.maskedApiKey || `账号 #${credential.id}`
 }
 
 function CredentialBindingPicker({
@@ -122,7 +122,7 @@ function CredentialBindingPicker({
   onToggle: (id: number) => void
 }) {
   if (!credentials.length) {
-    return <EmptyState text="暂无可绑定凭据" />
+    return <EmptyState text="暂无可绑定账号" />
   }
 
   const sortedCredentials = [...credentials].sort((left, right) => {
@@ -248,10 +248,10 @@ function ProxyEditorModal({
     if (!form.name.trim()) return toast.error('请输入代理名称')
     if (!form.proxyUrl.trim()) return toast.error('请输入代理 URL')
     if (!bindingReady) {
-      return toast.error('凭据列表仍在加载，请稍后再保存')
+      return toast.error('账号列表仍在加载，请稍后再保存')
     }
     if (credentials.isError || !credentials.data) {
-      return toast.error(`凭据列表加载失败，无法同步绑定: ${extractErrorMessage(credentials.error)}`)
+      return toast.error(`账号列表加载失败，无法同步绑定: ${extractErrorMessage(credentials.error)}`)
     }
     const request = {
       name: form.name.trim(),
@@ -271,9 +271,9 @@ function ProxyEditorModal({
         : await create.mutateAsync(request)
       const bindingResult = await syncCredentialBindings(saved.id)
       if (bindingResult.fail > 0) {
-        toast.warning(`代理已保存，凭据绑定成功 ${bindingResult.ok} 个，失败 ${bindingResult.fail} 个`)
+        toast.warning(`代理已保存，账号绑定成功 ${bindingResult.ok} 个，失败 ${bindingResult.fail} 个`)
       } else if (bindingResult.ok > 0) {
-        toast.success(`代理已保存，已同步 ${bindingResult.ok} 个凭据绑定`)
+        toast.success(`代理已保存，已同步 ${bindingResult.ok} 个账号绑定`)
       } else {
         toast.success(isEditing ? '代理资源已更新' : '代理资源已创建')
       }
@@ -329,7 +329,7 @@ function ProxyEditorModal({
           <div className="flex items-end justify-between gap-3 rounded-box border border-base-300 bg-base-200 p-3">
             <div>
               <div className="text-xs font-semibold">启用状态</div>
-              <div className="text-xs text-base-content/60">禁用后绑定该资源的凭据不会回退到全局代理或直连。</div>
+              <div className="text-xs text-base-content/60">禁用后绑定该资源的账号不会回退到全局代理或直连。</div>
             </div>
             <Toggle color="primary" checked={form.enabled} onChange={() => set('enabled', !form.enabled)} />
           </div>
@@ -352,16 +352,16 @@ function ProxyEditorModal({
         <div className="space-y-2">
           <div className="flex items-center justify-between gap-3">
             <div>
-              <div className="text-sm font-semibold">绑定凭据</div>
-              <div className="text-xs text-base-content/60">可直接选择要绑定到该代理资源的凭据；已禁用凭据仍可选择，但会用红色标识。</div>
+              <div className="text-sm font-semibold">绑定账号</div>
+              <div className="text-xs text-base-content/60">可直接选择要绑定到该代理资源的账号；已禁用账号仍可选择，但会用红色标识。</div>
             </div>
             <Badge tone="info">{selectedCredentialIds.size} 已选</Badge>
           </div>
           {!bindingReady && (credentials.isLoading || credentials.isFetching) ? (
-            <LoadingState text="加载凭据..." />
+            <LoadingState text="加载账号..." />
           ) : !bindingReady && credentials.isError ? (
             <div className="rounded-box border border-error/30 bg-error/5 p-4 text-center text-sm text-error">
-              凭据列表加载失败：{extractErrorMessage(credentials.error)}
+              账号列表加载失败：{extractErrorMessage(credentials.error)}
             </div>
           ) : (
             <CredentialBindingPicker credentials={allCredentials} selectedIds={selectedCredentialIds} onToggle={toggleCredential} />
@@ -403,7 +403,7 @@ function ProxyResourceCard({ resource, onEdit }: { resource: ProxyResource; onEd
   const deleteResource = async () => {
     const confirmed = await confirmDialog({
       title: '删除代理资源',
-      message: `确定删除代理资源「${resource.name}」吗？如果仍有凭据绑定，后端会拒绝删除。`,
+      message: `确定删除代理资源「${resource.name}」吗？如果仍有账号绑定，后端会拒绝删除。`,
       confirmText: '删除',
       tone: 'danger',
     })
@@ -454,7 +454,7 @@ function ProxyResourceCard({ resource, onEdit }: { resource: ProxyResource; onEd
             </div>
           </div>
           <div>
-            <div className="text-base-content/50">绑定凭据</div>
+            <div className="text-base-content/50">绑定账号</div>
             <div className="font-semibold">{resource.credentialCount}</div>
           </div>
           <div>
@@ -527,7 +527,7 @@ export function ProxyPanel() {
       <div className="metric-grid">
         <StatCard title="代理资源" value={list.length} tone="info" />
         <StatCard title="启用资源" value={enabledCount} tone={enabledCount ? 'success' : 'warning'} />
-        <StatCard title="绑定凭据" value={boundCount} />
+        <StatCard title="绑定账号" value={boundCount} />
       </div>
 
       <SectionCard

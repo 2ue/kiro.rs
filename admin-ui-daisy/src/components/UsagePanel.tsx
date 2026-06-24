@@ -74,13 +74,13 @@ function routeLabel(record: UsageRecord): string {
   const labels: Record<string, string> = {
     local_success: '本地成功',
     local_error_no_fallback: '本地错误',
-    local_rescue_after_external: '备用池后回本地',
+    local_rescue_after_external: '外部账号后回本地',
     external_fallback_preflight: '预检 fallback',
     external_fallback_after_local_attempts: '失败后 fallback',
     external_direct_policy: '外部直连',
     external_error: '外部错误',
   }
-  return labels[record.routeSubtype || ''] || (record.routeKind === 'external_pool' ? '外部池' : '本地')
+  return labels[record.routeSubtype || ''] || (record.routeKind === 'external_pool' ? '外部账号' : '本地')
 }
 
 function routeTone(record: UsageRecord): 'neutral' | 'success' | 'warning' | 'error' | 'info' {
@@ -139,7 +139,7 @@ function formatAttemptSummary(record: UsageRecord): string {
 
 function formatExternalAttemptChain(record: UsageRecord): string {
   return (record.externalAttempts || [])
-    .map((attempt) => `外部池 #${attempt.poolId}(${attempt.status ?? attempt.errorType ?? attempt.action})`)
+    .map((attempt) => `外部账号 #${attempt.poolId}(${attempt.status ?? attempt.errorType ?? attempt.action})`)
     .join(' > ')
 }
 
@@ -250,7 +250,7 @@ export function UsagePanel() {
   const credentialLabels = useMemo(() => {
     const labels = new Map<number, string>()
     for (const credential of credentials.data?.credentials || []) {
-      labels.set(credential.id, credential.email || credential.maskedApiKey || `凭据 #${credential.id}`)
+      labels.set(credential.id, credential.email || credential.maskedApiKey || `账号 #${credential.id}`)
     }
     return labels
   }, [credentials.data?.credentials])
@@ -366,15 +366,15 @@ export function UsagePanel() {
           <Input bordered size="sm" value={endpoint} onChange={(event) => setEndpoint(event.target.value)} placeholder="入口路径，如 /cc/v1/messages" />
           <Input bordered size="sm" value={conversationId} onChange={(event) => setConversationId(event.target.value)} placeholder="会话 ID" />
           <Select size="sm" value={routeTarget} onChange={(event) => setRouteTarget(event.target.value)}>
-            <Select.Option value="">全部账号/外部池</Select.Option>
+            <Select.Option value="">全部账号/外部账号</Select.Option>
             {(credentials.data?.credentials || []).map((credential) => (
               <Select.Option key={`credential:${credential.id}`} value={`credential:${credential.id}`}>
-                账号 #{credential.id} {credential.email || credential.maskedApiKey || '未命名凭据'}
+                账号 #{credential.id} {credential.email || credential.maskedApiKey || '未命名账号'}
               </Select.Option>
             ))}
             {(externalPools.data?.pools || []).map((pool) => (
               <Select.Option key={`external:${pool.id}`} value={`external:${pool.id}`}>
-                外部池 #{pool.id} {pool.name}
+                外部账号 #{pool.id} {pool.name}
               </Select.Option>
             ))}
           </Select>
@@ -466,7 +466,7 @@ export function UsagePanel() {
                         </div>
                       </span>
                       <span>
-                        <div className="font-semibold">{isExternal ? `外部池 #${record.externalPoolId ?? '-'}` : `#${record.credentialId ?? '-'}`}</div>
+                        <div className="font-semibold">{isExternal ? `外部账号 #${record.externalPoolId ?? '-'}` : `#${record.credentialId ?? '-'}`}</div>
                         {label && <div className="max-w-[180px] truncate text-xs text-base-content/55" title={label}>{label}</div>}
                         {isExternal && record.externalPoolName && <div className="max-w-[180px] truncate text-xs text-base-content/55" title={record.externalPoolName}>{record.externalPoolName}</div>}
                       </span>
@@ -621,7 +621,7 @@ export function UsagePanel() {
 
                     <div className="grid gap-2 text-sm md:grid-cols-2 xl:grid-cols-[220px_1fr]">
                       <div className="min-w-0 rounded-box bg-base-200/60 px-2.5 py-1.5">
-                        <div className="text-xs text-base-content/50">{isExternal ? '外部池' : '账号'}</div>
+                        <div className="text-xs text-base-content/50">{isExternal ? '外部账号' : '账号'}</div>
                         <div className="font-semibold">{isExternal ? `#${record.externalPoolId ?? '-'}` : `#${record.credentialId ?? '-'}`}</div>
                         {label && <div className="truncate text-xs text-base-content/60" title={label}>{label}</div>}
                         {isExternal && record.externalPoolName && <div className="truncate text-xs text-base-content/60" title={record.externalPoolName}>{record.externalPoolName}</div>}
@@ -909,7 +909,7 @@ function UsageBillingModal({ record, onClose }: { record: UsageRecord | null; on
           {billing && (
             <div className="rounded-box border border-base-300 bg-base-200/50 p-3 text-sm">
               <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                <div className="font-medium">外部池计费拆分</div>
+                <div className="font-medium">外部账号计费拆分</div>
                 <Badge tone={deltaTone === 'loss' ? 'error' : deltaTone === 'profit' ? 'warning' : 'success'}>
                   {deltaTone === 'loss' ? `亏损 ${formatUsd(Math.abs(profit))}` : deltaTone === 'profit' ? `盈利 ${formatUsd(profit)}` : '持平'}
                 </Badge>
@@ -963,7 +963,7 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
             <Detail label="账号" value={`#${record.credentialId ?? '-'} ${record.credentialLabel || ''}`} />
             <Detail label="路由" value={`${routeLabel(record)} · ${record.routeKind || '-'}${record.routeSubtype ? ` · ${record.routeSubtype}` : ''}`} />
             {record.routeKind === 'external_pool' && (
-              <Detail label="外部池" value={`#${record.externalPoolId ?? '-'} ${record.externalPoolName || ''}`} />
+              <Detail label="外部账号" value={`#${record.externalPoolId ?? '-'} ${record.externalPoolName || ''}`} />
             )}
             {(record.fallbackReason || record.directPolicyReason) && (
               <Detail label="路由原因" value={record.fallbackReason || record.directPolicyReason || '-'} />
@@ -1005,7 +1005,7 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
               return (
                 <div className="rounded-box border border-base-300 bg-base-200/50 p-3 text-sm">
                   <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                    <div className="font-medium">外部池计费拆分</div>
+                    <div className="font-medium">外部账号计费拆分</div>
                     <Badge tone={hasLoss ? 'error' : hasProfit ? 'warning' : 'success'}>
                       {hasLoss ? `亏损 ${formatUsd(Math.abs(profit))}` : hasProfit ? `盈利 ${formatUsd(profit)}` : '持平'}
                     </Badge>
@@ -1015,7 +1015,7 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
                       <div className="text-xs text-base-content/55">原始成本</div>
                       <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.rawUsage)}</div>
                       <div className="mt-1 font-medium">{formatUsd(billing.rawCostUsd || 0)}</div>
-                      <div className="text-xs text-base-content/55">按备用资源实际消耗估算</div>
+                      <div className="text-xs text-base-content/55">按外部账号实际消耗估算</div>
                     </div>
                     <div>
                       <div className="text-xs text-base-content/55">展示计费</div>
@@ -1080,13 +1080,13 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
           )}
           {(record.externalAttempts || []).length > 0 && (
             <div>
-              <div className="mb-2 text-sm font-medium">外部池链路</div>
+              <div className="mb-2 text-sm font-medium">外部账号链路</div>
               <div className="mb-2 rounded-box border border-base-300 bg-base-200 px-3 py-2 font-mono text-xs">{formatExternalAttemptChain(record)}</div>
               <div className="table-panel">
                 <Table size="sm" className="data-table min-w-[760px]">
                   <Table.Head>
                     <span>顺序</span>
-                    <span>外部池</span>
+                    <span>外部账号</span>
                     <span>状态</span>
                     <span>动作</span>
                     <span className="text-right">耗时</span>

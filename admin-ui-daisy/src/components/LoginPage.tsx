@@ -83,7 +83,7 @@ export function LoginPage({ initialError = '', onLogin }: { initialError?: strin
                   <div className="mb-4 flex items-center justify-between gap-3">
                     <div>
                       <div className="text-xs font-semibold text-base-content/45">安全入口</div>
-                      <div className="mt-1 text-lg font-semibold">登录凭证</div>
+                      <div className="mt-1 text-lg font-semibold">登录 Key</div>
                     </div>
                     <ShieldCheck className="h-6 w-6 text-primary" />
                   </div>
@@ -137,7 +137,7 @@ export function LoginPage({ initialError = '', onLogin }: { initialError?: strin
                   />
                 </Join>
                 <p className="text-xs leading-5 text-base-content/50">
-                  请使用管理员提供的后台登录凭证。
+                  请使用管理员提供的后台登录 Key。
                 </p>
               </div>
 

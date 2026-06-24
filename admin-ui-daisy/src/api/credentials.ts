@@ -30,6 +30,7 @@ import type {
   SetPriorityRequest,
   SetWarmupRequest,
   SuccessResponse,
+  SystemVersionResponse,
   TestCredentialRequest,
   TestCredentialResponse,
   ValidateExistingCredentialsRequest,
@@ -292,6 +293,11 @@ export async function setLoadBalancingMode(mode: LoadBalancingMode): Promise<{ m
 
 export async function getRuntimeConfig(): Promise<RuntimeConfig> {
   const { data } = await api.get<RuntimeConfig>('/config/runtime')
+  return data
+}
+
+export async function getSystemVersion(): Promise<SystemVersionResponse> {
+  const { data } = await api.get<SystemVersionResponse>('/system/version')
   return data
 }
 
