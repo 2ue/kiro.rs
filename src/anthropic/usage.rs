@@ -287,6 +287,14 @@ pub struct UsageRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_status_code: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_metadata: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_breakdown: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_guard_report: Option<serde_json::Value>,
@@ -1625,6 +1633,10 @@ mod tests {
             error_type: None,
             error_message: None,
             error_detail: None,
+            error_status_code: None,
+            error_source: None,
+            error_id: None,
+            error_metadata: None,
             payload_breakdown: None,
             payload_guard_report: None,
         }
@@ -1632,6 +1644,23 @@ mod tests {
 
     fn record(id: &str, cache_read: i32, source: UsageSource) -> UsageRecord {
         record_with_time(id, cache_read, source, Utc::now().to_rfc3339())
+    }
+
+    #[test]
+    fn usage_record_deserializes_historical_json_without_error_diagnostics() {
+        let mut value = serde_json::to_value(record("historical", 0, UsageSource::None)).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("errorStatusCode");
+        object.remove("errorSource");
+        object.remove("errorId");
+        object.remove("errorMetadata");
+
+        let decoded: UsageRecord = serde_json::from_value(value).unwrap();
+
+        assert_eq!(decoded.error_status_code, None);
+        assert_eq!(decoded.error_source, None);
+        assert_eq!(decoded.error_id, None);
+        assert_eq!(decoded.error_metadata, None);
     }
 
     #[test]

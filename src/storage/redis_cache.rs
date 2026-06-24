@@ -4050,6 +4050,11 @@ mod tests {
             error_type: (status != UsageRecordStatus::Success).then(|| "rate_limit".to_string()),
             error_message: (status != UsageRecordStatus::Success).then(|| "429".to_string()),
             error_detail: None,
+            error_status_code: (status != UsageRecordStatus::Success).then_some(429),
+            error_source: (status != UsageRecordStatus::Success)
+                .then(|| "local_account".to_string()),
+            error_id: None,
+            error_metadata: None,
             payload_breakdown: None,
             payload_guard_report: None,
         }

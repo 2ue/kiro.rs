@@ -5425,6 +5425,10 @@ mod tests {
             error_type: None,
             error_message: None,
             error_detail: None,
+            error_status_code: None,
+            error_source: None,
+            error_id: None,
+            error_metadata: None,
             payload_breakdown: None,
             payload_guard_report: None,
         }
@@ -5749,6 +5753,10 @@ mod tests {
             error_type: None,
             error_message: None,
             error_detail: None,
+            error_status_code: None,
+            error_source: None,
+            error_id: None,
+            error_metadata: None,
             payload_breakdown: None,
             payload_guard_report: None,
         }

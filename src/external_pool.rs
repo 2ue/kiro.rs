@@ -61,6 +61,7 @@ const DEFAULT_EXTERNAL_POOL_REQUEST_TIMEOUT_SECS: u64 = 180;
 const EXTERNAL_POOL_LEASE_TOUCH_INTERVAL_SECS: u64 = 30;
 const EXTERNAL_POOL_PROMPT_CACHE_CREDENTIAL_ID_OFFSET: u64 = 1_u64 << 63;
 const EXTERNAL_POOL_AVAILABILITY_CACHE_TTL: Duration = Duration::from_millis(250);
+const MAX_RECORDED_EXTERNAL_ERROR_MESSAGE_BYTES: usize = 8192;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -386,6 +387,7 @@ pub struct ExternalRouteRequest {
     pub model_capabilities: Arc<ModelCapabilitiesCatalog>,
     pub pricing_catalog: Arc<PricingCatalog>,
     pub request_id: String,
+    pub error_id: String,
     pub recorder: Arc<crate::anthropic::usage::UsageRecorder>,
     pub started_at: Instant,
     pub first_token_latency_ms: Arc<AtomicU64>,
@@ -469,6 +471,7 @@ struct ExternalForwardResponse {
 #[derive(Debug, Clone)]
 struct ExternalStreamErrorMask {
     request_id: String,
+    error_id: String,
     pool_id: u64,
     pool_name: String,
 }
@@ -484,6 +487,7 @@ pub struct ExternalPoolFinalError {
     pub response_error_type: String,
     pub route_error_type: String,
     pub message: String,
+    pub error_id: String,
     pub retryable: bool,
     pub attempts: Vec<ExternalPoolAttempt>,
     pub pool_id: Option<u64>,
@@ -492,13 +496,12 @@ pub struct ExternalPoolFinalError {
 
 impl ExternalPoolFinalError {
     pub fn into_response(self, request_id: &str) -> Response {
-        let external_error_id = envelope::request_id();
         let public_status = self.public_status();
         let public_error_type = self.public_error_type();
-        let message = self.public_message(&external_error_id);
+        let message = self.public_message(&self.error_id);
         tracing::warn!(
             request_id,
-            external_error_id = %external_error_id,
+            error_id = %self.error_id,
             status = self.status.as_u16(),
             public_status = public_status.as_u16(),
             response_error_type = %self.response_error_type,
@@ -516,7 +519,7 @@ impl ExternalPoolFinalError {
             public_error_type,
             message,
             request_id,
-            [("x-kiro-rs-error-id", external_error_id)],
+            [("x-kiro-rs-error-id", self.error_id)],
         )
     }
 
@@ -704,6 +707,14 @@ struct ExternalPoolError {
     auto_disable_reason: Option<String>,
     cooldown: Option<(Duration, String)>,
     response_body: Option<Bytes>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct UsageErrorDiagnostics {
+    status_code: Option<u16>,
+    source: Option<String>,
+    error_id: Option<String>,
+    metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -948,12 +959,18 @@ impl ExternalPoolManager {
                 Vec::new(),
                 "external_pool_disabled",
                 "request route is disabled",
+                synthetic_external_error_diagnostics(
+                    &route,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "external_dispatch",
+                ),
             );
             return ExternalPoolForwardOutcome::FinalError(ExternalPoolFinalError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 response_error_type: "service_unavailable".to_string(),
                 route_error_type: "external_pool_unavailable".to_string(),
                 message: "request route is disabled".to_string(),
+                error_id: route.error_id.clone(),
                 retryable: false,
                 attempts: Vec::new(),
                 pool_id: None,
@@ -1129,15 +1146,29 @@ impl ExternalPoolManager {
                         continue;
                     }
                     let error_type = error_type_for_external_error(&err);
+                    let response_error_type = anthropic_error_type_for_external_error(&err);
+                    let (record_message, message_truncated) = external_error_record_message(&err);
+                    let diagnostics = external_error_diagnostics(
+                        &route,
+                        &err,
+                        response_error_type,
+                        message_truncated,
+                    );
                     self.record_external_failure(
                         &route,
                         Some(&pool),
                         attempts.clone(),
                         &error_type,
-                        &err.message,
+                        &record_message,
+                        diagnostics,
                     );
                     return ExternalPoolForwardOutcome::FinalError(
-                        external_final_error_from_error(Some(&pool), attempts, &err),
+                        external_final_error_from_error(
+                            Some(&pool),
+                            attempts,
+                            &err,
+                            &route.error_id,
+                        ),
                     );
                 }
             }
@@ -1145,17 +1176,23 @@ impl ExternalPoolManager {
 
         if let Some((pool, err)) = last_error {
             let error_type = error_type_for_external_error(&err);
+            let response_error_type = anthropic_error_type_for_external_error(&err);
+            let (record_message, message_truncated) = external_error_record_message(&err);
+            let diagnostics =
+                external_error_diagnostics(&route, &err, response_error_type, message_truncated);
             self.record_external_failure(
                 &route,
                 Some(&pool),
                 attempts.clone(),
                 &error_type,
-                &err.message,
+                &record_message,
+                diagnostics,
             );
             return ExternalPoolForwardOutcome::FinalError(external_final_error_from_error(
                 Some(&pool),
                 attempts,
                 &err,
+                &route.error_id,
             ));
         }
 
@@ -1165,12 +1202,18 @@ impl ExternalPoolManager {
             attempts.clone(),
             "external_pool_unavailable",
             "No available external fallback pools",
+            synthetic_external_error_diagnostics(
+                &route,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "external_dispatch",
+            ),
         );
         ExternalPoolForwardOutcome::FinalError(ExternalPoolFinalError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             response_error_type: "service_unavailable".to_string(),
             route_error_type: "external_pool_unavailable".to_string(),
             message: "No available external fallback pools".to_string(),
+            error_id: route.error_id.clone(),
             retryable: false,
             attempts,
             pool_id: None,
@@ -1207,7 +1250,13 @@ impl ExternalPoolManager {
             ));
         }
         let response = request.send().await.map_err(|err| {
-            tracing::warn!(pool_id = pool.id, error = %err, "external pool request send failed");
+            tracing::warn!(
+                request_id = %route.request_id,
+                error_id = %route.error_id,
+                pool_id = pool.id,
+                error = %err,
+                "external pool request send failed"
+            );
             ExternalPoolError {
                 status: None,
                 message: sanitized_external_network_error("request send failed", &err),
@@ -1256,6 +1305,7 @@ impl ExternalPoolManager {
             let route_started_at = route.started_at;
             let stream_error_mask = Arc::new(ExternalStreamErrorMask {
                 request_id: route.request_id.clone(),
+                error_id: route.error_id.clone(),
                 pool_id: pool.id,
                 pool_name: pool.name.clone(),
             });
@@ -1314,7 +1364,14 @@ impl ExternalPoolManager {
                                             }
                                         }
                                         Some(Err(err)) => {
-                                            tracing::warn!(error = %err, "external pool stream read failed");
+                                            tracing::warn!(
+                                                request_id = %stream_error_mask.request_id,
+                                                error_id = %stream_error_mask.error_id,
+                                                pool_id = stream_error_mask.pool_id,
+                                                pool_name = %stream_error_mask.pool_name,
+                                                error = %err,
+                                                "external pool stream read failed"
+                                            );
                                             drop(lease);
                                             return Some((
                                                 Err(std::io::Error::other(
@@ -1409,14 +1466,22 @@ impl ExternalPoolManager {
             })
         } else {
             let bytes = response.bytes().await.map_err(|err| {
-                tracing::warn!(pool_id = pool.id, error = %err, "external pool response read failed");
+                tracing::warn!(
+                    request_id = %route.request_id,
+                    error_id = %route.error_id,
+                    pool_id = pool.id,
+                    error = %err,
+                    "external pool response read failed"
+                );
                 ExternalPoolError {
                     status: None,
                     message: sanitized_external_network_error("response read failed", &err),
                     retryable: true,
                     auto_disable_reason: None,
                     cooldown: Some((
-                        Duration::from_secs(config.external_pool_network_error_cooldown_secs.max(1)),
+                        Duration::from_secs(
+                            config.external_pool_network_error_cooldown_secs.max(1),
+                        ),
                         "network_error".to_string(),
                     )),
                     response_body: None,
@@ -1583,11 +1648,23 @@ impl ExternalPoolManager {
     ) -> ExternalCapacityDecision {
         if config.external_pool_capacity_mode != ExternalPoolCapacityMode::Wait {
             let (error_type, message) = external_capacity_error(reason);
-            self.record_external_failure(route, None, attempts, error_type, message);
+            self.record_external_failure(
+                route,
+                None,
+                attempts,
+                error_type,
+                message,
+                synthetic_external_error_diagnostics(
+                    route,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "external_dispatch",
+                ),
+            );
             return ExternalCapacityDecision::FinalError(external_capacity_final_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 error_type,
                 message,
+                &route.error_id,
             ));
         }
 
@@ -1611,11 +1688,17 @@ impl ExternalPoolManager {
                     attempts,
                     "external_pool_wait_timeout",
                     &message,
+                    synthetic_external_error_diagnostics(
+                        route,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "external_dispatch",
+                    ),
                 );
                 return ExternalCapacityDecision::FinalError(external_capacity_final_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "external_pool_wait_timeout",
                     message,
+                    &route.error_id,
                 ));
             }
         }
@@ -1634,11 +1717,17 @@ impl ExternalPoolManager {
                         attempts,
                         "external_pool_queue_full",
                         message,
+                        synthetic_external_error_diagnostics(
+                            route,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "external_dispatch",
+                        ),
                     );
                     return ExternalCapacityDecision::FinalError(external_capacity_final_error(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "external_pool_queue_full",
                         message,
+                        &route.error_id,
                     ));
                 }
                 Err(err) => {
@@ -1649,11 +1738,17 @@ impl ExternalPoolManager {
                         attempts,
                         "external_pool_queue_error",
                         &message,
+                        synthetic_external_error_diagnostics(
+                            route,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "external_dispatch",
+                        ),
                     );
                     return ExternalCapacityDecision::FinalError(external_capacity_final_error(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "external_pool_queue_error",
                         message,
+                        &route.error_id,
                     ));
                 }
             }
@@ -1675,11 +1770,17 @@ impl ExternalPoolManager {
                     attempts,
                     "external_pool_wait_timeout",
                     &message,
+                    synthetic_external_error_diagnostics(
+                        route,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "external_dispatch",
+                    ),
                 );
                 return ExternalCapacityDecision::FinalError(external_capacity_final_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "external_pool_wait_timeout",
                     message,
+                    &route.error_id,
                 ));
             }
             wakeup = wakeup.min(remaining);
@@ -2005,6 +2106,7 @@ impl ExternalPoolManager {
             None,
             None,
             None,
+            UsageErrorDiagnostics::default(),
             billing,
         );
     }
@@ -2016,6 +2118,7 @@ impl ExternalPoolManager {
         attempts: Vec<ExternalPoolAttempt>,
         error_type: &str,
         error_message: &str,
+        diagnostics: UsageErrorDiagnostics,
     ) {
         let error_detail = format!("{}: {}", error_type, error_message);
         self.record_external(
@@ -2026,6 +2129,7 @@ impl ExternalPoolManager {
             Some(error_type.to_string()),
             Some(error_message.to_string()),
             Some(error_detail),
+            diagnostics,
             None,
         );
     }
@@ -2063,8 +2167,15 @@ impl ExternalPoolManager {
                         Some((Ok(chunk), (data_stream, guard)))
                     }
                     Some(Err(err)) => {
-                        tracing::warn!(error = %err, "external stream response failed");
                         if let Some(mut guard) = guard.take() {
+                            tracing::warn!(
+                                request_id = %guard.route.request_id,
+                                error_id = %guard.route.error_id,
+                                pool_id = guard.pool.id,
+                                pool_name = %guard.pool.name,
+                                error = %err,
+                                "external stream response failed"
+                            );
                             guard.record_stream_error("external stream response failed");
                         }
                         Some((
@@ -2096,6 +2207,7 @@ impl ExternalPoolManager {
         error_type: Option<String>,
         error_message: Option<String>,
         error_detail: Option<String>,
+        error_diagnostics: UsageErrorDiagnostics,
         billing: Option<ExternalPoolBilling>,
     ) {
         let request_input_tokens = token::count_all_tokens(
@@ -2211,6 +2323,10 @@ impl ExternalPoolManager {
             error_type,
             error_message,
             error_detail,
+            error_status_code: error_diagnostics.status_code,
+            error_source: error_diagnostics.source,
+            error_id: error_diagnostics.error_id,
+            error_metadata: error_diagnostics.metadata,
             payload_breakdown: route
                 .payload_breakdown
                 .as_ref()
@@ -2282,6 +2398,12 @@ impl ExternalStreamUsageGuard {
                 Some("stream_error".to_string()),
                 Some(message.clone()),
                 Some(format!("stream_error: {}", message)),
+                UsageErrorDiagnostics {
+                    status_code: Some(StatusCode::OK.as_u16()),
+                    source: Some("external_account_stream".to_string()),
+                    error_id: Some(self.route.error_id.clone()),
+                    metadata: Some(json!({ "streamErrorEvent": true })),
+                },
                 None,
             );
             self.completed = true;
@@ -2314,6 +2436,12 @@ impl ExternalStreamUsageGuard {
             Some("stream_error".to_string()),
             Some(message.to_string()),
             Some(format!("stream_error: {}", message)),
+            UsageErrorDiagnostics {
+                status_code: None,
+                source: Some("external_stream".to_string()),
+                error_id: Some(self.route.error_id.clone()),
+                metadata: Some(json!({ "streamTransportError": true })),
+            },
             None,
         );
         self.completed = true;
@@ -2332,6 +2460,12 @@ impl ExternalStreamUsageGuard {
             Some("client_dropped".to_string()),
             Some(message.to_string()),
             Some(format!("client_dropped: {}", message)),
+            UsageErrorDiagnostics {
+                status_code: None,
+                source: Some("downstream_client".to_string()),
+                error_id: Some(self.route.error_id.clone()),
+                metadata: None,
+            },
             None,
         );
         self.completed = true;
@@ -2835,7 +2969,7 @@ fn success_error_body_protocol_error(
     config: &ExternalPoolsConfig,
 ) -> ExternalPoolError {
     ExternalPoolError {
-        status: Some(StatusCode::BAD_GATEWAY),
+        status: Some(StatusCode::OK),
         message: "model endpoint returned an error envelope with a success status".to_string(),
         retryable: true,
         auto_disable_reason: None,
@@ -2870,7 +3004,7 @@ fn success_protocol_error(
         format!("{context}; content-type={content_type}; body_prefix={body_prefix}")
     };
     ExternalPoolError {
-        status: Some(StatusCode::BAD_GATEWAY),
+        status: Some(StatusCode::OK),
         message,
         retryable: true,
         auto_disable_reason: Some("misconfigured_endpoint".to_string()),
@@ -2929,6 +3063,7 @@ fn external_final_error_from_error(
     pool: Option<&ExternalPool>,
     attempts: Vec<ExternalPoolAttempt>,
     err: &ExternalPoolError,
+    error_id: &str,
 ) -> ExternalPoolFinalError {
     let message = err
         .response_body
@@ -2941,6 +3076,7 @@ fn external_final_error_from_error(
         response_error_type: anthropic_error_type_for_external_error(err).to_string(),
         route_error_type: error_type_for_external_error(err),
         message,
+        error_id: error_id.to_string(),
         retryable: err.retryable,
         attempts,
         pool_id: pool.map(|pool| pool.id),
@@ -2962,16 +3098,112 @@ fn external_capacity_final_error(
     status: StatusCode,
     code: &str,
     message: impl Into<String>,
+    error_id: &str,
 ) -> ExternalPoolFinalError {
     ExternalPoolFinalError {
         status,
         response_error_type: code.to_string(),
         route_error_type: code.to_string(),
         message: message.into(),
+        error_id: error_id.to_string(),
         retryable: true,
         attempts: Vec::new(),
         pool_id: None,
         pool_name: None,
+    }
+}
+
+fn compact_usage_error_message(message: &str) -> (String, bool) {
+    if message.len() <= MAX_RECORDED_EXTERNAL_ERROR_MESSAGE_BYTES {
+        return (message.to_string(), false);
+    }
+    let mut out = String::with_capacity(MAX_RECORDED_EXTERNAL_ERROR_MESSAGE_BYTES + 3);
+    for ch in message.chars() {
+        if out.len() + ch.len_utf8() > MAX_RECORDED_EXTERNAL_ERROR_MESSAGE_BYTES {
+            out.push_str("...");
+            return (out, true);
+        }
+        out.push(ch);
+    }
+    (out, false)
+}
+
+fn external_error_record_message(err: &ExternalPoolError) -> (String, bool) {
+    let message = err
+        .response_body
+        .as_ref()
+        .map(|body| String::from_utf8_lossy(body).to_string())
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| err.message.clone());
+    compact_usage_error_message(&message)
+}
+
+fn metadata_insert(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    key: &'static str,
+    value: impl Into<serde_json::Value>,
+) {
+    map.insert(key.to_string(), value.into());
+}
+
+fn external_error_diagnostics(
+    route: &ExternalRouteRequest,
+    err: &ExternalPoolError,
+    response_error_type: &str,
+    message_truncated: bool,
+) -> UsageErrorDiagnostics {
+    let mut metadata = serde_json::Map::new();
+    metadata_insert(&mut metadata, "responseErrorType", response_error_type);
+    metadata_insert(&mut metadata, "retryable", err.retryable);
+    if let Some(reason) = err.auto_disable_reason.as_deref() {
+        metadata_insert(&mut metadata, "autoDisableReason", reason);
+    }
+    if let Some((duration, reason)) = err.cooldown.as_ref() {
+        metadata_insert(&mut metadata, "cooldownReason", reason.as_str());
+        if !duration.is_zero() {
+            metadata_insert(
+                &mut metadata,
+                "cooldownMs",
+                serde_json::Value::from(duration.as_millis() as u64),
+            );
+        }
+    }
+    if message_truncated {
+        metadata_insert(&mut metadata, "messageTruncated", true);
+    }
+    if err.status == Some(StatusCode::OK)
+        && err
+            .response_body
+            .as_ref()
+            .is_some_and(|body| success_response_looks_like_error_body(body))
+    {
+        metadata_insert(&mut metadata, "protocolError", "success_error_envelope");
+    } else if err
+        .auto_disable_reason
+        .as_deref()
+        .is_some_and(|reason| reason == "misconfigured_endpoint")
+    {
+        metadata_insert(&mut metadata, "protocolError", "unexpected_response_shape");
+    }
+
+    UsageErrorDiagnostics {
+        status_code: err.status.map(|status| status.as_u16()),
+        source: Some("external_account".to_string()),
+        error_id: Some(route.error_id.clone()),
+        metadata: (!metadata.is_empty()).then_some(serde_json::Value::Object(metadata)),
+    }
+}
+
+fn synthetic_external_error_diagnostics(
+    route: &ExternalRouteRequest,
+    status: StatusCode,
+    source: &'static str,
+) -> UsageErrorDiagnostics {
+    UsageErrorDiagnostics {
+        status_code: Some(status.as_u16()),
+        source: Some(source.to_string()),
+        error_id: Some(route.error_id.clone()),
+        metadata: Some(json!({ "syntheticStatus": true })),
     }
 }
 
@@ -3414,20 +3646,16 @@ fn maybe_mask_external_stream_error_event(
         return None;
     }
 
-    let external_error_id = envelope::request_id();
     let raw_event = compact_external_stream_error_event(text, 2048);
     if let Some(capture) = capture {
         let mut capture = capture.lock();
         if capture.stream_error_message.is_none() {
-            capture.stream_error_message = Some(format!(
-                "masked_stream_error error_id={} raw_event={}",
-                external_error_id, raw_event
-            ));
+            capture.stream_error_message = Some(raw_event.clone());
         }
     }
     tracing::warn!(
         request_id = %mask.request_id,
-        external_error_id = %external_error_id,
+        error_id = %mask.error_id,
         pool_id = mask.pool_id,
         pool_name = %mask.pool_name,
         raw_event = %raw_event,
@@ -3436,7 +3664,7 @@ fn maybe_mask_external_stream_error_event(
 
     let message = envelope::public_message_with_error_id(
         envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
-        &external_error_id,
+        &mask.error_id,
     );
     let body = json!({
         "type": "error",
@@ -4314,7 +4542,8 @@ mod tests {
             &ExternalPoolsConfig::default(),
         );
         let response =
-            external_final_error_from_error(None, Vec::new(), &err).into_response("req_gateway");
+            external_final_error_from_error(None, Vec::new(), &err, "req_01gatewayerror")
+                .into_response("req_gateway");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
@@ -4375,7 +4604,8 @@ mod tests {
         assert_eq!(error_type_for_external_error(&err), "rate_limit");
 
         let response =
-            external_final_error_from_error(None, Vec::new(), &err).into_response("req_gateway");
+            external_final_error_from_error(None, Vec::new(), &err, "req_01gatewayerror")
+                .into_response("req_gateway");
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(
@@ -4411,6 +4641,46 @@ mod tests {
         assert!(err.retryable);
         assert_eq!(error_type_for_external_error(&err), "rate_limit");
         assert!(err.auto_disable_reason.is_none());
+    }
+
+    #[test]
+    fn external_error_diagnostics_records_status_and_non_duplicate_metadata() {
+        let mut route = test_route("claude-sonnet-4-6");
+        route.error_id = "req_01diagnostic".to_string();
+        let err = classify_external_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            Bytes::from_static(br#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#),
+            HeaderMap::new(),
+            &ExternalPoolsConfig::default(),
+        );
+        let response_error_type = anthropic_error_type_for_external_error(&err);
+        let (record_message, message_truncated) = external_error_record_message(&err);
+        let diagnostics =
+            external_error_diagnostics(&route, &err, response_error_type, message_truncated);
+
+        assert_eq!(record_message, err.message);
+        assert_eq!(diagnostics.status_code, Some(429));
+        assert_eq!(diagnostics.source.as_deref(), Some("external_account"));
+        assert_eq!(diagnostics.error_id.as_deref(), Some("req_01diagnostic"));
+        let metadata = diagnostics.metadata.unwrap();
+        assert_eq!(metadata["responseErrorType"], "rate_limit_error");
+        assert_eq!(metadata["retryable"], true);
+        assert_eq!(metadata["cooldownReason"], "rate_limit");
+        for duplicate_key in [
+            "message",
+            "rawMessage",
+            "attempts",
+            "poolId",
+            "poolName",
+            "requestId",
+            "errorId",
+            "statusCode",
+        ] {
+            assert!(
+                metadata.get(duplicate_key).is_none(),
+                "metadata duplicated {duplicate_key}: {metadata}"
+            );
+        }
     }
 
     #[test]
@@ -4551,6 +4821,7 @@ mod tests {
             model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_external_capacity".to_string(),
+            error_id: "req_01capacity".to_string(),
             recorder: Arc::new(crate::anthropic::usage::UsageRecorder::new(1)),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
@@ -4561,8 +4832,12 @@ mod tests {
         };
 
         let (error_type, message) = external_capacity_error(PoolCapacityWaitReason::Full);
-        let err =
-            external_capacity_final_error(StatusCode::SERVICE_UNAVAILABLE, error_type, message);
+        let err = external_capacity_final_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_type,
+            message,
+            &route.error_id,
+        );
         assert!(err.is_capacity_like());
         assert_eq!(err.route_error_type, "external_pool_capacity_full");
         let response = err.into_response(&route.request_id);
@@ -4599,7 +4874,7 @@ mod tests {
         );
 
         assert!(err.retryable);
-        assert_eq!(err.status, Some(StatusCode::BAD_GATEWAY));
+        assert_eq!(err.status, Some(StatusCode::OK));
         assert_eq!(
             err.auto_disable_reason.as_deref(),
             Some("misconfigured_endpoint")
@@ -4620,7 +4895,7 @@ mod tests {
         let err = success_error_body_protocol_error(&body, &ExternalPoolsConfig::default());
 
         assert!(err.retryable);
-        assert_eq!(err.status, Some(StatusCode::BAD_GATEWAY));
+        assert_eq!(err.status, Some(StatusCode::OK));
         assert_eq!(err.response_body.as_deref(), Some(body.as_ref()));
         assert!(err.message.contains("success status"));
     }
@@ -4630,6 +4905,7 @@ mod tests {
         let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
         let mask = ExternalStreamErrorMask {
             request_id: "req_stream_mask".to_string(),
+            error_id: "req_01streammask".to_string(),
             pool_id: 7,
             pool_name: "pool-a".to_string(),
         };
@@ -4643,7 +4919,7 @@ data: {"type":"error","error":{"type":"api_error","message":"raw external promo 
 
         assert!(text.contains("event: error"));
         assert!(text.contains(envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE));
-        assert!(text.contains("error ID: req_01"));
+        assert!(text.contains("error ID: req_01streammask"));
         assert!(text.contains("req_stream_mask"));
         assert!(!text.contains("raw external promo text"));
         assert!(!text.contains("pool-a"));
@@ -4655,7 +4931,7 @@ data: {"type":"error","error":{"type":"api_error","message":"raw external promo 
             .clone()
             .expect("raw stream error recorded");
         assert!(recorded.contains("raw external promo text"));
-        assert!(recorded.contains("masked_stream_error"));
+        assert!(!recorded.contains("req_01streammask"));
     }
 
     fn assert_public_message_hides_internal_routing(message: &str) {
@@ -4825,6 +5101,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
             model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_external_billing".to_string(),
+            error_id: "req_error_external_billing".to_string(),
             recorder: Arc::new(crate::anthropic::usage::UsageRecorder::new(1)),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),

@@ -80,6 +80,7 @@ struct RequestUsageContext {
         Arc<super::prompt_cache_creation_control::PromptCacheCreationController>,
     pricing_catalog: Arc<super::pricing::PricingCatalog>,
     request_id: String,
+    error_id: String,
     endpoint: String,
     stream: bool,
     model: String,
@@ -177,6 +178,7 @@ struct ExternalFallbackContext {
     model_capabilities: Arc<super::model_capabilities::ModelCapabilitiesCatalog>,
     pricing_catalog: Arc<super::pricing::PricingCatalog>,
     recorder: Arc<super::usage::UsageRecorder>,
+    error_id: String,
     payload_guard_external_enabled: bool,
     payload_guard_initial_config: PayloadGuardConfig,
     payload_guard_retry_config: Option<PayloadGuardConfig>,
@@ -446,6 +448,7 @@ fn build_external_fallback_context(
             model_capabilities: state.model_capabilities.clone(),
             pricing_catalog: state.pricing_catalog.clone(),
             recorder: state.usage_recorder.clone(),
+            error_id: envelope::request_id(),
             payload_guard_external_enabled: runtime_config.payload_guard_external_enabled,
             payload_guard_initial_config: runtime_config.initial_payload_guard_config(),
             payload_guard_retry_config: runtime_config
@@ -669,6 +672,7 @@ impl ExternalFallbackContext {
             model_capabilities: self.model_capabilities.clone(),
             pricing_catalog: self.pricing_catalog.clone(),
             request_id,
+            error_id: self.error_id.clone(),
             recorder: self.recorder.clone(),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
@@ -1327,35 +1331,38 @@ fn extract_credential_error_hint(message: &str) -> Option<CredentialErrorHint> {
     Some(CredentialErrorHint { id, label })
 }
 
-fn log_provider_call_failure(message: &str) {
+fn log_provider_call_failure(message: &str, error_id: Option<&str>) {
     if let Some(hint) = extract_credential_error_hint(message) {
         tracing::warn!(
+            error_id = ?error_id,
             credential_id = hint.id,
             credential_label = %hint.display_label(),
             error = %message,
             "模型请求失败"
         );
     } else {
-        tracing::warn!(error = %message, "模型请求失败");
+        tracing::warn!(error_id = ?error_id, error = %message, "模型请求失败");
     }
 }
 
-fn log_provider_warning_with_hint(message: &str, reason: &'static str) {
+fn log_provider_warning_with_hint(message: &str, reason: &'static str, error_id: Option<&str>) {
     if let Some(hint) = extract_credential_error_hint(message) {
         tracing::warn!(
+            error_id = ?error_id,
             credential_id = hint.id,
             credential_label = %hint.display_label(),
             error = %message,
             "{}", reason
         );
     } else {
-        tracing::warn!(error = %message, "{}", reason);
+        tracing::warn!(error_id = ?error_id, error = %message, "{}", reason);
     }
 }
 
-fn log_provider_rate_limit_with_hint(message: &str, retry_after_secs: u64) {
+fn log_provider_rate_limit_with_hint(message: &str, retry_after_secs: u64, error_id: Option<&str>) {
     if let Some(hint) = extract_credential_error_hint(message) {
         tracing::warn!(
+            error_id = ?error_id,
             credential_id = hint.id,
             credential_label = %hint.display_label(),
             error = %message,
@@ -1364,6 +1371,7 @@ fn log_provider_rate_limit_with_hint(message: &str, retry_after_secs: u64) {
         );
     } else {
         tracing::warn!(
+            error_id = ?error_id,
             error = %message,
             retry_after_secs,
             "模型请求或本地凭据调度临时不可用，返回 429"
@@ -1371,17 +1379,40 @@ fn log_provider_rate_limit_with_hint(message: &str, retry_after_secs: u64) {
     }
 }
 
-fn log_provider_error_with_hint(message: &str, reason: &'static str) {
+fn log_provider_error_with_hint(message: &str, reason: &'static str, error_id: Option<&str>) {
     if let Some(hint) = extract_credential_error_hint(message) {
         tracing::error!(
+            error_id = ?error_id,
             credential_id = hint.id,
             credential_label = %hint.display_label(),
             error = %message,
             "{}", reason
         );
     } else {
-        tracing::error!(error = %message, "{}", reason);
+        tracing::error!(error_id = ?error_id, error = %message, "{}", reason);
     }
+}
+
+fn public_error_response(
+    status: StatusCode,
+    error_type: &'static str,
+    message: impl Into<String>,
+    request_id: Option<&str>,
+    error_id: Option<&str>,
+    extra_headers: impl IntoIterator<Item = (&'static str, String)>,
+) -> Response {
+    let request_id = request_id
+        .map(str::to_string)
+        .unwrap_or_else(envelope::request_id);
+    let message = match error_id {
+        Some(error_id) => envelope::public_message_with_error_id(&message.into(), error_id),
+        None => message.into(),
+    };
+    let mut headers = extra_headers.into_iter().collect::<Vec<_>>();
+    if let Some(error_id) = error_id {
+        headers.push(("x-kiro-rs-error-id", error_id.to_string()));
+    }
+    envelope::error_response_with_id_and_headers(status, error_type, message, &request_id, headers)
 }
 
 impl CredentialUsageContext {
@@ -1674,6 +1705,21 @@ impl CredentialUsageContext {
             None
         };
         let duration_ms = self.request.started_at.elapsed().as_millis() as u64;
+        let error_source = match status {
+            UsageRecordStatus::Success => None,
+            UsageRecordStatus::ClientDropped => Some("downstream_client".to_string()),
+            UsageRecordStatus::StreamError => Some("local_account_stream".to_string()),
+            UsageRecordStatus::Error | UsageRecordStatus::UpstreamTimeout => {
+                Some("local_account".to_string())
+            }
+        };
+        let error_status_code = error_source.as_ref().and_then(|_| {
+            self.credential_attempts
+                .iter()
+                .rev()
+                .find_map(|attempt| attempt.status)
+        });
+        let error_id = error_source.as_ref().map(|_| self.request.error_id.clone());
         self.request.recorder.record(UsageRecord {
             id: self.request.request_id.clone(),
             created_at: Utc::now().to_rfc3339(),
@@ -1728,6 +1774,10 @@ impl CredentialUsageContext {
             error_type,
             error_message,
             error_detail,
+            error_status_code,
+            error_source,
+            error_id,
+            error_metadata: None,
             payload_breakdown,
             payload_guard_report,
         });
@@ -2272,6 +2322,7 @@ fn prepare_usage_context(
         prompt_cache_profile.as_ref(),
     );
     let request_id = envelope::request_id();
+    let error_id = envelope::request_id();
     let reported_cache_creation_seed = prompt_cache_profile
         .as_ref()
         .map(|profile| profile.cache_jitter_seed())
@@ -2290,6 +2341,7 @@ fn prepare_usage_context(
         prompt_cache_creation_controller: state.prompt_cache_creation_controller.clone(),
         pricing_catalog: state.pricing_catalog.clone(),
         request_id,
+        error_id,
         endpoint: endpoint.to_string(),
         stream,
         model: payload.model.clone(),
@@ -2450,6 +2502,7 @@ fn cooldown_retry_after_secs(
 fn map_provider_error(
     err: Error,
     request_id: Option<&str>,
+    error_id: Option<&str>,
     provider: Option<&crate::kiro::provider::KiroProvider>,
 ) -> Response {
     let err_str = err.to_string();
@@ -2457,86 +2510,77 @@ fn map_provider_error(
     // Provider content length thresholds and model context windows are different limits.
     if is_upstream_payload_too_long_error(&err_str) {
         let message = "Request input content length exceeded the request threshold. This limit is separate from the model context window. Reduce oversized tools, system prompt, documents, images, tool results, or conversation history.";
-        log_provider_warning_with_hint(&err_str, "请求被拒绝：输入内容长度超过接口阈值");
-        return if let Some(request_id) = request_id {
-            envelope::error_response_with_id(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                message,
-                request_id,
-            )
-        } else {
-            envelope::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message)
-        };
+        log_provider_warning_with_hint(&err_str, "请求被拒绝：输入内容长度超过接口阈值", error_id);
+        return public_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            message,
+            request_id,
+            error_id,
+            std::iter::empty::<(&'static str, String)>(),
+        );
     }
 
     if is_upstream_context_window_full_error(&err_str) {
         let message = "Context window is full. Reduce conversation history, system prompt, tools, documents, images, or tool results.";
-        log_provider_warning_with_hint(&err_str, "请求被拒绝：上下文窗口已满");
-        return if let Some(request_id) = request_id {
-            envelope::error_response_with_id(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                message,
-                request_id,
-            )
-        } else {
-            envelope::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message)
-        };
+        log_provider_warning_with_hint(&err_str, "请求被拒绝：上下文窗口已满", error_id);
+        return public_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            message,
+            request_id,
+            error_id,
+            std::iter::empty::<(&'static str, String)>(),
+        );
     }
 
     if is_upstream_improperly_formed_error(&err_str) {
         log_provider_warning_with_hint(
             &err_str,
             "请求被拒绝：Kiro payload 形态不合法（不应切换账号重试）",
+            error_id,
         );
-        return if let Some(request_id) = request_id {
-            envelope::error_response_with_id(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                UPSTREAM_INVALID_REQUEST_MESSAGE,
-                request_id,
-            )
-        } else {
-            envelope::error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                UPSTREAM_INVALID_REQUEST_MESSAGE,
-            )
-        };
+        return public_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            UPSTREAM_INVALID_REQUEST_MESSAGE,
+            request_id,
+            error_id,
+            std::iter::empty::<(&'static str, String)>(),
+        );
     }
 
     if is_upstream_invalid_model_error(&err_str) {
-        log_provider_warning_with_hint(&err_str, "请求被拒绝：上游模型不支持（不应切换账号重试）");
+        log_provider_warning_with_hint(
+            &err_str,
+            "请求被拒绝：上游模型不支持（不应切换账号重试）",
+            error_id,
+        );
         let message = envelope::PUBLIC_MODEL_UNAVAILABLE_MESSAGE;
-        return if let Some(request_id) = request_id {
-            envelope::error_response_with_id(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                message,
-                request_id,
-            )
-        } else {
-            envelope::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message)
-        };
+        return public_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            message,
+            request_id,
+            error_id,
+            std::iter::empty::<(&'static str, String)>(),
+        );
     }
 
     if is_upstream_bad_request_error(&err_str) {
-        log_provider_warning_with_hint(&err_str, "请求被上游以 400 拒绝（不应切换账号重试）");
-        return if let Some(request_id) = request_id {
-            envelope::error_response_with_id(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                UPSTREAM_INVALID_REQUEST_MESSAGE,
-                request_id,
-            )
-        } else {
-            envelope::error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                UPSTREAM_INVALID_REQUEST_MESSAGE,
-            )
-        };
+        log_provider_warning_with_hint(
+            &err_str,
+            "请求被上游以 400 拒绝（不应切换账号重试）",
+            error_id,
+        );
+        return public_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            UPSTREAM_INVALID_REQUEST_MESSAGE,
+            request_id,
+            error_id,
+            std::iter::empty::<(&'static str, String)>(),
+        );
     }
 
     if err_str.contains("临时冷却")
@@ -2550,60 +2594,45 @@ fn map_provider_error(
         let retry_after_secs = retry_after_secs_from_error(&err_str)
             .map(|secs| secs.max(1))
             .unwrap_or_else(|| cooldown_retry_after_secs(provider, 1));
-        log_provider_rate_limit_with_hint(&err_str, retry_after_secs);
+        log_provider_rate_limit_with_hint(&err_str, retry_after_secs, error_id);
         let message = format!(
             "Too many requests. Retry after {} seconds.",
             retry_after_secs
         );
-        return if let Some(request_id) = request_id {
-            envelope::error_response_with_id_and_headers(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate_limit_error",
-                message,
-                request_id,
-                [("retry-after", retry_after_secs.to_string())],
-            )
-        } else {
-            envelope::error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", message)
-        };
+        return public_error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            message,
+            request_id,
+            error_id,
+            [("retry-after", retry_after_secs.to_string())],
+        );
     }
 
     if err_str.contains("所有凭据均已禁用")
         || err_str.contains("所有凭据已用尽")
         || err_str.contains("没有支持当前模型的可用凭据")
     {
-        log_provider_error_with_hint(&err_str, "没有可调度凭据");
-        return if let Some(request_id) = request_id {
-            envelope::error_response_with_id(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "api_error",
-                envelope::PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE,
-                request_id,
-            )
-        } else {
-            envelope::error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "api_error",
-                envelope::PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE,
-            )
-        };
+        log_provider_error_with_hint(&err_str, "没有可调度凭据", error_id);
+        return public_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            envelope::PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE,
+            request_id,
+            error_id,
+            std::iter::empty::<(&'static str, String)>(),
+        );
     }
 
-    log_provider_error_with_hint(&err_str, "Kiro API 调用失败");
-    if let Some(request_id) = request_id {
-        envelope::error_response_with_id(
-            StatusCode::BAD_GATEWAY,
-            "api_error",
-            envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
-            request_id,
-        )
-    } else {
-        envelope::error_response(
-            StatusCode::BAD_GATEWAY,
-            "api_error",
-            envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
-        )
-    }
+    log_provider_error_with_hint(&err_str, "Kiro API 调用失败", error_id);
+    public_error_response(
+        StatusCode::BAD_GATEWAY,
+        "api_error",
+        envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+        request_id,
+        error_id,
+        std::iter::empty::<(&'static str, String)>(),
+    )
 }
 
 fn is_upstream_payload_too_long_error(value: &str) -> bool {
@@ -3551,7 +3580,7 @@ async fn handle_stream_request(
         Err(e) => {
             let message = e.to_string();
             let attempts = KiroProvider::attempts_from_error(&e);
-            log_provider_call_failure(&message);
+            log_provider_call_failure(&message, Some(&usage_context.error_id));
             let endpoint = usage_context.endpoint.clone();
             attach_and_log_tool_use_format_diagnostics(
                 &message,
@@ -3605,7 +3634,7 @@ async fn handle_stream_request(
                         let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
                         let all_attempts =
                             merge_credential_attempts(retry_attempt_prefix.clone(), retry_attempts);
-                        log_provider_call_failure(&retry_message);
+                        log_provider_call_failure(&retry_message, Some(&usage_context.error_id));
                         let endpoint = usage_context.endpoint.clone();
                         attach_and_log_tool_use_format_diagnostics(
                             &retry_message,
@@ -3678,7 +3707,11 @@ async fn handle_stream_request(
                                                             retry_attempt_prefix.clone(),
                                                             rescue_attempts,
                                                         );
-                                                    log_provider_call_failure(&rescue_message);
+                                                    log_provider_call_failure(
+                                                        &rescue_message,
+                                                        Some(&usage_context.error_id),
+                                                    );
+                                                    let error_id = usage_context.error_id.clone();
                                                     usage_context
                                                         .attach_provider_error_credential(
                                                             &provider,
@@ -3693,6 +3726,7 @@ async fn handle_stream_request(
                                                     return map_provider_error(
                                                         rescue_error,
                                                         Some(&request_id),
+                                                        Some(&error_id),
                                                         Some(provider.as_ref()),
                                                     );
                                                 }
@@ -3706,6 +3740,7 @@ async fn handle_stream_request(
                                 }
                             }
                         } else {
+                            let error_id = usage_context.error_id.clone();
                             usage_context
                                 .attach_provider_error_credential(
                                     &provider,
@@ -3720,6 +3755,7 @@ async fn handle_stream_request(
                             return map_provider_error(
                                 retry_error,
                                 Some(&request_id),
+                                Some(&error_id),
                                 Some(provider.as_ref()),
                             );
                         }
@@ -3784,7 +3820,11 @@ async fn handle_stream_request(
                                                 retry_attempt_prefix.clone(),
                                                 rescue_attempts,
                                             );
-                                            log_provider_call_failure(&rescue_message);
+                                            log_provider_call_failure(
+                                                &rescue_message,
+                                                Some(&usage_context.error_id),
+                                            );
+                                            let error_id = usage_context.error_id.clone();
                                             usage_context
                                                 .attach_provider_error_credential(
                                                     &provider,
@@ -3799,6 +3839,7 @@ async fn handle_stream_request(
                                             return map_provider_error(
                                                 rescue_error,
                                                 Some(&request_id),
+                                                Some(&error_id),
                                                 Some(provider.as_ref()),
                                             );
                                         }
@@ -3812,10 +3853,16 @@ async fn handle_stream_request(
                         }
                     }
                 } else {
+                    let error_id = usage_context.error_id.clone();
                     usage_context
                         .attach_provider_error_credential(&provider, &message, attempts)
                         .record_failure(UsageRecordStatus::Error, "api_error", message);
-                    return map_provider_error(e, Some(&request_id), Some(provider.as_ref()));
+                    return map_provider_error(
+                        e,
+                        Some(&request_id),
+                        Some(&error_id),
+                        Some(provider.as_ref()),
+                    );
                 }
             }
         }
@@ -4131,7 +4178,7 @@ async fn handle_non_stream_request(
         Err(e) => {
             let message = e.to_string();
             let attempts = KiroProvider::attempts_from_error(&e);
-            log_provider_call_failure(&message);
+            log_provider_call_failure(&message, Some(&usage_context.error_id));
             let endpoint = usage_context.endpoint.clone();
             attach_and_log_tool_use_format_diagnostics(
                 &message,
@@ -4185,7 +4232,7 @@ async fn handle_non_stream_request(
                         let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
                         let all_attempts =
                             merge_credential_attempts(retry_attempt_prefix.clone(), retry_attempts);
-                        log_provider_call_failure(&retry_message);
+                        log_provider_call_failure(&retry_message, Some(&usage_context.error_id));
                         let endpoint = usage_context.endpoint.clone();
                         attach_and_log_tool_use_format_diagnostics(
                             &retry_message,
@@ -4258,7 +4305,11 @@ async fn handle_non_stream_request(
                                                             retry_attempt_prefix.clone(),
                                                             rescue_attempts,
                                                         );
-                                                    log_provider_call_failure(&rescue_message);
+                                                    log_provider_call_failure(
+                                                        &rescue_message,
+                                                        Some(&usage_context.error_id),
+                                                    );
+                                                    let error_id = usage_context.error_id.clone();
                                                     usage_context
                                                         .attach_provider_error_credential(
                                                             &provider,
@@ -4273,6 +4324,7 @@ async fn handle_non_stream_request(
                                                     return map_provider_error(
                                                         rescue_error,
                                                         Some(&request_id),
+                                                        Some(&error_id),
                                                         Some(provider.as_ref()),
                                                     );
                                                 }
@@ -4286,6 +4338,7 @@ async fn handle_non_stream_request(
                                 }
                             }
                         } else {
+                            let error_id = usage_context.error_id.clone();
                             usage_context
                                 .attach_provider_error_credential(
                                     &provider,
@@ -4300,6 +4353,7 @@ async fn handle_non_stream_request(
                             return map_provider_error(
                                 retry_error,
                                 Some(&request_id),
+                                Some(&error_id),
                                 Some(provider.as_ref()),
                             );
                         }
@@ -4364,7 +4418,11 @@ async fn handle_non_stream_request(
                                                 retry_attempt_prefix.clone(),
                                                 rescue_attempts,
                                             );
-                                            log_provider_call_failure(&rescue_message);
+                                            log_provider_call_failure(
+                                                &rescue_message,
+                                                Some(&usage_context.error_id),
+                                            );
+                                            let error_id = usage_context.error_id.clone();
                                             usage_context
                                                 .attach_provider_error_credential(
                                                     &provider,
@@ -4379,6 +4437,7 @@ async fn handle_non_stream_request(
                                             return map_provider_error(
                                                 rescue_error,
                                                 Some(&request_id),
+                                                Some(&error_id),
                                                 Some(provider.as_ref()),
                                             );
                                         }
@@ -4392,10 +4451,16 @@ async fn handle_non_stream_request(
                         }
                     }
                 } else {
+                    let error_id = usage_context.error_id.clone();
                     usage_context
                         .attach_provider_error_credential(&provider, &message, attempts)
                         .record_failure(UsageRecordStatus::Error, "api_error", message);
-                    return map_provider_error(e, Some(&request_id), Some(provider.as_ref()));
+                    return map_provider_error(
+                        e,
+                        Some(&request_id),
+                        Some(&error_id),
+                        Some(provider.as_ref()),
+                    );
                 }
             }
         }
@@ -5520,6 +5585,7 @@ mod tests {
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_reported_limit".to_string(),
+            error_id: "req_01reported_limit".to_string(),
             endpoint: "/cc/v1/messages".to_string(),
             stream: false,
             model: "claude-sonnet-4-6".to_string(),
@@ -5597,6 +5663,7 @@ mod tests {
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_prod_like_cc_reported_usage".to_string(),
+            error_id: "req_01prod_like_cc_reported_usage".to_string(),
             endpoint: "/cc/v1/messages".to_string(),
             stream: true,
             model: "claude-opus-4-6".to_string(),
@@ -5737,6 +5804,7 @@ mod tests {
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_latency_trace".to_string(),
+            error_id: "req_01latency_trace".to_string(),
             endpoint: "/cc/v1/messages".to_string(),
             stream: true,
             model: "claude-opus-4-8".to_string(),
@@ -5833,6 +5901,7 @@ mod tests {
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_v1_policy".to_string(),
+            error_id: "req_01v1_policy".to_string(),
             endpoint: "/v1/messages".to_string(),
             stream: false,
             model: "claude-sonnet-4-6".to_string(),
@@ -5873,6 +5942,7 @@ mod tests {
         let cc_context = RequestUsageContext {
             endpoint: "/cc/v1/messages".to_string(),
             request_id: "req_cc_policy".to_string(),
+            error_id: "req_01cc_policy".to_string(),
             reported_cache_usage_policy: reported_cache_usage_policy(
                 "/cc/v1/messages",
                 PromptCacheSimulationMode::HighCache,
@@ -5884,6 +5954,7 @@ mod tests {
         let ha_context = RequestUsageContext {
             endpoint: "/ha/v1/messages".to_string(),
             request_id: "req_ha_policy".to_string(),
+            error_id: "req_01ha_policy".to_string(),
             reported_cache_usage_policy: reported_cache_usage_policy(
                 "/ha/v1/messages",
                 PromptCacheSimulationMode::HighCache,
@@ -5895,6 +5966,7 @@ mod tests {
         let na_context = RequestUsageContext {
             endpoint: "/na/v1/messages".to_string(),
             request_id: "req_na_policy".to_string(),
+            error_id: "req_01na_policy".to_string(),
             reported_cache_usage_policy: reported_cache_usage_policy(
                 "/na/v1/messages",
                 PromptCacheSimulationMode::HighCache,
@@ -5990,6 +6062,7 @@ mod tests {
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_error_hint".to_string(),
+            error_id: "req_01error_hint".to_string(),
             endpoint: "/v1/messages".to_string(),
             stream: false,
             model: "claude-sonnet-4-6".to_string(),
@@ -6033,6 +6106,8 @@ mod tests {
             records[0].credential_label.as_deref(),
             Some("IlmiMiazzi@gmail.com")
         );
+        assert_eq!(records[0].error_id.as_deref(), Some("req_01error_hint"));
+        assert_eq!(records[0].error_source.as_deref(), Some("local_account"));
     }
 
     #[tokio::test]
@@ -6043,6 +6118,7 @@ mod tests {
                 r#"流式 API 请求失败（凭据 #1 test@example.com）: 400 Bad Request {"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#
             ),
             Some("req_test_content_length"),
+            None,
             None,
         );
 
@@ -6070,6 +6146,7 @@ mod tests {
             ),
             Some("req_test_malformed"),
             None,
+            None,
         );
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -6096,6 +6173,7 @@ mod tests {
             ),
             Some("req_test_opaque_bad_request"),
             None,
+            None,
         );
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -6118,6 +6196,7 @@ mod tests {
         let response = map_provider_error(
             anyhow::anyhow!("所有凭据均已禁用（0/26）"),
             Some("req_no_account"),
+            None,
             None,
         );
 
@@ -6149,6 +6228,7 @@ mod tests {
             ),
             Some("req_generic_provider"),
             None,
+            None,
         );
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -6168,6 +6248,43 @@ mod tests {
         assert_public_error_message_is_normalized(message);
         assert!(!message.contains("shadow"));
         assert_eq!(value["request_id"], "req_generic_provider");
+    }
+
+    #[tokio::test]
+    async fn provider_error_response_exposes_matching_public_error_id() {
+        let response = map_provider_error(
+            anyhow::anyhow!(
+                "流式 API 请求失败（凭据 #37 shadow，请求失败）: 502 Bad Gateway raw upstream body"
+            ),
+            Some("req_public_error_id"),
+            Some("req_01public_error_id"),
+            None,
+        );
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-kiro-rs-error-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("req_01public_error_id")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            value.pointer("/error/type").and_then(|v| v.as_str()),
+            Some("api_error")
+        );
+        let message = value
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .expect("error message");
+        assert!(message.contains(envelope::PUBLIC_PROCESSING_FAILED_MESSAGE));
+        assert!(message.contains("error ID: req_01public_error_id"));
+        assert!(!message.contains("shadow"));
+        assert_public_error_message_is_normalized(message);
     }
 
     fn assert_public_error_message_is_normalized(message: &str) {
@@ -6222,6 +6339,7 @@ mod tests {
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_test".to_string(),
+            error_id: "req_01test".to_string(),
             endpoint: "/v1/messages".to_string(),
             stream: true,
             model: payload.model.clone(),
@@ -6305,6 +6423,7 @@ mod tests {
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_high_cache".to_string(),
+            error_id: "req_01high_cache".to_string(),
             endpoint: "/v1/messages".to_string(),
             stream: true,
             model: payload.model.clone(),
@@ -6884,6 +7003,7 @@ mod tests {
             message:
                 r#"{"message":"Too many requests, please wait before trying again.","reason":"SERVICE_REQUEST_RATE_EXCEEDED"}"#
                     .to_string(),
+            error_id: "req_01rate_limit".to_string(),
             retryable: true,
             attempts: Vec::new(),
             pool_id: Some(1),
@@ -6907,6 +7027,7 @@ mod tests {
             response_error_type: "api_error".to_string(),
             route_error_type: "network_error".to_string(),
             message: "stream idle timeout".to_string(),
+            error_id: "req_01timeout".to_string(),
             retryable: true,
             attempts: Vec::new(),
             pool_id: Some(1),
@@ -6922,6 +7043,7 @@ mod tests {
             response_error_type: "api_error".to_string(),
             route_error_type: "external_pool_capacity_full".to_string(),
             message: "Request capacity is full".to_string(),
+            error_id: "req_01capacity".to_string(),
             retryable: true,
             attempts: Vec::new(),
             pool_id: None,
@@ -6937,6 +7059,7 @@ mod tests {
             response_error_type: "invalid_request_error".to_string(),
             route_error_type: "client_error".to_string(),
             message: "Improperly formed request".to_string(),
+            error_id: "req_01bad_request".to_string(),
             retryable: false,
             attempts: Vec::new(),
             pool_id: Some(1),
