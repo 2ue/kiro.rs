@@ -19,6 +19,11 @@ struct AdminAsset;
 #[folder = "admin-ui-daisy/dist"]
 struct ConsoleAsset;
 
+/// 嵌入重构版前端构建产物(shadcn + Tailwind v4)
+#[derive(Embed)]
+#[folder = "ui/dist"]
+struct NewUiAsset;
+
 trait UiAsset {
     const BUILD_HINT: &'static str;
 
@@ -42,6 +47,14 @@ impl UiAsset for ConsoleAsset {
     }
 }
 
+impl UiAsset for NewUiAsset {
+    const BUILD_HINT: &'static str = "New UI not built. Run 'pnpm build' in ui directory.";
+
+    fn get(path: &str) -> Option<rust_embed::EmbeddedFile> {
+        <Self as rust_embed::RustEmbed>::get(path)
+    }
+}
+
 /// 创建旧版 Admin UI 路由
 pub fn create_admin_ui_router() -> Router {
     Router::new()
@@ -54,6 +67,13 @@ pub fn create_console_ui_router() -> Router {
     Router::new()
         .route("/", get(console_index_handler))
         .route("/{*file}", get(console_static_handler))
+}
+
+/// 创建重构版 UI 路由
+pub fn create_new_ui_router() -> Router {
+    Router::new()
+        .route("/", get(new_ui_index_handler))
+        .route("/{*file}", get(new_ui_static_handler))
 }
 
 /// 处理旧版首页请求
@@ -74,6 +94,16 @@ async fn admin_static_handler(uri: Uri) -> impl IntoResponse {
 /// 处理新版静态文件请求
 async fn console_static_handler(uri: Uri) -> impl IntoResponse {
     static_handler::<ConsoleAsset>(uri)
+}
+
+/// 处理重构版首页请求
+async fn new_ui_index_handler() -> impl IntoResponse {
+    serve_index::<NewUiAsset>()
+}
+
+/// 处理重构版静态文件请求
+async fn new_ui_static_handler(uri: Uri) -> impl IntoResponse {
+    static_handler::<NewUiAsset>(uri)
 }
 
 /// 处理静态文件请求

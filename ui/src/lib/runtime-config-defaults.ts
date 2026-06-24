@@ -1,0 +1,346 @@
+import type {
+  PayloadShapingConfig,
+  PromptCacheCreationControlConfig,
+  ReportedUsageConfig,
+  ReportedUsageFieldMode,
+  ReportedUsageFieldPolicy,
+  ReportedUsagePathPolicy,
+  RuntimeConfig,
+} from '@/types/api'
+
+export function preserveFieldPolicy(): ReportedUsageFieldPolicy {
+  return {
+    mode: 'preserve',
+    maxTokens: 0,
+    targetTokens: 0,
+    normalMaxMultiplier: 1.1,
+    moveDeltaToCacheRead: false,
+  }
+}
+
+export function rawFieldPolicy(): ReportedUsageFieldPolicy {
+  return { ...preserveFieldPolicy(), mode: 'raw' }
+}
+
+export function inputSamplePolicy(maxTokens = 96): ReportedUsageFieldPolicy {
+  return { ...preserveFieldPolicy(), mode: 'sample-max', maxTokens, moveDeltaToCacheRead: true }
+}
+
+export function writerSamplePolicy(targetTokens = 3000, normalMaxMultiplier = 1.2): ReportedUsageFieldPolicy {
+  return { ...preserveFieldPolicy(), mode: 'sample-target', targetTokens, normalMaxMultiplier }
+}
+
+export function pathPolicy(
+  enabled = true,
+  input: ReportedUsageFieldPolicy = rawFieldPolicy(),
+  cacheCreation: ReportedUsageFieldPolicy = preserveFieldPolicy()
+): ReportedUsagePathPolicy {
+  return {
+    enabled,
+    finalCacheReadMaxTokens: 700000,
+    finalCacheReadJitterMinTokens: 0,
+    finalCacheReadJitterMaxTokens: 0,
+    input,
+    output: rawFieldPolicy(),
+    cacheRead: preserveFieldPolicy(),
+    cacheCreation,
+  }
+}
+
+export function defaultReportedUsage(): ReportedUsageConfig {
+  return {
+    default: pathPolicy(),
+    pathOverrides: {
+      '/na': pathPolicy(false),
+      '/cc': pathPolicy(true, inputSamplePolicy(96), writerSamplePolicy(3000)),
+      '/ha': pathPolicy(true, inputSamplePolicy(96), preserveFieldPolicy()),
+    },
+  }
+}
+
+export function defaultPayloadShaping(): PayloadShapingConfig {
+  return {
+    enabled: true,
+    truncateHistoricalToolResults: true,
+    historicalToolResultMaxChars: 8000,
+    historicalToolResultHeadLines: 80,
+    historicalToolResultTailLines: 40,
+    discardHistoricalThinking: true,
+    compressToolDefinitions: true,
+    toolDefinitionsBudgetBytes: 20000,
+    toolDescriptionMaxChars: 4000,
+    toolSchemaAnnotationMaxChars: 1000,
+    webFetchTrimEnabled: true,
+    webFetchBodyMaxChars: 12000,
+    fitCurrentPayloadToBudget: false,
+    truncateCurrentToolResults: false,
+    currentToolResultMaxChars: 80000,
+    truncateCurrentUserContent: false,
+    currentUserContentMaxChars: 120000,
+    truncateCurrentDocuments: false,
+    currentDocumentMaxChars: 80000,
+    truncateCurrentImages: false,
+    currentImagesMaxBytes: 180000,
+  }
+}
+
+export function defaultPromptCacheCreationControl(): PromptCacheCreationControlConfig {
+  return {
+    enabled: true,
+    scopeMode: 'conversation_model',
+    minSuccessfulRequestsBetweenCreation: 3,
+    minCreationIntervalSecs: 60,
+    minCreationDeltaTokens: 12000,
+    maxCreationTokensPerEvent: 30000,
+    creationBudgetWindowSecs: 300,
+    maxCreationTokensPerWindow: 120000,
+    expireAfterIdleSecs: 3600,
+  }
+}
+
+export function defaultExternalPoolsConfig() {
+  return {
+    externalPoolsEnabled: false,
+    externalPoolGlobalMaxConcurrentRequests: 0,
+    externalPoolMaxQueuedRequests: 0,
+    externalPoolCapacityMode: 'fail_fast' as const,
+    externalPoolDispatchMaxWaitSecs: 30,
+    externalPoolRetryMaxAttempts: 0,
+    externalDirectPolicyEnabled: false,
+    directExternalOnLocalMaintenance: false,
+    directExternalModelRules: [],
+    directExternalPathRules: [],
+    fallbackOnLocalCapacityExhausted: true,
+    fallbackOnNoAvailableCredentials: true,
+    fallbackOnLocalTransientExhausted: true,
+    fallbackOnUnsupportedModel: false,
+    localPoolPreflightEnabled: true,
+    externalPoolLocalRescueEnabled: true,
+    externalPoolLocalRescueOnRateLimit: true,
+    externalPoolLocalRescueOnTimeout: true,
+    externalPoolLocalRescueOnCapacity: true,
+    externalPoolLocalRescueMaxWaitSecs: 15,
+    localPoolCircuitEnabled: false,
+    localPoolCircuitWindowSecs: 60,
+    localPoolCircuitOpenAfterFailures: 3,
+    localPoolCircuitRequireDistinctCredentials: 2,
+    localPoolCircuitOpenSecs: 30,
+    externalPoolAutoDisableEnabled: false,
+    externalPoolAutoDisableOnAuthError: true,
+    externalPoolAutoDisableOnSecurityLock: true,
+    externalPoolAutoDisableOnQuotaExhausted: false,
+    externalPoolAutoDisableOnMisconfiguredEndpoint: false,
+    externalPoolAutoDisableFailureThreshold: 1,
+    externalPoolAutoDisableWindowSecs: 60,
+    externalPoolAutoDisableDurationSecs: 0,
+    externalPoolRateLimitCooldownSecs: 30,
+    externalPoolServerErrorCooldownSecs: 10,
+    externalPoolNetworkErrorCooldownSecs: 10,
+    externalPoolProtocolErrorCooldownSecs: 10,
+    externalPoolRequestTimeoutSecs: 180,
+    externalPoolStreamRequestTimeoutSecs: 0,
+    externalPoolStreamIdleTimeoutSecs: 180,
+    externalPoolAutoDisableOnChannelDisabled: true,
+    externalPoolUsageProjectionUpliftPercent: 25,
+    externalPoolUsageProjectionOutputUpliftMinTokens: 0,
+    externalPoolUsageProjectionOutputUpliftPercent: 0,
+  }
+}
+
+export function defaultModelMappingConfig() {
+  return {
+    enabled: true,
+    autoGenerateRules: true,
+    rules: [],
+  }
+}
+
+export const emptyRuntimeConfig: RuntimeConfig = {
+  proxyUrl: null,
+  proxyUsername: null,
+  proxyPassword: null,
+  credentialRpm: 0,
+  credentialMaxConcurrentRequests: 0,
+  credentialTransientCooldownSecs: 10,
+  credentialRateLimitCooldownSecs: 30,
+  credentialServerErrorCooldownSecs: 5,
+  credentialNetworkErrorCooldownSecs: 5,
+  credentialStreamErrorCooldownSecs: 5,
+  credentialProtocolErrorCooldownSecs: 10,
+  credentialAuthErrorCooldownSecs: 10,
+  credentialCooldownBackoffMultiplier: 2,
+  credentialCooldownJitterPercent: 20,
+  credentialProbationSecs: 30,
+  credentialMaxCooldownSecs: 300,
+  credentialDispatchMaxWaitSecs: 120,
+  kiroUpstreamResponseTimeoutSecs: 180,
+  credentialRetryMaxAttempts: 0,
+  credentialInFlightLeaseMaxSecs: 900,
+  dispatchGlobalMaxConcurrentRequests: 0,
+  dispatchMaxQueuedRequests: 0,
+  credentialWarmupRequests: 3,
+  credentialWarmupSelectionPercent: 5,
+  credentialWarmupMaxSelectionPercent: 50,
+  schedulerErrorEwmaAlpha: 0.2,
+  schedulerPriorityWeight: 1,
+  schedulerLoadWeight: 100,
+  schedulerErrorWeight: 100,
+  schedulerLatencyWeight: 0.01,
+  schedulerProbationWeight: 50,
+  schedulerSelectionPressureWeight: 25,
+  schedulerTotalSelectionWeight: 0,
+  schedulerTopK: 3,
+  compressionEnabled: false,
+  whitespaceCompression: true,
+  payloadGuardEnabled: true,
+  payloadGuardMode: 'preemptive',
+  payloadGuardMaxBytes: 460800,
+  payloadGuardSafetyMarginBytes: 32768,
+  payloadGuardTrimHistory: true,
+  payloadGuardExternalEnabled: true,
+  payloadShaping: defaultPayloadShaping(),
+  promptCacheTargetReadRatio: 0.98,
+  promptCacheTokenScale: 1.6,
+  promptCacheMaxSimulatedInputTokens: 300000,
+  promptCacheCapJitterMinTokens: 12000,
+  promptCacheCapJitterMaxTokens: 24000,
+  promptCacheScaleMinInputTokens: 20000,
+  promptCacheCreationControl: defaultPromptCacheCreationControl(),
+  reportedUsage: defaultReportedUsage(),
+  externalPools: defaultExternalPoolsConfig(),
+  highCacheThreshold: 10000,
+  compatProfile: 'claude-code',
+  kiroAgentModeStrategy: 'vibe',
+  modelResolutionMode: 'compatible',
+  modelMapping: defaultModelMappingConfig(),
+  extractThinking: true,
+  exposeProxyWarnings: false,
+}
+
+export function reportedUsageModeDescription(mode: ReportedUsageFieldMode): string {
+  switch (mode) {
+    case 'raw':
+      return '显示服务收到或返回的原始用量，不再额外调整缓存、输入或输出数值。'
+    case 'preserve':
+      return '保留系统已经计算好的展示结果，适合大多数默认场景。'
+    case 'sample-max':
+      return '把展示值控制在上限以内，并让数值自然浮动。需要配置“展示上限”。'
+    case 'sample-target':
+      return '让展示值围绕目标值自然浮动，并受最大倍率限制。'
+  }
+}
+
+export function fieldNeedsMax(policy: ReportedUsageFieldPolicy): boolean {
+  return policy.mode === 'sample-max'
+}
+
+export function fieldNeedsTarget(policy: ReportedUsageFieldPolicy): boolean {
+  return policy.mode === 'sample-target'
+}
+
+export function toWhole(value: number, min = 0, max?: number): number {
+  const normalized = Math.max(min, Math.floor(value || 0))
+  return typeof max === 'number' ? Math.min(max, normalized) : normalized
+}
+
+export function toRatio(value: number): number {
+  if (!Number.isFinite(value)) return 0
+  return Math.min(0.99, Math.max(0, Number(value.toFixed(4))))
+}
+
+export function toScale(value: number): number {
+  if (!Number.isFinite(value)) return 1
+  return Math.min(3, Math.max(1, Number(value.toFixed(2))))
+}
+
+function toMultiplier(value: number): number {
+  if (!Number.isFinite(value)) return 1.1
+  return Math.max(1, Number(value.toFixed(2)))
+}
+
+function normalizeFieldPolicy(policy: ReportedUsageFieldPolicy): ReportedUsageFieldPolicy {
+  return {
+    ...policy,
+    maxTokens: toWhole(policy.maxTokens),
+    targetTokens: toWhole(policy.targetTokens),
+    normalMaxMultiplier: toMultiplier(policy.normalMaxMultiplier),
+  }
+}
+
+function normalizePathPolicy(policy: ReportedUsagePathPolicy): ReportedUsagePathPolicy {
+  const finalCacheReadMaxTokens = toWhole(policy.finalCacheReadMaxTokens ?? 700000)
+  const finalCacheReadJitterMaxTokens =
+    finalCacheReadMaxTokens > 0
+      ? toWhole(policy.finalCacheReadJitterMaxTokens ?? 0, 0, finalCacheReadMaxTokens)
+      : 0
+  const finalCacheReadJitterMinTokens = toWhole(
+    policy.finalCacheReadJitterMinTokens ?? 0,
+    0,
+    finalCacheReadJitterMaxTokens
+  )
+  return {
+    ...policy,
+    finalCacheReadMaxTokens,
+    finalCacheReadJitterMinTokens,
+    finalCacheReadJitterMaxTokens,
+    input: normalizeFieldPolicy(policy.input),
+    output: normalizeFieldPolicy(policy.output),
+    cacheRead: normalizeFieldPolicy(policy.cacheRead),
+    cacheCreation: normalizeFieldPolicy(policy.cacheCreation),
+  }
+}
+
+export function normalizeReportedUsage(config: ReportedUsageConfig): ReportedUsageConfig {
+  const pathOverrides = Object.fromEntries(
+    Object.entries(config.pathOverrides)
+      .map(([prefix, policy]) => {
+        const trimmed = prefix.trim()
+        if (!trimmed) return null
+        const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
+        const normalizedPrefix = withSlash.replace(/\/+$/, '') || '/'
+        return [normalizedPrefix, normalizePathPolicy(policy)] as const
+      })
+      .filter((entry): entry is readonly [string, ReportedUsagePathPolicy] => Boolean(entry))
+  )
+  return {
+    default: normalizePathPolicy(config.default),
+    pathOverrides,
+  }
+}
+
+export function normalizePromptCacheCreationControl(
+  config: PromptCacheCreationControlConfig
+): PromptCacheCreationControlConfig {
+  return {
+    ...defaultPromptCacheCreationControl(),
+    ...config,
+    scopeMode:
+      config.scopeMode === 'credential_conversation_model'
+        ? 'credential_conversation_model'
+        : 'conversation_model',
+    minSuccessfulRequestsBetweenCreation: toWhole(config.minSuccessfulRequestsBetweenCreation),
+    minCreationIntervalSecs: toWhole(config.minCreationIntervalSecs),
+    minCreationDeltaTokens: toWhole(config.minCreationDeltaTokens),
+    maxCreationTokensPerEvent: toWhole(config.maxCreationTokensPerEvent),
+    creationBudgetWindowSecs: toWhole(config.creationBudgetWindowSecs),
+    maxCreationTokensPerWindow: toWhole(config.maxCreationTokensPerWindow),
+    expireAfterIdleSecs: toWhole(config.expireAfterIdleSecs),
+  }
+}
+
+export function normalizePayloadShaping(config: PayloadShapingConfig): PayloadShapingConfig {
+  return {
+    ...config,
+    historicalToolResultMaxChars: toWhole(config.historicalToolResultMaxChars),
+    historicalToolResultHeadLines: toWhole(config.historicalToolResultHeadLines),
+    historicalToolResultTailLines: toWhole(config.historicalToolResultTailLines),
+    toolDefinitionsBudgetBytes: toWhole(config.toolDefinitionsBudgetBytes),
+    toolDescriptionMaxChars: toWhole(config.toolDescriptionMaxChars),
+    toolSchemaAnnotationMaxChars: toWhole(config.toolSchemaAnnotationMaxChars),
+    webFetchBodyMaxChars: toWhole(config.webFetchBodyMaxChars),
+    currentToolResultMaxChars: toWhole(config.currentToolResultMaxChars),
+    currentUserContentMaxChars: toWhole(config.currentUserContentMaxChars),
+    currentDocumentMaxChars: toWhole(config.currentDocumentMaxChars),
+    currentImagesMaxBytes: toWhole(config.currentImagesMaxBytes),
+  }
+}
