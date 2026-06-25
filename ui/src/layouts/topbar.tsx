@@ -1,5 +1,5 @@
 import { useLocation } from 'react-router-dom'
-import { LogOut, Menu, Moon, Sun, ChevronRight } from 'lucide-react'
+import { LogOut, Menu, Moon, Sun } from 'lucide-react'
 import { Button } from '@/components/ui'
 import { getPageFromPathname, domainLabelOf } from '@/app/router-utils'
 import { pageMeta } from '@/types/ui'
@@ -19,7 +19,7 @@ export function Topbar({
   const { theme, toggleTheme } = useTheme()
 
   return (
-    <header className="sticky top-0 z-30 flex h-[--header-h] shrink-0 items-center gap-3 border-b border-border bg-card/85 px-4 backdrop-blur-md lg:px-6">
+    <header className="sticky top-0 z-30 flex h-[var(--header-h)] shrink-0 items-center gap-4 border-b border-border bg-card/85 px-4 backdrop-blur-md lg:px-6">
       <Button
         variant="ghost"
         size="icon-sm"
@@ -30,14 +30,18 @@ export function Topbar({
         <Menu className="size-5" />
       </Button>
 
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-1.5 text-[0.7rem] text-muted-foreground">
-          <span>{domainLabel}</span>
-          <ChevronRight className="size-3" />
-          <span className="font-medium text-foreground/70">{meta.title}</span>
-        </div>
-        <p className="hidden truncate text-xs text-muted-foreground sm:block">{meta.subtitle}</p>
+      <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
+        <h1 className="truncate text-[0.98rem] font-semibold tracking-tight text-foreground">
+          {meta.title}
+        </h1>
+        <span className="hidden truncate text-xs text-muted-foreground md:inline">
+          {meta.subtitle}
+        </span>
       </div>
+
+      <span className="hidden rounded-md bg-muted px-2 py-0.5 text-[0.7rem] font-medium text-muted-foreground sm:inline">
+        {domainLabel}
+      </span>
 
       <Button
         variant="ghost"
