@@ -1,0 +1,451 @@
+import { useEffect, useState } from 'react'
+import {
+  ChevronDown,
+  ChevronRight,
+  Gauge,
+  Save,
+  Shield,
+  Sparkles,
+  Wand2,
+  Zap,
+} from 'lucide-react'
+import { toast } from 'sonner'
+import {
+  ErrorState,
+  LoadingState,
+  PageContainer,
+  PageHeader,
+} from '@/components/patterns'
+import {
+  Button,
+  Input,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  Spinner,
+  Switch,
+} from '@/components/ui'
+import { cn } from '@/lib/utils'
+import { extractErrorMessage } from '@/lib/utils'
+import {
+  defaultPayloadShaping,
+  defaultPromptCacheCreationControl,
+  emptyRuntimeConfig,
+  toRatio,
+  toScale,
+  toWhole,
+} from '@/lib/runtime-config-defaults'
+import {
+  useLoadBalancingMode,
+  useRuntimeConfig,
+  useSetLoadBalancingMode,
+  useUpdateRuntimeConfig,
+} from '@/hooks/use-credentials'
+import type { LoadBalancingMode, PayloadGuardMode, RuntimeConfig } from '@/types/api'
+
+// ─── 原子组件 ──────────────────────────────────────────────────────────────────
+
+function numberValue(value: string, fallback: number): number {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
+function NumField({
+  label,
+  desc,
+  value,
+  min,
+  max,
+  step,
+  suffix,
+  disabled,
+  onChange,
+}: {
+  label: string
+  desc: string
+  value: number
+  min?: number
+  max?: number
+  step?: number
+  suffix: string
+  disabled?: boolean
+  onChange: (v: number) => void
+}) {
+  return (
+    <div className="space-y-1.5">
+      <div className="text-sm font-semibold text-foreground">{label}</div>
+      <div className="text-xs text-muted-foreground leading-relaxed">{desc}</div>
+      <div className="flex items-center gap-2">
+        <Input
+          type="number"
+          className="w-full"
+          value={value}
+          min={min}
+          max={max}
+          step={step}
+          inputMode={step && step < 1 ? 'decimal' : 'numeric'}
+          disabled={disabled}
+          onChange={(e) => onChange(numberValue(e.target.value, min ?? 0))}
+        />
+        <span className="min-w-[5rem] shrink-0 text-sm text-muted-foreground">{suffix}</span>
+      </div>
+    </div>
+  )
+}
+
+function TogField({
+  label,
+  desc,
+  checked,
+  disabled,
+  onChange,
+}: {
+  label: string
+  desc: string
+  checked: boolean
+  disabled?: boolean
+  onChange: (v: boolean) => void
+}) {
+  return (
+    <div className="flex items-start justify-between gap-4">
+      <div className="min-w-0">
+        <div className="text-sm font-semibold text-foreground">{label}</div>
+        <div className="mt-0.5 text-xs leading-relaxed text-muted-foreground">{desc}</div>
+      </div>
+      <Switch checked={checked} disabled={disabled} onCheckedChange={onChange} className="mt-0.5 shrink-0" />
+    </div>
+  )
+}
+
+function TwoCol({ children }: { children: React.ReactNode }) {
+  return <div className="grid gap-4 md:grid-cols-2">{children}</div>
+}
+
+// ─── normalizeConfig ──────────────────────────────────────────────────────────
+
+function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
+  const next: RuntimeConfig = {
+    ...draft,
+    credentialRpm: toWhole(draft.credentialRpm),
+    credentialMaxConcurrentRequests: toWhole(draft.credentialMaxConcurrentRequests),
+    credentialTransientCooldownSecs: toWhole(draft.credentialTransientCooldownSecs, 1),
+    credentialRateLimitCooldownSecs: toWhole(draft.credentialRateLimitCooldownSecs, 1),
+    credentialServerErrorCooldownSecs: toWhole(draft.credentialServerErrorCooldownSecs, 1),
+    credentialNetworkErrorCooldownSecs: toWhole(draft.credentialNetworkErrorCooldownSecs, 1),
+    credentialStreamErrorCooldownSecs: toWhole(draft.credentialStreamErrorCooldownSecs, 1),
+    credentialProtocolErrorCooldownSecs: toWhole(draft.credentialProtocolErrorCooldownSecs, 1),
+    credentialAuthErrorCooldownSecs: toWhole(draft.credentialAuthErrorCooldownSecs, 1),
+    credentialCooldownBackoffMultiplier: Math.max(1, Number(draft.credentialCooldownBackoffMultiplier.toFixed(2))),
+    credentialCooldownJitterPercent: toWhole(draft.credentialCooldownJitterPercent, 0, 100),
+    credentialProbationSecs: toWhole(draft.credentialProbationSecs),
+    credentialMaxCooldownSecs: toWhole(draft.credentialMaxCooldownSecs, 1),
+    credentialDispatchMaxWaitSecs: toWhole(draft.credentialDispatchMaxWaitSecs),
+    kiroUpstreamResponseTimeoutSecs: toWhole(draft.kiroUpstreamResponseTimeoutSecs),
+    credentialRetryMaxAttempts: toWhole(draft.credentialRetryMaxAttempts),
+    credentialInFlightLeaseMaxSecs: toWhole(draft.credentialInFlightLeaseMaxSecs),
+    dispatchGlobalMaxConcurrentRequests: toWhole(draft.dispatchGlobalMaxConcurrentRequests),
+    dispatchMaxQueuedRequests: toWhole(draft.dispatchMaxQueuedRequests),
+    credentialWarmupRequests: toWhole(draft.credentialWarmupRequests),
+    credentialWarmupSelectionPercent: toWhole(draft.credentialWarmupSelectionPercent, 0, 100),
+    credentialWarmupMaxSelectionPercent: toWhole(draft.credentialWarmupMaxSelectionPercent, 0, 100),
+    schedulerErrorEwmaAlpha: Math.min(1, Math.max(0.01, Number(draft.schedulerErrorEwmaAlpha.toFixed(2)))),
+    schedulerPriorityWeight: Math.max(0, Number(draft.schedulerPriorityWeight.toFixed(2))),
+    schedulerLoadWeight: Math.max(0, Number(draft.schedulerLoadWeight.toFixed(2))),
+    schedulerErrorWeight: Math.max(0, Number(draft.schedulerErrorWeight.toFixed(2))),
+    schedulerLatencyWeight: Math.max(0, Number(draft.schedulerLatencyWeight.toFixed(4))),
+    schedulerProbationWeight: Math.max(0, Number(draft.schedulerProbationWeight.toFixed(2))),
+    schedulerSelectionPressureWeight: Math.max(0, Number(draft.schedulerSelectionPressureWeight.toFixed(2))),
+    schedulerTotalSelectionWeight: Math.max(0, Number(draft.schedulerTotalSelectionWeight.toFixed(4))),
+    schedulerTopK: toWhole(draft.schedulerTopK, 1, 100),
+    payloadGuardMaxBytes: toWhole(draft.payloadGuardMaxBytes),
+    payloadGuardSafetyMarginBytes: toWhole(draft.payloadGuardSafetyMarginBytes),
+    promptCacheTargetReadRatio: toRatio(draft.promptCacheTargetReadRatio),
+    promptCacheTokenScale: toScale(draft.promptCacheTokenScale),
+    promptCacheMaxSimulatedInputTokens: toWhole(draft.promptCacheMaxSimulatedInputTokens),
+    promptCacheCapJitterMinTokens: toWhole(draft.promptCacheCapJitterMinTokens),
+    promptCacheCapJitterMaxTokens: toWhole(draft.promptCacheCapJitterMaxTokens),
+    promptCacheScaleMinInputTokens: toWhole(draft.promptCacheScaleMinInputTokens),
+    highCacheThreshold: toWhole(draft.highCacheThreshold),
+  }
+  return next
+}
+
+// ─── RuntimePage ──────────────────────────────────────────────────────────────
+
+export function RuntimePage() {
+  const config = useRuntimeConfig()
+  const updateConfig = useUpdateRuntimeConfig()
+  const loadBalancing = useLoadBalancingMode()
+  const setLbMode = useSetLoadBalancingMode()
+  const [draft, setDraft] = useState<RuntimeConfig>(emptyRuntimeConfig)
+
+  useEffect(() => {
+    if (config.data) {
+      setDraft({
+        ...emptyRuntimeConfig,
+        ...config.data,
+        payloadShaping: { ...defaultPayloadShaping(), ...config.data.payloadShaping },
+        promptCacheCreationControl: { ...defaultPromptCacheCreationControl(), ...config.data.promptCacheCreationControl },
+      })
+    }
+  }, [config.data])
+
+  const set = <K extends keyof RuntimeConfig>(k: K) => (v: RuntimeConfig[K]) =>
+    setDraft((prev) => ({ ...prev, [k]: v }))
+
+  const save = () => {
+    const next = normalizeConfig(draft)
+    if (next.credentialTransientCooldownSecs > next.credentialMaxCooldownSecs)
+      return toast.error('临时冷却秒数不能大于最大冷却秒数')
+    if (
+      [next.credentialRateLimitCooldownSecs, next.credentialServerErrorCooldownSecs,
+       next.credentialNetworkErrorCooldownSecs, next.credentialStreamErrorCooldownSecs,
+       next.credentialProtocolErrorCooldownSecs, next.credentialAuthErrorCooldownSecs]
+        .some((v) => v > next.credentialMaxCooldownSecs)
+    ) return toast.error('错误类型基础冷却秒数不能大于最大冷却秒数')
+    if (next.promptCacheCapJitterMinTokens > next.promptCacheCapJitterMaxTokens)
+      return toast.error('触顶扣减下限不能大于上限')
+    const editable = { ...next }
+    delete editable.proxyUrl
+    delete editable.proxyUsername
+    delete editable.proxyPassword
+    updateConfig.mutate(editable, {
+      onSuccess: () => toast.success('配置已保存，新请求立即生效'),
+      onError: (e) => toast.error(`保存失败: ${extractErrorMessage(e)}`),
+    })
+  }
+
+  const handleLbMode = (mode: LoadBalancingMode) => {
+    setLbMode.mutate(mode, {
+      onSuccess: () => toast.success(`已切换为${mode === 'priority' ? '优先级' : mode === 'balanced' ? '均衡负载' : '健康均衡'}模式`),
+      onError: (e) => toast.error(`切换失败: ${extractErrorMessage(e)}`),
+    })
+  }
+
+  if (config.isLoading) return <LoadingState text="加载运行配置..." />
+  if (config.error) return <ErrorState message={extractErrorMessage(config.error)} />
+
+  const payloadSizeLimitEnabled = draft.payloadGuardEnabled && draft.payloadGuardMaxBytes > 0
+  const payloadGuardMode = (draft.payloadGuardMode ?? 'preemptive') as PayloadGuardMode
+
+  return (
+    <PageContainer>
+      <PageHeader
+        title="运行配置"
+        subtitle="调度、限流、冷却、缓存与兼容等运行时参数，保存后新请求立即生效"
+        actions={
+          <Button size="sm" onClick={save} disabled={updateConfig.isPending}>
+            {updateConfig.isPending ? <Spinner size="sm" /> : <Save className="h-4 w-4" />}
+            保存配置
+          </Button>
+        }
+      />
+
+      {/* 负载均衡模式 — 高优先级，展开显示 */}
+      <CollapseSection icon={<Gauge />} title="负载均衡模式" desc="控制请求分配给账号的策略" defaultOpen>
+        <div className="space-y-3">
+          <div className="text-xs text-muted-foreground">
+            切换后立即生效，无需点击保存。
+          </div>
+          <Select
+            value={loadBalancing.data?.mode ?? 'priority'}
+            onValueChange={(v) => handleLbMode(v as LoadBalancingMode)}
+            disabled={setLbMode.isPending || loadBalancing.isLoading}
+          >
+            <SelectTrigger className="w-56">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="priority">优先级模式 — 高优先级账号优先</SelectItem>
+              <SelectItem value="balanced">均衡负载 — 平均分配请求</SelectItem>
+              <SelectItem value="health_balanced">健康均衡 — 综合健康度平衡</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      </CollapseSection>
+
+      {/* 请求容量 */}
+      <CollapseSection icon={<Gauge />} title="请求容量" desc="并发、排队、重试、超时" defaultOpen>
+        <TwoCol>
+          <NumField label="单账号每分钟请求上限" desc="0 表示关闭本地限速" value={draft.credentialRpm} min={0} suffix="次/分钟" onChange={set('credentialRpm')} />
+          <NumField label="单账号最大并发" desc="0 表示不限制" value={draft.credentialMaxConcurrentRequests} min={0} suffix="并发" onChange={set('credentialMaxConcurrentRequests')} />
+          <NumField label="全局最大并发" desc="0 表示不限制" value={draft.dispatchGlobalMaxConcurrentRequests} min={0} suffix="并发" onChange={set('dispatchGlobalMaxConcurrentRequests')} />
+          <NumField label="最大排队请求数" desc="0 表示不限制" value={draft.dispatchMaxQueuedRequests} min={0} suffix="请求" onChange={set('dispatchMaxQueuedRequests')} />
+          <NumField label="单请求最长排队等待" desc="0 表示不限制" value={draft.credentialDispatchMaxWaitSecs} min={0} suffix="秒" onChange={set('credentialDispatchMaxWaitSecs')} />
+          <NumField label="开始响应等待时间" desc="0 表示使用默认超时" value={draft.kiroUpstreamResponseTimeoutSecs} min={0} suffix="秒" onChange={set('kiroUpstreamResponseTimeoutSecs')} />
+          <NumField label="单请求最大重试次数" desc="0 表示系统自动决定" value={draft.credentialRetryMaxAttempts} min={0} suffix="次" onChange={set('credentialRetryMaxAttempts')} />
+          <NumField label="异常并发自动回收" desc="0 表示关闭" value={draft.credentialInFlightLeaseMaxSecs} min={0} suffix="秒" onChange={set('credentialInFlightLeaseMaxSecs')} />
+        </TwoCol>
+      </CollapseSection>
+
+      {/* 错误恢复 */}
+      <CollapseSection icon={<Shield />} title="错误恢复 / 冷却" desc="不同错误类型的暂停策略与退避" defaultOpen>
+        <TwoCol>
+          <NumField label="默认暂停时间" desc="临时错误后暂停多久" value={draft.credentialTransientCooldownSecs} min={1} suffix="秒" onChange={set('credentialTransientCooldownSecs')} />
+          <NumField label="限流后暂停" desc="" value={draft.credentialRateLimitCooldownSecs} min={1} suffix="秒" onChange={set('credentialRateLimitCooldownSecs')} />
+          <NumField label="服务繁忙后暂停" desc="" value={draft.credentialServerErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialServerErrorCooldownSecs')} />
+          <NumField label="网络错误基础冷却" desc="" value={draft.credentialNetworkErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialNetworkErrorCooldownSecs')} />
+          <NumField label="流式中断后暂停" desc="" value={draft.credentialStreamErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialStreamErrorCooldownSecs')} />
+          <NumField label="格式异常后暂停" desc="" value={draft.credentialProtocolErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialProtocolErrorCooldownSecs')} />
+          <NumField label="授权异常后暂停" desc="" value={draft.credentialAuthErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialAuthErrorCooldownSecs')} />
+          <NumField label="最大冷却时长" desc="单账号冷却上限" value={draft.credentialMaxCooldownSecs} min={1} suffix="秒" onChange={set('credentialMaxCooldownSecs')} />
+          <NumField label="退避倍率" desc="连续出错时逐步延长" value={draft.credentialCooldownBackoffMultiplier} min={1} max={10} step={0.1} suffix="倍" onChange={set('credentialCooldownBackoffMultiplier')} />
+          <NumField label="恢复时间错开比例" desc="防止多账号同时恢复" value={draft.credentialCooldownJitterPercent} min={0} max={100} suffix="%" onChange={set('credentialCooldownJitterPercent')} />
+          <NumField label="恢复观察时间" desc="降频使用直到稳定" value={draft.credentialProbationSecs} min={0} suffix="秒" onChange={set('credentialProbationSecs')} />
+        </TwoCol>
+      </CollapseSection>
+
+      {/* 账号调度权重 */}
+      <CollapseSection icon={<Gauge />} title="账号选择权重" desc="优先使用哪些账号的调度参数">
+        <TwoCol>
+          <NumField label="近期错误敏感度" desc="越高近期错误越快影响选择" value={draft.schedulerErrorEwmaAlpha} min={0.01} max={1} step={0.01} suffix="系数" onChange={set('schedulerErrorEwmaAlpha')} />
+          <NumField label="优先级权重" desc="" value={draft.schedulerPriorityWeight} min={0} step={0.1} suffix="权重" onChange={set('schedulerPriorityWeight')} />
+          <NumField label="当前负载权重" desc="" value={draft.schedulerLoadWeight} min={0} step={1} suffix="权重" onChange={set('schedulerLoadWeight')} />
+          <NumField label="近期错误权重" desc="" value={draft.schedulerErrorWeight} min={0} step={1} suffix="权重" onChange={set('schedulerErrorWeight')} />
+          <NumField label="响应耗时权重" desc="" value={draft.schedulerLatencyWeight} min={0} step={0.001} suffix="权重" onChange={set('schedulerLatencyWeight')} />
+          <NumField label="恢复期降权" desc="" value={draft.schedulerProbationWeight} min={0} step={1} suffix="权重" onChange={set('schedulerProbationWeight')} />
+          <NumField label="短时集中降权" desc="避免请求集中单一账号" value={draft.schedulerSelectionPressureWeight} min={0} step={1} suffix="权重" onChange={set('schedulerSelectionPressureWeight')} />
+          <NumField label="候选账号数量" desc="数值越大越分散" value={draft.schedulerTopK} min={1} max={100} suffix="个" onChange={set('schedulerTopK')} />
+        </TwoCol>
+      </CollapseSection>
+
+      {/* 新账号预热 */}
+      <CollapseSection icon={<Sparkles />} title="新账号预热" desc="新账号逐步参与请求，稳定后恢复正常">
+        <TwoCol>
+          <NumField label="预热请求数" desc="0 表示不预热" value={draft.credentialWarmupRequests} min={0} suffix="次" onChange={set('credentialWarmupRequests')} />
+          <NumField label="单个预热账号参与比例" desc="" value={draft.credentialWarmupSelectionPercent} min={0} max={100} suffix="%" onChange={set('credentialWarmupSelectionPercent')} />
+          <NumField label="预热账号总占比上限" desc="" value={draft.credentialWarmupMaxSelectionPercent} min={0} max={100} suffix="%" onChange={set('credentialWarmupMaxSelectionPercent')} />
+        </TwoCol>
+      </CollapseSection>
+
+      {/* 请求大小保护 */}
+      <CollapseSection icon={<Wand2 />} title="请求大小保护" desc="压缩、大小阈值和处理时机">
+        <div className="space-y-4">
+          <TwoCol>
+            <TogField label="启用请求压缩" desc="发送前尽量减少冗余内容" checked={draft.compressionEnabled} onChange={set('compressionEnabled')} />
+            <TogField label="仅压缩空白字符" desc="只处理多余空白，风险低" checked={draft.whitespaceCompression} disabled={!draft.compressionEnabled} onChange={set('whitespaceCompression')} />
+            <TogField label="启用大小保护" desc="统计请求大小并修正格式问题" checked={draft.payloadGuardEnabled} onChange={set('payloadGuardEnabled')} />
+            <TogField label="外部账号也应用大小保护" desc="" checked={draft.payloadGuardExternalEnabled} disabled={!draft.payloadGuardEnabled} onChange={set('payloadGuardExternalEnabled')} />
+          </TwoCol>
+          <div className="space-y-1.5">
+            <div className="text-sm font-semibold">过大请求处理方式</div>
+            <Select
+              value={payloadGuardMode}
+              disabled={!draft.payloadGuardEnabled}
+              onValueChange={(v) => set('payloadGuardMode')(v as PayloadGuardMode)}
+            >
+              <SelectTrigger size="sm" className="w-72"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="preemptive">发送前先处理</SelectItem>
+                <SelectItem value="on_too_long">失败后再处理并重试</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <TwoCol>
+            <NumField label="请求大小阈值" desc="0 表示不按大小处理" value={draft.payloadGuardMaxBytes} min={0} suffix="字节" onChange={set('payloadGuardMaxBytes')} />
+            <NumField label="安全余量" desc="实际处理目标比阈值小一点" value={draft.payloadGuardSafetyMarginBytes} min={0} suffix="字节" disabled={!payloadSizeLimitEnabled} onChange={set('payloadGuardSafetyMarginBytes')} />
+          </TwoCol>
+        </div>
+      </CollapseSection>
+
+      {/* 缓存展示 */}
+      <CollapseSection icon={<Zap />} title="缓存命中展示" desc="缓存读取和输入 Token 的展示口径">
+        <TwoCol>
+          <NumField label="缓存读取目标比例" desc="建议 0.95~0.99" value={draft.promptCacheTargetReadRatio} min={0} max={0.99} step={0.01} suffix="比例" onChange={set('promptCacheTargetReadRatio')} />
+          <NumField label="输入估算放大倍数" desc="" value={draft.promptCacheTokenScale} min={1} max={3} step={0.1} suffix="倍" onChange={set('promptCacheTokenScale')} />
+          <NumField label="输入展示上限" desc="0 表示不设上限" value={draft.promptCacheMaxSimulatedInputTokens} min={0} suffix="Token" onChange={set('promptCacheMaxSimulatedInputTokens')} />
+          <NumField label="放大启用门槛" desc="" value={draft.promptCacheScaleMinInputTokens} min={0} suffix="Token" onChange={set('promptCacheScaleMinInputTokens')} />
+          <NumField label="触顶扣减下限" desc="" value={draft.promptCacheCapJitterMinTokens} min={0} suffix="Token" onChange={set('promptCacheCapJitterMinTokens')} />
+          <NumField label="触顶扣减上限" desc="" value={draft.promptCacheCapJitterMaxTokens} min={0} suffix="Token" onChange={set('promptCacheCapJitterMaxTokens')} />
+        </TwoCol>
+      </CollapseSection>
+
+      {/* 兼容模式 */}
+      <CollapseSection icon={<Shield />} title="兼容与统计" desc="接口兼容模式、模型解析策略">
+        <div className="space-y-4">
+          <div className="grid gap-4 md:grid-cols-2">
+            <div className="space-y-1.5">
+              <div className="text-sm font-semibold">兼容模式</div>
+              <Select value={draft.compatProfile} onValueChange={(v) => set('compatProfile')(v as RuntimeConfig['compatProfile'])}>
+                <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="claude-code">Claude Code 兼容</SelectItem>
+                  <SelectItem value="anthropic-strict">Anthropic 严格模式</SelectItem>
+                  <SelectItem value="debug">调试模式</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1.5">
+              <div className="text-sm font-semibold">模型解析策略</div>
+              <Select value={draft.modelResolutionMode} onValueChange={(v) => set('modelResolutionMode')(v as RuntimeConfig['modelResolutionMode'])}>
+                <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="compatible">默认兼容解析</SelectItem>
+                  <SelectItem value="alias_only">仅精确与显式别名</SelectItem>
+                  <SelectItem value="exact_only">仅完整模型名</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+          <TwoCol>
+            <TogField label="整理思考内容" desc="把响应里的思考内容单独整理出来" checked={draft.extractThinking} onChange={set('extractThinking')} />
+            <TogField label="显示处理告警" desc="把排查提示返回给客户端" checked={draft.exposeProxyWarnings} onChange={set('exposeProxyWarnings')} />
+          </TwoCol>
+          <TwoCol>
+            <NumField label="缓存命中判定阈值" desc="多少 Token 以上算缓存命中较高" value={draft.highCacheThreshold} min={0} suffix="Token" onChange={set('highCacheThreshold')} />
+          </TwoCol>
+        </div>
+      </CollapseSection>
+
+      {/* 底部操作栏 */}
+      <div className={cn('flex items-center justify-between rounded-xl border border-border bg-muted/30 px-4 py-3')}>
+        <span className="text-xs text-muted-foreground">保存后，新的请求会立即使用这些配置。</span>
+        <Button size="sm" onClick={save} disabled={updateConfig.isPending}>
+          {updateConfig.isPending ? <Spinner size="sm" /> : <Save className="h-4 w-4" />}
+          保存配置
+        </Button>
+      </div>
+    </PageContainer>
+  )
+}
+
+// ─── 折叠分区 ─────────────────────────────────────────────────────────────────
+
+function CollapseSection({
+  icon,
+  title,
+  desc,
+  defaultOpen = false,
+  children,
+}: {
+  icon: React.ReactNode
+  title: string
+  desc: string
+  defaultOpen?: boolean
+  children: React.ReactNode
+}) {
+  const [open, setOpen] = useState(defaultOpen)
+  return (
+    <div className="rounded-xl border border-border bg-card overflow-hidden">
+      <button
+        type="button"
+        className="flex w-full items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-muted/40"
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-border bg-muted text-muted-foreground [&_svg]:size-4">
+          {icon}
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-semibold">{title}</div>
+          <div className="text-xs text-muted-foreground">{desc}</div>
+        </div>
+        <span className="shrink-0 text-muted-foreground">
+          {open ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
+        </span>
+      </button>
+      {open && <div className="border-t border-border px-4 pb-4 pt-3 space-y-4">{children}</div>}
+    </div>
+  )
+}
