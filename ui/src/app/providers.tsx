@@ -2,6 +2,7 @@ import * as React from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ConfirmProvider } from '@/components/patterns'
 import { Toaster, TooltipProvider } from '@/components/ui'
+import { ThemeProvider } from '@/app/theme'
 
 function isAdminAuthFailure(error: unknown) {
   const status = (error as { response?: { status?: number } } | null)?.response?.status
@@ -28,10 +29,12 @@ export { queryClient }
 export function AppProviders({ children }: { children: React.ReactNode }) {
   return (
     <QueryClientProvider client={queryClient}>
-      <TooltipProvider delayDuration={200}>
-        <ConfirmProvider>{children}</ConfirmProvider>
-      </TooltipProvider>
-      <Toaster />
+      <ThemeProvider>
+        <TooltipProvider delayDuration={200}>
+          <ConfirmProvider>{children}</ConfirmProvider>
+        </TooltipProvider>
+        <Toaster />
+      </ThemeProvider>
     </QueryClientProvider>
   )
 }

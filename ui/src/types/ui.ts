@@ -1,65 +1,93 @@
 import type { LucideIcon } from 'lucide-react'
 import {
-  BarChart3,
-  DollarSign,
-  FileClock,
   LayoutDashboard,
-  Network,
   Server,
-  Settings,
-  ShieldCheck,
   Boxes,
+  Network,
+  BarChart3,
+  Wallet,
+  FileClock,
+  SlidersHorizontal,
+  Boxes as ModelsIcon,
+  ShieldCheck,
 } from 'lucide-react'
 
-export type TabKey =
-  | 'dashboard'
-  | 'credentials'
-  | 'validation'
-  | 'proxies'
-  | 'external'
-  | 'usage'
-  | 'pricing'
-  | 'audit'
-  | 'config'
+export const CONSOLE_BASE_PATH = '/ui'
 
-export interface NavItem {
-  key: TabKey
+/** 四个一级任务域 */
+export type DomainKey = 'overview' | 'resources' | 'analytics' | 'settings'
+
+/** 页面 key(二级,或单页域本身) */
+export type PageKey =
+  | 'overview'
+  | 'credentials'
+  | 'external'
+  | 'proxies'
+  | 'usage'
+  | 'cost'
+  | 'audit'
+  | 'runtime'
+  | 'models'
+  | 'security'
+
+export interface NavPage {
+  key: PageKey
+  /** 相对 basename 的路径(不含 /ui) */
   path: string
   label: string
   description: string
   icon: LucideIcon
-  group: 'overview' | 'resources' | 'insights' | 'system'
+  domain: DomainKey
 }
 
-export const CONSOLE_BASE_PATH = '/ui'
+export interface NavDomain {
+  key: DomainKey
+  label: string
+  icon: LucideIcon
+  /** 域入口路径(点击域名跳转的默认页) */
+  path: string
+}
 
-export const navItems: NavItem[] = [
-  { key: 'dashboard', path: 'dashboard', label: '总览', description: '系统状态概览', icon: LayoutDashboard, group: 'overview' },
-  { key: 'credentials', path: 'credentials', label: '账号', description: '本地账号资源', icon: Server, group: 'resources' },
-  { key: 'validation', path: 'validation', label: '校验', description: '账号可用性检查', icon: ShieldCheck, group: 'resources' },
-  { key: 'proxies', path: 'proxies', label: '代理', description: '网络代理资源', icon: Network, group: 'resources' },
-  { key: 'external', path: 'external-pools', label: '外部账号', description: '扩展账号池', icon: Boxes, group: 'resources' },
-  { key: 'usage', path: 'usage', label: '用量', description: '请求与成本', icon: BarChart3, group: 'insights' },
-  { key: 'pricing', path: 'pricing', label: '价格', description: '模型计价', icon: DollarSign, group: 'insights' },
-  { key: 'audit', path: 'audit', label: '审计', description: '操作记录', icon: FileClock, group: 'insights' },
-  { key: 'config', path: 'config', label: '配置', description: '运行设置', icon: Settings, group: 'system' },
+export const navDomains: NavDomain[] = [
+  { key: 'overview', label: '总览', icon: LayoutDashboard, path: 'overview' },
+  { key: 'resources', label: '资源', icon: Server, path: 'credentials' },
+  { key: 'analytics', label: '分析', icon: BarChart3, path: 'usage' },
+  { key: 'settings', label: '设置', icon: SlidersHorizontal, path: 'runtime' },
 ]
 
-export const navGroups: Array<{ id: NavItem['group']; label: string }> = [
-  { id: 'overview', label: '概览' },
-  { id: 'resources', label: '资源管理' },
-  { id: 'insights', label: '数据洞察' },
-  { id: 'system', label: '系统' },
+export const navPages: NavPage[] = [
+  // 总览(单页域)
+  { key: 'overview', path: 'overview', label: '总览', description: '实时健康与关键指标', icon: LayoutDashboard, domain: 'overview' },
+
+  // 资源域
+  { key: 'credentials', path: 'credentials', label: '账号', description: '本地账号池:筛选、批量、导入、校验', icon: Server, domain: 'resources' },
+  { key: 'external', path: 'external-pools', label: '外部池', description: '外部账号池与计费', icon: Boxes, domain: 'resources' },
+  { key: 'proxies', path: 'proxies', label: '代理', description: '网络代理资源', icon: Network, domain: 'resources' },
+
+  // 分析域
+  { key: 'usage', path: 'usage', label: '用量', description: '请求趋势与明细', icon: BarChart3, domain: 'analytics' },
+  { key: 'cost', path: 'cost', label: '成本', description: '计费链路、盈亏与模型价格', icon: Wallet, domain: 'analytics' },
+  { key: 'audit', path: 'audit', label: '审计', description: '关键操作记录', icon: FileClock, domain: 'analytics' },
+
+  // 设置域
+  { key: 'runtime', path: 'runtime', label: '运行', description: '调度、限流、冷却、缓存、兼容', icon: SlidersHorizontal, domain: 'settings' },
+  { key: 'models', path: 'models', label: '模型', description: '模型能力与价格目录', icon: ModelsIcon, domain: 'settings' },
+  { key: 'security', path: 'security', label: '安全', description: 'Admin Key、客户端接入 Key', icon: ShieldCheck, domain: 'settings' },
 ]
 
-export const pageMeta: Record<TabKey, { title: string; subtitle: string }> = {
-  dashboard: { title: '总览', subtitle: '快速了解系统状态和关键变化' },
-  credentials: { title: '账号管理', subtitle: '维护本地账号资源，保持服务稳定' },
-  validation: { title: '账号校验', subtitle: '检查账号可用性，减少异常影响' },
-  proxies: { title: '代理资源', subtitle: '维护网络资源和连通状态' },
-  external: { title: '外部账号', subtitle: '维护扩展账号资源，提高服务稳定性' },
-  usage: { title: '用量统计', subtitle: '查看使用情况和成本变化' },
-  pricing: { title: '模型价格', subtitle: '维护价格信息，辅助成本核算' },
-  audit: { title: '审计日志', subtitle: '查看关键操作记录' },
-  config: { title: '运行配置', subtitle: '调整基础设置，控制运行表现' },
+export function pagesOfDomain(domain: DomainKey): NavPage[] {
+  return navPages.filter((p) => p.domain === domain)
+}
+
+export const pageMeta: Record<PageKey, { title: string; subtitle: string }> = {
+  overview: { title: '总览', subtitle: '实时健康状态与关键指标一览' },
+  credentials: { title: '账号', subtitle: '维护本地账号池,保持调度稳定' },
+  external: { title: '外部池', subtitle: '管理外部账号池与计费拆分' },
+  proxies: { title: '代理', subtitle: '维护网络代理资源与连通状态' },
+  usage: { title: '用量', subtitle: '请求趋势、Top 维度与明细记录' },
+  cost: { title: '成本', subtitle: '计费链路、外部池盈亏与模型价格' },
+  audit: { title: '审计', subtitle: '关键操作与变更记录' },
+  runtime: { title: '运行配置', subtitle: '调度、限流、冷却、缓存与兼容策略' },
+  models: { title: '模型', subtitle: '模型能力与价格目录,支持同步与手动维护' },
+  security: { title: '安全', subtitle: 'Admin Key 与客户端接入 Key 管理' },
 }

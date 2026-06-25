@@ -5,6 +5,18 @@
     <link rel="icon" type="image/svg+xml" href="/ui/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Kiro 控制台</title>
+    <script>
+      // 在 React 挂载前应用主题,避免亮/暗闪烁
+      (function () {
+        try {
+          var saved = localStorage.getItem('kiro-console:theme')
+          var dark =
+            saved === 'dark' ||
+            (!saved && window.matchMedia('(prefers-color-scheme: dark)').matches)
+          if (dark) document.documentElement.classList.add('dark')
+        } catch (e) {}
+      })()
+    </script>
   </head>
   <body>
     <div id="root"></div>

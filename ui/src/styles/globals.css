@@ -2,58 +2,134 @@
 @import 'tw-animate-css';
 
 /* ============================================================================
-   Kiro Console 设计系统 — Tailwind v4
-   配色延续 blackGold:浅灰底 + 黑色结构 + 金色点缀
+   Kiro Console 设计系统 v2 — Tailwind v4
+   融合风格:密集高效的信息密度 + 清爽卡片的层次表达
+   中性石板底 + 靛蓝强调 + 系统化语义色 · 亮/暗双主题
    ============================================================================ */
 
 @layer base {
   :root {
-    --background: 220 16% 97%;
-    --foreground: 222 39% 11%;
+    /* 表面层级:page < subtle < card < elevated */
+    --background: 210 20% 98%;
+    --surface-subtle: 210 17% 95%;
     --card: 0 0% 100%;
-    --card-foreground: 222 39% 11%;
+    --card-foreground: 222 30% 16%;
+    --elevated: 0 0% 100%;
     --popover: 0 0% 100%;
-    --popover-foreground: 222 39% 11%;
+    --popover-foreground: 222 30% 16%;
+    --foreground: 222 30% 16%;
 
-    --primary: 38 61% 45%;
-    --primary-foreground: 0 0% 7%;
-    --secondary: 222 39% 11%;
+    /* 强调色:靛蓝 */
+    --primary: 234 64% 56%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 222 26% 22%;
     --secondary-foreground: 0 0% 100%;
-    --muted: 220 14% 96%;
-    --muted-foreground: 220 9% 46%;
-    --accent: 38 61% 45%;
-    --accent-foreground: 0 0% 7%;
+    --muted: 210 17% 95%;
+    --muted-foreground: 218 12% 47%;
+    --accent: 234 64% 56%;
+    --accent-foreground: 0 0% 100%;
 
+    /* 语义色 */
     --destructive: 0 72% 51%;
     --destructive-foreground: 0 0% 100%;
-    --success: 142 71% 36%;
+    --success: 152 56% 38%;
     --success-foreground: 0 0% 100%;
-    --warning: 32 95% 44%;
+    --warning: 35 92% 47%;
     --warning-foreground: 0 0% 100%;
-    --info: 217 91% 53%;
+    --info: 217 85% 55%;
     --info-foreground: 0 0% 100%;
 
-    --border: 220 13% 91%;
-    --border-strong: 218 11% 82%;
-    --input: 218 11% 82%;
-    --ring: 38 61% 45%;
+    /* 描边与控件 */
+    --border: 218 16% 90%;
+    --border-strong: 217 13% 80%;
+    --input: 217 13% 82%;
+    --ring: 234 64% 56%;
 
-    --sidebar: 0 0% 100%;
-    --sidebar-foreground: 222 39% 11%;
-    --sidebar-border: 220 13% 91%;
+    /* 侧边栏(深色玻璃,亮主题下也是深底,营造结构感) */
+    --sidebar: 222 30% 13%;
+    --sidebar-foreground: 215 20% 75%;
+    --sidebar-muted: 217 14% 52%;
+    --sidebar-accent: 234 70% 68%;
+    --sidebar-active: 222 26% 20%;
+    --sidebar-border: 222 22% 20%;
 
-    --radius: 0.625rem;
+    /* 图表调色板(8 色,亮主题) */
+    --chart-1: 234 64% 56%;
+    --chart-2: 152 56% 42%;
+    --chart-3: 35 92% 52%;
+    --chart-4: 280 60% 60%;
+    --chart-5: 192 70% 45%;
+    --chart-6: 340 70% 58%;
+    --chart-7: 95 50% 45%;
+    --chart-8: 22 80% 55%;
+    --chart-grid: 218 16% 90%;
+
+    --radius: 0.5rem;
     --sidebar-w: 15rem;
-    --sidebar-w-collapsed: 4.25rem;
-    --header-h: 3.75rem;
+    --sidebar-w-collapsed: 3.5rem;
+    --header-h: 3.5rem;
+  }
+
+  .dark {
+    --background: 222 28% 9%;
+    --surface-subtle: 222 24% 12%;
+    --card: 222 24% 13%;
+    --card-foreground: 213 25% 90%;
+    --elevated: 222 22% 16%;
+    --popover: 222 24% 14%;
+    --popover-foreground: 213 25% 90%;
+    --foreground: 213 25% 90%;
+
+    --primary: 234 76% 68%;
+    --primary-foreground: 222 40% 10%;
+    --secondary: 213 20% 88%;
+    --secondary-foreground: 222 30% 13%;
+    --muted: 222 20% 18%;
+    --muted-foreground: 217 14% 60%;
+    --accent: 234 76% 68%;
+    --accent-foreground: 222 40% 10%;
+
+    --destructive: 0 72% 60%;
+    --destructive-foreground: 0 0% 100%;
+    --success: 152 52% 50%;
+    --success-foreground: 222 40% 10%;
+    --warning: 35 92% 58%;
+    --warning-foreground: 222 40% 10%;
+    --info: 217 85% 65%;
+    --info-foreground: 222 40% 10%;
+
+    --border: 220 16% 22%;
+    --border-strong: 218 14% 32%;
+    --input: 218 14% 28%;
+    --ring: 234 76% 68%;
+
+    --sidebar: 222 30% 11%;
+    --sidebar-foreground: 215 20% 72%;
+    --sidebar-muted: 217 14% 48%;
+    --sidebar-accent: 234 80% 74%;
+    --sidebar-active: 222 24% 18%;
+    --sidebar-border: 222 20% 18%;
+
+    --chart-1: 234 80% 72%;
+    --chart-2: 152 56% 56%;
+    --chart-3: 35 92% 62%;
+    --chart-4: 280 65% 70%;
+    --chart-5: 192 72% 58%;
+    --chart-6: 340 75% 68%;
+    --chart-7: 95 52% 58%;
+    --chart-8: 22 82% 64%;
+    --chart-grid: 220 16% 22%;
   }
 }
+/* PLACEHOLDER_THEME */
 
 @theme inline {
   --color-background: hsl(var(--background));
+  --color-surface-subtle: hsl(var(--surface-subtle));
   --color-foreground: hsl(var(--foreground));
   --color-card: hsl(var(--card));
   --color-card-foreground: hsl(var(--card-foreground));
+  --color-elevated: hsl(var(--elevated));
   --color-popover: hsl(var(--popover));
   --color-popover-foreground: hsl(var(--popover-foreground));
   --color-primary: hsl(var(--primary));
@@ -76,12 +152,26 @@
   --color-border-strong: hsl(var(--border-strong));
   --color-input: hsl(var(--input));
   --color-ring: hsl(var(--ring));
+
   --color-sidebar: hsl(var(--sidebar));
   --color-sidebar-foreground: hsl(var(--sidebar-foreground));
+  --color-sidebar-muted: hsl(var(--sidebar-muted));
+  --color-sidebar-accent: hsl(var(--sidebar-accent));
+  --color-sidebar-active: hsl(var(--sidebar-active));
   --color-sidebar-border: hsl(var(--sidebar-border));
 
-  --radius-sm: calc(var(--radius) - 4px);
-  --radius-md: calc(var(--radius) - 2px);
+  --color-chart-1: hsl(var(--chart-1));
+  --color-chart-2: hsl(var(--chart-2));
+  --color-chart-3: hsl(var(--chart-3));
+  --color-chart-4: hsl(var(--chart-4));
+  --color-chart-5: hsl(var(--chart-5));
+  --color-chart-6: hsl(var(--chart-6));
+  --color-chart-7: hsl(var(--chart-7));
+  --color-chart-8: hsl(var(--chart-8));
+  --color-chart-grid: hsl(var(--chart-grid));
+
+  --radius-sm: calc(var(--radius) - 3px);
+  --radius-md: calc(var(--radius) - 1px);
   --radius-lg: var(--radius);
   --radius-xl: calc(var(--radius) + 4px);
 
@@ -89,7 +179,6 @@
     'Microsoft YaHei', sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, 'Menlo', monospace;
 }
-/* PLACEHOLDER_BASE */
 
 @layer base {
   * {
@@ -101,6 +190,10 @@
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
+    color-scheme: light;
+  }
+  html.dark {
+    color-scheme: dark;
   }
 
   body {
@@ -111,14 +204,27 @@
     color: hsl(var(--foreground));
     font-family: var(--font-sans);
     font-feature-settings: 'rlig' 1, 'calt' 1;
+    font-size: 14px;
   }
 
   :focus-visible {
     outline: none;
   }
+
+  /* 主题切换平滑过渡 */
+  html.theme-transition,
+  html.theme-transition * {
+    transition: background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+  }
 }
 
 @layer utilities {
+  /* 数字等宽,用于指标/表格对齐 */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: 'tnum';
+  }
+
   .scrollbar-thin {
     scrollbar-width: thin;
     scrollbar-color: hsl(var(--border-strong)) transparent;
