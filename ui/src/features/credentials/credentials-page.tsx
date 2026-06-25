@@ -1,0 +1,563 @@
+import {
+  CheckCircle2,
+  Download,
+  FileUp,
+  Filter,
+  Plus,
+  RefreshCw,
+  RotateCcw,
+  Server,
+  Trash2,
+  Upload,
+  X,
+} from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
+import { toast } from 'sonner'
+import { forceRefreshToken, testCredential } from '@/api/credentials'
+import {
+  Badge,
+  Button,
+  Checkbox,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  Spinner,
+} from '@/components/ui'
+import {
+  EmptyState,
+  ErrorState,
+  LoadingState,
+  PageContainer,
+  PageHeader,
+  Pagination,
+  SectionCard,
+  StatCard,
+  StatGrid,
+  Toolbar,
+  ToolbarActions,
+  ToolbarSearch,
+  useConfirm,
+} from '@/components/patterns'
+import { formatNumber } from '@/lib/format'
+import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
+import { extractErrorMessage } from '@/lib/utils'
+import {
+  useCredentialList,
+  useCredentialRuntime,
+  useCredentialSummary,
+  useCredentialAccountInfo,
+  useCredentialUsageSummary,
+  useCredentials,
+  useDeleteCredential,
+  useDeleteDisabledCredentials,
+  useLoadBalancingMode,
+  useProxyResources,
+  useResetFailure,
+  useSetLoadBalancingMode,
+} from '@/hooks/use-credentials'
+import type {
+  CredentialSortBy,
+  CredentialSortOrder,
+  CredentialStatusItem,
+  LoadBalancingMode,
+} from '@/types/api'
+import { pageMeta } from '@/types/ui'
+import { CredentialCard } from './credential-card'
+import {
+  AddCredentialModal,
+  BatchEditCredentialsModal,
+  BatchImportModal,
+  BatchVerifyModal,
+  CredentialExportModal,
+  CredentialTestModal,
+  KamImportModal,
+  type VerifyResult,
+} from './credential-dialogs'
+import { mapById, mergeCredentialPlanes } from './credential-utils'
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const PAGE_SIZE = 15
+
+const SORT_OPTIONS: Array<{ value: CredentialSortBy; label: string }> = [
+  { value: 'default', label: '默认排序' },
+  { value: 'priority', label: '优先级' },
+  { value: 'created_at', label: '创建时间' },
+  { value: 'updated_at', label: '更新时间' },
+  { value: 'last_used_at', label: '最后使用' },
+  { value: 'success_count', label: '成功次数' },
+  { value: 'failure_count', label: '失败次数' },
+  { value: 'in_flight_requests', label: '并发占用' },
+  { value: 'scheduler_score', label: '调度评分' },
+  { value: 'estimated_cost', label: '本地成本' },
+  { value: 'usage_percentage', label: '额度使用率' },
+  { value: 'remaining_quota', label: '剩余额度' },
+  { value: 'id', label: 'ID' },
+]
+
+// ============================================================================
+// CredentialsPage
+// ============================================================================
+
+export function CredentialsPage() {
+  const [page, setPage] = useState(1)
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
+  const [queryText, setQueryText] = useState('')
+  const [statusFilter, setStatusFilter] = useState('__all__')
+  const [authFilter, setAuthFilter] = useState('__all__')
+  const [subscriptionFilter, setSubscriptionFilter] = useState('__all__')
+  const [proxyFilter, setProxyFilter] = useState('__all__')
+  const [sortBy, setSortBy] = useState<CredentialSortBy>('default')
+  const [sortOrder, setSortOrder] = useState<CredentialSortOrder>('desc')
+  const [showFilters, setShowFilters] = useState(false)
+  const [testingCredential, setTestingCredential] = useState<CredentialStatusItem | null>(null)
+  const [addOpen, setAddOpen] = useState(false)
+  const [batchOpen, setBatchOpen] = useState(false)
+  const [batchEditOpen, setBatchEditOpen] = useState(false)
+  const [kamOpen, setKamOpen] = useState(false)
+  const [exportOpen, setExportOpen] = useState(false)
+  const [verifyOpen, setVerifyOpen] = useState(false)
+  const [verifying, setVerifying] = useState(false)
+  const [verifyProgress, setVerifyProgress] = useState({ current: 0, total: 0 })
+  const [verifyResults, setVerifyResults] = useState<Map<number, VerifyResult>>(new Map())
+  const [batchRefreshing, setBatchRefreshing] = useState(false)
+  const cancelVerifyRef = useRef(false)
+
+  const confirmDialog = useConfirm()
+  const queryClient = useQueryClient()
+
+  // Derived filter params — sentinel '__all__' avoids empty-string in Select
+  const listQuery = useMemo(() => ({
+    page,
+    limit: PAGE_SIZE,
+    q: queryText.trim() || undefined,
+    status: statusFilter !== '__all__' ? statusFilter : undefined,
+    authMethod: authFilter !== '__all__' ? authFilter : undefined,
+    subscription: subscriptionFilter !== '__all__' ? subscriptionFilter : undefined,
+    proxyResourceId: proxyFilter !== '__all__' ? Number(proxyFilter) : undefined,
+    sortBy: sortBy !== 'default' ? sortBy : undefined,
+    sortOrder: sortBy !== 'default' ? sortOrder : undefined,
+  }), [page, queryText, statusFilter, authFilter, subscriptionFilter, proxyFilter, sortBy, sortOrder])
+
+  const credentials = useCredentialList(listQuery)
+  const allCredentials = useCredentials({ enabled: batchOpen || kamOpen })
+  const currentIds = useMemo(() => (credentials.data?.items || []).map((i) => i.id), [credentials.data?.items])
+  const credentialSummary = useCredentialSummary()
+  const credentialRuntime = useCredentialRuntime(currentIds)
+  const credentialAccountInfo = useCredentialAccountInfo(currentIds)
+  const credentialUsage = useCredentialUsageSummary(currentIds)
+  const proxyResources = useProxyResources()
+  const loadBalancing = useLoadBalancingMode()
+  const setLoadBalancingMutation = useSetLoadBalancingMode()
+  const deleteCredential = useDeleteCredential()
+  const deleteDisabledCredentials = useDeleteDisabledCredentials()
+  const resetFailure = useResetFailure()
+
+  const currentCredentials = useMemo(() => {
+    const runtimeById = mapById(credentialRuntime.data?.items)
+    const accountById = mapById(credentialAccountInfo.data?.items)
+    const usageById = mapById(credentialUsage.data?.items)
+    return (credentials.data?.items || []).map((item) =>
+      mergeCredentialPlanes(item, runtimeById.get(item.id), accountById.get(item.id), usageById.get(item.id))
+    )
+  }, [credentials.data?.items, credentialRuntime.data?.items, credentialAccountInfo.data?.items, credentialUsage.data?.items])
+
+  const importDuplicateCheckCredentials = allCredentials.data?.credentials || currentCredentials
+  const totalPages = credentials.data?.totalPages || 0
+  const filteredTotal = credentials.data?.filteredTotal ?? credentials.data?.total ?? 0
+  const grandTotal = credentials.data?.total ?? 0
+  const disabledCount = credentialSummary.data?.disabled ?? Math.max((credentials.data?.total || 0) - (credentials.data?.available || 0), 0)
+  const hasActiveFilters = statusFilter !== '__all__' || authFilter !== '__all__' || subscriptionFilter !== '__all__' || proxyFilter !== '__all__'
+  const activeFilterCount = [statusFilter, authFilter, subscriptionFilter, proxyFilter].filter((f) => f !== '__all__').length
+  const selectedDisabledCount = Array.from(selectedIds).filter((id) => currentCredentials.find((c) => c.id === id)?.disabled).length
+
+  // Reset page on filter change
+  useEffect(() => { setPage(1); setSelectedIds(new Set()) }, [queryText, statusFilter, authFilter, subscriptionFilter, proxyFilter, sortBy, sortOrder])
+  useEffect(() => { setSelectedIds(new Set()) }, [page])
+  useEffect(() => {
+    if (credentials.data && page > Math.max(credentials.data.totalPages, 1)) setPage(Math.max(credentials.data.totalPages, 1))
+  }, [credentials.data, page])
+
+  const invalidate = () => {
+    queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    queryClient.invalidateQueries({ queryKey: ['credential-list'] })
+    queryClient.invalidateQueries({ queryKey: ['credential-summary'] })
+    queryClient.invalidateQueries({ queryKey: ['credential-runtime'] })
+    queryClient.invalidateQueries({ queryKey: ['credential-account-info'] })
+    queryClient.invalidateQueries({ queryKey: ['credential-usage-summary'] })
+    queryClient.invalidateQueries({ queryKey: ['credentials-page'] })
+  }
+
+  const toggleSelect = (id: number) =>
+    setSelectedIds((prev) => { const next = new Set(prev); if (next.has(id)) next.delete(id); else next.add(id); return next })
+  const selectAll = () => {
+    if (selectedIds.size === currentCredentials.length) setSelectedIds(new Set())
+    else setSelectedIds(new Set(currentCredentials.map((c) => c.id)))
+  }
+  const clearFilters = () => { setQueryText(''); setStatusFilter('__all__'); setAuthFilter('__all__'); setSubscriptionFilter('__all__'); setProxyFilter('__all__') }
+
+  const setLbMode = (mode: LoadBalancingMode) => {
+    setLoadBalancingMutation.mutate(mode, {
+      onSuccess: () => toast.success(`已切换为${mode === 'priority' ? '优先级' : mode === 'balanced' ? '均衡负载' : '健康均衡'}模式`),
+      onError: (e) => toast.error(`切换失败: ${extractErrorMessage(e)}`),
+    })
+  }
+
+  const batchDelete = async () => {
+    const disabledIds = Array.from(selectedIds).filter((id) => currentCredentials.find((c) => c.id === id)?.disabled)
+    if (!disabledIds.length) return toast.error('选中项中没有已禁用账号')
+    const ok = await confirmDialog({ title: '批量删除', message: `确定删除 ${disabledIds.length} 个已禁用账号？此操作无法撤销。`, confirmText: '删除', tone: 'danger' })
+    if (!ok) return
+    let success = 0; let fail = 0
+    for (const id of disabledIds) { try { await deleteCredential.mutateAsync(id); success++ } catch { fail++ } }
+    setSelectedIds(new Set())
+    if (fail === 0) toast.success(`成功删除 ${success} 个账号`)
+    else toast.warning(`删除：成功 ${success}，失败 ${fail}`)
+  }
+
+  const batchResetFailure = async () => {
+    const ids = Array.from(selectedIds).filter((id) => (currentCredentials.find((c) => c.id === id)?.failureCount || 0) > 0)
+    if (!ids.length) return toast.error('选中项中没有有失败记录的账号')
+    let success = 0; let fail = 0
+    for (const id of ids) { try { await resetFailure.mutateAsync(id); success++ } catch { fail++ } }
+    setSelectedIds(new Set())
+    if (fail === 0) toast.success(`成功恢复 ${success} 个账号`)
+    else toast.warning(`恢复：成功 ${success}，失败 ${fail}`)
+  }
+
+  const batchForceRefresh = async () => {
+    const ids = Array.from(selectedIds).filter((id) => {
+      const c = currentCredentials.find((cr) => cr.id === id)
+      return c && c.authMethod !== 'api_key'
+    })
+    if (!ids.length) return toast.error('选中项中没有可刷新 Token 的 OAuth 账号')
+    setBatchRefreshing(true); let success = 0; let fail = 0
+    for (const id of ids) { try { await forceRefreshToken(id); success++ } catch { fail++ } }
+    setBatchRefreshing(false); setSelectedIds(new Set()); invalidate()
+    if (fail === 0) toast.success(`成功刷新 ${success} 个账号 Token`)
+    else toast.warning(`刷新 Token：成功 ${success}，失败 ${fail}`)
+  }
+
+  const clearAllDisabled = async () => {
+    if (!disabledCount) return toast.error('没有可清除的已禁用账号')
+    const ok = await confirmDialog({ title: '清除已禁用账号', message: `确定清除所有 ${disabledCount} 个已禁用账号？此操作无法撤销。`, confirmText: '清除全部', tone: 'danger' })
+    if (!ok) return
+    try {
+      const result = await deleteDisabledCredentials.mutateAsync()
+      setSelectedIds(new Set())
+      if (result.failed === 0) toast.success(`成功清除 ${result.success} 个已禁用账号`)
+      else toast.warning(`清除：成功 ${result.success}，失败 ${result.failed}`)
+    } catch (e) { toast.error(`清除失败: ${extractErrorMessage(e)}`) }
+  }
+
+  const batchVerify = async () => {
+    const ids = Array.from(selectedIds)
+    if (!ids.length) return toast.error('请先选择要验活的账号')
+    setVerifying(true); cancelVerifyRef.current = false; setVerifyOpen(true)
+    setVerifyProgress({ current: 0, total: ids.length })
+    setVerifyResults(new Map(ids.map((id) => [id, { id, status: 'pending' as const }])))
+    let success = 0
+    for (let i = 0; i < ids.length; i++) {
+      if (cancelVerifyRef.current) break
+      const id = ids[i]
+      setVerifyResults((prev) => new Map(prev).set(id, { id, status: 'verifying' }))
+      try {
+        const res = await testCredential(id, { model: DEFAULT_TEST_MODEL, prompt: DEFAULT_TEST_PROMPT })
+        success++
+        setVerifyResults((prev) => new Map(prev).set(id, { id, status: 'success', model: testModelLabel(res.model), response: res.response }))
+      } catch (e) {
+        setVerifyResults((prev) => new Map(prev).set(id, { id, status: 'failed', error: extractErrorMessage(e) }))
+      }
+      setVerifyProgress({ current: i + 1, total: ids.length })
+      if (i < ids.length - 1 && !cancelVerifyRef.current) await new Promise((r) => setTimeout(r, 2000))
+    }
+    setVerifying(false)
+    if (!cancelVerifyRef.current) toast.success(`验活完成：成功 ${success}/${ids.length}`)
+  }
+
+  // Loading / error
+  if (credentials.isLoading && !credentials.data) return <LoadingState text="加载账号列表..." />
+  if (credentials.error) return <ErrorState message={extractErrorMessage(credentials.error)} />
+
+  return (
+    <PageContainer>
+      <PageHeader
+        title={pageMeta.credentials.title}
+        subtitle={pageMeta.credentials.subtitle}
+        actions={
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Select
+              value={loadBalancing.data?.mode || 'priority'}
+              onValueChange={(v) => setLbMode(v as LoadBalancingMode)}
+              disabled={setLoadBalancingMutation.isPending || loadBalancing.isLoading}
+            >
+              <SelectTrigger size="sm" className="w-32"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="priority">优先级</SelectItem>
+                <SelectItem value="balanced">均衡负载</SelectItem>
+                <SelectItem value="health_balanced">健康均衡</SelectItem>
+              </SelectContent>
+            </Select>
+            <Button variant="outline" size="sm" onClick={() => credentials.refetch()}>
+              <RefreshCw className={`h-4 w-4 ${credentials.isFetching ? 'animate-spin' : ''}`} />
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => setKamOpen(true)}>
+              <FileUp className="h-4 w-4" /><span className="hidden sm:inline">KAM</span>
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => setBatchOpen(true)}>
+              <Upload className="h-4 w-4" /><span className="hidden sm:inline">批量导入</span>
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => setExportOpen(true)}>
+              <Download className="h-4 w-4" /><span className="hidden sm:inline">导出</span>
+            </Button>
+            <Button size="sm" onClick={() => setAddOpen(true)}>
+              <Plus className="h-4 w-4" />添加账号
+            </Button>
+          </div>
+        }
+      />
+
+      {/* Stats */}
+      <StatGrid>
+        <StatCard
+          title="账号总数"
+          value={formatNumber(credentialSummary.data?.total ?? grandTotal)}
+          icon={<Server className="h-5 w-5" />}
+        />
+        <StatCard
+          title="可用账号"
+          value={formatNumber(credentialSummary.data?.available ?? credentials.data?.available ?? 0)}
+          tone="success"
+        />
+        <StatCard
+          title="全局并发"
+          value={`${credentialSummary.data?.globalInFlightRequests ?? 0} / ${credentialSummary.data?.globalMaxConcurrentRequests ?? '∞'}`}
+          desc={`排队 ${credentialSummary.data?.queuedRequests ?? 0}`}
+          tone="info"
+        />
+        <StatCard
+          title="已禁用"
+          value={formatNumber(disabledCount)}
+          tone={disabledCount > 0 ? 'warning' : 'default'}
+        />
+      </StatGrid>
+
+      {/* Main section */}
+      <SectionCard
+        title="账号列表"
+        description={
+          hasActiveFilters || queryText
+            ? `筛选后 ${filteredTotal} / 共 ${credentialSummary.data?.total ?? grandTotal}`
+            : `共 ${credentialSummary.data?.total ?? grandTotal} 个账号`
+        }
+      >
+        {/* Toolbar */}
+        <Toolbar className="mb-3">
+          <ToolbarSearch
+            value={queryText}
+            onChange={setQueryText}
+            placeholder="搜索邮箱、ID、订阅、代理..."
+          />
+          <ToolbarActions>
+            <Select value={sortBy} onValueChange={(v) => setSortBy(v as CredentialSortBy)}>
+              <SelectTrigger size="sm" className="w-36"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {SORT_OPTIONS.map((o) => <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>)}
+              </SelectContent>
+            </Select>
+            <Select value={sortOrder} onValueChange={(v) => setSortOrder(v as CredentialSortOrder)} disabled={sortBy === 'default'}>
+              <SelectTrigger size="sm" className="w-20"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="desc">降序</SelectItem>
+                <SelectItem value="asc">升序</SelectItem>
+              </SelectContent>
+            </Select>
+            <Button
+              variant="outline"
+              size="sm"
+              className={hasActiveFilters ? 'border-primary text-primary' : ''}
+              onClick={() => setShowFilters((v) => !v)}
+            >
+              <Filter className="h-3.5 w-3.5" />
+              筛选
+              {activeFilterCount > 0 && <Badge tone="primary">{activeFilterCount}</Badge>}
+            </Button>
+          </ToolbarActions>
+        </Toolbar>
+
+        {/* Filter Panel */}
+        {showFilters && (
+          <div className="mb-3 rounded-lg border border-border bg-muted/40 p-3">
+            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+              <Select value={statusFilter} onValueChange={setStatusFilter}>
+                <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__all__">全部状态</SelectItem>
+                  <SelectItem value="enabled">启用</SelectItem>
+                  <SelectItem value="disabled">已禁用</SelectItem>
+                  <SelectItem value="cooldown">冷却中</SelectItem>
+                  <SelectItem value="rate_limited">限流中</SelectItem>
+                  <SelectItem value="error">有错误</SelectItem>
+                  <SelectItem value="unknown_subscription">未知订阅</SelectItem>
+                </SelectContent>
+              </Select>
+              <Select value={authFilter} onValueChange={setAuthFilter}>
+                <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__all__">全部认证</SelectItem>
+                  <SelectItem value="social">Social</SelectItem>
+                  <SelectItem value="idc">IdC</SelectItem>
+                  <SelectItem value="api_key">API Key</SelectItem>
+                </SelectContent>
+              </Select>
+              <Select value={subscriptionFilter} onValueChange={setSubscriptionFilter}>
+                <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__all__">全部订阅</SelectItem>
+                  <SelectItem value="pro_plus">Pro+</SelectItem>
+                  <SelectItem value="pro">Pro</SelectItem>
+                  <SelectItem value="trial">试用</SelectItem>
+                  <SelectItem value="free">Free</SelectItem>
+                  <SelectItem value="unknown">未知</SelectItem>
+                </SelectContent>
+              </Select>
+              <Select value={proxyFilter} onValueChange={setProxyFilter}>
+                <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__all__">全部代理</SelectItem>
+                  {(proxyResources.data?.resources || []).map((r) => (
+                    <SelectItem key={r.id} value={String(r.id)}>{r.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            {hasActiveFilters && (
+              <div className="mt-2 flex justify-end">
+                <Button variant="ghost" size="xs" onClick={clearFilters}>
+                  <X className="h-3.5 w-3.5" />清除筛选
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Batch actions bar */}
+        {selectedIds.size > 0 && (
+          <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2">
+            <Badge tone="primary">已选 {selectedIds.size}</Badge>
+            <Button variant="outline" size="xs" onClick={batchVerify}>
+              <CheckCircle2 className="h-3.5 w-3.5" />验活
+            </Button>
+            <Button variant="outline" size="xs" onClick={() => setBatchEditOpen(true)}>
+              <Filter className="h-3.5 w-3.5" />批量修改
+            </Button>
+            <Button variant="outline" size="xs" onClick={batchForceRefresh} disabled={batchRefreshing}>
+              {batchRefreshing ? <Spinner size="sm" /> : <RefreshCw className="h-3.5 w-3.5" />}刷新Token
+            </Button>
+            <Button variant="outline" size="xs" onClick={batchResetFailure}>
+              <RotateCcw className="h-3.5 w-3.5" />恢复异常
+            </Button>
+            <Button
+              variant="outline" size="xs"
+              className="text-destructive hover:bg-destructive/10"
+              onClick={batchDelete}
+              disabled={selectedDisabledCount === 0}
+            >
+              <Trash2 className="h-3.5 w-3.5" />删除已禁用 ({selectedDisabledCount})
+            </Button>
+            <Button variant="ghost" size="xs" onClick={() => setSelectedIds(new Set())}>取消</Button>
+          </div>
+        )}
+
+        {/* Select-all row */}
+        <div className="mb-3 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Checkbox
+              checked={currentCredentials.length > 0 && selectedIds.size === currentCredentials.length}
+              onCheckedChange={selectAll}
+            />
+            <span className="text-xs text-muted-foreground">
+              {selectedIds.size > 0 ? `已选 ${selectedIds.size} 个` : '全选当前页'}
+            </span>
+            {credentials.isFetching && !credentials.isLoading && <Spinner size="sm" />}
+          </div>
+          {disabledCount > 0 && (
+            <Button
+              variant="outline" size="xs"
+              className="text-destructive hover:bg-destructive/10"
+              onClick={clearAllDisabled}
+            >
+              <Trash2 className="h-3.5 w-3.5" />清除全部已禁用 ({disabledCount})
+            </Button>
+          )}
+        </div>
+
+        {/* Credential list */}
+        {currentCredentials.length === 0 ? (
+          <EmptyState
+            icon={<Server className="h-12 w-12" />}
+            title="暂无账号"
+            description={hasActiveFilters || queryText ? '没有匹配当前筛选条件的账号' : '点击添加按钮创建第一个账号'}
+            action={
+              hasActiveFilters || queryText ? (
+                <Button variant="outline" size="sm" onClick={clearFilters}>清除筛选</Button>
+              ) : (
+                <Button size="sm" onClick={() => setAddOpen(true)}>
+                  <Plus className="h-4 w-4" />添加账号
+                </Button>
+              )
+            }
+          />
+        ) : (
+          <div className="grid gap-3 lg:grid-cols-2">
+            {currentCredentials.map((credential) => (
+              <CredentialCard
+                key={credential.id}
+                credential={credential}
+                selected={selectedIds.has(credential.id)}
+                onToggleSelect={() => toggleSelect(credential.id)}
+                onQueryBalance={() => {}}
+                onTest={setTestingCredential}
+                loadingBalance={false}
+              />
+            ))}
+          </div>
+        )}
+
+        {/* Pagination */}
+        {totalPages > 1 && (
+          <div className="mt-4">
+            <Pagination
+              page={page}
+              pageCount={totalPages}
+              total={filteredTotal}
+              pageSize={PAGE_SIZE}
+              onPageChange={setPage}
+            />
+          </div>
+        )}
+      </SectionCard>
+
+      {/* Modals */}
+      <AddCredentialModal open={addOpen} onClose={() => setAddOpen(false)} />
+      <CredentialTestModal credential={testingCredential} open={Boolean(testingCredential)} onClose={() => setTestingCredential(null)} />
+      <BatchEditCredentialsModal open={batchEditOpen} ids={Array.from(selectedIds)} onClose={() => setBatchEditOpen(false)} onDone={() => { invalidate(); setSelectedIds(new Set()) }} />
+      <BatchImportModal open={batchOpen} onClose={() => setBatchOpen(false)} existingCredentials={importDuplicateCheckCredentials} onDone={invalidate} />
+      <KamImportModal open={kamOpen} onClose={() => setKamOpen(false)} existingCredentials={importDuplicateCheckCredentials} onDone={invalidate} />
+      <CredentialExportModal open={exportOpen} onClose={() => setExportOpen(false)} />
+      <BatchVerifyModal
+        open={verifyOpen}
+        verifying={verifying}
+        progress={verifyProgress}
+        results={verifyResults}
+        onCancel={() => { cancelVerifyRef.current = true; setVerifying(false) }}
+        onClose={() => setVerifyOpen(false)}
+      />
+    </PageContainer>
+  )
+}

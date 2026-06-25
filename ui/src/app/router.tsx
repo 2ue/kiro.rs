@@ -3,6 +3,8 @@ import { AppShell } from '@/layouts/app-shell'
 import { AuthGate, useAuth } from './auth-gate'
 import { CONSOLE_BASE_PATH } from '@/types/ui'
 import { PlaceholderPage } from '@/features/_placeholder/placeholder-page'
+import { OverviewPage } from '@/features/overview/overview-page'
+import { CredentialsPage } from '@/features/credentials/credentials-page'
 
 function ShellWithAuth() {
   const { logout } = useAuth()
@@ -21,9 +23,9 @@ const router = createBrowserRouter(
       children: [
         { index: true, element: <Navigate to="overview" replace /> },
         // 总览
-        { path: 'overview', element: <PlaceholderPage pageKey="overview" /> },
+        { path: 'overview', element: <OverviewPage /> },
         // 资源域
-        { path: 'credentials', element: <PlaceholderPage pageKey="credentials" /> },
+        { path: 'credentials', element: <CredentialsPage /> },
         { path: 'external-pools', element: <PlaceholderPage pageKey="external" /> },
         { path: 'proxies', element: <PlaceholderPage pageKey="proxies" /> },
         // 分析域
