@@ -1,8 +1,9 @@
 import { useLocation } from 'react-router-dom'
-import { LogOut, Menu } from 'lucide-react'
+import { LogOut, Menu, Moon, Sun, ChevronRight } from 'lucide-react'
 import { Button } from '@/components/ui'
-import { getTabFromPathname } from '@/app/router-utils'
+import { getPageFromPathname, domainLabelOf } from '@/app/router-utils'
 import { pageMeta } from '@/types/ui'
+import { useTheme } from '@/app/theme'
 
 export function Topbar({
   onLogout,
@@ -12,12 +13,13 @@ export function Topbar({
   onOpenMobileMenu: () => void
 }) {
   const location = useLocation()
-  const tab = getTabFromPathname(location.pathname)
-  const meta = pageMeta[tab]
+  const page = getPageFromPathname(location.pathname)
+  const meta = pageMeta[page]
+  const domainLabel = domainLabelOf(page)
+  const { theme, toggleTheme } = useTheme()
 
   return (
-    <header className="sticky top-0 z-30 flex h-[--header-h] shrink-0 items-center gap-3 border-b border-border bg-card/90 px-4 backdrop-blur-md lg:px-6">
-      {/* 移动端菜单按钮 */}
+    <header className="sticky top-0 z-30 flex h-[--header-h] shrink-0 items-center gap-3 border-b border-border bg-card/85 px-4 backdrop-blur-md lg:px-6">
       <Button
         variant="ghost"
         size="icon-sm"
@@ -29,11 +31,23 @@ export function Topbar({
       </Button>
 
       <div className="min-w-0 flex-1">
-        <h2 className="truncate text-sm font-semibold tracking-tight text-foreground">
-          {meta.title}
-        </h2>
+        <div className="flex items-center gap-1.5 text-[0.7rem] text-muted-foreground">
+          <span>{domainLabel}</span>
+          <ChevronRight className="size-3" />
+          <span className="font-medium text-foreground/70">{meta.title}</span>
+        </div>
         <p className="hidden truncate text-xs text-muted-foreground sm:block">{meta.subtitle}</p>
       </div>
+
+      <Button
+        variant="ghost"
+        size="icon-sm"
+        onClick={toggleTheme}
+        aria-label={theme === 'dark' ? '切换到亮色' : '切换到暗色'}
+        title={theme === 'dark' ? '切换到亮色' : '切换到暗色'}
+      >
+        {theme === 'dark' ? <Sun className="size-4" /> : <Moon className="size-4" />}
+      </Button>
 
       <Button
         variant="ghost"

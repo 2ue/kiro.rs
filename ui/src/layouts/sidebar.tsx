@@ -1,135 +1,118 @@
-import { NavLink } from 'react-router-dom'
-import { ChevronLeft, ChevronRight } from 'lucide-react'
+import { NavLink, useLocation } from 'react-router-dom'
 import { cn } from '@/lib/utils'
-import { navItems, navGroups } from '@/types/ui'
+import { navDomains, navPages, pagesOfDomain, type DomainKey } from '@/types/ui'
 import { useSystemVersion } from '@/hooks/use-credentials'
-import { Tooltip, TooltipProvider } from '@/components/ui'
 
 interface SidebarProps {
-  collapsed?: boolean
   embedded?: boolean
-  onToggleCollapse?: () => void
   onNavigate?: () => void
 }
 
-export function Sidebar({ collapsed = false, embedded, onToggleCollapse, onNavigate }: SidebarProps) {
+/** 从当前路径解析所属域 */
+function domainOfPathname(pathname: string): DomainKey {
+  const seg = pathname.replace(/^\/+/, '').split('/')[0]
+  const page = navPages.find((p) => p.path === seg)
+  return page?.domain ?? 'overview'
+}
+
+export function Sidebar({ embedded, onNavigate }: SidebarProps) {
   const version = useSystemVersion()
-  const showLabels = embedded || !collapsed
+  const location = useLocation()
+  const activeDomain = domainOfPathname(location.pathname)
+  const subPages = pagesOfDomain(activeDomain)
+  const showSubNav = subPages.length > 1
 
   return (
-    <TooltipProvider delayDuration={150}>
-      <div className="flex h-full flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground">
-        {/* 品牌 */}
-        <div
-          className={cn(
-            'flex h-[--header-h] shrink-0 items-center gap-2.5 border-b border-sidebar-border px-3',
-            !showLabels && 'justify-center px-0'
-          )}
-        >
-          <div className="relative flex size-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-secondary text-primary">
-            <span className="text-base font-bold">K</span>
-            <span className="absolute inset-x-1.5 bottom-1 h-0.5 rounded-full bg-primary" />
-          </div>
-          {showLabels && (
-            <div className="min-w-0">
-              <div className="truncate text-sm font-bold tracking-tight">Kiro Console</div>
-              <div className="truncate text-[0.66rem] font-semibold text-muted-foreground">
-                管理控制台
-              </div>
-            </div>
-          )}
+    <div className="flex h-full bg-sidebar text-sidebar-foreground">
+      {/* 一级:域导航条 */}
+      <nav
+        className={cn(
+          'flex w-[3.75rem] shrink-0 flex-col items-center gap-1 border-r border-sidebar-border py-3',
+          showSubNav ? '' : 'w-[4.25rem]'
+        )}
+      >
+        <div className="mb-2 flex size-9 items-center justify-center rounded-lg bg-sidebar-accent/15 text-sidebar-accent">
+          <span className="text-base font-bold">K</span>
         </div>
-
-        {/* 导航 */}
-        <nav className="scrollbar-thin flex-1 overflow-y-auto px-2 py-3">
-          {navGroups.map((group) => {
-            const items = navItems.filter((item) => item.group === group.id)
-            if (!items.length) return null
-            return (
-              <div key={group.id} className="mb-3 last:mb-0">
-                {showLabels && (
-                  <div className="mb-1 px-2 text-[0.62rem] font-bold uppercase tracking-wider text-muted-foreground/70">
-                    {group.label}
-                  </div>
+        {navDomains.map((domain) => {
+          const Icon = domain.icon
+          const active = domain.key === activeDomain
+          return (
+            <NavLink
+              key={domain.key}
+              to={`/${domain.path}`}
+              onClick={onNavigate}
+              title={domain.label}
+              className={cn(
+                'group flex w-full flex-col items-center gap-1 rounded-lg py-2 text-[0.62rem] font-medium transition-colors',
+                active
+                  ? 'text-sidebar-accent'
+                  : 'text-sidebar-muted hover:text-sidebar-foreground'
+              )}
+            >
+              <span
+                className={cn(
+                  'flex size-9 items-center justify-center rounded-lg transition-colors',
+                  active ? 'bg-sidebar-accent/15' : 'group-hover:bg-sidebar-active'
                 )}
-                <ul className="space-y-0.5">
-                  {items.map((item) => {
-                    const Icon = item.icon
-                    const link = (
-                      <NavLink
-                        to={`/${item.path}`}
-                        onClick={onNavigate}
-                        className={({ isActive }) =>
-                          cn(
-                            'group relative flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors',
-                            !showLabels && 'justify-center px-0',
-                            isActive
-                              ? 'bg-primary/10 text-primary'
-                              : 'text-muted-foreground hover:bg-muted hover:text-foreground'
-                          )
-                        }
-                      >
-                        {({ isActive }) => (
-                          <>
-                            <span
-                              className={cn(
-                                'absolute left-0 top-1/2 h-0 w-0.5 -translate-y-1/2 rounded-r-full bg-primary transition-all',
-                                isActive && 'h-6'
-                              )}
-                            />
-                            <Icon className="size-[1.15rem] shrink-0" />
-                            {showLabels && (
-                              <span className="min-w-0 flex-1">
-                                <span className="block truncate">{item.label}</span>
-                              </span>
-                            )}
-                          </>
-                        )}
-                      </NavLink>
-                    )
-                    return (
-                      <li key={item.key}>
-                        {showLabels ? (
-                          link
-                        ) : (
-                          <Tooltip label={item.label} side="right">
-                            {link}
-                          </Tooltip>
-                        )}
-                      </li>
-                    )
-                  })}
-                </ul>
-              </div>
-            )
-          })}
-        </nav>
+              >
+                <Icon className="size-[1.15rem]" />
+              </span>
+              {domain.label}
+            </NavLink>
+          )
+        })}
+      </nav>
 
-        {/* 底部 */}
-        <div className="shrink-0 border-t border-sidebar-border p-2">
-          {showLabels ? (
-            <div className="flex items-center justify-between rounded-lg bg-muted px-3 py-2">
-              <span className="text-[0.66rem] font-semibold text-muted-foreground">版本</span>
-              <span className="rounded-full border border-border px-2 py-0.5 font-mono text-[0.62rem] font-semibold text-foreground/70">
+      {/* 二级:当前域内页面 */}
+      {showSubNav && (
+        <div className="flex w-[11.25rem] shrink-0 flex-col">
+          <div className="flex h-[--header-h] items-center px-4">
+            <div className="text-sm font-bold tracking-tight text-sidebar-foreground/95">
+              {navDomains.find((d) => d.key === activeDomain)?.label}
+            </div>
+          </div>
+          <nav className="scrollbar-thin flex-1 overflow-y-auto px-2.5 pb-3">
+            <ul className="space-y-0.5">
+              {subPages.map((page) => {
+                const Icon = page.icon
+                return (
+                  <li key={page.key}>
+                    <NavLink
+                      to={`/${page.path}`}
+                      onClick={onNavigate}
+                      className={({ isActive }) =>
+                        cn(
+                          'group flex items-center gap-2.5 rounded-md px-2.5 py-2 text-[0.8rem] font-medium transition-colors',
+                          isActive
+                            ? 'bg-sidebar-active text-sidebar-foreground'
+                            : 'text-sidebar-muted hover:bg-sidebar-active/60 hover:text-sidebar-foreground'
+                        )
+                      }
+                    >
+                      <Icon className="size-4 shrink-0" />
+                      <span className="truncate">{page.label}</span>
+                    </NavLink>
+                  </li>
+                )
+              })}
+            </ul>
+          </nav>
+          <div className="px-3 pb-3">
+            <div className="flex items-center justify-between rounded-md bg-sidebar-active/50 px-2.5 py-1.5">
+              <span className="text-[0.62rem] font-semibold text-sidebar-muted">版本</span>
+              <span className="font-mono text-[0.62rem] font-semibold text-sidebar-foreground/70">
                 {version.data?.version ? `v${version.data.version}` : '—'}
               </span>
             </div>
-          ) : null}
-          {!embedded && onToggleCollapse && (
-            <button
-              type="button"
-              onClick={onToggleCollapse}
-              className={cn(
-                'mt-1.5 flex w-full items-center justify-center gap-2 rounded-lg px-3 py-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground'
-              )}
-              aria-label={collapsed ? '展开侧边栏' : '收起侧边栏'}
-            >
-              {collapsed ? <ChevronRight className="size-4" /> : <ChevronLeft className="size-4" />}
-              {showLabels && <span>收起</span>}
-            </button>
-          )}
+          </div>
         </div>
-      </div>
-    </TooltipProvider>
+      )}
+
+      {/* 单页域(总览):域条右侧不展开二级,但仍显示版本 */}
+      {!showSubNav && !embedded && (
+        <div className="flex w-0 flex-col" aria-hidden />
+      )}
+    </div>
   )
 }
