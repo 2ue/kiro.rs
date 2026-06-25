@@ -1,7 +1,7 @@
 import { NavLink } from 'react-router-dom'
 import { ChevronLeft, ChevronRight } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { navItems, navGroups, CONSOLE_BASE_PATH } from '@/types/ui'
+import { navItems, navGroups } from '@/types/ui'
 import { useSystemVersion } from '@/hooks/use-credentials'
 import { Tooltip, TooltipProvider } from '@/components/ui'
 
@@ -57,7 +57,7 @@ export function Sidebar({ collapsed = false, embedded, onToggleCollapse, onNavig
                     const Icon = item.icon
                     const link = (
                       <NavLink
-                        to={`${CONSOLE_BASE_PATH}/${item.path}`}
+                        to={`/${item.path}`}
                         onClick={onNavigate}
                         className={({ isActive }) =>
                           cn(
