@@ -1,22 +1,50 @@
+import * as React from 'react'
 import { createBrowserRouter, Navigate, RouterProvider } from 'react-router-dom'
 import { AppShell } from '@/layouts/app-shell'
 import { AuthGate, useAuth } from './auth-gate'
 import { CONSOLE_BASE_PATH } from '@/types/ui'
+import { LoadingState } from '@/components/patterns'
 
-import { OverviewPage } from '@/features/overview/overview-page'
-import { CredentialsPage } from '@/features/credentials/credentials-page'
-import { ExternalPoolsPage } from '@/features/external-pools/external-pools-page'
-import { ProxiesPage } from '@/features/proxies/proxies-page'
-import { UsagePage } from '@/features/usage/usage-page'
-import { CostPage } from '@/features/cost/cost-page'
-import { AuditPage } from '@/features/audit/audit-page'
-import { RuntimePage } from '@/features/runtime/runtime-page'
-import { ModelsPage } from '@/features/models/models-page'
-import { SecurityPage } from '@/features/security/security-page'
+// 路由级懒加载:每个页面单独分包,首屏只加载当前页
+const OverviewPage = React.lazy(() =>
+  import('@/features/overview/overview-page').then((m) => ({ default: m.OverviewPage }))
+)
+const CredentialsPage = React.lazy(() =>
+  import('@/features/credentials/credentials-page').then((m) => ({ default: m.CredentialsPage }))
+)
+const ExternalPoolsPage = React.lazy(() =>
+  import('@/features/external-pools/external-pools-page').then((m) => ({ default: m.ExternalPoolsPage }))
+)
+const ProxiesPage = React.lazy(() =>
+  import('@/features/proxies/proxies-page').then((m) => ({ default: m.ProxiesPage }))
+)
+const UsagePage = React.lazy(() =>
+  import('@/features/usage/usage-page').then((m) => ({ default: m.UsagePage }))
+)
+const CostPage = React.lazy(() =>
+  import('@/features/cost/cost-page').then((m) => ({ default: m.CostPage }))
+)
+const AuditPage = React.lazy(() =>
+  import('@/features/audit/audit-page').then((m) => ({ default: m.AuditPage }))
+)
+const RuntimePage = React.lazy(() =>
+  import('@/features/runtime/runtime-page').then((m) => ({ default: m.RuntimePage }))
+)
+const ModelsPage = React.lazy(() =>
+  import('@/features/models/models-page').then((m) => ({ default: m.ModelsPage }))
+)
+const SecurityPage = React.lazy(() =>
+  import('@/features/security/security-page').then((m) => ({ default: m.SecurityPage }))
+)
 
 function ShellWithAuth() {
   const { logout } = useAuth()
   return <AppShell onLogout={logout} />
+}
+
+/** 懒加载页面的 Suspense 包裹 */
+function Lazy({ children }: { children: React.ReactNode }) {
+  return <React.Suspense fallback={<LoadingState text="加载页面..." />}>{children}</React.Suspense>
 }
 
 const router = createBrowserRouter(
@@ -31,19 +59,19 @@ const router = createBrowserRouter(
       children: [
         { index: true, element: <Navigate to="overview" replace /> },
         // 总览
-        { path: 'overview', element: <OverviewPage /> },
+        { path: 'overview', element: <Lazy><OverviewPage /></Lazy> },
         // 资源域
-        { path: 'credentials', element: <CredentialsPage /> },
-        { path: 'external-pools', element: <ExternalPoolsPage /> },
-        { path: 'proxies', element: <ProxiesPage /> },
+        { path: 'credentials', element: <Lazy><CredentialsPage /></Lazy> },
+        { path: 'external-pools', element: <Lazy><ExternalPoolsPage /></Lazy> },
+        { path: 'proxies', element: <Lazy><ProxiesPage /></Lazy> },
         // 分析域
-        { path: 'usage', element: <UsagePage /> },
-        { path: 'cost', element: <CostPage /> },
-        { path: 'audit', element: <AuditPage /> },
+        { path: 'usage', element: <Lazy><UsagePage /></Lazy> },
+        { path: 'cost', element: <Lazy><CostPage /></Lazy> },
+        { path: 'audit', element: <Lazy><AuditPage /></Lazy> },
         // 设置域
-        { path: 'runtime', element: <RuntimePage /> },
-        { path: 'models', element: <ModelsPage /> },
-        { path: 'security', element: <SecurityPage /> },
+        { path: 'runtime', element: <Lazy><RuntimePage /></Lazy> },
+        { path: 'models', element: <Lazy><ModelsPage /></Lazy> },
+        { path: 'security', element: <Lazy><SecurityPage /></Lazy> },
 
         { path: '*', element: <Navigate to="overview" replace /> },
       ],

@@ -43,7 +43,9 @@ use super::converter::{
 };
 use super::envelope;
 use super::middleware::AppState;
-use super::model_capabilities::{ModelResolution, ModelResolutionSource};
+use super::model_capabilities::{
+    ModelResolution, ModelResolutionSource, strip_model_compat_suffixes,
+};
 use super::payload_guard::{
     PayloadByteBreakdown, PayloadGuardConfig, PayloadGuardError, PayloadGuardReport,
     ToolUseFormatDiagnostics, breakdown_anthropic_messages_request, breakdown_kiro_request,
@@ -2821,6 +2823,27 @@ fn resolve_request_model(
     }
 
     if let Some(upstream_model) = resolution.upstream_model.as_deref() {
+        let (_, requested_thinking) = strip_model_compat_suffixes(&resolution.requested_model);
+        let (_, upstream_thinking) = strip_model_compat_suffixes(upstream_model);
+        if requested_thinking && !upstream_thinking {
+            tracing::info!(
+                endpoint,
+                requested_model = %resolution.requested_model,
+                upstream_model = %upstream_model,
+                resolution = %resolution.source.as_str(),
+                thinking_transport = "base_model_with_thinking_controls",
+                "上游目录未提供对应 thinking 模型，使用基础模型并保留 thinking 控制"
+            );
+        } else if requested_thinking && upstream_thinking {
+            tracing::info!(
+                endpoint,
+                requested_model = %resolution.requested_model,
+                upstream_model = %upstream_model,
+                resolution = %resolution.source.as_str(),
+                thinking_transport = "thinking_model",
+                "使用上游 thinking 模型"
+            );
+        }
         tracing::debug!(
             endpoint,
             requested_model = %resolution.requested_model,
@@ -4808,51 +4831,74 @@ async fn handle_non_stream_request(
     )
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ThinkingModelDefaults {
+    thinking_type: &'static str,
+    effort: Option<&'static str>,
+}
+
+fn claude_minor_version(model: &str, family: &str) -> Option<u32> {
+    let prefix = format!("claude-{family}-4");
+    let rest = model.strip_prefix(&prefix)?;
+    let rest = rest.strip_prefix(['-', '.'])?;
+    let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
+fn thinking_model_defaults(model: &str) -> Option<ThinkingModelDefaults> {
+    let (model_base, requested_thinking) = strip_model_compat_suffixes(model);
+    if !requested_thinking {
+        return None;
+    }
+
+    let is_opus_alias = matches!(
+        model_base.as_str(),
+        "opus" | "opusplan" | "best" | "default"
+    );
+    let is_sonnet_alias = model_base == "sonnet";
+    let is_opus = is_opus_alias || model_base.contains("opus");
+    let is_sonnet = is_sonnet_alias || model_base.contains("sonnet");
+
+    let effort = if is_opus_alias
+        || claude_minor_version(&model_base, "opus").is_some_and(|minor| minor >= 7)
+    {
+        Some("xhigh")
+    } else if is_opus || is_sonnet {
+        Some("high")
+    } else {
+        None
+    };
+
+    Some(ThinkingModelDefaults {
+        thinking_type: "enabled",
+        effort,
+    })
+}
+
 /// 检测模型名是否包含 "thinking" 后缀，若包含则在调用方未显式配置时注入 thinking
 ///
 /// - 调用方已指定 `thinking` 字段：保留原值
-/// - 调用方未指定：根据模型注入
-///   - Opus 4.6 / 4.7：adaptive 类型
-///   - 其他模型：enabled 类型
+/// - 调用方未指定：注入 `enabled`，确保 `-thinking` 兼容模型有真实 thinking 输出
 ///   - budget_tokens 固定为 20000
-/// - `output_config.effort` 同样仅在调用方未设置时填充
+/// - `output_config.effort` 仅在调用方显式传 adaptive 且未设置时按模型族填充
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
-    let model_lower = payload.model.to_lowercase();
-    if !model_lower.contains("thinking") {
+    let Some(defaults) = thinking_model_defaults(&payload.model) else {
         return;
-    }
-
-    let model_base = model_lower.strip_suffix("[1m]").unwrap_or(&model_lower);
-    let is_opus_alias = matches!(
-        model_base,
-        "opus-thinking" | "opusplan-thinking" | "best-thinking" | "default-thinking"
-    );
-    let is_opus_4_7 = is_opus_alias
-        || (model_base.contains("opus")
-            && (model_base.contains("4-7")
-                || model_base.contains("4.7")
-                || model_base == "opus"
-                || model_base == "opusplan"
-                || model_base == "best"
-                || model_base == "default"));
-    let is_opus_4_6 =
-        model_base.contains("opus") && (model_base.contains("4-6") || model_base.contains("4.6"));
-    let is_adaptive_opus = is_opus_4_7 || is_opus_4_6;
-
-    let thinking_type = if is_adaptive_opus {
-        "adaptive"
-    } else {
-        "enabled"
     };
 
     if payload.thinking.is_none() {
         tracing::info!(
             model = %payload.model,
-            thinking_type = thinking_type,
+            thinking_type = defaults.thinking_type,
+            effort = defaults.effort.unwrap_or(""),
             "模型名包含 thinking 后缀，注入默认 thinking 配置"
         );
         payload.thinking = Some(Thinking {
-            thinking_type: thinking_type.to_string(),
+            thinking_type: defaults.thinking_type.to_string(),
             budget_tokens: 20000,
         });
     } else {
@@ -4862,9 +4908,13 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         );
     }
 
-    if is_adaptive_opus && payload.output_config.is_none() {
+    let final_thinking_type = payload
+        .thinking
+        .as_ref()
+        .map(|thinking| thinking.thinking_type.as_str());
+    if final_thinking_type == Some("adaptive") && payload.output_config.is_none() {
         payload.output_config = Some(OutputConfig {
-            effort: if is_opus_4_7 { "xhigh" } else { "high" }.to_string(),
+            effort: defaults.effort.unwrap_or("high").to_string(),
         });
     }
 }
@@ -5422,49 +5472,89 @@ mod tests {
     }
 
     #[test]
-    fn thinking_suffix_opus_4_7_uses_adaptive() {
+    fn thinking_suffix_opus_4_7_uses_enabled_by_default() {
         let mut payload = messages_request_for_model("claude-opus-4-7-thinking");
 
         override_thinking_from_model_name(&mut payload);
 
         let thinking = payload.thinking.expect("thinking should be set");
-        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.thinking_type, "enabled");
         assert_eq!(thinking.budget_tokens, 20000);
-        assert_eq!(
-            payload
-                .output_config
-                .expect("output_config should be set")
-                .effort,
-            "xhigh"
-        );
+        assert!(payload.output_config.is_none());
     }
 
     #[test]
-    fn thinking_suffix_opus_alias_uses_opus_4_7_adaptive_defaults() {
+    fn thinking_suffix_opus_alias_uses_enabled_by_default() {
         let mut payload = messages_request_for_model("opus-thinking");
 
         override_thinking_from_model_name(&mut payload);
 
         let thinking = payload.thinking.expect("thinking should be set");
-        assert_eq!(thinking.thinking_type, "adaptive");
-        assert_eq!(
-            payload
-                .output_config
-                .expect("output_config should be set")
-                .effort,
-            "xhigh"
-        );
+        assert_eq!(thinking.thinking_type, "enabled");
+        assert_eq!(thinking.budget_tokens, 20000);
+        assert!(payload.output_config.is_none());
     }
 
     #[test]
-    fn thinking_suffix_sonnet_stays_enabled() {
+    fn thinking_suffix_sonnet_4_6_uses_enabled_by_default() {
         let mut payload = messages_request_for_model("claude-sonnet-4-6-thinking");
 
         override_thinking_from_model_name(&mut payload);
 
         let thinking = payload.thinking.expect("thinking should be set");
         assert_eq!(thinking.thinking_type, "enabled");
+        assert_eq!(thinking.budget_tokens, 20000);
         assert!(payload.output_config.is_none());
+    }
+
+    #[test]
+    fn thinking_suffix_sonnet_alias_uses_enabled_by_default() {
+        let mut payload = messages_request_for_model("sonnet-thinking");
+
+        override_thinking_from_model_name(&mut payload);
+
+        let thinking = payload.thinking.expect("thinking should be set");
+        assert_eq!(thinking.thinking_type, "enabled");
+        assert_eq!(thinking.budget_tokens, 20000);
+        assert!(payload.output_config.is_none());
+    }
+
+    #[test]
+    fn thinking_suffix_preserves_explicit_enabled_without_effort() {
+        let mut payload = messages_request_for_model("claude-opus-4-7-thinking");
+        payload.thinking = Some(Thinking {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: 4096,
+        });
+
+        override_thinking_from_model_name(&mut payload);
+
+        let thinking = payload.thinking.expect("thinking should be preserved");
+        assert_eq!(thinking.thinking_type, "enabled");
+        assert_eq!(thinking.budget_tokens, 4096);
+        assert!(payload.output_config.is_none());
+    }
+
+    #[test]
+    fn thinking_suffix_fills_effort_for_explicit_adaptive() {
+        let mut payload = messages_request_for_model("claude-sonnet-4-6-thinking");
+        payload.thinking = Some(Thinking {
+            thinking_type: "adaptive".to_string(),
+            budget_tokens: 4096,
+        });
+
+        override_thinking_from_model_name(&mut payload);
+
+        let thinking = payload.thinking.expect("thinking should be preserved");
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.budget_tokens, 4096);
+        assert_eq!(
+            payload
+                .output_config
+                .expect("output_config should be filled")
+                .effort,
+            "high"
+        );
     }
 
     #[test]

@@ -3655,6 +3655,71 @@ mod tests {
     }
 
     #[test]
+    fn test_resolved_base_model_keeps_enabled_thinking_prefix() {
+        use crate::anthropic::model_capabilities::ModelResolutionSource;
+
+        use super::super::types::{Message as AnthropicMessage, Thinking};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6-thinking".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: 20000,
+            }),
+            output_config: None,
+            metadata: None,
+        };
+        let resolution = ModelResolution::resolved(
+            "claude-sonnet-4-6-thinking".to_string(),
+            "claude-sonnet-4.5".to_string(),
+            ModelResolutionSource::FamilyNormalized,
+        );
+
+        let result =
+            convert_request_with_resolved_model(&req, ConverterOptions::default(), &resolution)
+                .expect("thinking request should convert through resolved base model");
+
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .model_id,
+            "claude-sonnet-4.5"
+        );
+        let first_history_user = result
+            .conversation_state
+            .history
+            .iter()
+            .find_map(|message| match message {
+                Message::User(user) => Some(&user.user_input_message),
+                _ => None,
+            })
+            .expect("thinking controls should be injected as synthetic history");
+
+        assert_eq!(first_history_user.model_id, "claude-sonnet-4.5");
+        assert!(
+            first_history_user
+                .content
+                .contains("<thinking_mode>enabled</thinking_mode>")
+        );
+        assert!(
+            first_history_user
+                .content
+                .contains("<max_thinking_length>20000</max_thinking_length>")
+        );
+    }
+
+    #[test]
     fn test_anthropic_strict_drops_prefill_like_claude_code() {
         use super::super::types::Message as AnthropicMessage;
 

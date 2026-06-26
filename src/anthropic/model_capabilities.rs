@@ -1536,6 +1536,23 @@ mod tests {
             alternate.upstream_model.as_deref(),
             Some("claude-opus-4-7-thinking")
         );
+
+        let sonnet = resolve_model_with_catalog("claude-sonnet-4-6-thinking", &models);
+        assert_eq!(
+            sonnet.upstream_model.as_deref(),
+            Some("claude-sonnet-4-6-thinking")
+        );
+    }
+
+    #[test]
+    fn resolver_falls_back_to_base_model_when_thinking_variant_is_not_available() {
+        let models = vec!["claude-sonnet-4.6".to_string()];
+
+        let result = resolve_model_with_catalog("claude-sonnet-4-6-thinking", &models);
+
+        assert_eq!(result.source, ModelResolutionSource::Alias);
+        assert_eq!(result.requested_model, "claude-sonnet-4-6-thinking");
+        assert_eq!(result.upstream_model.as_deref(), Some("claude-sonnet-4.6"));
     }
 
     #[test]
@@ -1626,6 +1643,14 @@ mod tests {
         let dotted = resolve_model_with_catalog("claude-sonnet-4.6", &models);
         assert_eq!(dotted.source, ModelResolutionSource::FamilyNormalized);
         assert_eq!(dotted.upstream_model.as_deref(), Some("claude-sonnet-4.5"));
+
+        let thinking = resolve_model_with_catalog("claude-sonnet-4-6-thinking", &models);
+        assert_eq!(thinking.source, ModelResolutionSource::FamilyNormalized);
+        assert_eq!(thinking.requested_model, "claude-sonnet-4-6-thinking");
+        assert_eq!(
+            thinking.upstream_model.as_deref(),
+            Some("claude-sonnet-4.5")
+        );
     }
 
     #[test]
