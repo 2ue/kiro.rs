@@ -115,6 +115,7 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
               {status.matchedRows && <span>匹配: {formatNumber(status.matchedRows)} 条</span>}
               {status.remainingRows !== undefined && <span>剩余: {formatNumber(status.remainingRows)} 条</span>}
               <span>批次: {status.batches} / 上限 {status.maxBatches}</span>
+              {status.lastBatchRows > 0 && <span>最后一批: {formatNumber(status.lastBatchRows)} 条</span>}
               {status.stopReason && <span className="col-span-2">停止原因: {status.stopReason}</span>}
             </div>
             {status.lastError && (

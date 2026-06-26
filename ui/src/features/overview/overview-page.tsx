@@ -1000,6 +1000,8 @@ export function OverviewPage() {
         <div className="flex flex-wrap items-center gap-2">
           <span>总览 · {selectedWindow.label}</span>
           <span className="text-muted-foreground/40">·</span>
+          <span>时区 {OVERVIEW_TIMEZONE}</span>
+          <span className="text-muted-foreground/40">·</span>
           <span>
             {autoRefresh.enabled
               ? `每 ${autoRefresh.intervalSeconds} 秒自动刷新`
