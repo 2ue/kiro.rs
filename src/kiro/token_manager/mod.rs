@@ -2,22 +2,24 @@ mod admin_snapshot;
 mod manager;
 mod refresh;
 mod route_state;
+mod types;
 
 #[allow(unused_imports)]
 pub use admin_snapshot::{
     CredentialBaseSnapshot, CredentialCooldownSnapshot, CredentialEntrySnapshot,
     ManagerBaseSnapshot, ManagerRuntimeSnapshot, ManagerSnapshot, ManagerSummarySnapshot,
 };
-pub use manager::{
-    AcquireMode, CallContext, CredentialAuthUpdate, CredentialRiskControlReason,
-    EXTERNAL_CREDENTIAL_CONTEXT_ID, InFlightLeaseGuard, MultiTokenManager, TransientFailureKind,
-};
+pub use manager::{CredentialRiskControlReason, InFlightLeaseGuard, MultiTokenManager};
 pub use route_state::{LocalPoolRouteState, LocalPoolRouteStateKind};
+pub use types::{
+    AcquireMode, CallContext, CredentialAuthUpdate, EXTERNAL_CREDENTIAL_CONTEXT_ID,
+    TransientFailureKind,
+};
 
-#[allow(unused_imports)]
-pub(crate) use manager::InFlightKind;
 #[allow(unused_imports)]
 pub(crate) use refresh::{
     RefreshTokenInvalidError, get_usage_limits, is_token_expired, is_token_expiring_soon,
     is_token_expiring_within, refresh_token, validate_refresh_token,
 };
+#[allow(unused_imports)]
+pub(crate) use types::InFlightKind;
