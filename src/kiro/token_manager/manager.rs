@@ -59,7 +59,11 @@ use super::refresh::{
     RefreshTokenInvalidError, get_usage_limits, is_token_expired, is_token_expiring_soon,
     refresh_token, validate_refresh_token,
 };
-use super::route_state::{CachedLocalPoolRouteState, LocalPoolRouteState, LocalPoolRouteStateKind};
+use super::route_state::{
+    CachedLocalPoolRouteState, LocalPoolRouteState, LocalPoolRouteStateKind,
+    cached_local_pool_route_state, invalidate_local_pool_route_state_cache,
+    local_pool_route_state_cache_key, store_local_pool_route_state_cache,
+};
 use super::rpm::{effective_rpm, entry_rate_limit_remaining, rate_limit_interval_for_rpm};
 use super::sticky::{
     bind_session_to_credential as bind_sticky_session_to_credential,
@@ -264,8 +268,6 @@ const SCHEDULER_REDIS_SYNC_MIN_INTERVAL: StdDuration = StdDuration::from_secs(1)
 const SCHEDULER_REDIS_CLEANUP_MIN_INTERVAL: StdDuration = StdDuration::from_secs(5);
 const SCHEDULER_REDIS_HOT_OP_TIMEOUT: StdDuration = StdDuration::from_millis(75);
 const SCHEDULER_REDIS_DEGRADED_BACKOFF: StdDuration = StdDuration::from_secs(2);
-const LOCAL_POOL_ROUTE_STATE_CACHE_TTL: StdDuration = StdDuration::from_millis(250);
-const LOCAL_POOL_ROUTE_STATE_CACHE_MAX_KEYS: usize = 128;
 const SELECTION_FAILURE_SAMPLE_LIMIT: usize = 20;
 const CREDENTIAL_STATS_FLUSH_MIN_INTERVAL: StdDuration = StdDuration::from_secs(5);
 
@@ -673,56 +675,16 @@ impl MultiTokenManager {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
 
-    fn local_pool_route_state_cache_key(model: Option<&str>) -> String {
-        model
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_else(|| "*".to_string())
-    }
-
-    fn cached_local_pool_route_state(
-        &self,
-        key: &str,
-        now: Instant,
-    ) -> Option<LocalPoolRouteState> {
-        self.local_pool_route_state_cache
-            .lock()
-            .get(key)
-            .filter(|cached| cached.expires_at > now)
-            .map(|cached| cached.state.clone())
-    }
-
-    fn store_local_pool_route_state_cache(
-        &self,
-        key: String,
-        state: LocalPoolRouteState,
-        now: Instant,
-    ) {
-        let mut cache = self.local_pool_route_state_cache.lock();
-        if cache.len() >= LOCAL_POOL_ROUTE_STATE_CACHE_MAX_KEYS && !cache.contains_key(&key) {
-            cache.retain(|_, cached| cached.expires_at > now);
-            if cache.len() >= LOCAL_POOL_ROUTE_STATE_CACHE_MAX_KEYS {
-                cache.clear();
-            }
-        }
-        cache.insert(
-            key,
-            CachedLocalPoolRouteState {
-                state,
-                expires_at: now + LOCAL_POOL_ROUTE_STATE_CACHE_TTL,
-            },
-        );
-    }
-
     fn invalidate_local_pool_route_state_cache(&self) {
-        self.local_pool_route_state_cache.lock().clear();
+        invalidate_local_pool_route_state_cache(&self.local_pool_route_state_cache);
     }
 
     pub fn local_pool_route_state(&self, model: Option<&str>) -> LocalPoolRouteState {
-        let cache_key = Self::local_pool_route_state_cache_key(model);
+        let cache_key = local_pool_route_state_cache_key(model);
         let now = Instant::now();
-        if let Some(state) = self.cached_local_pool_route_state(&cache_key, now) {
+        if let Some(state) =
+            cached_local_pool_route_state(&self.local_pool_route_state_cache, &cache_key, now)
+        {
             return state;
         }
 
@@ -730,7 +692,12 @@ impl MultiTokenManager {
         if state.kind.should_route_external() && self.auto_heal_too_many_failures_if_applicable() {
             state = self.compute_local_pool_route_state(model);
         }
-        self.store_local_pool_route_state_cache(cache_key, state.clone(), Instant::now());
+        store_local_pool_route_state_cache(
+            &self.local_pool_route_state_cache,
+            cache_key,
+            state.clone(),
+            Instant::now(),
+        );
         state
     }
 
