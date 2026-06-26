@@ -46,6 +46,7 @@ use super::refresh::{
     refresh_token, validate_refresh_token,
 };
 use super::route_state::{CachedLocalPoolRouteState, LocalPoolRouteState, LocalPoolRouteStateKind};
+use super::rpm::{effective_rpm, entry_rate_limit_remaining, rate_limit_interval_for_rpm};
 use super::storage_task::{block_on_storage, spawn_best_effort_storage_task};
 use super::types::{
     AcquireMode, CallContext, CredentialAuthUpdate, EXTERNAL_CREDENTIAL_CONTEXT_ID, InFlightKind,
@@ -863,7 +864,7 @@ impl MultiTokenManager {
                 (AccountRejectReason::ProxyUnavailable, None)
             } else if let Some(remaining) = Self::entry_cooldown_remaining(entry, model, now) {
                 (AccountRejectReason::CooldownActive, Some(remaining))
-            } else if Self::entry_rate_limit_remaining(entry, now).is_some() {
+            } else if entry_rate_limit_remaining(entry, now).is_some() {
                 waitable_account_count = waitable_account_count.saturating_add(1);
                 (AccountRejectReason::RpmLimited, None)
             } else if !global_has_capacity {
@@ -886,7 +887,7 @@ impl MultiTokenManager {
                 sampled_accounts.push(RejectedAccountSample {
                     account_id: entry.id,
                     reason,
-                    rpm_limit: Some(Self::effective_rpm(entry, global_rpm)),
+                    rpm_limit: Some(effective_rpm(entry, global_rpm)),
                     in_flight: Some(entry.in_flight_requests),
                     max_concurrent: Some(Self::effective_max_concurrent_requests(
                         entry,
@@ -960,7 +961,7 @@ impl MultiTokenManager {
             });
 
             let cooldown_remaining = Self::entry_cooldown_remaining(entry, model, now);
-            let rate_limit_remaining = Self::entry_rate_limit_remaining(entry, now);
+            let rate_limit_remaining = entry_rate_limit_remaining(entry, now);
 
             if let Some(remaining) = cooldown_remaining {
                 cooldown_blocked += 1;
@@ -1202,12 +1203,6 @@ impl MultiTokenManager {
         }
     }
 
-    fn entry_rate_limit_remaining(entry: &CredentialEntry, now: Instant) -> Option<StdDuration> {
-        entry
-            .rate_limit_available_at
-            .and_then(|until| until.checked_duration_since(now))
-    }
-
     fn credential_is_dispatchable(
         proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
         entry: &CredentialEntry,
@@ -1218,7 +1213,7 @@ impl MultiTokenManager {
         Self::credential_is_usable_for_model(entry, model)
             && Self::credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
             && Self::entry_cooldown_remaining(entry, model, now).is_none()
-            && Self::entry_rate_limit_remaining(entry, now).is_none()
+            && entry_rate_limit_remaining(entry, now).is_none()
             && Self::entry_has_concurrency_capacity(entry, max_concurrent_requests)
     }
 
@@ -1231,7 +1226,7 @@ impl MultiTokenManager {
         Self::credential_is_usable_for_model(entry, model)
             && Self::credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
             && Self::entry_cooldown_remaining(entry, model, now).is_none()
-            && Self::entry_rate_limit_remaining(entry, now).is_none()
+            && entry_rate_limit_remaining(entry, now).is_none()
     }
 
     fn credential_is_dispatch_candidate(
@@ -1302,19 +1297,6 @@ impl MultiTokenManager {
             .credentials
             .max_concurrent_requests
             .unwrap_or(global_max_concurrent_requests)
-    }
-
-    fn effective_rpm(entry: &CredentialEntry, global_rpm: u32) -> u32 {
-        entry.credentials.rpm.unwrap_or(global_rpm)
-    }
-
-    fn rate_limit_interval_for_rpm(rpm: u32) -> Option<StdDuration> {
-        if rpm == 0 {
-            return None;
-        }
-
-        let millis = (60_000u64 / rpm as u64).max(1);
-        Some(StdDuration::from_millis(millis))
     }
 
     fn entry_has_concurrency_capacity(
@@ -1667,8 +1649,8 @@ impl MultiTokenManager {
             entries
                 .iter_mut()
                 .filter_map(|entry| {
-                    let rpm = Self::effective_rpm(entry, global_rpm);
-                    if Self::rate_limit_interval_for_rpm(rpm).is_some() {
+                    let rpm = effective_rpm(entry, global_rpm);
+                    if rate_limit_interval_for_rpm(rpm).is_some() {
                         return None;
                     }
                     if entry.rate_limit_available_at.is_none() {
@@ -1728,7 +1710,7 @@ impl MultiTokenManager {
             .filter_map(|entry| {
                 match (
                     Self::entry_cooldown_remaining(entry, model, now),
-                    Self::entry_rate_limit_remaining(entry, now),
+                    entry_rate_limit_remaining(entry, now),
                 ) {
                     (Some(a), Some(b)) => Some(a.max(b)),
                     (Some(a), None) => Some(a),
@@ -1754,7 +1736,7 @@ impl MultiTokenManager {
             .filter(|entry| {
                 Self::credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids)
                     && Self::entry_cooldown_remaining(entry, model, now).is_none()
-                    && Self::entry_rate_limit_remaining(entry, now).is_none()
+                    && entry_rate_limit_remaining(entry, now).is_none()
                     && (!global_has_capacity
                         || !Self::entry_has_concurrency_capacity(entry, max_concurrent_requests))
             })
@@ -1799,8 +1781,8 @@ impl MultiTokenManager {
             let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
                 return Ok(());
             };
-            let rpm = Self::effective_rpm(entry, global_rpm);
-            let Some(interval) = Self::rate_limit_interval_for_rpm(rpm) else {
+            let rpm = effective_rpm(entry, global_rpm);
+            let Some(interval) = rate_limit_interval_for_rpm(rpm) else {
                 entry.rate_limit_available_at = None;
                 return Ok(());
             };
@@ -3508,7 +3490,7 @@ impl MultiTokenManager {
                 config.credential_max_concurrent_requests,
             ),
             max_concurrent_requests_override: entry.credentials.max_concurrent_requests,
-            rpm: Self::effective_rpm(entry, config.credential_rpm.unwrap_or(0)),
+            rpm: effective_rpm(entry, config.credential_rpm.unwrap_or(0)),
             rpm_override: entry.credentials.rpm,
             warmup_remaining: entry.warmup_remaining,
         }
@@ -3608,8 +3590,8 @@ impl MultiTokenManager {
                 .unwrap_or(0),
             cooldown_reason,
             cooldowns,
-            rate_limited: Self::entry_rate_limit_remaining(entry, now).is_some(),
-            rate_limit_remaining_secs: Self::entry_rate_limit_remaining(entry, now)
+            rate_limited: entry_rate_limit_remaining(entry, now).is_some(),
+            rate_limit_remaining_secs: entry_rate_limit_remaining(entry, now)
                 .map(|duration| duration.as_secs().saturating_add(1))
                 .unwrap_or(0),
             in_flight_requests: entry.in_flight_requests,
@@ -3620,7 +3602,7 @@ impl MultiTokenManager {
                 max_concurrent_requests,
             ),
             max_concurrent_requests_override: entry.credentials.max_concurrent_requests,
-            rpm: Self::effective_rpm(entry, config.credential_rpm.unwrap_or(0)),
+            rpm: effective_rpm(entry, config.credential_rpm.unwrap_or(0)),
             rpm_override: entry.credentials.rpm,
             in_flight_lease_max_secs: lease_max_age
                 .map(|duration| duration.as_secs())
@@ -4377,9 +4359,7 @@ impl MultiTokenManager {
                 entry.model_health.insert(key, model_state.health);
             }
             entry.rate_limit_available_at =
-                if Self::rate_limit_interval_for_rpm(Self::effective_rpm(entry, global_rpm))
-                    .is_some()
-                {
+                if rate_limit_interval_for_rpm(effective_rpm(entry, global_rpm)).is_some() {
                     let redis_available_at = state
                         .rate_limit_available_at_ms
                         .and_then(|until_ms| instant_from_epoch_ms(until_ms, now_ms, now));

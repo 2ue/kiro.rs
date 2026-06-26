@@ -4,6 +4,7 @@ mod concurrency;
 mod manager;
 mod refresh;
 mod route_state;
+mod rpm;
 mod storage_task;
 mod types;
 
