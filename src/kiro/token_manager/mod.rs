@@ -4,6 +4,7 @@ mod capacity;
 mod concurrency;
 mod cooldown;
 mod manager;
+mod queue;
 mod refresh;
 mod route_state;
 mod rpm;

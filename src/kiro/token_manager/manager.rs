@@ -52,6 +52,10 @@ use super::cooldown::{
     entry_any_cooldown_remaining, entry_cooldown_remaining, entry_cooldown_snapshots,
     model_state_key,
 };
+use super::queue::{
+    concurrency_blocked_count, effective_concurrency_range_for_candidates,
+    format_effective_concurrency_range, min_dispatch_wait,
+};
 use super::refresh::{
     RefreshTokenInvalidError, get_usage_limits, is_token_expired, is_token_expiring_soon,
     refresh_token, validate_refresh_token,
@@ -1005,7 +1009,7 @@ impl MultiTokenManager {
             .map(|duration| duration.as_secs().saturating_add(1))
             .filter(|value| *value > 0);
         let effective_credential_max_concurrent_requests =
-            Self::format_effective_concurrency_range(effective_concurrency_range);
+            format_effective_concurrency_range(effective_concurrency_range);
 
         let kind = if total == 0 {
             LocalPoolRouteStateKind::NoCredentials
@@ -1357,84 +1361,6 @@ impl MultiTokenManager {
             redis.clear_rate_limit(id).await?;
             Ok(())
         });
-    }
-
-    fn min_dispatch_wait(
-        &self,
-        entries: &[CredentialEntry],
-        proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
-        model: Option<&str>,
-        excluded_ids: &HashSet<u64>,
-        now: Instant,
-    ) -> Option<StdDuration> {
-        entries
-            .iter()
-            .filter(|entry| {
-                credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids)
-            })
-            .filter_map(|entry| {
-                match (
-                    entry_cooldown_remaining(entry, model, now),
-                    entry_rate_limit_remaining(entry, now),
-                ) {
-                    (Some(a), Some(b)) => Some(a.max(b)),
-                    (Some(a), None) => Some(a),
-                    (None, Some(b)) => Some(b),
-                    (None, None) => None,
-                }
-            })
-            .min()
-    }
-
-    fn concurrency_blocked_count(
-        &self,
-        entries: &[CredentialEntry],
-        proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
-        model: Option<&str>,
-        excluded_ids: &HashSet<u64>,
-        now: Instant,
-        max_concurrent_requests: u32,
-        global_has_capacity: bool,
-    ) -> usize {
-        entries
-            .iter()
-            .filter(|entry| {
-                credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids)
-                    && entry_cooldown_remaining(entry, model, now).is_none()
-                    && entry_rate_limit_remaining(entry, now).is_none()
-                    && (!global_has_capacity
-                        || !entry_has_concurrency_capacity(entry, max_concurrent_requests))
-            })
-            .count()
-    }
-
-    fn effective_concurrency_range_for_candidates(
-        entries: &[CredentialEntry],
-        proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
-        model: Option<&str>,
-        excluded_ids: &HashSet<u64>,
-        global_max_concurrent_requests: u32,
-    ) -> Option<(u32, u32)> {
-        entries
-            .iter()
-            .filter(|entry| {
-                credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids)
-            })
-            .map(|entry| effective_max_concurrent_requests(entry, global_max_concurrent_requests))
-            .fold(None, |range, value| {
-                Some(match range {
-                    Some((min, max)) => (min.min(value), max.max(value)),
-                    None => (value, value),
-                })
-            })
-    }
-
-    fn format_effective_concurrency_range(range: Option<(u32, u32)>) -> String {
-        match range {
-            Some((min, max)) if min == max => min.to_string(),
-            Some((min, max)) => format!("{min}..{max}"),
-            None => "none".to_string(),
-        }
     }
 
     fn mark_rate_limited_at(&self, id: u64, now: Instant) -> anyhow::Result<()> {
@@ -2380,16 +2306,15 @@ impl MultiTokenManager {
                             } else {
                                 0
                             };
-                            let effective_concurrency_range =
-                                Self::format_effective_concurrency_range(
-                                    Self::effective_concurrency_range_for_candidates(
-                                        &entries,
-                                        &proxy_resources,
-                                        model,
-                                        &local_excluded_ids,
-                                        max_concurrent_requests,
-                                    ),
-                                );
+                            let effective_concurrency_range = format_effective_concurrency_range(
+                                effective_concurrency_range_for_candidates(
+                                    &entries,
+                                    &proxy_resources,
+                                    model,
+                                    &local_excluded_ids,
+                                    max_concurrent_requests,
+                                ),
+                            );
                             let excluded_usable = entries
                                 .iter()
                                 .filter(|e| {
@@ -2466,7 +2391,7 @@ impl MultiTokenManager {
                                         ) && entry_cooldown_remaining(e, model, now).is_some()
                                     })
                                     .count();
-                                let wait_for = self.min_dispatch_wait(
+                                let wait_for = min_dispatch_wait(
                                     &entries,
                                     &proxy_resources,
                                     model,
@@ -2489,7 +2414,7 @@ impl MultiTokenManager {
                                         retry_after_secs
                                     );
                                 }
-                                let concurrency_blocked = self.concurrency_blocked_count(
+                                let concurrency_blocked = concurrency_blocked_count(
                                     &entries,
                                     &proxy_resources,
                                     model,
@@ -2629,8 +2554,8 @@ impl MultiTokenManager {
                     let effective_credential_max_concurrent_requests = {
                         let entries = self.entries.lock();
                         let proxy_resources = self.proxy_resources.lock();
-                        Self::format_effective_concurrency_range(
-                            Self::effective_concurrency_range_for_candidates(
+                        format_effective_concurrency_range(
+                            effective_concurrency_range_for_candidates(
                                 &entries,
                                 &proxy_resources,
                                 model,
