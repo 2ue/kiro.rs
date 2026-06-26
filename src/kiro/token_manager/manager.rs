@@ -5,7 +5,6 @@
 
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, Notify};
 
@@ -27,13 +26,17 @@ use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
 use crate::storage::postgres::{
     CredentialRuntimeStateRow, CredentialRuntimeStateSnapshot, CredentialStatsDeltaRow,
-    PostgresStore, ProxyResourceRow,
+    PostgresStore,
 };
 use crate::storage::redis_cache::{
     RedisStore, SchedulerCredentialState, SchedulerGlobalCapacityState, SchedulerHealthState,
     SchedulerSessionBinding,
 };
 
+use super::account_state::{
+    CredentialEntry, CredentialModelCooldown, CredentialRiskControlReason, DisabledReason,
+    InFlightLease, ProxyResourceAvailability, ProxyResourceRuntime, SessionBinding,
+};
 use super::admin_snapshot::{
     CredentialBaseSnapshot, CredentialCooldownSnapshot, CredentialEntrySnapshot,
     ManagerBaseSnapshot, ManagerRuntimeSnapshot, ManagerSnapshot, ManagerSummarySnapshot,
@@ -144,212 +147,9 @@ fn apply_credential_auth_update(credential: &mut KiroCredentials, update: Creden
     }
 }
 
-#[derive(Debug, Clone)]
-struct ProxyResourceRuntime {
-    id: u64,
-    name: String,
-    proxy_url: String,
-    proxy_username: Option<String>,
-    proxy_password: Option<String>,
-    enabled: bool,
-}
-
-#[derive(Debug, Clone)]
-enum ProxyResourceAvailability {
-    Available(ProxyResourceRuntime),
-    Missing(u64),
-    Disabled(ProxyResourceRuntime),
-}
-
-impl From<ProxyResourceRow> for ProxyResourceRuntime {
-    fn from(row: ProxyResourceRow) -> Self {
-        Self {
-            id: row.id,
-            name: row.name,
-            proxy_url: row.proxy_url,
-            proxy_username: row.proxy_username,
-            proxy_password: row.proxy_password,
-            enabled: row.enabled,
-        }
-    }
-}
-
 // ============================================================================
 // 多凭据 Token 管理器
 // ============================================================================
-
-/// 单个凭据条目的状态
-struct CredentialEntry {
-    /// 凭据唯一 ID
-    id: u64,
-    /// 凭据信息
-    credentials: KiroCredentials,
-    /// API 调用连续失败次数
-    failure_count: u32,
-    /// Token 刷新连续失败次数
-    refresh_failure_count: u32,
-    /// 是否已禁用
-    disabled: bool,
-    /// 禁用原因（用于区分手动禁用 vs 自动禁用，便于自愈）
-    disabled_reason: Option<DisabledReason>,
-    /// API 调用成功次数
-    success_count: u64,
-    /// 调度器实际选中该凭据的总次数。
-    total_selection_count: u64,
-    /// 最后一次 API 调用时间（RFC3339 格式）
-    last_used_at: Option<String>,
-    /// 临时冷却到期时间（上游 Retry-After/瞬态错误触发），不持久化。
-    cooldown_until: Option<Instant>,
-    /// 临时冷却原因，便于诊断。
-    cooldown_reason: Option<String>,
-    /// 按真实上游模型维度同步的 Redis 冷却镜像。
-    model_cooldowns: HashMap<String, CredentialModelCooldown>,
-    /// 下一次本地限流允许发送请求的时间，不持久化。
-    rate_limit_available_at: Option<Instant>,
-    /// 当前正在使用该凭据的请求数，不持久化。
-    in_flight_requests: u32,
-    /// 当前正在使用该凭据的请求 lease，不持久化。
-    in_flight_leases: Vec<InFlightLease>,
-    /// 预热剩余请求数。仅影响 balanced 选择，不伪造 success_count。
-    warmup_remaining: u32,
-    /// 近期上游健康状态；Redis 部署下在调度前同步。
-    health: SchedulerHealthState,
-    /// 按真实上游模型维度同步的 Redis 健康状态镜像。
-    model_health: HashMap<String, SchedulerHealthState>,
-    /// 本进程内的近期调度选中事件；无 Redis 时用于计算短窗口调度压力。
-    selection_events: VecDeque<Instant>,
-}
-
-#[derive(Debug, Clone)]
-struct CredentialModelCooldown {
-    model: String,
-    until: Instant,
-    reason: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct InFlightLease {
-    id: u64,
-    acquired_at: Instant,
-    last_seen_at: Instant,
-    kind: InFlightKind,
-}
-
-/// 会话到凭据的粘性绑定。
-struct SessionBinding {
-    credential_id: u64,
-    last_used_at: DateTime<Utc>,
-    soft_failure_count: u32,
-}
-
-/// 禁用原因
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DisabledReason {
-    /// Admin API 手动禁用
-    Manual,
-    /// 连续失败达到阈值后自动禁用
-    TooManyFailures,
-    /// Token 刷新连续失败达到阈值后自动禁用
-    TooManyRefreshFailures,
-    /// 额度已用尽（如 MONTHLY_REQUEST_COUNT / OVERAGE_REQUEST_LIMIT_EXCEEDED）
-    QuotaExceeded,
-    /// Refresh Token 永久失效（服务端返回 invalid_grant）
-    InvalidRefreshToken,
-    /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
-    InvalidConfig,
-    /// 上游明确返回临时风控/暂停
-    TemporarilySuspended,
-    /// 上游明确返回账号已暂停/封禁
-    AccountSuspended,
-    /// 上游明确返回账号锁定
-    AccountLocked,
-}
-
-impl DisabledReason {
-    fn as_str(self) -> &'static str {
-        match self {
-            DisabledReason::Manual => "Manual",
-            DisabledReason::TooManyFailures => "TooManyFailures",
-            DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
-            DisabledReason::QuotaExceeded => "QuotaExceeded",
-            DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
-            DisabledReason::InvalidConfig => "InvalidConfig",
-            DisabledReason::TemporarilySuspended => "TemporarilySuspended",
-            DisabledReason::AccountSuspended => "AccountSuspended",
-            DisabledReason::AccountLocked => "AccountLocked",
-        }
-    }
-
-    fn from_str(value: &str) -> Option<Self> {
-        match value {
-            "Manual" => Some(DisabledReason::Manual),
-            "TooManyFailures" => Some(DisabledReason::TooManyFailures),
-            "TooManyRefreshFailures" => Some(DisabledReason::TooManyRefreshFailures),
-            "QuotaExceeded" => Some(DisabledReason::QuotaExceeded),
-            "InvalidRefreshToken" => Some(DisabledReason::InvalidRefreshToken),
-            "InvalidConfig" => Some(DisabledReason::InvalidConfig),
-            "TemporarilySuspended" => Some(DisabledReason::TemporarilySuspended),
-            "AccountSuspended" => Some(DisabledReason::AccountSuspended),
-            "AccountLocked" => Some(DisabledReason::AccountLocked),
-            _ => None,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            DisabledReason::Manual => "手动禁用",
-            DisabledReason::TooManyFailures => "连续 API 调用失败",
-            DisabledReason::TooManyRefreshFailures => "连续 Token 刷新失败",
-            DisabledReason::QuotaExceeded => "额度耗尽",
-            DisabledReason::InvalidRefreshToken => "refreshToken 失效",
-            DisabledReason::InvalidConfig => "凭据配置无效",
-            DisabledReason::TemporarilySuspended => "临时风控/暂停",
-            DisabledReason::AccountSuspended => "账号暂停/封禁",
-            DisabledReason::AccountLocked => "账号锁定",
-        }
-    }
-}
-
-/// 上游明确返回的账号风控/暂停状态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CredentialRiskControlReason {
-    TemporarilySuspended,
-    AccountSuspended,
-    AccountLocked,
-}
-
-impl CredentialRiskControlReason {
-    fn disabled_reason(self) -> DisabledReason {
-        match self {
-            CredentialRiskControlReason::TemporarilySuspended => {
-                DisabledReason::TemporarilySuspended
-            }
-            CredentialRiskControlReason::AccountSuspended => DisabledReason::AccountSuspended,
-            CredentialRiskControlReason::AccountLocked => DisabledReason::AccountLocked,
-        }
-    }
-
-    fn event_reason(self) -> &'static str {
-        self.disabled_reason().as_str()
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            CredentialRiskControlReason::TemporarilySuspended => "临时风控/暂停",
-            CredentialRiskControlReason::AccountSuspended => "账号暂停/封禁",
-            CredentialRiskControlReason::AccountLocked => "账号锁定",
-        }
-    }
-}
-
-/// 统计数据持久化条目
-#[derive(Serialize, Deserialize)]
-struct StatsEntry {
-    success_count: u64,
-    #[serde(default)]
-    selection_count: u64,
-    last_used_at: Option<String>,
-}
 
 fn block_on_storage<T>(
     operation: &'static str,
