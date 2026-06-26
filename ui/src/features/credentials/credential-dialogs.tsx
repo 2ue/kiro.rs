@@ -8,7 +8,7 @@ import {
 
   XCircle,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import {
   addCredential,
@@ -459,7 +459,7 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
   const [parseError, setParseError] = useState('')
   const proxyResources = useProxyResources()
   const proxyOptions = proxyResources.data?.resources || []
-  const cancelRef = { current: false }
+  const cancelRef = useRef(false)
 
   useEffect(() => {
     if (!open) { setText(''); setDefaults(initialParameterDefaults()); setResults([]); setParsed([]); setParseError(''); setRunning(false) }

@@ -555,7 +555,7 @@ export function CredentialsPage() {
 
         {/* Filter Panel */}
         {showFilters && (
-          <div className="mb-3 rounded-lg border border-border bg-muted/40 p-3">
+          <div className="mb-3 rounded-lg border border-border bg-muted/40 p-3 animate-in fade-in-0 duration-150">
             <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
               <Select value={statusFilter} onValueChange={setStatusFilter}>
                 <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
@@ -613,7 +613,7 @@ export function CredentialsPage() {
 
         {/* Batch actions bar */}
         {selectedIds.size > 0 && (
-          <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2">
+          <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 animate-in fade-in slide-in-from-top-2 duration-150">
             <Badge tone="primary">已选 {selectedIds.size}</Badge>
             <Button variant="outline" size="xs" onClick={batchVerify}>
               <CheckCircle2 className="h-3.5 w-3.5" />验活

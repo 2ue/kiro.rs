@@ -73,7 +73,7 @@ import { SecretInput } from './credential-inputs'
 function SummaryCell({ label, value, error, onClick }: { label: string; value: React.ReactNode; error?: boolean; onClick?: () => void }) {
   const content = (
     <>
-      <span className="text-[0.65rem] font-medium text-muted-foreground uppercase tracking-wide truncate">{label}</span>
+      <span className="text-[0.68rem] font-medium text-muted-foreground uppercase tracking-wide truncate">{label}</span>
       <span className={`text-xs font-semibold tabular truncate ${error ? 'text-destructive' : onClick ? 'text-primary' : 'text-foreground'}`}>
         {value}
       </span>
@@ -470,7 +470,7 @@ export function CredentialCard({
 
       {/* ── Expanded Detail ── */}
       {expanded && (
-        <div className="border-t border-border/50 px-3 py-3 space-y-4">
+        <div className="border-t border-border/50 px-3 py-3 space-y-4 animate-in fade-in-0 slide-in-from-top-2 duration-200">
 
           {/* 调度运行态 */}
           <div>
@@ -803,7 +803,7 @@ export function CredentialCard({
         onClose={() => { if (setCredentialProxy.isPending) return; resetProxyDraft(); setEditingProxy(false) }}>
         <div className="space-y-3">
           <button type="button"
-            className={`w-full rounded-lg border p-3 text-left text-sm transition ${!proxyResourceId ? 'border-primary bg-primary/5' : 'border-border hover:bg-muted'}`}
+            className={`w-full rounded-lg border p-3 text-left text-sm transition-colors ${!proxyResourceId ? 'border-primary bg-primary/5' : 'border-border hover:bg-muted'}`}
             onClick={() => setProxyResourceId('')}>
             <div className="flex items-center justify-between">
               <span className="font-semibold">不绑定代理资源</span>
@@ -841,7 +841,7 @@ export function CredentialCard({
                 const sel = proxyResourceId === String(r.id)
                 return (
                   <button key={r.id} type="button"
-                    className={`w-full rounded-lg border p-2.5 text-left text-sm transition ${sel ? 'border-primary bg-primary/5' : r.enabled ? 'border-border hover:bg-muted' : 'border-destructive/25 bg-destructive/5 opacity-60'}`}
+                    className={`w-full rounded-lg border p-2.5 text-left text-sm transition-colors ${sel ? 'border-primary bg-primary/5' : r.enabled ? 'border-border hover:bg-muted' : 'border-destructive/25 bg-destructive/5 opacity-60'}`}
                     onClick={() => { setProxyResourceId(String(r.id)); setProxyUrl(''); setProxyUsername(''); setProxyPassword('') }}>
                     <div className="flex items-center gap-1.5">
                       <span className="font-semibold">{r.name}</span>

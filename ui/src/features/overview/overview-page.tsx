@@ -225,7 +225,7 @@ function CredentialPoolPanel() {
           strokeWidth={7}
           color="hsl(var(--success))"
           trackColor="hsl(var(--muted))"
-          label={<span className="text-[0.65rem] font-bold">{Math.round(availRatio * 100)}%</span>}
+          label={<span className="text-[0.68rem] font-bold">{Math.round(availRatio * 100)}%</span>}
         />
         <div className="grid flex-1 grid-cols-2 gap-x-6 gap-y-2 text-xs min-w-[180px]">
           <PoolStatRow label="可用" value={available} tone="success" />
@@ -631,7 +631,7 @@ function ExternalPoolBillingPanel({
         <div className="border-t border-border pt-3">
           <div className="mb-2 flex items-center justify-between gap-2">
             <div className="text-xs font-semibold text-foreground/70">外部账号成本与盈亏</div>
-            <div className="text-[0.65rem] text-muted-foreground/45">按当前时间窗口聚合</div>
+            <div className="text-[0.68rem] text-muted-foreground/45">按当前时间窗口聚合</div>
           </div>
           {visiblePools.length === 0 ? (
             <div className="rounded-lg border border-dashed border-border p-3 text-sm text-muted-foreground/60">

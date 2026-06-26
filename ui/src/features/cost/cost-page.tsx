@@ -270,7 +270,7 @@ function ExternalPoolBillingPanel() {
               {item.value}
             </div>
             {'desc' in item && item.desc && (
-              <div className="mt-0.5 text-[0.65rem] leading-4 text-muted-foreground/70">{item.desc}</div>
+              <div className="mt-0.5 text-[0.68rem] leading-4 text-muted-foreground/70">{item.desc}</div>
             )}
           </div>
         ))}

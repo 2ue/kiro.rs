@@ -353,19 +353,17 @@ export function AuditPage() {
               </Table>
             </div>
 
-            {(page > 1 || hasNext) && (
-              <div className="border-t border-border px-4 py-3">
-                <div className="flex items-center justify-center gap-3">
-                  <Button variant="outline" size="sm" disabled={page === 1 || pending} onClick={() => setPage((v) => Math.max(1, v - 1))}>
-                    上一页
-                  </Button>
-                  <span className="text-xs text-muted-foreground">第 {page} 页，每页 {limit} 条</span>
-                  <Button variant="outline" size="sm" disabled={!hasNext || pending} onClick={() => setPage((v) => v + 1)}>
-                    下一页
-                  </Button>
-                </div>
+            <div className="border-t border-border px-4 py-3">
+              <div className="flex items-center justify-center gap-3">
+                <Button variant="outline" size="sm" disabled={page === 1 || pending} onClick={() => setPage((v) => Math.max(1, v - 1))}>
+                  上一页
+                </Button>
+                <span className="text-xs text-muted-foreground">第 {page} 页，每页 {limit} 条</span>
+                <Button variant="outline" size="sm" disabled={!hasNext || pending} onClick={() => setPage((v) => v + 1)}>
+                  下一页
+                </Button>
               </div>
-            )}
+            </div>
           </>
         )}
       </SectionCard>

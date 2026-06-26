@@ -34,7 +34,7 @@ export function Sidebar({ onNavigate }: SidebarProps) {
           const pages = pagesOfDomain(domain.key)
           return (
             <div key={domain.key} className="mb-4 last:mb-0">
-              <div className="mb-1 px-2.5 text-[0.66rem] font-semibold uppercase tracking-wider text-sidebar-muted/80">
+              <div className="mb-1 px-2.5 text-[0.68rem] font-semibold uppercase tracking-wider text-sidebar-muted/80">
                 {domain.label}
               </div>
               <ul className="space-y-0.5">
@@ -85,8 +85,8 @@ export function Sidebar({ onNavigate }: SidebarProps) {
       {/* 版本 */}
       <div className="shrink-0 px-4 py-3">
         <div className="flex items-center justify-between border-t border-sidebar-border pt-3">
-          <span className="text-[0.66rem] font-medium text-sidebar-muted">版本</span>
-          <span className="font-mono text-[0.66rem] font-semibold text-sidebar-foreground/70">
+          <span className="text-[0.68rem] font-medium text-sidebar-muted">版本</span>
+          <span className="font-mono text-[0.68rem] font-semibold text-sidebar-foreground/70">
             {version.data?.version ? `v${version.data.version}` : '—'}
           </span>
         </div>

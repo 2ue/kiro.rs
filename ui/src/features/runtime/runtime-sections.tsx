@@ -253,7 +253,7 @@ function PathPolicyEditor({
     <div className="space-y-3">
       <TogField label="启用本规则" checked={policy.enabled} onChange={set('enabled')} />
       {!policy.enabled && (
-        <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-700 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-400">
+        <div className="rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-xs leading-5 text-warning">
           当前入口会尽量使用原始用量显示。重新开启后才会使用下面的展示规则。
         </div>
       )}

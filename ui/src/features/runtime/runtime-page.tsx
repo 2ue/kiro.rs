@@ -528,7 +528,7 @@ function CollapseSection({
           {open ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
         </span>
       </button>
-      {open && <div className="border-t border-border px-4 pb-4 pt-3 space-y-4">{children}</div>}
+      {open && <div className="border-t border-border px-4 pb-4 pt-3 space-y-4 animate-in fade-in-0 slide-in-from-top-1 duration-200">{children}</div>}
     </div>
   )
 }

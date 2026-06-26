@@ -506,7 +506,7 @@ export function ProxyResourceCard({ resource, onEdit }: { resource: ProxyResourc
 
       {/* 展开态：账号绑定选择器 */}
       {expanded && (
-        <div className="border-t border-border p-4 space-y-3">
+        <div className="border-t border-border p-4 space-y-3 animate-in fade-in-0 slide-in-from-top-2 duration-200">
           <div className="flex items-center justify-between gap-3">
             <div>
               <div className="text-sm font-semibold">账号绑定</div>

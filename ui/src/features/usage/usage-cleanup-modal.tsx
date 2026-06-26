@@ -27,9 +27,9 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
 
   const buildRequest = (): UsageCleanupRequest => ({
     mode,
-    olderThanDays: Number(olderThanDays),
-    batchSize: Number(batchSize) || 1000,
-    pauseMsBetweenBatches: Number(pauseMs) || 100,
+    olderThanDays: Math.max(1, Math.min(3650, Math.floor(Number(olderThanDays)) || 30)),
+    batchSize: Math.max(1, Math.min(100000, Math.floor(Number(batchSize)) || 1000)),
+    pauseMsBetweenBatches: Math.max(0, Math.min(60000, Math.floor(Number(pauseMs)) || 100)),
   })
 
   const handlePreview = async () => {

@@ -270,12 +270,8 @@ type ExistingScope = 'all' | 'enabled' | 'disabled'
 
 function ExistingValidationSection({
   onResult,
-  loading,
-  setLoading,
 }: {
   onResult: (r: CredentialValidationResponse) => void
-  loading: boolean
-  setLoading: (v: boolean) => void
 }) {
   const [scope, setScope] = useState<ExistingScope>('all')
 
@@ -288,11 +284,9 @@ function ExistingValidationSection({
     onError: (error) => {
       toast.error(`校验失败: ${extractErrorMessage(error)}`)
     },
-    onSettled: () => setLoading(false),
   })
 
   const handleRun = () => {
-    setLoading(true)
     mutation.mutate(scope)
   }
 
@@ -301,8 +295,8 @@ function ExistingValidationSection({
       title="系统账号复查"
       description="对已入库账号查询订阅与用量快照，强制刷新后与上次快照对比差异。"
       actions={
-        <Button size="sm" onClick={handleRun} disabled={loading}>
-          {loading && mutation.isPending ? <Spinner size="sm" /> : <RefreshCw className="h-4 w-4" />}
+        <Button size="sm" onClick={handleRun} disabled={mutation.isPending}>
+          {mutation.isPending ? <Spinner size="sm" /> : <RefreshCw className="h-4 w-4" />}
           执行复查
         </Button>
       }
@@ -316,13 +310,13 @@ function ExistingValidationSection({
                 key={s}
                 type="button"
                 onClick={() => setScope(s)}
-                disabled={loading}
+                disabled={mutation.isPending}
                 className={[
                   'rounded-md border px-3 py-1 text-sm transition-colors',
                   scope === s
                     ? 'border-primary bg-primary/10 font-semibold text-primary'
                     : 'border-border bg-card text-muted-foreground hover:border-primary/40 hover:text-foreground',
-                  loading ? 'cursor-not-allowed opacity-50' : '',
+                  mutation.isPending ? 'cursor-not-allowed opacity-50' : '',
                 ].join(' ')}
               >
                 {s === 'all' ? '全部' : s === 'enabled' ? '仅启用' : '仅禁用'}
@@ -369,12 +363,8 @@ function initialExternalOptions(): ExternalOptions {
 
 function ExternalValidationSection({
   onResult,
-  loading,
-  setLoading,
 }: {
   onResult: (r: CredentialValidationResponse) => void
-  loading: boolean
-  setLoading: (v: boolean) => void
 }) {
   const [raw, setRaw] = useState('')
   const [opts, setOpts] = useState<ExternalOptions>(initialExternalOptions)
@@ -420,7 +410,6 @@ function ExternalValidationSection({
     onError: (error) => {
       toast.error(`校验失败: ${extractErrorMessage(error)}`)
     },
-    onSettled: () => setLoading(false),
   })
 
   const handleRun = () => {
@@ -433,7 +422,6 @@ function ExternalValidationSection({
     }
     if (!credentials.length) { toast.error('没有解析到可校验的账号'); return }
     if (!hasAction) { toast.error('请至少选择订阅、用量或验活中的一项'); return }
-    setLoading(true)
     mutation.mutate({
       credentials,
       querySubscription: opts.querySubscription,
@@ -450,7 +438,7 @@ function ExternalValidationSection({
       description="校验未入库的外部账号，支持订阅/用量/模型验活，不入库、不改变调度。"
       actions={
         <div className="flex items-center gap-1.5">
-          <Button variant="outline" size="sm" asChild disabled={loading}>
+          <Button variant="outline" size="sm" asChild disabled={mutation.isPending}>
             <label className="cursor-pointer">
               <FileUp className="h-4 w-4" />
               选择文件
@@ -460,16 +448,16 @@ function ExternalValidationSection({
                 multiple
                 className="hidden"
                 onChange={handleFiles}
-                disabled={loading}
+                disabled={mutation.isPending}
               />
             </label>
           </Button>
           <Button
             size="sm"
             onClick={handleRun}
-            disabled={loading || parsedCount === 0 || !hasAction}
+            disabled={mutation.isPending || parsedCount === 0 || !hasAction}
           >
-            {loading && mutation.isPending ? <Spinner size="sm" /> : <FileSearch className="h-4 w-4" />}
+            {mutation.isPending ? <Spinner size="sm" /> : <FileSearch className="h-4 w-4" />}
             校验 JSON
           </Button>
         </div>
@@ -485,7 +473,7 @@ function ExternalValidationSection({
               <label className="flex cursor-pointer items-center gap-2">
                 <Checkbox
                   checked={opts.querySubscription}
-                  disabled={loading}
+                  disabled={mutation.isPending}
                   onCheckedChange={(v) => setOpt('querySubscription', Boolean(v))}
                 />
                 查询订阅
@@ -493,7 +481,7 @@ function ExternalValidationSection({
               <label className="flex cursor-pointer items-center gap-2">
                 <Checkbox
                   checked={opts.queryUsage}
-                  disabled={loading}
+                  disabled={mutation.isPending}
                   onCheckedChange={(v) => setOpt('queryUsage', Boolean(v))}
                 />
                 查询用量
@@ -501,7 +489,7 @@ function ExternalValidationSection({
               <label className="flex cursor-pointer items-center gap-2">
                 <Checkbox
                   checked={opts.checkLiveness}
-                  disabled={loading}
+                  disabled={mutation.isPending}
                   onCheckedChange={(v) => setOpt('checkLiveness', Boolean(v))}
                 />
                 模型验活
@@ -519,7 +507,7 @@ function ExternalValidationSection({
               <Select
                 value={opts.livenessModel}
                 onValueChange={(v) => setOpt('livenessModel', v)}
-                disabled={loading || !opts.checkLiveness}
+                disabled={mutation.isPending || !opts.checkLiveness}
               >
                 <SelectTrigger size="sm">
                   <SelectValue />
@@ -535,7 +523,7 @@ function ExternalValidationSection({
               <span className="text-xs font-semibold text-muted-foreground">验活提示词</span>
               <Input
                 value={opts.livenessPrompt}
-                disabled={loading || !opts.checkLiveness}
+                disabled={mutation.isPending || !opts.checkLiveness}
                 onChange={(e) => setOpt('livenessPrompt', e.target.value)}
                 placeholder={DEFAULT_TEST_PROMPT}
               />
@@ -577,7 +565,6 @@ function ExternalValidationSection({
 
 export function ValidationPage() {
   const [result, setResult] = useState<CredentialValidationResponse | null>(null)
-  const [loading, setLoading] = useState(false)
 
   return (
     <PageContainer>
@@ -588,14 +575,10 @@ export function ValidationPage() {
 
       <ExistingValidationSection
         onResult={setResult}
-        loading={loading}
-        setLoading={setLoading}
       />
 
       <ExternalValidationSection
         onResult={setResult}
-        loading={loading}
-        setLoading={setLoading}
       />
 
       <SectionCard title="校验结果">

@@ -42,7 +42,7 @@ export function StatCard({ title, value, desc, icon, tone = 'default', className
   return (
     <div
       className={cn(
-        'relative flex min-h-[6.5rem] flex-col justify-between overflow-hidden rounded-xl border border-border bg-card p-4 shadow-sm transition-colors hover:border-border-strong',
+        'relative flex min-h-[6.5rem] flex-col justify-between overflow-hidden rounded-xl border border-border bg-card p-4 shadow-sm transition hover:border-border-strong hover:shadow-md',
         className
       )}
     >

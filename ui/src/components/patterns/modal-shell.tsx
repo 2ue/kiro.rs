@@ -34,16 +34,14 @@ export function ModalShell({
 }: ModalShellProps) {
   return (
     <Dialog open={open} onOpenChange={(next) => !next && onClose()}>
-      {open && (
-        <DialogContent width={width}>
-          <DialogHeader>
-            <DialogTitle>{title}</DialogTitle>
-            {description && <DialogDescription>{description}</DialogDescription>}
-          </DialogHeader>
-          <DialogBody className={noBodyPadding ? 'p-0' : undefined}>{children}</DialogBody>
-          {footer && <DialogFooter>{footer}</DialogFooter>}
-        </DialogContent>
-      )}
+      <DialogContent width={width}>
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+          {description && <DialogDescription>{description}</DialogDescription>}
+        </DialogHeader>
+        <DialogBody className={noBodyPadding ? 'p-0' : undefined}>{children}</DialogBody>
+        {footer && <DialogFooter>{footer}</DialogFooter>}
+      </DialogContent>
     </Dialog>
   )
 }
