@@ -50,6 +50,7 @@ import { useModelCapabilities } from '@/hooks/use-usage'
 import type { KiroAgentModeStrategy, LoadBalancingMode, ModelMappingConfig, PayloadGuardMode, RuntimeConfig } from '@/types/api'
 import {
   CacheCreationSection,
+  DefinedCacheRoutesSection,
   ModelMappingSection,
   PayloadFallbackSection,
   PayloadHistorySection,
@@ -391,6 +392,11 @@ export function RuntimePage() {
             <CacheCreationSection control={draft.promptCacheCreationControl} onChange={set('promptCacheCreationControl')} />
           </div>
         </div>
+      </CollapseSection>
+
+      {/* 自定义缓存路由 */}
+      <CollapseSection icon={<Zap />} title="自定义缓存路由" desc="定义 /dfcache/{前缀} 路由的固定前缀列表">
+        <DefinedCacheRoutesSection routes={draft.definedCacheRoutes} onChange={set('definedCacheRoutes')} />
       </CollapseSection>
 
       {/* 内容体积优化（合并：旧内容清理 + 当前内容兜底） */}

@@ -80,6 +80,7 @@ export type ExternalPoolFormDraft = {
   maxConcurrentRequests: number
   usageProjectionMode: NonNullable<CreateExternalPoolRequest['usageProjectionMode']>
   autoDisablePolicy: NonNullable<CreateExternalPoolRequest['autoDisablePolicy']>
+  preservePath: boolean
   normalizeModelVersionDots: boolean
   modelMappingMode: NonNullable<CreateExternalPoolRequest['modelMappingMode']>
   modelMappingRequireMatch: boolean
@@ -97,6 +98,7 @@ export const defaultPoolForm = (): ExternalPoolFormDraft => ({
   maxConcurrentRequests: 10,
   usageProjectionMode: 'pass_through',
   autoDisablePolicy: 'inherit',
+  preservePath: true,
   normalizeModelVersionDots: false,
   modelMappingMode: DEFAULT_POOL_MODEL_MAPPING_MODE,
   modelMappingRequireMatch: false,
@@ -114,6 +116,7 @@ export const poolFormFromPool = (pool: ExternalPool): ExternalPoolFormDraft => (
   maxConcurrentRequests: pool.maxConcurrentRequests,
   usageProjectionMode: pool.usageProjectionMode,
   autoDisablePolicy: pool.autoDisablePolicy,
+  preservePath: pool.preservePath !== false,
   normalizeModelVersionDots: Boolean(pool.normalizeModelVersionDots),
   modelMappingMode: pool.modelMappingMode || DEFAULT_POOL_MODEL_MAPPING_MODE,
   modelMappingRequireMatch: Boolean(pool.modelMappingRequireMatch),

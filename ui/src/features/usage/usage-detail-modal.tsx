@@ -155,6 +155,12 @@ export function UsageDetailModal({
             <MetricTile label="展示输出" value={formatNumber(record.outputTokens)} />
             <MetricTile label="成本估算输入" value={formatNumber(record.billableInputTokens)} />
           </div>
+          {(record.cacheCreation5mInputTokens > 0 || record.cacheCreation1hInputTokens > 0) && (
+            <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3">
+              <MetricTile label="缓存写入·5分钟" value={formatNumber(record.cacheCreation5mInputTokens)} />
+              <MetricTile label="缓存写入·1小时" value={formatNumber(record.cacheCreation1hInputTokens)} />
+            </div>
+          )}
           <div className="mt-2 text-xs leading-5 text-muted-foreground">
             成本估算输入 = 展示输入 + 展示缓存写入，仅用于本系统费用估算和历史兼容，不是返回给客户端的独立字段。
           </div>

@@ -140,6 +140,8 @@ export interface CredentialStatusItem {
   estimatedCostUsd: number
   pricedRequests: number
   unpricedRequests: number
+  rpm?: number
+  rpmOverride?: number | null
 }
 
 export type CredentialListItem = Pick<
@@ -1218,6 +1220,7 @@ export interface RuntimeConfig {
   modelMapping: ModelMappingConfig
   extractThinking: boolean
   exposeProxyWarnings: boolean
+  definedCacheRoutes: string[]
 }
 
 export type UpdateRuntimeConfigRequest = RuntimeConfig

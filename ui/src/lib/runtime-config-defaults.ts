@@ -215,6 +215,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   modelMapping: defaultModelMappingConfig(),
   extractThinking: true,
   exposeProxyWarnings: false,
+  definedCacheRoutes: [],
 }
 
 export function reportedUsageModeDescription(mode: ReportedUsageFieldMode): string {

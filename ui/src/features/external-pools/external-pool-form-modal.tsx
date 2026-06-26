@@ -136,7 +136,11 @@ export function ExternalPoolFormModal({
               <NumberBox label="单账号最大并发" description="当前外部账号同时处理的最大请求数。" suffix="并发" value={draft.maxConcurrentRequests} min={1} disabled={saving} onChange={(v) => set('maxConcurrentRequests', v)} />
               <NumberBox label="优先级" description="数字越小越靠前；同优先级再按容量和状态分配。" suffix="值" value={draft.priority} disabled={saving} onChange={(v) => set('priority', v)} />
               <ToggleRow label={isEdit ? '启用外部账号' : '创建后立即启用'} checked={Boolean(draft.enabled)} disabled={saving} onChange={(v) => set('enabled', v)} />
+              <ToggleRow label="保留请求路径" checked={Boolean(draft.preservePath)} disabled={saving} onChange={(v) => set('preservePath', v)} />
               <ToggleRow label="模型版本号格式转换（例 4.5 → 4-5）" checked={Boolean(draft.normalizeModelVersionDots)} disabled={saving || draft.modelMappingMode === 'passthrough' || draft.modelMappingRequireMatch} onChange={(v) => set('normalizeModelVersionDots', v)} />
+            </div>
+            <div className="mt-2 text-xs leading-relaxed text-muted-foreground">
+              保留请求路径：转发时保留原始请求路径（默认开启）。关闭后只转发到服务根地址，适合不需要路径透传的场景。
             </div>
           </FormSection>
 

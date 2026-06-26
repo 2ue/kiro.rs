@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import { Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Switch, Textarea, Button } from '@/components/ui'
+import { splitRules, joinRules } from '@/features/external-pools/external-pool-utils'
 import type {
   ModelCapabilitiesStatus,
   ModelMappingConfig,
@@ -481,6 +482,34 @@ export function ModelMappingSection({
         <div className="text-xs text-muted-foreground">
           每条规则字段:source(来源名)、target(目标模型)、kind(version_equivalent / alias / fallback)、enabled、note。
         </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── 自定义缓存路由前缀(definedCacheRoutes) ───────────────────────────────────
+
+export function DefinedCacheRoutesSection({
+  routes, onChange,
+}: {
+  routes: string[]
+  onChange: (next: string[]) => void
+}) {
+  const text = joinRules(routes)
+  const handleChange = (value: string) => {
+    onChange(splitRules(value))
+  }
+  return (
+    <div className="space-y-3">
+      <Textarea
+        className="min-h-24 w-full font-mono text-xs"
+        placeholder={"每行一个前缀，例如：\nproject-a\nteam-b"}
+        value={text}
+        onChange={(e) => handleChange(e.target.value)}
+      />
+      <div className="text-xs leading-relaxed text-muted-foreground">
+        每行填写一个缓存路由前缀。填写后，系统会为 <code className="rounded bg-muted px-1 py-0.5">/dfcache/&lt;前缀&gt;</code> 路径开放自定义缓存路由。
+        留空表示不启用自定义缓存路由。
       </div>
     </div>
   )
