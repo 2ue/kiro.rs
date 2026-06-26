@@ -51,6 +51,7 @@ import type { KiroAgentModeStrategy, LoadBalancingMode, ModelMappingConfig, Payl
 import {
   CacheCreationSection,
   DefinedCacheRoutesSection,
+  normalizeDefinedCacheRoutes,
   ModelMappingSection,
   PayloadFallbackSection,
   PayloadHistorySection,
@@ -182,6 +183,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     highCacheThreshold: toWhole(draft.highCacheThreshold),
     promptCacheCreationControl: normalizePromptCacheCreationControl(draft.promptCacheCreationControl),
     reportedUsage: normalizeReportedUsage(draft.reportedUsage),
+    definedCacheRoutes: normalizeDefinedCacheRoutes(draft.definedCacheRoutes),
   }
   return next
 }
@@ -395,8 +397,12 @@ export function RuntimePage() {
       </CollapseSection>
 
       {/* 自定义缓存路由 */}
-      <CollapseSection icon={<Zap />} title="自定义缓存路由" desc="定义 /dfcache/{前缀} 路由的固定前缀列表">
-        <DefinedCacheRoutesSection routes={draft.definedCacheRoutes} onChange={set('definedCacheRoutes')} />
+      <CollapseSection icon={<Zap />} title="自定义缓存路由" desc="定义 /dfcache/{名称} 高缓存路由，固定前缀 /dfcache/">
+        <DefinedCacheRoutesSection
+          routes={draft.definedCacheRoutes}
+          reported={draft.reportedUsage}
+          onChange={(routes, reported) => setDraft((prev) => ({ ...prev, definedCacheRoutes: routes, reportedUsage: reported }))}
+        />
       </CollapseSection>
 
       {/* 内容体积优化（合并：旧内容清理 + 当前内容兜底） */}

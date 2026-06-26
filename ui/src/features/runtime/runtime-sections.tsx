@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
+import { Plus, Trash2 } from 'lucide-react'
 import { Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Switch, Textarea, Button } from '@/components/ui'
-import { splitRules, joinRules } from '@/features/external-pools/external-pool-utils'
+import { pathPolicy, inputSamplePolicy, preserveFieldPolicy } from '@/lib/runtime-config-defaults'
 import type {
   ModelCapabilitiesStatus,
   ModelMappingConfig,
@@ -489,28 +490,157 @@ export function ModelMappingSection({
 
 // ─── 自定义缓存路由前缀(definedCacheRoutes) ───────────────────────────────────
 
+const DFCACHE_ROUTE_PREFIX = '/dfcache/'
+
+/** 归一化为合法的 /dfcache/<name>，非法返回 null。name 仅允许 a-z 0-9 . _ -，≤64 */
+export function normalizeDefinedCacheRoute(route: string): string | null {
+  const trimmed = route.trim()
+  if (!trimmed) return null
+  const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
+  const normalized = withSlash.replace(/\/+$/, '').toLowerCase()
+  const name = normalized.startsWith(DFCACHE_ROUTE_PREFIX)
+    ? normalized.slice(DFCACHE_ROUTE_PREFIX.length)
+    : ''
+  if (!name || name.includes('/') || name.length > 64 || !/^[a-z0-9._-]+$/.test(name)) {
+    return null
+  }
+  return `${DFCACHE_ROUTE_PREFIX}${name}`
+}
+
+/** 取出 /dfcache/ 之后的名称部分，用于输入框展示 */
+function getDefinedCacheRouteName(route: string): string {
+  const normalized = normalizeDefinedCacheRoute(route)
+  if (normalized) return normalized.slice(DFCACHE_ROUTE_PREFIX.length)
+  const trimmed = route.trim()
+  const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
+  if (withSlash.toLowerCase().startsWith(DFCACHE_ROUTE_PREFIX)) {
+    return withSlash.slice(DFCACHE_ROUTE_PREFIX.length)
+  }
+  return trimmed
+}
+
+function definedCacheRouteFromNameInput(name: string): string {
+  const trimmed = name.trim()
+  const normalizedFullRoute = normalizeDefinedCacheRoute(trimmed)
+  if (
+    normalizedFullRoute &&
+    (trimmed.startsWith('/') || trimmed.toLowerCase().startsWith(DFCACHE_ROUTE_PREFIX.slice(1)))
+  ) {
+    return normalizedFullRoute
+  }
+  return `${DFCACHE_ROUTE_PREFIX}${name}`
+}
+
+export function normalizeDefinedCacheRoutes(routes: string[]): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const route of routes) {
+    const value = normalizeDefinedCacheRoute(route)
+    if (value && !seen.has(value)) {
+      seen.add(value)
+      out.push(value)
+    }
+  }
+  return out
+}
+
+/**
+ * 自定义高缓存路由编辑：固定前缀 /dfcache/，用户只填名称。
+ * 增/改/删时同步维护 reportedUsage.pathOverrides（以完整 route 为 key），与后端语义一致。
+ */
 export function DefinedCacheRoutesSection({
-  routes, onChange,
+  routes,
+  reported,
+  onChange,
 }: {
   routes: string[]
-  onChange: (next: string[]) => void
+  reported: ReportedUsageConfig
+  onChange: (routes: string[], reported: ReportedUsageConfig) => void
 }) {
-  const text = joinRules(routes)
-  const handleChange = (value: string) => {
-    onChange(splitRules(value))
+  const addRoute = () => {
+    let index = routes.length + 1
+    const existing = new Set(routes)
+    let route = `${DFCACHE_ROUTE_PREFIX}route-${index}`
+    while (existing.has(route)) {
+      index += 1
+      route = `${DFCACHE_ROUTE_PREFIX}route-${index}`
+    }
+    const pathOverrides = {
+      ...reported.pathOverrides,
+      [route]: reported.pathOverrides[route] ?? pathPolicy(true, inputSamplePolicy(96), preserveFieldPolicy()),
+    }
+    onChange([...routes, route], { ...reported, pathOverrides })
   }
+
+  const editRoute = (index: number, nameInput: string) => {
+    const nextRoute = definedCacheRouteFromNameInput(nameInput)
+    const nextRoutes = [...routes]
+    const prevRoute = nextRoutes[index]
+    nextRoutes[index] = nextRoute
+    const pathOverrides = { ...reported.pathOverrides }
+    const normPrev = normalizeDefinedCacheRoute(prevRoute)
+    const normNext = normalizeDefinedCacheRoute(nextRoute)
+    if (normPrev && pathOverrides[normPrev] && normNext && !pathOverrides[normNext]) {
+      pathOverrides[normNext] = pathOverrides[normPrev]
+      delete pathOverrides[normPrev]
+    }
+    onChange(nextRoutes, { ...reported, pathOverrides })
+  }
+
+  const removeRoute = (index: number) => {
+    const target = routes[index]
+    const nextRoutes = routes.filter((_, i) => i !== index)
+    const pathOverrides = { ...reported.pathOverrides }
+    const norm = normalizeDefinedCacheRoute(target)
+    if (norm) delete pathOverrides[norm]
+    onChange(nextRoutes, { ...reported, pathOverrides })
+  }
+
   return (
     <div className="space-y-3">
-      <Textarea
-        className="min-h-24 w-full font-mono text-xs"
-        placeholder={"每行一个前缀，例如：\nproject-a\nteam-b"}
-        value={text}
-        onChange={(e) => handleChange(e.target.value)}
-      />
-      <div className="text-xs leading-relaxed text-muted-foreground">
-        每行填写一个缓存路由前缀。填写后，系统会为 <code className="rounded bg-muted px-1 py-0.5">/dfcache/&lt;前缀&gt;</code> 路径开放自定义缓存路由。
-        留空表示不启用自定义缓存路由。
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="text-xs leading-5 text-muted-foreground">
+          只需填写 <code className="rounded bg-muted px-1 py-0.5">/dfcache/</code> 后面的名称。未在此定义的 <code className="rounded bg-muted px-1 py-0.5">/dfcache/*</code> 请求会直接报错。
+        </div>
+        <Button type="button" variant="outline" size="sm" onClick={addRoute}>
+          <Plus className="h-4 w-4" />添加路由
+        </Button>
       </div>
+      {routes.length === 0 ? (
+        <div className="rounded-md border border-dashed border-border px-3 py-3 text-sm text-muted-foreground">
+          暂未定义自定义路由。
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {routes.map((route, index) => {
+            const name = getDefinedCacheRouteName(route)
+            const invalid = name.trim().length > 0 && !normalizeDefinedCacheRoute(route)
+            return (
+              <div key={`${route}-${index}`} className="flex items-center gap-2">
+                <div
+                  className={`flex min-w-0 flex-1 overflow-hidden rounded-md border bg-background focus-within:ring-2 focus-within:ring-ring ${invalid ? 'border-destructive' : 'border-input'}`}
+                >
+                  <span className="inline-flex shrink-0 select-none items-center border-r border-border bg-muted/50 px-3 font-mono text-sm text-muted-foreground">
+                    {DFCACHE_ROUTE_PREFIX}
+                  </span>
+                  <Input
+                    className="min-w-0 flex-1 rounded-none border-0 font-mono focus-visible:ring-0"
+                    value={name}
+                    placeholder="cc"
+                    onChange={(e) => editRoute(index, e.target.value)}
+                  />
+                </div>
+                <Button type="button" variant="outline" size="icon-sm" title="删除路由" onClick={() => removeRoute(index)}>
+                  <Trash2 className="h-4 w-4" />
+                </Button>
+              </div>
+            )
+          })}
+          <div className="text-xs text-muted-foreground">
+            名称仅允许小写字母、数字、点、下划线或短横线，长度不超过 64。
+          </div>
+        </div>
+      )}
     </div>
   )
 }
