@@ -31,6 +31,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use chrono::Utc;
 use futures::{Stream, StreamExt, stream};
+use parking_lot::Mutex;
 use reqwest::header::{CONTENT_TYPE as REQWEST_CONTENT_TYPE, LOCATION as REQWEST_LOCATION};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -58,8 +59,8 @@ use super::types::{
     Thinking,
 };
 use super::usage::{
-    ExternalPoolAttempt, ExternalPoolUsageSnapshot, UsageLatencyTrace, UsageRecord,
-    UsageRecordStatus, UsageRouteKind, UsageRouteSubtype, UsageSource,
+    ExternalPoolAttempt, ExternalPoolUsageSnapshot, StreamTerminalReason, UsageLatencyTrace,
+    UsageRecord, UsageRecordStatus, UsageRouteKind, UsageRouteSubtype, UsageSource,
 };
 use super::websearch;
 use crate::external_pool::{
@@ -121,10 +122,14 @@ struct RequestLatencyTraceState {
     payload_guard_ms: Option<u64>,
     upstream_header_latency_ms: Arc<AtomicU64>,
     first_upstream_chunk_latency_ms: Arc<AtomicU64>,
+    first_thinking_delta_latency_ms: Arc<AtomicU64>,
+    first_visible_text_delta_latency_ms: Arc<AtomicU64>,
+    client_dropped_latency_ms: Arc<AtomicU64>,
     upstream_chunks_seen: Arc<AtomicU32>,
     events_seen_before_first_output: Arc<AtomicU32>,
     chunks_before_first_output: Arc<AtomicU32>,
     events_before_first_output: Arc<AtomicU32>,
+    terminal_reason: Arc<Mutex<Option<StreamTerminalReason>>>,
 }
 
 impl RequestLatencyTraceState {
@@ -133,10 +138,14 @@ impl RequestLatencyTraceState {
             payload_guard_ms: None,
             upstream_header_latency_ms: Arc::new(AtomicU64::new(0)),
             first_upstream_chunk_latency_ms: Arc::new(AtomicU64::new(0)),
+            first_thinking_delta_latency_ms: Arc::new(AtomicU64::new(0)),
+            first_visible_text_delta_latency_ms: Arc::new(AtomicU64::new(0)),
+            client_dropped_latency_ms: Arc::new(AtomicU64::new(0)),
             upstream_chunks_seen: Arc::new(AtomicU32::new(0)),
             events_seen_before_first_output: Arc::new(AtomicU32::new(0)),
             chunks_before_first_output: Arc::new(AtomicU32::new(LATENCY_COUNTER_UNSET)),
             events_before_first_output: Arc::new(AtomicU32::new(LATENCY_COUNTER_UNSET)),
+            terminal_reason: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -976,6 +985,66 @@ impl RequestUsageContext {
             .compare_exchange(0, elapsed, Ordering::AcqRel, Ordering::Acquire);
     }
 
+    fn mark_stream_events(&self, events: &[SseEvent]) {
+        self.mark_first_thinking_delta_if_output(events);
+        self.mark_first_visible_text_delta_if_output(events);
+        self.mark_first_token_if_output(events);
+    }
+
+    fn mark_first_thinking_delta_if_output(&self, events: &[SseEvent]) {
+        if self
+            .latency
+            .first_thinking_delta_latency_ms
+            .load(Ordering::Acquire)
+            > 0
+        {
+            return;
+        }
+        if events.iter().any(is_thinking_delta_output_event) {
+            let elapsed = self.elapsed_ms();
+            let _ = self
+                .latency
+                .first_thinking_delta_latency_ms
+                .compare_exchange(0, elapsed, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+
+    fn mark_first_visible_text_delta_if_output(&self, events: &[SseEvent]) {
+        if self
+            .latency
+            .first_visible_text_delta_latency_ms
+            .load(Ordering::Acquire)
+            > 0
+        {
+            return;
+        }
+        if events.iter().any(is_visible_text_delta_output_event) {
+            let elapsed = self.elapsed_ms();
+            let _ = self
+                .latency
+                .first_visible_text_delta_latency_ms
+                .compare_exchange(0, elapsed, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+
+    fn mark_stream_terminal(&self, reason: StreamTerminalReason) {
+        let mut terminal_reason = self.latency.terminal_reason.lock();
+        if terminal_reason.is_none() {
+            *terminal_reason = Some(reason);
+        }
+    }
+
+    fn mark_client_dropped(&self) {
+        let elapsed = self.elapsed_ms();
+        let _ = self.latency.client_dropped_latency_ms.compare_exchange(
+            0,
+            elapsed,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.mark_stream_terminal(StreamTerminalReason::ClientDropped);
+    }
+
     fn mark_first_token_if_output(&self, events: &[SseEvent]) {
         if self.first_token_latency_ms.load(Ordering::Acquire) > 0 {
             return;
@@ -1022,6 +1091,10 @@ impl RequestUsageContext {
         let first_upstream_chunk_ms =
             load_latency_ms(&self.latency.first_upstream_chunk_latency_ms);
         let first_output_delta_ms = self.first_token_latency_ms();
+        let first_thinking_delta_ms =
+            load_latency_ms(&self.latency.first_thinking_delta_latency_ms);
+        let first_visible_text_delta_ms =
+            load_latency_ms(&self.latency.first_visible_text_delta_latency_ms);
         let stream_gap_to_first_output_ms = match (first_upstream_chunk_ms, first_output_delta_ms) {
             (Some(first_chunk), Some(first_output)) => {
                 Some(first_output.saturating_sub(first_chunk))
@@ -1033,6 +1106,8 @@ impl RequestUsageContext {
             upstream_header_ms,
             first_upstream_chunk_ms,
             first_output_delta_ms,
+            first_thinking_delta_ms,
+            first_visible_text_delta_ms,
             stream_gap_to_first_output_ms,
             chunks_before_first_output: load_latency_counter(
                 &self.latency.chunks_before_first_output,
@@ -1040,6 +1115,8 @@ impl RequestUsageContext {
             events_before_first_output: load_latency_counter(
                 &self.latency.events_before_first_output,
             ),
+            client_dropped_ms: load_latency_ms(&self.latency.client_dropped_latency_ms),
+            terminal_reason: *self.latency.terminal_reason.lock(),
         };
         (!trace.is_empty()).then_some(trace)
     }
@@ -1200,20 +1277,15 @@ impl RequestUsageContext {
 }
 
 fn is_first_token_output_event(event: &SseEvent) -> bool {
+    if is_visible_text_delta_output_event(event) || is_thinking_delta_output_event(event) {
+        return true;
+    }
     match event.event.as_str() {
         "content_block_delta" => {
             let Some(delta) = event.data.get("delta").and_then(|value| value.as_object()) else {
                 return false;
             };
             match delta.get("type").and_then(|value| value.as_str()) {
-                Some("text_delta") => delta
-                    .get("text")
-                    .and_then(|value| value.as_str())
-                    .is_some_and(|text| !text.is_empty()),
-                Some("thinking_delta") => delta
-                    .get("thinking")
-                    .and_then(|value| value.as_str())
-                    .is_some_and(|thinking| !thinking.is_empty()),
                 Some("input_json_delta") => delta
                     .get("partial_json")
                     .and_then(|value| value.as_str())
@@ -1234,6 +1306,36 @@ fn is_first_token_output_event(event: &SseEvent) -> bool {
             }),
         _ => false,
     }
+}
+
+fn is_visible_text_delta_output_event(event: &SseEvent) -> bool {
+    if event.event != "content_block_delta" {
+        return false;
+    }
+    event
+        .data
+        .get("delta")
+        .and_then(|value| value.as_object())
+        .filter(|delta| delta.get("type").and_then(|value| value.as_str()) == Some("text_delta"))
+        .and_then(|delta| delta.get("text"))
+        .and_then(|value| value.as_str())
+        .is_some_and(|text| !text.is_empty())
+}
+
+fn is_thinking_delta_output_event(event: &SseEvent) -> bool {
+    if event.event != "content_block_delta" {
+        return false;
+    }
+    event
+        .data
+        .get("delta")
+        .and_then(|value| value.as_object())
+        .filter(|delta| {
+            delta.get("type").and_then(|value| value.as_str()) == Some("thinking_delta")
+        })
+        .and_then(|delta| delta.get("thinking"))
+        .and_then(|value| value.as_str())
+        .is_some_and(|thinking| !thinking.is_empty())
 }
 
 fn reported_cache_usage_policy(
@@ -1849,6 +1951,7 @@ impl Drop for StreamUsageGuard {
         if self.completed.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.usage_context.request.mark_client_dropped();
         self.usage_context.record_client_dropped();
     }
 }
@@ -4195,13 +4298,18 @@ fn finish_stream_with_recorded_error(
     ctx: &mut StreamContext,
     usage_guard: &StreamUsageGuard,
     status: UsageRecordStatus,
+    terminal_reason: StreamTerminalReason,
 ) -> Vec<Result<Bytes, Infallible>> {
     let error_detail = ctx.stream_error_detail();
     let final_events = ctx.generate_final_events();
     usage_guard
         .context()
         .request
-        .mark_first_token_if_output(&final_events);
+        .mark_stream_terminal(terminal_reason);
+    usage_guard
+        .context()
+        .request
+        .mark_stream_events(&final_events);
     usage_guard.context().record_stream_failure_from_context(
         status,
         ctx.final_usage(),
@@ -4303,6 +4411,7 @@ fn create_sse_stream(
                                         &mut ctx,
                                         &usage_guard,
                                         UsageRecordStatus::StreamError,
+                                        StreamTerminalReason::UpstreamJsonException,
                                     );
                                     return Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline)));
                                 }
@@ -4332,7 +4441,7 @@ fn create_sse_stream(
                             usage_guard
                                 .context()
                                 .request
-                                .mark_first_token_if_output(&events);
+                                .mark_stream_events(&events);
                             let bytes: Vec<Result<Bytes, Infallible>> = events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -4352,6 +4461,7 @@ fn create_sse_stream(
                                 &mut ctx,
                                 &usage_guard,
                                 UsageRecordStatus::StreamError,
+                                StreamTerminalReason::InternalError,
                             );
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline)))
                         }
@@ -4369,6 +4479,7 @@ fn create_sse_stream(
                                     &mut ctx,
                                     &usage_guard,
                                     UsageRecordStatus::StreamError,
+                                    StreamTerminalReason::UpstreamJsonException,
                                 );
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline)));
                             }
@@ -4400,7 +4511,15 @@ fn create_sse_stream(
                             usage_guard
                                 .context()
                                 .request
-                                .mark_first_token_if_output(&final_events);
+                                .mark_stream_terminal(if had_stream_error {
+                                    StreamTerminalReason::UpstreamStatusError
+                                } else {
+                                    StreamTerminalReason::Completed
+                                });
+                            usage_guard
+                                .context()
+                                .request
+                                .mark_stream_events(&final_events);
                             if had_stream_error {
                                 usage_guard.context().record_stream_failure_from_context(
                                     UsageRecordStatus::StreamError,
@@ -4432,6 +4551,7 @@ fn create_sse_stream(
                         &mut ctx,
                         &usage_guard,
                         UsageRecordStatus::UpstreamTimeout,
+                        StreamTerminalReason::UpstreamIdleTimeout,
                     );
                     Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline)))
                 }
@@ -6289,7 +6409,7 @@ mod tests {
         usage_context.mark_payload_guard_latency(Duration::from_millis(3));
         usage_context.mark_upstream_header();
         usage_context.mark_first_upstream_chunk();
-        usage_context.mark_first_token_if_output(&[
+        usage_context.mark_stream_events(&[
             SseEvent::new("message_start", json!({"type": "message_start"})),
             SseEvent::new(
                 "content_block_start",
@@ -6303,17 +6423,26 @@ mod tests {
         assert!(usage_context.first_token_latency_ms().is_none());
 
         usage_context.mark_first_upstream_chunk();
-        usage_context.mark_first_token_if_output(&[
+        usage_context.mark_stream_events(&[
             SseEvent::new("ping", json!({"type": "ping"})),
             SseEvent::new(
                 "content_block_delta",
                 json!({
                     "type": "content_block_delta",
                     "index": 0,
-                    "delta": {"type": "text_delta", "text": "hello"}
+                    "delta": {"type": "thinking_delta", "thinking": "thinking"}
                 }),
             ),
         ]);
+        usage_context.mark_stream_events(&[SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "text_delta", "text": "hello"}
+            }),
+        )]);
+        usage_context.mark_stream_terminal(StreamTerminalReason::Completed);
 
         let trace = usage_context.latency_trace().expect("latency trace");
         assert_eq!(trace.payload_guard_ms, Some(3));
@@ -6323,9 +6452,12 @@ mod tests {
             trace.first_output_delta_ms,
             usage_context.first_token_latency_ms()
         );
+        assert_eq!(trace.first_thinking_delta_ms, trace.first_output_delta_ms);
+        assert!(trace.first_visible_text_delta_ms.is_some());
         assert_eq!(trace.chunks_before_first_output, Some(1));
         assert_eq!(trace.events_before_first_output, Some(3));
         assert!(trace.stream_gap_to_first_output_ms.is_some());
+        assert_eq!(trace.terminal_reason, Some(StreamTerminalReason::Completed));
     }
 
     #[test]

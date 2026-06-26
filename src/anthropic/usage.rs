@@ -192,11 +192,31 @@ pub struct UsageLatencyTrace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_output_delta_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_thinking_delta_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_visible_text_delta_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_gap_to_first_output_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunks_before_first_output: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events_before_first_output: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_dropped_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<StreamTerminalReason>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamTerminalReason {
+    Completed,
+    UpstreamStatusError,
+    UpstreamJsonException,
+    UpstreamIdleTimeout,
+    MalformedSse,
+    ClientDropped,
+    InternalError,
 }
 
 impl UsageLatencyTrace {
@@ -205,9 +225,13 @@ impl UsageLatencyTrace {
             && self.upstream_header_ms.is_none()
             && self.first_upstream_chunk_ms.is_none()
             && self.first_output_delta_ms.is_none()
+            && self.first_thinking_delta_ms.is_none()
+            && self.first_visible_text_delta_ms.is_none()
             && self.stream_gap_to_first_output_ms.is_none()
             && self.chunks_before_first_output.is_none()
             && self.events_before_first_output.is_none()
+            && self.client_dropped_ms.is_none()
+            && self.terminal_reason.is_none()
     }
 }
 

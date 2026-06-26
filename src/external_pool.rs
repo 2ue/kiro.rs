@@ -446,11 +446,15 @@ impl ExternalLatencyTraceState {
             upstream_header_ms: load_nonzero(&self.upstream_header_ms),
             first_upstream_chunk_ms: load_nonzero(&self.first_upstream_chunk_ms),
             first_output_delta_ms,
+            first_thinking_delta_ms: None,
+            first_visible_text_delta_ms: None,
             stream_gap_to_first_output_ms: load_nonzero(&self.stream_gap_to_first_output_ms),
             chunks_before_first_output: first_output_delta_ms
                 .map(|_| self.chunks_before_first_output.load(Ordering::Acquire) as u32),
             events_before_first_output: first_output_delta_ms
                 .map(|_| self.events_before_first_output.load(Ordering::Acquire) as u32),
+            client_dropped_ms: None,
+            terminal_reason: None,
         };
         (!trace.is_empty()).then_some(trace)
     }
