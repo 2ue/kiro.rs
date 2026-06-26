@@ -8,6 +8,7 @@ use chrono::{
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 
 use crate::kiro::call_trace::{KiroCredentialAttempt, summarize_attempts};
@@ -22,6 +23,10 @@ const USAGE_WRITER_MAX_ATTEMPTS: u32 = 3;
 const USAGE_WRITER_BATCH_MAX: usize = 64;
 const USAGE_DASHBOARD_REDIS_TIMEOUT_SECS: u64 = 2;
 const USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS: u64 = 5;
+const ERROR_DIAGNOSTIC_MAX_TEXT_BYTES: usize = 2048;
+const ERROR_DIAGNOSTIC_MAX_METADATA_BYTES: usize = 8192;
+const ERROR_DIAGNOSTIC_MAX_STRING_BYTES: usize = 512;
+const ERROR_DIAGNOSTIC_MAX_ARRAY_ITEMS: usize = 20;
 pub const REALTIME_USAGE_WINDOW_SECS: u32 = 60;
 pub const DEFAULT_USAGE_DASHBOARD_TIMEZONE: &str = "Asia/Shanghai";
 
@@ -787,6 +792,206 @@ enum UsageDashboardCacheRead {
     Timeout,
 }
 
+fn normalize_error_diagnostics(mut record: UsageRecord) -> UsageRecord {
+    if matches!(record.status, UsageRecordStatus::Success)
+        && record.error_message.is_none()
+        && record.error_detail.is_none()
+        && record.error_metadata.is_none()
+    {
+        return record;
+    }
+
+    let (error_message, message_truncated) =
+        truncate_error_text(record.error_message.take(), ERROR_DIAGNOSTIC_MAX_TEXT_BYTES);
+    let (error_detail, detail_truncated) =
+        truncate_error_text(record.error_detail.take(), ERROR_DIAGNOSTIC_MAX_TEXT_BYTES);
+    record.error_message = error_message;
+    record.error_detail = error_detail;
+    record.error_metadata = sanitize_error_metadata(
+        record.error_metadata.take(),
+        message_truncated,
+        detail_truncated,
+        ERROR_DIAGNOSTIC_MAX_METADATA_BYTES,
+    );
+    record
+}
+
+fn truncate_error_text(value: Option<String>, max_bytes: usize) -> (Option<String>, bool) {
+    let Some(value) = value else {
+        return (None, false);
+    };
+    if value.len() <= max_bytes {
+        return (Some(value), false);
+    }
+
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = value[..end].to_string();
+    truncated.push_str("...");
+    (Some(truncated), true)
+}
+
+fn sanitize_error_metadata(
+    value: Option<Value>,
+    message_truncated: bool,
+    detail_truncated: bool,
+    max_bytes: usize,
+) -> Option<Value> {
+    if value.is_none() && !message_truncated && !detail_truncated {
+        return None;
+    }
+    let mut value = value.unwrap_or_else(|| Value::Object(Map::new()));
+    remove_duplicate_error_fields(&mut value);
+    let original_bytes = serialized_len(&value);
+    let mut metadata_truncated = false;
+    if original_bytes > max_bytes {
+        metadata_truncated = true;
+        shrink_metadata_value(&mut value);
+    }
+
+    let mut final_bytes = serialized_len(&value);
+    if final_bytes > max_bytes {
+        value = Value::Object(Map::from_iter([
+            ("metadataTruncated".to_string(), Value::Bool(true)),
+            (
+                "originalMetadataBytes".to_string(),
+                Value::from(original_bytes as u64),
+            ),
+        ]));
+        final_bytes = serialized_len(&value);
+    }
+
+    if message_truncated || detail_truncated || metadata_truncated {
+        ensure_metadata_object_flags(
+            &mut value,
+            message_truncated,
+            detail_truncated,
+            metadata_truncated,
+            original_bytes,
+            final_bytes,
+        );
+    }
+
+    Some(value)
+}
+
+fn serialized_len(value: &Value) -> usize {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn remove_duplicate_error_fields(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            let duplicate_keys = map
+                .keys()
+                .filter(|key| is_duplicate_error_metadata_key(key))
+                .cloned()
+                .collect::<Vec<_>>();
+            for key in duplicate_keys {
+                map.remove(&key);
+            }
+            for value in map.values_mut() {
+                remove_duplicate_error_fields(value);
+            }
+        }
+        Value::Array(items) => {
+            for value in items {
+                remove_duplicate_error_fields(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_duplicate_error_metadata_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "errorid"
+            | "requestid"
+            | "statuscode"
+            | "errorstatuscode"
+            | "source"
+            | "errorsource"
+            | "message"
+            | "rawmessage"
+            | "publicerrortype"
+            | "publicstatuscode"
+            | "internalsource"
+            | "upstreamstatuscode"
+    )
+}
+
+fn shrink_metadata_value(value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            let (truncated, _) = truncate_error_text(
+                Some(std::mem::take(text)),
+                ERROR_DIAGNOSTIC_MAX_STRING_BYTES,
+            );
+            *text = truncated.unwrap_or_default();
+        }
+        Value::Array(items) => {
+            if items.len() > ERROR_DIAGNOSTIC_MAX_ARRAY_ITEMS {
+                items.truncate(ERROR_DIAGNOSTIC_MAX_ARRAY_ITEMS);
+            }
+            for item in items {
+                shrink_metadata_value(item);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values_mut() {
+                shrink_metadata_value(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn ensure_metadata_object_flags(
+    value: &mut Value,
+    message_truncated: bool,
+    detail_truncated: bool,
+    metadata_truncated: bool,
+    original_bytes: usize,
+    final_bytes: usize,
+) {
+    if !value.is_object() {
+        let old = std::mem::take(value);
+        let mut map = Map::new();
+        map.insert("value".to_string(), old);
+        *value = Value::Object(map);
+    }
+    let Some(map) = value.as_object_mut() else {
+        return;
+    };
+    if message_truncated {
+        map.insert("messageTruncated".to_string(), Value::Bool(true));
+    }
+    if detail_truncated {
+        map.insert("detailTruncated".to_string(), Value::Bool(true));
+    }
+    if metadata_truncated {
+        map.insert("metadataTruncated".to_string(), Value::Bool(true));
+        map.insert(
+            "originalMetadataBytes".to_string(),
+            Value::from(original_bytes as u64),
+        );
+        map.insert(
+            "finalMetadataBytes".to_string(),
+            Value::from(final_bytes as u64),
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CredentialCostSummary {
     pub estimated_cost_usd: f64,
@@ -834,6 +1039,7 @@ impl UsageRecorder {
     }
 
     pub fn record(&self, record: UsageRecord) {
+        let record = normalize_error_diagnostics(record);
         {
             let mut records = self.records.lock();
             if let Some(index) = records.iter().position(|existing| existing.id == record.id) {
@@ -1578,6 +1784,7 @@ fn top_aggregates(map: HashMap<String, UsageAggregate>) -> Vec<UsageAggregate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn record_with_time(
         id: &str,
@@ -1661,6 +1868,102 @@ mod tests {
         assert_eq!(decoded.error_source, None);
         assert_eq!(decoded.error_id, None);
         assert_eq!(decoded.error_metadata, None);
+    }
+
+    #[test]
+    fn recorder_removes_duplicate_error_metadata_fields_recursively() {
+        let recorder = UsageRecorder::new(10);
+        let mut usage = record("diagnostic-duplicates", 0, UsageSource::None);
+        usage.status = UsageRecordStatus::Error;
+        usage.error_id = Some("req_01canonical".to_string());
+        usage.error_status_code = Some(429);
+        usage.error_source = Some("local_account".to_string());
+        usage.error_metadata = Some(json!({
+            "errorId": "req_01duplicate",
+            "requestId": "req_duplicate",
+            "statusCode": 429,
+            "responseErrorType": "rate_limit_error",
+            "selectionFailure": {
+                "requestId": "req_duplicate_nested",
+                "primaryReason": "rpm_limited",
+                "sampledAccounts": [
+                    {
+                        "accountId": 7,
+                        "statusCode": 429,
+                        "reason": "rpm_limited"
+                    }
+                ]
+            }
+        }));
+
+        recorder.record(usage);
+
+        let records = recorder.query(UsageRecordQuery::default()).records;
+        let metadata = records[0].error_metadata.as_ref().unwrap();
+        assert!(metadata.get("errorId").is_none());
+        assert!(metadata.get("requestId").is_none());
+        assert!(metadata.get("statusCode").is_none());
+        assert_eq!(metadata["responseErrorType"], "rate_limit_error");
+        assert_eq!(
+            metadata
+                .pointer("/selectionFailure/primaryReason")
+                .and_then(Value::as_str),
+            Some("rpm_limited")
+        );
+        assert!(metadata.pointer("/selectionFailure/requestId").is_none());
+        assert!(
+            metadata
+                .pointer("/selectionFailure/sampledAccounts/0/statusCode")
+                .is_none()
+        );
+        assert_eq!(
+            metadata
+                .pointer("/selectionFailure/sampledAccounts/0/accountId")
+                .and_then(Value::as_u64),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn recorder_bounds_error_text_and_metadata_size() {
+        let recorder = UsageRecorder::new(10);
+        let mut usage = record("diagnostic-bounds", 0, UsageSource::None);
+        usage.status = UsageRecordStatus::Error;
+        usage.error_message = Some("x".repeat(ERROR_DIAGNOSTIC_MAX_TEXT_BYTES + 128));
+        usage.error_detail = Some("y".repeat(ERROR_DIAGNOSTIC_MAX_TEXT_BYTES + 128));
+        usage.error_metadata = Some(json!({
+            "large": "z".repeat(ERROR_DIAGNOSTIC_MAX_METADATA_BYTES + 1024),
+            "items": (0..64).map(|idx| json!({
+                "idx": idx,
+                "message": format!("duplicate-message-{idx}")
+            })).collect::<Vec<_>>()
+        }));
+
+        recorder.record(usage);
+
+        let records = recorder.query(UsageRecordQuery::default()).records;
+        let record = &records[0];
+        assert!(
+            record.error_message.as_ref().unwrap().len()
+                <= ERROR_DIAGNOSTIC_MAX_TEXT_BYTES + "...".len()
+        );
+        assert!(
+            record.error_detail.as_ref().unwrap().len()
+                <= ERROR_DIAGNOSTIC_MAX_TEXT_BYTES + "...".len()
+        );
+        let metadata = record.error_metadata.as_ref().unwrap();
+        let metadata_len = serde_json::to_vec(metadata).unwrap().len();
+        assert!(metadata_len <= ERROR_DIAGNOSTIC_MAX_METADATA_BYTES);
+        assert_eq!(metadata["messageTruncated"], true);
+        assert_eq!(metadata["detailTruncated"], true);
+        assert_eq!(metadata["metadataTruncated"], true);
+        assert!(metadata.get("originalMetadataBytes").is_some());
+        assert!(
+            metadata
+                .get("items")
+                .and_then(Value::as_array)
+                .is_none_or(|items| items.len() <= ERROR_DIAGNOSTIC_MAX_ARRAY_ITEMS)
+        );
     }
 
     #[test]
