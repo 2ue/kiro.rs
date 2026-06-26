@@ -1,5 +1,6 @@
 mod admin_snapshot;
 mod manager;
+mod refresh;
 mod route_state;
 
 #[allow(unused_imports)]
@@ -14,7 +15,9 @@ pub use manager::{
 pub use route_state::{LocalPoolRouteState, LocalPoolRouteStateKind};
 
 #[allow(unused_imports)]
-pub(crate) use manager::{
-    InFlightKind, RefreshTokenInvalidError, get_usage_limits, is_token_expired,
-    is_token_expiring_soon, is_token_expiring_within, refresh_token, validate_refresh_token,
+pub(crate) use manager::InFlightKind;
+#[allow(unused_imports)]
+pub(crate) use refresh::{
+    RefreshTokenInvalidError, get_usage_limits, is_token_expired, is_token_expiring_soon,
+    is_token_expiring_within, refresh_token, validate_refresh_token,
 };
