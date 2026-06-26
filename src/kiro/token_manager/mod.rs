@@ -1,5 +1,6 @@
 mod account_state;
 mod admin_snapshot;
+mod concurrency;
 mod manager;
 mod refresh;
 mod route_state;
@@ -12,7 +13,8 @@ pub use admin_snapshot::{
     CredentialBaseSnapshot, CredentialCooldownSnapshot, CredentialEntrySnapshot,
     ManagerBaseSnapshot, ManagerRuntimeSnapshot, ManagerSnapshot, ManagerSummarySnapshot,
 };
-pub use manager::{InFlightLeaseGuard, MultiTokenManager};
+pub use concurrency::InFlightLeaseGuard;
+pub use manager::MultiTokenManager;
 pub use route_state::{LocalPoolRouteState, LocalPoolRouteStateKind};
 pub use types::{
     AcquireMode, CallContext, CredentialAuthUpdate, EXTERNAL_CREDENTIAL_CONTEXT_ID,

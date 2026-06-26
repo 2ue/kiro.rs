@@ -2,7 +2,7 @@ use std::time::Duration as StdDuration;
 
 use crate::kiro::model::credentials::KiroCredentials;
 
-use super::manager::InFlightLeaseGuard;
+use super::concurrency::InFlightLeaseGuard;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InFlightKind {
