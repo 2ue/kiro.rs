@@ -37,10 +37,14 @@ use super::account_state::{
     InFlightLease, ProxyResourceAvailability, ProxyResourceRuntime, SessionBinding,
 };
 use super::admin_snapshot::{
-    CredentialBaseSnapshot, CredentialCooldownSnapshot, CredentialEntrySnapshot,
-    ManagerBaseSnapshot, ManagerRuntimeSnapshot, ManagerSnapshot, ManagerSummarySnapshot,
+    CredentialBaseSnapshot, CredentialEntrySnapshot, ManagerBaseSnapshot, ManagerRuntimeSnapshot,
+    ManagerSnapshot, ManagerSummarySnapshot,
 };
 use super::concurrency::{DispatchQueueGuard, InFlightLeaseGuard};
+use super::cooldown::{
+    entry_any_cooldown_remaining, entry_cooldown_remaining, entry_cooldown_snapshots,
+    model_state_key,
+};
 use super::refresh::{
     RefreshTokenInvalidError, get_usage_limits, is_token_expired, is_token_expiring_soon,
     refresh_token, validate_refresh_token,
@@ -862,7 +866,7 @@ impl MultiTokenManager {
             } else if !Self::credential_proxy_is_dispatchable(&entry.credentials, &proxy_resources)
             {
                 (AccountRejectReason::ProxyUnavailable, None)
-            } else if let Some(remaining) = Self::entry_cooldown_remaining(entry, model, now) {
+            } else if let Some(remaining) = entry_cooldown_remaining(entry, model, now) {
                 (AccountRejectReason::CooldownActive, Some(remaining))
             } else if entry_rate_limit_remaining(entry, now).is_some() {
                 waitable_account_count = waitable_account_count.saturating_add(1);
@@ -960,7 +964,7 @@ impl MultiTokenManager {
                 None => (effective_concurrency, effective_concurrency),
             });
 
-            let cooldown_remaining = Self::entry_cooldown_remaining(entry, model, now);
+            let cooldown_remaining = entry_cooldown_remaining(entry, model, now);
             let rate_limit_remaining = entry_rate_limit_remaining(entry, now);
 
             if let Some(remaining) = cooldown_remaining {
@@ -1099,96 +1103,12 @@ impl MultiTokenManager {
         true
     }
 
-    fn model_state_key(model: &str) -> String {
-        model.trim().to_ascii_lowercase()
-    }
-
-    fn entry_global_cooldown_remaining(
-        entry: &CredentialEntry,
-        now: Instant,
-    ) -> Option<StdDuration> {
-        entry
-            .cooldown_until
-            .and_then(|until| until.checked_duration_since(now))
-    }
-
-    fn entry_model_cooldown<'a>(
-        entry: &'a CredentialEntry,
-        model: Option<&str>,
-    ) -> Option<&'a CredentialModelCooldown> {
-        model
-            .map(Self::model_state_key)
-            .and_then(|key| entry.model_cooldowns.get(&key))
-    }
-
-    fn entry_model_cooldown_remaining(
-        entry: &CredentialEntry,
-        model: Option<&str>,
-        now: Instant,
-    ) -> Option<StdDuration> {
-        Self::entry_model_cooldown(entry, model)
-            .and_then(|cooldown| cooldown.until.checked_duration_since(now))
-    }
-
-    fn entry_cooldown_remaining(
-        entry: &CredentialEntry,
-        model: Option<&str>,
-        now: Instant,
-    ) -> Option<StdDuration> {
-        match (
-            Self::entry_global_cooldown_remaining(entry, now),
-            Self::entry_model_cooldown_remaining(entry, model, now),
-        ) {
-            (Some(global), Some(model)) => Some(global.max(model)),
-            (Some(global), None) => Some(global),
-            (None, Some(model)) => Some(model),
-            (None, None) => None,
-        }
-    }
-
-    fn entry_any_cooldown_remaining(entry: &CredentialEntry, now: Instant) -> Option<StdDuration> {
-        entry
-            .model_cooldowns
-            .values()
-            .filter_map(|cooldown| cooldown.until.checked_duration_since(now))
-            .chain(Self::entry_global_cooldown_remaining(entry, now))
-            .max()
-    }
-
-    fn entry_cooldown_snapshots(
-        entry: &CredentialEntry,
-        now: Instant,
-    ) -> Vec<CredentialCooldownSnapshot> {
-        let mut cooldowns = Vec::new();
-        if let Some(remaining) = Self::entry_global_cooldown_remaining(entry, now) {
-            cooldowns.push(CredentialCooldownSnapshot {
-                model: None,
-                global: true,
-                remaining_secs: remaining.as_secs().saturating_add(1),
-                reason: entry.cooldown_reason.clone(),
-            });
-        }
-        let mut model_cooldowns: Vec<_> = entry.model_cooldowns.values().collect();
-        model_cooldowns.sort_by(|left, right| left.model.cmp(&right.model));
-        for cooldown in model_cooldowns {
-            if let Some(remaining) = cooldown.until.checked_duration_since(now) {
-                cooldowns.push(CredentialCooldownSnapshot {
-                    model: Some(cooldown.model.clone()),
-                    global: false,
-                    remaining_secs: remaining.as_secs().saturating_add(1),
-                    reason: cooldown.reason.clone(),
-                });
-            }
-        }
-        cooldowns
-    }
-
     fn entry_effective_health<'a>(
         entry: &'a CredentialEntry,
         model: Option<&str>,
     ) -> &'a SchedulerHealthState {
         model
-            .map(Self::model_state_key)
+            .map(model_state_key)
             .and_then(|key| entry.model_health.get(&key))
             .unwrap_or(&entry.health)
     }
@@ -1197,7 +1117,7 @@ impl MultiTokenManager {
         entry: &'a mut CredentialEntry,
         model: Option<&str>,
     ) -> &'a mut SchedulerHealthState {
-        match model.map(Self::model_state_key) {
+        match model.map(model_state_key) {
             Some(key) => entry.model_health.entry(key).or_default(),
             None => &mut entry.health,
         }
@@ -1212,7 +1132,7 @@ impl MultiTokenManager {
     ) -> bool {
         Self::credential_is_usable_for_model(entry, model)
             && Self::credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
-            && Self::entry_cooldown_remaining(entry, model, now).is_none()
+            && entry_cooldown_remaining(entry, model, now).is_none()
             && entry_rate_limit_remaining(entry, now).is_none()
             && Self::entry_has_concurrency_capacity(entry, max_concurrent_requests)
     }
@@ -1225,7 +1145,7 @@ impl MultiTokenManager {
     ) -> bool {
         Self::credential_is_usable_for_model(entry, model)
             && Self::credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
-            && Self::entry_cooldown_remaining(entry, model, now).is_none()
+            && entry_cooldown_remaining(entry, model, now).is_none()
             && entry_rate_limit_remaining(entry, now).is_none()
     }
 
@@ -1709,7 +1629,7 @@ impl MultiTokenManager {
             })
             .filter_map(|entry| {
                 match (
-                    Self::entry_cooldown_remaining(entry, model, now),
+                    entry_cooldown_remaining(entry, model, now),
                     entry_rate_limit_remaining(entry, now),
                 ) {
                     (Some(a), Some(b)) => Some(a.max(b)),
@@ -1735,7 +1655,7 @@ impl MultiTokenManager {
             .iter()
             .filter(|entry| {
                 Self::credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids)
-                    && Self::entry_cooldown_remaining(entry, model, now).is_none()
+                    && entry_cooldown_remaining(entry, model, now).is_none()
                     && entry_rate_limit_remaining(entry, now).is_none()
                     && (!global_has_capacity
                         || !Self::entry_has_concurrency_capacity(entry, max_concurrent_requests))
@@ -2872,7 +2792,7 @@ impl MultiTokenManager {
                                             e,
                                             model,
                                             &local_excluded_ids,
-                                        ) && Self::entry_cooldown_remaining(e, model, now).is_some()
+                                        ) && entry_cooldown_remaining(e, model, now).is_some()
                                     })
                                     .count();
                                 let wait_for = self.min_dispatch_wait(
@@ -3523,7 +3443,7 @@ impl MultiTokenManager {
             .map(|lease| now.saturating_duration_since(lease.last_seen_at).as_secs())
             .min()
             .unwrap_or(0);
-        let cooldowns = Self::entry_cooldown_snapshots(entry, now);
+        let cooldowns = entry_cooldown_snapshots(entry, now);
         let cooldown_reason = cooldowns
             .iter()
             .find_map(|cooldown| cooldown.reason.clone());
@@ -3584,8 +3504,8 @@ impl MultiTokenManager {
             refresh_failure_count: entry.refresh_failure_count,
             disabled_reason: entry.disabled_reason.map(|r| r.as_str().to_string()),
             endpoint: entry.credentials.endpoint.clone(),
-            cooled_down: Self::entry_any_cooldown_remaining(entry, now).is_some(),
-            cooldown_remaining_secs: Self::entry_any_cooldown_remaining(entry, now)
+            cooled_down: entry_any_cooldown_remaining(entry, now).is_some(),
+            cooldown_remaining_secs: entry_any_cooldown_remaining(entry, now)
                 .map(|duration| duration.as_secs().saturating_add(1))
                 .unwrap_or(0),
             cooldown_reason,
@@ -4343,7 +4263,7 @@ impl MultiTokenManager {
             entry.model_cooldowns.clear();
             entry.model_health.clear();
             for model_state in state.model_states {
-                let key = Self::model_state_key(&model_state.model);
+                let key = model_state_key(&model_state.model);
                 if let Some(cooldown) = model_state.cooldown {
                     if let Some(until) = instant_from_epoch_ms(cooldown.until_ms, now_ms, now) {
                         entry.model_cooldowns.insert(
@@ -4581,7 +4501,7 @@ impl MultiTokenManager {
                 Self::local_cooldown_duration(retry_after, base, max, multiplier, jitter, streak);
             let until = now + duration;
             if let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) {
-                let key = Self::model_state_key(model);
+                let key = model_state_key(model);
                 let should_update = entry
                     .model_cooldowns
                     .get(&key)
