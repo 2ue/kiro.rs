@@ -327,10 +327,19 @@ function ModelPricingTable({
   const pricingStatus = pricing.data
   const capStatus = capabilities.data
 
+  const pricingDesc = [
+    `${rows.length} 个模型`,
+    pricingStatus?.available === false ? '价格源不可用' : null,
+    pricingStatus?.source ? `来源 ${pricingStatus.source}` : null,
+    pricingStatus?.sourceUrl ? pricingStatus.sourceUrl : null,
+  ]
+    .filter(Boolean)
+    .join(' · ')
+
   return (
     <SectionCard
       title="模型价格目录"
-      description={`${rows.length} 个模型`}
+      description={pricingDesc}
       icon={<DollarSign />}
       actions={
         <div className="flex items-center gap-2">

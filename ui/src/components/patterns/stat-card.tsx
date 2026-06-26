@@ -78,7 +78,7 @@ export function StatGrid({
   return (
     <div
       className={cn('grid gap-3', className)}
-      style={{ gridTemplateColumns: `repeat(auto-fill, minmax(min(${min}, 100%), 1fr))` }}
+      style={{ gridTemplateColumns: `repeat(auto-fit, minmax(min(${min}, 100%), 1fr))` }}
     >
       {children}
     </div>
