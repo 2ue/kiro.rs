@@ -26,7 +26,7 @@ export function AppShell({ onLogout }: { onLogout: () => void }) {
             hideClose
             className="left-0 top-0 h-dvh max-h-dvh translate-x-0 translate-y-0 rounded-none border-l-0 p-0 data-[state=closed]:slide-out-to-left data-[state=open]:slide-in-from-left"
           >
-            <Sidebar embedded onNavigate={() => setMobileOpen(false)} />
+            <Sidebar onNavigate={() => setMobileOpen(false)} />
           </DialogContent>
         )}
       </Dialog>

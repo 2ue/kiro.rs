@@ -5,7 +5,7 @@ import { AuthGate, useAuth } from './auth-gate'
 import { CONSOLE_BASE_PATH } from '@/types/ui'
 import { LoadingState } from '@/components/patterns'
 
-// 路由级懒加载:每个页面单独分包,首屏只加载当前页
+// 路由级懒加载:每个页面单独成 chunk,首屏只加载当前页
 const OverviewPage = React.lazy(() =>
   import('@/features/overview/overview-page').then((m) => ({ default: m.OverviewPage }))
 )
@@ -42,9 +42,11 @@ function ShellWithAuth() {
   return <AppShell onLogout={logout} />
 }
 
-/** 懒加载页面的 Suspense 包裹 */
+/** 懒加载页面的加载兜底 */
 function Lazy({ children }: { children: React.ReactNode }) {
-  return <React.Suspense fallback={<LoadingState text="加载页面..." />}>{children}</React.Suspense>
+  return (
+    <React.Suspense fallback={<LoadingState text="加载页面..." />}>{children}</React.Suspense>
+  )
 }
 
 const router = createBrowserRouter(

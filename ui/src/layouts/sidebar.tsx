@@ -4,13 +4,12 @@ import { navDomains, pagesOfDomain } from '@/types/ui'
 import { useSystemVersion } from '@/hooks/use-credentials'
 
 interface SidebarProps {
-  embedded?: boolean
   onNavigate?: () => void
 }
 
 /**
  * 单层分组侧边栏:域作为分组标题,页面作为导航项直接平铺。
- * 干净、一目了然,无双层图标条。
+ * 干净、一目了然,无双层图标条。桌面常驻,移动端在抽屉中复用。
  */
 export function Sidebar({ onNavigate }: SidebarProps) {
   const version = useSystemVersion()
