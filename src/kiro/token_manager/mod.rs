@@ -1,13 +1,17 @@
+mod admin_snapshot;
 mod manager;
+mod route_state;
 
 #[allow(unused_imports)]
-pub use manager::{
-    AcquireMode, CallContext, CredentialAuthUpdate, CredentialBaseSnapshot,
-    CredentialCooldownSnapshot, CredentialEntrySnapshot, CredentialRiskControlReason,
-    EXTERNAL_CREDENTIAL_CONTEXT_ID, InFlightLeaseGuard, LocalPoolRouteState,
-    LocalPoolRouteStateKind, ManagerBaseSnapshot, ManagerRuntimeSnapshot, ManagerSnapshot,
-    ManagerSummarySnapshot, MultiTokenManager, TransientFailureKind,
+pub use admin_snapshot::{
+    CredentialBaseSnapshot, CredentialCooldownSnapshot, CredentialEntrySnapshot,
+    ManagerBaseSnapshot, ManagerRuntimeSnapshot, ManagerSnapshot, ManagerSummarySnapshot,
 };
+pub use manager::{
+    AcquireMode, CallContext, CredentialAuthUpdate, CredentialRiskControlReason,
+    EXTERNAL_CREDENTIAL_CONTEXT_ID, InFlightLeaseGuard, MultiTokenManager, TransientFailureKind,
+};
+pub use route_state::{LocalPoolRouteState, LocalPoolRouteStateKind};
 
 #[allow(unused_imports)]
 pub(crate) use manager::{
