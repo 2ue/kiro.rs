@@ -36,6 +36,9 @@ const ModelsPage = React.lazy(() =>
 const SecurityPage = React.lazy(() =>
   import('@/features/security/security-page').then((m) => ({ default: m.SecurityPage }))
 )
+const ValidationPage = React.lazy(() =>
+  import('@/features/validation/validation-page').then((m) => ({ default: m.ValidationPage }))
+)
 
 function ShellWithAuth() {
   const { logout } = useAuth()
@@ -64,6 +67,7 @@ const router = createBrowserRouter(
         { path: 'overview', element: <Lazy><OverviewPage /></Lazy> },
         // 资源域
         { path: 'credentials', element: <Lazy><CredentialsPage /></Lazy> },
+        { path: 'validation', element: <Lazy><ValidationPage /></Lazy> },
         { path: 'external-pools', element: <Lazy><ExternalPoolsPage /></Lazy> },
         { path: 'proxies', element: <Lazy><ProxiesPage /></Lazy> },
         // 分析域

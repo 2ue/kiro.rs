@@ -348,6 +348,7 @@ export function RuntimePage() {
             <TogField label="仅压缩空白字符" desc="只处理多余空白，风险低" checked={draft.whitespaceCompression} disabled={!draft.compressionEnabled} onChange={set('whitespaceCompression')} />
             <TogField label="启用大小保护" desc="统计请求大小并修正格式问题" checked={draft.payloadGuardEnabled} onChange={set('payloadGuardEnabled')} />
             <TogField label="外部账号也应用大小保护" desc="" checked={draft.payloadGuardExternalEnabled} disabled={!draft.payloadGuardEnabled} onChange={set('payloadGuardExternalEnabled')} />
+            <TogField label="优先裁剪旧历史" desc="内容太长时，优先缩短较早的对话历史，尽量保留当前请求" checked={draft.payloadGuardTrimHistory} disabled={!payloadSizeLimitEnabled} onChange={set('payloadGuardTrimHistory')} />
           </TwoCol>
           <div className="space-y-1.5">
             <div className="text-sm font-semibold">过大请求处理方式</div>
