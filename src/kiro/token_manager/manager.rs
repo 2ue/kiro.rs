@@ -36,8 +36,8 @@ use super::account_state::{
     InFlightLease, ProxyResourceAvailability, ProxyResourceRuntime, SessionBinding,
 };
 use super::admin_snapshot::{
-    CredentialBaseSnapshot, CredentialEntrySnapshot, ManagerBaseSnapshot, ManagerRuntimeSnapshot,
-    ManagerSnapshot, ManagerSummarySnapshot,
+    ManagerBaseSnapshot, ManagerRuntimeSnapshot, ManagerSnapshot, ManagerSummarySnapshot,
+    base_snapshot_from_entry, runtime_snapshot_from_entry,
 };
 use super::capacity::{
     credential_is_dispatch_candidate, credential_is_dispatchable,
@@ -47,10 +47,7 @@ use super::capacity::{
     global_has_concurrency_capacity, is_opus_model, proxy_unavailable_error,
 };
 use super::concurrency::{DispatchQueueGuard, InFlightLeaseGuard};
-use super::cooldown::{
-    entry_any_cooldown_remaining, entry_cooldown_remaining, entry_cooldown_snapshots,
-    model_state_key,
-};
+use super::cooldown::{entry_cooldown_remaining, model_state_key};
 use super::queue::{
     concurrency_blocked_count, effective_concurrency_range_for_candidates,
     format_effective_concurrency_range, min_dispatch_wait,
@@ -78,7 +75,7 @@ use super::storage_task::{block_on_storage, spawn_best_effort_storage_task};
 use super::strategy::{
     balanced_selection_key, entry_effective_health_mut, priority_selection_key,
     record_local_selection, refresh_local_selection_windows_locked, scheduler_score_with_config,
-    select_health_weighted, selection_pressure_from_totals, should_select_warming_from_totals,
+    select_health_weighted, should_select_warming_from_totals,
 };
 use super::types::{
     AcquireMode, CallContext, CredentialAuthUpdate, EXTERNAL_CREDENTIAL_CONTEXT_ID, InFlightKind,
@@ -2748,269 +2745,6 @@ impl MultiTokenManager {
         credentials
     }
 
-    fn effective_proxy_display_with_resources(
-        &self,
-        creds: &KiroCredentials,
-        resources: &HashMap<u64, ProxyResourceRuntime>,
-    ) -> (Option<String>, String) {
-        match creds.proxy_url.as_deref() {
-            Some(url) if url.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT) => {
-                (None, "direct".to_string())
-            }
-            Some(url) => (Some(url.to_string()), "credential".to_string()),
-            None => {
-                if let Some(resource_id) = creds.proxy_resource_id {
-                    if let Some(resource) = resources.get(&resource_id) {
-                        if resource.enabled {
-                            return (Some(resource.proxy_url.clone()), "resource".to_string());
-                        }
-                        return (None, "resource_disabled".to_string());
-                    }
-                    return (None, "resource_missing".to_string());
-                }
-                match &self.proxy {
-                    Some(proxy) => (Some(proxy.url.clone()), "global".to_string()),
-                    None => (None, "none".to_string()),
-                }
-            }
-        }
-    }
-
-    fn proxy_resource_name_from_resources(
-        resources: &HashMap<u64, ProxyResourceRuntime>,
-        resource_id: Option<u64>,
-    ) -> Option<String> {
-        let resource_id = resource_id?;
-        resources
-            .get(&resource_id)
-            .map(|resource| resource.name.clone())
-    }
-
-    fn normalized_auth_method(credentials: &KiroCredentials) -> Option<String> {
-        if credentials.is_api_key_credential() {
-            return Some("api_key".to_string());
-        }
-        credentials.auth_method.as_deref().map(|method| {
-            if method.eq_ignore_ascii_case("builder-id") || method.eq_ignore_ascii_case("iam") {
-                "idc".to_string()
-            } else if method.eq_ignore_ascii_case("external-idp")
-                || method.eq_ignore_ascii_case("externalidp")
-                || method.eq_ignore_ascii_case("enterprise")
-            {
-                "external_idp".to_string()
-            } else {
-                method.to_string()
-            }
-        })
-    }
-
-    fn base_snapshot_from_entry(
-        &self,
-        entry: &CredentialEntry,
-        config: &Config,
-        resources: &HashMap<u64, ProxyResourceRuntime>,
-    ) -> CredentialBaseSnapshot {
-        let (effective_proxy_url, effective_proxy_source) =
-            self.effective_proxy_display_with_resources(&entry.credentials, resources);
-        let proxy_resource_id = entry.credentials.proxy_resource_id;
-        CredentialBaseSnapshot {
-            id: entry.id,
-            created_at: entry.credentials.created_at.clone(),
-            updated_at: entry.credentials.updated_at.clone(),
-            priority: entry.credentials.priority,
-            disabled: entry.disabled,
-            disabled_reason: entry.disabled_reason.map(|r| r.as_str().to_string()),
-            auth_method: Self::normalized_auth_method(&entry.credentials),
-            provider: entry.credentials.provider.clone(),
-            region: entry.credentials.region.clone(),
-            auth_region: entry.credentials.auth_region.clone(),
-            api_region: entry.credentials.api_region.clone(),
-            effective_auth_region: entry.credentials.effective_auth_region(config).to_string(),
-            effective_api_region: entry.credentials.effective_api_region(config).to_string(),
-            has_profile_arn: entry.credentials.profile_arn.is_some(),
-            refresh_token_hash: if entry.credentials.is_api_key_credential() {
-                None
-            } else {
-                entry.credentials.refresh_token.as_deref().map(sha256_hex)
-            },
-            api_key_hash: if entry.credentials.is_api_key_credential() {
-                entry.credentials.kiro_api_key.as_deref().map(sha256_hex)
-            } else {
-                None
-            },
-            masked_api_key: if entry.credentials.is_api_key_credential() {
-                entry.credentials.kiro_api_key.as_deref().map(mask_api_key)
-            } else {
-                None
-            },
-            email: entry.credentials.email.clone(),
-            subscription_title: entry.credentials.subscription_title.clone(),
-            has_proxy: effective_proxy_url.is_some(),
-            proxy_url: entry.credentials.proxy_url.clone(),
-            proxy_username: entry.credentials.proxy_username.clone(),
-            proxy_password: entry.credentials.proxy_password.clone(),
-            proxy_resource_id,
-            proxy_resource_name: Self::proxy_resource_name_from_resources(
-                resources,
-                proxy_resource_id,
-            ),
-            effective_proxy_url,
-            effective_proxy_source,
-            endpoint: entry.credentials.endpoint.clone(),
-            max_concurrent_requests: effective_max_concurrent_requests(
-                entry,
-                config.credential_max_concurrent_requests,
-            ),
-            max_concurrent_requests_override: entry.credentials.max_concurrent_requests,
-            rpm: effective_rpm(entry, config.credential_rpm.unwrap_or(0)),
-            rpm_override: entry.credentials.rpm,
-            warmup_remaining: entry.warmup_remaining,
-        }
-    }
-
-    fn runtime_snapshot_from_entry(
-        &self,
-        entry: &CredentialEntry,
-        config: &Config,
-        resources: &HashMap<u64, ProxyResourceRuntime>,
-        max_concurrent_requests: u32,
-        lease_max_age: Option<StdDuration>,
-        now: Instant,
-        now_ms: i64,
-        score_total_recent: u64,
-        score_candidate_count: usize,
-    ) -> CredentialEntrySnapshot {
-        let (effective_proxy_url, effective_proxy_source) =
-            self.effective_proxy_display_with_resources(&entry.credentials, resources);
-        let proxy_resource_id = entry.credentials.proxy_resource_id;
-        let oldest_in_flight_age_secs = entry
-            .in_flight_leases
-            .iter()
-            .map(|lease| now.saturating_duration_since(lease.acquired_at).as_secs())
-            .max()
-            .unwrap_or(0);
-        let newest_in_flight_idle_secs = entry
-            .in_flight_leases
-            .iter()
-            .map(|lease| now.saturating_duration_since(lease.last_seen_at).as_secs())
-            .min()
-            .unwrap_or(0);
-        let cooldowns = entry_cooldown_snapshots(entry, now);
-        let cooldown_reason = cooldowns
-            .iter()
-            .find_map(|cooldown| cooldown.reason.clone());
-        let selection_pressure =
-            selection_pressure_from_totals(entry, score_total_recent, score_candidate_count);
-
-        CredentialEntrySnapshot {
-            id: entry.id,
-            created_at: entry.credentials.created_at.clone(),
-            updated_at: entry.credentials.updated_at.clone(),
-            priority: entry.credentials.priority,
-            disabled: entry.disabled,
-            failure_count: entry.failure_count,
-            auth_method: Self::normalized_auth_method(&entry.credentials),
-            provider: entry.credentials.provider.clone(),
-            region: entry.credentials.region.clone(),
-            auth_region: entry.credentials.auth_region.clone(),
-            api_region: entry.credentials.api_region.clone(),
-            effective_auth_region: entry.credentials.effective_auth_region(config).to_string(),
-            effective_api_region: entry.credentials.effective_api_region(config).to_string(),
-            has_profile_arn: entry.credentials.profile_arn.is_some(),
-            expires_at: if entry.credentials.is_api_key_credential() {
-                None
-            } else {
-                entry.credentials.expires_at.clone()
-            },
-            refresh_token_hash: if entry.credentials.is_api_key_credential() {
-                None
-            } else {
-                entry.credentials.refresh_token.as_deref().map(sha256_hex)
-            },
-            api_key_hash: if entry.credentials.is_api_key_credential() {
-                entry.credentials.kiro_api_key.as_deref().map(sha256_hex)
-            } else {
-                None
-            },
-            masked_api_key: if entry.credentials.is_api_key_credential() {
-                entry.credentials.kiro_api_key.as_deref().map(mask_api_key)
-            } else {
-                None
-            },
-            email: entry.credentials.email.clone(),
-            subscription_title: entry.credentials.subscription_title.clone(),
-            success_count: entry.success_count,
-            total_selection_count: entry.total_selection_count,
-            last_used_at: entry.last_used_at.clone(),
-            has_proxy: effective_proxy_url.is_some(),
-            proxy_url: entry.credentials.proxy_url.clone(),
-            proxy_username: entry.credentials.proxy_username.clone(),
-            proxy_password: entry.credentials.proxy_password.clone(),
-            proxy_resource_id,
-            proxy_resource_name: Self::proxy_resource_name_from_resources(
-                resources,
-                proxy_resource_id,
-            ),
-            effective_proxy_url,
-            effective_proxy_source,
-            refresh_failure_count: entry.refresh_failure_count,
-            disabled_reason: entry.disabled_reason.map(|r| r.as_str().to_string()),
-            endpoint: entry.credentials.endpoint.clone(),
-            cooled_down: entry_any_cooldown_remaining(entry, now).is_some(),
-            cooldown_remaining_secs: entry_any_cooldown_remaining(entry, now)
-                .map(|duration| duration.as_secs().saturating_add(1))
-                .unwrap_or(0),
-            cooldown_reason,
-            cooldowns,
-            rate_limited: entry_rate_limit_remaining(entry, now).is_some(),
-            rate_limit_remaining_secs: entry_rate_limit_remaining(entry, now)
-                .map(|duration| duration.as_secs().saturating_add(1))
-                .unwrap_or(0),
-            in_flight_requests: entry.in_flight_requests,
-            oldest_in_flight_age_secs,
-            newest_in_flight_idle_secs,
-            max_concurrent_requests: effective_max_concurrent_requests(
-                entry,
-                max_concurrent_requests,
-            ),
-            max_concurrent_requests_override: entry.credentials.max_concurrent_requests,
-            rpm: effective_rpm(entry, config.credential_rpm.unwrap_or(0)),
-            rpm_override: entry.credentials.rpm,
-            in_flight_lease_max_secs: lease_max_age
-                .map(|duration| duration.as_secs())
-                .unwrap_or(0),
-            warmup_remaining: entry.warmup_remaining,
-            transient_failure_streak: entry.health.transient_failure_streak,
-            recent_error_rate: entry.health.recent_error_rate,
-            latency_ewma_ms: entry.health.latency_ewma_ms,
-            last_error_kind: entry.health.last_error_kind.clone(),
-            last_error_reason: entry.health.last_error_reason.clone(),
-            last_error_at_ms: entry.health.last_error_at_ms,
-            in_probation: entry
-                .health
-                .probation_until_ms
-                .is_some_and(|until_ms| until_ms > now_ms),
-            probation_remaining_secs: entry
-                .health
-                .probation_until_ms
-                .filter(|until_ms| *until_ms > now_ms)
-                .map(|until_ms| ((until_ms - now_ms) as u64).div_ceil(1000))
-                .unwrap_or(0),
-            scheduler_selection_count: entry.total_selection_count,
-            recent_scheduler_selection_count_10s: entry.health.recent_selection_count_10s,
-            recent_scheduler_selection_count_60s: entry.health.recent_selection_count_60s,
-            recent_scheduler_selection_count_5m: entry.health.recent_selection_count_5m,
-            scheduler_selection_pressure: selection_pressure,
-            scheduler_score: scheduler_score_with_config(
-                entry,
-                None,
-                now_ms,
-                selection_pressure,
-                config,
-            ),
-        }
-    }
-
     fn credential_from_entry(entry: &CredentialEntry) -> KiroCredentials {
         let mut cred = entry.credentials.clone();
         cred.id = Some(entry.id);
@@ -4548,16 +4282,19 @@ impl MultiTokenManager {
         let entries_snapshot = entries
             .iter()
             .map(|entry| {
-                self.runtime_snapshot_from_entry(
+                runtime_snapshot_from_entry(
                     entry,
                     &config,
                     &proxy_resources,
+                    self.proxy.as_ref(),
                     max_concurrent_requests,
                     lease_max_age,
                     now,
                     now_ms,
                     score_total_recent,
                     score_candidate_count,
+                    sha256_hex,
+                    mask_api_key,
                 )
             })
             .collect();
@@ -4587,7 +4324,16 @@ impl MultiTokenManager {
         let proxy_resources = self.proxy_resources.lock();
         let entries_snapshot = entries
             .iter()
-            .map(|entry| self.base_snapshot_from_entry(entry, &config, &proxy_resources))
+            .map(|entry| {
+                base_snapshot_from_entry(
+                    entry,
+                    &config,
+                    &proxy_resources,
+                    self.proxy.as_ref(),
+                    sha256_hex,
+                    mask_api_key,
+                )
+            })
             .collect();
 
         ManagerBaseSnapshot {
@@ -4691,16 +4437,19 @@ impl MultiTokenManager {
             .iter()
             .filter(|entry| ids.is_empty() || ids.contains(&entry.id))
             .map(|entry| {
-                self.runtime_snapshot_from_entry(
+                runtime_snapshot_from_entry(
                     entry,
                     &config,
                     &proxy_resources,
+                    self.proxy.as_ref(),
                     max_concurrent_requests,
                     lease_max_age,
                     now,
                     now_ms,
                     score_total_recent,
                     score_candidate_count,
+                    sha256_hex,
+                    mask_api_key,
                 )
             })
             .collect();
