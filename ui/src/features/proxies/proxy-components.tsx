@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Activity, Edit3, Eye, EyeOff, Plus, Trash2 } from 'lucide-react'
+import { Activity, ChevronDown, ChevronUp, Edit3, Eye, EyeOff, Plus, Trash2, Users } from 'lucide-react'
 import { toast } from 'sonner'
 import { formatDate } from '@/lib/format'
 import { extractErrorMessage, cn } from '@/lib/utils'
@@ -74,7 +74,7 @@ function SecretInput({ value, onChange, visible, onToggle }: {
 
 const credentialLabel = (c: CredentialStatusItem) => c.email || c.maskedApiKey || `账号 #${c.id}`
 
-function CredentialBindingPicker({ credentials, selectedIds, onToggle }: {
+export function CredentialBindingPicker({ credentials, selectedIds, onToggle }: {
   credentials: CredentialStatusItem[]; selectedIds: Set<number>; onToggle: (id: number) => void
 }) {
   if (!credentials.length) return <EmptyState title="暂无可绑定账号" />
@@ -340,10 +340,63 @@ function Detail({ label, children }: { label: string; children: React.ReactNode 
 export function ProxyResourceCard({ resource, onEdit }: { resource: ProxyResource; onEdit: (r: ProxyResource) => void }) {
   const [showSecrets, setShowSecrets] = React.useState(false)
   const [testResult, setTestResult] = React.useState<ProxyResourceTestResponse | null>(null)
+  const [expanded, setExpanded] = React.useState(false)
+  const [selectedIds, setSelectedIds] = React.useState<Set<number>>(new Set())
+  const [bindingReady, setBindingReady] = React.useState(false)
+  const [savingBindings, setSavingBindings] = React.useState(false)
   const update = useUpdateProxyResource()
   const remove = useDeleteProxyResource()
   const testProxy = useTestProxyResource()
+  const setCredentialProxy = useSetCredentialProxy()
   const confirm = useConfirm()
+  const credentials = useCredentials({ enabled: expanded })
+
+  const allCredentials = credentials.data?.credentials || []
+
+  // 当展开时加载账号并初始化选中状态
+  React.useEffect(() => {
+    if (!expanded) return
+    let cancelled = false
+    setBindingReady(false)
+    credentials.refetch().then((result) => {
+      if (cancelled || result.error || !result.data) return
+      const list = result.data.credentials || []
+      setSelectedIds(new Set(list.filter((c) => c.proxyResourceId === resource.id).map((c) => c.id)))
+      setBindingReady(true)
+    })
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [expanded, resource.id])
+
+  const toggleCredential = (id: number) =>
+    setSelectedIds((prev) => { const next = new Set(prev); if (next.has(id)) next.delete(id); else next.add(id); return next })
+
+  const saveBindings = async () => {
+    if (!bindingReady || !credentials.data) return toast.error('账号列表尚未加载完成')
+    setSavingBindings(true)
+    try {
+      const ops = allCredentials
+        .map((c) => {
+          const selected = selectedIds.has(c.id)
+          if (selected && c.proxyResourceId !== resource.id) return { id: c.id, proxyResourceId: resource.id }
+          if (!selected && c.proxyResourceId === resource.id) return { id: c.id, proxyResourceId: null as null }
+          return null
+        })
+        .filter((op): op is { id: number; proxyResourceId: number | null } => Boolean(op))
+      if (!ops.length) { toast.success('绑定关系无变化'); return }
+      const results = await Promise.allSettled(
+        ops.map((op) => setCredentialProxy.mutateAsync({ id: op.id, request: { proxyResourceId: op.proxyResourceId } }))
+      )
+      const ok = results.filter((r) => r.status === 'fulfilled').length
+      const fail = results.filter((r) => r.status === 'rejected').length
+      if (fail > 0) toast.warning(`绑定成功 ${ok} 个，失败 ${fail} 个`)
+      else toast.success(`已同步 ${ok} 个账号绑定`)
+    } catch (error) {
+      toast.error(`保存绑定失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setSavingBindings(false)
+    }
+  }
 
   const toggleEnabled = () => update.mutate(
     { id: resource.id, request: { enabled: !resource.enabled } },
@@ -384,62 +437,108 @@ export function ProxyResourceCard({ resource, onEdit }: { resource: ProxyResourc
   }
 
   return (
-    <div className="rounded-lg border border-border bg-card p-4">
-      <div className="flex flex-col gap-3">
-        <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-1.5">
-              <h3 className="truncate text-sm font-semibold" title={resource.name}>{resource.name}</h3>
-              <Badge>#{resource.id}</Badge>
-              <Badge tone={resource.enabled ? 'success' : 'error'}>{resource.enabled ? '启用' : '已禁用'}</Badge>
-              {resource.hasPassword && <Badge tone="info">密码</Badge>}
+    <div className="rounded-lg border border-border bg-card">
+      <div className="p-4">
+        <div className="flex flex-col gap-3">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <h3 className="truncate text-sm font-semibold" title={resource.name}>{resource.name}</h3>
+                <Badge>#{resource.id}</Badge>
+                <Badge tone={resource.enabled ? 'success' : 'error'}>{resource.enabled ? '启用' : '已禁用'}</Badge>
+                {resource.hasPassword && <Badge tone="info">密码</Badge>}
+              </div>
+              <div className="mt-1 truncate text-xs text-muted-foreground" title={resource.proxyUrl}>{resource.proxyUrl}</div>
             </div>
-            <div className="mt-1 truncate text-xs text-muted-foreground" title={resource.proxyUrl}>{resource.proxyUrl}</div>
+            <Switch checked={resource.enabled} disabled={update.isPending} onCheckedChange={toggleEnabled} />
           </div>
-          <Switch checked={resource.enabled} disabled={update.isPending} onCheckedChange={toggleEnabled} />
-        </div>
 
-        <div className="grid gap-2 text-xs sm:grid-cols-2">
-          <Detail label="用户名">
-            <span className="font-mono font-semibold">{showSecrets ? resource.proxyUsername || '-' : maskSecret(resource.proxyUsername)}</span>
-          </Detail>
-          <Detail label="密码">
-            <span className="font-mono font-semibold">{showSecrets ? resource.proxyPassword || '-' : resource.hasPassword ? maskSecret(resource.proxyPassword || '******') : '-'}</span>
-          </Detail>
-          <Detail label="绑定账号"><span className="font-semibold">{resource.credentialCount}</span></Detail>
-          <Detail label="创建时间"><span className="font-semibold">{formatDate(resource.createdAt)}</span></Detail>
-          <Detail label="更新时间"><span className="font-semibold">{formatDate(resource.updatedAt)}</span></Detail>
-          {resource.notes && (
-            <div className="sm:col-span-2">
-              <div className="text-muted-foreground">备注</div>
-              <div className="whitespace-pre-wrap break-words font-semibold">{resource.notes}</div>
-            </div>
-          )}
-        </div>
+          <div className="grid gap-2 text-xs sm:grid-cols-2">
+            <Detail label="用户名">
+              <span className="font-mono font-semibold">{showSecrets ? resource.proxyUsername || '-' : maskSecret(resource.proxyUsername)}</span>
+            </Detail>
+            <Detail label="密码">
+              <span className="font-mono font-semibold">{showSecrets ? resource.proxyPassword || '-' : resource.hasPassword ? maskSecret(resource.proxyPassword || '******') : '-'}</span>
+            </Detail>
+            <Detail label="绑定账号"><span className="font-semibold">{resource.credentialCount}</span></Detail>
+            <Detail label="创建时间"><span className="font-semibold">{formatDate(resource.createdAt)}</span></Detail>
+            <Detail label="更新时间"><span className="font-semibold">{formatDate(resource.updatedAt)}</span></Detail>
+            {resource.notes && (
+              <div className="sm:col-span-2">
+                <div className="text-muted-foreground">备注</div>
+                <div className="whitespace-pre-wrap break-words font-semibold">{resource.notes}</div>
+              </div>
+            )}
+          </div>
 
-        <ProxyTestResult result={testResult} />
+          <ProxyTestResult result={testResult} />
 
-        <div className="flex flex-wrap gap-1.5">
-          <Button variant="ghost" size="xs" onClick={testSavedProxy} disabled={testProxy.isPending}>
-            {testProxy.isPending ? <Spinner size="sm" /> : <Activity className="size-3.5" />}测试
-          </Button>
-          <Button variant="ghost" size="xs" onClick={() => setShowSecrets((v) => !v)}>
-            {showSecrets ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
-            {showSecrets ? '隐藏账号密码' : '显示账号密码'}
-          </Button>
-          <Button variant="ghost" size="xs" onClick={() => onEdit(resource)}>
-            <Edit3 className="size-3.5" />编辑
-          </Button>
-          <Button
-            variant="ghost" size="xs"
-            className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-            onClick={deleteResource}
-            disabled={remove.isPending}
-          >
-            <Trash2 className="size-3.5" />删除
-          </Button>
+          <div className="flex flex-wrap gap-1.5">
+            <Button variant="ghost" size="xs" onClick={testSavedProxy} disabled={testProxy.isPending}>
+              {testProxy.isPending ? <Spinner size="sm" /> : <Activity className="size-3.5" />}测试
+            </Button>
+            <Button variant="ghost" size="xs" onClick={() => setShowSecrets((v) => !v)}>
+              {showSecrets ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
+              {showSecrets ? '隐藏账号密码' : '显示账号密码'}
+            </Button>
+            <Button variant="ghost" size="xs" onClick={() => onEdit(resource)}>
+              <Edit3 className="size-3.5" />编辑
+            </Button>
+            <Button
+              variant="ghost" size="xs"
+              className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+              onClick={deleteResource}
+              disabled={remove.isPending}
+            >
+              <Trash2 className="size-3.5" />删除
+            </Button>
+            <Button
+              variant="ghost" size="xs"
+              className={cn(expanded ? 'text-primary' : '')}
+              onClick={() => setExpanded((v) => !v)}
+            >
+              <Users className="size-3.5" />账号绑定
+              {expanded ? <ChevronUp className="size-3.5" /> : <ChevronDown className="size-3.5" />}
+            </Button>
+          </div>
         </div>
       </div>
+
+      {/* 展开态：账号绑定选择器 */}
+      {expanded && (
+        <div className="border-t border-border p-4 space-y-3">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div className="text-sm font-semibold">账号绑定</div>
+              <div className="text-xs text-muted-foreground">勾选账号后点击保存绑定同步到服务器；已禁用账号以红色标识。</div>
+            </div>
+            <div className="flex items-center gap-2">
+              <Badge tone="info">{selectedIds.size} 已选</Badge>
+              <Button
+                size="xs"
+                disabled={!bindingReady || savingBindings || setCredentialProxy.isPending}
+                onClick={saveBindings}
+              >
+                {savingBindings ? <Spinner size="sm" /> : null}
+                保存绑定
+              </Button>
+            </div>
+          </div>
+          {!bindingReady && (credentials.isLoading || credentials.isFetching) ? (
+            <LoadingState text="加载账号..." />
+          ) : !bindingReady && credentials.isError ? (
+            <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-center text-xs text-destructive">
+              账号列表加载失败：{extractErrorMessage(credentials.error)}
+            </div>
+          ) : (
+            <CredentialBindingPicker
+              credentials={allCredentials}
+              selectedIds={selectedIds}
+              onToggle={toggleCredential}
+            />
+          )}
+        </div>
+      )}
     </div>
   )
 }

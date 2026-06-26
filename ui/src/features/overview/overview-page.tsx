@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   Clock3,
   Database,
+  DollarSign,
   RefreshCw,
   Server,
   ShieldAlert,
@@ -19,7 +20,10 @@ import { useCredentialSummary } from '@/hooks/use-credentials'
 import { formatNumber, formatPercent, formatUsd } from '@/lib/format'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import type {
+  UsageBreakdownItem,
   UsageDashboardWindow,
+  UsageExternalPoolBillingByPool,
+  UsageExternalPoolBillingSummary,
   UsageSeriesPoint,
   UsageTopAggregate,
 } from '@/types/api'
@@ -528,6 +532,216 @@ function DimensionRankPanel({
   )
 }
 
+// ─── 子组件：外部账号计费拆分 ──────────────────────────────────────────────────
+
+type BillingDeltaTone = 'loss' | 'profit' | 'even'
+
+function billingDeltaTone(delta: number): BillingDeltaTone {
+  if (delta < 0) return 'loss'
+  if (delta > 0) return 'profit'
+  return 'even'
+}
+
+function billingDeltaTextClass(tone: BillingDeltaTone): string {
+  if (tone === 'loss') return 'text-destructive'
+  if (tone === 'profit') return 'text-warning'
+  return 'text-muted-foreground/50'
+}
+
+function ExternalPoolBillingPanel({
+  billing,
+  billingByPool,
+}: {
+  billing: UsageExternalPoolBillingSummary
+  billingByPool: UsageExternalPoolBillingByPool[]
+}) {
+  const shapedCost = billing.shapedCostUsd ?? billing.reportedCostUsd ?? 0
+  const upliftedCost = billing.upliftedCostUsd ?? billing.reportedCostUsd ?? billing.billableCostUsd ?? 0
+  const profit = billing.profitUsd ?? (upliftedCost - (billing.rawCostUsd || 0))
+  const profitRatio = billing.rawCostUsd > 0 ? profit / billing.rawCostUsd : 0
+  const deltaTone = billingDeltaTone(profit)
+  const hasLoss = deltaTone === 'loss'
+  const hasProfit = deltaTone === 'profit'
+  const visiblePools = billingByPool.filter((pool) => pool.requests > 0).slice(0, 20)
+
+  return (
+    <SectionCard
+      title="外部账号计费拆分"
+      description="展示外部账号的成本、计费金额和差额，便于判断外部账号是否划算"
+      icon={<DollarSign />}
+      actions={
+        <span className={cn(
+          'rounded border px-2 py-0.5 text-[0.68rem] font-semibold',
+          hasLoss
+            ? 'border-destructive/25 bg-card text-destructive'
+            : hasProfit
+              ? 'border-warning/25 bg-card text-warning'
+              : 'border-border bg-card text-muted-foreground/55'
+        )}>
+          {hasLoss ? `亏损 ${formatUsd(Math.abs(profit))}` : hasProfit ? `盈利 ${formatUsd(profit)}` : '持平'}
+        </span>
+      }
+    >
+      <div className="space-y-4">
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="rounded-lg border border-border bg-muted/40 p-3">
+            <div className="text-xs text-muted-foreground">外部账号请求</div>
+            <div className="mt-1 text-lg font-semibold">{formatNumber(billing.requests)}</div>
+            <div className="mt-1 text-xs text-muted-foreground/60">
+              可计价 {formatNumber(billing.pricedRequests)} / 未计价 {formatNumber(billing.unpricedRequests)}
+            </div>
+          </div>
+          <div className="rounded-lg border border-border bg-muted/40 p-3">
+            <div className="text-xs text-muted-foreground">原始成本</div>
+            <div className="mt-1 text-lg font-semibold">{formatUsd(billing.rawCostUsd)}</div>
+            <div className="mt-1 text-xs text-muted-foreground/60">按外部账号实际消耗估算</div>
+          </div>
+          <div className="rounded-lg border border-border bg-muted/40 p-3">
+            <div className="text-xs text-muted-foreground">展示计费</div>
+            <div className="mt-1 text-lg font-semibold">{formatUsd(shapedCost)}</div>
+            <div className="mt-1 text-xs text-muted-foreground/60">按当前展示规则计算</div>
+          </div>
+          <div className="rounded-lg border border-border bg-muted/40 p-3">
+            <div className="text-xs text-muted-foreground">补偿后计费</div>
+            <div className="mt-1 text-lg font-semibold">{formatUsd(upliftedCost)}</div>
+            <div className={cn('mt-1 text-xs', billingDeltaTextClass(deltaTone))}>
+              盈利 = 放大后 - 原始：{profit >= 0 ? '+' : ''}{formatUsd(profit)}
+            </div>
+          </div>
+        </div>
+
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between gap-2 text-xs">
+            <span className="truncate font-medium text-foreground/75">盈利占原始成本</span>
+            <span className="shrink-0 font-mono text-muted-foreground">
+              {profit >= 0 ? '+' : ''}{formatUsd(profit)} · {formatPercent(profitRatio)}
+            </span>
+          </div>
+          <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+            <div
+              className={cn('h-full rounded-full', hasLoss ? 'bg-warning/80' : 'bg-success/80')}
+              style={{ width: `${Math.min(100, Math.abs(profitRatio) * 100)}%` }}
+            />
+          </div>
+        </div>
+
+        <div className="border-t border-border pt-3">
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <div className="text-xs font-semibold text-foreground/70">外部账号成本与盈亏</div>
+            <div className="text-[0.65rem] text-muted-foreground/45">按当前时间窗口聚合</div>
+          </div>
+          {visiblePools.length === 0 ? (
+            <div className="rounded-lg border border-dashed border-border p-3 text-sm text-muted-foreground/60">
+              当前窗口没有外部账号计费样本。
+            </div>
+          ) : (
+            <div className="scrollbar-thin overflow-x-auto rounded-lg border border-border">
+              <table className="w-full min-w-[640px] text-xs">
+                <thead>
+                  <tr className="border-b border-border bg-muted/40 text-muted-foreground">
+                    <th className="px-3 py-2 text-left font-medium">外部账号</th>
+                    <th className="px-3 py-2 text-right font-medium">请求</th>
+                    <th className="px-3 py-2 text-right font-medium">原始成本</th>
+                    <th className="px-3 py-2 text-right font-medium">展示计费</th>
+                    <th className="px-3 py-2 text-right font-medium">补偿后</th>
+                    <th className="px-3 py-2 text-right font-medium">盈亏</th>
+                    <th className="px-3 py-2 text-right font-medium">未计价</th>
+                    <th className="px-3 py-2 text-right font-medium">兜底</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border">
+                  {visiblePools.map((pool) => {
+                    const poolProfit = pool.profitUsd ?? ((pool.upliftedCostUsd ?? pool.reportedCostUsd ?? 0) - pool.rawCostUsd)
+                    const poolTone = billingDeltaTone(poolProfit)
+                    return (
+                      <tr key={pool.poolId} className="bg-card hover:bg-muted/30 transition-colors">
+                        <td className="px-3 py-2">
+                          <div className="max-w-[200px] truncate font-medium" title={pool.poolName}>{pool.poolName}</div>
+                          <div className="font-mono text-[0.62rem] text-muted-foreground/45">#{pool.poolId}</div>
+                        </td>
+                        <td className="px-3 py-2 text-right font-mono">{formatNumber(pool.requests)}</td>
+                        <td className="px-3 py-2 text-right font-mono">{formatUsd(pool.rawCostUsd)}</td>
+                        <td className="px-3 py-2 text-right font-mono">{formatUsd(pool.shapedCostUsd ?? pool.reportedCostUsd)}</td>
+                        <td className="px-3 py-2 text-right font-mono">{formatUsd(pool.upliftedCostUsd ?? pool.reportedCostUsd)}</td>
+                        <td className={cn('px-3 py-2 text-right font-mono', billingDeltaTextClass(poolTone))}>
+                          {poolProfit >= 0 ? '+' : ''}{formatUsd(poolProfit)}
+                        </td>
+                        <td className="px-3 py-2 text-right font-mono">{formatNumber(pool.unpricedRequests)}</td>
+                        <td className="px-3 py-2 text-right font-mono">{formatNumber(pool.costFloorAppliedRequests)}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </div>
+    </SectionCard>
+  )
+}
+
+// ─── 子组件：占比分解面板 ──────────────────────────────────────────────────────
+
+const BREAKDOWN_TONES: Record<string, string> = {
+  success: 'bg-success/80',
+  timeout: 'bg-warning/80',
+  upstream_timeout: 'bg-warning/80',
+  client_error: 'bg-destructive/70',
+  stream_error: 'bg-destructive/70',
+  error: 'bg-destructive/70',
+  upstream_metadata: 'bg-primary/65',
+  local_prompt_cache: 'bg-success/70',
+  context_estimate: 'bg-info/70',
+  request_estimate: 'bg-info/60',
+}
+
+function breakdownBarColor(key: string): string {
+  return BREAKDOWN_TONES[key] ?? 'bg-muted-foreground/40'
+}
+
+function BreakdownPanel({
+  title,
+  description,
+  items,
+  emptyText,
+}: {
+  title: string
+  description?: string
+  items: UsageBreakdownItem[]
+  emptyText: string
+}) {
+  return (
+    <SectionCard title={title} description={description}>
+      <div className="space-y-3">
+        {items.length === 0 ? (
+          <div className="rounded-lg border border-dashed border-border px-3 py-3 text-sm text-muted-foreground/60">
+            {emptyText}
+          </div>
+        ) : (
+          items.slice(0, 6).map((item) => {
+            const width = Number.isFinite(item.ratio) ? Math.min(100, Math.max(0, item.ratio * 100)) : 0
+            const barColor = breakdownBarColor(item.key)
+            return (
+              <div key={item.key} className="space-y-1.5">
+                <div className="flex items-center justify-between gap-2 text-xs">
+                  <span className="truncate font-medium text-foreground/75">{item.label}</span>
+                  <span className="shrink-0 font-mono text-muted-foreground">
+                    {formatNumber(item.requests)} · {formatPercent(item.ratio)}
+                  </span>
+                </div>
+                <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+                  <div className={cn('h-full rounded-full', barColor)} style={{ width: `${width}%` }} />
+                </div>
+              </div>
+            )
+          })
+        )}
+      </div>
+    </SectionCard>
+  )
+}
+
 // ─── 主页 ──────────────────────────────────────────────────────────────────────
 
 export function OverviewPage() {
@@ -755,7 +969,33 @@ export function OverviewPage() {
       {/* 6. 维度排行 */}
       <DimensionRankPanel top={top} activeKey={rankDimension} onActiveKeyChange={setRankDimension} />
 
-      {/* 7. 底部状态栏 */}
+      {/* 7. 外部账号计费拆分（仅当有外部账号请求时显示） */}
+      {(summary.externalPoolBilling?.requests ?? 0) > 0 && (
+        <ExternalPoolBillingPanel
+          billing={summary.externalPoolBilling!}
+          billingByPool={summary.externalPoolBillingByPool ?? []}
+        />
+      )}
+
+      {/* 8. 状态分布 + 用量来源 */}
+      {(summary.statusBreakdown?.length > 0 || summary.usageSourceBreakdown?.length > 0) && (
+        <div className="grid gap-3 xl:grid-cols-2">
+          <BreakdownPanel
+            title="状态分布"
+            description="成功、超时、客户端错误等整体占比"
+            items={summary.statusBreakdown ?? []}
+            emptyText="暂无状态样本。"
+          />
+          <BreakdownPanel
+            title="用量来源"
+            description="用量来自服务返回、缓存展示或系统补充的占比"
+            items={summary.usageSourceBreakdown ?? []}
+            emptyText="暂无来源样本。"
+          />
+        </div>
+      )}
+
+      {/* 9. 底部状态栏 */}
       <div className="rounded-xl border border-border bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">
         <div className="flex flex-wrap items-center gap-2">
           <span>总览 · {selectedWindow.label}</span>
