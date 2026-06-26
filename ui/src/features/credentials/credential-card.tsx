@@ -3,7 +3,6 @@ import {
   ChevronUp,
   Eye,
   EyeOff,
-  Gauge,
   RefreshCw,
   RotateCcw,
   Router,
@@ -51,7 +50,6 @@ import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
 import {
   accountInfoValue,
   authLabel,
-  concurrencyLimitLabel,
   credentialLabel,
   dispatchStatusLabel,
   endpointLabel,
@@ -83,15 +81,24 @@ function SecretInput({
   )
 }
 
-function SummaryCell({ label, value, error }: { label: string; value: React.ReactNode; error?: boolean }) {
-  return (
-    <div className="flex flex-col gap-0.5 min-w-0">
+function SummaryCell({ label, value, error, onClick }: { label: string; value: React.ReactNode; error?: boolean; onClick?: () => void }) {
+  const content = (
+    <>
       <span className="text-[0.65rem] font-medium text-muted-foreground uppercase tracking-wide truncate">{label}</span>
-      <span className={`text-xs font-semibold tabular truncate ${error ? 'text-destructive' : 'text-foreground'}`}>
+      <span className={`text-xs font-semibold tabular truncate ${error ? 'text-destructive' : onClick ? 'text-primary' : 'text-foreground'}`}>
         {value}
       </span>
-    </div>
+    </>
   )
+  if (onClick) {
+    return (
+      <button type="button" onClick={onClick} title={`修改${label}`}
+        className="flex flex-col gap-0.5 min-w-0 items-start rounded px-1 -mx-1 text-left transition-colors hover:bg-muted/60">
+        {content}
+      </button>
+    )
+  }
+  return <div className="flex flex-col gap-0.5 min-w-0">{content}</div>
 }
 
 function MetaItem({ label, value, detail, error }: {
@@ -118,12 +125,12 @@ export interface CredentialCardProps {
   onTest: (credential: CredentialStatusItem) => void
   balance?: BalanceResponse
   loadingBalance: boolean
+  expanded: boolean
 }
 
 export function CredentialCard({
-  credential, selected, onToggleSelect, onQueryBalance, onTest, balance, loadingBalance,
+  credential, selected, onToggleSelect, onQueryBalance, onTest, balance, loadingBalance, expanded,
 }: CredentialCardProps) {
-  const [expanded, setExpanded] = useState(false)
   const [editingPriority, setEditingPriority] = useState(false)
   const [editingProxy, setEditingProxy] = useState(false)
   const [editingConcurrency, setEditingConcurrency] = useState(false)
@@ -331,15 +338,12 @@ export function CredentialCard({
               }
             )}
           />
-          <Button variant="ghost" size="icon-sm" onClick={() => setExpanded((v) => !v)} title={expanded ? '收起' : '展开'}>
-            {expanded ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
-          </Button>
         </div>
       </div>
 
       {/* ── Summary Row ── */}
       <div className="grid grid-cols-5 gap-2 border-t border-border/50 px-3 py-2">
-        <SummaryCell label="优先级" value={credential.priority} />
+        <SummaryCell label="优先级" value={credential.priority} onClick={() => setEditingPriority(true)} />
         <SummaryCell
           label="并发"
           value={
@@ -348,6 +352,7 @@ export function CredentialCard({
               : `${credential.inFlightRequests}/∞`
           }
           error={credential.maxConcurrentRequests > 0 && credential.inFlightRequests >= credential.maxConcurrentRequests}
+          onClick={() => setEditingConcurrency(true)}
         />
         <SummaryCell label="调度" value={dispatchStatus} error={dispatchStatus !== '可调度'} />
         <SummaryCell label="成功" value={formatNumber(credential.successCount)} />
@@ -424,32 +429,24 @@ export function CredentialCard({
           <div>
             <div className="mb-2 text-[0.68rem] font-semibold text-muted-foreground uppercase tracking-wide">调度 / 运行态</div>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-              <div className="flex items-center gap-3">
-                {credential.maxConcurrentRequests > 0 ? (
-                  <ProgressRing
-                    value={concurrencyPct}
-                    size={44}
-                    strokeWidth={5}
-                    color={ringColor}
-                    label={<span className="text-[0.6rem] tabular">{credential.inFlightRequests}</span>}
+              {credential.inFlightRequests > 0 && (
+                <div className="flex items-center gap-3">
+                  {credential.maxConcurrentRequests > 0 ? (
+                    <ProgressRing
+                      value={concurrencyPct}
+                      size={44}
+                      strokeWidth={5}
+                      color={ringColor}
+                      label={<span className="text-[0.6rem] tabular">{credential.inFlightRequests}</span>}
+                    />
+                  ) : null}
+                  <MetaItem
+                    label="在途请求"
+                    value={`${credential.inFlightRequests}${credential.maxConcurrentRequests > 0 ? `/${credential.maxConcurrentRequests}` : ' / ∞'}`}
+                    detail={`最老 ${credential.oldestInFlightAgeSecs}s · 闲置 ${credential.newestInFlightIdleSecs}s`}
                   />
-                ) : null}
-                <MetaItem
-                  label="并发"
-                  value={
-                    <button type="button" className="text-primary hover:underline text-sm font-semibold"
-                      onClick={() => setEditingConcurrency(true)}>
-                      {credential.inFlightRequests}{credential.maxConcurrentRequests > 0 ? `/${credential.maxConcurrentRequests}` : ' / ∞'}
-                    </button>
-                  }
-                  detail={
-                    credential.inFlightRequests > 0
-                      ? `最老 ${credential.oldestInFlightAgeSecs}s · 闲置 ${credential.newestInFlightIdleSecs}s`
-                      : concurrencyLimitLabel(credential)
-                  }
-                />
-              </div>
-              <MetaItem label="调度状态" value={dispatchStatus} error={dispatchStatus !== '可调度'} />
+                </div>
+              )}
               <MetaItem label="近期错误率" value={`${(recentErrorRate * 100).toFixed(1)}%`} error={recentErrorRate > 0} />
               <MetaItem label="延迟 EWMA" value={credential.latencyEwmaMs == null ? '未知' : `${Math.round(credential.latencyEwmaMs)}ms`} />
               <MetaItem label="调度评分" value={schedulerScore.toFixed(2)} />
@@ -569,22 +566,6 @@ export function CredentialCard({
               <span className="text-muted-foreground">{credential.lastErrorKind}: {credential.lastErrorReason}</span>
             </div>
           )}
-
-          {/* 操作扩展 */}
-          <div className="flex flex-wrap gap-1 pt-1 border-t border-border/50">
-            <Button type="button" variant="ghost" size="xs" onClick={() => setEditingPriority(true)}>
-              <Gauge className="h-3.5 w-3.5" /> 修改优先级
-            </Button>
-            <Button type="button" variant="ghost" size="xs" onClick={() => setEditingConcurrency(true)}>
-              修改并发
-            </Button>
-            <Button type="button" variant="ghost" size="xs" onClick={() => setEditingRegions(true)}>
-              修改 Region
-            </Button>
-            <Button type="button" variant="ghost" size="xs" onClick={() => { resetProxyDraft(); setEditingProxy(true) }}>
-              <Router className="h-3.5 w-3.5" /> 绑定代理
-            </Button>
-          </div>
         </div>
       )}
 

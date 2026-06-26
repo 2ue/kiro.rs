@@ -1,6 +1,8 @@
 import {
   CheckCircle2,
+  ChevronDown,
   ChevronRight,
+  ChevronUp,
   Download,
   FileUp,
   Filter,
@@ -122,6 +124,7 @@ const SORT_OPTIONS: Array<{ value: CredentialSortBy; label: string }> = [
 
 export function CredentialsPage() {
   const [page, setPage] = useState(1)
+  const [allExpanded, setAllExpanded] = useState(true)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [queryText, setQueryText] = useState('')
   const [statusFilter, setStatusFilter] = useState('__all__')
@@ -632,15 +635,21 @@ export function CredentialsPage() {
             </span>
             {credentials.isFetching && !credentials.isLoading && <Spinner size="sm" />}
           </div>
-          {disabledCount > 0 && (
-            <Button
-              variant="outline" size="xs"
-              className="text-destructive hover:bg-destructive/10"
-              onClick={clearAllDisabled}
-            >
-              <Trash2 className="h-3.5 w-3.5" />清除全部已禁用 ({disabledCount})
+          <div className="flex items-center gap-2">
+            <Button variant="ghost" size="xs" onClick={() => setAllExpanded((v) => !v)}>
+              {allExpanded ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+              {allExpanded ? '收起全部' : '展开全部'}
             </Button>
-          )}
+            {disabledCount > 0 && (
+              <Button
+                variant="outline" size="xs"
+                className="text-destructive hover:bg-destructive/10"
+                onClick={clearAllDisabled}
+              >
+                <Trash2 className="h-3.5 w-3.5" />清除全部已禁用 ({disabledCount})
+              </Button>
+            )}
+          </div>
         </div>
 
         {/* Credential list */}
@@ -670,6 +679,7 @@ export function CredentialsPage() {
                 onQueryBalance={() => {}}
                 onTest={setTestingCredential}
                 loadingBalance={false}
+                expanded={allExpanded}
               />
             ))}
           </div>
