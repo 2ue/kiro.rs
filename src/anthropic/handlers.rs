@@ -194,6 +194,7 @@ struct CredentialUsageContext {
     sticky_bound: bool,
     fallback_from_sticky: bool,
     credential_attempts: Vec<KiroCredentialAttempt>,
+    error_metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1076,6 +1077,7 @@ impl RequestUsageContext {
             sticky_bound,
             fallback_from_sticky,
             credential_attempts,
+            error_metadata: None,
         }
     }
 
@@ -1418,6 +1420,13 @@ fn public_error_response(
 }
 
 impl CredentialUsageContext {
+    fn with_error_metadata(mut self, error_metadata: Option<serde_json::Value>) -> Self {
+        if error_metadata.is_some() {
+            self.error_metadata = error_metadata;
+        }
+        self
+    }
+
     fn scope(&self) -> Option<PromptCacheScope> {
         Some(PromptCacheScope {
             credential_id: self.credential_id?,
@@ -1779,11 +1788,19 @@ impl CredentialUsageContext {
             error_status_code,
             error_source,
             error_id,
-            error_metadata: None,
+            error_metadata: self.error_metadata.clone(),
             payload_breakdown,
             payload_guard_report,
         });
     }
+}
+
+fn provider_error_metadata(err: &Error) -> Option<serde_json::Value> {
+    let selection_failure = KiroProvider::selection_failure_from_error(err)?;
+    serde_json::to_value(json!({
+        "selectionFailure": selection_failure
+    }))
+    .ok()
 }
 
 fn should_persist_payload_diagnostics(
@@ -3628,6 +3645,7 @@ async fn handle_stream_request(
                         Err(err) => {
                             usage_context
                             .attach_provider_error_credential(&provider, &message, attempts)
+                            .with_error_metadata(provider_error_metadata(&e))
                             .record_failure(
                                 UsageRecordStatus::Error,
                                 "payload_guard_error",
@@ -3738,6 +3756,9 @@ async fn handle_stream_request(
                                                             &rescue_message,
                                                             all_attempts,
                                                         )
+                                                        .with_error_metadata(provider_error_metadata(
+                                                            &rescue_error,
+                                                        ))
                                                         .record_failure(
                                                             UsageRecordStatus::Error,
                                                             "api_error",
@@ -3767,6 +3788,7 @@ async fn handle_stream_request(
                                     &retry_message,
                                     all_attempts,
                                 )
+                                .with_error_metadata(provider_error_metadata(&retry_error))
                                 .record_failure(
                                     UsageRecordStatus::Error,
                                     "api_error",
@@ -3851,6 +3873,9 @@ async fn handle_stream_request(
                                                     &rescue_message,
                                                     all_attempts,
                                                 )
+                                                .with_error_metadata(provider_error_metadata(
+                                                    &rescue_error,
+                                                ))
                                                 .record_failure(
                                                     UsageRecordStatus::Error,
                                                     "api_error",
@@ -3876,6 +3901,7 @@ async fn handle_stream_request(
                     let error_id = usage_context.error_id.clone();
                     usage_context
                         .attach_provider_error_credential(&provider, &message, attempts)
+                        .with_error_metadata(provider_error_metadata(&e))
                         .record_failure(UsageRecordStatus::Error, "api_error", message);
                     return map_provider_error(
                         e,
@@ -4497,6 +4523,7 @@ async fn handle_non_stream_request(
                         Err(err) => {
                             usage_context
                             .attach_provider_error_credential(&provider, &message, attempts)
+                            .with_error_metadata(provider_error_metadata(&e))
                             .record_failure(
                                 UsageRecordStatus::Error,
                                 "payload_guard_error",
@@ -4607,6 +4634,9 @@ async fn handle_non_stream_request(
                                                             &rescue_message,
                                                             all_attempts,
                                                         )
+                                                        .with_error_metadata(provider_error_metadata(
+                                                            &rescue_error,
+                                                        ))
                                                         .record_failure(
                                                             UsageRecordStatus::Error,
                                                             "api_error",
@@ -4636,6 +4666,7 @@ async fn handle_non_stream_request(
                                     &retry_message,
                                     all_attempts,
                                 )
+                                .with_error_metadata(provider_error_metadata(&retry_error))
                                 .record_failure(
                                     UsageRecordStatus::Error,
                                     "api_error",
@@ -4720,6 +4751,9 @@ async fn handle_non_stream_request(
                                                     &rescue_message,
                                                     all_attempts,
                                                 )
+                                                .with_error_metadata(provider_error_metadata(
+                                                    &rescue_error,
+                                                ))
                                                 .record_failure(
                                                     UsageRecordStatus::Error,
                                                     "api_error",
@@ -4745,6 +4779,7 @@ async fn handle_non_stream_request(
                     let error_id = usage_context.error_id.clone();
                     usage_context
                         .attach_provider_error_credential(&provider, &message, attempts)
+                        .with_error_metadata(provider_error_metadata(&e))
                         .record_failure(UsageRecordStatus::Error, "api_error", message);
                     return map_provider_error(
                         e,
@@ -5534,8 +5569,12 @@ mod tests {
     use crate::anthropic::prompt_cache_creation_control::PromptCacheCreationController;
     use crate::anthropic::types::{Message, SystemMessage};
     use crate::anthropic::usage::{UsageRecordQuery, UsageRecorder};
+    use crate::kiro::call_trace::{
+        AccountRejectReason, KiroCallError, SelectionFailureStage, SelectionFailureSummary,
+    };
     use crate::kiro::model::events::MetadataTokenUsage;
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     fn messages_request_for_model(model: &str) -> MessagesRequest {
         MessagesRequest {
@@ -6506,6 +6545,12 @@ mod tests {
         };
         usage_context
             .attach_credential(Some(hint.id), hint.label, false, false, Vec::new())
+            .with_error_metadata(Some(json!({
+                "selectionFailure": {
+                    "stage": "rpm_limit",
+                    "primaryReason": "rpm_limited"
+                }
+            })))
             .record_failure(UsageRecordStatus::Error, "api_error", "upstream failed");
 
         let records = usage_recorder.query(Default::default()).records;
@@ -6517,6 +6562,49 @@ mod tests {
         );
         assert_eq!(records[0].error_id.as_deref(), Some("req_01error_hint"));
         assert_eq!(records[0].error_source.as_deref(), Some("local_account"));
+        assert_eq!(
+            records[0]
+                .error_metadata
+                .as_ref()
+                .and_then(|value| value.pointer("/selectionFailure/primaryReason"))
+                .and_then(|value| value.as_str()),
+            Some("rpm_limited")
+        );
+    }
+
+    #[test]
+    fn provider_error_metadata_wraps_selection_failure_without_error_id_duplication() {
+        let mut reason_counts = BTreeMap::new();
+        reason_counts.insert(AccountRejectReason::RpmLimited, 3);
+        let summary = SelectionFailureSummary {
+            request_id: "req_selection".to_string(),
+            route: "/cc/v1/messages".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
+            stage: SelectionFailureStage::RpmLimit,
+            primary_reason: AccountRejectReason::RpmLimited,
+            rejected_account_count: 3,
+            waitable_account_count: 3,
+            retry_after_ms: Some(1000),
+            reason_counts,
+            sampled_accounts: Vec::new(),
+            dispatch_wait_ms: None,
+            queue_depth: 0,
+            global_in_flight: 0,
+        };
+        let err: Error = KiroCallError::new("local selection failed", Vec::new())
+            .with_selection_failure(Some(summary))
+            .into();
+
+        let metadata = provider_error_metadata(&err).expect("selection failure metadata");
+
+        assert_eq!(
+            metadata
+                .pointer("/selectionFailure/primaryReason")
+                .and_then(|value| value.as_str()),
+            Some("rpm_limited")
+        );
+        assert!(metadata.pointer("/errorId").is_none());
+        assert!(metadata.pointer("/selectionFailure/errorId").is_none());
     }
 
     #[tokio::test]

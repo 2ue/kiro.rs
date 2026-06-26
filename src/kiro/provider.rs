@@ -19,7 +19,9 @@ use tokio::time::sleep;
 use crate::http_client::{
     ProxyConfig, build_client, response_text_with_body_timeout, send_with_response_header_timeout,
 };
-use crate::kiro::call_trace::{KiroCallError, KiroCredentialAttempt, summarize_attempts};
+use crate::kiro::call_trace::{
+    KiroCallError, KiroCredentialAttempt, SelectionFailureSummary, summarize_attempts,
+};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::{KiroAvailableModel, KiroAvailableModelsResponse};
@@ -372,6 +374,7 @@ mod tests {
     use chrono::{Duration, Utc};
 
     use super::{CredentialRiskControlReason, KiroProvider, KiroStreamCompletion};
+    use crate::kiro::call_trace::{AccountRejectReason, SelectionFailureStage};
     use crate::kiro::endpoint::{IdeEndpoint, KiroEndpoint};
     use crate::kiro::model::credentials::KiroCredentials;
     use crate::kiro::token_manager::MultiTokenManager;
@@ -774,6 +777,55 @@ mod tests {
             err
         );
     }
+
+    #[tokio::test]
+    async fn api_local_acquire_failure_attaches_selection_summary() {
+        let mut config = Config::default();
+        config.credential_retry_max_attempts = 100_000;
+
+        let mut disabled = KiroCredentials::default();
+        disabled.disabled = true;
+        disabled.access_token = Some("secret-token-should-not-leak".to_string());
+        let manager =
+            Arc::new(MultiTokenManager::new(config, vec![disabled], None, None, false).unwrap());
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        endpoints.insert("ide".to_string(), Arc::new(IdeEndpoint));
+        let provider = KiroProvider::with_proxy(manager, None, endpoints, "ide".to_string());
+        let body = r#"{
+            "conversationState": {
+                "currentMessage": {
+                    "userInputMessage": {
+                        "modelId": "claude-sonnet-4.5"
+                    }
+                }
+            }
+        }"#;
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            provider.call_api_with_context_with_request_id(body, Some("req-selection-1")),
+        )
+        .await
+        .expect("本地无可用账号时 API 不应跑满 retry 上限")
+        .err()
+        .unwrap();
+
+        let summary = KiroProvider::selection_failure_from_error(&err)
+            .expect("API 调度失败应携带结构化选择失败摘要");
+        assert_eq!(summary.request_id, "req-selection-1");
+        assert_eq!(summary.route, "local_account");
+        assert_eq!(summary.model, "claude-sonnet-4.5");
+        assert_eq!(summary.stage, SelectionFailureStage::AccountEligibility);
+        assert_eq!(summary.primary_reason, AccountRejectReason::Disabled);
+        assert_eq!(
+            summary.reason_counts.get(&AccountRejectReason::Disabled),
+            Some(&1)
+        );
+        assert_eq!(summary.sampled_accounts.len(), 1);
+
+        let serialized = serde_json::to_string(&summary).unwrap();
+        assert!(!serialized.contains("secret-token-should-not-leak"));
+    }
 }
 
 impl KiroProvider {
@@ -883,11 +935,26 @@ impl KiroProvider {
             .unwrap_or_default()
     }
 
+    pub fn selection_failure_from_error(err: &anyhow::Error) -> Option<SelectionFailureSummary> {
+        err.downcast_ref::<KiroCallError>()
+            .and_then(|err| err.selection_failure().cloned())
+    }
+
     fn traced_error(
         message: impl Into<String>,
         attempts: &[KiroCredentialAttempt],
     ) -> anyhow::Error {
         KiroCallError::new(message, attempts.to_vec()).into()
+    }
+
+    fn traced_error_with_selection_failure(
+        message: impl Into<String>,
+        attempts: &[KiroCredentialAttempt],
+        selection_failure: Option<SelectionFailureSummary>,
+    ) -> anyhow::Error {
+        KiroCallError::new(message, attempts.to_vec())
+            .with_selection_failure(selection_failure)
+            .into()
     }
 
     fn push_attempt(
@@ -2090,6 +2157,7 @@ impl KiroProvider {
         let max_retries =
             Self::max_retry_attempts(total_credentials, &self.token_manager.runtime_config());
         let mut last_error: Option<anyhow::Error> = None;
+        let mut last_selection_failure: Option<SelectionFailureSummary> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
         let mut attempts: Vec<KiroCredentialAttempt> = Vec::new();
@@ -2113,7 +2181,14 @@ impl KiroProvider {
             {
                 Ok(c) => c,
                 Err(e) => {
+                    let selection_failure = self.token_manager.selection_failure_summary(
+                        request_id.unwrap_or_default(),
+                        "local_account",
+                        model.as_deref(),
+                        &e.to_string(),
+                    );
                     if last_error.is_none() {
+                        last_selection_failure = Some(selection_failure);
                         last_error = Some(e);
                     } else {
                         tracing::warn!(
@@ -2943,7 +3018,11 @@ impl KiroProvider {
                 api_type, max_retries
             )
         });
-        Err(Self::traced_error(message, &attempts))
+        Err(Self::traced_error_with_selection_failure(
+            message,
+            &attempts,
+            last_selection_failure,
+        ))
     }
 
     /// 从请求体中提取模型信息

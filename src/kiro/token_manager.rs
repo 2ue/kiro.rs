@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, Notify};
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
@@ -19,6 +19,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client, send_with_response_header_timeout};
+use crate::kiro::call_trace::{
+    AccountRejectReason, RejectedAccountSample, SelectionFailureStage, SelectionFailureSummary,
+};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
@@ -1229,6 +1232,7 @@ const SCHEDULER_REDIS_HOT_OP_TIMEOUT: StdDuration = StdDuration::from_millis(75)
 const SCHEDULER_REDIS_DEGRADED_BACKOFF: StdDuration = StdDuration::from_secs(2);
 const LOCAL_POOL_ROUTE_STATE_CACHE_TTL: StdDuration = StdDuration::from_millis(250);
 const LOCAL_POOL_ROUTE_STATE_CACHE_MAX_KEYS: usize = 128;
+const SELECTION_FAILURE_SAMPLE_LIMIT: usize = 20;
 const CREDENTIAL_STATS_FLUSH_MIN_INTERVAL: StdDuration = StdDuration::from_secs(5);
 const SELECTION_WINDOW_10S: StdDuration = StdDuration::from_secs(10);
 const SELECTION_WINDOW_60S: StdDuration = StdDuration::from_secs(60);
@@ -1992,6 +1996,198 @@ impl MultiTokenManager {
         }
         self.store_local_pool_route_state_cache(cache_key, state.clone(), Instant::now());
         state
+    }
+
+    pub fn selection_failure_summary(
+        &self,
+        request_id: impl Into<String>,
+        route: impl Into<String>,
+        model: Option<&str>,
+        error_message: &str,
+    ) -> SelectionFailureSummary {
+        let state = self.compute_local_pool_route_state(model);
+        let (stage, primary_reason) =
+            Self::selection_failure_stage_and_reason(&state, error_message);
+        let (reason_counts, sampled_accounts, rejected_account_count, waitable_account_count) =
+            self.selection_failure_account_breakdown(model);
+        let retry_after_ms = state.retry_after_secs.map(|secs| secs.saturating_mul(1000));
+
+        SelectionFailureSummary {
+            request_id: request_id.into(),
+            route: route.into(),
+            model: model.unwrap_or("").to_string(),
+            stage,
+            primary_reason,
+            rejected_account_count,
+            waitable_account_count,
+            retry_after_ms,
+            reason_counts,
+            sampled_accounts,
+            dispatch_wait_ms: None,
+            queue_depth: state.queued_requests,
+            global_in_flight: state.global_in_flight_requests,
+        }
+    }
+
+    fn selection_failure_stage_and_reason(
+        state: &LocalPoolRouteState,
+        error_message: &str,
+    ) -> (SelectionFailureStage, AccountRejectReason) {
+        if error_message.contains("等待队列已满") {
+            return (
+                SelectionFailureStage::DispatchQueue,
+                AccountRejectReason::GlobalConcurrencyFull,
+            );
+        }
+        if error_message.contains("排队等待超时") {
+            return (
+                SelectionFailureStage::DispatchWait,
+                if state.global_max_concurrent_requests > 0
+                    && state.global_in_flight_requests >= state.global_max_concurrent_requests
+                {
+                    AccountRejectReason::GlobalConcurrencyFull
+                } else {
+                    AccountRejectReason::AccountConcurrencyFull
+                },
+            );
+        }
+        if error_message.contains("临时排除") {
+            return (
+                SelectionFailureStage::StickyBinding,
+                AccountRejectReason::StickyTargetUnavailable,
+            );
+        }
+
+        match state.kind {
+            LocalPoolRouteStateKind::NoCredentials => (
+                SelectionFailureStage::AccountEligibility,
+                AccountRejectReason::NoAccounts,
+            ),
+            LocalPoolRouteStateKind::AllDisabled => (
+                SelectionFailureStage::AccountEligibility,
+                AccountRejectReason::Disabled,
+            ),
+            LocalPoolRouteStateKind::NoModelCompatible => (
+                SelectionFailureStage::ModelEligibility,
+                AccountRejectReason::ModelNotSupported,
+            ),
+            LocalPoolRouteStateKind::ProxyBlocked => (
+                SelectionFailureStage::RouteValidation,
+                AccountRejectReason::ProxyUnavailable,
+            ),
+            LocalPoolRouteStateKind::AllCoolingDown => {
+                if state.rate_limit_blocked >= state.cooldown_blocked {
+                    (
+                        SelectionFailureStage::RpmLimit,
+                        AccountRejectReason::RpmLimited,
+                    )
+                } else {
+                    (
+                        SelectionFailureStage::Cooldown,
+                        AccountRejectReason::CooldownActive,
+                    )
+                }
+            }
+            LocalPoolRouteStateKind::CapacityFull => {
+                if state.global_max_concurrent_requests > 0
+                    && state.global_in_flight_requests >= state.global_max_concurrent_requests
+                {
+                    (
+                        SelectionFailureStage::GlobalConcurrency,
+                        AccountRejectReason::GlobalConcurrencyFull,
+                    )
+                } else {
+                    (
+                        SelectionFailureStage::AccountConcurrency,
+                        AccountRejectReason::AccountConcurrencyFull,
+                    )
+                }
+            }
+            LocalPoolRouteStateKind::Ready => (
+                SelectionFailureStage::AccountEligibility,
+                AccountRejectReason::Unknown,
+            ),
+        }
+    }
+
+    fn selection_failure_account_breakdown(
+        &self,
+        model: Option<&str>,
+    ) -> (
+        BTreeMap<AccountRejectReason, usize>,
+        Vec<RejectedAccountSample>,
+        usize,
+        usize,
+    ) {
+        let entries = self.entries.lock();
+        let proxy_resources = self.proxy_resources.lock();
+        let config = self.config.lock().clone();
+        let now = Instant::now();
+        let global_in_flight = entries
+            .iter()
+            .map(|entry| entry.in_flight_requests)
+            .sum::<u32>();
+        let global_has_capacity = Self::global_has_concurrency_capacity(
+            global_in_flight,
+            config.dispatch_global_max_concurrent_requests,
+        );
+        let global_rpm = config.credential_rpm.unwrap_or(0);
+        let mut reason_counts: BTreeMap<AccountRejectReason, usize> = BTreeMap::new();
+        let mut sampled_accounts = Vec::new();
+        let mut rejected_account_count = 0usize;
+        let mut waitable_account_count = 0usize;
+
+        for entry in entries.iter() {
+            let (reason, cooldown_remaining) = if entry.disabled {
+                (AccountRejectReason::Disabled, None)
+            } else if Self::is_opus_model(model) && !entry.credentials.supports_opus() {
+                (AccountRejectReason::ModelNotSupported, None)
+            } else if !Self::credential_proxy_is_dispatchable(&entry.credentials, &proxy_resources)
+            {
+                (AccountRejectReason::ProxyUnavailable, None)
+            } else if let Some(remaining) = Self::entry_cooldown_remaining(entry, model, now) {
+                (AccountRejectReason::CooldownActive, Some(remaining))
+            } else if Self::entry_rate_limit_remaining(entry, now).is_some() {
+                waitable_account_count = waitable_account_count.saturating_add(1);
+                (AccountRejectReason::RpmLimited, None)
+            } else if !global_has_capacity {
+                waitable_account_count = waitable_account_count.saturating_add(1);
+                (AccountRejectReason::GlobalConcurrencyFull, None)
+            } else if !Self::entry_has_concurrency_capacity(
+                entry,
+                config.credential_max_concurrent_requests,
+            ) {
+                waitable_account_count = waitable_account_count.saturating_add(1);
+                (AccountRejectReason::AccountConcurrencyFull, None)
+            } else {
+                continue;
+            };
+
+            rejected_account_count = rejected_account_count.saturating_add(1);
+            *reason_counts.entry(reason).or_insert(0) += 1;
+
+            if sampled_accounts.len() < SELECTION_FAILURE_SAMPLE_LIMIT {
+                sampled_accounts.push(RejectedAccountSample {
+                    account_id: entry.id,
+                    reason,
+                    rpm_limit: Some(Self::effective_rpm(entry, global_rpm)),
+                    in_flight: Some(entry.in_flight_requests),
+                    max_concurrent: Some(Self::effective_max_concurrent_requests(
+                        entry,
+                        config.credential_max_concurrent_requests,
+                    )),
+                    cooldown_remaining_ms: cooldown_remaining
+                        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64),
+                });
+            }
+        }
+
+        (
+            reason_counts,
+            sampled_accounts,
+            rejected_account_count,
+            waitable_account_count,
+        )
     }
 
     fn compute_local_pool_route_state(&self, model: Option<&str>) -> LocalPoolRouteState {
@@ -9458,6 +9654,136 @@ mod tests {
         let ready_again = manager.local_pool_route_state(None);
         assert_eq!(ready_again.kind, LocalPoolRouteStateKind::Ready);
         assert_eq!(ready_again.dispatchable, 1);
+    }
+
+    #[tokio::test]
+    async fn selection_failure_summary_records_concurrency_full_accounts() {
+        let mut config = Config::default();
+        config.credential_max_concurrent_requests = 1;
+        let manager = MultiTokenManager::new(
+            config,
+            vec![test_access_token_credential("first", "Pro")],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut ctx = manager.acquire_context(None).await.unwrap();
+        let summary = manager.selection_failure_summary(
+            "req_concurrency",
+            "/cc/v1/messages",
+            None,
+            "凭据调度排队等待超时",
+        );
+
+        assert_eq!(summary.stage, SelectionFailureStage::DispatchWait);
+        assert_eq!(
+            summary.primary_reason,
+            AccountRejectReason::AccountConcurrencyFull
+        );
+        assert_eq!(
+            summary
+                .reason_counts
+                .get(&AccountRejectReason::AccountConcurrencyFull),
+            Some(&1)
+        );
+        assert_eq!(summary.sampled_accounts.len(), 1);
+        assert_eq!(
+            summary.sampled_accounts[0].reason,
+            AccountRejectReason::AccountConcurrencyFull
+        );
+
+        ctx.release_in_flight();
+    }
+
+    #[tokio::test]
+    async fn selection_failure_summary_records_rpm_limited_accounts() {
+        let mut config = Config::default();
+        config.credential_rpm = Some(60);
+        let manager = MultiTokenManager::new(
+            config,
+            vec![test_access_token_credential("first", "Pro")],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut ctx = manager.acquire_context(None).await.unwrap();
+        ctx.release_in_flight();
+        let summary = manager.selection_failure_summary(
+            "req_rpm",
+            "/cc/v1/messages",
+            None,
+            "本地限流 retry_after_secs=1",
+        );
+
+        assert_eq!(summary.stage, SelectionFailureStage::RpmLimit);
+        assert_eq!(summary.primary_reason, AccountRejectReason::RpmLimited);
+        assert_eq!(
+            summary.reason_counts.get(&AccountRejectReason::RpmLimited),
+            Some(&1)
+        );
+        assert_eq!(summary.waitable_account_count, 1);
+        assert!(summary.retry_after_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn selection_failure_summary_records_model_not_supported() {
+        let mut free = api_key_credential("ksk_selection_free");
+        free.subscription_title = Some("Free".to_string());
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![free], None, None, false).unwrap();
+
+        let summary = manager.selection_failure_summary(
+            "req_model",
+            "/cc/v1/messages",
+            Some("claude-opus-4-8"),
+            "没有支持当前模型的可用凭据",
+        );
+
+        assert_eq!(summary.stage, SelectionFailureStage::ModelEligibility);
+        assert_eq!(
+            summary.primary_reason,
+            AccountRejectReason::ModelNotSupported
+        );
+        assert_eq!(
+            summary
+                .reason_counts
+                .get(&AccountRejectReason::ModelNotSupported),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn selection_failure_summary_enforces_sample_limit_and_omits_secrets() {
+        let credentials = (0..100)
+            .map(|idx| {
+                let mut credential = api_key_credential(&format!("ksk_secret_selection_{idx:03}"));
+                credential.disabled = true;
+                credential
+            })
+            .collect::<Vec<_>>();
+        let manager =
+            MultiTokenManager::new(Config::default(), credentials, None, None, false).unwrap();
+
+        let summary = manager.selection_failure_summary(
+            "req_disabled",
+            "/cc/v1/messages",
+            None,
+            "所有凭据均已禁用",
+        );
+
+        assert_eq!(summary.rejected_account_count, 100);
+        assert_eq!(
+            summary.sampled_accounts.len(),
+            SELECTION_FAILURE_SAMPLE_LIMIT
+        );
+        let serialized = serde_json::to_string(&summary).unwrap();
+        assert!(!serialized.contains("ksk_secret_selection"));
+        assert!(!serialized.contains("access_token"));
+        assert!(!serialized.contains("refresh_token"));
     }
 
     #[tokio::test]
