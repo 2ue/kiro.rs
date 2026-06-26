@@ -450,25 +450,24 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
     return false
   }
 
-  const run = async () => {
-    if (!parsed.length) return
+  const runItems = async (items: AddCredentialRequest[], isRetry = false) => {
     setRunning(true); cancelRef.current = false
-    const newResults: ImportResult[] = parsed.map((_, i) => ({ index: i, status: 'pending' }))
-    setResults([...newResults])
+    const newResults: ImportResult[] = items.map((_, i) => ({ index: i, status: 'pending' }))
+    if (!isRetry) setResults([...newResults])
 
-    for (let i = 0; i < parsed.length; i++) {
+    for (let i = 0; i < items.length; i++) {
       if (cancelRef.current) break
-      const cred = parsed[i]
+      const cred = items[i]
       newResults[i] = { ...newResults[i], status: 'importing' }
-      setResults([...newResults])
+      if (!isRetry) setResults([...newResults])
       try {
-        const dup = await isDuplicate(cred)
-        if (dup) { newResults[i] = { ...newResults[i], status: 'skipped', error: '重复账号' }; setResults([...newResults]); continue }
+        const dup = !isRetry && await isDuplicate(cred)
+        if (dup) { newResults[i] = { ...newResults[i], status: 'skipped', error: '重复账号' }; if (!isRetry) setResults([...newResults]); continue }
         const res = await addCredential(cred)
         newResults[i] = { ...newResults[i], credentialId: res.credentialId, email: res.email }
         if (!skipVerify) {
           newResults[i].status = 'verifying'
-          setResults([...newResults])
+          if (!isRetry) setResults([...newResults])
           try {
             const verified = await verifyImportedCredential(res.credentialId, verifyMode)
             newResults[i] = { ...newResults[i], status: 'success', model: verified.model, response: verified.response }
@@ -482,8 +481,22 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
       } catch (e) {
         newResults[i] = { ...newResults[i], status: 'failed', error: extractErrorMessage(e) }
       }
-      setResults([...newResults])
+      if (!isRetry) setResults([...newResults])
     }
+
+    if (isRetry) {
+      // merge retry outcomes back into the full results list
+      setResults((prev) => {
+        let retryIdx = 0
+        return prev.map((r) => {
+          if (r.status === 'failed' && retryIdx < newResults.length) {
+            return { ...newResults[retryIdx++], index: r.index }
+          }
+          return r
+        })
+      })
+    }
+
     setRunning(false)
     const success = newResults.filter((r) => r.status === 'success').length
     const failed = newResults.filter((r) => r.status === 'failed').length
@@ -491,6 +504,11 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
     onDone()
     toast.success(`批量导入完成：成功 ${success}，失败 ${failed}，跳过 ${skipped}`)
   }
+
+  const run = () => { if (parsed.length) runItems(parsed) }
+
+  const failedItems = parsed.filter((_, i) => results[i]?.status === 'failed')
+  const retryFailed = () => { if (failedItems.length) runItems(failedItems, true) }
 
   const statusIcon = (s: ImportResult['status']) => {
     if (s === 'success') return <CheckCircle2 className="h-4 w-4 text-success" />
@@ -576,7 +594,12 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
                   <Play className="h-3.5 w-3.5" />开始导入
                 </Button>
               )}
-              {!running && results.every((r) => r.status !== 'pending') && (
+              {!running && failedItems.length > 0 && (
+                <Button size="sm" onClick={retryFailed}>
+                  <AlertCircle className="h-3.5 w-3.5" />重试失败账号 ({failedItems.length})
+                </Button>
+              )}
+              {!running && results.every((r) => r.status !== 'pending') && failedItems.length === 0 && (
                 <Button size="sm" onClick={onClose}>完成</Button>
               )}
             </div>
@@ -598,14 +621,22 @@ export function KamImportModal({ open, onClose, onDone }: {
 }) {
   const [text, setText] = useState('')
   const [accounts, setAccounts] = useState<KamAccount[]>([])
+  const [skipErrorAccounts, setSkipErrorAccounts] = useState(true)
+  const [verifyMode, setVerifyMode] = useState<ImportVerificationMode>('model_and_subscription')
   const [defaults, setDefaults] = useState(initialParameterDefaults)
   const [running, setRunning] = useState(false)
   const [results, setResults] = useState<ImportResult[]>([])
   const proxyResources = useProxyResources()
   const proxyOptions = proxyResources.data?.resources || []
 
+  const hasErrorAccounts = accounts.some((a) => a.status === 'error')
+
   useEffect(() => {
-    if (!open) { setText(''); setAccounts([]); setResults([]); setDefaults(initialParameterDefaults()); setRunning(false) }
+    if (!open) {
+      setText(''); setAccounts([]); setResults([])
+      setDefaults(initialParameterDefaults()); setRunning(false)
+      setSkipErrorAccounts(true); setVerifyMode('model_and_subscription')
+    }
   }, [open])
 
   const handleParse = () => {
@@ -631,13 +662,18 @@ export function KamImportModal({ open, onClose, onDone }: {
     } catch (e) { toast.error(`文件解析失败: ${extractErrorMessage(e)}`) }
   }
 
-  const run = async () => {
-    if (!accounts.length) return
+  const runAccounts = async (targetAccounts: KamAccount[], isRetry = false) => {
     setRunning(true)
-    const newResults: ImportResult[] = accounts.map((_, i) => ({ index: i, status: 'pending' }))
-    setResults([...newResults])
-    for (let i = 0; i < accounts.length; i++) {
-      const acc = accounts[i]
+    const newResults: ImportResult[] = targetAccounts.map((_, i) => ({ index: i, status: 'pending' }))
+    if (!isRetry) setResults([...newResults])
+    let skippedCount = 0
+    for (let i = 0; i < targetAccounts.length; i++) {
+      const acc = targetAccounts[i]
+      // skip error-status accounts if option enabled (only on first run, not retry)
+      if (!isRetry && skipErrorAccounts && acc.status === 'error') {
+        newResults[i] = { ...newResults[i], status: 'skipped', error: '跳过 error 状态账号' }
+        setResults([...newResults]); skippedCount++; continue
+      }
       newResults[i] = { ...newResults[i], status: 'importing' }
       setResults([...newResults])
       try {
@@ -656,7 +692,7 @@ export function KamImportModal({ open, onClose, onDone }: {
         newResults[i] = { ...newResults[i], credentialId: res.credentialId, email: res.email, status: 'verifying' }
         setResults([...newResults])
         try {
-          const verified = await verifyImportedCredential(res.credentialId, 'model_and_subscription')
+          const verified = await verifyImportedCredential(res.credentialId, verifyMode)
           newResults[i] = { ...newResults[i], status: 'success', model: verified.model, response: verified.response }
         } catch (ve) {
           await rollbackCredential(res.credentialId)
@@ -667,17 +703,34 @@ export function KamImportModal({ open, onClose, onDone }: {
       }
       setResults([...newResults])
     }
+    if (isRetry) {
+      setResults((prev) => {
+        let retryIdx = 0
+        return prev.map((r) => {
+          if (r.status === 'failed' && retryIdx < newResults.length) {
+            return { ...newResults[retryIdx++], index: r.index }
+          }
+          return r
+        })
+      })
+    }
     setRunning(false)
     const success = newResults.filter((r) => r.status === 'success').length
     const failed = newResults.filter((r) => r.status === 'failed').length
     onDone()
-    toast.success(`KAM 导入完成：成功 ${success}，失败 ${failed}`)
+    toast.success(`KAM 导入完成：成功 ${success}，失败 ${failed}，跳过 ${skippedCount}`)
   }
+
+  const run = () => { if (accounts.length) runAccounts(accounts) }
+
+  const failedAccounts = accounts.filter((_, i) => results[i]?.status === 'failed')
+  const retryFailed = () => { if (failedAccounts.length) runAccounts(failedAccounts, true) }
 
   const statusIcon = (s: ImportResult['status']) => {
     if (s === 'success') return <CheckCircle2 className="h-4 w-4 text-success" />
     if (s === 'failed') return <XCircle className="h-4 w-4 text-destructive" />
     if (s === 'importing' || s === 'verifying') return <Loader2 className="h-4 w-4 animate-spin text-primary" />
+    if (s === 'skipped') return <AlertCircle className="h-4 w-4 text-warning" />
     return <div className="h-4 w-4 rounded-full border border-border" />
   }
 
@@ -702,9 +755,42 @@ export function KamImportModal({ open, onClose, onDone }: {
         ) : (
           <>
             <div className="flex items-center justify-between">
-              <div className="text-sm">共 <span className="font-semibold">{accounts.length}</span> 个账号</div>
+              <div className="text-sm">
+                共 <span className="font-semibold">{accounts.length}</span> 个账号
+                {results.some((r) => r.status !== 'pending') && (
+                  <span className="ml-2 text-muted-foreground">
+                    成功 {results.filter((r) => r.status === 'success').length} · 失败 {results.filter((r) => r.status === 'failed').length} · 跳过 {results.filter((r) => r.status === 'skipped').length}
+                  </span>
+                )}
+              </div>
               {!running && <Button variant="ghost" size="xs" onClick={() => { setAccounts([]); setResults([]) }}>重新编辑</Button>}
             </div>
+            {/* 验活模式和跳过 error 选项（仅未开始时显示） */}
+            {results.every((r) => r.status === 'pending') && (
+              <div className="rounded-lg border border-border bg-muted/40 p-3 space-y-2">
+                <div className="text-sm font-semibold">导入选项</div>
+                <Select value={verifyMode} onValueChange={(v) => setVerifyMode(v as ImportVerificationMode)} disabled={running}>
+                  <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="model_and_subscription">测试模型 + 查询订阅</SelectItem>
+                    <SelectItem value="subscription_only">只查询订阅</SelectItem>
+                  </SelectContent>
+                </Select>
+                {hasErrorAccounts && (
+                  <div className="flex items-center gap-2">
+                    <Checkbox
+                      id="skip-error-accounts"
+                      checked={skipErrorAccounts}
+                      onCheckedChange={(v) => setSkipErrorAccounts(Boolean(v))}
+                      disabled={running}
+                    />
+                    <label htmlFor="skip-error-accounts" className="text-sm cursor-pointer">
+                      跳过 error 状态的账号（{accounts.filter((a) => a.status === 'error').length} 个）
+                    </label>
+                  </div>
+                )}
+              </div>
+            )}
             {running && <Progress value={Math.round((results.filter((r) => r.status !== 'pending').length / accounts.length) * 100)} className="h-1.5" />}
             <div className="max-h-64 overflow-y-auto scrollbar-thin space-y-1">
               {results.map((r, i) => (
@@ -723,7 +809,14 @@ export function KamImportModal({ open, onClose, onDone }: {
               {!running && results.some((r) => r.status === 'pending') && (
                 <Button size="sm" onClick={run}><Play className="h-3.5 w-3.5" />开始导入</Button>
               )}
-              {!running && results.every((r) => r.status !== 'pending') && <Button size="sm" onClick={onClose}>完成</Button>}
+              {!running && failedAccounts.length > 0 && (
+                <Button size="sm" onClick={retryFailed}>
+                  <AlertCircle className="h-3.5 w-3.5" />重试失败账号 ({failedAccounts.length})
+                </Button>
+              )}
+              {!running && results.every((r) => r.status !== 'pending') && failedAccounts.length === 0 && (
+                <Button size="sm" onClick={onClose}>完成</Button>
+              )}
             </div>
           </>
         )}
@@ -1017,7 +1110,10 @@ export function BatchVerifyModal({ open, verifying, progress, results, onCancel,
         </div>
         <div className="flex justify-end gap-2">
           {verifying ? (
-            <Button variant="outline" size="sm" onClick={onCancel}>取消</Button>
+            <>
+              <Button variant="ghost" size="sm" onClick={onClose}>后台运行</Button>
+              <Button variant="outline" size="sm" onClick={onCancel}>取消</Button>
+            </>
           ) : (
             <Button size="sm" onClick={onClose}>关闭</Button>
           )}

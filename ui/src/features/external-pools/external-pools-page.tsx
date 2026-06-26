@@ -351,6 +351,11 @@ export function ExternalPoolsPage() {
         <StatCard title="可调度" value={dispatchablePools} tone={dispatchablePools > 0 ? 'success' : 'warning'} />
         <StatCard title="外部并发" value={`${totalInFlight}/${totalCapacity || 0}`} tone="default" />
         <StatCard title="按入口规则" value={`${currentPathPoolCount} 个`} />
+        <StatCard
+          title="入口策略"
+          value={fallbackActive || directPolicyActive ? '已配置' : '未配置'}
+          tone={fallbackActive || directPolicyActive ? 'success' : 'warning'}
+        />
       </StatGrid>
 
       {/* Policy config section */}

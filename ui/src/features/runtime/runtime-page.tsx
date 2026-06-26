@@ -385,12 +385,12 @@ export function RuntimePage() {
 
       {/* 旧内容清理 */}
       <CollapseSection icon={<Wand2 />} title="旧内容清理" desc="历史消息、工具结果与网页内容的体积优化">
-        <PayloadHistorySection shaping={draft.payloadShaping} onChange={set('payloadShaping')} />
+        <PayloadHistorySection shaping={draft.payloadShaping} payloadSizeLimitEnabled={payloadSizeLimitEnabled} onChange={set('payloadShaping')} />
       </CollapseSection>
 
       {/* 当前内容兜底 */}
       <CollapseSection icon={<Wand2 />} title="当前内容兜底" desc="当前请求超阈值时压缩当前消息、文档与图片">
-        <PayloadFallbackSection shaping={draft.payloadShaping} onChange={set('payloadShaping')} />
+        <PayloadFallbackSection shaping={draft.payloadShaping} payloadShapingBranchEnabled={payloadSizeLimitEnabled && draft.payloadShaping.enabled} onChange={set('payloadShaping')} />
       </CollapseSection>
 
       {/* 缓存创建频次 */}

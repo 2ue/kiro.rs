@@ -50,6 +50,11 @@ export function ExternalPoolTestModal({
     return options
   }, [modelCapabilities.data?.models])
 
+  const selectedModelLabel = useMemo(
+    () => modelOptions.find((o) => o.id === model)?.label || model,
+    [model, modelOptions]
+  )
+
   useEffect(() => {
     if (!open) return
     setModel(DEFAULT_TEST_MODEL)
@@ -160,6 +165,11 @@ export function ExternalPoolTestModal({
               )}
               {!running && !result && !error && <div className="text-muted-foreground">等待开始测试</div>}
             </div>
+          </div>
+
+          <div className="flex flex-wrap justify-between gap-3 text-xs text-muted-foreground">
+            <span>测试模型：{selectedModelLabel}</span>
+            <span>提示词："{prompt.trim() || DEFAULT_TEST_PROMPT}"</span>
           </div>
         </div>
       )}

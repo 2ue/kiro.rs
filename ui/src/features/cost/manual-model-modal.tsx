@@ -19,6 +19,7 @@ export interface ManualModelForm {
   cacheCreationInputCostPerMillion: string
   cacheReadInputCostPerMillion: string
   clearPricing: boolean
+  includePricing: boolean
 }
 
 export function emptyForm(): ManualModelForm {
@@ -26,8 +27,8 @@ export function emptyForm(): ManualModelForm {
     model: '',
     displayName: '',
     description: '',
-    maxInputTokens: '',
-    maxOutputTokens: '',
+    maxInputTokens: '200000',
+    maxOutputTokens: '64000',
     supportsPromptCaching: false,
     supportedInputTypes: { TEXT: true, IMAGE: false },
     inputCostPerMillion: '',
@@ -35,6 +36,7 @@ export function emptyForm(): ManualModelForm {
     cacheCreationInputCostPerMillion: '',
     cacheReadInputCostPerMillion: '',
     clearPricing: false,
+    includePricing: false,
   }
 }
 
@@ -55,6 +57,7 @@ export function formFromCapability(item: ModelCapabilityItem, priceItem?: ModelP
     cacheCreationInputCostPerMillion: priceItem ? String(priceItem.pricing.cacheCreationInputTokenCost * 1_000_000) : '',
     cacheReadInputCostPerMillion: priceItem ? String(priceItem.pricing.cacheReadInputTokenCost * 1_000_000) : '',
     clearPricing: false,
+    includePricing: Boolean(priceItem),
   }
 }
 
@@ -115,10 +118,16 @@ export function ManualModelModal({
       maxOutputTokens: maxOutput,
       supportsPromptCaching: form.supportsPromptCaching,
       supportedInputTypes,
-      clearPricing: form.clearPricing,
+      clearPricing: isEdit ? form.clearPricing : !form.includePricing,
     }
 
-    if (!form.clearPricing && (form.inputCostPerMillion || form.outputCostPerMillion)) {
+    // 创建模式：includePricing=true 时才附价格
+    // 编辑模式：clearPricing=false 且有输入时附价格
+    const shouldAttachPricing = isEdit
+      ? !form.clearPricing && (form.inputCostPerMillion || form.outputCostPerMillion)
+      : form.includePricing && (form.inputCostPerMillion || form.outputCostPerMillion)
+
+    if (shouldAttachPricing) {
       const input = Number(form.inputCostPerMillion)
       const output = Number(form.outputCostPerMillion)
       if (!Number.isFinite(input) || input < 0 || !Number.isFinite(output) || output < 0) {
@@ -217,14 +226,19 @@ export function ManualModelModal({
         <div className="rounded-lg border border-border p-3 space-y-3">
           <div className="flex items-center justify-between">
             <span className="text-xs font-medium">价格配置（每百万 Token，USD）</span>
-            {isEdit && (
+            {isEdit ? (
               <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer">
                 <Switch checked={form.clearPricing} onCheckedChange={(v) => set('clearPricing', v)} />
                 清除价格
               </label>
+            ) : (
+              <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer">
+                <Switch checked={form.includePricing} onCheckedChange={(v) => set('includePricing', v)} />
+                同时配置计价
+              </label>
             )}
           </div>
-          {!form.clearPricing && (
+          {(isEdit ? !form.clearPricing : form.includePricing) && (
             <FieldGrid>
               <Field label="输入单价">
                 <Input type="number" min={0} step="0.000001" className="h-8 text-xs" value={form.inputCostPerMillion} onChange={(e) => set('inputCostPerMillion', e.target.value)} placeholder="3.00" />

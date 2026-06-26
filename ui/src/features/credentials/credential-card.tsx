@@ -322,6 +322,13 @@ export function CredentialCard({
             {epLabel && <Badge title={credential.endpoint}>{epLabel}</Badge>}
             {credential.hasProxy && <Badge tone="info">代理</Badge>}
             {typeof credential.maxConcurrentRequestsOverride === 'number' && <Badge tone="info">并发覆盖</Badge>}
+            {credential.hasProfileArn && <Badge tone="secondary">Profile ARN</Badge>}
+            {!credential.disabled && credential.cooledDown && credential.cooldownRemainingSecs > 0 && (
+              <Badge tone="error" title={credential.cooldownReason || undefined}>冷却 {credential.cooldownRemainingSecs}s</Badge>
+            )}
+            {!credential.disabled && credential.rateLimited && (
+              <Badge tone="warning">限流 {credential.rateLimitRemainingSecs}s</Badge>
+            )}
             {transientFailureStreak > 0 && <Badge tone="error">错误 {transientFailureStreak}</Badge>}
             {credential.warmupRemaining > 0 && <Badge tone="warning">预热 {credential.warmupRemaining}</Badge>}
           </div>
@@ -441,24 +448,30 @@ export function CredentialCard({
           <div>
             <div className="mb-2 text-[0.68rem] font-semibold text-muted-foreground uppercase tracking-wide">调度 / 运行态</div>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-              {credential.inFlightRequests > 0 && (
-                <div className="flex items-center gap-3">
-                  {credential.maxConcurrentRequests > 0 ? (
-                    <ProgressRing
-                      value={concurrencyPct}
-                      size={44}
-                      strokeWidth={5}
-                      color={ringColor}
-                      label={<span className="text-[0.6rem] tabular">{credential.inFlightRequests}</span>}
-                    />
-                  ) : null}
-                  <MetaItem
-                    label="在途请求"
-                    value={`${credential.inFlightRequests}${credential.maxConcurrentRequests > 0 ? `/${credential.maxConcurrentRequests}` : ' / ∞'}`}
-                    detail={`最老 ${credential.oldestInFlightAgeSecs}s · 闲置 ${credential.newestInFlightIdleSecs}s`}
+              <div className="flex items-center gap-3">
+                {credential.inFlightRequests > 0 && credential.maxConcurrentRequests > 0 ? (
+                  <ProgressRing
+                    value={concurrencyPct}
+                    size={44}
+                    strokeWidth={5}
+                    color={ringColor}
+                    label={<span className="text-[0.6rem] tabular">{credential.inFlightRequests}</span>}
                   />
-                </div>
-              )}
+                ) : null}
+                <MetaItem
+                  label="在途请求"
+                  value={`${credential.inFlightRequests}${credential.maxConcurrentRequests > 0 ? `/${credential.maxConcurrentRequests}` : ' / ∞'}`}
+                  detail={
+                    credential.inFlightRequests > 0
+                      ? `最老 ${credential.oldestInFlightAgeSecs}s · 闲置 ${credential.newestInFlightIdleSecs}s`
+                      : typeof credential.maxConcurrentRequestsOverride === 'number'
+                        ? `账号覆盖：${credential.maxConcurrentRequestsOverride}`
+                        : credential.maxConcurrentRequests > 0
+                          ? `继承全局：${credential.maxConcurrentRequests}`
+                          : '不限制'
+                  }
+                />
+              </div>
               <MetaItem label="近期错误率" value={`${(recentErrorRate * 100).toFixed(1)}%`} error={recentErrorRate > 0} />
               <MetaItem label="延迟 EWMA" value={credential.latencyEwmaMs == null ? '未知' : `${Math.round(credential.latencyEwmaMs)}ms`} />
               <MetaItem label="调度评分" value={schedulerScore.toFixed(2)} />

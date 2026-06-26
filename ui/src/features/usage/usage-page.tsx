@@ -443,8 +443,15 @@ function RecordsView({
                           <div className="text-muted-foreground/60">{formatPercent(rowReadRatio)} / {formatPercent(rowCachedRatio)}</div>
                         </TableCell>
                         {/* 费用 */}
-                        <TableCell className="text-right font-mono text-xs tabular-nums">
-                          {record.pricingAvailable ? formatUsd(record.estimatedCostUsd) : <span className="text-muted-foreground/40">—</span>}
+                        <TableCell className="text-right font-mono text-xs tabular-nums" onClick={(e) => e.stopPropagation()}>
+                          <button
+                            type="button"
+                            className="font-semibold tabular-nums underline-offset-2 hover:underline focus:outline-none focus:ring-2 focus:ring-primary/30"
+                            onClick={() => onViewDetail(record)}
+                            title="查看计费明细"
+                          >
+                            {record.pricingAvailable ? formatUsd(record.estimatedCostUsd) : <span className="text-muted-foreground/40">—</span>}
+                          </button>
                         </TableCell>
                         {/* 耗时 */}
                         <TableCell className="text-right font-mono text-xs tabular-nums">
@@ -617,7 +624,7 @@ export function UsagePage() {
         <StatCard
           title="估算费用"
           value={formatUsd(data?.totalEstimatedCostUsd ?? 0)}
-          desc={`计价覆盖 ${formatNumber(data?.pricedRequests ?? 0)} / ${formatNumber(data?.totalRequests ?? 0)}`}
+          desc={`计价覆盖 ${formatPercent(ratio(data?.pricedRequests ?? 0, data?.totalRequests ?? 1))}`}
           icon={<Clock3 />}
           tone="primary"
         />

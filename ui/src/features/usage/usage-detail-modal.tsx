@@ -116,6 +116,10 @@ export function UsageDetailModal({
             {record.routeKind === 'external_pool' && (
               <DetailField label="外部账号" value={`#${record.externalPoolId ?? '-'}${record.externalPoolName ? ' ' + record.externalPoolName : ''}`} />
             )}
+            <DetailField
+              label="路由"
+              value={`${routeLabel(record)} · ${record.routeKind || '-'}${record.routeSubtype ? ` · ${record.routeSubtype}` : ''}`}
+            />
           </div>
         </div>
 
@@ -174,8 +178,12 @@ export function UsageDetailModal({
                 <MetricTile label="上游响应头" value={formatLatency(record.latencyTrace.upstreamHeaderMs)} />
                 <MetricTile label="首个流分片" value={formatLatency(record.latencyTrace.firstUpstreamChunkMs)} />
                 <MetricTile label="首次输出" value={formatLatency(record.latencyTrace.firstOutputDeltaMs)} tone="success" />
+                <MetricTile label="分片到输出" value={formatLatency(record.latencyTrace.streamGapToFirstOutputMs)} />
                 {typeof record.latencyTrace.chunksBeforeFirstOutput === 'number' && (
                   <MetricTile label="输出前分片" value={formatNumber(record.latencyTrace.chunksBeforeFirstOutput)} />
+                )}
+                {typeof record.latencyTrace.eventsBeforeFirstOutput === 'number' && (
+                  <MetricTile label="输出前事件" value={formatNumber(record.latencyTrace.eventsBeforeFirstOutput)} />
                 )}
               </>
             )}

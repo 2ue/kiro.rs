@@ -440,6 +440,7 @@ function ModelPricingTable({
                                 cacheCreationInputCostPerMillion: priceItem ? String(priceItem.pricing.cacheCreationInputTokenCost * 1_000_000) : '',
                                 cacheReadInputCostPerMillion: priceItem ? String(priceItem.pricing.cacheReadInputTokenCost * 1_000_000) : '',
                                 clearPricing: false,
+                                includePricing: Boolean(priceItem),
                               }
                           onEdit(form)
                         }}

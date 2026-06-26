@@ -17,7 +17,7 @@ import {
 import { useAutoRefreshPreference } from '@/hooks/use-auto-refresh'
 import { useUsageDashboard } from '@/hooks/use-usage'
 import { useCredentialSummary } from '@/hooks/use-credentials'
-import { formatNumber, formatPercent, formatUsd } from '@/lib/format'
+import { formatDate, formatNumber, formatPercent, formatUsd } from '@/lib/format'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import type {
   UsageBreakdownItem,
@@ -61,6 +61,20 @@ import {
 
 const OVERVIEW_TIMEZONE = 'Asia/Shanghai'
 const OVERVIEW_AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:overview'
+
+const EMPTY_EXTERNAL_POOL_BILLING: UsageExternalPoolBillingSummary = {
+  requests: 0,
+  pricedRequests: 0,
+  unpricedRequests: 0,
+  costFloorAppliedRequests: 0,
+  rawCostUsd: 0,
+  shapedCostUsd: 0,
+  upliftedCostUsd: 0,
+  profitUsd: 0,
+  reportedCostUsd: 0,
+  billableCostUsd: 0,
+  costFloorDeltaUsd: 0,
+}
 
 type RankDimension = 'models' | 'credentials' | 'endpoints' | 'errors'
 
@@ -969,36 +983,34 @@ export function OverviewPage() {
       {/* 6. 维度排行 */}
       <DimensionRankPanel top={top} activeKey={rankDimension} onActiveKeyChange={setRankDimension} />
 
-      {/* 7. 外部账号计费拆分（仅当有外部账号请求时显示） */}
-      {(summary.externalPoolBilling?.requests ?? 0) > 0 && (
-        <ExternalPoolBillingPanel
-          billing={summary.externalPoolBilling!}
-          billingByPool={summary.externalPoolBillingByPool ?? []}
-        />
-      )}
+      {/* 7. 外部账号计费拆分（始终展示，无样本时为持平/0） */}
+      <ExternalPoolBillingPanel
+        billing={summary.externalPoolBilling ?? EMPTY_EXTERNAL_POOL_BILLING}
+        billingByPool={summary.externalPoolBillingByPool ?? []}
+      />
 
       {/* 8. 状态分布 + 用量来源 */}
-      {(summary.statusBreakdown?.length > 0 || summary.usageSourceBreakdown?.length > 0) && (
-        <div className="grid gap-3 xl:grid-cols-2">
-          <BreakdownPanel
-            title="状态分布"
-            description="成功、超时、客户端错误等整体占比"
-            items={summary.statusBreakdown ?? []}
-            emptyText="暂无状态样本。"
-          />
-          <BreakdownPanel
-            title="用量来源"
-            description="用量来自服务返回、缓存展示或系统补充的占比"
-            items={summary.usageSourceBreakdown ?? []}
-            emptyText="暂无来源样本。"
-          />
-        </div>
-      )}
+      <div className="grid gap-3 xl:grid-cols-2">
+        <BreakdownPanel
+          title="状态分布"
+          description="成功、超时、客户端错误等整体占比"
+          items={summary.statusBreakdown ?? []}
+          emptyText="暂无状态样本。"
+        />
+        <BreakdownPanel
+          title="用量来源"
+          description="用量来自服务返回、缓存展示或系统补充的占比"
+          items={summary.usageSourceBreakdown ?? []}
+          emptyText="暂无来源样本。"
+        />
+      </div>
 
       {/* 9. 底部状态栏 */}
       <div className="rounded-xl border border-border bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">
         <div className="flex flex-wrap items-center gap-2">
           <span>总览 · {selectedWindow.label}</span>
+          <span className="text-muted-foreground/40">·</span>
+          <span>{formatDate(selectedWindow.from)} — {formatDate(selectedWindow.to)}</span>
           <span className="text-muted-foreground/40">·</span>
           <span>时区 {OVERVIEW_TIMEZONE}</span>
           <span className="text-muted-foreground/40">·</span>
@@ -1010,7 +1022,7 @@ export function OverviewPage() {
           {data.generatedAt && (
             <>
               <span className="text-muted-foreground/40">·</span>
-              <span>数据生成于 {new Date(data.generatedAt).toLocaleTimeString('zh-CN')}</span>
+              <span>生成于 {formatDate(data.generatedAt)}</span>
             </>
           )}
         </div>

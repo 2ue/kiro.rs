@@ -61,38 +61,41 @@ function TwoCol({ children }: { children: React.ReactNode }) {
 // ─── 旧内容清理(payloadHistory) ───────────────────────────────────────────────
 
 export function PayloadHistorySection({
-  shaping, onChange,
+  shaping, payloadSizeLimitEnabled, onChange,
 }: {
   shaping: PayloadShapingConfig
+  payloadSizeLimitEnabled: boolean
   onChange: (next: PayloadShapingConfig) => void
 }) {
   const set = <K extends keyof PayloadShapingConfig>(key: K) => (v: PayloadShapingConfig[K]) =>
     onChange({ ...shaping, [key]: v })
+  // 子字段仅在 payloadSizeLimitEnabled && shaping.enabled 时可编辑
+  const branchEnabled = payloadSizeLimitEnabled && shaping.enabled
   return (
     <div className="space-y-4">
-      <TogField label="启用内容清理" desc="对历史消息做体积优化,降低上游压力" checked={shaping.enabled} onChange={set('enabled')} />
+      <TogField label="启用内容清理" desc="对历史消息做体积优化,降低上游压力" checked={shaping.enabled} disabled={!payloadSizeLimitEnabled} onChange={set('enabled')} />
       <TwoCol>
-        <TogField label="截短历史工具结果" desc="保留头尾,中间省略" checked={shaping.truncateHistoricalToolResults} onChange={set('truncateHistoricalToolResults')} />
-        <NumField label="历史工具结果保留字符" value={shaping.historicalToolResultMaxChars} min={0} suffix="字符" onChange={set('historicalToolResultMaxChars')} />
+        <TogField label="截短历史工具结果" desc="保留头尾,中间省略" checked={shaping.truncateHistoricalToolResults} disabled={!branchEnabled} onChange={set('truncateHistoricalToolResults')} />
+        <NumField label="历史工具结果保留字符" value={shaping.historicalToolResultMaxChars} min={0} suffix="字符" disabled={!branchEnabled} onChange={set('historicalToolResultMaxChars')} />
       </TwoCol>
       <TwoCol>
-        <NumField label="保留头部行数" value={shaping.historicalToolResultHeadLines} min={0} suffix="行" onChange={set('historicalToolResultHeadLines')} />
-        <NumField label="保留尾部行数" value={shaping.historicalToolResultTailLines} min={0} suffix="行" onChange={set('historicalToolResultTailLines')} />
+        <NumField label="保留头部行数" value={shaping.historicalToolResultHeadLines} min={0} suffix="行" disabled={!branchEnabled} onChange={set('historicalToolResultHeadLines')} />
+        <NumField label="保留尾部行数" value={shaping.historicalToolResultTailLines} min={0} suffix="行" disabled={!branchEnabled} onChange={set('historicalToolResultTailLines')} />
       </TwoCol>
       <TwoCol>
-        <TogField label="移除历史思考内容" desc="丢弃历史消息里的 thinking 块" checked={shaping.discardHistoricalThinking} onChange={set('discardHistoricalThinking')} />
-        <TogField label="压缩工具说明" desc="精简工具定义体积" checked={shaping.compressToolDefinitions} onChange={set('compressToolDefinitions')} />
+        <TogField label="移除历史思考内容" desc="丢弃历史消息里的 thinking 块" checked={shaping.discardHistoricalThinking} disabled={!branchEnabled} onChange={set('discardHistoricalThinking')} />
+        <TogField label="压缩工具说明" desc="精简工具定义体积" checked={shaping.compressToolDefinitions} disabled={!branchEnabled} onChange={set('compressToolDefinitions')} />
       </TwoCol>
       <TwoCol>
-        <NumField label="工具说明大小上限" value={shaping.toolDefinitionsBudgetBytes} min={0} suffix="字节" onChange={set('toolDefinitionsBudgetBytes')} />
-        <NumField label="单工具描述上限" value={shaping.toolDescriptionMaxChars} min={0} suffix="字符" onChange={set('toolDescriptionMaxChars')} />
+        <NumField label="工具说明大小上限" value={shaping.toolDefinitionsBudgetBytes} min={0} suffix="字节" disabled={!branchEnabled} onChange={set('toolDefinitionsBudgetBytes')} />
+        <NumField label="单工具描述上限" value={shaping.toolDescriptionMaxChars} min={0} suffix="字符" disabled={!branchEnabled} onChange={set('toolDescriptionMaxChars')} />
       </TwoCol>
       <TwoCol>
-        <NumField label="工具 Schema 注解上限" value={shaping.toolSchemaAnnotationMaxChars} min={0} suffix="字符" onChange={set('toolSchemaAnnotationMaxChars')} />
-        <TogField label="清理网页抓取历史" desc="截短历史 web fetch 正文" checked={shaping.webFetchTrimEnabled} onChange={set('webFetchTrimEnabled')} />
+        <NumField label="工具 Schema 注解上限" value={shaping.toolSchemaAnnotationMaxChars} min={0} suffix="字符" disabled={!branchEnabled} onChange={set('toolSchemaAnnotationMaxChars')} />
+        <TogField label="清理网页抓取历史" desc="截短历史 web fetch 正文" checked={shaping.webFetchTrimEnabled} disabled={!branchEnabled} onChange={set('webFetchTrimEnabled')} />
       </TwoCol>
       <TwoCol>
-        <NumField label="网页抓取正文保留字符" value={shaping.webFetchBodyMaxChars} min={0} suffix="字符" onChange={set('webFetchBodyMaxChars')} />
+        <NumField label="网页抓取正文保留字符" value={shaping.webFetchBodyMaxChars} min={0} suffix="字符" disabled={!branchEnabled} onChange={set('webFetchBodyMaxChars')} />
       </TwoCol>
     </div>
   )
@@ -101,31 +104,33 @@ export function PayloadHistorySection({
 // ─── 当前内容兜底(payloadFallback) ────────────────────────────────────────────
 
 export function PayloadFallbackSection({
-  shaping, onChange,
+  shaping, payloadShapingBranchEnabled, onChange,
 }: {
   shaping: PayloadShapingConfig
+  payloadShapingBranchEnabled: boolean
   onChange: (next: PayloadShapingConfig) => void
 }) {
   const set = <K extends keyof PayloadShapingConfig>(key: K) => (v: PayloadShapingConfig[K]) =>
     onChange({ ...shaping, [key]: v })
+  const dis = !payloadShapingBranchEnabled
   return (
     <div className="space-y-4">
-      <TogField label="自动压缩当前内容" desc="当前请求超阈值时,按下列规则压缩当前消息" checked={shaping.fitCurrentPayloadToBudget} onChange={set('fitCurrentPayloadToBudget')} />
+      <TogField label="自动压缩当前内容" desc="当前请求超阈值时,按下列规则压缩当前消息" checked={shaping.fitCurrentPayloadToBudget} disabled={dis} onChange={set('fitCurrentPayloadToBudget')} />
       <TwoCol>
-        <TogField label="截短当前工具结果" checked={shaping.truncateCurrentToolResults} onChange={set('truncateCurrentToolResults')} />
-        <NumField label="当前工具结果保留字符" value={shaping.currentToolResultMaxChars} min={0} suffix="字符" onChange={set('currentToolResultMaxChars')} />
+        <TogField label="截短当前工具结果" checked={shaping.truncateCurrentToolResults} disabled={dis} onChange={set('truncateCurrentToolResults')} />
+        <NumField label="当前工具结果保留字符" value={shaping.currentToolResultMaxChars} min={0} suffix="字符" disabled={dis} onChange={set('currentToolResultMaxChars')} />
       </TwoCol>
       <TwoCol>
-        <TogField label="截短当前用户文本" checked={shaping.truncateCurrentUserContent} onChange={set('truncateCurrentUserContent')} />
-        <NumField label="当前用户文本保留字符" value={shaping.currentUserContentMaxChars} min={0} suffix="字符" onChange={set('currentUserContentMaxChars')} />
+        <TogField label="截短当前用户文本" checked={shaping.truncateCurrentUserContent} disabled={dis} onChange={set('truncateCurrentUserContent')} />
+        <NumField label="当前用户文本保留字符" value={shaping.currentUserContentMaxChars} min={0} suffix="字符" disabled={dis} onChange={set('currentUserContentMaxChars')} />
       </TwoCol>
       <TwoCol>
-        <TogField label="截短当前文档" checked={shaping.truncateCurrentDocuments} onChange={set('truncateCurrentDocuments')} />
-        <NumField label="当前文档保留字符" value={shaping.currentDocumentMaxChars} min={0} suffix="字符" onChange={set('currentDocumentMaxChars')} />
+        <TogField label="截短当前文档" checked={shaping.truncateCurrentDocuments} disabled={dis} onChange={set('truncateCurrentDocuments')} />
+        <NumField label="当前文档保留字符" value={shaping.currentDocumentMaxChars} min={0} suffix="字符" disabled={dis} onChange={set('currentDocumentMaxChars')} />
       </TwoCol>
       <TwoCol>
-        <TogField label="移除当前图片" checked={shaping.truncateCurrentImages} onChange={set('truncateCurrentImages')} />
-        <NumField label="当前图片保留大小" value={shaping.currentImagesMaxBytes} min={0} suffix="字节" onChange={set('currentImagesMaxBytes')} />
+        <TogField label="移除当前图片" checked={shaping.truncateCurrentImages} disabled={dis} onChange={set('truncateCurrentImages')} />
+        <NumField label="当前图片保留大小" value={shaping.currentImagesMaxBytes} min={0} suffix="字节" disabled={dis} onChange={set('currentImagesMaxBytes')} />
       </TwoCol>
     </div>
   )
@@ -146,7 +151,7 @@ export function CacheCreationSection({
       <TogField label="启用缓存创建频次控制" desc="限制缓存写入展示的节奏" checked={control.enabled} onChange={set('enabled')} />
       <div className="space-y-1.5">
         <div className="text-sm font-semibold">控制维度</div>
-        <Select value={control.scopeMode} onValueChange={(v) => set('scopeMode')(v as PromptCacheCreationControlConfig['scopeMode'])}>
+        <Select value={control.scopeMode} disabled={!control.enabled} onValueChange={(v) => set('scopeMode')(v as PromptCacheCreationControlConfig['scopeMode'])}>
           <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
           <SelectContent>
             <SelectItem value="credential_conversation_model">账号 + 会话 + 模型</SelectItem>
@@ -155,19 +160,19 @@ export function CacheCreationSection({
         </Select>
       </div>
       <TwoCol>
-        <NumField label="最小成功请求间隔" value={control.minSuccessfulRequestsBetweenCreation} min={0} suffix="次" onChange={set('minSuccessfulRequestsBetweenCreation')} />
-        <NumField label="最小时间间隔" value={control.minCreationIntervalSecs} min={0} suffix="秒" onChange={set('minCreationIntervalSecs')} />
+        <NumField label="最小成功请求间隔" value={control.minSuccessfulRequestsBetweenCreation} min={0} suffix="次" disabled={!control.enabled} onChange={set('minSuccessfulRequestsBetweenCreation')} />
+        <NumField label="最小时间间隔" value={control.minCreationIntervalSecs} min={0} suffix="秒" disabled={!control.enabled} onChange={set('minCreationIntervalSecs')} />
       </TwoCol>
       <TwoCol>
-        <NumField label="最小累计增量" value={control.minCreationDeltaTokens} min={0} suffix="Token" onChange={set('minCreationDeltaTokens')} />
-        <NumField label="单次展示上限" value={control.maxCreationTokensPerEvent} min={0} suffix="Token" onChange={set('maxCreationTokensPerEvent')} />
+        <NumField label="最小累计增量" value={control.minCreationDeltaTokens} min={0} suffix="Token" disabled={!control.enabled} onChange={set('minCreationDeltaTokens')} />
+        <NumField label="单次展示上限" value={control.maxCreationTokensPerEvent} min={0} suffix="Token" disabled={!control.enabled} onChange={set('maxCreationTokensPerEvent')} />
       </TwoCol>
       <TwoCol>
-        <NumField label="额度窗口长度" value={control.creationBudgetWindowSecs} min={0} suffix="秒" onChange={set('creationBudgetWindowSecs')} />
-        <NumField label="窗口展示额度" value={control.maxCreationTokensPerWindow} min={0} suffix="Token" onChange={set('maxCreationTokensPerWindow')} />
+        <NumField label="额度窗口长度" value={control.creationBudgetWindowSecs} min={0} suffix="秒" disabled={!control.enabled} onChange={set('creationBudgetWindowSecs')} />
+        <NumField label="窗口展示额度" value={control.maxCreationTokensPerWindow} min={0} suffix="Token" disabled={!control.enabled} onChange={set('maxCreationTokensPerWindow')} />
       </TwoCol>
       <TwoCol>
-        <NumField label="空闲后清理状态" value={control.expireAfterIdleSecs} min={0} suffix="秒" onChange={set('expireAfterIdleSecs')} />
+        <NumField label="空闲后清理状态" value={control.expireAfterIdleSecs} min={0} suffix="秒" disabled={!control.enabled} onChange={set('expireAfterIdleSecs')} />
       </TwoCol>
     </div>
   )
@@ -180,6 +185,14 @@ const FIELD_MODE_LABELS: Record<string, string> = {
   preserve: '保留口径',
   'sample-max': '采样封顶',
   'sample-target': '采样目标',
+}
+
+function fieldNeedsMax(policy: ReportedUsageFieldPolicy): boolean {
+  return policy.mode === 'sample-max'
+}
+
+function fieldNeedsTarget(policy: ReportedUsageFieldPolicy): boolean {
+  return policy.mode === 'sample-target'
 }
 
 function FieldPolicyEditor({
@@ -205,16 +218,23 @@ function FieldPolicyEditor({
           </SelectContent>
         </Select>
       </div>
-      <TwoCol>
+      {fieldNeedsMax(policy) && (
         <NumField label="封顶 Token" value={policy.maxTokens} min={0} suffix="Token" onChange={set('maxTokens')} />
-        <NumField label="目标 Token" value={policy.targetTokens} min={0} suffix="Token" onChange={set('targetTokens')} />
-      </TwoCol>
-      <TwoCol>
-        <NumField label="常规上限倍数" value={policy.normalMaxMultiplier} min={0} step={0.1} suffix="倍" onChange={set('normalMaxMultiplier')} />
-        {allowMoveDelta && (
-          <TogField label="差额计入缓存读取" checked={policy.moveDeltaToCacheRead} onChange={set('moveDeltaToCacheRead')} />
-        )}
-      </TwoCol>
+      )}
+      {fieldNeedsTarget(policy) && (
+        <TwoCol>
+          <NumField label="目标 Token" value={policy.targetTokens} min={0} suffix="Token" onChange={set('targetTokens')} />
+          <NumField label="常规上限倍数" value={policy.normalMaxMultiplier} min={0} step={0.1} suffix="倍" onChange={set('normalMaxMultiplier')} />
+        </TwoCol>
+      )}
+      {allowMoveDelta && (
+        <TogField
+          label="差额计入缓存读取"
+          checked={policy.moveDeltaToCacheRead}
+          disabled={policy.mode === 'preserve' || policy.mode === 'raw'}
+          onChange={set('moveDeltaToCacheRead')}
+        />
+      )}
     </div>
   )
 }
@@ -230,17 +250,26 @@ function PathPolicyEditor({
   return (
     <div className="space-y-3">
       <TogField label="启用本规则" checked={policy.enabled} onChange={set('enabled')} />
-      <FieldPolicyEditor title="展示输入" policy={policy.input} allowMoveDelta onChange={set('input')} />
-      <FieldPolicyEditor title="展示输出" policy={policy.output} onChange={set('output')} />
-      <FieldPolicyEditor title="展示缓存读取" policy={policy.cacheRead} onChange={set('cacheRead')} />
-      <FieldPolicyEditor title="展示缓存写入" policy={policy.cacheCreation} onChange={set('cacheCreation')} />
-      <TwoCol>
-        <NumField label="读取缓存最终上限" value={policy.finalCacheReadMaxTokens} min={0} suffix="Token" onChange={set('finalCacheReadMaxTokens')} />
-        <NumField label="最终上限扣减下限" value={policy.finalCacheReadJitterMinTokens} min={0} suffix="Token" onChange={set('finalCacheReadJitterMinTokens')} />
-      </TwoCol>
-      <TwoCol>
-        <NumField label="最终上限扣减上限" value={policy.finalCacheReadJitterMaxTokens} min={0} suffix="Token" onChange={set('finalCacheReadJitterMaxTokens')} />
-      </TwoCol>
+      {!policy.enabled && (
+        <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-700 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-400">
+          当前入口会尽量使用原始用量显示。重新开启后才会使用下面的展示规则。
+        </div>
+      )}
+      {policy.enabled && (
+        <>
+          <FieldPolicyEditor title="展示输入" policy={policy.input} allowMoveDelta onChange={set('input')} />
+          <FieldPolicyEditor title="展示输出" policy={policy.output} onChange={set('output')} />
+          <FieldPolicyEditor title="展示缓存读取" policy={policy.cacheRead} onChange={set('cacheRead')} />
+          <FieldPolicyEditor title="展示缓存写入" policy={policy.cacheCreation} onChange={set('cacheCreation')} />
+          <TwoCol>
+            <NumField label="读取缓存最终上限" value={policy.finalCacheReadMaxTokens} min={0} suffix="Token" onChange={set('finalCacheReadMaxTokens')} />
+            <NumField label="最终上限扣减下限" value={policy.finalCacheReadJitterMinTokens} min={0} suffix="Token" onChange={set('finalCacheReadJitterMinTokens')} />
+          </TwoCol>
+          <TwoCol>
+            <NumField label="最终上限扣减上限" value={policy.finalCacheReadJitterMaxTokens} min={0} suffix="Token" onChange={set('finalCacheReadJitterMaxTokens')} />
+          </TwoCol>
+        </>
+      )}
     </div>
   )
 }
@@ -252,6 +281,8 @@ export function ReportedUsageSection({
   onChange: (next: ReportedUsageConfig) => void
 }) {
   const [newPrefix, setNewPrefix] = useState('')
+  const [editingPrefix, setEditingPrefix] = useState<string | null>(null)
+  const [prefixDraft, setPrefixDraft] = useState('')
   const overrides = Object.entries(reported.pathOverrides)
 
   const addOverride = () => {
@@ -271,6 +302,25 @@ export function ReportedUsageSection({
   }
   const setOverride = (prefix: string, policy: ReportedUsagePathPolicy) =>
     onChange({ ...reported, pathOverrides: { ...reported.pathOverrides, [prefix]: policy } })
+
+  const startRename = (prefix: string) => {
+    setEditingPrefix(prefix)
+    setPrefixDraft(prefix)
+  }
+  const commitRename = (oldPrefix: string) => {
+    const newPrefix = prefixDraft.trim()
+    if (!newPrefix || newPrefix === oldPrefix) {
+      setEditingPrefix(null)
+      return
+    }
+    const policy = reported.pathOverrides[oldPrefix]
+    if (!policy) return
+    const next = { ...reported.pathOverrides }
+    delete next[oldPrefix]
+    next[newPrefix] = policy
+    onChange({ ...reported, pathOverrides: next })
+    setEditingPrefix(null)
+  }
 
   return (
     <div className="space-y-5">
@@ -296,7 +346,29 @@ export function ReportedUsageSection({
         {overrides.map(([prefix, policy]) => (
           <div key={prefix} className="rounded-lg border border-border bg-card p-3">
             <div className="mb-3 flex items-center justify-between gap-2">
-              <code className="rounded bg-muted px-1.5 py-0.5 text-sm font-semibold">{prefix}</code>
+              {editingPrefix === prefix ? (
+                <div className="flex flex-1 items-center gap-2">
+                  <Input
+                    value={prefixDraft}
+                    className="h-7 flex-1 font-mono text-sm"
+                    onChange={(e) => setPrefixDraft(e.target.value)}
+                    onBlur={() => commitRename(prefix)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') commitRename(prefix)
+                      if (e.key === 'Escape') setEditingPrefix(null)
+                    }}
+                    autoFocus
+                  />
+                </div>
+              ) : (
+                <code
+                  className="cursor-pointer rounded bg-muted px-1.5 py-0.5 text-sm font-semibold hover:bg-muted/70"
+                  onClick={() => startRename(prefix)}
+                  title="点击编辑入口前缀"
+                >
+                  {prefix}
+                </code>
+              )}
               <Button size="sm" variant="ghost" className="text-destructive hover:bg-destructive/10" onClick={() => removeOverride(prefix)}>删除</Button>
             </div>
             <PathPolicyEditor policy={policy} onChange={(p) => setOverride(prefix, p)} />
@@ -386,7 +458,7 @@ export function ModelMappingSection({
     for (const rule of defaultRules) addModelRule(merged, rule)
     setText(JSON.stringify(merged, null, 2))
     setError(null)
-    onChange({ ...mapping, rules: merged })
+    onChange({ ...mapping, enabled: true, autoGenerateRules: true, rules: merged })
   }
 
   return (
