@@ -1,28 +1,25 @@
 import * as React from 'react'
 import { cn } from '@/lib/utils'
 
-/** 页面头部:标题 + 副标题 + 操作区。用于每个 feature 页面顶部 */
+/**
+ * 页面头部操作区。标题/副标题由顶部 Topbar 统一展示(见 layouts/topbar.tsx),
+ * 此处不再重复渲染标题,仅保留页面级操作按钮。无操作按钮时不占用空间。
+ */
 export function PageHeader({
-  title,
-  subtitle,
+  title: _title,
+  subtitle: _subtitle,
   actions,
   className,
 }: {
-  title: React.ReactNode
+  title?: React.ReactNode
   subtitle?: React.ReactNode
   actions?: React.ReactNode
   className?: string
 }) {
+  if (!actions) return null
   return (
-    <div className={cn('flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between', className)}>
-      <div className="min-w-0">
-        <h1 className="flex items-center gap-2.5 text-xl font-semibold tracking-tight text-foreground">
-          <span className="h-6 w-1 rounded-full bg-primary" />
-          <span className="truncate">{title}</span>
-        </h1>
-        {subtitle && <p className="mt-1 truncate text-sm text-muted-foreground">{subtitle}</p>}
-      </div>
-      {actions && <div className="flex shrink-0 flex-wrap items-center gap-2">{actions}</div>}
+    <div className={cn('flex flex-wrap items-center justify-end gap-2', className)}>
+      {actions}
     </div>
   )
 }
