@@ -3913,6 +3913,7 @@ async fn handle_stream_request(
         credential_usage.request.simulation_mode,
     );
     ctx.set_reported_cache_usage_policy(credential_usage.request.reported_cache_usage_policy());
+    ctx.set_stream_error_id(credential_usage.request.error_id.clone());
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events_with_reported_usage_mapper(|reported_usage| {
@@ -3936,10 +3937,257 @@ async fn handle_stream_request(
 const PING_INTERVAL_SECS: u64 = 25;
 /// 上游 eventstream 读空闲超时（180秒）
 const UPSTREAM_IDLE_TIMEOUT_SECS: u64 = 180;
+const JSON_STREAM_ERROR_SNIFF_MAX_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JsonStreamError {
+    error_type: &'static str,
+    internal_detail: String,
+    body_preview: String,
+}
+
+enum JsonStreamSniffResult {
+    Pass(Bytes),
+    Pending,
+    Error(JsonStreamError),
+}
+
+struct JsonStreamErrorSniffer {
+    enabled: bool,
+    decided: bool,
+    buffer: Vec<u8>,
+}
+
+impl JsonStreamErrorSniffer {
+    fn new(content_type: Option<&str>) -> Self {
+        Self {
+            enabled: content_type.is_some_and(is_json_media_type),
+            decided: false,
+            buffer: Vec::new(),
+        }
+    }
+
+    fn inspect(&mut self, chunk: Bytes) -> JsonStreamSniffResult {
+        if !self.enabled || self.decided {
+            return JsonStreamSniffResult::Pass(chunk);
+        }
+
+        self.buffer.extend_from_slice(&chunk);
+
+        let Some(first_non_ws) = self
+            .buffer
+            .iter()
+            .copied()
+            .find(|byte| !byte.is_ascii_whitespace())
+        else {
+            if self.buffer.len() > JSON_STREAM_ERROR_SNIFF_MAX_BYTES {
+                return JsonStreamSniffResult::Error(
+                    self.protocol_error("json_stream_error_body_too_large"),
+                );
+            }
+            return JsonStreamSniffResult::Pending;
+        };
+
+        if !matches!(first_non_ws, b'{' | b'[') {
+            self.decided = true;
+            return JsonStreamSniffResult::Pass(Bytes::from(std::mem::take(&mut self.buffer)));
+        }
+
+        if self.buffer.len() > JSON_STREAM_ERROR_SNIFF_MAX_BYTES {
+            return JsonStreamSniffResult::Error(
+                self.protocol_error("json_stream_error_body_too_large"),
+            );
+        }
+
+        let trimmed = trim_ascii_whitespace(&self.buffer);
+        match serde_json::from_slice::<Value>(trimmed) {
+            Ok(value) => {
+                self.decided = true;
+                JsonStreamSniffResult::Error(classify_json_stream_error(&value, trimmed))
+            }
+            Err(err) if err.is_eof() => JsonStreamSniffResult::Pending,
+            Err(err) => JsonStreamSniffResult::Error(JsonStreamError {
+                error_type: "api_error",
+                internal_detail: format!("json_stream_malformed_json: {}", err),
+                body_preview: bytes_preview(trimmed),
+            }),
+        }
+    }
+
+    fn finish(&mut self) -> Option<JsonStreamError> {
+        if !self.enabled || self.decided || self.buffer.is_empty() {
+            return None;
+        }
+        self.decided = true;
+
+        let trimmed = trim_ascii_whitespace(&self.buffer);
+        if trimmed.is_empty() {
+            return Some(JsonStreamError {
+                error_type: "api_error",
+                internal_detail: "json_stream_empty_body".to_string(),
+                body_preview: String::new(),
+            });
+        }
+
+        Some(JsonStreamError {
+            error_type: "api_error",
+            internal_detail: "json_stream_incomplete_json".to_string(),
+            body_preview: bytes_preview(trimmed),
+        })
+    }
+
+    fn protocol_error(&self, reason: &str) -> JsonStreamError {
+        JsonStreamError {
+            error_type: "api_error",
+            internal_detail: reason.to_string(),
+            body_preview: bytes_preview(trim_ascii_whitespace(&self.buffer)),
+        }
+    }
+}
+
+fn is_json_media_type(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .map(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
+        .unwrap_or(false)
+}
+
+fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|idx| idx + 1)
+        .unwrap_or(start);
+    &bytes[start..end]
+}
+
+fn bytes_preview(bytes: &[u8]) -> String {
+    const PREVIEW_LIMIT: usize = 2048;
+    let end = bytes.len().min(PREVIEW_LIMIT);
+    let mut preview = String::from_utf8_lossy(&bytes[..end]).into_owned();
+    if bytes.len() > PREVIEW_LIMIT {
+        preview.push_str("...[truncated]");
+    }
+    preview
+}
+
+fn json_string_at<'a>(value: &'a Value, pointers: &[&str]) -> Option<&'a str> {
+    pointers
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn classify_json_stream_error(value: &Value, raw_body: &[u8]) -> JsonStreamError {
+    let code = json_string_at(
+        value,
+        &[
+            "/__type",
+            "/code",
+            "/Code",
+            "/type",
+            "/error/type",
+            "/error/code",
+            "/error/Code",
+        ],
+    )
+    .map(str::to_string);
+    let reason = json_string_at(
+        value,
+        &["/reason", "/Reason", "/error/reason", "/error/Reason"],
+    )
+    .map(str::to_string);
+    let message = json_string_at(
+        value,
+        &[
+            "/message",
+            "/Message",
+            "/error/message",
+            "/error/Message",
+            "/error",
+        ],
+    )
+    .map(str::to_string);
+
+    let combined = [&code, &reason, &message]
+        .into_iter()
+        .filter_map(|value| value.as_deref())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+
+    let error_type = if combined.contains("request_body_invalid")
+        || combined.contains("invalid tool use")
+        || combined.contains("validation")
+        || combined.contains("bad request")
+    {
+        "invalid_request_error"
+    } else if combined.contains("throttl")
+        || combined.contains("too many requests")
+        || combined.contains("rate")
+    {
+        "rate_limit_error"
+    } else {
+        "api_error"
+    };
+
+    let mut fields = Vec::new();
+    if let Some(code) = code {
+        fields.push(format!("code={}", code));
+    }
+    if let Some(reason) = reason {
+        fields.push(format!("reason={}", reason));
+    }
+    if let Some(message) = message {
+        fields.push(format!("message={}", message));
+    }
+
+    let internal_detail = if fields.is_empty() {
+        "json_stream_unexpected_body".to_string()
+    } else {
+        format!("json_stream_exception {}", fields.join(" "))
+    };
+
+    JsonStreamError {
+        error_type,
+        internal_detail,
+        body_preview: bytes_preview(raw_body),
+    }
+}
 
 /// 创建 ping 事件的 SSE 字符串
 fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
+}
+
+fn finish_stream_with_recorded_error(
+    ctx: &mut StreamContext,
+    usage_guard: &StreamUsageGuard,
+    status: UsageRecordStatus,
+) -> Vec<Result<Bytes, Infallible>> {
+    let error_detail = ctx.stream_error_detail();
+    let final_events = ctx.generate_final_events();
+    usage_guard
+        .context()
+        .request
+        .mark_first_token_if_output(&final_events);
+    usage_guard.context().record_stream_failure_from_context(
+        status,
+        ctx.final_usage(),
+        error_detail,
+        ctx.metadata_usage(),
+        ctx.context_input_tokens,
+    );
+    usage_guard.complete();
+    final_events
+        .into_iter()
+        .map(|event| Ok(Bytes::from(event.to_sse_string())))
+        .collect()
 }
 
 /// 创建 SSE 事件流
@@ -3959,6 +4207,12 @@ fn create_sse_stream(
     );
 
     // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
+    let upstream_content_type = response
+        .headers()
+        .get(REQWEST_CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let json_sniffer = JsonStreamErrorSniffer::new(upstream_content_type.as_deref());
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
@@ -3966,6 +4220,7 @@ fn create_sse_stream(
             body_stream,
             ctx,
             EventStreamDecoder::new(),
+            json_sniffer,
             false,
             completion,
             usage_guard,
@@ -3976,6 +4231,7 @@ fn create_sse_stream(
             mut body_stream,
             mut ctx,
             mut decoder,
+            mut json_sniffer,
             finished,
             completion,
             usage_guard,
@@ -4001,6 +4257,31 @@ fn create_sse_stream(
                                 .mark_first_upstream_chunk();
                             idle_deadline = Instant::now() + Duration::from_secs(UPSTREAM_IDLE_TIMEOUT_SECS);
                             completion.touch();
+
+                            let chunk = match json_sniffer.inspect(chunk) {
+                                JsonStreamSniffResult::Pass(chunk) => chunk,
+                                JsonStreamSniffResult::Pending => {
+                                    let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
+                                    return Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, false, completion, usage_guard, ping_interval, idle_deadline)));
+                                }
+                                JsonStreamSniffResult::Error(error) => {
+                                    tracing::warn!(
+                                        error_type = error.error_type,
+                                        error_detail = %error.internal_detail,
+                                        body = %error.body_preview,
+                                        "流式 API 返回 2xx JSON 错误体"
+                                    );
+                                    completion.report_upstream_stream_failure(error.internal_detail.clone());
+                                    ctx.record_stream_error(error.error_type, error.internal_detail);
+                                    let bytes = finish_stream_with_recorded_error(
+                                        &mut ctx,
+                                        &usage_guard,
+                                        UsageRecordStatus::StreamError,
+                                    );
+                                    return Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline)));
+                                }
+                            };
+
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
                                 tracing::warn!("缓冲区溢出: {}", e);
@@ -4031,7 +4312,7 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, completion, usage_guard, ping_interval, idle_deadline)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, false, completion, usage_guard, ping_interval, idle_deadline)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
@@ -4041,27 +4322,30 @@ fn create_sse_stream(
                             ));
                             // 读取错误：关闭已有内容块后发送 SSE error，不再发送正常 message_stop。
                             ctx.record_stream_error("api_error", format!("upstream stream read error: {}", e));
-                            let error_detail = ctx.stream_error_detail();
-                            let final_events = ctx.generate_final_events();
-                            usage_guard
-                                .context()
-                                .request
-                                .mark_first_token_if_output(&final_events);
-                            usage_guard.context().record_stream_failure_from_context(
+                            let bytes = finish_stream_with_recorded_error(
+                                &mut ctx,
+                                &usage_guard,
                                 UsageRecordStatus::StreamError,
-                                ctx.final_usage(),
-                                error_detail,
-                                ctx.metadata_usage(),
-                                ctx.context_input_tokens,
                             );
-                            usage_guard.complete();
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, usage_guard, ping_interval, idle_deadline)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline)))
                         }
                         None => {
+                            if let Some(error) = json_sniffer.finish() {
+                                tracing::warn!(
+                                    error_type = error.error_type,
+                                    error_detail = %error.internal_detail,
+                                    body = %error.body_preview,
+                                    "流式 API 返回未完成的 JSON 错误体"
+                                );
+                                completion.report_upstream_stream_failure(error.internal_detail.clone());
+                                ctx.record_stream_error(error.error_type, error.internal_detail);
+                                let bytes = finish_stream_with_recorded_error(
+                                    &mut ctx,
+                                    &usage_guard,
+                                    UsageRecordStatus::StreamError,
+                                );
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline)));
+                            }
                             // 流结束，发送最终事件
                             if ctx.has_stream_error() {
                                 let scheduler_reason = ctx
@@ -4107,7 +4391,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, usage_guard, ping_interval, idle_deadline)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline)))
                         }
                     }
                 }
@@ -4118,31 +4402,18 @@ fn create_sse_stream(
                     );
                     completion.report_upstream_stream_failure("upstream stream idle timeout");
                     ctx.record_stream_error("api_error", "upstream stream idle timeout");
-                    let error_detail = ctx.stream_error_detail();
-                    let final_events = ctx.generate_final_events();
-                    usage_guard
-                        .context()
-                        .request
-                        .mark_first_token_if_output(&final_events);
-                    usage_guard.context().record_stream_failure_from_context(
+                    let bytes = finish_stream_with_recorded_error(
+                        &mut ctx,
+                        &usage_guard,
                         UsageRecordStatus::UpstreamTimeout,
-                        ctx.final_usage(),
-                        error_detail,
-                        ctx.metadata_usage(),
-                        ctx.context_input_tokens,
                     );
-                    usage_guard.complete();
-                    let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                        .into_iter()
-                        .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                        .collect();
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, true, completion, usage_guard, ping_interval, idle_deadline)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline)))
                 }
                 // 发送 ping 保活
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, completion, usage_guard, ping_interval, idle_deadline)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, false, completion, usage_guard, ping_interval, idle_deadline)))
                 }
             }
         },
@@ -5281,6 +5552,57 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+        }
+    }
+
+    #[test]
+    fn json_stream_sniffer_detects_request_body_invalid_exception() {
+        let mut sniffer = JsonStreamErrorSniffer::new(Some("application/json; charset=utf-8"));
+
+        let result = sniffer.inspect(Bytes::from_static(
+            br#"{"message":"Invalid tool use format.","reason":"REQUEST_BODY_INVALID"}"#,
+        ));
+
+        match result {
+            JsonStreamSniffResult::Error(error) => {
+                assert_eq!(error.error_type, "invalid_request_error");
+                assert!(error.internal_detail.contains("REQUEST_BODY_INVALID"));
+                assert!(error.internal_detail.contains("Invalid tool use format."));
+                assert!(error.body_preview.contains("Invalid tool use format."));
+            }
+            _ => panic!("expected JSON stream error"),
+        }
+    }
+
+    #[test]
+    fn json_stream_sniffer_passes_binary_eventstream_mislabeled_as_json() {
+        let mut sniffer = JsonStreamErrorSniffer::new(Some("application/json"));
+        let chunk = Bytes::from_static(&[0, 0, 0, 16, 0, 0, 0, 0]);
+
+        match sniffer.inspect(chunk.clone()) {
+            JsonStreamSniffResult::Pass(passed) => assert_eq!(passed, chunk),
+            _ => panic!("expected binary eventstream chunk to pass through"),
+        }
+    }
+
+    #[test]
+    fn json_stream_sniffer_accumulates_split_json_exception() {
+        let mut sniffer = JsonStreamErrorSniffer::new(Some("application/json"));
+
+        assert!(matches!(
+            sniffer.inspect(Bytes::from_static(br#"{"message":"Too many"#)),
+            JsonStreamSniffResult::Pending
+        ));
+
+        match sniffer.inspect(Bytes::from_static(
+            br#" requests","code":"ThrottlingException"}"#,
+        )) {
+            JsonStreamSniffResult::Error(error) => {
+                assert_eq!(error.error_type, "rate_limit_error");
+                assert!(error.internal_detail.contains("ThrottlingException"));
+                assert!(error.internal_detail.contains("Too many requests"));
+            }
+            _ => panic!("expected split JSON stream error"),
         }
     }
 

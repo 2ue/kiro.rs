@@ -1189,8 +1189,13 @@ pub struct StreamContext {
     native_reasoning_signature: Option<String>,
     /// 原生 reasoning 签名是否已通过 signature_delta 发送。
     native_reasoning_signature_sent: bool,
-    /// 上游流内错误，最终以 SSE error 事件暴露
+    /// 上游流内错误，最终以 SSE error 事件暴露。
+    ///
+    /// 这里保存原始错误用于 usage/日志定位；生产 SSE 输出会通过
+    /// `stream_error_id` 归一化，避免把上游内部错误直接暴露给下游。
     stream_error: Option<(String, String)>,
+    /// 生产链路上的错误 ID。设置后，流式 error event 使用统一对外文案。
+    stream_error_id: Option<String>,
     /// 无 metadata 时使用的本地 prompt-cache usage 模拟结果
     pub simulated_usage: Option<super::cache::CacheSimulation>,
     /// 本地 prompt-cache usage 模拟模式。
@@ -1314,6 +1319,7 @@ impl StreamContext {
             native_reasoning_signature: None,
             native_reasoning_signature_sent: false,
             stream_error: None,
+            stream_error_id: None,
             simulated_usage,
             simulation_mode,
             reported_cache_usage_policy: None,
@@ -1330,6 +1336,10 @@ impl StreamContext {
         policy: Option<super::cache::ReportedCacheUsagePolicy>,
     ) {
         self.reported_cache_usage_policy = policy;
+    }
+
+    pub fn set_stream_error_id(&mut self, error_id: impl Into<String>) {
+        self.stream_error_id = Some(error_id.into());
     }
 
     fn reported_usage_for_downstream(
@@ -1574,6 +1584,18 @@ impl StreamContext {
 
     pub fn stream_error_detail(&self) -> Option<(String, String)> {
         self.stream_error.clone()
+    }
+
+    fn public_stream_error_message(&self, error_type: &str, raw_message: String) -> String {
+        let Some(error_id) = self.stream_error_id.as_deref() else {
+            return raw_message;
+        };
+        let public_message = match error_type {
+            "invalid_request_error" => envelope::PUBLIC_INVALID_REQUEST_MESSAGE,
+            "rate_limit_error" => envelope::PUBLIC_RATE_LIMIT_MESSAGE,
+            _ => envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+        };
+        envelope::public_message_with_error_id(public_message, error_id)
     }
 
     fn create_error_event(error_type: String, message: String) -> SseEvent {
@@ -2410,8 +2432,9 @@ impl StreamContext {
             self.thinking_buffer.clear();
         }
 
-        if let Some((error_type, message)) = self.stream_error.take() {
+        if let Some((error_type, raw_message)) = self.stream_error.take() {
             events.extend(self.state_manager.close_open_blocks());
+            let message = self.public_stream_error_message(&error_type, raw_message);
             events.push(Self::create_error_event(error_type, message));
             return events;
         }
@@ -2976,6 +2999,40 @@ mod tests {
             .expect("error event should be emitted");
         assert_eq!(error.data["error"]["type"], "invalid_request_error");
         assert_eq!(error.data["error"]["message"], "session expired");
+    }
+
+    #[test]
+    fn stream_error_with_error_id_keeps_internal_detail_but_masks_downstream_message() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        ctx.set_stream_error_id("req_01masked_stream");
+
+        ctx.record_stream_error(
+            "api_error",
+            "raw upstream billing or routing text that must stay internal",
+        );
+
+        assert_eq!(
+            ctx.stream_error_detail(),
+            Some((
+                "api_error".to_string(),
+                "raw upstream billing or routing text that must stay internal".to_string(),
+            ))
+        );
+
+        let events = ctx.generate_final_events();
+        let error = events
+            .iter()
+            .find(|event| event.event == "error")
+            .expect("error event should be emitted");
+        assert_eq!(error.data["error"]["type"], "api_error");
+        let message = error.data["error"]["message"]
+            .as_str()
+            .expect("message should be string");
+        assert!(message.contains(envelope::PUBLIC_PROCESSING_FAILED_MESSAGE));
+        assert!(message.contains("error ID: req_01masked_stream"));
+        assert!(!message.contains("upstream"));
+        assert!(!message.contains("billing"));
+        assert!(!message.contains("routing"));
     }
 
     #[test]
