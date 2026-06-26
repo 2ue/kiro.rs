@@ -3,6 +3,7 @@ mod admin_snapshot;
 mod manager;
 mod refresh;
 mod route_state;
+mod storage_task;
 mod types;
 
 pub use account_state::CredentialRiskControlReason;

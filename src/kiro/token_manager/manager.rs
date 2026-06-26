@@ -46,6 +46,7 @@ use super::refresh::{
     refresh_token, validate_refresh_token,
 };
 use super::route_state::{CachedLocalPoolRouteState, LocalPoolRouteState, LocalPoolRouteStateKind};
+use super::storage_task::{block_on_storage, spawn_best_effort_storage_task};
 use super::types::{
     AcquireMode, CallContext, CredentialAuthUpdate, EXTERNAL_CREDENTIAL_CONTEXT_ID, InFlightKind,
     TransientFailureKind,
@@ -150,60 +151,6 @@ fn apply_credential_auth_update(credential: &mut KiroCredentials, update: Creden
 // ============================================================================
 // 多凭据 Token 管理器
 // ============================================================================
-
-fn block_on_storage<T>(
-    operation: &'static str,
-    future: impl Future<Output = anyhow::Result<T>>,
-) -> anyhow::Result<T> {
-    let started_at = Instant::now();
-    let result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| handle.block_on(future))
-    } else {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(future)
-    };
-    let elapsed = started_at.elapsed();
-    if elapsed >= StdDuration::from_millis(100) {
-        tracing::warn!(
-            operation,
-            elapsed_ms = elapsed.as_millis() as u64,
-            "同步存储操作耗时较长"
-        );
-    }
-    result.map_err(|err| anyhow::anyhow!("{}失败: {}", operation, err))
-}
-
-fn spawn_best_effort_storage_task(
-    operation: &'static str,
-    future: impl Future<Output = anyhow::Result<()>> + Send + 'static,
-) {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::spawn(async move {
-            if let Err(err) = future.await {
-                tracing::warn!("{}失败: {}", operation, err);
-            }
-        });
-        return;
-    }
-
-    if let Err(err) = std::thread::Builder::new()
-        .name(format!("kiro-{}", operation))
-        .spawn(move || {
-            let result = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(anyhow::Error::from)
-                .and_then(|runtime| runtime.block_on(future));
-            if let Err(err) = result {
-                tracing::warn!("{}失败: {}", operation, err);
-            }
-        })
-    {
-        tracing::warn!("{}任务启动失败: {}", operation, err);
-    }
-}
 
 fn instant_from_epoch_ms(target_ms: i64, now_ms: i64, now: Instant) -> Option<Instant> {
     (target_ms > now_ms).then(|| now + StdDuration::from_millis((target_ms - now_ms) as u64))
