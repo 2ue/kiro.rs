@@ -3,7 +3,7 @@
 //! 负责 Token 过期检测和刷新，支持 Social 和 IdC 认证方式
 //! 支持多凭据 (MultiTokenManager) 管理
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, Notify};
@@ -53,6 +53,8 @@ use super::queue::{
     format_effective_concurrency_range, min_dispatch_wait,
 };
 use super::redis_runtime::{
+    apply_scheduler_states as apply_redis_scheduler_states,
+    clear_scheduler_state_for_credential_local, clear_scheduler_state_for_credential_redis,
     publish_credentials_changed as publish_redis_credentials_changed,
     publish_runtime_config_changed as publish_redis_runtime_config_changed,
 };
@@ -78,8 +80,8 @@ use super::sticky::{
 use super::storage_task::{block_on_storage, spawn_best_effort_storage_task};
 use super::strategy::{
     balanced_selection_key, entry_effective_health_mut, priority_selection_key,
-    record_local_selection, refresh_local_selection_windows_locked, scheduler_score_with_config,
-    select_health_weighted, should_select_warming_from_totals,
+    record_local_selection, refresh_local_selection_windows_locked, select_health_weighted,
+    should_select_warming_from_totals,
 };
 use super::types::{
     AcquireMode, CallContext, CredentialAuthUpdate, EXTERNAL_CREDENTIAL_CONTEXT_ID, InFlightKind,
@@ -90,6 +92,10 @@ use super::types::{
 use super::refresh::{
     is_invalid_grant_response, usage_limits_amz_user_agent, usage_limits_user_agent,
 };
+#[cfg(test)]
+use super::strategy::scheduler_score_with_config;
+#[cfg(test)]
+use chrono::Duration;
 
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
@@ -185,19 +191,6 @@ fn apply_credential_auth_update(credential: &mut KiroCredentials, update: Creden
 // ============================================================================
 // 多凭据 Token 管理器
 // ============================================================================
-
-fn instant_from_epoch_ms(target_ms: i64, now_ms: i64, now: Instant) -> Option<Instant> {
-    (target_ms > now_ms).then(|| now + StdDuration::from_millis((target_ms - now_ms) as u64))
-}
-
-fn instant_from_elapsed_epoch_ms(target_ms: i64, now_ms: i64, now: Instant) -> Instant {
-    if target_ms >= now_ms {
-        now
-    } else {
-        now.checked_sub(StdDuration::from_millis((now_ms - target_ms) as u64))
-            .unwrap_or(now)
-    }
-}
 
 fn truncate_for_audit(value: &str, max_chars: usize) -> String {
     let mut truncated = value.chars().take(max_chars).collect::<String>();
@@ -3405,62 +3398,7 @@ impl MultiTokenManager {
     }
 
     fn apply_scheduler_states(&self, states: HashMap<u64, SchedulerCredentialState>) {
-        let now_ms = Utc::now().timestamp_millis();
-        let now = Instant::now();
-        let global_rpm = self.config.lock().credential_rpm.unwrap_or(0);
-        let mut entries = self.entries.lock();
-        for entry in entries.iter_mut() {
-            let state = states.get(&entry.id).cloned().unwrap_or_default();
-            entry.cooldown_until = state
-                .cooldown
-                .as_ref()
-                .and_then(|cooldown| instant_from_epoch_ms(cooldown.until_ms, now_ms, now));
-            entry.cooldown_reason = state.cooldown.and_then(|cooldown| cooldown.reason);
-            entry.model_cooldowns.clear();
-            entry.model_health.clear();
-            for model_state in state.model_states {
-                let key = model_state_key(&model_state.model);
-                if let Some(cooldown) = model_state.cooldown {
-                    if let Some(until) = instant_from_epoch_ms(cooldown.until_ms, now_ms, now) {
-                        entry.model_cooldowns.insert(
-                            key.clone(),
-                            CredentialModelCooldown {
-                                model: model_state.model.clone(),
-                                until,
-                                reason: cooldown.reason,
-                            },
-                        );
-                    }
-                }
-                entry.model_health.insert(key, model_state.health);
-            }
-            entry.rate_limit_available_at =
-                if rate_limit_interval_for_rpm(effective_rpm(entry, global_rpm)).is_some() {
-                    let redis_available_at = state
-                        .rate_limit_available_at_ms
-                        .and_then(|until_ms| instant_from_epoch_ms(until_ms, now_ms, now));
-                    match (entry.rate_limit_available_at, redis_available_at) {
-                        (Some(local), Some(redis)) => Some(local.max(redis)),
-                        (Some(local), None) if local > now => Some(local),
-                        (_, redis) => redis,
-                    }
-                } else {
-                    None
-                };
-            entry.in_flight_leases = state
-                .in_flight_leases
-                .into_iter()
-                .map(|lease| InFlightLease {
-                    id: lease.id,
-                    acquired_at: instant_from_elapsed_epoch_ms(lease.acquired_at_ms, now_ms, now),
-                    last_seen_at: instant_from_elapsed_epoch_ms(lease.last_seen_at_ms, now_ms, now),
-                    kind: InFlightKind::from_str(&lease.kind),
-                })
-                .collect();
-            entry.in_flight_requests = entry.in_flight_leases.len() as u32;
-            entry.health = state.health;
-        }
-        drop(entries);
+        apply_redis_scheduler_states(&self.entries, &self.config, states);
         self.invalidate_local_pool_route_state_cache();
     }
 
@@ -3486,36 +3424,9 @@ impl MultiTokenManager {
     }
 
     fn clear_scheduler_state_for_credential(&self, id: u64, clear_in_flight: bool) {
-        {
-            let mut entries = self.entries.lock();
-            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
-                entry.cooldown_until = None;
-                entry.cooldown_reason = None;
-                entry.model_cooldowns.clear();
-                entry.rate_limit_available_at = None;
-                entry.health = SchedulerHealthState::default();
-                entry.model_health.clear();
-                if clear_in_flight {
-                    entry.in_flight_requests = 0;
-                    entry.in_flight_leases.clear();
-                }
-            }
-        }
+        clear_scheduler_state_for_credential_local(&self.entries, id, clear_in_flight);
         self.invalidate_local_pool_route_state_cache();
-        let Some(redis) = &self.redis_store else {
-            return;
-        };
-        let redis = redis.clone();
-        spawn_best_effort_storage_task("清理 Redis 凭据调度状态", async move {
-            redis.clear_scheduler_cooldown(id).await?;
-            redis.clear_scheduler_health(id).await?;
-            redis.clear_rate_limit(id).await?;
-            redis.delete_sessions_for_credential(id).await?;
-            if clear_in_flight {
-                redis.clear_in_flight_leases(id, None).await?;
-            }
-            Ok(())
-        });
+        clear_scheduler_state_for_credential_redis(self.redis_store.as_ref(), id, clear_in_flight);
     }
 
     /// 报告指定凭据 API 调用成功
