@@ -22,6 +22,7 @@ use crate::kiro::model::requests::{
 use crate::model::config::PayloadShapingConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 const CURRENT_FIT_MIN_TEXT_CHARS: usize = 512;
 const CURRENT_FIT_MAX_ITERATIONS: usize = 64;
@@ -137,6 +138,8 @@ pub struct PayloadGuardReport {
     pub dropped_current_images: usize,
     pub dropped_current_image_bytes: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_use_format_diagnostics: Option<ToolUseFormatDiagnostics>,
     pub still_oversized: bool,
 }
@@ -176,6 +179,7 @@ impl PayloadGuardReport {
             truncated_current_user_content_chars: 0,
             dropped_current_images: 0,
             dropped_current_image_bytes: 0,
+            body_sha256: None,
             tool_use_format_diagnostics: None,
             still_oversized: false,
         }
@@ -354,10 +358,9 @@ pub fn guard_kiro_request(
     let original_history_entries = request.conversation_state.history.len();
 
     if !config.enabled {
-        return Ok((
-            original_body,
-            PayloadGuardReport::disabled(original_bytes, original_history_entries),
-        ));
+        let mut report = PayloadGuardReport::disabled(original_bytes, original_history_entries);
+        report.body_sha256 = Some(sha256_hex(&original_body));
+        return Ok((original_body, report));
     }
     let size_limit_enabled = config.max_bytes > 0;
 
@@ -394,6 +397,7 @@ pub fn guard_kiro_request(
         truncated_current_user_content_chars: 0,
         dropped_current_images: 0,
         dropped_current_image_bytes: 0,
+        body_sha256: None,
         tool_use_format_diagnostics: None,
         still_oversized: false,
     };
@@ -506,6 +510,7 @@ pub fn guard_kiro_request(
     report.final_history_entries = request.conversation_state.history.len();
     report.final_bytes = body.len();
     report.still_oversized = size_limit_enabled && report.final_bytes > config.max_bytes;
+    report.body_sha256 = Some(sha256_hex(&body));
 
     log_payload_guard_timing(
         "kiro",
@@ -752,10 +757,10 @@ pub fn guard_anthropic_messages_request(
     let original_history_entries = request.messages.len().saturating_sub(1);
 
     if !config.enabled {
-        return Ok((
-            body,
-            PayloadGuardReport::disabled(original_body_bytes, original_history_entries),
-        ));
+        let mut report =
+            PayloadGuardReport::disabled(original_body_bytes, original_history_entries);
+        report.body_sha256 = Some(sha256_hex(&body));
+        return Ok((body, report));
     }
 
     let size_limit_enabled = config.max_bytes > 0;
@@ -880,6 +885,7 @@ pub fn guard_anthropic_messages_request(
 
     report.final_history_entries = request.messages.len().saturating_sub(1);
     report.still_oversized = size_limit_enabled && final_bytes > config.max_bytes;
+    report.body_sha256 = Some(sha256_hex(&body));
     log_payload_guard_timing(
         "anthropic",
         guard_started_at.elapsed(),
@@ -1000,9 +1006,16 @@ fn new_payload_guard_report(
         truncated_current_user_content_chars: 0,
         dropped_current_images: 0,
         dropped_current_image_bytes: 0,
+        body_sha256: None,
         tool_use_format_diagnostics: None,
         still_oversized: false,
     }
+}
+
+fn sha256_hex(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn serialize_request(request: &KiroRequest) -> Result<String, PayloadGuardError> {
@@ -3768,6 +3781,47 @@ mod tests {
     }
 
     #[test]
+    fn payload_guard_report_records_body_hash_without_body() {
+        let mut request = request_with_history(vec![Message::User(HistoryUserMessage::new(
+            "old user content that must not be copied into diagnostics",
+            TEST_MODEL,
+        ))]);
+
+        let (body, report) =
+            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+
+        let expected_hash = sha256_hex(&body);
+        assert_eq!(report.body_sha256.as_deref(), Some(expected_hash.as_str()));
+        let serialized = serde_json::to_string(&report).unwrap();
+        assert!(serialized.contains("bodySha256"));
+        assert!(!serialized.contains("old user content"));
+        assert!(!serialized.contains(&body));
+    }
+
+    #[test]
+    fn anthropic_payload_guard_report_records_body_hash_without_body() {
+        let mut request = anthropic_request(vec![anthropic_message(
+            "user",
+            serde_json::json!("current user content that must not be copied into diagnostics"),
+        )]);
+        let original = serde_json::to_string(&request).unwrap();
+
+        let (body, report) = guard_anthropic_messages_request(
+            &mut request,
+            guard_config(usize::MAX),
+            original.len(),
+        )
+        .expect("guard");
+
+        let expected_hash = sha256_hex(&body);
+        assert_eq!(report.body_sha256.as_deref(), Some(expected_hash.as_str()));
+        let serialized = serde_json::to_string(&report).unwrap();
+        assert!(serialized.contains("bodySha256"));
+        assert!(!serialized.contains("current user content"));
+        assert!(!serialized.contains(&body));
+    }
+
+    #[test]
     fn guard_trims_old_history_until_under_limit() {
         let mut history = Vec::new();
         for idx in 0..10 {
@@ -4294,6 +4348,7 @@ mod tests {
             truncated_current_user_content_chars: 10,
             dropped_current_images: 1,
             dropped_current_image_bytes: 10,
+            body_sha256: None,
             tool_use_format_diagnostics: None,
             still_oversized: false,
         };
