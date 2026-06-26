@@ -548,7 +548,7 @@ impl ExternalPoolFinalError {
 
     fn public_message(&self, external_error_id: &str) -> String {
         let message = if self.is_rate_limit() {
-            "Too many requests. Please retry later."
+            envelope::PUBLIC_RATE_LIMIT_MESSAGE
         } else if self.is_public_invalid_request() {
             envelope::PUBLIC_INVALID_REQUEST_MESSAGE
         } else {
@@ -4700,7 +4700,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&actual).expect("json envelope");
         assert_eq!(value["error"]["type"], "rate_limit_error");
         let message = value["error"]["message"].as_str().unwrap();
-        assert!(message.contains("Too many requests"));
+        assert!(message.contains(envelope::PUBLIC_RATE_LIMIT_MESSAGE));
         assert!(message.contains("error ID: req_01"));
         assert!(!message.contains("slow down"));
         assert!(!message.contains("rate_limit_error"));

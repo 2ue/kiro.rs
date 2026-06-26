@@ -2597,10 +2597,7 @@ fn map_provider_error(
             .map(|secs| secs.max(1))
             .unwrap_or_else(|| cooldown_retry_after_secs(provider, 1));
         log_provider_rate_limit_with_hint(&err_str, retry_after_secs, error_id);
-        let message = format!(
-            "Too many requests. Retry after {} seconds.",
-            retry_after_secs
-        );
+        let message = envelope::public_rate_limit_message(Some(retry_after_secs));
         return public_error_response(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limit_error",

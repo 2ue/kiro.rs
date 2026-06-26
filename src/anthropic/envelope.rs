@@ -12,20 +12,31 @@ const ID_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrs
 const ID_RANDOM_LEN: usize = 22;
 
 pub(crate) const PUBLIC_TEMPORARY_FAILURE_MESSAGE: &str =
-    "The request could not be completed right now. Please retry later.";
+    "The request could not be completed right now. Please retry shortly.";
 pub(crate) const PUBLIC_PROCESSING_FAILED_MESSAGE: &str =
-    "Request processing failed. Please retry later.";
+    "The request could not be completed. Please retry shortly.";
 pub(crate) const PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE: &str =
-    "No account is currently available. Please retry later or contact the administrator.";
+    "No account is ready for this request right now. Please retry shortly.";
 pub(crate) const PUBLIC_PROVIDER_NOT_READY_MESSAGE: &str =
-    "Requests cannot be processed right now. Please retry later or contact the administrator.";
+    "The request could not be started right now. Please retry shortly.";
 pub(crate) const PUBLIC_MODEL_UNAVAILABLE_MESSAGE: &str =
-    "The requested model is not available. Select a supported model and retry.";
-pub(crate) const PUBLIC_INVALID_REQUEST_MESSAGE: &str =
-    "Invalid request. Simplify the message, tools, tool results, files, or images and retry.";
+    "The requested model is not available for this endpoint.";
+pub(crate) const PUBLIC_INVALID_REQUEST_MESSAGE: &str = "The request body is invalid. Simplify the message, tools, tool results, files, or images and retry.";
+pub(crate) const PUBLIC_RATE_LIMIT_MESSAGE: &str =
+    "No account is ready for this request right now. Please retry shortly.";
 
 pub(crate) fn public_message_with_error_id(message: &str, error_id: &str) -> String {
     format!("{message} If this continues, contact the administrator with error ID: {error_id}")
+}
+
+pub(crate) fn public_rate_limit_message(retry_after_secs: Option<u64>) -> String {
+    match retry_after_secs {
+        Some(seconds) if seconds > 0 => {
+            let unit = if seconds == 1 { "second" } else { "seconds" };
+            format!("No account is ready for this request right now. Retry after {seconds} {unit}.")
+        }
+        _ => PUBLIC_RATE_LIMIT_MESSAGE.to_string(),
+    }
 }
 
 fn random_anthropic_id(prefix: &str) -> String {
@@ -155,5 +166,66 @@ mod tests {
 
         assert_eq!(headers["request-id"], "req_existing");
         assert_eq!(headers["anthropic-request-id"], "req_01abc");
+    }
+
+    #[test]
+    fn public_error_messages_do_not_expose_internal_terms() {
+        let retry_after_message = public_rate_limit_message(Some(3));
+        for message in [
+            PUBLIC_TEMPORARY_FAILURE_MESSAGE,
+            PUBLIC_PROCESSING_FAILED_MESSAGE,
+            PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE,
+            PUBLIC_PROVIDER_NOT_READY_MESSAGE,
+            PUBLIC_MODEL_UNAVAILABLE_MESSAGE,
+            PUBLIC_INVALID_REQUEST_MESSAGE,
+            PUBLIC_RATE_LIMIT_MESSAGE,
+            retry_after_message.as_str(),
+        ] {
+            let lower = message.to_ascii_lowercase();
+            for forbidden in [
+                "credential",
+                "external pool",
+                "external_pool",
+                "fallback",
+                "backup",
+                "scheduler",
+                "lease",
+                "capacity snapshot",
+                "service unavailable",
+                "upstream",
+                "备用",
+                "外部池",
+                "凭据",
+                "凭证",
+            ] {
+                assert!(
+                    !public_message_contains_forbidden_term(&lower, forbidden),
+                    "public message leaked internal term {forbidden:?}: {message}"
+                );
+            }
+        }
+    }
+
+    fn public_message_contains_forbidden_term(lower_message: &str, forbidden: &str) -> bool {
+        if forbidden
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            return lower_message
+                .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .any(|part| part == forbidden);
+        }
+        lower_message.contains(forbidden)
+    }
+
+    #[test]
+    fn retry_after_message_uses_singular_and_plural_units() {
+        assert!(public_rate_limit_message(Some(1)).contains("1 second."));
+        assert!(public_rate_limit_message(Some(2)).contains("2 seconds."));
+        assert_eq!(
+            public_rate_limit_message(Some(0)),
+            PUBLIC_RATE_LIMIT_MESSAGE
+        );
+        assert_eq!(public_rate_limit_message(None), PUBLIC_RATE_LIMIT_MESSAGE);
     }
 }
