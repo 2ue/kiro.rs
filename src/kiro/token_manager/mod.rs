@@ -7,6 +7,7 @@ mod refresh;
 mod route_state;
 mod rpm;
 mod storage_task;
+mod strategy;
 mod types;
 
 pub use account_state::CredentialRiskControlReason;

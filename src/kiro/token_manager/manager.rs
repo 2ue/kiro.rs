@@ -52,6 +52,11 @@ use super::refresh::{
 use super::route_state::{CachedLocalPoolRouteState, LocalPoolRouteState, LocalPoolRouteStateKind};
 use super::rpm::{effective_rpm, entry_rate_limit_remaining, rate_limit_interval_for_rpm};
 use super::storage_task::{block_on_storage, spawn_best_effort_storage_task};
+use super::strategy::{
+    balanced_selection_key, entry_effective_health_mut, priority_selection_key,
+    record_local_selection, refresh_local_selection_windows_locked, scheduler_score_with_config,
+    select_health_weighted, selection_pressure_from_totals, should_select_warming_from_totals,
+};
 use super::types::{
     AcquireMode, CallContext, CredentialAuthUpdate, EXTERNAL_CREDENTIAL_CONTEXT_ID, InFlightKind,
     TransientFailureKind,
@@ -250,9 +255,6 @@ const LOCAL_POOL_ROUTE_STATE_CACHE_TTL: StdDuration = StdDuration::from_millis(2
 const LOCAL_POOL_ROUTE_STATE_CACHE_MAX_KEYS: usize = 128;
 const SELECTION_FAILURE_SAMPLE_LIMIT: usize = 20;
 const CREDENTIAL_STATS_FLUSH_MIN_INTERVAL: StdDuration = StdDuration::from_secs(5);
-const SELECTION_WINDOW_10S: StdDuration = StdDuration::from_secs(10);
-const SELECTION_WINDOW_60S: StdDuration = StdDuration::from_secs(60);
-const SELECTION_WINDOW_5M: StdDuration = StdDuration::from_secs(5 * 60);
 
 impl MultiTokenManager {
     /// 创建多凭据 Token 管理器
@@ -1103,26 +1105,6 @@ impl MultiTokenManager {
         true
     }
 
-    fn entry_effective_health<'a>(
-        entry: &'a CredentialEntry,
-        model: Option<&str>,
-    ) -> &'a SchedulerHealthState {
-        model
-            .map(model_state_key)
-            .and_then(|key| entry.model_health.get(&key))
-            .unwrap_or(&entry.health)
-    }
-
-    fn entry_effective_health_mut<'a>(
-        entry: &'a mut CredentialEntry,
-        model: Option<&str>,
-    ) -> &'a mut SchedulerHealthState {
-        match model.map(model_state_key) {
-            Some(key) => entry.model_health.entry(key).or_default(),
-            None => &mut entry.health,
-        }
-    }
-
     fn credential_is_dispatchable(
         proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
         entry: &CredentialEntry,
@@ -1444,122 +1426,6 @@ impl MultiTokenManager {
             StdDuration::from_millis(millis.max(1.0).round() as u64)
         });
         requested.clamp(StdDuration::from_secs(1), max)
-    }
-
-    fn scheduler_score_with_config(
-        entry: &CredentialEntry,
-        model: Option<&str>,
-        now_ms: i64,
-        selection_pressure: f64,
-        config: &Config,
-    ) -> f64 {
-        let max_concurrent = Self::effective_max_concurrent_requests(
-            entry,
-            config.credential_max_concurrent_requests,
-        );
-        let load = if max_concurrent > 0 {
-            entry.in_flight_requests as f64 / max_concurrent as f64
-        } else {
-            entry.in_flight_requests as f64
-        };
-        let health = Self::entry_effective_health(entry, model);
-        let probation = health
-            .probation_until_ms
-            .is_some_and(|until_ms| until_ms > now_ms) as u8 as f64;
-        entry.credentials.priority as f64 * config.scheduler_priority_weight.max(0.0)
-            + load * config.scheduler_load_weight.max(0.0)
-            + health.recent_error_rate.clamp(0.0, 1.0) * config.scheduler_error_weight.max(0.0)
-            + health.latency_ewma_ms.unwrap_or(0.0).max(0.0)
-                * config.scheduler_latency_weight.max(0.0)
-            + probation * config.scheduler_probation_weight.max(0.0)
-            + selection_pressure.max(0.0) * config.scheduler_selection_pressure_weight.max(0.0)
-            + (entry.total_selection_count as f64).ln_1p()
-                * config.scheduler_total_selection_weight.max(0.0)
-    }
-
-    fn prune_local_selection_events(entry: &mut CredentialEntry, now: Instant) {
-        while entry.selection_events.front().is_some_and(|selected_at| {
-            now.saturating_duration_since(*selected_at) > SELECTION_WINDOW_5M
-        }) {
-            entry.selection_events.pop_front();
-        }
-        entry.health.recent_selection_count_10s = entry
-            .selection_events
-            .iter()
-            .filter(|selected_at| {
-                now.saturating_duration_since(**selected_at) <= SELECTION_WINDOW_10S
-            })
-            .count()
-            .min(u32::MAX as usize) as u32;
-        entry.health.recent_selection_count_60s = entry
-            .selection_events
-            .iter()
-            .filter(|selected_at| {
-                now.saturating_duration_since(**selected_at) <= SELECTION_WINDOW_60S
-            })
-            .count()
-            .min(u32::MAX as usize) as u32;
-        entry.health.recent_selection_count_5m =
-            entry.selection_events.len().min(u32::MAX as usize) as u32;
-    }
-
-    fn record_local_selection(entry: &mut CredentialEntry, now: Instant) {
-        entry.total_selection_count = entry.total_selection_count.saturating_add(1);
-        entry.health.selection_count = entry.health.selection_count.saturating_add(1);
-        entry.selection_events.push_back(now);
-        Self::prune_local_selection_events(entry, now);
-    }
-
-    fn refresh_local_selection_windows_locked(entries: &mut [CredentialEntry], now: Instant) {
-        for entry in entries {
-            Self::prune_local_selection_events(entry, now);
-        }
-    }
-
-    fn selection_pressure_from_totals(
-        entry: &CredentialEntry,
-        total_recent: u64,
-        candidate_count: usize,
-    ) -> f64 {
-        if candidate_count <= 1 || total_recent == 0 {
-            return 0.0;
-        }
-        let share = entry.health.recent_selection_count_60s as f64 / total_recent as f64;
-        let expected_share = 1.0 / candidate_count as f64;
-        (share / expected_share - 1.0).max(0.0)
-    }
-
-    fn warmup_target_share_with_config(config: &Config, warming_count: usize) -> f64 {
-        if warming_count == 0 {
-            return 0.0;
-        }
-        let per_warming = config.credential_warmup_selection_percent.min(100) as f64 / 100.0;
-        let max_share = config.credential_warmup_max_selection_percent.min(100) as f64 / 100.0;
-        (per_warming * warming_count as f64).min(max_share).min(1.0)
-    }
-
-    fn should_select_warming_from_totals(
-        config: &Config,
-        ready_count: usize,
-        warming_count: usize,
-        total_recent: u64,
-        warming_recent: u64,
-    ) -> bool {
-        if warming_count == 0 {
-            return false;
-        }
-        if ready_count == 0 {
-            return true;
-        }
-        let target_share = Self::warmup_target_share_with_config(config, warming_count);
-        if target_share <= 0.0 {
-            return false;
-        }
-        if total_recent == 0 {
-            return true;
-        }
-        let current_share = warming_recent as f64 / total_recent as f64;
-        current_share < target_share
     }
 
     fn update_credential_rpm_from_config(&self) {
@@ -2110,7 +1976,7 @@ impl MultiTokenManager {
         let now = Instant::now();
         let max_concurrent_requests = self.max_concurrent_requests();
         if self.redis_store.is_none() {
-            Self::refresh_local_selection_windows_locked(&mut entries, now);
+            refresh_local_selection_windows_locked(&mut entries, now);
         }
         let proxy_resources = self.proxy_resources.lock();
         entries.iter().any(|entry| {
@@ -2186,7 +2052,7 @@ impl MultiTokenManager {
             return None;
         }
 
-        let select_warming = Self::should_select_warming_from_totals(
+        let select_warming = should_select_warming_from_totals(
             &config,
             ready.len(),
             warming.len(),
@@ -2200,7 +2066,7 @@ impl MultiTokenManager {
             "health_balanced" => {
                 // 预热不是后台主动打流量，而是在真实业务请求中按目标份额参与调度；
                 // 份额按预热账号数量放大并受最大预热份额限制，避免批量导入后长期吃不到流量。
-                let entry = self.select_health_weighted(
+                let entry = select_health_weighted(
                     candidates,
                     model,
                     Utc::now().timestamp_millis(),
@@ -2212,88 +2078,15 @@ impl MultiTokenManager {
             "balanced" => {
                 let entry = candidates
                     .iter()
-                    .min_by_key(|entry| Self::balanced_selection_key(entry))?;
+                    .min_by_key(|entry| balanced_selection_key(entry))?;
                 Some((entry.id, entry.credentials.clone()))
             }
             _ => {
                 // priority 模式（默认）：优先级仍是第一排序，但同优先级账号优先选低并发。
-                let entry = available
-                    .iter()
-                    .min_by_key(|e| Self::priority_selection_key(e))?;
+                let entry = available.iter().min_by_key(|e| priority_selection_key(e))?;
                 Some((entry.id, entry.credentials.clone()))
             }
         }
-    }
-
-    fn select_health_weighted<'a>(
-        &self,
-        candidates: &[&'a CredentialEntry],
-        model: Option<&str>,
-        now_ms: i64,
-        config: &Config,
-    ) -> Option<&'a CredentialEntry> {
-        let candidate_count = candidates.len();
-        let total_recent: u64 = candidates
-            .iter()
-            .map(|candidate| candidate.health.recent_selection_count_60s as u64)
-            .sum();
-        let top_k = (config.scheduler_top_k.max(1) as usize).min(candidate_count);
-        let mut top: Vec<(&CredentialEntry, f64)> = Vec::with_capacity(top_k);
-        for entry in candidates.iter().copied() {
-            let pressure =
-                Self::selection_pressure_from_totals(entry, total_recent, candidate_count);
-            let score = Self::scheduler_score_with_config(entry, model, now_ms, pressure, config);
-            let insert_at = top
-                .iter()
-                .position(|(existing_entry, existing_score)| {
-                    score < *existing_score
-                        || (score == *existing_score && entry.id < existing_entry.id)
-                })
-                .unwrap_or(top.len());
-            if insert_at < top_k {
-                top.insert(insert_at, (entry, score));
-                if top.len() > top_k {
-                    top.pop();
-                }
-            }
-        }
-        let worst_score = top.last()?.1;
-        let total_weight: f64 = top
-            .iter()
-            .map(|(_, score)| (worst_score - score + 1.0).max(0.01))
-            .sum();
-        let mut roll = fastrand::f64() * total_weight;
-        for (entry, score) in &top {
-            roll -= (worst_score - score + 1.0).max(0.01);
-            if roll <= 0.0 {
-                return Some(*entry);
-            }
-        }
-        top.last().map(|(entry, _)| *entry)
-    }
-
-    fn balanced_selection_key(entry: &CredentialEntry) -> (u32, u32, u32, u64, u32, u64, u64) {
-        (
-            entry.in_flight_requests,
-            entry.health.recent_selection_count_10s,
-            entry.health.recent_selection_count_60s,
-            entry.success_count,
-            entry.credentials.priority,
-            entry.total_selection_count,
-            entry.id,
-        )
-    }
-
-    fn priority_selection_key(entry: &CredentialEntry) -> (u32, u32, u32, u32, u64, u64, u64) {
-        (
-            entry.credentials.priority,
-            entry.in_flight_requests,
-            entry.health.recent_selection_count_10s,
-            entry.health.recent_selection_count_60s,
-            entry.success_count,
-            entry.total_selection_count,
-            entry.id,
-        )
     }
 
     fn prune_session_bindings_locked(bindings: &mut HashMap<String, SessionBinding>) {
@@ -3448,7 +3241,7 @@ impl MultiTokenManager {
             .iter()
             .find_map(|cooldown| cooldown.reason.clone());
         let selection_pressure =
-            Self::selection_pressure_from_totals(entry, score_total_recent, score_candidate_count);
+            selection_pressure_from_totals(entry, score_total_recent, score_candidate_count);
 
         CredentialEntrySnapshot {
             id: entry.id,
@@ -3549,7 +3342,7 @@ impl MultiTokenManager {
             recent_scheduler_selection_count_60s: entry.health.recent_selection_count_60s,
             recent_scheduler_selection_count_5m: entry.health.recent_selection_count_5m,
             scheduler_selection_pressure: selection_pressure,
-            scheduler_score: Self::scheduler_score_with_config(
+            scheduler_score: scheduler_score_with_config(
                 entry,
                 None,
                 now_ms,
@@ -4313,7 +4106,7 @@ impl MultiTokenManager {
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
-                Self::record_local_selection(entry, now);
+                record_local_selection(entry, now);
             }
         }
         if let Some(redis) = &self.redis_store {
@@ -4399,7 +4192,7 @@ impl MultiTokenManager {
                 let now = now_at.to_rfc3339();
                 entry.last_used_at = Some(now.clone());
                 {
-                    let health = Self::entry_effective_health_mut(entry, model);
+                    let health = entry_effective_health_mut(entry, model);
                     health.recent_error_rate *= 1.0 - alpha;
                     health.transient_failure_streak =
                         health.transient_failure_streak.saturating_sub(1);
@@ -4489,7 +4282,7 @@ impl MultiTokenManager {
                 return Ok(entries.iter().any(|entry| !entry.disabled));
             };
             let streak = {
-                let health = Self::entry_effective_health_mut(entry, model);
+                let health = entry_effective_health_mut(entry, model);
                 health.transient_failure_streak = health.transient_failure_streak.saturating_add(1);
                 health.recent_error_rate += alpha * (1.0 - health.recent_error_rate);
                 health.last_error_kind = Some(kind.as_str().to_string());
@@ -4520,7 +4313,7 @@ impl MultiTokenManager {
                 entry.cooldown_until = Some(until);
                 entry.cooldown_reason = Some(reason.clone());
             }
-            let health = Self::entry_effective_health_mut(entry, model);
+            let health = entry_effective_health_mut(entry, model);
             health.probation_until_ms = Some(
                 health
                     .probation_until_ms
@@ -5058,7 +4851,7 @@ impl MultiTokenManager {
         let config = self.config.lock().clone();
         let mut entries = self.entries.lock();
         if self.redis_store.is_none() {
-            Self::refresh_local_selection_windows_locked(&mut entries, Instant::now());
+            refresh_local_selection_windows_locked(&mut entries, Instant::now());
         }
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
@@ -5209,7 +5002,7 @@ impl MultiTokenManager {
         let mut entries = self.entries.lock();
         let now = Instant::now();
         if self.redis_store.is_none() {
-            Self::refresh_local_selection_windows_locked(&mut entries, now);
+            refresh_local_selection_windows_locked(&mut entries, now);
         }
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
@@ -7498,8 +7291,8 @@ mod tests {
         config.scheduler_total_selection_weight = 0.0;
 
         assert_eq!(
-            MultiTokenManager::scheduler_score_with_config(&worse, None, now_ms, 0.0, &config),
-            MultiTokenManager::scheduler_score_with_config(&better, None, now_ms, 0.0, &config)
+            scheduler_score_with_config(&worse, None, now_ms, 0.0, &config),
+            scheduler_score_with_config(&better, None, now_ms, 0.0, &config)
         );
 
         let weight_setters: [fn(&mut Config); 7] = [
@@ -7516,11 +7309,8 @@ mod tests {
             let mut weighted = config.clone();
             enable_weight(&mut weighted);
             assert!(
-                MultiTokenManager::scheduler_score_with_config(
-                    &worse, None, now_ms, 1.0, &weighted,
-                ) > MultiTokenManager::scheduler_score_with_config(
-                    &better, None, now_ms, 0.0, &weighted,
-                ),
+                scheduler_score_with_config(&worse, None, now_ms, 1.0, &weighted)
+                    > scheduler_score_with_config(&better, None, now_ms, 0.0, &weighted),
                 "启用单个健康调度权重后，较差候选得分应更高"
             );
         }
