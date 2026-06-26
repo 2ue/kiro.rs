@@ -40,6 +40,13 @@ use super::admin_snapshot::{
     CredentialBaseSnapshot, CredentialEntrySnapshot, ManagerBaseSnapshot, ManagerRuntimeSnapshot,
     ManagerSnapshot, ManagerSummarySnapshot,
 };
+use super::capacity::{
+    credential_is_dispatch_candidate, credential_is_dispatchable,
+    credential_is_temporarily_available, credential_is_usable_for_model,
+    credential_proxy_availability, credential_proxy_is_dispatchable,
+    effective_max_concurrent_requests, entry_has_concurrency_capacity,
+    global_has_concurrency_capacity, is_opus_model, proxy_unavailable_error,
+};
 use super::concurrency::{DispatchQueueGuard, InFlightLeaseGuard};
 use super::cooldown::{
     entry_any_cooldown_remaining, entry_cooldown_remaining, entry_cooldown_snapshots,
@@ -850,7 +857,7 @@ impl MultiTokenManager {
             .iter()
             .map(|entry| entry.in_flight_requests)
             .sum::<u32>();
-        let global_has_capacity = Self::global_has_concurrency_capacity(
+        let global_has_capacity = global_has_concurrency_capacity(
             global_in_flight,
             config.dispatch_global_max_concurrent_requests,
         );
@@ -863,10 +870,9 @@ impl MultiTokenManager {
         for entry in entries.iter() {
             let (reason, cooldown_remaining) = if entry.disabled {
                 (AccountRejectReason::Disabled, None)
-            } else if Self::is_opus_model(model) && !entry.credentials.supports_opus() {
+            } else if is_opus_model(model) && !entry.credentials.supports_opus() {
                 (AccountRejectReason::ModelNotSupported, None)
-            } else if !Self::credential_proxy_is_dispatchable(&entry.credentials, &proxy_resources)
-            {
+            } else if !credential_proxy_is_dispatchable(&entry.credentials, &proxy_resources) {
                 (AccountRejectReason::ProxyUnavailable, None)
             } else if let Some(remaining) = entry_cooldown_remaining(entry, model, now) {
                 (AccountRejectReason::CooldownActive, Some(remaining))
@@ -876,7 +882,7 @@ impl MultiTokenManager {
             } else if !global_has_capacity {
                 waitable_account_count = waitable_account_count.saturating_add(1);
                 (AccountRejectReason::GlobalConcurrencyFull, None)
-            } else if !Self::entry_has_concurrency_capacity(
+            } else if !entry_has_concurrency_capacity(
                 entry,
                 config.credential_max_concurrent_requests,
             ) {
@@ -895,7 +901,7 @@ impl MultiTokenManager {
                     reason,
                     rpm_limit: Some(effective_rpm(entry, global_rpm)),
                     in_flight: Some(entry.in_flight_requests),
-                    max_concurrent: Some(Self::effective_max_concurrent_requests(
+                    max_concurrent: Some(effective_max_concurrent_requests(
                         entry,
                         config.credential_max_concurrent_requests,
                     )),
@@ -930,7 +936,7 @@ impl MultiTokenManager {
             .iter()
             .map(|entry| entry.in_flight_requests)
             .sum::<u32>();
-        let global_has_capacity = Self::global_has_concurrency_capacity(
+        let global_has_capacity = global_has_concurrency_capacity(
             global_in_flight_requests,
             config.dispatch_global_max_concurrent_requests,
         );
@@ -945,19 +951,19 @@ impl MultiTokenManager {
         let mut effective_concurrency_range: Option<(u32, u32)> = None;
 
         for entry in entries.iter() {
-            if !Self::credential_is_usable_for_model(entry, model) {
+            if !credential_is_usable_for_model(entry, model) {
                 continue;
             }
             model_usable += 1;
 
-            if !Self::credential_proxy_is_dispatchable(&entry.credentials, &proxy_resources) {
+            if !credential_proxy_is_dispatchable(&entry.credentials, &proxy_resources) {
                 proxy_blocked += 1;
                 continue;
             }
 
             usable += 1;
             let effective_concurrency =
-                Self::effective_max_concurrent_requests(entry, max_concurrent_requests);
+                effective_max_concurrent_requests(entry, max_concurrent_requests);
             effective_concurrency_range = Some(match effective_concurrency_range {
                 Some((min, max)) => (
                     min.min(effective_concurrency),
@@ -985,7 +991,7 @@ impl MultiTokenManager {
             }
 
             if !global_has_capacity
-                || !Self::entry_has_concurrency_capacity(entry, max_concurrent_requests)
+                || !entry_has_concurrency_capacity(entry, max_concurrent_requests)
             {
                 concurrency_blocked += 1;
                 continue;
@@ -1089,131 +1095,6 @@ impl MultiTokenManager {
         true
     }
 
-    fn is_opus_model(model: Option<&str>) -> bool {
-        model
-            .map(|m| m.to_lowercase().contains("opus"))
-            .unwrap_or(false)
-    }
-
-    fn credential_is_usable_for_model(entry: &CredentialEntry, model: Option<&str>) -> bool {
-        if entry.disabled {
-            return false;
-        }
-        if Self::is_opus_model(model) && !entry.credentials.supports_opus() {
-            return false;
-        }
-        true
-    }
-
-    fn credential_is_dispatchable(
-        proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
-        entry: &CredentialEntry,
-        model: Option<&str>,
-        now: Instant,
-        max_concurrent_requests: u32,
-    ) -> bool {
-        Self::credential_is_usable_for_model(entry, model)
-            && Self::credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
-            && entry_cooldown_remaining(entry, model, now).is_none()
-            && entry_rate_limit_remaining(entry, now).is_none()
-            && Self::entry_has_concurrency_capacity(entry, max_concurrent_requests)
-    }
-
-    fn credential_is_temporarily_available(
-        proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
-        entry: &CredentialEntry,
-        model: Option<&str>,
-        now: Instant,
-    ) -> bool {
-        Self::credential_is_usable_for_model(entry, model)
-            && Self::credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
-            && entry_cooldown_remaining(entry, model, now).is_none()
-            && entry_rate_limit_remaining(entry, now).is_none()
-    }
-
-    fn credential_is_dispatch_candidate(
-        proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
-        entry: &CredentialEntry,
-        model: Option<&str>,
-        excluded_ids: &HashSet<u64>,
-    ) -> bool {
-        !excluded_ids.contains(&entry.id)
-            && Self::credential_is_usable_for_model(entry, model)
-            && Self::credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
-    }
-
-    fn credential_proxy_availability(
-        credentials: &KiroCredentials,
-        proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
-    ) -> Option<ProxyResourceAvailability> {
-        if credentials.proxy_url.is_some() {
-            return None;
-        }
-        let resource_id = credentials.proxy_resource_id?;
-        let Some(resource) = proxy_resources.get(&resource_id) else {
-            return Some(ProxyResourceAvailability::Missing(resource_id));
-        };
-        if !resource.enabled {
-            return Some(ProxyResourceAvailability::Disabled(resource.clone()));
-        }
-        Some(ProxyResourceAvailability::Available(resource.clone()))
-    }
-
-    fn credential_proxy_is_dispatchable(
-        credentials: &KiroCredentials,
-        proxy_resources: &HashMap<u64, ProxyResourceRuntime>,
-    ) -> bool {
-        match Self::credential_proxy_availability(credentials, proxy_resources) {
-            Some(ProxyResourceAvailability::Missing(_))
-            | Some(ProxyResourceAvailability::Disabled(_)) => false,
-            Some(ProxyResourceAvailability::Available(_)) | None => true,
-        }
-    }
-
-    fn proxy_unavailable_error(
-        credential_id: Option<u64>,
-        availability: ProxyResourceAvailability,
-    ) -> anyhow::Error {
-        match availability {
-            ProxyResourceAvailability::Missing(resource_id) => anyhow::anyhow!(
-                "凭据 #{} 绑定的代理资源 #{} 不存在，已阻止回退到全局代理/直连",
-                credential_id.unwrap_or_default(),
-                resource_id
-            ),
-            ProxyResourceAvailability::Disabled(resource) => anyhow::anyhow!(
-                "凭据 #{} 绑定的代理资源「{}」已禁用，已阻止回退到全局代理/直连",
-                credential_id.unwrap_or_default(),
-                resource.name
-            ),
-            ProxyResourceAvailability::Available(_) => {
-                anyhow::anyhow!("代理资源可用状态异常")
-            }
-        }
-    }
-
-    fn effective_max_concurrent_requests(
-        entry: &CredentialEntry,
-        global_max_concurrent_requests: u32,
-    ) -> u32 {
-        entry
-            .credentials
-            .max_concurrent_requests
-            .unwrap_or(global_max_concurrent_requests)
-    }
-
-    fn entry_has_concurrency_capacity(
-        entry: &CredentialEntry,
-        global_max_concurrent_requests: u32,
-    ) -> bool {
-        let max_concurrent_requests =
-            Self::effective_max_concurrent_requests(entry, global_max_concurrent_requests);
-        max_concurrent_requests == 0 || entry.in_flight_requests < max_concurrent_requests
-    }
-
-    fn global_has_concurrency_capacity(global_in_flight: u32, global_max: u32) -> bool {
-        global_max == 0 || global_in_flight < global_max
-    }
-
     fn max_concurrent_requests(&self) -> u32 {
         self.config.lock().credential_max_concurrent_requests
     }
@@ -1227,9 +1108,7 @@ impl MultiTokenManager {
         entries
             .iter()
             .find(|entry| entry.id == id)
-            .map(|entry| {
-                Self::effective_max_concurrent_requests(entry, global_max_concurrent_requests)
-            })
+            .map(|entry| effective_max_concurrent_requests(entry, global_max_concurrent_requests))
             .unwrap_or(global_max_concurrent_requests)
     }
 
@@ -1343,7 +1222,7 @@ impl MultiTokenManager {
             return false;
         }
         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-            if !Self::entry_has_concurrency_capacity(entry, max_concurrent_requests) {
+            if !entry_has_concurrency_capacity(entry, max_concurrent_requests) {
                 return false;
             }
             entry.in_flight_requests = entry.in_flight_requests.saturating_add(1);
@@ -1491,7 +1370,7 @@ impl MultiTokenManager {
         entries
             .iter()
             .filter(|entry| {
-                Self::credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids)
+                credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids)
             })
             .filter_map(|entry| {
                 match (
@@ -1520,11 +1399,11 @@ impl MultiTokenManager {
         entries
             .iter()
             .filter(|entry| {
-                Self::credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids)
+                credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids)
                     && entry_cooldown_remaining(entry, model, now).is_none()
                     && entry_rate_limit_remaining(entry, now).is_none()
                     && (!global_has_capacity
-                        || !Self::entry_has_concurrency_capacity(entry, max_concurrent_requests))
+                        || !entry_has_concurrency_capacity(entry, max_concurrent_requests))
             })
             .count()
     }
@@ -1539,11 +1418,9 @@ impl MultiTokenManager {
         entries
             .iter()
             .filter(|entry| {
-                Self::credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids)
+                credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids)
             })
-            .map(|entry| {
-                Self::effective_max_concurrent_requests(entry, global_max_concurrent_requests)
-            })
+            .map(|entry| effective_max_concurrent_requests(entry, global_max_concurrent_requests))
             .fold(None, |range, value| {
                 Some(match range {
                     Some((min, max)) => (min.min(value), max.max(value)),
@@ -1982,7 +1859,7 @@ impl MultiTokenManager {
         entries.iter().any(|entry| {
             entry.id != current_id
                 && !excluded_ids.contains(&entry.id)
-                && Self::credential_is_dispatchable(
+                && credential_is_dispatchable(
                     &proxy_resources,
                     entry,
                     model,
@@ -2011,7 +1888,7 @@ impl MultiTokenManager {
             .iter()
             .map(|entry| entry.in_flight_requests)
             .sum::<u32>();
-        let global_has_capacity = Self::global_has_concurrency_capacity(
+        let global_has_capacity = global_has_concurrency_capacity(
             global_in_flight,
             config.dispatch_global_max_concurrent_requests,
         );
@@ -2025,7 +1902,7 @@ impl MultiTokenManager {
         if global_has_capacity {
             for entry in entries.iter() {
                 if excluded_ids.contains(&entry.id)
-                    || !Self::credential_is_dispatchable(
+                    || !credential_is_dispatchable(
                         &proxy_resources,
                         entry,
                         model,
@@ -2142,7 +2019,7 @@ impl MultiTokenManager {
             .iter()
             .find(|e| {
                 e.id == bound_id
-                    && Self::credential_is_dispatchable(
+                    && credential_is_dispatchable(
                         &proxy_resources,
                         e,
                         model,
@@ -2171,9 +2048,10 @@ impl MultiTokenManager {
         let entries = self.entries.lock();
         let proxy_resources = self.proxy_resources.lock();
         let now = Instant::now();
-        entries.iter().find(|e| e.id == bound_id).is_none_or(|e| {
-            !Self::credential_is_temporarily_available(&proxy_resources, e, model, now)
-        })
+        entries
+            .iter()
+            .find(|e| e.id == bound_id)
+            .is_none_or(|e| !credential_is_temporarily_available(&proxy_resources, e, model, now))
     }
 
     fn bind_session_to_credential(&self, session_id: &str, credential_id: u64) {
@@ -2457,19 +2335,19 @@ impl MultiTokenManager {
                                 .iter()
                                 .map(|entry| entry.in_flight_requests)
                                 .sum::<u32>();
-                            let global_has_capacity = Self::global_has_concurrency_capacity(
+                            let global_has_capacity = global_has_concurrency_capacity(
                                 global_in_flight,
                                 config.dispatch_global_max_concurrent_requests,
                             );
                             let model_usable = entries
                                 .iter()
-                                .filter(|e| Self::credential_is_usable_for_model(e, model))
+                                .filter(|e| credential_is_usable_for_model(e, model))
                                 .count();
                             let usable = entries
                                 .iter()
                                 .filter(|e| {
-                                    Self::credential_is_usable_for_model(e, model)
-                                        && Self::credential_proxy_is_dispatchable(
+                                    credential_is_usable_for_model(e, model)
+                                        && credential_proxy_is_dispatchable(
                                             &e.credentials,
                                             &proxy_resources,
                                         )
@@ -2478,8 +2356,8 @@ impl MultiTokenManager {
                             let proxy_blocked = entries
                                 .iter()
                                 .filter(|e| {
-                                    Self::credential_is_usable_for_model(e, model)
-                                        && !Self::credential_proxy_is_dispatchable(
+                                    credential_is_usable_for_model(e, model)
+                                        && !credential_proxy_is_dispatchable(
                                             &e.credentials,
                                             &proxy_resources,
                                         )
@@ -2490,7 +2368,7 @@ impl MultiTokenManager {
                                     .iter()
                                     .filter(|e| {
                                         !local_excluded_ids.contains(&e.id)
-                                            && Self::credential_is_dispatchable(
+                                            && credential_is_dispatchable(
                                                 &proxy_resources,
                                                 e,
                                                 model,
@@ -2516,8 +2394,8 @@ impl MultiTokenManager {
                                 .iter()
                                 .filter(|e| {
                                     local_excluded_ids.contains(&e.id)
-                                        && Self::credential_is_usable_for_model(e, model)
-                                        && Self::credential_proxy_is_dispatchable(
+                                        && credential_is_usable_for_model(e, model)
+                                        && credential_proxy_is_dispatchable(
                                             &e.credentials,
                                             &proxy_resources,
                                         )
@@ -2569,7 +2447,7 @@ impl MultiTokenManager {
                                 let dispatch_candidate_count = entries
                                     .iter()
                                     .filter(|e| {
-                                        Self::credential_is_dispatch_candidate(
+                                        credential_is_dispatch_candidate(
                                             &proxy_resources,
                                             e,
                                             model,
@@ -2580,7 +2458,7 @@ impl MultiTokenManager {
                                 let cooldown_blocked = entries
                                     .iter()
                                     .filter(|e| {
-                                        Self::credential_is_dispatch_candidate(
+                                        credential_is_dispatch_candidate(
                                             &proxy_resources,
                                             e,
                                             model,
@@ -3061,7 +2939,7 @@ impl MultiTokenManager {
         }
         let availability = {
             let resources = self.proxy_resources.lock();
-            Self::credential_proxy_availability(&creds, &resources)
+            credential_proxy_availability(&creds, &resources)
         };
         let Some(availability) = availability else {
             return Ok(creds);
@@ -3074,7 +2952,7 @@ impl MultiTokenManager {
                 creds.proxy_password = resource.proxy_password;
                 Ok(creds)
             }
-            unavailable => Err(Self::proxy_unavailable_error(creds.id, unavailable)),
+            unavailable => Err(proxy_unavailable_error(creds.id, unavailable)),
         }
     }
 
@@ -3198,7 +3076,7 @@ impl MultiTokenManager {
             effective_proxy_url,
             effective_proxy_source,
             endpoint: entry.credentials.endpoint.clone(),
-            max_concurrent_requests: Self::effective_max_concurrent_requests(
+            max_concurrent_requests: effective_max_concurrent_requests(
                 entry,
                 config.credential_max_concurrent_requests,
             ),
@@ -3310,7 +3188,7 @@ impl MultiTokenManager {
             in_flight_requests: entry.in_flight_requests,
             oldest_in_flight_age_secs,
             newest_in_flight_idle_secs,
-            max_concurrent_requests: Self::effective_max_concurrent_requests(
+            max_concurrent_requests: effective_max_concurrent_requests(
                 entry,
                 max_concurrent_requests,
             ),
@@ -4363,7 +4241,7 @@ impl MultiTokenManager {
             let max_concurrent_requests = self.max_concurrent_requests();
             entries.iter().any(|e| {
                 e.id != id
-                    && Self::credential_is_dispatchable(
+                    && credential_is_dispatchable(
                         &proxy_resources,
                         e,
                         model,
@@ -4872,7 +4750,7 @@ impl MultiTokenManager {
         let score_candidates: Vec<_> = entries
             .iter()
             .filter(|entry| {
-                Self::credential_is_dispatchable(
+                credential_is_dispatchable(
                     &proxy_resources,
                     entry,
                     None,
@@ -5014,7 +4892,7 @@ impl MultiTokenManager {
         let score_candidates: Vec<_> = entries
             .iter()
             .filter(|entry| {
-                Self::credential_is_dispatchable(
+                credential_is_dispatchable(
                     &proxy_resources,
                     entry,
                     None,

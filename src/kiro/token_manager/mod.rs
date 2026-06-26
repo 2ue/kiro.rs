@@ -1,5 +1,6 @@
 mod account_state;
 mod admin_snapshot;
+mod capacity;
 mod concurrency;
 mod cooldown;
 mod manager;
