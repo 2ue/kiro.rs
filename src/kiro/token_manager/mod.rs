@@ -8,6 +8,7 @@ mod queue;
 mod refresh;
 mod route_state;
 mod rpm;
+mod sticky;
 mod storage_task;
 mod strategy;
 mod types;

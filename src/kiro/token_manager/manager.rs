@@ -29,7 +29,6 @@ use crate::storage::postgres::{
 };
 use crate::storage::redis_cache::{
     RedisStore, SchedulerCredentialState, SchedulerGlobalCapacityState, SchedulerHealthState,
-    SchedulerSessionBinding,
 };
 
 use super::account_state::{
@@ -62,6 +61,15 @@ use super::refresh::{
 };
 use super::route_state::{CachedLocalPoolRouteState, LocalPoolRouteState, LocalPoolRouteStateKind};
 use super::rpm::{effective_rpm, entry_rate_limit_remaining, rate_limit_interval_for_rpm};
+use super::sticky::{
+    bind_session_to_credential as bind_sticky_session_to_credential,
+    bound_credential_id as sticky_bound_credential_id,
+    clear_session_soft_failure as clear_sticky_session_soft_failure, prune_session_bindings_locked,
+    record_session_soft_failure as record_sticky_session_soft_failure,
+    unbind_session as unbind_sticky_session,
+    unbind_session_if_bound_to as unbind_sticky_session_if_bound_to,
+    unbind_sessions_for_credential as unbind_sticky_sessions_for_credential,
+};
 use super::storage_task::{block_on_storage, spawn_best_effort_storage_task};
 use super::strategy::{
     balanced_selection_key, entry_effective_health_mut, priority_selection_key,
@@ -250,12 +258,6 @@ pub struct MultiTokenManager {
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
-/// 会话绑定最长保留时间，避免长期运行进程无限增长。
-const SESSION_BINDING_TTL_SECS: i64 = 6 * 60 * 60;
-/// 会话绑定表上限。
-const MAX_SESSION_BINDINGS: usize = 10_000;
-/// 同一会话绑定账号连续软失败达到该阈值后，本次请求允许临时 fallback。
-const MAX_SESSION_SOFT_FAILURES: u32 = 2;
 /// 并发排队等待的周期性唤醒间隔，避免极端竞态下丢失通知后永久睡眠。
 const CONCURRENCY_WAIT_WAKEUP_SECS: u64 = 30;
 const SCHEDULER_REDIS_SYNC_MIN_INTERVAL: StdDuration = StdDuration::from_secs(1);
@@ -1892,30 +1894,6 @@ impl MultiTokenManager {
         }
     }
 
-    fn prune_session_bindings_locked(bindings: &mut HashMap<String, SessionBinding>) {
-        let now = Utc::now();
-        bindings.retain(|_, binding| {
-            now.signed_duration_since(binding.last_used_at)
-                .num_seconds()
-                <= SESSION_BINDING_TTL_SECS
-        });
-
-        if bindings.len() <= MAX_SESSION_BINDINGS {
-            return;
-        }
-
-        let mut sessions_by_age: Vec<_> = bindings
-            .iter()
-            .map(|(session_id, binding)| (session_id.clone(), binding.last_used_at))
-            .collect();
-        sessions_by_age.sort_by_key(|(_, last_used_at)| *last_used_at);
-
-        let remove_count = bindings.len() - MAX_SESSION_BINDINGS;
-        for (session_id, _) in sessions_by_age.into_iter().take(remove_count) {
-            bindings.remove(&session_id);
-        }
-    }
-
     fn get_bound_credential(
         &self,
         session_id: &str,
@@ -1927,7 +1905,7 @@ impl MultiTokenManager {
         }
         let bound_id = {
             let mut bindings = self.session_bindings.lock();
-            Self::prune_session_bindings_locked(&mut bindings);
+            prune_session_bindings_locked(&mut bindings);
             bindings
                 .get(session_id)
                 .map(|binding| binding.credential_id)
@@ -1957,10 +1935,7 @@ impl MultiTokenManager {
     }
 
     fn bound_credential_id(&self, session_id: &str) -> Option<u64> {
-        self.session_bindings
-            .lock()
-            .get(session_id)
-            .map(|binding| binding.credential_id)
+        sticky_bound_credential_id(&self.session_bindings, session_id)
     }
 
     fn bound_credential_exists_but_unusable(&self, session_id: &str, model: Option<&str>) -> bool {
@@ -1981,146 +1956,60 @@ impl MultiTokenManager {
     }
 
     fn bind_session_to_credential(&self, session_id: &str, credential_id: u64) {
-        let soft_failure_count = {
-            let mut bindings = self.session_bindings.lock();
-            Self::prune_session_bindings_locked(&mut bindings);
-            match bindings.get_mut(session_id) {
-                Some(binding) if binding.credential_id == credential_id => {
-                    binding.last_used_at = Utc::now();
-                    binding.soft_failure_count
-                }
-                _ => {
-                    bindings.insert(
-                        session_id.to_string(),
-                        SessionBinding {
-                            credential_id,
-                            last_used_at: Utc::now(),
-                            soft_failure_count: 0,
-                        },
-                    );
-                    0
-                }
-            }
-        };
-        if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            let session_id = session_id.to_string();
-            spawn_best_effort_storage_task("写入 Redis 会话绑定", async move {
-                let binding = SchedulerSessionBinding {
-                    credential_id,
-                    last_used_at: Utc::now(),
-                    soft_failure_count,
-                };
-                redis
-                    .set_session_binding(&session_id, &binding, SESSION_BINDING_TTL_SECS as usize)
-                    .await
-            });
-        }
+        bind_sticky_session_to_credential(
+            &self.session_bindings,
+            self.redis_store.as_ref(),
+            session_id,
+            credential_id,
+        );
     }
 
     /// 清理指定会话的粘性绑定。
     pub fn unbind_session(&self, session_id: &str) {
-        self.session_bindings.lock().remove(session_id);
-        if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            let session_id = session_id.to_string();
-            spawn_best_effort_storage_task("删除 Redis 会话绑定", async move {
-                redis.delete_session_binding(&session_id).await
-            });
-        }
+        unbind_sticky_session(
+            &self.session_bindings,
+            self.redis_store.as_ref(),
+            session_id,
+        );
     }
 
     /// 仅当指定会话当前绑定到该凭据时清理绑定。
     pub fn unbind_session_if_bound_to(&self, session_id: &str, credential_id: u64) {
-        let mut bindings = self.session_bindings.lock();
-        if bindings
-            .get(session_id)
-            .is_some_and(|binding| binding.credential_id == credential_id)
-        {
-            bindings.remove(session_id);
-            drop(bindings);
-            if let Some(redis) = &self.redis_store {
-                let redis = redis.clone();
-                let session_id = session_id.to_string();
-                spawn_best_effort_storage_task("删除 Redis 会话绑定", async move {
-                    redis.delete_session_binding(&session_id).await
-                });
-            }
-        }
+        unbind_sticky_session_if_bound_to(
+            &self.session_bindings,
+            self.redis_store.as_ref(),
+            session_id,
+            credential_id,
+        );
     }
 
     /// 清理某个凭据关联的所有会话绑定。
     pub fn unbind_sessions_for_credential(&self, credential_id: u64) {
-        self.session_bindings
-            .lock()
-            .retain(|_, binding| binding.credential_id != credential_id);
-        if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            spawn_best_effort_storage_task("删除 Redis 凭据会话绑定", async move {
-                redis.delete_sessions_for_credential(credential_id).await?;
-                Ok(())
-            });
-        }
+        unbind_sticky_sessions_for_credential(
+            &self.session_bindings,
+            self.redis_store.as_ref(),
+            credential_id,
+        );
     }
 
     /// 记录绑定账号的一次软失败。返回 true 表示本次请求可以临时 fallback。
     pub fn record_session_soft_failure(&self, session_id: &str, credential_id: u64) -> bool {
-        let should_fallback = {
-            let mut bindings = self.session_bindings.lock();
-            if let Some(binding) = bindings.get_mut(session_id) {
-                if binding.credential_id == credential_id {
-                    binding.last_used_at = Utc::now();
-                    binding.soft_failure_count = binding.soft_failure_count.saturating_add(1);
-                    binding.soft_failure_count >= MAX_SESSION_SOFT_FAILURES
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        };
-        if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            let session_id = session_id.to_string();
-            spawn_best_effort_storage_task("记录 Redis 会话软失败", async move {
-                redis
-                    .record_session_soft_failure(
-                        &session_id,
-                        credential_id,
-                        MAX_SESSION_SOFT_FAILURES,
-                        SESSION_BINDING_TTL_SECS as usize,
-                    )
-                    .await?;
-                Ok(())
-            });
-        }
-        should_fallback
+        record_sticky_session_soft_failure(
+            &self.session_bindings,
+            self.redis_store.as_ref(),
+            session_id,
+            credential_id,
+        )
     }
 
     /// 清理绑定账号的软失败计数。
     pub fn clear_session_soft_failure(&self, session_id: &str, credential_id: u64) {
-        {
-            let mut bindings = self.session_bindings.lock();
-            if let Some(binding) = bindings.get_mut(session_id) {
-                if binding.credential_id == credential_id {
-                    binding.last_used_at = Utc::now();
-                    binding.soft_failure_count = 0;
-                }
-            }
-        }
-        if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            let session_id = session_id.to_string();
-            spawn_best_effort_storage_task("清理 Redis 会话软失败", async move {
-                redis
-                    .clear_session_soft_failure(
-                        &session_id,
-                        credential_id,
-                        SESSION_BINDING_TTL_SECS as usize,
-                    )
-                    .await
-            });
-        }
+        clear_sticky_session_soft_failure(
+            &self.session_bindings,
+            self.redis_store.as_ref(),
+            session_id,
+            credential_id,
+        );
     }
 
     /// 获取 API 调用上下文
