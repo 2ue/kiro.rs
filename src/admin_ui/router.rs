@@ -203,5 +203,12 @@ mod tests {
         let console = std::str::from_utf8(console.data.as_ref()).expect("console index is utf-8");
         assert!(console.contains("/console/assets/"));
         assert!(!console.contains("/admin/assets/"));
+
+        let new_ui = <NewUiAsset as rust_embed::RustEmbed>::get("index.html")
+            .expect("ui index should be embedded");
+        let new_ui = std::str::from_utf8(new_ui.data.as_ref()).expect("ui index is utf-8");
+        assert!(new_ui.contains("/ui/assets/"));
+        assert!(!new_ui.contains("/admin/assets/"));
+        assert!(!new_ui.contains("/console/assets/"));
     }
 }

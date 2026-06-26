@@ -10,6 +10,11 @@ admin-ui-daisy/node_modules/
 admin-ui-daisy/dist/
 admin-ui-daisy/tsconfig.tsbuildinfo
 admin-ui-daisy/.vite/
+ui/node_modules/
+ui/dist/
+ui/tsconfig.tsbuildinfo
+ui/.vite/
+.local-run/
 
 # Version control
 .git/

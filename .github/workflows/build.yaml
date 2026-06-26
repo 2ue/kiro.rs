@@ -53,6 +53,14 @@ jobs:
         working-directory: admin-ui-daisy
         run: pnpm build
 
+      - name: Install ui dependencies
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Build ui
+        working-directory: ui
+        run: pnpm build
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 

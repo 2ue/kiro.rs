@@ -14,6 +14,12 @@ RUN pnpm install --frozen-lockfile
 COPY admin-ui-daisy ./
 RUN pnpm build
 
+WORKDIR /app/ui
+COPY ui/package.json ui/pnpm-lock.yaml ui/.npmrc ui/pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY ui ./
+RUN pnpm build
+
 FROM rust:1.92-alpine AS builder
 
 RUN apk add --no-cache musl-dev perl make
@@ -24,6 +30,7 @@ COPY src ./src
 COPY data ./data
 COPY --from=frontend-builder /app/admin-ui/dist /app/admin-ui/dist
 COPY --from=frontend-builder /app/admin-ui-daisy/dist /app/admin-ui-daisy/dist
+COPY --from=frontend-builder /app/ui/dist /app/ui/dist
 
 ENV CARGO_PROFILE_RELEASE_LTO=false \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16

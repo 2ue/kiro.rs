@@ -48,11 +48,5 @@
   },
   "volta": {
     "node": "22.23.0"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "@swc/core",
-      "esbuild"
-    ]
   }
 }
