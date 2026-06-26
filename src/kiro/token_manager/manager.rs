@@ -52,6 +52,10 @@ use super::queue::{
     concurrency_blocked_count, effective_concurrency_range_for_candidates,
     format_effective_concurrency_range, min_dispatch_wait,
 };
+use super::redis_runtime::{
+    publish_credentials_changed as publish_redis_credentials_changed,
+    publish_runtime_config_changed as publish_redis_runtime_config_changed,
+};
 use super::refresh::{
     RefreshTokenInvalidError, get_usage_limits, is_token_expired, is_token_expiring_soon,
     refresh_token, validate_refresh_token,
@@ -2963,52 +2967,18 @@ impl MultiTokenManager {
         Ok(changed)
     }
 
-    fn redis_event_payload(&self, kind: &str, version: Option<i64>, reason: &str) -> String {
-        serde_json::json!({
-            "kind": kind,
-            "version": version,
-            "reason": reason,
-            "changedAt": Utc::now().to_rfc3339(),
-        })
-        .to_string()
-    }
-
     fn publish_runtime_config_changed(&self, version: Option<i64>, reason: &str) {
         self.invalidate_local_pool_route_state_cache();
-        let Some(redis) = &self.redis_store else {
-            return;
-        };
-        let redis = redis.clone();
-        let payload = self.redis_event_payload("runtime_config_changed", version, reason);
-        spawn_best_effort_storage_task("发布 Redis 运行配置变更通知", async move {
-            redis.publish_runtime_config_changed(payload).await
-        });
+        publish_redis_runtime_config_changed(self.redis_store.as_ref(), version, reason);
     }
 
     fn publish_credentials_changed(&self, reason: &str) {
         self.invalidate_local_pool_route_state_cache();
-        if let Some(store) = &self.postgres_store {
-            let store = store.clone();
-            let reason_owned = reason.to_string();
-            spawn_best_effort_storage_task("记录凭据事件到 PgSQL", async move {
-                store
-                    .record_credential_event(
-                        None,
-                        "credentials_changed",
-                        Some(&reason_owned),
-                        serde_json::json!({ "reason": reason_owned }),
-                    )
-                    .await
-            });
-        }
-        let Some(redis) = &self.redis_store else {
-            return;
-        };
-        let redis = redis.clone();
-        let payload = self.redis_event_payload("credentials_changed", None, reason);
-        spawn_best_effort_storage_task("发布 Redis 凭据变更通知", async move {
-            redis.publish_credentials_changed(payload).await
-        });
+        publish_redis_credentials_changed(
+            self.postgres_store.as_ref(),
+            self.redis_store.as_ref(),
+            reason,
+        );
     }
 
     pub fn publish_admin_credentials_changed(&self, reason: &str) {

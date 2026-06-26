@@ -5,6 +5,7 @@ mod concurrency;
 mod cooldown;
 mod manager;
 mod queue;
+mod redis_runtime;
 mod refresh;
 mod route_state;
 mod rpm;
