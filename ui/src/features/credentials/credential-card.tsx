@@ -1,8 +1,7 @@
 import {
   ChevronDown,
   ChevronUp,
-  Eye,
-  EyeOff,
+  MoreHorizontal,
   RefreshCw,
   RotateCcw,
   Router,
@@ -16,6 +15,12 @@ import {
   Badge,
   Button,
   Checkbox,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
   Input,
   Spinner,
   Switch,
@@ -58,28 +63,11 @@ import {
   proxySummary,
   subscriptionBadgeMeta,
 } from './credential-utils'
+import { SecretInput } from './credential-inputs'
 
 // ============================================================================
 // Sub-components
 // ============================================================================
-
-function SecretInput({
-  value, onChange, visible, onToggle, disabled, placeholder,
-}: {
-  value: string; onChange: (v: string) => void; visible: boolean
-  onToggle: () => void; disabled?: boolean; placeholder?: string
-}) {
-  return (
-    <div className="relative">
-      <Input className="pr-10" type={visible ? 'text' : 'password'} value={value}
-        placeholder={placeholder} disabled={disabled} onChange={(e) => onChange(e.target.value)} />
-      <Button type="button" variant="ghost" size="icon-sm" className="absolute right-1 top-1"
-        onClick={onToggle} disabled={disabled} title={visible ? '隐藏' : '显示'}>
-        {visible ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-      </Button>
-    </div>
-  )
-}
 
 function SummaryCell({ label, value, error, onClick }: { label: string; value: React.ReactNode; error?: boolean; onClick?: () => void }) {
   const content = (
@@ -361,13 +349,14 @@ export function CredentialCard({
           error={credential.maxConcurrentRequests > 0 && credential.inFlightRequests >= credential.maxConcurrentRequests}
           onClick={() => setEditingConcurrency(true)}
         />
-        <SummaryCell label="调度" value={dispatchStatus} error={dispatchStatus !== '可调度'} />
+        <SummaryCell label="调度状态" value={dispatchStatus} error={dispatchStatus !== '可调度'} />
         <SummaryCell label="成功" value={formatNumber(credential.successCount)} />
         <SummaryCell label="最近" value={formatLastUsed(credential.lastUsedAt)} />
       </div>
 
       {/* ── Action Strip ── */}
       <div className="flex flex-wrap gap-0.5 border-t border-border/50 px-2 py-1.5">
+        {/* 高频操作：直接展示 */}
         <Button type="button" variant="ghost" size="xs" onClick={() => onTest(credential)}>
           <Wand2 className="h-3.5 w-3.5" /> 测试
         </Button>
@@ -397,35 +386,53 @@ export function CredentialCard({
         <Button type="button" variant="ghost" size="xs" disabled={setPriority.isPending} onClick={() => adjustPriority(1)}>
           <ChevronDown className="h-3.5 w-3.5" /> 优先级
         </Button>
-        <Button type="button" variant="ghost" size="xs"
-          onClick={() => setWarmup.mutate(
-            { id: credential.id, warmupRemaining: credential.warmupRemaining > 0 ? 0 : Math.max(1, warmupTarget) },
-            {
-              onSuccess: () => toast.success(credential.warmupRemaining > 0 ? '已关闭预热' : '已开启预热'),
-              onError: (e) => toast.error(`预热设置失败: ${extractErrorMessage(e)}`),
-            }
-          )}>
-          {credential.warmupRemaining > 0 ? '关闭预热' : '开启预热'}
-        </Button>
-        <Button type="button" variant="ghost" size="xs"
-          disabled={clearInFlight.isPending || !canClearInFlight}
-          onClick={async () => {
-            if (!canClearInFlight) return
-            const ok = await confirmDialog({ title: '清理并发', message: `清理账号 #${credential.id} 当前并发占用？`, confirmText: '清理', tone: 'danger' })
-            if (!ok) return
-            clearInFlight.mutate({ id: credential.id }, {
-              onSuccess: (res) => toast.success(res.message),
-              onError: (e) => toast.error(`清理失败: ${extractErrorMessage(e)}`),
-            })
-          }}>
-          清理并发
-        </Button>
-        <Button type="button" variant="ghost" size="xs"
-          className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-          disabled={!credential.disabled}
-          onClick={() => { if (credential.disabled) setShowDeleteConfirm(true) }}>
-          <Trash2 className="h-3.5 w-3.5" /> 删除
-        </Button>
+
+        {/* 低频/危险操作：收入 ... 菜单 */}
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button type="button" variant="ghost" size="xs" title="更多操作">
+              <MoreHorizontal className="h-3.5 w-3.5" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuLabel>更多操作</DropdownMenuLabel>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              disabled={setWarmup.isPending}
+              onSelect={() => setWarmup.mutate(
+                { id: credential.id, warmupRemaining: credential.warmupRemaining > 0 ? 0 : Math.max(1, warmupTarget) },
+                {
+                  onSuccess: () => toast.success(credential.warmupRemaining > 0 ? '已关闭预热' : '已开启预热'),
+                  onError: (e) => toast.error(`预热设置失败: ${extractErrorMessage(e)}`),
+                }
+              )}
+            >
+              {credential.warmupRemaining > 0 ? '关闭预热' : '开启预热'}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              disabled={clearInFlight.isPending || !canClearInFlight}
+              onSelect={async () => {
+                if (!canClearInFlight) return
+                const ok = await confirmDialog({ title: '清理并发', message: `清理账号 #${credential.id} 当前并发占用？`, confirmText: '清理', tone: 'danger' })
+                if (!ok) return
+                clearInFlight.mutate({ id: credential.id }, {
+                  onSuccess: (res) => toast.success(res.message),
+                  onError: (e) => toast.error(`清理失败: ${extractErrorMessage(e)}`),
+                })
+              }}
+            >
+              清理并发
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              destructive
+              disabled={!credential.disabled}
+              onSelect={() => { if (credential.disabled) setShowDeleteConfirm(true) }}
+            >
+              <Trash2 className="h-3.5 w-3.5" /> 删除
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
       </div>
 
       {/* ── Expanded Detail ── */}

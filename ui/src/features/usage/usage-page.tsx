@@ -2,6 +2,8 @@ import { useMemo, useState } from 'react'
 import {
   Activity,
   BarChart3,
+  ChevronDown,
+  ChevronUp,
   Clock3,
   Database,
   Filter,
@@ -75,8 +77,6 @@ import { UsageCleanupModal } from './usage-cleanup-modal'
 
 const AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:usage'
 const PAGE_SIZE = 20
-
-type ViewTab = 'trend' | 'records'
 
 // ─── 工具函数 ──────────────────────────────────────────────────────────────────
 
@@ -521,7 +521,7 @@ function RecordsView({
 // ─── 主页 ──────────────────────────────────────────────────────────────────────
 
 export function UsagePage() {
-  const [activeTab, setActiveTab] = useState<ViewTab>('trend')
+  const [trendOpen, setTrendOpen] = useState(true)
   const [selectedRecord, setSelectedRecord] = useState<UsageRecord | null>(null)
   const [cleanupOpen, setCleanupOpen] = useState(false)
 
@@ -556,6 +556,10 @@ export function UsagePage() {
           value={autoRefresh.intervalSeconds}
           disabled={!autoRefresh.enabled}
           onChange={(e) => autoRefresh.setIntervalSeconds(Number(e.target.value))}
+          onBlur={(e) => {
+            const v = Math.max(5, Math.min(3600, Number(e.target.value) || 30))
+            autoRefresh.setIntervalSeconds(v)
+          }}
         />
         <span className="text-xs text-muted-foreground">秒</span>
       </div>
@@ -637,32 +641,31 @@ export function UsagePage() {
         </Callout>
       )}
 
-      {/* 视图切换 Tabs */}
-      <div className="inline-flex overflow-hidden rounded-lg border border-border">
-        <Button
-          variant={activeTab === 'trend' ? 'default' : 'ghost'}
-          size="sm"
-          className="rounded-none"
-          onClick={() => setActiveTab('trend')}
+      {/* 趋势图区（可折叠） */}
+      <div className="rounded-xl border border-border bg-card shadow-sm">
+        <button
+          type="button"
+          className="flex w-full items-center justify-between px-4 py-3 text-sm font-medium text-foreground/80 hover:bg-muted/40 transition-colors rounded-xl"
+          onClick={() => setTrendOpen((v) => !v)}
         >
-          <BarChart3 className="h-3.5 w-3.5" />趋势图
-        </Button>
-        <Button
-          variant={activeTab === 'records' ? 'default' : 'ghost'}
-          size="sm"
-          className="rounded-none"
-          onClick={() => setActiveTab('records')}
-        >
-          <Activity className="h-3.5 w-3.5" />明细记录
-        </Button>
+          <div className="flex items-center gap-2">
+            <BarChart3 className="size-4 text-muted-foreground" />
+            趋势图
+          </div>
+          {trendOpen
+            ? <ChevronUp className="size-4 text-muted-foreground" />
+            : <ChevronDown className="size-4 text-muted-foreground" />
+          }
+        </button>
+        {trendOpen && (
+          <div className="border-t border-border px-4 pb-4 pt-3">
+            <TrendView />
+          </div>
+        )}
       </div>
 
-      {/* 内容区 */}
-      {activeTab === 'trend' ? (
-        <TrendView />
-      ) : (
-        <RecordsView onViewDetail={setSelectedRecord} autoRefreshInterval={autoRefresh.refetchInterval} />
-      )}
+      {/* 明细记录（常驻） */}
+      <RecordsView onViewDetail={setSelectedRecord} autoRefreshInterval={autoRefresh.refetchInterval} />
 
       {/* 底部状态 */}
       <div className="rounded-xl border border-border bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">

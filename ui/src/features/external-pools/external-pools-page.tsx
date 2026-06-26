@@ -36,14 +36,8 @@ import {
   StatGrid,
   useConfirm,
 } from '@/components/patterns'
-import { Badge, Button, Input, Label, Switch, Textarea } from '@/components/ui'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui'
+import { Badge, Button } from '@/components/ui'
+import { SelectItem } from '@/components/ui'
 import { ProgressRing } from '@/components/charts'
 import {
   type ExternalPoolFormDraft,
@@ -59,98 +53,35 @@ import {
 } from './external-pool-utils'
 import { ExternalPoolFormModal } from './external-pool-form-modal'
 import { ExternalPoolTestModal } from './external-pool-test-modal'
+import {
+  FormSection,
+  NumberBox,
+  SelectBox,
+  TextAreaBox,
+  ToggleRow,
+} from './external-pool-components'
 
 // ============================================================================
 // Local sub-components
 // ============================================================================
 
-function PolicyBlock({ title, description, active, children }: {
-  title: string; description: string; active: boolean; children: ReactNode
+function PolicyBlock({ title, titleSuffix, description, active, children }: {
+  title: string; titleSuffix?: string; description: string; active: boolean; children: ReactNode
 }) {
   return (
     <section className={cn('rounded-lg border border-border p-3', active ? 'bg-card' : 'bg-muted/40')}>
       <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
         <div>
-          <div className="text-sm font-semibold">{title}</div>
+          <div className="flex items-center gap-2">
+            <div className="text-sm font-semibold">{title}</div>
+            {titleSuffix && <span className="text-xs text-muted-foreground">{titleSuffix}</span>}
+          </div>
           <p className="mt-1 text-xs text-muted-foreground">{description}</p>
         </div>
         <Badge tone={active ? 'success' : 'neutral'}>{active ? '生效中' : '未生效'}</Badge>
       </div>
       {children}
     </section>
-  )
-}
-
-function FormSection({ title, description, children }: { title: string; description?: string; children: ReactNode }) {
-  return (
-    <section className="rounded-lg border border-border bg-card p-3">
-      <div className="mb-3">
-        <div className="text-sm font-semibold">{title}</div>
-        {description && <p className="mt-1 text-xs leading-5 text-muted-foreground">{description}</p>}
-      </div>
-      {children}
-    </section>
-  )
-}
-
-function HintBox({ children }: { children: ReactNode }) {
-  return (
-    <div className="rounded-lg border border-border bg-muted/50 px-3 py-2 text-xs leading-5 text-muted-foreground">
-      {children}
-    </div>
-  )
-}
-
-function ToggleRow({ label, checked, disabled = false, onChange }: {
-  label: string; checked: boolean; disabled?: boolean; onChange: (v: boolean) => void
-}) {
-  return (
-    <label className={cn('flex min-h-12 items-center justify-between gap-3 rounded-lg border border-border bg-card px-3 py-2 text-sm', disabled && 'cursor-not-allowed opacity-60')}>
-      <span className="min-w-0 font-medium text-muted-foreground">{label}</span>
-      <Switch className="shrink-0" checked={checked} disabled={disabled} onCheckedChange={onChange} />
-    </label>
-  )
-}
-
-function NumberBox({ label, description, value, min = 0, disabled = false, suffix, onChange }: {
-  label: string; description?: string; value: number; min?: number; disabled?: boolean; suffix?: string; onChange: (v: number) => void
-}) {
-  return (
-    <div>
-      <div className="mb-1">
-        <Label>{label}</Label>
-        {description && <p className="mt-0.5 text-xs text-muted-foreground">{description}</p>}
-      </div>
-      <div className="flex items-center gap-1">
-        <Input type="number" min={min} inputMode="numeric" className="h-9 w-full text-sm" value={value} disabled={disabled} onChange={(e) => onChange(Number(e.target.value))} />
-        {suffix && <span className="shrink-0 text-xs text-muted-foreground">{suffix}</span>}
-      </div>
-    </div>
-  )
-}
-
-function TextAreaBox({ label, disabled = false, value, onChange }: {
-  label: string; disabled?: boolean; value: string; onChange: (v: string) => void
-}) {
-  return (
-    <div>
-      <div className="mb-1"><Label>{label}</Label></div>
-      <Textarea className="min-h-20 w-full font-mono text-xs" value={value} disabled={disabled} onChange={(e) => onChange(e.target.value)} />
-    </div>
-  )
-}
-
-function SelectBox({ label, value, disabled = false, onChange, children }: {
-  label: string; value: string; disabled?: boolean; onChange: (v: string) => void; children: ReactNode
-}) {
-  return (
-    <div>
-      <div className="mb-1"><Label>{label}</Label></div>
-      <Select value={value} onValueChange={onChange} disabled={disabled}>
-        <SelectTrigger size="sm" className="w-full"><SelectValue /></SelectTrigger>
-        <SelectContent>{children}</SelectContent>
-      </Select>
-    </div>
   )
 }
 
@@ -369,13 +300,18 @@ export function ExternalPoolsPage() {
         }
       >
         <div className="space-y-5">
-          <PolicyBlock title="1. 是否启用外部账号" active={externalEnabled} description="关闭后不会进入任何外部账号，请求只走本地账号。">
+          <PolicyBlock title="启用控制" active={externalEnabled} description="关闭后不会进入任何外部账号，请求只走本地账号。">
             <div className="grid gap-3 md:grid-cols-2">
               <ToggleRow label="启用外部账号" checked={configDraft.externalPoolsEnabled} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolsEnabled: v }))} />
             </div>
           </PolicyBlock>
 
-          <PolicyBlock title="2. 什么时候进入外部账号" active={Boolean(fallbackActive || directPolicyActive)} description="默认先使用本地账号；本地不可用或命中指定规则时，再使用外部账号。">
+          <PolicyBlock
+            title="触发条件"
+            titleSuffix={!externalEnabled ? '需先启用外部账号' : undefined}
+            active={Boolean(fallbackActive || directPolicyActive)}
+            description="默认先使用本地账号；本地不可用或命中指定规则时，再使用外部账号。"
+          >
             <div className="grid gap-4 lg:grid-cols-2">
               <FormSection title="本地优先" description="先调度本地账号，只有下面情况出现时才转入外部账号。">
                 <div className="grid gap-3 sm:grid-cols-2">
@@ -406,7 +342,12 @@ export function ExternalPoolsPage() {
             </div>
           </PolicyBlock>
 
-          <PolicyBlock title="3. 进入外部账号后怎么调度" active={externalEnabled} description="控制外部账号自己的并发、排队、重试和超时。">
+          <PolicyBlock
+            title="调度策略"
+            titleSuffix={!externalEnabled ? '需先启用外部账号' : undefined}
+            active={externalEnabled}
+            description="控制外部账号自己的并发、排队、重试和超时。"
+          >
             <div className="space-y-4">
               <FormSection title="容量与排队" description={waitModeActive ? '外部账号满并发时会等待容量。' : '外部账号满并发时不会排队。'}>
                 <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
@@ -443,7 +384,12 @@ export function ExternalPoolsPage() {
             </div>
           </PolicyBlock>
 
-          <PolicyBlock title="4. 外部账号异常后怎么处理" active={autoDisableActive} description="自动禁用只作用于外部账号本身；单个外部账号可选择继承、强制启用或关闭。">
+          <PolicyBlock
+            title="自动禁用"
+            titleSuffix={!externalEnabled ? '需先启用外部账号' : undefined}
+            active={autoDisableActive}
+            description="自动禁用只作用于外部账号本身；单个外部账号可选择继承、强制启用或关闭。"
+          >
             <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
               <ToggleRow disabled={!externalEnabled} label="启用自动禁用" checked={configDraft.externalPoolAutoDisableEnabled} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolAutoDisableEnabled: v }))} />
               <ToggleRow disabled={!autoDisableActive} label="认证错误" checked={configDraft.externalPoolAutoDisableOnAuthError} onChange={(v) => setConfigDraft((p) => ({ ...p, externalPoolAutoDisableOnAuthError: v }))} />
@@ -457,11 +403,13 @@ export function ExternalPoolsPage() {
             </div>
           </PolicyBlock>
 
-          <PolicyBlock title="5. 返回给客户端的用量" active={externalEnabled && usageCompensationActive} description={'只影响选择"按入口规则展示"的外部账号。'}>
+          <PolicyBlock
+            title="用量补偿"
+            titleSuffix={!externalEnabled ? '需先启用外部账号' : undefined}
+            active={externalEnabled && usageCompensationActive}
+            description={'仅对用量模式为"按入口规则展示"的外部账号生效；选"保持原样"的账号不受影响。'}
+          >
             <div className="space-y-4">
-              <HintBox>
-                生效条件：请求进入外部账号，并且该外部账号的用量模式为"按入口规则展示"。如果外部账号选择"保持原样"，下面配置不会改动用量展示。
-              </HintBox>
               <div className="grid gap-4 lg:grid-cols-2">
                 <FormSection title="缓存读写补偿">
                   <div className="grid gap-3 sm:grid-cols-2">

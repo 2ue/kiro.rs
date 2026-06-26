@@ -2,13 +2,11 @@ import { useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import {
   Activity,
-  AlertTriangle,
   CheckCircle2,
   Clock3,
   Database,
   DollarSign,
   RefreshCw,
-  Server,
   ShieldAlert,
   TrendingUp,
   Users,
@@ -19,6 +17,7 @@ import { useUsageDashboard } from '@/hooks/use-usage'
 import { useCredentialSummary } from '@/hooks/use-credentials'
 import { formatDate, formatNumber, formatPercent, formatUsd } from '@/lib/format'
 import { cn, extractErrorMessage } from '@/lib/utils'
+import { billingDeltaTone, billingDeltaTextClass } from '../usage/usage-helpers'
 import type {
   UsageBreakdownItem,
   UsageDashboardWindow,
@@ -361,11 +360,13 @@ function SignalRow({
   value,
   ratio,
   barColor = 'bg-primary/65',
+  title,
 }: {
   label: string
   value: ReactNode
   ratio?: number
   barColor?: string
+  title?: string
 }) {
   const width = Number.isFinite(ratio ?? NaN)
     ? Math.min(100, Math.max(0, (ratio as number) * 100))
@@ -373,7 +374,7 @@ function SignalRow({
   return (
     <div className="space-y-1.5">
       <div className="flex items-center justify-between gap-2 text-xs">
-        <span className="truncate font-medium text-foreground/75">{label}</span>
+        <span className="truncate font-medium text-foreground/75" title={title}>{label}{title && <span className="ml-1 cursor-help text-muted-foreground/50">ⓘ</span>}</span>
         <span className="shrink-0 font-mono text-xs text-muted-foreground">{value}</span>
       </div>
       {ratio !== undefined && (
@@ -432,12 +433,14 @@ function RunSignalsPanel({
         <SignalRow
           label="模拟展示"
           value={formatNumber(simulated)}
-          barColor={simulated > 0 ? 'bg-info/70' : 'bg-muted-foreground/30'}
+          title="该窗口内用量由本地模拟计算展示（非服务实际返回），通常出现在流式响应或无用量元数据时"
         />
         <SignalRow
           label="服务返回用量"
           value={formatNumber(upstreamMeta)}
+          ratio={upstreamMeta > 0 ? upstreamMeta / (simulated + upstreamMeta) : 0}
           barColor="bg-primary/65"
+          title="该窗口内用量直接由上游服务返回（upstream_metadata），精度最高"
         />
       </div>
     </SectionCard>
@@ -547,20 +550,6 @@ function DimensionRankPanel({
 }
 
 // ─── 子组件：外部账号计费拆分 ──────────────────────────────────────────────────
-
-type BillingDeltaTone = 'loss' | 'profit' | 'even'
-
-function billingDeltaTone(delta: number): BillingDeltaTone {
-  if (delta < 0) return 'loss'
-  if (delta > 0) return 'profit'
-  return 'even'
-}
-
-function billingDeltaTextClass(tone: BillingDeltaTone): string {
-  if (tone === 'loss') return 'text-destructive'
-  if (tone === 'profit') return 'text-warning'
-  return 'text-muted-foreground/50'
-}
 
 function ExternalPoolBillingPanel({
   billing,
@@ -695,7 +684,7 @@ function ExternalPoolBillingPanel({
   )
 }
 
-// ─── 子组件：占比分解面板 ──────────────────────────────────────────────────────
+// ─── 子组件：占比分解面板（Tab 合并版） ────────────────────────────────────────
 
 const BREAKDOWN_TONES: Record<string, string> = {
   success: 'bg-success/80',
@@ -714,19 +703,44 @@ function breakdownBarColor(key: string): string {
   return BREAKDOWN_TONES[key] ?? 'bg-muted-foreground/40'
 }
 
-function BreakdownPanel({
-  title,
-  description,
-  items,
-  emptyText,
+type BreakdownTab = 'status' | 'source'
+
+function BreakdownTabPanel({
+  statusItems,
+  sourceItems,
 }: {
-  title: string
-  description?: string
-  items: UsageBreakdownItem[]
-  emptyText: string
+  statusItems: UsageBreakdownItem[]
+  sourceItems: UsageBreakdownItem[]
 }) {
+  const [activeTab, setActiveTab] = useState<BreakdownTab>('status')
+  const items = activeTab === 'status' ? statusItems : sourceItems
+  const emptyText = activeTab === 'status' ? '暂无状态样本。' : '暂无来源样本。'
+
   return (
-    <SectionCard title={title} description={description}>
+    <SectionCard
+      title={activeTab === 'status' ? '状态分布' : '用量来源'}
+      description={activeTab === 'status' ? '成功、超时、客户端错误等整体占比' : '用量来自服务返回、缓存展示或系统补充的占比'}
+      actions={
+        <div className="inline-flex overflow-hidden rounded-lg border border-border">
+          <Button
+            variant={activeTab === 'status' ? 'default' : 'ghost'}
+            size="xs"
+            className="rounded-none"
+            onClick={() => setActiveTab('status')}
+          >
+            状态分布
+          </Button>
+          <Button
+            variant={activeTab === 'source' ? 'default' : 'ghost'}
+            size="xs"
+            className="rounded-none"
+            onClick={() => setActiveTab('source')}
+          >
+            用量来源
+          </Button>
+        </div>
+      }
+    >
       <div className="space-y-3">
         {items.length === 0 ? (
           <div className="rounded-lg border border-dashed border-border px-3 py-3 text-sm text-muted-foreground/60">
@@ -842,6 +856,10 @@ export function OverviewPage() {
           value={autoRefresh.intervalSeconds}
           disabled={!autoRefresh.enabled}
           onChange={(e) => autoRefresh.setIntervalSeconds(Number(e.target.value))}
+          onBlur={(e) => {
+            const v = Math.max(5, Math.min(3600, Number(e.target.value) || 30))
+            autoRefresh.setIntervalSeconds(v)
+          }}
         />
         <span className="text-xs text-muted-foreground">秒</span>
       </div>
@@ -932,32 +950,13 @@ export function OverviewPage() {
           title="估算费用"
           value={formatUsd(summary.totalEstimatedCostUsd)}
           desc={`计价覆盖 ${formatPercent(pricedRatio)}`}
-          icon={<Server />}
+          icon={<DollarSign />}
           tone="primary"
         />
       </div>
 
       {/* 2. 账号池状态 */}
       <CredentialPoolPanel />
-
-      {/* 3. 异常警示 Callout（仅在有错误时显示在显眼位置） */}
-      {summary.errorRequests > 0 && summary.errorRate >= 0.05 && (
-        <Callout tone={summary.errorRate >= 0.2 ? 'error' : 'warning'}>
-          <div className="flex items-center gap-2">
-            <AlertTriangle className="size-3.5 shrink-0" />
-            当前窗口错误率 {formatPercent(summary.errorRate)}（{formatNumber(summary.errorRequests)} 次），建议查看下方异常摘要。
-          </div>
-        </Callout>
-      )}
-
-      {summary.fallbackFromStickyRequests > 0 && (
-        <Callout tone="warning">
-          <div className="flex items-center gap-2">
-            <Zap className="size-3.5 shrink-0" />
-            检测到 {formatNumber(summary.fallbackFromStickyRequests)} 次 Sticky 回退，说明粘度命中的账号不可用或并发已满。
-          </div>
-        </Callout>
-      )}
 
       {/* 4. 趋势图区 */}
       <TrendSection hourly={series.hourly24h ?? []} daily={series.daily7d ?? []} />
@@ -989,21 +988,11 @@ export function OverviewPage() {
         billingByPool={summary.externalPoolBillingByPool ?? []}
       />
 
-      {/* 8. 状态分布 + 用量来源 */}
-      <div className="grid gap-3 xl:grid-cols-2">
-        <BreakdownPanel
-          title="状态分布"
-          description="成功、超时、客户端错误等整体占比"
-          items={summary.statusBreakdown ?? []}
-          emptyText="暂无状态样本。"
-        />
-        <BreakdownPanel
-          title="用量来源"
-          description="用量来自服务返回、缓存展示或系统补充的占比"
-          items={summary.usageSourceBreakdown ?? []}
-          emptyText="暂无来源样本。"
-        />
-      </div>
+      {/* 8. 状态分布 + 用量来源（Tab 切换） */}
+      <BreakdownTabPanel
+        statusItems={summary.statusBreakdown ?? []}
+        sourceItems={summary.usageSourceBreakdown ?? []}
+      />
 
       {/* 9. 底部状态栏 */}
       <div className="rounded-xl border border-border bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">

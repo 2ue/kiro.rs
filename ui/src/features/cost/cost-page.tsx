@@ -75,9 +75,11 @@ function pricingByModel(pricing?: { models: ModelPriceItem[] }) {
 // ─── 模型能力目录 ──────────────────────────────────────────────────────────────
 
 function ModelCapabilitiesTable({
+  onAdd,
   onEdit,
   onDelete,
 }: {
+  onAdd: () => void
   onEdit: (form: ManualModelForm) => void
   onDelete: (model: string) => void
 }) {
@@ -95,23 +97,28 @@ function ModelCapabilitiesTable({
       title="模型能力目录"
       description="从 Kiro 同步的可用模型、上下文窗口、输出上限和缓存能力；手动模型作为补充。"
       actions={
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => {
-            syncCapabilities.mutate(undefined, {
-              onSuccess: (s) => {
-                if (s.lastError) toast.warning(`同步失败: ${s.lastError}`)
-                else toast.success(`模型能力已同步：${s.modelCount} 个模型`)
-              },
-              onError: (e) => toast.error(`同步失败: ${extractErrorMessage(e)}`),
-            })
-          }}
-          disabled={syncCapabilities.isPending}
-        >
-          {syncCapabilities.isPending ? <Spinner size="sm" /> : <RefreshCw className="h-3.5 w-3.5" />}
-          同步能力
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button size="sm" variant="outline" onClick={onAdd}>
+            <Plus className="h-3.5 w-3.5" />添加手动模型
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              syncCapabilities.mutate(undefined, {
+                onSuccess: (s) => {
+                  if (s.lastError) toast.warning(`同步失败: ${s.lastError}`)
+                  else toast.success(`模型能力已同步：${s.modelCount} 个模型`)
+                },
+                onError: (e) => toast.error(`同步失败: ${extractErrorMessage(e)}`),
+              })
+            }}
+            disabled={syncCapabilities.isPending}
+          >
+            {syncCapabilities.isPending ? <Spinner size="sm" /> : <RefreshCw className="h-3.5 w-3.5" />}
+            同步能力
+          </Button>
+        </div>
       }
       noPadding
     >
@@ -246,8 +253,8 @@ function ExternalPoolBillingPanel() {
           { label: '原始成本', value: formatUsd(billing.rawCostUsd) },
           { label: '上报费用', value: formatUsd(billing.reportedCostUsd) },
           { label: '可计费费用', value: formatUsd(billing.billableCostUsd) },
-          { label: '底线调整', value: formatUsd(billing.costFloorDeltaUsd), tone: billing.costFloorDeltaUsd > 0 ? 'warning' : 'neutral' as const },
-          { label: '底线触发次数', value: formatNumber(billing.costFloorAppliedRequests) },
+          { label: '底线调整', value: formatUsd(billing.costFloorDeltaUsd), tone: billing.costFloorDeltaUsd > 0 ? 'warning' : 'neutral' as const, desc: '实际成本低于底线时按底线计费，底线调整为补的差额' },
+          { label: '底线触发次数', value: formatNumber(billing.costFloorAppliedRequests), desc: '成本低于配置底线的请求数' },
           ...(billing.profitUsd !== undefined
             ? [{ label: '净盈亏', value: formatUsd(billing.profitUsd), tone: profitTone as 'success' | 'error' | 'neutral' }]
             : []),
@@ -262,6 +269,9 @@ function ExternalPoolBillingPanel() {
             }`}>
               {item.value}
             </div>
+            {'desc' in item && item.desc && (
+              <div className="mt-0.5 text-[0.65rem] leading-4 text-muted-foreground/70">{item.desc}</div>
+            )}
           </div>
         ))}
       </div>
@@ -529,15 +539,15 @@ export function CostPage() {
         <StatCard
           title="模型总数"
           value={formatNumber(totalModels)}
-          desc="已知能力"
+          desc={`已知能力${capabilities.data?.available === false ? ' · 不可用' : ''}${capabilities.data?.source ? ` · ${capabilities.data.source}` : ''}${capabilities.data?.lastSyncedAt ? ` · 同步 ${formatDate(capabilities.data.lastSyncedAt)}` : ''}`}
           icon={<DollarSign />}
-          tone="primary"
+          tone={capabilities.data?.available === false ? 'warning' : 'primary'}
         />
         <StatCard
           title="有价格模型"
           value={formatNumber(pricedModels)}
-          desc="可用于计费"
-          tone="success"
+          desc={`可用于计费${pricing.data?.available === false ? ' · 价格不可用' : ''}${pricing.data?.lastSyncedAt ? ` · 同步 ${formatDate(pricing.data.lastSyncedAt)}` : ''}`}
+          tone={pricing.data?.available === false ? 'warning' : 'success'}
         />
         <StatCard
           title="手动模型"
@@ -553,33 +563,8 @@ export function CostPage() {
         />
       </StatGrid>
 
-      {/* 能力状态卡 */}
-      <StatGrid>
-        <StatCard
-          title="模型能力"
-          value={<Badge tone={capabilities.data?.available ? 'success' : 'error'}>{capabilities.data?.available ? '可用' : '不可用'}</Badge>}
-          desc={`来源: ${capabilities.data?.source || '-'}`}
-        />
-        <StatCard
-          title="能力模型数"
-          value={formatNumber(capabilities.data?.modelCount ?? 0)}
-          desc={capabilities.data?.lastSyncedAt ? `同步: ${formatDate(capabilities.data.lastSyncedAt)}` : '未同步'}
-        />
-        <StatCard
-          title="价格状态"
-          value={<Badge tone={pricing.data?.available ? 'success' : 'error'}>{pricing.data?.available ? '可用' : '不可用'}</Badge>}
-          desc={pricing.data?.sourceUrl ? pricing.data.sourceUrl : `来源: ${pricing.data?.source || '-'}`}
-        />
-        <StatCard
-          title="价格模型数"
-          value={formatNumber(pricing.data?.modelCount ?? 0)}
-          desc={pricing.data?.lastSyncedAt ? `同步: ${formatDate(pricing.data.lastSyncedAt)}` : '未同步'}
-          tone={pricedModels > 0 ? 'success' : 'default'}
-        />
-      </StatGrid>
-
       {/* 模型能力目录 */}
-      <ModelCapabilitiesTable onEdit={handleEdit} onDelete={handleDelete} />
+      <ModelCapabilitiesTable onAdd={() => { setEditingForm(null); setManualOpen(true) }} onEdit={handleEdit} onDelete={handleDelete} />
 
       {/* 外部池盈亏 */}
       <ExternalPoolBillingPanel />

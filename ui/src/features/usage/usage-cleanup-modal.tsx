@@ -91,6 +91,23 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
   return (
     <ModalShell open={open} onClose={onClose} title="清理用量记录" width="max-w-lg">
       <div className="space-y-4 text-sm">
+        {/* 危险区：清空全部 */}
+        <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 space-y-2">
+          <div className="text-xs font-semibold text-destructive">危险操作</div>
+          <p className="text-xs text-muted-foreground">
+            清空所有用量展示记录将删除全部历史数据，仅影响展示，不影响实际计费，但操作无法撤销。
+          </p>
+          <Button
+            variant="outline"
+            size="sm"
+            className="text-destructive border-destructive/40 hover:bg-destructive/10 w-full"
+            onClick={handleClearAll}
+            disabled={clearRecords.isPending}
+          >
+            清空全部展示记录
+          </Button>
+        </div>
+
         {/* 当前任务状态 */}
         {status && status.status !== 'idle' && (
           <div className="rounded-lg border border-border bg-muted/40 p-3 space-y-2">
@@ -153,29 +170,35 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
             />
             <span className="text-xs text-muted-foreground">天前的记录</span>
           </div>
-          <div className="flex items-center gap-3">
-            <label className="text-xs text-muted-foreground w-20 shrink-0">每批数量</label>
-            <Input
-              type="number"
-              min={1}
-              className="flex-1 h-8 text-xs"
-              value={batchSize}
-              onChange={(e) => setBatchSize(e.target.value)}
-              placeholder="1000"
-            />
-            <span className="text-xs text-muted-foreground/60">条</span>
+          <div className="space-y-1">
+            <div className="flex items-center gap-3">
+              <label className="text-xs text-muted-foreground w-20 shrink-0">每批数量</label>
+              <Input
+                type="number"
+                min={1}
+                className="flex-1 h-8 text-xs"
+                value={batchSize}
+                onChange={(e) => setBatchSize(e.target.value)}
+                placeholder="1000"
+              />
+              <span className="text-xs text-muted-foreground/60">条</span>
+            </div>
+            <p className="pl-[5.5rem] text-[0.68rem] text-muted-foreground/50">每次删除的记录数，越大越快但数据库压力越高，默认 1000 通常合适</p>
           </div>
-          <div className="flex items-center gap-3">
-            <label className="text-xs text-muted-foreground w-20 shrink-0">批次间隔</label>
-            <Input
-              type="number"
-              min={0}
-              className="flex-1 h-8 text-xs"
-              value={pauseMs}
-              onChange={(e) => setPauseMs(e.target.value)}
-              placeholder="100"
-            />
-            <span className="text-xs text-muted-foreground/60">ms</span>
+          <div className="space-y-1">
+            <div className="flex items-center gap-3">
+              <label className="text-xs text-muted-foreground w-20 shrink-0">批次间隔</label>
+              <Input
+                type="number"
+                min={0}
+                className="flex-1 h-8 text-xs"
+                value={pauseMs}
+                onChange={(e) => setPauseMs(e.target.value)}
+                placeholder="100"
+              />
+              <span className="text-xs text-muted-foreground/60">ms</span>
+            </div>
+            <p className="pl-[5.5rem] text-[0.68rem] text-muted-foreground/50">每批之间的等待毫秒，控制数据库负载，默认 100ms</p>
           </div>
           <div className="text-xs text-muted-foreground/60">系统后端保留安全上限（maxBatches），超出后自动停止。</div>
         </div>
@@ -197,17 +220,12 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
 
         {/* 操作按钮 */}
         <div className="flex flex-wrap gap-2 justify-end pt-1 border-t border-border">
-          <Button variant="ghost" size="sm" className="text-destructive hover:bg-destructive/10" onClick={handleClearAll} disabled={clearRecords.isPending}>
-            清空全部展示记录
+          <Button variant="outline" size="sm" onClick={handlePreview} disabled={previewing || isRunning}>
+            {previewing ? '预览中...' : '预览'}
           </Button>
-          <div className="flex gap-2 ml-auto">
-            <Button variant="outline" size="sm" onClick={handlePreview} disabled={previewing || isRunning}>
-              {previewing ? '预览中...' : '预览'}
-            </Button>
-            <Button size="sm" onClick={handleStart} disabled={!previewResult || startCleanup.isPending || isRunning}>
-              {startCleanup.isPending ? '启动中...' : '执行清理'}
-            </Button>
-          </div>
+          <Button size="sm" onClick={handleStart} disabled={!previewResult || startCleanup.isPending || isRunning}>
+            {startCleanup.isPending ? '启动中...' : '执行清理'}
+          </Button>
         </div>
       </div>
     </ModalShell>

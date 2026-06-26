@@ -2,8 +2,6 @@ import {
   AlertCircle,
   CheckCircle2,
   Download,
-  Eye,
-  EyeOff,
   FileUp,
   Loader2,
   Play,
@@ -47,6 +45,88 @@ import type {
   ProxyResource,
   TestCredentialResponse,
 } from '@/types/api'
+import { SecretInput } from './credential-inputs'
+
+// ============================================================================
+// ImportProgressList — 共用进度列表（BatchImportModal + KamImportModal 共用）
+// ============================================================================
+
+function statusIcon(s: ImportResult['status']) {
+  if (s === 'success') return <CheckCircle2 className="h-4 w-4 text-success" />
+  if (s === 'failed') return <XCircle className="h-4 w-4 text-destructive" />
+  if (s === 'importing' || s === 'verifying') return <Loader2 className="h-4 w-4 animate-spin text-primary" />
+  if (s === 'skipped') return <AlertCircle className="h-4 w-4 text-warning" />
+  return <div className="h-4 w-4 rounded-full border border-border" />
+}
+
+function ImportProgressList({
+  results,
+  getLabel,
+}: {
+  results: ImportResult[]
+  /** 根据条目索引返回显示标签 */
+  getLabel: (index: number) => string
+}) {
+  return (
+    <div className="max-h-72 overflow-y-auto scrollbar-thin space-y-1">
+      {results.map((r, i) => (
+        <div key={i} className="flex items-start gap-2 rounded-lg border border-border/50 bg-muted/30 px-3 py-2">
+          <div className="mt-0.5 shrink-0">{statusIcon(r.status)}</div>
+          <div className="min-w-0 flex-1 text-xs">
+            <div className="font-semibold truncate">{getLabel(i)}</div>
+            {r.status === 'success' && r.model && (
+              <div className="text-muted-foreground truncate">{r.model}: {r.response?.slice(0, 60)}</div>
+            )}
+            {r.error && <div className="text-destructive">{r.error}</div>}
+            {r.status === 'verifying' && <div className="text-primary">验活中…</div>}
+            {r.status === 'importing' && <div className="text-primary">导入中…</div>}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// ============================================================================
+// ImportResultFooter — 共用底部操作栏（关闭/开始/重试/完成）
+// ============================================================================
+
+function ImportResultFooter({
+  running,
+  results,
+  failedCount,
+  onClose,
+  onRun,
+  onRetry,
+}: {
+  running: boolean
+  results: ImportResult[]
+  failedCount: number
+  onClose: () => void
+  onRun?: () => void
+  onRetry?: () => void
+}) {
+  const hasPending = results.some((r) => r.status === 'pending')
+  const allDone = results.length > 0 && results.every((r) => r.status !== 'pending')
+  return (
+    <div className="flex justify-end gap-2">
+      <Button variant="ghost" size="sm" onClick={onClose} disabled={running}>关闭</Button>
+      {!running && hasPending && onRun && (
+        <Button size="sm" onClick={onRun}>
+          <Play className="h-3.5 w-3.5" />开始导入
+        </Button>
+      )}
+      {!running && failedCount > 0 && onRetry && (
+        <Button size="sm" onClick={onRetry}>
+          <AlertCircle className="h-3.5 w-3.5" />重试失败账号 ({failedCount})
+        </Button>
+      )}
+      {!running && allDone && failedCount === 0 && (
+        <Button size="sm" onClick={onClose}>完成</Button>
+      )}
+    </div>
+  )
+}
 
 type AuthMethod = 'social' | 'idc' | 'api_key'
 type ImportVerificationMode = 'model_and_subscription' | 'subscription_only'
@@ -163,23 +243,6 @@ function downloadBlob(blob: Blob, filename: string) {
   a.href = url; a.download = filename
   document.body.appendChild(a); a.click(); a.remove()
   URL.revokeObjectURL(url)
-}
-
-// ============================================================================
-// SecretInput
-// ============================================================================
-
-function SecretInput({ value, onChange, visible, onToggle, placeholder, disabled }: {
-  value: string; onChange: (v: string) => void; visible: boolean; onToggle: () => void; placeholder?: string; disabled?: boolean
-}) {
-  return (
-    <div className="relative">
-      <Input className="pr-10" type={visible ? 'text' : 'password'} value={value} placeholder={placeholder} disabled={disabled} onChange={(e) => onChange(e.target.value)} />
-      <Button type="button" variant="ghost" size="icon-sm" className="absolute right-1 top-1" onClick={onToggle} disabled={disabled} title={visible ? '隐藏' : '显示'}>
-        {visible ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-      </Button>
-    </div>
-  )
 }
 
 // ============================================================================
@@ -510,14 +573,6 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
   const failedItems = parsed.filter((_, i) => results[i]?.status === 'failed')
   const retryFailed = () => { if (failedItems.length) runItems(failedItems, true) }
 
-  const statusIcon = (s: ImportResult['status']) => {
-    if (s === 'success') return <CheckCircle2 className="h-4 w-4 text-success" />
-    if (s === 'failed') return <XCircle className="h-4 w-4 text-destructive" />
-    if (s === 'importing' || s === 'verifying') return <Loader2 className="h-4 w-4 animate-spin text-primary" />
-    if (s === 'skipped') return <AlertCircle className="h-4 w-4 text-warning" />
-    return <div className="h-4 w-4 rounded-full border border-border" />
-  }
-
   return (
     <ModalShell open={open} title="批量导入账号" width="max-w-3xl" onClose={onClose}>
       <div className="space-y-4">
@@ -573,36 +628,18 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
               {!running && <Button variant="ghost" size="xs" onClick={() => { setResults([]); setParsed([]) }}>重新编辑</Button>}
             </div>
             {running && <Progress value={Math.round((results.filter((r) => r.status !== 'pending').length / parsed.length) * 100)} className="h-1.5" />}
-            <div className="max-h-72 overflow-y-auto scrollbar-thin space-y-1">
-              {results.map((r, i) => (
-                <div key={i} className="flex items-start gap-2 rounded-lg border border-border/50 bg-muted/30 px-3 py-2">
-                  <div className="mt-0.5 shrink-0">{statusIcon(r.status)}</div>
-                  <div className="min-w-0 flex-1 text-xs">
-                    <div className="font-semibold truncate">{parsed[i]?.email || parsed[i]?.kiroApiKey?.slice(0, 20) || `账号 ${i + 1}`}</div>
-                    {r.status === 'success' && r.model && <div className="text-muted-foreground truncate">{r.model}: {r.response?.slice(0, 60)}</div>}
-                    {r.error && <div className="text-destructive">{r.error}</div>}
-                    {r.status === 'verifying' && <div className="text-primary">验活中…</div>}
-                    {r.status === 'importing' && <div className="text-primary">导入中…</div>}
-                  </div>
-                </div>
-              ))}
-            </div>
-            <div className="flex justify-end gap-2">
-              <Button variant="ghost" size="sm" onClick={onClose} disabled={running}>关闭</Button>
-              {!running && results.some((r) => r.status === 'pending') && (
-                <Button size="sm" onClick={run}>
-                  <Play className="h-3.5 w-3.5" />开始导入
-                </Button>
-              )}
-              {!running && failedItems.length > 0 && (
-                <Button size="sm" onClick={retryFailed}>
-                  <AlertCircle className="h-3.5 w-3.5" />重试失败账号 ({failedItems.length})
-                </Button>
-              )}
-              {!running && results.every((r) => r.status !== 'pending') && failedItems.length === 0 && (
-                <Button size="sm" onClick={onClose}>完成</Button>
-              )}
-            </div>
+            <ImportProgressList
+              results={results}
+              getLabel={(i) => parsed[i]?.email || parsed[i]?.kiroApiKey?.slice(0, 20) || `账号 ${i + 1}`}
+            />
+            <ImportResultFooter
+              running={running}
+              results={results}
+              failedCount={failedItems.length}
+              onClose={onClose}
+              onRun={run}
+              onRetry={retryFailed}
+            />
           </>
         )}
       </div>
@@ -726,14 +763,6 @@ export function KamImportModal({ open, onClose, onDone }: {
   const failedAccounts = accounts.filter((_, i) => results[i]?.status === 'failed')
   const retryFailed = () => { if (failedAccounts.length) runAccounts(failedAccounts, true) }
 
-  const statusIcon = (s: ImportResult['status']) => {
-    if (s === 'success') return <CheckCircle2 className="h-4 w-4 text-success" />
-    if (s === 'failed') return <XCircle className="h-4 w-4 text-destructive" />
-    if (s === 'importing' || s === 'verifying') return <Loader2 className="h-4 w-4 animate-spin text-primary" />
-    if (s === 'skipped') return <AlertCircle className="h-4 w-4 text-warning" />
-    return <div className="h-4 w-4 rounded-full border border-border" />
-  }
-
   return (
     <ModalShell open={open} title="KAM 导入账号" width="max-w-2xl" onClose={onClose}>
       <div className="space-y-4">
@@ -792,32 +821,18 @@ export function KamImportModal({ open, onClose, onDone }: {
               </div>
             )}
             {running && <Progress value={Math.round((results.filter((r) => r.status !== 'pending').length / accounts.length) * 100)} className="h-1.5" />}
-            <div className="max-h-64 overflow-y-auto scrollbar-thin space-y-1">
-              {results.map((r, i) => (
-                <div key={i} className="flex items-start gap-2 rounded-lg border border-border/50 bg-muted/30 px-3 py-2">
-                  <div className="mt-0.5 shrink-0">{statusIcon(r.status)}</div>
-                  <div className="min-w-0 flex-1 text-xs">
-                    <div className="font-semibold truncate">{accounts[i]?.email || `账号 ${i + 1}`}</div>
-                    {r.status === 'success' && r.model && <div className="text-muted-foreground truncate">{r.model}: {r.response?.slice(0, 60)}</div>}
-                    {r.error && <div className="text-destructive">{r.error}</div>}
-                  </div>
-                </div>
-              ))}
-            </div>
-            <div className="flex justify-end gap-2">
-              <Button variant="ghost" size="sm" onClick={onClose} disabled={running}>关闭</Button>
-              {!running && results.some((r) => r.status === 'pending') && (
-                <Button size="sm" onClick={run}><Play className="h-3.5 w-3.5" />开始导入</Button>
-              )}
-              {!running && failedAccounts.length > 0 && (
-                <Button size="sm" onClick={retryFailed}>
-                  <AlertCircle className="h-3.5 w-3.5" />重试失败账号 ({failedAccounts.length})
-                </Button>
-              )}
-              {!running && results.every((r) => r.status !== 'pending') && failedAccounts.length === 0 && (
-                <Button size="sm" onClick={onClose}>完成</Button>
-              )}
-            </div>
+            <ImportProgressList
+              results={results}
+              getLabel={(i) => accounts[i]?.email || `账号 ${i + 1}`}
+            />
+            <ImportResultFooter
+              running={running}
+              results={results}
+              failedCount={failedAccounts.length}
+              onClose={onClose}
+              onRun={run}
+              onRetry={retryFailed}
+            />
           </>
         )}
       </div>
@@ -1082,6 +1097,10 @@ export function BatchVerifyModal({ open, verifying, progress, results, onCancel,
   return (
     <ModalShell open={open} title="批量验活" width="max-w-lg" onClose={onClose}>
       <div className="space-y-3">
+        <div className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+          测试模型：<span className="font-semibold text-foreground">{testModelLabel(DEFAULT_TEST_MODEL)}</span>
+          <span className="ml-2 text-muted-foreground/70">（批量验活固定使用默认模型）</span>
+        </div>
         {verifying && (
           <div className="space-y-1.5">
             <div className="flex justify-between text-xs text-muted-foreground">

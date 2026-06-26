@@ -303,12 +303,12 @@ export function RuntimePage() {
       <CollapseSection icon={<Shield />} title="错误恢复 / 冷却" desc="不同错误类型的暂停策略与退避" defaultOpen>
         <TwoCol>
           <NumField label="默认暂停时间" desc="临时错误后暂停多久" value={draft.credentialTransientCooldownSecs} min={1} suffix="秒" onChange={set('credentialTransientCooldownSecs')} />
-          <NumField label="限流后暂停" desc="" value={draft.credentialRateLimitCooldownSecs} min={1} suffix="秒" onChange={set('credentialRateLimitCooldownSecs')} />
-          <NumField label="服务繁忙后暂停" desc="" value={draft.credentialServerErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialServerErrorCooldownSecs')} />
-          <NumField label="网络错误基础冷却" desc="" value={draft.credentialNetworkErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialNetworkErrorCooldownSecs')} />
-          <NumField label="流式中断后暂停" desc="" value={draft.credentialStreamErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialStreamErrorCooldownSecs')} />
-          <NumField label="格式异常后暂停" desc="" value={draft.credentialProtocolErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialProtocolErrorCooldownSecs')} />
-          <NumField label="授权异常后暂停" desc="" value={draft.credentialAuthErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialAuthErrorCooldownSecs')} />
+          <NumField label="限流后暂停" desc="收到 429 限流响应后的初始冷却，受最大冷却时长约束" value={draft.credentialRateLimitCooldownSecs} min={1} suffix="秒" onChange={set('credentialRateLimitCooldownSecs')} />
+          <NumField label="服务繁忙后暂停" desc="收到 5xx 服务端错误后的初始冷却" value={draft.credentialServerErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialServerErrorCooldownSecs')} />
+          <NumField label="网络错误基础冷却" desc="连接超时、DNS 失败等网络层错误后的冷却" value={draft.credentialNetworkErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialNetworkErrorCooldownSecs')} />
+          <NumField label="流式中断后暂停" desc="流式响应中途中断后的冷却" value={draft.credentialStreamErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialStreamErrorCooldownSecs')} />
+          <NumField label="格式异常后暂停" desc="响应格式/协议异常后的冷却" value={draft.credentialProtocolErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialProtocolErrorCooldownSecs')} />
+          <NumField label="授权异常后暂停" desc="收到 401/403 授权失败后的冷却" value={draft.credentialAuthErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialAuthErrorCooldownSecs')} />
           <NumField label="最大冷却时长" desc="单账号冷却上限" value={draft.credentialMaxCooldownSecs} min={1} suffix="秒" onChange={set('credentialMaxCooldownSecs')} />
           <NumField label="退避倍率" desc="连续出错时逐步延长" value={draft.credentialCooldownBackoffMultiplier} min={1} max={10} step={0.1} suffix="倍" onChange={set('credentialCooldownBackoffMultiplier')} />
           <NumField label="恢复时间错开比例" desc="防止多账号同时恢复" value={draft.credentialCooldownJitterPercent} min={0} max={100} suffix="%" onChange={set('credentialCooldownJitterPercent')} />
@@ -320,13 +320,13 @@ export function RuntimePage() {
       <CollapseSection icon={<Gauge />} title="账号选择权重" desc="优先使用哪些账号的调度参数">
         <TwoCol>
           <NumField label="近期错误敏感度" desc="越高近期错误越快影响选择" value={draft.schedulerErrorEwmaAlpha} min={0.01} max={1} step={0.01} suffix="系数" onChange={set('schedulerErrorEwmaAlpha')} />
-          <NumField label="优先级权重" desc="" value={draft.schedulerPriorityWeight} min={0} step={0.1} suffix="权重" onChange={set('schedulerPriorityWeight')} />
-          <NumField label="当前负载权重" desc="" value={draft.schedulerLoadWeight} min={0} step={1} suffix="权重" onChange={set('schedulerLoadWeight')} />
-          <NumField label="近期错误权重" desc="" value={draft.schedulerErrorWeight} min={0} step={1} suffix="权重" onChange={set('schedulerErrorWeight')} />
-          <NumField label="响应耗时权重" desc="" value={draft.schedulerLatencyWeight} min={0} step={0.001} suffix="权重" onChange={set('schedulerLatencyWeight')} />
-          <NumField label="恢复期降权" desc="" value={draft.schedulerProbationWeight} min={0} step={1} suffix="权重" onChange={set('schedulerProbationWeight')} />
+          <NumField label="优先级权重" desc="数值越大，账号优先级差异对选择的影响越显著" value={draft.schedulerPriorityWeight} min={0} step={0.1} suffix="权重" onChange={set('schedulerPriorityWeight')} />
+          <NumField label="当前负载权重" desc="数值越大，负载轻的账号越优先被选中" value={draft.schedulerLoadWeight} min={0} step={1} suffix="权重" onChange={set('schedulerLoadWeight')} />
+          <NumField label="近期错误权重" desc="数值越大，近期出错多的账号越少被选中" value={draft.schedulerErrorWeight} min={0} step={1} suffix="权重" onChange={set('schedulerErrorWeight')} />
+          <NumField label="响应耗时权重" desc="数值越大，响应慢的账号越少被选中；通常设较小值" value={draft.schedulerLatencyWeight} min={0} step={0.001} suffix="权重" onChange={set('schedulerLatencyWeight')} />
+          <NumField label="恢复期降权" desc="处于观察期的账号被降低权重的程度" value={draft.schedulerProbationWeight} min={0} step={1} suffix="权重" onChange={set('schedulerProbationWeight')} />
           <NumField label="短时集中降权" desc="避免请求集中单一账号" value={draft.schedulerSelectionPressureWeight} min={0} step={1} suffix="权重" onChange={set('schedulerSelectionPressureWeight')} />
-          <NumField label="长期使用次数权重" desc="通常保持 0 即可" value={draft.schedulerTotalSelectionWeight} min={0} step={0.001} suffix="权重" onChange={set('schedulerTotalSelectionWeight')} />
+          <NumField label="长期使用次数权重" desc="数值越大，历史调度次数多的账号越少被选中，促进均衡" value={draft.schedulerTotalSelectionWeight} min={0} step={0.001} suffix="权重" onChange={set('schedulerTotalSelectionWeight')} />
           <NumField label="候选账号数量" desc="数值越大越分散" value={draft.schedulerTopK} min={1} max={100} suffix="个" onChange={set('schedulerTopK')} />
         </TwoCol>
       </CollapseSection>
@@ -335,8 +335,8 @@ export function RuntimePage() {
       <CollapseSection icon={<Sparkles />} title="新账号预热" desc="新账号逐步参与请求，稳定后恢复正常">
         <TwoCol>
           <NumField label="预热请求数" desc="0 表示不预热" value={draft.credentialWarmupRequests} min={0} suffix="次" onChange={set('credentialWarmupRequests')} />
-          <NumField label="单个预热账号参与比例" desc="" value={draft.credentialWarmupSelectionPercent} min={0} max={100} suffix="%" onChange={set('credentialWarmupSelectionPercent')} />
-          <NumField label="预热账号总占比上限" desc="" value={draft.credentialWarmupMaxSelectionPercent} min={0} max={100} suffix="%" onChange={set('credentialWarmupMaxSelectionPercent')} />
+          <NumField label="单个预热账号参与比例" desc="每次调度时该预热账号被选中的概率上限" value={draft.credentialWarmupSelectionPercent} min={0} max={100} suffix="%" onChange={set('credentialWarmupSelectionPercent')} />
+          <NumField label="预热账号总占比上限" desc="所有预热中账号合计流量不超过此比例" value={draft.credentialWarmupMaxSelectionPercent} min={0} max={100} suffix="%" onChange={set('credentialWarmupMaxSelectionPercent')} />
         </TwoCol>
       </CollapseSection>
 
@@ -365,37 +365,47 @@ export function RuntimePage() {
             </Select>
           </div>
           <TwoCol>
-            <NumField label="请求大小阈值" desc="0 表示不按大小处理" value={draft.payloadGuardMaxBytes} min={0} suffix="字节" onChange={set('payloadGuardMaxBytes')} />
-            <NumField label="安全余量" desc="实际处理目标比阈值小一点" value={draft.payloadGuardSafetyMarginBytes} min={0} suffix="字节" disabled={!payloadSizeLimitEnabled} onChange={set('payloadGuardSafetyMarginBytes')} />
+            <NumField label="请求大小阈值" desc="超过此大小才触发处理（如 1048576 = 1 MB）；0 表示不按大小处理" value={draft.payloadGuardMaxBytes} min={0} suffix="字节" onChange={set('payloadGuardMaxBytes')} />
+            <NumField label="安全余量" desc="处理目标比阈值小出的缓冲（如 65536 = 64 KB），避免裁剪后仍超限" value={draft.payloadGuardSafetyMarginBytes} min={0} suffix="字节" disabled={!payloadSizeLimitEnabled} onChange={set('payloadGuardSafetyMarginBytes')} />
           </TwoCol>
         </div>
       </CollapseSection>
 
-      {/* 缓存展示 */}
-      <CollapseSection icon={<Zap />} title="缓存命中展示" desc="缓存读取和输入 Token 的展示口径">
-        <TwoCol>
-          <NumField label="缓存读取目标比例" desc="建议 0.95~0.99" value={draft.promptCacheTargetReadRatio} min={0} max={0.99} step={0.01} suffix="比例" onChange={set('promptCacheTargetReadRatio')} />
-          <NumField label="输入估算放大倍数" desc="" value={draft.promptCacheTokenScale} min={1} max={3} step={0.1} suffix="倍" onChange={set('promptCacheTokenScale')} />
-          <NumField label="输入展示上限" desc="0 表示不设上限" value={draft.promptCacheMaxSimulatedInputTokens} min={0} suffix="Token" onChange={set('promptCacheMaxSimulatedInputTokens')} />
-          <NumField label="放大启用门槛" desc="" value={draft.promptCacheScaleMinInputTokens} min={0} suffix="Token" onChange={set('promptCacheScaleMinInputTokens')} />
-          <NumField label="触顶扣减下限" desc="" value={draft.promptCacheCapJitterMinTokens} min={0} suffix="Token" onChange={set('promptCacheCapJitterMinTokens')} />
-          <NumField label="触顶扣减上限" desc="" value={draft.promptCacheCapJitterMaxTokens} min={0} suffix="Token" onChange={set('promptCacheCapJitterMaxTokens')} />
-        </TwoCol>
+      {/* 缓存展示控制（合并：命中展示 + 创建频次） */}
+      <CollapseSection icon={<Zap />} title="缓存展示控制" desc="缓存读取口径与写入展示节奏">
+        <div className="space-y-6">
+          <div className="space-y-3">
+            <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">命中展示参数</div>
+            <TwoCol>
+              <NumField label="缓存读取目标比例" desc="建议 0.95~0.99" value={draft.promptCacheTargetReadRatio} min={0} max={0.99} step={0.01} suffix="比例" onChange={set('promptCacheTargetReadRatio')} />
+              <NumField label="输入估算放大倍数" desc="" value={draft.promptCacheTokenScale} min={1} max={3} step={0.1} suffix="倍" onChange={set('promptCacheTokenScale')} />
+              <NumField label="输入展示上限" desc="0 表示不设上限" value={draft.promptCacheMaxSimulatedInputTokens} min={0} suffix="Token" onChange={set('promptCacheMaxSimulatedInputTokens')} />
+              <NumField label="放大启用门槛" desc="" value={draft.promptCacheScaleMinInputTokens} min={0} suffix="Token" onChange={set('promptCacheScaleMinInputTokens')} />
+              <NumField label="触顶扣减下限" desc="" value={draft.promptCacheCapJitterMinTokens} min={0} suffix="Token" onChange={set('promptCacheCapJitterMinTokens')} />
+              <NumField label="触顶扣减上限" desc="" value={draft.promptCacheCapJitterMaxTokens} min={0} suffix="Token" onChange={set('promptCacheCapJitterMaxTokens')} />
+            </TwoCol>
+          </div>
+          <div className="border-t border-border" />
+          <div className="space-y-3">
+            <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">写入频次控制</div>
+            <CacheCreationSection control={draft.promptCacheCreationControl} onChange={set('promptCacheCreationControl')} />
+          </div>
+        </div>
       </CollapseSection>
 
-      {/* 旧内容清理 */}
-      <CollapseSection icon={<Wand2 />} title="旧内容清理" desc="历史消息、工具结果与网页内容的体积优化">
-        <PayloadHistorySection shaping={draft.payloadShaping} payloadSizeLimitEnabled={payloadSizeLimitEnabled} onChange={set('payloadShaping')} />
-      </CollapseSection>
-
-      {/* 当前内容兜底 */}
-      <CollapseSection icon={<Wand2 />} title="当前内容兜底" desc="当前请求超阈值时压缩当前消息、文档与图片">
-        <PayloadFallbackSection shaping={draft.payloadShaping} payloadShapingBranchEnabled={payloadSizeLimitEnabled && draft.payloadShaping.enabled} onChange={set('payloadShaping')} />
-      </CollapseSection>
-
-      {/* 缓存创建频次 */}
-      <CollapseSection icon={<Zap />} title="缓存创建频次" desc="控制缓存写入展示的节奏与额度">
-        <CacheCreationSection control={draft.promptCacheCreationControl} onChange={set('promptCacheCreationControl')} />
+      {/* 内容体积优化（合并：旧内容清理 + 当前内容兜底） */}
+      <CollapseSection icon={<Wand2 />} title="内容体积优化" desc="历史消息与当前请求的压缩、裁剪策略">
+        <div className="space-y-6">
+          <div className="space-y-3">
+            <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">历史消息清理</div>
+            <PayloadHistorySection shaping={draft.payloadShaping} payloadSizeLimitEnabled={payloadSizeLimitEnabled} onChange={set('payloadShaping')} />
+          </div>
+          <div className="border-t border-border" />
+          <div className="space-y-3">
+            <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">当前请求兜底</div>
+            <PayloadFallbackSection shaping={draft.payloadShaping} payloadShapingBranchEnabled={payloadSizeLimitEnabled && draft.payloadShaping.enabled} onChange={set('payloadShaping')} />
+          </div>
+        </div>
       </CollapseSection>
 
       {/* 用量展示规则 */}

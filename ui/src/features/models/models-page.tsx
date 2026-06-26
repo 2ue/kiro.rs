@@ -105,7 +105,7 @@ export function ModelsPage() {
     <PageContainer>
       <PageHeader
         title="模型能力"
-        subtitle="查看同步来的模型列表、手动维护能力与定价信息"
+        subtitle="查看同步来的模型列表、手动维护能力参数；模型价格与盈亏分析请见「成本」页"
         actions={
           <div className="flex items-center gap-2">
             <Button
@@ -203,7 +203,7 @@ export function ModelsPage() {
                   <TableHead>显示名称</TableHead>
                   <TableHead className="text-right">最大输入</TableHead>
                   <TableHead className="text-right">最大输出</TableHead>
-                  <TableHead>Caching</TableHead>
+                  <TableHead>缓存支持</TableHead>
                   <TableHead className="text-right">输入价格/M</TableHead>
                   <TableHead className="text-right">输出价格/M</TableHead>
                   <TableHead>来源</TableHead>

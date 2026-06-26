@@ -424,6 +424,10 @@ export function CredentialsPage() {
             <Button variant="outline" size="sm" onClick={() => credentials.refetch()}>
               <RefreshCw className={`h-4 w-4 ${credentials.isFetching ? 'animate-spin' : ''}`} />
             </Button>
+            <Button variant="outline" size="sm" onClick={updateAllCreditInfo} disabled={queryingCreditInfo} title="更新积分统计">
+              {queryingCreditInfo ? <Spinner size="sm" /> : <Wallet className="h-4 w-4" />}
+              <span className="hidden sm:inline">更新积分</span>
+            </Button>
             <Button variant="outline" size="sm" onClick={() => setKamOpen(true)}>
               <FileUp className="h-4 w-4" /><span className="hidden sm:inline">KAM</span>
             </Button>
@@ -439,43 +443,6 @@ export function CredentialsPage() {
           </div>
         }
       />
-
-      {/* Credit Summary Panel */}
-      <div className="rounded-lg border border-border bg-card shadow-sm p-4">
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-          <div className="flex items-center gap-2">
-            <Wallet className="h-4 w-4 text-primary" />
-            <h2 className="text-sm font-semibold">积分统计</h2>
-            {creditSummary.isFetching && <Spinner size="sm" />}
-          </div>
-          <Button size="sm" onClick={updateAllCreditInfo} disabled={queryingCreditInfo}>
-            {queryingCreditInfo ? <Spinner size="sm" /> : <RefreshCw className="h-4 w-4" />}
-            更新积分统计
-          </Button>
-        </div>
-        <div className="mt-3 grid gap-2 sm:grid-cols-2">
-          <button
-            type="button"
-            className="rounded-lg border border-transparent bg-muted/40 px-3 py-2 text-left transition hover:border-primary/40 hover:bg-muted focus:outline-none focus:ring-2 focus:ring-primary/30"
-            onClick={openCreditDetails}
-            title="查看明细"
-          >
-            <div className="flex items-center justify-between gap-2">
-              <div className="text-[0.7rem] font-semibold text-muted-foreground">剩余可用积分</div>
-              <ChevronRight className="h-3.5 w-3.5 text-muted-foreground/60" />
-            </div>
-            <div className="mt-0.5 break-all text-lg font-bold text-success">
-              {formatCredits(creditSummary.data?.enabledCreditRemaining)}
-            </div>
-          </button>
-          <div className="rounded-lg border border-border/60 bg-muted/30 px-3 py-2">
-            <div className="text-[0.7rem] font-semibold text-muted-foreground">最近查询</div>
-            <div className="mt-0.5 text-sm font-semibold">
-              {creditSummary.data?.lastCheckedAt ? formatFullDate(creditSummary.data.lastCheckedAt) : '未查询'}
-            </div>
-          </div>
-        </div>
-      </div>
 
       {/* Stats */}
       <StatGrid>
@@ -518,6 +485,29 @@ export function CredentialsPage() {
           value={formatNumber(disabledCount)}
           tone={disabledCount > 0 ? 'warning' : 'default'}
         />
+        <button
+          type="button"
+          className="relative flex min-h-[6.5rem] flex-col justify-between overflow-hidden rounded-xl border border-border bg-card p-4 shadow-sm transition-colors hover:border-primary/60 focus:outline-none focus:ring-2 focus:ring-primary/30 text-left"
+          onClick={openCreditDetails}
+          title="查看积分明细"
+        >
+          <span className="absolute left-0 top-4 h-8 w-1 rounded-r-full bg-success" />
+          <div className="flex items-start justify-between gap-2 pl-2.5">
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-1.5 text-[0.72rem] font-semibold text-muted-foreground">
+                剩余可用积分
+                {creditSummary.isFetching && <Spinner size="sm" />}
+              </div>
+              <div className="mt-1 break-words text-2xl font-semibold tracking-tight tabular-nums text-success">
+                {formatCredits(creditSummary.data?.enabledCreditRemaining)}
+              </div>
+            </div>
+            <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground/60 mt-1" />
+          </div>
+          <div className="mt-2 truncate pl-2.5 text-[0.72rem] text-muted-foreground">
+            最近查询：{creditSummary.data?.lastCheckedAt ? formatFullDate(creditSummary.data.lastCheckedAt) : '未查询'}
+          </div>
+        </button>
       </StatGrid>
 
       {/* Main section */}
@@ -671,8 +661,7 @@ export function CredentialsPage() {
             </Button>
             {disabledCount > 0 && (
               <Button
-                variant="outline" size="xs"
-                className="text-destructive hover:bg-destructive/10"
+                variant="destructive" size="xs"
                 onClick={clearAllDisabled}
               >
                 <Trash2 className="h-3.5 w-3.5" />清除全部已禁用 ({disabledCount})

@@ -7,7 +7,6 @@ import {
   KeyRound,
   Plus,
   Save,
-  Shield,
   Trash2,
   Wand2,
   X,
@@ -27,6 +26,7 @@ import {
   Input,
   Separator,
   Spinner,
+  Tooltip,
 } from '@/components/ui'
 import { extractErrorMessage } from '@/lib/utils'
 import { storage } from '@/lib/storage'
@@ -167,7 +167,9 @@ function RequestKeysSection({
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="text-sm font-semibold">请求 Key</span>
                   {item.primary && (
-                    <Badge tone="primary">主 Key</Badge>
+                    <Tooltip label="功能与其他请求 Key 相同，仅标记为首个创建的 Key">
+                      <Badge tone="primary" className="cursor-default">主 Key</Badge>
+                    </Tooltip>
                   )}
                   <span className="font-mono text-[0.68rem] text-muted-foreground">{item.id.slice(0, 12)}</span>
                 </div>
@@ -356,13 +358,7 @@ export function SecurityPage() {
     <PageContainer>
       <PageHeader
         title="安全"
-        subtitle="管理客户端请求 Key 与后台登录 Key"
-        actions={
-          <div className="flex items-center gap-2 text-xs text-muted-foreground">
-            <Shield className="h-4 w-4 text-warning" />
-            修改登录 Key 属高危操作，需二次确认
-          </div>
-        }
+        subtitle="请求 Key 用于客户端调用模型接口，登录 Key 用于后台管理登录，两者相互独立"
       />
 
       {/* 新增 Key 一次性明文提示 */}

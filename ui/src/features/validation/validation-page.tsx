@@ -299,7 +299,7 @@ function ExistingValidationSection({
   return (
     <SectionCard
       title="系统账号复查"
-      description="强制查询系统内账号的订阅与额度用量，并和上次快照对比。"
+      description="对已入库账号查询订阅与用量快照，强制刷新后与上次快照对比差异。"
       actions={
         <Button size="sm" onClick={handleRun} disabled={loading}>
           {loading && mutation.isPending ? <Spinner size="sm" /> : <RefreshCw className="h-4 w-4" />}
@@ -447,7 +447,7 @@ function ExternalValidationSection({
   return (
     <SectionCard
       title="外部 JSON 校验"
-      description="粘贴或选择 Kiro Account Manager / 批量导入格式 JSON，不导入系统、不改变调度。"
+      description="校验未入库的外部账号，支持订阅/用量/模型验活，不入库、不改变调度。"
       actions={
         <div className="flex items-center gap-1.5">
           <Button variant="outline" size="sm" asChild disabled={loading}>
@@ -553,7 +553,12 @@ function ExternalValidationSection({
 
         {/* Footer info */}
         <div className="flex items-center justify-between text-xs text-muted-foreground">
-          <span>已解析 {parsedCount} 条可校验账号</span>
+          <span>
+            {raw.trim() && parsedCount === 0
+              ? <span className="text-destructive font-medium">解析失败，请检查 JSON 格式</span>
+              : `已解析 ${parsedCount} 条可校验账号`
+            }
+          </span>
           <span className="flex items-center gap-1">
             <Upload className="h-3.5 w-3.5" />
             {selectedFiles.length
