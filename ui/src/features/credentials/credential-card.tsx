@@ -165,6 +165,11 @@ export function CredentialCard({
   const probationRemainingSecs = numberOrZero(credential.probationRemainingSecs)
   const recentErrorRate = numberOrZero(credential.recentErrorRate)
   const schedulerScore = numberOrZero(credential.schedulerScore)
+  const schedulerSelectionCount = numberOrZero(credential.schedulerSelectionCount)
+  const recentSelection10s = numberOrZero(credential.recentSchedulerSelectionCount10s)
+  const recentSelection60s = numberOrZero(credential.recentSchedulerSelectionCount60s)
+  const recentSelection5m = numberOrZero(credential.recentSchedulerSelectionCount5m)
+  const schedulerSelectionPressure = numberOrZero(credential.schedulerSelectionPressure)
   const lastTransientErrorAgo = formatApproxElapsedMs(credential.lastErrorAtMs)
   const dispatchStatus = dispatchStatusLabel(credential, probationRemainingSecs)
   const subMeta = subscriptionBadgeMeta(credential, balance)
@@ -437,18 +442,63 @@ export function CredentialCard({
                       {credential.inFlightRequests}{credential.maxConcurrentRequests > 0 ? `/${credential.maxConcurrentRequests}` : ' / ∞'}
                     </button>
                   }
-                  detail={concurrencyLimitLabel(credential)}
+                  detail={
+                    credential.inFlightRequests > 0
+                      ? `最老 ${credential.oldestInFlightAgeSecs}s · 闲置 ${credential.newestInFlightIdleSecs}s`
+                      : concurrencyLimitLabel(credential)
+                  }
                 />
               </div>
               <MetaItem label="调度状态" value={dispatchStatus} error={dispatchStatus !== '可调度'} />
               <MetaItem label="近期错误率" value={`${(recentErrorRate * 100).toFixed(1)}%`} error={recentErrorRate > 0} />
               <MetaItem label="延迟 EWMA" value={credential.latencyEwmaMs == null ? '未知' : `${Math.round(credential.latencyEwmaMs)}ms`} />
               <MetaItem label="调度评分" value={schedulerScore.toFixed(2)} />
+              <MetaItem label="总调度" value={formatNumber(schedulerSelectionCount)} />
+              <MetaItem
+                label="近期调度"
+                value={`${formatNumber(recentSelection60s)}/60s`}
+                detail={`10s ${formatNumber(recentSelection10s)} · 5m ${formatNumber(recentSelection5m)}`}
+              />
+              <MetaItem
+                label="调度压力"
+                value={schedulerSelectionPressure.toFixed(2)}
+                error={schedulerSelectionPressure > 1}
+              />
               <MetaItem label="失败/刷新失败" value={`${credential.failureCount} / ${credential.refreshFailureCount}`} error={hasFailures} />
+              <MetaItem
+                label="Lease 回收"
+                value={credential.inFlightLeaseMaxSecs > 0 ? `${credential.inFlightLeaseMaxSecs}s` : '-'}
+              />
+              {credential.warmupRemaining > 0 && (
+                <MetaItem label="预热剩余" value={credential.warmupRemaining} />
+              )}
+              {credential.inProbation && (
+                <MetaItem label="观察期" value={`${probationRemainingSecs}s`} />
+              )}
+              {(credential.pricedRequests > 0 || credential.unpricedRequests > 0) && (
+                <MetaItem
+                  label="计价请求覆盖"
+                  value={`${formatNumber(credential.pricedRequests)}/${formatNumber(credential.pricedRequests + credential.unpricedRequests)}`}
+                  error={credential.unpricedRequests > 0}
+                />
+              )}
               {credential.cooldownReason && (
                 <MetaItem label="冷却原因" value={<span className="truncate text-destructive text-xs">{credential.cooldownReason}</span>} />
               )}
             </div>
+            {credential.cooldowns && credential.cooldowns.length > 0 && (
+              <div className="mt-2 flex flex-wrap gap-1.5 text-xs text-muted-foreground">
+                {credential.cooldowns.map((cd) => (
+                  <span
+                    key={`${cd.global ? 'global' : cd.model}-${cd.remainingSecs}`}
+                    className="rounded border border-border bg-muted/40 px-2 py-0.5"
+                    title={cd.reason || undefined}
+                  >
+                    {cd.global ? '全部模型' : cd.model || '-'} · 冷却 {cd.remainingSecs}s
+                  </span>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* 额度 */}

@@ -4,7 +4,7 @@ import { extractErrorMessage } from '@/lib/utils'
 import { useUpsertManualModel } from '@/hooks/use-usage'
 import type { ModelCapabilityItem, ModelPriceItem, UpsertManualModelRequest } from '@/types/api'
 import { ModalShell, Field, FieldGrid } from '@/components/patterns'
-import { Button, Input, Switch } from '@/components/ui'
+import { Button, Checkbox, Input, Switch, Textarea } from '@/components/ui'
 
 export interface ManualModelForm {
   model: string
@@ -13,6 +13,7 @@ export interface ManualModelForm {
   maxInputTokens: string
   maxOutputTokens: string
   supportsPromptCaching: boolean
+  supportedInputTypes: { TEXT: boolean; IMAGE: boolean }
   inputCostPerMillion: string
   outputCostPerMillion: string
   cacheCreationInputCostPerMillion: string
@@ -28,6 +29,7 @@ export function emptyForm(): ManualModelForm {
     maxInputTokens: '',
     maxOutputTokens: '',
     supportsPromptCaching: false,
+    supportedInputTypes: { TEXT: true, IMAGE: false },
     inputCostPerMillion: '',
     outputCostPerMillion: '',
     cacheCreationInputCostPerMillion: '',
@@ -44,12 +46,24 @@ export function formFromCapability(item: ModelCapabilityItem, priceItem?: ModelP
     maxInputTokens: item.maxInputTokens != null ? String(item.maxInputTokens) : '',
     maxOutputTokens: item.maxOutputTokens != null ? String(item.maxOutputTokens) : '',
     supportsPromptCaching: item.supportsPromptCaching ?? false,
+    supportedInputTypes: {
+      TEXT: item.supportedInputTypes?.includes('TEXT') ?? true,
+      IMAGE: item.supportedInputTypes?.includes('IMAGE') ?? false,
+    },
     inputCostPerMillion: priceItem ? String(priceItem.pricing.inputCostPerToken * 1_000_000) : '',
     outputCostPerMillion: priceItem ? String(priceItem.pricing.outputCostPerToken * 1_000_000) : '',
     cacheCreationInputCostPerMillion: priceItem ? String(priceItem.pricing.cacheCreationInputTokenCost * 1_000_000) : '',
     cacheReadInputCostPerMillion: priceItem ? String(priceItem.pricing.cacheReadInputTokenCost * 1_000_000) : '',
     clearPricing: false,
   }
+}
+
+function parsePositiveInteger(value: string): number | undefined | typeof Number.NaN {
+  const trimmed = value.trim()
+  if (!trimmed) return undefined
+  const parsed = Number(trimmed)
+  if (!Number.isFinite(parsed) || parsed <= 0 || !Number.isInteger(parsed)) return Number.NaN
+  return parsed
 }
 
 export function ManualModelModal({
@@ -77,24 +91,48 @@ export function ManualModelModal({
       toast.error('模型 ID 不能为空')
       return
     }
+
+    const maxInput = parsePositiveInteger(form.maxInputTokens)
+    const maxOutput = parsePositiveInteger(form.maxOutputTokens)
+    if (Number.isNaN(maxInput)) {
+      toast.error('输入上限必须是大于 0 的整数，或留空')
+      return
+    }
+    if (Number.isNaN(maxOutput)) {
+      toast.error('输出上限必须是大于 0 的整数，或留空')
+      return
+    }
+
+    const supportedInputTypes = (Object.entries(form.supportedInputTypes) as [string, boolean][])
+      .filter(([, enabled]) => enabled)
+      .map(([type]) => type)
+
     const payload: UpsertManualModelRequest = {
       model: form.model.trim(),
       displayName: form.displayName.trim() || undefined,
       description: form.description.trim() || undefined,
-      maxInputTokens: form.maxInputTokens ? Number(form.maxInputTokens) : undefined,
-      maxOutputTokens: form.maxOutputTokens ? Number(form.maxOutputTokens) : undefined,
+      maxInputTokens: maxInput,
+      maxOutputTokens: maxOutput,
       supportsPromptCaching: form.supportsPromptCaching,
-      supportedInputTypes: ['text'],
+      supportedInputTypes,
       clearPricing: form.clearPricing,
     }
+
     if (!form.clearPricing && (form.inputCostPerMillion || form.outputCostPerMillion)) {
+      const input = Number(form.inputCostPerMillion)
+      const output = Number(form.outputCostPerMillion)
+      if (!Number.isFinite(input) || input < 0 || !Number.isFinite(output) || output < 0) {
+        toast.error('价格必须是有效的非负数')
+        return
+      }
       payload.pricing = {
-        inputCostPerMillion: Number(form.inputCostPerMillion) || 0,
-        outputCostPerMillion: Number(form.outputCostPerMillion) || 0,
+        inputCostPerMillion: input,
+        outputCostPerMillion: output,
         cacheCreationInputCostPerMillion: form.cacheCreationInputCostPerMillion ? Number(form.cacheCreationInputCostPerMillion) : undefined,
         cacheReadInputCostPerMillion: form.cacheReadInputCostPerMillion ? Number(form.cacheReadInputCostPerMillion) : undefined,
       }
     }
+
     try {
       await upsert.mutateAsync(payload)
       toast.success(isEdit ? '模型已更新' : '模型已添加')
@@ -105,7 +143,7 @@ export function ManualModelModal({
   }
 
   return (
-    <ModalShell open={open} onClose={onClose} title={isEdit ? '编辑手动模型' : '添加手动模型'} width="max-w-lg">
+    <ModalShell open={open} onClose={onClose} title={isEdit ? '编辑手动模型' : '添加手动模型'} width="max-w-xl">
       <div className="space-y-4 text-sm">
         <FieldGrid>
           <Field label="模型 ID" required>
@@ -120,17 +158,60 @@ export function ManualModelModal({
           <Field label="显示名称">
             <Input className="h-8 text-xs" value={form.displayName} onChange={(e) => set('displayName', e.target.value)} placeholder="可选" />
           </Field>
-          <Field label="最大输入 Token">
-            <Input type="number" className="h-8 text-xs" value={form.maxInputTokens} onChange={(e) => set('maxInputTokens', e.target.value)} />
+          <Field label="最大输入 Token" description="正整数，留空表示不限制">
+            <Input
+              type="number"
+              min={1}
+              step={1}
+              className="h-8 text-xs"
+              value={form.maxInputTokens}
+              onChange={(e) => set('maxInputTokens', e.target.value)}
+              placeholder="200000"
+            />
           </Field>
-          <Field label="最大输出 Token">
-            <Input type="number" className="h-8 text-xs" value={form.maxOutputTokens} onChange={(e) => set('maxOutputTokens', e.target.value)} />
+          <Field label="最大输出 Token" description="正整数，留空表示不限制">
+            <Input
+              type="number"
+              min={1}
+              step={1}
+              className="h-8 text-xs"
+              value={form.maxOutputTokens}
+              onChange={(e) => set('maxOutputTokens', e.target.value)}
+              placeholder="64000"
+            />
           </Field>
         </FieldGrid>
 
-        <div className="flex items-center gap-3">
-          <label className="text-xs text-muted-foreground w-28">支持 Prompt 缓存</label>
-          <Switch checked={form.supportsPromptCaching} onCheckedChange={(v) => set('supportsPromptCaching', v)} />
+        <div className="col-span-2">
+          <Field label="描述">
+            <Textarea
+              className="min-h-16 text-xs"
+              value={form.description}
+              onChange={(e) => set('description', e.target.value)}
+              placeholder="可选，模型用途说明"
+            />
+          </Field>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-6">
+          <div className="flex items-center gap-2">
+            <label className="text-xs text-muted-foreground">支持 Prompt 缓存</label>
+            <Switch checked={form.supportsPromptCaching} onCheckedChange={(v) => set('supportsPromptCaching', v)} />
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="text-xs text-muted-foreground">输入类型</span>
+            {(['TEXT', 'IMAGE'] as const).map((type) => (
+              <label key={type} className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
+                <Checkbox
+                  checked={form.supportedInputTypes[type]}
+                  onCheckedChange={(checked) =>
+                    set('supportedInputTypes', { ...form.supportedInputTypes, [type]: Boolean(checked) })
+                  }
+                />
+                {type}
+              </label>
+            ))}
+          </div>
         </div>
 
         <div className="rounded-lg border border-border p-3 space-y-3">
@@ -146,16 +227,16 @@ export function ManualModelModal({
           {!form.clearPricing && (
             <FieldGrid>
               <Field label="输入单价">
-                <Input type="number" className="h-8 text-xs" value={form.inputCostPerMillion} onChange={(e) => set('inputCostPerMillion', e.target.value)} placeholder="3.00" />
+                <Input type="number" min={0} step="0.000001" className="h-8 text-xs" value={form.inputCostPerMillion} onChange={(e) => set('inputCostPerMillion', e.target.value)} placeholder="3.00" />
               </Field>
               <Field label="输出单价">
-                <Input type="number" className="h-8 text-xs" value={form.outputCostPerMillion} onChange={(e) => set('outputCostPerMillion', e.target.value)} placeholder="15.00" />
+                <Input type="number" min={0} step="0.000001" className="h-8 text-xs" value={form.outputCostPerMillion} onChange={(e) => set('outputCostPerMillion', e.target.value)} placeholder="15.00" />
               </Field>
-              <Field label="缓存写入单价">
-                <Input type="number" className="h-8 text-xs" value={form.cacheCreationInputCostPerMillion} onChange={(e) => set('cacheCreationInputCostPerMillion', e.target.value)} placeholder="3.75" />
+              <Field label="缓存写入单价" description="留空按输入 ×1.25">
+                <Input type="number" min={0} step="0.000001" className="h-8 text-xs" value={form.cacheCreationInputCostPerMillion} onChange={(e) => set('cacheCreationInputCostPerMillion', e.target.value)} placeholder="3.75" />
               </Field>
-              <Field label="缓存读取单价">
-                <Input type="number" className="h-8 text-xs" value={form.cacheReadInputCostPerMillion} onChange={(e) => set('cacheReadInputCostPerMillion', e.target.value)} placeholder="0.30" />
+              <Field label="缓存读取单价" description="留空按输入 ×0.1">
+                <Input type="number" min={0} step="0.000001" className="h-8 text-xs" value={form.cacheReadInputCostPerMillion} onChange={(e) => set('cacheReadInputCostPerMillion', e.target.value)} placeholder="0.30" />
               </Field>
             </FieldGrid>
           )}

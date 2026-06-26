@@ -10,7 +10,9 @@ import { Badge, Button, Input, Select, SelectContent, SelectItem, SelectTrigger,
 export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [olderThanDays, setOlderThanDays] = useState('30')
   const [mode, setMode] = useState<'soft_delete' | 'hard_delete'>('soft_delete')
-  const [previewResult, setPreviewResult] = useState<{ matchedRows: number; cutoffAt: string; oldestCreatedAt?: string } | null>(null)
+  const [batchSize, setBatchSize] = useState('1000')
+  const [pauseMs, setPauseMs] = useState('100')
+  const [previewResult, setPreviewResult] = useState<{ matchedRows: number; cutoffAt: string; oldestCreatedAt?: string; newestCreatedAt?: string } | null>(null)
   const [previewing, setPreviewing] = useState(false)
 
   const preview = usePreviewUsageCleanup()
@@ -26,6 +28,8 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
   const buildRequest = (): UsageCleanupRequest => ({
     mode,
     olderThanDays: Number(olderThanDays),
+    batchSize: Number(batchSize) || 1000,
+    pauseMsBetweenBatches: Number(pauseMs) || 100,
   })
 
   const handlePreview = async () => {
@@ -106,10 +110,12 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
               </Badge>
             </div>
             <div className="grid grid-cols-2 gap-2 text-xs text-muted-foreground">
+              {status.jobId && <span className="col-span-2">任务 ID: {status.jobId}</span>}
               <span>已处理: {formatNumber(status.processedRows)} 条</span>
               {status.matchedRows && <span>匹配: {formatNumber(status.matchedRows)} 条</span>}
               {status.remainingRows !== undefined && <span>剩余: {formatNumber(status.remainingRows)} 条</span>}
-              <span>批次: {status.batches}</span>
+              <span>批次: {status.batches} / 上限 {status.maxBatches}</span>
+              {status.stopReason && <span className="col-span-2">停止原因: {status.stopReason}</span>}
             </div>
             {status.lastError && (
               <div className="text-xs text-destructive">{status.lastError}</div>
@@ -146,6 +152,31 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
             />
             <span className="text-xs text-muted-foreground">天前的记录</span>
           </div>
+          <div className="flex items-center gap-3">
+            <label className="text-xs text-muted-foreground w-20 shrink-0">每批数量</label>
+            <Input
+              type="number"
+              min={1}
+              className="flex-1 h-8 text-xs"
+              value={batchSize}
+              onChange={(e) => setBatchSize(e.target.value)}
+              placeholder="1000"
+            />
+            <span className="text-xs text-muted-foreground/60">条</span>
+          </div>
+          <div className="flex items-center gap-3">
+            <label className="text-xs text-muted-foreground w-20 shrink-0">批次间隔</label>
+            <Input
+              type="number"
+              min={0}
+              className="flex-1 h-8 text-xs"
+              value={pauseMs}
+              onChange={(e) => setPauseMs(e.target.value)}
+              placeholder="100"
+            />
+            <span className="text-xs text-muted-foreground/60">ms</span>
+          </div>
+          <div className="text-xs text-muted-foreground/60">系统后端保留安全上限（maxBatches），超出后自动停止。</div>
         </div>
 
         {mode === 'hard_delete' && (
@@ -159,6 +190,7 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
             <div>匹配记录: <span className="font-semibold tabular-nums">{formatNumber(previewResult.matchedRows)}</span> 条</div>
             <div>截止时间: <span className="tabular-nums">{formatDate(previewResult.cutoffAt)}</span></div>
             {previewResult.oldestCreatedAt && <div>最旧记录: {formatDate(previewResult.oldestCreatedAt)}</div>}
+            {previewResult.newestCreatedAt && <div>最新记录: {formatDate(previewResult.newestCreatedAt)}</div>}
           </div>
         )}
 

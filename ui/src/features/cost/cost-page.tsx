@@ -9,7 +9,7 @@ import {
   TrendingUp,
 } from 'lucide-react'
 import { toast } from 'sonner'
-import { formatDate, formatNumber, formatPricePerMillion, formatUsd } from '@/lib/format'
+import { formatCompact, formatDate, formatNumber, formatPricePerMillion, formatUsd } from '@/lib/format'
 import { extractErrorMessage } from '@/lib/utils'
 import {
   useDeleteManualModel,
@@ -70,6 +70,136 @@ function pricingByModel(pricing?: { models: ModelPriceItem[] }) {
   const map = new Map<string, ModelPriceItem>()
   for (const item of pricing?.models ?? []) map.set(item.model, item)
   return map
+}
+
+// ─── 模型能力目录 ──────────────────────────────────────────────────────────────
+
+function ModelCapabilitiesTable({
+  onEdit,
+  onDelete,
+}: {
+  onEdit: (form: ManualModelForm) => void
+  onDelete: (model: string) => void
+}) {
+  const capabilities = useModelCapabilities()
+  const pricing = useModelPricing()
+  const syncCapabilities = useSyncModelCapabilities()
+  const priceMap = useMemo(() => {
+    const map = new Map<string, ModelPriceItem>()
+    for (const item of pricing.data?.models ?? []) map.set(item.model, item)
+    return map
+  }, [pricing.data?.models])
+
+  return (
+    <SectionCard
+      title="模型能力目录"
+      description="从 Kiro 同步的可用模型、上下文窗口、输出上限和缓存能力；手动模型作为补充。"
+      actions={
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            syncCapabilities.mutate(undefined, {
+              onSuccess: (s) => {
+                if (s.lastError) toast.warning(`同步失败: ${s.lastError}`)
+                else toast.success(`模型能力已同步：${s.modelCount} 个模型`)
+              },
+              onError: (e) => toast.error(`同步失败: ${extractErrorMessage(e)}`),
+            })
+          }}
+          disabled={syncCapabilities.isPending}
+        >
+          {syncCapabilities.isPending ? <Spinner size="sm" /> : <RefreshCw className="h-3.5 w-3.5" />}
+          同步能力
+        </Button>
+      }
+      noPadding
+    >
+      {capabilities.data?.lastError && (
+        <div className="px-4 pt-4">
+          <Callout tone="warning">{capabilities.data.lastError}</Callout>
+        </div>
+      )}
+      {capabilities.isLoading ? (
+        <LoadingState text="加载能力数据..." className="py-8" />
+      ) : !capabilities.data?.models.length ? (
+        <div className="px-4 pb-4 pt-4">
+          <EmptyState title="暂无模型能力数据" description="点击同步按钮获取最新数据，或手动添加模型" />
+        </div>
+      ) : (
+        <div className="scrollbar-thin overflow-x-auto">
+          <Table className="min-w-[960px]">
+            <TableHeader>
+              <TableRow>
+                <TableHead>模型</TableHead>
+                <TableHead>显示名</TableHead>
+                <TableHead>来源</TableHead>
+                <TableHead className="text-right">输入上限</TableHead>
+                <TableHead className="text-right">输出上限</TableHead>
+                <TableHead className="text-right">缓存</TableHead>
+                <TableHead>输入类型</TableHead>
+                <TableHead className="text-right">操作</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {capabilities.data.models.map((item) => {
+                const isManual = item.source === 'manual'
+                return (
+                  <TableRow key={item.model}>
+                    <TableCell>
+                      <div className="max-w-[200px] truncate text-xs font-semibold" title={item.model}>{item.model}</div>
+                    </TableCell>
+                    <TableCell className="text-xs">{item.displayName || '-'}</TableCell>
+                    <TableCell>
+                      <Badge tone={sourceTone(item.source)}>{sourceLabel(item.source)}</Badge>
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-xs tabular-nums">{item.maxInputTokens ? formatCompact(item.maxInputTokens) : '—'}</TableCell>
+                    <TableCell className="text-right font-mono text-xs tabular-nums">{item.maxOutputTokens ? formatCompact(item.maxOutputTokens) : '—'}</TableCell>
+                    <TableCell className="text-right text-xs">
+                      {item.supportsPromptCaching === undefined ? '—' : item.supportsPromptCaching ? '支持' : '不支持'}
+                    </TableCell>
+                    <TableCell className="text-xs text-muted-foreground">
+                      {item.supportedInputTypes?.length ? item.supportedInputTypes.join(', ') : '—'}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <div className="flex items-center justify-end gap-1">
+                        {isManual ? (
+                          <>
+                            <Button
+                              variant="ghost"
+                              size="icon-xs"
+                              onClick={() => onEdit(formFromCapability(item, priceMap.get(item.model)))}
+                            >
+                              <Edit3 className="size-3.5" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon-xs"
+                              className="text-destructive hover:bg-destructive/10"
+                              onClick={() => onDelete(item.model)}
+                            >
+                              <Trash2 className="size-3.5" />
+                            </Button>
+                          </>
+                        ) : (
+                          <span className="text-xs text-muted-foreground/40">-</span>
+                        )}
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                )
+              })}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+      {capabilities.data?.lastSyncedAt && (
+        <div className="border-t border-border px-4 py-2 text-xs text-muted-foreground">
+          能力同步: {formatDate(capabilities.data.lastSyncedAt)}
+        </div>
+      )}
+    </SectionCard>
+  )
 }
 
 // ─── 外部池盈亏面板 ────────────────────────────────────────────────────────────
@@ -304,6 +434,7 @@ function ModelPricingTable({
                                 maxInputTokens: '',
                                 maxOutputTokens: '',
                                 supportsPromptCaching: false,
+                                supportedInputTypes: { TEXT: true, IMAGE: false },
                                 inputCostPerMillion: priceItem ? String(priceItem.pricing.inputCostPerToken * 1_000_000) : '',
                                 outputCostPerMillion: priceItem ? String(priceItem.pricing.outputCostPerToken * 1_000_000) : '',
                                 cacheCreationInputCostPerMillion: priceItem ? String(priceItem.pricing.cacheCreationInputTokenCost * 1_000_000) : '',
@@ -420,6 +551,34 @@ export function CostPage() {
           tone="primary"
         />
       </StatGrid>
+
+      {/* 能力状态卡 */}
+      <StatGrid>
+        <StatCard
+          title="模型能力"
+          value={<Badge tone={capabilities.data?.available ? 'success' : 'error'}>{capabilities.data?.available ? '可用' : '不可用'}</Badge>}
+          desc={`来源: ${capabilities.data?.source || '-'}`}
+        />
+        <StatCard
+          title="能力模型数"
+          value={formatNumber(capabilities.data?.modelCount ?? 0)}
+          desc={capabilities.data?.lastSyncedAt ? `同步: ${formatDate(capabilities.data.lastSyncedAt)}` : '未同步'}
+        />
+        <StatCard
+          title="价格状态"
+          value={<Badge tone={pricing.data?.available ? 'success' : 'error'}>{pricing.data?.available ? '可用' : '不可用'}</Badge>}
+          desc={pricing.data?.sourceUrl ? pricing.data.sourceUrl : `来源: ${pricing.data?.source || '-'}`}
+        />
+        <StatCard
+          title="价格模型数"
+          value={formatNumber(pricing.data?.modelCount ?? 0)}
+          desc={pricing.data?.lastSyncedAt ? `同步: ${formatDate(pricing.data.lastSyncedAt)}` : '未同步'}
+          tone={pricedModels > 0 ? 'success' : 'default'}
+        />
+      </StatGrid>
+
+      {/* 模型能力目录 */}
+      <ModelCapabilitiesTable onEdit={handleEdit} onDelete={handleDelete} />
 
       {/* 外部池盈亏 */}
       <ExternalPoolBillingPanel />

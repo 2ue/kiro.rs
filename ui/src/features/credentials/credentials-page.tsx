@@ -1,5 +1,6 @@
 import {
   CheckCircle2,
+  ChevronRight,
   Download,
   FileUp,
   Filter,
@@ -9,12 +10,13 @@ import {
   Server,
   Trash2,
   Upload,
+  Wallet,
   X,
 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { forceRefreshToken, testCredential } from '@/api/credentials'
+import { forceRefreshToken, getCredentials, getCredentialAccountInfo, refreshCredentialInfo, testCredential } from '@/api/credentials'
 import {
   Badge,
   Button,
@@ -30,6 +32,7 @@ import {
   EmptyState,
   ErrorState,
   LoadingState,
+  ModalShell,
   PageContainer,
   PageHeader,
   Pagination,
@@ -41,7 +44,7 @@ import {
   ToolbarSearch,
   useConfirm,
 } from '@/components/patterns'
-import { formatNumber } from '@/lib/format'
+import { formatCredits, formatFullDate, formatNumber } from '@/lib/format'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
 import { extractErrorMessage } from '@/lib/utils'
 import {
@@ -50,6 +53,7 @@ import {
   useCredentialSummary,
   useCredentialAccountInfo,
   useCredentialUsageSummary,
+  useCredentialCreditSummary,
   useCredentials,
   useDeleteCredential,
   useDeleteDisabledCredentials,
@@ -59,6 +63,7 @@ import {
   useSetLoadBalancingMode,
 } from '@/hooks/use-credentials'
 import type {
+  CredentialAccountInfoItem,
   CredentialSortBy,
   CredentialSortOrder,
   CredentialStatusItem,
@@ -83,6 +88,16 @@ import { mapById, mergeCredentialPlanes } from './credential-utils'
 // ============================================================================
 
 const PAGE_SIZE = 15
+const CREDIT_INFO_BATCH_SIZE = 500
+
+interface CreditDetailRow {
+  id: number
+  email?: string | null
+  subscriptionTitle?: string | null
+  creditRemaining?: number
+  creditLimit?: number
+  checkedAt?: string
+}
 
 const SORT_OPTIONS: Array<{ value: CredentialSortBy; label: string }> = [
   { value: 'default', label: '默认排序' },
@@ -92,6 +107,7 @@ const SORT_OPTIONS: Array<{ value: CredentialSortBy; label: string }> = [
   { value: 'last_used_at', label: '最后使用' },
   { value: 'success_count', label: '成功次数' },
   { value: 'failure_count', label: '失败次数' },
+  { value: 'refresh_failure_count', label: '刷新失败' },
   { value: 'in_flight_requests', label: '并发占用' },
   { value: 'scheduler_score', label: '调度评分' },
   { value: 'estimated_cost', label: '本地成本' },
@@ -126,6 +142,10 @@ export function CredentialsPage() {
   const [verifyProgress, setVerifyProgress] = useState({ current: 0, total: 0 })
   const [verifyResults, setVerifyResults] = useState<Map<number, VerifyResult>>(new Map())
   const [batchRefreshing, setBatchRefreshing] = useState(false)
+  const [queryingCreditInfo, setQueryingCreditInfo] = useState(false)
+  const [creditDetailsOpen, setCreditDetailsOpen] = useState(false)
+  const [creditDetailsLoading, setCreditDetailsLoading] = useState(false)
+  const [creditDetailRows, setCreditDetailRows] = useState<CreditDetailRow[]>([])
   const cancelVerifyRef = useRef(false)
 
   const confirmDialog = useConfirm()
@@ -151,6 +171,7 @@ export function CredentialsPage() {
   const credentialRuntime = useCredentialRuntime(currentIds)
   const credentialAccountInfo = useCredentialAccountInfo(currentIds)
   const credentialUsage = useCredentialUsageSummary(currentIds)
+  const creditSummary = useCredentialCreditSummary()
   const proxyResources = useProxyResources()
   const loadBalancing = useLoadBalancingMode()
   const setLoadBalancingMutation = useSetLoadBalancingMode()
@@ -191,6 +212,91 @@ export function CredentialsPage() {
     queryClient.invalidateQueries({ queryKey: ['credential-account-info'] })
     queryClient.invalidateQueries({ queryKey: ['credential-usage-summary'] })
     queryClient.invalidateQueries({ queryKey: ['credentials-page'] })
+    queryClient.invalidateQueries({ queryKey: ['credential-credit-summary'] })
+  }
+
+  const loadCreditDetails = async () => {
+    setCreditDetailsLoading(true)
+    try {
+      const all = await getCredentials()
+      const enabledCredentials = all.credentials
+        .filter((item) => !item.disabled)
+        .sort((a, b) => a.id - b.id)
+      const ids = enabledCredentials.map((item) => item.id)
+      const infoMap = new Map<number, CredentialAccountInfoItem>()
+      for (let i = 0; i < ids.length; i += CREDIT_INFO_BATCH_SIZE) {
+        const batchIds = ids.slice(i, i + CREDIT_INFO_BATCH_SIZE)
+        const data = await getCredentialAccountInfo(batchIds)
+        data.items.forEach((item) => infoMap.set(item.id, item))
+      }
+      setCreditDetailRows(
+        enabledCredentials.map((cred) => {
+          const info = infoMap.get(cred.id)
+          return {
+            id: cred.id,
+            email: cred.email,
+            subscriptionTitle: info?.subscriptionTitle ?? cred.subscriptionTitle,
+            creditRemaining: info?.creditRemaining,
+            creditLimit: info?.creditLimit,
+            checkedAt: info?.checkedAt,
+          }
+        })
+      )
+    } catch (e) {
+      toast.error(`加载积分明细失败: ${extractErrorMessage(e)}`)
+    } finally {
+      setCreditDetailsLoading(false)
+    }
+  }
+
+  const openCreditDetails = () => {
+    setCreditDetailsOpen(true)
+    loadCreditDetails()
+  }
+
+  const updateAllCreditInfo = async () => {
+    setQueryingCreditInfo(true)
+    try {
+      const all = await getCredentials()
+      const ids = all.credentials.map((item) => item.id)
+      if (!ids.length) { toast.error('没有可查询信息的账号'); return }
+      let total = 0; let success = 0; let failed = 0
+      for (let i = 0; i < ids.length; i += CREDIT_INFO_BATCH_SIZE) {
+        const batchIds = ids.slice(i, i + CREDIT_INFO_BATCH_SIZE)
+        const data = await refreshCredentialInfo(batchIds, true)
+        total += data.total; success += data.success; failed += data.failed
+      }
+      invalidate()
+      await creditSummary.refetch()
+      if (creditDetailsOpen) await loadCreditDetails()
+      if (failed === 0) toast.success(`积分统计已更新：成功 ${success}/${total}`)
+      else toast.warning(`积分统计更新完成：成功 ${success}，失败 ${failed}`)
+    } catch (e) {
+      toast.error(`更新积分统计失败: ${extractErrorMessage(e)}`)
+    } finally {
+      setQueryingCreditInfo(false)
+    }
+  }
+
+  const batchQueryCreditInfo = async () => {
+    const ids = Array.from(selectedIds)
+    if (!ids.length) return toast.error('请先选择要查询积分的账号')
+    setQueryingCreditInfo(true)
+    try {
+      let success = 0; let failed = 0; let total = 0
+      for (let i = 0; i < ids.length; i += CREDIT_INFO_BATCH_SIZE) {
+        const batchIds = ids.slice(i, i + CREDIT_INFO_BATCH_SIZE)
+        const data = await refreshCredentialInfo(batchIds, true)
+        total += data.total; success += data.success; failed += data.failed
+      }
+      invalidate()
+      if (failed === 0) toast.success(`积分查询完成：成功 ${success}/${total}`)
+      else toast.warning(`积分查询完成：成功 ${success}，失败 ${failed}`)
+    } catch (e) {
+      toast.error(`查询积分失败: ${extractErrorMessage(e)}`)
+    } finally {
+      setQueryingCreditInfo(false)
+    }
   }
 
   const toggleSelect = (id: number) =>
@@ -321,6 +427,43 @@ export function CredentialsPage() {
           </div>
         }
       />
+
+      {/* Credit Summary Panel */}
+      <div className="rounded-lg border border-border bg-card shadow-sm p-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div className="flex items-center gap-2">
+            <Wallet className="h-4 w-4 text-primary" />
+            <h2 className="text-sm font-semibold">积分统计</h2>
+            {creditSummary.isFetching && <Spinner size="sm" />}
+          </div>
+          <Button size="sm" onClick={updateAllCreditInfo} disabled={queryingCreditInfo}>
+            {queryingCreditInfo ? <Spinner size="sm" /> : <RefreshCw className="h-4 w-4" />}
+            更新积分统计
+          </Button>
+        </div>
+        <div className="mt-3 grid gap-2 sm:grid-cols-2">
+          <button
+            type="button"
+            className="rounded-lg border border-transparent bg-muted/40 px-3 py-2 text-left transition hover:border-primary/40 hover:bg-muted focus:outline-none focus:ring-2 focus:ring-primary/30"
+            onClick={openCreditDetails}
+            title="查看明细"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-[0.7rem] font-semibold text-muted-foreground">剩余可用积分</div>
+              <ChevronRight className="h-3.5 w-3.5 text-muted-foreground/60" />
+            </div>
+            <div className="mt-0.5 break-all text-lg font-bold text-success">
+              {formatCredits(creditSummary.data?.enabledCreditRemaining)}
+            </div>
+          </button>
+          <div className="rounded-lg border border-border/60 bg-muted/30 px-3 py-2">
+            <div className="text-[0.7rem] font-semibold text-muted-foreground">最近查询</div>
+            <div className="mt-0.5 text-sm font-semibold">
+              {creditSummary.data?.lastCheckedAt ? formatFullDate(creditSummary.data.lastCheckedAt) : '未查询'}
+            </div>
+          </div>
+        </div>
+      </div>
 
       {/* Stats */}
       <StatGrid>
@@ -459,6 +602,9 @@ export function CredentialsPage() {
             <Button variant="outline" size="xs" onClick={batchForceRefresh} disabled={batchRefreshing}>
               {batchRefreshing ? <Spinner size="sm" /> : <RefreshCw className="h-3.5 w-3.5" />}刷新Token
             </Button>
+            <Button variant="outline" size="xs" onClick={batchQueryCreditInfo} disabled={queryingCreditInfo}>
+              {queryingCreditInfo ? <Spinner size="sm" /> : <Wallet className="h-3.5 w-3.5" />}查询积分
+            </Button>
             <Button variant="outline" size="xs" onClick={batchResetFailure}>
               <RotateCcw className="h-3.5 w-3.5" />恢复异常
             </Button>
@@ -544,6 +690,42 @@ export function CredentialsPage() {
       </SectionCard>
 
       {/* Modals */}
+      <ModalShell open={creditDetailsOpen} title="剩余可用积分明细" width="max-w-4xl" onClose={() => setCreditDetailsOpen(false)}>
+        {creditDetailsLoading ? (
+          <LoadingState text="加载积分明细..." />
+        ) : creditDetailRows.length > 0 ? (
+          <div className="overflow-hidden rounded-lg border border-border">
+            <div className="max-h-[60vh] overflow-auto">
+              <table className="w-full text-sm">
+                <thead className="sticky top-0 z-10 bg-card border-b border-border">
+                  <tr>
+                    <th className="px-3 py-2 text-left font-semibold text-muted-foreground w-20">ID</th>
+                    <th className="px-3 py-2 text-left font-semibold text-muted-foreground">账号</th>
+                    <th className="px-3 py-2 text-left font-semibold text-muted-foreground w-28">订阅</th>
+                    <th className="px-3 py-2 text-right font-semibold text-muted-foreground w-28">剩余</th>
+                    <th className="px-3 py-2 text-right font-semibold text-muted-foreground w-28">总额</th>
+                    <th className="px-3 py-2 text-left font-semibold text-muted-foreground w-44">最近查询</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {creditDetailRows.map((row, i) => (
+                    <tr key={row.id} className={i % 2 === 0 ? 'bg-muted/20' : ''}>
+                      <td className="px-3 py-2 font-mono text-xs text-muted-foreground">#{row.id}</td>
+                      <td className="px-3 py-2 max-w-[240px] truncate font-medium">{row.email || `账号 #${row.id}`}</td>
+                      <td className="px-3 py-2 text-muted-foreground">{row.subscriptionTitle || '未知'}</td>
+                      <td className="px-3 py-2 text-right font-semibold text-success">{formatCredits(row.creditRemaining)}</td>
+                      <td className="px-3 py-2 text-right text-muted-foreground">{formatCredits(row.creditLimit)}</td>
+                      <td className="px-3 py-2 text-xs text-muted-foreground">{row.checkedAt ? formatFullDate(row.checkedAt) : '未查询'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ) : (
+          <EmptyState title="暂无积分明细" />
+        )}
+      </ModalShell>
       <AddCredentialModal open={addOpen} onClose={() => setAddOpen(false)} />
       <CredentialTestModal credential={testingCredential} open={Boolean(testingCredential)} onClose={() => setTestingCredential(null)} />
       <BatchEditCredentialsModal open={batchEditOpen} ids={Array.from(selectedIds)} onClose={() => setBatchEditOpen(false)} onDone={() => { invalidate(); setSelectedIds(new Set()) }} />

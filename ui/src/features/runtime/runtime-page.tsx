@@ -32,7 +32,10 @@ import { extractErrorMessage } from '@/lib/utils'
 import {
   defaultPayloadShaping,
   defaultPromptCacheCreationControl,
+  defaultReportedUsage,
   emptyRuntimeConfig,
+  normalizePromptCacheCreationControl,
+  normalizeReportedUsage,
   toRatio,
   toScale,
   toWhole,
@@ -43,7 +46,15 @@ import {
   useSetLoadBalancingMode,
   useUpdateRuntimeConfig,
 } from '@/hooks/use-credentials'
-import type { LoadBalancingMode, PayloadGuardMode, RuntimeConfig } from '@/types/api'
+import { useModelCapabilities } from '@/hooks/use-usage'
+import type { KiroAgentModeStrategy, LoadBalancingMode, ModelMappingConfig, PayloadGuardMode, RuntimeConfig } from '@/types/api'
+import {
+  CacheCreationSection,
+  ModelMappingSection,
+  PayloadFallbackSection,
+  PayloadHistorySection,
+  ReportedUsageSection,
+} from './runtime-sections'
 
 // ─── 原子组件 ──────────────────────────────────────────────────────────────────
 
@@ -168,6 +179,8 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     promptCacheCapJitterMaxTokens: toWhole(draft.promptCacheCapJitterMaxTokens),
     promptCacheScaleMinInputTokens: toWhole(draft.promptCacheScaleMinInputTokens),
     highCacheThreshold: toWhole(draft.highCacheThreshold),
+    promptCacheCreationControl: normalizePromptCacheCreationControl(draft.promptCacheCreationControl),
+    reportedUsage: normalizeReportedUsage(draft.reportedUsage),
   }
   return next
 }
@@ -179,6 +192,7 @@ export function RuntimePage() {
   const updateConfig = useUpdateRuntimeConfig()
   const loadBalancing = useLoadBalancingMode()
   const setLbMode = useSetLoadBalancingMode()
+  const modelCapabilities = useModelCapabilities()
   const [draft, setDraft] = useState<RuntimeConfig>(emptyRuntimeConfig)
 
   useEffect(() => {
@@ -188,6 +202,7 @@ export function RuntimePage() {
         ...config.data,
         payloadShaping: { ...defaultPayloadShaping(), ...config.data.payloadShaping },
         promptCacheCreationControl: { ...defaultPromptCacheCreationControl(), ...config.data.promptCacheCreationControl },
+        reportedUsage: config.data.reportedUsage ?? defaultReportedUsage(),
       })
     }
   }, [config.data])
@@ -207,6 +222,10 @@ export function RuntimePage() {
     ) return toast.error('错误类型基础冷却秒数不能大于最大冷却秒数')
     if (next.promptCacheCapJitterMinTokens > next.promptCacheCapJitterMaxTokens)
       return toast.error('触顶扣减下限不能大于上限')
+    if (next.payloadGuardMaxBytes > 0 && next.payloadGuardMaxBytes < 65536)
+      return toast.error('处理阈值必须为 0 或不小于 65536 字节')
+    if (next.payloadGuardMaxBytes - next.payloadGuardSafetyMarginBytes < 65536 && next.payloadGuardMaxBytes > 0)
+      return toast.error('安全余量不能过大,处理阈值减去安全余量需不小于 65536 字节')
     const editable = { ...next }
     delete editable.proxyUrl
     delete editable.proxyUsername
@@ -307,6 +326,7 @@ export function RuntimePage() {
           <NumField label="响应耗时权重" desc="" value={draft.schedulerLatencyWeight} min={0} step={0.001} suffix="权重" onChange={set('schedulerLatencyWeight')} />
           <NumField label="恢复期降权" desc="" value={draft.schedulerProbationWeight} min={0} step={1} suffix="权重" onChange={set('schedulerProbationWeight')} />
           <NumField label="短时集中降权" desc="避免请求集中单一账号" value={draft.schedulerSelectionPressureWeight} min={0} step={1} suffix="权重" onChange={set('schedulerSelectionPressureWeight')} />
+          <NumField label="长期使用次数权重" desc="通常保持 0 即可" value={draft.schedulerTotalSelectionWeight} min={0} step={0.001} suffix="权重" onChange={set('schedulerTotalSelectionWeight')} />
           <NumField label="候选账号数量" desc="数值越大越分散" value={draft.schedulerTopK} min={1} max={100} suffix="个" onChange={set('schedulerTopK')} />
         </TwoCol>
       </CollapseSection>
@@ -362,6 +382,35 @@ export function RuntimePage() {
         </TwoCol>
       </CollapseSection>
 
+      {/* 旧内容清理 */}
+      <CollapseSection icon={<Wand2 />} title="旧内容清理" desc="历史消息、工具结果与网页内容的体积优化">
+        <PayloadHistorySection shaping={draft.payloadShaping} onChange={set('payloadShaping')} />
+      </CollapseSection>
+
+      {/* 当前内容兜底 */}
+      <CollapseSection icon={<Wand2 />} title="当前内容兜底" desc="当前请求超阈值时压缩当前消息、文档与图片">
+        <PayloadFallbackSection shaping={draft.payloadShaping} onChange={set('payloadShaping')} />
+      </CollapseSection>
+
+      {/* 缓存创建频次 */}
+      <CollapseSection icon={<Zap />} title="缓存创建频次" desc="控制缓存写入展示的节奏与额度">
+        <CacheCreationSection control={draft.promptCacheCreationControl} onChange={set('promptCacheCreationControl')} />
+      </CollapseSection>
+
+      {/* 用量展示规则 */}
+      <CollapseSection icon={<Gauge />} title="用量展示规则" desc="不同入口返回给客户端的用量口径">
+        <ReportedUsageSection reported={draft.reportedUsage} onChange={set('reportedUsage')} />
+      </CollapseSection>
+
+      {/* 模型映射 */}
+      <CollapseSection icon={<Shield />} title="模型映射" desc="客户端模型名到实际模型的映射规则">
+        <ModelMappingSection
+          mapping={draft.modelMapping}
+          capabilities={modelCapabilities.data}
+          onChange={(m: ModelMappingConfig) => set('modelMapping')(m)}
+        />
+      </CollapseSection>
+
       {/* 兼容模式 */}
       <CollapseSection icon={<Shield />} title="兼容与统计" desc="接口兼容模式、模型解析策略">
         <div className="space-y-4">
@@ -385,6 +434,17 @@ export function RuntimePage() {
                   <SelectItem value="compatible">默认兼容解析</SelectItem>
                   <SelectItem value="alias_only">仅精确与显式别名</SelectItem>
                   <SelectItem value="exact_only">仅完整模型名</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1.5">
+              <div className="text-sm font-semibold">Kiro 工作模式</div>
+              <Select value={draft.kiroAgentModeStrategy} onValueChange={(v) => set('kiroAgentModeStrategy')(v as KiroAgentModeStrategy)}>
+                <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="vibe">Vibe</SelectItem>
+                  <SelectItem value="spec">Spec</SelectItem>
+                  <SelectItem value="auto">自动</SelectItem>
                 </SelectContent>
               </Select>
             </div>
