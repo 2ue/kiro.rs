@@ -427,6 +427,18 @@ export function CredentialCard({
 
           {/* 调度运行态 */}
           <div>
+            <div className="mb-2 text-[0.68rem] font-semibold text-muted-foreground uppercase tracking-wide">基础信息</div>
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+              <MetaItem label="创建时间" value={credential.createdAt ? formatFullDate(credential.createdAt) : '-'} />
+              <MetaItem label="更新时间" value={credential.updatedAt ? formatFullDate(credential.updatedAt) : '-'} />
+              {credential.email && credential.maskedApiKey && (
+                <MetaItem label="API Key" value={<span className="font-mono truncate block" title={credential.maskedApiKey}>{credential.maskedApiKey}</span>} />
+              )}
+            </div>
+          </div>
+
+          {/* 调度运行态 */}
+          <div>
             <div className="mb-2 text-[0.68rem] font-semibold text-muted-foreground uppercase tracking-wide">调度 / 运行态</div>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
               {credential.inFlightRequests > 0 && (

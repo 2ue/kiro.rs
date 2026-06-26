@@ -62,6 +62,7 @@ import {
   useLoadBalancingMode,
   useProxyResources,
   useResetFailure,
+  useRuntimeConfig,
   useSetLoadBalancingMode,
 } from '@/hooks/use-credentials'
 import type {
@@ -177,6 +178,7 @@ export function CredentialsPage() {
   const creditSummary = useCredentialCreditSummary()
   const proxyResources = useProxyResources()
   const loadBalancing = useLoadBalancingMode()
+  const runtimeConfig = useRuntimeConfig()
   const setLoadBalancingMutation = useSetLoadBalancingMode()
   const deleteCredential = useDeleteCredential()
   const deleteDisabledCredentials = useDeleteDisabledCredentials()
@@ -199,6 +201,13 @@ export function CredentialsPage() {
   const hasActiveFilters = statusFilter !== '__all__' || authFilter !== '__all__' || subscriptionFilter !== '__all__' || proxyFilter !== '__all__'
   const activeFilterCount = [statusFilter, authFilter, subscriptionFilter, proxyFilter].filter((f) => f !== '__all__').length
   const selectedDisabledCount = Array.from(selectedIds).filter((id) => currentCredentials.find((c) => c.id === id)?.disabled).length
+  const defaultCredentialConcurrency = runtimeConfig.data?.credentialMaxConcurrentRequests ?? 0
+  const concurrencyOverrides = currentCredentials
+    .map((c) => c.maxConcurrentRequestsOverride)
+    .filter((v): v is number => typeof v === 'number')
+  const concurrencyOverrideDesc = concurrencyOverrides.length
+    ? `${concurrencyOverrides.length} 个账号已覆盖`
+    : '账号未覆盖'
 
   // Reset page on filter change
   useEffect(() => { setPage(1); setSelectedIds(new Set()) }, [queryText, statusFilter, authFilter, subscriptionFilter, proxyFilter, sortBy, sortOrder])
@@ -481,9 +490,27 @@ export function CredentialsPage() {
           tone="success"
         />
         <StatCard
+          title="当前活跃"
+          value={`#${credentialSummary.data?.currentId || '-'}`}
+          desc={
+            loadBalancing.data?.mode === 'priority'
+              ? '优先级模式'
+              : loadBalancing.data?.mode === 'balanced'
+                ? '均衡负载'
+                : '健康均衡'
+          }
+          tone="primary"
+        />
+        <StatCard
           title="全局并发"
           value={`${credentialSummary.data?.globalInFlightRequests ?? 0} / ${credentialSummary.data?.globalMaxConcurrentRequests ?? '∞'}`}
           desc={`排队 ${credentialSummary.data?.queuedRequests ?? 0}`}
+          tone="info"
+        />
+        <StatCard
+          title="默认单账号并发"
+          value={defaultCredentialConcurrency > 0 ? String(defaultCredentialConcurrency) : '不限制'}
+          desc={concurrencyOverrideDesc}
           tone="info"
         />
         <StatCard
@@ -546,8 +573,10 @@ export function CredentialsPage() {
                   <SelectItem value="__all__">全部状态</SelectItem>
                   <SelectItem value="enabled">启用</SelectItem>
                   <SelectItem value="disabled">已禁用</SelectItem>
+                  <SelectItem value="current">当前活跃</SelectItem>
                   <SelectItem value="cooldown">冷却中</SelectItem>
                   <SelectItem value="rate_limited">限流中</SelectItem>
+                  <SelectItem value="proxy_blocked">代理不可用</SelectItem>
                   <SelectItem value="error">有错误</SelectItem>
                   <SelectItem value="unknown_subscription">未知订阅</SelectItem>
                 </SelectContent>

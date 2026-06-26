@@ -739,21 +739,54 @@ export function KamImportModal({ open, onClose, onDone }: {
 export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
   open: boolean; ids: number[]; onClose: () => void; onDone: () => void
 }) {
-  const [fields, setFields] = useState({ priority: '', concurrency: '', proxyResourceId: '', region: '', authRegion: '', apiRegion: '' })
+  const [fields, setFields] = useState({
+    priority: '',
+    concurrency: '',
+    proxyResourceId: '',
+    proxyUrl: '',
+    proxyUsername: '',
+    proxyPassword: '',
+    region: '',
+    authRegion: '',
+    apiRegion: '',
+  })
+  const [showProxyUsername, setShowProxyUsername] = useState(false)
+  const [showProxyPassword, setShowProxyPassword] = useState(false)
   const [enableFields, setEnableFields] = useState({ priority: false, concurrency: false, proxy: false, regions: false })
   const batchUpdate = useBatchUpdateCredentials()
   const proxyResources = useProxyResources()
   const proxyOptions = proxyResources.data?.resources || []
 
+  const proxyLocked = Boolean(fields.proxyResourceId)
+
+  const setProxyResourceDraft = (v: string) => {
+    setFields((p) => ({ ...p, proxyResourceId: v, proxyUrl: v ? '' : p.proxyUrl, proxyUsername: v ? '' : p.proxyUsername, proxyPassword: v ? '' : p.proxyPassword }))
+  }
+
+  const setDirectProxyDraft = (key: 'proxyUrl' | 'proxyUsername' | 'proxyPassword', v: string) => {
+    setFields((p) => ({ ...p, [key]: v, proxyResourceId: v.trim() ? '' : p.proxyResourceId }))
+  }
+
   useEffect(() => {
-    if (!open) { setFields({ priority: '', concurrency: '', proxyResourceId: '', region: '', authRegion: '', apiRegion: '' }); setEnableFields({ priority: false, concurrency: false, proxy: false, regions: false }) }
+    if (!open) {
+      setFields({ priority: '', concurrency: '', proxyResourceId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', region: '', authRegion: '', apiRegion: '' })
+      setEnableFields({ priority: false, concurrency: false, proxy: false, regions: false })
+      setShowProxyUsername(false)
+      setShowProxyPassword(false)
+    }
   }, [open])
 
   const submit = async () => {
     if (!ids.length) { toast.error('没有选中账号'); return }
     const req: BatchUpdateCredentialsRequest = { ids }
     if (enableFields.proxy) {
-      req.proxy = { proxyResourceId: fields.proxyResourceId ? Number(fields.proxyResourceId) : null }
+      const resourceId = fields.proxyResourceId ? Number(fields.proxyResourceId) : null
+      req.proxy = {
+        proxyResourceId: resourceId,
+        proxyUrl: resourceId ? undefined : fields.proxyUrl.trim() || undefined,
+        proxyUsername: resourceId ? undefined : fields.proxyUsername.trim() || undefined,
+        proxyPassword: resourceId ? undefined : fields.proxyPassword.trim() || undefined,
+      }
     }
     if (enableFields.regions) {
       req.regions = {
@@ -788,16 +821,55 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
           <div className="rounded-lg border border-border bg-muted/30 p-3 space-y-3">
             <div className="flex items-center gap-2">
               <Checkbox checked={enableFields.proxy} onCheckedChange={(v) => setEnableFields((p) => ({ ...p, proxy: Boolean(v) }))} id="batch-proxy" />
-              <label htmlFor="batch-proxy" className="text-sm font-semibold cursor-pointer">代理资源</label>
+              <label htmlFor="batch-proxy" className="text-sm font-semibold cursor-pointer">代理设置</label>
             </div>
             {enableFields.proxy && (
-              <Select value={fields.proxyResourceId || '__none__'} onValueChange={(v) => setFields((p) => ({ ...p, proxyResourceId: v === '__none__' ? '' : v }))}>
-                <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="__none__">清除代理资源（继承全局）</SelectItem>
-                  {proxyOptions.map((r) => <SelectItem key={r.id} value={String(r.id)}>{r.name}</SelectItem>)}
-                </SelectContent>
-              </Select>
+              <div className="space-y-3">
+                <Field label="代理资源" description="选择资源会清空直连代理字段；不选且 URL 为空则清除账号级代理">
+                  <Select value={fields.proxyResourceId || '__none__'} onValueChange={(v) => setProxyResourceDraft(v === '__none__' ? '' : v)}>
+                    <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__none__">不绑定（清除代理资源）</SelectItem>
+                      {proxyOptions.map((r) => <SelectItem key={r.id} value={String(r.id)}>{r.name}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                </Field>
+                <div className={`rounded-lg border p-3 space-y-2 ${proxyLocked ? 'opacity-50 bg-muted/20' : 'bg-card'}`}>
+                  <div className="text-xs font-semibold text-muted-foreground">
+                    直连代理{proxyLocked ? '（已选代理资源，保存时会清空）' : ''}
+                  </div>
+                  <FieldGrid>
+                    <Field label="代理 URL">
+                      <Input
+                        value={fields.proxyUrl}
+                        placeholder="socks5h://127.0.0.1:1080"
+                        disabled={proxyLocked}
+                        onChange={(e) => setDirectProxyDraft('proxyUrl', e.target.value)}
+                      />
+                    </Field>
+                    <Field label="用户名">
+                      <SecretInput
+                        value={fields.proxyUsername}
+                        onChange={(v) => setDirectProxyDraft('proxyUsername', v)}
+                        visible={showProxyUsername}
+                        onToggle={() => setShowProxyUsername((v) => !v)}
+                        disabled={proxyLocked}
+                        placeholder="可选"
+                      />
+                    </Field>
+                    <Field label="密码">
+                      <SecretInput
+                        value={fields.proxyPassword}
+                        onChange={(v) => setDirectProxyDraft('proxyPassword', v)}
+                        visible={showProxyPassword}
+                        onToggle={() => setShowProxyPassword((v) => !v)}
+                        disabled={proxyLocked}
+                        placeholder="可选"
+                      />
+                    </Field>
+                  </FieldGrid>
+                </div>
+              </div>
             )}
           </div>
           <div className="rounded-lg border border-border bg-muted/30 p-3 space-y-3">
