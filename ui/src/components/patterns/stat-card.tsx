@@ -5,6 +5,8 @@ import { cn } from '@/lib/utils'
 interface StatCardProps {
   title: string
   value: React.ReactNode
+  /** 悬停在主数值上显示的完整值（用于缩写数字展示完整数字） */
+  valueTitle?: string
   desc?: React.ReactNode
   icon?: React.ReactNode
   tone?: 'default' | 'primary' | 'success' | 'warning' | 'error' | 'info'
@@ -38,7 +40,7 @@ const valueMap: Record<string, string> = {
   info: 'text-info',
 }
 
-export function StatCard({ title, value, desc, icon, tone = 'default', className }: StatCardProps) {
+export function StatCard({ title, value, valueTitle, desc, icon, tone = 'default', className }: StatCardProps) {
   return (
     <div
       className={cn(
@@ -50,7 +52,7 @@ export function StatCard({ title, value, desc, icon, tone = 'default', className
       <div className="flex items-start justify-between gap-2 pl-2.5">
         <div className="min-w-0 flex-1">
           <div className="text-[0.72rem] font-semibold text-muted-foreground">{title}</div>
-          <div className={cn('mt-1 break-words text-2xl font-semibold tracking-tight tabular-nums', valueMap[tone])}>
+          <div className={cn('mt-1 break-words text-2xl font-semibold tracking-tight tabular-nums', valueMap[tone])} title={valueTitle}>
             {value}
           </div>
         </div>

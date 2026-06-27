@@ -29,6 +29,7 @@ import { EmptyState, Field, FieldGrid, LoadingState, ModalShell, useConfirm } fr
 import { ProgressRing } from '@/components/charts'
 import {
   formatApproxElapsedMs,
+  formatCompact,
   formatCredits,
   formatFullDate,
   formatLastUsed,
@@ -383,7 +384,7 @@ export function CredentialCard({
           onClick={() => setEditingRpm(true)}
         />
         <SummaryCell label="调度状态" value={dispatchStatus} error={dispatchStatus !== '可调度'} />
-        <SummaryCell label="成功" value={formatNumber(credential.successCount)} />
+        <SummaryCell label="成功" value={<span title={formatNumber(credential.successCount)}>{formatCompact(credential.successCount)}</span>} />
         <SummaryCell label="最近" value={formatLastUsed(credential.lastUsedAt)} />
       </div>
 
@@ -537,7 +538,7 @@ export function CredentialCard({
               <MetaItem label="近期错误率" value={`${(recentErrorRate * 100).toFixed(1)}%`} error={recentErrorRate > 0} />
               <MetaItem label="延迟 EWMA" value={credential.latencyEwmaMs == null ? '未知' : `${Math.round(credential.latencyEwmaMs)}ms`} />
               <MetaItem label="调度评分" value={schedulerScore.toFixed(2)} />
-              <MetaItem label="总调度" value={formatNumber(schedulerSelectionCount)} />
+              <MetaItem label="总调度" value={<span title={formatNumber(schedulerSelectionCount)}>{formatCompact(schedulerSelectionCount)}</span>} />
               <MetaItem
                 label="近期调度"
                 value={`${formatNumber(recentSelection60s)}/60s`}
@@ -562,7 +563,7 @@ export function CredentialCard({
               {(credential.pricedRequests > 0 || credential.unpricedRequests > 0) && (
                 <MetaItem
                   label="计价请求覆盖"
-                  value={`${formatNumber(credential.pricedRequests)}/${formatNumber(credential.pricedRequests + credential.unpricedRequests)}`}
+                  value={<span title={`${formatNumber(credential.pricedRequests)}/${formatNumber(credential.pricedRequests + credential.unpricedRequests)}`}>{formatCompact(credential.pricedRequests)}/{formatCompact(credential.pricedRequests + credential.unpricedRequests)}</span>}
                   error={credential.unpricedRequests > 0}
                 />
               )}

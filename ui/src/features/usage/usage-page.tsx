@@ -25,7 +25,7 @@ import {
   useRefreshUsageQueriesAfterCleanup,
 } from '@/hooks/use-usage'
 import { getExternalPools } from '@/api/credentials'
-import { formatDate, formatNumber, formatPercent, formatUsd, ratio } from '@/lib/format'
+import { formatDate, formatCompact, formatNumber, formatPercent, formatUsd, ratio } from '@/lib/format'
 import { extractErrorMessage } from '@/lib/utils'
 import type { UsageRecord, UsageRecordStatus, UsageRecordsPageQuery, UsageSource, UsageSeriesPoint } from '@/types/api'
 import {
@@ -114,7 +114,7 @@ function TrendView() {
           description="请求量与错误趋势"
           actions={
             hourlyData.length > 0
-              ? <Badge tone="neutral">{formatNumber(hourlyData.reduce((s, r) => s + Number(r.requests), 0))} 请求</Badge>
+              ? <Badge tone="neutral" title={formatNumber(hourlyData.reduce((s, r) => s + Number(r.requests), 0))}>{formatCompact(hourlyData.reduce((s, r) => s + Number(r.requests), 0))} 请求</Badge>
               : undefined
           }
         >
@@ -441,13 +441,13 @@ function RecordsView({
                         </TableCell>
                         {/* Token */}
                         <TableCell className="text-right font-mono text-xs tabular-nums">
-                          <div>展示输入 {formatNumber(record.compatInputTokens)}</div>
-                          <div className="text-muted-foreground/60">展示输出 {formatNumber(record.outputTokens)}</div>
+                          <div title={formatNumber(record.compatInputTokens)}>展示输入 {formatCompact(record.compatInputTokens)}</div>
+                          <div className="text-muted-foreground/60" title={formatNumber(record.outputTokens)}>展示输出 {formatCompact(record.outputTokens)}</div>
                         </TableCell>
                         {/* 缓存 */}
                         <TableCell className="font-mono text-xs tabular-nums">
-                          <div className="text-success">读 {formatNumber(record.cacheReadInputTokens)}</div>
-                          <div className="text-primary">写 {formatNumber(record.cacheCreationInputTokens)}</div>
+                          <div className="text-success" title={formatNumber(record.cacheReadInputTokens)}>读 {formatCompact(record.cacheReadInputTokens)}</div>
+                          <div className="text-primary" title={formatNumber(record.cacheCreationInputTokens)}>写 {formatCompact(record.cacheCreationInputTokens)}</div>
                           <div className="text-muted-foreground/60">{formatPercent(rowReadRatio)} / {formatPercent(rowCachedRatio)}</div>
                         </TableCell>
                         {/* 费用 */}
@@ -586,8 +586,9 @@ export function UsagePage() {
       <StatGrid>
         <StatCard
           title="总请求"
-          value={formatNumber(data?.totalRequests ?? 0)}
-          desc={`成功 ${formatNumber(data?.successRequests ?? 0)} / 错误 ${formatNumber(data?.errorRequests ?? 0)}`}
+          value={formatCompact(data?.totalRequests ?? 0)}
+          valueTitle={formatNumber(data?.totalRequests ?? 0)}
+          desc={`成功 ${formatCompact(data?.successRequests ?? 0)} / 错误 ${formatCompact(data?.errorRequests ?? 0)}`}
           icon={<Activity />}
           tone="primary"
         />
@@ -600,14 +601,16 @@ export function UsagePage() {
         />
         <StatCard
           title="实时 TPM"
-          value={formatNumber(realtime?.totalTpm ?? 0)}
+          value={formatCompact(realtime?.totalTpm ?? 0)}
+          valueTitle={formatNumber(realtime?.totalTpm ?? 0)}
           desc="按展示输入 + 展示输出统计"
           icon={<Activity />}
           tone="info"
         />
         <StatCard
           title="缓存命中较高"
-          value={formatNumber(data?.highCacheRequests ?? 0)}
+          value={formatCompact(data?.highCacheRequests ?? 0)}
+          valueTitle={formatNumber(data?.highCacheRequests ?? 0)}
           desc="highCacheThreshold 以上的请求"
           icon={<Zap />}
           tone="success"
@@ -621,14 +624,16 @@ export function UsagePage() {
         />
         <StatCard
           title="Token 用量"
-          value={formatNumber(totalTokens)}
-          desc={`输入 ${formatNumber(data?.totalInputTokens ?? 0)} / 输出 ${formatNumber(data?.totalOutputTokens ?? 0)}`}
+          value={formatCompact(totalTokens)}
+          valueTitle={formatNumber(totalTokens)}
+          desc={`输入 ${formatCompact(data?.totalInputTokens ?? 0)} / 输出 ${formatCompact(data?.totalOutputTokens ?? 0)}`}
           icon={<Database />}
           tone="info"
         />
         <StatCard
           title="缓存读取"
-          value={formatNumber(data?.totalCacheReadInputTokens ?? 0)}
+          value={formatCompact(data?.totalCacheReadInputTokens ?? 0)}
+          valueTitle={formatNumber(data?.totalCacheReadInputTokens ?? 0)}
           desc={`本地读取 ${formatPercent(readRatio)} / 总缓存 ${formatPercent(cachedRatio)}`}
           icon={<Zap />}
           tone="success"

@@ -15,7 +15,7 @@ import {
 import { useAutoRefreshPreference } from '@/hooks/use-auto-refresh'
 import { useUsageDashboard } from '@/hooks/use-usage'
 import { useCredentialSummary } from '@/hooks/use-credentials'
-import { formatDate, formatNumber, formatPercent, formatUsd } from '@/lib/format'
+import { formatCompact, formatDate, formatNumber, formatPercent, formatUsd } from '@/lib/format'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import { billingDeltaTone, billingDeltaTextClass } from '../usage/usage-helpers'
 import type {
@@ -135,7 +135,7 @@ function TrendSection({
         description="按小时聚合的请求量与错误"
         actions={
           hourlyErrors > 0
-            ? <Badge tone="error">错误 {formatNumber(hourlyErrors)}</Badge>
+            ? <Badge tone="error" title={formatNumber(hourlyErrors)}>错误 {formatCompact(hourlyErrors)}</Badge>
             : <Badge tone="success">无错误</Badge>
         }
       >
@@ -159,7 +159,7 @@ function TrendSection({
         description="按天聚合的请求量与错误"
         actions={
           dailyErrors > 0
-            ? <Badge tone="error">错误 {formatNumber(dailyErrors)}</Badge>
+            ? <Badge tone="error" title={formatNumber(dailyErrors)}>错误 {formatCompact(dailyErrors)}</Badge>
             : <Badge tone="success">无错误</Badge>
         }
       >
@@ -305,7 +305,7 @@ function ErrorSummaryPanel({
       icon={<ShieldAlert />}
       actions={
         hasAny
-          ? <Badge tone={isHigh ? 'error' : 'warning'}>{formatNumber(totalErrors)} 错误</Badge>
+          ? <Badge tone={isHigh ? 'error' : 'warning'} title={formatNumber(totalErrors)}>{formatCompact(totalErrors)} 错误</Badge>
           : <Badge tone="success">正常</Badge>
       }
     >
@@ -338,11 +338,11 @@ function ErrorSummaryPanel({
                     <div className="truncate font-mono text-[0.62rem] text-muted-foreground/60">{item.key}</div>
                   )}
                 </div>
-                <Badge tone="error">{formatNumber(item.requests)}</Badge>
+                <Badge tone="error" title={formatNumber(item.requests)}>{formatCompact(item.requests)}</Badge>
               </div>
               <div className="mt-1.5 grid grid-cols-3 gap-1 pl-1.5 text-[0.62rem] text-muted-foreground/60">
-                <span>输入 {formatNumber(item.totalInputTokens)}</span>
-                <span>输出 {formatNumber(item.totalOutputTokens)}</span>
+                <span title={formatNumber(item.totalInputTokens)}>输入 {formatCompact(item.totalInputTokens)}</span>
+                <span title={formatNumber(item.totalOutputTokens)}>输出 {formatCompact(item.totalOutputTokens)}</span>
                 <span className="text-right">{formatUsd(item.totalEstimatedCostUsd)}</span>
               </div>
             </div>
@@ -426,18 +426,18 @@ function RunSignalsPanel({
         />
         <SignalRow
           label="Sticky 回退"
-          value={`${formatNumber(stickyFallback)} / ${formatNumber(stickyBound)}`}
+          value={<span title={`${formatNumber(stickyFallback)} / ${formatNumber(stickyBound)}`}>{formatCompact(stickyFallback)} / {formatCompact(stickyBound)}</span>}
           ratio={stickyBound > 0 ? stickyFallback / stickyBound : 0}
           barColor={stickyFallback > 0 ? 'bg-warning/80' : 'bg-muted-foreground/30'}
         />
         <SignalRow
           label="模拟展示"
-          value={formatNumber(simulated)}
+          value={<span title={formatNumber(simulated)}>{formatCompact(simulated)}</span>}
           title="该窗口内用量由本地模拟计算展示（非服务实际返回），通常出现在流式响应或无用量元数据时"
         />
         <SignalRow
           label="服务返回用量"
-          value={formatNumber(upstreamMeta)}
+          value={<span title={formatNumber(upstreamMeta)}>{formatCompact(upstreamMeta)}</span>}
           ratio={upstreamMeta > 0 ? upstreamMeta / (simulated + upstreamMeta) : 0}
           barColor="bg-primary/65"
           title="该窗口内用量直接由上游服务返回（upstream_metadata），精度最高"
@@ -519,14 +519,14 @@ function DimensionRankPanel({
                       </div>
                     )}
                   </TableCell>
-                  <TableCell className="text-right font-mono text-xs">{formatNumber(item.requests)}</TableCell>
+                  <TableCell className="text-right font-mono text-xs" title={formatNumber(item.requests)}>{formatCompact(item.requests)}</TableCell>
                   <TableCell className="text-right font-mono text-xs">
                     {item.errorRequests > 0
-                      ? <span className="text-destructive">{formatNumber(item.errorRequests)}</span>
+                      ? <span className="text-destructive" title={formatNumber(item.errorRequests)}>{formatCompact(item.errorRequests)}</span>
                       : <span className="text-muted-foreground/40">—</span>}
                   </TableCell>
-                  <TableCell className="text-right font-mono text-xs">{formatNumber(item.totalInputTokens)}</TableCell>
-                  <TableCell className="text-right font-mono text-xs">{formatNumber(item.totalOutputTokens)}</TableCell>
+                  <TableCell className="text-right font-mono text-xs" title={formatNumber(item.totalInputTokens)}>{formatCompact(item.totalInputTokens)}</TableCell>
+                  <TableCell className="text-right font-mono text-xs" title={formatNumber(item.totalOutputTokens)}>{formatCompact(item.totalOutputTokens)}</TableCell>
                   <TableCell className="text-right font-mono text-xs">{formatUsd(item.totalEstimatedCostUsd)}</TableCell>
                   <TableCell>
                     <div className="h-1.5 overflow-hidden rounded-full bg-muted">
@@ -589,9 +589,9 @@ function ExternalPoolBillingPanel({
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
           <div className="rounded-lg border border-border bg-muted/40 p-3">
             <div className="text-xs text-muted-foreground">外部账号请求</div>
-            <div className="mt-1 text-lg font-semibold">{formatNumber(billing.requests)}</div>
+            <div className="mt-1 text-lg font-semibold" title={formatNumber(billing.requests)}>{formatCompact(billing.requests)}</div>
             <div className="mt-1 text-xs text-muted-foreground/60">
-              可计价 {formatNumber(billing.pricedRequests)} / 未计价 {formatNumber(billing.unpricedRequests)}
+              可计价 <span title={formatNumber(billing.pricedRequests)}>{formatCompact(billing.pricedRequests)}</span> / 未计价 <span title={formatNumber(billing.unpricedRequests)}>{formatCompact(billing.unpricedRequests)}</span>
             </div>
           </div>
           <div className="rounded-lg border border-border bg-muted/40 p-3">
@@ -662,15 +662,15 @@ function ExternalPoolBillingPanel({
                           <div className="max-w-[200px] truncate font-medium" title={pool.poolName}>{pool.poolName}</div>
                           <div className="font-mono text-[0.62rem] text-muted-foreground/45">#{pool.poolId}</div>
                         </td>
-                        <td className="px-3 py-2 text-right font-mono">{formatNumber(pool.requests)}</td>
+                        <td className="px-3 py-2 text-right font-mono" title={formatNumber(pool.requests)}>{formatCompact(pool.requests)}</td>
                         <td className="px-3 py-2 text-right font-mono">{formatUsd(pool.rawCostUsd)}</td>
                         <td className="px-3 py-2 text-right font-mono">{formatUsd(pool.shapedCostUsd ?? pool.reportedCostUsd)}</td>
                         <td className="px-3 py-2 text-right font-mono">{formatUsd(pool.upliftedCostUsd ?? pool.reportedCostUsd)}</td>
                         <td className={cn('px-3 py-2 text-right font-mono', billingDeltaTextClass(poolTone))}>
                           {poolProfit >= 0 ? '+' : ''}{formatUsd(poolProfit)}
                         </td>
-                        <td className="px-3 py-2 text-right font-mono">{formatNumber(pool.unpricedRequests)}</td>
-                        <td className="px-3 py-2 text-right font-mono">{formatNumber(pool.costFloorAppliedRequests)}</td>
+                        <td className="px-3 py-2 text-right font-mono" title={formatNumber(pool.unpricedRequests)}>{formatCompact(pool.unpricedRequests)}</td>
+                        <td className="px-3 py-2 text-right font-mono" title={formatNumber(pool.costFloorAppliedRequests)}>{formatCompact(pool.costFloorAppliedRequests)}</td>
                       </tr>
                     )
                   })}
@@ -754,8 +754,8 @@ function BreakdownTabPanel({
               <div key={item.key} className="space-y-1.5">
                 <div className="flex items-center justify-between gap-2 text-xs">
                   <span className="truncate font-medium text-foreground/75">{item.label}</span>
-                  <span className="shrink-0 font-mono text-muted-foreground">
-                    {formatNumber(item.requests)} · {formatPercent(item.ratio)}
+                  <span className="shrink-0 font-mono text-muted-foreground" title={formatNumber(item.requests)}>
+                    {formatCompact(item.requests)} · {formatPercent(item.ratio)}
                   </span>
                 </div>
                 <div className="h-1.5 overflow-hidden rounded-full bg-muted">
@@ -881,8 +881,8 @@ export function OverviewPage() {
           <div className="flex items-start justify-between gap-2 pl-2.5">
             <div className="min-w-0 flex-1">
               <div className="text-[0.72rem] font-semibold text-muted-foreground">请求量</div>
-              <div className="mt-1 text-2xl font-semibold tracking-tight tabular-nums text-primary">
-                {formatNumber(summary.totalRequests)}
+              <div className="mt-1 text-2xl font-semibold tracking-tight tabular-nums text-primary" title={formatNumber(summary.totalRequests)}>
+                {formatCompact(summary.totalRequests)}
               </div>
             </div>
             <div className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-border bg-muted text-primary [&_svg]:size-4">
@@ -894,7 +894,7 @@ export function OverviewPage() {
               <Sparkline data={sparkData} dataKey="requests" color={CHART_COLORS[0]} height={28} />
             )}
             <div className="mt-1 truncate text-[0.72rem] text-muted-foreground">
-              成功 {formatNumber(summary.successRequests)} / 错误 {formatNumber(summary.errorRequests)}
+              成功 <span title={formatNumber(summary.successRequests)}>{formatCompact(summary.successRequests)}</span> / 错误 <span title={formatNumber(summary.errorRequests)}>{formatCompact(summary.errorRequests)}</span>
             </div>
           </div>
         </div>
@@ -920,8 +920,9 @@ export function OverviewPage() {
         {/* Token 用量 */}
         <StatCard
           title="Token"
-          value={formatNumber(totalTokens)}
-          desc={`输入 ${formatNumber(summary.totalInputTokens)} / 输出 ${formatNumber(summary.totalOutputTokens)}`}
+          value={formatCompact(totalTokens)}
+          valueTitle={formatNumber(totalTokens)}
+          desc={`输入 ${formatCompact(summary.totalInputTokens)} / 输出 ${formatCompact(summary.totalOutputTokens)}`}
           icon={<Database />}
           tone="primary"
         />
@@ -940,8 +941,8 @@ export function OverviewPage() {
               <Zap />
             </div>
           </div>
-          <div className="mt-1 pl-2.5 truncate text-[0.72rem] text-muted-foreground">
-            读取 {formatNumber(summary.totalCacheReadInputTokens)} tokens
+          <div className="mt-1 pl-2.5 truncate text-[0.72rem] text-muted-foreground" title={`${formatNumber(summary.totalCacheReadInputTokens)} tokens`}>
+            读取 {formatCompact(summary.totalCacheReadInputTokens)} tokens
           </div>
         </div>
 

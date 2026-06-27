@@ -34,7 +34,7 @@ import {
   StatCard,
   StatGrid,
 } from '@/components/patterns'
-import { formatDate, formatNumber, formatQuota } from '@/lib/format'
+import { formatCompact, formatDate, formatNumber, formatQuota } from '@/lib/format'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, TEST_MODELS, testModelLabel } from '@/lib/test-models'
 import { extractErrorMessage } from '@/lib/utils'
 import { parseCredentialImportFiles, parseCredentialImportText } from '@/lib/credential-import'
@@ -229,24 +229,27 @@ function ValidationResults({ result }: { result: CredentialValidationResponse | 
   return (
     <div className="space-y-4">
       <StatGrid>
-        <StatCard title="总数" value={formatNumber(result.total)} />
-        <StatCard title="成功" value={formatNumber(result.success)} tone="success" />
+        <StatCard title="总数" value={formatCompact(result.total)} valueTitle={formatNumber(result.total)} />
+        <StatCard title="成功" value={formatCompact(result.success)} valueTitle={formatNumber(result.success)} tone="success" />
         <StatCard
           title="失败"
-          value={formatNumber(result.failed)}
+          value={formatCompact(result.failed)}
+          valueTitle={formatNumber(result.failed)}
           tone={result.failed > 0 ? 'error' : 'default'}
         />
         <StatCard
           title="升级"
-          value={formatNumber(result.upgraded)}
+          value={formatCompact(result.upgraded)}
+          valueTitle={formatNumber(result.upgraded)}
           tone={result.upgraded > 0 ? 'success' : 'default'}
         />
         <StatCard
           title="疑似掉级"
-          value={formatNumber(result.downgraded)}
+          value={formatCompact(result.downgraded)}
+          valueTitle={formatNumber(result.downgraded)}
           tone={result.downgraded > 0 ? 'warning' : 'default'}
         />
-        <StatCard title="无变化" value={formatNumber(result.unchanged)} />
+        <StatCard title="无变化" value={formatCompact(result.unchanged)} valueTitle={formatNumber(result.unchanged)} />
       </StatGrid>
 
       {result.groups.length === 0 ? (

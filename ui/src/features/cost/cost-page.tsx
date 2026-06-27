@@ -160,8 +160,8 @@ function ModelCapabilitiesTable({
                     <TableCell>
                       <Badge tone={sourceTone(item.source)}>{sourceLabel(item.source)}</Badge>
                     </TableCell>
-                    <TableCell className="text-right font-mono text-xs tabular-nums">{item.maxInputTokens ? formatCompact(item.maxInputTokens) : '—'}</TableCell>
-                    <TableCell className="text-right font-mono text-xs tabular-nums">{item.maxOutputTokens ? formatCompact(item.maxOutputTokens) : '—'}</TableCell>
+                    <TableCell className="text-right font-mono text-xs tabular-nums" title={item.maxInputTokens ? formatNumber(item.maxInputTokens) : undefined}>{item.maxInputTokens ? formatCompact(item.maxInputTokens) : '—'}</TableCell>
+                    <TableCell className="text-right font-mono text-xs tabular-nums" title={item.maxOutputTokens ? formatNumber(item.maxOutputTokens) : undefined}>{item.maxOutputTokens ? formatCompact(item.maxOutputTokens) : '—'}</TableCell>
                     <TableCell className="text-right text-xs">
                       {item.supportsPromptCaching === undefined ? '—' : item.supportsPromptCaching ? '支持' : '不支持'}
                     </TableCell>
@@ -247,14 +247,14 @@ function ExternalPoolBillingPanel() {
     >
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
         {[
-          { label: '外部池请求数', value: formatNumber(billing.requests) },
-          { label: '有计价请求', value: formatNumber(billing.pricedRequests) },
-          { label: '无计价请求', value: formatNumber(billing.unpricedRequests) },
+          { label: '外部池请求数', value: formatCompact(billing.requests), title: formatNumber(billing.requests) },
+          { label: '有计价请求', value: formatCompact(billing.pricedRequests), title: formatNumber(billing.pricedRequests) },
+          { label: '无计价请求', value: formatCompact(billing.unpricedRequests), title: formatNumber(billing.unpricedRequests) },
           { label: '原始成本', value: formatUsd(billing.rawCostUsd) },
           { label: '上报费用', value: formatUsd(billing.reportedCostUsd) },
           { label: '可计费费用', value: formatUsd(billing.billableCostUsd) },
           { label: '底线调整', value: formatUsd(billing.costFloorDeltaUsd), tone: billing.costFloorDeltaUsd > 0 ? 'warning' : 'neutral' as const, desc: '实际成本低于底线时按底线计费，底线调整为补的差额' },
-          { label: '底线触发次数', value: formatNumber(billing.costFloorAppliedRequests), desc: '成本低于配置底线的请求数' },
+          { label: '底线触发次数', value: formatCompact(billing.costFloorAppliedRequests), title: formatNumber(billing.costFloorAppliedRequests), desc: '成本低于配置底线的请求数' },
           ...(billing.profitUsd !== undefined
             ? [{ label: '净盈亏', value: formatUsd(billing.profitUsd), tone: profitTone as 'success' | 'error' | 'neutral' }]
             : []),
@@ -266,7 +266,7 @@ function ExternalPoolBillingPanel() {
               : item.tone === 'error' ? 'text-destructive'
               : item.tone === 'warning' ? 'text-warning'
               : 'text-foreground'
-            }`}>
+            }`} title={'title' in item ? item.title : undefined}>
               {item.value}
             </div>
             {'desc' in item && item.desc && (
@@ -434,9 +434,9 @@ function ModelPricingTable({
                   <TableCell className="text-right font-mono text-xs tabular-nums">
                     {priceItem ? formatPricePerMillion(priceItem.pricing.cacheReadInputTokenCost * 1_000_000) : <span className="text-muted-foreground/40">—</span>}
                   </TableCell>
-                  <TableCell className="text-xs text-muted-foreground">
-                    {cap?.maxInputTokens ? `${formatNumber(cap.maxInputTokens)} in` : '—'}
-                    {cap?.maxOutputTokens ? ` / ${formatNumber(cap.maxOutputTokens)} out` : ''}
+                  <TableCell className="text-xs text-muted-foreground" title={cap?.maxInputTokens || cap?.maxOutputTokens ? `${cap?.maxInputTokens ? `${formatNumber(cap.maxInputTokens)} in` : ''}${cap?.maxOutputTokens ? ` / ${formatNumber(cap.maxOutputTokens)} out` : ''}` : undefined}>
+                    {cap?.maxInputTokens ? `${formatCompact(cap.maxInputTokens)} in` : '—'}
+                    {cap?.maxOutputTokens ? ` / ${formatCompact(cap.maxOutputTokens)} out` : ''}
                   </TableCell>
                   <TableCell className="text-right">
                     <div className="flex items-center justify-end gap-1">
@@ -567,7 +567,7 @@ export function CostPage() {
         <StatCard
           title="估算总费用"
           value={formatUsd(summary.data?.totalEstimatedCostUsd ?? 0)}
-          desc={`有计价 ${formatNumber(summary.data?.pricedRequests ?? 0)} 次`}
+          desc={`有计价 ${formatCompact(summary.data?.pricedRequests ?? 0)} 次`}
           tone="primary"
         />
       </StatGrid>

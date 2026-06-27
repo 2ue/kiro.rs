@@ -6,9 +6,18 @@ export function formatNumber(value: number | undefined | null): string {
 export function formatCompact(value: number | undefined | null): string {
   if (!Number.isFinite(value ?? Number.NaN)) return '-'
   const num = value as number
-  if (Math.abs(num) >= 1_000_000) return `${(num / 1_000_000).toFixed(1)}M`
-  if (Math.abs(num) >= 1000) return `${Math.round(num / 1000)}K`
-  return String(num)
+  const abs = Math.abs(num)
+  // 小数据保持原始显示(千分位),不缩写
+  if (abs < 1000) return new Intl.NumberFormat('zh-CN').format(num)
+  const sign = num < 0 ? '-' : ''
+  const trim = (n: number) => {
+    // 最多两位小数,去掉尾随的 0(1.20→1.2, 1.00→1)
+    const fixed = n.toFixed(2)
+    return fixed.replace(/\.?0+$/, '')
+  }
+  if (abs >= 1_000_000_000) return `${sign}${trim(abs / 1_000_000_000)}B`
+  if (abs >= 1_000_000) return `${sign}${trim(abs / 1_000_000)}M`
+  return `${sign}${trim(abs / 1000)}K`
 }
 
 export function formatUsd(value: number | undefined | null): string {

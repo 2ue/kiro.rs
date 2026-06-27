@@ -46,7 +46,7 @@ import {
   ToolbarSearch,
   useConfirm,
 } from '@/components/patterns'
-import { formatCredits, formatFullDate, formatNumber } from '@/lib/format'
+import { formatCompact, formatCredits, formatFullDate, formatNumber } from '@/lib/format'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
 import { extractErrorMessage } from '@/lib/utils'
 import {
@@ -456,12 +456,14 @@ export function CredentialsPage() {
       <StatGrid>
         <StatCard
           title="账号总数"
-          value={formatNumber(credentialSummary.data?.total ?? grandTotal)}
+          value={formatCompact(credentialSummary.data?.total ?? grandTotal)}
+          valueTitle={formatNumber(credentialSummary.data?.total ?? grandTotal)}
           icon={<Server className="h-5 w-5" />}
         />
         <StatCard
           title="可用账号"
-          value={formatNumber(credentialSummary.data?.available ?? credentials.data?.available ?? 0)}
+          value={formatCompact(credentialSummary.data?.available ?? credentials.data?.available ?? 0)}
+          valueTitle={formatNumber(credentialSummary.data?.available ?? credentials.data?.available ?? 0)}
           tone="success"
         />
         <StatCard
@@ -490,7 +492,8 @@ export function CredentialsPage() {
         />
         <StatCard
           title="已禁用"
-          value={formatNumber(disabledCount)}
+          value={formatCompact(disabledCount)}
+          valueTitle={formatNumber(disabledCount)}
           tone={disabledCount > 0 ? 'warning' : 'default'}
         />
         <button
