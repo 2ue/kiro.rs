@@ -5,7 +5,6 @@ import {
   Boxes,
   Network,
   BarChart3,
-  Wallet,
   FileClock,
   SlidersHorizontal,
   Boxes as ModelsIcon,
@@ -26,7 +25,6 @@ export type PageKey =
   | 'external'
   | 'proxies'
   | 'usage'
-  | 'cost'
   | 'audit'
   | 'runtime'
   | 'models'
@@ -69,7 +67,6 @@ export const navPages: NavPage[] = [
 
   // 分析域
   { key: 'usage', path: 'usage', label: '用量', description: '请求趋势与明细', icon: BarChart3, domain: 'analytics' },
-  { key: 'cost', path: 'cost', label: '成本', description: '计费链路、盈亏与模型价格', icon: Wallet, domain: 'analytics' },
   { key: 'audit', path: 'audit', label: '审计', description: '关键操作记录', icon: FileClock, domain: 'analytics' },
 
   // 设置域
@@ -89,7 +86,6 @@ export const pageMeta: Record<PageKey, { title: string; subtitle: string }> = {
   external: { title: '外部池', subtitle: '管理外部账号池与计费拆分' },
   proxies: { title: '代理', subtitle: '维护网络代理资源与连通状态' },
   usage: { title: '用量', subtitle: '请求趋势、Top 维度与明细记录' },
-  cost: { title: '成本', subtitle: '计费链路、外部池盈亏与模型价格' },
   audit: { title: '审计', subtitle: '关键操作与变更记录' },
   runtime: { title: '运行配置', subtitle: '调度、限流、冷却、缓存与兼容策略' },
   models: { title: '模型', subtitle: '模型能力与价格目录,支持同步与手动维护' },

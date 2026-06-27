@@ -21,9 +21,6 @@ const ProxiesPage = React.lazy(() =>
 const UsagePage = React.lazy(() =>
   import('@/features/usage/usage-page').then((m) => ({ default: m.UsagePage }))
 )
-const CostPage = React.lazy(() =>
-  import('@/features/cost/cost-page').then((m) => ({ default: m.CostPage }))
-)
 const AuditPage = React.lazy(() =>
   import('@/features/audit/audit-page').then((m) => ({ default: m.AuditPage }))
 )
@@ -72,7 +69,6 @@ const router = createBrowserRouter(
         { path: 'proxies', element: <Lazy><ProxiesPage /></Lazy> },
         // 分析域
         { path: 'usage', element: <Lazy><UsagePage /></Lazy> },
-        { path: 'cost', element: <Lazy><CostPage /></Lazy> },
         { path: 'audit', element: <Lazy><AuditPage /></Lazy> },
         // 设置域
         { path: 'runtime', element: <Lazy><RuntimePage /></Lazy> },
