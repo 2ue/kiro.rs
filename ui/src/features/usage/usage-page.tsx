@@ -33,7 +33,6 @@ import {
   PageHeader,
   SectionCard,
   StatCard,
-  StatGrid,
   EmptyState,
   LoadingState,
   ErrorState,
@@ -583,7 +582,7 @@ export function UsagePage() {
       <PageHeader title="用量" subtitle="请求趋势与明细记录" actions={headerActions} />
 
       {/* 指标卡 */}
-      <StatGrid>
+      <div className="grid gap-3 grid-cols-2 lg:grid-cols-4">
         <StatCard
           title="总请求"
           value={formatCompact(data?.totalRequests ?? 0)}
@@ -645,7 +644,7 @@ export function UsagePage() {
           icon={<Clock3 />}
           tone="primary"
         />
-      </StatGrid>
+      </div>
 
       {/* Callout */}
       {data && data.errorRequests > 0 && errorRate >= 0.05 && (
