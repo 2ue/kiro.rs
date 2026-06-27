@@ -1144,6 +1144,8 @@ pub struct StreamContext {
     pub metadata_usage: Option<MetadataTokenUsage>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
+    /// 实际发送给下游的 thinking tokens 估算，仅用于 Anthropic usage details。
+    thinking_output_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具输入 JSON 片段累计，用于 stop 时生成稳定去重签名。
@@ -1296,6 +1298,7 @@ impl StreamContext {
             context_input_tokens: None,
             metadata_usage: None,
             output_tokens: 0,
+            thinking_output_tokens: 0,
             tool_block_indices: HashMap::new(),
             tool_input_buffers: HashMap::new(),
             pending_leaked_tools: Vec::new(),
@@ -1367,6 +1370,52 @@ impl StreamContext {
             .unwrap_or(usage)
     }
 
+    fn initial_usage_for_downstream(&self) -> super::cache::CacheUsage {
+        let usage = super::cache::build_usage_with_simulation_policy(
+            None,
+            self.input_tokens.max(1),
+            0,
+            self.simulated_usage,
+            self.simulation_mode == PromptCacheSimulationMode::HighCache,
+        );
+        let mut usage = self.reported_usage_for_downstream(usage);
+
+        // Some clients, including Claude Code's live agent view, surface the
+        // assistant message_start usage before the final message_delta arrives.
+        // Keep output at zero, but provide a request-level input estimate so
+        // long tool/agent runs do not appear as "0 tokens" until completion.
+        if usage.input_tokens <= 0
+            && usage.cache_creation_input_tokens <= 0
+            && usage.cache_read_input_tokens <= 0
+        {
+            usage.input_tokens = self.input_tokens.max(1);
+            usage.total_input_tokens = usage.input_tokens;
+        }
+
+        usage
+    }
+
+    fn record_thinking_output_tokens(&mut self, thinking: &str) {
+        if thinking.is_empty() {
+            return;
+        }
+        self.thinking_output_tokens = self
+            .thinking_output_tokens
+            .saturating_add(estimate_tokens(thinking));
+    }
+
+    fn thinking_output_tokens_for_usage(&self, output_tokens: i32) -> Option<i32> {
+        if self.thinking_output_tokens <= 0 {
+            return None;
+        }
+        let output_tokens = output_tokens.max(0);
+        if output_tokens > 0 {
+            Some(self.thinking_output_tokens.min(output_tokens))
+        } else {
+            Some(self.thinking_output_tokens)
+        }
+    }
+
     /// 生成 message_start 事件
     pub fn create_message_start_event_with_reported_usage_mapper<F>(
         &self,
@@ -1376,19 +1425,9 @@ impl StreamContext {
         F: FnOnce(super::cache::CacheUsage) -> super::cache::CacheUsage,
     {
         // message_start is emitted before final context/metadata usage is known.
-        // Keep input/cache neutral here; the final message_delta carries the
-        // authoritative downstream usage. Some callers only overwrite positive
-        // fields, so early non-zero cache values can become stale.
-        let usage = usage_mapper(super::cache::CacheUsage {
-            total_input_tokens: self.input_tokens,
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-            cache_creation_5m_input_tokens: 0,
-            cache_creation_1h_input_tokens: 0,
-        })
-        .to_anthropic_usage_json();
+        // The final message_delta remains authoritative, but an input estimate
+        // here keeps live clients from showing zero tokens during long runs.
+        let usage = usage_mapper(self.initial_usage_for_downstream()).to_anthropic_usage_json();
         json!({
             "type": "message_start",
             "message": {
@@ -2139,7 +2178,8 @@ impl StreamContext {
     }
 
     /// 创建 thinking_delta 事件
-    fn create_thinking_delta_event(&self, index: i32, thinking: &str) -> SseEvent {
+    fn create_thinking_delta_event(&mut self, index: i32, thinking: &str) -> SseEvent {
+        self.record_thinking_output_tokens(thinking);
         SseEvent::new(
             "content_block_delta",
             json!({
@@ -2408,8 +2448,9 @@ impl StreamContext {
                 } else {
                     // 如果还在 thinking 块内，发送剩余内容作为 thinking_delta
                     if let Some(thinking_index) = self.thinking_block_index {
+                        let thinking_buffer = self.thinking_buffer.clone();
                         events.push(
-                            self.create_thinking_delta_event(thinking_index, &self.thinking_buffer),
+                            self.create_thinking_delta_event(thinking_index, &thinking_buffer),
                         );
                     }
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
@@ -2468,11 +2509,12 @@ impl StreamContext {
         } else {
             final_input_tokens
         };
+        let estimated_output_tokens = self.output_tokens.max(self.thinking_output_tokens);
         let final_output_tokens = self
             .metadata_usage
             .as_ref()
             .map(|usage| usage.output_tokens)
-            .unwrap_or(self.output_tokens);
+            .unwrap_or(estimated_output_tokens);
         let final_usage = super::cache::build_usage_with_simulation_policy(
             self.metadata_usage.as_ref(),
             usage_input_tokens,
@@ -2493,10 +2535,10 @@ impl StreamContext {
         self.final_reported_usage = Some(reported_usage);
 
         // 生成最终事件
-        events.extend(
-            self.state_manager
-                .generate_final_events_with_usage(reported_usage.to_anthropic_usage_json()),
-        );
+        let thinking_tokens = self.thinking_output_tokens_for_usage(reported_usage.output_tokens);
+        events.extend(self.state_manager.generate_final_events_with_usage(
+            reported_usage.to_anthropic_usage_json_with_thinking_tokens(thinking_tokens),
+        ));
         events
     }
 }
@@ -2752,10 +2794,14 @@ mod tests {
             .find(|e| e.event == "message_start")
             .expect("message_start should exist");
         let start_usage = &message_start.data["message"]["usage"];
-        assert_eq!(start_usage["input_tokens"], 0);
+        let start_input = start_usage["input_tokens"].as_i64().expect("start input");
+        let start_cache_read = start_usage["cache_read_input_tokens"]
+            .as_i64()
+            .expect("start cache read");
+        assert!((1..=96).contains(&start_input));
         assert_eq!(start_usage["output_tokens"], 0);
         assert_eq!(start_usage["cache_creation_input_tokens"], 0);
-        assert_eq!(start_usage["cache_read_input_tokens"], 0);
+        assert!(start_cache_read > 0);
         assert!(start_usage.get("cache_creation_5m_input_tokens").is_none());
         assert!(start_usage.get("cache_creation_1h_input_tokens").is_none());
 
@@ -4236,6 +4282,33 @@ mod tests {
             message_delta.data["delta"]["stop_reason"], "end_turn",
             "stop_reason should be end_turn when text is also produced"
         );
+    }
+
+    #[test]
+    fn test_thinking_usage_reports_output_token_details() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 12, true, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_assistant_response(
+            "<thinking>\nI should answer briefly.</thinking>\n\nHello",
+        ));
+        all_events.extend(ctx.generate_final_events());
+
+        let message_delta = all_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta event");
+        let usage = &message_delta.data["usage"];
+        let thinking_tokens = usage["output_tokens_details"]["thinking_tokens"]
+            .as_i64()
+            .expect("thinking tokens should be reported");
+        let output_tokens = usage["output_tokens"]
+            .as_i64()
+            .expect("output tokens should be reported");
+
+        assert!(thinking_tokens > 0);
+        assert!(thinking_tokens <= output_tokens);
     }
 
     #[test]

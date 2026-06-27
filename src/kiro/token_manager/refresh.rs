@@ -6,7 +6,8 @@ use crate::http_client::{ProxyConfig, build_client, send_with_response_header_ti
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
-    IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
+    ExternalIdpRefreshResponse, IdcRefreshRequest, IdcRefreshResponse, RefreshRequest,
+    RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::protocol::{is_external_idp_credentials, resolve_profile_arn};
@@ -115,7 +116,9 @@ pub(crate) async fn refresh_token(
 
     let mut refresh_credentials = credentials.clone();
     refresh_credentials.auth_method = Some(auth_method.to_string());
-    if refresh_credentials.is_idc_refresh_credential() {
+    if refresh_credentials.is_external_idp_refresh_credential() {
+        refresh_external_idp_token(credentials, config, proxy).await
+    } else if refresh_credentials.is_idc_refresh_credential() {
         refresh_idc_token(credentials, config, proxy).await
     } else {
         refresh_social_token(credentials, config, proxy).await
@@ -192,6 +195,93 @@ async fn refresh_social_token(
 
     if let Some(profile_arn) = data.profile_arn {
         new_credentials.profile_arn = Some(profile_arn);
+    }
+
+    if let Some(expires_in) = data.expires_in {
+        let expires_at = Utc::now() + Duration::seconds(expires_in);
+        new_credentials.expires_at = Some(expires_at.to_rfc3339());
+    }
+
+    Ok(new_credentials)
+}
+
+/// 刷新外部 IdP Token（Microsoft Entra ID 等 OAuth v2 token endpoint）
+async fn refresh_external_idp_token(
+    credentials: &KiroCredentials,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<KiroCredentials> {
+    tracing::info!("正在刷新 External IdP Token...");
+
+    let refresh_token = credentials.refresh_token.as_ref().unwrap();
+    let client_id = credentials
+        .client_id
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("External IdP 刷新需要 clientId"))?;
+    let token_endpoint = credentials
+        .token_endpoint
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("External IdP 刷新需要 tokenEndpoint"))?;
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+    let mut form = vec![
+        ("client_id", client_id.as_str()),
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token.as_str()),
+    ];
+    if let Some(scopes) = credentials
+        .scopes
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        form.push(("scope", scopes));
+    }
+
+    let response = client
+        .post(token_endpoint)
+        .header("Accept", "application/json")
+        .header("User-Agent", format!("KiroIDE-{}", config.kiro_version))
+        .header("Connection", "close")
+        .form(&form)
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+
+        if is_invalid_grant_response(status, &body_text) {
+            return Err(RefreshTokenInvalidError {
+                message: format!(
+                    "External IdP refreshToken 已失效 (invalid_grant): {}",
+                    body_text
+                ),
+            }
+            .into());
+        }
+
+        let error_msg = match status.as_u16() {
+            400 | 401 => "External IdP 凭证已过期或无效，需要重新认证",
+            403 => "权限不足，无法刷新 External IdP Token",
+            429 => "请求过于频繁，已被限流",
+            500..=599 => "External IdP 服务暂时不可用",
+            _ => "External IdP Token 刷新失败",
+        };
+        bail!("{}: {} {}", error_msg, status, body_text);
+    }
+
+    let data: ExternalIdpRefreshResponse = response.json().await?;
+
+    let mut new_credentials = credentials.clone();
+    new_credentials.access_token = Some(data.access_token);
+
+    if let Some(new_refresh_token) = data.refresh_token {
+        new_credentials.refresh_token = Some(new_refresh_token);
+    }
+
+    if let Some(scope) = data.scope {
+        new_credentials.scopes = Some(scope);
     }
 
     if let Some(expires_in) = data.expires_in {
@@ -385,4 +475,187 @@ pub(super) fn usage_limits_user_agent(
 
 pub(super) fn usage_limits_amz_user_agent(kiro_version: &str, machine_id: &str) -> String {
     format!("aws-sdk-js/1.0.0 KiroIDE {} {}", kiro_version, machine_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::fs;
+    use std::sync::{Arc, Mutex};
+
+    use axum::extract::{Form, State};
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use serde_json::json;
+
+    use super::refresh_token;
+    use crate::kiro::model::credentials::KiroCredentials;
+    use crate::model::config::Config;
+
+    #[derive(Clone)]
+    struct TokenEndpointState {
+        captured_form: Arc<Mutex<Option<HashMap<String, String>>>>,
+    }
+
+    async fn mock_external_idp_token_endpoint(
+        State(state): State<TokenEndpointState>,
+        Form(form): Form<HashMap<String, String>>,
+    ) -> Json<serde_json::Value> {
+        *state.captured_form.lock().unwrap() = Some(form);
+        Json(json!({
+            "access_token": "new-access-token",
+            "refresh_token": "new-refresh-token",
+            "expires_in": 3600,
+            "scope": "offline_access codewhisperer:conversations"
+        }))
+    }
+
+    #[tokio::test]
+    async fn external_idp_refresh_uses_token_endpoint_without_client_secret() {
+        let captured_form = Arc::new(Mutex::new(None));
+        let state = TokenEndpointState {
+            captured_form: captured_form.clone(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/token", post(mock_external_idp_token_endpoint))
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let credentials = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            refresh_token: Some("r".repeat(150)),
+            client_id: Some("client-123".to_string()),
+            token_endpoint: Some(format!("http://{addr}/token")),
+            scopes: Some("offline_access codewhisperer:conversations".to_string()),
+            profile_arn: Some(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        let refreshed = refresh_token(&credentials, &Config::default(), None)
+            .await
+            .unwrap();
+
+        server.abort();
+
+        assert_eq!(refreshed.access_token.as_deref(), Some("new-access-token"));
+        assert_eq!(
+            refreshed.refresh_token.as_deref(),
+            Some("new-refresh-token")
+        );
+        assert_eq!(
+            refreshed.scopes.as_deref(),
+            Some("offline_access codewhisperer:conversations")
+        );
+        assert_eq!(refreshed.profile_arn, credentials.profile_arn);
+        assert!(refreshed.expires_at.is_some());
+
+        let form = captured_form.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            form.get("client_id").map(String::as_str),
+            Some("client-123")
+        );
+        assert_eq!(
+            form.get("grant_type").map(String::as_str),
+            Some("refresh_token")
+        );
+        assert_eq!(
+            form.get("scope").map(String::as_str),
+            Some("offline_access codewhisperer:conversations")
+        );
+        assert!(!form.contains_key("client_secret"));
+    }
+
+    #[tokio::test]
+    async fn external_idp_real_credential_file_refreshes_when_env_set() {
+        let Ok(path) = std::env::var("KIRO_RS_REAL_EXTERNAL_IDP_CREDENTIAL_FILE") else {
+            eprintln!("skip real external_idp credential test: env not set");
+            return;
+        };
+        let raw = fs::read_to_string(&path).expect("read real external_idp credential file");
+        let mut credentials: KiroCredentials =
+            serde_json::from_str(&raw).expect("parse real external_idp credential file");
+        credentials.canonicalize_auth_method();
+
+        assert_eq!(credentials.auth_method.as_deref(), Some("external_idp"));
+        assert!(credentials.is_external_idp_refresh_credential());
+        assert!(
+            credentials
+                .refresh_token
+                .as_deref()
+                .is_some_and(|v| !v.is_empty())
+        );
+        assert!(
+            credentials
+                .client_id
+                .as_deref()
+                .is_some_and(|v| !v.is_empty())
+        );
+        assert!(
+            credentials
+                .token_endpoint
+                .as_deref()
+                .is_some_and(|v| !v.is_empty())
+        );
+        assert!(
+            credentials
+                .profile_arn
+                .as_deref()
+                .is_some_and(|v| !v.is_empty())
+        );
+
+        let config = Config::default();
+        let refreshed = refresh_token(&credentials, &config, None)
+            .await
+            .expect("refresh real external_idp credential");
+        let access_token = refreshed
+            .access_token
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .expect("refreshed access token");
+
+        assert!(
+            refreshed
+                .refresh_token
+                .as_deref()
+                .is_some_and(|v| !v.is_empty())
+        );
+        assert!(
+            refreshed
+                .expires_at
+                .as_deref()
+                .is_some_and(|v| !v.is_empty())
+        );
+        assert_eq!(refreshed.token_endpoint, credentials.token_endpoint);
+        assert_eq!(refreshed.issuer_url, credentials.issuer_url);
+        assert_eq!(refreshed.profile_arn, credentials.profile_arn);
+
+        let usage = super::get_usage_limits(&refreshed, &config, access_token, None)
+            .await
+            .expect("query usage with real external_idp credential");
+        assert!(usage.usage_limit() >= usage.current_usage());
+
+        if let Ok(output_path) = std::env::var("KIRO_RS_REAL_EXTERNAL_IDP_REFRESH_OUTPUT") {
+            fs::write(
+                &output_path,
+                serde_json::to_string_pretty(&refreshed).expect("serialize refreshed credential"),
+            )
+            .expect("write refreshed real external_idp credential");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&output_path, fs::Permissions::from_mode(0o600))
+                    .expect("chmod refreshed real external_idp credential");
+            }
+            eprintln!(
+                "real external_idp credential refreshed and saved: {}",
+                output_path
+            );
+        }
+    }
 }

@@ -2288,12 +2288,21 @@ impl PostgresUsageStore {
         rollups.apply(&mut tx).await?;
         tx.commit().await?;
         let elapsed = started_at.elapsed();
-        if elapsed >= std::time::Duration::from_millis(100) {
+        if elapsed >= std::time::Duration::from_millis(500)
+            || (records.len() > 1 && elapsed >= std::time::Duration::from_millis(250))
+        {
             tracing::warn!(
                 input_count,
                 persisted_count = records.len(),
                 elapsed_ms = elapsed.as_millis() as u64,
                 "PgSQL usage 批量写入耗时较长"
+            );
+        } else if elapsed >= std::time::Duration::from_millis(100) {
+            tracing::debug!(
+                input_count,
+                persisted_count = records.len(),
+                elapsed_ms = elapsed.as_millis() as u64,
+                "PgSQL usage 批量写入耗时略高"
             );
         }
         Ok(())

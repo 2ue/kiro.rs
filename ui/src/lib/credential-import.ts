@@ -27,7 +27,12 @@ function numberField(value: unknown): number | undefined {
 
 function authMethodField(value: unknown): AddCredentialRequest['authMethod'] | undefined {
   const method = stringField(value)
-  if (method === 'social' || method === 'idc' || method === 'api_key') return method
+  if (!method) return undefined
+  const compact = method.toLowerCase().replace(/[^a-z0-9]/g, '')
+  if (compact === 'social') return 'social'
+  if (compact === 'idc' || compact === 'builderid' || compact === 'iam') return 'idc'
+  if (compact === 'apikey') return 'api_key'
+  if (compact === 'externalidp' || compact === 'enterprise' || compact === 'iamsso' || compact === 'awsidc' || compact === 'internal') return 'external_idp'
   return undefined
 }
 
@@ -69,6 +74,9 @@ export function normalizeCredentialImportItem(value: unknown): AddCredentialRequ
   const kiroApiKey = stringField(normalized.kiroApiKey) ?? stringField(normalized.apiKey)
   const clientId = stringField(normalized.clientId) ?? stringField(nested?.clientId)
   const clientSecret = stringField(normalized.clientSecret) ?? stringField(nested?.clientSecret)
+  const tokenEndpoint = stringField(normalized.tokenEndpoint) ?? stringField(nested?.tokenEndpoint)
+  const issuerUrl = stringField(normalized.issuerUrl) ?? stringField(nested?.issuerUrl)
+  const scopes = stringField(normalized.scopes) ?? stringField(normalized.scope) ?? stringField(nested?.scopes) ?? stringField(nested?.scope)
   const profileArn = stringField(normalized.profileArn) ?? stringField(nested?.profileArn)
   const region = stringField(normalized.region) ?? stringField(nested?.region)
   const authRegion =
@@ -92,7 +100,10 @@ export function normalizeCredentialImportItem(value: unknown): AddCredentialRequ
     refreshToken: authMethod === 'api_key' ? undefined : refreshToken,
     kiroApiKey: authMethod === 'api_key' ? kiroApiKey : undefined,
     clientId: authMethod === 'api_key' ? undefined : clientId,
-    clientSecret: authMethod === 'api_key' ? undefined : clientSecret,
+    clientSecret: authMethod === 'idc' ? clientSecret : undefined,
+    tokenEndpoint: authMethod === 'external_idp' ? tokenEndpoint : undefined,
+    issuerUrl: authMethod === 'external_idp' ? issuerUrl : undefined,
+    scopes: authMethod === 'external_idp' ? scopes : undefined,
     email: stringField(normalized.email) ?? stringField(normalized.nickname),
     profileArn,
     priority: numberField(normalized.priority),

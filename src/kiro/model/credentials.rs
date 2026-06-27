@@ -39,7 +39,11 @@ pub struct KiroCredentials {
     pub profile_arn: Option<String>,
 
     /// 过期时间 (RFC3339 格式)
-    #[serde(skip_serializing_if = "Option::is_none", alias = "expires_at")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        alias = "expires_at",
+        alias = "expired"
+    )]
     pub expires_at: Option<String>,
 
     /// 认证方式 (social / idc / external_idp / api_key)
@@ -57,6 +61,18 @@ pub struct KiroCredentials {
     /// OIDC Client Secret (IdC 认证需要)
     #[serde(skip_serializing_if = "Option::is_none", alias = "client_secret")]
     pub client_secret: Option<String>,
+
+    /// 外部 IdP OAuth token endpoint（external_idp 认证需要）
+    #[serde(skip_serializing_if = "Option::is_none", alias = "token_endpoint")]
+    pub token_endpoint: Option<String>,
+
+    /// 外部 IdP issuer URL（可选，主要用于导入留痕和排查）
+    #[serde(skip_serializing_if = "Option::is_none", alias = "issuer_url")]
+    pub issuer_url: Option<String>,
+
+    /// 外部 IdP OAuth scopes（可选；存在时刷新时原样带给 token endpoint）
+    #[serde(skip_serializing_if = "Option::is_none", alias = "scope")]
+    pub scopes: Option<String>,
 
     /// 凭据优先级（数字越小优先级越高，默认为 0）
     #[serde(default)]
@@ -246,6 +262,9 @@ impl KiroCredentials {
             && self.provider == other.provider
             && self.client_id == other.client_id
             && self.client_secret == other.client_secret
+            && self.token_endpoint == other.token_endpoint
+            && self.issuer_url == other.issuer_url
+            && self.scopes == other.scopes
             && self.priority == other.priority
             && self.max_concurrent_requests == other.max_concurrent_requests
             && self.rpm == other.rpm
@@ -352,20 +371,39 @@ impl KiroCredentials {
         if self.is_api_key_credential() {
             return false;
         }
+        if self.is_external_idp_refresh_credential() {
+            return false;
+        }
 
         self.auth_method.as_deref().is_some_and(|m| {
             matches!(
                 compact_protocol_value(m).as_str(),
-                "idc"
-                    | "builderid"
-                    | "iam"
-                    | "externalidp"
-                    | "enterprise"
-                    | "iamsso"
-                    | "awsidc"
-                    | "internal"
+                "idc" | "builderid" | "iam"
             )
         }) || (self.client_id.is_some() && self.client_secret.is_some())
+    }
+
+    /// 检查是否应使用外部 IdP 自带 token endpoint 刷新。
+    ///
+    /// 这类凭证来自企业 SSO，例如 Microsoft Entra ID，通常只有 public
+    /// clientId、refreshToken、tokenEndpoint 和 scopes，不存在 AWS SSO
+    /// OIDC device-flow 的 clientSecret。
+    pub fn is_external_idp_refresh_credential(&self) -> bool {
+        if self.is_api_key_credential() {
+            return false;
+        }
+
+        self.auth_method.as_deref().is_some_and(|m| {
+            matches!(
+                compact_protocol_value(m).as_str(),
+                "externalidp" | "enterprise" | "iamsso" | "awsidc" | "internal"
+            )
+        }) || self.provider.as_deref().is_some_and(|p| {
+            matches!(
+                compact_protocol_value(p).as_str(),
+                "enterprise" | "externalidp" | "iamsso" | "awsidc" | "internal"
+            )
+        })
     }
 }
 
@@ -414,6 +452,9 @@ mod tests {
             "provider": "Enterprise",
             "client_id": "fake-client-id",
             "client_secret": "fake-client-secret",
+            "token_endpoint": "https://login.example.com/oauth2/v2.0/token",
+            "issuer_url": "https://login.example.com/tenant/v2.0",
+            "scopes": "offline_access codewhisperer:conversations",
             "region": "us-east-1",
             "auth_region": "us-west-2",
             "api_region": "eu-west-1",
@@ -436,6 +477,18 @@ mod tests {
         assert_eq!(creds.provider.as_deref(), Some("Enterprise"));
         assert_eq!(creds.client_id.as_deref(), Some("fake-client-id"));
         assert_eq!(creds.client_secret.as_deref(), Some("fake-client-secret"));
+        assert_eq!(
+            creds.token_endpoint.as_deref(),
+            Some("https://login.example.com/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            creds.issuer_url.as_deref(),
+            Some("https://login.example.com/tenant/v2.0")
+        );
+        assert_eq!(
+            creds.scopes.as_deref(),
+            Some("offline_access codewhisperer:conversations")
+        );
         assert_eq!(creds.region.as_deref(), Some("us-east-1"));
         assert_eq!(creds.auth_region.as_deref(), Some("us-west-2"));
         assert_eq!(creds.api_region.as_deref(), Some("eu-west-1"));
@@ -507,7 +560,8 @@ mod tests {
         creds.canonicalize_auth_method();
         assert_eq!(creds.auth_method.as_deref(), Some("external_idp"));
         assert_eq!(creds.provider.as_deref(), Some("Enterprise"));
-        assert!(creds.is_idc_refresh_credential());
+        assert!(creds.is_external_idp_refresh_credential());
+        assert!(!creds.is_idc_refresh_credential());
     }
 
     #[test]
@@ -532,8 +586,40 @@ mod tests {
 
             creds.canonicalize_auth_method();
             assert_eq!(creds.auth_method.as_deref(), Some("external_idp"));
-            assert!(creds.is_idc_refresh_credential());
+            assert!(creds.is_external_idp_refresh_credential());
+            assert!(!creds.is_idc_refresh_credential());
         }
+    }
+
+    #[test]
+    fn test_external_idp_import_fields_and_expired_alias() {
+        let json = r#"{
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "auth_method": "external_idp",
+            "client_id": "client123",
+            "profile_arn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL",
+            "expired": "2026-06-27T07:49:39Z",
+            "token_endpoint": "https://login.example.com/oauth2/v2.0/token",
+            "issuer_url": "https://login.example.com/tenant/v2.0",
+            "scopes": "api://client123/codewhisperer:conversations offline_access"
+        }"#;
+
+        let mut creds = KiroCredentials::from_json(json).unwrap();
+        creds.canonicalize_auth_method();
+
+        assert_eq!(creds.auth_method.as_deref(), Some("external_idp"));
+        assert_eq!(creds.expires_at.as_deref(), Some("2026-06-27T07:49:39Z"));
+        assert_eq!(
+            creds.token_endpoint.as_deref(),
+            Some("https://login.example.com/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            creds.scopes.as_deref(),
+            Some("api://client123/codewhisperer:conversations offline_access")
+        );
+        assert!(creds.is_external_idp_refresh_credential());
+        assert!(!creds.is_idc_refresh_credential());
     }
 
     #[test]

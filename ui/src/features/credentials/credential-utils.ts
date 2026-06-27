@@ -18,6 +18,7 @@ export function credentialLabel(c: Pick<CredentialStatusItem, 'id' | 'email' | '
 export function authLabel(authMethod: string | null | undefined) {
   if (authMethod === 'api_key') return 'API Key'
   if (authMethod === 'idc') return 'IdC'
+  if (authMethod === 'external_idp') return 'External IdP'
   if (authMethod === 'social') return 'Social'
   return authMethod || 'Unknown'
 }

@@ -586,9 +586,10 @@ export function CredentialsPage() {
                 <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="__all__">全部认证</SelectItem>
-                  <SelectItem value="social">Social</SelectItem>
-                  <SelectItem value="idc">IdC</SelectItem>
-                  <SelectItem value="api_key">API Key</SelectItem>
+	                  <SelectItem value="social">Social</SelectItem>
+	                  <SelectItem value="idc">IdC</SelectItem>
+	                  <SelectItem value="external_idp">External IdP</SelectItem>
+	                  <SelectItem value="api_key">API Key</SelectItem>
                 </SelectContent>
               </Select>
               <Select value={subscriptionFilter} onValueChange={setSubscriptionFilter}>

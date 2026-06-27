@@ -1397,6 +1397,27 @@ fn raw_usage_from_metadata_or_estimate(
         })
 }
 
+fn thinking_tokens_from_content(content: &[Value], output_tokens: i32) -> Option<i32> {
+    let tokens = content
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("thinking"))
+        .filter_map(|block| block.get("thinking").and_then(Value::as_str))
+        .filter(|thinking| !thinking.is_empty())
+        .map(|thinking| token::count_tokens(thinking) as i32)
+        .fold(0_i32, i32::saturating_add);
+
+    if tokens <= 0 {
+        return None;
+    }
+
+    let output_tokens = output_tokens.max(0);
+    if output_tokens > 0 {
+        Some(tokens.min(output_tokens))
+    } else {
+        Some(tokens)
+    }
+}
+
 fn credential_display_label(id: u64, label: Option<&str>) -> String {
     let prefix = format!("#{}", id);
     let Some(label) = label.map(str::trim).filter(|label| !label.is_empty()) else {
@@ -5235,6 +5256,9 @@ async fn handle_non_stream_request(
     completion.report_success();
 
     // 构建 Anthropic 响应
+    let usage_json = reported_usage.to_anthropic_usage_json_with_thinking_tokens(
+        thinking_tokens_from_content(&content, reported_usage.output_tokens),
+    );
     let response_body = json!({
         "id": envelope::message_id(),
         "type": "message",
@@ -5243,7 +5267,7 @@ async fn handle_non_stream_request(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": reported_usage.to_anthropic_usage_json()
+        "usage": usage_json
     });
 
     envelope::json_response_with_id(

@@ -85,65 +85,102 @@ pub(super) fn publish_credentials_changed(
     });
 }
 
+fn apply_scheduler_state_to_entry(
+    entry: &mut CredentialEntry,
+    state: SchedulerCredentialState,
+    global_rpm: u32,
+    now_ms: i64,
+    now: Instant,
+) {
+    entry.cooldown_until = state
+        .cooldown
+        .as_ref()
+        .and_then(|cooldown| instant_from_epoch_ms(cooldown.until_ms, now_ms, now));
+    entry.cooldown_reason = state.cooldown.and_then(|cooldown| cooldown.reason);
+    entry.model_cooldowns.clear();
+    entry.model_health.clear();
+    for model_state in state.model_states {
+        let key = model_state_key(&model_state.model);
+        if let Some(cooldown) = model_state.cooldown {
+            if let Some(until) = instant_from_epoch_ms(cooldown.until_ms, now_ms, now) {
+                entry.model_cooldowns.insert(
+                    key.clone(),
+                    CredentialModelCooldown {
+                        model: model_state.model.clone(),
+                        until,
+                        reason: cooldown.reason,
+                    },
+                );
+            }
+        }
+        entry.model_health.insert(key, model_state.health);
+    }
+    entry.rate_limit_available_at =
+        if rate_limit_interval_for_rpm(effective_rpm(entry, global_rpm)).is_some() {
+            let redis_available_at = state
+                .rate_limit_available_at_ms
+                .and_then(|until_ms| instant_from_epoch_ms(until_ms, now_ms, now));
+            match (entry.rate_limit_available_at, redis_available_at) {
+                (Some(local), Some(redis)) => Some(local.max(redis)),
+                (Some(local), None) if local > now => Some(local),
+                (_, redis) => redis,
+            }
+        } else {
+            None
+        };
+    entry.in_flight_leases = state
+        .in_flight_leases
+        .into_iter()
+        .map(|lease| InFlightLease {
+            id: lease.id,
+            acquired_at: instant_from_elapsed_epoch_ms(lease.acquired_at_ms, now_ms, now),
+            last_seen_at: instant_from_elapsed_epoch_ms(lease.last_seen_at_ms, now_ms, now),
+            kind: InFlightKind::from_str(&lease.kind),
+        })
+        .collect();
+    entry.in_flight_requests = entry.in_flight_leases.len() as u32;
+    entry.health = state.health;
+}
+
 pub(super) fn apply_scheduler_states(
     entries: &Mutex<Vec<CredentialEntry>>,
     config: &Mutex<Config>,
     states: HashMap<u64, SchedulerCredentialState>,
 ) {
+    let global_rpm = config.lock().credential_rpm.unwrap_or(0);
+    apply_scheduler_states_with_global_rpm(entries, global_rpm, states);
+}
+
+pub(super) fn apply_scheduler_states_with_global_rpm(
+    entries: &Mutex<Vec<CredentialEntry>>,
+    global_rpm: u32,
+    states: HashMap<u64, SchedulerCredentialState>,
+) {
+    let now_ms = Utc::now().timestamp_millis();
+    let now = Instant::now();
+    let mut entries = entries.lock();
+    for entry in entries.iter_mut() {
+        let state = states.get(&entry.id).cloned().unwrap_or_default();
+        apply_scheduler_state_to_entry(entry, state, global_rpm, now_ms, now);
+    }
+}
+
+pub(super) fn apply_scheduler_states_for_ids(
+    entries: &Mutex<Vec<CredentialEntry>>,
+    config: &Mutex<Config>,
+    states: HashMap<u64, SchedulerCredentialState>,
+) {
+    if states.is_empty() {
+        return;
+    }
     let now_ms = Utc::now().timestamp_millis();
     let now = Instant::now();
     let global_rpm = config.lock().credential_rpm.unwrap_or(0);
     let mut entries = entries.lock();
     for entry in entries.iter_mut() {
-        let state = states.get(&entry.id).cloned().unwrap_or_default();
-        entry.cooldown_until = state
-            .cooldown
-            .as_ref()
-            .and_then(|cooldown| instant_from_epoch_ms(cooldown.until_ms, now_ms, now));
-        entry.cooldown_reason = state.cooldown.and_then(|cooldown| cooldown.reason);
-        entry.model_cooldowns.clear();
-        entry.model_health.clear();
-        for model_state in state.model_states {
-            let key = model_state_key(&model_state.model);
-            if let Some(cooldown) = model_state.cooldown {
-                if let Some(until) = instant_from_epoch_ms(cooldown.until_ms, now_ms, now) {
-                    entry.model_cooldowns.insert(
-                        key.clone(),
-                        CredentialModelCooldown {
-                            model: model_state.model.clone(),
-                            until,
-                            reason: cooldown.reason,
-                        },
-                    );
-                }
-            }
-            entry.model_health.insert(key, model_state.health);
+        if let Some(state) = states.get(&entry.id).cloned() {
+            apply_scheduler_state_to_entry(entry, state, global_rpm, now_ms, now);
         }
-        entry.rate_limit_available_at =
-            if rate_limit_interval_for_rpm(effective_rpm(entry, global_rpm)).is_some() {
-                let redis_available_at = state
-                    .rate_limit_available_at_ms
-                    .and_then(|until_ms| instant_from_epoch_ms(until_ms, now_ms, now));
-                match (entry.rate_limit_available_at, redis_available_at) {
-                    (Some(local), Some(redis)) => Some(local.max(redis)),
-                    (Some(local), None) if local > now => Some(local),
-                    (_, redis) => redis,
-                }
-            } else {
-                None
-            };
-        entry.in_flight_leases = state
-            .in_flight_leases
-            .into_iter()
-            .map(|lease| InFlightLease {
-                id: lease.id,
-                acquired_at: instant_from_elapsed_epoch_ms(lease.acquired_at_ms, now_ms, now),
-                last_seen_at: instant_from_elapsed_epoch_ms(lease.last_seen_at_ms, now_ms, now),
-                kind: InFlightKind::from_str(&lease.kind),
-            })
-            .collect();
-        entry.in_flight_requests = entry.in_flight_leases.len() as u32;
-        entry.health = state.health;
     }
 }
 

@@ -21,6 +21,7 @@ const MAX_QUERY_LIMIT: usize = 1000;
 const USAGE_WRITER_QUEUE_CAPACITY: usize = 4096;
 const USAGE_WRITER_MAX_ATTEMPTS: u32 = 3;
 const USAGE_WRITER_BATCH_MAX: usize = 64;
+const USAGE_WRITER_BATCH_COALESCE_DELAY: StdDuration = StdDuration::from_millis(25);
 const USAGE_DASHBOARD_REDIS_TIMEOUT_SECS: u64 = 2;
 const USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS: u64 = 5;
 const ERROR_DIAGNOSTIC_MAX_TEXT_BYTES: usize = 2048;
@@ -1562,14 +1563,27 @@ async fn usage_writer_loop(store: Arc<PostgresUsageStore>, mut rx: mpsc::Receive
     while let Some(first) = rx.recv().await {
         let mut records = Vec::with_capacity(USAGE_WRITER_BATCH_MAX);
         records.push(first);
-        while records.len() < USAGE_WRITER_BATCH_MAX {
-            match rx.try_recv() {
-                Ok(record) => records.push(record),
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
+        drain_usage_writer_queue(&mut rx, &mut records);
+        if records.len() < USAGE_WRITER_BATCH_MAX {
+            match tokio::time::timeout(USAGE_WRITER_BATCH_COALESCE_DELAY, rx.recv()).await {
+                Ok(Some(record)) => {
+                    records.push(record);
+                    drain_usage_writer_queue(&mut rx, &mut records);
+                }
+                Ok(None) | Err(_) => {}
             }
         }
         persist_usage_batch_with_retry(&store, records).await;
+    }
+}
+
+fn drain_usage_writer_queue(rx: &mut mpsc::Receiver<UsageRecord>, records: &mut Vec<UsageRecord>) {
+    while records.len() < USAGE_WRITER_BATCH_MAX {
+        match rx.try_recv() {
+            Ok(record) => records.push(record),
+            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
+        }
     }
 }
 

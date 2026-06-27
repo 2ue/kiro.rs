@@ -183,6 +183,7 @@ async fn main() {
             std::process::exit(1);
         });
     config.set_config_path_for_runtime(None);
+    apply_service_bind_env_overrides(&mut config);
 
     let credentials_list = postgres_store.load_credentials().await.unwrap_or_else(|e| {
         tracing::error!("从 PgSQL 加载凭据失败: {}", e);
@@ -580,6 +581,30 @@ fn startup_retry_delay(attempt: u32) -> StdDuration {
     let shift = attempt.saturating_sub(1).min(3);
     let millis = 500u64.saturating_mul(1u64 << shift).min(5_000);
     StdDuration::from_millis(millis)
+}
+
+fn apply_service_bind_env_overrides(config: &mut Config) {
+    if let Ok(host) = std::env::var("KIRO_RS_HOST") {
+        let host = host.trim();
+        if !host.is_empty() {
+            config.host = host.to_string();
+        }
+    }
+
+    if let Ok(port) = std::env::var("KIRO_RS_PORT") {
+        let port = port.trim();
+        if port.is_empty() {
+            return;
+        }
+        match port.parse::<u16>() {
+            Ok(port) => config.port = port,
+            Err(err) => tracing::warn!(
+                value = port,
+                error = %err,
+                "忽略无效的 KIRO_RS_PORT 环境变量"
+            ),
+        }
+    }
 }
 
 #[derive(Default)]

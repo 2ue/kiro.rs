@@ -44,3 +44,15 @@ pub struct IdcRefreshResponse {
     #[serde(default)]
     pub profile_arn: Option<String>,
 }
+
+/// 外部 IdP Token 刷新响应体（Microsoft Entra ID 等 OAuth v2 token endpoint）
+#[derive(Debug, Deserialize)]
+pub struct ExternalIdpRefreshResponse {
+    pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub expires_in: Option<i64>,
+    #[serde(default)]
+    pub scope: Option<String>,
+}

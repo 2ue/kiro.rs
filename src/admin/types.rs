@@ -546,6 +546,12 @@ pub struct UpdateCredentialAuthRequest {
     pub client_id: Option<String>,
     #[serde(default)]
     pub client_secret: Option<String>,
+    #[serde(default, alias = "token_endpoint")]
+    pub token_endpoint: Option<String>,
+    #[serde(default, alias = "issuer_url")]
+    pub issuer_url: Option<String>,
+    #[serde(default, alias = "scope")]
+    pub scopes: Option<String>,
     #[serde(default)]
     pub kiro_api_key: Option<String>,
     #[serde(default)]
@@ -690,6 +696,18 @@ pub struct AddCredentialRequest {
     /// OIDC Client Secret（IdC 认证需要）
     #[serde(alias = "client_secret")]
     pub client_secret: Option<String>,
+
+    /// 外部 IdP OAuth token endpoint（external_idp 认证需要）
+    #[serde(alias = "token_endpoint")]
+    pub token_endpoint: Option<String>,
+
+    /// 外部 IdP issuer URL（可选）
+    #[serde(alias = "issuer_url")]
+    pub issuer_url: Option<String>,
+
+    /// 外部 IdP OAuth scopes（可选，存在时刷新会原样带给 token endpoint）
+    #[serde(alias = "scope")]
+    pub scopes: Option<String>,
 
     /// Profile ARN（IdC 凭据可选，用于 Amazon Q / CodeWhisperer profile）
     #[serde(alias = "profile_arn")]
@@ -1604,6 +1622,9 @@ mod tests {
             "auth_method": "idc",
             "client_id": "fake-client-id",
             "client_secret": "fake-client-secret",
+            "token_endpoint": "https://login.example.com/oauth2/v2.0/token",
+            "issuer_url": "https://login.example.com/tenant/v2.0",
+            "scopes": "offline_access codewhisperer:conversations",
             "profile_arn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE",
             "region": "us-east-1",
             "auth_region": "us-west-2",
@@ -1618,6 +1639,18 @@ mod tests {
         assert_eq!(req.auth_method, "idc");
         assert_eq!(req.client_id.as_deref(), Some("fake-client-id"));
         assert_eq!(req.client_secret.as_deref(), Some("fake-client-secret"));
+        assert_eq!(
+            req.token_endpoint.as_deref(),
+            Some("https://login.example.com/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            req.issuer_url.as_deref(),
+            Some("https://login.example.com/tenant/v2.0")
+        );
+        assert_eq!(
+            req.scopes.as_deref(),
+            Some("offline_access codewhisperer:conversations")
+        );
         assert_eq!(
             req.profile_arn.as_deref(),
             Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE")
@@ -1636,6 +1669,9 @@ mod tests {
             "authMethod": "idc",
             "clientId": "fake-client-id",
             "clientSecret": "fake-client-secret",
+            "tokenEndpoint": "https://login.example.com/oauth2/v2.0/token",
+            "issuerUrl": "https://login.example.com/tenant/v2.0",
+            "scopes": "offline_access codewhisperer:completions",
             "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE",
             "region": "us-east-1",
             "authRegion": "us-west-2",
@@ -1650,6 +1686,18 @@ mod tests {
         assert_eq!(req.auth_method, "idc");
         assert_eq!(req.client_id.as_deref(), Some("fake-client-id"));
         assert_eq!(req.client_secret.as_deref(), Some("fake-client-secret"));
+        assert_eq!(
+            req.token_endpoint.as_deref(),
+            Some("https://login.example.com/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            req.issuer_url.as_deref(),
+            Some("https://login.example.com/tenant/v2.0")
+        );
+        assert_eq!(
+            req.scopes.as_deref(),
+            Some("offline_access codewhisperer:completions")
+        );
         assert_eq!(
             req.profile_arn.as_deref(),
             Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE")

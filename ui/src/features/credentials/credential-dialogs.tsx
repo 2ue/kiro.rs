@@ -128,7 +128,7 @@ function ImportResultFooter({
   )
 }
 
-type AuthMethod = 'social' | 'idc' | 'api_key'
+type AuthMethod = 'social' | 'idc' | 'external_idp' | 'api_key'
 type ImportVerificationMode = 'model_and_subscription' | 'subscription_only'
 
 // ============================================================================
@@ -165,7 +165,7 @@ function initialParameterDefaults(): CredentialParameterDefaults {
 }
 
 function initialCredentialForm() {
-  return { authMethod: 'social' as AuthMethod, refreshToken: '', kiroApiKey: '', profileArn: '', region: '', authRegion: '', apiRegion: '', clientId: '', clientSecret: '', email: '', priority: '0', maxConcurrentRequests: '', machineId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', proxyResourceId: '', endpoint: '' }
+  return { authMethod: 'social' as AuthMethod, refreshToken: '', kiroApiKey: '', profileArn: '', region: '', authRegion: '', apiRegion: '', clientId: '', clientSecret: '', tokenEndpoint: '', issuerUrl: '', scopes: '', email: '', priority: '0', maxConcurrentRequests: '', machineId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', proxyResourceId: '', endpoint: '' }
 }
 
 function formFromCredential(c: AddCredentialRequest) {
@@ -174,7 +174,8 @@ function formFromCredential(c: AddCredentialRequest) {
     authMethod: (c.authMethod || (c.kiroApiKey ? 'api_key' : c.clientId && c.clientSecret ? 'idc' : 'social')) as AuthMethod,
     refreshToken: c.refreshToken || '', kiroApiKey: c.kiroApiKey || '', profileArn: c.profileArn || '',
     region: c.region || '', authRegion: c.authRegion || '', apiRegion: c.apiRegion || '',
-    clientId: c.clientId || '', clientSecret: c.clientSecret || '', email: c.email || '',
+    clientId: c.clientId || '', clientSecret: c.clientSecret || '', tokenEndpoint: c.tokenEndpoint || '',
+    issuerUrl: c.issuerUrl || '', scopes: c.scopes || '', email: c.email || '',
     priority: String(c.priority ?? 0),
     maxConcurrentRequests: typeof c.maxConcurrentRequests === 'number' ? String(c.maxConcurrentRequests) : '',
     machineId: c.machineId || '', proxyUrl: c.proxyUrl || '', proxyUsername: c.proxyUsername || '',
@@ -315,7 +316,17 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
     setForm((prev) => {
       if (key === 'authMethod') {
         const am = value as AuthMethod
-        return { ...prev, authMethod: am, refreshToken: am === 'api_key' ? '' : prev.refreshToken, kiroApiKey: am === 'api_key' ? prev.kiroApiKey : '', clientId: am === 'idc' ? prev.clientId : '', clientSecret: am === 'idc' ? prev.clientSecret : '' }
+        return {
+          ...prev,
+          authMethod: am,
+          refreshToken: am === 'api_key' ? '' : prev.refreshToken,
+          kiroApiKey: am === 'api_key' ? prev.kiroApiKey : '',
+          clientId: am === 'idc' || am === 'external_idp' ? prev.clientId : '',
+          clientSecret: am === 'idc' ? prev.clientSecret : '',
+          tokenEndpoint: am === 'external_idp' ? prev.tokenEndpoint : '',
+          issuerUrl: am === 'external_idp' ? prev.issuerUrl : '',
+          scopes: am === 'external_idp' ? prev.scopes : '',
+        }
       }
       if (key === 'region' && value.trim() && !prev.authRegion.trim()) return { ...prev, region: value, authRegion: value }
       if (key === 'proxyResourceId' && value && value !== '__none__') return { ...prev, proxyResourceId: value, proxyUrl: '', proxyUsername: '', proxyPassword: '' }
@@ -339,6 +350,7 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
     if (isApiKey && !form.kiroApiKey.trim()) return toast.error('请输入 Kiro API Key')
     if (!isApiKey && !form.refreshToken.trim()) return toast.error('请输入 Refresh Token')
     if (form.authMethod === 'idc' && (!form.clientId.trim() || !form.clientSecret.trim())) return toast.error('IdC 认证需要 Client ID 和 Client Secret')
+    if (form.authMethod === 'external_idp' && (!form.clientId.trim() || !form.tokenEndpoint.trim())) return toast.error('External IdP 认证需要 Client ID 和 Token Endpoint')
     const priority = Number(form.priority)
     if (!Number.isInteger(priority) || priority < 0) return toast.error('优先级必须是非负整数')
     let maxConcurrentRequests: number | undefined
@@ -352,7 +364,10 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
       authRegion: form.authRegion.trim() || undefined,
       apiRegion: form.apiRegion.trim() || undefined,
       clientId: isApiKey ? undefined : form.clientId.trim() || undefined,
-      clientSecret: isApiKey ? undefined : form.clientSecret.trim() || undefined,
+      clientSecret: form.authMethod === 'idc' ? form.clientSecret.trim() || undefined : undefined,
+      tokenEndpoint: form.authMethod === 'external_idp' ? form.tokenEndpoint.trim() || undefined : undefined,
+      issuerUrl: form.authMethod === 'external_idp' ? form.issuerUrl.trim() || undefined : undefined,
+      scopes: form.authMethod === 'external_idp' ? form.scopes.trim() || undefined : undefined,
       email: form.email.trim() || undefined,
       priority,
       maxConcurrentRequests,
@@ -378,6 +393,7 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
               <SelectContent>
                 <SelectItem value="social">Social</SelectItem>
                 <SelectItem value="idc">IdC</SelectItem>
+                <SelectItem value="external_idp">External IdP</SelectItem>
                 <SelectItem value="api_key">API Key</SelectItem>
               </SelectContent>
             </Select>
@@ -402,6 +418,12 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
           {form.authMethod === 'idc' && <>
             <Field label="Client ID"><Input value={form.clientId} disabled={add.isPending} onChange={(e) => update('clientId', e.target.value)} /></Field>
             <Field label="Client Secret"><SecretInput value={form.clientSecret} onChange={(v) => update('clientSecret', v)} visible={showPp} onToggle={() => setShowPp((v) => !v)} disabled={add.isPending} /></Field>
+          </>}
+          {form.authMethod === 'external_idp' && <>
+            <Field label="Client ID"><Input value={form.clientId} disabled={add.isPending} onChange={(e) => update('clientId', e.target.value)} /></Field>
+            <Field label="Token Endpoint"><Input className="font-mono" value={form.tokenEndpoint} disabled={add.isPending} onChange={(e) => update('tokenEndpoint', e.target.value)} placeholder="https://.../oauth2/v2.0/token" /></Field>
+            <Field label="Issuer URL（可选）"><Input className="font-mono" value={form.issuerUrl} disabled={add.isPending} onChange={(e) => update('issuerUrl', e.target.value)} placeholder="https://..." /></Field>
+            <Field label="Scopes（可选）"><Input className="font-mono" value={form.scopes} disabled={add.isPending} onChange={(e) => update('scopes', e.target.value)} placeholder="offline_access ..." /></Field>
           </>}
           <Field label="邮箱（可选）"><Input value={form.email} disabled={add.isPending} onChange={(e) => update('email', e.target.value)} placeholder="user@example.com" /></Field>
           <Field label="Profile ARN（可选）"><Input value={form.profileArn} disabled={add.isPending} onChange={(e) => update('profileArn', e.target.value)} /></Field>
@@ -715,10 +737,13 @@ export function KamImportModal({ open, onClose, onDone }: {
       setResults([...newResults])
       try {
         const cred: AddCredentialRequest = mergeCredentialDefaults({
-          authMethod: (acc.credentials.authMethod || 'social') as 'social' | 'idc' | 'api_key',
+          authMethod: (acc.credentials.authMethod || 'social') as AddCredentialRequest['authMethod'],
           refreshToken: acc.credentials.refreshToken,
           clientId: acc.credentials.clientId,
           clientSecret: acc.credentials.clientSecret,
+          tokenEndpoint: acc.credentials.tokenEndpoint,
+          issuerUrl: acc.credentials.issuerUrl,
+          scopes: acc.credentials.scopes,
           profileArn: acc.credentials.profileArn,
           region: acc.credentials.region,
           apiRegion: acc.credentials.apiRegion,

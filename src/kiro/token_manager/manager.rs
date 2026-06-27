@@ -54,6 +54,8 @@ use super::queue::{
 };
 use super::redis_runtime::{
     apply_scheduler_states as apply_redis_scheduler_states,
+    apply_scheduler_states_for_ids as apply_redis_scheduler_states_for_ids,
+    apply_scheduler_states_with_global_rpm as apply_redis_scheduler_states_with_global_rpm,
     clear_scheduler_state_for_credential_local, clear_scheduler_state_for_credential_redis,
     publish_credentials_changed as publish_redis_credentials_changed,
     publish_runtime_config_changed as publish_redis_runtime_config_changed,
@@ -133,6 +135,9 @@ fn apply_credential_auth_update(credential: &mut KiroCredentials, update: Creden
         credential.provider = None;
         credential.client_id = None;
         credential.client_secret = None;
+        credential.token_endpoint = None;
+        credential.issuer_url = None;
+        credential.scopes = None;
         credential.auth_method = Some("api_key".to_string());
         clear_access_token = true;
     }
@@ -165,6 +170,17 @@ fn apply_credential_auth_update(credential: &mut KiroCredentials, update: Creden
     }
     if update.client_secret.is_some() {
         apply_optional_string(&mut credential.client_secret, update.client_secret);
+        clear_access_token = true;
+    }
+    if update.token_endpoint.is_some() {
+        apply_optional_string(&mut credential.token_endpoint, update.token_endpoint);
+        clear_access_token = true;
+    }
+    if update.issuer_url.is_some() {
+        apply_optional_string(&mut credential.issuer_url, update.issuer_url);
+    }
+    if update.scopes.is_some() {
+        apply_optional_string(&mut credential.scopes, update.scopes);
         clear_access_token = true;
     }
     if update.region.is_some() {
@@ -238,6 +254,8 @@ pub struct MultiTokenManager {
     last_scheduler_redis_cleanup_at: Mutex<Option<Instant>>,
     /// Redis 调度热路径最近一次超时/失败后的退避截止时间。退避期间请求只用本机内存态调度。
     scheduler_redis_degraded_until: Mutex<Option<Instant>>,
+    /// Redis 全量调度状态同步后台任务是否正在运行，避免高并发下重复扫全部账号状态。
+    scheduler_redis_sync_in_flight: Arc<AtomicBool>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
     /// 未落盘的统计增量。请求热路径只合并内存 delta，后台任务定期写入 PgSQL。
@@ -459,6 +477,7 @@ impl MultiTokenManager {
             last_scheduler_redis_sync_at: Mutex::new(None),
             last_scheduler_redis_cleanup_at: Mutex::new(None),
             scheduler_redis_degraded_until: Mutex::new(None),
+            scheduler_redis_sync_in_flight: Arc::new(AtomicBool::new(false)),
             stats_dirty: AtomicBool::new(false),
             pending_stats_deltas: Mutex::new(HashMap::new()),
             pending_runtime_state_snapshots: Mutex::new(HashMap::new()),
@@ -1140,6 +1159,38 @@ impl MultiTokenManager {
             }
             Err(err) => {
                 self.mark_scheduler_redis_degraded(operation, &err);
+                None
+            }
+        }
+    }
+
+    fn block_on_scheduler_redis_state_sync<T>(
+        &self,
+        operation: &'static str,
+        future: impl Future<Output = anyhow::Result<T>>,
+    ) -> Option<T> {
+        if self.redis_store.is_some() && !self.scheduler_redis_hot_path_allowed() {
+            return None;
+        }
+        let result = block_on_storage(operation, async move {
+            match tokio::time::timeout(SCHEDULER_REDIS_HOT_OP_TIMEOUT, future).await {
+                Ok(result) => result,
+                Err(_) => anyhow::bail!(
+                    "{}超过 {}ms",
+                    operation,
+                    SCHEDULER_REDIS_HOT_OP_TIMEOUT.as_millis()
+                ),
+            }
+        });
+        match result {
+            Ok(value) => Some(value),
+            Err(err) => {
+                tracing::debug!(
+                    operation,
+                    timeout_ms = SCHEDULER_REDIS_HOT_OP_TIMEOUT.as_millis() as u64,
+                    "Redis 调度状态同步未在预算内完成，沿用本地调度缓存: {}",
+                    err
+                );
                 None
             }
         }
@@ -3315,6 +3366,9 @@ impl MultiTokenManager {
         if self.redis_store.is_none() {
             return Ok(());
         }
+        if !self.scheduler_redis_hot_path_allowed() {
+            return Ok(());
+        }
 
         let now = Instant::now();
         {
@@ -3327,6 +3381,64 @@ impl MultiTokenManager {
             *last_sync_at = Some(now);
         }
 
+        let Some(redis) = &self.redis_store else {
+            return Ok(());
+        };
+        let ids: Vec<u64> = {
+            let entries = self.entries.lock();
+            entries.iter().map(|entry| entry.id).collect()
+        };
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        if self
+            .scheduler_redis_sync_in_flight
+            .swap(true, Ordering::AcqRel)
+        {
+            return Ok(());
+        }
+
+        let redis = redis.clone();
+        let entries = self.entries.clone();
+        let config_rpm = self.config.lock().credential_rpm.unwrap_or(0);
+        let local_pool_route_state_cache = self.local_pool_route_state_cache.clone();
+        let sync_in_flight = self.scheduler_redis_sync_in_flight.clone();
+
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::spawn(async move {
+                let result = tokio::time::timeout(
+                    SCHEDULER_REDIS_HOT_OP_TIMEOUT,
+                    redis.scheduler_state_for_credentials(&ids),
+                )
+                .await;
+                match result {
+                    Ok(Ok(states)) => {
+                        apply_redis_scheduler_states_with_global_rpm(&entries, config_rpm, states);
+                        local_pool_route_state_cache.lock().clear();
+                    }
+                    Ok(Err(err)) => {
+                        tracing::debug!(
+                            operation = "从 Redis 后台同步调度运行态",
+                            "Redis 调度状态后台同步失败，沿用本地调度缓存: {}",
+                            err
+                        );
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            operation = "从 Redis 后台同步调度运行态",
+                            timeout_ms = SCHEDULER_REDIS_HOT_OP_TIMEOUT.as_millis() as u64,
+                            "Redis 调度状态后台同步未在预算内完成，沿用本地调度缓存"
+                        );
+                    }
+                }
+                sync_in_flight.store(false, Ordering::Release);
+            });
+            return Ok(());
+        }
+
+        self.scheduler_redis_sync_in_flight
+            .store(false, Ordering::Release);
         self.refresh_scheduler_state_from_redis_force()
     }
 
@@ -3344,7 +3456,7 @@ impl MultiTokenManager {
 
         let redis = redis.clone();
         if let Some(states) = self
-            .block_on_scheduler_redis_hot("从 Redis 同步调度运行态", async move {
+            .block_on_scheduler_redis_state_sync("从 Redis 同步调度运行态", async move {
                 redis.scheduler_state_for_credentials(&ids).await
             })
         {
@@ -3374,11 +3486,11 @@ impl MultiTokenManager {
         }
         let redis = redis.clone();
         if let Some(states) = self
-            .block_on_scheduler_redis_hot("从 Redis 同步指定凭据调度运行态", async move {
+            .block_on_scheduler_redis_state_sync("从 Redis 同步指定凭据调度运行态", async move {
                 redis.scheduler_state_for_credentials(&ids).await
             })
         {
-            self.apply_scheduler_states(states);
+            self.apply_scheduler_states_for_ids(states);
             Ok(())
         } else {
             anyhow::bail!("Redis 调度运行态未在热路径超时内返回")
@@ -3399,6 +3511,11 @@ impl MultiTokenManager {
 
     fn apply_scheduler_states(&self, states: HashMap<u64, SchedulerCredentialState>) {
         apply_redis_scheduler_states(&self.entries, &self.config, states);
+        self.invalidate_local_pool_route_state_cache();
+    }
+
+    fn apply_scheduler_states_for_ids(&self, states: HashMap<u64, SchedulerCredentialState>) {
+        apply_redis_scheduler_states_for_ids(&self.entries, &self.config, states);
         self.invalidate_local_pool_route_state_cache();
     }
 
@@ -4963,8 +5080,14 @@ impl MultiTokenManager {
                 m
             }
         });
+        if new_cred.profile_arn.is_some() {
+            validated_cred.profile_arn = new_cred.profile_arn;
+        }
         validated_cred.client_id = new_cred.client_id;
         validated_cred.client_secret = new_cred.client_secret;
+        validated_cred.token_endpoint = new_cred.token_endpoint;
+        validated_cred.issuer_url = new_cred.issuer_url;
+        validated_cred.scopes = new_cred.scopes;
         validated_cred.region = new_cred.region;
         validated_cred.auth_region = new_cred.auth_region;
         validated_cred.api_region = new_cred.api_region;
@@ -5348,6 +5471,83 @@ mod tests {
             auth_method: Some("api_key".to_string()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn test_partial_scheduler_state_apply_preserves_unrequested_entries() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                test_access_token_credential("token-1", "Pro"),
+                test_access_token_credential("token-2", "Pro"),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].in_flight_requests = 7;
+            entries[0].health.last_error_kind = Some("old-first".to_string());
+            entries[1].in_flight_requests = 3;
+            entries[1].health.last_error_kind = Some("keep-second".to_string());
+            entries[1].health.selection_count = 11;
+        }
+
+        let mut health = SchedulerHealthState {
+            last_error_kind: Some("updated-first".to_string()),
+            selection_count: 5,
+            ..Default::default()
+        };
+        health.recent_selection_count_60s = 2;
+        let mut states = HashMap::new();
+        states.insert(
+            1,
+            SchedulerCredentialState {
+                health,
+                ..Default::default()
+            },
+        );
+
+        manager.apply_scheduler_states_for_ids(states);
+
+        let entries = manager.entries.lock();
+        assert_eq!(
+            entries[0].health.last_error_kind.as_deref(),
+            Some("updated-first")
+        );
+        assert_eq!(entries[0].health.selection_count, 5);
+        assert_eq!(entries[0].in_flight_requests, 0);
+        assert_eq!(
+            entries[1].health.last_error_kind.as_deref(),
+            Some("keep-second")
+        );
+        assert_eq!(entries[1].health.selection_count, 11);
+        assert_eq!(entries[1].in_flight_requests, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_scheduler_state_sync_timeout_does_not_degrade_hot_path() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![test_access_token_credential("token-1", "Pro")],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let result =
+            manager.block_on_scheduler_redis_state_sync("测试 Redis 调度状态同步", async move {
+                tokio::time::sleep(SCHEDULER_REDIS_HOT_OP_TIMEOUT + StdDuration::from_millis(10))
+                    .await;
+                Ok::<(), anyhow::Error>(())
+            });
+
+        assert!(result.is_none());
+        assert!(manager.scheduler_redis_degraded_until.lock().is_none());
     }
 
     fn test_access_token_credential(token: &str, subscription_title: &str) -> KiroCredentials {

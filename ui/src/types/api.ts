@@ -485,9 +485,13 @@ export interface BatchUpdateCredentialsResponse {
 
 export interface AddCredentialRequest {
   refreshToken?: string
-  authMethod?: 'social' | 'idc' | 'api_key'
+  authMethod?: 'social' | 'idc' | 'external_idp' | 'api_key'
+  provider?: string
   clientId?: string
   clientSecret?: string
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string
   email?: string
   profileArn?: string
   priority?: number

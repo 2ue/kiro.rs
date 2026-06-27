@@ -24,12 +24,27 @@ pub struct CacheUsage {
 
 impl CacheUsage {
     pub fn to_anthropic_usage_json(self) -> serde_json::Value {
-        json!({
+        self.to_anthropic_usage_json_with_thinking_tokens(None)
+    }
+
+    pub fn to_anthropic_usage_json_with_thinking_tokens(
+        self,
+        thinking_tokens: Option<i32>,
+    ) -> serde_json::Value {
+        let mut usage = json!({
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "cache_creation_input_tokens": self.cache_creation_input_tokens,
             "cache_read_input_tokens": self.cache_read_input_tokens
-        })
+        });
+
+        if let Some(thinking_tokens) = thinking_tokens.filter(|tokens| *tokens > 0) {
+            usage["output_tokens_details"] = json!({
+                "thinking_tokens": thinking_tokens,
+            });
+        }
+
+        usage
     }
 
     #[cfg(test)]
