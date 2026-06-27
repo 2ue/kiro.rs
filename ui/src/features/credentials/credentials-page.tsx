@@ -65,6 +65,7 @@ import {
   useRuntimeConfig,
   useSetLoadBalancingMode,
 } from '@/hooks/use-credentials'
+import { useDebouncedValue } from '@/hooks/use-debounced-value'
 import type {
   CredentialAccountInfoItem,
   CredentialSortBy,
@@ -156,17 +157,18 @@ export function CredentialsPage() {
   const queryClient = useQueryClient()
 
   // Derived filter params — sentinel '__all__' avoids empty-string in Select
+  const debouncedQueryText = useDebouncedValue(queryText)
   const listQuery = useMemo(() => ({
     page,
     limit: PAGE_SIZE,
-    q: queryText.trim() || undefined,
+    q: debouncedQueryText.trim() || undefined,
     status: statusFilter !== '__all__' ? statusFilter : undefined,
     authMethod: authFilter !== '__all__' ? authFilter : undefined,
     subscription: subscriptionFilter !== '__all__' ? subscriptionFilter : undefined,
     proxyResourceId: proxyFilter !== '__all__' ? Number(proxyFilter) : undefined,
     sortBy: sortBy !== 'default' ? sortBy : undefined,
     sortOrder: sortBy !== 'default' ? sortOrder : undefined,
-  }), [page, queryText, statusFilter, authFilter, subscriptionFilter, proxyFilter, sortBy, sortOrder])
+  }), [page, debouncedQueryText, statusFilter, authFilter, subscriptionFilter, proxyFilter, sortBy, sortOrder])
 
   const credentials = useCredentialList(listQuery)
   const allCredentials = useCredentials({ enabled: batchOpen || kamOpen })
@@ -210,7 +212,7 @@ export function CredentialsPage() {
     : '账号未覆盖'
 
   // Reset page on filter change
-  useEffect(() => { setPage(1); setSelectedIds(new Set()) }, [queryText, statusFilter, authFilter, subscriptionFilter, proxyFilter, sortBy, sortOrder])
+  useEffect(() => { setPage(1); setSelectedIds(new Set()) }, [debouncedQueryText, statusFilter, authFilter, subscriptionFilter, proxyFilter, sortBy, sortOrder])
   useEffect(() => { setSelectedIds(new Set()) }, [page])
   useEffect(() => {
     if (credentials.data && page > Math.max(credentials.data.totalPages, 1)) setPage(Math.max(credentials.data.totalPages, 1))
@@ -327,22 +329,28 @@ export function CredentialsPage() {
   }
 
   const batchDelete = async () => {
+    if (batchRefreshing) return
     const disabledIds = Array.from(selectedIds).filter((id) => currentCredentials.find((c) => c.id === id)?.disabled)
     if (!disabledIds.length) return toast.error('选中项中没有已禁用账号')
     const ok = await confirmDialog({ title: '批量删除', message: `确定删除 ${disabledIds.length} 个已禁用账号？此操作无法撤销。`, confirmText: '删除', tone: 'danger' })
     if (!ok) return
+    setBatchRefreshing(true)
     let success = 0; let fail = 0
     for (const id of disabledIds) { try { await deleteCredential.mutateAsync(id); success++ } catch { fail++ } }
+    setBatchRefreshing(false)
     setSelectedIds(new Set())
     if (fail === 0) toast.success(`成功删除 ${success} 个账号`)
     else toast.warning(`删除：成功 ${success}，失败 ${fail}`)
   }
 
   const batchResetFailure = async () => {
+    if (batchRefreshing) return
     const ids = Array.from(selectedIds).filter((id) => (currentCredentials.find((c) => c.id === id)?.failureCount || 0) > 0)
     if (!ids.length) return toast.error('选中项中没有有失败记录的账号')
+    setBatchRefreshing(true)
     let success = 0; let fail = 0
     for (const id of ids) { try { await resetFailure.mutateAsync(id); success++ } catch { fail++ } }
+    setBatchRefreshing(false)
     setSelectedIds(new Set())
     if (fail === 0) toast.success(`成功恢复 ${success} 个账号`)
     else toast.warning(`恢复：成功 ${success}，失败 ${fail}`)

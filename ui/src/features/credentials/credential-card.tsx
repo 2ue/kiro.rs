@@ -336,10 +336,10 @@ export function CredentialCard({
             {typeof credential.rpmOverride === 'number' && <Badge tone="info">RPM覆盖</Badge>}
             {credential.hasProfileArn && <Badge tone="secondary">Profile ARN</Badge>}
             {!credential.disabled && credential.cooledDown && credential.cooldownRemainingSecs > 0 && (
-              <Badge tone="error" title={credential.cooldownReason || undefined}>冷却 {credential.cooldownRemainingSecs}s</Badge>
+              <Badge tone="error" className="animate-pulse" title={credential.cooldownReason || undefined}>冷却 {credential.cooldownRemainingSecs}s</Badge>
             )}
             {!credential.disabled && credential.rateLimited && (
-              <Badge tone="warning">限流 {credential.rateLimitRemainingSecs}s</Badge>
+              <Badge tone="warning" className="animate-pulse">限流 {credential.rateLimitRemainingSecs}s</Badge>
             )}
             {transientFailureStreak > 0 && <Badge tone="error">错误 {transientFailureStreak}</Badge>}
             {credential.warmupRemaining > 0 && <Badge tone="warning">预热 {credential.warmupRemaining}</Badge>}

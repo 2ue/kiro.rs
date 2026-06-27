@@ -15,6 +15,7 @@ import {
 } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { useAutoRefreshPreference } from '@/hooks/use-auto-refresh'
+import { useDebouncedValue } from '@/hooks/use-debounced-value'
 import { useCredentials } from '@/hooks/use-credentials'
 import {
   useUsageDashboard,
@@ -183,6 +184,13 @@ function RecordsView({
   const [minCacheRead, setMinCacheRead] = useState('')
   const [showFilters, setShowFilters] = useState(false)
 
+  // 文本筛选项防抖,避免每次按键都触发查询(展示值即时,查询用防抖值)
+  const qD = useDebouncedValue(q)
+  const modelD = useDebouncedValue(model)
+  const endpointD = useDebouncedValue(endpoint)
+  const conversationIdD = useDebouncedValue(conversationId)
+  const minCacheReadD = useDebouncedValue(minCacheRead)
+
   const credentials = useCredentials({ refetchInterval: autoRefreshInterval })
   const externalPools = useQuery({
     queryKey: ['external-pools'],
@@ -200,10 +208,10 @@ function RecordsView({
 
   const query = useMemo<UsageRecordsPageQuery>(() => {
     const next: UsageRecordsPageQuery = { page, limit: PAGE_SIZE }
-    if (q.trim()) next.q = q.trim()
-    if (model.trim()) next.model = model.trim()
-    if (endpoint.trim()) next.endpoint = endpoint.trim()
-    if (conversationId.trim()) next.conversationId = conversationId.trim()
+    if (qD.trim()) next.q = qD.trim()
+    if (modelD.trim()) next.model = modelD.trim()
+    if (endpointD.trim()) next.endpoint = endpointD.trim()
+    if (conversationIdD.trim()) next.conversationId = conversationIdD.trim()
     const [routeType, routeId] = routeTarget.split(':')
     const parsedRouteId = Number(routeId)
     if (routeTarget && Number.isFinite(parsedRouteId)) {
@@ -213,9 +221,9 @@ function RecordsView({
     if (status !== '__all__') next.status = status
     if (source !== '__all__') next.source = source
     if (streamMode !== 'all') next.stream = streamMode === 'stream'
-    if (minCacheRead.trim() && Number.isFinite(Number(minCacheRead))) next.minCacheRead = Number(minCacheRead)
+    if (minCacheReadD.trim() && Number.isFinite(Number(minCacheReadD))) next.minCacheRead = Number(minCacheReadD)
     return next
-  }, [conversationId, endpoint, minCacheRead, model, page, q, routeTarget, source, status, streamMode])
+  }, [conversationIdD, endpointD, minCacheReadD, modelD, page, qD, routeTarget, source, status, streamMode])
 
   const records = useUsageRecordsPage(query, autoRefreshInterval)
   const items = records.data?.records ?? []
