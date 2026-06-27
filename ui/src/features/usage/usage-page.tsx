@@ -582,28 +582,32 @@ export function UsagePage() {
       <PageHeader title="用量" subtitle="请求趋势与明细记录" actions={headerActions} />
 
       {/* 指标卡 */}
-      <div className="grid gap-3 grid-cols-2 lg:grid-cols-4">
+      <div className="grid gap-3 grid-cols-2 lg:grid-cols-3">
         <StatCard
           title="总请求"
           value={formatCompact(data?.totalRequests ?? 0)}
           valueTitle={formatNumber(data?.totalRequests ?? 0)}
-          desc={`成功 ${formatCompact(data?.successRequests ?? 0)} / 错误 ${formatCompact(data?.errorRequests ?? 0)}`}
+          desc={
+            <span>
+              成功 {formatCompact(data?.successRequests ?? 0)} · 错误率{' '}
+              <span className={errorRate > 0 ? 'font-semibold text-destructive' : 'font-semibold text-success'}>
+                {formatPercent(errorRate)}
+              </span>
+              {' '}({formatCompact(data?.errorRequests ?? 0)})
+            </span>
+          }
           icon={<Activity />}
           tone="primary"
         />
         <StatCard
           title="实时 RPM"
           value={formatNumber(realtime?.rpm ?? 0)}
-          desc={`近 ${realtimeWindow} 秒 ${formatNumber(realtime?.requests ?? 0)} 请求`}
+          desc={
+            <span>
+              TPM {formatCompact(realtime?.totalTpm ?? 0)} · 近 {realtimeWindow} 秒 {formatNumber(realtime?.requests ?? 0)} 请求
+            </span>
+          }
           icon={<Zap />}
-          tone="info"
-        />
-        <StatCard
-          title="实时 TPM"
-          value={formatCompact(realtime?.totalTpm ?? 0)}
-          valueTitle={formatNumber(realtime?.totalTpm ?? 0)}
-          desc="按展示输入 + 展示输出统计"
-          icon={<Activity />}
           tone="info"
         />
         <StatCard
@@ -613,13 +617,6 @@ export function UsagePage() {
           desc="highCacheThreshold 以上的请求"
           icon={<Zap />}
           tone="success"
-        />
-        <StatCard
-          title="错误率"
-          value={formatPercent(errorRate)}
-          desc={errorRate >= 0.2 ? '偏高，请排查' : errorRate > 0 ? '有少量错误' : '当前无错误'}
-          icon={<BarChart3 />}
-          tone={errorRate >= 0.2 ? 'error' : errorRate > 0 ? 'warning' : 'success'}
         />
         <StatCard
           title="Token 用量"
