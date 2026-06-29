@@ -41,12 +41,13 @@ use crate::{
         types::MessagesRequest,
         usage::{
             ExternalPoolAttempt, ExternalPoolBilling, ExternalPoolUsageSnapshot, UsageLatencyTrace,
-            UsageRecord, UsageRecordStatus, UsageRouteKind, UsageRouteSubtype, UsageSource,
+            UsagePublicError, UsageRecord, UsageRecordStatus, UsageRouteKind, UsageRouteSubtype,
+            UsageSource,
         },
     },
     model::config::{
         ExternalPoolCapacityMode, ExternalPoolsConfig, ModelMappingRule,
-        PromptCacheCreationControlConfig, ReportedUsageConfig,
+        PromptCacheCreationControlConfig, PromptCacheSimulationMode, ReportedUsageConfig,
     },
     model::model_processing::{
         ModelProcessingConfig, ModelProcessingError, ModelProcessingInput, ModelProcessingMode,
@@ -64,6 +65,13 @@ const EXTERNAL_POOL_LEASE_TOUCH_INTERVAL_SECS: u64 = 30;
 const EXTERNAL_POOL_PROMPT_CACHE_CREDENTIAL_ID_OFFSET: u64 = 1_u64 << 63;
 const EXTERNAL_POOL_AVAILABILITY_CACHE_TTL: Duration = Duration::from_millis(250);
 const MAX_RECORDED_EXTERNAL_ERROR_MESSAGE_BYTES: usize = 8192;
+const EXTERNAL_POOL_AUTO_DISABLE_REASONS: &[&str] = &[
+    "auth_error",
+    "security_lock",
+    "quota_exhausted",
+    "misconfigured_endpoint",
+    "channel_disabled",
+];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -379,6 +387,8 @@ pub struct ExternalRouteRequest {
     pub reported_usage: ReportedUsageConfig,
     pub prompt_cache: Arc<PromptCacheTracker>,
     pub prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
+    pub prompt_cache_simulation_mode: PromptCacheSimulationMode,
+    pub prompt_cache_route_namespace: Option<String>,
     pub prompt_cache_target_read_ratio: f64,
     pub prompt_cache_token_scale: f64,
     pub prompt_cache_max_simulated_input_tokens: i32,
@@ -470,9 +480,35 @@ fn load_nonzero(value: &AtomicU64) -> Option<u64> {
 
 struct ExternalForwardResponse {
     response: Response,
+    outbound_model: Option<String>,
     billing: Option<ExternalPoolBilling>,
     stream_usage_capture: Option<Arc<SyncMutex<ExternalUsageCapture>>>,
     stream_usage_projection: Option<ExternalUsageProjectionContext>,
+}
+
+struct PreparedExternalRequest {
+    body: Bytes,
+    outbound_model: Option<String>,
+}
+
+struct ExternalForwardError {
+    err: ExternalPoolError,
+    outbound_model: Option<String>,
+}
+
+impl ExternalForwardError {
+    fn new(err: ExternalPoolError, outbound_model: Option<String>) -> Self {
+        Self {
+            err,
+            outbound_model,
+        }
+    }
+}
+
+impl From<ExternalPoolError> for ExternalForwardError {
+    fn from(err: ExternalPoolError) -> Self {
+        Self::new(err, None)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -502,6 +538,14 @@ pub struct ExternalPoolFinalError {
 }
 
 impl ExternalPoolFinalError {
+    pub fn public_error(&self) -> UsagePublicError {
+        UsagePublicError {
+            status_code: self.public_status().as_u16(),
+            error_type: self.public_error_type().to_string(),
+            message: self.public_message(&self.error_id),
+        }
+    }
+
     pub fn into_response(self, request_id: &str) -> Response {
         let public_status = self.public_status();
         let public_error_type = self.public_error_type();
@@ -564,7 +608,7 @@ impl ExternalPoolFinalError {
         envelope::public_message_with_error_id(message, external_error_id)
     }
 
-    fn is_public_invalid_request(&self) -> bool {
+    pub fn is_public_invalid_request(&self) -> bool {
         self.status == StatusCode::BAD_REQUEST
             && !self.retryable
             && matches!(
@@ -723,6 +767,7 @@ struct UsageErrorDiagnostics {
     source: Option<String>,
     error_id: Option<String>,
     metadata: Option<serde_json::Value>,
+    public_error: Option<UsagePublicError>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1095,6 +1140,7 @@ impl ExternalPoolManager {
                         attempt: current_attempt,
                         pool_id,
                         pool_name: pool.name.clone(),
+                        outbound_model: forwarded.outbound_model.clone(),
                         status: Some(forwarded.response.status().as_u16()),
                         action: "success".to_string(),
                         duration_ms: started.elapsed().as_millis() as u64,
@@ -1124,12 +1170,15 @@ impl ExternalPoolManager {
                     );
                     return ExternalPoolForwardOutcome::Response(forwarded.response);
                 }
-                Err(err) => {
+                Err(forward_err) => {
+                    let outbound_model = forward_err.outbound_model;
+                    let err = forward_err.err;
                     let action = if err.retryable { "retry_next" } else { "fail" };
                     attempts.push(ExternalPoolAttempt {
                         attempt: current_attempt,
                         pool_id,
                         pool_name: pool.name.clone(),
+                        outbound_model,
                         status: err.status.map(|status| status.as_u16()),
                         action: action.to_string(),
                         duration_ms: started.elapsed().as_millis() as u64,
@@ -1247,7 +1296,7 @@ impl ExternalPoolManager {
         route: &ExternalRouteRequest,
         lease: ExternalPoolLease,
         config: &ExternalPoolsConfig,
-    ) -> Result<ExternalForwardResponse, ExternalPoolError> {
+    ) -> Result<ExternalForwardResponse, ExternalForwardError> {
         let url = external_pool_url(pool, &route.endpoint, config)?;
         let mut headers = forward_headers(&route.headers, pool)?;
         if !headers.contains_key(header::CONTENT_TYPE) {
@@ -1256,8 +1305,9 @@ impl ExternalPoolManager {
                 HeaderValue::from_static("application/json"),
             );
         }
-        let outbound_body = external_pool_outbound_body(route, pool)?;
-        let mut request = self.client.post(url).headers(headers).body(outbound_body);
+        let prepared = external_pool_prepare_request(route, pool)?;
+        let outbound_model = prepared.outbound_model.clone();
+        let mut request = self.client.post(url).headers(headers).body(prepared.body);
         if route.payload.stream {
             if config.external_pool_stream_request_timeout_secs > 0 {
                 request = request.timeout(Duration::from_secs(
@@ -1277,34 +1327,45 @@ impl ExternalPoolManager {
                 error = %err,
                 "external pool request send failed"
             );
-            ExternalPoolError {
-                status: None,
-                message: sanitized_external_network_error("request send failed", &err),
-                retryable: true,
-                auto_disable_reason: None,
-                cooldown: Some((
-                    Duration::from_secs(config.external_pool_network_error_cooldown_secs.max(1)),
-                    "network_error".to_string(),
-                )),
-                response_body: None,
-            }
+            ExternalForwardError::new(
+                ExternalPoolError {
+                    status: None,
+                    message: sanitized_external_network_error("request send failed", &err),
+                    retryable: true,
+                    auto_disable_reason: None,
+                    cooldown: Some((
+                        Duration::from_secs(
+                            config.external_pool_network_error_cooldown_secs.max(1),
+                        ),
+                        "network_error".to_string(),
+                    )),
+                    response_body: None,
+                },
+                outbound_model.clone(),
+            )
         })?;
 
         let status = response.status();
         if !status.is_success() {
             let headers = response.headers().clone();
             let body = response.bytes().await.unwrap_or_default();
-            return Err(classify_external_error(status, body, headers, config));
+            return Err(ExternalForwardError::new(
+                classify_external_error(status, body, headers, config),
+                outbound_model.clone(),
+            ));
         }
         let response_headers = response.headers().clone();
         let status = response.status();
         if route.payload.stream {
             if success_response_headers_look_like_html(&response_headers) {
-                return Err(success_protocol_error(
-                    &response_headers,
-                    None,
-                    config,
-                    "model endpoint returned an HTML response for a streaming request",
+                return Err(ExternalForwardError::new(
+                    success_protocol_error(
+                        &response_headers,
+                        None,
+                        config,
+                        "model endpoint returned an HTML response for a streaming request",
+                    ),
+                    outbound_model.clone(),
                 ));
             }
             route.latency_trace.mark_upstream_header(route.started_at);
@@ -1470,16 +1531,22 @@ impl ExternalPoolManager {
             let stream = Body::from_stream(stream);
             let mut builder = Response::builder().status(status);
             apply_forwarded_response_headers(&mut builder, &response_headers, &route.request_id);
-            let response = builder.body(stream).map_err(|err| ExternalPoolError {
-                status: None,
-                message: format!("build external stream response failed: {}", err),
-                retryable: false,
-                auto_disable_reason: None,
-                cooldown: None,
-                response_body: None,
+            let response = builder.body(stream).map_err(|err| {
+                ExternalForwardError::new(
+                    ExternalPoolError {
+                        status: None,
+                        message: format!("build external stream response failed: {}", err),
+                        retryable: false,
+                        auto_disable_reason: None,
+                        cooldown: None,
+                        response_body: None,
+                    },
+                    outbound_model.clone(),
+                )
             })?;
             Ok(ExternalForwardResponse {
                 response,
+                outbound_model,
                 billing: None,
                 stream_usage_capture: Some(stream_usage_capture),
                 stream_usage_projection,
@@ -1493,30 +1560,39 @@ impl ExternalPoolManager {
                     error = %err,
                     "external pool response read failed"
                 );
-                ExternalPoolError {
-                    status: None,
-                    message: sanitized_external_network_error("response read failed", &err),
-                    retryable: true,
-                    auto_disable_reason: None,
-                    cooldown: Some((
-                        Duration::from_secs(
-                            config.external_pool_network_error_cooldown_secs.max(1),
-                        ),
-                        "network_error".to_string(),
-                    )),
-                    response_body: None,
-                }
+                ExternalForwardError::new(
+                    ExternalPoolError {
+                        status: None,
+                        message: sanitized_external_network_error("response read failed", &err),
+                        retryable: true,
+                        auto_disable_reason: None,
+                        cooldown: Some((
+                            Duration::from_secs(
+                                config.external_pool_network_error_cooldown_secs.max(1),
+                            ),
+                            "network_error".to_string(),
+                        )),
+                        response_body: None,
+                    },
+                    outbound_model.clone(),
+                )
             })?;
             if success_response_looks_like_html(&response_headers, &bytes) {
-                return Err(success_protocol_error(
-                    &response_headers,
-                    Some(&bytes),
-                    config,
-                    "model endpoint returned an HTML response for a non-streaming request",
+                return Err(ExternalForwardError::new(
+                    success_protocol_error(
+                        &response_headers,
+                        Some(&bytes),
+                        config,
+                        "model endpoint returned an HTML response for a non-streaming request",
+                    ),
+                    outbound_model.clone(),
                 ));
             }
             if success_response_looks_like_error_body(&bytes) {
-                return Err(success_error_body_protocol_error(&bytes, config));
+                return Err(ExternalForwardError::new(
+                    success_error_body_protocol_error(&bytes, config),
+                    outbound_model.clone(),
+                ));
             }
             route.latency_trace.mark_upstream_header(route.started_at);
             drop(lease);
@@ -1531,19 +1607,22 @@ impl ExternalPoolManager {
             let billing = external_pool_billing_from_capture(route, pool, projected.usage_capture);
             let mut builder = Response::builder().status(status);
             apply_forwarded_response_headers(&mut builder, &response_headers, &route.request_id);
-            let response =
-                builder
-                    .body(Body::from(projected.body))
-                    .map_err(|err| ExternalPoolError {
+            let response = builder.body(Body::from(projected.body)).map_err(|err| {
+                ExternalForwardError::new(
+                    ExternalPoolError {
                         status: None,
                         message: format!("build external response failed: {}", err),
                         retryable: false,
                         auto_disable_reason: None,
                         cooldown: None,
                         response_body: None,
-                    })?;
+                    },
+                    outbound_model.clone(),
+                )
+            })?;
             Ok(ExternalForwardResponse {
                 response,
+                outbound_model,
                 billing,
                 stream_usage_capture: None,
                 stream_usage_projection: projection_context,
@@ -2137,6 +2216,18 @@ impl ExternalPoolManager {
         }
     }
 
+    fn reset_pool_auto_disable_failure_counts(&self, pool_id: u64) {
+        let redis = self.redis.clone();
+        tokio::spawn(async move {
+            for reason in EXTERNAL_POOL_AUTO_DISABLE_REASONS {
+                let key = format!("external_pool:{}:auto_disable_failures:{}", pool_id, reason);
+                if let Err(err) = redis.del(key).await {
+                    tracing::warn!(pool_id, reason, "清理外部账号自动禁用失败计数失败: {}", err);
+                }
+            }
+        });
+    }
+
     fn record_external_success(
         &self,
         route: &ExternalRouteRequest,
@@ -2144,6 +2235,7 @@ impl ExternalPoolManager {
         attempts: Vec<ExternalPoolAttempt>,
         billing: Option<ExternalPoolBilling>,
     ) {
+        self.reset_pool_auto_disable_failure_counts(pool.id);
         self.record_external(
             route,
             Some(pool),
@@ -2164,9 +2256,22 @@ impl ExternalPoolManager {
         attempts: Vec<ExternalPoolAttempt>,
         error_type: &str,
         error_message: &str,
-        diagnostics: UsageErrorDiagnostics,
+        mut diagnostics: UsageErrorDiagnostics,
     ) {
         let error_detail = format!("{}: {}", error_type, error_message);
+        if diagnostics.public_error.is_none() {
+            let status = diagnostics
+                .status_code
+                .and_then(|status| StatusCode::from_u16(status).ok())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
+            diagnostics.public_error = Some(external_public_error_from_parts(
+                status,
+                error_type,
+                false,
+                error_message,
+                &route.error_id,
+            ));
+        }
         self.record_external(
             route,
             pool,
@@ -2311,6 +2416,10 @@ impl ExternalPoolManager {
             UsageSource::RequestEstimate
         };
         let duration_ms = route.started_at.elapsed().as_millis() as u64;
+        let external_outbound_model = attempts
+            .iter()
+            .rev()
+            .find_map(|attempt| attempt.outbound_model.clone());
         route.recorder.record(UsageRecord {
             id: route.request_id.clone(),
             created_at: Utc::now().to_rfc3339(),
@@ -2318,6 +2427,7 @@ impl ExternalPoolManager {
             stream: route.payload.stream,
             model: route.payload.model.clone(),
             upstream_model: route.upstream_model.clone(),
+            external_outbound_model,
             model_resolution_source: route.model_resolution_source.clone(),
             model_resolution_note: route.model_resolution_note.clone(),
             conversation_id: crate::anthropic::converter::extract_stable_conversation_id(
@@ -2373,6 +2483,15 @@ impl ExternalPoolManager {
             error_source: error_diagnostics.source,
             error_id: error_diagnostics.error_id,
             error_metadata: error_diagnostics.metadata,
+            public_error_status_code: error_diagnostics
+                .public_error
+                .as_ref()
+                .map(|error| error.status_code),
+            public_error_type: error_diagnostics
+                .public_error
+                .as_ref()
+                .map(|error| error.error_type.clone()),
+            public_error_message: error_diagnostics.public_error.map(|error| error.message),
             payload_breakdown: route
                 .payload_breakdown
                 .as_ref()
@@ -2449,6 +2568,10 @@ impl ExternalStreamUsageGuard {
                     source: Some("external_account_stream".to_string()),
                     error_id: Some(self.route.error_id.clone()),
                     metadata: Some(json!({ "streamErrorEvent": true })),
+                    public_error: Some(external_stream_public_error(
+                        "api_error",
+                        &self.route.error_id,
+                    )),
                 },
                 None,
             );
@@ -2487,6 +2610,10 @@ impl ExternalStreamUsageGuard {
                 source: Some("external_stream".to_string()),
                 error_id: Some(self.route.error_id.clone()),
                 metadata: Some(json!({ "streamTransportError": true })),
+                public_error: Some(external_stream_public_error(
+                    "api_error",
+                    &self.route.error_id,
+                )),
             },
             None,
         );
@@ -2511,6 +2638,7 @@ impl ExternalStreamUsageGuard {
                 source: Some("downstream_client".to_string()),
                 error_id: Some(self.route.error_id.clone()),
                 metadata: None,
+                public_error: None,
             },
             None,
         );
@@ -2797,24 +2925,41 @@ fn external_pool_outbound_body(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
 ) -> Result<Bytes, ExternalPoolError> {
+    external_pool_prepare_request(route, pool).map(|prepared| prepared.body)
+}
+
+fn external_pool_prepare_request(
+    route: &ExternalRouteRequest,
+    pool: &ExternalPool,
+) -> Result<PreparedExternalRequest, ExternalPoolError> {
     let mut value = match serde_json::to_value(&route.payload) {
         Ok(value) => value,
         Err(_) => match serde_json::from_slice::<serde_json::Value>(&route.raw_body) {
             Ok(value) => value,
-            Err(_) => return Ok(route.raw_body.clone()),
+            Err(_) => {
+                return Ok(PreparedExternalRequest {
+                    body: route.raw_body.clone(),
+                    outbound_model: None,
+                });
+            }
         },
     };
 
-    if let Some(outbound_model) = external_pool_outbound_model(route, pool, &value)? {
-        if value.get("model").and_then(|model| model.as_str()) != Some(outbound_model.as_str()) {
-            value["model"] = serde_json::Value::String(outbound_model);
+    let outbound_model = external_pool_outbound_model(route, pool, &value)?;
+    if let Some(outbound_model) = outbound_model.as_deref() {
+        if value.get("model").and_then(|model| model.as_str()) != Some(outbound_model) {
+            value["model"] = serde_json::Value::String(outbound_model.to_string());
         }
     }
     normalize_external_pool_thinking_value(&mut value);
 
-    Ok(serde_json::to_vec(&value)
+    let body = serde_json::to_vec(&value)
         .map(Bytes::from)
-        .unwrap_or_else(|_| route.raw_body.clone()))
+        .unwrap_or_else(|_| route.raw_body.clone());
+    Ok(PreparedExternalRequest {
+        body,
+        outbound_model,
+    })
 }
 
 fn external_pool_outbound_model(
@@ -3130,6 +3275,40 @@ fn external_final_error_from_error(
     }
 }
 
+fn external_public_error_from_parts(
+    status: StatusCode,
+    route_error_type: &str,
+    retryable: bool,
+    message: &str,
+    error_id: &str,
+) -> UsagePublicError {
+    let final_error = ExternalPoolFinalError {
+        status,
+        response_error_type: "api_error".to_string(),
+        route_error_type: route_error_type.to_string(),
+        message: message.to_string(),
+        error_id: error_id.to_string(),
+        retryable,
+        attempts: Vec::new(),
+        pool_id: None,
+        pool_name: None,
+    };
+    final_error.public_error()
+}
+
+fn external_stream_public_error(error_type: &str, error_id: &str) -> UsagePublicError {
+    let message = match error_type {
+        "invalid_request_error" => envelope::PUBLIC_INVALID_REQUEST_MESSAGE,
+        "rate_limit_error" => envelope::PUBLIC_RATE_LIMIT_MESSAGE,
+        _ => envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE,
+    };
+    UsagePublicError {
+        status_code: StatusCode::OK.as_u16(),
+        error_type: error_type.to_string(),
+        message: envelope::public_message_with_error_id(message, error_id),
+    }
+}
+
 fn external_capacity_error(reason: PoolCapacityWaitReason) -> (&'static str, &'static str) {
     match reason {
         PoolCapacityWaitReason::Full => ("external_pool_capacity_full", "Request capacity is full"),
@@ -3232,11 +3411,21 @@ fn external_error_diagnostics(
         metadata_insert(&mut metadata, "protocolError", "unexpected_response_shape");
     }
 
+    let route_error_type = error_type_for_external_error(err);
+    let public_error = Some(external_public_error_from_parts(
+        err.status.unwrap_or(StatusCode::BAD_GATEWAY),
+        &route_error_type,
+        err.retryable,
+        &err.message,
+        &route.error_id,
+    ));
+
     UsageErrorDiagnostics {
         status_code: err.status.map(|status| status.as_u16()),
         source: Some("external_account".to_string()),
         error_id: Some(route.error_id.clone()),
         metadata: (!metadata.is_empty()).then_some(serde_json::Value::Object(metadata)),
+        public_error,
     }
 }
 
@@ -3250,6 +3439,7 @@ fn synthetic_external_error_diagnostics(
         source: Some(source.to_string()),
         error_id: Some(route.error_id.clone()),
         metadata: Some(json!({ "syntheticStatus": true })),
+        public_error: None,
     }
 }
 
@@ -3378,7 +3568,15 @@ fn classify_external_error(
             response_body: Some(body),
         };
     }
-    if status.as_u16() == 402 || lower.contains("quota") || lower.contains("insufficient credits") {
+    if status.as_u16() == 402
+        || lower.contains("quota")
+        || lower.contains("insufficient credit")
+        || lower.contains("insufficient balance")
+        || lower.contains("billing")
+        || lower.contains("payment required")
+        || lower.contains("no credit")
+        || lower.contains("not enough credit")
+    {
         return ExternalPoolError {
             status: Some(status),
             message,
@@ -4126,7 +4324,9 @@ fn build_external_usage_projection_context(
         .unwrap_or(true);
 
     let raw_input_tokens = count_external_route_input_tokens(&route.payload);
-    let (scope, profile, simulated_usage) = if prompt_cache_supported {
+    let (scope, profile, simulated_usage) = if prompt_cache_supported
+        && route.prompt_cache_simulation_mode == PromptCacheSimulationMode::HighCache
+    {
         let profile = route.prompt_cache.build_high_cache_profile_for_model(
             &route.payload,
             raw_input_tokens,
@@ -4197,6 +4397,7 @@ fn external_prompt_cache_scope(
             &route.payload,
         )?,
         model: model.to_string(),
+        route_namespace: route.prompt_cache_route_namespace.clone(),
     })
 }
 
@@ -4673,6 +4874,27 @@ mod tests {
         assert_eq!(value["request_id"], "req_gateway");
     }
 
+    #[test]
+    fn external_public_error_masks_raw_message() {
+        let public_error = external_public_error_from_parts(
+            StatusCode::BAD_GATEWAY,
+            "server_error",
+            true,
+            "provider says buy credits at https://example.invalid",
+            "req_01public",
+        );
+
+        assert_eq!(public_error.status_code, StatusCode::BAD_GATEWAY.as_u16());
+        assert_eq!(public_error.error_type, "api_error");
+        assert!(
+            public_error
+                .message
+                .contains(envelope::PUBLIC_TEMPORARY_FAILURE_MESSAGE)
+        );
+        assert!(public_error.message.contains("error ID: req_01public"));
+        assert!(!public_error.message.contains("buy credits"));
+    }
+
     #[tokio::test]
     async fn external_pool_retryable_final_error_uses_gateway_error_envelope() {
         let mut headers = HeaderMap::new();
@@ -4901,6 +5123,8 @@ mod tests {
             reported_usage: ReportedUsageConfig::default(),
             prompt_cache: Arc::new(PromptCacheTracker::default()),
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+            prompt_cache_simulation_mode: PromptCacheSimulationMode::HighCache,
+            prompt_cache_route_namespace: None,
             prompt_cache_target_read_ratio: 0.98,
             prompt_cache_token_scale: 1.6,
             prompt_cache_max_simulated_input_tokens: 300_000,
@@ -5182,6 +5406,8 @@ data: {"type":"message_delta","note":"content_block_delta"}
             reported_usage: ReportedUsageConfig::default(),
             prompt_cache: Arc::new(PromptCacheTracker::default()),
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+            prompt_cache_simulation_mode: PromptCacheSimulationMode::HighCache,
+            prompt_cache_route_namespace: None,
             prompt_cache_target_read_ratio: 0.98,
             prompt_cache_token_scale: 1.6,
             prompt_cache_max_simulated_input_tokens: 300_000,
@@ -5262,10 +5488,15 @@ data: {"type":"message_delta","note":"content_block_delta"}
 
         let pool = test_pool_with_model_dot_normalization();
         let outbound = test_external_pool_outbound_body(&route, &pool);
+        let prepared = external_pool_prepare_request(&route, &pool).unwrap();
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
         assert_eq!(value["model"], "claude-sonnet-4-5");
+        assert_eq!(
+            prepared.outbound_model.as_deref(),
+            Some("claude-sonnet-4-5")
+        );
         assert_eq!(route.payload.model, "claude-sonnet-4-5-20250929");
     }
 
@@ -5368,10 +5599,15 @@ data: {"type":"message_delta","note":"content_block_delta"}
         pool.model_mapping_rules = vec![model_rule("claude-sonnet-4-5-20250929", "custom-sonnet")];
 
         let outbound = test_external_pool_outbound_body(&route, &pool);
+        let prepared = external_pool_prepare_request(&route, &pool).unwrap();
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
         assert_eq!(value["model"], "claude-sonnet-4-5-20250929");
+        assert_eq!(
+            prepared.outbound_model.as_deref(),
+            Some("claude-sonnet-4-5-20250929")
+        );
     }
 
     #[test]
@@ -5428,10 +5664,12 @@ data: {"type":"message_delta","note":"content_block_delta"}
             vec![model_rule("claude-sonnet-4-5-20250929", "external-sonnet")];
 
         let outbound = test_external_pool_outbound_body(&route, &pool);
+        let prepared = external_pool_prepare_request(&route, &pool).unwrap();
         let value: serde_json::Value =
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
         assert_eq!(value["model"], "external-sonnet");
+        assert_eq!(prepared.outbound_model.as_deref(), Some("external-sonnet"));
     }
 
     #[test]

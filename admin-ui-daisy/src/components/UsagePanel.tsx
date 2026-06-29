@@ -11,6 +11,7 @@ import { useAutoRefreshPreference } from '@/hooks/use-auto-refresh'
 import { useCredentials } from '@/hooks/use-credentials'
 import {
   useCancelUsageCleanup,
+  useClearUsageRecords,
   usePreviewUsageCleanup,
   useRefreshUsageQueriesAfterCleanup,
   useStartUsageCleanup,
@@ -731,6 +732,7 @@ function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: () => vo
   const previewCleanup = usePreviewUsageCleanup()
   const startCleanup = useStartUsageCleanup()
   const cancelCleanup = useCancelUsageCleanup()
+  const clearRecords = useClearUsageRecords()
   const confirmDialog = useConfirm()
   useRefreshUsageQueriesAfterCleanup(cleanupStatus.data)
 
@@ -797,9 +799,36 @@ function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: () => vo
     })
   }
 
+  const clearAll = async () => {
+    const ok = await confirmDialog({
+      title: '清空所有记录',
+      message: '将清空所有用量展示记录，仅影响后台展示和查询，不影响实际计费。此操作无法撤销。',
+      confirmText: '清空全部',
+      tone: 'danger',
+    })
+    if (!ok) return
+    try {
+      await clearRecords.mutateAsync()
+      toast.success('已清空用量展示记录')
+      onClose()
+    } catch (error) {
+      toast.error(`清空失败: ${extractErrorMessage(error)}`)
+    }
+  }
+
   return (
     <ModalShell open={open} title="分批清理用量记录" width="max-w-2xl" onClose={onClose}>
       <div className="space-y-4 text-sm">
+        <div className="rounded-box border border-error/30 bg-error/5 p-3">
+          <div className="text-xs font-semibold text-error">危险操作</div>
+          <p className="mt-1 text-xs leading-5 text-base-content/60">
+            清空所有用量展示记录会删除全部历史明细，仅影响后台展示和查询，不影响实际计费，且无法撤销。
+          </p>
+          <Button type="button" variant="outline" color="error" size="sm" className="mt-3 w-full" onClick={clearAll} disabled={clearRecords.isPending || running}>
+            {clearRecords.isPending ? '清空中...' : '清空全部展示记录'}
+          </Button>
+        </div>
+
         <div className="rounded-box border border-base-300 bg-base-100 p-3 text-base-content/70">
           <span className="mr-2 inline-block h-3 w-1 rounded-full bg-warning align-[-1px]" />
           这是手动单次任务，不会定时执行。你只需要设置清理范围和每批数量，系统会自动分批清到没有更多匹配记录；后端保留 {formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批安全上限。清理只影响使用记录明细列表，已累计的顶部统计和总览统计会保留。

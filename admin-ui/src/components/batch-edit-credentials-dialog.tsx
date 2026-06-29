@@ -120,6 +120,8 @@ export function BatchEditCredentialsDialog({
   const [proxyPassword, setProxyPassword] = useState('')
   const [showProxyUsername, setShowProxyUsername] = useState(false)
   const [showProxyPassword, setShowProxyPassword] = useState(false)
+  const [updatePriority, setUpdatePriority] = useState(false)
+  const [priorityValue, setPriorityValue] = useState('')
 
   const batchUpdate = useBatchUpdateCredentials()
   const proxyResources = useProxyResources()
@@ -174,19 +176,34 @@ export function BatchEditCredentialsDialog({
     setProxyPassword('')
     setShowProxyUsername(false)
     setShowProxyPassword(false)
+    setUpdatePriority(false)
+    setPriorityValue('')
   }, [open])
 
   const submit = () => {
     if (ids.length === 0) {
-      toast.error('请先选择要修改的凭据')
+      toast.error('请先选择要修改的账号')
       return
     }
-    if (!updateRegions && !updateConcurrency && !updateRpm && !updateProxy) {
+    if (!updatePriority && !updateRegions && !updateConcurrency && !updateRpm && !updateProxy) {
       toast.error('请选择至少一组要修改的参数')
       return
     }
 
     const request: BatchUpdateCredentialsRequest = { ids }
+    if (updatePriority) {
+      try {
+        request.priority = {
+          priority: priorityValue.trim()
+            ? (parseOptionalNonNegativeInteger(priorityValue, '账号优先级') ?? 0)
+            : 0,
+        }
+      } catch (error) {
+        toast.error(extractErrorMessage(error))
+        return
+      }
+    }
+
     if (updateRegions) {
       const regions = {
         region: optionalRegionUpdate(updateRegion, regionValue),
@@ -243,7 +260,7 @@ export function BatchEditCredentialsDialog({
     batchUpdate.mutate(request, {
       onSuccess: (response) => {
         if (response.failed === 0) {
-          toast.success(`成功修改 ${response.success}/${response.total} 个凭据`)
+          toast.success(`成功修改 ${response.success}/${response.total} 个账号`)
         } else {
           toast.warning(`批量修改完成：成功 ${response.success} 个，失败 ${response.failed} 个`)
         }
@@ -258,13 +275,36 @@ export function BatchEditCredentialsDialog({
     <Dialog open={open} onOpenChange={(nextOpen) => { if (!batchUpdate.isPending) onOpenChange(nextOpen) }}>
       <DialogContent className="max-h-[85vh] max-w-3xl overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>批量修改 {ids.length} 个凭据</DialogTitle>
+          <DialogTitle>批量修改 {ids.length} 个账号</DialogTitle>
           <DialogDescription>
             只会修改已勾选的参数组；Region 字段填空并勾选保存时会清空对应账号覆盖。
           </DialogDescription>
         </DialogHeader>
 
         <div className="space-y-4">
+          <div className={`rounded-md border p-3 ${updatePriority ? 'border-primary bg-primary/5' : 'bg-muted/20'}`}>
+            <ToggleRow
+              checked={updatePriority}
+              disabled={batchUpdate.isPending}
+              label="修改账号优先级"
+              onCheckedChange={setUpdatePriority}
+            />
+            <label className="mt-3 block space-y-2">
+              <span className="text-sm font-medium">账号优先级</span>
+              <Input
+                type="number"
+                min="0"
+                value={priorityValue}
+                placeholder="留空保存为 0"
+                disabled={!updatePriority || batchUpdate.isPending}
+                onChange={(event) => setPriorityValue(event.target.value)}
+              />
+              <span className="block text-xs leading-5 text-muted-foreground">
+                数值越大优先级越高；保存为 0 表示回到默认优先级。
+              </span>
+            </label>
+          </div>
+
           <div className={`rounded-md border p-3 ${updateRegions ? 'border-primary bg-primary/5' : 'bg-muted/20'}`}>
             <ToggleRow
               checked={updateRegions}
@@ -385,7 +425,7 @@ export function BatchEditCredentialsDialog({
                   ))}
                 </select>
                 <span className="block text-xs leading-5 text-muted-foreground">
-                  选择资源会清空凭据直连代理；不选且 URL 为空会清空凭据级代理。
+                  选择资源会清空账号直连代理；不选且 URL 为空会清空账号级代理。
                 </span>
               </label>
               <label className="block space-y-2">

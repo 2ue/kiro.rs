@@ -61,7 +61,7 @@ async function verifyImportedCredential(
   try {
     await getCredentialBalance(credentialId)
   } catch (error) {
-    toast.warning(`凭据 #${credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
+    toast.warning(`账号 #${credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
   }
   return {
     model: testModelLabel(testResult.model),
@@ -137,13 +137,13 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     const result = await parseCredentialImportFiles(files)
     if (result.credentials.length > 0) {
       appendCredentialsToInput(result.credentials)
-      toast.success(`已从 ${files.length} 个文件读取 ${result.credentials.length} 条凭据`)
+      toast.success(`已从 ${files.length} 个文件读取 ${result.credentials.length} 条账号`)
     }
     if (result.errors.length > 0) {
       toast.warning(`部分文件未读取: ${result.errors.slice(0, 3).join('；')}`)
     }
     if (result.credentials.length === 0 && result.errors.length === 0) {
-      toast.error('没有读取到有效凭据')
+      toast.error('没有读取到有效账号')
     }
   }
 
@@ -162,7 +162,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     }
 
     if (credentials.length === 0) {
-      toast.error('没有可导入的凭据')
+      toast.error('没有可导入的账号')
       return
     }
 
@@ -210,7 +210,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
         const isApiKeyCred = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
 
         // 更新状态为检查中
-        setCurrentProcessing(`正在处理凭据 ${i + 1}/${credentials.length}`)
+        setCurrentProcessing(`正在处理账号 ${i + 1}/${credentials.length}`)
         setResults(prev => {
           const newResults = [...prev]
           newResults[i] = { ...newResults[i], status: 'checking' }
@@ -244,7 +244,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               newResults[i] = {
                 ...newResults[i],
                 status: 'duplicate',
-                error: '该凭据已存在',
+                error: '该账号已存在',
                 email: existingCred?.email || undefined
               }
               return newResults
@@ -277,7 +277,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               newResults[i] = {
                 ...newResults[i],
                 status: 'duplicate',
-                error: '该凭据已存在',
+                error: '该账号已存在',
                 email: existingCred?.email || undefined
               }
               return newResults
@@ -297,9 +297,9 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
         let addedCredId: number | null = null
 
         try {
-          // 添加凭据
+          // 添加账号
           if (isApiKeyCred) {
-            // API Key 凭据
+            // API Key 账号
             const addedCred = await addCredential({
               authMethod: 'api_key',
               kiroApiKey: cred.kiroApiKey?.trim(),
@@ -328,7 +328,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
             successCount++
             existingApiKeyHashes.add(credHash)
-            setCurrentProcessing(addedCred.email ? `验活成功: ${addedCred.email}` : `验活成功: 凭据 ${i + 1}`)
+            setCurrentProcessing(addedCred.email ? `验活成功: ${addedCred.email}` : `验活成功: 账号 ${i + 1}`)
             setResults(prev => {
               const newResults = [...prev]
               newResults[i] = {
@@ -345,27 +345,41 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             continue
           }
 
-          // OAuth 凭据
+          // OAuth 账号
           const token = cred.refreshToken!.trim()
           const clientId = cred.clientId?.trim() || undefined
           const clientSecret = cred.clientSecret?.trim() || undefined
-          const authMethod = cred.authMethod === 'idc' || (clientId && clientSecret) ? 'idc' : 'social'
+          const authMethod = cred.authMethod === 'external_idp'
+            ? 'external_idp'
+            : cred.authMethod === 'idc' || (clientId && clientSecret)
+              ? 'idc'
+              : 'social'
 
-          // idc 模式下必须同时提供 clientId 和 clientSecret
-          if (authMethod === 'social' && (clientId || clientSecret)) {
+          if (authMethod === 'idc' && (!clientId || !clientSecret)) {
             throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
+          }
+          if (authMethod === 'external_idp' && !clientId) {
+            throw new Error('external_idp 模式需要提供 clientId')
+          }
+          if (authMethod === 'social' && (clientId || clientSecret)) {
+            throw new Error('social 模式不应提供 clientId 或 clientSecret；企业 SSO 请设置 authMethod 为 external_idp')
           }
 
           const addedCred = await addCredential({
             refreshToken: token,
             authMethod,
+            accessToken: cred.accessToken?.trim() || undefined,
+            expiresAt: cred.expiresAt?.trim() || undefined,
             email: cred.email?.trim() || undefined,
             profileArn: cred.profileArn?.trim() || undefined,
             region: cred.region?.trim() || undefined,
             authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
             apiRegion: cred.apiRegion?.trim() || undefined,
             clientId,
-            clientSecret,
+            clientSecret: authMethod === 'idc' ? clientSecret : undefined,
+            tokenEndpoint: authMethod === 'external_idp' ? cred.tokenEndpoint?.trim() || undefined : undefined,
+            issuerUrl: authMethod === 'external_idp' ? cred.issuerUrl?.trim() || undefined : undefined,
+            scopes: authMethod === 'external_idp' ? cred.scopes?.trim() || undefined : undefined,
             priority: cred.priority || 0,
             maxConcurrentRequests: cred.maxConcurrentRequests ?? undefined,
             rpm: cred.rpm ?? undefined,
@@ -387,7 +401,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           // 验活成功
           successCount++
           existingOauthHashes.add(credHash)
-          setCurrentProcessing(addedCred.email ? `验活成功: ${addedCred.email}` : `验活成功: 凭据 ${i + 1}`)
+          setCurrentProcessing(addedCred.email ? `验活成功: ${addedCred.email}` : `验活成功: 账号 ${i + 1}`)
           setResults(prev => {
             const newResults = [...prev]
             newResults[i] = {
@@ -439,7 +453,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
       // 显示结果
       if (failCount === 0 && duplicateCount === 0) {
-        toast.success(`成功导入并验活 ${successCount} 个凭据`)
+        toast.success(`成功导入并验活 ${successCount} 个账号`)
       } else {
         const failureSummary = failCount > 0
           ? `，失败 ${failCount} 个（已排除 ${rollbackSuccessCount}，未排除 ${rollbackFailedCount}，无需排除 ${rollbackSkippedCount}）`
@@ -447,7 +461,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
         toast.info(`验活完成：成功 ${successCount} 个，重复 ${duplicateCount} 个${failureSummary}`)
 
         if (rollbackFailedCount > 0) {
-          toast.warning(`有 ${rollbackFailedCount} 个失败凭据回滚未完成，请手动禁用并删除`)
+          toast.warning(`有 ${rollbackFailedCount} 个失败账号回滚未完成，请手动禁用并删除`)
         }
       }
     } catch (error) {
@@ -465,7 +479,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
   const handleRetryFailed = async () => {
     if (failedCredentials.length === 0) {
-      toast.error('没有可重试的失败凭据')
+      toast.error('没有可重试的失败账号')
       return
     }
     await handleBatchImport(failedCredentials)
@@ -498,7 +512,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       case 'verified':
         return '验活成功'
       case 'duplicate':
-        return '重复凭据'
+        return '重复账号'
       case 'failed':
         if (result.rollbackStatus === 'success') return '验活失败（已排除）'
         if (result.rollbackStatus === 'failed') return '验活失败（未排除）'
@@ -519,14 +533,14 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     >
       <DialogContent className="sm:max-w-2xl max-h-[80vh] flex flex-col">
         <DialogHeader>
-          <DialogTitle>批量导入凭据（自动验活）</DialogTitle>
+          <DialogTitle>批量导入账号（自动验活）</DialogTitle>
         </DialogHeader>
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
           <div className="space-y-2">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <label className="text-sm font-medium">
-                JSON / JSONL 格式凭据
+                JSON / JSONL 格式账号
               </label>
               <Button type="button" variant="outline" size="sm" disabled={importing} asChild>
                 <label className="cursor-pointer">
@@ -544,14 +558,14 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               </Button>
             </div>
             <textarea
-              placeholder={'粘贴 JSON / JSONL 格式的凭据，或选择一个/多个文件\n\n每个文件可以是单个对象、数组、jsonl 多行，或导出的 { "credentials": [...] } / { "accounts": [...] }\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴 JSON / JSONL 格式的账号，或选择一个/多个文件\n\n每个文件可以是单个对象、数组、jsonl 多行，或导出的 { "credentials": [...] } / { "accounts": [...] }\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
               className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
             <p className="text-xs text-muted-foreground">
-              支持单选或多选文件。导入时自动验活，失败的凭据会被排除。
+              支持单选或多选文件。导入时自动验活，失败的账号会被排除。
             </p>
           </div>
 
@@ -578,7 +592,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               <option value="subscription_only">只查询订阅（不请求模型）</option>
             </select>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
-              只查询订阅时不会发送模型测试请求；订阅查询失败的凭据仍会按验活失败回滚。
+              只查询订阅时不会发送模型测试请求；订阅查询失败的账号仍会按验活失败回滚。
             </p>
           </div>
 
@@ -625,7 +639,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2">
                           <span className="text-sm font-medium">
-                            {result.email || `凭据 #${result.index}`}
+                            {result.email || `账号 #${result.index}`}
                           </span>
                           <span className="text-xs text-muted-foreground">
                             {getStatusText(result)}

@@ -18,7 +18,7 @@ import type {
   TestCredentialResponse,
 } from '@/types/api'
 
-type AuthMethod = 'social' | 'idc' | 'api_key'
+type AuthMethod = 'social' | 'idc' | 'external_idp' | 'api_key'
 
 function SecretInput({
   value,
@@ -62,7 +62,7 @@ function SecretInput({
   )
 }
 
-function initialCredentialForm(): Required<Pick<AddCredentialRequest, 'email' | 'refreshToken' | 'kiroApiKey' | 'profileArn' | 'region' | 'authRegion' | 'apiRegion' | 'clientId' | 'clientSecret' | 'machineId' | 'proxyUrl' | 'proxyUsername' | 'proxyPassword' | 'endpoint'>> & { authMethod: AuthMethod; priority: string; maxConcurrentRequests: string; proxyResourceId: string } {
+function initialCredentialForm(): Required<Pick<AddCredentialRequest, 'email' | 'refreshToken' | 'kiroApiKey' | 'profileArn' | 'region' | 'authRegion' | 'apiRegion' | 'clientId' | 'clientSecret' | 'tokenEndpoint' | 'issuerUrl' | 'scopes' | 'machineId' | 'proxyUrl' | 'proxyUsername' | 'proxyPassword' | 'endpoint'>> & { authMethod: AuthMethod; priority: string; maxConcurrentRequests: string; proxyResourceId: string } {
   return {
     authMethod: 'social',
     refreshToken: '',
@@ -73,6 +73,9 @@ function initialCredentialForm(): Required<Pick<AddCredentialRequest, 'email' | 
     apiRegion: '',
     clientId: '',
     clientSecret: '',
+    tokenEndpoint: '',
+    issuerUrl: '',
+    scopes: '',
     email: '',
     priority: '0',
     maxConcurrentRequests: '',
@@ -97,6 +100,9 @@ function formFromCredential(credential: AddCredentialRequest) {
     apiRegion: credential.apiRegion || '',
     clientId: credential.clientId || '',
     clientSecret: credential.clientSecret || '',
+    tokenEndpoint: credential.tokenEndpoint || '',
+    issuerUrl: credential.issuerUrl || '',
+    scopes: credential.scopes || '',
     email: credential.email || '',
     priority: String(credential.priority ?? 0),
     maxConcurrentRequests: typeof credential.maxConcurrentRequests === 'number' ? String(credential.maxConcurrentRequests) : '',
@@ -380,8 +386,11 @@ export function AddCredentialModal({
         authMethod,
         refreshToken: authMethod === 'api_key' ? '' : prev.refreshToken,
         kiroApiKey: authMethod === 'api_key' ? prev.kiroApiKey : '',
-        clientId: authMethod === 'idc' ? prev.clientId : '',
+        clientId: authMethod === 'idc' || authMethod === 'external_idp' ? prev.clientId : '',
         clientSecret: authMethod === 'idc' ? prev.clientSecret : '',
+        tokenEndpoint: authMethod === 'external_idp' ? prev.tokenEndpoint : '',
+        issuerUrl: authMethod === 'external_idp' ? prev.issuerUrl : '',
+        scopes: authMethod === 'external_idp' ? prev.scopes : '',
       }
     }
     if (key === 'region' && value.trim() && !prev.authRegion.trim()) {
@@ -417,6 +426,9 @@ export function AddCredentialModal({
     if (form.authMethod === 'idc' && (!form.clientId.trim() || !form.clientSecret.trim())) {
       return toast.error('IdC/Builder-ID/IAM 认证需要填写 Client ID 和 Client Secret')
     }
+    if (form.authMethod === 'external_idp' && !form.clientId.trim()) {
+      return toast.error('External IdP 认证需要填写 Client ID')
+    }
     const priority = Number(form.priority)
     if (!Number.isInteger(priority) || priority < 0) return toast.error('优先级必须是非负整数')
     let maxConcurrentRequests: number | undefined
@@ -436,7 +448,10 @@ export function AddCredentialModal({
         authRegion: form.authRegion.trim() || undefined,
         apiRegion: form.apiRegion.trim() || undefined,
         clientId: isApiKey ? undefined : form.clientId.trim() || undefined,
-        clientSecret: isApiKey ? undefined : form.clientSecret.trim() || undefined,
+        clientSecret: form.authMethod === 'idc' ? form.clientSecret.trim() || undefined : undefined,
+        tokenEndpoint: form.authMethod === 'external_idp' ? form.tokenEndpoint.trim() || undefined : undefined,
+        issuerUrl: form.authMethod === 'external_idp' ? form.issuerUrl.trim() || undefined : undefined,
+        scopes: form.authMethod === 'external_idp' ? form.scopes.trim() || undefined : undefined,
         email: form.email.trim() || undefined,
         priority,
         maxConcurrentRequests,
@@ -472,6 +487,7 @@ export function AddCredentialModal({
             <Select bordered size="sm" value={form.authMethod} onChange={(event) => update('authMethod', event.target.value)}>
               <Select.Option value="social">Social</Select.Option>
               <Select.Option value="idc">IdC/Builder-ID/IAM</Select.Option>
+              <Select.Option value="external_idp">External IdP</Select.Option>
               <Select.Option value="api_key">API Key</Select.Option>
             </Select>
           </FieldLabel>
@@ -494,6 +510,22 @@ export function AddCredentialModal({
               </FieldLabel>
               <FieldLabel title="Client Secret">
                 <Input bordered size="sm" type="password" value={form.clientSecret} onChange={(event) => update('clientSecret', event.target.value)} />
+              </FieldLabel>
+            </>
+          )}
+          {form.authMethod === 'external_idp' && (
+            <>
+              <FieldLabel title="Client ID">
+                <Input bordered size="sm" value={form.clientId} onChange={(event) => update('clientId', event.target.value)} />
+              </FieldLabel>
+              <FieldLabel title="Token Endpoint">
+                <Input bordered size="sm" className="font-mono" value={form.tokenEndpoint} onChange={(event) => update('tokenEndpoint', event.target.value)} placeholder="https://.../oauth2/v2.0/token" />
+              </FieldLabel>
+              <FieldLabel title="Issuer URL">
+                <Input bordered size="sm" className="font-mono" value={form.issuerUrl} onChange={(event) => update('issuerUrl', event.target.value)} placeholder="https://..." />
+              </FieldLabel>
+              <FieldLabel title="Scopes">
+                <Input bordered size="sm" className="font-mono" value={form.scopes} onChange={(event) => update('scopes', event.target.value)} placeholder="offline_access ..." />
               </FieldLabel>
             </>
           )}
@@ -883,22 +915,36 @@ export function BatchImportModal({
       try {
         const clientId = cred.clientId?.trim() || undefined
         const clientSecret = cred.clientSecret?.trim() || undefined
-        const authMethod = isApiKeyCred ? 'api_key' : cred.authMethod === 'idc' || (clientId && clientSecret) ? 'idc' : 'social'
-        if (authMethod === 'social' && (clientId || clientSecret)) throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
+        const authMethod = isApiKeyCred
+          ? 'api_key'
+          : cred.authMethod === 'external_idp'
+            ? 'external_idp'
+            : cred.authMethod === 'idc' || (clientId && clientSecret)
+              ? 'idc'
+              : 'social'
+        if (authMethod === 'idc' && (!clientId || !clientSecret)) throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
+        if (authMethod === 'external_idp' && !clientId) throw new Error('external_idp 模式需要提供 clientId')
+        if (authMethod === 'social' && (clientId || clientSecret)) throw new Error('social 模式不应提供 clientId 或 clientSecret；企业 SSO 请设置 authMethod 为 external_idp')
 
         const added = await addCredential({
           authMethod,
           kiroApiKey: isApiKeyCred ? cred.kiroApiKey?.trim() : undefined,
           refreshToken: isApiKeyCred ? undefined : cred.refreshToken?.trim(),
+          accessToken: isApiKeyCred ? undefined : cred.accessToken?.trim() || undefined,
+          expiresAt: isApiKeyCred ? undefined : cred.expiresAt?.trim() || undefined,
           email: cred.email?.trim() || undefined,
           profileArn: cred.profileArn?.trim() || undefined,
           priority: cred.priority || 0,
           maxConcurrentRequests: cred.maxConcurrentRequests ?? undefined,
+          rpm: cred.rpm ?? undefined,
           region: cred.region?.trim() || undefined,
           authRegion: cred.authRegion?.trim() || undefined,
           apiRegion: cred.apiRegion?.trim() || undefined,
           clientId: isApiKeyCred ? undefined : clientId,
-          clientSecret: isApiKeyCred ? undefined : clientSecret,
+          clientSecret: authMethod === 'idc' ? clientSecret : undefined,
+          tokenEndpoint: authMethod === 'external_idp' ? cred.tokenEndpoint?.trim() || undefined : undefined,
+          issuerUrl: authMethod === 'external_idp' ? cred.issuerUrl?.trim() || undefined : undefined,
+          scopes: authMethod === 'external_idp' ? cred.scopes?.trim() || undefined : undefined,
           machineId: cred.machineId?.trim() || undefined,
           proxyUrl: cred.proxyUrl?.trim() || undefined,
           proxyUsername: cred.proxyUsername?.trim() || undefined,
@@ -1127,19 +1173,31 @@ export function KamImportModal({
       try {
         const clientId = account.credentials.clientId?.trim() || undefined
         const clientSecret = account.credentials.clientSecret?.trim() || undefined
-        const authMethod = clientId && clientSecret ? 'idc' : 'social'
-        if (authMethod === 'social' && (clientId || clientSecret)) throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
+        const rawAuthMethod = account.credentials.authMethod?.trim().toLowerCase().replace(/[^a-z0-9]/g, '')
+        const authMethod = rawAuthMethod === 'externalidp' || rawAuthMethod === 'enterprise' || rawAuthMethod === 'iamsso' || rawAuthMethod === 'awsidc'
+          ? 'external_idp'
+          : rawAuthMethod === 'idc' || rawAuthMethod === 'builderid' || rawAuthMethod === 'iam' || (clientId && clientSecret)
+            ? 'idc'
+            : 'social'
+        if (authMethod === 'idc' && (!clientId || !clientSecret)) throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
+        if (authMethod === 'external_idp' && !clientId) throw new Error('external_idp 模式需要提供 clientId')
+        if (authMethod === 'social' && (clientId || clientSecret)) throw new Error('social 模式不应提供 clientId 或 clientSecret；企业 SSO 请设置 authMethod 为 external_idp')
         const accountRegion = account.credentials.region?.trim() || undefined
         const baseCredential: AddCredentialRequest = {
           refreshToken: token,
           authMethod,
+          accessToken: account.credentials.accessToken?.trim() || undefined,
+          expiresAt: account.credentials.expiresAt?.trim() || undefined,
           email: account.email?.trim() || undefined,
           profileArn: account.credentials.profileArn?.trim() || undefined,
           region: accountRegion,
           authRegion: optionalTrimmed(defaults.authRegion) || accountRegion,
           apiRegion: account.credentials.apiRegion?.trim() || undefined,
           clientId,
-          clientSecret,
+          clientSecret: authMethod === 'idc' ? clientSecret : undefined,
+          tokenEndpoint: authMethod === 'external_idp' ? account.credentials.tokenEndpoint?.trim() || undefined : undefined,
+          issuerUrl: authMethod === 'external_idp' ? account.credentials.issuerUrl?.trim() || undefined : undefined,
+          scopes: authMethod === 'external_idp' ? account.credentials.scopes?.trim() || undefined : undefined,
           machineId: account.machineId?.trim() || undefined,
         }
         const added = await addCredential(mergeCredentialDefaults(baseCredential, { ...defaults, authRegion: '' }))
@@ -1283,8 +1341,12 @@ export function BatchEditCredentialsModal({
   const [regionValue, setRegionValue] = useState('')
   const [authRegionValue, setAuthRegionValue] = useState('')
   const [apiRegionValue, setApiRegionValue] = useState('')
+  const [updatePriority, setUpdatePriority] = useState(false)
+  const [priorityValue, setPriorityValue] = useState('')
   const [updateConcurrency, setUpdateConcurrency] = useState(false)
   const [concurrencyValue, setConcurrencyValue] = useState('')
+  const [updateRpm, setUpdateRpm] = useState(false)
+  const [rpmValue, setRpmValue] = useState('')
   const [updateProxy, setUpdateProxy] = useState(false)
   const [proxyResourceId, setProxyResourceId] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
@@ -1334,8 +1396,12 @@ export function BatchEditCredentialsModal({
       setRegionValue('')
       setAuthRegionValue('')
       setApiRegionValue('')
+      setUpdatePriority(false)
+      setPriorityValue('')
       setUpdateConcurrency(false)
       setConcurrencyValue('')
+      setUpdateRpm(false)
+      setRpmValue('')
       setUpdateProxy(false)
       setProxyResourceId('')
       setProxyUrl('')
@@ -1348,9 +1414,19 @@ export function BatchEditCredentialsModal({
 
   const submit = () => {
     if (!ids.length) return toast.error('请先选择要修改的账号')
-    if (!updateRegions && !updateConcurrency && !updateProxy) return toast.error('请选择至少一组要修改的参数')
+    if (!updatePriority && !updateRegions && !updateConcurrency && !updateRpm && !updateProxy) return toast.error('请选择至少一组要修改的参数')
 
     const request: BatchUpdateCredentialsRequest = { ids }
+    if (updatePriority) {
+      try {
+        request.priority = {
+          priority: priorityValue.trim() ? parseOptionalNonNegativeInteger(priorityValue, '账号优先级') ?? 0 : 0,
+        }
+      } catch (error) {
+        return toast.error(extractErrorMessage(error))
+      }
+    }
+
     if (updateRegions) {
       const regions = {
         region: optionalRegionUpdate(updateRegion, regionValue),
@@ -1367,6 +1443,16 @@ export function BatchEditCredentialsModal({
       try {
         request.concurrency = {
           maxConcurrentRequests: concurrencyValue.trim() ? parseOptionalNonNegativeInteger(concurrencyValue, '账号并发覆盖') : null,
+        }
+      } catch (error) {
+        return toast.error(extractErrorMessage(error))
+      }
+    }
+
+    if (updateRpm) {
+      try {
+        request.rpm = {
+          rpm: rpmValue.trim() ? parseOptionalNonNegativeInteger(rpmValue, '账号 RPM 覆盖') : null,
         }
       } catch (error) {
         return toast.error(extractErrorMessage(error))
@@ -1397,6 +1483,16 @@ export function BatchEditCredentialsModal({
   return (
     <ModalShell open={open} title={`批量修改 ${ids.length} 个账号`} width="max-w-3xl" onClose={() => { if (!batchUpdate.isPending) onClose() }}>
       <div className="space-y-4">
+        <div className={`rounded-lg border p-3 ${updatePriority ? 'border-primary/40 bg-primary/5' : 'border-base-300 bg-base-200/40'}`}>
+          <Form.Label className="mb-3 flex w-fit cursor-pointer items-center gap-2">
+            <Checkbox size="sm" checked={updatePriority} disabled={batchUpdate.isPending} onChange={(event) => setUpdatePriority(event.target.checked)} />
+            <span className="text-sm font-semibold">修改账号优先级</span>
+          </Form.Label>
+          <FieldLabel title="账号优先级" description="留空保存为 0；数值越大优先级越高。">
+            <Input bordered size="sm" type="number" min={0} value={priorityValue} disabled={!updatePriority || batchUpdate.isPending} onChange={(event) => setPriorityValue(event.target.value)} />
+          </FieldLabel>
+        </div>
+
         <div className={`rounded-lg border p-3 ${updateRegions ? 'border-primary/40 bg-primary/5' : 'border-base-300 bg-base-200/40'}`}>
           <Form.Label className="mb-3 flex w-fit cursor-pointer items-center gap-2">
             <Checkbox size="sm" checked={updateRegions} disabled={batchUpdate.isPending} onChange={(event) => setRegionsEnabled(event.target.checked)} />
@@ -1440,6 +1536,16 @@ export function BatchEditCredentialsModal({
           </Form.Label>
           <FieldLabel title="账号级最大并发" description="留空改为继承全局，0 表示不限并发">
             <Input bordered size="sm" type="number" min={0} value={concurrencyValue} disabled={!updateConcurrency || batchUpdate.isPending} onChange={(event) => setConcurrencyValue(event.target.value)} />
+          </FieldLabel>
+        </div>
+
+        <div className={`rounded-lg border p-3 ${updateRpm ? 'border-primary/40 bg-primary/5' : 'border-base-300 bg-base-200/40'}`}>
+          <Form.Label className="mb-3 flex w-fit cursor-pointer items-center gap-2">
+            <Checkbox size="sm" checked={updateRpm} disabled={batchUpdate.isPending} onChange={(event) => setUpdateRpm(event.target.checked)} />
+            <span className="text-sm font-semibold">修改账号 RPM 覆盖</span>
+          </Form.Label>
+          <FieldLabel title="账号级 RPM" description="留空改为继承全局，0 表示不限频率。">
+            <Input bordered size="sm" type="number" min={0} value={rpmValue} disabled={!updateRpm || batchUpdate.isPending} onChange={(event) => setRpmValue(event.target.value)} />
           </FieldLabel>
         </div>
 

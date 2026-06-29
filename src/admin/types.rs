@@ -4,10 +4,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::anthropic::pricing::ModelPricing;
 use crate::model::config::{
-    CompatProfile, CompressionConfig, ExternalPoolsConfig, KiroAgentModeStrategy,
-    ModelMappingConfig, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
-    PayloadShapingConfigPatch, PromptCacheCreationControlConfig, ReportedUsageConfig,
-    ThinkingTriggerMode,
+    CachePolicyConfig, CompatProfile, CompressionConfig, ExternalPoolsConfig,
+    KiroAgentModeStrategy, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
+    PayloadShapingConfig, PayloadShapingConfigPatch, PromptCacheCreationControlConfig,
+    ReportedUsageConfig, ThinkingTriggerMode,
 };
 
 // ============ 凭据状态 ============
@@ -476,7 +476,7 @@ pub struct SetDisabledRequest {
 }
 
 /// 修改优先级请求
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetPriorityRequest {
     /// 新优先级值
@@ -979,6 +979,8 @@ pub struct SetCredentialProxyRequest {
 pub struct BatchUpdateCredentialsRequest {
     pub ids: Vec<u64>,
     #[serde(default)]
+    pub priority: Option<SetPriorityRequest>,
+    #[serde(default)]
     pub regions: Option<SetCredentialRegionsRequest>,
     #[serde(default)]
     pub concurrency: Option<SetCredentialConcurrencyRequest>,
@@ -1356,6 +1358,7 @@ pub struct RuntimeConfigResponse {
     pub prompt_cache_entry_ttl_secs: u64,
     pub prompt_cache_estimated_bytes_limit: u64,
     pub reported_usage: ReportedUsageConfig,
+    pub cache_policy: CachePolicyConfig,
     pub defined_cache_routes: Vec<String>,
     pub external_pools: ExternalPoolsConfig,
     pub high_cache_threshold: i32,
@@ -1482,6 +1485,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub prompt_cache_estimated_bytes_limit: Option<u64>,
     #[serde(default)]
     pub reported_usage: Option<ReportedUsageConfig>,
+    #[serde(default)]
+    pub cache_policy: Option<CachePolicyConfig>,
     #[serde(default)]
     pub defined_cache_routes: Option<Vec<String>>,
     #[serde(default)]
@@ -1761,5 +1766,24 @@ mod tests {
         assert_eq!(req.api_region.as_deref(), Some("eu-west-1"));
         assert_eq!(req.machine_id.as_deref(), Some("fake-machine-id"));
         assert_eq!(req.max_concurrent_requests, Some(3));
+    }
+
+    #[test]
+    fn batch_update_credentials_request_accepts_priority_and_clear_overrides() {
+        let json = serde_json::json!({
+            "ids": [1, 2, 2],
+            "priority": { "priority": 0 },
+            "concurrency": { "maxConcurrentRequests": null },
+            "rpm": { "rpm": null }
+        });
+
+        let req: BatchUpdateCredentialsRequest = serde_json::from_value(json).unwrap();
+
+        assert_eq!(req.ids, vec![1, 2, 2]);
+        assert_eq!(req.priority.unwrap().priority, 0);
+        assert_eq!(req.concurrency.unwrap().max_concurrent_requests, None);
+        assert_eq!(req.rpm.unwrap().rpm, None);
+        assert!(req.regions.is_none());
+        assert!(req.proxy.is_none());
     }
 }

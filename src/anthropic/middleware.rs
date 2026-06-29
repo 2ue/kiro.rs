@@ -15,9 +15,9 @@ use crate::common::auth::RequestApiKeyStore;
 use crate::external_pool::ExternalPoolManager;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
-    CompatProfile, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
-    PromptCacheCreationControlConfig, PromptCacheSimulationMode, ReportedUsageConfig,
-    ThinkingTriggerMode, normalize_defined_cache_routes,
+    CachePolicyConfig, CompatProfile, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
+    PayloadShapingConfig, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
+    ReportedUsageConfig, ThinkingTriggerMode, normalize_defined_cache_routes,
 };
 
 use super::{
@@ -26,6 +26,7 @@ use super::{
     pricing::PricingCatalog,
     prompt_cache::{PromptCacheBounds, PromptCacheTracker},
     prompt_cache_creation_control::PromptCacheCreationController,
+    tool_format_debug::ToolFormatDebugRecorder,
     usage::UsageRecorder,
 };
 
@@ -43,6 +44,8 @@ pub struct AppState {
     pub thinking_trigger_mode: ThinkingTriggerMode,
     /// 请求级 usage 记录器
     pub usage_recorder: Arc<UsageRecorder>,
+    /// tool-use 格式错误内部诊断写盘器。关闭时为 no-op。
+    pub tool_format_debug_recorder: Arc<ToolFormatDebugRecorder>,
     /// 模型价格目录。仅用于统计计价，失败不影响请求。
     pub pricing_catalog: Arc<PricingCatalog>,
     /// 模型能力目录。仅用于 /models 和后台观测，失败不影响请求调度。
@@ -71,6 +74,8 @@ pub struct AppState {
     pub prompt_cache_bounds: PromptCacheBounds,
     /// 下游 usage 上报投影配置
     pub reported_usage: ReportedUsageConfig,
+    /// 路径级缓存策略覆盖
+    pub cache_policy: CachePolicyConfig,
     /// 已定义的 /dfcache/{name} 自定义 high-cache 路由。
     pub defined_cache_routes: Vec<String>,
     /// Anthropic compatibility profile
@@ -126,6 +131,7 @@ impl AppState {
             extract_thinking,
             thinking_trigger_mode: ThinkingTriggerMode::RealRequest,
             usage_recorder,
+            tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
             prompt_cache,
@@ -140,6 +146,7 @@ impl AppState {
             prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
             prompt_cache_bounds: PromptCacheBounds::default(),
             reported_usage: ReportedUsageConfig::default(),
+            cache_policy: CachePolicyConfig::default(),
             defined_cache_routes: Vec::new(),
             compat_profile,
             model_resolution_mode: ModelResolutionMode::Compatible,
@@ -199,6 +206,14 @@ impl AppState {
         self
     }
 
+    pub fn with_tool_format_debug_recorder(
+        mut self,
+        recorder: Arc<ToolFormatDebugRecorder>,
+    ) -> Self {
+        self.tool_format_debug_recorder = recorder;
+        self
+    }
+
     pub fn with_model_capabilities(
         mut self,
         model_capabilities: Arc<ModelCapabilitiesCatalog>,
@@ -209,6 +224,11 @@ impl AppState {
 
     pub fn with_reported_usage(mut self, reported_usage: ReportedUsageConfig) -> Self {
         self.reported_usage = reported_usage.normalized();
+        self
+    }
+
+    pub fn with_cache_policy(mut self, cache_policy: CachePolicyConfig) -> Self {
+        self.cache_policy = cache_policy.normalized();
         self
     }
 

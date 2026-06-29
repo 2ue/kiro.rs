@@ -427,6 +427,7 @@ async fn main() {
             config.prompt_cache_estimated_bytes_limit,
         ),
         config.reported_usage.clone(),
+        config.cache_policy.clone(),
         config.defined_cache_routes.clone(),
         config.compat_profile,
         config.thinking_trigger_mode,
@@ -444,6 +445,7 @@ async fn main() {
         config.kiro_cache_point_record_plan,
         config.kiro_upstream_stream_idle_timeout_secs,
         config.payload_shaping,
+        config.tool_format_debug.clone(),
         Some(external_pool_manager.clone()),
     );
 

@@ -67,6 +67,8 @@ pub struct ExternalPoolAttempt {
     pub pool_id: u64,
     pub pool_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
     pub action: String,
     pub duration_ms: u64,
@@ -236,6 +238,14 @@ impl UsageLatencyTrace {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsagePublicError {
+    pub status_code: u16,
+    pub error_type: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageRecord {
@@ -246,6 +256,8 @@ pub struct UsageRecord {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_outbound_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_resolution_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -324,6 +336,12 @@ pub struct UsageRecord {
     pub error_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_metadata: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_error_status_code: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_error_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_error_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_breakdown: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -822,6 +840,7 @@ fn normalize_error_diagnostics(mut record: UsageRecord) -> UsageRecord {
         && record.error_message.is_none()
         && record.error_detail.is_none()
         && record.error_metadata.is_none()
+        && record.public_error_message.is_none()
     {
         return record;
     }
@@ -830,12 +849,18 @@ fn normalize_error_diagnostics(mut record: UsageRecord) -> UsageRecord {
         truncate_error_text(record.error_message.take(), ERROR_DIAGNOSTIC_MAX_TEXT_BYTES);
     let (error_detail, detail_truncated) =
         truncate_error_text(record.error_detail.take(), ERROR_DIAGNOSTIC_MAX_TEXT_BYTES);
+    let (public_error_message, public_message_truncated) = truncate_error_text(
+        record.public_error_message.take(),
+        ERROR_DIAGNOSTIC_MAX_TEXT_BYTES,
+    );
     record.error_message = error_message;
     record.error_detail = error_detail;
+    record.public_error_message = public_error_message;
     record.error_metadata = sanitize_error_metadata(
         record.error_metadata.take(),
         message_truncated,
         detail_truncated,
+        public_message_truncated,
         ERROR_DIAGNOSTIC_MAX_METADATA_BYTES,
     );
     record
@@ -862,9 +887,10 @@ fn sanitize_error_metadata(
     value: Option<Value>,
     message_truncated: bool,
     detail_truncated: bool,
+    public_message_truncated: bool,
     max_bytes: usize,
 ) -> Option<Value> {
-    if value.is_none() && !message_truncated && !detail_truncated {
+    if value.is_none() && !message_truncated && !detail_truncated && !public_message_truncated {
         return None;
     }
     let mut value = value.unwrap_or_else(|| Value::Object(Map::new()));
@@ -888,11 +914,12 @@ fn sanitize_error_metadata(
         final_bytes = serialized_len(&value);
     }
 
-    if message_truncated || detail_truncated || metadata_truncated {
+    if message_truncated || detail_truncated || public_message_truncated || metadata_truncated {
         ensure_metadata_object_flags(
             &mut value,
             message_truncated,
             detail_truncated,
+            public_message_truncated,
             metadata_truncated,
             original_bytes,
             final_bytes,
@@ -985,6 +1012,7 @@ fn ensure_metadata_object_flags(
     value: &mut Value,
     message_truncated: bool,
     detail_truncated: bool,
+    public_message_truncated: bool,
     metadata_truncated: bool,
     original_bytes: usize,
     final_bytes: usize,
@@ -1003,6 +1031,9 @@ fn ensure_metadata_object_flags(
     }
     if detail_truncated {
         map.insert("detailTruncated".to_string(), Value::Bool(true));
+    }
+    if public_message_truncated {
+        map.insert("publicMessageTruncated".to_string(), Value::Bool(true));
     }
     if metadata_truncated {
         map.insert("metadataTruncated".to_string(), Value::Bool(true));
@@ -1697,7 +1728,10 @@ fn record_matches(record: &UsageRecord, query: &UsageRecordQuery) -> bool {
         }
     }
     if let Some(model) = &query.model {
-        if &record.model != model && record.upstream_model.as_ref() != Some(model) {
+        if &record.model != model
+            && record.upstream_model.as_ref() != Some(model)
+            && record.external_outbound_model.as_ref() != Some(model)
+        {
             return false;
         }
     }
@@ -1759,6 +1793,7 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
         Some(record.endpoint.as_str()),
         Some(record.model.as_str()),
         record.upstream_model.as_deref(),
+        record.external_outbound_model.as_deref(),
         record.model_resolution_source.as_deref(),
         record.model_resolution_note.as_deref(),
         record.conversation_id.as_deref(),
@@ -1837,6 +1872,7 @@ mod tests {
             stream: true,
             model: "claude-sonnet-4-5".to_string(),
             upstream_model: None,
+            external_outbound_model: None,
             model_resolution_source: None,
             model_resolution_note: None,
             conversation_id: Some("session-a".to_string()),
@@ -1882,6 +1918,9 @@ mod tests {
             error_source: None,
             error_id: None,
             error_metadata: None,
+            public_error_status_code: None,
+            public_error_type: None,
+            public_error_message: None,
             payload_breakdown: None,
             payload_guard_report: None,
         }
@@ -1899,6 +1938,9 @@ mod tests {
         object.remove("errorSource");
         object.remove("errorId");
         object.remove("errorMetadata");
+        object.remove("publicErrorStatusCode");
+        object.remove("publicErrorType");
+        object.remove("publicErrorMessage");
 
         let decoded: UsageRecord = serde_json::from_value(value).unwrap();
 
@@ -1906,6 +1948,9 @@ mod tests {
         assert_eq!(decoded.error_source, None);
         assert_eq!(decoded.error_id, None);
         assert_eq!(decoded.error_metadata, None);
+        assert_eq!(decoded.public_error_status_code, None);
+        assert_eq!(decoded.public_error_type, None);
+        assert_eq!(decoded.public_error_message, None);
     }
 
     #[test]
@@ -1969,6 +2014,7 @@ mod tests {
         usage.status = UsageRecordStatus::Error;
         usage.error_message = Some("x".repeat(ERROR_DIAGNOSTIC_MAX_TEXT_BYTES + 128));
         usage.error_detail = Some("y".repeat(ERROR_DIAGNOSTIC_MAX_TEXT_BYTES + 128));
+        usage.public_error_message = Some("p".repeat(ERROR_DIAGNOSTIC_MAX_TEXT_BYTES + 128));
         usage.error_metadata = Some(json!({
             "large": "z".repeat(ERROR_DIAGNOSTIC_MAX_METADATA_BYTES + 1024),
             "items": (0..64).map(|idx| json!({
@@ -1989,11 +2035,16 @@ mod tests {
             record.error_detail.as_ref().unwrap().len()
                 <= ERROR_DIAGNOSTIC_MAX_TEXT_BYTES + "...".len()
         );
+        assert!(
+            record.public_error_message.as_ref().unwrap().len()
+                <= ERROR_DIAGNOSTIC_MAX_TEXT_BYTES + "...".len()
+        );
         let metadata = record.error_metadata.as_ref().unwrap();
         let metadata_len = serde_json::to_vec(metadata).unwrap().len();
         assert!(metadata_len <= ERROR_DIAGNOSTIC_MAX_METADATA_BYTES);
         assert_eq!(metadata["messageTruncated"], true);
         assert_eq!(metadata["detailTruncated"], true);
+        assert_eq!(metadata["publicMessageTruncated"], true);
         assert_eq!(metadata["metadataTruncated"], true);
         assert!(metadata.get("originalMetadataBytes").is_some());
         assert!(

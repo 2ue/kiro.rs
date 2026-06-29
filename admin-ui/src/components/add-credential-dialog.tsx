@@ -19,7 +19,7 @@ interface AddCredentialDialogProps {
   onOpenChange: (open: boolean) => void
 }
 
-type AuthMethod = 'social' | 'idc' | 'api_key'
+type AuthMethod = 'social' | 'idc' | 'external_idp' | 'api_key'
 
 function SecretInput({
   value,
@@ -71,6 +71,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [apiRegion, setApiRegion] = useState('')
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
+  const [tokenEndpoint, setTokenEndpoint] = useState('')
+  const [issuerUrl, setIssuerUrl] = useState('')
+  const [scopes, setScopes] = useState('')
   const [email, setEmail] = useState('')
   const [priority, setPriority] = useState('0')
   const [maxConcurrentRequests, setMaxConcurrentRequests] = useState('')
@@ -98,6 +101,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setApiRegion('')
     setClientId('')
     setClientSecret('')
+    setTokenEndpoint('')
+    setIssuerUrl('')
+    setScopes('')
     setEmail('')
     setPriority('0')
     setMaxConcurrentRequests('')
@@ -115,7 +121,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const isApiKey = authMethod === 'api_key'
 
   const fillFromCredential = (credential: {
-    authMethod?: 'social' | 'idc' | 'api_key'
+    authMethod?: AuthMethod
     refreshToken?: string
     kiroApiKey?: string
     profileArn?: string
@@ -124,6 +130,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     apiRegion?: string
     clientId?: string
     clientSecret?: string
+    tokenEndpoint?: string
+    issuerUrl?: string
+    scopes?: string
     email?: string
     priority?: number
     maxConcurrentRequests?: number | null
@@ -144,6 +153,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setApiRegion(credential.apiRegion || '')
     setClientId(credential.clientId || '')
     setClientSecret(credential.clientSecret || '')
+    setTokenEndpoint(credential.tokenEndpoint || '')
+    setIssuerUrl(credential.issuerUrl || '')
+    setScopes(credential.scopes || '')
     setEmail(credential.email || '')
     setPriority(String(credential.priority ?? 0))
     setMaxConcurrentRequests(typeof credential.maxConcurrentRequests === 'number' ? String(credential.maxConcurrentRequests) : '')
@@ -171,11 +183,23 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       setRefreshToken('')
       setClientId('')
       setClientSecret('')
+      setTokenEndpoint('')
+      setIssuerUrl('')
+      setScopes('')
       return
     }
     setKiroApiKey('')
-    if (nextAuthMethod !== 'idc') {
+    if (nextAuthMethod === 'social') {
       setClientId('')
+      setClientSecret('')
+      setTokenEndpoint('')
+      setIssuerUrl('')
+      setScopes('')
+    } else if (nextAuthMethod === 'idc') {
+      setTokenEndpoint('')
+      setIssuerUrl('')
+      setScopes('')
+    } else if (nextAuthMethod === 'external_idp') {
       setClientSecret('')
     }
   }
@@ -244,6 +268,10 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         toast.error('IdC/Builder-ID/IAM 认证需要填写 Client ID 和 Client Secret')
         return
       }
+      if (authMethod === 'external_idp' && !clientId.trim()) {
+        toast.error('External IdP 认证需要填写 Client ID')
+        return
+      }
     }
 
     const parsedPriority = Number(priority)
@@ -287,7 +315,10 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         authRegion: authRegion.trim() || undefined,
         apiRegion: apiRegion.trim() || undefined,
         clientId: isApiKey ? undefined : clientId.trim() || undefined,
-        clientSecret: isApiKey ? undefined : clientSecret.trim() || undefined,
+        clientSecret: authMethod === 'idc' ? clientSecret.trim() || undefined : undefined,
+        tokenEndpoint: authMethod === 'external_idp' ? tokenEndpoint.trim() || undefined : undefined,
+        issuerUrl: authMethod === 'external_idp' ? issuerUrl.trim() || undefined : undefined,
+        scopes: authMethod === 'external_idp' ? scopes.trim() || undefined : undefined,
         email: email.trim() || undefined,
         priority: parsedPriority,
         maxConcurrentRequests: parsedMaxConcurrentRequests,
@@ -349,6 +380,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               >
                 <option value="social">Social</option>
                 <option value="idc">IdC/Builder-ID/IAM</option>
+                <option value="external_idp">External IdP</option>
                 <option value="api_key">API Key</option>
               </select>
             </div>
@@ -468,6 +500,62 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     value={clientSecret}
                     onChange={(e) => setClientSecret(e.target.value)}
                     disabled={isPending}
+                  />
+                </div>
+              </>
+            )}
+
+            {authMethod === 'external_idp' && (
+              <>
+                <div className="space-y-2">
+                  <label htmlFor="externalClientId" className="text-sm font-medium">
+                    Client ID <span className="text-red-500">*</span>
+                  </label>
+                  <Input
+                    id="externalClientId"
+                    placeholder="请输入 Client ID"
+                    value={clientId}
+                    onChange={(e) => setClientId(e.target.value)}
+                    disabled={isPending}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="tokenEndpoint" className="text-sm font-medium">
+                    Token Endpoint
+                  </label>
+                  <Input
+                    id="tokenEndpoint"
+                    placeholder="https://.../oauth2/v2.0/token"
+                    value={tokenEndpoint}
+                    onChange={(e) => setTokenEndpoint(e.target.value)}
+                    disabled={isPending}
+                    className="font-mono"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="issuerUrl" className="text-sm font-medium">
+                    Issuer URL
+                  </label>
+                  <Input
+                    id="issuerUrl"
+                    placeholder="https://..."
+                    value={issuerUrl}
+                    onChange={(e) => setIssuerUrl(e.target.value)}
+                    disabled={isPending}
+                    className="font-mono"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="scopes" className="text-sm font-medium">
+                    Scopes
+                  </label>
+                  <Input
+                    id="scopes"
+                    placeholder="offline_access ..."
+                    value={scopes}
+                    onChange={(e) => setScopes(e.target.value)}
+                    disabled={isPending}
+                    className="font-mono"
                   />
                 </div>
               </>

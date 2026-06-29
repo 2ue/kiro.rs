@@ -13,10 +13,12 @@ use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::model::config::{
-    CompatProfile, Config, ExternalPoolsConfig, ModelMappingConfig, ModelResolutionMode,
-    PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
-    PromptCacheSimulationMode, ReportedUsageConfig, ThinkingTriggerMode,
-    normalize_defined_cache_route, normalize_defined_cache_routes,
+    CacheBoundsPolicy, CachePointPolicy, CachePolicyConfig, CacheRoutePolicy,
+    CacheSimulationPolicy, CompatProfile, Config, ExternalPoolsConfig, ModelMappingConfig,
+    ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
+    PromptCacheSimulationMode, ReportedUsageConfig, ReportedUsagePathPolicy,
+    ResolvedCacheRoutePolicy, ThinkingTriggerMode, normalize_defined_cache_route,
+    normalize_defined_cache_routes, resolve_cache_policy_for_path,
 };
 use crate::token;
 use anyhow::Error;
@@ -55,13 +57,15 @@ use super::payload_guard::{
 };
 use super::prompt_cache::{PromptCacheBounds, PromptCacheProfile, PromptCacheScope};
 use super::stream::{SseEvent, StreamContext};
+use super::tool_format_debug::{ToolFormatDebugEvent, ToolFormatDebugRecorder};
 use super::types::{
     CountTokensRequest, CountTokensResponse, MessagesRequest, ModelsResponse, OutputConfig,
     Thinking,
 };
 use super::usage::{
     ExternalPoolAttempt, ExternalPoolUsageSnapshot, StreamTerminalReason, UsageLatencyTrace,
-    UsageRecord, UsageRecordStatus, UsageRouteKind, UsageRouteSubtype, UsageSource,
+    UsagePublicError, UsageRecord, UsageRecordStatus, UsageRouteKind, UsageRouteSubtype,
+    UsageSource,
 };
 use super::websearch;
 use crate::external_pool::{
@@ -79,6 +83,7 @@ const LATENCY_COUNTER_UNSET: u32 = u32::MAX;
 #[derive(Clone)]
 struct RequestUsageContext {
     recorder: Arc<super::usage::UsageRecorder>,
+    tool_format_debug_recorder: Arc<ToolFormatDebugRecorder>,
     prompt_cache: Arc<super::prompt_cache::PromptCacheTracker>,
     prompt_cache_creation_controller:
         Arc<super::prompt_cache_creation_control::PromptCacheCreationController>,
@@ -96,6 +101,7 @@ struct RequestUsageContext {
     input_tokens: i32,
     context_window_tokens: i32,
     prompt_cache_profile: Option<PromptCacheProfile>,
+    prompt_cache_route_namespace: Option<String>,
     simulation_mode: PromptCacheSimulationMode,
     prompt_cache_target_read_ratio: f64,
     prompt_cache_token_scale: f64,
@@ -181,6 +187,8 @@ struct ExternalFallbackContext {
     prompt_cache: Arc<super::prompt_cache::PromptCacheTracker>,
     prompt_cache_creation_controller:
         Arc<super::prompt_cache_creation_control::PromptCacheCreationController>,
+    prompt_cache_simulation_mode: PromptCacheSimulationMode,
+    prompt_cache_route_namespace: Option<String>,
     prompt_cache_target_read_ratio: f64,
     prompt_cache_token_scale: f64,
     prompt_cache_max_simulated_input_tokens: i32,
@@ -219,6 +227,7 @@ struct CredentialErrorHint {
 struct RequestRuntimeConfig {
     extract_thinking: bool,
     thinking_trigger_mode: ThinkingTriggerMode,
+    prompt_cache_simulation_mode: PromptCacheSimulationMode,
     prompt_cache_target_read_ratio: f64,
     prompt_cache_token_scale: f64,
     prompt_cache_max_simulated_input_tokens: i32,
@@ -228,6 +237,7 @@ struct RequestRuntimeConfig {
     prompt_cache_creation_control: PromptCacheCreationControlConfig,
     prompt_cache_bounds: PromptCacheBounds,
     reported_usage: ReportedUsageConfig,
+    cache_policy: CachePolicyConfig,
     compat_profile: CompatProfile,
     model_resolution_mode: ModelResolutionMode,
     model_mapping: ModelMappingConfig,
@@ -250,6 +260,7 @@ impl RequestRuntimeConfig {
         Self {
             extract_thinking: state.extract_thinking,
             thinking_trigger_mode: state.thinking_trigger_mode,
+            prompt_cache_simulation_mode: state.prompt_cache_simulation_mode,
             prompt_cache_target_read_ratio: state.prompt_cache_target_read_ratio,
             prompt_cache_token_scale: state.prompt_cache_token_scale,
             prompt_cache_max_simulated_input_tokens: state.prompt_cache_max_simulated_input_tokens,
@@ -259,6 +270,7 @@ impl RequestRuntimeConfig {
             prompt_cache_creation_control: state.prompt_cache_creation_control,
             prompt_cache_bounds: state.prompt_cache_bounds,
             reported_usage: state.reported_usage.clone(),
+            cache_policy: state.cache_policy.clone(),
             compat_profile: state.compat_profile,
             model_resolution_mode: state.model_resolution_mode,
             model_mapping: state.model_mapping.clone().normalized(),
@@ -281,6 +293,7 @@ impl RequestRuntimeConfig {
         Self {
             extract_thinking: config.extract_thinking,
             thinking_trigger_mode: config.thinking_trigger_mode,
+            prompt_cache_simulation_mode: fallback.prompt_cache_simulation_mode,
             prompt_cache_target_read_ratio: if config.prompt_cache_target_read_ratio.is_finite() {
                 config.prompt_cache_target_read_ratio.clamp(0.0, 0.99)
             } else {
@@ -305,6 +318,7 @@ impl RequestRuntimeConfig {
                 config.prompt_cache_estimated_bytes_limit,
             ),
             reported_usage: config.reported_usage.normalized(),
+            cache_policy: config.cache_policy.normalized(),
             compat_profile: config.compat_profile,
             model_resolution_mode: config.model_resolution_mode,
             model_mapping: config.model_mapping.clone().normalized(),
@@ -363,6 +377,68 @@ impl RequestRuntimeConfig {
         self.payload_guard_mode == PayloadGuardMode::OnTooLong
             && self.payload_guard_enabled
             && self.payload_guard_max_bytes > 0
+    }
+
+    fn legacy_cache_route_policy_default(&self) -> CacheRoutePolicy {
+        CacheRoutePolicy {
+            simulation: CacheSimulationPolicy {
+                enabled: self.prompt_cache_simulation_mode == PromptCacheSimulationMode::HighCache,
+                target_read_ratio: self.prompt_cache_target_read_ratio,
+                token_scale: self.prompt_cache_token_scale,
+                max_simulated_input_tokens: self.prompt_cache_max_simulated_input_tokens,
+                cap_jitter_min_tokens: self.prompt_cache_cap_jitter_min_tokens,
+                cap_jitter_max_tokens: self.prompt_cache_cap_jitter_max_tokens,
+                scale_min_input_tokens: self.prompt_cache_scale_min_input_tokens,
+            }
+            .normalized(),
+            creation_control: self.prompt_cache_creation_control.normalized(),
+            reported_usage: self.reported_usage.default.normalized(),
+            cache_point: CachePointPolicy {
+                enabled: self.kiro_cache_point_enabled,
+                tools_only: self.kiro_cache_point_tools_only,
+                record_plan: self.kiro_cache_point_record_plan,
+            },
+            bounds: CacheBoundsPolicy {
+                max_entries_per_account: self.prompt_cache_bounds.max_entries_per_account,
+                max_entries_global: self.prompt_cache_bounds.max_entries_global,
+                entry_ttl_secs: self.prompt_cache_bounds.entry_ttl.as_secs(),
+                estimated_bytes_limit: self.prompt_cache_bounds.estimated_bytes_limit,
+            },
+        }
+        .normalized()
+    }
+
+    fn cache_policy_for_path(&self, path: &str) -> ResolvedCacheRoutePolicy {
+        resolve_cache_policy_for_path(
+            self.legacy_cache_route_policy_default(),
+            &self.reported_usage,
+            &self.cache_policy,
+            path,
+        )
+    }
+}
+
+fn prompt_cache_simulation_mode_for_policy(policy: &CacheRoutePolicy) -> PromptCacheSimulationMode {
+    if policy.simulation.enabled {
+        PromptCacheSimulationMode::HighCache
+    } else {
+        PromptCacheSimulationMode::Disabled
+    }
+}
+
+fn prompt_cache_bounds_for_policy(policy: &CacheRoutePolicy) -> PromptCacheBounds {
+    PromptCacheBounds::from_config(
+        policy.bounds.max_entries_per_account,
+        policy.bounds.max_entries_global,
+        policy.bounds.entry_ttl_secs,
+        policy.bounds.estimated_bytes_limit,
+    )
+}
+
+fn reported_usage_config_for_policy(policy: ReportedUsagePathPolicy) -> ReportedUsageConfig {
+    ReportedUsageConfig {
+        default: policy,
+        path_overrides: Default::default(),
     }
 }
 
@@ -503,6 +579,7 @@ fn build_external_fallback_context(
     state: &AppState,
     provider: &KiroProvider,
     runtime_config: &RequestRuntimeConfig,
+    cache_route: &ResolvedCacheRoutePolicy,
     endpoint: &str,
     raw_body: Bytes,
     headers: HeaderMap,
@@ -510,6 +587,7 @@ fn build_external_fallback_context(
 ) -> Option<ExternalFallbackContext> {
     let manager = state.external_pool_manager.clone()?;
     let config = provider.runtime_config().external_pools;
+    let policy = &cache_route.policy;
     config
         .external_pools_enabled
         .then_some(ExternalFallbackContext {
@@ -520,18 +598,19 @@ fn build_external_fallback_context(
             endpoint: endpoint.to_string(),
             payload: payload.clone(),
             model_resolution: None,
-            reported_usage: runtime_config.reported_usage.clone(),
+            reported_usage: reported_usage_config_for_policy(policy.reported_usage.clone()),
             prompt_cache: state.prompt_cache.clone(),
             prompt_cache_creation_controller: state.prompt_cache_creation_controller.clone(),
-            prompt_cache_target_read_ratio: runtime_config.prompt_cache_target_read_ratio,
-            prompt_cache_token_scale: runtime_config.prompt_cache_token_scale,
-            prompt_cache_max_simulated_input_tokens: runtime_config
-                .prompt_cache_max_simulated_input_tokens,
-            prompt_cache_cap_jitter_min_tokens: runtime_config.prompt_cache_cap_jitter_min_tokens,
-            prompt_cache_cap_jitter_max_tokens: runtime_config.prompt_cache_cap_jitter_max_tokens,
-            prompt_cache_scale_min_input_tokens: runtime_config.prompt_cache_scale_min_input_tokens,
-            prompt_cache_creation_control: runtime_config.prompt_cache_creation_control,
-            prompt_cache_bounds: runtime_config.prompt_cache_bounds,
+            prompt_cache_simulation_mode: prompt_cache_simulation_mode_for_policy(policy),
+            prompt_cache_route_namespace: cache_route.namespace.clone(),
+            prompt_cache_target_read_ratio: policy.simulation.target_read_ratio,
+            prompt_cache_token_scale: policy.simulation.token_scale,
+            prompt_cache_max_simulated_input_tokens: policy.simulation.max_simulated_input_tokens,
+            prompt_cache_cap_jitter_min_tokens: policy.simulation.cap_jitter_min_tokens,
+            prompt_cache_cap_jitter_max_tokens: policy.simulation.cap_jitter_max_tokens,
+            prompt_cache_scale_min_input_tokens: policy.simulation.scale_min_input_tokens,
+            prompt_cache_creation_control: policy.creation_control,
+            prompt_cache_bounds: prompt_cache_bounds_for_policy(policy),
             model_capabilities: state.model_capabilities.clone(),
             pricing_catalog: state.pricing_catalog.clone(),
             recorder: state.usage_recorder.clone(),
@@ -653,15 +732,32 @@ impl ExternalFallbackContext {
         error_message: &str,
         local_attempts: Vec<KiroCredentialAttempt>,
     ) -> Option<ExternalPoolForwardOutcome> {
+        let classification_attempts = local_attempts.clone();
+        self.fallback_after_local_error_outcome_with_diagnostics(
+            request_id,
+            error_message,
+            classification_attempts,
+            local_attempts,
+        )
+        .await
+    }
+
+    async fn fallback_after_local_error_outcome_with_diagnostics(
+        &self,
+        request_id: &str,
+        error_message: &str,
+        classification_attempts: Vec<KiroCredentialAttempt>,
+        diagnostic_attempts: Vec<KiroCredentialAttempt>,
+    ) -> Option<ExternalPoolForwardOutcome> {
         let reason = classify_local_error_for_external_fallback(
             error_message,
-            &local_attempts,
+            &classification_attempts,
             &self.config,
         )?;
         if self.config.local_pool_circuit_enabled {
             let mut seen_credentials = HashSet::new();
             let mut recorded = false;
-            for attempt in &local_attempts {
+            for attempt in &classification_attempts {
                 if seen_credentials.insert(attempt.credential_id) {
                     recorded = true;
                     let _ = self
@@ -687,9 +783,10 @@ impl ExternalFallbackContext {
         let local_preflight = Some(json!({
             "reason": reason.clone(),
             "error": error_message,
-            "attemptCount": local_attempts.len(),
+            "attemptCount": diagnostic_attempts.len(),
+            "classificationAttemptCount": classification_attempts.len(),
         }));
-        let route_subtype = if local_attempts.is_empty() {
+        let route_subtype = if diagnostic_attempts.is_empty() {
             UsageRouteSubtype::ExternalFallbackPreflight
         } else {
             UsageRouteSubtype::ExternalFallbackAfterLocalAttempts
@@ -705,7 +802,7 @@ impl ExternalFallbackContext {
                         None,
                         true,
                         local_preflight,
-                        local_attempts,
+                        diagnostic_attempts,
                     ),
                 )
                 .await,
@@ -749,6 +846,8 @@ impl ExternalFallbackContext {
             reported_usage: self.reported_usage.clone(),
             prompt_cache: self.prompt_cache.clone(),
             prompt_cache_creation_controller: self.prompt_cache_creation_controller.clone(),
+            prompt_cache_simulation_mode: self.prompt_cache_simulation_mode,
+            prompt_cache_route_namespace: self.prompt_cache_route_namespace.clone(),
             prompt_cache_target_read_ratio: self.prompt_cache_target_read_ratio,
             prompt_cache_token_scale: self.prompt_cache_token_scale,
             prompt_cache_max_simulated_input_tokens: self.prompt_cache_max_simulated_input_tokens,
@@ -1264,6 +1363,15 @@ impl RequestUsageContext {
         }
     }
 
+    fn attach_tool_format_debug_ref(&mut self, debug_ref: Option<serde_json::Value>) {
+        let Some(debug_ref) = debug_ref else {
+            return;
+        };
+        if let Some(report) = self.payload_guard_report.as_mut() {
+            report.tool_format_debug_ref = Some(debug_ref);
+        }
+    }
+
     fn attach_cache_point_retry(&mut self, planned: usize, reason: &str) {
         if let Some(report) = self.payload_guard_report.as_mut() {
             report.kiro_cache_points_planned = report.kiro_cache_points_planned.max(planned);
@@ -1429,17 +1537,27 @@ fn is_thinking_delta_output_event(event: &SseEvent) -> bool {
 }
 
 fn reported_cache_usage_policy(
-    endpoint: &str,
     simulation_mode: PromptCacheSimulationMode,
-    reported_usage: &ReportedUsageConfig,
+    reported_usage: &ReportedUsagePathPolicy,
     seed: u64,
 ) -> Option<super::cache::ReportedCacheUsagePolicy> {
     if simulation_mode != PromptCacheSimulationMode::HighCache {
         return None;
     }
 
-    super::cache::ReportedCacheUsagePolicy::from_path_policy(
-        reported_usage.policy_for_path(endpoint),
+    super::cache::ReportedCacheUsagePolicy::from_path_policy(reported_usage.clone(), seed)
+}
+
+#[cfg(test)]
+fn reported_cache_usage_policy_for_path(
+    endpoint: &str,
+    simulation_mode: PromptCacheSimulationMode,
+    reported_usage: &ReportedUsageConfig,
+    seed: u64,
+) -> Option<super::cache::ReportedCacheUsagePolicy> {
+    reported_cache_usage_policy(
+        simulation_mode,
+        &reported_usage.policy_for_path(endpoint),
         seed,
     )
 }
@@ -1651,6 +1769,7 @@ impl CredentialUsageContext {
                 .upstream_model
                 .clone()
                 .unwrap_or_else(|| self.request.model.clone()),
+            route_namespace: self.request.prompt_cache_route_namespace.clone(),
         })
     }
 
@@ -1805,6 +1924,17 @@ impl CredentialUsageContext {
             )
         });
         let error_detail = format!("{}: {}", error_type, error_message);
+        let public_error_message = match error_type.as_str() {
+            "invalid_request_error" => envelope::PUBLIC_INVALID_REQUEST_MESSAGE,
+            "rate_limit_error" => envelope::PUBLIC_RATE_LIMIT_MESSAGE,
+            _ => envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+        };
+        let public_error = Some(usage_public_error(
+            StatusCode::OK,
+            error_type.clone(),
+            public_error_message,
+            Some(&self.request.error_id),
+        ));
         self.record(
             status,
             usage,
@@ -1813,6 +1943,7 @@ impl CredentialUsageContext {
             Some(error_type),
             Some(error_message),
             Some(error_detail),
+            public_error,
         );
     }
 
@@ -1844,6 +1975,7 @@ impl CredentialUsageContext {
             None,
             None,
             None,
+            None,
         );
 
         if usage_source != UsageSource::LocalPromptCache {
@@ -1869,6 +2001,15 @@ impl CredentialUsageContext {
         let error_type = error_type.into();
         let error_message = error_message.into();
         let error_detail = format!("{}: {}", error_type, error_message);
+        let public_error = if error_type == "client_dropped" {
+            None
+        } else {
+            Some(provider_public_error_for_message(
+                &error_message,
+                Some(&self.request.error_id),
+                None,
+            ))
+        };
         let usage = super::cache::CacheUsage {
             total_input_tokens: self.request.input_tokens,
             input_tokens: self.request.input_tokens,
@@ -1886,6 +2027,7 @@ impl CredentialUsageContext {
             Some(error_type),
             Some(error_message),
             Some(error_detail),
+            public_error,
         );
     }
 
@@ -1906,6 +2048,7 @@ impl CredentialUsageContext {
         error_type: Option<String>,
         error_message: Option<String>,
         error_detail: Option<String>,
+        public_error: Option<UsagePublicError>,
     ) {
         let pricing = self.request.pricing_catalog.estimate(
             self.request
@@ -1954,6 +2097,7 @@ impl CredentialUsageContext {
             stream: self.request.stream,
             model: self.request.model.clone(),
             upstream_model: self.request.upstream_model.clone(),
+            external_outbound_model: None,
             model_resolution_source: self.request.model_resolution_source.clone(),
             model_resolution_note: self.request.model_resolution_note.clone(),
             conversation_id: self.request.conversation_id.clone(),
@@ -2005,6 +2149,9 @@ impl CredentialUsageContext {
             error_source,
             error_id,
             error_metadata: self.error_metadata.clone(),
+            public_error_status_code: public_error.as_ref().map(|error| error.status_code),
+            public_error_type: public_error.as_ref().map(|error| error.error_type.clone()),
+            public_error_message: public_error.map(|error| error.message),
             payload_breakdown,
             payload_guard_report,
         });
@@ -2531,7 +2678,7 @@ fn is_blocked_ip(addr: &std::net::IpAddr) -> bool {
 
 fn prepare_usage_context(
     state: &AppState,
-    runtime_config: RequestRuntimeConfig,
+    cache_route: ResolvedCacheRoutePolicy,
     endpoint: &str,
     stream: bool,
     payload: &MessagesRequest,
@@ -2540,6 +2687,8 @@ fn prepare_usage_context(
     stable_conversation_id: Option<String>,
     input_tokens: i32,
 ) -> RequestUsageContext {
+    let policy = cache_route.policy;
+    let simulation_mode = prompt_cache_simulation_mode_for_policy(&policy);
     let prompt_cache_model = model_resolution
         .as_ref()
         .and_then(|resolution| resolution.upstream_model.as_deref())
@@ -2548,7 +2697,7 @@ fn prepare_usage_context(
         .model_capabilities
         .supports_prompt_caching_for(prompt_cache_model)
         .unwrap_or(true);
-    let prompt_cache_profile = match state.prompt_cache_simulation_mode {
+    let prompt_cache_profile = match simulation_mode {
         PromptCacheSimulationMode::Disabled => None,
         PromptCacheSimulationMode::HighCache if prompt_cache_supported => state
             .prompt_cache
@@ -2556,7 +2705,7 @@ fn prepare_usage_context(
         PromptCacheSimulationMode::HighCache => None,
     };
     let (simulated_usage, simulated_source) = build_simulated_usage(
-        state,
+        simulation_mode,
         stable_conversation_id.as_deref(),
         prompt_cache_profile.as_ref(),
     );
@@ -2568,14 +2717,14 @@ fn prepare_usage_context(
         .unwrap_or(0)
         ^ fastrand::u64(..);
     let reported_cache_usage_policy = reported_cache_usage_policy(
-        endpoint,
-        state.prompt_cache_simulation_mode,
-        &runtime_config.reported_usage,
+        simulation_mode,
+        &policy.reported_usage,
         reported_cache_creation_seed,
     );
 
     RequestUsageContext {
         recorder: state.usage_recorder.clone(),
+        tool_format_debug_recorder: state.tool_format_debug_recorder.clone(),
         prompt_cache: state.prompt_cache.clone(),
         prompt_cache_creation_controller: state.prompt_cache_creation_controller.clone(),
         pricing_catalog: state.pricing_catalog.clone(),
@@ -2608,16 +2757,16 @@ fn prepare_usage_context(
                 get_context_window_size(model)
             }),
         prompt_cache_profile,
-        simulation_mode: state.prompt_cache_simulation_mode,
-        prompt_cache_target_read_ratio: runtime_config.prompt_cache_target_read_ratio,
-        prompt_cache_token_scale: runtime_config.prompt_cache_token_scale,
-        prompt_cache_max_simulated_input_tokens: runtime_config
-            .prompt_cache_max_simulated_input_tokens,
-        prompt_cache_cap_jitter_min_tokens: runtime_config.prompt_cache_cap_jitter_min_tokens,
-        prompt_cache_cap_jitter_max_tokens: runtime_config.prompt_cache_cap_jitter_max_tokens,
-        prompt_cache_scale_min_input_tokens: runtime_config.prompt_cache_scale_min_input_tokens,
-        prompt_cache_creation_control: runtime_config.prompt_cache_creation_control,
-        prompt_cache_bounds: runtime_config.prompt_cache_bounds,
+        prompt_cache_route_namespace: cache_route.namespace,
+        simulation_mode,
+        prompt_cache_target_read_ratio: policy.simulation.target_read_ratio,
+        prompt_cache_token_scale: policy.simulation.token_scale,
+        prompt_cache_max_simulated_input_tokens: policy.simulation.max_simulated_input_tokens,
+        prompt_cache_cap_jitter_min_tokens: policy.simulation.cap_jitter_min_tokens,
+        prompt_cache_cap_jitter_max_tokens: policy.simulation.cap_jitter_max_tokens,
+        prompt_cache_scale_min_input_tokens: policy.simulation.scale_min_input_tokens,
+        prompt_cache_creation_control: policy.creation_control,
+        prompt_cache_bounds: prompt_cache_bounds_for_policy(&policy),
         reported_cache_usage_policy,
         simulated_usage,
         simulated_source,
@@ -2644,11 +2793,11 @@ fn prompt_cache_scope_conversation_id(
 }
 
 fn build_simulated_usage(
-    state: &AppState,
+    simulation_mode: PromptCacheSimulationMode,
     conversation_id: Option<&str>,
     prompt_cache_profile: Option<&PromptCacheProfile>,
 ) -> (Option<super::cache::CacheSimulation>, Option<UsageSource>) {
-    match state.prompt_cache_simulation_mode {
+    match simulation_mode {
         PromptCacheSimulationMode::Disabled => (None, None),
         PromptCacheSimulationMode::HighCache => {
             if conversation_id.is_none() {
@@ -2689,6 +2838,7 @@ fn prepare_credential_usage_context(
                     .upstream_model
                     .clone()
                     .unwrap_or_else(|| usage_context.model.clone()),
+                route_namespace: usage_context.prompt_cache_route_namespace.clone(),
             });
         let prompt_usage = usage_context.prompt_cache.compute_with_bounds(
             scope,
@@ -2728,6 +2878,122 @@ fn cooldown_retry_after_secs(
         return fallback_secs;
     };
     provider.cooldown_retry_after_hint_secs(fallback_secs)
+}
+
+fn public_message_with_optional_error_id(
+    message: impl Into<String>,
+    error_id: Option<&str>,
+) -> String {
+    let message = message.into();
+    match error_id {
+        Some(error_id) => envelope::public_message_with_error_id(&message, error_id),
+        None => message,
+    }
+}
+
+fn usage_public_error(
+    status: StatusCode,
+    error_type: impl Into<String>,
+    message: impl Into<String>,
+    error_id: Option<&str>,
+) -> UsagePublicError {
+    UsagePublicError {
+        status_code: status.as_u16(),
+        error_type: error_type.into(),
+        message: public_message_with_optional_error_id(message, error_id),
+    }
+}
+
+fn provider_public_error_for_message(
+    err_str: &str,
+    error_id: Option<&str>,
+    provider: Option<&crate::kiro::provider::KiroProvider>,
+) -> UsagePublicError {
+    if is_upstream_payload_too_long_error(err_str) {
+        return usage_public_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Request input content length exceeded the request threshold. This limit is separate from the model context window. Reduce oversized tools, system prompt, documents, images, tool results, or conversation history.",
+            error_id,
+        );
+    }
+
+    if is_upstream_context_window_full_error(err_str) {
+        return usage_public_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Context window is full. Reduce conversation history, system prompt, tools, documents, images, or tool results.",
+            error_id,
+        );
+    }
+
+    if is_upstream_improperly_formed_error(err_str) || is_upstream_bad_request_error(err_str) {
+        return usage_public_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            UPSTREAM_INVALID_REQUEST_MESSAGE,
+            error_id,
+        );
+    }
+
+    if is_upstream_invalid_model_error(err_str) {
+        return usage_public_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            envelope::PUBLIC_MODEL_UNAVAILABLE_MESSAGE,
+            error_id,
+        );
+    }
+
+    if err_str.contains("临时冷却")
+        || err_str.contains("本地限流")
+        || err_str.contains("本地账号调度容量暂不可用")
+        || err_str.contains("本地凭据调度容量暂不可用")
+        || err_str.contains("账号调度等待队列已满")
+        || err_str.contains("凭据调度等待队列已满")
+        || err_str.contains("账号调度排队等待超时")
+        || err_str.contains("凭据调度排队等待超时")
+        || err_str.contains("暂不可调度")
+        || err_str.contains("retry-after")
+        || err_str.contains("Retry-After")
+        || err_str.contains("429")
+    {
+        let retry_after_secs = retry_after_secs_from_error(err_str)
+            .map(|secs| secs.max(1))
+            .unwrap_or_else(|| cooldown_retry_after_secs(provider, 1));
+        return usage_public_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            envelope::public_rate_limit_message(Some(retry_after_secs)),
+            error_id,
+        );
+    }
+
+    if err_str.contains("所有账号均已禁用")
+        || err_str.contains("所有凭据均已禁用")
+        || err_str.contains("所有账号均无法获取有效 Token")
+        || err_str.contains("所有凭据均无法获取有效 Token")
+        || err_str.contains("所有可用账号均因代理资源不可用")
+        || err_str.contains("所有可用凭据均因代理资源不可用")
+        || err_str.contains("所有账号已用尽")
+        || err_str.contains("所有凭据已用尽")
+        || err_str.contains("没有支持当前模型的可用账号")
+        || err_str.contains("没有支持当前模型的可用凭据")
+    {
+        return usage_public_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            envelope::PUBLIC_ACCOUNT_UNAVAILABLE_MESSAGE,
+            error_id,
+        );
+    }
+
+    usage_public_error(
+        StatusCode::BAD_GATEWAY,
+        "api_error",
+        envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+        error_id,
+    )
 }
 
 fn map_provider_error(
@@ -2963,6 +3229,20 @@ fn attach_and_log_tool_use_format_diagnostics(
 
     let diagnostics = diagnose_kiro_tool_use_format(request);
     usage_context.attach_tool_use_format_diagnostics(diagnostics);
+    let debug_ref = usage_context
+        .tool_format_debug_recorder
+        .record(ToolFormatDebugEvent {
+            request_id: &usage_context.request_id,
+            endpoint,
+            stream: usage_context.stream,
+            requested_model,
+            upstream_model: Some(upstream_model),
+            error_message: message,
+            request,
+            report: usage_context.payload_guard_report.as_ref(),
+            diagnostics,
+        });
+    usage_context.attach_tool_format_debug_ref(debug_ref);
 
     tracing::debug!(
         request_id = %usage_context.request_id,
@@ -3178,6 +3458,9 @@ fn log_payload_guard_report(
             textified_duplicate_tool_results = report.textified_duplicate_tool_results,
             textified_orphan_tool_results = report.textified_orphan_tool_results,
             removed_orphan_tool_uses = report.removed_orphan_tool_uses,
+            flattened_history_tool_uses = report.flattened_history_tool_uses,
+            textified_history_tool_results = report.textified_history_tool_results,
+            removed_history_tools = report.removed_history_tools,
             truncated_history_tool_results = report.truncated_history_tool_results,
             truncated_history_tool_result_chars = report.truncated_history_tool_result_chars,
             removed_history_thinking_blocks = report.removed_history_thinking_blocks,
@@ -3461,10 +3744,13 @@ async fn post_messages_inner(
         }
     };
     let runtime_config = request_runtime_config(&state, &provider);
+    let cache_route = runtime_config.cache_policy_for_path(&endpoint);
+    let request_simulation_mode = prompt_cache_simulation_mode_for_policy(&cache_route.policy);
     let mut external_fallback = build_external_fallback_context(
         &state,
         &provider,
         &runtime_config,
+        &cache_route,
         &endpoint,
         raw_body,
         headers.clone(),
@@ -3542,10 +3828,10 @@ async fn post_messages_inner(
         &payload,
         ConverterOptions {
             compat_profile: runtime_config.compat_profile,
-            prompt_cache_simulation_mode: state.prompt_cache_simulation_mode,
-            kiro_cache_point_enabled: runtime_config.kiro_cache_point_enabled,
-            kiro_cache_point_tools_only: runtime_config.kiro_cache_point_tools_only,
-            kiro_cache_point_record_plan: runtime_config.kiro_cache_point_record_plan,
+            prompt_cache_simulation_mode: request_simulation_mode,
+            kiro_cache_point_enabled: cache_route.policy.cache_point.enabled,
+            kiro_cache_point_tools_only: cache_route.policy.cache_point.tools_only,
+            kiro_cache_point_record_plan: cache_route.policy.cache_point.record_plan,
             force_visible_thinking: should_force_visible_thinking(&payload, &runtime_config),
         },
         &model_resolution,
@@ -3645,13 +3931,13 @@ async fn post_messages_inner(
     ) as i32;
     let mut usage_context = prepare_usage_context(
         &state,
-        runtime_config.clone(),
+        cache_route,
         &endpoint,
         payload.stream,
         &payload,
         Some(model_resolution.clone()),
         Some(conversation_id.clone()),
-        prompt_cache_scope_conversation_id(state.prompt_cache_simulation_mode, &payload),
+        prompt_cache_scope_conversation_id(request_simulation_mode, &payload),
         input_tokens,
     )
     .with_payload_diagnostics(payload_breakdown, payload_guard_report.clone());
@@ -3792,27 +4078,90 @@ async fn maybe_external_fallback_after_local_error_outcome(
         .await
 }
 
+async fn maybe_external_fallback_after_local_error_outcome_with_diagnostics(
+    external_fallback: Option<&ExternalFallbackContext>,
+    request_id: &str,
+    message: &str,
+    classification_attempts: Vec<KiroCredentialAttempt>,
+    diagnostic_attempts: Vec<KiroCredentialAttempt>,
+) -> Option<ExternalPoolForwardOutcome> {
+    external_fallback?
+        .fallback_after_local_error_outcome_with_diagnostics(
+            request_id,
+            message,
+            classification_attempts,
+            diagnostic_attempts,
+        )
+        .await
+}
+
 fn local_rescue_reason_after_external_error(
     config: &ExternalPoolsConfig,
     err: &ExternalPoolFinalError,
-    local_fallback_reason: Option<&str>,
+    _local_fallback_reason: Option<&str>,
 ) -> Option<&'static str> {
-    if local_fallback_reason.is_some() {
-        return None;
-    }
     if !config.external_pool_local_rescue_enabled {
         return None;
     }
-    if config.external_pool_local_rescue_on_rate_limit && err.is_rate_limit() {
-        return Some("external_rate_limit");
+    if err.is_rate_limit() {
+        return config
+            .external_pool_local_rescue_on_rate_limit
+            .then_some("external_rate_limit");
     }
-    if config.external_pool_local_rescue_on_timeout && err.is_timeout_like() {
-        return Some("external_timeout");
+    if err.is_timeout_like() {
+        return config
+            .external_pool_local_rescue_on_timeout
+            .then_some("external_timeout");
     }
-    if config.external_pool_local_rescue_on_capacity && err.is_capacity_like() {
-        return Some("external_capacity");
+    if err.is_capacity_like() {
+        return config
+            .external_pool_local_rescue_on_capacity
+            .then_some("external_capacity");
     }
-    None
+    if err.is_public_invalid_request() {
+        return Some("external_bad_request");
+    }
+    Some("external_error")
+}
+
+/// Last-chance local retry after an external-pool final error.
+///
+/// This deliberately calls the provider-local `*_max_wait` entrypoint directly. Do not route this
+/// through `call_api_stream_maybe_fail_fast`, `call_api_maybe_fail_fast`, or
+/// `ExternalFallbackContext::*fallback*`; those paths can choose the external pool again.
+async fn call_stream_local_rescue_after_external_error(
+    provider: &Arc<KiroProvider>,
+    request_body: &str,
+    request_id: &str,
+    external: &ExternalFallbackContext,
+) -> anyhow::Result<crate::kiro::provider::KiroStreamResponse> {
+    provider
+        .call_api_stream_with_request_id_max_wait(
+            request_body,
+            Some(request_id),
+            Duration::from_secs(external.config.external_pool_local_rescue_max_wait_secs),
+        )
+        .await
+}
+
+/// Last-chance local retry after an external-pool final error.
+///
+/// This deliberately calls the provider-local `*_max_wait` entrypoint directly. Do not route this
+/// through `call_api_stream_maybe_fail_fast`, `call_api_maybe_fail_fast`, or
+/// `ExternalFallbackContext::*fallback*`; those paths can choose the external pool again.
+async fn call_non_stream_local_rescue_after_external_error(
+    provider: &Arc<KiroProvider>,
+    request_body: &str,
+    request_id: &str,
+    external: &ExternalFallbackContext,
+) -> anyhow::Result<crate::kiro::provider::KiroApiResponse> {
+    provider
+        .call_api_with_context_with_request_id_max_wait(
+            request_body,
+            Some(request_id),
+            Duration::from_secs(external.config.external_pool_local_rescue_max_wait_secs),
+        )
+        .await
 }
 
 fn external_rescue_preflight(reason: &str, err: &ExternalPoolFinalError) -> serde_json::Value {
@@ -3928,6 +4277,7 @@ async fn handle_stream_request(
                     Err(retry_error) => {
                         let retry_message = retry_error.to_string();
                         let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
+                        let classification_attempts = retry_attempts.clone();
                         let all_attempts =
                             merge_credential_attempts(retry_attempt_prefix.clone(), retry_attempts);
                         log_provider_call_failure(&retry_message, Some(&usage_context.error_id));
@@ -3940,13 +4290,15 @@ async fn handle_stream_request(
                             model,
                             preflight_model,
                         );
-                        if let Some(outcome) = maybe_external_fallback_after_local_error_outcome(
-                            external_fallback.as_ref(),
-                            &request_id,
-                            &retry_message,
-                            all_attempts.clone(),
-                        )
-                        .await
+                        if let Some(outcome) =
+                            maybe_external_fallback_after_local_error_outcome_with_diagnostics(
+                                external_fallback.as_ref(),
+                                &request_id,
+                                &retry_message,
+                                classification_attempts,
+                                all_attempts.clone(),
+                            )
+                            .await
                         {
                             match outcome {
                                 ExternalPoolForwardOutcome::Response(response) => return response,
@@ -4015,6 +4367,7 @@ async fn handle_stream_request(
                     Err(retry_error) => {
                         let retry_message = retry_error.to_string();
                         let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
+                        let classification_attempts = retry_attempts.clone();
                         let all_attempts =
                             merge_credential_attempts(retry_attempt_prefix.clone(), retry_attempts);
                         log_provider_call_failure(&retry_message, Some(&usage_context.error_id));
@@ -4027,13 +4380,15 @@ async fn handle_stream_request(
                             model,
                             preflight_model,
                         );
-                        if let Some(outcome) = maybe_external_fallback_after_local_error_outcome(
-                            external_fallback.as_ref(),
-                            &request_id,
-                            &retry_message,
-                            all_attempts.clone(),
-                        )
-                        .await
+                        if let Some(outcome) =
+                            maybe_external_fallback_after_local_error_outcome_with_diagnostics(
+                                external_fallback.as_ref(),
+                                &request_id,
+                                &retry_message,
+                                classification_attempts.clone(),
+                                all_attempts.clone(),
+                            )
+                            .await
                         {
                             match outcome {
                                 ExternalPoolForwardOutcome::Response(response) => return response,
@@ -4042,7 +4397,7 @@ async fn handle_stream_request(
                                         let local_fallback_reason =
                                             classify_local_error_for_external_fallback(
                                                 &retry_message,
-                                                &all_attempts,
+                                                &classification_attempts,
                                                 &external.config,
                                             );
                                         if let Some(reason) =
@@ -4066,17 +4421,13 @@ async fn handle_stream_request(
                                                 err.attempts.clone(),
                                             );
                                             retry_attempt_prefix = all_attempts.clone();
-                                            match provider
-                                                .call_api_stream_with_request_id_max_wait(
-                                                    &retry_body,
-                                                    Some(&request_id),
-                                                    Duration::from_secs(
-                                                        external
-                                                            .config
-                                                            .external_pool_local_rescue_max_wait_secs,
-                                                    ),
-                                                )
-                                                .await
+                                            match call_stream_local_rescue_after_external_error(
+                                                &provider,
+                                                &retry_body,
+                                                &request_id,
+                                                external,
+                                            )
+                                            .await
                                             {
                                                 Ok(resp) => resp,
                                                 Err(rescue_error) => {
@@ -4085,11 +4436,10 @@ async fn handle_stream_request(
                                                         KiroProvider::attempts_from_error(
                                                             &rescue_error,
                                                         );
-                                                    let all_attempts =
-                                                        merge_credential_attempts(
-                                                            retry_attempt_prefix.clone(),
-                                                            rescue_attempts,
-                                                        );
+                                                    let all_attempts = merge_credential_attempts(
+                                                        retry_attempt_prefix.clone(),
+                                                        rescue_attempts,
+                                                    );
                                                     log_provider_call_failure(
                                                         &rescue_message,
                                                         Some(&usage_context.error_id),
@@ -4101,9 +4451,9 @@ async fn handle_stream_request(
                                                             &rescue_message,
                                                             all_attempts,
                                                         )
-                                                        .with_error_metadata(provider_error_metadata(
-                                                            &rescue_error,
-                                                        ))
+                                                        .with_error_metadata(
+                                                            provider_error_metadata(&rescue_error),
+                                                        )
                                                         .record_failure(
                                                             UsageRecordStatus::Error,
                                                             "api_error",
@@ -4186,17 +4536,13 @@ async fn handle_stream_request(
                                         err.attempts.clone(),
                                     );
                                     retry_attempt_prefix = attempts.clone();
-                                    match provider
-                                        .call_api_stream_with_request_id_max_wait(
-                                            request_body,
-                                            Some(&request_id),
-                                            Duration::from_secs(
-                                                external
-                                                    .config
-                                                    .external_pool_local_rescue_max_wait_secs,
-                                            ),
-                                        )
-                                        .await
+                                    match call_stream_local_rescue_after_external_error(
+                                        &provider,
+                                        request_body,
+                                        &request_id,
+                                        external,
+                                    )
+                                    .await
                                     {
                                         Ok(resp) => resp,
                                         Err(rescue_error) => {
@@ -4928,6 +5274,7 @@ async fn handle_non_stream_request(
                     Err(retry_error) => {
                         let retry_message = retry_error.to_string();
                         let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
+                        let classification_attempts = retry_attempts.clone();
                         let all_attempts =
                             merge_credential_attempts(retry_attempt_prefix.clone(), retry_attempts);
                         log_provider_call_failure(&retry_message, Some(&usage_context.error_id));
@@ -4940,13 +5287,15 @@ async fn handle_non_stream_request(
                             model,
                             preflight_model,
                         );
-                        if let Some(outcome) = maybe_external_fallback_after_local_error_outcome(
-                            external_fallback.as_ref(),
-                            &request_id,
-                            &retry_message,
-                            all_attempts.clone(),
-                        )
-                        .await
+                        if let Some(outcome) =
+                            maybe_external_fallback_after_local_error_outcome_with_diagnostics(
+                                external_fallback.as_ref(),
+                                &request_id,
+                                &retry_message,
+                                classification_attempts,
+                                all_attempts.clone(),
+                            )
+                            .await
                         {
                             match outcome {
                                 ExternalPoolForwardOutcome::Response(response) => return response,
@@ -5015,6 +5364,7 @@ async fn handle_non_stream_request(
                     Err(retry_error) => {
                         let retry_message = retry_error.to_string();
                         let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
+                        let classification_attempts = retry_attempts.clone();
                         let all_attempts =
                             merge_credential_attempts(retry_attempt_prefix.clone(), retry_attempts);
                         log_provider_call_failure(&retry_message, Some(&usage_context.error_id));
@@ -5027,13 +5377,15 @@ async fn handle_non_stream_request(
                             model,
                             preflight_model,
                         );
-                        if let Some(outcome) = maybe_external_fallback_after_local_error_outcome(
-                            external_fallback.as_ref(),
-                            &request_id,
-                            &retry_message,
-                            all_attempts.clone(),
-                        )
-                        .await
+                        if let Some(outcome) =
+                            maybe_external_fallback_after_local_error_outcome_with_diagnostics(
+                                external_fallback.as_ref(),
+                                &request_id,
+                                &retry_message,
+                                classification_attempts.clone(),
+                                all_attempts.clone(),
+                            )
+                            .await
                         {
                             match outcome {
                                 ExternalPoolForwardOutcome::Response(response) => return response,
@@ -5042,7 +5394,7 @@ async fn handle_non_stream_request(
                                         let local_fallback_reason =
                                             classify_local_error_for_external_fallback(
                                                 &retry_message,
-                                                &all_attempts,
+                                                &classification_attempts,
                                                 &external.config,
                                             );
                                         if let Some(reason) =
@@ -5066,17 +5418,13 @@ async fn handle_non_stream_request(
                                                 err.attempts.clone(),
                                             );
                                             retry_attempt_prefix = all_attempts.clone();
-                                            match provider
-                                                .call_api_with_context_with_request_id_max_wait(
-                                                    &retry_body,
-                                                    Some(&request_id),
-                                                    Duration::from_secs(
-                                                        external
-                                                            .config
-                                                            .external_pool_local_rescue_max_wait_secs,
-                                                    ),
-                                                )
-                                                .await
+                                            match call_non_stream_local_rescue_after_external_error(
+                                                &provider,
+                                                &retry_body,
+                                                &request_id,
+                                                external,
+                                            )
+                                            .await
                                             {
                                                 Ok(resp) => resp,
                                                 Err(rescue_error) => {
@@ -5085,11 +5433,10 @@ async fn handle_non_stream_request(
                                                         KiroProvider::attempts_from_error(
                                                             &rescue_error,
                                                         );
-                                                    let all_attempts =
-                                                        merge_credential_attempts(
-                                                            retry_attempt_prefix.clone(),
-                                                            rescue_attempts,
-                                                        );
+                                                    let all_attempts = merge_credential_attempts(
+                                                        retry_attempt_prefix.clone(),
+                                                        rescue_attempts,
+                                                    );
                                                     log_provider_call_failure(
                                                         &rescue_message,
                                                         Some(&usage_context.error_id),
@@ -5101,9 +5448,9 @@ async fn handle_non_stream_request(
                                                             &rescue_message,
                                                             all_attempts,
                                                         )
-                                                        .with_error_metadata(provider_error_metadata(
-                                                            &rescue_error,
-                                                        ))
+                                                        .with_error_metadata(
+                                                            provider_error_metadata(&rescue_error),
+                                                        )
                                                         .record_failure(
                                                             UsageRecordStatus::Error,
                                                             "api_error",
@@ -5186,17 +5533,13 @@ async fn handle_non_stream_request(
                                         err.attempts.clone(),
                                     );
                                     retry_attempt_prefix = attempts.clone();
-                                    match provider
-                                        .call_api_with_context_with_request_id_max_wait(
-                                            request_body,
-                                            Some(&request_id),
-                                            Duration::from_secs(
-                                                external
-                                                    .config
-                                                    .external_pool_local_rescue_max_wait_secs,
-                                            ),
-                                        )
-                                        .await
+                                    match call_non_stream_local_rescue_after_external_error(
+                                        &provider,
+                                        request_body,
+                                        &request_id,
+                                        external,
+                                    )
+                                    .await
                                     {
                                         Ok(resp) => resp,
                                         Err(rescue_error) => {
@@ -5929,10 +6272,13 @@ pub async fn post_messages_cc(
         }
     };
     let runtime_config = request_runtime_config(&state, &provider);
+    let cache_route = runtime_config.cache_policy_for_path("/cc/v1/messages");
+    let request_simulation_mode = prompt_cache_simulation_mode_for_policy(&cache_route.policy);
     let mut external_fallback = build_external_fallback_context(
         &state,
         &provider,
         &runtime_config,
+        &cache_route,
         "/cc/v1/messages",
         raw_body,
         headers.clone(),
@@ -6010,10 +6356,10 @@ pub async fn post_messages_cc(
         &payload,
         ConverterOptions {
             compat_profile: runtime_config.compat_profile,
-            prompt_cache_simulation_mode: state.prompt_cache_simulation_mode,
-            kiro_cache_point_enabled: runtime_config.kiro_cache_point_enabled,
-            kiro_cache_point_tools_only: runtime_config.kiro_cache_point_tools_only,
-            kiro_cache_point_record_plan: runtime_config.kiro_cache_point_record_plan,
+            prompt_cache_simulation_mode: request_simulation_mode,
+            kiro_cache_point_enabled: cache_route.policy.cache_point.enabled,
+            kiro_cache_point_tools_only: cache_route.policy.cache_point.tools_only,
+            kiro_cache_point_record_plan: cache_route.policy.cache_point.record_plan,
             force_visible_thinking: should_force_visible_thinking(&payload, &runtime_config),
         },
         &model_resolution,
@@ -6113,13 +6459,13 @@ pub async fn post_messages_cc(
     ) as i32;
     let mut usage_context = prepare_usage_context(
         &state,
-        runtime_config.clone(),
+        cache_route,
         "/cc/v1/messages",
         payload.stream,
         &payload,
         Some(model_resolution.clone()),
         Some(conversation_id.clone()),
-        prompt_cache_scope_conversation_id(state.prompt_cache_simulation_mode, &payload),
+        prompt_cache_scope_conversation_id(request_simulation_mode, &payload),
         input_tokens,
     )
     .with_payload_diagnostics(payload_breakdown, payload_guard_report.clone());
@@ -6372,6 +6718,7 @@ mod tests {
         RequestRuntimeConfig {
             extract_thinking: true,
             thinking_trigger_mode: ThinkingTriggerMode::RealRequest,
+            prompt_cache_simulation_mode: PromptCacheSimulationMode::HighCache,
             prompt_cache_target_read_ratio: 0.98,
             prompt_cache_token_scale: 1.0,
             prompt_cache_max_simulated_input_tokens: 0,
@@ -6381,6 +6728,7 @@ mod tests {
             prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
             prompt_cache_bounds: PromptCacheBounds::default(),
             reported_usage: ReportedUsageConfig::default(),
+            cache_policy: CachePolicyConfig::default(),
             compat_profile: CompatProfile::ClaudeCode,
             model_resolution_mode: ModelResolutionMode::Compatible,
             model_mapping: ModelMappingConfig::default(),
@@ -6892,7 +7240,7 @@ Return a fix plan."#
         };
         let values: Vec<i32> = (0..24)
             .map(|seed| {
-                let policy = reported_cache_usage_policy(
+                let policy = reported_cache_usage_policy_for_path(
                     "/cc/v1/messages",
                     PromptCacheSimulationMode::HighCache,
                     &reported_usage_config,
@@ -6910,7 +7258,7 @@ Return a fix plan."#
         assert!(values.iter().any(|value| value % 10 != 0));
 
         let reported = usage.with_reported_cache_usage_policy(
-            reported_cache_usage_policy(
+            reported_cache_usage_policy_for_path(
                 "/cc/v1/messages",
                 PromptCacheSimulationMode::HighCache,
                 &reported_usage_config,
@@ -6927,7 +7275,7 @@ Return a fix plan."#
         assert_eq!(reported.output_tokens, 1);
 
         let raw_reported = usage.with_reported_cache_usage_policy_and_raw(
-            reported_cache_usage_policy(
+            reported_cache_usage_policy_for_path(
                 "/cc/v1/messages",
                 PromptCacheSimulationMode::HighCache,
                 &reported_usage_config,
@@ -6948,7 +7296,7 @@ Return a fix plan."#
     #[test]
     fn reported_usage_rewrite_only_changes_local_prompt_cache_downstream_usage() {
         let reported_usage_config = ReportedUsageConfig::default();
-        let v1_policy = reported_cache_usage_policy(
+        let v1_policy = reported_cache_usage_policy_for_path(
             "/v1/messages",
             PromptCacheSimulationMode::HighCache,
             &reported_usage_config,
@@ -6979,7 +7327,7 @@ Return a fix plan."#
             unchanged_usage.cache_read_input_tokens
         );
         assert_eq!(
-            reported_cache_usage_policy(
+            reported_cache_usage_policy_for_path(
                 "/cc/v1/messages",
                 PromptCacheSimulationMode::Disabled,
                 &reported_usage_config,
@@ -6992,6 +7340,7 @@ Return a fix plan."#
         let usage_recorder = Arc::new(UsageRecorder::new(10));
         let usage_context = RequestUsageContext {
             recorder: usage_recorder.clone(),
+            tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
             prompt_cache,
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -7008,6 +7357,7 @@ Return a fix plan."#
             input_tokens: 100_000,
             context_window_tokens: 200_000,
             prompt_cache_profile: None,
+            prompt_cache_route_namespace: None,
             simulation_mode: PromptCacheSimulationMode::HighCache,
             prompt_cache_target_read_ratio: 0.95,
             prompt_cache_token_scale: 1.0,
@@ -7017,7 +7367,7 @@ Return a fix plan."#
             prompt_cache_scale_min_input_tokens: 0,
             prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
             prompt_cache_bounds: PromptCacheBounds::default(),
-            reported_cache_usage_policy: reported_cache_usage_policy(
+            reported_cache_usage_policy: reported_cache_usage_policy_for_path(
                 "/cc/v1/messages",
                 PromptCacheSimulationMode::HighCache,
                 &reported_usage_config,
@@ -7071,6 +7421,7 @@ Return a fix plan."#
         let usage_recorder = Arc::new(UsageRecorder::new(10));
         let usage_context = RequestUsageContext {
             recorder: usage_recorder.clone(),
+            tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
             prompt_cache: Arc::new(PromptCacheTracker::default()),
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -7087,6 +7438,7 @@ Return a fix plan."#
             input_tokens: request_input_tokens,
             context_window_tokens: 200_000,
             prompt_cache_profile: None,
+            prompt_cache_route_namespace: None,
             simulation_mode: PromptCacheSimulationMode::HighCache,
             prompt_cache_target_read_ratio: 0.99,
             prompt_cache_token_scale: 2.0,
@@ -7096,7 +7448,7 @@ Return a fix plan."#
             prompt_cache_scale_min_input_tokens: 20_000,
             prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
             prompt_cache_bounds: PromptCacheBounds::default(),
-            reported_cache_usage_policy: reported_cache_usage_policy(
+            reported_cache_usage_policy: reported_cache_usage_policy_for_path(
                 "/cc/v1/messages",
                 PromptCacheSimulationMode::HighCache,
                 &reported_usage_config,
@@ -7213,6 +7565,7 @@ Return a fix plan."#
     fn local_latency_trace_records_markers_without_changing_first_output_semantics() {
         let mut usage_context = RequestUsageContext {
             recorder: Arc::new(UsageRecorder::new(10)),
+            tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
             prompt_cache: Arc::new(PromptCacheTracker::default()),
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -7229,6 +7582,7 @@ Return a fix plan."#
             input_tokens: 100,
             context_window_tokens: 200_000,
             prompt_cache_profile: None,
+            prompt_cache_route_namespace: None,
             simulation_mode: PromptCacheSimulationMode::Disabled,
             prompt_cache_target_read_ratio: 0.95,
             prompt_cache_token_scale: 1.0,
@@ -7323,6 +7677,7 @@ Return a fix plan."#
 
         let v1_context = RequestUsageContext {
             recorder: usage_recorder.clone(),
+            tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
             prompt_cache: prompt_cache.clone(),
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -7339,6 +7694,7 @@ Return a fix plan."#
             input_tokens: 100_000,
             context_window_tokens: 200_000,
             prompt_cache_profile: None,
+            prompt_cache_route_namespace: None,
             simulation_mode: PromptCacheSimulationMode::HighCache,
             prompt_cache_target_read_ratio: 0.95,
             prompt_cache_token_scale: 1.0,
@@ -7348,7 +7704,7 @@ Return a fix plan."#
             prompt_cache_scale_min_input_tokens: 0,
             prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
             prompt_cache_bounds: PromptCacheBounds::default(),
-            reported_cache_usage_policy: reported_cache_usage_policy(
+            reported_cache_usage_policy: reported_cache_usage_policy_for_path(
                 "/v1/messages",
                 PromptCacheSimulationMode::HighCache,
                 &reported_usage_config,
@@ -7370,7 +7726,7 @@ Return a fix plan."#
             endpoint: "/cc/v1/messages".to_string(),
             request_id: "req_cc_policy".to_string(),
             error_id: "req_01cc_policy".to_string(),
-            reported_cache_usage_policy: reported_cache_usage_policy(
+            reported_cache_usage_policy: reported_cache_usage_policy_for_path(
                 "/cc/v1/messages",
                 PromptCacheSimulationMode::HighCache,
                 &reported_usage_config,
@@ -7382,7 +7738,7 @@ Return a fix plan."#
             endpoint: "/ha/v1/messages".to_string(),
             request_id: "req_ha_policy".to_string(),
             error_id: "req_01ha_policy".to_string(),
-            reported_cache_usage_policy: reported_cache_usage_policy(
+            reported_cache_usage_policy: reported_cache_usage_policy_for_path(
                 "/ha/v1/messages",
                 PromptCacheSimulationMode::HighCache,
                 &reported_usage_config,
@@ -7394,7 +7750,7 @@ Return a fix plan."#
             endpoint: "/na/v1/messages".to_string(),
             request_id: "req_na_policy".to_string(),
             error_id: "req_01na_policy".to_string(),
-            reported_cache_usage_policy: reported_cache_usage_policy(
+            reported_cache_usage_policy: reported_cache_usage_policy_for_path(
                 "/na/v1/messages",
                 PromptCacheSimulationMode::HighCache,
                 &reported_usage_config,
@@ -7485,6 +7841,7 @@ Return a fix plan."#
         let usage_recorder = Arc::new(UsageRecorder::new(10));
         let usage_context = RequestUsageContext {
             recorder: usage_recorder.clone(),
+            tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
             prompt_cache,
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -7501,6 +7858,7 @@ Return a fix plan."#
             input_tokens: 4096,
             context_window_tokens: 200_000,
             prompt_cache_profile: None,
+            prompt_cache_route_namespace: None,
             simulation_mode: PromptCacheSimulationMode::HighCache,
             prompt_cache_target_read_ratio: 0.95,
             prompt_cache_token_scale: 1.0,
@@ -7812,6 +8170,7 @@ Return a fix plan."#
         let profile = prompt_cache.build_profile(&payload, 4096);
         let usage_context = RequestUsageContext {
             recorder: usage_recorder,
+            tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
             prompt_cache: prompt_cache.clone(),
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -7828,6 +8187,7 @@ Return a fix plan."#
             input_tokens: 4096,
             context_window_tokens: 200_000,
             prompt_cache_profile: profile.clone(),
+            prompt_cache_route_namespace: None,
             simulation_mode: PromptCacheSimulationMode::HighCache,
             prompt_cache_target_read_ratio: 0.85,
             prompt_cache_token_scale: 1.0,
@@ -7867,6 +8227,7 @@ Return a fix plan."#
             credential_id: 1,
             conversation_id: "session-a".to_string(),
             model: payload.model,
+            route_namespace: None,
         };
         let second = prompt_cache.compute(Some(scope), profile.as_ref(), 0.85);
         assert!(second.cache_read_input_tokens > 0);
@@ -7897,6 +8258,7 @@ Return a fix plan."#
         let profile = prompt_cache.build_high_cache_profile(&payload, 4096);
         let usage_context = RequestUsageContext {
             recorder: usage_recorder,
+            tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
             prompt_cache: prompt_cache.clone(),
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
@@ -7913,6 +8275,7 @@ Return a fix plan."#
             input_tokens: 4096,
             context_window_tokens: 200_000,
             prompt_cache_profile: profile.clone(),
+            prompt_cache_route_namespace: None,
             simulation_mode: PromptCacheSimulationMode::HighCache,
             prompt_cache_target_read_ratio: 0.95,
             prompt_cache_token_scale: 1.0,
@@ -7966,6 +8329,7 @@ Return a fix plan."#
             credential_id: 1,
             conversation_id: "session-high-cache".to_string(),
             model: payload.model,
+            route_namespace: None,
         };
         let second = prompt_cache.compute(Some(scope), profile.as_ref(), 0.95);
         assert!(second.cache_read_input_tokens > 0);
@@ -8008,7 +8372,7 @@ Return a fix plan."#
             extract_stable_conversation_id(&first_payload).expect("fallback id");
         let first_context = prepare_usage_context(
             &state,
-            RequestRuntimeConfig::from_app_state(&state),
+            RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/v1/messages"),
             "/v1/messages",
             false,
             &first_payload,
@@ -8065,7 +8429,7 @@ Return a fix plan."#
 
         let second_context = prepare_usage_context(
             &state,
-            RequestRuntimeConfig::from_app_state(&state),
+            RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/v1/messages"),
             "/v1/messages",
             false,
             &second_payload,
@@ -8126,14 +8490,15 @@ Return a fix plan."#
             output_config: None,
             metadata: None,
         };
-        let (simulation, source) = build_simulated_usage(&state, None, None);
+        let (simulation, source) =
+            build_simulated_usage(PromptCacheSimulationMode::Disabled, None, None);
 
         assert!(simulation.is_none());
         assert!(source.is_none());
 
         let context = prepare_usage_context(
             &state,
-            RequestRuntimeConfig::from_app_state(&state),
+            RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/v1/messages"),
             "/v1/messages",
             true,
             &payload,
@@ -8189,7 +8554,7 @@ Return a fix plan."#
 
         let context = prepare_usage_context(
             &state,
-            RequestRuntimeConfig::from_app_state(&state),
+            RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/na/v1/messages"),
             "/na/v1/messages",
             false,
             &payload,
@@ -8218,6 +8583,7 @@ Return a fix plan."#
                 credential_id,
                 conversation_id: conversation_id.clone(),
                 model: usage_context.model.clone(),
+                route_namespace: None,
             });
         let prompt_usage = usage_context.prompt_cache.compute_with_bounds(
             scope,
@@ -8312,6 +8678,65 @@ Return a fix plan."#
             classify_local_error_for_external_fallback("429 Too Many Requests", &[], &config)
                 .as_deref(),
             Some("local_transient_exhausted")
+        );
+    }
+
+    #[test]
+    fn external_fallback_classifier_can_use_retry_stage_attempts_after_payload_guard_retry() {
+        let config = ExternalPoolsConfig::default();
+        let prior_too_long_attempt = KiroCredentialAttempt::new(
+            0,
+            63,
+            Some("account@example.com".to_string()),
+            Some(StatusCode::BAD_REQUEST),
+            "fail",
+            Some("client_error"),
+            Some(
+                r#"400 Bad Request {"message":"Input is too long.","reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#,
+            ),
+            1200,
+        );
+        let capacity_message = "本地账号调度容量暂不可用（可用: 7/29, 临时可调度: 0, global_credential_max_concurrent_requests=10, effective_credential_max_concurrent_requests=50, retry_after_secs=1）";
+
+        let diagnostic_attempts =
+            merge_credential_attempts(vec![prior_too_long_attempt.clone()], Vec::new());
+        assert_eq!(
+            classify_local_error_for_external_fallback(
+                capacity_message,
+                &diagnostic_attempts,
+                &config,
+            ),
+            None
+        );
+
+        let retry_stage_attempts = Vec::new();
+        assert_eq!(
+            classify_local_error_for_external_fallback(
+                capacity_message,
+                &retry_stage_attempts,
+                &config,
+            )
+            .as_deref(),
+            Some("local_capacity_exhausted")
+        );
+
+        let retry_bad_request_attempt = vec![KiroCredentialAttempt::new(
+            0,
+            64,
+            Some("retry@example.com".to_string()),
+            Some(StatusCode::BAD_REQUEST),
+            "fail",
+            Some("client_error"),
+            Some("bad request"),
+            10,
+        )];
+        assert_eq!(
+            classify_local_error_for_external_fallback(
+                capacity_message,
+                &retry_bad_request_attempt,
+                &config,
+            ),
+            None
         );
     }
 
@@ -8499,7 +8924,15 @@ Return a fix plan."#
                 &rate_limit,
                 Some("no_available_credentials")
             ),
-            None
+            Some("external_rate_limit")
+        );
+        assert_eq!(
+            local_rescue_reason_after_external_error(
+                &config,
+                &rate_limit,
+                Some("local_capacity_exhausted")
+            ),
+            Some("external_rate_limit")
         );
 
         let timeout = ExternalPoolFinalError {
@@ -8547,7 +8980,7 @@ Return a fix plan."#
         };
         assert_eq!(
             local_rescue_reason_after_external_error(&config, &bad_request, None),
-            None
+            Some("external_bad_request")
         );
 
         let mut disabled = config.clone();
@@ -8569,6 +9002,34 @@ Return a fix plan."#
         assert_eq!(
             local_rescue_reason_after_external_error(&no_capacity, &capacity, None),
             None
+        );
+
+        let server_error = ExternalPoolFinalError {
+            status: StatusCode::BAD_GATEWAY,
+            response_error_type: "api_error".to_string(),
+            route_error_type: "server_error".to_string(),
+            message: "external upstream failed".to_string(),
+            error_id: "req_01server".to_string(),
+            retryable: true,
+            attempts: Vec::new(),
+            pool_id: Some(1),
+            pool_name: Some("backup".to_string()),
+        };
+        assert_eq!(
+            local_rescue_reason_after_external_error(
+                &no_capacity,
+                &server_error,
+                Some("local_transient_exhausted")
+            ),
+            Some("external_error")
+        );
+        assert_eq!(
+            local_rescue_reason_after_external_error(
+                &no_capacity,
+                &server_error,
+                Some("local_capacity_exhausted")
+            ),
+            Some("external_error")
         );
     }
 

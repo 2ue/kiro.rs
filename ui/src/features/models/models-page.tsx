@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
   Plus,
   RefreshCw,
@@ -17,6 +17,7 @@ import {
 import {
   Badge,
   Button,
+  Checkbox,
   Dialog,
   DialogBody,
   DialogContent,
@@ -33,6 +34,7 @@ import {
   TableHead,
   TableHeader,
   TableRow,
+  Textarea,
 } from '@/components/ui'
 import { extractErrorMessage } from '@/lib/utils'
 import { formatNumber } from '@/lib/format'
@@ -44,7 +46,7 @@ import {
   useSyncModelPricing,
   useUpsertManualModel,
 } from '@/hooks/use-usage'
-import type { ModelCapabilityItem, UpsertManualModelRequest } from '@/types/api'
+import type { ModelCapabilityItem, ModelPricing, UpsertManualModelRequest } from '@/types/api'
 
 // ─── 工具 ──────────────────────────────────────────────────────────────────────
 
@@ -62,6 +64,125 @@ function formatTokens(v?: number): string {
 function formatUsdPerM(perToken?: number): string {
   if (perToken == null) return '—'
   return `$${(perToken * 1_000_000).toFixed(2)}`
+}
+
+function dollarsPerMillion(value?: number): string {
+  if (value == null || !Number.isFinite(value)) return ''
+  return String(Number((value * 1_000_000).toFixed(6)))
+}
+
+function optionalNumber(value: string): number | undefined {
+  const trimmed = value.trim()
+  if (!trimmed) return undefined
+  const parsed = Number(trimmed)
+  return Number.isFinite(parsed) ? parsed : Number.NaN
+}
+
+function positiveInteger(value: string): number | undefined {
+  const parsed = optionalNumber(value)
+  if (parsed === undefined) return undefined
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : Number.NaN
+}
+
+type ManualModelForm = {
+  model: string
+  displayName: string
+  description: string
+  maxInputTokens: string
+  maxOutputTokens: string
+  supportsPromptCaching: boolean
+  supportedInputTypes: {
+    TEXT: boolean
+    IMAGE: boolean
+  }
+  includePricing: boolean
+  inputCostPerMillion: string
+  outputCostPerMillion: string
+  cacheCreationInputCostPerMillion: string
+  cacheReadInputCostPerMillion: string
+}
+
+const emptyManualForm = (): ManualModelForm => ({
+  model: '',
+  displayName: '',
+  description: '',
+  maxInputTokens: '200000',
+  maxOutputTokens: '64000',
+  supportsPromptCaching: true,
+  supportedInputTypes: {
+    TEXT: true,
+    IMAGE: true,
+  },
+  includePricing: false,
+  inputCostPerMillion: '',
+  outputCostPerMillion: '',
+  cacheCreationInputCostPerMillion: '',
+  cacheReadInputCostPerMillion: '',
+})
+
+function formFromModel(item?: ModelCapabilityItem, price?: ModelPricing): ManualModelForm {
+  if (!item) return emptyManualForm()
+  return {
+    model: item.model,
+    displayName: item.displayName || item.model,
+    description: item.description || '',
+    maxInputTokens: item.maxInputTokens ? String(item.maxInputTokens) : '',
+    maxOutputTokens: item.maxOutputTokens ? String(item.maxOutputTokens) : '',
+    supportsPromptCaching: item.supportsPromptCaching ?? true,
+    supportedInputTypes: {
+      TEXT: item.supportedInputTypes?.some((type) => type.toUpperCase() === 'TEXT') ?? true,
+      IMAGE: item.supportedInputTypes?.some((type) => type.toUpperCase() === 'IMAGE') ?? false,
+    },
+    includePricing: Boolean(price),
+    inputCostPerMillion: dollarsPerMillion(price?.inputCostPerToken),
+    outputCostPerMillion: dollarsPerMillion(price?.outputCostPerToken),
+    cacheCreationInputCostPerMillion: dollarsPerMillion(price?.cacheCreationInputTokenCost),
+    cacheReadInputCostPerMillion: dollarsPerMillion(price?.cacheReadInputTokenCost),
+  }
+}
+
+function buildManualPayload(form: ManualModelForm): UpsertManualModelRequest {
+  const supportedInputTypes = Object.entries(form.supportedInputTypes)
+    .filter(([, enabled]) => enabled)
+    .map(([type]) => type)
+  const maxInputTokens = positiveInteger(form.maxInputTokens)
+  const maxOutputTokens = positiveInteger(form.maxOutputTokens)
+  if (Number.isNaN(maxInputTokens) || Number.isNaN(maxOutputTokens)) {
+    throw new Error('输入上限和输出上限必须是大于 0 的整数，或留空')
+  }
+  const payload: UpsertManualModelRequest = {
+    model: form.model.trim().toLowerCase(),
+    displayName: form.displayName.trim() || undefined,
+    description: form.description.trim() || undefined,
+    maxInputTokens,
+    maxOutputTokens,
+    supportsPromptCaching: form.supportsPromptCaching,
+    supportedInputTypes,
+    clearPricing: !form.includePricing,
+  }
+  if (form.includePricing) {
+    const input = optionalNumber(form.inputCostPerMillion)
+    const output = optionalNumber(form.outputCostPerMillion)
+    const cacheCreation = optionalNumber(form.cacheCreationInputCostPerMillion)
+    const cacheRead = optionalNumber(form.cacheReadInputCostPerMillion)
+    if (
+      !Number.isFinite(input) ||
+      !Number.isFinite(output) ||
+      (input as number) < 0 ||
+      (output as number) < 0 ||
+      (cacheCreation !== undefined && (!Number.isFinite(cacheCreation) || cacheCreation < 0)) ||
+      (cacheRead !== undefined && (!Number.isFinite(cacheRead) || cacheRead < 0))
+    ) {
+      throw new Error('价格必须是有效数字')
+    }
+    payload.pricing = {
+      inputCostPerMillion: input as number,
+      outputCostPerMillion: output as number,
+      cacheCreationInputCostPerMillion: cacheCreation,
+      cacheReadInputCostPerMillion: cacheRead,
+    }
+  }
+  return payload
 }
 
 // ─── ModelsPage ───────────────────────────────────────────────────────────────
@@ -196,7 +317,7 @@ export function ModelsPage() {
           />
         ) : (
           <div className="scrollbar-thin overflow-x-auto">
-            <Table className="min-w-[700px]">
+            <Table className="min-w-[980px]">
               <TableHeader>
                 <TableRow>
                   <TableHead>模型 ID</TableHead>
@@ -204,8 +325,11 @@ export function ModelsPage() {
                   <TableHead className="text-right">最大输入</TableHead>
                   <TableHead className="text-right">最大输出</TableHead>
                   <TableHead>缓存支持</TableHead>
+                  <TableHead>输入类型</TableHead>
                   <TableHead className="text-right">输入价格/M</TableHead>
                   <TableHead className="text-right">输出价格/M</TableHead>
+                  <TableHead className="text-right">缓存写入/M</TableHead>
+                  <TableHead className="text-right">缓存读取/M</TableHead>
                   <TableHead>来源</TableHead>
                   <TableHead className="w-20" />
                 </TableRow>
@@ -235,11 +359,22 @@ export function ModelsPage() {
                           <span className="text-xs text-muted-foreground/50">—</span>
                         )}
                       </TableCell>
+                      <TableCell className="max-w-[140px] text-xs text-muted-foreground">
+                        <div className="truncate" title={item.supportedInputTypes?.join(', ') || ''}>
+                          {item.supportedInputTypes?.length ? item.supportedInputTypes.join(', ') : '—'}
+                        </div>
+                      </TableCell>
                       <TableCell className="text-right font-mono text-xs tabular-nums">
                         {formatUsdPerM(price?.inputCostPerToken)}
                       </TableCell>
                       <TableCell className="text-right font-mono text-xs tabular-nums">
                         {formatUsdPerM(price?.outputCostPerToken)}
+                      </TableCell>
+                      <TableCell className="text-right font-mono text-xs tabular-nums">
+                        {formatUsdPerM(price?.cacheCreationInputTokenCost)}
+                      </TableCell>
+                      <TableCell className="text-right font-mono text-xs tabular-nums">
+                        {formatUsdPerM(price?.cacheReadInputTokenCost)}
                       </TableCell>
                       <TableCell>
                         <Badge tone={manual ? 'primary' : 'neutral'}>
@@ -286,6 +421,7 @@ export function ModelsPage() {
         <EditModelDialog
           open
           initial={editTarget}
+          initialPricing={priceMap.get(editTarget.model)}
           onClose={() => setEditTarget(null)}
           onSaved={() => setEditTarget(null)}
         />
@@ -299,28 +435,36 @@ export function ModelsPage() {
 interface EditModelDialogProps {
   open: boolean
   initial?: ModelCapabilityItem
+  initialPricing?: ModelPricing
   onClose: () => void
   onSaved: () => void
 }
 
-function EditModelDialog({ open, initial, onClose, onSaved }: EditModelDialogProps) {
+function EditModelDialog({ open, initial, initialPricing, onClose, onSaved }: EditModelDialogProps) {
   const upsert = useUpsertManualModel()
-  const [model, setModel] = useState(initial?.model ?? '')
-  const [displayName, setDisplayName] = useState(initial?.displayName ?? '')
-  const [maxInput, setMaxInput] = useState(String(initial?.maxInputTokens ?? ''))
-  const [maxOutput, setMaxOutput] = useState(String(initial?.maxOutputTokens ?? ''))
-  const [caching, setCaching] = useState(initial?.supportsPromptCaching ?? false)
-  const [inputTypes, setInputTypes] = useState((initial?.supportedInputTypes ?? ['text']).join(', '))
+  const [form, setForm] = useState<ManualModelForm>(() => formFromModel(initial, initialPricing))
+
+  useEffect(() => {
+    if (open) setForm(formFromModel(initial, initialPricing))
+  }, [initial, initialPricing, open])
+
+  const update = <K extends keyof ManualModelForm>(key: K, value: ManualModelForm[K]) =>
+    setForm((prev) => ({ ...prev, [key]: value }))
+
+  const updateInputType = (type: keyof ManualModelForm['supportedInputTypes'], enabled: boolean) =>
+    setForm((prev) => ({
+      ...prev,
+      supportedInputTypes: { ...prev.supportedInputTypes, [type]: enabled },
+    }))
 
   const handleSave = () => {
-    if (!model.trim()) return toast.error('模型名称不能为空')
-    const payload: UpsertManualModelRequest = {
-      model: model.trim().toLowerCase(),
-      displayName: displayName.trim() || undefined,
-      maxInputTokens: maxInput ? Number(maxInput) : undefined,
-      maxOutputTokens: maxOutput ? Number(maxOutput) : undefined,
-      supportsPromptCaching: caching,
-      supportedInputTypes: inputTypes.split(',').map((s) => s.trim()).filter(Boolean),
+    if (!form.model.trim()) return toast.error('模型名称不能为空')
+    let payload: UpsertManualModelRequest
+    try {
+      payload = buildManualPayload(form)
+    } catch (error) {
+      toast.error(extractErrorMessage(error))
+      return
     }
     upsert.mutate(payload, {
       onSuccess: () => {
@@ -334,41 +478,147 @@ function EditModelDialog({ open, initial, onClose, onSaved }: EditModelDialogPro
 
   return (
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
-      <DialogContent className="max-w-lg">
+      <DialogContent width="max-w-4xl">
         <DialogHeader>
           <DialogTitle>{initial ? '编辑模型能力' : '手动添加模型'}</DialogTitle>
         </DialogHeader>
-        <DialogBody className="space-y-3">
-          <div className="space-y-1.5">
-            <Label>模型 ID</Label>
-            <Input
-              value={model}
-              placeholder="claude-opus-4-5"
-              disabled={!!initial}
-              onChange={(e) => setModel(e.target.value)}
-            />
-          </div>
-          <div className="space-y-1.5">
-            <Label>显示名称（可选）</Label>
-            <Input value={displayName} placeholder="Claude Opus 4.5" onChange={(e) => setDisplayName(e.target.value)} />
-          </div>
-          <div className="grid grid-cols-2 gap-3">
+        <DialogBody className="space-y-4">
+          <div className="grid gap-3 md:grid-cols-2">
+            <div className="space-y-1.5">
+              <Label>模型 ID</Label>
+              <Input
+                value={form.model}
+                placeholder="claude-opus-4-5"
+                disabled={!!initial || upsert.isPending}
+                onChange={(e) => update('model', e.target.value)}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label>显示名称（可选）</Label>
+              <Input
+                value={form.displayName}
+                placeholder="Claude Opus 4.5"
+                disabled={upsert.isPending}
+                onChange={(e) => update('displayName', e.target.value)}
+              />
+            </div>
             <div className="space-y-1.5">
               <Label>最大输入 Token</Label>
-              <Input type="number" value={maxInput} placeholder="200000" onChange={(e) => setMaxInput(e.target.value)} />
+              <Input
+                type="number"
+                min={1}
+                value={form.maxInputTokens}
+                placeholder="200000"
+                disabled={upsert.isPending}
+                onChange={(e) => update('maxInputTokens', e.target.value)}
+              />
             </div>
             <div className="space-y-1.5">
               <Label>最大输出 Token</Label>
-              <Input type="number" value={maxOutput} placeholder="32000" onChange={(e) => setMaxOutput(e.target.value)} />
+              <Input
+                type="number"
+                min={1}
+                value={form.maxOutputTokens}
+                placeholder="64000"
+                disabled={upsert.isPending}
+                onChange={(e) => update('maxOutputTokens', e.target.value)}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label>输入类型</Label>
+              <div className="flex h-9 items-center gap-4">
+                {(['TEXT', 'IMAGE'] as const).map((type) => (
+                  <label key={type} className="flex items-center gap-2 text-sm">
+                    <Checkbox
+                      checked={form.supportedInputTypes[type]}
+                      disabled={upsert.isPending}
+                      onCheckedChange={(checked) => updateInputType(type, checked === true)}
+                    />
+                    {type}
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div className="flex items-center gap-3">
+              <Switch
+                checked={form.supportsPromptCaching}
+                disabled={upsert.isPending}
+                onCheckedChange={(checked) => update('supportsPromptCaching', checked)}
+              />
+              <span className="text-sm">支持 Prompt Caching</span>
+            </div>
+            <div className="space-y-1.5 md:col-span-2">
+              <Label>描述（可选）</Label>
+              <Textarea
+                rows={3}
+                value={form.description}
+                disabled={upsert.isPending}
+                placeholder="用于说明模型能力或适用场景"
+                onChange={(e) => update('description', e.target.value)}
+              />
             </div>
           </div>
-          <div className="space-y-1.5">
-            <Label>支持的输入类型（逗号分隔）</Label>
-            <Input value={inputTypes} placeholder="text, image" onChange={(e) => setInputTypes(e.target.value)} />
-          </div>
-          <div className="flex items-center gap-3">
-            <Switch checked={caching} onCheckedChange={setCaching} />
-            <span className="text-sm">支持 Prompt Caching</span>
+
+          <div className="rounded-lg border border-border bg-muted/30 p-3">
+            <label className="flex items-center gap-2 text-sm font-medium">
+              <Checkbox
+                checked={form.includePricing}
+                disabled={upsert.isPending}
+                onCheckedChange={(checked) => update('includePricing', checked === true)}
+              />
+              同时维护价格
+            </label>
+            <p className="mt-1 text-xs text-muted-foreground">
+              关闭后保存会清除该手动模型的价格；开启后按每百万 Token 填写，缓存价格留空时使用后端默认规则。
+            </p>
+            {form.includePricing && (
+              <div className="mt-3 grid gap-3 md:grid-cols-4">
+                <div className="space-y-1.5">
+                  <Label>输入 $/M</Label>
+                  <Input
+                    type="number"
+                    min={0}
+                    step="0.000001"
+                    value={form.inputCostPerMillion}
+                    disabled={upsert.isPending}
+                    onChange={(e) => update('inputCostPerMillion', e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <Label>输出 $/M</Label>
+                  <Input
+                    type="number"
+                    min={0}
+                    step="0.000001"
+                    value={form.outputCostPerMillion}
+                    disabled={upsert.isPending}
+                    onChange={(e) => update('outputCostPerMillion', e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <Label>缓存写入 $/M</Label>
+                  <Input
+                    type="number"
+                    min={0}
+                    step="0.000001"
+                    value={form.cacheCreationInputCostPerMillion}
+                    disabled={upsert.isPending}
+                    onChange={(e) => update('cacheCreationInputCostPerMillion', e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <Label>缓存读取 $/M</Label>
+                  <Input
+                    type="number"
+                    min={0}
+                    step="0.000001"
+                    value={form.cacheReadInputCostPerMillion}
+                    disabled={upsert.isPending}
+                    onChange={(e) => update('cacheReadInputCostPerMillion', e.target.value)}
+                  />
+                </div>
+              </div>
+            )}
           </div>
         </DialogBody>
         <DialogFooter>

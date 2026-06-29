@@ -6,9 +6,14 @@ export interface KamAccount {
   userId?: string | null
   nickname?: string
   credentials: {
+    accessToken?: string
+    expiresAt?: string
     refreshToken: string
     clientId?: string
     clientSecret?: string
+    tokenEndpoint?: string
+    issuerUrl?: string
+    scopes?: string
     profileArn?: string
     region?: string
     apiRegion?: string
@@ -31,9 +36,14 @@ function normalizeKamAccount(item: unknown): unknown {
       status: typeof obj.status === 'string' ? obj.status : undefined,
       machineId: typeof obj.machineId === 'string' ? obj.machineId : undefined,
       credentials: {
+        accessToken: typeof obj.accessToken === 'string' ? obj.accessToken : undefined,
+        expiresAt: typeof obj.expiresAt === 'string' ? obj.expiresAt : typeof obj.expired === 'string' ? obj.expired : undefined,
         refreshToken: obj.refreshToken,
         clientId: typeof obj.clientId === 'string' ? obj.clientId : undefined,
         clientSecret: typeof obj.clientSecret === 'string' ? obj.clientSecret : undefined,
+        tokenEndpoint: typeof obj.tokenEndpoint === 'string' ? obj.tokenEndpoint : undefined,
+        issuerUrl: typeof obj.issuerUrl === 'string' ? obj.issuerUrl : undefined,
+        scopes: typeof obj.scopes === 'string' ? obj.scopes : typeof obj.scope === 'string' ? obj.scope : undefined,
         profileArn: typeof obj.profileArn === 'string' ? obj.profileArn : undefined,
         region: typeof obj.region === 'string' ? obj.region : undefined,
         apiRegion: typeof obj.apiRegion === 'string' ? obj.apiRegion : undefined,

@@ -2777,27 +2777,29 @@ impl AdminService {
     ) -> Result<BatchUpdateCredentialsResponse, AdminServiceError> {
         if req.ids.is_empty() {
             return Err(AdminServiceError::InvalidCredential(
-                "没有选择要修改的凭据".to_string(),
+                "没有选择要修改的账号".to_string(),
             ));
         }
         if req.ids.len() > MAX_CREDENTIALS_PAGE_LIMIT {
             return Err(AdminServiceError::InvalidCredential(format!(
-                "单次最多修改 {} 个凭据",
+                "单次最多修改 {} 个账号",
                 MAX_CREDENTIALS_PAGE_LIMIT
             )));
         }
-        if req.regions.is_none()
+        if req.priority.is_none()
+            && req.regions.is_none()
             && req.concurrency.is_none()
             && req.rpm.is_none()
             && req.proxy.is_none()
         {
             return Err(AdminServiceError::InvalidCredential(
-                "没有选择任何要修改的字段".to_string(),
+                "没有选择任何要修改的账号字段".to_string(),
             ));
         }
 
         let mut seen = HashSet::new();
         let ids: Vec<u64> = req.ids.into_iter().filter(|id| seen.insert(*id)).collect();
+        let priority = req.priority.map(|value| value.priority);
         let regions = req.regions.map(|regions| {
             (
                 normalize_optional_update(regions.region),
@@ -2822,18 +2824,30 @@ impl AdminService {
         for id in ids {
             let mut error: Option<String> = None;
 
-            if let Some((region, auth_region, api_region)) = &regions {
+            if let Some(priority) = priority {
                 if let Err(err) = self
                     .token_manager
-                    .set_credential_regions(
-                        id,
-                        region.clone(),
-                        auth_region.clone(),
-                        api_region.clone(),
-                    )
+                    .set_priority(id, priority)
                     .map_err(|e| self.classify_error(e, id))
                 {
                     error = Some(err.to_string());
+                }
+            }
+
+            if error.is_none() {
+                if let Some((region, auth_region, api_region)) = &regions {
+                    if let Err(err) = self
+                        .token_manager
+                        .set_credential_regions(
+                            id,
+                            region.clone(),
+                            auth_region.clone(),
+                            api_region.clone(),
+                        )
+                        .map_err(|e| self.classify_error(e, id))
+                    {
+                        error = Some(err.to_string());
+                    }
                 }
             }
 
@@ -2897,13 +2911,15 @@ impl AdminService {
             "credential",
             None,
             failed == 0,
-            (failed > 0).then(|| format!("{} 个凭据修改失败", failed)),
+            (failed > 0).then(|| format!("{} 个账号修改失败", failed)),
             json!({
                 "total": items.len(),
                 "success": success,
                 "failed": failed,
+                "priority": priority.is_some(),
                 "regions": regions.is_some(),
                 "concurrency": concurrency.is_some(),
+                "rpm": rpm.is_some(),
                 "proxy": proxy.is_some(),
             }),
         );
@@ -3475,6 +3491,7 @@ impl AdminService {
             prompt_cache_entry_ttl_secs: config.prompt_cache_entry_ttl_secs,
             prompt_cache_estimated_bytes_limit: config.prompt_cache_estimated_bytes_limit,
             reported_usage: config.reported_usage.normalized(),
+            cache_policy: config.cache_policy.normalized(),
             defined_cache_routes: normalize_defined_cache_routes(&config.defined_cache_routes),
             external_pools: config.external_pools.clone(),
             high_cache_threshold: config.high_cache_threshold,
@@ -3653,6 +3670,11 @@ impl AdminService {
             .clone()
             .unwrap_or_else(|| current_config.reported_usage.clone())
             .normalized();
+        let cache_policy_raw = req
+            .cache_policy
+            .clone()
+            .unwrap_or_else(|| current_config.cache_policy.clone());
+        let cache_policy = cache_policy_raw.normalized();
         let defined_cache_routes = match req.defined_cache_routes {
             Some(ref routes) => {
                 let has_invalid = routes.iter().any(|route| {
@@ -3849,6 +3871,31 @@ impl AdminService {
                 "promptCacheEntryTtlSecs 必须大于 0".to_string(),
             ));
         }
+        let mut cache_validation_config = current_config.clone();
+        cache_validation_config.prompt_cache_target_read_ratio = prompt_cache_target_read_ratio;
+        cache_validation_config.prompt_cache_token_scale = prompt_cache_token_scale;
+        cache_validation_config.prompt_cache_max_simulated_input_tokens =
+            prompt_cache_max_simulated_input_tokens;
+        cache_validation_config.prompt_cache_cap_jitter_min_tokens =
+            prompt_cache_cap_jitter_min_tokens;
+        cache_validation_config.prompt_cache_cap_jitter_max_tokens =
+            prompt_cache_cap_jitter_max_tokens;
+        cache_validation_config.prompt_cache_scale_min_input_tokens =
+            prompt_cache_scale_min_input_tokens;
+        cache_validation_config.prompt_cache_creation_control = prompt_cache_creation_control;
+        cache_validation_config.prompt_cache_max_entries_per_account =
+            prompt_cache_max_entries_per_account;
+        cache_validation_config.prompt_cache_max_entries_global = prompt_cache_max_entries_global;
+        cache_validation_config.prompt_cache_entry_ttl_secs = prompt_cache_entry_ttl_secs;
+        cache_validation_config.prompt_cache_estimated_bytes_limit =
+            prompt_cache_estimated_bytes_limit;
+        cache_validation_config.reported_usage = reported_usage.clone();
+        cache_validation_config.kiro_cache_point_enabled = kiro_cache_point_enabled;
+        cache_validation_config.kiro_cache_point_tools_only = kiro_cache_point_tools_only;
+        cache_validation_config.kiro_cache_point_record_plan = kiro_cache_point_record_plan;
+        cache_policy_raw
+            .validate(cache_validation_config.legacy_cache_route_policy_default())
+            .map_err(AdminServiceError::InvalidCredential)?;
         validate_external_pools_config(&external_pools)
             .map_err(AdminServiceError::InvalidCredential)?;
         if high_cache_threshold < 0 {
@@ -3927,6 +3974,7 @@ impl AdminService {
                 config.prompt_cache_entry_ttl_secs = prompt_cache_entry_ttl_secs;
                 config.prompt_cache_estimated_bytes_limit = prompt_cache_estimated_bytes_limit;
                 config.reported_usage = reported_usage;
+                config.cache_policy = cache_policy;
                 config.defined_cache_routes = defined_cache_routes;
                 config.external_pools = external_pools;
                 config.high_cache_threshold = high_cache_threshold;
@@ -5064,6 +5112,16 @@ fn credential_matches_query(
                 credential.effective_proxy_source.as_str(),
                 "resource_disabled" | "resource_missing"
             ),
+            "custom_priority" | "custom-priority" => credential.priority != 0,
+            "custom_concurrency" | "custom-concurrency" => {
+                credential.max_concurrent_requests_override.is_some()
+            }
+            "custom_rpm" | "custom-rpm" => credential.rpm_override.is_some(),
+            "custom_scheduling" | "custom-scheduling" => {
+                credential.priority != 0
+                    || credential.max_concurrent_requests_override.is_some()
+                    || credential.rpm_override.is_some()
+            }
             "error" => {
                 credential.failure_count > 0
                     || credential.refresh_failure_count > 0
@@ -5139,6 +5197,16 @@ fn credential_base_matches_query(
                 credential.effective_proxy_source.as_str(),
                 "resource_disabled" | "resource_missing"
             ),
+            "custom_priority" | "custom-priority" => credential.priority != 0,
+            "custom_concurrency" | "custom-concurrency" => {
+                credential.max_concurrent_requests_override.is_some()
+            }
+            "custom_rpm" | "custom-rpm" => credential.rpm_override.is_some(),
+            "custom_scheduling" | "custom-scheduling" => {
+                credential.priority != 0
+                    || credential.max_concurrent_requests_override.is_some()
+                    || credential.rpm_override.is_some()
+            }
             "unknown_subscription" | "unknown-subscription" => {
                 subscription_key(credential.subscription_title.as_deref()) == "unknown"
             }
@@ -5187,6 +5255,8 @@ fn credential_subscription_title(credential: &CredentialStatusItem) -> Option<St
 fn credential_search_text(credential: &CredentialStatusItem) -> String {
     [
         Some(credential.id.to_string()),
+        Some(format!("#{}", credential.id)),
+        Some(format!("id:{}", credential.id)),
         credential.email.clone(),
         credential.masked_api_key.clone(),
         credential.refresh_token_hash.clone(),
@@ -5202,6 +5272,18 @@ fn credential_search_text(credential: &CredentialStatusItem) -> String {
         credential.last_error_reason.clone(),
         Some(credential.endpoint.clone()),
         credential.auth_method.clone(),
+        Some(format!("priority:{}", credential.priority)),
+        Some(format!(
+            "concurrency:{}",
+            credential.max_concurrent_requests
+        )),
+        credential
+            .max_concurrent_requests_override
+            .map(|value| format!("concurrency-override:{}", value)),
+        Some(format!("rpm:{}", credential.rpm)),
+        credential
+            .rpm_override
+            .map(|value| format!("rpm-override:{}", value)),
     ]
     .into_iter()
     .flatten()
@@ -5213,6 +5295,8 @@ fn credential_search_text(credential: &CredentialStatusItem) -> String {
 fn credential_base_search_text(credential: &CredentialListItem) -> String {
     [
         Some(credential.id.to_string()),
+        Some(format!("#{}", credential.id)),
+        Some(format!("id:{}", credential.id)),
         credential.email.clone(),
         credential.masked_api_key.clone(),
         credential.refresh_token_hash.clone(),
@@ -5229,6 +5313,18 @@ fn credential_base_search_text(credential: &CredentialListItem) -> String {
         credential.region.clone(),
         credential.auth_region.clone(),
         credential.api_region.clone(),
+        Some(format!("priority:{}", credential.priority)),
+        Some(format!(
+            "concurrency:{}",
+            credential.max_concurrent_requests
+        )),
+        credential
+            .max_concurrent_requests_override
+            .map(|value| format!("concurrency-override:{}", value)),
+        Some(format!("rpm:{}", credential.rpm)),
+        credential
+            .rpm_override
+            .map(|value| format!("rpm-override:{}", value)),
     ]
     .into_iter()
     .flatten()
@@ -5971,6 +6067,43 @@ mod tests {
             .map(|credential| credential.id)
             .collect();
         assert_eq!(ids, vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn credential_filters_and_search_match_scheduling_overrides() {
+        let mut credential = credential_item(9, false, Some("2026-01-01T00:00:00Z"), 0, 0.0, None);
+        credential.priority = 4;
+        credential.max_concurrent_requests = 7;
+        credential.max_concurrent_requests_override = Some(7);
+        credential.rpm = 60;
+        credential.rpm_override = Some(60);
+
+        for status in [
+            "custom_priority",
+            "custom_concurrency",
+            "custom_rpm",
+            "custom_scheduling",
+        ] {
+            let query = CredentialListQuery {
+                status: Some(status.to_string()),
+                ..Default::default()
+            };
+            assert!(
+                credential_matches_query(&credential, &query),
+                "{status} should match"
+            );
+        }
+
+        for q in ["#9", "id:9", "priority:4", "concurrency:7", "rpm:60"] {
+            let query = CredentialListQuery {
+                q: Some(q.to_string()),
+                ..Default::default()
+            };
+            assert!(
+                credential_matches_query(&credential, &query),
+                "{q} should match"
+            );
+        }
     }
 
     #[test]

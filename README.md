@@ -476,8 +476,32 @@ RUST_LOG=debug ./target/release/kiro-rs
 | `KIRO_RS_IMAGE` | `ghcr.io/2ue/kiro-rs` | `docker-compose.deploy.yml` 使用的镜像仓库 |
 | `KIRO_RS_VERSION` | `latest` | `docker-compose.deploy.yml` 使用的镜像 tag |
 | `KIRO_RS_PORT` | `8990` | Docker 部署时映射到宿主机的端口 |
+| `KIRO_UI_MODE` | `embedded` | 新版 `/ui` 的服务模式：`embedded` / `redirect` / `proxy` / `filesystem` / `disabled` |
+| `KIRO_UI_DIR` | `ui/dist` | `KIRO_UI_MODE=filesystem` 时读取的新版 UI 构建目录 |
+| `KIRO_UI_DEV_SERVER` | - | `KIRO_UI_MODE=redirect` 或 `proxy` 时使用的新版 UI 前端服务地址，例如 `http://127.0.0.1:9023` |
+| `KIRO_ADMIN_UI_MODE` | `embedded` | 旧版 `/admin` 的服务模式，取值同 `KIRO_UI_MODE` |
+| `KIRO_CONSOLE_UI_MODE` | `embedded` | `/console` 的服务模式，取值同 `KIRO_UI_MODE` |
 
-Admin UI 本地开发时还可以用 `VITE_API_PROXY_TARGET` 覆盖 Vite 代理后端地址，默认 `http://localhost:8080`。
+生产默认使用 `embedded`，前端构建产物编进后端二进制，部署仍是单服务，不需要额外挂载 UI 目录。开发环境使用 Vite 单独运行前端，前端通过 `/api` 代理到 9022；如果需要临时验证其他部署方式，也可以显式设置 `filesystem`、`redirect` 或 `proxy`。
+
+新版 UI 本地开发示例：
+
+```bash
+# 后端 API，仍然监听 9022
+./target/release/kiro-rs -c config.json --credentials credentials.json
+
+# 前端开发服务，监听 9023，/api 自动代理到 9022
+pnpm --dir ui dev
+```
+
+如果希望访问后端 `/ui` 时跳到前端开发服务，可以这样启动后端：
+
+```bash
+KIRO_UI_MODE=redirect KIRO_UI_DEV_SERVER=http://127.0.0.1:9023 \
+  ./target/release/kiro-rs -c config.json --credentials credentials.json
+```
+
+Vite 代理后端地址可以用 `VITE_API_PROXY_TARGET` 覆盖，默认 `http://127.0.0.1:9022`。
 
 ## API 端点
 
@@ -637,8 +661,8 @@ kiro-rs/
 │   │   ├── types.rs            # 类型定义
 │   │   ├── middleware.rs       # 认证中间件
 │   │   └── error.rs            # 错误处理
-│   ├── admin_ui/               # Admin UI 静态文件嵌入
-│   │   └── router.rs           # 静态文件路由
+│   ├── admin_ui/               # Admin UI 静态文件服务
+│   │   └── router.rs           # embedded / redirect / proxy / filesystem 路由
 │   ├── storage/                # PgSQL 和 Redis 存储
 │   │   ├── postgres.rs         # PgSQL 表结构和读写
 │   │   └── redis_cache.rs      # Redis 缓存和调度运行态

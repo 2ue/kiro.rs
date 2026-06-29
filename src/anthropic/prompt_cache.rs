@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -22,27 +21,12 @@ const DEFAULT_MAX_ENTRY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const DEFAULT_ESTIMATED_BYTES_LIMIT: u64 = 256 * 1024 * 1024;
 const ESTIMATED_ENTRY_BYTES: u64 = 256;
 
-#[derive(Debug, Clone, Eq)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct PromptCacheScope {
     pub credential_id: u64,
     pub conversation_id: String,
     pub model: String,
-}
-
-impl PartialEq for PromptCacheScope {
-    fn eq(&self, other: &Self) -> bool {
-        self.credential_id == other.credential_id
-            && self.conversation_id == other.conversation_id
-            && self.model == other.model
-    }
-}
-
-impl Hash for PromptCacheScope {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.credential_id.hash(state);
-        self.conversation_id.hash(state);
-        self.model.hash(state);
-    }
+    pub route_namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -941,6 +925,7 @@ mod tests {
             credential_id: 1,
             conversation_id: "session-a".to_string(),
             model: req.model.clone(),
+            route_namespace: None,
         };
 
         let first = tracker.compute(Some(scope.clone()), Some(&profile), 0.85);
@@ -963,6 +948,7 @@ mod tests {
             credential_id: 1,
             conversation_id: "high-cache-session".to_string(),
             model: req.model.clone(),
+            route_namespace: None,
         };
 
         let first = tracker.compute(Some(scope.clone()), Some(&profile), 0.95);
@@ -1001,6 +987,7 @@ mod tests {
             credential_id: 1,
             conversation_id: "haiku-threshold-session".to_string(),
             model: "claude-haiku-4-5-20251001".to_string(),
+            route_namespace: None,
         };
 
         let short = tracker.compute(Some(scope.clone()), Some(&profile), 0.95);
@@ -1051,6 +1038,7 @@ mod tests {
             credential_id: 1,
             conversation_id: "tool-cache-session".to_string(),
             model: req.model.clone(),
+            route_namespace: None,
         };
 
         let first = tracker.compute(Some(scope.clone()), Some(&profile), 0.85);
@@ -1078,11 +1066,13 @@ mod tests {
             credential_id: 1,
             conversation_id: "a".to_string(),
             model: req.model.clone(),
+            route_namespace: None,
         };
         let scope_b = PromptCacheScope {
             credential_id: 2,
             conversation_id: "a".to_string(),
             model: req.model.clone(),
+            route_namespace: None,
         };
         tracker.update(Some(scope_a), Some(&profile), 0.85);
         let usage = tracker.compute(Some(scope_b), Some(&profile), 0.85);
@@ -1123,6 +1113,7 @@ mod tests {
             credential_id: 1,
             conversation_id: "ttl-session".to_string(),
             model: req.model.clone(),
+            route_namespace: None,
         };
 
         let usage = tracker.compute(Some(scope), Some(&profile), 0.85);
@@ -1138,6 +1129,7 @@ mod tests {
             credential_id: 1,
             conversation_id: "growing-session".to_string(),
             model: "claude-sonnet-4-5".to_string(),
+            route_namespace: None,
         };
         let shared_prefix = "stable project context and tool transcript ".repeat(500);
         let new_tail = "new user turn and assistant result ".repeat(500);
@@ -1188,6 +1180,7 @@ mod tests {
             credential_id: 1,
             conversation_id: "target-ratio-session".to_string(),
             model: "claude-sonnet-4-5".to_string(),
+            route_namespace: None,
         };
         let mut req = request("cacheable target ratio block ".repeat(4000));
         req.messages[0].content = json!([
@@ -1212,6 +1205,7 @@ mod tests {
             credential_id: 2,
             conversation_id: scope.conversation_id,
             model: scope.model,
+            route_namespace: None,
         };
         let isolated = tracker.compute(Some(different_scope), Some(&profile), 0.95);
         assert_eq!(
@@ -1219,6 +1213,34 @@ mod tests {
             "local prompt cache must not invent reads across credentials"
         );
         assert!(isolated.cache_creation_input_tokens > 0);
+    }
+
+    #[test]
+    fn route_namespace_prevents_cross_route_cache_reads() {
+        let tracker = PromptCacheTracker::default();
+        let req = request("route namespace cache block ".repeat(4000));
+        let profile = tracker
+            .build_high_cache_profile(&req, 120_000)
+            .expect("high-cache profile");
+        let default_scope = PromptCacheScope {
+            credential_id: 1,
+            conversation_id: "route-namespace-session".to_string(),
+            model: req.model.clone(),
+            route_namespace: None,
+        };
+        let custom_scope = PromptCacheScope {
+            route_namespace: Some("/dfcache/team-a".to_string()),
+            ..default_scope.clone()
+        };
+
+        tracker.update(Some(default_scope.clone()), Some(&profile), 0.95);
+
+        let default_usage = tracker.compute(Some(default_scope), Some(&profile), 0.95);
+        let custom_usage = tracker.compute(Some(custom_scope), Some(&profile), 0.95);
+
+        assert!(default_usage.cache_read_input_tokens > 0);
+        assert_eq!(custom_usage.cache_read_input_tokens, 0);
+        assert!(custom_usage.cache_creation_input_tokens > 0);
     }
 
     #[test]
@@ -1268,6 +1290,7 @@ mod tests {
             credential_id: 1,
             conversation_id: "volatile-tool-id-session".to_string(),
             model: first_req.model.clone(),
+            route_namespace: None,
         };
         tracker.update(Some(scope.clone()), Some(&first_profile), 0.85);
         let usage = tracker.compute(Some(scope), Some(&second_profile), 0.85);
@@ -1326,6 +1349,7 @@ mod tests {
                 credential_id: 7,
                 conversation_id: conversation_id.to_string(),
                 model: req.model,
+                route_namespace: None,
             };
             tracker.update_with_bounds(Some(scope), Some(&profile), 0.85, bounds);
         }
@@ -1360,6 +1384,7 @@ mod tests {
                 credential_id,
                 conversation_id: format!("global-session-{credential_id}"),
                 model: req.model,
+                route_namespace: None,
             };
             tracker.update_with_bounds(Some(scope), Some(&profile), 0.85, bounds);
         }

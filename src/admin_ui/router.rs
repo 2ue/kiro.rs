@@ -1,12 +1,19 @@
 //! Admin UI 路由配置
 
+use std::{
+    env,
+    path::{Component, Path, PathBuf},
+    sync::OnceLock,
+};
+
 use axum::{
     Router,
     body::Body,
+    extract::State,
     http::{Response, StatusCode, Uri, header},
-    response::IntoResponse,
     routing::get,
 };
+
 use rust_embed::Embed;
 
 /// 嵌入旧版前端构建产物
@@ -55,59 +62,178 @@ impl UiAsset for NewUiAsset {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiServeMode {
+    Embedded,
+    Filesystem,
+    Redirect,
+    Proxy,
+    Disabled,
+}
+
+impl UiServeMode {
+    fn from_env(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "embedded" | "embed" => Some(Self::Embedded),
+            "filesystem" | "fs" | "dir" | "dist" => Some(Self::Filesystem),
+            "redirect" | "external" => Some(Self::Redirect),
+            "proxy" => Some(Self::Proxy),
+            "disabled" | "disable" | "off" | "none" => Some(Self::Disabled),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Embedded => "embedded",
+            Self::Filesystem => "filesystem",
+            Self::Redirect => "redirect",
+            Self::Proxy => "proxy",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct UiServeState {
+    name: &'static str,
+    mount_prefix: &'static str,
+    env_prefix: &'static str,
+    mode: UiServeMode,
+    filesystem_dir: PathBuf,
+    external_url: Option<String>,
+    build_hint: &'static str,
+}
+
+impl UiServeState {
+    fn from_env(
+        name: &'static str,
+        mount_prefix: &'static str,
+        env_prefix: &'static str,
+        fallback_env_prefix: Option<&'static str>,
+        default_dir: &'static str,
+        build_hint: &'static str,
+    ) -> Self {
+        let mode = read_ui_env(env_prefix, fallback_env_prefix, "MODE")
+            .as_deref()
+            .and_then(UiServeMode::from_env)
+            .or_else(|| {
+                read_ui_env(env_prefix, fallback_env_prefix, "DEV_SERVER")
+                    .or_else(|| read_ui_env(env_prefix, fallback_env_prefix, "EXTERNAL_URL"))
+                    .map(|_| UiServeMode::Redirect)
+            })
+            .unwrap_or(UiServeMode::Embedded);
+        let filesystem_dir = read_ui_env(env_prefix, fallback_env_prefix, "DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(default_dir));
+        let external_url = read_ui_env(env_prefix, fallback_env_prefix, "DEV_SERVER")
+            .or_else(|| read_ui_env(env_prefix, fallback_env_prefix, "EXTERNAL_URL"))
+            .map(|value| value.trim().trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty());
+
+        tracing::info!(
+            ui = name,
+            mount = mount_prefix,
+            mode = mode.as_str(),
+            dir = %filesystem_dir.display(),
+            external_url = external_url.as_deref().unwrap_or(""),
+            "UI 服务模式"
+        );
+
+        Self {
+            name,
+            mount_prefix,
+            env_prefix,
+            mode,
+            filesystem_dir,
+            external_url,
+            build_hint,
+        }
+    }
+}
+
+fn read_ui_env(
+    env_prefix: &str,
+    fallback_env_prefix: Option<&str>,
+    suffix: &str,
+) -> Option<String> {
+    let specific_key = format!("{env_prefix}_{suffix}");
+    env::var(&specific_key).ok().or_else(|| {
+        fallback_env_prefix.and_then(|prefix| env::var(format!("{prefix}_{suffix}")).ok())
+    })
+}
+
 /// 创建旧版 Admin UI 路由
 pub fn create_admin_ui_router() -> Router {
-    Router::new()
-        .route("/", get(admin_index_handler))
-        .route("/{*file}", get(admin_static_handler))
+    create_ui_router::<AdminAsset>(UiServeState::from_env(
+        "admin",
+        "/admin",
+        "KIRO_ADMIN_UI",
+        None,
+        "admin-ui/dist",
+        AdminAsset::BUILD_HINT,
+    ))
 }
 
 /// 创建新版 Console UI 路由
 pub fn create_console_ui_router() -> Router {
-    Router::new()
-        .route("/", get(console_index_handler))
-        .route("/{*file}", get(console_static_handler))
+    create_ui_router::<ConsoleAsset>(UiServeState::from_env(
+        "console",
+        "/console",
+        "KIRO_CONSOLE_UI",
+        None,
+        "admin-ui-daisy/dist",
+        ConsoleAsset::BUILD_HINT,
+    ))
 }
 
 /// 创建重构版 UI 路由
 pub fn create_new_ui_router() -> Router {
+    create_ui_router::<NewUiAsset>(UiServeState::from_env(
+        "ui",
+        "/ui",
+        "KIRO_NEW_UI",
+        Some("KIRO_UI"),
+        "ui/dist",
+        NewUiAsset::BUILD_HINT,
+    ))
+}
+
+fn create_ui_router<A: UiAsset + Send + Sync + 'static>(state: UiServeState) -> Router {
     Router::new()
-        .route("/", get(new_ui_index_handler))
-        .route("/{*file}", get(new_ui_static_handler))
+        .route("/", get(ui_index_handler::<A>))
+        .route("/{*file}", get(ui_static_handler::<A>))
+        .with_state(state)
 }
 
-/// 处理旧版首页请求
-async fn admin_index_handler() -> impl IntoResponse {
-    serve_index::<AdminAsset>()
+async fn ui_index_handler<A: UiAsset>(
+    State(state): State<UiServeState>,
+    uri: Uri,
+) -> Response<Body> {
+    match state.mode {
+        UiServeMode::Embedded => serve_embedded_index::<A>(),
+        UiServeMode::Filesystem => serve_filesystem_index(&state).await,
+        UiServeMode::Redirect => redirect_to_external(&state, &uri),
+        UiServeMode::Proxy => proxy_external(&state, &uri).await,
+        UiServeMode::Disabled => ui_disabled_response(&state),
+    }
 }
 
-/// 处理新版首页请求
-async fn console_index_handler() -> impl IntoResponse {
-    serve_index::<ConsoleAsset>()
-}
-
-/// 处理旧版静态文件请求
-async fn admin_static_handler(uri: Uri) -> impl IntoResponse {
-    static_handler::<AdminAsset>(uri)
-}
-
-/// 处理新版静态文件请求
-async fn console_static_handler(uri: Uri) -> impl IntoResponse {
-    static_handler::<ConsoleAsset>(uri)
-}
-
-/// 处理重构版首页请求
-async fn new_ui_index_handler() -> impl IntoResponse {
-    serve_index::<NewUiAsset>()
-}
-
-/// 处理重构版静态文件请求
-async fn new_ui_static_handler(uri: Uri) -> impl IntoResponse {
-    static_handler::<NewUiAsset>(uri)
+async fn ui_static_handler<A: UiAsset>(
+    State(state): State<UiServeState>,
+    uri: Uri,
+) -> Response<Body> {
+    match state.mode {
+        UiServeMode::Embedded => serve_embedded_static::<A>(&uri),
+        UiServeMode::Filesystem => serve_filesystem_static(&state, &uri).await,
+        UiServeMode::Redirect => redirect_to_external(&state, &uri),
+        UiServeMode::Proxy => proxy_external(&state, &uri).await,
+        UiServeMode::Disabled => ui_disabled_response(&state),
+    }
 }
 
 /// 处理静态文件请求
-fn static_handler<A: UiAsset>(uri: Uri) -> Response<Body> {
+fn serve_embedded_static<A: UiAsset>(uri: &Uri) -> Response<Body> {
     let path = uri.path().trim_start_matches('/');
 
     // 安全检查：拒绝包含 .. 的路径
@@ -137,7 +263,7 @@ fn static_handler<A: UiAsset>(uri: Uri) -> Response<Body> {
 
     // SPA fallback: 如果文件不存在且不是资源文件，返回 index.html
     if !is_asset_path(path) {
-        return serve_index::<A>();
+        return serve_embedded_index::<A>();
     }
 
     // 404
@@ -148,7 +274,7 @@ fn static_handler<A: UiAsset>(uri: Uri) -> Response<Body> {
 }
 
 /// 提供 index.html
-fn serve_index<A: UiAsset>() -> Response<Body> {
+fn serve_embedded_index<A: UiAsset>() -> Response<Body> {
     match A::get("index.html") {
         Some(content) => Response::builder()
             .status(StatusCode::OK)
@@ -161,6 +287,183 @@ fn serve_index<A: UiAsset>() -> Response<Body> {
             .body(Body::from(A::BUILD_HINT))
             .expect("Failed to build response"),
     }
+}
+
+async fn serve_filesystem_index(state: &UiServeState) -> Response<Body> {
+    serve_filesystem_file(state, "index.html", true).await
+}
+
+async fn serve_filesystem_static(state: &UiServeState, uri: &Uri) -> Response<Body> {
+    let path = uri.path().trim_start_matches('/');
+    if path.contains("..") {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from("Invalid path"))
+            .expect("Failed to build response");
+    }
+
+    let response = serve_filesystem_file(state, path, false).await;
+    if response.status() != StatusCode::NOT_FOUND || is_asset_path(path) {
+        return response;
+    }
+    serve_filesystem_index(state).await
+}
+
+async fn serve_filesystem_file(state: &UiServeState, path: &str, index: bool) -> Response<Body> {
+    let Some(file_path) = safe_join(&state.filesystem_dir, path) else {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from("Invalid path"))
+            .expect("Failed to build response");
+    };
+    match tokio::fs::read(&file_path).await {
+        Ok(bytes) => {
+            let mime = mime_guess::from_path(path)
+                .first_or_octet_stream()
+                .to_string();
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, mime)
+                .header(header::CACHE_CONTROL, get_cache_control(path))
+                .body(Body::from(bytes))
+                .expect("Failed to build response")
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let body = if index {
+                format!(
+                    "{} Filesystem UI directory not found or not built: {}",
+                    state.build_hint,
+                    state.filesystem_dir.display()
+                )
+            } else {
+                "Not found".to_string()
+            };
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::from(body))
+                .expect("Failed to build response")
+        }
+        Err(err) => Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from(format!("Failed to read UI file: {err}")))
+            .expect("Failed to build response"),
+    }
+}
+
+fn safe_join(base: &Path, path: &str) -> Option<PathBuf> {
+    let relative = if path.trim().is_empty() {
+        Path::new("index.html")
+    } else {
+        Path::new(path)
+    };
+    let mut output = base.to_path_buf();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => output.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(output)
+}
+
+fn redirect_to_external(state: &UiServeState, uri: &Uri) -> Response<Body> {
+    let Some(url) = external_ui_url(state, uri) else {
+        return missing_external_url_response(state);
+    };
+    Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header(header::LOCATION, url)
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::empty())
+        .expect("Failed to build response")
+}
+
+async fn proxy_external(state: &UiServeState, uri: &Uri) -> Response<Body> {
+    let Some(url) = external_ui_url(state, uri) else {
+        return missing_external_url_response(state);
+    };
+    let client = proxy_client();
+    match client.get(&url).send().await {
+        Ok(response) => {
+            let status = response.status();
+            let content_type = response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            match response.bytes().await {
+                Ok(bytes) => {
+                    let mut builder = Response::builder()
+                        .status(status)
+                        .header(header::CACHE_CONTROL, "no-cache");
+                    if let Some(content_type) = content_type {
+                        builder = builder.header(header::CONTENT_TYPE, content_type);
+                    }
+                    builder
+                        .body(Body::from(bytes))
+                        .expect("Failed to build response")
+                }
+                Err(err) => Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(Body::from(format!(
+                        "Failed to read UI proxy response: {err}"
+                    )))
+                    .expect("Failed to build response"),
+            }
+        }
+        Err(err) => Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Body::from(format!("UI dev server is unavailable: {err}")))
+            .expect("Failed to build response"),
+    }
+}
+
+fn proxy_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
+fn external_ui_url(state: &UiServeState, uri: &Uri) -> Option<String> {
+    let base = state.external_url.as_deref()?.trim_end_matches('/');
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
+    let mount_prefix = state.mount_prefix.trim_end_matches('/');
+    let path_and_query = if path_and_query == "/" {
+        "/"
+    } else {
+        path_and_query
+    };
+
+    let mounted_path = if base.ends_with(mount_prefix) {
+        path_and_query.to_string()
+    } else if path_and_query == "/" {
+        format!("{mount_prefix}/")
+    } else {
+        format!("{mount_prefix}{path_and_query}")
+    };
+    Some(format!("{base}{mounted_path}"))
+}
+
+fn missing_external_url_response(state: &UiServeState) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .body(Body::from(format!(
+            "{} UI mode requires {}_DEV_SERVER or {}_EXTERNAL_URL",
+            state.name.to_uppercase(),
+            state.env_prefix,
+            state.env_prefix
+        )))
+        .expect("Failed to build response")
+}
+
+fn ui_disabled_response(state: &UiServeState) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(Body::from(format!("{} UI is disabled", state.name)))
+        .expect("Failed to build response")
 }
 
 /// 根据文件类型返回合适的缓存策略
@@ -210,5 +513,45 @@ mod tests {
         assert!(new_ui.contains("/ui/assets/"));
         assert!(!new_ui.contains("/admin/assets/"));
         assert!(!new_ui.contains("/console/assets/"));
+    }
+
+    #[test]
+    fn external_ui_url_keeps_mount_prefix_once() {
+        let state = UiServeState {
+            name: "ui",
+            mount_prefix: "/ui",
+            env_prefix: "KIRO_UI",
+            mode: UiServeMode::Redirect,
+            filesystem_dir: PathBuf::from("ui/dist"),
+            external_url: Some("http://127.0.0.1:9023".to_string()),
+            build_hint: NewUiAsset::BUILD_HINT,
+        };
+        assert_eq!(
+            external_ui_url(&state, &"/".parse::<Uri>().unwrap()).as_deref(),
+            Some("http://127.0.0.1:9023/ui/")
+        );
+        assert_eq!(
+            external_ui_url(&state, &"/assets/app.js?x=1".parse::<Uri>().unwrap()).as_deref(),
+            Some("http://127.0.0.1:9023/ui/assets/app.js?x=1")
+        );
+
+        let mut state_with_mount = state.clone();
+        state_with_mount.external_url = Some("http://127.0.0.1:9023/ui".to_string());
+        assert_eq!(
+            external_ui_url(&state_with_mount, &"/assets/app.js".parse::<Uri>().unwrap())
+                .as_deref(),
+            Some("http://127.0.0.1:9023/ui/assets/app.js")
+        );
+    }
+
+    #[test]
+    fn safe_join_rejects_parent_and_absolute_paths() {
+        let base = Path::new("ui/dist");
+        assert_eq!(
+            safe_join(base, "").as_deref(),
+            Some(Path::new("ui/dist/index.html"))
+        );
+        assert!(safe_join(base, "../config.json").is_none());
+        assert!(safe_join(base, "/etc/passwd").is_none());
     }
 }

@@ -2712,6 +2712,81 @@ impl KiroProvider {
                     status,
                     body
                 );
+                if bad_request_reason == "profile_arn_bad_request" {
+                    tracing::warn!(
+                        credential_id = ctx.id,
+                        credential_label = %credential_label,
+                        "API 请求失败（{}，profileArn 可能失效，清理 profileArn 并尝试其他账号，尝试 {}/{}）: {} {}",
+                        credential_context,
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+                    Self::push_attempt(
+                        &mut attempts,
+                        attempt,
+                        ctx.id,
+                        &credential_label,
+                        Some(status),
+                        "profile_arn_retry",
+                        Some(bad_request_reason),
+                        Some(message.clone()),
+                        attempt_started_at,
+                        model.as_deref(),
+                    );
+                    if let Err(err) = self
+                        .token_manager
+                        .update_credential_profile_arn(ctx.id, None)
+                    {
+                        let final_message = format!(
+                            "{} API 请求失败（{}，profileArn 状态清理失败）: {}",
+                            api_type, credential_context, err
+                        );
+                        if let Some(last) = attempts.last_mut() {
+                            last.action = "fail".to_string();
+                            last.error_type = Some("scheduler_state_error".to_string());
+                            last.error_message = Some(final_message.clone());
+                        }
+                        Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                        self.finish_attempt(&mut ctx);
+                        return Err(Self::traced_error(final_message, &attempts));
+                    }
+                    if let Err(err) = self.token_manager.report_transient_failure_kind(
+                        ctx.id,
+                        model.as_deref(),
+                        TransientFailureKind::Protocol,
+                        None,
+                        format!("profile_arn_bad_request {} {}", status, body),
+                    ) {
+                        let final_message = format!(
+                            "{} API 请求失败（{}，调度状态写入失败）: {}",
+                            api_type, credential_context, err
+                        );
+                        if let Some(last) = attempts.last_mut() {
+                            last.action = "fail".to_string();
+                            last.error_type = Some("scheduler_state_error".to_string());
+                            last.error_message = Some(final_message.clone());
+                        }
+                        Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                        self.finish_attempt(&mut ctx);
+                        return Err(Self::traced_error(final_message, &attempts));
+                    }
+                    if let Some(session_id) = conversation_id.as_deref() {
+                        self.token_manager
+                            .unbind_session_if_bound_to(session_id, ctx.id);
+                    }
+                    if self.token_manager.has_alternate_usable_credential(
+                        model.as_deref(),
+                        &excluded_ids,
+                        ctx.id,
+                    ) {
+                        excluded_ids.insert(ctx.id);
+                    }
+                    last_error = Some(anyhow::anyhow!(message));
+                    self.finish_attempt(&mut ctx);
+                    continue;
+                }
                 Self::push_attempt(
                     &mut attempts,
                     attempt,

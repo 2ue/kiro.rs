@@ -45,6 +45,7 @@ pub(crate) mod prompt_cache;
 pub(crate) mod prompt_cache_creation_control;
 mod router;
 mod stream;
+pub(crate) mod tool_format_debug;
 pub mod types;
 pub(crate) mod usage;
 mod websearch;

@@ -488,10 +488,16 @@ export interface BatchUpdateCredentialsResponse {
 }
 
 export interface AddCredentialRequest {
+  accessToken?: string
+  expiresAt?: string
   refreshToken?: string
-  authMethod?: 'social' | 'idc' | 'api_key'
+  authMethod?: 'social' | 'idc' | 'external_idp' | 'api_key'
+  provider?: string
   clientId?: string
   clientSecret?: string
+  tokenEndpoint?: string
+  issuerUrl?: string
+  scopes?: string
   email?: string
   profileArn?: string
   priority?: number
@@ -1204,6 +1210,8 @@ export interface ExternalPoolTestRequest {
   prompt?: string
 }
 
+export type ThinkingTriggerMode = 'real_request' | 'always'
+
 export interface RuntimeConfig {
   proxyUrl?: string | null
   proxyUsername?: string | null
@@ -1223,6 +1231,7 @@ export interface RuntimeConfig {
   credentialMaxCooldownSecs: number
   credentialDispatchMaxWaitSecs: number
   kiroUpstreamResponseTimeoutSecs: number
+  kiroUpstreamStreamIdleTimeoutSecs: number
   credentialRetryMaxAttempts: number
   credentialInFlightLeaseMaxSecs: number
   dispatchGlobalMaxConcurrentRequests: number
@@ -1239,6 +1248,8 @@ export interface RuntimeConfig {
   schedulerSelectionPressureWeight: number
   schedulerTotalSelectionWeight: number
   schedulerTopK: number
+  selectionFailureSampleLimit: number
+  selectionFailureRecordEnabled: boolean
   compressionEnabled: boolean
   whitespaceCompression: boolean
   payloadGuardEnabled: boolean
@@ -1247,6 +1258,9 @@ export interface RuntimeConfig {
   payloadGuardSafetyMarginBytes: number
   payloadGuardTrimHistory: boolean
   payloadGuardExternalEnabled: boolean
+  kiroCachePointEnabled: boolean
+  kiroCachePointToolsOnly: boolean
+  kiroCachePointRecordPlan: boolean
   payloadShaping: PayloadShapingConfig
   promptCacheTargetReadRatio: number
   promptCacheTokenScale: number
@@ -1255,6 +1269,10 @@ export interface RuntimeConfig {
   promptCacheCapJitterMaxTokens: number
   promptCacheScaleMinInputTokens: number
   promptCacheCreationControl: PromptCacheCreationControlConfig
+  promptCacheMaxEntriesPerAccount: number
+  promptCacheMaxEntriesGlobal: number
+  promptCacheEntryTtlSecs: number
+  promptCacheEstimatedBytesLimit: number
   reportedUsage: ReportedUsageConfig
   cachePolicy: CachePolicyConfig
   definedCacheRoutes: string[]
@@ -1265,6 +1283,7 @@ export interface RuntimeConfig {
   modelResolutionMode: ModelResolutionMode
   modelMapping: ModelMappingConfig
   extractThinking: boolean
+  thinkingTriggerMode: ThinkingTriggerMode
   exposeProxyWarnings: boolean
 }
 
@@ -1297,7 +1316,7 @@ export interface UpdateAdminApiKeyRequest {
   adminApiKey: string
 }
 
-export type LoadBalancingMode = 'priority' | 'balanced' | 'health_balanced'
+export type LoadBalancingMode = 'priority' | 'balanced' | 'health_balanced' | 'weighted_least_inflight'
 
 export interface ModelPricing {
   inputCostPerToken: number

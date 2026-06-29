@@ -4057,8 +4057,13 @@ fn push_usage_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &UsageRec
         builder.push_bind(external_pool_id.to_string());
     }
     if let Some(model) = &query.model {
-        builder.push(" AND model = ");
+        builder.push(" AND (model = ");
         builder.push_bind(model.clone());
+        builder.push(" OR data->>'upstreamModel' = ");
+        builder.push_bind(model.clone());
+        builder.push(" OR data->>'externalOutboundModel' = ");
+        builder.push_bind(model.clone());
+        builder.push(")");
     }
     if let Some(status) = query.status {
         builder.push(" AND status = ");
@@ -5393,6 +5398,7 @@ mod tests {
             stream: false,
             model: "claude-sonnet-4-5".to_string(),
             upstream_model: None,
+            external_outbound_model: None,
             model_resolution_source: None,
             model_resolution_note: None,
             conversation_id: Some("session-a".to_string()),
@@ -5438,6 +5444,9 @@ mod tests {
             error_source: None,
             error_id: None,
             error_metadata: None,
+            public_error_status_code: None,
+            public_error_type: None,
+            public_error_message: None,
             payload_breakdown: None,
             payload_guard_report: None,
         }
@@ -5705,6 +5714,7 @@ mod tests {
             stream: id.ends_with('0'),
             model: "claude-sonnet-4-5".to_string(),
             upstream_model: Some("claude-sonnet-4-5".to_string()),
+            external_outbound_model: Some("claude-sonnet-4-5".to_string()),
             model_resolution_source: Some("exact".to_string()),
             model_resolution_note: None,
             conversation_id: Some(format!("external-session-{}", id)),
@@ -5766,6 +5776,9 @@ mod tests {
             error_source: None,
             error_id: None,
             error_metadata: None,
+            public_error_status_code: None,
+            public_error_type: None,
+            public_error_message: None,
             payload_breakdown: None,
             payload_guard_report: None,
         }

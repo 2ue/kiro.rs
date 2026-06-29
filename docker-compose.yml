@@ -8,4 +8,5 @@ services:
       - "${KIRO_RS_PORT:-8990}:8990"
     volumes:
       - ./config/:/app/config/
+      - ./logs/:/app/logs/
     restart: unless-stopped

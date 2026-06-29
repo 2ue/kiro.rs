@@ -13,9 +13,9 @@ use crate::common::auth::RequestApiKeyStore;
 use crate::external_pool::ExternalPoolManager;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
-    CompatProfile, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
-    PromptCacheCreationControlConfig, PromptCacheSimulationMode, ReportedUsageConfig,
-    ThinkingTriggerMode,
+    CachePolicyConfig, CompatProfile, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
+    PayloadShapingConfig, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
+    ReportedUsageConfig, ThinkingTriggerMode, ToolFormatDebugConfig,
 };
 
 use super::{
@@ -28,6 +28,7 @@ use super::{
     pricing::PricingCatalog,
     prompt_cache::{PromptCacheBounds, PromptCacheTracker},
     prompt_cache_creation_control::PromptCacheCreationController,
+    tool_format_debug::ToolFormatDebugRecorder,
     usage::UsageRecorder,
 };
 
@@ -76,6 +77,7 @@ pub fn create_router_with_provider(
     prompt_cache_creation_control: PromptCacheCreationControlConfig,
     prompt_cache_bounds: PromptCacheBounds,
     reported_usage: ReportedUsageConfig,
+    cache_policy: CachePolicyConfig,
     defined_cache_routes: Vec<String>,
     compat_profile: CompatProfile,
     thinking_trigger_mode: ThinkingTriggerMode,
@@ -93,8 +95,10 @@ pub fn create_router_with_provider(
     kiro_cache_point_record_plan: bool,
     kiro_upstream_stream_idle_timeout_secs: u64,
     payload_shaping: PayloadShapingConfig,
+    tool_format_debug: ToolFormatDebugConfig,
     external_pool_manager: Option<Arc<ExternalPoolManager>>,
 ) -> Router {
+    let tool_format_debug_recorder = ToolFormatDebugRecorder::new(tool_format_debug);
     let mut base_state = AppState::new(
         request_api_keys,
         extract_thinking,
@@ -116,6 +120,7 @@ pub fn create_router_with_provider(
     .with_prompt_cache_creation_control(prompt_cache_creation_control)
     .with_prompt_cache_bounds(prompt_cache_bounds)
     .with_reported_usage(reported_usage)
+    .with_cache_policy(cache_policy)
     .with_defined_cache_routes(defined_cache_routes)
     .with_thinking_trigger_mode(thinking_trigger_mode)
     .with_model_resolution_mode(model_resolution_mode)
@@ -133,6 +138,7 @@ pub fn create_router_with_provider(
         kiro_upstream_stream_idle_timeout_secs,
         payload_shaping,
     )
+    .with_tool_format_debug_recorder(tool_format_debug_recorder)
     .with_pricing_catalog(pricing_catalog)
     .with_model_capabilities(model_capabilities);
     if let Some(provider) = kiro_provider {

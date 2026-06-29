@@ -29,6 +29,7 @@ import {
   useCredentialsRuntime,
   useCredentialsSummary,
   useCredentialsUsageSummary,
+  useBatchUpdateCredentials,
   useDeleteCredential,
   useDeleteDisabledCredentials,
   useLoadBalancingMode,
@@ -166,6 +167,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const usageSummaryQuery = useCredentialsUsageSummary(visibleCredentialIds)
   const { mutate: deleteCredential } = useDeleteCredential()
   const deleteDisabled = useDeleteDisabledCredentials()
+  const batchUpdateCredentials = useBatchUpdateCredentials()
   const { mutate: resetFailure } = useResetFailure()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { data: proxyResourcesData } = useProxyResources()
@@ -227,6 +229,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
     const credential = currentCredentials.find(c => c.id === id)
     return Boolean(credential?.disabled)
   }).length
+  const selectedCredentials = currentCredentials.filter((credential) => selectedIds.has(credential.id))
+  const selectedPriorityOverrideCount = selectedCredentials.filter((credential) => credential.priority !== 0).length
+  const selectedConcurrencyOverrideCount = selectedCredentials.filter((credential) => typeof credential.maxConcurrentRequestsOverride === 'number').length
+  const selectedRpmOverrideCount = selectedCredentials.filter((credential) => typeof credential.rpmOverride === 'number').length
 
   // 后台分页总数变化时，避免停留在不存在的页码。
   useEffect(() => {
@@ -470,6 +476,105 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
 
     deselectAll()
+  }
+
+  const handleBatchQuerySelectedInfo = async () => {
+    const ids = Array.from(selectedIds)
+    if (ids.length === 0) {
+      toast.error('请先选择要查询信息的账号')
+      return
+    }
+    setQueryingInfo(true)
+    setLoadingBalanceIds(prev => {
+      const next = new Set(prev)
+      ids.forEach(id => next.add(id))
+      return next
+    })
+    try {
+      const response = await refreshCredentialInfo(ids, true)
+      setBalanceMap(prev => {
+        const next = new Map(prev)
+        response.items.forEach(item => {
+          if (item.ok && item.info) {
+            next.set(item.id, item.info)
+          }
+        })
+        return next
+      })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials-page'] })
+      if (response.failed === 0) {
+        toast.success(`查询完成：成功 ${response.success}/${response.total}`)
+      } else {
+        toast.warning(`查询完成：成功 ${response.success} 个，失败 ${response.failed} 个`)
+      }
+    } catch (error) {
+      toast.error(`查询信息失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setQueryingInfo(false)
+      setLoadingBalanceIds(prev => {
+        const next = new Set(prev)
+        ids.forEach(id => next.delete(id))
+        return next
+      })
+    }
+  }
+
+  const handleBatchResetPriority = () => {
+    const ids = selectedCredentials.filter((credential) => credential.priority !== 0).map((credential) => credential.id)
+    if (ids.length === 0) {
+      toast.error('选中的账号没有自定义优先级')
+      return
+    }
+    batchUpdateCredentials.mutate(
+      { ids, priority: { priority: 0 } },
+      {
+        onSuccess: (response) => {
+          refetch()
+          if (response.failed === 0) toast.success(`已重置 ${response.success} 个账号优先级`)
+          else toast.warning(`重置优先级：成功 ${response.success} 个，失败 ${response.failed} 个`)
+        },
+        onError: (error) => toast.error(`重置优先级失败: ${extractErrorMessage(error)}`),
+      }
+    )
+  }
+
+  const handleBatchClearConcurrency = () => {
+    const ids = selectedCredentials.filter((credential) => typeof credential.maxConcurrentRequestsOverride === 'number').map((credential) => credential.id)
+    if (ids.length === 0) {
+      toast.error('选中的账号没有自定义并发')
+      return
+    }
+    batchUpdateCredentials.mutate(
+      { ids, concurrency: { maxConcurrentRequests: null } },
+      {
+        onSuccess: (response) => {
+          refetch()
+          if (response.failed === 0) toast.success(`已清除 ${response.success} 个账号并发覆盖`)
+          else toast.warning(`清除并发覆盖：成功 ${response.success} 个，失败 ${response.failed} 个`)
+        },
+        onError: (error) => toast.error(`清除并发覆盖失败: ${extractErrorMessage(error)}`),
+      }
+    )
+  }
+
+  const handleBatchClearRpm = () => {
+    const ids = selectedCredentials.filter((credential) => typeof credential.rpmOverride === 'number').map((credential) => credential.id)
+    if (ids.length === 0) {
+      toast.error('选中的账号没有自定义 RPM')
+      return
+    }
+    batchUpdateCredentials.mutate(
+      { ids, rpm: { rpm: null } },
+      {
+        onSuccess: (response) => {
+          refetch()
+          if (response.failed === 0) toast.success(`已清除 ${response.success} 个账号 RPM 覆盖`)
+          else toast.warning(`清除 RPM 覆盖：成功 ${response.success} 个，失败 ${response.failed} 个`)
+        },
+        onError: (error) => toast.error(`清除 RPM 覆盖失败: ${extractErrorMessage(error)}`),
+      }
+    )
   }
 
   // 一键清除所有已禁用凭据
@@ -818,6 +923,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               <option value="priority">优先级模式</option>
               <option value="balanced">均衡负载模式</option>
               <option value="health_balanced">健康均衡模式</option>
+              <option value="weighted_least_inflight">低负载优先模式</option>
             </select>
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
@@ -938,6 +1044,33 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     批量修改
                   </Button>
                   <Button
+                    onClick={handleBatchResetPriority}
+                    size="sm"
+                    variant="outline"
+                    disabled={batchUpdateCredentials.isPending || selectedPriorityOverrideCount === 0}
+                  >
+                    <RotateCcw className="h-4 w-4 mr-2" />
+                    重置优先级 ({selectedPriorityOverrideCount})
+                  </Button>
+                  <Button
+                    onClick={handleBatchClearConcurrency}
+                    size="sm"
+                    variant="outline"
+                    disabled={batchUpdateCredentials.isPending || selectedConcurrencyOverrideCount === 0}
+                  >
+                    <RotateCcw className="h-4 w-4 mr-2" />
+                    清除并发 ({selectedConcurrencyOverrideCount})
+                  </Button>
+                  <Button
+                    onClick={handleBatchClearRpm}
+                    size="sm"
+                    variant="outline"
+                    disabled={batchUpdateCredentials.isPending || selectedRpmOverrideCount === 0}
+                  >
+                    <RotateCcw className="h-4 w-4 mr-2" />
+                    清除 RPM ({selectedRpmOverrideCount})
+                  </Button>
+                  <Button
                     onClick={handleBatchForceRefresh}
                     size="sm"
                     variant="outline"
@@ -945,6 +1078,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   >
                     <RefreshCw className={`h-4 w-4 mr-2 ${batchRefreshing ? 'animate-spin' : ''}`} />
                     {batchRefreshing ? `刷新中... ${batchRefreshProgress.current}/${batchRefreshProgress.total}` : '批量刷新 Token'}
+                  </Button>
+                  <Button
+                    onClick={handleBatchQuerySelectedInfo}
+                    size="sm"
+                    variant="outline"
+                    disabled={queryingInfo}
+                  >
+                    <RefreshCw className={`h-4 w-4 mr-2 ${queryingInfo ? 'animate-spin' : ''}`} />
+                    查询信息
                   </Button>
                   <Button onClick={handleBatchResetFailure} size="sm" variant="outline">
                     <RotateCcw className="h-4 w-4 mr-2" />
@@ -1059,7 +1201,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
               <option value="all">全部状态</option>
               <option value="enabled">启用</option>
               <option value="disabled">已禁用</option>
+              <option value="current">当前活跃</option>
+              <option value="cooldown">冷却中</option>
+              <option value="rate_limited">限流中</option>
               <option value="proxy_blocked">代理不可用</option>
+              <option value="custom_scheduling">有调度覆盖</option>
+              <option value="custom_priority">自定义优先级</option>
+              <option value="custom_concurrency">自定义并发</option>
+              <option value="custom_rpm">自定义 RPM</option>
+              <option value="error">有错误</option>
               <option value="unknown_subscription">未知订阅</option>
             </select>
             <select
@@ -1070,6 +1220,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               <option value="all">全部认证</option>
               <option value="social">Social</option>
               <option value="idc">IdC</option>
+              <option value="external_idp">External IdP</option>
               <option value="api_key">API Key</option>
             </select>
             <select

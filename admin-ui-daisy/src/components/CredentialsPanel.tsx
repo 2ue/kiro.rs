@@ -43,6 +43,7 @@ import {
   useCredentialRuntime,
   useCredentialSummary,
   useCredentialUsageSummary,
+  useBatchUpdateCredentials,
   useDeleteCredential,
   useDeleteDisabledCredentials,
   useLoadBalancingMode,
@@ -81,7 +82,6 @@ const credentialSortOptions: Array<{ value: CredentialSortBy; label: string }> =
   { value: 'id', label: 'ID' },
 ]
 
-const runtimeOwnedStatusFilters = new Set(['current', 'cooldown', 'rate_limited', 'proxy_blocked', 'error'])
 const runtimeOwnedSorts = new Set<CredentialSortBy>([
   'last_used_at',
   'success_count',
@@ -197,7 +197,7 @@ export function CredentialsPanel() {
     page,
     limit: itemsPerPage,
     q: queryText.trim() || undefined,
-    status: statusFilter !== 'all' && !runtimeOwnedStatusFilters.has(statusFilter) ? statusFilter : undefined,
+    status: statusFilter !== 'all' ? statusFilter : undefined,
     authMethod: authFilter !== 'all' ? authFilter : undefined,
     subscription: subscriptionFilter !== 'all' ? subscriptionFilter : undefined,
     proxyResourceId: proxyFilter !== 'all' ? Number(proxyFilter) : undefined,
@@ -218,6 +218,7 @@ export function CredentialsPanel() {
   const setLoadBalancing = useSetLoadBalancingMode()
   const deleteCredential = useDeleteCredential()
   const deleteDisabledCredentials = useDeleteDisabledCredentials()
+  const batchUpdateCredentials = useBatchUpdateCredentials()
   const resetFailure = useResetFailure()
 
   // Derived state
@@ -234,6 +235,10 @@ export function CredentialsPanel() {
   const credentialsPage = credentials.data?.page
   const pageTransitionPending = credentialsPage !== undefined && (credentials.isPlaceholderData || (credentials.isFetching && credentialsPage !== page))
   const selectedDisabledCount = Array.from(selectedIds).filter((id) => currentCredentials.find((item) => item.id === id)?.disabled).length
+  const selectedCredentials = currentCredentials.filter((credential) => selectedIds.has(credential.id))
+  const selectedPriorityOverrideCount = selectedCredentials.filter((credential) => credential.priority !== 0).length
+  const selectedConcurrencyOverrideCount = selectedCredentials.filter((credential) => typeof credential.maxConcurrentRequestsOverride === 'number').length
+  const selectedRpmOverrideCount = selectedCredentials.filter((credential) => typeof credential.rpmOverride === 'number').length
   const disabledCredentialCount = credentialSummary.data?.disabled ?? Math.max((credentials.data?.total || 0) - (credentials.data?.available || 0), 0)
   const hasActiveFilters = statusFilter !== 'all' || authFilter !== 'all' || subscriptionFilter !== 'all' || proxyFilter !== 'all'
   const defaultCredentialConcurrency = runtimeConfig.data?.credentialMaxConcurrentRequests ?? 0
@@ -506,6 +511,89 @@ export function CredentialsPanel() {
     else toast.warning(`刷新 Token：成功 ${success} 个，失败 ${fail} 个`)
   }
 
+  const batchQueryInfo = async () => {
+    const ids = Array.from(selectedIds)
+    if (!ids.length) return toast.error('请先选择要查询信息的账号')
+    setQueryingInfo(true)
+    setLoadingBalanceIds((prev) => {
+      const next = new Set(prev)
+      ids.forEach((id) => next.add(id))
+      return next
+    })
+    try {
+      const response = await refreshCredentialInfo(ids, true)
+      setBalanceMap((prev) => {
+        const next = new Map(prev)
+        response.items.forEach((item) => {
+          if (item.ok && item.info) next.set(item.id, item.info)
+        })
+        return next
+      })
+      invalidate()
+      await creditSummary.refetch()
+      if (creditDetailsOpen) await loadCreditDetails()
+      if (response.failed === 0) toast.success(`查询完成：成功 ${response.success}/${response.total}`)
+      else toast.warning(`查询完成：成功 ${response.success} 个，失败 ${response.failed} 个`)
+    } catch (error) {
+      toast.error(`查询信息失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setQueryingInfo(false)
+      setLoadingBalanceIds((prev) => {
+        const next = new Set(prev)
+        ids.forEach((id) => next.delete(id))
+        return next
+      })
+    }
+  }
+
+  const batchResetPriority = () => {
+    const ids = selectedCredentials.filter((credential) => credential.priority !== 0).map((credential) => credential.id)
+    if (!ids.length) return toast.error('选中的账号没有自定义优先级')
+    batchUpdateCredentials.mutate(
+      { ids, priority: { priority: 0 } },
+      {
+        onSuccess: (response) => {
+          invalidate()
+          if (response.failed === 0) toast.success(`已重置 ${response.success} 个账号优先级`)
+          else toast.warning(`重置优先级：成功 ${response.success} 个，失败 ${response.failed} 个`)
+        },
+        onError: (error) => toast.error(`重置优先级失败: ${extractErrorMessage(error)}`),
+      }
+    )
+  }
+
+  const batchClearConcurrency = () => {
+    const ids = selectedCredentials.filter((credential) => typeof credential.maxConcurrentRequestsOverride === 'number').map((credential) => credential.id)
+    if (!ids.length) return toast.error('选中的账号没有自定义并发')
+    batchUpdateCredentials.mutate(
+      { ids, concurrency: { maxConcurrentRequests: null } },
+      {
+        onSuccess: (response) => {
+          invalidate()
+          if (response.failed === 0) toast.success(`已清除 ${response.success} 个账号并发覆盖`)
+          else toast.warning(`清除并发覆盖：成功 ${response.success} 个，失败 ${response.failed} 个`)
+        },
+        onError: (error) => toast.error(`清除并发覆盖失败: ${extractErrorMessage(error)}`),
+      }
+    )
+  }
+
+  const batchClearRpm = () => {
+    const ids = selectedCredentials.filter((credential) => typeof credential.rpmOverride === 'number').map((credential) => credential.id)
+    if (!ids.length) return toast.error('选中的账号没有自定义 RPM')
+    batchUpdateCredentials.mutate(
+      { ids, rpm: { rpm: null } },
+      {
+        onSuccess: (response) => {
+          invalidate()
+          if (response.failed === 0) toast.success(`已清除 ${response.success} 个账号 RPM 覆盖`)
+          else toast.warning(`清除 RPM 覆盖：成功 ${response.success} 个，失败 ${response.failed} 个`)
+        },
+        onError: (error) => toast.error(`清除 RPM 覆盖失败: ${extractErrorMessage(error)}`),
+      }
+    )
+  }
+
   const clearAllDisabled = async () => {
     if (!disabledCredentialCount) return toast.error('没有可清除的已禁用账号')
     const confirmed = await confirmDialog({
@@ -614,7 +702,7 @@ export function CredentialsPanel() {
         <StatCard
           title="当前活跃"
           value={`#${credentialSummary.data?.currentId || '-'}`}
-          desc={loadBalancing.data?.mode === 'priority' ? '优先级模式' : loadBalancing.data?.mode === 'balanced' ? '均衡负载' : '健康均衡'}
+          desc={loadBalancing.data?.mode === 'priority' ? '优先级模式' : loadBalancing.data?.mode === 'balanced' ? '均衡负载' : loadBalancing.data?.mode === 'weighted_least_inflight' ? '低负载优先' : '健康均衡'}
           tone="primary"
         />
         <StatCard
@@ -653,6 +741,7 @@ export function CredentialsPanel() {
               <Select.Option value="priority">优先级</Select.Option>
               <Select.Option value="balanced">均衡负载</Select.Option>
               <Select.Option value="health_balanced">健康均衡</Select.Option>
+              <Select.Option value="weighted_least_inflight">低负载优先</Select.Option>
             </Select>
             <Button type="button" variant="outline" size="sm" onClick={() => credentials.refetch()}>
               <RefreshCw className="h-4 w-4" />
@@ -736,6 +825,10 @@ export function CredentialsPanel() {
                   <Select.Option value="cooldown">冷却中</Select.Option>
                   <Select.Option value="rate_limited">限流中</Select.Option>
                   <Select.Option value="proxy_blocked">代理不可用</Select.Option>
+                  <Select.Option value="custom_scheduling">有调度覆盖</Select.Option>
+                  <Select.Option value="custom_priority">自定义优先级</Select.Option>
+                  <Select.Option value="custom_concurrency">自定义并发</Select.Option>
+                  <Select.Option value="custom_rpm">自定义 RPM</Select.Option>
                   <Select.Option value="error">有错误</Select.Option>
                   <Select.Option value="unknown_subscription">未知订阅</Select.Option>
                 </Select>
@@ -743,6 +836,7 @@ export function CredentialsPanel() {
                   <Select.Option value="all">全部认证</Select.Option>
                   <Select.Option value="social">Social</Select.Option>
                   <Select.Option value="idc">IdC</Select.Option>
+                  <Select.Option value="external_idp">External IdP</Select.Option>
                   <Select.Option value="api_key">API Key</Select.Option>
                 </Select>
                 <Select bordered size="sm" value={subscriptionFilter} onChange={(e) => setSubscriptionFilter(e.target.value)}>
@@ -781,9 +875,22 @@ export function CredentialsPanel() {
             <Button type="button" variant="outline" size="xs" onClick={() => setBatchEditOpen(true)}>
               <Filter className="h-3.5 w-3.5" /> 批量修改
             </Button>
+            <Button type="button" variant="outline" size="xs" onClick={batchResetPriority} disabled={batchUpdateCredentials.isPending || selectedPriorityOverrideCount === 0}>
+              <RotateCcw className="h-3.5 w-3.5" /> 重置优先级 ({selectedPriorityOverrideCount})
+            </Button>
+            <Button type="button" variant="outline" size="xs" onClick={batchClearConcurrency} disabled={batchUpdateCredentials.isPending || selectedConcurrencyOverrideCount === 0}>
+              <RotateCcw className="h-3.5 w-3.5" /> 清除并发 ({selectedConcurrencyOverrideCount})
+            </Button>
+            <Button type="button" variant="outline" size="xs" onClick={batchClearRpm} disabled={batchUpdateCredentials.isPending || selectedRpmOverrideCount === 0}>
+              <RotateCcw className="h-3.5 w-3.5" /> 清除 RPM ({selectedRpmOverrideCount})
+            </Button>
             <Button type="button" variant="outline" size="xs" onClick={batchForceRefresh} disabled={batchRefreshing}>
               {batchRefreshing ? <Loading size="xs" /> : <RefreshCw className="h-3.5 w-3.5" />}
               刷新Token
+            </Button>
+            <Button type="button" variant="outline" size="xs" onClick={batchQueryInfo} disabled={queryingInfo}>
+              {queryingInfo ? <Loading size="xs" /> : <Wallet className="h-3.5 w-3.5" />}
+              查询信息
             </Button>
             <Button type="button" variant="outline" size="xs" onClick={batchResetFailure}>
               <RotateCcw className="h-3.5 w-3.5" /> 恢复异常

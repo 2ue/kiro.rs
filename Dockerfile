@@ -34,7 +34,7 @@ COPY --from=frontend-builder /app/ui/dist /app/ui/dist
 
 ENV CARGO_PROFILE_RELEASE_LTO=false \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
-RUN cargo build --release --no-default-features
+RUN cargo build --release --locked --no-default-features
 
 FROM alpine:3.21
 
@@ -43,7 +43,7 @@ RUN apk add --no-cache busybox-extras ca-certificates
 WORKDIR /app
 COPY --from=builder /app/target/release/kiro-rs /app/kiro-rs
 
-VOLUME ["/app/config"]
+VOLUME ["/app/config", "/app/logs"]
 
 EXPOSE 8990
 

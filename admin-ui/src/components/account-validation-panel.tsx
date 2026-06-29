@@ -1,13 +1,16 @@
-import { AlertTriangle, FileSearch, RefreshCw } from 'lucide-react'
+import { AlertTriangle, FileSearch, FileUp, RefreshCw, Upload } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
+import { Checkbox } from '@/components/ui/checkbox'
+import { Input } from '@/components/ui/input'
 import { validateExistingCredentials, validateExternalCredentials } from '@/api/credentials'
-import { parseCredentialImportText } from '@/lib/credential-import'
+import { parseCredentialImportFiles, parseCredentialImportText } from '@/lib/credential-import'
+import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, TEST_MODELS } from '@/lib/test-models'
 import { extractErrorMessage } from '@/lib/utils'
-import type { CredentialValidationGroup, CredentialValidationItem, CredentialValidationResponse } from '@/types/api'
+import type { AddCredentialRequest, CredentialValidationGroup, CredentialValidationItem, CredentialValidationResponse } from '@/types/api'
 
 function formatNumber(value: number | null | undefined): string {
   if (!Number.isFinite(value ?? Number.NaN)) return '0'
@@ -98,10 +101,30 @@ function Results({ result }: { result: CredentialValidationResponse | null }) {
   )
 }
 
+interface ExternalValidationOptions {
+  querySubscription: boolean
+  queryUsage: boolean
+  checkLiveness: boolean
+  livenessModel: string
+  livenessPrompt: string
+}
+
+function initialExternalOptions(): ExternalValidationOptions {
+  return {
+    querySubscription: true,
+    queryUsage: true,
+    checkLiveness: false,
+    livenessModel: DEFAULT_TEST_MODEL,
+    livenessPrompt: DEFAULT_TEST_PROMPT,
+  }
+}
+
 export function AccountValidationPanel() {
   const [raw, setRaw] = useState('')
   const [result, setResult] = useState<CredentialValidationResponse | null>(null)
   const [loading, setLoading] = useState(false)
+  const [externalOptions, setExternalOptions] = useState<ExternalValidationOptions>(initialExternalOptions)
+  const [selectedFiles, setSelectedFiles] = useState<string[]>([])
   const parsedCount = useMemo(() => {
     try {
       return raw.trim() ? parseCredentialImportText(raw).length : 0
@@ -109,6 +132,7 @@ export function AccountValidationPanel() {
       return 0
     }
   }, [raw])
+  const hasExternalAction = externalOptions.querySubscription || externalOptions.queryUsage || externalOptions.checkLiveness
 
   const validateExisting = async (scope: 'all' | 'enabled' | 'disabled') => {
     setLoading(true)
@@ -132,12 +156,23 @@ export function AccountValidationPanel() {
       return
     }
     if (credentials.length === 0) {
-      toast.error('没有解析到可校验的凭据')
+      toast.error('没有解析到可校验的账号')
+      return
+    }
+    if (!hasExternalAction) {
+      toast.error('请至少选择订阅、用量或验活中的一项')
       return
     }
     setLoading(true)
     try {
-      const data = await validateExternalCredentials({ credentials })
+      const data = await validateExternalCredentials({
+        credentials,
+        querySubscription: externalOptions.querySubscription,
+        queryUsage: externalOptions.queryUsage,
+        checkLiveness: externalOptions.checkLiveness,
+        livenessModel: externalOptions.livenessModel,
+        livenessPrompt: externalOptions.livenessPrompt,
+      })
       setResult(data)
       toast.success(`校验完成：成功 ${data.success}/${data.total}`)
     } catch (error) {
@@ -147,14 +182,48 @@ export function AccountValidationPanel() {
     }
   }
 
+  const appendExternalCredentials = (credentials: AddCredentialRequest[]) => {
+    let existing: AddCredentialRequest[] = []
+    if (raw.trim()) {
+      try {
+        existing = parseCredentialImportText(raw)
+      } catch {
+        existing = []
+      }
+    }
+    setRaw(JSON.stringify([...existing, ...credentials], null, 2))
+  }
+
+  const handleExternalFiles = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || [])
+    event.target.value = ''
+    if (!files.length) return
+    const parsed = await parseCredentialImportFiles(files)
+    if (parsed.credentials.length) {
+      appendExternalCredentials(parsed.credentials)
+      setSelectedFiles(files.map((file) => file.name))
+      toast.success(`已从 ${files.length} 个文件读取 ${parsed.credentials.length} 条账号`)
+    }
+    if (parsed.errors.length) {
+      toast.warning(`部分文件未读取: ${parsed.errors.slice(0, 3).join('；')}`)
+    }
+    if (!parsed.credentials.length && !parsed.errors.length) {
+      toast.error('没有读取到有效账号')
+    }
+  }
+
+  const updateExternalOption = <K extends keyof ExternalValidationOptions>(key: K, value: ExternalValidationOptions[K]) => {
+    setExternalOptions((prev) => ({ ...prev, [key]: value }))
+  }
+
   return (
     <div className="space-y-6">
       <Card>
         <CardHeader>
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <CardTitle>系统凭据复查</CardTitle>
-              <CardDescription>强制查询系统内凭据的订阅、额度和用量，并和上次快照比较。禁用凭据也可以手动复查。</CardDescription>
+              <CardTitle>系统账号复查</CardTitle>
+              <CardDescription>强制查询系统内账号的订阅、额度和用量，并和上次快照比较。禁用账号也可以手动复查。</CardDescription>
             </div>
             <div className="flex flex-wrap gap-2">
               <Button variant="outline" size="sm" onClick={() => validateExisting('all')} disabled={loading}><RefreshCw className="h-4 w-4 mr-2" />全部复查</Button>
@@ -176,19 +245,73 @@ export function AccountValidationPanel() {
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
               <CardTitle>外部 JSON 校验</CardTitle>
-              <CardDescription>粘贴 Kiro Account Manager 或批量导入格式 JSON，只查询订阅和额度，不导入系统、不改变调度。</CardDescription>
+              <CardDescription>粘贴或选择 Kiro Account Manager / 批量导入格式 JSON，不导入系统、不改变调度。</CardDescription>
             </div>
-            <Button size="sm" onClick={validateExternal} disabled={loading || parsedCount === 0}><FileSearch className="h-4 w-4 mr-2" />校验 JSON</Button>
+            <div className="flex flex-wrap gap-2">
+              <Button asChild variant="outline" size="sm" disabled={loading}>
+                <label>
+                  <FileUp className="h-4 w-4 mr-2" />
+                  选择文件
+                  <input type="file" accept=".json,.jsonl,.txt,application/json" multiple className="hidden" onChange={handleExternalFiles} disabled={loading} />
+                </label>
+              </Button>
+              <Button size="sm" onClick={validateExternal} disabled={loading || parsedCount === 0 || !hasExternalAction}><FileSearch className="h-4 w-4 mr-2" />校验 JSON</Button>
+            </div>
           </div>
         </CardHeader>
-        <CardContent className="space-y-2">
+        <CardContent className="space-y-3">
+          <div className="grid gap-3 rounded-md border bg-muted/20 p-3 lg:grid-cols-[1fr_1.4fr]">
+            <div>
+              <div className="mb-2 text-xs font-semibold text-muted-foreground">校验项目</div>
+              <div className="flex flex-wrap gap-3 text-sm">
+                <label className="inline-flex items-center gap-2">
+                  <Checkbox checked={externalOptions.querySubscription} disabled={loading} onCheckedChange={(checked) => updateExternalOption('querySubscription', checked === true)} />
+                  查询订阅
+                </label>
+                <label className="inline-flex items-center gap-2">
+                  <Checkbox checked={externalOptions.queryUsage} disabled={loading} onCheckedChange={(checked) => updateExternalOption('queryUsage', checked === true)} />
+                  查询用量
+                </label>
+                <label className="inline-flex items-center gap-2">
+                  <Checkbox checked={externalOptions.checkLiveness} disabled={loading} onCheckedChange={(checked) => updateExternalOption('checkLiveness', checked === true)} />
+                  模型验活
+                </label>
+              </div>
+              {!hasExternalAction && <div className="mt-2 text-xs text-destructive">至少选择一个校验项目</div>}
+            </div>
+            <div className="grid gap-2 sm:grid-cols-2">
+              <label className="space-y-1">
+                <span className="text-xs font-semibold text-muted-foreground">验活模型</span>
+                <select
+                  className="h-9 w-full rounded-md border bg-background px-3 text-sm"
+                  value={externalOptions.livenessModel}
+                  disabled={loading || !externalOptions.checkLiveness}
+                  onChange={(event) => updateExternalOption('livenessModel', event.target.value)}
+                >
+                  {TEST_MODELS.map((model) => (
+                    <option key={model.id} value={model.id}>{model.label}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="space-y-1">
+                <span className="text-xs font-semibold text-muted-foreground">验活提示词</span>
+                <Input value={externalOptions.livenessPrompt} disabled={loading || !externalOptions.checkLiveness} onChange={(event) => updateExternalOption('livenessPrompt', event.target.value)} />
+              </label>
+            </div>
+          </div>
           <textarea
             className="min-h-[220px] w-full rounded-md border bg-background px-3 py-2 font-mono text-xs"
             value={raw}
             onChange={event => setRaw(event.target.value)}
             placeholder="粘贴 KAM JSON、credentials 数组或 JSONL"
           />
-          <div className="text-xs text-muted-foreground">已解析 {parsedCount} 条可校验凭据</div>
+          <div className="flex items-center justify-between text-xs text-muted-foreground">
+            <span>已解析 {parsedCount} 条可校验账号</span>
+            <span className="inline-flex items-center gap-1">
+              <Upload className="h-3.5 w-3.5" />
+              {selectedFiles.length ? `已选择 ${selectedFiles.length} 个文件` : '文件内容可直接粘贴到这里'}
+            </span>
+          </div>
         </CardContent>
       </Card>
 

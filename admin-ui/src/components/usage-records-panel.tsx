@@ -11,6 +11,7 @@ import { useAutoRefreshPreference } from '@/hooks/use-auto-refresh'
 import { useCredentials } from '@/hooks/use-credentials'
 import {
   useCancelUsageCleanup,
+  useClearUsageRecords,
   useModelPricing,
   usePreviewUsageCleanup,
   useRefreshUsageQueriesAfterCleanup,
@@ -283,6 +284,7 @@ function LatencyTracePanel({ record }: { record: UsageRecord }) {
 export function UsageRecordsPanel() {
   const [searchText, setSearchText] = useState('')
   const [model, setModel] = useState('')
+  const [endpoint, setEndpoint] = useState('')
   const [conversationId, setConversationId] = useState('')
   const [routeTarget, setRouteTarget] = useState('')
   const [status, setStatus] = useState<UsageRecordStatus | ''>('')
@@ -302,6 +304,9 @@ export function UsageRecordsPanel() {
     }
     if (model.trim()) {
       next.model = model.trim()
+    }
+    if (endpoint.trim()) {
+      next.endpoint = endpoint.trim()
     }
     if (conversationId.trim()) {
       next.conversationId = conversationId.trim()
@@ -326,7 +331,7 @@ export function UsageRecordsPanel() {
       next.minCacheRead = parsedMinCacheRead
     }
     return next
-  }, [conversationId, currentPage, minCacheRead, model, routeTarget, searchText, source, status, streamMode])
+  }, [conversationId, currentPage, endpoint, minCacheRead, model, routeTarget, searchText, source, status, streamMode])
 
   const summary = useUsageSummary(autoRefresh.refetchInterval)
   const records = useUsageRecordsPage(query, autoRefresh.refetchInterval)
@@ -344,7 +349,7 @@ export function UsageRecordsPanel() {
     for (const credential of credentials.data?.credentials || []) {
       labels.set(
         credential.id,
-        credential.email || credential.maskedApiKey || `凭据 #${credential.id}`
+        credential.email || credential.maskedApiKey || `账号 #${credential.id}`
       )
     }
     return labels
@@ -374,6 +379,7 @@ export function UsageRecordsPanel() {
   const hasFilters = Boolean(
     searchText.trim() ||
     model.trim() ||
+    endpoint.trim() ||
     conversationId.trim() ||
     routeTarget ||
     status ||
@@ -385,6 +391,7 @@ export function UsageRecordsPanel() {
   const handleResetFilters = () => {
     setSearchText('')
     setModel('')
+    setEndpoint('')
     setConversationId('')
     setRouteTarget('')
     setStatus('')
@@ -518,6 +525,11 @@ export function UsageRecordsPanel() {
             placeholder="模型"
           />
           <Input
+            value={endpoint}
+            onChange={(event) => setEndpoint(event.target.value)}
+            placeholder="入口路径，如 /cc/v1/messages"
+          />
+          <Input
             value={conversationId}
             onChange={(event) => setConversationId(event.target.value)}
             placeholder="会话 ID"
@@ -532,7 +544,7 @@ export function UsageRecordsPanel() {
               <optgroup label="账号凭证">
                 {(credentials.data?.credentials || []).map((credential) => (
                   <option key={`credential:${credential.id}`} value={`credential:${credential.id}`}>
-                    #{credential.id} {credential.email || credential.maskedApiKey || '未命名凭据'}
+                    #{credential.id} {credential.email || credential.maskedApiKey || '未命名账号'}
                   </option>
                 ))}
               </optgroup>
@@ -1163,6 +1175,7 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
   const previewCleanup = usePreviewUsageCleanup()
   const startCleanup = useStartUsageCleanup()
   const cancelCleanup = useCancelUsageCleanup()
+  const clearRecords = useClearUsageRecords()
   useRefreshUsageQueriesAfterCleanup(cleanupStatus.data)
 
   const parsedOlderThanDays = parseCleanupInteger(olderThanDays, 7, 0)
@@ -1218,6 +1231,18 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
     })
   }
 
+  const clearAll = () => {
+    const confirmed = confirm('确定清空所有 Usage 展示记录吗？此操作无法撤销，只影响后台展示记录，不影响实际计费。')
+    if (!confirmed) return
+    clearRecords.mutate(undefined, {
+      onSuccess: () => {
+        toast.success('已清空 Usage 展示记录')
+        onOpenChange(false)
+      },
+      onError: (error) => toast.error(`清空失败: ${extractErrorMessage(error)}`),
+    })
+  }
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-2xl">
@@ -1225,6 +1250,21 @@ function UsageCleanupDialog({ open, onOpenChange }: { open: boolean; onOpenChang
           <DialogTitle>分批清理 Usage 记录</DialogTitle>
         </DialogHeader>
         <div className="space-y-4 text-sm">
+          <div className="rounded-md border border-destructive/30 bg-destructive/5 p-3">
+            <div className="text-xs font-semibold text-destructive">危险操作</div>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+              清空所有 Usage 展示记录会删除全部历史明细，仅影响后台展示和查询，不影响实际计费，且无法撤销。
+            </p>
+            <Button
+              className="mt-3 w-full text-destructive"
+              variant="outline"
+              onClick={clearAll}
+              disabled={clearRecords.isPending || running}
+            >
+              {clearRecords.isPending ? '清空中...' : '清空全部展示记录'}
+            </Button>
+          </div>
+
           <div className="rounded-md border border-kiro-warning-soft bg-kiro-warning-soft p-3 text-kiro-warning">
             这是手动单次任务，不会定时执行。你只需要设置清理范围和每批数量，系统会自动分批清到没有更多匹配记录；后端保留 {formatNumber(USAGE_CLEANUP_DEFAULT_MAX_BATCHES)} 批安全上限。清理只影响使用记录明细列表，已累计的顶部统计和 Dashboard rollup 会保留。
           </div>

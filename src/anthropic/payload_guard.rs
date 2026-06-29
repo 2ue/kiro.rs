@@ -6,7 +6,7 @@
 //! entries while preserving Kiro history invariants.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::{self, Write},
     time::{Duration, Instant},
 };
@@ -31,6 +31,7 @@ const PAYLOAD_GUARD_SLOW_LOG_THRESHOLD: Duration = Duration::from_millis(25);
 const EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER: &str = "Tool result content was empty.";
 const TOOL_FORMAT_DIAGNOSTIC_MAX_HISTORY_ENTRIES: usize = 512;
 const TOOL_FORMAT_DIAGNOSTIC_MAX_ITEMS: usize = 4096;
+const TOOL_RESULTS_TEXT_PREFIX: &str = "Tool results:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -121,6 +122,12 @@ pub struct PayloadGuardReport {
     pub textified_duplicate_tool_results: usize,
     pub textified_orphan_tool_results: usize,
     pub removed_orphan_tool_uses: usize,
+    #[serde(default)]
+    pub flattened_history_tool_uses: usize,
+    #[serde(default)]
+    pub textified_history_tool_results: usize,
+    #[serde(default)]
+    pub removed_history_tools: usize,
     pub truncated_history_tool_results: usize,
     pub truncated_history_tool_result_chars: usize,
     pub removed_history_thinking_blocks: usize,
@@ -149,6 +156,8 @@ pub struct PayloadGuardReport {
     pub body_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_use_format_diagnostics: Option<ToolUseFormatDiagnostics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_format_debug_ref: Option<Value>,
     pub still_oversized: bool,
 }
 
@@ -171,6 +180,9 @@ impl PayloadGuardReport {
             textified_duplicate_tool_results: 0,
             textified_orphan_tool_results: 0,
             removed_orphan_tool_uses: 0,
+            flattened_history_tool_uses: 0,
+            textified_history_tool_results: 0,
+            removed_history_tools: 0,
             truncated_history_tool_results: 0,
             truncated_history_tool_result_chars: 0,
             removed_history_thinking_blocks: 0,
@@ -193,6 +205,7 @@ impl PayloadGuardReport {
             cache_point_retry_reason: None,
             body_sha256: None,
             tool_use_format_diagnostics: None,
+            tool_format_debug_ref: None,
             still_oversized: false,
         }
     }
@@ -208,6 +221,9 @@ impl PayloadGuardReport {
             || self.textified_duplicate_tool_results > 0
             || self.textified_orphan_tool_results > 0
             || self.removed_orphan_tool_uses > 0
+            || self.flattened_history_tool_uses > 0
+            || self.textified_history_tool_results > 0
+            || self.removed_history_tools > 0
             || self.truncated_history_tool_results > 0
             || self.removed_history_thinking_blocks > 0
             || self.trimmed_web_fetch_blocks > 0
@@ -334,7 +350,7 @@ impl PayloadGuardReport {
         if self.still_oversized {
             parts.push(format!("payload-oversized={}", self.final_bytes));
         }
-        Some(parts.join(","))
+        (!parts.is_empty()).then(|| parts.join(","))
     }
 }
 
@@ -394,6 +410,9 @@ pub fn guard_kiro_request(
         textified_duplicate_tool_results: 0,
         textified_orphan_tool_results: 0,
         removed_orphan_tool_uses: 0,
+        flattened_history_tool_uses: 0,
+        textified_history_tool_results: 0,
+        removed_history_tools: 0,
         truncated_history_tool_results: 0,
         truncated_history_tool_result_chars: 0,
         removed_history_thinking_blocks: 0,
@@ -416,6 +435,7 @@ pub fn guard_kiro_request(
         cache_point_retry_reason: None,
         body_sha256: None,
         tool_use_format_diagnostics: None,
+        tool_format_debug_ref: None,
         still_oversized: false,
     };
 
@@ -522,6 +542,28 @@ pub fn guard_kiro_request(
                 report.final_bytes = body.len();
             }
         }
+    }
+
+    let final_repair_started_at = Instant::now();
+    let final_repair = {
+        let conversation_state = &mut request.conversation_state;
+        flatten_completed_history_tool_turns(
+            &mut conversation_state.history,
+            &conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tool_results,
+        )
+    };
+    let should_reserialize = final_repair.was_modified();
+    add_repair_stats_to_report(&mut report, final_repair);
+    repair_elapsed += final_repair_started_at.elapsed();
+
+    if should_reserialize {
+        let serialize_started_at = Instant::now();
+        body = serialize_request(request)?;
+        serialize_elapsed += serialize_started_at.elapsed();
     }
 
     report.final_history_entries = request.conversation_state.history.len();
@@ -1008,6 +1050,9 @@ fn new_payload_guard_report(
         textified_duplicate_tool_results: 0,
         textified_orphan_tool_results: 0,
         removed_orphan_tool_uses: 0,
+        flattened_history_tool_uses: 0,
+        textified_history_tool_results: 0,
+        removed_history_tools: 0,
         truncated_history_tool_results: 0,
         truncated_history_tool_result_chars: 0,
         removed_history_thinking_blocks: 0,
@@ -1030,6 +1075,7 @@ fn new_payload_guard_report(
         cache_point_retry_reason: None,
         body_sha256: None,
         tool_use_format_diagnostics: None,
+        tool_format_debug_ref: None,
         still_oversized: false,
     }
 }
@@ -1184,6 +1230,9 @@ fn log_payload_guard_timing(
             final_bytes = report.final_bytes,
             max_bytes = report.max_bytes,
             modified = report.was_modified(),
+            flattened_history_tool_uses = report.flattened_history_tool_uses,
+            textified_history_tool_results = report.textified_history_tool_results,
+            removed_history_tools = report.removed_history_tools,
             still_oversized = report.still_oversized,
             "payload guard timing"
         );
@@ -3329,6 +3378,9 @@ struct RepairStats {
     textified_duplicate_tool_results: usize,
     textified_orphan_tool_results: usize,
     removed_orphan_tool_uses: usize,
+    flattened_history_tool_uses: usize,
+    textified_history_tool_results: usize,
+    removed_history_tools: usize,
 }
 
 impl RepairStats {
@@ -3342,6 +3394,9 @@ impl RepairStats {
             || self.textified_duplicate_tool_results > 0
             || self.textified_orphan_tool_results > 0
             || self.removed_orphan_tool_uses > 0
+            || self.flattened_history_tool_uses > 0
+            || self.textified_history_tool_results > 0
+            || self.removed_history_tools > 0
     }
 }
 
@@ -3386,6 +3441,9 @@ fn add_repair_stats_to_report(report: &mut PayloadGuardReport, repair: RepairSta
     report.textified_duplicate_tool_results += repair.textified_duplicate_tool_results;
     report.textified_orphan_tool_results += repair.textified_orphan_tool_results;
     report.removed_orphan_tool_uses += repair.removed_orphan_tool_uses;
+    report.flattened_history_tool_uses += repair.flattened_history_tool_uses;
+    report.textified_history_tool_results += repair.textified_history_tool_results;
+    report.removed_history_tools += repair.removed_history_tools;
 }
 
 fn normalize_empty_tool_result_contents(history: &mut [Message]) -> usize {
@@ -3711,6 +3769,131 @@ fn remove_unpaired_tool_uses(history: &mut [Message], current_results: &[ToolRes
     removed
 }
 
+fn flatten_completed_history_tool_turns(
+    history: &mut [Message],
+    current_results: &[ToolResult],
+) -> RepairStats {
+    let current_result_ids = collect_tool_result_ids(current_results);
+    let active_idx = active_history_tool_turn_index(history, &current_result_ids);
+    let tool_names = collect_history_tool_names(history);
+    let mut stats = RepairStats::default();
+
+    for (idx, message) in history.iter_mut().enumerate() {
+        match message {
+            Message::Assistant(assistant) => {
+                if active_idx == Some(idx) {
+                    continue;
+                }
+                if let Some(tool_uses) = assistant.assistant_response_message.tool_uses.take() {
+                    stats.flattened_history_tool_uses += tool_uses.len();
+                }
+            }
+            Message::User(user) => {
+                let context = &mut user.user_input_message.user_input_message_context;
+                if !context.tool_results.is_empty() {
+                    let result_count = context.tool_results.len();
+                    if let Some(text) = narrate_tool_results(&context.tool_results, &tool_names) {
+                        append_text(&mut user.user_input_message.content, &text);
+                        stats.textified_history_tool_results += result_count;
+                    }
+                    context.tool_results.clear();
+                }
+                if !context.tools.is_empty() {
+                    stats.removed_history_tools += context.tools.len();
+                    context.tools.clear();
+                }
+            }
+        }
+    }
+
+    stats
+}
+
+fn collect_tool_result_ids(results: &[ToolResult]) -> HashSet<String> {
+    results
+        .iter()
+        .filter_map(|result| {
+            let id = result.tool_use_id.trim();
+            (!id.is_empty()).then(|| id.to_string())
+        })
+        .collect()
+}
+
+fn active_history_tool_turn_index(
+    history: &[Message],
+    current_result_ids: &HashSet<String>,
+) -> Option<usize> {
+    if current_result_ids.is_empty() {
+        return None;
+    }
+
+    let idx = history.len().checked_sub(1)?;
+    let Message::Assistant(assistant) = &history[idx] else {
+        return None;
+    };
+    let tool_uses = assistant
+        .assistant_response_message
+        .tool_uses
+        .as_deref()
+        .filter(|tool_uses| !tool_uses.is_empty())?;
+
+    tool_uses
+        .iter()
+        .all(|tool_use| current_result_ids.contains(tool_use.tool_use_id.trim()))
+        .then_some(idx)
+}
+
+fn collect_history_tool_names(history: &[Message]) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    for message in history {
+        let Message::Assistant(assistant) = message else {
+            continue;
+        };
+        let Some(tool_uses) = &assistant.assistant_response_message.tool_uses else {
+            continue;
+        };
+        for tool_use in tool_uses {
+            let id = tool_use.tool_use_id.trim();
+            let name = tool_use.name.trim();
+            if !id.is_empty() && !name.is_empty() {
+                names.insert(id.to_string(), name.to_string());
+            }
+        }
+    }
+    names
+}
+
+fn narrate_tool_results(
+    results: &[ToolResult],
+    tool_names: &HashMap<String, String>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    for result in results {
+        let body = tool_result_to_text(result)
+            .unwrap_or_else(|| EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER.to_string());
+        let id = result.tool_use_id.trim();
+        let label = tool_names
+            .get(id)
+            .cloned()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| {
+                if id.is_empty() {
+                    "tool result".to_string()
+                } else {
+                    format!("tool result {}", id)
+                }
+            });
+        let status = if result.is_error || result.status.as_deref() == Some("error") {
+            " error"
+        } else {
+            ""
+        };
+        parts.push(format!("[{}{}] {}", label, status, body));
+    }
+
+    (!parts.is_empty()).then(|| format!("{TOOL_RESULTS_TEXT_PREFIX}\n\n{}", parts.join("\n\n")))
+}
+
 fn previous_assistant_tool_use_ids(history: &[Message], idx: usize) -> HashSet<String> {
     if idx == 0 {
         return HashSet::new();
@@ -4014,15 +4197,21 @@ mod tests {
             .expect("guard should repair");
 
         assert_eq!(report.removed_orphan_tool_results, 1);
+        assert_eq!(report.flattened_history_tool_uses, 1);
+        assert_eq!(report.textified_history_tool_results, 1);
         let Message::User(user) = &request.conversation_state.history[2] else {
             panic!("expected user");
         };
-        assert_eq!(
+        assert!(
             user.user_input_message
                 .user_input_message_context
                 .tool_results
-                .len(),
-            1
+                .is_empty()
+        );
+        assert!(
+            user.user_input_message
+                .content
+                .contains("[readFile] valid result")
         );
         assert!(user.user_input_message.content.contains("orphan result"));
     }
@@ -4047,18 +4236,22 @@ mod tests {
             guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert_eq!(report.removed_orphan_tool_results, 0);
+        assert_eq!(report.flattened_history_tool_uses, 1);
+        assert_eq!(report.textified_history_tool_results, 1);
         assert!(body.contains(EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER));
         let Message::User(user) = &request.conversation_state.history[2] else {
             panic!("expected user");
         };
-        assert_eq!(
-            tool_result_text(
-                &user
-                    .user_input_message
-                    .user_input_message_context
-                    .tool_results[0]
-            ),
-            EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER
+        assert!(
+            user.user_input_message
+                .user_input_message_context
+                .tool_results
+                .is_empty()
+        );
+        assert!(
+            user.user_input_message
+                .content
+                .contains(EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER)
         );
     }
 
@@ -4092,6 +4285,156 @@ mod tests {
                     .tool_results[0]
             ),
             EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER
+        );
+    }
+
+    #[test]
+    fn guard_flattens_completed_history_tool_cycles_for_plain_current_message() {
+        let first_assistant = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new("running build")
+                .with_tool_uses(vec![ToolUseEntry::new("tool-1", "exec_command")]),
+        };
+        let mut first_result = HistoryUserMessage::new("", TEST_MODEL);
+        first_result.user_input_message.user_input_message_context = UserInputMessageContext::new()
+            .with_tool_results(vec![ToolResult::success("tool-1", "build ok")]);
+
+        let second_assistant = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new("")
+                .with_tool_uses(vec![ToolUseEntry::new("tool-2", "exec_command")]),
+        };
+        let mut second_result = HistoryUserMessage::new("", TEST_MODEL);
+        second_result.user_input_message.user_input_message_context =
+            UserInputMessageContext::new()
+                .with_tool_results(vec![ToolResult::success("tool-2", "tests pass")]);
+
+        let mut request = request_with_history(vec![
+            Message::User(HistoryUserMessage::new("run the build", TEST_MODEL)),
+            Message::Assistant(first_assistant),
+            Message::User(first_result),
+            Message::Assistant(second_assistant),
+            Message::User(second_result),
+        ]);
+        request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content = "Summarize everything above.".to_string();
+
+        let (_body, report) =
+            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+
+        assert_eq!(report.flattened_history_tool_uses, 2);
+        assert_eq!(report.textified_history_tool_results, 2);
+        assert_eq!(report.removed_orphan_tool_uses, 0);
+        assert_eq!(report.removed_orphan_tool_results, 0);
+
+        let mut combined_history = String::new();
+        for message in &request.conversation_state.history {
+            match message {
+                Message::Assistant(assistant) => {
+                    assert!(assistant.assistant_response_message.tool_uses.is_none());
+                    assert!(
+                        !assistant
+                            .assistant_response_message
+                            .content
+                            .contains("[Called tool")
+                    );
+                    combined_history.push_str(&assistant.assistant_response_message.content);
+                    combined_history.push('\n');
+                }
+                Message::User(user) => {
+                    assert!(
+                        user.user_input_message
+                            .user_input_message_context
+                            .tool_results
+                            .is_empty()
+                    );
+                    combined_history.push_str(&user.user_input_message.content);
+                    combined_history.push('\n');
+                }
+            }
+        }
+
+        assert!(combined_history.contains("Tool results:"));
+        assert!(combined_history.contains("[exec_command] build ok"));
+        assert!(combined_history.contains("[exec_command] tests pass"));
+        assert!(
+            request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tool_results
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn guard_keeps_only_active_current_tool_turn_structured() {
+        let completed_assistant = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new("first")
+                .with_tool_uses(vec![ToolUseEntry::new("tool-old", "readFile")]),
+        };
+        let mut completed_result = HistoryUserMessage::new("", TEST_MODEL);
+        completed_result
+            .user_input_message
+            .user_input_message_context = UserInputMessageContext::new()
+            .with_tool_results(vec![ToolResult::success("tool-old", "old content")]);
+        let active_assistant = HistoryAssistantMessage {
+            assistant_response_message: AssistantMessage::new("active")
+                .with_tool_uses(vec![ToolUseEntry::new("tool-current", "readFile")]),
+        };
+        let mut current = UserInputMessage::new("", TEST_MODEL);
+        current.user_input_message_context = UserInputMessageContext::new()
+            .with_tool_results(vec![ToolResult::success("tool-current", "current content")]);
+
+        let mut request = request_with_history(vec![
+            Message::User(HistoryUserMessage::new("read old", TEST_MODEL)),
+            Message::Assistant(completed_assistant),
+            Message::User(completed_result),
+            Message::Assistant(active_assistant),
+        ]);
+        request.conversation_state.current_message = CurrentMessage::new(current);
+
+        let (_body, report) =
+            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+
+        assert_eq!(report.flattened_history_tool_uses, 1);
+        assert_eq!(report.textified_history_tool_results, 1);
+
+        let Message::Assistant(first_assistant) = &request.conversation_state.history[1] else {
+            panic!("expected completed assistant");
+        };
+        assert!(
+            first_assistant
+                .assistant_response_message
+                .tool_uses
+                .is_none()
+        );
+
+        let Message::Assistant(active_assistant) =
+            request.conversation_state.history.last().unwrap()
+        else {
+            panic!("expected active assistant");
+        };
+        assert_eq!(
+            active_assistant
+                .assistant_response_message
+                .tool_uses
+                .as_ref()
+                .expect("active tool use")[0]
+                .tool_use_id,
+            "tool-current"
+        );
+        assert_eq!(
+            request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tool_results[0]
+                .tool_use_id,
+            "tool-current"
         );
     }
 
@@ -4162,30 +4505,23 @@ mod tests {
         assert_eq!(report.renamed_duplicate_tool_uses, 1);
         assert_eq!(report.removed_orphan_tool_uses, 0);
         assert_eq!(report.removed_orphan_tool_results, 0);
+        assert_eq!(report.flattened_history_tool_uses, 2);
+        assert_eq!(report.textified_history_tool_results, 2);
 
         let Message::Assistant(assistant) = &request.conversation_state.history[3] else {
             panic!("expected second assistant");
         };
-        let renamed_id = assistant
-            .assistant_response_message
-            .tool_uses
-            .as_ref()
-            .expect("tool use")
-            .first()
-            .expect("first tool use")
-            .tool_use_id
-            .clone();
-        assert_ne!(renamed_id, "tool-1");
+        assert!(assistant.assistant_response_message.tool_uses.is_none());
         let Message::User(user) = &request.conversation_state.history[4] else {
             panic!("expected second result user");
         };
-        assert_eq!(
+        assert!(
             user.user_input_message
                 .user_input_message_context
-                .tool_results[0]
-                .tool_use_id,
-            renamed_id
+                .tool_results
+                .is_empty()
         );
+        assert!(user.user_input_message.content.contains("second content"));
     }
 
     #[test]
@@ -4218,6 +4554,8 @@ mod tests {
             guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert_eq!(report.renamed_duplicate_tool_uses, 1);
+        assert_eq!(report.flattened_history_tool_uses, 1);
+        assert_eq!(report.textified_history_tool_results, 1);
         let Message::Assistant(assistant) = request.conversation_state.history.last().unwrap()
         else {
             panic!("expected last assistant");
@@ -4436,6 +4774,9 @@ mod tests {
             textified_duplicate_tool_results: 1,
             textified_orphan_tool_results: 1,
             removed_orphan_tool_uses: 1,
+            flattened_history_tool_uses: 1,
+            textified_history_tool_results: 1,
+            removed_history_tools: 1,
             truncated_history_tool_results: 1,
             truncated_history_tool_result_chars: 10,
             removed_history_thinking_blocks: 1,
@@ -4458,6 +4799,7 @@ mod tests {
             cache_point_retry_reason: None,
             body_sha256: None,
             tool_use_format_diagnostics: None,
+            tool_format_debug_ref: None,
             still_oversized: false,
         };
 
@@ -4475,6 +4817,17 @@ mod tests {
         assert!(header.contains("payload-current-documents-truncated=1"));
         assert!(header.contains("payload-current-content-truncated=1"));
         assert!(header.contains("payload-current-images-dropped=1"));
+    }
+
+    #[test]
+    fn warning_header_fragment_does_not_expose_internal_history_tool_flattening() {
+        let mut report = new_payload_guard_report(usize::MAX, 100, 4);
+        report.flattened_history_tool_uses = 2;
+        report.textified_history_tool_results = 2;
+        report.removed_history_tools = 1;
+
+        assert!(report.was_modified());
+        assert!(report.warning_header_fragment().is_none());
     }
 
     #[test]
@@ -4685,16 +5038,19 @@ mod tests {
         .expect("guard");
 
         assert_eq!(report.truncated_history_tool_results, 1);
+        assert_eq!(report.flattened_history_tool_uses, 1);
+        assert_eq!(report.textified_history_tool_results, 1);
         let Message::User(user) = &request.conversation_state.history[2] else {
             panic!("expected historical user");
         };
-        let historical_text = tool_result_text(
-            &user
-                .user_input_message
+        assert!(
+            user.user_input_message
                 .user_input_message_context
-                .tool_results[0],
+                .tool_results
+                .is_empty()
         );
-        assert!(historical_text.chars().count() <= 1_000);
+        let historical_text = &user.user_input_message.content;
+        assert!(historical_text.chars().count() <= 1_120);
         assert!(historical_text.contains("historical tool result truncated by proxy"));
 
         let current_text = tool_result_text(
@@ -5081,18 +5437,21 @@ mod tests {
 
         assert_eq!(report.trimmed_web_fetch_blocks, 1);
         assert_eq!(report.truncated_history_tool_results, 0);
+        assert_eq!(report.flattened_history_tool_uses, 1);
+        assert_eq!(report.textified_history_tool_results, 1);
         let Message::User(user) = &request.conversation_state.history[2] else {
             panic!("expected historical user");
         };
-        let text = tool_result_text(
-            &user
-                .user_input_message
+        assert!(
+            user.user_input_message
                 .user_input_message_context
-                .tool_results[0],
+                .tool_results
+                .is_empty()
         );
+        let text = &user.user_input_message.content;
         assert!(text.contains("Proxy note: web page navigation"));
         assert!(text.chars().count() > 1_000);
-        assert!(text.chars().count() < 4_000);
+        assert!(text.chars().count() < 4_120);
     }
 
     #[test]
@@ -5128,16 +5487,19 @@ mod tests {
 
         assert_eq!(report.trimmed_web_fetch_blocks, 0);
         assert_eq!(report.truncated_history_tool_results, 1);
+        assert_eq!(report.flattened_history_tool_uses, 1);
+        assert_eq!(report.textified_history_tool_results, 1);
         let Message::User(user) = &request.conversation_state.history[2] else {
             panic!("expected historical user");
         };
-        let text = tool_result_text(
-            &user
-                .user_input_message
+        assert!(
+            user.user_input_message
                 .user_input_message_context
-                .tool_results[0],
+                .tool_results
+                .is_empty()
         );
-        assert!(text.chars().count() <= 1_000);
+        let text = &user.user_input_message.content;
+        assert!(text.chars().count() <= 1_120);
     }
 
     #[test]

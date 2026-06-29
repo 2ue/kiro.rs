@@ -35,6 +35,8 @@ import { useModelCapabilities } from '@/hooks/use-usage'
 import { storage } from '@/lib/storage'
 import type {
   AccessKeysResponse,
+  CachePolicyConfig,
+  CacheRoutePolicyPatch,
   CompatProfile,
   KiroAgentModeStrategy,
   ModelCapabilitiesStatus,
@@ -61,6 +63,7 @@ type ConfigTab =
   | 'cacheRead'
   | 'cacheCreate'
   | 'usage'
+  | 'cachePolicy'
   | 'compat'
   | 'stats'
 
@@ -76,6 +79,7 @@ const configTabs: Array<{ key: ConfigTab; label: string; description: string; ic
   { key: 'cacheRead', label: '缓存命中展示', description: '输入和缓存读取展示口径', icon: <Zap className="h-4 w-4" /> },
   { key: 'cacheCreate', label: '缓存创建频次', description: '缓存写入展示节奏', icon: <Zap className="h-4 w-4" /> },
   { key: 'usage', label: '用量展示', description: '不同入口的展示规则', icon: <BadgeInfo className="h-4 w-4" /> },
+  { key: 'cachePolicy', label: '路径缓存策略', description: '按入口覆盖缓存行为', icon: <Zap className="h-4 w-4" /> },
   { key: 'compat', label: '兼容与模型', description: '兼容模式和模型映射', icon: <Shield className="h-4 w-4" /> },
   { key: 'stats', label: '后台统计', description: '页面统计判断标准', icon: <Gauge className="h-4 w-4" /> },
 ]
@@ -229,6 +233,119 @@ function ToggleField({
         <div className="mt-0.5 text-xs leading-4 text-base-content/60">{description}</div>
       </div>
       <Toggle color="primary" size="sm" className="shrink-0" checked={checked} disabled={disabled} onChange={(event) => onChange(event.target.checked)} />
+    </div>
+  )
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function parseCachePolicyText(value: string): CachePolicyConfig {
+  const parsed: unknown = JSON.parse(value)
+  if (!isPlainObject(parsed)) {
+    throw new Error('配置必须是对象')
+  }
+  const defaultPatch = parsed.default ?? {}
+  const pathOverrides = parsed.pathOverrides ?? {}
+  if (!isPlainObject(defaultPatch)) {
+    throw new Error('default 必须是对象')
+  }
+  if (!isPlainObject(pathOverrides)) {
+    throw new Error('pathOverrides 必须是对象')
+  }
+  return normalizeCachePolicy({
+    default: defaultPatch as CacheRoutePolicyPatch,
+    pathOverrides: pathOverrides as Record<string, CacheRoutePolicyPatch>,
+  })
+}
+
+function CachePolicyJsonEditor({
+  value,
+  onChange,
+}: {
+  value: CachePolicyConfig
+  onChange: (value: CachePolicyConfig) => void
+}) {
+  const [text, setText] = useState(() => JSON.stringify(value, null, 2))
+  const [error, setError] = useState<string | null>(null)
+  const [dirty, setDirty] = useState(false)
+
+  useEffect(() => {
+    if (dirty) return
+    setText(JSON.stringify(value, null, 2))
+    setError(null)
+  }, [value, dirty])
+
+  const commit = (nextText: string) => {
+    setDirty(true)
+    setText(nextText)
+    try {
+      const parsed = parseCachePolicyText(nextText)
+      setError(null)
+      onChange(parsed)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'JSON 解析失败')
+    }
+  }
+
+  const fillExample = () => {
+    const example: CachePolicyConfig = {
+      default: {},
+      pathOverrides: {
+        '/cc': {
+          simulation: {
+            enabled: true,
+            targetReadRatio: 0.98,
+            tokenScale: 1.6,
+            maxSimulatedInputTokens: 300000,
+          },
+          reportedUsage: pathPolicy(true, inputSamplePolicy(96), preserveFieldPolicy()),
+        },
+        '/dfcache/team-a': {
+          simulation: { enabled: true, targetReadRatio: 0.96 },
+          creationControl: {
+            enabled: true,
+            scopeMode: 'conversation_model',
+            minSuccessfulRequestsBetweenCreation: 2,
+            minCreationIntervalSecs: 30,
+            minCreationDeltaTokens: 8000,
+            maxCreationTokensPerEvent: 30000,
+            creationBudgetWindowSecs: 300,
+            maxCreationTokensPerWindow: 120000,
+            expireAfterIdleSecs: 3600,
+          },
+          cachePoint: { enabled: false },
+          bounds: { maxEntriesPerAccount: 200, maxEntriesGlobal: 20000, entryTtlSecs: 86400 },
+        },
+      },
+    }
+    commit(JSON.stringify(example, null, 2))
+  }
+
+  return (
+    <div className="md:col-span-2 space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="text-xs leading-5 text-base-content/60">
+          按路径前缀覆盖缓存模拟、缓存创建频次、usage 展示、真实 cachePoint 和缓存边界。空对象表示沿用全局配置；最长匹配生效。
+        </p>
+        <Button type="button" variant="outline" size="sm" onClick={fillExample}>
+          填充示例
+        </Button>
+      </div>
+      <textarea
+        className="textarea textarea-bordered min-h-96 w-full font-mono text-xs"
+        value={text}
+        spellCheck={false}
+        onChange={(event) => commit(event.target.value)}
+      />
+      {error ? (
+        <div className="text-xs text-error">配置格式错误：{error}</div>
+      ) : (
+        <div className="text-xs text-base-content/60">
+          支持字段：simulation、creationControl、reportedUsage、cachePoint、bounds。路径策略只改变策略，不会自动创建 /dfcache 路由。
+        </div>
+      )}
     </div>
   )
 }
@@ -933,6 +1050,7 @@ export function ConfigPanel() {
       credentialMaxCooldownSecs: toWhole(draft.credentialMaxCooldownSecs, 1),
       credentialDispatchMaxWaitSecs: toWhole(draft.credentialDispatchMaxWaitSecs),
       kiroUpstreamResponseTimeoutSecs: toWhole(draft.kiroUpstreamResponseTimeoutSecs),
+      kiroUpstreamStreamIdleTimeoutSecs: toWhole(draft.kiroUpstreamStreamIdleTimeoutSecs),
       credentialRetryMaxAttempts: toWhole(draft.credentialRetryMaxAttempts),
       credentialInFlightLeaseMaxSecs: toWhole(draft.credentialInFlightLeaseMaxSecs),
       dispatchGlobalMaxConcurrentRequests: toWhole(draft.dispatchGlobalMaxConcurrentRequests),
@@ -949,6 +1067,7 @@ export function ConfigPanel() {
       schedulerSelectionPressureWeight: Math.max(0, Number(draft.schedulerSelectionPressureWeight.toFixed(2))),
       schedulerTotalSelectionWeight: Math.max(0, Number(draft.schedulerTotalSelectionWeight.toFixed(4))),
       schedulerTopK: toWhole(draft.schedulerTopK, 1, 100),
+      selectionFailureSampleLimit: toWhole(draft.selectionFailureSampleLimit, 0, 1000),
       payloadGuardMaxBytes: toWhole(draft.payloadGuardMaxBytes),
       payloadGuardSafetyMarginBytes: toWhole(draft.payloadGuardSafetyMarginBytes),
       payloadShaping: normalizePayloadShaping(draft.payloadShaping),
@@ -959,6 +1078,10 @@ export function ConfigPanel() {
       promptCacheCapJitterMaxTokens: toWhole(draft.promptCacheCapJitterMaxTokens),
       promptCacheScaleMinInputTokens: toWhole(draft.promptCacheScaleMinInputTokens),
       promptCacheCreationControl: normalizePromptCacheCreationControl(draft.promptCacheCreationControl),
+      promptCacheMaxEntriesPerAccount: toWhole(draft.promptCacheMaxEntriesPerAccount),
+      promptCacheMaxEntriesGlobal: toWhole(draft.promptCacheMaxEntriesGlobal),
+      promptCacheEntryTtlSecs: toWhole(draft.promptCacheEntryTtlSecs, 1),
+      promptCacheEstimatedBytesLimit: toWhole(draft.promptCacheEstimatedBytesLimit),
       reportedUsage: normalizeReportedUsage({
         ...draft.reportedUsage,
         pathOverrides: definedCacheRoutes.reduce(
@@ -1092,6 +1215,7 @@ export function ConfigPanel() {
             <NumberField title="最大等待队列请求数" description="调度容量已满时允许排队等待的请求数量。填 0 表示不限制。" value={draft.dispatchMaxQueuedRequests} min={0} suffix="请求" onChange={(dispatchMaxQueuedRequests) => setDraft((prev) => ({ ...prev, dispatchMaxQueuedRequests }))} />
             <NumberField title="单请求最长排队等待" description="所有可用账号都处于冷却、限速或并发占满时最多等待多久。填 0 表示不限制。" value={draft.credentialDispatchMaxWaitSecs} min={0} suffix="秒" onChange={(credentialDispatchMaxWaitSecs) => setDraft((prev) => ({ ...prev, credentialDispatchMaxWaitSecs }))} />
             <NumberField title="开始响应等待时间" description="请求发出后最多等多久开始返回内容。填 0 表示使用默认超时。" value={draft.kiroUpstreamResponseTimeoutSecs} min={0} suffix="秒" onChange={(kiroUpstreamResponseTimeoutSecs) => setDraft((prev) => ({ ...prev, kiroUpstreamResponseTimeoutSecs }))} />
+            <NumberField title="流式静默超时" description="流式响应长时间没有新内容时结束本次请求。填 0 表示不按流式空闲时间主动结束。" value={draft.kiroUpstreamStreamIdleTimeoutSecs} min={0} suffix="秒" onChange={(kiroUpstreamStreamIdleTimeoutSecs) => setDraft((prev) => ({ ...prev, kiroUpstreamStreamIdleTimeoutSecs }))} />
             <NumberField title="单请求最大重试次数" description="一次请求失败后最多换几个账号再试。填 0 表示由系统自动决定。" value={draft.credentialRetryMaxAttempts} min={0} suffix="次" onChange={(credentialRetryMaxAttempts) => setDraft((prev) => ({ ...prev, credentialRetryMaxAttempts }))} />
             <NumberField title="异常并发自动回收" description="单个并发占用超过多久未活跃时自动释放。填 0 表示关闭。" value={draft.credentialInFlightLeaseMaxSecs} min={0} suffix="秒" onChange={(credentialInFlightLeaseMaxSecs) => setDraft((prev) => ({ ...prev, credentialInFlightLeaseMaxSecs }))} />
           </ConfigGroup>
@@ -1124,6 +1248,8 @@ export function ConfigPanel() {
               <NumberField title="短时间集中使用降权" description="最近一分钟被选中过多时降低使用频率，避免请求集中到单个账号。" value={draft.schedulerSelectionPressureWeight} min={0} step={1} suffix="权重" onChange={(schedulerSelectionPressureWeight) => setDraft((prev) => ({ ...prev, schedulerSelectionPressureWeight }))} />
               <NumberField title="长期使用次数权重" description="根据历史使用次数做轻微均衡。通常保持 0 即可。" value={draft.schedulerTotalSelectionWeight} min={0} step={0.001} suffix="权重" onChange={(schedulerTotalSelectionWeight) => setDraft((prev) => ({ ...prev, schedulerTotalSelectionWeight }))} />
               <NumberField title="候选账号数量" description="每次从排名靠前的几个账号里选择，数值越大越分散。" value={draft.schedulerTopK} min={1} max={100} suffix="个" onChange={(schedulerTopK) => setDraft((prev) => ({ ...prev, schedulerTopK }))} />
+              <NumberField title="失败诊断样本数" description="调度失败时最多记录多少个账号样本，用于后台排查；0 表示不记录样本。" value={draft.selectionFailureSampleLimit} min={0} max={1000} suffix="个" onChange={(selectionFailureSampleLimit) => setDraft((prev) => ({ ...prev, selectionFailureSampleLimit }))} />
+              <ToggleField title="记录失败样本" description="关闭后只保留失败原因统计，不记录具体账号样本。" checked={draft.selectionFailureRecordEnabled} onChange={(selectionFailureRecordEnabled) => setDraft((prev) => ({ ...prev, selectionFailureRecordEnabled }))} />
             </ConfigGroup>
         )}
 
@@ -1232,6 +1358,13 @@ export function ConfigPanel() {
             <NumberField title="放大启用门槛" description="输入量达到多少后才开始放大估算。" value={draft.promptCacheScaleMinInputTokens} min={0} suffix="Token" onChange={(promptCacheScaleMinInputTokens) => setDraft((prev) => ({ ...prev, promptCacheScaleMinInputTokens }))} />
             <NumberField title="触顶扣减下限" description="达到上限时，至少从上限扣掉多少，避免数值总是贴边。" value={draft.promptCacheCapJitterMinTokens} min={0} suffix="Token" onChange={(promptCacheCapJitterMinTokens) => setDraft((prev) => ({ ...prev, promptCacheCapJitterMinTokens }))} />
             <NumberField title="触顶扣减上限" description="达到上限时，最多从上限扣掉多少。" value={draft.promptCacheCapJitterMaxTokens} min={0} suffix="Token" onChange={(promptCacheCapJitterMaxTokens) => setDraft((prev) => ({ ...prev, promptCacheCapJitterMaxTokens }))} />
+            <NumberField title="单账号缓存条目上限" description="每个账号最多保留多少个可复用缓存指纹，防止长会话无限增长。" value={draft.promptCacheMaxEntriesPerAccount} min={0} suffix="条" onChange={(promptCacheMaxEntriesPerAccount) => setDraft((prev) => ({ ...prev, promptCacheMaxEntriesPerAccount }))} />
+            <NumberField title="全局缓存条目上限" description="所有账号合计最多保留多少个缓存指纹。填 0 表示不按条目数限制。" value={draft.promptCacheMaxEntriesGlobal} min={0} suffix="条" onChange={(promptCacheMaxEntriesGlobal) => setDraft((prev) => ({ ...prev, promptCacheMaxEntriesGlobal }))} />
+            <NumberField title="缓存指纹保留时间" description="单条缓存指纹最多保留多久，实际不会超过上游缓存标记的时间。" value={draft.promptCacheEntryTtlSecs} min={1} suffix="秒" onChange={(promptCacheEntryTtlSecs) => setDraft((prev) => ({ ...prev, promptCacheEntryTtlSecs }))} />
+            <NumberField title="缓存估算内存上限" description="达到估算上限后优先移除最久未使用的缓存指纹。填 0 表示不按内存估算限制。" value={draft.promptCacheEstimatedBytesLimit} min={0} suffix="字节" onChange={(promptCacheEstimatedBytesLimit) => setDraft((prev) => ({ ...prev, promptCacheEstimatedBytesLimit }))} />
+            <ToggleField title="发送真实 cachePoint" description="把带缓存标记的工具发送给 Kiro 上游；上游不接受时会自动去掉后重试一次。" checked={draft.kiroCachePointEnabled} onChange={(kiroCachePointEnabled) => setDraft((prev) => ({ ...prev, kiroCachePointEnabled }))} />
+            <ToggleField title="只处理工具缓存标记" description="只根据工具上的缓存标记插入 cachePoint，不改写系统消息或历史消息。" checked={draft.kiroCachePointToolsOnly} disabled={!draft.kiroCachePointEnabled} onChange={(kiroCachePointToolsOnly) => setDraft((prev) => ({ ...prev, kiroCachePointToolsOnly }))} />
+            <ToggleField title="记录 cachePoint 计划" description="在系统日志中记录插入数量，方便排查上游请求体错误。" checked={draft.kiroCachePointRecordPlan} disabled={!draft.kiroCachePointEnabled} onChange={(kiroCachePointRecordPlan) => setDraft((prev) => ({ ...prev, kiroCachePointRecordPlan }))} />
           </ConfigGroup>
         )}
 
@@ -1473,6 +1606,15 @@ export function ConfigPanel() {
           </ConfigGroup>
         )}
 
+        {activeTab === 'cachePolicy' && (
+          <ConfigGroup icon={<Zap className="h-4 w-4" />} title="路径级缓存策略" description="按入口前缀覆盖高缓存模拟、缓存创建频次、路径级 usage 上报改写、真实 cachePoint 和缓存边界。">
+            <CachePolicyJsonEditor
+              value={draft.cachePolicy}
+              onChange={(cachePolicy) => setDraft((prev) => ({ ...prev, cachePolicy }))}
+            />
+          </ConfigGroup>
+        )}
+
         {activeTab === 'compat' && (
             <ConfigGroup icon={<Shield className="h-4 w-4" />} title="兼容与模型" description="选择接口兼容方式，并维护模型名称映射。">
               <FieldLabel title="兼容模式" description="日常使用建议保持兼容模式；严格模式会尽量减少代理侧处理；调试模式会输出更多排查信息。">
@@ -1531,6 +1673,12 @@ export function ConfigPanel() {
                   />
                   <div className="text-xs text-base-content/60">当前规则 {draft.modelMapping.rules.length} 条；可生成默认规则 {defaultModelMappingRules.length} 条。</div>
                 </div>
+              </FieldLabel>
+              <FieldLabel title="思考触发策略" description="按请求触发会遵循 Claude Code CLI 的 thinking 语义；总是触发会在请求没有明确关闭时启用思考输出。">
+                <Select bordered size="sm" value={draft.thinkingTriggerMode} onChange={(event) => setDraft((prev) => ({ ...prev, thinkingTriggerMode: event.target.value as RuntimeConfig['thinkingTriggerMode'] }))}>
+                  <Select.Option value="real_request">按请求触发</Select.Option>
+                  <Select.Option value="always">总是触发</Select.Option>
+                </Select>
               </FieldLabel>
               <ToggleField title="整理思考内容" description="开启后，会把响应里的思考内容单独整理出来。" checked={draft.extractThinking} onChange={(extractThinking) => setDraft((prev) => ({ ...prev, extractThinking }))} />
               <ToggleField title="显示处理告警" description="开启后，会把排查提示返回给客户端，方便定位兼容问题。" checked={draft.exposeProxyWarnings} onChange={(exposeProxyWarnings) => setDraft((prev) => ({ ...prev, exposeProxyWarnings }))} />

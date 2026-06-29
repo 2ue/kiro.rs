@@ -118,6 +118,79 @@ pub struct PayloadShapingConfig {
     pub current_images_max_bytes: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolFormatDebugConfig {
+    /// 是否在 Kiro 上游返回 tool-use 格式错误时记录内部诊断。
+    #[serde(default = "default_tool_format_debug_enabled")]
+    pub enabled: bool,
+    /// JSONL 诊断文件目录。仅用于内部排查，不返回给下游。
+    #[serde(default = "default_tool_format_debug_dir")]
+    pub dir: String,
+    /// 非阻塞写盘队列容量。队列满时丢弃诊断，不阻塞主请求。
+    #[serde(default = "default_tool_format_debug_channel_capacity")]
+    pub channel_capacity: usize,
+    /// 单条 JSONL 最大字节数，超过后会丢弃 samples 保留聚合指标。
+    #[serde(default = "default_tool_format_debug_max_record_bytes")]
+    pub max_record_bytes: usize,
+    /// 每类异常最多记录多少个样本。
+    #[serde(default = "default_tool_format_debug_max_samples_per_kind")]
+    pub max_samples_per_kind: usize,
+    /// 同类记录限流窗口秒数。
+    #[serde(default = "default_tool_format_debug_window_secs")]
+    pub window_secs: u64,
+    /// 每个精确 fingerprint 在窗口内最多写几条完整诊断。
+    #[serde(default = "default_tool_format_debug_max_records_per_fingerprint")]
+    pub max_records_per_fingerprint: u32,
+    /// 每个结构 group 在窗口内最多写几条完整诊断。
+    #[serde(default = "default_tool_format_debug_max_records_per_group")]
+    pub max_records_per_group: u32,
+    /// 全局窗口内最多写几条完整诊断。
+    #[serde(default = "default_tool_format_debug_max_records_global")]
+    pub max_records_global: u32,
+    /// 诊断字段中的字符串最大字节数。
+    #[serde(default = "default_tool_format_debug_max_string_bytes")]
+    pub max_string_bytes: usize,
+}
+
+impl Default for ToolFormatDebugConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_tool_format_debug_enabled(),
+            dir: default_tool_format_debug_dir(),
+            channel_capacity: default_tool_format_debug_channel_capacity(),
+            max_record_bytes: default_tool_format_debug_max_record_bytes(),
+            max_samples_per_kind: default_tool_format_debug_max_samples_per_kind(),
+            window_secs: default_tool_format_debug_window_secs(),
+            max_records_per_fingerprint: default_tool_format_debug_max_records_per_fingerprint(),
+            max_records_per_group: default_tool_format_debug_max_records_per_group(),
+            max_records_global: default_tool_format_debug_max_records_global(),
+            max_string_bytes: default_tool_format_debug_max_string_bytes(),
+        }
+    }
+}
+
+impl ToolFormatDebugConfig {
+    pub fn normalized(&self) -> Self {
+        Self {
+            enabled: self.enabled,
+            dir: if self.dir.trim().is_empty() {
+                default_tool_format_debug_dir()
+            } else {
+                self.dir.trim().to_string()
+            },
+            channel_capacity: self.channel_capacity.clamp(1, 65_536),
+            max_record_bytes: self.max_record_bytes.clamp(1024, 256 * 1024),
+            max_samples_per_kind: self.max_samples_per_kind.min(100),
+            window_secs: self.window_secs.clamp(1, 86_400),
+            max_records_per_fingerprint: self.max_records_per_fingerprint.min(10_000),
+            max_records_per_group: self.max_records_per_group.min(100_000),
+            max_records_global: self.max_records_global.min(1_000_000),
+            max_string_bytes: self.max_string_bytes.clamp(32, 4096),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PayloadShapingConfigPatch {
@@ -549,6 +622,16 @@ impl ReportedUsageConfig {
             .map(|(_, policy)| policy.clone())
             .unwrap_or(normalized.default)
     }
+
+    pub fn path_override_for_path(&self, path: &str) -> Option<ReportedUsagePathPolicy> {
+        let normalized = self.normalized();
+        normalized
+            .path_overrides
+            .iter()
+            .filter(|(prefix, _)| reported_usage_path_matches(prefix, path))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .map(|(_, policy)| policy.clone())
+    }
 }
 
 /// 本地 prompt-cache creation 上报频次控制的状态维度。
@@ -645,29 +728,522 @@ impl PromptCacheCreationControlConfig {
     }
 
     pub fn validate(self) -> Result<(), String> {
+        self.validate_with_label("promptCacheCreationControl")
+    }
+
+    fn validate_with_label(self, label: &str) -> Result<(), String> {
+        if self.min_creation_delta_tokens < 0 {
+            return Err(format!("{label}.minCreationDeltaTokens 不能小于 0"));
+        }
+        if self.max_creation_tokens_per_event < 0 {
+            return Err(format!("{label}.maxCreationTokensPerEvent 不能小于 0"));
+        }
+        if self.max_creation_tokens_per_window < 0 {
+            return Err(format!("{label}.maxCreationTokensPerWindow 不能小于 0"));
+        }
+
         let config = self.normalized();
         if config.min_successful_requests_between_creation > 10_000 {
-            return Err(
-                "promptCacheCreationControl.minSuccessfulRequestsBetweenCreation 不能大于 10000"
-                    .to_string(),
-            );
+            return Err(format!(
+                "{label}.minSuccessfulRequestsBetweenCreation 不能大于 10000"
+            ));
         }
         if config.min_creation_interval_secs > 7 * 24 * 60 * 60 {
-            return Err(
-                "promptCacheCreationControl.minCreationIntervalSecs 不能大于 604800".to_string(),
-            );
+            return Err(format!("{label}.minCreationIntervalSecs 不能大于 604800"));
         }
         if config.creation_budget_window_secs > 7 * 24 * 60 * 60 {
-            return Err(
-                "promptCacheCreationControl.creationBudgetWindowSecs 不能大于 604800".to_string(),
-            );
+            return Err(format!("{label}.creationBudgetWindowSecs 不能大于 604800"));
         }
         if config.expire_after_idle_secs > 30 * 24 * 60 * 60 {
-            return Err(
-                "promptCacheCreationControl.expireAfterIdleSecs 不能大于 2592000".to_string(),
-            );
+            return Err(format!("{label}.expireAfterIdleSecs 不能大于 2592000"));
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheSimulationPolicy {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_prompt_cache_target_read_ratio")]
+    pub target_read_ratio: f64,
+    #[serde(default = "default_prompt_cache_token_scale")]
+    pub token_scale: f64,
+    #[serde(default = "default_prompt_cache_max_simulated_input_tokens")]
+    pub max_simulated_input_tokens: i32,
+    #[serde(default = "default_prompt_cache_cap_jitter_min_tokens")]
+    pub cap_jitter_min_tokens: i32,
+    #[serde(default = "default_prompt_cache_cap_jitter_max_tokens")]
+    pub cap_jitter_max_tokens: i32,
+    #[serde(default = "default_prompt_cache_scale_min_input_tokens")]
+    pub scale_min_input_tokens: i32,
+}
+
+impl Default for CacheSimulationPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            target_read_ratio: default_prompt_cache_target_read_ratio(),
+            token_scale: default_prompt_cache_token_scale(),
+            max_simulated_input_tokens: default_prompt_cache_max_simulated_input_tokens(),
+            cap_jitter_min_tokens: default_prompt_cache_cap_jitter_min_tokens(),
+            cap_jitter_max_tokens: default_prompt_cache_cap_jitter_max_tokens(),
+            scale_min_input_tokens: default_prompt_cache_scale_min_input_tokens(),
+        }
+    }
+}
+
+impl CacheSimulationPolicy {
+    pub fn normalized(self) -> Self {
+        Self {
+            enabled: self.enabled,
+            target_read_ratio: if self.target_read_ratio.is_finite() {
+                self.target_read_ratio.clamp(0.0, 0.99)
+            } else {
+                default_prompt_cache_target_read_ratio()
+            },
+            token_scale: if self.token_scale.is_finite() {
+                self.token_scale.clamp(1.0, 3.0)
+            } else {
+                default_prompt_cache_token_scale()
+            },
+            max_simulated_input_tokens: self.max_simulated_input_tokens.max(0),
+            cap_jitter_min_tokens: self.cap_jitter_min_tokens.max(0),
+            cap_jitter_max_tokens: self.cap_jitter_max_tokens.max(0),
+            scale_min_input_tokens: self.scale_min_input_tokens.max(0),
+        }
+    }
+
+    pub fn validate(self, label: &str) -> Result<(), String> {
+        if !(0.0..=0.99).contains(&self.target_read_ratio) || !self.target_read_ratio.is_finite() {
+            return Err(format!("{label}.targetReadRatio 必须在 0 到 0.99 之间"));
+        }
+        if !(1.0..=3.0).contains(&self.token_scale) || !self.token_scale.is_finite() {
+            return Err(format!("{label}.tokenScale 必须在 1 到 3 之间"));
+        }
+        if self.max_simulated_input_tokens < 0 {
+            return Err(format!("{label}.maxSimulatedInputTokens 不能小于 0"));
+        }
+        if self.cap_jitter_min_tokens < 0 || self.cap_jitter_max_tokens < 0 {
+            return Err(format!(
+                "{label}.capJitterMinTokens 和 capJitterMaxTokens 不能小于 0"
+            ));
+        }
+        if self.cap_jitter_min_tokens > self.cap_jitter_max_tokens {
+            return Err(format!(
+                "{label}.capJitterMinTokens 不能大于 capJitterMaxTokens"
+            ));
+        }
+        if self.scale_min_input_tokens < 0 {
+            return Err(format!("{label}.scaleMinInputTokens 不能小于 0"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheSimulationPolicyPatch {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub target_read_ratio: Option<f64>,
+    #[serde(default)]
+    pub token_scale: Option<f64>,
+    #[serde(default)]
+    pub max_simulated_input_tokens: Option<i32>,
+    #[serde(default)]
+    pub cap_jitter_min_tokens: Option<i32>,
+    #[serde(default)]
+    pub cap_jitter_max_tokens: Option<i32>,
+    #[serde(default)]
+    pub scale_min_input_tokens: Option<i32>,
+}
+
+impl CacheSimulationPolicyPatch {
+    fn apply_to(self, mut policy: CacheSimulationPolicy) -> CacheSimulationPolicy {
+        if let Some(value) = self.enabled {
+            policy.enabled = value;
+        }
+        if let Some(value) = self.target_read_ratio {
+            policy.target_read_ratio = value;
+        }
+        if let Some(value) = self.token_scale {
+            policy.token_scale = value;
+        }
+        if let Some(value) = self.max_simulated_input_tokens {
+            policy.max_simulated_input_tokens = value;
+        }
+        if let Some(value) = self.cap_jitter_min_tokens {
+            policy.cap_jitter_min_tokens = value;
+        }
+        if let Some(value) = self.cap_jitter_max_tokens {
+            policy.cap_jitter_max_tokens = value;
+        }
+        if let Some(value) = self.scale_min_input_tokens {
+            policy.scale_min_input_tokens = value;
+        }
+        policy.normalized()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.target_read_ratio.is_none()
+            && self.token_scale.is_none()
+            && self.max_simulated_input_tokens.is_none()
+            && self.cap_jitter_min_tokens.is_none()
+            && self.cap_jitter_max_tokens.is_none()
+            && self.scale_min_input_tokens.is_none()
+    }
+
+    fn validate_raw(&self, label: &str) -> Result<(), String> {
+        if let Some(value) = self.target_read_ratio {
+            if !(0.0..=0.99).contains(&value) || !value.is_finite() {
+                return Err(format!("{label}.targetReadRatio 必须在 0 到 0.99 之间"));
+            }
+        }
+        if let Some(value) = self.token_scale {
+            if !(1.0..=3.0).contains(&value) || !value.is_finite() {
+                return Err(format!("{label}.tokenScale 必须在 1 到 3 之间"));
+            }
+        }
+        if self
+            .max_simulated_input_tokens
+            .is_some_and(|value| value < 0)
+        {
+            return Err(format!("{label}.maxSimulatedInputTokens 不能小于 0"));
+        }
+        if self.cap_jitter_min_tokens.is_some_and(|value| value < 0)
+            || self.cap_jitter_max_tokens.is_some_and(|value| value < 0)
+        {
+            return Err(format!(
+                "{label}.capJitterMinTokens 和 capJitterMaxTokens 不能小于 0"
+            ));
+        }
+        if self.scale_min_input_tokens.is_some_and(|value| value < 0) {
+            return Err(format!("{label}.scaleMinInputTokens 不能小于 0"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CachePointPolicy {
+    #[serde(default = "default_kiro_cache_point_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_kiro_cache_point_tools_only")]
+    pub tools_only: bool,
+    #[serde(default = "default_kiro_cache_point_record_plan")]
+    pub record_plan: bool,
+}
+
+impl Default for CachePointPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: default_kiro_cache_point_enabled(),
+            tools_only: default_kiro_cache_point_tools_only(),
+            record_plan: default_kiro_cache_point_record_plan(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CachePointPolicyPatch {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub tools_only: Option<bool>,
+    #[serde(default)]
+    pub record_plan: Option<bool>,
+}
+
+impl CachePointPolicyPatch {
+    fn apply_to(self, mut policy: CachePointPolicy) -> CachePointPolicy {
+        if let Some(value) = self.enabled {
+            policy.enabled = value;
+        }
+        if let Some(value) = self.tools_only {
+            policy.tools_only = value;
+        }
+        if let Some(value) = self.record_plan {
+            policy.record_plan = value;
+        }
+        policy
+    }
+
+    fn is_empty(&self) -> bool {
+        self.enabled.is_none() && self.tools_only.is_none() && self.record_plan.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheBoundsPolicy {
+    #[serde(default = "default_prompt_cache_max_entries_per_account")]
+    pub max_entries_per_account: usize,
+    #[serde(default = "default_prompt_cache_max_entries_global")]
+    pub max_entries_global: usize,
+    #[serde(default = "default_prompt_cache_entry_ttl_secs")]
+    pub entry_ttl_secs: u64,
+    #[serde(default = "default_prompt_cache_estimated_bytes_limit")]
+    pub estimated_bytes_limit: u64,
+}
+
+impl Default for CacheBoundsPolicy {
+    fn default() -> Self {
+        Self {
+            max_entries_per_account: default_prompt_cache_max_entries_per_account(),
+            max_entries_global: default_prompt_cache_max_entries_global(),
+            entry_ttl_secs: default_prompt_cache_entry_ttl_secs(),
+            estimated_bytes_limit: default_prompt_cache_estimated_bytes_limit(),
+        }
+    }
+}
+
+impl CacheBoundsPolicy {
+    pub fn validate(self, label: &str) -> Result<(), String> {
+        if self.max_entries_global > 0 && self.max_entries_per_account > self.max_entries_global {
+            return Err(format!(
+                "{label}.maxEntriesPerAccount 不能大于 maxEntriesGlobal"
+            ));
+        }
+        if self.entry_ttl_secs == 0 {
+            return Err(format!("{label}.entryTtlSecs 必须大于 0"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheBoundsPolicyPatch {
+    #[serde(default)]
+    pub max_entries_per_account: Option<usize>,
+    #[serde(default)]
+    pub max_entries_global: Option<usize>,
+    #[serde(default)]
+    pub entry_ttl_secs: Option<u64>,
+    #[serde(default)]
+    pub estimated_bytes_limit: Option<u64>,
+}
+
+impl CacheBoundsPolicyPatch {
+    fn apply_to(self, mut policy: CacheBoundsPolicy) -> CacheBoundsPolicy {
+        if let Some(value) = self.max_entries_per_account {
+            policy.max_entries_per_account = value;
+        }
+        if let Some(value) = self.max_entries_global {
+            policy.max_entries_global = value;
+        }
+        if let Some(value) = self.entry_ttl_secs {
+            policy.entry_ttl_secs = value;
+        }
+        if let Some(value) = self.estimated_bytes_limit {
+            policy.estimated_bytes_limit = value;
+        }
+        policy
+    }
+
+    fn is_empty(&self) -> bool {
+        self.max_entries_per_account.is_none()
+            && self.max_entries_global.is_none()
+            && self.entry_ttl_secs.is_none()
+            && self.estimated_bytes_limit.is_none()
+    }
+
+    fn validate_raw(&self, label: &str) -> Result<(), String> {
+        if self.entry_ttl_secs == Some(0) {
+            return Err(format!("{label}.entryTtlSecs 必须大于 0"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheRoutePolicyPatch {
+    #[serde(default)]
+    pub simulation: Option<CacheSimulationPolicyPatch>,
+    #[serde(default)]
+    pub creation_control: Option<PromptCacheCreationControlConfig>,
+    #[serde(default)]
+    pub reported_usage: Option<ReportedUsagePathPolicy>,
+    #[serde(default)]
+    pub cache_point: Option<CachePointPolicyPatch>,
+    #[serde(default)]
+    pub bounds: Option<CacheBoundsPolicyPatch>,
+}
+
+impl CacheRoutePolicyPatch {
+    fn apply_to(&self, mut policy: CacheRoutePolicy) -> CacheRoutePolicy {
+        if let Some(patch) = self.simulation {
+            policy.simulation = patch.apply_to(policy.simulation);
+        }
+        if let Some(config) = self.creation_control {
+            policy.creation_control = config.normalized();
+        }
+        if let Some(reported_usage) = &self.reported_usage {
+            policy.reported_usage = reported_usage.normalized();
+        }
+        if let Some(patch) = self.cache_point {
+            policy.cache_point = patch.apply_to(policy.cache_point);
+        }
+        if let Some(patch) = self.bounds {
+            policy.bounds = patch.apply_to(policy.bounds);
+        }
+        policy.normalized()
+    }
+
+    pub fn validate(&self, label: &str, base: CacheRoutePolicy) -> Result<(), String> {
+        if let Some(patch) = &self.simulation {
+            patch.validate_raw(&format!("{label}.simulation"))?;
+        }
+        if let Some(config) = self.creation_control {
+            config.validate_with_label(&format!("{label}.creationControl"))?;
+        }
+        if let Some(reported_usage) = &self.reported_usage {
+            reported_usage.validate(&format!("{label}.reportedUsage"))?;
+        }
+        if let Some(patch) = &self.bounds {
+            patch.validate_raw(&format!("{label}.bounds"))?;
+        }
+        let policy = self.apply_to(base);
+        policy.validate(label)
+    }
+
+    fn affects_cache_state(&self) -> bool {
+        self.simulation
+            .as_ref()
+            .is_some_and(|patch| !patch.is_empty())
+            || self.creation_control.is_some()
+            || self.bounds.as_ref().is_some_and(|patch| !patch.is_empty())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.simulation
+            .as_ref()
+            .is_none_or(CacheSimulationPolicyPatch::is_empty)
+            && self.creation_control.is_none()
+            && self.reported_usage.is_none()
+            && self
+                .cache_point
+                .as_ref()
+                .is_none_or(CachePointPolicyPatch::is_empty)
+            && self
+                .bounds
+                .as_ref()
+                .is_none_or(CacheBoundsPolicyPatch::is_empty)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CachePolicyConfig {
+    #[serde(default)]
+    pub default: CacheRoutePolicyPatch,
+    #[serde(default)]
+    pub path_overrides: BTreeMap<String, CacheRoutePolicyPatch>,
+}
+
+impl CachePolicyConfig {
+    pub fn normalized(&self) -> Self {
+        let path_overrides = self
+            .path_overrides
+            .iter()
+            .filter_map(|(prefix, policy)| {
+                normalize_reported_usage_path_prefix(prefix).map(|prefix| (prefix, policy.clone()))
+            })
+            .filter(|(_, policy)| !policy.is_empty())
+            .collect();
+        Self {
+            default: self.default.clone(),
+            path_overrides,
+        }
+    }
+
+    pub fn validate(&self, base: CacheRoutePolicy) -> Result<(), String> {
+        self.default.validate("默认缓存策略", base.clone())?;
+        let default_policy = self.default.apply_to(base);
+        for (prefix, policy) in &self.path_overrides {
+            let Some(normalized_prefix) = normalize_reported_usage_path_prefix(prefix) else {
+                return Err("缓存策略路径前缀不能为空".to_string());
+            };
+            policy.validate(
+                &format!("路径 {normalized_prefix} 缓存策略"),
+                default_policy.clone(),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CacheRoutePolicy {
+    pub simulation: CacheSimulationPolicy,
+    pub creation_control: PromptCacheCreationControlConfig,
+    pub reported_usage: ReportedUsagePathPolicy,
+    pub cache_point: CachePointPolicy,
+    pub bounds: CacheBoundsPolicy,
+}
+
+impl CacheRoutePolicy {
+    pub fn normalized(mut self) -> Self {
+        self.simulation = self.simulation.normalized();
+        self.creation_control = self.creation_control.normalized();
+        self.reported_usage = self.reported_usage.normalized();
+        self
+    }
+
+    pub fn validate(&self, label: &str) -> Result<(), String> {
+        self.simulation.validate(&format!("{label}.simulation"))?;
+        self.creation_control
+            .validate()
+            .map_err(|err| format!("{label}.creationControl: {err}"))?;
+        self.reported_usage
+            .validate(&format!("{label}.reportedUsage"))?;
+        self.bounds.validate(&format!("{label}.bounds"))?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedCacheRoutePolicy {
+    pub policy: CacheRoutePolicy,
+    pub namespace: Option<String>,
+}
+
+pub fn resolve_cache_policy_for_path(
+    base: CacheRoutePolicy,
+    reported_usage: &ReportedUsageConfig,
+    cache_policy: &CachePolicyConfig,
+    path: &str,
+) -> ResolvedCacheRoutePolicy {
+    let cache_policy = cache_policy.normalized();
+    let mut policy = cache_policy.default.apply_to(base);
+
+    if let Some(reported_usage) = reported_usage.path_override_for_path(path) {
+        policy.reported_usage = reported_usage.normalized();
+    }
+
+    let mut namespace = None;
+    if let Some((prefix, override_policy)) = cache_policy
+        .path_overrides
+        .iter()
+        .filter(|(prefix, _)| reported_usage_path_matches(prefix, path))
+        .max_by_key(|(prefix, _)| prefix.len())
+    {
+        if override_policy.affects_cache_state() {
+            namespace = Some(prefix.clone());
+        }
+        policy = override_policy.apply_to(policy);
+    }
+
+    ResolvedCacheRoutePolicy {
+        policy: policy.normalized(),
+        namespace,
     }
 }
 
@@ -1539,6 +2115,13 @@ pub struct Config {
     #[serde(default)]
     pub reported_usage: ReportedUsageConfig,
 
+    /// 路径级缓存策略覆盖。
+    ///
+    /// 旧的全局 prompt-cache/cachePoint/reportedUsage 字段仍作为默认值；这里可以按路径前缀
+    /// 覆盖高缓存模拟、写入频次控制、usage 上报和真实 cachePoint 行为。
+    #[serde(default)]
+    pub cache_policy: CachePolicyConfig,
+
     /// 自定义 high-cache 路由前缀。
     ///
     /// 只允许 `/dfcache/{name}` 形式，实际模型接口为
@@ -1550,6 +2133,10 @@ pub struct Config {
     /// 请求级 usage record 内存保留上限。
     #[serde(default = "default_usage_record_limit")]
     pub usage_record_limit: usize,
+
+    /// tool-use 格式错误的内部 JSONL 诊断记录。详细内容不写入 usage 数据库。
+    #[serde(default)]
+    pub tool_format_debug: ToolFormatDebugConfig,
 
     /// Admin 高缓存请求阈值。
     #[serde(default = "default_high_cache_threshold")]
@@ -1909,6 +2496,46 @@ fn default_usage_record_limit() -> usize {
     5000
 }
 
+fn default_tool_format_debug_enabled() -> bool {
+    true
+}
+
+fn default_tool_format_debug_dir() -> String {
+    "logs/tool-format-debug".to_string()
+}
+
+fn default_tool_format_debug_channel_capacity() -> usize {
+    1024
+}
+
+fn default_tool_format_debug_max_record_bytes() -> usize {
+    8 * 1024
+}
+
+fn default_tool_format_debug_max_samples_per_kind() -> usize {
+    5
+}
+
+fn default_tool_format_debug_window_secs() -> u64 {
+    600
+}
+
+fn default_tool_format_debug_max_records_per_fingerprint() -> u32 {
+    3
+}
+
+fn default_tool_format_debug_max_records_per_group() -> u32 {
+    20
+}
+
+fn default_tool_format_debug_max_records_global() -> u32 {
+    200
+}
+
+fn default_tool_format_debug_max_string_bytes() -> usize {
+    256
+}
+
 fn default_high_cache_threshold() -> i32 {
     10_000
 }
@@ -2173,8 +2800,10 @@ impl Default for Config {
             prompt_cache_entry_ttl_secs: default_prompt_cache_entry_ttl_secs(),
             prompt_cache_estimated_bytes_limit: default_prompt_cache_estimated_bytes_limit(),
             reported_usage: ReportedUsageConfig::default(),
+            cache_policy: CachePolicyConfig::default(),
             defined_cache_routes: Vec::new(),
             usage_record_limit: default_usage_record_limit(),
+            tool_format_debug: ToolFormatDebugConfig::default(),
             high_cache_threshold: default_high_cache_threshold(),
             default_endpoint: default_endpoint(),
             expose_proxy_warnings: default_expose_proxy_warnings(),
@@ -2200,6 +2829,44 @@ impl Config {
     /// 优先使用 api_region，未配置时回退到 region
     pub fn effective_api_region(&self) -> &str {
         self.api_region.as_deref().unwrap_or(&self.region)
+    }
+
+    pub fn legacy_cache_route_policy_default(&self) -> CacheRoutePolicy {
+        CacheRoutePolicy {
+            simulation: CacheSimulationPolicy {
+                enabled: true,
+                target_read_ratio: self.prompt_cache_target_read_ratio,
+                token_scale: self.prompt_cache_token_scale,
+                max_simulated_input_tokens: self.prompt_cache_max_simulated_input_tokens,
+                cap_jitter_min_tokens: self.prompt_cache_cap_jitter_min_tokens,
+                cap_jitter_max_tokens: self.prompt_cache_cap_jitter_max_tokens,
+                scale_min_input_tokens: self.prompt_cache_scale_min_input_tokens,
+            }
+            .normalized(),
+            creation_control: self.prompt_cache_creation_control.normalized(),
+            reported_usage: self.reported_usage.default.normalized(),
+            cache_point: CachePointPolicy {
+                enabled: self.kiro_cache_point_enabled,
+                tools_only: self.kiro_cache_point_tools_only,
+                record_plan: self.kiro_cache_point_record_plan,
+            },
+            bounds: CacheBoundsPolicy {
+                max_entries_per_account: self.prompt_cache_max_entries_per_account,
+                max_entries_global: self.prompt_cache_max_entries_global,
+                entry_ttl_secs: self.prompt_cache_entry_ttl_secs,
+                estimated_bytes_limit: self.prompt_cache_estimated_bytes_limit,
+            },
+        }
+        .normalized()
+    }
+
+    pub fn cache_policy_for_path(&self, path: &str) -> ResolvedCacheRoutePolicy {
+        resolve_cache_policy_for_path(
+            self.legacy_cache_route_policy_default(),
+            &self.reported_usage,
+            &self.cache_policy,
+            path,
+        )
     }
 
     /// 返回规范化后的客户端调用 API Key 列表。
@@ -2823,6 +3490,139 @@ mod tests {
         assert_eq!(normalize_defined_cache_route(&legacy_route), None);
         assert_eq!(normalize_defined_cache_route("/dfcache/a/b"), None);
         assert_eq!(normalize_defined_cache_route("/dfcache/a?b"), None);
+    }
+
+    #[test]
+    fn cache_policy_resolves_legacy_and_path_overrides_in_order() {
+        let mut config = Config::default();
+        config.cache_policy.default.simulation = Some(CacheSimulationPolicyPatch {
+            target_read_ratio: Some(0.91),
+            ..CacheSimulationPolicyPatch::default()
+        });
+        config.cache_policy.path_overrides.insert(
+            "/cc".to_string(),
+            CacheRoutePolicyPatch {
+                simulation: Some(CacheSimulationPolicyPatch {
+                    enabled: Some(false),
+                    token_scale: Some(1.2),
+                    ..CacheSimulationPolicyPatch::default()
+                }),
+                reported_usage: Some(ReportedUsagePathPolicy {
+                    input: ReportedUsageFieldPolicy::sample_input_max(48),
+                    ..ReportedUsagePathPolicy::default()
+                }),
+                cache_point: Some(CachePointPolicyPatch {
+                    enabled: Some(true),
+                    ..CachePointPolicyPatch::default()
+                }),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+
+        let cc = config.cache_policy_for_path("/cc/v1/messages");
+
+        assert_eq!(cc.namespace.as_deref(), Some("/cc"));
+        assert!(!cc.policy.simulation.enabled);
+        assert_eq!(cc.policy.simulation.target_read_ratio, 0.91);
+        assert_eq!(cc.policy.simulation.token_scale, 1.2);
+        assert_eq!(cc.policy.reported_usage.input.max_tokens, 48);
+        assert!(cc.policy.cache_point.enabled);
+
+        let ha = config.cache_policy_for_path("/ha/v1/messages");
+        assert_eq!(ha.namespace, None);
+        assert!(ha.policy.simulation.enabled);
+        assert_eq!(ha.policy.simulation.target_read_ratio, 0.91);
+        assert_eq!(ha.policy.reported_usage.input.max_tokens, 96);
+    }
+
+    #[test]
+    fn cache_policy_reported_usage_only_override_does_not_split_cache_scope() {
+        let mut config = Config::default();
+        config.cache_policy.path_overrides.insert(
+            "/reports".to_string(),
+            CacheRoutePolicyPatch {
+                reported_usage: Some(ReportedUsagePathPolicy {
+                    input: ReportedUsageFieldPolicy::sample_input_max(64),
+                    ..ReportedUsagePathPolicy::default()
+                }),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+
+        let resolved = config.cache_policy_for_path("/reports/v1/messages");
+
+        assert_eq!(resolved.namespace, None);
+        assert_eq!(resolved.policy.reported_usage.input.max_tokens, 64);
+    }
+
+    #[test]
+    fn cache_policy_validation_rejects_invalid_path_values() {
+        let mut config = Config::default();
+        config.cache_policy.path_overrides.insert(
+            "/bad".to_string(),
+            CacheRoutePolicyPatch {
+                simulation: Some(CacheSimulationPolicyPatch {
+                    target_read_ratio: Some(1.5),
+                    ..CacheSimulationPolicyPatch::default()
+                }),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+
+        assert!(
+            config
+                .cache_policy
+                .validate(config.legacy_cache_route_policy_default())
+                .is_err()
+        );
+
+        let mut invalid_prefix = Config::default();
+        invalid_prefix
+            .cache_policy
+            .path_overrides
+            .insert(" ".to_string(), CacheRoutePolicyPatch::default());
+        assert!(
+            invalid_prefix
+                .cache_policy
+                .validate(invalid_prefix.legacy_cache_route_policy_default())
+                .is_err()
+        );
+
+        let mut invalid_creation_control = Config::default();
+        invalid_creation_control.cache_policy.path_overrides.insert(
+            "/bad-creation".to_string(),
+            CacheRoutePolicyPatch {
+                creation_control: Some(PromptCacheCreationControlConfig {
+                    min_creation_delta_tokens: -1,
+                    ..PromptCacheCreationControlConfig::default()
+                }),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+        assert!(
+            invalid_creation_control
+                .cache_policy
+                .validate(invalid_creation_control.legacy_cache_route_policy_default())
+                .is_err()
+        );
+
+        let mut invalid_bounds = Config::default();
+        invalid_bounds.cache_policy.path_overrides.insert(
+            "/bad-bounds".to_string(),
+            CacheRoutePolicyPatch {
+                bounds: Some(CacheBoundsPolicyPatch {
+                    entry_ttl_secs: Some(0),
+                    ..CacheBoundsPolicyPatch::default()
+                }),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+        assert!(
+            invalid_bounds
+                .cache_policy
+                .validate(invalid_bounds.legacy_cache_route_policy_default())
+                .is_err()
+        );
     }
 
     #[test]

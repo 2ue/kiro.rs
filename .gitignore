@@ -18,6 +18,7 @@
 /kiro_usage_records.jsonl
 /.local-run/
 /backups/
+/logs/
 .history
 /ui/node_modules/
 /ui/dist/

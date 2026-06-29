@@ -33,9 +33,14 @@ interface KamAccount {
   userId?: string | null
   nickname?: string
   credentials: {
+    accessToken?: string
+    expiresAt?: string
     refreshToken: string
     clientId?: string
     clientSecret?: string
+    tokenEndpoint?: string
+    issuerUrl?: string
+    scopes?: string
     profileArn?: string
     region?: string
     apiRegion?: string
@@ -80,7 +85,7 @@ async function verifyImportedCredential(
   try {
     await getCredentialBalance(credentialId)
   } catch (error) {
-    toast.warning(`凭据 #${credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
+    toast.warning(`账号 #${credentialId} 验活成功，但查询信息失败: ${extractErrorMessage(error)}`)
   }
   return {
     model: testModelLabel(testResult.model),
@@ -106,8 +111,23 @@ function normalizeKamAccount(item: unknown): unknown {
           : undefined
     const status = typeof obj.status === 'string' ? obj.status : undefined
     const machineId = typeof obj.machineId === 'string' ? obj.machineId : undefined
+    const accessToken = typeof obj.accessToken === 'string' ? obj.accessToken : undefined
+    const expiresAt =
+      typeof obj.expiresAt === 'string'
+        ? obj.expiresAt
+        : typeof obj.expired === 'string'
+          ? obj.expired
+          : undefined
     const clientId = typeof obj.clientId === 'string' ? obj.clientId : undefined
     const clientSecret = typeof obj.clientSecret === 'string' ? obj.clientSecret : undefined
+    const tokenEndpoint = typeof obj.tokenEndpoint === 'string' ? obj.tokenEndpoint : undefined
+    const issuerUrl = typeof obj.issuerUrl === 'string' ? obj.issuerUrl : undefined
+    const scopes =
+      typeof obj.scopes === 'string'
+        ? obj.scopes
+        : typeof obj.scope === 'string'
+          ? obj.scope
+          : undefined
     const profileArn = typeof obj.profileArn === 'string' ? obj.profileArn : undefined
     const region = typeof obj.region === 'string' ? obj.region : undefined
     const apiRegion = typeof obj.apiRegion === 'string' ? obj.apiRegion : undefined
@@ -121,9 +141,14 @@ function normalizeKamAccount(item: unknown): unknown {
       status,
       machineId,
       credentials: {
+        accessToken,
+        expiresAt,
         refreshToken: obj.refreshToken,
         clientId,
         clientSecret,
+        tokenEndpoint,
+        issuerUrl,
+        scopes,
         profileArn,
         region,
         apiRegion,
@@ -133,6 +158,16 @@ function normalizeKamAccount(item: unknown): unknown {
     }
   }
   return normalized
+}
+
+function normalizedKamAuthMethod(method?: string): AddCredentialRequest['authMethod'] | undefined {
+  const compact = method?.trim().toLowerCase().replace(/[^a-z0-9]/g, '')
+  if (!compact) return undefined
+  if (compact === 'externalidp' || compact === 'enterprise' || compact === 'iamsso' || compact === 'awsidc') return 'external_idp'
+  if (compact === 'idc' || compact === 'builderid' || compact === 'iam') return 'idc'
+  if (compact === 'social') return 'social'
+  if (compact === 'apikey') return 'api_key'
+  return undefined
 }
 
 // 校验元素是否为有效的 KAM 账号结构
@@ -352,7 +387,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           const existingCred = existingCredentials?.credentials.find(c => c.refreshTokenHash === tokenHash)
           setResults(prev => {
             const next = [...prev]
-            next[i] = { ...next[i], status: 'duplicate', error: '该凭据已存在', email: existingCred?.email || account.email }
+            next[i] = { ...next[i], status: 'duplicate', error: '该账号已存在', email: existingCred?.email || account.email }
             return next
           })
           setProgress({ current: i + 1, total: validAccounts.length })
@@ -371,24 +406,38 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         try {
           const clientId = cred.clientId?.trim() || undefined
           const clientSecret = cred.clientSecret?.trim() || undefined
-          const authMethod = clientId && clientSecret ? 'idc' : 'social'
+          const authMethod = normalizedKamAuthMethod(cred.authMethod) === 'external_idp'
+            ? 'external_idp'
+            : normalizedKamAuthMethod(cred.authMethod) === 'idc' || (clientId && clientSecret)
+              ? 'idc'
+              : 'social'
 
-          // idc 模式下必须同时提供 clientId 和 clientSecret
-          if (authMethod === 'social' && (clientId || clientSecret)) {
+          if (authMethod === 'idc' && (!clientId || !clientSecret)) {
             throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
+          }
+          if (authMethod === 'external_idp' && !clientId) {
+            throw new Error('external_idp 模式需要提供 clientId')
+          }
+          if (authMethod === 'social' && (clientId || clientSecret)) {
+            throw new Error('social 模式不应提供 clientId 或 clientSecret；企业 SSO 请设置 authMethod 为 external_idp')
           }
 
           const accountRegion = optionalTrimmed(cred.region) || optionalTrimmed(defaults.region)
           const baseCredential: AddCredentialRequest = {
             refreshToken: token,
             authMethod,
+            accessToken: cred.accessToken?.trim() || undefined,
+            expiresAt: cred.expiresAt?.trim() || undefined,
             email: account.email?.trim() || undefined,
             profileArn: cred.profileArn?.trim() || undefined,
             region: cred.region?.trim() || undefined,
             authRegion: optionalTrimmed(defaults.authRegion) || accountRegion,
             apiRegion: cred.apiRegion?.trim() || undefined,
             clientId,
-            clientSecret,
+            clientSecret: authMethod === 'idc' ? clientSecret : undefined,
+            tokenEndpoint: authMethod === 'external_idp' ? cred.tokenEndpoint?.trim() || undefined : undefined,
+            issuerUrl: authMethod === 'external_idp' ? cred.issuerUrl?.trim() || undefined : undefined,
+            scopes: authMethod === 'external_idp' ? cred.scopes?.trim() || undefined : undefined,
             machineId: account.machineId?.trim() || undefined,
           }
           const addedCred = await addCredential(mergeCredentialDefaults(baseCredential, { ...defaults, authRegion: '' }))
@@ -453,7 +502,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       if (skippedCount > 0) parts.push(`跳过 ${skippedCount}`)
 
       if (failCount === 0 && duplicateCount === 0 && skippedCount === 0) {
-        toast.success(`成功导入并验活 ${successCount} 个凭据`)
+        toast.success(`成功导入并验活 ${successCount} 个账号`)
       } else {
         toast.info(`导入完成：${parts.join('，')}`)
       }
@@ -502,7 +551,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       case 'checking': return '检查重复...'
       case 'verifying': return '验活中...'
       case 'verified': return '验活成功'
-      case 'duplicate': return '重复凭据'
+      case 'duplicate': return '重复账号'
       case 'skipped': return '已跳过（error 状态）'
       case 'failed':
         if (result.rollbackStatus === 'success') return '验活失败（已排除）'
@@ -591,7 +640,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
               <option value="subscription_only">只查询订阅（不请求模型）</option>
             </select>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
-              只查询订阅时不会发送模型测试请求；订阅查询失败的凭据仍会按验活失败回滚。
+              只查询订阅时不会发送模型测试请求；订阅查询失败的账号仍会按验活失败回滚。
             </p>
           </div>
 

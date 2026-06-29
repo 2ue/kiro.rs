@@ -17,6 +17,7 @@ struct CreationControlKey {
     credential_id: Option<u64>,
     conversation_id: String,
     model: String,
+    route_namespace: Option<String>,
 }
 
 impl CreationControlKey {
@@ -30,6 +31,7 @@ impl CreationControlKey {
             },
             conversation_id: scope.conversation_id.clone(),
             model: scope.model.clone(),
+            route_namespace: scope.route_namespace.clone(),
         }
     }
 }
@@ -298,6 +300,7 @@ mod tests {
             credential_id: 7,
             conversation_id: "conversation-a".to_string(),
             model: "claude-sonnet-4.6".to_string(),
+            route_namespace: None,
         }
     }
 
@@ -444,6 +447,22 @@ mod tests {
         let first_scope = scope();
         let mut second_scope = scope();
         second_scope.credential_id = 8;
+
+        let first = controller.apply_success(Some(&first_scope), config, usage(20_000));
+        let second = controller.apply_success(Some(&second_scope), config, usage(12_000));
+
+        assert_eq!(first.cache_creation_input_tokens, 20_000);
+        assert_eq!(second.cache_creation_input_tokens, 12_000);
+    }
+
+    #[test]
+    fn route_namespace_keeps_creation_frequency_state_independent() {
+        let controller = PromptCacheCreationController::default();
+        let config = enabled_config();
+        let mut first_scope = scope();
+        first_scope.route_namespace = Some("/dfcache/a".to_string());
+        let mut second_scope = scope();
+        second_scope.route_namespace = Some("/dfcache/b".to_string());
 
         let first = controller.apply_success(Some(&first_scope), config, usage(20_000));
         let second = controller.apply_success(Some(&second_scope), config, usage(12_000));
