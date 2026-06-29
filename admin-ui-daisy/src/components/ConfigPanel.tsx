@@ -8,13 +8,21 @@ import {
   defaultPayloadShaping,
   defaultExternalPoolsConfig,
   defaultPromptCacheCreationControl,
+  definedCacheRouteFromNameInput,
+  DFCACHE_ROUTE_PREFIX,
   emptyRuntimeConfig,
   fieldNeedsMax,
   fieldNeedsTarget,
+  getDefinedCacheRouteName,
+  inputSamplePolicy,
+  normalizeDefinedCacheRoute,
+  normalizeDefinedCacheRoutes,
   normalizePayloadShaping,
+  normalizeCachePolicy,
   normalizePromptCacheCreationControl,
   normalizeReportedUsage,
   pathPolicy,
+  preserveFieldPolicy,
   reportedUsageModeDescription,
   toRatio,
   toScale,
@@ -894,12 +902,20 @@ export function ConfigPanel() {
           ...defaultPromptCacheCreationControl(),
           ...config.data.promptCacheCreationControl,
         },
+        cachePolicy: normalizeCachePolicy(config.data.cachePolicy),
+        definedCacheRoutes: normalizeDefinedCacheRoutes(config.data.definedCacheRoutes || []),
         modelMapping: normalizeModelMapping(config.data.modelMapping),
       })
     }
   }, [config.data])
 
   const save = () => {
+    const invalidDefinedCacheRoute = (draft.definedCacheRoutes || []).find((route) => route.trim() && !normalizeDefinedCacheRoute(route))
+    if (invalidDefinedCacheRoute) {
+      toast.error('自定义高缓存路由必须是 /dfcache/{name}，name 只能包含字母、数字、点、下划线或短横线')
+      return
+    }
+    const definedCacheRoutes = normalizeDefinedCacheRoutes(draft.definedCacheRoutes || [])
     const next: RuntimeConfig = {
       ...draft,
       credentialRpm: toWhole(draft.credentialRpm),
@@ -943,7 +959,18 @@ export function ConfigPanel() {
       promptCacheCapJitterMaxTokens: toWhole(draft.promptCacheCapJitterMaxTokens),
       promptCacheScaleMinInputTokens: toWhole(draft.promptCacheScaleMinInputTokens),
       promptCacheCreationControl: normalizePromptCacheCreationControl(draft.promptCacheCreationControl),
-      reportedUsage: normalizeReportedUsage(draft.reportedUsage),
+      reportedUsage: normalizeReportedUsage({
+        ...draft.reportedUsage,
+        pathOverrides: definedCacheRoutes.reduce(
+          (pathOverrides, route) => ({
+            ...pathOverrides,
+            [route]: pathOverrides[route] || pathPolicy(true, inputSamplePolicy(96), preserveFieldPolicy()),
+          }),
+          draft.reportedUsage.pathOverrides
+        ),
+      }),
+      cachePolicy: normalizeCachePolicy(draft.cachePolicy),
+      definedCacheRoutes,
       modelMapping: normalizeModelMapping(draft.modelMapping),
       externalPools: {
         ...defaultExternalPoolsConfig(),
@@ -1229,6 +1256,113 @@ export function ConfigPanel() {
 
         {activeTab === 'usage' && (
           <ConfigGroup icon={<BadgeInfo className="h-4 w-4" />} title="用量展示规则" description="按不同入口设置看到的输入、输出和缓存用量。只影响展示口径，不改变实际请求内容。">
+            <div className="md:col-span-2 space-y-3 rounded-lg border border-base-300 bg-base-200/40 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-semibold">自定义高缓存路由</div>
+                  <div className="mt-1 text-xs leading-5 text-base-content/60">
+                    只需要填写 /dfcache/ 后面的名称。未在这里定义的 /dfcache/* 请求会直接报错。
+                  </div>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    setDraft((prev) => {
+                      let index = prev.definedCacheRoutes.length + 1
+                      let route = `${DFCACHE_ROUTE_PREFIX}route-${index}`
+                      const existing = new Set(prev.definedCacheRoutes)
+                      while (existing.has(route)) {
+                        index += 1
+                        route = `${DFCACHE_ROUTE_PREFIX}route-${index}`
+                      }
+                      return {
+                        ...prev,
+                        definedCacheRoutes: [...prev.definedCacheRoutes, route],
+                        reportedUsage: {
+                          ...prev.reportedUsage,
+                          pathOverrides: {
+                            ...prev.reportedUsage.pathOverrides,
+                            [route]: prev.reportedUsage.pathOverrides[route] || pathPolicy(true, inputSamplePolicy(96), preserveFieldPolicy()),
+                          },
+                        },
+                      }
+                    })
+                  }
+                >
+                  <Plus className="h-4 w-4" />
+                  添加路由
+                </Button>
+              </div>
+              {draft.definedCacheRoutes.length === 0 ? (
+                <div className="rounded-md border border-dashed border-base-300 px-3 py-3 text-sm text-base-content/60">
+                  暂未定义自定义路由。
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {draft.definedCacheRoutes.map((route, index) => (
+                    <div key={`${route}-${index}`} className="flex items-center gap-2">
+                      <div className="flex min-w-0 flex-1 overflow-hidden rounded-md border border-base-300 bg-base-100 focus-within:ring-2 focus-within:ring-primary">
+                        <span className="inline-flex h-10 shrink-0 select-none items-center border-r border-base-300 bg-base-200/60 px-3 font-mono text-sm text-base-content/60">
+                          {DFCACHE_ROUTE_PREFIX}
+                        </span>
+                        <input
+                          className="h-10 min-w-0 flex-1 border-0 bg-transparent px-3 font-mono text-sm focus:outline-none"
+                          value={getDefinedCacheRouteName(route)}
+                          placeholder="cc"
+                          onChange={(event) => {
+                            const nextRoute = definedCacheRouteFromNameInput(event.target.value)
+                            setDraft((prev) => {
+                              const definedCacheRoutes = [...prev.definedCacheRoutes]
+                              const previousRoute = definedCacheRoutes[index]
+                              definedCacheRoutes[index] = nextRoute
+                              const pathOverrides = { ...prev.reportedUsage.pathOverrides }
+                              const normalizedPrevious = normalizeDefinedCacheRoute(previousRoute)
+                              const normalizedNext = normalizeDefinedCacheRoute(nextRoute)
+                              if (normalizedPrevious && pathOverrides[normalizedPrevious] && normalizedNext && !pathOverrides[normalizedNext]) {
+                                pathOverrides[normalizedNext] = pathOverrides[normalizedPrevious]
+                                delete pathOverrides[normalizedPrevious]
+                              }
+                              return {
+                                ...prev,
+                                definedCacheRoutes,
+                                reportedUsage: { ...prev.reportedUsage, pathOverrides },
+                              }
+                            })
+                          }}
+                        />
+                      </div>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        shape="square"
+                        title="删除路由"
+                        onClick={() =>
+                          setDraft((prev) => {
+                            const routeToDelete = prev.definedCacheRoutes[index]
+                            const definedCacheRoutes = prev.definedCacheRoutes.filter((_, itemIndex) => itemIndex !== index)
+                            const pathOverrides = { ...prev.reportedUsage.pathOverrides }
+                            const normalized = normalizeDefinedCacheRoute(routeToDelete)
+                            if (normalized) {
+                              delete pathOverrides[normalized]
+                            }
+                            return {
+                              ...prev,
+                              definedCacheRoutes,
+                              reportedUsage: { ...prev.reportedUsage, pathOverrides },
+                            }
+                          })
+                        }
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
             <div className="reported-usage-layout md:col-span-2">
               <div className="reported-usage-list" role="tablist" aria-label="用量展示规则入口">
                 <button

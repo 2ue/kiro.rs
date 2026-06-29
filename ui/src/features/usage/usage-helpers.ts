@@ -125,6 +125,15 @@ export function formatExternalAttemptChain(record: UsageRecord): string {
 }
 
 export function upstreamModelLabel(record: UsageRecord): string {
+  const model = record.routeKind === 'external_pool'
+    ? record.externalOutboundModel || record.upstreamModel || record.model || '-'
+    : record.upstreamModel || record.model || '-'
+  if (record.routeKind === 'external_pool' && record.externalOutboundModel) return model
+  const source = record.modelResolutionSource ? `（${record.modelResolutionSource}）` : ''
+  return `${model}${source}`
+}
+
+export function resolvedModelLabel(record: UsageRecord): string {
   const model = record.upstreamModel || record.model || '-'
   const source = record.modelResolutionSource ? `（${record.modelResolutionSource}）` : ''
   return `${model}${source}`

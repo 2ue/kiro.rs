@@ -4,10 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite --host 127.0.0.1 --port 9022",
+    "dev": "vite --host 127.0.0.1 --port 9024",
     "build": "tsc -b && vite build",
     "check": "tsc -b --pretty false",
-    "preview": "vite preview --host 127.0.0.1 --port 9022"
+    "preview": "vite preview --host 127.0.0.1 --port 9024"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.60.0",

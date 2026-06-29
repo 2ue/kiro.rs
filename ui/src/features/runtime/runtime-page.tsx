@@ -34,6 +34,7 @@ import {
   defaultPromptCacheCreationControl,
   defaultReportedUsage,
   emptyRuntimeConfig,
+  normalizeCachePolicy,
   normalizePromptCacheCreationControl,
   normalizeReportedUsage,
   toRatio,
@@ -50,6 +51,7 @@ import { useModelCapabilities } from '@/hooks/use-usage'
 import type { KiroAgentModeStrategy, LoadBalancingMode, ModelMappingConfig, PayloadGuardMode, RuntimeConfig } from '@/types/api'
 import {
   CacheCreationSection,
+  CachePolicySection,
   DefinedCacheRoutesSection,
   normalizeDefinedCacheRoutes,
   ModelMappingSection,
@@ -189,6 +191,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     highCacheThreshold: toWhole(draft.highCacheThreshold),
     promptCacheCreationControl: normalizePromptCacheCreationControl(draft.promptCacheCreationControl),
     reportedUsage: normalizeReportedUsage(draft.reportedUsage),
+    cachePolicy: normalizeCachePolicy(draft.cachePolicy),
     definedCacheRoutes: normalizeDefinedCacheRoutes(draft.definedCacheRoutes),
   }
   return next
@@ -212,6 +215,7 @@ export function RuntimePage() {
         payloadShaping: { ...defaultPayloadShaping(), ...config.data.payloadShaping },
         promptCacheCreationControl: { ...defaultPromptCacheCreationControl(), ...config.data.promptCacheCreationControl },
         reportedUsage: config.data.reportedUsage ?? defaultReportedUsage(),
+        cachePolicy: normalizeCachePolicy(config.data.cachePolicy),
       })
     }
   }, [config.data])
@@ -442,6 +446,11 @@ export function RuntimePage() {
       {/* 用量展示规则 */}
       <CollapseSection icon={<Gauge />} title="用量展示规则" desc="不同入口返回给客户端的用量口径">
         <ReportedUsageSection reported={draft.reportedUsage} onChange={set('reportedUsage')} />
+      </CollapseSection>
+
+      {/* 路径级缓存策略 */}
+      <CollapseSection icon={<Zap />} title="路径级缓存策略" desc="按入口覆盖缓存模拟、写入频次、cachePoint 与 usage 口径">
+        <CachePolicySection cachePolicy={draft.cachePolicy} onChange={set('cachePolicy')} />
       </CollapseSection>
 
       {/* 模型映射 */}

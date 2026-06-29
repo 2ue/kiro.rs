@@ -26,6 +26,7 @@ import {
   useRuntimeConfig,
   useSetCredentialProxy,
   useSetCredentialConcurrency,
+  useSetCredentialRpm,
   useSetCredentialRegions,
   useSetDisabled,
   useSetPriority,
@@ -217,6 +218,7 @@ export function CredentialCard({
   const [editingPriority, setEditingPriority] = useState(false)
   const [editingProxy, setEditingProxy] = useState(false)
   const [editingConcurrency, setEditingConcurrency] = useState(false)
+  const [editingRpm, setEditingRpm] = useState(false)
   const [editingRegions, setEditingRegions] = useState(false)
   const [detailsOpen, setDetailsOpen] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
@@ -235,11 +237,15 @@ export function CredentialCard({
       ? String(credential.maxConcurrentRequestsOverride)
       : ''
   )
+  const [rpmValue, setRpmValue] = useState(
+    typeof credential.rpmOverride === 'number' ? String(credential.rpmOverride) : ''
+  )
 
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
   const setCredentialProxy = useSetCredentialProxy()
   const setCredentialConcurrency = useSetCredentialConcurrency()
+  const setCredentialRpm = useSetCredentialRpm()
   const setCredentialRegions = useSetCredentialRegions()
   const proxyResources = useProxyResources()
   const proxyResourceOptions = proxyResources.data?.resources || []
@@ -272,7 +278,7 @@ export function CredentialCard({
   const quotaDetail = accountInfo
     ? `检查 ${formatFullDate(accountInfo.checkedAt)}${accountInfo.nextResetAt ? ` · 重置 ${formatResetAt(accountInfo.nextResetAt)}` : ''}`
     : undefined
-  const hasOpenModal = detailsOpen || editingPriority || editingProxy || editingConcurrency || editingRegions || showDeleteConfirm
+  const hasOpenModal = detailsOpen || editingPriority || editingProxy || editingConcurrency || editingRpm || editingRegions || showDeleteConfirm
 
   const resetProxyDraft = () => {
     setProxyResourceId(credential.proxyResourceId ? String(credential.proxyResourceId) : '')
@@ -325,6 +331,10 @@ export function CredentialCard({
         : ''
     )
   }, [credential.id, credential.maxConcurrentRequestsOverride])
+
+  useEffect(() => {
+    setRpmValue(typeof credential.rpmOverride === 'number' ? String(credential.rpmOverride) : '')
+  }, [credential.id, credential.rpmOverride])
 
   useEffect(() => {
     setRegionValue(credential.region || '')
@@ -410,6 +420,29 @@ export function CredentialCard({
           setEditingConcurrency(false)
         },
         onError: (error) => toast.error(`并发限制设置失败: ${extractErrorMessage(error)}`),
+      }
+    )
+  }
+
+  const saveRpm = () => {
+    const trimmed = rpmValue.trim()
+    let rpm: number | null = null
+    if (trimmed) {
+      const parsed = Number(trimmed)
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        toast.error('账号 RPM 限制必须是非负整数')
+        return
+      }
+      rpm = parsed
+    }
+    setCredentialRpm.mutate(
+      { id: credential.id, request: { rpm } },
+      {
+        onSuccess: (res) => {
+          toast.success(res.message)
+          setEditingRpm(false)
+        },
+        onError: (error) => toast.error(`RPM 限制设置失败: ${extractErrorMessage(error)}`),
       }
     )
   }
@@ -703,6 +736,25 @@ export function CredentialCard({
                 }
                 error={credential.maxConcurrentRequests > 0 && credential.inFlightRequests >= credential.maxConcurrentRequests}
               />
+              <MetaItem
+                label="RPM"
+                value={
+                  <button
+                    type="button"
+                    className="group block min-w-0 text-left text-primary hover:underline"
+                    onClick={() => setEditingRpm(true)}
+                  >
+                    <span className="flex min-w-0 items-center gap-1 font-semibold leading-5">
+                      <span className="whitespace-nowrap">
+                        {typeof credential.rpm === 'number' && credential.rpm > 0 ? `${credential.rpm}/min` : '不限'}
+                      </span>
+                    </span>
+                    <span className="mt-0.5 block truncate text-xs font-medium leading-4 text-base-content/45 group-hover:text-primary">
+                      {typeof credential.rpmOverride === 'number' ? '账号覆盖' : '继承全局'}
+                    </span>
+                  </button>
+                }
+              />
               <MetaItem label="Lease 回收" value={credential.inFlightLeaseMaxSecs > 0 ? `${credential.inFlightLeaseMaxSecs}s` : '-'} />
               {credential.warmupRemaining > 0 && (
                 <MetaItem label="预热剩余" value={credential.warmupRemaining} />
@@ -983,6 +1035,72 @@ export function CredentialCard({
             </Button>
             <Button type="button" color="primary" size="sm" onClick={saveConcurrency} disabled={setCredentialConcurrency.isPending}>
               {setCredentialConcurrency.isPending && <Loading size="xs" />}
+              保存
+            </Button>
+          </Modal.Actions>
+        </div>
+      </ModalShell>
+
+      <ModalShell open={editingRpm} title={`RPM 限制：${credentialLabel(credential)}`} width="max-w-lg" onClose={() => setEditingRpm(false)}>
+        <div className="space-y-3">
+          <div className="rounded-lg border border-base-300 bg-base-200/60 p-3 text-sm">
+            <div className="flex items-center justify-between gap-3">
+              <span className="text-base-content/60">当前生效</span>
+              <span className="font-semibold">
+                {typeof credential.rpm === 'number' && credential.rpm > 0 ? `${credential.rpm} 次/分钟` : '不限 RPM'}
+              </span>
+            </div>
+            <div className="mt-1 text-xs text-base-content/55">
+              {typeof credential.rpmOverride === 'number'
+                ? '当前账号已覆盖全局配置。'
+                : '当前账号继承全局配置。'}
+            </div>
+          </div>
+          <label className="block">
+            <span className="text-sm font-semibold">账号级 RPM</span>
+            <Input
+              bordered
+              size="sm"
+              type="number"
+              min={0}
+              className="mt-2"
+              value={rpmValue}
+              placeholder="留空继承全局，0 表示不限"
+              disabled={setCredentialRpm.isPending}
+              onChange={(event) => setRpmValue(event.target.value)}
+            />
+            <span className="mt-1 block text-xs text-base-content/55">
+              留空表示继承全局“单账号每分钟请求数”；填 0 表示该账号不限 RPM；填正整数表示该账号自己的 RPM 上限。
+            </span>
+          </label>
+
+          <Modal.Actions>
+            <Button type="button" color="ghost" size="sm" onClick={() => setEditingRpm(false)} disabled={setCredentialRpm.isPending}>
+              取消
+            </Button>
+            <Button
+              type="button"
+              color="ghost"
+              size="sm"
+              disabled={setCredentialRpm.isPending || typeof credential.rpmOverride !== 'number'}
+              onClick={() => {
+                setRpmValue('')
+                setCredentialRpm.mutate(
+                  { id: credential.id, request: { rpm: null } },
+                  {
+                    onSuccess: (res) => {
+                      toast.success(res.message)
+                      setEditingRpm(false)
+                    },
+                    onError: (error) => toast.error(`RPM 限制设置失败: ${extractErrorMessage(error)}`),
+                  }
+                )
+              }}
+            >
+              继承全局
+            </Button>
+            <Button type="button" color="primary" size="sm" onClick={saveRpm} disabled={setCredentialRpm.isPending}>
+              {setCredentialRpm.isPending && <Loading size="xs" />}
               保存
             </Button>
           </Modal.Actions>

@@ -149,6 +149,7 @@ export interface VerifyResult {
 interface CredentialParameterDefaults {
   priority: string
   maxConcurrentRequests: string
+  rpm: string
   region: string
   authRegion: string
   apiRegion: string
@@ -161,7 +162,7 @@ interface CredentialParameterDefaults {
 }
 
 function initialParameterDefaults(): CredentialParameterDefaults {
-  return { priority: '', maxConcurrentRequests: '', region: '', authRegion: '', apiRegion: '', machineId: '', endpoint: '', proxyResourceId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '' }
+  return { priority: '', maxConcurrentRequests: '', rpm: '', region: '', authRegion: '', apiRegion: '', machineId: '', endpoint: '', proxyResourceId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '' }
 }
 
 function initialCredentialForm() {
@@ -206,6 +207,7 @@ function mergeCredentialDefaults(cred: AddCredentialRequest, defaults: Credentia
     ...cred,
     priority: cred.priority ?? parseOptionalNonNegativeInteger(defaults.priority, '默认优先级'),
     maxConcurrentRequests: typeof cred.maxConcurrentRequests === 'undefined' ? parseOptionalNonNegativeInteger(defaults.maxConcurrentRequests, '默认账号并发') : cred.maxConcurrentRequests,
+    rpm: typeof cred.rpm === 'undefined' ? parseOptionalNonNegativeInteger(defaults.rpm, '默认账号 RPM') : cred.rpm,
     region: optionalTrimmed(cred.region) || optionalTrimmed(defaults.region),
     authRegion: optionalTrimmed(cred.authRegion) || optionalTrimmed(defaults.authRegion),
     apiRegion: optionalTrimmed(cred.apiRegion) || optionalTrimmed(defaults.apiRegion),
@@ -275,6 +277,7 @@ function CredentialParameterDefaultsPanel({ defaults, onChange, proxyResources, 
       <FieldGrid>
         <Field label="默认优先级"><Input type="number" min={0} value={defaults.priority} disabled={disabled} onChange={(e) => update('priority', e.target.value)} /></Field>
         <Field label="默认账号并发" description="留空继承全局，0 不限"><Input type="number" min={0} value={defaults.maxConcurrentRequests} disabled={disabled} onChange={(e) => update('maxConcurrentRequests', e.target.value)} /></Field>
+        <Field label="默认账号 RPM" description="留空继承全局，0 不限"><Input type="number" min={0} value={defaults.rpm} disabled={disabled} onChange={(e) => update('rpm', e.target.value)} /></Field>
         <Field label="Region 兼容"><Input className="font-mono" value={defaults.region} disabled={disabled} onChange={(e) => update('region', e.target.value)} placeholder="us-east-1" /></Field>
         <Field label="Auth Region"><Input className="font-mono" value={defaults.authRegion} disabled={disabled} onChange={(e) => update('authRegion', e.target.value)} placeholder="us-east-1" /></Field>
         <Field label="API Region"><Input className="font-mono" value={defaults.apiRegion} disabled={disabled} onChange={(e) => update('apiRegion', e.target.value)} placeholder="us-east-1" /></Field>
@@ -877,6 +880,7 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
   const [fields, setFields] = useState({
     priority: '',
     concurrency: '',
+    rpm: '',
     proxyResourceId: '',
     proxyUrl: '',
     proxyUsername: '',
@@ -887,7 +891,7 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
   })
   const [showProxyUsername, setShowProxyUsername] = useState(false)
   const [showProxyPassword, setShowProxyPassword] = useState(false)
-  const [enableFields, setEnableFields] = useState({ priority: false, concurrency: false, proxy: false, regions: false })
+  const [enableFields, setEnableFields] = useState({ priority: false, concurrency: false, rpm: false, proxy: false, regions: false })
   const batchUpdate = useBatchUpdateCredentials()
   const proxyResources = useProxyResources()
   const proxyOptions = proxyResources.data?.resources || []
@@ -904,16 +908,31 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
 
   useEffect(() => {
     if (!open) {
-      setFields({ priority: '', concurrency: '', proxyResourceId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', region: '', authRegion: '', apiRegion: '' })
-      setEnableFields({ priority: false, concurrency: false, proxy: false, regions: false })
+      setFields({ priority: '', concurrency: '', rpm: '', proxyResourceId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', region: '', authRegion: '', apiRegion: '' })
+      setEnableFields({ priority: false, concurrency: false, rpm: false, proxy: false, regions: false })
       setShowProxyUsername(false)
       setShowProxyPassword(false)
     }
   }, [open])
 
+  const clearSchedulingDraft = () => {
+    setFields((p) => ({ ...p, priority: '', concurrency: '', rpm: '' }))
+    setEnableFields((p) => ({ ...p, priority: true, concurrency: true, rpm: true }))
+  }
+
   const submit = async () => {
     if (!ids.length) { toast.error('没有选中账号'); return }
     const req: BatchUpdateCredentialsRequest = { ids }
+    if (enableFields.priority) {
+      const v = fields.priority.trim()
+      let priority = 0
+      if (v) {
+        const n = Number(v)
+        if (!Number.isInteger(n) || n < 0) { toast.error('优先级必须是非负整数'); return }
+        priority = n
+      }
+      req.priority = { priority }
+    }
     if (enableFields.proxy) {
       const resourceId = fields.proxyResourceId ? Number(fields.proxyResourceId) : null
       req.proxy = {
@@ -940,6 +959,16 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
       }
       req.concurrency = { maxConcurrentRequests }
     }
+    if (enableFields.rpm) {
+      const v = fields.rpm.trim()
+      let rpm: number | null = null
+      if (v) {
+        const n = Number(v)
+        if (!Number.isInteger(n) || n < 0) { toast.error('RPM 必须是非负整数'); return }
+        rpm = n
+      }
+      req.rpm = { rpm }
+    }
     batchUpdate.mutate(req, {
       onSuccess: (res) => {
         toast.success(`批量修改完成：成功 ${res.success}，失败 ${res.failed}`)
@@ -953,6 +982,55 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
     <ModalShell open={open} title={`批量修改（${ids.length} 个账号）`} width="max-w-lg" onClose={onClose}>
       <div className="space-y-4">
         <div className="space-y-3">
+          <div className="rounded-lg border border-border bg-muted/30 p-3 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="text-sm font-semibold">调度覆盖</div>
+              <Button type="button" variant="ghost" size="xs" onClick={clearSchedulingDraft} disabled={batchUpdate.isPending}>
+                清理优先级/并发/RPM
+              </Button>
+            </div>
+            <FieldGrid>
+              <Field label="优先级" description="数字越小越优先；留空重置为默认 0">
+                <div className="flex items-center gap-2">
+                  <Checkbox checked={enableFields.priority} onCheckedChange={(v) => setEnableFields((p) => ({ ...p, priority: Boolean(v) }))} id="batch-priority" />
+                  <Input
+                    type="number"
+                    min={0}
+                    value={fields.priority}
+                    disabled={!enableFields.priority || batchUpdate.isPending}
+                    onChange={(e) => setFields((p) => ({ ...p, priority: e.target.value }))}
+                    placeholder="留空重置"
+                  />
+                </div>
+              </Field>
+              <Field label="最大并发" description="留空清除覆盖，0 表示不限">
+                <div className="flex items-center gap-2">
+                  <Checkbox checked={enableFields.concurrency} onCheckedChange={(v) => setEnableFields((p) => ({ ...p, concurrency: Boolean(v) }))} id="batch-concurrency" />
+                  <Input
+                    type="number"
+                    min={0}
+                    value={fields.concurrency}
+                    disabled={!enableFields.concurrency || batchUpdate.isPending}
+                    onChange={(e) => setFields((p) => ({ ...p, concurrency: e.target.value }))}
+                    placeholder="留空继承全局"
+                  />
+                </div>
+              </Field>
+              <Field label="RPM" description="留空清除覆盖，0 表示不限">
+                <div className="flex items-center gap-2">
+                  <Checkbox checked={enableFields.rpm} onCheckedChange={(v) => setEnableFields((p) => ({ ...p, rpm: Boolean(v) }))} id="batch-rpm" />
+                  <Input
+                    type="number"
+                    min={0}
+                    value={fields.rpm}
+                    disabled={!enableFields.rpm || batchUpdate.isPending}
+                    onChange={(e) => setFields((p) => ({ ...p, rpm: e.target.value }))}
+                    placeholder="留空继承全局"
+                  />
+                </div>
+              </Field>
+            </FieldGrid>
+          </div>
           <div className="rounded-lg border border-border bg-muted/30 p-3 space-y-3">
             <div className="flex items-center gap-2">
               <Checkbox checked={enableFields.proxy} onCheckedChange={(v) => setEnableFields((p) => ({ ...p, proxy: Boolean(v) }))} id="batch-proxy" />
@@ -1017,17 +1095,6 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
                 <Field label="Auth Region"><Input className="font-mono" value={fields.authRegion} onChange={(e) => setFields((p) => ({ ...p, authRegion: e.target.value }))} placeholder="留空清除" /></Field>
                 <Field label="API Region"><Input className="font-mono" value={fields.apiRegion} onChange={(e) => setFields((p) => ({ ...p, apiRegion: e.target.value }))} placeholder="留空清除" /></Field>
               </FieldGrid>
-            )}
-          </div>
-          <div className="rounded-lg border border-border bg-muted/30 p-3 space-y-3">
-            <div className="flex items-center gap-2">
-              <Checkbox checked={enableFields.concurrency} onCheckedChange={(v) => setEnableFields((p) => ({ ...p, concurrency: Boolean(v) }))} id="batch-concurrency" />
-              <label htmlFor="batch-concurrency" className="text-sm font-semibold cursor-pointer">并发限制</label>
-            </div>
-            {enableFields.concurrency && (
-              <Field label="最大并发" description="留空清除覆盖（继承全局），0 表示不限">
-                <Input type="number" min={0} value={fields.concurrency} onChange={(e) => setFields((p) => ({ ...p, concurrency: e.target.value }))} placeholder="留空继承全局" />
-              </Field>
             )}
           </div>
         </div>

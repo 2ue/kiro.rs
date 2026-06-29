@@ -1,9 +1,10 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Plus, Trash2 } from 'lucide-react'
 import { Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Switch, Textarea, Button } from '@/components/ui'
 import { pathPolicy, inputSamplePolicy, preserveFieldPolicy } from '@/lib/runtime-config-defaults'
 import type {
   ModelCapabilitiesStatus,
+  CachePolicyConfig,
   ModelMappingConfig,
   ModelMappingRule,
   PayloadShapingConfig,
@@ -58,6 +59,116 @@ export function TogField({
 
 function TwoCol({ children }: { children: React.ReactNode }) {
   return <div className="grid gap-4 md:grid-cols-2">{children}</div>
+}
+
+// ─── 路径级缓存策略(cachePolicy) ──────────────────────────────────────────────
+
+function normalizeCachePolicyShape(value: unknown): CachePolicyConfig {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('配置必须是对象')
+  }
+  const object = value as Partial<CachePolicyConfig>
+  const defaultPatch = object.default
+  const pathOverrides = object.pathOverrides
+  if (defaultPatch !== undefined && (typeof defaultPatch !== 'object' || Array.isArray(defaultPatch) || defaultPatch === null)) {
+    throw new Error('default 必须是对象')
+  }
+  if (pathOverrides !== undefined && (typeof pathOverrides !== 'object' || Array.isArray(pathOverrides) || pathOverrides === null)) {
+    throw new Error('pathOverrides 必须是对象')
+  }
+  return {
+    default: defaultPatch ?? {},
+    pathOverrides: pathOverrides ?? {},
+  }
+}
+
+export function CachePolicySection({
+  cachePolicy,
+  onChange,
+}: {
+  cachePolicy: CachePolicyConfig
+  onChange: (next: CachePolicyConfig) => void
+}) {
+  const [text, setText] = useState(() => JSON.stringify(cachePolicy, null, 2))
+  const [error, setError] = useState<string | null>(null)
+  const [dirty, setDirty] = useState(false)
+
+  useEffect(() => {
+    if (dirty) return
+    setText(JSON.stringify(cachePolicy, null, 2))
+    setError(null)
+  }, [cachePolicy, dirty])
+
+  const commit = (value: string) => {
+    setDirty(true)
+    setText(value)
+    try {
+      const parsed = normalizeCachePolicyShape(JSON.parse(value))
+      setError(null)
+      onChange(parsed)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'JSON 解析失败')
+    }
+  }
+
+  const fillExample = () => {
+    const example: CachePolicyConfig = {
+      default: {},
+      pathOverrides: {
+        '/cc': {
+          simulation: {
+            enabled: true,
+            targetReadRatio: 0.98,
+            tokenScale: 1.6,
+            maxSimulatedInputTokens: 300000,
+          },
+          reportedUsage: pathPolicy(true, inputSamplePolicy(96), preserveFieldPolicy()),
+        },
+        '/dfcache/team-a': {
+          simulation: { enabled: true, targetReadRatio: 0.96 },
+          creationControl: {
+            enabled: true,
+            scopeMode: 'conversation_model',
+            minSuccessfulRequestsBetweenCreation: 2,
+            minCreationIntervalSecs: 30,
+            minCreationDeltaTokens: 8000,
+            maxCreationTokensPerEvent: 30000,
+            creationBudgetWindowSecs: 300,
+            maxCreationTokensPerWindow: 120000,
+            expireAfterIdleSecs: 3600,
+          },
+          cachePoint: { enabled: false },
+          bounds: { maxEntriesPerAccount: 200, maxEntriesGlobal: 20000, entryTtlSecs: 86400 },
+        },
+      },
+    }
+    commit(JSON.stringify(example, null, 2))
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="text-xs leading-5 text-muted-foreground">
+          按入口前缀覆盖缓存模拟、缓存写入展示节奏、usage 展示、真实 cachePoint 和缓存边界。空对象表示沿用全局配置；最长匹配生效。
+        </div>
+        <Button type="button" variant="outline" size="sm" onClick={fillExample}>填充示例</Button>
+      </div>
+      <Textarea
+        value={text}
+        rows={16}
+        className="font-mono text-xs"
+        spellCheck={false}
+        onChange={(e) => commit(e.target.value)}
+      />
+      {error ? (
+        <div className="text-xs text-destructive">配置格式错误：{error}</div>
+      ) : (
+        <div className="text-xs text-muted-foreground">
+          支持字段：simulation、creationControl、reportedUsage、cachePoint、bounds。路径只改变策略，不会自动创建 /dfcache 路由。
+        </div>
+      )}
+    </div>
+  )
 }
 
 // ─── 旧内容清理(payloadHistory) ───────────────────────────────────────────────

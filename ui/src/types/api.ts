@@ -175,6 +175,8 @@ export type CredentialListItem = Pick<
   | 'endpoint'
   | 'maxConcurrentRequests'
   | 'maxConcurrentRequestsOverride'
+  | 'rpm'
+  | 'rpmOverride'
   | 'warmupRemaining'
 > & {
   provider?: string
@@ -465,8 +467,10 @@ export interface SetCredentialRegionsRequest {
 
 export interface BatchUpdateCredentialsRequest {
   ids: number[]
+  priority?: SetPriorityRequest
   regions?: SetCredentialRegionsRequest
   concurrency?: SetCredentialConcurrencyRequest
+  rpm?: SetCredentialRpmRequest
   proxy?: SetCredentialProxyRequest
 }
 
@@ -498,6 +502,7 @@ export interface AddCredentialRequest {
   profileArn?: string
   priority?: number
   maxConcurrentRequests?: number | null
+  rpm?: number | null
   region?: string
   authRegion?: string
   apiRegion?: string
@@ -639,6 +644,7 @@ export interface UsageRecord {
   stream: boolean
   model: string
   upstreamModel?: string
+  externalOutboundModel?: string
   modelResolutionSource?: string
   modelResolutionNote?: string
   conversationId?: string
@@ -679,6 +685,9 @@ export interface UsageRecord {
   errorType?: string
   errorMessage?: string
   errorDetail?: string
+  publicErrorStatusCode?: number
+  publicErrorType?: string
+  publicErrorMessage?: string
   payloadBreakdown?: unknown
   payloadGuardReport?: unknown
 }
@@ -716,6 +725,7 @@ export interface ExternalPoolAttempt {
   attempt: number
   poolId: number
   poolName: string
+  outboundModel?: string
   status?: number
   action: string
   durationMs: number
@@ -991,6 +1001,42 @@ export interface ReportedUsageConfig {
   pathOverrides: Record<string, ReportedUsagePathPolicy>
 }
 
+export interface CacheSimulationPolicyPatch {
+  enabled?: boolean
+  targetReadRatio?: number
+  tokenScale?: number
+  maxSimulatedInputTokens?: number
+  capJitterMinTokens?: number
+  capJitterMaxTokens?: number
+  scaleMinInputTokens?: number
+}
+
+export interface CachePointPolicyPatch {
+  enabled?: boolean
+  toolsOnly?: boolean
+  recordPlan?: boolean
+}
+
+export interface CacheBoundsPolicyPatch {
+  maxEntriesPerAccount?: number
+  maxEntriesGlobal?: number
+  entryTtlSecs?: number
+  estimatedBytesLimit?: number
+}
+
+export interface CacheRoutePolicyPatch {
+  simulation?: CacheSimulationPolicyPatch
+  creationControl?: PromptCacheCreationControlConfig
+  reportedUsage?: ReportedUsagePathPolicy
+  cachePoint?: CachePointPolicyPatch
+  bounds?: CacheBoundsPolicyPatch
+}
+
+export interface CachePolicyConfig {
+  default: CacheRoutePolicyPatch
+  pathOverrides: Record<string, CacheRoutePolicyPatch>
+}
+
 export interface PromptCacheCreationControlConfig {
   enabled: boolean
   scopeMode: 'credential_conversation_model' | 'conversation_model'
@@ -1229,6 +1275,7 @@ export interface RuntimeConfig {
   promptCacheEntryTtlSecs: number
   promptCacheEstimatedBytesLimit: number
   reportedUsage: ReportedUsageConfig
+  cachePolicy: CachePolicyConfig
   externalPools: ExternalPoolsConfig
   highCacheThreshold: number
   compatProfile: CompatProfile

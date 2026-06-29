@@ -1,4 +1,6 @@
 import type {
+  CachePolicyConfig,
+  CacheRoutePolicyPatch,
   PayloadShapingConfig,
   PromptCacheCreationControlConfig,
   ReportedUsageConfig,
@@ -55,6 +57,13 @@ export function defaultReportedUsage(): ReportedUsageConfig {
       '/cc': pathPolicy(true, inputSamplePolicy(96), writerSamplePolicy(3000)),
       '/ha': pathPolicy(true, inputSamplePolicy(96), preserveFieldPolicy()),
     },
+  }
+}
+
+export function defaultCachePolicy(): CachePolicyConfig {
+  return {
+    default: {},
+    pathOverrides: {},
   }
 }
 
@@ -217,6 +226,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   promptCacheEntryTtlSecs: 86400,
   promptCacheEstimatedBytesLimit: 268435456,
   reportedUsage: defaultReportedUsage(),
+  cachePolicy: defaultCachePolicy(),
   externalPools: defaultExternalPoolsConfig(),
   highCacheThreshold: 10000,
   compatProfile: 'claude-code',
@@ -316,6 +326,34 @@ export function normalizeReportedUsage(config: ReportedUsageConfig): ReportedUsa
   )
   return {
     default: normalizePathPolicy(config.default),
+    pathOverrides,
+  }
+}
+
+function normalizeCachePolicyPathPrefix(prefix: string): string | null {
+  const trimmed = prefix.trim()
+  if (!trimmed) return null
+  const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
+  return withSlash.replace(/\/+$/, '') || '/'
+}
+
+function isEmptyCachePolicyPatch(policy: CacheRoutePolicyPatch): boolean {
+  return !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds
+}
+
+export function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyConfig {
+  const source = config ?? defaultCachePolicy()
+  const pathOverrides = Object.fromEntries(
+    Object.entries(source.pathOverrides ?? {})
+      .map(([prefix, policy]) => {
+        const normalizedPrefix = normalizeCachePolicyPathPrefix(prefix)
+        if (!normalizedPrefix || isEmptyCachePolicyPatch(policy)) return null
+        return [normalizedPrefix, policy] as const
+      })
+      .filter((entry): entry is readonly [string, CacheRoutePolicyPatch] => Boolean(entry))
+  )
+  return {
+    default: source.default ?? {},
     pathOverrides,
   }
 }

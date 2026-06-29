@@ -112,6 +112,7 @@ function formFromCredential(credential: AddCredentialRequest) {
 interface CredentialParameterDefaults {
   priority: string
   maxConcurrentRequests: string
+  rpm: string
   region: string
   authRegion: string
   apiRegion: string
@@ -129,6 +130,7 @@ function initialParameterDefaults(): CredentialParameterDefaults {
   return {
     priority: '',
     maxConcurrentRequests: '',
+    rpm: '',
     region: '',
     authRegion: '',
     apiRegion: '',
@@ -227,6 +229,9 @@ function mergeCredentialDefaults(credential: AddCredentialRequest, defaults: Cre
     maxConcurrentRequests: typeof credential.maxConcurrentRequests === 'undefined'
       ? parseOptionalNonNegativeInteger(defaults.maxConcurrentRequests, '默认账号并发')
       : credential.maxConcurrentRequests,
+    rpm: typeof credential.rpm === 'undefined'
+      ? parseOptionalNonNegativeInteger(defaults.rpm, '默认账号 RPM')
+      : credential.rpm,
     region: optionalTrimmed(credential.region) || optionalTrimmed(defaults.region),
     authRegion: optionalTrimmed(credential.authRegion) || optionalTrimmed(defaults.authRegion),
     apiRegion: optionalTrimmed(credential.apiRegion) || optionalTrimmed(defaults.apiRegion),
@@ -287,6 +292,9 @@ function CredentialParameterDefaultsPanel({
         </FieldLabel>
         <FieldLabel title="默认账号并发" description="留空继承全局，0 表示不限">
           <Input bordered size="sm" type="number" min={0} value={defaults.maxConcurrentRequests} disabled={disabled} onChange={(event) => update('maxConcurrentRequests', event.target.value)} />
+        </FieldLabel>
+        <FieldLabel title="默认账号 RPM" description="留空继承全局，0 表示不限">
+          <Input bordered size="sm" type="number" min={0} value={defaults.rpm} disabled={disabled} onChange={(event) => update('rpm', event.target.value)} />
         </FieldLabel>
         <FieldLabel title="Region 兼容字段" description="未设置 Auth Region 时作为 token 刷新回退">
           <Input bordered size="sm" className="font-mono" value={defaults.region} disabled={disabled} onChange={(event) => update('region', event.target.value)} placeholder="us-east-1" />

@@ -1,4 +1,6 @@
 import type {
+  CachePolicyConfig,
+  CacheRoutePolicyPatch,
   PayloadShapingConfig,
   PromptCacheCreationControlConfig,
   ReportedUsageConfig,
@@ -55,6 +57,13 @@ export function defaultReportedUsage(): ReportedUsageConfig {
       '/cc': pathPolicy(true, inputSamplePolicy(96), writerSamplePolicy(3000)),
       '/ha': pathPolicy(true, inputSamplePolicy(96), preserveFieldPolicy()),
     },
+  }
+}
+
+export function defaultCachePolicy(): CachePolicyConfig {
+  return {
+    default: {},
+    pathOverrides: {},
   }
 }
 
@@ -207,6 +216,8 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   promptCacheScaleMinInputTokens: 20000,
   promptCacheCreationControl: defaultPromptCacheCreationControl(),
   reportedUsage: defaultReportedUsage(),
+  cachePolicy: defaultCachePolicy(),
+  definedCacheRoutes: [],
   externalPools: defaultExternalPoolsConfig(),
   highCacheThreshold: 10000,
   compatProfile: 'claude-code',
@@ -308,6 +319,34 @@ export function normalizeReportedUsage(config: ReportedUsageConfig): ReportedUsa
   }
 }
 
+function normalizeCachePolicyPathPrefix(prefix: string): string | null {
+  const trimmed = prefix.trim()
+  if (!trimmed) return null
+  const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
+  return withSlash.replace(/\/+$/, '') || '/'
+}
+
+function isEmptyCachePolicyPatch(policy: CacheRoutePolicyPatch): boolean {
+  return !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds
+}
+
+export function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyConfig {
+  const source = config ?? defaultCachePolicy()
+  const pathOverrides = Object.fromEntries(
+    Object.entries(source.pathOverrides ?? {})
+      .map(([prefix, policy]) => {
+        const normalizedPrefix = normalizeCachePolicyPathPrefix(prefix)
+        if (!normalizedPrefix || isEmptyCachePolicyPatch(policy)) return null
+        return [normalizedPrefix, policy] as const
+      })
+      .filter((entry): entry is readonly [string, CacheRoutePolicyPatch] => Boolean(entry))
+  )
+  return {
+    default: source.default ?? {},
+    pathOverrides,
+  }
+}
+
 export function normalizePromptCacheCreationControl(
   config: PromptCacheCreationControlConfig
 ): PromptCacheCreationControlConfig {
@@ -343,4 +382,58 @@ export function normalizePayloadShaping(config: PayloadShapingConfig): PayloadSh
     currentDocumentMaxChars: toWhole(config.currentDocumentMaxChars),
     currentImagesMaxBytes: toWhole(config.currentImagesMaxBytes),
   }
+}
+
+export const DFCACHE_ROUTE_PREFIX = '/dfcache/'
+
+export function normalizeDefinedCacheRoute(route: string): string | null {
+  const trimmed = route.trim()
+  if (!trimmed) return null
+  const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
+  const normalized = withSlash.replace(/\/+$/, '').toLowerCase()
+  const name = normalized.startsWith(DFCACHE_ROUTE_PREFIX)
+    ? normalized.slice(DFCACHE_ROUTE_PREFIX.length)
+    : ''
+  if (!name || name.includes('/') || name.length > 64 || !/^[a-z0-9._-]+$/.test(name)) {
+    return null
+  }
+  return `${DFCACHE_ROUTE_PREFIX}${name}`
+}
+
+export function getDefinedCacheRouteName(route: string): string {
+  const normalized = normalizeDefinedCacheRoute(route)
+  if (normalized) {
+    return normalized.slice(DFCACHE_ROUTE_PREFIX.length)
+  }
+  const trimmed = route.trim()
+  const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
+  if (withSlash.toLowerCase().startsWith(DFCACHE_ROUTE_PREFIX)) {
+    return withSlash.slice(DFCACHE_ROUTE_PREFIX.length)
+  }
+  return trimmed
+}
+
+export function definedCacheRouteFromNameInput(name: string): string {
+  const trimmed = name.trim()
+  const normalizedFullRoute = normalizeDefinedCacheRoute(trimmed)
+  if (
+    normalizedFullRoute &&
+    (trimmed.startsWith('/') || trimmed.toLowerCase().startsWith(DFCACHE_ROUTE_PREFIX.slice(1)))
+  ) {
+    return normalizedFullRoute
+  }
+  return `${DFCACHE_ROUTE_PREFIX}${name}`
+}
+
+export function normalizeDefinedCacheRoutes(routes: string[]): string[] {
+  const seen = new Set<string>()
+  const normalized: string[] = []
+  for (const route of routes) {
+    const value = normalizeDefinedCacheRoute(route)
+    if (value && !seen.has(value)) {
+      seen.add(value)
+      normalized.push(value)
+    }
+  }
+  return normalized
 }

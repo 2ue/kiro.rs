@@ -20,6 +20,7 @@ import {
   attemptActionLabel,
   routeLabel,
   routeTone,
+  resolvedModelLabel,
   sourceLabel,
   statusLabel,
   statusTone,
@@ -93,6 +94,10 @@ export function UsageDetailModal({
   const hasExternalAttempts = (record.externalAttempts?.length ?? 0) > 0
   const hasExternalBilling = !!record.externalPoolBilling
   const billing = record.externalPoolBilling
+  const showExternalResolvedModel =
+    record.routeKind === 'external_pool'
+    && !!record.upstreamModel
+    && record.upstreamModel !== (record.externalOutboundModel || record.upstreamModel)
 
   return (
     <ModalShell open={open} onClose={onClose} title="请求明细" width="max-w-4xl">
@@ -107,6 +112,9 @@ export function UsageDetailModal({
             <DetailField label="会话 ID" value={record.conversationId || '-'} mono />
             <DetailField label="模型（请求）" value={record.model} />
             <DetailField label="模型（上游）" value={upstreamModelLabel(record)} />
+            {showExternalResolvedModel && (
+              <DetailField label="模型（本地解析）" value={resolvedModelLabel(record)} />
+            )}
             {record.modelResolutionNote && (
               <div className="sm:col-span-2">
                 <DetailField label="模型解析说明" value={record.modelResolutionNote} />
@@ -136,8 +144,11 @@ export function UsageDetailModal({
             <Badge tone="neutral">{sourceLabel(record.usageSource)}</Badge>
           </div>
           <div className="grid gap-3 sm:grid-cols-2">
+            {record.publicErrorType && <DetailField label="客户端错误类型" value={record.publicErrorType} />}
+            {record.publicErrorStatusCode != null && <DetailField label="客户端状态码" value={String(record.publicErrorStatusCode)} />}
+            {record.publicErrorMessage && <DetailField label="客户端收到的错误" value={record.publicErrorMessage} />}
             {record.errorType && <DetailField label="错误类型" value={record.errorType} />}
-            {record.errorMessage && <DetailField label="错误信息" value={record.errorMessage} />}
+            {record.errorMessage && <DetailField label="内部错误信息" value={record.errorMessage} />}
             {record.fallbackReason && <DetailField label="Fallback 原因" value={record.fallbackReason} />}
             {record.directPolicyReason && <DetailField label="直连原因" value={record.directPolicyReason} />}
           </div>
@@ -259,6 +270,7 @@ export function UsageDetailModal({
                   <TableRow>
                     <TableHead>顺序</TableHead>
                     <TableHead>外部账号</TableHead>
+                    <TableHead>请求模型</TableHead>
                     <TableHead>状态</TableHead>
                     <TableHead>动作</TableHead>
                     <TableHead className="text-right">耗时</TableHead>
@@ -272,6 +284,11 @@ export function UsageDetailModal({
                       <TableCell>
                         <div className="font-medium">#{a.poolId}</div>
                         <div className="max-w-[180px] truncate text-[0.68rem] text-muted-foreground/70">{a.poolName}</div>
+                      </TableCell>
+                      <TableCell>
+                        <div className="max-w-[220px] truncate font-mono text-xs" title={a.outboundModel || ''}>
+                          {a.outboundModel || '-'}
+                        </div>
                       </TableCell>
                       <TableCell>{a.status != null ? String(a.status) : '-'}</TableCell>
                       <TableCell>{attemptActionLabel(a.action)}</TableCell>
@@ -334,7 +351,7 @@ export function UsageDetailModal({
 
         {/* 错误详情 */}
         <div>
-          <SectionTitle>错误详情</SectionTitle>
+          <SectionTitle>内部错误详情</SectionTitle>
           <pre className="max-h-60 overflow-auto rounded-lg border border-border bg-muted/40 p-3 text-xs whitespace-pre-wrap break-words">
             {record.errorDetail || record.errorMessage || '-'}
           </pre>

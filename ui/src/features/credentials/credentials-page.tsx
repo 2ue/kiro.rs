@@ -59,6 +59,7 @@ import {
   useCredentials,
   useDeleteCredential,
   useDeleteDisabledCredentials,
+  useBatchUpdateCredentials,
   useLoadBalancingMode,
   useProxyResources,
   useResetFailure,
@@ -184,6 +185,7 @@ export function CredentialsPage() {
   const setLoadBalancingMutation = useSetLoadBalancingMode()
   const deleteCredential = useDeleteCredential()
   const deleteDisabledCredentials = useDeleteDisabledCredentials()
+  const batchUpdateCredentials = useBatchUpdateCredentials()
   const resetFailure = useResetFailure()
 
   const currentCredentials = useMemo(() => {
@@ -202,7 +204,11 @@ export function CredentialsPage() {
   const disabledCount = credentialSummary.data?.disabled ?? Math.max((credentials.data?.total || 0) - (credentials.data?.available || 0), 0)
   const hasActiveFilters = statusFilter !== '__all__' || authFilter !== '__all__' || subscriptionFilter !== '__all__' || proxyFilter !== '__all__'
   const activeFilterCount = [statusFilter, authFilter, subscriptionFilter, proxyFilter].filter((f) => f !== '__all__').length
-  const selectedDisabledCount = Array.from(selectedIds).filter((id) => currentCredentials.find((c) => c.id === id)?.disabled).length
+  const selectedCredentials = currentCredentials.filter((c) => selectedIds.has(c.id))
+  const selectedDisabledCount = selectedCredentials.filter((c) => c.disabled).length
+  const selectedPriorityOverrideCount = selectedCredentials.filter((c) => c.priority !== 0).length
+  const selectedConcurrencyOverrideCount = selectedCredentials.filter((c) => typeof c.maxConcurrentRequestsOverride === 'number').length
+  const selectedRpmOverrideCount = selectedCredentials.filter((c) => typeof c.rpmOverride === 'number').length
   const defaultCredentialConcurrency = runtimeConfig.data?.credentialMaxConcurrentRequests ?? 0
   const concurrencyOverrides = currentCredentials
     .map((c) => c.maxConcurrentRequestsOverride)
@@ -376,6 +382,54 @@ export function CredentialsPage() {
     else toast.warning(`刷新 Token：成功 ${success}，失败 ${fail}`)
   }
 
+  const batchResetPriority = async () => {
+    const ids = selectedCredentials.filter((c) => c.priority !== 0).map((c) => c.id)
+    if (!ids.length) return toast.error('选中账号没有自定义优先级')
+    batchUpdateCredentials.mutate(
+      { ids, priority: { priority: 0 } },
+      {
+        onSuccess: (res) => {
+          invalidate()
+          if (res.failed === 0) toast.success(`已重置 ${res.success} 个账号优先级`)
+          else toast.warning(`重置优先级：成功 ${res.success}，失败 ${res.failed}`)
+        },
+        onError: (e) => toast.error(`重置优先级失败: ${extractErrorMessage(e)}`),
+      }
+    )
+  }
+
+  const batchClearConcurrency = async () => {
+    const ids = selectedCredentials.filter((c) => typeof c.maxConcurrentRequestsOverride === 'number').map((c) => c.id)
+    if (!ids.length) return toast.error('选中账号没有自定义并发')
+    batchUpdateCredentials.mutate(
+      { ids, concurrency: { maxConcurrentRequests: null } },
+      {
+        onSuccess: (res) => {
+          invalidate()
+          if (res.failed === 0) toast.success(`已清除 ${res.success} 个账号并发覆盖`)
+          else toast.warning(`清除并发覆盖：成功 ${res.success}，失败 ${res.failed}`)
+        },
+        onError: (e) => toast.error(`清除并发覆盖失败: ${extractErrorMessage(e)}`),
+      }
+    )
+  }
+
+  const batchClearRpm = async () => {
+    const ids = selectedCredentials.filter((c) => typeof c.rpmOverride === 'number').map((c) => c.id)
+    if (!ids.length) return toast.error('选中账号没有自定义 RPM')
+    batchUpdateCredentials.mutate(
+      { ids, rpm: { rpm: null } },
+      {
+        onSuccess: (res) => {
+          invalidate()
+          if (res.failed === 0) toast.success(`已清除 ${res.success} 个账号 RPM 覆盖`)
+          else toast.warning(`清除 RPM 覆盖：成功 ${res.success}，失败 ${res.failed}`)
+        },
+        onError: (e) => toast.error(`清除 RPM 覆盖失败: ${extractErrorMessage(e)}`),
+      }
+    )
+  }
+
   const clearAllDisabled = async () => {
     if (!disabledCount) return toast.error('没有可清除的已禁用账号')
     const ok = await confirmDialog({ title: '清除已禁用账号', message: `确定清除所有 ${disabledCount} 个已禁用账号？此操作无法撤销。`, confirmText: '清除全部', tone: 'danger' })
@@ -545,7 +599,7 @@ export function CredentialsPage() {
           <ToolbarSearch
             value={queryText}
             onChange={setQueryText}
-            placeholder="搜索邮箱、ID、订阅、代理..."
+            placeholder="搜索邮箱、#ID、订阅、代理、Region、priority:0、rpm:60..."
           />
           <ToolbarActions>
             <Select value={sortBy} onValueChange={(v) => setSortBy(v as CredentialSortBy)}>
@@ -588,6 +642,10 @@ export function CredentialsPage() {
                   <SelectItem value="cooldown">冷却中</SelectItem>
                   <SelectItem value="rate_limited">限流中</SelectItem>
                   <SelectItem value="proxy_blocked">代理不可用</SelectItem>
+                  <SelectItem value="custom_scheduling">有调度覆盖</SelectItem>
+                  <SelectItem value="custom_priority">自定义优先级</SelectItem>
+                  <SelectItem value="custom_concurrency">自定义并发</SelectItem>
+                  <SelectItem value="custom_rpm">自定义 RPM</SelectItem>
                   <SelectItem value="error">有错误</SelectItem>
                   <SelectItem value="unknown_subscription">未知订阅</SelectItem>
                 </SelectContent>
@@ -596,10 +654,10 @@ export function CredentialsPage() {
                 <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="__all__">全部认证</SelectItem>
-	                  <SelectItem value="social">Social</SelectItem>
-	                  <SelectItem value="idc">IdC</SelectItem>
-	                  <SelectItem value="external_idp">External IdP</SelectItem>
-	                  <SelectItem value="api_key">API Key</SelectItem>
+                  <SelectItem value="social">Social</SelectItem>
+                  <SelectItem value="idc">IdC</SelectItem>
+                  <SelectItem value="external_idp">External IdP</SelectItem>
+                  <SelectItem value="api_key">API Key</SelectItem>
                 </SelectContent>
               </Select>
               <Select value={subscriptionFilter} onValueChange={setSubscriptionFilter}>
@@ -642,6 +700,33 @@ export function CredentialsPage() {
             </Button>
             <Button variant="outline" size="xs" onClick={() => setBatchEditOpen(true)}>
               <Filter className="h-3.5 w-3.5" />批量修改
+            </Button>
+            <Button
+              variant="outline"
+              size="xs"
+              onClick={batchResetPriority}
+              disabled={batchUpdateCredentials.isPending || selectedPriorityOverrideCount === 0}
+            >
+              {batchUpdateCredentials.isPending ? <Spinner size="sm" /> : <RotateCcw className="h-3.5 w-3.5" />}
+              重置优先级 ({selectedPriorityOverrideCount})
+            </Button>
+            <Button
+              variant="outline"
+              size="xs"
+              onClick={batchClearConcurrency}
+              disabled={batchUpdateCredentials.isPending || selectedConcurrencyOverrideCount === 0}
+            >
+              {batchUpdateCredentials.isPending ? <Spinner size="sm" /> : <RotateCcw className="h-3.5 w-3.5" />}
+              清除并发 ({selectedConcurrencyOverrideCount})
+            </Button>
+            <Button
+              variant="outline"
+              size="xs"
+              onClick={batchClearRpm}
+              disabled={batchUpdateCredentials.isPending || selectedRpmOverrideCount === 0}
+            >
+              {batchUpdateCredentials.isPending ? <Spinner size="sm" /> : <RotateCcw className="h-3.5 w-3.5" />}
+              清除 RPM ({selectedRpmOverrideCount})
             </Button>
             <Button variant="outline" size="xs" onClick={batchForceRefresh} disabled={batchRefreshing}>
               {batchRefreshing ? <Spinner size="sm" /> : <RefreshCw className="h-3.5 w-3.5" />}刷新Token

@@ -401,6 +401,9 @@ function RecordsView({
                     const attemptSummary = formatAttemptSummary(record)
                     const attemptChain = formatAttemptChain(record)
                     const externalChain = formatExternalAttemptChain(record)
+                    const calledModel = isExternal
+                      ? record.externalOutboundModel || record.upstreamModel
+                      : record.upstreamModel
                     return (
                       <TableRow key={record.id} className="cursor-pointer" onClick={() => onViewDetail(record)}>
                         {/* 时间 / 状态 */}
@@ -415,8 +418,8 @@ function RecordsView({
                         {/* 模型 / 入口 */}
                         <TableCell>
                           <div className="max-w-[200px] truncate text-xs font-medium" title={record.model}>{record.model}</div>
-                          {record.upstreamModel && record.upstreamModel !== record.model && (
-                            <div className="max-w-[200px] truncate font-mono text-[0.62rem] text-muted-foreground/60" title={record.upstreamModel}>{record.upstreamModel}</div>
+                          {calledModel && calledModel !== record.model && (
+                            <div className="max-w-[200px] truncate font-mono text-[0.62rem] text-muted-foreground/60" title={calledModel}>{calledModel}</div>
                           )}
                           <div className="mt-1 flex flex-wrap gap-1">
                             <Badge>{record.endpoint || '-'}</Badge>
@@ -480,12 +483,12 @@ function RecordsView({
                               {externalChain}
                             </div>
                           )}
-                          {record.errorMessage && (
+                          {(record.publicErrorMessage || record.errorMessage) && (
                             <div
                               className="max-w-[200px] truncate text-xs text-destructive"
-                              title={record.errorDetail || record.errorMessage}
+                              title={record.publicErrorMessage || record.errorDetail || record.errorMessage}
                             >
-                              {record.errorMessage}
+                              {record.publicErrorMessage || record.errorMessage}
                             </div>
                           )}
                         </TableCell>
