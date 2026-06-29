@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Plus, Trash2 } from 'lucide-react'
 import { Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue, Switch, Textarea, Button } from '@/components/ui'
-import { pathPolicy, inputSamplePolicy, preserveFieldPolicy } from '@/lib/runtime-config-defaults'
+import { defaultPromptCacheCreationControl, inputSamplePolicy, pathPolicy, preserveFieldPolicy } from '@/lib/runtime-config-defaults'
 import type {
   ModelCapabilitiesStatus,
   CachePolicyConfig,
+  CacheRoutePolicyPatch,
   ModelMappingConfig,
   ModelMappingRule,
   PayloadShapingConfig,
@@ -63,23 +64,216 @@ function TwoCol({ children }: { children: React.ReactNode }) {
 
 // ─── 路径级缓存策略(cachePolicy) ──────────────────────────────────────────────
 
-function normalizeCachePolicyShape(value: unknown): CachePolicyConfig {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error('配置必须是对象')
-  }
-  const object = value as Partial<CachePolicyConfig>
-  const defaultPatch = object.default
-  const pathOverrides = object.pathOverrides
-  if (defaultPatch !== undefined && (typeof defaultPatch !== 'object' || Array.isArray(defaultPatch) || defaultPatch === null)) {
-    throw new Error('default 必须是对象')
-  }
-  if (pathOverrides !== undefined && (typeof pathOverrides !== 'object' || Array.isArray(pathOverrides) || pathOverrides === null)) {
-    throw new Error('pathOverrides 必须是对象')
-  }
+type CacheSimulationPatch = NonNullable<CacheRoutePolicyPatch['simulation']>
+
+function normalizeCachePolicyPath(prefix: string): string | null {
+  const trimmed = prefix.trim()
+  if (!trimmed) return null
+  const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
+  return withSlash.replace(/\/+$/, '') || '/'
+}
+
+function defaultSimulationPatch(): CacheSimulationPatch {
   return {
-    default: defaultPatch ?? {},
-    pathOverrides: pathOverrides ?? {},
+    enabled: true,
+    targetReadRatio: 0.98,
+    tokenScale: 1.6,
+    maxSimulatedInputTokens: 300000,
+    capJitterMinTokens: 12000,
+    capJitterMaxTokens: 24000,
+    scaleMinInputTokens: 20000,
   }
+}
+
+function defaultPathCachePatch(): CacheRoutePolicyPatch {
+  return {
+    simulation: defaultSimulationPatch(),
+    creationControl: defaultPromptCacheCreationControl(),
+  }
+}
+
+function isEmptyRoutePatch(policy: CacheRoutePolicyPatch): boolean {
+  return !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds
+}
+
+function SimulationOverrideForm({
+  value,
+  onChange,
+}: {
+  value: CacheSimulationPatch
+  onChange: (next: CacheSimulationPatch) => void
+}) {
+  const merged = { ...defaultSimulationPatch(), ...value }
+  const set = <K extends keyof CacheSimulationPatch>(key: K) => (nextValue: CacheSimulationPatch[K]) =>
+    onChange({ ...merged, [key]: nextValue })
+
+  return (
+    <div className="space-y-4 rounded-lg border border-border bg-muted/20 p-4">
+      <TogField
+        label="启用高缓存模拟"
+        desc="只覆盖当前路径的高缓存模拟开关，不影响其他入口。"
+        checked={merged.enabled ?? true}
+        onChange={set('enabled')}
+      />
+      <TwoCol>
+        <NumField label="目标缓存读取比例" value={merged.targetReadRatio ?? 0.98} min={0} max={0.99} step={0.01} suffix="比例" onChange={set('targetReadRatio')} />
+        <NumField label="输入放大倍数" value={merged.tokenScale ?? 1.6} min={1} max={3} step={0.1} suffix="倍" onChange={set('tokenScale')} />
+      </TwoCol>
+      <TwoCol>
+        <NumField label="模拟输入上限" value={merged.maxSimulatedInputTokens ?? 300000} min={0} suffix="Token" onChange={set('maxSimulatedInputTokens')} />
+        <NumField label="放大生效门槛" value={merged.scaleMinInputTokens ?? 20000} min={0} suffix="Token" onChange={set('scaleMinInputTokens')} />
+      </TwoCol>
+      <TwoCol>
+        <NumField label="上限扣减下限" value={merged.capJitterMinTokens ?? 12000} min={0} suffix="Token" onChange={set('capJitterMinTokens')} />
+        <NumField label="上限扣减上限" value={merged.capJitterMaxTokens ?? 24000} min={0} suffix="Token" onChange={set('capJitterMaxTokens')} />
+      </TwoCol>
+    </div>
+  )
+}
+
+function CreationControlOverrideForm({
+  value,
+  onChange,
+}: {
+  value: PromptCacheCreationControlConfig
+  onChange: (next: PromptCacheCreationControlConfig) => void
+}) {
+  const merged = { ...defaultPromptCacheCreationControl(), ...value }
+  const set = <K extends keyof PromptCacheCreationControlConfig>(key: K) => (nextValue: PromptCacheCreationControlConfig[K]) =>
+    onChange({ ...merged, [key]: nextValue })
+
+  return (
+    <div className="space-y-4 rounded-lg border border-border bg-muted/20 p-4">
+      <TogField
+        label="启用缓存创建频次控制"
+        desc="只覆盖当前路径的缓存写入展示节奏。"
+        checked={merged.enabled}
+        onChange={set('enabled')}
+      />
+      <div className="space-y-1.5">
+        <div className="text-sm font-semibold">控制维度</div>
+        <Select value={merged.scopeMode} disabled={!merged.enabled} onValueChange={(v) => set('scopeMode')(v as PromptCacheCreationControlConfig['scopeMode'])}>
+          <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="credential_conversation_model">账号 + 会话 + 模型</SelectItem>
+            <SelectItem value="conversation_model">会话 + 模型</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+      <TwoCol>
+        <NumField label="最小成功请求间隔" value={merged.minSuccessfulRequestsBetweenCreation} min={0} suffix="次" disabled={!merged.enabled} onChange={set('minSuccessfulRequestsBetweenCreation')} />
+        <NumField label="最小时间间隔" value={merged.minCreationIntervalSecs} min={0} suffix="秒" disabled={!merged.enabled} onChange={set('minCreationIntervalSecs')} />
+      </TwoCol>
+      <TwoCol>
+        <NumField label="最小累计增量" value={merged.minCreationDeltaTokens} min={0} suffix="Token" disabled={!merged.enabled} onChange={set('minCreationDeltaTokens')} />
+        <NumField label="单次展示上限" value={merged.maxCreationTokensPerEvent} min={0} suffix="Token" disabled={!merged.enabled} onChange={set('maxCreationTokensPerEvent')} />
+      </TwoCol>
+      <TwoCol>
+        <NumField label="额度窗口长度" value={merged.creationBudgetWindowSecs} min={0} suffix="秒" disabled={!merged.enabled} onChange={set('creationBudgetWindowSecs')} />
+        <NumField label="窗口展示额度" value={merged.maxCreationTokensPerWindow} min={0} suffix="Token" disabled={!merged.enabled} onChange={set('maxCreationTokensPerWindow')} />
+      </TwoCol>
+      <TwoCol>
+        <NumField label="空闲后清理状态" value={merged.expireAfterIdleSecs} min={0} suffix="秒" disabled={!merged.enabled} onChange={set('expireAfterIdleSecs')} />
+      </TwoCol>
+    </div>
+  )
+}
+
+function PathCachePolicyCard({
+  prefix,
+  policy,
+  onPrefixChange,
+  onDelete,
+  onChange,
+}: {
+  prefix: string
+  policy: CacheRoutePolicyPatch
+  onPrefixChange: (nextPrefix: string) => void
+  onDelete: () => void
+  onChange: (next: CacheRoutePolicyPatch) => void
+}) {
+  const [draftPrefix, setDraftPrefix] = useState(prefix)
+  const [prefixError, setPrefixError] = useState<string | null>(null)
+
+  useEffect(() => {
+    setDraftPrefix(prefix)
+    setPrefixError(null)
+  }, [prefix])
+
+  const commitPrefix = () => {
+    const normalized = normalizeCachePolicyPath(draftPrefix)
+    if (!normalized) {
+      setPrefixError('路径不能为空')
+      setDraftPrefix(prefix)
+      return
+    }
+    setPrefixError(null)
+    onPrefixChange(normalized)
+  }
+
+  const setSimulation = (simulation?: CacheSimulationPatch) => {
+    onChange({ ...policy, simulation })
+  }
+  const setCreationControl = (creationControl?: PromptCacheCreationControlConfig) => {
+    onChange({ ...policy, creationControl })
+  }
+
+  return (
+    <div className="space-y-4 rounded-lg border border-border bg-background p-4">
+      <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+        <div className="min-w-0 flex-1 space-y-1.5">
+          <div className="text-sm font-semibold">路径覆盖</div>
+          <Input
+            value={draftPrefix}
+            onChange={(event) => setDraftPrefix(event.target.value)}
+            onBlur={commitPrefix}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') event.currentTarget.blur()
+              if (event.key === 'Escape') {
+                setDraftPrefix(prefix)
+                setPrefixError(null)
+              }
+            }}
+          />
+          {prefixError && <div className="text-xs text-destructive">{prefixError}</div>}
+        </div>
+        <Button type="button" variant="outline" size="sm" className="text-destructive" onClick={onDelete}>
+          <Trash2 className="mr-1 h-4 w-4" />
+          删除路径
+        </Button>
+      </div>
+
+      <div className="space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-sm font-semibold">高缓存模拟覆盖</div>
+            <div className="text-xs text-muted-foreground">不设置时沿用通用高缓存配置。</div>
+          </div>
+          {policy.simulation ? (
+            <Button type="button" variant="ghost" size="sm" onClick={() => setSimulation(undefined)}>清除覆盖</Button>
+          ) : (
+            <Button type="button" variant="outline" size="sm" onClick={() => setSimulation(defaultSimulationPatch())}>设置覆盖</Button>
+          )}
+        </div>
+        {policy.simulation && <SimulationOverrideForm value={policy.simulation} onChange={setSimulation} />}
+      </div>
+
+      <div className="space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-sm font-semibold">缓存创建频次覆盖</div>
+            <div className="text-xs text-muted-foreground">不设置时沿用通用缓存创建频次。</div>
+          </div>
+          {policy.creationControl ? (
+            <Button type="button" variant="ghost" size="sm" onClick={() => setCreationControl(undefined)}>清除覆盖</Button>
+          ) : (
+            <Button type="button" variant="outline" size="sm" onClick={() => setCreationControl(defaultPromptCacheCreationControl())}>设置覆盖</Button>
+          )}
+        </div>
+        {policy.creationControl && <CreationControlOverrideForm value={policy.creationControl} onChange={setCreationControl} />}
+      </div>
+    </div>
+  )
 }
 
 export function CachePolicySection({
@@ -89,82 +283,100 @@ export function CachePolicySection({
   cachePolicy: CachePolicyConfig
   onChange: (next: CachePolicyConfig) => void
 }) {
-  const [text, setText] = useState(() => JSON.stringify(cachePolicy, null, 2))
+  const [newPath, setNewPath] = useState('')
   const [error, setError] = useState<string | null>(null)
-  const [dirty, setDirty] = useState(false)
+  const paths = Object.keys(cachePolicy.pathOverrides ?? {}).sort()
 
-  useEffect(() => {
-    if (dirty) return
-    setText(JSON.stringify(cachePolicy, null, 2))
-    setError(null)
-  }, [cachePolicy, dirty])
-
-  const commit = (value: string) => {
-    setDirty(true)
-    setText(value)
-    try {
-      const parsed = normalizeCachePolicyShape(JSON.parse(value))
-      setError(null)
-      onChange(parsed)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'JSON 解析失败')
+  const setPathPolicy = (prefix: string, nextPolicy: CacheRoutePolicyPatch) => {
+    const pathOverrides = { ...(cachePolicy.pathOverrides ?? {}) }
+    if (isEmptyRoutePatch(nextPolicy)) {
+      delete pathOverrides[prefix]
+    } else {
+      pathOverrides[prefix] = nextPolicy
     }
+    onChange({ ...cachePolicy, pathOverrides })
   }
 
-  const fillExample = () => {
-    const example: CachePolicyConfig = {
-      default: {},
-      pathOverrides: {
-        '/cc': {
-          simulation: {
-            enabled: true,
-            targetReadRatio: 0.98,
-            tokenScale: 1.6,
-            maxSimulatedInputTokens: 300000,
-          },
-          reportedUsage: pathPolicy(true, inputSamplePolicy(96), preserveFieldPolicy()),
-        },
-        '/dfcache/team-a': {
-          simulation: { enabled: true, targetReadRatio: 0.96 },
-          creationControl: {
-            enabled: true,
-            scopeMode: 'conversation_model',
-            minSuccessfulRequestsBetweenCreation: 2,
-            minCreationIntervalSecs: 30,
-            minCreationDeltaTokens: 8000,
-            maxCreationTokensPerEvent: 30000,
-            creationBudgetWindowSecs: 300,
-            maxCreationTokensPerWindow: 120000,
-            expireAfterIdleSecs: 3600,
-          },
-          cachePoint: { enabled: false },
-          bounds: { maxEntriesPerAccount: 200, maxEntriesGlobal: 20000, entryTtlSecs: 86400 },
-        },
-      },
+  const addPath = () => {
+    const prefix = normalizeCachePolicyPath(newPath)
+    if (!prefix) {
+      setError('请输入路径前缀，例如 /cc 或 /dfcache/team-a')
+      return
     }
-    commit(JSON.stringify(example, null, 2))
+    if (cachePolicy.pathOverrides?.[prefix]) {
+      setError(`${prefix} 已存在`)
+      return
+    }
+    setError(null)
+    setNewPath('')
+    onChange({
+      ...cachePolicy,
+      pathOverrides: {
+        ...(cachePolicy.pathOverrides ?? {}),
+        [prefix]: defaultPathCachePatch(),
+      },
+    })
+  }
+
+  const renamePath = (oldPrefix: string, nextPrefix: string) => {
+    if (oldPrefix === nextPrefix) return
+    if (cachePolicy.pathOverrides?.[nextPrefix]) {
+      setError(`${nextPrefix} 已存在`)
+      return
+    }
+    const pathOverrides = { ...(cachePolicy.pathOverrides ?? {}) }
+    const policy = pathOverrides[oldPrefix]
+    delete pathOverrides[oldPrefix]
+    pathOverrides[nextPrefix] = policy
+    setError(null)
+    onChange({ ...cachePolicy, pathOverrides })
+  }
+
+  const deletePath = (prefix: string) => {
+    const pathOverrides = { ...(cachePolicy.pathOverrides ?? {}) }
+    delete pathOverrides[prefix]
+    onChange({ ...cachePolicy, pathOverrides })
   }
 
   return (
-    <div className="space-y-3">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="text-xs leading-5 text-muted-foreground">
-          按入口前缀覆盖缓存模拟、缓存写入展示节奏、usage 展示、真实 cachePoint 和缓存边界。空对象表示沿用全局配置；最长匹配生效。
-        </div>
-        <Button type="button" variant="outline" size="sm" onClick={fillExample}>填充示例</Button>
+    <div className="space-y-4">
+      <div className="text-xs leading-5 text-muted-foreground">
+        按入口路径覆盖通用高缓存模拟和缓存创建频次。没有设置覆盖的路径会继续使用通用配置；路径匹配时使用最长前缀。
       </div>
-      <Textarea
-        value={text}
-        rows={16}
-        className="font-mono text-xs"
-        spellCheck={false}
-        onChange={(e) => commit(e.target.value)}
-      />
-      {error ? (
-        <div className="text-xs text-destructive">配置格式错误：{error}</div>
+      <div className="flex flex-col gap-2 rounded-lg border border-border bg-muted/20 p-4 md:flex-row md:items-end">
+        <div className="min-w-0 flex-1 space-y-1.5">
+          <div className="text-sm font-semibold">新增路径覆盖</div>
+          <Input
+            placeholder="/cc、/ha 或 /dfcache/team-a"
+            value={newPath}
+            onChange={(event) => setNewPath(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') addPath()
+            }}
+          />
+        </div>
+        <Button type="button" onClick={addPath}>
+          <Plus className="mr-1 h-4 w-4" />
+          新增路径
+        </Button>
+      </div>
+      {error && <div className="text-xs text-destructive">{error}</div>}
+      {paths.length === 0 ? (
+        <div className="rounded-lg border border-dashed border-border p-6 text-sm text-muted-foreground">
+          暂无路径覆盖。当前所有入口都会使用通用高缓存配置和通用缓存创建频次。
+        </div>
       ) : (
-        <div className="text-xs text-muted-foreground">
-          支持字段：simulation、creationControl、reportedUsage、cachePoint、bounds。路径只改变策略，不会自动创建 /dfcache 路由。
+        <div className="space-y-4">
+          {paths.map((prefix) => (
+            <PathCachePolicyCard
+              key={prefix}
+              prefix={prefix}
+              policy={cachePolicy.pathOverrides[prefix]}
+              onPrefixChange={(nextPrefix) => renamePath(prefix, nextPrefix)}
+              onDelete={() => deletePath(prefix)}
+              onChange={(nextPolicy) => setPathPolicy(prefix, nextPolicy)}
+            />
+          ))}
         </div>
       )}
     </div>

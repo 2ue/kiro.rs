@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   Plus,
   RefreshCw,
@@ -46,7 +46,7 @@ import {
   useSyncModelPricing,
   useUpsertManualModel,
 } from '@/hooks/use-usage'
-import type { ModelCapabilityItem, ModelPricing, UpsertManualModelRequest } from '@/types/api'
+import type { ModelCapabilityItem, ModelPriceItem, ModelPricing, UpsertManualModelRequest } from '@/types/api'
 
 // ─── 工具 ──────────────────────────────────────────────────────────────────────
 
@@ -64,6 +64,65 @@ function formatTokens(v?: number): string {
 function formatUsdPerM(perToken?: number): string {
   if (perToken == null) return '—'
   return `$${(perToken * 1_000_000).toFixed(2)}`
+}
+
+function sourceLabel(source?: string): string {
+  if (!source) return '同步'
+  if (source === 'manual') return '手动'
+  if (source === 'built-in') return '内置'
+  if (source === 'litellm') return '价格源'
+  return source
+}
+
+function sourceTone(source?: string): 'neutral' | 'primary' | 'secondary' | 'success' | 'warning' | 'error' | 'info' {
+  if (source === 'manual') return 'primary'
+  if (source === 'built-in') return 'secondary'
+  if (source === 'litellm') return 'success'
+  return 'neutral'
+}
+
+function addModelKeyAliases(model: string, target: Set<string>) {
+  const normalized = model.trim().toLowerCase()
+  if (!normalized) return
+  target.add(normalized)
+  const slashIndex = normalized.lastIndexOf('/')
+  if (slashIndex >= 0 && slashIndex + 1 < normalized.length) {
+    target.add(normalized.slice(slashIndex + 1))
+  }
+  for (const value of Array.from(target)) {
+    const dotVersion = value.match(/^(claude-(?:opus|sonnet|haiku)-\d+)-(\d+)(-.+)?$/)
+    if (dotVersion) {
+      target.add(`${dotVersion[1]}.${dotVersion[2]}${dotVersion[3] ?? ''}`)
+    }
+    const dashVersion = value.match(/^(claude-(?:opus|sonnet|haiku)-\d+)\.(\d+)(-.+)?$/)
+    if (dashVersion) {
+      target.add(`${dashVersion[1]}-${dashVersion[2]}${dashVersion[3] ?? ''}`)
+    }
+  }
+}
+
+function modelKeyAliases(model: string): string[] {
+  const aliases = new Set<string>()
+  addModelKeyAliases(model, aliases)
+  return Array.from(aliases)
+}
+
+function pricingIndex(items: ModelPriceItem[]): Map<string, ModelPriceItem> {
+  const map = new Map<string, ModelPriceItem>()
+  for (const item of items) {
+    for (const alias of modelKeyAliases(item.model)) {
+      if (!map.has(alias)) map.set(alias, item)
+    }
+  }
+  return map
+}
+
+function findPricing(index: Map<string, ModelPriceItem>, model: string): ModelPriceItem | undefined {
+  for (const alias of modelKeyAliases(model)) {
+    const item = index.get(alias)
+    if (item) return item
+  }
+  return undefined
 }
 
 function dollarsPerMillion(value?: number): string {
@@ -199,7 +258,7 @@ export function ModelsPage() {
   const [addOpen, setAddOpen] = useState(false)
 
   const models = capabilities.data?.models ?? []
-  const priceMap = new Map((pricing.data?.models ?? []).map((p) => [p.model, p.pricing]))
+  const priceIndex = useMemo(() => pricingIndex(pricing.data?.models ?? []), [pricing.data?.models])
 
   const handleDelete = async (item: ModelCapabilityItem) => {
     const ok = await confirm({
@@ -297,8 +356,53 @@ export function ModelsPage() {
 
       {/* 模型能力清单 */}
       <SectionCard
+        title="模型价格目录"
+        description={pricing.data?.sourceUrl || '同步后展示当前可用于计费和成本估算的模型价格'}
+        noPadding
+      >
+        {pricing.isLoading ? (
+          <LoadingState text="加载价格目录..." className="py-8" />
+        ) : pricing.error ? (
+          <ErrorState message={extractErrorMessage(pricing.error)} />
+        ) : !pricing.data?.models.length ? (
+          <EmptyState title="暂无价格数据" description="点击「同步价格」获取模型价格目录" />
+        ) : (
+          <div className="scrollbar-thin overflow-x-auto">
+            <Table className="min-w-[840px]">
+              <TableHeader>
+                <TableRow>
+                  <TableHead>模型 ID</TableHead>
+                  <TableHead>来源</TableHead>
+                  <TableHead className="text-right">输入价格/M</TableHead>
+                  <TableHead className="text-right">输出价格/M</TableHead>
+                  <TableHead className="text-right">缓存写入/M</TableHead>
+                  <TableHead className="text-right">缓存读取/M</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {pricing.data.models.map((item) => (
+                  <TableRow key={item.model}>
+                    <TableCell className="font-mono text-xs max-w-[260px]">
+                      <div className="truncate" title={item.model}>{item.model}</div>
+                    </TableCell>
+                    <TableCell>
+                      <Badge tone={sourceTone(item.source)}>{sourceLabel(item.source)}</Badge>
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-xs tabular-nums">{formatUsdPerM(item.pricing.inputCostPerToken)}</TableCell>
+                    <TableCell className="text-right font-mono text-xs tabular-nums">{formatUsdPerM(item.pricing.outputCostPerToken)}</TableCell>
+                    <TableCell className="text-right font-mono text-xs tabular-nums">{formatUsdPerM(item.pricing.cacheCreationInputTokenCost)}</TableCell>
+                    <TableCell className="text-right font-mono text-xs tabular-nums">{formatUsdPerM(item.pricing.cacheReadInputTokenCost)}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+      </SectionCard>
+
+      <SectionCard
         title="模型清单"
-        description="系统同步的模型不可删除，手动添加的可编辑或删除"
+        description="系统同步的模型不可删除，手动添加的可编辑或删除；价格列会按模型名兼容匹配当前价格目录"
         noPadding
       >
         {capabilities.isLoading ? (
@@ -336,7 +440,8 @@ export function ModelsPage() {
               </TableHeader>
               <TableBody>
                 {models.map((item) => {
-                  const price = priceMap.get(item.model)
+                  const priceItem = findPricing(priceIndex, item.model)
+                  const price = priceItem?.pricing
                   const manual = isManual(item)
                   return (
                     <TableRow key={item.model}>
@@ -377,8 +482,8 @@ export function ModelsPage() {
                         {formatUsdPerM(price?.cacheReadInputTokenCost)}
                       </TableCell>
                       <TableCell>
-                        <Badge tone={manual ? 'primary' : 'neutral'}>
-                          {manual ? '手动' : item.source ?? '同步'}
+                        <Badge tone={sourceTone(item.source)}>
+                          {sourceLabel(manual ? 'manual' : item.source)}
                         </Badge>
                       </TableCell>
                       <TableCell>
@@ -421,7 +526,7 @@ export function ModelsPage() {
         <EditModelDialog
           open
           initial={editTarget}
-          initialPricing={priceMap.get(editTarget.model)}
+          initialPricing={findPricing(priceIndex, editTarget.model)?.pricing}
           onClose={() => setEditTarget(null)}
           onSaved={() => setEditTarget(null)}
         />

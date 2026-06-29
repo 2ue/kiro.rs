@@ -3536,6 +3536,74 @@ mod tests {
     }
 
     #[test]
+    fn cache_policy_resolves_path_creation_control_override() {
+        let mut config = Config::default();
+        config.prompt_cache_creation_control = PromptCacheCreationControlConfig {
+            enabled: true,
+            scope_mode: PromptCacheCreationControlScopeMode::ConversationModel,
+            min_successful_requests_between_creation: 7,
+            min_creation_interval_secs: 120,
+            min_creation_delta_tokens: 30000,
+            max_creation_tokens_per_event: 40000,
+            creation_budget_window_secs: 600,
+            max_creation_tokens_per_window: 200000,
+            expire_after_idle_secs: 7200,
+        };
+        config.cache_policy.path_overrides.insert(
+            "/dfcache/team-a".to_string(),
+            CacheRoutePolicyPatch {
+                creation_control: Some(PromptCacheCreationControlConfig {
+                    enabled: true,
+                    scope_mode: PromptCacheCreationControlScopeMode::CredentialConversationModel,
+                    min_successful_requests_between_creation: 2,
+                    min_creation_interval_secs: 30,
+                    min_creation_delta_tokens: 8000,
+                    max_creation_tokens_per_event: 12000,
+                    creation_budget_window_secs: 180,
+                    max_creation_tokens_per_window: 50000,
+                    expire_after_idle_secs: 900,
+                }),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+
+        let overridden = config.cache_policy_for_path("/dfcache/team-a/v1/messages");
+        assert_eq!(overridden.namespace.as_deref(), Some("/dfcache/team-a"));
+        assert_eq!(
+            overridden
+                .policy
+                .creation_control
+                .scope_mode,
+            PromptCacheCreationControlScopeMode::CredentialConversationModel
+        );
+        assert_eq!(
+            overridden
+                .policy
+                .creation_control
+                .min_successful_requests_between_creation,
+            2
+        );
+        assert_eq!(
+            overridden.policy.creation_control.min_creation_interval_secs,
+            30
+        );
+
+        let inherited = config.cache_policy_for_path("/cc/v1/messages");
+        assert_eq!(inherited.namespace, None);
+        assert_eq!(
+            inherited
+                .policy
+                .creation_control
+                .min_successful_requests_between_creation,
+            7
+        );
+        assert_eq!(
+            inherited.policy.creation_control.min_creation_interval_secs,
+            120
+        );
+    }
+
+    #[test]
     fn cache_policy_reported_usage_only_override_does_not_split_cache_scope() {
         let mut config = Config::default();
         config.cache_policy.path_overrides.insert(
