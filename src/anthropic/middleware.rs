@@ -17,12 +17,15 @@ use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
     CompatProfile, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
     PromptCacheCreationControlConfig, PromptCacheSimulationMode, ReportedUsageConfig,
-    normalize_defined_cache_routes,
+    ThinkingTriggerMode, normalize_defined_cache_routes,
 };
 
 use super::{
-    envelope, model_capabilities::ModelCapabilitiesCatalog, pricing::PricingCatalog,
-    prompt_cache::PromptCacheTracker, prompt_cache_creation_control::PromptCacheCreationController,
+    envelope,
+    model_capabilities::ModelCapabilitiesCatalog,
+    pricing::PricingCatalog,
+    prompt_cache::{PromptCacheBounds, PromptCacheTracker},
+    prompt_cache_creation_control::PromptCacheCreationController,
     usage::UsageRecorder,
 };
 
@@ -36,6 +39,8 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// thinking 触发策略
+    pub thinking_trigger_mode: ThinkingTriggerMode,
     /// 请求级 usage 记录器
     pub usage_recorder: Arc<UsageRecorder>,
     /// 模型价格目录。仅用于统计计价，失败不影响请求。
@@ -62,6 +67,8 @@ pub struct AppState {
     pub prompt_cache_scale_min_input_tokens: i32,
     /// 本地 prompt-cache creation 上报频次控制配置
     pub prompt_cache_creation_control: PromptCacheCreationControlConfig,
+    /// 本地 prompt-cache 内存和条目边界
+    pub prompt_cache_bounds: PromptCacheBounds,
     /// 下游 usage 上报投影配置
     pub reported_usage: ReportedUsageConfig,
     /// 已定义的 /dfcache/{name} 自定义 high-cache 路由。
@@ -86,6 +93,14 @@ pub struct AppState {
     pub payload_guard_trim_history: bool,
     /// 外部备用池是否复用同一套 payload guard / shaping 配置
     pub payload_guard_external_enabled: bool,
+    /// 是否把工具 cache_control 转成 Kiro cachePoint
+    pub kiro_cache_point_enabled: bool,
+    /// cachePoint 是否仅按工具 cache_control 插入
+    pub kiro_cache_point_tools_only: bool,
+    /// 是否记录 cachePoint 插入计划
+    pub kiro_cache_point_record_plan: bool,
+    /// Kiro 上游流式响应正文静默超时秒数
+    pub kiro_upstream_stream_idle_timeout_secs: u64,
     /// payload shaping 配置
     pub payload_shaping: PayloadShapingConfig,
     /// 外部备用号池管理器。
@@ -109,6 +124,7 @@ impl AppState {
             request_api_keys,
             kiro_provider: None,
             extract_thinking,
+            thinking_trigger_mode: ThinkingTriggerMode::RealRequest,
             usage_recorder,
             pricing_catalog: Arc::new(PricingCatalog::new()),
             model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
@@ -122,6 +138,7 @@ impl AppState {
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
             prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+            prompt_cache_bounds: PromptCacheBounds::default(),
             reported_usage: ReportedUsageConfig::default(),
             defined_cache_routes: Vec::new(),
             compat_profile,
@@ -134,6 +151,10 @@ impl AppState {
             payload_guard_safety_margin_bytes: 32 * 1024,
             payload_guard_trim_history: true,
             payload_guard_external_enabled: true,
+            kiro_cache_point_enabled: false,
+            kiro_cache_point_tools_only: true,
+            kiro_cache_point_record_plan: true,
+            kiro_upstream_stream_idle_timeout_secs: 180,
             payload_shaping: PayloadShapingConfig::default(),
             external_pool_manager: None,
         }
@@ -144,6 +165,16 @@ impl AppState {
         config: PromptCacheCreationControlConfig,
     ) -> Self {
         self.prompt_cache_creation_control = config.normalized();
+        self
+    }
+
+    pub fn with_thinking_trigger_mode(mut self, mode: ThinkingTriggerMode) -> Self {
+        self.thinking_trigger_mode = mode;
+        self
+    }
+
+    pub fn with_prompt_cache_bounds(mut self, bounds: PromptCacheBounds) -> Self {
+        self.prompt_cache_bounds = bounds;
         self
     }
 
@@ -209,6 +240,10 @@ impl AppState {
         safety_margin_bytes: usize,
         trim_history: bool,
         external_enabled: bool,
+        kiro_cache_point_enabled: bool,
+        kiro_cache_point_tools_only: bool,
+        kiro_cache_point_record_plan: bool,
+        kiro_upstream_stream_idle_timeout_secs: u64,
         payload_shaping: PayloadShapingConfig,
     ) -> Self {
         self.payload_guard_enabled = enabled;
@@ -217,6 +252,10 @@ impl AppState {
         self.payload_guard_safety_margin_bytes = safety_margin_bytes;
         self.payload_guard_trim_history = trim_history;
         self.payload_guard_external_enabled = external_enabled;
+        self.kiro_cache_point_enabled = kiro_cache_point_enabled;
+        self.kiro_cache_point_tools_only = kiro_cache_point_tools_only;
+        self.kiro_cache_point_record_plan = kiro_cache_point_record_plan;
+        self.kiro_upstream_stream_idle_timeout_secs = kiro_upstream_stream_idle_timeout_secs;
         self.payload_shaping = payload_shaping;
         self
     }

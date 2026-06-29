@@ -16,12 +16,13 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::State,
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::any,
 };
 use chrono::{SecondsFormat, Utc};
 use clap::{Parser, ValueEnum};
+use crc::{CRC_32_ISO_HDLC, Crc};
 use futures::{Stream, StreamExt, stream};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -71,10 +72,14 @@ struct Args {
     fake_listen: Option<SocketAddr>,
     #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true")]
     fake_only: bool,
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true")]
+    fake_kiro_eventstream: bool,
     #[arg(long, default_value_t = 1500)]
     fake_delay_ms: u64,
     #[arg(long, default_value_t = 10)]
     fake_recover_after: u64,
+    #[arg(long)]
+    fake_capture_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
@@ -89,6 +94,8 @@ enum Scenario {
     RateLimit429,
     ServerError500,
     InvalidToolFormat,
+    CachePointReject,
+    ToolUseStream,
     MalformedSse,
     ClientDrop,
     RecoveryAfterBurst,
@@ -170,6 +177,8 @@ struct FakeServerState {
     scenario: Scenario,
     delay: Duration,
     recover_after: u64,
+    kiro_eventstream: bool,
+    capture_dir: Option<PathBuf>,
     counter: Arc<AtomicU64>,
 }
 
@@ -189,6 +198,8 @@ async fn main() -> anyhow::Result<()> {
             scenario: args.scenario,
             delay: Duration::from_millis(args.fake_delay_ms),
             recover_after: args.fake_recover_after,
+            kiro_eventstream: args.fake_kiro_eventstream,
+            capture_dir: args.fake_capture_dir,
             counter: Arc::new(AtomicU64::new(0)),
         };
         let server = tokio::spawn(run_fake_server(addr, state));
@@ -380,7 +391,7 @@ async fn execute_request(
             first_text_ms: metrics.first_text_ms,
             total_latency_ms: started.elapsed().as_millis(),
             request_id,
-            error_id,
+            error_id: error_id.or(metrics.error_id),
         })
     } else {
         let bytes = response.bytes().await?;
@@ -429,7 +440,7 @@ fn request_body(config: &RunConfig, index: usize) -> Value {
     }
 
     if config.tool_use {
-        body["tools"] = json!([{
+        let mut tool = json!({
             "name": "echo",
             "description": "Return the provided text.",
             "input_schema": {
@@ -439,7 +450,11 @@ fn request_body(config: &RunConfig, index: usize) -> Value {
                 },
                 "required": ["text"]
             }
-        }]);
+        });
+        if config.cache_control {
+            tool["cache_control"] = json!({"type": "ephemeral"});
+        }
+        body["tools"] = json!([tool]);
     }
 
     body
@@ -449,6 +464,7 @@ fn request_body(config: &RunConfig, index: usize) -> Value {
 struct ParsedSseMetrics {
     first_thinking_ms: Option<u128>,
     first_text_ms: Option<u128>,
+    error_id: Option<String>,
     saw_message_stop: bool,
     saw_done: bool,
 }
@@ -503,6 +519,9 @@ impl SseMetricsParser {
             }
             if data_has_message_stop(&item) {
                 self.metrics.saw_message_stop = true;
+            }
+            if self.metrics.error_id.is_none() {
+                self.metrics.error_id = error_id_from_sse_data(&item);
             }
         }
     }
@@ -577,6 +596,30 @@ fn data_has_message_stop(data: &str) -> bool {
                 .map(|kind| kind == "message_stop")
         })
         .unwrap_or(false)
+}
+
+fn error_id_from_sse_data(data: &str) -> Option<String> {
+    if data == "[DONE]" {
+        return None;
+    }
+    let value = serde_json::from_str::<Value>(data).ok()?;
+    value
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .and_then(extract_error_id)
+        .or_else(|| {
+            value
+                .get("error_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| {
+            value
+                .get("request_id")
+                .and_then(Value::as_str)
+                .filter(|_| value.get("error").is_some())
+                .map(ToOwned::to_owned)
+        })
 }
 
 fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -798,6 +841,7 @@ async fn run_fake_server(addr: SocketAddr, state: FakeServerState) -> anyhow::Re
 
 async fn fake_handler(
     State(state): State<FakeServerState>,
+    uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -809,8 +853,10 @@ async fn fake_handler(
     let stream = request
         .get("stream")
         .and_then(Value::as_bool)
-        .unwrap_or_else(|| wants_stream(&headers));
+        .unwrap_or_else(|| wants_stream(&headers) || wants_kiro_eventstream(&state, &uri));
     let scenario = effective_fake_scenario(&state);
+    capture_fake_request(&state, &request_id, &uri, &headers, &request).await;
+    let thinking = body_requests_thinking(&request);
 
     match scenario {
         Scenario::RateLimit429 => json_error(
@@ -831,6 +877,27 @@ async fn fake_handler(
             "invalid_request_error",
             "Invalid tool use format.",
         ),
+        Scenario::CachePointReject => {
+            if body_contains_cache_point(&request) {
+                json_error(
+                    StatusCode::BAD_REQUEST,
+                    &request_id,
+                    "invalid_request_error",
+                    "Invalid tool use format.",
+                )
+            } else if stream {
+                if state.kiro_eventstream {
+                    kiro_eventstream_response(
+                        request_id,
+                        normal_kiro_events(Duration::ZERO, thinking),
+                    )
+                } else {
+                    sse_response(request_id, normal_sse_events(Duration::ZERO, thinking))
+                }
+            } else {
+                fake_json_message(&request_id)
+            }
+        }
         Scenario::JsonException200 => (
             StatusCode::OK,
             [
@@ -852,13 +919,26 @@ async fn fake_handler(
         ),
         Scenario::StreamIdleTimeout => {
             if stream {
-                sse_response(
-                    request_id,
-                    vec![(
-                        state.delay,
-                        "data: {\"type\":\"message_start\"}\n\n".to_string(),
-                    )],
-                )
+                if state.kiro_eventstream {
+                    kiro_eventstream_response(
+                        request_id,
+                        vec![(
+                            state.delay,
+                            kiro_event_frame(
+                                "assistantResponseEvent",
+                                json!({"content":"partial response"}),
+                            ),
+                        )],
+                    )
+                } else {
+                    sse_response(
+                        request_id,
+                        vec![(
+                            state.delay,
+                            "data: {\"type\":\"message_start\"}\n\n".to_string(),
+                        )],
+                    )
+                }
             } else {
                 sleep(state.delay).await;
                 fake_json_message(&request_id)
@@ -866,7 +946,11 @@ async fn fake_handler(
         }
         Scenario::SlowFirstByte => {
             if stream {
-                sse_response(request_id, normal_sse_events(state.delay, false))
+                if state.kiro_eventstream {
+                    kiro_eventstream_response(request_id, normal_kiro_events(state.delay, false))
+                } else {
+                    sse_response(request_id, normal_sse_events(state.delay, false))
+                }
             } else {
                 sleep(state.delay).await;
                 fake_json_message(&request_id)
@@ -874,16 +958,53 @@ async fn fake_handler(
         }
         Scenario::SlowThinkingThenText => {
             if stream {
-                sse_response(request_id, thinking_sse_events(state.delay))
+                if state.kiro_eventstream {
+                    kiro_eventstream_response(request_id, thinking_kiro_events(state.delay))
+                } else {
+                    sse_response(request_id, thinking_sse_events(state.delay))
+                }
             } else {
                 sleep(state.delay).await;
+                fake_json_message(&request_id)
+            }
+        }
+        Scenario::ToolUseStream => {
+            if stream {
+                if state.kiro_eventstream {
+                    if body_contains_tool_result(&request) {
+                        kiro_eventstream_response(
+                            request_id,
+                            normal_kiro_events(Duration::ZERO, thinking),
+                        )
+                    } else {
+                        kiro_eventstream_response(
+                            request_id,
+                            tool_use_kiro_events(select_fake_tool_name(&request)),
+                        )
+                    }
+                } else if body_contains_tool_result(&request) {
+                    sse_response(request_id, normal_sse_events(Duration::ZERO, thinking))
+                } else {
+                    sse_response(
+                        request_id,
+                        tool_use_sse_events(select_fake_tool_name(&request)),
+                    )
+                }
+            } else {
                 fake_json_message(&request_id)
             }
         }
         Scenario::NormalNonStream => fake_json_message(&request_id),
         Scenario::NormalStream | Scenario::ClientDrop | Scenario::RecoveryAfterBurst => {
             if stream {
-                sse_response(request_id, normal_sse_events(Duration::ZERO, false))
+                if state.kiro_eventstream {
+                    kiro_eventstream_response(
+                        request_id,
+                        normal_kiro_events(Duration::ZERO, thinking),
+                    )
+                } else {
+                    sse_response(request_id, normal_sse_events(Duration::ZERO, thinking))
+                }
             } else {
                 fake_json_message(&request_id)
             }
@@ -908,6 +1029,164 @@ fn wants_stream(headers: &HeaderMap) -> bool {
         .get(header::ACCEPT)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.contains("text/event-stream"))
+}
+
+fn wants_kiro_eventstream(state: &FakeServerState, uri: &Uri) -> bool {
+    state.kiro_eventstream && uri.path().contains("generateAssistantResponse")
+}
+
+fn body_contains_cache_point(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, value)| key == "cachePoint" || body_contains_cache_point(value)),
+        Value::Array(items) => items.iter().any(body_contains_cache_point),
+        _ => false,
+    }
+}
+
+fn body_contains_tool_result(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            if map.iter().any(|(key, value)| {
+                key == "toolResults" && value.as_array().is_some_and(|items| !items.is_empty())
+            }) {
+                return true;
+            }
+            map.values().any(body_contains_tool_result)
+        }
+        Value::Array(items) => items.iter().any(body_contains_tool_result),
+        _ => false,
+    }
+}
+
+fn select_fake_tool_name(value: &Value) -> String {
+    let mut names = Vec::new();
+    collect_tool_names(value, &mut names);
+    names
+        .iter()
+        .find(|name| {
+            let normalized = name.to_ascii_lowercase();
+            normalized == "bash" || normalized.starts_with("bash")
+        })
+        .or_else(|| {
+            names.iter().find(|name| {
+                let normalized = name.to_ascii_lowercase();
+                normalized == "echo" || normalized.starts_with("echo")
+            })
+        })
+        .or_else(|| {
+            names.iter().find(|name| {
+                let normalized = name.to_ascii_lowercase();
+                normalized == "ping"
+                    || normalized.starts_with("ping")
+                    || normalized.ends_with("__ping")
+                    || normalized.contains("ping")
+            })
+        })
+        .or_else(|| names.first())
+        .cloned()
+        .unwrap_or_else(|| "echo".to_string())
+}
+
+fn collect_tool_names(value: &Value, names: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(name) = map
+                .get("toolSpecification")
+                .and_then(|spec| spec.get("name"))
+                .and_then(Value::as_str)
+            {
+                names.push(name.to_string());
+            }
+            for value in map.values() {
+                collect_tool_names(value, names);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_tool_names(item, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn capture_fake_request(
+    state: &FakeServerState,
+    request_id: &str,
+    uri: &Uri,
+    headers: &HeaderMap,
+    request: &Value,
+) {
+    let Some(dir) = state.capture_dir.as_ref() else {
+        return;
+    };
+    if let Err(err) = tokio::fs::create_dir_all(dir).await {
+        tracing::warn!(path = %dir.display(), error = %err, "failed to create fake capture dir");
+        return;
+    }
+
+    let mut captured_headers = serde_json::Map::new();
+    for (name, value) in headers.iter() {
+        let key = name.as_str().to_ascii_lowercase();
+        let value = if matches!(
+            key.as_str(),
+            "authorization" | "x-api-key" | "x-amz-security-token"
+        ) {
+            "<redacted>".to_string()
+        } else {
+            value.to_str().unwrap_or("<non-utf8>").to_string()
+        };
+        captured_headers.insert(key, Value::String(value));
+    }
+
+    let capture = json!({
+        "requestId": request_id,
+        "path": uri.path(),
+        "query": uri.query(),
+        "headers": captured_headers,
+        "thinkingDetected": body_requests_thinking(request),
+        "body": request,
+    });
+    let path = dir.join(format!("{request_id}.json"));
+    match serde_json::to_vec_pretty(&capture) {
+        Ok(bytes) => {
+            if let Err(err) = tokio::fs::write(&path, bytes).await {
+                tracing::warn!(path = %path.display(), error = %err, "failed to write fake capture");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(request_id, error = %err, "failed to serialize fake capture");
+        }
+    }
+}
+
+fn body_requests_thinking(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            if map
+                .get("thinking")
+                .is_some_and(|thinking| thinking_value_enabled(thinking))
+            {
+                return true;
+            }
+            map.values().any(body_requests_thinking)
+        }
+        Value::Array(items) => items.iter().any(body_requests_thinking),
+        Value::String(text) => {
+            text.contains("<thinking_mode>enabled</thinking_mode>")
+                || text.contains("<thinking_mode>adaptive</thinking_mode>")
+        }
+        _ => false,
+    }
+}
+
+fn thinking_value_enabled(value: &Value) -> bool {
+    value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| matches!(kind, "enabled" | "adaptive"))
 }
 
 fn json_error(status: StatusCode, request_id: &str, error_type: &str, message: &str) -> Response {
@@ -962,8 +1241,32 @@ fn sse_response(request_id: String, events: Vec<(Duration, String)>) -> Response
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+fn kiro_eventstream_response(request_id: String, events: Vec<(Duration, Vec<u8>)>) -> Response {
+    let body_stream = delayed_byte_stream(events);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/vnd.amazon.eventstream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header("request-id", &request_id)
+        .header("x-amzn-requestid", &request_id)
+        .body(Body::from_stream(body_stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 fn delayed_event_stream(
     events: Vec<(Duration, String)>,
+) -> impl Stream<Item = Result<Bytes, Infallible>> {
+    stream::unfold(events.into_iter(), |mut iter| async move {
+        let (delay, event) = iter.next()?;
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
+        Some((Ok(Bytes::from(event)), iter))
+    })
+}
+
+fn delayed_byte_stream(
+    events: Vec<(Duration, Vec<u8>)>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     stream::unfold(events.into_iter(), |mut iter| async move {
         let (delay, event) = iter.next()?;
@@ -1012,6 +1315,58 @@ fn normal_sse_events(first_delay: Duration, thinking: bool) -> Vec<(Duration, St
     events
 }
 
+fn normal_kiro_events(first_delay: Duration, thinking: bool) -> Vec<(Duration, Vec<u8>)> {
+    let mut events = Vec::new();
+    if thinking {
+        events.push((
+            Duration::ZERO,
+            kiro_event_frame(
+                "reasoningContentEvent",
+                json!({"text":"thinking through the loadtest path","signature":"fake-signature"}),
+            ),
+        ));
+    }
+    events.extend([
+        (
+            first_delay,
+            kiro_event_frame("assistantResponseEvent", json!({"content":"fake response"})),
+        ),
+        (
+            Duration::ZERO,
+            kiro_event_frame(
+                "metadataEvent",
+                json!({
+                    "tokenUsage": {
+                        "uncachedInputTokens": 10,
+                        "cacheReadInputTokens": 0,
+                        "cacheWriteInputTokens": 0,
+                        "outputTokens": if thinking { 9 } else { 3 },
+                        "totalTokens": if thinking { 19 } else { 13 }
+                    }
+                }),
+            ),
+        ),
+        (
+            Duration::ZERO,
+            kiro_event_frame(
+                "messageMetadataEvent",
+                json!({
+                    "conversationId": "fake-conversation",
+                    "utteranceId": "fake-utterance",
+                    "tokenUsage": {
+                        "uncachedInputTokens": 10,
+                        "cacheReadInputTokens": 0,
+                        "cacheWriteInputTokens": 0,
+                        "outputTokens": if thinking { 9 } else { 3 },
+                        "totalTokens": if thinking { 19 } else { 13 }
+                    }
+                }),
+            ),
+        ),
+    ]);
+    events
+}
+
 fn thinking_sse_events(text_delay: Duration) -> Vec<(Duration, String)> {
     vec![
         (
@@ -1031,6 +1386,172 @@ fn thinking_sse_events(text_delay: Duration) -> Vec<(Duration, String)> {
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
         ),
     ]
+}
+
+fn thinking_kiro_events(text_delay: Duration) -> Vec<(Duration, Vec<u8>)> {
+    vec![
+        (
+            Duration::ZERO,
+            kiro_event_frame(
+                "reasoningContentEvent",
+                json!({"text":"real thinking chunk","signature":"fake-signature"}),
+            ),
+        ),
+        (
+            text_delay,
+            kiro_event_frame("assistantResponseEvent", json!({"content":"visible text"})),
+        ),
+        (
+            Duration::ZERO,
+            kiro_event_frame(
+                "metadataEvent",
+                json!({
+                    "tokenUsage": {
+                        "uncachedInputTokens": 10,
+                        "cacheReadInputTokens": 0,
+                        "cacheWriteInputTokens": 0,
+                        "outputTokens": 8,
+                        "totalTokens": 18
+                    }
+                }),
+            ),
+        ),
+    ]
+}
+
+fn tool_use_input_for(name: &str) -> Value {
+    let normalized = name.to_ascii_lowercase();
+    if normalized == "bash" || normalized.starts_with("bash") {
+        json!({"command": "echo cli tool ok"})
+    } else if normalized == "echo" || normalized.starts_with("echo") {
+        json!({"text": "cli tool ok"})
+    } else {
+        json!({})
+    }
+}
+
+fn tool_use_kiro_events(name: String) -> Vec<(Duration, Vec<u8>)> {
+    let input = tool_use_input_for(&name).to_string();
+    vec![
+        (
+            Duration::ZERO,
+            kiro_event_frame(
+                "toolUseEvent",
+                json!({
+                    "name": name,
+                    "toolUseId": "toolu_fake_1",
+                    "input": input,
+                    "stop": true
+                }),
+            ),
+        ),
+        (
+            Duration::ZERO,
+            kiro_event_frame(
+                "metadataEvent",
+                json!({
+                    "tokenUsage": {
+                        "uncachedInputTokens": 10,
+                        "cacheReadInputTokens": 0,
+                        "cacheWriteInputTokens": 0,
+                        "outputTokens": 6,
+                        "totalTokens": 16
+                    }
+                }),
+            ),
+        ),
+    ]
+}
+
+fn tool_use_sse_events(name: String) -> Vec<(Duration, String)> {
+    let input = tool_use_input_for(&name).to_string();
+    vec![
+        (
+            Duration::ZERO,
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fake\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"fake-sonnet\",\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n".to_string(),
+        ),
+        (
+            Duration::ZERO,
+            format!(
+                "event: content_block_start\ndata: {}\n\n",
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_fake_1",
+                        "name": name,
+                        "input": {}
+                    }
+                })
+            ),
+        ),
+        (
+            Duration::ZERO,
+            format!(
+                "event: content_block_delta\ndata: {}\n\n",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": input
+                    }
+                })
+            ),
+        ),
+        (
+            Duration::ZERO,
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_string(),
+        ),
+        (
+            Duration::ZERO,
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":6}}\n\n".to_string(),
+        ),
+        (
+            Duration::ZERO,
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
+        ),
+    ]
+}
+
+fn kiro_event_frame(event_type: &str, payload: Value) -> Vec<u8> {
+    let payload = serde_json::to_vec(&payload).expect("fake event payload serializes");
+    let headers = kiro_event_headers(event_type);
+    let total_length = 12usize + headers.len() + payload.len() + 4usize;
+    let header_length = headers.len();
+
+    let mut frame = Vec::with_capacity(total_length);
+    frame.extend_from_slice(&(total_length as u32).to_be_bytes());
+    frame.extend_from_slice(&(header_length as u32).to_be_bytes());
+    let prelude_crc = crc32(&frame[..8]);
+    frame.extend_from_slice(&prelude_crc.to_be_bytes());
+    frame.extend_from_slice(&headers);
+    frame.extend_from_slice(&payload);
+    let message_crc = crc32(&frame);
+    frame.extend_from_slice(&message_crc.to_be_bytes());
+    frame
+}
+
+fn kiro_event_headers(event_type: &str) -> Vec<u8> {
+    let mut headers = Vec::new();
+    push_eventstream_string_header(&mut headers, ":message-type", "event");
+    push_eventstream_string_header(&mut headers, ":event-type", event_type);
+    push_eventstream_string_header(&mut headers, ":content-type", "application/json");
+    headers
+}
+
+fn push_eventstream_string_header(headers: &mut Vec<u8>, name: &str, value: &str) {
+    headers.push(name.len() as u8);
+    headers.extend_from_slice(name.as_bytes());
+    headers.push(7);
+    headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    headers.extend_from_slice(value.as_bytes());
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    static CRC: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
+    CRC.checksum(data)
 }
 
 #[cfg(test)]
@@ -1060,6 +1581,104 @@ mod tests {
     }
 
     #[test]
+    fn fake_server_detects_native_thinking_request() {
+        let request = json!({
+            "thinking": {
+                "type": "enabled",
+                "budget_tokens": 1024
+            }
+        });
+
+        assert!(body_requests_thinking(&request));
+    }
+
+    #[test]
+    fn fake_server_detects_kiro_history_thinking_tags() {
+        let request = json!({
+            "conversationState": {
+                "history": [{
+                    "userInputMessage": {
+                        "content": "<thinking_mode>adaptive</thinking_mode><thinking_effort>high</thinking_effort>"
+                    }
+                }]
+            }
+        });
+
+        assert!(body_requests_thinking(&request));
+    }
+
+    #[test]
+    fn fake_server_detects_tool_result_and_prefers_bash_tool() {
+        let request = json!({
+            "conversationState": {
+                "currentMessage": {
+                    "userInputMessage": {
+                        "userInputMessageContext": {
+                            "tools": [
+                                {"toolSpecification": {"name": "echo"}},
+                                {"toolSpecification": {"name": "Bash"}}
+                            ],
+                            "toolResults": [{
+                                "toolUseId": "toolu_fake_1",
+                                "content": [{"text": "ok"}]
+                            }]
+                        }
+                    }
+                }
+            }
+        });
+
+        assert!(body_contains_tool_result(&request));
+        assert_eq!(select_fake_tool_name(&request), "Bash");
+    }
+
+    #[test]
+    fn fake_server_prefers_mcp_ping_over_generic_first_tool() {
+        let request = json!({
+            "conversationState": {
+                "currentMessage": {
+                    "userInputMessage": {
+                        "userInputMessageContext": {
+                            "tools": [
+                                {"toolSpecification": {"name": "mcp__kiro-local-test__fail"}},
+                                {"toolSpecification": {"name": "mcp__kiro-local-test__ping"}}
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            select_fake_tool_name(&request),
+            "mcp__kiro-local-test__ping"
+        );
+    }
+
+    #[test]
+    fn fake_server_prefers_sanitized_mcp_ping_tool_name() {
+        let request = json!({
+            "conversationState": {
+                "currentMessage": {
+                    "userInputMessage": {
+                        "userInputMessageContext": {
+                            "tools": [
+                                {"toolSpecification": {"name": "mcpKiroLocalTestFailHash29c36f63"}},
+                                {"toolSpecification": {"name": "mcpKiroLocalTestPingHash62ce4ea1"}}
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            select_fake_tool_name(&request),
+            "mcpKiroLocalTestPingHash62ce4ea1"
+        );
+    }
+
+    #[test]
     fn real_upstream_guard_requires_env() {
         unsafe {
             std::env::remove_var("KIRO_LOADTEST_ALLOW_REAL_UPSTREAM");
@@ -1074,6 +1693,14 @@ mod tests {
             "The request could not be completed. If this continues, contact the administrator with error ID: err_01abc.",
         );
         assert_eq!(id.as_deref(), Some("err_01abc"));
+    }
+
+    #[test]
+    fn sse_error_event_exposes_error_id_to_report() {
+        let id = error_id_from_sse_data(
+            r#"{"type":"error","error":{"type":"api_error","message":"The request could not be completed. If this continues, contact the administrator with error ID: req_01abc."}}"#,
+        );
+        assert_eq!(id.as_deref(), Some("req_01abc"));
     }
 
     #[test]

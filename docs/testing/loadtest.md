@@ -32,14 +32,14 @@ cargo run --bin kiro_loadtest -- \
   --report target/loadtest/smoke.json
 ```
 
-## 测本地 9022 代理
+## 测本地代理
 
-本地服务必须已经启动在 `9022`。
+优先使用隔离测试代理，例如 `19022`。只有在明确要验证日常开发服务时，才把 `base-url` 改成 `9022`。
 
 ```bash
 CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
 cargo run --bin kiro_loadtest -- \
-  --base-url http://127.0.0.1:9022 \
+  --base-url http://127.0.0.1:19022 \
   --route /cc/v1/messages \
   --model claude-sonnet-4-20250514 \
   --requests 100 \
@@ -54,7 +54,7 @@ cargo run --bin kiro_loadtest -- \
 ```bash
 CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
 cargo run --bin kiro_loadtest -- \
-  --base-url http://127.0.0.1:9022 \
+  --base-url http://127.0.0.1:19022 \
   --route /cc/v1/messages \
   --model claude-sonnet-4-20250514 \
   --requests 30 \
@@ -76,7 +76,7 @@ cargo run --bin kiro_loadtest -- \
 ```bash
 CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
 cargo run --bin kiro_loadtest -- \
-  --base-url http://127.0.0.1:9022 \
+  --base-url http://127.0.0.1:19022 \
   --route /cc/v1/messages \
   --model claude-sonnet-4-20250514 \
   --requests 30 \
@@ -94,7 +94,7 @@ cargo run --bin kiro_loadtest -- \
 ```bash
 CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
 cargo run --bin kiro_loadtest -- \
-  --base-url http://127.0.0.1:9022 \
+  --base-url http://127.0.0.1:19022 \
   --dfcache-route /dfcache/cc/v1/messages \
   --requests 20 \
   --concurrency 2 \
@@ -108,7 +108,7 @@ cargo run --bin kiro_loadtest -- \
 ```bash
 CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
 cargo run --bin kiro_loadtest -- \
-  --base-url http://127.0.0.1:9022 \
+  --base-url http://127.0.0.1:19022 \
   --dfcache-route /dfcache/not-configured/v1/messages \
   --requests 5 \
   --concurrency 1 \
@@ -153,7 +153,7 @@ KIRO_LOADTEST_ALLOW_REAL_UPSTREAM=1 \
 CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
 cargo run --bin kiro_loadtest -- \
   --real-upstream true \
-  --base-url http://127.0.0.1:9022 \
+  --base-url http://127.0.0.1:19022 \
   --route /cc/v1/messages \
   --requests 20 \
   --concurrency 2 \
@@ -183,8 +183,7 @@ cargo run --bin kiro_loadtest -- \
 ## 大并发建议
 
 - 先用 fake server 做 100 并发验证工具本身。
-- 再用本地 9022 从 `concurrency=5` 开始。
+- 再用本地隔离代理从 `concurrency=5` 开始。
 - 如果 `ttfbMs.p95` 随并发明显升高，优先降低单账号并发或缩短 dispatch wait。
 - 如果错误主要是 429，检查单账号 RPM、全局并发和排队长度。
 - 如果 `memory.peak` 持续上涨且结束后不回落，需要进一步查 stream 是否释放资源。
-

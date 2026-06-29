@@ -34,6 +34,8 @@ impl InFlightKind {
 
 #[derive(Debug, Clone, Default)]
 pub struct CredentialAuthUpdate {
+    pub access_token: Option<String>,
+    pub expires_at: Option<String>,
     pub refresh_token: Option<String>,
     pub auth_method: Option<String>,
     pub provider: Option<String>,

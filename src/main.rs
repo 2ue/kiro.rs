@@ -19,6 +19,7 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 
+use anthropic::prompt_cache::PromptCacheBounds;
 use anyhow::Context as _;
 use axum::{
     Json, Router,
@@ -419,9 +420,16 @@ async fn main() {
         config.prompt_cache_cap_jitter_max_tokens,
         config.prompt_cache_scale_min_input_tokens,
         config.prompt_cache_creation_control.normalized(),
+        PromptCacheBounds::from_config(
+            config.prompt_cache_max_entries_per_account,
+            config.prompt_cache_max_entries_global,
+            config.prompt_cache_entry_ttl_secs,
+            config.prompt_cache_estimated_bytes_limit,
+        ),
         config.reported_usage.clone(),
         config.defined_cache_routes.clone(),
         config.compat_profile,
+        config.thinking_trigger_mode,
         config.model_resolution_mode,
         config.model_mapping.clone().normalized(),
         config.expose_proxy_warnings,
@@ -431,6 +439,10 @@ async fn main() {
         config.payload_guard_safety_margin_bytes,
         config.payload_guard_trim_history,
         config.payload_guard_external_enabled,
+        config.kiro_cache_point_enabled,
+        config.kiro_cache_point_tools_only,
+        config.kiro_cache_point_record_plan,
+        config.kiro_upstream_stream_idle_timeout_secs,
         config.payload_shaping,
         Some(external_pool_manager.clone()),
     );
@@ -839,12 +851,12 @@ fn handle_credentials_command(
             if !is_multiple {
                 println!("warning: single credentials format cannot be rewritten by token refresh");
             }
-            if config.load_balancing_mode != "priority"
-                && config.load_balancing_mode != "balanced"
-                && config.load_balancing_mode != "health_balanced"
-            {
+            if !matches!(
+                config.load_balancing_mode.as_str(),
+                "priority" | "balanced" | "health_balanced" | "weighted_least_inflight"
+            ) {
                 println!(
-                    "error: invalid loadBalancingMode '{}', expected priority, balanced or health_balanced",
+                    "error: invalid loadBalancingMode '{}', expected priority, balanced, health_balanced or weighted_least_inflight",
                     config.load_balancing_mode
                 );
             }

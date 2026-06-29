@@ -15,6 +15,7 @@ use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
     CompatProfile, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
     PromptCacheCreationControlConfig, PromptCacheSimulationMode, ReportedUsageConfig,
+    ThinkingTriggerMode,
 };
 
 use super::{
@@ -25,7 +26,7 @@ use super::{
     middleware::{AppState, auth_middleware, cors_layer},
     model_capabilities::ModelCapabilitiesCatalog,
     pricing::PricingCatalog,
-    prompt_cache::PromptCacheTracker,
+    prompt_cache::{PromptCacheBounds, PromptCacheTracker},
     prompt_cache_creation_control::PromptCacheCreationController,
     usage::UsageRecorder,
 };
@@ -73,9 +74,11 @@ pub fn create_router_with_provider(
     prompt_cache_cap_jitter_max_tokens: i32,
     prompt_cache_scale_min_input_tokens: i32,
     prompt_cache_creation_control: PromptCacheCreationControlConfig,
+    prompt_cache_bounds: PromptCacheBounds,
     reported_usage: ReportedUsageConfig,
     defined_cache_routes: Vec<String>,
     compat_profile: CompatProfile,
+    thinking_trigger_mode: ThinkingTriggerMode,
     model_resolution_mode: ModelResolutionMode,
     model_mapping: ModelMappingConfig,
     expose_proxy_warnings: bool,
@@ -85,6 +88,10 @@ pub fn create_router_with_provider(
     payload_guard_safety_margin_bytes: usize,
     payload_guard_trim_history: bool,
     payload_guard_external_enabled: bool,
+    kiro_cache_point_enabled: bool,
+    kiro_cache_point_tools_only: bool,
+    kiro_cache_point_record_plan: bool,
+    kiro_upstream_stream_idle_timeout_secs: u64,
     payload_shaping: PayloadShapingConfig,
     external_pool_manager: Option<Arc<ExternalPoolManager>>,
 ) -> Router {
@@ -107,8 +114,10 @@ pub fn create_router_with_provider(
         prompt_cache_scale_min_input_tokens,
     )
     .with_prompt_cache_creation_control(prompt_cache_creation_control)
+    .with_prompt_cache_bounds(prompt_cache_bounds)
     .with_reported_usage(reported_usage)
     .with_defined_cache_routes(defined_cache_routes)
+    .with_thinking_trigger_mode(thinking_trigger_mode)
     .with_model_resolution_mode(model_resolution_mode)
     .with_model_mapping(model_mapping)
     .with_payload_guard(
@@ -118,6 +127,10 @@ pub fn create_router_with_provider(
         payload_guard_safety_margin_bytes,
         payload_guard_trim_history,
         payload_guard_external_enabled,
+        kiro_cache_point_enabled,
+        kiro_cache_point_tools_only,
+        kiro_cache_point_record_plan,
+        kiro_upstream_stream_idle_timeout_secs,
         payload_shaping,
     )
     .with_pricing_catalog(pricing_catalog)

@@ -156,6 +156,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     credentialMaxCooldownSecs: toWhole(draft.credentialMaxCooldownSecs, 1),
     credentialDispatchMaxWaitSecs: toWhole(draft.credentialDispatchMaxWaitSecs),
     kiroUpstreamResponseTimeoutSecs: toWhole(draft.kiroUpstreamResponseTimeoutSecs),
+    kiroUpstreamStreamIdleTimeoutSecs: toWhole(draft.kiroUpstreamStreamIdleTimeoutSecs),
     credentialRetryMaxAttempts: toWhole(draft.credentialRetryMaxAttempts),
     credentialInFlightLeaseMaxSecs: toWhole(draft.credentialInFlightLeaseMaxSecs),
     dispatchGlobalMaxConcurrentRequests: toWhole(draft.dispatchGlobalMaxConcurrentRequests),
@@ -172,6 +173,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     schedulerSelectionPressureWeight: Math.max(0, Number(draft.schedulerSelectionPressureWeight.toFixed(2))),
     schedulerTotalSelectionWeight: Math.max(0, Number(draft.schedulerTotalSelectionWeight.toFixed(4))),
     schedulerTopK: toWhole(draft.schedulerTopK, 1, 100),
+    selectionFailureSampleLimit: toWhole(draft.selectionFailureSampleLimit, 0, 1000),
     payloadGuardMaxBytes: toWhole(draft.payloadGuardMaxBytes),
     payloadGuardSafetyMarginBytes: toWhole(draft.payloadGuardSafetyMarginBytes),
     promptCacheTargetReadRatio: toRatio(draft.promptCacheTargetReadRatio),
@@ -180,6 +182,10 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     promptCacheCapJitterMinTokens: toWhole(draft.promptCacheCapJitterMinTokens),
     promptCacheCapJitterMaxTokens: toWhole(draft.promptCacheCapJitterMaxTokens),
     promptCacheScaleMinInputTokens: toWhole(draft.promptCacheScaleMinInputTokens),
+    promptCacheMaxEntriesPerAccount: toWhole(draft.promptCacheMaxEntriesPerAccount),
+    promptCacheMaxEntriesGlobal: toWhole(draft.promptCacheMaxEntriesGlobal),
+    promptCacheEntryTtlSecs: toWhole(draft.promptCacheEntryTtlSecs, 1),
+    promptCacheEstimatedBytesLimit: toWhole(draft.promptCacheEstimatedBytesLimit),
     highCacheThreshold: toWhole(draft.highCacheThreshold),
     promptCacheCreationControl: normalizePromptCacheCreationControl(draft.promptCacheCreationControl),
     reportedUsage: normalizeReportedUsage(draft.reportedUsage),
@@ -215,14 +221,6 @@ export function RuntimePage() {
 
   const save = () => {
     const next = normalizeConfig(draft)
-    if (next.credentialTransientCooldownSecs > next.credentialMaxCooldownSecs)
-      return toast.error('临时冷却秒数不能大于最大冷却秒数')
-    if (
-      [next.credentialRateLimitCooldownSecs, next.credentialServerErrorCooldownSecs,
-       next.credentialNetworkErrorCooldownSecs, next.credentialStreamErrorCooldownSecs,
-       next.credentialProtocolErrorCooldownSecs, next.credentialAuthErrorCooldownSecs]
-        .some((v) => v > next.credentialMaxCooldownSecs)
-    ) return toast.error('错误类型基础冷却秒数不能大于最大冷却秒数')
     if (next.promptCacheCapJitterMinTokens > next.promptCacheCapJitterMaxTokens)
       return toast.error('触顶扣减下限不能大于上限')
     if (next.payloadGuardMaxBytes > 0 && next.payloadGuardMaxBytes < 65536)
@@ -240,8 +238,15 @@ export function RuntimePage() {
   }
 
   const handleLbMode = (mode: LoadBalancingMode) => {
+    const label = mode === 'priority'
+      ? '优先级'
+      : mode === 'balanced'
+        ? '均衡负载'
+        : mode === 'health_balanced'
+          ? '健康均衡'
+          : '低负载优先'
     setLbMode.mutate(mode, {
-      onSuccess: () => toast.success(`已切换为${mode === 'priority' ? '优先级' : mode === 'balanced' ? '均衡负载' : '健康均衡'}模式`),
+      onSuccess: () => toast.success(`已切换为${label}模式`),
       onError: (e) => toast.error(`切换失败: ${extractErrorMessage(e)}`),
     })
   }
@@ -279,13 +284,14 @@ export function RuntimePage() {
             <SelectTrigger className="w-56">
               <SelectValue />
             </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="priority">优先级模式 — 高优先级账号优先</SelectItem>
-              <SelectItem value="balanced">均衡负载 — 平均分配请求</SelectItem>
-              <SelectItem value="health_balanced">健康均衡 — 综合健康度平衡</SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
+              <SelectContent>
+                <SelectItem value="priority">优先级模式 — 高优先级账号优先</SelectItem>
+                <SelectItem value="balanced">均衡负载 — 平均分配请求</SelectItem>
+                <SelectItem value="health_balanced">健康均衡 — 综合健康度平衡</SelectItem>
+                <SelectItem value="weighted_least_inflight">低负载优先 — 高并发时优先空闲账号</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
       </CollapseSection>
 
       {/* 请求容量 */}
@@ -297,6 +303,7 @@ export function RuntimePage() {
           <NumField label="最大排队请求数" desc="0 表示不限制" value={draft.dispatchMaxQueuedRequests} min={0} suffix="请求" onChange={set('dispatchMaxQueuedRequests')} />
           <NumField label="单请求最长排队等待" desc="0 表示不限制" value={draft.credentialDispatchMaxWaitSecs} min={0} suffix="秒" onChange={set('credentialDispatchMaxWaitSecs')} />
           <NumField label="开始响应等待时间" desc="0 表示使用默认超时" value={draft.kiroUpstreamResponseTimeoutSecs} min={0} suffix="秒" onChange={set('kiroUpstreamResponseTimeoutSecs')} />
+          <NumField label="流式静默超时" desc="流式响应长时间没有新内容时结束本次请求" value={draft.kiroUpstreamStreamIdleTimeoutSecs} min={0} suffix="秒" onChange={set('kiroUpstreamStreamIdleTimeoutSecs')} />
           <NumField label="单请求最大重试次数" desc="0 表示系统自动决定" value={draft.credentialRetryMaxAttempts} min={0} suffix="次" onChange={set('credentialRetryMaxAttempts')} />
           <NumField label="异常并发自动回收" desc="0 表示关闭" value={draft.credentialInFlightLeaseMaxSecs} min={0} suffix="秒" onChange={set('credentialInFlightLeaseMaxSecs')} />
         </TwoCol>
@@ -312,7 +319,7 @@ export function RuntimePage() {
           <NumField label="流式中断后暂停" desc="流式响应中途中断后的冷却" value={draft.credentialStreamErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialStreamErrorCooldownSecs')} />
           <NumField label="格式异常后暂停" desc="响应格式/协议异常后的冷却" value={draft.credentialProtocolErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialProtocolErrorCooldownSecs')} />
           <NumField label="授权异常后暂停" desc="收到 401/403 授权失败后的冷却" value={draft.credentialAuthErrorCooldownSecs} min={1} suffix="秒" onChange={set('credentialAuthErrorCooldownSecs')} />
-          <NumField label="最大冷却时长" desc="单账号冷却上限" value={draft.credentialMaxCooldownSecs} min={1} suffix="秒" onChange={set('credentialMaxCooldownSecs')} />
+          <NumField label="最大冷却时长" desc="连续出错时最多暂停多久" value={draft.credentialMaxCooldownSecs} min={1} suffix="秒" onChange={set('credentialMaxCooldownSecs')} />
           <NumField label="退避倍率" desc="连续出错时逐步延长" value={draft.credentialCooldownBackoffMultiplier} min={1} max={10} step={0.1} suffix="倍" onChange={set('credentialCooldownBackoffMultiplier')} />
           <NumField label="恢复时间错开比例" desc="防止多账号同时恢复" value={draft.credentialCooldownJitterPercent} min={0} max={100} suffix="%" onChange={set('credentialCooldownJitterPercent')} />
           <NumField label="恢复观察时间" desc="降频使用直到稳定" value={draft.credentialProbationSecs} min={0} suffix="秒" onChange={set('credentialProbationSecs')} />
@@ -331,6 +338,8 @@ export function RuntimePage() {
           <NumField label="短时集中降权" desc="避免请求集中单一账号" value={draft.schedulerSelectionPressureWeight} min={0} step={1} suffix="权重" onChange={set('schedulerSelectionPressureWeight')} />
           <NumField label="长期使用次数权重" desc="数值越大，历史调度次数多的账号越少被选中，促进均衡" value={draft.schedulerTotalSelectionWeight} min={0} step={0.001} suffix="权重" onChange={set('schedulerTotalSelectionWeight')} />
           <NumField label="候选账号数量" desc="数值越大越分散" value={draft.schedulerTopK} min={1} max={100} suffix="个" onChange={set('schedulerTopK')} />
+          <NumField label="失败诊断样本数" desc="调度失败时最多记录多少个账号样本，用于后台排查；0 表示不记录样本。" value={draft.selectionFailureSampleLimit} min={0} max={1000} suffix="个" onChange={set('selectionFailureSampleLimit')} />
+          <TogField label="记录失败样本" desc="关闭后只保留失败原因统计，不记录具体账号样本。" checked={draft.selectionFailureRecordEnabled} onChange={set('selectionFailureRecordEnabled')} />
         </TwoCol>
       </CollapseSection>
 
@@ -386,6 +395,16 @@ export function RuntimePage() {
               <NumField label="放大启用门槛" desc="" value={draft.promptCacheScaleMinInputTokens} min={0} suffix="Token" onChange={set('promptCacheScaleMinInputTokens')} />
               <NumField label="触顶扣减下限" desc="" value={draft.promptCacheCapJitterMinTokens} min={0} suffix="Token" onChange={set('promptCacheCapJitterMinTokens')} />
               <NumField label="触顶扣减上限" desc="" value={draft.promptCacheCapJitterMaxTokens} min={0} suffix="Token" onChange={set('promptCacheCapJitterMaxTokens')} />
+            </TwoCol>
+          </div>
+          <div className="border-t border-border" />
+          <div className="space-y-3">
+            <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">本地缓存边界</div>
+            <TwoCol>
+              <NumField label="单账号条目上限" desc="每个账号最多保留多少个可复用缓存指纹，防止长会话无限增长。" value={draft.promptCacheMaxEntriesPerAccount} min={0} suffix="条" onChange={set('promptCacheMaxEntriesPerAccount')} />
+              <NumField label="全局条目上限" desc="所有账号合计最多保留多少个缓存指纹，0 表示不按条目数限制。" value={draft.promptCacheMaxEntriesGlobal} min={0} suffix="条" onChange={set('promptCacheMaxEntriesGlobal')} />
+              <NumField label="最长保留时间" desc="单条缓存指纹最多保留多久；实际不会超过上游缓存标记的时间。" value={draft.promptCacheEntryTtlSecs} min={1} suffix="秒" onChange={set('promptCacheEntryTtlSecs')} />
+              <NumField label="估算内存上限" desc="达到估算上限后优先移除最久未使用的缓存指纹，0 表示不按内存估算限制。" value={draft.promptCacheEstimatedBytesLimit} min={0} suffix="字节" onChange={set('promptCacheEstimatedBytesLimit')} />
             </TwoCol>
           </div>
           <div className="border-t border-border" />
@@ -471,10 +490,32 @@ export function RuntimePage() {
                 </SelectContent>
               </Select>
             </div>
+            <div className="space-y-1.5">
+              <div className="text-sm font-semibold">思考触发</div>
+              <Select value={draft.thinkingTriggerMode} onValueChange={(v) => set('thinkingTriggerMode')(v as RuntimeConfig['thinkingTriggerMode'])}>
+                <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="real_request">按请求触发</SelectItem>
+                  <SelectItem value="always">总是触发</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                {draft.thinkingTriggerMode === 'always'
+                  ? '除非请求明确关闭，否则每次调用都会输出思考内容。'
+                  : '按 Claude Code CLI 语义触发：thinking 模型、显式参数或本轮深度思考信号才会输出思考内容。'}
+              </p>
+            </div>
           </div>
           <TwoCol>
             <TogField label="整理思考内容" desc="把响应里的思考内容单独整理出来" checked={draft.extractThinking} onChange={set('extractThinking')} />
             <TogField label="显示处理告警" desc="把排查提示返回给客户端" checked={draft.exposeProxyWarnings} onChange={set('exposeProxyWarnings')} />
+          </TwoCol>
+          <TwoCol>
+            <TogField label="发送真实 cachePoint" desc="把带缓存标记的工具发送给 Kiro 上游；上游不接受时会自动去掉后重试一次。" checked={draft.kiroCachePointEnabled} onChange={set('kiroCachePointEnabled')} />
+            <TogField label="只处理工具缓存标记" desc="只根据工具上的缓存标记插入 cachePoint，不改写系统消息或历史消息。" checked={draft.kiroCachePointToolsOnly} disabled={!draft.kiroCachePointEnabled} onChange={set('kiroCachePointToolsOnly')} />
+          </TwoCol>
+          <TwoCol>
+            <TogField label="记录 cachePoint 计划" desc="在系统日志中记录插入数量，方便排查上游请求体错误。" checked={draft.kiroCachePointRecordPlan} disabled={!draft.kiroCachePointEnabled} onChange={set('kiroCachePointRecordPlan')} />
           </TwoCol>
           <TwoCol>
             <NumField label="缓存命中判定阈值" desc="多少 Token 以上算缓存命中较高" value={draft.highCacheThreshold} min={0} suffix="Token" onChange={set('highCacheThreshold')} />

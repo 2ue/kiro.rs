@@ -6,6 +6,8 @@ export interface KamAccount {
   userId?: string | null
   nickname?: string
   credentials: {
+    accessToken?: string
+    expiresAt?: string
     refreshToken: string
     clientId?: string
     clientSecret?: string
@@ -34,6 +36,8 @@ function normalizeKamAccount(item: unknown): unknown {
       status: typeof obj.status === 'string' ? obj.status : undefined,
       machineId: typeof obj.machineId === 'string' ? obj.machineId : undefined,
       credentials: {
+        accessToken: typeof obj.accessToken === 'string' ? obj.accessToken : undefined,
+        expiresAt: typeof obj.expiresAt === 'string' ? obj.expiresAt : typeof obj.expired === 'string' ? obj.expired : undefined,
         refreshToken: obj.refreshToken,
         clientId: typeof obj.clientId === 'string' ? obj.clientId : undefined,
         clientSecret: typeof obj.clientSecret === 'string' ? obj.clientSecret : undefined,

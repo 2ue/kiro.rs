@@ -15,8 +15,8 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::model::config::{
     CompatProfile, Config, ExternalPoolsConfig, ModelMappingConfig, ModelResolutionMode,
     PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
-    PromptCacheSimulationMode, ReportedUsageConfig, normalize_defined_cache_route,
-    normalize_defined_cache_routes,
+    PromptCacheSimulationMode, ReportedUsageConfig, ThinkingTriggerMode,
+    normalize_defined_cache_route, normalize_defined_cache_routes,
 };
 use crate::token;
 use anyhow::Error;
@@ -51,8 +51,9 @@ use super::payload_guard::{
     PayloadByteBreakdown, PayloadGuardConfig, PayloadGuardError, PayloadGuardReport,
     ToolUseFormatDiagnostics, breakdown_anthropic_messages_request, breakdown_kiro_request,
     diagnose_kiro_tool_use_format, guard_anthropic_messages_request, guard_kiro_request,
+    serialize_kiro_request,
 };
-use super::prompt_cache::{PromptCacheProfile, PromptCacheScope};
+use super::prompt_cache::{PromptCacheBounds, PromptCacheProfile, PromptCacheScope};
 use super::stream::{SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, MessagesRequest, ModelsResponse, OutputConfig,
@@ -103,6 +104,7 @@ struct RequestUsageContext {
     prompt_cache_cap_jitter_max_tokens: i32,
     prompt_cache_scale_min_input_tokens: i32,
     prompt_cache_creation_control: PromptCacheCreationControlConfig,
+    prompt_cache_bounds: PromptCacheBounds,
     reported_cache_usage_policy: Option<super::cache::ReportedCacheUsagePolicy>,
     simulated_usage: Option<super::cache::CacheSimulation>,
     simulated_source: Option<UsageSource>,
@@ -186,6 +188,7 @@ struct ExternalFallbackContext {
     prompt_cache_cap_jitter_max_tokens: i32,
     prompt_cache_scale_min_input_tokens: i32,
     prompt_cache_creation_control: PromptCacheCreationControlConfig,
+    prompt_cache_bounds: PromptCacheBounds,
     model_capabilities: Arc<super::model_capabilities::ModelCapabilitiesCatalog>,
     pricing_catalog: Arc<super::pricing::PricingCatalog>,
     recorder: Arc<super::usage::UsageRecorder>,
@@ -215,6 +218,7 @@ struct CredentialErrorHint {
 #[derive(Debug, Clone)]
 struct RequestRuntimeConfig {
     extract_thinking: bool,
+    thinking_trigger_mode: ThinkingTriggerMode,
     prompt_cache_target_read_ratio: f64,
     prompt_cache_token_scale: f64,
     prompt_cache_max_simulated_input_tokens: i32,
@@ -222,6 +226,7 @@ struct RequestRuntimeConfig {
     prompt_cache_cap_jitter_max_tokens: i32,
     prompt_cache_scale_min_input_tokens: i32,
     prompt_cache_creation_control: PromptCacheCreationControlConfig,
+    prompt_cache_bounds: PromptCacheBounds,
     reported_usage: ReportedUsageConfig,
     compat_profile: CompatProfile,
     model_resolution_mode: ModelResolutionMode,
@@ -233,6 +238,10 @@ struct RequestRuntimeConfig {
     payload_guard_safety_margin_bytes: usize,
     payload_guard_trim_history: bool,
     payload_guard_external_enabled: bool,
+    kiro_cache_point_enabled: bool,
+    kiro_cache_point_tools_only: bool,
+    kiro_cache_point_record_plan: bool,
+    kiro_upstream_stream_idle_timeout_secs: u64,
     payload_shaping: PayloadShapingConfig,
 }
 
@@ -240,6 +249,7 @@ impl RequestRuntimeConfig {
     fn from_app_state(state: &AppState) -> Self {
         Self {
             extract_thinking: state.extract_thinking,
+            thinking_trigger_mode: state.thinking_trigger_mode,
             prompt_cache_target_read_ratio: state.prompt_cache_target_read_ratio,
             prompt_cache_token_scale: state.prompt_cache_token_scale,
             prompt_cache_max_simulated_input_tokens: state.prompt_cache_max_simulated_input_tokens,
@@ -247,6 +257,7 @@ impl RequestRuntimeConfig {
             prompt_cache_cap_jitter_max_tokens: state.prompt_cache_cap_jitter_max_tokens,
             prompt_cache_scale_min_input_tokens: state.prompt_cache_scale_min_input_tokens,
             prompt_cache_creation_control: state.prompt_cache_creation_control,
+            prompt_cache_bounds: state.prompt_cache_bounds,
             reported_usage: state.reported_usage.clone(),
             compat_profile: state.compat_profile,
             model_resolution_mode: state.model_resolution_mode,
@@ -258,6 +269,10 @@ impl RequestRuntimeConfig {
             payload_guard_safety_margin_bytes: state.payload_guard_safety_margin_bytes,
             payload_guard_trim_history: state.payload_guard_trim_history,
             payload_guard_external_enabled: state.payload_guard_external_enabled,
+            kiro_cache_point_enabled: state.kiro_cache_point_enabled,
+            kiro_cache_point_tools_only: state.kiro_cache_point_tools_only,
+            kiro_cache_point_record_plan: state.kiro_cache_point_record_plan,
+            kiro_upstream_stream_idle_timeout_secs: state.kiro_upstream_stream_idle_timeout_secs,
             payload_shaping: state.payload_shaping,
         }
     }
@@ -265,6 +280,7 @@ impl RequestRuntimeConfig {
     fn from_config_with_fallback(config: &Config, fallback: Self) -> Self {
         Self {
             extract_thinking: config.extract_thinking,
+            thinking_trigger_mode: config.thinking_trigger_mode,
             prompt_cache_target_read_ratio: if config.prompt_cache_target_read_ratio.is_finite() {
                 config.prompt_cache_target_read_ratio.clamp(0.0, 0.99)
             } else {
@@ -282,6 +298,12 @@ impl RequestRuntimeConfig {
             prompt_cache_cap_jitter_max_tokens: config.prompt_cache_cap_jitter_max_tokens.max(0),
             prompt_cache_scale_min_input_tokens: config.prompt_cache_scale_min_input_tokens.max(0),
             prompt_cache_creation_control: config.prompt_cache_creation_control.normalized(),
+            prompt_cache_bounds: PromptCacheBounds::from_config(
+                config.prompt_cache_max_entries_per_account,
+                config.prompt_cache_max_entries_global,
+                config.prompt_cache_entry_ttl_secs,
+                config.prompt_cache_estimated_bytes_limit,
+            ),
             reported_usage: config.reported_usage.normalized(),
             compat_profile: config.compat_profile,
             model_resolution_mode: config.model_resolution_mode,
@@ -293,6 +315,10 @@ impl RequestRuntimeConfig {
             payload_guard_safety_margin_bytes: config.payload_guard_safety_margin_bytes,
             payload_guard_trim_history: config.payload_guard_trim_history,
             payload_guard_external_enabled: config.payload_guard_external_enabled,
+            kiro_cache_point_enabled: config.kiro_cache_point_enabled,
+            kiro_cache_point_tools_only: config.kiro_cache_point_tools_only,
+            kiro_cache_point_record_plan: config.kiro_cache_point_record_plan,
+            kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
             payload_shaping: config.payload_shaping,
         }
     }
@@ -400,6 +426,54 @@ impl PayloadTooLongRetryRequest {
     }
 }
 
+#[derive(Clone)]
+struct CachePointRetryRequest {
+    request: KiroRequest,
+    endpoint: String,
+    requested_model: String,
+    upstream_model: Option<String>,
+    conversation_id: String,
+}
+
+impl CachePointRetryRequest {
+    fn new(
+        request: KiroRequest,
+        endpoint: &str,
+        requested_model: &str,
+        upstream_model: Option<&str>,
+        conversation_id: &str,
+    ) -> Option<Self> {
+        request.has_tool_cache_point_plan().then(|| Self {
+            request,
+            endpoint: endpoint.to_string(),
+            requested_model: requested_model.to_string(),
+            upstream_model: upstream_model.map(str::to_string),
+            conversation_id: conversation_id.to_string(),
+        })
+    }
+
+    fn build_retry_body(
+        self,
+        reason: &str,
+        usage_context: &mut RequestUsageContext,
+    ) -> Result<String, PayloadGuardError> {
+        let mut request = self.request;
+        let planned = request.clear_tool_cache_point_plan();
+        usage_context.attach_cache_point_retry(planned, reason);
+        let body = serialize_kiro_request(&request)?;
+        tracing::warn!(
+            request_id = %usage_context.request_id,
+            endpoint = %self.endpoint,
+            requested_model = %self.requested_model,
+            upstream_model = ?self.upstream_model,
+            conversation_id = %self.conversation_id,
+            planned_cache_points = planned,
+            "Kiro cachePoint payload was rejected; retrying once without cachePoint"
+        );
+        Ok(body)
+    }
+}
+
 fn request_runtime_config(state: &AppState, provider: &KiroProvider) -> RequestRuntimeConfig {
     RequestRuntimeConfig::from_config_with_fallback(
         &provider.runtime_config(),
@@ -457,6 +531,7 @@ fn build_external_fallback_context(
             prompt_cache_cap_jitter_max_tokens: runtime_config.prompt_cache_cap_jitter_max_tokens,
             prompt_cache_scale_min_input_tokens: runtime_config.prompt_cache_scale_min_input_tokens,
             prompt_cache_creation_control: runtime_config.prompt_cache_creation_control,
+            prompt_cache_bounds: runtime_config.prompt_cache_bounds,
             model_capabilities: state.model_capabilities.clone(),
             pricing_catalog: state.pricing_catalog.clone(),
             recorder: state.usage_recorder.clone(),
@@ -681,6 +756,7 @@ impl ExternalFallbackContext {
             prompt_cache_cap_jitter_max_tokens: self.prompt_cache_cap_jitter_max_tokens,
             prompt_cache_scale_min_input_tokens: self.prompt_cache_scale_min_input_tokens,
             prompt_cache_creation_control: self.prompt_cache_creation_control,
+            prompt_cache_bounds: self.prompt_cache_bounds,
             model_capabilities: self.model_capabilities.clone(),
             pricing_catalog: self.pricing_catalog.clone(),
             request_id,
@@ -834,7 +910,9 @@ fn classify_local_error_for_external_fallback(
         return None;
     }
     if config.fallback_on_local_capacity_exhausted
-        && (lower.contains("本地凭据调度容量暂不可用")
+        && (lower.contains("本地账号调度容量暂不可用")
+            || lower.contains("本地凭据调度容量暂不可用")
+            || lower.contains("账号调度等待队列已满")
             || lower.contains("凭据调度等待队列已满")
             || lower.contains("排队等待超时")
             || lower.contains("并发槽位已满")
@@ -860,9 +938,13 @@ fn classify_local_error_for_external_fallback(
         return Some("local_transient_exhausted".to_string());
     }
     if config.fallback_on_no_available_credentials
-        && (lower.contains("所有凭据")
+        && (lower.contains("所有账号")
+            || lower.contains("所有凭据")
+            || lower.contains("所有可用账号")
             || lower.contains("所有可用凭据")
+            || lower.contains("所有账号已用尽")
             || lower.contains("所有凭据已用尽")
+            || lower.contains("无可用账号")
             || lower.contains("无可用凭据")
             || lower.contains("quota_exhausted")
             || lower.contains("risk_control")
@@ -1182,6 +1264,14 @@ impl RequestUsageContext {
         }
     }
 
+    fn attach_cache_point_retry(&mut self, planned: usize, reason: &str) {
+        if let Some(report) = self.payload_guard_report.as_mut() {
+            report.kiro_cache_points_planned = report.kiro_cache_points_planned.max(planned);
+            report.cache_point_retry_without_cache_point = true;
+            report.cache_point_retry_reason = Some(reason.to_string());
+        }
+    }
+
     fn mark_local_rescue_after_external(
         &mut self,
         reason: impl Into<String>,
@@ -1432,8 +1522,10 @@ fn credential_display_label(id: u64, label: Option<&str>) -> String {
 }
 
 fn extract_credential_error_hint(message: &str) -> Option<CredentialErrorHint> {
-    let marker = "凭据 #";
-    let marker_start = message.rfind(marker)?;
+    let (marker, marker_start) = message
+        .rfind("账号 #")
+        .map(|pos| ("账号 #", pos))
+        .or_else(|| message.rfind("凭据 #").map(|pos| ("凭据 #", pos)))?;
     let digits_start = marker_start + marker.len();
     let digits_len = message[digits_start..]
         .chars()
@@ -1494,14 +1586,14 @@ fn log_provider_rate_limit_with_hint(message: &str, retry_after_secs: u64, error
             credential_label = %hint.display_label(),
             error = %message,
             retry_after_secs,
-            "模型请求或本地凭据调度临时不可用，返回 429"
+            "模型请求或本地账号调度临时不可用，返回 429"
         );
     } else {
         tracing::warn!(
             error_id = ?error_id,
             error = %message,
             retry_after_secs,
-            "模型请求或本地凭据调度临时不可用，返回 429"
+            "模型请求或本地账号调度临时不可用，返回 429"
         );
     }
 }
@@ -1759,10 +1851,11 @@ impl CredentialUsageContext {
         }
 
         if let Some(scope) = self.scope() {
-            self.request.prompt_cache.update(
+            self.request.prompt_cache.update_with_bounds(
                 Some(scope),
                 self.request.prompt_cache_profile.as_ref(),
                 self.request.prompt_cache_target_read_ratio,
+                self.request.prompt_cache_bounds,
             );
         }
     }
@@ -1938,6 +2031,9 @@ fn should_persist_payload_diagnostics(
     };
     report.was_modified()
         || report.still_oversized
+        || report.kiro_cache_points_planned > 0
+        || report.kiro_cache_points_inserted > 0
+        || report.cache_point_retry_without_cache_point
         || (report.max_bytes > 0 && report.final_bytes > report.max_bytes.saturating_mul(70) / 100)
 }
 
@@ -2521,6 +2617,7 @@ fn prepare_usage_context(
         prompt_cache_cap_jitter_max_tokens: runtime_config.prompt_cache_cap_jitter_max_tokens,
         prompt_cache_scale_min_input_tokens: runtime_config.prompt_cache_scale_min_input_tokens,
         prompt_cache_creation_control: runtime_config.prompt_cache_creation_control,
+        prompt_cache_bounds: runtime_config.prompt_cache_bounds,
         reported_cache_usage_policy,
         simulated_usage,
         simulated_source,
@@ -2593,10 +2690,11 @@ fn prepare_credential_usage_context(
                     .clone()
                     .unwrap_or_else(|| usage_context.model.clone()),
             });
-        let prompt_usage = usage_context.prompt_cache.compute(
+        let prompt_usage = usage_context.prompt_cache.compute_with_bounds(
             scope,
             usage_context.prompt_cache_profile.as_ref(),
             usage_context.prompt_cache_target_read_ratio,
+            usage_context.prompt_cache_bounds,
         );
         usage_context.simulated_usage =
             super::cache::CacheSimulation::from_prompt_cache_with_ratio_and_amplification(
@@ -2629,17 +2727,7 @@ fn cooldown_retry_after_secs(
     let Some(provider) = provider else {
         return fallback_secs;
     };
-    let snapshot = provider.manager_snapshot();
-    let retry_after = snapshot
-        .entries
-        .iter()
-        .filter(|entry| !entry.disabled)
-        .filter_map(|entry| {
-            (entry.cooldown_remaining_secs > 0).then_some(entry.cooldown_remaining_secs)
-        })
-        .min()
-        .unwrap_or(fallback_secs);
-    retry_after.max(1)
+    provider.cooldown_retry_after_hint_secs(fallback_secs)
 }
 
 fn map_provider_error(
@@ -2728,6 +2816,11 @@ fn map_provider_error(
 
     if err_str.contains("临时冷却")
         || err_str.contains("本地限流")
+        || err_str.contains("本地账号调度容量暂不可用")
+        || err_str.contains("本地凭据调度容量暂不可用")
+        || err_str.contains("账号调度等待队列已满")
+        || err_str.contains("凭据调度等待队列已满")
+        || err_str.contains("账号调度排队等待超时")
         || err_str.contains("凭据调度排队等待超时")
         || err_str.contains("暂不可调度")
         || err_str.contains("retry-after")
@@ -2749,11 +2842,18 @@ fn map_provider_error(
         );
     }
 
-    if err_str.contains("所有凭据均已禁用")
+    if err_str.contains("所有账号均已禁用")
+        || err_str.contains("所有凭据均已禁用")
+        || err_str.contains("所有账号均无法获取有效 Token")
+        || err_str.contains("所有凭据均无法获取有效 Token")
+        || err_str.contains("所有可用账号均因代理资源不可用")
+        || err_str.contains("所有可用凭据均因代理资源不可用")
+        || err_str.contains("所有账号已用尽")
         || err_str.contains("所有凭据已用尽")
+        || err_str.contains("没有支持当前模型的可用账号")
         || err_str.contains("没有支持当前模型的可用凭据")
     {
-        log_provider_error_with_hint(&err_str, "没有可调度凭据", error_id);
+        log_provider_error_with_hint(&err_str, "没有可调度账号", error_id);
         return public_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "api_error",
@@ -2841,6 +2941,12 @@ fn should_retry_payload_guard_after_error(
         || (retry_max_bytes > 0
             && attempted_body_bytes > retry_max_bytes
             && is_upstream_improperly_formed_error(value))
+}
+
+fn should_retry_without_cache_point_after_error(value: &str) -> bool {
+    is_upstream_tool_use_format_error(value)
+        || is_upstream_improperly_formed_error(value)
+        || is_upstream_bad_request_error(value)
 }
 
 fn attach_and_log_tool_use_format_diagnostics(
@@ -3039,6 +3145,17 @@ fn log_payload_guard_report(
 ) {
     if !report.enabled {
         return;
+    }
+    if report.kiro_cache_points_planned > 0 || report.kiro_cache_points_inserted > 0 {
+        tracing::debug!(
+            endpoint,
+            requested_model,
+            upstream_model,
+            conversation_id,
+            cache_points_planned = report.kiro_cache_points_planned,
+            cache_points_inserted = report.kiro_cache_points_inserted,
+            "Kiro cachePoint insertion plan applied"
+        );
     }
     if report.was_modified() || report.still_oversized {
         tracing::warn!(
@@ -3356,6 +3473,7 @@ async fn post_messages_inner(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+    apply_thinking_trigger_mode(&mut payload, &runtime_config);
 
     let caller_ua = headers
         .get(header::USER_AGENT)
@@ -3425,6 +3543,10 @@ async fn post_messages_inner(
         ConverterOptions {
             compat_profile: runtime_config.compat_profile,
             prompt_cache_simulation_mode: state.prompt_cache_simulation_mode,
+            kiro_cache_point_enabled: runtime_config.kiro_cache_point_enabled,
+            kiro_cache_point_tools_only: runtime_config.kiro_cache_point_tools_only,
+            kiro_cache_point_record_plan: runtime_config.kiro_cache_point_record_plan,
+            force_visible_thinking: should_force_visible_thinking(&payload, &runtime_config),
         },
         &model_resolution,
     ) {
@@ -3439,6 +3561,8 @@ async fn post_messages_inner(
     let mut kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
+        tool_cache_point_insert_after: conversion_result.tool_cache_point_insert_after.clone(),
+        cache_point_plan_recording_enabled: conversion_result.cache_point_plan_recording_enabled,
     };
     let conversation_id = kiro_request.conversation_state.conversation_id.clone();
 
@@ -3526,7 +3650,7 @@ async fn post_messages_inner(
         payload.stream,
         &payload,
         Some(model_resolution.clone()),
-        Some(conversation_id),
+        Some(conversation_id.clone()),
         prompt_cache_scope_conversation_id(state.prompt_cache_simulation_mode, &payload),
         input_tokens,
     )
@@ -3551,6 +3675,13 @@ async fn post_messages_inner(
         None
     };
     let extract_xml_thinking = runtime_config.compat_profile.allows_unsigned_thinking();
+    let cache_point_retry = CachePointRetryRequest::new(
+        kiro_request.clone(),
+        &endpoint,
+        &payload.model,
+        model_resolution.upstream_model.as_deref(),
+        &conversation_id,
+    );
 
     if payload.stream {
         // 流式响应
@@ -3572,7 +3703,9 @@ async fn post_messages_inner(
             usage_context,
             warnings_header,
             too_long_retry,
+            cache_point_retry,
             external_fallback,
+            runtime_config.kiro_upstream_stream_idle_timeout_secs,
         )
         .await
     } else {
@@ -3594,6 +3727,7 @@ async fn post_messages_inner(
             usage_context,
             warnings_header,
             too_long_retry,
+            cache_point_retry,
             external_fallback,
         )
         .await
@@ -3711,7 +3845,9 @@ async fn handle_stream_request(
     usage_context: RequestUsageContext,
     warnings_header: Option<String>,
     too_long_retry: Option<PayloadTooLongRetryRequest>,
+    cache_point_retry: Option<CachePointRetryRequest>,
     external_fallback: Option<ExternalFallbackContext>,
+    stream_idle_timeout_secs: u64,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let mut usage_context = usage_context;
@@ -3751,7 +3887,92 @@ async fn handle_stream_request(
                 model,
                 preflight_model,
             );
-            if let Some(retry) = too_long_retry.filter(|retry| {
+            let should_payload_guard_retry = too_long_retry.as_ref().is_some_and(|retry| {
+                should_retry_payload_guard_after_error(
+                    &message,
+                    request_body.len(),
+                    retry.config.max_bytes,
+                )
+            });
+            if let Some(retry) = cache_point_retry.filter(|_| {
+                !should_payload_guard_retry
+                    && should_retry_without_cache_point_after_error(&message)
+            }) {
+                retry_attempt_prefix = attempts.clone();
+                let retry_body = match retry.build_retry_body(&message, &mut usage_context) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        usage_context
+                            .attach_provider_error_credential(&provider, &message, attempts)
+                            .with_error_metadata(provider_error_metadata(&e))
+                            .record_failure(
+                                UsageRecordStatus::Error,
+                                "payload_guard_error",
+                                format!(
+                                    "cachePoint retry failed while building fallback payload: {}",
+                                    err
+                                ),
+                            );
+                        return payload_guard_error_response(err);
+                    }
+                };
+                match call_api_stream_maybe_fail_fast(
+                    &provider,
+                    &retry_body,
+                    Some(&request_id),
+                    external_fallback.as_ref(),
+                )
+                .await
+                {
+                    Ok(resp) => resp,
+                    Err(retry_error) => {
+                        let retry_message = retry_error.to_string();
+                        let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
+                        let all_attempts =
+                            merge_credential_attempts(retry_attempt_prefix.clone(), retry_attempts);
+                        log_provider_call_failure(&retry_message, Some(&usage_context.error_id));
+                        let endpoint = usage_context.endpoint.clone();
+                        attach_and_log_tool_use_format_diagnostics(
+                            &retry_message,
+                            kiro_request,
+                            &mut usage_context,
+                            &endpoint,
+                            model,
+                            preflight_model,
+                        );
+                        if let Some(outcome) = maybe_external_fallback_after_local_error_outcome(
+                            external_fallback.as_ref(),
+                            &request_id,
+                            &retry_message,
+                            all_attempts.clone(),
+                        )
+                        .await
+                        {
+                            match outcome {
+                                ExternalPoolForwardOutcome::Response(response) => return response,
+                                ExternalPoolForwardOutcome::FinalError(err) => {
+                                    return err.into_response(&request_id);
+                                }
+                            }
+                        }
+                        let error_id = usage_context.error_id.clone();
+                        usage_context
+                            .attach_provider_error_credential(
+                                &provider,
+                                &retry_message,
+                                all_attempts,
+                            )
+                            .with_error_metadata(provider_error_metadata(&retry_error))
+                            .record_failure(UsageRecordStatus::Error, "api_error", retry_message);
+                        return map_provider_error(
+                            retry_error,
+                            Some(&request_id),
+                            Some(&error_id),
+                            Some(provider.as_ref()),
+                        );
+                    }
+                }
+            } else if let Some(retry) = too_long_retry.filter(|retry| {
                 should_retry_payload_guard_after_error(
                     &message,
                     request_body.len(),
@@ -4073,7 +4294,14 @@ async fn handle_stream_request(
 
     // 创建 SSE 流
     let response_request_id = credential_usage.request.request_id.clone();
-    let stream = create_sse_stream(response, ctx, initial_events, completion, credential_usage);
+    let stream = create_sse_stream(
+        response,
+        ctx,
+        initial_events,
+        completion,
+        credential_usage,
+        stream_idle_timeout_secs,
+    );
 
     // 返回 SSE 响应
     let mut builder = envelope::sse_builder_with_id(&response_request_id);
@@ -4085,8 +4313,8 @@ async fn handle_stream_request(
 
 /// Ping 事件间隔（25秒）
 const PING_INTERVAL_SECS: u64 = 25;
-/// 上游 eventstream 读空闲超时（180秒）
-const UPSTREAM_IDLE_TIMEOUT_SECS: u64 = 180;
+/// 上游 eventstream 默认读空闲超时（180秒）
+const DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECS: u64 = 180;
 const JSON_STREAM_ERROR_SNIFF_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4352,8 +4580,10 @@ fn create_sse_stream(
     initial_events: Vec<SseEvent>,
     completion: KiroStreamCompletion,
     usage_context: CredentialUsageContext,
+    stream_idle_timeout_secs: u64,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let usage_guard = StreamUsageGuard::new(usage_context);
+    let stream_idle_timeout_secs = normalize_stream_idle_timeout_secs(stream_idle_timeout_secs);
     // 先发送初始事件
     let initial_stream = stream::iter(
         initial_events
@@ -4380,7 +4610,8 @@ fn create_sse_stream(
             completion,
             usage_guard,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
-            Instant::now() + Duration::from_secs(UPSTREAM_IDLE_TIMEOUT_SECS),
+            Instant::now() + Duration::from_secs(stream_idle_timeout_secs),
+            stream_idle_timeout_secs,
         ),
         |(
             mut body_stream,
@@ -4392,6 +4623,7 @@ fn create_sse_stream(
             usage_guard,
             mut ping_interval,
             mut idle_deadline,
+            stream_idle_timeout_secs,
         )| async move {
             if finished {
                 return None;
@@ -4410,14 +4642,14 @@ fn create_sse_stream(
                                 .context()
                                 .request
                                 .mark_first_upstream_chunk();
-                            idle_deadline = Instant::now() + Duration::from_secs(UPSTREAM_IDLE_TIMEOUT_SECS);
+                            idle_deadline = Instant::now() + Duration::from_secs(stream_idle_timeout_secs);
                             completion.touch();
 
                             let chunk = match json_sniffer.inspect(chunk) {
                                 JsonStreamSniffResult::Pass(chunk) => chunk,
                                 JsonStreamSniffResult::Pending => {
                                     let bytes: Vec<Result<Bytes, Infallible>> = Vec::new();
-                                    return Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, false, completion, usage_guard, ping_interval, idle_deadline)));
+                                    return Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, false, completion, usage_guard, ping_interval, idle_deadline, stream_idle_timeout_secs)));
                                 }
                                 JsonStreamSniffResult::Error(error) => {
                                     tracing::warn!(
@@ -4434,7 +4666,7 @@ fn create_sse_stream(
                                         UsageRecordStatus::StreamError,
                                         StreamTerminalReason::UpstreamJsonException,
                                     );
-                                    return Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline)));
+                                    return Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline, stream_idle_timeout_secs)));
                                 }
                             };
 
@@ -4468,7 +4700,7 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, false, completion, usage_guard, ping_interval, idle_deadline)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, false, completion, usage_guard, ping_interval, idle_deadline, stream_idle_timeout_secs)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
@@ -4484,7 +4716,7 @@ fn create_sse_stream(
                                 UsageRecordStatus::StreamError,
                                 StreamTerminalReason::InternalError,
                             );
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline, stream_idle_timeout_secs)))
                         }
                         None => {
                             if let Some(error) = json_sniffer.finish() {
@@ -4502,7 +4734,7 @@ fn create_sse_stream(
                                     UsageRecordStatus::StreamError,
                                     StreamTerminalReason::UpstreamJsonException,
                                 );
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline, stream_idle_timeout_secs)));
                             }
                             // 流结束，发送最终事件
                             if ctx.has_stream_error() {
@@ -4557,14 +4789,14 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline, stream_idle_timeout_secs)))
                         }
                     }
                 }
                 _ = &mut idle_sleep => {
                     tracing::error!(
                         "上游响应流超过 {} 秒未产生数据，结束流并发送错误事件",
-                        UPSTREAM_IDLE_TIMEOUT_SECS
+                        stream_idle_timeout_secs
                     );
                     completion.report_upstream_stream_failure("upstream stream idle timeout");
                     ctx.record_stream_error("api_error", "upstream stream idle timeout");
@@ -4574,13 +4806,13 @@ fn create_sse_stream(
                         UsageRecordStatus::UpstreamTimeout,
                         StreamTerminalReason::UpstreamIdleTimeout,
                     );
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, true, completion, usage_guard, ping_interval, idle_deadline, stream_idle_timeout_secs)))
                 }
                 // 发送 ping 保活
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, false, completion, usage_guard, ping_interval, idle_deadline)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, false, completion, usage_guard, ping_interval, idle_deadline, stream_idle_timeout_secs)))
                 }
             }
         },
@@ -4588,6 +4820,14 @@ fn create_sse_stream(
     .flatten();
 
     initial_stream.chain(processing_stream)
+}
+
+fn normalize_stream_idle_timeout_secs(value: u64) -> u64 {
+    if value == 0 {
+        DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECS
+    } else {
+        value
+    }
 }
 
 use super::converter::get_context_window_size;
@@ -4606,6 +4846,7 @@ async fn handle_non_stream_request(
     usage_context: RequestUsageContext,
     warnings_header: Option<String>,
     too_long_retry: Option<PayloadTooLongRetryRequest>,
+    cache_point_retry: Option<CachePointRetryRequest>,
     external_fallback: Option<ExternalFallbackContext>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
@@ -4646,7 +4887,92 @@ async fn handle_non_stream_request(
                 model,
                 preflight_model,
             );
-            if let Some(retry) = too_long_retry.filter(|retry| {
+            let should_payload_guard_retry = too_long_retry.as_ref().is_some_and(|retry| {
+                should_retry_payload_guard_after_error(
+                    &message,
+                    request_body.len(),
+                    retry.config.max_bytes,
+                )
+            });
+            if let Some(retry) = cache_point_retry.filter(|_| {
+                !should_payload_guard_retry
+                    && should_retry_without_cache_point_after_error(&message)
+            }) {
+                retry_attempt_prefix = attempts.clone();
+                let retry_body = match retry.build_retry_body(&message, &mut usage_context) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        usage_context
+                            .attach_provider_error_credential(&provider, &message, attempts)
+                            .with_error_metadata(provider_error_metadata(&e))
+                            .record_failure(
+                                UsageRecordStatus::Error,
+                                "payload_guard_error",
+                                format!(
+                                    "cachePoint retry failed while building fallback payload: {}",
+                                    err
+                                ),
+                            );
+                        return payload_guard_error_response(err);
+                    }
+                };
+                match call_api_maybe_fail_fast(
+                    &provider,
+                    &retry_body,
+                    Some(&request_id),
+                    external_fallback.as_ref(),
+                )
+                .await
+                {
+                    Ok(resp) => resp,
+                    Err(retry_error) => {
+                        let retry_message = retry_error.to_string();
+                        let retry_attempts = KiroProvider::attempts_from_error(&retry_error);
+                        let all_attempts =
+                            merge_credential_attempts(retry_attempt_prefix.clone(), retry_attempts);
+                        log_provider_call_failure(&retry_message, Some(&usage_context.error_id));
+                        let endpoint = usage_context.endpoint.clone();
+                        attach_and_log_tool_use_format_diagnostics(
+                            &retry_message,
+                            kiro_request,
+                            &mut usage_context,
+                            &endpoint,
+                            model,
+                            preflight_model,
+                        );
+                        if let Some(outcome) = maybe_external_fallback_after_local_error_outcome(
+                            external_fallback.as_ref(),
+                            &request_id,
+                            &retry_message,
+                            all_attempts.clone(),
+                        )
+                        .await
+                        {
+                            match outcome {
+                                ExternalPoolForwardOutcome::Response(response) => return response,
+                                ExternalPoolForwardOutcome::FinalError(err) => {
+                                    return err.into_response(&request_id);
+                                }
+                            }
+                        }
+                        let error_id = usage_context.error_id.clone();
+                        usage_context
+                            .attach_provider_error_credential(
+                                &provider,
+                                &retry_message,
+                                all_attempts,
+                            )
+                            .with_error_metadata(provider_error_metadata(&retry_error))
+                            .record_failure(UsageRecordStatus::Error, "api_error", retry_message);
+                        return map_provider_error(
+                            retry_error,
+                            Some(&request_id),
+                            Some(&error_id),
+                            Some(provider.as_ref()),
+                        );
+                    }
+                }
+            } else if let Some(retry) = too_long_retry.filter(|retry| {
                 should_retry_payload_guard_after_error(
                     &message,
                     request_body.len(),
@@ -5282,6 +5608,7 @@ async fn handle_non_stream_request(
 struct ThinkingModelDefaults {
     thinking_type: &'static str,
     effort: Option<&'static str>,
+    budget_tokens: i32,
 }
 
 fn claude_minor_version(model: &str, family: &str) -> Option<u32> {
@@ -5310,10 +5637,16 @@ fn thinking_model_defaults(model: &str) -> Option<ThinkingModelDefaults> {
     let is_opus = is_opus_alias || model_base.contains("opus");
     let is_sonnet = is_sonnet_alias || model_base.contains("sonnet");
 
-    let effort = if is_opus_alias
-        || claude_minor_version(&model_base, "opus").is_some_and(|minor| minor >= 7)
-    {
+    let opus_minor = claude_minor_version(&model_base, "opus");
+    let sonnet_minor = claude_minor_version(&model_base, "sonnet");
+    let adaptive = is_opus_alias
+        || is_sonnet_alias
+        || opus_minor.is_some_and(|minor| minor >= 6)
+        || sonnet_minor.is_some_and(|minor| minor >= 6);
+    let effort = if is_opus_alias || opus_minor.is_some_and(|minor| minor >= 6) {
         Some("xhigh")
+    } else if is_sonnet_alias || sonnet_minor.is_some_and(|minor| minor >= 6) {
+        Some("high")
     } else if is_opus || is_sonnet {
         Some("high")
     } else {
@@ -5321,17 +5654,19 @@ fn thinking_model_defaults(model: &str) -> Option<ThinkingModelDefaults> {
     };
 
     Some(ThinkingModelDefaults {
-        thinking_type: "enabled",
+        thinking_type: if adaptive { "adaptive" } else { "enabled" },
         effort,
+        budget_tokens: if adaptive { 0 } else { 20000 },
     })
 }
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则在调用方未显式配置时注入 thinking
 ///
 /// - 调用方已指定 `thinking` 字段：保留原值
-/// - 调用方未指定：注入 `enabled`，确保 `-thinking` 兼容模型有真实 thinking 输出
-///   - budget_tokens 固定为 20000
-/// - `output_config.effort` 仅在调用方显式传 adaptive 且未设置时按模型族填充
+/// - 调用方未指定：按模型族注入默认 thinking，确保 `-thinking` 兼容模型有真实 thinking 输出
+///   - Opus/Sonnet 4.6+ 和别名使用 `adaptive` + `output_config.effort`
+///   - 旧模型使用 `enabled` + `budget_tokens`
+/// - `output_config.effort` 在最终 thinking 类型为 adaptive 且未设置时按模型族填充
 fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let Some(defaults) = thinking_model_defaults(&payload.model) else {
         return;
@@ -5346,7 +5681,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         );
         payload.thinking = Some(Thinking {
             thinking_type: defaults.thinking_type.to_string(),
-            budget_tokens: 20000,
+            budget_tokens: defaults.budget_tokens,
         });
     } else {
         tracing::debug!(
@@ -5363,6 +5698,152 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         payload.output_config = Some(OutputConfig {
             effort: defaults.effort.unwrap_or("high").to_string(),
         });
+    }
+}
+
+fn apply_thinking_trigger_mode(
+    payload: &mut MessagesRequest,
+    runtime_config: &RequestRuntimeConfig,
+) {
+    let should_trigger = match runtime_config.thinking_trigger_mode {
+        ThinkingTriggerMode::Always => true,
+        ThinkingTriggerMode::RealRequest => {
+            request_has_claude_code_visible_thinking_signal(payload)
+        }
+    };
+    if !should_trigger {
+        return;
+    }
+
+    if payload
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.thinking_type == "disabled")
+    {
+        return;
+    }
+
+    match payload.thinking.as_mut() {
+        Some(thinking) if thinking.is_enabled() => {}
+        Some(thinking) => {
+            tracing::debug!(
+                model = %payload.model,
+                thinking_type = %thinking.thinking_type,
+                trigger_mode = ?runtime_config.thinking_trigger_mode,
+                "thinking 触发信号已匹配，改写未知 thinking 类型为 adaptive"
+            );
+            thinking.thinking_type = "adaptive".to_string();
+            thinking.budget_tokens = 0;
+        }
+        None => {
+            payload.thinking = Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 0,
+            });
+        }
+    }
+
+    if payload
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.thinking_type == "adaptive")
+        && payload.output_config.is_none()
+    {
+        payload.output_config = Some(OutputConfig {
+            effort: "high".to_string(),
+        });
+    }
+}
+
+fn request_has_claude_code_visible_thinking_signal(payload: &MessagesRequest) -> bool {
+    latest_natural_user_text(payload)
+        .as_deref()
+        .is_some_and(user_text_has_claude_code_visible_thinking_signal)
+}
+
+fn latest_natural_user_text(payload: &MessagesRequest) -> Option<String> {
+    payload
+        .messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == "user")
+        .filter_map(|message| {
+            let text = text_from_user_content(&message.content);
+            if text.trim().is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        })
+        .next()
+}
+
+fn text_from_user_content(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(text_from_user_content_block)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(_) => text_from_user_content_block(content).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn text_from_user_content_block(block: &Value) -> Option<String> {
+    let Some(object) = block.as_object() else {
+        return block.as_str().map(ToOwned::to_owned);
+    };
+    if object
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|block_type| block_type == "tool_result")
+    {
+        return None;
+    }
+    object
+        .get("text")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn user_text_has_claude_code_visible_thinking_signal(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("requesting deeper reasoning on this turn")
+        || lower.contains("reason as thoroughly as the task warrants")
+        || contains_ascii_word(&lower, "ultrathink")
+}
+
+fn contains_ascii_word(haystack: &str, needle: &str) -> bool {
+    haystack.match_indices(needle).any(|(start, _)| {
+        let before = haystack[..start].chars().next_back();
+        let after = haystack[start + needle.len()..].chars().next();
+        !before.is_some_and(is_ascii_word_char) && !after.is_some_and(is_ascii_word_char)
+    })
+}
+
+fn is_ascii_word_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'
+}
+
+fn should_force_visible_thinking(
+    payload: &MessagesRequest,
+    runtime_config: &RequestRuntimeConfig,
+) -> bool {
+    if !payload
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.is_enabled())
+    {
+        return false;
+    }
+
+    match runtime_config.thinking_trigger_mode {
+        ThinkingTriggerMode::Always => true,
+        ThinkingTriggerMode::RealRequest => {
+            request_has_claude_code_visible_thinking_signal(payload)
+        }
     }
 }
 
@@ -5460,6 +5941,7 @@ pub async fn post_messages_cc(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+    apply_thinking_trigger_mode(&mut payload, &runtime_config);
 
     let caller_ua = headers
         .get(header::USER_AGENT)
@@ -5529,6 +6011,10 @@ pub async fn post_messages_cc(
         ConverterOptions {
             compat_profile: runtime_config.compat_profile,
             prompt_cache_simulation_mode: state.prompt_cache_simulation_mode,
+            kiro_cache_point_enabled: runtime_config.kiro_cache_point_enabled,
+            kiro_cache_point_tools_only: runtime_config.kiro_cache_point_tools_only,
+            kiro_cache_point_record_plan: runtime_config.kiro_cache_point_record_plan,
+            force_visible_thinking: should_force_visible_thinking(&payload, &runtime_config),
         },
         &model_resolution,
     ) {
@@ -5543,6 +6029,8 @@ pub async fn post_messages_cc(
     let mut kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
+        tool_cache_point_insert_after: conversion_result.tool_cache_point_insert_after.clone(),
+        cache_point_plan_recording_enabled: conversion_result.cache_point_plan_recording_enabled,
     };
     let conversation_id = kiro_request.conversation_state.conversation_id.clone();
 
@@ -5630,7 +6118,7 @@ pub async fn post_messages_cc(
         payload.stream,
         &payload,
         Some(model_resolution.clone()),
-        Some(conversation_id),
+        Some(conversation_id.clone()),
         prompt_cache_scope_conversation_id(state.prompt_cache_simulation_mode, &payload),
         input_tokens,
     )
@@ -5655,6 +6143,13 @@ pub async fn post_messages_cc(
         None
     };
     let extract_xml_thinking = runtime_config.compat_profile.allows_unsigned_thinking();
+    let cache_point_retry = CachePointRetryRequest::new(
+        kiro_request.clone(),
+        "/cc/v1/messages",
+        &payload.model,
+        model_resolution.upstream_model.as_deref(),
+        &conversation_id,
+    );
 
     if payload.stream {
         // 流式响应（实时模式）
@@ -5676,7 +6171,9 @@ pub async fn post_messages_cc(
             usage_context,
             warnings_header,
             too_long_retry,
+            cache_point_retry,
             external_fallback,
+            runtime_config.kiro_upstream_stream_idle_timeout_secs,
         )
         .await
     } else {
@@ -5698,6 +6195,7 @@ pub async fn post_messages_cc(
             usage_context,
             warnings_header,
             too_long_retry,
+            cache_point_retry,
             external_fallback,
         )
         .await
@@ -5873,6 +6371,7 @@ mod tests {
     ) -> RequestRuntimeConfig {
         RequestRuntimeConfig {
             extract_thinking: true,
+            thinking_trigger_mode: ThinkingTriggerMode::RealRequest,
             prompt_cache_target_read_ratio: 0.98,
             prompt_cache_token_scale: 1.0,
             prompt_cache_max_simulated_input_tokens: 0,
@@ -5880,6 +6379,7 @@ mod tests {
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
             prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+            prompt_cache_bounds: PromptCacheBounds::default(),
             reported_usage: ReportedUsageConfig::default(),
             compat_profile: CompatProfile::ClaudeCode,
             model_resolution_mode: ModelResolutionMode::Compatible,
@@ -5891,6 +6391,10 @@ mod tests {
             payload_guard_safety_margin_bytes: 0,
             payload_guard_trim_history: true,
             payload_guard_external_enabled: true,
+            kiro_cache_point_enabled: false,
+            kiro_cache_point_tools_only: true,
+            kiro_cache_point_record_plan: true,
+            kiro_upstream_stream_idle_timeout_secs: 180,
             payload_shaping: PayloadShapingConfig::default(),
         }
     }
@@ -5974,44 +6478,76 @@ mod tests {
     }
 
     #[test]
-    fn thinking_suffix_opus_4_7_uses_enabled_by_default() {
+    fn thinking_suffix_opus_4_7_uses_adaptive_by_default() {
         let mut payload = messages_request_for_model("claude-opus-4-7-thinking");
 
         override_thinking_from_model_name(&mut payload);
 
         let thinking = payload.thinking.expect("thinking should be set");
-        assert_eq!(thinking.thinking_type, "enabled");
-        assert_eq!(thinking.budget_tokens, 20000);
-        assert!(payload.output_config.is_none());
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(
+            payload
+                .output_config
+                .expect("output_config should be filled")
+                .effort,
+            "xhigh"
+        );
     }
 
     #[test]
-    fn thinking_suffix_opus_alias_uses_enabled_by_default() {
+    fn thinking_suffix_opus_alias_uses_adaptive_by_default() {
         let mut payload = messages_request_for_model("opus-thinking");
 
         override_thinking_from_model_name(&mut payload);
 
         let thinking = payload.thinking.expect("thinking should be set");
-        assert_eq!(thinking.thinking_type, "enabled");
-        assert_eq!(thinking.budget_tokens, 20000);
-        assert!(payload.output_config.is_none());
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(
+            payload
+                .output_config
+                .expect("output_config should be filled")
+                .effort,
+            "xhigh"
+        );
     }
 
     #[test]
-    fn thinking_suffix_sonnet_4_6_uses_enabled_by_default() {
+    fn thinking_suffix_sonnet_4_6_uses_adaptive_by_default() {
         let mut payload = messages_request_for_model("claude-sonnet-4-6-thinking");
 
         override_thinking_from_model_name(&mut payload);
 
         let thinking = payload.thinking.expect("thinking should be set");
-        assert_eq!(thinking.thinking_type, "enabled");
-        assert_eq!(thinking.budget_tokens, 20000);
-        assert!(payload.output_config.is_none());
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(
+            payload
+                .output_config
+                .expect("output_config should be filled")
+                .effort,
+            "high"
+        );
     }
 
     #[test]
-    fn thinking_suffix_sonnet_alias_uses_enabled_by_default() {
+    fn thinking_suffix_sonnet_alias_uses_adaptive_by_default() {
         let mut payload = messages_request_for_model("sonnet-thinking");
+
+        override_thinking_from_model_name(&mut payload);
+
+        let thinking = payload.thinking.expect("thinking should be set");
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(
+            payload
+                .output_config
+                .expect("output_config should be filled")
+                .effort,
+            "high"
+        );
+    }
+
+    #[test]
+    fn thinking_suffix_sonnet_4_5_uses_enabled_by_default() {
+        let mut payload = messages_request_for_model("claude-sonnet-4-5-thinking");
 
         override_thinking_from_model_name(&mut payload);
 
@@ -6057,6 +6593,289 @@ mod tests {
                 .effort,
             "high"
         );
+    }
+
+    #[test]
+    fn thinking_trigger_real_request_preserves_empty_payload() {
+        let mut payload = messages_request_for_model("claude-sonnet-4-6");
+        let runtime_config =
+            runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
+
+        apply_thinking_trigger_mode(&mut payload, &runtime_config);
+
+        assert!(payload.thinking.is_none());
+        assert!(payload.output_config.is_none());
+        assert!(!should_force_visible_thinking(&payload, &runtime_config));
+    }
+
+    #[test]
+    fn thinking_trigger_real_request_uses_claude_code_ultrathink_signal() {
+        let mut payload = messages_request_for_model("claude-sonnet-4-6");
+        payload.messages[0].content = json!("ultrathink analyze this issue");
+        let runtime_config =
+            runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
+
+        apply_thinking_trigger_mode(&mut payload, &runtime_config);
+
+        let thinking = payload
+            .thinking
+            .as_ref()
+            .expect("ultrathink should inject adaptive thinking");
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.budget_tokens, 0);
+        assert_eq!(
+            payload
+                .output_config
+                .as_ref()
+                .expect("output_config should be filled")
+                .effort,
+            "high"
+        );
+        assert!(should_force_visible_thinking(&payload, &runtime_config));
+    }
+
+    #[test]
+    fn thinking_trigger_real_request_uses_claude_code_deep_reasoning_wrapper() {
+        let mut payload = messages_request_for_model("claude-sonnet-4-6");
+        payload.messages[0].content = json!(
+            r#"<system-reminder>
+The user included the keyword "ultrathink", requesting deeper reasoning on this turn. Reason as thoroughly as the task warrants.
+</system-reminder>
+
+Return a fix plan."#
+        );
+        let runtime_config =
+            runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
+
+        apply_thinking_trigger_mode(&mut payload, &runtime_config);
+
+        assert_eq!(
+            payload
+                .thinking
+                .as_ref()
+                .expect("Claude Code wrapper should inject thinking")
+                .thinking_type,
+            "adaptive"
+        );
+        assert!(should_force_visible_thinking(&payload, &runtime_config));
+    }
+
+    #[test]
+    fn thinking_trigger_real_request_does_not_treat_think_hard_as_cli_keyword() {
+        let mut payload = messages_request_for_model("claude-sonnet-4-6");
+        payload.messages[0].content = json!("think hard about this issue");
+        let runtime_config =
+            runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
+
+        apply_thinking_trigger_mode(&mut payload, &runtime_config);
+
+        assert!(payload.thinking.is_none());
+        assert!(payload.output_config.is_none());
+        assert!(!should_force_visible_thinking(&payload, &runtime_config));
+    }
+
+    #[test]
+    fn thinking_trigger_real_request_respects_explicit_disabled_over_cli_signal() {
+        let mut payload = messages_request_for_model("claude-sonnet-4-6");
+        payload.messages[0].content = json!("ultrathink analyze this issue");
+        payload.thinking = Some(Thinking {
+            thinking_type: "disabled".to_string(),
+            budget_tokens: 4096,
+        });
+        let runtime_config =
+            runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
+
+        apply_thinking_trigger_mode(&mut payload, &runtime_config);
+
+        let thinking = payload
+            .thinking
+            .as_ref()
+            .expect("disabled thinking should be preserved");
+        assert_eq!(thinking.thinking_type, "disabled");
+        assert_eq!(thinking.budget_tokens, 4096);
+        assert!(payload.output_config.is_none());
+        assert!(!should_force_visible_thinking(&payload, &runtime_config));
+    }
+
+    #[test]
+    fn thinking_trigger_real_request_ignores_old_user_signal_after_new_turn() {
+        let mut payload = messages_request_for_model("claude-sonnet-4-6");
+        payload.messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: json!("ultrathink analyze the old turn"),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: json!([{ "type": "text", "text": "done" }]),
+            },
+            Message {
+                role: "user".to_string(),
+                content: json!("new plain turn"),
+            },
+        ];
+        let runtime_config =
+            runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
+
+        apply_thinking_trigger_mode(&mut payload, &runtime_config);
+
+        assert!(payload.thinking.is_none());
+        assert!(payload.output_config.is_none());
+        assert!(!should_force_visible_thinking(&payload, &runtime_config));
+    }
+
+    #[test]
+    fn thinking_trigger_real_request_keeps_signal_across_tool_result_continuation() {
+        let mut payload = messages_request_for_model("claude-sonnet-4-6");
+        payload.messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: json!("ultrathink inspect the file then answer"),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: json!([{
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "Read",
+                    "input": {"file_path": "src/main.rs"}
+                }]),
+            },
+            Message {
+                role: "user".to_string(),
+                content: json!([{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": "file contents"
+                }]),
+            },
+        ];
+        let runtime_config =
+            runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
+
+        apply_thinking_trigger_mode(&mut payload, &runtime_config);
+
+        assert_eq!(
+            payload
+                .thinking
+                .as_ref()
+                .expect("current turn signal should survive tool-result continuation")
+                .thinking_type,
+            "adaptive"
+        );
+        assert!(should_force_visible_thinking(&payload, &runtime_config));
+    }
+
+    #[test]
+    fn thinking_trigger_always_adds_adaptive_and_effort() {
+        let mut payload = messages_request_for_model("claude-sonnet-4-6");
+        let mut runtime_config =
+            runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
+        runtime_config.thinking_trigger_mode = ThinkingTriggerMode::Always;
+
+        apply_thinking_trigger_mode(&mut payload, &runtime_config);
+
+        let thinking = payload
+            .thinking
+            .as_ref()
+            .expect("thinking should be injected");
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.budget_tokens, 0);
+        assert_eq!(
+            payload
+                .output_config
+                .as_ref()
+                .expect("output_config should be filled")
+                .effort,
+            "high"
+        );
+        assert!(should_force_visible_thinking(&payload, &runtime_config));
+    }
+
+    #[test]
+    fn thinking_trigger_always_preserves_disabled() {
+        let mut payload = messages_request_for_model("claude-sonnet-4-6");
+        payload.thinking = Some(Thinking {
+            thinking_type: "disabled".to_string(),
+            budget_tokens: 4096,
+        });
+        let mut runtime_config =
+            runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
+        runtime_config.thinking_trigger_mode = ThinkingTriggerMode::Always;
+
+        apply_thinking_trigger_mode(&mut payload, &runtime_config);
+
+        let thinking = payload
+            .thinking
+            .as_ref()
+            .expect("thinking should be preserved");
+        assert_eq!(thinking.thinking_type, "disabled");
+        assert_eq!(thinking.budget_tokens, 4096);
+        assert!(payload.output_config.is_none());
+        assert!(!should_force_visible_thinking(&payload, &runtime_config));
+    }
+
+    #[test]
+    fn thinking_trigger_always_preserves_enabled_and_output_config() {
+        let mut payload = messages_request_for_model("claude-sonnet-4-6");
+        payload.thinking = Some(Thinking {
+            thinking_type: "enabled".to_string(),
+            budget_tokens: 4096,
+        });
+        payload.output_config = Some(OutputConfig {
+            effort: "low".to_string(),
+        });
+        let mut runtime_config =
+            runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
+        runtime_config.thinking_trigger_mode = ThinkingTriggerMode::Always;
+
+        apply_thinking_trigger_mode(&mut payload, &runtime_config);
+
+        let thinking = payload
+            .thinking
+            .as_ref()
+            .expect("thinking should be preserved");
+        assert_eq!(thinking.thinking_type, "enabled");
+        assert_eq!(thinking.budget_tokens, 4096);
+        assert_eq!(
+            payload
+                .output_config
+                .as_ref()
+                .expect("output_config should be preserved")
+                .effort,
+            "low"
+        );
+        assert!(should_force_visible_thinking(&payload, &runtime_config));
+    }
+
+    #[test]
+    fn thinking_trigger_always_rewrites_unknown_type_to_adaptive() {
+        let mut payload = messages_request_for_model("claude-sonnet-4-6");
+        payload.thinking = Some(Thinking {
+            thinking_type: "mystery".to_string(),
+            budget_tokens: 4096,
+        });
+        let mut runtime_config =
+            runtime_config_for_payload_guard(PayloadGuardMode::OnTooLong, true, 460_800);
+        runtime_config.thinking_trigger_mode = ThinkingTriggerMode::Always;
+
+        apply_thinking_trigger_mode(&mut payload, &runtime_config);
+
+        let thinking = payload
+            .thinking
+            .as_ref()
+            .expect("thinking should be rewritten");
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert_eq!(thinking.budget_tokens, 0);
+        assert_eq!(
+            payload
+                .output_config
+                .as_ref()
+                .expect("output_config should be filled")
+                .effort,
+            "high"
+        );
+        assert!(should_force_visible_thinking(&payload, &runtime_config));
     }
 
     #[test]
@@ -6197,6 +7016,7 @@ mod tests {
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
             prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+            prompt_cache_bounds: PromptCacheBounds::default(),
             reported_cache_usage_policy: reported_cache_usage_policy(
                 "/cc/v1/messages",
                 PromptCacheSimulationMode::HighCache,
@@ -6275,6 +7095,7 @@ mod tests {
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 20_000,
             prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+            prompt_cache_bounds: PromptCacheBounds::default(),
             reported_cache_usage_policy: reported_cache_usage_policy(
                 "/cc/v1/messages",
                 PromptCacheSimulationMode::HighCache,
@@ -6416,6 +7237,7 @@ mod tests {
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
             prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+            prompt_cache_bounds: PromptCacheBounds::default(),
             reported_cache_usage_policy: None,
             simulated_usage: None,
             simulated_source: None,
@@ -6525,6 +7347,7 @@ mod tests {
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
             prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+            prompt_cache_bounds: PromptCacheBounds::default(),
             reported_cache_usage_policy: reported_cache_usage_policy(
                 "/v1/messages",
                 PromptCacheSimulationMode::HighCache,
@@ -6686,6 +7509,7 @@ mod tests {
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
             prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+            prompt_cache_bounds: PromptCacheBounds::default(),
             reported_cache_usage_policy: None,
             simulated_usage: None,
             simulated_source: None,
@@ -7012,6 +7836,7 @@ mod tests {
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
             prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+            prompt_cache_bounds: PromptCacheBounds::default(),
             reported_cache_usage_policy: None,
             simulated_usage: None,
             simulated_source: Some(UsageSource::LocalPromptCache),
@@ -7096,6 +7921,7 @@ mod tests {
             prompt_cache_cap_jitter_max_tokens: 0,
             prompt_cache_scale_min_input_tokens: 0,
             prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+            prompt_cache_bounds: PromptCacheBounds::default(),
             reported_cache_usage_policy: None,
             simulated_usage: Some(cache::CacheSimulation {
                 cache_creation_input_tokens: 3968,
@@ -7393,10 +8219,11 @@ mod tests {
                 conversation_id: conversation_id.clone(),
                 model: usage_context.model.clone(),
             });
-        let prompt_usage = usage_context.prompt_cache.compute(
+        let prompt_usage = usage_context.prompt_cache.compute_with_bounds(
             scope,
             usage_context.prompt_cache_profile.as_ref(),
             usage_context.prompt_cache_target_read_ratio,
+            usage_context.prompt_cache_bounds,
         );
         usage_context.simulated_usage =
             cache::CacheSimulation::from_prompt_cache_with_ratio_and_amplification(

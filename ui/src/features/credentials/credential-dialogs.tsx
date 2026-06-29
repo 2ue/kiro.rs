@@ -350,7 +350,7 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
     if (isApiKey && !form.kiroApiKey.trim()) return toast.error('请输入 Kiro API Key')
     if (!isApiKey && !form.refreshToken.trim()) return toast.error('请输入 Refresh Token')
     if (form.authMethod === 'idc' && (!form.clientId.trim() || !form.clientSecret.trim())) return toast.error('IdC 认证需要 Client ID 和 Client Secret')
-    if (form.authMethod === 'external_idp' && (!form.clientId.trim() || !form.tokenEndpoint.trim())) return toast.error('External IdP 认证需要 Client ID 和 Token Endpoint')
+    if (form.authMethod === 'external_idp' && !form.clientId.trim()) return toast.error('External IdP 认证需要 Client ID')
     const priority = Number(form.priority)
     if (!Number.isInteger(priority) || priority < 0) return toast.error('优先级必须是非负整数')
     let maxConcurrentRequests: number | undefined
@@ -738,6 +738,8 @@ export function KamImportModal({ open, onClose, onDone }: {
       try {
         const cred: AddCredentialRequest = mergeCredentialDefaults({
           authMethod: (acc.credentials.authMethod || 'social') as AddCredentialRequest['authMethod'],
+          accessToken: acc.credentials.accessToken,
+          expiresAt: acc.credentials.expiresAt,
           refreshToken: acc.credentials.refreshToken,
           clientId: acc.credentials.clientId,
           clientSecret: acc.credentials.clientSecret,

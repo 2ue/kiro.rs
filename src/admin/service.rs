@@ -1149,14 +1149,14 @@ impl AdminService {
             }
         }
 
-        Ok(KiroCredentials {
+        let mut credentials = KiroCredentials {
             id: None,
             created_at: None,
             updated_at: None,
-            access_token: None,
+            access_token: req.access_token,
             refresh_token: req.refresh_token,
             profile_arn: req.profile_arn,
-            expires_at: None,
+            expires_at: req.expires_at,
             auth_method: Some(req.auth_method),
             provider: req.provider,
             client_id: req.client_id,
@@ -1180,7 +1180,10 @@ impl AdminService {
             disabled,
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
-        })
+        };
+        credentials.canonicalize_auth_method();
+        credentials.normalize_external_idp_defaults();
+        Ok(credentials)
     }
 
     fn invalidate_all_credential_caches(&self) {
@@ -2226,6 +2229,8 @@ impl AdminService {
         let kiro_request = KiroRequest {
             conversation_state,
             profile_arn: None,
+            tool_cache_point_insert_after: Vec::new(),
+            cache_point_plan_recording_enabled: true,
         };
         let request_body = serde_json::to_string(&kiro_request)
             .map_err(|e| AdminServiceError::InternalError(format!("序列化测试请求失败: {}", e)))?;
@@ -2366,6 +2371,8 @@ impl AdminService {
 
         let reset_runtime_state = req.reset_runtime_state;
         let update = CredentialAuthUpdate {
+            access_token: req.access_token,
+            expires_at: req.expires_at,
             refresh_token: req.refresh_token,
             auth_method: req.auth_method,
             provider: req.provider,
@@ -3425,6 +3432,7 @@ impl AdminService {
             credential_max_cooldown_secs: config.credential_max_cooldown_secs,
             credential_dispatch_max_wait_secs: config.credential_dispatch_max_wait_secs,
             kiro_upstream_response_timeout_secs: config.kiro_upstream_response_timeout_secs,
+            kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
             credential_retry_max_attempts: config.credential_retry_max_attempts,
             credential_in_flight_lease_max_secs: config.credential_in_flight_lease_max_secs,
             dispatch_global_max_concurrent_requests: config.dispatch_global_max_concurrent_requests,
@@ -3441,6 +3449,8 @@ impl AdminService {
             scheduler_selection_pressure_weight: config.scheduler_selection_pressure_weight,
             scheduler_total_selection_weight: config.scheduler_total_selection_weight,
             scheduler_top_k: config.scheduler_top_k,
+            selection_failure_sample_limit: config.selection_failure_sample_limit,
+            selection_failure_record_enabled: config.selection_failure_record_enabled,
             compression_enabled: config.compression.enabled,
             whitespace_compression: config.compression.whitespace_compression,
             payload_guard_enabled: config.payload_guard_enabled,
@@ -3449,6 +3459,9 @@ impl AdminService {
             payload_guard_safety_margin_bytes: config.payload_guard_safety_margin_bytes as u64,
             payload_guard_trim_history: config.payload_guard_trim_history,
             payload_guard_external_enabled: config.payload_guard_external_enabled,
+            kiro_cache_point_enabled: config.kiro_cache_point_enabled,
+            kiro_cache_point_tools_only: config.kiro_cache_point_tools_only,
+            kiro_cache_point_record_plan: config.kiro_cache_point_record_plan,
             payload_shaping: config.payload_shaping,
             prompt_cache_target_read_ratio: config.prompt_cache_target_read_ratio,
             prompt_cache_token_scale: config.prompt_cache_token_scale,
@@ -3457,6 +3470,10 @@ impl AdminService {
             prompt_cache_cap_jitter_max_tokens: config.prompt_cache_cap_jitter_max_tokens,
             prompt_cache_scale_min_input_tokens: config.prompt_cache_scale_min_input_tokens,
             prompt_cache_creation_control: config.prompt_cache_creation_control.normalized(),
+            prompt_cache_max_entries_per_account: config.prompt_cache_max_entries_per_account,
+            prompt_cache_max_entries_global: config.prompt_cache_max_entries_global,
+            prompt_cache_entry_ttl_secs: config.prompt_cache_entry_ttl_secs,
+            prompt_cache_estimated_bytes_limit: config.prompt_cache_estimated_bytes_limit,
             reported_usage: config.reported_usage.normalized(),
             defined_cache_routes: normalize_defined_cache_routes(&config.defined_cache_routes),
             external_pools: config.external_pools.clone(),
@@ -3466,6 +3483,7 @@ impl AdminService {
             model_resolution_mode: config.model_resolution_mode,
             model_mapping: config.model_mapping.clone().normalized(),
             extract_thinking: config.extract_thinking,
+            thinking_trigger_mode: config.thinking_trigger_mode,
             expose_proxy_warnings: config.expose_proxy_warnings,
         }
     }
@@ -3482,6 +3500,9 @@ impl AdminService {
         let kiro_upstream_response_timeout_secs = req
             .kiro_upstream_response_timeout_secs
             .unwrap_or(current_config.kiro_upstream_response_timeout_secs);
+        let kiro_upstream_stream_idle_timeout_secs = req
+            .kiro_upstream_stream_idle_timeout_secs
+            .unwrap_or(current_config.kiro_upstream_stream_idle_timeout_secs);
         let credential_retry_max_attempts = req
             .credential_retry_max_attempts
             .unwrap_or(current_config.credential_retry_max_attempts);
@@ -3554,6 +3575,12 @@ impl AdminService {
         let scheduler_top_k = req
             .scheduler_top_k
             .unwrap_or(current_config.scheduler_top_k);
+        let selection_failure_sample_limit = req
+            .selection_failure_sample_limit
+            .unwrap_or(current_config.selection_failure_sample_limit);
+        let selection_failure_record_enabled = req
+            .selection_failure_record_enabled
+            .unwrap_or(current_config.selection_failure_record_enabled);
         let prompt_cache_target_read_ratio = req
             .prompt_cache_target_read_ratio
             .unwrap_or(current_config.prompt_cache_target_read_ratio);
@@ -3577,6 +3604,15 @@ impl AdminService {
         let payload_guard_external_enabled = req
             .payload_guard_external_enabled
             .unwrap_or(current_config.payload_guard_external_enabled);
+        let kiro_cache_point_enabled = req
+            .kiro_cache_point_enabled
+            .unwrap_or(current_config.kiro_cache_point_enabled);
+        let kiro_cache_point_tools_only = req
+            .kiro_cache_point_tools_only
+            .unwrap_or(current_config.kiro_cache_point_tools_only);
+        let kiro_cache_point_record_plan = req
+            .kiro_cache_point_record_plan
+            .unwrap_or(current_config.kiro_cache_point_record_plan);
         let payload_shaping = req
             .payload_shaping
             .map(|patch| patch.apply_to(current_config.payload_shaping))
@@ -3600,6 +3636,18 @@ impl AdminService {
             .prompt_cache_creation_control
             .unwrap_or(current_config.prompt_cache_creation_control)
             .normalized();
+        let prompt_cache_max_entries_per_account = req
+            .prompt_cache_max_entries_per_account
+            .unwrap_or(current_config.prompt_cache_max_entries_per_account);
+        let prompt_cache_max_entries_global = req
+            .prompt_cache_max_entries_global
+            .unwrap_or(current_config.prompt_cache_max_entries_global);
+        let prompt_cache_entry_ttl_secs = req
+            .prompt_cache_entry_ttl_secs
+            .unwrap_or(current_config.prompt_cache_entry_ttl_secs);
+        let prompt_cache_estimated_bytes_limit = req
+            .prompt_cache_estimated_bytes_limit
+            .unwrap_or(current_config.prompt_cache_estimated_bytes_limit);
         let reported_usage = req
             .reported_usage
             .clone()
@@ -3644,35 +3692,25 @@ impl AdminService {
         let extract_thinking = req
             .extract_thinking
             .unwrap_or(current_config.extract_thinking);
+        let thinking_trigger_mode = req
+            .thinking_trigger_mode
+            .unwrap_or(current_config.thinking_trigger_mode);
         let expose_proxy_warnings = req
             .expose_proxy_warnings
             .unwrap_or(current_config.expose_proxy_warnings);
 
-        if req.credential_max_cooldown_secs == 0 {
-            return Err(AdminServiceError::InvalidCredential(
-                "credentialMaxCooldownSecs 必须大于 0".to_string(),
-            ));
-        }
-        if req.credential_transient_cooldown_secs > req.credential_max_cooldown_secs {
-            return Err(AdminServiceError::InvalidCredential(
-                "credentialTransientCooldownSecs 不能大于 credentialMaxCooldownSecs".to_string(),
-            ));
-        }
-        if [
-            credential_rate_limit_cooldown_secs,
-            credential_server_error_cooldown_secs,
-            credential_network_error_cooldown_secs,
-            credential_stream_error_cooldown_secs,
-            credential_protocol_error_cooldown_secs,
-            credential_auth_error_cooldown_secs,
-        ]
-        .into_iter()
-        .any(|value| value == 0 || value > req.credential_max_cooldown_secs)
-        {
-            return Err(AdminServiceError::InvalidCredential(
-                "各错误类型基础冷却秒数必须大于 0 且不能大于 credentialMaxCooldownSecs".to_string(),
-            ));
-        }
+        validate_runtime_cooldown_settings(
+            req.credential_transient_cooldown_secs,
+            req.credential_max_cooldown_secs,
+            &[
+                credential_rate_limit_cooldown_secs,
+                credential_server_error_cooldown_secs,
+                credential_network_error_cooldown_secs,
+                credential_stream_error_cooldown_secs,
+                credential_protocol_error_cooldown_secs,
+                credential_auth_error_cooldown_secs,
+            ],
+        )?;
         if !credential_cooldown_backoff_multiplier.is_finite()
             || !(1.0..=10.0).contains(&credential_cooldown_backoff_multiplier)
         {
@@ -3693,6 +3731,11 @@ impl AdminService {
         if kiro_upstream_response_timeout_secs > 86_400 {
             return Err(AdminServiceError::InvalidCredential(
                 "kiroUpstreamResponseTimeoutSecs 不能大于 86400".to_string(),
+            ));
+        }
+        if kiro_upstream_stream_idle_timeout_secs > 86_400 {
+            return Err(AdminServiceError::InvalidCredential(
+                "kiroUpstreamStreamIdleTimeoutSecs 不能大于 86400".to_string(),
             ));
         }
         if !scheduler_error_ewma_alpha.is_finite()
@@ -3721,6 +3764,11 @@ impl AdminService {
         if scheduler_top_k == 0 || scheduler_top_k > 100 {
             return Err(AdminServiceError::InvalidCredential(
                 "schedulerTopK 必须在 1 到 100 之间".to_string(),
+            ));
+        }
+        if selection_failure_sample_limit > 1000 {
+            return Err(AdminServiceError::InvalidCredential(
+                "selectionFailureSampleLimit 不能大于 1000".to_string(),
             ));
         }
         if warmup_selection_percent > 100 {
@@ -3789,6 +3837,18 @@ impl AdminService {
         prompt_cache_creation_control
             .validate()
             .map_err(AdminServiceError::InvalidCredential)?;
+        if prompt_cache_max_entries_global > 0
+            && prompt_cache_max_entries_per_account > prompt_cache_max_entries_global
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "promptCacheMaxEntriesPerAccount 不能大于 promptCacheMaxEntriesGlobal".to_string(),
+            ));
+        }
+        if prompt_cache_entry_ttl_secs == 0 {
+            return Err(AdminServiceError::InvalidCredential(
+                "promptCacheEntryTtlSecs 必须大于 0".to_string(),
+            ));
+        }
         validate_external_pools_config(&external_pools)
             .map_err(AdminServiceError::InvalidCredential)?;
         if high_cache_threshold < 0 {
@@ -3822,6 +3882,8 @@ impl AdminService {
                 config.credential_max_cooldown_secs = req.credential_max_cooldown_secs;
                 config.credential_dispatch_max_wait_secs = credential_dispatch_max_wait_secs;
                 config.kiro_upstream_response_timeout_secs = kiro_upstream_response_timeout_secs;
+                config.kiro_upstream_stream_idle_timeout_secs =
+                    kiro_upstream_stream_idle_timeout_secs;
                 config.credential_retry_max_attempts = credential_retry_max_attempts;
                 config.credential_in_flight_lease_max_secs = credential_in_flight_lease_max_secs;
                 config.dispatch_global_max_concurrent_requests =
@@ -3839,6 +3901,8 @@ impl AdminService {
                 config.scheduler_selection_pressure_weight = scheduler_selection_pressure_weight;
                 config.scheduler_total_selection_weight = scheduler_total_selection_weight;
                 config.scheduler_top_k = scheduler_top_k;
+                config.selection_failure_sample_limit = selection_failure_sample_limit;
+                config.selection_failure_record_enabled = selection_failure_record_enabled;
                 config.compression = compression.clone();
                 config.payload_guard_enabled = payload_guard_enabled;
                 config.payload_guard_mode = payload_guard_mode;
@@ -3846,6 +3910,9 @@ impl AdminService {
                 config.payload_guard_safety_margin_bytes = payload_guard_safety_margin_bytes;
                 config.payload_guard_trim_history = payload_guard_trim_history;
                 config.payload_guard_external_enabled = payload_guard_external_enabled;
+                config.kiro_cache_point_enabled = kiro_cache_point_enabled;
+                config.kiro_cache_point_tools_only = kiro_cache_point_tools_only;
+                config.kiro_cache_point_record_plan = kiro_cache_point_record_plan;
                 config.payload_shaping = payload_shaping;
                 config.prompt_cache_target_read_ratio = prompt_cache_target_read_ratio;
                 config.prompt_cache_token_scale = prompt_cache_token_scale;
@@ -3855,6 +3922,10 @@ impl AdminService {
                 config.prompt_cache_cap_jitter_max_tokens = prompt_cache_cap_jitter_max_tokens;
                 config.prompt_cache_scale_min_input_tokens = prompt_cache_scale_min_input_tokens;
                 config.prompt_cache_creation_control = prompt_cache_creation_control;
+                config.prompt_cache_max_entries_per_account = prompt_cache_max_entries_per_account;
+                config.prompt_cache_max_entries_global = prompt_cache_max_entries_global;
+                config.prompt_cache_entry_ttl_secs = prompt_cache_entry_ttl_secs;
+                config.prompt_cache_estimated_bytes_limit = prompt_cache_estimated_bytes_limit;
                 config.reported_usage = reported_usage;
                 config.defined_cache_routes = defined_cache_routes;
                 config.external_pools = external_pools;
@@ -3864,6 +3935,7 @@ impl AdminService {
                 config.model_resolution_mode = model_resolution_mode;
                 config.model_mapping = model_mapping;
                 config.extract_thinking = extract_thinking;
+                config.thinking_trigger_mode = thinking_trigger_mode;
                 config.expose_proxy_warnings = expose_proxy_warnings;
             })
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
@@ -3932,9 +4004,13 @@ impl AdminService {
         req: SetLoadBalancingModeRequest,
     ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
         // 验证模式值
-        if req.mode != "priority" && req.mode != "balanced" && req.mode != "health_balanced" {
+        if !matches!(
+            req.mode.as_str(),
+            "priority" | "balanced" | "health_balanced" | "weighted_least_inflight"
+        ) {
             return Err(AdminServiceError::InvalidCredential(
-                "mode 必须是 'priority'、'balanced' 或 'health_balanced'".to_string(),
+                "mode 必须是 'priority'、'balanced'、'health_balanced' 或 'weighted_least_inflight'"
+                    .to_string(),
             ));
         }
 
@@ -3996,6 +4072,9 @@ impl AdminService {
         if msg.contains("API Key 凭据不支持刷新") {
             return AdminServiceError::InvalidCredential(msg);
         }
+        if msg.contains("refreshToken 已失效") || msg.contains("invalid_grant") {
+            return AdminServiceError::InvalidCredential(msg);
+        }
 
         // 3. 上游服务错误特征：HTTP 响应错误或网络错误
         let is_upstream_error =
@@ -4047,6 +4126,8 @@ impl AdminService {
             || msg.contains("kiroApiKey 为空")
             || msg.contains("代理资源不存在")
             || msg.contains("代理资源不存在或已禁用")
+            || msg.contains("refreshToken 已失效")
+            || msg.contains("invalid_grant")
             || msg.contains("凭证已过期或无效")
             || msg.contains("权限不足")
             || msg.contains("已被限流");
@@ -4302,6 +4383,29 @@ fn proxy_test_preview(body: &str) -> Option<String> {
         .take(PROXY_TEST_PREVIEW_CHARS)
         .collect::<String>();
     (!preview.is_empty()).then_some(preview)
+}
+
+fn validate_runtime_cooldown_settings(
+    transient_cooldown_secs: u64,
+    max_cooldown_secs: u64,
+    typed_cooldown_secs: &[u64],
+) -> Result<(), AdminServiceError> {
+    if max_cooldown_secs == 0 {
+        return Err(AdminServiceError::InvalidCredential(
+            "credentialMaxCooldownSecs 必须大于 0".to_string(),
+        ));
+    }
+    if transient_cooldown_secs == 0 {
+        return Err(AdminServiceError::InvalidCredential(
+            "credentialTransientCooldownSecs 必须大于 0".to_string(),
+        ));
+    }
+    if typed_cooldown_secs.iter().any(|value| *value == 0) {
+        return Err(AdminServiceError::InvalidCredential(
+            "各错误类型基础冷却秒数必须大于 0".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_external_pools_config(config: &ExternalPoolsConfig) -> Result<(), String> {
@@ -5595,6 +5699,28 @@ mod tests {
             max_batches: None,
             pause_ms_between_batches: None,
         }
+    }
+
+    #[test]
+    fn runtime_cooldown_validation_allows_base_values_above_max_cap() {
+        validate_runtime_cooldown_settings(10, 2, &[30, 5, 10, 60])
+            .expect("max cooldown is an upper cap applied at runtime");
+    }
+
+    #[test]
+    fn runtime_cooldown_validation_rejects_zero_values() {
+        assert!(matches!(
+            validate_runtime_cooldown_settings(0, 2, &[1]),
+            Err(AdminServiceError::InvalidCredential(_))
+        ));
+        assert!(matches!(
+            validate_runtime_cooldown_settings(1, 0, &[1]),
+            Err(AdminServiceError::InvalidCredential(_))
+        ));
+        assert!(matches!(
+            validate_runtime_cooldown_settings(1, 2, &[1, 0]),
+            Err(AdminServiceError::InvalidCredential(_))
+        ));
     }
 
     #[test]

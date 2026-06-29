@@ -1,9 +1,9 @@
 use chrono::Utc;
 use parking_lot::Mutex;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration as StdDuration, Instant};
 
 use crate::model::config::Config;
 use crate::storage::postgres::PostgresStore;
@@ -29,6 +29,21 @@ fn instant_from_elapsed_epoch_ms(target_ms: i64, now_ms: i64, now: Instant) -> I
         ))
         .unwrap_or(now)
     }
+}
+
+fn redis_in_flight_lease_is_fresh(
+    last_seen_at_ms: i64,
+    now_ms: i64,
+    max_age: Option<StdDuration>,
+) -> bool {
+    let Some(max_age) = max_age else {
+        return true;
+    };
+    if last_seen_at_ms >= now_ms {
+        return true;
+    }
+    let idle_ms = (now_ms - last_seen_at_ms) as u128;
+    idle_ms <= max_age.as_millis()
 }
 
 fn runtime_event_payload(kind: &str, version: Option<i64>, reason: &str) -> String {
@@ -89,6 +104,7 @@ fn apply_scheduler_state_to_entry(
     entry: &mut CredentialEntry,
     state: SchedulerCredentialState,
     global_rpm: u32,
+    in_flight_max_age: Option<StdDuration>,
     now_ms: i64,
     now: Instant,
 ) {
@@ -128,17 +144,31 @@ fn apply_scheduler_state_to_entry(
         } else {
             None
         };
-    entry.in_flight_leases = state
+    let previous_local_leases = std::mem::take(&mut entry.in_flight_leases);
+    let mut seen_lease_ids = HashSet::new();
+    let mut merged_in_flight_leases: Vec<InFlightLease> = state
         .in_flight_leases
         .into_iter()
-        .map(|lease| InFlightLease {
-            id: lease.id,
-            acquired_at: instant_from_elapsed_epoch_ms(lease.acquired_at_ms, now_ms, now),
-            last_seen_at: instant_from_elapsed_epoch_ms(lease.last_seen_at_ms, now_ms, now),
-            kind: InFlightKind::from_str(&lease.kind),
+        .filter(|lease| {
+            redis_in_flight_lease_is_fresh(lease.last_seen_at_ms, now_ms, in_flight_max_age)
+        })
+        .map(|lease| {
+            seen_lease_ids.insert(lease.id);
+            InFlightLease {
+                id: lease.id,
+                acquired_at: instant_from_elapsed_epoch_ms(lease.acquired_at_ms, now_ms, now),
+                last_seen_at: instant_from_elapsed_epoch_ms(lease.last_seen_at_ms, now_ms, now),
+                kind: InFlightKind::from_str(&lease.kind),
+            }
         })
         .collect();
-    entry.in_flight_requests = entry.in_flight_leases.len() as u32;
+    for lease in previous_local_leases {
+        if seen_lease_ids.insert(lease.id) {
+            merged_in_flight_leases.push(lease);
+        }
+    }
+    entry.in_flight_requests = merged_in_flight_leases.len() as u32;
+    entry.in_flight_leases = merged_in_flight_leases;
     entry.health = state.health;
 }
 
@@ -147,13 +177,21 @@ pub(super) fn apply_scheduler_states(
     config: &Mutex<Config>,
     states: HashMap<u64, SchedulerCredentialState>,
 ) {
-    let global_rpm = config.lock().credential_rpm.unwrap_or(0);
-    apply_scheduler_states_with_global_rpm(entries, global_rpm, states);
+    let (global_rpm, in_flight_max_age) = {
+        let config = config.lock();
+        (
+            config.credential_rpm.unwrap_or(0),
+            (config.credential_in_flight_lease_max_secs > 0)
+                .then(|| StdDuration::from_secs(config.credential_in_flight_lease_max_secs)),
+        )
+    };
+    apply_scheduler_states_with_global_rpm(entries, global_rpm, in_flight_max_age, states);
 }
 
 pub(super) fn apply_scheduler_states_with_global_rpm(
     entries: &Mutex<Vec<CredentialEntry>>,
     global_rpm: u32,
+    in_flight_max_age: Option<StdDuration>,
     states: HashMap<u64, SchedulerCredentialState>,
 ) {
     let now_ms = Utc::now().timestamp_millis();
@@ -161,7 +199,7 @@ pub(super) fn apply_scheduler_states_with_global_rpm(
     let mut entries = entries.lock();
     for entry in entries.iter_mut() {
         let state = states.get(&entry.id).cloned().unwrap_or_default();
-        apply_scheduler_state_to_entry(entry, state, global_rpm, now_ms, now);
+        apply_scheduler_state_to_entry(entry, state, global_rpm, in_flight_max_age, now_ms, now);
     }
 }
 
@@ -175,11 +213,25 @@ pub(super) fn apply_scheduler_states_for_ids(
     }
     let now_ms = Utc::now().timestamp_millis();
     let now = Instant::now();
-    let global_rpm = config.lock().credential_rpm.unwrap_or(0);
+    let (global_rpm, in_flight_max_age) = {
+        let config = config.lock();
+        (
+            config.credential_rpm.unwrap_or(0),
+            (config.credential_in_flight_lease_max_secs > 0)
+                .then(|| StdDuration::from_secs(config.credential_in_flight_lease_max_secs)),
+        )
+    };
     let mut entries = entries.lock();
     for entry in entries.iter_mut() {
         if let Some(state) = states.get(&entry.id).cloned() {
-            apply_scheduler_state_to_entry(entry, state, global_rpm, now_ms, now);
+            apply_scheduler_state_to_entry(
+                entry,
+                state,
+                global_rpm,
+                in_flight_max_age,
+                now_ms,
+                now,
+            );
         }
     }
 }

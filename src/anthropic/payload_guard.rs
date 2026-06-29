@@ -137,6 +137,14 @@ pub struct PayloadGuardReport {
     pub truncated_current_user_content_chars: usize,
     pub dropped_current_images: usize,
     pub dropped_current_image_bytes: usize,
+    #[serde(default)]
+    pub kiro_cache_points_planned: usize,
+    #[serde(default)]
+    pub kiro_cache_points_inserted: usize,
+    #[serde(default)]
+    pub cache_point_retry_without_cache_point: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_point_retry_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -179,6 +187,10 @@ impl PayloadGuardReport {
             truncated_current_user_content_chars: 0,
             dropped_current_images: 0,
             dropped_current_image_bytes: 0,
+            kiro_cache_points_planned: 0,
+            kiro_cache_points_inserted: 0,
+            cache_point_retry_without_cache_point: false,
+            cache_point_retry_reason: None,
             body_sha256: None,
             tool_use_format_diagnostics: None,
             still_oversized: false,
@@ -359,6 +371,7 @@ pub fn guard_kiro_request(
 
     if !config.enabled {
         let mut report = PayloadGuardReport::disabled(original_bytes, original_history_entries);
+        set_cache_point_report_fields(&mut report, request);
         report.body_sha256 = Some(sha256_hex(&original_body));
         return Ok((original_body, report));
     }
@@ -397,6 +410,10 @@ pub fn guard_kiro_request(
         truncated_current_user_content_chars: 0,
         dropped_current_images: 0,
         dropped_current_image_bytes: 0,
+        kiro_cache_points_planned: 0,
+        kiro_cache_points_inserted: 0,
+        cache_point_retry_without_cache_point: false,
+        cache_point_retry_reason: None,
         body_sha256: None,
         tool_use_format_diagnostics: None,
         still_oversized: false,
@@ -510,6 +527,7 @@ pub fn guard_kiro_request(
     report.final_history_entries = request.conversation_state.history.len();
     report.final_bytes = body.len();
     report.still_oversized = size_limit_enabled && report.final_bytes > config.max_bytes;
+    set_cache_point_report_fields(&mut report, request);
     report.body_sha256 = Some(sha256_hex(&body));
 
     log_payload_guard_timing(
@@ -1006,6 +1024,10 @@ fn new_payload_guard_report(
         truncated_current_user_content_chars: 0,
         dropped_current_images: 0,
         dropped_current_image_bytes: 0,
+        kiro_cache_points_planned: 0,
+        kiro_cache_points_inserted: 0,
+        cache_point_retry_without_cache_point: false,
+        cache_point_retry_reason: None,
         body_sha256: None,
         tool_use_format_diagnostics: None,
         still_oversized: false,
@@ -1018,12 +1040,88 @@ fn sha256_hex(value: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+pub fn serialize_kiro_request(request: &KiroRequest) -> Result<String, PayloadGuardError> {
+    serialize_request(request)
+}
+
 fn serialize_request(request: &KiroRequest) -> Result<String, PayloadGuardError> {
-    serde_json::to_string(request).map_err(|err| PayloadGuardError::Serialize(err.to_string()))
+    if request.tool_cache_point_insert_after.is_empty() {
+        return serde_json::to_string(request)
+            .map_err(|err| PayloadGuardError::Serialize(err.to_string()));
+    }
+
+    let mut value = serde_json::to_value(request)
+        .map_err(|err| PayloadGuardError::Serialize(err.to_string()))?;
+    insert_tool_cache_points(&mut value, &request.tool_cache_point_insert_after);
+    serde_json::to_string(&value).map_err(|err| PayloadGuardError::Serialize(err.to_string()))
 }
 
 fn serialize_anthropic_request(request: &MessagesRequest) -> Result<String, PayloadGuardError> {
     serde_json::to_string(request).map_err(|err| PayloadGuardError::Serialize(err.to_string()))
+}
+
+fn set_cache_point_report_fields(report: &mut PayloadGuardReport, request: &KiroRequest) {
+    if !request.cache_point_plan_recording_enabled {
+        return;
+    }
+    report.kiro_cache_points_planned = request.tool_cache_point_insert_after.len();
+    report.kiro_cache_points_inserted =
+        valid_tool_cache_point_insertions(request, &request.tool_cache_point_insert_after);
+}
+
+fn valid_tool_cache_point_insertions(request: &KiroRequest, plan: &[usize]) -> usize {
+    if plan.is_empty() {
+        return 0;
+    }
+    let tool_count = request
+        .conversation_state
+        .current_message
+        .user_input_message
+        .user_input_message_context
+        .tools
+        .len();
+    let mut indices = plan
+        .iter()
+        .copied()
+        .filter(|idx| *idx < tool_count)
+        .collect::<Vec<_>>();
+    indices.sort_unstable();
+    indices.dedup();
+    indices.len()
+}
+
+fn insert_tool_cache_points(value: &mut Value, plan: &[usize]) -> usize {
+    if plan.is_empty() {
+        return 0;
+    }
+    let Some(tools) = value
+        .pointer_mut(
+            "/conversationState/currentMessage/userInputMessage/userInputMessageContext/tools",
+        )
+        .and_then(Value::as_array_mut)
+    else {
+        return 0;
+    };
+
+    let mut indices = plan
+        .iter()
+        .copied()
+        .filter(|idx| *idx < tools.len())
+        .collect::<Vec<_>>();
+    indices.sort_unstable();
+    indices.dedup();
+    let inserted = indices.len();
+    for idx in indices.into_iter().rev() {
+        tools.insert(
+            idx + 1,
+            serde_json::json!({
+                "cachePoint": {
+                    "type": "default"
+                }
+            }),
+        );
+    }
+    inserted
 }
 
 #[derive(Default)]
@@ -3717,6 +3815,8 @@ mod tests {
                 )))
                 .with_history(history),
             profile_arn: None,
+            tool_cache_point_insert_after: Vec::new(),
+            cache_point_plan_recording_enabled: true,
         }
     }
 
@@ -4182,6 +4282,8 @@ mod tests {
                 CurrentMessage::new(UserInputMessage::new("x".repeat(10_000), TEST_MODEL)),
             ),
             profile_arn: None,
+            tool_cache_point_insert_after: Vec::new(),
+            cache_point_plan_recording_enabled: true,
         };
 
         let (body, report) = guard_kiro_request(&mut request, guard_config(1_000))
@@ -4293,6 +4395,8 @@ mod tests {
                 ])
                 .with_current_message(CurrentMessage::new(current)),
             profile_arn: None,
+            tool_cache_point_insert_after: Vec::new(),
+            cache_point_plan_recording_enabled: true,
         };
 
         let diagnostics = diagnose_kiro_tool_use_format(&request);
@@ -4348,6 +4452,10 @@ mod tests {
             truncated_current_user_content_chars: 10,
             dropped_current_images: 1,
             dropped_current_image_bytes: 10,
+            kiro_cache_points_planned: 0,
+            kiro_cache_points_inserted: 0,
+            cache_point_retry_without_cache_point: false,
+            cache_point_retry_reason: None,
             body_sha256: None,
             tool_use_format_diagnostics: None,
             still_oversized: false,
@@ -4383,6 +4491,62 @@ mod tests {
             json_len(&value),
             serde_json::to_string(&value).unwrap().len()
         );
+    }
+
+    #[test]
+    fn cache_point_plan_inserts_markers_in_serialized_kiro_body() {
+        let mut current = UserInputMessage::new("current", TEST_MODEL);
+        current.user_input_message_context = UserInputMessageContext::new().with_tools(vec![
+            Tool {
+                tool_specification: ToolSpecification {
+                    name: "read".to_string(),
+                    description: "read".to_string(),
+                    input_schema: InputSchema::default(),
+                },
+            },
+            Tool {
+                tool_specification: ToolSpecification {
+                    name: "write".to_string(),
+                    description: "write".to_string(),
+                    input_schema: InputSchema::default(),
+                },
+            },
+        ]);
+        let mut request = KiroRequest {
+            conversation_state: ConversationState::new("conv-test")
+                .with_current_message(CurrentMessage::new(current)),
+            profile_arn: None,
+            tool_cache_point_insert_after: vec![0, 1, 1, 99],
+            cache_point_plan_recording_enabled: true,
+        };
+
+        let (body, report) =
+            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+        let value: Value = serde_json::from_str(&body).expect("body json");
+        let tools = value
+            .pointer(
+                "/conversationState/currentMessage/userInputMessage/userInputMessageContext/tools",
+            )
+            .and_then(Value::as_array)
+            .expect("tools array");
+
+        assert_eq!(tools.len(), 4);
+        assert!(tools[0].get("toolSpecification").is_some());
+        assert_eq!(tools[1]["cachePoint"]["type"], "default");
+        assert!(tools[2].get("toolSpecification").is_some());
+        assert_eq!(tools[3]["cachePoint"]["type"], "default");
+        assert_eq!(report.kiro_cache_points_planned, 4);
+        assert_eq!(report.kiro_cache_points_inserted, 2);
+    }
+
+    #[test]
+    fn cache_point_plan_is_not_serialized_by_plain_serde_json() {
+        let mut request = request_with_history(Vec::new());
+        request.tool_cache_point_insert_after = vec![0];
+        let body = serde_json::to_string(&request).expect("plain serialize");
+
+        assert!(!body.contains("toolCachePointInsertAfter"));
+        assert!(!body.contains("cachePoint"));
     }
 
     #[test]

@@ -144,6 +144,8 @@ impl DashboardBucketCache {
 pub struct RedisStore {
     client: redis::Client,
     manager: ConnectionManager,
+    scheduler_manager: ConnectionManager,
+    scheduler_capacity_manager: ConnectionManager,
     key_prefix: String,
 }
 
@@ -185,11 +187,23 @@ impl RedisStore {
             .ok_or_else(|| anyhow::anyhow!("必须配置 redis.url"))?;
         let client = redis::Client::open(url)?;
         let manager = client.get_connection_manager().await?;
+        let scheduler_manager = client.get_connection_manager().await?;
+        let scheduler_capacity_manager = client.get_connection_manager().await?;
         Ok(Self {
             client,
             manager,
+            scheduler_manager,
+            scheduler_capacity_manager,
             key_prefix: config.redis.key_prefix.trim_end_matches(':').to_string(),
         })
+    }
+
+    fn scheduler_manager(&self) -> ConnectionManager {
+        self.scheduler_manager.clone()
+    }
+
+    fn scheduler_capacity_manager(&self) -> ConnectionManager {
+        self.scheduler_capacity_manager.clone()
     }
 
     async fn dashboard_bucket_cache(
@@ -1425,7 +1439,7 @@ impl RedisStore {
             redis.call('EXPIRE', ARGV[5] .. ARGV[2], ARGV[4])
             return 1
         "#;
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_manager();
         let _: i64 = redis::cmd("EVAL")
             .arg(script)
             .arg(1)
@@ -1453,7 +1467,7 @@ impl RedisStore {
             end
             return 1
         "#;
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_manager();
         let _: i64 = redis::cmd("EVAL")
             .arg(script)
             .arg(1)
@@ -1470,7 +1484,7 @@ impl RedisStore {
         credential_id: u64,
     ) -> anyhow::Result<usize> {
         let set_key = self.key(sessions_by_credential_key(credential_id));
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_manager();
         let session_hashes: Vec<String> = manager.smembers(&set_key).await?;
         let mut deleted = 0usize;
         for session_hash in &session_hashes {
@@ -1516,7 +1530,7 @@ impl RedisStore {
             end
             return 0
         "#;
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_manager();
         let should_fallback: i64 = redis::cmd("EVAL")
             .arg(script)
             .arg(1)
@@ -1558,7 +1572,7 @@ impl RedisStore {
             redis.call('EXPIRE', ARGV[5] .. ARGV[2], ARGV[4])
             return 1
         "#;
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_manager();
         let _: i64 = redis::cmd("EVAL")
             .arg(script)
             .arg(1)
@@ -1604,7 +1618,7 @@ impl RedisStore {
             redis.call('SET', KEYS[1], ARGV[2], 'PX', ARGV[3])
             return ARGV[2]
         "#;
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_manager();
         let stored: String = redis::cmd("EVAL")
             .arg(script)
             .arg(1)
@@ -1635,7 +1649,7 @@ impl RedisStore {
     }
 
     pub async fn clear_scheduler_cooldown(&self, credential_id: u64) -> anyhow::Result<()> {
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_manager();
         let index_key = scheduler_model_index_key(credential_id);
         let models: HashMap<String, String> = manager
             .hgetall(self.key(&index_key))
@@ -1665,6 +1679,7 @@ impl RedisStore {
         jitter_factor: f64,
         probation: StdDuration,
         ewma_alpha: f64,
+        coalesce_window: StdDuration,
     ) -> anyhow::Result<(SchedulerCooldownState, SchedulerHealthState)> {
         let now = now_ms();
         let retry_after_ms = retry_after
@@ -1694,6 +1709,7 @@ impl RedisStore {
             local health_ttl = tonumber(ARGV[11])
             local model = ARGV[12]
             local model_hash = ARGV[13]
+            local coalesce_window_ms = tonumber(ARGV[14])
 
             local health = {}
             local health_raw = redis.call('GET', KEYS[2])
@@ -1701,7 +1717,29 @@ impl RedisStore {
                 local ok, parsed = pcall(cjson.decode, health_raw)
                 if ok and parsed then health = parsed end
             end
-            local streak = tonumber(health['transient_failure_streak'] or '0') + 1
+            local cooldown = nil
+            local existing_until = 0
+            local cooldown_raw = redis.call('GET', KEYS[1])
+            if cooldown_raw then
+                local ok, parsed = pcall(cjson.decode, cooldown_raw)
+                if ok and parsed then
+                    cooldown = parsed
+                    existing_until = tonumber(parsed['until_ms'] or '0')
+                end
+            end
+            local last_error_at = tonumber(health['last_error_at_ms'] or '-1')
+            local duplicate_wave = retry_after_ms < 0
+                and existing_until > now
+                and health['last_error_kind'] == kind
+                and last_error_at >= 0
+                and now >= last_error_at
+                and (now - last_error_at) <= coalesce_window_ms
+            local streak = tonumber(health['transient_failure_streak'] or '0')
+            if duplicate_wave then
+                streak = math.max(streak, 1)
+            else
+                streak = streak + 1
+            end
             local previous_error_rate = tonumber(health['recent_error_rate'] or '0')
             health['transient_failure_streak'] = streak
             health['recent_error_rate'] = previous_error_rate + alpha * (1 - previous_error_rate)
@@ -1718,13 +1756,15 @@ impl RedisStore {
             local duration_ms = math.max(1000, math.min(max_ms, math.floor(requested + 0.5)))
             local candidate_until = now + duration_ms
 
-            local cooldown = {until_ms = candidate_until, reason = reason}
-            if model ~= '' then cooldown['model'] = model end
-            local cooldown_raw = redis.call('GET', KEYS[1])
-            if cooldown_raw then
-                local ok, parsed = pcall(cjson.decode, cooldown_raw)
-                if ok and parsed and tonumber(parsed['until_ms'] or '0') >= candidate_until then
-                    cooldown = parsed
+            if duplicate_wave and cooldown then
+                -- Keep the current cooldown deadline for concurrent failures in the same burst.
+            else
+                local candidate_cooldown = {until_ms = candidate_until, reason = reason}
+                if model ~= '' then candidate_cooldown['model'] = model end
+                if cooldown and existing_until >= candidate_until then
+                    -- Keep the longer existing cooldown.
+                else
+                    cooldown = candidate_cooldown
                 end
             end
 
@@ -1741,7 +1781,7 @@ impl RedisStore {
             return {cooldown_encoded, health_encoded}
         "#;
         let health_ttl_secs = 30 * 24 * 60 * 60;
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_manager();
         let result: Vec<String> = redis::cmd("EVAL")
             .arg(script)
             .arg(3)
@@ -1761,6 +1801,7 @@ impl RedisStore {
             .arg(health_ttl_secs)
             .arg(model.unwrap_or(""))
             .arg(model_hash.as_deref().unwrap_or(""))
+            .arg(coalesce_window.as_millis().clamp(1, i64::MAX as u128) as i64)
             .query_async(&mut manager)
             .await?;
         let cooldown = serde_json::from_str(
@@ -1823,7 +1864,7 @@ impl RedisStore {
         let latency_ms = latency
             .map(|duration| duration.as_millis() as i64)
             .unwrap_or(-1);
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_manager();
         let encoded: String = redis::cmd("EVAL")
             .arg(script)
             .arg(2)
@@ -1868,7 +1909,7 @@ impl RedisStore {
             redis.call('SET', KEYS[1], cjson.encode(health), 'EX', ttl)
             return cjson.encode(health)
         "#;
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_manager();
         let encoded: String = redis::cmd("EVAL")
             .arg(script)
             .arg(3)
@@ -1886,7 +1927,7 @@ impl RedisStore {
     }
 
     pub async fn clear_scheduler_health(&self, credential_id: u64) -> anyhow::Result<()> {
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_manager();
         let index_key = scheduler_model_index_key(credential_id);
         let models: HashMap<String, String> = manager
             .hgetall(self.key(&index_key))
@@ -1926,7 +1967,7 @@ impl RedisStore {
             redis.call('SET', KEYS[1], tostring(next_at), 'EX', ttl)
             return next_at
         "#;
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_capacity_manager();
         let next_at: i64 = redis::cmd("EVAL")
             .arg(script)
             .arg(1)
@@ -1944,7 +1985,7 @@ impl RedisStore {
         credential_id: u64,
     ) -> anyhow::Result<Option<i64>> {
         let key = scheduler_rate_limit_key(credential_id);
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_manager();
         let value: Option<String> = manager.get(self.key(&key)).await?;
         let Some(value) = value else {
             return Ok(None);
@@ -1963,7 +2004,7 @@ impl RedisStore {
 
     #[allow(dead_code)]
     pub async fn next_in_flight_lease_id(&self) -> anyhow::Result<u64> {
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_capacity_manager();
         let id: u64 = manager
             .incr(self.key("scheduler:inflight:lease_sequence"), 1u64)
             .await?;
@@ -1971,7 +2012,7 @@ impl RedisStore {
     }
 
     pub async fn next_external_pool_lease_id(&self) -> anyhow::Result<u64> {
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_capacity_manager();
         let id: u64 = manager
             .incr(self.key("external_pool:inflight:lease_sequence"), 1u64)
             .await?;
@@ -2021,6 +2062,10 @@ impl RedisStore {
             local kind = ARGV[6]
             local ttl_secs = tonumber(ARGV[7])
 
+            if redis.call('SISMEMBER', KEYS[7], lease_id) == 1 then
+                return {0, -1}
+            end
+
             if max_age_ms > 0 then
                 local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now - max_age_ms)
                 for _, member in ipairs(expired) do
@@ -2036,14 +2081,18 @@ impl RedisStore {
                 end
             end
 
-            local count = redis.call('ZCARD', KEYS[1])
+            local count = redis.call('ZCARD', KEYS[2])
             if max_count > 0 and count >= max_count then
                 return {0, count}
             end
 
-            local global_count = redis.call('ZCARD', KEYS[4])
+            local global_count = redis.call('ZCARD', KEYS[5])
             if global_max_count > 0 and global_count >= global_max_count then
                 return {0, global_count}
+            end
+
+            if redis.call('SISMEMBER', KEYS[7], lease_id) == 1 then
+                return {0, -1}
             end
 
             redis.call('ZADD', KEYS[1], now, lease_id)
@@ -2064,16 +2113,17 @@ impl RedisStore {
         "#;
         let keys = in_flight_keys(credential_id);
         let global_keys = global_in_flight_keys();
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_capacity_manager();
         let result: Vec<i64> = redis::cmd("EVAL")
             .arg(script)
-            .arg(6)
+            .arg(7)
             .arg(self.key(&keys.last_seen))
             .arg(self.key(&keys.acquired))
             .arg(self.key(&keys.kind))
             .arg(self.key(&global_keys.last_seen))
             .arg(self.key(&global_keys.acquired))
             .arg(self.key(&global_keys.kind))
+            .arg(self.key(&keys.released))
             .arg(now)
             .arg(max_age_ms)
             .arg(max_concurrent_requests)
@@ -2085,99 +2135,6 @@ impl RedisStore {
             .await?;
         if result.first().copied().unwrap_or(0) == 1 {
             Ok(Some(result.get(1).copied().unwrap_or(1).max(0) as usize))
-        } else {
-            Ok(None)
-        }
-    }
-
-    pub async fn acquire_dispatch_lease_with_new_id(
-        &self,
-        credential_id: u64,
-        max_concurrent_requests: u32,
-        global_max_concurrent_requests: u32,
-        max_age: Option<StdDuration>,
-        kind: &str,
-    ) -> anyhow::Result<Option<(u64, usize)>> {
-        let now = now_ms();
-        let max_age_ms = max_age.map(|age| age.as_millis() as i64).unwrap_or(0);
-        let ttl_secs = max_age
-            .map(|age| age.as_secs().saturating_mul(2).max(60) as i64)
-            .unwrap_or(0);
-        let script = r#"
-            local now = tonumber(ARGV[1])
-            local max_age_ms = tonumber(ARGV[2])
-            local max_count = tonumber(ARGV[3])
-            local global_max_count = tonumber(ARGV[4])
-            local kind = ARGV[5]
-            local ttl_secs = tonumber(ARGV[6])
-
-            if max_age_ms > 0 then
-                local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now - max_age_ms)
-                for _, member in ipairs(expired) do
-                    redis.call('ZREM', KEYS[1], member)
-                    redis.call('ZREM', KEYS[2], member)
-                    redis.call('HDEL', KEYS[3], member)
-                end
-                local global_expired = redis.call('ZRANGEBYSCORE', KEYS[4], '-inf', now - max_age_ms)
-                for _, member in ipairs(global_expired) do
-                    redis.call('ZREM', KEYS[4], member)
-                    redis.call('ZREM', KEYS[5], member)
-                    redis.call('HDEL', KEYS[6], member)
-                end
-            end
-
-            local count = redis.call('ZCARD', KEYS[1])
-            if max_count > 0 and count >= max_count then
-                return {0, 0, count}
-            end
-
-            local global_count = redis.call('ZCARD', KEYS[4])
-            if global_max_count > 0 and global_count >= global_max_count then
-                return {0, 0, global_count}
-            end
-
-            local lease_id = redis.call('INCR', KEYS[7])
-            redis.call('ZADD', KEYS[1], now, lease_id)
-            redis.call('ZADD', KEYS[2], now, lease_id)
-            redis.call('HSET', KEYS[3], lease_id, kind)
-            redis.call('ZADD', KEYS[4], now, lease_id)
-            redis.call('ZADD', KEYS[5], now, lease_id)
-            redis.call('HSET', KEYS[6], lease_id, kind)
-            if ttl_secs > 0 then
-                redis.call('EXPIRE', KEYS[1], ttl_secs)
-                redis.call('EXPIRE', KEYS[2], ttl_secs)
-                redis.call('EXPIRE', KEYS[3], ttl_secs)
-                redis.call('EXPIRE', KEYS[4], ttl_secs)
-                redis.call('EXPIRE', KEYS[5], ttl_secs)
-                redis.call('EXPIRE', KEYS[6], ttl_secs)
-            end
-            return {1, lease_id, count + 1}
-        "#;
-        let keys = in_flight_keys(credential_id);
-        let global_keys = global_in_flight_keys();
-        let mut manager = self.manager.clone();
-        let result: Vec<i64> = redis::cmd("EVAL")
-            .arg(script)
-            .arg(7)
-            .arg(self.key(&keys.last_seen))
-            .arg(self.key(&keys.acquired))
-            .arg(self.key(&keys.kind))
-            .arg(self.key(&global_keys.last_seen))
-            .arg(self.key(&global_keys.acquired))
-            .arg(self.key(&global_keys.kind))
-            .arg(self.key("scheduler:inflight:lease_sequence"))
-            .arg(now)
-            .arg(max_age_ms)
-            .arg(max_concurrent_requests)
-            .arg(global_max_concurrent_requests)
-            .arg(kind)
-            .arg(ttl_secs)
-            .query_async(&mut manager)
-            .await?;
-        if result.first().copied().unwrap_or(0) == 1 {
-            let lease_id = result.get(1).copied().unwrap_or(0).max(0) as u64;
-            let count = result.get(2).copied().unwrap_or(1).max(0) as usize;
-            Ok(Some((lease_id, count)))
         } else {
             Ok(None)
         }
@@ -2241,7 +2198,7 @@ impl RedisStore {
         "#;
         let keys = external_pool_in_flight_keys(pool_id);
         let global_keys = external_pool_global_in_flight_keys();
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_capacity_manager();
         let result: Vec<i64> = redis::cmd("EVAL")
             .arg(script)
             .arg(4)
@@ -2269,33 +2226,66 @@ impl RedisStore {
         credential_id: u64,
         lease_id: u64,
     ) -> anyhow::Result<bool> {
+        self.release_in_flight_lease_inner(credential_id, lease_id, false)
+            .await
+    }
+
+    pub async fn release_in_flight_lease_with_tombstone(
+        &self,
+        credential_id: u64,
+        lease_id: u64,
+    ) -> anyhow::Result<bool> {
+        self.release_in_flight_lease_inner(credential_id, lease_id, true)
+            .await
+    }
+
+    async fn release_in_flight_lease_inner(
+        &self,
+        credential_id: u64,
+        lease_id: u64,
+        tombstone: bool,
+    ) -> anyhow::Result<bool> {
         let keys = in_flight_keys(credential_id);
         let global_keys = global_in_flight_keys();
         let lease_id = lease_id.to_string();
-        let mut manager = self.manager.clone();
-        let removed: i64 = redis::pipe()
-            .atomic()
-            .cmd("ZREM")
+        let mut manager = self.scheduler_capacity_manager();
+        let script = r#"
+            local lease_id = ARGV[1]
+            local tombstone = tonumber(ARGV[2])
+            local ttl_secs = tonumber(ARGV[3])
+
+            if tombstone == 1 then
+                redis.call('SADD', KEYS[7], lease_id)
+                if ttl_secs > 0 then
+                    redis.call('EXPIRE', KEYS[7], ttl_secs)
+                end
+            end
+
+            local removed = 0
+            removed = removed + redis.call('ZREM', KEYS[1], lease_id)
+            removed = removed + redis.call('ZREM', KEYS[2], lease_id)
+            removed = removed + redis.call('HDEL', KEYS[3], lease_id)
+            removed = removed + redis.call('ZREM', KEYS[4], lease_id)
+            removed = removed + redis.call('ZREM', KEYS[5], lease_id)
+            removed = removed + redis.call('HDEL', KEYS[6], lease_id)
+            return removed
+        "#;
+        let tombstone_ttl_secs = 120i64;
+        let removed: i64 = redis::cmd("EVAL")
+            .arg(script)
+            .arg(7)
             .arg(self.key(&keys.last_seen))
-            .arg(&lease_id)
-            .cmd("ZREM")
             .arg(self.key(&keys.acquired))
-            .arg(&lease_id)
-            .cmd("HDEL")
             .arg(self.key(&keys.kind))
-            .arg(&lease_id)
-            .cmd("ZREM")
             .arg(self.key(&global_keys.last_seen))
-            .arg(&lease_id)
-            .cmd("ZREM")
             .arg(self.key(&global_keys.acquired))
-            .arg(&lease_id)
-            .cmd("HDEL")
             .arg(self.key(&global_keys.kind))
+            .arg(self.key(&keys.released))
             .arg(&lease_id)
-            .query_async::<(i64, i64, i64, i64, i64, i64)>(&mut manager)
-            .await
-            .map(|(a, b, c, d, e, f)| a + b + c + d + e + f)?;
+            .arg(if tombstone { 1 } else { 0 })
+            .arg(tombstone_ttl_secs)
+            .query_async(&mut manager)
+            .await?;
         Ok(removed > 0)
     }
 
@@ -2307,7 +2297,7 @@ impl RedisStore {
         let keys = external_pool_in_flight_keys(pool_id);
         let global_keys = external_pool_global_in_flight_keys();
         let lease_id = lease_id.to_string();
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_capacity_manager();
         let removed: i64 = redis::pipe()
             .atomic()
             .cmd("ZREM")
@@ -2360,7 +2350,7 @@ impl RedisStore {
             end
             return 1
         "#;
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_capacity_manager();
         let touched: i64 = redis::cmd("EVAL")
             .arg(script)
             .arg(4)
@@ -2402,7 +2392,7 @@ impl RedisStore {
         "#;
         let keys = external_pool_in_flight_keys(pool_id);
         let global_keys = external_pool_global_in_flight_keys();
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_capacity_manager();
         let result: Vec<i64> = redis::cmd("EVAL")
             .arg(script)
             .arg(4)
@@ -2485,7 +2475,7 @@ impl RedisStore {
             return {opened, open_until, reported_reason, failures, distinct}
         "#;
         let ttl_secs = window.as_secs().saturating_add(open_for.as_secs()).max(1) as usize;
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_manager();
         let result: Vec<redis::Value> = redis::cmd("EVAL")
             .arg(script)
             .arg(4)
@@ -2534,7 +2524,7 @@ impl RedisStore {
     ) -> anyhow::Result<LocalPoolCircuitState> {
         let now = now_ms();
         let window_ms = window.as_millis().max(1) as i64;
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_manager();
         let script = r#"
             local now = tonumber(ARGV[1])
             redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - tonumber(ARGV[2]))
@@ -2611,18 +2601,32 @@ impl RedisStore {
     ) -> anyhow::Result<()> {
         let keys = in_flight_keys(credential_id);
         let global_keys = global_in_flight_keys();
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_capacity_manager();
         let lease_id = lease_id.to_string();
-        let now = now_ms() as f64;
-        let _: (i64, i64) = redis::pipe()
-            .atomic()
-            .cmd("ZADD")
+        let script = r#"
+            local now = tonumber(ARGV[1])
+            local lease_id = ARGV[2]
+
+            if not redis.call('ZSCORE', KEYS[2], lease_id)
+                or not redis.call('ZSCORE', KEYS[4], lease_id)
+            then
+                redis.call('ZREM', KEYS[1], lease_id)
+                redis.call('ZREM', KEYS[3], lease_id)
+                return 0
+            end
+
+            redis.call('ZADD', KEYS[1], now, lease_id)
+            redis.call('ZADD', KEYS[3], now, lease_id)
+            return 1
+        "#;
+        let _: i64 = redis::cmd("EVAL")
+            .arg(script)
+            .arg(4)
             .arg(self.key(&keys.last_seen))
-            .arg(now)
-            .arg(&lease_id)
-            .cmd("ZADD")
+            .arg(self.key(&keys.acquired))
             .arg(self.key(&global_keys.last_seen))
-            .arg(now)
+            .arg(self.key(&global_keys.acquired))
+            .arg(now_ms())
             .arg(&lease_id)
             .query_async(&mut manager)
             .await?;
@@ -2638,26 +2642,41 @@ impl RedisStore {
         let keys = in_flight_keys(credential_id);
         let global_keys = global_in_flight_keys();
         let lease_id = lease_id.to_string();
-        let mut manager = self.manager.clone();
-        let _: (i64, i64, i64, i64) = redis::pipe()
-            .atomic()
-            .cmd("HSET")
-            .arg(self.key(&keys.kind))
-            .arg(&lease_id)
-            .arg(kind)
-            .cmd("ZADD")
+        let mut manager = self.scheduler_capacity_manager();
+        let script = r#"
+            local now = tonumber(ARGV[1])
+            local lease_id = ARGV[2]
+            local kind = ARGV[3]
+
+            if not redis.call('ZSCORE', KEYS[2], lease_id)
+                or not redis.call('ZSCORE', KEYS[5], lease_id)
+            then
+                redis.call('ZREM', KEYS[1], lease_id)
+                redis.call('HDEL', KEYS[3], lease_id)
+                redis.call('ZREM', KEYS[4], lease_id)
+                redis.call('HDEL', KEYS[6], lease_id)
+                return 0
+            end
+
+            redis.call('ZADD', KEYS[1], now, lease_id)
+            redis.call('HSET', KEYS[3], lease_id, kind)
+            redis.call('ZADD', KEYS[4], now, lease_id)
+            redis.call('HSET', KEYS[6], lease_id, kind)
+            return 1
+        "#;
+        let _: i64 = redis::cmd("EVAL")
+            .arg(script)
+            .arg(6)
             .arg(self.key(&keys.last_seen))
-            .arg(now_ms() as f64)
-            .arg(&lease_id)
-            .cmd("HSET")
+            .arg(self.key(&keys.acquired))
+            .arg(self.key(&keys.kind))
+            .arg(self.key(&global_keys.last_seen))
+            .arg(self.key(&global_keys.acquired))
             .arg(self.key(&global_keys.kind))
+            .arg(now_ms())
             .arg(&lease_id)
             .arg(kind)
-            .cmd("ZADD")
-            .arg(self.key(&global_keys.last_seen))
-            .arg(now_ms() as f64)
-            .arg(&lease_id)
-            .query_async::<(i64, i64, i64, i64)>(&mut manager)
+            .query_async(&mut manager)
             .await?;
         Ok(())
     }
@@ -2683,7 +2702,7 @@ impl RedisStore {
             end
             return #expired
         "#;
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_capacity_manager();
         let mut cleaned = 0usize;
         let global_keys = global_in_flight_keys();
         for credential_id in credential_ids {
@@ -2713,7 +2732,7 @@ impl RedisStore {
     ) -> anyhow::Result<usize> {
         let keys = in_flight_keys(credential_id);
         let global_keys = global_in_flight_keys();
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_capacity_manager();
         if let Some(min_idle) = min_idle {
             let cutoff = now_ms() - min_idle.as_millis() as i64;
             let script = r#"
@@ -2815,7 +2834,7 @@ impl RedisStore {
                 .arg(self.key(scheduler_model_index_key(*credential_id)));
         }
 
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_manager();
         let values: Vec<redis::Value> = pipe.query_async(&mut manager).await?;
         let now = now_ms();
         let mut keys_to_delete = Vec::new();
@@ -2940,7 +2959,7 @@ impl RedisStore {
             }
         }
         if !keys_to_delete.is_empty() {
-            let mut manager = self.manager.clone();
+            let mut manager = self.scheduler_manager();
             let full_keys: Vec<String> = keys_to_delete
                 .into_iter()
                 .map(|key| self.key(key))
@@ -2953,10 +2972,10 @@ impl RedisStore {
     #[allow(dead_code)]
     pub async fn global_capacity_state(&self) -> anyhow::Result<SchedulerGlobalCapacityState> {
         let keys = global_in_flight_keys();
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_capacity_manager();
         let (in_flight, queued): (i64, Option<i64>) = redis::pipe()
             .cmd("ZCARD")
-            .arg(self.key(&keys.last_seen))
+            .arg(self.key(&keys.acquired))
             .cmd("GET")
             .arg(self.key(scheduler_global_queue_key()))
             .query_async(&mut manager)
@@ -2982,7 +3001,7 @@ impl RedisStore {
             redis.call('EXPIRE', KEYS[1], ARGV[2])
             return 1
         "#;
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_capacity_manager();
         let admitted: i64 = redis::cmd("EVAL")
             .arg(script)
             .arg(1)
@@ -3004,7 +3023,7 @@ impl RedisStore {
             end
             return 1
         "#;
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_capacity_manager();
         let _: i64 = redis::cmd("EVAL")
             .arg(script)
             .arg(1)
@@ -3028,7 +3047,7 @@ impl RedisStore {
             redis.call('EXPIRE', KEYS[1], ARGV[2])
             return 1
         "#;
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_capacity_manager();
         let admitted: i64 = redis::cmd("EVAL")
             .arg(script)
             .arg(1)
@@ -3050,7 +3069,7 @@ impl RedisStore {
             end
             return 1
         "#;
-        let mut manager = self.manager.clone();
+        let mut manager = self.scheduler_capacity_manager();
         let _: i64 = redis::cmd("EVAL")
             .arg(script)
             .arg(1)
@@ -3927,6 +3946,7 @@ struct InFlightKeys {
     last_seen: String,
     acquired: String,
     kind: String,
+    released: String,
 }
 
 fn in_flight_keys(credential_id: u64) -> InFlightKeys {
@@ -3934,6 +3954,7 @@ fn in_flight_keys(credential_id: u64) -> InFlightKeys {
         last_seen: format!("scheduler:inflight:{}:last_seen", credential_id),
         acquired: format!("scheduler:inflight:{}:acquired", credential_id),
         kind: format!("scheduler:inflight:{}:kind", credential_id),
+        released: format!("scheduler:inflight:{}:released", credential_id),
     }
 }
 
@@ -3942,6 +3963,7 @@ fn global_in_flight_keys() -> InFlightKeys {
         last_seen: "scheduler:global:inflight:last_seen".to_string(),
         acquired: "scheduler:global:inflight:acquired".to_string(),
         kind: "scheduler:global:inflight:kind".to_string(),
+        released: "scheduler:global:inflight:released".to_string(),
     }
 }
 
@@ -3950,6 +3972,7 @@ fn external_pool_in_flight_keys(pool_id: u64) -> InFlightKeys {
         last_seen: format!("external_pool:inflight:{}:last_seen", pool_id),
         acquired: format!("external_pool:inflight:{}:acquired", pool_id),
         kind: format!("external_pool:inflight:{}:kind", pool_id),
+        released: format!("external_pool:inflight:{}:released", pool_id),
     }
 }
 
@@ -3958,6 +3981,7 @@ fn external_pool_global_in_flight_keys() -> InFlightKeys {
         last_seen: "external_pool:global:inflight:last_seen".to_string(),
         acquired: "external_pool:global:inflight:acquired".to_string(),
         kind: "external_pool:global:inflight:kind".to_string(),
+        released: "external_pool:global:inflight:released".to_string(),
     }
 }
 
@@ -4562,6 +4586,7 @@ mod tests {
                 1.0,
                 StdDuration::from_secs(5),
                 0.2,
+                StdDuration::from_secs(1),
             )
             .await
             .unwrap();
@@ -4589,6 +4614,7 @@ mod tests {
                 1.0,
                 StdDuration::from_secs(5),
                 0.2,
+                StdDuration::from_secs(1),
             )
             .await
             .unwrap();
@@ -4785,6 +4811,143 @@ mod tests {
         );
         let state = store.scheduler_state_for_credentials(&[9]).await.unwrap();
         assert_eq!(state.get(&9).unwrap().in_flight_leases.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn redis_scheduler_late_touch_after_release_does_not_reoccupy_capacity() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+
+        let store = RedisStore::connect(&config).await.unwrap();
+        let credential_id = 42;
+        let lease_a = store.next_in_flight_lease_id().await.unwrap();
+        assert!(
+            store
+                .acquire_in_flight_lease(
+                    credential_id,
+                    lease_a,
+                    1,
+                    Some(StdDuration::from_secs(60)),
+                    "stream",
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .release_in_flight_lease(credential_id, lease_a)
+                .await
+                .unwrap()
+        );
+
+        store
+            .touch_in_flight_lease(credential_id, lease_a)
+            .await
+            .unwrap();
+        store
+            .set_in_flight_lease_kind(credential_id, lease_a, "stream")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .global_capacity_state()
+                .await
+                .unwrap()
+                .in_flight_requests,
+            0
+        );
+        let state = store
+            .scheduler_state_for_credentials(&[credential_id])
+            .await
+            .unwrap();
+        assert_eq!(state.get(&credential_id).unwrap().in_flight_leases.len(), 0);
+
+        let lease_b = store.next_in_flight_lease_id().await.unwrap();
+        assert!(
+            store
+                .acquire_in_flight_lease(
+                    credential_id,
+                    lease_b,
+                    1,
+                    Some(StdDuration::from_secs(60)),
+                    "stream",
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn redis_scheduler_tombstone_blocks_late_acquire_after_release() {
+        let Some(config) = test_config() else {
+            eprintln!("跳过 Redis 集成测试：未设置 KIRO_RS_TEST_REDIS_URL");
+            return;
+        };
+
+        let store = RedisStore::connect(&config).await.unwrap();
+        let credential_id = 43;
+        let lease_id = store.next_in_flight_lease_id().await.unwrap();
+
+        assert!(
+            !store
+                .release_in_flight_lease_with_tombstone(credential_id, lease_id)
+                .await
+                .unwrap(),
+            "release may run before a timed-out Redis acquire has actually written the lease"
+        );
+        assert!(
+            store
+                .acquire_in_flight_lease(
+                    credential_id,
+                    lease_id,
+                    1,
+                    Some(StdDuration::from_secs(60)),
+                    "stream",
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "a late acquire for a released lease must not reoccupy Redis capacity"
+        );
+        assert_eq!(
+            store
+                .global_capacity_state()
+                .await
+                .unwrap()
+                .in_flight_requests,
+            0
+        );
+        let state = store
+            .scheduler_state_for_credentials(&[credential_id])
+            .await
+            .unwrap();
+        assert_eq!(state.get(&credential_id).unwrap().in_flight_leases.len(), 0);
+
+        let next_lease_id = store.next_in_flight_lease_id().await.unwrap();
+        assert!(
+            store
+                .acquire_in_flight_lease(
+                    credential_id,
+                    next_lease_id,
+                    1,
+                    Some(StdDuration::from_secs(60)),
+                    "stream",
+                )
+                .await
+                .unwrap()
+                .is_some(),
+            "tombstone must only block the released lease id"
+        );
+        assert!(
+            store
+                .release_in_flight_lease(credential_id, next_lease_id)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
+use base64::{
+    Engine as _,
+    engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
+};
+
 use crate::http_client::ProxyConfig;
 use crate::model::config::Config;
 
@@ -184,6 +189,59 @@ fn canonicalize_auth_method_value(value: &str) -> &str {
     }
 }
 
+fn trimmed_non_empty(value: &Option<String>) -> Option<&str> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn microsoft_token_endpoint_from_issuer(issuer: &str) -> Option<String> {
+    let parsed = url::Url::parse(issuer.trim()).ok()?;
+    if parsed.scheme() != "https" {
+        return None;
+    }
+
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    if host != "login.microsoftonline.com" {
+        return None;
+    }
+
+    let mut segments = parsed.path_segments()?;
+    let tenant = segments.find(|segment| !segment.is_empty())?;
+    if tenant.eq_ignore_ascii_case("oauth2") {
+        return None;
+    }
+
+    Some(format!(
+        "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+    ))
+}
+
+fn jwt_issuer(token: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| URL_SAFE.decode(payload))
+        .ok()?;
+    let value = serde_json::from_slice::<serde_json::Value>(&decoded).ok()?;
+    value
+        .get("iss")
+        .and_then(|issuer| issuer.as_str())
+        .map(str::to_string)
+}
+
+fn looks_like_microsoft_refresh_token(refresh_token: &str) -> bool {
+    let trimmed = refresh_token.trim();
+    trimmed.starts_with("1.") || trimmed.starts_with("0.")
+}
+
+fn default_external_idp_scopes(client_id: &str) -> String {
+    format!(
+        "api://{client_id}/codewhisperer:conversations api://{client_id}/codewhisperer:completions offline_access"
+    )
+}
+
 /// 凭据配置（支持单对象或数组格式）
 ///
 /// 自动识别配置文件格式：
@@ -228,6 +286,7 @@ impl CredentialsConfig {
         match self {
             CredentialsConfig::Single(mut cred) => {
                 cred.canonicalize_auth_method();
+                cred.normalize_external_idp_defaults();
                 vec![cred]
             }
             CredentialsConfig::Multiple(mut creds) => {
@@ -235,6 +294,7 @@ impl CredentialsConfig {
                 creds.sort_by_key(|c| c.priority);
                 for cred in &mut creds {
                     cred.canonicalize_auth_method();
+                    cred.normalize_external_idp_defaults();
                 }
                 creds
             }
@@ -333,6 +393,44 @@ impl KiroCredentials {
         let canonical = canonicalize_auth_method_value(auth_method);
         if canonical != auth_method {
             self.auth_method = Some(canonical.to_string());
+        }
+    }
+
+    /// 补齐 external_idp 账号的可推导字段。
+    ///
+    /// 企业 SSO 导出格式经常没有 AWS SSO device-flow 的 clientSecret。Microsoft
+    /// Entra ID 这类 public-client refresh token 只需要 clientId、refreshToken
+    /// 和 token endpoint；当导入 JSON 只带 issuerUrl 或 accessToken 时，可以安全
+    /// 推导 token endpoint。缺 scopes 时按 Kiro 官方 CodeWhisperer scope 补齐。
+    pub fn normalize_external_idp_defaults(&mut self) {
+        self.canonicalize_auth_method();
+        if !self.is_external_idp_refresh_credential() {
+            return;
+        }
+
+        if self.token_endpoint.as_deref().is_none_or(str::is_empty) {
+            if let Some(endpoint) =
+                trimmed_non_empty(&self.issuer_url).and_then(microsoft_token_endpoint_from_issuer)
+            {
+                self.token_endpoint = Some(endpoint);
+            } else if let Some(endpoint) = trimmed_non_empty(&self.access_token)
+                .and_then(jwt_issuer)
+                .as_deref()
+                .and_then(microsoft_token_endpoint_from_issuer)
+            {
+                self.token_endpoint = Some(endpoint);
+            } else if trimmed_non_empty(&self.refresh_token)
+                .is_some_and(looks_like_microsoft_refresh_token)
+            {
+                self.token_endpoint =
+                    Some("https://login.microsoftonline.com/common/oauth2/v2.0/token".to_string());
+            }
+        }
+
+        if self.scopes.as_deref().is_none_or(str::is_empty) {
+            if let Some(client_id) = trimmed_non_empty(&self.client_id) {
+                self.scopes = Some(default_external_idp_scopes(client_id));
+            }
         }
     }
 
@@ -620,6 +718,86 @@ mod tests {
         );
         assert!(creds.is_external_idp_refresh_credential());
         assert!(!creds.is_idc_refresh_credential());
+    }
+
+    #[test]
+    fn test_external_idp_defaults_are_derived_from_issuer_url_without_client_secret() {
+        let mut creds = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            refresh_token: Some("1.example-refresh-token".to_string()),
+            client_id: Some("client-123".to_string()),
+            issuer_url: Some("https://login.microsoftonline.com/tenant-abc/v2.0".to_string()),
+            ..Default::default()
+        };
+
+        creds.normalize_external_idp_defaults();
+
+        assert_eq!(creds.auth_method.as_deref(), Some("external_idp"));
+        assert_eq!(
+            creds.token_endpoint.as_deref(),
+            Some("https://login.microsoftonline.com/tenant-abc/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            creds.scopes.as_deref(),
+            Some(
+                "api://client-123/codewhisperer:conversations api://client-123/codewhisperer:completions offline_access"
+            )
+        );
+        assert!(creds.client_secret.is_none());
+        assert!(creds.is_external_idp_refresh_credential());
+        assert!(!creds.is_idc_refresh_credential());
+    }
+
+    #[test]
+    fn test_external_idp_defaults_are_derived_from_access_token_issuer() {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD
+            .encode(br#"{"iss":"https://login.microsoftonline.com/tenant-from-token/v2.0"}"#);
+        let mut creds = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            access_token: Some(format!("{header}.{payload}.")),
+            refresh_token: Some("1.example-refresh-token".to_string()),
+            client_id: Some("client-456".to_string()),
+            ..Default::default()
+        };
+
+        creds.normalize_external_idp_defaults();
+
+        assert_eq!(
+            creds.token_endpoint.as_deref(),
+            Some("https://login.microsoftonline.com/tenant-from-token/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            creds.scopes.as_deref(),
+            Some(
+                "api://client-456/codewhisperer:conversations api://client-456/codewhisperer:completions offline_access"
+            )
+        );
+        assert!(creds.client_secret.is_none());
+    }
+
+    #[test]
+    fn test_external_idp_defaults_fall_back_to_microsoft_common_for_msal_refresh_token() {
+        let mut creds = KiroCredentials {
+            auth_method: Some("external_idp".to_string()),
+            refresh_token: Some("1.msal-refresh-token-without-issuer".to_string()),
+            client_id: Some("client-789".to_string()),
+            ..Default::default()
+        };
+
+        creds.normalize_external_idp_defaults();
+
+        assert_eq!(
+            creds.token_endpoint.as_deref(),
+            Some("https://login.microsoftonline.com/common/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            creds.scopes.as_deref(),
+            Some(
+                "api://client-789/codewhisperer:conversations api://client-789/codewhisperer:completions offline_access"
+            )
+        );
+        assert!(creds.client_secret.is_none());
     }
 
     #[test]

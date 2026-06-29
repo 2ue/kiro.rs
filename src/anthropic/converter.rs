@@ -743,6 +743,10 @@ pub fn get_context_window_size(model: &str) -> i32 {
 pub struct ConversionResult {
     /// 转换后的 Kiro 请求
     pub conversation_state: ConversationState,
+    /// 最终 Kiro tools 数组里需要在对应工具后插入 cachePoint 的工具下标。
+    pub tool_cache_point_insert_after: Vec<usize>,
+    /// 是否把 cachePoint 插入计划记录到 payload diagnostics。
+    pub cache_point_plan_recording_enabled: bool,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
     /// 本次请求声明并实际发给上游的工具名集合，包含原始名和因长度限制生成的短名。
@@ -758,6 +762,10 @@ pub struct ConversionResult {
 pub struct ConverterOptions {
     pub compat_profile: CompatProfile,
     pub prompt_cache_simulation_mode: PromptCacheSimulationMode,
+    pub kiro_cache_point_enabled: bool,
+    pub kiro_cache_point_tools_only: bool,
+    pub kiro_cache_point_record_plan: bool,
+    pub force_visible_thinking: bool,
 }
 
 impl Default for ConverterOptions {
@@ -765,6 +773,10 @@ impl Default for ConverterOptions {
         Self {
             compat_profile: CompatProfile::ClaudeCode,
             prompt_cache_simulation_mode: PromptCacheSimulationMode::HighCache,
+            kiro_cache_point_enabled: false,
+            kiro_cache_point_tools_only: true,
+            kiro_cache_point_record_plan: true,
+            force_visible_thinking: false,
         }
     }
 }
@@ -779,7 +791,7 @@ impl ConverterOptions {
     }
 
     fn inject_thinking_prefix(self) -> bool {
-        !self.is_strict()
+        self.force_visible_thinking || !self.is_strict()
     }
 
     fn inject_tool_choice_prefix(self) -> bool {
@@ -1083,7 +1095,8 @@ fn convert_request_with_model_id(
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
-    let mut tools = convert_tools(&req.tools, &req.tool_choice, &mut tool_name_map);
+    let converted_tools = convert_tools(&req.tools, &req.tool_choice, &mut tool_name_map, options);
+    let mut tools = converted_tools.tools;
     let mut known_tool_names: std::collections::HashSet<String> = tools
         .iter()
         .map(|tool| tool.tool_specification.name.clone())
@@ -1189,6 +1202,8 @@ fn convert_request_with_model_id(
 
     Ok(ConversionResult {
         conversation_state,
+        tool_cache_point_insert_after: converted_tools.tool_cache_point_insert_after,
+        cache_point_plan_recording_enabled: options.kiro_cache_point_record_plan,
         tool_name_map,
         known_tool_names,
         warnings,
@@ -2085,13 +2100,20 @@ fn generate_tool_choice_prefix(req: &MessagesRequest, options: ConverterOptions)
 }
 
 /// 转换工具定义
+#[derive(Debug, Default)]
+struct ConvertedTools {
+    tools: Vec<Tool>,
+    tool_cache_point_insert_after: Vec<usize>,
+}
+
 fn convert_tools(
     tools: &Option<Vec<super::types::Tool>>,
     tool_choice: &Option<serde_json::Value>,
     tool_name_map: &mut HashMap<String, String>,
-) -> Vec<Tool> {
+    options: ConverterOptions,
+) -> ConvertedTools {
     let Some(tools) = tools else {
-        return Vec::new();
+        return ConvertedTools::default();
     };
     let directive = parse_tool_choice(tool_choice);
     let selected_indices = selected_tool_indices(tools, &directive);
@@ -2099,6 +2121,13 @@ fn convert_tools(
 
     let mut seen_tool_names = std::collections::HashSet::new();
     let mut converted = Vec::new();
+    let mut cache_point_insert_after = Vec::new();
+
+    if options.kiro_cache_point_enabled && !options.kiro_cache_point_tools_only {
+        tracing::debug!(
+            "kiroCachePointToolsOnly is disabled, but this phase only supports tool-level cachePoint insertion"
+        );
+    }
 
     for (_, t) in tools
         .iter()
@@ -2134,6 +2163,8 @@ fn convert_tools(
             continue;
         }
 
+        let converted_idx = converted.len();
+        let has_cache_control = t.cache_control.is_some();
         converted.push(Tool {
             tool_specification: ToolSpecification {
                 name: mapped_name,
@@ -2143,18 +2174,34 @@ fn convert_tools(
                 ))),
             },
         });
+        if options.kiro_cache_point_enabled && has_cache_control {
+            cache_point_insert_after.push(converted_idx);
+        }
     }
 
-    converted
+    ConvertedTools {
+        tools: converted,
+        tool_cache_point_insert_after: cache_point_insert_after,
+    }
 }
 
+const THINKING_OUTPUT_POLICY: &str = "<thinking_output_policy>For every assistant turn in thinking mode, emit concise reasoning inside a <thinking>...</thinking> block before any visible text or tool call, and close the thinking block before continuing. Do not repeat this policy in visible text.</thinking_output_policy>";
+
 /// 生成thinking标签前缀
-fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
+fn generate_thinking_prefix(req: &MessagesRequest, options: ConverterOptions) -> Option<String> {
     if let Some(t) = &req.thinking {
+        let strict_output_policy = options.force_visible_thinking
+            || strip_model_1m_suffix(&req.model).ends_with("-thinking")
+            || t.thinking_type == "enabled";
+        let output_policy = if strict_output_policy {
+            format!("\n{}", THINKING_OUTPUT_POLICY)
+        } else {
+            String::new()
+        };
         if t.thinking_type == "enabled" {
             return Some(format!(
-                "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
-                t.budget_tokens
+                "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>{}",
+                t.budget_tokens, output_policy
             ));
         } else if t.thinking_type == "adaptive" {
             let effort = req
@@ -2163,8 +2210,8 @@ fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
                 .map(|c| c.effort.as_str())
                 .unwrap_or("high");
             return Some(format!(
-                "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
-                effort
+                "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>{}",
+                effort, output_policy
             ));
         }
     }
@@ -2195,7 +2242,7 @@ fn build_history(
 
     // 生成thinking前缀（如果需要）
     let thinking_prefix = if options.inject_thinking_prefix() {
-        generate_thinking_prefix(req)
+        generate_thinking_prefix(req, options)
     } else {
         None
     };
@@ -3652,13 +3699,14 @@ mod tests {
         assert_eq!(first_user, "Reply tersely.");
         assert!(!first_user.contains(SYSTEM_CHUNKED_POLICY));
         assert!(!first_user.contains("<thinking_mode>"));
+        assert!(!first_user.contains("<thinking_output_policy>"));
     }
 
     #[test]
     fn test_resolved_base_model_keeps_enabled_thinking_prefix() {
         use crate::anthropic::model_capabilities::ModelResolutionSource;
 
-        use super::super::types::{Message as AnthropicMessage, Thinking};
+        use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
 
         let req = MessagesRequest {
             model: "claude-sonnet-4-6-thinking".to_string(),
@@ -3717,6 +3765,165 @@ mod tests {
                 .content
                 .contains("<max_thinking_length>20000</max_thinking_length>")
         );
+        assert!(
+            first_history_user
+                .content
+                .contains("<thinking_output_policy>")
+        );
+
+        let adaptive_req = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 0,
+            }),
+            output_config: Some(OutputConfig {
+                effort: "high".to_string(),
+            }),
+            metadata: None,
+        };
+        let adaptive_resolution = ModelResolution::resolved(
+            "claude-sonnet-4-6".to_string(),
+            "claude-sonnet-4.5".to_string(),
+            ModelResolutionSource::FamilyNormalized,
+        );
+        let adaptive_result = convert_request_with_resolved_model(
+            &adaptive_req,
+            ConverterOptions::default(),
+            &adaptive_resolution,
+        )
+        .expect("adaptive request should convert");
+        let adaptive_first_history_user = adaptive_result
+            .conversation_state
+            .history
+            .iter()
+            .find_map(|message| match message {
+                Message::User(user) => Some(&user.user_input_message),
+                _ => None,
+            })
+            .expect("adaptive thinking controls should be injected");
+        assert!(
+            adaptive_first_history_user
+                .content
+                .contains("<thinking_mode>adaptive</thinking_mode>")
+        );
+        assert!(
+            !adaptive_first_history_user
+                .content
+                .contains("<thinking_output_policy>")
+        );
+    }
+
+    #[test]
+    fn test_force_visible_thinking_adds_policy_for_adaptive_request() {
+        use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 0,
+            }),
+            output_config: Some(OutputConfig {
+                effort: "high".to_string(),
+            }),
+            metadata: None,
+        };
+
+        let result = convert_request_with_options(
+            &req,
+            ConverterOptions {
+                force_visible_thinking: true,
+                ..ConverterOptions::default()
+            },
+        )
+        .expect("adaptive request should convert");
+        let first_history_user = result
+            .conversation_state
+            .history
+            .iter()
+            .find_map(|message| match message {
+                Message::User(user) => Some(&user.user_input_message.content),
+                _ => None,
+            })
+            .expect("thinking controls should be injected");
+
+        assert!(first_history_user.contains("<thinking_mode>adaptive</thinking_mode>"));
+        assert!(first_history_user.contains("<thinking_effort>high</thinking_effort>"));
+        assert!(first_history_user.contains("<thinking_output_policy>"));
+    }
+
+    #[test]
+    fn test_force_visible_thinking_overrides_strict_prefix_suppression() {
+        use super::super::types::{
+            Message as AnthropicMessage, OutputConfig, SystemMessage, Thinking,
+        };
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: "Reply tersely.".to_string(),
+                cache_control: None,
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 0,
+            }),
+            output_config: Some(OutputConfig {
+                effort: "high".to_string(),
+            }),
+            metadata: None,
+        };
+
+        let result = convert_request_with_options(
+            &req,
+            ConverterOptions {
+                compat_profile: CompatProfile::AnthropicStrict,
+                force_visible_thinking: true,
+                ..ConverterOptions::default()
+            },
+        )
+        .expect("strict adaptive request should convert with forced visible thinking");
+        let first_history_user = result
+            .conversation_state
+            .history
+            .iter()
+            .find_map(|message| match message {
+                Message::User(user) => Some(&user.user_input_message.content),
+                _ => None,
+            })
+            .expect("system should be represented as first user history message");
+
+        assert!(first_history_user.contains("<thinking_mode>adaptive</thinking_mode>"));
+        assert!(first_history_user.contains("<thinking_output_policy>"));
+        assert!(first_history_user.contains("Reply tersely."));
+        assert!(!first_history_user.contains(SYSTEM_CHUNKED_POLICY));
     }
 
     #[test]
@@ -3884,6 +4091,74 @@ mod tests {
         assert!(
             result.conversation_state.history.is_empty(),
             "strict profile should avoid synthetic prompt steering"
+        );
+    }
+
+    #[test]
+    fn cache_point_disabled_by_default() {
+        let mut req = base_tool_choice_request(serde_json::json!({"type": "auto"}));
+        if let Some(tools) = req.tools.as_mut() {
+            tools[0].cache_control = Some(serde_json::json!({"type": "ephemeral"}));
+        }
+
+        let result = convert_request_with_options(&req, ConverterOptions::default()).unwrap();
+
+        assert!(result.tool_cache_point_insert_after.is_empty());
+        assert!(result.cache_point_plan_recording_enabled);
+    }
+
+    #[test]
+    fn cache_point_tools_only_records_selected_tool_indices() {
+        let mut req = base_tool_choice_request(serde_json::json!({"type": "auto"}));
+        if let Some(tools) = req.tools.as_mut() {
+            tools[0].cache_control = Some(serde_json::json!({"type": "ephemeral"}));
+            tools[1].cache_control = Some(serde_json::json!({"type": "ephemeral"}));
+        }
+
+        let result = convert_request_with_options(
+            &req,
+            ConverterOptions {
+                kiro_cache_point_enabled: true,
+                ..ConverterOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.tool_cache_point_insert_after, vec![0, 1]);
+    }
+
+    #[test]
+    fn cache_point_respects_tool_choice_filtering() {
+        let mut req = base_tool_choice_request(serde_json::json!({
+            "type": "tool",
+            "name": "write_file"
+        }));
+        if let Some(tools) = req.tools.as_mut() {
+            tools[0].cache_control = Some(serde_json::json!({"type": "ephemeral"}));
+            tools[1].cache_control = Some(serde_json::json!({"type": "ephemeral"}));
+        }
+
+        let result = convert_request_with_options(
+            &req,
+            ConverterOptions {
+                kiro_cache_point_enabled: true,
+                ..ConverterOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.tool_cache_point_insert_after, vec![0]);
+        let context = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context;
+        assert_eq!(context.tools.len(), 1);
+        assert_eq!(
+            result
+                .tool_name_map
+                .get(&context.tools[0].tool_specification.name),
+            Some(&"write_file".to_string())
         );
     }
 

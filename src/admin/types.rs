@@ -7,6 +7,7 @@ use crate::model::config::{
     CompatProfile, CompressionConfig, ExternalPoolsConfig, KiroAgentModeStrategy,
     ModelMappingConfig, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
     PayloadShapingConfigPatch, PromptCacheCreationControlConfig, ReportedUsageConfig,
+    ThinkingTriggerMode,
 };
 
 // ============ 凭据状态 ============
@@ -536,6 +537,10 @@ where
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateCredentialAuthRequest {
+    #[serde(default, alias = "access_token")]
+    pub access_token: Option<String>,
+    #[serde(default, alias = "expires_at", alias = "expired")]
+    pub expires_at: Option<String>,
     #[serde(default)]
     pub refresh_token: Option<String>,
     #[serde(default)]
@@ -677,6 +682,14 @@ pub struct UsageCleanupStatusResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddCredentialRequest {
+    /// 访问令牌（可选；主要用于从 SSO JWT issuer 推导 token endpoint）
+    #[serde(alias = "access_token")]
+    pub access_token: Option<String>,
+
+    /// 访问令牌过期时间（可选；新增时仍会刷新验证）
+    #[serde(alias = "expires_at", alias = "expired")]
+    pub expires_at: Option<String>,
+
     /// 刷新令牌（OAuth 凭据必填，API Key 凭据不需要）
     #[serde(alias = "refresh_token")]
     pub refresh_token: Option<String>,
@@ -1300,6 +1313,7 @@ pub struct RuntimeConfigResponse {
     pub credential_max_cooldown_secs: u64,
     pub credential_dispatch_max_wait_secs: u64,
     pub kiro_upstream_response_timeout_secs: u64,
+    pub kiro_upstream_stream_idle_timeout_secs: u64,
     pub credential_retry_max_attempts: u32,
     pub credential_in_flight_lease_max_secs: u64,
     pub dispatch_global_max_concurrent_requests: u32,
@@ -1316,6 +1330,8 @@ pub struct RuntimeConfigResponse {
     pub scheduler_selection_pressure_weight: f64,
     pub scheduler_total_selection_weight: f64,
     pub scheduler_top_k: u32,
+    pub selection_failure_sample_limit: usize,
+    pub selection_failure_record_enabled: bool,
     pub compression_enabled: bool,
     pub whitespace_compression: bool,
     pub payload_guard_enabled: bool,
@@ -1324,6 +1340,9 @@ pub struct RuntimeConfigResponse {
     pub payload_guard_safety_margin_bytes: u64,
     pub payload_guard_trim_history: bool,
     pub payload_guard_external_enabled: bool,
+    pub kiro_cache_point_enabled: bool,
+    pub kiro_cache_point_tools_only: bool,
+    pub kiro_cache_point_record_plan: bool,
     pub payload_shaping: PayloadShapingConfig,
     pub prompt_cache_target_read_ratio: f64,
     pub prompt_cache_token_scale: f64,
@@ -1332,6 +1351,10 @@ pub struct RuntimeConfigResponse {
     pub prompt_cache_cap_jitter_max_tokens: i32,
     pub prompt_cache_scale_min_input_tokens: i32,
     pub prompt_cache_creation_control: PromptCacheCreationControlConfig,
+    pub prompt_cache_max_entries_per_account: usize,
+    pub prompt_cache_max_entries_global: usize,
+    pub prompt_cache_entry_ttl_secs: u64,
+    pub prompt_cache_estimated_bytes_limit: u64,
     pub reported_usage: ReportedUsageConfig,
     pub defined_cache_routes: Vec<String>,
     pub external_pools: ExternalPoolsConfig,
@@ -1341,6 +1364,7 @@ pub struct RuntimeConfigResponse {
     pub model_resolution_mode: ModelResolutionMode,
     pub model_mapping: ModelMappingConfig,
     pub extract_thinking: bool,
+    pub thinking_trigger_mode: ThinkingTriggerMode,
     pub expose_proxy_warnings: bool,
 }
 
@@ -1375,6 +1399,8 @@ pub struct UpdateRuntimeConfigRequest {
     #[serde(default)]
     pub kiro_upstream_response_timeout_secs: Option<u64>,
     #[serde(default)]
+    pub kiro_upstream_stream_idle_timeout_secs: Option<u64>,
+    #[serde(default)]
     pub credential_retry_max_attempts: Option<u32>,
     #[serde(default)]
     pub credential_in_flight_lease_max_secs: Option<u64>,
@@ -1405,6 +1431,10 @@ pub struct UpdateRuntimeConfigRequest {
     pub scheduler_total_selection_weight: Option<f64>,
     #[serde(default)]
     pub scheduler_top_k: Option<u32>,
+    #[serde(default)]
+    pub selection_failure_sample_limit: Option<usize>,
+    #[serde(default)]
+    pub selection_failure_record_enabled: Option<bool>,
     pub compression_enabled: bool,
     #[serde(default = "default_true")]
     pub whitespace_compression: bool,
@@ -1421,6 +1451,12 @@ pub struct UpdateRuntimeConfigRequest {
     #[serde(default)]
     pub payload_guard_external_enabled: Option<bool>,
     #[serde(default)]
+    pub kiro_cache_point_enabled: Option<bool>,
+    #[serde(default)]
+    pub kiro_cache_point_tools_only: Option<bool>,
+    #[serde(default)]
+    pub kiro_cache_point_record_plan: Option<bool>,
+    #[serde(default)]
     pub payload_shaping: Option<PayloadShapingConfigPatch>,
     #[serde(default)]
     pub prompt_cache_target_read_ratio: Option<f64>,
@@ -1436,6 +1472,14 @@ pub struct UpdateRuntimeConfigRequest {
     pub prompt_cache_scale_min_input_tokens: Option<i32>,
     #[serde(default)]
     pub prompt_cache_creation_control: Option<PromptCacheCreationControlConfig>,
+    #[serde(default)]
+    pub prompt_cache_max_entries_per_account: Option<usize>,
+    #[serde(default)]
+    pub prompt_cache_max_entries_global: Option<usize>,
+    #[serde(default)]
+    pub prompt_cache_entry_ttl_secs: Option<u64>,
+    #[serde(default)]
+    pub prompt_cache_estimated_bytes_limit: Option<u64>,
     #[serde(default)]
     pub reported_usage: Option<ReportedUsageConfig>,
     #[serde(default)]
@@ -1454,6 +1498,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub model_mapping: Option<ModelMappingConfig>,
     #[serde(default)]
     pub extract_thinking: Option<bool>,
+    #[serde(default)]
+    pub thinking_trigger_mode: Option<ThinkingTriggerMode>,
     #[serde(default)]
     pub expose_proxy_warnings: Option<bool>,
 }
@@ -1619,6 +1665,8 @@ mod tests {
     fn add_credential_request_accepts_snake_case_import_fields() {
         let json = serde_json::json!({
             "refresh_token": "fake-refresh-token",
+            "access_token": "fake-access-token",
+            "expires_at": "2026-06-28T00:00:00Z",
             "auth_method": "idc",
             "client_id": "fake-client-id",
             "client_secret": "fake-client-secret",
@@ -1635,6 +1683,8 @@ mod tests {
 
         let req: AddCredentialRequest = serde_json::from_value(json).unwrap();
 
+        assert_eq!(req.access_token.as_deref(), Some("fake-access-token"));
+        assert_eq!(req.expires_at.as_deref(), Some("2026-06-28T00:00:00Z"));
         assert_eq!(req.refresh_token.as_deref(), Some("fake-refresh-token"));
         assert_eq!(req.auth_method, "idc");
         assert_eq!(req.client_id.as_deref(), Some("fake-client-id"));
@@ -1666,6 +1716,8 @@ mod tests {
     fn add_credential_request_accepts_camel_case_import_fields() {
         let json = serde_json::json!({
             "refreshToken": "fake-refresh-token",
+            "accessToken": "fake-access-token",
+            "expired": "2026-06-28T00:00:00Z",
             "authMethod": "idc",
             "clientId": "fake-client-id",
             "clientSecret": "fake-client-secret",
@@ -1682,6 +1734,8 @@ mod tests {
 
         let req: AddCredentialRequest = serde_json::from_value(json).unwrap();
 
+        assert_eq!(req.access_token.as_deref(), Some("fake-access-token"));
+        assert_eq!(req.expires_at.as_deref(), Some("2026-06-28T00:00:00Z"));
         assert_eq!(req.refresh_token.as_deref(), Some("fake-refresh-token"));
         assert_eq!(req.auth_method, "idc");
         assert_eq!(req.client_id.as_deref(), Some("fake-client-id"));

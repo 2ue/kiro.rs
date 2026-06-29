@@ -95,6 +95,11 @@ pub(crate) async fn refresh_token(
     config: &Config,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<KiroCredentials> {
+    let mut normalized_credentials = credentials.clone();
+    normalized_credentials.canonicalize_auth_method();
+    normalized_credentials.normalize_external_idp_defaults();
+    let credentials = &normalized_credentials;
+
     // API Key 凭据不支持 Token 刷新：底层契约级拦截
     // 其他调用点（try_ensure_token / 活跃路径 / add_credential）在调用前已显式分流 API Key；
     // 仅 force_refresh_token_for 未分流，此处 bail 让错误自然传播为 400 BAD_REQUEST。

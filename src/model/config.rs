@@ -742,6 +742,23 @@ impl CompatProfile {
     }
 }
 
+/// Thinking 触发策略。
+///
+/// `real_request` 保持客户端请求的真实语义；`always` 在请求未显式关闭
+/// thinking 时强制进入可见 thinking 输出。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingTriggerMode {
+    RealRequest,
+    Always,
+}
+
+impl Default for ThinkingTriggerMode {
+    fn default() -> Self {
+        Self::RealRequest
+    }
+}
+
 /// Kiro IDE `x-amzn-kiro-agent-mode` header strategy.
 ///
 /// `vibe` preserves the current Kiro IDE / Claude Code compatible behavior.
@@ -1272,6 +1289,13 @@ pub struct Config {
     #[serde(default = "default_kiro_upstream_response_timeout_secs")]
     pub kiro_upstream_response_timeout_secs: u64,
 
+    /// Kiro 上游流式响应正文的静默超时秒数。
+    ///
+    /// 响应头回来后，如果 eventstream 在该时间内没有任何新 chunk，就按上游
+    /// stream idle 处理并释放并发占用。`0` 表示使用默认值，避免错误关闭保护。
+    #[serde(default = "default_kiro_upstream_stream_idle_timeout_secs")]
+    pub kiro_upstream_stream_idle_timeout_secs: u64,
+
     /// Kiro 上游基础 URL 覆盖。
     ///
     /// 默认 `None` 时使用官方 `https://q.{region}.amazonaws.com`。仅用于本地压测、
@@ -1358,6 +1382,20 @@ pub struct Config {
     #[serde(default = "default_payload_guard_external_enabled")]
     pub payload_guard_external_enabled: bool,
 
+    /// 是否把 Anthropic tool cache_control 转成 Kiro cachePoint 发送给上游。
+    ///
+    /// 默认关闭；开启后仅对实际发送给 Kiro 的工具定义插入 cachePoint。
+    #[serde(default = "default_kiro_cache_point_enabled")]
+    pub kiro_cache_point_enabled: bool,
+
+    /// cachePoint 第一阶段只根据工具上的 cache_control 插入，不自动改写系统消息或历史消息。
+    #[serde(default = "default_kiro_cache_point_tools_only")]
+    pub kiro_cache_point_tools_only: bool,
+
+    /// 是否把 cachePoint 插入计划写入 payload diagnostics，便于定位上游 body invalid。
+    #[serde(default = "default_kiro_cache_point_record_plan")]
+    pub kiro_cache_point_record_plan: bool,
+
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
@@ -1398,6 +1436,18 @@ pub struct Config {
     #[serde(default = "default_scheduler_top_k")]
     pub scheduler_top_k: u32,
 
+    /// 调度失败诊断中最多记录多少个账号样本。
+    ///
+    /// 只影响内部 usage/trace 元数据，不影响对下游返回的统一错误。
+    #[serde(default = "default_selection_failure_sample_limit")]
+    pub selection_failure_sample_limit: usize,
+
+    /// 是否记录调度失败的账号样本明细。
+    ///
+    /// 关闭后仍会保留原因计数和主原因，但不写入具体账号样本。
+    #[serde(default = "default_selection_failure_record_enabled")]
+    pub selection_failure_record_enabled: bool,
+
     /// Anthropic 兼容 profile（默认 claude-code）。
     #[serde(default = "default_compat_profile")]
     pub compat_profile: CompatProfile,
@@ -1423,6 +1473,10 @@ pub struct Config {
     /// 独立的 `{"type": "thinking", ...}` 内容块,与流式响应行为一致。
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
+
+    /// thinking 触发策略（默认按真实请求触发）。
+    #[serde(default = "default_thinking_trigger_mode")]
+    pub thinking_trigger_mode: ThinkingTriggerMode,
 
     /// 本地 prompt-cache 模拟的目标 cache read 中心比例。
     ///
@@ -1459,6 +1513,24 @@ pub struct Config {
     /// 本地 prompt-cache creation 上报频次控制。
     #[serde(default)]
     pub prompt_cache_creation_control: PromptCacheCreationControlConfig,
+
+    /// 本地 prompt-cache 每个账号最多保留的 fingerprint 条目。
+    #[serde(default = "default_prompt_cache_max_entries_per_account")]
+    pub prompt_cache_max_entries_per_account: usize,
+
+    /// 本地 prompt-cache 全局最多保留的 fingerprint 条目。
+    #[serde(default = "default_prompt_cache_max_entries_global")]
+    pub prompt_cache_max_entries_global: usize,
+
+    /// 本地 prompt-cache 单条 fingerprint 的最大 TTL 秒数。
+    ///
+    /// 实际 TTL 会取上游 cache_control TTL 与该值的较小值；默认值不会缩短现有 5m/1h 行为。
+    #[serde(default = "default_prompt_cache_entry_ttl_secs")]
+    pub prompt_cache_entry_ttl_secs: u64,
+
+    /// 本地 prompt-cache 估算内存上限。
+    #[serde(default = "default_prompt_cache_estimated_bytes_limit")]
+    pub prompt_cache_estimated_bytes_limit: u64,
 
     /// 下游 usage 上报投影配置。
     ///
@@ -1593,6 +1665,10 @@ fn default_kiro_upstream_response_timeout_secs() -> u64 {
     180
 }
 
+fn default_kiro_upstream_stream_idle_timeout_secs() -> u64 {
+    180
+}
+
 fn default_credential_in_flight_lease_max_secs() -> u64 {
     900
 }
@@ -1643,6 +1719,14 @@ fn default_scheduler_total_selection_weight() -> f64 {
 
 fn default_scheduler_top_k() -> u32 {
     3
+}
+
+fn default_selection_failure_sample_limit() -> usize {
+    20
+}
+
+fn default_selection_failure_record_enabled() -> bool {
+    true
 }
 
 fn default_payload_shaping_enabled() -> bool {
@@ -1717,6 +1801,18 @@ fn default_payload_guard_external_enabled() -> bool {
     true
 }
 
+fn default_kiro_cache_point_enabled() -> bool {
+    false
+}
+
+fn default_kiro_cache_point_tools_only() -> bool {
+    true
+}
+
+fn default_kiro_cache_point_record_plan() -> bool {
+    true
+}
+
 fn default_compat_profile() -> CompatProfile {
     CompatProfile::ClaudeCode
 }
@@ -1731,6 +1827,10 @@ fn default_model_resolution_mode() -> ModelResolutionMode {
 
 fn default_extract_thinking() -> bool {
     true
+}
+
+fn default_thinking_trigger_mode() -> ThinkingTriggerMode {
+    ThinkingTriggerMode::RealRequest
 }
 
 fn default_true() -> bool {
@@ -1787,6 +1887,22 @@ fn default_prompt_cache_creation_max_tokens_per_window() -> i32 {
 
 fn default_prompt_cache_creation_expire_after_idle_secs() -> u64 {
     3_600
+}
+
+fn default_prompt_cache_max_entries_per_account() -> usize {
+    200
+}
+
+fn default_prompt_cache_max_entries_global() -> usize {
+    20_000
+}
+
+fn default_prompt_cache_entry_ttl_secs() -> u64 {
+    86_400
+}
+
+fn default_prompt_cache_estimated_bytes_limit() -> u64 {
+    256 * 1024 * 1024
 }
 
 fn default_usage_record_limit() -> usize {
@@ -2004,6 +2120,8 @@ impl Default for Config {
             credential_max_cooldown_secs: default_credential_max_cooldown_secs(),
             credential_dispatch_max_wait_secs: default_credential_dispatch_max_wait_secs(),
             kiro_upstream_response_timeout_secs: default_kiro_upstream_response_timeout_secs(),
+            kiro_upstream_stream_idle_timeout_secs: default_kiro_upstream_stream_idle_timeout_secs(
+            ),
             kiro_upstream_base_url: None,
             credential_retry_max_attempts: 0,
             credential_in_flight_lease_max_secs: default_credential_in_flight_lease_max_secs(),
@@ -2021,6 +2139,9 @@ impl Default for Config {
             payload_guard_safety_margin_bytes: default_payload_guard_safety_margin_bytes(),
             payload_guard_trim_history: default_payload_guard_trim_history(),
             payload_guard_external_enabled: default_payload_guard_external_enabled(),
+            kiro_cache_point_enabled: default_kiro_cache_point_enabled(),
+            kiro_cache_point_tools_only: default_kiro_cache_point_tools_only(),
+            kiro_cache_point_record_plan: default_kiro_cache_point_record_plan(),
             load_balancing_mode: default_load_balancing_mode(),
             scheduler_error_ewma_alpha: default_scheduler_error_ewma_alpha(),
             scheduler_priority_weight: default_scheduler_priority_weight(),
@@ -2031,11 +2152,14 @@ impl Default for Config {
             scheduler_selection_pressure_weight: default_scheduler_selection_pressure_weight(),
             scheduler_total_selection_weight: default_scheduler_total_selection_weight(),
             scheduler_top_k: default_scheduler_top_k(),
+            selection_failure_sample_limit: default_selection_failure_sample_limit(),
+            selection_failure_record_enabled: default_selection_failure_record_enabled(),
             compat_profile: default_compat_profile(),
             kiro_agent_mode_strategy: default_kiro_agent_mode_strategy(),
             model_resolution_mode: default_model_resolution_mode(),
             model_mapping: ModelMappingConfig::default(),
             extract_thinking: default_extract_thinking(),
+            thinking_trigger_mode: default_thinking_trigger_mode(),
             prompt_cache_target_read_ratio: default_prompt_cache_target_read_ratio(),
             prompt_cache_token_scale: default_prompt_cache_token_scale(),
             prompt_cache_max_simulated_input_tokens:
@@ -2044,6 +2168,10 @@ impl Default for Config {
             prompt_cache_cap_jitter_max_tokens: default_prompt_cache_cap_jitter_max_tokens(),
             prompt_cache_scale_min_input_tokens: default_prompt_cache_scale_min_input_tokens(),
             prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+            prompt_cache_max_entries_per_account: default_prompt_cache_max_entries_per_account(),
+            prompt_cache_max_entries_global: default_prompt_cache_max_entries_global(),
+            prompt_cache_entry_ttl_secs: default_prompt_cache_entry_ttl_secs(),
+            prompt_cache_estimated_bytes_limit: default_prompt_cache_estimated_bytes_limit(),
             reported_usage: ReportedUsageConfig::default(),
             defined_cache_routes: Vec::new(),
             usage_record_limit: default_usage_record_limit(),
@@ -2225,6 +2353,7 @@ mod tests {
         assert_eq!(config.credential_max_cooldown_secs, 300);
         assert_eq!(config.credential_dispatch_max_wait_secs, 120);
         assert_eq!(config.kiro_upstream_response_timeout_secs, 180);
+        assert_eq!(config.kiro_upstream_stream_idle_timeout_secs, 180);
         assert_eq!(config.kiro_upstream_base_url, None);
         assert_eq!(config.credential_retry_max_attempts, 0);
         assert_eq!(config.credential_in_flight_lease_max_secs, 900);
@@ -2239,6 +2368,9 @@ mod tests {
         assert_eq!(config.payload_guard_safety_margin_bytes, 32 * 1024);
         assert!(config.payload_guard_trim_history);
         assert!(config.payload_guard_external_enabled);
+        assert!(!config.kiro_cache_point_enabled);
+        assert!(config.kiro_cache_point_tools_only);
+        assert!(config.kiro_cache_point_record_plan);
         assert!(config.payload_shaping.enabled);
         assert!(config.payload_shaping.truncate_historical_tool_results);
         assert_eq!(
@@ -2253,6 +2385,12 @@ mod tests {
         assert_eq!(config.scheduler_selection_pressure_weight, 25.0);
         assert_eq!(config.scheduler_total_selection_weight, 0.0);
         assert_eq!(config.scheduler_top_k, 3);
+        assert_eq!(config.selection_failure_sample_limit, 20);
+        assert!(config.selection_failure_record_enabled);
+        assert_eq!(config.prompt_cache_max_entries_per_account, 200);
+        assert_eq!(config.prompt_cache_max_entries_global, 20_000);
+        assert_eq!(config.prompt_cache_entry_ttl_secs, 86_400);
+        assert_eq!(config.prompt_cache_estimated_bytes_limit, 256 * 1024 * 1024);
         assert!(!config.external_pools.external_pools_enabled);
         assert_eq!(
             config.external_pools.external_pool_capacity_mode,
@@ -2556,6 +2694,37 @@ mod tests {
         assert_eq!(config.prompt_cache_cap_jitter_min_tokens, 5_000);
         assert_eq!(config.prompt_cache_cap_jitter_max_tokens, 20_000);
         assert_eq!(config.prompt_cache_scale_min_input_tokens, 10_000);
+    }
+
+    #[test]
+    fn prompt_cache_bounds_and_selection_diagnostics_deserialize_from_camel_case_config() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "apiKey": "sk-test",
+                "selectionFailureSampleLimit": 12,
+                "selectionFailureRecordEnabled": false,
+                "kiroUpstreamStreamIdleTimeoutSecs": 45,
+                "kiroCachePointEnabled": true,
+                "kiroCachePointToolsOnly": false,
+                "kiroCachePointRecordPlan": false,
+                "promptCacheMaxEntriesPerAccount": 50,
+                "promptCacheMaxEntriesGlobal": 500,
+                "promptCacheEntryTtlSecs": 600,
+                "promptCacheEstimatedBytesLimit": 1048576
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.selection_failure_sample_limit, 12);
+        assert!(!config.selection_failure_record_enabled);
+        assert_eq!(config.kiro_upstream_stream_idle_timeout_secs, 45);
+        assert!(config.kiro_cache_point_enabled);
+        assert!(!config.kiro_cache_point_tools_only);
+        assert!(!config.kiro_cache_point_record_plan);
+        assert_eq!(config.prompt_cache_max_entries_per_account, 50);
+        assert_eq!(config.prompt_cache_max_entries_global, 500);
+        assert_eq!(config.prompt_cache_entry_ttl_secs, 600);
+        assert_eq!(config.prompt_cache_estimated_bytes_limit, 1_048_576);
     }
 
     #[test]

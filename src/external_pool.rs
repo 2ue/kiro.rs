@@ -34,7 +34,9 @@ use crate::{
             breakdown_anthropic_messages_request, guard_anthropic_messages_request,
         },
         pricing::PricingCatalog,
-        prompt_cache::{PromptCacheProfile, PromptCacheScope, PromptCacheTracker},
+        prompt_cache::{
+            PromptCacheBounds, PromptCacheProfile, PromptCacheScope, PromptCacheTracker,
+        },
         prompt_cache_creation_control::PromptCacheCreationController,
         types::MessagesRequest,
         usage::{
@@ -384,6 +386,7 @@ pub struct ExternalRouteRequest {
     pub prompt_cache_cap_jitter_max_tokens: i32,
     pub prompt_cache_scale_min_input_tokens: i32,
     pub prompt_cache_creation_control: PromptCacheCreationControlConfig,
+    pub prompt_cache_bounds: PromptCacheBounds,
     pub model_capabilities: Arc<ModelCapabilitiesCatalog>,
     pub pricing_catalog: Arc<PricingCatalog>,
     pub request_id: String,
@@ -627,6 +630,7 @@ struct ExternalUsageProjectionContext {
     prompt_cache: Arc<PromptCacheTracker>,
     prompt_cache_profile: Option<PromptCacheProfile>,
     prompt_cache_target_read_ratio: f64,
+    prompt_cache_bounds: PromptCacheBounds,
     prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
     prompt_cache_creation_control: PromptCacheCreationControlConfig,
     uplift_percent: u32,
@@ -4129,10 +4133,11 @@ fn build_external_usage_projection_context(
             &model,
         );
         let scope = external_prompt_cache_scope(route, pool, &model);
-        let prompt_usage = route.prompt_cache.compute(
+        let prompt_usage = route.prompt_cache.compute_with_bounds(
             scope.clone(),
             profile.as_ref(),
             route.prompt_cache_target_read_ratio,
+            route.prompt_cache_bounds,
         );
         let simulated_usage = profile.as_ref().and_then(|profile| {
             CacheSimulation::from_prompt_cache_with_ratio_and_amplification(
@@ -4162,6 +4167,7 @@ fn build_external_usage_projection_context(
         prompt_cache: route.prompt_cache.clone(),
         prompt_cache_profile: profile,
         prompt_cache_target_read_ratio: route.prompt_cache_target_read_ratio,
+        prompt_cache_bounds: route.prompt_cache_bounds,
         prompt_cache_creation_controller: route.prompt_cache_creation_controller.clone(),
         prompt_cache_creation_control: route.prompt_cache_creation_control,
         uplift_percent,
@@ -4227,10 +4233,11 @@ impl ExternalUsageProjectionContext {
             self.prompt_cache_creation_control,
             usage,
         );
-        self.prompt_cache.update(
+        self.prompt_cache.update_with_bounds(
             self.scope.clone(),
             self.prompt_cache_profile.as_ref(),
             self.prompt_cache_target_read_ratio,
+            self.prompt_cache_bounds,
         );
     }
 }
@@ -4901,6 +4908,7 @@ mod tests {
             prompt_cache_cap_jitter_max_tokens: 24_000,
             prompt_cache_scale_min_input_tokens: 20_000,
             prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+            prompt_cache_bounds: PromptCacheBounds::default(),
             model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_external_capacity".to_string(),
@@ -5181,6 +5189,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
             prompt_cache_cap_jitter_max_tokens: 24_000,
             prompt_cache_scale_min_input_tokens: 20_000,
             prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+            prompt_cache_bounds: PromptCacheBounds::default(),
             model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_external_billing".to_string(),

@@ -31,8 +31,7 @@ use crate::kiro::protocol::{
 };
 use crate::kiro::token_manager::{
     AcquireMode, CallContext, CredentialRiskControlReason, EXTERNAL_CREDENTIAL_CONTEXT_ID,
-    InFlightKind, InFlightLeaseGuard, LocalPoolRouteState, ManagerSnapshot, MultiTokenManager,
-    TransientFailureKind,
+    InFlightKind, InFlightLeaseGuard, LocalPoolRouteState, MultiTokenManager, TransientFailureKind,
 };
 use crate::model::config::{Config, TlsBackend};
 use parking_lot::Mutex;
@@ -772,7 +771,7 @@ mod tests {
         .to_string();
 
         assert!(
-            err.contains("所有凭据均已禁用"),
+            err.contains("所有账号均已禁用"),
             "错误应直接来自本地调度失败，实际: {}",
             err
         );
@@ -883,16 +882,7 @@ impl KiroProvider {
 
     /// 获取凭据的脱敏展示名称，用于请求级 usage 记录。
     pub fn credential_label(&self, id: u64) -> Option<String> {
-        self.token_manager
-            .snapshot()
-            .entries
-            .into_iter()
-            .find(|entry| entry.id == id)
-            .and_then(|entry| {
-                entry.email.or(entry.masked_api_key).or(entry
-                    .endpoint
-                    .map(|endpoint| format!("#{} {}", id, endpoint)))
-            })
+        self.token_manager.credential_display_label(id)
     }
 
     /// 获取当前运行时配置快照。
@@ -900,9 +890,13 @@ impl KiroProvider {
         self.token_manager.runtime_config()
     }
 
-    /// 获取调度器状态快照，用于错误响应携带当前冷却/容量信息。
-    pub fn manager_snapshot(&self) -> ManagerSnapshot {
-        self.token_manager.snapshot()
+    /// 获取下游错误响应的 Retry-After 提示。
+    ///
+    /// 该路径只读本进程内存状态，避免在请求失败热路径触发 Admin 完整快照的
+    /// PgSQL/Redis 同步。
+    pub fn cooldown_retry_after_hint_secs(&self, fallback_secs: u64) -> u64 {
+        self.token_manager
+            .cooldown_retry_after_hint_secs(fallback_secs)
     }
 
     pub fn local_pool_route_state(&self, model: Option<&str>) -> LocalPoolRouteState {
@@ -1419,7 +1413,7 @@ impl KiroProvider {
             .acquire_context_for_credential(credential_id)
             .await?;
         let credential_label = self.credential_log_label(ctx.id);
-        let credential_context = format!("凭据 {}", credential_label);
+        let credential_context = format!("账号 {}", credential_label);
         self.call_api_with_single_context(ctx, request_body, credential_label, credential_context)
             .await
     }
@@ -1573,7 +1567,7 @@ impl KiroProvider {
             let ctx = match self.token_manager.acquire_context_for_credential(id).await {
                 Ok(ctx) => ctx,
                 Err(err) => {
-                    last_error = Some(anyhow::anyhow!("凭据 #{} 获取 token 失败: {}", id, err));
+                    last_error = Some(anyhow::anyhow!("账号 #{} 获取 token 失败: {}", id, err));
                     continue;
                 }
             };
@@ -1581,7 +1575,7 @@ impl KiroProvider {
             match self.list_available_models_for_context(ctx).await {
                 Ok(models) if !models.is_empty() => return Ok(models),
                 Ok(_) => {
-                    last_error = Some(anyhow::anyhow!("凭据 #{} 返回空模型列表", id));
+                    last_error = Some(anyhow::anyhow!("账号 #{} 返回空模型列表", id));
                 }
                 Err(err) => {
                     let label = self.credential_log_label(ctx_id);
@@ -1596,7 +1590,7 @@ impl KiroProvider {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("没有已启用且可用于同步模型能力的凭据")))
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("没有已启用且可用于同步模型能力的账号")))
     }
 
     async fn list_available_models_for_context(
@@ -1759,7 +1753,7 @@ impl KiroProvider {
             };
             ctx.mark_in_flight_kind(InFlightKind::Mcp);
             let credential_label = self.credential_log_label(ctx.id);
-            let credential_context = format!("凭据 {}", credential_label);
+            let credential_context = format!("账号 {}", credential_label);
             let attempt_started_at = Instant::now();
 
             let config = self.token_manager.runtime_config();
@@ -1902,7 +1896,7 @@ impl KiroProvider {
                 if !has_available {
                     self.finish_attempt(&mut ctx);
                     anyhow::bail!(
-                        "MCP 请求失败（{}，所有凭据已用尽）: {} {}",
+                        "MCP 请求失败（{}，所有账号已用尽）: {} {}",
                         credential_context,
                         status,
                         body
@@ -1934,7 +1928,7 @@ impl KiroProvider {
                 if !has_available {
                     self.finish_attempt(&mut ctx);
                     anyhow::bail!(
-                        "MCP 请求失败（{}，所有凭据已用尽）: {} {}",
+                        "MCP 请求失败（{}，所有账号已用尽）: {} {}",
                         credential_context,
                         status,
                         body
@@ -1993,7 +1987,7 @@ impl KiroProvider {
                 tracing::warn!(
                     credential_id = ctx.id,
                     credential_label = %credential_label,
-                    "MCP 请求失败（{}，可能为凭据错误，尝试 {}/{}）: {} {}",
+                    "MCP 请求失败（{}，可能为账号认证错误，尝试 {}/{}）: {} {}",
                     credential_context,
                     attempt + 1,
                     max_retries,
@@ -2034,7 +2028,7 @@ impl KiroProvider {
                 self.finish_attempt(&mut ctx);
                 if matches!(decision, CredentialAuthFailureDecision::Exhausted) {
                     anyhow::bail!(
-                        "MCP 请求失败（{}，所有凭据已用尽）: {} {}",
+                        "MCP 请求失败（{}，所有账号已用尽）: {} {}",
                         credential_context,
                         status,
                         body
@@ -2205,7 +2199,7 @@ impl KiroProvider {
                 InFlightKind::Api
             });
             let credential_label = self.credential_log_label(ctx.id);
-            let credential_context = format!("凭据 {}", credential_label);
+            let credential_context = format!("账号 {}", credential_label);
             let attempt_started_at = Instant::now();
 
             let config = self.token_manager.runtime_config();
@@ -2566,7 +2560,7 @@ impl KiroProvider {
                 }
                 if !has_available {
                     let final_message = format!(
-                        "{} API 请求失败（{}，所有凭据已用尽）: {} {}",
+                        "{} API 请求失败（{}，所有账号已用尽）: {} {}",
                         api_type, credential_context, status, body
                     );
                     Self::push_attempt(
@@ -2626,7 +2620,7 @@ impl KiroProvider {
                 }
                 if !has_available {
                     let final_message = format!(
-                        "{} API 请求失败（{}，所有凭据已用尽）: {} {}",
+                        "{} API 请求失败（{}，所有账号已用尽）: {} {}",
                         api_type, credential_context, status, body
                     );
                     Self::push_attempt(
@@ -2744,7 +2738,7 @@ impl KiroProvider {
                 tracing::warn!(
                     credential_id = ctx.id,
                     credential_label = %credential_label,
-                    "API 请求失败（{}，可能为凭据错误，尝试 {}/{}）: {} {}",
+                    "API 请求失败（{}，可能为账号认证错误，尝试 {}/{}）: {} {}",
                     credential_context,
                     attempt + 1,
                     max_retries,
@@ -2809,7 +2803,7 @@ impl KiroProvider {
 
                 if matches!(decision, CredentialAuthFailureDecision::Exhausted) {
                     let final_message = format!(
-                        "{} API 请求失败（{}，所有凭据已用尽）: {} {}",
+                        "{} API 请求失败（{}，所有账号已用尽）: {} {}",
                         api_type, credential_context, status, body
                     );
                     Self::push_attempt(

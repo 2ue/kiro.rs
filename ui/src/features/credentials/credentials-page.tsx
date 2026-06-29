@@ -322,8 +322,15 @@ export function CredentialsPage() {
   const clearFilters = () => { setQueryText(''); setStatusFilter('__all__'); setAuthFilter('__all__'); setSubscriptionFilter('__all__'); setProxyFilter('__all__') }
 
   const setLbMode = (mode: LoadBalancingMode) => {
+    const label = mode === 'priority'
+      ? '优先级'
+      : mode === 'balanced'
+        ? '均衡负载'
+        : mode === 'health_balanced'
+          ? '健康均衡'
+          : '低负载优先'
     setLoadBalancingMutation.mutate(mode, {
-      onSuccess: () => toast.success(`已切换为${mode === 'priority' ? '优先级' : mode === 'balanced' ? '均衡负载' : '健康均衡'}模式`),
+      onSuccess: () => toast.success(`已切换为${label}模式`),
       onError: (e) => toast.error(`切换失败: ${extractErrorMessage(e)}`),
     })
   }
@@ -427,6 +434,7 @@ export function CredentialsPage() {
                 <SelectItem value="priority">优先级</SelectItem>
                 <SelectItem value="balanced">均衡负载</SelectItem>
                 <SelectItem value="health_balanced">健康均衡</SelectItem>
+                <SelectItem value="weighted_least_inflight">低负载优先</SelectItem>
               </SelectContent>
             </Select>
             <Button variant="outline" size="sm" onClick={() => credentials.refetch()}>
@@ -474,7 +482,9 @@ export function CredentialsPage() {
               ? '优先级模式'
               : loadBalancing.data?.mode === 'balanced'
                 ? '均衡负载'
-                : '健康均衡'
+                : loadBalancing.data?.mode === 'health_balanced'
+                  ? '健康均衡'
+                  : '低负载优先'
           }
           tone="primary"
         />

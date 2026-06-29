@@ -46,8 +46,13 @@ use super::capacity::{
     effective_max_concurrent_requests, entry_has_concurrency_capacity,
     global_has_concurrency_capacity, is_opus_model, proxy_unavailable_error,
 };
-use super::concurrency::{DispatchQueueGuard, InFlightLeaseGuard};
-use super::cooldown::{entry_cooldown_remaining, model_state_key};
+#[cfg(test)]
+use super::concurrency::record_released_in_flight_lease_tombstone;
+use super::concurrency::{
+    DispatchQueueGuard, InFlightLeaseGuard, ReleasedInFlightLeaseTombstones,
+    filter_released_in_flight_leases_from_scheduler_states,
+};
+use super::cooldown::{entry_any_cooldown_remaining, entry_cooldown_remaining, model_state_key};
 use super::queue::{
     concurrency_blocked_count, effective_concurrency_range_for_candidates,
     format_effective_concurrency_range, min_dispatch_wait,
@@ -83,7 +88,7 @@ use super::storage_task::{block_on_storage, spawn_best_effort_storage_task};
 use super::strategy::{
     balanced_selection_key, entry_effective_health_mut, priority_selection_key,
     record_local_selection, refresh_local_selection_windows_locked, select_health_weighted,
-    should_select_warming_from_totals,
+    select_weighted_least_inflight, should_select_warming_from_totals,
 };
 use super::types::{
     AcquireMode, CallContext, CredentialAuthUpdate, EXTERNAL_CREDENTIAL_CONTEXT_ID, InFlightKind,
@@ -128,6 +133,8 @@ fn apply_optional_string(target: &mut Option<String>, value: Option<String>) {
 
 fn apply_credential_auth_update(credential: &mut KiroCredentials, update: CredentialAuthUpdate) {
     let mut clear_access_token = false;
+    let explicit_access_token = update.access_token;
+    let explicit_expires_at = update.expires_at;
 
     if let Some(api_key) = update.kiro_api_key {
         credential.kiro_api_key = trimmed_optional(api_key);
@@ -202,6 +209,13 @@ fn apply_credential_auth_update(credential: &mut KiroCredentials, update: Creden
         credential.profile_arn = None;
         credential.subscription_title = None;
     }
+    if explicit_access_token.is_some() {
+        apply_optional_string(&mut credential.access_token, explicit_access_token);
+    }
+    if explicit_expires_at.is_some() {
+        apply_optional_string(&mut credential.expires_at, explicit_expires_at);
+    }
+    credential.normalize_external_idp_defaults();
 }
 
 // ============================================================================
@@ -254,6 +268,10 @@ pub struct MultiTokenManager {
     last_scheduler_redis_cleanup_at: Mutex<Option<Instant>>,
     /// Redis 调度热路径最近一次超时/失败后的退避截止时间。退避期间请求只用本机内存态调度。
     scheduler_redis_degraded_until: Mutex<Option<Instant>>,
+    /// Redis 调度热路径连续失败次数。Redis 持续慢时拉长退避，避免每个退避周期重复制造阻塞。
+    scheduler_redis_degraded_streak: AtomicU32,
+    /// Redis 热路径并发探测数量。突发流量下限制同进程同时阻塞在 Redis 上的请求数。
+    scheduler_redis_hot_ops_in_flight: AtomicU32,
     /// Redis 全量调度状态同步后台任务是否正在运行，避免高并发下重复扫全部账号状态。
     scheduler_redis_sync_in_flight: Arc<AtomicBool>,
     /// 统计数据是否有未落盘更新
@@ -266,6 +284,9 @@ pub struct MultiTokenManager {
     session_bindings: Mutex<HashMap<String, SessionBinding>>,
     /// 凭据并发槽释放通知，用于所有凭据占满时排队等待。
     in_flight_notify: Arc<Notify>,
+    /// 本进程近期已经释放的 Redis lease。Redis release 是异步写，后台同步可能先读到旧快照；
+    /// 这里用短 TTL tombstone 避免旧 lease 被重新导入本地并发槽。
+    released_in_flight_lease_tombstones: ReleasedInFlightLeaseTombstones,
     next_in_flight_lease_id: AtomicU64,
     queued_requests: Arc<AtomicU32>,
     /// 短 TTL 派生缓存，只用于避免高并发下本地池预检重复全量扫描。
@@ -279,9 +300,44 @@ const CONCURRENCY_WAIT_WAKEUP_SECS: u64 = 30;
 const SCHEDULER_REDIS_SYNC_MIN_INTERVAL: StdDuration = StdDuration::from_secs(1);
 const SCHEDULER_REDIS_CLEANUP_MIN_INTERVAL: StdDuration = StdDuration::from_secs(5);
 const SCHEDULER_REDIS_HOT_OP_TIMEOUT: StdDuration = StdDuration::from_millis(75);
-const SCHEDULER_REDIS_DEGRADED_BACKOFF: StdDuration = StdDuration::from_secs(2);
-const SELECTION_FAILURE_SAMPLE_LIMIT: usize = 20;
+const SCHEDULER_REDIS_DEGRADED_BACKOFF_BASE: StdDuration = StdDuration::from_secs(2);
+const SCHEDULER_REDIS_DEGRADED_BACKOFF_MAX: StdDuration = StdDuration::from_secs(30);
+const SCHEDULER_REDIS_HOT_MAX_PARALLEL_OPS: u32 = 2;
 const CREDENTIAL_STATS_FLUSH_MIN_INTERVAL: StdDuration = StdDuration::from_secs(5);
+const LOCAL_REDIS_LEASE_COUNTER_SPACE: u64 = 1_000_000_000;
+const LOCAL_REDIS_LEASE_NAMESPACE_COUNT: u64 = 9_000_000_000;
+static LOCAL_REDIS_LEASE_NAMESPACE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+struct SchedulerRedisHotOpGuard<'a> {
+    in_flight: &'a AtomicU32,
+}
+
+enum SchedulerRedisHotOutcome<T> {
+    Completed(T),
+    Skipped,
+    Failed,
+}
+
+impl Drop for SchedulerRedisHotOpGuard<'_> {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn initial_in_flight_lease_id(redis_enabled: bool) -> u64 {
+    if !redis_enabled {
+        return 1;
+    }
+    let seq = LOCAL_REDIS_LEASE_NAMESPACE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let now = Utc::now()
+        .timestamp_nanos_opt()
+        .map(|value| value as u64)
+        .unwrap_or_else(|| Utc::now().timestamp_micros() as u64);
+    let pid = std::process::id() as u64;
+    let mixed = now ^ pid.rotate_left(17) ^ seq.rotate_left(33);
+    let namespace = mixed % LOCAL_REDIS_LEASE_NAMESPACE_COUNT + 1;
+    namespace.saturating_mul(LOCAL_REDIS_LEASE_COUNTER_SPACE)
+}
 
 impl MultiTokenManager {
     /// 创建多凭据 Token 管理器
@@ -463,6 +519,7 @@ impl MultiTokenManager {
         } else {
             HashMap::new()
         };
+        let redis_enabled = redis_store.is_some();
         let manager = Self {
             config: Mutex::new(config),
             proxy,
@@ -477,13 +534,16 @@ impl MultiTokenManager {
             last_scheduler_redis_sync_at: Mutex::new(None),
             last_scheduler_redis_cleanup_at: Mutex::new(None),
             scheduler_redis_degraded_until: Mutex::new(None),
+            scheduler_redis_degraded_streak: AtomicU32::new(0),
+            scheduler_redis_hot_ops_in_flight: AtomicU32::new(0),
             scheduler_redis_sync_in_flight: Arc::new(AtomicBool::new(false)),
             stats_dirty: AtomicBool::new(false),
             pending_stats_deltas: Mutex::new(HashMap::new()),
             pending_runtime_state_snapshots: Mutex::new(HashMap::new()),
             session_bindings: Mutex::new(HashMap::new()),
             in_flight_notify: Arc::new(Notify::new()),
-            next_in_flight_lease_id: AtomicU64::new(1),
+            released_in_flight_lease_tombstones: Arc::new(Mutex::new(HashMap::new())),
+            next_in_flight_lease_id: AtomicU64::new(initial_in_flight_lease_id(redis_enabled)),
             queued_requests: Arc::new(AtomicU32::new(0)),
             local_pool_route_state_cache: Arc::new(Mutex::new(HashMap::new())),
         };
@@ -524,6 +584,55 @@ impl MultiTokenManager {
 
     pub fn current_id(&self) -> u64 {
         *self.current_id.lock()
+    }
+
+    /// 获取请求热路径使用的账号展示名。
+    ///
+    /// 这里只读取内存中的凭据基础字段，不触发 PgSQL/Redis 同步。调用方用于 usage
+    /// 记录和日志展示，不能因为展示字段读取把 Admin 完整快照放进模型请求热路径。
+    pub fn credential_display_label(&self, id: u64) -> Option<String> {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| {
+                entry
+                    .credentials
+                    .email
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| entry.credentials.kiro_api_key.as_deref().map(mask_api_key))
+                    .or_else(|| {
+                        entry
+                            .credentials
+                            .endpoint
+                            .as_ref()
+                            .map(|endpoint| format!("#{} {}", id, endpoint))
+                    })
+            })
+    }
+
+    /// 获取错误响应热路径使用的 Retry-After 提示。
+    ///
+    /// 该方法只基于本进程内存中的冷却状态计算，不同步 PgSQL 统计或 Redis 调度运行态。
+    /// 调度决策本身仍由 acquire 路径负责；这里仅用于构造下游响应头。
+    pub fn cooldown_retry_after_hint_secs(&self, fallback_secs: u64) -> u64 {
+        self.cleanup_expired_in_flight_leases_local_first();
+        let fallback_secs = fallback_secs.max(1);
+        let now = Instant::now();
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .filter(|entry| !entry.disabled)
+            .filter_map(|entry| {
+                entry_any_cooldown_remaining(entry, now)
+                    .map(|duration| duration.as_secs().saturating_add(1))
+            })
+            .min()
+            .unwrap_or(fallback_secs)
+            .max(1)
     }
 
     fn credential_audit_label(entry: &CredentialEntry) -> String {
@@ -724,8 +833,14 @@ impl MultiTokenManager {
         let state = self.compute_local_pool_route_state(model);
         let (stage, primary_reason) =
             Self::selection_failure_stage_and_reason(&state, error_message);
+        let config = self.config.lock().clone();
+        let sample_limit = if config.selection_failure_record_enabled {
+            config.selection_failure_sample_limit
+        } else {
+            0
+        };
         let (reason_counts, sampled_accounts, rejected_account_count, waitable_account_count) =
-            self.selection_failure_account_breakdown(model);
+            self.selection_failure_account_breakdown(model, sample_limit);
         let retry_after_ms = state.retry_after_secs.map(|secs| secs.saturating_mul(1000));
 
         SelectionFailureSummary {
@@ -829,6 +944,7 @@ impl MultiTokenManager {
     fn selection_failure_account_breakdown(
         &self,
         model: Option<&str>,
+        sample_limit: usize,
     ) -> (
         BTreeMap<AccountRejectReason, usize>,
         Vec<RejectedAccountSample>,
@@ -881,7 +997,7 @@ impl MultiTokenManager {
             rejected_account_count = rejected_account_count.saturating_add(1);
             *reason_counts.entry(reason).or_insert(0) += 1;
 
-            if sampled_accounts.len() < SELECTION_FAILURE_SAMPLE_LIMIT {
+            if sampled_accounts.len() < sample_limit {
                 sampled_accounts.push(RejectedAccountSample {
                     account_id: entry.id,
                     reason,
@@ -1122,16 +1238,55 @@ impl MultiTokenManager {
         }
     }
 
+    fn try_enter_scheduler_redis_hot_op(&self) -> Option<SchedulerRedisHotOpGuard<'_>> {
+        self.scheduler_redis_hot_ops_in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < SCHEDULER_REDIS_HOT_MAX_PARALLEL_OPS).then_some(current + 1)
+            })
+            .ok()?;
+        Some(SchedulerRedisHotOpGuard {
+            in_flight: &self.scheduler_redis_hot_ops_in_flight,
+        })
+    }
+
     fn mark_scheduler_redis_degraded(&self, operation: &'static str, err: &anyhow::Error) {
-        *self.scheduler_redis_degraded_until.lock() =
-            Some(Instant::now() + SCHEDULER_REDIS_DEGRADED_BACKOFF);
-        tracing::warn!(
-            operation,
-            timeout_ms = SCHEDULER_REDIS_HOT_OP_TIMEOUT.as_millis() as u64,
-            backoff_ms = SCHEDULER_REDIS_DEGRADED_BACKOFF.as_millis() as u64,
-            "Redis 调度热路径不可用，本进程暂时降级为本地调度: {}",
-            err
-        );
+        let now = Instant::now();
+        let (already_degraded, backoff) = {
+            let mut degraded_until = self.scheduler_redis_degraded_until.lock();
+            let already_degraded = degraded_until.is_some_and(|existing| existing > now);
+            let streak = if already_degraded {
+                self.scheduler_redis_degraded_streak.load(Ordering::Acquire)
+            } else {
+                self.scheduler_redis_degraded_streak
+                    .fetch_add(1, Ordering::AcqRel)
+                    .saturating_add(1)
+            };
+            let shift = streak.saturating_sub(1).min(4);
+            let multiplier = 1u32 << shift;
+            let backoff = SCHEDULER_REDIS_DEGRADED_BACKOFF_BASE
+                .saturating_mul(multiplier)
+                .min(SCHEDULER_REDIS_DEGRADED_BACKOFF_MAX);
+            let until = now + backoff;
+            *degraded_until = Some(until);
+            (already_degraded, backoff)
+        };
+        if already_degraded {
+            tracing::debug!(
+                operation,
+                timeout_ms = SCHEDULER_REDIS_HOT_OP_TIMEOUT.as_millis() as u64,
+                backoff_ms = backoff.as_millis() as u64,
+                "Redis 调度热路径仍在退避窗口内，沿用本地调度: {}",
+                err
+            );
+        } else {
+            tracing::warn!(
+                operation,
+                timeout_ms = SCHEDULER_REDIS_HOT_OP_TIMEOUT.as_millis() as u64,
+                backoff_ms = backoff.as_millis() as u64,
+                "Redis 调度热路径不可用，本进程暂时降级为本地调度: {}",
+                err
+            );
+        }
     }
 
     fn block_on_scheduler_redis_hot<T>(
@@ -1139,6 +1294,10 @@ impl MultiTokenManager {
         operation: &'static str,
         future: impl Future<Output = anyhow::Result<T>>,
     ) -> Option<T> {
+        if !self.scheduler_redis_hot_path_allowed() {
+            return None;
+        }
+        let _redis_hot_op_guard = self.try_enter_scheduler_redis_hot_op()?;
         if !self.scheduler_redis_hot_path_allowed() {
             return None;
         }
@@ -1154,12 +1313,48 @@ impl MultiTokenManager {
         });
         match result {
             Ok(value) => {
-                *self.scheduler_redis_degraded_until.lock() = None;
+                self.scheduler_redis_degraded_streak
+                    .store(0, Ordering::Release);
                 Some(value)
             }
             Err(err) => {
                 self.mark_scheduler_redis_degraded(operation, &err);
                 None
+            }
+        }
+    }
+
+    async fn await_scheduler_redis_hot_outcome<T>(
+        &self,
+        operation: &'static str,
+        future: impl Future<Output = anyhow::Result<T>>,
+    ) -> SchedulerRedisHotOutcome<T> {
+        if !self.scheduler_redis_hot_path_allowed() {
+            return SchedulerRedisHotOutcome::Skipped;
+        }
+        let Some(_redis_hot_op_guard) = self.try_enter_scheduler_redis_hot_op() else {
+            return SchedulerRedisHotOutcome::Skipped;
+        };
+        if !self.scheduler_redis_hot_path_allowed() {
+            return SchedulerRedisHotOutcome::Skipped;
+        }
+        let result = match tokio::time::timeout(SCHEDULER_REDIS_HOT_OP_TIMEOUT, future).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "{}超过 {}ms",
+                operation,
+                SCHEDULER_REDIS_HOT_OP_TIMEOUT.as_millis()
+            )),
+        };
+        match result {
+            Ok(value) => {
+                self.scheduler_redis_degraded_streak
+                    .store(0, Ordering::Release);
+                SchedulerRedisHotOutcome::Completed(value)
+            }
+            Err(err) => {
+                self.mark_scheduler_redis_degraded(operation, &err);
+                SchedulerRedisHotOutcome::Failed
             }
         }
     }
@@ -1325,6 +1520,10 @@ impl MultiTokenManager {
         requested.clamp(StdDuration::from_secs(1), max)
     }
 
+    fn transient_failure_coalesce_window(base: StdDuration) -> StdDuration {
+        base.clamp(StdDuration::from_secs(1), StdDuration::from_secs(5))
+    }
+
     fn update_credential_rpm_from_config(&self) {
         let global_rpm = self.config.lock().credential_rpm.unwrap_or(0);
         let ids: Vec<u64> = {
@@ -1405,31 +1604,35 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    fn acquire_in_flight_slot(&self, id: u64) -> anyhow::Result<Option<InFlightLeaseGuard>> {
+    async fn acquire_in_flight_slot(&self, id: u64) -> anyhow::Result<Option<InFlightLeaseGuard>> {
         self.cleanup_expired_in_flight_leases_local_first();
         let max_concurrent_requests = self.max_concurrent_requests();
         let effective_max_concurrent_requests =
             self.effective_max_concurrent_requests_for_id(id, max_concurrent_requests);
         let global_max_concurrent_requests = self.global_max_concurrent_requests();
         let now = Instant::now();
+        let lease_id = self.next_in_flight_lease_id.fetch_add(1, Ordering::Relaxed);
+        let mut late_redis_acquire_possible = false;
 
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
             let max_age = self.in_flight_lease_max_age();
-            let redis_acquire =
-                self.block_on_scheduler_redis_hot("占用 Redis 凭据并发槽", async move {
+            let redis_acquire = self
+                .await_scheduler_redis_hot_outcome("占用 Redis 凭据并发槽", async move {
                     redis
-                        .acquire_dispatch_lease_with_new_id(
+                        .acquire_dispatch_lease(
                             id,
+                            lease_id,
                             effective_max_concurrent_requests,
                             global_max_concurrent_requests,
                             max_age,
                             InFlightKind::Api.as_str(),
                         )
                         .await
-                });
+                })
+                .await;
             match redis_acquire {
-                Some(Some((lease_id, _count))) => {
+                SchedulerRedisHotOutcome::Completed(Some(_count)) => {
                     if self.acquire_local_in_flight_slot_with_id(
                         id,
                         lease_id,
@@ -1441,10 +1644,14 @@ impl MultiTokenManager {
                         return Ok(Some(InFlightLeaseGuard::new(
                             self.entries.clone(),
                             self.redis_store.clone(),
+                            self.redis_store
+                                .is_some()
+                                .then(|| self.released_in_flight_lease_tombstones.clone()),
                             self.in_flight_notify.clone(),
                             self.local_pool_route_state_cache.clone(),
                             id,
                             lease_id,
+                            false,
                         )));
                     }
                     if let Some(redis) = &self.redis_store {
@@ -1459,12 +1666,14 @@ impl MultiTokenManager {
                     }
                     return Ok(None);
                 }
-                Some(None) => return Ok(None),
-                None => {}
+                SchedulerRedisHotOutcome::Completed(None) => return Ok(None),
+                SchedulerRedisHotOutcome::Failed => {
+                    late_redis_acquire_possible = true;
+                }
+                SchedulerRedisHotOutcome::Skipped => {}
             }
         }
 
-        let lease_id = self.next_in_flight_lease_id.fetch_add(1, Ordering::Relaxed);
         if self.acquire_local_in_flight_slot_with_id(
             id,
             lease_id,
@@ -1475,11 +1684,17 @@ impl MultiTokenManager {
             self.invalidate_local_pool_route_state_cache();
             return Ok(Some(InFlightLeaseGuard::new(
                 self.entries.clone(),
-                None,
+                late_redis_acquire_possible
+                    .then(|| self.redis_store.clone())
+                    .flatten(),
+                self.redis_store
+                    .is_some()
+                    .then(|| self.released_in_flight_lease_tombstones.clone()),
                 self.in_flight_notify.clone(),
                 self.local_pool_route_state_cache.clone(),
                 id,
                 lease_id,
+                late_redis_acquire_possible,
             )));
         }
         Ok(None)
@@ -1487,7 +1702,30 @@ impl MultiTokenManager {
 
     #[cfg(test)]
     pub(crate) fn acquire_in_flight_lease_for_test(&self, id: u64) -> Option<InFlightLeaseGuard> {
-        self.acquire_in_flight_slot(id).unwrap()
+        self.cleanup_expired_in_flight_leases_local_first();
+        let max_concurrent_requests = self.max_concurrent_requests();
+        let global_max_concurrent_requests = self.global_max_concurrent_requests();
+        let lease_id = self.next_in_flight_lease_id.fetch_add(1, Ordering::Relaxed);
+        if self.acquire_local_in_flight_slot_with_id(
+            id,
+            lease_id,
+            Instant::now(),
+            max_concurrent_requests,
+            global_max_concurrent_requests,
+        ) {
+            self.invalidate_local_pool_route_state_cache();
+            return Some(InFlightLeaseGuard::new(
+                self.entries.clone(),
+                None,
+                None,
+                self.in_flight_notify.clone(),
+                self.local_pool_route_state_cache.clone(),
+                id,
+                lease_id,
+                false,
+            ));
+        }
+        None
     }
 
     #[cfg(test)]
@@ -1898,6 +2136,15 @@ impl MultiTokenManager {
                     .min_by_key(|entry| balanced_selection_key(entry))?;
                 Some((entry.id, entry.credentials.clone()))
             }
+            "weighted_least_inflight" => {
+                let entry = select_weighted_least_inflight(
+                    candidates,
+                    model,
+                    Utc::now().timestamp_millis(),
+                    &config,
+                )?;
+                Some((entry.id, entry.credentials.clone()))
+            }
             _ => {
                 // priority 模式（默认）：优先级仍是第一排序，但同优先级账号优先选低并发。
                 let entry = available.iter().min_by_key(|e| priority_selection_key(e))?;
@@ -2110,7 +2357,7 @@ impl MultiTokenManager {
             self.cleanup_expired_in_flight_leases_local_first();
             if attempt_count >= max_attempts {
                 anyhow::bail!(
-                    "所有凭据均无法获取有效 Token（可用: {}/{}）",
+                    "所有账号均无法获取有效 Token（可用: {}/{}）",
                     self.available_count(),
                     total
                 );
@@ -2230,7 +2477,7 @@ impl MultiTokenManager {
                             if usable > 0 && excluded_usable >= usable {
                                 if acquire_mode.is_fail_fast() && slot_race_excluded_count > 0 {
                                     anyhow::bail!(
-                                        "本地凭据调度容量暂不可用（本次请求因并发槽竞争临时排除了所有可用凭据，可用: {}/{}, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}）",
+                                        "本地账号调度容量暂不可用（本次请求因并发槽竞争临时排除了所有可用账号，可用: {}/{}, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}）",
                                         available,
                                         total,
                                         max_concurrent_requests,
@@ -2238,7 +2485,7 @@ impl MultiTokenManager {
                                     );
                                 }
                                 anyhow::bail!(
-                                    "本次请求临时排除了所有可用凭据（可用: {}/{}, 临时排除: {}）",
+                                    "本次请求临时排除了所有可用账号（可用: {}/{}, 临时排除: {}）",
                                     available,
                                     total,
                                     excluded_usable
@@ -2246,14 +2493,14 @@ impl MultiTokenManager {
                             }
                             if available > 0 && model_usable == 0 && model.is_some() {
                                 anyhow::bail!(
-                                    "没有支持当前模型的可用凭据（可用: {}/{}）",
+                                    "没有支持当前模型的可用账号（可用: {}/{}）",
                                     available,
                                     total
                                 );
                             }
                             if model_usable > 0 && usable == 0 && proxy_blocked >= model_usable {
                                 anyhow::bail!(
-                                    "所有可用凭据均因代理资源不可用而不可调度（可用: {}/{}, 代理不可用: {}）",
+                                    "所有可用账号均因代理资源不可用而不可调度（可用: {}/{}, 代理不可用: {}）",
                                     available,
                                     total,
                                     proxy_blocked
@@ -2307,7 +2554,7 @@ impl MultiTokenManager {
                                         .unwrap_or(1)
                                         .max(1);
                                     anyhow::bail!(
-                                        "所有可用凭据均处于上游临时冷却（可用: {}/{}, 临时可调度: 0, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}, retry_after_secs={}）",
+                                        "所有可用账号均处于上游临时冷却（可用: {}/{}, 临时可调度: 0, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}, retry_after_secs={}）",
                                         available,
                                         total,
                                         max_concurrent_requests,
@@ -2348,7 +2595,7 @@ impl MultiTokenManager {
                                     }
                                 }
                             } else {
-                                anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                                anyhow::bail!("所有账号均已禁用（{}/{}）", available, total);
                             }
                         }
                     }
@@ -2372,7 +2619,7 @@ impl MultiTokenManager {
                             .unwrap_or(1)
                             .max(1);
                         anyhow::bail!(
-                            "本地凭据调度容量暂不可用（可用: {}/{}, 临时可调度: 0, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}, retry_after_secs={}）",
+                            "本地账号调度容量暂不可用（可用: {}/{}, 临时可调度: 0, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}, retry_after_secs={}）",
                             available,
                             total,
                             global_credential_max_concurrent_requests,
@@ -2384,7 +2631,7 @@ impl MultiTokenManager {
                         queue_guard = self.try_enter_dispatch_queue()?;
                         if queue_guard.is_none() {
                             anyhow::bail!(
-                                "凭据调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
+                                "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
                                 self.max_queued_requests(),
                                 self.global_max_concurrent_requests()
                             );
@@ -2398,7 +2645,7 @@ impl MultiTokenManager {
                         self.dispatch_wait_exceeded(acquire_mode, dispatch_wait_started_at, now)
                     {
                         anyhow::bail!(
-                            "凭据调度排队等待超时（可用: {}/{}, 临时可调度: 0, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}, waited_secs={}, max_wait_secs={}, retry_after_secs={}）",
+                            "账号调度排队等待超时（可用: {}/{}, 临时可调度: 0, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}, waited_secs={}, max_wait_secs={}, retry_after_secs={}）",
                             available,
                             total,
                             global_credential_max_concurrent_requests,
@@ -2425,7 +2672,7 @@ impl MultiTokenManager {
                 }
             };
 
-            let Some(in_flight_lease) = self.acquire_in_flight_slot(id)? else {
+            let Some(in_flight_lease) = self.acquire_in_flight_slot(id).await? else {
                 if acquire_mode.is_fail_fast() {
                     local_excluded_ids.insert(id);
                     attempt_count += 1;
@@ -2433,7 +2680,7 @@ impl MultiTokenManager {
                     tracing::debug!(
                         credential_id = id,
                         excluded_count = local_excluded_ids.len(),
-                        "fail-fast 预检选中凭据后并发槽已满，本次请求临时排除并重选"
+                        "fail-fast 预检选中账号后并发槽已满，本次请求临时排除并重选"
                     );
                     continue;
                 }
@@ -2441,7 +2688,7 @@ impl MultiTokenManager {
                     queue_guard = self.try_enter_dispatch_queue()?;
                     if queue_guard.is_none() {
                         anyhow::bail!(
-                            "凭据调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
+                            "账号调度等待队列已满（max_queued_requests={}, global_max_concurrent_requests={}）",
                             self.max_queued_requests(),
                             self.global_max_concurrent_requests()
                         );
@@ -2466,7 +2713,7 @@ impl MultiTokenManager {
                         )
                     };
                     anyhow::bail!(
-                        "凭据调度排队等待超时（可用: {}/{}, 临时可调度: 0, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}, waited_secs={}, max_wait_secs={}, retry_after_secs=1）",
+                        "账号调度排队等待超时（可用: {}/{}, 临时可调度: 0, global_credential_max_concurrent_requests={}, effective_credential_max_concurrent_requests={}, waited_secs={}, max_wait_secs={}, retry_after_secs=1）",
                         self.available_count(),
                         total,
                         global_credential_max_concurrent_requests,
@@ -2533,7 +2780,7 @@ impl MultiTokenManager {
                     drop(in_flight_lease);
                     attempt_count += 1;
                     if !has_available {
-                        anyhow::bail!("所有凭据均已禁用（0/{}）", total);
+                        anyhow::bail!("所有账号均已禁用（0/{}）", total);
                     }
                 }
             }
@@ -3401,9 +3648,17 @@ impl MultiTokenManager {
 
         let redis = redis.clone();
         let entries = self.entries.clone();
-        let config_rpm = self.config.lock().credential_rpm.unwrap_or(0);
+        let (config_rpm, in_flight_max_age) = {
+            let config = self.config.lock();
+            (
+                config.credential_rpm.unwrap_or(0),
+                (config.credential_in_flight_lease_max_secs > 0)
+                    .then(|| StdDuration::from_secs(config.credential_in_flight_lease_max_secs)),
+            )
+        };
         let local_pool_route_state_cache = self.local_pool_route_state_cache.clone();
         let sync_in_flight = self.scheduler_redis_sync_in_flight.clone();
+        let released_lease_tombstones = self.released_in_flight_lease_tombstones.clone();
 
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::spawn(async move {
@@ -3413,8 +3668,17 @@ impl MultiTokenManager {
                 )
                 .await;
                 match result {
-                    Ok(Ok(states)) => {
-                        apply_redis_scheduler_states_with_global_rpm(&entries, config_rpm, states);
+                    Ok(Ok(mut states)) => {
+                        filter_released_in_flight_leases_from_scheduler_states(
+                            &released_lease_tombstones,
+                            &mut states,
+                        );
+                        apply_redis_scheduler_states_with_global_rpm(
+                            &entries,
+                            config_rpm,
+                            in_flight_max_age,
+                            states,
+                        );
                         local_pool_route_state_cache.lock().clear();
                     }
                     Ok(Err(err)) => {
@@ -3509,12 +3773,20 @@ impl MultiTokenManager {
         }
     }
 
-    fn apply_scheduler_states(&self, states: HashMap<u64, SchedulerCredentialState>) {
+    fn apply_scheduler_states(&self, mut states: HashMap<u64, SchedulerCredentialState>) {
+        filter_released_in_flight_leases_from_scheduler_states(
+            &self.released_in_flight_lease_tombstones,
+            &mut states,
+        );
         apply_redis_scheduler_states(&self.entries, &self.config, states);
         self.invalidate_local_pool_route_state_cache();
     }
 
-    fn apply_scheduler_states_for_ids(&self, states: HashMap<u64, SchedulerCredentialState>) {
+    fn apply_scheduler_states_for_ids(&self, mut states: HashMap<u64, SchedulerCredentialState>) {
+        filter_released_in_flight_leases_from_scheduler_states(
+            &self.released_in_flight_lease_tombstones,
+            &mut states,
+        );
         apply_redis_scheduler_states_for_ids(&self.entries, &self.config, states);
         self.invalidate_local_pool_route_state_cache();
     }
@@ -3653,6 +3925,7 @@ impl MultiTokenManager {
         let reason = reason.into();
         let (base, max, multiplier, jitter, probation, alpha) =
             self.transient_failure_settings(kind);
+        let coalesce_window = Self::transient_failure_coalesce_window(base);
         let now = Instant::now();
         let now_ms = Utc::now().timestamp_millis();
 
@@ -3667,14 +3940,41 @@ impl MultiTokenManager {
             }
         }
 
-        let duration = {
+        let (duration, coalesced) = {
             let mut entries = self.entries.lock();
             let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
                 return Ok(entries.iter().any(|entry| !entry.disabled));
             };
+            let model = model.map(str::trim).filter(|value| !value.is_empty());
+            let model_key = model.map(model_state_key);
+            let existing_until = if let Some(key) = &model_key {
+                entry
+                    .model_cooldowns
+                    .get(key)
+                    .map(|cooldown| cooldown.until)
+            } else {
+                entry.cooldown_until
+            };
+            let coalesced = {
+                let health = entry_effective_health_mut(entry, model);
+                let same_kind = health.last_error_kind.as_deref() == Some(kind.as_str());
+                let in_same_failure_wave = health.last_error_at_ms.is_some_and(|last_at| {
+                    now_ms >= last_at
+                        && now_ms.saturating_sub(last_at) <= coalesce_window.as_millis() as i64
+                });
+                retry_after.is_none()
+                    && existing_until.is_some_and(|until| until > now)
+                    && same_kind
+                    && in_same_failure_wave
+            };
             let streak = {
                 let health = entry_effective_health_mut(entry, model);
-                health.transient_failure_streak = health.transient_failure_streak.saturating_add(1);
+                if coalesced {
+                    health.transient_failure_streak = health.transient_failure_streak.max(1);
+                } else {
+                    health.transient_failure_streak =
+                        health.transient_failure_streak.saturating_add(1);
+                }
                 health.recent_error_rate += alpha * (1.0 - health.recent_error_rate);
                 health.last_error_kind = Some(kind.as_str().to_string());
                 health.last_error_reason = Some(reason.clone());
@@ -3683,9 +3983,15 @@ impl MultiTokenManager {
             };
             let duration =
                 Self::local_cooldown_duration(retry_after, base, max, multiplier, jitter, streak);
-            let until = now + duration;
-            if let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) {
-                let key = model_state_key(model);
+            let candidate_until = now + duration;
+            let until = if coalesced {
+                existing_until.unwrap_or(candidate_until)
+            } else {
+                existing_until
+                    .filter(|existing| *existing >= candidate_until)
+                    .unwrap_or(candidate_until)
+            };
+            if let (Some(model), Some(key)) = (model, model_key) {
                 let should_update = entry
                     .model_cooldowns
                     .get(&key)
@@ -3705,47 +4011,59 @@ impl MultiTokenManager {
                 entry.cooldown_reason = Some(reason.clone());
             }
             let health = entry_effective_health_mut(entry, model);
-            health.probation_until_ms = Some(
-                health
-                    .probation_until_ms
-                    .unwrap_or(0)
-                    .max(now_ms + duration.as_millis() as i64 + probation.as_millis() as i64),
-            );
+            health.probation_until_ms = Some(health.probation_until_ms.unwrap_or(0).max(
+                now_ms
+                    + until.saturating_duration_since(now).as_millis() as i64
+                    + probation.as_millis() as i64,
+            ));
             entry.last_used_at = Some(Utc::now().to_rfc3339());
-            duration
+            (until.saturating_duration_since(now), coalesced)
         };
 
-        if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            let reason_for_redis = reason.clone();
-            let model_for_redis = model.map(str::to_string);
-            spawn_best_effort_storage_task("写入 Redis 凭据临时冷却与健康状态", async move {
-                redis
-                    .record_scheduler_transient_failure(
-                        id,
-                        model_for_redis.as_deref(),
-                        kind.as_str(),
-                        &reason_for_redis,
-                        retry_after,
-                        base,
-                        max,
-                        multiplier,
-                        jitter,
-                        probation,
-                        alpha,
-                    )
-                    .await?;
-                Ok(())
-            });
+        if !coalesced {
+            if let Some(redis) = &self.redis_store {
+                let redis = redis.clone();
+                let reason_for_redis = reason.clone();
+                let model_for_redis = model.map(str::to_string);
+                spawn_best_effort_storage_task("写入 Redis 凭据临时冷却与健康状态", async move {
+                    redis
+                        .record_scheduler_transient_failure(
+                            id,
+                            model_for_redis.as_deref(),
+                            kind.as_str(),
+                            &reason_for_redis,
+                            retry_after,
+                            base,
+                            max,
+                            multiplier,
+                            jitter,
+                            probation,
+                            alpha,
+                            coalesce_window,
+                        )
+                        .await?;
+                    Ok(())
+                });
+            }
         }
 
-        tracing::warn!(
-            "凭据 #{} 因 {} 瞬态错误进入临时冷却 {} 秒: {}",
-            id,
-            kind.as_str(),
-            duration.as_secs(),
-            reason
-        );
+        if coalesced {
+            tracing::debug!(
+                "凭据 #{} 因 {} 瞬态错误仍处于同一波冷却，未放大退避，剩余约 {} 秒: {}",
+                id,
+                kind.as_str(),
+                duration.as_secs(),
+                reason
+            );
+        } else {
+            tracing::warn!(
+                "凭据 #{} 因 {} 瞬态错误进入临时冷却 {} 秒: {}",
+                id,
+                kind.as_str(),
+                duration.as_secs(),
+                reason
+            );
+        }
 
         self.invalidate_local_pool_route_state_cache();
         let has_alternate = {
@@ -4996,6 +5314,10 @@ impl MultiTokenManager {
     /// - `Ok(u64)` - 新凭据 ID
     /// - `Err(_)` - 验证失败或添加失败
     pub async fn add_credential(&self, new_cred: KiroCredentials) -> anyhow::Result<u64> {
+        let mut new_cred = new_cred;
+        new_cred.canonicalize_auth_method();
+        new_cred.normalize_external_idp_defaults();
+
         // 1. 基本验证
         if let Some(resource_id) = new_cred.proxy_resource_id {
             let exists = self.proxy_resources.lock().contains_key(&resource_id);
@@ -5409,7 +5731,10 @@ impl MultiTokenManager {
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         // 验证模式值
-        if mode != "priority" && mode != "balanced" && mode != "health_balanced" {
+        if !matches!(
+            mode.as_str(),
+            "priority" | "balanced" | "health_balanced" | "weighted_least_inflight"
+        ) {
             anyhow::bail!("无效的负载均衡模式: {}", mode);
         }
 
@@ -5528,6 +5853,164 @@ mod tests {
         assert_eq!(entries[1].in_flight_requests, 3);
     }
 
+    #[test]
+    fn test_scheduler_state_apply_preserves_local_in_flight_leases() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![test_access_token_credential("token-1", "Pro")],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let now = Instant::now();
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].in_flight_requests = 1;
+            entries[0].in_flight_leases.push(InFlightLease {
+                id: 99,
+                acquired_at: now,
+                last_seen_at: now,
+                kind: InFlightKind::Stream,
+            });
+        }
+
+        let mut states = HashMap::new();
+        states.insert(1, SchedulerCredentialState::default());
+
+        manager.apply_scheduler_states_for_ids(states);
+
+        let entries = manager.entries.lock();
+        assert_eq!(entries[0].in_flight_requests, 1);
+        assert_eq!(entries[0].in_flight_leases.len(), 1);
+        assert_eq!(entries[0].in_flight_leases[0].id, 99);
+        assert_eq!(entries[0].in_flight_leases[0].kind, InFlightKind::Stream);
+    }
+
+    #[test]
+    fn test_scheduler_state_apply_filters_expired_redis_in_flight_leases() {
+        let mut config = Config::default();
+        config.credential_in_flight_lease_max_secs = 1;
+        let manager = MultiTokenManager::new(
+            config,
+            vec![test_access_token_credential("token-1", "Pro")],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let now_ms = Utc::now().timestamp_millis();
+        let stale_redis_lease = crate::storage::redis_cache::SchedulerInFlightLease {
+            id: 44,
+            acquired_at_ms: now_ms - 5_000,
+            last_seen_at_ms: now_ms - 5_000,
+            kind: InFlightKind::Api.as_str().to_string(),
+        };
+
+        let mut states = HashMap::new();
+        states.insert(
+            1,
+            SchedulerCredentialState {
+                in_flight_leases: vec![stale_redis_lease.clone()],
+                ..Default::default()
+            },
+        );
+        manager.apply_scheduler_states_for_ids(states);
+        {
+            let entries = manager.entries.lock();
+            assert_eq!(entries[0].in_flight_requests, 0);
+            assert!(entries[0].in_flight_leases.is_empty());
+        }
+
+        let now = Instant::now();
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].in_flight_requests = 1;
+            entries[0].in_flight_leases.push(InFlightLease {
+                id: 99,
+                acquired_at: now,
+                last_seen_at: now,
+                kind: InFlightKind::Stream,
+            });
+        }
+
+        let mut states = HashMap::new();
+        states.insert(
+            1,
+            SchedulerCredentialState {
+                in_flight_leases: vec![stale_redis_lease],
+                ..Default::default()
+            },
+        );
+        manager.apply_scheduler_states_for_ids(states);
+
+        let entries = manager.entries.lock();
+        assert_eq!(entries[0].in_flight_requests, 1);
+        assert_eq!(entries[0].in_flight_leases.len(), 1);
+        assert_eq!(entries[0].in_flight_leases[0].id, 99);
+        assert_eq!(entries[0].in_flight_leases[0].kind, InFlightKind::Stream);
+    }
+
+    #[test]
+    fn test_scheduler_state_apply_ignores_recently_released_redis_in_flight_lease() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![test_access_token_credential("token-1", "Pro")],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let now_ms = Utc::now().timestamp_millis();
+
+        record_released_in_flight_lease_tombstone(
+            &manager.released_in_flight_lease_tombstones,
+            1,
+            44,
+        );
+
+        let mut states = HashMap::new();
+        states.insert(
+            1,
+            SchedulerCredentialState {
+                in_flight_leases: vec![crate::storage::redis_cache::SchedulerInFlightLease {
+                    id: 44,
+                    acquired_at_ms: now_ms,
+                    last_seen_at_ms: now_ms,
+                    kind: InFlightKind::Api.as_str().to_string(),
+                }],
+                ..Default::default()
+            },
+        );
+        manager.apply_scheduler_states_for_ids(states);
+        {
+            let entries = manager.entries.lock();
+            assert_eq!(entries[0].in_flight_requests, 0);
+            assert!(entries[0].in_flight_leases.is_empty());
+        }
+
+        let mut states = HashMap::new();
+        states.insert(
+            1,
+            SchedulerCredentialState {
+                in_flight_leases: vec![crate::storage::redis_cache::SchedulerInFlightLease {
+                    id: 45,
+                    acquired_at_ms: now_ms,
+                    last_seen_at_ms: now_ms,
+                    kind: InFlightKind::Api.as_str().to_string(),
+                }],
+                ..Default::default()
+            },
+        );
+        manager.apply_scheduler_states_for_ids(states);
+
+        let entries = manager.entries.lock();
+        assert_eq!(entries[0].in_flight_requests, 1);
+        assert_eq!(entries[0].in_flight_leases.len(), 1);
+        assert_eq!(entries[0].in_flight_leases[0].id, 45);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_scheduler_state_sync_timeout_does_not_degrade_hot_path() {
         let manager = MultiTokenManager::new(
@@ -5548,6 +6031,61 @@ mod tests {
 
         assert!(result.is_none());
         assert!(manager.scheduler_redis_degraded_until.lock().is_none());
+    }
+
+    #[test]
+    fn test_scheduler_redis_hot_op_guard_caps_parallel_ops() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![test_access_token_credential("token-1", "Pro")],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut guards = Vec::new();
+        for _ in 0..SCHEDULER_REDIS_HOT_MAX_PARALLEL_OPS {
+            guards.push(
+                manager
+                    .try_enter_scheduler_redis_hot_op()
+                    .expect("hot Redis op guard should be admitted below cap"),
+            );
+        }
+        assert!(manager.try_enter_scheduler_redis_hot_op().is_none());
+
+        drop(guards.pop());
+        assert!(manager.try_enter_scheduler_redis_hot_op().is_some());
+    }
+
+    #[test]
+    fn test_scheduler_redis_degraded_backoff_grows_on_repeated_failures() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![test_access_token_credential("token-1", "Pro")],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let err = anyhow::anyhow!("redis timeout");
+
+        manager.mark_scheduler_redis_degraded("测试 Redis 热路径", &err);
+        let first_deadline = *manager.scheduler_redis_degraded_until.lock();
+        let first_remaining = first_deadline
+            .expect("degraded deadline")
+            .saturating_duration_since(Instant::now());
+
+        *manager.scheduler_redis_degraded_until.lock() = None;
+        manager.mark_scheduler_redis_degraded("测试 Redis 热路径", &err);
+        let second_deadline = *manager.scheduler_redis_degraded_until.lock();
+        let second_remaining = second_deadline
+            .expect("degraded deadline")
+            .saturating_duration_since(Instant::now());
+
+        assert!(first_remaining <= SCHEDULER_REDIS_DEGRADED_BACKOFF_BASE);
+        assert!(second_remaining > first_remaining);
+        assert!(second_remaining <= SCHEDULER_REDIS_DEGRADED_BACKOFF_MAX);
     }
 
     fn test_access_token_credential(token: &str, subscription_title: &str) -> KiroCredentials {
@@ -6172,7 +6710,7 @@ mod tests {
             "全部 refreshToken 无效时应按凭据数量和失败阈值有界结束，不应持续打"
         );
         assert!(
-            err.contains("所有可用凭据均处于上游临时冷却"),
+            err.contains("所有可用账号均处于上游临时冷却"),
             "错误应明确结束调度并要求退避，实际: {}",
             err
         );
@@ -6597,6 +7135,15 @@ mod tests {
         manager
             .report_transient_failure_kind(1, None, TransientFailureKind::RateLimit, None, "429")
             .unwrap();
+        {
+            let mut entries = manager.entries.lock();
+            let entry = entries.iter_mut().find(|entry| entry.id == 1).unwrap();
+            let coalesce_window_ms =
+                MultiTokenManager::transient_failure_coalesce_window(StdDuration::from_secs(1))
+                    .as_millis() as i64;
+            entry.health.last_error_at_ms =
+                Some(Utc::now().timestamp_millis() - coalesce_window_ms - 1);
+        }
         manager
             .report_transient_failure_kind(
                 1,
@@ -6613,6 +7160,44 @@ mod tests {
         assert_eq!(entry.last_error_kind.as_deref(), Some("rate_limit"));
         assert!(entry.cooldown_remaining_secs >= 2);
         assert!(entry.in_probation);
+    }
+
+    #[test]
+    fn test_transient_failure_coalesces_same_burst_without_backoff_amplification() {
+        let mut config = Config::default();
+        config.credential_server_error_cooldown_secs = 5;
+        config.credential_max_cooldown_secs = 300;
+        config.credential_cooldown_backoff_multiplier = 2.0;
+        config.credential_cooldown_jitter_percent = 0;
+        let manager = MultiTokenManager::new(
+            config,
+            vec![test_access_token_credential("token", "Pro")],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        for index in 0..12 {
+            manager
+                .report_transient_failure_kind(
+                    1,
+                    None,
+                    TransientFailureKind::Server,
+                    None,
+                    format!("server burst {index}"),
+                )
+                .unwrap();
+        }
+
+        let entry = &manager.snapshot().entries[0];
+        assert_eq!(entry.transient_failure_streak, 1);
+        assert!(
+            entry.cooldown_remaining_secs <= 6,
+            "同一波并发 server 错误不应把 5s 基础冷却放大，实际 remaining={}",
+            entry.cooldown_remaining_secs
+        );
+        assert_eq!(entry.last_error_kind.as_deref(), Some("server"));
     }
 
     #[test]
@@ -6850,6 +7435,43 @@ mod tests {
 
         let mut ctx = manager.acquire_context(None).await.unwrap();
         assert_eq!(ctx.id, 2);
+        ctx.release_in_flight();
+    }
+
+    #[tokio::test]
+    async fn test_weighted_least_inflight_mode_prefers_lower_load_candidate() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "weighted_least_inflight".to_string();
+        config.credential_max_concurrent_requests = 10;
+        config.scheduler_top_k = 1;
+        config.scheduler_priority_weight = 10.0;
+        config.scheduler_load_weight = 100.0;
+        config.scheduler_error_weight = 0.0;
+        config.scheduler_latency_weight = 0.0;
+        config.scheduler_probation_weight = 0.0;
+        config.scheduler_selection_pressure_weight = 0.0;
+        config.scheduler_total_selection_weight = 0.0;
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                test_access_token_credential("busy-token", "Pro"),
+                test_access_token_credential("idle-token", "Pro"),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].in_flight_requests = 8;
+            entries[1].in_flight_requests = 0;
+        }
+
+        let mut ctx = manager.acquire_context(None).await.unwrap();
+
+        assert_eq!(ctx.id, 2);
+        assert_eq!(ctx.token, "idle-token");
         ctx.release_in_flight();
     }
 
@@ -7170,7 +7792,7 @@ mod tests {
             "全部候选都处于上游冷却时不应排队等待"
         );
         assert!(
-            err.contains("所有可用凭据均处于上游临时冷却"),
+            err.contains("所有可用账号均处于上游临时冷却"),
             "错误应明确提示全部处于上游临时冷却，实际: {}",
             err
         );
@@ -7348,7 +7970,7 @@ mod tests {
             "全账号上游冷却时不应让请求排队等冷却恢复"
         );
         assert!(
-            err.contains("所有可用凭据均处于上游临时冷却"),
+            err.contains("所有可用账号均处于上游临时冷却"),
             "错误应明确提示全部处于上游临时冷却，实际: {}",
             err
         );
@@ -7492,7 +8114,7 @@ mod tests {
             .to_string();
 
         assert!(
-            err.contains("本地凭据调度容量暂不可用"),
+            err.contains("本地账号调度容量暂不可用"),
             "fail-fast 模式全局容量满应直接返回容量错误，实际: {}",
             err
         );
@@ -7569,7 +8191,7 @@ mod tests {
             "req_concurrency",
             "/cc/v1/messages",
             None,
-            "凭据调度排队等待超时",
+            "账号调度排队等待超时",
         );
 
         assert_eq!(summary.stage, SelectionFailureStage::DispatchWait);
@@ -7635,7 +8257,7 @@ mod tests {
             "req_model",
             "/cc/v1/messages",
             Some("claude-opus-4-8"),
-            "没有支持当前模型的可用凭据",
+            "没有支持当前模型的可用账号",
         );
 
         assert_eq!(summary.stage, SelectionFailureStage::ModelEligibility);
@@ -7667,18 +8289,47 @@ mod tests {
             "req_disabled",
             "/cc/v1/messages",
             None,
-            "所有凭据均已禁用",
+            "所有账号均已禁用",
         );
 
         assert_eq!(summary.rejected_account_count, 100);
         assert_eq!(
             summary.sampled_accounts.len(),
-            SELECTION_FAILURE_SAMPLE_LIMIT
+            Config::default().selection_failure_sample_limit
         );
         let serialized = serde_json::to_string(&summary).unwrap();
         assert!(!serialized.contains("ksk_secret_selection"));
         assert!(!serialized.contains("access_token"));
         assert!(!serialized.contains("refresh_token"));
+    }
+
+    #[test]
+    fn selection_failure_summary_can_disable_account_samples() {
+        let mut config = Config::default();
+        config.selection_failure_record_enabled = false;
+        config.selection_failure_sample_limit = 20;
+        let credentials = (0..10)
+            .map(|idx| {
+                let mut credential = api_key_credential(&format!("ksk_secret_selection_{idx:03}"));
+                credential.disabled = true;
+                credential
+            })
+            .collect::<Vec<_>>();
+        let manager = MultiTokenManager::new(config, credentials, None, None, false).unwrap();
+
+        let summary = manager.selection_failure_summary(
+            "req_disabled_no_samples",
+            "/cc/v1/messages",
+            None,
+            "所有账号均已禁用",
+        );
+
+        assert_eq!(summary.rejected_account_count, 10);
+        assert!(summary.sampled_accounts.is_empty());
+        assert_eq!(
+            summary.reason_counts.get(&AccountRejectReason::Disabled),
+            Some(&10)
+        );
     }
 
     #[tokio::test]
@@ -7984,7 +8635,7 @@ mod tests {
             "全部手动禁用不是临时调度阻塞，不应进入并发排队等待"
         );
         assert!(
-            err.contains("所有凭据均已禁用"),
+            err.contains("所有账号均已禁用"),
             "错误应明确提示全部禁用，实际: {}",
             err
         );
@@ -8014,7 +8665,7 @@ mod tests {
             "模型不兼容不是临时容量阻塞，不应进入等待队列"
         );
         assert!(
-            err.contains("没有支持当前模型的可用凭据"),
+            err.contains("没有支持当前模型的可用账号"),
             "错误应明确提示模型不兼容，实际: {}",
             err
         );
@@ -8218,7 +8869,7 @@ mod tests {
             "排队等待上限生效前不应提前失败"
         );
         assert!(
-            err.contains("凭据调度排队等待超时"),
+            err.contains("账号调度排队等待超时"),
             "错误应提示调度排队超时，实际: {}",
             err
         );
@@ -8623,13 +9274,13 @@ mod tests {
             .to_string();
 
         assert!(
-            err.contains("本次请求临时排除了所有可用凭据"),
+            err.contains("本次请求临时排除了所有可用账号"),
             "错误应提示临时排除，实际: {}",
             err
         );
         assert!(
-            !err.contains("所有凭据均已禁用"),
-            "错误不应误报所有凭据禁用，实际: {}",
+            !err.contains("所有账号均已禁用"),
+            "错误不应误报所有账号禁用，实际: {}",
             err
         );
     }
@@ -8720,7 +9371,7 @@ mod tests {
             err
         );
         assert!(
-            !err.contains("所有凭据均已禁用") && !err.contains("没有支持当前模型"),
+            !err.contains("所有账号均已禁用") && !err.contains("没有支持当前模型"),
             "代理不可用不应误报禁用或模型不兼容，实际: {}",
             err
         );
@@ -9272,8 +9923,8 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(
-            err.contains("所有凭据均已禁用"),
-            "错误应提示所有凭据禁用，实际: {}",
+            err.contains("所有账号均已禁用"),
+            "错误应提示所有账号禁用，实际: {}",
             err
         );
     }
@@ -9344,8 +9995,8 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(
-            err.contains("所有凭据均已禁用"),
-            "错误应提示所有凭据禁用，实际: {}",
+            err.contains("所有账号均已禁用"),
+            "错误应提示所有账号禁用，实际: {}",
             err
         );
         assert_eq!(manager.available_count(), 0);

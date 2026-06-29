@@ -16,6 +16,11 @@ const DEFAULT_MIN_CACHEABLE_TOKENS: i32 = 1024;
 const EXTENDED_MIN_CACHEABLE_TOKENS: i32 = 4096;
 const HAIKU_3_MIN_CACHEABLE_TOKENS: i32 = 2048;
 const TARGET_READ_RATIO_SPREAD: f64 = 0.03;
+const DEFAULT_MAX_ENTRIES_PER_ACCOUNT: usize = 200;
+const DEFAULT_MAX_ENTRIES_GLOBAL: usize = 20_000;
+const DEFAULT_MAX_ENTRY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const DEFAULT_ESTIMATED_BYTES_LIMIT: u64 = 256 * 1024 * 1024;
+const ESTIMATED_ENTRY_BYTES: u64 = 256;
 
 #[derive(Debug, Clone, Eq)]
 pub struct PromptCacheScope {
@@ -44,6 +49,7 @@ impl Hash for PromptCacheScope {
 struct PromptCacheEntry {
     expires_at: DateTime<Utc>,
     ttl: Duration,
+    last_used_at: DateTime<Utc>,
     cached_tokens: i32,
 }
 
@@ -85,6 +91,54 @@ pub struct PromptCacheUsage {
     pub cache_creation_5m_input_tokens: i32,
     pub cache_creation_1h_input_tokens: i32,
     pub effective_cache_ratio: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PromptCacheBounds {
+    pub max_entries_per_account: usize,
+    pub max_entries_global: usize,
+    pub entry_ttl: Duration,
+    pub estimated_bytes_limit: u64,
+}
+
+impl Default for PromptCacheBounds {
+    fn default() -> Self {
+        Self {
+            max_entries_per_account: DEFAULT_MAX_ENTRIES_PER_ACCOUNT,
+            max_entries_global: DEFAULT_MAX_ENTRIES_GLOBAL,
+            entry_ttl: DEFAULT_MAX_ENTRY_TTL,
+            estimated_bytes_limit: DEFAULT_ESTIMATED_BYTES_LIMIT,
+        }
+    }
+}
+
+impl PromptCacheBounds {
+    pub fn from_config(
+        max_entries_per_account: usize,
+        max_entries_global: usize,
+        entry_ttl_secs: u64,
+        estimated_bytes_limit: u64,
+    ) -> Self {
+        Self {
+            max_entries_per_account,
+            max_entries_global,
+            entry_ttl: Duration::from_secs(entry_ttl_secs.max(1)),
+            estimated_bytes_limit,
+        }
+    }
+
+    fn effective_ttl(self, ttl: Duration) -> Duration {
+        ttl.min(self.entry_ttl)
+    }
+
+    fn max_entries_by_bytes(self) -> usize {
+        if self.estimated_bytes_limit == 0 {
+            return usize::MAX;
+        }
+        (self.estimated_bytes_limit / ESTIMATED_ENTRY_BYTES)
+            .try_into()
+            .unwrap_or(usize::MAX)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -184,11 +238,27 @@ impl PromptCacheTracker {
         })
     }
 
+    #[cfg(test)]
     pub fn compute(
         &self,
         scope: Option<PromptCacheScope>,
         profile: Option<&PromptCacheProfile>,
         target_read_ratio: f64,
+    ) -> PromptCacheUsage {
+        self.compute_with_bounds(
+            scope,
+            profile,
+            target_read_ratio,
+            PromptCacheBounds::default(),
+        )
+    }
+
+    pub fn compute_with_bounds(
+        &self,
+        scope: Option<PromptCacheScope>,
+        profile: Option<&PromptCacheProfile>,
+        target_read_ratio: f64,
+        bounds: PromptCacheBounds,
     ) -> PromptCacheUsage {
         let Some(scope) = scope else {
             return PromptCacheUsage::default();
@@ -234,7 +304,9 @@ impl PromptCacheTracker {
             if entry.expires_at <= now {
                 continue;
             }
-            entry.expires_at = now + chrono::Duration::from_std(entry.ttl).unwrap_or_default();
+            entry.last_used_at = now;
+            entry.expires_at = now
+                + chrono::Duration::from_std(bounds.effective_ttl(entry.ttl)).unwrap_or_default();
             matched_tokens = entry.cached_tokens.min(target_tokens).max(0);
             break;
         }
@@ -250,11 +322,27 @@ impl PromptCacheTracker {
         }
     }
 
+    #[cfg(test)]
     pub fn update(
         &self,
         scope: Option<PromptCacheScope>,
         profile: Option<&PromptCacheProfile>,
         target_read_ratio: f64,
+    ) {
+        self.update_with_bounds(
+            scope,
+            profile,
+            target_read_ratio,
+            PromptCacheBounds::default(),
+        )
+    }
+
+    pub fn update_with_bounds(
+        &self,
+        scope: Option<PromptCacheScope>,
+        profile: Option<&PromptCacheProfile>,
+        target_read_ratio: f64,
+        bounds: PromptCacheBounds,
     ) {
         let Some(scope) = scope else {
             return;
@@ -285,11 +373,13 @@ impl PromptCacheTracker {
             return;
         }
 
-        let ttl = profile
-            .breakpoints
-            .last()
-            .map(|breakpoint| breakpoint.ttl)
-            .unwrap_or(DEFAULT_PROMPT_CACHE_TTL);
+        let ttl = bounds.effective_ttl(
+            profile
+                .breakpoints
+                .last()
+                .map(|breakpoint| breakpoint.ttl)
+                .unwrap_or(DEFAULT_PROMPT_CACHE_TTL),
+        );
         let now = Utc::now();
         let mut entries_by_scope = self.entries.lock();
         prune_expired_locked(&mut entries_by_scope, now);
@@ -308,10 +398,12 @@ impl PromptCacheTracker {
                 PromptCacheEntry {
                     expires_at: now + chrono::Duration::from_std(ttl).unwrap_or_default(),
                     ttl,
+                    last_used_at: now,
                     cached_tokens,
                 },
             );
         }
+        enforce_cache_bounds_locked(&mut entries_by_scope, bounds);
     }
 
     pub fn clear_credential(&self, credential_id: u64) {
@@ -319,6 +411,92 @@ impl PromptCacheTracker {
             .lock()
             .retain(|scope, _| scope.credential_id != credential_id);
     }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.entries.lock().values().map(HashMap::len).sum()
+    }
+}
+
+fn enforce_cache_bounds_locked(
+    entries_by_scope: &mut HashMap<PromptCacheScope, HashMap<[u8; 32], PromptCacheEntry>>,
+    bounds: PromptCacheBounds,
+) {
+    if entries_by_scope.is_empty() {
+        return;
+    }
+
+    if bounds.max_entries_per_account > 0 {
+        let mut account_counts: HashMap<u64, usize> = HashMap::new();
+        for (scope, entries) in entries_by_scope.iter() {
+            *account_counts.entry(scope.credential_id).or_default() += entries.len();
+        }
+        for (credential_id, count) in account_counts {
+            let overflow = count.saturating_sub(bounds.max_entries_per_account);
+            if overflow > 0 {
+                remove_oldest_entries_locked(entries_by_scope, overflow, |scope| {
+                    scope.credential_id == credential_id
+                });
+            }
+        }
+    }
+
+    let global_entry_limit = if bounds.max_entries_global == 0 {
+        usize::MAX
+    } else {
+        bounds.max_entries_global
+    }
+    .min(bounds.max_entries_by_bytes());
+    let total = total_cache_entries(entries_by_scope);
+    if total > global_entry_limit {
+        remove_oldest_entries_locked(entries_by_scope, total - global_entry_limit, |_| true);
+    }
+}
+
+fn total_cache_entries(
+    entries_by_scope: &HashMap<PromptCacheScope, HashMap<[u8; 32], PromptCacheEntry>>,
+) -> usize {
+    entries_by_scope.values().map(HashMap::len).sum()
+}
+
+fn remove_oldest_entries_locked(
+    entries_by_scope: &mut HashMap<PromptCacheScope, HashMap<[u8; 32], PromptCacheEntry>>,
+    remove_count: usize,
+    include_scope: impl Fn(&PromptCacheScope) -> bool,
+) {
+    if remove_count == 0 {
+        return;
+    }
+
+    let mut candidates = Vec::new();
+    for (scope, entries) in entries_by_scope.iter() {
+        if !include_scope(scope) {
+            continue;
+        }
+        for (fingerprint, entry) in entries {
+            candidates.push((
+                entry.last_used_at,
+                entry.expires_at,
+                scope.clone(),
+                *fingerprint,
+            ));
+        }
+    }
+    candidates.sort_by_key(|(last_used_at, expires_at, scope, fingerprint)| {
+        (
+            *last_used_at,
+            *expires_at,
+            scope.credential_id,
+            *fingerprint,
+        )
+    });
+
+    for (_, _, scope, fingerprint) in candidates.into_iter().take(remove_count) {
+        if let Some(entries) = entries_by_scope.get_mut(&scope) {
+            entries.remove(&fingerprint);
+        }
+    }
+    entries_by_scope.retain(|_, entries| !entries.is_empty());
 }
 
 #[derive(Debug)]
@@ -633,7 +811,7 @@ fn write_canonical_json(value: &Value, out: &mut String) {
                 }
                 out.push_str(&serde_json::to_string(key.as_str()).unwrap_or_default());
                 out.push(':');
-                if is_cache_position_key(key) {
+                if is_cache_position_key(key) || is_cache_volatile_key(key, map.get(*key), map) {
                     out.push_str("null");
                 } else if let Some(value) = map.get(*key) {
                     write_canonical_json(value, out);
@@ -649,6 +827,52 @@ fn is_cache_position_key(key: &str) -> bool {
         key,
         "tool_index" | "system_index" | "message_index" | "block_index"
     )
+}
+
+fn is_cache_volatile_key(
+    key: &str,
+    value: Option<&Value>,
+    object: &serde_json::Map<String, Value>,
+) -> bool {
+    match key {
+        "tool_use_id" | "toolUseId" | "request_id" | "requestId" | "message_id" | "messageId" => {
+            true
+        }
+        "id" => value
+            .and_then(Value::as_str)
+            .is_some_and(|id| is_cache_volatile_id_value(id, object)),
+        _ => false,
+    }
+}
+
+fn is_cache_volatile_id_value(id: &str, object: &serde_json::Map<String, Value>) -> bool {
+    let kind = object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    matches!(kind, "tool_use" | "tool_result" | "message")
+        || id.starts_with("toolu_")
+        || id.starts_with("srvtoolu_")
+        || id.starts_with("msg_")
+        || id.starts_with("req_")
+        || looks_like_uuid(id)
+}
+
+fn looks_like_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for (idx, byte) in bytes.iter().enumerate() {
+        if matches!(idx, 8 | 13 | 18 | 23) {
+            if *byte != b'-' {
+                return false;
+            }
+        } else if !byte.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
 }
 
 fn write_hash_chunk(hasher: &mut Sha256, chunk: &str) {
@@ -995,6 +1219,155 @@ mod tests {
             "local prompt cache must not invent reads across credentials"
         );
         assert!(isolated.cache_creation_input_tokens > 0);
+    }
+
+    #[test]
+    fn volatile_tool_use_ids_do_not_break_prompt_cache_fingerprint() {
+        let tracker = PromptCacheTracker::default();
+        let mut first_req = request("stable system prompt ".repeat(500));
+        first_req.messages[0].content = json!([
+            {
+                "type": "tool_use",
+                "id": "toolu_first",
+                "name": "Read",
+                "input": {"file_path": "Cargo.toml"}
+            },
+            {
+                "type": "text",
+                "text": "cacheable response context ".repeat(700),
+                "cache_control": {"type": "ephemeral"}
+            }
+        ]);
+        let mut second_req = first_req.clone();
+        second_req.messages[0].content = json!([
+            {
+                "type": "tool_use",
+                "id": "toolu_second",
+                "name": "Read",
+                "input": {"file_path": "Cargo.toml"}
+            },
+            {
+                "type": "text",
+                "text": "cacheable response context ".repeat(700),
+                "cache_control": {"type": "ephemeral"}
+            }
+        ]);
+
+        let first_profile = tracker
+            .build_profile(&first_req, 8_192)
+            .expect("first profile");
+        let second_profile = tracker
+            .build_profile(&second_req, 8_192)
+            .expect("second profile");
+        assert_eq!(
+            first_profile.cache_jitter_seed(),
+            second_profile.cache_jitter_seed()
+        );
+
+        let scope = PromptCacheScope {
+            credential_id: 1,
+            conversation_id: "volatile-tool-id-session".to_string(),
+            model: first_req.model.clone(),
+        };
+        tracker.update(Some(scope.clone()), Some(&first_profile), 0.85);
+        let usage = tracker.compute(Some(scope), Some(&second_profile), 0.85);
+        assert!(
+            usage.cache_read_input_tokens > 0,
+            "tool_use ids change between turns and must not invalidate the stable prompt prefix"
+        );
+    }
+
+    #[test]
+    fn user_text_content_is_not_treated_as_volatile_metadata() {
+        let first = canonicalize_cache_value(&json!({
+            "type": "text",
+            "text": "The literal request_id req_first is part of user content."
+        }));
+        let second = canonicalize_cache_value(&json!({
+            "type": "text",
+            "text": "The literal request_id req_second is part of user content."
+        }));
+        assert_ne!(first, second);
+
+        let stable_business_id = canonicalize_cache_value(&json!({
+            "type": "text",
+            "id": "customer-plan-a",
+            "text": "same content"
+        }));
+        let changed_business_id = canonicalize_cache_value(&json!({
+            "type": "text",
+            "id": "customer-plan-b",
+            "text": "same content"
+        }));
+        assert_ne!(stable_business_id, changed_business_id);
+    }
+
+    #[test]
+    fn prompt_cache_enforces_per_account_entry_limit() {
+        let tracker = PromptCacheTracker::default();
+        let bounds = PromptCacheBounds {
+            max_entries_per_account: 2,
+            max_entries_global: 100,
+            entry_ttl: std::time::Duration::from_secs(3_600),
+            estimated_bytes_limit: 0,
+        };
+
+        for conversation_id in ["session-a", "session-b", "session-c"] {
+            let mut req = request(format!("cacheable {conversation_id} ").repeat(900));
+            req.messages[0].content = json!([
+                {
+                    "type": "text",
+                    "text": format!("cacheable body {conversation_id} ").repeat(900),
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ]);
+            let profile = tracker.build_profile(&req, 8_192).expect("profile");
+            let scope = PromptCacheScope {
+                credential_id: 7,
+                conversation_id: conversation_id.to_string(),
+                model: req.model,
+            };
+            tracker.update_with_bounds(Some(scope), Some(&profile), 0.85, bounds);
+        }
+
+        assert!(
+            tracker.entry_count() <= 2,
+            "per-account cache bound must cap retained fingerprints"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_enforces_global_entry_limit_and_estimated_bytes_limit() {
+        let tracker = PromptCacheTracker::default();
+        let bounds = PromptCacheBounds {
+            max_entries_per_account: 0,
+            max_entries_global: 10,
+            entry_ttl: std::time::Duration::from_secs(3_600),
+            estimated_bytes_limit: 3 * ESTIMATED_ENTRY_BYTES,
+        };
+
+        for credential_id in 1..=6 {
+            let mut req = request(format!("global cacheable {credential_id} ").repeat(900));
+            req.messages[0].content = json!([
+                {
+                    "type": "text",
+                    "text": format!("global cacheable body {credential_id} ").repeat(900),
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ]);
+            let profile = tracker.build_profile(&req, 8_192).expect("profile");
+            let scope = PromptCacheScope {
+                credential_id,
+                conversation_id: format!("global-session-{credential_id}"),
+                model: req.model,
+            };
+            tracker.update_with_bounds(Some(scope), Some(&profile), 0.85, bounds);
+        }
+
+        assert!(
+            tracker.entry_count() <= 3,
+            "estimated byte limit should reduce the effective global entry cap"
+        );
     }
 
     #[test]

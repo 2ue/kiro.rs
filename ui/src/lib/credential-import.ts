@@ -70,6 +70,8 @@ export function normalizeCredentialImportItem(value: unknown): AddCredentialRequ
   if (!isObject(normalized)) return null
 
   const nested = isObject(normalized.credentials) ? normalized.credentials : undefined
+  const accessToken = stringField(normalized.accessToken) ?? stringField(nested?.accessToken)
+  const expiresAt = stringField(normalized.expiresAt) ?? stringField(normalized.expired) ?? stringField(nested?.expiresAt) ?? stringField(nested?.expired)
   const refreshToken = stringField(normalized.refreshToken) ?? stringField(nested?.refreshToken)
   const kiroApiKey = stringField(normalized.kiroApiKey) ?? stringField(normalized.apiKey)
   const clientId = stringField(normalized.clientId) ?? stringField(nested?.clientId)
@@ -97,6 +99,8 @@ export function normalizeCredentialImportItem(value: unknown): AddCredentialRequ
 
   return {
     authMethod,
+    accessToken: authMethod === 'api_key' ? undefined : accessToken,
+    expiresAt: authMethod === 'api_key' ? undefined : expiresAt,
     refreshToken: authMethod === 'api_key' ? undefined : refreshToken,
     kiroApiKey: authMethod === 'api_key' ? kiroApiKey : undefined,
     clientId: authMethod === 'api_key' ? undefined : clientId,
