@@ -5715,6 +5715,10 @@ async fn handle_non_stream_request(
                                     .get(&tool_use.name)
                                     .cloned()
                                     .unwrap_or_else(|| tool_use.name.clone());
+                                let input = crate::anthropic::stream::repair_tool_use_input_for_cli(
+                                    &original_name,
+                                    input,
+                                );
                                 let sig = crate::anthropic::stream::tool_use_signature(
                                     &original_name,
                                     &input,

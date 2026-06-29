@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::kiro::model::events::{Event, MetadataTokenUsage};
@@ -709,6 +709,72 @@ fn tool_use_signature_from_json_str(name: &str, input_json: &str) -> String {
     tool_use_signature(name, &input)
 }
 
+fn is_blank_string(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_str)
+        .is_none_or(|text| text.trim().is_empty())
+}
+
+fn fallback_question_for_ask_user_question(question: &serde_json::Map<String, Value>) -> String {
+    if let Some(header) = question.get("header").and_then(Value::as_str) {
+        let header = header.trim();
+        if !header.is_empty() {
+            return header.to_string();
+        }
+    }
+
+    "Please choose an option.".to_string()
+}
+
+/// Claude Code validates `AskUserQuestion.questions[*].question` locally before
+/// rendering the prompt. Some Kiro responses include header/options but omit
+/// that required field, which turns into `Invalid tool parameters` in the CLI.
+/// Only repair this display-only tool; never synthesize parameters for tools
+/// with side effects such as Bash/Edit/Write.
+pub(crate) fn repair_tool_use_input_for_cli(name: &str, mut input: Value) -> Value {
+    if name != "AskUserQuestion" {
+        return input;
+    }
+
+    if let Some(input_obj) = input.as_object_mut() {
+        if let Some(raw_questions) = input_obj.get("questions").and_then(Value::as_str) {
+            if let Ok(parsed_questions @ Value::Array(_)) =
+                serde_json::from_str::<Value>(raw_questions)
+            {
+                input_obj.insert("questions".to_string(), parsed_questions);
+            }
+        }
+    }
+
+    let Some(questions) = input.get_mut("questions").and_then(Value::as_array_mut) else {
+        return input;
+    };
+
+    for question in questions {
+        let Some(question_obj) = question.as_object_mut() else {
+            continue;
+        };
+        if is_blank_string(question_obj.get("question")) {
+            let fallback = fallback_question_for_ask_user_question(question_obj);
+            question_obj.insert("question".to_string(), Value::String(fallback));
+        }
+    }
+
+    input
+}
+
+fn repair_tool_use_input_json_for_cli(name: &str, input_json: &str) -> String {
+    if name != "AskUserQuestion" || input_json.trim().is_empty() {
+        return input_json.to_string();
+    }
+
+    let Ok(input) = serde_json::from_str::<Value>(input_json) else {
+        return input_json.to_string();
+    };
+    let repaired = repair_tool_use_input_for_cli(name, input);
+    serde_json::to_string(&repaired).unwrap_or_else(|_| input_json.to_string())
+}
+
 /// 一次性把完整 assistant 文本里的字面 `<invoke>` 恢复成 Anthropic content blocks。
 pub(crate) fn extract_invoke_content_blocks(
     text: &str,
@@ -755,9 +821,10 @@ pub(crate) fn extract_invoke_content_blocks(
             }
             push_text(&mut blocks, &mut pending_text);
             let (name, input_json) = parsed.expect("parsed is Some when name_known");
+            let name = tool_name_map.get(&name).cloned().unwrap_or(name);
             let input: serde_json::Value =
                 serde_json::from_str(&input_json).unwrap_or_else(|_| json!({}));
-            let name = tool_name_map.get(&name).cloned().unwrap_or(name);
+            let input = repair_tool_use_input_for_cli(&name, input);
             let tool_use_id = format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
             blocks.push(json!({
                 "type": "tool_use",
@@ -2001,6 +2068,7 @@ impl StreamContext {
             .get(&parsed_name)
             .cloned()
             .unwrap_or(parsed_name);
+        let input_json = repair_tool_use_input_json_for_cli(&output_name, &input_json);
         let sig = tool_use_signature_from_json_str(&output_name, &input_json);
         if self.seen_tool_sigs.contains(&sig) {
             tracing::debug!(tool = %output_name, "跳过重复的字面 invoke 工具调用");
@@ -2346,8 +2414,11 @@ impl StreamContext {
         );
         events.extend(start_events);
 
-        // 发送参数增量 (ToolUseEvent.input 是 String 类型)
-        if !tool_use.input.is_empty() {
+        let defer_input_until_stop = original_name == "AskUserQuestion";
+
+        // 发送参数增量 (ToolUseEvent.input 是 String 类型)。AskUserQuestion 需要先
+        // 累计完整 JSON，避免已经发给 CLI 的增量参数无法修正。
+        if !defer_input_until_stop && !tool_use.input.is_empty() {
             self.output_tokens += (tool_use.input.len() as i32 + 3) / 4; // 估算 token
 
             if let Some(delta_event) = self.state_manager.handle_content_block_delta(
@@ -2371,7 +2442,28 @@ impl StreamContext {
                 .tool_input_buffers
                 .remove(&tool_use.tool_use_id)
                 .unwrap_or_else(|| tool_use.input.clone());
-            let sig = tool_use_signature_from_json_str(&original_name, &full_input);
+            let output_input = if defer_input_until_stop {
+                repair_tool_use_input_json_for_cli(&original_name, &full_input)
+            } else {
+                full_input
+            };
+            if defer_input_until_stop && !output_input.is_empty() {
+                self.output_tokens += (output_input.len() as i32 + 3) / 4;
+                if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+                    block_index,
+                    json!({
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": output_input
+                        }
+                    }),
+                ) {
+                    events.push(delta_event);
+                }
+            }
+            let sig = tool_use_signature_from_json_str(&original_name, &output_input);
             self.seen_tool_sigs.insert(sig);
             if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
                 events.push(stop_event);
@@ -3701,6 +3793,126 @@ mod tests {
             result.push((name, input));
         }
         result
+    }
+
+    #[test]
+    fn test_repair_ask_user_question_input_adds_missing_question() {
+        let repaired = repair_tool_use_input_for_cli(
+            "AskUserQuestion",
+            json!({
+                "questions": [
+                    {
+                        "header": "反补范围",
+                        "multiSelect": true,
+                        "options": [
+                            {"label": "#3 校验统计卡", "description": "补统计卡。"},
+                            {"label": "#2 publicError 展示", "description": "补错误展示。"}
+                        ]
+                    }
+                ]
+            }),
+        );
+
+        assert_eq!(
+            repaired["questions"][0]["question"].as_str(),
+            Some("反补范围")
+        );
+        assert_eq!(
+            repaired["questions"][0]["multiSelect"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            repaired["questions"][0]["options"][0]["label"].as_str(),
+            Some("#3 校验统计卡")
+        );
+    }
+
+    #[test]
+    fn test_repair_ask_user_question_keeps_existing_question() {
+        let repaired = repair_tool_use_input_for_cli(
+            "AskUserQuestion",
+            json!({
+                "questions": [
+                    {
+                        "header": "范围",
+                        "question": "请选择反补范围",
+                        "options": [{"label": "A", "description": "A"}]
+                    }
+                ]
+            }),
+        );
+
+        assert_eq!(
+            repaired["questions"][0]["question"].as_str(),
+            Some("请选择反补范围")
+        );
+    }
+
+    #[test]
+    fn test_stream_buffers_and_repairs_ask_user_question_input() {
+        use crate::kiro::model::events::ToolUseEvent;
+
+        let mut ctx = StreamContext::new_with_thinking_with_known_tools(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            {
+                let mut tools = HashSet::new();
+                tools.insert("AskUserQuestion".to_string());
+                tools
+            },
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_tool_use(&ToolUseEvent {
+            name: "AskUserQuestion".to_string(),
+            tool_use_id: "toolu_question".to_string(),
+            input: r##"{"questions":[{"header":"反补范围","multiSelect":true,"options":[{"label":"#3 校验统计卡","description":"补统计卡"}"##.to_string(),
+            stop: false,
+        }));
+        assert_eq!(collect_tool_uses(&all)[0].1, "");
+
+        all.extend(ctx.process_tool_use(&ToolUseEvent {
+            name: "AskUserQuestion".to_string(),
+            tool_use_id: "toolu_question".to_string(),
+            input:
+                r##",{"label":"#2 publicError 展示","description":"补错误展示"}]}]}"##.to_string(),
+            stop: true,
+        }));
+
+        let tool_uses = collect_tool_uses(&all);
+        assert_eq!(tool_uses.len(), 1);
+        assert_eq!(tool_uses[0].0, "AskUserQuestion");
+        let input: Value = serde_json::from_str(&tool_uses[0].1).expect("valid repaired input");
+        assert_eq!(input["questions"][0]["question"].as_str(), Some("反补范围"));
+        assert_eq!(
+            input["questions"][0]["options"][1]["label"].as_str(),
+            Some("#2 publicError 展示")
+        );
+    }
+
+    #[test]
+    fn test_extract_invoke_repairs_ask_user_question_input() {
+        let mut known = HashSet::new();
+        known.insert("AskUserQuestion".to_string());
+        let blocks = extract_invoke_content_blocks(
+            r#"confirm
+<invoke name="AskUserQuestion"><parameter name="questions">[{"header":"反补范围","options":[{"label":"A","description":"A"}]}]</parameter></invoke>"#,
+            &known,
+            &HashMap::new(),
+        );
+
+        let tool = blocks
+            .iter()
+            .find(|block| block["type"] == "tool_use")
+            .expect("tool use");
+        assert_eq!(tool["name"].as_str(), Some("AskUserQuestion"));
+        assert_eq!(
+            tool["input"]["questions"][0]["question"].as_str(),
+            Some("反补范围")
+        );
     }
 
     #[test]
