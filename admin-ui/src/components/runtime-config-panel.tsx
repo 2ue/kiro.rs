@@ -19,6 +19,8 @@ import { storage } from '@/lib/storage'
 import { extractErrorMessage } from '@/lib/utils'
 import type {
   AccessKeysResponse,
+  CachePolicyConfig,
+  CacheRoutePolicyPatch,
   CompatProfile,
   KiroAgentModeStrategy,
   ModelCapabilitiesStatus,
@@ -89,6 +91,11 @@ const defaultReportedUsage = (): ReportedUsageConfig => ({
     '/cc': pathPolicy(true, inputSamplePolicy(96), writerSamplePolicy(3000)),
     '/ha': pathPolicy(true, inputSamplePolicy(96), preserveFieldPolicy()),
   },
+})
+
+const defaultCachePolicy = (): CachePolicyConfig => ({
+  default: {},
+  pathOverrides: {},
 })
 
 const defaultPayloadShaping = (): PayloadShapingConfig => ({
@@ -316,6 +323,7 @@ const emptyConfig: RuntimeConfig = {
   promptCacheScaleMinInputTokens: 20000,
   promptCacheCreationControl: defaultPromptCacheCreationControl(),
   reportedUsage: defaultReportedUsage(),
+  cachePolicy: defaultCachePolicy(),
   definedCacheRoutes: [],
   externalPools: defaultExternalPoolsConfig(),
   highCacheThreshold: 10000,
@@ -1447,6 +1455,34 @@ function normalizeReportedUsage(config: ReportedUsageConfig): ReportedUsageConfi
   }
 }
 
+function normalizeCachePolicyPathPrefix(prefix: string): string | null {
+  const trimmed = prefix.trim()
+  if (!trimmed) return null
+  const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
+  return withSlash.replace(/\/+$/, '') || '/'
+}
+
+function isEmptyCachePolicyPatch(policy: CacheRoutePolicyPatch): boolean {
+  return !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds
+}
+
+function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyConfig {
+  const source = config ?? defaultCachePolicy()
+  const pathOverrides = Object.fromEntries(
+    Object.entries(source.pathOverrides ?? {})
+      .map(([prefix, policy]) => {
+        const normalizedPrefix = normalizeCachePolicyPathPrefix(prefix)
+        if (!normalizedPrefix || isEmptyCachePolicyPatch(policy)) return null
+        return [normalizedPrefix, policy] as const
+      })
+      .filter((entry): entry is readonly [string, CacheRoutePolicyPatch] => Boolean(entry))
+  )
+  return {
+    default: source.default ?? {},
+    pathOverrides,
+  }
+}
+
 const DFCACHE_ROUTE_PREFIX = '/dfcache/'
 
 function normalizeDefinedCacheRoute(route: string): string | null {
@@ -1569,6 +1605,7 @@ export function RuntimeConfigPanel() {
           ...defaultPromptCacheCreationControl(),
           ...config.data.promptCacheCreationControl,
         },
+        cachePolicy: normalizeCachePolicy(config.data.cachePolicy),
         definedCacheRoutes: normalizeDefinedCacheRoutes(config.data.definedCacheRoutes || []),
         modelMapping: normalizeModelMapping(config.data.modelMapping),
       })
@@ -1633,6 +1670,7 @@ export function RuntimeConfigPanel() {
           draft.reportedUsage.pathOverrides
         ),
       }),
+      cachePolicy: normalizeCachePolicy(draft.cachePolicy),
       definedCacheRoutes,
       modelMapping: normalizeModelMapping(draft.modelMapping),
       payloadGuardMaxBytes: toWhole(draft.payloadGuardMaxBytes),

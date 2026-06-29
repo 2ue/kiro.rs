@@ -471,6 +471,7 @@ export interface SetCredentialRegionsRequest {
 
 export interface BatchUpdateCredentialsRequest {
   ids: number[]
+  priority?: SetPriorityRequest
   regions?: SetCredentialRegionsRequest
   concurrency?: SetCredentialConcurrencyRequest
   rpm?: SetCredentialRpmRequest
@@ -683,6 +684,9 @@ export interface UsageRecord {
   errorType?: string
   errorMessage?: string
   errorDetail?: string
+  publicErrorStatusCode?: number
+  publicErrorType?: string
+  publicErrorMessage?: string
   payloadBreakdown?: unknown
   payloadGuardReport?: unknown
 }
@@ -993,6 +997,42 @@ export interface ReportedUsageConfig {
   pathOverrides: Record<string, ReportedUsagePathPolicy>
 }
 
+export interface CacheSimulationPolicyPatch {
+  enabled?: boolean
+  targetReadRatio?: number
+  tokenScale?: number
+  maxSimulatedInputTokens?: number
+  capJitterMinTokens?: number
+  capJitterMaxTokens?: number
+  scaleMinInputTokens?: number
+}
+
+export interface CachePointPolicyPatch {
+  enabled?: boolean
+  toolsOnly?: boolean
+  recordPlan?: boolean
+}
+
+export interface CacheBoundsPolicyPatch {
+  maxEntriesPerAccount?: number
+  maxEntriesGlobal?: number
+  entryTtlSecs?: number
+  estimatedBytesLimit?: number
+}
+
+export interface CacheRoutePolicyPatch {
+  simulation?: CacheSimulationPolicyPatch
+  creationControl?: PromptCacheCreationControlConfig
+  reportedUsage?: ReportedUsagePathPolicy
+  cachePoint?: CachePointPolicyPatch
+  bounds?: CacheBoundsPolicyPatch
+}
+
+export interface CachePolicyConfig {
+  default: CacheRoutePolicyPatch
+  pathOverrides: Record<string, CacheRoutePolicyPatch>
+}
+
 export interface PromptCacheCreationControlConfig {
   enabled: boolean
   scopeMode: 'credential_conversation_model' | 'conversation_model'
@@ -1221,6 +1261,7 @@ export interface RuntimeConfig {
   promptCacheScaleMinInputTokens: number
   promptCacheCreationControl: PromptCacheCreationControlConfig
   reportedUsage: ReportedUsageConfig
+  cachePolicy: CachePolicyConfig
   definedCacheRoutes: string[]
   externalPools: ExternalPoolsConfig
   highCacheThreshold: number

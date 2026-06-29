@@ -85,11 +85,13 @@ function Results({ result }: { result: CredentialValidationResponse | null }) {
   }
   return (
     <div className="space-y-4">
-      <div className="grid gap-4 md:grid-cols-4">
+      <div className="grid gap-4 md:grid-cols-3 lg:grid-cols-6">
         <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">总数</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold">{formatNumber(result.total)}</div></CardContent></Card>
         <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">成功</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold text-green-600">{formatNumber(result.success)}</div></CardContent></Card>
         <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">失败</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold text-amber-600">{formatNumber(result.failed)}</div></CardContent></Card>
+        <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">升级</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold text-emerald-600">{formatNumber(result.upgraded)}</div></CardContent></Card>
         <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">疑似掉级</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold text-red-600">{formatNumber(result.downgraded)}</div></CardContent></Card>
+        <Card><CardHeader className="pb-2"><CardTitle className="text-sm text-muted-foreground">无变化</CardTitle></CardHeader><CardContent><div className="text-2xl font-bold text-muted-foreground">{formatNumber(result.unchanged)}</div></CardContent></Card>
       </div>
       {result.groups.length === 0 ? <Card><CardContent className="py-8 text-center text-muted-foreground">暂无分组结果</CardContent></Card> : result.groups.map(group => <ResultGroup key={group.key} group={group} />)}
     </div>

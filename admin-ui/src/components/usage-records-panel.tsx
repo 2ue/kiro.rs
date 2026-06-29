@@ -915,6 +915,24 @@ export function UsageRecordsPanel() {
                   <div className="text-xs text-muted-foreground">首字 token</div>
                   <div>{formatLatency(selectedRecord.firstTokenLatencyMs)}</div>
                 </div>
+                {selectedRecord.publicErrorType && (
+                  <div>
+                    <div className="text-xs text-muted-foreground">客户端错误类型</div>
+                    <div className="break-all">{selectedRecord.publicErrorType}</div>
+                  </div>
+                )}
+                {selectedRecord.publicErrorStatusCode != null && (
+                  <div>
+                    <div className="text-xs text-muted-foreground">客户端状态码</div>
+                    <div>{selectedRecord.publicErrorStatusCode}</div>
+                  </div>
+                )}
+                {selectedRecord.publicErrorMessage && (
+                  <div className="md:col-span-2">
+                    <div className="text-xs text-muted-foreground">客户端收到的错误</div>
+                    <div className="break-all">{selectedRecord.publicErrorMessage}</div>
+                  </div>
+                )}
               </div>
               <LatencyTracePanel record={selectedRecord} />
               <div className="rounded-md border bg-muted/30 p-3 text-sm">
