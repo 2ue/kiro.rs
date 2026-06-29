@@ -1233,6 +1233,30 @@ impl KiroProvider {
         }
     }
 
+    fn maybe_exclude_after_transient_failure(
+        &self,
+        model: Option<&str>,
+        credential_id: u64,
+        credential_label: &str,
+        excluded_ids: &mut HashSet<u64>,
+    ) {
+        if excluded_ids.contains(&credential_id) {
+            return;
+        }
+        if self.token_manager.has_alternate_usable_credential_cached(
+            model,
+            excluded_ids,
+            credential_id,
+        ) {
+            tracing::warn!(
+                credential_id,
+                credential_label = %credential_label,
+                "账号发生上游瞬态错误，本次请求临时排除当前账号并重试其他账号"
+            );
+            excluded_ids.insert(credential_id);
+        }
+    }
+
     async fn handle_credential_auth_failure(
         &self,
         call_scope: &str,
@@ -1846,6 +1870,12 @@ impl KiroProvider {
                             err
                         );
                     }
+                    self.maybe_exclude_after_transient_failure(
+                        None,
+                        ctx.id,
+                        &credential_label,
+                        &mut excluded_ids,
+                    );
                     self.finish_attempt(&mut ctx);
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
@@ -1965,6 +1995,12 @@ impl KiroProvider {
                         err
                     );
                 }
+                self.maybe_exclude_after_transient_failure(
+                    None,
+                    ctx.id,
+                    &credential_label,
+                    &mut excluded_ids,
+                );
                 self.finish_attempt(&mut ctx);
                 continue;
             }
@@ -2074,6 +2110,12 @@ impl KiroProvider {
                         err
                     );
                 }
+                self.maybe_exclude_after_transient_failure(
+                    None,
+                    ctx.id,
+                    &credential_label,
+                    &mut excluded_ids,
+                );
                 self.finish_attempt(&mut ctx);
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
@@ -2123,6 +2165,12 @@ impl KiroProvider {
                     err
                 );
             }
+            self.maybe_exclude_after_transient_failure(
+                None,
+                ctx.id,
+                &credential_label,
+                &mut excluded_ids,
+            );
             self.finish_attempt(&mut ctx);
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
@@ -2344,8 +2392,8 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
-                    // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
-                    // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
+                    // 网络错误通常是上游/链路瞬态问题，不禁用凭据；若本机内存态存在备选，
+                    // 仅在当前请求内临时排除失败账号，避免重试链反复命中同一账号。
                     Self::push_attempt(
                         &mut attempts,
                         attempt,
@@ -2381,6 +2429,12 @@ impl KiroProvider {
                     }
                     self.maybe_exclude_after_soft_failure(
                         conversation_id.as_deref(),
+                        model.as_deref(),
+                        ctx.id,
+                        &credential_label,
+                        &mut excluded_ids,
+                    );
+                    self.maybe_exclude_after_transient_failure(
                         model.as_deref(),
                         ctx.id,
                         &credential_label,
@@ -2470,6 +2524,12 @@ impl KiroProvider {
                         }
                         self.maybe_exclude_after_soft_failure(
                             conversation_id.as_deref(),
+                            model.as_deref(),
+                            ctx.id,
+                            &credential_label,
+                            &mut excluded_ids,
+                        );
+                        self.maybe_exclude_after_transient_failure(
                             model.as_deref(),
                             ctx.id,
                             &credential_label,
@@ -2926,8 +2986,8 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
-            // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
+            // 429/408/5xx - 瞬态上游错误：不禁用凭据；若本机内存态存在备选，
+            // 仅在当前请求内临时排除失败账号，避免重试链反复命中同一账号。
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 let message = format!(
                     "{} API 请求失败（{}）: {} {}",
@@ -2988,6 +3048,12 @@ impl KiroProvider {
                     &credential_label,
                     &mut excluded_ids,
                 );
+                self.maybe_exclude_after_transient_failure(
+                    model.as_deref(),
+                    ctx.id,
+                    &credential_label,
+                    &mut excluded_ids,
+                );
                 self.finish_attempt(&mut ctx);
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
@@ -3018,7 +3084,8 @@ impl KiroProvider {
                 return Err(Self::traced_error(message, &attempts));
             }
 
-            // 兜底：当作可重试的瞬态错误处理（不切换凭据）
+            // 兜底：当作可重试的瞬态错误处理；若本机内存态存在备选，
+            // 仅在当前请求内临时排除失败账号。
             let message = format!(
                 "{} API 请求失败（{}）: {} {}",
                 api_type, credential_context, status, body
@@ -3068,6 +3135,12 @@ impl KiroProvider {
             }
             self.maybe_exclude_after_soft_failure(
                 conversation_id.as_deref(),
+                model.as_deref(),
+                ctx.id,
+                &credential_label,
+                &mut excluded_ids,
+            );
+            self.maybe_exclude_after_transient_failure(
                 model.as_deref(),
                 ctx.id,
                 &credential_label,

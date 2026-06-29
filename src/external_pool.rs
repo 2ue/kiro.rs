@@ -824,6 +824,12 @@ impl PoolAvailabilitySnapshot {
     fn has_temporary_unavailable_pool(&self) -> bool {
         self.temporary_unavailable_pools > 0
     }
+
+    fn default_retry_attempts(&self, payload_guard_retry_enabled: bool) -> usize {
+        self.eligible_pools
+            .max(1)
+            .saturating_add(usize::from(payload_guard_retry_enabled))
+    }
 }
 
 enum ExternalCapacityDecision {
@@ -1037,23 +1043,15 @@ impl ExternalPoolManager {
             });
         }
 
-        let enabled_count = self
-            .postgres
-            .list_external_pools(false)
-            .await
-            .map(|pools| {
-                pools
-                    .iter()
-                    .filter(|pool| pool.enabled && !pool.is_auto_disabled_now())
-                    .count()
-            })
-            .unwrap_or(0);
-        let max_attempts = if config.external_pool_retry_max_attempts == 0 {
-            enabled_count.max(1)
+        let payload_guard_retry_enabled = route.payload_guard_retry_config.is_some();
+        let mut max_attempts = if config.external_pool_retry_max_attempts == 0 {
+            None
         } else {
-            config.external_pool_retry_max_attempts as usize
-        }
-        .saturating_add(usize::from(route.payload_guard_retry_config.is_some()));
+            Some(
+                (config.external_pool_retry_max_attempts as usize)
+                    .saturating_add(usize::from(payload_guard_retry_enabled)),
+            )
+        };
 
         let mut excluded = HashSet::new();
         let mut attempts = Vec::new();
@@ -1062,10 +1060,20 @@ impl ExternalPoolManager {
         let mut wait_started_at: Option<Instant> = None;
         let mut attempt_index = 0usize;
 
-        while attempt_index < max_attempts {
+        loop {
+            if max_attempts.is_some_and(|max_attempts| attempt_index >= max_attempts) {
+                break;
+            }
             let selection = self
                 .select_pool_with_availability_uncached(&excluded, &config)
                 .await;
+            if max_attempts.is_none() {
+                max_attempts = Some(
+                    selection
+                        .availability
+                        .default_retry_attempts(payload_guard_retry_enabled),
+                );
+            }
             let Some(pool) = selection.selected_pool else {
                 let snapshot = selection.availability;
                 if snapshot.has_temporary_unavailable_pool() {
@@ -4544,6 +4552,34 @@ mod tests {
             ExternalPoolAutoDisablePolicy::Inherit,
             &config
         ));
+    }
+
+    #[test]
+    fn external_pool_default_retry_attempts_cover_eligible_pools_and_payload_guard_retry() {
+        assert_eq!(
+            PoolAvailabilitySnapshot {
+                eligible_pools: 0,
+                ..PoolAvailabilitySnapshot::default()
+            }
+            .default_retry_attempts(false),
+            1
+        );
+        assert_eq!(
+            PoolAvailabilitySnapshot {
+                eligible_pools: 2,
+                ..PoolAvailabilitySnapshot::default()
+            }
+            .default_retry_attempts(false),
+            2
+        );
+        assert_eq!(
+            PoolAvailabilitySnapshot {
+                eligible_pools: 2,
+                ..PoolAvailabilitySnapshot::default()
+            }
+            .default_retry_attempts(true),
+            3
+        );
     }
 
     #[test]

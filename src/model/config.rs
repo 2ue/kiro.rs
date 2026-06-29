@@ -3570,10 +3570,7 @@ mod tests {
         let overridden = config.cache_policy_for_path("/dfcache/team-a/v1/messages");
         assert_eq!(overridden.namespace.as_deref(), Some("/dfcache/team-a"));
         assert_eq!(
-            overridden
-                .policy
-                .creation_control
-                .scope_mode,
+            overridden.policy.creation_control.scope_mode,
             PromptCacheCreationControlScopeMode::CredentialConversationModel
         );
         assert_eq!(
@@ -3584,7 +3581,10 @@ mod tests {
             2
         );
         assert_eq!(
-            overridden.policy.creation_control.min_creation_interval_secs,
+            overridden
+                .policy
+                .creation_control
+                .min_creation_interval_secs,
             30
         );
 

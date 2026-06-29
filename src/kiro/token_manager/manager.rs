@@ -2027,6 +2027,28 @@ impl MultiTokenManager {
             tracing::warn!("判断备选凭据前同步 Redis 调度状态失败: {}", err);
             return false;
         }
+        self.has_alternate_usable_credential_from_current_state(model, excluded_ids, current_id)
+    }
+
+    /// 判断当前本机内存态中是否还有其他可调度凭据。
+    ///
+    /// 这个方法不触发 Redis/PgSQL 同步，用于上游瞬态失败后的当前请求 retry
+    /// 决策，避免失败路径为了换账号再增加一次存储热路径等待。
+    pub fn has_alternate_usable_credential_cached(
+        &self,
+        model: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        current_id: u64,
+    ) -> bool {
+        self.has_alternate_usable_credential_from_current_state(model, excluded_ids, current_id)
+    }
+
+    fn has_alternate_usable_credential_from_current_state(
+        &self,
+        model: Option<&str>,
+        excluded_ids: &HashSet<u64>,
+        current_id: u64,
+    ) -> bool {
         let mut entries = self.entries.lock();
         let now = Instant::now();
         let max_concurrent_requests = self.max_concurrent_requests();
@@ -9248,6 +9270,63 @@ mod tests {
         assert!(!manager.record_session_soft_failure("session-only", ctx.id));
         assert!(manager.record_session_soft_failure("session-only", ctx.id));
         assert!(!manager.has_alternate_usable_credential(None, &empty, ctx.id));
+    }
+
+    #[test]
+    fn test_cached_alternate_usable_credential_uses_current_memory_state() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.credential_transient_cooldown_secs = 60;
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                test_access_token_credential("t1", "Pro"),
+                test_access_token_credential("t2", "Pro"),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let mut excluded = HashSet::new();
+
+        assert!(manager.has_alternate_usable_credential_cached(None, &excluded, 1));
+
+        manager
+            .report_transient_failure_kind(1, None, TransientFailureKind::RateLimit, None, "429")
+            .unwrap();
+
+        assert!(
+            manager.has_alternate_usable_credential_cached(None, &excluded, 1),
+            "当前账号冷却后，本次 retry 应能用本机内存态发现另一个可调度账号"
+        );
+
+        excluded.insert(2);
+        assert!(
+            !manager.has_alternate_usable_credential_cached(None, &excluded, 1),
+            "唯一备选账号已被本次请求排除时，不应误报可 fallback"
+        );
+    }
+
+    #[test]
+    fn test_cached_alternate_usable_credential_is_false_for_single_active_credential() {
+        let mut disabled = KiroCredentials::default();
+        disabled.disabled = true;
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                disabled,
+                test_access_token_credential("active-token", "Pro"),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let empty = HashSet::new();
+
+        assert!(!manager.has_alternate_usable_credential_cached(None, &empty, 2));
     }
 
     #[tokio::test]
