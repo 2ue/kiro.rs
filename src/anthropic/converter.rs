@@ -38,6 +38,7 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     };
 
     normalize_schema_object(&mut obj, true);
+    flatten_root_schema_combinators(&mut obj);
     obj.insert(
         "type".to_string(),
         serde_json::Value::String("object".to_string()),
@@ -49,6 +50,125 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
         );
     }
     serde_json::Value::Object(obj)
+}
+
+fn flatten_root_schema_combinators(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    flatten_root_schema_combinator(obj, "allOf", RequiredMergeMode::Union);
+    flatten_root_schema_combinator(obj, "oneOf", RequiredMergeMode::Intersection);
+    flatten_root_schema_combinator(obj, "anyOf", RequiredMergeMode::Intersection);
+}
+
+#[derive(Clone, Copy)]
+enum RequiredMergeMode {
+    Union,
+    Intersection,
+}
+
+fn flatten_root_schema_combinator(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    required_mode: RequiredMergeMode,
+) {
+    let Some(serde_json::Value::Array(items)) = obj.remove(key) else {
+        return;
+    };
+
+    let mut required_sets = Vec::new();
+    for item in items {
+        let serde_json::Value::Object(item) = item else {
+            continue;
+        };
+        merge_root_variant_properties(obj, &item);
+        let required = schema_required_set(&item);
+        if !required.is_empty() {
+            required_sets.push(required);
+        }
+    }
+
+    merge_root_variant_required(obj, required_sets, required_mode);
+}
+
+fn merge_root_variant_properties(
+    root: &mut serde_json::Map<String, serde_json::Value>,
+    variant: &serde_json::Map<String, serde_json::Value>,
+) {
+    let Some(serde_json::Value::Object(variant_props)) = variant.get("properties") else {
+        return;
+    };
+
+    let root_props = root
+        .entry("properties".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !root_props.is_object() {
+        *root_props = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let root_props = root_props
+        .as_object_mut()
+        .expect("root properties should be an object after normalization");
+
+    for (name, schema) in variant_props {
+        root_props
+            .entry(name.clone())
+            .or_insert_with(|| schema.clone());
+    }
+}
+
+fn schema_required_set(
+    schema: &serde_json::Map<String, serde_json::Value>,
+) -> std::collections::BTreeSet<String> {
+    schema
+        .get("required")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn merge_root_variant_required(
+    root: &mut serde_json::Map<String, serde_json::Value>,
+    required_sets: Vec<std::collections::BTreeSet<String>>,
+    mode: RequiredMergeMode,
+) {
+    if required_sets.is_empty() {
+        return;
+    }
+
+    let mut merged = schema_required_set(root);
+    let variant_required = match mode {
+        RequiredMergeMode::Union => required_sets
+            .into_iter()
+            .flatten()
+            .collect::<std::collections::BTreeSet<_>>(),
+        RequiredMergeMode::Intersection => {
+            let mut iter = required_sets.into_iter();
+            let Some(first) = iter.next() else {
+                return;
+            };
+            iter.fold(first, |acc, required| {
+                acc.intersection(&required).cloned().collect()
+            })
+        }
+    };
+    merged.extend(variant_required);
+
+    if merged.is_empty() {
+        root.remove("required");
+    } else {
+        root.insert(
+            "required".to_string(),
+            serde_json::Value::Array(
+                merged
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect::<Vec<_>>(),
+            ),
+        );
+    }
 }
 
 fn normalize_schema_object(obj: &mut serde_json::Map<String, serde_json::Value>, is_root: bool) {
@@ -1257,11 +1377,8 @@ fn process_message_content(
                             }
                         }
                         "tool_result" => {
-                            if let Some(tool_use_id) = block
-                                .tool_use_id
-                                .as_deref()
-                                .map(str::trim)
-                                .filter(|id| !id.is_empty())
+                            if let Some(tool_use_id) =
+                                block.tool_use_id.as_deref().and_then(sanitize_tool_use_id)
                             {
                                 let result_content = normalize_tool_result_content(
                                     extract_tool_result_content(&block.content),
@@ -1269,9 +1386,9 @@ fn process_message_content(
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
-                                    ToolResult::error(tool_use_id, result_content)
+                                    ToolResult::error(tool_use_id.clone(), result_content)
                                 } else {
-                                    ToolResult::success(tool_use_id, result_content)
+                                    ToolResult::success(tool_use_id.clone(), result_content)
                                 };
                                 result.status =
                                     Some(if is_error { "error" } else { "success" }.to_string());
@@ -1708,6 +1825,43 @@ fn normalize_tool_use_input(input: serde_json::Value) -> serde_json::Value {
         serde_json::Value::Null => serde_json::json!({}),
         other => serde_json::json!({ "value": other }),
     }
+}
+
+fn sanitize_tool_use_id(id: &str) -> Option<String> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return Some(trimmed.to_string());
+    }
+
+    let sanitized = trimmed
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let sanitized = sanitized.trim_matches('_');
+    let prefix = if sanitized.is_empty() {
+        "toolu".to_string()
+    } else {
+        sanitized.to_string()
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(trimmed.as_bytes());
+    let digest = hasher.finalize();
+    Some(format!(
+        "{}_{:02x}{:02x}{:02x}{:02x}",
+        prefix, digest[0], digest[1], digest[2], digest[3]
+    ))
 }
 
 /// 验证并过滤 tool_use/tool_result 配对
@@ -2438,11 +2592,7 @@ fn convert_assistant_message(
                         }
                         "tool_use" => {
                             if let (Some(id), Some(name)) = (
-                                block
-                                    .id
-                                    .as_deref()
-                                    .map(str::trim)
-                                    .filter(|id| !id.is_empty()),
+                                block.id.as_deref().and_then(sanitize_tool_use_id),
                                 block
                                     .name
                                     .as_deref()
@@ -2453,10 +2603,8 @@ fn convert_assistant_message(
                                     block.input.unwrap_or(serde_json::json!({})),
                                 );
                                 let mapped_name = map_tool_name(name, tool_name_map);
-                                tool_uses.push(
-                                    ToolUseEntry::new(id.to_string(), mapped_name)
-                                        .with_input(input),
-                                );
+                                tool_uses
+                                    .push(ToolUseEntry::new(id, mapped_name).with_input(input));
                             }
                         }
                         _ => {}
@@ -2971,6 +3119,82 @@ mod tests {
         assert!(props["bounded"].get("minimum").is_none());
         assert_eq!(props["bounded"]["maximum"], serde_json::json!(10));
         assert!(props["bounded"].get("multipleOf").is_none());
+    }
+
+    #[test]
+    fn test_normalize_json_schema_flattens_root_union_combinators() {
+        let schema = serde_json::json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "required": ["path", "mode"],
+                    "properties": {
+                        "path": {"type": "string"},
+                        "mode": {"type": "string"}
+                    }
+                },
+                {
+                    "type": "object",
+                    "required": ["path", "query"],
+                    "properties": {
+                        "path": {"type": "string"},
+                        "query": {"type": "string"}
+                    }
+                }
+            ]
+        });
+
+        let normalized = normalize_json_schema(schema);
+
+        assert_eq!(normalized["type"], "object");
+        assert!(normalized.get("oneOf").is_none());
+        assert!(normalized.get("anyOf").is_none());
+        assert!(normalized.get("allOf").is_none());
+        assert_eq!(
+            normalized["properties"]["path"],
+            serde_json::json!({"type": "string"})
+        );
+        assert_eq!(
+            normalized["properties"]["mode"],
+            serde_json::json!({"type": "string"})
+        );
+        assert_eq!(
+            normalized["properties"]["query"],
+            serde_json::json!({"type": "string"})
+        );
+        assert_eq!(normalized["required"], serde_json::json!(["path"]));
+    }
+
+    #[test]
+    fn test_normalize_json_schema_flattens_root_all_of_required_union() {
+        let schema = serde_json::json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "required": ["path"],
+                    "properties": {
+                        "path": {"type": "string"}
+                    }
+                },
+                {
+                    "type": "object",
+                    "required": ["recursive"],
+                    "properties": {
+                        "recursive": {"type": "boolean"}
+                    }
+                }
+            ]
+        });
+
+        let normalized = normalize_json_schema(schema);
+
+        assert!(normalized.get("allOf").is_none());
+        assert_eq!(normalized["properties"]["path"]["type"], "string");
+        assert_eq!(normalized["properties"]["recursive"]["type"], "boolean");
+        assert_eq!(
+            normalized["required"],
+            serde_json::json!(["path", "recursive"])
+        );
     }
 
     #[test]
@@ -4562,6 +4786,43 @@ mod tests {
 
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_ok");
+    }
+
+    #[test]
+    fn test_tool_use_ids_are_sanitized_consistently() {
+        let raw_id = "toolu:01/ABC";
+        let sanitized = sanitize_tool_use_id(raw_id).expect("sanitized id");
+        assert!(
+            sanitized
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        );
+        assert_ne!(sanitized, raw_id);
+
+        let assistant = super::super::types::Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "tool_use", "id": raw_id, "name": "read_file", "input": {"path": "/test.txt"}}
+            ]),
+        };
+        let user_content = serde_json::json!([
+            {"type": "tool_result", "tool_use_id": raw_id, "content": "done"}
+        ]);
+
+        let mut tool_name_map = HashMap::new();
+        let assistant = convert_assistant_message(&assistant, &mut tool_name_map).expect("convert");
+        let (_, _, tool_results) = process_message_content(&user_content).expect("process");
+
+        assert_eq!(
+            assistant
+                .assistant_response_message
+                .tool_uses
+                .as_ref()
+                .expect("tool use")[0]
+                .tool_use_id,
+            sanitized
+        );
+        assert_eq!(tool_results[0].tool_use_id, sanitized);
     }
 
     #[test]

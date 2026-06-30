@@ -28,6 +28,7 @@ const CURRENT_FIT_MIN_TEXT_CHARS: usize = 512;
 const CURRENT_FIT_MAX_ITERATIONS: usize = 64;
 const CURRENT_FIT_OVERHEAD_BYTES: usize = 512;
 const PAYLOAD_GUARD_SLOW_LOG_THRESHOLD: Duration = Duration::from_millis(25);
+const UPSTREAM_IMAGE_SOURCE_MAX_BYTES: usize = 5 * 1024 * 1024;
 const EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER: &str = "Tool result content was empty.";
 const TOOL_FORMAT_DIAGNOSTIC_MAX_HISTORY_ENTRIES: usize = 512;
 const TOOL_FORMAT_DIAGNOSTIC_MAX_ITEMS: usize = 4096;
@@ -145,6 +146,10 @@ pub struct PayloadGuardReport {
     pub dropped_current_images: usize,
     pub dropped_current_image_bytes: usize,
     #[serde(default)]
+    pub dropped_historical_images: usize,
+    #[serde(default)]
+    pub dropped_historical_image_bytes: usize,
+    #[serde(default)]
     pub kiro_cache_points_planned: usize,
     #[serde(default)]
     pub kiro_cache_points_inserted: usize,
@@ -199,6 +204,8 @@ impl PayloadGuardReport {
             truncated_current_user_content_chars: 0,
             dropped_current_images: 0,
             dropped_current_image_bytes: 0,
+            dropped_historical_images: 0,
+            dropped_historical_image_bytes: 0,
             kiro_cache_points_planned: 0,
             kiro_cache_points_inserted: 0,
             cache_point_retry_without_cache_point: false,
@@ -232,6 +239,7 @@ impl PayloadGuardReport {
             || self.truncated_current_documents > 0
             || self.truncated_current_user_content > 0
             || self.dropped_current_images > 0
+            || self.dropped_historical_images > 0
     }
 
     pub fn warning_header_fragment(&self) -> Option<String> {
@@ -347,6 +355,12 @@ impl PayloadGuardReport {
                 self.dropped_current_images
             ));
         }
+        if self.dropped_historical_images > 0 {
+            parts.push(format!(
+                "payload-history-images-dropped={}",
+                self.dropped_historical_images
+            ));
+        }
         if self.still_oversized {
             parts.push(format!("payload-oversized={}", self.final_bytes));
         }
@@ -429,6 +443,8 @@ pub fn guard_kiro_request(
         truncated_current_user_content_chars: 0,
         dropped_current_images: 0,
         dropped_current_image_bytes: 0,
+        dropped_historical_images: 0,
+        dropped_historical_image_bytes: 0,
         kiro_cache_points_planned: 0,
         kiro_cache_points_inserted: 0,
         cache_point_retry_without_cache_point: false,
@@ -452,19 +468,27 @@ pub fn guard_kiro_request(
     serialize_elapsed += serialize_started_at.elapsed();
     report.final_bytes = body.len();
 
+    if config.shaping.enabled {
+        let shaping_started_at = Instant::now();
+        let safety_shaping = apply_payload_safety_shaping(request, config.shaping);
+        let should_reserialize = safety_shaping.was_modified();
+        add_shaping_stats_to_report(&mut report, safety_shaping);
+        if should_reserialize {
+            let serialize_started_at = Instant::now();
+            body = serialize_request(request)?;
+            serialize_elapsed += serialize_started_at.elapsed();
+            report.final_bytes = body.len();
+        }
+        shaping_elapsed += shaping_started_at.elapsed();
+    }
+
     if size_limit_enabled && report.final_bytes > config.max_bytes && config.shaping.enabled {
         let shaping_started_at = Instant::now();
         let shaping = apply_payload_shaping(request, config.shaping);
-        report.truncated_history_tool_results += shaping.truncated_history_tool_results;
-        report.truncated_history_tool_result_chars += shaping.truncated_history_tool_result_chars;
-        report.removed_history_thinking_blocks += shaping.removed_history_thinking_blocks;
-        report.removed_history_thinking_chars += shaping.removed_history_thinking_chars;
-        report.trimmed_web_fetch_blocks += shaping.trimmed_web_fetch_blocks;
-        report.trimmed_web_fetch_chars += shaping.trimmed_web_fetch_chars;
-        report.compressed_tool_definitions += shaping.compressed_tool_definitions;
-        report.compressed_tool_definition_bytes += shaping.compressed_tool_definition_bytes;
+        let should_reserialize = shaping.was_modified();
+        add_shaping_stats_to_report(&mut report, shaping);
 
-        if shaping.was_modified() {
+        if should_reserialize {
             let serialize_started_at = Instant::now();
             body = serialize_request(request)?;
             serialize_elapsed += serialize_started_at.elapsed();
@@ -850,19 +874,28 @@ pub fn guard_anthropic_messages_request(
         report.final_bytes = final_bytes;
     }
 
+    if config.shaping.enabled {
+        let shaping_started_at = Instant::now();
+        let safety_shaping = apply_anthropic_payload_safety_shaping(request, config.shaping);
+        let should_reserialize = safety_shaping.was_modified();
+        add_shaping_stats_to_report(&mut report, safety_shaping);
+        if should_reserialize {
+            let serialize_started_at = Instant::now();
+            body = serialize_anthropic_request(request)?;
+            serialize_elapsed += serialize_started_at.elapsed();
+            final_bytes = body.len();
+            report.final_bytes = final_bytes;
+        }
+        shaping_elapsed += shaping_started_at.elapsed();
+    }
+
     if size_limit_enabled && final_bytes > config.max_bytes && config.shaping.enabled {
         let shaping_started_at = Instant::now();
         let shaping = apply_anthropic_payload_shaping(request, config.shaping);
-        report.truncated_history_tool_results += shaping.truncated_history_tool_results;
-        report.truncated_history_tool_result_chars += shaping.truncated_history_tool_result_chars;
-        report.removed_history_thinking_blocks += shaping.removed_history_thinking_blocks;
-        report.removed_history_thinking_chars += shaping.removed_history_thinking_chars;
-        report.trimmed_web_fetch_blocks += shaping.trimmed_web_fetch_blocks;
-        report.trimmed_web_fetch_chars += shaping.trimmed_web_fetch_chars;
-        report.compressed_tool_definitions += shaping.compressed_tool_definitions;
-        report.compressed_tool_definition_bytes += shaping.compressed_tool_definition_bytes;
+        let should_reserialize = shaping.was_modified();
+        add_shaping_stats_to_report(&mut report, shaping);
 
-        if shaping.was_modified() {
+        if should_reserialize {
             let serialize_started_at = Instant::now();
             body = serialize_anthropic_request(request)?;
             serialize_elapsed += serialize_started_at.elapsed();
@@ -1069,6 +1102,8 @@ fn new_payload_guard_report(
         truncated_current_user_content_chars: 0,
         dropped_current_images: 0,
         dropped_current_image_bytes: 0,
+        dropped_historical_images: 0,
+        dropped_historical_image_bytes: 0,
         kiro_cache_points_planned: 0,
         kiro_cache_points_inserted: 0,
         cache_point_retry_without_cache_point: false,
@@ -1360,12 +1395,68 @@ fn history_images_bytes(history: &[Message]) -> usize {
         .sum()
 }
 
+fn kiro_image_source_bytes(image: &crate::kiro::model::requests::conversation::KiroImage) -> usize {
+    image
+        .source
+        .bytes
+        .as_ref()
+        .map(|bytes| bytes.len())
+        .unwrap_or_else(|| json_len(image))
+}
+
+fn drop_oversized_history_images(
+    history: &mut [Message],
+    max_source_bytes: usize,
+) -> (usize, usize) {
+    if max_source_bytes == 0 {
+        return (0, 0);
+    }
+
+    let mut dropped = 0usize;
+    let mut dropped_bytes = 0usize;
+    for message in history {
+        let Message::User(user) = message else {
+            continue;
+        };
+        let images = &mut user.user_input_message.images;
+        if images.is_empty() {
+            continue;
+        }
+        let before = images.len();
+        let mut message_dropped_bytes = 0usize;
+        images.retain(|image| {
+            let bytes = kiro_image_source_bytes(image);
+            if bytes > max_source_bytes {
+                dropped += 1;
+                dropped_bytes += bytes;
+                message_dropped_bytes += bytes;
+                false
+            } else {
+                true
+            }
+        });
+        let removed = before.saturating_sub(images.len());
+        if removed > 0 {
+            append_text(
+                &mut user.user_input_message.content,
+                &format!(
+                    "[Historical images omitted because they exceeded the image size limit: count={}, removed_source_bytes={}]",
+                    removed, message_dropped_bytes
+                ),
+            );
+        }
+    }
+    (dropped, dropped_bytes)
+}
+
 #[derive(Default)]
 struct ShapingStats {
     truncated_history_tool_results: usize,
     truncated_history_tool_result_chars: usize,
     removed_history_thinking_blocks: usize,
     removed_history_thinking_chars: usize,
+    dropped_historical_images: usize,
+    dropped_historical_image_bytes: usize,
     trimmed_web_fetch_blocks: usize,
     trimmed_web_fetch_chars: usize,
     compressed_tool_definitions: usize,
@@ -1376,9 +1467,66 @@ impl ShapingStats {
     fn was_modified(&self) -> bool {
         self.truncated_history_tool_results > 0
             || self.removed_history_thinking_blocks > 0
+            || self.dropped_historical_images > 0
             || self.trimmed_web_fetch_blocks > 0
             || self.compressed_tool_definitions > 0
     }
+}
+
+fn add_shaping_stats_to_report(report: &mut PayloadGuardReport, shaping: ShapingStats) {
+    report.truncated_history_tool_results += shaping.truncated_history_tool_results;
+    report.truncated_history_tool_result_chars += shaping.truncated_history_tool_result_chars;
+    report.removed_history_thinking_blocks += shaping.removed_history_thinking_blocks;
+    report.removed_history_thinking_chars += shaping.removed_history_thinking_chars;
+    report.dropped_historical_images += shaping.dropped_historical_images;
+    report.dropped_historical_image_bytes += shaping.dropped_historical_image_bytes;
+    report.trimmed_web_fetch_blocks += shaping.trimmed_web_fetch_blocks;
+    report.trimmed_web_fetch_chars += shaping.trimmed_web_fetch_chars;
+    report.compressed_tool_definitions += shaping.compressed_tool_definitions;
+    report.compressed_tool_definition_bytes += shaping.compressed_tool_definition_bytes;
+}
+
+fn apply_payload_safety_shaping(
+    request: &mut KiroRequest,
+    _config: PayloadShapingConfig,
+) -> ShapingStats {
+    let mut stats = ShapingStats::default();
+    let result = drop_oversized_history_images(
+        &mut request.conversation_state.history,
+        UPSTREAM_IMAGE_SOURCE_MAX_BYTES,
+    );
+    stats.dropped_historical_images += result.0;
+    stats.dropped_historical_image_bytes += result.1;
+    stats
+}
+
+fn apply_anthropic_payload_safety_shaping(
+    request: &mut MessagesRequest,
+    config: PayloadShapingConfig,
+) -> ShapingStats {
+    let mut stats = ShapingStats::default();
+    let history_end = request.messages.len().saturating_sub(1);
+
+    if config.discard_historical_thinking {
+        let result = discard_anthropic_history_thinking(&mut request.messages[..history_end]);
+        stats.removed_history_thinking_blocks += result.0;
+        stats.removed_history_thinking_chars += result.1;
+    }
+
+    let result = drop_oversized_anthropic_history_images(
+        &mut request.messages[..history_end],
+        UPSTREAM_IMAGE_SOURCE_MAX_BYTES,
+    );
+    stats.dropped_historical_images += result.0;
+    stats.dropped_historical_image_bytes += result.1;
+    stats
+}
+
+pub fn sanitize_anthropic_messages_for_external_forwarding(
+    request: &mut MessagesRequest,
+    config: PayloadShapingConfig,
+) -> bool {
+    apply_anthropic_payload_safety_shaping(request, config).was_modified()
 }
 
 fn apply_payload_shaping(request: &mut KiroRequest, config: PayloadShapingConfig) -> ShapingStats {
@@ -1607,6 +1755,58 @@ fn discard_anthropic_history_thinking(messages: &mut [AnthropicMessage]) -> (usi
         removed_chars += chars;
     }
     (removed_blocks, removed_chars)
+}
+
+fn anthropic_image_source_bytes(block: &Value) -> usize {
+    let Some(source) = block.get("source").and_then(Value::as_object) else {
+        return json_len(block);
+    };
+    for key in ["data", "base64", "bytes"] {
+        if let Some(value) = source.get(key).and_then(Value::as_str) {
+            return value.len();
+        }
+    }
+    json_len(block)
+}
+
+fn oversized_historical_image_placeholder(bytes: usize, max_source_bytes: usize) -> Value {
+    serde_json::json!({
+        "type": "text",
+        "text": format!(
+            "[Historical image omitted because it exceeded the image size limit: source_bytes={}, max_source_bytes={}.]",
+            bytes, max_source_bytes
+        )
+    })
+}
+
+fn drop_oversized_anthropic_history_images(
+    messages: &mut [AnthropicMessage],
+    max_source_bytes: usize,
+) -> (usize, usize) {
+    if max_source_bytes == 0 {
+        return (0, 0);
+    }
+
+    let mut dropped = 0usize;
+    let mut dropped_bytes = 0usize;
+    for message in messages {
+        let Some(blocks) = content_blocks_mut(&mut message.content) else {
+            continue;
+        };
+        for block in blocks {
+            if block_type(block) != Some("image") {
+                continue;
+            }
+            let bytes = anthropic_image_source_bytes(block);
+            if bytes <= max_source_bytes {
+                continue;
+            }
+            *block = oversized_historical_image_placeholder(bytes, max_source_bytes);
+            dropped += 1;
+            dropped_bytes += bytes;
+        }
+    }
+    (dropped, dropped_bytes)
 }
 
 fn compress_anthropic_tool_definitions(
@@ -2990,7 +3190,7 @@ fn drop_anthropic_current_images_to_budget(
         append_anthropic_current_text(
             request,
             &format!(
-                "[current images omitted by proxy: count={}, removed_json_bytes={}]",
+                "[Current images omitted because they exceeded the image size limit: count={}, removed_json_bytes={}]",
                 dropped, dropped_bytes
             ),
         );
@@ -3285,7 +3485,7 @@ fn drop_current_images_to_budget(user: &mut UserInputMessage, max_bytes: usize) 
         append_text(
             &mut user.content,
             &format!(
-                "[current images omitted by proxy: count={}, removed_json_bytes={}]",
+                "[Current images omitted because they exceeded the image size limit: count={}, removed_json_bytes={}]",
                 dropped, dropped_bytes
             ),
         );
@@ -3308,7 +3508,7 @@ fn drop_largest_current_image(user: &mut UserInputMessage) -> (usize, usize) {
         append_text(
             &mut user.content,
             &format!(
-                "[current image omitted by proxy: removed_json_bytes={}]",
+                "[Current image omitted because it exceeded the image size limit: removed_json_bytes={}]",
                 bytes
             ),
         );
@@ -4793,6 +4993,8 @@ mod tests {
             truncated_current_user_content_chars: 10,
             dropped_current_images: 1,
             dropped_current_image_bytes: 10,
+            dropped_historical_images: 1,
+            dropped_historical_image_bytes: 10,
             kiro_cache_points_planned: 0,
             kiro_cache_points_inserted: 0,
             cache_point_retry_without_cache_point: false,
@@ -5250,7 +5452,7 @@ mod tests {
                 .current_message
                 .user_input_message
                 .content
-                .contains("current image omitted by proxy")
+                .contains("Current image omitted because it exceeded the image size limit")
         );
     }
 
@@ -5396,6 +5598,93 @@ mod tests {
             assistant.assistant_response_message.content,
             "visible\n\nanswer"
         );
+    }
+
+    #[test]
+    fn anthropic_guard_discards_historical_thinking_even_when_body_fits() {
+        let mut request = anthropic_request(vec![
+            anthropic_message("user", serde_json::json!("question")),
+            anthropic_message(
+                "assistant",
+                serde_json::json!([
+                    {
+                        "type": "thinking",
+                        "thinking": "signed history",
+                        "signature": "invalid-signature"
+                    },
+                    {"type": "text", "text": "visible answer"}
+                ]),
+            ),
+            anthropic_message("user", serde_json::json!("continue")),
+        ]);
+
+        let (body, report) = guard_anthropic_messages_request(
+            &mut request,
+            guard_config_with_shaping(
+                usize::MAX,
+                false,
+                PayloadShapingConfig {
+                    truncate_historical_tool_results: false,
+                    compress_tool_definitions: false,
+                    web_fetch_trim_enabled: false,
+                    discard_historical_thinking: true,
+                    ..PayloadShapingConfig::default()
+                },
+            ),
+            512,
+        )
+        .expect("guard");
+
+        assert_eq!(report.removed_history_thinking_blocks, 1);
+        assert!(!body.contains("invalid-signature"));
+        assert!(!body.contains("signed history"));
+        assert!(body.contains("visible answer"));
+    }
+
+    #[test]
+    fn anthropic_guard_drops_oversized_historical_images_even_when_body_fits() {
+        let oversized = "a".repeat(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1);
+        let mut request = anthropic_request(vec![
+            anthropic_message(
+                "user",
+                serde_json::json!([
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": oversized
+                        }
+                    }
+                ]),
+            ),
+            anthropic_message("user", serde_json::json!("continue")),
+        ]);
+
+        let (body, report) = guard_anthropic_messages_request(
+            &mut request,
+            guard_config_with_shaping(
+                usize::MAX,
+                false,
+                PayloadShapingConfig {
+                    truncate_historical_tool_results: false,
+                    discard_historical_thinking: false,
+                    compress_tool_definitions: false,
+                    web_fetch_trim_enabled: false,
+                    ..PayloadShapingConfig::default()
+                },
+            ),
+            512,
+        )
+        .expect("guard");
+
+        assert_eq!(report.dropped_historical_images, 1);
+        assert_eq!(
+            report.dropped_historical_image_bytes,
+            UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1
+        );
+        assert!(!body.contains(r#""type":"image""#));
+        assert!(body.contains("Historical image omitted"));
     }
 
     #[test]
@@ -5681,5 +5970,34 @@ mod tests {
             guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
 
         assert!(report.original_bytes > 2048);
+    }
+
+    #[test]
+    fn kiro_guard_drops_oversized_historical_images_even_when_body_fits() {
+        let mut user = HistoryUserMessage::new("image", TEST_MODEL);
+        user.user_input_message.images = vec![KiroImage::from_base64(
+            "png",
+            "a".repeat(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1),
+        )];
+        let mut request = request_with_history(vec![Message::User(user)]);
+
+        let (body, report) =
+            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+
+        assert_eq!(report.dropped_historical_images, 1);
+        assert_eq!(
+            report.dropped_historical_image_bytes,
+            UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1
+        );
+        let Message::User(user) = &request.conversation_state.history[0] else {
+            panic!("expected user");
+        };
+        assert!(user.user_input_message.images.is_empty());
+        assert!(
+            user.user_input_message
+                .content
+                .contains("Historical images omitted because they exceeded the image size limit")
+        );
+        assert!(!body.contains(&"a".repeat(128)));
     }
 }

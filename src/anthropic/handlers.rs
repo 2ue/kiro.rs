@@ -53,7 +53,7 @@ use super::payload_guard::{
     PayloadByteBreakdown, PayloadGuardConfig, PayloadGuardError, PayloadGuardReport,
     ToolUseFormatDiagnostics, breakdown_anthropic_messages_request, breakdown_kiro_request,
     diagnose_kiro_tool_use_format, guard_anthropic_messages_request, guard_kiro_request,
-    serialize_kiro_request,
+    sanitize_anthropic_messages_for_external_forwarding, serialize_kiro_request,
 };
 use super::prompt_cache::{PromptCacheBounds, PromptCacheProfile, PromptCacheScope};
 use super::stream::{SseEvent, StreamContext};
@@ -932,15 +932,27 @@ impl ExternalFallbackContext {
                 }
             }
             Err(err) => {
+                let mut payload = self.payload.clone();
+                let sanitized = guard_config.shaping.enabled
+                    && sanitize_anthropic_messages_for_external_forwarding(
+                        &mut payload,
+                        guard_config.shaping,
+                    );
+                let raw_body = if sanitized {
+                    serialize_messages_request_body(&payload)
+                } else {
+                    self.raw_body.clone()
+                };
                 tracing::warn!(
                     error = %err,
                     endpoint = self.endpoint,
                     model = %self.payload.model,
-                    "external pool payload guard failed; forwarding original request body"
+                    sanitized,
+                    "external pool payload guard failed; forwarding safety-sanitized request body when possible"
                 );
                 GuardedExternalRoutePayload {
-                    raw_body: self.raw_body.clone(),
-                    payload: self.payload.clone(),
+                    raw_body,
+                    payload,
                     payload_breakdown: None,
                     payload_guard_report: None,
                     payload_guard_retry_config: None,
