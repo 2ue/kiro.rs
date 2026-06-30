@@ -2929,6 +2929,7 @@ fn forward_headers(
     Ok(out)
 }
 
+#[cfg(test)]
 fn external_pool_outbound_body(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,

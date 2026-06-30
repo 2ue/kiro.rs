@@ -50,14 +50,11 @@ import {
 import { useModelCapabilities } from '@/hooks/use-usage'
 import type { KiroAgentModeStrategy, LoadBalancingMode, ModelMappingConfig, PayloadGuardMode, RuntimeConfig } from '@/types/api'
 import {
-  CacheCreationSection,
   CachePolicySection,
-  DefinedCacheRoutesSection,
   normalizeDefinedCacheRoutes,
   ModelMappingSection,
   PayloadFallbackSection,
   PayloadHistorySection,
-  ReportedUsageSection,
 } from './runtime-sections'
 
 // ─── 原子组件 ──────────────────────────────────────────────────────────────────
@@ -387,45 +384,9 @@ export function RuntimePage() {
         </div>
       </CollapseSection>
 
-      {/* 缓存展示控制（合并：命中展示 + 创建频次） */}
-      <CollapseSection icon={<Zap />} title="缓存展示控制" desc="缓存读取口径与写入展示节奏">
-        <div className="space-y-6">
-          <div className="space-y-3">
-            <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">命中展示参数</div>
-            <TwoCol>
-              <NumField label="缓存读取目标比例" desc="建议 0.95~0.99" value={draft.promptCacheTargetReadRatio} min={0} max={0.99} step={0.01} suffix="比例" onChange={set('promptCacheTargetReadRatio')} />
-              <NumField label="输入估算放大倍数" desc="" value={draft.promptCacheTokenScale} min={1} max={3} step={0.1} suffix="倍" onChange={set('promptCacheTokenScale')} />
-              <NumField label="输入展示上限" desc="0 表示不设上限" value={draft.promptCacheMaxSimulatedInputTokens} min={0} suffix="Token" onChange={set('promptCacheMaxSimulatedInputTokens')} />
-              <NumField label="放大启用门槛" desc="" value={draft.promptCacheScaleMinInputTokens} min={0} suffix="Token" onChange={set('promptCacheScaleMinInputTokens')} />
-              <NumField label="触顶扣减下限" desc="" value={draft.promptCacheCapJitterMinTokens} min={0} suffix="Token" onChange={set('promptCacheCapJitterMinTokens')} />
-              <NumField label="触顶扣减上限" desc="" value={draft.promptCacheCapJitterMaxTokens} min={0} suffix="Token" onChange={set('promptCacheCapJitterMaxTokens')} />
-            </TwoCol>
-          </div>
-          <div className="border-t border-border" />
-          <div className="space-y-3">
-            <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">本地缓存边界</div>
-            <TwoCol>
-              <NumField label="单账号条目上限" desc="每个账号最多保留多少个可复用缓存指纹，防止长会话无限增长。" value={draft.promptCacheMaxEntriesPerAccount} min={0} suffix="条" onChange={set('promptCacheMaxEntriesPerAccount')} />
-              <NumField label="全局条目上限" desc="所有账号合计最多保留多少个缓存指纹，0 表示不按条目数限制。" value={draft.promptCacheMaxEntriesGlobal} min={0} suffix="条" onChange={set('promptCacheMaxEntriesGlobal')} />
-              <NumField label="最长保留时间" desc="单条缓存指纹最多保留多久；实际不会超过上游缓存标记的时间。" value={draft.promptCacheEntryTtlSecs} min={1} suffix="秒" onChange={set('promptCacheEntryTtlSecs')} />
-              <NumField label="估算内存上限" desc="达到估算上限后优先移除最久未使用的缓存指纹，0 表示不按内存估算限制。" value={draft.promptCacheEstimatedBytesLimit} min={0} suffix="字节" onChange={set('promptCacheEstimatedBytesLimit')} />
-            </TwoCol>
-          </div>
-          <div className="border-t border-border" />
-          <div className="space-y-3">
-            <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">写入频次控制</div>
-            <CacheCreationSection control={draft.promptCacheCreationControl} onChange={set('promptCacheCreationControl')} />
-          </div>
-        </div>
-      </CollapseSection>
-
-      {/* 自定义缓存路由 */}
-      <CollapseSection icon={<Zap />} title="自定义缓存路由" desc="定义 /dfcache/{名称} 高缓存路由，固定前缀 /dfcache/">
-        <DefinedCacheRoutesSection
-          routes={draft.definedCacheRoutes}
-          reported={draft.reportedUsage}
-          onChange={(routes, reported) => setDraft((prev) => ({ ...prev, definedCacheRoutes: routes, reportedUsage: reported }))}
-        />
+      {/* 缓存策略 */}
+      <CollapseSection icon={<Zap />} title="缓存策略" desc="默认配置和路径覆盖统一维护">
+        <CachePolicySection config={draft} onChange={setDraft} />
       </CollapseSection>
 
       {/* 内容体积优化（合并：旧内容清理 + 当前内容兜底） */}
@@ -441,16 +402,6 @@ export function RuntimePage() {
             <PayloadFallbackSection shaping={draft.payloadShaping} payloadShapingBranchEnabled={payloadSizeLimitEnabled && draft.payloadShaping.enabled} onChange={set('payloadShaping')} />
           </div>
         </div>
-      </CollapseSection>
-
-      {/* 用量展示规则 */}
-      <CollapseSection icon={<Gauge />} title="用量展示规则" desc="不同入口返回给客户端的用量口径">
-        <ReportedUsageSection reported={draft.reportedUsage} onChange={set('reportedUsage')} />
-      </CollapseSection>
-
-      {/* 路径级缓存策略 */}
-      <CollapseSection icon={<Zap />} title="路径级缓存策略" desc="按入口覆盖缓存模拟、写入频次、cachePoint 与 usage 口径">
-        <CachePolicySection cachePolicy={draft.cachePolicy} onChange={set('cachePolicy')} />
       </CollapseSection>
 
       {/* 模型映射 */}
@@ -518,13 +469,6 @@ export function RuntimePage() {
           <TwoCol>
             <TogField label="整理思考内容" desc="把响应里的思考内容单独整理出来" checked={draft.extractThinking} onChange={set('extractThinking')} />
             <TogField label="显示处理告警" desc="把排查提示返回给客户端" checked={draft.exposeProxyWarnings} onChange={set('exposeProxyWarnings')} />
-          </TwoCol>
-          <TwoCol>
-            <TogField label="发送真实 cachePoint" desc="把带缓存标记的工具发送给 Kiro 上游；上游不接受时会自动去掉后重试一次。" checked={draft.kiroCachePointEnabled} onChange={set('kiroCachePointEnabled')} />
-            <TogField label="只处理工具缓存标记" desc="只根据工具上的缓存标记插入 cachePoint，不改写系统消息或历史消息。" checked={draft.kiroCachePointToolsOnly} disabled={!draft.kiroCachePointEnabled} onChange={set('kiroCachePointToolsOnly')} />
-          </TwoCol>
-          <TwoCol>
-            <TogField label="记录 cachePoint 计划" desc="在系统日志中记录插入数量，方便排查上游请求体错误。" checked={draft.kiroCachePointRecordPlan} disabled={!draft.kiroCachePointEnabled} onChange={set('kiroCachePointRecordPlan')} />
           </TwoCol>
           <TwoCol>
             <NumField label="缓存命中判定阈值" desc="多少 Token 以上算缓存命中较高" value={draft.highCacheThreshold} min={0} suffix="Token" onChange={set('highCacheThreshold')} />

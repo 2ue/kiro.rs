@@ -19,7 +19,7 @@ use crate::kiro::model::requests::{
     kiro::KiroRequest,
     tool::{Tool, ToolResult},
 };
-use crate::model::config::PayloadShapingConfig;
+use crate::model::config::{OversizedImageHandling, PayloadShapingConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -371,12 +371,34 @@ impl PayloadGuardReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PayloadGuardError {
     Serialize(String),
+    OversizedImage {
+        current_images: usize,
+        current_image_bytes: usize,
+        historical_images: usize,
+        historical_image_bytes: usize,
+        max_source_bytes: usize,
+    },
 }
 
 impl std::fmt::Display for PayloadGuardError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PayloadGuardError::Serialize(err) => write!(f, "序列化请求失败: {}", err),
+            PayloadGuardError::OversizedImage {
+                current_images,
+                current_image_bytes,
+                historical_images,
+                historical_image_bytes,
+                max_source_bytes,
+            } => write!(
+                f,
+                "image exceeds upstream size limit: current_images={}, current_image_bytes={}, historical_images={}, historical_image_bytes={}, max_source_bytes={}",
+                current_images,
+                current_image_bytes,
+                historical_images,
+                historical_image_bytes,
+                max_source_bytes
+            ),
         }
     }
 }
@@ -470,9 +492,17 @@ pub fn guard_kiro_request(
 
     if config.shaping.enabled {
         let shaping_started_at = Instant::now();
+        reject_oversized_images_if_configured(
+            config.shaping,
+            find_oversized_kiro_images(request, UPSTREAM_IMAGE_SOURCE_MAX_BYTES),
+            UPSTREAM_IMAGE_SOURCE_MAX_BYTES,
+        )?;
         let safety_shaping = apply_payload_safety_shaping(request, config.shaping);
         let should_reserialize = safety_shaping.was_modified();
         add_shaping_stats_to_report(&mut report, safety_shaping);
+        let current_safety_shaping = apply_current_payload_safety_shaping(request, config.shaping);
+        let should_reserialize = should_reserialize || current_safety_shaping.was_modified();
+        add_current_shaping_stats_to_report(&mut report, &current_safety_shaping);
         if should_reserialize {
             let serialize_started_at = Instant::now();
             body = serialize_request(request)?;
@@ -538,16 +568,7 @@ pub fn guard_kiro_request(
             config.max_bytes,
             body,
         )?;
-        report.truncated_current_tool_results += current_stats.truncated_current_tool_results;
-        report.truncated_current_tool_result_chars +=
-            current_stats.truncated_current_tool_result_chars;
-        report.truncated_current_documents += current_stats.truncated_current_documents;
-        report.truncated_current_document_chars += current_stats.truncated_current_document_chars;
-        report.truncated_current_user_content += current_stats.truncated_current_user_content;
-        report.truncated_current_user_content_chars +=
-            current_stats.truncated_current_user_content_chars;
-        report.dropped_current_images += current_stats.dropped_current_images;
-        report.dropped_current_image_bytes += current_stats.dropped_current_image_bytes;
+        add_current_shaping_stats_to_report(&mut report, &current_stats);
         body = new_body;
         report.final_bytes = body.len();
         current_shaping_elapsed += current_started_at.elapsed();
@@ -876,9 +897,18 @@ pub fn guard_anthropic_messages_request(
 
     if config.shaping.enabled {
         let shaping_started_at = Instant::now();
+        reject_oversized_images_if_configured(
+            config.shaping,
+            find_oversized_anthropic_images(request, UPSTREAM_IMAGE_SOURCE_MAX_BYTES),
+            UPSTREAM_IMAGE_SOURCE_MAX_BYTES,
+        )?;
         let safety_shaping = apply_anthropic_payload_safety_shaping(request, config.shaping);
         let should_reserialize = safety_shaping.was_modified();
         add_shaping_stats_to_report(&mut report, safety_shaping);
+        let current_safety_shaping =
+            apply_anthropic_current_payload_safety_shaping(request, config.shaping);
+        let should_reserialize = should_reserialize || current_safety_shaping.was_modified();
+        add_current_shaping_stats_to_report(&mut report, &current_safety_shaping);
         if should_reserialize {
             let serialize_started_at = Instant::now();
             body = serialize_anthropic_request(request)?;
@@ -944,16 +974,7 @@ pub fn guard_anthropic_messages_request(
             config.max_bytes,
             body,
         )?;
-        report.truncated_current_tool_results += current_stats.truncated_current_tool_results;
-        report.truncated_current_tool_result_chars +=
-            current_stats.truncated_current_tool_result_chars;
-        report.truncated_current_documents += current_stats.truncated_current_documents;
-        report.truncated_current_document_chars += current_stats.truncated_current_document_chars;
-        report.truncated_current_user_content += current_stats.truncated_current_user_content;
-        report.truncated_current_user_content_chars +=
-            current_stats.truncated_current_user_content_chars;
-        report.dropped_current_images += current_stats.dropped_current_images;
-        report.dropped_current_image_bytes += current_stats.dropped_current_image_bytes;
+        add_current_shaping_stats_to_report(&mut report, &current_stats);
         body = new_body;
         final_bytes = body.len();
         report.final_bytes = final_bytes;
@@ -1404,6 +1425,74 @@ fn kiro_image_source_bytes(image: &crate::kiro::model::requests::conversation::K
         .unwrap_or_else(|| json_len(image))
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct OversizedImageViolation {
+    current_images: usize,
+    current_image_bytes: usize,
+    historical_images: usize,
+    historical_image_bytes: usize,
+}
+
+impl OversizedImageViolation {
+    fn has_images(self) -> bool {
+        self.current_images > 0 || self.historical_images > 0
+    }
+}
+
+fn reject_oversized_images_if_configured(
+    config: PayloadShapingConfig,
+    violation: OversizedImageViolation,
+    max_source_bytes: usize,
+) -> Result<(), PayloadGuardError> {
+    if config.oversized_image_handling != OversizedImageHandling::Reject || !violation.has_images()
+    {
+        return Ok(());
+    }
+    Err(PayloadGuardError::OversizedImage {
+        current_images: violation.current_images,
+        current_image_bytes: violation.current_image_bytes,
+        historical_images: violation.historical_images,
+        historical_image_bytes: violation.historical_image_bytes,
+        max_source_bytes,
+    })
+}
+
+fn find_oversized_kiro_images(
+    request: &KiroRequest,
+    max_source_bytes: usize,
+) -> OversizedImageViolation {
+    if max_source_bytes == 0 {
+        return OversizedImageViolation::default();
+    }
+
+    let mut violation = OversizedImageViolation::default();
+    for image in &request
+        .conversation_state
+        .current_message
+        .user_input_message
+        .images
+    {
+        let bytes = kiro_image_source_bytes(image);
+        if bytes > max_source_bytes {
+            violation.current_images += 1;
+            violation.current_image_bytes += bytes;
+        }
+    }
+    for message in &request.conversation_state.history {
+        let Message::User(user) = message else {
+            continue;
+        };
+        for image in &user.user_input_message.images {
+            let bytes = kiro_image_source_bytes(image);
+            if bytes > max_source_bytes {
+                violation.historical_images += 1;
+                violation.historical_image_bytes += bytes;
+            }
+        }
+    }
+    violation
+}
+
 fn drop_oversized_history_images(
     history: &mut [Message],
     max_source_bytes: usize,
@@ -1423,13 +1512,11 @@ fn drop_oversized_history_images(
             continue;
         }
         let before = images.len();
-        let mut message_dropped_bytes = 0usize;
         images.retain(|image| {
             let bytes = kiro_image_source_bytes(image);
             if bytes > max_source_bytes {
                 dropped += 1;
                 dropped_bytes += bytes;
-                message_dropped_bytes += bytes;
                 false
             } else {
                 true
@@ -1437,13 +1524,12 @@ fn drop_oversized_history_images(
         });
         let removed = before.saturating_sub(images.len());
         if removed > 0 {
-            append_text(
-                &mut user.user_input_message.content,
-                &format!(
-                    "[Historical images omitted because they exceeded the image size limit: count={}, removed_source_bytes={}]",
-                    removed, message_dropped_bytes
-                ),
-            );
+            let note = if removed == 1 {
+                "[Historical image was omitted because it exceeded the upstream 5 MB image size limit.]"
+            } else {
+                "[Historical images were omitted because they exceeded the upstream 5 MB image size limit.]"
+            };
+            append_text(&mut user.user_input_message.content, note);
         }
     }
     (dropped, dropped_bytes)
@@ -1486,11 +1572,28 @@ fn add_shaping_stats_to_report(report: &mut PayloadGuardReport, shaping: Shaping
     report.compressed_tool_definition_bytes += shaping.compressed_tool_definition_bytes;
 }
 
+fn add_current_shaping_stats_to_report(
+    report: &mut PayloadGuardReport,
+    current: &CurrentShapingStats,
+) {
+    report.truncated_current_tool_results += current.truncated_current_tool_results;
+    report.truncated_current_tool_result_chars += current.truncated_current_tool_result_chars;
+    report.truncated_current_documents += current.truncated_current_documents;
+    report.truncated_current_document_chars += current.truncated_current_document_chars;
+    report.truncated_current_user_content += current.truncated_current_user_content;
+    report.truncated_current_user_content_chars += current.truncated_current_user_content_chars;
+    report.dropped_current_images += current.dropped_current_images;
+    report.dropped_current_image_bytes += current.dropped_current_image_bytes;
+}
+
 fn apply_payload_safety_shaping(
     request: &mut KiroRequest,
-    _config: PayloadShapingConfig,
+    config: PayloadShapingConfig,
 ) -> ShapingStats {
     let mut stats = ShapingStats::default();
+    if config.oversized_image_handling != OversizedImageHandling::DropWithPlaceholder {
+        return stats;
+    }
     let result = drop_oversized_history_images(
         &mut request.conversation_state.history,
         UPSTREAM_IMAGE_SOURCE_MAX_BYTES,
@@ -1513,12 +1616,48 @@ fn apply_anthropic_payload_safety_shaping(
         stats.removed_history_thinking_chars += result.1;
     }
 
-    let result = drop_oversized_anthropic_history_images(
-        &mut request.messages[..history_end],
+    if config.oversized_image_handling == OversizedImageHandling::DropWithPlaceholder {
+        let result = drop_oversized_anthropic_history_images(
+            &mut request.messages[..history_end],
+            UPSTREAM_IMAGE_SOURCE_MAX_BYTES,
+        );
+        stats.dropped_historical_images += result.0;
+        stats.dropped_historical_image_bytes += result.1;
+    }
+    stats
+}
+
+fn apply_current_payload_safety_shaping(
+    request: &mut KiroRequest,
+    config: PayloadShapingConfig,
+) -> CurrentShapingStats {
+    let mut stats = CurrentShapingStats::default();
+    if config.oversized_image_handling != OversizedImageHandling::DropWithPlaceholder {
+        return stats;
+    }
+    let result = drop_oversized_current_images(
+        &mut request
+            .conversation_state
+            .current_message
+            .user_input_message,
         UPSTREAM_IMAGE_SOURCE_MAX_BYTES,
     );
-    stats.dropped_historical_images += result.0;
-    stats.dropped_historical_image_bytes += result.1;
+    stats.dropped_current_images += result.0;
+    stats.dropped_current_image_bytes += result.1;
+    stats
+}
+
+fn apply_anthropic_current_payload_safety_shaping(
+    request: &mut MessagesRequest,
+    config: PayloadShapingConfig,
+) -> CurrentShapingStats {
+    let mut stats = CurrentShapingStats::default();
+    if config.oversized_image_handling != OversizedImageHandling::DropWithPlaceholder {
+        return stats;
+    }
+    let result = drop_oversized_anthropic_current_images(request, UPSTREAM_IMAGE_SOURCE_MAX_BYTES);
+    stats.dropped_current_images += result.0;
+    stats.dropped_current_image_bytes += result.1;
     stats
 }
 
@@ -1769,13 +1908,54 @@ fn anthropic_image_source_bytes(block: &Value) -> usize {
     json_len(block)
 }
 
-fn oversized_historical_image_placeholder(bytes: usize, max_source_bytes: usize) -> Value {
+fn count_oversized_anthropic_content_images(
+    content: &Value,
+    max_source_bytes: usize,
+) -> (usize, usize) {
+    if max_source_bytes == 0 {
+        return (0, 0);
+    }
+    let mut count = 0usize;
+    let mut bytes_total = 0usize;
+    for block in content_blocks_by_type(content, "image") {
+        let bytes = anthropic_image_source_bytes(block);
+        if bytes > max_source_bytes {
+            count += 1;
+            bytes_total += bytes;
+        }
+    }
+    (count, bytes_total)
+}
+
+fn find_oversized_anthropic_images(
+    request: &MessagesRequest,
+    max_source_bytes: usize,
+) -> OversizedImageViolation {
+    if max_source_bytes == 0 {
+        return OversizedImageViolation::default();
+    }
+
+    let mut violation = OversizedImageViolation::default();
+    let history_end = request.messages.len().saturating_sub(1);
+    for message in request.messages.iter().take(history_end) {
+        let (count, bytes) =
+            count_oversized_anthropic_content_images(&message.content, max_source_bytes);
+        violation.historical_images += count;
+        violation.historical_image_bytes += bytes;
+    }
+    if let Some(message) = request.messages.last() {
+        let (count, bytes) =
+            count_oversized_anthropic_content_images(&message.content, max_source_bytes);
+        violation.current_images += count;
+        violation.current_image_bytes += bytes;
+    }
+    violation
+}
+
+fn oversized_historical_image_placeholder(_bytes: usize, _max_source_bytes: usize) -> Value {
     serde_json::json!({
         "type": "text",
-        "text": format!(
-            "[Historical image omitted because it exceeded the image size limit: source_bytes={}, max_source_bytes={}.]",
-            bytes, max_source_bytes
-        )
+        "text": "[Historical image was omitted because it exceeded the upstream 5 MB image size limit.]"
     })
 }
 
@@ -3187,13 +3367,50 @@ fn drop_anthropic_current_images_to_budget(
         dropped_bytes += result.1;
     }
     if dropped > 0 {
-        append_anthropic_current_text(
-            request,
-            &format!(
-                "[Current images omitted because they exceeded the image size limit: count={}, removed_json_bytes={}]",
-                dropped, dropped_bytes
-            ),
-        );
+        let note = if dropped == 1 {
+            "[Current image was omitted because it exceeded the request image budget.]"
+        } else {
+            "[Current images were omitted because they exceeded the request image budget.]"
+        };
+        append_anthropic_current_text(request, note);
+    }
+    (dropped, dropped_bytes)
+}
+
+fn oversized_current_image_placeholder(_bytes: usize, _max_source_bytes: usize) -> Value {
+    serde_json::json!({
+        "type": "text",
+        "text": "[Current image was omitted because it exceeded the upstream 5 MB image size limit.]"
+    })
+}
+
+fn drop_oversized_anthropic_current_images(
+    request: &mut MessagesRequest,
+    max_source_bytes: usize,
+) -> (usize, usize) {
+    if max_source_bytes == 0 {
+        return (0, 0);
+    }
+    let Some(message) = request.messages.last_mut() else {
+        return (0, 0);
+    };
+    let Some(blocks) = content_blocks_mut(&mut message.content) else {
+        return (0, 0);
+    };
+
+    let mut dropped = 0usize;
+    let mut dropped_bytes = 0usize;
+    for block in blocks {
+        if block_type(block) != Some("image") {
+            continue;
+        }
+        let bytes = anthropic_image_source_bytes(block);
+        if bytes <= max_source_bytes {
+            continue;
+        }
+        *block = oversized_current_image_placeholder(bytes, max_source_bytes);
+        dropped += 1;
+        dropped_bytes += bytes;
     }
     (dropped, dropped_bytes)
 }
@@ -3482,13 +3699,44 @@ fn drop_current_images_to_budget(user: &mut UserInputMessage, max_bytes: usize) 
         dropped_bytes += result.1;
     }
     if dropped > 0 {
-        append_text(
-            &mut user.content,
-            &format!(
-                "[Current images omitted because they exceeded the image size limit: count={}, removed_json_bytes={}]",
-                dropped, dropped_bytes
-            ),
-        );
+        let note = if dropped == 1 {
+            "[Current image was omitted because it exceeded the request image budget.]"
+        } else {
+            "[Current images were omitted because they exceeded the request image budget.]"
+        };
+        append_text(&mut user.content, note);
+    }
+    (dropped, dropped_bytes)
+}
+
+fn drop_oversized_current_images(
+    user: &mut UserInputMessage,
+    max_source_bytes: usize,
+) -> (usize, usize) {
+    if max_source_bytes == 0 || user.images.is_empty() {
+        return (0, 0);
+    }
+
+    let before = user.images.len();
+    let mut dropped_bytes = 0usize;
+    user.images.retain(|image| {
+        let bytes = kiro_image_source_bytes(image);
+        if bytes > max_source_bytes {
+            dropped_bytes += bytes;
+            false
+        } else {
+            true
+        }
+    });
+
+    let dropped = before.saturating_sub(user.images.len());
+    if dropped > 0 {
+        let note = if dropped == 1 {
+            "[Current image was omitted because it exceeded the upstream 5 MB image size limit.]"
+        } else {
+            "[Current images were omitted because they exceeded the upstream 5 MB image size limit.]"
+        };
+        append_text(&mut user.content, note);
     }
     (dropped, dropped_bytes)
 }
@@ -3507,10 +3755,7 @@ fn drop_largest_current_image(user: &mut UserInputMessage) -> (usize, usize) {
     if user.images.is_empty() {
         append_text(
             &mut user.content,
-            &format!(
-                "[Current image omitted because it exceeded the image size limit: removed_json_bytes={}]",
-                bytes
-            ),
+            "[Current image was omitted because it exceeded the request image budget.]",
         );
     }
     (1, bytes)
@@ -5452,7 +5697,9 @@ mod tests {
                 .current_message
                 .user_input_message
                 .content
-                .contains("Current image omitted because it exceeded the image size limit")
+                .contains(
+                    "Current images were omitted because they exceeded the request image budget"
+                )
         );
     }
 
@@ -5684,7 +5931,97 @@ mod tests {
             UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1
         );
         assert!(!body.contains(r#""type":"image""#));
-        assert!(body.contains("Historical image omitted"));
+        assert!(body.contains("Historical image was omitted"));
+    }
+
+    #[test]
+    fn anthropic_guard_drops_oversized_current_images_even_when_body_fits() {
+        let oversized = "a".repeat(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1);
+        let mut request = anthropic_request(vec![anthropic_message(
+            "user",
+            serde_json::json!([
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": oversized
+                    }
+                }
+            ]),
+        )]);
+
+        let (body, report) = guard_anthropic_messages_request(
+            &mut request,
+            guard_config_with_shaping(
+                usize::MAX,
+                false,
+                PayloadShapingConfig {
+                    truncate_historical_tool_results: false,
+                    discard_historical_thinking: false,
+                    compress_tool_definitions: false,
+                    web_fetch_trim_enabled: false,
+                    ..PayloadShapingConfig::default()
+                },
+            ),
+            512,
+        )
+        .expect("guard");
+
+        assert_eq!(report.dropped_current_images, 1);
+        assert_eq!(
+            report.dropped_current_image_bytes,
+            UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1
+        );
+        assert_eq!(report.dropped_historical_images, 0);
+        assert!(!body.contains(r#""type":"image""#));
+        assert!(body.contains("Current image was omitted"));
+    }
+
+    #[test]
+    fn anthropic_guard_rejects_oversized_images_when_configured() {
+        let oversized = "a".repeat(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1);
+        let mut request = anthropic_request(vec![anthropic_message(
+            "user",
+            serde_json::json!([
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": oversized
+                    }
+                }
+            ]),
+        )]);
+
+        let err = guard_anthropic_messages_request(
+            &mut request,
+            guard_config_with_shaping(
+                usize::MAX,
+                false,
+                PayloadShapingConfig {
+                    oversized_image_handling: OversizedImageHandling::Reject,
+                    ..PayloadShapingConfig::default()
+                },
+            ),
+            512,
+        )
+        .expect_err("oversized image should be rejected");
+
+        assert!(matches!(
+            err,
+            PayloadGuardError::OversizedImage {
+                current_images: 1,
+                historical_images: 0,
+                max_source_bytes: UPSTREAM_IMAGE_SOURCE_MAX_BYTES,
+                ..
+            }
+        ));
+        assert_eq!(
+            count_content_blocks_by_type(&request.messages[0].content, "image"),
+            1
+        );
     }
 
     #[test]
@@ -5993,11 +6330,101 @@ mod tests {
             panic!("expected user");
         };
         assert!(user.user_input_message.images.is_empty());
+        assert!(user.user_input_message.content.contains(
+            "Historical image was omitted because it exceeded the upstream 5 MB image size limit"
+        ));
+        assert!(!body.contains(&"a".repeat(128)));
+    }
+
+    #[test]
+    fn kiro_guard_drops_oversized_current_images_even_when_body_fits() {
+        let mut request = request_with_history(Vec::new());
+        request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .images = vec![KiroImage::from_base64(
+            "png",
+            "a".repeat(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1),
+        )];
+
+        let (body, report) =
+            guard_kiro_request(&mut request, guard_config(usize::MAX)).expect("guard");
+
+        assert_eq!(report.dropped_current_images, 1);
+        assert_eq!(
+            report.dropped_current_image_bytes,
+            UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1
+        );
         assert!(
-            user.user_input_message
+            request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .images
+                .is_empty()
+        );
+        assert!(
+            request
+                .conversation_state
+                .current_message
+                .user_input_message
                 .content
-                .contains("Historical images omitted because they exceeded the image size limit")
+                .contains("Current image was omitted because it exceeded the upstream 5 MB image size limit")
         );
         assert!(!body.contains(&"a".repeat(128)));
+    }
+
+    #[test]
+    fn kiro_guard_rejects_oversized_images_when_configured() {
+        let mut request = request_with_history(Vec::new());
+        request
+            .conversation_state
+            .current_message
+            .user_input_message
+            .images = vec![KiroImage::from_base64(
+            "png",
+            "a".repeat(UPSTREAM_IMAGE_SOURCE_MAX_BYTES + 1),
+        )];
+
+        let err = guard_kiro_request(
+            &mut request,
+            guard_config_with_shaping(
+                usize::MAX,
+                true,
+                PayloadShapingConfig {
+                    oversized_image_handling: OversizedImageHandling::Reject,
+                    ..PayloadShapingConfig::default()
+                },
+            ),
+        )
+        .expect_err("oversized image should be rejected");
+
+        assert!(matches!(
+            err,
+            PayloadGuardError::OversizedImage {
+                current_images: 1,
+                historical_images: 0,
+                max_source_bytes: UPSTREAM_IMAGE_SOURCE_MAX_BYTES,
+                ..
+            }
+        ));
+        assert_eq!(
+            request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .images
+                .len(),
+            1
+        );
+        assert!(
+            !request
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content
+                .contains("omitted")
+        );
     }
 }

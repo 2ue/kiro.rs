@@ -641,20 +641,21 @@ impl ExternalFallbackContext {
             .manager
             .direct_policy_reason(&self.config, &self.endpoint, &self.payload.model)
             .await?;
+        let route = match self.route_request(
+            request_id.to_string(),
+            UsageRouteSubtype::ExternalDirectPolicy,
+            None,
+            Some(reason),
+            false,
+            None,
+            Vec::new(),
+        ) {
+            Ok(route) => route,
+            Err(err) => return Some(payload_guard_error_response(err)),
+        };
         Some(
             self.manager
-                .forward_with_failover(
-                    self.config.clone(),
-                    self.route_request(
-                        request_id.to_string(),
-                        UsageRouteSubtype::ExternalDirectPolicy,
-                        None,
-                        Some(reason),
-                        false,
-                        None,
-                        Vec::new(),
-                    ),
-                )
+                .forward_with_failover(self.config.clone(), route)
                 .await,
         )
     }
@@ -690,23 +691,28 @@ impl ExternalFallbackContext {
             retry_after_secs = ?state.retry_after_secs,
             "local credential pool is not immediately schedulable; routing request directly to external pool"
         );
+        let route = match self.route_request(
+            request_id.to_string(),
+            UsageRouteSubtype::ExternalFallbackPreflight,
+            Some(reason.clone()),
+            None,
+            false,
+            Some(json!({
+                "reason": reason,
+                "state": state,
+            })),
+            Vec::new(),
+        ) {
+            Ok(route) => route,
+            Err(err) => {
+                return Some(ExternalPoolForwardOutcome::Response(
+                    payload_guard_error_response(err),
+                ));
+            }
+        };
         Some(
             self.manager
-                .forward_with_failover_result(
-                    self.config.clone(),
-                    self.route_request(
-                        request_id.to_string(),
-                        UsageRouteSubtype::ExternalFallbackPreflight,
-                        Some(reason.clone()),
-                        None,
-                        false,
-                        Some(json!({
-                            "reason": reason,
-                            "state": state,
-                        })),
-                        Vec::new(),
-                    ),
-                )
+                .forward_with_failover_result(self.config.clone(), route)
                 .await,
         )
     }
@@ -791,20 +797,25 @@ impl ExternalFallbackContext {
         } else {
             UsageRouteSubtype::ExternalFallbackAfterLocalAttempts
         };
+        let route = match self.route_request(
+            request_id.to_string(),
+            route_subtype,
+            Some(reason),
+            None,
+            true,
+            local_preflight,
+            diagnostic_attempts,
+        ) {
+            Ok(route) => route,
+            Err(err) => {
+                return Some(ExternalPoolForwardOutcome::Response(
+                    payload_guard_error_response(err),
+                ));
+            }
+        };
         Some(
             self.manager
-                .forward_with_failover_result(
-                    self.config.clone(),
-                    self.route_request(
-                        request_id.to_string(),
-                        route_subtype,
-                        Some(reason),
-                        None,
-                        true,
-                        local_preflight,
-                        diagnostic_attempts,
-                    ),
-                )
+                .forward_with_failover_result(self.config.clone(), route)
                 .await,
         )
     }
@@ -818,9 +829,9 @@ impl ExternalFallbackContext {
         local_attempted: bool,
         local_preflight: Option<serde_json::Value>,
         local_attempts: Vec<KiroCredentialAttempt>,
-    ) -> ExternalRouteRequest {
-        let guarded_payload = self.guarded_route_payload();
-        ExternalRouteRequest {
+    ) -> Result<ExternalRouteRequest, PayloadGuardError> {
+        let guarded_payload = self.guarded_route_payload()?;
+        Ok(ExternalRouteRequest {
             raw_body: guarded_payload.raw_body,
             headers: self.headers.clone(),
             endpoint: self.endpoint.clone(),
@@ -867,22 +878,22 @@ impl ExternalFallbackContext {
             payload_breakdown: guarded_payload.payload_breakdown,
             payload_guard_report: guarded_payload.payload_guard_report,
             payload_guard_retry_config: guarded_payload.payload_guard_retry_config,
-        }
+        })
     }
 
-    fn guarded_route_payload(&self) -> GuardedExternalRoutePayload {
+    fn guarded_route_payload(&self) -> Result<GuardedExternalRoutePayload, PayloadGuardError> {
         let retry_config = self
             .payload_guard_external_enabled
             .then_some(())
             .and(self.payload_guard_retry_config);
         if !self.payload_guard_external_enabled {
-            return GuardedExternalRoutePayload {
+            return Ok(GuardedExternalRoutePayload {
                 raw_body: self.raw_body.clone(),
                 payload: self.payload.clone(),
                 payload_breakdown: None,
                 payload_guard_report: None,
                 payload_guard_retry_config: None,
-            };
+            });
         }
 
         let mut payload = self.payload.clone();
@@ -923,15 +934,18 @@ impl ExternalFallbackContext {
                         extract_stable_conversation_id(&payload).as_deref(),
                     );
                 }
-                GuardedExternalRoutePayload {
+                Ok(GuardedExternalRoutePayload {
                     raw_body,
                     payload,
                     payload_breakdown: breakdown,
                     payload_guard_report: include_diagnostics.then_some(report),
                     payload_guard_retry_config: retry_config,
-                }
+                })
             }
             Err(err) => {
+                if matches!(err, PayloadGuardError::OversizedImage { .. }) {
+                    return Err(err);
+                }
                 let mut payload = self.payload.clone();
                 let sanitized = guard_config.shaping.enabled
                     && sanitize_anthropic_messages_for_external_forwarding(
@@ -950,13 +964,13 @@ impl ExternalFallbackContext {
                     sanitized,
                     "external pool payload guard failed; forwarding safety-sanitized request body when possible"
                 );
-                GuardedExternalRoutePayload {
+                Ok(GuardedExternalRoutePayload {
                     raw_body,
                     payload,
                     payload_breakdown: None,
                     payload_guard_report: None,
                     payload_guard_retry_config: None,
-                }
+                })
             }
         }
     }
@@ -3229,6 +3243,7 @@ fn should_retry_without_cache_point_after_error(value: &str) -> bool {
 
 fn attach_and_log_tool_use_format_diagnostics(
     message: &str,
+    attempted_body: &str,
     request: &KiroRequest,
     usage_context: &mut RequestUsageContext,
     endpoint: &str,
@@ -3250,6 +3265,7 @@ fn attach_and_log_tool_use_format_diagnostics(
             requested_model,
             upstream_model: Some(upstream_model),
             error_message: message,
+            attempted_body: Some(attempted_body),
             request,
             report: usage_context.payload_guard_report.as_ref(),
             diagnostics,
@@ -3423,6 +3439,27 @@ fn payload_guard_error_response(err: PayloadGuardError) -> Response {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "api_error",
                 envelope::PUBLIC_PROCESSING_FAILED_MESSAGE,
+            )
+        }
+        PayloadGuardError::OversizedImage {
+            current_images,
+            current_image_bytes,
+            historical_images,
+            historical_image_bytes,
+            max_source_bytes,
+        } => {
+            tracing::warn!(
+                current_images,
+                current_image_bytes,
+                historical_images,
+                historical_image_bytes,
+                max_source_bytes,
+                "request contains image input exceeding upstream image size limit"
+            );
+            envelope::error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "One or more images exceed the upstream 5 MB image size limit. Remove or resize the oversized image and retry.",
             )
         }
     }
@@ -4242,6 +4279,7 @@ async fn handle_stream_request(
             let endpoint = usage_context.endpoint.clone();
             attach_and_log_tool_use_format_diagnostics(
                 &message,
+                request_body,
                 kiro_request,
                 &mut usage_context,
                 &endpoint,
@@ -4296,6 +4334,7 @@ async fn handle_stream_request(
                         let endpoint = usage_context.endpoint.clone();
                         attach_and_log_tool_use_format_diagnostics(
                             &retry_message,
+                            &retry_body,
                             kiro_request,
                             &mut usage_context,
                             &endpoint,
@@ -4386,6 +4425,7 @@ async fn handle_stream_request(
                         let endpoint = usage_context.endpoint.clone();
                         attach_and_log_tool_use_format_diagnostics(
                             &retry_message,
+                            &retry_body,
                             kiro_request,
                             &mut usage_context,
                             &endpoint,
@@ -5239,6 +5279,7 @@ async fn handle_non_stream_request(
             let endpoint = usage_context.endpoint.clone();
             attach_and_log_tool_use_format_diagnostics(
                 &message,
+                request_body,
                 kiro_request,
                 &mut usage_context,
                 &endpoint,
@@ -5293,6 +5334,7 @@ async fn handle_non_stream_request(
                         let endpoint = usage_context.endpoint.clone();
                         attach_and_log_tool_use_format_diagnostics(
                             &retry_message,
+                            &retry_body,
                             kiro_request,
                             &mut usage_context,
                             &endpoint,
@@ -5383,6 +5425,7 @@ async fn handle_non_stream_request(
                         let endpoint = usage_context.endpoint.clone();
                         attach_and_log_tool_use_format_diagnostics(
                             &retry_message,
+                            &retry_body,
                             kiro_request,
                             &mut usage_context,
                             &endpoint,

@@ -10,9 +10,9 @@ import type {
   ModelMappingRule,
   PayloadShapingConfig,
   PromptCacheCreationControlConfig,
-  ReportedUsageConfig,
   ReportedUsageFieldPolicy,
   ReportedUsagePathPolicy,
+  RuntimeConfig,
 } from '@/types/api'
 
 // ─── 共用原子 ─────────────────────────────────────────────────────────────────
@@ -62,9 +62,11 @@ function TwoCol({ children }: { children: React.ReactNode }) {
   return <div className="grid gap-4 md:grid-cols-2">{children}</div>
 }
 
-// ─── 路径级缓存策略(cachePolicy) ──────────────────────────────────────────────
+// ─── 统一缓存策略(cachePolicy + legacy defaults) ─────────────────────────────
 
 type CacheSimulationPatch = NonNullable<CacheRoutePolicyPatch['simulation']>
+type CachePointPatch = NonNullable<CacheRoutePolicyPatch['cachePoint']>
+type CacheBoundsPatch = NonNullable<CacheRoutePolicyPatch['bounds']>
 
 function normalizeCachePolicyPath(prefix: string): string | null {
   const trimmed = prefix.trim()
@@ -85,15 +87,58 @@ function defaultSimulationPatch(): CacheSimulationPatch {
   }
 }
 
-function defaultPathCachePatch(): CacheRoutePolicyPatch {
+function defaultCachePointPatch(): CachePointPatch {
+  return {
+    enabled: false,
+    toolsOnly: true,
+    recordPlan: true,
+  }
+}
+
+function defaultBoundsPatch(): CacheBoundsPatch {
+  return {
+    maxEntriesPerAccount: 200,
+    maxEntriesGlobal: 20000,
+    entryTtlSecs: 86400,
+    estimatedBytesLimit: 268435456,
+  }
+}
+
+function defaultUsagePatch(prefix: string): ReportedUsagePathPolicy {
+  return normalizeDefinedCacheRoute(prefix)
+    ? pathPolicy(true, inputSamplePolicy(96), preserveFieldPolicy())
+    : pathPolicy()
+}
+
+function defaultPathCachePatch(prefix: string): CacheRoutePolicyPatch {
   return {
     simulation: defaultSimulationPatch(),
     creationControl: defaultPromptCacheCreationControl(),
+    reportedUsage: defaultUsagePatch(prefix),
+    cachePoint: defaultCachePointPatch(),
+    bounds: defaultBoundsPatch(),
   }
 }
 
 function isEmptyRoutePatch(policy: CacheRoutePolicyPatch): boolean {
   return !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds
+}
+
+function normalizedDefinedRoutesWith(routes: string[], prefix: string, enabled: boolean): string[] {
+  const normalizedRoute = normalizeDefinedCacheRoute(prefix)
+  if (!normalizedRoute) return normalizeDefinedCacheRoutes(routes)
+  const next = routes.filter((route) => normalizeDefinedCacheRoute(route) !== normalizedRoute)
+  if (enabled) next.push(normalizedRoute)
+  return normalizeDefinedCacheRoutes(next)
+}
+
+function moveDefinedRoute(routes: string[], oldPrefix: string, nextPrefix: string): string[] {
+  const oldRoute = normalizeDefinedCacheRoute(oldPrefix)
+  if (!oldRoute || !routes.some((route) => normalizeDefinedCacheRoute(route) === oldRoute)) {
+    return normalizeDefinedCacheRoutes(routes)
+  }
+  const withoutOld = normalizedDefinedRoutesWith(routes, oldPrefix, false)
+  return normalizedDefinedRoutesWith(withoutOld, nextPrefix, Boolean(normalizeDefinedCacheRoute(nextPrefix)))
 }
 
 function SimulationOverrideForm({
@@ -179,21 +224,125 @@ function CreationControlOverrideForm({
   )
 }
 
+function CachePointOverrideForm({
+  value,
+  onChange,
+}: {
+  value: CachePointPatch
+  onChange: (next: CachePointPatch) => void
+}) {
+  const merged = { ...defaultCachePointPatch(), ...value }
+  const set = <K extends keyof CachePointPatch>(key: K) => (nextValue: CachePointPatch[K]) =>
+    onChange({ ...merged, [key]: nextValue })
+
+  return (
+    <div className="space-y-4 rounded-lg border border-border bg-muted/20 p-4">
+      <TogField
+        label="发送真实 cachePoint"
+        desc="把带缓存标记的工具发送给 Kiro 上游；上游不接受时会自动去掉后重试一次。"
+        checked={merged.enabled ?? false}
+        onChange={set('enabled')}
+      />
+      <TwoCol>
+        <TogField
+          label="只处理工具缓存标记"
+          desc="只根据工具上的缓存标记插入 cachePoint，不改写系统消息或历史消息。"
+          checked={merged.toolsOnly ?? true}
+          disabled={!merged.enabled}
+          onChange={set('toolsOnly')}
+        />
+        <TogField
+          label="记录 cachePoint 计划"
+          desc="在系统日志中记录插入数量，方便排查上游请求体错误。"
+          checked={merged.recordPlan ?? true}
+          disabled={!merged.enabled}
+          onChange={set('recordPlan')}
+        />
+      </TwoCol>
+    </div>
+  )
+}
+
+function CacheBoundsOverrideForm({
+  value,
+  onChange,
+}: {
+  value: CacheBoundsPatch
+  onChange: (next: CacheBoundsPatch) => void
+}) {
+  const merged = { ...defaultBoundsPatch(), ...value }
+  const set = <K extends keyof CacheBoundsPatch>(key: K) => (nextValue: CacheBoundsPatch[K]) =>
+    onChange({ ...merged, [key]: nextValue })
+
+  return (
+    <div className="space-y-4 rounded-lg border border-border bg-muted/20 p-4">
+      <TwoCol>
+        <NumField label="单账号条目上限" value={merged.maxEntriesPerAccount ?? 200} min={0} suffix="条" onChange={set('maxEntriesPerAccount')} />
+        <NumField label="全局条目上限" value={merged.maxEntriesGlobal ?? 20000} min={0} suffix="条" onChange={set('maxEntriesGlobal')} />
+      </TwoCol>
+      <TwoCol>
+        <NumField label="最长保留时间" value={merged.entryTtlSecs ?? 86400} min={1} suffix="秒" onChange={set('entryTtlSecs')} />
+        <NumField label="估算内存上限" value={merged.estimatedBytesLimit ?? 268435456} min={0} suffix="字节" onChange={set('estimatedBytesLimit')} />
+      </TwoCol>
+    </div>
+  )
+}
+
+function CachePatchBlock({
+  title,
+  desc,
+  enabled,
+  onSet,
+  onClear,
+  children,
+}: {
+  title: string
+  desc: string
+  enabled: boolean
+  onSet: () => void
+  onClear: () => void
+  children: React.ReactNode
+}) {
+  return (
+    <div className="space-y-3 rounded-lg border border-border bg-muted/10 p-4">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="text-sm font-semibold">{title}</div>
+          <div className="text-xs text-muted-foreground">{desc}</div>
+        </div>
+        {enabled ? (
+          <Button type="button" variant="ghost" size="sm" onClick={onClear}>清除覆盖</Button>
+        ) : (
+          <Button type="button" variant="outline" size="sm" onClick={onSet}>设置覆盖</Button>
+        )}
+      </div>
+      {enabled && children}
+    </div>
+  )
+}
+
 function PathCachePolicyCard({
   prefix,
   policy,
+  definedRoutes,
   onPrefixChange,
   onDelete,
   onChange,
+  onDefinedRouteChange,
 }: {
   prefix: string
   policy: CacheRoutePolicyPatch
+  definedRoutes: string[]
   onPrefixChange: (nextPrefix: string) => void
   onDelete: () => void
   onChange: (next: CacheRoutePolicyPatch) => void
+  onDefinedRouteChange: (enabled: boolean) => void
 }) {
   const [draftPrefix, setDraftPrefix] = useState(prefix)
   const [prefixError, setPrefixError] = useState<string | null>(null)
+  const normalizedDefinedRoute = normalizeDefinedCacheRoute(prefix)
+  const isDfcachePath = prefix.toLowerCase().startsWith(DFCACHE_ROUTE_PREFIX)
+  const isRouteRegistered = Boolean(normalizedDefinedRoute && definedRoutes.includes(normalizedDefinedRoute))
 
   useEffect(() => {
     setDraftPrefix(prefix)
@@ -217,12 +366,21 @@ function PathCachePolicyCard({
   const setCreationControl = (creationControl?: PromptCacheCreationControlConfig) => {
     onChange({ ...policy, creationControl })
   }
+  const setReportedUsage = (reportedUsage?: ReportedUsagePathPolicy) => {
+    onChange({ ...policy, reportedUsage })
+  }
+  const setCachePoint = (cachePoint?: CachePointPatch) => {
+    onChange({ ...policy, cachePoint })
+  }
+  const setBounds = (bounds?: CacheBoundsPatch) => {
+    onChange({ ...policy, bounds })
+  }
 
   return (
     <div className="space-y-4 rounded-lg border border-border bg-background p-4">
       <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
         <div className="min-w-0 flex-1 space-y-1.5">
-          <div className="text-sm font-semibold">路径覆盖</div>
+          <div className="text-sm font-semibold">路径前缀</div>
           <Input
             value={draftPrefix}
             onChange={(event) => setDraftPrefix(event.target.value)}
@@ -243,58 +401,122 @@ function PathCachePolicyCard({
         </Button>
       </div>
 
-      <div className="space-y-3">
-        <div className="flex items-center justify-between gap-3">
-          <div>
-            <div className="text-sm font-semibold">高缓存模拟覆盖</div>
-            <div className="text-xs text-muted-foreground">不设置时沿用通用高缓存配置。</div>
-          </div>
-          {policy.simulation ? (
-            <Button type="button" variant="ghost" size="sm" onClick={() => setSimulation(undefined)}>清除覆盖</Button>
-          ) : (
-            <Button type="button" variant="outline" size="sm" onClick={() => setSimulation(defaultSimulationPatch())}>设置覆盖</Button>
-          )}
+      {isDfcachePath && (
+        <div className="rounded-lg border border-border bg-muted/10 p-4">
+          <TogField
+            label="注册为 /dfcache 路由"
+            desc={normalizedDefinedRoute ? '开启后允许客户端访问这个 /dfcache/{name} 入口。' : '路径必须是 /dfcache/{name}，name 仅允许小写字母、数字、点、下划线或短横线。'}
+            checked={isRouteRegistered}
+            disabled={!normalizedDefinedRoute}
+            onChange={onDefinedRouteChange}
+          />
         </div>
-        {policy.simulation && <SimulationOverrideForm value={policy.simulation} onChange={setSimulation} />}
-      </div>
+      )}
 
-      <div className="space-y-3">
-        <div className="flex items-center justify-between gap-3">
-          <div>
-            <div className="text-sm font-semibold">缓存创建频次覆盖</div>
-            <div className="text-xs text-muted-foreground">不设置时沿用通用缓存创建频次。</div>
-          </div>
-          {policy.creationControl ? (
-            <Button type="button" variant="ghost" size="sm" onClick={() => setCreationControl(undefined)}>清除覆盖</Button>
-          ) : (
-            <Button type="button" variant="outline" size="sm" onClick={() => setCreationControl(defaultPromptCacheCreationControl())}>设置覆盖</Button>
-          )}
-        </div>
+      <CachePatchBlock
+        title="高缓存模拟"
+        desc="不设置时沿用默认策略里的高缓存模拟参数。"
+        enabled={Boolean(policy.simulation)}
+        onSet={() => setSimulation(defaultSimulationPatch())}
+        onClear={() => setSimulation(undefined)}
+      >
+        {policy.simulation && <SimulationOverrideForm value={policy.simulation} onChange={setSimulation} />}
+      </CachePatchBlock>
+
+      <CachePatchBlock
+        title="缓存创建频次"
+        desc="不设置时沿用默认策略里的缓存创建频次。"
+        enabled={Boolean(policy.creationControl)}
+        onSet={() => setCreationControl(defaultPromptCacheCreationControl())}
+        onClear={() => setCreationControl(undefined)}
+      >
         {policy.creationControl && <CreationControlOverrideForm value={policy.creationControl} onChange={setCreationControl} />}
-      </div>
+      </CachePatchBlock>
+
+      <CachePatchBlock
+        title="用量展示"
+        desc="控制这个路径返回给客户端和后台记录的 input、output、cache read、cache write 口径。"
+        enabled={Boolean(policy.reportedUsage)}
+        onSet={() => setReportedUsage(defaultUsagePatch(prefix))}
+        onClear={() => setReportedUsage(undefined)}
+      >
+        {policy.reportedUsage && <PathPolicyEditor policy={policy.reportedUsage} onChange={setReportedUsage} />}
+      </CachePatchBlock>
+
+      <CachePatchBlock
+        title="真实 cachePoint"
+        desc="不设置时沿用默认策略里的 cachePoint 开关。"
+        enabled={Boolean(policy.cachePoint)}
+        onSet={() => setCachePoint(defaultCachePointPatch())}
+        onClear={() => setCachePoint(undefined)}
+      >
+        {policy.cachePoint && <CachePointOverrideForm value={policy.cachePoint} onChange={setCachePoint} />}
+      </CachePatchBlock>
+
+      <CachePatchBlock
+        title="缓存边界"
+        desc="按路径覆盖缓存指纹条目、保留时间和估算内存上限。"
+        enabled={Boolean(policy.bounds)}
+        onSet={() => setBounds(defaultBoundsPatch())}
+        onClear={() => setBounds(undefined)}
+      >
+        {policy.bounds && <CacheBoundsOverrideForm value={policy.bounds} onChange={setBounds} />}
+      </CachePatchBlock>
     </div>
   )
 }
 
 export function CachePolicySection({
-  cachePolicy,
+  config,
   onChange,
 }: {
-  cachePolicy: CachePolicyConfig
-  onChange: (next: CachePolicyConfig) => void
+  config: RuntimeConfig
+  onChange: (next: RuntimeConfig) => void
 }) {
   const [newPath, setNewPath] = useState('')
   const [error, setError] = useState<string | null>(null)
-  const paths = Object.keys(cachePolicy.pathOverrides ?? {}).sort()
+  const cachePolicy = config.cachePolicy
+  const paths = Array.from(new Set([
+    ...Object.keys(cachePolicy.pathOverrides ?? {}),
+    ...Object.keys(config.reportedUsage.pathOverrides ?? {}),
+    ...config.definedCacheRoutes,
+  ])).sort()
+
+  const updateCachePolicy = (
+    nextCachePolicy: CachePolicyConfig,
+    nextReportedUsage = config.reportedUsage,
+    nextDefinedRoutes = config.definedCacheRoutes
+  ) => {
+    onChange({
+      ...config,
+      cachePolicy: nextCachePolicy,
+      reportedUsage: nextReportedUsage,
+      definedCacheRoutes: nextDefinedRoutes,
+    })
+  }
+
+  const setRuntime = <K extends keyof RuntimeConfig>(key: K) => (value: RuntimeConfig[K]) => {
+    onChange({ ...config, [key]: value })
+  }
+
+  const mergedPolicyForPath = (prefix: string): CacheRoutePolicyPatch => ({
+    ...(cachePolicy.pathOverrides?.[prefix] ?? {}),
+    reportedUsage: cachePolicy.pathOverrides?.[prefix]?.reportedUsage ?? config.reportedUsage.pathOverrides[prefix],
+  })
 
   const setPathPolicy = (prefix: string, nextPolicy: CacheRoutePolicyPatch) => {
     const pathOverrides = { ...(cachePolicy.pathOverrides ?? {}) }
+    const reportedPathOverrides = { ...config.reportedUsage.pathOverrides }
+    delete reportedPathOverrides[prefix]
     if (isEmptyRoutePatch(nextPolicy)) {
       delete pathOverrides[prefix]
     } else {
       pathOverrides[prefix] = nextPolicy
     }
-    onChange({ ...cachePolicy, pathOverrides })
+    updateCachePolicy(
+      { ...cachePolicy, pathOverrides },
+      { ...config.reportedUsage, pathOverrides: reportedPathOverrides }
+    )
   }
 
   const addPath = () => {
@@ -303,49 +525,120 @@ export function CachePolicySection({
       setError('请输入路径前缀，例如 /cc 或 /dfcache/team-a')
       return
     }
-    if (cachePolicy.pathOverrides?.[prefix]) {
+    if (paths.includes(prefix)) {
       setError(`${prefix} 已存在`)
       return
     }
     setError(null)
     setNewPath('')
-    onChange({
-      ...cachePolicy,
-      pathOverrides: {
-        ...(cachePolicy.pathOverrides ?? {}),
-        [prefix]: defaultPathCachePatch(),
+    updateCachePolicy(
+      {
+        ...cachePolicy,
+        pathOverrides: {
+          ...(cachePolicy.pathOverrides ?? {}),
+          [prefix]: defaultPathCachePatch(prefix),
+        },
       },
-    })
+      config.reportedUsage,
+      normalizedDefinedRoutesWith(config.definedCacheRoutes, prefix, Boolean(normalizeDefinedCacheRoute(prefix)))
+    )
   }
 
   const renamePath = (oldPrefix: string, nextPrefix: string) => {
     if (oldPrefix === nextPrefix) return
-    if (cachePolicy.pathOverrides?.[nextPrefix]) {
+    if (paths.includes(nextPrefix)) {
       setError(`${nextPrefix} 已存在`)
       return
     }
     const pathOverrides = { ...(cachePolicy.pathOverrides ?? {}) }
-    const policy = pathOverrides[oldPrefix]
+    const policy = mergedPolicyForPath(oldPrefix)
     delete pathOverrides[oldPrefix]
-    pathOverrides[nextPrefix] = policy
+    if (!isEmptyRoutePatch(policy)) {
+      pathOverrides[nextPrefix] = policy
+    }
+    const reportedPathOverrides = { ...config.reportedUsage.pathOverrides }
+    delete reportedPathOverrides[oldPrefix]
     setError(null)
-    onChange({ ...cachePolicy, pathOverrides })
+    updateCachePolicy(
+      { ...cachePolicy, pathOverrides },
+      { ...config.reportedUsage, pathOverrides: reportedPathOverrides },
+      moveDefinedRoute(config.definedCacheRoutes, oldPrefix, nextPrefix)
+    )
   }
 
   const deletePath = (prefix: string) => {
     const pathOverrides = { ...(cachePolicy.pathOverrides ?? {}) }
     delete pathOverrides[prefix]
-    onChange({ ...cachePolicy, pathOverrides })
+    const reportedPathOverrides = { ...config.reportedUsage.pathOverrides }
+    delete reportedPathOverrides[prefix]
+    updateCachePolicy(
+      { ...cachePolicy, pathOverrides },
+      { ...config.reportedUsage, pathOverrides: reportedPathOverrides },
+      normalizedDefinedRoutesWith(config.definedCacheRoutes, prefix, false)
+    )
+  }
+
+  const setDefinedRoute = (prefix: string, enabled: boolean) => {
+    updateCachePolicy(cachePolicy, config.reportedUsage, normalizedDefinedRoutesWith(config.definedCacheRoutes, prefix, enabled))
   }
 
   return (
-    <div className="space-y-4">
-      <div className="text-xs leading-5 text-muted-foreground">
-        按入口路径覆盖通用高缓存模拟和缓存创建频次。没有设置覆盖的路径会继续使用通用配置；路径匹配时使用最长前缀。
+    <div className="space-y-6">
+      <div className="space-y-5 rounded-lg border border-border bg-background p-4">
+        <div>
+          <div className="text-sm font-semibold">默认缓存策略</div>
+          <div className="mt-1 text-xs leading-5 text-muted-foreground">
+            所有入口先使用这里的默认值；下方路径覆盖按最长前缀匹配后覆盖对应字段。
+          </div>
+        </div>
+        <div className="space-y-3">
+          <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">高缓存模拟</div>
+          <TwoCol>
+            <NumField label="缓存读取目标比例" desc="建议 0.95~0.99" value={config.promptCacheTargetReadRatio} min={0} max={0.99} step={0.01} suffix="比例" onChange={setRuntime('promptCacheTargetReadRatio')} />
+            <NumField label="输入估算放大倍数" value={config.promptCacheTokenScale} min={1} max={3} step={0.1} suffix="倍" onChange={setRuntime('promptCacheTokenScale')} />
+            <NumField label="输入展示上限" desc="0 表示不设上限" value={config.promptCacheMaxSimulatedInputTokens} min={0} suffix="Token" onChange={setRuntime('promptCacheMaxSimulatedInputTokens')} />
+            <NumField label="放大启用门槛" value={config.promptCacheScaleMinInputTokens} min={0} suffix="Token" onChange={setRuntime('promptCacheScaleMinInputTokens')} />
+            <NumField label="触顶扣减下限" value={config.promptCacheCapJitterMinTokens} min={0} suffix="Token" onChange={setRuntime('promptCacheCapJitterMinTokens')} />
+            <NumField label="触顶扣减上限" value={config.promptCacheCapJitterMaxTokens} min={0} suffix="Token" onChange={setRuntime('promptCacheCapJitterMaxTokens')} />
+          </TwoCol>
+        </div>
+        <div className="border-t border-border" />
+        <div className="space-y-3">
+          <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">缓存边界</div>
+          <TwoCol>
+            <NumField label="单账号条目上限" desc="每个账号最多保留多少个可复用缓存指纹。" value={config.promptCacheMaxEntriesPerAccount} min={0} suffix="条" onChange={setRuntime('promptCacheMaxEntriesPerAccount')} />
+            <NumField label="全局条目上限" desc="所有账号合计最多保留多少个缓存指纹，0 表示不按条目数限制。" value={config.promptCacheMaxEntriesGlobal} min={0} suffix="条" onChange={setRuntime('promptCacheMaxEntriesGlobal')} />
+            <NumField label="最长保留时间" desc="单条缓存指纹最多保留多久。" value={config.promptCacheEntryTtlSecs} min={1} suffix="秒" onChange={setRuntime('promptCacheEntryTtlSecs')} />
+            <NumField label="估算内存上限" desc="达到估算上限后优先移除最久未使用的缓存指纹，0 表示不按内存估算限制。" value={config.promptCacheEstimatedBytesLimit} min={0} suffix="字节" onChange={setRuntime('promptCacheEstimatedBytesLimit')} />
+          </TwoCol>
+        </div>
+        <div className="border-t border-border" />
+        <div className="space-y-3">
+          <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">真实 cachePoint</div>
+          <TwoCol>
+            <TogField label="发送真实 cachePoint" desc="把带缓存标记的工具发送给 Kiro 上游；上游不接受时会自动去掉后重试一次。" checked={config.kiroCachePointEnabled} onChange={setRuntime('kiroCachePointEnabled')} />
+            <TogField label="只处理工具缓存标记" desc="只根据工具上的缓存标记插入 cachePoint，不改写系统消息或历史消息。" checked={config.kiroCachePointToolsOnly} disabled={!config.kiroCachePointEnabled} onChange={setRuntime('kiroCachePointToolsOnly')} />
+            <TogField label="记录 cachePoint 计划" desc="在系统日志中记录插入数量，方便排查上游请求体错误。" checked={config.kiroCachePointRecordPlan} disabled={!config.kiroCachePointEnabled} onChange={setRuntime('kiroCachePointRecordPlan')} />
+          </TwoCol>
+        </div>
+        <div className="border-t border-border" />
+        <div className="space-y-3">
+          <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">缓存创建频次</div>
+          <CacheCreationSection control={config.promptCacheCreationControl} onChange={setRuntime('promptCacheCreationControl')} />
+        </div>
+        <div className="border-t border-border" />
+        <div className="space-y-3">
+          <div className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">用量展示</div>
+          <PathPolicyEditor
+            policy={config.reportedUsage.default}
+            onChange={(defaultPolicy) => onChange({ ...config, reportedUsage: { ...config.reportedUsage, default: defaultPolicy } })}
+          />
+        </div>
       </div>
+
       <div className="flex flex-col gap-2 rounded-lg border border-border bg-muted/20 p-4 md:flex-row md:items-end">
         <div className="min-w-0 flex-1 space-y-1.5">
-          <div className="text-sm font-semibold">新增路径覆盖</div>
+          <div className="text-sm font-semibold">新增路径策略</div>
           <Input
             placeholder="/cc、/ha 或 /dfcache/team-a"
             value={newPath}
@@ -363,7 +656,7 @@ export function CachePolicySection({
       {error && <div className="text-xs text-destructive">{error}</div>}
       {paths.length === 0 ? (
         <div className="rounded-lg border border-dashed border-border p-6 text-sm text-muted-foreground">
-          暂无路径覆盖。当前所有入口都会使用通用高缓存配置和通用缓存创建频次。
+          暂无路径覆盖。当前所有入口都会使用默认缓存策略。
         </div>
       ) : (
         <div className="space-y-4">
@@ -371,10 +664,12 @@ export function CachePolicySection({
             <PathCachePolicyCard
               key={prefix}
               prefix={prefix}
-              policy={cachePolicy.pathOverrides[prefix]}
+              policy={mergedPolicyForPath(prefix)}
+              definedRoutes={config.definedCacheRoutes}
               onPrefixChange={(nextPrefix) => renamePath(prefix, nextPrefix)}
               onDelete={() => deletePath(prefix)}
               onChange={(nextPolicy) => setPathPolicy(prefix, nextPolicy)}
+              onDefinedRouteChange={(enabled) => setDefinedRoute(prefix, enabled)}
             />
           ))}
         </div>
@@ -457,6 +752,21 @@ export function PayloadFallbackSection({
         <TogField label="移除当前图片" checked={shaping.truncateCurrentImages} disabled={dis} onChange={set('truncateCurrentImages')} />
         <NumField label="当前图片保留大小" value={shaping.currentImagesMaxBytes} min={0} suffix="字节" disabled={dis} onChange={set('currentImagesMaxBytes')} />
       </TwoCol>
+      <div className="space-y-1.5">
+        <div className="text-sm font-semibold text-foreground">单图超 5MB 处理</div>
+        <div className="text-xs leading-relaxed text-muted-foreground">图片超过上游单图限制时，选择移除并给模型占位说明，或直接返回请求错误。</div>
+        <Select
+          value={shaping.oversizedImageHandling ?? 'drop-with-placeholder'}
+          disabled={dis}
+          onValueChange={(v) => set('oversizedImageHandling')(v as PayloadShapingConfig['oversizedImageHandling'])}
+        >
+          <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="drop-with-placeholder">移除图片并占位</SelectItem>
+            <SelectItem value="reject">直接报错</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
     </div>
   )
 }
@@ -503,7 +813,7 @@ export function CacheCreationSection({
   )
 }
 
-// ─── 用量展示规则(reportedUsage) ─────────────────────────────────────────────
+// ─── 用量上报字段策略 ─────────────────────────────────────────────────────────
 
 const FIELD_MODE_LABELS: Record<string, string> = {
   raw: '原始返回',
@@ -595,111 +905,6 @@ function PathPolicyEditor({
           </TwoCol>
         </>
       )}
-    </div>
-  )
-}
-
-export function ReportedUsageSection({
-  reported, onChange,
-}: {
-  reported: ReportedUsageConfig
-  onChange: (next: ReportedUsageConfig) => void
-}) {
-  const [newPrefix, setNewPrefix] = useState('')
-  const [editingPrefix, setEditingPrefix] = useState<string | null>(null)
-  const [prefixDraft, setPrefixDraft] = useState('')
-  const overrides = Object.entries(reported.pathOverrides)
-
-  const addOverride = () => {
-    const trimmed = newPrefix.trim()
-    if (!trimmed) return
-    const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
-    onChange({
-      ...reported,
-      pathOverrides: { ...reported.pathOverrides, [withSlash]: structuredClone(reported.default) },
-    })
-    setNewPrefix('')
-  }
-  const removeOverride = (prefix: string) => {
-    const next = { ...reported.pathOverrides }
-    delete next[prefix]
-    onChange({ ...reported, pathOverrides: next })
-  }
-  const setOverride = (prefix: string, policy: ReportedUsagePathPolicy) =>
-    onChange({ ...reported, pathOverrides: { ...reported.pathOverrides, [prefix]: policy } })
-
-  const startRename = (prefix: string) => {
-    setEditingPrefix(prefix)
-    setPrefixDraft(prefix)
-  }
-  const commitRename = (oldPrefix: string) => {
-    const newPrefix = prefixDraft.trim()
-    if (!newPrefix || newPrefix === oldPrefix) {
-      setEditingPrefix(null)
-      return
-    }
-    const policy = reported.pathOverrides[oldPrefix]
-    if (!policy) return
-    const next = { ...reported.pathOverrides }
-    delete next[oldPrefix]
-    next[newPrefix] = policy
-    onChange({ ...reported, pathOverrides: next })
-    setEditingPrefix(null)
-  }
-
-  return (
-    <div className="space-y-5">
-      <div className="rounded-lg border border-border bg-card p-3">
-        <div className="mb-3 text-sm font-semibold">默认入口规则</div>
-        <PathPolicyEditor policy={reported.default} onChange={(p) => onChange({ ...reported, default: p })} />
-      </div>
-
-      <div className="space-y-3">
-        <div className="flex items-center justify-between gap-2">
-          <span className="text-sm font-semibold">入口覆盖规则</span>
-          <div className="flex items-center gap-2">
-            <Input placeholder="入口前缀,如 /cc" value={newPrefix} className="h-8 w-[12rem]"
-              onChange={(e) => setNewPrefix(e.target.value)} />
-            <Button size="sm" variant="outline" onClick={addOverride}>添加入口</Button>
-          </div>
-        </div>
-        {overrides.length === 0 && (
-          <div className="rounded-lg border border-dashed border-border px-3 py-6 text-center text-xs text-muted-foreground">
-            暂无入口覆盖规则,所有入口走默认规则
-          </div>
-        )}
-        {overrides.map(([prefix, policy]) => (
-          <div key={prefix} className="rounded-lg border border-border bg-card p-3">
-            <div className="mb-3 flex items-center justify-between gap-2">
-              {editingPrefix === prefix ? (
-                <div className="flex flex-1 items-center gap-2">
-                  <Input
-                    value={prefixDraft}
-                    className="h-7 flex-1 font-mono text-sm"
-                    onChange={(e) => setPrefixDraft(e.target.value)}
-                    onBlur={() => commitRename(prefix)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') commitRename(prefix)
-                      if (e.key === 'Escape') setEditingPrefix(null)
-                    }}
-                    autoFocus
-                  />
-                </div>
-              ) : (
-                <code
-                  className="cursor-pointer rounded bg-muted px-1.5 py-0.5 text-sm font-semibold hover:bg-muted/70"
-                  onClick={() => startRename(prefix)}
-                  title="点击编辑入口前缀"
-                >
-                  {prefix}
-                </code>
-              )}
-              <Button size="sm" variant="ghost" className="text-destructive hover:bg-destructive/10" onClick={() => removeOverride(prefix)}>删除</Button>
-            </div>
-            <PathPolicyEditor policy={policy} onChange={(p) => setOverride(prefix, p)} />
-          </div>
-        ))}
-      </div>
     </div>
   )
 }
@@ -811,7 +1016,7 @@ export function ModelMappingSection({
   )
 }
 
-// ─── 自定义缓存路由前缀(definedCacheRoutes) ───────────────────────────────────
+// ─── /dfcache 路径归一化 ─────────────────────────────────────────────────────
 
 const DFCACHE_ROUTE_PREFIX = '/dfcache/'
 
@@ -830,30 +1035,6 @@ export function normalizeDefinedCacheRoute(route: string): string | null {
   return `${DFCACHE_ROUTE_PREFIX}${name}`
 }
 
-/** 取出 /dfcache/ 之后的名称部分，用于输入框展示 */
-function getDefinedCacheRouteName(route: string): string {
-  const normalized = normalizeDefinedCacheRoute(route)
-  if (normalized) return normalized.slice(DFCACHE_ROUTE_PREFIX.length)
-  const trimmed = route.trim()
-  const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
-  if (withSlash.toLowerCase().startsWith(DFCACHE_ROUTE_PREFIX)) {
-    return withSlash.slice(DFCACHE_ROUTE_PREFIX.length)
-  }
-  return trimmed
-}
-
-function definedCacheRouteFromNameInput(name: string): string {
-  const trimmed = name.trim()
-  const normalizedFullRoute = normalizeDefinedCacheRoute(trimmed)
-  if (
-    normalizedFullRoute &&
-    (trimmed.startsWith('/') || trimmed.toLowerCase().startsWith(DFCACHE_ROUTE_PREFIX.slice(1)))
-  ) {
-    return normalizedFullRoute
-  }
-  return `${DFCACHE_ROUTE_PREFIX}${name}`
-}
-
 export function normalizeDefinedCacheRoutes(routes: string[]): string[] {
   const seen = new Set<string>()
   const out: string[] = []
@@ -865,105 +1046,4 @@ export function normalizeDefinedCacheRoutes(routes: string[]): string[] {
     }
   }
   return out
-}
-
-/**
- * 自定义高缓存路由编辑：固定前缀 /dfcache/，用户只填名称。
- * 增/改/删时同步维护 reportedUsage.pathOverrides（以完整 route 为 key），与后端语义一致。
- */
-export function DefinedCacheRoutesSection({
-  routes,
-  reported,
-  onChange,
-}: {
-  routes: string[]
-  reported: ReportedUsageConfig
-  onChange: (routes: string[], reported: ReportedUsageConfig) => void
-}) {
-  const addRoute = () => {
-    let index = routes.length + 1
-    const existing = new Set(routes)
-    let route = `${DFCACHE_ROUTE_PREFIX}route-${index}`
-    while (existing.has(route)) {
-      index += 1
-      route = `${DFCACHE_ROUTE_PREFIX}route-${index}`
-    }
-    const pathOverrides = {
-      ...reported.pathOverrides,
-      [route]: reported.pathOverrides[route] ?? pathPolicy(true, inputSamplePolicy(96), preserveFieldPolicy()),
-    }
-    onChange([...routes, route], { ...reported, pathOverrides })
-  }
-
-  const editRoute = (index: number, nameInput: string) => {
-    const nextRoute = definedCacheRouteFromNameInput(nameInput)
-    const nextRoutes = [...routes]
-    const prevRoute = nextRoutes[index]
-    nextRoutes[index] = nextRoute
-    const pathOverrides = { ...reported.pathOverrides }
-    const normPrev = normalizeDefinedCacheRoute(prevRoute)
-    const normNext = normalizeDefinedCacheRoute(nextRoute)
-    if (normPrev && pathOverrides[normPrev] && normNext && !pathOverrides[normNext]) {
-      pathOverrides[normNext] = pathOverrides[normPrev]
-      delete pathOverrides[normPrev]
-    }
-    onChange(nextRoutes, { ...reported, pathOverrides })
-  }
-
-  const removeRoute = (index: number) => {
-    const target = routes[index]
-    const nextRoutes = routes.filter((_, i) => i !== index)
-    const pathOverrides = { ...reported.pathOverrides }
-    const norm = normalizeDefinedCacheRoute(target)
-    if (norm) delete pathOverrides[norm]
-    onChange(nextRoutes, { ...reported, pathOverrides })
-  }
-
-  return (
-    <div className="space-y-3">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="text-xs leading-5 text-muted-foreground">
-          只需填写 <code className="rounded bg-muted px-1 py-0.5">/dfcache/</code> 后面的名称。未在此定义的 <code className="rounded bg-muted px-1 py-0.5">/dfcache/*</code> 请求会直接报错。
-        </div>
-        <Button type="button" variant="outline" size="sm" onClick={addRoute}>
-          <Plus className="h-4 w-4" />添加路由
-        </Button>
-      </div>
-      {routes.length === 0 ? (
-        <div className="rounded-md border border-dashed border-border px-3 py-3 text-sm text-muted-foreground">
-          暂未定义自定义路由。
-        </div>
-      ) : (
-        <div className="space-y-2">
-          {routes.map((route, index) => {
-            const name = getDefinedCacheRouteName(route)
-            const invalid = name.trim().length > 0 && !normalizeDefinedCacheRoute(route)
-            return (
-              <div key={`${route}-${index}`} className="flex items-center gap-2">
-                <div
-                  className={`flex min-w-0 flex-1 overflow-hidden rounded-md border bg-background focus-within:ring-2 focus-within:ring-ring ${invalid ? 'border-destructive' : 'border-input'}`}
-                >
-                  <span className="inline-flex shrink-0 select-none items-center border-r border-border bg-muted/50 px-3 font-mono text-sm text-muted-foreground">
-                    {DFCACHE_ROUTE_PREFIX}
-                  </span>
-                  <Input
-                    className="min-w-0 flex-1 rounded-none border-0 font-mono focus-visible:ring-0"
-                    value={name}
-                    placeholder="cc"
-                    onChange={(e) => editRoute(index, e.target.value)}
-                  />
-                </div>
-                <Button type="button" variant="outline" size="icon-sm" title="删除路由" onClick={() => removeRoute(index)}>
-                  <Trash2 className="h-4 w-4" />
-                </Button>
-              </div>
-            )
-          })}
-          <div className="text-xs text-muted-foreground">
-            名称仅允许小写字母、数字、点、下划线或短横线，长度不超过 64。
-          </div>
-        </div>
-      )}
-    </div>
-  )
 }

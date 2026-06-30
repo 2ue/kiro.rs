@@ -37,7 +37,8 @@
     "truncateCurrentDocuments": false,
     "currentDocumentMaxChars": 80000,
     "truncateCurrentImages": false,
-    "currentImagesMaxBytes": 180000
+    "currentImagesMaxBytes": 180000,
+    "oversizedImageHandling": "drop-with-placeholder"
   },
   "kiroAgentModeStrategy": "vibe"
 }

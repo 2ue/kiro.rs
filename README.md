@@ -238,6 +238,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `payloadShaping.currentDocumentMaxChars` | number | `80000` | 单个当前 document 正文的头尾保留字符预算 |
 | `payloadShaping.truncateCurrentImages` | boolean | `false` | 是否允许在仍超预算时丢弃当前图片；图片不会本地重编码压缩 |
 | `payloadShaping.currentImagesMaxBytes` | number | `180000` | 当前 images 数组允许保留的 JSON 字节预算 |
+| `payloadShaping.oversizedImageHandling` | string | `drop-with-placeholder` | 单张图片超过上游 5 MB 限制时的处理方式：`drop-with-placeholder` 移除图片并给模型占位说明；`reject` 直接返回 400 |
 | `compatProfile` | string | `claude-code` | 兼容 profile：`claude-code` 优先真实 Claude Code CLI 可用性；`anthropic-strict` 减少代理改写和调试特征；`debug` 等同 `claude-code` 但默认暴露代理 warning |
 | `kiroAgentModeStrategy` | string | `vibe` | Kiro IDE `x-amzn-kiro-agent-mode` 策略：`vibe` 保持当前成功链路，`spec` 强制规格模式，`auto` 按账号协议自动判定 |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
@@ -292,7 +293,8 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
       "truncateCurrentDocuments": false,
       "currentDocumentMaxChars": 80000,
       "truncateCurrentImages": false,
-      "currentImagesMaxBytes": 180000
+      "currentImagesMaxBytes": 180000,
+      "oversizedImageHandling": "drop-with-placeholder"
    }
 }
 ```

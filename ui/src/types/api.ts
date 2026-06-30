@@ -1049,6 +1049,8 @@ export interface PromptCacheCreationControlConfig {
   expireAfterIdleSecs: number
 }
 
+export type OversizedImageHandling = 'drop-with-placeholder' | 'reject'
+
 export interface PayloadShapingConfig {
   enabled: boolean
   truncateHistoricalToolResults: boolean
@@ -1071,6 +1073,7 @@ export interface PayloadShapingConfig {
   currentDocumentMaxChars: number
   truncateCurrentImages: boolean
   currentImagesMaxBytes: number
+  oversizedImageHandling: OversizedImageHandling
 }
 
 export interface ExternalPoolsConfig {

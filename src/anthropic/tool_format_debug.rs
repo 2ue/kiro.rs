@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -30,6 +30,8 @@ use crate::{
 
 use super::payload_guard::{PayloadGuardReport, ToolUseFormatDiagnostics};
 
+const TOOL_FORMAT_DEBUG_BODY_HASH_SAMPLE_BYTES: usize = 4096;
+
 #[derive(Debug, Clone)]
 pub struct ToolFormatDebugEvent<'a> {
     pub request_id: &'a str,
@@ -38,6 +40,7 @@ pub struct ToolFormatDebugEvent<'a> {
     pub requested_model: &'a str,
     pub upstream_model: Option<&'a str>,
     pub error_message: &'a str,
+    pub attempted_body: Option<&'a str>,
     pub request: &'a KiroRequest,
     pub report: Option<&'a PayloadGuardReport>,
     pub diagnostics: ToolUseFormatDiagnostics,
@@ -47,6 +50,7 @@ pub struct ToolFormatDebugEvent<'a> {
 struct SamplerState {
     window_start: Option<Instant>,
     global_count: u32,
+    request_body_count: u32,
     fingerprint_counts: HashMap<String, u32>,
     group_counts: HashMap<String, u32>,
 }
@@ -82,6 +86,9 @@ struct SamplingDecision {
     group_seen_in_window: u32,
     global_seen_in_window: u32,
     drop_reason: Option<SamplingDropReason>,
+    request_body_captured: bool,
+    request_body_seen_in_window: u32,
+    request_body_drop_reason: Option<&'static str>,
 }
 
 impl SamplerState {
@@ -90,6 +97,7 @@ impl SamplerState {
         config: &ToolFormatDebugConfig,
         fingerprint: &str,
         group_key: &str,
+        has_request_body: bool,
     ) -> SamplingDecision {
         let now = Instant::now();
         if self.window_start.is_none_or(|start| {
@@ -97,6 +105,7 @@ impl SamplerState {
         }) {
             self.window_start = Some(now);
             self.global_count = 0;
+            self.request_body_count = 0;
             self.fingerprint_counts.clear();
             self.group_counts.clear();
         }
@@ -129,6 +138,24 @@ impl SamplerState {
         } else {
             None
         };
+        let mut request_body_seen = self.request_body_count;
+        let mut request_body_captured = false;
+        let mut request_body_drop_reason = None;
+        if drop_reason.is_none() {
+            if !has_request_body {
+                request_body_drop_reason = Some("missing");
+            } else if !config.capture_request_body {
+                request_body_drop_reason = Some("disabled");
+            } else if config.max_request_body_bytes == 0 {
+                request_body_drop_reason = Some("max_bytes_zero");
+            } else if request_body_seen >= config.max_request_body_records_per_window {
+                request_body_drop_reason = Some("request_body_record_limit");
+            } else {
+                request_body_seen = request_body_seen.saturating_add(1);
+                self.request_body_count = request_body_seen;
+                request_body_captured = true;
+            }
+        }
 
         SamplingDecision {
             sampled: drop_reason.is_none(),
@@ -137,6 +164,9 @@ impl SamplerState {
             group_seen_in_window: group_seen,
             global_seen_in_window: global_seen,
             drop_reason,
+            request_body_captured,
+            request_body_seen_in_window: request_body_seen,
+            request_body_drop_reason,
         }
     }
 }
@@ -177,6 +207,8 @@ impl ToolFormatDebugRecorder {
         let (tx, rx) = mpsc::channel(config.channel_capacity);
         tokio::spawn(tool_format_debug_writer_loop(
             PathBuf::from(config.dir.clone()),
+            config.roll_interval_secs,
+            config.max_file_bytes,
             rx,
         ));
 
@@ -194,13 +226,17 @@ impl ToolFormatDebugRecorder {
             return None;
         }
 
-        let mut snapshot = ToolFormatDebugSnapshot::from_event(&self.config, event);
+        let attempted_body = event.attempted_body;
+        let body_identity = body_identity_for_sampling(&event);
+        let mut snapshot = ToolFormatDebugSnapshot::from_event(&self.config, event, body_identity);
         let fingerprint = snapshot.sampling.fingerprint.clone();
         let group_key = snapshot.sampling.group_key.clone();
-        let decision = self
-            .sampler
-            .lock()
-            .decide(&self.config, &fingerprint, &group_key);
+        let decision = self.sampler.lock().decide(
+            &self.config,
+            &fingerprint,
+            &group_key,
+            attempted_body.is_some(),
+        );
 
         snapshot.sampling.sampled = decision.sampled;
         snapshot.sampling.sampled_index_in_window = decision.sampled_index_in_window;
@@ -208,6 +244,19 @@ impl ToolFormatDebugRecorder {
         snapshot.sampling.group_seen_in_window = decision.group_seen_in_window;
         snapshot.sampling.global_seen_in_window = decision.global_seen_in_window;
         snapshot.sampling.drop_reason = decision.drop_reason.map(|reason| reason.as_str());
+        if decision.sampled {
+            if let Some(body) = attempted_body {
+                snapshot.body.body_sha256 = sha256_hex(body);
+            }
+        }
+        snapshot.request_body = ToolFormatRequestBodySnapshot::from_attempted_body(
+            &self.config,
+            attempted_body,
+            decision.request_body_captured,
+            decision.request_body_drop_reason,
+            decision.request_body_seen_in_window,
+            decision.sampled,
+        );
 
         if !decision.sampled {
             self.dropped_rate_limited.fetch_add(1, Ordering::Relaxed);
@@ -221,7 +270,8 @@ impl ToolFormatDebugRecorder {
             ));
         }
 
-        let mut line = match serde_json::to_string(&snapshot) {
+        let line = match serialize_snapshot_with_budget(&mut snapshot, self.config.max_record_bytes)
+        {
             Ok(line) => line,
             Err(err) => {
                 tracing::warn!("序列化 tool format debug 失败: {}", err);
@@ -235,12 +285,6 @@ impl ToolFormatDebugRecorder {
                 ));
             }
         };
-
-        if line.len() > self.config.max_record_bytes {
-            snapshot.samples = ToolFormatSamples::default();
-            snapshot.record_truncated = true;
-            line = serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string());
-        }
 
         let record_bytes = line.len();
         let Some(tx) = &self.tx else {
@@ -311,23 +355,127 @@ fn debug_ref(
         "droppedRateLimited": dropped_rate_limited,
         "droppedChannel": dropped_channel,
         "recordBytes": record_bytes,
+        "requestBody": {
+            "captured": snapshot.request_body.captured,
+            "dropReason": snapshot.request_body.drop_reason,
+            "bytes": snapshot.request_body.bytes,
+            "truncated": snapshot.request_body.truncated,
+            "seenInWindow": snapshot.request_body.seen_in_window,
+            "limitInWindow": snapshot.request_body.limit_in_window,
+        },
     })
 }
 
-async fn tool_format_debug_writer_loop(dir: PathBuf, mut rx: mpsc::Receiver<String>) {
+async fn tool_format_debug_writer_loop(
+    dir: PathBuf,
+    roll_interval_secs: u64,
+    max_file_bytes: u64,
+    mut rx: mpsc::Receiver<String>,
+) {
+    let mut state = ToolFormatDebugWriterState::new(dir, roll_interval_secs, max_file_bytes);
     while let Some(mut line) = rx.recv().await {
         line.push('\n');
-        let path = daily_file_path(&dir);
+        let path = match state.path_for_next_record(line.len() as u64).await {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::warn!("选择 tool format debug 滚动文件失败: {}", err);
+                continue;
+            }
+        };
         if let Err(err) = append_line(&path, line.as_bytes()).await {
             tracing::warn!(path = %path.display(), "写入 tool format debug 文件失败: {}", err);
+        } else {
+            state.record_written(line.len() as u64);
         }
     }
 }
 
-fn daily_file_path(dir: &Path) -> PathBuf {
+struct ToolFormatDebugWriterState {
+    dir: PathBuf,
+    roll_interval_secs: u64,
+    max_file_bytes: u64,
+    period_start_epoch_secs: Option<u64>,
+    sequence: u32,
+    current_path: Option<PathBuf>,
+    current_bytes: u64,
+}
+
+impl ToolFormatDebugWriterState {
+    fn new(dir: PathBuf, roll_interval_secs: u64, max_file_bytes: u64) -> Self {
+        Self {
+            dir,
+            roll_interval_secs: roll_interval_secs.max(60),
+            max_file_bytes: max_file_bytes.max(1),
+            period_start_epoch_secs: None,
+            sequence: 0,
+            current_path: None,
+            current_bytes: 0,
+        }
+    }
+
+    async fn path_for_next_record(&mut self, record_bytes: u64) -> std::io::Result<PathBuf> {
+        let period_start = current_roll_period_start(self.roll_interval_secs);
+        if self.period_start_epoch_secs != Some(period_start) {
+            self.period_start_epoch_secs = Some(period_start);
+            self.sequence = 0;
+            self.current_path = None;
+            self.current_bytes = 0;
+        }
+
+        if self.current_path.is_none() {
+            self.select_existing_or_new_file(period_start).await?;
+        }
+
+        if self.current_bytes > 0
+            && self.current_bytes.saturating_add(record_bytes) > self.max_file_bytes
+        {
+            self.sequence = self.sequence.saturating_add(1);
+            self.current_path = Some(roll_file_path(&self.dir, period_start, self.sequence));
+            self.current_bytes = file_len(self.current_path.as_ref().expect("path")).await?;
+        }
+
+        Ok(self.current_path.clone().expect("tool debug path selected"))
+    }
+
+    async fn select_existing_or_new_file(&mut self, period_start: u64) -> std::io::Result<()> {
+        loop {
+            let path = roll_file_path(&self.dir, period_start, self.sequence);
+            let len = file_len(&path).await?;
+            if len < self.max_file_bytes {
+                self.current_path = Some(path);
+                self.current_bytes = len;
+                return Ok(());
+            }
+            self.sequence = self.sequence.saturating_add(1);
+        }
+    }
+
+    fn record_written(&mut self, bytes: u64) {
+        self.current_bytes = self.current_bytes.saturating_add(bytes);
+    }
+}
+
+async fn file_len(path: &Path) -> std::io::Result<u64> {
+    match fs::metadata(path).await {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(err),
+    }
+}
+
+fn current_roll_period_start(roll_interval_secs: u64) -> u64 {
+    let now = Utc::now().timestamp().max(0) as u64;
+    let interval = roll_interval_secs.max(60);
+    now - (now % interval)
+}
+
+fn roll_file_path(dir: &Path, period_start_epoch_secs: u64, sequence: u32) -> PathBuf {
+    let period_start =
+        DateTime::from_timestamp(period_start_epoch_secs as i64, 0).unwrap_or_else(Utc::now);
     dir.join(format!(
-        "tool-format-{}.jsonl",
-        Utc::now().format("%Y-%m-%d")
+        "tool-format-{}-{:03}.jsonl",
+        period_start.format("%Y-%m-%d-%H%M"),
+        sequence
     ))
 }
 
@@ -362,16 +510,17 @@ struct ToolFormatDebugSnapshot {
     repair: ToolFormatRepairSnapshot,
     anomalies: ToolFormatAnomalySnapshot,
     samples: ToolFormatSamples,
+    request_body: ToolFormatRequestBodySnapshot,
     sampling: ToolFormatSamplingSnapshot,
     record_truncated: bool,
 }
 
 impl ToolFormatDebugSnapshot {
-    fn from_event(config: &ToolFormatDebugConfig, event: ToolFormatDebugEvent<'_>) -> Self {
-        let body_sha256 = event
-            .report
-            .and_then(|report| report.body_sha256.clone())
-            .unwrap_or_else(|| short_hash(event.error_message));
+    fn from_event(
+        config: &ToolFormatDebugConfig,
+        event: ToolFormatDebugEvent<'_>,
+        body_sha256: String,
+    ) -> Self {
         let repair = event
             .report
             .map(ToolFormatRepairSnapshot::from)
@@ -394,7 +543,10 @@ impl ToolFormatDebugSnapshot {
             error_reason: "REQUEST_BODY_INVALID",
             error_message_class,
             body: ToolFormatBodySnapshot {
-                final_bytes: event.report.map(|report| report.final_bytes),
+                final_bytes: event
+                    .attempted_body
+                    .map(str::len)
+                    .or_else(|| event.report.map(|report| report.final_bytes)),
                 original_bytes: event.report.map(|report| report.original_bytes),
                 still_oversized: event.report.map(|report| report.still_oversized),
                 body_sha256,
@@ -436,6 +588,7 @@ impl ToolFormatDebugSnapshot {
                     .history_tool_names_missing_from_tools,
             },
             samples,
+            request_body: ToolFormatRequestBodySnapshot::missing(config),
             sampling: ToolFormatSamplingSnapshot {
                 fingerprint,
                 group_key,
@@ -462,6 +615,96 @@ struct ToolFormatBodySnapshot {
     original_bytes: Option<usize>,
     still_oversized: Option<bool>,
     body_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolFormatRequestBodySnapshot {
+    captured: bool,
+    drop_reason: Option<&'static str>,
+    bytes: Option<usize>,
+    max_bytes: usize,
+    sha256: Option<String>,
+    truncated: bool,
+    seen_in_window: u32,
+    limit_in_window: u32,
+    content: Option<String>,
+}
+
+impl ToolFormatRequestBodySnapshot {
+    fn missing(config: &ToolFormatDebugConfig) -> Self {
+        Self {
+            captured: false,
+            drop_reason: Some("missing"),
+            bytes: None,
+            max_bytes: config.max_request_body_bytes,
+            sha256: None,
+            truncated: false,
+            seen_in_window: 0,
+            limit_in_window: config.max_request_body_records_per_window,
+            content: None,
+        }
+    }
+
+    fn from_attempted_body(
+        config: &ToolFormatDebugConfig,
+        attempted_body: Option<&str>,
+        capture: bool,
+        drop_reason: Option<&'static str>,
+        seen_in_window: u32,
+        include_sha256: bool,
+    ) -> Self {
+        let Some(body) = attempted_body else {
+            return Self {
+                seen_in_window,
+                ..Self::missing(config)
+            };
+        };
+        let bytes = body.len();
+        let sha256 = include_sha256.then(|| sha256_hex(body));
+        if !capture {
+            return Self {
+                captured: false,
+                drop_reason: drop_reason.or(Some("not_captured")),
+                bytes: Some(bytes),
+                max_bytes: config.max_request_body_bytes,
+                sha256,
+                truncated: false,
+                seen_in_window,
+                limit_in_window: config.max_request_body_records_per_window,
+                content: None,
+            };
+        }
+
+        let (content, truncated) = truncate_string_to_limit(body, config.max_request_body_bytes);
+        Self {
+            captured: true,
+            drop_reason: None,
+            bytes: Some(bytes),
+            max_bytes: config.max_request_body_bytes,
+            sha256,
+            truncated,
+            seen_in_window,
+            limit_in_window: config.max_request_body_records_per_window,
+            content: Some(content),
+        }
+    }
+
+    fn truncate_content_to(&mut self, max_bytes: usize) {
+        let Some(content) = self.content.as_deref() else {
+            return;
+        };
+        let (content, truncated) = truncate_string_to_limit(content, max_bytes);
+        self.content = Some(content);
+        self.truncated = self.truncated || truncated;
+        self.drop_reason.get_or_insert("record_size_limit");
+    }
+
+    fn drop_content(&mut self, reason: &'static str) {
+        self.content = None;
+        self.captured = false;
+        self.drop_reason = Some(reason);
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -809,6 +1052,37 @@ fn classify_error_message(message: &str) -> &'static str {
     }
 }
 
+fn body_identity_for_sampling(event: &ToolFormatDebugEvent<'_>) -> String {
+    if let Some(body_sha256) = event
+        .report
+        .and_then(|report| report.body_sha256.as_deref())
+    {
+        return body_sha256.to_string();
+    }
+    if let Some(body) = event.attempted_body {
+        return sampled_body_hash(body);
+    }
+    short_hash(event.error_message)
+}
+
+fn sampled_body_hash(body: &str) -> String {
+    let bytes = body.as_bytes();
+    let head_len = bytes.len().min(TOOL_FORMAT_DEBUG_BODY_HASH_SAMPLE_BYTES);
+    let tail_start = bytes
+        .len()
+        .saturating_sub(TOOL_FORMAT_DEBUG_BODY_HASH_SAMPLE_BYTES)
+        .max(head_len);
+
+    let mut hasher = Sha256::new();
+    hasher.update(bytes.len().to_le_bytes());
+    hasher.update(&bytes[..head_len]);
+    if tail_start < bytes.len() {
+        hasher.update(&bytes[tail_start..]);
+    }
+    let digest = hasher.finalize();
+    hex_prefix(&digest, 32)
+}
+
 fn fingerprint(event: &ToolFormatDebugEvent<'_>, body_sha256: &str) -> String {
     short_hash(&format!(
         "{}|{}|{:?}|{}|{}|{}|{}|{}",
@@ -842,6 +1116,44 @@ fn group_key(event: &ToolFormatDebugEvent<'_>, repair: &ToolFormatRepairSnapshot
     ))
 }
 
+fn serialize_snapshot_with_budget(
+    snapshot: &mut ToolFormatDebugSnapshot,
+    max_record_bytes: usize,
+) -> Result<String, serde_json::Error> {
+    let mut line = serde_json::to_string(snapshot)?;
+    if line.len() <= max_record_bytes {
+        return Ok(line);
+    }
+
+    snapshot.samples = ToolFormatSamples::default();
+    snapshot.record_truncated = true;
+    line = serde_json::to_string(snapshot)?;
+    if line.len() <= max_record_bytes {
+        return Ok(line);
+    }
+
+    if snapshot.request_body.content.is_some() {
+        let target_body_bytes = max_record_bytes.saturating_div(2).max(128);
+        snapshot.request_body.truncate_content_to(target_body_bytes);
+        line = serde_json::to_string(snapshot)?;
+        if line.len() <= max_record_bytes {
+            return Ok(line);
+        }
+
+        snapshot.request_body.drop_content("record_size_limit");
+        line = serde_json::to_string(snapshot)?;
+    }
+
+    Ok(line)
+}
+
+fn sha256_hex(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    let digest = hasher.finalize();
+    hex_prefix(&digest, 32)
+}
+
 fn short_hash(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());
@@ -858,16 +1170,23 @@ fn hex_prefix(bytes: &[u8], len: usize) -> String {
 }
 
 fn truncate_string(value: &str, max_bytes: usize) -> String {
+    let (value, truncated) = truncate_string_to_limit(value, max_bytes);
+    if truncated {
+        format!("{value}...")
+    } else {
+        value
+    }
+}
+
+fn truncate_string_to_limit(value: &str, max_bytes: usize) -> (String, bool) {
     if value.len() <= max_bytes {
-        return value.to_string();
+        return (value.to_string(), false);
     }
     let mut end = max_bytes;
     while end > 0 && !value.is_char_boundary(end) {
         end -= 1;
     }
-    let mut truncated = value[..end].to_string();
-    truncated.push_str("...");
-    truncated
+    (value[..end].to_string(), true)
 }
 
 #[cfg(test)]
@@ -922,6 +1241,7 @@ mod tests {
             requested_model: "claude-sonnet-4-6",
             upstream_model: Some("claude-sonnet-4.6"),
             error_message: "400 Bad Request Invalid tool use format REQUEST_BODY_INVALID",
+            attempted_body: None,
             request,
             report: None,
             diagnostics,
@@ -964,8 +1284,8 @@ mod tests {
         }
         .normalized();
         let mut sampler = SamplerState::default();
-        let first = sampler.decide(&config, "fp", "group");
-        let second = sampler.decide(&config, "fp", "group");
+        let first = sampler.decide(&config, "fp", "group", true);
+        let second = sampler.decide(&config, "fp", "group", true);
 
         assert!(first.sampled);
         assert!(!second.sampled);
@@ -981,6 +1301,7 @@ mod tests {
         let snapshot = ToolFormatDebugSnapshot::from_event(
             &ToolFormatDebugConfig::default().normalized(),
             test_event(&request, test_diagnostics()),
+            "test-body-hash".to_string(),
         );
         let json = serde_json::to_string(&snapshot).unwrap();
 
@@ -1019,13 +1340,116 @@ mod tests {
         assert_eq!(second["dropReason"], "fingerprint_limit");
 
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let path = daily_file_path(&dir);
-        let content = fs::read_to_string(&path).await.expect("debug jsonl");
+        let content = read_debug_dir(&dir).await;
         assert!(content.contains("req-test"));
         assert!(content.contains("invalid_tool_use_format"));
         assert!(!content.contains("secret result content"));
         assert!(!content.contains("duplicate secret"));
 
         let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn recorder_captures_attempted_body_only_within_body_limit() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-tool-format-debug-body-test-{}-{}",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
+        let config = ToolFormatDebugConfig {
+            dir: dir.to_string_lossy().to_string(),
+            max_records_per_fingerprint: 10,
+            max_records_per_group: 10,
+            max_records_global: 10,
+            max_record_bytes: 16 * 1024,
+            max_request_body_bytes: 64,
+            max_request_body_records_per_window: 1,
+            ..ToolFormatDebugConfig::default()
+        };
+        let recorder = ToolFormatDebugRecorder::new(config);
+        let request = test_request();
+        let diagnostics = test_diagnostics();
+        let body =
+            r#"{"messages":[{"role":"user","content":"request body content for diagnostics"}]}"#;
+        let event = ToolFormatDebugEvent {
+            request_id: "req-body-1",
+            endpoint: "/cc/v1/messages",
+            stream: false,
+            requested_model: "claude-sonnet-4-6",
+            upstream_model: Some("claude-sonnet-4.6"),
+            error_message: "400 Bad Request Invalid tool use format REQUEST_BODY_INVALID",
+            attempted_body: Some(body),
+            request: &request,
+            report: None,
+            diagnostics,
+        };
+        let first = recorder.record(event).expect("first ref");
+        let second = recorder
+            .record(ToolFormatDebugEvent {
+                request_id: "req-body-2",
+                endpoint: "/cc/v1/messages",
+                stream: false,
+                requested_model: "claude-sonnet-4-6",
+                upstream_model: Some("claude-sonnet-4.6"),
+                error_message: "400 Bad Request Invalid tool use format REQUEST_BODY_INVALID",
+                attempted_body: Some(body),
+                request: &request,
+                report: None,
+                diagnostics,
+            })
+            .expect("second ref");
+
+        assert_eq!(first["sampled"], true);
+        assert_eq!(first["requestBody"]["captured"], true);
+        assert_eq!(second["sampled"], true);
+        assert_eq!(second["requestBody"]["captured"], false);
+        assert_eq!(
+            second["requestBody"]["dropReason"],
+            "request_body_record_limit"
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let content = read_debug_dir(&dir).await;
+        assert!(content.contains("req-body-1"));
+        assert!(content.contains("req-body-2"));
+        assert!(content.contains("request body content for diagnostics"));
+        assert!(content.contains("request_body_record_limit"));
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn writer_state_rolls_when_file_size_budget_would_be_exceeded() {
+        let dir = std::env::temp_dir().join(format!(
+            "kiro-tool-format-debug-roll-test-{}-{}",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
+        let mut state = ToolFormatDebugWriterState::new(dir.clone(), 30 * 60, 10);
+
+        let first = state.path_for_next_record(8).await.expect("first path");
+        state.record_written(8);
+        let second = state.path_for_next_record(8).await.expect("second path");
+
+        assert_ne!(first, second);
+        assert!(first.to_string_lossy().ends_with("-000.jsonl"));
+        assert!(second.to_string_lossy().ends_with("-001.jsonl"));
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    async fn read_debug_dir(dir: &Path) -> String {
+        let mut entries = fs::read_dir(dir).await.expect("debug dir");
+        let mut content = String::new();
+        while let Some(entry) = entries.next_entry().await.expect("debug entry") {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("tool-format-")
+            {
+                content.push_str(&fs::read_to_string(entry.path()).await.expect("debug jsonl"));
+            }
+        }
+        content
     }
 }

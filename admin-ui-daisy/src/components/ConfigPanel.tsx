@@ -1,4 +1,4 @@
-import { BadgeInfo, Copy, Edit3, Eye, EyeOff, Gauge, KeyRound, Plus, Save, Shield, Sparkles, Trash2, Wand2, X, Zap } from 'lucide-react'
+import { Copy, Edit3, Eye, EyeOff, Gauge, KeyRound, Plus, Save, Shield, Sparkles, Trash2, Wand2, X, Zap } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { Alert, Button, Input, Join, Loading, Toggle } from 'react-daisyui'
@@ -8,12 +8,10 @@ import {
   defaultPayloadShaping,
   defaultExternalPoolsConfig,
   defaultPromptCacheCreationControl,
-  definedCacheRouteFromNameInput,
   DFCACHE_ROUTE_PREFIX,
   emptyRuntimeConfig,
   fieldNeedsMax,
   fieldNeedsTarget,
-  getDefinedCacheRouteName,
   inputSamplePolicy,
   normalizeDefinedCacheRoute,
   normalizeDefinedCacheRoutes,
@@ -44,6 +42,7 @@ import type {
   ModelMappingRule,
   ModelResolutionMode,
   PayloadGuardMode,
+  PayloadShapingConfig,
   PromptCacheCreationControlConfig,
   ReportedUsageFieldMode,
   ReportedUsageFieldPolicy,
@@ -61,9 +60,6 @@ type ConfigTab =
   | 'payload'
   | 'payloadHistory'
   | 'payloadFallback'
-  | 'cacheRead'
-  | 'cacheCreate'
-  | 'usage'
   | 'cachePolicy'
   | 'compat'
   | 'stats'
@@ -77,10 +73,7 @@ const configTabs: Array<{ key: ConfigTab; label: string; description: string; ic
   { key: 'payload', label: '大小保护', description: '压缩、阈值和处理时机', icon: <Wand2 className="h-4 w-4" /> },
   { key: 'payloadHistory', label: '旧内容清理', description: '历史消息、工具和网页内容', icon: <Wand2 className="h-4 w-4" /> },
   { key: 'payloadFallback', label: '当前内容兜底', description: '当前消息、文档和图片', icon: <Wand2 className="h-4 w-4" /> },
-  { key: 'cacheRead', label: '缓存命中展示', description: '输入和缓存读取展示口径', icon: <Zap className="h-4 w-4" /> },
-  { key: 'cacheCreate', label: '缓存创建频次', description: '缓存写入展示节奏', icon: <Zap className="h-4 w-4" /> },
-  { key: 'usage', label: '用量展示', description: '不同入口的展示规则', icon: <BadgeInfo className="h-4 w-4" /> },
-  { key: 'cachePolicy', label: '路径缓存策略', description: '按入口覆盖缓存行为', icon: <Zap className="h-4 w-4" /> },
+  { key: 'cachePolicy', label: '缓存策略', description: '默认配置和路径覆盖', icon: <Zap className="h-4 w-4" /> },
   { key: 'compat', label: '兼容与模型', description: '兼容模式和模型映射', icon: <Shield className="h-4 w-4" /> },
   { key: 'stats', label: '后台统计', description: '页面统计判断标准', icon: <Gauge className="h-4 w-4" /> },
 ]
@@ -246,6 +239,8 @@ function normalizeCachePolicyPathPrefix(prefix: string): string | null {
 }
 
 type CacheSimulationPatch = NonNullable<CacheRoutePolicyPatch['simulation']>
+type CachePointPatch = NonNullable<CacheRoutePolicyPatch['cachePoint']>
+type CacheBoundsPatch = NonNullable<CacheRoutePolicyPatch['bounds']>
 
 function defaultSimulationPatch(): CacheSimulationPatch {
   return {
@@ -259,15 +254,58 @@ function defaultSimulationPatch(): CacheSimulationPatch {
   }
 }
 
-function defaultPathCachePatch(): CacheRoutePolicyPatch {
+function defaultCachePointPatch(): CachePointPatch {
+  return {
+    enabled: false,
+    toolsOnly: true,
+    recordPlan: true,
+  }
+}
+
+function defaultBoundsPatch(): CacheBoundsPatch {
+  return {
+    maxEntriesPerAccount: 200,
+    maxEntriesGlobal: 20000,
+    entryTtlSecs: 86400,
+    estimatedBytesLimit: 268435456,
+  }
+}
+
+function defaultUsagePatch(prefix: string): ReportedUsagePathPolicy {
+  return normalizeDefinedCacheRoute(prefix)
+    ? pathPolicy(true, inputSamplePolicy(96), preserveFieldPolicy())
+    : pathPolicy()
+}
+
+function defaultPathCachePatch(prefix: string): CacheRoutePolicyPatch {
   return {
     simulation: defaultSimulationPatch(),
     creationControl: defaultPromptCacheCreationControl(),
+    reportedUsage: defaultUsagePatch(prefix),
+    cachePoint: defaultCachePointPatch(),
+    bounds: defaultBoundsPatch(),
   }
 }
 
 function isEmptyRoutePatch(policy: CacheRoutePolicyPatch): boolean {
   return !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds
+}
+
+function normalizedDefinedRoutesWith(routes: string[], prefix: string, enabled: boolean): string[] {
+  const normalizedRoute = normalizeDefinedCacheRoute(prefix)
+  if (!normalizedRoute) return normalizeDefinedCacheRoutes(routes)
+  const next = routes.filter((route) => normalizeDefinedCacheRoute(route) !== normalizedRoute)
+  if (enabled) next.push(normalizedRoute)
+  return normalizeDefinedCacheRoutes(next)
+}
+
+function moveDefinedRoute(routes: string[], oldPrefix: string, nextPrefix: string): string[] {
+  const oldRoute = normalizeDefinedCacheRoute(oldPrefix)
+  if (!oldRoute || !routes.some((route) => normalizeDefinedCacheRoute(route) === oldRoute)) {
+    return normalizeDefinedCacheRoutes(routes)
+  }
+  const withoutOld = normalizedDefinedRoutesWith(routes, oldPrefix, false)
+  return normalizedDefinedRoutesWith(withoutOld, nextPrefix, Boolean(normalizeDefinedCacheRoute(nextPrefix)))
 }
 
 function SimulationOverrideForm({
@@ -329,21 +367,106 @@ function CreationControlOverrideForm({
   )
 }
 
+function CachePointOverrideForm({
+  value,
+  onChange,
+}: {
+  value: CachePointPatch
+  onChange: (next: CachePointPatch) => void
+}) {
+  const merged = { ...defaultCachePointPatch(), ...value }
+  const set = <K extends keyof CachePointPatch>(key: K) => (nextValue: CachePointPatch[K]) =>
+    onChange({ ...merged, [key]: nextValue })
+
+  return (
+    <div className="space-y-3 rounded-lg border border-base-300 bg-base-100/70 p-4">
+      <ToggleField title="发送真实 cachePoint" description="把带缓存标记的工具发送给 Kiro 上游；上游不接受时会自动去掉后重试一次。" checked={merged.enabled ?? false} onChange={set('enabled')} />
+      <div className="grid gap-3 xl:grid-cols-2">
+        <ToggleField title="只处理工具缓存标记" description="只根据工具上的缓存标记插入 cachePoint，不改写系统消息或历史消息。" checked={merged.toolsOnly ?? true} disabled={!merged.enabled} onChange={set('toolsOnly')} />
+        <ToggleField title="记录 cachePoint 计划" description="在系统日志中记录插入数量，方便排查上游请求体错误。" checked={merged.recordPlan ?? true} disabled={!merged.enabled} onChange={set('recordPlan')} />
+      </div>
+    </div>
+  )
+}
+
+function CacheBoundsOverrideForm({
+  value,
+  onChange,
+}: {
+  value: CacheBoundsPatch
+  onChange: (next: CacheBoundsPatch) => void
+}) {
+  const merged = { ...defaultBoundsPatch(), ...value }
+  const set = <K extends keyof CacheBoundsPatch>(key: K) => (nextValue: CacheBoundsPatch[K]) =>
+    onChange({ ...merged, [key]: nextValue })
+
+  return (
+    <div className="space-y-3 rounded-lg border border-base-300 bg-base-100/70 p-4">
+      <div className="grid gap-3 xl:grid-cols-2">
+        <NumberField title="单账号条目上限" description="当前入口每个账号最多保留多少个可复用缓存指纹。" value={merged.maxEntriesPerAccount ?? 200} min={0} suffix="条" onChange={set('maxEntriesPerAccount')} />
+        <NumberField title="全局条目上限" description="当前入口所有账号合计最多保留多少个缓存指纹。" value={merged.maxEntriesGlobal ?? 20000} min={0} suffix="条" onChange={set('maxEntriesGlobal')} />
+        <NumberField title="最长保留时间" description="当前入口单条缓存指纹最多保留多久。" value={merged.entryTtlSecs ?? 86400} min={1} suffix="秒" onChange={set('entryTtlSecs')} />
+        <NumberField title="估算内存上限" description="当前入口达到估算上限后优先移除最久未使用的缓存指纹。" value={merged.estimatedBytesLimit ?? 268435456} min={0} suffix="字节" onChange={set('estimatedBytesLimit')} />
+      </div>
+    </div>
+  )
+}
+
+function CachePatchBlock({
+  title,
+  description,
+  enabled,
+  onSet,
+  onClear,
+  children,
+}: {
+  title: string
+  description: string
+  enabled: boolean
+  onSet: () => void
+  onClear: () => void
+  children: React.ReactNode
+}) {
+  return (
+    <div className="space-y-3 rounded-lg border border-base-300 bg-base-200/40 p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h4 className="text-sm font-semibold">{title}</h4>
+          <p className="mt-1 text-xs leading-5 text-base-content/60">{description}</p>
+        </div>
+        {enabled ? (
+          <Button type="button" variant="outline" size="xs" onClick={onClear}>清除覆盖</Button>
+        ) : (
+          <Button type="button" variant="outline" size="xs" onClick={onSet}>设置覆盖</Button>
+        )}
+      </div>
+      {enabled && children}
+    </div>
+  )
+}
+
 function PathCachePolicyCard({
   prefix,
   policy,
+  definedRoutes,
   onPrefixChange,
   onDelete,
   onChange,
+  onDefinedRouteChange,
 }: {
   prefix: string
   policy: CacheRoutePolicyPatch
+  definedRoutes: string[]
   onPrefixChange: (nextPrefix: string) => void
   onDelete: () => void
   onChange: (next: CacheRoutePolicyPatch) => void
+  onDefinedRouteChange: (enabled: boolean) => void
 }) {
   const [draftPrefix, setDraftPrefix] = useState(prefix)
   const [prefixError, setPrefixError] = useState<string | null>(null)
+  const normalizedDefinedRoute = normalizeDefinedCacheRoute(prefix)
+  const isDfcachePath = prefix.toLowerCase().startsWith(DFCACHE_ROUTE_PREFIX)
+  const isRouteRegistered = Boolean(normalizedDefinedRoute && definedRoutes.includes(normalizedDefinedRoute))
 
   useEffect(() => {
     setDraftPrefix(prefix)
@@ -366,6 +489,15 @@ function PathCachePolicyCard({
   }
   const setCreationControl = (creationControl?: PromptCacheCreationControlConfig) => {
     onChange({ ...policy, creationControl })
+  }
+  const setReportedUsage = (reportedUsage?: ReportedUsagePathPolicy) => {
+    onChange({ ...policy, reportedUsage })
+  }
+  const setCachePoint = (cachePoint?: CachePointPatch) => {
+    onChange({ ...policy, cachePoint })
+  }
+  const setBounds = (bounds?: CacheBoundsPatch) => {
+    onChange({ ...policy, bounds })
   }
 
   return (
@@ -394,35 +526,74 @@ function PathCachePolicyCard({
         </Button>
       </div>
 
-      <div className="space-y-3 rounded-lg border border-base-300 bg-base-200/40 p-4">
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <h4 className="text-sm font-semibold">高缓存模拟覆盖</h4>
-            <p className="mt-1 text-xs leading-5 text-base-content/60">不设置时沿用通用高缓存配置。</p>
-          </div>
-          {policy.simulation ? (
-            <Button type="button" variant="outline" size="xs" onClick={() => setSimulation(undefined)}>清除覆盖</Button>
-          ) : (
-            <Button type="button" variant="outline" size="xs" onClick={() => setSimulation(defaultSimulationPatch())}>设置覆盖</Button>
-          )}
+      {isDfcachePath && (
+        <div className="rounded-lg border border-base-300 bg-base-200/40 p-4">
+          <ToggleField
+            title="注册为 /dfcache 路由"
+            description={normalizedDefinedRoute ? '开启后允许客户端访问这个 /dfcache/{name} 入口。' : '路径必须是 /dfcache/{name}，name 仅允许小写字母、数字、点、下划线或短横线。'}
+            checked={isRouteRegistered}
+            disabled={!normalizedDefinedRoute}
+            onChange={onDefinedRouteChange}
+          />
         </div>
-        {policy.simulation && <SimulationOverrideForm value={policy.simulation} onChange={setSimulation} />}
-      </div>
+      )}
 
-      <div className="space-y-3 rounded-lg border border-base-300 bg-base-200/40 p-4">
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <h4 className="text-sm font-semibold">缓存创建频次覆盖</h4>
-            <p className="mt-1 text-xs leading-5 text-base-content/60">不设置时沿用通用缓存创建频次。</p>
-          </div>
-          {policy.creationControl ? (
-            <Button type="button" variant="outline" size="xs" onClick={() => setCreationControl(undefined)}>清除覆盖</Button>
-          ) : (
-            <Button type="button" variant="outline" size="xs" onClick={() => setCreationControl(defaultPromptCacheCreationControl())}>设置覆盖</Button>
-          )}
-        </div>
+      <CachePatchBlock
+        title="高缓存模拟"
+        description="不设置时沿用默认策略里的高缓存模拟参数。"
+        enabled={Boolean(policy.simulation)}
+        onSet={() => setSimulation(defaultSimulationPatch())}
+        onClear={() => setSimulation(undefined)}
+      >
+        {policy.simulation && <SimulationOverrideForm value={policy.simulation} onChange={setSimulation} />}
+      </CachePatchBlock>
+
+      <CachePatchBlock
+        title="缓存创建频次"
+        description="不设置时沿用默认策略里的缓存创建频次。"
+        enabled={Boolean(policy.creationControl)}
+        onSet={() => setCreationControl(defaultPromptCacheCreationControl())}
+        onClear={() => setCreationControl(undefined)}
+      >
         {policy.creationControl && <CreationControlOverrideForm value={policy.creationControl} onChange={setCreationControl} />}
-      </div>
+      </CachePatchBlock>
+
+      <CachePatchBlock
+        title="用量展示"
+        description="控制这个路径返回给客户端和后台记录的 input、output、cache read、cache write 口径。"
+        enabled={Boolean(policy.reportedUsage)}
+        onSet={() => setReportedUsage(defaultUsagePatch(prefix))}
+        onClear={() => setReportedUsage(undefined)}
+      >
+        {policy.reportedUsage && (
+          <ReportedUsagePathEditor
+            title={`${prefix || '/'} 用量展示`}
+            description="只影响这个路径前缀匹配到的请求。"
+            value={policy.reportedUsage}
+            onChange={setReportedUsage}
+          />
+        )}
+      </CachePatchBlock>
+
+      <CachePatchBlock
+        title="真实 cachePoint"
+        description="不设置时沿用默认策略里的 cachePoint 开关。"
+        enabled={Boolean(policy.cachePoint)}
+        onSet={() => setCachePoint(defaultCachePointPatch())}
+        onClear={() => setCachePoint(undefined)}
+      >
+        {policy.cachePoint && <CachePointOverrideForm value={policy.cachePoint} onChange={setCachePoint} />}
+      </CachePatchBlock>
+
+      <CachePatchBlock
+        title="缓存边界"
+        description="按路径覆盖缓存指纹条目、保留时间和估算内存上限。"
+        enabled={Boolean(policy.bounds)}
+        onSet={() => setBounds(defaultBoundsPatch())}
+        onClear={() => setBounds(undefined)}
+      >
+        {policy.bounds && <CacheBoundsOverrideForm value={policy.bounds} onChange={setBounds} />}
+      </CachePatchBlock>
     </div>
   )
 }
@@ -431,21 +602,53 @@ function CachePolicyEditor({
   value,
   onChange,
 }: {
-  value: CachePolicyConfig
-  onChange: (value: CachePolicyConfig) => void
+  value: RuntimeConfig
+  onChange: (value: RuntimeConfig) => void
 }) {
   const [newPath, setNewPath] = useState('')
   const [error, setError] = useState<string | null>(null)
-  const paths = Object.keys(value.pathOverrides ?? {}).sort()
+  const cachePolicy = value.cachePolicy
+  const paths = Array.from(new Set([
+    ...Object.keys(cachePolicy.pathOverrides ?? {}),
+    ...Object.keys(value.reportedUsage.pathOverrides ?? {}),
+    ...value.definedCacheRoutes,
+  ])).sort()
+
+  const updateCachePolicy = (
+    nextCachePolicy: CachePolicyConfig,
+    nextReportedUsage = value.reportedUsage,
+    nextDefinedRoutes = value.definedCacheRoutes
+  ) => {
+    onChange({
+      ...value,
+      cachePolicy: nextCachePolicy,
+      reportedUsage: nextReportedUsage,
+      definedCacheRoutes: nextDefinedRoutes,
+    })
+  }
+
+  const setRuntime = <K extends keyof RuntimeConfig>(key: K) => (nextValue: RuntimeConfig[K]) => {
+    onChange({ ...value, [key]: nextValue })
+  }
+
+  const mergedPolicyForPath = (prefix: string): CacheRoutePolicyPatch => ({
+    ...(cachePolicy.pathOverrides?.[prefix] ?? {}),
+    reportedUsage: cachePolicy.pathOverrides?.[prefix]?.reportedUsage ?? value.reportedUsage.pathOverrides[prefix],
+  })
 
   const setPathPolicy = (prefix: string, nextPolicy: CacheRoutePolicyPatch) => {
-    const pathOverrides = { ...(value.pathOverrides ?? {}) }
+    const pathOverrides = { ...(cachePolicy.pathOverrides ?? {}) }
+    const reportedPathOverrides = { ...value.reportedUsage.pathOverrides }
+    delete reportedPathOverrides[prefix]
     if (isEmptyRoutePatch(nextPolicy)) {
       delete pathOverrides[prefix]
     } else {
       pathOverrides[prefix] = nextPolicy
     }
-    onChange({ ...value, pathOverrides })
+    updateCachePolicy(
+      { ...cachePolicy, pathOverrides },
+      { ...value.reportedUsage, pathOverrides: reportedPathOverrides }
+    )
   }
 
   const addPath = () => {
@@ -454,49 +657,134 @@ function CachePolicyEditor({
       setError('请输入路径前缀，例如 /cc 或 /dfcache/team-a')
       return
     }
-    if (value.pathOverrides?.[prefix]) {
+    if (paths.includes(prefix)) {
       setError(`${prefix} 已存在`)
       return
     }
     setError(null)
     setNewPath('')
-    onChange({
-      ...value,
-      pathOverrides: {
-        ...(value.pathOverrides ?? {}),
-        [prefix]: defaultPathCachePatch(),
+    updateCachePolicy(
+      {
+        ...cachePolicy,
+        pathOverrides: {
+          ...(cachePolicy.pathOverrides ?? {}),
+          [prefix]: defaultPathCachePatch(prefix),
+        },
       },
-    })
+      value.reportedUsage,
+      normalizedDefinedRoutesWith(value.definedCacheRoutes, prefix, Boolean(normalizeDefinedCacheRoute(prefix)))
+    )
   }
 
   const renamePath = (oldPrefix: string, nextPrefix: string) => {
     if (oldPrefix === nextPrefix) return
-    if (value.pathOverrides?.[nextPrefix]) {
+    if (paths.includes(nextPrefix)) {
       setError(`${nextPrefix} 已存在`)
       return
     }
-    const pathOverrides = { ...(value.pathOverrides ?? {}) }
-    const policy = pathOverrides[oldPrefix]
+    const pathOverrides = { ...(cachePolicy.pathOverrides ?? {}) }
+    const policy = mergedPolicyForPath(oldPrefix)
     delete pathOverrides[oldPrefix]
-    pathOverrides[nextPrefix] = policy
+    if (!isEmptyRoutePatch(policy)) {
+      pathOverrides[nextPrefix] = policy
+    }
+    const reportedPathOverrides = { ...value.reportedUsage.pathOverrides }
+    delete reportedPathOverrides[oldPrefix]
     setError(null)
-    onChange({ ...value, pathOverrides })
+    updateCachePolicy(
+      { ...cachePolicy, pathOverrides },
+      { ...value.reportedUsage, pathOverrides: reportedPathOverrides },
+      moveDefinedRoute(value.definedCacheRoutes, oldPrefix, nextPrefix)
+    )
   }
 
   const deletePath = (prefix: string) => {
-    const pathOverrides = { ...(value.pathOverrides ?? {}) }
+    const pathOverrides = { ...(cachePolicy.pathOverrides ?? {}) }
     delete pathOverrides[prefix]
-    onChange({ ...value, pathOverrides })
+    const reportedPathOverrides = { ...value.reportedUsage.pathOverrides }
+    delete reportedPathOverrides[prefix]
+    updateCachePolicy(
+      { ...cachePolicy, pathOverrides },
+      { ...value.reportedUsage, pathOverrides: reportedPathOverrides },
+      normalizedDefinedRoutesWith(value.definedCacheRoutes, prefix, false)
+    )
+  }
+
+  const setDefinedRoute = (prefix: string, enabled: boolean) => {
+    updateCachePolicy(cachePolicy, value.reportedUsage, normalizedDefinedRoutesWith(value.definedCacheRoutes, prefix, enabled))
   }
 
   return (
-    <div className="space-y-4">
-      <div className="text-xs leading-5 text-base-content/60">
-        按入口路径覆盖通用高缓存模拟和缓存创建频次。未设置覆盖的入口会继续使用通用配置；路径匹配时使用最长前缀。
+    <div className="space-y-5">
+      <div className="space-y-4 rounded-lg border border-base-300 bg-base-100/70 p-4">
+        <div>
+          <h3 className="text-sm font-semibold">默认缓存策略</h3>
+          <p className="mt-1 text-xs leading-5 text-base-content/60">
+            所有入口先使用这里的默认值；下方路径覆盖按最长前缀匹配后覆盖对应字段。
+          </p>
+        </div>
+        <div className="config-inline-note md:col-span-2">
+          <span className="config-note-label">高缓存模拟</span>
+        </div>
+        <div className="grid gap-3 xl:grid-cols-2">
+          <NumberField title="缓存读取目标比例" description="希望缓存读取量大约占输入量的比例，常用 0.95 到 0.99。" value={value.promptCacheTargetReadRatio} min={0} max={0.99} step={0.01} suffix="比例" onChange={setRuntime('promptCacheTargetReadRatio')} />
+          <NumberField title="输入估算放大倍数" description="用于估算缓存展示时的输入规模，不代表真实请求内容一定变大。" value={value.promptCacheTokenScale} min={1} max={3} step={0.1} suffix="倍" onChange={setRuntime('promptCacheTokenScale')} />
+          <NumberField title="输入展示上限" description="估算后的输入量最高显示到多少。填 0 表示不设上限。" value={value.promptCacheMaxSimulatedInputTokens} min={0} suffix="Token" onChange={setRuntime('promptCacheMaxSimulatedInputTokens')} />
+          <NumberField title="放大启用门槛" description="输入量达到多少后才开始放大估算。" value={value.promptCacheScaleMinInputTokens} min={0} suffix="Token" onChange={setRuntime('promptCacheScaleMinInputTokens')} />
+          <NumberField title="触顶扣减下限" description="达到上限时，至少从上限扣掉多少，避免数值总是贴边。" value={value.promptCacheCapJitterMinTokens} min={0} suffix="Token" onChange={setRuntime('promptCacheCapJitterMinTokens')} />
+          <NumberField title="触顶扣减上限" description="达到上限时，最多从上限扣掉多少。" value={value.promptCacheCapJitterMaxTokens} min={0} suffix="Token" onChange={setRuntime('promptCacheCapJitterMaxTokens')} />
+        </div>
+        <div className="border-t border-base-300" />
+        <div className="config-inline-note md:col-span-2">
+          <span className="config-note-label">缓存边界</span>
+        </div>
+        <div className="grid gap-3 xl:grid-cols-2">
+          <NumberField title="单账号缓存条目上限" description="每个账号最多保留多少个可复用缓存指纹，防止长会话无限增长。" value={value.promptCacheMaxEntriesPerAccount} min={0} suffix="条" onChange={setRuntime('promptCacheMaxEntriesPerAccount')} />
+          <NumberField title="全局缓存条目上限" description="所有账号合计最多保留多少个缓存指纹。填 0 表示不按条目数限制。" value={value.promptCacheMaxEntriesGlobal} min={0} suffix="条" onChange={setRuntime('promptCacheMaxEntriesGlobal')} />
+          <NumberField title="缓存指纹保留时间" description="单条缓存指纹最多保留多久，实际不会超过上游缓存标记的时间。" value={value.promptCacheEntryTtlSecs} min={1} suffix="秒" onChange={setRuntime('promptCacheEntryTtlSecs')} />
+          <NumberField title="缓存估算内存上限" description="达到估算上限后优先移除最久未使用的缓存指纹。填 0 表示不按内存估算限制。" value={value.promptCacheEstimatedBytesLimit} min={0} suffix="字节" onChange={setRuntime('promptCacheEstimatedBytesLimit')} />
+        </div>
+        <div className="border-t border-base-300" />
+        <div className="config-inline-note md:col-span-2">
+          <span className="config-note-label">真实 cachePoint</span>
+        </div>
+        <div className="grid gap-3 xl:grid-cols-2">
+          <ToggleField title="发送真实 cachePoint" description="把带缓存标记的工具发送给 Kiro 上游；上游不接受时会自动去掉后重试一次。" checked={value.kiroCachePointEnabled} onChange={setRuntime('kiroCachePointEnabled')} />
+          <ToggleField title="只处理工具缓存标记" description="只根据工具上的缓存标记插入 cachePoint，不改写系统消息或历史消息。" checked={value.kiroCachePointToolsOnly} disabled={!value.kiroCachePointEnabled} onChange={setRuntime('kiroCachePointToolsOnly')} />
+          <ToggleField title="记录 cachePoint 计划" description="在系统日志中记录插入数量，方便排查上游请求体错误。" checked={value.kiroCachePointRecordPlan} disabled={!value.kiroCachePointEnabled} onChange={setRuntime('kiroCachePointRecordPlan')} />
+        </div>
+        <div className="border-t border-base-300" />
+        <div className="config-inline-note md:col-span-2">
+          <span className="config-note-label">缓存创建频次</span>
+        </div>
+        <div className="grid gap-3 xl:grid-cols-2">
+          <ToggleField title="启用缓存创建频次控制" description="开启后，只影响缓存创建数值的展示频率。" checked={value.promptCacheCreationControl.enabled} onChange={(enabled) => onChange({ ...value, promptCacheCreationControl: { ...value.promptCacheCreationControl, enabled } })} />
+          <FieldLabel title="控制维度" description="选择按账号分别控制，还是按同一个会话和模型统一控制。">
+            <Select bordered size="sm" className="w-full" value={value.promptCacheCreationControl.scopeMode} disabled={!value.promptCacheCreationControl.enabled} onChange={(event) => onChange({ ...value, promptCacheCreationControl: { ...value.promptCacheCreationControl, scopeMode: event.target.value as 'credential_conversation_model' | 'conversation_model' } })}>
+              <Select.Option value="credential_conversation_model">账号 + 会话 + 模型</Select.Option>
+              <Select.Option value="conversation_model">会话 + 模型</Select.Option>
+            </Select>
+          </FieldLabel>
+          <NumberField title="最小成功请求间隔" description="两次缓存创建展示之间至少间隔多少次成功请求。填 0 表示不限制。" value={value.promptCacheCreationControl.minSuccessfulRequestsBetweenCreation} disabled={!value.promptCacheCreationControl.enabled} min={0} suffix="次" onChange={(minSuccessfulRequestsBetweenCreation) => onChange({ ...value, promptCacheCreationControl: { ...value.promptCacheCreationControl, minSuccessfulRequestsBetweenCreation } })} />
+          <NumberField title="最小时间间隔" description="两次缓存创建展示之间至少间隔多少秒。填 0 表示不限制。" value={value.promptCacheCreationControl.minCreationIntervalSecs} disabled={!value.promptCacheCreationControl.enabled} min={0} suffix="秒" onChange={(minCreationIntervalSecs) => onChange({ ...value, promptCacheCreationControl: { ...value.promptCacheCreationControl, minCreationIntervalSecs } })} />
+          <NumberField title="最小累计增量" description="累计变化达到多少后，才允许下一次展示缓存创建数值。" value={value.promptCacheCreationControl.minCreationDeltaTokens} disabled={!value.promptCacheCreationControl.enabled} min={0} suffix="Token" onChange={(minCreationDeltaTokens) => onChange({ ...value, promptCacheCreationControl: { ...value.promptCacheCreationControl, minCreationDeltaTokens } })} />
+          <NumberField title="单次展示上限" description="一次响应最多展示多少缓存创建量。填 0 表示不限制。" value={value.promptCacheCreationControl.maxCreationTokensPerEvent} disabled={!value.promptCacheCreationControl.enabled} min={0} suffix="Token" onChange={(maxCreationTokensPerEvent) => onChange({ ...value, promptCacheCreationControl: { ...value.promptCacheCreationControl, maxCreationTokensPerEvent } })} />
+          <NumberField title="额度窗口长度" description="在这个时间窗口内统计缓存创建展示额度。填 0 表示关闭窗口限制。" value={value.promptCacheCreationControl.creationBudgetWindowSecs} disabled={!value.promptCacheCreationControl.enabled} min={0} suffix="秒" onChange={(creationBudgetWindowSecs) => onChange({ ...value, promptCacheCreationControl: { ...value.promptCacheCreationControl, creationBudgetWindowSecs } })} />
+          <NumberField title="窗口展示额度" description="单个时间窗口内最多展示多少缓存创建量。填 0 表示不限制。" value={value.promptCacheCreationControl.maxCreationTokensPerWindow} disabled={!value.promptCacheCreationControl.enabled} min={0} suffix="Token" onChange={(maxCreationTokensPerWindow) => onChange({ ...value, promptCacheCreationControl: { ...value.promptCacheCreationControl, maxCreationTokensPerWindow } })} />
+          <NumberField title="空闲后清理状态" description="长时间没有请求后清理控制状态。填 0 表示不按空闲时间清理。" value={value.promptCacheCreationControl.expireAfterIdleSecs} disabled={!value.promptCacheCreationControl.enabled} min={0} suffix="秒" onChange={(expireAfterIdleSecs) => onChange({ ...value, promptCacheCreationControl: { ...value.promptCacheCreationControl, expireAfterIdleSecs } })} />
+        </div>
+        <div className="border-t border-base-300" />
+        <ReportedUsagePathEditor
+          title="默认用量展示"
+          description="没有匹配到单独路径策略时，使用这里的默认设置。"
+          value={value.reportedUsage.default}
+          onChange={(defaultPolicy) => onChange({ ...value, reportedUsage: { ...value.reportedUsage, default: defaultPolicy } })}
+        />
       </div>
+
       <div className="space-y-3 rounded-lg border border-base-300 bg-base-100/70 p-4">
         <div className="flex flex-col gap-3 lg:flex-row lg:items-end">
-          <FieldLabel title="新增路径覆盖">
+          <FieldLabel title="新增路径策略">
             <Input
               bordered
               size="sm"
@@ -517,7 +805,7 @@ function CachePolicyEditor({
       {error && <div className="text-xs text-error">{error}</div>}
       {paths.length === 0 ? (
         <div className="rounded-lg border border-dashed border-base-300 p-6 text-sm text-base-content/60">
-          暂无路径覆盖。当前所有入口都会使用通用高缓存配置和通用缓存创建频次。
+          暂无路径覆盖。当前所有入口都会使用默认缓存策略。
         </div>
       ) : (
         <div className="space-y-4">
@@ -525,10 +813,12 @@ function CachePolicyEditor({
             <PathCachePolicyCard
               key={prefix}
               prefix={prefix}
-              policy={value.pathOverrides[prefix]}
+              policy={mergedPolicyForPath(prefix)}
+              definedRoutes={value.definedCacheRoutes}
               onPrefixChange={(nextPrefix) => renamePath(prefix, nextPrefix)}
               onDelete={() => deletePath(prefix)}
               onChange={(nextPolicy) => setPathPolicy(prefix, nextPolicy)}
+              onDefinedRouteChange={(enabled) => setDefinedRoute(prefix, enabled)}
             />
           ))}
         </div>
@@ -1187,7 +1477,6 @@ export function ConfigPanel() {
   const modelCapabilities = useModelCapabilities()
   const [draft, setDraft] = useState<RuntimeConfig>(emptyRuntimeConfig)
   const [activeTab, setActiveTab] = useState<ConfigTab>('access')
-  const [selectedUsagePath, setSelectedUsagePath] = useState('__default')
 
   useEffect(() => {
     if (config.data) {
@@ -1216,7 +1505,7 @@ export function ConfigPanel() {
   const save = () => {
     const invalidDefinedCacheRoute = (draft.definedCacheRoutes || []).find((route) => route.trim() && !normalizeDefinedCacheRoute(route))
     if (invalidDefinedCacheRoute) {
-      toast.error('自定义高缓存路由必须是 /dfcache/{name}，name 只能包含字母、数字、点、下划线或短横线')
+      toast.error('缓存策略里的 /dfcache 路径必须是 /dfcache/{name}，name 只能包含字母、数字、点、下划线或短横线')
       return
     }
     const definedCacheRoutes = normalizeDefinedCacheRoutes(draft.definedCacheRoutes || [])
@@ -1269,16 +1558,7 @@ export function ConfigPanel() {
       promptCacheMaxEntriesGlobal: toWhole(draft.promptCacheMaxEntriesGlobal),
       promptCacheEntryTtlSecs: toWhole(draft.promptCacheEntryTtlSecs, 1),
       promptCacheEstimatedBytesLimit: toWhole(draft.promptCacheEstimatedBytesLimit),
-      reportedUsage: normalizeReportedUsage({
-        ...draft.reportedUsage,
-        pathOverrides: definedCacheRoutes.reduce(
-          (pathOverrides, route) => ({
-            ...pathOverrides,
-            [route]: pathOverrides[route] || pathPolicy(true, inputSamplePolicy(96), preserveFieldPolicy()),
-          }),
-          draft.reportedUsage.pathOverrides
-        ),
-      }),
+      reportedUsage: normalizeReportedUsage(draft.reportedUsage),
       cachePolicy: normalizeCachePolicy(draft.cachePolicy),
       definedCacheRoutes,
       modelMapping: normalizeModelMapping(draft.modelMapping),
@@ -1339,10 +1619,6 @@ export function ConfigPanel() {
       : '发送前会检查请求大小；只有超过阈值时才会处理内容。'
     : '当前未启用大小阈值，因此下面这些按大小触发的处理不会运行。'
   const activeTabMeta = configTabs.find((tab) => tab.key === activeTab) ?? configTabs[0]
-  const reportedUsagePaths = Object.keys(draft.reportedUsage.pathOverrides)
-  const selectedUsageKey = selectedUsagePath === '__default' || draft.reportedUsage.pathOverrides[selectedUsagePath]
-    ? selectedUsagePath
-    : '__default'
   const showRuntimeSave = activeTab !== 'access'
 
   if (config.isLoading) return <div className="py-10 text-center text-base-content/60">加载中...</div>
@@ -1534,270 +1810,22 @@ export function ConfigPanel() {
               <NumberField title="当前文档保留字符" description="单个当前文档最多保留多少字符。" value={draft.payloadShaping.currentDocumentMaxChars} disabled={!payloadShapingBranchEnabled} min={0} suffix="字符" onChange={(currentDocumentMaxChars) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, currentDocumentMaxChars } }))} />
               <ToggleField title="移除当前图片" description="图片太大且请求仍然超限时，可按体积优先移除大图。" checked={draft.payloadShaping.truncateCurrentImages} disabled={!payloadShapingBranchEnabled} onChange={(truncateCurrentImages) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, truncateCurrentImages } }))} />
               <NumberField title="当前图片保留大小" description="当前图片数据最多保留多少字节。" value={draft.payloadShaping.currentImagesMaxBytes} disabled={!payloadShapingBranchEnabled} min={0} suffix="字节" onChange={(currentImagesMaxBytes) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, currentImagesMaxBytes } }))} />
+              <div className="rounded-box border border-base-300 bg-base-100 p-4">
+                <FieldLabel title="单图超 5MB 处理" description="图片超过上游单图限制时，选择移除并给模型占位说明，或直接返回请求错误。">
+                  <Select bordered size="sm" className="w-full" value={draft.payloadShaping.oversizedImageHandling ?? 'drop-with-placeholder'} disabled={!payloadShapingBranchEnabled} onChange={(event) => setDraft((prev) => ({ ...prev, payloadShaping: { ...prev.payloadShaping, oversizedImageHandling: event.target.value as PayloadShapingConfig['oversizedImageHandling'] } }))}>
+                    <Select.Option value="drop-with-placeholder">移除图片并占位</Select.Option>
+                    <Select.Option value="reject">直接报错</Select.Option>
+                  </Select>
+                </FieldLabel>
+              </div>
             </ConfigGroup>
         )}
 
-        {activeTab === 'cacheRead' && (
-          <ConfigGroup icon={<Zap className="h-4 w-4" />} title="缓存命中展示" description="控制页面和响应里展示的缓存用量，让统计更接近预期展示口径。">
-            <NumberField title="缓存读取目标比例" description="希望缓存读取量大约占输入量的比例，常用 0.95 到 0.99。" value={draft.promptCacheTargetReadRatio} min={0} max={0.99} step={0.01} suffix="比例" onChange={(promptCacheTargetReadRatio) => setDraft((prev) => ({ ...prev, promptCacheTargetReadRatio }))} />
-            <NumberField title="输入估算放大倍数" description="用于估算缓存展示时的输入规模，不代表真实请求内容一定变大。" value={draft.promptCacheTokenScale} min={1} max={3} step={0.1} suffix="倍" onChange={(promptCacheTokenScale) => setDraft((prev) => ({ ...prev, promptCacheTokenScale }))} />
-            <NumberField title="输入展示上限" description="估算后的输入量最高显示到多少。填 0 表示不设上限。" value={draft.promptCacheMaxSimulatedInputTokens} min={0} suffix="Token" onChange={(promptCacheMaxSimulatedInputTokens) => setDraft((prev) => ({ ...prev, promptCacheMaxSimulatedInputTokens }))} />
-            <NumberField title="放大启用门槛" description="输入量达到多少后才开始放大估算。" value={draft.promptCacheScaleMinInputTokens} min={0} suffix="Token" onChange={(promptCacheScaleMinInputTokens) => setDraft((prev) => ({ ...prev, promptCacheScaleMinInputTokens }))} />
-            <NumberField title="触顶扣减下限" description="达到上限时，至少从上限扣掉多少，避免数值总是贴边。" value={draft.promptCacheCapJitterMinTokens} min={0} suffix="Token" onChange={(promptCacheCapJitterMinTokens) => setDraft((prev) => ({ ...prev, promptCacheCapJitterMinTokens }))} />
-            <NumberField title="触顶扣减上限" description="达到上限时，最多从上限扣掉多少。" value={draft.promptCacheCapJitterMaxTokens} min={0} suffix="Token" onChange={(promptCacheCapJitterMaxTokens) => setDraft((prev) => ({ ...prev, promptCacheCapJitterMaxTokens }))} />
-            <NumberField title="单账号缓存条目上限" description="每个账号最多保留多少个可复用缓存指纹，防止长会话无限增长。" value={draft.promptCacheMaxEntriesPerAccount} min={0} suffix="条" onChange={(promptCacheMaxEntriesPerAccount) => setDraft((prev) => ({ ...prev, promptCacheMaxEntriesPerAccount }))} />
-            <NumberField title="全局缓存条目上限" description="所有账号合计最多保留多少个缓存指纹。填 0 表示不按条目数限制。" value={draft.promptCacheMaxEntriesGlobal} min={0} suffix="条" onChange={(promptCacheMaxEntriesGlobal) => setDraft((prev) => ({ ...prev, promptCacheMaxEntriesGlobal }))} />
-            <NumberField title="缓存指纹保留时间" description="单条缓存指纹最多保留多久，实际不会超过上游缓存标记的时间。" value={draft.promptCacheEntryTtlSecs} min={1} suffix="秒" onChange={(promptCacheEntryTtlSecs) => setDraft((prev) => ({ ...prev, promptCacheEntryTtlSecs }))} />
-            <NumberField title="缓存估算内存上限" description="达到估算上限后优先移除最久未使用的缓存指纹。填 0 表示不按内存估算限制。" value={draft.promptCacheEstimatedBytesLimit} min={0} suffix="字节" onChange={(promptCacheEstimatedBytesLimit) => setDraft((prev) => ({ ...prev, promptCacheEstimatedBytesLimit }))} />
-            <ToggleField title="发送真实 cachePoint" description="把带缓存标记的工具发送给 Kiro 上游；上游不接受时会自动去掉后重试一次。" checked={draft.kiroCachePointEnabled} onChange={(kiroCachePointEnabled) => setDraft((prev) => ({ ...prev, kiroCachePointEnabled }))} />
-            <ToggleField title="只处理工具缓存标记" description="只根据工具上的缓存标记插入 cachePoint，不改写系统消息或历史消息。" checked={draft.kiroCachePointToolsOnly} disabled={!draft.kiroCachePointEnabled} onChange={(kiroCachePointToolsOnly) => setDraft((prev) => ({ ...prev, kiroCachePointToolsOnly }))} />
-            <ToggleField title="记录 cachePoint 计划" description="在系统日志中记录插入数量，方便排查上游请求体错误。" checked={draft.kiroCachePointRecordPlan} disabled={!draft.kiroCachePointEnabled} onChange={(kiroCachePointRecordPlan) => setDraft((prev) => ({ ...prev, kiroCachePointRecordPlan }))} />
-          </ConfigGroup>
-        )}
-
-        {activeTab === 'cacheCreate' && (
-          <ConfigGroup icon={<Gauge className="h-4 w-4" />} title="缓存创建频次" description="控制缓存创建数值出现的频率，避免展示结果过于频繁或过大。">
-            <ToggleField title="启用缓存创建频次控制" description="开启后，只影响缓存创建数值的展示频率。" checked={draft.promptCacheCreationControl.enabled} onChange={(enabled) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, enabled } }))} />
-            <FieldLabel title="控制维度" description="选择按账号分别控制，还是按同一个会话和模型统一控制。">
-              <Select bordered size="sm" className="w-full" value={draft.promptCacheCreationControl.scopeMode} disabled={!draft.promptCacheCreationControl.enabled} onChange={(event) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, scopeMode: event.target.value as 'credential_conversation_model' | 'conversation_model' } }))}>
-                <Select.Option value="credential_conversation_model">账号 + 会话 + 模型</Select.Option>
-                <Select.Option value="conversation_model">会话 + 模型</Select.Option>
-              </Select>
-            </FieldLabel>
-            <NumberField title="最小成功请求间隔" description="两次缓存创建展示之间至少间隔多少次成功请求。填 0 表示不限制。" value={draft.promptCacheCreationControl.minSuccessfulRequestsBetweenCreation} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="次" onChange={(minSuccessfulRequestsBetweenCreation) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, minSuccessfulRequestsBetweenCreation } }))} />
-            <NumberField title="最小时间间隔" description="两次缓存创建展示之间至少间隔多少秒。填 0 表示不限制。" value={draft.promptCacheCreationControl.minCreationIntervalSecs} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="秒" onChange={(minCreationIntervalSecs) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, minCreationIntervalSecs } }))} />
-            <NumberField title="最小累计增量" description="累计变化达到多少后，才允许下一次展示缓存创建数值。" value={draft.promptCacheCreationControl.minCreationDeltaTokens} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="Token" onChange={(minCreationDeltaTokens) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, minCreationDeltaTokens } }))} />
-            <NumberField title="单次展示上限" description="一次响应最多展示多少缓存创建量。填 0 表示不限制。" value={draft.promptCacheCreationControl.maxCreationTokensPerEvent} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="Token" onChange={(maxCreationTokensPerEvent) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, maxCreationTokensPerEvent } }))} />
-            <NumberField title="额度窗口长度" description="在这个时间窗口内统计缓存创建展示额度。填 0 表示关闭窗口限制。" value={draft.promptCacheCreationControl.creationBudgetWindowSecs} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="秒" onChange={(creationBudgetWindowSecs) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, creationBudgetWindowSecs } }))} />
-            <NumberField title="窗口展示额度" description="单个时间窗口内最多展示多少缓存创建量。填 0 表示不限制。" value={draft.promptCacheCreationControl.maxCreationTokensPerWindow} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="Token" onChange={(maxCreationTokensPerWindow) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, maxCreationTokensPerWindow } }))} />
-            <NumberField title="空闲后清理状态" description="长时间没有请求后清理控制状态。填 0 表示不按空闲时间清理。" value={draft.promptCacheCreationControl.expireAfterIdleSecs} disabled={!draft.promptCacheCreationControl.enabled} min={0} suffix="秒" onChange={(expireAfterIdleSecs) => setDraft((prev) => ({ ...prev, promptCacheCreationControl: { ...prev.promptCacheCreationControl, expireAfterIdleSecs } }))} />
-          </ConfigGroup>
-        )}
-
-        {activeTab === 'usage' && (
-          <ConfigGroup icon={<BadgeInfo className="h-4 w-4" />} title="用量展示规则" description="按不同入口设置看到的输入、输出和缓存用量。只影响展示口径，不改变实际请求内容。">
-            <div className="md:col-span-2 space-y-3 rounded-lg border border-base-300 bg-base-200/40 p-3">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <div className="text-sm font-semibold">自定义高缓存路由</div>
-                  <div className="mt-1 text-xs leading-5 text-base-content/60">
-                    只需要填写 /dfcache/ 后面的名称。未在这里定义的 /dfcache/* 请求会直接报错。
-                  </div>
-                </div>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() =>
-                    setDraft((prev) => {
-                      let index = prev.definedCacheRoutes.length + 1
-                      let route = `${DFCACHE_ROUTE_PREFIX}route-${index}`
-                      const existing = new Set(prev.definedCacheRoutes)
-                      while (existing.has(route)) {
-                        index += 1
-                        route = `${DFCACHE_ROUTE_PREFIX}route-${index}`
-                      }
-                      return {
-                        ...prev,
-                        definedCacheRoutes: [...prev.definedCacheRoutes, route],
-                        reportedUsage: {
-                          ...prev.reportedUsage,
-                          pathOverrides: {
-                            ...prev.reportedUsage.pathOverrides,
-                            [route]: prev.reportedUsage.pathOverrides[route] || pathPolicy(true, inputSamplePolicy(96), preserveFieldPolicy()),
-                          },
-                        },
-                      }
-                    })
-                  }
-                >
-                  <Plus className="h-4 w-4" />
-                  添加路由
-                </Button>
-              </div>
-              {draft.definedCacheRoutes.length === 0 ? (
-                <div className="rounded-md border border-dashed border-base-300 px-3 py-3 text-sm text-base-content/60">
-                  暂未定义自定义路由。
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  {draft.definedCacheRoutes.map((route, index) => (
-                    <div key={`${route}-${index}`} className="flex items-center gap-2">
-                      <div className="flex min-w-0 flex-1 overflow-hidden rounded-md border border-base-300 bg-base-100 focus-within:ring-2 focus-within:ring-primary">
-                        <span className="inline-flex h-10 shrink-0 select-none items-center border-r border-base-300 bg-base-200/60 px-3 font-mono text-sm text-base-content/60">
-                          {DFCACHE_ROUTE_PREFIX}
-                        </span>
-                        <input
-                          className="h-10 min-w-0 flex-1 border-0 bg-transparent px-3 font-mono text-sm focus:outline-none"
-                          value={getDefinedCacheRouteName(route)}
-                          placeholder="cc"
-                          onChange={(event) => {
-                            const nextRoute = definedCacheRouteFromNameInput(event.target.value)
-                            setDraft((prev) => {
-                              const definedCacheRoutes = [...prev.definedCacheRoutes]
-                              const previousRoute = definedCacheRoutes[index]
-                              definedCacheRoutes[index] = nextRoute
-                              const pathOverrides = { ...prev.reportedUsage.pathOverrides }
-                              const normalizedPrevious = normalizeDefinedCacheRoute(previousRoute)
-                              const normalizedNext = normalizeDefinedCacheRoute(nextRoute)
-                              if (normalizedPrevious && pathOverrides[normalizedPrevious] && normalizedNext && !pathOverrides[normalizedNext]) {
-                                pathOverrides[normalizedNext] = pathOverrides[normalizedPrevious]
-                                delete pathOverrides[normalizedPrevious]
-                              }
-                              return {
-                                ...prev,
-                                definedCacheRoutes,
-                                reportedUsage: { ...prev.reportedUsage, pathOverrides },
-                              }
-                            })
-                          }}
-                        />
-                      </div>
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        shape="square"
-                        title="删除路由"
-                        onClick={() =>
-                          setDraft((prev) => {
-                            const routeToDelete = prev.definedCacheRoutes[index]
-                            const definedCacheRoutes = prev.definedCacheRoutes.filter((_, itemIndex) => itemIndex !== index)
-                            const pathOverrides = { ...prev.reportedUsage.pathOverrides }
-                            const normalized = normalizeDefinedCacheRoute(routeToDelete)
-                            if (normalized) {
-                              delete pathOverrides[normalized]
-                            }
-                            return {
-                              ...prev,
-                              definedCacheRoutes,
-                              reportedUsage: { ...prev.reportedUsage, pathOverrides },
-                            }
-                          })
-                        }
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </Button>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-            <div className="reported-usage-layout md:col-span-2">
-              <div className="reported-usage-list" role="tablist" aria-label="用量展示规则入口">
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={selectedUsageKey === '__default'}
-                  className={`reported-usage-item ${selectedUsageKey === '__default' ? 'is-active' : ''}`}
-                  onClick={() => setSelectedUsagePath('__default')}
-                >
-                  <span className="font-semibold">默认规则</span>
-                  <span>未匹配入口时使用</span>
-                </button>
-                {reportedUsagePaths.map((prefix) => (
-                  <button
-                    key={prefix}
-                    type="button"
-                    role="tab"
-                    aria-selected={selectedUsageKey === prefix}
-                    className={`reported-usage-item ${selectedUsageKey === prefix ? 'is-active' : ''}`}
-                    onClick={() => setSelectedUsagePath(prefix)}
-                  >
-                    <span className="font-semibold">{prefix || '/'}</span>
-                    <span>{draft.reportedUsage.pathOverrides[prefix]?.enabled ? '已启用' : '已关闭'}</span>
-                  </button>
-                ))}
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => {
-                    let index = 1
-                    let prefix = '/new'
-                    while (draft.reportedUsage.pathOverrides[prefix]) {
-                      index += 1
-                      prefix = `/new-${index}`
-                    }
-                    setDraft((prev) => {
-                      return {
-                        ...prev,
-                        reportedUsage: {
-                          ...prev.reportedUsage,
-                          pathOverrides: { ...prev.reportedUsage.pathOverrides, [prefix]: pathPolicy() },
-                        },
-                      }
-                    })
-                    setSelectedUsagePath(prefix)
-                  }}
-                >
-                  添加入口规则
-                </Button>
-              </div>
-
-              <div className="reported-usage-detail">
-                {selectedUsageKey === '__default' ? (
-                  <ReportedUsagePathEditor
-                    title="默认展示规则"
-                    description="没有匹配到单独入口规则时，使用这里的默认设置。"
-                    value={draft.reportedUsage.default}
-                    onChange={(defaultPolicy) => setDraft((prev) => ({ ...prev, reportedUsage: { ...prev.reportedUsage, default: defaultPolicy } }))}
-                  />
-                ) : (
-                  <div className="space-y-3">
-                    <FieldLabel title="入口前缀" description="只影响匹配这个前缀的入口。不同前缀互相独立。">
-                      <Input
-                        bordered
-                        size="sm"
-                        value={selectedUsageKey}
-                        onChange={(event) => {
-                          const nextPrefix = event.target.value
-                          setDraft((prev) => {
-                            const policy = prev.reportedUsage.pathOverrides[selectedUsageKey]
-                            if (!policy) return prev
-                            const pathOverrides = { ...prev.reportedUsage.pathOverrides }
-                            delete pathOverrides[selectedUsageKey]
-                            pathOverrides[nextPrefix] = policy
-                            return { ...prev, reportedUsage: { ...prev.reportedUsage, pathOverrides } }
-                          })
-                          setSelectedUsagePath(nextPrefix)
-                        }}
-                      />
-                    </FieldLabel>
-                    <ReportedUsagePathEditor
-                      title={`${selectedUsageKey || '/'} 单独规则`}
-                      description="只影响匹配这个入口的用量展示。关闭后使用服务返回值或默认展示规则。"
-                      value={draft.reportedUsage.pathOverrides[selectedUsageKey]}
-                      onDelete={() => {
-                        setDraft((prev) => {
-                          const pathOverrides = { ...prev.reportedUsage.pathOverrides }
-                          delete pathOverrides[selectedUsageKey]
-                          return { ...prev, reportedUsage: { ...prev.reportedUsage, pathOverrides } }
-                        })
-                        setSelectedUsagePath('__default')
-                      }}
-                      onChange={(nextPolicy) =>
-                        setDraft((prev) => ({
-                          ...prev,
-                          reportedUsage: {
-                            ...prev.reportedUsage,
-                            pathOverrides: { ...prev.reportedUsage.pathOverrides, [selectedUsageKey]: nextPolicy },
-                          },
-                        }))
-                      }
-                    />
-                  </div>
-                )}
-              </div>
-            </div>
-          </ConfigGroup>
-        )}
-
         {activeTab === 'cachePolicy' && (
-          <ConfigGroup icon={<Zap className="h-4 w-4" />} title="路径级缓存策略" description="按入口前缀覆盖高缓存模拟、缓存创建频次、路径级 usage 上报改写、真实 cachePoint 和缓存边界。">
+          <ConfigGroup icon={<Zap className="h-4 w-4" />} title="缓存策略" description="默认缓存策略和路径覆盖在这里统一维护。">
             <CachePolicyEditor
-              value={draft.cachePolicy}
-              onChange={(cachePolicy) => setDraft((prev) => ({ ...prev, cachePolicy }))}
+              value={draft}
+              onChange={setDraft}
             />
           </ConfigGroup>
         )}

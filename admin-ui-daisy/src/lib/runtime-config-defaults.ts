@@ -90,6 +90,7 @@ export function defaultPayloadShaping(): PayloadShapingConfig {
     currentDocumentMaxChars: 80000,
     truncateCurrentImages: false,
     currentImagesMaxBytes: 180000,
+    oversizedImageHandling: 'drop-with-placeholder',
   }
 }
 
@@ -392,6 +393,7 @@ export function normalizePayloadShaping(config: PayloadShapingConfig): PayloadSh
     currentUserContentMaxChars: toWhole(config.currentUserContentMaxChars),
     currentDocumentMaxChars: toWhole(config.currentDocumentMaxChars),
     currentImagesMaxBytes: toWhole(config.currentImagesMaxBytes),
+    oversizedImageHandling: config.oversizedImageHandling ?? 'drop-with-placeholder',
   }
 }
 

@@ -51,6 +51,14 @@ pub struct CompressionConfig {
 ///
 /// 该配置只处理旧历史和可安全压缩的冗余内容；默认不截断当前用户消息、
 /// 当前合法 tool_result、当前 document/PDF 或当前图片。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum OversizedImageHandling {
+    #[default]
+    DropWithPlaceholder,
+    Reject,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PayloadShapingConfig {
@@ -116,6 +124,9 @@ pub struct PayloadShapingConfig {
 
     #[serde(default = "default_current_images_max_bytes")]
     pub current_images_max_bytes: usize,
+
+    #[serde(default)]
+    pub oversized_image_handling: OversizedImageHandling,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +162,21 @@ pub struct ToolFormatDebugConfig {
     /// 诊断字段中的字符串最大字节数。
     #[serde(default = "default_tool_format_debug_max_string_bytes")]
     pub max_string_bytes: usize,
+    /// 是否在采样命中的 tool-use 格式错误诊断中记录实际发送失败的 Kiro 请求体。
+    #[serde(default = "default_tool_format_debug_capture_request_body")]
+    pub capture_request_body: bool,
+    /// 单条诊断中最多保留多少字节的请求体内容。
+    #[serde(default = "default_tool_format_debug_max_request_body_bytes")]
+    pub max_request_body_bytes: usize,
+    /// 同一限流窗口内最多有多少条诊断可以包含请求体内容。
+    #[serde(default = "default_tool_format_debug_max_request_body_records_per_window")]
+    pub max_request_body_records_per_window: u32,
+    /// 诊断文件按时间滚动的间隔秒数。
+    #[serde(default = "default_tool_format_debug_roll_interval_secs")]
+    pub roll_interval_secs: u64,
+    /// 单个诊断文件最大字节数，超过后在同一时间分片内递增序号滚动。
+    #[serde(default = "default_tool_format_debug_max_file_bytes")]
+    pub max_file_bytes: u64,
 }
 
 impl Default for ToolFormatDebugConfig {
@@ -166,12 +192,25 @@ impl Default for ToolFormatDebugConfig {
             max_records_per_group: default_tool_format_debug_max_records_per_group(),
             max_records_global: default_tool_format_debug_max_records_global(),
             max_string_bytes: default_tool_format_debug_max_string_bytes(),
+            capture_request_body: default_tool_format_debug_capture_request_body(),
+            max_request_body_bytes: default_tool_format_debug_max_request_body_bytes(),
+            max_request_body_records_per_window:
+                default_tool_format_debug_max_request_body_records_per_window(),
+            roll_interval_secs: default_tool_format_debug_roll_interval_secs(),
+            max_file_bytes: default_tool_format_debug_max_file_bytes(),
         }
     }
 }
 
 impl ToolFormatDebugConfig {
     pub fn normalized(&self) -> Self {
+        let max_record_bytes = self.max_record_bytes.clamp(1024, 1024 * 1024);
+        let max_buffered_records_by_bytes = ((64 * 1024 * 1024) / max_record_bytes).max(1);
+        let channel_capacity = self
+            .channel_capacity
+            .clamp(1, 1024)
+            .min(max_buffered_records_by_bytes);
+
         Self {
             enabled: self.enabled,
             dir: if self.dir.trim().is_empty() {
@@ -179,14 +218,21 @@ impl ToolFormatDebugConfig {
             } else {
                 self.dir.trim().to_string()
             },
-            channel_capacity: self.channel_capacity.clamp(1, 65_536),
-            max_record_bytes: self.max_record_bytes.clamp(1024, 256 * 1024),
+            channel_capacity,
+            max_record_bytes,
             max_samples_per_kind: self.max_samples_per_kind.min(100),
             window_secs: self.window_secs.clamp(1, 86_400),
-            max_records_per_fingerprint: self.max_records_per_fingerprint.min(10_000),
-            max_records_per_group: self.max_records_per_group.min(100_000),
-            max_records_global: self.max_records_global.min(1_000_000),
+            max_records_per_fingerprint: self.max_records_per_fingerprint.min(1_000),
+            max_records_per_group: self.max_records_per_group.min(10_000),
+            max_records_global: self.max_records_global.min(10_000),
             max_string_bytes: self.max_string_bytes.clamp(32, 4096),
+            capture_request_body: self.capture_request_body,
+            max_request_body_bytes: normalize_tool_format_debug_request_body_bytes(
+                self.max_request_body_bytes,
+            ),
+            max_request_body_records_per_window: self.max_request_body_records_per_window.min(100),
+            roll_interval_secs: self.roll_interval_secs.clamp(60, 86_400),
+            max_file_bytes: normalize_tool_format_debug_max_file_bytes(self.max_file_bytes),
         }
     }
 }
@@ -236,6 +282,8 @@ pub struct PayloadShapingConfigPatch {
     pub truncate_current_images: Option<bool>,
     #[serde(default)]
     pub current_images_max_bytes: Option<usize>,
+    #[serde(default)]
+    pub oversized_image_handling: Option<OversizedImageHandling>,
 }
 
 impl PayloadShapingConfigPatch {
@@ -302,6 +350,9 @@ impl PayloadShapingConfigPatch {
         }
         if let Some(value) = self.current_images_max_bytes {
             config.current_images_max_bytes = value;
+        }
+        if let Some(value) = self.oversized_image_handling {
+            config.oversized_image_handling = value;
         }
         config
     }
@@ -1280,6 +1331,7 @@ impl Default for PayloadShapingConfig {
             current_document_max_chars: default_current_document_max_chars(),
             truncate_current_images: false,
             current_images_max_bytes: default_current_images_max_bytes(),
+            oversized_image_handling: OversizedImageHandling::default(),
         }
     }
 }
@@ -2505,11 +2557,11 @@ fn default_tool_format_debug_dir() -> String {
 }
 
 fn default_tool_format_debug_channel_capacity() -> usize {
-    1024
+    128
 }
 
 fn default_tool_format_debug_max_record_bytes() -> usize {
-    8 * 1024
+    512 * 1024
 }
 
 fn default_tool_format_debug_max_samples_per_kind() -> usize {
@@ -2534,6 +2586,42 @@ fn default_tool_format_debug_max_records_global() -> u32 {
 
 fn default_tool_format_debug_max_string_bytes() -> usize {
     256
+}
+
+fn default_tool_format_debug_capture_request_body() -> bool {
+    true
+}
+
+fn default_tool_format_debug_max_request_body_bytes() -> usize {
+    384 * 1024
+}
+
+fn default_tool_format_debug_max_request_body_records_per_window() -> u32 {
+    20
+}
+
+fn default_tool_format_debug_roll_interval_secs() -> u64 {
+    30 * 60
+}
+
+fn default_tool_format_debug_max_file_bytes() -> u64 {
+    100 * 1024 * 1024
+}
+
+fn normalize_tool_format_debug_request_body_bytes(value: usize) -> usize {
+    if value == 0 {
+        0
+    } else {
+        value.clamp(1024, 2 * 1024 * 1024)
+    }
+}
+
+fn normalize_tool_format_debug_max_file_bytes(value: u64) -> u64 {
+    if value == 0 {
+        default_tool_format_debug_max_file_bytes()
+    } else {
+        value.clamp(1024 * 1024, 1024 * 1024 * 1024)
+    }
 }
 
 fn default_high_cache_threshold() -> i32 {
@@ -2860,6 +2948,7 @@ impl Config {
         .normalized()
     }
 
+    #[cfg(test)]
     pub fn cache_policy_for_path(&self, path: &str) -> ResolvedCacheRoutePolicy {
         resolve_cache_policy_for_path(
             self.legacy_cache_route_policy_default(),
@@ -3418,6 +3507,7 @@ mod tests {
             current_document_max_chars: 99_000,
             truncate_current_images: false,
             current_images_max_bytes: 111_000,
+            oversized_image_handling: OversizedImageHandling::DropWithPlaceholder,
         };
 
         let patch: PayloadShapingConfigPatch = serde_json::from_value(serde_json::json!({
@@ -3434,6 +3524,31 @@ mod tests {
         assert_eq!(merged.historical_tool_result_max_chars, 12_345);
         assert_eq!(merged.tool_definitions_budget_bytes, 44_000);
         assert_eq!(merged.current_images_max_bytes, 111_000);
+        assert_eq!(
+            merged.oversized_image_handling,
+            OversizedImageHandling::DropWithPlaceholder
+        );
+    }
+
+    #[test]
+    fn tool_format_debug_normalization_caps_buffer_memory() {
+        let config = ToolFormatDebugConfig {
+            channel_capacity: 65_536,
+            max_record_bytes: 4 * 1024 * 1024,
+            max_records_per_fingerprint: u32::MAX,
+            max_records_per_group: u32::MAX,
+            max_records_global: u32::MAX,
+            max_request_body_records_per_window: u32::MAX,
+            ..ToolFormatDebugConfig::default()
+        }
+        .normalized();
+
+        assert_eq!(config.max_record_bytes, 1024 * 1024);
+        assert_eq!(config.channel_capacity, 64);
+        assert_eq!(config.max_records_per_fingerprint, 1_000);
+        assert_eq!(config.max_records_per_group, 10_000);
+        assert_eq!(config.max_records_global, 10_000);
+        assert_eq!(config.max_request_body_records_per_window, 100);
     }
 
     #[test]
