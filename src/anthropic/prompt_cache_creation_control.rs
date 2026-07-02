@@ -14,23 +14,15 @@ pub struct PromptCacheCreationController {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CreationControlKey {
-    credential_id: Option<u64>,
     conversation_id: String,
-    model: String,
     route_namespace: Option<String>,
 }
 
 impl CreationControlKey {
     fn from_scope(scope: &PromptCacheScope, mode: PromptCacheCreationControlScopeMode) -> Self {
+        let _ = mode;
         Self {
-            credential_id: match mode {
-                PromptCacheCreationControlScopeMode::CredentialConversationModel => {
-                    Some(scope.credential_id)
-                }
-                PromptCacheCreationControlScopeMode::ConversationModel => None,
-            },
             conversation_id: scope.conversation_id.clone(),
-            model: scope.model.clone(),
             route_namespace: scope.route_namespace.clone(),
         }
     }
@@ -140,11 +132,7 @@ impl PromptCacheCreationController {
     }
 
     pub fn clear_credential(&self, credential_id: u64) {
-        self.states.lock().retain(|scope, _| {
-            scope
-                .credential_id
-                .is_none_or(|scope_credential_id| scope_credential_id != credential_id)
-        });
+        let _ = credential_id;
     }
 }
 
@@ -296,12 +284,7 @@ mod tests {
     use super::*;
 
     fn scope() -> PromptCacheScope {
-        PromptCacheScope {
-            credential_id: 7,
-            conversation_id: "conversation-a".to_string(),
-            model: "claude-sonnet-4.6".to_string(),
-            route_namespace: None,
-        }
+        PromptCacheScope::new("conversation-a".to_string(), None)
     }
 
     fn usage(creation: i32) -> CacheUsage {
@@ -429,8 +412,7 @@ mod tests {
         let mut config = enabled_config();
         config.scope_mode = PromptCacheCreationControlScopeMode::ConversationModel;
         let first_scope = scope();
-        let mut second_scope = scope();
-        second_scope.credential_id = 8;
+        let second_scope = scope();
 
         let first = controller.apply_success(Some(&first_scope), config, usage(20_000));
         let second = controller.apply_success(Some(&second_scope), config, usage(12_000));
@@ -441,18 +423,18 @@ mod tests {
     }
 
     #[test]
-    fn credential_conversation_model_scope_keeps_credentials_independent() {
+    fn legacy_credential_conversation_model_scope_is_session_scoped() {
         let controller = PromptCacheCreationController::default();
         let config = enabled_config();
         let first_scope = scope();
-        let mut second_scope = scope();
-        second_scope.credential_id = 8;
+        let second_scope = scope();
 
         let first = controller.apply_success(Some(&first_scope), config, usage(20_000));
         let second = controller.apply_success(Some(&second_scope), config, usage(12_000));
 
         assert_eq!(first.cache_creation_input_tokens, 20_000);
-        assert_eq!(second.cache_creation_input_tokens, 12_000);
+        assert_eq!(second.cache_creation_input_tokens, 0);
+        assert_eq!(second.input_tokens, 22_000);
     }
 
     #[test]

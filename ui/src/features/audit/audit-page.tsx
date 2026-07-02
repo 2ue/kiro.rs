@@ -185,14 +185,14 @@ function AuditDetailModal({ record, open, onClose }: { record: AdminAuditLogRow 
         {record.errorMessage && (
           <div>
             <div className="mb-1 text-xs font-semibold text-destructive">错误信息</div>
-            <pre className="scrollbar-thin max-h-32 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-muted p-3 text-xs">
+            <pre className="scrollbar-thin max-h-32 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-muted p-3 text-xs">
               {record.errorMessage}
             </pre>
           </div>
         )}
         <div>
           <div className="mb-1 text-xs font-semibold text-muted-foreground">详情</div>
-          <pre className="scrollbar-thin max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-muted p-3 font-mono text-xs">
+          <pre className="scrollbar-thin max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-muted p-3 font-mono text-xs">
             {detailText(record.detail)}
           </pre>
         </div>
@@ -276,7 +276,7 @@ export function AuditPage() {
           </Toolbar>
 
           {showFilters && (
-            <div className="mt-2 rounded-lg border border-border bg-muted/40 p-3">
+            <div className="mt-2 rounded-lg bg-muted/30 p-3">
               <div className="grid gap-2 sm:grid-cols-3">
                 <Select value={categoryFilter} onValueChange={(v) => { setCategoryFilter(v); setPage(1) }}>
                   <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
@@ -375,7 +375,7 @@ export function AuditPage() {
               </Table>
             </div>
 
-            <div className="border-t border-border px-4 py-3">
+            <div className="px-4 py-3">
               <div className="flex items-center justify-center gap-3">
                 <Button variant="outline" size="sm" disabled={page === 1 || pending} onClick={() => setPage((v) => Math.max(1, v - 1))}>
                   上一页

@@ -10,7 +10,7 @@ export function Toaster(props: ToasterProps) {
       closeButton
       toastOptions={{
         classNames: {
-          toast: 'group rounded-lg border border-border bg-card text-card-foreground shadow-lg',
+          toast: 'group rounded-lg bg-card text-card-foreground shadow-lg',
           description: 'text-muted-foreground',
           actionButton: 'bg-primary text-primary-foreground',
           cancelButton: 'bg-muted text-muted-foreground',

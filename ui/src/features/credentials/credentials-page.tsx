@@ -562,7 +562,7 @@ export function CredentialsPage() {
         />
         <button
           type="button"
-          className="relative flex min-h-[6.5rem] flex-col justify-between overflow-hidden rounded-xl border border-border bg-card p-4 shadow-sm transition-colors hover:border-primary/60 focus:outline-none focus:ring-2 focus:ring-primary/30 text-left"
+          className="relative flex min-h-[6.5rem] flex-col justify-between overflow-hidden rounded-xl bg-card p-4 shadow-sm transition-colors hover:shadow-md focus:outline-none focus:ring-2 focus:ring-primary/30 text-left"
           onClick={openCreditDetails}
           title="查看积分明细"
         >
@@ -630,7 +630,7 @@ export function CredentialsPage() {
 
         {/* Filter Panel */}
         {showFilters && (
-          <div className="mb-3 rounded-lg border border-border bg-muted/40 p-3 animate-in fade-in-0 duration-150">
+          <div className="mb-3 rounded-lg bg-muted/30 p-3 animate-in fade-in-0 duration-150">
             <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
               <Select value={statusFilter} onValueChange={setStatusFilter}>
                 <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
@@ -693,7 +693,7 @@ export function CredentialsPage() {
 
         {/* Batch actions bar */}
         {selectedIds.size > 0 && (
-          <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 animate-in fade-in slide-in-from-top-2 duration-150">
+          <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg bg-primary/5 px-3 py-2 animate-in fade-in slide-in-from-top-2 duration-150">
             <Badge tone="primary">已选 {selectedIds.size}</Badge>
             <Button variant="outline" size="xs" onClick={batchVerify}>
               <CheckCircle2 className="h-3.5 w-3.5" />验活
@@ -829,10 +829,10 @@ export function CredentialsPage() {
         {creditDetailsLoading ? (
           <LoadingState text="加载积分明细..." />
         ) : creditDetailRows.length > 0 ? (
-          <div className="overflow-hidden rounded-lg border border-border">
+          <div className="overflow-hidden rounded-lg bg-card shadow-sm">
             <div className="max-h-[60vh] overflow-auto">
               <table className="w-full text-sm">
-                <thead className="sticky top-0 z-10 bg-card border-b border-border">
+                <thead className="sticky top-0 z-10 bg-card">
                   <tr>
                     <th className="px-3 py-2 text-left font-semibold text-muted-foreground w-20">ID</th>
                     <th className="px-3 py-2 text-left font-semibold text-muted-foreground">账号</th>

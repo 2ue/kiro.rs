@@ -18,7 +18,7 @@ export function FormSection({ title, description, children }: {
   children: ReactNode
 }) {
   return (
-    <section className="rounded-lg border border-border bg-card p-3">
+    <section className="rounded-lg bg-card p-3 shadow-sm">
       <div className="mb-3">
         <div className="text-sm font-semibold">{title}</div>
         {description && <p className="mt-1 text-xs leading-5 text-muted-foreground">{description}</p>}
@@ -34,7 +34,7 @@ export function FormSection({ title, description, children }: {
 
 export function HintBox({ children }: { children: ReactNode }) {
   return (
-    <div className="rounded-lg border border-border bg-muted/50 px-3 py-2 text-xs leading-5 text-muted-foreground">
+    <div className="rounded-lg bg-muted/40 px-3 py-2 text-xs leading-5 text-muted-foreground">
       {children}
     </div>
   )
@@ -52,7 +52,7 @@ export function ToggleRow({ label, checked, disabled = false, onChange }: {
 }) {
   return (
     <label className={cn(
-      'flex min-h-12 items-center justify-between gap-3 rounded-lg border border-border bg-card px-3 py-2 text-sm',
+      'flex min-h-12 items-center justify-between gap-3 rounded-lg bg-card px-3 py-2 text-sm shadow-sm',
       disabled && 'cursor-not-allowed opacity-60',
     )}>
       <span className="min-w-0 font-medium text-muted-foreground">{label}</span>

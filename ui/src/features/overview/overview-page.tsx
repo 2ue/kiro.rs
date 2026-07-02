@@ -13,7 +13,13 @@ import {
   Zap,
 } from 'lucide-react'
 import { useAutoRefreshPreference } from '@/hooks/use-auto-refresh'
-import { useUsageDashboard } from '@/hooks/use-usage'
+import {
+  useUsageDashboardBreakdown,
+  useUsageDashboardExternalPoolBilling,
+  useUsageDashboardSeries,
+  useUsageDashboardTop,
+  useUsageDashboardWindows,
+} from '@/hooks/use-usage'
 import { useCredentialSummary } from '@/hooks/use-credentials'
 import { formatCompact, formatDate, formatNumber, formatPercent, formatUsd } from '@/lib/format'
 import { cn, extractErrorMessage } from '@/lib/utils'
@@ -233,7 +239,7 @@ function CredentialPoolPanel() {
           <PoolStatRow label="冷却" value={Math.max(0, cooling)} tone="warning" />
           <PoolStatRow label="合计" value={total} tone="default" />
         </div>
-        <div className="border-l border-border pl-6 grid gap-2 text-xs min-w-[160px]">
+        <div className="grid gap-2 text-xs min-w-[160px]">
           <div className="flex items-center justify-between gap-4">
             <span className="text-muted-foreground">并发占用</span>
             <span className="tabular-nums font-semibold text-foreground">
@@ -318,7 +324,7 @@ function ErrorSummaryPanel({
       )}
       <div className="space-y-2">
         {visible.length === 0 ? (
-          <div className="flex items-center gap-2 rounded-lg border border-border bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">
+          <div className="flex items-center gap-2 rounded-lg bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">
             <CheckCircle2 className="size-4 shrink-0 text-success" />
             当前窗口无错误聚合
           </div>
@@ -326,7 +332,7 @@ function ErrorSummaryPanel({
           visible.map((item, idx) => (
             <div
               key={`${item.key}-${idx}`}
-              className="relative overflow-hidden rounded-lg border border-border bg-card px-3 py-2.5"
+              className="relative overflow-hidden rounded-lg bg-card px-3 py-2.5 shadow-sm"
             >
               <div className="absolute inset-y-3 left-0 w-0.5 rounded-r bg-destructive/70" />
               <div className="flex items-start justify-between gap-2">
@@ -472,7 +478,7 @@ function DimensionRankPanel({
       description="按请求量聚合的 Top 维度，切换查看"
       icon={<TrendingUp />}
       actions={
-        <div className="inline-flex overflow-hidden rounded-lg border border-border">
+        <div className="inline-flex overflow-hidden rounded-lg bg-muted/40 p-0.5">
           {rankDimensions.map((dim) => (
             <Button
               key={dim.key}
@@ -574,12 +580,12 @@ function ExternalPoolBillingPanel({
       icon={<DollarSign />}
       actions={
         <span className={cn(
-          'rounded border px-2 py-0.5 text-[0.68rem] font-semibold',
+          'rounded px-2 py-0.5 text-[0.68rem] font-semibold',
           hasLoss
-            ? 'border-destructive/25 bg-card text-destructive'
+            ? 'bg-destructive/10 text-destructive'
             : hasProfit
-              ? 'border-warning/25 bg-card text-warning'
-              : 'border-border bg-card text-muted-foreground/55'
+              ? 'bg-warning/10 text-warning'
+              : 'bg-muted text-muted-foreground/70'
         )}>
           {hasLoss ? `亏损 ${formatUsd(Math.abs(profit))}` : hasProfit ? `盈利 ${formatUsd(profit)}` : '持平'}
         </span>
@@ -587,24 +593,24 @@ function ExternalPoolBillingPanel({
     >
       <div className="space-y-4">
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-          <div className="rounded-lg border border-border bg-muted/40 p-3">
+          <div className="rounded-lg bg-muted/30 p-3">
             <div className="text-xs text-muted-foreground">外部账号请求</div>
             <div className="mt-1 text-lg font-semibold" title={formatNumber(billing.requests)}>{formatCompact(billing.requests)}</div>
             <div className="mt-1 text-xs text-muted-foreground/60">
               可计价 <span title={formatNumber(billing.pricedRequests)}>{formatCompact(billing.pricedRequests)}</span> / 未计价 <span title={formatNumber(billing.unpricedRequests)}>{formatCompact(billing.unpricedRequests)}</span>
             </div>
           </div>
-          <div className="rounded-lg border border-border bg-muted/40 p-3">
+          <div className="rounded-lg bg-muted/30 p-3">
             <div className="text-xs text-muted-foreground">原始成本</div>
             <div className="mt-1 text-lg font-semibold">{formatUsd(billing.rawCostUsd)}</div>
             <div className="mt-1 text-xs text-muted-foreground/60">按外部账号实际消耗估算</div>
           </div>
-          <div className="rounded-lg border border-border bg-muted/40 p-3">
+          <div className="rounded-lg bg-muted/30 p-3">
             <div className="text-xs text-muted-foreground">展示计费</div>
             <div className="mt-1 text-lg font-semibold">{formatUsd(shapedCost)}</div>
             <div className="mt-1 text-xs text-muted-foreground/60">按当前展示规则计算</div>
           </div>
-          <div className="rounded-lg border border-border bg-muted/40 p-3">
+          <div className="rounded-lg bg-muted/30 p-3">
             <div className="text-xs text-muted-foreground">补偿后计费</div>
             <div className="mt-1 text-lg font-semibold">{formatUsd(upliftedCost)}</div>
             <div className={cn('mt-1 text-xs', billingDeltaTextClass(deltaTone))}>
@@ -628,20 +634,20 @@ function ExternalPoolBillingPanel({
           </div>
         </div>
 
-        <div className="border-t border-border pt-3">
+        <div className="pt-1">
           <div className="mb-2 flex items-center justify-between gap-2">
             <div className="text-xs font-semibold text-foreground/70">外部账号成本与盈亏</div>
             <div className="text-[0.68rem] text-muted-foreground/45">按当前时间窗口聚合</div>
           </div>
           {visiblePools.length === 0 ? (
-            <div className="rounded-lg border border-dashed border-border p-3 text-sm text-muted-foreground/60">
+            <div className="rounded-lg bg-muted/30 p-3 text-sm text-muted-foreground/60">
               当前窗口没有外部账号计费样本。
             </div>
           ) : (
-            <div className="scrollbar-thin overflow-x-auto rounded-lg border border-border">
+            <div className="scrollbar-thin overflow-x-auto rounded-lg bg-card">
               <table className="w-full min-w-[640px] text-xs">
                 <thead>
-                  <tr className="border-b border-border bg-muted/40 text-muted-foreground">
+                  <tr className="bg-muted/40 text-muted-foreground">
                     <th className="px-3 py-2 text-left font-medium">外部账号</th>
                     <th className="px-3 py-2 text-right font-medium">请求</th>
                     <th className="px-3 py-2 text-right font-medium">原始成本</th>
@@ -652,7 +658,7 @@ function ExternalPoolBillingPanel({
                     <th className="px-3 py-2 text-right font-medium">兜底</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-border">
+                <tbody>
                   {visiblePools.map((pool) => {
                     const poolProfit = pool.profitUsd ?? ((pool.upliftedCostUsd ?? pool.reportedCostUsd ?? 0) - pool.rawCostUsd)
                     const poolTone = billingDeltaTone(poolProfit)
@@ -721,7 +727,7 @@ function BreakdownTabPanel({
       title={activeTab === 'status' ? '状态分布' : '用量来源'}
       description={activeTab === 'status' ? '成功、超时、客户端错误等整体占比' : '用量来自服务返回、缓存展示或系统补充的占比'}
       actions={
-        <div className="inline-flex overflow-hidden rounded-lg border border-border">
+        <div className="inline-flex overflow-hidden rounded-lg bg-muted/40 p-0.5">
           <Button
             variant={activeTab === 'status' ? 'default' : 'ghost'}
             size="xs"
@@ -743,7 +749,7 @@ function BreakdownTabPanel({
     >
       <div className="space-y-3">
         {items.length === 0 ? (
-          <div className="rounded-lg border border-dashed border-border px-3 py-3 text-sm text-muted-foreground/60">
+          <div className="rounded-lg bg-muted/30 px-3 py-3 text-sm text-muted-foreground/60">
             {emptyText}
           </div>
         ) : (
@@ -774,18 +780,31 @@ function BreakdownTabPanel({
 
 export function OverviewPage() {
   const autoRefresh = useAutoRefreshPreference(OVERVIEW_AUTO_REFRESH_KEY, 30)
-  const dashboard = useUsageDashboard(OVERVIEW_TIMEZONE, autoRefresh.refetchInterval)
+  const windowsQuery = useUsageDashboardWindows(OVERVIEW_TIMEZONE, autoRefresh.refetchInterval)
   const [selectedWindowKey, setSelectedWindowKey] = useState('today')
   const [rankDimension, setRankDimension] = useState<RankDimension>('credentials')
 
-  const data = dashboard.data
+  const data = windowsQuery.data
   const selectedWindow = useMemo(
     () => activeWindow(data?.windows ?? [], selectedWindowKey),
     [data?.windows, selectedWindowKey]
   )
+  const effectiveWindowKey = selectedWindow?.key ?? selectedWindowKey
+  const seriesQuery = useUsageDashboardSeries(OVERVIEW_TIMEZONE, autoRefresh.refetchInterval)
+  const topQuery = useUsageDashboardTop(autoRefresh.refetchInterval)
+  const breakdownQuery = useUsageDashboardBreakdown(
+    OVERVIEW_TIMEZONE,
+    effectiveWindowKey,
+    autoRefresh.refetchInterval
+  )
+  const externalPoolBillingQuery = useUsageDashboardExternalPoolBilling(
+    OVERVIEW_TIMEZONE,
+    effectiveWindowKey,
+    autoRefresh.refetchInterval
+  )
 
   // 加载态
-  if (dashboard.isLoading) {
+  if (windowsQuery.isLoading) {
     return (
       <PageContainer>
         <PageHeader title="总览" subtitle="实时健康、关键指标与异常" />
@@ -795,11 +814,11 @@ export function OverviewPage() {
   }
 
   // 错误态
-  if (dashboard.error) {
+  if (windowsQuery.error) {
     return (
       <PageContainer>
         <PageHeader title="总览" subtitle="实时健康、关键指标与异常" />
-        <ErrorState title="总览加载失败" message={extractErrorMessage(dashboard.error)} />
+        <ErrorState title="总览加载失败" message={extractErrorMessage(windowsQuery.error)} />
       </PageContainer>
     )
   }
@@ -815,8 +834,14 @@ export function OverviewPage() {
   }
 
   const summary = selectedWindow.summary
-  const top = data.top ?? EMPTY_TOP
-  const series = data.series ?? { hourly24h: [], daily7d: [] }
+  const top = topQuery.data?.top ?? EMPTY_TOP
+  const series = seriesQuery.data?.series ?? { hourly24h: [], daily7d: [] }
+  const statusBreakdown = breakdownQuery.data?.statusBreakdown ?? summary.statusBreakdown ?? []
+  const usageSourceBreakdown = breakdownQuery.data?.usageSourceBreakdown ?? summary.usageSourceBreakdown ?? []
+  const externalPoolBillingByPool =
+    externalPoolBillingQuery.data?.externalPoolBillingByPool ??
+    summary.externalPoolBillingByPool ??
+    []
 
   const pricedRatio = summary.totalRequests > 0 ? summary.pricedRequests / summary.totalRequests : 0
   const streamRatio = summary.totalRequests > 0 ? summary.streamRequests / summary.totalRequests : 0
@@ -829,7 +854,7 @@ export function OverviewPage() {
   const headerActions = (
     <div className="flex flex-wrap items-center gap-2">
       {/* 时间窗口 */}
-      <div className="inline-flex overflow-hidden rounded-lg border border-border">
+      <div className="inline-flex overflow-hidden rounded-lg bg-muted/40 p-0.5">
         {data.windows.map((w) => (
           <Button
             key={w.key}
@@ -863,7 +888,11 @@ export function OverviewPage() {
         />
         <span className="text-xs text-muted-foreground">秒</span>
       </div>
-      {dashboard.isFetching && (
+      {(windowsQuery.isFetching ||
+        seriesQuery.isFetching ||
+        topQuery.isFetching ||
+        breakdownQuery.isFetching ||
+        externalPoolBillingQuery.isFetching) && (
         <RefreshCw className="size-3.5 animate-spin text-muted-foreground/60" />
       )}
     </div>
@@ -876,7 +905,7 @@ export function OverviewPage() {
       {/* 1. 关键指标卡 */}
       <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-6">
         {/* 请求量 + Sparkline */}
-        <div className="relative flex min-h-[6.5rem] flex-col justify-between overflow-hidden rounded-xl border border-border bg-card p-4 shadow-sm transition-colors hover:border-border-strong">
+        <div className="relative flex min-h-[6.5rem] flex-col justify-between overflow-hidden rounded-xl bg-card p-4 shadow-sm transition-colors hover:shadow-md">
           <span className="absolute left-0 top-4 h-8 w-1 rounded-r-full bg-primary" />
           <div className="flex items-start justify-between gap-2 pl-2.5">
             <div className="min-w-0 flex-1">
@@ -885,7 +914,7 @@ export function OverviewPage() {
                 {formatCompact(summary.totalRequests)}
               </div>
             </div>
-            <div className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-border bg-muted text-primary [&_svg]:size-4">
+            <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted text-primary [&_svg]:size-4">
               <Activity />
             </div>
           </div>
@@ -928,7 +957,7 @@ export function OverviewPage() {
         />
 
         {/* 缓存命中 + Sparkline */}
-        <div className="relative flex min-h-[6.5rem] flex-col justify-between overflow-hidden rounded-xl border border-border bg-card p-4 shadow-sm transition-colors hover:border-border-strong">
+        <div className="relative flex min-h-[6.5rem] flex-col justify-between overflow-hidden rounded-xl bg-card p-4 shadow-sm transition-colors hover:shadow-md">
           <span className="absolute left-0 top-4 h-8 w-1 rounded-r-full bg-success" />
           <div className="flex items-start justify-between gap-2 pl-2.5">
             <div className="min-w-0 flex-1">
@@ -937,7 +966,7 @@ export function OverviewPage() {
                 {formatPercent(summary.cacheReadRatio)}
               </div>
             </div>
-            <div className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-border bg-muted text-success [&_svg]:size-4">
+            <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted text-success [&_svg]:size-4">
               <Zap />
             </div>
           </div>
@@ -986,17 +1015,17 @@ export function OverviewPage() {
       {/* 7. 外部账号计费拆分（始终展示，无样本时为持平/0） */}
       <ExternalPoolBillingPanel
         billing={summary.externalPoolBilling ?? EMPTY_EXTERNAL_POOL_BILLING}
-        billingByPool={summary.externalPoolBillingByPool ?? []}
+        billingByPool={externalPoolBillingByPool}
       />
 
       {/* 8. 状态分布 + 用量来源（Tab 切换） */}
       <BreakdownTabPanel
-        statusItems={summary.statusBreakdown ?? []}
-        sourceItems={summary.usageSourceBreakdown ?? []}
+        statusItems={statusBreakdown}
+        sourceItems={usageSourceBreakdown}
       />
 
       {/* 9. 底部状态栏 */}
-      <div className="rounded-xl border border-border bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">
+      <div className="rounded-xl bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">
         <div className="flex flex-wrap items-center gap-2">
           <span>总览 · {selectedWindow.label}</span>
           <span className="text-muted-foreground/40">·</span>

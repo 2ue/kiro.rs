@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+target="${1:-ui}"
+api_target="${VITE_API_PROXY_TARGET:-http://127.0.0.1:9022}"
+
+case "$target" in
+  ui|new)
+    dir="ui"
+    url="http://127.0.0.1:9023/ui/runtime"
+    ;;
+  console|daisy)
+    dir="admin-ui-daisy"
+    url="http://127.0.0.1:9024/console/config"
+    ;;
+  admin|old)
+    dir="admin-ui"
+    url="http://127.0.0.1:9025/admin/"
+    ;;
+  *)
+    cat >&2 <<'USAGE'
+Usage: bash scripts/dev-ui.sh [ui|console|admin]
+
+ui       New UI on http://127.0.0.1:9023/ui/runtime
+console  Daisy Console UI on http://127.0.0.1:9024/console/config
+admin    Old Admin UI on http://127.0.0.1:9025/admin/
+
+Set VITE_API_PROXY_TARGET to override the backend API target.
+USAGE
+    exit 2
+    ;;
+esac
+
+echo "Starting $target frontend from $dir"
+echo "Preview: $url"
+echo "API proxy: $api_target"
+
+exec env VITE_API_PROXY_TARGET="$api_target" pnpm --dir "$dir" dev

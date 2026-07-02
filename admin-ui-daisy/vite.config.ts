@@ -5,6 +5,8 @@ import { fileURLToPath } from 'url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
+const apiProxyTarget = process.env.VITE_API_PROXY_TARGET ?? 'http://127.0.0.1:9022'
+
 function manualChunks(id: string) {
   if (!id.includes('node_modules')) {
     return undefined
@@ -49,7 +51,7 @@ export default defineConfig({
     strictPort: true,
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:9022',
+        target: apiProxyTarget,
         changeOrigin: true,
       },
     },

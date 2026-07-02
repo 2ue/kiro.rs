@@ -24,7 +24,7 @@ export function AppShell({ onLogout }: { onLogout: () => void }) {
           <DialogContent
             width="w-auto max-w-[85vw]"
             hideClose
-            className="left-0 top-0 h-dvh max-h-dvh translate-x-0 translate-y-0 rounded-none border-l-0 p-0 data-[state=closed]:slide-out-to-left data-[state=open]:slide-in-from-left"
+            className="left-0 top-0 h-dvh max-h-dvh translate-x-0 translate-y-0 rounded-none p-0 data-[state=closed]:slide-out-to-left data-[state=open]:slide-in-from-left"
           >
             <Sidebar onNavigate={() => setMobileOpen(false)} />
           </DialogContent>

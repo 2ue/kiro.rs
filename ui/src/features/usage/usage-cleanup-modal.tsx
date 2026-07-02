@@ -110,7 +110,7 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
 
         {/* 当前任务状态 */}
         {status && status.status !== 'idle' && (
-          <div className="rounded-lg border border-border bg-muted/40 p-3 space-y-2">
+          <div className="rounded-lg bg-muted/30 p-3 space-y-2">
             <div className="flex items-center justify-between">
               <span className="font-medium">清理任务状态</span>
               <Badge tone={
@@ -209,7 +209,7 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
 
         {/* 预览结果 */}
         {previewResult && (
-          <div className="rounded-lg border border-border bg-muted/40 p-3 space-y-1 text-xs">
+          <div className="rounded-lg bg-muted/30 p-3 space-y-1 text-xs">
             <div className="font-medium">预览结果</div>
             <div>匹配记录: <span className="font-semibold tabular-nums">{formatNumber(previewResult.matchedRows)}</span> 条</div>
             <div>截止时间: <span className="tabular-nums">{formatDate(previewResult.cutoffAt)}</span></div>
@@ -219,7 +219,7 @@ export function UsageCleanupModal({ open, onClose }: { open: boolean; onClose: (
         )}
 
         {/* 操作按钮 */}
-        <div className="flex flex-wrap gap-2 justify-end pt-1 border-t border-border">
+        <div className="flex flex-wrap gap-2 justify-end pt-1">
           <Button variant="outline" size="sm" onClick={handlePreview} disabled={previewing || isRunning}>
             {previewing ? '预览中...' : '预览'}
           </Button>

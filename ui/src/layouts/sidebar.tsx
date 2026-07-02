@@ -84,7 +84,7 @@ export function Sidebar({ onNavigate }: SidebarProps) {
 
       {/* 版本 */}
       <div className="shrink-0 px-4 py-3">
-        <div className="flex items-center justify-between border-t border-sidebar-border pt-3">
+        <div className="flex items-center justify-between pt-3">
           <span className="text-[0.68rem] font-medium text-sidebar-muted">版本</span>
           <span className="font-mono text-[0.68rem] font-semibold text-sidebar-foreground/70">
             {version.data?.version ? `v${version.data.version}` : '—'}

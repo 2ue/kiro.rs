@@ -69,7 +69,7 @@ function PolicyBlock({ title, titleSuffix, description, active, children }: {
   title: string; titleSuffix?: string; description: string; active: boolean; children: ReactNode
 }) {
   return (
-    <section className={cn('rounded-lg border border-border p-3', active ? 'bg-card' : 'bg-muted/40')}>
+    <section className={cn('rounded-lg p-3 shadow-sm', active ? 'bg-card' : 'bg-muted/30')}>
       <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
         <div>
           <div className="flex items-center gap-2">
@@ -452,7 +452,7 @@ export function ExternalPoolsPage() {
               const capacity = pool.maxConcurrentRequests
               const usePct = capacity > 0 ? Math.round((inFlight / capacity) * 100) : 0
               return (
-                <div key={pool.id} className="rounded-lg border border-border bg-card p-4">
+                <div key={pool.id} className="rounded-lg bg-card p-4 shadow-sm">
                   <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
                     <div className="flex items-start gap-3">
                       <ProgressRing

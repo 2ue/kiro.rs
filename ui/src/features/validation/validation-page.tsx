@@ -109,14 +109,14 @@ function ResultGroup({ group }: { group: CredentialValidationGroup }) {
     'neutral'
 
   return (
-    <div className="overflow-hidden rounded-xl border border-border bg-card">
-      <div className="flex items-center justify-between border-b border-border bg-muted/30 px-4 py-2.5">
+    <div className="overflow-hidden rounded-xl bg-card shadow-sm">
+      <div className="flex items-center justify-between bg-muted/30 px-4 py-2.5">
         <div className="flex items-center gap-2">
           <Badge tone={badgeTone}>{group.title}</Badge>
           <span className="text-sm text-muted-foreground">{group.count} 个</span>
         </div>
       </div>
-      <div className="divide-y divide-border">
+      <div>
         {group.items.map((item) => (
           <ValidationItemRow
             key={`${item.id ?? 'ext'}-${item.index ?? item.email ?? item.subscriptionTitle}`}
@@ -307,7 +307,7 @@ function ExistingValidationSection({
       <div className="space-y-3">
         <div className="flex flex-wrap items-center gap-3">
           <span className="text-sm font-medium text-muted-foreground">范围</span>
-          <div className="flex gap-2">
+          <div className="flex rounded-lg bg-muted/60 p-1">
             {(['all', 'enabled', 'disabled'] as ExistingScope[]).map((s) => (
               <button
                 key={s}
@@ -315,10 +315,10 @@ function ExistingValidationSection({
                 onClick={() => setScope(s)}
                 disabled={mutation.isPending}
                 className={[
-                  'rounded-md border px-3 py-1 text-sm transition-colors',
+                  'rounded-md px-3 py-1 text-sm transition-colors',
                   scope === s
-                    ? 'border-primary bg-primary/10 font-semibold text-primary'
-                    : 'border-border bg-card text-muted-foreground hover:border-primary/40 hover:text-foreground',
+                    ? 'bg-card font-semibold text-primary shadow-sm'
+                    : 'text-muted-foreground hover:text-foreground',
                   mutation.isPending ? 'cursor-not-allowed opacity-50' : '',
                 ].join(' ')}
               >
@@ -468,7 +468,7 @@ function ExternalValidationSection({
     >
       <div className="space-y-3">
         {/* Options */}
-        <div className="grid gap-3 rounded-lg border border-border bg-muted/30 p-3 lg:grid-cols-[1fr_1.4fr]">
+        <div className="grid gap-3 rounded-lg bg-muted/30 p-3 lg:grid-cols-[1fr_1.4fr]">
           {/* Check items */}
           <div>
             <div className="mb-2 text-xs font-semibold text-muted-foreground">校验项目</div>

@@ -101,7 +101,7 @@ export function ExternalPoolTestModal({
     >
       {pool && (
         <div className="space-y-4">
-          <div className="rounded-lg border border-border bg-surface-subtle p-3">
+          <div className="rounded-lg bg-surface-subtle p-3">
             <div className="flex flex-wrap items-center gap-2">
               <span className="font-semibold">#{pool.id} {pool.name}</span>
               <Badge tone="neutral">{pool.authType}</Badge>
@@ -128,13 +128,13 @@ export function ExternalPoolTestModal({
             </div>
           </div>
 
-          <div className="rounded-lg border border-border bg-surface-subtle p-4 font-mono text-xs">
+          <div className="rounded-lg bg-surface-subtle p-4 font-mono text-xs">
             <div className="space-y-1 text-muted-foreground">
               <div><span className="text-info">外部账号：</span> #{pool.id} {pool.name}</div>
               <div><span className="text-info">使用模型：</span> {model}</div>
               <div><span className="text-muted-foreground">发送消息：</span> "{prompt.trim() || DEFAULT_TEST_PROMPT}"</div>
             </div>
-            <div className="mt-3 border-t border-border pt-3">
+            <div className="mt-3 pt-1">
               {running && (
                 <div className="flex items-center gap-2 text-info">
                   <Loader2 className="h-4 w-4 animate-spin" />

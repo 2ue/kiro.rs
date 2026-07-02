@@ -60,7 +60,7 @@ function ChartTooltip({
 }) {
   if (!active || !payload?.length) return null
   return (
-    <div className="rounded-lg border border-border bg-popover/95 px-3 py-2 text-xs shadow-md backdrop-blur">
+    <div className="rounded-lg bg-popover/95 px-3 py-2 text-xs shadow-md backdrop-blur">
       {label !== undefined && (
         <div className="mb-1 font-medium text-popover-foreground">
           {labelFormatter ? labelFormatter(label) : label}

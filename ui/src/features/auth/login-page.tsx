@@ -52,9 +52,9 @@ export function LoginPage({
     <main className="min-h-screen bg-background">
       <div className="absolute inset-x-0 top-0 h-0.5 bg-primary" />
       <div className="mx-auto flex min-h-screen w-full max-w-5xl items-center justify-center px-4 py-8">
-        <div className="grid w-full overflow-hidden rounded-2xl border border-border bg-card shadow-xl lg:grid-cols-[1fr_410px]">
+        <div className="grid w-full overflow-hidden rounded-2xl bg-card shadow-xl lg:grid-cols-[1fr_410px]">
           {/* 左侧品牌区 */}
-          <section className="hidden border-r border-border bg-muted/40 p-8 lg:block">
+          <section className="hidden bg-muted/40 p-8 lg:block">
             <div className="flex h-full flex-col justify-between">
               <div>
                 <div className="flex items-center gap-3">
@@ -85,7 +85,7 @@ export function LoginPage({
                   return (
                     <div
                       key={feature.title}
-                      className="rounded-xl border border-border bg-card p-3.5"
+                      className="rounded-xl bg-background/70 p-3.5 shadow-sm"
                     >
                       <Icon className="mb-3 size-4 text-primary" />
                       <div className="text-sm font-semibold">{feature.title}</div>

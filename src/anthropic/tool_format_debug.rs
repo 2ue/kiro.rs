@@ -1339,8 +1339,7 @@ mod tests {
         assert_eq!(second["sampled"], false);
         assert_eq!(second["dropReason"], "fingerprint_limit");
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let content = read_debug_dir(&dir).await;
+        let content = wait_debug_dir_contains(&dir, "invalid_tool_use_format").await;
         assert!(content.contains("req-test"));
         assert!(content.contains("invalid_tool_use_format"));
         assert!(!content.contains("secret result content"));
@@ -1408,8 +1407,7 @@ mod tests {
             "request_body_record_limit"
         );
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let content = read_debug_dir(&dir).await;
+        let content = wait_debug_dir_contains(&dir, "req-body-2").await;
         assert!(content.contains("req-body-1"));
         assert!(content.contains("req-body-2"));
         assert!(content.contains("request body content for diagnostics"));
@@ -1439,7 +1437,11 @@ mod tests {
     }
 
     async fn read_debug_dir(dir: &Path) -> String {
-        let mut entries = fs::read_dir(dir).await.expect("debug dir");
+        let mut entries = match fs::read_dir(dir).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return String::new(),
+            Err(err) => panic!("debug dir: {err}"),
+        };
         let mut content = String::new();
         while let Some(entry) = entries.next_entry().await.expect("debug entry") {
             if entry
@@ -1451,5 +1453,17 @@ mod tests {
             }
         }
         content
+    }
+
+    async fn wait_debug_dir_contains(dir: &Path, needle: &str) -> String {
+        let mut last = String::new();
+        for _ in 0..50 {
+            last = read_debug_dir(dir).await;
+            if last.contains(needle) {
+                return last;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        last
     }
 }

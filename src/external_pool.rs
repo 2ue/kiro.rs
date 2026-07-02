@@ -35,7 +35,8 @@ use crate::{
         },
         pricing::PricingCatalog,
         prompt_cache::{
-            PromptCacheBounds, PromptCacheProfile, PromptCacheScope, PromptCacheTracker,
+            KiroRsToolPromptCachePlan, PromptCacheBounds, PromptCacheProfile, PromptCacheScope,
+            PromptCacheTracker,
         },
         prompt_cache_creation_control::PromptCacheCreationController,
         types::MessagesRequest,
@@ -46,8 +47,9 @@ use crate::{
         },
     },
     model::config::{
-        ExternalPoolCapacityMode, ExternalPoolsConfig, ModelMappingRule,
-        PromptCacheCreationControlConfig, PromptCacheSimulationMode, ReportedUsageConfig,
+        ExternalPoolCapacityMode, ExternalPoolsConfig, KiroRsToolCachePolicy, ModelMappingRule,
+        PromptCacheCreationControlConfig, PromptCacheSimulationMode, PromptCacheStrategyType,
+        ReportedUsageConfig,
     },
     model::model_processing::{
         ModelProcessingConfig, ModelProcessingError, ModelProcessingInput, ModelProcessingMode,
@@ -62,7 +64,6 @@ use crate::{
 
 const DEFAULT_EXTERNAL_POOL_REQUEST_TIMEOUT_SECS: u64 = 180;
 const EXTERNAL_POOL_LEASE_TOUCH_INTERVAL_SECS: u64 = 30;
-const EXTERNAL_POOL_PROMPT_CACHE_CREDENTIAL_ID_OFFSET: u64 = 1_u64 << 63;
 const EXTERNAL_POOL_AVAILABILITY_CACHE_TTL: Duration = Duration::from_millis(250);
 const MAX_RECORDED_EXTERNAL_ERROR_MESSAGE_BYTES: usize = 8192;
 const EXTERNAL_POOL_AUTO_DISABLE_REASONS: &[&str] = &[
@@ -387,6 +388,7 @@ pub struct ExternalRouteRequest {
     pub reported_usage: ReportedUsageConfig,
     pub prompt_cache: Arc<PromptCacheTracker>,
     pub prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
+    pub prompt_cache_strategy_type: PromptCacheStrategyType,
     pub prompt_cache_simulation_mode: PromptCacheSimulationMode,
     pub prompt_cache_route_namespace: Option<String>,
     pub prompt_cache_target_read_ratio: f64,
@@ -397,6 +399,7 @@ pub struct ExternalRouteRequest {
     pub prompt_cache_scale_min_input_tokens: i32,
     pub prompt_cache_creation_control: PromptCacheCreationControlConfig,
     pub prompt_cache_bounds: PromptCacheBounds,
+    pub kiro_rs_tool_cache_policy: KiroRsToolCachePolicy,
     pub model_capabilities: Arc<ModelCapabilitiesCatalog>,
     pub pricing_catalog: Arc<PricingCatalog>,
     pub request_id: String,
@@ -673,6 +676,7 @@ struct ExternalUsageProjectionContext {
     scope: Option<PromptCacheScope>,
     prompt_cache: Arc<PromptCacheTracker>,
     prompt_cache_profile: Option<PromptCacheProfile>,
+    kiro_rs_tool_prompt_cache_plan: Option<KiroRsToolPromptCachePlan>,
     prompt_cache_target_read_ratio: f64,
     prompt_cache_bounds: PromptCacheBounds,
     prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
@@ -2434,6 +2438,9 @@ impl ExternalPoolManager {
             endpoint: route.endpoint.to_string(),
             stream: route.payload.stream,
             model: route.payload.model.clone(),
+            requested_max_tokens: (route.payload.max_tokens > 0)
+                .then_some(route.payload.max_tokens),
+            downstream_stop_reason: None,
             upstream_model: route.upstream_model.clone(),
             external_outbound_model,
             model_resolution_source: route.model_resolution_source.clone(),
@@ -4078,11 +4085,15 @@ fn project_usage_value(
         .map(|policy| computed.with_reported_cache_usage_policy_and_raw(policy, raw_usage))
         .unwrap_or(computed);
     projection.mark_committed(reported);
-    let shaped = projection.prompt_cache_creation_controller.preview_success(
-        projection.scope.as_ref(),
-        projection.prompt_cache_creation_control,
-        reported,
-    );
+    let shaped = if projection.reported_policy.is_some() {
+        projection.prompt_cache_creation_controller.preview_success(
+            projection.scope.as_ref(),
+            projection.prompt_cache_creation_control,
+            reported,
+        )
+    } else {
+        reported
+    };
     let shaped = projection
         .reported_policy
         .clone()
@@ -4322,6 +4333,9 @@ fn build_external_usage_projection_context(
     if pool.usage_projection_mode != ExternalPoolUsageProjectionMode::CurrentPathPolicy {
         return None;
     }
+    if route.prompt_cache_strategy_type == PromptCacheStrategyType::NoCache {
+        return None;
+    }
 
     let model = route
         .upstream_model
@@ -4333,40 +4347,65 @@ fn build_external_usage_projection_context(
         .unwrap_or(true);
 
     let raw_input_tokens = count_external_route_input_tokens(&route.payload);
-    let (scope, profile, simulated_usage) = if prompt_cache_supported
+    let scope = prompt_cache_supported
+        .then(|| external_prompt_cache_scope(route, pool, &model))
+        .flatten();
+    let (profile, kiro_rs_tool_prompt_cache_plan, simulated_usage) = match route
+        .prompt_cache_strategy_type
+    {
+        PromptCacheStrategyType::CurrentHighCache
+            if prompt_cache_supported
+                && route.prompt_cache_simulation_mode == PromptCacheSimulationMode::HighCache =>
+        {
+            let profile = route.prompt_cache.build_high_cache_profile_for_model(
+                &route.payload,
+                raw_input_tokens,
+                &model,
+            );
+            let prompt_usage = route.prompt_cache.compute_with_bounds(
+                scope.clone(),
+                profile.as_ref(),
+                route.prompt_cache_target_read_ratio,
+                route.prompt_cache_bounds,
+            );
+            let simulated_usage = profile.as_ref().and_then(|profile| {
+                CacheSimulation::from_prompt_cache_with_ratio_and_amplification(
+                    prompt_usage,
+                    route.prompt_cache_target_read_ratio,
+                    external_cache_amplification(route, profile),
+                )
+            });
+            (profile, None, simulated_usage)
+        }
+        PromptCacheStrategyType::KiroRsTool if prompt_cache_supported => {
+            let plan = route.prompt_cache.compute_kiro_rs_tool_with_bounds(
+                scope.clone(),
+                &route.payload,
+                raw_input_tokens,
+                &model,
+                route.prompt_cache_bounds,
+                route.kiro_rs_tool_cache_policy,
+            );
+            let simulated_usage = CacheSimulation::from_prompt_cache_split_input(plan.usage());
+            (None, Some(plan), simulated_usage)
+        }
+        _ => (None, None, None),
+    };
+    let reported_policy = if route.prompt_cache_strategy_type
+        == PromptCacheStrategyType::CurrentHighCache
         && route.prompt_cache_simulation_mode == PromptCacheSimulationMode::HighCache
     {
-        let profile = route.prompt_cache.build_high_cache_profile_for_model(
-            &route.payload,
-            raw_input_tokens,
-            &model,
-        );
-        let scope = external_prompt_cache_scope(route, pool, &model);
-        let prompt_usage = route.prompt_cache.compute_with_bounds(
-            scope.clone(),
-            profile.as_ref(),
-            route.prompt_cache_target_read_ratio,
-            route.prompt_cache_bounds,
-        );
-        let simulated_usage = profile.as_ref().and_then(|profile| {
-            CacheSimulation::from_prompt_cache_with_ratio_and_amplification(
-                prompt_usage,
-                route.prompt_cache_target_read_ratio,
-                external_cache_amplification(route, profile),
-            )
-        });
-        (scope, profile, simulated_usage)
+        ReportedCacheUsagePolicy::from_path_policy(
+            route.reported_usage.policy_for_path(&route.endpoint),
+            profile
+                .as_ref()
+                .map(|profile| profile.cache_jitter_seed())
+                .unwrap_or(0)
+                ^ fastrand::u64(..),
+        )
     } else {
-        (None, None, None)
+        None
     };
-    let reported_policy = ReportedCacheUsagePolicy::from_path_policy(
-        route.reported_usage.policy_for_path(&route.endpoint),
-        profile
-            .as_ref()
-            .map(|profile| profile.cache_jitter_seed())
-            .unwrap_or(0)
-            ^ fastrand::u64(..),
-    );
     Some(ExternalUsageProjectionContext {
         mode: pool.usage_projection_mode,
         raw_input_tokens,
@@ -4375,6 +4414,7 @@ fn build_external_usage_projection_context(
         scope,
         prompt_cache: route.prompt_cache.clone(),
         prompt_cache_profile: profile,
+        kiro_rs_tool_prompt_cache_plan,
         prompt_cache_target_read_ratio: route.prompt_cache_target_read_ratio,
         prompt_cache_bounds: route.prompt_cache_bounds,
         prompt_cache_creation_controller: route.prompt_cache_creation_controller.clone(),
@@ -4397,21 +4437,13 @@ fn count_external_route_input_tokens(payload: &MessagesRequest) -> i32 {
 
 fn external_prompt_cache_scope(
     route: &ExternalRouteRequest,
-    pool: &ExternalPool,
-    model: &str,
+    _pool: &ExternalPool,
+    _model: &str,
 ) -> Option<PromptCacheScope> {
-    Some(PromptCacheScope {
-        credential_id: external_pool_prompt_cache_credential_id(pool.id),
-        conversation_id: crate::anthropic::converter::extract_stable_conversation_id(
-            &route.payload,
-        )?,
-        model: model.to_string(),
-        route_namespace: route.prompt_cache_route_namespace.clone(),
-    })
-}
-
-fn external_pool_prompt_cache_credential_id(pool_id: u64) -> u64 {
-    EXTERNAL_POOL_PROMPT_CACHE_CREDENTIAL_ID_OFFSET.saturating_add(pool_id)
+    Some(PromptCacheScope::new(
+        crate::anthropic::converter::extract_stable_conversation_id(&route.payload)?,
+        route.prompt_cache_route_namespace.clone(),
+    ))
 }
 
 fn external_cache_amplification(
@@ -4438,17 +4470,27 @@ impl ExternalUsageProjectionContext {
         let Some(usage) = self.state.lock().committed_controlled_usage else {
             return;
         };
-        let _ = self.prompt_cache_creation_controller.apply_success(
-            self.scope.as_ref(),
-            self.prompt_cache_creation_control,
-            usage,
-        );
-        self.prompt_cache.update_with_bounds(
-            self.scope.clone(),
-            self.prompt_cache_profile.as_ref(),
-            self.prompt_cache_target_read_ratio,
-            self.prompt_cache_bounds,
-        );
+        if self.reported_policy.is_some() {
+            let _ = self.prompt_cache_creation_controller.apply_success(
+                self.scope.as_ref(),
+                self.prompt_cache_creation_control,
+                usage,
+            );
+        }
+        if let Some(plan) = self.kiro_rs_tool_prompt_cache_plan.as_ref() {
+            self.prompt_cache.commit_kiro_rs_tool_success_with_bounds(
+                self.scope.clone(),
+                plan,
+                self.prompt_cache_bounds,
+            );
+        } else {
+            self.prompt_cache.update_with_bounds(
+                self.scope.clone(),
+                self.prompt_cache_profile.as_ref(),
+                self.prompt_cache_target_read_ratio,
+                self.prompt_cache_bounds,
+            );
+        }
     }
 }
 
@@ -5160,6 +5202,7 @@ mod tests {
             reported_usage: ReportedUsageConfig::default(),
             prompt_cache: Arc::new(PromptCacheTracker::default()),
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+            prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
             prompt_cache_simulation_mode: PromptCacheSimulationMode::HighCache,
             prompt_cache_route_namespace: None,
             prompt_cache_target_read_ratio: 0.98,
@@ -5170,6 +5213,7 @@ mod tests {
             prompt_cache_scale_min_input_tokens: 20_000,
             prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
             prompt_cache_bounds: PromptCacheBounds::default(),
+            kiro_rs_tool_cache_policy: KiroRsToolCachePolicy::default(),
             model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_external_capacity".to_string(),
@@ -5443,6 +5487,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
             reported_usage: ReportedUsageConfig::default(),
             prompt_cache: Arc::new(PromptCacheTracker::default()),
             prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+            prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
             prompt_cache_simulation_mode: PromptCacheSimulationMode::HighCache,
             prompt_cache_route_namespace: None,
             prompt_cache_target_read_ratio: 0.98,
@@ -5453,6 +5498,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
             prompt_cache_scale_min_input_tokens: 20_000,
             prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
             prompt_cache_bounds: PromptCacheBounds::default(),
+            kiro_rs_tool_cache_policy: KiroRsToolCachePolicy::default(),
             model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             request_id: "req_external_billing".to_string(),
@@ -6059,7 +6105,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
                 .get("cache_read_input_tokens")
                 .and_then(|value| value.as_i64())
                 .unwrap_or_default()
-                > 0
+                == 0
         );
         assert!(
             usage
@@ -6122,6 +6168,17 @@ data: {"type":"message_delta","note":"content_block_delta"}
                 .cache_creation_input_tokens,
             0
         );
+    }
+
+    #[test]
+    fn usage_projection_no_cache_route_does_not_build_projection_context() {
+        let mut route = test_route("claude-sonnet-4-5");
+        route.prompt_cache_strategy_type = PromptCacheStrategyType::NoCache;
+        route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+
+        assert!(projection_context(&route, &pool, 25).is_none());
     }
 
     #[test]
@@ -6193,6 +6250,10 @@ data: {"type":"message_delta","note":"content_block_delta"}
         let mut pool = test_pool("http://pool.example.com", false);
         pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
+        let warmup_projection = projection_context(&route, &pool, 0).expect("warmup projection");
+        let _warmup = maybe_project_non_stream_usage(body.clone(), Some(&warmup_projection));
+        warmup_projection.record_success();
+
         let projection = projection_context(&route, &pool, 200).expect("projection");
         let projected = maybe_project_non_stream_usage(body, Some(&projection));
         let reported = projected.usage_capture.reported.expect("reported usage");
@@ -6228,7 +6289,8 @@ data: {"type":"message_delta","note":"content_block_delta"}
         let reported = projected.usage_capture.reported.expect("reported usage");
 
         assert!((1..=96).contains(&reported.input_tokens));
-        assert!(reported.cache_read_input_tokens > 0);
+        assert_eq!(reported.cache_read_input_tokens, 0);
+        assert!(reported.cache_creation_input_tokens > 0);
         assert_eq!(
             reported.total_input_tokens,
             reported
@@ -6433,6 +6495,96 @@ data: {"type":"message_delta","note":"content_block_delta"}
     }
 
     #[test]
+    fn kiro_rs_tool_usage_projection_commits_external_pool_cache_only_after_success() {
+        let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        );
+        let mut route = test_route("claude-sonnet-4-5");
+        route.endpoint = "/kiro/v1/messages".to_string();
+        route.prompt_cache_strategy_type = PromptCacheStrategyType::KiroRsTool;
+        route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
+        route.payload.metadata = Some(Metadata {
+            user_id: Some(
+                "user_test_account__session_8bb5523b-ec7c-4540-a9ca-beb6d79f1552".to_string(),
+            ),
+        });
+        route.payload.system = Some(vec![SystemMessage {
+            text: "stable external kiro strategy prompt ".repeat(700),
+            cache_control: Some(serde_json::json!({"type": "ephemeral"})),
+        }]);
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+
+        let failed_projection = projection_context(&route, &pool, 0).expect("failed projection");
+        let failed = maybe_project_non_stream_usage(body.clone(), Some(&failed_projection));
+        let failed_value: serde_json::Value =
+            serde_json::from_slice(&failed.body).expect("failed projected json");
+        assert_eq!(
+            failed_value["usage"]["cache_read_input_tokens"]
+                .as_i64()
+                .unwrap_or_default(),
+            0
+        );
+        assert!(
+            failed_value["usage"]["cache_creation_input_tokens"]
+                .as_i64()
+                .unwrap_or_default()
+                > 0
+        );
+
+        let retry_projection = projection_context(&route, &pool, 0).expect("retry projection");
+        let retry = maybe_project_non_stream_usage(body.clone(), Some(&retry_projection));
+        let retry_value: serde_json::Value =
+            serde_json::from_slice(&retry.body).expect("retry projected json");
+        assert_eq!(
+            retry_value["usage"]["cache_read_input_tokens"]
+                .as_i64()
+                .unwrap_or_default(),
+            0
+        );
+        assert!(
+            retry_value["usage"]["cache_creation_input_tokens"]
+                .as_i64()
+                .unwrap_or_default()
+                > 0
+        );
+        retry_projection.record_success();
+
+        route.payload.messages.extend([
+            Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!("ready"),
+            },
+            Message {
+                role: "user".to_string(),
+                content: serde_json::json!("continue external kiro strategy session"),
+            },
+        ]);
+        let second_projection = projection_context(&route, &pool, 0).expect("second projection");
+        let second = maybe_project_non_stream_usage(body, Some(&second_projection));
+        let second_value: serde_json::Value =
+            serde_json::from_slice(&second.body).expect("second projected json");
+        assert!(
+            second_value["usage"]["cache_read_input_tokens"]
+                .as_i64()
+                .unwrap_or_default()
+                > 0
+        );
+        let raw = second.usage_capture.raw.expect("raw usage");
+        let reported = second.usage_capture.reported.expect("reported usage");
+        assert_eq!(raw.input_tokens, 100000);
+        assert_eq!(raw.cache_read_input_tokens, 0);
+        assert!(reported.cache_read_input_tokens > 0);
+        assert!(reported.input_tokens > 0);
+        assert_eq!(
+            reported.input_tokens
+                + reported.cache_creation_input_tokens
+                + reported.cache_read_input_tokens,
+            reported.total_input_tokens
+        );
+    }
+
+    #[test]
     fn usage_projection_ignores_external_raw_cache_when_local_policy_reads() {
         let raw_creation_body = Bytes::from_static(
             br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":80000,"cache_read_input_tokens":0}}"#,
@@ -6586,7 +6738,7 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
 
         assert_eq!(raw.input_tokens, 100000);
         assert!(reported.input_tokens <= 96);
-        assert!(reported.cache_read_input_tokens > 0);
+        assert_eq!(reported.cache_read_input_tokens, 0);
         assert!(reported.cache_creation_input_tokens > 0);
     }
 

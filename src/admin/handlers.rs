@@ -123,6 +123,13 @@ pub struct UsageDashboardQueryParams {
     pub timezone: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDashboardWindowQueryParams {
+    pub timezone: Option<String>,
+    pub window_key: Option<String>,
+}
+
 /// GET /api/admin/system/version
 pub async fn get_system_version() -> Json<SystemVersionResponse> {
     Json(SystemVersionResponse {
@@ -984,6 +991,71 @@ pub async fn get_usage_dashboard(
     Query(params): Query<UsageDashboardQueryParams>,
 ) -> impl IntoResponse {
     match state.service.get_usage_dashboard(params.timezone) {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/usage-dashboard/windows
+/// 获取 usage 仪表盘窗口汇总。
+pub async fn get_usage_dashboard_windows(
+    State(state): State<AdminState>,
+    Query(params): Query<UsageDashboardQueryParams>,
+) -> impl IntoResponse {
+    match state.service.get_usage_dashboard_windows(params.timezone) {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/usage-dashboard/series
+/// 获取 usage 仪表盘趋势数据。
+pub async fn get_usage_dashboard_series(
+    State(state): State<AdminState>,
+    Query(params): Query<UsageDashboardQueryParams>,
+) -> impl IntoResponse {
+    match state.service.get_usage_dashboard_series(params.timezone) {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/usage-dashboard/top
+/// 获取 usage 仪表盘排行数据。
+pub async fn get_usage_dashboard_top(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.get_usage_dashboard_top() {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/usage-dashboard/breakdown
+/// 获取 usage 仪表盘单个窗口的状态和来源分布。
+pub async fn get_usage_dashboard_breakdown(
+    State(state): State<AdminState>,
+    Query(params): Query<UsageDashboardWindowQueryParams>,
+) -> impl IntoResponse {
+    let window_key = params.window_key.unwrap_or_else(|| "today".to_string());
+    match state
+        .service
+        .get_usage_dashboard_breakdown(params.timezone, window_key)
+    {
+        Ok(data) => Json(data).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/usage-dashboard/external-pool-billing
+/// 获取 usage 仪表盘单个窗口的外部池费用明细。
+pub async fn get_usage_dashboard_external_pool_billing(
+    State(state): State<AdminState>,
+    Query(params): Query<UsageDashboardWindowQueryParams>,
+) -> impl IntoResponse {
+    let window_key = params.window_key.unwrap_or_else(|| "today".to_string());
+    match state
+        .service
+        .get_usage_dashboard_external_pool_billing(params.timezone, window_key)
+    {
         Ok(data) => Json(data).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

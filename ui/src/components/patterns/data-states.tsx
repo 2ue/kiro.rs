@@ -20,7 +20,7 @@ export function EmptyState({
   return (
     <div
       className={cn(
-        'flex flex-col items-center justify-center rounded-xl border border-dashed border-border bg-muted/30 px-6 py-14 text-center',
+        'flex flex-col items-center justify-center rounded-xl bg-muted/30 px-6 py-14 text-center',
         className
       )}
     >
@@ -82,13 +82,14 @@ export function Callout({
   className?: string
 }) {
   const toneClass = {
-    info: 'border-info/30 bg-info/5 text-info',
+    info: 'bg-info/5 text-info',
     warning: 'border-warning/30 bg-warning/5 text-warning',
-    success: 'border-success/30 bg-success/5 text-success',
+    success: 'bg-success/5 text-success',
     error: 'border-destructive/30 bg-destructive/5 text-destructive',
   }[tone]
+  const needsBorder = tone === 'warning' || tone === 'error'
   return (
-    <div className={cn('rounded-lg border px-3.5 py-2.5 text-xs leading-relaxed', toneClass, className)}>
+    <div className={cn('rounded-lg px-3.5 py-2.5 text-xs leading-relaxed', needsBorder && 'border', toneClass, className)}>
       {children}
     </div>
   )

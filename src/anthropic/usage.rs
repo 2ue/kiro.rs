@@ -255,6 +255,10 @@ pub struct UsageRecord {
     pub stream: bool,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_max_tokens: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downstream_stop_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_outbound_model: Option<String>,
@@ -536,6 +540,48 @@ pub struct UsageDashboardResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UsageDashboardWindowsResponse {
+    pub generated_at: String,
+    pub timezone: String,
+    pub windows: Vec<UsageDashboardWindow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDashboardSeriesResponse {
+    pub generated_at: String,
+    pub timezone: String,
+    pub series: UsageDashboardSeries,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDashboardTopResponse {
+    pub generated_at: String,
+    pub top: UsageDashboardTop,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDashboardBreakdownResponse {
+    pub generated_at: String,
+    pub timezone: String,
+    pub window_key: String,
+    pub status_breakdown: Vec<UsageBreakdownItem>,
+    pub usage_source_breakdown: Vec<UsageBreakdownItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDashboardExternalPoolBillingResponse {
+    pub generated_at: String,
+    pub timezone: String,
+    pub window_key: String,
+    pub external_pool_billing_by_pool: Vec<UsageExternalPoolBillingByPool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UsageDashboardWindow {
     pub key: String,
     pub label: String,
@@ -692,6 +738,22 @@ pub fn usage_dashboard_windows(
         dashboard_window("last30d", "最近30天", now - ChronoDuration::days(30), now),
         dashboard_window("thisMonth", "本月", month_start, now),
     ]
+}
+
+pub fn usage_dashboard_window_spec_for_key(
+    now: DateTime<Utc>,
+    offset: FixedOffset,
+    key: &str,
+) -> UsageDashboardWindowSpec {
+    let requested_key = key.trim();
+    let windows = usage_dashboard_windows(now, offset);
+    windows
+        .iter()
+        .find(|window| window.key == requested_key)
+        .or_else(|| windows.iter().find(|window| window.key == "today"))
+        .or_else(|| windows.first())
+        .cloned()
+        .expect("usage dashboard always has at least one window")
 }
 
 pub fn usage_dashboard_hourly_windows(
@@ -1312,9 +1374,9 @@ impl UsageRecorder {
                 Ok(UsageDashboardCacheRead::Hit(dashboard)) => return Ok(dashboard),
                 Ok(UsageDashboardCacheRead::Empty) => {}
                 Ok(UsageDashboardCacheRead::Timeout) => {
-                    anyhow::bail!(
-                        "读取 Redis usage dashboard 超过 {} 秒，已中止本次后台查询",
-                        USAGE_DASHBOARD_REDIS_TIMEOUT_SECS
+                    tracing::warn!(
+                        timeout_secs = USAGE_DASHBOARD_REDIS_TIMEOUT_SECS,
+                        "读取 Redis usage dashboard 超时，回退 PgSQL"
                     );
                 }
                 Err(err) => {
@@ -1343,6 +1405,217 @@ impl UsageRecorder {
         }
 
         anyhow::bail!("usage dashboard 需要 Redis 或 PgSQL 聚合存储")
+    }
+
+    pub fn dashboard_windows(
+        &self,
+        timezone: Option<&str>,
+        high_cache_threshold: i32,
+    ) -> anyhow::Result<UsageDashboardWindowsResponse> {
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            let timezone = timezone.map(str::to_string);
+            match block_on_usage_store(async move {
+                redis
+                    .usage_dashboard_windows_only(timezone.as_deref(), high_cache_threshold)
+                    .await
+            }) {
+                Ok(Some((generated_at, timezone, windows))) => {
+                    return Ok(UsageDashboardWindowsResponse {
+                        generated_at,
+                        timezone,
+                        windows,
+                    });
+                }
+                Ok(None) => {}
+                Err(err) => tracing::warn!(
+                    "读取 Redis usage dashboard windows 失败，回退 PgSQL: {}",
+                    err
+                ),
+            }
+        }
+        if let Some(store) = &self.postgres_store {
+            let store = store.clone();
+            let timezone = timezone.map(str::to_string);
+            let (generated_at, timezone, windows) = block_on_usage_store(async move {
+                store
+                    .dashboard_windows_only(timezone.as_deref(), high_cache_threshold)
+                    .await
+            })?;
+            return Ok(UsageDashboardWindowsResponse {
+                generated_at,
+                timezone,
+                windows,
+            });
+        }
+        anyhow::bail!("usage dashboard windows 需要 Redis 或 PgSQL 聚合存储")
+    }
+
+    pub fn dashboard_series(
+        &self,
+        timezone: Option<&str>,
+    ) -> anyhow::Result<UsageDashboardSeriesResponse> {
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            let timezone = timezone.map(str::to_string);
+            match block_on_usage_store(async move {
+                redis.usage_dashboard_series_only(timezone.as_deref()).await
+            }) {
+                Ok(Some((generated_at, timezone, series))) => {
+                    return Ok(UsageDashboardSeriesResponse {
+                        generated_at,
+                        timezone,
+                        series,
+                    });
+                }
+                Ok(None) => {}
+                Err(err) => tracing::warn!(
+                    "读取 Redis usage dashboard series 失败，回退 PgSQL: {}",
+                    err
+                ),
+            }
+        }
+        if let Some(store) = &self.postgres_store {
+            let store = store.clone();
+            let timezone = timezone.map(str::to_string);
+            let (generated_at, timezone, series) = block_on_usage_store(async move {
+                store.dashboard_series_only(timezone.as_deref()).await
+            })?;
+            return Ok(UsageDashboardSeriesResponse {
+                generated_at,
+                timezone,
+                series,
+            });
+        }
+        anyhow::bail!("usage dashboard series 需要 Redis 或 PgSQL 聚合存储")
+    }
+
+    pub fn dashboard_top(&self) -> anyhow::Result<UsageDashboardTopResponse> {
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            match block_on_usage_store(async move { redis.usage_dashboard_top_only().await }) {
+                Ok(Some((generated_at, top))) => {
+                    return Ok(UsageDashboardTopResponse { generated_at, top });
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!("读取 Redis usage dashboard top 失败，回退 PgSQL: {}", err)
+                }
+            }
+        }
+        if let Some(store) = &self.postgres_store {
+            let store = store.clone();
+            let (generated_at, top) =
+                block_on_usage_store(async move { store.dashboard_top_only().await })?;
+            return Ok(UsageDashboardTopResponse { generated_at, top });
+        }
+        anyhow::bail!("usage dashboard top 需要 Redis 或 PgSQL 聚合存储")
+    }
+
+    pub fn dashboard_breakdown(
+        &self,
+        timezone: Option<&str>,
+        window_key: &str,
+    ) -> anyhow::Result<UsageDashboardBreakdownResponse> {
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            let timezone = timezone.map(str::to_string);
+            let window_key = window_key.to_string();
+            match block_on_usage_store(async move {
+                redis
+                    .usage_dashboard_breakdown_only(timezone.as_deref(), &window_key)
+                    .await
+            }) {
+                Ok(Some((
+                    generated_at,
+                    timezone,
+                    window_key,
+                    status_breakdown,
+                    usage_source_breakdown,
+                ))) => {
+                    return Ok(UsageDashboardBreakdownResponse {
+                        generated_at,
+                        timezone,
+                        window_key,
+                        status_breakdown,
+                        usage_source_breakdown,
+                    });
+                }
+                Ok(None) => {}
+                Err(err) => tracing::warn!(
+                    "读取 Redis usage dashboard breakdown 失败，回退 PgSQL: {}",
+                    err
+                ),
+            }
+        }
+        if let Some(store) = &self.postgres_store {
+            let store = store.clone();
+            let timezone = timezone.map(str::to_string);
+            let window_key = window_key.to_string();
+            let (generated_at, timezone, window_key, status_breakdown, usage_source_breakdown) =
+                block_on_usage_store(async move {
+                    store
+                        .dashboard_breakdown_only(timezone.as_deref(), &window_key)
+                        .await
+                })?;
+            return Ok(UsageDashboardBreakdownResponse {
+                generated_at,
+                timezone,
+                window_key,
+                status_breakdown,
+                usage_source_breakdown,
+            });
+        }
+        anyhow::bail!("usage dashboard breakdown 需要 Redis 或 PgSQL 聚合存储")
+    }
+
+    pub fn dashboard_external_pool_billing(
+        &self,
+        timezone: Option<&str>,
+        window_key: &str,
+    ) -> anyhow::Result<UsageDashboardExternalPoolBillingResponse> {
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            let timezone = timezone.map(str::to_string);
+            let window_key = window_key.to_string();
+            match block_on_usage_store(async move {
+                redis
+                    .usage_dashboard_external_pool_billing_only(timezone.as_deref(), &window_key)
+                    .await
+            }) {
+                Ok(Some((generated_at, timezone, window_key, external_pool_billing_by_pool))) => {
+                    return Ok(UsageDashboardExternalPoolBillingResponse {
+                        generated_at,
+                        timezone,
+                        window_key,
+                        external_pool_billing_by_pool,
+                    });
+                }
+                Ok(None) => {}
+                Err(err) => tracing::warn!(
+                    "读取 Redis usage dashboard external pool billing 失败，回退 PgSQL: {}",
+                    err
+                ),
+            }
+        }
+        if let Some(store) = &self.postgres_store {
+            let store = store.clone();
+            let timezone = timezone.map(str::to_string);
+            let window_key = window_key.to_string();
+            let (generated_at, timezone, window_key, external_pool_billing_by_pool) =
+                block_on_usage_store(async move {
+                    store
+                        .dashboard_external_pool_billing_only(timezone.as_deref(), &window_key)
+                        .await
+                })?;
+            return Ok(UsageDashboardExternalPoolBillingResponse {
+                generated_at,
+                timezone,
+                window_key,
+                external_pool_billing_by_pool,
+            });
+        }
+        anyhow::bail!("usage dashboard external pool billing 需要 Redis 或 PgSQL 聚合存储")
     }
 
     fn summary_memory(&self, high_cache_threshold: i32) -> UsageSummary {
@@ -1871,6 +2144,8 @@ mod tests {
             endpoint: "/v1/messages".to_string(),
             stream: true,
             model: "claude-sonnet-4-5".to_string(),
+            requested_max_tokens: None,
+            downstream_stop_reason: None,
             upstream_model: None,
             external_outbound_model: None,
             model_resolution_source: None,
@@ -1934,6 +2209,8 @@ mod tests {
     fn usage_record_deserializes_historical_json_without_error_diagnostics() {
         let mut value = serde_json::to_value(record("historical", 0, UsageSource::None)).unwrap();
         let object = value.as_object_mut().unwrap();
+        object.remove("requestedMaxTokens");
+        object.remove("downstreamStopReason");
         object.remove("errorStatusCode");
         object.remove("errorSource");
         object.remove("errorId");
@@ -1944,6 +2221,8 @@ mod tests {
 
         let decoded: UsageRecord = serde_json::from_value(value).unwrap();
 
+        assert_eq!(decoded.requested_max_tokens, None);
+        assert_eq!(decoded.downstream_stop_reason, None);
         assert_eq!(decoded.error_status_code, None);
         assert_eq!(decoded.error_source, None);
         assert_eq!(decoded.error_id, None);

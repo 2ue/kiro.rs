@@ -19,8 +19,8 @@ impl Default for TlsBackend {
 /// 路径级 prompt-cache usage 模式。
 ///
 /// 该枚举仍作为内部请求链路标记使用；外部配置不再选择缓存模式：
-/// `/v1`、`/cc/v1`、`/ha/v1`、`/na/v1` 消息路径固定使用 high-cache；
-/// `/na` 默认通过路径级上报策略关闭本地模拟 cache usage 补足。
+/// `/v1`、`/cc/v1`、`/ha/v1` 消息路径默认使用 high-cache；
+/// `/na` 是 no-cache 路径，不进入本地 prompt-cache 计算。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum PromptCacheSimulationMode {
@@ -611,7 +611,6 @@ pub struct ReportedUsageConfig {
 impl Default for ReportedUsageConfig {
     fn default() -> Self {
         let mut path_overrides = BTreeMap::new();
-        path_overrides.insert("/na".to_string(), ReportedUsagePathPolicy::disabled());
         path_overrides.insert(
             "/cc".to_string(),
             ReportedUsagePathPolicy {
@@ -1113,9 +1112,152 @@ impl CacheBoundsPolicyPatch {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroRsToolCachePolicy {
+    #[serde(default = "default_kiro_rs_tool_coverage_ratio")]
+    pub coverage_ratio: f64,
+    #[serde(default)]
+    pub max_coverage_tokens: i32,
+    #[serde(default = "default_true")]
+    pub incremental_create_enabled: bool,
+    #[serde(default)]
+    pub max_new_creation_tokens_per_request: i32,
+    #[serde(default)]
+    pub cache_current_user_stable_prefix: bool,
+    #[serde(default)]
+    pub current_user_stable_prefix_max_tokens: i32,
+}
+
+impl Default for KiroRsToolCachePolicy {
+    fn default() -> Self {
+        Self {
+            coverage_ratio: default_kiro_rs_tool_coverage_ratio(),
+            max_coverage_tokens: 0,
+            incremental_create_enabled: true,
+            max_new_creation_tokens_per_request: 0,
+            cache_current_user_stable_prefix: false,
+            current_user_stable_prefix_max_tokens: 0,
+        }
+    }
+}
+
+impl KiroRsToolCachePolicy {
+    pub fn normalized(mut self) -> Self {
+        if !self.coverage_ratio.is_finite() {
+            self.coverage_ratio = default_kiro_rs_tool_coverage_ratio();
+        }
+        self.coverage_ratio = self.coverage_ratio.clamp(0.0, 1.0);
+        self.max_coverage_tokens = self.max_coverage_tokens.max(0);
+        self.max_new_creation_tokens_per_request = self.max_new_creation_tokens_per_request.max(0);
+        self.current_user_stable_prefix_max_tokens =
+            self.current_user_stable_prefix_max_tokens.max(0);
+        if !self.cache_current_user_stable_prefix {
+            self.current_user_stable_prefix_max_tokens = 0;
+        }
+        self
+    }
+
+    pub fn validate(self, label: &str) -> Result<(), String> {
+        if !(0.0..=1.0).contains(&self.coverage_ratio) || !self.coverage_ratio.is_finite() {
+            return Err(format!("{label}.coverageRatio 必须在 0 到 1 之间"));
+        }
+        if self.max_coverage_tokens < 0 {
+            return Err(format!("{label}.maxCoverageTokens 不能小于 0"));
+        }
+        if self.max_new_creation_tokens_per_request < 0 {
+            return Err(format!("{label}.maxNewCreationTokensPerRequest 不能小于 0"));
+        }
+        if self.current_user_stable_prefix_max_tokens < 0 {
+            return Err(format!(
+                "{label}.currentUserStablePrefixMaxTokens 不能小于 0"
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroRsToolCachePolicyPatch {
+    #[serde(default)]
+    pub coverage_ratio: Option<f64>,
+    #[serde(default)]
+    pub max_coverage_tokens: Option<i32>,
+    #[serde(default)]
+    pub incremental_create_enabled: Option<bool>,
+    #[serde(default)]
+    pub max_new_creation_tokens_per_request: Option<i32>,
+    #[serde(default)]
+    pub cache_current_user_stable_prefix: Option<bool>,
+    #[serde(default)]
+    pub current_user_stable_prefix_max_tokens: Option<i32>,
+}
+
+impl KiroRsToolCachePolicyPatch {
+    fn apply_to(self, mut policy: KiroRsToolCachePolicy) -> KiroRsToolCachePolicy {
+        if let Some(value) = self.coverage_ratio {
+            policy.coverage_ratio = value;
+        }
+        if let Some(value) = self.max_coverage_tokens {
+            policy.max_coverage_tokens = value;
+        }
+        if let Some(value) = self.incremental_create_enabled {
+            policy.incremental_create_enabled = value;
+        }
+        if let Some(value) = self.max_new_creation_tokens_per_request {
+            policy.max_new_creation_tokens_per_request = value;
+        }
+        if let Some(value) = self.cache_current_user_stable_prefix {
+            policy.cache_current_user_stable_prefix = value;
+        }
+        if let Some(value) = self.current_user_stable_prefix_max_tokens {
+            policy.current_user_stable_prefix_max_tokens = value;
+        }
+        policy.normalized()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.coverage_ratio.is_none()
+            && self.max_coverage_tokens.is_none()
+            && self.incremental_create_enabled.is_none()
+            && self.max_new_creation_tokens_per_request.is_none()
+            && self.cache_current_user_stable_prefix.is_none()
+            && self.current_user_stable_prefix_max_tokens.is_none()
+    }
+
+    fn validate_raw(&self, label: &str) -> Result<(), String> {
+        if let Some(value) = self.coverage_ratio {
+            if !(0.0..=1.0).contains(&value) || !value.is_finite() {
+                return Err(format!("{label}.coverageRatio 必须在 0 到 1 之间"));
+            }
+        }
+        if self.max_coverage_tokens.is_some_and(|value| value < 0) {
+            return Err(format!("{label}.maxCoverageTokens 不能小于 0"));
+        }
+        if self
+            .max_new_creation_tokens_per_request
+            .is_some_and(|value| value < 0)
+        {
+            return Err(format!("{label}.maxNewCreationTokensPerRequest 不能小于 0"));
+        }
+        if self
+            .current_user_stable_prefix_max_tokens
+            .is_some_and(|value| value < 0)
+        {
+            return Err(format!(
+                "{label}.currentUserStablePrefixMaxTokens 不能小于 0"
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheRoutePolicyPatch {
+    #[serde(default)]
+    pub cache_type: Option<PromptCacheStrategyType>,
     #[serde(default)]
     pub simulation: Option<CacheSimulationPolicyPatch>,
     #[serde(default)]
@@ -1126,10 +1268,20 @@ pub struct CacheRoutePolicyPatch {
     pub cache_point: Option<CachePointPolicyPatch>,
     #[serde(default)]
     pub bounds: Option<CacheBoundsPolicyPatch>,
+    #[serde(default)]
+    pub kiro_rs_tool: Option<KiroRsToolCachePolicyPatch>,
 }
 
 impl CacheRoutePolicyPatch {
-    fn apply_to(&self, mut policy: CacheRoutePolicy) -> CacheRoutePolicy {
+    fn explicit_cache_type(&self) -> PromptCacheStrategyType {
+        self.cache_type
+            .unwrap_or(PromptCacheStrategyType::CurrentHighCache)
+    }
+
+    fn apply_fields_to(&self, mut policy: CacheRoutePolicy) -> CacheRoutePolicy {
+        if let Some(cache_type) = self.cache_type {
+            policy.cache_type = cache_type;
+        }
         if let Some(patch) = self.simulation {
             policy.simulation = patch.apply_to(policy.simulation);
         }
@@ -1145,7 +1297,15 @@ impl CacheRoutePolicyPatch {
         if let Some(patch) = self.bounds {
             policy.bounds = patch.apply_to(policy.bounds);
         }
+        if let Some(patch) = self.kiro_rs_tool {
+            policy.kiro_rs_tool = patch.apply_to(policy.kiro_rs_tool);
+        }
         policy.normalized()
+    }
+
+    fn apply_route_to(&self, mut policy: CacheRoutePolicy) -> CacheRoutePolicy {
+        policy.cache_type = self.explicit_cache_type();
+        self.apply_fields_for_strategy(policy)
     }
 
     pub fn validate(&self, label: &str, base: CacheRoutePolicy) -> Result<(), String> {
@@ -1161,22 +1321,60 @@ impl CacheRoutePolicyPatch {
         if let Some(patch) = &self.bounds {
             patch.validate_raw(&format!("{label}.bounds"))?;
         }
-        let policy = self.apply_to(base);
+        if let Some(patch) = &self.kiro_rs_tool {
+            patch.validate_raw(&format!("{label}.kiroRsTool"))?;
+        }
+        let policy = self.apply_route_to(base);
         policy.validate(label)
     }
 
+    fn apply_fields_for_strategy(&self, policy: CacheRoutePolicy) -> CacheRoutePolicy {
+        match policy.cache_type {
+            PromptCacheStrategyType::NoCache => self.apply_no_cache_fields_to(policy),
+            PromptCacheStrategyType::CurrentHighCache => self.apply_fields_to(policy),
+            PromptCacheStrategyType::KiroRsTool => self.apply_kiro_rs_tool_fields_to(policy),
+        }
+    }
+
+    fn apply_no_cache_fields_to(&self, mut policy: CacheRoutePolicy) -> CacheRoutePolicy {
+        if let Some(reported_usage) = &self.reported_usage {
+            policy.reported_usage = reported_usage.normalized();
+        }
+        policy.normalized()
+    }
+
+    fn apply_kiro_rs_tool_fields_to(&self, mut policy: CacheRoutePolicy) -> CacheRoutePolicy {
+        if let Some(cache_type) = self.cache_type {
+            policy.cache_type = cache_type;
+        }
+        if let Some(patch) = self.cache_point {
+            policy.cache_point = patch.apply_to(policy.cache_point);
+        }
+        if let Some(patch) = self.bounds {
+            policy.bounds = patch.apply_to(policy.bounds);
+        }
+        if let Some(patch) = self.kiro_rs_tool {
+            policy.kiro_rs_tool = patch.apply_to(policy.kiro_rs_tool);
+        }
+        policy.normalized()
+    }
+
     fn affects_cache_state(&self) -> bool {
-        self.simulation
-            .as_ref()
-            .is_some_and(|patch| !patch.is_empty())
+        self.cache_type
+            .is_some_and(|cache_type| cache_type != PromptCacheStrategyType::NoCache)
+            || self.simulation.is_some()
             || self.creation_control.is_some()
-            || self.bounds.as_ref().is_some_and(|patch| !patch.is_empty())
+            || self.cache_point.is_some()
+            || self.bounds.is_some()
+            || self.kiro_rs_tool.is_some()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.simulation
-            .as_ref()
-            .is_none_or(CacheSimulationPolicyPatch::is_empty)
+        self.cache_type.is_none()
+            && self
+                .simulation
+                .as_ref()
+                .is_none_or(CacheSimulationPolicyPatch::is_empty)
             && self.creation_control.is_none()
             && self.reported_usage.is_none()
             && self
@@ -1187,7 +1385,20 @@ impl CacheRoutePolicyPatch {
                 .bounds
                 .as_ref()
                 .is_none_or(CacheBoundsPolicyPatch::is_empty)
+            && self
+                .kiro_rs_tool
+                .as_ref()
+                .is_none_or(KiroRsToolCachePolicyPatch::is_empty)
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheStrategyType {
+    NoCache,
+    #[default]
+    CurrentHighCache,
+    KiroRsTool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -1196,10 +1407,57 @@ pub struct CachePolicyConfig {
     #[serde(default)]
     pub default: CacheRoutePolicyPatch,
     #[serde(default)]
+    pub current_high_cache: CacheRoutePolicyPatch,
+    #[serde(default)]
+    pub kiro_rs_tool: CacheRoutePolicyPatch,
+    #[serde(default)]
     pub path_overrides: BTreeMap<String, CacheRoutePolicyPatch>,
 }
 
 impl CachePolicyConfig {
+    pub fn with_builtin_path_defaults(mut self) -> Self {
+        for prefix in ["/v1", "/cc", "/ha"] {
+            self.path_overrides
+                .entry(prefix.to_string())
+                .or_insert_with(|| CacheRoutePolicyPatch {
+                    cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+                    ..CacheRoutePolicyPatch::default()
+                });
+        }
+        self.ensure_builtin_no_cache_route("/na");
+        self
+    }
+
+    pub fn with_legacy_defined_cache_route_defaults(mut self, routes: &[String]) -> Self {
+        for prefix in normalize_defined_cache_routes(routes) {
+            self.path_overrides
+                .entry(prefix)
+                .or_insert_with(|| CacheRoutePolicyPatch {
+                    cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+                    ..CacheRoutePolicyPatch::default()
+                });
+        }
+        self
+    }
+
+    pub fn migrate_builtin_no_cache_routes(&mut self) -> bool {
+        self.ensure_builtin_no_cache_route("/na")
+    }
+
+    fn ensure_builtin_no_cache_route(&mut self, prefix: &str) -> bool {
+        let expected = CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::NoCache),
+            ..CacheRoutePolicyPatch::default()
+        };
+        match self.path_overrides.get(prefix) {
+            Some(policy) if policy == &expected => false,
+            _ => {
+                self.path_overrides.insert(prefix.to_string(), expected);
+                true
+            }
+        }
+    }
+
     pub fn normalized(&self) -> Self {
         let path_overrides = self
             .path_overrides
@@ -1211,33 +1469,113 @@ impl CachePolicyConfig {
             .collect();
         Self {
             default: self.default.clone(),
+            current_high_cache: self.current_high_cache.clone(),
+            kiro_rs_tool: self.kiro_rs_tool.clone(),
             path_overrides,
         }
     }
 
     pub fn validate(&self, base: CacheRoutePolicy) -> Result<(), String> {
-        self.default.validate("默认缓存策略", base.clone())?;
-        let default_policy = self.default.apply_to(base);
+        self.default
+            .validate("当前本地模拟策略兼容参数", base.clone())?;
+        self.current_high_cache
+            .validate("当前本地模拟策略模板", base.clone())?;
+        self.kiro_rs_tool
+            .validate("Kiro-RS-Tool 缓存策略模板", base.clone())?;
         for (prefix, policy) in &self.path_overrides {
             let Some(normalized_prefix) = normalize_reported_usage_path_prefix(prefix) else {
                 return Err("缓存策略路径前缀不能为空".to_string());
             };
-            policy.validate(
-                &format!("路径 {normalized_prefix} 缓存策略"),
-                default_policy.clone(),
-            )?;
+            policy.validate(&format!("路径 {normalized_prefix} 缓存策略"), base.clone())?;
         }
         Ok(())
+    }
+
+    fn current_high_cache_template(&self, base: CacheRoutePolicy) -> CacheRoutePolicy {
+        let policy = self.default.apply_fields_to(base);
+        self.current_high_cache.apply_fields_to(policy)
+    }
+
+    fn kiro_rs_tool_template(&self, base: CacheRoutePolicy) -> CacheRoutePolicy {
+        let neutral = CacheRoutePolicy {
+            cache_type: PromptCacheStrategyType::KiroRsTool,
+            simulation: CacheSimulationPolicy {
+                enabled: false,
+                target_read_ratio: default_prompt_cache_target_read_ratio(),
+                token_scale: 1.0,
+                max_simulated_input_tokens: 0,
+                cap_jitter_min_tokens: 0,
+                cap_jitter_max_tokens: 0,
+                scale_min_input_tokens: 0,
+            }
+            .normalized(),
+            creation_control: PromptCacheCreationControlConfig {
+                enabled: false,
+                ..base.creation_control
+            }
+            .normalized(),
+            reported_usage: ReportedUsagePathPolicy::disabled().normalized(),
+            cache_point: CachePointPolicy::default(),
+            bounds: base.bounds,
+            kiro_rs_tool: KiroRsToolCachePolicy::default(),
+        };
+        self.kiro_rs_tool.apply_kiro_rs_tool_fields_to(neutral)
+    }
+
+    fn no_cache_policy(&self, base: CacheRoutePolicy) -> CacheRoutePolicy {
+        CacheRoutePolicy {
+            cache_type: PromptCacheStrategyType::NoCache,
+            simulation: CacheSimulationPolicy {
+                enabled: false,
+                ..base.simulation
+            }
+            .normalized(),
+            creation_control: PromptCacheCreationControlConfig {
+                enabled: false,
+                ..base.creation_control
+            }
+            .normalized(),
+            reported_usage: base.reported_usage,
+            cache_point: CachePointPolicy {
+                enabled: false,
+                ..base.cache_point
+            },
+            bounds: base.bounds,
+            kiro_rs_tool: base.kiro_rs_tool,
+        }
+        .normalized()
+    }
+
+    fn strategy_policy(
+        &self,
+        strategy_type: PromptCacheStrategyType,
+        base: CacheRoutePolicy,
+    ) -> CacheRoutePolicy {
+        match strategy_type {
+            PromptCacheStrategyType::NoCache => self.no_cache_policy(base),
+            PromptCacheStrategyType::CurrentHighCache => {
+                let mut policy = self.current_high_cache_template(base);
+                policy.cache_type = PromptCacheStrategyType::CurrentHighCache;
+                policy.normalized()
+            }
+            PromptCacheStrategyType::KiroRsTool => {
+                let mut policy = self.kiro_rs_tool_template(base);
+                policy.cache_type = PromptCacheStrategyType::KiroRsTool;
+                policy.normalized()
+            }
+        }
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CacheRoutePolicy {
+    pub cache_type: PromptCacheStrategyType,
     pub simulation: CacheSimulationPolicy,
     pub creation_control: PromptCacheCreationControlConfig,
     pub reported_usage: ReportedUsagePathPolicy,
     pub cache_point: CachePointPolicy,
     pub bounds: CacheBoundsPolicy,
+    pub kiro_rs_tool: KiroRsToolCachePolicy,
 }
 
 impl CacheRoutePolicy {
@@ -1245,6 +1583,7 @@ impl CacheRoutePolicy {
         self.simulation = self.simulation.normalized();
         self.creation_control = self.creation_control.normalized();
         self.reported_usage = self.reported_usage.normalized();
+        self.kiro_rs_tool = self.kiro_rs_tool.normalized();
         self
     }
 
@@ -1256,6 +1595,7 @@ impl CacheRoutePolicy {
         self.reported_usage
             .validate(&format!("{label}.reportedUsage"))?;
         self.bounds.validate(&format!("{label}.bounds"))?;
+        self.kiro_rs_tool.validate(&format!("{label}.kiroRsTool"))?;
         Ok(())
     }
 }
@@ -1273,24 +1613,40 @@ pub fn resolve_cache_policy_for_path(
     path: &str,
 ) -> ResolvedCacheRoutePolicy {
     let cache_policy = cache_policy.normalized();
-    let mut policy = cache_policy.default.apply_to(base);
+    let mut path_base = base.clone();
 
     if let Some(reported_usage) = reported_usage.path_override_for_path(path) {
-        policy.reported_usage = reported_usage.normalized();
+        path_base.reported_usage = reported_usage.normalized();
     }
 
-    let mut namespace = None;
-    if let Some((prefix, override_policy)) = cache_policy
+    let Some((prefix, override_policy)) = cache_policy
         .path_overrides
         .iter()
         .filter(|(prefix, _)| reported_usage_path_matches(prefix, path))
         .max_by_key(|(prefix, _)| prefix.len())
-    {
-        if override_policy.affects_cache_state() {
-            namespace = Some(prefix.clone());
+    else {
+        return ResolvedCacheRoutePolicy {
+            policy: cache_policy.no_cache_policy(path_base),
+            namespace: None,
+        };
+    };
+
+    let cache_type = override_policy.explicit_cache_type();
+    let policy = override_policy
+        .apply_fields_for_strategy(cache_policy.strategy_policy(cache_type, path_base));
+    let namespace = match cache_type {
+        PromptCacheStrategyType::NoCache => None,
+        PromptCacheStrategyType::KiroRsTool => Some(prefix.clone()),
+        PromptCacheStrategyType::CurrentHighCache => {
+            if matches!(prefix.as_str(), "/v1" | "/cc" | "/ha" | "/na") {
+                None
+            } else {
+                override_policy
+                    .affects_cache_state()
+                    .then(|| prefix.clone())
+            }
         }
-        policy = override_policy.apply_to(policy);
-    }
+    };
 
     ResolvedCacheRoutePolicy {
         policy: policy.normalized(),
@@ -2480,6 +2836,10 @@ fn default_prompt_cache_target_read_ratio() -> f64 {
     0.98
 }
 
+fn default_kiro_rs_tool_coverage_ratio() -> f64 {
+    1.0
+}
+
 fn default_prompt_cache_token_scale() -> f64 {
     1.6
 }
@@ -2921,6 +3281,7 @@ impl Config {
 
     pub fn legacy_cache_route_policy_default(&self) -> CacheRoutePolicy {
         CacheRoutePolicy {
+            cache_type: PromptCacheStrategyType::CurrentHighCache,
             simulation: CacheSimulationPolicy {
                 enabled: true,
                 target_read_ratio: self.prompt_cache_target_read_ratio,
@@ -2944,6 +3305,7 @@ impl Config {
                 entry_ttl_secs: self.prompt_cache_entry_ttl_secs,
                 estimated_bytes_limit: self.prompt_cache_estimated_bytes_limit,
             },
+            kiro_rs_tool: KiroRsToolCachePolicy::default(),
         }
         .normalized()
     }
@@ -2953,7 +3315,11 @@ impl Config {
         resolve_cache_policy_for_path(
             self.legacy_cache_route_policy_default(),
             &self.reported_usage,
-            &self.cache_policy,
+            &self
+                .cache_policy
+                .clone()
+                .with_builtin_path_defaults()
+                .with_legacy_defined_cache_route_defaults(&self.defined_cache_routes),
             path,
         )
     }
@@ -3011,6 +3377,14 @@ impl Config {
                 changed = true;
             }
         }
+        changed
+    }
+
+    /// Apply one-way runtime config migrations that keep old PgSQL configs aligned
+    /// with current built-in route semantics.
+    pub fn apply_runtime_config_migrations(&mut self) -> bool {
+        let mut changed = self.cache_policy.migrate_builtin_no_cache_routes();
+        changed |= self.reported_usage.path_overrides.remove("/na").is_some();
         changed
     }
 
@@ -3182,8 +3556,9 @@ mod tests {
             ha_policy.cache_creation.mode,
             ReportedUsageFieldMode::Preserve
         );
+        assert!(!config.reported_usage.path_overrides.contains_key("/na"));
         assert!(
-            !config
+            config
                 .reported_usage
                 .policy_for_path("/na/v1/messages")
                 .enabled
@@ -3583,7 +3958,8 @@ mod tests {
             reported_usage.policy_for_path("/cc/other").input.max_tokens,
             96
         );
-        assert!(!reported_usage.policy_for_path("/na/v1/messages").enabled);
+        assert!(!reported_usage.path_overrides.contains_key("/na"));
+        assert!(reported_usage.policy_for_path("/na/v1/messages").enabled);
     }
 
     #[test]
@@ -3617,6 +3993,7 @@ mod tests {
         config.cache_policy.path_overrides.insert(
             "/cc".to_string(),
             CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::KiroRsTool),
                 simulation: Some(CacheSimulationPolicyPatch {
                     enabled: Some(false),
                     token_scale: Some(1.2),
@@ -3637,17 +4014,167 @@ mod tests {
         let cc = config.cache_policy_for_path("/cc/v1/messages");
 
         assert_eq!(cc.namespace.as_deref(), Some("/cc"));
+        assert_eq!(cc.policy.cache_type, PromptCacheStrategyType::KiroRsTool);
         assert!(!cc.policy.simulation.enabled);
-        assert_eq!(cc.policy.simulation.target_read_ratio, 0.91);
-        assert_eq!(cc.policy.simulation.token_scale, 1.2);
-        assert_eq!(cc.policy.reported_usage.input.max_tokens, 48);
+        assert_eq!(cc.policy.simulation.token_scale, 1.0);
+        assert_eq!(cc.policy.simulation.target_read_ratio, 0.98);
+        assert!(!cc.policy.reported_usage.enabled);
+        assert_eq!(cc.policy.reported_usage.input.max_tokens, 0);
         assert!(cc.policy.cache_point.enabled);
 
         let ha = config.cache_policy_for_path("/ha/v1/messages");
         assert_eq!(ha.namespace, None);
+        assert_eq!(
+            ha.policy.cache_type,
+            PromptCacheStrategyType::CurrentHighCache
+        );
         assert!(ha.policy.simulation.enabled);
         assert_eq!(ha.policy.simulation.target_read_ratio, 0.91);
         assert_eq!(ha.policy.reported_usage.input.max_tokens, 96);
+
+        let na = config.cache_policy_for_path("/na/v1/messages");
+        assert_eq!(na.namespace, None);
+        assert_eq!(na.policy.cache_type, PromptCacheStrategyType::NoCache);
+        assert!(!na.policy.simulation.enabled);
+        assert!(!na.policy.creation_control.enabled);
+        assert!(!na.policy.cache_point.enabled);
+
+        let unknown = config.cache_policy_for_path("/reports/v1/messages");
+        assert_eq!(unknown.namespace, None);
+        assert_eq!(unknown.policy.cache_type, PromptCacheStrategyType::NoCache);
+        assert!(!unknown.policy.simulation.enabled);
+    }
+
+    #[test]
+    fn cache_policy_preserves_cache_type_only_override() {
+        let mut config = Config::default();
+        config.cache_policy.path_overrides.insert(
+            "/tool".to_string(),
+            CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::KiroRsTool),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+
+        let normalized = config.cache_policy.normalized();
+        assert!(normalized.path_overrides.contains_key("/tool"));
+
+        let resolved = config.cache_policy_for_path("/tool/v1/messages");
+        assert_eq!(resolved.namespace.as_deref(), Some("/tool"));
+        assert_eq!(
+            resolved.policy.cache_type,
+            PromptCacheStrategyType::KiroRsTool
+        );
+
+        let inherited = config.cache_policy_for_path("/cc/v1/messages");
+        assert_eq!(inherited.namespace, None);
+        assert_eq!(
+            inherited.policy.cache_type,
+            PromptCacheStrategyType::CurrentHighCache
+        );
+    }
+
+    #[test]
+    fn kiro_rs_tool_cache_policy_defaults_match_current_behavior() {
+        let policy = KiroRsToolCachePolicy::default();
+
+        assert_eq!(policy.coverage_ratio, 1.0);
+        assert_eq!(policy.max_coverage_tokens, 0);
+        assert!(policy.incremental_create_enabled);
+        assert_eq!(policy.max_new_creation_tokens_per_request, 0);
+        assert!(!policy.cache_current_user_stable_prefix);
+        assert_eq!(policy.current_user_stable_prefix_max_tokens, 0);
+    }
+
+    #[test]
+    fn kiro_rs_tool_cache_policy_deserializes_template_and_path_patch() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "cachePolicy": {
+                "kiroRsTool": {
+                    "kiroRsTool": {
+                        "coverageRatio": 0.75,
+                        "maxCoverageTokens": 12000,
+                        "incrementalCreateEnabled": true,
+                        "maxNewCreationTokensPerRequest": 3000,
+                        "cacheCurrentUserStablePrefix": true,
+                        "currentUserStablePrefixMaxTokens": 1500
+                    }
+                },
+                "pathOverrides": {
+                    "/dfcache/kiro-param": {
+                        "cacheType": "kiro_rs_tool",
+                        "kiroRsTool": {
+                            "coverageRatio": 0.5,
+                            "maxNewCreationTokensPerRequest": 1000
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("deserialize config");
+        config.cache_policy = config
+            .cache_policy
+            .with_builtin_path_defaults()
+            .with_legacy_defined_cache_route_defaults(&config.defined_cache_routes)
+            .normalized();
+
+        let template = config.cache_policy_for_path("/cc/v1/messages");
+        assert_eq!(
+            template.policy.cache_type,
+            PromptCacheStrategyType::CurrentHighCache
+        );
+
+        let resolved = config.cache_policy_for_path("/dfcache/kiro-param/v1/messages");
+        assert_eq!(resolved.namespace.as_deref(), Some("/dfcache/kiro-param"));
+        assert_eq!(
+            resolved.policy.cache_type,
+            PromptCacheStrategyType::KiroRsTool
+        );
+        assert_eq!(resolved.policy.kiro_rs_tool.coverage_ratio, 0.5);
+        assert_eq!(resolved.policy.kiro_rs_tool.max_coverage_tokens, 12_000);
+        assert_eq!(
+            resolved
+                .policy
+                .kiro_rs_tool
+                .max_new_creation_tokens_per_request,
+            1_000
+        );
+        assert!(
+            resolved
+                .policy
+                .kiro_rs_tool
+                .cache_current_user_stable_prefix
+        );
+        assert_eq!(
+            resolved
+                .policy
+                .kiro_rs_tool
+                .current_user_stable_prefix_max_tokens,
+            1_500
+        );
+    }
+
+    #[test]
+    fn kiro_rs_tool_cache_policy_rejects_invalid_values() {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "cachePolicy": {
+                "pathOverrides": {
+                    "/dfcache/bad": {
+                        "cacheType": "kiro_rs_tool",
+                        "kiroRsTool": {
+                            "coverageRatio": 1.5
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("deserialize config");
+
+        let err = config
+            .cache_policy
+            .validate(config.legacy_cache_route_policy_default())
+            .expect_err("invalid coverage ratio should fail");
+        assert!(err.contains("coverageRatio"));
     }
 
     #[test]
@@ -3735,7 +4262,126 @@ mod tests {
         let resolved = config.cache_policy_for_path("/reports/v1/messages");
 
         assert_eq!(resolved.namespace, None);
+        assert_eq!(
+            resolved.policy.cache_type,
+            PromptCacheStrategyType::CurrentHighCache
+        );
         assert_eq!(resolved.policy.reported_usage.input.max_tokens, 64);
+    }
+
+    #[test]
+    fn cache_policy_no_cache_route_skips_cache_state_and_is_preserved() {
+        let mut config = Config::default();
+        config.cache_policy.path_overrides.insert(
+            "/plain".to_string(),
+            CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::NoCache),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+
+        let normalized = config.cache_policy.normalized();
+        assert!(normalized.path_overrides.contains_key("/plain"));
+
+        let resolved = config.cache_policy_for_path("/plain/v1/messages");
+        assert_eq!(resolved.namespace, None);
+        assert_eq!(resolved.policy.cache_type, PromptCacheStrategyType::NoCache);
+        assert!(!resolved.policy.simulation.enabled);
+        assert!(!resolved.policy.creation_control.enabled);
+        assert!(!resolved.policy.cache_point.enabled);
+    }
+
+    #[test]
+    fn cache_policy_builtin_defaults_do_not_overwrite_existing_path() {
+        let mut cache_policy = CachePolicyConfig::default();
+        cache_policy.path_overrides.insert(
+            "/cc".to_string(),
+            CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::KiroRsTool),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+
+        cache_policy.path_overrides.insert(
+            "/na".to_string(),
+            CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+                simulation: Some(CacheSimulationPolicyPatch {
+                    enabled: Some(true),
+                    ..CacheSimulationPolicyPatch::default()
+                }),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+
+        let with_builtins = cache_policy.with_builtin_path_defaults();
+        for prefix in ["/v1", "/cc", "/ha", "/na"] {
+            assert!(with_builtins.path_overrides.contains_key(prefix));
+        }
+        assert_eq!(
+            with_builtins
+                .path_overrides
+                .get("/cc")
+                .and_then(|policy| policy.cache_type),
+            Some(PromptCacheStrategyType::KiroRsTool)
+        );
+        assert_eq!(
+            with_builtins
+                .path_overrides
+                .get("/na")
+                .and_then(|policy| policy.cache_type),
+            Some(PromptCacheStrategyType::NoCache)
+        );
+        assert!(
+            with_builtins
+                .path_overrides
+                .get("/na")
+                .and_then(|policy| policy.simulation)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn runtime_config_migration_rewrites_legacy_na_to_no_cache() {
+        let mut config = Config::default();
+        config.cache_policy.path_overrides.insert(
+            "/na".to_string(),
+            CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+                reported_usage: Some(ReportedUsagePathPolicy::disabled()),
+                cache_point: Some(CachePointPolicyPatch {
+                    enabled: Some(true),
+                    ..CachePointPolicyPatch::default()
+                }),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+
+        assert!(config.apply_runtime_config_migrations());
+        let na = config
+            .cache_policy
+            .path_overrides
+            .get("/na")
+            .expect("/na should be retained as an explicit route");
+        assert_eq!(na.cache_type, Some(PromptCacheStrategyType::NoCache));
+        assert!(na.reported_usage.is_none());
+        assert!(na.cache_point.is_none());
+
+        assert!(!config.apply_runtime_config_migrations());
+    }
+
+    #[test]
+    fn cache_policy_legacy_defined_cache_routes_default_to_current_strategy() {
+        let mut config = Config::default();
+        config.defined_cache_routes = vec!["/dfcache/team-a".to_string()];
+
+        let resolved = config.cache_policy_for_path("/dfcache/team-a/v1/messages");
+
+        assert_eq!(
+            resolved.policy.cache_type,
+            PromptCacheStrategyType::CurrentHighCache
+        );
+        assert_eq!(resolved.namespace.as_deref(), Some("/dfcache/team-a"));
     }
 
     #[test]
@@ -3849,8 +4495,9 @@ mod tests {
             ReportedUsageFieldMode::Preserve
         );
 
+        assert!(!config.reported_usage.path_overrides.contains_key("/na"));
         assert!(
-            !config
+            config
                 .reported_usage
                 .policy_for_path("/na/v1/messages")
                 .enabled

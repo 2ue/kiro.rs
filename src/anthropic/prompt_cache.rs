@@ -7,6 +7,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::anthropic::types::{Message, MessagesRequest, SystemMessage, Tool};
+use crate::model::config::KiroRsToolCachePolicy;
 use crate::token;
 
 const DEFAULT_PROMPT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -23,10 +24,17 @@ const ESTIMATED_ENTRY_BYTES: u64 = 256;
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct PromptCacheScope {
-    pub credential_id: u64,
     pub conversation_id: String,
-    pub model: String,
     pub route_namespace: Option<String>,
+}
+
+impl PromptCacheScope {
+    pub fn new(conversation_id: String, route_namespace: Option<String>) -> Self {
+        Self {
+            conversation_id,
+            route_namespace,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -65,6 +73,19 @@ impl PromptCacheProfile {
         let mut bytes = [0_u8; 8];
         bytes.copy_from_slice(&point.fingerprint[..8]);
         u64::from_be_bytes(bytes)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct KiroRsToolPromptCachePlan {
+    profile: Option<PromptCacheProfile>,
+    usage: PromptCacheUsage,
+    committed_cache_tokens: i32,
+}
+
+impl KiroRsToolPromptCachePlan {
+    pub fn usage(&self) -> PromptCacheUsage {
+        self.usage
     }
 }
 
@@ -158,6 +179,60 @@ impl PromptCacheTracker {
         self.build_profile_with_policy(req, total_input_tokens, true, cache_model)
     }
 
+    pub fn compute_kiro_rs_tool_with_bounds(
+        &self,
+        scope: Option<PromptCacheScope>,
+        req: &MessagesRequest,
+        total_input_tokens: i32,
+        cache_model: &str,
+        bounds: PromptCacheBounds,
+        policy: KiroRsToolCachePolicy,
+    ) -> KiroRsToolPromptCachePlan {
+        let policy = policy.normalized();
+        let profile =
+            self.build_kiro_rs_tool_profile_for_model(req, total_input_tokens, cache_model, policy);
+        let usage =
+            self.compute_kiro_rs_tool_profile_with_bounds(scope, profile.as_ref(), bounds, policy);
+        KiroRsToolPromptCachePlan {
+            profile,
+            usage,
+            committed_cache_tokens: usage
+                .cache_read_input_tokens
+                .saturating_add(usage.cache_creation_input_tokens)
+                .max(0),
+        }
+    }
+
+    pub fn commit_kiro_rs_tool_success_with_bounds(
+        &self,
+        scope: Option<PromptCacheScope>,
+        plan: &KiroRsToolPromptCachePlan,
+        bounds: PromptCacheBounds,
+    ) {
+        self.update_kiro_rs_tool_profile_with_bounds(
+            scope,
+            plan.profile.as_ref(),
+            bounds,
+            plan.committed_cache_tokens,
+        );
+    }
+
+    fn build_kiro_rs_tool_profile_for_model(
+        &self,
+        req: &MessagesRequest,
+        total_input_tokens: i32,
+        cache_model: &str,
+        policy: KiroRsToolCachePolicy,
+    ) -> Option<PromptCacheProfile> {
+        self.build_profile_with_blocks(
+            kiro_rs_tool_cache_blocks(req, policy),
+            total_input_tokens,
+            cache_model,
+            false,
+            false,
+        )
+    }
+
     fn build_profile_with_policy(
         &self,
         req: &MessagesRequest,
@@ -165,7 +240,23 @@ impl PromptCacheTracker {
         synthesize_stable_prefix: bool,
         cache_model: &str,
     ) -> Option<PromptCacheProfile> {
-        let blocks = flatten_cache_blocks(req);
+        self.build_profile_with_blocks(
+            flatten_cache_blocks(req),
+            total_input_tokens,
+            cache_model,
+            synthesize_stable_prefix,
+            true,
+        )
+    }
+
+    fn build_profile_with_blocks(
+        &self,
+        blocks: Vec<CacheBlock>,
+        total_input_tokens: i32,
+        cache_model: &str,
+        synthesize_stable_prefix: bool,
+        lookup_every_block: bool,
+    ) -> Option<PromptCacheProfile> {
         if blocks.is_empty() {
             return None;
         }
@@ -180,14 +271,6 @@ impl PromptCacheTracker {
             let canonical = canonicalize_cache_value(&block.value);
             write_hash_chunk(&mut hasher, &canonical);
             cumulative_tokens += block.tokens;
-            let digest = hasher.clone().finalize();
-            let mut fingerprint = [0_u8; 32];
-            fingerprint.copy_from_slice(&digest[..]);
-            lookup_points.push(PromptCacheLookupPoint {
-                fingerprint,
-                cumulative_tokens,
-            });
-
             let breakpoint_ttl = if let Some(ttl) = block.ttl {
                 active_ttl = Some(ttl);
                 Some(ttl)
@@ -196,6 +279,16 @@ impl PromptCacheTracker {
             } else {
                 None
             };
+
+            let digest = hasher.clone().finalize();
+            let mut fingerprint = [0_u8; 32];
+            fingerprint.copy_from_slice(&digest[..]);
+            if lookup_every_block || breakpoint_ttl.is_some() {
+                lookup_points.push(PromptCacheLookupPoint {
+                    fingerprint,
+                    cumulative_tokens,
+                });
+            }
 
             let Some(ttl) = breakpoint_ttl else {
                 continue;
@@ -390,10 +483,129 @@ impl PromptCacheTracker {
         enforce_cache_bounds_locked(&mut entries_by_scope, bounds);
     }
 
+    fn compute_kiro_rs_tool_profile_with_bounds(
+        &self,
+        scope: Option<PromptCacheScope>,
+        profile: Option<&PromptCacheProfile>,
+        bounds: PromptCacheBounds,
+        policy: KiroRsToolCachePolicy,
+    ) -> PromptCacheUsage {
+        let policy = policy.normalized();
+        let Some(scope) = scope else {
+            return PromptCacheUsage::default();
+        };
+        let Some(profile) = profile else {
+            return PromptCacheUsage::default();
+        };
+        let Some(covered_tokens) = profile
+            .lookup_points
+            .last()
+            .map(|point| point.cumulative_tokens.max(0))
+        else {
+            return PromptCacheUsage::default();
+        };
+        if covered_tokens <= 0 {
+            return PromptCacheUsage::default();
+        }
+        let covered_tokens = apply_kiro_rs_tool_coverage_policy(covered_tokens, policy);
+        if covered_tokens <= 0 {
+            return PromptCacheUsage::default();
+        }
+
+        let now = Utc::now();
+        let mut entries_by_scope = self.entries.lock();
+        prune_expired_locked(&mut entries_by_scope, now);
+
+        let mut read_tokens = 0;
+        if let Some(entries) = entries_by_scope.get_mut(&scope) {
+            for point in profile.lookup_points.iter().rev() {
+                let Some(entry) = entries.get_mut(&point.fingerprint) else {
+                    continue;
+                };
+                if entry.expires_at <= now {
+                    continue;
+                }
+                entry.last_used_at = now;
+                entry.expires_at = now
+                    + chrono::Duration::from_std(bounds.effective_ttl(entry.ttl))
+                        .unwrap_or_default();
+                read_tokens = point
+                    .cumulative_tokens
+                    .min(entry.cached_tokens)
+                    .min(covered_tokens)
+                    .max(0);
+                break;
+            }
+        }
+
+        let mut creation = covered_tokens.saturating_sub(read_tokens).max(0);
+        if !policy.incremental_create_enabled && read_tokens > 0 {
+            creation = 0;
+        }
+        if policy.max_new_creation_tokens_per_request > 0 {
+            creation = creation.min(policy.max_new_creation_tokens_per_request);
+        }
+        let (cache5m, cache1h) = target_ttl_breakdown(profile, creation);
+        PromptCacheUsage {
+            cache_creation_input_tokens: creation,
+            cache_read_input_tokens: read_tokens,
+            cache_creation_5m_input_tokens: cache5m,
+            cache_creation_1h_input_tokens: cache1h,
+            effective_cache_ratio: (profile.total_input_tokens > 0)
+                .then(|| covered_tokens as f64 / profile.total_input_tokens as f64),
+        }
+    }
+
+    fn update_kiro_rs_tool_profile_with_bounds(
+        &self,
+        scope: Option<PromptCacheScope>,
+        profile: Option<&PromptCacheProfile>,
+        bounds: PromptCacheBounds,
+        committed_cache_tokens: i32,
+    ) {
+        let Some(scope) = scope else {
+            return;
+        };
+        let Some(profile) = profile else {
+            return;
+        };
+        let committed_cache_tokens = committed_cache_tokens.max(0);
+        if profile.lookup_points.is_empty() || committed_cache_tokens <= 0 {
+            return;
+        }
+
+        let ttl = bounds.effective_ttl(
+            profile
+                .breakpoints
+                .last()
+                .map(|breakpoint| breakpoint.ttl)
+                .unwrap_or(DEFAULT_PROMPT_CACHE_TTL),
+        );
+        let now = Utc::now();
+        let mut entries_by_scope = self.entries.lock();
+        prune_expired_locked(&mut entries_by_scope, now);
+        let entries = entries_by_scope.entry(scope).or_default();
+
+        for point in &profile.lookup_points {
+            let cached_tokens = point.cumulative_tokens.min(committed_cache_tokens).max(0);
+            if cached_tokens <= 0 {
+                continue;
+            }
+            entries.insert(
+                point.fingerprint,
+                PromptCacheEntry {
+                    expires_at: now + chrono::Duration::from_std(ttl).unwrap_or_default(),
+                    ttl,
+                    last_used_at: now,
+                    cached_tokens,
+                },
+            );
+        }
+        enforce_cache_bounds_locked(&mut entries_by_scope, bounds);
+    }
+
     pub fn clear_credential(&self, credential_id: u64) {
-        self.entries
-            .lock()
-            .retain(|scope, _| scope.credential_id != credential_id);
+        let _ = credential_id;
     }
 
     #[cfg(test)]
@@ -411,15 +623,15 @@ fn enforce_cache_bounds_locked(
     }
 
     if bounds.max_entries_per_account > 0 {
-        let mut account_counts: HashMap<u64, usize> = HashMap::new();
-        for (scope, entries) in entries_by_scope.iter() {
-            *account_counts.entry(scope.credential_id).or_default() += entries.len();
-        }
-        for (credential_id, count) in account_counts {
+        let scope_counts: Vec<_> = entries_by_scope
+            .iter()
+            .map(|(scope, entries)| (scope.clone(), entries.len()))
+            .collect();
+        for (target_scope, count) in scope_counts {
             let overflow = count.saturating_sub(bounds.max_entries_per_account);
             if overflow > 0 {
                 remove_oldest_entries_locked(entries_by_scope, overflow, |scope| {
-                    scope.credential_id == credential_id
+                    scope == &target_scope
                 });
             }
         }
@@ -470,7 +682,8 @@ fn remove_oldest_entries_locked(
         (
             *last_used_at,
             *expires_at,
-            scope.credential_id,
+            scope.conversation_id.clone(),
+            scope.route_namespace.clone(),
             *fingerprint,
         )
     });
@@ -495,7 +708,6 @@ fn flatten_cache_blocks(req: &MessagesRequest) -> Vec<CacheBlock> {
     let mut blocks = Vec::new();
     let prelude = serde_json::json!({
         "kind": "request_prelude",
-        "model": req.model,
         "tool_choice": req.tool_choice,
     });
     append_cache_block(&mut blocks, prelude, false);
@@ -514,6 +726,51 @@ fn flatten_cache_blocks(req: &MessagesRequest) -> Vec<CacheBlock> {
 
     for msg in &req.messages {
         append_message_blocks(&mut blocks, msg);
+    }
+
+    blocks
+}
+
+fn kiro_rs_tool_cache_blocks(
+    req: &MessagesRequest,
+    policy: KiroRsToolCachePolicy,
+) -> Vec<CacheBlock> {
+    let mut blocks = Vec::new();
+    let policy = policy.normalized();
+
+    if let Some(tools) = &req.tools {
+        for tool in tools {
+            append_tool_block(&mut blocks, tool);
+        }
+    }
+
+    if let Some(system) = &req.system {
+        let start = system
+            .iter()
+            .position(|block| block.cache_control.is_some())
+            .unwrap_or(0);
+        for block in system.iter().skip(start) {
+            append_system_block(&mut blocks, block);
+        }
+    }
+
+    if let Some(block) = blocks.last_mut() {
+        block.ttl = Some(block.ttl.unwrap_or(DEFAULT_PROMPT_CACHE_TTL));
+    }
+
+    let cache_current_user_prefix =
+        policy.cache_current_user_stable_prefix && policy.current_user_stable_prefix_max_tokens > 0;
+    let last_message_idx = req.messages.len().saturating_sub(1);
+    for (idx, msg) in req.messages.iter().enumerate() {
+        if cache_current_user_prefix
+            && idx == last_message_idx
+            && msg.role == "user"
+            && !message_has_explicit_cache_control(msg)
+        {
+            append_kiro_rs_tool_current_user_stable_prefix_block(&mut blocks, msg, policy);
+            continue;
+        }
+        append_kiro_rs_tool_message_blocks(&mut blocks, msg, idx != last_message_idx);
     }
 
     blocks
@@ -586,6 +843,184 @@ fn append_message_blocks(blocks: &mut Vec<CacheBlock>, msg: &Message) {
     }
 }
 
+fn append_kiro_rs_tool_message_blocks(
+    blocks: &mut Vec<CacheBlock>,
+    msg: &Message,
+    auto_breakpoint_at_message_end: bool,
+) {
+    match &msg.content {
+        Value::String(text) => {
+            let value = serde_json::json!({
+                "kind": "message",
+                "role": msg.role,
+                "block": {
+                    "type": "text",
+                    "text": text,
+                }
+            });
+            append_cache_block_with_forced_ttl(
+                blocks,
+                value,
+                Some(DEFAULT_PROMPT_CACHE_TTL).filter(|_| auto_breakpoint_at_message_end),
+            );
+        }
+        Value::Array(items) => {
+            for (idx, item) in items.iter().enumerate() {
+                let value = serde_json::json!({
+                    "kind": "message",
+                    "role": msg.role,
+                    "block": item,
+                });
+                let explicit_ttl = item
+                    .get("cache_control")
+                    .and_then(extract_prompt_cache_ttl)
+                    .or_else(|| {
+                        (auto_breakpoint_at_message_end && idx + 1 == items.len())
+                            .then_some(DEFAULT_PROMPT_CACHE_TTL)
+                    });
+                append_cache_block_with_forced_ttl(blocks, value, explicit_ttl);
+            }
+        }
+        other if !other.is_null() => {
+            let value = serde_json::json!({
+                "kind": "message",
+                "role": msg.role,
+                "block": other,
+            });
+            let explicit_ttl = other
+                .get("cache_control")
+                .and_then(extract_prompt_cache_ttl)
+                .or_else(|| auto_breakpoint_at_message_end.then_some(DEFAULT_PROMPT_CACHE_TTL));
+            append_cache_block_with_forced_ttl(blocks, value, explicit_ttl);
+        }
+        _ => {}
+    }
+}
+
+fn message_has_explicit_cache_control(msg: &Message) -> bool {
+    match &msg.content {
+        Value::Array(items) => items.iter().any(|item| item.get("cache_control").is_some()),
+        other => other.get("cache_control").is_some(),
+    }
+}
+
+fn append_kiro_rs_tool_current_user_stable_prefix_block(
+    blocks: &mut Vec<CacheBlock>,
+    msg: &Message,
+    policy: KiroRsToolCachePolicy,
+) {
+    let max_tokens = policy.current_user_stable_prefix_max_tokens.max(0);
+    if max_tokens <= 0 {
+        return;
+    }
+
+    let Some(prefix_text) = current_user_stable_prefix_text(&msg.content, max_tokens) else {
+        return;
+    };
+    if prefix_text.trim().is_empty() {
+        return;
+    }
+
+    let value = serde_json::json!({
+        "kind": "current_user_stable_prefix",
+        "role": msg.role,
+        "block": {
+            "type": "text",
+            "text": prefix_text,
+        }
+    });
+    let Some(value) = shrink_current_user_prefix_value_to_token_cap(value, max_tokens) else {
+        return;
+    };
+    append_cache_block_with_forced_ttl(blocks, value, Some(DEFAULT_PROMPT_CACHE_TTL));
+}
+
+fn shrink_current_user_prefix_value_to_token_cap(
+    mut value: Value,
+    max_tokens: i32,
+) -> Option<Value> {
+    if max_tokens <= 0 {
+        return None;
+    }
+    loop {
+        let canonical = canonicalize_cache_value(&value);
+        if token::count_tokens(&canonical) as i32 <= max_tokens {
+            return Some(value);
+        }
+
+        let text = value
+            .get_mut("block")
+            .and_then(|block| block.get_mut("text"))
+            .and_then(|text| text.as_str())?
+            .to_string();
+        let next_len = text.len().saturating_mul(9) / 10;
+        if next_len == 0 {
+            return None;
+        }
+        let mut end = next_len;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let next = text[..end].trim_end();
+        if next.is_empty() {
+            return None;
+        }
+        value["block"]["text"] = Value::String(next.to_string());
+    }
+}
+
+fn current_user_stable_prefix_text(content: &Value, max_tokens: i32) -> Option<String> {
+    match content {
+        Value::String(text) => stable_prefix_text_with_token_cap(text, max_tokens),
+        Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter_map(|item| {
+                    (item.get("type").and_then(|value| value.as_str()) == Some("text"))
+                        .then(|| item.get("text").and_then(|value| value.as_str()))
+                        .flatten()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            stable_prefix_text_with_token_cap(&text, max_tokens)
+        }
+        _ => None,
+    }
+}
+
+fn stable_prefix_text_with_token_cap(text: &str, max_tokens: i32) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || max_tokens <= 0 {
+        return None;
+    }
+    let full_tokens = token::count_tokens(trimmed) as i32;
+    if full_tokens <= max_tokens {
+        return Some(trimmed.to_string());
+    }
+
+    let max_chars = (((trimmed.len() as f64) * (max_tokens as f64 / full_tokens as f64)).floor()
+        as usize)
+        .max(1)
+        .min(trimmed.len());
+    let mut end = max_chars;
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut prefix = trimmed[..end].trim_end().to_string();
+    while !prefix.is_empty() && token::count_tokens(&prefix) as i32 > max_tokens {
+        let next_len = prefix.len().saturating_mul(9) / 10;
+        if next_len == 0 {
+            return None;
+        }
+        let mut next_end = next_len.min(prefix.len());
+        while next_end > 0 && !prefix.is_char_boundary(next_end) {
+            next_end -= 1;
+        }
+        prefix = prefix[..next_end].trim_end().to_string();
+    }
+    (!prefix.is_empty()).then_some(prefix)
+}
+
 fn append_cache_block(blocks: &mut Vec<CacheBlock>, value: Value, is_message_end: bool) {
     let block_value = value.get("block").unwrap_or(&value);
     if is_anthropic_billing_header_block(block_value) {
@@ -600,6 +1035,27 @@ fn append_cache_block(blocks: &mut Vec<CacheBlock>, value: Value, is_message_end
         tokens,
         ttl,
         is_message_end,
+    });
+}
+
+fn append_cache_block_with_forced_ttl(
+    blocks: &mut Vec<CacheBlock>,
+    value: Value,
+    forced_ttl: Option<Duration>,
+) {
+    let block_value = value.get("block").unwrap_or(&value);
+    if is_anthropic_billing_header_block(block_value) {
+        return;
+    }
+
+    let ttl = forced_ttl.or_else(|| extract_prompt_cache_ttl(block_value));
+    let canonical = canonicalize_cache_value(&value);
+    let tokens = token::count_tokens(&canonical) as i32;
+    blocks.push(CacheBlock {
+        value,
+        tokens,
+        ttl,
+        is_message_end: false,
     });
 }
 
@@ -659,6 +1115,18 @@ fn target_cache_tokens(total_input_tokens: i32, target_read_ratio: f64, min_toke
         let target = target.clamp(0, total_input_tokens.saturating_sub(1));
         if target >= min_tokens { target } else { 0 }
     }
+}
+
+fn apply_kiro_rs_tool_coverage_policy(covered_tokens: i32, policy: KiroRsToolCachePolicy) -> i32 {
+    let policy = policy.normalized();
+    let mut covered_tokens = covered_tokens.max(0);
+    if policy.coverage_ratio < 1.0 {
+        covered_tokens = ((covered_tokens as f64) * policy.coverage_ratio).floor() as i32;
+    }
+    if policy.max_coverage_tokens > 0 {
+        covered_tokens = covered_tokens.min(policy.max_coverage_tokens);
+    }
+    covered_tokens.max(0)
 }
 
 fn effective_cache_read_ratio(profile: &PromptCacheProfile, target_read_ratio: f64) -> f64 {
@@ -902,6 +1370,10 @@ mod tests {
         }
     }
 
+    fn test_scope(conversation_id: &str) -> PromptCacheScope {
+        PromptCacheScope::new(conversation_id.to_string(), None)
+    }
+
     #[test]
     fn first_request_creates_second_reads() {
         let tracker = PromptCacheTracker::default();
@@ -921,12 +1393,7 @@ mod tests {
             }
         ]);
         let profile = tracker.build_profile(&req, 4096).unwrap();
-        let scope = PromptCacheScope {
-            credential_id: 1,
-            conversation_id: "session-a".to_string(),
-            model: req.model.clone(),
-            route_namespace: None,
-        };
+        let scope = test_scope("session-a");
 
         let first = tracker.compute(Some(scope.clone()), Some(&profile), 0.85);
         assert!(first.cache_creation_input_tokens > 0);
@@ -944,12 +1411,7 @@ mod tests {
         let profile = tracker
             .build_high_cache_profile(&req, 4096)
             .expect("high-cache should synthesize a stable-prefix breakpoint");
-        let scope = PromptCacheScope {
-            credential_id: 1,
-            conversation_id: "high-cache-session".to_string(),
-            model: req.model.clone(),
-            route_namespace: None,
-        };
+        let scope = test_scope("high-cache-session");
 
         let first = tracker.compute(Some(scope.clone()), Some(&profile), 0.95);
         assert!(first.cache_creation_input_tokens > 0);
@@ -983,12 +1445,7 @@ mod tests {
         let profile = tracker
             .build_high_cache_profile_for_model(&req, 3_500, "claude-haiku-4-5-20251001")
             .expect("high-cache should still build a profile for supported Haiku");
-        let scope = PromptCacheScope {
-            credential_id: 1,
-            conversation_id: "haiku-threshold-session".to_string(),
-            model: "claude-haiku-4-5-20251001".to_string(),
-            route_namespace: None,
-        };
+        let scope = test_scope("haiku-threshold-session");
 
         let short = tracker.compute(Some(scope.clone()), Some(&profile), 0.95);
         assert_eq!(
@@ -1034,12 +1491,7 @@ mod tests {
         let profile = tracker
             .build_profile(&req, 4096)
             .expect("tool cache_control should create a cache profile");
-        let scope = PromptCacheScope {
-            credential_id: 1,
-            conversation_id: "tool-cache-session".to_string(),
-            model: req.model.clone(),
-            route_namespace: None,
-        };
+        let scope = test_scope("tool-cache-session");
 
         let first = tracker.compute(Some(scope.clone()), Some(&profile), 0.85);
         assert!(first.cache_creation_input_tokens > 0);
@@ -1051,7 +1503,7 @@ mod tests {
     }
 
     #[test]
-    fn credential_and_conversation_are_isolated() {
+    fn current_scope_is_session_only_across_credentials_and_models() {
         let tracker = PromptCacheTracker::default();
         let mut req = request(long_text());
         req.messages[0].content = json!([
@@ -1062,21 +1514,11 @@ mod tests {
             }
         ]);
         let profile = tracker.build_profile(&req, 4096).unwrap();
-        let scope_a = PromptCacheScope {
-            credential_id: 1,
-            conversation_id: "a".to_string(),
-            model: req.model.clone(),
-            route_namespace: None,
-        };
-        let scope_b = PromptCacheScope {
-            credential_id: 2,
-            conversation_id: "a".to_string(),
-            model: req.model.clone(),
-            route_namespace: None,
-        };
+        let scope_a = test_scope("a");
+        let scope_b = test_scope("a");
         tracker.update(Some(scope_a), Some(&profile), 0.85);
         let usage = tracker.compute(Some(scope_b), Some(&profile), 0.85);
-        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert!(usage.cache_read_input_tokens > 0);
     }
 
     #[test]
@@ -1109,12 +1551,7 @@ mod tests {
             }
         ]);
         let profile = tracker.build_profile(&req, 4096).unwrap();
-        let scope = PromptCacheScope {
-            credential_id: 1,
-            conversation_id: "ttl-session".to_string(),
-            model: req.model.clone(),
-            route_namespace: None,
-        };
+        let scope = test_scope("ttl-session");
 
         let usage = tracker.compute(Some(scope), Some(&profile), 0.85);
         assert!(usage.cache_creation_input_tokens > 0);
@@ -1125,12 +1562,7 @@ mod tests {
     #[test]
     fn growing_conversation_reads_previous_prefix_when_cache_control_moves_forward() {
         let tracker = PromptCacheTracker::default();
-        let scope = PromptCacheScope {
-            credential_id: 1,
-            conversation_id: "growing-session".to_string(),
-            model: "claude-sonnet-4-5".to_string(),
-            route_namespace: None,
-        };
+        let scope = test_scope("growing-session");
         let shared_prefix = "stable project context and tool transcript ".repeat(500);
         let new_tail = "new user turn and assistant result ".repeat(500);
 
@@ -1176,12 +1608,7 @@ mod tests {
     #[test]
     fn local_prompt_cache_can_target_ninety_five_percent_without_cross_scope_reads() {
         let tracker = PromptCacheTracker::default();
-        let scope = PromptCacheScope {
-            credential_id: 1,
-            conversation_id: "target-ratio-session".to_string(),
-            model: "claude-sonnet-4-5".to_string(),
-            route_namespace: None,
-        };
+        let scope = test_scope("target-ratio-session");
         let mut req = request("cacheable target ratio block ".repeat(4000));
         req.messages[0].content = json!([
             {
@@ -1201,18 +1628,12 @@ mod tests {
         assert!(second.cache_read_input_tokens >= 110_000);
         assert_eq!(second.cache_creation_input_tokens, 0);
 
-        let different_scope = PromptCacheScope {
-            credential_id: 2,
-            conversation_id: scope.conversation_id,
-            model: scope.model,
-            route_namespace: None,
-        };
-        let isolated = tracker.compute(Some(different_scope), Some(&profile), 0.95);
-        assert_eq!(
-            isolated.cache_read_input_tokens, 0,
-            "local prompt cache must not invent reads across credentials"
+        let same_session = test_scope("target-ratio-session");
+        let reused = tracker.compute(Some(same_session), Some(&profile), 0.95);
+        assert!(
+            reused.cache_read_input_tokens >= 110_000,
+            "local prompt cache is session-scoped and should reuse across credential/model changes"
         );
-        assert!(isolated.cache_creation_input_tokens > 0);
     }
 
     #[test]
@@ -1222,12 +1643,7 @@ mod tests {
         let profile = tracker
             .build_high_cache_profile(&req, 120_000)
             .expect("high-cache profile");
-        let default_scope = PromptCacheScope {
-            credential_id: 1,
-            conversation_id: "route-namespace-session".to_string(),
-            model: req.model.clone(),
-            route_namespace: None,
-        };
+        let default_scope = test_scope("route-namespace-session");
         let custom_scope = PromptCacheScope {
             route_namespace: Some("/dfcache/team-a".to_string()),
             ..default_scope.clone()
@@ -1241,6 +1657,510 @@ mod tests {
         assert!(default_usage.cache_read_input_tokens > 0);
         assert_eq!(custom_usage.cache_read_input_tokens, 0);
         assert!(custom_usage.cache_creation_input_tokens > 0);
+    }
+
+    #[test]
+    fn kiro_rs_tool_first_miss_then_success_commit_hits() {
+        let tracker = PromptCacheTracker::default();
+        let scope = test_scope("kiro-session");
+        let mut first_req = request("stable system prompt ".repeat(300));
+        first_req.messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: json!("stable history question"),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: json!("stable history answer"),
+            },
+            Message {
+                role: "user".to_string(),
+                content: json!("current question"),
+            },
+        ];
+
+        let first = tracker.compute_kiro_rs_tool_with_bounds(
+            Some(scope.clone()),
+            &first_req,
+            12_000,
+            &first_req.model,
+            PromptCacheBounds::default(),
+            KiroRsToolCachePolicy::default(),
+        );
+        assert!(first.usage().cache_creation_input_tokens > 0);
+        assert_eq!(first.usage().cache_read_input_tokens, 0);
+
+        tracker.commit_kiro_rs_tool_success_with_bounds(
+            Some(scope.clone()),
+            &first,
+            PromptCacheBounds::default(),
+        );
+
+        let second = tracker.compute_kiro_rs_tool_with_bounds(
+            Some(scope),
+            &first_req,
+            12_000,
+            &first_req.model,
+            PromptCacheBounds::default(),
+            KiroRsToolCachePolicy::default(),
+        );
+        assert!(second.usage().cache_read_input_tokens > 0);
+        assert_eq!(second.usage().cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn kiro_rs_tool_failed_request_does_not_commit_segments() {
+        let tracker = PromptCacheTracker::default();
+        let scope = test_scope("kiro-failed-session");
+        let mut req = request("stable system prompt ".repeat(300));
+        req.messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: json!("stable history question"),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: json!("stable history answer"),
+            },
+            Message {
+                role: "user".to_string(),
+                content: json!("current question"),
+            },
+        ];
+
+        let failed = tracker.compute_kiro_rs_tool_with_bounds(
+            Some(scope.clone()),
+            &req,
+            12_000,
+            &req.model,
+            PromptCacheBounds::default(),
+            KiroRsToolCachePolicy::default(),
+        );
+        assert!(failed.usage().cache_creation_input_tokens > 0);
+        assert_eq!(failed.usage().cache_read_input_tokens, 0);
+
+        let retry = tracker.compute_kiro_rs_tool_with_bounds(
+            Some(scope),
+            &req,
+            12_000,
+            &req.model,
+            PromptCacheBounds::default(),
+            KiroRsToolCachePolicy::default(),
+        );
+        assert_eq!(retry.usage().cache_read_input_tokens, 0);
+        assert!(retry.usage().cache_creation_input_tokens > 0);
+    }
+
+    #[test]
+    fn kiro_rs_tool_skips_dynamic_system_before_first_cache_control() {
+        let tracker = PromptCacheTracker::default();
+        let scope = test_scope("kiro-dynamic-system");
+        let make_req = |dynamic: &str| MessagesRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: json!("stable history question"),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: json!("stable history answer"),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: json!("current question"),
+                },
+            ],
+            stream: false,
+            system: Some(vec![
+                SystemMessage {
+                    text: dynamic.to_string(),
+                    cache_control: None,
+                },
+                SystemMessage {
+                    text: "stable cached system ".repeat(300),
+                    cache_control: Some(json!({"type": "ephemeral"})),
+                },
+            ]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let first_req = make_req("time=1000");
+        let first = tracker.compute_kiro_rs_tool_with_bounds(
+            Some(scope.clone()),
+            &first_req,
+            12_000,
+            &first_req.model,
+            PromptCacheBounds::default(),
+            KiroRsToolCachePolicy::default(),
+        );
+        tracker.commit_kiro_rs_tool_success_with_bounds(
+            Some(scope.clone()),
+            &first,
+            PromptCacheBounds::default(),
+        );
+
+        let second_req = make_req("time=2000");
+        let second = tracker.compute_kiro_rs_tool_with_bounds(
+            Some(scope),
+            &second_req,
+            12_000,
+            &second_req.model,
+            PromptCacheBounds::default(),
+            KiroRsToolCachePolicy::default(),
+        );
+        assert!(
+            second.usage().cache_read_input_tokens > 0,
+            "dynamic system text before the first cache_control must not poison Kiro-RS-Tool cache hits"
+        );
+    }
+
+    #[test]
+    fn kiro_rs_tool_single_current_message_without_prefix_is_uncached() {
+        let tracker = PromptCacheTracker::default();
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!("only current question"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let plan = tracker.compute_kiro_rs_tool_with_bounds(
+            Some(test_scope("kiro-single-message")),
+            &req,
+            1_000,
+            &req.model,
+            PromptCacheBounds::default(),
+            KiroRsToolCachePolicy::default(),
+        );
+
+        assert_eq!(plan.usage().cache_read_input_tokens, 0);
+        assert_eq!(plan.usage().cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn kiro_rs_tool_cache_respects_global_entry_bounds() {
+        let tracker = PromptCacheTracker::default();
+        let bounds = PromptCacheBounds::from_config(10, 2, 3600, 0);
+        for idx in 0..5 {
+            let scope = test_scope(&format!("kiro-bounds-{idx}"));
+            let mut req = request(format!("stable system prompt {idx} ").repeat(300));
+            req.messages = vec![
+                Message {
+                    role: "user".to_string(),
+                    content: json!(format!("stable history question {idx}")),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: json!(format!("stable history answer {idx}")),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: json!("current question"),
+                },
+            ];
+            let plan = tracker.compute_kiro_rs_tool_with_bounds(
+                Some(scope.clone()),
+                &req,
+                12_000,
+                &req.model,
+                bounds,
+                KiroRsToolCachePolicy::default(),
+            );
+            tracker.commit_kiro_rs_tool_success_with_bounds(Some(scope), &plan, bounds);
+        }
+
+        assert!(tracker.entry_count() <= 2);
+    }
+
+    #[test]
+    fn kiro_rs_tool_coverage_ratio_caps_committed_reads() {
+        let tracker = PromptCacheTracker::default();
+        let scope = test_scope("kiro-coverage-ratio");
+        let mut req = request("stable system prompt ".repeat(300));
+        req.messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: json!("stable history question"),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: json!("stable history answer"),
+            },
+            Message {
+                role: "user".to_string(),
+                content: json!("current question"),
+            },
+        ];
+        let policy = KiroRsToolCachePolicy {
+            coverage_ratio: 0.5,
+            ..KiroRsToolCachePolicy::default()
+        };
+
+        let first = tracker.compute_kiro_rs_tool_with_bounds(
+            Some(scope.clone()),
+            &req,
+            12_000,
+            &req.model,
+            PromptCacheBounds::default(),
+            policy,
+        );
+        let first_create = first.usage().cache_creation_input_tokens;
+        assert!(first_create > 0);
+        assert_eq!(first.usage().cache_read_input_tokens, 0);
+        tracker.commit_kiro_rs_tool_success_with_bounds(
+            Some(scope.clone()),
+            &first,
+            PromptCacheBounds::default(),
+        );
+
+        let second = tracker.compute_kiro_rs_tool_with_bounds(
+            Some(scope),
+            &req,
+            12_000,
+            &req.model,
+            PromptCacheBounds::default(),
+            policy,
+        );
+        assert_eq!(second.usage().cache_read_input_tokens, first_create);
+        assert_eq!(second.usage().cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn kiro_rs_tool_creation_cap_commits_only_created_tokens() {
+        let tracker = PromptCacheTracker::default();
+        let scope = test_scope("kiro-creation-cap");
+        let mut req = request("stable system prompt with enough tokens ".repeat(2000));
+        req.messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: json!("stable history question"),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: json!("stable history answer"),
+            },
+            Message {
+                role: "user".to_string(),
+                content: json!("current question"),
+            },
+        ];
+        let policy = KiroRsToolCachePolicy {
+            max_new_creation_tokens_per_request: 2_048,
+            ..KiroRsToolCachePolicy::default()
+        };
+
+        let first = tracker.compute_kiro_rs_tool_with_bounds(
+            Some(scope.clone()),
+            &req,
+            20_000,
+            &req.model,
+            PromptCacheBounds::default(),
+            policy,
+        );
+        assert_eq!(first.usage().cache_creation_input_tokens, 2_048);
+        assert_eq!(first.usage().cache_read_input_tokens, 0);
+        tracker.commit_kiro_rs_tool_success_with_bounds(
+            Some(scope.clone()),
+            &first,
+            PromptCacheBounds::default(),
+        );
+
+        let second = tracker.compute_kiro_rs_tool_with_bounds(
+            Some(scope),
+            &req,
+            20_000,
+            &req.model,
+            PromptCacheBounds::default(),
+            policy,
+        );
+        assert_eq!(second.usage().cache_read_input_tokens, 2_048);
+        assert_eq!(second.usage().cache_creation_input_tokens, 2_048);
+    }
+
+    #[test]
+    fn kiro_rs_tool_can_disable_incremental_creation_after_read() {
+        let tracker = PromptCacheTracker::default();
+        let scope = test_scope("kiro-no-incremental-create");
+        let mut req = request("stable system prompt with enough tokens ".repeat(2000));
+        req.messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: json!("stable history question"),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: json!("stable history answer"),
+            },
+            Message {
+                role: "user".to_string(),
+                content: json!("current question"),
+            },
+        ];
+        let first_policy = KiroRsToolCachePolicy {
+            max_new_creation_tokens_per_request: 2_048,
+            ..KiroRsToolCachePolicy::default()
+        };
+        let second_policy = KiroRsToolCachePolicy {
+            incremental_create_enabled: false,
+            ..KiroRsToolCachePolicy::default()
+        };
+
+        let first = tracker.compute_kiro_rs_tool_with_bounds(
+            Some(scope.clone()),
+            &req,
+            20_000,
+            &req.model,
+            PromptCacheBounds::default(),
+            first_policy,
+        );
+        tracker.commit_kiro_rs_tool_success_with_bounds(
+            Some(scope.clone()),
+            &first,
+            PromptCacheBounds::default(),
+        );
+
+        let second = tracker.compute_kiro_rs_tool_with_bounds(
+            Some(scope),
+            &req,
+            20_000,
+            &req.model,
+            PromptCacheBounds::default(),
+            second_policy,
+        );
+        assert_eq!(second.usage().cache_read_input_tokens, 2_048);
+        assert_eq!(second.usage().cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn kiro_rs_tool_max_coverage_tokens_caps_default_creation() {
+        let tracker = PromptCacheTracker::default();
+        let scope = test_scope("kiro-max-coverage");
+        let mut req = request("stable system prompt with enough tokens ".repeat(2000));
+        req.messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: json!("stable history question"),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: json!("stable history answer"),
+            },
+            Message {
+                role: "user".to_string(),
+                content: json!("current question"),
+            },
+        ];
+        let policy = KiroRsToolCachePolicy {
+            max_coverage_tokens: 3_000,
+            ..KiroRsToolCachePolicy::default()
+        };
+
+        let first = tracker.compute_kiro_rs_tool_with_bounds(
+            Some(scope.clone()),
+            &req,
+            20_000,
+            &req.model,
+            PromptCacheBounds::default(),
+            policy,
+        );
+        assert_eq!(first.usage().cache_creation_input_tokens, 3_000);
+        tracker.commit_kiro_rs_tool_success_with_bounds(
+            Some(scope.clone()),
+            &first,
+            PromptCacheBounds::default(),
+        );
+
+        let second = tracker.compute_kiro_rs_tool_with_bounds(
+            Some(scope),
+            &req,
+            20_000,
+            &req.model,
+            PromptCacheBounds::default(),
+            policy,
+        );
+        assert_eq!(second.usage().cache_read_input_tokens, 3_000);
+        assert_eq!(second.usage().cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn kiro_rs_tool_current_user_prefix_is_opt_in() {
+        let tracker = PromptCacheTracker::default();
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 1024,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!("current question stable prefix ".repeat(600)),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let default_plan = tracker.compute_kiro_rs_tool_with_bounds(
+            Some(test_scope("kiro-current-user-default")),
+            &req,
+            10_000,
+            &req.model,
+            PromptCacheBounds::default(),
+            KiroRsToolCachePolicy::default(),
+        );
+        assert_eq!(default_plan.usage().cache_creation_input_tokens, 0);
+        assert_eq!(default_plan.usage().cache_read_input_tokens, 0);
+
+        let policy = KiroRsToolCachePolicy {
+            cache_current_user_stable_prefix: true,
+            current_user_stable_prefix_max_tokens: 1_500,
+            ..KiroRsToolCachePolicy::default()
+        };
+        let scope = test_scope("kiro-current-user-opt-in");
+        let first = tracker.compute_kiro_rs_tool_with_bounds(
+            Some(scope.clone()),
+            &req,
+            10_000,
+            &req.model,
+            PromptCacheBounds::default(),
+            policy,
+        );
+        assert!(first.usage().cache_creation_input_tokens > 0);
+        assert!(first.usage().cache_creation_input_tokens <= 1_500);
+        tracker.commit_kiro_rs_tool_success_with_bounds(
+            Some(scope.clone()),
+            &first,
+            PromptCacheBounds::default(),
+        );
+
+        let second = tracker.compute_kiro_rs_tool_with_bounds(
+            Some(scope),
+            &req,
+            10_000,
+            &req.model,
+            PromptCacheBounds::default(),
+            policy,
+        );
+        assert_eq!(
+            second.usage().cache_read_input_tokens,
+            first.usage().cache_creation_input_tokens
+        );
     }
 
     #[test]
@@ -1286,12 +2206,7 @@ mod tests {
             second_profile.cache_jitter_seed()
         );
 
-        let scope = PromptCacheScope {
-            credential_id: 1,
-            conversation_id: "volatile-tool-id-session".to_string(),
-            model: first_req.model.clone(),
-            route_namespace: None,
-        };
+        let scope = test_scope("volatile-tool-id-session");
         tracker.update(Some(scope.clone()), Some(&first_profile), 0.85);
         let usage = tracker.compute(Some(scope), Some(&second_profile), 0.85);
         assert!(
@@ -1326,7 +2241,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_cache_enforces_per_account_entry_limit() {
+    fn prompt_cache_enforces_per_scope_entry_limit() {
         let tracker = PromptCacheTracker::default();
         let bounds = PromptCacheBounds {
             max_entries_per_account: 2,
@@ -1335,28 +2250,23 @@ mod tests {
             estimated_bytes_limit: 0,
         };
 
-        for conversation_id in ["session-a", "session-b", "session-c"] {
-            let mut req = request(format!("cacheable {conversation_id} ").repeat(900));
+        let scope = test_scope("bounded-session");
+        for suffix in ["a", "b", "c"] {
+            let mut req = request(format!("cacheable {suffix} ").repeat(900));
             req.messages[0].content = json!([
                 {
                     "type": "text",
-                    "text": format!("cacheable body {conversation_id} ").repeat(900),
+                    "text": format!("cacheable body {suffix} ").repeat(900),
                     "cache_control": {"type": "ephemeral"}
                 }
             ]);
             let profile = tracker.build_profile(&req, 8_192).expect("profile");
-            let scope = PromptCacheScope {
-                credential_id: 7,
-                conversation_id: conversation_id.to_string(),
-                model: req.model,
-                route_namespace: None,
-            };
-            tracker.update_with_bounds(Some(scope), Some(&profile), 0.85, bounds);
+            tracker.update_with_bounds(Some(scope.clone()), Some(&profile), 0.85, bounds);
         }
 
         assert!(
             tracker.entry_count() <= 2,
-            "per-account cache bound must cap retained fingerprints"
+            "per-scope cache bound must cap retained fingerprints"
         );
     }
 
@@ -1380,12 +2290,7 @@ mod tests {
                 }
             ]);
             let profile = tracker.build_profile(&req, 8_192).expect("profile");
-            let scope = PromptCacheScope {
-                credential_id,
-                conversation_id: format!("global-session-{credential_id}"),
-                model: req.model,
-                route_namespace: None,
-            };
+            let scope = test_scope(&format!("global-session-{credential_id}"));
             tracker.update_with_bounds(Some(scope), Some(&profile), 0.85, bounds);
         }
 

@@ -813,6 +813,38 @@ export interface UsageDashboardResponse {
   top: UsageDashboardTop
 }
 
+export interface UsageDashboardWindowsResponse {
+  generatedAt: string
+  timezone: string
+  windows: UsageDashboardWindow[]
+}
+
+export interface UsageDashboardSeriesResponse {
+  generatedAt: string
+  timezone: string
+  series: UsageDashboardSeries
+}
+
+export interface UsageDashboardTopResponse {
+  generatedAt: string
+  top: UsageDashboardTop
+}
+
+export interface UsageDashboardBreakdownResponse {
+  generatedAt: string
+  timezone: string
+  windowKey: string
+  statusBreakdown: UsageBreakdownItem[]
+  usageSourceBreakdown: UsageBreakdownItem[]
+}
+
+export interface UsageDashboardExternalPoolBillingResponse {
+  generatedAt: string
+  timezone: string
+  windowKey: string
+  externalPoolBillingByPool: UsageExternalPoolBillingByPool[]
+}
+
 export interface UsageDashboardWindow {
   key: string
   label: string
@@ -1021,16 +1053,31 @@ export interface CacheBoundsPolicyPatch {
   estimatedBytesLimit?: number
 }
 
+export interface KiroRsToolCachePolicyPatch {
+  coverageRatio?: number
+  maxCoverageTokens?: number
+  incrementalCreateEnabled?: boolean
+  maxNewCreationTokensPerRequest?: number
+  cacheCurrentUserStablePrefix?: boolean
+  currentUserStablePrefixMaxTokens?: number
+}
+
+export type PromptCacheStrategyType = 'no_cache' | 'current_high_cache' | 'kiro_rs_tool'
+
 export interface CacheRoutePolicyPatch {
+  cacheType?: PromptCacheStrategyType
   simulation?: CacheSimulationPolicyPatch
   creationControl?: PromptCacheCreationControlConfig
   reportedUsage?: ReportedUsagePathPolicy
   cachePoint?: CachePointPolicyPatch
   bounds?: CacheBoundsPolicyPatch
+  kiroRsTool?: KiroRsToolCachePolicyPatch
 }
 
 export interface CachePolicyConfig {
   default: CacheRoutePolicyPatch
+  currentHighCache: CacheRoutePolicyPatch
+  kiroRsTool: CacheRoutePolicyPatch
   pathOverrides: Record<string, CacheRoutePolicyPatch>
 }
 

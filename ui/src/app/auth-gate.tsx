@@ -62,7 +62,7 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
   if (state === 'checking') {
     return (
       <div className="flex min-h-screen items-center justify-center bg-background">
-        <div className="flex flex-col items-center gap-4 rounded-xl border border-border bg-card px-8 py-7 shadow-sm">
+        <div className="flex flex-col items-center gap-4 rounded-xl bg-card px-8 py-7 shadow-sm">
           <Spinner size="lg" />
           <p className="text-sm text-muted-foreground">验证登录状态...</p>
         </div>

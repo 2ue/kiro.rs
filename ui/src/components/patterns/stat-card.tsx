@@ -44,7 +44,7 @@ export function StatCard({ title, value, valueTitle, desc, icon, tone = 'default
   return (
     <div
       className={cn(
-        'relative flex min-h-[6.5rem] flex-col justify-between overflow-hidden rounded-xl border border-border bg-card p-4 shadow-sm transition hover:border-border-strong hover:shadow-md',
+        'relative flex min-h-[6.5rem] flex-col justify-between overflow-hidden rounded-xl bg-card p-4 shadow-sm transition hover:shadow-md',
         className
       )}
     >
@@ -57,7 +57,7 @@ export function StatCard({ title, value, valueTitle, desc, icon, tone = 'default
           </div>
         </div>
         {icon && (
-          <div className={cn('flex size-9 shrink-0 items-center justify-center rounded-lg border border-border bg-muted [&_svg]:size-4', iconMap[tone])}>
+          <div className={cn('flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted [&_svg]:size-4', iconMap[tone])}>
             {icon}
           </div>
         )}

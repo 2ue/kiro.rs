@@ -664,7 +664,7 @@ function EditModelDialog({ open, initial, initialPricing, onClose, onSaved }: Ed
             </div>
           </div>
 
-          <div className="rounded-lg border border-border bg-muted/30 p-3">
+          <div className="rounded-lg bg-muted/30 p-3">
             <label className="flex items-center gap-2 text-sm font-medium">
               <Checkbox
                 checked={form.includePricing}

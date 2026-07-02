@@ -19,7 +19,7 @@ export function Topbar({
   const { theme, toggleTheme } = useTheme()
 
   return (
-    <header className="sticky top-0 z-30 flex h-[var(--header-h)] shrink-0 items-center gap-4 border-b border-border bg-card/85 px-4 backdrop-blur-md lg:px-6">
+    <header className="sticky top-0 z-30 flex h-[var(--header-h)] shrink-0 items-center gap-4 bg-card/85 px-4 backdrop-blur-md lg:px-6">
       <Button
         variant="ghost"
         size="icon-sm"

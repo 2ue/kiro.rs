@@ -22,7 +22,8 @@ use crate::anthropic::usage::{
     UsageExternalPoolBillingSummary, UsageRealtimeStats, UsageRecord, UsageRecordQuery,
     UsageRecordStatus, UsageRecordsPageResult, UsageRecordsResult, UsageRouteKind,
     UsageSeriesPoint, UsageSource, UsageSummary, UsageTopAggregate, usage_dashboard_daily_windows,
-    usage_dashboard_hourly_windows, usage_dashboard_timezone, usage_dashboard_windows,
+    usage_dashboard_hourly_windows, usage_dashboard_timezone, usage_dashboard_window_spec_for_key,
+    usage_dashboard_windows,
 };
 use crate::external_pool::{
     CreateExternalPoolRequest, ExternalPool, ExternalPoolAuthType, ExternalPoolAutoDisablePolicy,
@@ -350,10 +351,13 @@ impl PostgresStore {
             None => {
                 let mut config = file_config.clone();
                 config.set_request_api_keys(file_config.request_api_keys());
+                config.apply_runtime_config_migrations();
                 self.save_runtime_config(&config).await?;
             }
             Some(mut config) => {
-                if config.fill_missing_access_keys_from(file_config) {
+                let mut changed = config.fill_missing_access_keys_from(file_config);
+                changed |= config.apply_runtime_config_migrations();
+                if changed {
                     self.save_runtime_config(&config).await?;
                 }
             }
@@ -2633,6 +2637,117 @@ impl PostgresUsageStore {
                     .await?,
             },
         })
+    }
+
+    pub async fn dashboard_windows_only(
+        &self,
+        timezone: Option<&str>,
+        high_cache_threshold: i32,
+    ) -> anyhow::Result<(String, String, Vec<UsageDashboardWindow>)> {
+        let now = Utc::now();
+        let (timezone, offset) = usage_dashboard_timezone(timezone);
+        let window_specs = usage_dashboard_windows(now, offset);
+        let windows = self
+            .dashboard_windows(&window_specs, high_cache_threshold)
+            .await?;
+        Ok((now.to_rfc3339(), timezone, windows))
+    }
+
+    pub async fn dashboard_series_only(
+        &self,
+        timezone: Option<&str>,
+    ) -> anyhow::Result<(String, String, UsageDashboardSeries)> {
+        let now = Utc::now();
+        let (timezone, offset) = usage_dashboard_timezone(timezone);
+        let hourly_specs = usage_dashboard_hourly_windows(now, offset);
+        let daily_specs = usage_dashboard_daily_windows(now, offset);
+        Ok((
+            now.to_rfc3339(),
+            timezone,
+            UsageDashboardSeries {
+                hourly_24h: self.dashboard_series(&hourly_specs).await?,
+                daily_7d: self.dashboard_series(&daily_specs).await?,
+            },
+        ))
+    }
+
+    pub async fn dashboard_top_only(&self) -> anyhow::Result<(String, UsageDashboardTop)> {
+        let now = Utc::now();
+        Ok((
+            now.to_rfc3339(),
+            UsageDashboardTop {
+                window_key: "lifetime".to_string(),
+                models: self
+                    .dashboard_top_aggregates(DashboardTopGroup::Model)
+                    .await?,
+                credentials: self
+                    .dashboard_top_aggregates(DashboardTopGroup::Credential)
+                    .await?,
+                endpoints: self
+                    .dashboard_top_aggregates(DashboardTopGroup::Endpoint)
+                    .await?,
+                errors: self
+                    .dashboard_top_aggregates(DashboardTopGroup::Error)
+                    .await?,
+            },
+        ))
+    }
+
+    pub async fn dashboard_breakdown_only(
+        &self,
+        timezone: Option<&str>,
+        window_key: &str,
+    ) -> anyhow::Result<(
+        String,
+        String,
+        String,
+        Vec<UsageBreakdownItem>,
+        Vec<UsageBreakdownItem>,
+    )> {
+        let now = Utc::now();
+        let (timezone, offset) = usage_dashboard_timezone(timezone);
+        let window_spec = usage_dashboard_window_spec_for_key(now, offset, window_key);
+        let specs = [window_spec.clone()];
+        let windows = self.dashboard_windows(&specs, 0).await?;
+        let totals: HashMap<String, usize> = windows
+            .iter()
+            .map(|window| (window.key.clone(), window.summary.total_requests))
+            .collect();
+        let mut status_breakdown = self
+            .dashboard_breakdown(&specs, &totals, DashboardBreakdownColumn::Status)
+            .await?;
+        let mut usage_source_breakdown = self
+            .dashboard_breakdown(&specs, &totals, DashboardBreakdownColumn::UsageSource)
+            .await?;
+        Ok((
+            now.to_rfc3339(),
+            timezone,
+            window_spec.key.clone(),
+            status_breakdown
+                .remove(&window_spec.key)
+                .unwrap_or_default(),
+            usage_source_breakdown
+                .remove(&window_spec.key)
+                .unwrap_or_default(),
+        ))
+    }
+
+    pub async fn dashboard_external_pool_billing_only(
+        &self,
+        timezone: Option<&str>,
+        window_key: &str,
+    ) -> anyhow::Result<(String, String, String, Vec<UsageExternalPoolBillingByPool>)> {
+        let now = Utc::now();
+        let (timezone, offset) = usage_dashboard_timezone(timezone);
+        let window_spec = usage_dashboard_window_spec_for_key(now, offset, window_key);
+        let specs = [window_spec.clone()];
+        let mut billing = self.dashboard_external_pool_billing_by_pool(&specs).await?;
+        Ok((
+            now.to_rfc3339(),
+            timezone,
+            window_spec.key.clone(),
+            billing.remove(&window_spec.key).unwrap_or_default(),
+        ))
     }
 
     async fn dashboard_windows(
@@ -5397,6 +5512,8 @@ mod tests {
             endpoint: "/v1/messages".to_string(),
             stream: false,
             model: "claude-sonnet-4-5".to_string(),
+            requested_max_tokens: None,
+            downstream_stop_reason: None,
             upstream_model: None,
             external_outbound_model: None,
             model_resolution_source: None,
@@ -5713,6 +5830,8 @@ mod tests {
             endpoint: "/cc/v1/messages".to_string(),
             stream: id.ends_with('0'),
             model: "claude-sonnet-4-5".to_string(),
+            requested_max_tokens: None,
+            downstream_stop_reason: None,
             upstream_model: Some("claude-sonnet-4-5".to_string()),
             external_outbound_model: Some("claude-sonnet-4-5".to_string()),
             model_resolution_source: Some("exact".to_string()),

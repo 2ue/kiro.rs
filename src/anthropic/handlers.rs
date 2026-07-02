@@ -3,6 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
+    fmt::Write as _,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -14,11 +15,11 @@ use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::model::config::{
     CacheBoundsPolicy, CachePointPolicy, CachePolicyConfig, CacheRoutePolicy,
-    CacheSimulationPolicy, CompatProfile, Config, ExternalPoolsConfig, ModelMappingConfig,
-    ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
-    PromptCacheSimulationMode, ReportedUsageConfig, ReportedUsagePathPolicy,
-    ResolvedCacheRoutePolicy, ThinkingTriggerMode, normalize_defined_cache_route,
-    normalize_defined_cache_routes, resolve_cache_policy_for_path,
+    CacheSimulationPolicy, CompatProfile, Config, ExternalPoolsConfig, KiroRsToolCachePolicy,
+    ModelMappingConfig, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
+    PromptCacheCreationControlConfig, PromptCacheSimulationMode, PromptCacheStrategyType,
+    ReportedUsageConfig, ReportedUsagePathPolicy, ResolvedCacheRoutePolicy, ThinkingTriggerMode,
+    normalize_defined_cache_route, normalize_defined_cache_routes, resolve_cache_policy_for_path,
 };
 use crate::token;
 use anyhow::Error;
@@ -36,11 +37,12 @@ use futures::{Stream, StreamExt, stream};
 use parking_lot::Mutex;
 use reqwest::header::{CONTENT_TYPE as REQWEST_CONTENT_TYPE, LOCATION as REQWEST_LOCATION};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tokio::time::{Instant, interval, sleep_until};
 
 use super::converter::{
-    ConversionError, ConverterOptions, convert_request_with_resolved_model,
+    ConversionError, ConverterOptions, ProxyWarnings, convert_request_with_resolved_model,
     extract_stable_conversation_id, infer_document_media_type_from_url,
     infer_image_format_from_url,
 };
@@ -55,7 +57,9 @@ use super::payload_guard::{
     diagnose_kiro_tool_use_format, guard_anthropic_messages_request, guard_kiro_request,
     sanitize_anthropic_messages_for_external_forwarding, serialize_kiro_request,
 };
-use super::prompt_cache::{PromptCacheBounds, PromptCacheProfile, PromptCacheScope};
+use super::prompt_cache::{
+    KiroRsToolPromptCachePlan, PromptCacheBounds, PromptCacheProfile, PromptCacheScope,
+};
 use super::stream::{SseEvent, StreamContext};
 use super::tool_format_debug::{ToolFormatDebugEvent, ToolFormatDebugRecorder};
 use super::types::{
@@ -79,6 +83,70 @@ use crate::kiro::token_manager::LocalPoolRouteStateKind;
 const MAX_REMOTE_MULTIMODAL_BYTES: usize = 20 * 1024 * 1024;
 const UPSTREAM_INVALID_REQUEST_MESSAGE: &str = envelope::PUBLIC_INVALID_REQUEST_MESSAGE;
 const LATENCY_COUNTER_UNSET: u32 = u32::MAX;
+const OBSERVABILITY_HASH_BYTES: usize = 8;
+const SLOW_FIRST_VISIBLE_TEXT_MS: u64 = 10_000;
+const SLOW_STREAM_GAP_MS: u64 = 10_000;
+const SLOW_RESPONSE_MS: u64 = 60_000;
+const SLOW_EVENTS_BEFORE_FIRST_OUTPUT: u32 = 20;
+
+#[derive(Debug, Clone, Default)]
+struct TextDigestSummary {
+    bytes: usize,
+    chars: usize,
+    segments: usize,
+    hash: Option<String>,
+}
+
+struct TextDigestBuilder {
+    hasher: Sha256,
+    bytes: usize,
+    chars: usize,
+    segments: usize,
+}
+
+impl TextDigestBuilder {
+    fn new() -> Self {
+        Self {
+            hasher: Sha256::new(),
+            bytes: 0,
+            chars: 0,
+            segments: 0,
+        }
+    }
+
+    fn add_text(&mut self, text: &str) {
+        if self.segments > 0 {
+            self.hasher.update(b"\n");
+        }
+        self.hasher.update(text.as_bytes());
+        self.bytes = self.bytes.saturating_add(text.len());
+        self.chars = self.chars.saturating_add(text.chars().count());
+        self.segments = self.segments.saturating_add(1);
+    }
+
+    fn finish(self) -> TextDigestSummary {
+        TextDigestSummary {
+            bytes: self.bytes,
+            chars: self.chars,
+            segments: self.segments,
+            hash: (self.segments > 0).then(|| {
+                let digest = self.hasher.finalize();
+                short_digest_hex(&digest)
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AnthropicContentSummary {
+    kind: &'static str,
+    text: TextDigestSummary,
+    tool_result_count: usize,
+    tool_use_count: usize,
+    image_count: usize,
+    document_count: usize,
+    other_block_count: usize,
+}
 
 #[derive(Clone)]
 struct RequestUsageContext {
@@ -96,12 +164,16 @@ struct RequestUsageContext {
     upstream_model: Option<String>,
     model_resolution_source: Option<String>,
     model_resolution_note: Option<String>,
+    requested_max_tokens: i32,
+    downstream_stop_reason: Arc<Mutex<Option<String>>>,
     conversation_id: Option<String>,
     prompt_cache_scope_conversation_id: Option<String>,
     input_tokens: i32,
     context_window_tokens: i32,
     prompt_cache_profile: Option<PromptCacheProfile>,
+    kiro_rs_tool_prompt_cache_plan: Option<KiroRsToolPromptCachePlan>,
     prompt_cache_route_namespace: Option<String>,
+    prompt_cache_strategy_type: PromptCacheStrategyType,
     simulation_mode: PromptCacheSimulationMode,
     prompt_cache_target_read_ratio: f64,
     prompt_cache_token_scale: f64,
@@ -168,6 +240,267 @@ fn load_latency_counter(value: &AtomicU32) -> Option<u32> {
     (value != LATENCY_COUNTER_UNSET).then_some(value)
 }
 
+fn short_digest_hex(digest: &[u8]) -> String {
+    let mut out = String::with_capacity(OBSERVABILITY_HASH_BYTES * 2);
+    for byte in digest.iter().take(OBSERVABILITY_HASH_BYTES) {
+        let _ = write!(out, "{:02x}", byte);
+    }
+    out
+}
+
+fn short_text_hash(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    let digest = hasher.finalize();
+    short_digest_hex(&digest)
+}
+
+fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn summarize_anthropic_content(content: &Value) -> AnthropicContentSummary {
+    let mut text = TextDigestBuilder::new();
+    let mut summary = AnthropicContentSummary {
+        kind: value_kind(content),
+        text: TextDigestSummary::default(),
+        tool_result_count: 0,
+        tool_use_count: 0,
+        image_count: 0,
+        document_count: 0,
+        other_block_count: 0,
+    };
+
+    summarize_anthropic_content_value(content, &mut summary, &mut text);
+    summary.text = text.finish();
+    summary
+}
+
+fn summarize_anthropic_content_value(
+    content: &Value,
+    summary: &mut AnthropicContentSummary,
+    text: &mut TextDigestBuilder,
+) {
+    match content {
+        Value::String(value) => text.add_text(value),
+        Value::Array(blocks) => {
+            for block in blocks {
+                summarize_anthropic_content_block(block, summary, text);
+            }
+        }
+        Value::Object(_) => summarize_anthropic_content_block(content, summary, text),
+        _ => {}
+    }
+}
+
+fn summarize_anthropic_content_block(
+    block: &Value,
+    summary: &mut AnthropicContentSummary,
+    text: &mut TextDigestBuilder,
+) {
+    let Some(object) = block.as_object() else {
+        if let Some(value) = block.as_str() {
+            text.add_text(value);
+        } else {
+            summary.other_block_count = summary.other_block_count.saturating_add(1);
+        }
+        return;
+    };
+
+    match object.get("type").and_then(Value::as_str) {
+        Some("text") => {
+            if let Some(value) = object.get("text").and_then(Value::as_str) {
+                text.add_text(value);
+            }
+        }
+        Some("tool_result") => {
+            summary.tool_result_count = summary.tool_result_count.saturating_add(1);
+        }
+        Some("tool_use") => {
+            summary.tool_use_count = summary.tool_use_count.saturating_add(1);
+        }
+        Some("image") | Some("image_url") => {
+            summary.image_count = summary.image_count.saturating_add(1);
+        }
+        Some("document") => {
+            summary.document_count = summary.document_count.saturating_add(1);
+        }
+        Some(_) => {
+            if let Some(value) = object.get("text").and_then(Value::as_str) {
+                text.add_text(value);
+            } else {
+                summary.other_block_count = summary.other_block_count.saturating_add(1);
+            }
+        }
+        None => {
+            if let Some(value) = object.get("text").and_then(Value::as_str) {
+                text.add_text(value);
+            } else {
+                summary.other_block_count = summary.other_block_count.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn count_tool_use_blocks(content: &Value) -> usize {
+    match content {
+        Value::Array(blocks) => blocks.iter().map(count_tool_use_blocks).sum(),
+        Value::Object(object) => usize::from(
+            object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|block_type| block_type == "tool_use"),
+        ),
+        _ => 0,
+    }
+}
+
+fn log_anthropic_request_summary(endpoint: &str, payload: &MessagesRequest) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+
+    let last_user = payload
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, message)| message.role == "user");
+    let (last_user_index, last_user_summary) = last_user
+        .map(|(index, message)| {
+            (
+                Some(index),
+                Some(summarize_anthropic_content(&message.content)),
+            )
+        })
+        .unwrap_or((None, None));
+    let assistant_tool_use_count: usize = payload
+        .messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .map(|message| count_tool_use_blocks(&message.content))
+        .sum();
+    let metadata_user_hash = payload
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.user_id.as_deref())
+        .map(short_text_hash);
+
+    tracing::debug!(
+        endpoint,
+        model = %payload.model,
+        message_count = payload.messages.len(),
+        last_user_index = ?last_user_index,
+        last_user_content_kind = last_user_summary.as_ref().map(|summary| summary.kind),
+        last_user_text_bytes = last_user_summary.as_ref().map(|summary| summary.text.bytes).unwrap_or(0),
+        last_user_text_chars = last_user_summary.as_ref().map(|summary| summary.text.chars).unwrap_or(0),
+        last_user_text_segments = last_user_summary.as_ref().map(|summary| summary.text.segments).unwrap_or(0),
+        last_user_text_hash = ?last_user_summary.as_ref().and_then(|summary| summary.text.hash.as_deref()),
+        last_user_tool_result_count = last_user_summary.as_ref().map(|summary| summary.tool_result_count).unwrap_or(0),
+        last_user_tool_use_count = last_user_summary.as_ref().map(|summary| summary.tool_use_count).unwrap_or(0),
+        last_user_image_count = last_user_summary.as_ref().map(|summary| summary.image_count).unwrap_or(0),
+        last_user_document_count = last_user_summary.as_ref().map(|summary| summary.document_count).unwrap_or(0),
+        last_user_other_block_count = last_user_summary.as_ref().map(|summary| summary.other_block_count).unwrap_or(0),
+        assistant_tool_use_count,
+        tool_definition_count = payload.tools.as_ref().map(Vec::len).unwrap_or(0),
+        system_message_count = payload.system.as_ref().map(Vec::len).unwrap_or(0),
+        metadata_user_hash = ?metadata_user_hash,
+        "Anthropic request summary"
+    );
+}
+
+fn log_thinking_request_trace(
+    endpoint: &str,
+    payload: &MessagesRequest,
+    runtime_config: &RequestRuntimeConfig,
+) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+
+    let thinking_type = payload
+        .thinking
+        .as_ref()
+        .map(|thinking| thinking.thinking_type.as_str());
+    let thinking_requested = payload
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.is_enabled());
+    let output_effort = payload
+        .output_config
+        .as_ref()
+        .map(|config| config.effort.as_str());
+    let latest_user_has_visible_thinking_signal =
+        request_has_claude_code_visible_thinking_signal(payload);
+
+    tracing::debug!(
+        endpoint,
+        model = %payload.model,
+        trigger_mode = ?runtime_config.thinking_trigger_mode,
+        thinking_requested,
+        thinking_type = ?thinking_type,
+        output_effort = ?output_effort,
+        force_visible_thinking = should_force_visible_thinking(payload, runtime_config),
+        latest_user_has_visible_thinking_signal,
+        "Anthropic thinking request trace"
+    );
+}
+
+fn log_kiro_conversion_summary(
+    endpoint: &str,
+    payload: &MessagesRequest,
+    model_resolution: &ModelResolution,
+    kiro_request: &KiroRequest,
+    request_bytes: usize,
+    payload_guard_report: &PayloadGuardReport,
+    warnings: &ProxyWarnings,
+) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+
+    let current_user_input = &kiro_request
+        .conversation_state
+        .current_message
+        .user_input_message;
+    let current_context = &current_user_input.user_input_message_context;
+    let current_content = current_user_input.content.as_str();
+    let warnings_header = warnings.encode_header();
+
+    tracing::debug!(
+        endpoint,
+        requested_model = %payload.model,
+        upstream_model = ?model_resolution.upstream_model,
+        conversation_id = %kiro_request.conversation_state.conversation_id,
+        request_bytes,
+        original_history_entries = payload_guard_report.original_history_entries,
+        final_history_entries = payload_guard_report.final_history_entries,
+        current_message_bytes = current_content.len(),
+        current_message_chars = current_content.chars().count(),
+        current_message_hash = %short_text_hash(current_content),
+        current_tool_count = current_context.tools.len(),
+        current_tool_result_count = current_context.tool_results.len(),
+        current_image_count = current_user_input.images.len(),
+        warning_header = ?warnings_header,
+        warning_prefill_dropped = warnings.prefill_dropped,
+        warning_orphan_tool_results = warnings.orphan_tool_results,
+        warning_orphan_tool_results_textified = warnings.orphan_tool_results_textified,
+        warning_orphan_tool_uses = warnings.orphan_tool_uses,
+        warning_duplicate_tool_results = warnings.duplicate_tool_results,
+        warning_duplicate_tool_results_textified = warnings.duplicate_tool_results_textified,
+        warning_tool_result_content_placeholders = warnings.tool_result_content_placeholders,
+        warning_empty_content_placeholders = warnings.empty_content_placeholders,
+        "Kiro conversion summary"
+    );
+}
+
 fn saturating_fetch_add_u32(value: &AtomicU32, amount: u32) {
     let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_add(amount))
@@ -187,6 +520,7 @@ struct ExternalFallbackContext {
     prompt_cache: Arc<super::prompt_cache::PromptCacheTracker>,
     prompt_cache_creation_controller:
         Arc<super::prompt_cache_creation_control::PromptCacheCreationController>,
+    prompt_cache_strategy_type: PromptCacheStrategyType,
     prompt_cache_simulation_mode: PromptCacheSimulationMode,
     prompt_cache_route_namespace: Option<String>,
     prompt_cache_target_read_ratio: f64,
@@ -197,6 +531,7 @@ struct ExternalFallbackContext {
     prompt_cache_scale_min_input_tokens: i32,
     prompt_cache_creation_control: PromptCacheCreationControlConfig,
     prompt_cache_bounds: PromptCacheBounds,
+    kiro_rs_tool_cache_policy: KiroRsToolCachePolicy,
     model_capabilities: Arc<super::model_capabilities::ModelCapabilitiesCatalog>,
     pricing_catalog: Arc<super::pricing::PricingCatalog>,
     recorder: Arc<super::usage::UsageRecorder>,
@@ -238,6 +573,7 @@ struct RequestRuntimeConfig {
     prompt_cache_bounds: PromptCacheBounds,
     reported_usage: ReportedUsageConfig,
     cache_policy: CachePolicyConfig,
+    defined_cache_routes: Vec<String>,
     compat_profile: CompatProfile,
     model_resolution_mode: ModelResolutionMode,
     model_mapping: ModelMappingConfig,
@@ -271,6 +607,7 @@ impl RequestRuntimeConfig {
             prompt_cache_bounds: state.prompt_cache_bounds,
             reported_usage: state.reported_usage.clone(),
             cache_policy: state.cache_policy.clone(),
+            defined_cache_routes: state.defined_cache_routes.clone(),
             compat_profile: state.compat_profile,
             model_resolution_mode: state.model_resolution_mode,
             model_mapping: state.model_mapping.clone().normalized(),
@@ -318,7 +655,13 @@ impl RequestRuntimeConfig {
                 config.prompt_cache_estimated_bytes_limit,
             ),
             reported_usage: config.reported_usage.normalized(),
-            cache_policy: config.cache_policy.normalized(),
+            cache_policy: config
+                .cache_policy
+                .clone()
+                .with_builtin_path_defaults()
+                .with_legacy_defined_cache_route_defaults(&config.defined_cache_routes)
+                .normalized(),
+            defined_cache_routes: normalize_defined_cache_routes(&config.defined_cache_routes),
             compat_profile: config.compat_profile,
             model_resolution_mode: config.model_resolution_mode,
             model_mapping: config.model_mapping.clone().normalized(),
@@ -381,6 +724,7 @@ impl RequestRuntimeConfig {
 
     fn legacy_cache_route_policy_default(&self) -> CacheRoutePolicy {
         CacheRoutePolicy {
+            cache_type: PromptCacheStrategyType::CurrentHighCache,
             simulation: CacheSimulationPolicy {
                 enabled: self.prompt_cache_simulation_mode == PromptCacheSimulationMode::HighCache,
                 target_read_ratio: self.prompt_cache_target_read_ratio,
@@ -404,6 +748,7 @@ impl RequestRuntimeConfig {
                 entry_ttl_secs: self.prompt_cache_bounds.entry_ttl.as_secs(),
                 estimated_bytes_limit: self.prompt_cache_bounds.estimated_bytes_limit,
             },
+            kiro_rs_tool: KiroRsToolCachePolicy::default(),
         }
         .normalized()
     }
@@ -412,17 +757,34 @@ impl RequestRuntimeConfig {
         resolve_cache_policy_for_path(
             self.legacy_cache_route_policy_default(),
             &self.reported_usage,
-            &self.cache_policy,
+            &self
+                .cache_policy
+                .clone()
+                .with_builtin_path_defaults()
+                .with_legacy_defined_cache_route_defaults(&self.defined_cache_routes),
             path,
         )
     }
 }
 
 fn prompt_cache_simulation_mode_for_policy(policy: &CacheRoutePolicy) -> PromptCacheSimulationMode {
-    if policy.simulation.enabled {
-        PromptCacheSimulationMode::HighCache
-    } else {
-        PromptCacheSimulationMode::Disabled
+    match policy.cache_type {
+        PromptCacheStrategyType::CurrentHighCache if policy.simulation.enabled => {
+            PromptCacheSimulationMode::HighCache
+        }
+        PromptCacheStrategyType::NoCache
+        | PromptCacheStrategyType::CurrentHighCache
+        | PromptCacheStrategyType::KiroRsTool => PromptCacheSimulationMode::Disabled,
+    }
+}
+
+fn prompt_cache_converter_mode_for_policy(policy: &CacheRoutePolicy) -> PromptCacheSimulationMode {
+    match policy.cache_type {
+        PromptCacheStrategyType::NoCache => PromptCacheSimulationMode::Disabled,
+        PromptCacheStrategyType::CurrentHighCache => {
+            prompt_cache_simulation_mode_for_policy(policy)
+        }
+        PromptCacheStrategyType::KiroRsTool => PromptCacheSimulationMode::HighCache,
     }
 }
 
@@ -601,6 +963,7 @@ fn build_external_fallback_context(
             reported_usage: reported_usage_config_for_policy(policy.reported_usage.clone()),
             prompt_cache: state.prompt_cache.clone(),
             prompt_cache_creation_controller: state.prompt_cache_creation_controller.clone(),
+            prompt_cache_strategy_type: policy.cache_type,
             prompt_cache_simulation_mode: prompt_cache_simulation_mode_for_policy(policy),
             prompt_cache_route_namespace: cache_route.namespace.clone(),
             prompt_cache_target_read_ratio: policy.simulation.target_read_ratio,
@@ -611,6 +974,7 @@ fn build_external_fallback_context(
             prompt_cache_scale_min_input_tokens: policy.simulation.scale_min_input_tokens,
             prompt_cache_creation_control: policy.creation_control,
             prompt_cache_bounds: prompt_cache_bounds_for_policy(policy),
+            kiro_rs_tool_cache_policy: policy.kiro_rs_tool,
             model_capabilities: state.model_capabilities.clone(),
             pricing_catalog: state.pricing_catalog.clone(),
             recorder: state.usage_recorder.clone(),
@@ -857,6 +1221,7 @@ impl ExternalFallbackContext {
             reported_usage: self.reported_usage.clone(),
             prompt_cache: self.prompt_cache.clone(),
             prompt_cache_creation_controller: self.prompt_cache_creation_controller.clone(),
+            prompt_cache_strategy_type: self.prompt_cache_strategy_type,
             prompt_cache_simulation_mode: self.prompt_cache_simulation_mode,
             prompt_cache_route_namespace: self.prompt_cache_route_namespace.clone(),
             prompt_cache_target_read_ratio: self.prompt_cache_target_read_ratio,
@@ -867,6 +1232,7 @@ impl ExternalFallbackContext {
             prompt_cache_scale_min_input_tokens: self.prompt_cache_scale_min_input_tokens,
             prompt_cache_creation_control: self.prompt_cache_creation_control,
             prompt_cache_bounds: self.prompt_cache_bounds,
+            kiro_rs_tool_cache_policy: self.kiro_rs_tool_cache_policy,
             model_capabilities: self.model_capabilities.clone(),
             pricing_catalog: self.pricing_catalog.clone(),
             request_id,
@@ -1241,6 +1607,10 @@ impl RequestUsageContext {
         }
     }
 
+    fn set_downstream_stop_reason(&self, reason: impl Into<String>) {
+        *self.downstream_stop_reason.lock() = Some(reason.into());
+    }
+
     fn mark_client_dropped(&self) {
         let elapsed = self.elapsed_ms();
         let _ = self.latency.client_dropped_latency_ms.compare_exchange(
@@ -1329,7 +1699,9 @@ impl RequestUsageContext {
     }
 
     fn cache_amplification(&self) -> Option<super::cache::CacheAmplification> {
-        if self.simulation_mode != PromptCacheSimulationMode::HighCache {
+        if self.prompt_cache_strategy_type != PromptCacheStrategyType::CurrentHighCache
+            || self.simulation_mode != PromptCacheSimulationMode::HighCache
+        {
             return None;
         }
 
@@ -1457,8 +1829,7 @@ impl RequestUsageContext {
         usage: super::cache::CacheUsage,
         usage_source: UsageSource,
     ) -> super::cache::CacheUsage {
-        if usage_source != UsageSource::LocalPromptCache
-            || self.simulation_mode != PromptCacheSimulationMode::HighCache
+        if usage_source != UsageSource::LocalPromptCache || !self.uses_local_prompt_cache_strategy()
         {
             return usage;
         }
@@ -1479,8 +1850,7 @@ impl RequestUsageContext {
         usage: super::cache::CacheUsage,
         usage_source: UsageSource,
     ) -> super::cache::CacheUsage {
-        if usage_source != UsageSource::LocalPromptCache
-            || self.simulation_mode != PromptCacheSimulationMode::HighCache
+        if usage_source != UsageSource::LocalPromptCache || !self.uses_local_prompt_cache_strategy()
         {
             return usage;
         }
@@ -1497,6 +1867,14 @@ impl RequestUsageContext {
         } else {
             usage
         }
+    }
+
+    fn uses_local_prompt_cache_strategy(&self) -> bool {
+        matches!(
+            self.prompt_cache_strategy_type,
+            PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::KiroRsTool
+        ) && (self.simulation_mode == PromptCacheSimulationMode::HighCache
+            || self.kiro_rs_tool_prompt_cache_plan.is_some())
     }
 }
 
@@ -1563,11 +1941,12 @@ fn is_thinking_delta_output_event(event: &SseEvent) -> bool {
 }
 
 fn reported_cache_usage_policy(
+    strategy_type: PromptCacheStrategyType,
     simulation_mode: PromptCacheSimulationMode,
     reported_usage: &ReportedUsagePathPolicy,
     seed: u64,
 ) -> Option<super::cache::ReportedCacheUsagePolicy> {
-    if simulation_mode != PromptCacheSimulationMode::HighCache {
+    if !should_apply_current_high_cache_reported_usage(strategy_type, simulation_mode) {
         return None;
     }
 
@@ -1582,14 +1961,36 @@ fn reported_cache_usage_policy_for_path(
     seed: u64,
 ) -> Option<super::cache::ReportedCacheUsagePolicy> {
     reported_cache_usage_policy(
+        PromptCacheStrategyType::CurrentHighCache,
         simulation_mode,
         &reported_usage.policy_for_path(endpoint),
         seed,
     )
 }
 
-fn should_build_local_prompt_cache_usage(simulation_mode: PromptCacheSimulationMode) -> bool {
-    simulation_mode == PromptCacheSimulationMode::HighCache
+fn should_apply_current_high_cache_reported_usage(
+    strategy_type: PromptCacheStrategyType,
+    simulation_mode: PromptCacheSimulationMode,
+) -> bool {
+    match strategy_type {
+        PromptCacheStrategyType::CurrentHighCache => {
+            simulation_mode == PromptCacheSimulationMode::HighCache
+        }
+        PromptCacheStrategyType::NoCache | PromptCacheStrategyType::KiroRsTool => false,
+    }
+}
+
+fn should_build_local_prompt_cache_usage(
+    strategy_type: PromptCacheStrategyType,
+    simulation_mode: PromptCacheSimulationMode,
+) -> bool {
+    match strategy_type {
+        PromptCacheStrategyType::NoCache => false,
+        PromptCacheStrategyType::CurrentHighCache => {
+            simulation_mode == PromptCacheSimulationMode::HighCache
+        }
+        PromptCacheStrategyType::KiroRsTool => true,
+    }
 }
 
 fn usage_snapshot(usage: super::cache::CacheUsage) -> ExternalPoolUsageSnapshot {
@@ -1787,16 +2188,10 @@ impl CredentialUsageContext {
     }
 
     fn scope(&self) -> Option<PromptCacheScope> {
-        Some(PromptCacheScope {
-            credential_id: self.credential_id?,
-            conversation_id: self.request.prompt_cache_scope_conversation_id.clone()?,
-            model: self
-                .request
-                .upstream_model
-                .clone()
-                .unwrap_or_else(|| self.request.model.clone()),
-            route_namespace: self.request.prompt_cache_route_namespace.clone(),
-        })
+        Some(PromptCacheScope::new(
+            self.request.prompt_cache_scope_conversation_id.clone()?,
+            self.request.prompt_cache_route_namespace.clone(),
+        ))
     }
 
     fn usage_source(
@@ -1884,7 +2279,11 @@ impl CredentialUsageContext {
         metadata_usage: Option<&crate::kiro::model::events::MetadataTokenUsage>,
         usage: &super::cache::CacheUsage,
     ) -> bool {
-        self.request.simulation_mode == PromptCacheSimulationMode::HighCache
+        matches!(
+            self.request.prompt_cache_strategy_type,
+            PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::KiroRsTool
+        ) && (self.request.prompt_cache_strategy_type == PromptCacheStrategyType::KiroRsTool
+            || self.request.simulation_mode == PromptCacheSimulationMode::HighCache)
             && metadata_usage.is_some_and(super::cache::metadata_cache_is_empty)
             && self.request.simulated_source == Some(UsageSource::LocalPromptCache)
             && super::cache::usage_has_cache(usage)
@@ -1894,6 +2293,8 @@ impl CredentialUsageContext {
         let Some(usage) = ctx.final_usage() else {
             return;
         };
+        self.request
+            .set_downstream_stop_reason(ctx.downstream_stop_reason());
         let metadata_usage = ctx.metadata_usage();
         let context_estimated = metadata_usage.is_none() && ctx.context_input_tokens_seen();
         let usage_source = self.usage_source(&usage, metadata_usage, context_estimated);
@@ -2009,12 +2410,28 @@ impl CredentialUsageContext {
         }
 
         if let Some(scope) = self.scope() {
-            self.request.prompt_cache.update_with_bounds(
-                Some(scope),
-                self.request.prompt_cache_profile.as_ref(),
-                self.request.prompt_cache_target_read_ratio,
-                self.request.prompt_cache_bounds,
-            );
+            match self.request.prompt_cache_strategy_type {
+                PromptCacheStrategyType::NoCache => {}
+                PromptCacheStrategyType::CurrentHighCache => {
+                    self.request.prompt_cache.update_with_bounds(
+                        Some(scope),
+                        self.request.prompt_cache_profile.as_ref(),
+                        self.request.prompt_cache_target_read_ratio,
+                        self.request.prompt_cache_bounds,
+                    );
+                }
+                PromptCacheStrategyType::KiroRsTool => {
+                    if let Some(plan) = self.request.kiro_rs_tool_prompt_cache_plan.as_ref() {
+                        self.request
+                            .prompt_cache
+                            .commit_kiro_rs_tool_success_with_bounds(
+                                Some(scope),
+                                plan,
+                                self.request.prompt_cache_bounds,
+                            );
+                    }
+                }
+            }
         }
     }
 
@@ -2065,6 +2482,63 @@ impl CredentialUsageContext {
         );
     }
 
+    fn log_slow_interaction_diagnostic(
+        &self,
+        status: UsageRecordStatus,
+        duration_ms: u64,
+        latency_trace: Option<&UsageLatencyTrace>,
+    ) {
+        let first_visible_text_delta_ms =
+            latency_trace.and_then(|trace| trace.first_visible_text_delta_ms);
+        let stream_gap_to_first_output_ms =
+            latency_trace.and_then(|trace| trace.stream_gap_to_first_output_ms);
+        let events_before_first_output =
+            latency_trace.and_then(|trace| trace.events_before_first_output);
+        let slow_first_visible_text =
+            first_visible_text_delta_ms.is_some_and(|value| value >= SLOW_FIRST_VISIBLE_TEXT_MS);
+        let slow_stream_gap =
+            stream_gap_to_first_output_ms.is_some_and(|value| value >= SLOW_STREAM_GAP_MS);
+        let slow_response = duration_ms >= SLOW_RESPONSE_MS;
+        let many_events_before_output = events_before_first_output
+            .is_some_and(|value| value >= SLOW_EVENTS_BEFORE_FIRST_OUTPUT);
+
+        if !slow_first_visible_text
+            && !slow_stream_gap
+            && !slow_response
+            && !many_events_before_output
+        {
+            return;
+        }
+
+        let conversation_id_hash = self.request.conversation_id.as_deref().map(short_text_hash);
+        tracing::warn!(
+            request_id = %self.request.request_id,
+            endpoint = %self.request.endpoint,
+            stream = self.request.stream,
+            status = ?status,
+            requested_model = %self.request.model,
+            upstream_model = ?self.request.upstream_model.as_deref(),
+            conversation_id_hash = ?conversation_id_hash,
+            credential_id = ?self.credential_id,
+            route_subtype = ?self.request.route_subtype_override,
+            duration_ms,
+            first_token_latency_ms = ?self.request.first_token_latency_ms(),
+            upstream_header_ms = ?latency_trace.and_then(|trace| trace.upstream_header_ms),
+            first_upstream_chunk_ms = ?latency_trace.and_then(|trace| trace.first_upstream_chunk_ms),
+            first_thinking_delta_ms = ?latency_trace.and_then(|trace| trace.first_thinking_delta_ms),
+            first_visible_text_delta_ms = ?first_visible_text_delta_ms,
+            stream_gap_to_first_output_ms = ?stream_gap_to_first_output_ms,
+            events_before_first_output = ?events_before_first_output,
+            chunks_before_first_output = ?latency_trace.and_then(|trace| trace.chunks_before_first_output),
+            terminal_reason = ?latency_trace.and_then(|trace| trace.terminal_reason),
+            slow_first_visible_text,
+            slow_stream_gap,
+            slow_response,
+            many_events_before_output,
+            "Kiro slow interaction diagnostic"
+        );
+    }
+
     fn record(
         &self,
         status: UsageRecordStatus,
@@ -2101,6 +2575,8 @@ impl CredentialUsageContext {
             None
         };
         let duration_ms = self.request.started_at.elapsed().as_millis() as u64;
+        let latency_trace = self.request.latency_trace();
+        self.log_slow_interaction_diagnostic(status, duration_ms, latency_trace.as_ref());
         let error_source = match status {
             UsageRecordStatus::Success => None,
             UsageRecordStatus::ClientDropped => Some("downstream_client".to_string()),
@@ -2126,6 +2602,9 @@ impl CredentialUsageContext {
             external_outbound_model: None,
             model_resolution_source: self.request.model_resolution_source.clone(),
             model_resolution_note: self.request.model_resolution_note.clone(),
+            requested_max_tokens: (self.request.requested_max_tokens > 0)
+                .then_some(self.request.requested_max_tokens),
+            downstream_stop_reason: self.request.downstream_stop_reason.lock().clone(),
             conversation_id: self.request.conversation_id.clone(),
             credential_id: self.credential_id,
             credential_label: self.credential_label.clone(),
@@ -2146,7 +2625,7 @@ impl CredentialUsageContext {
             duration_ms,
             first_token_latency_ms: self.request.first_token_latency_ms(),
             response_latency_ms: Some(duration_ms),
-            latency_trace: self.request.latency_trace(),
+            latency_trace,
             simulated: usage_source.is_simulated(),
             sticky_bound: self.sticky_bound,
             fallback_from_sticky: self.fallback_from_sticky,
@@ -2715,6 +3194,7 @@ fn prepare_usage_context(
 ) -> RequestUsageContext {
     let policy = cache_route.policy;
     let simulation_mode = prompt_cache_simulation_mode_for_policy(&policy);
+    let strategy_type = policy.cache_type;
     let prompt_cache_model = model_resolution
         .as_ref()
         .and_then(|resolution| resolution.upstream_model.as_deref())
@@ -2723,18 +3203,53 @@ fn prepare_usage_context(
         .model_capabilities
         .supports_prompt_caching_for(prompt_cache_model)
         .unwrap_or(true);
-    let prompt_cache_profile = match simulation_mode {
-        PromptCacheSimulationMode::Disabled => None,
-        PromptCacheSimulationMode::HighCache if prompt_cache_supported => state
-            .prompt_cache
-            .build_high_cache_profile_for_model(payload, input_tokens, prompt_cache_model),
-        PromptCacheSimulationMode::HighCache => None,
+    let scope = stable_conversation_id.as_ref().map(|conversation_id| {
+        PromptCacheScope::new(conversation_id.clone(), cache_route.namespace.clone())
+    });
+    let (prompt_cache_profile, kiro_rs_tool_prompt_cache_plan) = match strategy_type {
+        PromptCacheStrategyType::NoCache => (None, None),
+        PromptCacheStrategyType::CurrentHighCache => match simulation_mode {
+            PromptCacheSimulationMode::Disabled => (None, None),
+            PromptCacheSimulationMode::HighCache if prompt_cache_supported => (
+                state.prompt_cache.build_high_cache_profile_for_model(
+                    payload,
+                    input_tokens,
+                    prompt_cache_model,
+                ),
+                None,
+            ),
+            PromptCacheSimulationMode::HighCache => (None, None),
+        },
+        PromptCacheStrategyType::KiroRsTool if prompt_cache_supported => (
+            None,
+            Some(state.prompt_cache.compute_kiro_rs_tool_with_bounds(
+                scope.clone(),
+                payload,
+                input_tokens,
+                prompt_cache_model,
+                prompt_cache_bounds_for_policy(&policy),
+                policy.kiro_rs_tool,
+            )),
+        ),
+        PromptCacheStrategyType::KiroRsTool => (None, None),
     };
-    let (simulated_usage, simulated_source) = build_simulated_usage(
-        simulation_mode,
-        stable_conversation_id.as_deref(),
-        prompt_cache_profile.as_ref(),
-    );
+    let (simulated_usage, simulated_source) = match strategy_type {
+        PromptCacheStrategyType::NoCache => (None, None),
+        PromptCacheStrategyType::CurrentHighCache => build_simulated_usage(
+            simulation_mode,
+            stable_conversation_id.as_deref(),
+            prompt_cache_profile.as_ref(),
+        ),
+        PromptCacheStrategyType::KiroRsTool => {
+            let simulated_usage = kiro_rs_tool_prompt_cache_plan.as_ref().and_then(|plan| {
+                super::cache::CacheSimulation::from_prompt_cache_split_input(plan.usage())
+            });
+            (
+                simulated_usage,
+                simulated_usage.map(|_| UsageSource::LocalPromptCache),
+            )
+        }
+    };
     let request_id = envelope::request_id();
     let error_id = envelope::request_id();
     let reported_cache_creation_seed = prompt_cache_profile
@@ -2743,6 +3258,7 @@ fn prepare_usage_context(
         .unwrap_or(0)
         ^ fastrand::u64(..);
     let reported_cache_usage_policy = reported_cache_usage_policy(
+        strategy_type,
         simulation_mode,
         &policy.reported_usage,
         reported_cache_creation_seed,
@@ -2768,6 +3284,8 @@ fn prepare_usage_context(
         model_resolution_note: model_resolution
             .as_ref()
             .and_then(|resolution| resolution.note.clone()),
+        requested_max_tokens: payload.max_tokens.max(0),
+        downstream_stop_reason: Arc::new(Mutex::new(None)),
         conversation_id,
         prompt_cache_scope_conversation_id: stable_conversation_id,
         input_tokens,
@@ -2783,7 +3301,9 @@ fn prepare_usage_context(
                 get_context_window_size(model)
             }),
         prompt_cache_profile,
+        kiro_rs_tool_prompt_cache_plan,
         prompt_cache_route_namespace: cache_route.namespace,
+        prompt_cache_strategy_type: strategy_type,
         simulation_mode,
         prompt_cache_target_read_ratio: policy.simulation.target_read_ratio,
         prompt_cache_token_scale: policy.simulation.token_scale,
@@ -2809,12 +3329,17 @@ fn prepare_usage_context(
 }
 
 fn prompt_cache_scope_conversation_id(
+    strategy_type: PromptCacheStrategyType,
     mode: PromptCacheSimulationMode,
     payload: &MessagesRequest,
 ) -> Option<String> {
-    match mode {
-        PromptCacheSimulationMode::Disabled => None,
-        PromptCacheSimulationMode::HighCache => extract_stable_conversation_id(payload),
+    match strategy_type {
+        PromptCacheStrategyType::NoCache => None,
+        PromptCacheStrategyType::KiroRsTool => extract_stable_conversation_id(payload),
+        PromptCacheStrategyType::CurrentHighCache => match mode {
+            PromptCacheSimulationMode::Disabled => None,
+            PromptCacheSimulationMode::HighCache => extract_stable_conversation_id(payload),
+        },
     }
 }
 
@@ -2857,14 +3382,12 @@ fn prepare_credential_usage_context(
         let scope = usage_context
             .prompt_cache_scope_conversation_id
             .as_ref()
-            .map(|conversation_id| PromptCacheScope {
-                credential_id,
-                conversation_id: conversation_id.clone(),
-                model: usage_context
-                    .upstream_model
-                    .clone()
-                    .unwrap_or_else(|| usage_context.model.clone()),
-                route_namespace: usage_context.prompt_cache_route_namespace.clone(),
+            .map(|conversation_id| {
+                let _ = credential_id;
+                PromptCacheScope::new(
+                    conversation_id.clone(),
+                    usage_context.prompt_cache_route_namespace.clone(),
+                )
             });
         let prompt_usage = usage_context.prompt_cache.compute_with_bounds(
             scope,
@@ -3696,7 +4219,7 @@ pub async fn post_messages(
 
 /// POST /na/v1/messages
 ///
-/// 创建消息（对话），底层 high-cache 计算保持开启；默认只上报真实上游 cache usage。
+/// 创建消息（对话），默认不进入本地 prompt-cache 模拟，直接使用原始 usage。
 pub async fn post_messages_real_cache_usage(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3780,6 +4303,7 @@ async fn post_messages_inner(
         message_count = %payload.messages.len(),
         "Received POST messages request"
     );
+    log_anthropic_request_summary(&endpoint, &payload);
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -3795,6 +4319,8 @@ async fn post_messages_inner(
     let runtime_config = request_runtime_config(&state, &provider);
     let cache_route = runtime_config.cache_policy_for_path(&endpoint);
     let request_simulation_mode = prompt_cache_simulation_mode_for_policy(&cache_route.policy);
+    let converter_prompt_cache_mode = prompt_cache_converter_mode_for_policy(&cache_route.policy);
+    let cache_type = cache_route.policy.cache_type;
     let mut external_fallback = build_external_fallback_context(
         &state,
         &provider,
@@ -3809,6 +4335,7 @@ async fn post_messages_inner(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
     apply_thinking_trigger_mode(&mut payload, &runtime_config);
+    log_thinking_request_trace(&endpoint, &payload, &runtime_config);
 
     let caller_ua = headers
         .get(header::USER_AGENT)
@@ -3877,7 +4404,7 @@ async fn post_messages_inner(
         &payload,
         ConverterOptions {
             compat_profile: runtime_config.compat_profile,
-            prompt_cache_simulation_mode: request_simulation_mode,
+            prompt_cache_simulation_mode: converter_prompt_cache_mode,
             kiro_cache_point_enabled: cache_route.policy.cache_point.enabled,
             kiro_cache_point_tools_only: cache_route.policy.cache_point.tools_only,
             kiro_cache_point_record_plan: cache_route.policy.cache_point.record_plan,
@@ -3938,6 +4465,15 @@ async fn post_messages_inner(
         model_resolution.upstream_model.as_deref(),
         Some(&conversation_id),
     );
+    log_kiro_conversion_summary(
+        &endpoint,
+        &payload,
+        &model_resolution,
+        &kiro_request,
+        request_body.len(),
+        &payload_guard_report,
+        &conversion_result.warnings,
+    );
     if model_resolution.is_remapped() {
         tracing::info!(
             endpoint,
@@ -3986,7 +4522,7 @@ async fn post_messages_inner(
         &payload,
         Some(model_resolution.clone()),
         Some(conversation_id.clone()),
-        prompt_cache_scope_conversation_id(request_simulation_mode, &payload),
+        prompt_cache_scope_conversation_id(cache_type, request_simulation_mode, &payload),
         input_tokens,
     )
     .with_payload_diagnostics(payload_breakdown, payload_guard_report.clone());
@@ -4029,6 +4565,7 @@ async fn post_messages_inner(
                 .upstream_model
                 .as_deref()
                 .unwrap_or(&payload.model),
+            payload.max_tokens,
             input_tokens,
             usage_context.context_window_tokens,
             thinking_enabled,
@@ -4234,6 +4771,7 @@ async fn handle_stream_request(
     kiro_request: &KiroRequest,
     model: &str,
     preflight_model: &str,
+    requested_max_tokens: i32,
     input_tokens: i32,
     context_window_tokens: i32,
     thinking_enabled: bool,
@@ -4681,7 +5219,11 @@ async fn handle_stream_request(
         credential_usage.request.simulated_usage,
         credential_usage.request.simulation_mode,
     );
+    ctx.set_requested_max_tokens(requested_max_tokens);
     ctx.set_reported_cache_usage_policy(credential_usage.request.reported_cache_usage_policy());
+    ctx.set_local_prompt_cache_projection_enabled(
+        credential_usage.request.uses_local_prompt_cache_strategy(),
+    );
     ctx.set_stream_error_id(credential_usage.request.error_id.clone());
 
     // 生成初始事件
@@ -4709,8 +5251,9 @@ async fn handle_stream_request(
     builder.body(Body::from_stream(stream)).unwrap()
 }
 
-/// Ping 事件间隔（25秒）
-const PING_INTERVAL_SECS: u64 = 25;
+/// Ping 事件间隔。Claude Code 的插件 UI 在长 thinking/tool_use 阶段可能没有可见正文；
+/// 更短的保活能避免中间代理或客户端误判流已经停住，且不会污染模型输出内容。
+const PING_INTERVAL_SECS: u64 = 5;
 /// 上游 eventstream 默认读空闲超时（180秒）
 const DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECS: u64 = 180;
 const JSON_STREAM_ERROR_SNIFF_MAX_BYTES: usize = 64 * 1024;
@@ -4989,7 +5532,7 @@ fn create_sse_stream(
             .map(|e| Ok(Bytes::from(e.to_sse_string()))),
     );
 
-    // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
+    // 然后处理 Kiro 响应流，同时定期发送 ping 保活
     let upstream_content_type = response
         .headers()
         .get(REQWEST_CONTENT_TYPE)
@@ -5949,6 +6492,18 @@ async fn handle_non_stream_request(
         .as_ref()
         .map(|usage| usage.output_tokens)
         .unwrap_or_else(|| token::estimate_output_tokens(&content));
+    if stop_reason == "end_turn"
+        && !has_tool_use
+        && super::stream::output_tokens_reached_requested_max_tokens(
+            credential_usage.request.requested_max_tokens,
+            output_tokens,
+        )
+    {
+        stop_reason = "max_tokens".to_string();
+    }
+    credential_usage
+        .request
+        .set_downstream_stop_reason(stop_reason.clone());
 
     // 优先使用 metadataEvent 的准确 usage，其次使用 contextUsageEvent 估算值。
     let final_input_tokens = metadata_usage
@@ -5956,19 +6511,22 @@ async fn handle_non_stream_request(
         .map(|usage| usage.total_input_tokens())
         .or(context_input_tokens)
         .unwrap_or(input_tokens);
-    let usage_input_tokens =
-        if should_build_local_prompt_cache_usage(credential_usage.request.simulation_mode) {
-            final_input_tokens.max(credential_usage.request.input_tokens)
-        } else {
-            final_input_tokens
-        };
+    let build_local_prompt_cache_usage = should_build_local_prompt_cache_usage(
+        credential_usage.request.prompt_cache_strategy_type,
+        credential_usage.request.simulation_mode,
+    );
+    let usage_input_tokens = if build_local_prompt_cache_usage {
+        final_input_tokens.max(credential_usage.request.input_tokens)
+    } else {
+        final_input_tokens
+    };
 
     let usage = super::cache::build_usage_with_simulation_policy(
         metadata_usage.as_ref(),
         usage_input_tokens,
         output_tokens,
         credential_usage.request.simulated_usage,
-        should_build_local_prompt_cache_usage(credential_usage.request.simulation_mode),
+        build_local_prompt_cache_usage,
     );
     let has_metadata = metadata_usage.is_some();
     let context_estimated = !has_metadata && context_input_tokens.is_some();
@@ -6317,6 +6875,7 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
+    log_anthropic_request_summary("/cc/v1/messages", &payload);
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
@@ -6333,6 +6892,8 @@ pub async fn post_messages_cc(
     let runtime_config = request_runtime_config(&state, &provider);
     let cache_route = runtime_config.cache_policy_for_path("/cc/v1/messages");
     let request_simulation_mode = prompt_cache_simulation_mode_for_policy(&cache_route.policy);
+    let converter_prompt_cache_mode = prompt_cache_converter_mode_for_policy(&cache_route.policy);
+    let cache_type = cache_route.policy.cache_type;
     let mut external_fallback = build_external_fallback_context(
         &state,
         &provider,
@@ -6347,6 +6908,7 @@ pub async fn post_messages_cc(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
     apply_thinking_trigger_mode(&mut payload, &runtime_config);
+    log_thinking_request_trace("/cc/v1/messages", &payload, &runtime_config);
 
     let caller_ua = headers
         .get(header::USER_AGENT)
@@ -6415,7 +6977,7 @@ pub async fn post_messages_cc(
         &payload,
         ConverterOptions {
             compat_profile: runtime_config.compat_profile,
-            prompt_cache_simulation_mode: request_simulation_mode,
+            prompt_cache_simulation_mode: converter_prompt_cache_mode,
             kiro_cache_point_enabled: cache_route.policy.cache_point.enabled,
             kiro_cache_point_tools_only: cache_route.policy.cache_point.tools_only,
             kiro_cache_point_record_plan: cache_route.policy.cache_point.record_plan,
@@ -6476,6 +7038,15 @@ pub async fn post_messages_cc(
         model_resolution.upstream_model.as_deref(),
         Some(&conversation_id),
     );
+    log_kiro_conversion_summary(
+        "/cc/v1/messages",
+        &payload,
+        &model_resolution,
+        &kiro_request,
+        request_body.len(),
+        &payload_guard_report,
+        &conversion_result.warnings,
+    );
     if model_resolution.is_remapped() {
         tracing::info!(
             endpoint = "/cc/v1/messages",
@@ -6524,7 +7095,7 @@ pub async fn post_messages_cc(
         &payload,
         Some(model_resolution.clone()),
         Some(conversation_id.clone()),
-        prompt_cache_scope_conversation_id(request_simulation_mode, &payload),
+        prompt_cache_scope_conversation_id(cache_type, request_simulation_mode, &payload),
         input_tokens,
     )
     .with_payload_diagnostics(payload_breakdown, payload_guard_report.clone());
@@ -6567,6 +7138,7 @@ pub async fn post_messages_cc(
                 .upstream_model
                 .as_deref()
                 .unwrap_or(&payload.model),
+            payload.max_tokens,
             input_tokens,
             usage_context.context_window_tokens,
             thinking_enabled,
@@ -6614,12 +7186,17 @@ mod tests {
     use crate::anthropic::pricing::PricingCatalog;
     use crate::anthropic::prompt_cache::PromptCacheTracker;
     use crate::anthropic::prompt_cache_creation_control::PromptCacheCreationController;
-    use crate::anthropic::types::{Message, SystemMessage};
+    use crate::anthropic::types::{Message, Metadata, SystemMessage};
     use crate::anthropic::usage::{UsageRecordQuery, UsageRecorder};
     use crate::kiro::call_trace::{
         AccountRejectReason, KiroCallError, SelectionFailureStage, SelectionFailureSummary,
     };
     use crate::kiro::model::events::MetadataTokenUsage;
+    use crate::model::config::{
+        CachePointPolicyPatch, CachePolicyConfig, CacheRoutePolicyPatch,
+        CacheSimulationPolicyPatch, PromptCacheCreationControlConfig, ReportedUsageFieldPolicy,
+        ReportedUsagePathPolicy,
+    };
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -6639,6 +7216,41 @@ mod tests {
             output_config: None,
             metadata: None,
         }
+    }
+
+    #[test]
+    fn anthropic_content_summary_skips_tool_result_text_for_latest_user() {
+        let content = json!([
+            {"type": "text", "text": "please answer this"},
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": [{"type": "text", "text": "large command output"}]
+            }
+        ]);
+
+        let summary = summarize_anthropic_content(&content);
+
+        assert_eq!(summary.kind, "array");
+        assert_eq!(summary.text.bytes, "please answer this".len());
+        assert_eq!(summary.text.chars, "please answer this".chars().count());
+        assert_eq!(summary.text.segments, 1);
+        assert_eq!(
+            summary.text.hash,
+            Some(short_text_hash("please answer this"))
+        );
+        assert_eq!(summary.tool_result_count, 1);
+    }
+
+    #[test]
+    fn count_tool_use_blocks_counts_assistant_tool_uses_without_text_hashing() {
+        let content = json!([
+            {"type": "text", "text": "I will call a tool."},
+            {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "README.md"}},
+            {"type": "tool_use", "id": "toolu_2", "name": "Grep", "input": {"pattern": "kiro"}}
+        ]);
+
+        assert_eq!(count_tool_use_blocks(&content), 2);
     }
 
     #[test]
@@ -6788,6 +7400,7 @@ mod tests {
             prompt_cache_bounds: PromptCacheBounds::default(),
             reported_usage: ReportedUsageConfig::default(),
             cache_policy: CachePolicyConfig::default(),
+            defined_cache_routes: Vec::new(),
             compat_profile: CompatProfile::ClaudeCode,
             model_resolution_mode: ModelResolutionMode::Compatible,
             model_mapping: ModelMappingConfig::default(),
@@ -7326,11 +7939,8 @@ Return a fix plan."#
             .expect("policy should apply"),
         );
         assert!((1..=96).contains(&reported.input_tokens));
-        assert_eq!(
-            reported.cache_read_input_tokens,
-            usage.input_tokens.saturating_sub(reported.input_tokens)
-        );
-        assert!(reported.cache_read_input_tokens < usage.input_tokens);
+        assert_eq!(reported.cache_read_input_tokens, 0);
+        assert!(reported.cache_creation_input_tokens > 0);
         assert_eq!(reported.output_tokens, 1);
 
         let raw_reported = usage.with_reported_cache_usage_policy_and_raw(
@@ -7344,12 +7954,8 @@ Return a fix plan."#
             cache::RawUsage::uncached(100_000, 1),
         );
         assert!((1..=96).contains(&raw_reported.input_tokens));
-        assert_eq!(
-            raw_reported.cache_read_input_tokens,
-            usage
-                .cache_read_input_tokens
-                .saturating_add(100_000_i32.saturating_sub(raw_reported.input_tokens))
-        );
+        assert_eq!(raw_reported.cache_read_input_tokens, 0);
+        assert!(raw_reported.cache_creation_input_tokens > 0);
     }
 
     #[test]
@@ -7411,12 +8017,16 @@ Return a fix plan."#
             upstream_model: None,
             model_resolution_source: None,
             model_resolution_note: None,
+            requested_max_tokens: 0,
+            downstream_stop_reason: Arc::new(Mutex::new(None)),
             conversation_id: Some("session-limit".to_string()),
             prompt_cache_scope_conversation_id: Some("session-limit".to_string()),
             input_tokens: 100_000,
             context_window_tokens: 200_000,
             prompt_cache_profile: None,
+            kiro_rs_tool_prompt_cache_plan: None,
             prompt_cache_route_namespace: None,
+            prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
             simulation_mode: PromptCacheSimulationMode::HighCache,
             prompt_cache_target_read_ratio: 0.95,
             prompt_cache_token_scale: 1.0,
@@ -7492,12 +8102,16 @@ Return a fix plan."#
             upstream_model: Some("claude-opus-4.6".to_string()),
             model_resolution_source: None,
             model_resolution_note: None,
+            requested_max_tokens: 0,
+            downstream_stop_reason: Arc::new(Mutex::new(None)),
             conversation_id: Some("conversation-prod-like".to_string()),
             prompt_cache_scope_conversation_id: Some("conversation-prod-like".to_string()),
             input_tokens: request_input_tokens,
             context_window_tokens: 200_000,
             prompt_cache_profile: None,
+            kiro_rs_tool_prompt_cache_plan: None,
             prompt_cache_route_namespace: None,
+            prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
             simulation_mode: PromptCacheSimulationMode::HighCache,
             prompt_cache_target_read_ratio: 0.99,
             prompt_cache_token_scale: 2.0,
@@ -7520,6 +8134,7 @@ Return a fix plan."#
                 cache_creation_1h_input_tokens: 0,
                 target_cache_ratio: Some(0.99),
                 amplification: None,
+                split_cached_input: false,
             }),
             simulated_source: Some(UsageSource::LocalPromptCache),
             payload_breakdown: None,
@@ -7589,6 +8204,111 @@ Return a fix plan."#
     }
 
     #[test]
+    fn kiro_rs_tool_local_prompt_cache_uses_strategy_usage_without_legacy_reported_usage() {
+        let usage_recorder = Arc::new(UsageRecorder::new(10));
+        let usage_context = RequestUsageContext {
+            recorder: usage_recorder.clone(),
+            tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
+            prompt_cache: Arc::new(PromptCacheTracker::default()),
+            prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+            pricing_catalog: Arc::new(PricingCatalog::new()),
+            request_id: "req_kiro_strategy_reported_usage".to_string(),
+            error_id: "req_01kiro_strategy_reported_usage".to_string(),
+            endpoint: "/kiro/v1/messages".to_string(),
+            stream: false,
+            model: "claude-sonnet-4-6".to_string(),
+            upstream_model: None,
+            model_resolution_source: None,
+            model_resolution_note: None,
+            requested_max_tokens: 0,
+            downstream_stop_reason: Arc::new(Mutex::new(None)),
+            conversation_id: Some("conversation-kiro-strategy".to_string()),
+            prompt_cache_scope_conversation_id: Some("conversation-kiro-strategy".to_string()),
+            input_tokens: 100_000,
+            context_window_tokens: 200_000,
+            prompt_cache_profile: None,
+            kiro_rs_tool_prompt_cache_plan: None,
+            prompt_cache_route_namespace: Some("/kiro".to_string()),
+            prompt_cache_strategy_type: PromptCacheStrategyType::KiroRsTool,
+            simulation_mode: PromptCacheSimulationMode::Disabled,
+            prompt_cache_target_read_ratio: 0.5,
+            prompt_cache_token_scale: 3.0,
+            prompt_cache_max_simulated_input_tokens: 300_000,
+            prompt_cache_cap_jitter_min_tokens: 0,
+            prompt_cache_cap_jitter_max_tokens: 0,
+            prompt_cache_scale_min_input_tokens: 0,
+            prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+            prompt_cache_bounds: PromptCacheBounds::default(),
+            reported_cache_usage_policy: reported_cache_usage_policy(
+                PromptCacheStrategyType::KiroRsTool,
+                PromptCacheSimulationMode::Disabled,
+                &ReportedUsagePathPolicy {
+                    input: ReportedUsageFieldPolicy::sample_input_max(96),
+                    ..ReportedUsagePathPolicy::default()
+                },
+                7,
+            ),
+            simulated_usage: Some(cache::CacheSimulation {
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 60_000,
+                cache_creation_5m_input_tokens: 0,
+                cache_creation_1h_input_tokens: 0,
+                target_cache_ratio: None,
+                amplification: None,
+                split_cached_input: true,
+            }),
+            simulated_source: Some(UsageSource::LocalPromptCache),
+            payload_breakdown: None,
+            payload_guard_report: None,
+            route_subtype_override: None,
+            fallback_reason: None,
+            local_preflight: None,
+            external_attempts: Vec::new(),
+            started_at: Instant::now(),
+            first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            latency: RequestLatencyTraceState::new(),
+        };
+
+        assert!(usage_context.reported_cache_usage_policy().is_none());
+        let usage = cache::build_usage_with_simulation_policy(
+            None,
+            100_000,
+            6,
+            usage_context.simulated_usage,
+            should_build_local_prompt_cache_usage(
+                usage_context.prompt_cache_strategy_type,
+                usage_context.simulation_mode,
+            ),
+        );
+        assert_eq!(usage.input_tokens, 40_000);
+        assert_eq!(usage.cache_read_input_tokens, 60_000);
+
+        let credential_usage =
+            usage_context.attach_credential(Some(131), None, false, false, Vec::new());
+        let reported =
+            credential_usage.final_reported_usage_for_success(usage, UsageSource::LocalPromptCache);
+
+        assert_eq!(reported.input_tokens, 40_000);
+        assert_eq!(reported.cache_read_input_tokens, 60_000);
+        assert_eq!(reported.output_tokens, 6);
+
+        let raw_usage = raw_usage_from_metadata_or_estimate(None, 100_000, 6);
+        credential_usage.record_success_reported(
+            reported,
+            UsageSource::LocalPromptCache,
+            Some(raw_usage),
+        );
+        let records = usage_recorder.query(UsageRecordQuery::default());
+        assert_eq!(records.total, 1);
+        let record = records.records.first().expect("usage record should exist");
+        assert_eq!(record.compat_input_tokens, 40_000);
+        assert_eq!(record.cache_read_input_tokens, 60_000);
+        let raw_usage = record.raw_usage.expect("raw usage should be retained");
+        assert_eq!(raw_usage.input_tokens, 100_000);
+        assert_eq!(raw_usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
     fn first_token_detection_ignores_initial_empty_blocks() {
         assert!(!is_first_token_output_event(&SseEvent::new(
             "message_start",
@@ -7636,12 +8356,16 @@ Return a fix plan."#
             upstream_model: Some("claude-opus-4.8".to_string()),
             model_resolution_source: None,
             model_resolution_note: None,
+            requested_max_tokens: 0,
+            downstream_stop_reason: Arc::new(Mutex::new(None)),
             conversation_id: Some("session-latency".to_string()),
             prompt_cache_scope_conversation_id: Some("session-latency".to_string()),
             input_tokens: 100,
             context_window_tokens: 200_000,
             prompt_cache_profile: None,
+            kiro_rs_tool_prompt_cache_plan: None,
             prompt_cache_route_namespace: None,
+            prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
             simulation_mode: PromptCacheSimulationMode::Disabled,
             prompt_cache_target_read_ratio: 0.95,
             prompt_cache_token_scale: 1.0,
@@ -7720,6 +8444,83 @@ Return a fix plan."#
     }
 
     #[test]
+    fn stream_success_records_requested_max_tokens_and_downstream_stop_reason() {
+        let prompt_cache = Arc::new(PromptCacheTracker::default());
+        let usage_recorder = Arc::new(UsageRecorder::new(10));
+        let state = AppState::new(
+            Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+            true,
+            usage_recorder.clone(),
+            prompt_cache,
+            Arc::new(PromptCacheCreationController::default()),
+            PromptCacheSimulationMode::Disabled,
+            0.95,
+            CompatProfile::ClaudeCode,
+            false,
+        );
+        let mut payload = messages_request_for_model("claude-sonnet-4-6");
+        payload.stream = true;
+        payload.max_tokens = 100;
+
+        let usage_context = prepare_usage_context(
+            &state,
+            RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/cc/v1/messages"),
+            "/cc/v1/messages",
+            true,
+            &payload,
+            None,
+            Some("conv-stop-reason".to_string()),
+            Some("conv-stop-reason".to_string()),
+            50,
+        );
+        let credential_usage = attach_test_credential_usage(usage_context, 1);
+
+        let mut stream_context = StreamContext::new_with_simulation(
+            &payload.model,
+            50,
+            200_000,
+            false,
+            false,
+            HashMap::new(),
+            None,
+            PromptCacheSimulationMode::Disabled,
+        );
+        stream_context.set_requested_max_tokens(payload.max_tokens);
+        let _initial_events = stream_context.generate_initial_events();
+        let mut events = Vec::new();
+        let mut assistant_response = crate::kiro::model::events::AssistantResponseEvent::default();
+        assistant_response.content = "near token limit".to_string();
+        events.extend(
+            stream_context.process_kiro_event(&Event::AssistantResponse(assistant_response)),
+        );
+        events.extend(stream_context.process_kiro_event(&Event::MessageMetadata(
+            crate::kiro::model::events::MessageMetadataEvent {
+                conversation_id: Some("conv-stop-reason".to_string()),
+                utterance_id: Some("utt-stop-reason".to_string()),
+                token_usage: Some(MetadataTokenUsage {
+                    uncached_input_tokens: 50,
+                    output_tokens: 95,
+                    total_tokens: 145,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                }),
+            },
+        )));
+        events.extend(stream_context.generate_final_events());
+        assert!(events.iter().any(|event| {
+            event.event == "message_delta" && event.data["delta"]["stop_reason"] == "max_tokens"
+        }));
+
+        credential_usage.record_success_from_stream(&stream_context);
+
+        let records = usage_recorder.query(UsageRecordQuery::default());
+        assert_eq!(records.total, 1);
+        let record = records.records.first().expect("usage record should exist");
+        assert_eq!(record.requested_max_tokens, Some(100));
+        assert_eq!(record.downstream_stop_reason.as_deref(), Some("max_tokens"));
+    }
+
+    #[test]
     fn path_overrides_independently_control_reported_usage_fields() {
         let reported_usage_config = ReportedUsageConfig::default();
         let usage = CacheUsage {
@@ -7748,12 +8549,16 @@ Return a fix plan."#
             upstream_model: None,
             model_resolution_source: None,
             model_resolution_note: None,
+            requested_max_tokens: 0,
+            downstream_stop_reason: Arc::new(Mutex::new(None)),
             conversation_id: Some("session-policy".to_string()),
             prompt_cache_scope_conversation_id: Some("session-policy".to_string()),
             input_tokens: 100_000,
             context_window_tokens: 200_000,
             prompt_cache_profile: None,
+            kiro_rs_tool_prompt_cache_plan: None,
             prompt_cache_route_namespace: None,
+            prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
             simulation_mode: PromptCacheSimulationMode::HighCache,
             prompt_cache_target_read_ratio: 0.95,
             prompt_cache_token_scale: 1.0,
@@ -7809,19 +8614,17 @@ Return a fix plan."#
             endpoint: "/na/v1/messages".to_string(),
             request_id: "req_na_policy".to_string(),
             error_id: "req_01na_policy".to_string(),
-            reported_cache_usage_policy: reported_cache_usage_policy_for_path(
-                "/na/v1/messages",
-                PromptCacheSimulationMode::HighCache,
-                &reported_usage_config,
-                7,
-            ),
+            prompt_cache_strategy_type: PromptCacheStrategyType::NoCache,
+            simulation_mode: PromptCacheSimulationMode::Disabled,
+            reported_cache_usage_policy: None,
+            simulated_source: None,
             ..v1_context.clone()
         };
 
         assert!(v1_context.reported_cache_usage_policy().is_some());
         assert!(cc_context.reported_cache_usage_policy().is_some());
         assert!(ha_context.reported_cache_usage_policy().is_some());
-        assert!(na_context.reported_cache_usage_policy().is_some());
+        assert!(na_context.reported_cache_usage_policy().is_none());
 
         let v1_reported =
             v1_context.reported_usage_for_downstream(usage, UsageSource::LocalPromptCache);
@@ -7877,13 +8680,7 @@ Return a fix plan."#
 
         let na_reported =
             na_context.reported_usage_for_downstream(usage, UsageSource::LocalPromptCache);
-        assert_eq!(na_reported.total_input_tokens, na_context.input_tokens);
-        assert_eq!(na_reported.input_tokens, na_context.input_tokens);
-        assert_eq!(na_reported.cache_creation_input_tokens, 0);
-        assert_eq!(na_reported.cache_read_input_tokens, 0);
-        assert_eq!(na_reported.cache_creation_5m_input_tokens, 0);
-        assert_eq!(na_reported.cache_creation_1h_input_tokens, 0);
-        assert_eq!(na_reported.output_tokens, usage.output_tokens);
+        assert_eq!(na_reported, usage);
     }
 
     #[test]
@@ -7912,12 +8709,16 @@ Return a fix plan."#
             upstream_model: None,
             model_resolution_source: None,
             model_resolution_note: None,
+            requested_max_tokens: 0,
+            downstream_stop_reason: Arc::new(Mutex::new(None)),
             conversation_id: Some("session-error".to_string()),
             prompt_cache_scope_conversation_id: Some("session-error".to_string()),
             input_tokens: 4096,
             context_window_tokens: 200_000,
             prompt_cache_profile: None,
+            kiro_rs_tool_prompt_cache_plan: None,
             prompt_cache_route_namespace: None,
+            prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
             simulation_mode: PromptCacheSimulationMode::HighCache,
             prompt_cache_target_read_ratio: 0.95,
             prompt_cache_token_scale: 1.0,
@@ -8241,12 +9042,16 @@ Return a fix plan."#
             upstream_model: None,
             model_resolution_source: None,
             model_resolution_note: None,
+            requested_max_tokens: 0,
+            downstream_stop_reason: Arc::new(Mutex::new(None)),
             conversation_id: Some("session-a".to_string()),
             prompt_cache_scope_conversation_id: Some("session-a".to_string()),
             input_tokens: 4096,
             context_window_tokens: 200_000,
             prompt_cache_profile: profile.clone(),
+            kiro_rs_tool_prompt_cache_plan: None,
             prompt_cache_route_namespace: None,
+            prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
             simulation_mode: PromptCacheSimulationMode::HighCache,
             prompt_cache_target_read_ratio: 0.85,
             prompt_cache_token_scale: 1.0,
@@ -8283,9 +9088,7 @@ Return a fix plan."#
         usage_context.record_success(usage, UsageSource::LocalPromptCache, true);
 
         let scope = PromptCacheScope {
-            credential_id: 1,
             conversation_id: "session-a".to_string(),
-            model: payload.model,
             route_namespace: None,
         };
         let second = prompt_cache.compute(Some(scope), profile.as_ref(), 0.85);
@@ -8329,12 +9132,16 @@ Return a fix plan."#
             upstream_model: None,
             model_resolution_source: None,
             model_resolution_note: None,
+            requested_max_tokens: 0,
+            downstream_stop_reason: Arc::new(Mutex::new(None)),
             conversation_id: Some("session-high-cache".to_string()),
             prompt_cache_scope_conversation_id: Some("session-high-cache".to_string()),
             input_tokens: 4096,
             context_window_tokens: 200_000,
             prompt_cache_profile: profile.clone(),
+            kiro_rs_tool_prompt_cache_plan: None,
             prompt_cache_route_namespace: None,
+            prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
             simulation_mode: PromptCacheSimulationMode::HighCache,
             prompt_cache_target_read_ratio: 0.95,
             prompt_cache_token_scale: 1.0,
@@ -8352,6 +9159,7 @@ Return a fix plan."#
                 cache_creation_1h_input_tokens: 0,
                 target_cache_ratio: Some(0.95),
                 amplification: None,
+                split_cached_input: false,
             }),
             simulated_source: Some(UsageSource::LocalPromptCache),
             payload_breakdown: None,
@@ -8385,9 +9193,7 @@ Return a fix plan."#
         usage_context.record_success(usage, source, false);
 
         let scope = PromptCacheScope {
-            credential_id: 1,
             conversation_id: "session-high-cache".to_string(),
-            model: payload.model,
             route_namespace: None,
         };
         let second = prompt_cache.compute(Some(scope), profile.as_ref(), 0.95);
@@ -8450,7 +9256,15 @@ Return a fix plan."#
         );
         assert!(first_usage_body.cache_creation_input_tokens > 0);
         assert_eq!(first_usage_body.cache_read_input_tokens, 0);
-        let first_source = first_usage.usage_source(&first_usage_body, None, false);
+        let first_metadata = MetadataTokenUsage {
+            uncached_input_tokens: 4096,
+            output_tokens: 1,
+            total_tokens: 4097,
+            cache_read_input_tokens: 0,
+            cache_write_input_tokens: 0,
+        };
+        let first_source =
+            first_usage.usage_source(&first_usage_body, Some(&first_metadata), false);
         assert_eq!(first_source, UsageSource::LocalPromptCache);
         first_usage.record_success(first_usage_body, first_source, false);
 
@@ -8514,6 +9328,247 @@ Return a fix plan."#
     }
 
     #[test]
+    fn kiro_rs_tool_route_strategy_misses_first_then_reads_after_success() {
+        let prompt_cache = Arc::new(PromptCacheTracker::default());
+        let usage_recorder = Arc::new(UsageRecorder::new(10));
+        let mut cache_policy = CachePolicyConfig::default();
+        cache_policy.path_overrides.insert(
+            "/kiro/v1/messages".to_string(),
+            CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::KiroRsTool),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+        let state = AppState::new(
+            Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+            true,
+            usage_recorder,
+            prompt_cache,
+            Arc::new(PromptCacheCreationController::default()),
+            PromptCacheSimulationMode::Disabled,
+            0.95,
+            CompatProfile::ClaudeCode,
+            false,
+        )
+        .with_cache_policy(cache_policy);
+        let session_id = "8bb5523b-ec7c-4540-a9ca-beb6d79f1552";
+        let mut first_payload = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 16,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!("start kiro strategy session"),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: "stable kiro strategy system prompt ".repeat(700),
+                cache_control: Some(json!({"type": "ephemeral"})),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: Some(Metadata {
+                user_id: Some(format!("user_test_account__session_{session_id}")),
+            }),
+        };
+        let cache_route =
+            RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/kiro/v1/messages");
+        assert_eq!(
+            cache_route.policy.cache_type,
+            PromptCacheStrategyType::KiroRsTool
+        );
+        let first_context = prepare_usage_context(
+            &state,
+            cache_route,
+            "/kiro/v1/messages",
+            false,
+            &first_payload,
+            None,
+            Some(session_id.to_string()),
+            prompt_cache_scope_conversation_id(
+                PromptCacheStrategyType::KiroRsTool,
+                PromptCacheSimulationMode::Disabled,
+                &first_payload,
+            ),
+            4096,
+        );
+
+        assert_eq!(
+            first_context.simulation_mode,
+            PromptCacheSimulationMode::Disabled
+        );
+        assert_eq!(
+            first_context.prompt_cache_scope_conversation_id.as_deref(),
+            Some(session_id)
+        );
+        assert!(first_context.kiro_rs_tool_prompt_cache_plan.is_some());
+        let first_simulation = first_context
+            .simulated_usage
+            .expect("first kiro request should project cache creation");
+        assert!(first_simulation.cache_creation_input_tokens > 0);
+        assert_eq!(first_simulation.cache_read_input_tokens, 0);
+        let first_usage = first_context.attach_credential(Some(1), None, false, false, Vec::new());
+        let first_usage_body = cache::build_usage_with_simulation_policy(
+            None,
+            4096,
+            1,
+            first_usage.request.simulated_usage,
+            true,
+        );
+        assert!(first_usage_body.cache_creation_input_tokens > 0);
+        assert_eq!(first_usage_body.cache_read_input_tokens, 0);
+        let first_source = first_usage.usage_source(&first_usage_body, None, false);
+        assert_eq!(first_source, UsageSource::LocalPromptCache);
+        first_usage.record_success(first_usage_body, first_source, false);
+
+        first_payload.messages.extend([
+            Message {
+                role: "assistant".to_string(),
+                content: json!("ready"),
+            },
+            Message {
+                role: "user".to_string(),
+                content: json!("continue the same kiro strategy session"),
+            },
+        ]);
+        let second_context = prepare_usage_context(
+            &state,
+            RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/kiro/v1/messages"),
+            "/kiro/v1/messages",
+            false,
+            &first_payload,
+            None,
+            Some(session_id.to_string()),
+            prompt_cache_scope_conversation_id(
+                PromptCacheStrategyType::KiroRsTool,
+                PromptCacheSimulationMode::Disabled,
+                &first_payload,
+            ),
+            8192,
+        );
+        assert!(second_context.kiro_rs_tool_prompt_cache_plan.is_some());
+        let second_simulation = second_context
+            .simulated_usage
+            .expect("second kiro request should project a cache read");
+        assert!(second_simulation.cache_read_input_tokens > 0);
+        let second_usage =
+            cache::build_usage_with_simulation_policy(None, 8192, 1, Some(second_simulation), true);
+        assert!(second_usage.cache_read_input_tokens > 0);
+        assert_eq!(
+            second_usage.input_tokens
+                + second_usage.cache_creation_input_tokens
+                + second_usage.cache_read_input_tokens,
+            second_usage.total_input_tokens
+        );
+        assert_eq!(second_usage.total_input_tokens, 8192);
+    }
+
+    #[test]
+    fn kiro_rs_tool_route_strategy_commits_without_credential_id() {
+        let prompt_cache = Arc::new(PromptCacheTracker::default());
+        let usage_recorder = Arc::new(UsageRecorder::new(10));
+        let mut cache_policy = CachePolicyConfig::default();
+        cache_policy.path_overrides.insert(
+            "/kiro/v1/messages".to_string(),
+            CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::KiroRsTool),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+        let state = AppState::new(
+            Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+            true,
+            usage_recorder,
+            prompt_cache,
+            Arc::new(PromptCacheCreationController::default()),
+            PromptCacheSimulationMode::Disabled,
+            0.95,
+            CompatProfile::ClaudeCode,
+            false,
+        )
+        .with_cache_policy(cache_policy);
+        let session_id = "8bb5523b-ec7c-4540-a9ca-beb6d79f1552";
+        let mut payload = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 16,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!("start kiro no credential session"),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: "stable kiro no credential system prompt ".repeat(700),
+                cache_control: Some(json!({"type": "ephemeral"})),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: Some(Metadata {
+                user_id: Some(format!("user_test_account__session_{session_id}")),
+            }),
+        };
+
+        let first_context = prepare_usage_context(
+            &state,
+            RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/kiro/v1/messages"),
+            "/kiro/v1/messages",
+            false,
+            &payload,
+            None,
+            Some(session_id.to_string()),
+            prompt_cache_scope_conversation_id(
+                PromptCacheStrategyType::KiroRsTool,
+                PromptCacheSimulationMode::Disabled,
+                &payload,
+            ),
+            4096,
+        );
+        let first_usage_body = cache::build_usage_with_simulation_policy(
+            None,
+            4096,
+            1,
+            first_context.simulated_usage,
+            true,
+        );
+        let first_usage = first_context.attach_credential(None, None, false, false, Vec::new());
+        let first_source = first_usage.usage_source(&first_usage_body, None, false);
+        assert_eq!(first_source, UsageSource::LocalPromptCache);
+        first_usage.record_success(first_usage_body, first_source, false);
+
+        payload.messages.extend([
+            Message {
+                role: "assistant".to_string(),
+                content: json!("ready"),
+            },
+            Message {
+                role: "user".to_string(),
+                content: json!("continue no credential session"),
+            },
+        ]);
+        let second_context = prepare_usage_context(
+            &state,
+            RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/kiro/v1/messages"),
+            "/kiro/v1/messages",
+            false,
+            &payload,
+            None,
+            Some(session_id.to_string()),
+            prompt_cache_scope_conversation_id(
+                PromptCacheStrategyType::KiroRsTool,
+                PromptCacheSimulationMode::Disabled,
+                &payload,
+            ),
+            8192,
+        );
+        let second_simulation = second_context
+            .simulated_usage
+            .expect("second kiro request should read cache without credential id");
+        assert!(second_simulation.cache_read_input_tokens > 0);
+    }
+
+    #[test]
     fn disabled_prompt_cache_does_not_simulate_without_stable_conversation_id() {
         let prompt_cache = Arc::new(PromptCacheTracker::default());
         let usage_recorder = Arc::new(UsageRecorder::new(10));
@@ -8563,7 +9618,11 @@ Return a fix plan."#
             &payload,
             None,
             Some("random-conversation".to_string()),
-            prompt_cache_scope_conversation_id(state.prompt_cache_simulation_mode, &payload),
+            prompt_cache_scope_conversation_id(
+                PromptCacheStrategyType::CurrentHighCache,
+                state.prompt_cache_simulation_mode,
+                &payload,
+            ),
             4096,
         );
         assert!(context.prompt_cache_profile.is_none());
@@ -8575,7 +9634,7 @@ Return a fix plan."#
     }
 
     #[test]
-    fn disabled_prompt_cache_mode_does_not_build_local_profile_even_for_na_path() {
+    fn builtin_na_path_does_not_build_local_profile_or_reporting_policy() {
         let prompt_cache = Arc::new(PromptCacheTracker::default());
         let usage_recorder = Arc::new(UsageRecorder::new(10));
         let state = AppState::new(
@@ -8619,13 +9678,126 @@ Return a fix plan."#
             &payload,
             None,
             Some("conversation-id".to_string()),
-            prompt_cache_scope_conversation_id(state.prompt_cache_simulation_mode, &payload),
+            prompt_cache_scope_conversation_id(
+                PromptCacheStrategyType::NoCache,
+                PromptCacheSimulationMode::Disabled,
+                &payload,
+            ),
             4096,
         );
 
+        assert_eq!(
+            context.prompt_cache_strategy_type,
+            PromptCacheStrategyType::NoCache
+        );
         assert_eq!(context.simulation_mode, PromptCacheSimulationMode::Disabled);
         assert!(context.prompt_cache_profile.is_none());
+        assert!(context.kiro_rs_tool_prompt_cache_plan.is_none());
         assert!(context.prompt_cache_scope_conversation_id.is_none());
+        assert_eq!(context.prompt_cache_route_namespace, None);
+        assert!(context.simulated_usage.is_none());
+        assert!(context.simulated_source.is_none());
+        assert!(context.reported_cache_usage_policy.is_none());
+    }
+
+    #[test]
+    fn no_cache_route_does_not_build_cache_profile_plan_or_reporting_policy() {
+        let prompt_cache = Arc::new(PromptCacheTracker::default());
+        let usage_recorder = Arc::new(UsageRecorder::new(10));
+        let mut cache_policy = CachePolicyConfig::default();
+        cache_policy.path_overrides.insert(
+            "/plain".to_string(),
+            CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::NoCache),
+                simulation: Some(CacheSimulationPolicyPatch {
+                    enabled: Some(true),
+                    ..CacheSimulationPolicyPatch::default()
+                }),
+                creation_control: Some(PromptCacheCreationControlConfig::default()),
+                reported_usage: Some(ReportedUsagePathPolicy {
+                    input: ReportedUsageFieldPolicy::sample_input_max(32),
+                    ..ReportedUsagePathPolicy::default()
+                }),
+                cache_point: Some(CachePointPolicyPatch {
+                    enabled: Some(true),
+                    ..CachePointPolicyPatch::default()
+                }),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+        let state = AppState::new(
+            Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+            true,
+            usage_recorder,
+            prompt_cache,
+            Arc::new(PromptCacheCreationController::default()),
+            PromptCacheSimulationMode::HighCache,
+            0.95,
+            CompatProfile::ClaudeCode,
+            false,
+        )
+        .with_cache_policy(cache_policy);
+        let payload = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 16,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!("plain request should not enter prompt cache"),
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: "cacheable prompt block ".repeat(700),
+                cache_control: Some(json!({"type": "ephemeral"})),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let cache_route = RequestRuntimeConfig::from_app_state(&state)
+            .cache_policy_for_path("/plain/v1/messages");
+        assert_eq!(
+            cache_route.policy.cache_type,
+            PromptCacheStrategyType::NoCache
+        );
+        assert_eq!(cache_route.namespace, None);
+        assert_eq!(
+            prompt_cache_simulation_mode_for_policy(&cache_route.policy),
+            PromptCacheSimulationMode::Disabled
+        );
+        assert_eq!(
+            prompt_cache_converter_mode_for_policy(&cache_route.policy),
+            PromptCacheSimulationMode::Disabled
+        );
+        assert!(!cache_route.policy.cache_point.enabled);
+
+        let context = prepare_usage_context(
+            &state,
+            cache_route,
+            "/plain/v1/messages",
+            false,
+            &payload,
+            None,
+            Some("plain-session".to_string()),
+            prompt_cache_scope_conversation_id(
+                PromptCacheStrategyType::NoCache,
+                PromptCacheSimulationMode::Disabled,
+                &payload,
+            ),
+            4096,
+        );
+
+        assert_eq!(
+            context.prompt_cache_strategy_type,
+            PromptCacheStrategyType::NoCache
+        );
+        assert_eq!(context.simulation_mode, PromptCacheSimulationMode::Disabled);
+        assert!(context.prompt_cache_profile.is_none());
+        assert!(context.kiro_rs_tool_prompt_cache_plan.is_none());
+        assert!(context.prompt_cache_scope_conversation_id.is_none());
+        assert_eq!(context.prompt_cache_route_namespace, None);
         assert!(context.simulated_usage.is_none());
         assert!(context.simulated_source.is_none());
         assert!(context.reported_cache_usage_policy.is_none());
@@ -8638,11 +9810,9 @@ Return a fix plan."#
         let scope = usage_context
             .prompt_cache_scope_conversation_id
             .as_ref()
-            .map(|conversation_id| PromptCacheScope {
-                credential_id,
-                conversation_id: conversation_id.clone(),
-                model: usage_context.model.clone(),
-                route_namespace: None,
+            .map(|conversation_id| {
+                let _ = credential_id;
+                PromptCacheScope::new(conversation_id.clone(), None)
             });
         let prompt_usage = usage_context.prompt_cache.compute_with_bounds(
             scope,

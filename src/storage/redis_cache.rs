@@ -14,7 +14,7 @@ use crate::anthropic::usage::{
     UsageRealtimeStats, UsageRecord, UsageRecordQuery, UsageRecordStatus, UsageRecordsPageResult,
     UsageRouteKind, UsageSeriesPoint, UsageSource, UsageSummary, UsageTopAggregate,
     usage_dashboard_daily_windows, usage_dashboard_hourly_windows, usage_dashboard_timezone,
-    usage_dashboard_windows,
+    usage_dashboard_window_spec_for_key, usage_dashboard_windows,
 };
 use crate::model::config::Config;
 
@@ -242,6 +242,93 @@ impl RedisStore {
             .filter(|(_, bucket)| !bucket.is_empty())
             .collect();
         Ok(DashboardBucketCache { buckets })
+    }
+
+    async fn dashboard_bucket_cache_for_suffixes(
+        &self,
+        suffixes: Vec<String>,
+    ) -> anyhow::Result<DashboardBucketCache> {
+        if suffixes.is_empty() {
+            return Ok(DashboardBucketCache::default());
+        }
+
+        let mut pipe = redis::pipe();
+        for suffix in &suffixes {
+            pipe.cmd("HGETALL").arg(self.key(suffix));
+        }
+        let mut manager = self.manager.clone();
+        let buckets: Vec<HashMap<String, String>> = pipe.query_async(&mut manager).await?;
+        let buckets = suffixes
+            .into_iter()
+            .zip(buckets)
+            .filter(|(_, bucket)| !bucket.is_empty())
+            .collect();
+        Ok(DashboardBucketCache { buckets })
+    }
+
+    async fn dashboard_window_summary_cache(
+        &self,
+        specs: &[UsageDashboardWindowSpec],
+    ) -> anyhow::Result<DashboardBucketCache> {
+        let mut suffixes = Vec::new();
+        let mut seen = HashSet::new();
+        for spec in specs {
+            collect_dashboard_global_bucket_keys(&mut suffixes, &mut seen, spec);
+            collect_dashboard_cache_read_bucket_keys(&mut suffixes, &mut seen, spec);
+        }
+        self.dashboard_bucket_cache_for_suffixes(suffixes).await
+    }
+
+    async fn dashboard_series_cache(
+        &self,
+        specs: &[UsageDashboardWindowSpec],
+    ) -> anyhow::Result<DashboardBucketCache> {
+        let mut suffixes = Vec::new();
+        let mut seen = HashSet::new();
+        for spec in specs {
+            collect_dashboard_global_bucket_keys(&mut suffixes, &mut seen, spec);
+        }
+        self.dashboard_bucket_cache_for_suffixes(suffixes).await
+    }
+
+    async fn dashboard_breakdown_cache(
+        &self,
+        spec: &UsageDashboardWindowSpec,
+    ) -> anyhow::Result<DashboardBucketCache> {
+        let mut suffixes = Vec::new();
+        let mut seen = HashSet::new();
+        collect_dashboard_global_bucket_keys(&mut suffixes, &mut seen, spec);
+        collect_dashboard_dimension_bucket_keys(
+            &mut suffixes,
+            &mut seen,
+            spec,
+            "status",
+            &USAGE_STATUS_VALUES,
+        );
+        collect_dashboard_dimension_bucket_keys(
+            &mut suffixes,
+            &mut seen,
+            spec,
+            "usage_source",
+            &USAGE_SOURCE_VALUES,
+        );
+        self.dashboard_bucket_cache_for_suffixes(suffixes).await
+    }
+
+    async fn dashboard_external_pool_billing_cache(
+        &self,
+        spec: &UsageDashboardWindowSpec,
+        external_pool_index: &[RedisExternalPoolIndexItem],
+    ) -> anyhow::Result<DashboardBucketCache> {
+        let mut suffixes = Vec::new();
+        let mut seen = HashSet::new();
+        collect_dashboard_external_pool_bucket_keys(
+            &mut suffixes,
+            &mut seen,
+            spec,
+            external_pool_index,
+        );
+        self.dashboard_bucket_cache_for_suffixes(suffixes).await
     }
 
     fn dashboard_breakdown_from_cache(
@@ -1196,6 +1283,177 @@ impl RedisStore {
             },
             top,
         }))
+    }
+
+    pub async fn usage_dashboard_windows_only(
+        &self,
+        timezone: Option<&str>,
+        high_cache_threshold: i32,
+    ) -> anyhow::Result<Option<(String, String, Vec<UsageDashboardWindow>)>> {
+        let mut manager = self.manager.clone();
+        let totals: HashMap<String, String> =
+            manager.hgetall(self.key(USAGE_SUMMARY_TOTALS_KEY)).await?;
+        if totals.is_empty() {
+            return Ok(None);
+        }
+        let lifetime_requests = usage_usize(&totals, "total_requests");
+
+        let now = Utc::now();
+        let (timezone, offset) = usage_dashboard_timezone(timezone);
+        let window_specs = usage_dashboard_windows(now, offset);
+        let bucket_cache = self.dashboard_window_summary_cache(&window_specs).await?;
+        let windows = window_specs
+            .iter()
+            .map(|spec| {
+                self.dashboard_window_from_cache(spec, high_cache_threshold, &[], &bucket_cache)
+            })
+            .collect::<Vec<_>>();
+        let has_window_data = windows
+            .iter()
+            .any(|window| window.summary.total_requests > 0);
+        if lifetime_requests > 0 && !has_window_data {
+            return Ok(None);
+        }
+
+        Ok(Some((now.to_rfc3339(), timezone, windows)))
+    }
+
+    pub async fn usage_dashboard_series_only(
+        &self,
+        timezone: Option<&str>,
+    ) -> anyhow::Result<Option<(String, String, UsageDashboardSeries)>> {
+        let mut manager = self.manager.clone();
+        let totals: HashMap<String, String> =
+            manager.hgetall(self.key(USAGE_SUMMARY_TOTALS_KEY)).await?;
+        if totals.is_empty() {
+            return Ok(None);
+        }
+
+        let now = Utc::now();
+        let (timezone, offset) = usage_dashboard_timezone(timezone);
+        let hourly_specs = usage_dashboard_hourly_windows(now, offset);
+        let daily_specs = usage_dashboard_daily_windows(now, offset);
+        let hourly_cache = self.dashboard_series_cache(&hourly_specs).await?;
+        let daily_cache = self.dashboard_series_cache(&daily_specs).await?;
+        Ok(Some((
+            now.to_rfc3339(),
+            timezone,
+            UsageDashboardSeries {
+                hourly_24h: self.dashboard_series_from_cache(&hourly_specs, &hourly_cache),
+                daily_7d: self.dashboard_series_from_cache(&daily_specs, &daily_cache),
+            },
+        )))
+    }
+
+    pub async fn usage_dashboard_top_only(
+        &self,
+    ) -> anyhow::Result<Option<(String, UsageDashboardTop)>> {
+        let mut manager = self.manager.clone();
+        let totals: HashMap<String, String> =
+            manager.hgetall(self.key(USAGE_SUMMARY_TOTALS_KEY)).await?;
+        if totals.is_empty() {
+            return Ok(None);
+        }
+
+        let now = Utc::now();
+        Ok(Some((
+            now.to_rfc3339(),
+            UsageDashboardTop {
+                window_key: "lifetime".to_string(),
+                models: self
+                    .dashboard_top_aggregates(USAGE_DASHBOARD_TOP_MODELS_KEY, "model")
+                    .await?,
+                credentials: self
+                    .dashboard_top_aggregates(USAGE_DASHBOARD_TOP_CREDENTIALS_KEY, "credential")
+                    .await?,
+                endpoints: self
+                    .dashboard_top_aggregates(USAGE_DASHBOARD_TOP_ENDPOINTS_KEY, "endpoint")
+                    .await?,
+                errors: self
+                    .dashboard_top_aggregates(USAGE_DASHBOARD_TOP_ERRORS_KEY, "error")
+                    .await?,
+            },
+        )))
+    }
+
+    pub async fn usage_dashboard_breakdown_only(
+        &self,
+        timezone: Option<&str>,
+        window_key: &str,
+    ) -> anyhow::Result<
+        Option<(
+            String,
+            String,
+            String,
+            Vec<UsageBreakdownItem>,
+            Vec<UsageBreakdownItem>,
+        )>,
+    > {
+        let mut manager = self.manager.clone();
+        let totals: HashMap<String, String> =
+            manager.hgetall(self.key(USAGE_SUMMARY_TOTALS_KEY)).await?;
+        if totals.is_empty() {
+            return Ok(None);
+        }
+
+        let now = Utc::now();
+        let (timezone, offset) = usage_dashboard_timezone(timezone);
+        let spec = usage_dashboard_window_spec_for_key(now, offset, window_key);
+        let bucket_cache = self.dashboard_breakdown_cache(&spec).await?;
+        let total_requests = usage_usize(
+            &bucket_cache.sum_bucket("global", "all", &spec),
+            "total_requests",
+        );
+        let status_breakdown = self.dashboard_breakdown_from_cache(
+            &spec,
+            "status",
+            &USAGE_STATUS_VALUES,
+            usage_status_label,
+            total_requests,
+            &bucket_cache,
+        );
+        let usage_source_breakdown = self.dashboard_breakdown_from_cache(
+            &spec,
+            "usage_source",
+            &USAGE_SOURCE_VALUES,
+            usage_source_label,
+            total_requests,
+            &bucket_cache,
+        );
+        Ok(Some((
+            now.to_rfc3339(),
+            timezone,
+            spec.key,
+            status_breakdown,
+            usage_source_breakdown,
+        )))
+    }
+
+    pub async fn usage_dashboard_external_pool_billing_only(
+        &self,
+        timezone: Option<&str>,
+        window_key: &str,
+    ) -> anyhow::Result<Option<(String, String, String, Vec<UsageExternalPoolBillingByPool>)>> {
+        let mut manager = self.manager.clone();
+        let totals: HashMap<String, String> =
+            manager.hgetall(self.key(USAGE_SUMMARY_TOTALS_KEY)).await?;
+        if totals.is_empty() {
+            return Ok(None);
+        }
+
+        let now = Utc::now();
+        let (timezone, offset) = usage_dashboard_timezone(timezone);
+        let spec = usage_dashboard_window_spec_for_key(now, offset, window_key);
+        let external_pool_index = self.dashboard_external_pool_index().await?;
+        let bucket_cache = self
+            .dashboard_external_pool_billing_cache(&spec, &external_pool_index)
+            .await?;
+        let billing = self.dashboard_external_pool_billing_by_pool_from_cache(
+            &spec,
+            &external_pool_index,
+            &bucket_cache,
+        );
+        Ok(Some((now.to_rfc3339(), timezone, spec.key, billing)))
     }
 
     pub async fn clear_usage_summary(&self) -> anyhow::Result<usize> {
@@ -3633,6 +3891,51 @@ fn collect_dashboard_global_bucket_keys(
     }
 }
 
+fn collect_dashboard_cache_read_bucket_keys(
+    suffixes: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    spec: &UsageDashboardWindowSpec,
+) {
+    for epoch in usage_dashboard_hour_epochs(spec.from, spec.to) {
+        push_dashboard_bucket_suffix(suffixes, seen, usage_dashboard_cache_read_bucket_key(epoch));
+    }
+}
+
+fn collect_dashboard_dimension_bucket_keys(
+    suffixes: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    spec: &UsageDashboardWindowSpec,
+    dimension: &str,
+    keys: &[&str],
+) {
+    for epoch in usage_dashboard_hour_epochs(spec.from, spec.to) {
+        for key in keys {
+            push_dashboard_bucket_suffix(
+                suffixes,
+                seen,
+                usage_dashboard_bucket_key(dimension, key, epoch),
+            );
+        }
+    }
+}
+
+fn collect_dashboard_external_pool_bucket_keys(
+    suffixes: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    spec: &UsageDashboardWindowSpec,
+    external_pool_index: &[RedisExternalPoolIndexItem],
+) {
+    for epoch in usage_dashboard_hour_epochs(spec.from, spec.to) {
+        for pool in external_pool_index {
+            push_dashboard_bucket_suffix(
+                suffixes,
+                seen,
+                usage_dashboard_bucket_key("external_pool", &pool.id, epoch),
+            );
+        }
+    }
+}
+
 fn push_dashboard_bucket_suffix(
     suffixes: &mut Vec<String>,
     seen: &mut HashSet<String>,
@@ -4025,6 +4328,8 @@ mod tests {
             endpoint: "/v1/messages".to_string(),
             stream: status == UsageRecordStatus::Success,
             model: "claude-sonnet-4-5".to_string(),
+            requested_max_tokens: None,
+            downstream_stop_reason: None,
             upstream_model: None,
             external_outbound_model: None,
             model_resolution_source: None,

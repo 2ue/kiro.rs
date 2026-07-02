@@ -519,7 +519,7 @@ async fn main() {
     tracing::info!("  POST /v1/messages (high-cache)");
     tracing::info!("  POST /v1/messages/count_tokens");
     tracing::info!("  GET  /na/v1/models");
-    tracing::info!("  POST /na/v1/messages (real-cache-usage)");
+    tracing::info!("  POST /na/v1/messages (no-cache)");
     tracing::info!("  POST /na/v1/messages/count_tokens");
     tracing::info!("  GET  /ha/v1/models");
     tracing::info!("  POST /ha/v1/messages (high-cache input-compatible)");

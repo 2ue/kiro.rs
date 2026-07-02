@@ -14,7 +14,7 @@ export function Toolbar({
   return (
     <div
       className={cn(
-        'flex flex-col gap-3 rounded-xl border border-border bg-card p-3 shadow-sm lg:flex-row lg:items-center',
+        'flex flex-col gap-3 rounded-xl bg-card p-3 shadow-sm lg:flex-row lg:items-center',
         className
       )}
     >

@@ -8,6 +8,11 @@ import type {
   SuccessResponse,
   UpsertManualModelRequest,
   UsageDashboardResponse,
+  UsageDashboardBreakdownResponse,
+  UsageDashboardExternalPoolBillingResponse,
+  UsageDashboardSeriesResponse,
+  UsageDashboardTopResponse,
+  UsageDashboardWindowsResponse,
   UsageCleanupPreviewResponse,
   UsageCleanupRequest,
   UsageCleanupStatusResponse,
@@ -36,6 +41,45 @@ export async function getUsageSummary(): Promise<UsageSummary> {
 export async function getUsageDashboard(timezone = 'Asia/Shanghai'): Promise<UsageDashboardResponse> {
   const { data } = await api.get<UsageDashboardResponse>('/usage-dashboard', {
     params: { timezone },
+  })
+  return data
+}
+
+export async function getUsageDashboardWindows(timezone = 'Asia/Shanghai'): Promise<UsageDashboardWindowsResponse> {
+  const { data } = await api.get<UsageDashboardWindowsResponse>('/usage-dashboard/windows', {
+    params: { timezone },
+  })
+  return data
+}
+
+export async function getUsageDashboardSeries(timezone = 'Asia/Shanghai'): Promise<UsageDashboardSeriesResponse> {
+  const { data } = await api.get<UsageDashboardSeriesResponse>('/usage-dashboard/series', {
+    params: { timezone },
+  })
+  return data
+}
+
+export async function getUsageDashboardTop(): Promise<UsageDashboardTopResponse> {
+  const { data } = await api.get<UsageDashboardTopResponse>('/usage-dashboard/top')
+  return data
+}
+
+export async function getUsageDashboardBreakdown(
+  timezone = 'Asia/Shanghai',
+  windowKey = 'today'
+): Promise<UsageDashboardBreakdownResponse> {
+  const { data } = await api.get<UsageDashboardBreakdownResponse>('/usage-dashboard/breakdown', {
+    params: { timezone, windowKey },
+  })
+  return data
+}
+
+export async function getUsageDashboardExternalPoolBilling(
+  timezone = 'Asia/Shanghai',
+  windowKey = 'today'
+): Promise<UsageDashboardExternalPoolBillingResponse> {
+  const { data } = await api.get<UsageDashboardExternalPoolBillingResponse>('/usage-dashboard/external-pool-billing', {
+    params: { timezone, windowKey },
   })
   return data
 }

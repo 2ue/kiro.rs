@@ -53,7 +53,6 @@ export function defaultReportedUsage(): ReportedUsageConfig {
   return {
     default: pathPolicy(),
     pathOverrides: {
-      '/na': pathPolicy(false),
       '/cc': pathPolicy(true, inputSamplePolicy(96), writerSamplePolicy(3000)),
       '/ha': pathPolicy(true, inputSamplePolicy(96), preserveFieldPolicy()),
     },
@@ -63,6 +62,8 @@ export function defaultReportedUsage(): ReportedUsageConfig {
 export function defaultCachePolicy(): CachePolicyConfig {
   return {
     default: {},
+    currentHighCache: {},
+    kiroRsTool: {},
     pathOverrides: {},
   }
 }
@@ -339,7 +340,7 @@ function normalizeCachePolicyPathPrefix(prefix: string): string | null {
 }
 
 function isEmptyCachePolicyPatch(policy: CacheRoutePolicyPatch): boolean {
-  return !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds
+  return !policy.cacheType && !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds && !policy.kiroRsTool
 }
 
 export function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyConfig {
@@ -355,6 +356,8 @@ export function normalizeCachePolicy(config?: CachePolicyConfig): CachePolicyCon
   )
   return {
     default: source.default ?? {},
+    currentHighCache: source.currentHighCache ?? {},
+    kiroRsTool: source.kiroRsTool ?? {},
     pathOverrides,
   }
 }

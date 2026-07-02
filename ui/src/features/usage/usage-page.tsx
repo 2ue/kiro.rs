@@ -6,7 +6,6 @@ import {
   ChevronUp,
   Clock3,
   Database,
-  Filter,
   Info,
   RefreshCw,
   Trash2,
@@ -18,7 +17,7 @@ import { useAutoRefreshPreference } from '@/hooks/use-auto-refresh'
 import { useDebouncedValue } from '@/hooks/use-debounced-value'
 import { useCredentials } from '@/hooks/use-credentials'
 import {
-  useUsageDashboard,
+  useUsageDashboardSeries,
   useUsageSummary,
   useUsageRecordsPage,
   useUsageCleanupStatus,
@@ -69,6 +68,7 @@ import {
   formatAttemptSummary,
   formatAttemptChain,
   formatExternalAttemptChain,
+  upstreamModelLabel,
 } from './usage-helpers'
 import { UsageDetailModal } from './usage-detail-modal'
 import { UsageCleanupModal } from './usage-cleanup-modal'
@@ -91,19 +91,31 @@ function seriesPointToRow(p: UsageSeriesPoint): Record<string, number | string> 
   }
 }
 
+function usageInputTotal(record: UsageRecord): number {
+  return record.compatInputTokens + record.cacheReadInputTokens + record.cacheCreationInputTokens
+}
+
+function routeTargetLabel(record: UsageRecord, credentialLabel?: string): string {
+  if (record.routeKind === 'external_pool') {
+    const name = record.externalPoolName ? ` ${record.externalPoolName}` : ''
+    return `外部账号 #${record.externalPoolId ?? '-'}${name}`
+  }
+  const label = credentialLabel ? ` ${credentialLabel}` : ''
+  return `账号 #${record.credentialId ?? '-'}${label}`
+}
+
 // ─── 趋势图区 ─────────────────────────────────────────────────────────────────
 
 function TrendView() {
   const autoRefresh = useAutoRefreshPreference(AUTO_REFRESH_KEY, 30)
-  const dashboard = useUsageDashboard('Asia/Shanghai', autoRefresh.refetchInterval)
-  const data = dashboard.data
-  const series = data?.series
+  const dashboardSeries = useUsageDashboardSeries('Asia/Shanghai', autoRefresh.refetchInterval)
+  const series = dashboardSeries.data?.series
 
   const hourlyData = useMemo(() => (series?.hourly24h ?? []).map(seriesPointToRow), [series?.hourly24h])
   const dailyData = useMemo(() => (series?.daily7d ?? []).map(seriesPointToRow), [series?.daily7d])
 
-  if (dashboard.isLoading) return <LoadingState text="加载趋势数据..." className="py-12" />
-  if (dashboard.error) return <ErrorState title="趋势加载失败" message={extractErrorMessage(dashboard.error)} />
+  if (dashboardSeries.isLoading) return <LoadingState text="加载趋势数据..." className="py-12" />
+  if (dashboardSeries.error) return <ErrorState title="趋势加载失败" message={extractErrorMessage(dashboardSeries.error)} />
 
   return (
     <div className="space-y-3">
@@ -181,7 +193,6 @@ function RecordsView({
   const [source, setSource] = useState<UsageSource | '__all__'>('__all__')
   const [streamMode, setStreamMode] = useState<'all' | 'stream' | 'non_stream'>('all')
   const [minCacheRead, setMinCacheRead] = useState('')
-  const [showFilters, setShowFilters] = useState(false)
 
   // 文本筛选项防抖,避免每次按键都触发查询(展示值即时,查询用防抖值)
   const qD = useDebouncedValue(q)
@@ -231,11 +242,6 @@ function RecordsView({
     status !== '__all__' || source !== '__all__' || streamMode !== 'all' ||
     !!q.trim() || !!model.trim() || !!endpoint.trim() || !!conversationId.trim() ||
     !!routeTarget || !!minCacheRead.trim()
-  const filterCount = [
-    status !== '__all__', source !== '__all__', streamMode !== 'all',
-    !!q.trim(), !!model.trim(), !!endpoint.trim(), !!conversationId.trim(),
-    !!routeTarget, !!minCacheRead.trim(),
-  ].filter(Boolean).length
 
   const clearFilters = () => {
     setQ(''); setModel(''); setEndpoint(''); setConversationId('')
@@ -247,23 +253,13 @@ function RecordsView({
     <div className="space-y-3">
       <SectionCard
         title="明细记录"
-        description="每次请求的完整记录，点击行或操作图标查看详情"
+        description="每次请求的完整记录，点击行查看详情"
         noPadding
       >
         <div className="px-4 pt-4 pb-2">
           <Toolbar>
             <ToolbarSearch value={q} onChange={(v) => { setQ(v); setPage(1) }} placeholder="搜索模型、账号、会话、路径、错误..." />
             <ToolbarActions>
-              <Button
-                variant="outline"
-                size="sm"
-                className={hasFilters ? 'border-primary text-primary' : ''}
-                onClick={() => setShowFilters((v) => !v)}
-              >
-                <Filter className="h-3.5 w-3.5" />
-                筛选
-                {filterCount > 0 && <Badge tone="primary">{filterCount}</Badge>}
-              </Button>
               {hasFilters && (
                 <Button variant="ghost" size="sm" onClick={() => { clearFilters(); setPage(1) }}>
                   <X className="h-3.5 w-3.5" />重置
@@ -273,83 +269,81 @@ function RecordsView({
             </ToolbarActions>
           </Toolbar>
 
-          {showFilters && (
-            <div className="mt-2 rounded-lg border border-border bg-muted/40 p-3">
-              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-                <Input
-                  placeholder="模型"
-                  value={model}
-                  onChange={(e) => { setModel(e.target.value); setPage(1) }}
-                  className="h-8 text-xs"
-                />
-                <Input
-                  placeholder="入口路径，如 /cc/v1/messages"
-                  value={endpoint}
-                  onChange={(e) => { setEndpoint(e.target.value); setPage(1) }}
-                  className="h-8 text-xs"
-                />
-                <Input
-                  placeholder="会话 ID"
-                  value={conversationId}
-                  onChange={(e) => { setConversationId(e.target.value); setPage(1) }}
-                  className="h-8 text-xs"
-                />
-                <Input
-                  placeholder="最小 cache read token 数"
-                  value={minCacheRead}
-                  onChange={(e) => { setMinCacheRead(e.target.value); setPage(1) }}
-                  className="h-8 text-xs"
-                  inputMode="numeric"
-                />
-                <Select value={status} onValueChange={(v) => { setStatus(v as UsageRecordStatus | '__all__'); setPage(1) }}>
-                  <SelectTrigger size="sm"><SelectValue placeholder="全部状态" /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="__all__">全部状态</SelectItem>
-                    <SelectItem value="success">成功</SelectItem>
-                    <SelectItem value="error">错误</SelectItem>
-                    <SelectItem value="stream_error">流错误</SelectItem>
-                    <SelectItem value="upstream_timeout">服务超时</SelectItem>
-                    <SelectItem value="client_dropped">客户端断开</SelectItem>
-                  </SelectContent>
-                </Select>
-                <Select value={source} onValueChange={(v) => { setSource(v as UsageSource | '__all__'); setPage(1) }}>
-                  <SelectTrigger size="sm"><SelectValue placeholder="全部来源" /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="__all__">全部来源</SelectItem>
-                    <SelectItem value="upstream_metadata">服务返回用量</SelectItem>
-                    <SelectItem value="local_prompt_cache">本地缓存估算</SelectItem>
-                    <SelectItem value="context_estimate">上下文估算</SelectItem>
-                    <SelectItem value="request_estimate">请求估算</SelectItem>
-                    <SelectItem value="none">无缓存</SelectItem>
-                  </SelectContent>
-                </Select>
-                <Select value={streamMode} onValueChange={(v) => { setStreamMode(v as 'all' | 'stream' | 'non_stream'); setPage(1) }}>
-                  <SelectTrigger size="sm"><SelectValue placeholder="全部请求" /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="all">全部请求</SelectItem>
-                    <SelectItem value="stream">Stream</SelectItem>
-                    <SelectItem value="non_stream">非 Stream</SelectItem>
-                  </SelectContent>
-                </Select>
-                <Select value={routeTarget} onValueChange={(v) => { setRouteTarget(v); setPage(1) }}>
-                  <SelectTrigger size="sm"><SelectValue placeholder="全部账号/外部账号" /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="">全部账号/外部账号</SelectItem>
-                    {(credentials.data?.credentials ?? []).map((c) => (
-                      <SelectItem key={`credential:${c.id}`} value={`credential:${c.id}`}>
-                        账号 #{c.id} {c.email || c.maskedApiKey || ''}
-                      </SelectItem>
-                    ))}
-                    {(externalPools.data?.pools ?? []).map((p) => (
-                      <SelectItem key={`external:${p.id}`} value={`external:${p.id}`}>
-                        外部账号 #{p.id} {p.name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
+          <div className="mt-2 rounded-lg bg-muted/30 p-3">
+            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+              <Input
+                placeholder="模型"
+                value={model}
+                onChange={(e) => { setModel(e.target.value); setPage(1) }}
+                className="h-8 text-xs"
+              />
+              <Input
+                placeholder="入口路径，如 /cc/v1/messages"
+                value={endpoint}
+                onChange={(e) => { setEndpoint(e.target.value); setPage(1) }}
+                className="h-8 text-xs"
+              />
+              <Input
+                placeholder="会话 ID"
+                value={conversationId}
+                onChange={(e) => { setConversationId(e.target.value); setPage(1) }}
+                className="h-8 text-xs"
+              />
+              <Input
+                placeholder="最小缓存读取 token"
+                value={minCacheRead}
+                onChange={(e) => { setMinCacheRead(e.target.value); setPage(1) }}
+                className="h-8 text-xs"
+                inputMode="numeric"
+              />
+              <Select value={status} onValueChange={(v) => { setStatus(v as UsageRecordStatus | '__all__'); setPage(1) }}>
+                <SelectTrigger size="sm"><SelectValue placeholder="全部状态" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__all__">全部状态</SelectItem>
+                  <SelectItem value="success">成功</SelectItem>
+                  <SelectItem value="error">错误</SelectItem>
+                  <SelectItem value="stream_error">流错误</SelectItem>
+                  <SelectItem value="upstream_timeout">服务超时</SelectItem>
+                  <SelectItem value="client_dropped">客户端断开</SelectItem>
+                </SelectContent>
+              </Select>
+              <Select value={source} onValueChange={(v) => { setSource(v as UsageSource | '__all__'); setPage(1) }}>
+                <SelectTrigger size="sm"><SelectValue placeholder="全部来源" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__all__">全部来源</SelectItem>
+                  <SelectItem value="upstream_metadata">服务返回用量</SelectItem>
+                  <SelectItem value="local_prompt_cache">本地缓存估算</SelectItem>
+                  <SelectItem value="context_estimate">上下文估算</SelectItem>
+                  <SelectItem value="request_estimate">请求估算</SelectItem>
+                  <SelectItem value="none">无缓存</SelectItem>
+                </SelectContent>
+              </Select>
+              <Select value={streamMode} onValueChange={(v) => { setStreamMode(v as 'all' | 'stream' | 'non_stream'); setPage(1) }}>
+                <SelectTrigger size="sm"><SelectValue placeholder="全部请求" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">全部请求</SelectItem>
+                  <SelectItem value="stream">Stream</SelectItem>
+                  <SelectItem value="non_stream">非 Stream</SelectItem>
+                </SelectContent>
+              </Select>
+              <Select value={routeTarget || '__all__'} onValueChange={(v) => { setRouteTarget(v === '__all__' ? '' : v); setPage(1) }}>
+                <SelectTrigger size="sm"><SelectValue placeholder="全部账号/外部账号" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__all__">全部账号/外部账号</SelectItem>
+                  {(credentials.data?.credentials ?? []).map((c) => (
+                    <SelectItem key={`credential:${c.id}`} value={`credential:${c.id}`}>
+                      账号 #{c.id} {c.email || c.maskedApiKey || ''}
+                    </SelectItem>
+                  ))}
+                  {(externalPools.data?.pools ?? []).map((p) => (
+                    <SelectItem key={`external:${p.id}`} value={`external:${p.id}`}>
+                      外部账号 #{p.id} {p.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
-          )}
+          </div>
         </div>
 
         {records.isLoading ? (
@@ -373,26 +367,23 @@ function RecordsView({
                 <TableHeader>
                   <TableRow>
                     <TableHead>时间 / 状态</TableHead>
+                    <TableHead>会话 / 请求</TableHead>
                     <TableHead>模型 / 入口</TableHead>
-                    <TableHead>账号</TableHead>
-                    <TableHead className="text-right">Token</TableHead>
+                    <TableHead>账号 / 路由</TableHead>
+                    <TableHead className="text-right">用量</TableHead>
                     <TableHead>缓存</TableHead>
                     <TableHead className="text-right">费用</TableHead>
                     <TableHead className="text-right">耗时</TableHead>
-                    <TableHead>调用链路</TableHead>
+                    <TableHead>链路 / 错误</TableHead>
                     <TableHead className="text-right">操作</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {items.map((record) => {
-                    const isExternal = record.routeKind === 'external_pool'
                     const label = typeof record.credentialId === 'number'
                       ? credentialLabels.get(record.credentialId) || record.credentialLabel
                       : record.credentialLabel
-                    const reportedInputTotal =
-                      record.compatInputTokens +
-                      record.cacheReadInputTokens +
-                      record.cacheCreationInputTokens
+                    const reportedInputTotal = usageInputTotal(record)
                     const rowReadRatio = ratio(record.cacheReadInputTokens, reportedInputTotal)
                     const rowCachedRatio = ratio(
                       record.cacheReadInputTokens + record.cacheCreationInputTokens,
@@ -401,9 +392,9 @@ function RecordsView({
                     const attemptSummary = formatAttemptSummary(record)
                     const attemptChain = formatAttemptChain(record)
                     const externalChain = formatExternalAttemptChain(record)
-                    const calledModel = isExternal
-                      ? record.externalOutboundModel || record.upstreamModel
-                      : record.upstreamModel
+                    const targetLabel = routeTargetLabel(record, label)
+                    const resolvedModel = upstreamModelLabel(record)
+                    const hasModelChange = resolvedModel !== '-' && resolvedModel !== record.model
                     return (
                       <TableRow key={record.id} className="cursor-pointer" onClick={() => onViewDetail(record)}>
                         {/* 时间 / 状态 */}
@@ -415,34 +406,59 @@ function RecordsView({
                             <Badge tone={routeTone(record)}>{routeLabel(record)}</Badge>
                           </div>
                         </TableCell>
+                        {/* 会话 / 请求 */}
+                        <TableCell>
+                          <div
+                            className="max-w-[180px] truncate font-mono text-xs"
+                            title={record.conversationId || '-'}
+                          >
+                            会话 {record.conversationId || '-'}
+                          </div>
+                          <div
+                            className="mt-1 max-w-[180px] truncate font-mono text-[0.62rem] text-muted-foreground/60"
+                            title={record.id}
+                          >
+                            请求 {record.id}
+                          </div>
+                        </TableCell>
                         {/* 模型 / 入口 */}
                         <TableCell>
-                          <div className="max-w-[200px] truncate text-xs font-medium" title={record.model}>{record.model}</div>
-                          {calledModel && calledModel !== record.model && (
-                            <div className="max-w-[200px] truncate font-mono text-[0.62rem] text-muted-foreground/60" title={calledModel}>{calledModel}</div>
-                          )}
+                          <div className="max-w-[220px] truncate text-xs font-medium" title={record.model || '-'}>
+                            请求 {record.model || '-'}
+                          </div>
+                          <div
+                            className="max-w-[220px] truncate font-mono text-[0.62rem] text-muted-foreground/60"
+                            title={resolvedModel}
+                          >
+                            实际 {hasModelChange ? resolvedModel : '同请求模型'}
+                          </div>
                           <div className="mt-1 flex flex-wrap gap-1">
-                            <Badge>{record.endpoint || '-'}</Badge>
+                            <Badge title={record.endpoint || '-'}>{record.endpoint || '-'}</Badge>
                             {record.stickyBound && <Badge tone="secondary">sticky</Badge>}
                             {record.fallbackFromSticky && <Badge tone="warning">sticky回退</Badge>}
                             {record.simulated && <Badge tone="warning">{sourceLabel(record.usageSource)}</Badge>}
                             {!record.simulated && <Badge tone="neutral">{sourceLabel(record.usageSource)}</Badge>}
                           </div>
                         </TableCell>
-                        {/* 账号 */}
+                        {/* 账号 / 路由 */}
                         <TableCell>
-                          <div className="text-xs font-semibold">
-                            {isExternal ? `外部 #${record.externalPoolId ?? '-'}` : `#${record.credentialId ?? '-'}`}
+                          <div className="max-w-[190px] truncate text-xs font-semibold" title={targetLabel}>
+                            {targetLabel}
                           </div>
-                          {label && (
-                            <div className="max-w-[160px] truncate text-[0.68rem] text-muted-foreground/70" title={label}>{label}</div>
+                          {record.routeSubtype && (
+                            <div className="max-w-[190px] truncate text-[0.68rem] text-muted-foreground/70" title={record.routeSubtype}>
+                              {record.routeSubtype}
+                            </div>
                           )}
-                          {isExternal && record.externalPoolName && (
-                            <div className="max-w-[160px] truncate text-[0.68rem] text-muted-foreground/70" title={record.externalPoolName}>{record.externalPoolName}</div>
+                          {record.fallbackReason && (
+                            <div className="max-w-[190px] truncate text-[0.68rem] text-muted-foreground/70" title={record.fallbackReason}>
+                              {record.fallbackReason}
+                            </div>
                           )}
                         </TableCell>
-                        {/* Token */}
+                        {/* 用量 */}
                         <TableCell className="text-right font-mono text-xs tabular-nums">
+                          <div title={formatNumber(record.totalInputTokens)}>实际输入 {formatCompact(record.totalInputTokens)}</div>
                           <div title={formatNumber(record.compatInputTokens)}>展示输入 {formatCompact(record.compatInputTokens)}</div>
                           <div className="text-muted-foreground/60" title={formatNumber(record.outputTokens)}>展示输出 {formatCompact(record.outputTokens)}</div>
                         </TableCell>
@@ -454,14 +470,18 @@ function RecordsView({
                         </TableCell>
                         {/* 费用 */}
                         <TableCell className="text-right font-mono text-xs tabular-nums" onClick={(e) => e.stopPropagation()}>
-                          <button
-                            type="button"
-                            className="font-semibold tabular-nums underline-offset-2 hover:underline focus:outline-none focus:ring-2 focus:ring-primary/30"
+                          <Button
+                            variant="link"
+                            size="xs"
+                            className="h-auto p-0 font-mono text-xs font-semibold tabular-nums"
                             onClick={() => onViewDetail(record)}
                             title="查看计费明细"
                           >
-                            {record.pricingAvailable ? formatUsd(record.estimatedCostUsd) : <span className="text-muted-foreground/40">—</span>}
-                          </button>
+                            {formatUsd(record.estimatedCostUsd)}
+                          </Button>
+                          <div className="text-[0.62rem] text-muted-foreground/60">
+                            {record.pricingAvailable ? record.pricingModel || '已计价' : '未计价'}
+                          </div>
                         </TableCell>
                         {/* 耗时 */}
                         <TableCell className="text-right font-mono text-xs tabular-nums">
@@ -472,20 +492,20 @@ function RecordsView({
                         <TableCell>
                           {attemptChain ? (
                             <div
-                              className="max-w-[200px] truncate text-xs font-medium text-primary"
+                              className="max-w-[220px] truncate text-xs font-medium text-primary"
                               title={`${attemptSummary} · ${attemptChain}`}
                             >
                               {attemptSummary}
                             </div>
                           ) : null}
                           {externalChain && (
-                            <div className="max-w-[200px] truncate text-xs text-muted-foreground" title={externalChain}>
+                            <div className="max-w-[220px] truncate text-xs text-muted-foreground" title={externalChain}>
                               {externalChain}
                             </div>
                           )}
                           {(record.publicErrorMessage || record.errorMessage) && (
                             <div
-                              className="max-w-[200px] truncate text-xs text-destructive"
+                              className="max-w-[220px] truncate text-xs text-destructive"
                               title={record.publicErrorMessage || record.errorDetail || record.errorMessage}
                             >
                               {record.publicErrorMessage || record.errorMessage}
@@ -513,7 +533,7 @@ function RecordsView({
               </Table>
             </div>
             {(page > 1 || hasNext) && (
-              <div className="border-t border-border px-4 py-3">
+              <div className="px-4 py-3">
                 <div className="flex items-center justify-center gap-3">
                   <Button variant="outline" size="sm" disabled={page === 1} onClick={() => setPage((v) => Math.max(1, v - 1))}>上一页</Button>
                   <span className="text-xs text-muted-foreground">第 {page} 页，每页 {PAGE_SIZE} 条</span>
@@ -654,10 +674,10 @@ export function UsagePage() {
       )}
 
       {/* 趋势图区（可折叠） */}
-      <div className="rounded-xl border border-border bg-card shadow-sm">
-        <button
-          type="button"
-          className="flex w-full items-center justify-between px-4 py-3 text-sm font-medium text-foreground/80 hover:bg-muted/40 transition-colors rounded-xl"
+      <div className="rounded-xl bg-card shadow-sm">
+        <Button
+          variant="ghost"
+          className="flex h-auto w-full items-center justify-between rounded-xl px-4 py-3 text-sm font-medium text-foreground/80 hover:bg-muted/40"
           onClick={() => setTrendOpen((v) => !v)}
         >
           <div className="flex items-center gap-2">
@@ -668,9 +688,9 @@ export function UsagePage() {
             ? <ChevronUp className="size-4 text-muted-foreground" />
             : <ChevronDown className="size-4 text-muted-foreground" />
           }
-        </button>
+        </Button>
         {trendOpen && (
-          <div className="border-t border-border px-4 pb-4 pt-3">
+          <div className="px-4 pb-4 pt-2">
             <TrendView />
           </div>
         )}
@@ -680,7 +700,7 @@ export function UsagePage() {
       <RecordsView onViewDetail={setSelectedRecord} autoRefreshInterval={autoRefresh.refetchInterval} />
 
       {/* 底部状态 */}
-      <div className="rounded-xl border border-border bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">
+      <div className="rounded-xl bg-muted/30 px-3 py-2.5 text-xs text-muted-foreground">
         <span>用量 · </span>
         <span>{autoRefresh.enabled ? `每 ${autoRefresh.intervalSeconds} 秒自动刷新` : '自动刷新已关闭'}</span>
         {cleanupStatus.data?.status === 'running' && (

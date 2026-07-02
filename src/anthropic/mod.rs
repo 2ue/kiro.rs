@@ -9,9 +9,9 @@
 //! - `POST /v1/messages` - 创建消息（对话，默认 high-cache 本地 usage 模拟）
 //! - `POST /v1/messages/count_tokens` - 计算 token 数量
 //!
-//! ## 真实 cache usage 上报端点 (/na/v1)
+//! ## No-cache 端点 (/na/v1)
 //! - `GET /na/v1/models` - 获取可用模型列表
-//! - `POST /na/v1/messages` - 创建消息（底层 high-cache 计算保持开启；默认只上报真实上游 cache usage）
+//! - `POST /na/v1/messages` - 创建消息（默认不进入本地 prompt-cache 模拟，直接使用原始 usage）
 //! - `POST /na/v1/messages/count_tokens` - 计算 token 数量
 //!
 //! ## 高缓存 input 兼容端点 (/ha/v1)

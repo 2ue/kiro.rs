@@ -19,6 +19,7 @@
 /.local-run/
 /backups/
 /logs/
+/tmp/
 .history
 /ui/node_modules/
 /ui/dist/

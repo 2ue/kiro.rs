@@ -41,8 +41,8 @@ const MAX_BODY_SIZE: usize = 50 * 1024 * 1024;
 /// - `GET /v1/models` - 获取可用模型列表
 /// - `POST /v1/messages` - 创建消息（对话）
 /// - `POST /v1/messages/count_tokens` - 计算 token 数量
-/// - `GET /na/v1/models` - 获取可用模型列表（保留真实上游 usage）
-/// - `POST /na/v1/messages` - 创建消息（保留真实上游 usage）
+/// - `GET /na/v1/models` - 获取可用模型列表（no-cache）
+/// - `POST /na/v1/messages` - 创建消息（no-cache）
 /// - `POST /na/v1/messages/count_tokens` - 计算 token 数量
 /// - `GET /ha/v1/models` - 获取可用模型列表（high-cache，usage 上报由 `/ha` 覆盖项控制）
 /// - `POST /ha/v1/messages` - 创建消息（high-cache，usage 上报由 `/ha` 覆盖项控制）
@@ -162,7 +162,7 @@ pub fn create_router_with_provider(
         ))
         .with_state(v1_state);
 
-    // 需要认证的 /na/v1 路由（默认只上报真实上游 usage）
+    // 需要认证的 /na/v1 路由（默认 no-cache）
     let na_v1_routes = Router::new()
         .route("/models", get(get_models))
         .route("/messages", post(post_messages_real_cache_usage))
@@ -228,7 +228,7 @@ fn route_prompt_cache_states(base_state: AppState) -> (AppState, AppState, AppSt
             .with_prompt_cache_simulation_mode(PromptCacheSimulationMode::HighCache),
         base_state
             .clone()
-            .with_prompt_cache_simulation_mode(PromptCacheSimulationMode::HighCache),
+            .with_prompt_cache_simulation_mode(PromptCacheSimulationMode::Disabled),
         base_state
             .clone()
             .with_prompt_cache_simulation_mode(PromptCacheSimulationMode::HighCache),
@@ -255,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn route_prompt_cache_states_force_all_message_paths_to_high_cache() {
+    fn route_prompt_cache_states_keep_na_no_cache_and_other_builtin_cache_paths_high_cache() {
         for base_mode in [
             PromptCacheSimulationMode::Disabled,
             PromptCacheSimulationMode::HighCache,
@@ -269,7 +269,7 @@ mod tests {
             );
             assert_eq!(
                 na_v1_state.prompt_cache_simulation_mode,
-                PromptCacheSimulationMode::HighCache
+                PromptCacheSimulationMode::Disabled
             );
             assert_eq!(
                 cc_v1_state.prompt_cache_simulation_mode,

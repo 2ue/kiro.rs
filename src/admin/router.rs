@@ -18,13 +18,16 @@ use super::{
         get_credentials_summary, get_credentials_usage_summary, get_external_pool_status,
         get_external_pools, get_load_balancing_mode, get_model_capabilities, get_model_pricing,
         get_proxy_resources, get_runtime_config, get_system_version, get_usage_cleanup_status,
-        get_usage_dashboard, get_usage_records, get_usage_records_page, get_usage_summary,
-        get_usage_writer_stats, preview_usage_cleanup, refresh_credentials_info,
-        reset_failure_count, set_credential_concurrency, set_credential_disabled,
-        set_credential_priority, set_credential_proxy, set_credential_regions, set_credential_rpm,
-        set_credential_warmup, set_external_pool_enabled, set_load_balancing_mode,
-        start_usage_cleanup, sync_model_capabilities, sync_model_pricing, test_credential,
-        test_external_pool, test_proxy_resource, test_proxy_resource_config, update_admin_api_key,
+        get_usage_dashboard, get_usage_dashboard_breakdown,
+        get_usage_dashboard_external_pool_billing, get_usage_dashboard_series,
+        get_usage_dashboard_top, get_usage_dashboard_windows, get_usage_records,
+        get_usage_records_page, get_usage_summary, get_usage_writer_stats, preview_usage_cleanup,
+        refresh_credentials_info, reset_failure_count, set_credential_concurrency,
+        set_credential_disabled, set_credential_priority, set_credential_proxy,
+        set_credential_regions, set_credential_rpm, set_credential_warmup,
+        set_external_pool_enabled, set_load_balancing_mode, start_usage_cleanup,
+        sync_model_capabilities, sync_model_pricing, test_credential, test_external_pool,
+        test_proxy_resource, test_proxy_resource_config, update_admin_api_key,
         update_credential_auth, update_external_pool, update_proxy_resource,
         update_request_api_key, update_runtime_config, upsert_manual_model,
         validate_existing_credentials, validate_external_credentials,
@@ -153,6 +156,17 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/usage-records/cleanup/cancel", post(cancel_usage_cleanup))
         .route("/usage-summary", get(get_usage_summary))
         .route("/usage-dashboard", get(get_usage_dashboard))
+        .route("/usage-dashboard/windows", get(get_usage_dashboard_windows))
+        .route("/usage-dashboard/series", get(get_usage_dashboard_series))
+        .route("/usage-dashboard/top", get(get_usage_dashboard_top))
+        .route(
+            "/usage-dashboard/breakdown",
+            get(get_usage_dashboard_breakdown),
+        )
+        .route(
+            "/usage-dashboard/external-pool-billing",
+            get(get_usage_dashboard_external_pool_billing),
+        )
         .route("/usage-writer-stats", get(get_usage_writer_stats))
         .route("/audit-logs", get(get_audit_logs))
         .route(

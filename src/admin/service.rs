@@ -3057,6 +3057,54 @@ impl AdminService {
         Ok(dashboard)
     }
 
+    pub fn get_usage_dashboard_windows(
+        &self,
+        timezone: Option<String>,
+    ) -> Result<crate::anthropic::usage::UsageDashboardWindowsResponse, AdminServiceError> {
+        let high_cache_threshold = self.token_manager.runtime_config().high_cache_threshold;
+        self.usage_recorder
+            .dashboard_windows(timezone.as_deref(), high_cache_threshold)
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))
+    }
+
+    pub fn get_usage_dashboard_series(
+        &self,
+        timezone: Option<String>,
+    ) -> Result<crate::anthropic::usage::UsageDashboardSeriesResponse, AdminServiceError> {
+        self.usage_recorder
+            .dashboard_series(timezone.as_deref())
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))
+    }
+
+    pub fn get_usage_dashboard_top(
+        &self,
+    ) -> Result<crate::anthropic::usage::UsageDashboardTopResponse, AdminServiceError> {
+        self.usage_recorder
+            .dashboard_top()
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))
+    }
+
+    pub fn get_usage_dashboard_breakdown(
+        &self,
+        timezone: Option<String>,
+        window_key: String,
+    ) -> Result<crate::anthropic::usage::UsageDashboardBreakdownResponse, AdminServiceError> {
+        self.usage_recorder
+            .dashboard_breakdown(timezone.as_deref(), &window_key)
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))
+    }
+
+    pub fn get_usage_dashboard_external_pool_billing(
+        &self,
+        timezone: Option<String>,
+        window_key: String,
+    ) -> Result<crate::anthropic::usage::UsageDashboardExternalPoolBillingResponse, AdminServiceError>
+    {
+        self.usage_recorder
+            .dashboard_external_pool_billing(timezone.as_deref(), &window_key)
+            .map_err(|err| AdminServiceError::InternalError(err.to_string()))
+    }
+
     /// 获取 usage 持久化 writer 状态。该状态只用于观测，不参与调度。
     pub fn get_usage_writer_stats(&self) -> UsageRecorderStats {
         self.usage_recorder.writer_stats()
@@ -3491,7 +3539,12 @@ impl AdminService {
             prompt_cache_entry_ttl_secs: config.prompt_cache_entry_ttl_secs,
             prompt_cache_estimated_bytes_limit: config.prompt_cache_estimated_bytes_limit,
             reported_usage: config.reported_usage.normalized(),
-            cache_policy: config.cache_policy.normalized(),
+            cache_policy: config
+                .cache_policy
+                .clone()
+                .with_builtin_path_defaults()
+                .with_legacy_defined_cache_route_defaults(&config.defined_cache_routes)
+                .normalized(),
             defined_cache_routes: normalize_defined_cache_routes(&config.defined_cache_routes),
             external_pools: config.external_pools.clone(),
             high_cache_threshold: config.high_cache_threshold,
@@ -3674,7 +3727,6 @@ impl AdminService {
             .cache_policy
             .clone()
             .unwrap_or_else(|| current_config.cache_policy.clone());
-        let cache_policy = cache_policy_raw.normalized();
         let defined_cache_routes = match req.defined_cache_routes {
             Some(ref routes) => {
                 let has_invalid = routes.iter().any(|route| {
@@ -3692,6 +3744,11 @@ impl AdminService {
             }
             None => normalize_defined_cache_routes(&current_config.defined_cache_routes),
         };
+        let cache_policy = cache_policy_raw
+            .clone()
+            .with_builtin_path_defaults()
+            .with_legacy_defined_cache_route_defaults(&defined_cache_routes)
+            .normalized();
         let external_pools = req
             .external_pools
             .clone()

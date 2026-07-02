@@ -44,7 +44,7 @@ function MetricTile({
     error: 'text-destructive',
   }[tone]
   return (
-    <div className="rounded-lg border border-border bg-muted/40 px-2.5 py-1.5">
+    <div className="rounded-lg bg-muted/30 px-2.5 py-1.5">
       <div className="text-[0.68rem] font-medium text-muted-foreground">{label}</div>
       <div className={cn('mt-0.5 truncate font-mono text-[0.82rem] font-semibold', cls)}>{value}</div>
     </div>
@@ -214,7 +214,7 @@ export function UsageDetailModal({
             <div className="mb-2 flex flex-wrap items-center gap-2">
               <Badge tone="secondary">{formatAttemptSummary(record)}</Badge>
             </div>
-            <div className="mb-2 rounded-lg border border-border bg-muted/40 px-3 py-2 font-mono text-xs break-all">
+            <div className="mb-2 rounded-lg bg-muted/30 px-3 py-2 font-mono text-xs break-all">
               {formatAttemptChain(record) || '-'}
             </div>
             <div className="scrollbar-thin overflow-x-auto">
@@ -261,7 +261,7 @@ export function UsageDetailModal({
         {hasExternalAttempts && (
           <div>
             <SectionTitle>外部池链路</SectionTitle>
-            <div className="mb-2 rounded-lg border border-border bg-muted/40 px-3 py-2 font-mono text-xs break-all">
+            <div className="mb-2 rounded-lg bg-muted/30 px-3 py-2 font-mono text-xs break-all">
               {formatExternalAttemptChain(record) || '-'}
             </div>
             <div className="scrollbar-thin overflow-x-auto">
@@ -352,7 +352,7 @@ export function UsageDetailModal({
         {/* 错误详情 */}
         <div>
           <SectionTitle>内部错误详情</SectionTitle>
-          <pre className="max-h-60 overflow-auto rounded-lg border border-border bg-muted/40 p-3 text-xs whitespace-pre-wrap break-words">
+          <pre className="max-h-60 overflow-auto rounded-lg bg-muted/30 p-3 text-xs whitespace-pre-wrap break-words">
             {record.errorDetail || record.errorMessage || '-'}
           </pre>
         </div>
@@ -361,7 +361,7 @@ export function UsageDetailModal({
         {Boolean(record.payloadBreakdown || record.payloadGuardReport) && (
           <div>
             <SectionTitle>请求内容诊断</SectionTitle>
-            <pre className="max-h-72 overflow-auto rounded-lg border border-border bg-muted/40 p-3 text-xs whitespace-pre-wrap break-words">
+            <pre className="max-h-72 overflow-auto rounded-lg bg-muted/30 p-3 text-xs whitespace-pre-wrap break-words">
               {formatJsonBlock({
                 breakdown: record.payloadBreakdown || null,
                 guard: record.payloadGuardReport || null,

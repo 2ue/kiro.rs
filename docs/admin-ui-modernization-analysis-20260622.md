@@ -104,13 +104,13 @@
 
 ### 菜单切换
 
-左侧菜单应继续是真实链接，点击后更新路由并切换 tab。实现上 `Sidebar` 已用 `<a href>` 加 `preventDefault`，问题更可能来自覆盖层、z-index 或 dev 端口不一致造成访问的不是最新构建。后续验证必须只使用 9022。
+左侧菜单应继续是真实链接，点击后更新路由并切换 tab。实现上 `Sidebar` 已用 `<a href>` 加 `preventDefault`，问题更可能来自覆盖层、z-index 或开发入口不一致造成访问的不是最新源码。后续前端验证统一使用 Vite 热更新入口，具体端口以 `docs/frontend-dev-environment.md` 为准，不再用后端 embedded 页面判断源码效果。
 
 ## 重构策略
 
 第一阶段先处理全局基础层：
 
-- 调整 `package.json`，开发和预览端口统一为 9022。
+- 调整 `package.json`，Daisy Console 的开发和预览端口统一为 9024，通过 `/api` 代理到后端 API。
 - 重建 DaisyUI 主题和 CSS token，去掉大面积米黄、暖色渐变、浮雕阴影。
 - 重构侧栏、顶栏、按钮、输入框、表格、弹层、卡片、badge、toolbar、settings group 的基础样式。
 - 给页面配置增加 layout 类型，让 `Dashboard` 根据页面类型决定内容宽度和页面 class。
@@ -134,10 +134,10 @@
 
 ## 验证要求
 
-- 不启动 9026。
-- 只访问 `http://127.0.0.1:9022/console`。
+- 不启动临时散乱端口。
+- 前端开发只访问 `http://127.0.0.1:9024/console/config`；如需验证 embedded 发布产物，再单独构建前端和 Rust 二进制。
 - 登录 Key：`admin123`。
-- 前端构建后必须重新构建 Rust release，因为后端嵌入 `admin-ui-daisy/dist`。
+- 日常开发不需要重新构建 Rust release；只有验证 embedded 发布产物时才需要先构建前端再构建 Rust release。
 - 检查 `/console/dashboard`、`/console/credentials`、`/console/config`、`/console/usage`、`/console/proxies`、`/console/external-pools`。
 - 检查左侧菜单点击是否切换页面并同步路由。
 - 扫描确认没有原生 select 和浏览器原生弹层调用。

@@ -87,6 +87,28 @@ fn max_thinking_open_tag_len() -> usize {
         .unwrap_or(0)
 }
 
+fn thinking_open_tag_partial_start(buffer: &str) -> Option<usize> {
+    if buffer.is_empty() {
+        return None;
+    }
+    if buffer.trim().is_empty() {
+        return Some(0);
+    }
+
+    let min_start = buffer.len().saturating_sub(max_thinking_open_tag_len());
+    buffer
+        .char_indices()
+        .filter(|(idx, _)| *idx >= min_start)
+        .filter_map(|(idx, _)| {
+            let suffix = &buffer[idx..];
+            THINKING_XML_TAGS
+                .iter()
+                .any(|tag| suffix.len() < tag.open.len() && tag.open.starts_with(suffix))
+                .then_some(idx)
+        })
+        .next()
+}
+
 fn valid_unquoted_tag(buffer: &str, absolute_pos: usize, tag: &str) -> bool {
     let has_quote_before = absolute_pos > 0 && is_xml_tag_wrapper_char(buffer, absolute_pos - 1);
     let after_pos = absolute_pos + tag.len();
@@ -937,6 +959,22 @@ impl BlockState {
     }
 }
 
+pub(crate) fn output_tokens_reached_requested_max_tokens(
+    requested_max_tokens: i32,
+    output_tokens: i32,
+) -> bool {
+    if requested_max_tokens <= 0 || output_tokens <= 0 {
+        return false;
+    }
+
+    let tolerance = requested_max_tokens
+        .saturating_div(20)
+        .clamp(1, 256)
+        .min(requested_max_tokens.saturating_sub(1).max(0));
+    let threshold = requested_max_tokens.saturating_sub(tolerance);
+    output_tokens >= threshold
+}
+
 /// SSE 状态管理器
 ///
 /// 确保 SSE 事件序列符合 Claude API 规范：
@@ -1003,6 +1041,19 @@ impl SseStateManager {
     /// 设置 stop_reason
     pub fn set_stop_reason(&mut self, reason: impl Into<String>) {
         self.stop_reason = Some(reason.into());
+    }
+
+    fn has_explicit_stop_reason(&self) -> bool {
+        self.stop_reason.is_some()
+    }
+
+    fn maybe_set_max_tokens_stop_reason(&mut self, requested_max_tokens: i32, output_tokens: i32) {
+        if self.has_explicit_stop_reason() || self.has_tool_use {
+            return;
+        }
+        if output_tokens_reached_requested_max_tokens(requested_max_tokens, output_tokens) {
+            self.set_stop_reason("max_tokens");
+        }
     }
 
     /// 检查是否存在非 thinking 类型的内容块（如 text 或 tool_use）
@@ -1211,6 +1262,8 @@ pub struct StreamContext {
     pub metadata_usage: Option<MetadataTokenUsage>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
+    /// 下游请求声明的 max_tokens。Kiro 上游没有等价字段时，用于最终 stop_reason 推断。
+    requested_max_tokens: i32,
     /// 实际发送给下游的 thinking tokens 估算，仅用于 Anthropic usage details。
     thinking_output_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
@@ -1267,8 +1320,8 @@ pub struct StreamContext {
     stream_error_id: Option<String>,
     /// 无 metadata 时使用的本地 prompt-cache usage 模拟结果
     pub simulated_usage: Option<super::cache::CacheSimulation>,
-    /// 本地 prompt-cache usage 模拟模式。
-    pub simulation_mode: PromptCacheSimulationMode,
+    /// 是否把本地 prompt-cache 投影写入下游 usage。
+    local_prompt_cache_projection_enabled: bool,
     /// 仅用于下游上报的 cache usage 改写策略。
     reported_cache_usage_policy: Option<super::cache::ReportedCacheUsagePolicy>,
     /// 最近一次最终 usage，用于请求级记录。
@@ -1365,6 +1418,7 @@ impl StreamContext {
             context_input_tokens: None,
             metadata_usage: None,
             output_tokens: 0,
+            requested_max_tokens: 0,
             thinking_output_tokens: 0,
             tool_block_indices: HashMap::new(),
             tool_input_buffers: HashMap::new(),
@@ -1391,7 +1445,8 @@ impl StreamContext {
             stream_error: None,
             stream_error_id: None,
             simulated_usage,
-            simulation_mode,
+            local_prompt_cache_projection_enabled: simulation_mode
+                == PromptCacheSimulationMode::HighCache,
             reported_cache_usage_policy: None,
             final_usage: None,
             final_reported_usage: None,
@@ -1401,11 +1456,23 @@ impl StreamContext {
         }
     }
 
+    pub fn set_requested_max_tokens(&mut self, max_tokens: i32) {
+        self.requested_max_tokens = max_tokens.max(0);
+    }
+
+    pub fn downstream_stop_reason(&self) -> String {
+        self.state_manager.get_stop_reason()
+    }
+
     pub fn set_reported_cache_usage_policy(
         &mut self,
         policy: Option<super::cache::ReportedCacheUsagePolicy>,
     ) {
         self.reported_cache_usage_policy = policy;
+    }
+
+    pub fn set_local_prompt_cache_projection_enabled(&mut self, enabled: bool) {
+        self.local_prompt_cache_projection_enabled = enabled;
     }
 
     pub fn set_stream_error_id(&mut self, error_id: impl Into<String>) {
@@ -1416,7 +1483,7 @@ impl StreamContext {
         &self,
         usage: super::cache::CacheUsage,
     ) -> super::cache::CacheUsage {
-        if self.simulation_mode != PromptCacheSimulationMode::HighCache
+        if !self.local_prompt_cache_projection_enabled
             || self.simulated_usage.is_none()
             || self
                 .metadata_usage
@@ -1443,7 +1510,7 @@ impl StreamContext {
             self.input_tokens.max(1),
             0,
             self.simulated_usage,
-            self.simulation_mode == PromptCacheSimulationMode::HighCache,
+            self.local_prompt_cache_projection_enabled,
         );
         let mut usage = self.reported_usage_for_downstream(usage);
 
@@ -1863,23 +1930,23 @@ impl StreamContext {
                     );
                     events.extend(start_events);
                 } else {
-                    // 没有找到 thinking 开始标签，检查是否可能是部分标签
-                    // 保留可能是部分标签的内容
-                    let target_len = self
-                        .thinking_buffer
-                        .len()
-                        .saturating_sub(max_thinking_open_tag_len());
-                    let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
-                    if safe_len > 0 {
-                        let safe_content = self.thinking_buffer[..safe_len].to_string();
-                        // 如果 thinking 尚未提取，且安全内容只是空白字符，
-                        // 则不发送为 text_delta，继续保留在缓冲区等待更多内容。
-                        // 这避免了 4.6 模型中 <thinking> 标签跨事件分割时，
-                        // 前导空白（如 "\n\n"）被错误地创建为 text 块，
-                        // 导致 text 块先于 thinking 块出现的问题。
-                        if !safe_content.is_empty() && !safe_content.trim().is_empty() {
+                    // 没有找到完整 thinking 开始标签时，只保留可能组成 `<thinking>` / `<think>`
+                    // 的尾部。旧逻辑按最长标签长度保守缓冲，会把很短的正常正文首包压住，
+                    // 导致 Claude Code 在工具调用后长时间没有可见 text_delta。
+                    if let Some(retain_start) =
+                        thinking_open_tag_partial_start(&self.thinking_buffer)
+                    {
+                        if retain_start > 0 {
+                            let safe_content = self.thinking_buffer[..retain_start].to_string();
+                            if !safe_content.trim().is_empty() {
+                                events.extend(self.create_text_delta_events(&safe_content));
+                            }
+                            self.thinking_buffer = self.thinking_buffer[retain_start..].to_string();
+                        }
+                    } else {
+                        let safe_content = std::mem::take(&mut self.thinking_buffer);
+                        if !safe_content.trim().is_empty() {
                             events.extend(self.create_text_delta_events(&safe_content));
-                            self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
                         }
                     }
                     break;
@@ -2596,7 +2663,7 @@ impl StreamContext {
             .map(|usage| usage.total_input_tokens())
             .or(self.context_input_tokens)
             .unwrap_or(self.input_tokens);
-        let usage_input_tokens = if self.simulation_mode == PromptCacheSimulationMode::HighCache {
+        let usage_input_tokens = if self.local_prompt_cache_projection_enabled {
             final_input_tokens.max(self.input_tokens)
         } else {
             final_input_tokens
@@ -2607,12 +2674,14 @@ impl StreamContext {
             .as_ref()
             .map(|usage| usage.output_tokens)
             .unwrap_or(estimated_output_tokens);
+        self.state_manager
+            .maybe_set_max_tokens_stop_reason(self.requested_max_tokens, final_output_tokens);
         let final_usage = super::cache::build_usage_with_simulation_policy(
             self.metadata_usage.as_ref(),
             usage_input_tokens,
             final_output_tokens,
             self.simulated_usage,
-            self.simulation_mode == PromptCacheSimulationMode::HighCache,
+            self.local_prompt_cache_projection_enabled,
         );
         self.final_usage = Some(final_usage);
         let reported_usage = self.reported_usage_for_downstream(final_usage);
@@ -2873,6 +2942,7 @@ mod tests {
                 cache_creation_1h_input_tokens: 0,
                 target_cache_ratio: None,
                 amplification: None,
+                split_cached_input: false,
             }),
             PromptCacheSimulationMode::HighCache,
         );
@@ -2948,6 +3018,62 @@ mod tests {
         assert_eq!(sub2api_output, final_output);
         assert_eq!(sub2api_cache_creation, final_cache_creation);
         assert_eq!(sub2api_cache_read, final_cache_read);
+    }
+
+    #[test]
+    fn test_stream_local_prompt_cache_projection_can_be_enabled_without_high_cache_mode() {
+        let mut ctx = StreamContext::new_with_simulation(
+            "test-model",
+            100_000,
+            200_000,
+            false,
+            true,
+            HashMap::new(),
+            Some(crate::anthropic::cache::CacheSimulation {
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 50_000,
+                cache_creation_5m_input_tokens: 0,
+                cache_creation_1h_input_tokens: 0,
+                target_cache_ratio: None,
+                amplification: None,
+                split_cached_input: false,
+            }),
+            PromptCacheSimulationMode::Disabled,
+        );
+        ctx.set_local_prompt_cache_projection_enabled(true);
+        ctx.set_reported_cache_usage_policy(
+            crate::anthropic::cache::ReportedCacheUsagePolicy::new(3_000, 96, 7),
+        );
+
+        let initial_events = ctx.generate_initial_events();
+        let message_start = initial_events
+            .iter()
+            .find(|e| e.event == "message_start")
+            .expect("message_start should exist");
+        let start_usage = &message_start.data["message"]["usage"];
+        let start_input = start_usage["input_tokens"].as_i64().expect("start input");
+        let start_cache_read = start_usage["cache_read_input_tokens"]
+            .as_i64()
+            .expect("start cache read");
+        assert!((1..=96).contains(&start_input));
+        assert!(start_cache_read > 0);
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_assistant_response("hello"));
+        all_events.extend(ctx.generate_final_events());
+
+        let message_delta = all_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("message_delta should exist");
+        let final_usage = &message_delta.data["usage"];
+        let final_input = final_usage["input_tokens"].as_i64().expect("input");
+        let final_cache_read = final_usage["cache_read_input_tokens"]
+            .as_i64()
+            .expect("cache read");
+
+        assert!((1..=96).contains(&final_input));
+        assert!(final_cache_read > 50_000);
     }
 
     #[test]
@@ -3052,6 +3178,137 @@ mod tests {
             .expect("message_delta should exist");
         assert_eq!(ctx.context_input_tokens, Some(1_000_000));
         assert_eq!(message_delta.data["usage"]["input_tokens"], 1_000_000);
+        assert_eq!(
+            message_delta.data["delta"]["stop_reason"],
+            "model_context_window_exceeded"
+        );
+    }
+
+    #[test]
+    fn test_requested_max_tokens_threshold_is_not_overbroad_for_small_budgets() {
+        assert!(!output_tokens_reached_requested_max_tokens(0, 100));
+        assert!(!output_tokens_reached_requested_max_tokens(16, 1));
+        assert!(!output_tokens_reached_requested_max_tokens(16, 14));
+        assert!(output_tokens_reached_requested_max_tokens(16, 15));
+        assert!(!output_tokens_reached_requested_max_tokens(100, 94));
+        assert!(output_tokens_reached_requested_max_tokens(100, 95));
+    }
+
+    #[test]
+    fn test_requested_max_tokens_infers_max_tokens_stop_reason() {
+        use crate::kiro::model::events::{MessageMetadataEvent, MetadataTokenUsage};
+
+        let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
+        ctx.set_requested_max_tokens(100);
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_assistant_response("near token limit"));
+        all_events.extend(
+            ctx.process_kiro_event(&Event::MessageMetadata(MessageMetadataEvent {
+                conversation_id: Some("conv-max".to_string()),
+                utterance_id: Some("utt-max".to_string()),
+                token_usage: Some(MetadataTokenUsage {
+                    uncached_input_tokens: 21,
+                    output_tokens: 95,
+                    total_tokens: 116,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                }),
+            })),
+        );
+        all_events.extend(ctx.generate_final_events());
+
+        let message_delta = all_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta should exist");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "max_tokens");
+    }
+
+    #[test]
+    fn test_requested_max_tokens_does_not_override_tool_use_stop_reason() {
+        use crate::kiro::model::events::{MessageMetadataEvent, MetadataTokenUsage};
+
+        let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
+        ctx.set_requested_max_tokens(100);
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(
+            ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+                name: "test_tool".to_string(),
+                tool_use_id: "tool_1".to_string(),
+                input: "{}".to_string(),
+                stop: true,
+            }),
+        );
+        all_events.extend(
+            ctx.process_kiro_event(&Event::MessageMetadata(MessageMetadataEvent {
+                conversation_id: Some("conv-tool".to_string()),
+                utterance_id: Some("utt-tool".to_string()),
+                token_usage: Some(MetadataTokenUsage {
+                    uncached_input_tokens: 21,
+                    output_tokens: 100,
+                    total_tokens: 121,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                }),
+            })),
+        );
+        all_events.extend(ctx.generate_final_events());
+
+        let message_delta = all_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta should exist");
+        assert_eq!(message_delta.data["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn test_requested_max_tokens_does_not_override_context_window_stop_reason() {
+        use crate::kiro::model::events::{
+            ContextUsageEvent, MessageMetadataEvent, MetadataTokenUsage,
+        };
+
+        let mut ctx = StreamContext::new_with_simulation(
+            "claude-sonnet-4.6",
+            1_000,
+            1_000_000,
+            false,
+            true,
+            HashMap::new(),
+            None,
+            PromptCacheSimulationMode::Disabled,
+        );
+        ctx.set_requested_max_tokens(100);
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(
+            ctx.process_kiro_event(&Event::ContextUsage(ContextUsageEvent {
+                context_usage_percentage: 100.0,
+            })),
+        );
+        all_events.extend(
+            ctx.process_kiro_event(&Event::MessageMetadata(MessageMetadataEvent {
+                conversation_id: Some("conv-context".to_string()),
+                utterance_id: Some("utt-context".to_string()),
+                token_usage: Some(MetadataTokenUsage {
+                    uncached_input_tokens: 21,
+                    output_tokens: 100,
+                    total_tokens: 121,
+                    cache_read_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                }),
+            })),
+        );
+        all_events.extend(ctx.generate_final_events());
+
+        let message_delta = all_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta should exist");
         assert_eq!(
             message_delta.data["delta"]["stop_reason"],
             "model_context_window_exceeded"
@@ -3233,24 +3490,65 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_use_flushes_pending_thinking_buffer_text_before_tool_block() {
-        // thinking 模式下，短文本可能被暂存在 thinking_buffer 以等待 `<thinking>` 的跨 chunk 匹配。
-        // 当紧接着出现 tool_use 时，应先 flush 这段文本，再开始 tool_use block。
+    fn test_short_initial_text_flushes_without_waiting_for_thinking_tag() {
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
         let _initial_events = ctx.generate_initial_events();
 
-        // 两段短文本（各 2 个中文字符），总长度仍可能不足以满足 safe_len>0 的输出条件，
-        // 因而会留在 thinking_buffer 中等待后续 chunk。
-        let ev1 = ctx.process_assistant_response("有修");
+        let events = ctx.process_assistant_response("好");
+
         assert!(
-            ev1.iter().all(|e| e.event != "content_block_delta"),
-            "short prefix should be buffered under thinking mode"
+            events.iter().any(|event| {
+                event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "text_delta"
+                    && event.data["delta"]["text"] == "好"
+            }),
+            "short visible text should be emitted immediately instead of waiting for more chunks"
         );
-        let ev2 = ctx.process_assistant_response("改：");
         assert!(
-            ev2.iter().all(|e| e.event != "content_block_delta"),
-            "short prefix should still be buffered under thinking mode"
+            ctx.thinking_buffer.is_empty(),
+            "normal visible text should not remain in the thinking buffer"
         );
+    }
+
+    #[test]
+    fn test_partial_thinking_tag_prefix_is_still_buffered() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let events = ctx.process_assistant_response("\n\n<th");
+
+        assert!(
+            events.iter().all(|event| {
+                !(event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "text_delta")
+            }),
+            "partial thinking tag prefix should not be emitted as visible text"
+        );
+        assert_eq!(ctx.thinking_buffer, "<th");
+    }
+
+    #[test]
+    fn test_tool_use_flushes_pending_thinking_buffer_text_before_tool_block() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let ev1 = ctx.process_assistant_response("有修改：");
+        assert!(
+            ev1.iter().any(|e| {
+                e.event == "content_block_delta"
+                    && e.data["delta"]["type"] == "text_delta"
+                    && e.data["delta"]["text"] == "有修改："
+            }),
+            "ordinary short text should be emitted before a later tool_use"
+        );
+        let text_start_index = ev1.iter().find_map(|e| {
+            if e.event == "content_block_start" && e.data["content_block"]["type"] == "text" {
+                e.data["index"].as_i64()
+            } else {
+                None
+            }
+        });
+        assert!(text_start_index.is_some(), "should start a text block");
 
         let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
             name: "Write".to_string(),
@@ -3259,55 +3557,26 @@ mod tests {
             stop: false,
         });
 
-        let text_start_index = events.iter().find_map(|e| {
-            if e.event == "content_block_start" && e.data["content_block"]["type"] == "text" {
-                e.data["index"].as_i64()
-            } else {
-                None
-            }
-        });
-        let pos_text_delta = events.iter().position(|e| {
-            e.event == "content_block_delta" && e.data["delta"]["type"] == "text_delta"
-        });
-        let pos_text_stop = text_start_index.and_then(|idx| {
-            events.iter().position(|e| {
-                e.event == "content_block_stop" && e.data["index"].as_i64() == Some(idx)
-            })
+        let text_start_index = text_start_index.unwrap();
+        let pos_text_stop = events.iter().position(|e| {
+            e.event == "content_block_stop" && e.data["index"].as_i64() == Some(text_start_index)
         });
         let pos_tool_start = events.iter().position(|e| {
             e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use"
         });
 
         assert!(
-            text_start_index.is_some(),
-            "should start a text block to flush buffered text"
-        );
-        assert!(
-            pos_text_delta.is_some(),
-            "should flush buffered text as text_delta"
-        );
-        assert!(
             pos_text_stop.is_some(),
             "should stop text block before tool_use block starts"
         );
         assert!(pos_tool_start.is_some(), "should start tool_use block");
 
-        let pos_text_delta = pos_text_delta.unwrap();
         let pos_text_stop = pos_text_stop.unwrap();
         let pos_tool_start = pos_tool_start.unwrap();
 
         assert!(
-            pos_text_delta < pos_text_stop && pos_text_stop < pos_tool_start,
-            "ordering should be: text_delta -> text_stop -> tool_use_start"
-        );
-
-        assert!(
-            events.iter().any(|e| {
-                e.event == "content_block_delta"
-                    && e.data["delta"]["type"] == "text_delta"
-                    && e.data["delta"]["text"] == "有修改："
-            }),
-            "flushed text should equal the buffered prefix"
+            pos_text_stop < pos_tool_start,
+            "ordering should be: text_stop -> tool_use_start"
         );
     }
 

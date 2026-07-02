@@ -56,7 +56,7 @@ function statusIcon(s: ImportResult['status']) {
   if (s === 'failed') return <XCircle className="h-4 w-4 text-destructive" />
   if (s === 'importing' || s === 'verifying') return <Loader2 className="h-4 w-4 animate-spin text-primary" />
   if (s === 'skipped') return <AlertCircle className="h-4 w-4 text-warning" />
-  return <div className="h-4 w-4 rounded-full border border-border" />
+  return <div className="h-4 w-4 rounded-full bg-muted" />
 }
 
 function ImportProgressList({
@@ -70,7 +70,7 @@ function ImportProgressList({
   return (
     <div className="max-h-72 overflow-y-auto scrollbar-thin space-y-1">
       {results.map((r, i) => (
-        <div key={i} className="flex items-start gap-2 rounded-lg border border-border/50 bg-muted/30 px-3 py-2">
+        <div key={i} className="flex items-start gap-2 rounded-lg bg-muted/30 px-3 py-2">
           <div className="mt-0.5 shrink-0">{statusIcon(r.status)}</div>
           <div className="min-w-0 flex-1 text-xs">
             <div className="font-semibold truncate">{getLabel(i)}</div>
@@ -266,7 +266,7 @@ function CredentialParameterDefaultsPanel({ defaults, onChange, proxyResources, 
   }
   const proxyLocked = Boolean(defaults.proxyResourceId)
   return (
-    <div className="rounded-lg border border-border bg-muted/40 p-3">
+    <div className="rounded-lg bg-muted/30 p-3">
       <div className="mb-3 flex items-start justify-between gap-3">
         <div>
           <div className="text-sm font-semibold">默认参数</div>
@@ -618,7 +618,7 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
             />
             {parseError && <div className="text-xs text-destructive">{parseError}</div>}
             <CredentialParameterDefaultsPanel defaults={defaults} onChange={setDefaults} proxyResources={proxyOptions} />
-            <div className="rounded-lg border border-border bg-muted/40 p-3 space-y-2">
+            <div className="rounded-lg bg-muted/30 p-3 space-y-2">
               <div className="text-sm font-semibold">验活方式</div>
               <div className="flex items-center gap-3">
                 <Checkbox checked={skipVerify} onCheckedChange={(v) => setSkipVerify(Boolean(v))} id="skip-verify" />
@@ -826,7 +826,7 @@ export function KamImportModal({ open, onClose, onDone }: {
             </div>
             {/* 验活模式和跳过 error 选项（仅未开始时显示） */}
             {results.every((r) => r.status === 'pending') && (
-              <div className="rounded-lg border border-border bg-muted/40 p-3 space-y-2">
+              <div className="rounded-lg bg-muted/30 p-3 space-y-2">
                 <div className="text-sm font-semibold">导入选项</div>
                 <Select value={verifyMode} onValueChange={(v) => setVerifyMode(v as ImportVerificationMode)} disabled={running}>
                   <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
@@ -982,7 +982,7 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
     <ModalShell open={open} title={`批量修改（${ids.length} 个账号）`} width="max-w-lg" onClose={onClose}>
       <div className="space-y-4">
         <div className="space-y-3">
-          <div className="rounded-lg border border-border bg-muted/30 p-3 space-y-3">
+          <div className="rounded-lg bg-muted/30 p-3 space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="text-sm font-semibold">调度覆盖</div>
               <Button type="button" variant="ghost" size="xs" onClick={clearSchedulingDraft} disabled={batchUpdate.isPending}>
@@ -1031,7 +1031,7 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
               </Field>
             </FieldGrid>
           </div>
-          <div className="rounded-lg border border-border bg-muted/30 p-3 space-y-3">
+          <div className="rounded-lg bg-muted/30 p-3 space-y-3">
             <div className="flex items-center gap-2">
               <Checkbox checked={enableFields.proxy} onCheckedChange={(v) => setEnableFields((p) => ({ ...p, proxy: Boolean(v) }))} id="batch-proxy" />
               <label htmlFor="batch-proxy" className="text-sm font-semibold cursor-pointer">代理设置</label>
@@ -1047,7 +1047,7 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
                     </SelectContent>
                   </Select>
                 </Field>
-                <div className={`rounded-lg border p-3 space-y-2 ${proxyLocked ? 'opacity-50 bg-muted/20' : 'bg-card'}`}>
+                <div className={`rounded-lg p-3 space-y-2 ${proxyLocked ? 'opacity-50 bg-muted/20' : 'bg-card shadow-sm'}`}>
                   <div className="text-xs font-semibold text-muted-foreground">
                     直连代理{proxyLocked ? '（已选代理资源，保存时会清空）' : ''}
                   </div>
@@ -1085,7 +1085,7 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
               </div>
             )}
           </div>
-          <div className="rounded-lg border border-border bg-muted/30 p-3 space-y-3">
+          <div className="rounded-lg bg-muted/30 p-3 space-y-3">
             <div className="flex items-center gap-2">
               <Checkbox checked={enableFields.regions} onCheckedChange={(v) => setEnableFields((p) => ({ ...p, regions: Boolean(v) }))} id="batch-regions" />
               <label htmlFor="batch-regions" className="text-sm font-semibold cursor-pointer">Region 设置</label>
@@ -1148,7 +1148,7 @@ export function CredentialTestModal({ credential, open, onClose }: {
           <Textarea className="font-mono text-xs" rows={3} value={prompt} disabled={testMutation.isPending} onChange={(e) => setPrompt(e.target.value)} />
         </Field>
         {result && (
-          <div className="rounded-lg border border-success/30 bg-success/5 p-3 space-y-1 text-sm">
+          <div className="rounded-lg bg-success/5 p-3 space-y-1 text-sm">
             <div className="flex items-center gap-2 font-semibold text-success"><CheckCircle2 className="h-4 w-4" />测试成功 ({result.durationMs}ms)</div>
             <div className="text-xs text-muted-foreground">模型：{testModelLabel(result.model)}</div>
             <div className="mt-1 text-xs whitespace-pre-wrap break-words text-foreground">{result.response}</div>
@@ -1185,13 +1185,13 @@ export function BatchVerifyModal({ open, verifying, progress, results, onCancel,
     if (s === 'success') return <CheckCircle2 className="h-3.5 w-3.5 text-success" />
     if (s === 'failed') return <XCircle className="h-3.5 w-3.5 text-destructive" />
     if (s === 'verifying') return <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
-    return <div className="h-3.5 w-3.5 rounded-full border border-border" />
+    return <div className="h-3.5 w-3.5 rounded-full bg-muted" />
   }
 
   return (
     <ModalShell open={open} title="批量验活" width="max-w-lg" onClose={onClose}>
       <div className="space-y-3">
-        <div className="rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+        <div className="rounded-lg bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
           测试模型：<span className="font-semibold text-foreground">{testModelLabel(DEFAULT_TEST_MODEL)}</span>
           <span className="ml-2 text-muted-foreground/70">（批量验活固定使用默认模型）</span>
         </div>
@@ -1211,7 +1211,7 @@ export function BatchVerifyModal({ open, verifying, progress, results, onCancel,
         )}
         <div className="max-h-72 overflow-y-auto scrollbar-thin space-y-1">
           {items.map((r) => (
-            <div key={r.id} className="flex items-start gap-2 rounded-lg border border-border/50 bg-muted/30 px-3 py-2">
+            <div key={r.id} className="flex items-start gap-2 rounded-lg bg-muted/30 px-3 py-2">
               <div className="mt-0.5 shrink-0">{icon(r.status)}</div>
               <div className="min-w-0 flex-1 text-xs">
                 <div className="font-semibold">账号 #{r.id}</div>

@@ -23,9 +23,9 @@ export function ProxyTestResult({ result }: { result: ProxyResourceTestResponse 
   if (!result) return null
   return (
     <div className={cn(
-      'rounded-lg border p-3 text-xs',
+      'rounded-lg p-3 text-xs',
       result.success
-        ? 'border-success/30 bg-success/5 text-success'
+        ? 'bg-success/5 text-success'
         : 'border-destructive/30 bg-destructive/5 text-destructive'
     )}>
       <div className="font-semibold">{result.message}</div>
@@ -83,7 +83,7 @@ export function CredentialBindingPicker({ credentials, selectedIds, onToggle }: 
     return a.id - b.id
   })
   return (
-    <div className="scrollbar-thin max-h-72 space-y-2 overflow-y-auto rounded-xl border border-border bg-muted/30 p-2">
+    <div className="scrollbar-thin max-h-72 space-y-2 overflow-y-auto rounded-xl bg-muted/30 p-2">
       {sorted.map((credential) => {
         const selected = selectedIds.has(credential.id)
         return (
@@ -273,7 +273,7 @@ export function ProxyEditorModal({ open, resource, onClose }: {
           <Field label="备注">
             <Textarea className="min-h-20" value={form.notes} onChange={(e) => set('notes', e.target.value)} />
           </Field>
-          <div className="flex items-center justify-between gap-3 self-end rounded-xl border border-border bg-muted/40 p-3">
+          <div className="flex items-center justify-between gap-3 self-end rounded-xl bg-muted/30 p-3">
             <div>
               <div className="text-xs font-semibold">启用状态</div>
               <div className="text-xs text-muted-foreground">禁用后绑定该资源的账号不会回退到全局代理或直连。</div>
@@ -282,7 +282,7 @@ export function ProxyEditorModal({ open, resource, onClose }: {
           </div>
         </FieldGrid>
 
-        <div className="space-y-2 rounded-xl border border-border bg-muted/30 p-3">
+        <div className="space-y-2 rounded-xl bg-muted/30 p-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div>
               <div className="text-sm font-semibold">代理连通性</div>
@@ -437,7 +437,7 @@ export function ProxyResourceCard({ resource, onEdit }: { resource: ProxyResourc
   }
 
   return (
-    <div className="rounded-lg border border-border bg-card">
+    <div className="rounded-lg bg-card shadow-sm">
       <div className="p-4">
         <div className="flex flex-col gap-3">
           <div className="flex items-start justify-between gap-3">
@@ -506,7 +506,7 @@ export function ProxyResourceCard({ resource, onEdit }: { resource: ProxyResourc
 
       {/* 展开态：账号绑定选择器 */}
       {expanded && (
-        <div className="border-t border-border p-4 space-y-3 animate-in fade-in-0 slide-in-from-top-2 duration-200">
+        <div className="p-4 pt-2 space-y-3 animate-in fade-in-0 slide-in-from-top-2 duration-200">
           <div className="flex items-center justify-between gap-3">
             <div>
               <div className="text-sm font-semibold">账号绑定</div>

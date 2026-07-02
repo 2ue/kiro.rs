@@ -39,6 +39,7 @@
   - [3. 启动](#3-启动)
   - [4. 验证](#4-验证)
   - [Docker](#docker)
+- [前端开发预览](docs/frontend-dev-environment.md)
 - [配置详解](#配置详解)
   - [config.json](#configjson)
   - [credentials.json](#credentialsjson)
@@ -66,11 +67,14 @@
 
 > PS: 如果不想编辑可以直接前往 Release 下载二进制文件
 
-> **前置步骤**：编译前需要先构建前端 Admin UI（用于嵌入到二进制中）：
+> **发布/嵌入式构建前置步骤**：如果要重新构建带 embedded 前端的 Rust 二进制，需要先生成三套前端 `dist`：
 > ```bash
 > pnpm --dir admin-ui install && pnpm --dir admin-ui build
 > pnpm --dir admin-ui-daisy install && pnpm --dir admin-ui-daisy build
+> pnpm --dir ui install && pnpm --dir ui build
 > ```
+>
+> 日常前端开发不要靠重新构建 Rust 二进制看效果，直接使用 Vite 热更新入口，见 [前端开发预览](docs/frontend-dev-environment.md)。
 
 ```bash
 cargo build --release
@@ -133,6 +137,8 @@ IdC 认证：
 ```bash
 ./target/release/kiro-rs -c /path/to/config.json --credentials /path/to/credentials.json
 ```
+
+本地开发时，仓库里的 `config.json` 当前监听 `127.0.0.1:9022`。这个端口只作为后端 API 使用；前端页面使用 Vite 热更新地址预览。
 
 ### 4. 验证
 
@@ -242,14 +248,14 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `compatProfile` | string | `claude-code` | 兼容 profile：`claude-code` 优先真实 Claude Code CLI 可用性；`anthropic-strict` 减少代理改写和调试特征；`debug` 等同 `claude-code` 但默认暴露代理 warning |
 | `kiroAgentModeStrategy` | string | `vibe` | Kiro IDE `x-amzn-kiro-agent-mode` 策略：`vibe` 保持当前成功链路，`spec` 强制规格模式，`auto` 按账号协议自动判定 |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
-| `promptCacheTargetReadRatio` | number | `0.98` | `/v1/messages`、`/cc/v1/messages`、`/ha/v1/messages`、`/na/v1/messages` high-cache 的目标 cache read 中心比例；`/na` 默认只保留真实上游 cache usage，不用本地模拟补足 cache usage |
-| `promptCacheTokenScale` | number | `1.6` | `/v1/messages`、`/cc/v1/messages`、`/ha/v1/messages`、`/na/v1/messages` high-cache 模拟专用的 total input 放大倍数，只影响本地模拟 cache usage |
-| `promptCacheMaxSimulatedInputTokens` | number | `300000` | `/v1/messages`、`/cc/v1/messages`、`/ha/v1/messages`、`/na/v1/messages` high-cache 模拟 total input 的上限；触顶时会做确定性 soft-cap 抖动 |
+| `promptCacheTargetReadRatio` | number | `0.98` | `/v1/messages`、`/cc/v1/messages`、`/ha/v1/messages` high-cache 的目标 cache read 中心比例；`/na/v1/messages` 默认是 no-cache，不进入本地缓存模拟 |
+| `promptCacheTokenScale` | number | `1.6` | `/v1/messages`、`/cc/v1/messages`、`/ha/v1/messages` high-cache 模拟专用的 total input 放大倍数，只影响本地模拟 cache usage |
+| `promptCacheMaxSimulatedInputTokens` | number | `300000` | `/v1/messages`、`/cc/v1/messages`、`/ha/v1/messages` high-cache 模拟 total input 的上限；触顶时会做确定性 soft-cap 抖动 |
 | `promptCacheCapJitterMinTokens` | number | `12000` | high-cache 触顶 soft-cap 的最小扣减 token |
 | `promptCacheCapJitterMaxTokens` | number | `24000` | high-cache 触顶 soft-cap 的最大扣减 token |
 | `promptCacheScaleMinInputTokens` | number | `20000` | 基础输入达到该门槛后才启用 high-cache token scale，避免短测试请求被放大 |
 | `reportedUsage.default` | object | input/output 原始值，cache read/write 保留计算值 | 控制所有路径的默认 usage 上报方式，只影响响应和后台 usage record，不影响 reader 计算、本地缓存 tracker 或上游请求 |
-| `reportedUsage.pathOverrides` | object | `/na`、`/cc`、`/ha` | 按路径前缀独立覆盖默认 usage 上报策略，最长前缀优先；例如 `/cc` 会匹配 `/cc/v1/messages`，`/ha` 和 `/na` 不会继承 `/cc` 的 writer 配置 |
+| `reportedUsage.pathOverrides` | object | `/cc`、`/ha` | 按路径前缀独立覆盖默认 usage 上报策略，最长前缀优先；例如 `/cc` 会匹配 `/cc/v1/messages`，`/ha` 不会继承 `/cc` 的 writer 配置 |
 | `reportedUsage.*.finalCacheReadMaxTokens` | number | `700000` | 每个路径策略最终上报的 `cache_read_input_tokens` 上限；在 input 差值转入 cache read 后执行，0 表示关闭 |
 | `reportedUsage.*.finalCacheReadJitterMinTokens` | number | `0` | 最终读取缓存上限的确定性扣减下限 |
 | `reportedUsage.*.finalCacheReadJitterMaxTokens` | number | `0` | 最终读取缓存上限的确定性扣减上限 |
@@ -299,7 +305,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 }
 ```
 
-未写出的字段会使用内置默认值。首次启动导入 PgSQL 后，也可以在后台配置页热更新调度、payload 防护、高缓存模拟和路径级 usage 上报策略。
+未写出的字段会使用内置默认值。首次启动导入 PgSQL 后，也可以在后台配置页热更新调度、payload 防护、本地模拟缓存和路径级 usage 上报策略。
 
 `payloadShaping` 默认不会截断当前 user message、当前合法 `tool_result`、当前 PDF/document 或当前图片。如果显式打开 `fitCurrentPayloadToBudget` 或具体当前内容截断项，服务会在历史整形和旧历史裁剪后仍超出 `payloadGuardMaxBytes` 时，按最终序列化后的 Kiro JSON body 字节数循环收缩当前内容，直到低于配置预算或没有可继续处理的内容。若仍超出预算，服务会记录 `still_oversized=true` 并继续请求 Kiro，让上游返回真实错误。
 
@@ -308,9 +314,9 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 - `/v1/messages`：high-cache。即使请求没有显式 `cache_control`，也会按稳定前缀建立本地缓存；如果上游 metadata 返回的 cache read/write 都是 0，会用本地缓存 usage 补足 cache 字段。
 - `/cc/v1/messages`：high-cache，与 `/v1/messages` 使用同一套底层缓存模拟；默认只通过 `reportedUsage.pathOverrides["/cc"]` 改写下游 input 和 cache write 上报。
 - `/ha/v1/messages`：high-cache，与 `/v1/messages` 使用同一套底层缓存模拟；默认只通过 `reportedUsage.pathOverrides["/ha"]` 改写下游 input 上报。后续如果要改 writer，需要单独改 `/ha` 覆盖项。
-- `/na/v1/messages`：high-cache 路由；`reportedUsage.pathOverrides["/na"]` 默认关闭本地模拟 cache usage 补足，只保留真实上游 cache usage。
+- `/na/v1/messages`：no-cache 路由；不进入本地缓存模拟，响应和后台记录直接使用原始 usage。
 
-本地高缓存模拟按实际解析后的上游模型判断 prompt cache 能力和最小缓存长度。Anthropic prompt caching 支持 active Claude 模型；Haiku 不是无缓存模型，但 Haiku 4.5 的最小可缓存长度是 4096 tokens，Haiku 3.5 是 2048 tokens。低于模型最小长度时本地不会模拟 cache creation/read。
+本地模拟缓存按实际解析后的上游模型判断 prompt cache 能力和最小缓存长度。Anthropic prompt caching 支持 active Claude 模型；Haiku 不是无缓存模型，但 Haiku 4.5 的最小可缓存长度是 4096 tokens，Haiku 3.5 是 2048 tokens。低于模型最小长度时本地不会模拟 cache creation/read。
 
 路径级 usage 上报策略支持这些字段：
 
@@ -478,32 +484,40 @@ RUST_LOG=debug ./target/release/kiro-rs
 | `KIRO_RS_IMAGE` | `ghcr.io/2ue/kiro-rs` | `docker-compose.deploy.yml` 使用的镜像仓库 |
 | `KIRO_RS_VERSION` | `latest` | `docker-compose.deploy.yml` 使用的镜像 tag |
 | `KIRO_RS_PORT` | `8990` | Docker 部署时映射到宿主机的端口 |
-| `KIRO_UI_MODE` | `embedded` | 新版 `/ui` 的服务模式：`embedded` / `redirect` / `proxy` / `filesystem` / `disabled` |
-| `KIRO_UI_DIR` | `ui/dist` | `KIRO_UI_MODE=filesystem` 时读取的新版 UI 构建目录 |
-| `KIRO_UI_DEV_SERVER` | - | `KIRO_UI_MODE=redirect` 或 `proxy` 时使用的新版 UI 前端服务地址，例如 `http://127.0.0.1:9023` |
-| `KIRO_ADMIN_UI_MODE` | `embedded` | 旧版 `/admin` 的服务模式，取值同 `KIRO_UI_MODE` |
-| `KIRO_CONSOLE_UI_MODE` | `embedded` | `/console` 的服务模式，取值同 `KIRO_UI_MODE` |
+| `KIRO_NEW_UI_MODE` / `KIRO_UI_MODE` | `embedded` | 新版 `/ui` 的服务模式：`embedded` / `redirect` / `proxy` / `filesystem` / `disabled` |
+| `KIRO_NEW_UI_DIR` / `KIRO_UI_DIR` | `ui/dist` | `/ui` 使用 `filesystem` 模式时读取的构建目录 |
+| `KIRO_NEW_UI_DEV_SERVER` / `KIRO_UI_DEV_SERVER` | - | `/ui` 使用 `redirect` 或 `proxy` 时指向的 Vite 服务，例如 `http://127.0.0.1:9023` |
+| `KIRO_ADMIN_UI_MODE` | `embedded` | 旧版 `/admin` 的服务模式，取值同上 |
+| `KIRO_ADMIN_UI_DIR` | `admin-ui/dist` | `/admin` 使用 `filesystem` 模式时读取的构建目录 |
+| `KIRO_ADMIN_UI_DEV_SERVER` | - | `/admin` 使用 `redirect` 或 `proxy` 时指向的 Vite 服务，例如 `http://127.0.0.1:9025` |
+| `KIRO_CONSOLE_UI_MODE` | `embedded` | `/console` 的服务模式，取值同上 |
+| `KIRO_CONSOLE_UI_DIR` | `admin-ui-daisy/dist` | `/console` 使用 `filesystem` 模式时读取的构建目录 |
+| `KIRO_CONSOLE_UI_DEV_SERVER` | - | `/console` 使用 `redirect` 或 `proxy` 时指向的 Vite 服务，例如 `http://127.0.0.1:9024` |
 
-生产默认使用 `embedded`，前端构建产物编进后端二进制，部署仍是单服务，不需要额外挂载 UI 目录。开发环境使用 Vite 单独运行前端，前端通过 `/api` 代理到 9022；如果需要临时验证其他部署方式，也可以显式设置 `filesystem`、`redirect` 或 `proxy`。
+生产默认使用 `embedded`，前端构建产物编进后端二进制，部署仍是单服务。开发环境统一使用 Vite 热更新，前端通过 `/api` 代理到后端 API；不要用后端 embedded 页面判断当前前端源码效果。
 
-新版 UI 本地开发示例：
+本地开发预览地址：
+
+| 前端 | 命令 | 浏览器地址 | 用途 |
+|------|------|------------|------|
+| 新版 UI | `bash scripts/dev-ui.sh ui` | `http://127.0.0.1:9023/ui/runtime` | 当前主要开发入口 |
+| Console UI | `bash scripts/dev-ui.sh console` | `http://127.0.0.1:9024/console/config` | Daisy 版本对照 |
+| 旧版 Admin UI | `bash scripts/dev-ui.sh admin` | `http://127.0.0.1:9025/admin/` | 旧版对照，打开后点“配置” |
+
+后端 API 示例：
 
 ```bash
-# 后端 API，仍然监听 9022
+# 当前本地 config.json 监听 9022；config.example.json 的默认示例是 8990
 ./target/release/kiro-rs -c config.json --credentials credentials.json
-
-# 前端开发服务，监听 9023，/api 自动代理到 9022
-pnpm --dir ui dev
 ```
 
-如果希望访问后端 `/ui` 时跳到前端开发服务，可以这样启动后端：
+前端默认把 `/api` 代理到 `http://127.0.0.1:9022`。如果后端不是 9022，用 `VITE_API_PROXY_TARGET` 覆盖：
 
 ```bash
-KIRO_UI_MODE=redirect KIRO_UI_DEV_SERVER=http://127.0.0.1:9023 \
-  ./target/release/kiro-rs -c config.json --credentials credentials.json
+VITE_API_PROXY_TARGET=http://127.0.0.1:8990 bash scripts/dev-ui.sh ui
 ```
 
-Vite 代理后端地址可以用 `VITE_API_PROXY_TARGET` 覆盖，默认 `http://127.0.0.1:9022`。
+日常前端开发不要从后端 `/ui`、`/console`、`/admin` 入口看效果。后端只跑 API，浏览器直接打开上表里的 Vite 地址。
 
 ## API 端点
 
@@ -515,12 +529,12 @@ Vite 代理后端地址可以用 `VITE_API_PROXY_TARGET` 覆盖，默认 `http:/
 | `/v1/messages` | POST | 创建消息（对话，固定 high-cache 本地 usage 模拟） |
 | `/v1/messages/count_tokens` | POST | 估算 Token 数量 |
 
-### 真实 Cache Usage 上报端点 (/na/v1)
+### No-Cache 端点 (/na/v1)
 
 | 端点 | 方法 | 描述 |
 |------|------|------|
 | `/na/v1/models` | GET | 获取可用模型列表 |
-| `/na/v1/messages` | POST | 创建消息（对话；底层 high-cache 计算保持开启，默认只上报真实上游 cache usage） |
+| `/na/v1/messages` | POST | 创建消息（对话；默认不进入本地缓存模拟，直接使用原始 usage） |
 | `/na/v1/messages/count_tokens` | POST | 估算 Token 数量 |
 
 ### Claude Code 兼容端点 (/cc/v1)
@@ -609,8 +623,9 @@ Vite 代理后端地址可以用 `VITE_API_PROXY_TARGET` 覆盖，默认 `http:/
   - `GET /api/admin/audit-logs` - 分页查询后台审计日志
 
 - **Admin UI**
-  - `GET /console` - 访问新版 Daisy 管理页面（需要在编译前构建 `admin-ui-daisy/dist`）
-  - `GET /admin` - 访问旧版管理页面（需要在编译前构建 `admin-ui/dist`）
+  - `GET /ui` - 访问新版管理页面。日常开发看 Vite 地址；该路由默认服务 embedded 发布产物。
+  - `GET /console` - 访问新版 Daisy 管理页面。日常开发看 Vite 地址；该路由默认服务 embedded 发布产物。
+  - `GET /admin` - 访问旧版管理页面。日常开发看 Vite 地址；该路由默认服务 embedded 发布产物。
 
 ## 注意事项
 
@@ -670,8 +685,9 @@ kiro-rs/
 │   │   └── redis_cache.rs      # Redis 缓存和调度运行态
 │   └── common/                 # 公共模块
 │       └── auth.rs             # 认证工具函数
-├── admin-ui/                   # 旧版 Admin UI 前端工程（构建产物会嵌入二进制）
-├── admin-ui-daisy/             # 新版 Console UI 前端工程（构建产物会嵌入二进制）
+├── ui/                         # 新版 UI 前端工程（开发用 Vite，发布产物可嵌入二进制）
+├── admin-ui/                   # 旧版 Admin UI 前端工程（开发用 Vite，发布产物可嵌入二进制）
+├── admin-ui-daisy/             # 新版 Console UI 前端工程（开发用 Vite，发布产物可嵌入二进制）
 ├── tools/                      # 辅助工具
 ├── Cargo.toml                  # 项目配置
 ├── config.example.json         # 配置示例

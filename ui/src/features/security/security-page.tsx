@@ -24,7 +24,6 @@ import {
   Badge,
   Button,
   Input,
-  Separator,
   Spinner,
   Tooltip,
 } from '@/components/ui'
@@ -152,7 +151,7 @@ function RequestKeysSection({
       </div>
 
       {/* Key 列表 */}
-      <div className="mt-3 divide-y divide-border rounded-lg border border-border">
+      <div className="mt-3 rounded-lg bg-muted/20">
         {loading && <div className="px-4 py-3 text-sm text-muted-foreground">加载中...</div>}
         {!loading && requestKeys.length === 0 && (
           <div className="px-4 py-3 text-sm text-destructive">未配置请求 Key，请先生成或手动添加。</div>
@@ -425,10 +424,8 @@ export function SecurityPage() {
           </div>
         </div>
 
-        <Separator className="my-4" />
-
         {/* 修改区域 */}
-        <div className="space-y-2">
+        <div className="mt-5 space-y-2">
           <div className="text-sm font-semibold">修改登录 Key</div>
           <div className="rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-xs text-warning-foreground leading-5">
             高危操作：保存后旧 Key 立即失效；所有其他已登录会话需重新登录。当前页面会自动写入新 Key。

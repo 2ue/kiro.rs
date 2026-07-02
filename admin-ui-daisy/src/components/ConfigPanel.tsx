@@ -9,9 +9,11 @@ import {
   defaultExternalPoolsConfig,
   defaultPromptCacheCreationControl,
   DFCACHE_ROUTE_PREFIX,
+  definedCacheRouteFromNameInput,
   emptyRuntimeConfig,
   fieldNeedsMax,
   fieldNeedsTarget,
+  getDefinedCacheRouteName,
   inputSamplePolicy,
   normalizeDefinedCacheRoute,
   normalizeDefinedCacheRoutes,
@@ -25,6 +27,7 @@ import {
   toRatio,
   toScale,
   toWhole,
+  writerSamplePolicy,
 } from '@/lib/runtime-config-defaults'
 import { extractErrorMessage } from '@/lib/utils'
 import { createRequestApiKey, deleteRequestApiKey, getAccessKeys, updateAdminApiKey, updateRequestApiKey } from '@/api/credentials'
@@ -73,7 +76,7 @@ const configTabs: Array<{ key: ConfigTab; label: string; description: string; ic
   { key: 'payload', label: '大小保护', description: '压缩、阈值和处理时机', icon: <Wand2 className="h-4 w-4" /> },
   { key: 'payloadHistory', label: '旧内容清理', description: '历史消息、工具和网页内容', icon: <Wand2 className="h-4 w-4" /> },
   { key: 'payloadFallback', label: '当前内容兜底', description: '当前消息、文档和图片', icon: <Wand2 className="h-4 w-4" /> },
-  { key: 'cachePolicy', label: '缓存策略', description: '默认配置和路径覆盖', icon: <Zap className="h-4 w-4" /> },
+  { key: 'cachePolicy', label: '缓存策略', description: '默认缓存设置和路径覆盖', icon: <Zap className="h-4 w-4" /> },
   { key: 'compat', label: '兼容与模型', description: '兼容模式和模型映射', icon: <Shield className="h-4 w-4" /> },
   { key: 'stats', label: '后台统计', description: '页面统计判断标准', icon: <Gauge className="h-4 w-4" /> },
 ]
@@ -239,8 +242,16 @@ function normalizeCachePolicyPathPrefix(prefix: string): string | null {
 }
 
 type CacheSimulationPatch = NonNullable<CacheRoutePolicyPatch['simulation']>
-type CachePointPatch = NonNullable<CacheRoutePolicyPatch['cachePoint']>
-type CacheBoundsPatch = NonNullable<CacheRoutePolicyPatch['bounds']>
+type KiroRsToolPatch = NonNullable<CacheRoutePolicyPatch['kiroRsTool']>
+type CacheStrategyType = NonNullable<CacheRoutePolicyPatch['cacheType']>
+
+const BUILT_IN_CACHE_PREFIXES = ['/v1', '/cc', '/ha', '/na'] as const
+const CACHE_ENDPOINT_LABELS: Record<string, string> = {
+  '/v1': '/v1/messages',
+  '/cc': '/cc/v1/messages',
+  '/ha': '/ha/v1/messages',
+  '/na': '/na/v1/messages',
+}
 
 function defaultSimulationPatch(): CacheSimulationPatch {
   return {
@@ -254,41 +265,110 @@ function defaultSimulationPatch(): CacheSimulationPatch {
   }
 }
 
-function defaultCachePointPatch(): CachePointPatch {
+function defaultKiroRsToolPatch(): KiroRsToolPatch {
   return {
-    enabled: false,
-    toolsOnly: true,
-    recordPlan: true,
-  }
-}
-
-function defaultBoundsPatch(): CacheBoundsPatch {
-  return {
-    maxEntriesPerAccount: 200,
-    maxEntriesGlobal: 20000,
-    entryTtlSecs: 86400,
-    estimatedBytesLimit: 268435456,
+    coverageRatio: 1,
+    maxCoverageTokens: 0,
+    incrementalCreateEnabled: true,
+    maxNewCreationTokensPerRequest: 0,
+    cacheCurrentUserStablePrefix: false,
+    currentUserStablePrefixMaxTokens: 0,
   }
 }
 
 function defaultUsagePatch(prefix: string): ReportedUsagePathPolicy {
+  if (prefix === '/cc') return pathPolicy(true, inputSamplePolicy(96), writerSamplePolicy(3000))
+  if (prefix === '/ha') return pathPolicy(true, inputSamplePolicy(96), preserveFieldPolicy())
   return normalizeDefinedCacheRoute(prefix)
     ? pathPolicy(true, inputSamplePolicy(96), preserveFieldPolicy())
     : pathPolicy()
 }
 
-function defaultPathCachePatch(prefix: string): CacheRoutePolicyPatch {
+function defaultPathCachePatch(
+  prefix: string,
+  cacheType: CacheStrategyType = 'no_cache'
+): CacheRoutePolicyPatch {
+  if (cacheType === 'no_cache') {
+    return { cacheType: 'no_cache' }
+  }
+  if (cacheType === 'kiro_rs_tool') {
+    return { cacheType: 'kiro_rs_tool', kiroRsTool: defaultKiroRsToolPatch() }
+  }
   return {
+    cacheType: 'current_high_cache',
     simulation: defaultSimulationPatch(),
     creationControl: defaultPromptCacheCreationControl(),
     reportedUsage: defaultUsagePatch(prefix),
-    cachePoint: defaultCachePointPatch(),
-    bounds: defaultBoundsPatch(),
   }
 }
 
-function isEmptyRoutePatch(policy: CacheRoutePolicyPatch): boolean {
-  return !policy.simulation && !policy.creationControl && !policy.reportedUsage && !policy.cachePoint && !policy.bounds
+function cacheTypeLabel(cacheType: CacheRoutePolicyPatch['cacheType']): string {
+  if (cacheType === 'no_cache') return '无缓存'
+  if (cacheType === 'kiro_rs_tool') return 'Kiro-RS Tool'
+  return '本地模拟缓存策略'
+}
+
+function isBuiltInCachePrefix(prefix: string): boolean {
+  return (BUILT_IN_CACHE_PREFIXES as readonly string[]).includes(prefix)
+}
+
+function cacheEndpointLabel(prefix: string): string {
+  return CACHE_ENDPOINT_LABELS[prefix] ?? `${prefix}/v1/messages`
+}
+
+function canonicalCachePolicyPath(prefix: string): string {
+  const normalized = prefix.replace(/\/+$/, '') || '/'
+  const lower = normalized.toLowerCase()
+  if (lower === '/cc/v1' || lower === '/cc/v1/messages') return '/cc'
+  if (lower === '/ha/v1' || lower === '/ha/v1/messages') return '/ha'
+  if (lower === '/na/v1' || lower === '/na/v1/messages') return '/na'
+  return normalized
+}
+
+function cachePolicyPathAliases(prefix: string): string[] {
+  if (prefix === '/cc') return ['/cc', '/cc/v1', '/cc/v1/messages']
+  if (prefix === '/ha') return ['/ha', '/ha/v1', '/ha/v1/messages']
+  if (prefix === '/na') return ['/na', '/na/v1', '/na/v1/messages']
+  return [prefix]
+}
+
+function routeOverrideForPrefix(
+  pathOverrides: Record<string, CacheRoutePolicyPatch> | undefined,
+  prefix: string
+): CacheRoutePolicyPatch | undefined {
+  for (const alias of cachePolicyPathAliases(prefix)) {
+    const policy = pathOverrides?.[alias]
+    if (policy) return policy
+  }
+  return undefined
+}
+
+function reportedUsageForPrefix(
+  pathOverrides: Record<string, ReportedUsagePathPolicy> | undefined,
+  prefix: string
+): ReportedUsagePathPolicy | undefined {
+  for (const alias of cachePolicyPathAliases(prefix)) {
+    const policy = pathOverrides?.[alias]
+    if (policy) return policy
+  }
+  return undefined
+}
+
+function deletePrefixAliases<T>(record: Record<string, T>, prefix: string) {
+  for (const alias of cachePolicyPathAliases(prefix)) {
+    delete record[alias]
+  }
+}
+
+function compareCachePrefix(a: string, b: string): number {
+  const aIndex = (BUILT_IN_CACHE_PREFIXES as readonly string[]).indexOf(a)
+  const bIndex = (BUILT_IN_CACHE_PREFIXES as readonly string[]).indexOf(b)
+  if (aIndex >= 0 || bIndex >= 0) {
+    if (aIndex < 0) return 1
+    if (bIndex < 0) return -1
+    return aIndex - bIndex
+  }
+  return a.localeCompare(b)
 }
 
 function normalizedDefinedRoutesWith(routes: string[], prefix: string, enabled: boolean): string[] {
@@ -321,10 +401,10 @@ function SimulationOverrideForm({
 
   return (
     <div className="space-y-3 rounded-lg border border-base-300 bg-base-100/70 p-4">
-      <ToggleField title="启用高缓存模拟" description="只覆盖当前入口的高缓存模拟开关。" checked={merged.enabled ?? true} onChange={set('enabled')} />
+      <ToggleField title="启用本地模拟缓存" description="只覆盖当前入口的本地模拟缓存开关。" checked={merged.enabled ?? true} onChange={set('enabled')} />
       <div className="grid gap-3 xl:grid-cols-2">
         <NumberField title="目标缓存读取比例" description="当前入口希望展示为缓存读取的比例。" value={merged.targetReadRatio ?? 0.98} min={0} max={0.99} step={0.01} suffix="比例" onChange={set('targetReadRatio')} />
-        <NumberField title="输入放大倍数" description="当前入口高缓存模拟时 total input 的放大程度。" value={merged.tokenScale ?? 1.6} min={1} max={3} step={0.1} suffix="倍" onChange={set('tokenScale')} />
+        <NumberField title="输入放大倍数" description="当前入口本地模拟时 total input 的放大程度。" value={merged.tokenScale ?? 1.6} min={1} max={3} step={0.1} suffix="倍" onChange={set('tokenScale')} />
         <NumberField title="模拟输入上限" description="当前入口模拟后的 total input 最高值，填 0 表示不限制。" value={merged.maxSimulatedInputTokens ?? 300000} min={0} suffix="Token" onChange={set('maxSimulatedInputTokens')} />
         <NumberField title="放大生效门槛" description="输入达到多少 Token 后才进行放大模拟。" value={merged.scaleMinInputTokens ?? 20000} min={0} suffix="Token" onChange={set('scaleMinInputTokens')} />
         <NumberField title="上限扣减下限" description="触顶后随机扣减的最小 Token 数。" value={merged.capJitterMinTokens ?? 12000} min={0} suffix="Token" onChange={set('capJitterMinTokens')} />
@@ -347,13 +427,10 @@ function CreationControlOverrideForm({
 
   return (
     <div className="space-y-3 rounded-lg border border-base-300 bg-base-100/70 p-4">
-      <ToggleField title="启用缓存创建频次控制" description="只覆盖当前入口的缓存写入展示节奏。" checked={merged.enabled} onChange={set('enabled')} />
-      <FieldLabel title="控制维度" description="决定缓存创建频次按什么范围累计。">
-        <Select value={merged.scopeMode} disabled={!merged.enabled} size="sm" onChange={(event) => set('scopeMode')(event.target.value as PromptCacheCreationControlConfig['scopeMode'])}>
-          <Select.Option value="conversation_model">会话 + 模型</Select.Option>
-          <Select.Option value="credential_conversation_model">账号 + 会话 + 模型</Select.Option>
-        </Select>
-      </FieldLabel>
+      <ToggleField title="启用缓存创建频次控制" description="只控制缓存创建数值的展示节奏；范围固定按会话和路径计算。" checked={merged.enabled} onChange={set('enabled')} />
+      <div className="rounded-lg border border-base-300 bg-base-200/40 p-3 text-xs leading-5 text-base-content/60">
+        已固定按会话和路径计算，不再按账号或模型拆分；旧配置里的 scopeMode 会保留但后端不会使用。
+      </div>
       <div className="grid gap-3 xl:grid-cols-2">
         <NumberField title="最小成功请求间隔" description="两次缓存创建展示之间至少间隔多少次成功请求。" value={merged.minSuccessfulRequestsBetweenCreation} disabled={!merged.enabled} min={0} suffix="次" onChange={set('minSuccessfulRequestsBetweenCreation')} />
         <NumberField title="最小时间间隔" description="两次缓存创建展示之间至少间隔多少秒。" value={merged.minCreationIntervalSecs} disabled={!merged.enabled} min={0} suffix="秒" onChange={set('minCreationIntervalSecs')} />
@@ -367,80 +444,146 @@ function CreationControlOverrideForm({
   )
 }
 
-function CachePointOverrideForm({
+function KiroRsToolPolicyForm({
   value,
   onChange,
 }: {
-  value: CachePointPatch
-  onChange: (next: CachePointPatch) => void
+  value: KiroRsToolPatch
+  onChange: (next: KiroRsToolPatch) => void
 }) {
-  const merged = { ...defaultCachePointPatch(), ...value }
-  const set = <K extends keyof CachePointPatch>(key: K) => (nextValue: CachePointPatch[K]) =>
-    onChange({ ...merged, [key]: nextValue })
-
-  return (
-    <div className="space-y-3 rounded-lg border border-base-300 bg-base-100/70 p-4">
-      <ToggleField title="发送真实 cachePoint" description="把带缓存标记的工具发送给 Kiro 上游；上游不接受时会自动去掉后重试一次。" checked={merged.enabled ?? false} onChange={set('enabled')} />
-      <div className="grid gap-3 xl:grid-cols-2">
-        <ToggleField title="只处理工具缓存标记" description="只根据工具上的缓存标记插入 cachePoint，不改写系统消息或历史消息。" checked={merged.toolsOnly ?? true} disabled={!merged.enabled} onChange={set('toolsOnly')} />
-        <ToggleField title="记录 cachePoint 计划" description="在系统日志中记录插入数量，方便排查上游请求体错误。" checked={merged.recordPlan ?? true} disabled={!merged.enabled} onChange={set('recordPlan')} />
-      </div>
-    </div>
-  )
-}
-
-function CacheBoundsOverrideForm({
-  value,
-  onChange,
-}: {
-  value: CacheBoundsPatch
-  onChange: (next: CacheBoundsPatch) => void
-}) {
-  const merged = { ...defaultBoundsPatch(), ...value }
-  const set = <K extends keyof CacheBoundsPatch>(key: K) => (nextValue: CacheBoundsPatch[K]) =>
+  const merged = { ...defaultKiroRsToolPatch(), ...value }
+  const set = <K extends keyof KiroRsToolPatch>(key: K) => (nextValue: KiroRsToolPatch[K]) =>
     onChange({ ...merged, [key]: nextValue })
 
   return (
     <div className="space-y-3 rounded-lg border border-base-300 bg-base-100/70 p-4">
       <div className="grid gap-3 xl:grid-cols-2">
-        <NumberField title="单账号条目上限" description="当前入口每个账号最多保留多少个可复用缓存指纹。" value={merged.maxEntriesPerAccount ?? 200} min={0} suffix="条" onChange={set('maxEntriesPerAccount')} />
-        <NumberField title="全局条目上限" description="当前入口所有账号合计最多保留多少个缓存指纹。" value={merged.maxEntriesGlobal ?? 20000} min={0} suffix="条" onChange={set('maxEntriesGlobal')} />
-        <NumberField title="最长保留时间" description="当前入口单条缓存指纹最多保留多久。" value={merged.entryTtlSecs ?? 86400} min={1} suffix="秒" onChange={set('entryTtlSecs')} />
-        <NumberField title="估算内存上限" description="当前入口达到估算上限后优先移除最久未使用的缓存指纹。" value={merged.estimatedBytesLimit ?? 268435456} min={0} suffix="字节" onChange={set('estimatedBytesLimit')} />
+        <NumberField title="缓存覆盖比例" description="本轮最多把多少稳定内容纳入 Kiro-RS Tool 缓存。1 表示保持当前表现；0 表示不创建也不读取。" value={merged.coverageRatio ?? 1} min={0} max={1} step={0.05} suffix="比例" onChange={set('coverageRatio')} />
+        <NumberField title="覆盖上限" description="单次最多纳入多少 Token。0 表示不限制，保持当前 Kiro-RS Tool 表现。" value={merged.maxCoverageTokens ?? 0} min={0} suffix="Token" onChange={set('maxCoverageTokens')} />
+        <NumberField title="单次新增创建上限" description="一次请求最多新增多少缓存。0 表示不限制；后续读取不会超过之前真正创建过的数量。" value={merged.maxNewCreationTokensPerRequest ?? 0} min={0} suffix="Token" onChange={set('maxNewCreationTokensPerRequest')} />
+        <NumberField title="当前用户前缀上限" description="开启下方选项后，最多取当前用户文本前段多少 Token。0 表示不取。" value={merged.currentUserStablePrefixMaxTokens ?? 0} min={0} suffix="Token" disabled={!merged.cacheCurrentUserStablePrefix} onChange={set('currentUserStablePrefixMaxTokens')} />
+      </div>
+      <div className="grid gap-3 xl:grid-cols-2">
+        <ToggleField title="允许后续继续创建" description="同一会话命中旧缓存后，如果又出现新的稳定内容，是否继续补创建。关闭后命中时只读不补建。" checked={merged.incrementalCreateEnabled ?? true} onChange={set('incrementalCreateEnabled')} />
+        <ToggleField title="缓存当前用户稳定前缀" description="默认关闭，和当前 Kiro-RS Tool 表现一致。开启后只取当前用户文本前段，适合确实有稳定长前缀的请求。" checked={merged.cacheCurrentUserStablePrefix ?? false} onChange={set('cacheCurrentUserStablePrefix')} />
       </div>
     </div>
   )
 }
 
-function CachePatchBlock({
+function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, cacheType: CacheStrategyType): CacheRoutePolicyPatch {
+  if (cacheType === 'no_cache') return { cacheType: 'no_cache' }
+  if (cacheType === 'kiro_rs_tool') return { cacheType: 'kiro_rs_tool', kiroRsTool: policy.kiroRsTool ?? defaultKiroRsToolPatch() }
+  return {
+    cacheType: 'current_high_cache',
+    simulation: policy.simulation ?? defaultSimulationPatch(),
+    creationControl: policy.creationControl ?? defaultPromptCacheCreationControl(),
+    reportedUsage: policy.reportedUsage ?? defaultUsagePatch('/v1'),
+  }
+}
+
+function currentHighCachePathDefaults(prefix: string, reportedUsage?: ReportedUsagePathPolicy): CacheRoutePolicyPatch {
+  return {
+    cacheType: 'current_high_cache',
+    simulation: defaultSimulationPatch(),
+    creationControl: defaultPromptCacheCreationControl(),
+    reportedUsage: reportedUsage ?? defaultUsagePatch(prefix),
+  }
+}
+
+function strategyDescription(cacheType: CacheRoutePolicyPatch['cacheType']): string {
+  if (cacheType === 'no_cache') {
+    return '这个路径不进入缓存计算，直接使用原始 usage 返回和记录。'
+  }
+  if (cacheType === 'kiro_rs_tool') {
+    return '按 Kiro-RS Tool 的会话和路径规则计算缓存；第一次请求不会显示缓存读取，失败请求不会写入缓存。'
+  }
+  return '使用当前系统的本地模拟缓存逻辑，把原始 usage 换算成对外显示的缓存 usage。'
+}
+
+function pathPolicyWithStrategyDefaults(
+  cachePolicy: CachePolicyConfig,
+  prefix: string,
+  policy: CacheRoutePolicyPatch
+): CacheRoutePolicyPatch {
+  const cacheType = policy.cacheType ?? 'no_cache'
+  if (cacheType === 'no_cache') return { cacheType: 'no_cache' }
+  const template = cacheType === 'kiro_rs_tool'
+    ? cachePolicyForStrategyTemplate(cachePolicy.kiroRsTool ?? {}, 'kiro_rs_tool')
+    : cachePolicyForStrategyTemplate(
+        {
+          ...(cachePolicy.default ?? {}),
+          ...(cachePolicy.currentHighCache ?? {}),
+        },
+        'current_high_cache'
+      )
+  return {
+    ...template,
+    ...policy,
+    cacheType,
+    ...(cacheType === 'current_high_cache'
+      ? {
+          simulation: policy.simulation ?? template.simulation ?? defaultSimulationPatch(),
+          creationControl: policy.creationControl ?? template.creationControl ?? defaultPromptCacheCreationControl(),
+          reportedUsage: policy.reportedUsage ?? template.reportedUsage ?? defaultUsagePatch(prefix),
+        }
+      : {
+          kiroRsTool: policy.kiroRsTool ?? template.kiroRsTool ?? defaultKiroRsToolPatch(),
+        }),
+  }
+}
+
+function StrategyTemplateBlock({
   title,
   description,
-  enabled,
-  onSet,
-  onClear,
-  children,
+  cacheType,
+  policy,
+  onChange,
 }: {
   title: string
   description: string
-  enabled: boolean
-  onSet: () => void
-  onClear: () => void
-  children: React.ReactNode
+  cacheType: CacheStrategyType
+  policy: CacheRoutePolicyPatch
+  onChange: (next: CacheRoutePolicyPatch) => void
 }) {
+  const template = cachePolicyForStrategyTemplate(policy, cacheType)
+  const setSimulation = (simulation: CacheSimulationPatch) => onChange({ ...template, simulation })
+  const setCreationControl = (creationControl: PromptCacheCreationControlConfig) => onChange({ ...template, creationControl })
+  const setReportedUsage = (reportedUsage: ReportedUsagePathPolicy) => onChange({ ...template, reportedUsage })
+  const setKiroRsTool = (kiroRsTool: KiroRsToolPatch) => onChange({ ...template, kiroRsTool })
+
   return (
-    <div className="space-y-3 rounded-lg border border-base-300 bg-base-200/40 p-4">
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <h4 className="text-sm font-semibold">{title}</h4>
-          <p className="mt-1 text-xs leading-5 text-base-content/60">{description}</p>
-        </div>
-        {enabled ? (
-          <Button type="button" variant="outline" size="xs" onClick={onClear}>清除覆盖</Button>
-        ) : (
-          <Button type="button" variant="outline" size="xs" onClick={onSet}>设置覆盖</Button>
-        )}
+    <div className="space-y-4 rounded-lg bg-base-100/70 p-4">
+      <div>
+        <h3 className="text-sm font-semibold">{title}</h3>
+        <p className="mt-1 text-xs leading-5 text-base-content/60">{description}</p>
       </div>
-      {enabled && children}
+      {cacheType === 'current_high_cache' ? (
+        <>
+          <div className="space-y-3">
+            <h4 className="text-sm font-semibold">模拟读取参数</h4>
+            <SimulationOverrideForm value={template.simulation ?? defaultSimulationPatch()} onChange={setSimulation} />
+          </div>
+          <div className="space-y-3">
+            <h4 className="text-sm font-semibold">缓存创建展示频次</h4>
+            <CreationControlOverrideForm value={template.creationControl ?? defaultPromptCacheCreationControl()} onChange={setCreationControl} />
+          </div>
+          <div className="space-y-3">
+            <h4 className="text-sm font-semibold">最终 usage 显示</h4>
+            <ReportedUsagePathEditor
+              title="默认 usage 显示"
+              description="使用本地模拟缓存策略、且路径没有单独调整时，按这里的规则返回和记录 usage。"
+              value={template.reportedUsage ?? defaultUsagePatch('/v1')}
+              onChange={setReportedUsage}
+            />
+          </div>
+        </>
+      ) : (
+        <KiroRsToolPolicyForm
+          value={template.kiroRsTool ?? defaultKiroRsToolPatch()}
+          onChange={setKiroRsTool}
+        />
+      )}
     </div>
   )
 }
@@ -448,7 +591,9 @@ function CachePatchBlock({
 function PathCachePolicyCard({
   prefix,
   policy,
+  cachePolicy,
   definedRoutes,
+  builtIn,
   onPrefixChange,
   onDelete,
   onChange,
@@ -456,144 +601,170 @@ function PathCachePolicyCard({
 }: {
   prefix: string
   policy: CacheRoutePolicyPatch
+  cachePolicy: CachePolicyConfig
   definedRoutes: string[]
+  builtIn?: boolean
   onPrefixChange: (nextPrefix: string) => void
   onDelete: () => void
   onChange: (next: CacheRoutePolicyPatch) => void
   onDefinedRouteChange: (enabled: boolean) => void
 }) {
   const [draftPrefix, setDraftPrefix] = useState(prefix)
+  const [draftDfcacheName, setDraftDfcacheName] = useState(getDefinedCacheRouteName(prefix))
   const [prefixError, setPrefixError] = useState<string | null>(null)
   const normalizedDefinedRoute = normalizeDefinedCacheRoute(prefix)
   const isDfcachePath = prefix.toLowerCase().startsWith(DFCACHE_ROUTE_PREFIX)
   const isRouteRegistered = Boolean(normalizedDefinedRoute && definedRoutes.includes(normalizedDefinedRoute))
+  const effectiveCacheType: CacheStrategyType = policy.cacheType ?? 'no_cache'
+  const effectivePolicy = pathPolicyWithStrategyDefaults(cachePolicy, prefix, policy)
 
   useEffect(() => {
     setDraftPrefix(prefix)
+    setDraftDfcacheName(getDefinedCacheRouteName(prefix))
     setPrefixError(null)
   }, [prefix])
 
   const commitPrefix = () => {
-    const normalized = normalizeCachePolicyPathPrefix(draftPrefix)
+    const normalized = isDfcachePath
+      ? normalizeDefinedCacheRoute(definedCacheRouteFromNameInput(draftDfcacheName))
+      : normalizeCachePolicyPathPrefix(draftPrefix)
     if (!normalized) {
-      setPrefixError('路径不能为空')
+      setPrefixError(isDfcachePath ? '请输入路径名，例如 team-a' : '路径不能为空')
       setDraftPrefix(prefix)
+      setDraftDfcacheName(getDefinedCacheRouteName(prefix))
       return
     }
     setPrefixError(null)
     onPrefixChange(normalized)
   }
 
-  const setSimulation = (simulation?: CacheSimulationPatch) => {
-    onChange({ ...policy, simulation })
+  const setCacheType = (cacheType: CacheStrategyType) => {
+    onChange(defaultPathCachePatch(prefix, cacheType))
   }
-  const setCreationControl = (creationControl?: PromptCacheCreationControlConfig) => {
-    onChange({ ...policy, creationControl })
-  }
-  const setReportedUsage = (reportedUsage?: ReportedUsagePathPolicy) => {
-    onChange({ ...policy, reportedUsage })
-  }
-  const setCachePoint = (cachePoint?: CachePointPatch) => {
-    onChange({ ...policy, cachePoint })
-  }
-  const setBounds = (bounds?: CacheBoundsPatch) => {
-    onChange({ ...policy, bounds })
+
+  const patch = (next: Partial<CacheRoutePolicyPatch>) => {
+    onChange({ ...effectivePolicy, ...next, cacheType: effectiveCacheType })
   }
 
   return (
-    <div className="space-y-4 rounded-lg border border-base-300 bg-base-100 p-4">
+    <div className="space-y-4 rounded-lg bg-base-100/70 p-4">
       <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
-        <FieldLabel title="路径前缀">
-          <Input
-            bordered
-            size="sm"
-            value={draftPrefix}
-            onChange={(event) => setDraftPrefix(event.target.value)}
-            onBlur={commitPrefix}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter') event.currentTarget.blur()
-              if (event.key === 'Escape') {
-                setDraftPrefix(prefix)
-                setPrefixError(null)
-              }
-            }}
-          />
+        <FieldLabel title={isDfcachePath ? '自定义路径后缀' : '路径前缀'}>
+          {builtIn ? (
+            <div className="rounded-lg bg-base-200/50 px-3 py-2 font-mono text-sm">
+              {prefix}
+            </div>
+          ) : isDfcachePath ? (
+            <div className="join w-full">
+              <span className="join-item flex items-center border border-base-300 bg-base-200/60 px-3 font-mono text-sm text-base-content/60">
+                {DFCACHE_ROUTE_PREFIX}
+              </span>
+              <Input
+                bordered
+                size="sm"
+                className="join-item flex-1"
+                value={draftDfcacheName}
+                onChange={(event) => setDraftDfcacheName(event.target.value)}
+                onBlur={commitPrefix}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') event.currentTarget.blur()
+                  if (event.key === 'Escape') {
+                    setDraftDfcacheName(getDefinedCacheRouteName(prefix))
+                    setPrefixError(null)
+                  }
+                }}
+              />
+            </div>
+          ) : (
+            <Input
+              bordered
+              size="sm"
+              value={draftPrefix}
+              onChange={(event) => setDraftPrefix(event.target.value)}
+              onBlur={commitPrefix}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') event.currentTarget.blur()
+                if (event.key === 'Escape') {
+                  setDraftPrefix(prefix)
+                  setPrefixError(null)
+                }
+              }}
+            />
+          )}
+          <div className="mt-2 text-xs leading-5 text-base-content/60">
+            {isDfcachePath
+              ? '固定前缀用于避开内置路由，只能修改后缀名。'
+              : `覆盖 ${cacheEndpointLabel(prefix)}。这里保存的是路径前缀，按最长前缀匹配。`}
+          </div>
           {prefixError && <div className="mt-2 text-xs text-error">{prefixError}</div>}
         </FieldLabel>
-        <Button type="button" color="error" variant="outline" size="sm" onClick={onDelete}>
-          <Trash2 className="h-4 w-4" />
-          删除路径
-        </Button>
+        {!builtIn && (
+          <Button type="button" color="error" variant="outline" size="sm" onClick={onDelete}>
+            <Trash2 className="h-4 w-4" />
+            删除路径
+          </Button>
+        )}
       </div>
 
       {isDfcachePath && (
-        <div className="rounded-lg border border-base-300 bg-base-200/40 p-4">
-          <ToggleField
-            title="注册为 /dfcache 路由"
-            description={normalizedDefinedRoute ? '开启后允许客户端访问这个 /dfcache/{name} 入口。' : '路径必须是 /dfcache/{name}，name 仅允许小写字母、数字、点、下划线或短横线。'}
-            checked={isRouteRegistered}
-            disabled={!normalizedDefinedRoute}
-            onChange={onDefinedRouteChange}
+        <ToggleField
+          title="注册为 /dfcache 路由"
+          description={normalizedDefinedRoute ? '开启后允许客户端访问这个 /dfcache/{name} 入口。' : '路径必须是 /dfcache/{name}，name 仅允许小写字母、数字、点、下划线或短横线。'}
+          checked={isRouteRegistered}
+          disabled={!normalizedDefinedRoute}
+          onChange={onDefinedRouteChange}
+        />
+      )}
+
+      <div className="space-y-3">
+        <div>
+          <h4 className="text-sm font-semibold">缓存策略</h4>
+          <p className="mt-1 text-xs leading-5 text-base-content/60">选择这个路径是无缓存，还是使用某一种缓存策略。</p>
+        </div>
+        <FieldLabel title="策略类型">
+          <Select value={effectiveCacheType} size="sm" onChange={(event) => setCacheType(event.target.value as CacheStrategyType)}>
+            <Select.Option value="no_cache">{cacheTypeLabel('no_cache')}</Select.Option>
+            <Select.Option value="current_high_cache">{cacheTypeLabel('current_high_cache')}</Select.Option>
+            <Select.Option value="kiro_rs_tool">{cacheTypeLabel('kiro_rs_tool')}</Select.Option>
+          </Select>
+        </FieldLabel>
+        <p className="text-xs leading-5 text-base-content/60">{strategyDescription(effectiveCacheType)}</p>
+      </div>
+
+      {effectiveCacheType === 'no_cache' ? (
+        <p className="rounded-lg bg-base-200/50 px-3 py-2 text-xs leading-5 text-base-content/60">
+          这个路径直接走无缓存逻辑，不进入缓存计算，也不展示缓存参数。
+        </p>
+      ) : effectiveCacheType === 'current_high_cache' ? (
+        <div className="space-y-4">
+          <h4 className="text-sm font-semibold">本路径策略参数</h4>
+          <SimulationOverrideForm
+            value={effectivePolicy.simulation ?? defaultSimulationPatch()}
+            onChange={(simulation) => patch({ simulation })}
+          />
+          <CreationControlOverrideForm
+            value={effectivePolicy.creationControl ?? defaultPromptCacheCreationControl()}
+            onChange={(creationControl) => patch({ creationControl })}
+          />
+          <ReportedUsagePathEditor
+            title={`${prefix || '/'} 最终 usage 显示`}
+            description="控制这个路径返回给客户端和后台记录的标准 usage 字段口径。"
+            value={effectivePolicy.reportedUsage ?? defaultUsagePatch(prefix)}
+            onChange={(reportedUsage) => patch({ reportedUsage })}
+          />
+        </div>
+      ) : (
+        <div className="space-y-3">
+          <h4 className="text-sm font-semibold">本路径策略参数</h4>
+          <p className="mt-1 text-xs leading-5 text-base-content/60">
+            这里只展示 Kiro-RS Tool 自己需要的参数，不读取本地模拟缓存策略的参数。
+          </p>
+          <KiroRsToolPolicyForm
+            value={effectivePolicy.kiroRsTool ?? defaultKiroRsToolPatch()}
+            onChange={(kiroRsTool) => patch({ kiroRsTool })}
           />
         </div>
       )}
-
-      <CachePatchBlock
-        title="高缓存模拟"
-        description="不设置时沿用默认策略里的高缓存模拟参数。"
-        enabled={Boolean(policy.simulation)}
-        onSet={() => setSimulation(defaultSimulationPatch())}
-        onClear={() => setSimulation(undefined)}
-      >
-        {policy.simulation && <SimulationOverrideForm value={policy.simulation} onChange={setSimulation} />}
-      </CachePatchBlock>
-
-      <CachePatchBlock
-        title="缓存创建频次"
-        description="不设置时沿用默认策略里的缓存创建频次。"
-        enabled={Boolean(policy.creationControl)}
-        onSet={() => setCreationControl(defaultPromptCacheCreationControl())}
-        onClear={() => setCreationControl(undefined)}
-      >
-        {policy.creationControl && <CreationControlOverrideForm value={policy.creationControl} onChange={setCreationControl} />}
-      </CachePatchBlock>
-
-      <CachePatchBlock
-        title="用量展示"
-        description="控制这个路径返回给客户端和后台记录的 input、output、cache read、cache write 口径。"
-        enabled={Boolean(policy.reportedUsage)}
-        onSet={() => setReportedUsage(defaultUsagePatch(prefix))}
-        onClear={() => setReportedUsage(undefined)}
-      >
-        {policy.reportedUsage && (
-          <ReportedUsagePathEditor
-            title={`${prefix || '/'} 用量展示`}
-            description="只影响这个路径前缀匹配到的请求。"
-            value={policy.reportedUsage}
-            onChange={setReportedUsage}
-          />
-        )}
-      </CachePatchBlock>
-
-      <CachePatchBlock
-        title="真实 cachePoint"
-        description="不设置时沿用默认策略里的 cachePoint 开关。"
-        enabled={Boolean(policy.cachePoint)}
-        onSet={() => setCachePoint(defaultCachePointPatch())}
-        onClear={() => setCachePoint(undefined)}
-      >
-        {policy.cachePoint && <CachePointOverrideForm value={policy.cachePoint} onChange={setCachePoint} />}
-      </CachePatchBlock>
-
-      <CachePatchBlock
-        title="缓存边界"
-        description="按路径覆盖缓存指纹条目、保留时间和估算内存上限。"
-        enabled={Boolean(policy.bounds)}
-        onSet={() => setBounds(defaultBoundsPatch())}
-        onClear={() => setBounds(undefined)}
-      >
-        {policy.bounds && <CacheBoundsOverrideForm value={policy.bounds} onChange={setBounds} />}
-      </CachePatchBlock>
     </div>
   )
 }
@@ -609,10 +780,11 @@ function CachePolicyEditor({
   const [error, setError] = useState<string | null>(null)
   const cachePolicy = value.cachePolicy
   const paths = Array.from(new Set([
-    ...Object.keys(cachePolicy.pathOverrides ?? {}),
-    ...Object.keys(value.reportedUsage.pathOverrides ?? {}),
-    ...value.definedCacheRoutes,
-  ])).sort()
+    ...BUILT_IN_CACHE_PREFIXES,
+    ...Object.keys(cachePolicy.pathOverrides ?? {}).map(canonicalCachePolicyPath),
+    ...Object.keys(value.reportedUsage.pathOverrides ?? {}).map(canonicalCachePolicyPath),
+    ...value.definedCacheRoutes.map(canonicalCachePolicyPath),
+  ])).sort(compareCachePrefix)
 
   const updateCachePolicy = (
     nextCachePolicy: CachePolicyConfig,
@@ -627,24 +799,41 @@ function CachePolicyEditor({
     })
   }
 
-  const setRuntime = <K extends keyof RuntimeConfig>(key: K) => (nextValue: RuntimeConfig[K]) => {
-    onChange({ ...value, [key]: nextValue })
+  const mergedPolicyForPath = (prefix: string): CacheRoutePolicyPatch => {
+    const normalizedPrefix = canonicalCachePolicyPath(prefix)
+    const existing = routeOverrideForPrefix(cachePolicy.pathOverrides, normalizedPrefix)
+    const legacyReportedUsage = reportedUsageForPrefix(value.reportedUsage.pathOverrides, normalizedPrefix)
+    if (normalizedPrefix === '/na') {
+      return { cacheType: 'no_cache' }
+    }
+    if (existing) {
+      if (existing.cacheType === 'no_cache' || existing.cacheType === 'kiro_rs_tool') {
+        return existing
+      }
+      return legacyReportedUsage ? { ...existing, reportedUsage: existing.reportedUsage ?? legacyReportedUsage } : existing
+    }
+    if (legacyReportedUsage) {
+      return currentHighCachePathDefaults(normalizedPrefix, legacyReportedUsage)
+    }
+    if (isBuiltInCachePrefix(normalizedPrefix)) {
+      return currentHighCachePathDefaults(normalizedPrefix)
+    }
+    const normalizedRoute = normalizeDefinedCacheRoute(normalizedPrefix)
+    if (normalizedRoute && value.definedCacheRoutes.includes(normalizedRoute)) {
+      return currentHighCachePathDefaults(normalizedPrefix)
+    }
+    return { cacheType: 'no_cache' }
   }
 
-  const mergedPolicyForPath = (prefix: string): CacheRoutePolicyPatch => ({
-    ...(cachePolicy.pathOverrides?.[prefix] ?? {}),
-    reportedUsage: cachePolicy.pathOverrides?.[prefix]?.reportedUsage ?? value.reportedUsage.pathOverrides[prefix],
-  })
-
   const setPathPolicy = (prefix: string, nextPolicy: CacheRoutePolicyPatch) => {
+    const normalizedPrefix = canonicalCachePolicyPath(prefix)
     const pathOverrides = { ...(cachePolicy.pathOverrides ?? {}) }
     const reportedPathOverrides = { ...value.reportedUsage.pathOverrides }
-    delete reportedPathOverrides[prefix]
-    if (isEmptyRoutePatch(nextPolicy)) {
-      delete pathOverrides[prefix]
-    } else {
-      pathOverrides[prefix] = nextPolicy
-    }
+    deletePrefixAliases(pathOverrides, normalizedPrefix)
+    deletePrefixAliases(reportedPathOverrides, normalizedPrefix)
+    pathOverrides[normalizedPrefix] = nextPolicy.cacheType === 'no_cache'
+      ? { cacheType: 'no_cache' }
+      : nextPolicy
     updateCachePolicy(
       { ...cachePolicy, pathOverrides },
       { ...value.reportedUsage, pathOverrides: reportedPathOverrides }
@@ -652,9 +841,9 @@ function CachePolicyEditor({
   }
 
   const addPath = () => {
-    const prefix = normalizeCachePolicyPathPrefix(newPath)
+    const prefix = normalizeDefinedCacheRoute(definedCacheRouteFromNameInput(newPath))
     if (!prefix) {
-      setError('请输入路径前缀，例如 /cc 或 /dfcache/team-a')
+      setError('请输入路径名，例如 team-a')
       return
     }
     if (paths.includes(prefix)) {
@@ -668,133 +857,119 @@ function CachePolicyEditor({
         ...cachePolicy,
         pathOverrides: {
           ...(cachePolicy.pathOverrides ?? {}),
-          [prefix]: defaultPathCachePatch(prefix),
+          [prefix]: { cacheType: 'no_cache' },
         },
       },
       value.reportedUsage,
-      normalizedDefinedRoutesWith(value.definedCacheRoutes, prefix, Boolean(normalizeDefinedCacheRoute(prefix)))
+      normalizedDefinedRoutesWith(value.definedCacheRoutes, prefix, true)
     )
   }
 
   const renamePath = (oldPrefix: string, nextPrefix: string) => {
-    if (oldPrefix === nextPrefix) return
-    if (paths.includes(nextPrefix)) {
-      setError(`${nextPrefix} 已存在`)
+    const normalizedOld = canonicalCachePolicyPath(oldPrefix)
+    const normalizedNext = canonicalCachePolicyPath(nextPrefix)
+    if (normalizedOld === normalizedNext) return
+    if (paths.includes(normalizedNext)) {
+      setError(`${normalizedNext} 已存在`)
       return
     }
     const pathOverrides = { ...(cachePolicy.pathOverrides ?? {}) }
-    const policy = mergedPolicyForPath(oldPrefix)
-    delete pathOverrides[oldPrefix]
-    if (!isEmptyRoutePatch(policy)) {
-      pathOverrides[nextPrefix] = policy
-    }
     const reportedPathOverrides = { ...value.reportedUsage.pathOverrides }
-    delete reportedPathOverrides[oldPrefix]
+    const policy = mergedPolicyForPath(normalizedOld)
+    deletePrefixAliases(pathOverrides, normalizedOld)
+    deletePrefixAliases(reportedPathOverrides, normalizedOld)
+    pathOverrides[normalizedNext] = policy.cacheType === 'no_cache' ? { cacheType: 'no_cache' } : policy
     setError(null)
     updateCachePolicy(
       { ...cachePolicy, pathOverrides },
       { ...value.reportedUsage, pathOverrides: reportedPathOverrides },
-      moveDefinedRoute(value.definedCacheRoutes, oldPrefix, nextPrefix)
+      moveDefinedRoute(value.definedCacheRoutes, normalizedOld, normalizedNext)
     )
   }
 
   const deletePath = (prefix: string) => {
+    const normalizedPrefix = canonicalCachePolicyPath(prefix)
     const pathOverrides = { ...(cachePolicy.pathOverrides ?? {}) }
-    delete pathOverrides[prefix]
     const reportedPathOverrides = { ...value.reportedUsage.pathOverrides }
-    delete reportedPathOverrides[prefix]
+    deletePrefixAliases(pathOverrides, normalizedPrefix)
+    deletePrefixAliases(reportedPathOverrides, normalizedPrefix)
     updateCachePolicy(
       { ...cachePolicy, pathOverrides },
       { ...value.reportedUsage, pathOverrides: reportedPathOverrides },
-      normalizedDefinedRoutesWith(value.definedCacheRoutes, prefix, false)
+      normalizedDefinedRoutesWith(value.definedCacheRoutes, normalizedPrefix, false)
     )
   }
 
   const setDefinedRoute = (prefix: string, enabled: boolean) => {
-    updateCachePolicy(cachePolicy, value.reportedUsage, normalizedDefinedRoutesWith(value.definedCacheRoutes, prefix, enabled))
+    const normalizedPrefix = canonicalCachePolicyPath(prefix)
+    updateCachePolicy(cachePolicy, value.reportedUsage, normalizedDefinedRoutesWith(value.definedCacheRoutes, normalizedPrefix, enabled))
   }
+
+  const setCurrentTemplate = (next: CacheRoutePolicyPatch) => {
+    updateCachePolicy({
+      ...cachePolicy,
+      currentHighCache: next,
+      default: { ...cachePolicy.default, ...next },
+    })
+  }
+
+  const setKiroTemplate = (next: CacheRoutePolicyPatch) => {
+    updateCachePolicy({ ...cachePolicy, kiroRsTool: next })
+  }
+
+  const currentTemplate = cachePolicyForStrategyTemplate(
+    { ...(cachePolicy.default ?? {}), ...(cachePolicy.currentHighCache ?? {}) },
+    'current_high_cache'
+  )
+  const kiroTemplate = cachePolicyForStrategyTemplate(cachePolicy.kiroRsTool ?? {}, 'kiro_rs_tool')
 
   return (
     <div className="space-y-5">
-      <div className="space-y-4 rounded-lg border border-base-300 bg-base-100/70 p-4">
-        <div>
-          <h3 className="text-sm font-semibold">默认缓存策略</h3>
-          <p className="mt-1 text-xs leading-5 text-base-content/60">
-            所有入口先使用这里的默认值；下方路径覆盖按最长前缀匹配后覆盖对应字段。
-          </p>
-        </div>
-        <div className="config-inline-note md:col-span-2">
-          <span className="config-note-label">高缓存模拟</span>
-        </div>
-        <div className="grid gap-3 xl:grid-cols-2">
-          <NumberField title="缓存读取目标比例" description="希望缓存读取量大约占输入量的比例，常用 0.95 到 0.99。" value={value.promptCacheTargetReadRatio} min={0} max={0.99} step={0.01} suffix="比例" onChange={setRuntime('promptCacheTargetReadRatio')} />
-          <NumberField title="输入估算放大倍数" description="用于估算缓存展示时的输入规模，不代表真实请求内容一定变大。" value={value.promptCacheTokenScale} min={1} max={3} step={0.1} suffix="倍" onChange={setRuntime('promptCacheTokenScale')} />
-          <NumberField title="输入展示上限" description="估算后的输入量最高显示到多少。填 0 表示不设上限。" value={value.promptCacheMaxSimulatedInputTokens} min={0} suffix="Token" onChange={setRuntime('promptCacheMaxSimulatedInputTokens')} />
-          <NumberField title="放大启用门槛" description="输入量达到多少后才开始放大估算。" value={value.promptCacheScaleMinInputTokens} min={0} suffix="Token" onChange={setRuntime('promptCacheScaleMinInputTokens')} />
-          <NumberField title="触顶扣减下限" description="达到上限时，至少从上限扣掉多少，避免数值总是贴边。" value={value.promptCacheCapJitterMinTokens} min={0} suffix="Token" onChange={setRuntime('promptCacheCapJitterMinTokens')} />
-          <NumberField title="触顶扣减上限" description="达到上限时，最多从上限扣掉多少。" value={value.promptCacheCapJitterMaxTokens} min={0} suffix="Token" onChange={setRuntime('promptCacheCapJitterMaxTokens')} />
-        </div>
-        <div className="border-t border-base-300" />
-        <div className="config-inline-note md:col-span-2">
-          <span className="config-note-label">缓存边界</span>
-        </div>
-        <div className="grid gap-3 xl:grid-cols-2">
-          <NumberField title="单账号缓存条目上限" description="每个账号最多保留多少个可复用缓存指纹，防止长会话无限增长。" value={value.promptCacheMaxEntriesPerAccount} min={0} suffix="条" onChange={setRuntime('promptCacheMaxEntriesPerAccount')} />
-          <NumberField title="全局缓存条目上限" description="所有账号合计最多保留多少个缓存指纹。填 0 表示不按条目数限制。" value={value.promptCacheMaxEntriesGlobal} min={0} suffix="条" onChange={setRuntime('promptCacheMaxEntriesGlobal')} />
-          <NumberField title="缓存指纹保留时间" description="单条缓存指纹最多保留多久，实际不会超过上游缓存标记的时间。" value={value.promptCacheEntryTtlSecs} min={1} suffix="秒" onChange={setRuntime('promptCacheEntryTtlSecs')} />
-          <NumberField title="缓存估算内存上限" description="达到估算上限后优先移除最久未使用的缓存指纹。填 0 表示不按内存估算限制。" value={value.promptCacheEstimatedBytesLimit} min={0} suffix="字节" onChange={setRuntime('promptCacheEstimatedBytesLimit')} />
-        </div>
-        <div className="border-t border-base-300" />
-        <div className="config-inline-note md:col-span-2">
-          <span className="config-note-label">真实 cachePoint</span>
-        </div>
-        <div className="grid gap-3 xl:grid-cols-2">
-          <ToggleField title="发送真实 cachePoint" description="把带缓存标记的工具发送给 Kiro 上游；上游不接受时会自动去掉后重试一次。" checked={value.kiroCachePointEnabled} onChange={setRuntime('kiroCachePointEnabled')} />
-          <ToggleField title="只处理工具缓存标记" description="只根据工具上的缓存标记插入 cachePoint，不改写系统消息或历史消息。" checked={value.kiroCachePointToolsOnly} disabled={!value.kiroCachePointEnabled} onChange={setRuntime('kiroCachePointToolsOnly')} />
-          <ToggleField title="记录 cachePoint 计划" description="在系统日志中记录插入数量，方便排查上游请求体错误。" checked={value.kiroCachePointRecordPlan} disabled={!value.kiroCachePointEnabled} onChange={setRuntime('kiroCachePointRecordPlan')} />
-        </div>
-        <div className="border-t border-base-300" />
-        <div className="config-inline-note md:col-span-2">
-          <span className="config-note-label">缓存创建频次</span>
-        </div>
-        <div className="grid gap-3 xl:grid-cols-2">
-          <ToggleField title="启用缓存创建频次控制" description="开启后，只影响缓存创建数值的展示频率。" checked={value.promptCacheCreationControl.enabled} onChange={(enabled) => onChange({ ...value, promptCacheCreationControl: { ...value.promptCacheCreationControl, enabled } })} />
-          <FieldLabel title="控制维度" description="选择按账号分别控制，还是按同一个会话和模型统一控制。">
-            <Select bordered size="sm" className="w-full" value={value.promptCacheCreationControl.scopeMode} disabled={!value.promptCacheCreationControl.enabled} onChange={(event) => onChange({ ...value, promptCacheCreationControl: { ...value.promptCacheCreationControl, scopeMode: event.target.value as 'credential_conversation_model' | 'conversation_model' } })}>
-              <Select.Option value="credential_conversation_model">账号 + 会话 + 模型</Select.Option>
-              <Select.Option value="conversation_model">会话 + 模型</Select.Option>
-            </Select>
-          </FieldLabel>
-          <NumberField title="最小成功请求间隔" description="两次缓存创建展示之间至少间隔多少次成功请求。填 0 表示不限制。" value={value.promptCacheCreationControl.minSuccessfulRequestsBetweenCreation} disabled={!value.promptCacheCreationControl.enabled} min={0} suffix="次" onChange={(minSuccessfulRequestsBetweenCreation) => onChange({ ...value, promptCacheCreationControl: { ...value.promptCacheCreationControl, minSuccessfulRequestsBetweenCreation } })} />
-          <NumberField title="最小时间间隔" description="两次缓存创建展示之间至少间隔多少秒。填 0 表示不限制。" value={value.promptCacheCreationControl.minCreationIntervalSecs} disabled={!value.promptCacheCreationControl.enabled} min={0} suffix="秒" onChange={(minCreationIntervalSecs) => onChange({ ...value, promptCacheCreationControl: { ...value.promptCacheCreationControl, minCreationIntervalSecs } })} />
-          <NumberField title="最小累计增量" description="累计变化达到多少后，才允许下一次展示缓存创建数值。" value={value.promptCacheCreationControl.minCreationDeltaTokens} disabled={!value.promptCacheCreationControl.enabled} min={0} suffix="Token" onChange={(minCreationDeltaTokens) => onChange({ ...value, promptCacheCreationControl: { ...value.promptCacheCreationControl, minCreationDeltaTokens } })} />
-          <NumberField title="单次展示上限" description="一次响应最多展示多少缓存创建量。填 0 表示不限制。" value={value.promptCacheCreationControl.maxCreationTokensPerEvent} disabled={!value.promptCacheCreationControl.enabled} min={0} suffix="Token" onChange={(maxCreationTokensPerEvent) => onChange({ ...value, promptCacheCreationControl: { ...value.promptCacheCreationControl, maxCreationTokensPerEvent } })} />
-          <NumberField title="额度窗口长度" description="在这个时间窗口内统计缓存创建展示额度。填 0 表示关闭窗口限制。" value={value.promptCacheCreationControl.creationBudgetWindowSecs} disabled={!value.promptCacheCreationControl.enabled} min={0} suffix="秒" onChange={(creationBudgetWindowSecs) => onChange({ ...value, promptCacheCreationControl: { ...value.promptCacheCreationControl, creationBudgetWindowSecs } })} />
-          <NumberField title="窗口展示额度" description="单个时间窗口内最多展示多少缓存创建量。填 0 表示不限制。" value={value.promptCacheCreationControl.maxCreationTokensPerWindow} disabled={!value.promptCacheCreationControl.enabled} min={0} suffix="Token" onChange={(maxCreationTokensPerWindow) => onChange({ ...value, promptCacheCreationControl: { ...value.promptCacheCreationControl, maxCreationTokensPerWindow } })} />
-          <NumberField title="空闲后清理状态" description="长时间没有请求后清理控制状态。填 0 表示不按空闲时间清理。" value={value.promptCacheCreationControl.expireAfterIdleSecs} disabled={!value.promptCacheCreationControl.enabled} min={0} suffix="秒" onChange={(expireAfterIdleSecs) => onChange({ ...value, promptCacheCreationControl: { ...value.promptCacheCreationControl, expireAfterIdleSecs } })} />
-        </div>
-        <div className="border-t border-base-300" />
-        <ReportedUsagePathEditor
-          title="默认用量展示"
-          description="没有匹配到单独路径策略时，使用这里的默认设置。"
-          value={value.reportedUsage.default}
-          onChange={(defaultPolicy) => onChange({ ...value, reportedUsage: { ...value.reportedUsage, default: defaultPolicy } })}
+      <div className="grid gap-4 xl:grid-cols-2">
+        <StrategyTemplateBlock
+          title="本地模拟缓存策略默认参数"
+          description="使用本策略的路径会先读取这里的参数，再合并路径自己的参数。"
+          cacheType="current_high_cache"
+          policy={currentTemplate}
+          onChange={setCurrentTemplate}
+        />
+        <StrategyTemplateBlock
+          title="Kiro-RS Tool 缓存策略默认参数"
+          description="使用本策略的路径只读取这里属于 Kiro-RS Tool 的参数，不读取本地模拟策略参数。"
+          cacheType="kiro_rs_tool"
+          policy={kiroTemplate}
+          onChange={setKiroTemplate}
         />
       </div>
 
       <div className="space-y-3 rounded-lg border border-base-300 bg-base-100/70 p-4">
+        <div>
+          <h3 className="text-sm font-semibold">路径绑定</h3>
+          <p className="mt-1 text-xs leading-5 text-base-content/60">
+            每个路径都显式选择无缓存、本地模拟缓存策略或 Kiro-RS Tool 缓存策略。
+          </p>
+        </div>
         <div className="flex flex-col gap-3 lg:flex-row lg:items-end">
-          <FieldLabel title="新增路径策略">
-            <Input
-              bordered
-              size="sm"
-              placeholder="/cc、/ha 或 /dfcache/team-a"
-              value={newPath}
-              onChange={(event) => setNewPath(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') addPath()
-              }}
-            />
+          <FieldLabel title="新增自定义缓存入口">
+            <div className="join w-full">
+              <span className="join-item flex items-center border border-base-300 bg-base-200/60 px-3 font-mono text-sm text-base-content/60">
+                {DFCACHE_ROUTE_PREFIX}
+              </span>
+              <Input
+                bordered
+                size="sm"
+                className="join-item flex-1"
+                placeholder="team-a"
+                value={newPath}
+                onChange={(event) => setNewPath(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') addPath()
+                }}
+              />
+            </div>
+            <div className="mt-2 text-xs leading-5 text-base-content/60">
+              这里只填后缀，例如 team-a，最终路径是 /dfcache/team-a。
+            </div>
           </FieldLabel>
           <Button type="button" color="primary" size="sm" onClick={addPath}>
             <Plus className="h-4 w-4" />
@@ -803,26 +978,22 @@ function CachePolicyEditor({
         </div>
       </div>
       {error && <div className="text-xs text-error">{error}</div>}
-      {paths.length === 0 ? (
-        <div className="rounded-lg border border-dashed border-base-300 p-6 text-sm text-base-content/60">
-          暂无路径覆盖。当前所有入口都会使用默认缓存策略。
-        </div>
-      ) : (
-        <div className="space-y-4">
-          {paths.map((prefix) => (
-            <PathCachePolicyCard
-              key={prefix}
-              prefix={prefix}
-              policy={mergedPolicyForPath(prefix)}
-              definedRoutes={value.definedCacheRoutes}
-              onPrefixChange={(nextPrefix) => renamePath(prefix, nextPrefix)}
-              onDelete={() => deletePath(prefix)}
-              onChange={(nextPolicy) => setPathPolicy(prefix, nextPolicy)}
-              onDefinedRouteChange={(enabled) => setDefinedRoute(prefix, enabled)}
-            />
-          ))}
-        </div>
-      )}
+      <div className="space-y-4">
+        {paths.map((prefix) => (
+          <PathCachePolicyCard
+            key={prefix}
+            prefix={prefix}
+            policy={mergedPolicyForPath(prefix)}
+            cachePolicy={cachePolicy}
+            definedRoutes={value.definedCacheRoutes}
+            builtIn={isBuiltInCachePrefix(prefix)}
+            onPrefixChange={(nextPrefix) => renamePath(prefix, nextPrefix)}
+            onDelete={() => deletePath(prefix)}
+            onChange={(nextPolicy) => setPathPolicy(prefix, nextPolicy)}
+            onDefinedRouteChange={(enabled) => setDefinedRoute(prefix, enabled)}
+          />
+        ))}
+      </div>
     </div>
   )
 }
@@ -1822,7 +1993,7 @@ export function ConfigPanel() {
         )}
 
         {activeTab === 'cachePolicy' && (
-          <ConfigGroup icon={<Zap className="h-4 w-4" />} title="缓存策略" description="默认缓存策略和路径覆盖在这里统一维护。">
+          <ConfigGroup icon={<Zap className="h-4 w-4" />} title="缓存策略" description="默认缓存设置和路径覆盖在这里统一维护。">
             <CachePolicyEditor
               value={draft}
               onChange={setDraft}
