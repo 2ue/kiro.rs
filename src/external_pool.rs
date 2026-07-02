@@ -4391,8 +4391,8 @@ fn build_external_usage_projection_context(
         }
         _ => (None, None, None),
     };
-    let reported_policy = if route.prompt_cache_strategy_type
-        == PromptCacheStrategyType::CurrentHighCache
+    let reported_policy = if prompt_cache_supported
+        && route.prompt_cache_strategy_type == PromptCacheStrategyType::CurrentHighCache
         && route.prompt_cache_simulation_mode == PromptCacheSimulationMode::HighCache
     {
         ReportedCacheUsagePolicy::from_path_policy(
@@ -6105,7 +6105,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
                 .get("cache_read_input_tokens")
                 .and_then(|value| value.as_i64())
                 .unwrap_or_default()
-                == 0
+                > 0
         );
         assert!(
             usage
@@ -6289,7 +6289,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
         let reported = projected.usage_capture.reported.expect("reported usage");
 
         assert!((1..=96).contains(&reported.input_tokens));
-        assert_eq!(reported.cache_read_input_tokens, 0);
+        assert!(reported.cache_read_input_tokens > 0);
         assert!(reported.cache_creation_input_tokens > 0);
         assert_eq!(
             reported.total_input_tokens,
@@ -6738,7 +6738,7 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
 
         assert_eq!(raw.input_tokens, 100000);
         assert!(reported.input_tokens <= 96);
-        assert_eq!(reported.cache_read_input_tokens, 0);
+        assert!(reported.cache_read_input_tokens > 0);
         assert!(reported.cache_creation_input_tokens > 0);
     }
 

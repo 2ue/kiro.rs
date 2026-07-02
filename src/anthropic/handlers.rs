@@ -1829,29 +1829,43 @@ impl RequestUsageContext {
         usage: super::cache::CacheUsage,
         usage_source: UsageSource,
     ) -> super::cache::CacheUsage {
-        if usage_source != UsageSource::LocalPromptCache || !self.uses_local_prompt_cache_strategy()
-        {
+        self.reported_usage_for_downstream_with_raw(
+            usage,
+            usage_source,
+            super::cache::RawUsage::uncached(self.input_tokens, usage.output_tokens),
+        )
+    }
+
+    fn reported_usage_for_downstream_with_raw(
+        &self,
+        usage: super::cache::CacheUsage,
+        usage_source: UsageSource,
+        raw: super::cache::RawUsage,
+    ) -> super::cache::CacheUsage {
+        if !self.uses_local_prompt_cache_strategy() {
             return usage;
         }
 
-        self.reported_cache_usage_policy
-            .clone()
-            .map(|policy| {
-                usage.with_reported_cache_usage_policy_and_raw(
-                    policy,
-                    super::cache::RawUsage::uncached(self.input_tokens, usage.output_tokens),
-                )
-            })
-            .unwrap_or(usage)
+        let Some(policy) = self.reported_cache_usage_policy.clone() else {
+            return usage;
+        };
+        let mut reported = if usage_source == UsageSource::LocalPromptCache
+            || super::cache::usage_has_cache(&usage)
+        {
+            usage.with_reported_cache_usage_policy_and_raw(policy.clone(), raw)
+        } else {
+            raw.to_cache_usage()
+        };
+        reported = policy.apply_final_input_guard(reported);
+        policy.apply_final_cache_read_guard(reported)
     }
 
     fn ensure_reported_usage_for_record(
         &self,
         usage: super::cache::CacheUsage,
-        usage_source: UsageSource,
+        _usage_source: UsageSource,
     ) -> super::cache::CacheUsage {
-        if usage_source != UsageSource::LocalPromptCache || !self.uses_local_prompt_cache_strategy()
-        {
+        if !self.uses_local_prompt_cache_strategy() {
             return usage;
         }
 
@@ -2030,6 +2044,17 @@ fn raw_usage_from_metadata_or_estimate(
             cache_creation_5m_input_tokens: 0,
             cache_creation_1h_input_tokens: 0,
         })
+}
+
+fn raw_usage_to_reported_raw(usage: super::cache::CacheUsage) -> super::cache::RawUsage {
+    super::cache::RawUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        cache_read_input_tokens: usage.cache_read_input_tokens,
+        cache_creation_5m_input_tokens: usage.cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens: usage.cache_creation_1h_input_tokens,
+    }
 }
 
 fn thinking_tokens_from_content(content: &[Value], output_tokens: i32) -> Option<i32> {
@@ -2224,12 +2249,38 @@ impl CredentialUsageContext {
         self.apply_creation_frequency_control(reported_usage, usage_source)
     }
 
+    fn final_reported_usage_for_success_with_raw(
+        &self,
+        usage: super::cache::CacheUsage,
+        usage_source: UsageSource,
+        raw_usage: super::cache::CacheUsage,
+    ) -> super::cache::CacheUsage {
+        let reported_usage = self.request.reported_usage_for_downstream_with_raw(
+            usage,
+            usage_source,
+            raw_usage_to_reported_raw(raw_usage),
+        );
+        self.apply_creation_frequency_control(reported_usage, usage_source)
+    }
+
     fn canonical_reported_usage_for_success(
         &self,
         usage: super::cache::CacheUsage,
         usage_source: UsageSource,
     ) -> super::cache::CacheUsage {
         let reported_usage = self.final_reported_usage_for_success(usage, usage_source);
+        self.request
+            .ensure_reported_usage_for_record(reported_usage, usage_source)
+    }
+
+    fn canonical_reported_usage_for_success_with_raw(
+        &self,
+        usage: super::cache::CacheUsage,
+        usage_source: UsageSource,
+        raw_usage: super::cache::CacheUsage,
+    ) -> super::cache::CacheUsage {
+        let reported_usage =
+            self.final_reported_usage_for_success_with_raw(usage, usage_source, raw_usage);
         self.request
             .ensure_reported_usage_for_record(reported_usage, usage_source)
     }
@@ -2317,7 +2368,12 @@ impl CredentialUsageContext {
         context_estimated: bool,
     ) -> super::cache::CacheUsage {
         let usage_source = self.usage_source(&final_usage, metadata_usage, context_estimated);
-        self.canonical_reported_usage_for_success(final_usage, usage_source)
+        let raw_usage = raw_usage_from_metadata_or_estimate(
+            metadata_usage,
+            final_usage.input_tokens,
+            final_usage.output_tokens,
+        );
+        self.canonical_reported_usage_for_success_with_raw(final_usage, usage_source, raw_usage)
     }
 
     fn record_stream_failure_from_context(
@@ -2577,6 +2633,15 @@ impl CredentialUsageContext {
         let duration_ms = self.request.started_at.elapsed().as_millis() as u64;
         let latency_trace = self.request.latency_trace();
         self.log_slow_interaction_diagnostic(status, duration_ms, latency_trace.as_ref());
+        let raw_usage_snapshot = raw_usage.map(usage_snapshot);
+        let diagnostic_total_input_tokens = if status == UsageRecordStatus::Success {
+            raw_usage_snapshot
+                .as_ref()
+                .map(|usage| usage.total_input_tokens)
+                .unwrap_or(self.request.input_tokens)
+        } else {
+            self.request.input_tokens
+        };
         let error_source = match status {
             UsageRecordStatus::Success => None,
             UsageRecordStatus::ClientDropped => Some("downstream_client".to_string()),
@@ -2610,8 +2675,8 @@ impl CredentialUsageContext {
             credential_label: self.credential_label.clone(),
             status,
             usage_source,
-            raw_usage: raw_usage.map(usage_snapshot),
-            total_input_tokens: self.request.input_tokens,
+            raw_usage: raw_usage_snapshot,
+            total_input_tokens: diagnostic_total_input_tokens,
             compat_input_tokens: usage.input_tokens,
             billable_input_tokens: usage.billable_input_tokens(),
             output_tokens: usage.output_tokens,
@@ -6531,13 +6596,17 @@ async fn handle_non_stream_request(
     );
     let has_metadata = metadata_usage.is_some();
     let context_estimated = !has_metadata && context_input_tokens.is_some();
-    let usage_source =
-        credential_usage.usage_source(&usage, metadata_usage.as_ref(), context_estimated);
-    let reported_usage = credential_usage.canonical_reported_usage_for_success(usage, usage_source);
     let raw_usage = raw_usage_from_metadata_or_estimate(
         metadata_usage.as_ref(),
         final_input_tokens,
         output_tokens,
+    );
+    let usage_source =
+        credential_usage.usage_source(&usage, metadata_usage.as_ref(), context_estimated);
+    let reported_usage = credential_usage.canonical_reported_usage_for_success_with_raw(
+        usage,
+        usage_source,
+        raw_usage,
     );
     credential_usage.record_success_reported(reported_usage, usage_source, Some(raw_usage));
     completion.report_success();
@@ -7941,7 +8010,10 @@ Return a fix plan."#
             .expect("policy should apply"),
         );
         assert!((1..=96).contains(&reported.input_tokens));
-        assert_eq!(reported.cache_read_input_tokens, 0);
+        assert_eq!(
+            reported.cache_read_input_tokens,
+            usage.input_tokens.saturating_sub(reported.input_tokens)
+        );
         assert!(reported.cache_creation_input_tokens > 0);
         assert_eq!(reported.output_tokens, 1);
 
@@ -7956,12 +8028,15 @@ Return a fix plan."#
             cache::RawUsage::uncached(100_000, 1),
         );
         assert!((1..=96).contains(&raw_reported.input_tokens));
-        assert_eq!(raw_reported.cache_read_input_tokens, 0);
+        assert_eq!(
+            raw_reported.cache_read_input_tokens,
+            100_000_i32.saturating_sub(raw_reported.input_tokens)
+        );
         assert!(raw_reported.cache_creation_input_tokens > 0);
     }
 
     #[test]
-    fn reported_usage_rewrite_only_changes_local_prompt_cache_downstream_usage() {
+    fn reported_usage_rewrite_shapes_high_cache_downstream_usage() {
         let reported_usage_config = ReportedUsageConfig::default();
         let v1_policy = reported_cache_usage_policy_for_path(
             "/v1/messages",
@@ -8082,7 +8157,102 @@ Return a fix plan."#
 
         let upstream_metadata =
             usage_context.reported_usage_for_downstream(usage, UsageSource::UpstreamMetadata);
-        assert_eq!(upstream_metadata.cache_creation_input_tokens, 50_000);
+        assert!((0..=3_300).contains(&upstream_metadata.cache_creation_input_tokens));
+        assert!((1..=96).contains(&upstream_metadata.input_tokens));
+        assert_eq!(
+            upstream_metadata.cache_read_input_tokens,
+            usage.cache_read_input_tokens.saturating_add(
+                usage_context
+                    .input_tokens
+                    .saturating_sub(upstream_metadata.input_tokens)
+            )
+        );
+        assert!(upstream_metadata.cache_read_input_tokens > usage.cache_read_input_tokens);
+    }
+
+    #[test]
+    fn upstream_metadata_raw_usage_is_shaped_by_high_cache_reported_usage() {
+        let usage_context = RequestUsageContext {
+            recorder: Arc::new(UsageRecorder::new(10)),
+            tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
+            prompt_cache: Arc::new(PromptCacheTracker::default()),
+            prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+            pricing_catalog: Arc::new(PricingCatalog::new()),
+            request_id: "req_upstream_raw_reported_limit".to_string(),
+            error_id: "req_01upstream_raw_reported_limit".to_string(),
+            endpoint: "/ha/v1/messages".to_string(),
+            stream: false,
+            model: "claude-haiku-4-5".to_string(),
+            upstream_model: None,
+            model_resolution_source: None,
+            model_resolution_note: None,
+            requested_max_tokens: 0,
+            downstream_stop_reason: Arc::new(Mutex::new(None)),
+            conversation_id: Some("session-upstream-raw-limit".to_string()),
+            prompt_cache_scope_conversation_id: Some("session-upstream-raw-limit".to_string()),
+            input_tokens: 1_234,
+            context_window_tokens: 200_000,
+            prompt_cache_profile: None,
+            kiro_rs_tool_prompt_cache_plan: None,
+            prompt_cache_route_namespace: None,
+            prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
+            simulation_mode: PromptCacheSimulationMode::HighCache,
+            prompt_cache_target_read_ratio: 0.95,
+            prompt_cache_token_scale: 1.0,
+            prompt_cache_max_simulated_input_tokens: 0,
+            prompt_cache_cap_jitter_min_tokens: 0,
+            prompt_cache_cap_jitter_max_tokens: 0,
+            prompt_cache_scale_min_input_tokens: 0,
+            prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+            prompt_cache_bounds: PromptCacheBounds::default(),
+            reported_cache_usage_policy: reported_cache_usage_policy(
+                PromptCacheStrategyType::CurrentHighCache,
+                PromptCacheSimulationMode::HighCache,
+                &ReportedUsagePathPolicy {
+                    input: ReportedUsageFieldPolicy::sample_input_max(500),
+                    ..ReportedUsagePathPolicy::default()
+                },
+                11,
+            ),
+            simulated_usage: None,
+            simulated_source: None,
+            payload_breakdown: None,
+            payload_guard_report: None,
+            route_subtype_override: None,
+            fallback_reason: None,
+            local_preflight: None,
+            external_attempts: Vec::new(),
+            started_at: Instant::now(),
+            first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            latency: RequestLatencyTraceState::new(),
+        };
+        let raw_usage = CacheUsage {
+            total_input_tokens: 1_234,
+            input_tokens: 1_234,
+            output_tokens: 7,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+
+        let reported =
+            usage_context.reported_usage_for_downstream(raw_usage, UsageSource::UpstreamMetadata);
+
+        assert!((1..=500).contains(&reported.input_tokens));
+        assert_eq!(
+            reported.cache_read_input_tokens,
+            raw_usage.input_tokens.saturating_sub(reported.input_tokens)
+        );
+        assert_eq!(reported.cache_creation_input_tokens, 0);
+        assert_eq!(reported.output_tokens, 7);
+        assert_eq!(
+            reported.total_input_tokens,
+            reported
+                .input_tokens
+                .saturating_add(reported.cache_read_input_tokens)
+                .saturating_add(reported.cache_creation_input_tokens)
+        );
     }
 
     #[test]
@@ -8169,9 +8339,11 @@ Return a fix plan."#
         assert_eq!(reported.cache_creation_input_tokens, 0);
         assert_eq!(
             reported.cache_read_input_tokens,
-            prod_like_usage
-                .cache_read_input_tokens
-                .saturating_add(request_input_tokens.saturating_sub(reported.input_tokens))
+            prod_like_usage.cache_read_input_tokens.saturating_add(
+                prod_like_usage
+                    .input_tokens
+                    .saturating_sub(reported.input_tokens)
+            )
         );
         let raw_usage = raw_usage_from_metadata_or_estimate(
             None,
@@ -8203,6 +8375,80 @@ Return a fix plan."#
         assert_eq!(raw_usage.output_tokens, prod_like_usage.output_tokens);
         assert_eq!(raw_usage.cache_creation_input_tokens, 0);
         assert_eq!(raw_usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn success_usage_record_uses_raw_usage_for_actual_input_diagnostic() {
+        let usage_recorder = Arc::new(UsageRecorder::new(10));
+        let usage_context = RequestUsageContext {
+            recorder: usage_recorder.clone(),
+            tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
+            prompt_cache: Arc::new(PromptCacheTracker::default()),
+            prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+            pricing_catalog: Arc::new(PricingCatalog::new()),
+            request_id: "req_context_actual_input".to_string(),
+            error_id: "req_01context_actual_input".to_string(),
+            endpoint: "/cc/v1/messages".to_string(),
+            stream: false,
+            model: "claude-sonnet-4-6".to_string(),
+            upstream_model: None,
+            model_resolution_source: None,
+            model_resolution_note: None,
+            requested_max_tokens: 0,
+            downstream_stop_reason: Arc::new(Mutex::new(None)),
+            conversation_id: Some("context-estimate-session".to_string()),
+            prompt_cache_scope_conversation_id: None,
+            input_tokens: 141,
+            context_window_tokens: 200_000,
+            prompt_cache_profile: None,
+            kiro_rs_tool_prompt_cache_plan: None,
+            prompt_cache_route_namespace: None,
+            prompt_cache_strategy_type: PromptCacheStrategyType::NoCache,
+            simulation_mode: PromptCacheSimulationMode::Disabled,
+            prompt_cache_target_read_ratio: 0.95,
+            prompt_cache_token_scale: 1.0,
+            prompt_cache_max_simulated_input_tokens: 0,
+            prompt_cache_cap_jitter_min_tokens: 0,
+            prompt_cache_cap_jitter_max_tokens: 0,
+            prompt_cache_scale_min_input_tokens: 0,
+            prompt_cache_creation_control: PromptCacheCreationControlConfig::default(),
+            prompt_cache_bounds: PromptCacheBounds::default(),
+            reported_cache_usage_policy: None,
+            simulated_usage: None,
+            simulated_source: None,
+            payload_breakdown: None,
+            payload_guard_report: None,
+            route_subtype_override: None,
+            fallback_reason: None,
+            local_preflight: None,
+            external_attempts: Vec::new(),
+            started_at: Instant::now(),
+            first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            latency: RequestLatencyTraceState::new(),
+        };
+        let credential_usage =
+            usage_context.attach_credential(Some(9), None, false, false, Vec::new());
+        let usage = CacheUsage {
+            total_input_tokens: 4_275,
+            input_tokens: 4_275,
+            output_tokens: 1,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+
+        credential_usage.record_success_reported(usage, UsageSource::ContextEstimate, Some(usage));
+
+        let records = usage_recorder.query(UsageRecordQuery::default());
+        assert_eq!(records.total, 1);
+        let record = records.records.first().expect("usage record should exist");
+        assert_eq!(record.total_input_tokens, 4_275);
+        assert_eq!(record.compat_input_tokens, 4_275);
+        assert_eq!(record.cache_creation_input_tokens, 0);
+        assert_eq!(record.cache_read_input_tokens, 0);
+        let raw_usage = record.raw_usage.expect("raw usage should be retained");
+        assert_eq!(raw_usage.total_input_tokens, 4_275);
     }
 
     #[test]
@@ -8683,6 +8929,93 @@ Return a fix plan."#
         let na_reported =
             na_context.reported_usage_for_downstream(usage, UsageSource::LocalPromptCache);
         assert_eq!(na_reported, usage);
+    }
+
+    #[test]
+    fn creation_control_preserves_reported_usage_input_policy() {
+        let usage_recorder = Arc::new(UsageRecorder::new(10));
+        let usage_context = RequestUsageContext {
+            recorder: usage_recorder,
+            tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
+            prompt_cache: Arc::new(PromptCacheTracker::default()),
+            prompt_cache_creation_controller: Arc::new(PromptCacheCreationController::default()),
+            pricing_catalog: Arc::new(PricingCatalog::new()),
+            request_id: "req_creation_reported_policy".to_string(),
+            error_id: "req_01creation_reported_policy".to_string(),
+            endpoint: "/ha/v1/messages".to_string(),
+            stream: true,
+            model: "claude-sonnet-4-6".to_string(),
+            upstream_model: None,
+            model_resolution_source: None,
+            model_resolution_note: None,
+            requested_max_tokens: 0,
+            downstream_stop_reason: Arc::new(Mutex::new(None)),
+            conversation_id: Some("session-creation-policy".to_string()),
+            prompt_cache_scope_conversation_id: Some("session-creation-policy".to_string()),
+            input_tokens: 100_000,
+            context_window_tokens: 200_000,
+            prompt_cache_profile: None,
+            kiro_rs_tool_prompt_cache_plan: None,
+            prompt_cache_route_namespace: None,
+            prompt_cache_strategy_type: PromptCacheStrategyType::CurrentHighCache,
+            simulation_mode: PromptCacheSimulationMode::HighCache,
+            prompt_cache_target_read_ratio: 0.95,
+            prompt_cache_token_scale: 1.0,
+            prompt_cache_max_simulated_input_tokens: 0,
+            prompt_cache_cap_jitter_min_tokens: 0,
+            prompt_cache_cap_jitter_max_tokens: 0,
+            prompt_cache_scale_min_input_tokens: 0,
+            prompt_cache_creation_control: PromptCacheCreationControlConfig {
+                max_creation_tokens_per_event: 30_000,
+                ..PromptCacheCreationControlConfig::default()
+            },
+            prompt_cache_bounds: PromptCacheBounds::default(),
+            reported_cache_usage_policy: reported_cache_usage_policy(
+                PromptCacheStrategyType::CurrentHighCache,
+                PromptCacheSimulationMode::HighCache,
+                &ReportedUsagePathPolicy {
+                    input: ReportedUsageFieldPolicy::sample_input_max(96),
+                    ..ReportedUsagePathPolicy::default()
+                },
+                7,
+            ),
+            simulated_usage: None,
+            simulated_source: Some(UsageSource::LocalPromptCache),
+            payload_breakdown: None,
+            payload_guard_report: None,
+            route_subtype_override: None,
+            fallback_reason: None,
+            local_preflight: None,
+            external_attempts: Vec::new(),
+            started_at: Instant::now(),
+            first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            latency: RequestLatencyTraceState::new(),
+        };
+        let credential_usage =
+            usage_context.attach_credential(Some(1), None, false, false, Vec::new());
+        let usage = CacheUsage {
+            total_input_tokens: 150_000,
+            input_tokens: 100_000,
+            output_tokens: 9,
+            cache_creation_input_tokens: 50_000,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 50_000,
+            cache_creation_1h_input_tokens: 0,
+        };
+
+        let reported = credential_usage
+            .canonical_reported_usage_for_success(usage, UsageSource::LocalPromptCache);
+
+        assert!((1..=96).contains(&reported.input_tokens));
+        assert_eq!(reported.cache_creation_input_tokens, 30_000);
+        assert!(reported.cache_read_input_tokens > 0);
+        assert_eq!(
+            reported.total_input_tokens,
+            reported
+                .input_tokens
+                .saturating_add(reported.cache_read_input_tokens)
+                .saturating_add(reported.cache_creation_input_tokens)
+        );
     }
 
     #[test]

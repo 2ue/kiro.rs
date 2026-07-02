@@ -1483,25 +1483,17 @@ impl StreamContext {
         &self,
         usage: super::cache::CacheUsage,
     ) -> super::cache::CacheUsage {
-        if !self.local_prompt_cache_projection_enabled
-            || self.simulated_usage.is_none()
-            || self
-                .metadata_usage
-                .as_ref()
-                .is_some_and(|usage| !super::cache::metadata_cache_is_empty(usage))
-        {
+        if !self.local_prompt_cache_projection_enabled {
             return usage;
         }
 
-        self.reported_cache_usage_policy
-            .clone()
-            .map(|policy| {
-                usage.with_reported_cache_usage_policy_and_raw(
-                    policy,
-                    super::cache::RawUsage::uncached(self.input_tokens, usage.output_tokens),
-                )
-            })
-            .unwrap_or(usage)
+        let Some(policy) = self.reported_cache_usage_policy.clone() else {
+            return usage;
+        };
+        let raw = super::cache::RawUsage::uncached(self.input_tokens, usage.output_tokens);
+        let mut reported = usage.with_reported_cache_usage_policy_and_raw(policy.clone(), raw);
+        reported = policy.apply_final_input_guard(reported);
+        policy.apply_final_cache_read_guard(reported)
     }
 
     fn initial_usage_for_downstream(&self) -> super::cache::CacheUsage {

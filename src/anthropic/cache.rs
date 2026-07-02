@@ -82,10 +82,6 @@ impl CacheUsage {
         raw: RawUsage,
     ) -> Self {
         let raw = raw.normalized();
-        if !self.has_prompt_cache() {
-            return self;
-        }
-
         if !policy.reports_local_prompt_cache() {
             return Self::from_raw_usage(raw);
         }
@@ -136,10 +132,7 @@ impl CacheUsage {
             if let Some(reported_input) = policy.sample_input(usage, current_input) {
                 let input_delta = current_input.saturating_sub(reported_input);
                 usage.input_tokens = reported_input;
-                if input_delta > 0
-                    && policy.input_moves_delta_to_cache_read()
-                    && usage.cache_read_input_tokens > 0
-                {
+                if input_delta > 0 && policy.input_moves_delta_to_cache_read() {
                     usage.cache_read_input_tokens = usage
                         .cache_read_input_tokens
                         .max(0)
@@ -188,10 +181,6 @@ impl CacheUsage {
             cache_creation_5m_input_tokens,
             cache_creation_1h_input_tokens,
         ))
-    }
-
-    fn has_prompt_cache(self) -> bool {
-        self.cache_creation_input_tokens > 0 || self.cache_read_input_tokens > 0
     }
 
     #[cfg(test)]
@@ -251,6 +240,10 @@ impl RawUsage {
             cache_creation_5m_input_tokens: 0,
             cache_creation_1h_input_tokens: 0,
         }
+    }
+
+    pub fn to_cache_usage(self) -> CacheUsage {
+        CacheUsage::from_raw_usage(self.normalized())
     }
 
     fn normalized(self) -> Self {
@@ -364,7 +357,7 @@ impl ReportedCacheUsagePolicy {
     }
 
     pub fn should_rewrite_local_prompt_cache_usage(&self, usage: CacheUsage) -> bool {
-        if !self.reports_local_prompt_cache() || !usage.has_prompt_cache() {
+        if !self.reports_local_prompt_cache() {
             return false;
         }
 
@@ -514,7 +507,7 @@ impl ReportedCacheUsagePolicy {
     }
 
     pub fn apply_final_input_guard(&self, mut usage: CacheUsage) -> CacheUsage {
-        if !self.reports_local_prompt_cache() || !usage.has_prompt_cache() {
+        if !self.reports_local_prompt_cache() {
             return usage;
         }
 
@@ -531,10 +524,7 @@ impl ReportedCacheUsagePolicy {
         };
         let input_delta = current_input.saturating_sub(reported_input);
         usage.input_tokens = reported_input;
-        if input_delta > 0
-            && self.input_moves_delta_to_cache_read()
-            && usage.cache_read_input_tokens > 0
-        {
+        if input_delta > 0 && self.input_moves_delta_to_cache_read() {
             usage.cache_read_input_tokens = usage
                 .cache_read_input_tokens
                 .max(0)
@@ -1630,6 +1620,75 @@ mod tests {
     }
 
     #[test]
+    fn reported_usage_policy_moves_input_delta_to_cache_read_without_existing_read() {
+        let usage = CacheUsage {
+            total_input_tokens: 150_000,
+            input_tokens: 100_000,
+            output_tokens: 9,
+            cache_creation_input_tokens: 50_000,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 50_000,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let raw = RawUsage::uncached(100_000, 9);
+        let policy = ReportedCacheUsagePolicy::from_path_policy(
+            ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy::sample_input_max(96),
+                ..ReportedUsagePathPolicy::default()
+            },
+            29,
+        )
+        .unwrap();
+
+        let reported = usage.with_reported_cache_usage_policy_and_raw(policy, raw);
+
+        assert!((1..=96).contains(&reported.input_tokens));
+        assert_eq!(
+            reported.cache_read_input_tokens,
+            raw.input_tokens.saturating_sub(reported.input_tokens)
+        );
+        assert_eq!(reported.cache_creation_input_tokens, 50_000);
+        assert_eq!(
+            reported.total_input_tokens,
+            reported.reported_total_input_tokens()
+        );
+    }
+
+    #[test]
+    fn final_input_guard_shapes_uncached_raw_usage() {
+        let usage = CacheUsage {
+            total_input_tokens: 1_234,
+            input_tokens: 1_234,
+            output_tokens: 9,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let policy = ReportedCacheUsagePolicy::from_path_policy(
+            ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy::sample_input_max(96),
+                ..ReportedUsagePathPolicy::default()
+            },
+            29,
+        )
+        .unwrap();
+
+        let reported = policy.apply_final_input_guard(usage);
+
+        assert!((1..=96).contains(&reported.input_tokens));
+        assert_eq!(
+            reported.cache_read_input_tokens,
+            usage.input_tokens.saturating_sub(reported.input_tokens)
+        );
+        assert_eq!(reported.cache_creation_input_tokens, 0);
+        assert_eq!(
+            reported.total_input_tokens,
+            reported.reported_total_input_tokens()
+        );
+    }
+
+    #[test]
     fn reported_usage_policy_raw_fields_keep_request_input_and_output() {
         let usage = CacheUsage {
             total_input_tokens: 242_500,
@@ -1802,7 +1861,7 @@ mod tests {
     }
 
     #[test]
-    fn reported_usage_policy_does_not_turn_creation_only_into_read_cache() {
+    fn reported_usage_policy_moves_creation_only_input_delta_into_read_cache() {
         let usage = CacheUsage {
             total_input_tokens: 120_000,
             input_tokens: 80_000,
@@ -1818,7 +1877,11 @@ mod tests {
 
         assert!((1..=3_300).contains(&reported.cache_creation_input_tokens));
         assert!((1..=96).contains(&reported.input_tokens));
-        assert_eq!(reported.cache_read_input_tokens, 0);
+        assert_eq!(
+            reported.cache_read_input_tokens,
+            usage.input_tokens.saturating_sub(reported.input_tokens)
+        );
+        assert!(reported.cache_read_input_tokens > 0);
         assert_eq!(
             reported.total_input_tokens,
             reported.reported_total_input_tokens()
@@ -1844,7 +1907,10 @@ mod tests {
         assert_eq!(reported.cache_creation_5m_input_tokens, 30_000);
         assert_eq!(reported.cache_creation_1h_input_tokens, 10_000);
         assert!((1..=96).contains(&reported.input_tokens));
-        assert_eq!(reported.cache_read_input_tokens, 0);
+        assert_eq!(
+            reported.cache_read_input_tokens,
+            usage.input_tokens.saturating_sub(reported.input_tokens)
+        );
         assert_eq!(
             reported.total_input_tokens,
             reported.reported_total_input_tokens()
@@ -1852,7 +1918,7 @@ mod tests {
     }
 
     #[test]
-    fn reported_usage_policy_does_not_fabricate_cache_for_uncached_usage() {
+    fn reported_usage_policy_shapes_uncached_usage_into_reported_cache_read() {
         let usage = CacheUsage {
             total_input_tokens: 120_000,
             input_tokens: 120_000,
@@ -1866,7 +1932,17 @@ mod tests {
 
         let reported = usage.with_reported_cache_usage_policy(policy);
 
-        assert_eq!(reported, usage);
+        assert!((1..=96).contains(&reported.input_tokens));
+        assert_eq!(
+            reported.cache_read_input_tokens,
+            usage.input_tokens.saturating_sub(reported.input_tokens)
+        );
+        assert_eq!(reported.cache_creation_input_tokens, 0);
+        assert_eq!(reported.output_tokens, usage.output_tokens);
+        assert_eq!(
+            reported.total_input_tokens,
+            reported.reported_total_input_tokens()
+        );
     }
 
     #[test]

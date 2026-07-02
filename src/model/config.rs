@@ -1632,8 +1632,13 @@ pub fn resolve_cache_policy_for_path(
     };
 
     let cache_type = override_policy.explicit_cache_type();
-    let policy = override_policy
-        .apply_fields_for_strategy(cache_policy.strategy_policy(cache_type, path_base));
+    let mut policy = cache_policy.strategy_policy(cache_type, path_base);
+    if override_policy.reported_usage.is_none() {
+        if let Some(reported_usage) = reported_usage.path_override_for_path(path) {
+            policy.reported_usage = reported_usage.normalized();
+        }
+    }
+    let policy = override_policy.apply_fields_for_strategy(policy);
     let namespace = match cache_type {
         PromptCacheStrategyType::NoCache => None,
         PromptCacheStrategyType::KiroRsTool => Some(prefix.clone()),
@@ -4043,6 +4048,84 @@ mod tests {
         assert_eq!(unknown.namespace, None);
         assert_eq!(unknown.policy.cache_type, PromptCacheStrategyType::NoCache);
         assert!(!unknown.policy.simulation.enabled);
+    }
+
+    #[test]
+    fn cache_policy_keeps_legacy_reported_usage_path_override_after_template_refactor() {
+        let mut config = Config::default();
+        config.reported_usage = ReportedUsageConfig {
+            default: ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy::raw(),
+                ..ReportedUsagePathPolicy::default()
+            },
+            path_overrides: [(
+                "/ha".to_string(),
+                ReportedUsagePathPolicy {
+                    input: ReportedUsageFieldPolicy::sample_input_max(500),
+                    cache_creation: ReportedUsageFieldPolicy::sample_target(150_000),
+                    ..ReportedUsagePathPolicy::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        config.cache_policy.default = CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+            reported_usage: Some(ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy::raw(),
+                ..ReportedUsagePathPolicy::default()
+            }),
+            ..CacheRoutePolicyPatch::default()
+        };
+        config.cache_policy.current_high_cache = CacheRoutePolicyPatch {
+            cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+            reported_usage: Some(ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy::raw(),
+                ..ReportedUsagePathPolicy::default()
+            }),
+            ..CacheRoutePolicyPatch::default()
+        };
+        config.cache_policy.path_overrides.insert(
+            "/ha".to_string(),
+            CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+
+        let ha = config.cache_policy_for_path("/ha/v1/messages");
+        assert_eq!(
+            ha.policy.cache_type,
+            PromptCacheStrategyType::CurrentHighCache
+        );
+        assert_eq!(
+            ha.policy.reported_usage.input.mode,
+            ReportedUsageFieldMode::SampleMax
+        );
+        assert_eq!(ha.policy.reported_usage.input.max_tokens, 500);
+        assert_eq!(
+            ha.policy.reported_usage.cache_creation.mode,
+            ReportedUsageFieldMode::SampleTarget
+        );
+        assert_eq!(
+            ha.policy.reported_usage.cache_creation.target_tokens,
+            150_000
+        );
+
+        config.cache_policy.path_overrides.insert(
+            "/ha".to_string(),
+            CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+                reported_usage: Some(ReportedUsagePathPolicy {
+                    input: ReportedUsageFieldPolicy::sample_input_max(42),
+                    ..ReportedUsagePathPolicy::default()
+                }),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+
+        let explicit_ha = config.cache_policy_for_path("/ha/v1/messages");
+        assert_eq!(explicit_ha.policy.reported_usage.input.max_tokens, 42);
     }
 
     #[test]

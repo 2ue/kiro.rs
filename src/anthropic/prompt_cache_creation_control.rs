@@ -206,13 +206,12 @@ fn with_allowed_creation(usage: CacheUsage, allowed_creation: i32) -> CacheUsage
         return usage;
     }
 
-    let suppressed_creation = original_creation.saturating_sub(allowed_creation);
     let (cache_creation_5m_input_tokens, cache_creation_1h_input_tokens) = cap_creation_breakdown(
         usage.cache_creation_5m_input_tokens,
         usage.cache_creation_1h_input_tokens,
         allowed_creation,
     );
-    let input_tokens = usage.input_tokens.saturating_add(suppressed_creation);
+    let input_tokens = usage.input_tokens;
 
     CacheUsage {
         input_tokens,
@@ -328,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn first_creation_is_allowed_but_immediate_next_creation_is_carried_as_input() {
+    fn first_creation_is_allowed_but_immediate_next_creation_is_suppressed() {
         let controller = PromptCacheCreationController::default();
         let config = enabled_config();
         let scope = scope();
@@ -340,8 +339,8 @@ mod tests {
         let second = controller.apply_success(Some(&scope), config, usage(12_000));
         assert_eq!(second.cache_creation_input_tokens, 0);
         assert_eq!(second.cache_creation_5m_input_tokens, 0);
-        assert_eq!(second.input_tokens, 22_000);
-        assert_eq!(second.total_input_tokens, 22_000);
+        assert_eq!(second.input_tokens, 10_000);
+        assert_eq!(second.total_input_tokens, 10_000);
     }
 
     #[test]
@@ -356,7 +355,7 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(first.cache_creation_input_tokens, 20_000);
         assert_eq!(second.cache_creation_input_tokens, 0);
-        assert_eq!(second.input_tokens, 22_000);
+        assert_eq!(second.input_tokens, 10_000);
     }
 
     #[test]
@@ -384,8 +383,8 @@ mod tests {
         let adjusted = controller.apply_success(Some(&scope), config, usage(80_000));
 
         assert_eq!(adjusted.cache_creation_input_tokens, 30_000);
-        assert_eq!(adjusted.input_tokens, 60_000);
-        assert_eq!(adjusted.total_input_tokens, 90_000);
+        assert_eq!(adjusted.input_tokens, 10_000);
+        assert_eq!(adjusted.total_input_tokens, 40_000);
     }
 
     #[test]
@@ -403,7 +402,7 @@ mod tests {
 
         assert_eq!(first.cache_creation_input_tokens, 30_000);
         assert_eq!(second.cache_creation_input_tokens, 15_000);
-        assert_eq!(second.input_tokens, 25_000);
+        assert_eq!(second.input_tokens, 10_000);
     }
 
     #[test]
@@ -419,7 +418,7 @@ mod tests {
 
         assert_eq!(first.cache_creation_input_tokens, 20_000);
         assert_eq!(second.cache_creation_input_tokens, 0);
-        assert_eq!(second.input_tokens, 22_000);
+        assert_eq!(second.input_tokens, 10_000);
     }
 
     #[test]
@@ -434,7 +433,7 @@ mod tests {
 
         assert_eq!(first.cache_creation_input_tokens, 20_000);
         assert_eq!(second.cache_creation_input_tokens, 0);
-        assert_eq!(second.input_tokens, 22_000);
+        assert_eq!(second.input_tokens, 10_000);
     }
 
     #[test]
