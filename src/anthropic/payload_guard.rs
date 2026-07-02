@@ -4443,6 +4443,7 @@ mod tests {
                 )))
                 .with_history(history),
             profile_arn: None,
+            additional_model_request_fields: None,
             tool_cache_point_insert_after: Vec::new(),
             cache_point_plan_recording_enabled: true,
         }
@@ -5065,6 +5066,7 @@ mod tests {
                 CurrentMessage::new(UserInputMessage::new("x".repeat(10_000), TEST_MODEL)),
             ),
             profile_arn: None,
+            additional_model_request_fields: None,
             tool_cache_point_insert_after: Vec::new(),
             cache_point_plan_recording_enabled: true,
         };
@@ -5178,6 +5180,7 @@ mod tests {
                 ])
                 .with_current_message(CurrentMessage::new(current)),
             profile_arn: None,
+            additional_model_request_fields: None,
             tool_cache_point_insert_after: Vec::new(),
             cache_point_plan_recording_enabled: true,
         };
@@ -5316,6 +5319,7 @@ mod tests {
             conversation_state: ConversationState::new("conv-test")
                 .with_current_message(CurrentMessage::new(current)),
             profile_arn: None,
+            additional_model_request_fields: None,
             tool_cache_point_insert_after: vec![0, 1, 1, 99],
             cache_point_plan_recording_enabled: true,
         };

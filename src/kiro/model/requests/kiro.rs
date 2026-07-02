@@ -35,6 +35,9 @@ pub struct KiroRequest {
     /// Profile ARN（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_arn: Option<String>,
+    /// Kiro 模型原生扩展字段，例如 reasoning effort。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
     /// 仅代理运行期使用：在最终 JSON 的 tools 数组中指定哪些工具后插入 Kiro cachePoint。
     ///
     /// Kiro 的 tools 数组是 `toolSpecification | cachePoint` 联合结构；Rust 侧仍保持
@@ -44,6 +47,39 @@ pub struct KiroRequest {
     /// 是否把 cachePoint 插入计划写入 payload diagnostics。
     #[serde(default = "default_cache_point_plan_recording_enabled", skip)]
     pub cache_point_plan_recording_enabled: bool,
+}
+
+/// Kiro `additionalModelRequestFields` 容器。
+///
+/// 注意：外层 `KiroRequest` 使用 camelCase，因此字段名会是
+/// `additionalModelRequestFields`；但这里的内层字段按真实 wire format 保持
+/// `output_config` 这种 snake_case。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AdditionalModelRequestFields {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<KiroThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<KiroOutputConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<KiroReasoningConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KiroThinkingConfig {
+    #[serde(rename = "type")]
+    pub thinking_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KiroOutputConfig {
+    pub effort: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KiroReasoningConfig {
+    pub effort: String,
 }
 
 fn default_cache_point_plan_recording_enabled() -> bool {
@@ -63,6 +99,7 @@ impl KiroRequest {
 }
 #[cfg(test)]
 mod tests {
+    use super::super::conversation::{CurrentMessage, UserInputMessage};
     use super::*;
     #[test]
     fn test_kiro_request_deserialize() {
@@ -89,5 +126,37 @@ mod tests {
                 .content,
             "Test message"
         );
+    }
+
+    #[test]
+    fn test_additional_model_request_fields_wire_format() {
+        let state = ConversationState::new("conv").with_current_message(CurrentMessage::new(
+            UserInputMessage::new("hi", "claude-opus-4.7"),
+        ));
+        let request = KiroRequest {
+            conversation_state: state,
+            profile_arn: None,
+            additional_model_request_fields: Some(AdditionalModelRequestFields {
+                thinking: None,
+                output_config: Some(KiroOutputConfig {
+                    effort: "xhigh".to_string(),
+                }),
+                reasoning: None,
+            }),
+            tool_cache_point_insert_after: Vec::new(),
+            cache_point_plan_recording_enabled: true,
+        };
+
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value["additionalModelRequestFields"]["output_config"]["effort"],
+            "xhigh"
+        );
+        assert!(
+            value["additionalModelRequestFields"]
+                .get("outputConfig")
+                .is_none()
+        );
+        assert!(value.get("toolCachePointInsertAfter").is_none());
     }
 }

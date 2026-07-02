@@ -6,13 +6,15 @@
 //! [`KiroEndpoint`] 抽象了请求侧的差异点；`KiroProvider` 持有一个 endpoint 注册表，
 //! 按凭据的 `endpoint` 字段选择对应实现。
 
-use reqwest::RequestBuilder;
+use reqwest::{Method, RequestBuilder};
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
+pub mod cli;
 pub mod ide;
 
+pub use cli::CliEndpoint;
 pub use ide::IdeEndpoint;
 
 /// Kiro 端点
@@ -25,11 +27,35 @@ pub trait KiroEndpoint: Send + Sync {
     /// API endpoint URL
     fn api_url(&self, ctx: &RequestContext<'_>) -> String;
 
+    /// API/MCP request content type.
+    ///
+    /// IDE uses normal JSON. CLI runtime uses AWS JSON 1.0.
+    fn content_type(&self) -> &'static str {
+        "application/json"
+    }
+
     /// MCP endpoint URL
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String;
 
     /// ListAvailableModels endpoint URL.
     fn models_url(&self, ctx: &RequestContext<'_>, next_token: Option<&str>) -> String;
+
+    /// ListAvailableModels HTTP method.
+    ///
+    /// IDE-compatible endpoints use the legacy GET form. The Kiro CLI management
+    /// endpoint uses AWS JSON 1.0 POST with a JSON body.
+    fn models_method(&self, _ctx: &RequestContext<'_>) -> Method {
+        Method::GET
+    }
+
+    /// Optional ListAvailableModels JSON body.
+    fn models_body(
+        &self,
+        _ctx: &RequestContext<'_>,
+        _next_token: Option<&str>,
+    ) -> Option<serde_json::Value> {
+        None
+    }
 
     /// 装饰 API 请求的端点特有 header
     ///

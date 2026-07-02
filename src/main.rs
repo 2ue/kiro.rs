@@ -33,7 +33,7 @@ use clap::Parser;
 use common::auth::RequestApiKeyStore;
 use external_pool::ExternalPoolManager;
 use futures::StreamExt;
-use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
+use kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -223,6 +223,8 @@ async fn main() {
     {
         let ide = IdeEndpoint::new();
         endpoints.insert(ide.name().to_string(), Arc::new(ide));
+        let cli = CliEndpoint::new();
+        endpoints.insert(cli.name().to_string(), Arc::new(cli));
     }
 
     // 校验默认端点存在

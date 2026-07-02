@@ -6207,7 +6207,7 @@ mod tests {
     fn usage_limits_user_agents_match_kiro_rest_shape() {
         assert_eq!(
             usage_limits_amz_user_agent("0.12.155", "machine"),
-            "aws-sdk-js/1.0.0 KiroIDE 0.12.155 machine"
+            "aws-sdk-js/1.0.0 KiroIDE-0.12.155-machine"
         );
         assert_eq!(
             usage_limits_user_agent("macos#23.4.0", "22.22.0", "0.12.155", "machine"),

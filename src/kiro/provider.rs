@@ -6,8 +6,8 @@
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
 use chrono::Utc;
-use reqwest::Client;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::{Client, Method};
 use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc,
@@ -545,7 +545,7 @@ mod tests {
             Some("codewhisperer.us-east-1.amazonaws.com")
         );
         let expected_x_amz_user_agent = format!(
-            "aws-sdk-js/1.0.34 KiroIDE {} machine",
+            "aws-sdk-js/1.0.34 KiroIDE-{}-machine",
             Config::default().kiro_version
         );
         assert_eq!(
@@ -1041,7 +1041,7 @@ impl KiroProvider {
         headers.insert(
             "x-amz-user-agent",
             HeaderValue::from_str(&format!(
-                "aws-sdk-js/1.0.34 KiroIDE {} {}",
+                "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
                 config.kiro_version, machine_id
             ))?,
         );
@@ -1531,7 +1531,7 @@ impl KiroProvider {
             })?
             .post(&url)
             .body(body)
-            .header("content-type", "application/json")
+            .header("content-type", endpoint.content_type())
             .header("Connection", "close");
         let request = endpoint.decorate_api(base, &rctx);
 
@@ -1638,7 +1638,15 @@ impl KiroProvider {
         let mut next_token: Option<String> = None;
         for _ in 0..20 {
             let url = endpoint.models_url(&rctx, next_token.as_deref());
-            let request = endpoint.decorate_models(client.get(&url), &rctx);
+            let mut request = match endpoint.models_method(&rctx) {
+                Method::GET => client.get(&url),
+                Method::POST => client.post(&url),
+                method => client.request(method, &url),
+            };
+            if let Some(body) = endpoint.models_body(&rctx, next_token.as_deref()) {
+                request = request.body(serde_json::to_vec(&body)?);
+            }
+            let request = endpoint.decorate_models(request, &rctx);
             let response = send_with_response_header_timeout(
                 request,
                 config.kiro_upstream_response_timeout_secs,
@@ -1830,7 +1838,7 @@ impl KiroProvider {
             let base = client
                 .post(&url)
                 .body(body)
-                .header("content-type", "application/json")
+                .header("content-type", endpoint.content_type())
                 .header("Connection", "close");
             let request = endpoint.decorate_mcp(base, &rctx);
 
@@ -2367,7 +2375,7 @@ impl KiroProvider {
             let base = client
                 .post(&url)
                 .body(body)
-                .header("content-type", "application/json")
+                .header("content-type", endpoint.content_type())
                 .header("Connection", "close");
             let request = endpoint.decorate_api(base, &rctx);
 

@@ -175,8 +175,21 @@ pub struct OutputConfig {
     pub effort: String,
 }
 
+pub const DEFAULT_THINKING_EFFORT: &str = "high";
+
+pub fn normalize_thinking_effort(effort: &str) -> &'static str {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "low" => "low",
+        "medium" => "medium",
+        "high" => "high",
+        "xhigh" => "xhigh",
+        "max" => "max",
+        _ => DEFAULT_THINKING_EFFORT,
+    }
+}
+
 fn default_effort() -> String {
-    "high".to_string()
+    DEFAULT_THINKING_EFFORT.to_string()
 }
 
 /// Claude Code 请求中的 metadata

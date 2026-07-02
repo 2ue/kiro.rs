@@ -4423,6 +4423,7 @@ async fn post_messages_inner(
     let mut kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
         tool_cache_point_insert_after: conversion_result.tool_cache_point_insert_after.clone(),
         cache_point_plan_recording_enabled: conversion_result.cache_point_plan_recording_enabled,
     };
@@ -6996,6 +6997,7 @@ pub async fn post_messages_cc(
     let mut kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
         tool_cache_point_insert_after: conversion_result.tool_cache_point_insert_after.clone(),
         cache_point_plan_recording_enabled: conversion_result.cache_point_plan_recording_enabled,
     };

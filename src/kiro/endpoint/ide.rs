@@ -46,7 +46,7 @@ impl IdeEndpoint {
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
-            "aws-sdk-js/1.0.34 KiroIDE {} {}",
+            "aws-sdk-js/1.0.34 KiroIDE-{}-{}",
             ctx.config.kiro_version, ctx.machine_id
         )
     }
@@ -164,8 +164,9 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
+        let body = inject_ide_thinking_fields(body);
         inject_profile_arn(
-            body,
+            &body,
             &resolve_streaming_profile_arn(ctx.credentials, ctx.config),
         )
     }
@@ -184,9 +185,35 @@ fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> Strin
     request_body.to_string()
 }
 
+fn inject_ide_thinking_fields(request_body: &str) -> String {
+    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) else {
+        return request_body.to_string();
+    };
+
+    let Some(fields) = json
+        .get_mut("additionalModelRequestFields")
+        .and_then(|v| v.as_object_mut())
+    else {
+        return request_body.to_string();
+    };
+
+    if !fields.contains_key("output_config") || fields.contains_key("thinking") {
+        return request_body.to_string();
+    }
+
+    fields.insert(
+        "thinking".to_string(),
+        serde_json::json!({
+            "type": "adaptive",
+            "display": "summarized"
+        }),
+    );
+    serde_json::to_string(&json).unwrap_or_else(|_| request_body.to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{IdeEndpoint, inject_profile_arn};
+    use super::{IdeEndpoint, inject_ide_thinking_fields, inject_profile_arn};
     use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
     use crate::kiro::model::credentials::KiroCredentials;
     use crate::kiro::protocol::{KIRO_BUILDER_ID_PLACEHOLDER_ARN, KIRO_SOCIAL_PROFILE_ARN};
@@ -231,6 +258,40 @@ mod tests {
         let arn = Some("arn:test".to_string());
         let result = inject_profile_arn(body, &arn);
         assert_eq!(result, "not-valid-json");
+    }
+
+    #[test]
+    fn test_ide_injects_thinking_for_output_config_effort() {
+        let body = r#"{"conversationState":{},"additionalModelRequestFields":{"output_config":{"effort":"xhigh"}}}"#;
+        let result = inject_ide_thinking_fields(body);
+        let json: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            json["additionalModelRequestFields"]["thinking"]["type"],
+            "adaptive"
+        );
+        assert_eq!(
+            json["additionalModelRequestFields"]["thinking"]["display"],
+            "summarized"
+        );
+        assert_eq!(
+            json["additionalModelRequestFields"]["output_config"]["effort"],
+            "xhigh"
+        );
+    }
+
+    #[test]
+    fn test_ide_preserves_existing_thinking_field() {
+        let body = r#"{"additionalModelRequestFields":{"thinking":{"type":"disabled"},"output_config":{"effort":"low"}}}"#;
+        let result = inject_ide_thinking_fields(body);
+        let json: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            json["additionalModelRequestFields"]["thinking"]["type"],
+            "disabled"
+        );
+        assert_eq!(
+            json["additionalModelRequestFields"]["output_config"]["effort"],
+            "low"
+        );
     }
 
     #[test]
@@ -389,7 +450,7 @@ mod tests {
             Some("EXTERNAL_IDP")
         );
         let expected_x_amz_user_agent =
-            format!("aws-sdk-js/1.0.34 KiroIDE {} machine", config.kiro_version);
+            format!("aws-sdk-js/1.0.34 KiroIDE-{}-machine", config.kiro_version);
         assert_eq!(
             headers
                 .get("x-amz-user-agent")

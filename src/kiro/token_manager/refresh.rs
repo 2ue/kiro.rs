@@ -479,7 +479,7 @@ pub(super) fn usage_limits_user_agent(
 }
 
 pub(super) fn usage_limits_amz_user_agent(kiro_version: &str, machine_id: &str) -> String {
-    format!("aws-sdk-js/1.0.0 KiroIDE {} {}", kiro_version, machine_id)
+    format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id)
 }
 
 #[cfg(test)]

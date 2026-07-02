@@ -1225,6 +1225,7 @@ mod tests {
                     Message::User(user),
                 ]),
             profile_arn: None,
+            additional_model_request_fields: None,
             tool_cache_point_insert_after: Vec::new(),
             cache_point_plan_recording_enabled: true,
         }

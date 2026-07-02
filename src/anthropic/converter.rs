@@ -17,12 +17,15 @@ use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
     HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
 };
+use crate::kiro::model::requests::kiro::{
+    AdditionalModelRequestFields, KiroOutputConfig, KiroReasoningConfig,
+};
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
 use crate::model::config::{CompatProfile, PromptCacheSimulationMode};
 
-use super::types::{ContentBlock, MessagesRequest};
+use super::types::{ContentBlock, MessagesRequest, normalize_thinking_effort};
 
 const TOOL_RESULTS_PROVIDED_PLACEHOLDER: &str = "Tool results provided.";
 const EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER: &str = "Tool result content was empty.";
@@ -858,6 +861,116 @@ pub fn get_context_window_size(model: &str) -> i32 {
     200_000
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeReasoningSchemaPath {
+    OutputConfig,
+    #[allow(dead_code)]
+    Reasoning,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NativeReasoningSchema {
+    path: NativeReasoningSchemaPath,
+    efforts: &'static [&'static str],
+}
+
+const EFFORTS_WITH_XHIGH: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+const EFFORTS_WITHOUT_XHIGH: &[&str] = &["low", "medium", "high", "max"];
+
+fn native_reasoning_schema(model_id: &str) -> Option<NativeReasoningSchema> {
+    match model_id {
+        "claude-opus-4.8" | "claude-opus-4-8" | "claude-opus-4.7" | "claude-opus-4-7" => {
+            Some(NativeReasoningSchema {
+                path: NativeReasoningSchemaPath::OutputConfig,
+                efforts: EFFORTS_WITH_XHIGH,
+            })
+        }
+        "claude-opus-4.6" | "claude-opus-4-6" | "claude-sonnet-4.6" | "claude-sonnet-4-6" => {
+            Some(NativeReasoningSchema {
+                path: NativeReasoningSchemaPath::OutputConfig,
+                efforts: EFFORTS_WITHOUT_XHIGH,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn requested_native_reasoning(req: &MessagesRequest) -> bool {
+    req.thinking.as_ref().is_some_and(|t| t.is_enabled())
+        || req
+            .output_config
+            .as_ref()
+            .is_some_and(|oc| !oc.effort.trim().is_empty())
+}
+
+fn effort_from_budget_tokens(tokens: i32) -> &'static str {
+    match tokens {
+        i32::MIN..=4_000 => "low",
+        4_001..=16_000 => "medium",
+        16_001..=64_000 => "high",
+        _ => "xhigh",
+    }
+}
+
+fn select_native_reasoning_effort(req: &MessagesRequest, schema: NativeReasoningSchema) -> String {
+    let requested = req
+        .output_config
+        .as_ref()
+        .map(|oc| normalize_thinking_effort(&oc.effort))
+        .or_else(|| {
+            req.thinking.as_ref().map(|t| {
+                if t.thinking_type == "enabled" {
+                    effort_from_budget_tokens(t.budget_tokens)
+                } else {
+                    normalize_thinking_effort("")
+                }
+            })
+        })
+        .unwrap_or_else(|| normalize_thinking_effort(""));
+
+    if schema.efforts.contains(&requested) {
+        requested.to_string()
+    } else {
+        schema.efforts.last().copied().unwrap_or("high").to_string()
+    }
+}
+
+fn build_additional_model_request_fields(
+    req: &MessagesRequest,
+    model_id: &str,
+) -> Option<AdditionalModelRequestFields> {
+    if req
+        .thinking
+        .as_ref()
+        .is_some_and(|t| t.thinking_type == "disabled")
+    {
+        return None;
+    }
+
+    let schema = native_reasoning_schema(model_id)?;
+    if !requested_native_reasoning(req) {
+        return None;
+    }
+
+    let effort = select_native_reasoning_effort(req, schema);
+    Some(match schema.path {
+        NativeReasoningSchemaPath::OutputConfig => AdditionalModelRequestFields {
+            thinking: None,
+            output_config: Some(KiroOutputConfig { effort }),
+            reasoning: None,
+        },
+        NativeReasoningSchemaPath::Reasoning => AdditionalModelRequestFields {
+            thinking: None,
+            output_config: None,
+            reasoning: Some(KiroReasoningConfig { effort }),
+        },
+    })
+}
+
+fn uses_native_reasoning_fields(req: &MessagesRequest, model_id: &str) -> bool {
+    build_additional_model_request_fields(req, model_id).is_some()
+}
+
 /// 转换结果
 #[derive(Debug)]
 pub struct ConversionResult {
@@ -876,6 +989,8 @@ pub struct ConversionResult {
     pub known_tool_names: std::collections::HashSet<String>,
     /// 代理对入参的隐式改写汇总（兜底动作的统计），用于可选的 `x-kiro-rs-warnings` 响应头。
     pub warnings: ProxyWarnings,
+    /// Kiro 原生模型扩展字段，例如 reasoning effort。
+    pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1320,6 +1435,18 @@ fn convert_request_with_model_id(
         tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
     }
 
+    let additional_model_request_fields = build_additional_model_request_fields(req, &model_id);
+    if additional_model_request_fields.is_none() {
+        if let Some(oc) = &req.output_config {
+            if !oc.effort.trim().is_empty() {
+                tracing::debug!(
+                    model_id = %model_id,
+                    "skipping unsupported additionalModelRequestFields for model"
+                );
+            }
+        }
+    }
+
     Ok(ConversionResult {
         conversation_state,
         tool_cache_point_insert_after: converted_tools.tool_cache_point_insert_after,
@@ -1327,6 +1454,7 @@ fn convert_request_with_model_id(
         tool_name_map,
         known_tool_names,
         warnings,
+        additional_model_request_fields,
     })
 }
 
@@ -2361,7 +2489,7 @@ fn generate_thinking_prefix(req: &MessagesRequest, options: ConverterOptions) ->
             let effort = req
                 .output_config
                 .as_ref()
-                .map(|c| c.effort.as_str())
+                .map(|c| normalize_thinking_effort(&c.effort))
                 .unwrap_or("high");
             return Some(format!(
                 "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>{}",
@@ -2370,6 +2498,17 @@ fn generate_thinking_prefix(req: &MessagesRequest, options: ConverterOptions) ->
         }
     }
     None
+}
+
+fn generate_thinking_prefix_for_model(
+    req: &MessagesRequest,
+    model_id: &str,
+    options: ConverterOptions,
+) -> Option<String> {
+    if uses_native_reasoning_fields(req, model_id) {
+        return None;
+    }
+    generate_thinking_prefix(req, options)
 }
 
 /// 检查内容是否已包含thinking标签
@@ -2396,7 +2535,7 @@ fn build_history(
 
     // 生成thinking前缀（如果需要）
     let thinking_prefix = if options.inject_thinking_prefix() {
-        generate_thinking_prefix(req, options)
+        generate_thinking_prefix_for_model(req, model_id, options)
     } else {
         None
     };
@@ -4048,11 +4187,91 @@ mod tests {
     }
 
     #[test]
+    fn test_native_reasoning_fields_emit_for_supported_models_without_prompt_tags() {
+        use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
+
+        let req = MessagesRequest {
+            model: "claude-opus-4-7-thinking".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 0,
+            }),
+            output_config: Some(OutputConfig {
+                effort: "xhigh".to_string(),
+            }),
+            metadata: None,
+        };
+
+        let result = convert_request_with_options(&req, ConverterOptions::default())
+            .expect("supported native reasoning request should convert");
+
+        let fields = result
+            .additional_model_request_fields
+            .expect("supported model should emit native reasoning fields");
+        assert!(fields.thinking.is_none());
+        assert_eq!(fields.output_config.unwrap().effort, "xhigh");
+        assert!(
+            result
+                .conversation_state
+                .history
+                .iter()
+                .all(|message| match message {
+                    Message::User(user) =>
+                        !user.user_input_message.content.contains("<thinking_mode>"),
+                    _ => true,
+                })
+        );
+    }
+
+    #[test]
+    fn test_sonnet_4_6_xhigh_downgrades_to_max_for_native_schema() {
+        use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6-thinking".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 0,
+            }),
+            output_config: Some(OutputConfig {
+                effort: "xhigh".to_string(),
+            }),
+            metadata: None,
+        };
+
+        let result = convert_request_with_options(&req, ConverterOptions::default())
+            .expect("sonnet native reasoning request should convert");
+
+        let fields = result
+            .additional_model_request_fields
+            .expect("sonnet 4.6 should emit native reasoning fields");
+        assert_eq!(fields.output_config.unwrap().effort, "max");
+    }
+
+    #[test]
     fn test_force_visible_thinking_adds_policy_for_adaptive_request() {
         use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4-6".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
@@ -4102,7 +4321,7 @@ mod tests {
         };
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4-6".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             max_tokens: 1024,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
