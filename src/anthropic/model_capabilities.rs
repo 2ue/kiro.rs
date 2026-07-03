@@ -128,6 +128,15 @@ impl ModelCapabilitiesCatalog {
 
     pub fn anthropic_models(&self) -> Vec<Model> {
         let status = self.status();
+        let max_input_by_model = status
+            .models
+            .iter()
+            .filter_map(|item| {
+                item.max_input_tokens
+                    .filter(|tokens| *tokens > 0)
+                    .map(|tokens| (item.model.clone(), tokens))
+            })
+            .collect::<HashMap<_, _>>();
         let upstream_ids = status
             .models
             .iter()
@@ -137,6 +146,7 @@ impl ModelCapabilitiesCatalog {
         for item in status.models {
             let created = model_created_at(&item.model);
             let max_tokens = item.max_output_tokens.unwrap_or(64_000).max(1);
+            let max_input_tokens = item.max_input_tokens.filter(|tokens| *tokens > 0);
             models.insert(
                 item.model.clone(),
                 Model {
@@ -147,10 +157,12 @@ impl ModelCapabilitiesCatalog {
                     display_name: item.display_name,
                     model_type: "chat".to_string(),
                     max_tokens,
+                    max_input_tokens,
+                    context_window: max_input_tokens,
                 },
             );
         }
-        for model in static_anthropic_models() {
+        for mut model in static_anthropic_models() {
             if models.contains_key(&model.id) {
                 continue;
             }
@@ -159,6 +171,14 @@ impl ModelCapabilitiesCatalog {
                 resolution.source,
                 ModelResolutionSource::Unsupported | ModelResolutionSource::PassThrough
             ) {
+                if let Some(max_input_tokens) = resolution
+                    .upstream_model
+                    .as_deref()
+                    .and_then(|model| max_input_by_model.get(model).copied())
+                {
+                    model.max_input_tokens = Some(max_input_tokens);
+                    model.context_window = Some(max_input_tokens);
+                }
                 models.insert(model.id.clone(), model);
             }
         }
@@ -1216,6 +1236,13 @@ pub fn static_anthropic_models() -> Vec<Model> {
         ),
         ("sonnet", "Claude Code Alias: Sonnet", 1_771_286_400, 64_000),
         ("haiku", "Claude Code Alias: Haiku", 1_760_486_400, 64_000),
+        ("claude-opus-4.8", "Claude Opus 4.8", 1_779_926_400, 128_000),
+        (
+            "claude-opus-4.8-thinking",
+            "Claude Opus 4.8 (Thinking)",
+            1_779_926_400,
+            128_000,
+        ),
         ("claude-opus-4-7", "Claude Opus 4.7", 1_776_276_000, 64_000),
         (
             "claude-opus-4-7-thinking",
@@ -1290,6 +1317,8 @@ pub fn static_anthropic_models() -> Vec<Model> {
             display_name: display_name.to_string(),
             model_type: "chat".to_string(),
             max_tokens,
+            max_input_tokens: None,
+            context_window: None,
         })
         .collect()
 }
@@ -1334,6 +1363,30 @@ mod tests {
             .find(|model| model.id == "claude-sonnet-4-9-20270101")
             .unwrap();
         assert_eq!(synced.max_tokens, 128_000);
+        assert_eq!(synced.max_input_tokens, Some(1_000_000));
+        assert_eq!(synced.context_window, Some(1_000_000));
+    }
+
+    #[test]
+    fn seed_includes_opus_4_8_as_one_m_context_model() {
+        let catalog = ModelCapabilitiesCatalog::new();
+        let opus = catalog
+            .status()
+            .models
+            .into_iter()
+            .find(|model| model.model == "claude-opus-4.8")
+            .expect("seed should include claude-opus-4.8");
+
+        assert_eq!(opus.max_input_tokens, Some(1_000_000));
+        assert_eq!(opus.max_output_tokens, Some(128_000));
+
+        let exposed = catalog
+            .anthropic_models()
+            .into_iter()
+            .find(|model| model.id == "claude-opus-4.8")
+            .expect("models endpoint should expose claude-opus-4.8");
+        assert_eq!(exposed.max_input_tokens, Some(1_000_000));
+        assert_eq!(exposed.context_window, Some(1_000_000));
     }
 
     #[test]

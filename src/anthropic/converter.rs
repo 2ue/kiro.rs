@@ -848,6 +848,8 @@ pub fn get_context_window_size(model: &str) -> i32 {
     }
 
     if explicit_one_m
+        || base == "claude-opus-4.8"
+        || base == "claude-opus-4.8-thinking"
         || base == "claude-opus-4.7"
         || base == "claude-opus-4.7-thinking"
         || base == "claude-opus-4.6"
@@ -3028,6 +3030,7 @@ mod tests {
         assert_eq!(get_context_window_size("auto"), 1_000_000);
         assert_eq!(get_context_window_size("sonnet"), 200_000);
         assert_eq!(get_context_window_size("opus"), 200_000);
+        assert_eq!(get_context_window_size("claude-opus-4.8"), 1_000_000);
         assert_eq!(get_context_window_size("claude-opus-4.7"), 1_000_000);
         assert_eq!(get_context_window_size("claude-sonnet-4.6"), 1_000_000);
         assert_eq!(

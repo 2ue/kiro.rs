@@ -243,7 +243,7 @@ async function parseKamFiles(files: File[]): Promise<{ accounts: KamAccount[]; e
 
 export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
-  const [verificationMode, setVerificationMode] = useState<ImportVerificationMode>('model_and_subscription')
+  const [verificationMode, setVerificationMode] = useState<ImportVerificationMode>('subscription_only')
   const [importing, setImporting] = useState(false)
   const [skipErrorAccounts, setSkipErrorAccounts] = useState(true)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
@@ -277,7 +277,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     setCurrentProcessing('')
     setResults([])
     setDefaults(initialParameterDefaults())
-    setVerificationMode('model_and_subscription')
+    setVerificationMode('subscription_only')
   }
 
   const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -583,7 +583,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     >
       <DialogContent className="sm:max-w-2xl max-h-[80vh] flex flex-col">
         <DialogHeader>
-          <DialogTitle>KAM 账号导入（自动验活）</DialogTitle>
+          <DialogTitle>KAM 账号导入（默认查询订阅）</DialogTitle>
         </DialogHeader>
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
@@ -636,8 +636,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
               disabled={importing}
               className="mt-2 flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              <option value="model_and_subscription">测试模型 + 查询订阅</option>
               <option value="subscription_only">只查询订阅（不请求模型）</option>
+              <option value="model_and_subscription">测试模型 + 查询订阅</option>
             </select>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
               只查询订阅时不会发送模型测试请求；订阅查询失败的账号仍会按验活失败回滚。
@@ -765,7 +765,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
               onClick={() => handleImport()}
               disabled={importing || !jsonInput.trim() || previewAccounts.length === 0 || !!parseError}
             >
-              开始导入并验活
+              开始导入
             </Button>
           )}
         </DialogFooter>

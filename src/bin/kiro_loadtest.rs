@@ -56,6 +56,24 @@ struct Args {
     tool_use: bool,
     #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true")]
     cache_control: bool,
+    #[arg(long, value_enum, default_value_t = PayloadCase::TextHistory)]
+    payload_case: PayloadCase,
+    #[arg(long, default_value_t = 0)]
+    long_context_chars: usize,
+    #[arg(long, default_value_t = 1)]
+    long_context_messages: usize,
+    #[arg(long, default_value_t = 0)]
+    current_user_chars: usize,
+    #[arg(long, default_value_t = 0)]
+    system_chars: usize,
+    #[arg(long, default_value_t = 0)]
+    tool_result_chars: usize,
+    #[arg(long, default_value_t = 0)]
+    tool_result_count: usize,
+    #[arg(long, default_value_t = 0)]
+    tool_input_depth: usize,
+    #[arg(long, default_value_t = 0)]
+    tool_count: usize,
     #[arg(long)]
     dfcache_route: Option<String>,
     #[arg(long, default_value_t = 60)]
@@ -78,6 +96,10 @@ struct Args {
     fake_delay_ms: u64,
     #[arg(long, default_value_t = 10)]
     fake_recover_after: u64,
+    #[arg(long, default_value_t = 16)]
+    fake_stream_chunks: usize,
+    #[arg(long, default_value_t = 250)]
+    fake_stream_chunk_delay_ms: u64,
     #[arg(long)]
     fake_capture_dir: Option<PathBuf>,
 }
@@ -96,9 +118,20 @@ enum Scenario {
     InvalidToolFormat,
     CachePointReject,
     ToolUseStream,
+    LongStream,
     MalformedSse,
     ClientDrop,
     RecoveryAfterBurst,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum PayloadCase {
+    TextHistory,
+    LargeToolResults,
+    DeepToolInput,
+    ManyTools,
+    MixedPathological,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +147,15 @@ struct RunConfig {
     thinking: bool,
     tool_use: bool,
     cache_control: bool,
+    payload_case: PayloadCase,
+    long_context_chars: usize,
+    long_context_messages: usize,
+    current_user_chars: usize,
+    system_chars: usize,
+    tool_result_chars: usize,
+    tool_result_count: usize,
+    tool_input_depth: usize,
+    tool_count: usize,
     timeout_secs: u64,
     auth_key: Option<String>,
     target_pid: u32,
@@ -123,6 +165,7 @@ struct RunConfig {
 #[serde(rename_all = "camelCase")]
 struct LoadtestReport {
     scenario: Scenario,
+    request_profile: RequestProfile,
     started_at: String,
     duration_ms: u128,
     requests: usize,
@@ -135,8 +178,27 @@ struct LoadtestReport {
     total_latency_ms: Percentiles,
     memory: ResourceStats,
     file_descriptors: ResourceStats,
+    cpu_percent: CpuStats,
     request_ids: Vec<String>,
     error_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RequestProfile {
+    payload_case: PayloadCase,
+    stream: bool,
+    thinking: bool,
+    tool_use: bool,
+    cache_control: bool,
+    long_context_chars: usize,
+    long_context_messages: usize,
+    current_user_chars: usize,
+    system_chars: usize,
+    tool_result_chars: usize,
+    tool_result_count: usize,
+    tool_input_depth: usize,
+    tool_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
@@ -152,6 +214,14 @@ struct ResourceStats {
     start: u64,
     peak: u64,
     end: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CpuStats {
+    start: f64,
+    peak: f64,
+    end: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +240,7 @@ struct RequestResult {
 struct ResourceSample {
     rss_bytes: u64,
     fd_count: u64,
+    cpu_percent: f64,
 }
 
 #[derive(Clone)]
@@ -177,6 +248,8 @@ struct FakeServerState {
     scenario: Scenario,
     delay: Duration,
     recover_after: u64,
+    stream_chunks: usize,
+    stream_chunk_delay: Duration,
     kiro_eventstream: bool,
     capture_dir: Option<PathBuf>,
     counter: Arc<AtomicU64>,
@@ -198,6 +271,8 @@ async fn main() -> anyhow::Result<()> {
             scenario: args.scenario,
             delay: Duration::from_millis(args.fake_delay_ms),
             recover_after: args.fake_recover_after,
+            stream_chunks: args.fake_stream_chunks.max(1),
+            stream_chunk_delay: Duration::from_millis(args.fake_stream_chunk_delay_ms),
             kiro_eventstream: args.fake_kiro_eventstream,
             capture_dir: args.fake_capture_dir,
             counter: Arc::new(AtomicU64::new(0)),
@@ -230,6 +305,15 @@ async fn main() -> anyhow::Result<()> {
         thinking: args.thinking,
         tool_use: args.tool_use,
         cache_control: args.cache_control,
+        payload_case: args.payload_case,
+        long_context_chars: args.long_context_chars,
+        long_context_messages: args.long_context_messages.max(1),
+        current_user_chars: args.current_user_chars,
+        system_chars: args.system_chars,
+        tool_result_chars: args.tool_result_chars,
+        tool_result_count: args.tool_result_count,
+        tool_input_depth: args.tool_input_depth,
+        tool_count: args.tool_count,
         timeout_secs: args.timeout_secs,
         auth_key: args.auth_key,
         target_pid: args.target_pid.unwrap_or_else(std::process::id),
@@ -282,6 +366,7 @@ async fn run_loadtest(config: RunConfig) -> anyhow::Result<LoadtestReport> {
             let mut peak = sampler_peak.lock().await;
             peak.rss_bytes = peak.rss_bytes.max(sample.rss_bytes);
             peak.fd_count = peak.fd_count.max(sample.fd_count);
+            peak.cpu_percent = peak.cpu_percent.max(sample.cpu_percent);
             drop(peak);
             sleep(Duration::from_millis(500)).await;
         }
@@ -336,6 +421,7 @@ async fn run_loadtest(config: RunConfig) -> anyhow::Result<LoadtestReport> {
 
     Ok(build_report(
         config.scenario,
+        request_profile(&config),
         started_at,
         run_started.elapsed().as_millis(),
         results,
@@ -411,17 +497,12 @@ async fn execute_request(
 }
 
 fn request_body(config: &RunConfig, index: usize) -> Value {
+    let messages = payload_case_messages(config, index);
     let mut body = json!({
         "model": config.model,
         "max_tokens": 256,
         "stream": config.stream,
-        "messages": [{
-            "role": "user",
-            "content": [{
-                "type": "text",
-                "text": format!("loadtest request {index}: respond with a short sentence")
-            }]
-        }]
+        "messages": messages
     });
 
     if config.thinking {
@@ -432,32 +513,381 @@ fn request_body(config: &RunConfig, index: usize) -> Value {
     }
 
     if config.cache_control {
+        let text = if config.system_chars > 0 {
+            deterministic_long_text(index, usize::MAX - 1, config.system_chars)
+        } else {
+            "stable loadtest system prompt".to_string()
+        };
         body["system"] = json!([{
             "type": "text",
-            "text": "stable loadtest system prompt",
+            "text": text,
             "cache_control": {"type": "ephemeral"}
+        }]);
+    } else if config.system_chars > 0 {
+        body["system"] = json!([{
+            "type": "text",
+            "text": deterministic_long_text(index, usize::MAX - 1, config.system_chars)
         }]);
     }
 
-    if config.tool_use {
-        let mut tool = json!({
-            "name": "echo",
-            "description": "Return the provided text.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string"}
-                },
-                "required": ["text"]
-            }
-        });
-        if config.cache_control {
-            tool["cache_control"] = json!({"type": "ephemeral"});
-        }
-        body["tools"] = json!([tool]);
+    if payload_case_requires_tools(config) {
+        body["tools"] = Value::Array(loadtest_tools(config));
     }
 
     body
+}
+
+fn payload_case_messages(config: &RunConfig, index: usize) -> Value {
+    match config.payload_case {
+        PayloadCase::TextHistory => {
+            if config.long_context_chars > 0 {
+                long_context_messages(
+                    index,
+                    config.long_context_chars,
+                    config.long_context_messages,
+                )
+            } else {
+                json!([user_text_message(current_user_text(config, index))])
+            }
+        }
+        PayloadCase::LargeToolResults => Value::Array(tool_result_messages(config, index)),
+        PayloadCase::DeepToolInput => Value::Array(deep_tool_input_messages(config, index)),
+        PayloadCase::ManyTools => {
+            Value::Array(vec![user_text_message(current_user_text(config, index))])
+        }
+        PayloadCase::MixedPathological => Value::Array(mixed_pathological_messages(config, index)),
+    }
+}
+
+fn user_text_message(text: String) -> Value {
+    json!({
+        "role": "user",
+        "content": [{
+            "type": "text",
+            "text": text
+        }]
+    })
+}
+
+fn assistant_text_message(text: String) -> Value {
+    json!({
+        "role": "assistant",
+        "content": [{
+            "type": "text",
+            "text": text
+        }]
+    })
+}
+
+fn current_user_text(config: &RunConfig, index: usize) -> String {
+    if config.current_user_chars > 0 {
+        deterministic_long_text(index, usize::MAX - 2, config.current_user_chars)
+    } else {
+        format!("loadtest request {index}: respond with a short sentence")
+    }
+}
+
+fn payload_case_requires_tools(config: &RunConfig) -> bool {
+    config.tool_use
+        || matches!(
+            config.payload_case,
+            PayloadCase::LargeToolResults
+                | PayloadCase::DeepToolInput
+                | PayloadCase::ManyTools
+                | PayloadCase::MixedPathological
+        )
+}
+
+fn loadtest_tools(config: &RunConfig) -> Vec<Value> {
+    let tool_count = effective_tool_count(config);
+    (0..tool_count)
+        .map(|index| {
+            let mut tool = json!({
+                "name": format!("loadtest_tool_{index}"),
+                "description": format!("Synthetic loadtest tool {index} with realistic schema pressure."),
+                "input_schema": nested_tool_schema(effective_tool_input_depth(config).min(64))
+            });
+            if index == 0 {
+                tool["name"] = json!("echo");
+                tool["description"] = json!("Return the provided text.");
+            }
+            if config.cache_control {
+                tool["cache_control"] = json!({"type": "ephemeral"});
+            }
+            tool
+        })
+        .collect()
+}
+
+fn effective_tool_count(config: &RunConfig) -> usize {
+    if config.tool_count > 0 {
+        return config.tool_count;
+    }
+    match config.payload_case {
+        PayloadCase::ManyTools | PayloadCase::MixedPathological => 64,
+        _ => 1,
+    }
+}
+
+fn effective_tool_result_count(config: &RunConfig) -> usize {
+    if config.tool_result_count > 0 {
+        return config.tool_result_count;
+    }
+    match config.payload_case {
+        PayloadCase::LargeToolResults => 4,
+        PayloadCase::MixedPathological => 6,
+        _ => 1,
+    }
+}
+
+fn effective_tool_result_chars(config: &RunConfig) -> usize {
+    if config.tool_result_chars > 0 {
+        return config.tool_result_chars;
+    }
+    match config.payload_case {
+        PayloadCase::LargeToolResults => 128 * 1024,
+        PayloadCase::MixedPathological => 96 * 1024,
+        _ => 4096,
+    }
+}
+
+fn effective_tool_input_depth(config: &RunConfig) -> usize {
+    if config.tool_input_depth > 0 {
+        return config.tool_input_depth;
+    }
+    match config.payload_case {
+        PayloadCase::DeepToolInput => 48,
+        PayloadCase::MixedPathological => 32,
+        PayloadCase::ManyTools => 8,
+        _ => 1,
+    }
+}
+
+fn tool_result_messages(config: &RunConfig, index: usize) -> Vec<Value> {
+    let count = effective_tool_result_count(config);
+    let chars = effective_tool_result_chars(config);
+    let mut messages = Vec::with_capacity(count.saturating_mul(3).saturating_add(1));
+    messages.push(user_text_message(format!(
+        "loadtest request {index}: run echo and summarize the captured command output"
+    )));
+    for result_index in 0..count {
+        let tool_use_id = format!("toolu_loadtest_{index}_{result_index}");
+        messages.push(json!({
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": tool_use_id,
+                "name": "echo",
+                "input": {"text": format!("collect diagnostics batch {result_index}")}
+            }]
+        }));
+        messages.push(json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": [{
+                    "type": "text",
+                    "text": deterministic_tool_result_text(index, result_index, chars)
+                }]
+            }]
+        }));
+        messages.push(assistant_text_message(format!(
+            "Captured diagnostics batch {result_index}; waiting for the next instruction."
+        )));
+    }
+    messages.push(user_text_message(current_user_text(config, index)));
+    messages
+}
+
+fn deep_tool_input_messages(config: &RunConfig, index: usize) -> Vec<Value> {
+    let depth = effective_tool_input_depth(config);
+    let tool_use_id = format!("toolu_deep_{index}");
+    vec![
+        user_text_message(format!(
+            "loadtest request {index}: inspect the nested plan and report the deepest action"
+        )),
+        json!({
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": tool_use_id,
+                "name": "echo",
+                "input": nested_tool_input(depth)
+            }]
+        }),
+        json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": [{
+                    "type": "text",
+                    "text": "nested plan accepted by the diagnostic collector"
+                }]
+            }]
+        }),
+        assistant_text_message("Nested diagnostic plan was inspected.".to_string()),
+        user_text_message(current_user_text(config, index)),
+    ]
+}
+
+fn mixed_pathological_messages(config: &RunConfig, index: usize) -> Vec<Value> {
+    let mut messages = if config.long_context_chars > 0 {
+        match long_context_messages(
+            index,
+            config.long_context_chars,
+            config.long_context_messages,
+        ) {
+            Value::Array(items) => items,
+            _ => Vec::new(),
+        }
+    } else {
+        vec![user_text_message(format!(
+            "loadtest request {index}: begin mixed payload pressure case"
+        ))]
+    };
+    messages.extend(tool_result_messages(config, index));
+    messages.extend(deep_tool_input_messages(config, index));
+    messages.push(user_text_message(current_user_text(config, index)));
+    messages
+}
+
+fn nested_tool_input(depth: usize) -> Value {
+    let mut value = json!({
+        "leafAction": "summarize",
+        "path": "/workspace/src/anthropic/payload_guard.rs",
+        "checks": ["serialize", "trim", "repair", "shape"]
+    });
+    for level in (0..depth).rev() {
+        value = json!({
+            "level": level,
+            "operation": "diagnostic_step",
+            "metadata": {
+                "file": format!("src/module_{level}.rs"),
+                "span": {"start": level * 17, "end": level * 17 + 13},
+                "hash": format!("{:08x}", level.wrapping_mul(2_654_435_761usize))
+            },
+            "children": [value, {
+                "level": level,
+                "operation": "side_check",
+                "status": "skipped"
+            }]
+        });
+    }
+    value
+}
+
+fn nested_tool_schema(depth: usize) -> Value {
+    let mut schema = json!({
+        "type": "object",
+        "properties": {
+            "text": {"type": "string"},
+            "limit": {"type": "integer"}
+        },
+        "required": ["text"]
+    });
+    for level in (0..depth).rev() {
+        let key = format!("step_{level}");
+        let mut properties = serde_json::Map::new();
+        properties.insert(key.clone(), schema);
+        properties.insert("enabled".to_string(), json!({"type": "boolean"}));
+        properties.insert(
+            "notes".to_string(),
+            json!({"type": "array", "items": {"type": "string"}}),
+        );
+        schema = json!({
+            "type": "object",
+            "properties": Value::Object(properties),
+            "required": [key]
+        });
+    }
+    schema
+}
+
+fn long_context_messages(index: usize, total_chars: usize, message_count: usize) -> Value {
+    let message_count = message_count.max(1);
+    let per_message = total_chars.div_ceil(message_count);
+    let mut messages = Vec::with_capacity(message_count);
+    for message_index in 0..message_count {
+        let role = if message_index + 1 == message_count {
+            "user"
+        } else if message_index % 2 == 0 {
+            "user"
+        } else {
+            "assistant"
+        };
+        let text = deterministic_long_text(index, message_index, per_message);
+        messages.push(json!({
+            "role": role,
+            "content": [{
+                "type": "text",
+                "text": text
+            }]
+        }));
+    }
+    Value::Array(messages)
+}
+
+fn deterministic_long_text(
+    request_index: usize,
+    message_index: usize,
+    target_chars: usize,
+) -> String {
+    let seed = format!(
+        "loadtest request={request_index} message={message_index} long context line with mixed code, JSON, markdown, and prose. "
+    );
+    let mut out = String::with_capacity(target_chars.saturating_add(seed.len()));
+    while out.len() < target_chars {
+        out.push_str(&seed);
+        out.push_str(
+            "fn compute(value: usize) -> usize { value.saturating_mul(31).wrapping_add(7) } ",
+        );
+        out.push_str("{\"path\":\"/tmp/example\",\"status\":\"ok\",\"items\":[1,2,3,4,5]} ");
+        out.push_str("这是一段用于压测长上下文本地处理路径的中文内容。 ");
+    }
+    let mut end = target_chars.min(out.len());
+    while end > 0 && !out.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.truncate(end);
+    out
+}
+
+fn deterministic_tool_result_text(
+    request_index: usize,
+    result_index: usize,
+    target_chars: usize,
+) -> String {
+    let mut out = String::with_capacity(target_chars.saturating_add(512));
+    let mut line = 0usize;
+    while out.len() < target_chars {
+        out.push_str(&format!(
+            "[2026-07-03T12:{:02}:{:02}Z] request={request_index} result={result_index} line={line} level=INFO target=loadtest.collector\n",
+            line % 60,
+            (line * 7) % 60
+        ));
+        out.push_str(
+            "command: rg -n \"payload_guard|serialize_request|trim_oldest\" src/anthropic src/external_pool.rs\n",
+        );
+        out.push_str(
+            r#"json: {"file":"src/anthropic/payload_guard.rs","phase":"trim","bytesBefore":983421,"bytesAfter":742118,"changed":true}"#,
+        );
+        out.push('\n');
+        out.push_str(
+            "diff: - old_history_entry_with_large_tool_result\n      + summarized_history_entry_with_hash_and_excerpt\n",
+        );
+        out.push_str(
+            "stack: converter::content_block -> payload_guard::breakdown -> usage::record_batch\n\n",
+        );
+        line += 1;
+    }
+    let mut end = target_chars.min(out.len());
+    while end > 0 && !out.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.truncate(end);
+    out
 }
 
 #[derive(Debug, Default)]
@@ -672,6 +1102,7 @@ fn extract_error_id(message: &str) -> Option<String> {
 
 fn build_report(
     scenario: Scenario,
+    request_profile: RequestProfile,
     started_at: String,
     duration_ms: u128,
     results: Vec<RequestResult>,
@@ -717,6 +1148,7 @@ fn build_report(
 
     LoadtestReport {
         scenario,
+        request_profile,
         started_at,
         duration_ms,
         requests: results.len(),
@@ -743,8 +1175,58 @@ fn build_report(
                 .max(resource_end.fd_count),
             end: resource_end.fd_count,
         },
+        cpu_percent: CpuStats {
+            start: resource_start.cpu_percent,
+            peak: resource_peak
+                .cpu_percent
+                .max(resource_start.cpu_percent)
+                .max(resource_end.cpu_percent),
+            end: resource_end.cpu_percent,
+        },
         request_ids,
         error_ids,
+    }
+}
+
+fn request_profile(config: &RunConfig) -> RequestProfile {
+    let uses_tool_results = matches!(
+        config.payload_case,
+        PayloadCase::LargeToolResults | PayloadCase::MixedPathological
+    );
+    let uses_deep_input = matches!(
+        config.payload_case,
+        PayloadCase::DeepToolInput | PayloadCase::ManyTools | PayloadCase::MixedPathological
+    );
+    RequestProfile {
+        payload_case: config.payload_case,
+        stream: config.stream,
+        thinking: config.thinking,
+        tool_use: config.tool_use,
+        cache_control: config.cache_control,
+        long_context_chars: config.long_context_chars,
+        long_context_messages: config.long_context_messages,
+        current_user_chars: config.current_user_chars,
+        system_chars: config.system_chars,
+        tool_result_chars: if uses_tool_results {
+            effective_tool_result_chars(config)
+        } else {
+            config.tool_result_chars
+        },
+        tool_result_count: if uses_tool_results {
+            effective_tool_result_count(config)
+        } else {
+            config.tool_result_count
+        },
+        tool_input_depth: if uses_deep_input {
+            effective_tool_input_depth(config)
+        } else {
+            config.tool_input_depth
+        },
+        tool_count: if payload_case_requires_tools(config) {
+            effective_tool_count(config)
+        } else {
+            config.tool_count
+        },
     }
 }
 
@@ -780,6 +1262,7 @@ fn sample_resources(pid: u32) -> ResourceSample {
     ResourceSample {
         rss_bytes: sample_rss_bytes(pid).unwrap_or_default(),
         fd_count: sample_fd_count(pid).unwrap_or_default(),
+        cpu_percent: sample_cpu_percent(pid).unwrap_or_default(),
     }
 }
 
@@ -796,6 +1279,20 @@ fn sample_rss_bytes(pid: u32) -> Option<u64> {
         .parse::<u64>()
         .ok()?;
     Some(rss_kb * 1024)
+}
+
+fn sample_cpu_percent(pid: u32) -> Option<f64> {
+    let output = Command::new("ps")
+        .args(["-o", "%cpu=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<f64>()
+        .ok()
 }
 
 fn sample_fd_count(pid: u32) -> Option<u64> {
@@ -994,6 +1491,37 @@ async fn fake_handler(
                 fake_json_message(&request_id)
             }
         }
+        Scenario::LongStream => {
+            if stream {
+                if state.kiro_eventstream {
+                    kiro_eventstream_response(
+                        request_id,
+                        long_stream_kiro_events(
+                            state.delay,
+                            state.stream_chunks,
+                            state.stream_chunk_delay,
+                        ),
+                    )
+                } else {
+                    sse_response(
+                        request_id,
+                        long_stream_sse_events(
+                            state.delay,
+                            state.stream_chunks,
+                            state.stream_chunk_delay,
+                        ),
+                    )
+                }
+            } else {
+                sleep(
+                    state
+                        .delay
+                        .saturating_add(state.stream_chunk_delay * state.stream_chunks as u32),
+                )
+                .await;
+                fake_json_message(&request_id)
+            }
+        }
         Scenario::NormalNonStream => fake_json_message(&request_id),
         Scenario::NormalStream | Scenario::ClientDrop | Scenario::RecoveryAfterBurst => {
             if stream {
@@ -1048,6 +1576,13 @@ fn body_contains_cache_point(value: &Value) -> bool {
 fn body_contains_tool_result(value: &Value) -> bool {
     match value {
         Value::Object(map) => {
+            if map
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind == "tool_result")
+            {
+                return true;
+            }
             if map.iter().any(|(key, value)| {
                 key == "toolResults" && value.as_array().is_some_and(|items| !items.is_empty())
             }) {
@@ -1367,6 +1902,99 @@ fn normal_kiro_events(first_delay: Duration, thinking: bool) -> Vec<(Duration, V
     events
 }
 
+fn long_stream_sse_events(
+    first_delay: Duration,
+    chunks: usize,
+    chunk_delay: Duration,
+) -> Vec<(Duration, String)> {
+    let chunks = chunks.max(1);
+    let mut events = vec![
+        (
+            first_delay,
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fake\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"fake-sonnet\",\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n".to_string(),
+        ),
+        (
+            Duration::ZERO,
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n".to_string(),
+        ),
+    ];
+    for index in 0..chunks {
+        events.push((
+            chunk_delay,
+            format!(
+                "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"stream chunk {index}; \"}}}}\n\n"
+            ),
+        ));
+    }
+    events.extend([
+        (
+            Duration::ZERO,
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n".to_string(),
+        ),
+        (
+            Duration::ZERO,
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":64}}\n\n".to_string(),
+        ),
+        (
+            Duration::ZERO,
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
+        ),
+        (Duration::ZERO, "data: [DONE]\n\n".to_string()),
+    ]);
+    events
+}
+
+fn long_stream_kiro_events(
+    first_delay: Duration,
+    chunks: usize,
+    chunk_delay: Duration,
+) -> Vec<(Duration, Vec<u8>)> {
+    let chunks = chunks.max(1);
+    let mut events = Vec::with_capacity(chunks.saturating_add(2));
+    for index in 0..chunks {
+        events.push((
+            if index == 0 { first_delay } else { chunk_delay },
+            kiro_event_frame(
+                "assistantResponseEvent",
+                json!({"content": format!("stream chunk {index}; ")}),
+            ),
+        ));
+    }
+    events.push((
+        Duration::ZERO,
+        kiro_event_frame(
+            "metadataEvent",
+            json!({
+                "tokenUsage": {
+                    "uncachedInputTokens": 10,
+                    "cacheReadInputTokens": 0,
+                    "cacheWriteInputTokens": 0,
+                    "outputTokens": 64,
+                    "totalTokens": 74
+                }
+            }),
+        ),
+    ));
+    events.push((
+        Duration::ZERO,
+        kiro_event_frame(
+            "messageMetadataEvent",
+            json!({
+                "conversationId": "fake-conversation",
+                "utteranceId": "fake-utterance",
+                "tokenUsage": {
+                    "uncachedInputTokens": 10,
+                    "cacheReadInputTokens": 0,
+                    "cacheWriteInputTokens": 0,
+                    "outputTokens": 64,
+                    "totalTokens": 74
+                }
+            }),
+        ),
+    ));
+    events
+}
+
 fn thinking_sse_events(text_delay: Duration) -> Vec<(Duration, String)> {
     vec![
         (
@@ -1630,6 +2258,75 @@ mod tests {
 
         assert!(body_contains_tool_result(&request));
         assert_eq!(select_fake_tool_name(&request), "Bash");
+    }
+
+    fn test_config(payload_case: PayloadCase) -> RunConfig {
+        RunConfig {
+            base_url: "http://127.0.0.1:19022".to_string(),
+            route: "/cc/v1/messages".to_string(),
+            model: "claude-sonnet-4-20250514".to_string(),
+            concurrency: 1,
+            requests: 1,
+            duration_secs: None,
+            scenario: Scenario::NormalStream,
+            stream: true,
+            thinking: false,
+            tool_use: false,
+            cache_control: false,
+            payload_case,
+            long_context_chars: 0,
+            long_context_messages: 1,
+            current_user_chars: 0,
+            system_chars: 0,
+            tool_result_chars: 1024,
+            tool_result_count: 2,
+            tool_input_depth: 4,
+            tool_count: 3,
+            timeout_secs: 60,
+            auth_key: None,
+            target_pid: std::process::id(),
+        }
+    }
+
+    #[test]
+    fn large_tool_result_case_builds_real_tool_result_blocks() {
+        let body = request_body(&test_config(PayloadCase::LargeToolResults), 7);
+        assert!(body_contains_tool_result(&body));
+        let serialized = serde_json::to_string(&body).expect("serialize body");
+        assert!(serialized.contains("payload_guard.rs"));
+        assert!(serialized.contains("tool_result"));
+        assert!(serialized.len() > 2000);
+    }
+
+    #[test]
+    fn deep_tool_input_case_builds_nested_input() {
+        let body = request_body(&test_config(PayloadCase::DeepToolInput), 3);
+        let serialized = serde_json::to_string(&body).expect("serialize body");
+        assert!(serialized.contains("\"level\":0"));
+        assert!(serialized.contains("\"level\":3"));
+        assert!(serialized.contains("side_check"));
+    }
+
+    #[test]
+    fn many_tools_case_builds_requested_tool_count() {
+        let body = request_body(&test_config(PayloadCase::ManyTools), 1);
+        let tools = body.get("tools").and_then(Value::as_array).expect("tools");
+        assert_eq!(tools.len(), 3);
+    }
+
+    #[test]
+    fn long_stream_sse_events_hold_stream_and_finish_cleanly() {
+        let started = Instant::now();
+        let mut parser = SseMetricsParser::new(started);
+        let events = long_stream_sse_events(Duration::ZERO, 4, Duration::ZERO);
+        assert!(events.len() >= 8);
+        for (_, event) in events {
+            parser.push(event.as_bytes());
+        }
+        let metrics = parser.finish();
+        assert!(metrics.first_text_ms.is_some());
+        assert!(metrics.saw_message_stop);
+        assert!(metrics.saw_done);
     }
 
     #[test]

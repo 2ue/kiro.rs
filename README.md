@@ -225,6 +225,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
 | `compression.enabled` | boolean | `false` | 是否启用上游请求压缩；默认关闭 |
 | `compression.whitespaceCompression` | boolean | `true` | 启用 compression 后是否只做 JSON whitespace 压缩；默认只开启该低风险压缩 |
 | `payloadGuardEnabled` | boolean | `true` | 是否启用发送 Kiro 上游前的最终 payload 防护 |
+| `payloadGuardMode` | string | `on_too_long` | payload 防护触发模式。`on_too_long` 首次请求只做协议修复、不按大小预裁剪；仅在上游返回输入过长/请求体过大后按预算裁剪并重试一次。`preemptive` 保持旧行为，发送前超过预算即裁剪 |
 | `payloadGuardMaxBytes` | number | `460800` | 本地 payload 经验预算，按最终发送的 Kiro JSON body 字节数计算；它不是模型上下文上限。`0` 表示不按大小整形或裁剪，但仍执行 payload 协议修复 |
 | `payloadGuardTrimHistory` | boolean | `true` | payload 超出本地预算时是否允许裁剪最旧历史；关闭后只做协议修复，仍超预算会标记后透传给 Kiro |
 | `payloadShaping.enabled` | boolean | `true` | 超出本地预算时是否先执行低风险内容整形 |
@@ -280,6 +281,7 @@ KIRO_RS_VERSION=0.0.5 docker compose -f docker-compose.deploy.yml up -d
    "apiKeys": [],
    "adminApiKey": "sk-admin-your-secret-key",
    "payloadGuardEnabled": true,
+   "payloadGuardMode": "on_too_long",
    "payloadGuardMaxBytes": 460800,
    "payloadGuardTrimHistory": true,
    "payloadShaping": {
@@ -542,13 +544,13 @@ VITE_API_PROXY_TARGET=http://127.0.0.1:8990 bash scripts/dev-ui.sh ui
 | 端点 | 方法 | 描述 |
 |------|------|------|
 | `/cc/v1/models` | GET | 获取可用模型列表 |
-| `/cc/v1/messages` | POST | 创建消息（缓冲模式，确保 `input_tokens` 准确） |
+| `/cc/v1/messages` | POST | 创建消息（实时流式返回，最终 `message_delta.usage` 修正 token 用量） |
 | `/cc/v1/messages/count_tokens` | POST | 估算 Token 数量（与 `/v1` 相同） |
 
 > **`/cc/v1/messages` 与 `/v1/messages` 的区别**：
 > - `/v1/messages`：实时流式返回，`message_start` 中的 `input_tokens` 是估算值
-> - `/cc/v1/messages`：缓冲模式，等待上游流完成后，用从 `contextUsageEvent` 计算的准确 `input_tokens` 更正 `message_start`，然后一次性返回所有事件
-> - 等待期间会每 25 秒发送 `ping` 事件保活
+> - `/cc/v1/messages`：实时流式返回，`message_start` 先给估算用量；最终 `message_delta.usage` 会优先使用上游 metadata，缺失时用 `contextUsageEvent` 和模型输入窗口换算后修正
+> - 上游长时间无内容时仍会发送 `ping` 事件保活
 
 ### Thinking 模式
 

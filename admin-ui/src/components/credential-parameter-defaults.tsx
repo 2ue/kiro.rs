@@ -5,6 +5,7 @@ import { Input } from '@/components/ui/input'
 import type { AddCredentialRequest, ProxyResource } from '@/types/api'
 
 export interface CredentialParameterDefaults {
+  disabled: string
   priority: string
   maxConcurrentRequests: string
   rpm: string
@@ -21,6 +22,7 @@ export interface CredentialParameterDefaults {
 
 export function initialParameterDefaults(): CredentialParameterDefaults {
   return {
+    disabled: 'false',
     priority: '',
     maxConcurrentRequests: '',
     rpm: '',
@@ -68,6 +70,9 @@ export function mergeCredentialDefaults(
   const useProxyResource = typeof proxyResourceId === 'number'
   return {
     ...credential,
+    disabled: typeof credential.disabled === 'undefined' || credential.disabled === null
+      ? defaults.disabled === 'true'
+      : credential.disabled,
     priority: credential.priority ?? parseOptionalNonNegativeInteger(defaults.priority, '默认优先级'),
     maxConcurrentRequests: typeof credential.maxConcurrentRequests === 'undefined'
       ? parseOptionalNonNegativeInteger(defaults.maxConcurrentRequests, '默认账号并发')
@@ -202,6 +207,17 @@ export function CredentialParameterDefaultsPanel({
       </div>
 
       <div className="grid gap-3 md:grid-cols-2">
+        <FieldLabel title="导入后状态" description="导入 JSON 中已有 disabled 字段时优先使用账号自身值">
+          <select
+            value={defaults.disabled}
+            disabled={disabled}
+            onChange={(event) => update('disabled', event.target.value)}
+            className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <option value="false">启用</option>
+            <option value="true">禁用</option>
+          </select>
+        </FieldLabel>
         <FieldLabel title="默认优先级" description="留空时使用凭据自身值或 0">
           <Input type="number" min="0" value={defaults.priority} disabled={disabled} onChange={(event) => update('priority', event.target.value)} />
         </FieldLabel>

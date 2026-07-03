@@ -11,6 +11,14 @@
       "supportedInputTypes": ["TEXT", "IMAGE"]
     },
     {
+      "model": "claude-opus-4.8",
+      "displayName": "Claude Opus 4.8",
+      "maxInputTokens": 1000000,
+      "maxOutputTokens": 128000,
+      "supportsPromptCaching": true,
+      "supportedInputTypes": ["TEXT", "IMAGE"]
+    },
+    {
       "model": "best",
       "displayName": "Claude Code Alias: Best Available",
       "maxInputTokens": 200000,

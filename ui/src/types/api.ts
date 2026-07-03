@@ -503,6 +503,7 @@ export interface AddCredentialRequest {
   priority?: number
   maxConcurrentRequests?: number | null
   rpm?: number | null
+  disabled?: boolean | null
   region?: string
   authRegion?: string
   apiRegion?: string

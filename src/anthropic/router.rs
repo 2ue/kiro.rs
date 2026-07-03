@@ -174,7 +174,7 @@ pub fn create_router_with_provider(
         .with_state(na_v1_state);
 
     // 需要认证的 /cc/v1 路由（Claude Code 兼容端点）
-    // 与 /v1 的区别：流式响应会等待 contextUsageEvent 后再发送 message_start
+    // 与 /v1 的区别：实时流式返回，最终 message_delta.usage 修正用量。
     let cc_v1_routes = Router::new()
         .route("/models", get(get_models))
         .route("/messages", post(post_messages_cc))

@@ -107,10 +107,10 @@ pub fn count_tokens(text: &str) -> u64 {
 ///
 /// 优先调用远程 API，失败时回退到本地计算
 pub(crate) fn count_all_tokens(
-    model: String,
-    system: Option<Vec<SystemMessage>>,
-    messages: Vec<Message>,
-    tools: Option<Vec<Tool>>,
+    model: &str,
+    system: Option<&[SystemMessage]>,
+    messages: &[Message],
+    tools: Option<&[Tool]>,
 ) -> u64 {
     // 检查是否配置了远程 API
     if let Some(config) = get_config() {
@@ -142,19 +142,19 @@ pub(crate) fn count_all_tokens(
 async fn call_remote_count_tokens(
     api_url: &str,
     config: &CountTokensConfig,
-    model: String,
-    system: &Option<Vec<SystemMessage>>,
-    messages: &Vec<Message>,
-    tools: &Option<Vec<Tool>>,
+    model: &str,
+    system: &Option<&[SystemMessage]>,
+    messages: &&[Message],
+    tools: &Option<&[Tool]>,
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
     let client = build_client(config.proxy.as_ref(), 300, config.tls_backend)?;
 
     // 构建请求体
     let request = CountTokensRequest {
-        model: model, // 模型名称用于 token 计算
-        messages: messages.clone(),
-        system: system.clone(),
-        tools: tools.clone(),
+        model: model.to_string(), // 模型名称用于 token 计算
+        messages: messages.to_vec(),
+        system: system.map(<[SystemMessage]>::to_vec),
+        tools: tools.map(<[Tool]>::to_vec),
     };
 
     // 构建请求
@@ -186,14 +186,14 @@ async fn call_remote_count_tokens(
 
 /// 本地计算请求的输入 tokens
 fn count_all_tokens_local(
-    system: Option<Vec<SystemMessage>>,
-    messages: Vec<Message>,
-    tools: Option<Vec<Tool>>,
+    system: Option<&[SystemMessage]>,
+    messages: &[Message],
+    tools: Option<&[Tool]>,
 ) -> u64 {
     let mut total = 0;
 
     // 系统消息
-    if let Some(ref system) = system {
+    if let Some(system) = system {
         for msg in system {
             total += count_tokens(&msg.text);
         }
@@ -201,12 +201,12 @@ fn count_all_tokens_local(
 
     // 消息内容。Anthropic content blocks may carry large text outside the
     // top-level `text` field, especially tool_result.content and tool_use.input.
-    for msg in &messages {
+    for msg in messages {
         total += count_message_content_tokens(&msg.content);
     }
 
     // 工具定义
-    if let Some(ref tools) = tools {
+    if let Some(tools) = tools {
         for tool in tools {
             total += count_tokens(&tool.name);
             total += count_tokens(&tool.description);
@@ -383,7 +383,7 @@ mod tests {
     use serde_json::json;
 
     fn estimate(messages: Vec<Message>) -> u64 {
-        count_all_tokens_local(None, messages, None)
+        count_all_tokens_local(None, &messages, None)
     }
 
     #[test]

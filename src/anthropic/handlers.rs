@@ -54,9 +54,10 @@ use super::model_capabilities::{
 use super::payload_guard::{
     PayloadByteBreakdown, PayloadGuardConfig, PayloadGuardError, PayloadGuardReport,
     ToolUseFormatDiagnostics, breakdown_anthropic_messages_request, breakdown_kiro_request,
-    diagnose_kiro_tool_use_format, guard_anthropic_messages_request, guard_kiro_request,
+    diagnose_kiro_tool_use_format, guard_kiro_request,
     sanitize_anthropic_messages_for_external_forwarding, serialize_kiro_request,
 };
+use super::payload_guard_runtime::{prepare_external_messages_payload, prepare_kiro_request_body};
 use super::prompt_cache::{
     KiroRsToolPromptCachePlan, PromptCacheBounds, PromptCacheProfile, PromptCacheScope,
 };
@@ -459,7 +460,7 @@ fn log_kiro_conversion_summary(
     model_resolution: &ModelResolution,
     kiro_request: &KiroRequest,
     request_bytes: usize,
-    payload_guard_report: &PayloadGuardReport,
+    payload_guard_report: Option<&PayloadGuardReport>,
     warnings: &ProxyWarnings,
 ) {
     if !tracing::enabled!(tracing::Level::DEBUG) {
@@ -473,6 +474,13 @@ fn log_kiro_conversion_summary(
     let current_context = &current_user_input.user_input_message_context;
     let current_content = current_user_input.content.as_str();
     let warnings_header = warnings.encode_header();
+    let history_entries = kiro_request.conversation_state.history.len();
+    let original_history_entries = payload_guard_report
+        .map(|report| report.original_history_entries)
+        .unwrap_or(history_entries);
+    let final_history_entries = payload_guard_report
+        .map(|report| report.final_history_entries)
+        .unwrap_or(history_entries);
 
     tracing::debug!(
         endpoint,
@@ -480,8 +488,9 @@ fn log_kiro_conversion_summary(
         upstream_model = ?model_resolution.upstream_model,
         conversation_id = %kiro_request.conversation_state.conversation_id,
         request_bytes,
-        original_history_entries = payload_guard_report.original_history_entries,
-        final_history_entries = payload_guard_report.final_history_entries,
+        payload_guard_enabled = payload_guard_report.is_some(),
+        original_history_entries,
+        final_history_entries,
         current_message_bytes = current_content.len(),
         current_message_chars = current_content.chars().count(),
         current_message_hash = %short_text_hash(current_content),
@@ -817,7 +826,7 @@ struct PayloadTooLongRetryRequest {
 
 impl PayloadTooLongRetryRequest {
     fn new(
-        request: KiroRequest,
+        request: &KiroRequest,
         runtime_config: &RequestRuntimeConfig,
         endpoint: &str,
         requested_model: &str,
@@ -826,7 +835,7 @@ impl PayloadTooLongRetryRequest {
         conversion_warnings: Option<String>,
     ) -> Option<Self> {
         runtime_config.too_long_retry_enabled().then(|| Self {
-            request,
+            request: request.clone(),
             config: runtime_config.payload_guard_config(),
             endpoint: endpoint.to_string(),
             requested_model: requested_model.to_string(),
@@ -875,14 +884,14 @@ struct CachePointRetryRequest {
 
 impl CachePointRetryRequest {
     fn new(
-        request: KiroRequest,
+        request: &KiroRequest,
         endpoint: &str,
         requested_model: &str,
         upstream_model: Option<&str>,
         conversation_id: &str,
     ) -> Option<Self> {
         request.has_tool_cache_point_plan().then(|| Self {
-            request,
+            request: request.clone(),
             endpoint: endpoint.to_string(),
             requested_model: requested_model.to_string(),
             upstream_model: upstream_model.map(str::to_string),
@@ -981,9 +990,9 @@ fn build_external_fallback_context(
             error_id: envelope::request_id(),
             payload_guard_external_enabled: runtime_config.payload_guard_external_enabled,
             payload_guard_initial_config: runtime_config.initial_payload_guard_config(),
-            payload_guard_retry_config: runtime_config
-                .too_long_retry_enabled()
-                .then(|| runtime_config.payload_guard_config()),
+            payload_guard_retry_config: (runtime_config.payload_guard_external_enabled
+                && runtime_config.too_long_retry_enabled())
+            .then(|| runtime_config.payload_guard_config()),
         })
 }
 
@@ -1195,11 +1204,18 @@ impl ExternalFallbackContext {
         local_attempts: Vec<KiroCredentialAttempt>,
     ) -> Result<ExternalRouteRequest, PayloadGuardError> {
         let guarded_payload = self.guarded_route_payload()?;
+        let request_input_tokens = token::count_all_tokens(
+            &guarded_payload.payload.model,
+            guarded_payload.payload.system.as_deref(),
+            &guarded_payload.payload.messages,
+            guarded_payload.payload.tools.as_deref(),
+        ) as i32;
         Ok(ExternalRouteRequest {
             raw_body: guarded_payload.raw_body,
             headers: self.headers.clone(),
             endpoint: self.endpoint.clone(),
             payload: guarded_payload.payload,
+            request_input_tokens,
             upstream_model: self
                 .model_resolution
                 .as_ref()
@@ -1248,37 +1264,31 @@ impl ExternalFallbackContext {
     }
 
     fn guarded_route_payload(&self) -> Result<GuardedExternalRoutePayload, PayloadGuardError> {
-        let retry_config = self
-            .payload_guard_external_enabled
+        let guard_config = self.payload_guard_initial_config;
+        let retry_config = (self.payload_guard_external_enabled && guard_config.enabled)
             .then_some(())
             .and(self.payload_guard_retry_config);
-        if !self.payload_guard_external_enabled {
-            return Ok(GuardedExternalRoutePayload {
-                raw_body: self.raw_body.clone(),
-                payload: self.payload.clone(),
-                payload_breakdown: None,
-                payload_guard_report: None,
-                payload_guard_retry_config: None,
-            });
-        }
-
-        let mut payload = self.payload.clone();
-        let guard_config = self.payload_guard_initial_config;
-        match guard_anthropic_messages_request(&mut payload, guard_config, self.raw_body.len()) {
-            Ok((body, report)) => {
-                let should_send_serialized = report.was_modified()
-                    || (guard_config.max_bytes > 0
-                        && self.raw_body.len() > guard_config.max_bytes
-                        && body.len() <= self.raw_body.len());
-                let raw_body = if should_send_serialized {
-                    Bytes::from(body)
-                } else {
-                    self.raw_body.clone()
+        match prepare_external_messages_payload(
+            &self.payload,
+            &self.raw_body,
+            self.payload_guard_external_enabled,
+            guard_config,
+        ) {
+            Ok(prepared) => {
+                let Some(report) = prepared.report else {
+                    return Ok(GuardedExternalRoutePayload {
+                        raw_body: prepared.raw_body,
+                        payload: prepared.payload,
+                        payload_breakdown: None,
+                        payload_guard_report: None,
+                        payload_guard_retry_config: None,
+                    });
                 };
                 let include_diagnostics = should_log_payload_byte_breakdown(&report)
                     || (guard_config.max_bytes > 0 && self.raw_body.len() > guard_config.max_bytes);
-                let breakdown = include_diagnostics
-                    .then(|| breakdown_anthropic_messages_request(&payload, raw_body.len()));
+                let breakdown = include_diagnostics.then(|| {
+                    breakdown_anthropic_messages_request(&prepared.payload, prepared.raw_body.len())
+                });
                 if include_diagnostics {
                     log_payload_guard_report(
                         &report,
@@ -1287,7 +1297,7 @@ impl ExternalFallbackContext {
                         self.model_resolution
                             .as_ref()
                             .and_then(|resolution| resolution.upstream_model.as_deref()),
-                        extract_stable_conversation_id(&payload).as_deref(),
+                        extract_stable_conversation_id(&prepared.payload).as_deref(),
                     );
                     log_payload_byte_breakdown(
                         breakdown,
@@ -1297,15 +1307,18 @@ impl ExternalFallbackContext {
                         self.model_resolution
                             .as_ref()
                             .and_then(|resolution| resolution.upstream_model.as_deref()),
-                        extract_stable_conversation_id(&payload).as_deref(),
+                        extract_stable_conversation_id(&prepared.payload).as_deref(),
                     );
                 }
                 Ok(GuardedExternalRoutePayload {
-                    raw_body,
-                    payload,
+                    raw_body: prepared.raw_body,
+                    payload: prepared.payload,
                     payload_breakdown: breakdown,
                     payload_guard_report: include_diagnostics.then_some(report),
-                    payload_guard_retry_config: retry_config,
+                    payload_guard_retry_config: prepared
+                        .guard_applied
+                        .then_some(())
+                        .and(retry_config),
                 })
             }
             Err(err) => {
@@ -4474,6 +4487,13 @@ async fn post_messages_inner(
         external.refresh_payload(&payload);
     }
 
+    if let Some(external) = external_fallback.as_ref() {
+        let request_id = envelope::request_id();
+        if let Some(response) = external.direct_policy_response(&request_id).await {
+            return response;
+        }
+    }
+
     let model_resolution = match resolve_request_model(&state, &runtime_config, &endpoint, &payload)
     {
         Ok(resolution) => resolution,
@@ -4494,12 +4514,6 @@ async fn post_messages_inner(
     if let Some(external) = external_fallback.as_mut() {
         external.model_resolution = Some(model_resolution.clone());
     }
-    if let Some(external) = external_fallback.as_ref() {
-        let request_id = envelope::request_id();
-        if let Some(response) = external.direct_policy_response(&request_id).await {
-            return response;
-        }
-    }
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -4514,10 +4528,10 @@ async fn post_messages_inner(
 
         // 估算输入 tokens
         let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
+            &payload.model,
+            payload.system.as_deref(),
+            &payload.messages,
+            payload.tools.as_deref(),
         ) as i32;
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
@@ -4554,7 +4568,7 @@ async fn post_messages_inner(
     let conversation_id = kiro_request.conversation_state.conversation_id.clone();
 
     let too_long_retry = PayloadTooLongRetryRequest::new(
-        kiro_request.clone(),
+        &kiro_request,
         &runtime_config,
         &endpoint,
         &payload.model,
@@ -4564,39 +4578,45 @@ async fn post_messages_inner(
             .then(|| conversion_result.warnings.encode_header())
             .flatten(),
     );
-    let payload_guard_started_at = Instant::now();
-    let (request_body, payload_guard_report) = match guard_kiro_request(
+    let prepared_payload = match prepare_kiro_request_body(
         &mut kiro_request,
         runtime_config.initial_payload_guard_config(),
     ) {
         Ok(result) => result,
         Err(err) => return payload_guard_error_response(err),
     };
-    let payload_guard_elapsed = payload_guard_started_at.elapsed();
-    log_payload_guard_report(
-        &payload_guard_report,
-        &endpoint,
-        &payload.model,
-        model_resolution.upstream_model.as_deref(),
-        Some(&conversation_id),
-    );
-    let payload_breakdown = should_log_payload_byte_breakdown(&payload_guard_report)
-        .then(|| breakdown_kiro_request(&kiro_request, &request_body));
-    log_payload_byte_breakdown(
-        payload_breakdown,
-        &payload_guard_report,
-        &endpoint,
-        &payload.model,
-        model_resolution.upstream_model.as_deref(),
-        Some(&conversation_id),
-    );
+    let request_body = prepared_payload.body;
+    let payload_guard_report = prepared_payload.report;
+    if let Some(report) = payload_guard_report.as_ref() {
+        log_payload_guard_report(
+            report,
+            &endpoint,
+            &payload.model,
+            model_resolution.upstream_model.as_deref(),
+            Some(&conversation_id),
+        );
+    }
+    let payload_breakdown = payload_guard_report.as_ref().and_then(|report| {
+        should_log_payload_byte_breakdown(report)
+            .then(|| breakdown_kiro_request(&kiro_request, &request_body))
+    });
+    if let Some(report) = payload_guard_report.as_ref() {
+        log_payload_byte_breakdown(
+            payload_breakdown,
+            report,
+            &endpoint,
+            &payload.model,
+            model_resolution.upstream_model.as_deref(),
+            Some(&conversation_id),
+        );
+    }
     log_kiro_conversion_summary(
         &endpoint,
         &payload,
         &model_resolution,
         &kiro_request,
         request_body.len(),
-        &payload_guard_report,
+        payload_guard_report.as_ref(),
         &conversion_result.warnings,
     );
     if model_resolution.is_remapped() {
@@ -4617,7 +4637,10 @@ async fn post_messages_inner(
         upstream_model = ?model_resolution.upstream_model,
         conversation_id = %conversation_id,
         request_bytes = request_body.len(),
-        history_entries = payload_guard_report.final_history_entries,
+        history_entries = payload_guard_report
+            .as_ref()
+            .map(|report| report.final_history_entries)
+            .unwrap_or_else(|| kiro_request.conversation_state.history.len()),
         current_tool_count = kiro_request.conversation_state.current_message.user_input_message.user_input_message_context.tools.len(),
         current_tool_result_count = kiro_request.conversation_state.current_message.user_input_message.user_input_message_context.tool_results.len(),
         current_image_count = kiro_request.conversation_state.current_message.user_input_message.images.len(),
@@ -4634,10 +4657,10 @@ async fn post_messages_inner(
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system.clone(),
-        payload.messages.clone(),
-        payload.tools.clone(),
+        &payload.model,
+        payload.system.as_deref(),
+        &payload.messages,
+        payload.tools.as_deref(),
     ) as i32;
     let mut usage_context = prepare_usage_context(
         &state,
@@ -4649,9 +4672,13 @@ async fn post_messages_inner(
         Some(conversation_id.clone()),
         prompt_cache_scope_conversation_id(cache_type, request_simulation_mode, &payload),
         input_tokens,
-    )
-    .with_payload_diagnostics(payload_breakdown, payload_guard_report.clone());
-    usage_context.mark_payload_guard_latency(payload_guard_elapsed);
+    );
+    if let Some(report) = payload_guard_report.clone() {
+        usage_context = usage_context.with_payload_diagnostics(payload_breakdown, report);
+    }
+    if let Some(elapsed) = prepared_payload.guard_elapsed {
+        usage_context.mark_payload_guard_latency(elapsed);
+    }
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -4665,14 +4692,14 @@ async fn post_messages_inner(
     let warnings_header = if should_expose_proxy_warnings(&runtime_config) {
         merge_warning_headers(
             conversion_result.warnings.encode_header(),
-            Some(&payload_guard_report),
+            payload_guard_report.as_ref(),
         )
     } else {
         None
     };
     let extract_xml_thinking = runtime_config.compat_profile.allows_unsigned_thinking();
     let cache_point_retry = CachePointRetryRequest::new(
-        kiro_request.clone(),
+        &kiro_request,
         &endpoint,
         &payload.model,
         model_resolution.upstream_model.as_deref(),
@@ -4811,6 +4838,9 @@ fn local_rescue_reason_after_external_error(
     err: &ExternalPoolFinalError,
     _local_fallback_reason: Option<&str>,
 ) -> Option<&'static str> {
+    if config.external_direct_policy_enabled {
+        return None;
+    }
     if !config.external_pool_local_rescue_enabled {
         return None;
     }
@@ -6949,10 +6979,10 @@ pub async fn count_tokens(
     );
 
     let total_tokens = token::count_all_tokens(
-        payload.model,
-        payload.system,
-        payload.messages,
-        payload.tools,
+        &payload.model,
+        payload.system.as_deref(),
+        &payload.messages,
+        payload.tools.as_deref(),
     ) as i32;
 
     Json(CountTokensResponse {
@@ -6971,10 +7001,10 @@ pub async fn count_tokens_dfcache(
     }
 
     let total_tokens = token::count_all_tokens(
-        payload.model,
-        payload.system,
-        payload.messages,
-        payload.tools,
+        &payload.model,
+        payload.system.as_deref(),
+        &payload.messages,
+        payload.tools.as_deref(),
     ) as i32;
 
     Json(CountTokensResponse {
@@ -7052,6 +7082,13 @@ pub async fn post_messages_cc(
         external.refresh_payload(&payload);
     }
 
+    if let Some(external) = external_fallback.as_ref() {
+        let request_id = envelope::request_id();
+        if let Some(response) = external.direct_policy_response(&request_id).await {
+            return response;
+        }
+    }
+
     let model_resolution =
         match resolve_request_model(&state, &runtime_config, "/cc/v1/messages", &payload) {
             Ok(resolution) => resolution,
@@ -7072,12 +7109,6 @@ pub async fn post_messages_cc(
     if let Some(external) = external_fallback.as_mut() {
         external.model_resolution = Some(model_resolution.clone());
     }
-    if let Some(external) = external_fallback.as_ref() {
-        let request_id = envelope::request_id();
-        if let Some(response) = external.direct_policy_response(&request_id).await {
-            return response;
-        }
-    }
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -7092,10 +7123,10 @@ pub async fn post_messages_cc(
 
         // 估算输入 tokens
         let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
+            &payload.model,
+            payload.system.as_deref(),
+            &payload.messages,
+            payload.tools.as_deref(),
         ) as i32;
 
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
@@ -7132,7 +7163,7 @@ pub async fn post_messages_cc(
     let conversation_id = kiro_request.conversation_state.conversation_id.clone();
 
     let too_long_retry = PayloadTooLongRetryRequest::new(
-        kiro_request.clone(),
+        &kiro_request,
         &runtime_config,
         "/cc/v1/messages",
         &payload.model,
@@ -7142,39 +7173,45 @@ pub async fn post_messages_cc(
             .then(|| conversion_result.warnings.encode_header())
             .flatten(),
     );
-    let payload_guard_started_at = Instant::now();
-    let (request_body, payload_guard_report) = match guard_kiro_request(
+    let prepared_payload = match prepare_kiro_request_body(
         &mut kiro_request,
         runtime_config.initial_payload_guard_config(),
     ) {
         Ok(result) => result,
         Err(err) => return payload_guard_error_response(err),
     };
-    let payload_guard_elapsed = payload_guard_started_at.elapsed();
-    log_payload_guard_report(
-        &payload_guard_report,
-        "/cc/v1/messages",
-        &payload.model,
-        model_resolution.upstream_model.as_deref(),
-        Some(&conversation_id),
-    );
-    let payload_breakdown = should_log_payload_byte_breakdown(&payload_guard_report)
-        .then(|| breakdown_kiro_request(&kiro_request, &request_body));
-    log_payload_byte_breakdown(
-        payload_breakdown,
-        &payload_guard_report,
-        "/cc/v1/messages",
-        &payload.model,
-        model_resolution.upstream_model.as_deref(),
-        Some(&conversation_id),
-    );
+    let request_body = prepared_payload.body;
+    let payload_guard_report = prepared_payload.report;
+    if let Some(report) = payload_guard_report.as_ref() {
+        log_payload_guard_report(
+            report,
+            "/cc/v1/messages",
+            &payload.model,
+            model_resolution.upstream_model.as_deref(),
+            Some(&conversation_id),
+        );
+    }
+    let payload_breakdown = payload_guard_report.as_ref().and_then(|report| {
+        should_log_payload_byte_breakdown(report)
+            .then(|| breakdown_kiro_request(&kiro_request, &request_body))
+    });
+    if let Some(report) = payload_guard_report.as_ref() {
+        log_payload_byte_breakdown(
+            payload_breakdown,
+            report,
+            "/cc/v1/messages",
+            &payload.model,
+            model_resolution.upstream_model.as_deref(),
+            Some(&conversation_id),
+        );
+    }
     log_kiro_conversion_summary(
         "/cc/v1/messages",
         &payload,
         &model_resolution,
         &kiro_request,
         request_body.len(),
-        &payload_guard_report,
+        payload_guard_report.as_ref(),
         &conversion_result.warnings,
     );
     if model_resolution.is_remapped() {
@@ -7195,7 +7232,10 @@ pub async fn post_messages_cc(
         upstream_model = ?model_resolution.upstream_model,
         conversation_id = %conversation_id,
         request_bytes = request_body.len(),
-        history_entries = payload_guard_report.final_history_entries,
+        history_entries = payload_guard_report
+            .as_ref()
+            .map(|report| report.final_history_entries)
+            .unwrap_or_else(|| kiro_request.conversation_state.history.len()),
         current_tool_count = kiro_request.conversation_state.current_message.user_input_message.user_input_message_context.tools.len(),
         current_tool_result_count = kiro_request.conversation_state.current_message.user_input_message.user_input_message_context.tool_results.len(),
         current_image_count = kiro_request.conversation_state.current_message.user_input_message.images.len(),
@@ -7212,10 +7252,10 @@ pub async fn post_messages_cc(
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system.clone(),
-        payload.messages.clone(),
-        payload.tools.clone(),
+        &payload.model,
+        payload.system.as_deref(),
+        &payload.messages,
+        payload.tools.as_deref(),
     ) as i32;
     let mut usage_context = prepare_usage_context(
         &state,
@@ -7227,9 +7267,13 @@ pub async fn post_messages_cc(
         Some(conversation_id.clone()),
         prompt_cache_scope_conversation_id(cache_type, request_simulation_mode, &payload),
         input_tokens,
-    )
-    .with_payload_diagnostics(payload_breakdown, payload_guard_report.clone());
-    usage_context.mark_payload_guard_latency(payload_guard_elapsed);
+    );
+    if let Some(report) = payload_guard_report.clone() {
+        usage_context = usage_context.with_payload_diagnostics(payload_breakdown, report);
+    }
+    if let Some(elapsed) = prepared_payload.guard_elapsed {
+        usage_context.mark_payload_guard_latency(elapsed);
+    }
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -7243,14 +7287,14 @@ pub async fn post_messages_cc(
     let warnings_header = if should_expose_proxy_warnings(&runtime_config) {
         merge_warning_headers(
             conversion_result.warnings.encode_header(),
-            Some(&payload_guard_report),
+            payload_guard_report.as_ref(),
         )
     } else {
         None
     };
     let extract_xml_thinking = runtime_config.compat_profile.allows_unsigned_thinking();
     let cache_point_retry = CachePointRetryRequest::new(
-        kiro_request.clone(),
+        &kiro_request,
         "/cc/v1/messages",
         &payload.model,
         model_resolution.upstream_model.as_deref(),
@@ -10835,6 +10879,13 @@ Return a fix plan."#
         disabled.external_pool_local_rescue_enabled = false;
         assert_eq!(
             local_rescue_reason_after_external_error(&disabled, &rate_limit, None),
+            None
+        );
+
+        let mut direct = config.clone();
+        direct.external_direct_policy_enabled = true;
+        assert_eq!(
+            local_rescue_reason_after_external_error(&direct, &rate_limit, None),
             None
         );
 

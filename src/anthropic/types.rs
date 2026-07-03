@@ -61,6 +61,10 @@ pub struct Model {
     #[serde(rename = "type")]
     pub model_type: String,
     pub max_tokens: i32,
+    #[serde(rename = "maxInputTokens", skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<i32>,
+    #[serde(rename = "contextWindow", skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<i32>,
 }
 
 /// 模型列表响应

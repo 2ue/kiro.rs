@@ -1957,7 +1957,7 @@ pub enum PayloadGuardMode {
 
 impl Default for PayloadGuardMode {
     fn default() -> Self {
-        Self::Preemptive
+        Self::OnTooLong
     }
 }
 
@@ -2182,6 +2182,13 @@ impl Default for RedisConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
+    /// Runtime config migration marker persisted in PgSQL.
+    ///
+    /// File configs loaded through `Config::load` are treated as current so
+    /// explicit operator choices are not rewritten as legacy defaults.
+    #[serde(default)]
+    pub runtime_config_migration_version: u32,
+
     /// PgSQL 配置。服务启动必须可连接；首次启动可从配置文件 bootstrap 运行配置和凭据。
     #[serde(default)]
     pub postgres: PostgresConfig,
@@ -2646,6 +2653,8 @@ fn default_region() -> String {
     "us-east-1".to_string()
 }
 
+const CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION: u32 = 1;
+
 fn default_kiro_version() -> String {
     "0.11.107".to_string()
 }
@@ -2840,7 +2849,7 @@ fn default_payload_guard_enabled() -> bool {
 }
 
 fn default_payload_guard_mode() -> PayloadGuardMode {
-    PayloadGuardMode::Preemptive
+    PayloadGuardMode::OnTooLong
 }
 
 fn default_payload_guard_max_bytes() -> usize {
@@ -3227,6 +3236,7 @@ fn normalize_request_api_keys(keys: impl IntoIterator<Item = impl AsRef<str>>) -
 impl Default for Config {
     fn default() -> Self {
         Self {
+            runtime_config_migration_version: CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION,
             postgres: PostgresConfig::default(),
             redis: RedisConfig::default(),
             host: default_host(),
@@ -3456,6 +3466,13 @@ impl Config {
     pub fn apply_runtime_config_migrations(&mut self) -> bool {
         let mut changed = self.cache_policy.migrate_builtin_no_cache_routes();
         changed |= self.reported_usage.path_overrides.remove("/na").is_some();
+        if self.runtime_config_migration_version < 1 {
+            if self.payload_guard_mode == PayloadGuardMode::Preemptive {
+                self.payload_guard_mode = PayloadGuardMode::OnTooLong;
+            }
+            self.runtime_config_migration_version = 1;
+            changed = true;
+        }
         changed
     }
 
@@ -3471,6 +3488,7 @@ impl Config {
 
         let content = fs::read_to_string(path)?;
         let mut config: Config = serde_json::from_str(&content)?;
+        config.runtime_config_migration_version = CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION;
         config.apply_env_overrides();
         config.config_path = Some(path.to_path_buf());
         Ok(config)
@@ -3539,6 +3557,10 @@ mod tests {
     fn default_runtime_controls_are_conservative() {
         let config = Config::default();
 
+        assert_eq!(
+            config.runtime_config_migration_version,
+            CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
+        );
         assert_eq!(config.postgres.max_connections, 10);
         assert!(config.postgres.migrate_on_start);
         assert!(!config.postgres.compress_usage_rollups_on_start);
@@ -3564,7 +3586,7 @@ mod tests {
         assert_eq!(config.credential_warmup_selection_percent, 5);
         assert_eq!(config.credential_warmup_max_selection_percent, 50);
         assert!(config.payload_guard_enabled);
-        assert_eq!(config.payload_guard_mode, PayloadGuardMode::Preemptive);
+        assert_eq!(config.payload_guard_mode, PayloadGuardMode::OnTooLong);
         assert_eq!(config.payload_guard_max_bytes, 450 * 1024);
         assert_eq!(config.payload_guard_safety_margin_bytes, 32 * 1024);
         assert!(config.payload_guard_trim_history);
@@ -4859,6 +4881,24 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_migration_rewrites_legacy_payload_guard_default_once() {
+        let mut config = Config::default();
+        config.runtime_config_migration_version = 0;
+        config.payload_guard_mode = PayloadGuardMode::Preemptive;
+
+        assert!(config.apply_runtime_config_migrations());
+        assert_eq!(config.payload_guard_mode, PayloadGuardMode::OnTooLong);
+        assert_eq!(
+            config.runtime_config_migration_version,
+            CURRENT_RUNTIME_CONFIG_MIGRATION_VERSION
+        );
+
+        config.payload_guard_mode = PayloadGuardMode::Preemptive;
+        assert!(!config.apply_runtime_config_migrations());
+        assert_eq!(config.payload_guard_mode, PayloadGuardMode::Preemptive);
+    }
+
+    #[test]
     fn cache_policy_legacy_defined_cache_routes_default_to_current_strategy() {
         let mut config = Config::default();
         config.defined_cache_routes = vec!["/dfcache/team-a".to_string()];
@@ -4948,6 +4988,8 @@ mod tests {
         let example_path = std::path::Path::new(manifest_dir).join("config.example.json");
         let json = std::fs::read_to_string(example_path).unwrap();
         let config: Config = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(config.payload_guard_mode, PayloadGuardMode::OnTooLong);
 
         let default_policy = config.reported_usage.policy_for_path("/v1/messages");
         assert_eq!(default_policy.input.mode, ReportedUsageFieldMode::Raw);

@@ -71,7 +71,7 @@ async function verifyImportedCredential(
 
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
-  const [verificationMode, setVerificationMode] = useState<ImportVerificationMode>('model_and_subscription')
+  const [verificationMode, setVerificationMode] = useState<ImportVerificationMode>('subscription_only')
   const [importing, setImporting] = useState(false)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
@@ -111,7 +111,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     setCurrentProcessing('')
     setResults([])
     setDefaults(initialParameterDefaults())
-    setVerificationMode('model_and_subscription')
+    setVerificationMode('subscription_only')
   }
 
   const appendCredentialsToInput = (credentials: AddCredentialRequest[]) => {
@@ -308,6 +308,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               priority: cred.priority || 0,
               maxConcurrentRequests: cred.maxConcurrentRequests ?? undefined,
               rpm: cred.rpm ?? undefined,
+              disabled: cred.disabled ?? false,
               region: cred.region?.trim() || undefined,
               authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
               apiRegion: cred.apiRegion?.trim() || undefined,
@@ -383,6 +384,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             priority: cred.priority || 0,
             maxConcurrentRequests: cred.maxConcurrentRequests ?? undefined,
             rpm: cred.rpm ?? undefined,
+            disabled: cred.disabled ?? false,
             machineId: cred.machineId?.trim() || undefined,
             proxyUrl: cred.proxyUrl?.trim() || undefined,
             proxyUsername: cred.proxyUsername?.trim() || undefined,
@@ -533,7 +535,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     >
       <DialogContent className="sm:max-w-2xl max-h-[80vh] flex flex-col">
         <DialogHeader>
-          <DialogTitle>批量导入账号（自动验活）</DialogTitle>
+          <DialogTitle>批量导入账号（默认查询订阅）</DialogTitle>
         </DialogHeader>
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
@@ -565,7 +567,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
             <p className="text-xs text-muted-foreground">
-              支持单选或多选文件。导入时自动验活，失败的账号会被排除。
+              支持单选或多选文件。导入后默认查询订阅，也可改为模型测试；失败的账号会被排除。
             </p>
           </div>
 
@@ -588,8 +590,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               disabled={importing}
               className="mt-2 flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              <option value="model_and_subscription">测试模型 + 查询订阅</option>
               <option value="subscription_only">只查询订阅（不请求模型）</option>
+              <option value="model_and_subscription">测试模型 + 查询订阅</option>
             </select>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
               只查询订阅时不会发送模型测试请求；订阅查询失败的账号仍会按验活失败回滚。
@@ -703,7 +705,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               onClick={() => handleBatchImport()}
               disabled={importing || !jsonInput.trim()}
             >
-              开始导入并验活
+              开始导入
             </Button>
           )}
         </DialogFooter>

@@ -20,6 +20,7 @@ use crate::kiro::model::requests::{
     tool::{Tool, ToolResult},
 };
 use crate::model::config::{OversizedImageHandling, PayloadShapingConfig};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -843,11 +844,65 @@ fn claim_tool_diagnostic_item(scanned: &mut usize, truncated: &mut bool) -> bool
     true
 }
 
+#[cfg(test)]
 pub fn guard_anthropic_messages_request(
     request: &mut MessagesRequest,
     config: PayloadGuardConfig,
     original_body_bytes: usize,
 ) -> Result<(String, PayloadGuardReport), PayloadGuardError> {
+    let (body, report) =
+        guard_anthropic_messages_request_inner(request, config, original_body_bytes, None)?;
+    let body = String::from_utf8(body.to_vec())
+        .map_err(|err| PayloadGuardError::Serialize(err.to_string()))?;
+    Ok((body, report))
+}
+
+pub fn guard_anthropic_messages_request_reusing_body(
+    request: &mut MessagesRequest,
+    config: PayloadGuardConfig,
+    original_body: &Bytes,
+) -> Result<(Bytes, PayloadGuardReport), PayloadGuardError> {
+    guard_anthropic_messages_request_inner(
+        request,
+        config,
+        original_body.len(),
+        Some(original_body),
+    )
+}
+
+fn serialize_anthropic_body_into(
+    body: &mut Option<String>,
+    request: &MessagesRequest,
+    serialize_elapsed: &mut Duration,
+) -> Result<usize, PayloadGuardError> {
+    let serialize_started_at = Instant::now();
+    let serialized = serialize_anthropic_request(request)?;
+    *serialize_elapsed += serialize_started_at.elapsed();
+    let len = serialized.len();
+    *body = Some(serialized);
+    Ok(len)
+}
+
+fn take_or_serialize_anthropic_body(
+    body: &mut Option<String>,
+    request: &MessagesRequest,
+    serialize_elapsed: &mut Duration,
+) -> Result<String, PayloadGuardError> {
+    if let Some(body) = body.take() {
+        return Ok(body);
+    }
+    let serialize_started_at = Instant::now();
+    let serialized = serialize_anthropic_request(request)?;
+    *serialize_elapsed += serialize_started_at.elapsed();
+    Ok(serialized)
+}
+
+fn guard_anthropic_messages_request_inner(
+    request: &mut MessagesRequest,
+    config: PayloadGuardConfig,
+    original_body_bytes: usize,
+    original_body: Option<&Bytes>,
+) -> Result<(Bytes, PayloadGuardReport), PayloadGuardError> {
     let guard_started_at = Instant::now();
     let mut serialize_elapsed = Duration::ZERO;
     let mut repair_elapsed = Duration::ZERO;
@@ -856,25 +911,34 @@ pub fn guard_anthropic_messages_request(
     let mut current_shaping_elapsed = Duration::ZERO;
     let mut history_trim_iterations = 0usize;
 
-    let serialize_started_at = Instant::now();
-    let mut body = serialize_anthropic_request(request)?;
-    serialize_elapsed += serialize_started_at.elapsed();
+    let mut body = None;
     let original_history_entries = request.messages.len().saturating_sub(1);
+    let size_limit_enabled = config.max_bytes > 0;
+
+    if original_body.is_none()
+        || !config.enabled
+        || (size_limit_enabled && original_body_bytes > config.max_bytes)
+    {
+        serialize_anthropic_body_into(&mut body, request, &mut serialize_elapsed)?;
+    }
 
     if !config.enabled {
         let mut report =
             PayloadGuardReport::disabled(original_body_bytes, original_history_entries);
-        report.body_sha256 = Some(sha256_hex(&body));
+        let body = body
+            .map(Bytes::from)
+            .or_else(|| original_body.cloned())
+            .ok_or_else(|| PayloadGuardError::Serialize("missing request body".to_string()))?;
+        report.body_sha256 = Some(sha256_hex_bytes(&body));
         return Ok((body, report));
     }
 
-    let size_limit_enabled = config.max_bytes > 0;
     let mut report = new_payload_guard_report(
         config.max_bytes,
         original_body_bytes,
         original_history_entries,
     );
-    let mut final_bytes = if size_limit_enabled && original_body_bytes > config.max_bytes {
+    let mut final_bytes = if let Some(body) = body.as_ref() {
         body.len()
     } else {
         original_body_bytes
@@ -888,10 +952,7 @@ pub fn guard_anthropic_messages_request(
     repair_elapsed += repair_started_at.elapsed();
 
     if should_reserialize {
-        let serialize_started_at = Instant::now();
-        body = serialize_anthropic_request(request)?;
-        serialize_elapsed += serialize_started_at.elapsed();
-        final_bytes = body.len();
+        final_bytes = serialize_anthropic_body_into(&mut body, request, &mut serialize_elapsed)?;
         report.final_bytes = final_bytes;
     }
 
@@ -910,10 +971,8 @@ pub fn guard_anthropic_messages_request(
         let should_reserialize = should_reserialize || current_safety_shaping.was_modified();
         add_current_shaping_stats_to_report(&mut report, &current_safety_shaping);
         if should_reserialize {
-            let serialize_started_at = Instant::now();
-            body = serialize_anthropic_request(request)?;
-            serialize_elapsed += serialize_started_at.elapsed();
-            final_bytes = body.len();
+            final_bytes =
+                serialize_anthropic_body_into(&mut body, request, &mut serialize_elapsed)?;
             report.final_bytes = final_bytes;
         }
         shaping_elapsed += shaping_started_at.elapsed();
@@ -926,10 +985,8 @@ pub fn guard_anthropic_messages_request(
         add_shaping_stats_to_report(&mut report, shaping);
 
         if should_reserialize {
-            let serialize_started_at = Instant::now();
-            body = serialize_anthropic_request(request)?;
-            serialize_elapsed += serialize_started_at.elapsed();
-            final_bytes = body.len();
+            final_bytes =
+                serialize_anthropic_body_into(&mut body, request, &mut serialize_elapsed)?;
             report.final_bytes = final_bytes;
         }
         shaping_elapsed += shaping_started_at.elapsed();
@@ -949,10 +1006,8 @@ pub fn guard_anthropic_messages_request(
             add_anthropic_repair_stats_to_report(&mut report, repair);
             repair_elapsed += repair_started_at.elapsed();
 
-            let serialize_started_at = Instant::now();
-            body = serialize_anthropic_request(request)?;
-            serialize_elapsed += serialize_started_at.elapsed();
-            let new_size = body.len();
+            let new_size =
+                serialize_anthropic_body_into(&mut body, request, &mut serialize_elapsed)?;
             if new_size >= final_bytes && after_trim == before {
                 break;
             }
@@ -968,15 +1023,17 @@ pub fn guard_anthropic_messages_request(
         && current_payload_shaping_enabled(config.shaping)
     {
         let current_started_at = Instant::now();
+        let current_body =
+            take_or_serialize_anthropic_body(&mut body, request, &mut serialize_elapsed)?;
         let (new_body, current_stats) = apply_anthropic_current_payload_shaping_until_fit(
             request,
             config.shaping,
             config.max_bytes,
-            body,
+            current_body,
         )?;
         add_current_shaping_stats_to_report(&mut report, &current_stats);
-        body = new_body;
-        final_bytes = body.len();
+        final_bytes = new_body.len();
+        body = Some(new_body);
         report.final_bytes = final_bytes;
         current_shaping_elapsed += current_started_at.elapsed();
 
@@ -988,10 +1045,8 @@ pub fn guard_anthropic_messages_request(
             repair_elapsed += repair_started_at.elapsed();
 
             if should_reserialize {
-                let serialize_started_at = Instant::now();
-                body = serialize_anthropic_request(request)?;
-                serialize_elapsed += serialize_started_at.elapsed();
-                final_bytes = body.len();
+                final_bytes =
+                    serialize_anthropic_body_into(&mut body, request, &mut serialize_elapsed)?;
                 report.final_bytes = final_bytes;
             }
         }
@@ -999,7 +1054,11 @@ pub fn guard_anthropic_messages_request(
 
     report.final_history_entries = request.messages.len().saturating_sub(1);
     report.still_oversized = size_limit_enabled && final_bytes > config.max_bytes;
-    report.body_sha256 = Some(sha256_hex(&body));
+    let body = body
+        .map(Bytes::from)
+        .or_else(|| original_body.cloned())
+        .ok_or_else(|| PayloadGuardError::Serialize("missing request body".to_string()))?;
+    report.body_sha256 = Some(sha256_hex_bytes(&body));
     log_payload_guard_timing(
         "anthropic",
         guard_started_at.elapsed(),
@@ -1136,10 +1195,14 @@ fn new_payload_guard_report(
     }
 }
 
-fn sha256_hex(value: &str) -> String {
+fn sha256_hex_bytes(value: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(value.as_bytes());
+    hasher.update(value);
     format!("{:x}", hasher.finalize())
+}
+
+fn sha256_hex(value: &str) -> String {
+    sha256_hex_bytes(value.as_bytes())
 }
 
 pub fn serialize_kiro_request(request: &KiroRequest) -> Result<String, PayloadGuardError> {

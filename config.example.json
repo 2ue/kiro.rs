@@ -13,6 +13,7 @@
   "kiroUpstreamResponseTimeoutSecs": 180,
   "credentialRetryMaxAttempts": 0,
   "payloadGuardEnabled": true,
+  "payloadGuardMode": "on_too_long",
   "payloadGuardMaxBytes": 460800,
   "payloadGuardTrimHistory": true,
   "payloadGuardExternalEnabled": true,

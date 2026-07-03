@@ -153,7 +153,7 @@ impl AppState {
             model_mapping: ModelMappingConfig::default(),
             expose_proxy_warnings: expose_proxy_warnings || compat_profile.is_debug(),
             payload_guard_enabled: true,
-            payload_guard_mode: PayloadGuardMode::Preemptive,
+            payload_guard_mode: PayloadGuardMode::OnTooLong,
             payload_guard_max_bytes: 450 * 1024,
             payload_guard_safety_margin_bytes: 32 * 1024,
             payload_guard_trim_history: true,

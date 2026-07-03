@@ -358,17 +358,17 @@ export function ExternalPoolsPanel() {
   }
 
   const externalEnabled = configDraft.externalPoolsEnabled
-  const fallbackActive = externalEnabled && (
+  const directPolicyActive = externalEnabled && configDraft.externalDirectPolicyEnabled
+  const fallbackActive = externalEnabled && !directPolicyActive && (
     configDraft.localPoolPreflightEnabled
     || configDraft.fallbackOnLocalCapacityExhausted
     || configDraft.fallbackOnNoAvailableCredentials
     || configDraft.fallbackOnLocalTransientExhausted
     || configDraft.fallbackOnUnsupportedModel
   )
-  const directPolicyActive = externalEnabled && configDraft.externalDirectPolicyEnabled
   const autoDisableActive = externalEnabled && configDraft.externalPoolAutoDisableEnabled
   const waitModeActive = externalEnabled && configDraft.externalPoolCapacityMode === 'wait'
-  const localRescueActive = externalEnabled && configDraft.externalPoolLocalRescueEnabled
+  const localRescueActive = externalEnabled && !directPolicyActive && configDraft.externalPoolLocalRescueEnabled
   const cacheUpliftActive = externalEnabled && configDraft.externalPoolUsageProjectionUpliftPercent > 0
   const outputUpliftActive = externalEnabled
     && configDraft.externalPoolUsageProjectionOutputUpliftMinTokens > 0
@@ -433,30 +433,30 @@ export function ExternalPoolsPanel() {
           <PolicyBlock
             title="2. 什么时候进入备用池"
             active={externalEnabled}
-            description="fallback 是本地凭证不可用后再转外部池；显式直连是命中规则后直接走外部池。"
+            description="启用显式直连后，所有请求跳过本地凭证，只调度外部池；关闭后才使用本地优先 fallback。"
           >
             <div className="grid gap-4 lg:grid-cols-2">
               <FormSection title="本地优先 fallback" description="先调度本地凭证，只有下面情况出现时才转外部池。">
                 <div className="grid gap-3 sm:grid-cols-2">
-                  <Toggle disabled={!externalEnabled} label="本地容量预检" checked={configDraft.localPoolPreflightEnabled} onChange={(localPoolPreflightEnabled) => setConfigDraft((prev) => ({ ...prev, localPoolPreflightEnabled }))} />
-                  <Toggle disabled={!externalEnabled} label="容量不足 fallback" checked={configDraft.fallbackOnLocalCapacityExhausted} onChange={(fallbackOnLocalCapacityExhausted) => setConfigDraft((prev) => ({ ...prev, fallbackOnLocalCapacityExhausted }))} />
-                  <Toggle disabled={!externalEnabled} label="无可用凭据 fallback" checked={configDraft.fallbackOnNoAvailableCredentials} onChange={(fallbackOnNoAvailableCredentials) => setConfigDraft((prev) => ({ ...prev, fallbackOnNoAvailableCredentials }))} />
-                  <Toggle disabled={!externalEnabled} label="瞬态错误耗尽 fallback" checked={configDraft.fallbackOnLocalTransientExhausted} onChange={(fallbackOnLocalTransientExhausted) => setConfigDraft((prev) => ({ ...prev, fallbackOnLocalTransientExhausted }))} />
-                  <Toggle disabled={!externalEnabled} label="模型不支持 fallback" checked={configDraft.fallbackOnUnsupportedModel} onChange={(fallbackOnUnsupportedModel) => setConfigDraft((prev) => ({ ...prev, fallbackOnUnsupportedModel }))} />
+                  <Toggle disabled={!externalEnabled || directPolicyActive} label="本地容量预检" checked={configDraft.localPoolPreflightEnabled} onChange={(localPoolPreflightEnabled) => setConfigDraft((prev) => ({ ...prev, localPoolPreflightEnabled }))} />
+                  <Toggle disabled={!externalEnabled || directPolicyActive} label="容量不足 fallback" checked={configDraft.fallbackOnLocalCapacityExhausted} onChange={(fallbackOnLocalCapacityExhausted) => setConfigDraft((prev) => ({ ...prev, fallbackOnLocalCapacityExhausted }))} />
+                  <Toggle disabled={!externalEnabled || directPolicyActive} label="无可用凭据 fallback" checked={configDraft.fallbackOnNoAvailableCredentials} onChange={(fallbackOnNoAvailableCredentials) => setConfigDraft((prev) => ({ ...prev, fallbackOnNoAvailableCredentials }))} />
+                  <Toggle disabled={!externalEnabled || directPolicyActive} label="瞬态错误耗尽 fallback" checked={configDraft.fallbackOnLocalTransientExhausted} onChange={(fallbackOnLocalTransientExhausted) => setConfigDraft((prev) => ({ ...prev, fallbackOnLocalTransientExhausted }))} />
+                  <Toggle disabled={!externalEnabled || directPolicyActive} label="模型不支持 fallback" checked={configDraft.fallbackOnUnsupportedModel} onChange={(fallbackOnUnsupportedModel) => setConfigDraft((prev) => ({ ...prev, fallbackOnUnsupportedModel }))} />
                 </div>
               </FormSection>
 
-              <FormSection title="显式直连" description="命中规则后绕过本地凭证，直接进入外部池。">
+              <FormSection title="显式直连" description="开关打开即全量直连外部池；模型和路径规则只用于细分记录的直连原因。">
                 <div className="grid gap-3 sm:grid-cols-2">
                   <Toggle disabled={!externalEnabled} label="启用显式直连" checked={configDraft.externalDirectPolicyEnabled} onChange={(externalDirectPolicyEnabled) => setConfigDraft((prev) => ({ ...prev, externalDirectPolicyEnabled }))} />
-                  <Toggle disabled={!directPolicyActive} label="本地熔断时直连" checked={configDraft.directExternalOnLocalMaintenance} onChange={(directExternalOnLocalMaintenance) => setConfigDraft((prev) => ({ ...prev, directExternalOnLocalMaintenance }))} />
+                  <Toggle disabled={!directPolicyActive} label="记录本地熔断原因" checked={configDraft.directExternalOnLocalMaintenance} onChange={(directExternalOnLocalMaintenance) => setConfigDraft((prev) => ({ ...prev, directExternalOnLocalMaintenance }))} />
                 </div>
                 <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                  <TextArea disabled={!directPolicyActive} label="直连模型规则" value={modelRulesText} onChange={setModelRulesText} />
-                  <TextArea disabled={!directPolicyActive} label="直连路径规则" value={pathRulesText} onChange={setPathRulesText} />
+                  <TextArea disabled={!directPolicyActive} label="模型原因规则" value={modelRulesText} onChange={setModelRulesText} />
+                  <TextArea disabled={!directPolicyActive} label="路径原因规则" value={pathRulesText} onChange={setPathRulesText} />
                 </div>
                 <div className="mt-3 grid gap-3 md:grid-cols-5">
-                  <Toggle disabled={!directPolicyActive} label="启用本地熔断" checked={configDraft.localPoolCircuitEnabled} onChange={(localPoolCircuitEnabled) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitEnabled }))} />
+                  <Toggle disabled={!directPolicyActive} label="启用本地熔断统计" checked={configDraft.localPoolCircuitEnabled} onChange={(localPoolCircuitEnabled) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitEnabled }))} />
                   <NumberBox disabled={!directPolicyActive || !configDraft.localPoolCircuitEnabled} label="熔断窗口秒数" value={configDraft.localPoolCircuitWindowSecs} min={1} onChange={(localPoolCircuitWindowSecs) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitWindowSecs }))} />
                   <NumberBox disabled={!directPolicyActive || !configDraft.localPoolCircuitEnabled} label="失败次数阈值" value={configDraft.localPoolCircuitOpenAfterFailures} min={1} onChange={(localPoolCircuitOpenAfterFailures) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitOpenAfterFailures }))} />
                   <NumberBox disabled={!directPolicyActive || !configDraft.localPoolCircuitEnabled} label="涉及凭证数" value={configDraft.localPoolCircuitRequireDistinctCredentials} min={1} onChange={(localPoolCircuitRequireDistinctCredentials) => setConfigDraft((prev) => ({ ...prev, localPoolCircuitRequireDistinctCredentials }))} />
@@ -497,9 +497,9 @@ export function ExternalPoolsPanel() {
                 </div>
               </FormSection>
 
-              <FormSection title="备用池失败后回本地" description="仅对本地失败后 fallback 到备用池的请求生效。命中后只回本地尝试一次，并禁止再次进入备用池。">
+              <FormSection title="备用池失败后回本地" description="仅对本地优先 fallback 到备用池的请求生效；显式直连开启时不会回本地。">
                 <div className="grid gap-3 md:grid-cols-4">
-                  <Toggle disabled={!externalEnabled} label="启用回本地" checked={configDraft.externalPoolLocalRescueEnabled} onChange={(externalPoolLocalRescueEnabled) => setConfigDraft((prev) => ({ ...prev, externalPoolLocalRescueEnabled }))} />
+                  <Toggle disabled={!externalEnabled || directPolicyActive} label="启用回本地" checked={configDraft.externalPoolLocalRescueEnabled} onChange={(externalPoolLocalRescueEnabled) => setConfigDraft((prev) => ({ ...prev, externalPoolLocalRescueEnabled }))} />
                   <Toggle disabled={!localRescueActive} label="429 时回本地" checked={configDraft.externalPoolLocalRescueOnRateLimit} onChange={(externalPoolLocalRescueOnRateLimit) => setConfigDraft((prev) => ({ ...prev, externalPoolLocalRescueOnRateLimit }))} />
                   <Toggle disabled={!localRescueActive} label="超时时回本地" checked={configDraft.externalPoolLocalRescueOnTimeout} onChange={(externalPoolLocalRescueOnTimeout) => setConfigDraft((prev) => ({ ...prev, externalPoolLocalRescueOnTimeout }))} />
                   <Toggle disabled={!localRescueActive} label="容量失败回本地" checked={configDraft.externalPoolLocalRescueOnCapacity} onChange={(externalPoolLocalRescueOnCapacity) => setConfigDraft((prev) => ({ ...prev, externalPoolLocalRescueOnCapacity }))} />

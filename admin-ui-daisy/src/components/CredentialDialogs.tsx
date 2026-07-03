@@ -62,7 +62,7 @@ function SecretInput({
   )
 }
 
-function initialCredentialForm(): Required<Pick<AddCredentialRequest, 'email' | 'refreshToken' | 'kiroApiKey' | 'profileArn' | 'region' | 'authRegion' | 'apiRegion' | 'clientId' | 'clientSecret' | 'tokenEndpoint' | 'issuerUrl' | 'scopes' | 'machineId' | 'proxyUrl' | 'proxyUsername' | 'proxyPassword' | 'endpoint'>> & { authMethod: AuthMethod; priority: string; maxConcurrentRequests: string; proxyResourceId: string } {
+function initialCredentialForm(): Required<Pick<AddCredentialRequest, 'email' | 'refreshToken' | 'kiroApiKey' | 'profileArn' | 'region' | 'authRegion' | 'apiRegion' | 'clientId' | 'clientSecret' | 'tokenEndpoint' | 'issuerUrl' | 'scopes' | 'machineId' | 'proxyUrl' | 'proxyUsername' | 'proxyPassword' | 'endpoint'>> & { authMethod: AuthMethod; priority: string; maxConcurrentRequests: string; disabled: string; proxyResourceId: string } {
   return {
     authMethod: 'social',
     refreshToken: '',
@@ -79,6 +79,7 @@ function initialCredentialForm(): Required<Pick<AddCredentialRequest, 'email' | 
     email: '',
     priority: '0',
     maxConcurrentRequests: '',
+    disabled: 'false',
     machineId: '',
     proxyUrl: '',
     proxyUsername: '',
@@ -106,6 +107,7 @@ function formFromCredential(credential: AddCredentialRequest) {
     email: credential.email || '',
     priority: String(credential.priority ?? 0),
     maxConcurrentRequests: typeof credential.maxConcurrentRequests === 'number' ? String(credential.maxConcurrentRequests) : '',
+    disabled: credential.disabled ? 'true' : 'false',
     machineId: credential.machineId || '',
     proxyUrl: credential.proxyUrl || '',
     proxyUsername: credential.proxyUsername || '',
@@ -116,6 +118,7 @@ function formFromCredential(credential: AddCredentialRequest) {
 }
 
 interface CredentialParameterDefaults {
+  disabled: string
   priority: string
   maxConcurrentRequests: string
   rpm: string
@@ -134,6 +137,7 @@ type ImportVerificationMode = 'model_and_subscription' | 'subscription_only'
 
 function initialParameterDefaults(): CredentialParameterDefaults {
   return {
+    disabled: 'false',
     priority: '',
     maxConcurrentRequests: '',
     rpm: '',
@@ -199,8 +203,8 @@ function ImportVerificationModeSelect({
     <div className="rounded-lg border border-base-300 bg-base-200/40 p-3">
       <FieldLabel title="验活方式" description="只查询订阅时不会发送模型测试请求；订阅查询失败的账号仍会按验活失败回滚。">
         <Select bordered size="sm" value={value} disabled={disabled} onChange={(event) => onChange(event.target.value as ImportVerificationMode)}>
-          <Select.Option value="model_and_subscription">测试模型 + 查询订阅</Select.Option>
           <Select.Option value="subscription_only">只查询订阅（不请求模型）</Select.Option>
+          <Select.Option value="model_and_subscription">测试模型 + 查询订阅</Select.Option>
         </Select>
       </FieldLabel>
     </div>
@@ -231,6 +235,9 @@ function mergeCredentialDefaults(credential: AddCredentialRequest, defaults: Cre
   const useProxyResource = typeof proxyResourceId === 'number'
   return {
     ...credential,
+    disabled: typeof credential.disabled === 'undefined' || credential.disabled === null
+      ? defaults.disabled === 'true'
+      : credential.disabled,
     priority: credential.priority ?? parseOptionalNonNegativeInteger(defaults.priority, '默认优先级'),
     maxConcurrentRequests: typeof credential.maxConcurrentRequests === 'undefined'
       ? parseOptionalNonNegativeInteger(defaults.maxConcurrentRequests, '默认账号并发')
@@ -293,6 +300,12 @@ function CredentialParameterDefaultsPanel({
         </Button>
       </div>
       <div className="form-grid">
+        <FieldLabel title="导入后状态" description="账号自身 disabled 字段优先">
+          <Select bordered size="sm" value={defaults.disabled} disabled={disabled} onChange={(event) => update('disabled', event.target.value)}>
+            <Select.Option value="false">启用</Select.Option>
+            <Select.Option value="true">禁用</Select.Option>
+          </Select>
+        </FieldLabel>
         <FieldLabel title="默认优先级" description="留空时使用账号自身值或 0">
           <Input bordered size="sm" type="number" min={0} value={defaults.priority} disabled={disabled} onChange={(event) => update('priority', event.target.value)} />
         </FieldLabel>
@@ -455,6 +468,7 @@ export function AddCredentialModal({
         email: form.email.trim() || undefined,
         priority,
         maxConcurrentRequests,
+        disabled: form.disabled === 'true',
         machineId: form.machineId.trim() || undefined,
         proxyResourceId: form.proxyResourceId ? Number(form.proxyResourceId) : undefined,
         proxyUrl: form.proxyUrl.trim() || undefined,
@@ -463,8 +477,13 @@ export function AddCredentialModal({
         endpoint: form.endpoint.trim() || undefined,
       },
       {
-        onSuccess: (data) => {
-          toast.success(data.message)
+        onSuccess: async (data) => {
+          try {
+            const info = await getCredentialBalance(data.credentialId)
+            toast.success(`${data.message}，订阅: ${info.subscriptionTitle || '未知'}`)
+          } catch (error) {
+            toast.warning(`${data.message}，但查询订阅失败: ${extractErrorMessage(error)}`)
+          }
           onClose()
         },
         onError: (error) => toast.error(`添加失败: ${extractErrorMessage(error)}`),
@@ -540,6 +559,12 @@ export function AddCredentialModal({
           </FieldLabel>
           <FieldLabel title="优先级" description="数字越小优先级越高">
             <Input bordered size="sm" type="number" min={0} value={form.priority} onChange={(event) => update('priority', event.target.value)} />
+          </FieldLabel>
+          <FieldLabel title="初始状态" description="新增后默认查询订阅，不测试模型">
+            <Select bordered size="sm" value={form.disabled} disabled={add.isPending} onChange={(event) => update('disabled', event.target.value)}>
+              <Select.Option value="false">启用</Select.Option>
+              <Select.Option value="true">禁用</Select.Option>
+            </Select>
           </FieldLabel>
           <FieldLabel title="账号并发覆盖" description="留空继承全局，0 表示该账号不限并发">
             <Input bordered size="sm" type="number" min={0} value={form.maxConcurrentRequests} onChange={(event) => update('maxConcurrentRequests', event.target.value)} />
@@ -804,7 +829,7 @@ export function BatchImportModal({
   const [currentProcessing, setCurrentProcessing] = useState('')
   const [results, setResults] = useState<VerificationResult[]>([])
   const [defaults, setDefaults] = useState<CredentialParameterDefaults>(initialParameterDefaults)
-  const [verificationMode, setVerificationMode] = useState<ImportVerificationMode>('model_and_subscription')
+  const [verificationMode, setVerificationMode] = useState<ImportVerificationMode>('subscription_only')
   const proxyResources = useProxyResources()
   const proxyResourceOptions = (proxyResources.data?.resources || []).filter((resource) => resource.enabled)
 
@@ -814,7 +839,7 @@ export function BatchImportModal({
     setCurrentProcessing('')
     setResults([])
     setDefaults(initialParameterDefaults())
-    setVerificationMode('model_and_subscription')
+    setVerificationMode('subscription_only')
   }
 
   const appendCredentials = (credentials: AddCredentialRequest[]) => {
@@ -937,6 +962,7 @@ export function BatchImportModal({
           priority: cred.priority || 0,
           maxConcurrentRequests: cred.maxConcurrentRequests ?? undefined,
           rpm: cred.rpm ?? undefined,
+          disabled: cred.disabled ?? false,
           region: cred.region?.trim() || undefined,
           authRegion: cred.authRegion?.trim() || undefined,
           apiRegion: cred.apiRegion?.trim() || undefined,
@@ -1004,7 +1030,7 @@ export function BatchImportModal({
   }
 
   return (
-    <ModalShell open={open} title="批量导入账号（自动验活）" width="max-w-4xl" onClose={() => { if (!importing) { reset(); onClose() } }}>
+    <ModalShell open={open} title="批量导入账号（默认查询订阅）" width="max-w-4xl" onClose={() => { if (!importing) { reset(); onClose() } }}>
       <div className="space-y-4">
         <div className="flex justify-end">
           <Button tag="label" variant="outline" size="sm">
@@ -1041,7 +1067,7 @@ export function BatchImportModal({
           </Button>
           {results.length === 0 && (
             <Button type="button" color="primary" size="sm" disabled={importing || !jsonInput.trim()} onClick={() => run()}>
-              开始导入并验活
+              开始导入
             </Button>
           )}
           {results.length > 0 && failedCredentials.length > 0 && (
@@ -1074,7 +1100,7 @@ export function KamImportModal({
   const [currentProcessing, setCurrentProcessing] = useState('')
   const [results, setResults] = useState<VerificationResult[]>([])
   const [defaults, setDefaults] = useState<CredentialParameterDefaults>(initialParameterDefaults)
-  const [verificationMode, setVerificationMode] = useState<ImportVerificationMode>('model_and_subscription')
+  const [verificationMode, setVerificationMode] = useState<ImportVerificationMode>('subscription_only')
   const proxyResources = useProxyResources()
   const proxyResourceOptions = (proxyResources.data?.resources || []).filter((resource) => resource.enabled)
 
@@ -1093,7 +1119,7 @@ export function KamImportModal({
     setCurrentProcessing('')
     setResults([])
     setDefaults(initialParameterDefaults())
-    setVerificationMode('model_and_subscription')
+    setVerificationMode('subscription_only')
   }
 
   const handleFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -1253,7 +1279,7 @@ export function KamImportModal({
   const errorCount = preview.accounts.filter((account) => account.status === 'error').length
 
   return (
-    <ModalShell open={open} title="Kiro Account Manager 导入（自动验活）" width="max-w-4xl" onClose={() => { if (!importing) { reset(); onClose() } }}>
+    <ModalShell open={open} title="Kiro Account Manager 导入（默认查询订阅）" width="max-w-4xl" onClose={() => { if (!importing) { reset(); onClose() } }}>
       <div className="space-y-4">
         <div className="flex justify-end">
           <Button tag="label" variant="outline" size="sm">
@@ -1302,7 +1328,7 @@ export function KamImportModal({
           </Button>
           {results.length === 0 && (
             <Button type="button" color="primary" size="sm" disabled={importing || !jsonInput.trim() || Boolean(preview.error) || !preview.accounts.length} onClick={() => run()}>
-              开始导入并验活
+              开始导入
             </Button>
           )}
           {results.length > 0 && failedAccounts.length > 0 && (

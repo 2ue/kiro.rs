@@ -11,6 +11,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { useAddCredential, useProxyResources } from '@/hooks/use-credentials'
+import { getCredentialBalance } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import { parseCredentialImportFiles } from '@/lib/credential-import'
 
@@ -78,6 +79,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [priority, setPriority] = useState('0')
   const [maxConcurrentRequests, setMaxConcurrentRequests] = useState('')
   const [rpm, setRpm] = useState('')
+  const [disabled, setDisabled] = useState(false)
   const [machineId, setMachineId] = useState('')
   const [proxyResourceId, setProxyResourceId] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
@@ -108,6 +110,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setPriority('0')
     setMaxConcurrentRequests('')
     setRpm('')
+    setDisabled(false)
     setMachineId('')
     setProxyResourceId('')
     setProxyUrl('')
@@ -137,6 +140,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     priority?: number
     maxConcurrentRequests?: number | null
     rpm?: number | null
+    disabled?: boolean | null
     machineId?: string
     proxyUrl?: string
     proxyUsername?: string
@@ -160,6 +164,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setPriority(String(credential.priority ?? 0))
     setMaxConcurrentRequests(typeof credential.maxConcurrentRequests === 'number' ? String(credential.maxConcurrentRequests) : '')
     setRpm(typeof credential.rpm === 'number' ? String(credential.rpm) : '')
+    setDisabled(Boolean(credential.disabled))
     setMachineId(credential.machineId || '')
     if (credential.proxyResourceId) {
       setProxyResourceId(String(credential.proxyResourceId))
@@ -323,6 +328,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         priority: parsedPriority,
         maxConcurrentRequests: parsedMaxConcurrentRequests,
         rpm: parsedRpm,
+        disabled,
         machineId: machineId.trim() || undefined,
         proxyResourceId: proxyResourceId ? Number(proxyResourceId) : undefined,
         proxyUrl: proxyResourceId ? undefined : directProxyUrl || undefined,
@@ -331,8 +337,13 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         endpoint: endpoint.trim() || undefined,
       },
       {
-        onSuccess: (data) => {
-          toast.success(data.message)
+        onSuccess: async (data) => {
+          try {
+            const info = await getCredentialBalance(data.credentialId)
+            toast.success(`${data.message}，订阅: ${info.subscriptionTitle || '未知'}`)
+          } catch (error) {
+            toast.warning(`${data.message}，但查询订阅失败: ${extractErrorMessage(error)}`)
+          }
           onOpenChange(false)
           resetForm()
         },
@@ -577,6 +588,25 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               />
               <p className="text-xs text-muted-foreground">
                 数字越小优先级越高，默认为 0
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <label htmlFor="initialStatus" className="text-sm font-medium">
+                初始状态
+              </label>
+              <select
+                id="initialStatus"
+                value={disabled ? 'disabled' : 'enabled'}
+                onChange={(e) => setDisabled(e.target.value === 'disabled')}
+                disabled={isPending}
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <option value="enabled">启用</option>
+                <option value="disabled">禁用</option>
+              </select>
+              <p className="text-xs text-muted-foreground">
+                新增后会默认查询订阅信息；不会发送模型测试请求。
               </p>
             </div>
 

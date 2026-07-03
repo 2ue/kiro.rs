@@ -31,7 +31,7 @@ use crate::{
         model_capabilities::ModelCapabilitiesCatalog,
         payload_guard::{
             PayloadByteBreakdown, PayloadGuardConfig, PayloadGuardReport,
-            breakdown_anthropic_messages_request, guard_anthropic_messages_request,
+            breakdown_anthropic_messages_request, guard_anthropic_messages_request_reusing_body,
         },
         pricing::PricingCatalog,
         prompt_cache::{
@@ -59,7 +59,6 @@ use crate::{
         postgres::PostgresStore,
         redis_cache::{LocalPoolCircuitState, RedisStore},
     },
-    token,
 };
 
 const DEFAULT_EXTERNAL_POOL_REQUEST_TIMEOUT_SECS: u64 = 180;
@@ -376,6 +375,7 @@ pub struct ExternalRouteRequest {
     pub headers: HeaderMap,
     pub endpoint: String,
     pub payload: MessagesRequest,
+    pub request_input_tokens: i32,
     pub upstream_model: Option<String>,
     pub model_resolution_source: Option<String>,
     pub model_resolution_note: Option<String>,
@@ -868,6 +868,33 @@ pub fn mask_external_pool_key(value: &str) -> String {
     )
 }
 
+const EXPLICIT_DIRECT_POLICY_REASON: &str = "explicit_direct";
+
+fn direct_external_policy_static_reason(
+    config: &ExternalPoolsConfig,
+    endpoint: &str,
+    model: &str,
+) -> Option<String> {
+    if !config.external_pools_enabled || !config.external_direct_policy_enabled {
+        return None;
+    }
+    if config
+        .direct_external_model_rules
+        .iter()
+        .any(|rule| rule_matches(rule, model))
+    {
+        return Some(format!("model_rule:{}", model));
+    }
+    if config
+        .direct_external_path_rules
+        .iter()
+        .any(|rule| rule_matches(rule, endpoint))
+    {
+        return Some(format!("path_rule:{}", endpoint));
+    }
+    Some(EXPLICIT_DIRECT_POLICY_REASON.to_string())
+}
+
 impl ExternalPoolManager {
     pub fn new(postgres: Arc<PostgresStore>, redis: Arc<RedisStore>) -> Self {
         Self {
@@ -981,29 +1008,16 @@ impl ExternalPoolManager {
         endpoint: &str,
         model: &str,
     ) -> Option<String> {
-        if !config.external_pools_enabled || !config.external_direct_policy_enabled {
-            return None;
+        let reason = direct_external_policy_static_reason(config, endpoint, model)?;
+        if reason != EXPLICIT_DIRECT_POLICY_REASON {
+            return Some(reason);
         }
         if config.direct_external_on_local_maintenance
             && self.local_pool_circuit_state(config).await.open
         {
             return Some("local_pool_circuit_open".to_string());
         }
-        if config
-            .direct_external_model_rules
-            .iter()
-            .any(|rule| rule_matches(rule, model))
-        {
-            return Some(format!("model_rule:{}", model));
-        }
-        if config
-            .direct_external_path_rules
-            .iter()
-            .any(|rule| rule_matches(rule, endpoint))
-        {
-            return Some(format!("path_rule:{}", endpoint));
-        }
-        None
+        Some(reason)
     }
 
     pub async fn forward_with_failover(
@@ -2376,12 +2390,7 @@ impl ExternalPoolManager {
         error_diagnostics: UsageErrorDiagnostics,
         billing: Option<ExternalPoolBilling>,
     ) {
-        let request_input_tokens = token::count_all_tokens(
-            route.payload.model.clone(),
-            route.payload.system.clone(),
-            route.payload.messages.clone(),
-            route.payload.tools.clone(),
-        ) as i32;
+        let request_input_tokens = route.request_input_tokens;
         let usage = billing
             .as_ref()
             .filter(|_| status == UsageRecordStatus::Success)
@@ -3662,21 +3671,24 @@ fn external_payload_guard_retry_route(
 ) -> Option<ExternalRouteRequest> {
     let config = route.payload_guard_retry_config?;
     let mut payload = route.payload.clone();
-    let (body, report) =
-        match guard_anthropic_messages_request(&mut payload, config, route.raw_body.len()) {
-            Ok(result) => result,
-            Err(err) => {
-                tracing::warn!(
-                    request_id = %route.request_id,
-                    error = %err,
-                    "external pool payload guard retry failed to build trimmed request"
-                );
-                return None;
-            }
-        };
+    let (body, report) = match guard_anthropic_messages_request_reusing_body(
+        &mut payload,
+        config,
+        &route.raw_body,
+    ) {
+        Ok(result) => result,
+        Err(err) => {
+            tracing::warn!(
+                request_id = %route.request_id,
+                error = %err,
+                "external pool payload guard retry failed to build trimmed request"
+            );
+            return None;
+        }
+    };
     let breakdown = breakdown_anthropic_messages_request(&payload, body.len());
     let mut next = route.clone();
-    next.raw_body = Bytes::from(body);
+    next.raw_body = body;
     next.payload = payload;
     next.payload_breakdown = Some(breakdown);
     next.payload_guard_report = Some(report);
@@ -4350,7 +4362,7 @@ fn build_external_usage_projection_context(
         .supports_prompt_caching_for(&model)
         .unwrap_or(true);
 
-    let raw_input_tokens = count_external_route_input_tokens(&route.payload);
+    let raw_input_tokens = route.request_input_tokens;
     let cache_state_enabled = route.prompt_cache_strategy_type != PromptCacheStrategyType::NoCache
         && prompt_cache_supported;
     let scope = cache_state_enabled
@@ -4449,12 +4461,13 @@ fn build_external_usage_projection_context(
     })
 }
 
+#[cfg(test)]
 fn count_external_route_input_tokens(payload: &MessagesRequest) -> i32 {
-    token::count_all_tokens(
-        payload.model.clone(),
-        payload.system.clone(),
-        payload.messages.clone(),
-        payload.tools.clone(),
+    crate::token::count_all_tokens(
+        &payload.model,
+        payload.system.as_deref(),
+        &payload.messages,
+        payload.tools.as_deref(),
     ) as i32
 }
 
@@ -5220,6 +5233,7 @@ mod tests {
                 output_config: None,
                 metadata: None,
             },
+            request_input_tokens: 1,
             upstream_model: None,
             model_resolution_source: None,
             model_resolution_note: None,
@@ -5500,11 +5514,14 @@ data: {"type":"message_delta","note":"content_block_delta"}
     }
 
     fn test_route(model: &str) -> ExternalRouteRequest {
+        let payload = test_payload(model);
+        let request_input_tokens = count_external_route_input_tokens(&payload);
         ExternalRouteRequest {
             raw_body: Bytes::new(),
             headers: HeaderMap::new(),
             endpoint: "/cc/v1/messages".to_string(),
-            payload: test_payload(model),
+            payload,
+            request_input_tokens,
             upstream_model: Some(model.to_string()),
             model_resolution_source: Some("exact_upstream".to_string()),
             model_resolution_note: None,
@@ -5564,6 +5581,39 @@ data: {"type":"message_delta","note":"content_block_delta"}
                 user_id: Some("user_test_account__session_external-projection-session".to_string()),
             }),
         }
+    }
+
+    #[test]
+    fn direct_external_policy_enabled_is_global_direct_reason() {
+        let mut config = ExternalPoolsConfig::default();
+
+        assert_eq!(
+            direct_external_policy_static_reason(&config, "/cc/v1/messages", "claude-custom"),
+            None
+        );
+
+        config.external_pools_enabled = true;
+        config.external_direct_policy_enabled = true;
+        assert_eq!(
+            direct_external_policy_static_reason(&config, "/cc/v1/messages", "claude-custom")
+                .as_deref(),
+            Some("explicit_direct")
+        );
+
+        config.direct_external_model_rules = vec!["sonnet".to_string()];
+        assert_eq!(
+            direct_external_policy_static_reason(&config, "/cc/v1/messages", "claude-sonnet-4-5")
+                .as_deref(),
+            Some("model_rule:claude-sonnet-4-5")
+        );
+
+        config.direct_external_model_rules.clear();
+        config.direct_external_path_rules = vec!["/ha/".to_string()];
+        assert_eq!(
+            direct_external_policy_static_reason(&config, "/ha/v1/messages", "custom-model")
+                .as_deref(),
+            Some("path_rule:/ha/v1/messages")
+        );
     }
 
     #[test]

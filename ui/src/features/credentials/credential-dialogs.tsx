@@ -147,6 +147,7 @@ export interface VerifyResult {
 // ============================================================================
 
 interface CredentialParameterDefaults {
+  disabled: string
   priority: string
   maxConcurrentRequests: string
   rpm: string
@@ -162,11 +163,11 @@ interface CredentialParameterDefaults {
 }
 
 function initialParameterDefaults(): CredentialParameterDefaults {
-  return { priority: '', maxConcurrentRequests: '', rpm: '', region: '', authRegion: '', apiRegion: '', machineId: '', endpoint: '', proxyResourceId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '' }
+  return { disabled: 'false', priority: '', maxConcurrentRequests: '', rpm: '', region: '', authRegion: '', apiRegion: '', machineId: '', endpoint: '', proxyResourceId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '' }
 }
 
 function initialCredentialForm() {
-  return { authMethod: 'social' as AuthMethod, refreshToken: '', kiroApiKey: '', profileArn: '', region: '', authRegion: '', apiRegion: '', clientId: '', clientSecret: '', tokenEndpoint: '', issuerUrl: '', scopes: '', email: '', priority: '0', maxConcurrentRequests: '', machineId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', proxyResourceId: '', endpoint: '' }
+  return { authMethod: 'social' as AuthMethod, refreshToken: '', kiroApiKey: '', profileArn: '', region: '', authRegion: '', apiRegion: '', clientId: '', clientSecret: '', tokenEndpoint: '', issuerUrl: '', scopes: '', email: '', priority: '0', maxConcurrentRequests: '', disabled: 'false', machineId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', proxyResourceId: '', endpoint: '' }
 }
 
 function formFromCredential(c: AddCredentialRequest) {
@@ -179,6 +180,7 @@ function formFromCredential(c: AddCredentialRequest) {
     issuerUrl: c.issuerUrl || '', scopes: c.scopes || '', email: c.email || '',
     priority: String(c.priority ?? 0),
     maxConcurrentRequests: typeof c.maxConcurrentRequests === 'number' ? String(c.maxConcurrentRequests) : '',
+    disabled: c.disabled ? 'true' : 'false',
     machineId: c.machineId || '', proxyUrl: c.proxyUrl || '', proxyUsername: c.proxyUsername || '',
     proxyPassword: c.proxyPassword || '', proxyResourceId: c.proxyResourceId ? String(c.proxyResourceId) : '',
     endpoint: c.endpoint || '',
@@ -205,6 +207,7 @@ function mergeCredentialDefaults(cred: AddCredentialRequest, defaults: Credentia
   const useProxyResource = typeof proxyResourceId === 'number'
   return {
     ...cred,
+    disabled: typeof cred.disabled === 'undefined' || cred.disabled === null ? defaults.disabled === 'true' : cred.disabled,
     priority: cred.priority ?? parseOptionalNonNegativeInteger(defaults.priority, '默认优先级'),
     maxConcurrentRequests: typeof cred.maxConcurrentRequests === 'undefined' ? parseOptionalNonNegativeInteger(defaults.maxConcurrentRequests, '默认账号并发') : cred.maxConcurrentRequests,
     rpm: typeof cred.rpm === 'undefined' ? parseOptionalNonNegativeInteger(defaults.rpm, '默认账号 RPM') : cred.rpm,
@@ -275,6 +278,15 @@ function CredentialParameterDefaultsPanel({ defaults, onChange, proxyResources, 
         <Button type="button" variant="ghost" size="xs" disabled={disabled} onClick={() => onChange(initialParameterDefaults())}>清空</Button>
       </div>
       <FieldGrid>
+        <Field label="导入后状态" description="账号自身 disabled 字段优先">
+          <Select value={defaults.disabled} onValueChange={(v) => update('disabled', v)} disabled={disabled}>
+            <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="false">启用</SelectItem>
+              <SelectItem value="true">禁用</SelectItem>
+            </SelectContent>
+          </Select>
+        </Field>
         <Field label="默认优先级"><Input type="number" min={0} value={defaults.priority} disabled={disabled} onChange={(e) => update('priority', e.target.value)} /></Field>
         <Field label="默认账号并发" description="留空继承全局，0 不限"><Input type="number" min={0} value={defaults.maxConcurrentRequests} disabled={disabled} onChange={(e) => update('maxConcurrentRequests', e.target.value)} /></Field>
         <Field label="默认账号 RPM" description="留空继承全局，0 不限"><Input type="number" min={0} value={defaults.rpm} disabled={disabled} onChange={(e) => update('rpm', e.target.value)} /></Field>
@@ -374,6 +386,7 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
       email: form.email.trim() || undefined,
       priority,
       maxConcurrentRequests,
+      disabled: form.disabled === 'true',
       machineId: form.machineId.trim() || undefined,
       proxyResourceId: form.proxyResourceId ? Number(form.proxyResourceId) : undefined,
       proxyUrl: form.proxyUrl.trim() || undefined,
@@ -381,7 +394,15 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
       proxyPassword: form.proxyPassword.trim() || undefined,
       endpoint: form.endpoint.trim() || undefined,
     }, {
-      onSuccess: (data) => { toast.success(data.message); onClose() },
+      onSuccess: async (data) => {
+        try {
+          const info = await getCredentialBalance(data.credentialId)
+          toast.success(`${data.message}，订阅: ${info.subscriptionTitle || '未知'}`)
+        } catch (err) {
+          toast.warning(`${data.message}，但查询订阅失败: ${extractErrorMessage(err)}`)
+        }
+        onClose()
+      },
       onError: (err) => toast.error(`添加失败: ${extractErrorMessage(err)}`),
     })
   }
@@ -431,6 +452,15 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
           <Field label="邮箱（可选）"><Input value={form.email} disabled={add.isPending} onChange={(e) => update('email', e.target.value)} placeholder="user@example.com" /></Field>
           <Field label="Profile ARN（可选）"><Input value={form.profileArn} disabled={add.isPending} onChange={(e) => update('profileArn', e.target.value)} /></Field>
           <Field label="优先级"><Input type="number" min={0} value={form.priority} disabled={add.isPending} onChange={(e) => update('priority', e.target.value)} /></Field>
+          <Field label="初始状态" description="新增后默认查询订阅，不测试模型">
+            <Select value={form.disabled} onValueChange={(v) => update('disabled', v)} disabled={add.isPending}>
+              <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="false">启用</SelectItem>
+                <SelectItem value="true">禁用</SelectItem>
+              </SelectContent>
+            </Select>
+          </Field>
           <Field label="账号并发（可选）" description="留空继承全局，0 不限"><Input type="number" min={0} value={form.maxConcurrentRequests} disabled={add.isPending} onChange={(e) => update('maxConcurrentRequests', e.target.value)} /></Field>
           <Field label="Auth Region"><Input className="font-mono" value={form.authRegion} disabled={add.isPending} onChange={(e) => update('authRegion', e.target.value)} placeholder="us-east-1" /></Field>
           <Field label="API Region"><Input className="font-mono" value={form.apiRegion} disabled={add.isPending} onChange={(e) => update('apiRegion', e.target.value)} placeholder="us-east-1" /></Field>
@@ -476,7 +506,7 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
 }) {
   const [text, setText] = useState('')
   const [defaults, setDefaults] = useState(initialParameterDefaults)
-  const [verifyMode, setVerifyMode] = useState<ImportVerificationMode>('model_and_subscription')
+  const [verifyMode, setVerifyMode] = useState<ImportVerificationMode>('subscription_only')
   const [skipVerify, setSkipVerify] = useState(false)
   const [running, setRunning] = useState(false)
   const [results, setResults] = useState<ImportResult[]>([])
@@ -487,7 +517,7 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
   const cancelRef = useRef(false)
 
   useEffect(() => {
-    if (!open) { setText(''); setDefaults(initialParameterDefaults()); setResults([]); setParsed([]); setParseError(''); setRunning(false) }
+    if (!open) { setText(''); setDefaults(initialParameterDefaults()); setVerifyMode('subscription_only'); setSkipVerify(false); setResults([]); setParsed([]); setParseError(''); setRunning(false) }
   }, [open])
 
   const handleParse = () => {
@@ -628,8 +658,8 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
                 <Select value={verifyMode} onValueChange={(v) => setVerifyMode(v as ImportVerificationMode)}>
                   <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
                   <SelectContent>
+                    <SelectItem value="subscription_only">只查询订阅（不请求模型）</SelectItem>
                     <SelectItem value="model_and_subscription">测试模型 + 查询订阅</SelectItem>
-                    <SelectItem value="subscription_only">只查询订阅</SelectItem>
                   </SelectContent>
                 </Select>
               )}
@@ -684,7 +714,7 @@ export function KamImportModal({ open, onClose, onDone }: {
   const [text, setText] = useState('')
   const [accounts, setAccounts] = useState<KamAccount[]>([])
   const [skipErrorAccounts, setSkipErrorAccounts] = useState(true)
-  const [verifyMode, setVerifyMode] = useState<ImportVerificationMode>('model_and_subscription')
+  const [verifyMode, setVerifyMode] = useState<ImportVerificationMode>('subscription_only')
   const [defaults, setDefaults] = useState(initialParameterDefaults)
   const [running, setRunning] = useState(false)
   const [results, setResults] = useState<ImportResult[]>([])
@@ -697,7 +727,7 @@ export function KamImportModal({ open, onClose, onDone }: {
     if (!open) {
       setText(''); setAccounts([]); setResults([])
       setDefaults(initialParameterDefaults()); setRunning(false)
-      setSkipErrorAccounts(true); setVerifyMode('model_and_subscription')
+      setSkipErrorAccounts(true); setVerifyMode('subscription_only')
     }
   }, [open])
 
@@ -831,8 +861,8 @@ export function KamImportModal({ open, onClose, onDone }: {
                 <Select value={verifyMode} onValueChange={(v) => setVerifyMode(v as ImportVerificationMode)} disabled={running}>
                   <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
                   <SelectContent>
+                    <SelectItem value="subscription_only">只查询订阅（不请求模型）</SelectItem>
                     <SelectItem value="model_and_subscription">测试模型 + 查询订阅</SelectItem>
-                    <SelectItem value="subscription_only">只查询订阅</SelectItem>
                   </SelectContent>
                 </Select>
                 {hasErrorAccounts && (
