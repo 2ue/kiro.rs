@@ -62,6 +62,7 @@ pub struct PromptCacheProfile {
     lookup_points: Vec<PromptCacheLookupPoint>,
     total_input_tokens: i32,
     model: String,
+    suppress_first_turn_fallback_read: bool,
 }
 
 impl PromptCacheProfile {
@@ -86,6 +87,13 @@ pub struct KiroRsToolPromptCachePlan {
 impl KiroRsToolPromptCachePlan {
     pub fn usage(&self) -> PromptCacheUsage {
         self.usage
+    }
+
+    pub fn cache_jitter_seed(&self) -> u64 {
+        self.profile
+            .as_ref()
+            .map(PromptCacheProfile::cache_jitter_seed)
+            .unwrap_or(0)
     }
 }
 
@@ -230,6 +238,7 @@ impl PromptCacheTracker {
             cache_model,
             false,
             false,
+            false,
         )
     }
 
@@ -240,12 +249,15 @@ impl PromptCacheTracker {
         synthesize_stable_prefix: bool,
         cache_model: &str,
     ) -> Option<PromptCacheProfile> {
+        let suppress_first_turn_fallback_read =
+            synthesize_stable_prefix && !has_metadata_conversation_id(req) && is_first_turn(req);
         self.build_profile_with_blocks(
             flatten_cache_blocks(req),
             total_input_tokens,
             cache_model,
             synthesize_stable_prefix,
             true,
+            suppress_first_turn_fallback_read,
         )
     }
 
@@ -256,6 +268,7 @@ impl PromptCacheTracker {
         cache_model: &str,
         synthesize_stable_prefix: bool,
         lookup_every_block: bool,
+        suppress_first_turn_fallback_read: bool,
     ) -> Option<PromptCacheProfile> {
         if blocks.is_empty() {
             return None;
@@ -312,6 +325,7 @@ impl PromptCacheTracker {
             lookup_points,
             total_input_tokens: total_input_tokens.max(cumulative_tokens),
             model: cache_model.to_string(),
+            suppress_first_turn_fallback_read,
         })
     }
 
@@ -354,20 +368,16 @@ impl PromptCacheTracker {
         if target_tokens <= 0 {
             return PromptCacheUsage::default();
         }
+        if profile.suppress_first_turn_fallback_read {
+            return creation_only_usage(profile, target_tokens, effective_ratio);
+        }
         let now = Utc::now();
 
         let mut entries_by_scope = self.entries.lock();
         prune_expired_locked(&mut entries_by_scope, now);
 
         let Some(entries) = entries_by_scope.get_mut(&scope) else {
-            let (cache5m, cache1h) = target_ttl_breakdown(profile, target_tokens);
-            return PromptCacheUsage {
-                cache_creation_input_tokens: target_tokens,
-                cache_read_input_tokens: 0,
-                cache_creation_5m_input_tokens: cache5m,
-                cache_creation_1h_input_tokens: cache1h,
-                effective_cache_ratio: Some(effective_ratio),
-            };
+            return creation_only_usage(profile, target_tokens, effective_ratio);
         };
 
         let mut matched_tokens = 0;
@@ -1117,6 +1127,67 @@ fn target_cache_tokens(total_input_tokens: i32, target_read_ratio: f64, min_toke
     }
 }
 
+fn creation_only_usage(
+    profile: &PromptCacheProfile,
+    target_tokens: i32,
+    effective_ratio: f64,
+) -> PromptCacheUsage {
+    let (cache5m, cache1h) = target_ttl_breakdown(profile, target_tokens);
+    PromptCacheUsage {
+        cache_creation_input_tokens: target_tokens,
+        cache_read_input_tokens: 0,
+        cache_creation_5m_input_tokens: cache5m,
+        cache_creation_1h_input_tokens: cache1h,
+        effective_cache_ratio: Some(effective_ratio),
+    }
+}
+
+fn is_first_turn(req: &MessagesRequest) -> bool {
+    !req.messages
+        .iter()
+        .any(|message| message.role.eq_ignore_ascii_case("assistant"))
+}
+
+fn has_metadata_conversation_id(req: &MessagesRequest) -> bool {
+    req.metadata
+        .as_ref()
+        .and_then(|metadata| metadata.user_id.as_deref())
+        .is_some_and(metadata_user_id_has_session_id)
+}
+
+fn metadata_user_id_has_session_id(user_id: &str) -> bool {
+    if let Ok(json) = serde_json::from_str::<Value>(user_id) {
+        if json
+            .get("session_id")
+            .and_then(|value| value.as_str())
+            .is_some_and(is_valid_uuid)
+        {
+            return true;
+        }
+    }
+
+    user_id.find("session_").is_some_and(|pos| {
+        let session_part = &user_id[pos + 8..];
+        session_part.len() >= 36 && is_valid_uuid(&session_part[..36])
+    })
+}
+
+fn is_valid_uuid(value: &str) -> bool {
+    if value.len() != 36 {
+        return false;
+    }
+    for (idx, byte) in value.bytes().enumerate() {
+        if matches!(idx, 8 | 13 | 18 | 23) {
+            if byte != b'-' {
+                return false;
+            }
+        } else if !byte.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
 fn apply_kiro_rs_tool_coverage_policy(covered_tokens: i32, policy: KiroRsToolCachePolicy) -> i32 {
     let policy = policy.normalized();
     let mut covered_tokens = covered_tokens.max(0);
@@ -1365,7 +1436,9 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: Some(Metadata {
-                user_id: Some("session".to_string()),
+                user_id: Some(
+                    "user_test_account__session_8bb5523b-ec7c-4540-a9ca-beb6d79f1552".to_string(),
+                ),
             }),
         }
     }
@@ -1405,6 +1478,48 @@ mod tests {
     }
 
     #[test]
+    fn entry_ttl_bound_expires_cached_entries() {
+        let tracker = PromptCacheTracker::default();
+        let mut req = request(long_text());
+        req.messages[0].content = json!([
+            {
+                "type": "text",
+                "text": long_text(),
+                "cache_control": {"type": "ephemeral"}
+            }
+        ]);
+        let profile = tracker.build_profile(&req, 4096).unwrap();
+        let scope = test_scope("ttl-session");
+        let bounds = PromptCacheBounds {
+            max_entries_per_account: 10,
+            max_entries_global: 10,
+            entry_ttl: std::time::Duration::from_secs(1),
+            estimated_bytes_limit: 0,
+        };
+
+        tracker.update_with_bounds(Some(scope.clone()), Some(&profile), 0.85, bounds);
+        {
+            let mut entries_by_scope = tracker.entries.lock();
+            let entries = entries_by_scope
+                .get_mut(&scope)
+                .expect("entry should be written");
+            assert!(
+                entries
+                    .values()
+                    .all(|entry| entry.ttl == std::time::Duration::from_secs(1))
+            );
+            for entry in entries.values_mut() {
+                entry.expires_at = Utc::now() - chrono::Duration::seconds(1);
+            }
+        }
+
+        let expired = tracker.compute_with_bounds(Some(scope), Some(&profile), 0.85, bounds);
+
+        assert_eq!(expired.cache_read_input_tokens, 0);
+        assert!(expired.cache_creation_input_tokens > 0);
+    }
+
+    #[test]
     fn high_cache_profile_creates_without_explicit_cache_control() {
         let tracker = PromptCacheTracker::default();
         let req = request(long_text());
@@ -1420,6 +1535,26 @@ mod tests {
         tracker.update(Some(scope.clone()), Some(&profile), 0.95);
         let second = tracker.compute(Some(scope), Some(&profile), 0.95);
         assert!(second.cache_read_input_tokens > 0);
+    }
+
+    #[test]
+    fn high_cache_fallback_first_turn_does_not_read_existing_scope() {
+        let tracker = PromptCacheTracker::default();
+        let mut req = request(long_text());
+        req.metadata = None;
+        let profile = tracker
+            .build_high_cache_profile(&req, 4096)
+            .expect("fallback high-cache profile");
+        let scope = test_scope("fallback-derived-session");
+
+        let first = tracker.compute(Some(scope.clone()), Some(&profile), 0.95);
+        assert_eq!(first.cache_read_input_tokens, 0);
+        assert!(first.cache_creation_input_tokens > 0);
+        tracker.update(Some(scope.clone()), Some(&profile), 0.95);
+
+        let repeated_first = tracker.compute(Some(scope), Some(&profile), 0.95);
+        assert_eq!(repeated_first.cache_read_input_tokens, 0);
+        assert!(repeated_first.cache_creation_input_tokens > 0);
     }
 
     #[test]

@@ -482,10 +482,15 @@ pub(super) fn runtime_snapshot_from_entry(
             .unwrap_or(0),
         cooldown_reason,
         cooldowns,
-        rate_limited: entry_rate_limit_remaining(entry, now).is_some(),
-        rate_limit_remaining_secs: entry_rate_limit_remaining(entry, now)
-            .map(|duration| duration.as_secs().saturating_add(1))
-            .unwrap_or(0),
+        rate_limited: entry_rate_limit_remaining(entry, config.credential_rpm.unwrap_or(0), now)
+            .is_some(),
+        rate_limit_remaining_secs: entry_rate_limit_remaining(
+            entry,
+            config.credential_rpm.unwrap_or(0),
+            now,
+        )
+        .map(|duration| duration.as_secs().saturating_add(1))
+        .unwrap_or(0),
         in_flight_requests: entry.in_flight_requests,
         oldest_in_flight_age_secs,
         newest_in_flight_idle_secs,

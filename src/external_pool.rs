@@ -671,6 +671,9 @@ struct ExternalUsageProjectionState {
 struct ExternalUsageProjectionContext {
     mode: ExternalPoolUsageProjectionMode,
     raw_input_tokens: i32,
+    cache_state_enabled: bool,
+    credential_key: Option<String>,
+    model: String,
     simulated_usage: Option<CacheSimulation>,
     reported_policy: Option<ReportedCacheUsagePolicy>,
     scope: Option<PromptCacheScope>,
@@ -4078,22 +4081,26 @@ fn project_usage_value(
             cache_creation_5m_input_tokens: 0,
             cache_creation_1h_input_tokens: 0,
         });
+    projection.mark_committed(computed);
+    let controlled = if projection.cache_state_enabled && projection.reported_policy.is_some() {
+        projection
+            .prompt_cache_creation_controller
+            .preview_success_with_context(
+                projection.scope.as_ref(),
+                projection.prompt_cache_creation_control,
+                computed,
+                projection.credential_key.as_deref(),
+                Some(projection.model.as_str()),
+            )
+    } else {
+        computed
+    };
     let raw_usage = RawUsage::uncached(projection.raw_input_tokens, output_tokens);
-    let reported = projection
+    let shaped = projection
         .reported_policy
         .clone()
-        .map(|policy| computed.with_reported_cache_usage_policy_and_raw(policy, raw_usage))
-        .unwrap_or(computed);
-    projection.mark_committed(reported);
-    let shaped = if projection.reported_policy.is_some() {
-        projection.prompt_cache_creation_controller.preview_success(
-            projection.scope.as_ref(),
-            projection.prompt_cache_creation_control,
-            reported,
-        )
-    } else {
-        reported
-    };
+        .map(|policy| controlled.with_reported_cache_usage_policy_and_raw(policy, raw_usage))
+        .unwrap_or(controlled);
     let shaped = projection
         .reported_policy
         .clone()
@@ -4333,9 +4340,6 @@ fn build_external_usage_projection_context(
     if pool.usage_projection_mode != ExternalPoolUsageProjectionMode::CurrentPathPolicy {
         return None;
     }
-    if route.prompt_cache_strategy_type == PromptCacheStrategyType::NoCache {
-        return None;
-    }
 
     let model = route
         .upstream_model
@@ -4347,7 +4351,9 @@ fn build_external_usage_projection_context(
         .unwrap_or(true);
 
     let raw_input_tokens = count_external_route_input_tokens(&route.payload);
-    let scope = prompt_cache_supported
+    let cache_state_enabled = route.prompt_cache_strategy_type != PromptCacheStrategyType::NoCache
+        && prompt_cache_supported;
+    let scope = cache_state_enabled
         .then(|| external_prompt_cache_scope(route, pool, &model))
         .flatten();
     let (profile, kiro_rs_tool_prompt_cache_plan, simulated_usage) = match route
@@ -4386,29 +4392,46 @@ fn build_external_usage_projection_context(
                 route.prompt_cache_bounds,
                 route.kiro_rs_tool_cache_policy,
             );
-            let simulated_usage = CacheSimulation::from_prompt_cache_split_input(plan.usage());
+            let policy = route.kiro_rs_tool_cache_policy.normalized();
+            let simulated_usage =
+                CacheSimulation::from_prompt_cache_split_input_with_reported_input_range(
+                    plan.usage(),
+                    policy.reported_input_min_tokens,
+                    policy.reported_input_max_tokens,
+                    plan.cache_jitter_seed(),
+                );
             (None, Some(plan), simulated_usage)
         }
         _ => (None, None, None),
     };
-    let reported_policy = if prompt_cache_supported
-        && route.prompt_cache_strategy_type == PromptCacheStrategyType::CurrentHighCache
-        && route.prompt_cache_simulation_mode == PromptCacheSimulationMode::HighCache
-    {
-        ReportedCacheUsagePolicy::from_path_policy(
-            route.reported_usage.policy_for_path(&route.endpoint),
-            profile
-                .as_ref()
-                .map(|profile| profile.cache_jitter_seed())
-                .unwrap_or(0)
-                ^ fastrand::u64(..),
-        )
-    } else {
-        None
+    let reported_usage = route.reported_usage.policy_for_path(&route.endpoint);
+    let reported_policy = match route.prompt_cache_strategy_type {
+        PromptCacheStrategyType::NoCache if reported_usage.enabled => {
+            ReportedCacheUsagePolicy::from_path_policy(reported_usage, fastrand::u64(..))
+        }
+        PromptCacheStrategyType::CurrentHighCache
+            if prompt_cache_supported
+                && route.prompt_cache_simulation_mode == PromptCacheSimulationMode::HighCache =>
+        {
+            ReportedCacheUsagePolicy::from_path_policy(
+                reported_usage,
+                profile
+                    .as_ref()
+                    .map(|profile| profile.cache_jitter_seed())
+                    .unwrap_or(0)
+                    ^ fastrand::u64(..),
+            )
+        }
+        PromptCacheStrategyType::CurrentHighCache
+        | PromptCacheStrategyType::KiroRsTool
+        | PromptCacheStrategyType::NoCache => None,
     };
     Some(ExternalUsageProjectionContext {
         mode: pool.usage_projection_mode,
         raw_input_tokens,
+        cache_state_enabled,
+        credential_key: Some(format!("external_pool:{}", pool.id)),
+        model,
         simulated_usage,
         reported_policy,
         scope,
@@ -4470,12 +4493,19 @@ impl ExternalUsageProjectionContext {
         let Some(usage) = self.state.lock().committed_controlled_usage else {
             return;
         };
+        if !self.cache_state_enabled {
+            return;
+        }
         if self.reported_policy.is_some() {
-            let _ = self.prompt_cache_creation_controller.apply_success(
-                self.scope.as_ref(),
-                self.prompt_cache_creation_control,
-                usage,
-            );
+            let _ = self
+                .prompt_cache_creation_controller
+                .apply_success_with_context(
+                    self.scope.as_ref(),
+                    self.prompt_cache_creation_control,
+                    usage,
+                    self.credential_key.as_deref(),
+                    Some(self.model.as_str()),
+                );
         }
         if let Some(plan) = self.kiro_rs_tool_prompt_cache_plan.as_ref() {
             self.prompt_cache.commit_kiro_rs_tool_success_with_bounds(
@@ -6105,7 +6135,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
                 .get("cache_read_input_tokens")
                 .and_then(|value| value.as_i64())
                 .unwrap_or_default()
-                > 0
+                == 0
         );
         assert!(
             usage
@@ -6171,14 +6201,61 @@ data: {"type":"message_delta","note":"content_block_delta"}
     }
 
     #[test]
-    fn usage_projection_no_cache_route_does_not_build_projection_context() {
+    fn usage_projection_no_cache_route_projects_without_cache_state() {
         let mut route = test_route("claude-sonnet-4-5");
         route.prompt_cache_strategy_type = PromptCacheStrategyType::NoCache;
         route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
+        route.reported_usage.path_overrides.insert(
+            "/cc".to_string(),
+            ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy::sample_input_max(64),
+                output: ReportedUsageFieldPolicy::sample_max(5),
+                ..ReportedUsagePathPolicy::default()
+            },
+        );
         let mut pool = test_pool("http://pool.example.com", false);
         pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
-        assert!(projection_context(&route, &pool, 25).is_none());
+        let projection = projection_context(&route, &pool, 0).expect("projection");
+        assert!(!projection.cache_state_enabled);
+        assert!(projection.simulated_usage.is_none());
+        assert!(projection.scope.is_none());
+        assert!(projection.prompt_cache_profile.is_none());
+        assert!(projection.kiro_rs_tool_prompt_cache_plan.is_none());
+
+        let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":9,"cache_creation_input_tokens":50000,"cache_read_input_tokens":25000}}"#,
+        );
+        let projected = maybe_project_non_stream_usage(body, Some(&projection));
+        let value: serde_json::Value =
+            serde_json::from_slice(&projected.body).expect("projected json");
+        let usage = value.get("usage").expect("usage object");
+        assert!(
+            usage
+                .get("input_tokens")
+                .and_then(|value| value.as_i64())
+                .is_some_and(|tokens| (1..=64).contains(&tokens))
+        );
+        assert!(
+            usage
+                .get("output_tokens")
+                .and_then(|value| value.as_i64())
+                .is_some_and(|tokens| (1..=5).contains(&tokens))
+        );
+        assert_eq!(
+            usage
+                .get("cache_creation_input_tokens")
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default(),
+            0
+        );
+        assert_eq!(
+            usage
+                .get("cache_read_input_tokens")
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default(),
+            0
+        );
     }
 
     #[test]
@@ -6254,6 +6331,16 @@ data: {"type":"message_delta","note":"content_block_delta"}
         let _warmup = maybe_project_non_stream_usage(body.clone(), Some(&warmup_projection));
         warmup_projection.record_success();
 
+        route.payload.messages.extend([
+            Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!("ready"),
+            },
+            Message {
+                role: "user".to_string(),
+                content: serde_json::json!("continue external projection session"),
+            },
+        ]);
         let projection = projection_context(&route, &pool, 200).expect("projection");
         let projected = maybe_project_non_stream_usage(body, Some(&projection));
         let reported = projected.usage_capture.reported.expect("reported usage");
@@ -6289,7 +6376,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
         let reported = projected.usage_capture.reported.expect("reported usage");
 
         assert!((1..=96).contains(&reported.input_tokens));
-        assert!(reported.cache_read_input_tokens > 0);
+        assert_eq!(reported.cache_read_input_tokens, 0);
         assert!(reported.cache_creation_input_tokens > 0);
         assert_eq!(
             reported.total_input_tokens,
@@ -6480,6 +6567,16 @@ data: {"type":"message_delta","note":"content_block_delta"}
         );
         first_projection.record_success();
 
+        route.payload.messages.extend([
+            Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!("ready"),
+            },
+            Message {
+                role: "user".to_string(),
+                content: serde_json::json!("continue external projection session"),
+            },
+        ]);
         let second_projection = projection_context(&route, &pool, 0).expect("second projection");
         let second = maybe_project_non_stream_usage(body, Some(&second_projection));
         let second_value: serde_json::Value =
@@ -6575,7 +6672,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
         assert_eq!(raw.input_tokens, 100000);
         assert_eq!(raw.cache_read_input_tokens, 0);
         assert!(reported.cache_read_input_tokens > 0);
-        assert!(reported.input_tokens > 0);
+        assert!((32..=4_096).contains(&reported.input_tokens));
         assert_eq!(
             reported.input_tokens
                 + reported.cache_creation_input_tokens
@@ -6609,6 +6706,16 @@ data: {"type":"message_delta","note":"content_block_delta"}
         );
         first_projection.record_success();
 
+        route.payload.messages.extend([
+            Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!("ready"),
+            },
+            Message {
+                role: "user".to_string(),
+                content: serde_json::json!("continue external projection session"),
+            },
+        ]);
         let second_projection = projection_context(&route, &pool, 0).expect("second projection");
         let second = maybe_project_non_stream_usage(raw_creation_body, Some(&second_projection));
         let second_value: serde_json::Value =
@@ -6738,7 +6845,7 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
 
         assert_eq!(raw.input_tokens, 100000);
         assert!(reported.input_tokens <= 96);
-        assert!(reported.cache_read_input_tokens > 0);
+        assert_eq!(reported.cache_read_input_tokens, 0);
         assert!(reported.cache_creation_input_tokens > 0);
     }
 

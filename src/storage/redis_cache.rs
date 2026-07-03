@@ -2141,6 +2141,7 @@ impl RedisStore {
     pub async fn record_scheduler_selection(
         &self,
         credential_id: u64,
+        rpm: u32,
     ) -> anyhow::Result<SchedulerHealthState> {
         let now = now_ms();
         let script = r#"
@@ -2149,6 +2150,7 @@ impl RedisStore {
             local window_10s = tonumber(ARGV[3])
             local window_60s = tonumber(ARGV[4])
             local window_5m = tonumber(ARGV[5])
+            local rpm = tonumber(ARGV[6])
             local health = {}
             local raw = redis.call('GET', KEYS[1])
             if raw then
@@ -2164,21 +2166,37 @@ impl RedisStore {
             health['recent_selection_count_10s'] = redis.call('ZCOUNT', KEYS[2], now - window_10s, '+inf')
             health['recent_selection_count_60s'] = redis.call('ZCOUNT', KEYS[2], now - window_60s, '+inf')
             health['recent_selection_count_5m'] = redis.call('ZCOUNT', KEYS[2], now - window_5m, '+inf')
+            if rpm > 0 and tonumber(health['recent_selection_count_60s']) >= rpm then
+                local oldest = redis.call('ZRANGEBYSCORE', KEYS[2], now - window_60s, '+inf', 'WITHSCORES', 'LIMIT', 0, 1)
+                local next_at = now + window_60s
+                if oldest and oldest[2] then
+                    next_at = tonumber(oldest[2]) + window_60s
+                end
+                if next_at > now then
+                    redis.call('SET', KEYS[4], tostring(next_at), 'PX', math.max(1, next_at - now))
+                else
+                    redis.call('DEL', KEYS[4])
+                end
+            else
+                redis.call('DEL', KEYS[4])
+            end
             redis.call('SET', KEYS[1], cjson.encode(health), 'EX', ttl)
             return cjson.encode(health)
         "#;
         let mut manager = self.scheduler_manager();
         let encoded: String = redis::cmd("EVAL")
             .arg(script)
-            .arg(3)
+            .arg(4)
             .arg(self.key(scheduler_health_key(credential_id)))
             .arg(self.key(scheduler_selection_window_key(credential_id)))
             .arg(self.key("scheduler:selection:sequence"))
+            .arg(self.key(scheduler_rate_limit_key(credential_id)))
             .arg(30 * 24 * 60 * 60)
             .arg(now)
             .arg(10_000)
             .arg(60_000)
             .arg(5 * 60_000)
+            .arg(rpm)
             .query_async(&mut manager)
             .await?;
         Ok(serde_json::from_str(&encoded)?)
@@ -2209,6 +2227,7 @@ impl RedisStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn bump_rate_limit_available_at(
         &self,
         credential_id: u64,
@@ -4957,12 +4976,12 @@ mod tests {
         assert_eq!(model_success_health.transient_failure_streak, 0);
         assert!(store.get_scheduler_cooldown(4).await.unwrap().is_none());
 
-        let selected_once = store.record_scheduler_selection(3).await.unwrap();
+        let selected_once = store.record_scheduler_selection(3, 60).await.unwrap();
         assert_eq!(selected_once.selection_count, 1);
         assert_eq!(selected_once.recent_selection_count_10s, 1);
         assert_eq!(selected_once.recent_selection_count_60s, 1);
         assert_eq!(selected_once.recent_selection_count_5m, 1);
-        let selected_twice = store.record_scheduler_selection(3).await.unwrap();
+        let selected_twice = store.record_scheduler_selection(3, 60).await.unwrap();
         assert_eq!(selected_twice.selection_count, 2);
         assert_eq!(
             store

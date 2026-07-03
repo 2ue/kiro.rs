@@ -15,6 +15,7 @@ pub(super) fn min_dispatch_wait(
     model: Option<&str>,
     excluded_ids: &HashSet<u64>,
     now: Instant,
+    global_rpm: u32,
 ) -> Option<StdDuration> {
     entries
         .iter()
@@ -24,7 +25,7 @@ pub(super) fn min_dispatch_wait(
         .filter_map(|entry| {
             match (
                 entry_cooldown_remaining(entry, model, now),
-                entry_rate_limit_remaining(entry, now),
+                entry_rate_limit_remaining(entry, global_rpm, now),
             ) {
                 (Some(a), Some(b)) => Some(a.max(b)),
                 (Some(a), None) => Some(a),
@@ -42,6 +43,7 @@ pub(super) fn concurrency_blocked_count(
     excluded_ids: &HashSet<u64>,
     now: Instant,
     max_concurrent_requests: u32,
+    global_rpm: u32,
     global_has_capacity: bool,
 ) -> usize {
     entries
@@ -49,7 +51,7 @@ pub(super) fn concurrency_blocked_count(
         .filter(|entry| {
             credential_is_dispatch_candidate(proxy_resources, entry, model, excluded_ids)
                 && entry_cooldown_remaining(entry, model, now).is_none()
-                && entry_rate_limit_remaining(entry, now).is_none()
+                && entry_rate_limit_remaining(entry, global_rpm, now).is_none()
                 && (!global_has_capacity
                     || !entry_has_concurrency_capacity(entry, max_concurrent_requests))
         })

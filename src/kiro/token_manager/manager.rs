@@ -74,7 +74,10 @@ use super::route_state::{
     cached_local_pool_route_state, invalidate_local_pool_route_state_cache,
     local_pool_route_state_cache_key, store_local_pool_route_state_cache,
 };
-use super::rpm::{effective_rpm, entry_rate_limit_remaining, rate_limit_interval_for_rpm};
+use super::rpm::{
+    effective_rpm, entry_rate_limit_remaining, entry_rate_limit_window_remaining,
+    rate_limit_interval_for_rpm,
+};
 use super::sticky::{
     bind_session_to_credential as bind_sticky_session_to_credential,
     bound_credential_id as sticky_bound_credential_id,
@@ -978,7 +981,7 @@ impl MultiTokenManager {
                 (AccountRejectReason::ProxyUnavailable, None)
             } else if let Some(remaining) = entry_cooldown_remaining(entry, model, now) {
                 (AccountRejectReason::CooldownActive, Some(remaining))
-            } else if entry_rate_limit_remaining(entry, now).is_some() {
+            } else if entry_rate_limit_remaining(entry, global_rpm, now).is_some() {
                 waitable_account_count = waitable_account_count.saturating_add(1);
                 (AccountRejectReason::RpmLimited, None)
             } else if !global_has_capacity {
@@ -1034,6 +1037,7 @@ impl MultiTokenManager {
         let total = entries.len();
         let available = entries.iter().filter(|entry| !entry.disabled).count();
         let max_concurrent_requests = config.credential_max_concurrent_requests;
+        let global_rpm = config.credential_rpm.unwrap_or(0);
         let global_in_flight_requests = entries
             .iter()
             .map(|entry| entry.in_flight_requests)
@@ -1075,7 +1079,7 @@ impl MultiTokenManager {
             });
 
             let cooldown_remaining = entry_cooldown_remaining(entry, model, now);
-            let rate_limit_remaining = entry_rate_limit_remaining(entry, now);
+            let rate_limit_remaining = entry_rate_limit_remaining(entry, global_rpm, now);
 
             if let Some(remaining) = cooldown_remaining {
                 cooldown_blocked += 1;
@@ -1578,28 +1582,19 @@ impl MultiTokenManager {
 
     fn mark_rate_limited_at(&self, id: u64, now: Instant) -> anyhow::Result<()> {
         let global_rpm = self.config.lock().credential_rpm.unwrap_or(0);
-        let interval = {
+        {
             let mut entries = self.entries.lock();
             let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
                 return Ok(());
             };
             let rpm = effective_rpm(entry, global_rpm);
-            let Some(interval) = rate_limit_interval_for_rpm(rpm) else {
+            if rate_limit_interval_for_rpm(rpm).is_none() {
                 entry.rate_limit_available_at = None;
                 return Ok(());
-            };
-            let base = entry
-                .rate_limit_available_at
-                .filter(|at| *at > now)
-                .unwrap_or(now);
-            entry.rate_limit_available_at = Some(base + interval);
-            interval
-        };
-        if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            let _ = self.block_on_scheduler_redis_hot("更新 Redis 凭据限流状态", async move {
-                redis.bump_rate_limit_available_at(id, interval).await
-            });
+            }
+            entry.rate_limit_available_at =
+                entry_rate_limit_window_remaining(entry, global_rpm, now)
+                    .and_then(|remaining| now.checked_add(remaining));
         }
         Ok(())
     }
@@ -2051,7 +2046,9 @@ impl MultiTokenManager {
     ) -> bool {
         let mut entries = self.entries.lock();
         let now = Instant::now();
-        let max_concurrent_requests = self.max_concurrent_requests();
+        let config = self.config.lock().clone();
+        let max_concurrent_requests = config.credential_max_concurrent_requests;
+        let global_rpm = config.credential_rpm.unwrap_or(0);
         if self.redis_store.is_none() {
             refresh_local_selection_windows_locked(&mut entries, now);
         }
@@ -2065,6 +2062,7 @@ impl MultiTokenManager {
                     model,
                     now,
                     max_concurrent_requests,
+                    global_rpm,
                 )
         })
     }
@@ -2084,6 +2082,7 @@ impl MultiTokenManager {
         let now = Instant::now();
         let config = self.config.lock().clone();
         let max_concurrent_requests = config.credential_max_concurrent_requests;
+        let global_rpm = config.credential_rpm.unwrap_or(0);
         let global_in_flight = entries
             .iter()
             .map(|entry| entry.in_flight_requests)
@@ -2108,6 +2107,7 @@ impl MultiTokenManager {
                         model,
                         now,
                         max_concurrent_requests,
+                        global_rpm,
                     )
                 {
                     continue;
@@ -2199,7 +2199,9 @@ impl MultiTokenManager {
         let entries = self.entries.lock();
         let proxy_resources = self.proxy_resources.lock();
         let now = Instant::now();
-        let max_concurrent_requests = self.max_concurrent_requests();
+        let config = self.config.lock().clone();
+        let max_concurrent_requests = config.credential_max_concurrent_requests;
+        let global_rpm = config.credential_rpm.unwrap_or(0);
         entries
             .iter()
             .find(|e| {
@@ -2210,6 +2212,7 @@ impl MultiTokenManager {
                         model,
                         now,
                         max_concurrent_requests,
+                        global_rpm,
                     )
             })
             .map(|e| (e.id, e.credentials.clone()))
@@ -2230,10 +2233,10 @@ impl MultiTokenManager {
         let entries = self.entries.lock();
         let proxy_resources = self.proxy_resources.lock();
         let now = Instant::now();
-        entries
-            .iter()
-            .find(|e| e.id == bound_id)
-            .is_none_or(|e| !credential_is_temporarily_available(&proxy_resources, e, model, now))
+        let global_rpm = self.config.lock().credential_rpm.unwrap_or(0);
+        entries.iter().find(|e| e.id == bound_id).is_none_or(|e| {
+            !credential_is_temporarily_available(&proxy_resources, e, model, now, global_rpm)
+        })
     }
 
     fn bind_session_to_credential(&self, session_id: &str, credential_id: u64) {
@@ -2427,6 +2430,7 @@ impl MultiTokenManager {
                             let available = entries.iter().filter(|e| !e.disabled).count();
                             let now = Instant::now();
                             let max_concurrent_requests = config.credential_max_concurrent_requests;
+                            let global_rpm = config.credential_rpm.unwrap_or(0);
                             let global_in_flight = entries
                                 .iter()
                                 .map(|entry| entry.in_flight_requests)
@@ -2470,6 +2474,7 @@ impl MultiTokenManager {
                                                 model,
                                                 now,
                                                 max_concurrent_requests,
+                                                global_rpm,
                                             )
                                     })
                                     .count()
@@ -2567,6 +2572,7 @@ impl MultiTokenManager {
                                     model,
                                     &local_excluded_ids,
                                     now,
+                                    global_rpm,
                                 );
                                 if dispatch_candidate_count > 0
                                     && cooldown_blocked >= dispatch_candidate_count
@@ -2591,6 +2597,7 @@ impl MultiTokenManager {
                                     &local_excluded_ids,
                                     now,
                                     max_concurrent_requests,
+                                    global_rpm,
                                     global_has_capacity,
                                 );
                                 if concurrency_blocked > 0
@@ -2760,6 +2767,7 @@ impl MultiTokenManager {
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials, true).await {
                 Ok(ctx) => {
+                    self.record_scheduler_selection(ctx.id);
                     if let Err(err) = self.mark_rate_limited_at(ctx.id, Instant::now()) {
                         drop(in_flight_lease);
                         return Err(err);
@@ -2775,7 +2783,6 @@ impl MultiTokenManager {
                             self.bind_session_to_credential(sid, ctx.id);
                         }
                     }
-                    self.record_scheduler_selection(ctx.id);
                     return Ok(CallContext {
                         sticky_bound,
                         fallback_from_sticky,
@@ -3823,8 +3830,17 @@ impl MultiTokenManager {
         }
         if let Some(redis) = &self.redis_store {
             let redis = redis.clone();
+            let global_rpm = self.config.lock().credential_rpm.unwrap_or(0);
+            let rpm = {
+                let entries = self.entries.lock();
+                entries
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .map(|entry| effective_rpm(entry, global_rpm))
+                    .unwrap_or(global_rpm)
+            };
             spawn_best_effort_storage_task("记录 Redis 调度选中次数", async move {
-                redis.record_scheduler_selection(id).await?;
+                redis.record_scheduler_selection(id, rpm).await?;
                 Ok(())
             });
         }
@@ -4091,7 +4107,9 @@ impl MultiTokenManager {
         let has_alternate = {
             let entries = self.entries.lock();
             let proxy_resources = self.proxy_resources.lock();
-            let max_concurrent_requests = self.max_concurrent_requests();
+            let config = self.config.lock().clone();
+            let max_concurrent_requests = config.credential_max_concurrent_requests;
+            let global_rpm = config.credential_rpm.unwrap_or(0);
             entries.iter().any(|e| {
                 e.id != id
                     && credential_is_dispatchable(
@@ -4100,6 +4118,7 @@ impl MultiTokenManager {
                         model,
                         Instant::now(),
                         max_concurrent_requests,
+                        global_rpm,
                     )
             })
         };
@@ -4589,6 +4608,7 @@ impl MultiTokenManager {
         let now = Instant::now();
         let now_ms = Utc::now().timestamp_millis();
         let max_concurrent_requests = config.credential_max_concurrent_requests;
+        let global_rpm = config.credential_rpm.unwrap_or(0);
         let lease_max_age = (config.credential_in_flight_lease_max_secs > 0)
             .then(|| StdDuration::from_secs(config.credential_in_flight_lease_max_secs));
         let local_global_in_flight = entries
@@ -4609,6 +4629,7 @@ impl MultiTokenManager {
                     None,
                     now,
                     max_concurrent_requests,
+                    global_rpm,
                 )
             })
             .collect();
@@ -4751,6 +4772,7 @@ impl MultiTokenManager {
         let available = entries.iter().filter(|e| !e.disabled).count();
         let now_ms = Utc::now().timestamp_millis();
         let max_concurrent_requests = config.credential_max_concurrent_requests;
+        let global_rpm = config.credential_rpm.unwrap_or(0);
         let lease_max_age = (config.credential_in_flight_lease_max_secs > 0)
             .then(|| StdDuration::from_secs(config.credential_in_flight_lease_max_secs));
         let proxy_resources = self.proxy_resources.lock();
@@ -4763,6 +4785,7 @@ impl MultiTokenManager {
                     None,
                     now,
                     max_concurrent_requests,
+                    global_rpm,
                 )
             })
             .collect();
@@ -7829,7 +7852,7 @@ mod tests {
     async fn test_rate_limiter_prefers_other_dispatchable_credential() {
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
-        config.credential_rpm = Some(60);
+        config.credential_rpm = Some(1);
 
         let mut cred1 = KiroCredentials::default();
         cred1.access_token = Some("t1".to_string());
@@ -7841,8 +7864,8 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
-        let first = manager.acquire_context(None).await.unwrap();
-        let second = manager.acquire_context(None).await.unwrap();
+        let mut first = manager.acquire_context(None).await.unwrap();
+        let mut second = manager.acquire_context(None).await.unwrap();
 
         assert_ne!(first.id, second.id);
         assert!(
@@ -7854,12 +7877,14 @@ mod tests {
                 .count()
                 >= 2
         );
+        first.release_in_flight();
+        second.release_in_flight();
     }
 
     #[tokio::test]
-    async fn test_rate_limiter_waits_until_slot_is_dispatchable() {
+    async fn test_rate_limiter_blocks_after_window_capacity_is_full() {
         let mut config = Config::default();
-        config.credential_rpm = Some(6_000);
+        config.credential_rpm = Some(1);
 
         let mut cred = KiroCredentials::default();
         cred.access_token = Some("t1".to_string());
@@ -7870,22 +7895,46 @@ mod tests {
         let mut first = manager.acquire_context(None).await.unwrap();
         first.release_in_flight();
 
-        let started = Instant::now();
-        let mut second =
-            tokio::time::timeout(StdDuration::from_millis(500), manager.acquire_context(None))
-                .await
-                .expect("本地 RPM 限流恢复后应继续调度")
-                .expect("等待请求应成功获取凭据");
+        let state = manager.local_pool_route_state(None);
+        assert_eq!(state.kind, LocalPoolRouteStateKind::AllCoolingDown);
+        assert_eq!(state.rate_limit_blocked, 1);
+        assert!(state.retry_after_secs.is_some());
+    }
 
-        assert!(started.elapsed() >= StdDuration::from_millis(8));
-        assert_eq!(second.id, first.id);
-        second.release_in_flight();
+    #[tokio::test]
+    async fn test_rate_limiter_allows_idle_burst_up_to_rpm_capacity() {
+        let mut config = Config::default();
+        config.credential_rpm = Some(50);
+        config.credential_max_concurrent_requests = 50;
+        config.dispatch_global_max_concurrent_requests = 80;
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![test_access_token_credential("t1", "Pro")],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut leases = Vec::new();
+        for _ in 0..50 {
+            leases.push(manager.acquire_context(None).await.unwrap());
+        }
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.global_in_flight_requests, 50);
+        assert!(snapshot.entries[0].rate_limited);
+
+        for lease in &mut leases {
+            lease.release_in_flight();
+        }
     }
 
     #[tokio::test]
     async fn test_runtime_config_disabling_credential_rpm_clears_rate_limit_state() {
         let mut config = Config::default();
-        config.credential_rpm = Some(60);
+        config.credential_rpm = Some(1);
 
         let manager = MultiTokenManager::new(
             config,
@@ -7921,15 +7970,15 @@ mod tests {
         config.credential_rpm = None;
 
         let mut cred = test_access_token_credential("t1", "Pro");
-        cred.rpm = Some(60);
+        cred.rpm = Some(1);
 
         let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
         let mut first = manager.acquire_context(None).await.unwrap();
         first.release_in_flight();
 
         let snapshot = manager.snapshot();
-        assert_eq!(snapshot.entries[0].rpm, 60);
-        assert_eq!(snapshot.entries[0].rpm_override, Some(60));
+        assert_eq!(snapshot.entries[0].rpm, 1);
+        assert_eq!(snapshot.entries[0].rpm_override, Some(1));
         assert!(snapshot.entries[0].rate_limited);
     }
 
@@ -8249,8 +8298,10 @@ mod tests {
         )
         .unwrap();
 
-        let mut ctx = manager.acquire_context(None).await.unwrap();
-        ctx.release_in_flight();
+        for _ in 0..60 {
+            let mut ctx = manager.acquire_context(None).await.unwrap();
+            ctx.release_in_flight();
+        }
         let summary = manager.selection_failure_summary(
             "req_rpm",
             "/cc/v1/messages",
@@ -9670,7 +9721,7 @@ mod tests {
     async fn test_sonnet_rate_limiter_prefers_other_dispatchable_credential() {
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
-        config.credential_rpm = Some(60);
+        config.credential_rpm = Some(1);
 
         let mut cred1 = KiroCredentials::default();
         cred1.subscription_title = Some("Free".to_string());

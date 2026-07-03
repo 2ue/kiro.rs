@@ -29,11 +29,12 @@ pub(super) fn credential_is_dispatchable(
     model: Option<&str>,
     now: Instant,
     max_concurrent_requests: u32,
+    global_rpm: u32,
 ) -> bool {
     credential_is_usable_for_model(entry, model)
         && credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
         && entry_cooldown_remaining(entry, model, now).is_none()
-        && entry_rate_limit_remaining(entry, now).is_none()
+        && entry_rate_limit_remaining(entry, global_rpm, now).is_none()
         && entry_has_concurrency_capacity(entry, max_concurrent_requests)
 }
 
@@ -42,11 +43,12 @@ pub(super) fn credential_is_temporarily_available(
     entry: &CredentialEntry,
     model: Option<&str>,
     now: Instant,
+    global_rpm: u32,
 ) -> bool {
     credential_is_usable_for_model(entry, model)
         && credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
         && entry_cooldown_remaining(entry, model, now).is_none()
-        && entry_rate_limit_remaining(entry, now).is_none()
+        && entry_rate_limit_remaining(entry, global_rpm, now).is_none()
 }
 
 pub(super) fn credential_is_dispatch_candidate(

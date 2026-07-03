@@ -1483,15 +1483,17 @@ impl StreamContext {
         &self,
         usage: super::cache::CacheUsage,
     ) -> super::cache::CacheUsage {
-        if !self.local_prompt_cache_projection_enabled {
-            return usage;
-        }
-
         let Some(policy) = self.reported_cache_usage_policy.clone() else {
             return usage;
         };
         let raw = super::cache::RawUsage::uncached(self.input_tokens, usage.output_tokens);
-        let mut reported = usage.with_reported_cache_usage_policy_and_raw(policy.clone(), raw);
+        let report_base = if self.local_prompt_cache_projection_enabled {
+            usage
+        } else {
+            raw.to_cache_usage()
+        };
+        let mut reported =
+            report_base.with_reported_cache_usage_policy_and_raw(policy.clone(), raw);
         reported = policy.apply_final_input_guard(reported);
         policy.apply_final_cache_read_guard(reported)
     }
@@ -2935,6 +2937,7 @@ mod tests {
                 target_cache_ratio: None,
                 amplification: None,
                 split_cached_input: false,
+                ..Default::default()
             }),
             PromptCacheSimulationMode::HighCache,
         );
@@ -3029,6 +3032,7 @@ mod tests {
                 target_cache_ratio: None,
                 amplification: None,
                 split_cached_input: false,
+                ..Default::default()
             }),
             PromptCacheSimulationMode::Disabled,
         );
@@ -3066,6 +3070,64 @@ mod tests {
 
         assert!((1..=96).contains(&final_input));
         assert!(final_cache_read > 50_000);
+    }
+
+    #[test]
+    fn test_stream_reported_usage_shapes_without_local_prompt_cache_projection() {
+        let mut ctx = StreamContext::new_with_simulation(
+            "test-model",
+            100_000,
+            200_000,
+            false,
+            true,
+            HashMap::new(),
+            Some(crate::anthropic::cache::CacheSimulation {
+                cache_creation_input_tokens: 20_000,
+                cache_read_input_tokens: 50_000,
+                cache_creation_5m_input_tokens: 20_000,
+                cache_creation_1h_input_tokens: 0,
+                target_cache_ratio: None,
+                amplification: None,
+                split_cached_input: false,
+                ..Default::default()
+            }),
+            PromptCacheSimulationMode::Disabled,
+        );
+        ctx.set_local_prompt_cache_projection_enabled(false);
+        ctx.set_reported_cache_usage_policy(
+            crate::anthropic::cache::ReportedCacheUsagePolicy::input_only(96, 7),
+        );
+
+        let initial_events = ctx.generate_initial_events();
+        let message_start = initial_events
+            .iter()
+            .find(|event| event.event == "message_start")
+            .expect("message_start should exist");
+        let start_usage = &message_start.data["message"]["usage"];
+        assert!(
+            start_usage["input_tokens"]
+                .as_i64()
+                .is_some_and(|tokens| (1..=96).contains(&tokens))
+        );
+        assert_eq!(start_usage["cache_creation_input_tokens"], 0);
+        assert_eq!(start_usage["cache_read_input_tokens"], 0);
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_assistant_response("hello"));
+        all_events.extend(ctx.generate_final_events());
+
+        let message_delta = all_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta should exist");
+        let final_usage = &message_delta.data["usage"];
+        assert!(
+            final_usage["input_tokens"]
+                .as_i64()
+                .is_some_and(|tokens| (1..=96).contains(&tokens))
+        );
+        assert_eq!(final_usage["cache_creation_input_tokens"], 0);
+        assert_eq!(final_usage["cache_read_input_tokens"], 0);
     }
 
     #[test]

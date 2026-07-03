@@ -1127,6 +1127,10 @@ pub struct KiroRsToolCachePolicy {
     pub cache_current_user_stable_prefix: bool,
     #[serde(default)]
     pub current_user_stable_prefix_max_tokens: i32,
+    #[serde(default = "default_kiro_rs_tool_reported_input_min_tokens")]
+    pub reported_input_min_tokens: i32,
+    #[serde(default = "default_kiro_rs_tool_reported_input_max_tokens")]
+    pub reported_input_max_tokens: i32,
 }
 
 impl Default for KiroRsToolCachePolicy {
@@ -1138,6 +1142,8 @@ impl Default for KiroRsToolCachePolicy {
             max_new_creation_tokens_per_request: 0,
             cache_current_user_stable_prefix: false,
             current_user_stable_prefix_max_tokens: 0,
+            reported_input_min_tokens: default_kiro_rs_tool_reported_input_min_tokens(),
+            reported_input_max_tokens: default_kiro_rs_tool_reported_input_max_tokens(),
         }
     }
 }
@@ -1152,6 +1158,13 @@ impl KiroRsToolCachePolicy {
         self.max_new_creation_tokens_per_request = self.max_new_creation_tokens_per_request.max(0);
         self.current_user_stable_prefix_max_tokens =
             self.current_user_stable_prefix_max_tokens.max(0);
+        self.reported_input_min_tokens = self.reported_input_min_tokens.max(0);
+        self.reported_input_max_tokens = self.reported_input_max_tokens.max(0);
+        if self.reported_input_max_tokens > 0
+            && self.reported_input_min_tokens > self.reported_input_max_tokens
+        {
+            self.reported_input_min_tokens = self.reported_input_max_tokens;
+        }
         if !self.cache_current_user_stable_prefix {
             self.current_user_stable_prefix_max_tokens = 0;
         }
@@ -1173,6 +1186,19 @@ impl KiroRsToolCachePolicy {
                 "{label}.currentUserStablePrefixMaxTokens 不能小于 0"
             ));
         }
+        if self.reported_input_min_tokens < 0 {
+            return Err(format!("{label}.reportedInputMinTokens 不能小于 0"));
+        }
+        if self.reported_input_max_tokens < 0 {
+            return Err(format!("{label}.reportedInputMaxTokens 不能小于 0"));
+        }
+        if self.reported_input_max_tokens > 0
+            && self.reported_input_min_tokens > self.reported_input_max_tokens
+        {
+            return Err(format!(
+                "{label}.reportedInputMinTokens 不能大于 reportedInputMaxTokens"
+            ));
+        }
         Ok(())
     }
 }
@@ -1192,6 +1218,10 @@ pub struct KiroRsToolCachePolicyPatch {
     pub cache_current_user_stable_prefix: Option<bool>,
     #[serde(default)]
     pub current_user_stable_prefix_max_tokens: Option<i32>,
+    #[serde(default)]
+    pub reported_input_min_tokens: Option<i32>,
+    #[serde(default)]
+    pub reported_input_max_tokens: Option<i32>,
 }
 
 impl KiroRsToolCachePolicyPatch {
@@ -1214,6 +1244,12 @@ impl KiroRsToolCachePolicyPatch {
         if let Some(value) = self.current_user_stable_prefix_max_tokens {
             policy.current_user_stable_prefix_max_tokens = value;
         }
+        if let Some(value) = self.reported_input_min_tokens {
+            policy.reported_input_min_tokens = value;
+        }
+        if let Some(value) = self.reported_input_max_tokens {
+            policy.reported_input_max_tokens = value;
+        }
         policy.normalized()
     }
 
@@ -1224,6 +1260,8 @@ impl KiroRsToolCachePolicyPatch {
             && self.max_new_creation_tokens_per_request.is_none()
             && self.cache_current_user_stable_prefix.is_none()
             && self.current_user_stable_prefix_max_tokens.is_none()
+            && self.reported_input_min_tokens.is_none()
+            && self.reported_input_max_tokens.is_none()
     }
 
     fn validate_raw(&self, label: &str) -> Result<(), String> {
@@ -1247,6 +1285,26 @@ impl KiroRsToolCachePolicyPatch {
         {
             return Err(format!(
                 "{label}.currentUserStablePrefixMaxTokens 不能小于 0"
+            ));
+        }
+        if self
+            .reported_input_min_tokens
+            .is_some_and(|value| value < 0)
+        {
+            return Err(format!("{label}.reportedInputMinTokens 不能小于 0"));
+        }
+        if self
+            .reported_input_max_tokens
+            .is_some_and(|value| value < 0)
+        {
+            return Err(format!("{label}.reportedInputMaxTokens 不能小于 0"));
+        }
+        if matches!(
+            (self.reported_input_min_tokens, self.reported_input_max_tokens),
+            (Some(min), Some(max)) if max > 0 && min > max
+        ) {
+            return Err(format!(
+                "{label}.reportedInputMinTokens 不能大于 reportedInputMaxTokens"
             ));
         }
         Ok(())
@@ -2845,6 +2903,14 @@ fn default_kiro_rs_tool_coverage_ratio() -> f64 {
     1.0
 }
 
+fn default_kiro_rs_tool_reported_input_min_tokens() -> i32 {
+    32
+}
+
+fn default_kiro_rs_tool_reported_input_max_tokens() -> i32 {
+    4_096
+}
+
 fn default_prompt_cache_token_scale() -> f64 {
     1.6
 }
@@ -4051,6 +4117,314 @@ mod tests {
     }
 
     #[test]
+    fn cache_policy_parameter_matrix_applies_each_strategy_semantics() {
+        let mut config = Config::default();
+        config.cache_policy.default = CacheRoutePolicyPatch {
+            simulation: Some(CacheSimulationPolicyPatch {
+                target_read_ratio: Some(0.61),
+                token_scale: Some(1.1),
+                max_simulated_input_tokens: Some(161_000),
+                cap_jitter_min_tokens: Some(1_000),
+                cap_jitter_max_tokens: Some(9_000),
+                scale_min_input_tokens: Some(6_000),
+                ..CacheSimulationPolicyPatch::default()
+            }),
+            creation_control: Some(PromptCacheCreationControlConfig {
+                enabled: true,
+                scope_mode: PromptCacheCreationControlScopeMode::ConversationModel,
+                min_successful_requests_between_creation: 5,
+                min_creation_interval_secs: 55,
+                min_creation_delta_tokens: 15_000,
+                max_creation_tokens_per_event: 25_000,
+                creation_budget_window_secs: 155,
+                max_creation_tokens_per_window: 75_000,
+                expire_after_idle_secs: 1_555,
+            }),
+            reported_usage: Some(ReportedUsagePathPolicy {
+                output: ReportedUsageFieldPolicy::sample_max(222),
+                ..ReportedUsagePathPolicy::default()
+            }),
+            cache_point: Some(CachePointPolicyPatch {
+                enabled: Some(true),
+                tools_only: Some(true),
+                record_plan: Some(true),
+            }),
+            bounds: Some(CacheBoundsPolicyPatch {
+                max_entries_per_account: Some(11),
+                max_entries_global: Some(111),
+                entry_ttl_secs: Some(1_111),
+                estimated_bytes_limit: Some(11_111),
+            }),
+            ..CacheRoutePolicyPatch::default()
+        };
+        config.cache_policy.current_high_cache = CacheRoutePolicyPatch {
+            simulation: Some(CacheSimulationPolicyPatch {
+                token_scale: Some(1.7),
+                cap_jitter_min_tokens: Some(2_000),
+                ..CacheSimulationPolicyPatch::default()
+            }),
+            cache_point: Some(CachePointPolicyPatch {
+                tools_only: Some(false),
+                ..CachePointPolicyPatch::default()
+            }),
+            ..CacheRoutePolicyPatch::default()
+        };
+        config.cache_policy.path_overrides.insert(
+            "/matrix".to_string(),
+            CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+                simulation: Some(CacheSimulationPolicyPatch {
+                    enabled: Some(true),
+                    target_read_ratio: Some(0.77),
+                    max_simulated_input_tokens: Some(177_000),
+                    scale_min_input_tokens: Some(17_000),
+                    ..CacheSimulationPolicyPatch::default()
+                }),
+                creation_control: Some(PromptCacheCreationControlConfig {
+                    enabled: true,
+                    scope_mode: PromptCacheCreationControlScopeMode::CredentialConversationModel,
+                    min_successful_requests_between_creation: 3,
+                    min_creation_interval_secs: 33,
+                    min_creation_delta_tokens: 13_000,
+                    max_creation_tokens_per_event: 23_000,
+                    creation_budget_window_secs: 133,
+                    max_creation_tokens_per_window: 73_000,
+                    expire_after_idle_secs: 1_333,
+                }),
+                reported_usage: Some(ReportedUsagePathPolicy {
+                    final_cache_read_max_tokens: 333_000,
+                    input: ReportedUsageFieldPolicy::sample_input_max(333),
+                    output: ReportedUsageFieldPolicy::sample_target(444),
+                    cache_read: ReportedUsageFieldPolicy::sample_max(55_000),
+                    cache_creation: ReportedUsageFieldPolicy::sample_target_with_multiplier(
+                        6_000, 1.4,
+                    ),
+                    ..ReportedUsagePathPolicy::default()
+                }),
+                cache_point: Some(CachePointPolicyPatch {
+                    enabled: Some(true),
+                    tools_only: Some(false),
+                    record_plan: Some(false),
+                }),
+                bounds: Some(CacheBoundsPolicyPatch {
+                    max_entries_per_account: Some(7),
+                    max_entries_global: Some(70),
+                    entry_ttl_secs: Some(700),
+                    estimated_bytes_limit: Some(7_000),
+                }),
+                kiro_rs_tool: Some(KiroRsToolCachePolicyPatch {
+                    coverage_ratio: Some(0.7),
+                    max_coverage_tokens: Some(70_000),
+                    incremental_create_enabled: Some(false),
+                    max_new_creation_tokens_per_request: Some(7_000),
+                    cache_current_user_stable_prefix: Some(true),
+                    current_user_stable_prefix_max_tokens: Some(700),
+                    ..Default::default()
+                }),
+            },
+        );
+        config.cache_policy.path_overrides.insert(
+            "/plain".to_string(),
+            CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::NoCache),
+                simulation: Some(CacheSimulationPolicyPatch {
+                    enabled: Some(true),
+                    target_read_ratio: Some(0.88),
+                    token_scale: Some(2.0),
+                    ..CacheSimulationPolicyPatch::default()
+                }),
+                creation_control: Some(PromptCacheCreationControlConfig::default()),
+                reported_usage: Some(ReportedUsagePathPolicy {
+                    input: ReportedUsageFieldPolicy::sample_input_max(111),
+                    output: ReportedUsageFieldPolicy::sample_max(22),
+                    ..ReportedUsagePathPolicy::default()
+                }),
+                cache_point: Some(CachePointPolicyPatch {
+                    enabled: Some(true),
+                    tools_only: Some(false),
+                    record_plan: Some(true),
+                }),
+                bounds: Some(CacheBoundsPolicyPatch {
+                    max_entries_per_account: Some(2),
+                    max_entries_global: Some(20),
+                    entry_ttl_secs: Some(200),
+                    estimated_bytes_limit: Some(2_000),
+                }),
+                kiro_rs_tool: Some(KiroRsToolCachePolicyPatch {
+                    coverage_ratio: Some(0.2),
+                    ..KiroRsToolCachePolicyPatch::default()
+                }),
+            },
+        );
+        config.cache_policy.path_overrides.insert(
+            "/tool-matrix".to_string(),
+            CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::KiroRsTool),
+                simulation: Some(CacheSimulationPolicyPatch {
+                    enabled: Some(true),
+                    token_scale: Some(2.5),
+                    ..CacheSimulationPolicyPatch::default()
+                }),
+                creation_control: Some(PromptCacheCreationControlConfig::default()),
+                reported_usage: Some(ReportedUsagePathPolicy {
+                    input: ReportedUsageFieldPolicy::sample_input_max(123),
+                    ..ReportedUsagePathPolicy::default()
+                }),
+                cache_point: Some(CachePointPolicyPatch {
+                    enabled: Some(true),
+                    tools_only: Some(false),
+                    record_plan: Some(true),
+                }),
+                bounds: Some(CacheBoundsPolicyPatch {
+                    max_entries_per_account: Some(5),
+                    max_entries_global: Some(50),
+                    entry_ttl_secs: Some(500),
+                    estimated_bytes_limit: Some(5_000),
+                }),
+                kiro_rs_tool: Some(KiroRsToolCachePolicyPatch {
+                    coverage_ratio: Some(0.5),
+                    max_coverage_tokens: Some(50_000),
+                    incremental_create_enabled: Some(false),
+                    max_new_creation_tokens_per_request: Some(5_000),
+                    cache_current_user_stable_prefix: Some(true),
+                    current_user_stable_prefix_max_tokens: Some(500),
+                    ..Default::default()
+                }),
+            },
+        );
+
+        let high = config.cache_policy_for_path("/matrix/v1/messages");
+        assert_eq!(high.namespace.as_deref(), Some("/matrix"));
+        assert_eq!(
+            high.policy.cache_type,
+            PromptCacheStrategyType::CurrentHighCache
+        );
+        assert!(high.policy.simulation.enabled);
+        assert_eq!(high.policy.simulation.target_read_ratio, 0.77);
+        assert_eq!(high.policy.simulation.token_scale, 1.7);
+        assert_eq!(high.policy.simulation.max_simulated_input_tokens, 177_000);
+        assert_eq!(high.policy.simulation.cap_jitter_min_tokens, 2_000);
+        assert_eq!(high.policy.simulation.cap_jitter_max_tokens, 9_000);
+        assert_eq!(high.policy.simulation.scale_min_input_tokens, 17_000);
+        assert_eq!(
+            high.policy.creation_control.scope_mode,
+            PromptCacheCreationControlScopeMode::CredentialConversationModel
+        );
+        assert_eq!(
+            high.policy
+                .creation_control
+                .min_successful_requests_between_creation,
+            3
+        );
+        assert_eq!(high.policy.creation_control.min_creation_interval_secs, 33);
+        assert_eq!(
+            high.policy.creation_control.min_creation_delta_tokens,
+            13_000
+        );
+        assert_eq!(
+            high.policy.creation_control.max_creation_tokens_per_event,
+            23_000
+        );
+        assert_eq!(
+            high.policy.creation_control.creation_budget_window_secs,
+            133
+        );
+        assert_eq!(
+            high.policy.creation_control.max_creation_tokens_per_window,
+            73_000
+        );
+        assert_eq!(high.policy.creation_control.expire_after_idle_secs, 1_333);
+        assert_eq!(
+            high.policy.reported_usage.input.mode,
+            ReportedUsageFieldMode::SampleMax
+        );
+        assert_eq!(high.policy.reported_usage.input.max_tokens, 333);
+        assert_eq!(
+            high.policy.reported_usage.output.mode,
+            ReportedUsageFieldMode::SampleTarget
+        );
+        assert_eq!(high.policy.reported_usage.output.target_tokens, 444);
+        assert_eq!(high.policy.reported_usage.cache_read.max_tokens, 55_000);
+        assert_eq!(
+            high.policy.reported_usage.cache_creation.target_tokens,
+            6_000
+        );
+        assert_eq!(
+            high.policy
+                .reported_usage
+                .cache_creation
+                .normal_max_multiplier,
+            1.4
+        );
+        assert_eq!(
+            high.policy.reported_usage.final_cache_read_max_tokens,
+            333_000
+        );
+        assert!(high.policy.cache_point.enabled);
+        assert!(!high.policy.cache_point.tools_only);
+        assert!(!high.policy.cache_point.record_plan);
+        assert_eq!(high.policy.bounds.max_entries_per_account, 7);
+        assert_eq!(high.policy.bounds.max_entries_global, 70);
+        assert_eq!(high.policy.bounds.entry_ttl_secs, 700);
+        assert_eq!(high.policy.bounds.estimated_bytes_limit, 7_000);
+        assert_eq!(high.policy.kiro_rs_tool.coverage_ratio, 0.7);
+        assert_eq!(high.policy.kiro_rs_tool.max_coverage_tokens, 70_000);
+        assert!(!high.policy.kiro_rs_tool.incremental_create_enabled);
+        assert_eq!(
+            high.policy.kiro_rs_tool.max_new_creation_tokens_per_request,
+            7_000
+        );
+        assert!(high.policy.kiro_rs_tool.cache_current_user_stable_prefix);
+        assert_eq!(
+            high.policy
+                .kiro_rs_tool
+                .current_user_stable_prefix_max_tokens,
+            700
+        );
+
+        let plain = config.cache_policy_for_path("/plain/v1/messages");
+        assert_eq!(plain.namespace, None);
+        assert_eq!(plain.policy.cache_type, PromptCacheStrategyType::NoCache);
+        assert!(!plain.policy.simulation.enabled);
+        assert_ne!(plain.policy.simulation.token_scale, 2.0);
+        assert!(!plain.policy.creation_control.enabled);
+        assert!(!plain.policy.cache_point.enabled);
+        assert_eq!(plain.policy.reported_usage.input.max_tokens, 111);
+        assert_eq!(plain.policy.reported_usage.output.max_tokens, 22);
+        assert_ne!(plain.policy.bounds.max_entries_per_account, 2);
+        assert_ne!(plain.policy.kiro_rs_tool.coverage_ratio, 0.2);
+
+        let tool = config.cache_policy_for_path("/tool-matrix/v1/messages");
+        assert_eq!(tool.namespace.as_deref(), Some("/tool-matrix"));
+        assert_eq!(tool.policy.cache_type, PromptCacheStrategyType::KiroRsTool);
+        assert!(!tool.policy.simulation.enabled);
+        assert_eq!(tool.policy.simulation.token_scale, 1.0);
+        assert!(!tool.policy.creation_control.enabled);
+        assert!(!tool.policy.reported_usage.enabled);
+        assert!(tool.policy.cache_point.enabled);
+        assert!(!tool.policy.cache_point.tools_only);
+        assert!(tool.policy.cache_point.record_plan);
+        assert_eq!(tool.policy.bounds.max_entries_per_account, 5);
+        assert_eq!(tool.policy.bounds.max_entries_global, 50);
+        assert_eq!(tool.policy.bounds.entry_ttl_secs, 500);
+        assert_eq!(tool.policy.bounds.estimated_bytes_limit, 5_000);
+        assert_eq!(tool.policy.kiro_rs_tool.coverage_ratio, 0.5);
+        assert_eq!(tool.policy.kiro_rs_tool.max_coverage_tokens, 50_000);
+        assert!(!tool.policy.kiro_rs_tool.incremental_create_enabled);
+        assert_eq!(
+            tool.policy.kiro_rs_tool.max_new_creation_tokens_per_request,
+            5_000
+        );
+        assert!(tool.policy.kiro_rs_tool.cache_current_user_stable_prefix);
+        assert_eq!(
+            tool.policy
+                .kiro_rs_tool
+                .current_user_stable_prefix_max_tokens,
+            500
+        );
+    }
+
+    #[test]
     fn cache_policy_keeps_legacy_reported_usage_path_override_after_template_refactor() {
         let mut config = Config::default();
         config.reported_usage = ReportedUsageConfig {
@@ -4167,6 +4541,8 @@ mod tests {
         assert_eq!(policy.max_new_creation_tokens_per_request, 0);
         assert!(!policy.cache_current_user_stable_prefix);
         assert_eq!(policy.current_user_stable_prefix_max_tokens, 0);
+        assert_eq!(policy.reported_input_min_tokens, 32);
+        assert_eq!(policy.reported_input_max_tokens, 4_096);
     }
 
     #[test]
@@ -4180,7 +4556,9 @@ mod tests {
                         "incrementalCreateEnabled": true,
                         "maxNewCreationTokensPerRequest": 3000,
                         "cacheCurrentUserStablePrefix": true,
-                        "currentUserStablePrefixMaxTokens": 1500
+                        "currentUserStablePrefixMaxTokens": 1500,
+                        "reportedInputMinTokens": 64,
+                        "reportedInputMaxTokens": 2048
                     }
                 },
                 "pathOverrides": {
@@ -4188,7 +4566,8 @@ mod tests {
                         "cacheType": "kiro_rs_tool",
                         "kiroRsTool": {
                             "coverageRatio": 0.5,
-                            "maxNewCreationTokensPerRequest": 1000
+                            "maxNewCreationTokensPerRequest": 1000,
+                            "reportedInputMinTokens": 128
                         }
                     }
                 }
@@ -4235,6 +4614,11 @@ mod tests {
                 .current_user_stable_prefix_max_tokens,
             1_500
         );
+        assert_eq!(resolved.policy.kiro_rs_tool.reported_input_min_tokens, 128);
+        assert_eq!(
+            resolved.policy.kiro_rs_tool.reported_input_max_tokens,
+            2_048
+        );
     }
 
     #[test]
@@ -4258,6 +4642,27 @@ mod tests {
             .validate(config.legacy_cache_route_policy_default())
             .expect_err("invalid coverage ratio should fail");
         assert!(err.contains("coverageRatio"));
+
+        let invalid_range: Config = serde_json::from_value(serde_json::json!({
+            "cachePolicy": {
+                "pathOverrides": {
+                    "/dfcache/bad-range": {
+                        "cacheType": "kiro_rs_tool",
+                        "kiroRsTool": {
+                            "reportedInputMinTokens": 4096,
+                            "reportedInputMaxTokens": 32
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("deserialize config");
+
+        let err = invalid_range
+            .cache_policy
+            .validate(invalid_range.legacy_cache_route_policy_default())
+            .expect_err("invalid reported input range should fail");
+        assert!(err.contains("reportedInputMinTokens"));
     }
 
     #[test]

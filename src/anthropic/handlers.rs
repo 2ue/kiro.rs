@@ -1842,20 +1842,24 @@ impl RequestUsageContext {
         usage_source: UsageSource,
         raw: super::cache::RawUsage,
     ) -> super::cache::CacheUsage {
-        if !self.uses_local_prompt_cache_strategy() {
-            return usage;
-        }
-
+        let usage = if usage_source == UsageSource::UpstreamMetadata {
+            raw.to_cache_usage()
+        } else {
+            usage
+        };
         let Some(policy) = self.reported_cache_usage_policy.clone() else {
             return usage;
         };
-        let mut reported = if usage_source == UsageSource::LocalPromptCache
-            || super::cache::usage_has_cache(&usage)
+        let report_base = if self.uses_local_prompt_cache_strategy()
+            && (usage_source == UsageSource::LocalPromptCache
+                || super::cache::usage_has_cache(&usage))
         {
-            usage.with_reported_cache_usage_policy_and_raw(policy.clone(), raw)
+            usage
         } else {
             raw.to_cache_usage()
         };
+        let mut reported =
+            report_base.with_reported_cache_usage_policy_and_raw(policy.clone(), raw);
         reported = policy.apply_final_input_guard(reported);
         policy.apply_final_cache_read_guard(reported)
     }
@@ -1865,21 +1869,42 @@ impl RequestUsageContext {
         usage: super::cache::CacheUsage,
         _usage_source: UsageSource,
     ) -> super::cache::CacheUsage {
-        if !self.uses_local_prompt_cache_strategy() {
-            return usage;
-        }
-
         let Some(policy) = self.reported_cache_usage_policy.clone() else {
             return usage;
         };
 
-        if policy.should_rewrite_local_prompt_cache_usage(usage) {
-            usage.with_reported_cache_usage_policy_and_raw(
-                policy,
-                super::cache::RawUsage::uncached(self.input_tokens, usage.output_tokens),
-            )
+        let raw = super::cache::RawUsage::uncached(self.input_tokens, usage.output_tokens);
+        if self.uses_local_prompt_cache_strategy() && super::cache::usage_has_cache(&usage) {
+            if policy.should_rewrite_local_prompt_cache_usage(usage) {
+                usage.with_reported_cache_usage_policy_and_raw(policy, raw)
+            } else {
+                usage
+            }
         } else {
-            usage
+            raw.to_cache_usage()
+                .with_reported_cache_usage_policy_and_raw(policy, raw)
+        }
+    }
+
+    fn ensure_reported_usage_for_record_with_raw(
+        &self,
+        usage: super::cache::CacheUsage,
+        _usage_source: UsageSource,
+        raw: super::cache::RawUsage,
+    ) -> super::cache::CacheUsage {
+        let Some(policy) = self.reported_cache_usage_policy.clone() else {
+            return usage;
+        };
+
+        if self.uses_local_prompt_cache_strategy() && super::cache::usage_has_cache(&usage) {
+            if policy.should_rewrite_local_prompt_cache_usage(usage) {
+                usage.with_reported_cache_usage_policy_and_raw(policy, raw)
+            } else {
+                usage
+            }
+        } else {
+            raw.to_cache_usage()
+                .with_reported_cache_usage_policy_and_raw(policy, raw)
         }
     }
 
@@ -1960,7 +1985,7 @@ fn reported_cache_usage_policy(
     reported_usage: &ReportedUsagePathPolicy,
     seed: u64,
 ) -> Option<super::cache::ReportedCacheUsagePolicy> {
-    if !should_apply_current_high_cache_reported_usage(strategy_type, simulation_mode) {
+    if !should_apply_reported_usage(strategy_type, simulation_mode, reported_usage) {
         return None;
     }
 
@@ -1982,15 +2007,20 @@ fn reported_cache_usage_policy_for_path(
     )
 }
 
-fn should_apply_current_high_cache_reported_usage(
+fn should_apply_reported_usage(
     strategy_type: PromptCacheStrategyType,
     simulation_mode: PromptCacheSimulationMode,
+    reported_usage: &ReportedUsagePathPolicy,
 ) -> bool {
+    if !reported_usage.enabled {
+        return false;
+    }
     match strategy_type {
+        PromptCacheStrategyType::NoCache => true,
         PromptCacheStrategyType::CurrentHighCache => {
             simulation_mode == PromptCacheSimulationMode::HighCache
         }
-        PromptCacheStrategyType::NoCache | PromptCacheStrategyType::KiroRsTool => false,
+        PromptCacheStrategyType::KiroRsTool => false,
     }
 }
 
@@ -2243,10 +2273,9 @@ impl CredentialUsageContext {
         usage: super::cache::CacheUsage,
         usage_source: UsageSource,
     ) -> super::cache::CacheUsage {
-        let reported_usage = self
-            .request
-            .reported_usage_for_downstream(usage, usage_source);
-        self.apply_creation_frequency_control(reported_usage, usage_source)
+        let usage = self.apply_creation_frequency_control(usage, usage_source);
+        self.request
+            .reported_usage_for_downstream(usage, usage_source)
     }
 
     fn final_reported_usage_for_success_with_raw(
@@ -2255,12 +2284,12 @@ impl CredentialUsageContext {
         usage_source: UsageSource,
         raw_usage: super::cache::CacheUsage,
     ) -> super::cache::CacheUsage {
-        let reported_usage = self.request.reported_usage_for_downstream_with_raw(
+        let usage = self.apply_creation_frequency_control(usage, usage_source);
+        self.request.reported_usage_for_downstream_with_raw(
             usage,
             usage_source,
             raw_usage_to_reported_raw(raw_usage),
-        );
-        self.apply_creation_frequency_control(reported_usage, usage_source)
+        )
     }
 
     fn canonical_reported_usage_for_success(
@@ -2281,27 +2310,38 @@ impl CredentialUsageContext {
     ) -> super::cache::CacheUsage {
         let reported_usage =
             self.final_reported_usage_for_success_with_raw(usage, usage_source, raw_usage);
-        self.request
-            .ensure_reported_usage_for_record(reported_usage, usage_source)
+        self.request.ensure_reported_usage_for_record_with_raw(
+            reported_usage,
+            usage_source,
+            raw_usage_to_reported_raw(raw_usage),
+        )
     }
 
     fn apply_creation_frequency_control(
         &self,
-        reported_usage: super::cache::CacheUsage,
+        usage: super::cache::CacheUsage,
         usage_source: UsageSource,
     ) -> super::cache::CacheUsage {
         if usage_source != UsageSource::LocalPromptCache
             || self.request.simulation_mode != PromptCacheSimulationMode::HighCache
         {
-            return reported_usage;
+            return usage;
         }
 
         let scope = self.scope();
-        self.request.prompt_cache_creation_controller.apply_success(
-            scope.as_ref(),
-            self.request.prompt_cache_creation_control,
-            reported_usage,
-        )
+        let credential_key = self
+            .credential_id
+            .map(|credential_id| format!("credential:{credential_id}"));
+        let model = self.creation_control_model();
+        self.request
+            .prompt_cache_creation_controller
+            .apply_success_with_context(
+                scope.as_ref(),
+                self.request.prompt_cache_creation_control,
+                usage,
+                credential_key.as_deref(),
+                Some(model),
+            )
     }
 
     fn preview_creation_frequency_control(
@@ -2316,13 +2356,26 @@ impl CredentialUsageContext {
         }
 
         let scope = self.scope();
+        let credential_key = self
+            .credential_id
+            .map(|credential_id| format!("credential:{credential_id}"));
+        let model = self.creation_control_model();
         self.request
             .prompt_cache_creation_controller
-            .preview_success(
+            .preview_success_with_context(
                 scope.as_ref(),
                 self.request.prompt_cache_creation_control,
                 reported_usage,
+                credential_key.as_deref(),
+                Some(model),
             )
+    }
+
+    fn creation_control_model(&self) -> &str {
+        self.request
+            .upstream_model
+            .as_deref()
+            .unwrap_or(self.request.model.as_str())
     }
 
     fn uses_local_prompt_cache_fallback(
@@ -3307,7 +3360,13 @@ fn prepare_usage_context(
         ),
         PromptCacheStrategyType::KiroRsTool => {
             let simulated_usage = kiro_rs_tool_prompt_cache_plan.as_ref().and_then(|plan| {
-                super::cache::CacheSimulation::from_prompt_cache_split_input(plan.usage())
+                let policy = policy.kiro_rs_tool.normalized();
+                super::cache::CacheSimulation::from_prompt_cache_split_input_with_reported_input_range(
+                    plan.usage(),
+                    policy.reported_input_min_tokens,
+                    policy.reported_input_max_tokens,
+                    plan.cache_jitter_seed(),
+                )
             });
             (
                 simulated_usage,
@@ -8010,10 +8069,7 @@ Return a fix plan."#
             .expect("policy should apply"),
         );
         assert!((1..=96).contains(&reported.input_tokens));
-        assert_eq!(
-            reported.cache_read_input_tokens,
-            usage.input_tokens.saturating_sub(reported.input_tokens)
-        );
+        assert_eq!(reported.cache_read_input_tokens, 0);
         assert!(reported.cache_creation_input_tokens > 0);
         assert_eq!(reported.output_tokens, 1);
 
@@ -8028,10 +8084,7 @@ Return a fix plan."#
             cache::RawUsage::uncached(100_000, 1),
         );
         assert!((1..=96).contains(&raw_reported.input_tokens));
-        assert_eq!(
-            raw_reported.cache_read_input_tokens,
-            100_000_i32.saturating_sub(raw_reported.input_tokens)
-        );
+        assert_eq!(raw_reported.cache_read_input_tokens, 0);
         assert!(raw_reported.cache_creation_input_tokens > 0);
     }
 
@@ -8157,17 +8210,26 @@ Return a fix plan."#
 
         let upstream_metadata =
             usage_context.reported_usage_for_downstream(usage, UsageSource::UpstreamMetadata);
-        assert!((0..=3_300).contains(&upstream_metadata.cache_creation_input_tokens));
         assert!((1..=96).contains(&upstream_metadata.input_tokens));
+        assert_eq!(upstream_metadata.cache_creation_input_tokens, 0);
+        assert_eq!(upstream_metadata.cache_read_input_tokens, 0);
+
+        let upstream_metadata_with_raw = usage_context.reported_usage_for_downstream_with_raw(
+            usage,
+            UsageSource::UpstreamMetadata,
+            raw_usage_to_reported_raw(usage),
+        );
+        assert!((0..=3_300).contains(&upstream_metadata_with_raw.cache_creation_input_tokens));
+        assert!((1..=96).contains(&upstream_metadata_with_raw.input_tokens));
         assert_eq!(
-            upstream_metadata.cache_read_input_tokens,
+            upstream_metadata_with_raw.cache_read_input_tokens,
             usage.cache_read_input_tokens.saturating_add(
-                usage_context
+                usage
                     .input_tokens
-                    .saturating_sub(upstream_metadata.input_tokens)
+                    .saturating_sub(upstream_metadata_with_raw.input_tokens)
             )
         );
-        assert!(upstream_metadata.cache_read_input_tokens > usage.cache_read_input_tokens);
+        assert!(upstream_metadata_with_raw.cache_read_input_tokens > usage.cache_read_input_tokens);
     }
 
     #[test]
@@ -8240,10 +8302,7 @@ Return a fix plan."#
             usage_context.reported_usage_for_downstream(raw_usage, UsageSource::UpstreamMetadata);
 
         assert!((1..=500).contains(&reported.input_tokens));
-        assert_eq!(
-            reported.cache_read_input_tokens,
-            raw_usage.input_tokens.saturating_sub(reported.input_tokens)
-        );
+        assert_eq!(reported.cache_read_input_tokens, 0);
         assert_eq!(reported.cache_creation_input_tokens, 0);
         assert_eq!(reported.output_tokens, 7);
         assert_eq!(
@@ -8307,6 +8366,7 @@ Return a fix plan."#
                 target_cache_ratio: Some(0.99),
                 amplification: None,
                 split_cached_input: false,
+                ..Default::default()
             }),
             simulated_source: Some(UsageSource::LocalPromptCache),
             payload_breakdown: None,
@@ -8504,6 +8564,7 @@ Return a fix plan."#
                 target_cache_ratio: None,
                 amplification: None,
                 split_cached_input: true,
+                ..Default::default()
             }),
             simulated_source: Some(UsageSource::LocalPromptCache),
             payload_breakdown: None,
@@ -8864,7 +8925,12 @@ Return a fix plan."#
             error_id: "req_01na_policy".to_string(),
             prompt_cache_strategy_type: PromptCacheStrategyType::NoCache,
             simulation_mode: PromptCacheSimulationMode::Disabled,
-            reported_cache_usage_policy: None,
+            reported_cache_usage_policy: reported_cache_usage_policy(
+                PromptCacheStrategyType::NoCache,
+                PromptCacheSimulationMode::Disabled,
+                &reported_usage_config.policy_for_path("/na/v1/messages"),
+                7,
+            ),
             simulated_source: None,
             ..v1_context.clone()
         };
@@ -8872,7 +8938,7 @@ Return a fix plan."#
         assert!(v1_context.reported_cache_usage_policy().is_some());
         assert!(cc_context.reported_cache_usage_policy().is_some());
         assert!(ha_context.reported_cache_usage_policy().is_some());
-        assert!(na_context.reported_cache_usage_policy().is_none());
+        assert!(na_context.reported_cache_usage_policy().is_some());
 
         let v1_reported =
             v1_context.reported_usage_for_downstream(usage, UsageSource::LocalPromptCache);
@@ -8928,7 +8994,11 @@ Return a fix plan."#
 
         let na_reported =
             na_context.reported_usage_for_downstream(usage, UsageSource::LocalPromptCache);
-        assert_eq!(na_reported, usage);
+        assert_eq!(na_reported.input_tokens, na_context.input_tokens);
+        assert_eq!(na_reported.output_tokens, usage.output_tokens);
+        assert_eq!(na_reported.cache_creation_input_tokens, 0);
+        assert_eq!(na_reported.cache_read_input_tokens, 0);
+        assert_eq!(na_reported.total_input_tokens, na_context.input_tokens);
     }
 
     #[test]
@@ -9007,8 +9077,8 @@ Return a fix plan."#
             .canonical_reported_usage_for_success(usage, UsageSource::LocalPromptCache);
 
         assert!((1..=96).contains(&reported.input_tokens));
-        assert_eq!(reported.cache_creation_input_tokens, 30_000);
-        assert!(reported.cache_read_input_tokens > 0);
+        assert!((26_400..30_000).contains(&reported.cache_creation_input_tokens));
+        assert_eq!(reported.cache_read_input_tokens, 0);
         assert_eq!(
             reported.total_input_tokens,
             reported
@@ -9434,7 +9504,7 @@ Return a fix plan."#
     fn high_cache_zero_metadata_fallback_updates_local_prompt_cache() {
         let prompt_cache = Arc::new(PromptCacheTracker::default());
         let usage_recorder = Arc::new(UsageRecorder::new(10));
-        let payload = MessagesRequest {
+        let mut payload = MessagesRequest {
             model: "claude-sonnet-4-6".to_string(),
             max_tokens: 16,
             messages: vec![Message {
@@ -9495,6 +9565,7 @@ Return a fix plan."#
                 target_cache_ratio: Some(0.95),
                 amplification: None,
                 split_cached_input: false,
+                ..Default::default()
             }),
             simulated_source: Some(UsageSource::LocalPromptCache),
             payload_breakdown: None,
@@ -9531,7 +9602,18 @@ Return a fix plan."#
             conversation_id: "session-high-cache".to_string(),
             route_namespace: None,
         };
-        let second = prompt_cache.compute(Some(scope), profile.as_ref(), 0.95);
+        payload.messages.extend([
+            Message {
+                role: "assistant".to_string(),
+                content: json!("ready"),
+            },
+            Message {
+                role: "user".to_string(),
+                content: json!("continue the same session"),
+            },
+        ]);
+        let second_profile = prompt_cache.build_high_cache_profile(&payload, 8192);
+        let second = prompt_cache.compute(Some(scope), second_profile.as_ref(), 0.95);
         assert!(second.cache_read_input_tokens > 0);
     }
 
@@ -9753,6 +9835,7 @@ Return a fix plan."#
         );
         assert!(first_usage_body.cache_creation_input_tokens > 0);
         assert_eq!(first_usage_body.cache_read_input_tokens, 0);
+        assert!((32..=4_096).contains(&first_usage_body.input_tokens));
         let first_source = first_usage.usage_source(&first_usage_body, None, false);
         assert_eq!(first_source, UsageSource::LocalPromptCache);
         first_usage.record_success(first_usage_body, first_source, false);
@@ -9790,6 +9873,7 @@ Return a fix plan."#
         let second_usage =
             cache::build_usage_with_simulation_policy(None, 8192, 1, Some(second_simulation), true);
         assert!(second_usage.cache_read_input_tokens > 0);
+        assert!((32..=4_096).contains(&second_usage.input_tokens));
         assert_eq!(
             second_usage.input_tokens
                 + second_usage.cache_creation_input_tokens
@@ -9901,6 +9985,9 @@ Return a fix plan."#
             .simulated_usage
             .expect("second kiro request should read cache without credential id");
         assert!(second_simulation.cache_read_input_tokens > 0);
+        let second_usage =
+            cache::build_usage_with_simulation_policy(None, 8192, 1, Some(second_simulation), true);
+        assert!((32..=4_096).contains(&second_usage.input_tokens));
     }
 
     #[test]
@@ -9969,7 +10056,7 @@ Return a fix plan."#
     }
 
     #[test]
-    fn builtin_na_path_does_not_build_local_profile_or_reporting_policy() {
+    fn builtin_na_path_does_not_build_local_profile_but_keeps_reporting_policy() {
         let prompt_cache = Arc::new(PromptCacheTracker::default());
         let usage_recorder = Arc::new(UsageRecorder::new(10));
         let state = AppState::new(
@@ -10032,11 +10119,11 @@ Return a fix plan."#
         assert_eq!(context.prompt_cache_route_namespace, None);
         assert!(context.simulated_usage.is_none());
         assert!(context.simulated_source.is_none());
-        assert!(context.reported_cache_usage_policy.is_none());
+        assert!(context.reported_cache_usage_policy.is_some());
     }
 
     #[test]
-    fn no_cache_route_does_not_build_cache_profile_plan_or_reporting_policy() {
+    fn no_cache_route_does_not_build_cache_profile_plan_but_shapes_reporting() {
         let prompt_cache = Arc::new(PromptCacheTracker::default());
         let usage_recorder = Arc::new(UsageRecorder::new(10));
         let mut cache_policy = CachePolicyConfig::default();
@@ -10135,7 +10222,204 @@ Return a fix plan."#
         assert_eq!(context.prompt_cache_route_namespace, None);
         assert!(context.simulated_usage.is_none());
         assert!(context.simulated_source.is_none());
+        assert!(context.reported_cache_usage_policy.is_some());
+
+        let reported = context.reported_usage_for_downstream(
+            cache::CacheUsage {
+                total_input_tokens: 125_000,
+                input_tokens: 100_000,
+                output_tokens: 7,
+                cache_creation_input_tokens: 20_000,
+                cache_read_input_tokens: 5_000,
+                cache_creation_5m_input_tokens: 20_000,
+                cache_creation_1h_input_tokens: 0,
+            },
+            UsageSource::UpstreamMetadata,
+        );
+        assert!((1..=32).contains(&reported.input_tokens));
+        assert_eq!(reported.output_tokens, 7);
+        assert_eq!(reported.cache_creation_input_tokens, 0);
+        assert_eq!(reported.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn no_cache_disabled_reported_usage_preserves_upstream_metadata_usage() {
+        let prompt_cache = Arc::new(PromptCacheTracker::default());
+        let usage_recorder = Arc::new(UsageRecorder::new(10));
+        let mut reported_usage = ReportedUsageConfig::default();
+        reported_usage
+            .path_overrides
+            .insert("/na".to_string(), ReportedUsagePathPolicy::disabled());
+        let state = AppState::new(
+            Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+            true,
+            usage_recorder,
+            prompt_cache,
+            Arc::new(PromptCacheCreationController::default()),
+            PromptCacheSimulationMode::HighCache,
+            0.95,
+            CompatProfile::ClaudeCode,
+            false,
+        )
+        .with_reported_usage(reported_usage);
+        let payload = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 16,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!("no-cache request should preserve upstream metadata usage"),
+            }],
+            stream: true,
+            system: Some(vec![SystemMessage {
+                text: "large no-cache system prompt ".repeat(700),
+                cache_control: Some(json!({"type": "ephemeral"})),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let context = prepare_usage_context(
+            &state,
+            RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/na/v1/messages"),
+            "/na/v1/messages",
+            true,
+            &payload,
+            None,
+            Some("na-disabled-reported".to_string()),
+            prompt_cache_scope_conversation_id(
+                PromptCacheStrategyType::NoCache,
+                PromptCacheSimulationMode::Disabled,
+                &payload,
+            ),
+            32_000,
+        );
+
+        assert_eq!(
+            context.prompt_cache_strategy_type,
+            PromptCacheStrategyType::NoCache
+        );
         assert!(context.reported_cache_usage_policy.is_none());
+
+        let context_usage = CacheUsage {
+            total_input_tokens: 32_000,
+            input_tokens: 32_000,
+            output_tokens: 3,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let upstream_raw = CacheUsage {
+            total_input_tokens: 10,
+            input_tokens: 10,
+            output_tokens: 3,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+
+        let reported = context.reported_usage_for_downstream_with_raw(
+            context_usage,
+            UsageSource::UpstreamMetadata,
+            raw_usage_to_reported_raw(upstream_raw),
+        );
+
+        assert_eq!(reported.input_tokens, 10);
+        assert_eq!(reported.output_tokens, 3);
+        assert_eq!(reported.cache_read_input_tokens, 0);
+        assert_eq!(reported.cache_creation_input_tokens, 0);
+    }
+
+    #[test]
+    fn no_cache_canonical_record_keeps_upstream_raw_when_default_reporting_exists() {
+        let prompt_cache = Arc::new(PromptCacheTracker::default());
+        let usage_recorder = Arc::new(UsageRecorder::new(10));
+        let state = AppState::new(
+            Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+            true,
+            usage_recorder,
+            prompt_cache,
+            Arc::new(PromptCacheCreationController::default()),
+            PromptCacheSimulationMode::HighCache,
+            0.95,
+            CompatProfile::ClaudeCode,
+            false,
+        );
+        let payload = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 16,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!("no-cache request should not be expanded by record shaping"),
+            }],
+            stream: true,
+            system: Some(vec![SystemMessage {
+                text: "large no-cache system prompt ".repeat(700),
+                cache_control: Some(json!({"type": "ephemeral"})),
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let context = prepare_usage_context(
+            &state,
+            RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/na/v1/messages"),
+            "/na/v1/messages",
+            true,
+            &payload,
+            None,
+            Some("na-default-reported".to_string()),
+            prompt_cache_scope_conversation_id(
+                PromptCacheStrategyType::NoCache,
+                PromptCacheSimulationMode::Disabled,
+                &payload,
+            ),
+            32_000,
+        );
+
+        assert_eq!(
+            context.prompt_cache_strategy_type,
+            PromptCacheStrategyType::NoCache
+        );
+        assert!(context.reported_cache_usage_policy.is_some());
+
+        let context_usage = CacheUsage {
+            total_input_tokens: 32_000,
+            input_tokens: 32_000,
+            output_tokens: 3,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let upstream_raw = CacheUsage {
+            total_input_tokens: 10,
+            input_tokens: 10,
+            output_tokens: 3,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let credential_context = context.attach_credential(Some(1), None, false, false, Vec::new());
+
+        let reported = credential_context.canonical_reported_usage_for_success_with_raw(
+            context_usage,
+            UsageSource::UpstreamMetadata,
+            upstream_raw,
+        );
+
+        assert_eq!(reported.input_tokens, 10);
+        assert_eq!(reported.output_tokens, 3);
+        assert_eq!(reported.cache_read_input_tokens, 0);
+        assert_eq!(reported.cache_creation_input_tokens, 0);
     }
 
     fn attach_test_credential_usage(
