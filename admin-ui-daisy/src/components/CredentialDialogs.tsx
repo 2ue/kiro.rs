@@ -153,8 +153,13 @@ function initialParameterDefaults(): CredentialParameterDefaults {
   }
 }
 
-function optionalTrimmed(value?: string | null) {
-  const trimmed = value?.trim()
+function optionalTrimmed(value: unknown) {
+  const trimmed =
+    typeof value === 'string'
+      ? value.trim()
+      : typeof value === 'number' && Number.isFinite(value)
+        ? String(Math.trunc(value))
+        : ''
   return trimmed ? trimmed : undefined
 }
 
@@ -938,8 +943,8 @@ export function BatchImportModal({
       setResults((prev) => prev.map((item, i) => (i === index ? { ...item, status: 'verifying' } : item)))
       let addedId: number | null = null
       try {
-        const clientId = cred.clientId?.trim() || undefined
-        const clientSecret = cred.clientSecret?.trim() || undefined
+        const clientId = optionalTrimmed(cred.clientId)
+        const clientSecret = optionalTrimmed(cred.clientSecret)
         const authMethod = isApiKeyCred
           ? 'api_key'
           : cred.authMethod === 'external_idp'
@@ -953,30 +958,30 @@ export function BatchImportModal({
 
         const added = await addCredential({
           authMethod,
-          kiroApiKey: isApiKeyCred ? cred.kiroApiKey?.trim() : undefined,
-          refreshToken: isApiKeyCred ? undefined : cred.refreshToken?.trim(),
-          accessToken: isApiKeyCred ? undefined : cred.accessToken?.trim() || undefined,
-          expiresAt: isApiKeyCred ? undefined : cred.expiresAt?.trim() || undefined,
-          email: cred.email?.trim() || undefined,
-          profileArn: cred.profileArn?.trim() || undefined,
+          kiroApiKey: isApiKeyCred ? optionalTrimmed(cred.kiroApiKey) : undefined,
+          refreshToken: isApiKeyCred ? undefined : optionalTrimmed(cred.refreshToken),
+          accessToken: isApiKeyCred ? undefined : optionalTrimmed(cred.accessToken),
+          expiresAt: isApiKeyCred ? undefined : optionalTrimmed(cred.expiresAt),
+          email: optionalTrimmed(cred.email),
+          profileArn: optionalTrimmed(cred.profileArn),
           priority: cred.priority || 0,
           maxConcurrentRequests: cred.maxConcurrentRequests ?? undefined,
           rpm: cred.rpm ?? undefined,
           disabled: cred.disabled ?? false,
-          region: cred.region?.trim() || undefined,
-          authRegion: cred.authRegion?.trim() || undefined,
-          apiRegion: cred.apiRegion?.trim() || undefined,
+          region: optionalTrimmed(cred.region),
+          authRegion: optionalTrimmed(cred.authRegion),
+          apiRegion: optionalTrimmed(cred.apiRegion),
           clientId: isApiKeyCred ? undefined : clientId,
           clientSecret: authMethod === 'idc' ? clientSecret : undefined,
-          tokenEndpoint: authMethod === 'external_idp' ? cred.tokenEndpoint?.trim() || undefined : undefined,
-          issuerUrl: authMethod === 'external_idp' ? cred.issuerUrl?.trim() || undefined : undefined,
-          scopes: authMethod === 'external_idp' ? cred.scopes?.trim() || undefined : undefined,
-          machineId: cred.machineId?.trim() || undefined,
-          proxyUrl: cred.proxyUrl?.trim() || undefined,
-          proxyUsername: cred.proxyUsername?.trim() || undefined,
-          proxyPassword: cred.proxyPassword?.trim() || undefined,
+          tokenEndpoint: authMethod === 'external_idp' ? optionalTrimmed(cred.tokenEndpoint) : undefined,
+          issuerUrl: authMethod === 'external_idp' ? optionalTrimmed(cred.issuerUrl) : undefined,
+          scopes: authMethod === 'external_idp' ? optionalTrimmed(cred.scopes) : undefined,
+          machineId: optionalTrimmed(cred.machineId),
+          proxyUrl: optionalTrimmed(cred.proxyUrl),
+          proxyUsername: optionalTrimmed(cred.proxyUsername),
+          proxyPassword: optionalTrimmed(cred.proxyPassword),
           proxyResourceId: cred.proxyResourceId || undefined,
-          endpoint: cred.endpoint?.trim() || undefined,
+          endpoint: optionalTrimmed(cred.endpoint),
         })
         addedId = added.credentialId
         await new Promise((resolve) => setTimeout(resolve, 1000))
@@ -1197,9 +1202,9 @@ export function KamImportModal({
       setResults((prev) => prev.map((item, i) => (i === index ? { ...item, status: 'verifying' } : item)))
       let addedId: number | null = null
       try {
-        const clientId = account.credentials.clientId?.trim() || undefined
-        const clientSecret = account.credentials.clientSecret?.trim() || undefined
-        const rawAuthMethod = account.credentials.authMethod?.trim().toLowerCase().replace(/[^a-z0-9]/g, '')
+        const clientId = optionalTrimmed(account.credentials.clientId)
+        const clientSecret = optionalTrimmed(account.credentials.clientSecret)
+        const rawAuthMethod = optionalTrimmed(account.credentials.authMethod)?.toLowerCase().replace(/[^a-z0-9]/g, '')
         const authMethod = rawAuthMethod === 'externalidp' || rawAuthMethod === 'enterprise' || rawAuthMethod === 'iamsso' || rawAuthMethod === 'awsidc'
           ? 'external_idp'
           : rawAuthMethod === 'idc' || rawAuthMethod === 'builderid' || rawAuthMethod === 'iam' || (clientId && clientSecret)
@@ -1208,23 +1213,23 @@ export function KamImportModal({
         if (authMethod === 'idc' && (!clientId || !clientSecret)) throw new Error('idc 模式需要同时提供 clientId 和 clientSecret')
         if (authMethod === 'external_idp' && !clientId) throw new Error('external_idp 模式需要提供 clientId')
         if (authMethod === 'social' && (clientId || clientSecret)) throw new Error('social 模式不应提供 clientId 或 clientSecret；企业 SSO 请设置 authMethod 为 external_idp')
-        const accountRegion = account.credentials.region?.trim() || undefined
+        const accountRegion = optionalTrimmed(account.credentials.region)
         const baseCredential: AddCredentialRequest = {
           refreshToken: token,
           authMethod,
-          accessToken: account.credentials.accessToken?.trim() || undefined,
-          expiresAt: account.credentials.expiresAt?.trim() || undefined,
-          email: account.email?.trim() || undefined,
-          profileArn: account.credentials.profileArn?.trim() || undefined,
+          accessToken: optionalTrimmed(account.credentials.accessToken),
+          expiresAt: optionalTrimmed(account.credentials.expiresAt),
+          email: optionalTrimmed(account.email),
+          profileArn: optionalTrimmed(account.credentials.profileArn),
           region: accountRegion,
           authRegion: optionalTrimmed(defaults.authRegion) || accountRegion,
-          apiRegion: account.credentials.apiRegion?.trim() || undefined,
+          apiRegion: optionalTrimmed(account.credentials.apiRegion),
           clientId,
           clientSecret: authMethod === 'idc' ? clientSecret : undefined,
-          tokenEndpoint: authMethod === 'external_idp' ? account.credentials.tokenEndpoint?.trim() || undefined : undefined,
-          issuerUrl: authMethod === 'external_idp' ? account.credentials.issuerUrl?.trim() || undefined : undefined,
-          scopes: authMethod === 'external_idp' ? account.credentials.scopes?.trim() || undefined : undefined,
-          machineId: account.machineId?.trim() || undefined,
+          tokenEndpoint: authMethod === 'external_idp' ? optionalTrimmed(account.credentials.tokenEndpoint) : undefined,
+          issuerUrl: authMethod === 'external_idp' ? optionalTrimmed(account.credentials.issuerUrl) : undefined,
+          scopes: authMethod === 'external_idp' ? optionalTrimmed(account.credentials.scopes) : undefined,
+          machineId: optionalTrimmed(account.machineId),
         }
         const added = await addCredential(mergeCredentialDefaults(baseCredential, { ...defaults, authRegion: '' }))
         addedId = added.credentialId

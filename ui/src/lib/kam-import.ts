@@ -24,35 +24,53 @@ export interface KamAccount {
   status?: string
 }
 
+type JsonObject = Record<string, unknown>
+
+function isObject(value: unknown): value is JsonObject {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function stringField(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined
+}
+
+function stringLikeField(value: unknown): string | undefined {
+  if (typeof value === 'string' && value.trim()) return value.trim()
+  if (typeof value === 'number' && Number.isFinite(value)) return String(Math.trunc(value))
+  return undefined
+}
+
 function normalizeKamAccount(item: unknown): unknown {
   const normalized = camelizeKeys(item)
-  if (typeof normalized !== 'object' || normalized === null) return normalized
-  const obj = normalized as Record<string, unknown>
-  if (typeof obj.refreshToken === 'string' && typeof obj.credentials === 'undefined') {
-    return {
-      email: typeof obj.email === 'string' ? obj.email : undefined,
-      userId: typeof obj.userId === 'string' || obj.userId === null ? (obj.userId as string | null) : undefined,
-      nickname: typeof obj.nickname === 'string' ? obj.nickname : typeof obj.label === 'string' ? obj.label : undefined,
-      status: typeof obj.status === 'string' ? obj.status : undefined,
-      machineId: typeof obj.machineId === 'string' ? obj.machineId : undefined,
-      credentials: {
-        accessToken: typeof obj.accessToken === 'string' ? obj.accessToken : undefined,
-        expiresAt: typeof obj.expiresAt === 'string' ? obj.expiresAt : typeof obj.expired === 'string' ? obj.expired : undefined,
-        refreshToken: obj.refreshToken,
-        clientId: typeof obj.clientId === 'string' ? obj.clientId : undefined,
-        clientSecret: typeof obj.clientSecret === 'string' ? obj.clientSecret : undefined,
-        tokenEndpoint: typeof obj.tokenEndpoint === 'string' ? obj.tokenEndpoint : undefined,
-        issuerUrl: typeof obj.issuerUrl === 'string' ? obj.issuerUrl : undefined,
-        scopes: typeof obj.scopes === 'string' ? obj.scopes : typeof obj.scope === 'string' ? obj.scope : undefined,
-        profileArn: typeof obj.profileArn === 'string' ? obj.profileArn : undefined,
-        region: typeof obj.region === 'string' ? obj.region : undefined,
-        apiRegion: typeof obj.apiRegion === 'string' ? obj.apiRegion : undefined,
-        authMethod: typeof obj.authMethod === 'string' ? obj.authMethod : undefined,
-        startUrl: typeof obj.startUrl === 'string' ? obj.startUrl : undefined,
-      },
-    }
+  if (!isObject(normalized)) return normalized
+  const obj = normalized
+  const nested = isObject(obj.credentials) ? obj.credentials : undefined
+  const source = nested ?? obj
+  const refreshToken = stringField(source.refreshToken)
+  if (!refreshToken) return normalized
+
+  return {
+    email: stringField(obj.email),
+    userId: typeof obj.userId === 'string' || obj.userId === null ? (obj.userId as string | null) : undefined,
+    nickname: stringField(obj.nickname) ?? stringField(obj.label),
+    status: stringField(obj.status),
+    machineId: stringField(obj.machineId) ?? stringField(source.machineId),
+    credentials: {
+      accessToken: stringField(source.accessToken),
+      expiresAt: stringLikeField(source.expiresAt) ?? stringLikeField(source.expired),
+      refreshToken,
+      clientId: stringField(source.clientId),
+      clientSecret: stringField(source.clientSecret),
+      tokenEndpoint: stringField(source.tokenEndpoint),
+      issuerUrl: stringField(source.issuerUrl),
+      scopes: stringField(source.scopes) ?? stringField(source.scope),
+      profileArn: stringField(source.profileArn),
+      region: stringField(source.region),
+      apiRegion: stringField(source.apiRegion),
+      authMethod: stringField(source.authMethod),
+      startUrl: stringField(source.startUrl),
+    },
   }
-  return item
 }
 
 function isValidKamAccount(item: unknown): item is KamAccount {

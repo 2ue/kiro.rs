@@ -16,6 +16,12 @@ function stringField(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined
 }
 
+function stringLikeField(value: unknown): string | undefined {
+  if (typeof value === 'string' && value.trim()) return value.trim()
+  if (typeof value === 'number' && Number.isFinite(value)) return String(Math.trunc(value))
+  return undefined
+}
+
 function numberField(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isFinite(value)) return Math.max(0, Math.trunc(value))
   if (typeof value === 'string' && value.trim()) {
@@ -72,10 +78,10 @@ export function normalizeCredentialImportItem(value: unknown): AddCredentialRequ
   const nested = isObject(normalized.credentials) ? normalized.credentials : undefined
   const accessToken = stringField(normalized.accessToken) ?? stringField(nested?.accessToken)
   const expiresAt =
-    stringField(normalized.expiresAt) ??
-    stringField(normalized.expired) ??
-    stringField(nested?.expiresAt) ??
-    stringField(nested?.expired)
+    stringLikeField(normalized.expiresAt) ??
+    stringLikeField(normalized.expired) ??
+    stringLikeField(nested?.expiresAt) ??
+    stringLikeField(nested?.expired)
   const refreshToken = stringField(normalized.refreshToken) ?? stringField(nested?.refreshToken)
   const kiroApiKey = stringField(normalized.kiroApiKey) ?? stringField(normalized.apiKey)
   const clientId = stringField(normalized.clientId) ?? stringField(nested?.clientId)

@@ -14,6 +14,7 @@ import {
   CredentialParameterDefaultsPanel,
   initialParameterDefaults,
   mergeCredentialDefaults,
+  optionalTrimmed,
 } from '@/components/credential-parameter-defaults'
 import { getCredentialBalance, setCredentialDisabled, testCredential } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
@@ -302,22 +303,22 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             // API Key 账号
             const addedCred = await addCredential({
               authMethod: 'api_key',
-              kiroApiKey: cred.kiroApiKey?.trim(),
-              email: cred.email?.trim() || undefined,
-              profileArn: cred.profileArn?.trim() || undefined,
+              kiroApiKey: optionalTrimmed(cred.kiroApiKey),
+              email: optionalTrimmed(cred.email),
+              profileArn: optionalTrimmed(cred.profileArn),
               priority: cred.priority || 0,
               maxConcurrentRequests: cred.maxConcurrentRequests ?? undefined,
               rpm: cred.rpm ?? undefined,
               disabled: cred.disabled ?? false,
-              region: cred.region?.trim() || undefined,
-              authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
-              apiRegion: cred.apiRegion?.trim() || undefined,
-              machineId: cred.machineId?.trim() || undefined,
-              proxyUrl: cred.proxyUrl?.trim() || undefined,
-              proxyUsername: cred.proxyUsername?.trim() || undefined,
-              proxyPassword: cred.proxyPassword?.trim() || undefined,
+              region: optionalTrimmed(cred.region),
+              authRegion: optionalTrimmed(cred.authRegion) || optionalTrimmed(cred.region),
+              apiRegion: optionalTrimmed(cred.apiRegion),
+              machineId: optionalTrimmed(cred.machineId),
+              proxyUrl: optionalTrimmed(cred.proxyUrl),
+              proxyUsername: optionalTrimmed(cred.proxyUsername),
+              proxyPassword: optionalTrimmed(cred.proxyPassword),
               proxyResourceId: cred.proxyResourceId || undefined,
-              endpoint: cred.endpoint?.trim() || undefined,
+              endpoint: optionalTrimmed(cred.endpoint),
             })
 
             addedCredId = addedCred.credentialId
@@ -348,8 +349,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
           // OAuth 账号
           const token = cred.refreshToken!.trim()
-          const clientId = cred.clientId?.trim() || undefined
-          const clientSecret = cred.clientSecret?.trim() || undefined
+          const clientId = optionalTrimmed(cred.clientId)
+          const clientSecret = optionalTrimmed(cred.clientSecret)
           const authMethod = cred.authMethod === 'external_idp'
             ? 'external_idp'
             : cred.authMethod === 'idc' || (clientId && clientSecret)
@@ -369,28 +370,28 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           const addedCred = await addCredential({
             refreshToken: token,
             authMethod,
-            accessToken: cred.accessToken?.trim() || undefined,
-            expiresAt: cred.expiresAt?.trim() || undefined,
-            email: cred.email?.trim() || undefined,
-            profileArn: cred.profileArn?.trim() || undefined,
-            region: cred.region?.trim() || undefined,
-            authRegion: cred.authRegion?.trim() || cred.region?.trim() || undefined,
-            apiRegion: cred.apiRegion?.trim() || undefined,
+            accessToken: optionalTrimmed(cred.accessToken),
+            expiresAt: optionalTrimmed(cred.expiresAt),
+            email: optionalTrimmed(cred.email),
+            profileArn: optionalTrimmed(cred.profileArn),
+            region: optionalTrimmed(cred.region),
+            authRegion: optionalTrimmed(cred.authRegion) || optionalTrimmed(cred.region),
+            apiRegion: optionalTrimmed(cred.apiRegion),
             clientId,
             clientSecret: authMethod === 'idc' ? clientSecret : undefined,
-            tokenEndpoint: authMethod === 'external_idp' ? cred.tokenEndpoint?.trim() || undefined : undefined,
-            issuerUrl: authMethod === 'external_idp' ? cred.issuerUrl?.trim() || undefined : undefined,
-            scopes: authMethod === 'external_idp' ? cred.scopes?.trim() || undefined : undefined,
+            tokenEndpoint: authMethod === 'external_idp' ? optionalTrimmed(cred.tokenEndpoint) : undefined,
+            issuerUrl: authMethod === 'external_idp' ? optionalTrimmed(cred.issuerUrl) : undefined,
+            scopes: authMethod === 'external_idp' ? optionalTrimmed(cred.scopes) : undefined,
             priority: cred.priority || 0,
             maxConcurrentRequests: cred.maxConcurrentRequests ?? undefined,
             rpm: cred.rpm ?? undefined,
             disabled: cred.disabled ?? false,
-            machineId: cred.machineId?.trim() || undefined,
-            proxyUrl: cred.proxyUrl?.trim() || undefined,
-            proxyUsername: cred.proxyUsername?.trim() || undefined,
-            proxyPassword: cred.proxyPassword?.trim() || undefined,
+            machineId: optionalTrimmed(cred.machineId),
+            proxyUrl: optionalTrimmed(cred.proxyUrl),
+            proxyUsername: optionalTrimmed(cred.proxyUsername),
+            proxyPassword: optionalTrimmed(cred.proxyPassword),
             proxyResourceId: cred.proxyResourceId || undefined,
-            endpoint: cred.endpoint?.trim() || undefined,
+            endpoint: optionalTrimmed(cred.endpoint),
           })
 
           addedCredId = addedCred.credentialId

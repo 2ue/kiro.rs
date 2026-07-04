@@ -38,8 +38,13 @@ export function initialParameterDefaults(): CredentialParameterDefaults {
   }
 }
 
-export function optionalTrimmed(value?: string | null) {
-  const trimmed = value?.trim()
+export function optionalTrimmed(value: unknown) {
+  const trimmed =
+    typeof value === 'string'
+      ? value.trim()
+      : typeof value === 'number' && Number.isFinite(value)
+        ? String(Math.trunc(value))
+        : ''
   return trimmed ? trimmed : undefined
 }
 

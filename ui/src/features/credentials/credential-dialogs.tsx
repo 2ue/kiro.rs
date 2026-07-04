@@ -187,9 +187,30 @@ function formFromCredential(c: AddCredentialRequest) {
   }
 }
 
-function optionalTrimmed(v?: string | null): string | undefined {
-  const t = v?.trim()
+function optionalTrimmed(v: unknown): string | undefined {
+  const t =
+    typeof v === 'string'
+      ? v.trim()
+      : typeof v === 'number' && Number.isFinite(v)
+        ? String(Math.trunc(v))
+        : ''
   return t || undefined
+}
+
+function normalizedKamAuthMethod(
+  value: unknown,
+  clientId?: string,
+  clientSecret?: string
+): AddCredentialRequest['authMethod'] {
+  const compact = optionalTrimmed(value)?.toLowerCase().replace(/[^a-z0-9]/g, '')
+  if (compact === 'externalidp' || compact === 'enterprise' || compact === 'iamsso' || compact === 'awsidc') {
+    return 'external_idp'
+  }
+  if (compact === 'idc' || compact === 'builderid' || compact === 'iam' || (clientId && clientSecret)) {
+    return 'idc'
+  }
+  if (compact === 'apikey') return 'api_key'
+  return 'social'
 }
 
 function parseOptionalNonNegativeInteger(value: string, label: string): number | undefined {
@@ -769,21 +790,24 @@ export function KamImportModal({ open, onClose, onDone }: {
       newResults[i] = { ...newResults[i], status: 'importing' }
       setResults([...newResults])
       try {
+        const clientId = optionalTrimmed(acc.credentials.clientId)
+        const clientSecret = optionalTrimmed(acc.credentials.clientSecret)
+        const authMethod = normalizedKamAuthMethod(acc.credentials.authMethod, clientId, clientSecret)
         const cred: AddCredentialRequest = mergeCredentialDefaults({
-          authMethod: (acc.credentials.authMethod || 'social') as AddCredentialRequest['authMethod'],
-          accessToken: acc.credentials.accessToken,
-          expiresAt: acc.credentials.expiresAt,
-          refreshToken: acc.credentials.refreshToken,
-          clientId: acc.credentials.clientId,
-          clientSecret: acc.credentials.clientSecret,
-          tokenEndpoint: acc.credentials.tokenEndpoint,
-          issuerUrl: acc.credentials.issuerUrl,
-          scopes: acc.credentials.scopes,
-          profileArn: acc.credentials.profileArn,
-          region: acc.credentials.region,
-          apiRegion: acc.credentials.apiRegion,
-          email: acc.email,
-          machineId: acc.machineId,
+          authMethod,
+          accessToken: optionalTrimmed(acc.credentials.accessToken),
+          expiresAt: optionalTrimmed(acc.credentials.expiresAt),
+          refreshToken: optionalTrimmed(acc.credentials.refreshToken),
+          clientId,
+          clientSecret: authMethod === 'idc' ? clientSecret : undefined,
+          tokenEndpoint: authMethod === 'external_idp' ? optionalTrimmed(acc.credentials.tokenEndpoint) : undefined,
+          issuerUrl: authMethod === 'external_idp' ? optionalTrimmed(acc.credentials.issuerUrl) : undefined,
+          scopes: authMethod === 'external_idp' ? optionalTrimmed(acc.credentials.scopes) : undefined,
+          profileArn: optionalTrimmed(acc.credentials.profileArn),
+          region: optionalTrimmed(acc.credentials.region),
+          apiRegion: optionalTrimmed(acc.credentials.apiRegion),
+          email: optionalTrimmed(acc.email),
+          machineId: optionalTrimmed(acc.machineId),
         }, defaults)
         const res = await addCredential(cred)
         newResults[i] = { ...newResults[i], credentialId: res.credentialId, email: res.email, status: 'verifying' }

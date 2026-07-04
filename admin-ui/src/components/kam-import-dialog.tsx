@@ -66,6 +66,26 @@ interface VerificationResult {
 
 type ImportVerificationMode = 'model_and_subscription' | 'subscription_only'
 
+type JsonObject = Record<string, unknown>
+
+function isObject(value: unknown): value is JsonObject {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function stringField(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined
+}
+
+function stringLikeField(value: unknown): string | undefined {
+  if (typeof value === 'string' && value.trim()) {
+    return value.trim()
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return String(Math.trunc(value))
+  }
+  return undefined
+}
+
 async function verifyImportedCredential(
   credentialId: number,
   mode: ImportVerificationMode
@@ -96,72 +116,41 @@ async function verifyImportedCredential(
 // 兼容 KAM 1.8.3 新版平铺格式，统一转换为旧格式（credentials 嵌套结构）
 function normalizeKamAccount(item: unknown): unknown {
   const normalized = camelizeKeys(item)
-  if (typeof normalized !== 'object' || normalized === null) return normalized
-  const obj = normalized as Record<string, unknown>
-  // 新格式：refreshToken 直接在账号对象上，无 credentials 嵌套
-  if (typeof obj.refreshToken === 'string' && typeof obj.credentials === 'undefined') {
-    const email = typeof obj.email === 'string' ? obj.email : undefined
-    const userId =
-      typeof obj.userId === 'string' || obj.userId === null ? (obj.userId as string | null) : undefined
-    const nickname =
-      typeof obj.nickname === 'string'
-        ? obj.nickname
-        : typeof obj.label === 'string'
-          ? (obj.label as string)
-          : undefined
-    const status = typeof obj.status === 'string' ? obj.status : undefined
-    const machineId = typeof obj.machineId === 'string' ? obj.machineId : undefined
-    const accessToken = typeof obj.accessToken === 'string' ? obj.accessToken : undefined
-    const expiresAt =
-      typeof obj.expiresAt === 'string'
-        ? obj.expiresAt
-        : typeof obj.expired === 'string'
-          ? obj.expired
-          : undefined
-    const clientId = typeof obj.clientId === 'string' ? obj.clientId : undefined
-    const clientSecret = typeof obj.clientSecret === 'string' ? obj.clientSecret : undefined
-    const tokenEndpoint = typeof obj.tokenEndpoint === 'string' ? obj.tokenEndpoint : undefined
-    const issuerUrl = typeof obj.issuerUrl === 'string' ? obj.issuerUrl : undefined
-    const scopes =
-      typeof obj.scopes === 'string'
-        ? obj.scopes
-        : typeof obj.scope === 'string'
-          ? obj.scope
-          : undefined
-    const profileArn = typeof obj.profileArn === 'string' ? obj.profileArn : undefined
-    const region = typeof obj.region === 'string' ? obj.region : undefined
-    const apiRegion = typeof obj.apiRegion === 'string' ? obj.apiRegion : undefined
-    const authMethod = typeof obj.authMethod === 'string' ? obj.authMethod : undefined
-    const startUrl = typeof obj.startUrl === 'string' ? obj.startUrl : undefined
-
-    return {
-      email,
-      userId,
-      nickname,
-      status,
-      machineId,
-      credentials: {
-        accessToken,
-        expiresAt,
-        refreshToken: obj.refreshToken,
-        clientId,
-        clientSecret,
-        tokenEndpoint,
-        issuerUrl,
-        scopes,
-        profileArn,
-        region,
-        apiRegion,
-        authMethod,
-        startUrl,
-      },
-    }
+  if (!isObject(normalized)) return normalized
+  const obj = normalized
+  const nested = isObject(obj.credentials) ? obj.credentials : undefined
+  const source = nested ?? obj
+  const refreshToken = stringField(source.refreshToken)
+  if (!refreshToken) {
+    return normalized
   }
-  return normalized
+
+  return {
+    email: stringField(obj.email),
+    userId: typeof obj.userId === 'string' || obj.userId === null ? (obj.userId as string | null) : undefined,
+    nickname: stringField(obj.nickname) ?? stringField(obj.label),
+    status: stringField(obj.status),
+    machineId: stringField(obj.machineId) ?? stringField(source.machineId),
+    credentials: {
+      accessToken: stringField(source.accessToken),
+      expiresAt: stringLikeField(source.expiresAt) ?? stringLikeField(source.expired),
+      refreshToken,
+      clientId: stringField(source.clientId),
+      clientSecret: stringField(source.clientSecret),
+      tokenEndpoint: stringField(source.tokenEndpoint),
+      issuerUrl: stringField(source.issuerUrl),
+      scopes: stringField(source.scopes) ?? stringField(source.scope),
+      profileArn: stringField(source.profileArn),
+      region: stringField(source.region),
+      apiRegion: stringField(source.apiRegion),
+      authMethod: stringField(source.authMethod),
+      startUrl: stringField(source.startUrl),
+    },
+  }
 }
 
-function normalizedKamAuthMethod(method?: string): AddCredentialRequest['authMethod'] | undefined {
-  const compact = method?.trim().toLowerCase().replace(/[^a-z0-9]/g, '')
+function normalizedKamAuthMethod(method: unknown): AddCredentialRequest['authMethod'] | undefined {
+  const compact = stringField(method)?.toLowerCase().replace(/[^a-z0-9]/g, '')
   if (!compact) return undefined
   if (compact === 'externalidp' || compact === 'enterprise' || compact === 'iamsso' || compact === 'awsidc') return 'external_idp'
   if (compact === 'idc' || compact === 'builderid' || compact === 'iam') return 'idc'
@@ -404,8 +393,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         let addedCredId: number | null = null
 
         try {
-          const clientId = cred.clientId?.trim() || undefined
-          const clientSecret = cred.clientSecret?.trim() || undefined
+          const clientId = stringField(cred.clientId)
+          const clientSecret = stringField(cred.clientSecret)
           const authMethod = normalizedKamAuthMethod(cred.authMethod) === 'external_idp'
             ? 'external_idp'
             : normalizedKamAuthMethod(cred.authMethod) === 'idc' || (clientId && clientSecret)
@@ -426,19 +415,19 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           const baseCredential: AddCredentialRequest = {
             refreshToken: token,
             authMethod,
-            accessToken: cred.accessToken?.trim() || undefined,
-            expiresAt: cred.expiresAt?.trim() || undefined,
-            email: account.email?.trim() || undefined,
-            profileArn: cred.profileArn?.trim() || undefined,
-            region: cred.region?.trim() || undefined,
+            accessToken: stringField(cred.accessToken),
+            expiresAt: stringLikeField(cred.expiresAt),
+            email: stringField(account.email),
+            profileArn: stringField(cred.profileArn),
+            region: stringField(cred.region),
             authRegion: optionalTrimmed(defaults.authRegion) || accountRegion,
-            apiRegion: cred.apiRegion?.trim() || undefined,
+            apiRegion: stringField(cred.apiRegion),
             clientId,
             clientSecret: authMethod === 'idc' ? clientSecret : undefined,
-            tokenEndpoint: authMethod === 'external_idp' ? cred.tokenEndpoint?.trim() || undefined : undefined,
-            issuerUrl: authMethod === 'external_idp' ? cred.issuerUrl?.trim() || undefined : undefined,
-            scopes: authMethod === 'external_idp' ? cred.scopes?.trim() || undefined : undefined,
-            machineId: account.machineId?.trim() || undefined,
+            tokenEndpoint: authMethod === 'external_idp' ? stringField(cred.tokenEndpoint) : undefined,
+            issuerUrl: authMethod === 'external_idp' ? stringField(cred.issuerUrl) : undefined,
+            scopes: authMethod === 'external_idp' ? stringField(cred.scopes) : undefined,
+            machineId: stringField(account.machineId),
           }
           const addedCred = await addCredential(mergeCredentialDefaults(baseCredential, { ...defaults, authRegion: '' }))
 
