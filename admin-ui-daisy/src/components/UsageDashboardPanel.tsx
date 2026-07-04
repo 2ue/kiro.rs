@@ -552,9 +552,9 @@ function ExternalPoolBillingPanel({
           <div className="mt-1 text-xs text-base-content/50">可计价 {formatNumber(billing.pricedRequests)} / 未计价 {formatNumber(billing.unpricedRequests)}</div>
         </div>
         <div className="rounded-box border border-base-300/60 bg-base-200/40 p-3">
-          <div className="text-xs text-base-content/55">原始成本</div>
+          <div className="text-xs text-base-content/55">上游原始成本</div>
           <div className="mt-1 text-lg font-semibold">{formatUsd(billing.rawCostUsd)}</div>
-          <div className="mt-1 text-xs text-base-content/50">按外部账号实际消耗估算</div>
+          <div className="mt-1 text-xs text-base-content/50">按外部上游返回 usage 估算</div>
         </div>
         <div className="rounded-box border border-base-300/60 bg-base-200/40 p-3">
           <div className="text-xs text-base-content/55">展示计费</div>
@@ -565,13 +565,13 @@ function ExternalPoolBillingPanel({
           <div className="text-xs text-base-content/55">补偿后计费</div>
           <div className="mt-1 text-lg font-semibold">{formatUsd(upliftedCost)}</div>
           <div className={`mt-1 text-xs ${billingDeltaTextClass(deltaTone)}`}>
-            盈利 = 放大后 - 原始：{profit >= 0 ? '+' : ''}{formatUsd(profit)}
+            盈利 = 放大后 - 上游原始：{profit >= 0 ? '+' : ''}{formatUsd(profit)}
           </div>
         </div>
       </div>
       <div className="px-3 pb-3">
         <SignalRow
-          label="盈利占原始成本"
+          label="盈利占上游原始成本"
           value={`${profit >= 0 ? '+' : ''}${formatUsd(profit)} · ${formatPercent(profitRatio)}`}
           ratio={Math.abs(profitRatio)}
           tone={hasLoss ? 'warning' : 'success'}
@@ -593,7 +593,7 @@ function ExternalPoolBillingPanel({
                 <tr>
                   <th>外部账号</th>
                   <th className="text-right">请求</th>
-                  <th className="text-right">原始成本</th>
+                  <th className="text-right">上游原始成本</th>
                   <th className="text-right">展示计费</th>
                   <th className="text-right">补偿后</th>
                   <th className="text-right">盈亏</th>

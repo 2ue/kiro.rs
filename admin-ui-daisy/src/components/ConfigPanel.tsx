@@ -1577,6 +1577,14 @@ function ReportedUsagePathEditor({
       )}
       {value.enabled && (
         <>
+          <ToggleField
+            title="禁用非流式整形"
+            description="开启后，命中此路径的非流式请求不会改写返回 usage；流式请求不受影响。此设置是上层拦截，后续外部池等配置不能重新开启本次整形。"
+            checked={Boolean(value.skipNonStreamUsageProjection)}
+            onChange={(skipNonStreamUsageProjection) =>
+              onChange({ ...value, skipNonStreamUsageProjection })
+            }
+          />
           <div className="grid gap-3 xl:grid-cols-2">
             <ReportedUsageFieldEditor
               title="输入用量展示"

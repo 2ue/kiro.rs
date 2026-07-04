@@ -4362,6 +4362,10 @@ fn build_external_usage_projection_context(
     if !route.payload.stream && pool.skip_non_stream_usage_projection {
         return None;
     }
+    let reported_usage = route.reported_usage.policy_for_path(&route.endpoint);
+    if !route.payload.stream && reported_usage.skip_non_stream_usage_projection {
+        return None;
+    }
 
     let model = route
         .upstream_model
@@ -4426,7 +4430,6 @@ fn build_external_usage_projection_context(
         }
         _ => (None, None, None),
     };
-    let reported_usage = route.reported_usage.policy_for_path(&route.endpoint);
     let reported_policy = match route.prompt_cache_strategy_type {
         PromptCacheStrategyType::NoCache if reported_usage.enabled => {
             ReportedCacheUsagePolicy::from_path_policy(reported_usage, fastrand::u64(..))
@@ -6237,6 +6240,45 @@ data: {"type":"message_delta","note":"content_block_delta"}
         let mut pool = test_pool("http://pool.example.com", false);
         pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
         pool.skip_non_stream_usage_projection = true;
+
+        let projection = projection_context(&route, &pool, 0);
+        assert!(projection.is_some());
+    }
+
+    #[test]
+    fn usage_projection_path_skip_non_stream_blocks_external_projection() {
+        let mut route = test_route("claude-sonnet-4-5");
+        route.reported_usage.path_overrides.insert(
+            "/cc".to_string(),
+            ReportedUsagePathPolicy {
+                skip_non_stream_usage_projection: true,
+                input: ReportedUsageFieldPolicy::sample_input_max(96),
+                ..ReportedUsagePathPolicy::default()
+            },
+        );
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+        pool.skip_non_stream_usage_projection = false;
+
+        let projection = projection_context(&route, &pool, 0);
+        assert!(projection.is_none());
+    }
+
+    #[test]
+    fn usage_projection_path_skip_non_stream_keeps_stream_projection_enabled() {
+        let mut route = test_route("claude-sonnet-4-5");
+        route.payload.stream = true;
+        route.reported_usage.path_overrides.insert(
+            "/cc".to_string(),
+            ReportedUsagePathPolicy {
+                skip_non_stream_usage_projection: true,
+                input: ReportedUsageFieldPolicy::sample_input_max(96),
+                ..ReportedUsagePathPolicy::default()
+            },
+        );
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+        pool.skip_non_stream_usage_projection = false;
 
         let projection = projection_context(&route, &pool, 0);
         assert!(projection.is_some());

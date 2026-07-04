@@ -1019,6 +1019,7 @@ export interface ReportedUsageFieldPolicy {
 
 export interface ReportedUsagePathPolicy {
   enabled: boolean
+  skipNonStreamUsageProjection: boolean
   finalCacheReadMaxTokens: number
   finalCacheReadJitterMinTokens: number
   finalCacheReadJitterMaxTokens: number

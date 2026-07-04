@@ -537,7 +537,7 @@ function ExternalPoolBillingPanel({
   return (
     <Panel
       title="备用池计费拆分"
-      subtitle="原始成本来自外部池原始 usage；最终上报使用整形并放大后的 usage；盈利按放大后计费减原始成本计算"
+      subtitle="上游原始成本来自外部池原始 usage；最终上报使用整形并放大后的 usage；盈利按放大后计费减上游原始成本计算"
       actions={
         <Badge variant={hasLoss ? 'destructive' : hasProfit ? 'warning' : 'success'}>
           {hasLoss ? `亏损 ${formatUsd(Math.abs(profit))}` : hasProfit ? `盈利 ${formatUsd(profit)}` : '持平'}
@@ -551,7 +551,7 @@ function ExternalPoolBillingPanel({
           <div className="mt-1 text-xs text-muted-foreground">可计价 {formatNumber(billing.pricedRequests)} / 未计价 {formatNumber(billing.unpricedRequests)}</div>
         </div>
         <div className="rounded-md border bg-muted/30 p-3">
-          <div className="text-xs text-muted-foreground">原始成本</div>
+          <div className="text-xs text-muted-foreground">上游原始成本</div>
           <div className="mt-1 text-lg font-semibold">{formatUsd(billing.rawCostUsd)}</div>
           <div className="mt-1 text-xs text-muted-foreground">按备用池 raw usage 估算</div>
         </div>
@@ -564,13 +564,13 @@ function ExternalPoolBillingPanel({
           <div className="text-xs text-muted-foreground">整形后放大计费</div>
           <div className="mt-1 text-lg font-semibold">{formatUsd(upliftedCost)}</div>
           <div className={`mt-1 text-xs ${billingDeltaTextClass(deltaTone)}`}>
-            盈利 = 放大后 - 原始：{profit >= 0 ? '+' : ''}{formatUsd(profit)}
+            盈利 = 放大后 - 上游原始：{profit >= 0 ? '+' : ''}{formatUsd(profit)}
           </div>
         </div>
       </div>
       <div className="mt-3">
         <SignalRow
-          label="盈利占原始成本"
+          label="盈利占上游原始成本"
           value={`${profit >= 0 ? '+' : ''}${formatUsd(profit)} · ${formatPercent(profitRatio)}`}
           ratio={Math.abs(profitRatio)}
           tone={hasLoss ? 'error' : 'success'}
@@ -592,7 +592,7 @@ function ExternalPoolBillingPanel({
                 <tr>
                   <th className="py-2 text-left font-medium">号池</th>
                   <th className="py-2 text-right font-medium">请求</th>
-                  <th className="py-2 text-right font-medium">原始成本</th>
+                  <th className="py-2 text-right font-medium">上游原始成本</th>
                   <th className="py-2 text-right font-medium">整形后</th>
                   <th className="py-2 text-right font-medium">放大后</th>
                   <th className="py-2 text-right font-medium">盈亏</th>

@@ -458,7 +458,7 @@ function RecordsView({
                         </TableCell>
                         {/* 用量 */}
                         <TableCell className="text-right font-mono text-xs tabular-nums">
-                          <div title={formatNumber(record.totalInputTokens)}>实际输入 {formatCompact(record.totalInputTokens)}</div>
+                          <div title={formatNumber(record.totalInputTokens)}>本地估算 {formatCompact(record.totalInputTokens)}</div>
                           <div title={formatNumber(record.compatInputTokens)}>展示输入 {formatCompact(record.compatInputTokens)}</div>
                           <div className="text-muted-foreground/60" title={formatNumber(record.outputTokens)}>展示输出 {formatCompact(record.outputTokens)}</div>
                         </TableCell>

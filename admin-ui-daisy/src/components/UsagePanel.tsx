@@ -949,7 +949,7 @@ function UsageBillingModal({ record, onClose }: { record: UsageRecord | null; on
               </div>
               <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
                 <div>
-                  <div className="text-xs text-base-content/55">原始成本</div>
+                  <div className="text-xs text-base-content/55">上游原始 usage 成本</div>
                   <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.rawUsage)}</div>
                   <div className="mt-1 font-medium">{formatUsd(billing.rawCostUsd || 0)}</div>
                 </div>
@@ -963,7 +963,7 @@ function UsageBillingModal({ record, onClose }: { record: UsageRecord | null; on
                   <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.reportedUsage)}</div>
                   <div className="mt-1 font-medium">{formatUsd(upliftedCost)}</div>
                   <div className={`text-xs ${billingDeltaTextClass(deltaTone)}`}>
-                    盈利 = 放大后 - 原始：{profit >= 0 ? '+' : ''}{formatUsd(profit)}
+                    盈利 = 放大后 - 上游原始：{profit >= 0 ? '+' : ''}{formatUsd(profit)}
                   </div>
                 </div>
                 <div>
@@ -1013,10 +1013,10 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
           <div className="rounded-box border border-base-300 bg-base-200/50 p-3 text-sm">
             <div className="mb-2 flex items-center gap-2">
               <div className="font-medium">用量口径</div>
-              <span className="text-xs text-base-content/55">主列表只展示返回给客户端的用量；实际输入和成本估算只在详情里查看。</span>
+              <span className="text-xs text-base-content/55">本地估算输入仅用于诊断；返回给客户端的用量以展示字段为准。</span>
             </div>
             <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-6">
-              <UsageMetric label="用户实际输入" value={formatNumber(record.totalInputTokens)} />
+              <UsageMetric label="本地估算输入" value={formatNumber(record.totalInputTokens)} />
               <UsageMetric label="展示输入" value={formatNumber(record.compatInputTokens)} />
               <UsageMetric label="展示缓存写入" value={formatNumber(record.cacheCreationInputTokens)} tone="info" />
               <UsageMetric label="展示缓存读取" value={formatNumber(record.cacheReadInputTokens)} tone="success" />
@@ -1046,10 +1046,10 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
                   </div>
                   <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
                     <div>
-                      <div className="text-xs text-base-content/55">原始成本</div>
+                      <div className="text-xs text-base-content/55">上游原始 usage 成本</div>
                       <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.rawUsage)}</div>
                       <div className="mt-1 font-medium">{formatUsd(billing.rawCostUsd || 0)}</div>
-                      <div className="text-xs text-base-content/55">按外部账号实际消耗估算</div>
+                      <div className="text-xs text-base-content/55">按外部上游返回 usage 估算</div>
                     </div>
                     <div>
                       <div className="text-xs text-base-content/55">展示计费</div>
@@ -1062,7 +1062,7 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
                       <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.reportedUsage)}</div>
                       <div className="mt-1 font-medium">{formatUsd(upliftedCost)}</div>
                       <div className={`text-xs ${billingDeltaTextClass(deltaTone)}`}>
-                        盈利 = 放大后 - 原始：{profit >= 0 ? '+' : ''}{formatUsd(profit)}
+                        盈利 = 放大后 - 上游原始：{profit >= 0 ? '+' : ''}{formatUsd(profit)}
                       </div>
                     </div>
                     <div>

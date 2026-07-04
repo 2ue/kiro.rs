@@ -75,6 +75,7 @@ const pathPolicy = (
   cacheCreation: ReportedUsageFieldPolicy = preserveFieldPolicy()
 ): ReportedUsagePathPolicy => ({
   enabled,
+  skipNonStreamUsageProjection: false,
   finalCacheReadMaxTokens: 700000,
   finalCacheReadJitterMinTokens: 0,
   finalCacheReadJitterMaxTokens: 0,
@@ -1325,6 +1326,14 @@ function ReportedUsagePathEditor({
       )}
       {value.enabled && (
         <>
+          <ToggleField
+            title="禁用非流式整形"
+            description="开启后，命中此路径的非流式请求不会改写返回 usage；流式请求不受影响。此设置是上层拦截，后续外部池等配置不能重新开启本次整形。"
+            checked={Boolean(value.skipNonStreamUsageProjection)}
+            onCheckedChange={(skipNonStreamUsageProjection) =>
+              onChange({ ...value, skipNonStreamUsageProjection })
+            }
+          />
           <div className="grid gap-4 lg:grid-cols-2">
             <ReportedUsageFieldEditor
               title="输入字段改写（input_tokens）"
@@ -1438,6 +1447,7 @@ function normalizePathPolicy(policy: ReportedUsagePathPolicy): ReportedUsagePath
   )
   return {
     ...policy,
+    skipNonStreamUsageProjection: Boolean(policy.skipNonStreamUsageProjection),
     finalCacheReadMaxTokens,
     finalCacheReadJitterMinTokens,
     finalCacheReadJitterMaxTokens,

@@ -601,9 +601,9 @@ function ExternalPoolBillingPanel({
             </div>
           </div>
           <div className="rounded-lg bg-muted/30 p-3">
-            <div className="text-xs text-muted-foreground">原始成本</div>
+            <div className="text-xs text-muted-foreground">上游原始成本</div>
             <div className="mt-1 text-lg font-semibold">{formatUsd(billing.rawCostUsd)}</div>
-            <div className="mt-1 text-xs text-muted-foreground/60">按外部账号实际消耗估算</div>
+            <div className="mt-1 text-xs text-muted-foreground/60">按外部上游返回 usage 估算</div>
           </div>
           <div className="rounded-lg bg-muted/30 p-3">
             <div className="text-xs text-muted-foreground">展示计费</div>
@@ -614,14 +614,14 @@ function ExternalPoolBillingPanel({
             <div className="text-xs text-muted-foreground">补偿后计费</div>
             <div className="mt-1 text-lg font-semibold">{formatUsd(upliftedCost)}</div>
             <div className={cn('mt-1 text-xs', billingDeltaTextClass(deltaTone))}>
-              盈利 = 放大后 - 原始：{profit >= 0 ? '+' : ''}{formatUsd(profit)}
+              盈利 = 放大后 - 上游原始：{profit >= 0 ? '+' : ''}{formatUsd(profit)}
             </div>
           </div>
         </div>
 
         <div className="space-y-1.5">
           <div className="flex items-center justify-between gap-2 text-xs">
-            <span className="truncate font-medium text-foreground/75">盈利占原始成本</span>
+            <span className="truncate font-medium text-foreground/75">盈利占上游原始成本</span>
             <span className="shrink-0 font-mono text-muted-foreground">
               {profit >= 0 ? '+' : ''}{formatUsd(profit)} · {formatPercent(profitRatio)}
             </span>
@@ -650,7 +650,7 @@ function ExternalPoolBillingPanel({
                   <tr className="bg-muted/40 text-muted-foreground">
                     <th className="px-3 py-2 text-left font-medium">外部账号</th>
                     <th className="px-3 py-2 text-right font-medium">请求</th>
-                    <th className="px-3 py-2 text-right font-medium">原始成本</th>
+                    <th className="px-3 py-2 text-right font-medium">上游原始成本</th>
                     <th className="px-3 py-2 text-right font-medium">展示计费</th>
                     <th className="px-3 py-2 text-right font-medium">补偿后</th>
                     <th className="px-3 py-2 text-right font-medium">盈亏</th>

@@ -1998,7 +1998,23 @@ fn reported_cache_usage_policy(
     reported_usage: &ReportedUsagePathPolicy,
     seed: u64,
 ) -> Option<super::cache::ReportedCacheUsagePolicy> {
-    if !should_apply_reported_usage(strategy_type, simulation_mode, reported_usage) {
+    reported_cache_usage_policy_for_request(
+        strategy_type,
+        simulation_mode,
+        reported_usage,
+        seed,
+        true,
+    )
+}
+
+fn reported_cache_usage_policy_for_request(
+    strategy_type: PromptCacheStrategyType,
+    simulation_mode: PromptCacheSimulationMode,
+    reported_usage: &ReportedUsagePathPolicy,
+    seed: u64,
+    stream: bool,
+) -> Option<super::cache::ReportedCacheUsagePolicy> {
+    if !should_apply_reported_usage(strategy_type, simulation_mode, reported_usage, stream) {
         return None;
     }
 
@@ -2024,8 +2040,12 @@ fn should_apply_reported_usage(
     strategy_type: PromptCacheStrategyType,
     simulation_mode: PromptCacheSimulationMode,
     reported_usage: &ReportedUsagePathPolicy,
+    stream: bool,
 ) -> bool {
     if !reported_usage.enabled {
+        return false;
+    }
+    if !stream && reported_usage.skip_non_stream_usage_projection {
         return false;
     }
     match strategy_type {
@@ -3418,11 +3438,12 @@ fn prepare_usage_context(
         .map(|profile| profile.cache_jitter_seed())
         .unwrap_or(0)
         ^ fastrand::u64(..);
-    let reported_cache_usage_policy = reported_cache_usage_policy(
+    let reported_cache_usage_policy = reported_cache_usage_policy_for_request(
         strategy_type,
         simulation_mode,
         &policy.reported_usage,
         reported_cache_creation_seed,
+        stream,
     );
 
     RequestUsageContext {
@@ -8165,6 +8186,33 @@ Return a fix plan."#
         assert!((1..=96).contains(&raw_reported.input_tokens));
         assert_eq!(raw_reported.cache_read_input_tokens, 0);
         assert!(raw_reported.cache_creation_input_tokens > 0);
+    }
+
+    #[test]
+    fn path_reported_usage_skip_non_stream_blocks_non_stream_only() {
+        let policy = ReportedUsagePathPolicy {
+            skip_non_stream_usage_projection: true,
+            input: ReportedUsageFieldPolicy::sample_input_max(96),
+            ..ReportedUsagePathPolicy::default()
+        };
+
+        let non_stream_policy = reported_cache_usage_policy_for_request(
+            PromptCacheStrategyType::CurrentHighCache,
+            PromptCacheSimulationMode::HighCache,
+            &policy,
+            7,
+            false,
+        );
+        assert!(non_stream_policy.is_none());
+
+        let stream_policy = reported_cache_usage_policy_for_request(
+            PromptCacheStrategyType::CurrentHighCache,
+            PromptCacheSimulationMode::HighCache,
+            &policy,
+            7,
+            true,
+        );
+        assert!(stream_policy.is_some());
     }
 
     #[test]

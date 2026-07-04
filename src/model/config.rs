@@ -486,6 +486,13 @@ pub struct ReportedUsagePathPolicy {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
+    /// 命中该路径的非流式请求是否跳过 usage 展示整形。
+    ///
+    /// 该字段只是否决开关：开启后非流式请求不改写下游 usage；流式请求不受影响。
+    /// 其他层（例如外部池）即使允许非流式整形，也不能覆盖这里的禁用。
+    #[serde(default)]
+    pub skip_non_stream_usage_projection: bool,
+
     /// 最终下游上报的 cache_read_input_tokens 上限。
     ///
     /// 该限制在 input 差值转入 cache read 之后执行，只向下裁剪，不会抬高小值。
@@ -518,6 +525,7 @@ impl Default for ReportedUsagePathPolicy {
     fn default() -> Self {
         Self {
             enabled: true,
+            skip_non_stream_usage_projection: false,
             final_cache_read_max_tokens: default_final_cache_read_max_tokens(),
             final_cache_read_jitter_min_tokens: 0,
             final_cache_read_jitter_max_tokens: 0,
@@ -553,6 +561,7 @@ impl ReportedUsagePathPolicy {
 
         Self {
             enabled: self.enabled,
+            skip_non_stream_usage_projection: self.skip_non_stream_usage_projection,
             final_cache_read_max_tokens,
             final_cache_read_jitter_min_tokens,
             final_cache_read_jitter_max_tokens,

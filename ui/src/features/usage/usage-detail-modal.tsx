@@ -157,9 +157,9 @@ export function UsageDetailModal({
         {/* 用量口径 */}
         <div>
           <SectionTitle>用量口径</SectionTitle>
-          <div className="mb-1.5 text-xs text-muted-foreground">主列表只展示返回给客户端的用量；实际输入和成本估算只在详情里查看。</div>
+          <div className="mb-1.5 text-xs text-muted-foreground">本地估算输入仅用于诊断；返回给客户端的用量以展示字段为准。</div>
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
-            <MetricTile label="用户实际输入" value={formatNumber(record.totalInputTokens)} tone="info" />
+            <MetricTile label="本地估算输入" value={formatNumber(record.totalInputTokens)} tone="info" />
             <MetricTile label="展示输入" value={formatNumber(record.compatInputTokens)} />
             <MetricTile label="展示缓存写入" value={formatNumber(record.cacheCreationInputTokens)} tone="info" />
             <MetricTile label="展示缓存读取" value={formatNumber(record.cacheReadInputTokens)} tone="success" />
@@ -313,10 +313,10 @@ export function UsageDetailModal({
             <SectionTitle>外部池计费拆分</SectionTitle>
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
               <div>
-                <div className="text-xs text-muted-foreground">原始成本</div>
+                <div className="text-xs text-muted-foreground">上游原始 usage 成本</div>
                 <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.rawUsage)}</div>
                 <div className="mt-1 font-medium">{formatUsd(billing.rawCostUsd)}</div>
-                <div className="text-xs text-muted-foreground">按外部账号实际消耗估算</div>
+                <div className="text-xs text-muted-foreground">按外部上游返回 usage 估算</div>
               </div>
               <div>
                 <div className="text-xs text-muted-foreground">展示计费（shaped）</div>

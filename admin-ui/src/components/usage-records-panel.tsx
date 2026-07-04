@@ -966,11 +966,11 @@ export function UsageRecordsPanel() {
                 <div className="mb-2 flex flex-wrap items-center gap-2">
                   <div className="font-medium">Usage 口径</div>
                   <span className="text-xs text-muted-foreground">
-                    主列表只展示下游响应上报字段；实际输入和内部成本口径仅用于诊断。
+                    本地估算输入仅用于诊断；下游响应用量以上报字段为准。
                   </span>
                 </div>
                 <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-6">
-                  <UsageMetric label="用户实际输入" value={formatNumber(selectedRecord.totalInputTokens)} />
+                  <UsageMetric label="本地估算输入" value={formatNumber(selectedRecord.totalInputTokens)} />
                   <UsageMetric label="上报输入" value={formatNumber(selectedRecord.compatInputTokens)} />
                   <UsageMetric label="上报缓存写入" value={formatNumber(selectedRecord.cacheCreationInputTokens)} tone="info" />
                   <UsageMetric label="上报缓存读取" value={formatNumber(selectedRecord.cacheReadInputTokens)} tone="success" />
@@ -1000,10 +1000,10 @@ export function UsageRecordsPanel() {
                       </div>
                       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
                         <div>
-                          <div className="text-xs text-muted-foreground">原始成本</div>
+                          <div className="text-xs text-muted-foreground">上游原始 usage 成本</div>
                           <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.rawUsage)}</div>
                           <div className="mt-1 font-medium">{formatUsd(billing.rawCostUsd || 0)}</div>
-                          <div className="text-xs text-muted-foreground">外部池原始返回 usage 估算</div>
+                          <div className="text-xs text-muted-foreground">按外部上游返回 usage 估算</div>
                         </div>
                         <div>
                           <div className="text-xs text-muted-foreground">整形后计费</div>
@@ -1016,7 +1016,7 @@ export function UsageRecordsPanel() {
                           <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.reportedUsage)}</div>
                           <div className="mt-1 font-medium">{formatUsd(upliftedCost)}</div>
                           <div className={`text-xs ${billingDeltaTextClass(deltaTone)}`}>
-                            盈利 = 放大后 - 原始：{profit >= 0 ? '+' : ''}{formatUsd(profit)}
+                            盈利 = 放大后 - 上游原始：{profit >= 0 ? '+' : ''}{formatUsd(profit)}
                           </div>
                         </div>
                         <div>

@@ -1402,6 +1402,12 @@ function PathPolicyEditor({
       )}
       {policy.enabled && (
         <>
+          <TogField
+            label="禁用非流式整形"
+            desc="开启后，命中此路径的非流式请求不会改写返回 usage；流式请求不受影响。此设置是上层拦截，后续外部池等配置不能重新开启本次整形。"
+            checked={Boolean(policy.skipNonStreamUsageProjection)}
+            onChange={set('skipNonStreamUsageProjection')}
+          />
           <FieldPolicyEditor title="展示输入" policy={policy.input} allowMoveDelta onChange={set('input')} />
           <FieldPolicyEditor title="展示输出" policy={policy.output} onChange={set('output')} />
           <FieldPolicyEditor title="展示缓存读取" policy={policy.cacheRead} onChange={set('cacheRead')} />
