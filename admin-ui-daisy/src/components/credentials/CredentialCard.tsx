@@ -267,6 +267,8 @@ export function CredentialCard({
   const recentSelection10s = numberOrZero(credential.recentSchedulerSelectionCount10s)
   const recentSelection60s = numberOrZero(credential.recentSchedulerSelectionCount60s)
   const recentSelection5m = numberOrZero(credential.recentSchedulerSelectionCount5m)
+  const projectedRpm10s = recentSelection10s * 6
+  const averageRpm5m = Math.round(recentSelection5m / 5)
   const schedulerSelectionPressure = numberOrZero(credential.schedulerSelectionPressure)
   const lastTransientErrorAgo = formatApproxElapsedMs(credential.lastErrorAtMs)
   const dispatchStatus = dispatchStatusLabel(credential, probationRemainingSecs)
@@ -707,7 +709,12 @@ export function CredentialCard({
               <MetaItem label="耗时 EWMA" value={credential.latencyEwmaMs == null ? '未知' : `${Math.round(credential.latencyEwmaMs)}ms`} />
               <MetaItem label="调度评分" value={schedulerScore.toFixed(2)} />
               <MetaItem label="总调度" value={formatNumber(schedulerSelectionCount)} />
-              <MetaItem label="近期调度" value={`${formatNumber(recentSelection60s)}/60s`} detail={`10s ${formatNumber(recentSelection10s)} · 5m ${formatNumber(recentSelection5m)}`} />
+              <MetaItem
+                label="当前RPM"
+                value={`${formatNumber(recentSelection60s)}/min`}
+                detail={`10s折算 ${formatNumber(projectedRpm10s)}/min · 5m均 ${formatNumber(averageRpm5m)}/min`}
+                error={(credential.rpm ?? 0) > 0 && recentSelection60s >= (credential.rpm ?? 0)}
+              />
               <MetaItem label="调度压力" value={schedulerSelectionPressure.toFixed(2)} error={schedulerSelectionPressure > 1} />
               <MetaItem
                 label="并发"

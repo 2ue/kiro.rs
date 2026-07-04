@@ -260,6 +260,8 @@ export function CredentialCard({
   const recentSelection10s = numberOrZero(credential.recentSchedulerSelectionCount10s)
   const recentSelection60s = numberOrZero(credential.recentSchedulerSelectionCount60s)
   const recentSelection5m = numberOrZero(credential.recentSchedulerSelectionCount5m)
+  const projectedRpm10s = recentSelection10s * 6
+  const averageRpm5m = Math.round(recentSelection5m / 5)
   const schedulerSelectionPressure = numberOrZero(credential.schedulerSelectionPressure)
   const lastTransientErrorAgo = formatApproxElapsedMs(credential.lastErrorAtMs)
 
@@ -796,12 +798,12 @@ export function CredentialCard({
               <span className="font-medium">{schedulerSelectionCount}</span>
             </div>
             <div>
-              <span className="text-muted-foreground">近期调度：</span>
-              <span className="font-medium">
-                {recentSelection60s}/60s
+              <span className="text-muted-foreground">当前 RPM：</span>
+              <span className={credential.rpm > 0 && recentSelection60s >= credential.rpm ? 'font-medium text-amber-600' : 'font-medium'}>
+                {recentSelection60s}/min
               </span>
               <span className="ml-1 text-xs text-muted-foreground">
-                10s {recentSelection10s} / 5m {recentSelection5m}
+                10s折算 {projectedRpm10s}/min / 5m均 {averageRpm5m}/min
               </span>
             </div>
             <div>
