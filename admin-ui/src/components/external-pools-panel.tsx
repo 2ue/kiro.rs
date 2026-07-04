@@ -156,6 +156,7 @@ type ExternalPoolFormDraft = {
   priority: number
   maxConcurrentRequests: number
   usageProjectionMode: NonNullable<CreateExternalPoolRequest['usageProjectionMode']>
+  skipNonStreamUsageProjection: boolean
   autoDisablePolicy: NonNullable<CreateExternalPoolRequest['autoDisablePolicy']>
   normalizeModelVersionDots: boolean
   modelMappingMode: NonNullable<CreateExternalPoolRequest['modelMappingMode']>
@@ -173,6 +174,7 @@ const defaultPoolForm = (): ExternalPoolFormDraft => ({
   priority: 100,
   maxConcurrentRequests: 10,
   usageProjectionMode: 'pass_through',
+  skipNonStreamUsageProjection: false,
   autoDisablePolicy: 'inherit',
   normalizeModelVersionDots: false,
   modelMappingMode: DEFAULT_POOL_MODEL_MAPPING_MODE,
@@ -190,6 +192,7 @@ const poolFormFromPool = (pool: ExternalPool): ExternalPoolFormDraft => ({
   priority: pool.priority,
   maxConcurrentRequests: pool.maxConcurrentRequests,
   usageProjectionMode: pool.usageProjectionMode,
+  skipNonStreamUsageProjection: Boolean(pool.skipNonStreamUsageProjection),
   autoDisablePolicy: pool.autoDisablePolicy,
   normalizeModelVersionDots: Boolean(pool.normalizeModelVersionDots),
   modelMappingMode: pool.modelMappingMode || DEFAULT_POOL_MODEL_MAPPING_MODE,
@@ -758,6 +761,12 @@ function ExternalPoolFormDialog({
                   <option value="pass_through">严格透传：不改外部池 usage</option>
                   <option value="current_path_policy">按当前路径整形：重写 usage 并应用全局补偿</option>
                 </SelectBox>
+                <Toggle
+                  label="同步请求不整形"
+                  checked={Boolean(draft.skipNonStreamUsageProjection)}
+                  disabled={saving || draft.usageProjectionMode !== 'current_path_policy'}
+                  onChange={(skipNonStreamUsageProjection) => onDraftChange((prev) => ({ ...prev, skipNonStreamUsageProjection }))}
+                />
                 <HintBox>{usageProjectionDescription(draft.usageProjectionMode)}</HintBox>
               </div>
             </FormSection>
@@ -1237,6 +1246,9 @@ function poolUsageSummary(pool: ExternalPool, config: ExternalPoolsConfig) {
     return 'Usage: 严格透传'
   }
   const parts = ['Usage: 按路径整形']
+  if (pool.skipNonStreamUsageProjection) {
+    parts.push('同步原样')
+  }
   if (config.externalPoolUsageProjectionUpliftPercent > 0) {
     parts.push(`缓存 +${config.externalPoolUsageProjectionUpliftPercent}%`)
   }

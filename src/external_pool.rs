@@ -224,6 +224,8 @@ pub struct ExternalPool {
     pub priority: i32,
     pub max_concurrent_requests: u32,
     pub usage_projection_mode: ExternalPoolUsageProjectionMode,
+    #[serde(default)]
+    pub skip_non_stream_usage_projection: bool,
     pub auto_disable_policy: ExternalPoolAutoDisablePolicy,
     pub auto_disabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -277,6 +279,8 @@ pub struct CreateExternalPoolRequest {
     #[serde(default)]
     pub usage_projection_mode: ExternalPoolUsageProjectionMode,
     #[serde(default)]
+    pub skip_non_stream_usage_projection: bool,
+    #[serde(default)]
     pub auto_disable_policy: ExternalPoolAutoDisablePolicy,
     #[serde(default = "default_true")]
     pub preserve_path: bool,
@@ -311,6 +315,8 @@ pub struct UpdateExternalPoolRequest {
     pub max_concurrent_requests: Option<u32>,
     #[serde(default)]
     pub usage_projection_mode: Option<ExternalPoolUsageProjectionMode>,
+    #[serde(default)]
+    pub skip_non_stream_usage_projection: Option<bool>,
     #[serde(default)]
     pub auto_disable_policy: Option<ExternalPoolAutoDisablePolicy>,
     #[serde(default)]
@@ -4353,6 +4359,9 @@ fn build_external_usage_projection_context(
     if pool.usage_projection_mode != ExternalPoolUsageProjectionMode::CurrentPathPolicy {
         return None;
     }
+    if !route.payload.stream && pool.skip_non_stream_usage_projection {
+        return None;
+    }
 
     let model = route
         .upstream_model
@@ -4606,6 +4615,7 @@ mod tests {
             priority,
             max_concurrent_requests: 1,
             usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
+            skip_non_stream_usage_projection: false,
             auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
             preserve_path: true,
             normalize_model_version_dots: false,
@@ -5474,6 +5484,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
             priority: 10,
             max_concurrent_requests: 10,
             usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
+            skip_non_stream_usage_projection: false,
             auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
             auto_disabled: false,
             auto_disabled_reason: None,
@@ -6195,6 +6206,40 @@ data: {"type":"message_delta","note":"content_block_delta"}
                 .unwrap_or_default()
                 > 0
         );
+    }
+
+    #[test]
+    fn usage_projection_can_skip_non_stream_current_path_policy() {
+        let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
+        );
+        let route = test_route("claude-sonnet-4-5");
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+        pool.skip_non_stream_usage_projection = true;
+
+        let projection = projection_context(&route, &pool, 0);
+        assert!(projection.is_none());
+
+        let projected = maybe_project_non_stream_usage(body.clone(), projection.as_ref());
+        assert_eq!(projected.body, body);
+        assert!(!projected.usage_capture.projected);
+        assert_eq!(
+            projected.usage_capture.raw,
+            projected.usage_capture.reported
+        );
+    }
+
+    #[test]
+    fn usage_projection_skip_non_stream_keeps_stream_projection_enabled() {
+        let mut route = test_route("claude-sonnet-4-5");
+        route.payload.stream = true;
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+        pool.skip_non_stream_usage_projection = true;
+
+        let projection = projection_context(&route, &pool, 0);
+        assert!(projection.is_some());
     }
 
     #[test]

@@ -150,6 +150,12 @@ export function ExternalPoolFormModal({
                 <SelectItem value="pass_through">保持原样：不改外部账号用量</SelectItem>
                 <SelectItem value="current_path_policy">按入口规则展示：应用全局补偿</SelectItem>
               </SelectBox>
+              <ToggleRow
+                label="同步请求不整形"
+                checked={Boolean(draft.skipNonStreamUsageProjection)}
+                disabled={saving || draft.usageProjectionMode !== 'current_path_policy'}
+                onChange={(v) => set('skipNonStreamUsageProjection', v)}
+              />
               <HintBox>{usageProjectionDescription(draft.usageProjectionMode)}</HintBox>
             </div>
           </FormSection>

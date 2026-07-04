@@ -1184,6 +1184,7 @@ export interface ExternalPool {
   priority: number
   maxConcurrentRequests: number
   usageProjectionMode: ExternalPoolUsageProjectionMode
+  skipNonStreamUsageProjection: boolean
   autoDisablePolicy: ExternalPoolAutoDisablePolicy
   autoDisabled: boolean
   autoDisabledReason?: string
@@ -1226,6 +1227,7 @@ export interface CreateExternalPoolRequest {
   priority?: number
   maxConcurrentRequests?: number
   usageProjectionMode?: ExternalPoolUsageProjectionMode
+  skipNonStreamUsageProjection?: boolean
   autoDisablePolicy?: ExternalPoolAutoDisablePolicy
   preservePath?: boolean
   normalizeModelVersionDots?: boolean
@@ -1244,6 +1246,7 @@ export interface UpdateExternalPoolRequest {
   priority?: number
   maxConcurrentRequests?: number
   usageProjectionMode?: ExternalPoolUsageProjectionMode
+  skipNonStreamUsageProjection?: boolean
   autoDisablePolicy?: ExternalPoolAutoDisablePolicy
   preservePath?: boolean
   normalizeModelVersionDots?: boolean

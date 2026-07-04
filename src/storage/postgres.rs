@@ -372,7 +372,8 @@ impl PostgresStore {
         let rows = sqlx::query(
             r#"
             SELECT id, name, base_url, api_key, auth_type, enabled, priority,
-                   max_concurrent_requests, usage_projection_mode, auto_disable_policy,
+                   max_concurrent_requests, usage_projection_mode, skip_non_stream_usage_projection,
+                   auto_disable_policy,
                    auto_disabled, auto_disabled_reason, auto_disabled_at,
                    auto_disabled_until, auto_disabled_last_error, preserve_path,
                    normalize_model_version_dots, model_mapping_mode,
@@ -398,7 +399,8 @@ impl PostgresStore {
         let row = sqlx::query(
             r#"
             SELECT id, name, base_url, api_key, auth_type, enabled, priority,
-                   max_concurrent_requests, usage_projection_mode, auto_disable_policy,
+                   max_concurrent_requests, usage_projection_mode, skip_non_stream_usage_projection,
+                   auto_disable_policy,
                    auto_disabled, auto_disabled_reason, auto_disabled_at,
                    auto_disabled_until, auto_disabled_last_error, preserve_path,
                    normalize_model_version_dots, model_mapping_mode,
@@ -431,13 +433,15 @@ impl PostgresStore {
             r#"
             INSERT INTO external_upstream_pools (
                 name, base_url, api_key, auth_type, enabled, priority,
-                max_concurrent_requests, usage_projection_mode, auto_disable_policy,
+                max_concurrent_requests, usage_projection_mode, skip_non_stream_usage_projection,
+                auto_disable_policy,
                 preserve_path, normalize_model_version_dots, model_mapping_mode,
                 model_mapping_require_match, model_mapping_rules, notes, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, now())
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
-                      max_concurrent_requests, usage_projection_mode, auto_disable_policy,
+                      max_concurrent_requests, usage_projection_mode, skip_non_stream_usage_projection,
+                      auto_disable_policy,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
                       normalize_model_version_dots, model_mapping_mode,
@@ -453,6 +457,7 @@ impl PostgresStore {
         .bind(request.priority)
         .bind(request.max_concurrent_requests as i32)
         .bind(request.usage_projection_mode.as_str())
+        .bind(request.skip_non_stream_usage_projection)
         .bind(request.auto_disable_policy.as_str())
         .bind(request.preserve_path)
         .bind(request.normalize_model_version_dots)
@@ -494,6 +499,9 @@ impl PostgresStore {
         let usage_projection_mode = request
             .usage_projection_mode
             .unwrap_or(current.usage_projection_mode);
+        let skip_non_stream_usage_projection = request
+            .skip_non_stream_usage_projection
+            .unwrap_or(current.skip_non_stream_usage_projection);
         let auto_disable_policy = request
             .auto_disable_policy
             .unwrap_or(current.auto_disable_policy);
@@ -525,17 +533,19 @@ impl PostgresStore {
                 priority = $7,
                 max_concurrent_requests = $8,
                 usage_projection_mode = $9,
-                auto_disable_policy = $10,
-                preserve_path = $11,
-                normalize_model_version_dots = $12,
-                model_mapping_mode = $13,
-                model_mapping_require_match = $14,
-                model_mapping_rules = $15,
-                notes = $16,
+                skip_non_stream_usage_projection = $10,
+                auto_disable_policy = $11,
+                preserve_path = $12,
+                normalize_model_version_dots = $13,
+                model_mapping_mode = $14,
+                model_mapping_require_match = $15,
+                model_mapping_rules = $16,
+                notes = $17,
                 updated_at = now()
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
-                      max_concurrent_requests, usage_projection_mode, auto_disable_policy,
+                      max_concurrent_requests, usage_projection_mode, skip_non_stream_usage_projection,
+                      auto_disable_policy,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
                       normalize_model_version_dots, model_mapping_mode,
@@ -552,6 +562,7 @@ impl PostgresStore {
         .bind(priority)
         .bind(max_concurrent_requests as i32)
         .bind(usage_projection_mode.as_str())
+        .bind(skip_non_stream_usage_projection)
         .bind(auto_disable_policy.as_str())
         .bind(preserve_path)
         .bind(normalize_model_version_dots)
@@ -575,7 +586,8 @@ impl PostgresStore {
             SET enabled = $2, updated_at = now()
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
-                      max_concurrent_requests, usage_projection_mode, auto_disable_policy,
+                      max_concurrent_requests, usage_projection_mode, skip_non_stream_usage_projection,
+                      auto_disable_policy,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
                       normalize_model_version_dots, model_mapping_mode,
@@ -615,7 +627,8 @@ impl PostgresStore {
                 updated_at = now()
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
-                      max_concurrent_requests, usage_projection_mode, auto_disable_policy,
+                      max_concurrent_requests, usage_projection_mode, skip_non_stream_usage_projection,
+                      auto_disable_policy,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
                       normalize_model_version_dots, model_mapping_mode,
@@ -4414,6 +4427,9 @@ fn external_pool_from_row(row: PgRow, mask_secrets: bool) -> anyhow::Result<Exte
     let api_key: String = row.try_get("api_key")?;
     let auth_type: String = row.try_get("auth_type")?;
     let usage_projection_mode: String = row.try_get("usage_projection_mode")?;
+    let skip_non_stream_usage_projection: bool = row
+        .try_get("skip_non_stream_usage_projection")
+        .unwrap_or(false);
     let auto_disable_policy: String = row.try_get("auto_disable_policy")?;
     let max_concurrent_requests: i32 = row.try_get("max_concurrent_requests")?;
     let model_mapping_mode: String = row.try_get("model_mapping_mode")?;
@@ -4432,6 +4448,7 @@ fn external_pool_from_row(row: PgRow, mask_secrets: bool) -> anyhow::Result<Exte
         priority: row.try_get("priority")?,
         max_concurrent_requests: max_concurrent_requests.max(1) as u32,
         usage_projection_mode: ExternalPoolUsageProjectionMode::parse(&usage_projection_mode),
+        skip_non_stream_usage_projection,
         auto_disable_policy: ExternalPoolAutoDisablePolicy::parse(&auto_disable_policy),
         auto_disabled: row.try_get("auto_disabled")?,
         auto_disabled_reason: row.try_get("auto_disabled_reason")?,
@@ -4676,6 +4693,7 @@ CREATE TABLE IF NOT EXISTS external_upstream_pools (
     priority INTEGER NOT NULL DEFAULT 100,
     max_concurrent_requests INTEGER NOT NULL DEFAULT 10,
     usage_projection_mode TEXT NOT NULL DEFAULT 'pass_through',
+    skip_non_stream_usage_projection BOOLEAN NOT NULL DEFAULT false,
     auto_disable_policy TEXT NOT NULL DEFAULT 'inherit',
     auto_disabled BOOLEAN NOT NULL DEFAULT false,
     auto_disabled_reason TEXT,
@@ -4707,6 +4725,9 @@ ALTER TABLE external_upstream_pools
 
 ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS usage_projection_mode TEXT NOT NULL DEFAULT 'pass_through';
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS skip_non_stream_usage_projection BOOLEAN NOT NULL DEFAULT false;
 
 ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS auto_disable_policy TEXT NOT NULL DEFAULT 'inherit';

@@ -79,6 +79,7 @@ export type ExternalPoolFormDraft = {
   priority: number
   maxConcurrentRequests: number
   usageProjectionMode: NonNullable<CreateExternalPoolRequest['usageProjectionMode']>
+  skipNonStreamUsageProjection: boolean
   autoDisablePolicy: NonNullable<CreateExternalPoolRequest['autoDisablePolicy']>
   preservePath: boolean
   normalizeModelVersionDots: boolean
@@ -97,6 +98,7 @@ export const defaultPoolForm = (): ExternalPoolFormDraft => ({
   priority: 100,
   maxConcurrentRequests: 10,
   usageProjectionMode: 'pass_through',
+  skipNonStreamUsageProjection: false,
   autoDisablePolicy: 'inherit',
   preservePath: true,
   normalizeModelVersionDots: false,
@@ -115,6 +117,7 @@ export const poolFormFromPool = (pool: ExternalPool): ExternalPoolFormDraft => (
   priority: pool.priority,
   maxConcurrentRequests: pool.maxConcurrentRequests,
   usageProjectionMode: pool.usageProjectionMode,
+  skipNonStreamUsageProjection: Boolean(pool.skipNonStreamUsageProjection),
   autoDisablePolicy: pool.autoDisablePolicy,
   preservePath: pool.preservePath !== false,
   normalizeModelVersionDots: Boolean(pool.normalizeModelVersionDots),
@@ -188,6 +191,9 @@ export function poolUsageSummary(pool: ExternalPool, config: ExternalPoolsConfig
     return '用量：保持原样'
   }
   const parts = ['用量：按入口规则']
+  if (pool.skipNonStreamUsageProjection) {
+    parts.push('同步原样')
+  }
   if (config.externalPoolUsageProjectionUpliftPercent > 0) {
     parts.push(`缓存 +${config.externalPoolUsageProjectionUpliftPercent}%`)
   }
