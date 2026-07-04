@@ -15,7 +15,7 @@ import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { Button, Card, Checkbox, Input, Loading, Modal, Toggle } from 'react-daisyui'
 import { Badge, EmptyState, LoadingState, ModalShell, useConfirm } from '@/components/ui'
-import { formatApproxElapsedMs, formatCredits, formatFullDate, formatLastUsed, formatNumber, formatQuota, formatUsd } from '@/lib/format'
+import { formatApproxElapsedMs, formatCredits, formatFullDate, formatLastUsed, formatMeteringUsage, formatNumber, formatQuota, formatUsd } from '@/lib/format'
 import { extractErrorMessage } from '@/lib/utils'
 import {
   useClearInFlight,
@@ -780,6 +780,7 @@ export function CredentialCard({
                 detail={accountInfo ? `总额 ${formatCredits(accountInfo.creditLimit)}` : undefined}
               />
               <MetaItem label="估算成本" value={formatUsd(credential.estimatedCostUsd)} />
+              <MetaItem label="Kiro计量" value={formatMeteringUsage(credential.kiroMeteringUsage)} />
               {hasPricingCoverage && (
                 <MetaItem label="计价请求" value={pricedCoverageLabel(credential)} error={credential.unpricedRequests > 0} />
               )}

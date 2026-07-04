@@ -2424,7 +2424,12 @@ impl CredentialUsageContext {
                 .unwrap_or(self.request.input_tokens),
             usage.output_tokens,
         );
-        self.record_success_reported(reported_usage, usage_source, Some(raw_usage));
+        self.record_success_reported_with_metering(
+            reported_usage,
+            usage_source,
+            Some(raw_usage),
+            ctx.kiro_metering_usage(),
+        );
     }
 
     fn final_reported_usage_for_stream(
@@ -2449,6 +2454,7 @@ impl CredentialUsageContext {
         error_detail: Option<(String, String)>,
         metadata_usage: Option<&crate::kiro::model::events::MetadataTokenUsage>,
         context_input_tokens: Option<i32>,
+        kiro_metering_usage: Option<f64>,
     ) {
         let usage = usage.unwrap_or(super::cache::CacheUsage {
             total_input_tokens: self.request.input_tokens,
@@ -2493,6 +2499,7 @@ impl CredentialUsageContext {
             Some(error_message),
             Some(error_detail),
             public_error,
+            kiro_metering_usage,
         );
     }
 
@@ -2510,11 +2517,22 @@ impl CredentialUsageContext {
         self.record_success_reported(usage, usage_source, Some(raw_usage));
     }
 
+    #[cfg(test)]
     fn record_success_reported(
         &self,
         usage: super::cache::CacheUsage,
         usage_source: UsageSource,
         raw_usage: Option<super::cache::CacheUsage>,
+    ) {
+        self.record_success_reported_with_metering(usage, usage_source, raw_usage, None);
+    }
+
+    fn record_success_reported_with_metering(
+        &self,
+        usage: super::cache::CacheUsage,
+        usage_source: UsageSource,
+        raw_usage: Option<super::cache::CacheUsage>,
+        kiro_metering_usage: Option<f64>,
     ) {
         self.record(
             UsageRecordStatus::Success,
@@ -2525,6 +2543,7 @@ impl CredentialUsageContext {
             None,
             None,
             None,
+            kiro_metering_usage,
         );
 
         if usage_source != UsageSource::LocalPromptCache {
@@ -2593,6 +2612,7 @@ impl CredentialUsageContext {
             Some(error_message),
             Some(error_detail),
             public_error,
+            None,
         );
     }
 
@@ -2671,6 +2691,7 @@ impl CredentialUsageContext {
         error_message: Option<String>,
         error_detail: Option<String>,
         public_error: Option<UsagePublicError>,
+        kiro_metering_usage: Option<f64>,
     ) {
         let pricing = self.request.pricing_catalog.estimate(
             self.request
@@ -2751,6 +2772,9 @@ impl CredentialUsageContext {
             cache_creation_5m_input_tokens: usage.cache_creation_5m_input_tokens,
             cache_creation_1h_input_tokens: usage.cache_creation_1h_input_tokens,
             estimated_cost_usd: pricing.cost_usd,
+            kiro_metering_usage: kiro_metering_usage
+                .filter(|usage| usage.is_finite())
+                .unwrap_or(0.0),
             pricing_available: pricing.available,
             pricing_model: Some(pricing.model),
             duration_ms,
@@ -5661,6 +5685,7 @@ fn finish_stream_with_recorded_error(
         error_detail,
         ctx.metadata_usage(),
         ctx.context_input_tokens,
+        ctx.kiro_metering_usage(),
     );
     usage_guard.complete();
     final_events
@@ -5876,6 +5901,7 @@ fn create_sse_stream(
                                     error_detail,
                                     ctx.metadata_usage(),
                                     ctx.context_input_tokens,
+                                    ctx.kiro_metering_usage(),
                                 );
                             } else {
                                 usage_guard.context().record_success_from_stream(&ctx);
@@ -6407,6 +6433,7 @@ async fn handle_non_stream_request(
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
     let mut metadata_usage: Option<crate::kiro::model::events::MetadataTokenUsage> = None;
+    let mut kiro_metering_usage: Option<f64> = None;
     let mut native_thinking_content = String::new();
     let mut native_thinking_signature: Option<String> = None;
     let mut redacted_thinking: Option<String> = None;
@@ -6536,6 +6563,9 @@ async fn handle_non_stream_request(
                             }
                         }
                         Event::Metering(metering) => {
+                            if metering.usage.is_finite() {
+                                kiro_metering_usage = Some(metering.usage);
+                            }
                             tracing::debug!(usage = metering.usage, "非流式响应收到 meteringEvent");
                         }
                         Event::InvalidState(invalid) => {
@@ -6697,7 +6727,12 @@ async fn handle_non_stream_request(
         usage_source,
         raw_usage,
     );
-    credential_usage.record_success_reported(reported_usage, usage_source, Some(raw_usage));
+    credential_usage.record_success_reported_with_metering(
+        reported_usage,
+        usage_source,
+        Some(raw_usage),
+        kiro_metering_usage,
+    );
     completion.report_success();
 
     // 构建 Anthropic 响应

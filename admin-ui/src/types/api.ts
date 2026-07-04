@@ -174,6 +174,7 @@ export interface CredentialAccountInfoItem extends CredentialAccountInfo {
 export interface CredentialUsageSummaryItem {
   id: number
   estimatedCostUsd: number
+  kiroMeteringUsage: number
   pricedRequests: number
   unpricedRequests: number
 }
@@ -258,6 +259,7 @@ export interface CredentialStatusItem {
   schedulerSelectionPressure?: number
   schedulerScore?: number
   estimatedCostUsd: number
+  kiroMeteringUsage: number
   pricedRequests: number
   unpricedRequests: number
 }
@@ -672,6 +674,7 @@ export interface UsageRecord {
   cacheCreation5mInputTokens: number
   cacheCreation1hInputTokens: number
   estimatedCostUsd: number
+  kiroMeteringUsage: number
   pricingAvailable: boolean
   pricingModel?: string
   durationMs: number

@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react'
 import { cn } from '@/lib/utils'
-import { formatDate, formatNumber, formatUsd } from '@/lib/format'
+import { formatDate, formatMeteringUsage, formatNumber, formatUsd } from '@/lib/format'
 import type { ExternalPoolUsageSnapshot, UsageRecord } from '@/types/api'
 import { Badge } from '@/components/ui'
 import {
@@ -178,6 +178,7 @@ export function UsageDetailModal({
           <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3">
             <MetricTile label="用量来源" value={sourceLabel(record.usageSource)} />
             <MetricTile label="估算费用" value={formatUsd(record.estimatedCostUsd)} tone={record.estimatedCostUsd > 0 ? 'warning' : 'default'} />
+            <MetricTile label="Kiro计量" value={formatMeteringUsage(record.kiroMeteringUsage)} />
             <MetricTile label="有定价" value={record.pricingAvailable ? `是（${record.pricingModel || 'priced'}）` : '否'} />
           </div>
         </div>

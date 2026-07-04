@@ -45,6 +45,14 @@ function formatNumber(value: number): string {
   return new Intl.NumberFormat('zh-CN').format(value)
 }
 
+function formatMeteringUsage(value: number | undefined | null): string {
+  if (!Number.isFinite(value ?? Number.NaN)) return '-'
+  const num = value as number
+  return new Intl.NumberFormat('zh-CN', {
+    maximumFractionDigits: num >= 1 ? 3 : 6,
+  }).format(num)
+}
+
 function formatLatency(value?: number): string {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '-'
   if (value < 1000) return `${formatNumber(Math.round(value))}ms`
@@ -792,6 +800,9 @@ export function UsageRecordsPanel() {
                         >
                           {formatUsd(record.estimatedCostUsd || 0)}
                         </button>
+                        <div className="text-xs text-muted-foreground">
+                          Kiro {formatMeteringUsage(record.kiroMeteringUsage || 0)}
+                        </div>
                       </td>
                       <td className="px-3 py-2 text-right">
                         <div className="flex items-center justify-end gap-2">
@@ -922,6 +933,10 @@ export function UsageRecordsPanel() {
                         : 'unpriced'}
                     </span>
                   </div>
+                </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">Kiro计量</div>
+                  <div>{formatMeteringUsage(selectedRecord.kiroMeteringUsage || 0)}</div>
                 </div>
                 <div>
                   <div className="text-xs text-muted-foreground">首字 token</div>

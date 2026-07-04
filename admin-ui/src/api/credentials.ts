@@ -123,6 +123,7 @@ function credentialListItemToStatus(item: CredentialListItem): CredentialStatusI
     schedulerSelectionPressure: 0,
     schedulerScore: 0,
     estimatedCostUsd: 0,
+    kiroMeteringUsage: 0,
     pricedRequests: 0,
     unpricedRequests: 0,
   }

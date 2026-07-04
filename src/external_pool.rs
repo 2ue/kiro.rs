@@ -2477,6 +2477,7 @@ impl ExternalPoolManager {
             cache_creation_5m_input_tokens,
             cache_creation_1h_input_tokens,
             estimated_cost_usd,
+            kiro_metering_usage: 0.0,
             pricing_available,
             pricing_model,
             duration_ms,

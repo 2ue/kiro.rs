@@ -186,6 +186,7 @@ pub struct CredentialUsageSummaryResponse {
 pub struct CredentialUsageSummaryItem {
     pub id: u64,
     pub estimated_cost_usd: f64,
+    pub kiro_metering_usage: f64,
     pub priced_requests: usize,
     pub unpriced_requests: usize,
 }
@@ -453,6 +454,8 @@ pub struct CredentialStatusItem {
     pub scheduler_score: f64,
     /// 该凭据已记录的估算费用（USD）。
     pub estimated_cost_usd: f64,
+    /// Kiro 上游 meteringEvent 累计上报的积分用量，仅用于和上游核对。
+    pub kiro_metering_usage: f64,
     /// 有价格表命中的请求数。
     pub priced_requests: usize,
     /// 无价格表命中的请求数。

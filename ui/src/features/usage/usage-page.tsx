@@ -24,7 +24,7 @@ import {
   useRefreshUsageQueriesAfterCleanup,
 } from '@/hooks/use-usage'
 import { getExternalPools } from '@/api/credentials'
-import { formatDate, formatCompact, formatNumber, formatPercent, formatUsd, ratio } from '@/lib/format'
+import { formatDate, formatCompact, formatMeteringUsage, formatNumber, formatPercent, formatUsd, ratio } from '@/lib/format'
 import { extractErrorMessage } from '@/lib/utils'
 import type { UsageRecord, UsageRecordStatus, UsageRecordsPageQuery, UsageSource, UsageSeriesPoint } from '@/types/api'
 import {
@@ -481,6 +481,9 @@ function RecordsView({
                           </Button>
                           <div className="text-[0.62rem] text-muted-foreground/60">
                             {record.pricingAvailable ? record.pricingModel || '已计价' : '未计价'}
+                          </div>
+                          <div className="text-[0.62rem] text-muted-foreground/60">
+                            Kiro {formatMeteringUsage(record.kiroMeteringUsage)}
                           </div>
                         </TableCell>
                         {/* 耗时 */}

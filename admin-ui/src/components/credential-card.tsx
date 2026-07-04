@@ -96,6 +96,13 @@ function formatUsd(value: number): string {
   }).format(value)
 }
 
+function formatMeteringUsage(value: number): string {
+  if (!Number.isFinite(value)) return '-'
+  return new Intl.NumberFormat('zh-CN', {
+    maximumFractionDigits: value >= 1 ? 3 : 6,
+  }).format(value)
+}
+
 function formatQuota(value: number): string {
   if (!Number.isFinite(value)) return '-'
   return new Intl.NumberFormat('zh-CN', {
@@ -806,6 +813,10 @@ export function CredentialCard({
             <div>
               <span className="text-muted-foreground">本地估算成本：</span>
               <span className="font-medium">{formatUsd(credential.estimatedCostUsd || 0)}</span>
+            </div>
+            <div>
+              <span className="text-muted-foreground">Kiro计量：</span>
+              <span className="font-medium">{formatMeteringUsage(credential.kiroMeteringUsage || 0)}</span>
             </div>
             {(credential.pricedRequests > 0 || credential.unpricedRequests > 0) && (
               <div>

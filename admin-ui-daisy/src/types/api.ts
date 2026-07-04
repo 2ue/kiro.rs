@@ -140,6 +140,7 @@ export interface CredentialStatusItem {
   schedulerSelectionPressure?: number
   schedulerScore?: number
   estimatedCostUsd: number
+  kiroMeteringUsage: number
   pricedRequests: number
   unpricedRequests: number
 }
@@ -236,7 +237,7 @@ export interface CredentialAccountInfoListResponse {
 
 export type CredentialUsageSummaryItem = Pick<
   CredentialStatusItem,
-  'id' | 'estimatedCostUsd' | 'pricedRequests' | 'unpricedRequests'
+  'id' | 'estimatedCostUsd' | 'kiroMeteringUsage' | 'pricedRequests' | 'unpricedRequests'
 >
 
 export interface CredentialUsageSummaryResponse {
@@ -661,6 +662,7 @@ export interface UsageRecord {
   cacheCreation5mInputTokens: number
   cacheCreation1hInputTokens: number
   estimatedCostUsd: number
+  kiroMeteringUsage: number
   pricingAvailable: boolean
   pricingModel?: string
   durationMs: number

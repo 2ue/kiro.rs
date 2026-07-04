@@ -33,6 +33,7 @@ import {
   formatCredits,
   formatFullDate,
   formatLastUsed,
+  formatMeteringUsage,
   formatNumber,
   formatQuota,
   formatUsd,
@@ -605,6 +606,7 @@ export function CredentialCard({
                 detail={accountInfo ? `总额 ${formatCredits(accountInfo.creditLimit)}` : undefined}
               />
               <MetaItem label="估算成本" value={formatUsd(credential.estimatedCostUsd)} />
+              <MetaItem label="Kiro计量" value={formatMeteringUsage(credential.kiroMeteringUsage)} />
             </div>
           </div>
 

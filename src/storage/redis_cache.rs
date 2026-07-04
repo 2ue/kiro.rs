@@ -3966,7 +3966,7 @@ fn push_dashboard_bucket_suffix(
 }
 
 fn usage_hash_field_is_float(key: &str) -> bool {
-    key.ends_with("_usd")
+    key.ends_with("_usd") || key == "kiro_metering_usage"
 }
 
 fn usage_ratio(part: usize, total: usize) -> f64 {
@@ -4136,6 +4136,7 @@ fn usage_record_matches_search(record: &UsageRecord, q: &str) -> bool {
     let credential_id = record.credential_id.map(|id| id.to_string());
     let external_pool_id = record.external_pool_id.map(|id| id.to_string());
     let estimated_cost = record.estimated_cost_usd.to_string();
+    let kiro_metering_usage = record.kiro_metering_usage.to_string();
 
     [
         Some(record.id.as_str()),
@@ -4157,6 +4158,7 @@ fn usage_record_matches_search(record: &UsageRecord, q: &str) -> bool {
         record.error_detail.as_deref(),
         record.pricing_model.as_deref(),
         Some(estimated_cost.as_str()),
+        Some(kiro_metering_usage.as_str()),
         credential_id.as_deref(),
     ]
     .into_iter()
@@ -4376,6 +4378,7 @@ mod tests {
             cache_creation_5m_input_tokens: 5,
             cache_creation_1h_input_tokens: 0,
             estimated_cost_usd,
+            kiro_metering_usage: 0.0,
             pricing_available: status == UsageRecordStatus::Success,
             pricing_model: Some("claude-sonnet-4-5".to_string()),
             duration_ms,

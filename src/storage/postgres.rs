@@ -3081,6 +3081,7 @@ impl PostgresUsageStore {
             SELECT
                 credential_id,
                 estimated_cost_usd,
+                kiro_metering_usage,
                 priced_requests,
                 unpriced_requests
             FROM usage_credential_cost_summary
@@ -3097,6 +3098,7 @@ impl PostgresUsageStore {
                 credential_id as u64,
                 CredentialCostSummary {
                     estimated_cost_usd: row.try_get("estimated_cost_usd")?,
+                    kiro_metering_usage: row.try_get("kiro_metering_usage")?,
                     priced_requests: row_i64_to_usize(&row, "priced_requests")?,
                     unpriced_requests: row_i64_to_usize(&row, "unpriced_requests")?,
                 },
@@ -3118,6 +3120,7 @@ impl PostgresUsageStore {
             SELECT
                 credential_id,
                 estimated_cost_usd,
+                kiro_metering_usage,
                 priced_requests,
                 unpriced_requests
             FROM usage_credential_cost_summary
@@ -3135,6 +3138,7 @@ impl PostgresUsageStore {
                 credential_id as u64,
                 CredentialCostSummary {
                     estimated_cost_usd: row.try_get("estimated_cost_usd")?,
+                    kiro_metering_usage: row.try_get("kiro_metering_usage")?,
                     priced_requests: row_i64_to_usize(&row, "priced_requests")?,
                     unpriced_requests: row_i64_to_usize(&row, "unpriced_requests")?,
                 },
@@ -3231,14 +3235,14 @@ async fn upsert_usage_record_in_tx(
             credential_label, status, usage_source, total_input_tokens, compat_input_tokens,
             billable_input_tokens, output_tokens, cache_read_input_tokens,
             cache_creation_input_tokens, cache_creation_5m_input_tokens,
-            cache_creation_1h_input_tokens, estimated_cost_usd, pricing_available,
-            pricing_model, duration_ms, simulated, sticky_bound, fallback_from_sticky,
+            cache_creation_1h_input_tokens, estimated_cost_usd, kiro_metering_usage,
+            pricing_available, pricing_model, duration_ms, simulated, sticky_bound, fallback_from_sticky,
             error_type, error_message, error_detail, data
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
             $11, $12, $13, $14, $15, $16, $17, $18,
-            $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29
+            $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30
         )
         ON CONFLICT (id) DO UPDATE
         SET created_at = EXCLUDED.created_at,
@@ -3259,6 +3263,7 @@ async fn upsert_usage_record_in_tx(
             cache_creation_5m_input_tokens = EXCLUDED.cache_creation_5m_input_tokens,
             cache_creation_1h_input_tokens = EXCLUDED.cache_creation_1h_input_tokens,
             estimated_cost_usd = EXCLUDED.estimated_cost_usd,
+            kiro_metering_usage = EXCLUDED.kiro_metering_usage,
             pricing_available = EXCLUDED.pricing_available,
             pricing_model = EXCLUDED.pricing_model,
             duration_ms = EXCLUDED.duration_ms,
@@ -3292,6 +3297,7 @@ async fn upsert_usage_record_in_tx(
     .bind(record.cache_creation_5m_input_tokens)
     .bind(record.cache_creation_1h_input_tokens)
     .bind(record.estimated_cost_usd)
+    .bind(record.kiro_metering_usage)
     .bind(record.pricing_available)
     .bind(&record.pricing_model)
     .bind(record.duration_ms as i64)
@@ -3504,6 +3510,7 @@ impl UsageRollupAggregate {
 struct CredentialUsageSummaryDelta {
     requests: i64,
     estimated_cost_usd: f64,
+    kiro_metering_usage: f64,
     priced_requests: i64,
     unpriced_requests: i64,
 }
@@ -3552,6 +3559,7 @@ impl UsageRollupBatchDelta {
             let summary = self.credential_summaries.entry(credential_id).or_default();
             summary.requests += direction;
             summary.estimated_cost_usd += record.estimated_cost_usd * direction as f64;
+            summary.kiro_metering_usage += record.kiro_metering_usage * direction as f64;
             summary.priced_requests += signed_bool(record.pricing_available, direction);
             summary.unpriced_requests += signed_bool(!record.pricing_available, direction);
         }
@@ -4006,13 +4014,14 @@ async fn upsert_credential_usage_summary_delta(
     sqlx::query(
         r#"
         INSERT INTO usage_credential_cost_summary (
-            credential_id, requests, estimated_cost_usd, priced_requests,
-            unpriced_requests, updated_at
+            credential_id, requests, estimated_cost_usd, kiro_metering_usage,
+            priced_requests, unpriced_requests, updated_at
         )
-        VALUES ($1, $2, $3, $4, $5, now())
+        VALUES ($1, $2, $3, $4, $5, $6, now())
         ON CONFLICT (credential_id) DO UPDATE
         SET requests = usage_credential_cost_summary.requests + EXCLUDED.requests,
             estimated_cost_usd = usage_credential_cost_summary.estimated_cost_usd + EXCLUDED.estimated_cost_usd,
+            kiro_metering_usage = usage_credential_cost_summary.kiro_metering_usage + EXCLUDED.kiro_metering_usage,
             priced_requests = usage_credential_cost_summary.priced_requests + EXCLUDED.priced_requests,
             unpriced_requests = usage_credential_cost_summary.unpriced_requests + EXCLUDED.unpriced_requests,
             updated_at = now()
@@ -4021,6 +4030,7 @@ async fn upsert_credential_usage_summary_delta(
     .bind(credential_id as i64)
     .bind(delta.requests)
     .bind(delta.estimated_cost_usd)
+    .bind(delta.kiro_metering_usage)
     .bind(delta.priced_requests)
     .bind(delta.unpriced_requests)
     .execute(&mut **tx)
@@ -4139,6 +4149,7 @@ fn push_usage_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &UsageRec
             "data->>'externalPoolId'",
             "data->>'externalPoolName'",
             "estimated_cost_usd::text",
+            "kiro_metering_usage::text",
             "data::text",
         ];
         for (index, field) in fields.iter().enumerate() {
@@ -4815,6 +4826,7 @@ CREATE TABLE IF NOT EXISTS usage_records (
     cache_creation_5m_input_tokens INTEGER NOT NULL,
     cache_creation_1h_input_tokens INTEGER NOT NULL,
     estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
     pricing_available BOOLEAN NOT NULL DEFAULT false,
     pricing_model TEXT,
     duration_ms BIGINT NOT NULL DEFAULT 0,
@@ -4830,7 +4842,8 @@ CREATE TABLE IF NOT EXISTS usage_records (
 );
 
 ALTER TABLE usage_records
-    ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+    ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS idx_usage_records_created_at ON usage_records (created_at DESC) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_usage_records_credential_created ON usage_records (credential_id, created_at DESC) WHERE deleted_at IS NULL;
@@ -5013,6 +5026,7 @@ CREATE TABLE IF NOT EXISTS usage_credential_cost_summary (
     credential_id BIGINT NOT NULL PRIMARY KEY,
     requests BIGINT NOT NULL DEFAULT 0,
     estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+    kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0,
     priced_requests BIGINT NOT NULL DEFAULT 0,
     unpriced_requests BIGINT NOT NULL DEFAULT 0,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -5020,6 +5034,9 @@ CREATE TABLE IF NOT EXISTS usage_credential_cost_summary (
 
 CREATE INDEX IF NOT EXISTS idx_usage_credential_cost_summary_cost
     ON usage_credential_cost_summary (estimated_cost_usd DESC, requests DESC);
+
+ALTER TABLE usage_credential_cost_summary
+    ADD COLUMN IF NOT EXISTS kiro_metering_usage DOUBLE PRECISION NOT NULL DEFAULT 0;
 
 INSERT INTO usage_rollup_totals (
     dimension, dimension_key, dimension_label, requests, success_requests, error_requests,
@@ -5250,12 +5267,13 @@ GROUP BY date_trunc('hour', created_at), LEAST(GREATEST(duration_ms, 0), 2147483
 ON CONFLICT (bucket_start, duration_ms) DO NOTHING;
 
 INSERT INTO usage_credential_cost_summary (
-    credential_id, requests, estimated_cost_usd, priced_requests, unpriced_requests
+    credential_id, requests, estimated_cost_usd, kiro_metering_usage, priced_requests, unpriced_requests
 )
 SELECT
     credential_id,
     COUNT(*)::bigint,
     COALESCE(SUM(estimated_cost_usd), 0)::double precision,
+    COALESCE(SUM(kiro_metering_usage), 0)::double precision,
     COUNT(*) FILTER (WHERE pricing_available)::bigint,
     COUNT(*) FILTER (WHERE NOT pricing_available)::bigint
 FROM usage_records
@@ -5533,6 +5551,7 @@ mod tests {
             cache_creation_5m_input_tokens: 5,
             cache_creation_1h_input_tokens: 0,
             estimated_cost_usd: 0.001,
+            kiro_metering_usage: 0.0,
             pricing_available: true,
             pricing_model: Some("claude-sonnet-4-5".to_string()),
             duration_ms: 30,
@@ -5851,6 +5870,7 @@ mod tests {
             cache_creation_5m_input_tokens: reported_usage.cache_creation_5m_input_tokens,
             cache_creation_1h_input_tokens: reported_usage.cache_creation_1h_input_tokens,
             estimated_cost_usd: uplifted_cost_usd,
+            kiro_metering_usage: 0.0,
             pricing_available: true,
             pricing_model: Some("claude-sonnet-4-5".to_string()),
             duration_ms: 50,
@@ -6071,15 +6091,15 @@ mod tests {
         assert_eq!(loaded_runtime_state.warmup_remaining, 4);
 
         let usage_store = PostgresUsageStore::new(Arc::new(store.clone()));
-        usage_store
-            .record(usage_record("usage-1", 10))
-            .await
-            .unwrap();
+        let mut usage_1 = usage_record("usage-1", 10);
+        usage_1.kiro_metering_usage = 0.125;
+        usage_store.record(usage_1).await.unwrap();
         let mut usage_2 = usage_record("usage-2", 20);
         usage_2.status = UsageRecordStatus::Error;
         usage_2.model = "claude-opus-4-5".to_string();
         usage_2.conversation_id = Some("session-b".to_string());
         usage_2.estimated_cost_usd = 0.0;
+        usage_2.kiro_metering_usage = 0.375;
         usage_2.pricing_available = false;
         usage_2.pricing_model = None;
         usage_2.error_message = Some("upstream quota exceeded".to_string());
@@ -6156,6 +6176,7 @@ mod tests {
         assert_eq!(cost_summary.priced_requests, 1);
         assert_eq!(cost_summary.unpriced_requests, 1);
         assert!((cost_summary.estimated_cost_usd - 0.001).abs() < f64::EPSILON);
+        assert!((cost_summary.kiro_metering_usage - 0.5).abs() < f64::EPSILON);
 
         usage_store.clear().await.unwrap();
         let cleared_summary = usage_store.summary(15).await.unwrap();

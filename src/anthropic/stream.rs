@@ -1328,6 +1328,8 @@ pub struct StreamContext {
     final_usage: Option<super::cache::CacheUsage>,
     /// 最近一次最终下游上报 usage，用于请求级记录。
     final_reported_usage: Option<super::cache::CacheUsage>,
+    /// Kiro 上游 meteringEvent 返回的本次请求积分用量。
+    kiro_metering_usage: Option<f64>,
     /// stray token 复读熔断：最近一行。
     repeat_guard_last_line: String,
     /// stray token 复读熔断：连续次数。
@@ -1450,6 +1452,7 @@ impl StreamContext {
             reported_cache_usage_policy: None,
             final_usage: None,
             final_reported_usage: None,
+            kiro_metering_usage: None,
             repeat_guard_last_line: String::new(),
             repeat_guard_run: 0,
             repeat_guard_tripped: false,
@@ -1682,6 +1685,9 @@ impl StreamContext {
                 Vec::new()
             }
             Event::Metering(metering) => {
+                if metering.usage.is_finite() {
+                    self.kiro_metering_usage = Some(metering.usage);
+                }
                 tracing::debug!(usage = metering.usage, "收到 meteringEvent");
                 Vec::new()
             }
@@ -1743,6 +1749,10 @@ impl StreamContext {
 
     pub fn metadata_usage(&self) -> Option<&MetadataTokenUsage> {
         self.metadata_usage.as_ref()
+    }
+
+    pub fn kiro_metering_usage(&self) -> Option<f64> {
+        self.kiro_metering_usage
     }
 
     pub fn context_input_tokens_seen(&self) -> bool {
@@ -2918,6 +2928,28 @@ mod tests {
             .expect("message_delta should exist");
         assert_eq!(message_delta.data["usage"]["input_tokens"], 100);
         assert_eq!(message_delta.data["usage"]["output_tokens"], 9);
+    }
+
+    #[test]
+    fn test_metering_event_is_recorded_but_not_emitted_downstream() {
+        use crate::kiro::model::events::MeteringEvent;
+
+        let mut ctx = StreamContext::new_with_thinking("test-model", 12, false, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let sse_events = ctx.process_kiro_event(&Event::Metering(MeteringEvent { usage: 1.25 }));
+        assert!(sse_events.is_empty());
+        assert_eq!(ctx.kiro_metering_usage(), Some(1.25));
+
+        let final_events = ctx.generate_final_events();
+        assert!(
+            final_events
+                .iter()
+                .all(|event| !serde_json::to_string(&event.data)
+                    .expect("event data serializes")
+                    .contains("kiroMeteringUsage")),
+            "Kiro metering is a system usage field and must not be emitted downstream"
+        );
     }
 
     #[test]

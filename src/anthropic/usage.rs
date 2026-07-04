@@ -287,6 +287,8 @@ pub struct UsageRecord {
     #[serde(default)]
     pub estimated_cost_usd: f64,
     #[serde(default)]
+    pub kiro_metering_usage: f64,
+    #[serde(default)]
     pub pricing_available: bool,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1113,6 +1115,7 @@ fn ensure_metadata_object_flags(
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CredentialCostSummary {
     pub estimated_cost_usd: f64,
+    pub kiro_metering_usage: f64,
     pub priced_requests: usize,
     pub unpriced_requests: usize,
 }
@@ -1812,6 +1815,7 @@ impl UsageRecorder {
             };
             let entry = summaries.entry(credential_id).or_default();
             entry.estimated_cost_usd += record.estimated_cost_usd;
+            entry.kiro_metering_usage += record.kiro_metering_usage;
             if record.pricing_available {
                 entry.priced_requests += 1;
             } else {
@@ -1836,6 +1840,7 @@ impl UsageRecorder {
             }
             let entry = summaries.entry(credential_id).or_default();
             entry.estimated_cost_usd += record.estimated_cost_usd;
+            entry.kiro_metering_usage += record.kiro_metering_usage;
             if record.pricing_available {
                 entry.priced_requests += 1;
             } else {
@@ -2058,6 +2063,7 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
     let credential_id = record.credential_id.map(|id| id.to_string());
     let external_pool_id = record.external_pool_id.map(|id| id.to_string());
     let estimated_cost = record.estimated_cost_usd.to_string();
+    let kiro_metering_usage = record.kiro_metering_usage.to_string();
     let attempt_chain = summarize_attempts(&record.credential_attempts);
 
     [
@@ -2080,6 +2086,7 @@ fn record_matches_search(record: &UsageRecord, q: &str) -> bool {
         record.error_detail.as_deref(),
         record.pricing_model.as_deref(),
         Some(estimated_cost.as_str()),
+        Some(kiro_metering_usage.as_str()),
         Some(attempt_chain.as_str()),
         credential_id.as_deref(),
     ]
@@ -2165,6 +2172,7 @@ mod tests {
             cache_creation_5m_input_tokens: 5,
             cache_creation_1h_input_tokens: 0,
             estimated_cost_usd: 0.001,
+            kiro_metering_usage: 0.0,
             pricing_available: true,
             pricing_model: Some("claude-sonnet-4-5".to_string()),
             duration_ms: 10,
@@ -2203,6 +2211,28 @@ mod tests {
 
     fn record(id: &str, cache_read: i32, source: UsageSource) -> UsageRecord {
         record_with_time(id, cache_read, source, Utc::now().to_rfc3339())
+    }
+
+    #[test]
+    fn credential_cost_summary_includes_kiro_metering_usage() {
+        let recorder = UsageRecorder::new(10);
+        let mut first = record("metering-1", 0, UsageSource::ContextEstimate);
+        first.credential_id = Some(7);
+        first.kiro_metering_usage = 0.125;
+        let mut second = record("metering-2", 0, UsageSource::UpstreamMetadata);
+        second.credential_id = Some(7);
+        second.kiro_metering_usage = 0.375;
+
+        recorder.record(first);
+        recorder.record(second);
+
+        let all = recorder.credential_cost_summary();
+        let summary = all.get(&7).expect("credential summary");
+        assert!((summary.kiro_metering_usage - 0.5).abs() < f64::EPSILON);
+
+        let by_id = recorder.credential_cost_summary_for_ids(&[7]);
+        let summary = by_id.get(&7).expect("credential summary by id");
+        assert!((summary.kiro_metering_usage - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -2523,6 +2553,32 @@ mod tests {
         assert_eq!(summary.realtime.total_tpm, 220.0);
         assert_eq!(summary.realtime.billable_tpm, 120.0);
         assert_eq!(summary.top_credentials[0].key, "1");
+    }
+
+    #[test]
+    fn credential_cost_summary_aggregates_kiro_metering_usage() {
+        let recorder = UsageRecorder::new(10);
+        let mut first = record("1", 5, UsageSource::UpstreamMetadata);
+        first.credential_id = Some(7);
+        first.estimated_cost_usd = 0.25;
+        first.kiro_metering_usage = 1.5;
+        first.pricing_available = true;
+        recorder.record(first);
+
+        let mut second = record("2", 5, UsageSource::UpstreamMetadata);
+        second.credential_id = Some(7);
+        second.estimated_cost_usd = 0.75;
+        second.kiro_metering_usage = 2.25;
+        second.pricing_available = false;
+        recorder.record(second);
+
+        let summary = recorder.credential_cost_summary_for_ids(&[7]);
+        let credential = summary.get(&7).expect("credential summary");
+
+        assert_eq!(credential.estimated_cost_usd, 1.0);
+        assert_eq!(credential.kiro_metering_usage, 3.75);
+        assert_eq!(credential.priced_requests, 1);
+        assert_eq!(credential.unpriced_requests, 1);
     }
 
     #[test]

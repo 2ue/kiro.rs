@@ -1430,6 +1430,7 @@ impl AdminService {
                     summaries.get(id).map(|summary| CredentialUsageSummaryItem {
                         id: *id,
                         estimated_cost_usd: summary.estimated_cost_usd,
+                        kiro_metering_usage: summary.kiro_metering_usage,
                         priced_requests: summary.priced_requests,
                         unpriced_requests: summary.unpriced_requests,
                     })
@@ -1555,6 +1556,7 @@ impl AdminService {
                 );
                 item.account_info = info;
                 item.estimated_cost_usd = cost.estimated_cost_usd;
+                item.kiro_metering_usage = cost.kiro_metering_usage;
                 item.priced_requests = cost.priced_requests;
                 item.unpriced_requests = cost.unpriced_requests;
                 item
@@ -4816,6 +4818,7 @@ fn credential_status_item_from_snapshot(
         scheduler_selection_pressure: entry.scheduler_selection_pressure,
         scheduler_score: entry.scheduler_score,
         estimated_cost_usd: 0.0,
+        kiro_metering_usage: 0.0,
         priced_requests: 0,
         unpriced_requests: 0,
     }
@@ -6082,6 +6085,7 @@ mod tests {
             scheduler_selection_pressure: 0.0,
             scheduler_score: 0.0,
             estimated_cost_usd,
+            kiro_metering_usage: 0.0,
             priced_requests: 0,
             unpriced_requests: 0,
         }

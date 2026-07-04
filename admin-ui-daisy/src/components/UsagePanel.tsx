@@ -4,7 +4,7 @@ import { useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Button, Card, Input, Table } from 'react-daisyui'
 import { Badge, EmptyState, ErrorState, LoadingState, ModalShell, SectionCard, Select, StatCard, useConfirm } from '@/components/common'
-import { formatDate, formatNumber, formatPercent, formatUsd, ratio } from '@/lib/format'
+import { formatDate, formatMeteringUsage, formatNumber, formatPercent, formatUsd, ratio } from '@/lib/format'
 import { extractErrorMessage } from '@/lib/utils'
 import { getExternalPools } from '@/api/credentials'
 import { useAutoRefreshPreference } from '@/hooks/use-auto-refresh'
@@ -490,6 +490,9 @@ export function UsagePanel() {
                         >
                           {formatUsd(record.estimatedCostUsd || 0)}
                         </button>
+                        <div className="text-xs text-base-content/55">
+                          Kiro {formatMeteringUsage(record.kiroMeteringUsage)}
+                        </div>
                       </span>
                       <span>
                         <div className="font-semibold">{formatLatency(record.durationMs)}</div>
@@ -918,6 +921,7 @@ function UsageBillingModal({ record, onClose }: { record: UsageRecord | null; on
             <Detail label="计价模型" value={record.pricingAvailable ? record.pricingModel || 'priced' : 'unpriced'} />
             <Detail label="计费状态" value={record.pricingAvailable ? '已计价' : '未计价'} />
             <Detail label="估算费用" value={formatUsd(record.estimatedCostUsd || 0)} />
+            <Detail label="Kiro计量" value={formatMeteringUsage(record.kiroMeteringUsage)} />
             <Detail label="耗时 / 首字" value={`${formatLatency(record.durationMs)} / ${formatLatency(record.firstTokenLatencyMs)}`} />
           </div>
 
@@ -999,6 +1003,7 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
             )}
             <Detail label="状态" value={statusLabel(record.status)} />
             <Detail label="估算费用" value={`${formatUsd(record.estimatedCostUsd || 0)} ${record.pricingAvailable ? record.pricingModel || 'priced' : 'unpriced'}`} />
+            <Detail label="Kiro计量" value={formatMeteringUsage(record.kiroMeteringUsage)} />
             <Detail
               label="首字 token"
               value={formatLatency(record.firstTokenLatencyMs)}

@@ -49,6 +49,14 @@ export function formatCredits(value: number | undefined | null): string {
   }).format(value as number)
 }
 
+export function formatMeteringUsage(value: number | undefined | null): string {
+  if (!Number.isFinite(value ?? Number.NaN)) return '-'
+  const num = value as number
+  return new Intl.NumberFormat('zh-CN', {
+    maximumFractionDigits: num >= 1 ? 3 : 6,
+  }).format(num)
+}
+
 export function formatPricePerMillion(value: number): string {
   if (!Number.isFinite(value)) return '-'
   return `$${(value * 1_000_000).toFixed(2)}/M`
