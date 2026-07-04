@@ -17,9 +17,20 @@ function stringField(value: unknown): string | undefined {
 }
 
 function stringLikeField(value: unknown): string | undefined {
-  if (typeof value === 'string' && value.trim()) return value.trim()
-  if (typeof value === 'number' && Number.isFinite(value)) return String(Math.trunc(value))
+  if (typeof value === 'string' && value.trim()) {
+    const trimmed = value.trim()
+    if (/^\d+(\.\d+)?$/.test(trimmed)) return timestampToIsoString(Number(trimmed))
+    return trimmed
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) return timestampToIsoString(value)
   return undefined
+}
+
+function timestampToIsoString(value: number): string | undefined {
+  if (!Number.isFinite(value)) return undefined
+  const millis = value > 10_000_000_000 ? value : value * 1000
+  const date = new Date(millis)
+  return Number.isFinite(date.getTime()) ? date.toISOString() : undefined
 }
 
 function numberField(value: unknown): number | undefined {
