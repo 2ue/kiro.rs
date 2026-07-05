@@ -1085,7 +1085,6 @@ fn build_external_fallback_context(
 impl ExternalFallbackContext {
     fn refresh_payload(&mut self, payload: &MessagesRequest) {
         self.payload = payload.clone();
-        self.raw_body = serialize_messages_request_body(payload);
     }
 
     async fn should_fail_fast_local(&self) -> bool {
@@ -1301,7 +1300,7 @@ impl ExternalFallbackContext {
             headers: self.headers.clone(),
             endpoint: self.endpoint.clone(),
             payload: Some(guarded_payload.payload),
-            body_mode_filter: Some(ExternalPoolRequestBodyMode::Normalized),
+            body_mode_filter: None,
             model_hint: None,
             stream_hint: None,
             request_input_tokens,

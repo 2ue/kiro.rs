@@ -2025,7 +2025,7 @@ impl ExternalPoolManager {
             if !pool.enabled || pool.is_auto_disabled_now() {
                 continue;
             }
-            if body_mode_filter.is_some_and(|mode| pool.request_body_mode != mode) {
+            if !external_pool_matches_body_mode_filter(&pool, body_mode_filter) {
                 continue;
             }
             availability.eligible_pools += 1;
@@ -3288,6 +3288,13 @@ fn external_pool_outbound_body(
     pool: &ExternalPool,
 ) -> Result<Bytes, ExternalPoolError> {
     external_pool_prepare_request(route, pool).map(|prepared| prepared.body)
+}
+
+fn external_pool_matches_body_mode_filter(
+    pool: &ExternalPool,
+    filter: Option<ExternalPoolRequestBodyMode>,
+) -> bool {
+    filter.is_none_or(|mode| pool.request_body_mode == mode)
 }
 
 fn external_pool_prepare_request(
@@ -6168,6 +6175,31 @@ data: {"type":"message_delta","note":"content_block_delta"}
                 .as_deref(),
             Some("path_rule:/ha/v1/messages")
         );
+    }
+
+    #[test]
+    fn fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools() {
+        let normalized_pool = test_pool("https://normalized.example.com/v1", true);
+        let mut raw_pool = test_pool("https://raw.example.com/v1", true);
+        raw_pool.request_body_mode = ExternalPoolRequestBodyMode::RawPassthrough;
+
+        assert!(external_pool_matches_body_mode_filter(
+            &normalized_pool,
+            None
+        ));
+        assert!(external_pool_matches_body_mode_filter(&raw_pool, None));
+        assert!(external_pool_matches_body_mode_filter(
+            &raw_pool,
+            Some(ExternalPoolRequestBodyMode::RawPassthrough)
+        ));
+        assert!(!external_pool_matches_body_mode_filter(
+            &raw_pool,
+            Some(ExternalPoolRequestBodyMode::Normalized)
+        ));
+        assert!(external_pool_matches_body_mode_filter(
+            &normalized_pool,
+            Some(ExternalPoolRequestBodyMode::Normalized)
+        ));
     }
 
     #[test]
