@@ -59,6 +59,7 @@ use crate::{
         postgres::PostgresStore,
         redis_cache::{LocalPoolCircuitState, RedisStore},
     },
+    token,
 };
 
 const DEFAULT_EXTERNAL_POOL_REQUEST_TIMEOUT_SECS: u64 = 180;
@@ -771,6 +772,7 @@ impl ExternalPoolFinalError {
 
 #[derive(Debug, Clone, Default)]
 struct ExternalUsageCapture {
+    request_input_tokens: Option<i32>,
     raw: Option<CacheUsage>,
     shaped: Option<CacheUsage>,
     reported: Option<CacheUsage>,
@@ -2717,7 +2719,14 @@ impl ExternalPoolManager {
         error_diagnostics: UsageErrorDiagnostics,
         billing: Option<ExternalPoolBilling>,
     ) {
-        let request_input_tokens = route.request_input_tokens;
+        let request_input_tokens = if route.request_input_tokens > 0 {
+            route.request_input_tokens
+        } else {
+            billing
+                .as_ref()
+                .and_then(|billing| billing.request_input_tokens)
+                .unwrap_or(0)
+        };
         let usage = billing
             .as_ref()
             .filter(|_| status == UsageRecordStatus::Success)
@@ -4227,6 +4236,7 @@ fn maybe_project_non_stream_usage(
     usage_capture.reported = raw_usage;
 
     if let Some(projected) = project_usage_value(usage, projection) {
+        usage_capture.request_input_tokens = Some(projected.request_input_tokens);
         usage_capture.shaped = Some(projected.shaped);
         usage_capture.reported = cache_usage_from_value(usage)
             .or(Some(projected.reported))
@@ -4288,6 +4298,10 @@ fn maybe_project_sse_event(
             out.extend_from_slice(line.as_bytes());
             continue;
         };
+        update_external_usage_capture_request_input(
+            capture,
+            Some(projected_usage.request_input_tokens),
+        );
         update_external_usage_capture(
             capture,
             raw_usage,
@@ -4460,6 +4474,20 @@ fn update_external_usage_capture(
     }
 }
 
+fn update_external_usage_capture_request_input(
+    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+    request_input_tokens: Option<i32>,
+) {
+    let Some(request_input_tokens) = request_input_tokens else {
+        return;
+    };
+    let Some(capture) = capture else {
+        return;
+    };
+    let mut capture = capture.lock();
+    capture.request_input_tokens = Some(request_input_tokens.max(0));
+}
+
 fn merge_external_usage(existing: Option<CacheUsage>, incoming: CacheUsage) -> CacheUsage {
     let Some(existing) = existing else {
         return incoming;
@@ -4512,6 +4540,7 @@ fn find_sse_event_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProjectedExternalUsage {
+    request_input_tokens: i32,
     shaped: CacheUsage,
     reported: CacheUsage,
 }
@@ -4592,6 +4621,7 @@ fn project_usage_value(
     obj.remove("cache_creation_1h_input_tokens");
     obj.remove("cache_creation");
     Some(ProjectedExternalUsage {
+        request_input_tokens: projection.raw_input_tokens,
         shaped,
         reported: projected,
     })
@@ -4717,6 +4747,7 @@ fn external_pool_billing_from_capture(
     Some(external_pool_billing(
         route,
         pool,
+        capture.request_input_tokens,
         raw,
         shaped,
         reported,
@@ -4735,6 +4766,7 @@ fn external_pool_billing_from_capture_ref(
 fn external_pool_billing(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
+    request_input_tokens: Option<i32>,
     raw_usage: CacheUsage,
     shaped_usage: CacheUsage,
     reported_usage: CacheUsage,
@@ -4772,6 +4804,7 @@ fn external_pool_billing(
     let profit_usd = uplifted_cost_usd - raw_cost_usd;
 
     ExternalPoolBilling {
+        request_input_tokens: request_input_tokens.map(|tokens| tokens.max(0)),
         raw_usage: external_usage_snapshot(raw_usage),
         shaped_usage: external_usage_snapshot(shaped_usage),
         reported_usage: external_usage_snapshot(reported_usage),
@@ -4797,17 +4830,28 @@ fn build_external_usage_projection_context(
     output_uplift_min_tokens: i32,
     output_uplift_percent: u32,
 ) -> Option<ExternalUsageProjectionContext> {
-    let payload = route.payload()?;
     if pool.usage_projection_mode != ExternalPoolUsageProjectionMode::CurrentPathPolicy {
         return None;
     }
-    if !payload.stream && pool.skip_non_stream_usage_projection {
+    let stream = route.is_stream();
+    if !stream && pool.skip_non_stream_usage_projection {
         return None;
     }
     let reported_usage = route.reported_usage.policy_for_path(&route.endpoint);
-    if !payload.stream && reported_usage.skip_non_stream_usage_projection {
+    if !stream && reported_usage.skip_non_stream_usage_projection {
         return None;
     }
+
+    let raw_projection_payload;
+    let payload = if let Some(payload) = route.payload() {
+        payload
+    } else {
+        raw_projection_payload = serde_json::from_slice::<MessagesRequest>(&route.raw_body).ok()?;
+        if raw_projection_payload.model.trim().is_empty() {
+            return None;
+        }
+        &raw_projection_payload
+    };
 
     let model = route
         .upstream_model
@@ -4818,11 +4862,28 @@ fn build_external_usage_projection_context(
         .supports_prompt_caching_for(&model)
         .unwrap_or(true);
 
-    let raw_input_tokens = route.request_input_tokens;
+    let raw_input_tokens = if route.request_input_tokens > 0 {
+        route.request_input_tokens
+    } else {
+        token::count_all_tokens(
+            &payload.model,
+            payload.system.as_deref(),
+            &payload.messages,
+            payload.tools.as_deref(),
+        ) as i32
+    };
     let cache_state_enabled = route.prompt_cache_strategy_type != PromptCacheStrategyType::NoCache
         && prompt_cache_supported;
+    let stable_conversation_id = route
+        .stable_conversation_id()
+        .or_else(|| crate::anthropic::converter::extract_stable_conversation_id(payload));
     let scope = cache_state_enabled
-        .then(|| external_prompt_cache_scope(route, pool, &model))
+        .then(|| {
+            external_prompt_cache_scope(
+                stable_conversation_id.clone(),
+                route.prompt_cache_route_namespace.clone(),
+            )
+        })
         .flatten();
     let (profile, kiro_rs_tool_prompt_cache_plan, simulated_usage) = match route
         .prompt_cache_strategy_type
@@ -4927,14 +4988,10 @@ fn count_external_route_input_tokens(payload: &MessagesRequest) -> i32 {
 }
 
 fn external_prompt_cache_scope(
-    route: &ExternalRouteRequest,
-    _pool: &ExternalPool,
-    _model: &str,
+    conversation_id: Option<String>,
+    namespace: Option<String>,
 ) -> Option<PromptCacheScope> {
-    Some(PromptCacheScope::new(
-        route.stable_conversation_id()?,
-        route.prompt_cache_route_namespace.clone(),
-    ))
+    Some(PromptCacheScope::new(conversation_id?, namespace))
 }
 
 fn external_cache_amplification(
@@ -6051,6 +6108,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
         route.body_mode_filter = Some(ExternalPoolRequestBodyMode::RawPassthrough);
         route.model_hint = model_hint;
         route.stream_hint = stream_hint;
+        route.request_input_tokens = 0;
         route.upstream_model = None;
         route.model_resolution_source = None;
         route
@@ -6758,6 +6816,47 @@ data: {"type":"message_delta","note":"content_block_delta"}
                 .and_then(|value| value.as_i64())
                 .unwrap_or_default()
                 > 0
+        );
+    }
+
+    #[test]
+    fn raw_passthrough_keeps_body_but_still_applies_usage_projection() {
+        let raw = br#"{"model":"claude-sonnet-4-5","max_tokens":8,"messages":[{"role":"user","content":"hello"}],"system":[{"type":"text","text":"You are a careful coding assistant. You are a careful coding assistant. You are a careful coding assistant. "}],"stream":false,"metadata":{"user_id":"raw-projection-session"}}"#;
+        let route = raw_test_route(raw);
+        assert!(route.payload.is_none());
+        assert_eq!(route.request_input_tokens, 0);
+
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.request_body_mode = ExternalPoolRequestBodyMode::RawPassthrough;
+        pool.raw_model_mode = ExternalPoolRawModelMode::None;
+        pool.model_mapping_mode = ExternalPoolModelMappingMode::Passthrough;
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+
+        let prepared = external_pool_prepare_request(&route, &pool).unwrap();
+        assert_eq!(prepared.body, Bytes::from_static(raw));
+
+        let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":5,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
+        );
+        let projection = projection_context(&route, &pool, 0).expect("raw usage projection");
+        assert!(projection.raw_input_tokens > 0);
+
+        let projected = maybe_project_non_stream_usage(body.clone(), Some(&projection));
+        let value: serde_json::Value =
+            serde_json::from_slice(&projected.body).expect("projected json");
+        let usage = value.get("usage").expect("usage object");
+
+        assert!(projected.usage_capture.projected);
+        assert_eq!(
+            projected.usage_capture.request_input_tokens,
+            Some(projection.raw_input_tokens)
+        );
+        assert_ne!(projected.body, body);
+        assert!(
+            usage
+                .get("input_tokens")
+                .and_then(|value| value.as_i64())
+                .is_some_and(|tokens| (1..=96).contains(&tokens))
         );
     }
 

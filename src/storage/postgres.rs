@@ -5940,6 +5940,7 @@ mod tests {
             external_attempts: Vec::new(),
             usage_projection_applied: Some(true),
             external_pool_billing: Some(ExternalPoolBilling {
+                request_input_tokens: None,
                 raw_usage,
                 shaped_usage,
                 reported_usage,

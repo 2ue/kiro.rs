@@ -1261,7 +1261,7 @@ function modelMappingDescription(mode: ExternalPool['modelMappingMode'] | undefi
 
 function requestBodyModeDescription(mode: ExternalPool['requestBodyMode'] | undefined) {
   if (mode === 'raw_passthrough') {
-    return '请求体不进入消息解析、图片处理、schema 修正和 payload guard。是否改写顶层 model 由下方模型处理配置单独控制。'
+    return '请求体不进入消息解析、图片处理、schema 修正和 payload guard。Usage 上报仍按当前外部池的 Usage 上报模式执行；是否改写顶层 model 由下方模型处理配置单独控制。'
   }
   return '按标准 Anthropic 请求处理链路转发，会应用图片预处理、payload guard、thinking/model 兼容逻辑和 usage 整形上下文。'
 }

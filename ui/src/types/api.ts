@@ -707,6 +707,7 @@ export interface ExternalPoolUsageSnapshot {
 }
 
 export interface ExternalPoolBilling {
+  requestInputTokens?: number
   rawUsage: ExternalPoolUsageSnapshot
   shapedUsage?: ExternalPoolUsageSnapshot
   reportedUsage: ExternalPoolUsageSnapshot

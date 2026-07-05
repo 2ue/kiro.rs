@@ -94,6 +94,8 @@ pub struct ExternalPoolUsageSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalPoolBilling {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_input_tokens: Option<i32>,
     pub raw_usage: ExternalPoolUsageSnapshot,
     #[serde(default)]
     pub shaped_usage: ExternalPoolUsageSnapshot,

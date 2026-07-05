@@ -4478,6 +4478,7 @@ mod tests {
         external.external_pool_id = Some(42);
         external.external_pool_name = Some("backup-a".to_string());
         external.external_pool_billing = Some(ExternalPoolBilling {
+            request_input_tokens: None,
             raw_usage: ExternalPoolUsageSnapshot::default(),
             shaped_usage: ExternalPoolUsageSnapshot::default(),
             reported_usage: ExternalPoolUsageSnapshot::default(),
