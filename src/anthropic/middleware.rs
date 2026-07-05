@@ -15,13 +15,15 @@ use crate::common::auth::RequestApiKeyStore;
 use crate::external_pool::ExternalPoolManager;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
-    CachePolicyConfig, CompatProfile, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
-    PayloadShapingConfig, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
-    ReportedUsageConfig, ThinkingTriggerMode, normalize_defined_cache_routes,
+    CachePolicyConfig, CompatProfile, ExternalPoolsConfig, ImageProcessingConfig,
+    ModelMappingConfig, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
+    PromptCacheCreationControlConfig, PromptCacheSimulationMode, ReportedUsageConfig,
+    ThinkingTriggerMode, normalize_defined_cache_routes,
 };
 
 use super::{
     envelope,
+    files::AnthropicFileStore,
     model_capabilities::ModelCapabilitiesCatalog,
     pricing::PricingCatalog,
     prompt_cache::{PromptCacheBounds, PromptCacheTracker},
@@ -50,6 +52,8 @@ pub struct AppState {
     pub pricing_catalog: Arc<PricingCatalog>,
     /// 模型能力目录。仅用于 /models 和后台观测，失败不影响请求调度。
     pub model_capabilities: Arc<ModelCapabilitiesCatalog>,
+    /// Anthropic Files 兼容上传暂存区，用于 Claude Code 图片/文件 source.file_id。
+    pub file_store: Arc<AnthropicFileStore>,
     /// 本地 prompt-cache tracker
     pub prompt_cache: Arc<PromptCacheTracker>,
     /// 本地 prompt-cache creation 上报频次控制器
@@ -106,8 +110,12 @@ pub struct AppState {
     pub kiro_cache_point_record_plan: bool,
     /// Kiro 上游流式响应正文静默超时秒数
     pub kiro_upstream_stream_idle_timeout_secs: u64,
+    /// 多模态图片/文件预处理配置
+    pub image_processing: ImageProcessingConfig,
     /// payload shaping 配置
     pub payload_shaping: PayloadShapingConfig,
+    /// 外部备用号池和直连策略配置。
+    pub external_pools: ExternalPoolsConfig,
     /// 外部备用号池管理器。
     pub external_pool_manager: Option<Arc<ExternalPoolManager>>,
 }
@@ -134,6 +142,7 @@ impl AppState {
             tool_format_debug_recorder: ToolFormatDebugRecorder::disabled(),
             pricing_catalog: Arc::new(PricingCatalog::new()),
             model_capabilities: Arc::new(ModelCapabilitiesCatalog::new()),
+            file_store: Arc::new(AnthropicFileStore::default()),
             prompt_cache,
             prompt_cache_creation_controller,
             prompt_cache_simulation_mode,
@@ -162,7 +171,9 @@ impl AppState {
             kiro_cache_point_tools_only: true,
             kiro_cache_point_record_plan: true,
             kiro_upstream_stream_idle_timeout_secs: 180,
+            image_processing: ImageProcessingConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
+            external_pools: ExternalPoolsConfig::default(),
             external_pool_manager: None,
         }
     }
@@ -264,6 +275,7 @@ impl AppState {
         kiro_cache_point_tools_only: bool,
         kiro_cache_point_record_plan: bool,
         kiro_upstream_stream_idle_timeout_secs: u64,
+        image_processing: ImageProcessingConfig,
         payload_shaping: PayloadShapingConfig,
     ) -> Self {
         self.payload_guard_enabled = enabled;
@@ -276,6 +288,7 @@ impl AppState {
         self.kiro_cache_point_tools_only = kiro_cache_point_tools_only;
         self.kiro_cache_point_record_plan = kiro_cache_point_record_plan;
         self.kiro_upstream_stream_idle_timeout_secs = kiro_upstream_stream_idle_timeout_secs;
+        self.image_processing = image_processing.normalized();
         self.payload_shaping = payload_shaping;
         self
     }
@@ -291,6 +304,11 @@ impl AppState {
         external_pool_manager: Arc<ExternalPoolManager>,
     ) -> Self {
         self.external_pool_manager = Some(external_pool_manager);
+        self
+    }
+
+    pub fn with_external_pools(mut self, external_pools: ExternalPoolsConfig) -> Self {
+        self.external_pools = external_pools;
         self
     }
 }

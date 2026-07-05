@@ -59,6 +59,55 @@ pub enum OversizedImageHandling {
     Reject,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageProcessingMode {
+    #[default]
+    Safe,
+    Light,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageProcessingConfig {
+    #[serde(default)]
+    pub mode: ImageProcessingMode,
+
+    #[serde(default = "default_true")]
+    pub safe_materialize_file_sources: bool,
+
+    #[serde(default = "default_true")]
+    pub safe_download_remote_sources: bool,
+
+    #[serde(default = "default_true")]
+    pub safe_normalize_base64_media_types: bool,
+}
+
+impl Default for ImageProcessingConfig {
+    fn default() -> Self {
+        Self {
+            mode: ImageProcessingMode::Safe,
+            safe_materialize_file_sources: true,
+            safe_download_remote_sources: true,
+            safe_normalize_base64_media_types: true,
+        }
+    }
+}
+
+impl ImageProcessingConfig {
+    pub fn normalized(self) -> Self {
+        match self.mode {
+            ImageProcessingMode::Safe => self,
+            ImageProcessingMode::Light => Self {
+                mode: ImageProcessingMode::Light,
+                safe_materialize_file_sources: false,
+                safe_download_remote_sources: false,
+                safe_normalize_base64_media_types: false,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PayloadShapingConfig {
@@ -2405,6 +2454,13 @@ pub struct Config {
     #[serde(default)]
     pub compression: CompressionConfig,
 
+    /// 多模态图片/文件预处理配置。
+    ///
+    /// safe 保持现有行为：展开本地 file_id、下载安全远程 URL、识别并修正 base64 图片媒体类型。
+    /// light 不下载、不展开、不 decode 校正图片，只让 inline base64/data URL 进入协议转换。
+    #[serde(default)]
+    pub image_processing: ImageProcessingConfig,
+
     /// Kiro payload shaping 配置。默认只压缩旧历史和明显冗余，不截断当前输入。
     #[serde(default)]
     pub payload_shaping: PayloadShapingConfig,
@@ -3297,6 +3353,7 @@ impl Default for Config {
             credential_warmup_max_selection_percent:
                 default_credential_warmup_max_selection_percent(),
             compression: CompressionConfig::default(),
+            image_processing: ImageProcessingConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
             payload_guard_enabled: default_payload_guard_enabled(),
             payload_guard_mode: default_payload_guard_mode(),

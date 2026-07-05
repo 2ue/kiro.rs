@@ -1,6 +1,7 @@
 import type {
   CachePolicyConfig,
   CacheRoutePolicyPatch,
+  ImageProcessingConfig,
   PayloadShapingConfig,
   PromptCacheCreationControlConfig,
   ReportedUsageConfig,
@@ -93,6 +94,36 @@ export function defaultPayloadShaping(): PayloadShapingConfig {
     truncateCurrentImages: false,
     currentImagesMaxBytes: 180000,
     oversizedImageHandling: 'drop-with-placeholder',
+  }
+}
+
+export function defaultImageProcessing(): ImageProcessingConfig {
+  return {
+    mode: 'safe',
+    safeMaterializeFileSources: true,
+    safeDownloadRemoteSources: true,
+    safeNormalizeBase64MediaTypes: true,
+  }
+}
+
+export function normalizeImageProcessing(input?: Partial<ImageProcessingConfig> | null): ImageProcessingConfig {
+  const next: ImageProcessingConfig = {
+    ...defaultImageProcessing(),
+    ...(input ?? {}),
+  }
+  if (next.mode === 'light') {
+    return {
+      mode: 'light',
+      safeMaterializeFileSources: false,
+      safeDownloadRemoteSources: false,
+      safeNormalizeBase64MediaTypes: false,
+    }
+  }
+  return {
+    mode: 'safe',
+    safeMaterializeFileSources: Boolean(next.safeMaterializeFileSources),
+    safeDownloadRemoteSources: Boolean(next.safeDownloadRemoteSources),
+    safeNormalizeBase64MediaTypes: Boolean(next.safeNormalizeBase64MediaTypes),
   }
 }
 
@@ -207,6 +238,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   selectionFailureRecordEnabled: true,
   compressionEnabled: false,
   whitespaceCompression: true,
+  imageProcessing: defaultImageProcessing(),
   payloadGuardEnabled: true,
   payloadGuardMode: 'preemptive',
   payloadGuardMaxBytes: 460800,

@@ -5,9 +5,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::anthropic::pricing::ModelPricing;
 use crate::model::config::{
     CachePolicyConfig, CompatProfile, CompressionConfig, ExternalPoolsConfig,
-    KiroAgentModeStrategy, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
-    PayloadShapingConfig, PayloadShapingConfigPatch, PromptCacheCreationControlConfig,
-    ReportedUsageConfig, ThinkingTriggerMode,
+    ImageProcessingConfig, KiroAgentModeStrategy, ModelMappingConfig, ModelResolutionMode,
+    PayloadGuardMode, PayloadShapingConfig, PayloadShapingConfigPatch,
+    PromptCacheCreationControlConfig, ReportedUsageConfig, ThinkingTriggerMode,
 };
 
 // ============ 凭据状态 ============
@@ -1339,6 +1339,7 @@ pub struct RuntimeConfigResponse {
     pub selection_failure_record_enabled: bool,
     pub compression_enabled: bool,
     pub whitespace_compression: bool,
+    pub image_processing: ImageProcessingConfig,
     pub payload_guard_enabled: bool,
     pub payload_guard_mode: PayloadGuardMode,
     pub payload_guard_max_bytes: u64,
@@ -1444,6 +1445,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub compression_enabled: bool,
     #[serde(default = "default_true")]
     pub whitespace_compression: bool,
+    #[serde(default)]
+    pub image_processing: Option<ImageProcessingConfig>,
     #[serde(default)]
     pub payload_guard_enabled: Option<bool>,
     #[serde(default)]

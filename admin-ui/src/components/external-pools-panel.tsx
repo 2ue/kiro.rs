@@ -155,6 +155,8 @@ type ExternalPoolFormDraft = {
   enabled: boolean
   priority: number
   maxConcurrentRequests: number
+  requestBodyMode: NonNullable<CreateExternalPoolRequest['requestBodyMode']>
+  rawModelMode: NonNullable<CreateExternalPoolRequest['rawModelMode']>
   usageProjectionMode: NonNullable<CreateExternalPoolRequest['usageProjectionMode']>
   skipNonStreamUsageProjection: boolean
   autoDisablePolicy: NonNullable<CreateExternalPoolRequest['autoDisablePolicy']>
@@ -173,6 +175,8 @@ const defaultPoolForm = (): ExternalPoolFormDraft => ({
   enabled: false,
   priority: 100,
   maxConcurrentRequests: 10,
+  requestBodyMode: 'normalized',
+  rawModelMode: 'none',
   usageProjectionMode: 'pass_through',
   skipNonStreamUsageProjection: false,
   autoDisablePolicy: 'inherit',
@@ -191,6 +195,8 @@ const poolFormFromPool = (pool: ExternalPool): ExternalPoolFormDraft => ({
   enabled: pool.enabled,
   priority: pool.priority,
   maxConcurrentRequests: pool.maxConcurrentRequests,
+  requestBodyMode: pool.requestBodyMode || 'normalized',
+  rawModelMode: pool.rawModelMode || 'none',
   usageProjectionMode: pool.usageProjectionMode,
   skipNonStreamUsageProjection: Boolean(pool.skipNonStreamUsageProjection),
   autoDisablePolicy: pool.autoDisablePolicy,
@@ -591,7 +597,7 @@ export function ExternalPoolsPanel() {
                     <Badge variant={runtime?.dispatchable ? 'outline' : 'secondary'}>{runtime?.dispatchable ? '可调度' : runtime?.skippedReason || '不可调度'}</Badge>
                   </div>
                   <div className="text-sm text-muted-foreground">{pool.baseUrl} · {pool.maskedApiKey || '未显示 Key'} · 并发 {runtime?.inFlight ?? 0}/{pool.maxConcurrentRequests} · 优先级 {pool.priority}</div>
-                  <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · auth: {authLabel(pool.authType)} · model: {poolModelMappingSummary(pool)} · request: /v1/messages {runtime?.cooldownRemainingSecs ? `· 冷却 ${runtime.cooldownRemainingSecs}s` : ''}</div>
+                  <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · {poolBodyModeSummary(pool)} · auth: {authLabel(pool.authType)} · model: {poolModelMappingSummary(pool)} · request: /v1/messages {runtime?.cooldownRemainingSecs ? `· 冷却 ${runtime.cooldownRemainingSecs}s` : ''}</div>
                   {pool.autoDisabledLastError && <div className="text-xs text-destructive">{pool.autoDisabledLastError}</div>}
                   </div>
                   <div className="flex flex-wrap gap-2">
@@ -772,9 +778,40 @@ function ExternalPoolFormDialog({
             </FormSection>
           </div>
 
+          <FormSection title="请求体处理" description="控制发往该外部池前是否进入本系统 body 处理链路。">
+            <div className="grid gap-3">
+              <div className="space-y-3">
+                <SelectBox
+                  label="Body 模式"
+                  value={draft.requestBodyMode}
+                  disabled={saving}
+                  onChange={(requestBodyMode) => onDraftChange((prev) => ({ ...prev, requestBodyMode: requestBodyMode as ExternalPoolFormDraft['requestBodyMode'] }))}
+                >
+                  <option value="normalized">标准处理</option>
+                  <option value="raw_passthrough">Raw 透传</option>
+                </SelectBox>
+                <HintBox>{requestBodyModeDescription(draft.requestBodyMode)}</HintBox>
+              </div>
+            </div>
+          </FormSection>
+
           <FormSection title="模型处理" description="控制当前外部池出站 model 字段的处理顺序和未命中策略。">
             <div className="grid gap-3 md:grid-cols-[240px_1fr]">
               <div className="space-y-3">
+                {draft.requestBodyMode === 'raw_passthrough' && (
+                  <>
+                    <Toggle
+                      label="写回顶层 model"
+                      checked={draft.rawModelMode === 'rewrite_top_level'}
+                      disabled={saving}
+                      onChange={(rawModelRewrite) => onDraftChange((prev) => ({
+                        ...prev,
+                        rawModelMode: rawModelRewrite ? 'rewrite_top_level' : 'none',
+                      }))}
+                    />
+                    <HintBox>开启后只扫描 raw JSON 顶层 model，按本区域模型处理规则得到目标模型并写回顶层 model；关闭则 body 和 model 都原样透传。</HintBox>
+                  </>
+                )}
                 <SelectBox label="映射模式" value={draft.modelMappingMode} disabled={saving} onChange={(modelMappingMode) => onDraftChange((prev) => ({ ...prev, modelMappingMode: modelMappingMode as ExternalPoolFormDraft['modelMappingMode'] }))}>
                   <option value="passthrough">直接透传请求模型</option>
                   <option value="passthrough_mapping">透传模型优先映射</option>
@@ -1222,6 +1259,13 @@ function modelMappingDescription(mode: ExternalPool['modelMappingMode'] | undefi
   return `先使用本系统解析后的模型匹配规则；${processedFallback}`
 }
 
+function requestBodyModeDescription(mode: ExternalPool['requestBodyMode'] | undefined) {
+  if (mode === 'raw_passthrough') {
+    return '请求体不进入消息解析、图片处理、schema 修正和 payload guard。是否改写顶层 model 由下方模型处理配置单独控制。'
+  }
+  return '按标准 Anthropic 请求处理链路转发，会应用图片预处理、payload guard、thinking/model 兼容逻辑和 usage 整形上下文。'
+}
+
 function poolModelMappingSummary(pool: ExternalPool) {
   if (pool.modelMappingMode === 'passthrough') return '透传'
   const count = pool.modelMappingRules?.length || 0
@@ -1232,6 +1276,15 @@ function poolModelMappingSummary(pool: ExternalPool) {
       : '内部+映射'
   const fallback = pool.modelMappingRequireMatch ? '必须命中' : pool.normalizeModelVersionDots ? '未命中4.8->4-8' : '允许未命中'
   return `${mode}${count ? ` ${count}条` : ''} · ${fallback}`
+}
+
+function poolBodyModeSummary(pool: ExternalPool) {
+  if (pool.requestBodyMode === 'raw_passthrough') {
+    return pool.rawModelMode === 'rewrite_top_level'
+      ? 'Body: raw透传+模型处理'
+      : 'Body: raw透传'
+  }
+  return 'Body: 标准处理'
 }
 
 function usageProjectionDescription(mode: ExternalPool['usageProjectionMode'] | undefined) {

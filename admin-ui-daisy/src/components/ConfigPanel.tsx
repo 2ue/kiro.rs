@@ -5,6 +5,7 @@ import { Alert, Button, Input, Join, Loading, Toggle } from 'react-daisyui'
 import { ErrorState, FieldLabel, Select, useConfirm } from '@/components/ui'
 import {
   defaultModelMappingConfig,
+  defaultImageProcessing,
   defaultPayloadShaping,
   defaultExternalPoolsConfig,
   defaultPromptCacheCreationControl,
@@ -19,6 +20,7 @@ import {
   normalizeDefinedCacheRoutes,
   normalizePayloadShaping,
   normalizeCachePolicy,
+  normalizeImageProcessing,
   normalizePromptCacheCreationControl,
   normalizeReportedUsage,
   pathPolicy,
@@ -1666,6 +1668,7 @@ export function ConfigPanel() {
           ...defaultPayloadShaping(),
           ...config.data.payloadShaping,
         },
+        imageProcessing: normalizeImageProcessing(config.data.imageProcessing),
         externalPools: {
           ...defaultExternalPoolsConfig(),
           ...config.data.externalPools,
@@ -1725,6 +1728,7 @@ export function ConfigPanel() {
       selectionFailureSampleLimit: toWhole(draft.selectionFailureSampleLimit, 0, 1000),
       payloadGuardMaxBytes: toWhole(draft.payloadGuardMaxBytes),
       payloadGuardSafetyMarginBytes: toWhole(draft.payloadGuardSafetyMarginBytes),
+      imageProcessing: normalizeImageProcessing(draft.imageProcessing),
       payloadShaping: normalizePayloadShaping(draft.payloadShaping),
       promptCacheTargetReadRatio: toRatio(draft.promptCacheTargetReadRatio),
       promptCacheTokenScale: toScale(draft.promptCacheTokenScale),
@@ -1787,6 +1791,7 @@ export function ConfigPanel() {
   const payloadSizeLimitEnabled = draft.payloadGuardEnabled && draft.payloadGuardMaxBytes > 0
   const payloadShapingBranchEnabled = payloadSizeLimitEnabled && draft.payloadShaping.enabled
   const payloadGuardMode = draft.payloadGuardMode ?? 'preemptive'
+  const imageProcessingMode = draft.imageProcessing?.mode ?? 'safe'
   const payloadGuardRetryMode = payloadGuardMode === 'on_too_long'
   const defaultModelMappingRules = generateDefaultModelMappingRules(modelCapabilities.data)
   const payloadConditionTitle = payloadGuardRetryMode
@@ -1916,6 +1921,15 @@ export function ConfigPanel() {
               />
               <ToggleField title="启用请求压缩" description="开启后会尽量减少请求里的冗余内容；关闭时不改动请求内容。" checked={draft.compressionEnabled} onChange={(compressionEnabled) => setDraft((prev) => ({ ...prev, compressionEnabled }))} />
               <ToggleField title="仅压缩空白字符" description="只处理多余空白，风险较低，适合默认开启。" checked={draft.whitespaceCompression} disabled={!draft.compressionEnabled} onChange={(whitespaceCompression) => setDraft((prev) => ({ ...prev, whitespaceCompression }))} />
+              <FieldLabel title="图片处理模式" description="Safe 保持现有兼容修复；Light 不展开 file_id、不下载远程 URL、不解码修正 base64 媒体类型。">
+                <Select bordered size="sm" className="w-full" value={imageProcessingMode} onChange={(event) => setDraft((prev) => ({ ...prev, imageProcessing: { ...defaultImageProcessing(), ...prev.imageProcessing, mode: event.target.value as RuntimeConfig['imageProcessing']['mode'] } }))}>
+                  <Select.Option value="safe">Safe：兼容修复</Select.Option>
+                  <Select.Option value="light">Light：轻量透传</Select.Option>
+                </Select>
+              </FieldLabel>
+              <ToggleField title="展开本地文件 source" description="把已上传文件引用展开为可发送给 Kiro 的 inline 内容。" checked={Boolean(draft.imageProcessing?.safeMaterializeFileSources)} disabled={imageProcessingMode !== 'safe'} onChange={(safeMaterializeFileSources) => setDraft((prev) => ({ ...prev, imageProcessing: { ...defaultImageProcessing(), ...prev.imageProcessing, safeMaterializeFileSources } }))} />
+              <ToggleField title="下载远程图片和文档" description="把请求里的远程 URL 下载后转成 inline 内容，便于上游识别。" checked={Boolean(draft.imageProcessing?.safeDownloadRemoteSources)} disabled={imageProcessingMode !== 'safe'} onChange={(safeDownloadRemoteSources) => setDraft((prev) => ({ ...prev, imageProcessing: { ...defaultImageProcessing(), ...prev.imageProcessing, safeDownloadRemoteSources } }))} />
+              <ToggleField title="修正 base64 图片类型" description="根据图片字节修正错误的 image/png、image/jpeg 等 media_type。" checked={Boolean(draft.imageProcessing?.safeNormalizeBase64MediaTypes)} disabled={imageProcessingMode !== 'safe'} onChange={(safeNormalizeBase64MediaTypes) => setDraft((prev) => ({ ...prev, imageProcessing: { ...defaultImageProcessing(), ...prev.imageProcessing, safeNormalizeBase64MediaTypes } }))} />
               <ToggleField title="启用大小保护" description="统计请求大小，并修正常见的格式问题，减少请求被拒绝的概率。" checked={draft.payloadGuardEnabled} onChange={(payloadGuardEnabled) => setDraft((prev) => ({ ...prev, payloadGuardEnabled }))} />
               <ToggleField title="外部账号也应用大小保护" description="开启后，外部账号请求也使用同一套大小保护设置。" checked={draft.payloadGuardExternalEnabled} disabled={!draft.payloadGuardEnabled} onChange={(payloadGuardExternalEnabled) => setDraft((prev) => ({ ...prev, payloadGuardExternalEnabled }))} />
               <FieldLabel title="过大请求处理方式" description="可选择发送前先裁剪，也可以在收到“内容过长”错误后再裁剪并重试。">

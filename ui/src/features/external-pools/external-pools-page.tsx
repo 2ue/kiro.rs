@@ -46,6 +46,7 @@ import {
   joinRules,
   parseModelMappingRules,
   poolFormFromPool,
+  poolBodyModeSummary,
   poolModelMappingSummary,
   poolUsageSummary,
   splitRules,
@@ -471,7 +472,7 @@ export function ExternalPoolsPage() {
                           <Badge tone={runtime?.dispatchable ? 'info' : 'neutral'}>{runtime?.dispatchable ? '可调度' : runtime?.skippedReason || '不可调度'}</Badge>
                         </div>
                         <div className="text-sm text-muted-foreground">{pool.baseUrl} · {pool.maskedApiKey || '未显示 Key'} · 并发 {inFlight}/{capacity} · 优先级 {pool.priority}</div>
-                        <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · 认证：{authLabel(pool.authType)} · 模型：{poolModelMappingSummary(pool)}{runtime?.cooldownRemainingSecs ? ` · 冷却 ${runtime.cooldownRemainingSecs}s` : ''}</div>
+                        <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · {poolBodyModeSummary(pool)} · 认证：{authLabel(pool.authType)} · 模型：{poolModelMappingSummary(pool)}{runtime?.cooldownRemainingSecs ? ` · 冷却 ${runtime.cooldownRemainingSecs}s` : ''}</div>
                         {pool.autoDisabledLastError && <div className="text-xs text-destructive">{pool.autoDisabledLastError}</div>}
                       </div>
                     </div>

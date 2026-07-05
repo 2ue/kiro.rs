@@ -13,12 +13,17 @@ use crate::common::auth::RequestApiKeyStore;
 use crate::external_pool::ExternalPoolManager;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
-    CachePolicyConfig, CompatProfile, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
-    PayloadShapingConfig, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
-    ReportedUsageConfig, ThinkingTriggerMode, ToolFormatDebugConfig,
+    CachePolicyConfig, CompatProfile, ExternalPoolsConfig, ImageProcessingConfig,
+    ModelMappingConfig, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
+    PromptCacheCreationControlConfig, PromptCacheSimulationMode, ReportedUsageConfig,
+    ThinkingTriggerMode, ToolFormatDebugConfig,
 };
 
 use super::{
+    files::{
+        delete_file, delete_file_dfcache, get_file, get_file_content, get_file_content_dfcache,
+        get_file_dfcache, list_files, upload_file,
+    },
     handlers::{
         count_tokens, count_tokens_dfcache, get_models, get_models_dfcache, post_messages,
         post_messages_cc, post_messages_dfcache, post_messages_ha, post_messages_real_cache_usage,
@@ -94,7 +99,9 @@ pub fn create_router_with_provider(
     kiro_cache_point_tools_only: bool,
     kiro_cache_point_record_plan: bool,
     kiro_upstream_stream_idle_timeout_secs: u64,
+    image_processing: ImageProcessingConfig,
     payload_shaping: PayloadShapingConfig,
+    external_pools: ExternalPoolsConfig,
     tool_format_debug: ToolFormatDebugConfig,
     external_pool_manager: Option<Arc<ExternalPoolManager>>,
 ) -> Router {
@@ -136,8 +143,10 @@ pub fn create_router_with_provider(
         kiro_cache_point_tools_only,
         kiro_cache_point_record_plan,
         kiro_upstream_stream_idle_timeout_secs,
+        image_processing,
         payload_shaping,
     )
+    .with_external_pools(external_pools)
     .with_tool_format_debug_recorder(tool_format_debug_recorder)
     .with_pricing_catalog(pricing_catalog)
     .with_model_capabilities(model_capabilities);
@@ -154,6 +163,9 @@ pub fn create_router_with_provider(
     // 需要认证的 /v1 路由（默认 high-cache）
     let v1_routes = Router::new()
         .route("/models", get(get_models))
+        .route("/files", get(list_files).post(upload_file))
+        .route("/files/{file_id}", get(get_file).delete(delete_file))
+        .route("/files/{file_id}/content", get(get_file_content))
         .route("/messages", post(post_messages))
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
@@ -165,6 +177,9 @@ pub fn create_router_with_provider(
     // 需要认证的 /na/v1 路由（默认 no-cache）
     let na_v1_routes = Router::new()
         .route("/models", get(get_models))
+        .route("/files", get(list_files).post(upload_file))
+        .route("/files/{file_id}", get(get_file).delete(delete_file))
+        .route("/files/{file_id}/content", get(get_file_content))
         .route("/messages", post(post_messages_real_cache_usage))
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
@@ -177,6 +192,9 @@ pub fn create_router_with_provider(
     // 与 /v1 的区别：实时流式返回，最终 message_delta.usage 修正用量。
     let cc_v1_routes = Router::new()
         .route("/models", get(get_models))
+        .route("/files", get(list_files).post(upload_file))
+        .route("/files/{file_id}", get(get_file).delete(delete_file))
+        .route("/files/{file_id}/content", get(get_file_content))
         .route("/messages", post(post_messages_cc))
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
@@ -188,6 +206,9 @@ pub fn create_router_with_provider(
     // 需要认证的 /ha/v1 路由（high-cache；usage 上报由 /ha 路径覆盖项独立控制）
     let ha_v1_routes = Router::new()
         .route("/models", get(get_models))
+        .route("/files", get(list_files).post(upload_file))
+        .route("/files/{file_id}", get(get_file).delete(delete_file))
+        .route("/files/{file_id}/content", get(get_file_content))
         .route("/messages", post(post_messages_ha))
         .route("/messages/count_tokens", post(count_tokens))
         .layer(middleware::from_fn_with_state(
@@ -200,6 +221,15 @@ pub fn create_router_with_provider(
     // route 必须在 definedCacheRoutes 中显式定义，避免未知路径被默认放行。
     let dfcache_routes = Router::new()
         .route("/{route}/v1/models", get(get_models_dfcache))
+        .route("/{route}/v1/files", get(list_files).post(upload_file))
+        .route(
+            "/{route}/v1/files/{file_id}",
+            get(get_file_dfcache).delete(delete_file_dfcache),
+        )
+        .route(
+            "/{route}/v1/files/{file_id}/content",
+            get(get_file_content_dfcache),
+        )
         .route("/{route}/v1/messages", post(post_messages_dfcache))
         .route(
             "/{route}/v1/messages/count_tokens",

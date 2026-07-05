@@ -16,6 +16,7 @@ import {
   appendModelMappingPresets,
   appendModelMappingRules,
   parseModelMappingRules,
+  requestBodyModeDescription,
   usageProjectionDescription,
 } from './external-pool-utils'
 import {
@@ -161,9 +162,39 @@ export function ExternalPoolFormModal({
           </FormSection>
         </div>
 
+        <FormSection title="请求体处理" description="控制发往该外部账号前是否进入本系统 body 处理链路。">
+          <div className="grid gap-3">
+            <div className="space-y-3">
+              <SelectBox
+                label="Body 模式"
+                value={draft.requestBodyMode}
+                disabled={saving}
+                onChange={(v) => set('requestBodyMode', v as ExternalPoolFormDraft['requestBodyMode'])}
+              >
+                <SelectItem value="normalized">标准处理</SelectItem>
+                <SelectItem value="raw_passthrough">Raw 透传</SelectItem>
+              </SelectBox>
+              <HintBox>{requestBodyModeDescription(draft.requestBodyMode)}</HintBox>
+            </div>
+          </div>
+        </FormSection>
+
         <FormSection title="模型处理" description="控制当前外部账号发出请求时的模型名称处理方式。">
           <div className="grid gap-3 md:grid-cols-[240px_1fr]">
             <div className="space-y-3">
+              {draft.requestBodyMode === 'raw_passthrough' && (
+                <>
+                  <ToggleRow
+                    label="写回顶层 model"
+                    checked={draft.rawModelMode === 'rewrite_top_level'}
+                    disabled={saving}
+                    onChange={(v) => set('rawModelMode', v ? 'rewrite_top_level' : 'none')}
+                  />
+                  <HintBox>
+                    开启后只扫描 raw JSON 顶层 model，按本区域模型处理规则得到目标模型并写回顶层 model；关闭则 body 和 model 都原样透传。
+                  </HintBox>
+                </>
+              )}
               <SelectBox label="映射模式" value={draft.modelMappingMode} disabled={saving} onChange={(v) => set('modelMappingMode', v as ExternalPoolFormDraft['modelMappingMode'])}>
                 <SelectItem value="passthrough">直接使用请求模型</SelectItem>
                 <SelectItem value="passthrough_mapping">请求模型优先映射</SelectItem>

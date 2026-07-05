@@ -133,6 +133,67 @@ impl ExternalPoolUsageProjectionMode {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum ExternalPoolRequestBodyMode {
+    Normalized,
+    RawPassthrough,
+}
+
+impl Default for ExternalPoolRequestBodyMode {
+    fn default() -> Self {
+        Self::Normalized
+    }
+}
+
+impl ExternalPoolRequestBodyMode {
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "raw_passthrough" | "raw" | "passthrough_body" => Self::RawPassthrough,
+            _ => Self::Normalized,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normalized => "normalized",
+            Self::RawPassthrough => "raw_passthrough",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalPoolRawModelMode {
+    None,
+    ProbeOnly,
+    RewriteTopLevel,
+}
+
+impl Default for ExternalPoolRawModelMode {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl ExternalPoolRawModelMode {
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "probe_only" | "probe" => Self::ProbeOnly,
+            "rewrite_top_level" | "rewrite" | "model_rewrite" => Self::RewriteTopLevel,
+            _ => Self::None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ProbeOnly => "probe_only",
+            Self::RewriteTopLevel => "rewrite_top_level",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ExternalPoolAutoDisablePolicy {
     Inherit,
     Disabled,
@@ -226,6 +287,10 @@ pub struct ExternalPool {
     pub usage_projection_mode: ExternalPoolUsageProjectionMode,
     #[serde(default)]
     pub skip_non_stream_usage_projection: bool,
+    #[serde(default)]
+    pub request_body_mode: ExternalPoolRequestBodyMode,
+    #[serde(default)]
+    pub raw_model_mode: ExternalPoolRawModelMode,
     pub auto_disable_policy: ExternalPoolAutoDisablePolicy,
     pub auto_disabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -281,6 +346,10 @@ pub struct CreateExternalPoolRequest {
     #[serde(default)]
     pub skip_non_stream_usage_projection: bool,
     #[serde(default)]
+    pub request_body_mode: ExternalPoolRequestBodyMode,
+    #[serde(default)]
+    pub raw_model_mode: ExternalPoolRawModelMode,
+    #[serde(default)]
     pub auto_disable_policy: ExternalPoolAutoDisablePolicy,
     #[serde(default = "default_true")]
     pub preserve_path: bool,
@@ -296,7 +365,7 @@ pub struct CreateExternalPoolRequest {
     pub notes: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateExternalPoolRequest {
     #[serde(default)]
@@ -317,6 +386,10 @@ pub struct UpdateExternalPoolRequest {
     pub usage_projection_mode: Option<ExternalPoolUsageProjectionMode>,
     #[serde(default)]
     pub skip_non_stream_usage_projection: Option<bool>,
+    #[serde(default)]
+    pub request_body_mode: Option<ExternalPoolRequestBodyMode>,
+    #[serde(default)]
+    pub raw_model_mode: Option<ExternalPoolRawModelMode>,
     #[serde(default)]
     pub auto_disable_policy: Option<ExternalPoolAutoDisablePolicy>,
     #[serde(default)]
@@ -380,7 +453,10 @@ pub struct ExternalRouteRequest {
     pub raw_body: Bytes,
     pub headers: HeaderMap,
     pub endpoint: String,
-    pub payload: MessagesRequest,
+    pub payload: Option<MessagesRequest>,
+    pub body_mode_filter: Option<ExternalPoolRequestBodyMode>,
+    pub model_hint: Option<String>,
+    pub stream_hint: Option<bool>,
     pub request_input_tokens: i32,
     pub upstream_model: Option<String>,
     pub model_resolution_source: Option<String>,
@@ -417,6 +493,40 @@ pub struct ExternalRouteRequest {
     pub payload_breakdown: Option<PayloadByteBreakdown>,
     pub payload_guard_report: Option<PayloadGuardReport>,
     pub payload_guard_retry_config: Option<PayloadGuardConfig>,
+}
+
+impl ExternalRouteRequest {
+    fn payload(&self) -> Option<&MessagesRequest> {
+        self.payload.as_ref()
+    }
+
+    fn is_stream(&self) -> bool {
+        self.payload
+            .as_ref()
+            .map(|payload| payload.stream)
+            .or(self.stream_hint)
+            .unwrap_or(false)
+    }
+
+    fn requested_model(&self) -> String {
+        self.payload
+            .as_ref()
+            .map(|payload| payload.model.clone())
+            .or_else(|| self.model_hint.clone())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    fn requested_max_tokens(&self) -> Option<i32> {
+        self.payload
+            .as_ref()
+            .and_then(|payload| (payload.max_tokens > 0).then_some(payload.max_tokens))
+    }
+
+    fn stable_conversation_id(&self) -> Option<String> {
+        self.payload
+            .as_ref()
+            .and_then(crate::anthropic::converter::extract_stable_conversation_id)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -874,6 +984,199 @@ pub fn mask_external_pool_key(value: &str) -> String {
     )
 }
 
+#[derive(Debug, Default, Clone)]
+struct RawMessagesBodyProbe {
+    model: Option<String>,
+    stream: Option<bool>,
+    model_value_span: Option<std::ops::Range<usize>>,
+}
+
+fn probe_raw_messages_body(raw_body: &Bytes) -> RawMessagesBodyProbe {
+    scan_raw_top_level_messages_body(raw_body.as_ref())
+}
+
+pub(crate) fn raw_messages_body_hints(raw_body: &Bytes) -> (Option<String>, Option<bool>) {
+    let probe = probe_raw_messages_body(raw_body);
+    (probe.model, probe.stream)
+}
+
+fn rewrite_raw_top_level_model(raw_body: &Bytes, model: &str) -> Result<Bytes, String> {
+    let probe = probe_raw_messages_body(raw_body);
+    let Some(span) = probe.model_value_span else {
+        return Err("top-level model field was not found".to_string());
+    };
+    let encoded_model = serde_json::to_string(model).map_err(|err| err.to_string())?;
+    let mut out = Vec::with_capacity(
+        raw_body
+            .len()
+            .saturating_sub(span.end.saturating_sub(span.start))
+            .saturating_add(encoded_model.len()),
+    );
+    out.extend_from_slice(&raw_body[..span.start]);
+    out.extend_from_slice(encoded_model.as_bytes());
+    out.extend_from_slice(&raw_body[span.end..]);
+    Ok(Bytes::from(out))
+}
+
+fn scan_raw_top_level_messages_body(bytes: &[u8]) -> RawMessagesBodyProbe {
+    let mut probe = RawMessagesBodyProbe::default();
+    let mut i = skip_json_ws(bytes, 0);
+    if bytes.get(i) != Some(&b'{') {
+        return probe;
+    }
+    i += 1;
+
+    loop {
+        i = skip_json_ws(bytes, i);
+        match bytes.get(i) {
+            Some(b'}') | None => return probe,
+            Some(b'"') => {}
+            _ => return probe,
+        }
+
+        let Some((key, key_end)) = parse_json_string_at(bytes, i) else {
+            return probe;
+        };
+        i = skip_json_ws(bytes, key_end);
+        if bytes.get(i) != Some(&b':') {
+            return probe;
+        }
+        i = skip_json_ws(bytes, i + 1);
+        let value_start = i;
+
+        if key == "model" {
+            if let Some((model, value_end)) = parse_json_string_at(bytes, value_start) {
+                probe.model = Some(model);
+                probe.model_value_span = Some(value_start..value_end);
+                i = value_end;
+            } else {
+                let Some(value_end) = skip_json_value(bytes, value_start) else {
+                    return probe;
+                };
+                i = value_end;
+            }
+        } else if key == "stream" {
+            if bytes.get(value_start..value_start.saturating_add(4)) == Some(b"true") {
+                probe.stream = Some(true);
+                i = value_start + 4;
+            } else if bytes.get(value_start..value_start.saturating_add(5)) == Some(b"false") {
+                probe.stream = Some(false);
+                i = value_start + 5;
+            } else {
+                let Some(value_end) = skip_json_value(bytes, value_start) else {
+                    return probe;
+                };
+                i = value_end;
+            }
+        } else {
+            let Some(value_end) = skip_json_value(bytes, value_start) else {
+                return probe;
+            };
+            i = value_end;
+        }
+
+        if probe.model.is_some() && probe.stream.is_some() {
+            return probe;
+        }
+
+        i = skip_json_ws(bytes, i);
+        match bytes.get(i) {
+            Some(b',') => i += 1,
+            Some(b'}') | None => return probe,
+            _ => return probe,
+        }
+    }
+}
+
+fn skip_json_ws(bytes: &[u8], mut i: usize) -> usize {
+    while bytes.get(i).is_some_and(|byte| byte.is_ascii_whitespace()) {
+        i += 1;
+    }
+    i
+}
+
+fn parse_json_string_at(bytes: &[u8], start: usize) -> Option<(String, usize)> {
+    let end = skip_json_string(bytes, start)?;
+    let value = serde_json::from_slice::<String>(&bytes[start..end]).ok()?;
+    Some((value, end))
+}
+
+fn skip_json_string(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut i = start + 1;
+    let mut escaped = false;
+    while let Some(byte) = bytes.get(i).copied() {
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            return Some(i + 1);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn skip_json_value(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = skip_json_ws(bytes, start);
+    match bytes.get(i).copied()? {
+        b'"' => skip_json_string(bytes, i),
+        b'{' | b'[' => skip_json_container(bytes, i),
+        b't' if bytes.get(i..i + 4) == Some(b"true") => Some(i + 4),
+        b'f' if bytes.get(i..i + 5) == Some(b"false") => Some(i + 5),
+        b'n' if bytes.get(i..i + 4) == Some(b"null") => Some(i + 4),
+        b'-' | b'0'..=b'9' => {
+            while bytes.get(i).is_some_and(|byte| {
+                !matches!(byte, b',' | b'}' | b']') && !byte.is_ascii_whitespace()
+            }) {
+                i += 1;
+            }
+            Some(i)
+        }
+        _ => None,
+    }
+}
+
+fn skip_json_container(bytes: &[u8], start: usize) -> Option<usize> {
+    let first = bytes.get(start).copied()?;
+    if !matches!(first, b'{' | b'[') {
+        return None;
+    }
+    let mut stack = vec![first];
+    let mut i = start + 1;
+    while let Some(byte) = bytes.get(i).copied() {
+        match byte {
+            b'"' => {
+                i = skip_json_string(bytes, i)?;
+                continue;
+            }
+            b'{' | b'[' => stack.push(byte),
+            b'}' => {
+                if stack.pop() != Some(b'{') {
+                    return None;
+                }
+                if stack.is_empty() {
+                    return Some(i + 1);
+                }
+            }
+            b']' => {
+                if stack.pop() != Some(b'[') {
+                    return None;
+                }
+                if stack.is_empty() {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 const EXPLICIT_DIRECT_POLICY_REASON: &str = "explicit_direct";
 
 fn direct_external_policy_static_reason(
@@ -952,6 +1255,17 @@ impl ExternalPoolManager {
     pub async fn has_eligible_pool(&self, config: &ExternalPoolsConfig) -> bool {
         self.pool_availability_snapshot(&HashSet::new(), config)
             .await
+            .has_eligible_pool()
+    }
+
+    pub async fn has_eligible_pool_for_body_mode(
+        &self,
+        config: &ExternalPoolsConfig,
+        body_mode: ExternalPoolRequestBodyMode,
+    ) -> bool {
+        self.scan_pool_availability_uncached(&HashSet::new(), config, false, Some(body_mode))
+            .await
+            .availability
             .has_eligible_pool()
     }
 
@@ -1092,7 +1406,7 @@ impl ExternalPoolManager {
                 break;
             }
             let selection = self
-                .select_pool_with_availability_uncached(&excluded, &config)
+                .select_pool_with_availability_uncached(&excluded, &config, route.body_mode_filter)
                 .await;
             if max_attempts.is_none() {
                 max_attempts = Some(
@@ -1182,7 +1496,7 @@ impl ExternalPoolManager {
                         error_type: None,
                         error_message: None,
                     });
-                    if route.payload.stream {
+                    if route.is_stream() {
                         return ExternalPoolForwardOutcome::Response(
                             self.wrap_external_stream_usage_record(
                                 forwarded.response,
@@ -1343,7 +1657,7 @@ impl ExternalPoolManager {
         let prepared = external_pool_prepare_request(route, pool)?;
         let outbound_model = prepared.outbound_model.clone();
         let mut request = self.client.post(url).headers(headers).body(prepared.body);
-        if route.payload.stream {
+        if route.is_stream() {
             if config.external_pool_stream_request_timeout_secs > 0 {
                 request = request.timeout(Duration::from_secs(
                     config.external_pool_stream_request_timeout_secs,
@@ -1391,7 +1705,9 @@ impl ExternalPoolManager {
         }
         let response_headers = response.headers().clone();
         let status = response.status();
-        if route.payload.stream {
+        let response_is_stream =
+            route.is_stream() || response_headers_look_like_sse(&response_headers);
+        if response_is_stream {
             if success_response_headers_look_like_html(&response_headers) {
                 return Err(ExternalForwardError::new(
                     success_protocol_error(
@@ -1670,7 +1986,7 @@ impl ExternalPoolManager {
         excluded: &HashSet<u64>,
         config: &ExternalPoolsConfig,
     ) -> Option<ExternalPool> {
-        self.scan_pool_availability_uncached(excluded, config, true)
+        self.scan_pool_availability_uncached(excluded, config, true, None)
             .await
             .selected_pool
     }
@@ -1679,8 +1995,9 @@ impl ExternalPoolManager {
         &self,
         excluded: &HashSet<u64>,
         config: &ExternalPoolsConfig,
+        body_mode_filter: Option<ExternalPoolRequestBodyMode>,
     ) -> PoolSelectionSnapshot {
-        self.scan_pool_availability_uncached(excluded, config, true)
+        self.scan_pool_availability_uncached(excluded, config, true, body_mode_filter)
             .await
     }
 
@@ -1689,6 +2006,7 @@ impl ExternalPoolManager {
         excluded: &HashSet<u64>,
         config: &ExternalPoolsConfig,
         include_selection: bool,
+        body_mode_filter: Option<ExternalPoolRequestBodyMode>,
     ) -> PoolSelectionSnapshot {
         if !config.external_pools_enabled {
             return PoolSelectionSnapshot::default();
@@ -1703,6 +2021,9 @@ impl ExternalPoolManager {
                 continue;
             }
             if !pool.enabled || pool.is_auto_disabled_now() {
+                continue;
+            }
+            if body_mode_filter.is_some_and(|mode| pool.request_body_mode != mode) {
                 continue;
             }
             availability.eligible_pools += 1;
@@ -1784,7 +2105,7 @@ impl ExternalPoolManager {
         }
 
         let snapshot = self
-            .scan_pool_availability_uncached(excluded, config, false)
+            .scan_pool_availability_uncached(excluded, config, false, None)
             .await
             .availability;
         if cacheable {
@@ -2454,18 +2775,15 @@ impl ExternalPoolManager {
             id: route.request_id.clone(),
             created_at: Utc::now().to_rfc3339(),
             endpoint: route.endpoint.to_string(),
-            stream: route.payload.stream,
-            model: route.payload.model.clone(),
-            requested_max_tokens: (route.payload.max_tokens > 0)
-                .then_some(route.payload.max_tokens),
+            stream: route.is_stream(),
+            model: route.requested_model(),
+            requested_max_tokens: route.requested_max_tokens(),
             downstream_stop_reason: None,
             upstream_model: route.upstream_model.clone(),
             external_outbound_model,
             model_resolution_source: route.model_resolution_source.clone(),
             model_resolution_note: route.model_resolution_note.clone(),
-            conversation_id: crate::anthropic::converter::extract_stable_conversation_id(
-                &route.payload,
-            ),
+            conversation_id: route.stable_conversation_id(),
             credential_id: None,
             credential_label: None,
             status,
@@ -2967,7 +3285,25 @@ fn external_pool_prepare_request(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
 ) -> Result<PreparedExternalRequest, ExternalPoolError> {
-    let mut value = match serde_json::to_value(&route.payload) {
+    if pool.request_body_mode == ExternalPoolRequestBodyMode::RawPassthrough {
+        return external_pool_prepare_raw_request(route, pool);
+    }
+
+    let Some(payload) = route.payload.as_ref() else {
+        return Err(ExternalPoolError {
+            status: None,
+            message: format!(
+                "external pool #{} requires normalized request body but raw route has no parsed payload",
+                pool.id
+            ),
+            retryable: false,
+            auto_disable_reason: None,
+            cooldown: Some((Duration::ZERO, "body_mode_mismatch".to_string())),
+            response_body: None,
+        });
+    };
+
+    let mut value = match serde_json::to_value(payload) {
         Ok(value) => value,
         Err(_) => match serde_json::from_slice::<serde_json::Value>(&route.raw_body) {
             Ok(value) => value,
@@ -2997,6 +3333,55 @@ fn external_pool_prepare_request(
     })
 }
 
+fn external_pool_prepare_raw_request(
+    route: &ExternalRouteRequest,
+    pool: &ExternalPool,
+) -> Result<PreparedExternalRequest, ExternalPoolError> {
+    match pool.raw_model_mode {
+        ExternalPoolRawModelMode::None => Ok(PreparedExternalRequest {
+            body: route.raw_body.clone(),
+            outbound_model: None,
+        }),
+        ExternalPoolRawModelMode::ProbeOnly => {
+            let probe = probe_raw_messages_body(&route.raw_body);
+            let outbound_model =
+                external_pool_raw_outbound_model(route, pool, probe.model.as_deref())?;
+            Ok(PreparedExternalRequest {
+                body: route.raw_body.clone(),
+                outbound_model,
+            })
+        }
+        ExternalPoolRawModelMode::RewriteTopLevel => {
+            let probe = probe_raw_messages_body(&route.raw_body);
+            let outbound_model =
+                external_pool_raw_outbound_model(route, pool, probe.model.as_deref())?;
+            let Some(outbound_model_value) = outbound_model.as_deref() else {
+                return Ok(PreparedExternalRequest {
+                    body: route.raw_body.clone(),
+                    outbound_model,
+                });
+            };
+            let body = rewrite_raw_top_level_model(&route.raw_body, outbound_model_value).map_err(
+                |message| ExternalPoolError {
+                    status: None,
+                    message: format!(
+                        "external pool #{} raw model rewrite failed: {}",
+                        pool.id, message
+                    ),
+                    retryable: false,
+                    auto_disable_reason: None,
+                    cooldown: Some((Duration::ZERO, "model_rewrite_failed".to_string())),
+                    response_body: None,
+                },
+            )?;
+            Ok(PreparedExternalRequest {
+                body,
+                outbound_model,
+            })
+        }
+    }
+}
+
 fn external_pool_outbound_model(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
@@ -3008,9 +3393,49 @@ fn external_pool_outbound_model(
         .map(str::trim)
         .filter(|model| !model.is_empty())
         .or_else(|| {
-            let model = route.payload.model.trim();
-            (!model.is_empty()).then_some(model)
+            route.payload.as_ref().and_then(|payload| {
+                let model = payload.model.trim();
+                (!model.is_empty()).then_some(model)
+            })
         });
+    let processed_model = route
+        .upstream_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .or(original_model);
+    let fallback_transform = (pool.normalize_model_version_dots
+        && matches!(
+            pool.model_mapping_mode,
+            ExternalPoolModelMappingMode::DirectMapping
+                | ExternalPoolModelMappingMode::ProcessedMapping
+        ))
+    .then_some(normalize_external_pool_outbound_model as fn(&str) -> String);
+    let result = process_model(
+        ModelProcessingInput {
+            original_model,
+            processed_model,
+        },
+        ModelProcessingConfig {
+            mode: pool.model_mapping_mode.processing_mode(),
+            rules: &pool.model_mapping_rules,
+            require_mapping_match: pool.model_mapping_require_match,
+            fallback_transform,
+        },
+    )
+    .map_err(|err| external_pool_model_processing_error(pool, err))?;
+    Ok(Some(result.model))
+}
+
+fn external_pool_raw_outbound_model(
+    route: &ExternalRouteRequest,
+    pool: &ExternalPool,
+    raw_model: Option<&str>,
+) -> Result<Option<String>, ExternalPoolError> {
+    let original_model = raw_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .or(route.model_hint.as_deref());
     let processed_model = route
         .upstream_model
         .as_deref()
@@ -3138,6 +3563,20 @@ fn success_response_headers_look_like_html(headers: &HeaderMap) -> bool {
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(|value| value.to_ascii_lowercase().contains("text/html"))
+        .unwrap_or(false)
+}
+
+fn response_headers_look_like_sse(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .to_ascii_lowercase()
+                .split(';')
+                .next()
+                .is_some_and(|content_type| content_type.trim() == "text/event-stream")
+        })
         .unwrap_or(false)
 }
 
@@ -3677,7 +4116,7 @@ fn external_payload_guard_retry_route(
     route: &ExternalRouteRequest,
 ) -> Option<ExternalRouteRequest> {
     let config = route.payload_guard_retry_config?;
-    let mut payload = route.payload.clone();
+    let mut payload = route.payload.clone()?;
     let (body, report) = match guard_anthropic_messages_request_reusing_body(
         &mut payload,
         config,
@@ -3696,7 +4135,7 @@ fn external_payload_guard_retry_route(
     let breakdown = breakdown_anthropic_messages_request(&payload, body.len());
     let mut next = route.clone();
     next.raw_body = body;
-    next.payload = payload;
+    next.payload = Some(payload);
     next.payload_breakdown = Some(breakdown);
     next.payload_guard_report = Some(report);
     next.payload_guard_retry_config = None;
@@ -4304,7 +4743,9 @@ fn external_pool_billing(
     let pricing_model = route
         .upstream_model
         .as_deref()
-        .unwrap_or(&route.payload.model);
+        .or(route.model_hint.as_deref())
+        .or_else(|| route.payload.as_ref().map(|payload| payload.model.as_str()))
+        .unwrap_or("unknown");
     let raw_estimate = route.pricing_catalog.estimate(pricing_model, raw_usage);
     let shaped_estimate = route.pricing_catalog.estimate(pricing_model, shaped_usage);
     let reported_estimate = route
@@ -4356,21 +4797,22 @@ fn build_external_usage_projection_context(
     output_uplift_min_tokens: i32,
     output_uplift_percent: u32,
 ) -> Option<ExternalUsageProjectionContext> {
+    let payload = route.payload()?;
     if pool.usage_projection_mode != ExternalPoolUsageProjectionMode::CurrentPathPolicy {
         return None;
     }
-    if !route.payload.stream && pool.skip_non_stream_usage_projection {
+    if !payload.stream && pool.skip_non_stream_usage_projection {
         return None;
     }
     let reported_usage = route.reported_usage.policy_for_path(&route.endpoint);
-    if !route.payload.stream && reported_usage.skip_non_stream_usage_projection {
+    if !payload.stream && reported_usage.skip_non_stream_usage_projection {
         return None;
     }
 
     let model = route
         .upstream_model
         .clone()
-        .unwrap_or_else(|| route.payload.model.clone());
+        .unwrap_or_else(|| payload.model.clone());
     let prompt_cache_supported = route
         .model_capabilities
         .supports_prompt_caching_for(&model)
@@ -4390,7 +4832,7 @@ fn build_external_usage_projection_context(
                 && route.prompt_cache_simulation_mode == PromptCacheSimulationMode::HighCache =>
         {
             let profile = route.prompt_cache.build_high_cache_profile_for_model(
-                &route.payload,
+                payload,
                 raw_input_tokens,
                 &model,
             );
@@ -4412,7 +4854,7 @@ fn build_external_usage_projection_context(
         PromptCacheStrategyType::KiroRsTool if prompt_cache_supported => {
             let plan = route.prompt_cache.compute_kiro_rs_tool_with_bounds(
                 scope.clone(),
-                &route.payload,
+                payload,
                 raw_input_tokens,
                 &model,
                 route.prompt_cache_bounds,
@@ -4490,7 +4932,7 @@ fn external_prompt_cache_scope(
     _model: &str,
 ) -> Option<PromptCacheScope> {
     Some(PromptCacheScope::new(
-        crate::anthropic::converter::extract_stable_conversation_id(&route.payload)?,
+        route.stable_conversation_id()?,
         route.prompt_cache_route_namespace.clone(),
     ))
 }
@@ -4619,6 +5061,8 @@ mod tests {
             max_concurrent_requests: 1,
             usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
             skip_non_stream_usage_projection: false,
+            request_body_mode: ExternalPoolRequestBodyMode::Normalized,
+            raw_model_mode: ExternalPoolRawModelMode::None,
             auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
             preserve_path: true,
             normalize_model_version_dots: false,
@@ -4930,7 +5374,7 @@ mod tests {
             PoolAcquireResult::Unavailable(_) => panic!("pool lease should be acquired"),
         };
         let selection = manager
-            .scan_pool_availability_uncached(&HashSet::new(), &config, true)
+            .scan_pool_availability_uncached(&HashSet::new(), &config, true, None)
             .await;
         assert!(selection.selected_pool.is_none());
         let uncached_full = selection.availability;
@@ -5196,8 +5640,9 @@ mod tests {
             role: "user".to_string(),
             content: serde_json::json!("current question"),
         });
-        route.payload.messages = messages;
-        let body = serde_json::to_string(&route.payload).expect("serialize route payload");
+        route.payload.as_mut().unwrap().messages = messages;
+        let body = serde_json::to_string(route.payload.as_ref().unwrap())
+            .expect("serialize route payload");
         route.raw_body = Bytes::from(body);
         route.payload_guard_retry_config = Some(PayloadGuardConfig {
             enabled: true,
@@ -5224,7 +5669,14 @@ mod tests {
                 .is_some_and(|report| report.trimmed_history_entries > 0)
         );
         assert_eq!(
-            retry_route.payload.messages.last().unwrap().content,
+            retry_route
+                .payload
+                .as_ref()
+                .unwrap()
+                .messages
+                .last()
+                .unwrap()
+                .content,
             serde_json::json!("current question")
         );
     }
@@ -5235,7 +5687,7 @@ mod tests {
             raw_body: Bytes::new(),
             headers: HeaderMap::new(),
             endpoint: "/v1/messages".to_string(),
-            payload: MessagesRequest {
+            payload: Some(MessagesRequest {
                 model: "claude-sonnet-4-5-20250929".to_string(),
                 max_tokens: 8,
                 messages: Vec::new(),
@@ -5246,7 +5698,10 @@ mod tests {
                 thinking: None,
                 output_config: None,
                 metadata: None,
-            },
+            }),
+            body_mode_filter: Some(ExternalPoolRequestBodyMode::Normalized),
+            model_hint: None,
+            stream_hint: None,
             request_input_tokens: 1,
             upstream_model: None,
             model_resolution_source: None,
@@ -5488,6 +5943,8 @@ data: {"type":"message_delta","note":"content_block_delta"}
             max_concurrent_requests: 10,
             usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
             skip_non_stream_usage_projection: false,
+            request_body_mode: ExternalPoolRequestBodyMode::Normalized,
+            raw_model_mode: ExternalPoolRawModelMode::None,
             auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
             auto_disabled: false,
             auto_disabled_reason: None,
@@ -5528,6 +5985,14 @@ data: {"type":"message_delta","note":"content_block_delta"}
         external_pool_outbound_body(route, pool).expect("build external outbound body")
     }
 
+    fn payload_ref(route: &ExternalRouteRequest) -> &MessagesRequest {
+        route.payload.as_ref().expect("typed test route payload")
+    }
+
+    fn payload_mut(route: &mut ExternalRouteRequest) -> &mut MessagesRequest {
+        route.payload.as_mut().expect("typed test route payload")
+    }
+
     fn test_route(model: &str) -> ExternalRouteRequest {
         let payload = test_payload(model);
         let request_input_tokens = count_external_route_input_tokens(&payload);
@@ -5535,7 +6000,10 @@ data: {"type":"message_delta","note":"content_block_delta"}
             raw_body: Bytes::new(),
             headers: HeaderMap::new(),
             endpoint: "/cc/v1/messages".to_string(),
-            payload,
+            payload: Some(payload),
+            body_mode_filter: Some(ExternalPoolRequestBodyMode::Normalized),
+            model_hint: None,
+            stream_hint: None,
             request_input_tokens,
             upstream_model: Some(model.to_string()),
             model_resolution_source: Some("exact_upstream".to_string()),
@@ -5573,6 +6041,19 @@ data: {"type":"message_delta","note":"content_block_delta"}
             payload_guard_report: None,
             payload_guard_retry_config: None,
         }
+    }
+
+    fn raw_test_route(raw_body: &'static [u8]) -> ExternalRouteRequest {
+        let mut route = test_route("raw-placeholder");
+        route.raw_body = Bytes::from_static(raw_body);
+        let (model_hint, stream_hint) = raw_messages_body_hints(&route.raw_body);
+        route.payload = None;
+        route.body_mode_filter = Some(ExternalPoolRequestBodyMode::RawPassthrough);
+        route.model_hint = model_hint;
+        route.stream_hint = stream_hint;
+        route.upstream_model = None;
+        route.model_resolution_source = None;
+        route
     }
 
     fn test_payload(model: &str) -> MessagesRequest {
@@ -5634,11 +6115,11 @@ data: {"type":"message_delta","note":"content_block_delta"}
     #[test]
     fn external_pool_outbound_body_strips_budget_tokens_for_adaptive_thinking() {
         let mut route = test_route("claude-opus-4-7-thinking");
-        route.payload.thinking = Some(Thinking {
+        payload_mut(&mut route).thinking = Some(Thinking {
             thinking_type: "adaptive".to_string(),
             budget_tokens: 20000,
         });
-        route.payload.output_config = Some(OutputConfig {
+        payload_mut(&mut route).output_config = Some(OutputConfig {
             effort: "xhigh".to_string(),
         });
         route.raw_body = Bytes::from_static(
@@ -5675,7 +6156,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
             prepared.outbound_model.as_deref(),
             Some("claude-sonnet-4-5")
         );
-        assert_eq!(route.payload.model, "claude-sonnet-4-5-20250929");
+        assert_eq!(payload_ref(&route).model, "claude-sonnet-4-5-20250929");
     }
 
     #[test]
@@ -5683,7 +6164,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
         let mut route = test_route("claude-sonnet-4-5-20250929");
         route.upstream_model = Some("claude-sonnet-4.5".to_string());
         route.model_resolution_source = Some("alias".to_string());
-        route.payload.messages = vec![Message {
+        payload_mut(&mut route).messages = vec![Message {
             role: "user".to_string(),
             content: serde_json::json!([{
                 "type": "image",
@@ -5719,11 +6200,11 @@ data: {"type":"message_delta","note":"content_block_delta"}
         let mut route = test_route("claude-opus-4-5-20251101");
         route.upstream_model = Some("claude-opus-4.5".to_string());
         route.model_resolution_source = Some("alias".to_string());
-        route.payload.thinking = Some(Thinking {
+        payload_mut(&mut route).thinking = Some(Thinking {
             thinking_type: "adaptive".to_string(),
             budget_tokens: 20000,
         });
-        route.payload.output_config = Some(OutputConfig {
+        payload_mut(&mut route).output_config = Some(OutputConfig {
             effort: "xhigh".to_string(),
         });
         route.raw_body = Bytes::from_static(
@@ -5763,6 +6244,75 @@ data: {"type":"message_delta","note":"content_block_delta"}
             serde_json::from_slice(&outbound).expect("parse outbound body");
 
         assert_eq!(value["model"], "claude-haiku-4.5");
+    }
+
+    #[test]
+    fn external_pool_raw_passthrough_keeps_body_byte_for_byte() {
+        let raw = br#" { "model":"client-model","stream":false,"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}] } "#;
+        let route = raw_test_route(raw);
+        let mut pool = test_pool("https://example.com/v1", true);
+        pool.request_body_mode = ExternalPoolRequestBodyMode::RawPassthrough;
+        pool.raw_model_mode = ExternalPoolRawModelMode::None;
+        pool.model_mapping_mode = ExternalPoolModelMappingMode::Passthrough;
+
+        let prepared = external_pool_prepare_request(&route, &pool).unwrap();
+
+        assert_eq!(prepared.body, Bytes::from_static(raw));
+        assert!(prepared.outbound_model.is_none());
+    }
+
+    #[test]
+    fn external_pool_raw_probe_only_maps_model_without_mutating_body() {
+        let raw = br#"{"model":"client-model","stream":true,"messages":[{"role":"user","content":"hello"}]}"#;
+        let route = raw_test_route(raw);
+        let mut pool = test_pool("https://example.com/v1", true);
+        pool.request_body_mode = ExternalPoolRequestBodyMode::RawPassthrough;
+        pool.raw_model_mode = ExternalPoolRawModelMode::ProbeOnly;
+        pool.model_mapping_mode = ExternalPoolModelMappingMode::PassthroughMapping;
+        pool.model_mapping_rules = vec![model_rule("client-model", "mapped-model")];
+
+        let prepared = external_pool_prepare_request(&route, &pool).unwrap();
+
+        assert_eq!(prepared.body, Bytes::from_static(raw));
+        assert_eq!(prepared.outbound_model.as_deref(), Some("mapped-model"));
+        assert_eq!(route.stream_hint, Some(true));
+        assert_eq!(route.model_hint.as_deref(), Some("client-model"));
+    }
+
+    #[test]
+    fn external_pool_raw_rewrite_changes_only_top_level_model() {
+        let raw = br#"{"messages":[{"role":"user","content":[{"type":"tool_result","content":{"model":"nested-model"}}]}],"model":"client-model","stream":false}"#;
+        let route = raw_test_route(raw);
+        let mut pool = test_pool("https://example.com/v1", true);
+        pool.request_body_mode = ExternalPoolRequestBodyMode::RawPassthrough;
+        pool.raw_model_mode = ExternalPoolRawModelMode::RewriteTopLevel;
+        pool.model_mapping_mode = ExternalPoolModelMappingMode::PassthroughMapping;
+        pool.model_mapping_rules = vec![model_rule("client-model", "mapped-model")];
+
+        let prepared = external_pool_prepare_request(&route, &pool).unwrap();
+        let text = std::str::from_utf8(&prepared.body).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&prepared.body).expect("rewritten body remains json");
+
+        assert_eq!(value["model"], "mapped-model");
+        assert_eq!(
+            value["messages"][0]["content"][0]["content"]["model"],
+            "nested-model"
+        );
+        assert!(text.contains(r#""model":"nested-model""#));
+        assert_eq!(prepared.outbound_model.as_deref(), Some("mapped-model"));
+    }
+
+    #[test]
+    fn raw_messages_body_hints_ignore_nested_model_without_top_level_model() {
+        let raw = Bytes::from_static(
+            br#"{"messages":[{"role":"user","content":[{"type":"text","model":"nested-model","text":"hello"}]}],"stream":true}"#,
+        );
+
+        let (model, stream) = raw_messages_body_hints(&raw);
+
+        assert_eq!(model, None);
+        assert_eq!(stream, Some(true));
     }
 
     #[test]
@@ -5990,7 +6540,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
     #[test]
     fn external_pool_outbound_body_strips_budget_tokens_for_disabled_thinking() {
         let mut route = test_route("claude-opus-4-7");
-        route.payload.thinking = Some(Thinking {
+        payload_mut(&mut route).thinking = Some(Thinking {
             thinking_type: "disabled".to_string(),
             budget_tokens: 20000,
         });
@@ -6010,7 +6560,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
     #[test]
     fn external_pool_outbound_body_preserves_enabled_budget_tokens() {
         let mut route = test_route("claude-sonnet-4-6-thinking");
-        route.payload.thinking = Some(Thinking {
+        payload_mut(&mut route).thinking = Some(Thinking {
             thinking_type: "enabled".to_string(),
             budget_tokens: 12345,
         });
@@ -6236,7 +6786,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
     #[test]
     fn usage_projection_skip_non_stream_keeps_stream_projection_enabled() {
         let mut route = test_route("claude-sonnet-4-5");
-        route.payload.stream = true;
+        payload_mut(&mut route).stream = true;
         let mut pool = test_pool("http://pool.example.com", false);
         pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
         pool.skip_non_stream_usage_projection = true;
@@ -6267,7 +6817,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
     #[test]
     fn usage_projection_path_skip_non_stream_keeps_stream_projection_enabled() {
         let mut route = test_route("claude-sonnet-4-5");
-        route.payload.stream = true;
+        payload_mut(&mut route).stream = true;
         route.reported_usage.path_overrides.insert(
             "/cc".to_string(),
             ReportedUsagePathPolicy {
@@ -6303,7 +6853,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
                 .get("input_tokens")
                 .and_then(|value| value.as_i64())
                 .unwrap_or_default(),
-            count_external_route_input_tokens(&route.payload) as i64
+            count_external_route_input_tokens(payload_ref(&route)) as i64
         );
         assert_eq!(
             usage
@@ -6469,7 +7019,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
         let _warmup = maybe_project_non_stream_usage(body.clone(), Some(&warmup_projection));
         warmup_projection.record_success();
 
-        route.payload.messages.extend([
+        payload_mut(&mut route).messages.extend([
             Message {
                 role: "assistant".to_string(),
                 content: serde_json::json!("ready"),
@@ -6669,7 +7219,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
         let billing = external_pool_billing_from_capture(&route, &pool, projected.usage_capture)
             .expect("billing");
 
-        assert_eq!(route.payload.model, "sonnet");
+        assert_eq!(payload_ref(&route).model, "sonnet");
         assert_eq!(billing.pricing_model.as_deref(), Some("claude-sonnet-4-5"));
         assert!(billing.pricing_available);
     }
@@ -6705,7 +7255,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
         );
         first_projection.record_success();
 
-        route.payload.messages.extend([
+        payload_mut(&mut route).messages.extend([
             Message {
                 role: "assistant".to_string(),
                 content: serde_json::json!("ready"),
@@ -6738,12 +7288,12 @@ data: {"type":"message_delta","note":"content_block_delta"}
         route.endpoint = "/kiro/v1/messages".to_string();
         route.prompt_cache_strategy_type = PromptCacheStrategyType::KiroRsTool;
         route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
-        route.payload.metadata = Some(Metadata {
+        payload_mut(&mut route).metadata = Some(Metadata {
             user_id: Some(
                 "user_test_account__session_8bb5523b-ec7c-4540-a9ca-beb6d79f1552".to_string(),
             ),
         });
-        route.payload.system = Some(vec![SystemMessage {
+        payload_mut(&mut route).system = Some(vec![SystemMessage {
             text: "stable external kiro strategy prompt ".repeat(700),
             cache_control: Some(serde_json::json!({"type": "ephemeral"})),
         }]);
@@ -6785,7 +7335,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
         );
         retry_projection.record_success();
 
-        route.payload.messages.extend([
+        payload_mut(&mut route).messages.extend([
             Message {
                 role: "assistant".to_string(),
                 content: serde_json::json!("ready"),
@@ -6844,7 +7394,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
         );
         first_projection.record_success();
 
-        route.payload.messages.extend([
+        payload_mut(&mut route).messages.extend([
             Message {
                 role: "assistant".to_string(),
                 content: serde_json::json!("ready"),

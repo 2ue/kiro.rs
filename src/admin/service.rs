@@ -3520,6 +3520,7 @@ impl AdminService {
             selection_failure_record_enabled: config.selection_failure_record_enabled,
             compression_enabled: config.compression.enabled,
             whitespace_compression: config.compression.whitespace_compression,
+            image_processing: config.image_processing.normalized(),
             payload_guard_enabled: config.payload_guard_enabled,
             payload_guard_mode: config.payload_guard_mode,
             payload_guard_max_bytes: config.payload_guard_max_bytes as u64,
@@ -3660,6 +3661,10 @@ impl AdminService {
         let payload_guard_enabled = req
             .payload_guard_enabled
             .unwrap_or(current_config.payload_guard_enabled);
+        let image_processing = req
+            .image_processing
+            .map(|config| config.normalized())
+            .unwrap_or_else(|| current_config.image_processing.normalized());
         let payload_guard_mode = req
             .payload_guard_mode
             .unwrap_or(current_config.payload_guard_mode);
@@ -4011,6 +4016,7 @@ impl AdminService {
                 config.selection_failure_sample_limit = selection_failure_sample_limit;
                 config.selection_failure_record_enabled = selection_failure_record_enabled;
                 config.compression = compression.clone();
+                config.image_processing = image_processing;
                 config.payload_guard_enabled = payload_guard_enabled;
                 config.payload_guard_mode = payload_guard_mode;
                 config.payload_guard_max_bytes = payload_guard_max_bytes;

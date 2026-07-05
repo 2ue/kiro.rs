@@ -22,6 +22,7 @@ import type {
   CachePolicyConfig,
   CacheRoutePolicyPatch,
   CompatProfile,
+  ImageProcessingConfig,
   KiroAgentModeStrategy,
   ModelCapabilitiesStatus,
   ModelMappingConfig,
@@ -124,6 +125,34 @@ const defaultPayloadShaping = (): PayloadShapingConfig => ({
   currentImagesMaxBytes: 180000,
   oversizedImageHandling: 'drop-with-placeholder',
 })
+
+const defaultImageProcessing = (): ImageProcessingConfig => ({
+  mode: 'safe',
+  safeMaterializeFileSources: true,
+  safeDownloadRemoteSources: true,
+  safeNormalizeBase64MediaTypes: true,
+})
+
+const normalizeImageProcessing = (input?: Partial<ImageProcessingConfig> | null): ImageProcessingConfig => {
+  const next: ImageProcessingConfig = {
+    ...defaultImageProcessing(),
+    ...(input ?? {}),
+  }
+  if (next.mode === 'light') {
+    return {
+      mode: 'light',
+      safeMaterializeFileSources: false,
+      safeDownloadRemoteSources: false,
+      safeNormalizeBase64MediaTypes: false,
+    }
+  }
+  return {
+    mode: 'safe',
+    safeMaterializeFileSources: Boolean(next.safeMaterializeFileSources),
+    safeDownloadRemoteSources: Boolean(next.safeDownloadRemoteSources),
+    safeNormalizeBase64MediaTypes: Boolean(next.safeNormalizeBase64MediaTypes),
+  }
+}
 
 const defaultPromptCacheCreationControl = (): PromptCacheCreationControlConfig => ({
   enabled: true,
@@ -314,6 +343,7 @@ const emptyConfig: RuntimeConfig = {
   selectionFailureRecordEnabled: true,
   compressionEnabled: false,
   whitespaceCompression: true,
+  imageProcessing: defaultImageProcessing(),
   payloadGuardEnabled: true,
   payloadGuardMode: 'preemptive',
   payloadGuardMaxBytes: 460800,
@@ -2420,6 +2450,7 @@ export function RuntimeConfigPanel() {
           ...defaultPayloadShaping(),
           ...config.data.payloadShaping,
         },
+        imageProcessing: normalizeImageProcessing(config.data.imageProcessing),
         externalPools: {
           ...defaultExternalPoolsConfig(),
           ...config.data.externalPools,
@@ -2478,6 +2509,7 @@ export function RuntimeConfigPanel() {
       schedulerTopK: toWhole(draft.schedulerTopK, 1, 100),
       selectionFailureSampleLimit: toWhole(draft.selectionFailureSampleLimit, 0, 1000),
       payloadShaping: normalizePayloadShaping(draft.payloadShaping),
+      imageProcessing: normalizeImageProcessing(draft.imageProcessing),
       promptCacheTargetReadRatio: toRatio(draft.promptCacheTargetReadRatio),
       promptCacheTokenScale: toScale(draft.promptCacheTokenScale),
       promptCacheMaxSimulatedInputTokens: toWhole(draft.promptCacheMaxSimulatedInputTokens),
@@ -2556,6 +2588,7 @@ export function RuntimeConfigPanel() {
   const payloadSizeLimitEnabled = draft.payloadGuardEnabled && draft.payloadGuardMaxBytes > 0
   const payloadShapingBranchEnabled = payloadSizeLimitEnabled && draft.payloadShaping.enabled
   const payloadGuardMode = draft.payloadGuardMode ?? 'preemptive'
+  const imageProcessingMode = draft.imageProcessing?.mode ?? 'safe'
   const payloadGuardRetryMode = payloadGuardMode === 'on_too_long'
   const defaultModelMappingRules = generateDefaultModelMappingRules(modelCapabilities.data)
   const payloadConditionTitle = payloadGuardRetryMode
@@ -2794,6 +2827,79 @@ export function RuntimeConfigPanel() {
               disabled={!draft.compressionEnabled}
               onCheckedChange={(whitespaceCompression) =>
                 setDraft((prev) => ({ ...prev, whitespaceCompression }))
+              }
+            />
+            <label className="block rounded-md border bg-background p-4">
+              <div className="mb-3">
+                <div className="text-sm font-medium">图片处理模式</div>
+                <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                  Safe 保持现有兼容修复；Light 不展开 file_id、不下载远程 URL、不解码修正 base64 媒体类型。
+                </div>
+              </div>
+              <select
+                className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                value={imageProcessingMode}
+                onChange={(event) =>
+                  setDraft((prev) => ({
+                    ...prev,
+                    imageProcessing: {
+                      ...defaultImageProcessing(),
+                      ...prev.imageProcessing,
+                      mode: event.target.value as RuntimeConfig['imageProcessing']['mode'],
+                    },
+                  }))
+                }
+              >
+                <option value="safe">Safe：兼容修复</option>
+                <option value="light">Light：轻量透传</option>
+              </select>
+            </label>
+            <ToggleField
+              title="展开本地文件 source"
+              description="把已上传文件引用展开为可发送给 Kiro 的 inline 内容。"
+              checked={Boolean(draft.imageProcessing?.safeMaterializeFileSources)}
+              disabled={imageProcessingMode !== 'safe'}
+              onCheckedChange={(safeMaterializeFileSources) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  imageProcessing: {
+                    ...defaultImageProcessing(),
+                    ...prev.imageProcessing,
+                    safeMaterializeFileSources,
+                  },
+                }))
+              }
+            />
+            <ToggleField
+              title="下载远程图片和文档"
+              description="把请求里的远程 URL 下载后转成 inline 内容，便于上游识别。"
+              checked={Boolean(draft.imageProcessing?.safeDownloadRemoteSources)}
+              disabled={imageProcessingMode !== 'safe'}
+              onCheckedChange={(safeDownloadRemoteSources) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  imageProcessing: {
+                    ...defaultImageProcessing(),
+                    ...prev.imageProcessing,
+                    safeDownloadRemoteSources,
+                  },
+                }))
+              }
+            />
+            <ToggleField
+              title="修正 base64 图片类型"
+              description="根据图片字节修正错误的 image/png、image/jpeg 等 media_type。"
+              checked={Boolean(draft.imageProcessing?.safeNormalizeBase64MediaTypes)}
+              disabled={imageProcessingMode !== 'safe'}
+              onCheckedChange={(safeNormalizeBase64MediaTypes) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  imageProcessing: {
+                    ...defaultImageProcessing(),
+                    ...prev.imageProcessing,
+                    safeNormalizeBase64MediaTypes,
+                  },
+                }))
               }
             />
             <ToggleField

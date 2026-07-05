@@ -446,7 +446,9 @@ async fn main() {
         config.kiro_cache_point_tools_only,
         config.kiro_cache_point_record_plan,
         config.kiro_upstream_stream_idle_timeout_secs,
+        config.image_processing.normalized(),
         config.payload_shaping,
+        config.external_pools.clone(),
         config.tool_format_debug.clone(),
         Some(external_pool_manager.clone()),
     );

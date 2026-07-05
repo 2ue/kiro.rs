@@ -78,6 +78,8 @@ export type ExternalPoolFormDraft = {
   enabled: boolean
   priority: number
   maxConcurrentRequests: number
+  requestBodyMode: NonNullable<CreateExternalPoolRequest['requestBodyMode']>
+  rawModelMode: NonNullable<CreateExternalPoolRequest['rawModelMode']>
   usageProjectionMode: NonNullable<CreateExternalPoolRequest['usageProjectionMode']>
   skipNonStreamUsageProjection: boolean
   autoDisablePolicy: NonNullable<CreateExternalPoolRequest['autoDisablePolicy']>
@@ -97,6 +99,8 @@ export const defaultPoolForm = (): ExternalPoolFormDraft => ({
   enabled: false,
   priority: 100,
   maxConcurrentRequests: 10,
+  requestBodyMode: 'normalized',
+  rawModelMode: 'none',
   usageProjectionMode: 'pass_through',
   skipNonStreamUsageProjection: false,
   autoDisablePolicy: 'inherit',
@@ -116,6 +120,8 @@ export const poolFormFromPool = (pool: ExternalPool): ExternalPoolFormDraft => (
   enabled: pool.enabled,
   priority: pool.priority,
   maxConcurrentRequests: pool.maxConcurrentRequests,
+  requestBodyMode: pool.requestBodyMode || 'normalized',
+  rawModelMode: pool.rawModelMode || 'none',
   usageProjectionMode: pool.usageProjectionMode,
   skipNonStreamUsageProjection: Boolean(pool.skipNonStreamUsageProjection),
   autoDisablePolicy: pool.autoDisablePolicy,
@@ -167,6 +173,13 @@ export function modelMappingDescription(mode: ExternalPool['modelMappingMode'] |
   return `先使用本系统解析后的模型匹配规则；${processedFallback}`
 }
 
+export function requestBodyModeDescription(mode: ExternalPool['requestBodyMode'] | undefined): string {
+  if (mode === 'raw_passthrough') {
+    return '请求体不进入本系统的消息解析、图片处理、schema 修正和 payload guard。是否改写顶层 model 由下方模型处理配置单独控制。'
+  }
+  return '按当前系统的标准 Anthropic 请求处理链路转发，会应用图片预处理、payload guard、thinking/model 兼容逻辑和 usage 整形上下文。'
+}
+
 export function poolModelMappingSummary(pool: ExternalPool): string {
   if (pool.modelMappingMode === 'passthrough') return '原样'
   const count = pool.modelMappingRules?.length || 0
@@ -177,6 +190,15 @@ export function poolModelMappingSummary(pool: ExternalPool): string {
       : '内部+映射'
   const fallback = pool.modelMappingRequireMatch ? '必须命中' : pool.normalizeModelVersionDots ? '未命中4.8->4-8' : '允许未命中'
   return `${mode}${count ? ` ${count}条` : ''} · ${fallback}`
+}
+
+export function poolBodyModeSummary(pool: ExternalPool): string {
+  if (pool.requestBodyMode === 'raw_passthrough') {
+    return pool.rawModelMode === 'rewrite_top_level'
+      ? 'Body：raw透传+模型处理'
+      : 'Body：raw透传'
+  }
+  return 'Body：标准处理'
 }
 
 export function usageProjectionDescription(mode: ExternalPool['usageProjectionMode'] | undefined): string {

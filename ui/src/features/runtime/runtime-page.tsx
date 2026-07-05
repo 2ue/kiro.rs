@@ -28,11 +28,13 @@ import {
 } from '@/components/ui'
 import { extractErrorMessage } from '@/lib/utils'
 import {
+  defaultImageProcessing,
   defaultPayloadShaping,
   defaultPromptCacheCreationControl,
   defaultReportedUsage,
   emptyRuntimeConfig,
   normalizeCachePolicy,
+  normalizeImageProcessing,
   normalizePromptCacheCreationControl,
   normalizeReportedUsage,
   toRatio,
@@ -213,6 +215,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     promptCacheEstimatedBytesLimit: toWhole(draft.promptCacheEstimatedBytesLimit),
     highCacheThreshold: toWhole(draft.highCacheThreshold),
     promptCacheCreationControl: normalizePromptCacheCreationControl(draft.promptCacheCreationControl),
+    imageProcessing: normalizeImageProcessing(draft.imageProcessing),
     reportedUsage: normalizeReportedUsage(draft.reportedUsage),
     cachePolicy: normalizeCachePolicy(draft.cachePolicy),
     definedCacheRoutes: normalizeDefinedCacheRoutes(draft.definedCacheRoutes),
@@ -236,6 +239,7 @@ export function RuntimePage() {
       setDraft({
         ...emptyRuntimeConfig,
         ...config.data,
+        imageProcessing: normalizeImageProcessing(config.data.imageProcessing ?? defaultImageProcessing()),
         payloadShaping: { ...defaultPayloadShaping(), ...config.data.payloadShaping },
         promptCacheCreationControl: { ...defaultPromptCacheCreationControl(), ...config.data.promptCacheCreationControl },
         reportedUsage: config.data.reportedUsage ?? defaultReportedUsage(),
@@ -246,6 +250,16 @@ export function RuntimePage() {
 
   const set = <K extends keyof RuntimeConfig>(k: K) => (v: RuntimeConfig[K]) =>
     setDraft((prev) => ({ ...prev, [k]: v }))
+
+  const setImageProcessing = <K extends keyof RuntimeConfig['imageProcessing']>(k: K) => (v: RuntimeConfig['imageProcessing'][K]) =>
+    setDraft((prev) => ({
+      ...prev,
+      imageProcessing: {
+        ...defaultImageProcessing(),
+        ...prev.imageProcessing,
+        [k]: v,
+      },
+    }))
 
   const save = () => {
     const next = normalizeConfig(draft)
@@ -284,6 +298,7 @@ export function RuntimePage() {
 
   const payloadSizeLimitEnabled = draft.payloadGuardEnabled && draft.payloadGuardMaxBytes > 0
   const payloadGuardMode = (draft.payloadGuardMode ?? 'preemptive') as PayloadGuardMode
+  const imageProcessingMode = draft.imageProcessing?.mode ?? 'safe'
   const activeMeta = runtimeSections.find((section) => section.key === activeSection) ?? runtimeSections[0]!
 
   return (
@@ -457,6 +472,55 @@ export function RuntimePage() {
                   <TwoCol>
                     <NumField label="请求大小阈值" desc="超过此大小才触发处理（如 1048576 = 1 MB）；0 表示不按大小处理" value={draft.payloadGuardMaxBytes} min={0} suffix="字节" onChange={set('payloadGuardMaxBytes')} />
                     <NumField label="安全余量" desc="处理目标比阈值小出的缓冲（如 65536 = 64 KB），避免裁剪后仍超限" value={draft.payloadGuardSafetyMarginBytes} min={0} suffix="字节" disabled={!payloadSizeLimitEnabled} onChange={set('payloadGuardSafetyMarginBytes')} />
+                  </TwoCol>
+                </div>
+                <div className="space-y-3">
+                  <div>
+                    <div className="text-sm font-semibold">图片处理</div>
+                    <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                      控制图片、文件和远程资源在发送上游前是否由本地展开或修正。
+                    </div>
+                  </div>
+                  <TwoCol>
+                    <div className="space-y-1.5">
+                      <div className="text-sm font-semibold">处理模式</div>
+                      <Select
+                        value={imageProcessingMode}
+                        onValueChange={(v) => setImageProcessing('mode')(v as RuntimeConfig['imageProcessing']['mode'])}
+                      >
+                        <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="safe">Safe：兼容修复</SelectItem>
+                          <SelectItem value="light">Light：轻量透传</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <div className="text-xs leading-5 text-muted-foreground">
+                        {imageProcessingMode === 'light'
+                          ? '不展开 file_id，不下载远程 URL，不解码修正 base64 媒体类型；只接受 inline base64 或 data URL。'
+                          : '保持现有兼容行为，可按下面开关展开文件、下载远程资源和修正图片 media_type。'}
+                      </div>
+                    </div>
+                    <TogField
+                      label="展开本地文件 source"
+                      desc="把已上传文件引用展开为可发送给 Kiro 的 inline 内容。"
+                      checked={Boolean(draft.imageProcessing?.safeMaterializeFileSources)}
+                      disabled={imageProcessingMode !== 'safe'}
+                      onChange={setImageProcessing('safeMaterializeFileSources')}
+                    />
+                    <TogField
+                      label="下载远程图片和文档"
+                      desc="把请求里的远程 URL 下载后转成 inline 内容，便于上游识别。"
+                      checked={Boolean(draft.imageProcessing?.safeDownloadRemoteSources)}
+                      disabled={imageProcessingMode !== 'safe'}
+                      onChange={setImageProcessing('safeDownloadRemoteSources')}
+                    />
+                    <TogField
+                      label="修正 base64 图片类型"
+                      desc="根据图片字节修正错误的 image/png、image/jpeg 等 media_type。"
+                      checked={Boolean(draft.imageProcessing?.safeNormalizeBase64MediaTypes)}
+                      disabled={imageProcessingMode !== 'safe'}
+                      onChange={setImageProcessing('safeNormalizeBase64MediaTypes')}
+                    />
                   </TwoCol>
                 </div>
                 <div className="space-y-3">

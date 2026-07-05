@@ -1548,14 +1548,18 @@ fn process_message_content(
 fn convert_image_source(source: super::types::ImageSource) -> Result<KiroImage, ConversionError> {
     match source.source_type.as_str() {
         "base64" => {
-            let media_type = source.media_type.ok_or_else(|| {
-                ConversionError::UnsupportedContent(
-                    "base64 image source missing media_type".to_string(),
-                )
-            })?;
             let data = source.data.ok_or_else(|| {
                 ConversionError::UnsupportedContent("base64 image source missing data".to_string())
             })?;
+            let media_type = source
+                .media_type
+                .or_else(|| parse_data_url(&data).map(|(media_type, _)| media_type))
+                .ok_or_else(|| {
+                    ConversionError::UnsupportedContent(
+                        "base64 image source missing media_type".to_string(),
+                    )
+                })?;
+            let (media_type, data) = normalize_inline_base64_source(&media_type, &data);
             let format =
                 image_format_from_base64_or_media_type(&media_type, &data).ok_or_else(|| {
                     ConversionError::UnsupportedContent(format!(
@@ -1584,9 +1588,8 @@ fn convert_image_source(source: super::types::ImageSource) -> Result<KiroImage, 
                 ))
             }
         }
-        "file" => Err(ConversionError::UnsupportedContent(
-            "image file source requires an Anthropic Files API adapter, which is not implemented"
-                .to_string(),
+        "file" | "file_id" => Err(ConversionError::UnsupportedContent(
+            "image file source was not materialized before conversion".to_string(),
         )),
         other => Err(ConversionError::UnsupportedContent(format!(
             "unsupported image source type: {}",
@@ -1595,28 +1598,57 @@ fn convert_image_source(source: super::types::ImageSource) -> Result<KiroImage, 
     }
 }
 
+fn normalize_inline_base64_source(media_type: &str, data: &str) -> (String, String) {
+    if let Some((data_url_media_type, data_url_data)) = parse_data_url(data) {
+        return (
+            normalize_media_type(&data_url_media_type),
+            strip_base64_whitespace(&data_url_data),
+        );
+    }
+    (
+        normalize_media_type(media_type),
+        strip_base64_whitespace(data),
+    )
+}
+
+fn strip_base64_whitespace(data: &str) -> String {
+    if data.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        data.chars()
+            .filter(|ch| !ch.is_ascii_whitespace())
+            .collect()
+    } else {
+        data.to_string()
+    }
+}
+
 fn convert_document_source_to_text(
     source: super::types::ImageSource,
 ) -> Result<String, ConversionError> {
     match source.source_type.as_str() {
         "text" => {
-            let media_type = source.media_type.unwrap_or_else(|| "text/plain".to_string());
+            let media_type = source
+                .media_type
+                .unwrap_or_else(|| "text/plain".to_string());
             let data = source.data.ok_or_else(|| {
                 ConversionError::UnsupportedContent("text document source missing data".to_string())
             })?;
             Ok(format_document_text(&media_type, data))
         }
         "base64" => {
-            let media_type = source.media_type.ok_or_else(|| {
-                ConversionError::UnsupportedContent(
-                    "base64 document source missing media_type".to_string(),
-                )
-            })?;
             let data = source.data.ok_or_else(|| {
                 ConversionError::UnsupportedContent(
                     "base64 document source missing data".to_string(),
                 )
             })?;
+            let media_type = source
+                .media_type
+                .or_else(|| parse_data_url(&data).map(|(media_type, _)| media_type))
+                .ok_or_else(|| {
+                    ConversionError::UnsupportedContent(
+                        "base64 document source missing media_type".to_string(),
+                    )
+                })?;
+            let (media_type, data) = normalize_inline_base64_source(&media_type, &data);
             decode_document_to_text(&media_type, &data)
         }
         "url" => {
@@ -1627,17 +1659,13 @@ fn convert_document_source_to_text(
                 decode_document_to_text(&media_type, &data)
             } else {
                 Err(ConversionError::UnsupportedContent(
-                    "remote document URL source was not materialized before conversion"
-                        .to_string(),
+                    "remote document URL source was not materialized before conversion".to_string(),
                 ))
             }
         }
-        "file" => {
-            Err(ConversionError::UnsupportedContent(
-                "document file source requires an Anthropic Files API adapter, which is not implemented"
-                    .to_string(),
-            ))
-        }
+        "file" | "file_id" => Err(ConversionError::UnsupportedContent(
+            "document file source was not materialized before conversion".to_string(),
+        )),
         other => Err(ConversionError::UnsupportedContent(format!(
             "unsupported document source type: {}",
             other
@@ -5135,6 +5163,67 @@ mod tests {
 
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].format, "jpeg");
+    }
+
+    #[test]
+    fn test_base64_image_accepts_data_url_in_data_field() {
+        let jpeg = BASE64_STANDARD.encode([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
+        let content = serde_json::json!([
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": format!("data:image/jpeg;base64,{}", jpeg)
+                }
+            }
+        ]);
+
+        let (_, images, _) = process_message_content(&content).expect("process");
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, "jpeg");
+        assert_eq!(images[0].source.bytes.as_deref(), Some(jpeg.as_str()));
+    }
+
+    #[test]
+    fn test_base64_image_data_url_can_supply_media_type() {
+        let png = BASE64_STANDARD.encode([0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']);
+        let content = serde_json::json!([
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "data": format!("data:image/png;base64,{}", png)
+                }
+            }
+        ]);
+
+        let (_, images, _) = process_message_content(&content).expect("process");
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, "png");
+        assert_eq!(images[0].source.bytes.as_deref(), Some(png.as_str()));
+    }
+
+    #[test]
+    fn test_base64_image_strips_whitespace_before_kiro_conversion() {
+        let png = "iVBORw0KGgo=";
+        let content = serde_json::json!([
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBO\nRw0K Ggo="
+                }
+            }
+        ]);
+
+        let (_, images, _) = process_message_content(&content).expect("process");
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].source.bytes.as_deref(), Some(png));
     }
 
     #[test]

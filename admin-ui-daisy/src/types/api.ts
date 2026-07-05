@@ -984,6 +984,8 @@ export type ExternalPoolAuthType = 'bearer' | 'x_api_key'
 export type ExternalPoolUsageProjectionMode = 'pass_through' | 'current_path_policy'
 export type ExternalPoolAutoDisablePolicy = 'inherit' | 'disabled' | 'enabled'
 export type ExternalPoolModelMappingMode = 'passthrough' | 'passthrough_mapping' | 'direct_mapping' | 'processed_mapping'
+export type ExternalPoolRequestBodyMode = 'normalized' | 'raw_passthrough'
+export type ExternalPoolRawModelMode = 'none' | 'probe_only' | 'rewrite_top_level'
 
 export interface ExternalPoolModelMappingRule {
   enabled?: boolean
@@ -1098,6 +1100,14 @@ export interface PromptCacheCreationControlConfig {
 }
 
 export type OversizedImageHandling = 'drop-with-placeholder' | 'reject'
+export type ImageProcessingMode = 'safe' | 'light'
+
+export interface ImageProcessingConfig {
+  mode: ImageProcessingMode
+  safeMaterializeFileSources: boolean
+  safeDownloadRemoteSources: boolean
+  safeNormalizeBase64MediaTypes: boolean
+}
 
 export interface PayloadShapingConfig {
   enabled: boolean
@@ -1183,6 +1193,8 @@ export interface ExternalPool {
   maxConcurrentRequests: number
   usageProjectionMode: ExternalPoolUsageProjectionMode
   skipNonStreamUsageProjection: boolean
+  requestBodyMode: ExternalPoolRequestBodyMode
+  rawModelMode: ExternalPoolRawModelMode
   autoDisablePolicy: ExternalPoolAutoDisablePolicy
   autoDisabled: boolean
   autoDisabledReason?: string
@@ -1226,6 +1238,8 @@ export interface CreateExternalPoolRequest {
   maxConcurrentRequests?: number
   usageProjectionMode?: ExternalPoolUsageProjectionMode
   skipNonStreamUsageProjection?: boolean
+  requestBodyMode?: ExternalPoolRequestBodyMode
+  rawModelMode?: ExternalPoolRawModelMode
   autoDisablePolicy?: ExternalPoolAutoDisablePolicy
   preservePath?: boolean
   normalizeModelVersionDots?: boolean
@@ -1245,6 +1259,8 @@ export interface UpdateExternalPoolRequest {
   maxConcurrentRequests?: number
   usageProjectionMode?: ExternalPoolUsageProjectionMode
   skipNonStreamUsageProjection?: boolean
+  requestBodyMode?: ExternalPoolRequestBodyMode
+  rawModelMode?: ExternalPoolRawModelMode
   autoDisablePolicy?: ExternalPoolAutoDisablePolicy
   preservePath?: boolean
   normalizeModelVersionDots?: boolean
@@ -1309,6 +1325,7 @@ export interface RuntimeConfig {
   selectionFailureRecordEnabled: boolean
   compressionEnabled: boolean
   whitespaceCompression: boolean
+  imageProcessing: ImageProcessingConfig
   payloadGuardEnabled: boolean
   payloadGuardMode: PayloadGuardMode
   payloadGuardMaxBytes: number

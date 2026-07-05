@@ -15,11 +15,12 @@ use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::model::config::{
     CacheBoundsPolicy, CachePointPolicy, CachePolicyConfig, CacheRoutePolicy,
-    CacheSimulationPolicy, CompatProfile, Config, ExternalPoolsConfig, KiroRsToolCachePolicy,
-    ModelMappingConfig, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
-    PromptCacheCreationControlConfig, PromptCacheSimulationMode, PromptCacheStrategyType,
-    ReportedUsageConfig, ReportedUsagePathPolicy, ResolvedCacheRoutePolicy, ThinkingTriggerMode,
-    normalize_defined_cache_route, normalize_defined_cache_routes, resolve_cache_policy_for_path,
+    CacheSimulationPolicy, CompatProfile, Config, ExternalPoolsConfig, ImageProcessingConfig,
+    KiroRsToolCachePolicy, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
+    PayloadShapingConfig, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
+    PromptCacheStrategyType, ReportedUsageConfig, ReportedUsagePathPolicy,
+    ResolvedCacheRoutePolicy, ThinkingTriggerMode, normalize_defined_cache_route,
+    normalize_defined_cache_routes, resolve_cache_policy_for_path,
 };
 use crate::token;
 use anyhow::Error;
@@ -30,21 +31,20 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bytes::Bytes;
 use chrono::Utc;
 use futures::{Stream, StreamExt, stream};
 use parking_lot::Mutex;
-use reqwest::header::{CONTENT_TYPE as REQWEST_CONTENT_TYPE, LOCATION as REQWEST_LOCATION};
+use reqwest::header::CONTENT_TYPE as REQWEST_CONTENT_TYPE;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tokio::time::{Instant, interval, sleep_until};
 
+use super::body_processing;
 use super::converter::{
     ConversionError, ConverterOptions, ProxyWarnings, convert_request_with_resolved_model,
-    extract_stable_conversation_id, infer_document_media_type_from_url,
-    infer_image_format_from_url,
+    extract_stable_conversation_id,
 };
 use super::envelope;
 use super::middleware::AppState;
@@ -74,14 +74,14 @@ use super::usage::{
 };
 use super::websearch;
 use crate::external_pool::{
-    ExternalPoolFinalError, ExternalPoolForwardOutcome, ExternalPoolManager, ExternalRouteRequest,
+    ExternalPoolFinalError, ExternalPoolForwardOutcome, ExternalPoolManager,
+    ExternalPoolRequestBodyMode, ExternalRouteRequest, raw_messages_body_hints,
 };
 use crate::http_client::response_bytes_with_body_timeout;
 use crate::kiro::call_trace::KiroCredentialAttempt;
 use crate::kiro::provider::{KiroProvider, KiroStreamCompletion};
 use crate::kiro::token_manager::LocalPoolRouteStateKind;
 
-const MAX_REMOTE_MULTIMODAL_BYTES: usize = 20 * 1024 * 1024;
 const UPSTREAM_INVALID_REQUEST_MESSAGE: &str = envelope::PUBLIC_INVALID_REQUEST_MESSAGE;
 const LATENCY_COUNTER_UNSET: u32 = u32::MAX;
 const OBSERVABILITY_HASH_BYTES: usize = 8;
@@ -597,7 +597,9 @@ struct RequestRuntimeConfig {
     kiro_cache_point_tools_only: bool,
     kiro_cache_point_record_plan: bool,
     kiro_upstream_stream_idle_timeout_secs: u64,
+    image_processing: ImageProcessingConfig,
     payload_shaping: PayloadShapingConfig,
+    external_pools: ExternalPoolsConfig,
 }
 
 impl RequestRuntimeConfig {
@@ -631,7 +633,9 @@ impl RequestRuntimeConfig {
             kiro_cache_point_tools_only: state.kiro_cache_point_tools_only,
             kiro_cache_point_record_plan: state.kiro_cache_point_record_plan,
             kiro_upstream_stream_idle_timeout_secs: state.kiro_upstream_stream_idle_timeout_secs,
+            image_processing: state.image_processing.normalized(),
             payload_shaping: state.payload_shaping,
+            external_pools: state.external_pools.clone(),
         }
     }
 
@@ -685,7 +689,9 @@ impl RequestRuntimeConfig {
             kiro_cache_point_tools_only: config.kiro_cache_point_tools_only,
             kiro_cache_point_record_plan: config.kiro_cache_point_record_plan,
             kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
+            image_processing: config.image_processing.normalized(),
             payload_shaping: config.payload_shaping,
+            external_pools: config.external_pools.clone(),
         }
     }
 
@@ -928,6 +934,14 @@ fn request_runtime_config(state: &AppState, provider: &KiroProvider) -> RequestR
     )
 }
 
+fn request_image_processing_config(state: &AppState) -> ImageProcessingConfig {
+    state
+        .kiro_provider
+        .as_ref()
+        .map(|provider| request_runtime_config(state, provider).image_processing)
+        .unwrap_or_else(|| state.image_processing.normalized())
+}
+
 fn parse_messages_payload(raw_body: &Bytes) -> Result<MessagesRequest, Response> {
     let payload = serde_json::from_slice::<MessagesRequest>(raw_body).map_err(|err| {
         envelope::error_response(
@@ -946,9 +960,81 @@ fn parse_messages_payload(raw_body: &Bytes) -> Result<MessagesRequest, Response>
     Ok(payload)
 }
 
+async fn maybe_raw_external_direct_response(
+    state: &AppState,
+    headers: HeaderMap,
+    raw_body: Bytes,
+    endpoint: &str,
+) -> Option<Response> {
+    let provider = state.kiro_provider.as_ref()?.clone();
+    let manager = state.external_pool_manager.clone()?;
+    let runtime_config = request_runtime_config(state, &provider);
+    let cache_route = runtime_config.cache_policy_for_path(endpoint);
+    let config = runtime_config.external_pools.clone();
+    if !manager
+        .has_eligible_pool_for_body_mode(&config, ExternalPoolRequestBodyMode::RawPassthrough)
+        .await
+    {
+        return None;
+    }
+
+    let (model_hint, stream_hint) = raw_messages_body_hints(&raw_body);
+    let reason = manager
+        .direct_policy_reason(&config, endpoint, model_hint.as_deref().unwrap_or(""))
+        .await?;
+    let policy = &cache_route.policy;
+    let request_id = envelope::request_id();
+    let route = ExternalRouteRequest {
+        raw_body,
+        headers,
+        endpoint: endpoint.to_string(),
+        payload: None,
+        body_mode_filter: Some(ExternalPoolRequestBodyMode::RawPassthrough),
+        model_hint,
+        stream_hint,
+        request_input_tokens: 0,
+        upstream_model: None,
+        model_resolution_source: None,
+        model_resolution_note: None,
+        route_subtype: UsageRouteSubtype::ExternalDirectPolicy,
+        fallback_reason: None,
+        direct_policy_reason: Some(reason),
+        local_attempted: false,
+        local_preflight: None,
+        local_attempts: Vec::new(),
+        reported_usage: reported_usage_config_for_policy(policy.reported_usage.clone()),
+        prompt_cache: state.prompt_cache.clone(),
+        prompt_cache_creation_controller: state.prompt_cache_creation_controller.clone(),
+        prompt_cache_strategy_type: policy.cache_type,
+        prompt_cache_simulation_mode: prompt_cache_simulation_mode_for_policy(policy),
+        prompt_cache_route_namespace: cache_route.namespace.clone(),
+        prompt_cache_target_read_ratio: policy.simulation.target_read_ratio,
+        prompt_cache_token_scale: policy.simulation.token_scale,
+        prompt_cache_max_simulated_input_tokens: policy.simulation.max_simulated_input_tokens,
+        prompt_cache_cap_jitter_min_tokens: policy.simulation.cap_jitter_min_tokens,
+        prompt_cache_cap_jitter_max_tokens: policy.simulation.cap_jitter_max_tokens,
+        prompt_cache_scale_min_input_tokens: policy.simulation.scale_min_input_tokens,
+        prompt_cache_creation_control: policy.creation_control,
+        prompt_cache_bounds: prompt_cache_bounds_for_policy(policy),
+        kiro_rs_tool_cache_policy: policy.kiro_rs_tool,
+        model_capabilities: state.model_capabilities.clone(),
+        pricing_catalog: state.pricing_catalog.clone(),
+        request_id: request_id.clone(),
+        error_id: envelope::request_id(),
+        recorder: state.usage_recorder.clone(),
+        started_at: Instant::now(),
+        first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+        latency_trace: Arc::new(crate::external_pool::ExternalLatencyTraceState::default()),
+        payload_breakdown: None,
+        payload_guard_report: None,
+        payload_guard_retry_config: None,
+    };
+
+    Some(manager.forward_with_failover(config, route).await)
+}
+
 fn build_external_fallback_context(
     state: &AppState,
-    provider: &KiroProvider,
     runtime_config: &RequestRuntimeConfig,
     cache_route: &ResolvedCacheRoutePolicy,
     endpoint: &str,
@@ -957,7 +1043,7 @@ fn build_external_fallback_context(
     payload: &MessagesRequest,
 ) -> Option<ExternalFallbackContext> {
     let manager = state.external_pool_manager.clone()?;
-    let config = provider.runtime_config().external_pools;
+    let config = runtime_config.external_pools.clone();
     let policy = &cache_route.policy;
     config
         .external_pools_enabled
@@ -1214,7 +1300,10 @@ impl ExternalFallbackContext {
             raw_body: guarded_payload.raw_body,
             headers: self.headers.clone(),
             endpoint: self.endpoint.clone(),
-            payload: guarded_payload.payload,
+            payload: Some(guarded_payload.payload),
+            body_mode_filter: Some(ExternalPoolRequestBodyMode::Normalized),
+            model_hint: None,
+            stream_hint: None,
             request_input_tokens,
             upstream_model: self
                 .model_resolution
@@ -1992,6 +2081,7 @@ fn is_thinking_delta_output_event(event: &SseEvent) -> bool {
         .is_some_and(|thinking| !thinking.is_empty())
 }
 
+#[cfg(test)]
 fn reported_cache_usage_policy(
     strategy_type: PromptCacheStrategyType,
     simulation_mode: PromptCacheSimulationMode,
@@ -2902,458 +2992,6 @@ impl Drop for StreamUsageGuard {
 
 fn credential_label(provider: &crate::kiro::provider::KiroProvider, id: u64) -> Option<String> {
     provider.credential_label(id)
-}
-
-async fn materialize_remote_multimodal_sources(
-    payload: &mut MessagesRequest,
-    caller_user_agent: Option<&str>,
-) -> Result<(), String> {
-    let mut builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(25))
-        .redirect(reqwest::redirect::Policy::none());
-    // 透传调用方原始 User-Agent；若调用方未提供则不强制设置。
-    if let Some(ua) = caller_user_agent {
-        if !ua.is_empty() {
-            builder = builder.user_agent(ua);
-        }
-    }
-    let client = builder
-        .build()
-        .map_err(|e| format!("failed to create remote source client: {}", e))?;
-
-    for message in &mut payload.messages {
-        materialize_content_sources(&client, &mut message.content).await?;
-    }
-
-    Ok(())
-}
-
-fn normalize_base64_image_media_types(payload: &mut MessagesRequest) -> usize {
-    let mut fixed = 0usize;
-    for message in &mut payload.messages {
-        fixed += normalize_content_base64_image_media_types(&mut message.content);
-    }
-    if fixed > 0 {
-        tracing::warn!(
-            fixed,
-            "base64 image media_type mismatches were corrected before upstream routing"
-        );
-    }
-    fixed
-}
-
-fn normalize_content_base64_image_media_types(content: &mut Value) -> usize {
-    let Value::Array(items) = content else {
-        return 0;
-    };
-
-    let mut fixed = 0usize;
-    for item in items {
-        let Some(obj) = item.as_object_mut() else {
-            continue;
-        };
-        if obj.get("type").and_then(Value::as_str) != Some("image") {
-            continue;
-        }
-        let Some(source) = obj.get_mut("source").and_then(Value::as_object_mut) else {
-            continue;
-        };
-        if source.get("type").and_then(Value::as_str) != Some("base64") {
-            continue;
-        }
-        let Some(data) = source.get("data").and_then(Value::as_str) else {
-            continue;
-        };
-        let Ok(bytes) = BASE64_STANDARD.decode(data) else {
-            continue;
-        };
-        let Some(detected_media_type) = infer_image_media_type_from_bytes(&bytes) else {
-            continue;
-        };
-        let declared_media_type = source
-            .get("media_type")
-            .and_then(Value::as_str)
-            .map(normalize_media_type);
-        if declared_media_type.as_deref() == Some(detected_media_type) {
-            continue;
-        }
-        source.insert(
-            "media_type".to_string(),
-            Value::String(detected_media_type.to_string()),
-        );
-        fixed += 1;
-    }
-    fixed
-}
-
-async fn materialize_content_sources(
-    client: &reqwest::Client,
-    content: &mut Value,
-) -> Result<(), String> {
-    let Value::Array(items) = content else {
-        return Ok(());
-    };
-
-    for item in items {
-        let Some((block_type, url, provided_media_type)) = remote_source_info(item) else {
-            continue;
-        };
-        if url.starts_with("data:") {
-            continue;
-        }
-
-        let (media_type, data) =
-            download_remote_multimodal_source(client, &block_type, &url, provided_media_type)
-                .await?;
-        replace_source_with_base64(item, media_type, data);
-    }
-
-    Ok(())
-}
-
-fn remote_source_info(item: &Value) -> Option<(String, String, Option<String>)> {
-    let obj = item.as_object()?;
-    let block_type = obj.get("type")?.as_str()?;
-    if block_type != "image" && block_type != "document" {
-        return None;
-    }
-    let source = obj.get("source")?.as_object()?;
-    if source.get("type")?.as_str()? != "url" {
-        return None;
-    }
-    let url = source.get("url")?.as_str()?.to_string();
-    let media_type = source
-        .get("media_type")
-        .and_then(|v| v.as_str())
-        .map(normalize_media_type);
-    Some((block_type.to_string(), url, media_type))
-}
-
-async fn download_remote_multimodal_source(
-    client: &reqwest::Client,
-    block_type: &str,
-    url: &str,
-    provided_media_type: Option<String>,
-) -> Result<(String, String), String> {
-    let mut current_url = url.to_string();
-    let mut response = None;
-
-    for redirect_count in 0..=5 {
-        if !current_url.starts_with("https://") && !current_url.starts_with("http://") {
-            return Err(format!(
-                "{} URL source must use http or https: {}",
-                block_type, current_url
-            ));
-        }
-
-        ensure_safe_remote_url_resolves(&current_url)
-            .await
-            .map_err(|reason| format!("{} URL rejected: {}", block_type, reason))?;
-
-        let candidate = client
-            .get(&current_url)
-            .send()
-            .await
-            .map_err(|e| format!("failed to download {} URL source: {}", block_type, e))?;
-
-        if candidate.status().is_redirection() {
-            if redirect_count >= 5 {
-                return Err(format!("{} URL source has too many redirects", block_type));
-            }
-
-            let location = candidate
-                .headers()
-                .get(REQWEST_LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| {
-                    format!(
-                        "{} URL source redirect is missing Location header",
-                        block_type
-                    )
-                })?;
-            let next_url = candidate
-                .url()
-                .join(location)
-                .map_err(|e| format!("invalid {} URL redirect: {}", block_type, e))?;
-            current_url = next_url.to_string();
-            continue;
-        }
-
-        response = Some(candidate);
-        break;
-    }
-
-    let response =
-        response.ok_or_else(|| format!("failed to download {} URL source", block_type))?;
-    let final_url = response.url().to_string();
-    if !final_url.starts_with("https://") && !final_url.starts_with("http://") {
-        return Err(format!(
-            "{} URL source must use http or https: {}",
-            block_type, final_url
-        ));
-    }
-    ensure_safe_remote_url_resolves(&final_url)
-        .await
-        .map_err(|reason| format!("{} URL rejected: {}", block_type, reason))?;
-
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!(
-            "failed to download {} URL source: HTTP {}",
-            block_type, status
-        ));
-    }
-
-    if response
-        .content_length()
-        .is_some_and(|len| len > MAX_REMOTE_MULTIMODAL_BYTES as u64)
-    {
-        return Err(format!(
-            "{} URL source exceeds {} bytes",
-            block_type, MAX_REMOTE_MULTIMODAL_BYTES
-        ));
-    }
-
-    let response_media_type = response
-        .headers()
-        .get(REQWEST_CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(normalize_media_type);
-    let bytes = read_limited_response_body(response, block_type).await?;
-
-    let media_type = infer_remote_media_type(
-        block_type,
-        &final_url,
-        provided_media_type.as_deref(),
-        response_media_type.as_deref(),
-        bytes.as_slice(),
-    )
-    .ok_or_else(|| {
-        format!(
-            "unsupported {} URL media type for {}",
-            block_type, final_url
-        )
-    })?;
-
-    Ok((media_type, BASE64_STANDARD.encode(bytes.as_slice())))
-}
-
-async fn read_limited_response_body(
-    response: reqwest::Response,
-    block_type: &str,
-) -> Result<Vec<u8>, String> {
-    let mut stream = response.bytes_stream();
-    let mut bytes = Vec::new();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|e| format!("failed to read {} URL source: {}", block_type, e))?;
-        if bytes.len() + chunk.len() > MAX_REMOTE_MULTIMODAL_BYTES {
-            return Err(format!(
-                "{} URL source exceeds {} bytes",
-                block_type, MAX_REMOTE_MULTIMODAL_BYTES
-            ));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-
-    Ok(bytes)
-}
-
-fn replace_source_with_base64(item: &mut Value, media_type: String, data: String) {
-    let Some(obj) = item.as_object_mut() else {
-        return;
-    };
-    obj.insert(
-        "source".to_string(),
-        json!({
-            "type": "base64",
-            "media_type": media_type,
-            "data": data
-        }),
-    );
-}
-
-fn infer_remote_media_type(
-    block_type: &str,
-    url: &str,
-    provided: Option<&str>,
-    response: Option<&str>,
-    bytes: &[u8],
-) -> Option<String> {
-    for candidate in [provided, response].into_iter().flatten() {
-        if is_supported_remote_media_type(block_type, candidate) {
-            return Some(candidate.to_string());
-        }
-    }
-
-    if block_type == "image" {
-        if let Some(media_type) = infer_image_media_type_from_bytes(bytes) {
-            return Some(media_type.to_string());
-        }
-        return infer_image_format_from_url(url)
-            .and_then(|format| image_media_type_from_format(&format).map(str::to_string));
-    }
-
-    if bytes.starts_with(b"%PDF") {
-        return Some("application/pdf".to_string());
-    }
-    let inferred = infer_document_media_type_from_url(url);
-    is_supported_remote_media_type(block_type, &inferred).then_some(inferred)
-}
-
-fn is_supported_remote_media_type(block_type: &str, media_type: &str) -> bool {
-    match block_type {
-        "image" => matches!(
-            media_type,
-            "image/jpeg" | "image/png" | "image/gif" | "image/webp"
-        ),
-        "document" => matches!(
-            media_type,
-            "application/pdf"
-                | "text/plain"
-                | "text/markdown"
-                | "text/html"
-                | "text/csv"
-                | "application/json"
-        ),
-        _ => false,
-    }
-}
-
-fn normalize_media_type(raw: &str) -> String {
-    raw.split(';')
-        .next()
-        .unwrap_or(raw)
-        .trim()
-        .to_ascii_lowercase()
-}
-
-fn infer_image_media_type_from_bytes(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
-        Some("image/png")
-    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-        Some("image/jpeg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
-        Some("image/webp")
-    } else {
-        None
-    }
-}
-
-fn image_media_type_from_format(format: &str) -> Option<&'static str> {
-    match format {
-        "jpeg" => Some("image/jpeg"),
-        "png" => Some("image/png"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        _ => None,
-    }
-}
-
-/// 拒绝指向私有/回环/链路本地/云元数据等敏感网络的 URL，避免 SSRF。
-fn ensure_safe_remote_url(url_str: &str) -> Result<(), String> {
-    let parsed = ::url::Url::parse(url_str).map_err(|e| format!("invalid URL: {}", e))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| "URL missing host".to_string())?;
-
-    let lower = host.to_ascii_lowercase();
-    const BLOCKED_HOSTS: &[&str] = &[
-        "localhost",
-        "ip6-localhost",
-        "ip6-loopback",
-        "metadata.google.internal",
-        "metadata",
-        "instance-data",
-    ];
-    if BLOCKED_HOSTS.contains(&lower.as_str()) || lower.ends_with(".localhost") {
-        return Err(format!("host {} is blocked", host));
-    }
-
-    let parsed_host_ip = match parsed.host() {
-        Some(::url::Host::Ipv4(ip)) => Some(std::net::IpAddr::V4(ip)),
-        Some(::url::Host::Ipv6(ip)) => Some(std::net::IpAddr::V6(ip)),
-        _ => host.parse::<std::net::IpAddr>().ok(),
-    };
-    if let Some(addr) = parsed_host_ip {
-        if is_blocked_ip(&addr) {
-            return Err(format!("IP {} is in a blocked range", addr));
-        }
-    }
-
-    Ok(())
-}
-
-async fn ensure_safe_remote_url_resolves(url_str: &str) -> Result<(), String> {
-    ensure_safe_remote_url(url_str)?;
-
-    let parsed = ::url::Url::parse(url_str).map_err(|e| format!("invalid URL: {}", e))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| "URL missing host".to_string())?;
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return Ok(());
-    }
-
-    let port = parsed
-        .port_or_known_default()
-        .ok_or_else(|| "URL has no resolvable port".to_string())?;
-    let addrs = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| format!("DNS lookup failed for {}: {}", host, e))?;
-
-    let mut resolved_any = false;
-    for addr in addrs {
-        resolved_any = true;
-        let ip = addr.ip();
-        if is_blocked_ip(&ip) {
-            return Err(format!("resolved IP {} is in a blocked range", ip));
-        }
-    }
-
-    if !resolved_any {
-        return Err(format!("DNS lookup returned no records for {}", host));
-    }
-
-    Ok(())
-}
-
-fn is_blocked_ip(addr: &std::net::IpAddr) -> bool {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-
-    match addr {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_broadcast()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                || v4.is_documentation()
-                // CGNAT 100.64.0.0/10
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
-                // AWS/GCP/Azure metadata 169.254.169.254 已被 link_local 覆盖
-                || *v4 == Ipv4Addr::new(0, 0, 0, 0)
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                // ULA fc00::/7
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
-                // Link-local fe80::/10
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-                // IPv4-mapped: 解出来再判
-                || v6
-                    .to_ipv4_mapped()
-                    .map(|m| is_blocked_ip(&IpAddr::V4(m)))
-                    .unwrap_or(false)
-                || *v6 == Ipv6Addr::UNSPECIFIED
-        }
-    }
 }
 
 fn prepare_usage_context(
@@ -4385,6 +4023,16 @@ pub async fn post_messages(
     headers: HeaderMap,
     raw_body: Bytes,
 ) -> Response {
+    if let Some(response) = maybe_raw_external_direct_response(
+        &state,
+        headers.clone(),
+        raw_body.clone(),
+        "/v1/messages",
+    )
+    .await
+    {
+        return response;
+    }
     let payload = match parse_messages_payload(&raw_body) {
         Ok(payload) => payload,
         Err(response) => return response,
@@ -4407,6 +4055,16 @@ pub async fn post_messages_real_cache_usage(
     headers: HeaderMap,
     raw_body: Bytes,
 ) -> Response {
+    if let Some(response) = maybe_raw_external_direct_response(
+        &state,
+        headers.clone(),
+        raw_body.clone(),
+        "/na/v1/messages",
+    )
+    .await
+    {
+        return response;
+    }
     let payload = match parse_messages_payload(&raw_body) {
         Ok(payload) => payload,
         Err(response) => return response,
@@ -4429,6 +4087,16 @@ pub async fn post_messages_ha(
     headers: HeaderMap,
     raw_body: Bytes,
 ) -> Response {
+    if let Some(response) = maybe_raw_external_direct_response(
+        &state,
+        headers.clone(),
+        raw_body.clone(),
+        "/ha/v1/messages",
+    )
+    .await
+    {
+        return response;
+    }
     let payload = match parse_messages_payload(&raw_body) {
         Ok(payload) => payload,
         Err(response) => return response,
@@ -4456,18 +4124,18 @@ pub async fn post_messages_dfcache(
         Ok(prefix) => prefix,
         Err(response) => return response,
     };
+    let endpoint = format!("{prefix}/v1/messages");
+    if let Some(response) =
+        maybe_raw_external_direct_response(&state, headers.clone(), raw_body.clone(), &endpoint)
+            .await
+    {
+        return response;
+    }
     let payload = match parse_messages_payload(&raw_body) {
         Ok(payload) => payload,
         Err(response) => return response,
     };
-    post_messages_inner(
-        state,
-        headers,
-        raw_body,
-        payload,
-        format!("{prefix}/v1/messages"),
-    )
-    .await
+    post_messages_inner(state, headers, raw_body, payload, endpoint).await
 }
 
 async fn post_messages_inner(
@@ -4505,7 +4173,6 @@ async fn post_messages_inner(
     let cache_type = cache_route.policy.cache_type;
     let mut external_fallback = build_external_fallback_context(
         &state,
-        &provider,
         &runtime_config,
         &cache_route,
         &endpoint,
@@ -4522,11 +4189,17 @@ async fn post_messages_inner(
     let caller_ua = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok());
-    if let Err(message) = materialize_remote_multimodal_sources(&mut payload, caller_ua).await {
-        tracing::warn!("多模态远程 source 处理失败: {}", message);
+    if let Err(message) = body_processing::prepare_multimodal_sources(
+        &state.file_store,
+        &mut payload,
+        caller_ua,
+        runtime_config.image_processing,
+    )
+    .await
+    {
+        tracing::warn!("多模态 source 处理失败: {}", message);
         return envelope::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message);
     }
-    normalize_base64_image_media_types(&mut payload);
 
     if let Some(external) = external_fallback.as_mut() {
         external.refresh_payload(&payload);
@@ -7026,13 +6699,27 @@ fn should_force_visible_thinking(
 ///
 /// 计算消息的 token 数量
 pub async fn count_tokens(
-    JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
-) -> impl IntoResponse {
+    State(state): State<AppState>,
+    JsonExtractor(mut payload): JsonExtractor<CountTokensRequest>,
+) -> Response {
     tracing::info!(
         model = %payload.model,
         message_count = %payload.messages.len(),
         "Received POST /v1/messages/count_tokens request"
     );
+
+    let image_processing = request_image_processing_config(&state);
+    if let Err(message) = body_processing::prepare_multimodal_message_sources(
+        &state.file_store,
+        &mut payload.messages,
+        None,
+        image_processing,
+    )
+    .await
+    {
+        tracing::warn!("count_tokens 多模态 source 处理失败: {}", message);
+        return envelope::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message);
+    }
 
     let total_tokens = token::count_all_tokens(
         &payload.model,
@@ -7044,16 +6731,29 @@ pub async fn count_tokens(
     Json(CountTokensResponse {
         input_tokens: total_tokens.max(1) as i32,
     })
+    .into_response()
 }
 
 /// POST /dfcache/:route/v1/messages/count_tokens
 pub async fn count_tokens_dfcache(
     State(state): State<AppState>,
     Path(route): Path<String>,
-    JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
+    JsonExtractor(mut payload): JsonExtractor<CountTokensRequest>,
 ) -> Response {
     if let Err(response) = resolve_defined_cache_route(&state, &route) {
         return response;
+    }
+    let image_processing = request_image_processing_config(&state);
+    if let Err(message) = body_processing::prepare_multimodal_message_sources(
+        &state.file_store,
+        &mut payload.messages,
+        None,
+        image_processing,
+    )
+    .await
+    {
+        tracing::warn!("dfcache count_tokens 多模态 source 处理失败: {}", message);
+        return envelope::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message);
     }
 
     let total_tokens = token::count_all_tokens(
@@ -7079,6 +6779,16 @@ pub async fn post_messages_cc(
     headers: HeaderMap,
     raw_body: Bytes,
 ) -> Response {
+    if let Some(response) = maybe_raw_external_direct_response(
+        &state,
+        headers.clone(),
+        raw_body.clone(),
+        "/cc/v1/messages",
+    )
+    .await
+    {
+        return response;
+    }
     let mut payload = match parse_messages_payload(&raw_body) {
         Ok(payload) => payload,
         Err(response) => return response,
@@ -7111,7 +6821,6 @@ pub async fn post_messages_cc(
     let cache_type = cache_route.policy.cache_type;
     let mut external_fallback = build_external_fallback_context(
         &state,
-        &provider,
         &runtime_config,
         &cache_route,
         "/cc/v1/messages",
@@ -7128,11 +6837,17 @@ pub async fn post_messages_cc(
     let caller_ua = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok());
-    if let Err(message) = materialize_remote_multimodal_sources(&mut payload, caller_ua).await {
-        tracing::warn!("多模态远程 source 处理失败: {}", message);
+    if let Err(message) = body_processing::prepare_multimodal_sources(
+        &state.file_store,
+        &mut payload,
+        caller_ua,
+        runtime_config.image_processing,
+    )
+    .await
+    {
+        tracing::warn!("多模态 source 处理失败: {}", message);
         return envelope::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message);
     }
-    normalize_base64_image_media_types(&mut payload);
 
     if let Some(external) = external_fallback.as_mut() {
         external.refresh_payload(&payload);
@@ -7567,28 +7282,6 @@ mod tests {
     }
 
     #[test]
-    fn normalize_base64_image_media_types_uses_detected_bytes() {
-        let jpeg = BASE64_STANDARD.encode([0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0x00]);
-        let mut payload = messages_request_for_model("claude-sonnet-4-5-20250929");
-        payload.messages[0].content = json!([{
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/png",
-                "data": jpeg
-            }
-        }]);
-
-        let fixed = normalize_base64_image_media_types(&mut payload);
-
-        assert_eq!(fixed, 1);
-        assert_eq!(
-            payload.messages[0].content[0]["source"]["media_type"],
-            "image/jpeg"
-        );
-    }
-
-    #[test]
     fn defined_cache_route_requires_explicit_configuration() {
         let state = AppState::new(
             Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
@@ -7645,7 +7338,9 @@ mod tests {
             kiro_cache_point_tools_only: true,
             kiro_cache_point_record_plan: true,
             kiro_upstream_stream_idle_timeout_secs: 180,
+            image_processing: ImageProcessingConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
+            external_pools: ExternalPoolsConfig::default(),
         }
     }
 
@@ -11025,7 +10720,7 @@ Return a fix plan."#
             "http://[::1]/image.png",
         ] {
             assert!(
-                ensure_safe_remote_url(url).is_err(),
+                body_processing::ensure_safe_remote_url(url).is_err(),
                 "{url} should be blocked"
             );
         }
