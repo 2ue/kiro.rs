@@ -2,15 +2,15 @@
 
 日期：2026-07-06
 
-状态：当前工作区已完成一轮外部池 raw/normalized 行为边界修正，并完成对应回归验证；这不是完整模块化重构。本文后半部分记录真正模块化重构的目标、边界和后续执行计划。
+状态：当前工作区已在已发布的 raw/normalized 行为边界修正基础上，继续完成文件级模块化重构：入口解析、raw request facts、本地 Kiro body pipeline、外部池 body/model/retry/usage projection 已拆分为独立模块。本文仍保留后续可选的 trait/plugin 化和更深层 route planner 规划。
 
 工作模式：execute-ready。本文记录目标、现状分析、阶段规划和本阶段落地状态。
 
 ## 执行版摘要
 
-反思结论：完整长文有价值，但必须配一个短执行版，否则实现容易继续发散。当前已完成的是可发布的行为边界修正；完整模块化仍需要按后文计划继续推进。
+反思结论：完整长文有价值，但必须配一个短执行版，否则实现容易继续发散。当前已完成的不是单点补丁，而是先把最容易耦合的热路径拆到文件级模块；后续若继续做插件化，应在这些边界上扩展，而不是回到 `handlers.rs`/`external_pool.rs` 里堆分支。
 
-当前行为修正已完成的核心内容：
+当前已完成的核心内容：
 
 1. **目标选择先于 body 处理**：raw 外部池的显式直连和本地池预检 fallback 都在 parse 前处理，不进入标准 Anthropic body parse、图片处理、Kiro 转换或 payload guard。
 2. **外部池按已选 pool 配置分支**：raw pool 走 raw body，normalized pool 才走 normalized body 和外部 payload guard。
@@ -18,14 +18,19 @@
 4. **token counting lazy 化到外部 usage 需要时**：外部 route 构造不再无条件 `count_all_tokens(...)`；usage projection 需要 input tokens 时再计算。
 5. **model 与 body 解耦**：raw body 可以按 `rawModelMode` 选择不改、只探测、或只改顶层 model；normalized body 继续按现有模型映射写入 outbound model。
 6. **usage 与 body mode 解耦**：raw body 仍可按 `usageProjectionMode=current_path_policy` 做 usage projection，路径级同步禁用仍是上层拦截。
+7. **入口路径去重**：`/v1/messages`、`/na/v1/messages`、`/ha/v1/messages`、`/dfcache/.../v1/messages`、`/cc/v1/messages` 统一进入 `request_entry::handle_messages_endpoint(...)`，避免不同路径漂移。
+8. **raw facts 独立**：raw 顶层 `model`/`stream` 探测和可选顶层 model rewrite 已迁移到 `src/anthropic/request_facts.rs`，不再属于外部池调度模块。
+9. **本地 body pipeline 独立**：Anthropic -> Kiro 转换、Kiro request 序列化、payload guard、payload diagnostics、warnings、cache-point retry 准备已迁移到 `src/anthropic/handlers/local_body_pipeline.rs`。
+10. **外部池处理拆分**：外部池 body、model、retry、usage projection 分别迁移到 `src/external_pool/body_pipeline.rs`、`model_pipeline.rs`、`retry_pipeline.rs`、`usage_projection.rs`。
 
 本轮仍不做的部分：
 
-- 不把所有函数强行拆成 trait/plugin 文件。当前先以清晰函数边界落地语义，后续再做文件级模块拆分。
-- 不改变本地凭证默认 Kiro 处理链。
+- 不把当前模块强行抽成 trait/plugin 系统；当前先建立稳定文件边界和调用契约。
+- 不改变本地凭证默认 Kiro 处理链的行为。
 - 不改 UI 配置结构，因为本轮后端语义兼容现有配置。
+- 不把容量等待、连接池 lease、外部池选择算法强拆；这块和 manager 状态强耦合，后续需要单独设计 scheduler trait。
 
-下一步应进入文件级模块化：`RequestEnvelope`、`RoutePlanner`、`BodyPipeline`、`ModelPipeline`、`UsageProjectionEngine`、`Retry/ErrorPipeline` 独立成模块，减少 `handlers.rs` 和 `external_pool.rs` 体积，并让“先选目标，再按目标计划处理”的语义成为代码结构本身。
+下一步如果继续深化，应在当前文件边界上继续做 `RoutePlanner`/`ProcessingPlan` trait 化，把 direct/preflight/after-local-attempt 的目标选择显式化，并把容量等待/错误归一化拆成独立调度模块。
 
 ### 本轮落地记录
 
@@ -39,18 +44,27 @@
 - 新增 parse 前 raw 外部池预检 fallback：仅当 raw 外部池当前可用、本地池无模型无关的可调度能力时，在标准 body parse、图片处理、Kiro 转换、Kiro payload guard 之前转 raw 外部池。
 - normalized 外部池仍走 parsed path，继续保留现有 source/image/schema 行为。
 - 外部 route 构造不再无条件进行 token counting，避免 raw/外部 fallback 在未命中 usage projection 时提前扫描长上下文。
+- 新增 `src/anthropic/request_facts.rs`：raw body 轻量 facts 和顶层 model rewrite，不反序列化完整 messages。
+- 新增 `src/anthropic/handlers/request_entry.rs`：所有 messages 路径共享 direct/preflight raw、parse、进入 inner pipeline 的入口。
+- 新增 `src/anthropic/handlers/local_body_pipeline.rs`：本地 Kiro body 准备独立于 handler 编排。
+- 新增 `src/external_pool/body_pipeline.rs`：外部池 raw/normalized body 准备按已选 pool 配置分支。
+- 新增 `src/external_pool/model_pipeline.rs`：外部池模型映射、raw model 探测结果处理、Claude 点号版本兼容转换。
+- 新增 `src/external_pool/retry_pipeline.rs`：外部 normalized payload guard retry 条件和 retry route 构造。
+- 新增 `src/external_pool/usage_projection.rs`：外部池 usage projection context 构造和 prompt-cache 成功提交。
 
 已验证：
 
 - `cargo fmt --check`
 - `git diff --check`
 - `cargo check`
-- `cargo test`：主服务 894 个测试、`kiro_loadtest` 15 个测试通过。
+- `cargo test`：主服务 896 个测试、`kiro_loadtest` 15 个测试通过。
 - `cargo build --release`
 - `pnpm --dir admin-ui build`
 - `pnpm --dir admin-ui-daisy build`
 - `pnpm --dir ui build`
 - `node tools/check-admin-ui-api-parity.mjs`
+- `cargo test raw_hints_ignore_nested_model_without_top_level_model -- --nocapture`
+- `cargo test raw_top_level_model_rewrite_preserves_nested_content -- --nocapture`
 - `cargo test external_pool_raw_body_mode_does_not_apply_payload_guard -- --nocapture`
 - `cargo test external_pool_normalized_body_mode_applies_payload_guard -- --nocapture`
 - `cargo test fallback_body_mode_filter_does_not_ignore_raw_passthrough_pools -- --nocapture`
@@ -59,9 +73,11 @@
 - `cargo test local_pool_preflight_reason_respects_scheduler_fallback_toggles -- --nocapture`
 - `cargo test external_pool_raw_passthrough -- --nocapture`
 - `cargo test raw_external_route_request_is_preparse_raw_only -- --nocapture`
-- fake upstream loadtest：normal stream、normal non-stream、slow first byte、429、long stream。
-- 临时 release 服务 19022：真实 `/v1/messages` 非流 1 次 200，真实 `/cc/v1/messages` 流式 1 次 200。
-- Claude CLI 2.1.197：隔离 HOME/CLAUDE_CONFIG_DIR 下 `claude --print --output-format=stream-json --verbose` 通过，收到 result，无 error。
+- `cargo test parse_messages_payload_rejects_empty_model_before_routing -- --nocapture`
+- fake upstream loadtest：normal stream 10/10 200、normal non-stream 10/10 200、slow first byte 6/6 200、429 6/6 429、long stream 4/4 200。
+- 临时 release 服务 19022：真实 `/v1/messages` 非流 1 次 200，真实 `/cc/v1/messages` 流式 1 次 200，`message_delta.usage` 非零。
+- Claude CLI 2.1.197：隔离 HOME/CLAUDE_CONFIG_DIR 下 `claude --print --output-format=stream-json --verbose` 通过，收到 result，无 error，usage 非零。
+- 临时 release 服务已停止，`19022` 端口已释放。
 
 ## 本轮目标
 

@@ -60,6 +60,7 @@ use super::payload_guard_runtime::prepare_kiro_request_body;
 use super::prompt_cache::{
     KiroRsToolPromptCachePlan, PromptCacheBounds, PromptCacheProfile, PromptCacheScope,
 };
+use super::request_facts::raw_messages_body_hints;
 use super::stream::{SseEvent, StreamContext};
 use super::tool_format_debug::{ToolFormatDebugEvent, ToolFormatDebugRecorder};
 use super::types::{
@@ -74,12 +75,17 @@ use super::usage::{
 use super::websearch;
 use crate::external_pool::{
     ExternalPoolFinalError, ExternalPoolForwardOutcome, ExternalPoolManager,
-    ExternalPoolRequestBodyMode, ExternalRouteRequest, raw_messages_body_hints,
+    ExternalPoolRequestBodyMode, ExternalRouteRequest,
 };
 use crate::http_client::response_bytes_with_body_timeout;
 use crate::kiro::call_trace::KiroCredentialAttempt;
 use crate::kiro::provider::{KiroProvider, KiroStreamCompletion};
 use crate::kiro::token_manager::LocalPoolRouteStateKind;
+
+#[path = "handlers/local_body_pipeline.rs"]
+mod local_body_pipeline;
+#[path = "handlers/request_entry.rs"]
+mod request_entry;
 
 const UPSTREAM_INVALID_REQUEST_MESSAGE: &str = envelope::PUBLIC_INVALID_REQUEST_MESSAGE;
 const LATENCY_COUNTER_UNSET: u32 = u32::MAX;
@@ -941,22 +947,9 @@ fn request_image_processing_config(state: &AppState) -> ImageProcessingConfig {
         .unwrap_or_else(|| state.image_processing.normalized())
 }
 
+#[cfg(test)]
 fn parse_messages_payload(raw_body: &Bytes) -> Result<MessagesRequest, Response> {
-    let payload = serde_json::from_slice::<MessagesRequest>(raw_body).map_err(|err| {
-        envelope::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            format!("Invalid JSON body: {}", err),
-        )
-    })?;
-    if payload.model.trim().is_empty() {
-        return Err(envelope::error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "model: field is required and cannot be empty",
-        ));
-    }
-    Ok(payload)
+    request_entry::parse_messages_payload(raw_body)
 }
 
 async fn maybe_raw_external_direct_response(
@@ -4005,38 +3998,7 @@ pub async fn post_messages(
     headers: HeaderMap,
     raw_body: Bytes,
 ) -> Response {
-    if let Some(response) = maybe_raw_external_direct_response(
-        &state,
-        headers.clone(),
-        raw_body.clone(),
-        "/v1/messages",
-    )
-    .await
-    {
-        return response;
-    }
-    if let Some(response) = maybe_raw_external_preflight_response(
-        &state,
-        headers.clone(),
-        raw_body.clone(),
-        "/v1/messages",
-    )
-    .await
-    {
-        return response;
-    }
-    let payload = match parse_messages_payload(&raw_body) {
-        Ok(payload) => payload,
-        Err(response) => return response,
-    };
-    post_messages_inner(
-        state,
-        headers,
-        raw_body,
-        payload,
-        "/v1/messages".to_string(),
-    )
-    .await
+    post_messages_for_endpoint(state, headers, raw_body, "/v1/messages".to_string()).await
 }
 
 /// POST /na/v1/messages
@@ -4047,38 +4009,7 @@ pub async fn post_messages_real_cache_usage(
     headers: HeaderMap,
     raw_body: Bytes,
 ) -> Response {
-    if let Some(response) = maybe_raw_external_direct_response(
-        &state,
-        headers.clone(),
-        raw_body.clone(),
-        "/na/v1/messages",
-    )
-    .await
-    {
-        return response;
-    }
-    if let Some(response) = maybe_raw_external_preflight_response(
-        &state,
-        headers.clone(),
-        raw_body.clone(),
-        "/na/v1/messages",
-    )
-    .await
-    {
-        return response;
-    }
-    let payload = match parse_messages_payload(&raw_body) {
-        Ok(payload) => payload,
-        Err(response) => return response,
-    };
-    post_messages_inner(
-        state,
-        headers,
-        raw_body,
-        payload,
-        "/na/v1/messages".to_string(),
-    )
-    .await
+    post_messages_for_endpoint(state, headers, raw_body, "/na/v1/messages".to_string()).await
 }
 
 /// POST /ha/v1/messages
@@ -4089,38 +4020,7 @@ pub async fn post_messages_ha(
     headers: HeaderMap,
     raw_body: Bytes,
 ) -> Response {
-    if let Some(response) = maybe_raw_external_direct_response(
-        &state,
-        headers.clone(),
-        raw_body.clone(),
-        "/ha/v1/messages",
-    )
-    .await
-    {
-        return response;
-    }
-    if let Some(response) = maybe_raw_external_preflight_response(
-        &state,
-        headers.clone(),
-        raw_body.clone(),
-        "/ha/v1/messages",
-    )
-    .await
-    {
-        return response;
-    }
-    let payload = match parse_messages_payload(&raw_body) {
-        Ok(payload) => payload,
-        Err(response) => return response,
-    };
-    post_messages_inner(
-        state,
-        headers,
-        raw_body,
-        payload,
-        "/ha/v1/messages".to_string(),
-    )
-    .await
+    post_messages_for_endpoint(state, headers, raw_body, "/ha/v1/messages".to_string()).await
 }
 
 /// POST /dfcache/:route/v1/messages
@@ -4137,23 +4037,16 @@ pub async fn post_messages_dfcache(
         Err(response) => return response,
     };
     let endpoint = format!("{prefix}/v1/messages");
-    if let Some(response) =
-        maybe_raw_external_direct_response(&state, headers.clone(), raw_body.clone(), &endpoint)
-            .await
-    {
-        return response;
-    }
-    if let Some(response) =
-        maybe_raw_external_preflight_response(&state, headers.clone(), raw_body.clone(), &endpoint)
-            .await
-    {
-        return response;
-    }
-    let payload = match parse_messages_payload(&raw_body) {
-        Ok(payload) => payload,
-        Err(response) => return response,
-    };
-    post_messages_inner(state, headers, raw_body, payload, endpoint).await
+    post_messages_for_endpoint(state, headers, raw_body, endpoint).await
+}
+
+async fn post_messages_for_endpoint(
+    state: AppState,
+    headers: HeaderMap,
+    raw_body: Bytes,
+    endpoint: String,
+) -> Response {
+    request_entry::handle_messages_endpoint(state, headers, raw_body, endpoint).await
 }
 
 async fn post_messages_inner(
@@ -4187,7 +4080,6 @@ async fn post_messages_inner(
     let runtime_config = request_runtime_config(&state, &provider);
     let cache_route = runtime_config.cache_policy_for_path(&endpoint);
     let request_simulation_mode = prompt_cache_simulation_mode_for_policy(&cache_route.policy);
-    let converter_prompt_cache_mode = prompt_cache_converter_mode_for_policy(&cache_route.policy);
     let cache_type = cache_route.policy.cache_type;
     let mut external_fallback = build_external_fallback_context(
         &state,
@@ -4272,131 +4164,33 @@ async fn post_messages_inner(
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
-    // 转换请求
-    let conversion_result = match convert_request_with_resolved_model(
+    let prepared_local = match local_body_pipeline::prepare(
+        &endpoint,
         &payload,
-        ConverterOptions {
-            compat_profile: runtime_config.compat_profile,
-            prompt_cache_simulation_mode: converter_prompt_cache_mode,
-            kiro_cache_point_enabled: cache_route.policy.cache_point.enabled,
-            kiro_cache_point_tools_only: cache_route.policy.cache_point.tools_only,
-            kiro_cache_point_record_plan: cache_route.policy.cache_point.record_plan,
-            force_visible_thinking: should_force_visible_thinking(&payload, &runtime_config),
-        },
-        &model_resolution,
-    ) {
-        Ok(result) => result,
-        Err(e) => {
-            tracing::warn!("请求转换失败: {}", e);
-            return conversion_error_response(&e);
-        }
-    };
-
-    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
-    let mut kiro_request = KiroRequest {
-        conversation_state: conversion_result.conversation_state,
-        profile_arn: None,
-        additional_model_request_fields: conversion_result.additional_model_request_fields,
-        tool_cache_point_insert_after: conversion_result.tool_cache_point_insert_after.clone(),
-        cache_point_plan_recording_enabled: conversion_result.cache_point_plan_recording_enabled,
-    };
-    let conversation_id = kiro_request.conversation_state.conversation_id.clone();
-
-    let too_long_retry = PayloadTooLongRetryRequest::new(
-        &kiro_request,
         &runtime_config,
-        &endpoint,
-        &payload.model,
-        model_resolution.upstream_model.as_deref(),
-        &conversation_id,
-        should_expose_proxy_warnings(&runtime_config)
-            .then(|| conversion_result.warnings.encode_header())
-            .flatten(),
-    );
-    let prepared_payload = match prepare_kiro_request_body(
-        &mut kiro_request,
-        runtime_config.initial_payload_guard_config(),
-    ) {
-        Ok(result) => result,
-        Err(err) => return payload_guard_error_response(err),
-    };
-    let request_body = prepared_payload.body;
-    let payload_guard_report = prepared_payload.report;
-    if let Some(report) = payload_guard_report.as_ref() {
-        log_payload_guard_report(
-            report,
-            &endpoint,
-            &payload.model,
-            model_resolution.upstream_model.as_deref(),
-            Some(&conversation_id),
-        );
-    }
-    let payload_breakdown = payload_guard_report.as_ref().and_then(|report| {
-        should_log_payload_byte_breakdown(report)
-            .then(|| breakdown_kiro_request(&kiro_request, &request_body))
-    });
-    if let Some(report) = payload_guard_report.as_ref() {
-        log_payload_byte_breakdown(
-            payload_breakdown,
-            report,
-            &endpoint,
-            &payload.model,
-            model_resolution.upstream_model.as_deref(),
-            Some(&conversation_id),
-        );
-    }
-    log_kiro_conversion_summary(
-        &endpoint,
-        &payload,
+        &cache_route,
         &model_resolution,
-        &kiro_request,
-        request_body.len(),
-        payload_guard_report.as_ref(),
-        &conversion_result.warnings,
-    );
-    if model_resolution.is_remapped() {
-        tracing::info!(
-            endpoint,
-            requested_model = %model_resolution.requested_model,
-            upstream_model = ?model_resolution.upstream_model,
-            resolution = %model_resolution.source.as_str(),
-            note = ?model_resolution.note,
-            conversation_id = %conversation_id,
-            "Kiro upstream model mapping applied to request payload"
-        );
+    ) {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
     };
+    let local_body_pipeline::PreparedLocalKiroBody {
+        request_body,
+        kiro_request,
+        conversation_id,
+        input_tokens,
+        payload_breakdown,
+        payload_guard_report,
+        payload_guard_elapsed,
+        thinking_enabled,
+        tool_name_map,
+        known_tool_names,
+        warnings_header,
+        extract_xml_thinking,
+        too_long_retry,
+        cache_point_retry,
+    } = prepared_local;
 
-    tracing::debug!(
-        endpoint = endpoint,
-        requested_model = %payload.model,
-        upstream_model = ?model_resolution.upstream_model,
-        conversation_id = %conversation_id,
-        request_bytes = request_body.len(),
-        history_entries = payload_guard_report
-            .as_ref()
-            .map(|report| report.final_history_entries)
-            .unwrap_or_else(|| kiro_request.conversation_state.history.len()),
-        current_tool_count = kiro_request.conversation_state.current_message.user_input_message.user_input_message_context.tools.len(),
-        current_tool_result_count = kiro_request.conversation_state.current_message.user_input_message.user_input_message_context.tool_results.len(),
-        current_image_count = kiro_request.conversation_state.current_message.user_input_message.images.len(),
-        "Kiro request prepared"
-    );
-    tracing::trace!(
-        endpoint = endpoint,
-        requested_model = %payload.model,
-        upstream_model = ?model_resolution.upstream_model,
-        conversation_id = %conversation_id,
-        request_body = %request_body,
-        "Kiro request body"
-    );
-
-    // 估算输入 tokens
-    let input_tokens = token::count_all_tokens(
-        &payload.model,
-        payload.system.as_deref(),
-        &payload.messages,
-        payload.tools.as_deref(),
-    ) as i32;
     let mut usage_context = prepare_usage_context(
         &state,
         cache_route,
@@ -4411,35 +4205,9 @@ async fn post_messages_inner(
     if let Some(report) = payload_guard_report.clone() {
         usage_context = usage_context.with_payload_diagnostics(payload_breakdown, report);
     }
-    if let Some(elapsed) = prepared_payload.guard_elapsed {
+    if let Some(elapsed) = payload_guard_elapsed {
         usage_context.mark_payload_guard_latency(elapsed);
     }
-
-    // 检查是否启用了thinking
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false);
-
-    let tool_name_map = conversion_result.tool_name_map;
-    let known_tool_names = conversion_result.known_tool_names;
-    let warnings_header = if should_expose_proxy_warnings(&runtime_config) {
-        merge_warning_headers(
-            conversion_result.warnings.encode_header(),
-            payload_guard_report.as_ref(),
-        )
-    } else {
-        None
-    };
-    let extract_xml_thinking = runtime_config.compat_profile.allows_unsigned_thinking();
-    let cache_point_retry = CachePointRetryRequest::new(
-        &kiro_request,
-        &endpoint,
-        &payload.model,
-        model_resolution.upstream_model.as_deref(),
-        &conversation_id,
-    );
 
     if payload.stream {
         // 流式响应
@@ -6809,358 +6577,7 @@ pub async fn post_messages_cc(
     headers: HeaderMap,
     raw_body: Bytes,
 ) -> Response {
-    if let Some(response) = maybe_raw_external_direct_response(
-        &state,
-        headers.clone(),
-        raw_body.clone(),
-        "/cc/v1/messages",
-    )
-    .await
-    {
-        return response;
-    }
-    if let Some(response) = maybe_raw_external_preflight_response(
-        &state,
-        headers.clone(),
-        raw_body.clone(),
-        "/cc/v1/messages",
-    )
-    .await
-    {
-        return response;
-    }
-    let mut payload = match parse_messages_payload(&raw_body) {
-        Ok(payload) => payload,
-        Err(response) => return response,
-    };
-    tracing::debug!(
-        model = %payload.model,
-        max_tokens = %payload.max_tokens,
-        stream = %payload.stream,
-        message_count = %payload.messages.len(),
-        "Received POST /cc/v1/messages request"
-    );
-    log_anthropic_request_summary("/cc/v1/messages", &payload);
-
-    // 检查 KiroProvider 是否可用
-    let provider = match &state.kiro_provider {
-        Some(p) => p.clone(),
-        None => {
-            tracing::error!("KiroProvider 未配置");
-            return envelope::error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "api_error",
-                envelope::PUBLIC_PROVIDER_NOT_READY_MESSAGE,
-            );
-        }
-    };
-    let runtime_config = request_runtime_config(&state, &provider);
-    let cache_route = runtime_config.cache_policy_for_path("/cc/v1/messages");
-    let request_simulation_mode = prompt_cache_simulation_mode_for_policy(&cache_route.policy);
-    let converter_prompt_cache_mode = prompt_cache_converter_mode_for_policy(&cache_route.policy);
-    let cache_type = cache_route.policy.cache_type;
-    let mut external_fallback = build_external_fallback_context(
-        &state,
-        &runtime_config,
-        &cache_route,
-        "/cc/v1/messages",
-        raw_body,
-        headers.clone(),
-        &payload,
-    );
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-    override_thinking_from_model_name(&mut payload);
-    apply_thinking_trigger_mode(&mut payload, &runtime_config);
-    log_thinking_request_trace("/cc/v1/messages", &payload, &runtime_config);
-
-    let caller_ua = headers
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok());
-    if let Err(message) = body_processing::prepare_multimodal_sources(
-        &state.file_store,
-        &mut payload,
-        caller_ua,
-        runtime_config.image_processing,
-    )
-    .await
-    {
-        tracing::warn!("多模态 source 处理失败: {}", message);
-        return envelope::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message);
-    }
-
-    if let Some(external) = external_fallback.as_mut() {
-        external.refresh_payload(&payload);
-    }
-
-    if let Some(external) = external_fallback.as_ref() {
-        let request_id = envelope::request_id();
-        if let Some(response) = external.direct_policy_response(&request_id).await {
-            return response;
-        }
-    }
-
-    let model_resolution =
-        match resolve_request_model(&state, &runtime_config, "/cc/v1/messages", &payload) {
-            Ok(resolution) => resolution,
-            Err(response) => {
-                if let Some(external_response) = maybe_forward_external_after_local_error(
-                    external_fallback.as_ref(),
-                    &envelope::request_id(),
-                    &format!("模型不支持: {}", payload.model),
-                    Vec::new(),
-                )
-                .await
-                {
-                    return external_response;
-                }
-                return response;
-            }
-        };
-    if let Some(external) = external_fallback.as_mut() {
-        external.model_resolution = Some(model_resolution.clone());
-    }
-
-    // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
-        if !websearch_supported_for_profile(runtime_config.compat_profile) {
-            return envelope::error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "The web_search tool is not supported for this request.",
-            );
-        }
-        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
-
-        // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            &payload.model,
-            payload.system.as_deref(),
-            &payload.messages,
-            payload.tools.as_deref(),
-        ) as i32;
-
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
-    }
-
-    // 转换请求
-    let conversion_result = match convert_request_with_resolved_model(
-        &payload,
-        ConverterOptions {
-            compat_profile: runtime_config.compat_profile,
-            prompt_cache_simulation_mode: converter_prompt_cache_mode,
-            kiro_cache_point_enabled: cache_route.policy.cache_point.enabled,
-            kiro_cache_point_tools_only: cache_route.policy.cache_point.tools_only,
-            kiro_cache_point_record_plan: cache_route.policy.cache_point.record_plan,
-            force_visible_thinking: should_force_visible_thinking(&payload, &runtime_config),
-        },
-        &model_resolution,
-    ) {
-        Ok(result) => result,
-        Err(e) => {
-            tracing::warn!("请求转换失败: {}", e);
-            return conversion_error_response(&e);
-        }
-    };
-
-    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
-    let mut kiro_request = KiroRequest {
-        conversation_state: conversion_result.conversation_state,
-        profile_arn: None,
-        additional_model_request_fields: conversion_result.additional_model_request_fields,
-        tool_cache_point_insert_after: conversion_result.tool_cache_point_insert_after.clone(),
-        cache_point_plan_recording_enabled: conversion_result.cache_point_plan_recording_enabled,
-    };
-    let conversation_id = kiro_request.conversation_state.conversation_id.clone();
-
-    let too_long_retry = PayloadTooLongRetryRequest::new(
-        &kiro_request,
-        &runtime_config,
-        "/cc/v1/messages",
-        &payload.model,
-        model_resolution.upstream_model.as_deref(),
-        &conversation_id,
-        should_expose_proxy_warnings(&runtime_config)
-            .then(|| conversion_result.warnings.encode_header())
-            .flatten(),
-    );
-    let prepared_payload = match prepare_kiro_request_body(
-        &mut kiro_request,
-        runtime_config.initial_payload_guard_config(),
-    ) {
-        Ok(result) => result,
-        Err(err) => return payload_guard_error_response(err),
-    };
-    let request_body = prepared_payload.body;
-    let payload_guard_report = prepared_payload.report;
-    if let Some(report) = payload_guard_report.as_ref() {
-        log_payload_guard_report(
-            report,
-            "/cc/v1/messages",
-            &payload.model,
-            model_resolution.upstream_model.as_deref(),
-            Some(&conversation_id),
-        );
-    }
-    let payload_breakdown = payload_guard_report.as_ref().and_then(|report| {
-        should_log_payload_byte_breakdown(report)
-            .then(|| breakdown_kiro_request(&kiro_request, &request_body))
-    });
-    if let Some(report) = payload_guard_report.as_ref() {
-        log_payload_byte_breakdown(
-            payload_breakdown,
-            report,
-            "/cc/v1/messages",
-            &payload.model,
-            model_resolution.upstream_model.as_deref(),
-            Some(&conversation_id),
-        );
-    }
-    log_kiro_conversion_summary(
-        "/cc/v1/messages",
-        &payload,
-        &model_resolution,
-        &kiro_request,
-        request_body.len(),
-        payload_guard_report.as_ref(),
-        &conversion_result.warnings,
-    );
-    if model_resolution.is_remapped() {
-        tracing::info!(
-            endpoint = "/cc/v1/messages",
-            requested_model = %model_resolution.requested_model,
-            upstream_model = ?model_resolution.upstream_model,
-            resolution = %model_resolution.source.as_str(),
-            note = ?model_resolution.note,
-            conversation_id = %conversation_id,
-            "Kiro upstream model mapping applied to request payload"
-        );
-    };
-
-    tracing::debug!(
-        endpoint = "/cc/v1/messages",
-        requested_model = %payload.model,
-        upstream_model = ?model_resolution.upstream_model,
-        conversation_id = %conversation_id,
-        request_bytes = request_body.len(),
-        history_entries = payload_guard_report
-            .as_ref()
-            .map(|report| report.final_history_entries)
-            .unwrap_or_else(|| kiro_request.conversation_state.history.len()),
-        current_tool_count = kiro_request.conversation_state.current_message.user_input_message.user_input_message_context.tools.len(),
-        current_tool_result_count = kiro_request.conversation_state.current_message.user_input_message.user_input_message_context.tool_results.len(),
-        current_image_count = kiro_request.conversation_state.current_message.user_input_message.images.len(),
-        "Kiro request prepared"
-    );
-    tracing::trace!(
-        endpoint = "/cc/v1/messages",
-        requested_model = %payload.model,
-        upstream_model = ?model_resolution.upstream_model,
-        conversation_id = %conversation_id,
-        request_body = %request_body,
-        "Kiro request body"
-    );
-
-    // 估算输入 tokens
-    let input_tokens = token::count_all_tokens(
-        &payload.model,
-        payload.system.as_deref(),
-        &payload.messages,
-        payload.tools.as_deref(),
-    ) as i32;
-    let mut usage_context = prepare_usage_context(
-        &state,
-        cache_route,
-        "/cc/v1/messages",
-        payload.stream,
-        &payload,
-        Some(model_resolution.clone()),
-        Some(conversation_id.clone()),
-        prompt_cache_scope_conversation_id(cache_type, request_simulation_mode, &payload),
-        input_tokens,
-    );
-    if let Some(report) = payload_guard_report.clone() {
-        usage_context = usage_context.with_payload_diagnostics(payload_breakdown, report);
-    }
-    if let Some(elapsed) = prepared_payload.guard_elapsed {
-        usage_context.mark_payload_guard_latency(elapsed);
-    }
-
-    // 检查是否启用了thinking
-    let thinking_enabled = payload
-        .thinking
-        .as_ref()
-        .map(|t| t.is_enabled())
-        .unwrap_or(false);
-
-    let tool_name_map = conversion_result.tool_name_map;
-    let known_tool_names = conversion_result.known_tool_names;
-    let warnings_header = if should_expose_proxy_warnings(&runtime_config) {
-        merge_warning_headers(
-            conversion_result.warnings.encode_header(),
-            payload_guard_report.as_ref(),
-        )
-    } else {
-        None
-    };
-    let extract_xml_thinking = runtime_config.compat_profile.allows_unsigned_thinking();
-    let cache_point_retry = CachePointRetryRequest::new(
-        &kiro_request,
-        "/cc/v1/messages",
-        &payload.model,
-        model_resolution.upstream_model.as_deref(),
-        &conversation_id,
-    );
-
-    if payload.stream {
-        // 流式响应（实时模式）
-        handle_stream_request(
-            provider,
-            &request_body,
-            &kiro_request,
-            &payload.model,
-            model_resolution
-                .upstream_model
-                .as_deref()
-                .unwrap_or(&payload.model),
-            payload.max_tokens,
-            input_tokens,
-            usage_context.context_window_tokens,
-            thinking_enabled,
-            extract_xml_thinking,
-            tool_name_map,
-            known_tool_names,
-            usage_context,
-            warnings_header,
-            too_long_retry,
-            cache_point_retry,
-            external_fallback,
-            runtime_config.kiro_upstream_stream_idle_timeout_secs,
-        )
-        .await
-    } else {
-        // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = should_extract_unsigned_thinking(&runtime_config, thinking_enabled);
-        handle_non_stream_request(
-            provider,
-            &request_body,
-            &kiro_request,
-            &payload.model,
-            model_resolution
-                .upstream_model
-                .as_deref()
-                .unwrap_or(&payload.model),
-            input_tokens,
-            extract_thinking,
-            tool_name_map,
-            known_tool_names,
-            usage_context,
-            warnings_header,
-            too_long_retry,
-            cache_point_retry,
-            external_fallback,
-        )
-        .await
-    }
+    post_messages_for_endpoint(state, headers, raw_body, "/cc/v1/messages".to_string()).await
 }
 
 #[cfg(test)]

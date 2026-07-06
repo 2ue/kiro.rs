@@ -43,6 +43,7 @@ use crate::{
             PromptCacheTracker,
         },
         prompt_cache_creation_control::PromptCacheCreationController,
+        request_facts::{probe_raw_messages_body, rewrite_raw_top_level_model},
         types::MessagesRequest,
         usage::{
             ExternalPoolAttempt, ExternalPoolBilling, ExternalPoolUsageSnapshot, UsageLatencyTrace,
@@ -65,6 +66,20 @@ use crate::{
     },
     token,
 };
+
+#[path = "external_pool/body_pipeline.rs"]
+mod body_pipeline;
+#[path = "external_pool/model_pipeline.rs"]
+mod model_pipeline;
+#[path = "external_pool/retry_pipeline.rs"]
+mod retry_pipeline;
+#[path = "external_pool/usage_projection.rs"]
+mod usage_projection;
+
+use usage_projection::ExternalUsageProjectionContext;
+
+#[cfg(test)]
+use crate::anthropic::request_facts::raw_messages_body_hints;
 
 const DEFAULT_EXTERNAL_POOL_REQUEST_TIMEOUT_SECS: u64 = 180;
 const EXTERNAL_POOL_LEASE_TOUCH_INTERVAL_SECS: u64 = 30;
@@ -612,11 +627,6 @@ struct ExternalForwardResponse {
     stream_usage_projection: Option<ExternalUsageProjectionContext>,
 }
 
-struct PreparedExternalRequest {
-    body: Bytes,
-    outbound_model: Option<String>,
-}
-
 struct ExternalForwardError {
     err: ExternalPoolError,
     outbound_model: Option<String>,
@@ -784,34 +794,6 @@ struct ExternalUsageCapture {
     reported: Option<CacheUsage>,
     projected: bool,
     stream_error_message: Option<String>,
-}
-
-#[derive(Debug, Default)]
-struct ExternalUsageProjectionState {
-    committed_controlled_usage: Option<CacheUsage>,
-}
-
-#[derive(Clone)]
-struct ExternalUsageProjectionContext {
-    mode: ExternalPoolUsageProjectionMode,
-    raw_input_tokens: i32,
-    cache_state_enabled: bool,
-    credential_key: Option<String>,
-    model: String,
-    simulated_usage: Option<CacheSimulation>,
-    reported_policy: Option<ReportedCacheUsagePolicy>,
-    scope: Option<PromptCacheScope>,
-    prompt_cache: Arc<PromptCacheTracker>,
-    prompt_cache_profile: Option<PromptCacheProfile>,
-    kiro_rs_tool_prompt_cache_plan: Option<KiroRsToolPromptCachePlan>,
-    prompt_cache_target_read_ratio: f64,
-    prompt_cache_bounds: PromptCacheBounds,
-    prompt_cache_creation_controller: Arc<PromptCacheCreationController>,
-    prompt_cache_creation_control: PromptCacheCreationControlConfig,
-    uplift_percent: u32,
-    output_uplift_min_tokens: i32,
-    output_uplift_percent: u32,
-    state: Arc<SyncMutex<ExternalUsageProjectionState>>,
 }
 
 #[derive(Clone)]
@@ -990,199 +972,6 @@ pub fn mask_external_pool_key(value: &str) -> String {
         &trimmed[..6],
         &trimmed[trimmed.len().saturating_sub(4)..]
     )
-}
-
-#[derive(Debug, Default, Clone)]
-struct RawMessagesBodyProbe {
-    model: Option<String>,
-    stream: Option<bool>,
-    model_value_span: Option<std::ops::Range<usize>>,
-}
-
-fn probe_raw_messages_body(raw_body: &Bytes) -> RawMessagesBodyProbe {
-    scan_raw_top_level_messages_body(raw_body.as_ref())
-}
-
-pub(crate) fn raw_messages_body_hints(raw_body: &Bytes) -> (Option<String>, Option<bool>) {
-    let probe = probe_raw_messages_body(raw_body);
-    (probe.model, probe.stream)
-}
-
-fn rewrite_raw_top_level_model(raw_body: &Bytes, model: &str) -> Result<Bytes, String> {
-    let probe = probe_raw_messages_body(raw_body);
-    let Some(span) = probe.model_value_span else {
-        return Err("top-level model field was not found".to_string());
-    };
-    let encoded_model = serde_json::to_string(model).map_err(|err| err.to_string())?;
-    let mut out = Vec::with_capacity(
-        raw_body
-            .len()
-            .saturating_sub(span.end.saturating_sub(span.start))
-            .saturating_add(encoded_model.len()),
-    );
-    out.extend_from_slice(&raw_body[..span.start]);
-    out.extend_from_slice(encoded_model.as_bytes());
-    out.extend_from_slice(&raw_body[span.end..]);
-    Ok(Bytes::from(out))
-}
-
-fn scan_raw_top_level_messages_body(bytes: &[u8]) -> RawMessagesBodyProbe {
-    let mut probe = RawMessagesBodyProbe::default();
-    let mut i = skip_json_ws(bytes, 0);
-    if bytes.get(i) != Some(&b'{') {
-        return probe;
-    }
-    i += 1;
-
-    loop {
-        i = skip_json_ws(bytes, i);
-        match bytes.get(i) {
-            Some(b'}') | None => return probe,
-            Some(b'"') => {}
-            _ => return probe,
-        }
-
-        let Some((key, key_end)) = parse_json_string_at(bytes, i) else {
-            return probe;
-        };
-        i = skip_json_ws(bytes, key_end);
-        if bytes.get(i) != Some(&b':') {
-            return probe;
-        }
-        i = skip_json_ws(bytes, i + 1);
-        let value_start = i;
-
-        if key == "model" {
-            if let Some((model, value_end)) = parse_json_string_at(bytes, value_start) {
-                probe.model = Some(model);
-                probe.model_value_span = Some(value_start..value_end);
-                i = value_end;
-            } else {
-                let Some(value_end) = skip_json_value(bytes, value_start) else {
-                    return probe;
-                };
-                i = value_end;
-            }
-        } else if key == "stream" {
-            if bytes.get(value_start..value_start.saturating_add(4)) == Some(b"true") {
-                probe.stream = Some(true);
-                i = value_start + 4;
-            } else if bytes.get(value_start..value_start.saturating_add(5)) == Some(b"false") {
-                probe.stream = Some(false);
-                i = value_start + 5;
-            } else {
-                let Some(value_end) = skip_json_value(bytes, value_start) else {
-                    return probe;
-                };
-                i = value_end;
-            }
-        } else {
-            let Some(value_end) = skip_json_value(bytes, value_start) else {
-                return probe;
-            };
-            i = value_end;
-        }
-
-        if probe.model.is_some() && probe.stream.is_some() {
-            return probe;
-        }
-
-        i = skip_json_ws(bytes, i);
-        match bytes.get(i) {
-            Some(b',') => i += 1,
-            Some(b'}') | None => return probe,
-            _ => return probe,
-        }
-    }
-}
-
-fn skip_json_ws(bytes: &[u8], mut i: usize) -> usize {
-    while bytes.get(i).is_some_and(|byte| byte.is_ascii_whitespace()) {
-        i += 1;
-    }
-    i
-}
-
-fn parse_json_string_at(bytes: &[u8], start: usize) -> Option<(String, usize)> {
-    let end = skip_json_string(bytes, start)?;
-    let value = serde_json::from_slice::<String>(&bytes[start..end]).ok()?;
-    Some((value, end))
-}
-
-fn skip_json_string(bytes: &[u8], start: usize) -> Option<usize> {
-    if bytes.get(start) != Some(&b'"') {
-        return None;
-    }
-    let mut i = start + 1;
-    let mut escaped = false;
-    while let Some(byte) = bytes.get(i).copied() {
-        if escaped {
-            escaped = false;
-        } else if byte == b'\\' {
-            escaped = true;
-        } else if byte == b'"' {
-            return Some(i + 1);
-        }
-        i += 1;
-    }
-    None
-}
-
-fn skip_json_value(bytes: &[u8], start: usize) -> Option<usize> {
-    let mut i = skip_json_ws(bytes, start);
-    match bytes.get(i).copied()? {
-        b'"' => skip_json_string(bytes, i),
-        b'{' | b'[' => skip_json_container(bytes, i),
-        b't' if bytes.get(i..i + 4) == Some(b"true") => Some(i + 4),
-        b'f' if bytes.get(i..i + 5) == Some(b"false") => Some(i + 5),
-        b'n' if bytes.get(i..i + 4) == Some(b"null") => Some(i + 4),
-        b'-' | b'0'..=b'9' => {
-            while bytes.get(i).is_some_and(|byte| {
-                !matches!(byte, b',' | b'}' | b']') && !byte.is_ascii_whitespace()
-            }) {
-                i += 1;
-            }
-            Some(i)
-        }
-        _ => None,
-    }
-}
-
-fn skip_json_container(bytes: &[u8], start: usize) -> Option<usize> {
-    let first = bytes.get(start).copied()?;
-    if !matches!(first, b'{' | b'[') {
-        return None;
-    }
-    let mut stack = vec![first];
-    let mut i = start + 1;
-    while let Some(byte) = bytes.get(i).copied() {
-        match byte {
-            b'"' => {
-                i = skip_json_string(bytes, i)?;
-                continue;
-            }
-            b'{' | b'[' => stack.push(byte),
-            b'}' => {
-                if stack.pop() != Some(b'{') {
-                    return None;
-                }
-                if stack.is_empty() {
-                    return Some(i + 1);
-                }
-            }
-            b']' => {
-                if stack.pop() != Some(b'[') {
-                    return None;
-                }
-                if stack.is_empty() {
-                    return Some(i + 1);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
 }
 
 const EXPLICIT_DIRECT_POLICY_REASON: &str = "explicit_direct";
@@ -3320,317 +3109,19 @@ fn external_pool_matches_body_mode_filter(
 fn external_pool_prepare_request(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
-) -> Result<PreparedExternalRequest, ExternalPoolError> {
-    if pool.request_body_mode == ExternalPoolRequestBodyMode::RawPassthrough {
-        return external_pool_prepare_raw_request(route, pool);
-    }
-
-    let Some(payload) = route.payload.as_ref() else {
-        return Err(ExternalPoolError {
-            status: None,
-            message: format!(
-                "external pool #{} requires normalized request body but raw route has no parsed payload",
-                pool.id
-            ),
-            retryable: false,
-            auto_disable_reason: None,
-            cooldown: Some((Duration::ZERO, "body_mode_mismatch".to_string())),
-            response_body: None,
-        });
-    };
-
-    let prepared_payload = external_pool_prepare_normalized_payload(route, pool, payload)?;
-    let payload = &prepared_payload.payload;
-    if let Some(report) = prepared_payload.report.as_ref() {
-        tracing::debug!(
-            request_id = %route.request_id,
-            pool_id = pool.id,
-            guard_applied = prepared_payload.guard_applied,
-            modified = report.was_modified(),
-            original_bytes = report.original_bytes,
-            final_bytes = report.final_bytes,
-            "external pool normalized body payload guard applied"
-        );
-    }
-
-    let mut value = match serde_json::to_value(payload) {
-        Ok(value) => value,
-        Err(_) => match serde_json::from_slice::<serde_json::Value>(&prepared_payload.raw_body) {
-            Ok(value) => value,
-            Err(_) => {
-                return Ok(PreparedExternalRequest {
-                    body: prepared_payload.raw_body,
-                    outbound_model: None,
-                });
-            }
-        },
-    };
-
-    let outbound_model = external_pool_outbound_model(route, pool, &value)?;
-    if let Some(outbound_model) = outbound_model.as_deref() {
-        if value.get("model").and_then(|model| model.as_str()) != Some(outbound_model) {
-            value["model"] = serde_json::Value::String(outbound_model.to_string());
-        }
-    }
-    normalize_external_pool_thinking_value(&mut value);
-
-    let body = serde_json::to_vec(&value)
-        .map(Bytes::from)
-        .unwrap_or(prepared_payload.raw_body);
-    Ok(PreparedExternalRequest {
-        body,
-        outbound_model,
-    })
-}
-
-fn external_pool_prepare_raw_request(
-    route: &ExternalRouteRequest,
-    pool: &ExternalPool,
-) -> Result<PreparedExternalRequest, ExternalPoolError> {
-    match pool.raw_model_mode {
-        ExternalPoolRawModelMode::None => Ok(PreparedExternalRequest {
-            body: route.raw_body.clone(),
-            outbound_model: None,
-        }),
-        ExternalPoolRawModelMode::ProbeOnly => {
-            let probe = probe_raw_messages_body(&route.raw_body);
-            let outbound_model =
-                external_pool_raw_outbound_model(route, pool, probe.model.as_deref())?;
-            Ok(PreparedExternalRequest {
-                body: route.raw_body.clone(),
-                outbound_model,
-            })
-        }
-        ExternalPoolRawModelMode::RewriteTopLevel => {
-            let probe = probe_raw_messages_body(&route.raw_body);
-            let outbound_model =
-                external_pool_raw_outbound_model(route, pool, probe.model.as_deref())?;
-            let Some(outbound_model_value) = outbound_model.as_deref() else {
-                return Ok(PreparedExternalRequest {
-                    body: route.raw_body.clone(),
-                    outbound_model,
-                });
-            };
-            let body = rewrite_raw_top_level_model(&route.raw_body, outbound_model_value).map_err(
-                |message| ExternalPoolError {
-                    status: None,
-                    message: format!(
-                        "external pool #{} raw model rewrite failed: {}",
-                        pool.id, message
-                    ),
-                    retryable: false,
-                    auto_disable_reason: None,
-                    cooldown: Some((Duration::ZERO, "model_rewrite_failed".to_string())),
-                    response_body: None,
-                },
-            )?;
-            Ok(PreparedExternalRequest {
-                body,
-                outbound_model,
-            })
-        }
-    }
-}
-
-fn external_pool_prepare_normalized_payload(
-    route: &ExternalRouteRequest,
-    pool: &ExternalPool,
-    payload: &MessagesRequest,
-) -> Result<PreparedExternalMessagesPayload, ExternalPoolError> {
-    let guard_config = route.payload_guard_initial_config;
-    match prepare_external_messages_payload(
-        payload,
-        &route.raw_body,
-        route.payload_guard_external_enabled,
-        guard_config,
-    ) {
-        Ok(prepared) => Ok(prepared),
-        Err(err) => {
-            if matches!(err, PayloadGuardError::OversizedImage { .. }) {
-                return Err(external_pool_payload_guard_error(pool, err));
-            }
-            let mut payload = payload.clone();
-            let sanitized = guard_config.shaping.enabled
-                && sanitize_anthropic_messages_for_external_forwarding(
-                    &mut payload,
-                    guard_config.shaping,
-                );
-            let raw_body = if sanitized {
-                serialize_external_messages_request_body(&payload)
-            } else {
-                route.raw_body.clone()
-            };
-            tracing::warn!(
-                request_id = %route.request_id,
-                pool_id = pool.id,
-                error = %err,
-                endpoint = route.endpoint,
-                model = %payload.model,
-                sanitized,
-                "external pool normalized payload guard failed; forwarding safety-sanitized request body when possible"
-            );
-            Ok(PreparedExternalMessagesPayload {
-                raw_body,
-                payload,
-                report: None,
-                guard_applied: false,
-            })
-        }
-    }
-}
-
-fn serialize_external_messages_request_body(payload: &MessagesRequest) -> Bytes {
-    serde_json::to_vec(payload)
-        .map(Bytes::from)
-        .unwrap_or_default()
-}
-
-fn external_pool_payload_guard_error(
-    pool: &ExternalPool,
-    err: PayloadGuardError,
-) -> ExternalPoolError {
-    let (status, message) = match err {
-        PayloadGuardError::Serialize(message) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("external pool #{} payload guard serialize failed: {}", pool.id, message),
-        ),
-        PayloadGuardError::OversizedImage { .. } => (
-            StatusCode::BAD_REQUEST,
-            "One or more images exceed the upstream 5 MB image size limit. Remove or resize the oversized image and retry."
-                .to_string(),
-        ),
-    };
-    ExternalPoolError {
-        status: Some(status),
-        message,
-        retryable: false,
-        auto_disable_reason: None,
-        cooldown: None,
-        response_body: None,
-    }
-}
-
-fn external_pool_outbound_model(
-    route: &ExternalRouteRequest,
-    pool: &ExternalPool,
-    value: &serde_json::Value,
-) -> Result<Option<String>, ExternalPoolError> {
-    let original_model = value
-        .get("model")
-        .and_then(|model| model.as_str())
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .or_else(|| {
-            route.payload.as_ref().and_then(|payload| {
-                let model = payload.model.trim();
-                (!model.is_empty()).then_some(model)
-            })
-        });
-    let processed_model = route
-        .upstream_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .or(original_model);
-    let fallback_transform = (pool.normalize_model_version_dots
-        && matches!(
-            pool.model_mapping_mode,
-            ExternalPoolModelMappingMode::DirectMapping
-                | ExternalPoolModelMappingMode::ProcessedMapping
-        ))
-    .then_some(normalize_external_pool_outbound_model as fn(&str) -> String);
-    let result = process_model(
-        ModelProcessingInput {
-            original_model,
-            processed_model,
-        },
-        ModelProcessingConfig {
-            mode: pool.model_mapping_mode.processing_mode(),
-            rules: &pool.model_mapping_rules,
-            require_mapping_match: pool.model_mapping_require_match,
-            fallback_transform,
-        },
-    )
-    .map_err(|err| external_pool_model_processing_error(pool, err))?;
-    Ok(Some(result.model))
-}
-
-fn external_pool_raw_outbound_model(
-    route: &ExternalRouteRequest,
-    pool: &ExternalPool,
-    raw_model: Option<&str>,
-) -> Result<Option<String>, ExternalPoolError> {
-    let original_model = raw_model
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .or(route.model_hint.as_deref());
-    let processed_model = route
-        .upstream_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .or(original_model);
-    let fallback_transform = (pool.normalize_model_version_dots
-        && matches!(
-            pool.model_mapping_mode,
-            ExternalPoolModelMappingMode::DirectMapping
-                | ExternalPoolModelMappingMode::ProcessedMapping
-        ))
-    .then_some(normalize_external_pool_outbound_model as fn(&str) -> String);
-    let result = process_model(
-        ModelProcessingInput {
-            original_model,
-            processed_model,
-        },
-        ModelProcessingConfig {
-            mode: pool.model_mapping_mode.processing_mode(),
-            rules: &pool.model_mapping_rules,
-            require_mapping_match: pool.model_mapping_require_match,
-            fallback_transform,
-        },
-    )
-    .map_err(|err| external_pool_model_processing_error(pool, err))?;
-    Ok(Some(result.model))
+) -> Result<body_pipeline::PreparedExternalRequest, ExternalPoolError> {
+    body_pipeline::prepare_request(route, pool)
 }
 
 pub fn normalize_external_pool_model_mapping_rules(
     rules: Vec<ModelMappingRule>,
 ) -> Vec<ModelMappingRule> {
-    rules
-        .into_iter()
-        .filter_map(|mut rule| {
-            rule.source = rule.source.trim().to_ascii_lowercase();
-            rule.target = rule.target.trim().to_string();
-            rule.note = rule.note.and_then(|value| {
-                let value = value.trim().to_string();
-                (!value.is_empty()).then_some(value)
-            });
-            (!rule.source.is_empty() && !rule.target.is_empty()).then_some(rule)
-        })
-        .collect()
+    model_pipeline::normalize_mapping_rules(rules)
 }
 
+#[cfg(test)]
 fn normalize_external_pool_outbound_model(model: &str) -> String {
-    let trimmed = model.trim();
-    if !trimmed.starts_with("claude-") || !trimmed.contains('.') {
-        return trimmed.to_string();
-    }
-
-    let chars: Vec<char> = trimmed.chars().collect();
-    let mut out = String::with_capacity(trimmed.len());
-    for (idx, ch) in chars.iter().enumerate() {
-        if *ch == '.'
-            && idx > 0
-            && idx + 1 < chars.len()
-            && chars[idx - 1].is_ascii_digit()
-            && chars[idx + 1].is_ascii_digit()
-        {
-            out.push('-');
-        } else {
-            out.push(*ch);
-        }
-    }
-    out
+    model_pipeline::normalize_outbound_model(model)
 }
 
 fn normalize_external_pool_thinking_value(value: &mut serde_json::Value) -> bool {
@@ -3806,33 +3297,6 @@ fn success_protocol_error(
             "misconfigured_endpoint".to_string(),
         )),
         response_body: None,
-    }
-}
-
-fn external_pool_model_processing_error(
-    pool: &ExternalPool,
-    err: ModelProcessingError,
-) -> ExternalPoolError {
-    match err {
-        ModelProcessingError::MissingModel => ExternalPoolError {
-            status: Some(StatusCode::BAD_REQUEST),
-            message: format!("external pool #{} model is missing", pool.id),
-            retryable: false,
-            auto_disable_reason: None,
-            cooldown: None,
-            response_body: None,
-        },
-        ModelProcessingError::MappingMiss { model } => ExternalPoolError {
-            status: Some(StatusCode::BAD_GATEWAY),
-            message: format!(
-                "external pool #{} requires model mapping match, but no rule matched model {}",
-                pool.id, model
-            ),
-            retryable: true,
-            auto_disable_reason: None,
-            cooldown: Some((Duration::ZERO, "model_mapping_miss".to_string())),
-            response_body: None,
-        },
     }
 }
 
@@ -4218,57 +3682,13 @@ fn should_retry_external_payload_guard(
     route: &ExternalRouteRequest,
     err: &ExternalPoolError,
 ) -> bool {
-    if route.payload_guard_retry_config.is_none() {
-        return false;
-    }
-    if err.status != Some(StatusCode::BAD_REQUEST) {
-        return false;
-    }
-    external_payload_too_long_message(&err.message)
-        || err
-            .response_body
-            .as_ref()
-            .is_some_and(|body| external_payload_too_long_message(&String::from_utf8_lossy(body)))
-}
-
-fn external_payload_too_long_message(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("context window is full")
-        || lower.contains("input is too long")
-        || lower.contains("content_length_exceeds_threshold")
-        || lower.contains("request payload is too large")
-        || lower.contains("payload is too large")
+    retry_pipeline::should_retry_payload_guard(route, err)
 }
 
 fn external_payload_guard_retry_route(
     route: &ExternalRouteRequest,
 ) -> Option<ExternalRouteRequest> {
-    let config = route.payload_guard_retry_config?;
-    let mut payload = route.payload.clone()?;
-    let (body, report) = match guard_anthropic_messages_request_reusing_body(
-        &mut payload,
-        config,
-        &route.raw_body,
-    ) {
-        Ok(result) => result,
-        Err(err) => {
-            tracing::warn!(
-                request_id = %route.request_id,
-                error = %err,
-                "external pool payload guard retry failed to build trimmed request"
-            );
-            return None;
-        }
-    };
-    let breakdown = breakdown_anthropic_messages_request(&payload, body.len());
-    let mut next = route.clone();
-    next.raw_body = body;
-    next.payload = Some(payload);
-    next.body_mode_filter = Some(ExternalPoolRequestBodyMode::Normalized);
-    next.payload_breakdown = Some(breakdown);
-    next.payload_guard_report = Some(report);
-    next.payload_guard_retry_config = None;
-    Some(next)
+    retry_pipeline::payload_guard_retry_route(route)
 }
 
 fn auto_disable_reason_enabled(config: &ExternalPoolsConfig, reason: &str) -> bool {
@@ -4950,151 +4370,13 @@ fn build_external_usage_projection_context(
     output_uplift_min_tokens: i32,
     output_uplift_percent: u32,
 ) -> Option<ExternalUsageProjectionContext> {
-    if pool.usage_projection_mode != ExternalPoolUsageProjectionMode::CurrentPathPolicy {
-        return None;
-    }
-    let stream = route.is_stream();
-    if !stream && pool.skip_non_stream_usage_projection {
-        return None;
-    }
-    let reported_usage = route.reported_usage.policy_for_path(&route.endpoint);
-    if !stream && reported_usage.skip_non_stream_usage_projection {
-        return None;
-    }
-
-    let raw_projection_payload;
-    let payload = if let Some(payload) = route.payload() {
-        payload
-    } else {
-        raw_projection_payload = serde_json::from_slice::<MessagesRequest>(&route.raw_body).ok()?;
-        if raw_projection_payload.model.trim().is_empty() {
-            return None;
-        }
-        &raw_projection_payload
-    };
-
-    let model = route
-        .upstream_model
-        .clone()
-        .unwrap_or_else(|| payload.model.clone());
-    let prompt_cache_supported = route
-        .model_capabilities
-        .supports_prompt_caching_for(&model)
-        .unwrap_or(true);
-
-    let raw_input_tokens = if route.request_input_tokens > 0 {
-        route.request_input_tokens
-    } else {
-        token::count_all_tokens(
-            &payload.model,
-            payload.system.as_deref(),
-            &payload.messages,
-            payload.tools.as_deref(),
-        ) as i32
-    };
-    let cache_state_enabled = route.prompt_cache_strategy_type != PromptCacheStrategyType::NoCache
-        && prompt_cache_supported;
-    let stable_conversation_id = route
-        .stable_conversation_id()
-        .or_else(|| crate::anthropic::converter::extract_stable_conversation_id(payload));
-    let scope = cache_state_enabled
-        .then(|| {
-            external_prompt_cache_scope(
-                stable_conversation_id.clone(),
-                route.prompt_cache_route_namespace.clone(),
-            )
-        })
-        .flatten();
-    let (profile, kiro_rs_tool_prompt_cache_plan, simulated_usage) = match route
-        .prompt_cache_strategy_type
-    {
-        PromptCacheStrategyType::CurrentHighCache
-            if prompt_cache_supported
-                && route.prompt_cache_simulation_mode == PromptCacheSimulationMode::HighCache =>
-        {
-            let profile = route.prompt_cache.build_high_cache_profile_for_model(
-                payload,
-                raw_input_tokens,
-                &model,
-            );
-            let prompt_usage = route.prompt_cache.compute_with_bounds(
-                scope.clone(),
-                profile.as_ref(),
-                route.prompt_cache_target_read_ratio,
-                route.prompt_cache_bounds,
-            );
-            let simulated_usage = profile.as_ref().and_then(|profile| {
-                CacheSimulation::from_prompt_cache_with_ratio_and_amplification(
-                    prompt_usage,
-                    route.prompt_cache_target_read_ratio,
-                    external_cache_amplification(route, profile),
-                )
-            });
-            (profile, None, simulated_usage)
-        }
-        PromptCacheStrategyType::KiroRsTool if prompt_cache_supported => {
-            let plan = route.prompt_cache.compute_kiro_rs_tool_with_bounds(
-                scope.clone(),
-                payload,
-                raw_input_tokens,
-                &model,
-                route.prompt_cache_bounds,
-                route.kiro_rs_tool_cache_policy,
-            );
-            let policy = route.kiro_rs_tool_cache_policy.normalized();
-            let simulated_usage =
-                CacheSimulation::from_prompt_cache_split_input_with_reported_input_range(
-                    plan.usage(),
-                    policy.reported_input_min_tokens,
-                    policy.reported_input_max_tokens,
-                    plan.cache_jitter_seed(),
-                );
-            (None, Some(plan), simulated_usage)
-        }
-        _ => (None, None, None),
-    };
-    let reported_policy = match route.prompt_cache_strategy_type {
-        PromptCacheStrategyType::NoCache if reported_usage.enabled => {
-            ReportedCacheUsagePolicy::from_path_policy(reported_usage, fastrand::u64(..))
-        }
-        PromptCacheStrategyType::CurrentHighCache
-            if prompt_cache_supported
-                && route.prompt_cache_simulation_mode == PromptCacheSimulationMode::HighCache =>
-        {
-            ReportedCacheUsagePolicy::from_path_policy(
-                reported_usage,
-                profile
-                    .as_ref()
-                    .map(|profile| profile.cache_jitter_seed())
-                    .unwrap_or(0)
-                    ^ fastrand::u64(..),
-            )
-        }
-        PromptCacheStrategyType::CurrentHighCache
-        | PromptCacheStrategyType::KiroRsTool
-        | PromptCacheStrategyType::NoCache => None,
-    };
-    Some(ExternalUsageProjectionContext {
-        mode: pool.usage_projection_mode,
-        raw_input_tokens,
-        cache_state_enabled,
-        credential_key: Some(format!("external_pool:{}", pool.id)),
-        model,
-        simulated_usage,
-        reported_policy,
-        scope,
-        prompt_cache: route.prompt_cache.clone(),
-        prompt_cache_profile: profile,
-        kiro_rs_tool_prompt_cache_plan,
-        prompt_cache_target_read_ratio: route.prompt_cache_target_read_ratio,
-        prompt_cache_bounds: route.prompt_cache_bounds,
-        prompt_cache_creation_controller: route.prompt_cache_creation_controller.clone(),
-        prompt_cache_creation_control: route.prompt_cache_creation_control,
+    usage_projection::build_context(
+        route,
+        pool,
         uplift_percent,
-        output_uplift_min_tokens: output_uplift_min_tokens.max(0),
-        output_uplift_percent: output_uplift_percent.min(200),
-        state: Arc::new(SyncMutex::new(ExternalUsageProjectionState::default())),
-    })
+        output_uplift_min_tokens,
+        output_uplift_percent,
+    )
 }
 
 #[cfg(test)]
@@ -5105,68 +4387,6 @@ fn count_external_route_input_tokens(payload: &MessagesRequest) -> i32 {
         &payload.messages,
         payload.tools.as_deref(),
     ) as i32
-}
-
-fn external_prompt_cache_scope(
-    conversation_id: Option<String>,
-    namespace: Option<String>,
-) -> Option<PromptCacheScope> {
-    Some(PromptCacheScope::new(conversation_id?, namespace))
-}
-
-fn external_cache_amplification(
-    route: &ExternalRouteRequest,
-    profile: &PromptCacheProfile,
-) -> Option<CacheAmplification> {
-    Some(CacheAmplification::new(
-        route.prompt_cache_token_scale,
-        route.prompt_cache_max_simulated_input_tokens,
-        route.prompt_cache_cap_jitter_min_tokens,
-        route.prompt_cache_cap_jitter_max_tokens,
-        route.prompt_cache_scale_min_input_tokens,
-        profile.cache_jitter_seed(),
-    ))
-}
-
-impl ExternalUsageProjectionContext {
-    fn mark_committed(&self, usage: CacheUsage) {
-        let mut state = self.state.lock();
-        state.committed_controlled_usage = Some(usage);
-    }
-
-    fn record_success(&self) {
-        let Some(usage) = self.state.lock().committed_controlled_usage else {
-            return;
-        };
-        if !self.cache_state_enabled {
-            return;
-        }
-        if self.reported_policy.is_some() {
-            let _ = self
-                .prompt_cache_creation_controller
-                .apply_success_with_context(
-                    self.scope.as_ref(),
-                    self.prompt_cache_creation_control,
-                    usage,
-                    self.credential_key.as_deref(),
-                    Some(self.model.as_str()),
-                );
-        }
-        if let Some(plan) = self.kiro_rs_tool_prompt_cache_plan.as_ref() {
-            self.prompt_cache.commit_kiro_rs_tool_success_with_bounds(
-                self.scope.clone(),
-                plan,
-                self.prompt_cache_bounds,
-            );
-        } else {
-            self.prompt_cache.update_with_bounds(
-                self.scope.clone(),
-                self.prompt_cache_profile.as_ref(),
-                self.prompt_cache_target_read_ratio,
-                self.prompt_cache_bounds,
-            );
-        }
-    }
 }
 
 fn external_usage_snapshot(usage: CacheUsage) -> ExternalPoolUsageSnapshot {
