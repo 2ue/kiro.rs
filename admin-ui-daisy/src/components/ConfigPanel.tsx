@@ -9,6 +9,7 @@ import {
   defaultPayloadShaping,
   defaultExternalPoolsConfig,
   defaultPromptCacheCreationControl,
+  defaultWeightedCapacity,
   DFCACHE_ROUTE_PREFIX,
   definedCacheRouteFromNameInput,
   emptyRuntimeConfig,
@@ -23,6 +24,7 @@ import {
   normalizeImageProcessing,
   normalizePromptCacheCreationControl,
   normalizeReportedUsage,
+  normalizeWeightedCapacity,
   pathPolicy,
   preserveFieldPolicy,
   reportedUsageModeDescription,
@@ -1669,6 +1671,7 @@ export function ConfigPanel() {
           ...config.data.payloadShaping,
         },
         imageProcessing: normalizeImageProcessing(config.data.imageProcessing),
+        weightedCapacity: normalizeWeightedCapacity(config.data.weightedCapacity ?? defaultWeightedCapacity()),
         externalPools: {
           ...defaultExternalPoolsConfig(),
           ...config.data.externalPools,
@@ -1713,6 +1716,7 @@ export function ConfigPanel() {
       credentialInFlightLeaseMaxSecs: toWhole(draft.credentialInFlightLeaseMaxSecs),
       dispatchGlobalMaxConcurrentRequests: toWhole(draft.dispatchGlobalMaxConcurrentRequests),
       dispatchMaxQueuedRequests: toWhole(draft.dispatchMaxQueuedRequests),
+      weightedCapacity: normalizeWeightedCapacity(draft.weightedCapacity),
       credentialWarmupRequests: toWhole(draft.credentialWarmupRequests),
       credentialWarmupSelectionPercent: toWhole(draft.credentialWarmupSelectionPercent, 0, 100),
       credentialWarmupMaxSelectionPercent: toWhole(draft.credentialWarmupMaxSelectionPercent, 0, 100),
@@ -1865,6 +1869,92 @@ export function ConfigPanel() {
             <NumberField title="流式静默超时" description="流式响应长时间没有新内容时结束本次请求。填 0 表示不按流式空闲时间主动结束。" value={draft.kiroUpstreamStreamIdleTimeoutSecs} min={0} suffix="秒" onChange={(kiroUpstreamStreamIdleTimeoutSecs) => setDraft((prev) => ({ ...prev, kiroUpstreamStreamIdleTimeoutSecs }))} />
             <NumberField title="单请求最大重试次数" description="一次请求失败后最多换几个账号再试。填 0 表示由系统自动决定。" value={draft.credentialRetryMaxAttempts} min={0} suffix="次" onChange={(credentialRetryMaxAttempts) => setDraft((prev) => ({ ...prev, credentialRetryMaxAttempts }))} />
             <NumberField title="异常并发自动回收" description="单个并发占用超过多久未活跃时自动释放。填 0 表示关闭。" value={draft.credentialInFlightLeaseMaxSecs} min={0} suffix="秒" onChange={(credentialInFlightLeaseMaxSecs) => setDraft((prev) => ({ ...prev, credentialInFlightLeaseMaxSecs }))} />
+            <ToggleField
+              title="按 token 重量计算本地容量"
+              description="默认关闭。关闭时不改变本地并发/RPM 口径；开启后只使用请求链路已有的粗略输入 token，不为容量单独遍历 body。"
+              checked={draft.weightedCapacity.enabled}
+              onChange={(enabled) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  weightedCapacity: { ...prev.weightedCapacity, enabled },
+                }))
+              }
+            />
+            <NumberField
+              title="单请求最大容量单位"
+              description="限制超长上下文最多占用多少本地并发/RPM 单位；只影响本地账号，不影响外部账号。"
+              value={draft.weightedCapacity.maxUnitsPerRequest}
+              min={1}
+              max={64}
+              suffix="单位"
+              disabled={!draft.weightedCapacity.enabled}
+              onChange={(maxUnitsPerRequest) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  weightedCapacity: {
+                    ...prev.weightedCapacity,
+                    maxUnitsPerRequest,
+                    tiers: prev.weightedCapacity.tiers.map((tier) => ({
+                      ...tier,
+                      units: Math.min(Math.max(1, tier.units), Math.max(1, maxUnitsPerRequest)),
+                    })),
+                  },
+                }))
+              }
+            />
+            <div className="rounded-box border border-base-300 bg-base-100 p-4 md:col-span-2">
+              <div className="mb-3">
+                <div className="text-sm font-semibold">容量分档</div>
+                <div className="mt-1 text-xs leading-5 text-base-content/60">
+                  命中不超过当前输入 token 的最高分档。默认 0=1、100k=2、300k=4、700k=8。
+                </div>
+              </div>
+              <div className="grid gap-3 md:grid-cols-2">
+                {draft.weightedCapacity.tiers.map((tier, index) => (
+                  <div key={index} className="grid grid-cols-2 gap-3 rounded-box border border-base-300 bg-base-200/40 p-3">
+                    <NumberField
+                      title="起始 token"
+                      description="大于等于该值"
+                      value={tier.minTokens}
+                      min={0}
+                      suffix="token"
+                      disabled={!draft.weightedCapacity.enabled}
+                      onChange={(minTokens) =>
+                        setDraft((prev) => ({
+                          ...prev,
+                          weightedCapacity: {
+                            ...prev.weightedCapacity,
+                            tiers: prev.weightedCapacity.tiers.map((item, itemIndex) =>
+                              itemIndex === index ? { ...item, minTokens } : item,
+                            ),
+                          },
+                        }))
+                      }
+                    />
+                    <NumberField
+                      title="容量单位"
+                      description="并发/RPM 权重"
+                      value={tier.units}
+                      min={1}
+                      max={draft.weightedCapacity.maxUnitsPerRequest}
+                      suffix="单位"
+                      disabled={!draft.weightedCapacity.enabled}
+                      onChange={(units) =>
+                        setDraft((prev) => ({
+                          ...prev,
+                          weightedCapacity: {
+                            ...prev.weightedCapacity,
+                            tiers: prev.weightedCapacity.tiers.map((item, itemIndex) =>
+                              itemIndex === index ? { ...item, units } : item,
+                            ),
+                          },
+                        }))
+                      }
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
           </ConfigGroup>
         )}
 

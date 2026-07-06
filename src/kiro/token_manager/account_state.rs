@@ -94,6 +94,7 @@ pub(super) struct InFlightLease {
     pub(super) acquired_at: Instant,
     pub(super) last_seen_at: Instant,
     pub(super) kind: InFlightKind,
+    pub(super) weight_units: u32,
 }
 
 /// 会话到凭据的粘性绑定。

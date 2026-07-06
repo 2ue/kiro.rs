@@ -159,6 +159,7 @@ fn apply_scheduler_state_to_entry(
                 acquired_at: instant_from_elapsed_epoch_ms(lease.acquired_at_ms, now_ms, now),
                 last_seen_at: instant_from_elapsed_epoch_ms(lease.last_seen_at_ms, now_ms, now),
                 kind: InFlightKind::from_str(&lease.kind),
+                weight_units: lease.weight_units.max(1),
             }
         })
         .collect();
@@ -167,7 +168,9 @@ fn apply_scheduler_state_to_entry(
             merged_in_flight_leases.push(lease);
         }
     }
-    entry.in_flight_requests = merged_in_flight_leases.len() as u32;
+    entry.in_flight_requests = merged_in_flight_leases.iter().fold(0u32, |sum, lease| {
+        sum.saturating_add(lease.weight_units.max(1))
+    });
     entry.in_flight_leases = merged_in_flight_leases;
     entry.health = state.health;
 }

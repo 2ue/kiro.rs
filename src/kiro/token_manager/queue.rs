@@ -45,6 +45,7 @@ pub(super) fn concurrency_blocked_count(
     max_concurrent_requests: u32,
     global_rpm: u32,
     global_has_capacity: bool,
+    request_weight_units: u32,
 ) -> usize {
     entries
         .iter()
@@ -53,7 +54,11 @@ pub(super) fn concurrency_blocked_count(
                 && entry_cooldown_remaining(entry, model, now).is_none()
                 && entry_rate_limit_remaining(entry, global_rpm, now).is_none()
                 && (!global_has_capacity
-                    || !entry_has_concurrency_capacity(entry, max_concurrent_requests))
+                    || !entry_has_concurrency_capacity(
+                        entry,
+                        max_concurrent_requests,
+                        request_weight_units,
+                    ))
         })
         .count()
 }

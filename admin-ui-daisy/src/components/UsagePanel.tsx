@@ -194,9 +194,15 @@ function LatencyTracePanel({ record }: { record: UsageRecord }) {
         <UsageMetric label="上游响应头" value={formatLatency(trace.upstreamHeaderMs)} tone="info" />
         <UsageMetric label="首个流分片" value={formatLatency(trace.firstUpstreamChunkMs)} />
         <UsageMetric label="首次输出" value={formatLatency(firstOutput)} tone="success" />
+        <UsageMetric label="首次思考" value={formatLatency(trace.firstThinkingDeltaMs)} />
+        <UsageMetric label="首次可见文本" value={formatLatency(trace.firstVisibleTextDeltaMs)} tone="success" />
         <UsageMetric label="分片到输出" value={formatLatency(trace.streamGapToFirstOutputMs)} />
+        <UsageMetric label="本地容量权重" value={typeof trace.capacityWeightUnits === 'number' ? `${formatNumber(trace.capacityWeightUnits)} 单位` : '-'} tone="info" />
+        <UsageMetric label="权重估算输入" value={typeof trace.estimatedInputTokens === 'number' ? `${formatNumber(trace.estimatedInputTokens)} token` : '-'} />
         <UsageMetric label="输出前分片" value={typeof trace.chunksBeforeFirstOutput === 'number' ? formatNumber(trace.chunksBeforeFirstOutput) : '-'} />
         <UsageMetric label="输出前事件" value={typeof trace.eventsBeforeFirstOutput === 'number' ? formatNumber(trace.eventsBeforeFirstOutput) : '-'} />
+        <UsageMetric label="客户端断开" value={formatLatency(trace.clientDroppedMs)} />
+        <UsageMetric label="结束原因" value={trace.terminalReason || '-'} />
       </div>
     </div>
   )

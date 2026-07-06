@@ -1,6 +1,7 @@
 import type {
   CachePolicyConfig,
   CacheRoutePolicyPatch,
+  BodyConversionConfig,
   ImageProcessingConfig,
   PayloadShapingConfig,
   PromptCacheCreationControlConfig,
@@ -9,6 +10,7 @@ import type {
   ReportedUsageFieldPolicy,
   ReportedUsagePathPolicy,
   RuntimeConfig,
+  WeightedCapacityConfig,
 } from '@/types/api'
 
 export function preserveFieldPolicy(): ReportedUsageFieldPolicy {
@@ -103,6 +105,57 @@ export function defaultImageProcessing(): ImageProcessingConfig {
     safeMaterializeFileSources: true,
     safeDownloadRemoteSources: true,
     safeNormalizeBase64MediaTypes: true,
+  }
+}
+
+export function defaultBodyConversion(): BodyConversionConfig {
+  return {
+    toolSchemaNormalization: true,
+    toolNameMapping: true,
+    toolChoiceSteering: true,
+    chunkedToolPolicy: true,
+    thinkingPromptControls: true,
+    nativeReasoningFields: true,
+    toolPairingRepair: true,
+    historyPlaceholderTools: true,
+  }
+}
+
+export function normalizeBodyConversion(input?: Partial<BodyConversionConfig> | null): BodyConversionConfig {
+  return {
+    ...defaultBodyConversion(),
+    ...(input ?? {}),
+  }
+}
+
+export function defaultWeightedCapacity(): WeightedCapacityConfig {
+  return {
+    enabled: false,
+    maxUnitsPerRequest: 8,
+    tiers: [
+      { minTokens: 0, units: 1 },
+      { minTokens: 100000, units: 2 },
+      { minTokens: 300000, units: 4 },
+      { minTokens: 700000, units: 8 },
+    ],
+  }
+}
+
+export function normalizeWeightedCapacity(input?: Partial<WeightedCapacityConfig> | null): WeightedCapacityConfig {
+  const base = defaultWeightedCapacity()
+  const maxUnitsPerRequest = toWhole(input?.maxUnitsPerRequest ?? base.maxUnitsPerRequest, 1, 64)
+  const tiers = (input?.tiers?.length ? input.tiers : base.tiers)
+    .map((tier) => ({
+      minTokens: toWhole(tier.minTokens),
+      units: toWhole(tier.units, 1, maxUnitsPerRequest),
+    }))
+    .sort((a, b) => a.minTokens - b.minTokens)
+    .filter((tier, index, all) => all.findIndex((item) => item.minTokens === tier.minTokens) === index)
+
+  return {
+    enabled: Boolean(input?.enabled ?? base.enabled),
+    maxUnitsPerRequest,
+    tiers: tiers.length ? tiers : base.tiers,
   }
 }
 
@@ -222,6 +275,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   credentialInFlightLeaseMaxSecs: 900,
   dispatchGlobalMaxConcurrentRequests: 0,
   dispatchMaxQueuedRequests: 0,
+  weightedCapacity: defaultWeightedCapacity(),
   credentialWarmupRequests: 3,
   credentialWarmupSelectionPercent: 5,
   credentialWarmupMaxSelectionPercent: 50,
@@ -239,6 +293,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   compressionEnabled: false,
   whitespaceCompression: true,
   imageProcessing: defaultImageProcessing(),
+  bodyConversion: defaultBodyConversion(),
   payloadGuardEnabled: true,
   payloadGuardMode: 'preemptive',
   payloadGuardMaxBytes: 460800,

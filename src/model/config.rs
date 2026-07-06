@@ -108,6 +108,160 @@ impl ImageProcessingConfig {
     }
 }
 
+/// 本地 Anthropic -> Kiro body 转换能力开关。
+///
+/// 这些开关只影响本地凭据路径的 Kiro 协议转换器。外部池 raw body 透传不会进入
+/// 这些转换阶段；外部池 normalized body 仍按外部池自己的 body/model/usage 配置处理。
+/// 默认全部开启以保持旧行为。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BodyConversionConfig {
+    /// 规范化工具 input_schema，移除 Kiro/上游容易拒绝的 OpenAPI/Zod/MCP 扩展字段。
+    #[serde(default = "default_true")]
+    pub tool_schema_normalization: bool,
+
+    /// 将不符合 Kiro 工具名约束的名称清洗/缩短，并维护响应反向映射。
+    #[serde(default = "default_true")]
+    pub tool_name_mapping: bool,
+
+    /// 处理 Anthropic tool_choice：过滤当前工具列表并注入兼容提示。
+    #[serde(default = "default_true")]
+    pub tool_choice_steering: bool,
+
+    /// 注入 Write/Edit 分块写入策略和工具描述后缀。
+    #[serde(default = "default_true")]
+    pub chunked_tool_policy: bool,
+
+    /// 对不支持原生 reasoning 的模型注入 synthetic thinking 控制提示。
+    #[serde(default = "default_true")]
+    pub thinking_prompt_controls: bool,
+
+    /// 对支持 Kiro 原生 reasoning/outputConfig 的模型上报 additionalModelRequestFields。
+    #[serde(default = "default_true")]
+    pub native_reasoning_fields: bool,
+
+    /// 修复或文本化不严格配对的 tool_use/tool_result，减少 Kiro 400。
+    #[serde(default = "default_true")]
+    pub tool_pairing_repair: bool,
+
+    /// 为历史中出现但当前 tools 缺失的工具补占位定义。
+    #[serde(default = "default_true")]
+    pub history_placeholder_tools: bool,
+}
+
+impl Default for BodyConversionConfig {
+    fn default() -> Self {
+        Self {
+            tool_schema_normalization: true,
+            tool_name_mapping: true,
+            tool_choice_steering: true,
+            chunked_tool_policy: true,
+            thinking_prompt_controls: true,
+            native_reasoning_fields: true,
+            tool_pairing_repair: true,
+            history_placeholder_tools: true,
+        }
+    }
+}
+
+/// 调度容量加权配置。
+///
+/// 默认关闭；关闭时请求热路径不会为了容量加权额外估算 token，也不会改变并发/RPM
+/// 口径。开启后，调用方在已经完成必要 body 处理时传入一个粗略 token 量级，
+/// 调度器按 tiers 映射成容量单位。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WeightedCapacityConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// 单请求最多消耗多少容量单位，防止极端上下文导致 Redis 写入和调度计数放大。
+    #[serde(default = "default_weighted_capacity_max_units")]
+    pub max_units_per_request: u32,
+
+    /// token 阈值到容量单位的映射。按 `minTokens` 升序匹配最后一个命中的 tier。
+    #[serde(default = "default_weighted_capacity_tiers")]
+    pub tiers: Vec<WeightedCapacityTier>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WeightedCapacityTier {
+    #[serde(default)]
+    pub min_tokens: u32,
+    #[serde(default = "default_weighted_capacity_unit")]
+    pub units: u32,
+}
+
+impl Default for WeightedCapacityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_units_per_request: default_weighted_capacity_max_units(),
+            tiers: default_weighted_capacity_tiers(),
+        }
+    }
+}
+
+impl WeightedCapacityConfig {
+    pub fn normalized(&self) -> Self {
+        let max_units_per_request = self.max_units_per_request.clamp(1, 64);
+        let mut tiers: Vec<_> = self
+            .tiers
+            .iter()
+            .copied()
+            .filter(|tier| tier.units > 0)
+            .collect();
+        if tiers.is_empty() {
+            tiers = default_weighted_capacity_tiers();
+        }
+        tiers.sort_by_key(|tier| tier.min_tokens);
+        tiers.dedup_by_key(|tier| tier.min_tokens);
+        for tier in &mut tiers {
+            tier.units = tier.units.clamp(1, max_units_per_request);
+        }
+        Self {
+            enabled: self.enabled,
+            max_units_per_request,
+            tiers,
+        }
+    }
+
+    pub fn units_for_tokens(&self, tokens: u32) -> u32 {
+        if !self.enabled {
+            return 1;
+        }
+        let normalized = self.normalized();
+        normalized
+            .tiers
+            .iter()
+            .filter(|tier| tokens >= tier.min_tokens)
+            .map(|tier| tier.units)
+            .last()
+            .unwrap_or(1)
+            .clamp(1, normalized.max_units_per_request)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_units_per_request == 0 || self.max_units_per_request > 64 {
+            return Err("weightedCapacity.maxUnitsPerRequest 必须在 1 到 64 之间".to_string());
+        }
+        let mut seen = BTreeSet::new();
+        for tier in &self.tiers {
+            if tier.units == 0 || tier.units > self.max_units_per_request {
+                return Err(
+                    "weightedCapacity.tiers[].units 必须大于 0 且不超过 maxUnitsPerRequest"
+                        .to_string(),
+                );
+            }
+            if !seen.insert(tier.min_tokens) {
+                return Err("weightedCapacity.tiers[].minTokens 不能重复".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PayloadShapingConfig {
@@ -2438,6 +2592,13 @@ pub struct Config {
     #[serde(default)]
     pub dispatch_max_queued_requests: u32,
 
+    /// 本地凭据调度容量是否按请求 token 量级加权。
+    ///
+    /// 默认关闭；关闭时不会在调度前做额外 token 估算，也不会改变并发/RPM 口径。
+    /// 开启后只影响本地凭据池，外部池仍按外部池自己的并发配置调度。
+    #[serde(default)]
+    pub weighted_capacity: WeightedCapacityConfig,
+
     /// 新凭据预热请求次数。预热期内 balanced 会降低该凭据调度权重，但不会伪造 success_count。
     #[serde(default = "default_credential_warmup_requests")]
     pub credential_warmup_requests: u32,
@@ -2460,6 +2621,10 @@ pub struct Config {
     /// light 不下载、不展开、不 decode 校正图片，只让 inline base64/data URL 进入协议转换。
     #[serde(default)]
     pub image_processing: ImageProcessingConfig,
+
+    /// 本地 Anthropic -> Kiro 协议转换能力配置。
+    #[serde(default)]
+    pub body_conversion: BodyConversionConfig,
 
     /// Kiro payload shaping 配置。默认只压缩旧历史和明显冗余，不截断当前输入。
     #[serde(default)]
@@ -2803,6 +2968,35 @@ fn default_kiro_upstream_stream_idle_timeout_secs() -> u64 {
 
 fn default_credential_in_flight_lease_max_secs() -> u64 {
     900
+}
+
+fn default_weighted_capacity_unit() -> u32 {
+    1
+}
+
+fn default_weighted_capacity_max_units() -> u32 {
+    8
+}
+
+fn default_weighted_capacity_tiers() -> Vec<WeightedCapacityTier> {
+    vec![
+        WeightedCapacityTier {
+            min_tokens: 0,
+            units: 1,
+        },
+        WeightedCapacityTier {
+            min_tokens: 100_000,
+            units: 2,
+        },
+        WeightedCapacityTier {
+            min_tokens: 300_000,
+            units: 4,
+        },
+        WeightedCapacityTier {
+            min_tokens: 700_000,
+            units: 8,
+        },
+    ]
 }
 
 fn default_credential_warmup_requests() -> u32 {
@@ -3348,12 +3542,14 @@ impl Default for Config {
             credential_in_flight_lease_max_secs: default_credential_in_flight_lease_max_secs(),
             dispatch_global_max_concurrent_requests: 0,
             dispatch_max_queued_requests: 0,
+            weighted_capacity: WeightedCapacityConfig::default(),
             credential_warmup_requests: default_credential_warmup_requests(),
             credential_warmup_selection_percent: default_credential_warmup_selection_percent(),
             credential_warmup_max_selection_percent:
                 default_credential_warmup_max_selection_percent(),
             compression: CompressionConfig::default(),
             image_processing: ImageProcessingConfig::default(),
+            body_conversion: BodyConversionConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
             payload_guard_enabled: default_payload_guard_enabled(),
             payload_guard_mode: default_payload_guard_mode(),
@@ -3620,6 +3816,55 @@ mod tests {
     }
 
     #[test]
+    fn weighted_capacity_defaults_disabled_and_costs_one_unit() {
+        let config = Config::default();
+
+        assert!(!config.weighted_capacity.enabled);
+        assert_eq!(config.weighted_capacity.max_units_per_request, 8);
+        assert_eq!(config.weighted_capacity.units_for_tokens(0), 1);
+        assert_eq!(config.weighted_capacity.units_for_tokens(1_000_000), 1);
+    }
+
+    #[test]
+    fn weighted_capacity_deserializes_missing_field_as_disabled() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+
+        assert!(!config.weighted_capacity.enabled);
+        assert_eq!(config.weighted_capacity.units_for_tokens(700_000), 1);
+    }
+
+    #[test]
+    fn weighted_capacity_enabled_maps_token_tiers() {
+        let config = WeightedCapacityConfig {
+            enabled: true,
+            max_units_per_request: 8,
+            tiers: vec![
+                WeightedCapacityTier {
+                    min_tokens: 0,
+                    units: 1,
+                },
+                WeightedCapacityTier {
+                    min_tokens: 100_000,
+                    units: 2,
+                },
+                WeightedCapacityTier {
+                    min_tokens: 300_000,
+                    units: 4,
+                },
+                WeightedCapacityTier {
+                    min_tokens: 700_000,
+                    units: 8,
+                },
+            ],
+        };
+
+        assert_eq!(config.units_for_tokens(99_999), 1);
+        assert_eq!(config.units_for_tokens(100_000), 2);
+        assert_eq!(config.units_for_tokens(450_000), 4);
+        assert_eq!(config.units_for_tokens(1_000_000), 8);
+    }
+
+    #[test]
     fn default_runtime_controls_are_conservative() {
         let config = Config::default();
 
@@ -3648,6 +3893,7 @@ mod tests {
         assert_eq!(config.credential_in_flight_lease_max_secs, 900);
         assert_eq!(config.dispatch_global_max_concurrent_requests, 0);
         assert_eq!(config.dispatch_max_queued_requests, 0);
+        assert!(!config.weighted_capacity.enabled);
         assert_eq!(config.credential_warmup_requests, 3);
         assert_eq!(config.credential_warmup_selection_percent, 5);
         assert_eq!(config.credential_warmup_max_selection_percent, 50);
@@ -5056,6 +5302,9 @@ mod tests {
         let config: Config = serde_json::from_str(&json).unwrap();
 
         assert_eq!(config.payload_guard_mode, PayloadGuardMode::OnTooLong);
+        assert!(!config.weighted_capacity.enabled);
+        assert_eq!(config.weighted_capacity.max_units_per_request, 8);
+        assert_eq!(config.weighted_capacity.units_for_tokens(1_000_000), 1);
 
         let default_policy = config.reported_usage.policy_for_path("/v1/messages");
         assert_eq!(default_policy.input.mode, ReportedUsageFieldMode::Raw);

@@ -13,10 +13,10 @@ use crate::common::auth::RequestApiKeyStore;
 use crate::external_pool::ExternalPoolManager;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
-    CachePolicyConfig, CompatProfile, ExternalPoolsConfig, ImageProcessingConfig,
-    ModelMappingConfig, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
-    PromptCacheCreationControlConfig, PromptCacheSimulationMode, ReportedUsageConfig,
-    ThinkingTriggerMode, ToolFormatDebugConfig,
+    BodyConversionConfig, CachePolicyConfig, CompatProfile, ExternalPoolsConfig,
+    ImageProcessingConfig, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
+    PayloadShapingConfig, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
+    ReportedUsageConfig, ThinkingTriggerMode, ToolFormatDebugConfig,
 };
 
 use super::{
@@ -100,6 +100,7 @@ pub fn create_router_with_provider(
     kiro_cache_point_record_plan: bool,
     kiro_upstream_stream_idle_timeout_secs: u64,
     image_processing: ImageProcessingConfig,
+    body_conversion: BodyConversionConfig,
     payload_shaping: PayloadShapingConfig,
     external_pools: ExternalPoolsConfig,
     tool_format_debug: ToolFormatDebugConfig,
@@ -144,6 +145,7 @@ pub fn create_router_with_provider(
         kiro_cache_point_record_plan,
         kiro_upstream_stream_idle_timeout_secs,
         image_processing,
+        body_conversion,
         payload_shaping,
     )
     .with_external_pools(external_pools)

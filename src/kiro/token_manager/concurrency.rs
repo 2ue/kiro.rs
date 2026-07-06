@@ -78,6 +78,7 @@ pub struct InFlightLeaseGuard {
     local_pool_route_state_cache: Arc<Mutex<HashMap<String, CachedLocalPoolRouteState>>>,
     credential_id: u64,
     lease_id: u64,
+    weight_units: u32,
     tombstone_redis_release: bool,
     released: AtomicBool,
 }
@@ -87,6 +88,7 @@ impl fmt::Debug for InFlightLeaseGuard {
         f.debug_struct("InFlightLeaseGuard")
             .field("credential_id", &self.credential_id)
             .field("lease_id", &self.lease_id)
+            .field("weight_units", &self.weight_units)
             .finish_non_exhaustive()
     }
 }
@@ -100,6 +102,7 @@ impl InFlightLeaseGuard {
         local_pool_route_state_cache: Arc<Mutex<HashMap<String, CachedLocalPoolRouteState>>>,
         credential_id: u64,
         lease_id: u64,
+        weight_units: u32,
         tombstone_redis_release: bool,
     ) -> Self {
         Self {
@@ -110,6 +113,7 @@ impl InFlightLeaseGuard {
             local_pool_route_state_cache,
             credential_id,
             lease_id,
+            weight_units: weight_units.max(1),
             tombstone_redis_release,
             released: AtomicBool::new(false),
         }
@@ -272,15 +276,19 @@ fn release_in_flight_lease_from_entries(
         .iter()
         .position(|lease| lease.id == lease_id)
     {
-        entry.in_flight_leases.remove(index);
-        if entry.in_flight_requests > 0 {
-            entry.in_flight_requests -= 1;
+        let lease = entry.in_flight_leases.remove(index);
+        let weight_units = lease.weight_units.max(1);
+        if entry.in_flight_requests >= weight_units {
+            entry.in_flight_requests -= weight_units;
         } else {
             tracing::debug!(
-                "凭据 #{} 并发 lease #{} 释放时计数已为空",
+                weight_units,
+                in_flight_requests = entry.in_flight_requests,
+                "凭据 #{} 并发 lease #{} 释放时计数小于权重，已归零",
                 credential_id,
                 lease_id
             );
+            entry.in_flight_requests = 0;
         }
         true
     } else {

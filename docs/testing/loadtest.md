@@ -134,6 +134,9 @@ cargo run --bin kiro_loadtest -- \
 - `normal-stream`
 - `normal-non-stream`
 - `slow-first-byte`
+- `random-slow-first-byte`
+- `dense-slow-first-byte`
+- `tiered-slow-first-byte`
 - `slow-thinking-then-text`
 - `stream-idle-timeout`
 - `long-stream`
@@ -144,8 +147,11 @@ cargo run --bin kiro_loadtest -- \
 - `malformed-sse`
 - `client-drop`
 - `recovery-after-burst`
+- `mixed-chaos`
 
-`long-stream` 用于模拟上游长时间占用流式连接。首包延迟由 `--fake-delay-ms` 控制，后续 chunk 数量和间隔由 `--fake-stream-chunks`、`--fake-stream-chunk-delay-ms` 控制。
+`slow-first-byte` 用于固定首字延迟；`random-slow-first-byte` 用于混合快首字和慢首字；`dense-slow-first-byte` 用于所有请求都慢首字的拥塞场景；`tiered-slow-first-byte` 固定轮转 3 秒、10 秒、22 秒三档，用于验证几秒、10 秒级、20 秒以上首字慢的组合压力。`long-stream` 用于模拟上游长时间占用流式连接。首包延迟由 `--fake-delay-ms` 控制，后续 chunk 数量和间隔由 `--fake-stream-chunks`、`--fake-stream-chunk-delay-ms` 控制。
+
+`mixed-chaos` 用于极端组合：同一轮请求中混合 429、500、3/10/22 秒分层慢首字、长流式占用、随机慢首字和正常响应，适合验证错误冷却、恢复、连接释放、资源回落和高并发下的排队行为。
 
 ```bash
 CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
@@ -156,6 +162,51 @@ cargo run --bin kiro_loadtest -- \
   --fake-delay-ms 3000 \
   --fake-stream-chunks 80 \
   --fake-stream-chunk-delay-ms 250
+```
+
+随机慢首字：
+
+```bash
+CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
+cargo run --bin kiro_loadtest -- \
+  --fake-listen 127.0.0.1:19080 \
+  --fake-only true \
+  --scenario random-slow-first-byte \
+  --fake-delay-ms 3000
+```
+
+密集慢首字：
+
+```bash
+CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
+cargo run --bin kiro_loadtest -- \
+  --fake-listen 127.0.0.1:19080 \
+  --fake-only true \
+  --scenario dense-slow-first-byte \
+  --fake-delay-ms 3000
+```
+
+分层慢首字，固定覆盖 3 秒、10 秒、22 秒：
+
+```bash
+CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
+cargo run --bin kiro_loadtest -- \
+  --fake-listen 127.0.0.1:19080 \
+  --fake-only true \
+  --scenario tiered-slow-first-byte
+```
+
+混合异常：
+
+```bash
+CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc \
+cargo run --bin kiro_loadtest -- \
+  --fake-listen 127.0.0.1:19080 \
+  --fake-only true \
+  --scenario mixed-chaos \
+  --fake-delay-ms 3000 \
+  --fake-stream-chunks 40 \
+  --fake-stream-chunk-delay-ms 150
 ```
 
 ## Payload 热点专项 case

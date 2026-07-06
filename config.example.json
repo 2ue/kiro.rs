@@ -12,11 +12,37 @@
   "adminApiKey": "sk-admin-your-secret-key",
   "kiroUpstreamResponseTimeoutSecs": 180,
   "credentialRetryMaxAttempts": 0,
+  "weightedCapacity": {
+    "enabled": false,
+    "maxUnitsPerRequest": 8,
+    "tiers": [
+      { "minTokens": 0, "units": 1 },
+      { "minTokens": 100000, "units": 2 },
+      { "minTokens": 300000, "units": 4 },
+      { "minTokens": 700000, "units": 8 }
+    ]
+  },
   "payloadGuardEnabled": true,
   "payloadGuardMode": "on_too_long",
   "payloadGuardMaxBytes": 460800,
   "payloadGuardTrimHistory": true,
   "payloadGuardExternalEnabled": true,
+  "imageProcessing": {
+    "mode": "safe",
+    "safeMaterializeFileSources": true,
+    "safeDownloadRemoteSources": true,
+    "safeNormalizeBase64MediaTypes": true
+  },
+  "bodyConversion": {
+    "toolSchemaNormalization": true,
+    "toolNameMapping": true,
+    "toolChoiceSteering": true,
+    "chunkedToolPolicy": true,
+    "thinkingPromptControls": true,
+    "nativeReasoningFields": true,
+    "toolPairingRepair": true,
+    "historyPlaceholderTools": true
+  },
   "payloadShaping": {
     "enabled": true,
     "truncateHistoricalToolResults": true,

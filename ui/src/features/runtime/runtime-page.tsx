@@ -29,14 +29,18 @@ import {
 import { extractErrorMessage } from '@/lib/utils'
 import {
   defaultImageProcessing,
+  defaultBodyConversion,
   defaultPayloadShaping,
   defaultPromptCacheCreationControl,
   defaultReportedUsage,
+  defaultWeightedCapacity,
   emptyRuntimeConfig,
   normalizeCachePolicy,
+  normalizeBodyConversion,
   normalizeImageProcessing,
   normalizePromptCacheCreationControl,
   normalizeReportedUsage,
+  normalizeWeightedCapacity,
   toRatio,
   toScale,
   toWhole,
@@ -188,6 +192,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     credentialInFlightLeaseMaxSecs: toWhole(draft.credentialInFlightLeaseMaxSecs),
     dispatchGlobalMaxConcurrentRequests: toWhole(draft.dispatchGlobalMaxConcurrentRequests),
     dispatchMaxQueuedRequests: toWhole(draft.dispatchMaxQueuedRequests),
+    weightedCapacity: normalizeWeightedCapacity(draft.weightedCapacity),
     credentialWarmupRequests: toWhole(draft.credentialWarmupRequests),
     credentialWarmupSelectionPercent: toWhole(draft.credentialWarmupSelectionPercent, 0, 100),
     credentialWarmupMaxSelectionPercent: toWhole(draft.credentialWarmupMaxSelectionPercent, 0, 100),
@@ -216,6 +221,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     highCacheThreshold: toWhole(draft.highCacheThreshold),
     promptCacheCreationControl: normalizePromptCacheCreationControl(draft.promptCacheCreationControl),
     imageProcessing: normalizeImageProcessing(draft.imageProcessing),
+    bodyConversion: normalizeBodyConversion(draft.bodyConversion),
     reportedUsage: normalizeReportedUsage(draft.reportedUsage),
     cachePolicy: normalizeCachePolicy(draft.cachePolicy),
     definedCacheRoutes: normalizeDefinedCacheRoutes(draft.definedCacheRoutes),
@@ -240,6 +246,8 @@ export function RuntimePage() {
         ...emptyRuntimeConfig,
         ...config.data,
         imageProcessing: normalizeImageProcessing(config.data.imageProcessing ?? defaultImageProcessing()),
+        bodyConversion: normalizeBodyConversion(config.data.bodyConversion ?? defaultBodyConversion()),
+        weightedCapacity: normalizeWeightedCapacity(config.data.weightedCapacity ?? defaultWeightedCapacity()),
         payloadShaping: { ...defaultPayloadShaping(), ...config.data.payloadShaping },
         promptCacheCreationControl: { ...defaultPromptCacheCreationControl(), ...config.data.promptCacheCreationControl },
         reportedUsage: config.data.reportedUsage ?? defaultReportedUsage(),
@@ -257,6 +265,16 @@ export function RuntimePage() {
       imageProcessing: {
         ...defaultImageProcessing(),
         ...prev.imageProcessing,
+        [k]: v,
+      },
+    }))
+
+  const setBodyConversion = <K extends keyof RuntimeConfig['bodyConversion']>(k: K) => (v: RuntimeConfig['bodyConversion'][K]) =>
+    setDraft((prev) => ({
+      ...prev,
+      bodyConversion: {
+        ...defaultBodyConversion(),
+        ...prev.bodyConversion,
         [k]: v,
       },
     }))
@@ -388,6 +406,92 @@ export function RuntimePage() {
                 <NumField label="单账号最大并发" desc="每个账号同一时间最多处理多少个请求；0 表示不限制。" value={draft.credentialMaxConcurrentRequests} min={0} suffix="并发" onChange={set('credentialMaxConcurrentRequests')} />
                 <NumField label="全局最大并发" desc="整个服务同一时间最多处理多少个请求；0 表示不限制。" value={draft.dispatchGlobalMaxConcurrentRequests} min={0} suffix="并发" onChange={set('dispatchGlobalMaxConcurrentRequests')} />
                 <NumField label="最大排队请求数" desc="账号忙不过来时最多让多少个请求排队；0 表示不限制。" value={draft.dispatchMaxQueuedRequests} min={0} suffix="请求" onChange={set('dispatchMaxQueuedRequests')} />
+                <TogField
+                  label="按 token 重量计算本地容量"
+                  desc="默认关闭。关闭时不改变本地并发/RPM 口径；开启后只使用请求链路已有的粗略输入 token，不为容量单独遍历 body。"
+                  checked={draft.weightedCapacity.enabled}
+                  onChange={(enabled) =>
+                    setDraft((prev) => ({
+                      ...prev,
+                      weightedCapacity: { ...prev.weightedCapacity, enabled },
+                    }))
+                  }
+                />
+                <NumField
+                  label="单请求最大容量单位"
+                  desc="限制超长上下文最多占用多少本地并发/RPM 单位；只影响本地账号，不影响外部账号。"
+                  value={draft.weightedCapacity.maxUnitsPerRequest}
+                  min={1}
+                  max={64}
+                  suffix="单位"
+                  disabled={!draft.weightedCapacity.enabled}
+                  onChange={(maxUnitsPerRequest) =>
+                    setDraft((prev) => ({
+                      ...prev,
+                      weightedCapacity: {
+                        ...prev.weightedCapacity,
+                        maxUnitsPerRequest,
+                        tiers: prev.weightedCapacity.tiers.map((tier) => ({
+                          ...tier,
+                          units: Math.min(Math.max(1, tier.units), Math.max(1, maxUnitsPerRequest)),
+                        })),
+                      },
+                    }))
+                  }
+                />
+                <div className="space-y-3 rounded-lg border bg-muted/20 p-4 md:col-span-2">
+                  <div>
+                    <div className="text-sm font-semibold">容量分档</div>
+                    <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                      命中不超过当前输入 token 的最高分档。默认 0=1、100k=2、300k=4、700k=8。
+                    </div>
+                  </div>
+                  <div className="grid gap-3 md:grid-cols-2">
+                    {draft.weightedCapacity.tiers.map((tier, index) => (
+                      <div key={index} className="grid grid-cols-2 gap-3 rounded-lg border bg-background p-3">
+                        <NumField
+                          label="起始 token"
+                          desc="大于等于该值"
+                          value={tier.minTokens}
+                          min={0}
+                          suffix="token"
+                          disabled={!draft.weightedCapacity.enabled}
+                          onChange={(minTokens) =>
+                            setDraft((prev) => ({
+                              ...prev,
+                              weightedCapacity: {
+                                ...prev.weightedCapacity,
+                                tiers: prev.weightedCapacity.tiers.map((item, itemIndex) =>
+                                  itemIndex === index ? { ...item, minTokens } : item,
+                                ),
+                              },
+                            }))
+                          }
+                        />
+                        <NumField
+                          label="容量单位"
+                          desc="并发/RPM 权重"
+                          value={tier.units}
+                          min={1}
+                          max={draft.weightedCapacity.maxUnitsPerRequest}
+                          suffix="单位"
+                          disabled={!draft.weightedCapacity.enabled}
+                          onChange={(units) =>
+                            setDraft((prev) => ({
+                              ...prev,
+                              weightedCapacity: {
+                                ...prev.weightedCapacity,
+                                tiers: prev.weightedCapacity.tiers.map((item, itemIndex) =>
+                                  itemIndex === index ? { ...item, units } : item,
+                                ),
+                              },
+                            }))
+                          }
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
                 <NumField label="单请求最长排队等待" desc="一个请求最多等账号空闲多久；0 表示不限制。" value={draft.credentialDispatchMaxWaitSecs} min={0} suffix="秒" onChange={set('credentialDispatchMaxWaitSecs')} />
                 <NumField label="开始响应等待时间" desc="发给上游后，多久还没开始返回就认为超时；0 表示使用默认超时。" value={draft.kiroUpstreamResponseTimeoutSecs} min={0} suffix="秒" onChange={set('kiroUpstreamResponseTimeoutSecs')} />
                 <NumField label="流式静默超时" desc="流式响应长时间没有新内容时，结束本次请求。" value={draft.kiroUpstreamStreamIdleTimeoutSecs} min={0} suffix="秒" onChange={set('kiroUpstreamStreamIdleTimeoutSecs')} />
@@ -633,6 +737,24 @@ export function RuntimePage() {
                   <TogField label="整理思考内容" desc="把响应里的思考内容单独整理出来，方便客户端按固定格式展示。" checked={draft.extractThinking} onChange={set('extractThinking')} />
                   <TogField label="显示处理告警" desc="把代理处理中的提醒返回给客户端，方便排查问题。" checked={draft.exposeProxyWarnings} onChange={set('exposeProxyWarnings')} />
                 </TwoCol>
+                <div className="space-y-3">
+                  <div>
+                    <div className="text-sm font-semibold">本地 Kiro 转换能力</div>
+                    <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                      只影响本地凭据的 Anthropic 到 Kiro 转换；外部池 raw body 透传不会进入这些阶段。
+                    </div>
+                  </div>
+                  <TwoCol>
+                    <TogField label="工具 schema 规范化" desc="清理 OpenAPI、Zod、MCP 等工具 schema 中上游容易拒绝的字段。" checked={draft.bodyConversion.toolSchemaNormalization} onChange={setBodyConversion('toolSchemaNormalization')} />
+                    <TogField label="工具名映射" desc="清洗或缩短不符合 Kiro 工具名约束的名称，并记录响应反向映射。" checked={draft.bodyConversion.toolNameMapping} onChange={setBodyConversion('toolNameMapping')} />
+                    <TogField label="tool_choice 引导" desc="按请求的 tool_choice 过滤工具并注入兼容提示。" checked={draft.bodyConversion.toolChoiceSteering} onChange={setBodyConversion('toolChoiceSteering')} />
+                    <TogField label="分块写入策略" desc="给 Write/Edit 工具和系统消息加入分块写入约束。" checked={draft.bodyConversion.chunkedToolPolicy} onChange={setBodyConversion('chunkedToolPolicy')} />
+                    <TogField label="thinking 提示控制" desc="对不支持原生 reasoning 的模型注入 synthetic thinking 控制。" checked={draft.bodyConversion.thinkingPromptControls} onChange={setBodyConversion('thinkingPromptControls')} />
+                    <TogField label="原生 reasoning 字段" desc="对支持的 Kiro 模型上报 additionalModelRequestFields。" checked={draft.bodyConversion.nativeReasoningFields} onChange={setBodyConversion('nativeReasoningFields')} />
+                    <TogField label="工具配对修复" desc="修复或文本化不严格配对的 tool_use/tool_result。" checked={draft.bodyConversion.toolPairingRepair} onChange={setBodyConversion('toolPairingRepair')} />
+                    <TogField label="历史工具占位" desc="历史里出现但当前 tools 缺失时补充占位工具定义。" checked={draft.bodyConversion.historyPlaceholderTools} onChange={setBodyConversion('historyPlaceholderTools')} />
+                  </TwoCol>
+                </div>
               </div>
             )}
           </div>

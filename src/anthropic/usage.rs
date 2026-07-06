@@ -22,6 +22,11 @@ const USAGE_WRITER_QUEUE_CAPACITY: usize = 4096;
 const USAGE_WRITER_MAX_ATTEMPTS: u32 = 3;
 const USAGE_WRITER_BATCH_MAX: usize = 64;
 const USAGE_WRITER_BATCH_COALESCE_DELAY: StdDuration = StdDuration::from_millis(25);
+const USAGE_WRITER_POSTGRES_TIMEOUT_SECS: u64 = 5;
+const USAGE_REDIS_WRITER_QUEUE_CAPACITY: usize = 4096;
+const USAGE_REDIS_WRITER_BATCH_MAX: usize = 64;
+const USAGE_REDIS_WRITER_BATCH_COALESCE_DELAY: StdDuration = StdDuration::from_millis(10);
+const USAGE_REDIS_WRITER_TIMEOUT_SECS: u64 = 2;
 const USAGE_DASHBOARD_REDIS_TIMEOUT_SECS: u64 = 2;
 const USAGE_DASHBOARD_POSTGRES_TIMEOUT_SECS: u64 = 5;
 const ERROR_DIAGNOSTIC_MAX_TEXT_BYTES: usize = 2048;
@@ -189,6 +194,10 @@ impl UsageSource {
 #[serde(rename_all = "camelCase")]
 pub struct UsageLatencyTrace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_weight_units: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_input_tokens: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_guard_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_header_ms: Option<u64>,
@@ -227,6 +236,8 @@ pub enum StreamTerminalReason {
 impl UsageLatencyTrace {
     pub fn is_empty(&self) -> bool {
         self.payload_guard_ms.is_none()
+            && self.capacity_weight_units.is_none()
+            && self.estimated_input_tokens.is_none()
             && self.upstream_header_ms.is_none()
             && self.first_upstream_chunk_ms.is_none()
             && self.first_output_delta_ms.is_none()
@@ -879,6 +890,11 @@ fn parse_fixed_offset(value: &str) -> Option<FixedOffset> {
 pub struct UsageRecorderStats {
     pub in_memory_limit: usize,
     pub in_memory_records: usize,
+    pub redis_enabled: bool,
+    pub redis_queue_enabled: bool,
+    pub redis_queue_capacity: usize,
+    pub redis_queue_available: usize,
+    pub dropped_redis_records: u64,
     pub postgres_enabled: bool,
     pub writer_queue_enabled: bool,
     pub writer_queue_capacity: usize,
@@ -892,7 +908,9 @@ pub struct UsageRecorder {
     postgres_store: Option<Arc<PostgresUsageStore>>,
     redis_store: Option<Arc<RedisStore>>,
     writer_tx: Option<mpsc::Sender<UsageRecord>>,
-    dropped_persist_records: AtomicU64,
+    redis_writer_tx: Option<mpsc::Sender<UsageRecord>>,
+    dropped_persist_records: Arc<AtomicU64>,
+    dropped_redis_records: Arc<AtomicU64>,
 }
 
 enum UsageDashboardCacheRead {
@@ -1132,7 +1150,9 @@ impl UsageRecorder {
             postgres_store: None,
             redis_store: None,
             writer_tx: None,
-            dropped_persist_records: AtomicU64::new(0),
+            redis_writer_tx: None,
+            dropped_persist_records: Arc::new(AtomicU64::new(0)),
+            dropped_redis_records: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1141,9 +1161,16 @@ impl UsageRecorder {
         postgres_store: Arc<PostgresUsageStore>,
         redis_store: Option<Arc<RedisStore>>,
     ) -> Self {
-        let writer_tx = if tokio::runtime::Handle::try_current().is_ok() {
+        let runtime_available = tokio::runtime::Handle::try_current().is_ok();
+        let dropped_persist_records = Arc::new(AtomicU64::new(0));
+        let dropped_redis_records = Arc::new(AtomicU64::new(0));
+        let writer_tx = if runtime_available {
             let (tx, rx) = mpsc::channel(USAGE_WRITER_QUEUE_CAPACITY);
-            tokio::spawn(usage_writer_loop(postgres_store.clone(), rx));
+            tokio::spawn(usage_writer_loop(
+                postgres_store.clone(),
+                rx,
+                dropped_persist_records.clone(),
+            ));
             Some(tx)
         } else {
             tracing::warn!(
@@ -1151,13 +1178,31 @@ impl UsageRecorder {
             );
             None
         };
+        let redis_writer_tx = redis_store.as_ref().and_then(|redis| {
+            if runtime_available {
+                let (tx, rx) = mpsc::channel(USAGE_REDIS_WRITER_QUEUE_CAPACITY);
+                tokio::spawn(usage_redis_writer_loop(
+                    redis.clone(),
+                    rx,
+                    dropped_redis_records.clone(),
+                ));
+                Some(tx)
+            } else {
+                tracing::warn!(
+                    "创建 UsageRecorder 时没有运行中的 Tokio runtime，将同步写入 Redis usage summary"
+                );
+                None
+            }
+        });
         Self {
             records: Mutex::new(VecDeque::with_capacity(limit.max(1).min(1024))),
             limit: limit.max(1),
             postgres_store: Some(postgres_store),
             redis_store,
             writer_tx,
-            dropped_persist_records: AtomicU64::new(0),
+            redis_writer_tx,
+            dropped_persist_records,
+            dropped_redis_records,
         }
     }
 
@@ -1183,8 +1228,12 @@ impl UsageRecorder {
                     let dropped = self.dropped_persist_records.fetch_add(1, Ordering::Relaxed) + 1;
                     tracing::warn!(dropped, "PgSQL usage 写入队列已满，本条 usage 持久化被丢弃");
                 }
-                Err(mpsc::error::TrySendError::Closed(record)) => {
-                    self.persist_usage_sync(record);
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    let dropped = self.dropped_persist_records.fetch_add(1, Ordering::Relaxed) + 1;
+                    tracing::warn!(
+                        dropped,
+                        "PgSQL usage 写入队列已关闭，本条 usage 持久化被丢弃"
+                    );
                 }
             }
         } else {
@@ -1196,14 +1245,29 @@ impl UsageRecorder {
         let Some(redis) = &self.redis_store else {
             return;
         };
-        let redis = redis.clone();
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::spawn(async move {
-                if let Err(err) = redis.record_usage_summary(&record).await {
-                    tracing::warn!("写入 Redis usage summary 失败: {}", err);
+        if let Some(tx) = &self.redis_writer_tx {
+            match tx.try_send(record) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    let dropped = self.dropped_redis_records.fetch_add(1, Ordering::Relaxed) + 1;
+                    tracing::warn!(
+                        dropped,
+                        "Redis usage 写入队列已满，本条 usage summary 被丢弃"
+                    );
                 }
-            });
-        } else if let Err(err) =
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    let dropped = self.dropped_redis_records.fetch_add(1, Ordering::Relaxed) + 1;
+                    tracing::warn!(
+                        dropped,
+                        "Redis usage 写入队列已关闭，本条 usage summary 被丢弃"
+                    );
+                }
+            }
+            return;
+        }
+
+        let redis = redis.clone();
+        if let Err(err) =
             block_on_usage_store(async move { redis.record_usage_summary(&record).await })
         {
             tracing::warn!("写入 Redis usage summary 失败: {}", err);
@@ -1218,9 +1282,20 @@ impl UsageRecorder {
             } else {
                 (false, 0, 0)
             };
+        let (redis_queue_enabled, redis_queue_capacity, redis_queue_available) =
+            if let Some(tx) = &self.redis_writer_tx {
+                (true, tx.max_capacity(), tx.capacity())
+            } else {
+                (false, 0, 0)
+            };
         UsageRecorderStats {
             in_memory_limit: self.limit,
             in_memory_records,
+            redis_enabled: self.redis_store.is_some(),
+            redis_queue_enabled,
+            redis_queue_capacity,
+            redis_queue_available,
+            dropped_redis_records: self.dropped_redis_records.load(Ordering::Relaxed),
             postgres_enabled: self.postgres_store.is_some(),
             writer_queue_enabled,
             writer_queue_capacity,
@@ -1870,7 +1945,11 @@ impl UsageRecorder {
     }
 }
 
-async fn usage_writer_loop(store: Arc<PostgresUsageStore>, mut rx: mpsc::Receiver<UsageRecord>) {
+async fn usage_writer_loop(
+    store: Arc<PostgresUsageStore>,
+    mut rx: mpsc::Receiver<UsageRecord>,
+    dropped_records: Arc<AtomicU64>,
+) {
     while let Some(first) = rx.recv().await {
         let mut records = Vec::with_capacity(USAGE_WRITER_BATCH_MAX);
         records.push(first);
@@ -1884,7 +1963,7 @@ async fn usage_writer_loop(store: Arc<PostgresUsageStore>, mut rx: mpsc::Receive
                 Ok(None) | Err(_) => {}
             }
         }
-        persist_usage_batch_with_retry(&store, records).await;
+        persist_usage_batch_with_retry(&store, records, &dropped_records).await;
     }
 }
 
@@ -1901,6 +1980,7 @@ fn drain_usage_writer_queue(rx: &mut mpsc::Receiver<UsageRecord>, records: &mut 
 async fn persist_usage_batch_with_retry(
     store: &Arc<PostgresUsageStore>,
     records: Vec<UsageRecord>,
+    dropped_records: &Arc<AtomicU64>,
 ) {
     let first_request_id = records
         .first()
@@ -1910,9 +1990,39 @@ async fn persist_usage_batch_with_retry(
     let record_count = records.len();
     let mut attempt = 1;
     loop {
-        match store.record_batch(records.clone()).await {
-            Ok(()) => break,
-            Err(err) if attempt < USAGE_WRITER_MAX_ATTEMPTS => {
+        let result = tokio::time::timeout(
+            StdDuration::from_secs(USAGE_WRITER_POSTGRES_TIMEOUT_SECS),
+            store.record_batch(records.clone()),
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => break,
+            Err(_) if attempt < USAGE_WRITER_MAX_ATTEMPTS => {
+                let delay_ms = 100u64.saturating_mul(2u64.saturating_pow(attempt - 1));
+                tracing::warn!(
+                    request_id = %first_request_id,
+                    record_count,
+                    attempt,
+                    timeout_secs = USAGE_WRITER_POSTGRES_TIMEOUT_SECS,
+                    "批量写入 PgSQL usage record 超时，准备重试"
+                );
+                tokio::time::sleep(StdDuration::from_millis(delay_ms)).await;
+                attempt += 1;
+            }
+            Err(_) => {
+                let dropped = dropped_records.fetch_add(record_count as u64, Ordering::Relaxed)
+                    + record_count as u64;
+                tracing::warn!(
+                    request_id = %first_request_id,
+                    record_count,
+                    attempt,
+                    timeout_secs = USAGE_WRITER_POSTGRES_TIMEOUT_SECS,
+                    dropped,
+                    "批量写入 PgSQL usage record 最终超时，已放弃本批持久化"
+                );
+                break;
+            }
+            Ok(Err(err)) if attempt < USAGE_WRITER_MAX_ATTEMPTS => {
                 let delay_ms = 100u64.saturating_mul(2u64.saturating_pow(attempt - 1));
                 tracing::warn!(
                     request_id = %first_request_id,
@@ -1924,16 +2034,114 @@ async fn persist_usage_batch_with_retry(
                 tokio::time::sleep(StdDuration::from_millis(delay_ms)).await;
                 attempt += 1;
             }
-            Err(err) => {
+            Ok(Err(err)) => {
+                let dropped = dropped_records.fetch_add(record_count as u64, Ordering::Relaxed)
+                    + record_count as u64;
                 tracing::warn!(
                     request_id = %first_request_id,
                     record_count,
                     attempt,
+                    dropped,
                     "批量写入 PgSQL usage record 最终失败，已放弃本批持久化: {}",
                     err
                 );
                 break;
             }
+        }
+    }
+}
+
+async fn usage_redis_writer_loop(
+    redis: Arc<RedisStore>,
+    mut rx: mpsc::Receiver<UsageRecord>,
+    dropped_records: Arc<AtomicU64>,
+) {
+    while let Some(first) = rx.recv().await {
+        let mut records = Vec::with_capacity(USAGE_REDIS_WRITER_BATCH_MAX);
+        records.push(first);
+        drain_usage_redis_writer_queue(&mut rx, &mut records);
+        if records.len() < USAGE_REDIS_WRITER_BATCH_MAX {
+            match tokio::time::timeout(USAGE_REDIS_WRITER_BATCH_COALESCE_DELAY, rx.recv()).await {
+                Ok(Some(record)) => {
+                    records.push(record);
+                    drain_usage_redis_writer_queue(&mut rx, &mut records);
+                }
+                Ok(None) | Err(_) => {}
+            }
+        }
+        persist_usage_redis_batch_with_timeout(&redis, records, &dropped_records).await;
+    }
+}
+
+fn drain_usage_redis_writer_queue(
+    rx: &mut mpsc::Receiver<UsageRecord>,
+    records: &mut Vec<UsageRecord>,
+) {
+    while records.len() < USAGE_REDIS_WRITER_BATCH_MAX {
+        match rx.try_recv() {
+            Ok(record) => records.push(record),
+            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
+        }
+    }
+}
+
+async fn persist_usage_redis_batch_with_timeout(
+    redis: &Arc<RedisStore>,
+    records: Vec<UsageRecord>,
+    dropped_records: &Arc<AtomicU64>,
+) {
+    let record_count = records.len();
+    let first_request_id = records
+        .first()
+        .map(|record| record.id.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let started_at = Instant::now();
+    let mut failed = 0u64;
+    let mut last_error: Option<String> = None;
+    for record in records {
+        match tokio::time::timeout(
+            StdDuration::from_secs(USAGE_REDIS_WRITER_TIMEOUT_SECS),
+            redis.record_usage_summary(&record),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                failed += 1;
+                last_error = Some(err.to_string());
+            }
+            Err(_) => {
+                failed += 1;
+                last_error = Some(format!(
+                    "timeout after {}s",
+                    USAGE_REDIS_WRITER_TIMEOUT_SECS
+                ));
+            }
+        }
+    }
+    if failed > 0 {
+        let dropped = dropped_records.fetch_add(failed, Ordering::Relaxed) + failed;
+        tracing::warn!(
+            request_id = %first_request_id,
+            record_count,
+            failed,
+            dropped,
+            timeout_secs = USAGE_REDIS_WRITER_TIMEOUT_SECS,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            error = ?last_error,
+            "写入 Redis usage summary 失败，已丢弃部分观测记录"
+        );
+    } else {
+        let elapsed = started_at.elapsed();
+        if elapsed >= StdDuration::from_millis(250) {
+            tracing::debug!(
+                request_id = %first_request_id,
+                record_count,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "Redis usage summary 批量写入耗时较长"
+            );
         }
     }
 }

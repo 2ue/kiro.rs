@@ -1,4 +1,7 @@
 use super::{model_pipeline, *};
+use crate::anthropic::body_capabilities::{
+    ExternalBodyBytesPlan, ExternalBodyPlan, PayloadGuardStagePlan, RawModelStagePlan,
+};
 
 pub(super) struct PreparedExternalRequest {
     pub(super) body: Bytes,
@@ -9,9 +12,25 @@ pub(super) fn prepare_request(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
 ) -> Result<PreparedExternalRequest, ExternalPoolError> {
-    if pool.request_body_mode == ExternalPoolRequestBodyMode::RawPassthrough {
-        return prepare_raw_request(route, pool);
-    }
+    let plan = plan_for_pool(route, pool);
+    tracing::trace!(
+        request_id = %route.request_id,
+        pool_id = pool.id,
+        profile = plan.profile.as_str(),
+        usage_projection_enabled = plan.usage_projection.is_enabled(),
+        "preparing external request body with capability plan"
+    );
+
+    let (payload_guard, model, thinking_normalization) = match plan.bytes {
+        ExternalBodyBytesPlan::RawPassthrough { model } => {
+            return prepare_raw_request(route, pool, model);
+        }
+        ExternalBodyBytesPlan::Normalized {
+            payload_guard,
+            model,
+            thinking_normalization,
+        } => (payload_guard, model, thinking_normalization),
+    };
 
     let Some(payload) = route.payload.as_ref() else {
         return Err(ExternalPoolError {
@@ -27,7 +46,7 @@ pub(super) fn prepare_request(
         });
     };
 
-    let prepared_payload = prepare_normalized_payload(route, pool, payload)?;
+    let prepared_payload = prepare_normalized_payload(route, pool, payload, payload_guard)?;
     let payload = &prepared_payload.payload;
     if let Some(report) = prepared_payload.report.as_ref() {
         tracing::debug!(
@@ -54,13 +73,20 @@ pub(super) fn prepare_request(
         },
     };
 
-    let outbound_model = model_pipeline::outbound_model_for_value(route, pool, &value)?;
-    if let Some(outbound_model) = outbound_model.as_deref() {
-        if value.get("model").and_then(|model| model.as_str()) != Some(outbound_model) {
-            value["model"] = serde_json::Value::String(outbound_model.to_string());
+    let outbound_model = if model.is_enabled() {
+        let outbound_model = model_pipeline::outbound_model_for_value(route, pool, &value)?;
+        if let Some(outbound_model) = outbound_model.as_deref() {
+            if value.get("model").and_then(|model| model.as_str()) != Some(outbound_model) {
+                value["model"] = serde_json::Value::String(outbound_model.to_string());
+            }
         }
+        outbound_model
+    } else {
+        None
+    };
+    if thinking_normalization.is_enabled() {
+        super::normalize_external_pool_thinking_value(&mut value);
     }
-    super::normalize_external_pool_thinking_value(&mut value);
 
     let body = serde_json::to_vec(&value)
         .map(Bytes::from)
@@ -71,16 +97,38 @@ pub(super) fn prepare_request(
     })
 }
 
+fn plan_for_pool(route: &ExternalRouteRequest, pool: &ExternalPool) -> ExternalBodyPlan {
+    match pool.request_body_mode {
+        ExternalPoolRequestBodyMode::RawPassthrough => {
+            ExternalBodyPlan::raw(raw_model_stage_plan(pool.raw_model_mode))
+        }
+        ExternalPoolRequestBodyMode::Normalized => {
+            let mut guard_config = route.payload_guard_initial_config;
+            guard_config.enabled = route.payload_guard_external_enabled && guard_config.enabled;
+            ExternalBodyPlan::normalized(guard_config)
+        }
+    }
+}
+
+fn raw_model_stage_plan(mode: ExternalPoolRawModelMode) -> RawModelStagePlan {
+    match mode {
+        ExternalPoolRawModelMode::None => RawModelStagePlan::None,
+        ExternalPoolRawModelMode::ProbeOnly => RawModelStagePlan::ProbeOnly,
+        ExternalPoolRawModelMode::RewriteTopLevel => RawModelStagePlan::RewriteTopLevel,
+    }
+}
+
 fn prepare_raw_request(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
+    model_stage: RawModelStagePlan,
 ) -> Result<PreparedExternalRequest, ExternalPoolError> {
-    match pool.raw_model_mode {
-        ExternalPoolRawModelMode::None => Ok(PreparedExternalRequest {
+    match model_stage {
+        RawModelStagePlan::None => Ok(PreparedExternalRequest {
             body: route.raw_body.clone(),
             outbound_model: None,
         }),
-        ExternalPoolRawModelMode::ProbeOnly => {
+        RawModelStagePlan::ProbeOnly => {
             let probe = probe_raw_messages_body(&route.raw_body);
             let outbound_model =
                 model_pipeline::outbound_model_for_raw(route, pool, probe.model.as_deref())?;
@@ -89,7 +137,7 @@ fn prepare_raw_request(
                 outbound_model,
             })
         }
-        ExternalPoolRawModelMode::RewriteTopLevel => {
+        RawModelStagePlan::RewriteTopLevel => {
             let probe = probe_raw_messages_body(&route.raw_body);
             let outbound_model =
                 model_pipeline::outbound_model_for_raw(route, pool, probe.model.as_deref())?;
@@ -124,13 +172,13 @@ fn prepare_normalized_payload(
     route: &ExternalRouteRequest,
     pool: &ExternalPool,
     payload: &MessagesRequest,
+    payload_guard: PayloadGuardStagePlan,
 ) -> Result<PreparedExternalMessagesPayload, ExternalPoolError> {
-    let guard_config = route.payload_guard_initial_config;
     match prepare_external_messages_payload(
         payload,
         &route.raw_body,
-        route.payload_guard_external_enabled,
-        guard_config,
+        payload_guard.state.is_enabled(),
+        payload_guard.config,
     ) {
         Ok(prepared) => Ok(prepared),
         Err(err) => {
@@ -138,10 +186,10 @@ fn prepare_normalized_payload(
                 return Err(payload_guard_error(pool, err));
             }
             let mut payload = payload.clone();
-            let sanitized = guard_config.shaping.enabled
+            let sanitized = payload_guard.config.shaping.enabled
                 && sanitize_anthropic_messages_for_external_forwarding(
                     &mut payload,
-                    guard_config.shaping,
+                    payload_guard.config.shaping,
                 );
             let raw_body = if sanitized {
                 serialize_external_messages_request_body(&payload)

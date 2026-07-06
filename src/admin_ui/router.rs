@@ -14,21 +14,31 @@ use axum::{
     routing::get,
 };
 
+#[cfg(not(debug_assertions))]
 use rust_embed::Embed;
 
 /// 嵌入旧版前端构建产物
+#[cfg(not(debug_assertions))]
 #[derive(Embed)]
 #[folder = "admin-ui/dist"]
 struct AdminAsset;
+#[cfg(debug_assertions)]
+struct AdminAsset;
 
 /// 嵌入新版 Daisy 前端构建产物
+#[cfg(not(debug_assertions))]
 #[derive(Embed)]
 #[folder = "admin-ui-daisy/dist"]
 struct ConsoleAsset;
+#[cfg(debug_assertions)]
+struct ConsoleAsset;
 
 /// 嵌入重构版前端构建产物(shadcn + Tailwind v4)
+#[cfg(not(debug_assertions))]
 #[derive(Embed)]
 #[folder = "ui/dist"]
+struct NewUiAsset;
+#[cfg(debug_assertions)]
 struct NewUiAsset;
 
 trait UiAsset {
@@ -40,8 +50,14 @@ trait UiAsset {
 impl UiAsset for AdminAsset {
     const BUILD_HINT: &'static str = "Admin UI not built. Run 'pnpm build' in admin-ui directory.";
 
+    #[cfg(not(debug_assertions))]
     fn get(path: &str) -> Option<rust_embed::EmbeddedFile> {
         <Self as rust_embed::RustEmbed>::get(path)
+    }
+
+    #[cfg(debug_assertions)]
+    fn get(_path: &str) -> Option<rust_embed::EmbeddedFile> {
+        None
     }
 }
 
@@ -49,16 +65,28 @@ impl UiAsset for ConsoleAsset {
     const BUILD_HINT: &'static str =
         "Console UI not built. Run 'pnpm build' in admin-ui-daisy directory.";
 
+    #[cfg(not(debug_assertions))]
     fn get(path: &str) -> Option<rust_embed::EmbeddedFile> {
         <Self as rust_embed::RustEmbed>::get(path)
+    }
+
+    #[cfg(debug_assertions)]
+    fn get(_path: &str) -> Option<rust_embed::EmbeddedFile> {
+        None
     }
 }
 
 impl UiAsset for NewUiAsset {
     const BUILD_HINT: &'static str = "New UI not built. Run 'pnpm build' in ui directory.";
 
+    #[cfg(not(debug_assertions))]
     fn get(path: &str) -> Option<rust_embed::EmbeddedFile> {
         <Self as rust_embed::RustEmbed>::get(path)
+    }
+
+    #[cfg(debug_assertions)]
+    fn get(_path: &str) -> Option<rust_embed::EmbeddedFile> {
+        None
     }
 }
 
@@ -112,22 +140,26 @@ impl UiServeState {
         env_prefix: &'static str,
         fallback_env_prefix: Option<&'static str>,
         default_dir: &'static str,
+        default_dev_server: &'static str,
         build_hint: &'static str,
     ) -> Self {
-        let mode = read_ui_env(env_prefix, fallback_env_prefix, "MODE")
+        let mode_from_env = read_ui_env(env_prefix, fallback_env_prefix, "MODE")
             .as_deref()
-            .and_then(UiServeMode::from_env)
+            .and_then(UiServeMode::from_env);
+        let external_url_from_env = read_ui_env(env_prefix, fallback_env_prefix, "DEV_SERVER")
+            .or_else(|| read_ui_env(env_prefix, fallback_env_prefix, "EXTERNAL_URL"));
+        let mode = mode_from_env
             .or_else(|| {
-                read_ui_env(env_prefix, fallback_env_prefix, "DEV_SERVER")
-                    .or_else(|| read_ui_env(env_prefix, fallback_env_prefix, "EXTERNAL_URL"))
+                external_url_from_env
+                    .as_ref()
                     .map(|_| UiServeMode::Redirect)
             })
-            .unwrap_or(UiServeMode::Embedded);
+            .unwrap_or_else(default_ui_serve_mode);
         let filesystem_dir = read_ui_env(env_prefix, fallback_env_prefix, "DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(default_dir));
-        let external_url = read_ui_env(env_prefix, fallback_env_prefix, "DEV_SERVER")
-            .or_else(|| read_ui_env(env_prefix, fallback_env_prefix, "EXTERNAL_URL"))
+        let external_url = external_url_from_env
+            .or_else(|| default_dev_external_url(mode, default_dev_server))
             .map(|value| value.trim().trim_end_matches('/').to_string())
             .filter(|value| !value.is_empty());
 
@@ -152,6 +184,22 @@ impl UiServeState {
     }
 }
 
+fn default_ui_serve_mode() -> UiServeMode {
+    if cfg!(debug_assertions) {
+        UiServeMode::Redirect
+    } else {
+        UiServeMode::Embedded
+    }
+}
+
+fn default_dev_external_url(mode: UiServeMode, default_dev_server: &str) -> Option<String> {
+    if cfg!(debug_assertions) && matches!(mode, UiServeMode::Redirect | UiServeMode::Proxy) {
+        Some(default_dev_server.to_string())
+    } else {
+        None
+    }
+}
+
 fn read_ui_env(
     env_prefix: &str,
     fallback_env_prefix: Option<&str>,
@@ -171,6 +219,7 @@ pub fn create_admin_ui_router() -> Router {
         "KIRO_ADMIN_UI",
         None,
         "admin-ui/dist",
+        "http://127.0.0.1:9025/admin",
         AdminAsset::BUILD_HINT,
     ))
 }
@@ -183,6 +232,7 @@ pub fn create_console_ui_router() -> Router {
         "KIRO_CONSOLE_UI",
         None,
         "admin-ui-daisy/dist",
+        "http://127.0.0.1:9024/console",
         ConsoleAsset::BUILD_HINT,
     ))
 }
@@ -195,6 +245,7 @@ pub fn create_new_ui_router() -> Router {
         "KIRO_NEW_UI",
         Some("KIRO_UI"),
         "ui/dist",
+        "http://127.0.0.1:9023/ui",
         NewUiAsset::BUILD_HINT,
     ))
 }
@@ -493,6 +544,7 @@ fn is_asset_path(path: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(not(debug_assertions))]
     #[test]
     fn embedded_ui_indexes_use_expected_mount_prefixes() {
         let admin = <AdminAsset as rust_embed::RustEmbed>::get("index.html")
@@ -513,6 +565,24 @@ mod tests {
         assert!(new_ui.contains("/ui/assets/"));
         assert!(!new_ui.contains("/admin/assets/"));
         assert!(!new_ui.contains("/console/assets/"));
+    }
+
+    #[test]
+    fn default_ui_mode_uses_dev_redirect_in_debug_and_embedded_in_release() {
+        if cfg!(debug_assertions) {
+            assert_eq!(default_ui_serve_mode(), UiServeMode::Redirect);
+            assert_eq!(
+                default_dev_external_url(UiServeMode::Redirect, "http://127.0.0.1:9023/ui")
+                    .as_deref(),
+                Some("http://127.0.0.1:9023/ui")
+            );
+        } else {
+            assert_eq!(default_ui_serve_mode(), UiServeMode::Embedded);
+            assert!(
+                default_dev_external_url(UiServeMode::Redirect, "http://127.0.0.1:9023/ui")
+                    .is_none()
+            );
+        }
     }
 
     #[test]

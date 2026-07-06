@@ -486,17 +486,17 @@ RUST_LOG=debug ./target/release/kiro-rs
 | `KIRO_RS_IMAGE` | `ghcr.io/2ue/kiro-rs` | `docker-compose.deploy.yml` 使用的镜像仓库 |
 | `KIRO_RS_VERSION` | `latest` | `docker-compose.deploy.yml` 使用的镜像 tag |
 | `KIRO_RS_PORT` | `8990` | Docker 部署时映射到宿主机的端口 |
-| `KIRO_NEW_UI_MODE` / `KIRO_UI_MODE` | `embedded` | 新版 `/ui` 的服务模式：`embedded` / `redirect` / `proxy` / `filesystem` / `disabled` |
+| `KIRO_NEW_UI_MODE` / `KIRO_UI_MODE` | debug: `redirect`; release: `embedded` | 新版 `/ui` 的服务模式：`embedded` / `redirect` / `proxy` / `filesystem` / `disabled` |
 | `KIRO_NEW_UI_DIR` / `KIRO_UI_DIR` | `ui/dist` | `/ui` 使用 `filesystem` 模式时读取的构建目录 |
-| `KIRO_NEW_UI_DEV_SERVER` / `KIRO_UI_DEV_SERVER` | - | `/ui` 使用 `redirect` 或 `proxy` 时指向的 Vite 服务，例如 `http://127.0.0.1:9023` |
-| `KIRO_ADMIN_UI_MODE` | `embedded` | 旧版 `/admin` 的服务模式，取值同上 |
+| `KIRO_NEW_UI_DEV_SERVER` / `KIRO_UI_DEV_SERVER` | debug: `http://127.0.0.1:9023/ui` | `/ui` 使用 `redirect` 或 `proxy` 时指向的 Vite 服务 |
+| `KIRO_ADMIN_UI_MODE` | debug: `redirect`; release: `embedded` | 旧版 `/admin` 的服务模式，取值同上 |
 | `KIRO_ADMIN_UI_DIR` | `admin-ui/dist` | `/admin` 使用 `filesystem` 模式时读取的构建目录 |
-| `KIRO_ADMIN_UI_DEV_SERVER` | - | `/admin` 使用 `redirect` 或 `proxy` 时指向的 Vite 服务，例如 `http://127.0.0.1:9025` |
-| `KIRO_CONSOLE_UI_MODE` | `embedded` | `/console` 的服务模式，取值同上 |
+| `KIRO_ADMIN_UI_DEV_SERVER` | debug: `http://127.0.0.1:9025/admin` | `/admin` 使用 `redirect` 或 `proxy` 时指向的 Vite 服务 |
+| `KIRO_CONSOLE_UI_MODE` | debug: `redirect`; release: `embedded` | `/console` 的服务模式，取值同上 |
 | `KIRO_CONSOLE_UI_DIR` | `admin-ui-daisy/dist` | `/console` 使用 `filesystem` 模式时读取的构建目录 |
-| `KIRO_CONSOLE_UI_DEV_SERVER` | - | `/console` 使用 `redirect` 或 `proxy` 时指向的 Vite 服务，例如 `http://127.0.0.1:9024` |
+| `KIRO_CONSOLE_UI_DEV_SERVER` | debug: `http://127.0.0.1:9024/console` | `/console` 使用 `redirect` 或 `proxy` 时指向的 Vite 服务 |
 
-生产默认使用 `embedded`，前端构建产物编进后端二进制，部署仍是单服务。开发环境统一使用 Vite 热更新，前端通过 `/api` 代理到后端 API；不要用后端 embedded 页面判断当前前端源码效果。
+生产默认使用 `embedded`，前端构建产物编进后端二进制，部署仍是单服务。debug 构建默认不嵌入前端 dist，后端 `/ui`、`/console`、`/admin` 会重定向到对应 Vite 服务；开发环境统一使用 Vite 热更新，前端通过 `/api` 代理到后端 API。
 
 本地开发预览地址：
 
@@ -519,7 +519,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 VITE_API_PROXY_TARGET=http://127.0.0.1:8990 bash scripts/dev-ui.sh ui
 ```
 
-日常前端开发不要从后端 `/ui`、`/console`、`/admin` 入口看效果。后端只跑 API，浏览器直接打开上表里的 Vite 地址。
+日常前端开发可以直接打开上表里的 Vite 地址；如果访问 debug 后端的 `/ui`、`/console`、`/admin`，后端也会自动重定向到对应 Vite 地址。release 二进制仍默认使用 embedded 页面。
 
 ## API 端点
 

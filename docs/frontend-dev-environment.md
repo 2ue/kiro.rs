@@ -2,13 +2,13 @@
 
 本文档只解决一个问题：本地开发时到底看哪个地址。
 
-结论很简单：开发看 Vite 热更新地址，后端只当 API 服务用。后端启动时把三套 UI 都设为 `disabled`，不要用 Rust embedded 页面判断前端源码是否生效。
+结论很简单：开发看 Vite 热更新地址，后端只当 API 服务用。debug 构建下，后端 `/ui`、`/console`、`/admin` 默认会重定向到对应 Vite 服务，不再依赖 Rust embedded 页面。
 
 ## 固定地址
 
 | 目标 | 地址 | 启动命令 | 说明 |
 |------|------|----------|------|
-| 后端 API | `http://127.0.0.1:9022` | 见下方后端启动命令 | 当前仓库本地 `config.json` 的端口。只作为 API 后端使用。 |
+| 后端 API | `http://127.0.0.1:9022` | 见下方后端启动命令 | 当前仓库本地 `config.json` 的端口。debug 下 `/ui` 等入口会跳到 Vite。 |
 | 新版 UI | `http://127.0.0.1:9023/ui/runtime` | `bash scripts/dev-ui.sh ui` | 主要开发入口，改源码后热更新。 |
 | Console UI | `http://127.0.0.1:9024/console/config` | `bash scripts/dev-ui.sh console` | Daisy 版本对照，改源码后热更新。 |
 | 旧版 Admin UI | `http://127.0.0.1:9025/admin/` | `bash scripts/dev-ui.sh admin` | 旧版对照。打开后点顶部“配置”。 |
@@ -29,16 +29,25 @@ VITE_API_PROXY_TARGET=http://127.0.0.1:8990 bash scripts/dev-ui.sh admin
 docker compose -f docker-compose.local-infra.yml up -d
 ```
 
-再启动后端 API：
+再启动后端 API。debug 构建不需要构建前端 dist：
 
 ```bash
-KIRO_NEW_UI_MODE=disabled \
-KIRO_CONSOLE_UI_MODE=disabled \
-KIRO_ADMIN_UI_MODE=disabled \
-  ./target/release/kiro-rs -c config.json --credentials credentials.json
+cargo run -- -c config.json --credentials credentials.json
 ```
 
-这样 `9022` 只承担 API 后端职责。访问 `http://127.0.0.1:9022/ui`、`/console`、`/admin` 会返回 UI disabled，这是预期行为。
+这样 `9022` 主要承担 API 后端职责。访问 `http://127.0.0.1:9022/ui`、`/console`、`/admin` 会自动重定向到对应 Vite 服务。
+
+如果你想直接跑 release 二进制但仍走 Vite，可显式指定：
+
+```bash
+KIRO_NEW_UI_MODE=redirect \
+KIRO_NEW_UI_DEV_SERVER=http://127.0.0.1:9023/ui \
+KIRO_CONSOLE_UI_MODE=redirect \
+KIRO_CONSOLE_UI_DEV_SERVER=http://127.0.0.1:9024/console \
+KIRO_ADMIN_UI_MODE=redirect \
+KIRO_ADMIN_UI_DEV_SERVER=http://127.0.0.1:9025/admin \
+  ./target/release/kiro-rs -c config.json --credentials credentials.json
+```
 
 最后启动需要看的前端。通常只需要新版 UI：
 
@@ -64,15 +73,15 @@ http://127.0.0.1:9023/ui/runtime
 
 ## 后端 UI 入口
 
-本地开发不要看后端 UI 入口。按上面的启动方式，后端 UI 已禁用：
+debug 构建下，后端 UI 入口默认只是跳转到 Vite：
 
 ```text
-http://127.0.0.1:9022/ui       -> ui UI is disabled
-http://127.0.0.1:9022/console  -> console UI is disabled
-http://127.0.0.1:9022/admin    -> admin UI is disabled
+http://127.0.0.1:9022/ui       -> http://127.0.0.1:9023/ui/
+http://127.0.0.1:9022/console  -> http://127.0.0.1:9024/console/
+http://127.0.0.1:9022/admin    -> http://127.0.0.1:9025/admin/
 ```
 
-这些入口不是开发预览地址。开发只看 `9023`、`9024`、`9025`。
+热更新由 Vite 提供，所以浏览器最终停留在 `9023`、`9024`、`9025` 才是正常现象。release 二进制默认不会这样跳转，仍使用 embedded 页面。
 
 ## 发布验证
 

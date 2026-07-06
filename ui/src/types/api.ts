@@ -617,13 +617,19 @@ export type UsageSource =
   | 'none'
 
 export interface UsageLatencyTrace {
+  capacityWeightUnits?: number
+  estimatedInputTokens?: number
   payloadGuardMs?: number
   upstreamHeaderMs?: number
   firstUpstreamChunkMs?: number
   firstOutputDeltaMs?: number
+  firstThinkingDeltaMs?: number
+  firstVisibleTextDeltaMs?: number
   streamGapToFirstOutputMs?: number
   chunksBeforeFirstOutput?: number
   eventsBeforeFirstOutput?: number
+  clientDroppedMs?: number
+  terminalReason?: 'completed' | 'upstream_status_error' | 'upstream_json_exception' | 'upstream_idle_timeout' | 'malformed_sse' | 'client_dropped' | 'internal_error'
 }
 
 export interface KiroCredentialAttempt {
@@ -693,6 +699,21 @@ export interface UsageRecord {
   publicErrorMessage?: string
   payloadBreakdown?: unknown
   payloadGuardReport?: unknown
+}
+
+export interface UsageRecorderStats {
+  inMemoryLimit: number
+  inMemoryRecords: number
+  redisEnabled: boolean
+  redisQueueEnabled: boolean
+  redisQueueCapacity: number
+  redisQueueAvailable: number
+  droppedRedisRecords: number
+  postgresEnabled: boolean
+  writerQueueEnabled: boolean
+  writerQueueCapacity: number
+  writerQueueAvailable: number
+  droppedPersistRecords: number
 }
 
 export interface ExternalPoolUsageSnapshot {
@@ -1113,6 +1134,17 @@ export interface ImageProcessingConfig {
   safeNormalizeBase64MediaTypes: boolean
 }
 
+export interface BodyConversionConfig {
+  toolSchemaNormalization: boolean
+  toolNameMapping: boolean
+  toolChoiceSteering: boolean
+  chunkedToolPolicy: boolean
+  thinkingPromptControls: boolean
+  nativeReasoningFields: boolean
+  toolPairingRepair: boolean
+  historyPlaceholderTools: boolean
+}
+
 export interface PayloadShapingConfig {
   enabled: boolean
   truncateHistoricalToolResults: boolean
@@ -1287,6 +1319,17 @@ export interface ExternalPoolTestRequest {
   prompt?: string
 }
 
+export interface WeightedCapacityTier {
+  minTokens: number
+  units: number
+}
+
+export interface WeightedCapacityConfig {
+  enabled: boolean
+  maxUnitsPerRequest: number
+  tiers: WeightedCapacityTier[]
+}
+
 export interface RuntimeConfig {
   proxyUrl?: string | null
   proxyUsername?: string | null
@@ -1311,6 +1354,7 @@ export interface RuntimeConfig {
   credentialInFlightLeaseMaxSecs: number
   dispatchGlobalMaxConcurrentRequests: number
   dispatchMaxQueuedRequests: number
+  weightedCapacity: WeightedCapacityConfig
   credentialWarmupRequests: number
   credentialWarmupSelectionPercent: number
   credentialWarmupMaxSelectionPercent: number
@@ -1328,6 +1372,7 @@ export interface RuntimeConfig {
   compressionEnabled: boolean
   whitespaceCompression: boolean
   imageProcessing: ImageProcessingConfig
+  bodyConversion: BodyConversionConfig
   payloadGuardEnabled: boolean
   payloadGuardMode: PayloadGuardMode
   payloadGuardMaxBytes: number

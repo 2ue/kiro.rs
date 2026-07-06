@@ -133,6 +133,24 @@ const defaultImageProcessing = (): ImageProcessingConfig => ({
   safeNormalizeBase64MediaTypes: true,
 })
 
+const defaultBodyConversion = (): RuntimeConfig['bodyConversion'] => ({
+  toolSchemaNormalization: true,
+  toolNameMapping: true,
+  toolChoiceSteering: true,
+  chunkedToolPolicy: true,
+  thinkingPromptControls: true,
+  nativeReasoningFields: true,
+  toolPairingRepair: true,
+  historyPlaceholderTools: true,
+})
+
+const normalizeBodyConversion = (
+  input?: Partial<RuntimeConfig['bodyConversion']> | null,
+): RuntimeConfig['bodyConversion'] => ({
+  ...defaultBodyConversion(),
+  ...(input ?? {}),
+})
+
 const normalizeImageProcessing = (input?: Partial<ImageProcessingConfig> | null): ImageProcessingConfig => {
   const next: ImageProcessingConfig = {
     ...defaultImageProcessing(),
@@ -151,6 +169,37 @@ const normalizeImageProcessing = (input?: Partial<ImageProcessingConfig> | null)
     safeMaterializeFileSources: Boolean(next.safeMaterializeFileSources),
     safeDownloadRemoteSources: Boolean(next.safeDownloadRemoteSources),
     safeNormalizeBase64MediaTypes: Boolean(next.safeNormalizeBase64MediaTypes),
+  }
+}
+
+const defaultWeightedCapacity = (): RuntimeConfig['weightedCapacity'] => ({
+  enabled: false,
+  maxUnitsPerRequest: 8,
+  tiers: [
+    { minTokens: 0, units: 1 },
+    { minTokens: 100000, units: 2 },
+    { minTokens: 300000, units: 4 },
+    { minTokens: 700000, units: 8 },
+  ],
+})
+
+const normalizeWeightedCapacity = (
+  input?: Partial<RuntimeConfig['weightedCapacity']> | null,
+): RuntimeConfig['weightedCapacity'] => {
+  const base = defaultWeightedCapacity()
+  const maxUnitsPerRequest = toWhole(input?.maxUnitsPerRequest ?? base.maxUnitsPerRequest, 1, 64)
+  const tiers = (input?.tiers?.length ? input.tiers : base.tiers)
+    .map((tier) => ({
+      minTokens: toWhole(tier.minTokens),
+      units: toWhole(tier.units, 1, maxUnitsPerRequest),
+    }))
+    .sort((a, b) => a.minTokens - b.minTokens)
+    .filter((tier, index, all) => all.findIndex((item) => item.minTokens === tier.minTokens) === index)
+
+  return {
+    enabled: Boolean(input?.enabled ?? base.enabled),
+    maxUnitsPerRequest,
+    tiers: tiers.length ? tiers : base.tiers,
   }
 }
 
@@ -327,6 +376,7 @@ const emptyConfig: RuntimeConfig = {
   credentialInFlightLeaseMaxSecs: 900,
   dispatchGlobalMaxConcurrentRequests: 0,
   dispatchMaxQueuedRequests: 0,
+  weightedCapacity: defaultWeightedCapacity(),
   credentialWarmupRequests: 3,
   credentialWarmupSelectionPercent: 5,
   credentialWarmupMaxSelectionPercent: 50,
@@ -344,6 +394,7 @@ const emptyConfig: RuntimeConfig = {
   compressionEnabled: false,
   whitespaceCompression: true,
   imageProcessing: defaultImageProcessing(),
+  bodyConversion: defaultBodyConversion(),
   payloadGuardEnabled: true,
   payloadGuardMode: 'preemptive',
   payloadGuardMaxBytes: 460800,
@@ -2451,6 +2502,8 @@ export function RuntimeConfigPanel() {
           ...config.data.payloadShaping,
         },
         imageProcessing: normalizeImageProcessing(config.data.imageProcessing),
+        bodyConversion: normalizeBodyConversion(config.data.bodyConversion),
+        weightedCapacity: normalizeWeightedCapacity(config.data.weightedCapacity),
         externalPools: {
           ...defaultExternalPoolsConfig(),
           ...config.data.externalPools,
@@ -2495,6 +2548,7 @@ export function RuntimeConfigPanel() {
       credentialInFlightLeaseMaxSecs: toWhole(draft.credentialInFlightLeaseMaxSecs),
       dispatchGlobalMaxConcurrentRequests: toWhole(draft.dispatchGlobalMaxConcurrentRequests),
       dispatchMaxQueuedRequests: toWhole(draft.dispatchMaxQueuedRequests),
+      weightedCapacity: normalizeWeightedCapacity(draft.weightedCapacity),
       credentialWarmupRequests: toWhole(draft.credentialWarmupRequests),
       credentialWarmupSelectionPercent: toWhole(draft.credentialWarmupSelectionPercent, 0, 100),
       credentialWarmupMaxSelectionPercent: toWhole(draft.credentialWarmupMaxSelectionPercent, 0, 100),
@@ -2510,6 +2564,7 @@ export function RuntimeConfigPanel() {
       selectionFailureSampleLimit: toWhole(draft.selectionFailureSampleLimit, 0, 1000),
       payloadShaping: normalizePayloadShaping(draft.payloadShaping),
       imageProcessing: normalizeImageProcessing(draft.imageProcessing),
+      bodyConversion: normalizeBodyConversion(draft.bodyConversion),
       promptCacheTargetReadRatio: toRatio(draft.promptCacheTargetReadRatio),
       promptCacheTokenScale: toScale(draft.promptCacheTokenScale),
       promptCacheMaxSimulatedInputTokens: toWhole(draft.promptCacheMaxSimulatedInputTokens),
@@ -2743,6 +2798,92 @@ export function RuntimeConfigPanel() {
             />
             <NumberField title="全局最大并发请求数" description="控制所有凭据合计可同时处理的请求数。填 0 表示不限制。" value={draft.dispatchGlobalMaxConcurrentRequests} min={0} suffix="并发" onChange={(dispatchGlobalMaxConcurrentRequests) => setDraft((prev) => ({ ...prev, dispatchGlobalMaxConcurrentRequests }))} />
             <NumberField title="最大等待队列请求数" description="调度容量已满时允许排队等待的请求数量。填 0 表示不限制。" value={draft.dispatchMaxQueuedRequests} min={0} suffix="请求" onChange={(dispatchMaxQueuedRequests) => setDraft((prev) => ({ ...prev, dispatchMaxQueuedRequests }))} />
+            <ToggleField
+              title="按 token 重量计算本地容量"
+              description="默认关闭。关闭时不改变本地并发/RPM 口径；开启后只使用请求链路已经得到的粗略输入 token，不为容量单独遍历 body。"
+              checked={draft.weightedCapacity.enabled}
+              onCheckedChange={(enabled) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  weightedCapacity: { ...prev.weightedCapacity, enabled },
+                }))
+              }
+            />
+            <NumberField
+              title="单请求最大容量单位"
+              description="限制超长上下文最多占用多少本地并发/RPM 单位，只影响本地凭据，不影响外部池。"
+              value={draft.weightedCapacity.maxUnitsPerRequest}
+              min={1}
+              max={64}
+              suffix="单位"
+              disabled={!draft.weightedCapacity.enabled}
+              onChange={(maxUnitsPerRequest) =>
+                setDraft((prev) => ({
+                  ...prev,
+                  weightedCapacity: {
+                    ...prev.weightedCapacity,
+                    maxUnitsPerRequest,
+                    tiers: prev.weightedCapacity.tiers.map((tier) => ({
+                      ...tier,
+                      units: Math.min(Math.max(1, tier.units), Math.max(1, maxUnitsPerRequest)),
+                    })),
+                  },
+                }))
+              }
+            />
+            <div className="space-y-3 rounded-md border bg-background p-4 md:col-span-2">
+              <div>
+                <div className="text-sm font-medium">容量分档</div>
+                <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                  命中不超过当前输入 token 的最高分档。默认 0=1、100k=2、300k=4、700k=8。
+                </div>
+              </div>
+              <div className="grid gap-3 md:grid-cols-2">
+                {draft.weightedCapacity.tiers.map((tier, index) => (
+                  <div key={index} className="grid grid-cols-2 gap-3 rounded-md border bg-muted/30 p-3">
+                    <NumberField
+                      title="起始 token"
+                      description="大于等于该值"
+                      value={tier.minTokens}
+                      min={0}
+                      suffix="token"
+                      disabled={!draft.weightedCapacity.enabled}
+                      onChange={(minTokens) =>
+                        setDraft((prev) => ({
+                          ...prev,
+                          weightedCapacity: {
+                            ...prev.weightedCapacity,
+                            tiers: prev.weightedCapacity.tiers.map((item, itemIndex) =>
+                              itemIndex === index ? { ...item, minTokens } : item,
+                            ),
+                          },
+                        }))
+                      }
+                    />
+                    <NumberField
+                      title="容量单位"
+                      description="并发/RPM 权重"
+                      value={tier.units}
+                      min={1}
+                      max={draft.weightedCapacity.maxUnitsPerRequest}
+                      suffix="单位"
+                      disabled={!draft.weightedCapacity.enabled}
+                      onChange={(units) =>
+                        setDraft((prev) => ({
+                          ...prev,
+                          weightedCapacity: {
+                            ...prev.weightedCapacity,
+                            tiers: prev.weightedCapacity.tiers.map((item, itemIndex) =>
+                              itemIndex === index ? { ...item, units } : item,
+                            ),
+                          },
+                        }))
+                      }
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
           </ConfigSection>
 
           <ConfigSection
@@ -2902,6 +3043,38 @@ export function RuntimeConfigPanel() {
                 }))
               }
             />
+            <ImpactGroupHeader
+              label="本地转换"
+              title="本地凭据路径的 Anthropic -> Kiro 转换能力"
+              description="这些开关只影响本地凭据请求。外部池 raw body 透传不会进入这些阶段，外部池 normalized 仍按外部池自己的配置处理。"
+            />
+            {[
+              ['toolSchemaNormalization', '工具 schema 规范化', '清理 OpenAPI、Zod、MCP 等工具 schema 中上游容易拒绝的字段。'],
+              ['toolNameMapping', '工具名映射', '清洗或缩短不符合 Kiro 工具名约束的名称，并记录响应反向映射。'],
+              ['toolChoiceSteering', 'tool_choice 引导', '按请求的 tool_choice 过滤工具并注入兼容提示。'],
+              ['chunkedToolPolicy', '分块写入策略', '给 Write/Edit 工具和系统消息加入分块写入约束。'],
+              ['thinkingPromptControls', 'thinking 提示控制', '对不支持原生 reasoning 的模型注入 synthetic thinking 控制。'],
+              ['nativeReasoningFields', '原生 reasoning 字段', '对支持的 Kiro 模型上报 additionalModelRequestFields。'],
+              ['toolPairingRepair', '工具配对修复', '修复或文本化不严格配对的 tool_use/tool_result。'],
+              ['historyPlaceholderTools', '历史工具占位', '历史里出现但当前 tools 缺失时补充占位工具定义。'],
+            ].map(([key, title, description]) => (
+              <ToggleField
+                key={key}
+                title={title}
+                description={description}
+                checked={Boolean(draft.bodyConversion?.[key as keyof RuntimeConfig['bodyConversion']])}
+                onCheckedChange={(value) =>
+                  setDraft((prev) => ({
+                    ...prev,
+                    bodyConversion: {
+                      ...defaultBodyConversion(),
+                      ...prev.bodyConversion,
+                      [key]: value,
+                    },
+                  }))
+                }
+              />
+            ))}
             <ToggleField
               title="启用 Kiro Payload 防护"
               description="按真实 Kiro JSON 字节数统计请求，并修复空 toolUses、孤立 tool_result 等 Kiro 容易拒绝的形态。"

@@ -14,7 +14,7 @@ use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::model::config::{
-    CacheBoundsPolicy, CachePointPolicy, CachePolicyConfig, CacheRoutePolicy,
+    BodyConversionConfig, CacheBoundsPolicy, CachePointPolicy, CachePolicyConfig, CacheRoutePolicy,
     CacheSimulationPolicy, CompatProfile, Config, ExternalPoolsConfig, ImageProcessingConfig,
     KiroRsToolCachePolicy, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
     PayloadShapingConfig, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
@@ -41,6 +41,7 @@ use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tokio::time::{Instant, interval, sleep_until};
 
+use super::body_capabilities::ParsedAnthropicBodyPlan;
 use super::body_processing;
 use super::converter::{
     ConversionError, ConverterOptions, ProxyWarnings, convert_request_with_resolved_model,
@@ -84,6 +85,8 @@ use crate::kiro::token_manager::LocalPoolRouteStateKind;
 
 #[path = "handlers/local_body_pipeline.rs"]
 mod local_body_pipeline;
+#[path = "handlers/parsed_body_pipeline.rs"]
+mod parsed_body_pipeline;
 #[path = "handlers/request_entry.rs"]
 mod request_entry;
 
@@ -200,6 +203,7 @@ struct RequestUsageContext {
     external_attempts: Vec<ExternalPoolAttempt>,
     started_at: Instant,
     first_token_latency_ms: Arc<AtomicU64>,
+    capacity_weight_units: Arc<AtomicU32>,
     latency: RequestLatencyTraceState,
 }
 
@@ -603,6 +607,7 @@ struct RequestRuntimeConfig {
     kiro_cache_point_record_plan: bool,
     kiro_upstream_stream_idle_timeout_secs: u64,
     image_processing: ImageProcessingConfig,
+    body_conversion: BodyConversionConfig,
     payload_shaping: PayloadShapingConfig,
     external_pools: ExternalPoolsConfig,
 }
@@ -639,6 +644,7 @@ impl RequestRuntimeConfig {
             kiro_cache_point_record_plan: state.kiro_cache_point_record_plan,
             kiro_upstream_stream_idle_timeout_secs: state.kiro_upstream_stream_idle_timeout_secs,
             image_processing: state.image_processing.normalized(),
+            body_conversion: state.body_conversion,
             payload_shaping: state.payload_shaping,
             external_pools: state.external_pools.clone(),
         }
@@ -695,6 +701,7 @@ impl RequestRuntimeConfig {
             kiro_cache_point_record_plan: config.kiro_cache_point_record_plan,
             kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
             image_processing: config.image_processing.normalized(),
+            body_conversion: config.body_conversion,
             payload_shaping: config.payload_shaping,
             external_pools: config.external_pools.clone(),
         }
@@ -1437,6 +1444,17 @@ fn local_pool_capacity_fail_fast_enabled(config: &ExternalPoolsConfig) -> bool {
     config.local_pool_preflight_enabled && config.fallback_on_local_capacity_exhausted
 }
 
+fn capacity_weight_units_for_local_request(provider: &KiroProvider, input_tokens: i32) -> u32 {
+    let config = provider.runtime_config();
+    if !config.weighted_capacity.enabled {
+        return 1;
+    }
+    config
+        .weighted_capacity
+        .units_for_tokens(input_tokens.max(0) as u32)
+        .clamp(1, 64)
+}
+
 fn local_pool_route_fallback_reason(
     kind: LocalPoolRouteStateKind,
     config: &ExternalPoolsConfig,
@@ -1603,6 +1621,11 @@ impl RequestUsageContext {
         self.latency.payload_guard_ms = Some(elapsed.as_millis().max(1) as u64);
     }
 
+    fn set_capacity_weight_units(&self, units: u32) {
+        self.capacity_weight_units
+            .store(units.clamp(1, 64), Ordering::Release);
+    }
+
     fn mark_upstream_header(&self) {
         let elapsed = self.elapsed_ms();
         let _ = self.latency.upstream_header_latency_ms.compare_exchange(
@@ -1755,7 +1778,10 @@ impl RequestUsageContext {
             }
             _ => None,
         };
+        let capacity_weight_units = self.capacity_weight_units.load(Ordering::Acquire);
         let trace = UsageLatencyTrace {
+            capacity_weight_units: (capacity_weight_units > 1).then_some(capacity_weight_units),
+            estimated_input_tokens: (capacity_weight_units > 1).then_some(self.input_tokens),
             payload_guard_ms: self.latency.payload_guard_ms,
             upstream_header_ms,
             first_upstream_chunk_ms,
@@ -3119,6 +3145,7 @@ fn prepare_usage_context(
         external_attempts: Vec::new(),
         started_at: Instant::now(),
         first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+        capacity_weight_units: Arc::new(AtomicU32::new(1)),
         latency: RequestLatencyTraceState::new(),
     }
 }
@@ -4090,24 +4117,19 @@ async fn post_messages_inner(
         headers.clone(),
         &payload,
     );
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
-    override_thinking_from_model_name(&mut payload);
-    apply_thinking_trigger_mode(&mut payload, &runtime_config);
-    log_thinking_request_trace(&endpoint, &payload, &runtime_config);
-
-    let caller_ua = headers
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok());
-    if let Err(message) = body_processing::prepare_multimodal_sources(
-        &state.file_store,
+    let parsed_body_plan =
+        ParsedAnthropicBodyPlan::shared_compatible(runtime_config.image_processing);
+    if let Err(response) = parsed_body_pipeline::prepare(
+        &state,
+        &headers,
+        &endpoint,
         &mut payload,
-        caller_ua,
-        runtime_config.image_processing,
+        &runtime_config,
+        parsed_body_plan,
     )
     .await
     {
-        tracing::warn!("多模态 source 处理失败: {}", message);
-        return envelope::error_response(StatusCode::BAD_REQUEST, "invalid_request_error", message);
+        return response;
     }
 
     if let Some(external) = external_fallback.as_mut() {
@@ -4208,6 +4230,9 @@ async fn post_messages_inner(
     if let Some(elapsed) = payload_guard_elapsed {
         usage_context.mark_payload_guard_latency(elapsed);
     }
+    let capacity_weight_units =
+        capacity_weight_units_for_local_request(provider.as_ref(), input_tokens);
+    usage_context.set_capacity_weight_units(capacity_weight_units);
 
     if payload.stream {
         // 流式响应
@@ -4233,6 +4258,7 @@ async fn post_messages_inner(
             cache_point_retry,
             external_fallback,
             runtime_config.kiro_upstream_stream_idle_timeout_secs,
+            capacity_weight_units,
         )
         .await
     } else {
@@ -4256,6 +4282,7 @@ async fn post_messages_inner(
             too_long_retry,
             cache_point_retry,
             external_fallback,
+            capacity_weight_units,
         )
         .await
     }
@@ -4266,16 +4293,25 @@ async fn call_api_stream_maybe_fail_fast(
     request_body: &str,
     request_id: Option<&str>,
     external_fallback: Option<&ExternalFallbackContext>,
+    capacity_weight_units: u32,
 ) -> anyhow::Result<crate::kiro::provider::KiroStreamResponse> {
     if let Some(external) = external_fallback {
         if external.should_fail_fast_local().await {
             return provider
-                .call_api_stream_with_request_id_fail_fast(request_body, request_id)
+                .call_api_stream_with_request_id_fail_fast_and_capacity_weight(
+                    request_body,
+                    request_id,
+                    capacity_weight_units,
+                )
                 .await;
         }
     }
     provider
-        .call_api_stream_with_request_id(request_body, request_id)
+        .call_api_stream_with_request_id_and_capacity_weight(
+            request_body,
+            request_id,
+            capacity_weight_units,
+        )
         .await
 }
 
@@ -4284,16 +4320,25 @@ async fn call_api_maybe_fail_fast(
     request_body: &str,
     request_id: Option<&str>,
     external_fallback: Option<&ExternalFallbackContext>,
+    capacity_weight_units: u32,
 ) -> anyhow::Result<crate::kiro::provider::KiroApiResponse> {
     if let Some(external) = external_fallback {
         if external.should_fail_fast_local().await {
             return provider
-                .call_api_with_context_with_request_id_fail_fast(request_body, request_id)
+                .call_api_with_context_with_request_id_fail_fast_and_capacity_weight(
+                    request_body,
+                    request_id,
+                    capacity_weight_units,
+                )
                 .await;
         }
     }
     provider
-        .call_api_with_context_with_request_id(request_body, request_id)
+        .call_api_with_context_with_request_id_and_capacity_weight(
+            request_body,
+            request_id,
+            capacity_weight_units,
+        )
         .await
 }
 
@@ -4393,12 +4438,14 @@ async fn call_stream_local_rescue_after_external_error(
     request_body: &str,
     request_id: &str,
     external: &ExternalFallbackContext,
+    capacity_weight_units: u32,
 ) -> anyhow::Result<crate::kiro::provider::KiroStreamResponse> {
     provider
-        .call_api_stream_with_request_id_max_wait(
+        .call_api_stream_with_request_id_max_wait_and_capacity_weight(
             request_body,
             Some(request_id),
             Duration::from_secs(external.config.external_pool_local_rescue_max_wait_secs),
+            capacity_weight_units,
         )
         .await
 }
@@ -4413,12 +4460,14 @@ async fn call_non_stream_local_rescue_after_external_error(
     request_body: &str,
     request_id: &str,
     external: &ExternalFallbackContext,
+    capacity_weight_units: u32,
 ) -> anyhow::Result<crate::kiro::provider::KiroApiResponse> {
     provider
-        .call_api_with_context_with_request_id_max_wait(
+        .call_api_with_context_with_request_id_max_wait_and_capacity_weight(
             request_body,
             Some(request_id),
             Duration::from_secs(external.config.external_pool_local_rescue_max_wait_secs),
+            capacity_weight_units,
         )
         .await
 }
@@ -4457,6 +4506,7 @@ async fn handle_stream_request(
     cache_point_retry: Option<CachePointRetryRequest>,
     external_fallback: Option<ExternalFallbackContext>,
     stream_idle_timeout_secs: u64,
+    capacity_weight_units: u32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let mut usage_context = usage_context;
@@ -4478,6 +4528,7 @@ async fn handle_stream_request(
         request_body,
         Some(&request_id),
         external_fallback.as_ref(),
+        capacity_weight_units,
     )
     .await
     {
@@ -4530,6 +4581,7 @@ async fn handle_stream_request(
                     &retry_body,
                     Some(&request_id),
                     external_fallback.as_ref(),
+                    capacity_weight_units,
                 )
                 .await
                 {
@@ -4621,6 +4673,7 @@ async fn handle_stream_request(
                     &retry_body,
                     Some(&request_id),
                     external_fallback.as_ref(),
+                    capacity_weight_units,
                 )
                 .await
                 {
@@ -4688,6 +4741,7 @@ async fn handle_stream_request(
                                                 &retry_body,
                                                 &request_id,
                                                 external,
+                                                capacity_weight_units,
                                             )
                                             .await
                                             {
@@ -4803,6 +4857,7 @@ async fn handle_stream_request(
                                         request_body,
                                         &request_id,
                                         external,
+                                        capacity_weight_units,
                                     )
                                     .await
                                     {
@@ -5463,6 +5518,7 @@ async fn handle_non_stream_request(
     too_long_retry: Option<PayloadTooLongRetryRequest>,
     cache_point_retry: Option<CachePointRetryRequest>,
     external_fallback: Option<ExternalFallbackContext>,
+    capacity_weight_units: u32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let mut usage_context = usage_context;
@@ -5484,6 +5540,7 @@ async fn handle_non_stream_request(
         request_body,
         Some(&request_id),
         external_fallback.as_ref(),
+        capacity_weight_units,
     )
     .await
     {
@@ -5536,6 +5593,7 @@ async fn handle_non_stream_request(
                     &retry_body,
                     Some(&request_id),
                     external_fallback.as_ref(),
+                    capacity_weight_units,
                 )
                 .await
                 {
@@ -5627,6 +5685,7 @@ async fn handle_non_stream_request(
                     &retry_body,
                     Some(&request_id),
                     external_fallback.as_ref(),
+                    capacity_weight_units,
                 )
                 .await
                 {
@@ -5694,6 +5753,7 @@ async fn handle_non_stream_request(
                                                 &retry_body,
                                                 &request_id,
                                                 external,
+                                                capacity_weight_units,
                                             )
                                             .await
                                             {
@@ -5809,6 +5869,7 @@ async fn handle_non_stream_request(
                                         request_body,
                                         &request_id,
                                         external,
+                                        capacity_weight_units,
                                     )
                                     .await
                                     {
@@ -6848,6 +6909,7 @@ mod tests {
             kiro_cache_point_record_plan: true,
             kiro_upstream_stream_idle_timeout_secs: 180,
             image_processing: ImageProcessingConfig::default(),
+            body_conversion: BodyConversionConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
             external_pools: ExternalPoolsConfig::default(),
         }
@@ -7513,6 +7575,7 @@ Return a fix plan."#
             external_attempts: Vec::new(),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            capacity_weight_units: Arc::new(AtomicU32::new(1)),
             latency: RequestLatencyTraceState::new(),
         };
         let usage = CacheUsage {
@@ -7617,6 +7680,7 @@ Return a fix plan."#
             external_attempts: Vec::new(),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            capacity_weight_units: Arc::new(AtomicU32::new(1)),
             latency: RequestLatencyTraceState::new(),
         };
         let raw_usage = CacheUsage {
@@ -7708,6 +7772,7 @@ Return a fix plan."#
             external_attempts: Vec::new(),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            capacity_weight_units: Arc::new(AtomicU32::new(1)),
             latency: RequestLatencyTraceState::new(),
         };
         let credential_usage =
@@ -7815,6 +7880,7 @@ Return a fix plan."#
             external_attempts: Vec::new(),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            capacity_weight_units: Arc::new(AtomicU32::new(1)),
             latency: RequestLatencyTraceState::new(),
         };
         let credential_usage =
@@ -7906,6 +7972,7 @@ Return a fix plan."#
             external_attempts: Vec::new(),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            capacity_weight_units: Arc::new(AtomicU32::new(1)),
             latency: RequestLatencyTraceState::new(),
         };
 
@@ -8026,6 +8093,7 @@ Return a fix plan."#
             external_attempts: Vec::new(),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            capacity_weight_units: Arc::new(AtomicU32::new(1)),
             latency: RequestLatencyTraceState::new(),
         };
 
@@ -8224,6 +8292,7 @@ Return a fix plan."#
             external_attempts: Vec::new(),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            capacity_weight_units: Arc::new(AtomicU32::new(1)),
             latency: RequestLatencyTraceState::new(),
         };
         let cc_context = RequestUsageContext {
@@ -8390,6 +8459,7 @@ Return a fix plan."#
             external_attempts: Vec::new(),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            capacity_weight_units: Arc::new(AtomicU32::new(1)),
             latency: RequestLatencyTraceState::new(),
         };
         let credential_usage =
@@ -8475,6 +8545,7 @@ Return a fix plan."#
             external_attempts: Vec::new(),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            capacity_weight_units: Arc::new(AtomicU32::new(1)),
             latency: RequestLatencyTraceState::new(),
         };
         usage_context
@@ -8808,6 +8879,7 @@ Return a fix plan."#
             external_attempts: Vec::new(),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            capacity_weight_units: Arc::new(AtomicU32::new(1)),
             latency: RequestLatencyTraceState::new(),
         }
         .attach_credential(Some(1), None, false, false, Vec::new());
@@ -8907,6 +8979,7 @@ Return a fix plan."#
             external_attempts: Vec::new(),
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
+            capacity_weight_units: Arc::new(AtomicU32::new(1)),
             latency: RequestLatencyTraceState::new(),
         }
         .attach_credential(Some(1), None, false, false, Vec::new());

@@ -3504,6 +3504,7 @@ impl AdminService {
             credential_in_flight_lease_max_secs: config.credential_in_flight_lease_max_secs,
             dispatch_global_max_concurrent_requests: config.dispatch_global_max_concurrent_requests,
             dispatch_max_queued_requests: config.dispatch_max_queued_requests,
+            weighted_capacity: config.weighted_capacity.normalized(),
             credential_warmup_requests: config.credential_warmup_requests,
             credential_warmup_selection_percent: config.credential_warmup_selection_percent,
             credential_warmup_max_selection_percent: config.credential_warmup_max_selection_percent,
@@ -3521,6 +3522,7 @@ impl AdminService {
             compression_enabled: config.compression.enabled,
             whitespace_compression: config.compression.whitespace_compression,
             image_processing: config.image_processing.normalized(),
+            body_conversion: config.body_conversion,
             payload_guard_enabled: config.payload_guard_enabled,
             payload_guard_mode: config.payload_guard_mode,
             payload_guard_max_bytes: config.payload_guard_max_bytes as u64,
@@ -3616,6 +3618,11 @@ impl AdminService {
         let dispatch_max_queued_requests = req
             .dispatch_max_queued_requests
             .unwrap_or(current_config.dispatch_max_queued_requests);
+        let weighted_capacity = req
+            .weighted_capacity
+            .clone()
+            .unwrap_or_else(|| current_config.weighted_capacity.clone())
+            .normalized();
         let warmup_selection_percent = req
             .credential_warmup_selection_percent
             .unwrap_or(current_config.credential_warmup_selection_percent);
@@ -3665,6 +3672,9 @@ impl AdminService {
             .image_processing
             .map(|config| config.normalized())
             .unwrap_or_else(|| current_config.image_processing.normalized());
+        let body_conversion = req
+            .body_conversion
+            .unwrap_or(current_config.body_conversion);
         let payload_guard_mode = req
             .payload_guard_mode
             .unwrap_or(current_config.payload_guard_mode);
@@ -3858,6 +3868,9 @@ impl AdminService {
                 "selectionFailureSampleLimit 不能大于 1000".to_string(),
             ));
         }
+        weighted_capacity
+            .validate()
+            .map_err(AdminServiceError::InvalidCredential)?;
         if warmup_selection_percent > 100 {
             return Err(AdminServiceError::InvalidCredential(
                 "credentialWarmupSelectionPercent 不能大于 100".to_string(),
@@ -4001,6 +4014,7 @@ impl AdminService {
                 config.dispatch_global_max_concurrent_requests =
                     dispatch_global_max_concurrent_requests;
                 config.dispatch_max_queued_requests = dispatch_max_queued_requests;
+                config.weighted_capacity = weighted_capacity;
                 config.credential_warmup_requests = req.credential_warmup_requests;
                 config.credential_warmup_selection_percent = warmup_selection_percent;
                 config.credential_warmup_max_selection_percent = warmup_max_selection_percent;
@@ -4017,6 +4031,7 @@ impl AdminService {
                 config.selection_failure_record_enabled = selection_failure_record_enabled;
                 config.compression = compression.clone();
                 config.image_processing = image_processing;
+                config.body_conversion = body_conversion;
                 config.payload_guard_enabled = payload_guard_enabled;
                 config.payload_guard_mode = payload_guard_mode;
                 config.payload_guard_max_bytes = payload_guard_max_bytes;

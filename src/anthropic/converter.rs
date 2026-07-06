@@ -2,976 +2,71 @@
 //!
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
-};
+use std::collections::HashMap;
 
+#[cfg(test)]
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::anthropic::model_capabilities::{ModelResolution, strip_model_1m_suffix};
+use crate::anthropic::body_capabilities::KiroConverterPlan;
+use crate::anthropic::model_capabilities::ModelResolution;
 use crate::anthropic::prompt_cache::canonicalize_cache_value;
+#[cfg(test)]
 use crate::kiro::model::requests::conversation::{
-    AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
-    HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
+    AssistantMessage, HistoryAssistantMessage, HistoryUserMessage, Message, UserMessage,
 };
-use crate::kiro::model::requests::kiro::{
-    AdditionalModelRequestFields, KiroOutputConfig, KiroReasoningConfig,
+use crate::kiro::model::requests::conversation::{
+    ConversationState, CurrentMessage, UserInputMessage, UserInputMessageContext,
 };
-use crate::kiro::model::requests::tool::{
-    InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
-};
+use crate::kiro::model::requests::kiro::AdditionalModelRequestFields;
+#[cfg(test)]
+use crate::kiro::model::requests::tool::ToolResult;
 use crate::model::config::{CompatProfile, PromptCacheSimulationMode};
 
-use super::types::{ContentBlock, MessagesRequest, normalize_thinking_effort};
+#[cfg(test)]
+use super::types::ContentBlock;
+use super::types::MessagesRequest;
+
+#[path = "converter/content.rs"]
+mod content;
+#[path = "converter/history.rs"]
+mod history;
+#[path = "converter/model.rs"]
+mod model;
+#[path = "converter/schema.rs"]
+mod schema;
+#[path = "converter/thinking.rs"]
+mod thinking;
+#[path = "converter/tool_pairing.rs"]
+mod tool_pairing;
+#[path = "converter/tools.rs"]
+mod tools;
+
+use content::process_message_content;
+#[cfg(test)]
+use content::sanitize_tool_use_id;
+pub(crate) use content::{infer_document_media_type_from_url, infer_image_format_from_url};
+use history::build_history;
+#[cfg(test)]
+use history::{convert_assistant_message, merge_assistant_messages};
+use model::build_additional_model_request_fields;
+pub use model::{get_context_window_size, map_model};
+#[cfg(test)]
+use schema::normalize_json_schema;
+#[cfg(test)]
+use tool_pairing::kiro_tool_result_to_text;
+use tool_pairing::{
+    append_orphan_tool_result_texts, remove_orphaned_tool_uses, validate_tool_pairing,
+};
+#[cfg(test)]
+use tools::{
+    SYSTEM_CHUNKED_POLICY, TOOL_HASH_MARKER, TOOL_NAME_MAX_LEN, map_tool_name, shorten_tool_name,
+};
+use tools::{collect_history_tool_names, convert_tools, create_placeholder_tool};
 
 const TOOL_RESULTS_PROVIDED_PLACEHOLDER: &str = "Tool results provided.";
 const EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER: &str = "Tool result content was empty.";
-
-/// 规范化 JSON Schema，修复 MCP/OpenAPI/Zod 工具定义中常见的兼容性问题。
-///
-/// 上游按 draft 2020-12 校验工具 `input_schema`，但 Claude Code / MCP 工具定义
-/// 经常混入旧 draft、OpenAPI 或简写结构。这里保守清洗成 Kiro/Anthropic 更容易
-/// 接受的 JSON Schema 子集，避免单个脏工具 schema 导致整次请求被 400 拒绝。
-fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
-    let serde_json::Value::Object(mut obj) = schema else {
-        return empty_object_schema();
-    };
-
-    normalize_schema_object(&mut obj, true);
-    flatten_root_schema_combinators(&mut obj);
-    obj.insert(
-        "type".to_string(),
-        serde_json::Value::String("object".to_string()),
-    );
-    if !matches!(obj.get("properties"), Some(serde_json::Value::Object(_))) {
-        obj.insert(
-            "properties".to_string(),
-            serde_json::Value::Object(serde_json::Map::new()),
-        );
-    }
-    serde_json::Value::Object(obj)
-}
-
-fn flatten_root_schema_combinators(obj: &mut serde_json::Map<String, serde_json::Value>) {
-    flatten_root_schema_combinator(obj, "allOf", RequiredMergeMode::Union);
-    flatten_root_schema_combinator(obj, "oneOf", RequiredMergeMode::Intersection);
-    flatten_root_schema_combinator(obj, "anyOf", RequiredMergeMode::Intersection);
-}
-
-#[derive(Clone, Copy)]
-enum RequiredMergeMode {
-    Union,
-    Intersection,
-}
-
-fn flatten_root_schema_combinator(
-    obj: &mut serde_json::Map<String, serde_json::Value>,
-    key: &str,
-    required_mode: RequiredMergeMode,
-) {
-    let Some(serde_json::Value::Array(items)) = obj.remove(key) else {
-        return;
-    };
-
-    let mut required_sets = Vec::new();
-    for item in items {
-        let serde_json::Value::Object(item) = item else {
-            continue;
-        };
-        merge_root_variant_properties(obj, &item);
-        let required = schema_required_set(&item);
-        if !required.is_empty() {
-            required_sets.push(required);
-        }
-    }
-
-    merge_root_variant_required(obj, required_sets, required_mode);
-}
-
-fn merge_root_variant_properties(
-    root: &mut serde_json::Map<String, serde_json::Value>,
-    variant: &serde_json::Map<String, serde_json::Value>,
-) {
-    let Some(serde_json::Value::Object(variant_props)) = variant.get("properties") else {
-        return;
-    };
-
-    let root_props = root
-        .entry("properties".to_string())
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    if !root_props.is_object() {
-        *root_props = serde_json::Value::Object(serde_json::Map::new());
-    }
-    let root_props = root_props
-        .as_object_mut()
-        .expect("root properties should be an object after normalization");
-
-    for (name, schema) in variant_props {
-        root_props
-            .entry(name.clone())
-            .or_insert_with(|| schema.clone());
-    }
-}
-
-fn schema_required_set(
-    schema: &serde_json::Map<String, serde_json::Value>,
-) -> std::collections::BTreeSet<String> {
-    schema
-        .get("required")
-        .and_then(|value| value.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn merge_root_variant_required(
-    root: &mut serde_json::Map<String, serde_json::Value>,
-    required_sets: Vec<std::collections::BTreeSet<String>>,
-    mode: RequiredMergeMode,
-) {
-    if required_sets.is_empty() {
-        return;
-    }
-
-    let mut merged = schema_required_set(root);
-    let variant_required = match mode {
-        RequiredMergeMode::Union => required_sets
-            .into_iter()
-            .flatten()
-            .collect::<std::collections::BTreeSet<_>>(),
-        RequiredMergeMode::Intersection => {
-            let mut iter = required_sets.into_iter();
-            let Some(first) = iter.next() else {
-                return;
-            };
-            iter.fold(first, |acc, required| {
-                acc.intersection(&required).cloned().collect()
-            })
-        }
-    };
-    merged.extend(variant_required);
-
-    if merged.is_empty() {
-        root.remove("required");
-    } else {
-        root.insert(
-            "required".to_string(),
-            serde_json::Value::Array(
-                merged
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect::<Vec<_>>(),
-            ),
-        );
-    }
-}
-
-fn normalize_schema_object(obj: &mut serde_json::Map<String, serde_json::Value>, is_root: bool) {
-    obj.remove("$schema");
-    obj.remove("additionalProperties");
-    obj.remove("additionalItems");
-    obj.remove("unevaluatedProperties");
-    obj.remove("unevaluatedItems");
-    obj.remove("$vocabulary");
-    obj.remove("discriminator");
-    obj.remove("xml");
-    obj.remove("externalDocs");
-    remove_openapi_extensions(obj);
-
-    if let Some(example) = obj.remove("example") {
-        obj.entry("examples".to_string())
-            .or_insert_with(|| serde_json::Value::Array(vec![example]));
-    }
-
-    if obj
-        .get("$id")
-        .is_some_and(|value| value.as_str().is_some_and(|text| text.trim().is_empty()))
-    {
-        obj.remove("$id");
-    }
-    if obj
-        .get("$anchor")
-        .is_some_and(|value| value.as_str().is_some_and(|text| text.trim().is_empty()))
-    {
-        obj.remove("$anchor");
-    }
-
-    if let Some(definitions) = obj.remove("definitions") {
-        obj.entry("$defs".to_string()).or_insert(definitions);
-    }
-
-    if let Some(dependencies) = obj.remove("dependencies") {
-        convert_legacy_dependencies(obj, dependencies);
-    }
-
-    if let Some(reference) = obj.remove("$ref") {
-        if let serde_json::Value::String(mut value) = reference {
-            if let Some(rest) = value.strip_prefix("#/definitions/") {
-                value = format!("#/$defs/{}", rest);
-            }
-            obj.insert("$ref".to_string(), serde_json::Value::String(value));
-        }
-    }
-
-    let nullable = matches!(obj.remove("nullable"), Some(serde_json::Value::Bool(true)));
-
-    normalize_properties(obj, is_root);
-    normalize_schema_map_keyword(obj, "patternProperties");
-    normalize_schema_map_keyword(obj, "$defs");
-    normalize_schema_map_keyword(obj, "dependentSchemas");
-    normalize_required(obj);
-    normalize_type_keyword(obj, is_root, nullable);
-    normalize_items_keywords(obj);
-
-    for key in [
-        "contains",
-        "propertyNames",
-        "contentSchema",
-        "not",
-        "if",
-        "then",
-        "else",
-    ] {
-        normalize_schema_keyword(obj, key);
-    }
-
-    for key in ["oneOf", "anyOf", "allOf"] {
-        normalize_schema_array_keyword(obj, key);
-    }
-
-    normalize_dependent_required(obj);
-    normalize_enum_keyword(obj);
-    normalize_annotation_keywords(obj);
-    normalize_validation_keywords(obj);
-    normalize_string_keywords(
-        obj,
-        &[
-            "$id",
-            "$anchor",
-            "$dynamicRef",
-            "$dynamicAnchor",
-            "format",
-            "pattern",
-            "contentEncoding",
-            "contentMediaType",
-        ],
-    );
-    normalize_bool_keywords(obj, &["deprecated", "readOnly", "writeOnly", "uniqueItems"]);
-    normalize_non_negative_integer_keywords(
-        obj,
-        &[
-            "minLength",
-            "maxLength",
-            "minItems",
-            "maxItems",
-            "minContains",
-            "maxContains",
-            "minProperties",
-            "maxProperties",
-        ],
-    );
-    normalize_number_keywords(
-        obj,
-        &["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"],
-    );
-
-    if let Some(value) = obj.get("multipleOf") {
-        if !value.as_f64().is_some_and(|number| number > 0.0) {
-            obj.remove("multipleOf");
-        }
-    }
-
-    if obj
-        .get("format")
-        .is_some_and(|value| value.as_str().is_some_and(|text| text.trim().is_empty()))
-    {
-        obj.remove("format");
-    }
-    if obj
-        .get("pattern")
-        .is_some_and(|value| value.as_str().is_some_and(|text| text.trim().is_empty()))
-    {
-        obj.remove("pattern");
-    }
-}
-
-fn empty_object_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {}
-    })
-}
-
-fn remove_openapi_extensions(obj: &mut serde_json::Map<String, serde_json::Value>) {
-    obj.retain(|key, _| !key.starts_with("x-"));
-}
-
-fn normalize_properties(obj: &mut serde_json::Map<String, serde_json::Value>, is_root: bool) {
-    match obj.get_mut("properties") {
-        Some(serde_json::Value::Object(properties)) => {
-            for value in properties.values_mut() {
-                *value = normalize_schema_value(std::mem::take(value));
-            }
-        }
-        Some(_) if is_root => {
-            obj.insert(
-                "properties".to_string(),
-                serde_json::Value::Object(serde_json::Map::new()),
-            );
-        }
-        Some(_) => {
-            obj.remove("properties");
-        }
-        None if is_root => {
-            obj.insert(
-                "properties".to_string(),
-                serde_json::Value::Object(serde_json::Map::new()),
-            );
-        }
-        None => {}
-    }
-}
-
-fn normalize_schema_value(value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(mut obj) => {
-            normalize_schema_object(&mut obj, false);
-            serde_json::Value::Object(obj)
-        }
-        serde_json::Value::Bool(value) => serde_json::Value::Bool(value),
-        serde_json::Value::String(value) => normalize_type_name(&value)
-            .map(|schema_type| serde_json::json!({ "type": schema_type }))
-            .unwrap_or_else(|| serde_json::json!({})),
-        _ => serde_json::json!({}),
-    }
-}
-
-fn normalize_schema_map_keyword(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str) {
-    match obj.remove(key) {
-        Some(serde_json::Value::Object(mut map)) => {
-            for value in map.values_mut() {
-                *value = normalize_schema_value(std::mem::take(value));
-            }
-            if !map.is_empty() {
-                obj.insert(key.to_string(), serde_json::Value::Object(map));
-            }
-        }
-        Some(_) | None => {}
-    }
-}
-
-fn normalize_required(obj: &mut serde_json::Map<String, serde_json::Value>) {
-    let Some(value) = obj.remove("required") else {
-        return;
-    };
-    let serde_json::Value::Array(items) = value else {
-        return;
-    };
-
-    let Some(properties) = obj.get("properties").and_then(|value| value.as_object()) else {
-        return;
-    };
-
-    let mut required = Vec::new();
-    for item in items {
-        let Some(name) = item.as_str() else {
-            continue;
-        };
-        if properties.contains_key(name) {
-            let value = serde_json::Value::String(name.to_string());
-            if !required.contains(&value) {
-                required.push(value);
-            }
-        }
-    }
-
-    if !required.is_empty() {
-        obj.insert("required".to_string(), serde_json::Value::Array(required));
-    }
-}
-
-fn normalize_type_keyword(
-    obj: &mut serde_json::Map<String, serde_json::Value>,
-    is_root: bool,
-    nullable: bool,
-) {
-    let raw_type = obj.remove("type");
-    let mut types = Vec::<String>::new();
-
-    if is_root {
-        types.push("object".to_string());
-    } else {
-        collect_schema_types(raw_type, &mut types);
-        if types.is_empty() {
-            if obj.contains_key("properties") || obj.contains_key("patternProperties") {
-                types.push("object".to_string());
-            } else if obj.contains_key("items")
-                || obj.contains_key("prefixItems")
-                || obj.contains_key("contains")
-            {
-                types.push("array".to_string());
-            }
-        }
-        if nullable && !types.is_empty() && !types.iter().any(|value| value == "null") {
-            types.push("null".to_string());
-        }
-    }
-
-    match types.len() {
-        0 => {}
-        1 => {
-            obj.insert(
-                "type".to_string(),
-                serde_json::Value::String(types.remove(0)),
-            );
-        }
-        _ => {
-            obj.insert(
-                "type".to_string(),
-                serde_json::Value::Array(
-                    types
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect::<Vec<_>>(),
-                ),
-            );
-        }
-    }
-}
-
-fn collect_schema_types(value: Option<serde_json::Value>, types: &mut Vec<String>) {
-    match value {
-        Some(serde_json::Value::String(value)) => push_schema_type(types, &value),
-        Some(serde_json::Value::Array(items)) => {
-            for item in items {
-                if let serde_json::Value::String(value) = item {
-                    push_schema_type(types, &value);
-                }
-            }
-        }
-        Some(_) | None => {}
-    }
-}
-
-fn push_schema_type(types: &mut Vec<String>, value: &str) {
-    if let Some(schema_type) = normalize_type_name(value) {
-        if !types.iter().any(|item| item == schema_type) {
-            types.push(schema_type.to_string());
-        }
-    }
-}
-
-fn normalize_type_name(value: &str) -> Option<&'static str> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "null" | "nil" | "none" => Some("null"),
-        "boolean" | "bool" => Some("boolean"),
-        "object" | "dict" | "map" | "record" => Some("object"),
-        "array" | "list" => Some("array"),
-        "number" | "float" | "double" => Some("number"),
-        "string" | "str" => Some("string"),
-        "integer" | "int" => Some("integer"),
-        _ => None,
-    }
-}
-
-fn normalize_items_keywords(obj: &mut serde_json::Map<String, serde_json::Value>) {
-    if let Some(items) = obj.remove("items") {
-        match items {
-            serde_json::Value::Array(items) => {
-                if !obj.contains_key("prefixItems") {
-                    let prefix_items = items
-                        .into_iter()
-                        .filter(|item| is_schema_like(item))
-                        .map(normalize_schema_value)
-                        .collect::<Vec<_>>();
-                    if !prefix_items.is_empty() {
-                        obj.insert(
-                            "prefixItems".to_string(),
-                            serde_json::Value::Array(prefix_items),
-                        );
-                    }
-                }
-            }
-            value if is_schema_like(&value) => {
-                obj.insert("items".to_string(), normalize_schema_value(value));
-            }
-            _ => {}
-        }
-    }
-
-    match obj.remove("prefixItems") {
-        Some(serde_json::Value::Array(items)) => {
-            let prefix_items = items
-                .into_iter()
-                .filter(|item| is_schema_like(item))
-                .map(normalize_schema_value)
-                .collect::<Vec<_>>();
-            if !prefix_items.is_empty() {
-                obj.insert(
-                    "prefixItems".to_string(),
-                    serde_json::Value::Array(prefix_items),
-                );
-            }
-        }
-        Some(_) | None => {}
-    }
-}
-
-fn normalize_schema_keyword(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str) {
-    match obj.remove(key) {
-        Some(value) if is_schema_like(&value) => {
-            obj.insert(key.to_string(), normalize_schema_value(value));
-        }
-        Some(_) | None => {}
-    }
-}
-
-fn normalize_schema_array_keyword(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str) {
-    match obj.remove(key) {
-        Some(serde_json::Value::Array(items)) => {
-            let items = items
-                .into_iter()
-                .filter(|item| is_schema_like(item))
-                .map(normalize_schema_value)
-                .collect::<Vec<_>>();
-            if !items.is_empty() {
-                obj.insert(key.to_string(), serde_json::Value::Array(items));
-            }
-        }
-        Some(value) if is_schema_like(&value) => {
-            obj.insert(
-                key.to_string(),
-                serde_json::Value::Array(vec![normalize_schema_value(value)]),
-            );
-        }
-        Some(_) | None => {}
-    }
-}
-
-fn is_schema_like(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Object(_) | serde_json::Value::Bool(_) => true,
-        serde_json::Value::String(value) => normalize_type_name(value).is_some(),
-        _ => false,
-    }
-}
-
-fn normalize_dependent_required(obj: &mut serde_json::Map<String, serde_json::Value>) {
-    let Some(value) = obj.remove("dependentRequired") else {
-        return;
-    };
-    let serde_json::Value::Object(map) = value else {
-        return;
-    };
-
-    let mut normalized = serde_json::Map::new();
-    for (key, value) in map {
-        let serde_json::Value::Array(items) = value else {
-            continue;
-        };
-        let mut required = Vec::new();
-        for item in items {
-            let Some(name) = item.as_str() else {
-                continue;
-            };
-            let value = serde_json::Value::String(name.to_string());
-            if !required.contains(&value) {
-                required.push(value);
-            }
-        }
-        if !required.is_empty() {
-            normalized.insert(key, serde_json::Value::Array(required));
-        }
-    }
-
-    if !normalized.is_empty() {
-        obj.insert(
-            "dependentRequired".to_string(),
-            serde_json::Value::Object(normalized),
-        );
-    }
-}
-
-fn convert_legacy_dependencies(
-    obj: &mut serde_json::Map<String, serde_json::Value>,
-    dependencies: serde_json::Value,
-) {
-    let serde_json::Value::Object(dependencies) = dependencies else {
-        return;
-    };
-
-    let mut dependent_required = obj
-        .remove("dependentRequired")
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
-    let mut dependent_schemas = obj
-        .remove("dependentSchemas")
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
-
-    for (key, value) in dependencies {
-        match value {
-            serde_json::Value::Array(_) => {
-                dependent_required.insert(key, value);
-            }
-            value if is_schema_like(&value) => {
-                dependent_schemas.insert(key, value);
-            }
-            _ => {}
-        }
-    }
-
-    if !dependent_required.is_empty() {
-        obj.insert(
-            "dependentRequired".to_string(),
-            serde_json::Value::Object(dependent_required),
-        );
-    }
-    if !dependent_schemas.is_empty() {
-        obj.insert(
-            "dependentSchemas".to_string(),
-            serde_json::Value::Object(dependent_schemas),
-        );
-    }
-}
-
-fn normalize_enum_keyword(obj: &mut serde_json::Map<String, serde_json::Value>) {
-    let Some(value) = obj.remove("enum") else {
-        return;
-    };
-
-    let items = match value {
-        serde_json::Value::Array(items) => items,
-        value => vec![value],
-    };
-    let mut normalized = Vec::new();
-    for item in items {
-        if !normalized.contains(&item) {
-            normalized.push(item);
-        }
-    }
-    if !normalized.is_empty() {
-        obj.insert("enum".to_string(), serde_json::Value::Array(normalized));
-    }
-}
-
-fn normalize_annotation_keywords(obj: &mut serde_json::Map<String, serde_json::Value>) {
-    normalize_string_keywords(obj, &["title", "description", "$comment"]);
-
-    match obj.remove("examples") {
-        Some(serde_json::Value::Array(items)) => {
-            obj.insert("examples".to_string(), serde_json::Value::Array(items));
-        }
-        Some(value) => {
-            obj.insert(
-                "examples".to_string(),
-                serde_json::Value::Array(vec![value]),
-            );
-        }
-        None => {}
-    }
-}
-
-fn normalize_validation_keywords(obj: &mut serde_json::Map<String, serde_json::Value>) {
-    for key in [
-        "minLength",
-        "maxLength",
-        "minItems",
-        "maxItems",
-        "minContains",
-        "maxContains",
-        "minProperties",
-        "maxProperties",
-    ] {
-        if obj.get(key).is_some_and(|value| value.as_u64().is_none()) {
-            obj.remove(key);
-        }
-    }
-
-    for key in ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"] {
-        if obj.get(key).is_some_and(|value| !value.is_number()) {
-            obj.remove(key);
-        }
-    }
-}
-
-fn normalize_string_keywords(obj: &mut serde_json::Map<String, serde_json::Value>, keys: &[&str]) {
-    for key in keys {
-        if obj
-            .get(*key)
-            .is_some_and(|value| !matches!(value, serde_json::Value::String(_)))
-        {
-            obj.remove(*key);
-        }
-    }
-}
-
-fn normalize_bool_keywords(obj: &mut serde_json::Map<String, serde_json::Value>, keys: &[&str]) {
-    for key in keys {
-        if obj
-            .get(*key)
-            .is_some_and(|value| !matches!(value, serde_json::Value::Bool(_)))
-        {
-            obj.remove(*key);
-        }
-    }
-}
-
-fn normalize_non_negative_integer_keywords(
-    obj: &mut serde_json::Map<String, serde_json::Value>,
-    keys: &[&str],
-) {
-    for key in keys {
-        if obj.get(*key).is_some_and(|value| value.as_u64().is_none()) {
-            obj.remove(*key);
-        }
-    }
-}
-
-fn normalize_number_keywords(obj: &mut serde_json::Map<String, serde_json::Value>, keys: &[&str]) {
-    for key in keys {
-        if obj.get(*key).is_some_and(|value| !value.is_number()) {
-            obj.remove(*key);
-        }
-    }
-}
-
-/// 追加到 Write 工具 description 末尾的内容
-const WRITE_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the content to write exceeds 150 lines, you MUST only write the first 50 lines using this tool, then use `Edit` tool to append the remaining content in chunks of no more than 50 lines each. If needed, leave a unique placeholder to help append content. Do NOT attempt to write all content at once.";
-
-/// 追加到 Edit 工具 description 末尾的内容
-const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` content exceeds 50 lines, you MUST split it into multiple Edit calls, each replacing no more than 50 lines at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder.";
-
-/// 追加到系统提示词的分块写入策略
-const SYSTEM_CHUNKED_POLICY: &str = "\
-When the Write or Edit tool has content size limits, always comply silently. \
-Never suggest bypassing these limits via alternative tools. \
-Never ask the user whether to switch approaches. \
-Complete all chunked operations without commentary.";
-
-/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
-/// 严格对照版本号
-pub fn map_model(model: &str) -> Option<String> {
-    let model_lower = model.to_lowercase();
-    let model_base = model_lower.strip_suffix("[1m]").unwrap_or(&model_lower);
-    let model_base = model_base.strip_suffix("-thinking").unwrap_or(model_base);
-
-    if matches!(model_base, "opus" | "opusplan" | "best" | "default") {
-        Some("claude-opus-4.7".to_string())
-    } else if model_base == "sonnet" {
-        Some("claude-sonnet-4.6".to_string())
-    } else if model_base == "haiku" {
-        Some("claude-haiku-4.5".to_string())
-    } else if is_native_claude_family_model(model_base, "sonnet") {
-        if model_base.contains("4-6") || model_base.contains("4.6") {
-            Some("claude-sonnet-4.6".to_string())
-        } else if model_base.contains("4-5") || model_base.contains("4.5") {
-            Some("claude-sonnet-4.5".to_string())
-        } else {
-            Some(model_base.to_string())
-        }
-    } else if model_base.contains("sonnet") {
-        if model_base.contains("4-6") || model_base.contains("4.6") {
-            Some("claude-sonnet-4.6".to_string())
-        } else if model_base.contains("4-5") || model_base.contains("4.5") {
-            Some("claude-sonnet-4.5".to_string())
-        } else if model_base.contains("4")
-            || model_base.contains("3-5")
-            || model_base.contains("3.5")
-        {
-            Some("claude-sonnet-4.5".to_string())
-        } else {
-            None
-        }
-    } else if is_native_claude_family_model(model_base, "opus") {
-        if model_base.contains("4-5") || model_base.contains("4.5") {
-            Some("claude-opus-4.5".to_string())
-        } else if model_base.contains("4-6") || model_base.contains("4.6") {
-            Some("claude-opus-4.6".to_string())
-        } else if model_base.contains("4-7") || model_base.contains("4.7") {
-            Some("claude-opus-4.7".to_string())
-        } else {
-            Some(model_base.to_string())
-        }
-    } else if model_base.contains("opus") {
-        if model_base.contains("4-5") || model_base.contains("4.5") {
-            Some("claude-opus-4.5".to_string())
-        } else if model_base.contains("4-6") || model_base.contains("4.6") {
-            Some("claude-opus-4.6".to_string())
-        } else if model_base.contains("4-7") || model_base.contains("4.7") {
-            Some("claude-opus-4.7".to_string())
-        } else if model_base.contains("4") {
-            Some("claude-opus-4.7".to_string())
-        } else {
-            None
-        }
-    } else if is_native_claude_family_model(model_base, "haiku") {
-        if model_base.contains("4-5") || model_base.contains("4.5") {
-            Some("claude-haiku-4.5".to_string())
-        } else {
-            Some(model_base.to_string())
-        }
-    } else if model_base.contains("haiku") {
-        Some("claude-haiku-4.5".to_string())
-    } else {
-        None
-    }
-}
-
-fn is_native_claude_family_model(model: &str, family: &str) -> bool {
-    model
-        .strip_prefix("claude-")
-        .and_then(|rest| rest.strip_prefix(family))
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', '.']))
-}
-
-/// 根据模型名称返回对应的上下文窗口大小
-///
-/// 这是仅在 Kiro `ListAvailableModels` 能力目录缺失时使用的保守兜底。
-/// 真实请求应优先使用上游目录中的 `maxInputTokens`；同名/同族模型在不同
-/// 账号池中可能是 200K 或 1M，不能仅凭普通别名把 free Sonnet 误抬成 1M。
-pub fn get_context_window_size(model: &str) -> i32 {
-    let model_lower = model.to_lowercase();
-    let explicit_one_m = model_lower.ends_with("[1m]");
-    let base = strip_model_1m_suffix(&model_lower);
-
-    if base == "auto" {
-        return 1_000_000;
-    }
-
-    if explicit_one_m
-        || base == "claude-opus-4.8"
-        || base == "claude-opus-4.8-thinking"
-        || base == "claude-opus-4.7"
-        || base == "claude-opus-4.7-thinking"
-        || base == "claude-opus-4.6"
-        || base == "claude-opus-4.6-thinking"
-        || base == "claude-sonnet-4.6"
-        || base == "claude-sonnet-4.6-thinking"
-    {
-        return 1_000_000;
-    }
-
-    200_000
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NativeReasoningSchemaPath {
-    OutputConfig,
-    #[allow(dead_code)]
-    Reasoning,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct NativeReasoningSchema {
-    path: NativeReasoningSchemaPath,
-    efforts: &'static [&'static str],
-}
-
-const EFFORTS_WITH_XHIGH: &[&str] = &["low", "medium", "high", "xhigh", "max"];
-const EFFORTS_WITHOUT_XHIGH: &[&str] = &["low", "medium", "high", "max"];
-
-fn native_reasoning_schema(model_id: &str) -> Option<NativeReasoningSchema> {
-    match model_id {
-        "claude-opus-4.8" | "claude-opus-4-8" | "claude-opus-4.7" | "claude-opus-4-7" => {
-            Some(NativeReasoningSchema {
-                path: NativeReasoningSchemaPath::OutputConfig,
-                efforts: EFFORTS_WITH_XHIGH,
-            })
-        }
-        "claude-opus-4.6" | "claude-opus-4-6" | "claude-sonnet-4.6" | "claude-sonnet-4-6" => {
-            Some(NativeReasoningSchema {
-                path: NativeReasoningSchemaPath::OutputConfig,
-                efforts: EFFORTS_WITHOUT_XHIGH,
-            })
-        }
-        _ => None,
-    }
-}
-
-fn requested_native_reasoning(req: &MessagesRequest) -> bool {
-    req.thinking.as_ref().is_some_and(|t| t.is_enabled())
-        || req
-            .output_config
-            .as_ref()
-            .is_some_and(|oc| !oc.effort.trim().is_empty())
-}
-
-fn effort_from_budget_tokens(tokens: i32) -> &'static str {
-    match tokens {
-        i32::MIN..=4_000 => "low",
-        4_001..=16_000 => "medium",
-        16_001..=64_000 => "high",
-        _ => "xhigh",
-    }
-}
-
-fn select_native_reasoning_effort(req: &MessagesRequest, schema: NativeReasoningSchema) -> String {
-    let requested = req
-        .output_config
-        .as_ref()
-        .map(|oc| normalize_thinking_effort(&oc.effort))
-        .or_else(|| {
-            req.thinking.as_ref().map(|t| {
-                if t.thinking_type == "enabled" {
-                    effort_from_budget_tokens(t.budget_tokens)
-                } else {
-                    normalize_thinking_effort("")
-                }
-            })
-        })
-        .unwrap_or_else(|| normalize_thinking_effort(""));
-
-    if schema.efforts.contains(&requested) {
-        requested.to_string()
-    } else {
-        schema.efforts.last().copied().unwrap_or("high").to_string()
-    }
-}
-
-fn build_additional_model_request_fields(
-    req: &MessagesRequest,
-    model_id: &str,
-) -> Option<AdditionalModelRequestFields> {
-    if req
-        .thinking
-        .as_ref()
-        .is_some_and(|t| t.thinking_type == "disabled")
-    {
-        return None;
-    }
-
-    let schema = native_reasoning_schema(model_id)?;
-    if !requested_native_reasoning(req) {
-        return None;
-    }
-
-    let effort = select_native_reasoning_effort(req, schema);
-    Some(match schema.path {
-        NativeReasoningSchemaPath::OutputConfig => AdditionalModelRequestFields {
-            thinking: None,
-            output_config: Some(KiroOutputConfig { effort }),
-            reasoning: None,
-        },
-        NativeReasoningSchemaPath::Reasoning => AdditionalModelRequestFields {
-            thinking: None,
-            output_config: None,
-            reasoning: Some(KiroReasoningConfig { effort }),
-        },
-    })
-}
-
-fn uses_native_reasoning_fields(req: &MessagesRequest, model_id: &str) -> bool {
-    build_additional_model_request_fields(req, model_id).is_some()
-}
 
 /// 转换结果
 #[derive(Debug)]
@@ -998,6 +93,7 @@ pub struct ConversionResult {
 #[derive(Debug, Clone, Copy)]
 pub struct ConverterOptions {
     pub compat_profile: CompatProfile,
+    pub conversion: KiroConverterPlan,
     pub prompt_cache_simulation_mode: PromptCacheSimulationMode,
     pub kiro_cache_point_enabled: bool,
     pub kiro_cache_point_tools_only: bool,
@@ -1009,6 +105,7 @@ impl Default for ConverterOptions {
     fn default() -> Self {
         Self {
             compat_profile: CompatProfile::ClaudeCode,
+            conversion: KiroConverterPlan::default(),
             prompt_cache_simulation_mode: PromptCacheSimulationMode::HighCache,
             kiro_cache_point_enabled: false,
             kiro_cache_point_tools_only: true,
@@ -1024,15 +121,16 @@ impl ConverterOptions {
     }
 
     fn inject_chunked_policy(self) -> bool {
-        !self.is_strict()
+        !self.is_strict() && self.conversion.chunked_tool_policy.is_enabled()
     }
 
     fn inject_thinking_prefix(self) -> bool {
-        self.force_visible_thinking || !self.is_strict()
+        self.conversion.thinking_prompt_controls.is_enabled()
+            && (self.force_visible_thinking || !self.is_strict())
     }
 
     fn inject_tool_choice_prefix(self) -> bool {
-        !self.is_strict()
+        !self.is_strict() && self.conversion.tool_choice_steering.is_enabled()
     }
 }
 
@@ -1055,15 +153,6 @@ pub struct ProxyWarnings {
     pub tool_result_content_placeholders: u32,
     /// user 消息没有文本也没有 tool_result 时补了 Continue 占位
     pub empty_content_placeholders: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ToolChoiceDirective {
-    Auto,
-    Any,
-    None,
-    Tool(String),
-    Unknown,
 }
 
 impl ProxyWarnings {
@@ -1224,42 +313,6 @@ fn is_valid_uuid(s: &str) -> bool {
     s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
 }
 
-/// 收集历史消息中使用的所有工具名称
-fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
-    let mut tool_names = Vec::new();
-    let mut seen_lower = std::collections::HashSet::new();
-
-    for msg in history {
-        if let Message::Assistant(assistant_msg) = msg {
-            if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
-                for tool_use in tool_uses {
-                    if seen_lower.insert(tool_use.name.to_ascii_lowercase()) {
-                        tool_names.push(tool_use.name.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    tool_names
-}
-
-/// 为历史中使用但不在 tools 列表中的工具创建占位符定义
-/// Kiro API 要求：历史消息中引用的工具必须在 currentMessage.tools 中有定义
-fn create_placeholder_tool(name: &str) -> Tool {
-    Tool {
-        tool_specification: ToolSpecification {
-            name: name.to_string(),
-            description: "Tool used in conversation history".to_string(),
-            input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!({
-                "$schema": "http://json-schema.org/draft-07/schema#",
-                "type": "object",
-                "properties": {}
-            }))),
-        },
-    }
-}
-
 /// 将 Anthropic 请求转换为 Kiro 请求
 #[allow(dead_code)]
 pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
@@ -1348,8 +401,17 @@ fn convert_request_with_model_id(
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
     // 同时返回孤立的 tool_use_id 集合，用于后续清理
+    let repair_tool_pairing = options.conversion.tool_pairing_repair.is_enabled();
     let (validated_tool_results, orphaned_tool_use_ids, orphan_tool_result_texts) =
-        validate_tool_pairing(&history, &tool_results, &mut warnings);
+        if repair_tool_pairing || options.is_strict() {
+            validate_tool_pairing(&history, &tool_results, &mut warnings)
+        } else {
+            (
+                tool_results.clone(),
+                std::collections::HashSet::new(),
+                Vec::new(),
+            )
+        };
 
     if options.is_strict()
         && (warnings.orphan_tool_results > 0
@@ -1363,7 +425,7 @@ fn convert_request_with_model_id(
     }
 
     // 9. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
-    if !options.is_strict() {
+    if !options.is_strict() && repair_tool_pairing {
         remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
     }
 
@@ -1376,18 +438,20 @@ fn convert_request_with_model_id(
         .map(|t| t.tool_specification.name.to_lowercase())
         .collect();
 
-    for tool_name in history_tool_names {
-        let tool_name_lower = tool_name.to_lowercase();
-        if !existing_tool_names.contains(&tool_name_lower) {
-            if options.is_strict() {
-                return Err(ConversionError::UnsupportedContent(format!(
-                    "tool {} appears in history but is missing from tools",
-                    tool_name
-                )));
+    if options.conversion.history_placeholder_tools.is_enabled() || options.is_strict() {
+        for tool_name in history_tool_names {
+            let tool_name_lower = tool_name.to_lowercase();
+            if !existing_tool_names.contains(&tool_name_lower) {
+                if options.is_strict() {
+                    return Err(ConversionError::UnsupportedContent(format!(
+                        "tool {} appears in history but is missing from tools",
+                        tool_name
+                    )));
+                }
+                known_tool_names.insert(tool_name.clone());
+                tools.push(create_placeholder_tool(&tool_name, options));
+                existing_tool_names.insert(tool_name_lower);
             }
-            known_tool_names.insert(tool_name.clone());
-            tools.push(create_placeholder_tool(&tool_name));
-            existing_tool_names.insert(tool_name_lower);
         }
     }
 
@@ -1403,7 +467,7 @@ fn convert_request_with_model_id(
     // 12. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
     let mut content = text_content;
-    if !options.is_strict() {
+    if !options.is_strict() && repair_tool_pairing {
         append_orphan_tool_result_texts(&mut content, &orphan_tool_result_texts);
     }
     if content.trim().is_empty() {
@@ -1437,7 +501,11 @@ fn convert_request_with_model_id(
         tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
     }
 
-    let additional_model_request_fields = build_additional_model_request_fields(req, &model_id);
+    let additional_model_request_fields = build_additional_model_request_fields(
+        req,
+        &model_id,
+        options.conversion.native_reasoning_fields.is_enabled(),
+    );
     if additional_model_request_fields.is_none() {
         if let Some(oc) = &req.output_config {
             if !oc.effort.trim().is_empty() {
@@ -1464,1392 +532,6 @@ fn convert_request_with_model_id(
 /// "AUTO" 模式可能会导致 400 Bad Request 错误
 fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
     "MANUAL".to_string()
-}
-
-/// 处理消息内容，提取文本、图片和工具结果
-fn process_message_content(
-    content: &serde_json::Value,
-) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
-    let mut text_parts = Vec::new();
-    let mut images = Vec::new();
-    let mut tool_results = Vec::new();
-
-    match content {
-        serde_json::Value::String(s) => {
-            text_parts.push(s.clone());
-        }
-        serde_json::Value::Array(arr) => {
-            for item in arr {
-                if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
-                    match block.block_type.as_str() {
-                        "text" => {
-                            if let Some(text) = block.text {
-                                text_parts.push(text);
-                            }
-                        }
-                        "image" => {
-                            let source = block.source.ok_or_else(|| {
-                                ConversionError::UnsupportedContent(
-                                    "image block missing source".to_string(),
-                                )
-                            })?;
-                            images.push(convert_image_source(source)?);
-                        }
-                        "document" => {
-                            let source = block.source.ok_or_else(|| {
-                                ConversionError::UnsupportedContent(
-                                    "document block missing source".to_string(),
-                                )
-                            })?;
-                            let document_text = convert_document_source_to_text(source)?;
-                            if !document_text.is_empty() {
-                                text_parts.push(document_text);
-                            }
-                        }
-                        "tool_result" => {
-                            if let Some(tool_use_id) =
-                                block.tool_use_id.as_deref().and_then(sanitize_tool_use_id)
-                            {
-                                let result_content = normalize_tool_result_content(
-                                    extract_tool_result_content(&block.content),
-                                );
-                                let is_error = block.is_error.unwrap_or(false);
-
-                                let mut result = if is_error {
-                                    ToolResult::error(tool_use_id.clone(), result_content)
-                                } else {
-                                    ToolResult::success(tool_use_id.clone(), result_content)
-                                };
-                                result.status =
-                                    Some(if is_error { "error" } else { "success" }.to_string());
-
-                                tool_results.push(result);
-                            }
-                        }
-                        "tool_use" => {
-                            // tool_use 在 assistant 消息中处理，这里忽略
-                        }
-                        "redacted_thinking" => {
-                            tracing::debug!(
-                                "用户消息中的 redacted_thinking 无法传递给当前 Kiro upstream，已跳过"
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-
-    Ok((text_parts.join("\n"), images, tool_results))
-}
-
-fn convert_image_source(source: super::types::ImageSource) -> Result<KiroImage, ConversionError> {
-    match source.source_type.as_str() {
-        "base64" => {
-            let data = source.data.ok_or_else(|| {
-                ConversionError::UnsupportedContent("base64 image source missing data".to_string())
-            })?;
-            let media_type = source
-                .media_type
-                .or_else(|| parse_data_url(&data).map(|(media_type, _)| media_type))
-                .ok_or_else(|| {
-                    ConversionError::UnsupportedContent(
-                        "base64 image source missing media_type".to_string(),
-                    )
-                })?;
-            let (media_type, data) = normalize_inline_base64_source(&media_type, &data);
-            let format =
-                image_format_from_base64_or_media_type(&media_type, &data).ok_or_else(|| {
-                    ConversionError::UnsupportedContent(format!(
-                        "unsupported image media_type: {}",
-                        media_type
-                    ))
-                })?;
-            Ok(KiroImage::from_base64(format, data))
-        }
-        "url" => {
-            let url = source.url.ok_or_else(|| {
-                ConversionError::UnsupportedContent("image URL source missing url".to_string())
-            })?;
-            if let Some((media_type, data)) = parse_data_url(&url) {
-                let format = image_format_from_base64_or_media_type(&media_type, &data)
-                    .ok_or_else(|| {
-                        ConversionError::UnsupportedContent(format!(
-                            "unsupported image media_type: {}",
-                            media_type
-                        ))
-                    })?;
-                Ok(KiroImage::from_base64(format, data))
-            } else {
-                Err(ConversionError::UnsupportedContent(
-                    "remote image URL source was not materialized before conversion".to_string(),
-                ))
-            }
-        }
-        "file" | "file_id" => Err(ConversionError::UnsupportedContent(
-            "image file source was not materialized before conversion".to_string(),
-        )),
-        other => Err(ConversionError::UnsupportedContent(format!(
-            "unsupported image source type: {}",
-            other
-        ))),
-    }
-}
-
-fn normalize_inline_base64_source(media_type: &str, data: &str) -> (String, String) {
-    if let Some((data_url_media_type, data_url_data)) = parse_data_url(data) {
-        return (
-            normalize_media_type(&data_url_media_type),
-            strip_base64_whitespace(&data_url_data),
-        );
-    }
-    (
-        normalize_media_type(media_type),
-        strip_base64_whitespace(data),
-    )
-}
-
-fn strip_base64_whitespace(data: &str) -> String {
-    if data.bytes().any(|byte| byte.is_ascii_whitespace()) {
-        data.chars()
-            .filter(|ch| !ch.is_ascii_whitespace())
-            .collect()
-    } else {
-        data.to_string()
-    }
-}
-
-fn convert_document_source_to_text(
-    source: super::types::ImageSource,
-) -> Result<String, ConversionError> {
-    match source.source_type.as_str() {
-        "text" => {
-            let media_type = source
-                .media_type
-                .unwrap_or_else(|| "text/plain".to_string());
-            let data = source.data.ok_or_else(|| {
-                ConversionError::UnsupportedContent("text document source missing data".to_string())
-            })?;
-            Ok(format_document_text(&media_type, data))
-        }
-        "base64" => {
-            let data = source.data.ok_or_else(|| {
-                ConversionError::UnsupportedContent(
-                    "base64 document source missing data".to_string(),
-                )
-            })?;
-            let media_type = source
-                .media_type
-                .or_else(|| parse_data_url(&data).map(|(media_type, _)| media_type))
-                .ok_or_else(|| {
-                    ConversionError::UnsupportedContent(
-                        "base64 document source missing media_type".to_string(),
-                    )
-                })?;
-            let (media_type, data) = normalize_inline_base64_source(&media_type, &data);
-            decode_document_to_text(&media_type, &data)
-        }
-        "url" => {
-            let url = source.url.ok_or_else(|| {
-                ConversionError::UnsupportedContent("document URL source missing url".to_string())
-            })?;
-            if let Some((media_type, data)) = parse_data_url(&url) {
-                decode_document_to_text(&media_type, &data)
-            } else {
-                Err(ConversionError::UnsupportedContent(
-                    "remote document URL source was not materialized before conversion".to_string(),
-                ))
-            }
-        }
-        "file" | "file_id" => Err(ConversionError::UnsupportedContent(
-            "document file source was not materialized before conversion".to_string(),
-        )),
-        other => Err(ConversionError::UnsupportedContent(format!(
-            "unsupported document source type: {}",
-            other
-        ))),
-    }
-}
-
-fn decode_document_to_text(media_type: &str, data: &str) -> Result<String, ConversionError> {
-    let bytes = BASE64_STANDARD.decode(data).map_err(|_| {
-        ConversionError::UnsupportedContent(format!(
-            "base64 document source contains invalid data for {}",
-            media_type
-        ))
-    })?;
-
-    let text = match media_type {
-        "text/plain" | "text/markdown" | "text/html" | "text/csv" | "application/json" => {
-            String::from_utf8(bytes).map_err(|_| {
-                ConversionError::UnsupportedContent(format!(
-                    "document media_type {} is not valid UTF-8 text",
-                    media_type
-                ))
-            })?
-        }
-        "application/pdf" => extract_text_from_pdf_bytes(&bytes).ok_or_else(|| {
-            ConversionError::UnsupportedContent(
-                "PDF document text could not be extracted (encrypted, image-only, or malformed PDF)"
-                    .to_string(),
-            )
-        })?,
-        _ => {
-            return Err(ConversionError::UnsupportedContent(format!(
-                "unsupported document media_type: {}",
-                media_type
-            )));
-        }
-    };
-
-    Ok(format_document_text(media_type, text))
-}
-
-fn format_document_text(media_type: &str, text: String) -> String {
-    format!(
-        "<document media_type=\"{}\">\n{}\n</document>",
-        media_type, text
-    )
-}
-
-fn extract_text_from_pdf_bytes(bytes: &[u8]) -> Option<String> {
-    if !bytes.starts_with(b"%PDF") {
-        return None;
-    }
-
-    // 优先使用 pdf-extract（支持压缩流、字体编码、布局）
-    match extract_pdf_text_with_panic_guard(bytes) {
-        Ok(Ok(text)) => {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-            tracing::debug!("pdf-extract 返回空文本，尝试简易解析回退");
-        }
-        Ok(Err(err)) => {
-            tracing::debug!("pdf-extract 抽取失败，回退到简易解析: {}", err);
-        }
-        Err(_) => {
-            tracing::warn!("pdf-extract 抽取过程发生 panic，回退到简易解析");
-        }
-    }
-
-    extract_text_from_pdf_bytes_fallback(bytes)
-}
-
-fn extract_pdf_text_with_panic_guard(
-    bytes: &[u8],
-) -> Result<Result<String, pdf_extract::OutputError>, ()> {
-    let _guard = pdf_extract_panic_lock()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let previous_hook = std::panic::take_hook();
-    let previous_hook_slot = Arc::new(Mutex::new(Some(previous_hook)));
-    let hook_slot = Arc::clone(&previous_hook_slot);
-    std::panic::set_hook(Box::new(move |info| {
-        if is_pdf_extract_panic(info) {
-            return;
-        }
-        if let Some(hook) = hook_slot
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-        {
-            hook(info);
-        }
-    }));
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        pdf_extract::extract_text_from_mem(bytes)
-    }));
-    let previous_hook = previous_hook_slot
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take()
-        .unwrap_or_else(|| Box::new(|_| {}));
-    std::panic::set_hook(previous_hook);
-    result.map_err(|_| ())
-}
-
-fn is_pdf_extract_panic(info: &std::panic::PanicHookInfo<'_>) -> bool {
-    info.location()
-        .is_some_and(|location| location.file().contains("pdf-extract"))
-}
-
-fn pdf_extract_panic_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
-/// 简易 PDF 文本抽取兜底：仅处理未压缩的 `(...) Tj` / `TJ` 形态。
-///
-/// 当 pdf-extract 解析失败（坏 PDF、不支持的编码等）时使用，能力非常有限。
-fn extract_text_from_pdf_bytes_fallback(bytes: &[u8]) -> Option<String> {
-    let raw = String::from_utf8_lossy(bytes);
-    if !raw.contains("%PDF") {
-        return None;
-    }
-
-    let chars: Vec<char> = raw.chars().collect();
-    let mut pieces = Vec::new();
-    let mut idx = 0;
-
-    while idx < chars.len() {
-        if chars[idx] != '(' {
-            idx += 1;
-            continue;
-        }
-
-        let start = idx + 1;
-        idx = start;
-        let mut escaped = false;
-        let mut piece = String::new();
-        while idx < chars.len() {
-            let ch = chars[idx];
-            if escaped {
-                piece.push(match ch {
-                    'n' => '\n',
-                    'r' => '\r',
-                    't' => '\t',
-                    'b' => '\u{0008}',
-                    'f' => '\u{000c}',
-                    '(' | ')' | '\\' => ch,
-                    other => other,
-                });
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == ')' {
-                break;
-            } else {
-                piece.push(ch);
-            }
-            idx += 1;
-        }
-
-        if idx >= chars.len() {
-            break;
-        }
-
-        let tail: String = chars.iter().skip(idx + 1).take(80).collect::<String>();
-        if tail.contains("Tj") || tail.contains("TJ") || tail.contains('\'') || tail.contains('"') {
-            let trimmed = piece.trim();
-            if !trimmed.is_empty() {
-                pieces.push(trimmed.to_string());
-            }
-        }
-
-        idx += 1;
-    }
-
-    if pieces.is_empty() {
-        None
-    } else {
-        Some(pieces.join("\n"))
-    }
-}
-
-fn parse_data_url(url: &str) -> Option<(String, String)> {
-    let data_part = url.strip_prefix("data:")?;
-    let (metadata, data) = data_part.split_once(',')?;
-    if !metadata
-        .split(';')
-        .skip(1)
-        .any(|part| part.trim().eq_ignore_ascii_case("base64"))
-    {
-        return None;
-    }
-    let media_type = metadata
-        .split(';')
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    Some((media_type.to_string(), data.to_string()))
-}
-
-/// 从 media_type 获取图片格式
-fn get_image_format(media_type: &str) -> Option<String> {
-    match normalize_media_type(media_type).as_str() {
-        "image/jpeg" => Some("jpeg".to_string()),
-        "image/png" => Some("png".to_string()),
-        "image/gif" => Some("gif".to_string()),
-        "image/webp" => Some("webp".to_string()),
-        _ => None,
-    }
-}
-
-fn normalize_media_type(media_type: &str) -> String {
-    media_type
-        .split(';')
-        .next()
-        .unwrap_or(media_type)
-        .trim()
-        .to_ascii_lowercase()
-}
-
-fn image_format_from_base64_or_media_type(media_type: &str, data: &str) -> Option<String> {
-    let declared = get_image_format(media_type);
-    if let Ok(bytes) = BASE64_STANDARD.decode(data) {
-        if let Some(detected) = infer_image_format_from_bytes(&bytes) {
-            if declared.as_deref().is_some_and(|value| value != detected) {
-                tracing::warn!(
-                    declared_media_type = %media_type,
-                    detected_format = detected,
-                    "图片 media_type 与内容字节不一致，已按字节识别结果修正"
-                );
-            }
-            return Some(detected.to_string());
-        }
-    }
-    declared
-}
-
-fn infer_image_format_from_bytes(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
-        Some("png")
-    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-        Some("jpeg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("gif")
-    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
-        Some("webp")
-    } else {
-        None
-    }
-}
-
-pub(crate) fn infer_image_format_from_url(url: &str) -> Option<String> {
-    let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
-    if path.ends_with(".jpg") || path.ends_with(".jpeg") {
-        Some("jpeg".to_string())
-    } else if path.ends_with(".png") {
-        Some("png".to_string())
-    } else if path.ends_with(".gif") {
-        Some("gif".to_string())
-    } else if path.ends_with(".webp") {
-        Some("webp".to_string())
-    } else {
-        None
-    }
-}
-
-pub(crate) fn infer_document_media_type_from_url(url: &str) -> String {
-    let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
-    if path.ends_with(".pdf") {
-        "application/pdf".to_string()
-    } else if path.ends_with(".md") {
-        "text/markdown".to_string()
-    } else if path.ends_with(".html") || path.ends_with(".htm") {
-        "text/html".to_string()
-    } else if path.ends_with(".txt") {
-        "text/plain".to_string()
-    } else {
-        "application/octet-stream".to_string()
-    }
-}
-
-/// 提取工具结果内容
-fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
-    match content {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(serde_json::Value::Array(arr)) => {
-            let mut parts = Vec::new();
-            for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    parts.push(text.to_string());
-                } else if !item.is_null() {
-                    parts.push(item.to_string());
-                }
-            }
-            parts.join("\n")
-        }
-        Some(v) => v.to_string(),
-        None => String::new(),
-    }
-}
-
-fn normalize_tool_result_content(content: String) -> String {
-    if content.trim().is_empty() {
-        EMPTY_TOOL_RESULT_CONTENT_PLACEHOLDER.to_string()
-    } else {
-        content
-    }
-}
-
-fn normalize_tool_use_input(input: serde_json::Value) -> serde_json::Value {
-    match input {
-        serde_json::Value::Object(_) => input,
-        serde_json::Value::Null => serde_json::json!({}),
-        other => serde_json::json!({ "value": other }),
-    }
-}
-
-fn sanitize_tool_use_id(id: &str) -> Option<String> {
-    let trimmed = id.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if trimmed
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-    {
-        return Some(trimmed.to_string());
-    }
-
-    let sanitized = trimmed
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    let sanitized = sanitized.trim_matches('_');
-    let prefix = if sanitized.is_empty() {
-        "toolu".to_string()
-    } else {
-        sanitized.to_string()
-    };
-    let mut hasher = Sha256::new();
-    hasher.update(trimmed.as_bytes());
-    let digest = hasher.finalize();
-    Some(format!(
-        "{}_{:02x}{:02x}{:02x}{:02x}",
-        prefix, digest[0], digest[1], digest[2], digest[3]
-    ))
-}
-
-/// 验证并过滤 tool_use/tool_result 配对
-///
-/// 收集所有 tool_use_id，验证 tool_result 是否匹配
-/// 静默跳过孤立的 tool_use 和 tool_result，输出警告日志
-///
-/// # Arguments
-/// * `history` - 历史消息引用
-/// * `tool_results` - 当前消息中的 tool_result 列表
-///
-/// # Returns
-/// 元组：(经过验证和过滤后的 tool_result 列表, 孤立的 tool_use_id 集合, 被保留为文本的孤立 tool_result)
-fn validate_tool_pairing(
-    history: &[Message],
-    tool_results: &[ToolResult],
-    warnings: &mut ProxyWarnings,
-) -> (
-    Vec<ToolResult>,
-    std::collections::HashSet<String>,
-    Vec<String>,
-) {
-    use std::collections::HashSet;
-
-    let mut all_tool_use_ids = HashSet::new();
-    let mut history_tool_result_ids = HashSet::new();
-    let mut current_tool_use_ids = HashSet::new();
-    let mut last_assistant_unpaired_candidates = HashSet::new();
-    let mut unpaired_tool_use_ids = HashSet::new();
-    let mut current_paired_tool_use_ids = HashSet::new();
-
-    let mut pending_assistant_tool_use_ids: Option<Vec<String>> = None;
-    for message in history {
-        match message {
-            Message::Assistant(assistant) => {
-                if let Some(ids) = pending_assistant_tool_use_ids.take() {
-                    unpaired_tool_use_ids.extend(ids);
-                }
-                if let Some(tool_uses) = &assistant.assistant_response_message.tool_uses {
-                    let ids = tool_uses
-                        .iter()
-                        .map(|tool_use| tool_use.tool_use_id.clone())
-                        .collect::<Vec<_>>();
-                    for tool_use in tool_uses {
-                        all_tool_use_ids.insert(tool_use.tool_use_id.clone());
-                    }
-                    if !ids.is_empty() {
-                        pending_assistant_tool_use_ids = Some(ids);
-                    }
-                }
-            }
-            Message::User(user) => {
-                let mut paired_ids = HashSet::new();
-                for result in &user
-                    .user_input_message
-                    .user_input_message_context
-                    .tool_results
-                {
-                    history_tool_result_ids.insert(result.tool_use_id.clone());
-                    paired_ids.insert(result.tool_use_id.clone());
-                }
-                if let Some(ids) = pending_assistant_tool_use_ids.take() {
-                    unpaired_tool_use_ids.extend(
-                        ids.into_iter()
-                            .filter(|tool_use_id| !paired_ids.contains(tool_use_id)),
-                    );
-                }
-            }
-        }
-    }
-    if let Some(ids) = pending_assistant_tool_use_ids.take() {
-        current_tool_use_ids.extend(ids.iter().cloned());
-        last_assistant_unpaired_candidates.extend(ids);
-        unpaired_tool_use_ids.extend(current_tool_use_ids.iter().cloned());
-    }
-
-    let mut filtered_results = Vec::new();
-    let mut orphan_tool_result_texts = Vec::new();
-    let mut seen_current_results = HashSet::new();
-
-    for result in tool_results {
-        if current_tool_use_ids.contains(&result.tool_use_id)
-            && seen_current_results.insert(result.tool_use_id.clone())
-        {
-            // 配对成功
-            filtered_results.push(result.clone());
-            unpaired_tool_use_ids.remove(&result.tool_use_id);
-            current_paired_tool_use_ids.insert(result.tool_use_id.clone());
-        } else if current_tool_use_ids.contains(&result.tool_use_id) {
-            // 当前消息中同一个 tool_use_id 多次返回，仅保留第一条结构化结果。
-            warnings.duplicate_tool_results += 1;
-            if let Some(text) = kiro_tool_result_to_text(result) {
-                warnings.duplicate_tool_results_textified += 1;
-                orphan_tool_result_texts.push(format!(
-                    "[duplicate tool result {}]\n{}",
-                    result.tool_use_id, text
-                ));
-            }
-            tracing::warn!(
-                "跳过重复的当前结构化 tool_result，并在兼容模式下转为普通文本：tool_use_id={}",
-                result.tool_use_id
-            );
-        } else if history_tool_result_ids.contains(&result.tool_use_id)
-            || all_tool_use_ids.contains(&result.tool_use_id)
-        {
-            // 不属于最后一条 assistant 的 tool_result 不能作为当前结构化结果继续发送。
-            warnings.orphan_tool_results += 1;
-            if let Some(text) = kiro_tool_result_to_text(result) {
-                warnings.orphan_tool_results_textified += 1;
-                orphan_tool_result_texts.push(format!(
-                    "[orphan tool result {}]\n{}",
-                    result.tool_use_id, text
-                ));
-            }
-            tracing::warn!(
-                "tool_result 不属于最后一条 assistant tool_use，已从 tool_results 移除并在兼容模式下转为普通文本，tool_use_id={}",
-                result.tool_use_id
-            );
-        } else {
-            // 孤立 tool_result - 找不到对应的 tool_use
-            warnings.orphan_tool_results += 1;
-            if let Some(text) = kiro_tool_result_to_text(result) {
-                warnings.orphan_tool_results_textified += 1;
-                orphan_tool_result_texts.push(format!(
-                    "[orphan tool result {}]\n{}",
-                    result.tool_use_id, text
-                ));
-            }
-            tracing::warn!(
-                "孤立的 tool_result 找不到对应 tool_use，已从 tool_results 移除并在兼容模式下转为普通文本，tool_use_id={}",
-                result.tool_use_id
-            );
-        }
-    }
-
-    for paired_id in &current_paired_tool_use_ids {
-        unpaired_tool_use_ids.remove(paired_id);
-    }
-    for orphaned_id in last_assistant_unpaired_candidates {
-        if !current_paired_tool_use_ids.contains(&orphaned_id) {
-            unpaired_tool_use_ids.insert(orphaned_id);
-        }
-    }
-
-    // 检测真正孤立的 tool_use（有 tool_use 但在历史和当前消息中都没有 tool_result）
-    for orphaned_id in &unpaired_tool_use_ids {
-        warnings.orphan_tool_uses += 1;
-        tracing::warn!(
-            "检测到孤立的 tool_use：找不到对应的 tool_result，将从历史中移除，tool_use_id={}",
-            orphaned_id
-        );
-    }
-
-    (
-        filtered_results,
-        unpaired_tool_use_ids,
-        orphan_tool_result_texts,
-    )
-}
-
-fn kiro_tool_result_to_text(result: &ToolResult) -> Option<String> {
-    let mut parts = Vec::new();
-    for item in &result.content {
-        if let Some(text) = item.get("text").and_then(|value| value.as_str()) {
-            if !text.is_empty() {
-                parts.push(text.to_string());
-            }
-        } else if !item.is_empty() {
-            parts.push(serde_json::Value::Object(item.clone()).to_string());
-        }
-    }
-    (!parts.is_empty()).then(|| parts.join("\n"))
-}
-
-fn append_orphan_tool_result_texts(content: &mut String, texts: &[String]) {
-    if texts.is_empty() {
-        return;
-    }
-    let suffix = texts.join("\n\n");
-    if content.trim().is_empty() {
-        *content = suffix;
-    } else {
-        content.push_str("\n\n");
-        content.push_str(&suffix);
-    }
-}
-
-/// 从历史消息中移除孤立的 tool_use
-///
-/// Kiro API 要求每个 tool_use 必须有对应的 tool_result，否则返回 400 Bad Request。
-/// 此函数遍历历史中的 assistant 消息，移除没有对应 tool_result 的 tool_use。
-///
-/// # Arguments
-/// * `history` - 可变的历史消息列表
-/// * `orphaned_ids` - 需要移除的孤立 tool_use_id 集合
-fn remove_orphaned_tool_uses(
-    history: &mut [Message],
-    orphaned_ids: &std::collections::HashSet<String>,
-) {
-    if orphaned_ids.is_empty() {
-        return;
-    }
-
-    for msg in history.iter_mut() {
-        if let Message::Assistant(assistant_msg) = msg {
-            if let Some(ref mut tool_uses) = assistant_msg.assistant_response_message.tool_uses {
-                let original_len = tool_uses.len();
-                tool_uses.retain(|tu| !orphaned_ids.contains(&tu.tool_use_id));
-
-                // 如果移除后为空，设置为 None
-                if tool_uses.is_empty() {
-                    assistant_msg.assistant_response_message.tool_uses = None;
-                } else if tool_uses.len() != original_len {
-                    tracing::debug!(
-                        "从 assistant 消息中移除了 {} 个孤立的 tool_use",
-                        original_len - tool_uses.len()
-                    );
-                }
-            }
-        }
-    }
-}
-
-/// Kiro API 工具名称最大长度限制
-const TOOL_NAME_MAX_LEN: usize = 63;
-const TOOL_HASH_MARKER: &str = "Hash";
-
-fn capitalize_ascii_first(value: &str) -> String {
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return String::new();
-    };
-    let mut result = first.to_ascii_uppercase().to_string();
-    result.push_str(chars.as_str());
-    result
-}
-
-fn sanitize_tool_name(name: &str) -> String {
-    let parts: Vec<String> = name
-        .split(|c: char| c == '_' || c == '-' || !c.is_ascii_alphanumeric())
-        .filter(|part| !part.is_empty())
-        .map(str::to_string)
-        .collect();
-
-    let mut iter = parts.into_iter();
-    let Some(first) = iter.next() else {
-        return "tool".to_string();
-    };
-
-    let mut sanitized = first;
-    let mut chars = sanitized.chars();
-    if let Some(first_char) = chars.next() {
-        sanitized = format!("{}{}", first_char.to_ascii_lowercase(), chars.as_str());
-    }
-    for part in iter {
-        sanitized.push_str(&capitalize_ascii_first(&part));
-    }
-
-    if sanitized.is_empty() {
-        "tool".to_string()
-    } else if !sanitized
-        .chars()
-        .next()
-        .is_some_and(|ch| ch.is_ascii_alphabetic())
-    {
-        format!("tool{}", capitalize_ascii_first(&sanitized))
-    } else {
-        sanitized
-    }
-}
-
-/// 生成确定性 Kiro-safe 名称：截断前缀 + Hash + 8 位 SHA256 hex
-fn shorten_tool_name(name: &str, hash_input: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(hash_input.as_bytes());
-    let hash_hex = format!("{:x}", hasher.finalize());
-    let hash_suffix = &hash_hex[..8];
-    // 51 prefix + "Hash" + 8 hash = 63
-    let prefix_max = TOOL_NAME_MAX_LEN - TOOL_HASH_MARKER.len() - 8;
-    let prefix = match name.char_indices().nth(prefix_max) {
-        Some((idx, _)) => &name[..idx],
-        None => name,
-    };
-    format!("{}{}{}", prefix, TOOL_HASH_MARKER, hash_suffix)
-}
-
-/// 如果名称超长则缩短，并记录映射（short → original）
-fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> String {
-    let sanitized = sanitize_tool_name(name);
-    let mapped = if sanitized != name || sanitized.len() > TOOL_NAME_MAX_LEN {
-        shorten_tool_name(&sanitized, name)
-    } else {
-        sanitized
-    };
-    if mapped != name {
-        tool_name_map.insert(mapped.clone(), name.to_string());
-    }
-    mapped
-}
-
-fn parse_tool_choice(tool_choice: &Option<serde_json::Value>) -> ToolChoiceDirective {
-    let Some(value) = tool_choice else {
-        return ToolChoiceDirective::Auto;
-    };
-
-    if let Some(choice) = value.as_str() {
-        return match choice {
-            "auto" => ToolChoiceDirective::Auto,
-            "any" => ToolChoiceDirective::Any,
-            "none" => ToolChoiceDirective::None,
-            _ => ToolChoiceDirective::Unknown,
-        };
-    }
-
-    let Some(obj) = value.as_object() else {
-        return ToolChoiceDirective::Unknown;
-    };
-
-    match obj.get("type").and_then(|v| v.as_str()) {
-        Some("auto") => ToolChoiceDirective::Auto,
-        Some("any") => ToolChoiceDirective::Any,
-        Some("none") => ToolChoiceDirective::None,
-        Some("tool") => obj
-            .get("name")
-            .and_then(|v| v.as_str())
-            .filter(|name| !name.trim().is_empty())
-            .map(|name| ToolChoiceDirective::Tool(name.to_string()))
-            .unwrap_or(ToolChoiceDirective::Unknown),
-        _ => ToolChoiceDirective::Unknown,
-    }
-}
-
-fn tool_choice_matches_name(tool_name: &str, requested_name: &str) -> bool {
-    tool_name == requested_name
-        || sanitize_tool_name(tool_name) == sanitize_tool_name(requested_name)
-}
-
-fn selected_tool_indices(
-    tools: &[super::types::Tool],
-    directive: &ToolChoiceDirective,
-) -> Vec<usize> {
-    match directive {
-        ToolChoiceDirective::None => Vec::new(),
-        ToolChoiceDirective::Tool(requested_name) => {
-            let selected = tools
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, tool)| {
-                    tool_choice_matches_name(&tool.name, requested_name).then_some(idx)
-                })
-                .collect::<Vec<_>>();
-            if selected.is_empty() {
-                tracing::warn!(
-                    requested_tool = requested_name,
-                    "tool_choice requested a tool that is not present in tools; preserving all tools for compatibility"
-                );
-                (0..tools.len()).collect()
-            } else {
-                selected
-            }
-        }
-        ToolChoiceDirective::Auto | ToolChoiceDirective::Any | ToolChoiceDirective::Unknown => {
-            (0..tools.len()).collect()
-        }
-    }
-}
-
-fn generate_tool_choice_prefix(req: &MessagesRequest, options: ConverterOptions) -> Option<String> {
-    if !options.inject_tool_choice_prefix() {
-        return None;
-    }
-
-    match parse_tool_choice(&req.tool_choice) {
-        ToolChoiceDirective::Any => Some(
-            "<tool_choice>any</tool_choice><tool_choice_policy>Use at least one available tool in this turn when a tool can satisfy the request.</tool_choice_policy>"
-                .to_string(),
-        ),
-        ToolChoiceDirective::Tool(name) => Some(format!(
-            "<tool_choice>tool</tool_choice><tool_choice_name>{}</tool_choice_name><tool_choice_policy>Use the named tool in this turn when responding.</tool_choice_policy>",
-            name
-        )),
-        ToolChoiceDirective::None if req.tools.as_ref().is_some_and(|tools| !tools.is_empty()) => {
-            Some(
-                "<tool_choice>none</tool_choice><tool_choice_policy>Do not call tools in this turn.</tool_choice_policy>"
-                    .to_string(),
-            )
-        }
-        _ => None,
-    }
-}
-
-/// 转换工具定义
-#[derive(Debug, Default)]
-struct ConvertedTools {
-    tools: Vec<Tool>,
-    tool_cache_point_insert_after: Vec<usize>,
-}
-
-fn convert_tools(
-    tools: &Option<Vec<super::types::Tool>>,
-    tool_choice: &Option<serde_json::Value>,
-    tool_name_map: &mut HashMap<String, String>,
-    options: ConverterOptions,
-) -> ConvertedTools {
-    let Some(tools) = tools else {
-        return ConvertedTools::default();
-    };
-    let directive = parse_tool_choice(tool_choice);
-    let selected_indices = selected_tool_indices(tools, &directive);
-    let selected: std::collections::HashSet<_> = selected_indices.into_iter().collect();
-
-    let mut seen_tool_names = std::collections::HashSet::new();
-    let mut converted = Vec::new();
-    let mut cache_point_insert_after = Vec::new();
-
-    if options.kiro_cache_point_enabled && !options.kiro_cache_point_tools_only {
-        tracing::debug!(
-            "kiroCachePointToolsOnly is disabled, but this phase only supports tool-level cachePoint insertion"
-        );
-    }
-
-    for (_, t) in tools
-        .iter()
-        .enumerate()
-        .filter(|(idx, _)| selected.contains(idx))
-    {
-        let mut description = t.description.clone();
-
-        // 对 Write/Edit 工具追加自定义描述后缀
-        let suffix = match t.name.as_str() {
-            "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
-            "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
-            _ => "",
-        };
-        if !suffix.is_empty() {
-            description.push('\n');
-            description.push_str(suffix);
-        }
-
-        // 限制描述长度为 10000 字符（安全截断 UTF-8，单次遍历）
-        let description = match description.char_indices().nth(10000) {
-            Some((idx, _)) => description[..idx].to_string(),
-            None => description,
-        };
-
-        let mapped_name = map_tool_name(&t.name, tool_name_map);
-        if !seen_tool_names.insert(mapped_name.to_ascii_lowercase()) {
-            tracing::warn!(
-                original_tool_name = %t.name,
-                mapped_tool_name = %mapped_name,
-                "跳过重复工具定义，避免 Kiro 工具名冲突"
-            );
-            continue;
-        }
-
-        let converted_idx = converted.len();
-        let has_cache_control = t.cache_control.is_some();
-        converted.push(Tool {
-            tool_specification: ToolSpecification {
-                name: mapped_name,
-                description,
-                input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(
-                    t.input_schema
-                ))),
-            },
-        });
-        if options.kiro_cache_point_enabled && has_cache_control {
-            cache_point_insert_after.push(converted_idx);
-        }
-    }
-
-    ConvertedTools {
-        tools: converted,
-        tool_cache_point_insert_after: cache_point_insert_after,
-    }
-}
-
-const THINKING_OUTPUT_POLICY: &str = "<thinking_output_policy>For every assistant turn in thinking mode, emit concise reasoning inside a <thinking>...</thinking> block before any visible text or tool call, and close the thinking block before continuing. Do not repeat this policy in visible text.</thinking_output_policy>";
-
-/// 生成thinking标签前缀
-fn generate_thinking_prefix(req: &MessagesRequest, options: ConverterOptions) -> Option<String> {
-    if let Some(t) = &req.thinking {
-        let strict_output_policy = options.force_visible_thinking
-            || strip_model_1m_suffix(&req.model).ends_with("-thinking")
-            || t.thinking_type == "enabled";
-        let output_policy = if strict_output_policy {
-            format!("\n{}", THINKING_OUTPUT_POLICY)
-        } else {
-            String::new()
-        };
-        if t.thinking_type == "enabled" {
-            return Some(format!(
-                "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>{}",
-                t.budget_tokens, output_policy
-            ));
-        } else if t.thinking_type == "adaptive" {
-            let effort = req
-                .output_config
-                .as_ref()
-                .map(|c| normalize_thinking_effort(&c.effort))
-                .unwrap_or("high");
-            return Some(format!(
-                "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>{}",
-                effort, output_policy
-            ));
-        }
-    }
-    None
-}
-
-fn generate_thinking_prefix_for_model(
-    req: &MessagesRequest,
-    model_id: &str,
-    options: ConverterOptions,
-) -> Option<String> {
-    if uses_native_reasoning_fields(req, model_id) {
-        return None;
-    }
-    generate_thinking_prefix(req, options)
-}
-
-/// 检查内容是否已包含thinking标签
-fn has_thinking_tags(content: &str) -> bool {
-    content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
-}
-
-/// 构建历史消息
-///
-/// # Arguments
-/// * `req` - 原始请求，用于读取 `system`、`thinking` 等配置字段
-/// * `messages` - 经过 prefill 预处理的消息切片，末尾必定是 user 消息。
-///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
-///   调用方应始终使用此参数而非 `req.messages`。
-/// * `model_id` - 已映射的 Kiro 模型 ID
-fn build_history(
-    req: &MessagesRequest,
-    messages: &[super::types::Message],
-    model_id: &str,
-    tool_name_map: &mut HashMap<String, String>,
-    options: ConverterOptions,
-) -> Result<Vec<Message>, ConversionError> {
-    let mut history = Vec::new();
-
-    // 生成thinking前缀（如果需要）
-    let thinking_prefix = if options.inject_thinking_prefix() {
-        generate_thinking_prefix_for_model(req, model_id, options)
-    } else {
-        None
-    };
-    let tool_choice_prefix = generate_tool_choice_prefix(req, options);
-
-    // 1. 处理系统消息
-    if let Some(ref system) = req.system {
-        let system_content: String = system
-            .iter()
-            .map(|s| s.text.clone())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        if !system_content.is_empty() {
-            // 追加分块写入策略到系统消息
-            let system_content = if options.inject_chunked_policy() {
-                format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY)
-            } else {
-                system_content
-            };
-
-            let system_content = if let Some(ref prefix) = tool_choice_prefix {
-                format!("{}\n{}", prefix, system_content)
-            } else {
-                system_content
-            };
-
-            // 注入thinking标签到系统消息最前面（如果需要且不存在）
-            let final_content = if let Some(ref prefix) = thinking_prefix {
-                if !has_thinking_tags(&system_content) {
-                    format!("{}\n{}", prefix, system_content)
-                } else {
-                    system_content
-                }
-            } else {
-                system_content
-            };
-
-            // 系统消息作为 user + assistant 配对
-            let user_msg = HistoryUserMessage::new(final_content, model_id);
-            history.push(Message::User(user_msg));
-
-            let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
-            history.push(Message::Assistant(assistant_msg));
-        }
-    } else {
-        let mut synthetic_prefixes = Vec::new();
-        if let Some(prefix) = thinking_prefix {
-            synthetic_prefixes.push(prefix);
-        }
-        if let Some(prefix) = tool_choice_prefix {
-            synthetic_prefixes.push(prefix);
-        }
-
-        if !synthetic_prefixes.is_empty() {
-            // 没有系统消息但有控制配置，插入新的系统消息
-            let user_msg = HistoryUserMessage::new(synthetic_prefixes.join("\n"), model_id);
-            history.push(Message::User(user_msg));
-
-            let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
-            history.push(Message::Assistant(assistant_msg));
-        }
-    }
-
-    // 2. 处理常规消息历史
-    // 最后一条消息作为 currentMessage，不加入历史
-    // 经过 prefill 预处理后，messages 末尾必定是 user，故直接截掉最后一条即可
-    let history_end_index = messages.len().saturating_sub(1);
-
-    // 收集并配对消息
-    let mut user_buffer: Vec<&super::types::Message> = Vec::new();
-    let mut assistant_buffer: Vec<&super::types::Message> = Vec::new();
-
-    for i in 0..history_end_index {
-        let msg = &messages[i];
-
-        if msg.role == "user" {
-            // 先处理累积的 assistant 消息
-            if !assistant_buffer.is_empty() {
-                let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
-                history.push(Message::Assistant(merged));
-                assistant_buffer.clear();
-            }
-            user_buffer.push(msg);
-        } else if msg.role == "assistant" {
-            // 先处理累积的 user 消息
-            if !user_buffer.is_empty() {
-                let merged_user = merge_user_messages(&user_buffer, model_id)?;
-                history.push(Message::User(merged_user));
-                user_buffer.clear();
-            }
-            // 累积 assistant 消息（支持连续多条）
-            assistant_buffer.push(msg);
-        }
-    }
-
-    // 处理末尾累积的 assistant 消息
-    if !assistant_buffer.is_empty() {
-        let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
-        history.push(Message::Assistant(merged));
-    }
-
-    // 处理结尾的孤立 user 消息
-    if !user_buffer.is_empty() {
-        let merged_user = merge_user_messages(&user_buffer, model_id)?;
-        history.push(Message::User(merged_user));
-
-        // 自动配对一个 "OK" 的 assistant 响应
-        let auto_assistant = HistoryAssistantMessage::new("OK");
-        history.push(Message::Assistant(auto_assistant));
-    }
-
-    Ok(history)
-}
-
-/// 合并多个 user 消息
-fn merge_user_messages(
-    messages: &[&super::types::Message],
-    model_id: &str,
-) -> Result<HistoryUserMessage, ConversionError> {
-    let mut content_parts = Vec::new();
-    let mut all_images = Vec::new();
-    let mut all_tool_results = Vec::new();
-
-    for msg in messages {
-        let (text, images, tool_results) = process_message_content(&msg.content)?;
-        if !text.is_empty() {
-            content_parts.push(text);
-        }
-        all_images.extend(images);
-        all_tool_results.extend(tool_results);
-    }
-
-    let mut content = content_parts.join("\n");
-    if content.trim().is_empty() && !all_tool_results.is_empty() {
-        content = TOOL_RESULTS_PROVIDED_PLACEHOLDER.to_string();
-    }
-    // 保留文本内容，即使有工具结果也不丢弃用户文本
-    let mut user_msg = UserMessage::new(&content, model_id);
-
-    if !all_images.is_empty() {
-        user_msg = user_msg.with_images(all_images);
-    }
-    if !all_tool_results.is_empty() {
-        let mut ctx = UserInputMessageContext::new();
-        ctx = ctx.with_tool_results(all_tool_results);
-        user_msg = user_msg.with_context(ctx);
-    }
-
-    Ok(HistoryUserMessage {
-        user_input_message: user_msg,
-    })
-}
-
-/// 转换 assistant 消息
-fn convert_assistant_message(
-    msg: &super::types::Message,
-    tool_name_map: &mut HashMap<String, String>,
-) -> Result<HistoryAssistantMessage, ConversionError> {
-    let mut thinking_content = String::new();
-    let mut text_content = String::new();
-    let mut tool_uses = Vec::new();
-
-    match &msg.content {
-        serde_json::Value::String(s) => {
-            text_content = s.clone();
-        }
-        serde_json::Value::Array(arr) => {
-            for item in arr {
-                if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
-                    match block.block_type.as_str() {
-                        "thinking" => {
-                            if block.signature.as_deref().is_some_and(|s| !s.is_empty()) {
-                                tracing::debug!(
-                                    "当前 Kiro history 模型不支持 Anthropic thinking signature；仅透传 thinking 文本"
-                                );
-                            }
-                            if let Some(thinking) = block.thinking {
-                                thinking_content.push_str(&thinking);
-                            }
-                        }
-                        "redacted_thinking" => {
-                            if block.data.as_deref().is_some_and(|s| !s.is_empty()) {
-                                tracing::debug!(
-                                    "当前 Kiro history 模型不支持 redacted_thinking；已跳过该历史块"
-                                );
-                            }
-                        }
-                        "text" => {
-                            if let Some(text) = block.text {
-                                text_content.push_str(&text);
-                            }
-                        }
-                        "tool_use" => {
-                            if let (Some(id), Some(name)) = (
-                                block.id.as_deref().and_then(sanitize_tool_use_id),
-                                block
-                                    .name
-                                    .as_deref()
-                                    .map(str::trim)
-                                    .filter(|name| !name.is_empty()),
-                            ) {
-                                let input = normalize_tool_use_input(
-                                    block.input.unwrap_or(serde_json::json!({})),
-                                );
-                                let mapped_name = map_tool_name(name, tool_name_map);
-                                tool_uses
-                                    .push(ToolUseEntry::new(id, mapped_name).with_input(input));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-
-    // 组合 thinking 和 text 内容
-    // 格式: <thinking>思考内容</thinking>\n\ntext内容
-    // 注意: Kiro API 要求 content 字段不能为空，当只有 tool_use 时需要占位符
-    let final_content = if !thinking_content.is_empty() {
-        if !text_content.is_empty() {
-            format!(
-                "<thinking>{}</thinking>\n\n{}",
-                thinking_content, text_content
-            )
-        } else {
-            format!("<thinking>{}</thinking>", thinking_content)
-        }
-    } else if text_content.is_empty() && !tool_uses.is_empty() {
-        " ".to_string()
-    } else {
-        text_content
-    };
-
-    let mut assistant = AssistantMessage::new(final_content);
-    if !tool_uses.is_empty() {
-        assistant = assistant.with_tool_uses(tool_uses);
-    }
-
-    Ok(HistoryAssistantMessage {
-        assistant_response_message: assistant,
-    })
-}
-
-/// 合并多个连续的 assistant 消息为一条
-/// 用于处理网络不稳定时产生的连续 assistant 消息（Issue #79）
-fn merge_assistant_messages(
-    messages: &[&super::types::Message],
-    tool_name_map: &mut HashMap<String, String>,
-) -> Result<HistoryAssistantMessage, ConversionError> {
-    assert!(!messages.is_empty());
-    if messages.len() == 1 {
-        return convert_assistant_message(messages[0], tool_name_map);
-    }
-
-    let mut all_tool_uses: Vec<ToolUseEntry> = Vec::new();
-    let mut content_parts: Vec<String> = Vec::new();
-
-    for msg in messages {
-        let converted = convert_assistant_message(msg, tool_name_map)?;
-        let am = converted.assistant_response_message;
-        if !am.content.trim().is_empty() {
-            content_parts.push(am.content);
-        }
-        if let Some(tus) = am.tool_uses {
-            all_tool_uses.extend(tus);
-        }
-    }
-
-    let content = if content_parts.is_empty() && !all_tool_uses.is_empty() {
-        " ".to_string()
-    } else {
-        content_parts.join("\n\n")
-    };
-
-    let mut assistant = AssistantMessage::new(content);
-    if !all_tool_uses.is_empty() {
-        assistant = assistant.with_tool_uses(all_tool_uses);
-    }
-    Ok(HistoryAssistantMessage {
-        assistant_response_message: assistant,
-    })
 }
 
 #[cfg(test)]
@@ -3137,7 +819,7 @@ mod tests {
 
     #[test]
     fn test_create_placeholder_tool() {
-        let tool = create_placeholder_tool("my_custom_tool");
+        let tool = create_placeholder_tool("my_custom_tool", ConverterOptions::default());
 
         assert_eq!(tool.tool_specification.name, "my_custom_tool");
         assert!(!tool.tool_specification.description.is_empty());
@@ -3448,7 +1130,7 @@ mod tests {
     #[test]
     fn test_map_tool_name_short_passthrough() {
         let mut map = HashMap::new();
-        let result = map_tool_name("shortName", &mut map);
+        let result = map_tool_name("shortName", &mut map, ConverterOptions::default());
         assert_eq!(result, "shortName");
         assert!(map.is_empty(), "Kiro-safe 短名称不应产生映射");
     }
@@ -3456,7 +1138,11 @@ mod tests {
     #[test]
     fn test_map_tool_name_sanitizes_separators_and_records_mapping() {
         let mut map = HashMap::new();
-        let result = map_tool_name("mcp__server-name__read_file", &mut map);
+        let result = map_tool_name(
+            "mcp__server-name__read_file",
+            &mut map,
+            ConverterOptions::default(),
+        );
         assert!(result.len() <= TOOL_NAME_MAX_LEN);
         assert!(result.chars().all(|ch| ch.is_ascii_alphanumeric()));
         assert!(result.contains(TOOL_HASH_MARKER));
@@ -3469,8 +1155,8 @@ mod tests {
     #[test]
     fn test_map_tool_name_avoids_collisions_after_sanitizing() {
         let mut map = HashMap::new();
-        let dash = map_tool_name("foo-bar", &mut map);
-        let underscore = map_tool_name("foo_bar", &mut map);
+        let dash = map_tool_name("foo-bar", &mut map, ConverterOptions::default());
+        let underscore = map_tool_name("foo_bar", &mut map, ConverterOptions::default());
         assert_ne!(dash, underscore);
         assert_eq!(map.get(&dash), Some(&"foo-bar".to_string()));
         assert_eq!(map.get(&underscore), Some(&"foo_bar".to_string()));
@@ -3480,10 +1166,53 @@ mod tests {
     fn test_map_tool_name_long_creates_mapping() {
         let mut map = HashMap::new();
         let long_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
-        let result = map_tool_name(long_name, &mut map);
+        let result = map_tool_name(long_name, &mut map, ConverterOptions::default());
         assert!(result.len() <= TOOL_NAME_MAX_LEN);
         assert!(result.chars().all(|ch| ch.is_ascii_alphanumeric()));
         assert_eq!(map.get(&result), Some(&long_name.to_string()));
+    }
+
+    #[test]
+    fn test_tool_name_mapping_can_be_disabled_by_conversion_plan() {
+        use crate::anthropic::body_capabilities::BodyStageState;
+
+        let mut map = HashMap::new();
+        let mut options = ConverterOptions::default();
+        options.conversion.tool_name_mapping = BodyStageState::Disabled;
+
+        let result = map_tool_name("mcp__server-name__read_file", &mut map, options);
+
+        assert_eq!(result, "mcp__server-name__read_file");
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_tool_choice_steering_can_be_disabled_by_conversion_plan() {
+        use crate::anthropic::body_capabilities::BodyStageState;
+
+        let req = base_tool_choice_request(serde_json::json!({"type": "none"}));
+        let mut options = ConverterOptions::default();
+        options.conversion.tool_choice_steering = BodyStageState::Disabled;
+
+        let result = convert_request_with_options(&req, options).unwrap();
+        let context = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context;
+
+        assert_eq!(context.tools.len(), 2);
+        assert!(
+            result
+                .conversation_state
+                .history
+                .iter()
+                .all(|message| !matches!(
+                    message,
+                    Message::User(user)
+                        if user.user_input_message.content.contains("<tool_choice>")
+                ))
+        );
     }
 
     #[test]
@@ -4298,6 +2027,50 @@ mod tests {
     }
 
     #[test]
+    fn test_native_reasoning_fields_can_be_disabled_by_conversion_plan() {
+        use crate::anthropic::body_capabilities::BodyStageState;
+
+        use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
+
+        let req = MessagesRequest {
+            model: "claude-opus-4-7-thinking".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 0,
+            }),
+            output_config: Some(OutputConfig {
+                effort: "xhigh".to_string(),
+            }),
+            metadata: None,
+        };
+        let mut options = ConverterOptions::default();
+        options.conversion.native_reasoning_fields = BodyStageState::Disabled;
+
+        let result = convert_request_with_options(&req, options)
+            .expect("request should convert without native reasoning fields");
+
+        assert!(result.additional_model_request_fields.is_none());
+        assert!(result.conversation_state.history.iter().any(|message| {
+            match message {
+                Message::User(user) => user
+                    .user_input_message
+                    .content
+                    .contains("<thinking_mode>adaptive"),
+                _ => false,
+            }
+        }));
+    }
+
+    #[test]
     fn test_force_visible_thinking_adds_policy_for_adaptive_request() {
         use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
 
@@ -4984,7 +2757,9 @@ mod tests {
         };
 
         let mut tool_name_map = HashMap::new();
-        let result = convert_assistant_message(&msg, &mut tool_name_map).expect("应该成功转换");
+        let result =
+            convert_assistant_message(&msg, &mut tool_name_map, ConverterOptions::default())
+                .expect("应该成功转换");
 
         // 验证 content 不为空（使用占位符）
         assert!(
@@ -5028,7 +2803,9 @@ mod tests {
         };
 
         let mut tool_name_map = HashMap::new();
-        let result = convert_assistant_message(&msg, &mut tool_name_map).expect("convert");
+        let result =
+            convert_assistant_message(&msg, &mut tool_name_map, ConverterOptions::default())
+                .expect("convert");
         let tool_uses = result
             .assistant_response_message
             .tool_uses
@@ -5060,7 +2837,9 @@ mod tests {
         ]);
 
         let mut tool_name_map = HashMap::new();
-        let assistant = convert_assistant_message(&assistant, &mut tool_name_map).expect("convert");
+        let assistant =
+            convert_assistant_message(&assistant, &mut tool_name_map, ConverterOptions::default())
+                .expect("convert");
         let (_, _, tool_results) = process_message_content(&user_content).expect("process");
 
         assert_eq!(
@@ -5085,7 +2864,9 @@ mod tests {
         };
 
         let mut tool_name_map = HashMap::new();
-        let result = convert_assistant_message(&msg, &mut tool_name_map).expect("convert");
+        let result =
+            convert_assistant_message(&msg, &mut tool_name_map, ConverterOptions::default())
+                .expect("convert");
         let tool_uses = result
             .assistant_response_message
             .tool_uses
@@ -5259,7 +3040,9 @@ mod tests {
         };
 
         let mut tool_name_map = HashMap::new();
-        let result = convert_assistant_message(&msg, &mut tool_name_map).expect("应该成功转换");
+        let result =
+            convert_assistant_message(&msg, &mut tool_name_map, ConverterOptions::default())
+                .expect("应该成功转换");
 
         // 验证 content 使用原始文本（不是占位符）
         assert_eq!(
@@ -5376,7 +3159,9 @@ mod tests {
         };
 
         let messages: Vec<&AnthropicMessage> = vec![&msg1, &msg2];
-        let result = merge_assistant_messages(&messages, &mut HashMap::new()).expect("合并应成功");
+        let result =
+            merge_assistant_messages(&messages, &mut HashMap::new(), ConverterOptions::default())
+                .expect("合并应成功");
 
         let content = &result.assistant_response_message.content;
         assert!(content.contains("<thinking>"), "应包含 thinking 标签");

@@ -34,5 +34,6 @@ esac
 echo "Starting $target frontend from $dir"
 echo "Preview: $url"
 echo "API proxy: $api_target"
+echo "Debug backend UI entry redirects here when the backend is built with cargo run."
 
 exec env VITE_API_PROXY_TARGET="$api_target" pnpm --dir "$dir" dev

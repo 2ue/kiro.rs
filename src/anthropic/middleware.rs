@@ -15,10 +15,10 @@ use crate::common::auth::RequestApiKeyStore;
 use crate::external_pool::ExternalPoolManager;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
-    CachePolicyConfig, CompatProfile, ExternalPoolsConfig, ImageProcessingConfig,
-    ModelMappingConfig, ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig,
-    PromptCacheCreationControlConfig, PromptCacheSimulationMode, ReportedUsageConfig,
-    ThinkingTriggerMode, normalize_defined_cache_routes,
+    BodyConversionConfig, CachePolicyConfig, CompatProfile, ExternalPoolsConfig,
+    ImageProcessingConfig, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
+    PayloadShapingConfig, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
+    ReportedUsageConfig, ThinkingTriggerMode, normalize_defined_cache_routes,
 };
 
 use super::{
@@ -112,6 +112,8 @@ pub struct AppState {
     pub kiro_upstream_stream_idle_timeout_secs: u64,
     /// 多模态图片/文件预处理配置
     pub image_processing: ImageProcessingConfig,
+    /// 本地 Anthropic -> Kiro 转换能力配置
+    pub body_conversion: BodyConversionConfig,
     /// payload shaping 配置
     pub payload_shaping: PayloadShapingConfig,
     /// 外部备用号池和直连策略配置。
@@ -172,6 +174,7 @@ impl AppState {
             kiro_cache_point_record_plan: true,
             kiro_upstream_stream_idle_timeout_secs: 180,
             image_processing: ImageProcessingConfig::default(),
+            body_conversion: BodyConversionConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
             external_pools: ExternalPoolsConfig::default(),
             external_pool_manager: None,
@@ -276,6 +279,7 @@ impl AppState {
         kiro_cache_point_record_plan: bool,
         kiro_upstream_stream_idle_timeout_secs: u64,
         image_processing: ImageProcessingConfig,
+        body_conversion: BodyConversionConfig,
         payload_shaping: PayloadShapingConfig,
     ) -> Self {
         self.payload_guard_enabled = enabled;
@@ -289,6 +293,7 @@ impl AppState {
         self.kiro_cache_point_record_plan = kiro_cache_point_record_plan;
         self.kiro_upstream_stream_idle_timeout_secs = kiro_upstream_stream_idle_timeout_secs;
         self.image_processing = image_processing.normalized();
+        self.body_conversion = body_conversion;
         self.payload_shaping = payload_shaping;
         self
     }

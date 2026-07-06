@@ -596,6 +596,8 @@ impl ExternalLatencyTraceState {
     fn snapshot(&self) -> Option<UsageLatencyTrace> {
         let first_output_delta_ms = load_nonzero(&self.first_output_delta_ms);
         let trace = UsageLatencyTrace {
+            capacity_weight_units: None,
+            estimated_input_tokens: None,
             payload_guard_ms: None,
             upstream_header_ms: load_nonzero(&self.upstream_header_ms),
             first_upstream_chunk_ms: load_nonzero(&self.first_upstream_chunk_ms),

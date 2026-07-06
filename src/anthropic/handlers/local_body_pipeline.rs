@@ -1,4 +1,5 @@
 use super::*;
+use crate::anthropic::body_capabilities::{BodyStageState, LocalKiroBodyPlan};
 
 pub(super) struct PreparedLocalKiroBody {
     pub(super) request_body: String,
@@ -24,11 +25,36 @@ pub(super) fn prepare(
     cache_route: &ResolvedCacheRoutePolicy,
     model_resolution: &ModelResolution,
 ) -> Result<PreparedLocalKiroBody, Response> {
+    let plan = LocalKiroBodyPlan::compatible_with_config(
+        runtime_config.initial_payload_guard_config(),
+        runtime_config.body_conversion,
+    );
+    prepare_with_plan(
+        endpoint,
+        payload,
+        runtime_config,
+        cache_route,
+        model_resolution,
+        plan,
+    )
+}
+
+pub(super) fn prepare_with_plan(
+    endpoint: &str,
+    payload: &MessagesRequest,
+    runtime_config: &RequestRuntimeConfig,
+    cache_route: &ResolvedCacheRoutePolicy,
+    model_resolution: &ModelResolution,
+    plan: LocalKiroBodyPlan,
+) -> Result<PreparedLocalKiroBody, Response> {
+    debug_assert_eq!(plan.profile.as_str(), "local_credential");
+    debug_assert_eq!(plan.conversion, BodyStageState::Enabled);
     let converter_prompt_cache_mode = prompt_cache_converter_mode_for_policy(&cache_route.policy);
     let conversion_result = match convert_request_with_resolved_model(
         payload,
         ConverterOptions {
             compat_profile: runtime_config.compat_profile,
+            conversion: plan.converter,
             prompt_cache_simulation_mode: converter_prompt_cache_mode,
             kiro_cache_point_enabled: cache_route.policy.cache_point.enabled,
             kiro_cache_point_tools_only: cache_route.policy.cache_point.tools_only,
@@ -53,24 +79,26 @@ pub(super) fn prepare(
     };
     let conversation_id = kiro_request.conversation_state.conversation_id.clone();
 
-    let too_long_retry = PayloadTooLongRetryRequest::new(
-        &kiro_request,
-        runtime_config,
-        endpoint,
-        &payload.model,
-        model_resolution.upstream_model.as_deref(),
-        &conversation_id,
-        should_expose_proxy_warnings(runtime_config)
-            .then(|| conversion_result.warnings.encode_header())
-            .flatten(),
-    );
-    let prepared_payload = match prepare_kiro_request_body(
-        &mut kiro_request,
-        runtime_config.initial_payload_guard_config(),
-    ) {
-        Ok(result) => result,
-        Err(err) => return Err(payload_guard_error_response(err)),
+    let too_long_retry = if plan.retry_payloads.is_enabled() {
+        PayloadTooLongRetryRequest::new(
+            &kiro_request,
+            runtime_config,
+            endpoint,
+            &payload.model,
+            model_resolution.upstream_model.as_deref(),
+            &conversation_id,
+            should_expose_proxy_warnings(runtime_config)
+                .then(|| conversion_result.warnings.encode_header())
+                .flatten(),
+        )
+    } else {
+        None
     };
+    let prepared_payload =
+        match prepare_kiro_request_body(&mut kiro_request, plan.payload_guard.config) {
+            Ok(result) => result,
+            Err(err) => return Err(payload_guard_error_response(err)),
+        };
     let request_body = prepared_payload.body;
     let payload_guard_report = prepared_payload.report;
     if let Some(report) = payload_guard_report.as_ref() {
@@ -82,10 +110,14 @@ pub(super) fn prepare(
             Some(&conversation_id),
         );
     }
-    let payload_breakdown = payload_guard_report.as_ref().and_then(|report| {
-        should_log_payload_byte_breakdown(report)
-            .then(|| breakdown_kiro_request(&kiro_request, &request_body))
-    });
+    let payload_breakdown = if plan.diagnostics.is_enabled() {
+        payload_guard_report.as_ref().and_then(|report| {
+            should_log_payload_byte_breakdown(report)
+                .then(|| breakdown_kiro_request(&kiro_request, &request_body))
+        })
+    } else {
+        None
+    };
     if let Some(report) = payload_guard_report.as_ref() {
         log_payload_byte_breakdown(
             payload_breakdown,
@@ -141,12 +173,16 @@ pub(super) fn prepare(
         "Kiro request body"
     );
 
-    let input_tokens = token::count_all_tokens(
-        &payload.model,
-        payload.system.as_deref(),
-        &payload.messages,
-        payload.tools.as_deref(),
-    ) as i32;
+    let input_tokens = if plan.token_counting.is_enabled() {
+        token::count_all_tokens(
+            &payload.model,
+            payload.system.as_deref(),
+            &payload.messages,
+            payload.tools.as_deref(),
+        ) as i32
+    } else {
+        0
+    };
     let thinking_enabled = payload
         .thinking
         .as_ref()
@@ -161,13 +197,17 @@ pub(super) fn prepare(
         None
     };
     let extract_xml_thinking = runtime_config.compat_profile.allows_unsigned_thinking();
-    let cache_point_retry = CachePointRetryRequest::new(
-        &kiro_request,
-        endpoint,
-        &payload.model,
-        model_resolution.upstream_model.as_deref(),
-        &conversation_id,
-    );
+    let cache_point_retry = if plan.retry_payloads.is_enabled() {
+        CachePointRetryRequest::new(
+            &kiro_request,
+            endpoint,
+            &payload.model,
+            model_resolution.upstream_model.as_deref(),
+            &conversation_id,
+        )
+    } else {
+        None
+    };
 
     Ok(PreparedLocalKiroBody {
         request_body,

@@ -43,8 +43,9 @@ use super::capacity::{
     credential_is_dispatch_candidate, credential_is_dispatchable,
     credential_is_temporarily_available, credential_is_usable_for_model,
     credential_proxy_availability, credential_proxy_is_dispatchable,
-    effective_max_concurrent_requests, entry_has_concurrency_capacity,
-    global_has_concurrency_capacity, is_opus_model, proxy_unavailable_error,
+    effective_max_concurrent_requests, effective_weight_for_limit, entry_has_concurrency_capacity,
+    global_has_concurrency_capacity, is_opus_model, normalize_capacity_weight_units,
+    proxy_unavailable_error,
 };
 #[cfg(test)]
 use super::concurrency::record_released_in_flight_lease_tombstone;
@@ -965,6 +966,7 @@ impl MultiTokenManager {
         let global_has_capacity = global_has_concurrency_capacity(
             global_in_flight,
             config.dispatch_global_max_concurrent_requests,
+            1,
         );
         let global_rpm = config.credential_rpm.unwrap_or(0);
         let mut reason_counts: BTreeMap<AccountRejectReason, usize> = BTreeMap::new();
@@ -990,6 +992,7 @@ impl MultiTokenManager {
             } else if !entry_has_concurrency_capacity(
                 entry,
                 config.credential_max_concurrent_requests,
+                1,
             ) {
                 waitable_account_count = waitable_account_count.saturating_add(1);
                 (AccountRejectReason::AccountConcurrencyFull, None)
@@ -1045,6 +1048,7 @@ impl MultiTokenManager {
         let global_has_capacity = global_has_concurrency_capacity(
             global_in_flight_requests,
             config.dispatch_global_max_concurrent_requests,
+            1,
         );
         let mut model_usable = 0usize;
         let mut usable = 0usize;
@@ -1097,7 +1101,7 @@ impl MultiTokenManager {
             }
 
             if !global_has_capacity
-                || !entry_has_concurrency_capacity(entry, max_concurrent_requests)
+                || !entry_has_concurrency_capacity(entry, max_concurrent_requests, 1)
             {
                 concurrency_blocked += 1;
                 continue;
@@ -1431,23 +1435,31 @@ impl MultiTokenManager {
         now: Instant,
         max_concurrent_requests: u32,
         global_max_concurrent_requests: u32,
+        request_weight_units: u32,
     ) -> bool {
         let mut entries = self.entries.lock();
         let global_in_flight: u32 = entries.iter().map(|entry| entry.in_flight_requests).sum();
-        if global_max_concurrent_requests > 0 && global_in_flight >= global_max_concurrent_requests
-        {
-            return false;
-        }
         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-            if !entry_has_concurrency_capacity(entry, max_concurrent_requests) {
+            let mut lease_weight_units =
+                effective_weight_for_limit(request_weight_units, max_concurrent_requests);
+            lease_weight_units =
+                effective_weight_for_limit(lease_weight_units, global_max_concurrent_requests);
+            if global_max_concurrent_requests > 0
+                && global_in_flight.saturating_add(lease_weight_units)
+                    > global_max_concurrent_requests
+            {
                 return false;
             }
-            entry.in_flight_requests = entry.in_flight_requests.saturating_add(1);
+            if !entry_has_concurrency_capacity(entry, max_concurrent_requests, lease_weight_units) {
+                return false;
+            }
+            entry.in_flight_requests = entry.in_flight_requests.saturating_add(lease_weight_units);
             entry.in_flight_leases.push(InFlightLease {
                 id: lease_id,
                 acquired_at: now,
                 last_seen_at: now,
                 kind: InFlightKind::Api,
+                weight_units: lease_weight_units,
             });
             return true;
         }
@@ -1599,7 +1611,11 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    async fn acquire_in_flight_slot(&self, id: u64) -> anyhow::Result<Option<InFlightLeaseGuard>> {
+    async fn acquire_in_flight_slot(
+        &self,
+        id: u64,
+        request_weight_units: u32,
+    ) -> anyhow::Result<Option<InFlightLeaseGuard>> {
         self.cleanup_expired_in_flight_leases_local_first();
         let max_concurrent_requests = self.max_concurrent_requests();
         let effective_max_concurrent_requests =
@@ -1620,6 +1636,7 @@ impl MultiTokenManager {
                             lease_id,
                             effective_max_concurrent_requests,
                             global_max_concurrent_requests,
+                            request_weight_units,
                             max_age,
                             InFlightKind::Api.as_str(),
                         )
@@ -1634,6 +1651,7 @@ impl MultiTokenManager {
                         now,
                         max_concurrent_requests,
                         global_max_concurrent_requests,
+                        request_weight_units,
                     ) {
                         self.invalidate_local_pool_route_state_cache();
                         return Ok(Some(InFlightLeaseGuard::new(
@@ -1646,6 +1664,7 @@ impl MultiTokenManager {
                             self.local_pool_route_state_cache.clone(),
                             id,
                             lease_id,
+                            request_weight_units,
                             false,
                         )));
                     }
@@ -1675,6 +1694,7 @@ impl MultiTokenManager {
             now,
             max_concurrent_requests,
             global_max_concurrent_requests,
+            request_weight_units,
         ) {
             self.invalidate_local_pool_route_state_cache();
             return Ok(Some(InFlightLeaseGuard::new(
@@ -1689,6 +1709,7 @@ impl MultiTokenManager {
                 self.local_pool_route_state_cache.clone(),
                 id,
                 lease_id,
+                request_weight_units,
                 late_redis_acquire_possible,
             )));
         }
@@ -1707,6 +1728,7 @@ impl MultiTokenManager {
             Instant::now(),
             max_concurrent_requests,
             global_max_concurrent_requests,
+            1,
         ) {
             self.invalidate_local_pool_route_state_cache();
             return Some(InFlightLeaseGuard::new(
@@ -1717,6 +1739,7 @@ impl MultiTokenManager {
                 self.local_pool_route_state_cache.clone(),
                 id,
                 lease_id,
+                1,
                 false,
             ));
         }
@@ -1789,17 +1812,23 @@ impl MultiTokenManager {
             let mut entries = self.entries.lock();
             for entry in entries.iter_mut() {
                 let before = entry.in_flight_leases.len();
-                entry
-                    .in_flight_leases
-                    .retain(|lease| now.saturating_duration_since(lease.last_seen_at) <= max_age);
+                let mut removed_weight = 0u32;
+                entry.in_flight_leases.retain(|lease| {
+                    let keep = now.saturating_duration_since(lease.last_seen_at) <= max_age;
+                    if !keep {
+                        removed_weight = removed_weight.saturating_add(lease.weight_units.max(1));
+                    }
+                    keep
+                });
                 let removed = before.saturating_sub(entry.in_flight_leases.len());
                 if removed > 0 {
                     cleaned += removed;
                     entry.in_flight_requests =
-                        entry.in_flight_requests.saturating_sub(removed as u32);
+                        entry.in_flight_requests.saturating_sub(removed_weight);
                     tracing::warn!(
                         credential_id = entry.id,
                         removed,
+                        removed_weight_units = removed_weight,
                         max_age_secs = max_age.as_secs(),
                         "清理超时未释放的凭据并发占用 lease"
                     );
@@ -1899,20 +1928,29 @@ impl MultiTokenManager {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == credential_id) {
                 let before = entry.in_flight_leases.len();
+                let mut removed_weight = 0u32;
                 match min_idle {
                     Some(min_idle) => {
                         entry.in_flight_leases.retain(|lease| {
-                            now.saturating_duration_since(lease.last_seen_at) < min_idle
+                            let keep = now.saturating_duration_since(lease.last_seen_at) < min_idle;
+                            if !keep {
+                                removed_weight =
+                                    removed_weight.saturating_add(lease.weight_units.max(1));
+                            }
+                            keep
                         });
                     }
                     None => {
+                        removed_weight = entry.in_flight_leases.iter().fold(0u32, |sum, lease| {
+                            sum.saturating_add(lease.weight_units.max(1))
+                        });
                         entry.in_flight_leases.clear();
                     }
                 }
                 cleared = before.saturating_sub(entry.in_flight_leases.len());
                 if cleared > 0 {
                     entry.in_flight_requests =
-                        entry.in_flight_requests.saturating_sub(cleared as u32);
+                        entry.in_flight_requests.saturating_sub(removed_weight);
                 }
             }
         }
@@ -2063,6 +2101,7 @@ impl MultiTokenManager {
                     now,
                     max_concurrent_requests,
                     global_rpm,
+                    1,
                 )
         })
     }
@@ -2072,6 +2111,7 @@ impl MultiTokenManager {
         &self,
         model: Option<&str>,
         excluded_ids: &HashSet<u64>,
+        request_weight_units: u32,
     ) -> Option<(u64, KiroCredentials)> {
         if let Err(err) = self.refresh_scheduler_state_from_redis() {
             tracing::warn!("选择凭据前同步 Redis 调度状态失败: {}", err);
@@ -2090,6 +2130,7 @@ impl MultiTokenManager {
         let global_has_capacity = global_has_concurrency_capacity(
             global_in_flight,
             config.dispatch_global_max_concurrent_requests,
+            request_weight_units,
         );
 
         let mut available = Vec::new();
@@ -2108,6 +2149,7 @@ impl MultiTokenManager {
                         now,
                         max_concurrent_requests,
                         global_rpm,
+                        request_weight_units,
                     )
                 {
                     continue;
@@ -2180,6 +2222,7 @@ impl MultiTokenManager {
         session_id: &str,
         model: Option<&str>,
         excluded_ids: &HashSet<u64>,
+        request_weight_units: u32,
     ) -> Option<(u64, KiroCredentials)> {
         if let Err(err) = self.refresh_scheduler_state_from_redis() {
             tracing::warn!("读取会话绑定前同步 Redis 调度状态失败: {}", err);
@@ -2213,6 +2256,7 @@ impl MultiTokenManager {
                         now,
                         max_concurrent_requests,
                         global_rpm,
+                        request_weight_units,
                     )
             })
             .map(|e| (e.id, e.credentials.clone()))
@@ -2342,6 +2386,7 @@ impl MultiTokenManager {
             session_id,
             excluded_ids,
             AcquireMode::WaitForCapacity,
+            1,
         )
         .await
     }
@@ -2357,7 +2402,9 @@ impl MultiTokenManager {
         session_id: Option<&str>,
         excluded_ids: &HashSet<u64>,
         acquire_mode: AcquireMode,
+        request_weight_units: u32,
     ) -> anyhow::Result<CallContext> {
+        let request_weight_units = normalize_capacity_weight_units(request_weight_units);
         enum AcquireDecision {
             Selected(u64, KiroCredentials, bool, bool),
             WaitForDispatch {
@@ -2390,8 +2437,9 @@ impl MultiTokenManager {
 
             let decision = {
                 let existing_bound_id = session_id.and_then(|sid| self.bound_credential_id(sid));
-                let bound_hit = session_id
-                    .and_then(|sid| self.get_bound_credential(sid, model, &local_excluded_ids));
+                let bound_hit = session_id.and_then(|sid| {
+                    self.get_bound_credential(sid, model, &local_excluded_ids, request_weight_units)
+                });
 
                 if let Some(hit) = bound_hit {
                     AcquireDecision::Selected(hit.0, hit.1, true, false)
@@ -2399,14 +2447,20 @@ impl MultiTokenManager {
                     let fallback_from_sticky = existing_bound_id.is_some();
                     {
                         // 根据负载均衡策略选择；priority 模式也会在同优先级账号之间优先低并发。
-                        let mut best =
-                            self.select_next_credential_excluding(model, &local_excluded_ids);
+                        let mut best = self.select_next_credential_excluding(
+                            model,
+                            &local_excluded_ids,
+                            request_weight_units,
+                        );
 
                         // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                         if best.is_none() {
                             if self.auto_heal_too_many_failures_if_applicable() {
-                                best = self
-                                    .select_next_credential_excluding(model, &local_excluded_ids);
+                                best = self.select_next_credential_excluding(
+                                    model,
+                                    &local_excluded_ids,
+                                    request_weight_units,
+                                );
                             }
                         }
 
@@ -2438,6 +2492,7 @@ impl MultiTokenManager {
                             let global_has_capacity = global_has_concurrency_capacity(
                                 global_in_flight,
                                 config.dispatch_global_max_concurrent_requests,
+                                request_weight_units,
                             );
                             let model_usable = entries
                                 .iter()
@@ -2475,6 +2530,7 @@ impl MultiTokenManager {
                                                 now,
                                                 max_concurrent_requests,
                                                 global_rpm,
+                                                request_weight_units,
                                             )
                                     })
                                     .count()
@@ -2599,6 +2655,7 @@ impl MultiTokenManager {
                                     max_concurrent_requests,
                                     global_rpm,
                                     global_has_capacity,
+                                    request_weight_units,
                                 );
                                 if concurrency_blocked > 0
                                     && concurrency_blocked >= dispatch_candidate_count
@@ -2701,7 +2758,10 @@ impl MultiTokenManager {
                 }
             };
 
-            let Some(in_flight_lease) = self.acquire_in_flight_slot(id).await? else {
+            let Some(in_flight_lease) = self
+                .acquire_in_flight_slot(id, request_weight_units)
+                .await?
+            else {
                 if acquire_mode.is_fail_fast() {
                     local_excluded_ids.insert(id);
                     attempt_count += 1;
@@ -2767,7 +2827,7 @@ impl MultiTokenManager {
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials, true).await {
                 Ok(ctx) => {
-                    self.record_scheduler_selection(ctx.id);
+                    self.record_scheduler_selection(ctx.id, request_weight_units);
                     if let Err(err) = self.mark_rate_limited_at(ctx.id, Instant::now()) {
                         drop(in_flight_lease);
                         return Err(err);
@@ -3820,12 +3880,13 @@ impl MultiTokenManager {
         self.invalidate_local_pool_route_state_cache();
     }
 
-    fn record_scheduler_selection(&self, id: u64) {
+    fn record_scheduler_selection(&self, id: u64, request_weight_units: u32) {
+        let request_weight_units = normalize_capacity_weight_units(request_weight_units);
         let now = Instant::now();
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
-                record_local_selection(entry, now);
+                record_local_selection(entry, now, request_weight_units);
             }
         }
         if let Some(redis) = &self.redis_store {
@@ -3840,7 +3901,9 @@ impl MultiTokenManager {
                     .unwrap_or(global_rpm)
             };
             spawn_best_effort_storage_task("记录 Redis 调度选中次数", async move {
-                redis.record_scheduler_selection(id, rpm).await?;
+                redis
+                    .record_scheduler_selection(id, rpm, request_weight_units)
+                    .await?;
                 Ok(())
             });
         }
@@ -4119,6 +4182,7 @@ impl MultiTokenManager {
                         Instant::now(),
                         max_concurrent_requests,
                         global_rpm,
+                        1,
                     )
             })
         };
@@ -4630,6 +4694,7 @@ impl MultiTokenManager {
                     now,
                     max_concurrent_requests,
                     global_rpm,
+                    1,
                 )
             })
             .collect();
@@ -4786,6 +4851,7 @@ impl MultiTokenManager {
                     now,
                     max_concurrent_requests,
                     global_rpm,
+                    1,
                 )
             })
             .collect();
@@ -5918,6 +5984,7 @@ mod tests {
                 acquired_at: now,
                 last_seen_at: now,
                 kind: InFlightKind::Stream,
+                weight_units: 1,
             });
         }
 
@@ -5951,6 +6018,7 @@ mod tests {
             acquired_at_ms: now_ms - 5_000,
             last_seen_at_ms: now_ms - 5_000,
             kind: InFlightKind::Api.as_str().to_string(),
+            weight_units: 1,
         };
 
         let mut states = HashMap::new();
@@ -5977,6 +6045,7 @@ mod tests {
                 acquired_at: now,
                 last_seen_at: now,
                 kind: InFlightKind::Stream,
+                weight_units: 1,
             });
         }
 
@@ -6024,6 +6093,7 @@ mod tests {
                     acquired_at_ms: now_ms,
                     last_seen_at_ms: now_ms,
                     kind: InFlightKind::Api.as_str().to_string(),
+                    weight_units: 1,
                 }],
                 ..Default::default()
             },
@@ -6044,6 +6114,7 @@ mod tests {
                     acquired_at_ms: now_ms,
                     last_seen_at_ms: now_ms,
                     kind: InFlightKind::Api.as_str().to_string(),
+                    weight_units: 1,
                 }],
                 ..Default::default()
             },
@@ -8178,6 +8249,7 @@ mod tests {
                 None,
                 &HashSet::new(),
                 AcquireMode::FailFastOnCapacity,
+                1,
             )
             .await
             .err()
@@ -8193,6 +8265,176 @@ mod tests {
         assert_eq!(snapshot.global_in_flight_requests, 1);
         assert_eq!(snapshot.queued_requests, 0);
         first.release_in_flight();
+    }
+
+    #[tokio::test]
+    async fn test_weighted_local_capacity_consumes_single_credential_slots() {
+        let mut config = Config::default();
+        config.credential_max_concurrent_requests = 4;
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![test_access_token_credential("weighted", "Pro")],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut first = manager
+            .acquire_context_for_session_with_mode(
+                None,
+                None,
+                &HashSet::new(),
+                AcquireMode::FailFastOnCapacity,
+                4,
+            )
+            .await
+            .unwrap();
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.entries[0].in_flight_requests, 4);
+        assert_eq!(snapshot.global_in_flight_requests, 4);
+
+        let err = manager
+            .acquire_context_for_session_with_mode(
+                None,
+                None,
+                &HashSet::new(),
+                AcquireMode::FailFastOnCapacity,
+                1,
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("本地账号调度容量暂不可用"),
+            "单账号 weighted 容量满应直接返回容量错误，实际: {err}"
+        );
+
+        first.release_in_flight();
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.entries[0].in_flight_requests, 0);
+        assert_eq!(snapshot.global_in_flight_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn test_weighted_local_capacity_consumes_global_slots() {
+        let mut config = Config::default();
+        config.credential_max_concurrent_requests = 8;
+        config.dispatch_global_max_concurrent_requests = 4;
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                test_access_token_credential("weighted-a", "Pro"),
+                test_access_token_credential("weighted-b", "Pro"),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut first = manager
+            .acquire_context_for_session_with_mode(
+                None,
+                None,
+                &HashSet::new(),
+                AcquireMode::FailFastOnCapacity,
+                4,
+            )
+            .await
+            .unwrap();
+        assert_eq!(manager.snapshot().global_in_flight_requests, 4);
+
+        let err = manager
+            .acquire_context_for_session_with_mode(
+                None,
+                None,
+                &HashSet::new(),
+                AcquireMode::FailFastOnCapacity,
+                1,
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("本地账号调度容量暂不可用"),
+            "全局 weighted 容量满应直接返回容量错误，实际: {err}"
+        );
+
+        first.release_in_flight();
+        assert_eq!(manager.snapshot().global_in_flight_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn test_weighted_selection_pressure_counts_capacity_units_not_total_requests() {
+        let mut config = Config::default();
+        config.credential_max_concurrent_requests = 8;
+        config.scheduler_selection_pressure_weight = 25.0;
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![test_access_token_credential("weighted-selection", "Pro")],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut ctx = manager
+            .acquire_context_for_session_with_mode(
+                None,
+                None,
+                &HashSet::new(),
+                AcquireMode::FailFastOnCapacity,
+                4,
+            )
+            .await
+            .unwrap();
+        ctx.release_in_flight();
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.entries[0].scheduler_selection_count, 1);
+        assert_eq!(snapshot.entries[0].recent_scheduler_selection_count_10s, 4);
+        assert_eq!(snapshot.entries[0].recent_scheduler_selection_count_60s, 4);
+        assert_eq!(snapshot.entries[0].recent_scheduler_selection_count_5m, 4);
+    }
+
+    #[tokio::test]
+    async fn test_weighted_rpm_consumes_capacity_units() {
+        let mut config = Config::default();
+        config.credential_rpm = Some(4);
+        config.credential_max_concurrent_requests = 8;
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![test_access_token_credential("weighted-rpm", "Pro")],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut ctx = manager
+            .acquire_context_for_session_with_mode(
+                None,
+                None,
+                &HashSet::new(),
+                AcquireMode::FailFastOnCapacity,
+                4,
+            )
+            .await
+            .unwrap();
+        ctx.release_in_flight();
+
+        let state = manager.local_pool_route_state(None);
+        assert_eq!(state.kind, LocalPoolRouteStateKind::AllCoolingDown);
+        assert_eq!(state.rate_limit_blocked, 1);
+        assert!(manager.snapshot().entries[0].rate_limited);
     }
 
     #[test]
@@ -8804,6 +9046,7 @@ mod tests {
                 None,
                 &HashSet::new(),
                 AcquireMode::FailFastOnCapacity,
+                1,
             )
             .await
             .expect("fail-fast should reselect another credential when the selected slot is full");

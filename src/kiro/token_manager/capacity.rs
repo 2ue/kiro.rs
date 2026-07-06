@@ -30,12 +30,13 @@ pub(super) fn credential_is_dispatchable(
     now: Instant,
     max_concurrent_requests: u32,
     global_rpm: u32,
+    request_weight_units: u32,
 ) -> bool {
     credential_is_usable_for_model(entry, model)
         && credential_proxy_is_dispatchable(&entry.credentials, proxy_resources)
         && entry_cooldown_remaining(entry, model, now).is_none()
         && entry_rate_limit_remaining(entry, global_rpm, now).is_none()
-        && entry_has_concurrency_capacity(entry, max_concurrent_requests)
+        && entry_has_concurrency_capacity(entry, max_concurrent_requests, request_weight_units)
 }
 
 pub(super) fn credential_is_temporarily_available(
@@ -124,12 +125,33 @@ pub(super) fn effective_max_concurrent_requests(
 pub(super) fn entry_has_concurrency_capacity(
     entry: &CredentialEntry,
     global_max_concurrent_requests: u32,
+    request_weight_units: u32,
 ) -> bool {
     let max_concurrent_requests =
         effective_max_concurrent_requests(entry, global_max_concurrent_requests);
-    max_concurrent_requests == 0 || entry.in_flight_requests < max_concurrent_requests
+    let request_weight_units =
+        effective_weight_for_limit(request_weight_units, max_concurrent_requests);
+    max_concurrent_requests == 0
+        || entry
+            .in_flight_requests
+            .saturating_add(request_weight_units)
+            <= max_concurrent_requests
 }
 
-pub(super) fn global_has_concurrency_capacity(global_in_flight: u32, global_max: u32) -> bool {
-    global_max == 0 || global_in_flight < global_max
+pub(super) fn global_has_concurrency_capacity(
+    global_in_flight: u32,
+    global_max: u32,
+    request_weight_units: u32,
+) -> bool {
+    let request_weight_units = effective_weight_for_limit(request_weight_units, global_max);
+    global_max == 0 || global_in_flight.saturating_add(request_weight_units) <= global_max
+}
+
+pub(super) fn normalize_capacity_weight_units(value: u32) -> u32 {
+    value.clamp(1, 64)
+}
+
+pub(super) fn effective_weight_for_limit(request_weight_units: u32, limit: u32) -> u32 {
+    let weight = normalize_capacity_weight_units(request_weight_units);
+    if limit > 0 { weight.min(limit) } else { weight }
 }

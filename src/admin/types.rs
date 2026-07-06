@@ -4,10 +4,11 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::anthropic::pricing::ModelPricing;
 use crate::model::config::{
-    CachePolicyConfig, CompatProfile, CompressionConfig, ExternalPoolsConfig,
+    BodyConversionConfig, CachePolicyConfig, CompatProfile, CompressionConfig, ExternalPoolsConfig,
     ImageProcessingConfig, KiroAgentModeStrategy, ModelMappingConfig, ModelResolutionMode,
     PayloadGuardMode, PayloadShapingConfig, PayloadShapingConfigPatch,
     PromptCacheCreationControlConfig, ReportedUsageConfig, ThinkingTriggerMode,
+    WeightedCapacityConfig,
 };
 
 // ============ 凭据状态 ============
@@ -1323,6 +1324,7 @@ pub struct RuntimeConfigResponse {
     pub credential_in_flight_lease_max_secs: u64,
     pub dispatch_global_max_concurrent_requests: u32,
     pub dispatch_max_queued_requests: u32,
+    pub weighted_capacity: WeightedCapacityConfig,
     pub credential_warmup_requests: u32,
     pub credential_warmup_selection_percent: u32,
     pub credential_warmup_max_selection_percent: u32,
@@ -1340,6 +1342,7 @@ pub struct RuntimeConfigResponse {
     pub compression_enabled: bool,
     pub whitespace_compression: bool,
     pub image_processing: ImageProcessingConfig,
+    pub body_conversion: BodyConversionConfig,
     pub payload_guard_enabled: bool,
     pub payload_guard_mode: PayloadGuardMode,
     pub payload_guard_max_bytes: u64,
@@ -1415,6 +1418,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub dispatch_global_max_concurrent_requests: Option<u32>,
     #[serde(default)]
     pub dispatch_max_queued_requests: Option<u32>,
+    #[serde(default)]
+    pub weighted_capacity: Option<WeightedCapacityConfig>,
     pub credential_warmup_requests: u32,
     #[serde(default)]
     pub credential_warmup_selection_percent: Option<u32>,
@@ -1447,6 +1452,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub whitespace_compression: bool,
     #[serde(default)]
     pub image_processing: Option<ImageProcessingConfig>,
+    #[serde(default)]
+    pub body_conversion: Option<BodyConversionConfig>,
     #[serde(default)]
     pub payload_guard_enabled: Option<bool>,
     #[serde(default)]

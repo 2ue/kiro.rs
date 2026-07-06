@@ -447,6 +447,7 @@ async fn main() {
         config.kiro_cache_point_record_plan,
         config.kiro_upstream_stream_idle_timeout_secs,
         config.image_processing.normalized(),
+        config.body_conversion,
         config.payload_shaping,
         config.external_pools.clone(),
         config.tool_format_debug.clone(),

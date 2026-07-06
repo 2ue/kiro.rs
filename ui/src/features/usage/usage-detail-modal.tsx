@@ -196,12 +196,26 @@ export function UsageDetailModal({
                 <MetricTile label="上游响应头" value={formatLatency(record.latencyTrace.upstreamHeaderMs)} />
                 <MetricTile label="首个流分片" value={formatLatency(record.latencyTrace.firstUpstreamChunkMs)} />
                 <MetricTile label="首次输出" value={formatLatency(record.latencyTrace.firstOutputDeltaMs)} tone="success" />
+                <MetricTile label="首次思考" value={formatLatency(record.latencyTrace.firstThinkingDeltaMs)} />
+                <MetricTile label="首次可见文本" value={formatLatency(record.latencyTrace.firstVisibleTextDeltaMs)} tone="success" />
                 <MetricTile label="分片到输出" value={formatLatency(record.latencyTrace.streamGapToFirstOutputMs)} />
+                {typeof record.latencyTrace.capacityWeightUnits === 'number' && (
+                  <MetricTile label="本地容量权重" value={`${formatNumber(record.latencyTrace.capacityWeightUnits)} 单位`} tone="info" />
+                )}
+                {typeof record.latencyTrace.estimatedInputTokens === 'number' && (
+                  <MetricTile label="权重估算输入" value={`${formatNumber(record.latencyTrace.estimatedInputTokens)} token`} />
+                )}
                 {typeof record.latencyTrace.chunksBeforeFirstOutput === 'number' && (
                   <MetricTile label="输出前分片" value={formatNumber(record.latencyTrace.chunksBeforeFirstOutput)} />
                 )}
                 {typeof record.latencyTrace.eventsBeforeFirstOutput === 'number' && (
                   <MetricTile label="输出前事件" value={formatNumber(record.latencyTrace.eventsBeforeFirstOutput)} />
+                )}
+                {typeof record.latencyTrace.clientDroppedMs === 'number' && (
+                  <MetricTile label="客户端断开" value={formatLatency(record.latencyTrace.clientDroppedMs)} />
+                )}
+                {record.latencyTrace.terminalReason && (
+                  <MetricTile label="结束原因" value={record.latencyTrace.terminalReason} />
                 )}
               </>
             )}

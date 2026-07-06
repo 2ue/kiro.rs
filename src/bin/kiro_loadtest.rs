@@ -110,6 +110,9 @@ enum Scenario {
     NormalStream,
     NormalNonStream,
     SlowFirstByte,
+    RandomSlowFirstByte,
+    DenseSlowFirstByte,
+    TieredSlowFirstByte,
     SlowThinkingThenText,
     StreamIdleTimeout,
     JsonException200,
@@ -122,6 +125,7 @@ enum Scenario {
     MalformedSse,
     ClientDrop,
     RecoveryAfterBurst,
+    MixedChaos,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
@@ -1342,16 +1346,14 @@ async fn fake_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let request_id = format!(
-        "fake_req_{}",
-        state.counter.fetch_add(1, Ordering::Relaxed) + 1
-    );
+    let sequence = state.counter.fetch_add(1, Ordering::Relaxed) + 1;
+    let request_id = format!("fake_req_{}", sequence);
     let request = serde_json::from_slice::<Value>(&body).unwrap_or_else(|_| json!({}));
     let stream = request
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or_else(|| wants_stream(&headers) || wants_kiro_eventstream(&state, &uri));
-    let scenario = effective_fake_scenario(&state);
+    let scenario = effective_fake_scenario(&state, sequence);
     capture_fake_request(&state, &request_id, &uri, &headers, &request).await;
     let thinking = body_requests_thinking(&request);
 
@@ -1453,6 +1455,45 @@ async fn fake_handler(
                 fake_json_message(&request_id)
             }
         }
+        Scenario::RandomSlowFirstByte => {
+            let delay = random_slow_first_byte_delay(state.delay, sequence);
+            if stream {
+                if state.kiro_eventstream {
+                    kiro_eventstream_response(request_id, normal_kiro_events(delay, thinking))
+                } else {
+                    sse_response(request_id, normal_sse_events(delay, thinking))
+                }
+            } else {
+                sleep(delay).await;
+                fake_json_message(&request_id)
+            }
+        }
+        Scenario::DenseSlowFirstByte => {
+            let delay = dense_slow_first_byte_delay(state.delay, sequence);
+            if stream {
+                if state.kiro_eventstream {
+                    kiro_eventstream_response(request_id, normal_kiro_events(delay, thinking))
+                } else {
+                    sse_response(request_id, normal_sse_events(delay, thinking))
+                }
+            } else {
+                sleep(delay).await;
+                fake_json_message(&request_id)
+            }
+        }
+        Scenario::TieredSlowFirstByte => {
+            let delay = tiered_slow_first_byte_delay(sequence);
+            if stream {
+                if state.kiro_eventstream {
+                    kiro_eventstream_response(request_id, normal_kiro_events(delay, thinking))
+                } else {
+                    sse_response(request_id, normal_sse_events(delay, thinking))
+                }
+            } else {
+                sleep(delay).await;
+                fake_json_message(&request_id)
+            }
+        }
         Scenario::SlowThinkingThenText => {
             if stream {
                 if state.kiro_eventstream {
@@ -1537,10 +1578,42 @@ async fn fake_handler(
                 fake_json_message(&request_id)
             }
         }
+        Scenario::MixedChaos => unreachable!("mixed chaos resolves to a concrete scenario"),
     }
 }
 
-fn effective_fake_scenario(state: &FakeServerState) -> Scenario {
+fn random_slow_first_byte_delay(base: Duration, sequence: u64) -> Duration {
+    let max_ms = base.as_millis().clamp(1, u64::MAX as u128) as u64;
+    let mixed = sequence
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    if mixed % 4 == 0 {
+        return Duration::ZERO;
+    }
+    let min_ms = max_ms.min(50);
+    let spread = max_ms.saturating_sub(min_ms).max(1);
+    Duration::from_millis(min_ms + (mixed % spread))
+}
+
+fn dense_slow_first_byte_delay(base: Duration, sequence: u64) -> Duration {
+    let base_ms = base.as_millis().clamp(1, u64::MAX as u128) as u64;
+    let jitter_cap = (base_ms / 5).clamp(1, 250);
+    let jitter = sequence.wrapping_mul(1103515245).wrapping_add(12345) % jitter_cap;
+    Duration::from_millis(base_ms.saturating_add(jitter))
+}
+
+fn tiered_slow_first_byte_delay(sequence: u64) -> Duration {
+    match sequence % 3 {
+        1 => Duration::from_secs(3),
+        2 => Duration::from_secs(10),
+        _ => Duration::from_secs(22),
+    }
+}
+
+fn effective_fake_scenario(state: &FakeServerState, sequence: u64) -> Scenario {
+    if state.scenario == Scenario::MixedChaos {
+        return mixed_chaos_scenario(sequence);
+    }
     if state.scenario != Scenario::RecoveryAfterBurst {
         return state.scenario;
     }
@@ -1549,6 +1622,17 @@ fn effective_fake_scenario(state: &FakeServerState) -> Scenario {
         Scenario::ServerError500
     } else {
         Scenario::NormalStream
+    }
+}
+
+fn mixed_chaos_scenario(sequence: u64) -> Scenario {
+    match sequence % 12 {
+        0 => Scenario::RateLimit429,
+        1 => Scenario::ServerError500,
+        2 | 3 => Scenario::TieredSlowFirstByte,
+        4 | 5 => Scenario::LongStream,
+        6 => Scenario::RandomSlowFirstByte,
+        _ => Scenario::NormalStream,
     }
 }
 
@@ -2233,6 +2317,54 @@ mod tests {
         });
 
         assert!(body_requests_thinking(&request));
+    }
+
+    #[test]
+    fn random_slow_first_byte_has_fast_and_slow_samples() {
+        let base = Duration::from_millis(1_500);
+        let samples: Vec<Duration> = (1..=16)
+            .map(|index| random_slow_first_byte_delay(base, index))
+            .collect();
+
+        assert!(samples.iter().any(|value| value.is_zero()));
+        assert!(
+            samples
+                .iter()
+                .any(|value| *value >= Duration::from_millis(50))
+        );
+        assert!(samples.iter().all(|value| *value <= base));
+    }
+
+    #[test]
+    fn dense_slow_first_byte_delays_every_sample() {
+        let base = Duration::from_millis(1_500);
+        let samples: Vec<Duration> = (1..=16)
+            .map(|index| dense_slow_first_byte_delay(base, index))
+            .collect();
+
+        assert!(samples.iter().all(|value| *value >= base));
+        assert!(samples.iter().any(|value| *value > base));
+    }
+
+    #[test]
+    fn tiered_slow_first_byte_covers_seconds_ten_and_twenty_plus_seconds() {
+        let samples: Vec<Duration> = (1..=6).map(tiered_slow_first_byte_delay).collect();
+
+        assert!(samples.contains(&Duration::from_secs(3)));
+        assert!(samples.contains(&Duration::from_secs(10)));
+        assert!(samples.contains(&Duration::from_secs(22)));
+    }
+
+    #[test]
+    fn mixed_chaos_includes_success_slow_long_and_errors() {
+        let scenarios: Vec<Scenario> = (1..=24).map(mixed_chaos_scenario).collect();
+
+        assert!(scenarios.contains(&Scenario::RateLimit429));
+        assert!(scenarios.contains(&Scenario::ServerError500));
+        assert!(scenarios.contains(&Scenario::TieredSlowFirstByte));
+        assert!(scenarios.contains(&Scenario::RandomSlowFirstByte));
+        assert!(scenarios.contains(&Scenario::LongStream));
+        assert!(scenarios.contains(&Scenario::NormalStream));
     }
 
     #[test]

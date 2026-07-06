@@ -80,10 +80,12 @@ pub(super) fn prune_local_selection_events(entry: &mut CredentialEntry, now: Ins
         entry.selection_events.len().min(u32::MAX as usize) as u32;
 }
 
-pub(super) fn record_local_selection(entry: &mut CredentialEntry, now: Instant) {
+pub(super) fn record_local_selection(entry: &mut CredentialEntry, now: Instant, weight_units: u32) {
     entry.total_selection_count = entry.total_selection_count.saturating_add(1);
     entry.health.selection_count = entry.health.selection_count.saturating_add(1);
-    entry.selection_events.push_back(now);
+    for _ in 0..weight_units.clamp(1, 64) {
+        entry.selection_events.push_back(now);
+    }
     prune_local_selection_events(entry, now);
 }
 
