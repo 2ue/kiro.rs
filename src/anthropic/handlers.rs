@@ -53,11 +53,10 @@ use super::model_capabilities::{
 };
 use super::payload_guard::{
     PayloadByteBreakdown, PayloadGuardConfig, PayloadGuardError, PayloadGuardReport,
-    ToolUseFormatDiagnostics, breakdown_anthropic_messages_request, breakdown_kiro_request,
-    diagnose_kiro_tool_use_format, guard_kiro_request,
-    sanitize_anthropic_messages_for_external_forwarding, serialize_kiro_request,
+    ToolUseFormatDiagnostics, breakdown_kiro_request, diagnose_kiro_tool_use_format,
+    guard_kiro_request, serialize_kiro_request,
 };
-use super::payload_guard_runtime::{prepare_external_messages_payload, prepare_kiro_request_body};
+use super::payload_guard_runtime::prepare_kiro_request_body;
 use super::prompt_cache::{
     KiroRsToolPromptCachePlan, PromptCacheBounds, PromptCacheProfile, PromptCacheScope,
 };
@@ -978,13 +977,107 @@ async fn maybe_raw_external_direct_response(
         return None;
     }
 
-    let (model_hint, stream_hint) = raw_messages_body_hints(&raw_body);
+    let (model_hint, _) = raw_messages_body_hints(&raw_body);
     let reason = manager
         .direct_policy_reason(&config, endpoint, model_hint.as_deref().unwrap_or(""))
         .await?;
-    let policy = &cache_route.policy;
     let request_id = envelope::request_id();
-    let route = ExternalRouteRequest {
+    let route = raw_external_route_request(
+        state,
+        &runtime_config,
+        &cache_route,
+        headers,
+        raw_body,
+        endpoint,
+        request_id,
+        UsageRouteSubtype::ExternalDirectPolicy,
+        None,
+        Some(reason),
+        None,
+    );
+
+    Some(manager.forward_with_failover(config, route).await)
+}
+
+async fn maybe_raw_external_preflight_response(
+    state: &AppState,
+    headers: HeaderMap,
+    raw_body: Bytes,
+    endpoint: &str,
+) -> Option<Response> {
+    let provider = state.kiro_provider.as_ref()?.clone();
+    let manager = state.external_pool_manager.clone()?;
+    let runtime_config = request_runtime_config(state, &provider);
+    let cache_route = runtime_config.cache_policy_for_path(endpoint);
+    let config = runtime_config.external_pools.clone();
+    if !config.local_pool_preflight_enabled {
+        return None;
+    }
+    if !manager
+        .has_available_pool_for_body_mode(&config, ExternalPoolRequestBodyMode::RawPassthrough)
+        .await
+    {
+        return None;
+    }
+
+    let local_state = provider.local_pool_route_state(None);
+    if !local_state.kind.should_route_external() {
+        return None;
+    }
+    let Some(reason) = local_pool_route_fallback_reason(local_state.kind, &config) else {
+        return None;
+    };
+
+    let reason = reason.to_string();
+    let request_id = envelope::request_id();
+    tracing::warn!(
+        request_id,
+        reason = %reason,
+        local_total = local_state.total,
+        local_available = local_state.available,
+        local_dispatchable = local_state.dispatchable,
+        local_usable = local_state.usable,
+        retry_after_secs = ?local_state.retry_after_secs,
+        "local credential pool is not immediately schedulable; routing raw request directly to external pool before parsing body"
+    );
+    let route = raw_external_route_request(
+        state,
+        &runtime_config,
+        &cache_route,
+        headers,
+        raw_body,
+        endpoint,
+        request_id,
+        UsageRouteSubtype::ExternalFallbackPreflight,
+        Some(reason.clone()),
+        None,
+        Some(json!({
+            "reason": reason,
+            "state": local_state,
+            "preflightStage": "before_parse",
+            "requiredBodyMode": ExternalPoolRequestBodyMode::RawPassthrough.as_str(),
+        })),
+    );
+
+    Some(manager.forward_with_failover(config, route).await)
+}
+
+fn raw_external_route_request(
+    state: &AppState,
+    runtime_config: &RequestRuntimeConfig,
+    cache_route: &ResolvedCacheRoutePolicy,
+    headers: HeaderMap,
+    raw_body: Bytes,
+    endpoint: &str,
+    request_id: String,
+    route_subtype: UsageRouteSubtype,
+    fallback_reason: Option<String>,
+    direct_policy_reason: Option<String>,
+    local_preflight: Option<serde_json::Value>,
+) -> ExternalRouteRequest {
+    let policy = &cache_route.policy;
+    let (model_hint, stream_hint) = raw_messages_body_hints(&raw_body);
+    ExternalRouteRequest {
         raw_body,
         headers,
         endpoint: endpoint.to_string(),
@@ -996,11 +1089,11 @@ async fn maybe_raw_external_direct_response(
         upstream_model: None,
         model_resolution_source: None,
         model_resolution_note: None,
-        route_subtype: UsageRouteSubtype::ExternalDirectPolicy,
-        fallback_reason: None,
-        direct_policy_reason: Some(reason),
+        route_subtype,
+        fallback_reason,
+        direct_policy_reason,
         local_attempted: false,
-        local_preflight: None,
+        local_preflight,
         local_attempts: Vec::new(),
         reported_usage: reported_usage_config_for_policy(policy.reported_usage.clone()),
         prompt_cache: state.prompt_cache.clone(),
@@ -1027,10 +1120,10 @@ async fn maybe_raw_external_direct_response(
         latency_trace: Arc::new(crate::external_pool::ExternalLatencyTraceState::default()),
         payload_breakdown: None,
         payload_guard_report: None,
+        payload_guard_external_enabled: false,
+        payload_guard_initial_config: runtime_config.initial_payload_guard_config(),
         payload_guard_retry_config: None,
-    };
-
-    Some(manager.forward_with_failover(config, route).await)
+    }
 }
 
 fn build_external_fallback_context(
@@ -1122,12 +1215,12 @@ impl ExternalFallbackContext {
         &self,
         provider: &KiroProvider,
         request_id: &str,
-        model: &str,
+        model: Option<&str>,
     ) -> Option<ExternalPoolForwardOutcome> {
         if !self.config.local_pool_preflight_enabled {
             return None;
         }
-        let state = provider.local_pool_route_state(Some(model));
+        let state = provider.local_pool_route_state(model);
         if !state.kind.should_route_external() {
             return None;
         }
@@ -1288,22 +1381,15 @@ impl ExternalFallbackContext {
         local_preflight: Option<serde_json::Value>,
         local_attempts: Vec<KiroCredentialAttempt>,
     ) -> Result<ExternalRouteRequest, PayloadGuardError> {
-        let guarded_payload = self.guarded_route_payload()?;
-        let request_input_tokens = token::count_all_tokens(
-            &guarded_payload.payload.model,
-            guarded_payload.payload.system.as_deref(),
-            &guarded_payload.payload.messages,
-            guarded_payload.payload.tools.as_deref(),
-        ) as i32;
         Ok(ExternalRouteRequest {
-            raw_body: guarded_payload.raw_body,
+            raw_body: self.raw_body.clone(),
             headers: self.headers.clone(),
             endpoint: self.endpoint.clone(),
-            payload: Some(guarded_payload.payload),
+            payload: Some(self.payload.clone()),
             body_mode_filter: None,
             model_hint: None,
             stream_hint: None,
-            request_input_tokens,
+            request_input_tokens: 0,
             upstream_model: self
                 .model_resolution
                 .as_ref()
@@ -1345,101 +1431,12 @@ impl ExternalFallbackContext {
             started_at: Instant::now(),
             first_token_latency_ms: Arc::new(AtomicU64::new(0)),
             latency_trace: Arc::new(crate::external_pool::ExternalLatencyTraceState::default()),
-            payload_breakdown: guarded_payload.payload_breakdown,
-            payload_guard_report: guarded_payload.payload_guard_report,
-            payload_guard_retry_config: guarded_payload.payload_guard_retry_config,
+            payload_breakdown: None,
+            payload_guard_report: None,
+            payload_guard_external_enabled: self.payload_guard_external_enabled,
+            payload_guard_initial_config: self.payload_guard_initial_config,
+            payload_guard_retry_config: self.payload_guard_retry_config,
         })
-    }
-
-    fn guarded_route_payload(&self) -> Result<GuardedExternalRoutePayload, PayloadGuardError> {
-        let guard_config = self.payload_guard_initial_config;
-        let retry_config = (self.payload_guard_external_enabled && guard_config.enabled)
-            .then_some(())
-            .and(self.payload_guard_retry_config);
-        match prepare_external_messages_payload(
-            &self.payload,
-            &self.raw_body,
-            self.payload_guard_external_enabled,
-            guard_config,
-        ) {
-            Ok(prepared) => {
-                let Some(report) = prepared.report else {
-                    return Ok(GuardedExternalRoutePayload {
-                        raw_body: prepared.raw_body,
-                        payload: prepared.payload,
-                        payload_breakdown: None,
-                        payload_guard_report: None,
-                        payload_guard_retry_config: None,
-                    });
-                };
-                let include_diagnostics = should_log_payload_byte_breakdown(&report)
-                    || (guard_config.max_bytes > 0 && self.raw_body.len() > guard_config.max_bytes);
-                let breakdown = include_diagnostics.then(|| {
-                    breakdown_anthropic_messages_request(&prepared.payload, prepared.raw_body.len())
-                });
-                if include_diagnostics {
-                    log_payload_guard_report(
-                        &report,
-                        &self.endpoint,
-                        &self.payload.model,
-                        self.model_resolution
-                            .as_ref()
-                            .and_then(|resolution| resolution.upstream_model.as_deref()),
-                        extract_stable_conversation_id(&prepared.payload).as_deref(),
-                    );
-                    log_payload_byte_breakdown(
-                        breakdown,
-                        &report,
-                        &self.endpoint,
-                        &self.payload.model,
-                        self.model_resolution
-                            .as_ref()
-                            .and_then(|resolution| resolution.upstream_model.as_deref()),
-                        extract_stable_conversation_id(&prepared.payload).as_deref(),
-                    );
-                }
-                Ok(GuardedExternalRoutePayload {
-                    raw_body: prepared.raw_body,
-                    payload: prepared.payload,
-                    payload_breakdown: breakdown,
-                    payload_guard_report: include_diagnostics.then_some(report),
-                    payload_guard_retry_config: prepared
-                        .guard_applied
-                        .then_some(())
-                        .and(retry_config),
-                })
-            }
-            Err(err) => {
-                if matches!(err, PayloadGuardError::OversizedImage { .. }) {
-                    return Err(err);
-                }
-                let mut payload = self.payload.clone();
-                let sanitized = guard_config.shaping.enabled
-                    && sanitize_anthropic_messages_for_external_forwarding(
-                        &mut payload,
-                        guard_config.shaping,
-                    );
-                let raw_body = if sanitized {
-                    serialize_messages_request_body(&payload)
-                } else {
-                    self.raw_body.clone()
-                };
-                tracing::warn!(
-                    error = %err,
-                    endpoint = self.endpoint,
-                    model = %self.payload.model,
-                    sanitized,
-                    "external pool payload guard failed; forwarding safety-sanitized request body when possible"
-                );
-                Ok(GuardedExternalRoutePayload {
-                    raw_body,
-                    payload,
-                    payload_breakdown: None,
-                    payload_guard_report: None,
-                    payload_guard_retry_config: None,
-                })
-            }
-        }
     }
 }
 
@@ -1473,20 +1470,6 @@ fn local_pool_route_fallback_reason(
         }
         _ => None,
     }
-}
-
-struct GuardedExternalRoutePayload {
-    raw_body: Bytes,
-    payload: MessagesRequest,
-    payload_breakdown: Option<PayloadByteBreakdown>,
-    payload_guard_report: Option<PayloadGuardReport>,
-    payload_guard_retry_config: Option<PayloadGuardConfig>,
-}
-
-fn serialize_messages_request_body(payload: &MessagesRequest) -> Bytes {
-    serde_json::to_vec(payload)
-        .map(Bytes::from)
-        .unwrap_or_default()
 }
 
 fn classify_local_error_for_external_fallback(
@@ -4032,6 +4015,16 @@ pub async fn post_messages(
     {
         return response;
     }
+    if let Some(response) = maybe_raw_external_preflight_response(
+        &state,
+        headers.clone(),
+        raw_body.clone(),
+        "/v1/messages",
+    )
+    .await
+    {
+        return response;
+    }
     let payload = match parse_messages_payload(&raw_body) {
         Ok(payload) => payload,
         Err(response) => return response,
@@ -4055,6 +4048,16 @@ pub async fn post_messages_real_cache_usage(
     raw_body: Bytes,
 ) -> Response {
     if let Some(response) = maybe_raw_external_direct_response(
+        &state,
+        headers.clone(),
+        raw_body.clone(),
+        "/na/v1/messages",
+    )
+    .await
+    {
+        return response;
+    }
+    if let Some(response) = maybe_raw_external_preflight_response(
         &state,
         headers.clone(),
         raw_body.clone(),
@@ -4096,6 +4099,16 @@ pub async fn post_messages_ha(
     {
         return response;
     }
+    if let Some(response) = maybe_raw_external_preflight_response(
+        &state,
+        headers.clone(),
+        raw_body.clone(),
+        "/ha/v1/messages",
+    )
+    .await
+    {
+        return response;
+    }
     let payload = match parse_messages_payload(&raw_body) {
         Ok(payload) => payload,
         Err(response) => return response,
@@ -4126,6 +4139,12 @@ pub async fn post_messages_dfcache(
     let endpoint = format!("{prefix}/v1/messages");
     if let Some(response) =
         maybe_raw_external_direct_response(&state, headers.clone(), raw_body.clone(), &endpoint)
+            .await
+    {
+        return response;
+    }
+    if let Some(response) =
+        maybe_raw_external_preflight_response(&state, headers.clone(), raw_body.clone(), &endpoint)
             .await
     {
         return response;
@@ -4179,7 +4198,6 @@ async fn post_messages_inner(
         headers.clone(),
         &payload,
     );
-
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
     apply_thinking_trigger_mode(&mut payload, &runtime_config);
@@ -4550,6 +4568,21 @@ async fn maybe_external_fallback_after_local_error_outcome_with_diagnostics(
         .await
 }
 
+async fn maybe_local_pool_preflight_external_response(
+    external_fallback: Option<&ExternalFallbackContext>,
+    provider: &KiroProvider,
+    request_id: &str,
+    model: Option<&str>,
+) -> Option<Response> {
+    let outcome = external_fallback?
+        .local_pool_preflight_outcome(provider, request_id, model)
+        .await?;
+    Some(match outcome {
+        ExternalPoolForwardOutcome::Response(response) => response,
+        ExternalPoolForwardOutcome::FinalError(err) => err.into_response(request_id),
+    })
+}
+
 fn local_rescue_reason_after_external_error(
     config: &ExternalPoolsConfig,
     err: &ExternalPoolFinalError,
@@ -4662,16 +4695,15 @@ async fn handle_stream_request(
     let mut warnings_header = warnings_header;
     let request_id = usage_context.request_id.clone();
     let mut retry_attempt_prefix: Vec<KiroCredentialAttempt> = Vec::new();
-    if let Some(external) = external_fallback.as_ref() {
-        if let Some(outcome) = external
-            .local_pool_preflight_outcome(provider.as_ref(), &request_id, preflight_model)
-            .await
-        {
-            return match outcome {
-                ExternalPoolForwardOutcome::Response(response) => response,
-                ExternalPoolForwardOutcome::FinalError(err) => err.into_response(&request_id),
-            };
-        }
+    if let Some(response) = maybe_local_pool_preflight_external_response(
+        external_fallback.as_ref(),
+        provider.as_ref(),
+        &request_id,
+        Some(preflight_model),
+    )
+    .await
+    {
+        return response;
     }
     let response = match call_api_stream_maybe_fail_fast(
         &provider,
@@ -5669,16 +5701,15 @@ async fn handle_non_stream_request(
     let mut warnings_header = warnings_header;
     let request_id = usage_context.request_id.clone();
     let mut retry_attempt_prefix: Vec<KiroCredentialAttempt> = Vec::new();
-    if let Some(external) = external_fallback.as_ref() {
-        if let Some(outcome) = external
-            .local_pool_preflight_outcome(provider.as_ref(), &request_id, preflight_model)
-            .await
-        {
-            return match outcome {
-                ExternalPoolForwardOutcome::Response(response) => response,
-                ExternalPoolForwardOutcome::FinalError(err) => err.into_response(&request_id),
-            };
-        }
+    if let Some(response) = maybe_local_pool_preflight_external_response(
+        external_fallback.as_ref(),
+        provider.as_ref(),
+        &request_id,
+        Some(preflight_model),
+    )
+    .await
+    {
+        return response;
     }
     let api_response = match call_api_maybe_fail_fast(
         &provider,
@@ -6788,6 +6819,16 @@ pub async fn post_messages_cc(
     {
         return response;
     }
+    if let Some(response) = maybe_raw_external_preflight_response(
+        &state,
+        headers.clone(),
+        raw_body.clone(),
+        "/cc/v1/messages",
+    )
+    .await
+    {
+        return response;
+    }
     let mut payload = match parse_messages_payload(&raw_body) {
         Ok(payload) => payload,
         Err(response) => return response,
@@ -6827,7 +6868,6 @@ pub async fn post_messages_cc(
         headers.clone(),
         &payload,
     );
-
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
     apply_thinking_trigger_mode(&mut payload, &runtime_config);
@@ -7301,6 +7341,59 @@ mod tests {
         );
         assert!(resolve_defined_cache_route(&state, "aa").is_err());
         assert!(resolve_defined_cache_route(&state, "aa/b").is_err());
+    }
+
+    #[test]
+    fn raw_external_route_request_is_preparse_raw_only() {
+        let state = AppState::new(
+            Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+            true,
+            Arc::new(UsageRecorder::new(10)),
+            Arc::new(PromptCacheTracker::default()),
+            Arc::new(PromptCacheCreationController::default()),
+            PromptCacheSimulationMode::HighCache,
+            0.98,
+            CompatProfile::ClaudeCode,
+            false,
+        );
+        let runtime_config = RequestRuntimeConfig::from_app_state(&state);
+        let cache_route = runtime_config.cache_policy_for_path("/cc/v1/messages");
+        let raw_body = Bytes::from_static(
+            br#"{"model":"client-model","stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
+        );
+
+        let route = raw_external_route_request(
+            &state,
+            &runtime_config,
+            &cache_route,
+            HeaderMap::new(),
+            raw_body.clone(),
+            "/cc/v1/messages",
+            "req_raw_preparse_test".to_string(),
+            UsageRouteSubtype::ExternalFallbackPreflight,
+            Some("local_capacity_full".to_string()),
+            None,
+            Some(json!({"preflightStage":"before_parse"})),
+        );
+
+        assert_eq!(route.raw_body, raw_body);
+        assert!(route.payload.is_none());
+        assert_eq!(
+            route.body_mode_filter,
+            Some(ExternalPoolRequestBodyMode::RawPassthrough)
+        );
+        assert_eq!(route.model_hint.as_deref(), Some("client-model"));
+        assert_eq!(route.stream_hint, Some(true));
+        assert_eq!(route.request_input_tokens, 0);
+        assert!(!route.payload_guard_external_enabled);
+        assert_eq!(
+            route
+                .local_preflight
+                .as_ref()
+                .and_then(|value| value.get("preflightStage"))
+                .and_then(|value| value.as_str()),
+            Some("before_parse")
+        );
     }
 
     fn runtime_config_for_payload_guard(

@@ -30,8 +30,12 @@ use crate::{
         envelope,
         model_capabilities::ModelCapabilitiesCatalog,
         payload_guard::{
-            PayloadByteBreakdown, PayloadGuardConfig, PayloadGuardReport,
+            PayloadByteBreakdown, PayloadGuardConfig, PayloadGuardError, PayloadGuardReport,
             breakdown_anthropic_messages_request, guard_anthropic_messages_request_reusing_body,
+            sanitize_anthropic_messages_for_external_forwarding,
+        },
+        payload_guard_runtime::{
+            PreparedExternalMessagesPayload, prepare_external_messages_payload,
         },
         pricing::PricingCatalog,
         prompt_cache::{
@@ -493,6 +497,8 @@ pub struct ExternalRouteRequest {
     pub latency_trace: Arc<ExternalLatencyTraceState>,
     pub payload_breakdown: Option<PayloadByteBreakdown>,
     pub payload_guard_report: Option<PayloadGuardReport>,
+    pub payload_guard_external_enabled: bool,
+    pub payload_guard_initial_config: PayloadGuardConfig,
     pub payload_guard_retry_config: Option<PayloadGuardConfig>,
 }
 
@@ -1271,6 +1277,18 @@ impl ExternalPoolManager {
             .has_eligible_pool()
     }
 
+    pub async fn has_available_pool_for_body_mode(
+        &self,
+        config: &ExternalPoolsConfig,
+        body_mode: ExternalPoolRequestBodyMode,
+    ) -> bool {
+        self.scan_pool_availability_uncached(&HashSet::new(), config, false, Some(body_mode))
+            .await
+            .availability
+            .available_pools
+            > 0
+    }
+
     pub async fn record_local_pool_failure(
         &self,
         config: &ExternalPoolsConfig,
@@ -1536,7 +1554,9 @@ impl ExternalPoolManager {
                         error_type: Some(error_type_for_external_error(&err).to_string()),
                         error_message: Some(err.message.clone()),
                     });
-                    if should_retry_external_payload_guard(&route, &err) {
+                    if pool.request_body_mode == ExternalPoolRequestBodyMode::Normalized
+                        && should_retry_external_payload_guard(&route, &err)
+                    {
                         if let Some(retry_route) = external_payload_guard_retry_route(&route) {
                             if let Some(last) = attempts.last_mut() {
                                 last.action = "payload_guard_retry".to_string();
@@ -3319,13 +3339,27 @@ fn external_pool_prepare_request(
         });
     };
 
+    let prepared_payload = external_pool_prepare_normalized_payload(route, pool, payload)?;
+    let payload = &prepared_payload.payload;
+    if let Some(report) = prepared_payload.report.as_ref() {
+        tracing::debug!(
+            request_id = %route.request_id,
+            pool_id = pool.id,
+            guard_applied = prepared_payload.guard_applied,
+            modified = report.was_modified(),
+            original_bytes = report.original_bytes,
+            final_bytes = report.final_bytes,
+            "external pool normalized body payload guard applied"
+        );
+    }
+
     let mut value = match serde_json::to_value(payload) {
         Ok(value) => value,
-        Err(_) => match serde_json::from_slice::<serde_json::Value>(&route.raw_body) {
+        Err(_) => match serde_json::from_slice::<serde_json::Value>(&prepared_payload.raw_body) {
             Ok(value) => value,
             Err(_) => {
                 return Ok(PreparedExternalRequest {
-                    body: route.raw_body.clone(),
+                    body: prepared_payload.raw_body,
                     outbound_model: None,
                 });
             }
@@ -3342,7 +3376,7 @@ fn external_pool_prepare_request(
 
     let body = serde_json::to_vec(&value)
         .map(Bytes::from)
-        .unwrap_or_else(|_| route.raw_body.clone());
+        .unwrap_or(prepared_payload.raw_body);
     Ok(PreparedExternalRequest {
         body,
         outbound_model,
@@ -3395,6 +3429,84 @@ fn external_pool_prepare_raw_request(
                 outbound_model,
             })
         }
+    }
+}
+
+fn external_pool_prepare_normalized_payload(
+    route: &ExternalRouteRequest,
+    pool: &ExternalPool,
+    payload: &MessagesRequest,
+) -> Result<PreparedExternalMessagesPayload, ExternalPoolError> {
+    let guard_config = route.payload_guard_initial_config;
+    match prepare_external_messages_payload(
+        payload,
+        &route.raw_body,
+        route.payload_guard_external_enabled,
+        guard_config,
+    ) {
+        Ok(prepared) => Ok(prepared),
+        Err(err) => {
+            if matches!(err, PayloadGuardError::OversizedImage { .. }) {
+                return Err(external_pool_payload_guard_error(pool, err));
+            }
+            let mut payload = payload.clone();
+            let sanitized = guard_config.shaping.enabled
+                && sanitize_anthropic_messages_for_external_forwarding(
+                    &mut payload,
+                    guard_config.shaping,
+                );
+            let raw_body = if sanitized {
+                serialize_external_messages_request_body(&payload)
+            } else {
+                route.raw_body.clone()
+            };
+            tracing::warn!(
+                request_id = %route.request_id,
+                pool_id = pool.id,
+                error = %err,
+                endpoint = route.endpoint,
+                model = %payload.model,
+                sanitized,
+                "external pool normalized payload guard failed; forwarding safety-sanitized request body when possible"
+            );
+            Ok(PreparedExternalMessagesPayload {
+                raw_body,
+                payload,
+                report: None,
+                guard_applied: false,
+            })
+        }
+    }
+}
+
+fn serialize_external_messages_request_body(payload: &MessagesRequest) -> Bytes {
+    serde_json::to_vec(payload)
+        .map(Bytes::from)
+        .unwrap_or_default()
+}
+
+fn external_pool_payload_guard_error(
+    pool: &ExternalPool,
+    err: PayloadGuardError,
+) -> ExternalPoolError {
+    let (status, message) = match err {
+        PayloadGuardError::Serialize(message) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("external pool #{} payload guard serialize failed: {}", pool.id, message),
+        ),
+        PayloadGuardError::OversizedImage { .. } => (
+            StatusCode::BAD_REQUEST,
+            "One or more images exceed the upstream 5 MB image size limit. Remove or resize the oversized image and retry."
+                .to_string(),
+        ),
+    };
+    ExternalPoolError {
+        status: Some(status),
+        message,
+        retryable: false,
+        auto_disable_reason: None,
+        cooldown: None,
+        response_body: None,
     }
 }
 
@@ -4152,6 +4264,7 @@ fn external_payload_guard_retry_route(
     let mut next = route.clone();
     next.raw_body = body;
     next.payload = Some(payload);
+    next.body_mode_filter = Some(ExternalPoolRequestBodyMode::Normalized);
     next.payload_breakdown = Some(breakdown);
     next.payload_guard_report = Some(report);
     next.payload_guard_retry_config = None;
@@ -5724,6 +5837,10 @@ mod tests {
         assert!(should_retry_external_payload_guard(&route, &err));
         let retry_route = external_payload_guard_retry_route(&route).expect("retry route");
 
+        assert_eq!(
+            retry_route.body_mode_filter,
+            Some(ExternalPoolRequestBodyMode::Normalized)
+        );
         assert!(retry_route.raw_body.len() <= 8_000);
         assert!(retry_route.payload_guard_retry_config.is_none());
         assert!(
@@ -5801,6 +5918,13 @@ mod tests {
             latency_trace: Arc::new(ExternalLatencyTraceState::default()),
             payload_breakdown: None,
             payload_guard_report: None,
+            payload_guard_external_enabled: true,
+            payload_guard_initial_config: PayloadGuardConfig {
+                enabled: true,
+                max_bytes: 0,
+                trim_history: false,
+                shaping: crate::model::config::PayloadShapingConfig::default(),
+            },
             payload_guard_retry_config: None,
         };
 
@@ -6103,6 +6227,13 @@ data: {"type":"message_delta","note":"content_block_delta"}
             latency_trace: Arc::new(ExternalLatencyTraceState::default()),
             payload_breakdown: None,
             payload_guard_report: None,
+            payload_guard_external_enabled: true,
+            payload_guard_initial_config: PayloadGuardConfig {
+                enabled: true,
+                max_bytes: 0,
+                trim_history: false,
+                shaping: crate::model::config::PayloadShapingConfig::default(),
+            },
             payload_guard_retry_config: None,
         }
     }
@@ -6349,6 +6480,71 @@ data: {"type":"message_delta","note":"content_block_delta"}
 
         assert_eq!(prepared.body, Bytes::from_static(raw));
         assert!(prepared.outbound_model.is_none());
+    }
+
+    #[test]
+    fn external_pool_raw_body_mode_does_not_apply_payload_guard() {
+        let raw = br#"{"model":"client-model","stream":false,"messages":[{"role":"user","content":"keep raw body even when guard config is enabled"}]}"#;
+        let mut route = test_route("client-model");
+        route.raw_body = Bytes::from_static(raw);
+        route.payload_guard_external_enabled = true;
+        route.payload_guard_initial_config = PayloadGuardConfig {
+            enabled: true,
+            max_bytes: 32,
+            trim_history: true,
+            shaping: crate::model::config::PayloadShapingConfig::default(),
+        };
+        let mut pool = test_pool("https://example.com/v1", true);
+        pool.request_body_mode = ExternalPoolRequestBodyMode::RawPassthrough;
+        pool.raw_model_mode = ExternalPoolRawModelMode::None;
+
+        let prepared = external_pool_prepare_request(&route, &pool).unwrap();
+
+        assert_eq!(prepared.body, Bytes::from_static(raw));
+    }
+
+    #[test]
+    fn external_pool_normalized_body_mode_applies_payload_guard() {
+        let mut route = test_route("client-model");
+        let mut messages = Vec::new();
+        for idx in 0..24 {
+            messages.push(Message {
+                role: "user".to_string(),
+                content: serde_json::json!(format!("old history {idx} {}", "x".repeat(240))),
+            });
+            messages.push(Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!(format!("old answer {idx} {}", "y".repeat(180))),
+            });
+        }
+        messages.push(Message {
+            role: "user".to_string(),
+            content: serde_json::json!("current question"),
+        });
+        payload_mut(&mut route).messages = messages;
+        route.raw_body = Bytes::from(
+            serde_json::to_vec(payload_ref(&route)).expect("serialize raw body for route"),
+        );
+        let original_len = route.raw_body.len();
+        route.payload_guard_external_enabled = true;
+        route.payload_guard_initial_config = PayloadGuardConfig {
+            enabled: true,
+            max_bytes: 2_000,
+            trim_history: true,
+            shaping: crate::model::config::PayloadShapingConfig::default(),
+        };
+        let mut pool = test_pool("https://example.com/v1", true);
+        pool.request_body_mode = ExternalPoolRequestBodyMode::Normalized;
+
+        let prepared = external_pool_prepare_request(&route, &pool).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&prepared.body).expect("normalized body remains json");
+
+        assert!(prepared.body.len() < original_len);
+        assert_eq!(
+            value["messages"].as_array().unwrap().last().unwrap()["content"],
+            serde_json::json!("current question")
+        );
     }
 
     #[test]
