@@ -247,6 +247,15 @@ fn default_external_idp_scopes(client_id: &str) -> String {
     )
 }
 
+fn profile_arn_region(profile_arn: &str) -> Option<&str> {
+    let parts: Vec<&str> = profile_arn.trim().splitn(6, ':').collect();
+    if parts.len() < 6 || parts[0] != "arn" || parts[2] != "codewhisperer" {
+        return None;
+    }
+    let region = parts[3].trim();
+    (!region.is_empty()).then_some(region)
+}
+
 /// 凭据配置（支持单对象或数组格式）
 ///
 /// 自动识别配置文件格式：
@@ -366,10 +375,11 @@ impl KiroCredentials {
     }
 
     /// 获取有效的 API Region（用于 API 请求）
-    /// 优先级：凭据.api_region > config.api_region > config.region
+    /// 优先级：凭据.api_region > profileArn region > config.api_region > config.region
     pub fn effective_api_region<'a>(&'a self, config: &'a Config) -> &'a str {
         self.api_region
             .as_deref()
+            .or_else(|| self.profile_arn.as_deref().and_then(profile_arn_region))
             .unwrap_or(config.effective_api_region())
     }
 
@@ -1187,15 +1197,30 @@ mod tests {
 
     #[test]
     fn test_effective_api_region_credential_api_region_highest() {
-        // 凭据.api_region > config.api_region > config.region
+        // 凭据.api_region > profileArn region > config.api_region > config.region
         let mut config = Config::default();
         config.region = "config-region".to_string();
         config.api_region = Some("config-api-region".to_string());
 
         let mut creds = KiroCredentials::default();
         creds.api_region = Some("cred-api-region".to_string());
+        creds.profile_arn =
+            Some("arn:aws:codewhisperer:eu-central-1:123456789012:profile/FAKE".to_string());
 
         assert_eq!(creds.effective_api_region(&config), "cred-api-region");
+    }
+
+    #[test]
+    fn test_effective_api_region_fallback_to_profile_arn_region() {
+        let mut config = Config::default();
+        config.region = "config-region".to_string();
+        config.api_region = Some("config-api-region".to_string());
+
+        let mut creds = KiroCredentials::default();
+        creds.profile_arn =
+            Some("arn:aws:codewhisperer:eu-central-1:123456789012:profile/FAKE".to_string());
+
+        assert_eq!(creds.effective_api_region(&config), "eu-central-1");
     }
 
     #[test]

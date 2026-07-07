@@ -727,7 +727,7 @@ pub struct AddCredentialRequest {
     #[serde(alias = "refresh_token")]
     pub refresh_token: Option<String>,
 
-    /// 认证方式（可选，默认 social）
+    /// 认证方式（可选；缺省时由服务端根据凭据字段自动推断）
     #[serde(default = "default_auth_method", alias = "auth_method")]
     pub auth_method: String,
 
@@ -830,7 +830,7 @@ pub struct AddCredentialRequest {
 }
 
 fn default_auth_method() -> String {
-    "social".to_string()
+    String::new()
 }
 
 /// 添加凭据成功响应
@@ -1820,6 +1820,23 @@ mod tests {
         assert_eq!(req.api_region.as_deref(), Some("eu-west-1"));
         assert_eq!(req.machine_id.as_deref(), Some("fake-machine-id"));
         assert_eq!(req.max_concurrent_requests, Some(3));
+    }
+
+    #[test]
+    fn add_credential_request_leaves_missing_auth_method_for_server_inference() {
+        let json = serde_json::json!({
+            "refreshToken": "fake-refresh-token",
+            "accessToken": "fake-access-token",
+            "clientId": "fake-client-id",
+            "clientSecret": "fake-client-secret",
+            "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE"
+        });
+
+        let req: AddCredentialRequest = serde_json::from_value(json).unwrap();
+
+        assert_eq!(req.auth_method, "");
+        assert_eq!(req.client_id.as_deref(), Some("fake-client-id"));
+        assert_eq!(req.client_secret.as_deref(), Some("fake-client-secret"));
     }
 
     #[test]

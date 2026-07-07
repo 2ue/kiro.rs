@@ -1226,6 +1226,7 @@ impl AdminService {
             }
         }
 
+        let auth_method = resolve_add_credential_auth_method(&req);
         let mut credentials = KiroCredentials {
             id: None,
             created_at: None,
@@ -1234,7 +1235,7 @@ impl AdminService {
             refresh_token: req.refresh_token,
             profile_arn: req.profile_arn,
             expires_at: req.expires_at,
-            auth_method: Some(req.auth_method),
+            auth_method: Some(auth_method),
             provider: req.provider,
             client_id: req.client_id,
             client_secret: req.client_secret,
@@ -4874,6 +4875,53 @@ fn apply_batch_import_defaults(
     credential
 }
 
+fn resolve_add_credential_auth_method(req: &AddCredentialRequest) -> String {
+    let explicit = req.auth_method.trim();
+    if !explicit.is_empty() {
+        return explicit.to_string();
+    }
+
+    if req.kiro_api_key.as_deref().is_some_and(has_text) {
+        return "api_key".to_string();
+    }
+
+    if add_request_looks_external_idp(req) {
+        return "external_idp".to_string();
+    }
+
+    if req.client_id.as_deref().is_some_and(has_text)
+        && req.client_secret.as_deref().is_some_and(has_text)
+    {
+        return "idc".to_string();
+    }
+
+    "social".to_string()
+}
+
+fn add_request_looks_external_idp(req: &AddCredentialRequest) -> bool {
+    req.token_endpoint.as_deref().is_some_and(has_text)
+        || req.issuer_url.as_deref().is_some_and(has_text)
+        || req.scopes.as_deref().is_some_and(has_text)
+        || req.provider.as_deref().is_some_and(|provider| {
+            matches!(
+                compact_auth_value(provider).as_str(),
+                "externalidp" | "enterprise" | "iamsso" | "awsidc" | "internal"
+            )
+        })
+}
+
+fn compact_auth_value(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn has_text(value: &str) -> bool {
+    !value.trim().is_empty()
+}
+
 fn is_duplicate_credential_error(err: &AdminServiceError) -> bool {
     let message = err.to_string();
     message.contains("凭据已存在")
@@ -6045,6 +6093,46 @@ mod tests {
             max_batches: None,
             pause_ms_between_batches: None,
         }
+    }
+
+    #[test]
+    fn missing_auth_method_with_client_secret_import_is_inferred_as_idc() {
+        let req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+            "refreshToken": "fake-refresh-token",
+            "accessToken": "fake-access-token",
+            "clientId": "fake-client-id",
+            "clientSecret": "fake-client-secret",
+            "profileArn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/FAKE"
+        }))
+        .unwrap();
+
+        assert_eq!(resolve_add_credential_auth_method(&req), "idc");
+    }
+
+    #[test]
+    fn explicit_social_auth_method_is_preserved() {
+        let req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+            "refreshToken": "fake-refresh-token",
+            "authMethod": "social",
+            "clientId": "ignored-client-id",
+            "clientSecret": "ignored-client-secret"
+        }))
+        .unwrap();
+
+        assert_eq!(resolve_add_credential_auth_method(&req), "social");
+    }
+
+    #[test]
+    fn missing_auth_method_with_external_idp_fields_is_inferred_as_external_idp() {
+        let req: AddCredentialRequest = serde_json::from_value(serde_json::json!({
+            "refreshToken": "fake-refresh-token",
+            "clientId": "fake-client-id",
+            "issuerUrl": "https://login.microsoftonline.com/common/v2.0",
+            "scopes": "offline_access"
+        }))
+        .unwrap();
+
+        assert_eq!(resolve_add_credential_auth_method(&req), "external_idp");
     }
 
     #[test]
