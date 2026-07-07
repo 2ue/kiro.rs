@@ -307,6 +307,8 @@ pub struct ExternalPool {
     pub priority: i32,
     pub max_concurrent_requests: u32,
     pub usage_projection_mode: ExternalPoolUsageProjectionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_response_mode: Option<ExternalPoolStreamResponseMode>,
     #[serde(default)]
     pub request_body_mode: ExternalPoolRequestBodyMode,
     #[serde(default)]
@@ -366,6 +368,8 @@ pub struct CreateExternalPoolRequest {
     #[serde(default)]
     pub usage_projection_mode: ExternalPoolUsageProjectionMode,
     #[serde(default)]
+    pub stream_response_mode: Option<ExternalPoolStreamResponseMode>,
+    #[serde(default)]
     pub request_body_mode: ExternalPoolRequestBodyMode,
     #[serde(default)]
     pub raw_model_mode: ExternalPoolRawModelMode,
@@ -406,6 +410,11 @@ pub struct UpdateExternalPoolRequest {
     pub max_concurrent_requests: Option<u32>,
     #[serde(default)]
     pub usage_projection_mode: Option<ExternalPoolUsageProjectionMode>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_stream_response_mode_update"
+    )]
+    pub stream_response_mode: Option<Option<ExternalPoolStreamResponseMode>>,
     #[serde(default)]
     pub request_body_mode: Option<ExternalPoolRequestBodyMode>,
     #[serde(default)]
@@ -426,6 +435,15 @@ pub struct UpdateExternalPoolRequest {
     pub supported_models: Option<Vec<String>>,
     #[serde(default)]
     pub notes: Option<String>,
+}
+
+fn deserialize_optional_stream_response_mode_update<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<ExternalPoolStreamResponseMode>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<ExternalPoolStreamResponseMode>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -815,6 +833,49 @@ struct ExternalUsageCapture {
     projected: bool,
     stream_error_message: Option<String>,
     stream_response_mode: Option<ExternalPoolStreamResponseMode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExternalStreamProcessingPlan {
+    response_mode: ExternalPoolStreamResponseMode,
+    mask_errors: bool,
+    rewrite_usage_for_downstream: bool,
+    capture_usage: bool,
+}
+
+impl ExternalStreamProcessingPlan {
+    fn from_mode(response_mode: ExternalPoolStreamResponseMode) -> Self {
+        match response_mode {
+            ExternalPoolStreamResponseMode::EventPassthroughUsageRewrite => Self {
+                response_mode,
+                mask_errors: true,
+                rewrite_usage_for_downstream: true,
+                capture_usage: true,
+            },
+            ExternalPoolStreamResponseMode::EventPassthroughCapture => Self {
+                response_mode,
+                mask_errors: true,
+                rewrite_usage_for_downstream: false,
+                capture_usage: true,
+            },
+        }
+    }
+
+    fn for_pool(pool: &ExternalPool, config: &ExternalPoolsConfig) -> Self {
+        Self::from_mode(effective_external_pool_stream_response_mode(pool, config))
+    }
+
+    fn needs_usage_projection(self) -> bool {
+        self.rewrite_usage_for_downstream || self.capture_usage
+    }
+}
+
+fn effective_external_pool_stream_response_mode(
+    pool: &ExternalPool,
+    config: &ExternalPoolsConfig,
+) -> ExternalPoolStreamResponseMode {
+    pool.stream_response_mode
+        .unwrap_or(config.external_pool_stream_response_mode)
 }
 
 #[derive(Clone)]
@@ -1562,19 +1623,24 @@ impl ExternalPoolManager {
             }
             route.latency_trace.mark_upstream_header(route.started_at);
             let body_stream = response.bytes_stream();
-            let projection_context = build_external_usage_projection_context(
-                route,
-                pool,
-                config.external_pool_usage_projection_uplift_percent,
-                config.external_pool_usage_projection_output_uplift_min_tokens,
-                config.external_pool_usage_projection_output_uplift_percent,
-            );
+            let stream_plan = ExternalStreamProcessingPlan::for_pool(pool, config);
+            let projection_context = stream_plan
+                .needs_usage_projection()
+                .then(|| {
+                    build_external_usage_projection_context(
+                        route,
+                        pool,
+                        config.external_pool_usage_projection_uplift_percent,
+                        config.external_pool_usage_projection_output_uplift_min_tokens,
+                        config.external_pool_usage_projection_output_uplift_percent,
+                    )
+                })
+                .flatten();
             let stream_idle_timeout = (config.external_pool_stream_idle_timeout_secs > 0)
                 .then(|| Duration::from_secs(config.external_pool_stream_idle_timeout_secs));
-            let stream_response_mode = config.external_pool_stream_response_mode;
             let stream_usage_projection = projection_context.clone();
             let usage_capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
-                stream_response_mode: Some(stream_response_mode),
+                stream_response_mode: Some(stream_plan.response_mode),
                 ..ExternalUsageCapture::default()
             }));
             let stream_usage_capture = usage_capture.clone();
@@ -1625,7 +1691,7 @@ impl ExternalPoolManager {
                                                 projection_context.as_ref(),
                                                 Some(&usage_capture),
                                                 Some(stream_error_mask.as_ref()),
-                                                stream_response_mode,
+                                                stream_plan,
                                             );
                                             if !projected.is_empty() {
                                                 return Some((
@@ -1694,12 +1760,12 @@ impl ExternalPoolManager {
                                             let tail = if buffer.is_empty() {
                                                 Vec::new()
                                             } else {
-                                                maybe_handle_sse_event(
+                                                process_sse_event_with_plan(
                                                     &buffer,
                                                     projection_context.as_ref(),
                                                     Some(&usage_capture),
                                                     Some(stream_error_mask.as_ref()),
-                                                    stream_response_mode,
+                                                    stream_plan,
                                                 )
                                             };
                                             drop(lease);
@@ -3898,16 +3964,11 @@ fn maybe_project_non_stream_usage(
     }
 }
 
-fn maybe_project_sse_event(
+fn rewrite_sse_event_usage(
     event: &[u8],
     projection: Option<&ExternalUsageProjectionContext>,
     capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
-    stream_error_mask: Option<&ExternalStreamErrorMask>,
 ) -> Vec<u8> {
-    if let Some(masked) = maybe_mask_external_stream_error_event(event, capture, stream_error_mask)
-    {
-        return masked;
-    }
     let Ok(text) = std::str::from_utf8(event) else {
         return event.to_vec();
     };
@@ -3965,21 +4026,7 @@ fn maybe_project_sse_event(
     if changed { out } else { event.to_vec() }
 }
 
-fn maybe_capture_passthrough_sse_event(
-    event: &[u8],
-    projection: Option<&ExternalUsageProjectionContext>,
-    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
-    stream_error_mask: Option<&ExternalStreamErrorMask>,
-) -> Vec<u8> {
-    if let Some(masked) = maybe_mask_external_stream_error_event(event, capture, stream_error_mask)
-    {
-        return masked;
-    }
-    capture_passthrough_sse_usage(event, projection, capture);
-    event.to_vec()
-}
-
-fn capture_passthrough_sse_usage(
+fn capture_sse_event_usage(
     event: &[u8],
     projection: Option<&ExternalUsageProjectionContext>,
     capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
@@ -4021,21 +4068,27 @@ fn capture_passthrough_sse_usage(
     }
 }
 
-fn maybe_handle_sse_event(
+fn process_sse_event_with_plan(
     event: &[u8],
     projection: Option<&ExternalUsageProjectionContext>,
     capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
     stream_error_mask: Option<&ExternalStreamErrorMask>,
-    response_mode: ExternalPoolStreamResponseMode,
+    plan: ExternalStreamProcessingPlan,
 ) -> Vec<u8> {
-    match response_mode {
-        ExternalPoolStreamResponseMode::ProjectedRewrite => {
-            maybe_project_sse_event(event, projection, capture, stream_error_mask)
-        }
-        ExternalPoolStreamResponseMode::EventPassthroughCapture => {
-            maybe_capture_passthrough_sse_event(event, projection, capture, stream_error_mask)
+    if plan.mask_errors {
+        if let Some(masked) =
+            maybe_mask_external_stream_error_event(event, capture, stream_error_mask)
+        {
+            return masked;
         }
     }
+    if plan.rewrite_usage_for_downstream && projection.is_some() {
+        return rewrite_sse_event_usage(event, projection, capture);
+    }
+    if plan.capture_usage {
+        capture_sse_event_usage(event, projection, capture);
+    }
+    event.to_vec()
 }
 
 fn drain_sse_events(
@@ -4043,18 +4096,18 @@ fn drain_sse_events(
     projection: Option<&ExternalUsageProjectionContext>,
     capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
     stream_error_mask: Option<&ExternalStreamErrorMask>,
-    response_mode: ExternalPoolStreamResponseMode,
+    plan: ExternalStreamProcessingPlan,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     while let Some((idx, delimiter_len)) = find_sse_event_delimiter(buffer) {
         let end = idx + delimiter_len;
         let event = buffer.drain(..end).collect::<Vec<u8>>();
-        out.extend(maybe_handle_sse_event(
+        out.extend(process_sse_event_with_plan(
             &event,
             projection,
             capture,
             stream_error_mask,
-            response_mode,
+            plan,
         ));
     }
     out
@@ -4641,6 +4694,7 @@ mod tests {
             priority,
             max_concurrent_requests: 1,
             usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
+            stream_response_mode: None,
             request_body_mode: ExternalPoolRequestBodyMode::Normalized,
             raw_model_mode: ExternalPoolRawModelMode::None,
             auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
@@ -5415,7 +5469,15 @@ data: {"type":"error","error":{"type":"api_error","message":"raw external promo 
 
 "#;
 
-        let masked = maybe_project_sse_event(event, None, Some(&capture), Some(&mask));
+        let masked = process_sse_event_with_plan(
+            event,
+            None,
+            Some(&capture),
+            Some(&mask),
+            ExternalStreamProcessingPlan::from_mode(
+                ExternalPoolStreamResponseMode::EventPassthroughUsageRewrite,
+            ),
+        );
         let text = std::str::from_utf8(&masked).expect("masked event utf8");
 
         assert!(text.contains("event: error"));
@@ -5534,6 +5596,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
             priority: 10,
             max_concurrent_requests: 10,
             usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
+            stream_response_mode: None,
             request_body_mode: ExternalPoolRequestBodyMode::Normalized,
             raw_model_mode: ExternalPoolRawModelMode::None,
             auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
@@ -6957,7 +7020,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
 
 "#;
 
-        let out = maybe_project_sse_event(event, Some(&projection), Some(&capture), None);
+        let out = rewrite_sse_event_usage(event, Some(&projection), Some(&capture));
         let text = std::str::from_utf8(&out).expect("event text");
         let event_input = event_usage_i64(text, "input_tokens");
         let reported = capture.lock().reported.expect("reported usage");
@@ -7331,7 +7394,7 @@ data: [DONE]
         let mut pool = test_pool("http://pool.example.com", false);
         pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
         let projection = projection_context(&route, &pool, 0);
-        let projected = maybe_project_sse_event(event, projection.as_ref(), None, None);
+        let projected = rewrite_sse_event_usage(event, projection.as_ref(), None);
         let text = String::from_utf8(projected).expect("utf8");
 
         assert!(text.contains("data: [DONE]"));
@@ -7350,7 +7413,7 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
         let mut pool = test_pool("http://pool.example.com", false);
         pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
         let projection = projection_context(&route, &pool, 0);
-        let _projected = maybe_project_sse_event(event, projection.as_ref(), Some(&capture), None);
+        let _projected = rewrite_sse_event_usage(event, projection.as_ref(), Some(&capture));
         let capture = capture.lock().clone();
         let raw = capture.raw.expect("raw usage");
         let reported = capture.reported.expect("reported usage");
@@ -7376,8 +7439,15 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
         pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
         let projection = projection_context(&route, &pool, 0).expect("projection");
 
-        let passthrough =
-            maybe_capture_passthrough_sse_event(event, Some(&projection), Some(&capture), None);
+        let passthrough = process_sse_event_with_plan(
+            event,
+            Some(&projection),
+            Some(&capture),
+            None,
+            ExternalStreamProcessingPlan::from_mode(
+                ExternalPoolStreamResponseMode::EventPassthroughCapture,
+            ),
+        );
 
         assert_eq!(passthrough, event);
         let capture = capture.lock().clone();
@@ -7394,7 +7464,55 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
     }
 
     #[test]
-    fn drain_sse_events_respects_response_mode() {
+    fn stream_processing_plan_inherits_global_and_allows_pool_override() {
+        let mut config = ExternalPoolsConfig::default();
+        config.external_pool_stream_response_mode =
+            ExternalPoolStreamResponseMode::EventPassthroughUsageRewrite;
+
+        let inherited = test_pool("http://pool.example.com", false);
+        assert_eq!(
+            ExternalStreamProcessingPlan::for_pool(&inherited, &config).response_mode,
+            ExternalPoolStreamResponseMode::EventPassthroughUsageRewrite
+        );
+
+        let mut overridden = inherited.clone();
+        overridden.stream_response_mode =
+            Some(ExternalPoolStreamResponseMode::EventPassthroughCapture);
+        let plan = ExternalStreamProcessingPlan::for_pool(&overridden, &config);
+        assert_eq!(
+            plan.response_mode,
+            ExternalPoolStreamResponseMode::EventPassthroughCapture
+        );
+        assert!(!plan.rewrite_usage_for_downstream);
+        assert!(plan.capture_usage);
+    }
+
+    #[test]
+    fn usage_rewrite_mode_does_not_rewrite_when_projection_is_disabled() {
+        let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}
+
+"#;
+        let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+        let out = process_sse_event_with_plan(
+            event,
+            None,
+            Some(&capture),
+            None,
+            ExternalStreamProcessingPlan::from_mode(
+                ExternalPoolStreamResponseMode::EventPassthroughUsageRewrite,
+            ),
+        );
+
+        assert_eq!(out, event);
+        let capture = capture.lock().clone();
+        assert!(!capture.projected);
+        assert_eq!(capture.raw.expect("raw").input_tokens, 100000);
+        assert_eq!(capture.reported.expect("reported").input_tokens, 100000);
+    }
+
+    #[test]
+    fn drain_sse_events_respects_processing_plan() {
         let event = br#"event: message_delta
 data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}
 
@@ -7410,7 +7528,9 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
             Some(&projection),
             None,
             None,
-            ExternalPoolStreamResponseMode::ProjectedRewrite,
+            ExternalStreamProcessingPlan::from_mode(
+                ExternalPoolStreamResponseMode::EventPassthroughUsageRewrite,
+            ),
         );
         assert!(rewrite_buffer.is_empty());
         assert_ne!(rewritten, event);
@@ -7424,7 +7544,9 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
             Some(&projection),
             Some(&capture),
             None,
-            ExternalPoolStreamResponseMode::EventPassthroughCapture,
+            ExternalStreamProcessingPlan::from_mode(
+                ExternalPoolStreamResponseMode::EventPassthroughCapture,
+            ),
         );
         assert!(passthrough_buffer.is_empty());
         assert_eq!(passthrough, event);
@@ -7444,7 +7566,7 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":120
         pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
         let projection =
             projection_context_with_output_uplift(&route, &pool, 0, 1_000, 50).expect("projection");
-        let projected = maybe_project_sse_event(event, Some(&projection), Some(&capture), None);
+        let projected = rewrite_sse_event_usage(event, Some(&projection), Some(&capture));
         let text = std::str::from_utf8(&projected).expect("projected sse");
         assert!(text.contains(r#""output_tokens":1800"#));
 

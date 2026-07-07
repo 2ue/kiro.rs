@@ -1018,7 +1018,7 @@ export type ModelMappingRuleKind = 'version_equivalent' | 'alias' | 'fallback'
 export type PayloadGuardMode = 'preemptive' | 'on_too_long'
 export type ExternalPoolAuthType = 'bearer' | 'x_api_key'
 export type ExternalPoolUsageProjectionMode = 'pass_through' | 'current_path_policy'
-export type ExternalPoolStreamResponseMode = 'projected_rewrite' | 'event_passthrough_capture'
+export type ExternalPoolStreamResponseMode = 'event_passthrough_usage_rewrite' | 'event_passthrough_capture'
 export type ExternalPoolAutoDisablePolicy = 'inherit' | 'disabled' | 'enabled'
 export type ExternalPoolModelMappingMode = 'passthrough' | 'passthrough_mapping' | 'direct_mapping' | 'processed_mapping'
 export type ExternalPoolRequestBodyMode = 'normalized' | 'raw_passthrough'
@@ -1241,6 +1241,7 @@ export interface ExternalPool {
   priority: number
   maxConcurrentRequests: number
   usageProjectionMode: ExternalPoolUsageProjectionMode
+  streamResponseMode?: ExternalPoolStreamResponseMode
   requestBodyMode: ExternalPoolRequestBodyMode
   rawModelMode: ExternalPoolRawModelMode
   autoDisablePolicy: ExternalPoolAutoDisablePolicy
@@ -1286,6 +1287,7 @@ export interface CreateExternalPoolRequest {
   priority?: number
   maxConcurrentRequests?: number
   usageProjectionMode?: ExternalPoolUsageProjectionMode
+  streamResponseMode?: ExternalPoolStreamResponseMode | null
   requestBodyMode?: ExternalPoolRequestBodyMode
   rawModelMode?: ExternalPoolRawModelMode
   autoDisablePolicy?: ExternalPoolAutoDisablePolicy
@@ -1307,6 +1309,7 @@ export interface UpdateExternalPoolRequest {
   priority?: number
   maxConcurrentRequests?: number
   usageProjectionMode?: ExternalPoolUsageProjectionMode
+  streamResponseMode?: ExternalPoolStreamResponseMode | null
   requestBodyMode?: ExternalPoolRequestBodyMode
   rawModelMode?: ExternalPoolRawModelMode
   autoDisablePolicy?: ExternalPoolAutoDisablePolicy

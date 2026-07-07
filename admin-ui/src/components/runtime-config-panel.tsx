@@ -260,7 +260,7 @@ export const defaultExternalPoolsConfig = () => ({
   externalPoolUsageProjectionUpliftPercent: 25,
   externalPoolUsageProjectionOutputUpliftMinTokens: 0,
   externalPoolUsageProjectionOutputUpliftPercent: 0,
-  externalPoolStreamResponseMode: 'event_passthrough_capture' as const,
+  externalPoolStreamResponseMode: 'event_passthrough_usage_rewrite' as const,
 })
 
 const defaultModelMappingConfig = (): ModelMappingConfig => ({
@@ -3553,9 +3553,9 @@ export function RuntimeConfigPanel() {
             </label>
             <label className="block rounded-md border bg-background p-4">
               <div className="mb-3">
-                <div className="text-sm font-medium">外部池流式响应</div>
+                <div className="text-sm font-medium">外部池默认流式 Usage 处理</div>
                 <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                  默认原样下发正常 SSE event，只旁路解析 usage 用于本地费用和历史记录；旧客户端依赖流式 usage 改写时再回退到旧行为。
+                  作为外部池默认值；单个外部池可以覆盖。默认只在 usage event 按路径缓存策略整形下游字段，普通 SSE event 仍事件级透传。
                 </div>
               </div>
               <select
@@ -3573,8 +3573,8 @@ export function RuntimeConfigPanel() {
                   }))
                 }
               >
-                <option value="event_passthrough_capture">事件透传并旁路计量</option>
-                <option value="projected_rewrite">改写流式 Usage</option>
+                <option value="event_passthrough_usage_rewrite">事件透传 + Usage 按路径整形</option>
+                <option value="event_passthrough_capture">事件完全透传，仅内部计量</option>
               </select>
             </label>
             <ToggleField

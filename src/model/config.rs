@@ -2196,27 +2196,36 @@ impl Default for ExternalPoolCapacityMode {
 
 /// 外部池流式响应处理模式。
 ///
-/// `event_passthrough_capture` 保持正常 SSE event 字节原样下发，只在旁路解析 usage
-/// 和错误事件；本地费用/历史 usage 仍可按当前路径策略投影。`projected_rewrite`
-/// 保留旧行为，会改写下游流式 usage event。
+/// `event_passthrough_usage_rewrite` 会透传普通 SSE event，只把下游流式 usage
+/// event 改写为当前路径缓存策略口径；
+/// `event_passthrough_capture` 保持正常 SSE event 字节原样下发，只在内部捕获 usage
+/// 用于费用/历史记录。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExternalPoolStreamResponseMode {
-    ProjectedRewrite,
+    EventPassthroughUsageRewrite,
     EventPassthroughCapture,
 }
 
 impl Default for ExternalPoolStreamResponseMode {
     fn default() -> Self {
-        Self::EventPassthroughCapture
+        Self::EventPassthroughUsageRewrite
     }
 }
 
 impl ExternalPoolStreamResponseMode {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::ProjectedRewrite => "projected_rewrite",
+            Self::EventPassthroughUsageRewrite => "event_passthrough_usage_rewrite",
             Self::EventPassthroughCapture => "event_passthrough_capture",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "event_passthrough_usage_rewrite" => Self::EventPassthroughUsageRewrite,
+            "event_passthrough_capture" => Self::EventPassthroughCapture,
+            _ => Self::default(),
         }
     }
 }
@@ -3986,7 +3995,7 @@ mod tests {
         assert_eq!(config.external_pools.external_pool_max_queued_requests, 0);
         assert_eq!(
             config.external_pools.external_pool_stream_response_mode,
-            ExternalPoolStreamResponseMode::EventPassthroughCapture
+            ExternalPoolStreamResponseMode::EventPassthroughUsageRewrite
         );
         assert!(!config.compression.enabled);
         assert!(config.compression.whitespace_compression);
@@ -4181,7 +4190,7 @@ mod tests {
         assert_eq!(config.external_pools.external_pool_max_queued_requests, 25);
         assert_eq!(
             config.external_pools.external_pool_stream_response_mode,
-            ExternalPoolStreamResponseMode::EventPassthroughCapture
+            ExternalPoolStreamResponseMode::EventPassthroughUsageRewrite
         );
 
         let wait_config: Config = serde_json::from_str(
@@ -4208,12 +4217,12 @@ mod tests {
     }
 
     #[test]
-    fn external_pool_stream_response_mode_can_restore_projected_rewrite() {
+    fn external_pool_stream_response_mode_can_select_capture_only() {
         let config: Config = serde_json::from_str(
             r#"{
                 "apiKey": "sk-test",
                 "externalPools": {
-                    "externalPoolStreamResponseMode": "projected_rewrite"
+                    "externalPoolStreamResponseMode": "event_passthrough_capture"
                 }
             }"#,
         )
@@ -4221,7 +4230,7 @@ mod tests {
 
         assert_eq!(
             config.external_pools.external_pool_stream_response_mode,
-            ExternalPoolStreamResponseMode::ProjectedRewrite
+            ExternalPoolStreamResponseMode::EventPassthroughCapture
         );
     }
 

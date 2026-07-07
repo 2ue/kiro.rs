@@ -184,19 +184,26 @@
 - 旧逻辑还会检查并屏蔽外部池流式错误事件，避免把内部池、凭证、fallback 等信息暴露给客户端。
 - 因为必须保留错误屏蔽，不能简单改成完全字节级 raw chunk 透传；否则上游中途返回的错误 event 可能泄露内部信息或破坏统一错误格式。
 
-因此，本次优化选择的是“event 级透传 + 旁路 capture”，不是无条件 raw chunk 透传。
+因此，本次优化选择的是“event 级透传 + usage 阶段处理”，不是无条件 raw chunk 透传。普通 SSE event 不重序列化；只有 usage event 按配置进入下游整形或仅内部捕获。
 
 ### 本次实施的优化
 
 新增全局配置：
 
 - 后端字段：`externalPools.externalPoolStreamResponseMode`
-- 页面入口：新旧运行配置页的“接口兼容/外部池流式响应”
+- 页面入口：新旧运行配置页的“外部池默认流式 Usage 处理”
 - 可选值：
-  - `event_passthrough_capture`：默认值。正常 SSE event 原样下发给客户端，只在旁路解析 usage 并更新内部费用/历史记录；流式错误 event 仍会被本地屏蔽。
-  - `projected_rewrite`：回到旧行为。流式 `usage` event 会被改写为投影后的字段。
+  - `event_passthrough_usage_rewrite`：默认值。普通 SSE event 原样下发给客户端；只在流式 `usage` event 上按当前路径缓存策略整形下游可见字段，并同时记录内部费用/历史。
+  - `event_passthrough_capture`：排查模式。普通 SSE event 和 `usage` event 都保持上游原样下发，只在内部捕获并按当前路径策略记录费用/历史；流式错误 event 仍会被本地屏蔽。
 
-默认改为 `event_passthrough_capture` 后，外部池正常流式响应的下游内容不再为了 usage projection 被重写。这样能减少本地 JSON 序列化和响应体改写的主路径影响，也更接近 Kiro 兼容上游本来的输出节奏。
+新增单池覆盖字段：
+
+- 后端字段：`external_upstream_pools.stream_response_mode`
+- API 字段：`externalPool.streamResponseMode`
+- 页面入口：新旧外部账号编辑弹窗的“流式 Usage 处理”
+- `NULL`/未配置表示继承全局默认。
+
+默认 `event_passthrough_usage_rewrite` 满足下游 usage 仍符合当前路径缓存策略的要求，同时避免对普通文本、thinking、tool 等 SSE event 做重序列化。`event_passthrough_capture` 只适合协议对比和上游排查，因为它会让下游看到上游原始 usage，不满足“下游返回符合路径配置的缓存 usage”这个主要求。
 
 本次还增加了外部池 SSE event 缓冲上限：
 
@@ -213,7 +220,7 @@
 - 异常或恶意上游 payload 导致未完成 SSE event buffer 持续增长；
 - 后续排查时无法区分“下游看到的是上游原始 usage”还是“kiro.rs 改写后的 usage”。
 
-在新默认值下，`externalPoolBilling.streamResponseMode` 会记录当前流式响应处理模式，便于后续从 usage record 判断这条请求是否走了 event 级透传。
+在新默认值下，`externalPoolBilling.streamResponseMode` 会记录当前流式响应处理模式，便于后续从 usage record 判断这条请求是否走了 usage rewrite 或 capture-only。
 
 ### 优化不能证明或不能解决什么
 
@@ -228,17 +235,15 @@
 
 ### 回滚方式
 
-如果上线后发现某些下游客户端依赖旧的流式 usage 投影字段，可以把全局配置改为：
+如果上线后需要对某个外部账号临时观察上游原始 usage，可以只把该外部账号改为：
 
 ```json
 {
-  "externalPools": {
-    "externalPoolStreamResponseMode": "projected_rewrite"
-  }
+  "streamResponseMode": "event_passthrough_capture"
 }
 ```
 
-这会恢复旧的流式 usage rewrite 行为。非流式响应不受这个开关影响，仍按现有非流 usage projection / cache strategy 逻辑处理。
+这会让该外部账号的流式 `usage` event 原样下发，但内部仍会捕获并记录 usage。非流式响应不受这个开关影响，仍按现有非流 usage projection / cache strategy 逻辑处理。
 
 ## 2026-07-08 运行配置归属更正
 
@@ -252,7 +257,7 @@
 - 页面文案：`非流式请求无缓存`。
 - 生效范围：只影响命中该路径/策略的非流式请求。
 - 具体效果：非流式请求不做本系统缓存展示投影，不写入本地缓存状态，返回和历史记录尽量按无缓存 usage 口径处理。
-- 不影响：流式请求继续按该路径原有缓存/usage 策略执行；外部池流式响应的透传模式也不由这个开关控制。
+- 不影响：流式请求继续按该路径原有缓存/usage 策略执行；外部池流式响应的 usage rewrite/capture 模式也不由这个开关控制。
 
 这解释了“打开后是不是所有非流请求都没有缓存”的边界：不是全局所有非流请求，而是命中对应默认策略或路径覆盖的非流请求。要让所有内置入口都这么做，需要在默认策略或每个内置路径策略上开启；要只影响 `/cc`、`/ha`、`/dfcache/{name}`，就在对应路径上开启。
 
@@ -263,9 +268,9 @@
 - 请求体处理页：压缩、payload guard、图片展开/下载/base64 修复、工具 schema 规范化、工具名映射、tool_choice 引导、历史 thinking 处理、tool_result 配对修复等。这些会改变发往上游的请求体。
 - 缓存策略页：本地模拟缓存、Kiro-RS Tool 缓存、reported usage 字段策略、非流式请求无缓存、路径覆盖。这些改变 usage/cache 展示和本地缓存状态。
 - 模型解析页：模型名解析、别名/映射规则、自动生成规则。这些改变模型路由和上游模型名。
-- 接口兼容页：客户端接口 profile、Kiro 工作模式、thinking 输出展示、代理告警、外部池流式响应模式。这些主要改变响应/协议兼容和诊断行为。
+- 接口兼容页：客户端接口 profile、Kiro 工作模式、thinking 输出展示、代理告警、外部池默认流式 Usage 处理。这些主要改变响应/协议兼容和诊断行为。
 
-因此，本次新增的 `externalPoolStreamResponseMode` 放在“接口兼容/外部池流式响应”是合理的：它不改变请求体，也不决定缓存策略；它决定外部池流式响应是否按 SSE event 原样下发，还是沿用旧的流式 usage rewrite。
+因此，本次新增的全局 `externalPoolStreamResponseMode` 放在“接口兼容/外部池默认流式 Usage 处理”是合理的：它不改变请求体，也不决定路径缓存策略；它只决定外部池流式响应在 usage event 上是下游整形还是仅内部捕获。单个外部账号可以覆盖这个默认值。
 
 ### supportedModels 的合理配置
 
@@ -305,7 +310,7 @@
 - 外部池：`milus`，`baseUrl=http://43.110.29.132:3000`
 - 外部池并发上限：本地降为 `4`
 - 路由策略：`externalDirectPolicyEnabled=true`
-- 流式响应模式：`externalPoolStreamResponseMode=event_passthrough_capture`
+- 流式响应模式：测试时使用 `externalPoolStreamResponseMode=event_passthrough_capture`，这是为了验证 capture-only 协议兼容性，不代表最终默认值。
 - 本地 Kiro 凭证：空列表，确保请求走外部池直连
 
 ### 直接协议验证
@@ -319,14 +324,14 @@
 | 本地 haiku non-stream | 200 | 1560ms | 1560ms | JSON message | `input=5, output=2` |
 | 直连 Milus haiku stream | 200 | 1539ms | 1653ms | 与本地 haiku stream 事件顺序一致 | `input=4103, output=2` |
 
-本地 haiku stream 与直连 Milus haiku stream 的事件顺序、文本 delta、最终 `message_delta.usage` 完全一致；差异只在请求 ID、模型名等请求上下文。说明 `event_passthrough_capture` 下正常 SSE event 没有被重写后再输出。
+本地 haiku stream 与直连 Milus haiku stream 的事件顺序、文本 delta、最终 `message_delta.usage` 完全一致；差异只在请求 ID、模型名等请求上下文。说明 `event_passthrough_capture` 下正常 SSE event 和 usage event 没有被重写后再输出。
 
 usage record 也能证明两套口径同时存在：
 
 - `externalPoolBilling.streamResponseMode=event_passthrough_capture`
 - `externalPoolBilling.rawUsage` 保存上游原始 usage
 - `externalPoolBilling.reportedUsage` 仍按本地 `current_path_policy` 做内部计费/历史兼容整形
-- 下游流式响应保留上游 usage，不再被本地 projected usage 改写
+- 下游流式响应保留上游 usage，不再被本地 usage rewrite 改写
 
 ### Claude Code CLI 验证
 
@@ -364,7 +369,7 @@ claude --bare --print --verbose \
 
 ### 本次结论
 
-在低流量真实上游验证范围内，Milus 外部池接入本地服务并开启 `event_passthrough_capture` 没有发现协议兼容问题：
+在低流量真实上游验证范围内，Milus 外部池接入本地服务并开启 `event_passthrough_capture` 没有发现协议兼容问题。这个测试只证明 capture-only 模式可用于排查；最终默认模式仍应使用 `event_passthrough_usage_rewrite`，保证下游看到符合路径配置的缓存 usage：
 
 - 直接 SSE 正常。
 - Claude Code CLI `stream-json` 正常。

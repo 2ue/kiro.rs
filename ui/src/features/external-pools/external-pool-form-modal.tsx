@@ -17,6 +17,7 @@ import {
   appendModelMappingRules,
   parseModelMappingRules,
   requestBodyModeDescription,
+  streamResponseDescription,
   usageProjectionDescription,
 } from './external-pool-utils'
 import {
@@ -181,6 +182,17 @@ export function ExternalPoolFormModal({
                 <SelectItem value="current_path_policy">按入口规则展示：应用全局补偿</SelectItem>
               </SelectBox>
               <HintBox>{usageProjectionDescription(draft.usageProjectionMode)}</HintBox>
+              <SelectBox
+                label="流式 Usage 处理"
+                value={draft.streamResponseMode}
+                disabled={saving}
+                onChange={(v) => set('streamResponseMode', v as ExternalPoolFormDraft['streamResponseMode'])}
+              >
+                <SelectItem value="inherit">继承全局默认</SelectItem>
+                <SelectItem value="event_passthrough_usage_rewrite">事件透传 + Usage 按路径整形</SelectItem>
+                <SelectItem value="event_passthrough_capture">事件完全透传，仅内部计量</SelectItem>
+              </SelectBox>
+              <HintBox>{streamResponseDescription(draft.streamResponseMode)}</HintBox>
             </div>
           </FormSection>
         </div>

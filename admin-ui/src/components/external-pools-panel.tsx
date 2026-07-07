@@ -31,13 +31,14 @@ import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { useModelCapabilities } from '@/hooks/use-usage'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, TEST_MODELS } from '@/lib/test-models'
-import type { CredentialListItem, CreateExternalPoolRequest, ExternalPool, ExternalPoolModelMappingRule, ExternalPoolsConfig, ExternalPoolTestResponse, UpdateExternalPoolRequest } from '@/types/api'
+import type { CredentialListItem, CreateExternalPoolRequest, ExternalPool, ExternalPoolModelMappingRule, ExternalPoolsConfig, ExternalPoolStreamResponseMode, ExternalPoolTestResponse, UpdateExternalPoolRequest } from '@/types/api'
 import { defaultExternalPoolsConfig } from '@/components/runtime-config-panel'
 
 const splitRules = (value: string) => value.split('\n').map((item) => item.trim()).filter(Boolean)
 const joinRules = (value: string[] = []) => value.join('\n')
 const whole = (value: number, min = 0) => Math.max(min, Math.floor(Number.isFinite(value) ? value : min))
 const DEFAULT_POOL_MODEL_MAPPING_MODE: NonNullable<CreateExternalPoolRequest['modelMappingMode']> = 'processed_mapping'
+type ExternalPoolStreamResponseDraft = ExternalPoolStreamResponseMode | 'inherit'
 
 const parseSupportedModelsText = (value: string): string[] => {
   const seen = new Set<string>()
@@ -180,6 +181,7 @@ type ExternalPoolFormDraft = {
   requestBodyMode: NonNullable<CreateExternalPoolRequest['requestBodyMode']>
   rawModelMode: NonNullable<CreateExternalPoolRequest['rawModelMode']>
   usageProjectionMode: NonNullable<CreateExternalPoolRequest['usageProjectionMode']>
+  streamResponseMode: ExternalPoolStreamResponseDraft
   autoDisablePolicy: NonNullable<CreateExternalPoolRequest['autoDisablePolicy']>
   normalizeModelVersionDots: boolean
   supportedModelsText: string
@@ -200,6 +202,7 @@ const defaultPoolForm = (): ExternalPoolFormDraft => ({
   requestBodyMode: 'normalized',
   rawModelMode: 'none',
   usageProjectionMode: 'pass_through',
+  streamResponseMode: 'inherit',
   autoDisablePolicy: 'inherit',
   normalizeModelVersionDots: false,
   supportedModelsText: '',
@@ -220,6 +223,7 @@ const poolFormFromPool = (pool: ExternalPool): ExternalPoolFormDraft => ({
   requestBodyMode: pool.requestBodyMode || 'normalized',
   rawModelMode: pool.rawModelMode || 'none',
   usageProjectionMode: pool.usageProjectionMode,
+  streamResponseMode: pool.streamResponseMode || 'inherit',
   autoDisablePolicy: pool.autoDisablePolicy,
   normalizeModelVersionDots: Boolean(pool.normalizeModelVersionDots),
   supportedModelsText: joinRules(pool.supportedModels || []),
@@ -337,6 +341,7 @@ export function ExternalPoolsPanel() {
         name: createForm.name.trim(),
         baseUrl: createForm.baseUrl.trim(),
         apiKey: createForm.apiKey.trim(),
+        streamResponseMode: createForm.streamResponseMode === 'inherit' ? null : createForm.streamResponseMode,
         priority: whole(createForm.priority ?? 100),
         maxConcurrentRequests: whole(createForm.maxConcurrentRequests ?? 10, 1),
         modelMappingRules: parseModelMappingRules(modelMappingRulesText),
@@ -372,6 +377,7 @@ export function ExternalPoolsPanel() {
         name: editForm.name.trim(),
         baseUrl: editForm.baseUrl.trim(),
         apiKey: editForm.apiKey?.trim() ? editForm.apiKey.trim() : undefined,
+        streamResponseMode: editForm.streamResponseMode === 'inherit' ? null : editForm.streamResponseMode,
         priority: whole(editForm.priority ?? 100),
         maxConcurrentRequests: whole(editForm.maxConcurrentRequests ?? 10, 1),
         modelMappingRules: parseModelMappingRules(modelMappingRulesText),
@@ -835,6 +841,20 @@ function ExternalPoolFormDialog({
                   <option value="current_path_policy">按当前路径整形：重写 usage 并应用全局补偿</option>
                 </SelectBox>
                 <HintBox>{usageProjectionDescription(draft.usageProjectionMode)}</HintBox>
+                <SelectBox
+                  label="流式 Usage 处理"
+                  value={draft.streamResponseMode}
+                  disabled={saving}
+                  onChange={(streamResponseMode) => onDraftChange((prev) => ({
+                    ...prev,
+                    streamResponseMode: streamResponseMode as ExternalPoolFormDraft['streamResponseMode'],
+                  }))}
+                >
+                  <option value="inherit">继承全局默认</option>
+                  <option value="event_passthrough_usage_rewrite">事件透传 + Usage 按路径整形</option>
+                  <option value="event_passthrough_capture">事件完全透传，仅内部计量</option>
+                </SelectBox>
+                <HintBox>{streamResponseDescription(draft.streamResponseMode)}</HintBox>
               </div>
             </FormSection>
           </div>
@@ -1388,11 +1408,28 @@ function usageProjectionDescription(mode: ExternalPool['usageProjectionMode'] | 
   return '严格透传外部池返回的 usage，不应用缓存补偿和输出补偿。适合只把外部池当作直接上游。'
 }
 
-function poolUsageSummary(pool: ExternalPool, config: ExternalPoolsConfig) {
-  if (pool.usageProjectionMode !== 'current_path_policy') {
-    return 'Usage: 严格透传'
+function streamResponseDescription(mode: ExternalPoolStreamResponseDraft) {
+  if (mode === 'event_passthrough_capture') {
+    return '普通 SSE event 原样下发；usage event 也保持上游原样，只在系统内部捕获并按入口策略记录费用和历史。适合排查外部上游原始输出。'
   }
-  const parts = ['Usage: 按路径整形']
+  if (mode === 'event_passthrough_usage_rewrite') {
+    return '普通 SSE event 原样下发；只在最终 usage event 按当前路径缓存策略改写下游可见字段，同时记录内部计量。'
+  }
+  return '不在该外部池单独指定流式 usage 处理方式，使用全局默认策略。'
+}
+
+function poolUsageSummary(pool: ExternalPool, config: ExternalPoolsConfig) {
+  const parts = pool.usageProjectionMode === 'current_path_policy'
+    ? ['Usage: 按路径整形']
+    : ['Usage: 严格透传']
+  const streamMode = pool.streamResponseMode || config.externalPoolStreamResponseMode
+  parts.push(streamMode === 'event_passthrough_capture' ? '流式: 原样usage' : '流式: 整形usage')
+  if (pool.streamResponseMode) {
+    parts.push('单池覆盖')
+  }
+  if (pool.usageProjectionMode !== 'current_path_policy') {
+    return parts.join(' · ')
+  }
   if (config.externalPoolUsageProjectionUpliftPercent > 0) {
     parts.push(`缓存 +${config.externalPoolUsageProjectionUpliftPercent}%`)
   }

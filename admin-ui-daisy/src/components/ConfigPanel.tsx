@@ -2278,7 +2278,7 @@ export function ConfigPanel() {
                   <Select.Option value="always">总是触发</Select.Option>
                 </Select>
               </FieldLabel>
-              <FieldLabel title="外部池流式响应" description="默认原样下发正常 SSE event，只旁路解析 usage 用于本地费用和历史记录；需要兼容旧的流式 usage 改写时再切回旧行为。">
+              <FieldLabel title="外部池默认流式 Usage 处理" description="作为外部池默认值；单个外部账号可以覆盖。默认只在 usage event 按入口缓存策略整形下游字段，普通 SSE event 仍事件级透传。">
                 <Select
                   bordered
                   size="sm"
@@ -2295,8 +2295,8 @@ export function ConfigPanel() {
                     }))
                   }
                 >
-                  <Select.Option value="event_passthrough_capture">事件透传并旁路计量</Select.Option>
-                  <Select.Option value="projected_rewrite">改写流式 Usage</Select.Option>
+                  <Select.Option value="event_passthrough_usage_rewrite">事件透传 + Usage 按路径整形</Select.Option>
+                  <Select.Option value="event_passthrough_capture">事件完全透传，仅内部计量</Select.Option>
                 </Select>
               </FieldLabel>
               <ToggleField title="整理思考内容" description="开启后，会把响应里的思考内容单独整理出来。" checked={draft.extractThinking} onChange={(extractThinking) => setDraft((prev) => ({ ...prev, extractThinking }))} />
