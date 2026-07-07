@@ -193,8 +193,8 @@
 - 后端字段：`externalPools.externalPoolStreamResponseMode`
 - 页面入口：新旧运行配置页的“外部池默认流式 Usage 处理”
 - 可选值：
-  - `event_passthrough_usage_rewrite`：默认值。普通 SSE event 原样下发给客户端；只在流式 `usage` event 上按当前路径缓存策略整形下游可见字段，并同时记录内部费用/历史。
-  - `event_passthrough_capture`：排查模式。普通 SSE event 和 `usage` event 都保持上游原样下发，只在内部捕获并按当前路径策略记录费用/历史；流式错误 event 仍会被本地屏蔽。
+  - `event_passthrough_usage_rewrite`：默认值。普通文本、thinking、tool 等 SSE event 原样下发给客户端；流式 `message_start.message.usage` 和最终 `message_delta.usage` 会按当前路径缓存策略整形下游可见字段，并同时记录内部费用/历史。`message_start.message.usage` 只做预览整形，不提交缓存状态，避免只有 start usage 的异常流污染下一次请求。
+  - `event_passthrough_capture`：排查模式。普通 SSE event、`message_start.message.usage` 和最终 usage 都保持上游原样下发，只在内部捕获并按当前路径策略记录费用/历史；流式错误 event 仍会被本地屏蔽。
 
 新增单池覆盖字段：
 
@@ -270,7 +270,7 @@
 - 模型解析页：模型名解析、别名/映射规则、自动生成规则。这些改变模型路由和上游模型名。
 - 接口兼容页：客户端接口 profile、Kiro 工作模式、thinking 输出展示、代理告警、外部池默认流式 Usage 处理。这些主要改变响应/协议兼容和诊断行为。
 
-因此，本次新增的全局 `externalPoolStreamResponseMode` 放在“接口兼容/外部池默认流式 Usage 处理”是合理的：它不改变请求体，也不决定路径缓存策略；它只决定外部池流式响应在 usage event 上是下游整形还是仅内部捕获。单个外部账号可以覆盖这个默认值。
+因此，本次新增的全局 `externalPoolStreamResponseMode` 放在“接口兼容/外部池默认流式 Usage 处理”是合理的：它不改变请求体，也不决定路径缓存策略；它只决定外部池流式响应里的 usage 字段是下游整形还是仅内部捕获。单个外部账号可以覆盖这个默认值。
 
 ### supportedModels 的合理配置
 
@@ -373,7 +373,8 @@ claude --bare --print --verbose \
 
 - 直接 SSE 正常。
 - Claude Code CLI `stream-json` 正常。
-- 下游流式 usage 保持上游透传。
+- `event_passthrough_capture` 下，下游流式 usage 保持上游透传。
+- 默认 `event_passthrough_usage_rewrite` 下，`message_start.message.usage` 与最终 `message_delta.usage` 均按路径策略整形；首次请求不会制造 cache read。
 - 内部 `reportedUsage` 仍能按本地策略整形并落库。
 - 错误路径会做公开错误遮蔽。
 - 外部池状态保持 `dispatchable=true`、`inFlight=0`、`autoDisabled=false`。

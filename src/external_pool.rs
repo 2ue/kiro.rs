@@ -3944,7 +3944,7 @@ fn maybe_project_non_stream_usage(
     usage_capture.raw = raw_usage;
     usage_capture.reported = raw_usage;
 
-    if let Some(projected) = project_usage_value(usage, projection) {
+    if let Some(projected) = project_usage_value(usage, projection, true) {
         usage_capture.request_input_tokens = Some(projected.request_input_tokens);
         usage_capture.shaped = Some(projected.shaped);
         usage_capture.reported = cache_usage_from_value(usage)
@@ -3992,27 +3992,11 @@ fn rewrite_sse_event_usage(
             out.extend_from_slice(line.as_bytes());
             continue;
         };
-        let Some(usage) = value.get_mut("usage") else {
+        let projected = process_usage_slots_in_sse_value(&mut value, projection, capture, true);
+        if !projected.changed {
             out.extend_from_slice(line.as_bytes());
             continue;
-        };
-        let raw_usage = cache_usage_from_value(usage);
-        let Some(projected_usage) = project_usage_value(usage, projection) else {
-            update_external_usage_capture(capture, raw_usage, raw_usage, raw_usage, false);
-            out.extend_from_slice(line.as_bytes());
-            continue;
-        };
-        update_external_usage_capture_request_input(
-            capture,
-            Some(projected_usage.request_input_tokens),
-        );
-        update_external_usage_capture(
-            capture,
-            raw_usage,
-            Some(projected_usage.shaped),
-            Some(projected_usage.reported),
-            true,
-        );
+        }
         changed = true;
         out.extend_from_slice(b"data:");
         out.extend_from_slice(leading_ws.as_bytes());
@@ -4046,26 +4030,68 @@ fn capture_sse_event_usage(
         let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data_json) else {
             continue;
         };
-        let Some(usage) = value.get_mut("usage") else {
-            continue;
-        };
-        let raw_usage = cache_usage_from_value(usage);
-        let Some(projected_usage) = project_usage_value(usage, projection) else {
-            update_external_usage_capture(capture, raw_usage, raw_usage, raw_usage, false);
-            continue;
-        };
-        update_external_usage_capture_request_input(
-            capture,
-            Some(projected_usage.request_input_tokens),
-        );
-        update_external_usage_capture(
-            capture,
-            raw_usage,
-            Some(projected_usage.shaped),
-            Some(projected_usage.reported),
-            true,
-        );
+        let _ = process_usage_slots_in_sse_value(&mut value, projection, capture, false);
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SseUsageProcessingResult {
+    changed: bool,
+}
+
+fn process_usage_slots_in_sse_value(
+    value: &mut serde_json::Value,
+    projection: Option<&ExternalUsageProjectionContext>,
+    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+    rewrite: bool,
+) -> SseUsageProcessingResult {
+    let mut result = SseUsageProcessingResult::default();
+    let mut handled_top_level = false;
+    if let Some(usage) = value.get_mut("usage") {
+        handled_top_level = true;
+        result.changed |= process_single_usage_value(usage, projection, capture, rewrite, true);
+    }
+    if let Some(usage) = value
+        .get_mut("message")
+        .and_then(|message| message.get_mut("usage"))
+    {
+        result.changed |= process_single_usage_value(usage, projection, capture, rewrite, false);
+    }
+    if !handled_top_level {
+        if let Some(usage) = value
+            .get_mut("delta")
+            .and_then(|delta| delta.get_mut("usage"))
+        {
+            result.changed |= process_single_usage_value(usage, projection, capture, rewrite, true);
+        }
+    }
+    result
+}
+
+fn process_single_usage_value(
+    usage: &mut serde_json::Value,
+    projection: Option<&ExternalUsageProjectionContext>,
+    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+    rewrite: bool,
+    commit_cache_state: bool,
+) -> bool {
+    let raw_usage = cache_usage_from_value(usage);
+    let Some(projected_usage) = project_usage_value(usage, projection, commit_cache_state) else {
+        update_external_usage_capture(capture, raw_usage, raw_usage, raw_usage, false);
+        return false;
+    };
+    update_external_usage_capture_request_input(
+        capture,
+        Some(projected_usage.request_input_tokens),
+    );
+    update_external_usage_capture(
+        capture,
+        raw_usage,
+        Some(projected_usage.shaped),
+        Some(projected_usage.reported),
+        true,
+    );
+    rewrite
 }
 
 fn process_sse_event_with_plan(
@@ -4319,6 +4345,7 @@ struct ProjectedExternalUsage {
 fn project_usage_value(
     usage: &mut serde_json::Value,
     projection: Option<&ExternalUsageProjectionContext>,
+    commit_cache_state: bool,
 ) -> Option<ProjectedExternalUsage> {
     let projection = projection?;
     if projection.mode != ExternalPoolUsageProjectionMode::CurrentPathPolicy {
@@ -4339,7 +4366,9 @@ fn project_usage_value(
             cache_creation_5m_input_tokens: 0,
             cache_creation_1h_input_tokens: 0,
         });
-    projection.mark_committed(computed);
+    if commit_cache_state {
+        projection.mark_committed(computed);
+    }
     let controlled = if projection.cache_state_enabled && projection.reported_policy.is_some() {
         projection
             .prompt_cache_creation_controller
@@ -7422,6 +7451,83 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
         assert!(reported.input_tokens <= 96);
         assert_eq!(reported.cache_read_input_tokens, 0);
         assert!(reported.cache_creation_input_tokens > 0);
+    }
+
+    #[test]
+    fn sse_message_start_usage_is_rewritten_without_committing_cache_state() {
+        let event = br#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_fake","type":"message","role":"assistant","content":[],"model":"fake-sonnet","stop_reason":null,"usage":{"input_tokens":100000,"output_tokens":0,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}}
+
+"#;
+        let route = test_route("claude-sonnet-4-5");
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+        let projection = projection_context(&route, &pool, 0).expect("projection");
+        let projected = rewrite_sse_event_usage(event, Some(&projection), None);
+        let text = std::str::from_utf8(&projected).expect("projected utf8");
+
+        assert!(text.contains(r#""type":"message_start""#));
+        assert!(!text.contains(r#""input_tokens":100000"#));
+        assert!(text.contains(r#""cache_read_input_tokens":0"#));
+        assert!(text.contains(r#""output_tokens":0"#));
+
+        let mut second_route = route.clone();
+        payload_mut(&mut second_route).messages.extend([
+            Message {
+                role: "assistant".to_string(),
+                content: serde_json::json!("ready"),
+            },
+            Message {
+                role: "user".to_string(),
+                content: serde_json::json!("continue after start event only"),
+            },
+        ]);
+        let second_projection =
+            projection_context(&second_route, &pool, 0).expect("second projection");
+        let mut final_usage = serde_json::json!({
+            "input_tokens": 100000,
+            "output_tokens": 1,
+            "cache_creation_input_tokens": 50000,
+            "cache_read_input_tokens": 0
+        });
+        let final_projected = project_usage_value(&mut final_usage, Some(&second_projection), true)
+            .expect("final projected usage");
+        assert_eq!(final_projected.reported.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn sse_capture_mode_keeps_message_start_usage_body_and_records_projection() {
+        let event = br#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_fake","type":"message","role":"assistant","content":[],"model":"fake-sonnet","stop_reason":null,"usage":{"input_tokens":100000,"output_tokens":0,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}}
+
+"#;
+        let capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
+            stream_response_mode: Some(ExternalPoolStreamResponseMode::EventPassthroughCapture),
+            ..ExternalUsageCapture::default()
+        }));
+        let route = test_route("claude-sonnet-4-5");
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+        let projection = projection_context(&route, &pool, 0).expect("projection");
+
+        let passthrough = process_sse_event_with_plan(
+            event,
+            Some(&projection),
+            Some(&capture),
+            None,
+            ExternalStreamProcessingPlan::from_mode(
+                ExternalPoolStreamResponseMode::EventPassthroughCapture,
+            ),
+        );
+
+        assert_eq!(passthrough, event);
+        let capture = capture.lock().clone();
+        assert!(capture.projected);
+        assert_eq!(capture.raw.expect("raw").input_tokens, 100000);
+        let reported = capture.reported.expect("reported usage");
+        assert!(reported.input_tokens <= 96);
+        assert_eq!(reported.output_tokens, 0);
+        assert_eq!(reported.cache_read_input_tokens, 0);
     }
 
     #[test]
