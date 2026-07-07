@@ -4,6 +4,20 @@ export const splitRules = (value: string) => value.split('\n').map((item) => ite
 export const joinRules = (value: string[] = []) => value.join('\n')
 export const whole = (value: number, min = 0) => Math.max(min, Math.floor(Number.isFinite(value) ? value : min))
 
+export const parseSupportedModelsText = (value: string): string[] => {
+  const seen = new Set<string>()
+  const models: string[] = []
+  for (const item of value.split(/[\n,\t]+/)) {
+    const model = item.trim()
+    if (!model) continue
+    const key = model.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    models.push(model)
+  }
+  return models
+}
+
 export const DEFAULT_POOL_MODEL_MAPPING_MODE: NonNullable<CreateExternalPoolRequest['modelMappingMode']> = 'processed_mapping'
 
 export const parseModelMappingRules = (value: string): ExternalPoolModelMappingRule[] => value
@@ -81,10 +95,10 @@ export type ExternalPoolFormDraft = {
   requestBodyMode: NonNullable<CreateExternalPoolRequest['requestBodyMode']>
   rawModelMode: NonNullable<CreateExternalPoolRequest['rawModelMode']>
   usageProjectionMode: NonNullable<CreateExternalPoolRequest['usageProjectionMode']>
-  skipNonStreamUsageProjection: boolean
   autoDisablePolicy: NonNullable<CreateExternalPoolRequest['autoDisablePolicy']>
   preservePath: boolean
   normalizeModelVersionDots: boolean
+  supportedModelsText: string
   modelMappingMode: NonNullable<CreateExternalPoolRequest['modelMappingMode']>
   modelMappingRequireMatch: boolean
   modelMappingRulesText: string
@@ -102,10 +116,10 @@ export const defaultPoolForm = (): ExternalPoolFormDraft => ({
   requestBodyMode: 'normalized',
   rawModelMode: 'none',
   usageProjectionMode: 'pass_through',
-  skipNonStreamUsageProjection: false,
   autoDisablePolicy: 'inherit',
   preservePath: true,
   normalizeModelVersionDots: false,
+  supportedModelsText: '',
   modelMappingMode: DEFAULT_POOL_MODEL_MAPPING_MODE,
   modelMappingRequireMatch: false,
   modelMappingRulesText: '',
@@ -123,10 +137,10 @@ export const poolFormFromPool = (pool: ExternalPool): ExternalPoolFormDraft => (
   requestBodyMode: pool.requestBodyMode || 'normalized',
   rawModelMode: pool.rawModelMode || 'none',
   usageProjectionMode: pool.usageProjectionMode,
-  skipNonStreamUsageProjection: Boolean(pool.skipNonStreamUsageProjection),
   autoDisablePolicy: pool.autoDisablePolicy,
   preservePath: pool.preservePath !== false,
   normalizeModelVersionDots: Boolean(pool.normalizeModelVersionDots),
+  supportedModelsText: joinRules(pool.supportedModels || []),
   modelMappingMode: pool.modelMappingMode || DEFAULT_POOL_MODEL_MAPPING_MODE,
   modelMappingRequireMatch: Boolean(pool.modelMappingRequireMatch),
   modelMappingRulesText: joinModelMappingRules(pool.modelMappingRules || []),
@@ -201,6 +215,13 @@ export function poolBodyModeSummary(pool: ExternalPool): string {
   return 'Body：标准处理'
 }
 
+export function poolSupportedModelsSummary(pool: ExternalPool): string {
+  const models = pool.supportedModels || []
+  if (models.length === 0) return '支持：不限制'
+  if (models.length <= 2) return `支持：${models.join(', ')}`
+  return `支持：${models[0]}, ${models[1]} 等 ${models.length} 个`
+}
+
 export function usageProjectionDescription(mode: ExternalPool['usageProjectionMode'] | undefined): string {
   if (mode === 'current_path_policy') {
     return '按当前入口规则整理用量，并应用全局用量补偿。适合希望外部账号展示方式和本地入口一致的场景。'
@@ -213,9 +234,6 @@ export function poolUsageSummary(pool: ExternalPool, config: ExternalPoolsConfig
     return '用量：保持原样'
   }
   const parts = ['用量：按入口规则']
-  if (pool.skipNonStreamUsageProjection) {
-    parts.push('同步原样')
-  }
   if (config.externalPoolUsageProjectionUpliftPercent > 0) {
     parts.push(`缓存 +${config.externalPoolUsageProjectionUpliftPercent}%`)
   }

@@ -60,6 +60,7 @@ use crate::{
         ModelProcessingConfig, ModelProcessingError, ModelProcessingInput, ModelProcessingMode,
         process_model,
     },
+    model::model_support::model_is_supported_by_list,
     storage::{
         postgres::PostgresStore,
         redis_cache::{LocalPoolCircuitState, RedisStore},
@@ -306,8 +307,6 @@ pub struct ExternalPool {
     pub max_concurrent_requests: u32,
     pub usage_projection_mode: ExternalPoolUsageProjectionMode,
     #[serde(default)]
-    pub skip_non_stream_usage_projection: bool,
-    #[serde(default)]
     pub request_body_mode: ExternalPoolRequestBodyMode,
     #[serde(default)]
     pub raw_model_mode: ExternalPoolRawModelMode,
@@ -330,6 +329,8 @@ pub struct ExternalPool {
     pub model_mapping_require_match: bool,
     #[serde(default)]
     pub model_mapping_rules: Vec<ModelMappingRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_models: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -364,8 +365,6 @@ pub struct CreateExternalPoolRequest {
     #[serde(default)]
     pub usage_projection_mode: ExternalPoolUsageProjectionMode,
     #[serde(default)]
-    pub skip_non_stream_usage_projection: bool,
-    #[serde(default)]
     pub request_body_mode: ExternalPoolRequestBodyMode,
     #[serde(default)]
     pub raw_model_mode: ExternalPoolRawModelMode,
@@ -381,6 +380,8 @@ pub struct CreateExternalPoolRequest {
     pub model_mapping_require_match: bool,
     #[serde(default)]
     pub model_mapping_rules: Vec<ModelMappingRule>,
+    #[serde(default)]
+    pub supported_models: Vec<String>,
     #[serde(default)]
     pub notes: Option<String>,
 }
@@ -405,8 +406,6 @@ pub struct UpdateExternalPoolRequest {
     #[serde(default)]
     pub usage_projection_mode: Option<ExternalPoolUsageProjectionMode>,
     #[serde(default)]
-    pub skip_non_stream_usage_projection: Option<bool>,
-    #[serde(default)]
     pub request_body_mode: Option<ExternalPoolRequestBodyMode>,
     #[serde(default)]
     pub raw_model_mode: Option<ExternalPoolRawModelMode>,
@@ -422,6 +421,8 @@ pub struct UpdateExternalPoolRequest {
     pub model_mapping_require_match: Option<bool>,
     #[serde(default)]
     pub model_mapping_rules: Option<Vec<ModelMappingRule>>,
+    #[serde(default)]
+    pub supported_models: Option<Vec<String>>,
     #[serde(default)]
     pub notes: Option<String>,
 }
@@ -538,6 +539,14 @@ impl ExternalRouteRequest {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
+    fn model_candidates_for_support(&self) -> [Option<&str>; 3] {
+        [
+            self.upstream_model.as_deref(),
+            self.payload.as_ref().map(|payload| payload.model.as_str()),
+            self.model_hint.as_deref(),
+        ]
+    }
+
     fn requested_max_tokens(&self) -> Option<i32> {
         self.payload
             .as_ref()
@@ -609,6 +618,14 @@ impl ExternalLatencyTraceState {
                 .map(|_| self.chunks_before_first_output.load(Ordering::Acquire) as u32),
             events_before_first_output: first_output_delta_ms
                 .map(|_| self.events_before_first_output.load(Ordering::Acquire) as u32),
+            upstream_bytes_before_first_output: None,
+            upstream_frames_before_first_output: None,
+            upstream_events_before_first_output: None,
+            upstream_frames_without_downstream_events_before_first_output: None,
+            upstream_pending_chunks_before_first_output: None,
+            upstream_frame_decode_errors_before_first_output: None,
+            upstream_event_parse_errors_before_first_output: None,
+            upstream_event_types_before_first_output: None,
             client_dropped_ms: None,
             terminal_reason: None,
         };
@@ -1062,7 +1079,7 @@ impl ExternalPoolManager {
         config: &ExternalPoolsConfig,
         body_mode: ExternalPoolRequestBodyMode,
     ) -> bool {
-        self.scan_pool_availability_uncached(&HashSet::new(), config, false, Some(body_mode))
+        self.scan_pool_availability_uncached(&HashSet::new(), config, false, Some(body_mode), None)
             .await
             .availability
             .has_eligible_pool()
@@ -1073,7 +1090,7 @@ impl ExternalPoolManager {
         config: &ExternalPoolsConfig,
         body_mode: ExternalPoolRequestBodyMode,
     ) -> bool {
-        self.scan_pool_availability_uncached(&HashSet::new(), config, false, Some(body_mode))
+        self.scan_pool_availability_uncached(&HashSet::new(), config, false, Some(body_mode), None)
             .await
             .availability
             .available_pools
@@ -1217,7 +1234,12 @@ impl ExternalPoolManager {
                 break;
             }
             let selection = self
-                .select_pool_with_availability_uncached(&excluded, &config, route.body_mode_filter)
+                .select_pool_with_availability_uncached(
+                    &excluded,
+                    &config,
+                    route.body_mode_filter,
+                    Some(&route.model_candidates_for_support()),
+                )
                 .await;
             if max_attempts.is_none() {
                 max_attempts = Some(
@@ -1265,7 +1287,11 @@ impl ExternalPoolManager {
                     );
                     if unavailable.exclude_pool_for_reselect {
                         excluded.insert(pool_id);
-                        if self.select_pool(&excluded, &config).await.is_some() {
+                        if self
+                            .select_pool_for_route(&excluded, &config, &route)
+                            .await
+                            .is_some()
+                        {
                             continue;
                         }
                         excluded.remove(&pool_id);
@@ -1794,14 +1820,32 @@ impl ExternalPoolManager {
         }
     }
 
+    #[cfg(test)]
     async fn select_pool(
         &self,
         excluded: &HashSet<u64>,
         config: &ExternalPoolsConfig,
     ) -> Option<ExternalPool> {
-        self.scan_pool_availability_uncached(excluded, config, true, None)
+        self.scan_pool_availability_uncached(excluded, config, true, None, None)
             .await
             .selected_pool
+    }
+
+    async fn select_pool_for_route(
+        &self,
+        excluded: &HashSet<u64>,
+        config: &ExternalPoolsConfig,
+        route: &ExternalRouteRequest,
+    ) -> Option<ExternalPool> {
+        self.scan_pool_availability_uncached(
+            excluded,
+            config,
+            true,
+            route.body_mode_filter,
+            Some(&route.model_candidates_for_support()),
+        )
+        .await
+        .selected_pool
     }
 
     async fn select_pool_with_availability_uncached(
@@ -1809,9 +1853,16 @@ impl ExternalPoolManager {
         excluded: &HashSet<u64>,
         config: &ExternalPoolsConfig,
         body_mode_filter: Option<ExternalPoolRequestBodyMode>,
+        model_candidates: Option<&[Option<&str>]>,
     ) -> PoolSelectionSnapshot {
-        self.scan_pool_availability_uncached(excluded, config, true, body_mode_filter)
-            .await
+        self.scan_pool_availability_uncached(
+            excluded,
+            config,
+            true,
+            body_mode_filter,
+            model_candidates,
+        )
+        .await
     }
 
     async fn scan_pool_availability_uncached(
@@ -1820,6 +1871,7 @@ impl ExternalPoolManager {
         config: &ExternalPoolsConfig,
         include_selection: bool,
         body_mode_filter: Option<ExternalPoolRequestBodyMode>,
+        model_candidates: Option<&[Option<&str>]>,
     ) -> PoolSelectionSnapshot {
         if !config.external_pools_enabled {
             return PoolSelectionSnapshot::default();
@@ -1837,6 +1889,9 @@ impl ExternalPoolManager {
                 continue;
             }
             if !external_pool_matches_body_mode_filter(&pool, body_mode_filter) {
+                continue;
+            }
+            if !external_pool_matches_supported_models(&pool, model_candidates) {
                 continue;
             }
             availability.eligible_pools += 1;
@@ -1918,7 +1973,7 @@ impl ExternalPoolManager {
         }
 
         let snapshot = self
-            .scan_pool_availability_uncached(excluded, config, false, None)
+            .scan_pool_availability_uncached(excluded, config, false, None, None)
             .await
             .availability;
         if cacheable {
@@ -3106,6 +3161,19 @@ fn external_pool_matches_body_mode_filter(
     filter: Option<ExternalPoolRequestBodyMode>,
 ) -> bool {
     filter.is_none_or(|mode| pool.request_body_mode == mode)
+}
+
+fn external_pool_matches_supported_models(
+    pool: &ExternalPool,
+    model_candidates: Option<&[Option<&str>]>,
+) -> bool {
+    if pool.supported_models.is_empty() {
+        return true;
+    }
+    let Some(model_candidates) = model_candidates else {
+        return true;
+    };
+    model_is_supported_by_list(&pool.supported_models, model_candidates)
 }
 
 fn external_pool_prepare_request(
@@ -4459,7 +4527,6 @@ mod tests {
             priority,
             max_concurrent_requests: 1,
             usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
-            skip_non_stream_usage_projection: false,
             request_body_mode: ExternalPoolRequestBodyMode::Normalized,
             raw_model_mode: ExternalPoolRawModelMode::None,
             auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
@@ -4468,6 +4535,7 @@ mod tests {
             model_mapping_mode: ExternalPoolModelMappingMode::ProcessedMapping,
             model_mapping_require_match: false,
             model_mapping_rules: Vec::new(),
+            supported_models: Vec::new(),
             notes: None,
         }
     }
@@ -4773,7 +4841,7 @@ mod tests {
             PoolAcquireResult::Unavailable(_) => panic!("pool lease should be acquired"),
         };
         let selection = manager
-            .scan_pool_availability_uncached(&HashSet::new(), &config, true, None)
+            .scan_pool_availability_uncached(&HashSet::new(), &config, true, None, None)
             .await;
         assert!(selection.selected_pool.is_none());
         let uncached_full = selection.availability;
@@ -5352,7 +5420,6 @@ data: {"type":"message_delta","note":"content_block_delta"}
             priority: 10,
             max_concurrent_requests: 10,
             usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
-            skip_non_stream_usage_projection: false,
             request_body_mode: ExternalPoolRequestBodyMode::Normalized,
             raw_model_mode: ExternalPoolRawModelMode::None,
             auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
@@ -5366,6 +5433,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
             model_mapping_mode: ExternalPoolModelMappingMode::ProcessedMapping,
             model_mapping_require_match: false,
             model_mapping_rules: Vec::new(),
+            supported_models: Vec::new(),
             notes: None,
             created_at: now,
             updated_at: now,
@@ -5386,6 +5454,75 @@ data: {"type":"message_delta","note":"content_block_delta"}
         let mut pool = test_pool("https://example.com/v1", true);
         pool.normalize_model_version_dots = true;
         pool
+    }
+
+    #[test]
+    fn supported_model_filter_allows_empty_and_matches_route_candidates() {
+        let mut pool = test_pool("https://example.com/v1", true);
+        let route = test_route("claude-sonnet-4.5");
+
+        assert!(external_pool_matches_supported_models(
+            &pool,
+            Some(&route.model_candidates_for_support())
+        ));
+
+        pool.supported_models = vec!["claude-haiku-4.5".to_string()];
+        assert!(!external_pool_matches_supported_models(
+            &pool,
+            Some(&route.model_candidates_for_support())
+        ));
+
+        pool.supported_models = vec!["claude-sonnet-4.5".to_string()];
+        assert!(external_pool_matches_supported_models(
+            &pool,
+            Some(&route.model_candidates_for_support())
+        ));
+    }
+
+    #[test]
+    fn supported_model_filter_matches_upstream_payload_and_raw_model_candidates() {
+        let mut pool = test_pool("https://example.com/v1", true);
+        let mut route = test_route("client-alias");
+        route.upstream_model = Some("claude-sonnet-4.5".to_string());
+
+        pool.supported_models = vec!["claude-sonnet-4.5".to_string()];
+        assert!(external_pool_matches_supported_models(
+            &pool,
+            Some(&route.model_candidates_for_support())
+        ));
+
+        pool.supported_models = vec!["client-alias".to_string()];
+        assert!(external_pool_matches_supported_models(
+            &pool,
+            Some(&route.model_candidates_for_support())
+        ));
+
+        let raw_route = raw_test_route(
+            br#"{"model":"raw-client-model","stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
+        );
+        pool.supported_models = vec!["raw-client-model".to_string()];
+        assert!(external_pool_matches_supported_models(
+            &pool,
+            Some(&raw_route.model_candidates_for_support())
+        ));
+
+        pool.supported_models = vec!["other-model".to_string()];
+        assert!(!external_pool_matches_supported_models(
+            &pool,
+            Some(&raw_route.model_candidates_for_support())
+        ));
+    }
+
+    #[test]
+    fn supported_model_filter_requires_a_candidate_when_list_is_restricted() {
+        let mut pool = test_pool("https://example.com/v1", true);
+        pool.supported_models = vec!["claude-sonnet-4.5".to_string()];
+
+        assert!(external_pool_matches_supported_models(&pool, None));
+        assert!(!external_pool_matches_supported_models(
+            &pool,
+            Some(&[None, None, None])
+        ));
     }
 
     fn test_external_pool_outbound_body(
@@ -5705,6 +5842,24 @@ data: {"type":"message_delta","note":"content_block_delta"}
     }
 
     #[test]
+    fn raw_body_none_model_mode_ignores_mapping_settings_and_keeps_body() {
+        let raw = br#"{"model":"client-model","stream":false,"messages":[{"role":"user","content":"hello"}]}"#;
+        let route = raw_test_route(raw);
+        let mut pool = test_pool("https://example.com/v1", true);
+        pool.request_body_mode = ExternalPoolRequestBodyMode::RawPassthrough;
+        pool.raw_model_mode = ExternalPoolRawModelMode::None;
+        pool.model_mapping_mode = ExternalPoolModelMappingMode::DirectMapping;
+        pool.model_mapping_require_match = true;
+        pool.normalize_model_version_dots = true;
+        pool.model_mapping_rules = vec![model_rule("other-model", "mapped-model")];
+
+        let prepared = external_pool_prepare_request(&route, &pool).unwrap();
+
+        assert_eq!(prepared.body, Bytes::from_static(raw));
+        assert!(prepared.outbound_model.is_none());
+    }
+
+    #[test]
     fn external_pool_raw_body_mode_does_not_apply_payload_guard() {
         let raw = br#"{"model":"client-model","stream":false,"messages":[{"role":"user","content":"keep raw body even when guard config is enabled"}]}"#;
         let mut route = test_route("client-model");
@@ -5788,6 +5943,27 @@ data: {"type":"message_delta","note":"content_block_delta"}
     }
 
     #[test]
+    fn external_pool_raw_probe_only_require_mapping_match_rejects_miss_without_mutating_body() {
+        let raw = br#"{"model":"client-model","stream":true,"messages":[{"role":"user","content":"hello"}]}"#;
+        let route = raw_test_route(raw);
+        let mut pool = test_pool("https://example.com/v1", true);
+        pool.request_body_mode = ExternalPoolRequestBodyMode::RawPassthrough;
+        pool.raw_model_mode = ExternalPoolRawModelMode::ProbeOnly;
+        pool.model_mapping_mode = ExternalPoolModelMappingMode::PassthroughMapping;
+        pool.model_mapping_require_match = true;
+        pool.model_mapping_rules = vec![model_rule("other-model", "mapped-model")];
+
+        let err = match external_pool_prepare_request(&route, &pool) {
+            Ok(_) => panic!("raw probe should reject mapping miss"),
+            Err(err) => err,
+        };
+
+        assert!(err.retryable);
+        assert_eq!(err.status, Some(StatusCode::BAD_GATEWAY));
+        assert_eq!(error_type_for_external_error(&err), "model_mapping_miss");
+    }
+
+    #[test]
     fn external_pool_raw_rewrite_changes_only_top_level_model() {
         let raw = br#"{"messages":[{"role":"user","content":[{"type":"tool_result","content":{"model":"nested-model"}}]}],"model":"client-model","stream":false}"#;
         let route = raw_test_route(raw);
@@ -5809,6 +5985,27 @@ data: {"type":"message_delta","note":"content_block_delta"}
         );
         assert!(text.contains(r#""model":"nested-model""#));
         assert_eq!(prepared.outbound_model.as_deref(), Some("mapped-model"));
+    }
+
+    #[test]
+    fn external_pool_raw_rewrite_require_mapping_match_rejects_miss() {
+        let raw = br#"{"model":"client-model","stream":false,"messages":[{"role":"user","content":"hello"}]}"#;
+        let route = raw_test_route(raw);
+        let mut pool = test_pool("https://example.com/v1", true);
+        pool.request_body_mode = ExternalPoolRequestBodyMode::RawPassthrough;
+        pool.raw_model_mode = ExternalPoolRawModelMode::RewriteTopLevel;
+        pool.model_mapping_mode = ExternalPoolModelMappingMode::PassthroughMapping;
+        pool.model_mapping_require_match = true;
+        pool.model_mapping_rules = vec![model_rule("other-model", "mapped-model")];
+
+        let err = match external_pool_prepare_request(&route, &pool) {
+            Ok(_) => panic!("raw rewrite should reject mapping miss"),
+            Err(err) => err,
+        };
+
+        assert!(err.retryable);
+        assert_eq!(err.status, Some(StatusCode::BAD_GATEWAY));
+        assert_eq!(error_type_for_external_error(&err), "model_mapping_miss");
     }
 
     #[test]
@@ -6311,40 +6508,6 @@ data: {"type":"message_delta","note":"content_block_delta"}
     }
 
     #[test]
-    fn usage_projection_can_skip_non_stream_current_path_policy() {
-        let body = Bytes::from_static(
-            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}"#,
-        );
-        let route = test_route("claude-sonnet-4-5");
-        let mut pool = test_pool("http://pool.example.com", false);
-        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
-        pool.skip_non_stream_usage_projection = true;
-
-        let projection = projection_context(&route, &pool, 0);
-        assert!(projection.is_none());
-
-        let projected = maybe_project_non_stream_usage(body.clone(), projection.as_ref());
-        assert_eq!(projected.body, body);
-        assert!(!projected.usage_capture.projected);
-        assert_eq!(
-            projected.usage_capture.raw,
-            projected.usage_capture.reported
-        );
-    }
-
-    #[test]
-    fn usage_projection_skip_non_stream_keeps_stream_projection_enabled() {
-        let mut route = test_route("claude-sonnet-4-5");
-        payload_mut(&mut route).stream = true;
-        let mut pool = test_pool("http://pool.example.com", false);
-        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
-        pool.skip_non_stream_usage_projection = true;
-
-        let projection = projection_context(&route, &pool, 0);
-        assert!(projection.is_some());
-    }
-
-    #[test]
     fn usage_projection_path_skip_non_stream_blocks_external_projection() {
         let mut route = test_route("claude-sonnet-4-5");
         route.reported_usage.path_overrides.insert(
@@ -6357,7 +6520,6 @@ data: {"type":"message_delta","note":"content_block_delta"}
         );
         let mut pool = test_pool("http://pool.example.com", false);
         pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
-        pool.skip_non_stream_usage_projection = false;
 
         let projection = projection_context(&route, &pool, 0);
         assert!(projection.is_none());
@@ -6377,7 +6539,6 @@ data: {"type":"message_delta","note":"content_block_delta"}
         );
         let mut pool = test_pool("http://pool.example.com", false);
         pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
-        pool.skip_non_stream_usage_projection = false;
 
         let projection = projection_context(&route, &pool, 0);
         assert!(projection.is_some());

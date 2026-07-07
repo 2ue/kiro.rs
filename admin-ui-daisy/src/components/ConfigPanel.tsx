@@ -1713,6 +1713,8 @@ export function ConfigPanel() {
       kiroUpstreamResponseTimeoutSecs: toWhole(draft.kiroUpstreamResponseTimeoutSecs),
       kiroUpstreamStreamIdleTimeoutSecs: toWhole(draft.kiroUpstreamStreamIdleTimeoutSecs),
       credentialRetryMaxAttempts: toWhole(draft.credentialRetryMaxAttempts),
+      credentialPromptLogicRetryEnabled: Boolean(draft.credentialPromptLogicRetryEnabled),
+      credentialPromptLogicRetryMaxAttempts: toWhole(draft.credentialPromptLogicRetryMaxAttempts),
       credentialInFlightLeaseMaxSecs: toWhole(draft.credentialInFlightLeaseMaxSecs),
       dispatchGlobalMaxConcurrentRequests: toWhole(draft.dispatchGlobalMaxConcurrentRequests),
       dispatchMaxQueuedRequests: toWhole(draft.dispatchMaxQueuedRequests),
@@ -1868,6 +1870,8 @@ export function ConfigPanel() {
             <NumberField title="开始响应等待时间" description="请求发出后最多等多久开始返回内容。填 0 表示使用默认超时。" value={draft.kiroUpstreamResponseTimeoutSecs} min={0} suffix="秒" onChange={(kiroUpstreamResponseTimeoutSecs) => setDraft((prev) => ({ ...prev, kiroUpstreamResponseTimeoutSecs }))} />
             <NumberField title="流式静默超时" description="流式响应长时间没有新内容时结束本次请求。填 0 表示不按流式空闲时间主动结束。" value={draft.kiroUpstreamStreamIdleTimeoutSecs} min={0} suffix="秒" onChange={(kiroUpstreamStreamIdleTimeoutSecs) => setDraft((prev) => ({ ...prev, kiroUpstreamStreamIdleTimeoutSecs }))} />
             <NumberField title="单请求最大重试次数" description="一次请求失败后最多换几个账号再试。填 0 表示由系统自动决定。" value={draft.credentialRetryMaxAttempts} min={0} suffix="次" onChange={(credentialRetryMaxAttempts) => setDraft((prev) => ({ ...prev, credentialRetryMaxAttempts }))} />
+            <ToggleField title="提示逻辑错误换号" description="开启后，部分模型已解析成功但上游返回提示/工具协议 400 的请求，会换未尝试账号重试。默认关闭。" checked={draft.credentialPromptLogicRetryEnabled} onChange={(credentialPromptLogicRetryEnabled) => setDraft((prev) => ({ ...prev, credentialPromptLogicRetryEnabled }))} />
+            <NumberField title="提示逻辑最多换号" description="仅在上方开关开启时生效；填 0 表示默认 1 次。" value={draft.credentialPromptLogicRetryMaxAttempts} min={0} suffix="次" disabled={!draft.credentialPromptLogicRetryEnabled} onChange={(credentialPromptLogicRetryMaxAttempts) => setDraft((prev) => ({ ...prev, credentialPromptLogicRetryMaxAttempts }))} />
             <NumberField title="异常并发自动回收" description="单个并发占用超过多久未活跃时自动释放。填 0 表示关闭。" value={draft.credentialInFlightLeaseMaxSecs} min={0} suffix="秒" onChange={(credentialInFlightLeaseMaxSecs) => setDraft((prev) => ({ ...prev, credentialInFlightLeaseMaxSecs }))} />
             <ToggleField
               title="按 token 重量计算本地容量"

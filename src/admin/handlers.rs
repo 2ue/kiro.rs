@@ -18,11 +18,13 @@ use super::{
         CreateRequestApiKeyRequest, ExportCredentialsQuery, ExternalPoolTestRequest,
         ProxyResourceTestRequest, RefreshCredentialInfoRequest, SetCredentialConcurrencyRequest,
         SetCredentialProxyRequest, SetCredentialRegionsRequest, SetCredentialRpmRequest,
-        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SetWarmupRequest,
-        SuccessResponse, SystemVersionResponse, TestCredentialRequest, UpdateAdminApiKeyRequest,
-        UpdateCredentialAuthRequest, UpdateProxyResourceRequest, UpdateRequestApiKeyRequest,
-        UpdateRuntimeConfigRequest, UpsertManualModelRequest, UsageCleanupRequest,
-        ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
+        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
+        SetSupportedModelsRequest, SetWarmupRequest, SuccessResponse,
+        SyncSupportedModelsFromCredentialRequest, SystemVersionResponse, TestCredentialRequest,
+        UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
+        UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
+        UsageCleanupRequest, ValidateExistingCredentialsRequest,
+        ValidateExternalCredentialsRequest,
     },
 };
 use crate::anthropic::usage::{UsageRecordQuery, UsageRecordStatus, UsageSource};
@@ -84,6 +86,7 @@ pub struct AuditLogsQueryParams {
 #[serde(rename_all = "camelCase")]
 pub struct UsageRecordsQueryParams {
     pub limit: Option<usize>,
+    pub request_id: Option<String>,
     pub q: Option<String>,
     pub endpoint: Option<String>,
     pub conversation_id: Option<String>,
@@ -103,6 +106,7 @@ pub struct UsageRecordsQueryParams {
 pub struct UsageRecordsPageQueryParams {
     pub page: Option<usize>,
     pub limit: Option<usize>,
+    pub request_id: Option<String>,
     pub q: Option<String>,
     pub endpoint: Option<String>,
     pub conversation_id: Option<String>,
@@ -141,6 +145,7 @@ impl UsageRecordsQueryParams {
     fn into_query(self) -> Result<UsageRecordQuery, String> {
         Ok(UsageRecordQuery {
             limit: self.limit.unwrap_or_default(),
+            request_id: non_blank(self.request_id),
             q: non_blank(self.q),
             endpoint: non_blank(self.endpoint),
             conversation_id: non_blank(self.conversation_id),
@@ -163,6 +168,7 @@ impl UsageRecordsPageQueryParams {
         let limit = self.limit.unwrap_or_default();
         let query = UsageRecordQuery {
             limit,
+            request_id: non_blank(self.request_id),
             q: non_blank(self.q),
             endpoint: non_blank(self.endpoint),
             conversation_id: non_blank(self.conversation_id),
@@ -384,6 +390,64 @@ pub async fn set_credential_rpm(
 ) -> impl IntoResponse {
     match state.service.set_credential_rpm(id, payload) {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} RPM 限制已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/supported-models
+/// 设置凭据支持模型列表
+pub async fn set_credential_supported_models(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetSupportedModelsRequest>,
+) -> impl IntoResponse {
+    match state.service.set_credential_supported_models(id, payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/supported-models/sync
+/// 使用该凭据同步并写回支持模型列表
+pub async fn sync_credential_supported_models(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.sync_credential_supported_models(id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/external-pools/:id/supported-models
+/// 设置外部池支持模型列表
+pub async fn set_external_pool_supported_models(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetSupportedModelsRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .set_external_pool_supported_models(id, payload)
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/external-pools/:id/supported-models/sync
+/// 使用指定本地凭据同步并写回外部池支持模型列表
+pub async fn sync_external_pool_supported_models(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SyncSupportedModelsFromCredentialRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .sync_external_pool_supported_models(id, payload)
+        .await
+    {
+        Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -1131,6 +1195,7 @@ mod tests {
     fn usage_records_query_ignores_blank_text_filters() {
         let query = UsageRecordsQueryParams {
             limit: Some(25),
+            request_id: None,
             q: Some("   ".to_string()),
             conversation_id: Some("   ".to_string()),
             credential_id: Some(7),
@@ -1163,6 +1228,7 @@ mod tests {
     fn usage_records_query_rejects_invalid_enums_and_time() {
         let bad_status = UsageRecordsQueryParams {
             limit: None,
+            request_id: None,
             q: None,
             conversation_id: None,
             credential_id: None,
@@ -1182,6 +1248,7 @@ mod tests {
 
         let bad_source = UsageRecordsQueryParams {
             limit: None,
+            request_id: None,
             q: None,
             conversation_id: None,
             credential_id: None,
@@ -1201,6 +1268,7 @@ mod tests {
 
         let bad_time = UsageRecordsQueryParams {
             limit: None,
+            request_id: None,
             q: None,
             conversation_id: None,
             credential_id: None,
@@ -1224,6 +1292,7 @@ mod tests {
         let (query, page, limit) = UsageRecordsPageQueryParams {
             page: Some(3),
             limit: Some(50),
+            request_id: None,
             q: Some("sonnet".to_string()),
             conversation_id: Some("session-a".to_string()),
             credential_id: None,

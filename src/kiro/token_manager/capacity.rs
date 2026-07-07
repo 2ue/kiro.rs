@@ -17,6 +17,9 @@ pub(super) fn credential_is_usable_for_model(entry: &CredentialEntry, model: Opt
     if entry.disabled {
         return false;
     }
+    if !entry.credentials.supports_model(&[model]) {
+        return false;
+    }
     if is_opus_model(model) && !entry.credentials.supports_opus() {
         return false;
     }

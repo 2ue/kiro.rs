@@ -79,6 +79,32 @@ function formatJsonBlock(value: unknown): string {
   try { return JSON.stringify(value, null, 2) } catch { return String(value) }
 }
 
+const UPSTREAM_EVENT_TYPE_LABELS: Record<string, string> = {
+  assistant_response: 'assistant',
+  tool_use: 'tool',
+  reasoning_content: 'thinking',
+  metadata: 'metadata',
+  metering: 'metering',
+  code: 'code',
+  context_usage: 'context',
+  message_metadata: 'message_meta',
+  invalid_state: 'invalid',
+  unknown: 'unknown',
+  error: 'error',
+  exception: 'exception',
+}
+
+function formatUpstreamEventTypeCounts(counts?: Record<string, number>): string {
+  if (!counts) return '-'
+  const entries = Object.entries(counts)
+    .filter(([, count]) => typeof count === 'number' && Number.isFinite(count) && count > 0)
+    .sort((a, b) => b[1] - a[1])
+  if (entries.length === 0) return '-'
+  return entries
+    .map(([kind, count]) => `${UPSTREAM_EVENT_TYPE_LABELS[kind] || kind} ${formatNumber(count)}`)
+    .join(' / ')
+}
+
 export function UsageDetailModal({
   record,
   open,
@@ -210,6 +236,30 @@ export function UsageDetailModal({
                 )}
                 {typeof record.latencyTrace.eventsBeforeFirstOutput === 'number' && (
                   <MetricTile label="输出前事件" value={formatNumber(record.latencyTrace.eventsBeforeFirstOutput)} />
+                )}
+                {typeof record.latencyTrace.upstreamBytesBeforeFirstOutput === 'number' && (
+                  <MetricTile label="输出前上游字节" value={formatNumber(record.latencyTrace.upstreamBytesBeforeFirstOutput)} />
+                )}
+                {typeof record.latencyTrace.upstreamFramesBeforeFirstOutput === 'number' && (
+                  <MetricTile label="输出前上游帧" value={formatNumber(record.latencyTrace.upstreamFramesBeforeFirstOutput)} />
+                )}
+                {typeof record.latencyTrace.upstreamEventsBeforeFirstOutput === 'number' && (
+                  <MetricTile label="输出前上游事件" value={formatNumber(record.latencyTrace.upstreamEventsBeforeFirstOutput)} />
+                )}
+                {typeof record.latencyTrace.upstreamFramesWithoutDownstreamEventsBeforeFirstOutput === 'number' && (
+                  <MetricTile label="输出前空转换帧" value={formatNumber(record.latencyTrace.upstreamFramesWithoutDownstreamEventsBeforeFirstOutput)} />
+                )}
+                {typeof record.latencyTrace.upstreamPendingChunksBeforeFirstOutput === 'number' && (
+                  <MetricTile label="输出前待解码分片" value={formatNumber(record.latencyTrace.upstreamPendingChunksBeforeFirstOutput)} />
+                )}
+                {typeof record.latencyTrace.upstreamFrameDecodeErrorsBeforeFirstOutput === 'number' && (
+                  <MetricTile label="输出前帧解码错" value={formatNumber(record.latencyTrace.upstreamFrameDecodeErrorsBeforeFirstOutput)} />
+                )}
+                {typeof record.latencyTrace.upstreamEventParseErrorsBeforeFirstOutput === 'number' && (
+                  <MetricTile label="输出前事件解析错" value={formatNumber(record.latencyTrace.upstreamEventParseErrorsBeforeFirstOutput)} />
+                )}
+                {record.latencyTrace.upstreamEventTypesBeforeFirstOutput && (
+                  <MetricTile label="输出前上游类型" value={formatUpstreamEventTypeCounts(record.latencyTrace.upstreamEventTypesBeforeFirstOutput)} />
                 )}
                 {typeof record.latencyTrace.clientDroppedMs === 'number' && (
                   <MetricTile label="客户端断开" value={formatLatency(record.latencyTrace.clientDroppedMs)} />

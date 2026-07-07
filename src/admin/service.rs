@@ -31,12 +31,13 @@ use super::types::{
     ProxyResourceTestRequest, ProxyResourceTestResponse, ProxyResourcesResponse,
     RefreshCredentialInfoRequest, RequestApiKeyItem, RuntimeConfigResponse,
     SetCredentialConcurrencyRequest, SetCredentialProxyRequest, SetCredentialRegionsRequest,
-    SetCredentialRpmRequest, SetLoadBalancingModeRequest, SetWarmupRequest, TestCredentialRequest,
-    TestCredentialResponse, UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest,
-    UpdateProxyResourceRequest, UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest,
-    UpsertManualModelRequest, UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse,
-    UsageCleanupRequest, UsageCleanupStatusResponse, ValidateExistingCredentialsRequest,
-    ValidateExternalCredentialsRequest,
+    SetCredentialRpmRequest, SetLoadBalancingModeRequest, SetSupportedModelsRequest,
+    SetWarmupRequest, SupportedModelsResponse, SyncSupportedModelsFromCredentialRequest,
+    TestCredentialRequest, TestCredentialResponse, UpdateAdminApiKeyRequest,
+    UpdateCredentialAuthRequest, UpdateProxyResourceRequest, UpdateRequestApiKeyRequest,
+    UpdateRuntimeConfigRequest, UpsertManualModelRequest, UsageCleanupJobStatus, UsageCleanupMode,
+    UsageCleanupPreviewResponse, UsageCleanupRequest, UsageCleanupStatusResponse,
+    ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
 };
 use crate::anthropic::{
     model_capabilities::{
@@ -73,6 +74,7 @@ use crate::kiro::token_manager::{
     CredentialAuthUpdate, CredentialBaseSnapshot, CredentialEntrySnapshot, MultiTokenManager,
 };
 use crate::model::config::{ExternalPoolsConfig, normalize_defined_cache_routes};
+use crate::model::model_support::normalize_supported_models;
 use crate::storage::postgres::{
     AdminAuditLogPage, CreateProxyResourceRow, CredentialAccountInfoRow, PostgresStore,
     PostgresUsageStore, ProxyResourceRow, UpdateProxyResourceRow,
@@ -883,6 +885,81 @@ impl AdminService {
         Ok(pool)
     }
 
+    pub fn set_external_pool_supported_models(
+        &self,
+        id: u64,
+        request: SetSupportedModelsRequest,
+    ) -> Result<SupportedModelsResponse, AdminServiceError> {
+        let store = self.postgres_store.clone();
+        let pool = block_on_admin_store(async move {
+            store
+                .set_external_pool_supported_models(id, request.supported_models)
+                .await
+        })
+        .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
+        .ok_or(AdminServiceError::NotFound { id })?;
+        self.audit(
+            "set_external_pool_supported_models",
+            "external_pool",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({ "supportedModels": pool.supported_models.clone() }),
+        );
+        self.invalidate_external_pool_admin_cache();
+        Ok(SupportedModelsResponse {
+            count: pool.supported_models.len(),
+            supported_models: pool.supported_models,
+        })
+    }
+
+    pub async fn sync_external_pool_supported_models(
+        &self,
+        id: u64,
+        request: SyncSupportedModelsFromCredentialRequest,
+    ) -> Result<SupportedModelsResponse, AdminServiceError> {
+        let models = self
+            .kiro_provider
+            .list_available_models_for_credential(request.credential_id)
+            .await
+            .map_err(|err| {
+                AdminServiceError::InvalidCredential(format!(
+                    "同步外部池 #{} 支持模型失败，账号 #{} 拉取模型失败: {}",
+                    id, request.credential_id, err
+                ))
+            })?;
+        let supported_models = normalize_supported_models(
+            models
+                .into_iter()
+                .map(|model| model.model_id)
+                .collect::<Vec<_>>(),
+        );
+        let store = self.postgres_store.clone();
+        let pool = block_on_admin_store(async move {
+            store
+                .set_external_pool_supported_models(id, supported_models)
+                .await
+        })
+        .map_err(|err| AdminServiceError::InvalidCredential(err.to_string()))?
+        .ok_or(AdminServiceError::NotFound { id })?;
+        self.audit(
+            "sync_external_pool_supported_models",
+            "external_pool",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({
+                "credentialId": request.credential_id,
+                "supportedModels": pool.supported_models.clone(),
+            }),
+        );
+        self.invalidate_external_pool_admin_cache();
+        Ok(SupportedModelsResponse {
+            count: pool.supported_models.len(),
+            supported_models: pool.supported_models,
+        })
+    }
+
     pub fn delete_external_pool(&self, id: u64) -> Result<(), AdminServiceError> {
         let store = self.postgres_store.clone();
         let deleted =
@@ -1173,6 +1250,7 @@ impl AdminService {
             machine_id: req.machine_id,
             email: req.email,
             subscription_title: None,
+            supported_models: req.supported_models,
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
@@ -1182,6 +1260,7 @@ impl AdminService {
             endpoint: req.endpoint,
         };
         credentials.canonicalize_auth_method();
+        credentials.normalize_supported_models();
         credentials.normalize_external_idp_defaults();
         Ok(credentials)
     }
@@ -1660,6 +1739,69 @@ impl AdminService {
             json!({ "rpm": req.rpm }),
         );
         Ok(())
+    }
+
+    /// 设置凭据支持模型列表。空列表表示不限制模型调度。
+    pub fn set_credential_supported_models(
+        &self,
+        id: u64,
+        req: SetSupportedModelsRequest,
+    ) -> Result<SupportedModelsResponse, AdminServiceError> {
+        let supported_models = self
+            .token_manager
+            .set_credential_supported_models(id, req.supported_models)
+            .map_err(|e| self.classify_error(e, id))?;
+        self.audit(
+            "set_credential_supported_models",
+            "credential",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({ "supportedModels": supported_models.clone() }),
+        );
+        Ok(SupportedModelsResponse {
+            count: supported_models.len(),
+            supported_models,
+        })
+    }
+
+    /// 使用指定凭据调用上游模型列表接口，并写回该凭据的支持模型列表。
+    pub async fn sync_credential_supported_models(
+        &self,
+        id: u64,
+    ) -> Result<SupportedModelsResponse, AdminServiceError> {
+        let models = self
+            .kiro_provider
+            .list_available_models_for_credential(id)
+            .await
+            .map_err(|err| {
+                AdminServiceError::InvalidCredential(format!(
+                    "同步账号 #{} 支持模型失败: {}",
+                    id, err
+                ))
+            })?;
+        let supported_models = normalize_supported_models(
+            models
+                .into_iter()
+                .map(|model| model.model_id)
+                .collect::<Vec<_>>(),
+        );
+        let supported_models = self
+            .token_manager
+            .set_credential_supported_models(id, supported_models)
+            .map_err(|e| self.classify_error(e, id))?;
+        self.audit(
+            "sync_credential_supported_models",
+            "credential",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({ "supportedModels": supported_models.clone() }),
+        );
+        Ok(SupportedModelsResponse {
+            count: supported_models.len(),
+            supported_models,
+        })
     }
 
     pub fn set_credential_regions(
@@ -3501,6 +3643,9 @@ impl AdminService {
             kiro_upstream_response_timeout_secs: config.kiro_upstream_response_timeout_secs,
             kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
             credential_retry_max_attempts: config.credential_retry_max_attempts,
+            credential_prompt_logic_retry_enabled: config.credential_prompt_logic_retry_enabled,
+            credential_prompt_logic_retry_max_attempts: config
+                .credential_prompt_logic_retry_max_attempts,
             credential_in_flight_lease_max_secs: config.credential_in_flight_lease_max_secs,
             dispatch_global_max_concurrent_requests: config.dispatch_global_max_concurrent_requests,
             dispatch_max_queued_requests: config.dispatch_max_queued_requests,
@@ -3582,6 +3727,12 @@ impl AdminService {
         let credential_retry_max_attempts = req
             .credential_retry_max_attempts
             .unwrap_or(current_config.credential_retry_max_attempts);
+        let credential_prompt_logic_retry_enabled = req
+            .credential_prompt_logic_retry_enabled
+            .unwrap_or(current_config.credential_prompt_logic_retry_enabled);
+        let credential_prompt_logic_retry_max_attempts = req
+            .credential_prompt_logic_retry_max_attempts
+            .unwrap_or(current_config.credential_prompt_logic_retry_max_attempts);
         let credential_in_flight_lease_max_secs = req
             .credential_in_flight_lease_max_secs
             .unwrap_or(current_config.credential_in_flight_lease_max_secs);
@@ -3825,6 +3976,11 @@ impl AdminService {
                 "credentialRetryMaxAttempts 不能大于 10000".to_string(),
             ));
         }
+        if credential_prompt_logic_retry_max_attempts > 10_000 {
+            return Err(AdminServiceError::InvalidCredential(
+                "credentialPromptLogicRetryMaxAttempts 不能大于 10000".to_string(),
+            ));
+        }
         if kiro_upstream_response_timeout_secs > 86_400 {
             return Err(AdminServiceError::InvalidCredential(
                 "kiroUpstreamResponseTimeoutSecs 不能大于 86400".to_string(),
@@ -4010,6 +4166,10 @@ impl AdminService {
                 config.kiro_upstream_stream_idle_timeout_secs =
                     kiro_upstream_stream_idle_timeout_secs;
                 config.credential_retry_max_attempts = credential_retry_max_attempts;
+                config.credential_prompt_logic_retry_enabled =
+                    credential_prompt_logic_retry_enabled;
+                config.credential_prompt_logic_retry_max_attempts =
+                    credential_prompt_logic_retry_max_attempts;
                 config.credential_in_flight_lease_max_secs = credential_in_flight_lease_max_secs;
                 config.dispatch_global_max_concurrent_requests =
                     dispatch_global_max_concurrent_requests;
@@ -4706,6 +4866,11 @@ fn apply_batch_import_defaults(
     if credential.warmup_remaining.is_none() {
         credential.warmup_remaining = defaults.warmup_remaining;
     }
+    if credential.supported_models.is_empty() {
+        if let Some(supported_models) = &defaults.supported_models {
+            credential.supported_models = supported_models.clone();
+        }
+    }
     credential
 }
 
@@ -4797,6 +4962,7 @@ fn credential_status_item_from_snapshot(
         account_info: None,
         success_count: entry.success_count,
         last_used_at: entry.last_used_at,
+        supported_models: entry.supported_models,
         has_proxy: entry.has_proxy,
         proxy_url: entry.proxy_url,
         proxy_username: entry.proxy_username,
@@ -4869,6 +5035,7 @@ fn credential_list_item_from_base(
         masked_api_key: credential.masked_api_key,
         email: credential.email,
         subscription_title: credential.subscription_title,
+        supported_models: credential.supported_models,
         has_proxy: credential.has_proxy,
         proxy_url: credential.proxy_url,
         proxy_username: credential.proxy_username,
@@ -4935,6 +5102,7 @@ fn credential_runtime_item_from_snapshot(
         recent_scheduler_selection_count_5m: credential.recent_scheduler_selection_count_5m,
         scheduler_selection_pressure: credential.scheduler_selection_pressure,
         scheduler_score: credential.scheduler_score,
+        supported_models: credential.supported_models,
     }
 }
 
@@ -6066,6 +6234,7 @@ mod tests {
             }),
             success_count,
             last_used_at: None,
+            supported_models: Vec::new(),
             has_proxy: false,
             proxy_url: None,
             proxy_username: None,

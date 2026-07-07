@@ -77,6 +77,7 @@ import { UsageCleanupModal } from './usage-cleanup-modal'
 
 const AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:usage'
 const PAGE_SIZE = 20
+const REQUEST_ID_PATTERN = /^req_[A-Za-z0-9_-]+$/
 
 // ─── 工具函数 ──────────────────────────────────────────────────────────────────
 
@@ -218,7 +219,11 @@ function RecordsView({
 
   const query = useMemo<UsageRecordsPageQuery>(() => {
     const next: UsageRecordsPageQuery = { page, limit: PAGE_SIZE }
-    if (qD.trim()) next.q = qD.trim()
+    const qValue = qD.trim()
+    if (qValue) {
+      if (REQUEST_ID_PATTERN.test(qValue)) next.requestId = qValue
+      else next.q = qValue
+    }
     if (modelD.trim()) next.model = modelD.trim()
     if (endpointD.trim()) next.endpoint = endpointD.trim()
     if (conversationIdD.trim()) next.conversationId = conversationIdD.trim()

@@ -34,6 +34,7 @@ use crate::external_pool::{
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 use crate::model::config::ModelMappingRule;
+use crate::model::model_support::normalize_supported_models;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -153,6 +154,7 @@ fn credential_from_row(row: PgRow) -> anyhow::Result<KiroCredentials> {
     credential.priority = priority.max(0) as u32;
     credential.disabled = disabled;
     credential.canonicalize_auth_method();
+    credential.normalize_supported_models();
     Ok(credential)
 }
 
@@ -373,12 +375,12 @@ impl PostgresStore {
         let rows = sqlx::query(
             r#"
             SELECT id, name, base_url, api_key, auth_type, enabled, priority,
-                   max_concurrent_requests, usage_projection_mode, skip_non_stream_usage_projection,
+                   max_concurrent_requests, usage_projection_mode,
                    request_body_mode, raw_model_mode, auto_disable_policy,
                    auto_disabled, auto_disabled_reason, auto_disabled_at,
                    auto_disabled_until, auto_disabled_last_error, preserve_path,
                    normalize_model_version_dots, model_mapping_mode,
-                   model_mapping_require_match, model_mapping_rules, notes,
+                   model_mapping_require_match, model_mapping_rules, supported_models, notes,
                    created_at, updated_at
             FROM external_upstream_pools
             WHERE deleted_at IS NULL
@@ -400,12 +402,12 @@ impl PostgresStore {
         let row = sqlx::query(
             r#"
             SELECT id, name, base_url, api_key, auth_type, enabled, priority,
-                   max_concurrent_requests, usage_projection_mode, skip_non_stream_usage_projection,
+                   max_concurrent_requests, usage_projection_mode,
                    request_body_mode, raw_model_mode, auto_disable_policy,
                    auto_disabled, auto_disabled_reason, auto_disabled_at,
                    auto_disabled_until, auto_disabled_last_error, preserve_path,
                    normalize_model_version_dots, model_mapping_mode,
-                   model_mapping_require_match, model_mapping_rules, notes,
+                   model_mapping_require_match, model_mapping_rules, supported_models, notes,
                    created_at, updated_at
             FROM external_upstream_pools
             WHERE id = $1 AND deleted_at IS NULL
@@ -430,23 +432,25 @@ impl PostgresStore {
         let model_mapping_rules =
             normalize_external_pool_model_mapping_rules(request.model_mapping_rules);
         let model_mapping_rules_value = serde_json::to_value(&model_mapping_rules)?;
+        let supported_models = normalize_supported_models(request.supported_models);
+        let supported_models_value = serde_json::to_value(&supported_models)?;
         let row = sqlx::query(
             r#"
             INSERT INTO external_upstream_pools (
                 name, base_url, api_key, auth_type, enabled, priority,
-                max_concurrent_requests, usage_projection_mode, skip_non_stream_usage_projection,
+                max_concurrent_requests, usage_projection_mode,
                 request_body_mode, raw_model_mode, auto_disable_policy,
                 preserve_path, normalize_model_version_dots, model_mapping_mode,
-                model_mapping_require_match, model_mapping_rules, notes, updated_at
+                model_mapping_require_match, model_mapping_rules, supported_models, notes, updated_at
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, now())
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
-                      max_concurrent_requests, usage_projection_mode, skip_non_stream_usage_projection,
+                      max_concurrent_requests, usage_projection_mode,
                       request_body_mode, raw_model_mode, auto_disable_policy,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
                       normalize_model_version_dots, model_mapping_mode,
-                      model_mapping_require_match, model_mapping_rules, notes,
+                      model_mapping_require_match, model_mapping_rules, supported_models, notes,
                       created_at, updated_at
             "#,
         )
@@ -458,7 +462,6 @@ impl PostgresStore {
         .bind(request.priority)
         .bind(request.max_concurrent_requests as i32)
         .bind(request.usage_projection_mode.as_str())
-        .bind(request.skip_non_stream_usage_projection)
         .bind(request.request_body_mode.as_str())
         .bind(request.raw_model_mode.as_str())
         .bind(request.auto_disable_policy.as_str())
@@ -467,6 +470,7 @@ impl PostgresStore {
         .bind(request.model_mapping_mode.as_str())
         .bind(request.model_mapping_require_match)
         .bind(model_mapping_rules_value)
+        .bind(supported_models_value)
         .bind(request.notes.map(|notes| notes.trim().to_string()))
         .fetch_one(&self.pool)
         .await?;
@@ -502,9 +506,6 @@ impl PostgresStore {
         let usage_projection_mode = request
             .usage_projection_mode
             .unwrap_or(current.usage_projection_mode);
-        let skip_non_stream_usage_projection = request
-            .skip_non_stream_usage_projection
-            .unwrap_or(current.skip_non_stream_usage_projection);
         let request_body_mode = request
             .request_body_mode
             .unwrap_or(current.request_body_mode);
@@ -527,6 +528,11 @@ impl PostgresStore {
             .map(normalize_external_pool_model_mapping_rules)
             .unwrap_or(current.model_mapping_rules);
         let model_mapping_rules_value = serde_json::to_value(&model_mapping_rules)?;
+        let supported_models = request
+            .supported_models
+            .map(normalize_supported_models)
+            .unwrap_or(current.supported_models);
+        let supported_models_value = serde_json::to_value(&supported_models)?;
         let notes = request.notes.or(current.notes);
         validate_external_pool_input(&name, &base_url, max_concurrent_requests)?;
         let row = sqlx::query(
@@ -540,25 +546,25 @@ impl PostgresStore {
                 priority = $7,
                 max_concurrent_requests = $8,
                 usage_projection_mode = $9,
-                skip_non_stream_usage_projection = $10,
-                request_body_mode = $11,
-                raw_model_mode = $12,
-                auto_disable_policy = $13,
-                preserve_path = $14,
-                normalize_model_version_dots = $15,
-                model_mapping_mode = $16,
-                model_mapping_require_match = $17,
-                model_mapping_rules = $18,
+                request_body_mode = $10,
+                raw_model_mode = $11,
+                auto_disable_policy = $12,
+                preserve_path = $13,
+                normalize_model_version_dots = $14,
+                model_mapping_mode = $15,
+                model_mapping_require_match = $16,
+                model_mapping_rules = $17,
+                supported_models = $18,
                 notes = $19,
                 updated_at = now()
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
-                      max_concurrent_requests, usage_projection_mode, skip_non_stream_usage_projection,
+                      max_concurrent_requests, usage_projection_mode,
                       request_body_mode, raw_model_mode, auto_disable_policy,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
                       normalize_model_version_dots, model_mapping_mode,
-                      model_mapping_require_match, model_mapping_rules, notes,
+                      model_mapping_require_match, model_mapping_rules, supported_models, notes,
                       created_at, updated_at
             "#,
         )
@@ -571,7 +577,6 @@ impl PostgresStore {
         .bind(priority)
         .bind(max_concurrent_requests as i32)
         .bind(usage_projection_mode.as_str())
-        .bind(skip_non_stream_usage_projection)
         .bind(request_body_mode.as_str())
         .bind(raw_model_mode.as_str())
         .bind(auto_disable_policy.as_str())
@@ -580,6 +585,7 @@ impl PostgresStore {
         .bind(model_mapping_mode.as_str())
         .bind(model_mapping_require_match)
         .bind(model_mapping_rules_value)
+        .bind(supported_models_value)
         .bind(notes)
         .fetch_one(&self.pool)
         .await?;
@@ -597,17 +603,47 @@ impl PostgresStore {
             SET enabled = $2, updated_at = now()
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
-                      max_concurrent_requests, usage_projection_mode, skip_non_stream_usage_projection,
-                      auto_disable_policy,
+                      max_concurrent_requests, usage_projection_mode,
+                      request_body_mode, raw_model_mode, auto_disable_policy,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
                       normalize_model_version_dots, model_mapping_mode,
-                      model_mapping_require_match, model_mapping_rules, notes,
+                      model_mapping_require_match, model_mapping_rules, supported_models, notes,
                       created_at, updated_at
             "#,
         )
         .bind(id as i64)
         .bind(enabled)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| external_pool_from_row(row, true)).transpose()
+    }
+
+    pub async fn set_external_pool_supported_models(
+        &self,
+        id: u64,
+        supported_models: Vec<String>,
+    ) -> anyhow::Result<Option<ExternalPool>> {
+        let supported_models = normalize_supported_models(supported_models);
+        let supported_models_value = serde_json::to_value(&supported_models)?;
+        let row = sqlx::query(
+            r#"
+            UPDATE external_upstream_pools
+            SET supported_models = $2,
+                updated_at = now()
+            WHERE id = $1 AND deleted_at IS NULL
+            RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
+                      max_concurrent_requests, usage_projection_mode,
+                      request_body_mode, raw_model_mode, auto_disable_policy,
+                      auto_disabled, auto_disabled_reason, auto_disabled_at,
+                      auto_disabled_until, auto_disabled_last_error, preserve_path,
+                      normalize_model_version_dots, model_mapping_mode,
+                      model_mapping_require_match, model_mapping_rules, supported_models, notes,
+                      created_at, updated_at
+            "#,
+        )
+        .bind(id as i64)
+        .bind(supported_models_value)
         .fetch_optional(&self.pool)
         .await?;
         row.map(|row| external_pool_from_row(row, true)).transpose()
@@ -638,12 +674,12 @@ impl PostgresStore {
                 updated_at = now()
             WHERE id = $1 AND deleted_at IS NULL
             RETURNING id, name, base_url, api_key, auth_type, enabled, priority,
-                      max_concurrent_requests, usage_projection_mode, skip_non_stream_usage_projection,
-                      auto_disable_policy,
+                      max_concurrent_requests, usage_projection_mode,
+                      request_body_mode, raw_model_mode, auto_disable_policy,
                       auto_disabled, auto_disabled_reason, auto_disabled_at,
                       auto_disabled_until, auto_disabled_last_error, preserve_path,
                       normalize_model_version_dots, model_mapping_mode,
-                      model_mapping_require_match, model_mapping_rules, notes,
+                      model_mapping_require_match, model_mapping_rules, supported_models, notes,
                       created_at, updated_at
             "#,
         )
@@ -826,6 +862,7 @@ impl PostgresStore {
         let mut canonical = credential.clone();
         canonical.id = Some(id);
         canonical.canonicalize_auth_method();
+        canonical.normalize_supported_models();
         self.upsert_credential(&canonical).await
     }
 
@@ -839,6 +876,7 @@ impl PostgresStore {
         let mut canonical = credential.clone();
         canonical.id = Some(id);
         canonical.canonicalize_auth_method();
+        canonical.normalize_supported_models();
         let (auth_kind, api_key_hash, refresh_token_hash) = credential_hash_columns(&canonical);
         let value = serde_json::to_value(&canonical)?;
         let row = sqlx::query(
@@ -4153,6 +4191,16 @@ fn normalize_page_limit(limit: usize) -> usize {
 fn push_usage_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &UsageRecordQuery) {
     builder.push(" WHERE deleted_at IS NULL");
 
+    if let Some(request_id) = query
+        .request_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|request_id| !request_id.is_empty())
+    {
+        builder.push(" AND id = ");
+        builder.push_bind(request_id.to_string());
+    }
+
     if let Some(q) = query.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
         let pattern = format!("%{}%", q);
         builder.push(" AND (");
@@ -4170,11 +4218,15 @@ fn push_usage_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &UsageRec
             "error_detail",
             "pricing_model",
             "credential_id::text",
+            "data->>'upstreamModel'",
+            "data->>'externalOutboundModel'",
             "data->>'externalPoolId'",
             "data->>'externalPoolName'",
+            "data->>'routeKind'",
+            "data->>'routeSubtype'",
+            "data->>'modelResolutionSource'",
             "estimated_cost_usd::text",
             "kiro_metering_usage::text",
-            "data::text",
         ];
         for (index, field) in fields.iter().enumerate() {
             if index > 0 {
@@ -4438,9 +4490,6 @@ fn external_pool_from_row(row: PgRow, mask_secrets: bool) -> anyhow::Result<Exte
     let api_key: String = row.try_get("api_key")?;
     let auth_type: String = row.try_get("auth_type")?;
     let usage_projection_mode: String = row.try_get("usage_projection_mode")?;
-    let skip_non_stream_usage_projection: bool = row
-        .try_get("skip_non_stream_usage_projection")
-        .unwrap_or(false);
     let request_body_mode: String = row
         .try_get("request_body_mode")
         .unwrap_or_else(|_| "normalized".to_string());
@@ -4454,6 +4503,12 @@ fn external_pool_from_row(row: PgRow, mask_secrets: bool) -> anyhow::Result<Exte
     let model_mapping_rules =
         serde_json::from_value::<Vec<ModelMappingRule>>(model_mapping_rules_value)
             .unwrap_or_default();
+    let supported_models_value: serde_json::Value = row
+        .try_get("supported_models")
+        .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
+    let supported_models = normalize_supported_models(
+        serde_json::from_value::<Vec<String>>(supported_models_value).unwrap_or_default(),
+    );
     Ok(ExternalPool {
         id: id.max(0) as u64,
         name: row.try_get("name")?,
@@ -4465,7 +4520,6 @@ fn external_pool_from_row(row: PgRow, mask_secrets: bool) -> anyhow::Result<Exte
         priority: row.try_get("priority")?,
         max_concurrent_requests: max_concurrent_requests.max(1) as u32,
         usage_projection_mode: ExternalPoolUsageProjectionMode::parse(&usage_projection_mode),
-        skip_non_stream_usage_projection,
         request_body_mode: ExternalPoolRequestBodyMode::parse(&request_body_mode),
         raw_model_mode: ExternalPoolRawModelMode::parse(&raw_model_mode),
         auto_disable_policy: ExternalPoolAutoDisablePolicy::parse(&auto_disable_policy),
@@ -4479,6 +4533,7 @@ fn external_pool_from_row(row: PgRow, mask_secrets: bool) -> anyhow::Result<Exte
         model_mapping_mode: ExternalPoolModelMappingMode::parse(&model_mapping_mode),
         model_mapping_require_match: row.try_get("model_mapping_require_match").unwrap_or(false),
         model_mapping_rules: normalize_external_pool_model_mapping_rules(model_mapping_rules),
+        supported_models,
         notes: row.try_get("notes")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
@@ -4726,6 +4781,7 @@ CREATE TABLE IF NOT EXISTS external_upstream_pools (
     model_mapping_mode TEXT NOT NULL DEFAULT 'processed_mapping',
     model_mapping_require_match BOOLEAN NOT NULL DEFAULT false,
     model_mapping_rules JSONB NOT NULL DEFAULT '[]'::jsonb,
+    supported_models JSONB NOT NULL DEFAULT '[]'::jsonb,
     notes TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -4788,6 +4844,9 @@ ALTER TABLE external_upstream_pools
 
 ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS model_mapping_rules JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+ALTER TABLE external_upstream_pools
+    ADD COLUMN IF NOT EXISTS supported_models JSONB NOT NULL DEFAULT '[]'::jsonb;
 
 ALTER TABLE external_upstream_pools
     ADD COLUMN IF NOT EXISTS notes TEXT;
@@ -4896,6 +4955,9 @@ ALTER TABLE usage_records
 CREATE INDEX IF NOT EXISTS idx_usage_records_created_at ON usage_records (created_at DESC) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_usage_records_credential_created ON usage_records (credential_id, created_at DESC) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_usage_records_model_created ON usage_records (model, created_at DESC) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_usage_records_upstream_model_created ON usage_records ((data->>'upstreamModel'), created_at DESC) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_usage_records_external_outbound_model_created ON usage_records ((data->>'externalOutboundModel'), created_at DESC) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_usage_records_external_pool_created ON usage_records ((data->>'externalPoolId'), created_at DESC) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_usage_records_status_created ON usage_records (status, created_at DESC) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_usage_records_conversation ON usage_records (conversation_id) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_usage_records_deleted_at ON usage_records (deleted_at ASC, id ASC) WHERE deleted_at IS NOT NULL;
@@ -6500,7 +6562,6 @@ mod tests {
                 priority: 1,
                 max_concurrent_requests: 2,
                 usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
-                skip_non_stream_usage_projection: false,
                 request_body_mode: ExternalPoolRequestBodyMode::RawPassthrough,
                 raw_model_mode: ExternalPoolRawModelMode::RewriteTopLevel,
                 auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
@@ -6515,6 +6576,7 @@ mod tests {
                     kind: Default::default(),
                     note: None,
                 }],
+                supported_models: Vec::new(),
                 notes: None,
             })
             .await

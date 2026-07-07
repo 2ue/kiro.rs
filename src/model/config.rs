@@ -2577,6 +2577,18 @@ pub struct Config {
     #[serde(default)]
     pub credential_retry_max_attempts: u32,
 
+    /// 是否允许部分提示/协议逻辑 400 错误换未尝试账号重试。
+    ///
+    /// 默认关闭，保持 400 请求错误直接失败的原语义。
+    #[serde(default)]
+    pub credential_prompt_logic_retry_enabled: bool,
+
+    /// 提示/协议逻辑 400 错误最多换号重试次数。
+    ///
+    /// 仅在 `credentialPromptLogicRetryEnabled=true` 时生效；0 表示开启时默认 1 次。
+    #[serde(default)]
+    pub credential_prompt_logic_retry_max_attempts: u32,
+
     /// 并发占用 lease 的最大存活秒数。
     ///
     /// `0` 表示不自动回收；`>0` 时，调度前会清理超过该时间仍未释放的占用，
@@ -3539,6 +3551,8 @@ impl Default for Config {
             ),
             kiro_upstream_base_url: None,
             credential_retry_max_attempts: 0,
+            credential_prompt_logic_retry_enabled: false,
+            credential_prompt_logic_retry_max_attempts: 0,
             credential_in_flight_lease_max_secs: default_credential_in_flight_lease_max_secs(),
             dispatch_global_max_concurrent_requests: 0,
             dispatch_max_queued_requests: 0,

@@ -955,6 +955,37 @@ impl RedisStore {
     ) -> anyhow::Result<Option<UsageRecordsPageResult>> {
         let page = page.max(1);
         let limit = if limit == 0 { 20 } else { limit.min(1000) };
+        if let Some(request_id) = query
+            .request_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|request_id| !request_id.is_empty())
+        {
+            if page > 1 {
+                return Ok(Some(UsageRecordsPageResult {
+                    page,
+                    limit,
+                    has_next: false,
+                    records: Vec::new(),
+                }));
+            }
+            let mut manager = self.manager.clone();
+            let value: Option<String> = manager.get(self.key(usage_record_key(request_id))).await?;
+            let mut records = Vec::new();
+            if let Some(value) = value {
+                if let Ok(record) = serde_json::from_str::<UsageRecord>(&value) {
+                    if usage_record_matches_query(&record, &query) {
+                        records.push(record);
+                    }
+                }
+            }
+            return Ok(Some(UsageRecordsPageResult {
+                page,
+                limit,
+                has_next: false,
+                records,
+            }));
+        }
         let target_start = page.saturating_sub(1).saturating_mul(limit);
         let target_len = limit.saturating_add(1);
         let target_matches = target_start.saturating_add(target_len);
@@ -4198,6 +4229,11 @@ fn usage_source_label(value: &str) -> String {
 }
 
 fn usage_record_matches_query(record: &UsageRecord, query: &UsageRecordQuery) -> bool {
+    if let Some(request_id) = query.request_id.as_deref() {
+        if record.id != request_id {
+            return false;
+        }
+    }
     if let Some(q) = query.q.as_deref() {
         if !usage_record_matches_search(record, q) {
             return false;
@@ -4225,7 +4261,10 @@ fn usage_record_matches_query(record: &UsageRecord, query: &UsageRecordQuery) ->
         }
     }
     if let Some(model) = query.model.as_deref() {
-        if record.model != model {
+        if record.model != model
+            && record.upstream_model.as_deref() != Some(model)
+            && record.external_outbound_model.as_deref() != Some(model)
+        {
             return false;
         }
     }

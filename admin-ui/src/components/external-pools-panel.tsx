@@ -6,9 +6,11 @@ import {
   clearExternalPoolAutoDisabled,
   createExternalPool,
   deleteExternalPool,
+  getCredentialsList,
   getExternalPools,
   getExternalPoolsStatus,
   setExternalPoolEnabled,
+  syncExternalPoolSupportedModels,
   testExternalPool,
   updateExternalPool,
   updateRuntimeConfig,
@@ -29,13 +31,33 @@ import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { useModelCapabilities } from '@/hooks/use-usage'
 import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, TEST_MODELS } from '@/lib/test-models'
-import type { CreateExternalPoolRequest, ExternalPool, ExternalPoolModelMappingRule, ExternalPoolsConfig, ExternalPoolTestResponse, UpdateExternalPoolRequest } from '@/types/api'
+import type { CredentialListItem, CreateExternalPoolRequest, ExternalPool, ExternalPoolModelMappingRule, ExternalPoolsConfig, ExternalPoolTestResponse, UpdateExternalPoolRequest } from '@/types/api'
 import { defaultExternalPoolsConfig } from '@/components/runtime-config-panel'
 
 const splitRules = (value: string) => value.split('\n').map((item) => item.trim()).filter(Boolean)
 const joinRules = (value: string[] = []) => value.join('\n')
 const whole = (value: number, min = 0) => Math.max(min, Math.floor(Number.isFinite(value) ? value : min))
 const DEFAULT_POOL_MODEL_MAPPING_MODE: NonNullable<CreateExternalPoolRequest['modelMappingMode']> = 'processed_mapping'
+
+const parseSupportedModelsText = (value: string): string[] => {
+  const seen = new Set<string>()
+  const models: string[] = []
+  value.split(/[\n,\t]+/).forEach((item) => {
+    const model = item.trim()
+    if (!model) return
+    const key = model.toLowerCase()
+    if (seen.has(key)) return
+    seen.add(key)
+    models.push(model)
+  })
+  return models
+}
+
+const supportedModelsSummary = (models: string[] = []) => {
+  if (models.length === 0) return '支持：不限制'
+  if (models.length <= 2) return `支持：${models.join(', ')}`
+  return `支持：${models[0]}, ${models[1]} 等 ${models.length} 个`
+}
 
 const parseModelMappingRules = (value: string): ExternalPoolModelMappingRule[] => value
   .split('\n')
@@ -158,9 +180,9 @@ type ExternalPoolFormDraft = {
   requestBodyMode: NonNullable<CreateExternalPoolRequest['requestBodyMode']>
   rawModelMode: NonNullable<CreateExternalPoolRequest['rawModelMode']>
   usageProjectionMode: NonNullable<CreateExternalPoolRequest['usageProjectionMode']>
-  skipNonStreamUsageProjection: boolean
   autoDisablePolicy: NonNullable<CreateExternalPoolRequest['autoDisablePolicy']>
   normalizeModelVersionDots: boolean
+  supportedModelsText: string
   modelMappingMode: NonNullable<CreateExternalPoolRequest['modelMappingMode']>
   modelMappingRequireMatch: boolean
   modelMappingRulesText: string
@@ -178,9 +200,9 @@ const defaultPoolForm = (): ExternalPoolFormDraft => ({
   requestBodyMode: 'normalized',
   rawModelMode: 'none',
   usageProjectionMode: 'pass_through',
-  skipNonStreamUsageProjection: false,
   autoDisablePolicy: 'inherit',
   normalizeModelVersionDots: false,
+  supportedModelsText: '',
   modelMappingMode: DEFAULT_POOL_MODEL_MAPPING_MODE,
   modelMappingRequireMatch: false,
   modelMappingRulesText: '',
@@ -198,9 +220,9 @@ const poolFormFromPool = (pool: ExternalPool): ExternalPoolFormDraft => ({
   requestBodyMode: pool.requestBodyMode || 'normalized',
   rawModelMode: pool.rawModelMode || 'none',
   usageProjectionMode: pool.usageProjectionMode,
-  skipNonStreamUsageProjection: Boolean(pool.skipNonStreamUsageProjection),
   autoDisablePolicy: pool.autoDisablePolicy,
   normalizeModelVersionDots: Boolean(pool.normalizeModelVersionDots),
+  supportedModelsText: joinRules(pool.supportedModels || []),
   modelMappingMode: pool.modelMappingMode || DEFAULT_POOL_MODEL_MAPPING_MODE,
   modelMappingRequireMatch: Boolean(pool.modelMappingRequireMatch),
   modelMappingRulesText: joinModelMappingRules(pool.modelMappingRules || []),
@@ -212,6 +234,15 @@ export function ExternalPoolsPanel() {
   const runtimeConfig = useRuntimeConfig()
   const pools = useQuery({ queryKey: ['external-pools'], queryFn: getExternalPools })
   const status = useQuery({ queryKey: ['external-pools-status'], queryFn: getExternalPoolsStatus, refetchInterval: 5000 })
+  const credentialOptions = useQuery({
+    queryKey: ['external-pool-sync-credentials'],
+    queryFn: () => getCredentialsList({ page: 1, limit: 500 }),
+    staleTime: 30000,
+  })
+  const syncCredentialOptions = useMemo(
+    () => (credentialOptions.data?.items || []).filter((credential) => !credential.disabled && credential.authMethod !== 'api_key'),
+    [credentialOptions.data?.items]
+  )
   const [savingConfig, setSavingConfig] = useState(false)
   const [configDraft, setConfigDraft] = useState<ExternalPoolsConfig>(defaultExternalPoolsConfig())
   const [modelRulesText, setModelRulesText] = useState('')
@@ -300,7 +331,7 @@ export function ExternalPoolsPanel() {
     }
     setSavingPool(true)
     try {
-      const { modelMappingRulesText, ...form } = createForm
+      const { modelMappingRulesText, supportedModelsText, ...form } = createForm
       await createExternalPool({
         ...form,
         name: createForm.name.trim(),
@@ -309,6 +340,7 @@ export function ExternalPoolsPanel() {
         priority: whole(createForm.priority ?? 100),
         maxConcurrentRequests: whole(createForm.maxConcurrentRequests ?? 10, 1),
         modelMappingRules: parseModelMappingRules(modelMappingRulesText),
+        supportedModels: parseSupportedModelsText(supportedModelsText),
       })
       toast.success('外部池已添加')
       setCreateOpen(false)
@@ -334,7 +366,7 @@ export function ExternalPoolsPanel() {
     }
     setSavingPool(true)
     try {
-      const { modelMappingRulesText, ...form } = editForm
+      const { modelMappingRulesText, supportedModelsText, ...form } = editForm
       const payload: UpdateExternalPoolRequest = {
         ...form,
         name: editForm.name.trim(),
@@ -343,6 +375,7 @@ export function ExternalPoolsPanel() {
         priority: whole(editForm.priority ?? 100),
         maxConcurrentRequests: whole(editForm.maxConcurrentRequests ?? 10, 1),
         modelMappingRules: parseModelMappingRules(modelMappingRulesText),
+        supportedModels: parseSupportedModelsText(supportedModelsText),
       }
       await updateExternalPool(editingPool.id, payload)
       toast.success('外部池已更新')
@@ -597,7 +630,7 @@ export function ExternalPoolsPanel() {
                     <Badge variant={runtime?.dispatchable ? 'outline' : 'secondary'}>{runtime?.dispatchable ? '可调度' : runtime?.skippedReason || '不可调度'}</Badge>
                   </div>
                   <div className="text-sm text-muted-foreground">{pool.baseUrl} · {pool.maskedApiKey || '未显示 Key'} · 并发 {runtime?.inFlight ?? 0}/{pool.maxConcurrentRequests} · 优先级 {pool.priority}</div>
-                  <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · {poolBodyModeSummary(pool)} · auth: {authLabel(pool.authType)} · model: {poolModelMappingSummary(pool)} · request: /v1/messages {runtime?.cooldownRemainingSecs ? `· 冷却 ${runtime.cooldownRemainingSecs}s` : ''}</div>
+                  <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · {poolBodyModeSummary(pool)} · auth: {authLabel(pool.authType)} · model: {poolModelMappingSummary(pool)} · {supportedModelsSummary(pool.supportedModels)} · request: /v1/messages {runtime?.cooldownRemainingSecs ? `· 冷却 ${runtime.cooldownRemainingSecs}s` : ''}</div>
                   {pool.autoDisabledLastError && <div className="text-xs text-destructive">{pool.autoDisabledLastError}</div>}
                   </div>
                   <div className="flex flex-wrap gap-2">
@@ -634,6 +667,7 @@ export function ExternalPoolsPanel() {
         open={createOpen}
         draft={createForm}
         saving={savingPool}
+        credentialOptions={syncCredentialOptions}
         onDraftChange={setCreateForm}
         onOpenChange={(open) => {
           if (savingPool) return
@@ -648,6 +682,13 @@ export function ExternalPoolsPanel() {
         open={Boolean(editingPool)}
         draft={editForm}
         saving={savingPool}
+        credentialOptions={syncCredentialOptions}
+        onSyncSupportedModels={async (credentialId) => {
+          if (!editingPool) return []
+          const response = await syncExternalPoolSupportedModels(editingPool.id, { credentialId })
+          invalidate()
+          return response.supportedModels
+        }}
         onDraftChange={setEditForm}
         onOpenChange={(open) => {
           if (savingPool) return
@@ -676,27 +717,36 @@ function ExternalPoolFormDialog({
   open,
   draft,
   saving,
+  credentialOptions = [],
   onDraftChange,
   onOpenChange,
   onSubmit,
+  onSyncSupportedModels,
 }: {
   mode: 'create' | 'edit'
   pool?: ExternalPool | null
   open: boolean
   draft: ExternalPoolFormDraft
   saving: boolean
+  credentialOptions?: CredentialListItem[]
   onDraftChange: (value: ExternalPoolFormDraft | ((prev: ExternalPoolFormDraft) => ExternalPoolFormDraft)) => void
   onOpenChange: (open: boolean) => void
   onSubmit: () => void
+  onSyncSupportedModels?: (credentialId: number) => Promise<string[]>
 }) {
   const isEdit = mode === 'edit'
   const title = isEdit ? `编辑外部池${pool ? ` #${pool.id}` : ''}` : '添加外部池'
   const keyLabel = isEdit ? '新请求 Key' : '请求 Key'
   const keyDescription = isEdit ? `留空表示不修改当前 Key。当前：${pool?.maskedApiKey || '未显示 Key'}` : '外部池的请求密钥，保存后只显示脱敏值。'
   const [quickImportText, setQuickImportText] = useState('')
+  const [syncCredentialId, setSyncCredentialId] = useState('')
+  const [syncingModels, setSyncingModels] = useState(false)
   const mappingPresets = useMemo(() => modelMappingPresetsForMode(draft.modelMappingMode), [draft.modelMappingMode])
   useEffect(() => {
-    if (!open) setQuickImportText('')
+    if (!open) {
+      setQuickImportText('')
+      setSyncCredentialId('')
+    }
   }, [open])
   const addMappingPreset = (preset: ExternalPoolModelMappingPreset) => {
     const result = appendModelMappingPreset(draft.modelMappingRulesText, preset)
@@ -731,6 +781,24 @@ function ExternalPoolFormDialog({
       toast.info('导入的模型映射规则都已存在')
     }
   }
+  const syncSupportedModels = async () => {
+    if (!onSyncSupportedModels) return
+    const credentialId = Number(syncCredentialId)
+    if (!Number.isInteger(credentialId) || credentialId <= 0) {
+      toast.error('请选择要同步的本地账号')
+      return
+    }
+    setSyncingModels(true)
+    try {
+      const supportedModels = await onSyncSupportedModels(credentialId)
+      onDraftChange((prev) => ({ ...prev, supportedModelsText: supportedModels.join('\n') }))
+      toast.success(`已同步 ${supportedModels.length} 个支持模型`)
+    } catch (error) {
+      toast.error(extractErrorMessage(error))
+    } finally {
+      setSyncingModels(false)
+    }
+  }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -757,7 +825,6 @@ function ExternalPoolFormDialog({
                 <NumberBox label="单池最大并发" description="当前外部池同时处理的最大请求数。" value={draft.maxConcurrentRequests} min={1} disabled={saving} onChange={(maxConcurrentRequests) => onDraftChange((prev) => ({ ...prev, maxConcurrentRequests }))} />
                 <NumberBox label="优先级" description="数字越小越靠前；同优先级再按容量和状态分配。" value={draft.priority} disabled={saving} onChange={(priority) => onDraftChange((prev) => ({ ...prev, priority }))} />
                 <Toggle label={isEdit ? '启用外部池' : '创建后立即启用'} checked={Boolean(draft.enabled)} disabled={saving} onChange={(enabled) => onDraftChange((prev) => ({ ...prev, enabled }))} />
-                <Toggle label="未命中时点号转横杠" checked={Boolean(draft.normalizeModelVersionDots)} disabled={saving || draft.modelMappingMode === 'passthrough' || draft.modelMappingRequireMatch} onChange={(normalizeModelVersionDots) => onDraftChange((prev) => ({ ...prev, normalizeModelVersionDots }))} />
               </div>
             </FormSection>
 
@@ -767,16 +834,42 @@ function ExternalPoolFormDialog({
                   <option value="pass_through">严格透传：不改外部池 usage</option>
                   <option value="current_path_policy">按当前路径整形：重写 usage 并应用全局补偿</option>
                 </SelectBox>
-                <Toggle
-                  label="同步请求不整形"
-                  checked={Boolean(draft.skipNonStreamUsageProjection)}
-                  disabled={saving || draft.usageProjectionMode !== 'current_path_policy'}
-                  onChange={(skipNonStreamUsageProjection) => onDraftChange((prev) => ({ ...prev, skipNonStreamUsageProjection }))}
-                />
                 <HintBox>{usageProjectionDescription(draft.usageProjectionMode)}</HintBox>
               </div>
             </FormSection>
           </div>
+
+          <FormSection title="调度资格" description="只决定该外部池是否允许承接某些模型；不改变请求体里的 model，也不影响模型映射规则。">
+            <div className="grid gap-3 md:grid-cols-[1fr_220px]">
+              <TextArea
+                label="支持模型"
+                description="空列表表示不限制；非空时，请求模型必须命中这里的列表才会调度到该外部池。"
+                value={draft.supportedModelsText}
+                disabled={saving || syncingModels}
+                onChange={(supportedModelsText) => onDraftChange((prev) => ({ ...prev, supportedModelsText }))}
+              />
+              <div className="space-y-2">
+                <SelectBox
+                  label="从本地账号同步"
+                  value={syncCredentialId}
+                  disabled={saving || syncingModels || !isEdit || !onSyncSupportedModels}
+                  onChange={setSyncCredentialId}
+                >
+                  <option value="">选择账号</option>
+                  {credentialOptions.map((credential) => (
+                    <option key={credential.id} value={String(credential.id)}>
+                      #{credential.id} {credential.email || credential.maskedApiKey || credential.authMethod || '账号'}
+                    </option>
+                  ))}
+                </SelectBox>
+                <Button type="button" variant="outline" size="sm" className="w-full" disabled={saving || syncingModels || !isEdit || !syncCredentialId || !onSyncSupportedModels} onClick={syncSupportedModels}>
+                  {syncingModels && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                  同步支持模型
+                </Button>
+                {!isEdit && <div className="text-xs text-muted-foreground">创建后编辑外部池可从本地账号同步。</div>}
+              </div>
+            </div>
+          </FormSection>
 
           <FormSection title="请求体处理" description="控制发往该外部池前是否进入本系统 body 处理链路。">
             <div className="grid gap-3">
@@ -819,6 +912,7 @@ function ExternalPoolFormDialog({
                   <option value="processed_mapping">内部处理后映射</option>
                 </SelectBox>
                 <HintBox>{modelMappingDescription(draft.modelMappingMode, draft.normalizeModelVersionDots)}</HintBox>
+                <Toggle label="未命中时点号转横杠" checked={Boolean(draft.normalizeModelVersionDots)} disabled={saving || draft.modelMappingMode === 'passthrough' || draft.modelMappingRequireMatch} onChange={(normalizeModelVersionDots) => onDraftChange((prev) => ({ ...prev, normalizeModelVersionDots }))} />
                 {draft.modelMappingMode !== 'passthrough' && (
                   <Toggle label="必须命中映射" checked={Boolean(draft.modelMappingRequireMatch)} disabled={saving} onChange={(modelMappingRequireMatch) => onDraftChange((prev) => ({ ...prev, modelMappingRequireMatch }))} />
                 )}
@@ -1299,9 +1393,6 @@ function poolUsageSummary(pool: ExternalPool, config: ExternalPoolsConfig) {
     return 'Usage: 严格透传'
   }
   const parts = ['Usage: 按路径整形']
-  if (pool.skipNonStreamUsageProjection) {
-    parts.push('同步原样')
-  }
   if (config.externalPoolUsageProjectionUpliftPercent > 0) {
     parts.push(`缓存 +${config.externalPoolUsageProjectionUpliftPercent}%`)
   }

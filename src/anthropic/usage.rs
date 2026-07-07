@@ -216,6 +216,22 @@ pub struct UsageLatencyTrace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events_before_first_output: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_bytes_before_first_output: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_frames_before_first_output: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_events_before_first_output: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_frames_without_downstream_events_before_first_output: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_pending_chunks_before_first_output: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_frame_decode_errors_before_first_output: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_event_parse_errors_before_first_output: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_event_types_before_first_output: Option<HashMap<String, u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_dropped_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_reason: Option<StreamTerminalReason>,
@@ -246,6 +262,20 @@ impl UsageLatencyTrace {
             && self.stream_gap_to_first_output_ms.is_none()
             && self.chunks_before_first_output.is_none()
             && self.events_before_first_output.is_none()
+            && self.upstream_bytes_before_first_output.is_none()
+            && self.upstream_frames_before_first_output.is_none()
+            && self.upstream_events_before_first_output.is_none()
+            && self
+                .upstream_frames_without_downstream_events_before_first_output
+                .is_none()
+            && self.upstream_pending_chunks_before_first_output.is_none()
+            && self
+                .upstream_frame_decode_errors_before_first_output
+                .is_none()
+            && self
+                .upstream_event_parse_errors_before_first_output
+                .is_none()
+            && self.upstream_event_types_before_first_output.is_none()
             && self.client_dropped_ms.is_none()
             && self.terminal_reason.is_none()
     }
@@ -370,6 +400,7 @@ pub struct UsageRecord {
 #[derive(Debug, Clone)]
 pub struct UsageRecordQuery {
     pub limit: usize,
+    pub request_id: Option<String>,
     pub q: Option<String>,
     pub endpoint: Option<String>,
     pub conversation_id: Option<String>,
@@ -388,6 +419,7 @@ impl Default for UsageRecordQuery {
     fn default() -> Self {
         Self {
             limit: DEFAULT_QUERY_LIMIT,
+            request_id: None,
             q: None,
             endpoint: None,
             conversation_id: None,
@@ -2189,6 +2221,11 @@ fn normalize_page(page: usize) -> usize {
 }
 
 fn record_matches(record: &UsageRecord, query: &UsageRecordQuery) -> bool {
+    if let Some(request_id) = &query.request_id {
+        if &record.id != request_id {
+            return false;
+        }
+    }
     if let Some(q) = &query.q {
         if !record_matches_search(record, q) {
             return false;
@@ -2633,6 +2670,41 @@ mod tests {
         assert!(!second_page.has_next);
         assert_eq!(second_page.records.len(), 1);
         assert_eq!(second_page.records[0].id, "1");
+    }
+
+    #[test]
+    fn recorder_query_supports_exact_request_id_and_model_aliases() {
+        let recorder = UsageRecorder::new(10);
+        let mut first = record("req_01alpha", 10, UsageSource::UpstreamMetadata);
+        first.model = "claude-sonnet-4".to_string();
+        first.upstream_model = Some("claude-sonnet-4-20250514".to_string());
+        recorder.record(first);
+
+        let mut second = record("req_01beta", 20, UsageSource::UpstreamMetadata);
+        second.model = "claude-sonnet-4.5".to_string();
+        second.external_outbound_model = Some("claude-sonnet-4-5".to_string());
+        recorder.record(second);
+
+        let by_request_id = recorder.query(UsageRecordQuery {
+            request_id: Some("req_01alpha".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(by_request_id.total, 1);
+        assert_eq!(by_request_id.records[0].id, "req_01alpha");
+
+        let by_upstream_model = recorder.query(UsageRecordQuery {
+            model: Some("claude-sonnet-4-20250514".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(by_upstream_model.total, 1);
+        assert_eq!(by_upstream_model.records[0].id, "req_01alpha");
+
+        let by_external_outbound_model = recorder.query(UsageRecordQuery {
+            model: Some("claude-sonnet-4-5".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(by_external_outbound_model.total, 1);
+        assert_eq!(by_external_outbound_model.records[0].id, "req_01beta");
     }
 
     #[test]

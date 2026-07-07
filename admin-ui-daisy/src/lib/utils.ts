@@ -24,6 +24,11 @@ export function parseError(error: unknown): ParsedError {
   const response = axiosError.response as Record<string, unknown> | undefined
   const data = response?.data as Record<string, unknown> | undefined
   const errorObj = data?.error as Record<string, unknown> | undefined
+  const status = typeof response?.status === 'number' ? response.status : undefined
+
+  if (status === 404 && (!data || Object.keys(data).length === 0)) {
+    return { title: '接口不存在或后端版本未更新（404），请确认后端已重启并加载最新版本' }
+  }
 
   if (errorObj && typeof errorObj.message === 'string') {
     const parsed = parseNestedErrorMessage(errorObj.message)

@@ -272,6 +272,8 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   kiroUpstreamResponseTimeoutSecs: 180,
   kiroUpstreamStreamIdleTimeoutSecs: 180,
   credentialRetryMaxAttempts: 0,
+  credentialPromptLogicRetryEnabled: false,
+  credentialPromptLogicRetryMaxAttempts: 0,
   credentialInFlightLeaseMaxSecs: 900,
   dispatchGlobalMaxConcurrentRequests: 0,
   dispatchMaxQueuedRequests: 0,

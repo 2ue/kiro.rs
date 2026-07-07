@@ -24,11 +24,12 @@ use super::{
         get_usage_records_page, get_usage_summary, get_usage_writer_stats, preview_usage_cleanup,
         refresh_credentials_info, reset_failure_count, set_credential_concurrency,
         set_credential_disabled, set_credential_priority, set_credential_proxy,
-        set_credential_regions, set_credential_rpm, set_credential_warmup,
-        set_external_pool_enabled, set_load_balancing_mode, start_usage_cleanup,
-        sync_model_capabilities, sync_model_pricing, test_credential, test_external_pool,
-        test_proxy_resource, test_proxy_resource_config, update_admin_api_key,
-        update_credential_auth, update_external_pool, update_proxy_resource,
+        set_credential_regions, set_credential_rpm, set_credential_supported_models,
+        set_credential_warmup, set_external_pool_enabled, set_external_pool_supported_models,
+        set_load_balancing_mode, start_usage_cleanup, sync_credential_supported_models,
+        sync_external_pool_supported_models, sync_model_capabilities, sync_model_pricing,
+        test_credential, test_external_pool, test_proxy_resource, test_proxy_resource_config,
+        update_admin_api_key, update_credential_auth, update_external_pool, update_proxy_resource,
         update_request_api_key, update_runtime_config, upsert_manual_model,
         validate_existing_credentials, validate_external_credentials,
     },
@@ -92,6 +93,14 @@ pub fn create_admin_router(state: AdminState) -> Router {
             post(set_credential_concurrency),
         )
         .route("/credentials/{id}/rpm", post(set_credential_rpm))
+        .route(
+            "/credentials/{id}/supported-models",
+            post(set_credential_supported_models),
+        )
+        .route(
+            "/credentials/{id}/supported-models/sync",
+            post(sync_credential_supported_models),
+        )
         .route("/credentials/{id}/regions", post(set_credential_regions))
         .route("/credentials/{id}/warmup", post(set_credential_warmup))
         .route(
@@ -135,6 +144,14 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/external-pools/{id}/enabled",
             post(set_external_pool_enabled),
+        )
+        .route(
+            "/external-pools/{id}/supported-models",
+            post(set_external_pool_supported_models),
+        )
+        .route(
+            "/external-pools/{id}/supported-models/sync",
+            post(sync_external_pool_supported_models),
         )
         .route(
             "/external-pools/{id}/auto-disabled/clear",

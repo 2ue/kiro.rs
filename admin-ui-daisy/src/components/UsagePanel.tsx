@@ -22,6 +22,7 @@ import {
 import type { ExternalPoolUsageSnapshot, UsageCleanupMode, UsageCleanupRequest, UsageRecord, UsageRecordsPageQuery, UsageRecordStatus, UsageSource } from '@/types/api'
 
 const USAGE_AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:usage'
+const REQUEST_ID_PATTERN = /^req_[A-Za-z0-9_-]+$/
 
 type BillingDeltaTone = 'loss' | 'profit' | 'even'
 
@@ -41,6 +42,32 @@ function formatLatency(value?: number): string {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '-'
   if (value < 1000) return `${formatNumber(Math.round(value))}ms`
   return `${(value / 1000).toFixed(2)}s`
+}
+
+const UPSTREAM_EVENT_TYPE_LABELS: Record<string, string> = {
+  assistant_response: 'assistant',
+  tool_use: 'tool',
+  reasoning_content: 'thinking',
+  metadata: 'metadata',
+  metering: 'metering',
+  code: 'code',
+  context_usage: 'context',
+  message_metadata: 'message_meta',
+  invalid_state: 'invalid',
+  unknown: 'unknown',
+  error: 'error',
+  exception: 'exception',
+}
+
+function formatUpstreamEventTypeCounts(counts?: Record<string, number>): string {
+  if (!counts) return '-'
+  const entries = Object.entries(counts)
+    .filter(([, count]) => typeof count === 'number' && Number.isFinite(count) && count > 0)
+    .sort((a, b) => b[1] - a[1])
+  if (entries.length === 0) return '-'
+  return entries
+    .map(([kind, count]) => `${UPSTREAM_EVENT_TYPE_LABELS[kind] || kind} ${formatNumber(count)}`)
+    .join(' / ')
 }
 
 function sourceLabel(source: UsageSource): string {
@@ -201,6 +228,14 @@ function LatencyTracePanel({ record }: { record: UsageRecord }) {
         <UsageMetric label="权重估算输入" value={typeof trace.estimatedInputTokens === 'number' ? `${formatNumber(trace.estimatedInputTokens)} token` : '-'} />
         <UsageMetric label="输出前分片" value={typeof trace.chunksBeforeFirstOutput === 'number' ? formatNumber(trace.chunksBeforeFirstOutput) : '-'} />
         <UsageMetric label="输出前事件" value={typeof trace.eventsBeforeFirstOutput === 'number' ? formatNumber(trace.eventsBeforeFirstOutput) : '-'} />
+        <UsageMetric label="输出前上游字节" value={typeof trace.upstreamBytesBeforeFirstOutput === 'number' ? formatNumber(trace.upstreamBytesBeforeFirstOutput) : '-'} />
+        <UsageMetric label="输出前上游帧" value={typeof trace.upstreamFramesBeforeFirstOutput === 'number' ? formatNumber(trace.upstreamFramesBeforeFirstOutput) : '-'} />
+        <UsageMetric label="输出前上游事件" value={typeof trace.upstreamEventsBeforeFirstOutput === 'number' ? formatNumber(trace.upstreamEventsBeforeFirstOutput) : '-'} />
+        <UsageMetric label="输出前空转换帧" value={typeof trace.upstreamFramesWithoutDownstreamEventsBeforeFirstOutput === 'number' ? formatNumber(trace.upstreamFramesWithoutDownstreamEventsBeforeFirstOutput) : '-'} />
+        <UsageMetric label="输出前待解码分片" value={typeof trace.upstreamPendingChunksBeforeFirstOutput === 'number' ? formatNumber(trace.upstreamPendingChunksBeforeFirstOutput) : '-'} />
+        <UsageMetric label="输出前帧解码错" value={typeof trace.upstreamFrameDecodeErrorsBeforeFirstOutput === 'number' ? formatNumber(trace.upstreamFrameDecodeErrorsBeforeFirstOutput) : '-'} />
+        <UsageMetric label="输出前事件解析错" value={typeof trace.upstreamEventParseErrorsBeforeFirstOutput === 'number' ? formatNumber(trace.upstreamEventParseErrorsBeforeFirstOutput) : '-'} />
+        <UsageMetric label="输出前上游类型" value={formatUpstreamEventTypeCounts(trace.upstreamEventTypesBeforeFirstOutput)} />
         <UsageMetric label="客户端断开" value={formatLatency(trace.clientDroppedMs)} />
         <UsageMetric label="结束原因" value={trace.terminalReason || '-'} />
       </div>
@@ -228,7 +263,11 @@ export function UsagePanel() {
 
   const query = useMemo<UsageRecordsPageQuery>(() => {
     const next: UsageRecordsPageQuery = { page, limit }
-    if (searchText.trim()) next.q = searchText.trim()
+    const qValue = searchText.trim()
+    if (qValue) {
+      if (REQUEST_ID_PATTERN.test(qValue)) next.requestId = qValue
+      else next.q = qValue
+    }
     if (model.trim()) next.model = model.trim()
     if (endpoint.trim()) next.endpoint = endpoint.trim()
     if (conversationId.trim()) next.conversationId = conversationId.trim()

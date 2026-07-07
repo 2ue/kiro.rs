@@ -1,0 +1,5 @@
+[target.aarch64-apple-darwin]
+linker = "/usr/bin/cc"
+
+[env]
+CC_aarch64_apple_darwin = "/usr/bin/cc"

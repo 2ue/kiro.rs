@@ -31,6 +31,8 @@ import {
   useSetCredentialProxy,
   useSetCredentialConcurrency,
   useSetCredentialRpm,
+  useSetCredentialSupportedModels,
+  useSyncCredentialSupportedModels,
 } from '@/hooks/use-credentials'
 
 interface CredentialCardProps {
@@ -42,6 +44,8 @@ interface CredentialCardProps {
   balance: BalanceResponse | null
   loadingBalance: boolean
 }
+
+const EMPTY_SUPPORTED_MODELS: string[] = []
 
 function formatLastUsed(lastUsedAt: string | null): string {
   if (!lastUsedAt) return '从未使用'
@@ -158,6 +162,30 @@ function rpmLimitLabel(credential: CredentialStatusItem): string {
   return `继承全局：${effective}`
 }
 
+function parseSupportedModelsText(value: string): string[] {
+  const seen = new Set<string>()
+  const models: string[] = []
+  for (const item of value.split(/[\n,\t]+/)) {
+    const model = item.trim()
+    if (!model) continue
+    const key = model.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    models.push(model)
+  }
+  return models
+}
+
+function supportedModelsText(models?: string[]) {
+  return (models || []).join('\n')
+}
+
+function supportedModelsSummary(models?: string[]) {
+  if (!models || models.length === 0) return '不限制'
+  if (models.length <= 2) return models.join(', ')
+  return `${models[0]}, ${models[1]} 等 ${models.length} 个`
+}
+
 function SecretInput({
   value,
   onChange,
@@ -207,11 +235,13 @@ export function CredentialCard({
   balance,
   loadingBalance,
 }: CredentialCardProps) {
+  const supportedModels = credential.supportedModels ?? EMPTY_SUPPORTED_MODELS
   const [editingPriority, setEditingPriority] = useState(false)
   const [editingRegions, setEditingRegions] = useState(false)
   const [editingProxy, setEditingProxy] = useState(false)
   const [editingConcurrency, setEditingConcurrency] = useState(false)
   const [editingRpm, setEditingRpm] = useState(false)
+  const [editingSupportedModels, setEditingSupportedModels] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [regionValue, setRegionValue] = useState(credential.region || '')
   const [authRegionValue, setAuthRegionValue] = useState(credential.authRegion || '')
@@ -232,6 +262,7 @@ export function CredentialCard({
       ? String(credential.rpmOverride)
       : ''
   )
+  const [supportedModelsValue, setSupportedModelsValue] = useState(supportedModelsText(supportedModels))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
@@ -245,6 +276,8 @@ export function CredentialCard({
   const setCredentialConcurrency = useSetCredentialConcurrency()
   const setCredentialRpm = useSetCredentialRpm()
   const setCredentialRegions = useSetCredentialRegions()
+  const setCredentialSupportedModels = useSetCredentialSupportedModels()
+  const syncCredentialSupportedModels = useSyncCredentialSupportedModels()
   const proxyResources = useProxyResources()
   const runtimeConfig = useRuntimeConfig()
   const proxyResourceOptions = proxyResources.data?.resources || []
@@ -352,6 +385,10 @@ export function CredentialCard({
         : ''
     )
   }, [credential.id, credential.rpmOverride])
+
+  useEffect(() => {
+    setSupportedModelsValue(supportedModelsText(supportedModels))
+  }, [credential.id, supportedModels])
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -495,6 +532,35 @@ export function CredentialCard({
     )
   }
 
+  const handleSupportedModelsSave = () => {
+    const supportedModels = parseSupportedModelsText(supportedModelsValue)
+    setCredentialSupportedModels.mutate(
+      { id: credential.id, request: { supportedModels } },
+      {
+        onSuccess: (res) => {
+          toast.success(`已保存 ${res.count} 个支持模型`)
+          setSupportedModelsValue(supportedModelsText(res.supportedModels))
+          setEditingSupportedModels(false)
+        },
+        onError: (err) => {
+          toast.error('支持模型保存失败: ' + extractErrorMessage(err))
+        },
+      }
+    )
+  }
+
+  const handleSupportedModelsSync = () => {
+    syncCredentialSupportedModels.mutate(credential.id, {
+      onSuccess: (res) => {
+        toast.success(`已同步 ${res.count} 个支持模型`)
+        setSupportedModelsValue(supportedModelsText(res.supportedModels))
+      },
+      onError: (err) => {
+        toast.error('模型同步失败: ' + extractErrorMessage(err))
+      },
+    })
+  }
+
   const handleReset = () => {
     resetFailure.mutate(credential.id, {
       onSuccess: (res) => {
@@ -612,6 +678,9 @@ export function CredentialCard({
                 )}
                 {!credential.disabled && credential.warmupRemaining > 0 && (
                   <Badge variant="secondary">预热 {credential.warmupRemaining}</Badge>
+                )}
+                {supportedModels.length > 0 && (
+                  <Badge variant="outline" title={supportedModels.join('\n')}>模型 {supportedModels.length}</Badge>
                 )}
                 {!credential.disabled && credential.inProbation && (
                   <Badge variant="secondary">观察 {probationRemainingSecs}s</Badge>
@@ -759,6 +828,21 @@ export function CredentialCard({
                 <Gauge className="h-3.5 w-3.5" />
                 {rpmLimitLabel(credential)}
               </button>
+            </div>
+            <div className="col-span-2">
+              <span className="text-muted-foreground">支持模型：</span>
+              <button
+                type="button"
+                className="ml-1 inline-flex max-w-full items-center gap-1 truncate font-medium hover:underline"
+                title={supportedModels.length > 0 ? supportedModels.join('\n') : '未设置，不限制模型'}
+                onClick={() => setEditingSupportedModels(true)}
+              >
+                <Gauge className="h-3.5 w-3.5 shrink-0" />
+                <span className="truncate">{supportedModelsSummary(supportedModels)}</span>
+              </button>
+              <span className="ml-1 text-xs text-muted-foreground">
+                {supportedModels.length > 0 ? '账号调度白名单' : '未设置'}
+              </span>
             </div>
             <div className="col-span-2">
               <span className="text-muted-foreground">Region：</span>
@@ -1389,6 +1473,78 @@ export function CredentialCard({
             </Button>
             <Button onClick={handleRpmSave} disabled={setCredentialRpm.isPending}>
               {setCredentialRpm.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+              保存
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={editingSupportedModels}
+        onOpenChange={(open) => {
+          if (!open && (setCredentialSupportedModels.isPending || syncCredentialSupportedModels.isPending)) return
+          setEditingSupportedModels(open)
+          if (open) {
+            setSupportedModelsValue(supportedModelsText(supportedModels))
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>支持模型：{displayName}</DialogTitle>
+            <DialogDescription>
+              空列表表示不限制；非空时，只有匹配模型的请求才会调度到该凭据。
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div className="rounded-md border bg-muted/30 p-3 text-sm">
+              当前限制：{supportedModels.length > 0 ? `${supportedModels.length} 个模型` : '不限制'}
+            </div>
+            <label className="block space-y-2">
+              <span className="text-sm font-medium">支持模型</span>
+              <textarea
+                className="min-h-36 w-full rounded-md border bg-background px-3 py-2 font-mono text-xs"
+                value={supportedModelsValue}
+                disabled={setCredentialSupportedModels.isPending || syncCredentialSupportedModels.isPending}
+                onChange={(event) => setSupportedModelsValue(event.target.value)}
+                placeholder={'claude-sonnet-4.5\nclaude-haiku-4.5'}
+              />
+              <span className="text-xs text-muted-foreground">一行一个模型，也可以用逗号分隔。</span>
+            </label>
+          </div>
+
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setSupportedModelsValue('')
+                setCredentialSupportedModels.mutate(
+                  { id: credential.id, request: { supportedModels: [] } },
+                  {
+                    onSuccess: (res) => {
+                      toast.success('已清空模型限制')
+                      setSupportedModelsValue(supportedModelsText(res.supportedModels))
+                      setEditingSupportedModels(false)
+                    },
+                    onError: (err) => toast.error('清空失败: ' + extractErrorMessage(err)),
+                  }
+                )
+              }}
+              disabled={setCredentialSupportedModels.isPending || syncCredentialSupportedModels.isPending || supportedModels.length === 0}
+            >
+              不限制
+            </Button>
+            <Button
+              variant="outline"
+              onClick={handleSupportedModelsSync}
+              disabled={setCredentialSupportedModels.isPending || syncCredentialSupportedModels.isPending || credential.authMethod === 'api_key'}
+            >
+              {syncCredentialSupportedModels.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+              同步上游
+            </Button>
+            <Button onClick={handleSupportedModelsSave} disabled={setCredentialSupportedModels.isPending || syncCredentialSupportedModels.isPending}>
+              {setCredentialSupportedModels.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
               保存
             </Button>
           </DialogFooter>

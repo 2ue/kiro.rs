@@ -219,6 +219,14 @@ struct RequestLatencyTraceState {
     events_seen_before_first_output: Arc<AtomicU32>,
     chunks_before_first_output: Arc<AtomicU32>,
     events_before_first_output: Arc<AtomicU32>,
+    upstream_bytes_before_first_output: Arc<AtomicU64>,
+    upstream_frames_before_first_output: Arc<AtomicU32>,
+    upstream_events_before_first_output: Arc<AtomicU32>,
+    upstream_frames_without_downstream_events_before_first_output: Arc<AtomicU32>,
+    upstream_pending_chunks_before_first_output: Arc<AtomicU32>,
+    upstream_frame_decode_errors_before_first_output: Arc<AtomicU32>,
+    upstream_event_parse_errors_before_first_output: Arc<AtomicU32>,
+    upstream_event_types_before_first_output: Arc<Mutex<HashMap<&'static str, u32>>>,
     terminal_reason: Arc<Mutex<Option<StreamTerminalReason>>>,
 }
 
@@ -235,6 +243,16 @@ impl RequestLatencyTraceState {
             events_seen_before_first_output: Arc::new(AtomicU32::new(0)),
             chunks_before_first_output: Arc::new(AtomicU32::new(LATENCY_COUNTER_UNSET)),
             events_before_first_output: Arc::new(AtomicU32::new(LATENCY_COUNTER_UNSET)),
+            upstream_bytes_before_first_output: Arc::new(AtomicU64::new(0)),
+            upstream_frames_before_first_output: Arc::new(AtomicU32::new(0)),
+            upstream_events_before_first_output: Arc::new(AtomicU32::new(0)),
+            upstream_frames_without_downstream_events_before_first_output: Arc::new(
+                AtomicU32::new(0),
+            ),
+            upstream_pending_chunks_before_first_output: Arc::new(AtomicU32::new(0)),
+            upstream_frame_decode_errors_before_first_output: Arc::new(AtomicU32::new(0)),
+            upstream_event_parse_errors_before_first_output: Arc::new(AtomicU32::new(0)),
+            upstream_event_types_before_first_output: Arc::new(Mutex::new(HashMap::new())),
             terminal_reason: Arc::new(Mutex::new(None)),
         }
     }
@@ -520,6 +538,12 @@ fn log_kiro_conversion_summary(
 }
 
 fn saturating_fetch_add_u32(value: &AtomicU32, amount: u32) {
+    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(amount))
+    });
+}
+
+fn saturating_fetch_add_u64(value: &AtomicU64, amount: u64) {
     let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_add(amount))
     });
@@ -1658,6 +1682,77 @@ impl RequestUsageContext {
             .compare_exchange(0, elapsed, Ordering::AcqRel, Ordering::Acquire);
     }
 
+    fn has_first_output(&self) -> bool {
+        self.first_token_latency_ms.load(Ordering::Acquire) > 0
+    }
+
+    fn mark_upstream_bytes_before_first_output(&self, byte_len: usize) {
+        if self.has_first_output() {
+            return;
+        }
+        saturating_fetch_add_u64(
+            &self.latency.upstream_bytes_before_first_output,
+            u64::try_from(byte_len).unwrap_or(u64::MAX),
+        );
+    }
+
+    fn mark_upstream_pending_chunk_before_first_output(&self) {
+        if self.has_first_output() {
+            return;
+        }
+        saturating_fetch_add_u32(&self.latency.upstream_pending_chunks_before_first_output, 1);
+    }
+
+    fn mark_upstream_frame_before_first_output(&self) {
+        if self.has_first_output() {
+            return;
+        }
+        saturating_fetch_add_u32(&self.latency.upstream_frames_before_first_output, 1);
+    }
+
+    fn mark_upstream_event_before_first_output(&self, event: &Event, downstream_events_len: usize) {
+        if self.has_first_output() {
+            return;
+        }
+
+        saturating_fetch_add_u32(&self.latency.upstream_events_before_first_output, 1);
+        if downstream_events_len == 0 {
+            saturating_fetch_add_u32(
+                &self
+                    .latency
+                    .upstream_frames_without_downstream_events_before_first_output,
+                1,
+            );
+        }
+
+        let kind = kiro_event_latency_kind(event);
+        let mut counts = self.latency.upstream_event_types_before_first_output.lock();
+        let entry = counts.entry(kind).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    fn mark_upstream_frame_decode_error_before_first_output(&self) {
+        if self.has_first_output() {
+            return;
+        }
+        saturating_fetch_add_u32(
+            &self
+                .latency
+                .upstream_frame_decode_errors_before_first_output,
+            1,
+        );
+    }
+
+    fn mark_upstream_event_parse_error_before_first_output(&self) {
+        if self.has_first_output() {
+            return;
+        }
+        saturating_fetch_add_u32(
+            &self.latency.upstream_event_parse_errors_before_first_output,
+            1,
+        );
+    }
+
     fn mark_stream_events(&self, events: &[SseEvent]) {
         self.mark_first_thinking_delta_if_output(events);
         self.mark_first_visible_text_delta_if_output(events);
@@ -1779,6 +1874,16 @@ impl RequestUsageContext {
             _ => None,
         };
         let capacity_weight_units = self.capacity_weight_units.load(Ordering::Acquire);
+        let include_upstream_diagnostics = first_upstream_chunk_ms.is_some();
+        let upstream_event_types_before_first_output = {
+            let counts = self.latency.upstream_event_types_before_first_output.lock();
+            (!counts.is_empty()).then(|| {
+                counts
+                    .iter()
+                    .map(|(kind, count)| ((*kind).to_string(), *count))
+                    .collect()
+            })
+        };
         let trace = UsageLatencyTrace {
             capacity_weight_units: (capacity_weight_units > 1).then_some(capacity_weight_units),
             estimated_input_tokens: (capacity_weight_units > 1).then_some(self.input_tokens),
@@ -1795,6 +1900,45 @@ impl RequestUsageContext {
             events_before_first_output: load_latency_counter(
                 &self.latency.events_before_first_output,
             ),
+            upstream_bytes_before_first_output: include_upstream_diagnostics.then_some(
+                self.latency
+                    .upstream_bytes_before_first_output
+                    .load(Ordering::Acquire),
+            ),
+            upstream_frames_before_first_output: include_upstream_diagnostics.then_some(
+                self.latency
+                    .upstream_frames_before_first_output
+                    .load(Ordering::Acquire),
+            ),
+            upstream_events_before_first_output: include_upstream_diagnostics.then_some(
+                self.latency
+                    .upstream_events_before_first_output
+                    .load(Ordering::Acquire),
+            ),
+            upstream_frames_without_downstream_events_before_first_output:
+                include_upstream_diagnostics.then_some(
+                    self.latency
+                        .upstream_frames_without_downstream_events_before_first_output
+                        .load(Ordering::Acquire),
+                ),
+            upstream_pending_chunks_before_first_output: include_upstream_diagnostics.then_some(
+                self.latency
+                    .upstream_pending_chunks_before_first_output
+                    .load(Ordering::Acquire),
+            ),
+            upstream_frame_decode_errors_before_first_output: include_upstream_diagnostics
+                .then_some(
+                    self.latency
+                        .upstream_frame_decode_errors_before_first_output
+                        .load(Ordering::Acquire),
+                ),
+            upstream_event_parse_errors_before_first_output: include_upstream_diagnostics
+                .then_some(
+                    self.latency
+                        .upstream_event_parse_errors_before_first_output
+                        .load(Ordering::Acquire),
+                ),
+            upstream_event_types_before_first_output,
             client_dropped_ms: load_latency_ms(&self.latency.client_dropped_latency_ms),
             terminal_reason: *self.latency.terminal_reason.lock(),
         };
@@ -2049,6 +2193,23 @@ fn is_first_token_output_event(event: &SseEvent) -> bool {
                 )
             }),
         _ => false,
+    }
+}
+
+fn kiro_event_latency_kind(event: &Event) -> &'static str {
+    match event {
+        Event::AssistantResponse(_) => "assistant_response",
+        Event::ToolUse(_) => "tool_use",
+        Event::ReasoningContent(_) => "reasoning_content",
+        Event::Metadata(_) => "metadata",
+        Event::Metering(_) => "metering",
+        Event::Code(_) => "code",
+        Event::ContextUsage(_) => "context_usage",
+        Event::MessageMetadata(_) => "message_metadata",
+        Event::InvalidState(_) => "invalid_state",
+        Event::Unknown {} => "unknown",
+        Event::Error { .. } => "error",
+        Event::Exception { .. } => "exception",
     }
 }
 
@@ -5342,20 +5503,89 @@ fn create_sse_stream(
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
                                 tracing::warn!("缓冲区溢出: {}", e);
+                                usage_guard
+                                    .context()
+                                    .request
+                                    .mark_upstream_frame_decode_error_before_first_output();
                             }
 
                             let mut events = Vec::new();
+                            let mut decoded_frames_in_chunk = 0_u32;
+                            let mut first_output_reached_in_chunk =
+                                usage_guard.context().request.has_first_output();
                             for result in decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {
-                                        if let Ok(event) = Event::from_frame(frame) {
-                                            let sse_events = ctx.process_kiro_event(&event);
-                                            events.extend(sse_events);
+                                        decoded_frames_in_chunk =
+                                            decoded_frames_in_chunk.saturating_add(1);
+                                        let before_first_output =
+                                            !first_output_reached_in_chunk
+                                                && !usage_guard.context().request.has_first_output();
+                                        match Event::from_frame(frame) {
+                                            Ok(event) => {
+                                                let sse_events = ctx.process_kiro_event(&event);
+                                                let frame_has_first_output = sse_events
+                                                    .iter()
+                                                    .any(is_first_token_output_event);
+
+                                                if before_first_output && !frame_has_first_output {
+                                                    usage_guard
+                                                        .context()
+                                                        .request
+                                                        .mark_upstream_frame_before_first_output();
+                                                    usage_guard
+                                                        .context()
+                                                        .request
+                                                        .mark_upstream_event_before_first_output(
+                                                            &event,
+                                                            sse_events.len(),
+                                                        );
+                                                }
+                                                if frame_has_first_output {
+                                                    first_output_reached_in_chunk = true;
+                                                }
+
+                                                events.extend(sse_events);
+                                            }
+                                            Err(_) => {
+                                                if before_first_output {
+                                                    usage_guard
+                                                        .context()
+                                                        .request
+                                                        .mark_upstream_frame_before_first_output();
+                                                    usage_guard
+                                                        .context()
+                                                        .request
+                                                        .mark_upstream_event_parse_error_before_first_output();
+                                                }
+                                            }
                                         }
                                     }
                                     Err(e) => {
                                         tracing::warn!("解码事件失败: {}", e);
+                                        if !first_output_reached_in_chunk
+                                            && !usage_guard.context().request.has_first_output()
+                                        {
+                                            usage_guard
+                                                .context()
+                                                .request
+                                                .mark_upstream_frame_decode_error_before_first_output();
+                                        }
                                     }
+                                }
+                            }
+                            if !first_output_reached_in_chunk
+                                && !usage_guard.context().request.has_first_output()
+                            {
+                                usage_guard
+                                    .context()
+                                    .request
+                                    .mark_upstream_bytes_before_first_output(chunk.len());
+                                if decoded_frames_in_chunk == 0 {
+                                    usage_guard
+                                        .context()
+                                        .request
+                                        .mark_upstream_pending_chunk_before_first_output();
                                 }
                             }
 
@@ -8100,6 +8330,16 @@ Return a fix plan."#
         usage_context.mark_payload_guard_latency(Duration::from_millis(3));
         usage_context.mark_upstream_header();
         usage_context.mark_first_upstream_chunk();
+        usage_context.mark_upstream_bytes_before_first_output(128);
+        usage_context.mark_upstream_pending_chunk_before_first_output();
+        usage_context.mark_upstream_frame_before_first_output();
+        usage_context.mark_upstream_event_before_first_output(
+            &Event::Metadata(crate::kiro::model::events::MetadataEvent::default()),
+            0,
+        );
+        usage_context.mark_upstream_frame_before_first_output();
+        usage_context.mark_upstream_frame_decode_error_before_first_output();
+        usage_context.mark_upstream_event_parse_error_before_first_output();
         usage_context.mark_stream_events(&[
             SseEvent::new("message_start", json!({"type": "message_start"})),
             SseEvent::new(
@@ -8147,6 +8387,29 @@ Return a fix plan."#
         assert!(trace.first_visible_text_delta_ms.is_some());
         assert_eq!(trace.chunks_before_first_output, Some(1));
         assert_eq!(trace.events_before_first_output, Some(3));
+        assert_eq!(trace.upstream_bytes_before_first_output, Some(128));
+        assert_eq!(trace.upstream_frames_before_first_output, Some(2));
+        assert_eq!(trace.upstream_events_before_first_output, Some(1));
+        assert_eq!(
+            trace.upstream_frames_without_downstream_events_before_first_output,
+            Some(1)
+        );
+        assert_eq!(trace.upstream_pending_chunks_before_first_output, Some(1));
+        assert_eq!(
+            trace.upstream_frame_decode_errors_before_first_output,
+            Some(1)
+        );
+        assert_eq!(
+            trace.upstream_event_parse_errors_before_first_output,
+            Some(1)
+        );
+        assert_eq!(
+            trace
+                .upstream_event_types_before_first_output
+                .as_ref()
+                .and_then(|counts| counts.get("metadata")),
+            Some(&1)
+        );
         assert!(trace.stream_gap_to_first_output_ms.is_some());
         assert_eq!(trace.terminal_reason, Some(StreamTerminalReason::Completed));
     }

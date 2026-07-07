@@ -15,9 +15,11 @@ import {
   clearExternalPoolAutoDisabled,
   createExternalPool,
   deleteExternalPool,
+  getCredentialList,
   getExternalPools,
   getExternalPoolsStatus,
   setExternalPoolEnabled,
+  syncExternalPoolSupportedModels,
   updateExternalPool,
   updateRuntimeConfig,
 } from '@/api/credentials'
@@ -45,9 +47,11 @@ import {
   defaultPoolForm,
   joinRules,
   parseModelMappingRules,
+  parseSupportedModelsText,
   poolFormFromPool,
   poolBodyModeSummary,
   poolModelMappingSummary,
+  poolSupportedModelsSummary,
   poolUsageSummary,
   splitRules,
   whole,
@@ -96,6 +100,15 @@ export function ExternalPoolsPage() {
   const runtimeConfig = useRuntimeConfig()
   const pools = useQuery({ queryKey: ['external-pools'], queryFn: getExternalPools })
   const status = useQuery({ queryKey: ['external-pools-status'], queryFn: getExternalPoolsStatus, refetchInterval: 5000 })
+  const credentialOptions = useQuery({
+    queryKey: ['external-pool-sync-credentials'],
+    queryFn: () => getCredentialList({ page: 1, limit: 500 }),
+    staleTime: 30000,
+  })
+  const syncCredentialOptions = useMemo(
+    () => (credentialOptions.data?.items || []).filter((credential) => !credential.disabled && credential.authMethod !== 'api_key'),
+    [credentialOptions.data?.items]
+  )
 
   const [savingConfig, setSavingConfig] = useState(false)
   const [configDraft, setConfigDraft] = useState<ExternalPoolsConfig>(defaultExternalPoolsConfig())
@@ -176,7 +189,7 @@ export function ExternalPoolsPage() {
     if (!createForm.name?.trim() || !createForm.baseUrl?.trim() || !createForm.apiKey?.trim()) return toast.error('名称、Base URL 和 Key 必填')
     setSavingPool(true)
     try {
-      const { modelMappingRulesText, ...form } = createForm
+      const { modelMappingRulesText, supportedModelsText, ...form } = createForm
       await createExternalPool({
         ...form,
         name: createForm.name.trim(),
@@ -185,6 +198,7 @@ export function ExternalPoolsPage() {
         priority: whole(createForm.priority ?? 100),
         maxConcurrentRequests: whole(createForm.maxConcurrentRequests ?? 10, 1),
         modelMappingRules: parseModelMappingRules(modelMappingRulesText),
+        supportedModels: parseSupportedModelsText(supportedModelsText),
       })
       toast.success('外部账号已添加')
       setCreateOpen(false)
@@ -207,7 +221,7 @@ export function ExternalPoolsPage() {
     if (!editForm.name?.trim() || !editForm.baseUrl?.trim()) return toast.error('名称和 Base URL 必填')
     setSavingPool(true)
     try {
-      const { modelMappingRulesText, ...form } = editForm
+      const { modelMappingRulesText, supportedModelsText, ...form } = editForm
       const payload: UpdateExternalPoolRequest = {
         ...form,
         name: editForm.name.trim(),
@@ -216,6 +230,7 @@ export function ExternalPoolsPage() {
         priority: whole(editForm.priority ?? 100),
         maxConcurrentRequests: whole(editForm.maxConcurrentRequests ?? 10, 1),
         modelMappingRules: parseModelMappingRules(modelMappingRulesText),
+        supportedModels: parseSupportedModelsText(supportedModelsText),
       }
       await updateExternalPool(editingPool.id, payload)
       toast.success('外部账号已更新')
@@ -472,7 +487,7 @@ export function ExternalPoolsPage() {
                           <Badge tone={runtime?.dispatchable ? 'info' : 'neutral'}>{runtime?.dispatchable ? '可调度' : runtime?.skippedReason || '不可调度'}</Badge>
                         </div>
                         <div className="text-sm text-muted-foreground">{pool.baseUrl} · {pool.maskedApiKey || '未显示 Key'} · 并发 {inFlight}/{capacity} · 优先级 {pool.priority}</div>
-                        <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · {poolBodyModeSummary(pool)} · 认证：{authLabel(pool.authType)} · 模型：{poolModelMappingSummary(pool)}{runtime?.cooldownRemainingSecs ? ` · 冷却 ${runtime.cooldownRemainingSecs}s` : ''}</div>
+                        <div className="text-xs text-muted-foreground">{poolUsageSummary(pool, configDraft)} · {poolBodyModeSummary(pool)} · 认证：{authLabel(pool.authType)} · 模型：{poolModelMappingSummary(pool)} · {poolSupportedModelsSummary(pool)}{runtime?.cooldownRemainingSecs ? ` · 冷却 ${runtime.cooldownRemainingSecs}s` : ''}</div>
                         {pool.autoDisabledLastError && <div className="text-xs text-destructive">{pool.autoDisabledLastError}</div>}
                       </div>
                     </div>
@@ -510,6 +525,7 @@ export function ExternalPoolsPage() {
         open={createOpen}
         draft={createForm}
         saving={savingPool}
+        credentialOptions={syncCredentialOptions}
         onDraftChange={setCreateForm}
         onClose={() => { if (savingPool) return; setCreateOpen(false); setCreateForm(defaultPoolForm()) }}
         onSubmit={submitPool}
@@ -520,7 +536,14 @@ export function ExternalPoolsPage() {
         open={Boolean(editingPool)}
         draft={editForm}
         saving={savingPool}
+        credentialOptions={syncCredentialOptions}
         onDraftChange={setEditForm}
+        onSyncSupportedModels={async (credentialId) => {
+          if (!editingPool) return []
+          const response = await syncExternalPoolSupportedModels(editingPool.id, { credentialId })
+          invalidate()
+          return response.supportedModels
+        }}
         onClose={() => { if (savingPool) return; setEditingPool(null); setEditForm(defaultPoolForm()) }}
         onSubmit={savePoolEdit}
       />

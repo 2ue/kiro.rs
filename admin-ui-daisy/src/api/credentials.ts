@@ -26,11 +26,14 @@ import type {
   SetCredentialConcurrencyRequest,
   SetCredentialRpmRequest,
   SetCredentialRegionsRequest,
+  SetSupportedModelsRequest,
   SetDisabledRequest,
   SetCredentialProxyRequest,
   SetPriorityRequest,
   SetWarmupRequest,
   SuccessResponse,
+  SupportedModelsResponse,
+  SyncSupportedModelsFromCredentialRequest,
   SystemVersionResponse,
   TestCredentialRequest,
   TestCredentialResponse,
@@ -175,6 +178,16 @@ export async function setCredentialRpm(id: number, req: SetCredentialRpmRequest)
 
 export async function setCredentialRegions(id: number, req: SetCredentialRegionsRequest): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/regions`, req)
+  return data
+}
+
+export async function setCredentialSupportedModels(id: number, req: SetSupportedModelsRequest): Promise<SupportedModelsResponse> {
+  const { data } = await api.post<SupportedModelsResponse>(`/credentials/${id}/supported-models`, req)
+  return data
+}
+
+export async function syncCredentialSupportedModels(id: number): Promise<SupportedModelsResponse> {
+  const { data } = await api.post<SupportedModelsResponse>(`/credentials/${id}/supported-models/sync`)
   return data
 }
 
@@ -370,6 +383,19 @@ export async function setExternalPoolEnabled(id: number, enabled: boolean): Prom
 
 export async function clearExternalPoolAutoDisabled(id: number): Promise<ExternalPool> {
   const { data } = await api.post<ExternalPool>(`/external-pools/${id}/auto-disabled/clear`)
+  return data
+}
+
+export async function setExternalPoolSupportedModels(id: number, req: SetSupportedModelsRequest): Promise<SupportedModelsResponse> {
+  const { data } = await api.post<SupportedModelsResponse>(`/external-pools/${id}/supported-models`, req)
+  return data
+}
+
+export async function syncExternalPoolSupportedModels(
+  id: number,
+  req: SyncSupportedModelsFromCredentialRequest
+): Promise<SupportedModelsResponse> {
+  const { data } = await api.post<SupportedModelsResponse>(`/external-pools/${id}/supported-models/sync`, req)
   return data
 }
 

@@ -172,6 +172,8 @@ pub struct CredentialRuntimeItem {
     pub recent_scheduler_selection_count_5m: u32,
     pub scheduler_selection_pressure: f64,
     pub scheduler_score: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_models: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -278,6 +280,8 @@ pub struct CredentialListItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpm_override: Option<u32>,
     pub warmup_remaining: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_models: Vec<String>,
 }
 
 /// 凭据数量与全局调度容量概览。
@@ -423,6 +427,9 @@ pub struct CredentialStatusItem {
     pub in_flight_lease_max_secs: u64,
     /// 预热剩余请求数。
     pub warmup_remaining: u32,
+    /// 凭据支持的模型列表。空列表表示不限制模型调度。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_models: Vec<String>,
     /// 连续瞬态失败次数。
     pub transient_failure_streak: u32,
     /// 近期错误率 EWMA，范围 0..=1。
@@ -511,6 +518,28 @@ pub struct SetCredentialRpmRequest {
     /// None 表示继承全局；Some(0) 表示该账号不限 RPM；Some(n) 表示该账号最多 n RPM。
     #[serde(default)]
     pub rpm: Option<u32>,
+}
+
+/// 修改支持模型列表。空列表表示不限制模型调度。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSupportedModelsRequest {
+    #[serde(default)]
+    pub supported_models: Vec<String>,
+}
+
+/// 基于一个本地凭据同步支持模型列表。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncSupportedModelsFromCredentialRequest {
+    pub credential_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupportedModelsResponse {
+    pub supported_models: Vec<String>,
+    pub count: usize,
 }
 
 /// 修改凭据 Region 覆盖值。
@@ -750,6 +779,10 @@ pub struct AddCredentialRequest {
     #[serde(default)]
     pub warmup_remaining: Option<u32>,
 
+    /// 凭据支持的模型列表。空列表表示不限制模型调度。
+    #[serde(default)]
+    pub supported_models: Vec<String>,
+
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     pub region: Option<String>,
@@ -842,6 +875,8 @@ pub struct BatchCredentialImportDefaults {
     pub endpoint: Option<String>,
     #[serde(default)]
     pub warmup_remaining: Option<u32>,
+    #[serde(default)]
+    pub supported_models: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1321,6 +1356,8 @@ pub struct RuntimeConfigResponse {
     pub kiro_upstream_response_timeout_secs: u64,
     pub kiro_upstream_stream_idle_timeout_secs: u64,
     pub credential_retry_max_attempts: u32,
+    pub credential_prompt_logic_retry_enabled: bool,
+    pub credential_prompt_logic_retry_max_attempts: u32,
     pub credential_in_flight_lease_max_secs: u64,
     pub dispatch_global_max_concurrent_requests: u32,
     pub dispatch_max_queued_requests: u32,
@@ -1412,6 +1449,10 @@ pub struct UpdateRuntimeConfigRequest {
     pub kiro_upstream_stream_idle_timeout_secs: Option<u64>,
     #[serde(default)]
     pub credential_retry_max_attempts: Option<u32>,
+    #[serde(default)]
+    pub credential_prompt_logic_retry_enabled: Option<bool>,
+    #[serde(default)]
+    pub credential_prompt_logic_retry_max_attempts: Option<u32>,
     #[serde(default)]
     pub credential_in_flight_lease_max_secs: Option<u64>,
     #[serde(default)]

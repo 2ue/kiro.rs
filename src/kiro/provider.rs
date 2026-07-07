@@ -518,6 +518,51 @@ mod tests {
     }
 
     #[test]
+    fn prompt_logic_retry_only_applies_to_enabled_protocol_reasons() {
+        let mut config = Config::default();
+        config.credential_prompt_logic_retry_enabled = false;
+        config.credential_prompt_logic_retry_max_attempts = 2;
+        assert!(!KiroProvider::should_retry_prompt_logic_bad_request(
+            "tool_use_format_bad_request",
+            Some("claude-sonnet-4"),
+            &config,
+            0,
+        ));
+
+        config.credential_prompt_logic_retry_enabled = true;
+        assert!(KiroProvider::should_retry_prompt_logic_bad_request(
+            "tool_use_format_bad_request",
+            Some("claude-sonnet-4"),
+            &config,
+            0,
+        ));
+        assert!(KiroProvider::should_retry_prompt_logic_bad_request(
+            "assistant_prefill_bad_request",
+            Some("claude-sonnet-4"),
+            &config,
+            1,
+        ));
+        assert!(!KiroProvider::should_retry_prompt_logic_bad_request(
+            "malformed_request",
+            Some("claude-sonnet-4"),
+            &config,
+            0,
+        ));
+        assert!(!KiroProvider::should_retry_prompt_logic_bad_request(
+            "tool_use_format_bad_request",
+            None,
+            &config,
+            0,
+        ));
+        assert!(!KiroProvider::should_retry_prompt_logic_bad_request(
+            "tool_use_format_bad_request",
+            Some("claude-sonnet-4"),
+            &config,
+            2,
+        ));
+    }
+
+    #[test]
     fn list_available_profiles_headers_attach_external_idp_token_type() {
         let credentials = KiroCredentials {
             auth_method: Some("external_idp".to_string()),
@@ -1670,6 +1715,21 @@ impl KiroProvider {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("没有已启用且可用于同步模型能力的账号")))
     }
 
+    /// 使用指定凭据同步 Kiro 可用模型列表。
+    ///
+    /// 该方法会真实调用上游模型列表接口，但不占用普通请求并发槽。
+    pub async fn list_available_models_for_credential(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<Vec<KiroAvailableModel>> {
+        let ctx = self
+            .token_manager
+            .acquire_context_for_credential(id)
+            .await
+            .map_err(|err| anyhow::anyhow!("账号 #{} 获取 token 失败: {}", id, err))?;
+        self.list_available_models_for_context(ctx).await
+    }
+
     async fn list_available_models_for_context(
         &self,
         mut ctx: CallContext,
@@ -2323,6 +2383,7 @@ impl KiroProvider {
         let model = Self::extract_model_from_request(request_body);
         let conversation_id = Self::extract_conversation_id_from_request(request_body);
         let mut excluded_ids: HashSet<u64> = HashSet::new();
+        let mut prompt_logic_retry_count = 0usize;
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
@@ -2963,6 +3024,50 @@ impl KiroProvider {
                     self.finish_attempt(&mut ctx);
                     continue;
                 }
+                if Self::should_retry_prompt_logic_bad_request(
+                    bad_request_reason,
+                    model.as_deref(),
+                    &config,
+                    prompt_logic_retry_count,
+                ) && self.token_manager.has_alternate_usable_credential(
+                    model.as_deref(),
+                    &excluded_ids,
+                    ctx.id,
+                ) {
+                    tracing::warn!(
+                        credential_id = ctx.id,
+                        credential_label = %credential_label,
+                        bad_request_reason,
+                        prompt_logic_retry_count = prompt_logic_retry_count + 1,
+                        "API 请求失败（{}，提示/协议逻辑错误，按配置换未尝试账号重试，尝试 {}/{}）: {} {}",
+                        credential_context,
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+                    Self::push_attempt(
+                        &mut attempts,
+                        attempt,
+                        ctx.id,
+                        &credential_label,
+                        Some(status),
+                        "prompt_logic_retry_next",
+                        Some(bad_request_reason),
+                        Some(message.clone()),
+                        attempt_started_at,
+                        model.as_deref(),
+                    );
+                    if let Some(session_id) = conversation_id.as_deref() {
+                        self.token_manager
+                            .unbind_session_if_bound_to(session_id, ctx.id);
+                    }
+                    excluded_ids.insert(ctx.id);
+                    prompt_logic_retry_count = prompt_logic_retry_count.saturating_add(1);
+                    last_error = Some(anyhow::anyhow!(message));
+                    self.finish_attempt(&mut ctx);
+                    continue;
+                }
                 Self::push_attempt(
                     &mut attempts,
                     attempt,
@@ -3466,6 +3571,32 @@ impl KiroProvider {
             return "malformed_request";
         }
         "bad_request"
+    }
+
+    fn should_retry_prompt_logic_bad_request(
+        reason: &str,
+        model: Option<&str>,
+        config: &Config,
+        already_retried: usize,
+    ) -> bool {
+        if !config.credential_prompt_logic_retry_enabled {
+            return false;
+        }
+        if model.map(str::trim).is_none_or(str::is_empty) {
+            return false;
+        }
+        if !matches!(
+            reason,
+            "tool_use_format_bad_request" | "assistant_prefill_bad_request"
+        ) {
+            return false;
+        }
+        let max_attempts = if config.credential_prompt_logic_retry_max_attempts == 0 {
+            1
+        } else {
+            config.credential_prompt_logic_retry_max_attempts as usize
+        };
+        already_retried < max_attempts
     }
 
     fn bad_request_reason_label(reason: &str) -> &'static str {

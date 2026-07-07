@@ -131,6 +131,7 @@ export interface CredentialStatusItem {
   lastErrorKind?: string
   lastErrorReason?: string
   lastErrorAtMs?: number | null
+  supportedModels?: string[]
   inProbation?: boolean
   probationRemainingSecs?: number
   schedulerSelectionCount?: number
@@ -179,6 +180,7 @@ export type CredentialListItem = Pick<
   | 'rpm'
   | 'rpmOverride'
   | 'warmupRemaining'
+  | 'supportedModels'
 > & {
   provider?: string
 }
@@ -209,6 +211,7 @@ export type CredentialRuntimeItem = Pick<
   | 'lastErrorKind'
   | 'lastErrorReason'
   | 'lastErrorAtMs'
+  | 'supportedModels'
   | 'inProbation'
   | 'probationRemainingSecs'
   | 'schedulerSelectionCount'
@@ -515,6 +518,7 @@ export interface AddCredentialRequest {
   proxyResourceId?: number | null
   kiroApiKey?: string
   endpoint?: string
+  supportedModels?: string[]
 }
 
 export interface AddCredentialResponse {
@@ -628,6 +632,14 @@ export interface UsageLatencyTrace {
   streamGapToFirstOutputMs?: number
   chunksBeforeFirstOutput?: number
   eventsBeforeFirstOutput?: number
+  upstreamBytesBeforeFirstOutput?: number
+  upstreamFramesBeforeFirstOutput?: number
+  upstreamEventsBeforeFirstOutput?: number
+  upstreamFramesWithoutDownstreamEventsBeforeFirstOutput?: number
+  upstreamPendingChunksBeforeFirstOutput?: number
+  upstreamFrameDecodeErrorsBeforeFirstOutput?: number
+  upstreamEventParseErrorsBeforeFirstOutput?: number
+  upstreamEventTypesBeforeFirstOutput?: Record<string, number>
   clientDroppedMs?: number
   terminalReason?: 'completed' | 'upstream_status_error' | 'upstream_json_exception' | 'upstream_idle_timeout' | 'malformed_sse' | 'client_dropped' | 'internal_error'
 }
@@ -956,6 +968,7 @@ export interface UsageTopAggregate {
 
 export interface UsageRecordsQuery {
   limit?: number
+  requestId?: string
   q?: string
   endpoint?: string
   conversationId?: string
@@ -1214,7 +1227,6 @@ export interface ExternalPool {
   priority: number
   maxConcurrentRequests: number
   usageProjectionMode: ExternalPoolUsageProjectionMode
-  skipNonStreamUsageProjection: boolean
   requestBodyMode: ExternalPoolRequestBodyMode
   rawModelMode: ExternalPoolRawModelMode
   autoDisablePolicy: ExternalPoolAutoDisablePolicy
@@ -1228,6 +1240,7 @@ export interface ExternalPool {
   modelMappingMode: ExternalPoolModelMappingMode
   modelMappingRequireMatch: boolean
   modelMappingRules: ExternalPoolModelMappingRule[]
+  supportedModels: string[]
   notes?: string
   createdAt: string
   updatedAt: string
@@ -1259,7 +1272,6 @@ export interface CreateExternalPoolRequest {
   priority?: number
   maxConcurrentRequests?: number
   usageProjectionMode?: ExternalPoolUsageProjectionMode
-  skipNonStreamUsageProjection?: boolean
   requestBodyMode?: ExternalPoolRequestBodyMode
   rawModelMode?: ExternalPoolRawModelMode
   autoDisablePolicy?: ExternalPoolAutoDisablePolicy
@@ -1268,6 +1280,7 @@ export interface CreateExternalPoolRequest {
   modelMappingMode?: ExternalPoolModelMappingMode
   modelMappingRequireMatch?: boolean
   modelMappingRules?: ExternalPoolModelMappingRule[]
+  supportedModels?: string[]
   notes?: string
 }
 
@@ -1280,7 +1293,6 @@ export interface UpdateExternalPoolRequest {
   priority?: number
   maxConcurrentRequests?: number
   usageProjectionMode?: ExternalPoolUsageProjectionMode
-  skipNonStreamUsageProjection?: boolean
   requestBodyMode?: ExternalPoolRequestBodyMode
   rawModelMode?: ExternalPoolRawModelMode
   autoDisablePolicy?: ExternalPoolAutoDisablePolicy
@@ -1289,7 +1301,21 @@ export interface UpdateExternalPoolRequest {
   modelMappingMode?: ExternalPoolModelMappingMode
   modelMappingRequireMatch?: boolean
   modelMappingRules?: ExternalPoolModelMappingRule[]
+  supportedModels?: string[]
   notes?: string
+}
+
+export interface SetSupportedModelsRequest {
+  supportedModels: string[]
+}
+
+export interface SyncSupportedModelsFromCredentialRequest {
+  credentialId: number
+}
+
+export interface SupportedModelsResponse {
+  supportedModels: string[]
+  count: number
 }
 
 export interface ExternalPoolTestResponse {
@@ -1339,6 +1365,8 @@ export interface RuntimeConfig {
   kiroUpstreamResponseTimeoutSecs: number
   kiroUpstreamStreamIdleTimeoutSecs: number
   credentialRetryMaxAttempts: number
+  credentialPromptLogicRetryEnabled: boolean
+  credentialPromptLogicRetryMaxAttempts: number
   credentialInFlightLeaseMaxSecs: number
   dispatchGlobalMaxConcurrentRequests: number
   dispatchMaxQueuedRequests: number

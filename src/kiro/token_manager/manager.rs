@@ -422,6 +422,7 @@ impl MultiTokenManager {
             .into_iter()
             .map(|mut cred| {
                 cred.canonicalize_auth_method();
+                cred.normalize_supported_models();
                 let id = cred.id.unwrap_or_else(|| {
                     let id = next_id;
                     next_id += 1;
@@ -977,7 +978,9 @@ impl MultiTokenManager {
         for entry in entries.iter() {
             let (reason, cooldown_remaining) = if entry.disabled {
                 (AccountRejectReason::Disabled, None)
-            } else if is_opus_model(model) && !entry.credentials.supports_opus() {
+            } else if !entry.credentials.supports_model(&[model])
+                || (is_opus_model(model) && !entry.credentials.supports_opus())
+            {
                 (AccountRejectReason::ModelNotSupported, None)
             } else if !credential_proxy_is_dispatchable(&entry.credentials, &proxy_resources) {
                 (AccountRejectReason::ProxyUnavailable, None)
@@ -3134,6 +3137,7 @@ impl MultiTokenManager {
         cred.id = Some(entry.id);
         cred.disabled = entry.disabled;
         cred.canonicalize_auth_method();
+        cred.normalize_supported_models();
         cred
     }
 
@@ -3254,6 +3258,7 @@ impl MultiTokenManager {
             if let Some(credential) = by_id.get(&entry.id) {
                 let mut credential = credential.clone();
                 credential.canonicalize_auth_method();
+                credential.normalize_supported_models();
                 if entry.credentials.disabled != credential.disabled
                     || !entry.credentials.same_dispatch_config(&credential)
                 {
@@ -3273,6 +3278,7 @@ impl MultiTokenManager {
                 continue;
             }
             credential.canonicalize_auth_method();
+            credential.normalize_supported_models();
             entries.push(CredentialEntry {
                 id,
                 disabled: credential.disabled,
@@ -5068,6 +5074,41 @@ impl MultiTokenManager {
         self.notify_dispatch_state_changed();
         self.publish_credentials_changed("credential_rpm_updated");
         Ok(())
+    }
+
+    /// 设置凭据支持模型列表（Admin API）。
+    ///
+    /// 空列表表示不限制该凭据可调度的模型。
+    pub fn set_credential_supported_models(
+        &self,
+        id: u64,
+        supported_models: Vec<String>,
+    ) -> anyhow::Result<Vec<String>> {
+        let credential = {
+            let entries = self.entries.lock();
+            let entry = entries
+                .iter()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            let mut credential = Self::credential_from_entry(entry);
+            credential.supported_models = supported_models;
+            credential.normalize_supported_models();
+            credential
+        };
+        self.persist_credential_value(&credential)?;
+
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.supported_models = credential.supported_models.clone();
+        }
+
+        self.notify_dispatch_state_changed();
+        self.publish_credentials_changed("credential_supported_models_updated");
+        Ok(credential.supported_models)
     }
 
     /// 设置凭据 Region 覆盖值（Admin API）。
@@ -6915,6 +6956,47 @@ mod tests {
         assert!(entry.cooled_down);
         assert_eq!(entry.cooldowns.len(), 1);
         assert_eq!(entry.cooldowns[0].model.as_deref(), Some("claude-opus-4.8"));
+    }
+
+    #[tokio::test]
+    async fn test_supported_model_alias_allows_local_scheduler_selection() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("t1".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        cred.supported_models = vec!["claude-sonnet-4-20250514".to_string()];
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        let mut ctx = manager
+            .acquire_context_for_session(Some("claude-sonnet-4"), None, &HashSet::new())
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.id, 1);
+        ctx.release_in_flight();
+    }
+
+    #[tokio::test]
+    async fn test_supported_model_alias_does_not_cross_family_in_local_scheduler() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut cred = KiroCredentials::default();
+        cred.access_token = Some("t1".to_string());
+        cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        cred.supported_models = vec!["claude-opus-4.8".to_string()];
+
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        let err = manager
+            .acquire_context_for_session(Some("claude-sonnet-4.6"), None, &HashSet::new())
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(err.contains("没有支持当前模型的可用账号"), "{err}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

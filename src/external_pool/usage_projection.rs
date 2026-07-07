@@ -39,9 +39,6 @@ pub(super) fn build_context(
         return None;
     }
     let stream = route.is_stream();
-    if !stream && pool.skip_non_stream_usage_projection {
-        return None;
-    }
     let reported_usage = route.reported_usage.policy_for_path(&route.endpoint);
     if !stream && reported_usage.skip_non_stream_usage_projection {
         return None;

@@ -16,8 +16,10 @@ import {
   setCredentialConcurrency,
   setCredentialRpm,
   setCredentialRegions,
+  setCredentialSupportedModels,
   setCredentialWarmup,
   setCredentialProxy,
+  syncCredentialSupportedModels,
   clearCredentialInFlight,
   resetCredentialFailure,
   forceRefreshToken,
@@ -42,6 +44,7 @@ import type {
   SetCredentialRpmRequest,
   SetCredentialProxyRequest,
   SetCredentialRegionsRequest,
+  SetSupportedModelsRequest,
   TestCredentialRequest,
   ProxyResourceTestRequest,
   UpdateProxyResourceRequest,
@@ -270,6 +273,27 @@ export function useSetCredentialRpm() {
       setCredentialRpm(id, request),
     onSuccess: (_data, variables) => {
       invalidateCredentialCaches(queryClient, variables.id)
+    },
+  })
+}
+
+export function useSetCredentialSupportedModels() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, request }: { id: number; request: SetSupportedModelsRequest }) =>
+      setCredentialSupportedModels(id, request),
+    onSuccess: (_data, variables) => {
+      invalidateCredentialCaches(queryClient, variables.id)
+    },
+  })
+}
+
+export function useSyncCredentialSupportedModels() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => syncCredentialSupportedModels(id),
+    onSuccess: (_data, id) => {
+      invalidateCredentialCaches(queryClient, id)
     },
   })
 }

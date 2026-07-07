@@ -14,6 +14,7 @@ use base64::{
 
 use crate::http_client::ProxyConfig;
 use crate::model::config::Config;
+use crate::model::model_support::{model_is_supported_by_list, normalize_supported_models};
 
 /// Kiro OAuth 凭证
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -126,6 +127,10 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub subscription_title: Option<String>,
+
+    /// 凭据支持的模型列表。空列表表示不限制模型调度。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_models: Vec<String>,
 
     /// 凭据级代理 URL（可选）
     /// 支持 http/https/socks5 协议
@@ -286,6 +291,7 @@ impl CredentialsConfig {
         match self {
             CredentialsConfig::Single(mut cred) => {
                 cred.canonicalize_auth_method();
+                cred.normalize_supported_models();
                 cred.normalize_external_idp_defaults();
                 vec![cred]
             }
@@ -294,6 +300,7 @@ impl CredentialsConfig {
                 creds.sort_by_key(|c| c.priority);
                 for cred in &mut creds {
                     cred.canonicalize_auth_method();
+                    cred.normalize_supported_models();
                     cred.normalize_external_idp_defaults();
                 }
                 creds
@@ -334,6 +341,7 @@ impl KiroCredentials {
             && self.machine_id == other.machine_id
             && self.email == other.email
             && self.subscription_title == other.subscription_title
+            && self.supported_models == other.supported_models
             && self.proxy_url == other.proxy_url
             && self.proxy_username == other.proxy_username
             && self.proxy_password == other.proxy_password
@@ -447,6 +455,15 @@ impl KiroCredentials {
             // 如果还没有获取订阅信息，暂时允许（首次使用时会获取）
             None => true,
         }
+    }
+
+    pub fn normalize_supported_models(&mut self) {
+        self.supported_models =
+            normalize_supported_models(std::mem::take(&mut self.supported_models));
+    }
+
+    pub fn supports_model(&self, candidates: &[Option<&str>]) -> bool {
+        model_is_supported_by_list(&self.supported_models, candidates)
     }
 
     /// 检查是否为 API Key 凭据
@@ -602,6 +619,31 @@ mod tests {
 
         let creds = KiroCredentials::from_json(json).unwrap();
         assert_eq!(creds.access_token, Some("test_token".to_string()));
+    }
+
+    #[test]
+    fn supported_models_empty_allows_any_and_nonempty_filters_candidates() {
+        let mut creds = KiroCredentials::default();
+        assert!(creds.supports_model(&[Some("claude-sonnet-4")]));
+
+        creds.supported_models = vec![
+            " claude-sonnet-4 ".to_string(),
+            "CLAUDE-SONNET-4".to_string(),
+            "claude-haiku-4.5".to_string(),
+        ];
+        creds.normalize_supported_models();
+
+        assert_eq!(
+            creds.supported_models,
+            vec![
+                "claude-sonnet-4".to_string(),
+                "claude-haiku-4.5".to_string()
+            ]
+        );
+        assert!(creds.supports_model(&[Some("Claude-Sonnet-4")]));
+        assert!(creds.supports_model(&[None, Some("claude-haiku-4.5")]));
+        assert!(!creds.supports_model(&[Some("claude-opus-4.5")]));
+        assert!(!creds.supports_model(&[None]));
     }
 
     #[test]

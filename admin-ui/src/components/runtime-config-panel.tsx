@@ -373,6 +373,8 @@ const emptyConfig: RuntimeConfig = {
   kiroUpstreamResponseTimeoutSecs: 180,
   kiroUpstreamStreamIdleTimeoutSecs: 180,
   credentialRetryMaxAttempts: 0,
+  credentialPromptLogicRetryEnabled: false,
+  credentialPromptLogicRetryMaxAttempts: 0,
   credentialInFlightLeaseMaxSecs: 900,
   dispatchGlobalMaxConcurrentRequests: 0,
   dispatchMaxQueuedRequests: 0,
@@ -2545,6 +2547,10 @@ export function RuntimeConfigPanel() {
       kiroUpstreamResponseTimeoutSecs: toWhole(draft.kiroUpstreamResponseTimeoutSecs),
       kiroUpstreamStreamIdleTimeoutSecs: toWhole(draft.kiroUpstreamStreamIdleTimeoutSecs),
       credentialRetryMaxAttempts: toWhole(draft.credentialRetryMaxAttempts),
+      credentialPromptLogicRetryEnabled: Boolean(draft.credentialPromptLogicRetryEnabled),
+      credentialPromptLogicRetryMaxAttempts: toWhole(
+        draft.credentialPromptLogicRetryMaxAttempts,
+      ),
       credentialInFlightLeaseMaxSecs: toWhole(draft.credentialInFlightLeaseMaxSecs),
       dispatchGlobalMaxConcurrentRequests: toWhole(draft.dispatchGlobalMaxConcurrentRequests),
       dispatchMaxQueuedRequests: toWhole(draft.dispatchMaxQueuedRequests),
@@ -2784,6 +2790,25 @@ export function RuntimeConfigPanel() {
               suffix="次"
               onChange={(credentialRetryMaxAttempts) =>
                 setDraft((prev) => ({ ...prev, credentialRetryMaxAttempts }))
+              }
+            />
+            <ToggleField
+              title="提示逻辑错误换号"
+              description="开启后，部分模型已解析成功但上游返回提示/工具协议 400 的请求，会换未尝试账号重试。默认关闭。"
+              checked={draft.credentialPromptLogicRetryEnabled}
+              onCheckedChange={(credentialPromptLogicRetryEnabled) =>
+                setDraft((prev) => ({ ...prev, credentialPromptLogicRetryEnabled }))
+              }
+            />
+            <NumberField
+              title="提示逻辑最多换号"
+              description="仅在上方开关开启时生效；填 0 表示默认 1 次。"
+              value={draft.credentialPromptLogicRetryMaxAttempts}
+              min={0}
+              suffix="次"
+              disabled={!draft.credentialPromptLogicRetryEnabled}
+              onChange={(credentialPromptLogicRetryMaxAttempts) =>
+                setDraft((prev) => ({ ...prev, credentialPromptLogicRetryMaxAttempts }))
               }
             />
             <NumberField
