@@ -6018,6 +6018,7 @@ mod tests {
                 pricing_available: true,
                 pricing_model: Some("claude-sonnet-4-5".to_string()),
                 usage_projection_mode: "current_path_policy".to_string(),
+                stream_response_mode: None,
             }),
             credential_attempts: Vec::new(),
             error_type: None,

@@ -689,10 +689,11 @@ pub struct ReportedUsagePathPolicy {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
-    /// 命中该路径的非流式请求是否跳过 usage 展示整形。
+    /// 命中该路径的非流式请求是否禁用本系统缓存投影和本地缓存状态推进。
     ///
-    /// 该字段只是否决开关：开启后非流式请求不改写下游 usage；流式请求不受影响。
-    /// 其他层（例如外部池）即使允许非流式整形，也不能覆盖这里的禁用。
+    /// 该字段保留旧的 usage projection 命名以兼容现有配置。开启后，非流式请求按无缓存
+    /// 口径返回和记录 usage，且不会读取或写入本地 prompt-cache 状态；流式请求不受影响。
+    /// 全局策略模板里开启会影响继承该模板的路径，路径级配置可单独覆盖。
     #[serde(default)]
     pub skip_non_stream_usage_projection: bool,
 
@@ -1617,6 +1618,9 @@ impl CacheRoutePolicyPatch {
         if let Some(cache_type) = self.cache_type {
             policy.cache_type = cache_type;
         }
+        if let Some(reported_usage) = &self.reported_usage {
+            policy.reported_usage = reported_usage.normalized();
+        }
         if let Some(patch) = self.cache_point {
             policy.cache_point = patch.apply_to(policy.cache_point);
         }
@@ -2190,6 +2194,33 @@ impl Default for ExternalPoolCapacityMode {
     }
 }
 
+/// 外部池流式响应处理模式。
+///
+/// `event_passthrough_capture` 保持正常 SSE event 字节原样下发，只在旁路解析 usage
+/// 和错误事件；本地费用/历史 usage 仍可按当前路径策略投影。`projected_rewrite`
+/// 保留旧行为，会改写下游流式 usage event。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalPoolStreamResponseMode {
+    ProjectedRewrite,
+    EventPassthroughCapture,
+}
+
+impl Default for ExternalPoolStreamResponseMode {
+    fn default() -> Self {
+        Self::EventPassthroughCapture
+    }
+}
+
+impl ExternalPoolStreamResponseMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProjectedRewrite => "projected_rewrite",
+            Self::EventPassthroughCapture => "event_passthrough_capture",
+        }
+    }
+}
+
 /// 外部备用号池全局策略配置。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -2282,6 +2313,8 @@ pub struct ExternalPoolsConfig {
     pub external_pool_usage_projection_output_uplift_min_tokens: i32,
     #[serde(default)]
     pub external_pool_usage_projection_output_uplift_percent: u32,
+    #[serde(default)]
+    pub external_pool_stream_response_mode: ExternalPoolStreamResponseMode,
 }
 
 impl Default for ExternalPoolsConfig {
@@ -2342,6 +2375,7 @@ impl Default for ExternalPoolsConfig {
                 default_external_pool_usage_projection_uplift_percent(),
             external_pool_usage_projection_output_uplift_min_tokens: 0,
             external_pool_usage_projection_output_uplift_percent: 0,
+            external_pool_stream_response_mode: ExternalPoolStreamResponseMode::default(),
         }
     }
 }
@@ -3950,6 +3984,10 @@ mod tests {
             30
         );
         assert_eq!(config.external_pools.external_pool_max_queued_requests, 0);
+        assert_eq!(
+            config.external_pools.external_pool_stream_response_mode,
+            ExternalPoolStreamResponseMode::EventPassthroughCapture
+        );
         assert!(!config.compression.enabled);
         assert!(config.compression.whitespace_compression);
         assert_eq!(
@@ -4141,6 +4179,10 @@ mod tests {
                 .external_pool_auto_disable_on_channel_disabled
         );
         assert_eq!(config.external_pools.external_pool_max_queued_requests, 25);
+        assert_eq!(
+            config.external_pools.external_pool_stream_response_mode,
+            ExternalPoolStreamResponseMode::EventPassthroughCapture
+        );
 
         let wait_config: Config = serde_json::from_str(
             r#"{
@@ -4162,6 +4204,24 @@ mod tests {
                 .external_pools
                 .external_pool_dispatch_max_wait_secs,
             3
+        );
+    }
+
+    #[test]
+    fn external_pool_stream_response_mode_can_restore_projected_rewrite() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "apiKey": "sk-test",
+                "externalPools": {
+                    "externalPoolStreamResponseMode": "projected_rewrite"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.external_pools.external_pool_stream_response_mode,
+            ExternalPoolStreamResponseMode::ProjectedRewrite
         );
     }
 
@@ -4437,8 +4497,8 @@ mod tests {
         assert!(!cc.policy.simulation.enabled);
         assert_eq!(cc.policy.simulation.token_scale, 1.0);
         assert_eq!(cc.policy.simulation.target_read_ratio, 0.98);
-        assert!(!cc.policy.reported_usage.enabled);
-        assert_eq!(cc.policy.reported_usage.input.max_tokens, 0);
+        assert!(cc.policy.reported_usage.enabled);
+        assert_eq!(cc.policy.reported_usage.input.max_tokens, 48);
         assert!(cc.policy.cache_point.enabled);
 
         let ha = config.cache_policy_for_path("/ha/v1/messages");
@@ -4748,7 +4808,8 @@ mod tests {
         assert!(!tool.policy.simulation.enabled);
         assert_eq!(tool.policy.simulation.token_scale, 1.0);
         assert!(!tool.policy.creation_control.enabled);
-        assert!(!tool.policy.reported_usage.enabled);
+        assert!(tool.policy.reported_usage.enabled);
+        assert_eq!(tool.policy.reported_usage.input.max_tokens, 123);
         assert!(tool.policy.cache_point.enabled);
         assert!(!tool.policy.cache_point.tools_only);
         assert!(tool.policy.cache_point.record_plan);
@@ -4870,6 +4931,13 @@ mod tests {
             resolved.policy.cache_type,
             PromptCacheStrategyType::KiroRsTool
         );
+        assert!(!resolved.policy.reported_usage.enabled);
+        assert!(
+            !resolved
+                .policy
+                .reported_usage
+                .skip_non_stream_usage_projection
+        );
 
         let inherited = config.cache_policy_for_path("/cc/v1/messages");
         assert_eq!(inherited.namespace, None);
@@ -4898,6 +4966,9 @@ mod tests {
         let mut config: Config = serde_json::from_value(serde_json::json!({
             "cachePolicy": {
                 "kiroRsTool": {
+                    "reportedUsage": {
+                        "skipNonStreamUsageProjection": true
+                    },
                     "kiroRsTool": {
                         "coverageRatio": 0.75,
                         "maxCoverageTokens": 12000,
@@ -4939,6 +5010,12 @@ mod tests {
         assert_eq!(
             resolved.policy.cache_type,
             PromptCacheStrategyType::KiroRsTool
+        );
+        assert!(
+            resolved
+                .policy
+                .reported_usage
+                .skip_non_stream_usage_projection
         );
         assert_eq!(resolved.policy.kiro_rs_tool.coverage_ratio, 0.5);
         assert_eq!(resolved.policy.kiro_rs_tool.max_coverage_tokens, 12_000);

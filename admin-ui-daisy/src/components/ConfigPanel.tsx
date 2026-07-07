@@ -5,6 +5,7 @@ import { Alert, Button, Input, Join, Loading, Toggle } from 'react-daisyui'
 import { ErrorState, FieldLabel, Select, useConfirm } from '@/components/ui'
 import {
   defaultModelMappingConfig,
+  defaultBodyConversion,
   defaultImageProcessing,
   defaultPayloadShaping,
   defaultExternalPoolsConfig,
@@ -20,6 +21,7 @@ import {
   normalizeDefinedCacheRoute,
   normalizeDefinedCacheRoutes,
   normalizePayloadShaping,
+  normalizeBodyConversion,
   normalizeCachePolicy,
   normalizeImageProcessing,
   normalizePromptCacheCreationControl,
@@ -65,9 +67,11 @@ type ConfigTab =
   | 'scheduler'
   | 'warmup'
   | 'payload'
+  | 'protocolConversion'
   | 'payloadHistory'
   | 'payloadFallback'
   | 'cachePolicy'
+  | 'modelMapping'
   | 'compat'
   | 'stats'
 
@@ -78,10 +82,12 @@ const configTabs: Array<{ key: ConfigTab; label: string; description: string; ic
   { key: 'scheduler', label: '账号选择', description: '负载、错误、延迟权重', icon: <Gauge className="h-4 w-4" /> },
   { key: 'warmup', label: '新账号预热', description: '新账号逐步参与请求', icon: <Sparkles className="h-4 w-4" /> },
   { key: 'payload', label: '大小保护', description: '压缩、阈值和处理时机', icon: <Wand2 className="h-4 w-4" /> },
+  { key: 'protocolConversion', label: '协议转换', description: '本地 Anthropic 到 Kiro 请求体转换', icon: <Wand2 className="h-4 w-4" /> },
   { key: 'payloadHistory', label: '旧内容清理', description: '历史消息、工具和网页内容', icon: <Wand2 className="h-4 w-4" /> },
   { key: 'payloadFallback', label: '当前内容兜底', description: '当前消息、文档和图片', icon: <Wand2 className="h-4 w-4" /> },
   { key: 'cachePolicy', label: '缓存策略', description: '默认缓存设置和路径覆盖', icon: <Zap className="h-4 w-4" /> },
-  { key: 'compat', label: '兼容与模型', description: '兼容模式和模型映射', icon: <Shield className="h-4 w-4" /> },
+  { key: 'modelMapping', label: '模型解析', description: '模型名解析和映射规则', icon: <Shield className="h-4 w-4" /> },
+  { key: 'compat', label: '接口兼容', description: '兼容模式、Kiro 工作模式和诊断', icon: <Shield className="h-4 w-4" /> },
   { key: 'stats', label: '后台统计', description: '页面统计判断标准', icon: <Gauge className="h-4 w-4" /> },
 ]
 
@@ -296,7 +302,11 @@ function defaultPathCachePatch(
     return { cacheType: 'no_cache' }
   }
   if (cacheType === 'kiro_rs_tool') {
-    return { cacheType: 'kiro_rs_tool', kiroRsTool: defaultKiroRsToolPatch() }
+    return {
+      cacheType: 'kiro_rs_tool',
+      reportedUsage: defaultUsagePatch(prefix),
+      kiroRsTool: defaultKiroRsToolPatch(),
+    }
   }
   return {
     cacheType: 'current_high_cache',
@@ -475,9 +485,39 @@ function KiroRsToolPolicyForm({
   )
 }
 
+function NonStreamCacheToggle({
+  value,
+  fallbackPrefix,
+  onChange,
+}: {
+  value?: ReportedUsagePathPolicy
+  fallbackPrefix: string
+  onChange: (value: ReportedUsagePathPolicy) => void
+}) {
+  const policy = value ?? defaultUsagePatch(fallbackPrefix)
+  return (
+    <div className="rounded-lg border border-base-300 bg-base-100/70 p-4">
+      <ToggleField
+        title="非流式请求无缓存"
+        description="开启后，命中此路径的非流式请求不做本系统缓存展示，不写入本地缓存状态，返回和记录都按无缓存 usage 口径；流式请求保持原策略。"
+        checked={Boolean(policy.skipNonStreamUsageProjection)}
+        onChange={(skipNonStreamUsageProjection) =>
+          onChange({ ...policy, skipNonStreamUsageProjection })
+        }
+      />
+    </div>
+  )
+}
+
 function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, cacheType: CacheStrategyType): CacheRoutePolicyPatch {
   if (cacheType === 'no_cache') return { cacheType: 'no_cache' }
-  if (cacheType === 'kiro_rs_tool') return { cacheType: 'kiro_rs_tool', kiroRsTool: policy.kiroRsTool ?? defaultKiroRsToolPatch() }
+  if (cacheType === 'kiro_rs_tool') {
+    return {
+      cacheType: 'kiro_rs_tool',
+      reportedUsage: policy.reportedUsage ?? defaultUsagePatch('/v1'),
+      kiroRsTool: policy.kiroRsTool ?? defaultKiroRsToolPatch(),
+    }
+  }
   return {
     cacheType: 'current_high_cache',
     simulation: policy.simulation ?? defaultSimulationPatch(),
@@ -532,6 +572,7 @@ function pathPolicyWithStrategyDefaults(
           reportedUsage: policy.reportedUsage ?? template.reportedUsage ?? defaultUsagePatch(prefix),
         }
       : {
+          reportedUsage: policy.reportedUsage ?? template.reportedUsage ?? defaultUsagePatch(prefix),
           kiroRsTool: policy.kiroRsTool ?? template.kiroRsTool ?? defaultKiroRsToolPatch(),
         }),
   }
@@ -583,10 +624,17 @@ function StrategyTemplateBlock({
           </div>
         </>
       ) : (
-        <KiroRsToolPolicyForm
-          value={template.kiroRsTool ?? defaultKiroRsToolPatch()}
-          onChange={setKiroRsTool}
-        />
+        <>
+          <NonStreamCacheToggle
+            value={template.reportedUsage}
+            fallbackPrefix="/v1"
+            onChange={setReportedUsage}
+          />
+          <KiroRsToolPolicyForm
+            value={template.kiroRsTool ?? defaultKiroRsToolPatch()}
+            onChange={setKiroRsTool}
+          />
+        </>
       )}
     </div>
   )
@@ -763,6 +811,11 @@ function PathCachePolicyCard({
           <p className="mt-1 text-xs leading-5 text-base-content/60">
             这里只展示 Kiro-RS Tool 自己需要的参数，不读取本地模拟缓存策略的参数。
           </p>
+          <NonStreamCacheToggle
+            value={effectivePolicy.reportedUsage}
+            fallbackPrefix={prefix}
+            onChange={(reportedUsage) => patch({ reportedUsage })}
+          />
           <KiroRsToolPolicyForm
             value={effectivePolicy.kiroRsTool ?? defaultKiroRsToolPatch()}
             onChange={(kiroRsTool) => patch({ kiroRsTool })}
@@ -929,7 +982,7 @@ function CachePolicyEditor({
 
   return (
     <div className="space-y-5">
-      <div className="grid gap-4 xl:grid-cols-2">
+      <div className="grid gap-4">
         <StrategyTemplateBlock
           title="本地模拟缓存策略默认参数"
           description="使用本策略的路径会先读取这里的参数，再合并路径自己的参数。"
@@ -953,8 +1006,8 @@ function CachePolicyEditor({
             每个路径都显式选择无缓存、本地模拟缓存策略或 Kiro-RS Tool 缓存策略。
           </p>
         </div>
-        <div className="flex flex-col gap-3 lg:flex-row lg:items-end">
-          <FieldLabel title="新增自定义缓存入口">
+        <div className="grid gap-3 lg:grid-cols-[minmax(0,34rem)_auto] lg:items-start">
+          <FieldLabel title="新增自定义缓存入口" description="这里只填后缀，例如 team-a，最终路径是 /dfcache/team-a。">
             <div className="join w-full">
               <span className="join-item flex items-center border border-base-300 bg-base-200/60 px-3 font-mono text-sm text-base-content/60">
                 {DFCACHE_ROUTE_PREFIX}
@@ -971,11 +1024,8 @@ function CachePolicyEditor({
                 }}
               />
             </div>
-            <div className="mt-2 text-xs leading-5 text-base-content/60">
-              这里只填后缀，例如 team-a，最终路径是 /dfcache/team-a。
-            </div>
           </FieldLabel>
-          <Button type="button" color="primary" size="sm" onClick={addPath}>
+          <Button type="button" color="primary" size="sm" className="lg:mt-[1.55rem]" onClick={addPath}>
             <Plus className="h-4 w-4" />
             新增路径
           </Button>
@@ -1574,6 +1624,16 @@ function ReportedUsagePathEditor({
           <Toggle color="primary" size="sm" className="shrink-0" checked={value.enabled} onChange={(event) => onChange({ ...value, enabled: event.target.checked })} />
         </div>
       </div>
+      <div className="mb-3">
+        <ToggleField
+          title="非流式请求无缓存"
+          description="开启后，命中此路径的非流式请求不做本系统缓存展示，不写入本地缓存状态，返回和记录都按无缓存 usage 口径；流式请求保持原策略。"
+          checked={Boolean(value.skipNonStreamUsageProjection)}
+          onChange={(skipNonStreamUsageProjection) =>
+            onChange({ ...value, skipNonStreamUsageProjection })
+          }
+        />
+      </div>
       {!value.enabled && (
         <Alert status="warning" className="mb-3 py-2 text-xs leading-5">
           当前入口会尽量使用原始用量显示。重新开启后才会使用下面的展示规则。
@@ -1581,14 +1641,6 @@ function ReportedUsagePathEditor({
       )}
       {value.enabled && (
         <>
-          <ToggleField
-            title="禁用非流式整形"
-            description="开启后，命中此路径的非流式请求不会改写返回 usage；流式请求不受影响。此设置是上层拦截，后续外部池等配置不能重新开启本次整形。"
-            checked={Boolean(value.skipNonStreamUsageProjection)}
-            onChange={(skipNonStreamUsageProjection) =>
-              onChange({ ...value, skipNonStreamUsageProjection })
-            }
-          />
           <div className="grid gap-3 xl:grid-cols-2">
             <ReportedUsageFieldEditor
               title="输入用量展示"
@@ -1671,6 +1723,7 @@ export function ConfigPanel() {
           ...config.data.payloadShaping,
         },
         imageProcessing: normalizeImageProcessing(config.data.imageProcessing),
+        bodyConversion: normalizeBodyConversion(config.data.bodyConversion),
         weightedCapacity: normalizeWeightedCapacity(config.data.weightedCapacity ?? defaultWeightedCapacity()),
         externalPools: {
           ...defaultExternalPoolsConfig(),
@@ -1686,6 +1739,18 @@ export function ConfigPanel() {
       })
     }
   }, [config.data])
+
+  const setBodyConversion = <K extends keyof RuntimeConfig['bodyConversion']>(
+    key: K,
+  ) => (value: RuntimeConfig['bodyConversion'][K]) =>
+    setDraft((prev) => ({
+      ...prev,
+      bodyConversion: {
+        ...defaultBodyConversion(),
+        ...prev.bodyConversion,
+        [key]: value,
+      },
+    }))
 
   const save = () => {
     const invalidDefinedCacheRoute = (draft.definedCacheRoutes || []).find((route) => route.trim() && !normalizeDefinedCacheRoute(route))
@@ -1735,6 +1800,7 @@ export function ConfigPanel() {
       payloadGuardMaxBytes: toWhole(draft.payloadGuardMaxBytes),
       payloadGuardSafetyMarginBytes: toWhole(draft.payloadGuardSafetyMarginBytes),
       imageProcessing: normalizeImageProcessing(draft.imageProcessing),
+      bodyConversion: normalizeBodyConversion(draft.bodyConversion),
       payloadShaping: normalizePayloadShaping(draft.payloadShaping),
       promptCacheTargetReadRatio: toRatio(draft.promptCacheTargetReadRatio),
       promptCacheTokenScale: toScale(draft.promptCacheTokenScale),
@@ -1776,6 +1842,7 @@ export function ConfigPanel() {
         externalPoolUsageProjectionUpliftPercent: toWhole(draft.externalPools.externalPoolUsageProjectionUpliftPercent),
         externalPoolUsageProjectionOutputUpliftMinTokens: toWhole(draft.externalPools.externalPoolUsageProjectionOutputUpliftMinTokens),
         externalPoolUsageProjectionOutputUpliftPercent: toWhole(draft.externalPools.externalPoolUsageProjectionOutputUpliftPercent),
+        externalPoolStreamResponseMode: draft.externalPools.externalPoolStreamResponseMode,
       },
       highCacheThreshold: toWhole(draft.highCacheThreshold),
     }
@@ -2048,6 +2115,28 @@ export function ConfigPanel() {
             </ConfigGroup>
         )}
 
+        {activeTab === 'protocolConversion' && (
+            <ConfigGroup
+              icon={<Wand2 className="h-4 w-4" />}
+              title="协议转换"
+              description="控制本地凭据路径的 Anthropic 到 Kiro 请求体转换能力。"
+            >
+              <ImpactGroupHeader
+                label="本地协议转换"
+                title="这些开关会改变最终发往 Kiro 的请求体"
+                description="只影响本地凭据请求。外部池 raw body 透传不会进入这些阶段，外部池 normalized 仍按外部池自己的配置处理。"
+              />
+              <ToggleField title="工具 schema 规范化" description="清理 OpenAPI、Zod、MCP 等工具 schema 中上游容易拒绝的字段。" checked={draft.bodyConversion.toolSchemaNormalization} onChange={setBodyConversion('toolSchemaNormalization')} />
+              <ToggleField title="工具名映射" description="清洗或缩短不符合 Kiro 工具名约束的名称，并记录响应反向映射。" checked={draft.bodyConversion.toolNameMapping} onChange={setBodyConversion('toolNameMapping')} />
+              <ToggleField title="tool_choice 引导" description="按请求的 tool_choice 过滤工具并注入兼容提示。" checked={draft.bodyConversion.toolChoiceSteering} onChange={setBodyConversion('toolChoiceSteering')} />
+              <ToggleField title="分块写入策略" description="给 Write/Edit 工具和系统消息加入分块写入约束。" checked={draft.bodyConversion.chunkedToolPolicy} onChange={setBodyConversion('chunkedToolPolicy')} />
+              <ToggleField title="thinking 提示控制" description="对不支持原生 reasoning 的模型注入 synthetic thinking 控制。" checked={draft.bodyConversion.thinkingPromptControls} onChange={setBodyConversion('thinkingPromptControls')} />
+              <ToggleField title="原生 reasoning 字段" description="对支持的 Kiro 模型上报 additionalModelRequestFields。" checked={draft.bodyConversion.nativeReasoningFields} onChange={setBodyConversion('nativeReasoningFields')} />
+              <ToggleField title="工具配对修复" description="修复或文本化不严格配对的 tool_use/tool_result。" checked={draft.bodyConversion.toolPairingRepair} onChange={setBodyConversion('toolPairingRepair')} />
+              <ToggleField title="历史工具占位" description="历史里出现但当前 tools 缺失时补充占位工具定义。" checked={draft.bodyConversion.historyPlaceholderTools} onChange={setBodyConversion('historyPlaceholderTools')} />
+            </ConfigGroup>
+        )}
+
         {activeTab === 'payloadHistory' && (
             <ConfigGroup
               icon={<Wand2 className="h-4 w-4" />}
@@ -2110,29 +2199,17 @@ export function ConfigPanel() {
 
         {activeTab === 'cachePolicy' && (
           <ConfigGroup icon={<Zap className="h-4 w-4" />} title="缓存策略" description="默认缓存设置和路径覆盖在这里统一维护。">
-            <CachePolicyEditor
-              value={draft}
-              onChange={setDraft}
-            />
+            <div className="md:col-span-2">
+              <CachePolicyEditor
+                value={draft}
+                onChange={setDraft}
+              />
+            </div>
           </ConfigGroup>
         )}
 
-        {activeTab === 'compat' && (
-            <ConfigGroup icon={<Shield className="h-4 w-4" />} title="兼容与模型" description="选择接口兼容方式，并维护模型名称映射。">
-              <FieldLabel title="兼容模式" description="日常使用建议保持兼容模式；严格模式会尽量减少代理侧处理；调试模式会输出更多排查信息。">
-                <Select bordered size="sm" value={draft.compatProfile} onChange={(event) => setDraft((prev) => ({ ...prev, compatProfile: event.target.value as CompatProfile }))}>
-                  <Select.Option value="claude-code">Claude Code 兼容</Select.Option>
-                  <Select.Option value="anthropic-strict">Anthropic 严格模式</Select.Option>
-                  <Select.Option value="debug">调试模式</Select.Option>
-                </Select>
-              </FieldLabel>
-              <FieldLabel title="Kiro 工作模式" description="控制 Kiro 侧使用的工作模式。一般保持默认即可，只有需要特定模式时再调整。">
-                <Select bordered size="sm" value={draft.kiroAgentModeStrategy} onChange={(event) => setDraft((prev) => ({ ...prev, kiroAgentModeStrategy: event.target.value as KiroAgentModeStrategy }))}>
-                  <Select.Option value="vibe">vibe（默认兼容）</Select.Option>
-                  <Select.Option value="spec">spec（强制规格模式）</Select.Option>
-                  <Select.Option value="auto">auto（按账号协议自动）</Select.Option>
-                </Select>
-              </FieldLabel>
+        {activeTab === 'modelMapping' && (
+            <ConfigGroup icon={<Shield className="h-4 w-4" />} title="模型解析" description="控制请求模型名如何匹配、归一化和映射到实际上游模型。">
               <FieldLabel title="模型解析策略" description="控制模型名称如何匹配。越严格越少自动转换，越兼容越适合常见简称。">
                 <Select bordered size="sm" value={draft.modelResolutionMode} onChange={(event) => setDraft((prev) => ({ ...prev, modelResolutionMode: event.target.value as ModelResolutionMode }))}>
                   <Select.Option value="compatible">默认兼容解析</Select.Option>
@@ -2176,10 +2253,50 @@ export function ConfigPanel() {
                   <div className="text-xs text-base-content/60">当前规则 {draft.modelMapping.rules.length} 条；可生成默认规则 {defaultModelMappingRules.length} 条。</div>
                 </div>
               </FieldLabel>
+            </ConfigGroup>
+        )}
+
+        {activeTab === 'compat' && (
+            <ConfigGroup icon={<Shield className="h-4 w-4" />} title="接口兼容" description="选择客户端接口兼容方式、Kiro 工作模式和响应诊断行为。">
+              <FieldLabel title="兼容模式" description="日常使用建议保持兼容模式；严格模式会尽量减少代理侧处理；调试模式会输出更多排查信息。请求体转换能力在协议转换里配置。">
+                <Select bordered size="sm" value={draft.compatProfile} onChange={(event) => setDraft((prev) => ({ ...prev, compatProfile: event.target.value as CompatProfile }))}>
+                  <Select.Option value="claude-code">Claude Code 兼容</Select.Option>
+                  <Select.Option value="anthropic-strict">Anthropic 严格模式</Select.Option>
+                  <Select.Option value="debug">调试模式</Select.Option>
+                </Select>
+              </FieldLabel>
+              <FieldLabel title="Kiro 工作模式" description="控制 Kiro 侧使用的工作模式。一般保持默认即可，只有需要特定模式时再调整。">
+                <Select bordered size="sm" value={draft.kiroAgentModeStrategy} onChange={(event) => setDraft((prev) => ({ ...prev, kiroAgentModeStrategy: event.target.value as KiroAgentModeStrategy }))}>
+                  <Select.Option value="vibe">vibe（默认兼容）</Select.Option>
+                  <Select.Option value="spec">spec（强制规格模式）</Select.Option>
+                  <Select.Option value="auto">auto（按账号协议自动）</Select.Option>
+                </Select>
+              </FieldLabel>
               <FieldLabel title="思考触发策略" description="按请求触发会遵循 Claude Code CLI 的 thinking 语义；总是触发会在请求没有明确关闭时启用思考输出。">
                 <Select bordered size="sm" value={draft.thinkingTriggerMode} onChange={(event) => setDraft((prev) => ({ ...prev, thinkingTriggerMode: event.target.value as RuntimeConfig['thinkingTriggerMode'] }))}>
                   <Select.Option value="real_request">按请求触发</Select.Option>
                   <Select.Option value="always">总是触发</Select.Option>
+                </Select>
+              </FieldLabel>
+              <FieldLabel title="外部池流式响应" description="默认原样下发正常 SSE event，只旁路解析 usage 用于本地费用和历史记录；需要兼容旧的流式 usage 改写时再切回旧行为。">
+                <Select
+                  bordered
+                  size="sm"
+                  value={draft.externalPools.externalPoolStreamResponseMode}
+                  onChange={(event) =>
+                    setDraft((prev) => ({
+                      ...prev,
+                      externalPools: {
+                        ...defaultExternalPoolsConfig(),
+                        ...prev.externalPools,
+                        externalPoolStreamResponseMode:
+                          event.target.value as RuntimeConfig['externalPools']['externalPoolStreamResponseMode'],
+                      },
+                    }))
+                  }
+                >
+                  <Select.Option value="event_passthrough_capture">事件透传并旁路计量</Select.Option>
+                  <Select.Option value="projected_rewrite">改写流式 Usage</Select.Option>
                 </Select>
               </FieldLabel>
               <ToggleField title="整理思考内容" description="开启后，会把响应里的思考内容单独整理出来。" checked={draft.extractThinking} onChange={(extractThinking) => setDraft((prev) => ({ ...prev, extractThinking }))} />

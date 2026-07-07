@@ -818,6 +818,29 @@ impl RequestRuntimeConfig {
     }
 }
 
+fn cache_route_for_request_stream(
+    mut cache_route: ResolvedCacheRoutePolicy,
+    stream: bool,
+) -> ResolvedCacheRoutePolicy {
+    if stream
+        || !cache_route
+            .policy
+            .reported_usage
+            .skip_non_stream_usage_projection
+    {
+        return cache_route;
+    }
+
+    cache_route.policy.cache_type = PromptCacheStrategyType::NoCache;
+    cache_route.policy.simulation.enabled = false;
+    cache_route.policy.creation_control.enabled = false;
+    cache_route.policy.cache_point.enabled = false;
+    cache_route.policy.reported_usage.enabled = false;
+    cache_route.policy = cache_route.policy.normalized();
+    cache_route.namespace = None;
+    cache_route
+}
+
 fn prompt_cache_simulation_mode_for_policy(policy: &CacheRoutePolicy) -> PromptCacheSimulationMode {
     match policy.cache_type {
         PromptCacheStrategyType::CurrentHighCache if policy.simulation.enabled => {
@@ -4267,8 +4290,6 @@ async fn post_messages_inner(
     };
     let runtime_config = request_runtime_config(&state, &provider);
     let cache_route = runtime_config.cache_policy_for_path(&endpoint);
-    let request_simulation_mode = prompt_cache_simulation_mode_for_policy(&cache_route.policy);
-    let cache_type = cache_route.policy.cache_type;
     let mut external_fallback = build_external_fallback_context(
         &state,
         &runtime_config,
@@ -4347,11 +4368,15 @@ async fn post_messages_inner(
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
+    let local_cache_route = cache_route_for_request_stream(cache_route, payload.stream);
+    let request_simulation_mode =
+        prompt_cache_simulation_mode_for_policy(&local_cache_route.policy);
+    let cache_type = local_cache_route.policy.cache_type;
     let prepared_local = match local_body_pipeline::prepare(
         &endpoint,
         &payload,
         &runtime_config,
-        &cache_route,
+        &local_cache_route,
         &model_resolution,
     ) {
         Ok(prepared) => prepared,
@@ -4376,7 +4401,7 @@ async fn post_messages_inner(
 
     let mut usage_context = prepare_usage_context(
         &state,
-        cache_route,
+        local_cache_route,
         &endpoint,
         payload.stream,
         &payload,
@@ -7709,6 +7734,70 @@ Return a fix plan."#
             true,
         );
         assert!(stream_policy.is_some());
+    }
+
+    #[test]
+    fn path_reported_usage_skip_non_stream_disables_local_cache_route_only_for_non_stream() {
+        let prompt_cache = Arc::new(PromptCacheTracker::default());
+        let usage_recorder = Arc::new(UsageRecorder::new(10));
+        let mut cache_policy = CachePolicyConfig::default();
+        cache_policy.path_overrides.insert(
+            "/kiro/v1/messages".to_string(),
+            CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::KiroRsTool),
+                reported_usage: Some(ReportedUsagePathPolicy {
+                    skip_non_stream_usage_projection: true,
+                    ..ReportedUsagePathPolicy::default()
+                }),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+        let state = AppState::new(
+            Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+            true,
+            usage_recorder,
+            prompt_cache,
+            Arc::new(PromptCacheCreationController::default()),
+            PromptCacheSimulationMode::Disabled,
+            0.95,
+            CompatProfile::ClaudeCode,
+            false,
+        )
+        .with_cache_policy(cache_policy);
+
+        let route =
+            RequestRuntimeConfig::from_app_state(&state).cache_policy_for_path("/kiro/v1/messages");
+        assert_eq!(route.policy.cache_type, PromptCacheStrategyType::KiroRsTool);
+        assert!(route.policy.reported_usage.skip_non_stream_usage_projection);
+
+        let stream_route = cache_route_for_request_stream(route.clone(), true);
+        assert_eq!(
+            stream_route.policy.cache_type,
+            PromptCacheStrategyType::KiroRsTool
+        );
+        assert!(
+            stream_route
+                .policy
+                .reported_usage
+                .skip_non_stream_usage_projection
+        );
+
+        let non_stream_route = cache_route_for_request_stream(route, false);
+        assert_eq!(
+            non_stream_route.policy.cache_type,
+            PromptCacheStrategyType::NoCache
+        );
+        assert!(non_stream_route.namespace.is_none());
+        assert!(!non_stream_route.policy.simulation.enabled);
+        assert!(!non_stream_route.policy.creation_control.enabled);
+        assert!(!non_stream_route.policy.cache_point.enabled);
+        assert!(!non_stream_route.policy.reported_usage.enabled);
+        assert!(
+            non_stream_route
+                .policy
+                .reported_usage
+                .skip_non_stream_usage_projection
+        );
     }
 
     #[test]

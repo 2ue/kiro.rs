@@ -260,6 +260,7 @@ export const defaultExternalPoolsConfig = () => ({
   externalPoolUsageProjectionUpliftPercent: 25,
   externalPoolUsageProjectionOutputUpliftMinTokens: 0,
   externalPoolUsageProjectionOutputUpliftPercent: 0,
+  externalPoolStreamResponseMode: 'event_passthrough_capture' as const,
 })
 
 const defaultModelMappingConfig = (): ModelMappingConfig => ({
@@ -1401,6 +1402,16 @@ function ReportedUsagePathEditor({
           />
         </div>
       </div>
+      <div className="mb-4">
+        <ToggleField
+          title="非流式请求无缓存"
+          description="开启后，命中此路径的非流式请求不做本系统缓存展示，不写入本地缓存状态，返回和记录都按无缓存 usage 口径；流式请求保持原策略。"
+          checked={Boolean(value.skipNonStreamUsageProjection)}
+          onCheckedChange={(skipNonStreamUsageProjection) =>
+            onChange({ ...value, skipNonStreamUsageProjection })
+          }
+        />
+      </div>
       {!value.enabled && (
         <div className="mb-4 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-5 text-amber-900">
           当前路径已关闭本地模拟缓存上报：下游响应和后台 usage 记录会隐藏模拟 cache read/write，
@@ -1409,14 +1420,6 @@ function ReportedUsagePathEditor({
       )}
       {value.enabled && (
         <>
-          <ToggleField
-            title="禁用非流式整形"
-            description="开启后，命中此路径的非流式请求不会改写返回 usage；流式请求不受影响。此设置是上层拦截，后续外部池等配置不能重新开启本次整形。"
-            checked={Boolean(value.skipNonStreamUsageProjection)}
-            onCheckedChange={(skipNonStreamUsageProjection) =>
-              onChange({ ...value, skipNonStreamUsageProjection })
-            }
-          />
           <div className="grid gap-4 lg:grid-cols-2">
             <ReportedUsageFieldEditor
               title="输入字段改写（input_tokens）"
@@ -1642,7 +1645,11 @@ function defaultPathCachePatch(
     return { cacheType: 'no_cache' }
   }
   if (cacheType === 'kiro_rs_tool') {
-    return { cacheType: 'kiro_rs_tool', kiroRsTool: defaultKiroRsToolPatch() }
+    return {
+      cacheType: 'kiro_rs_tool',
+      reportedUsage: defaultUsagePatch(prefix),
+      kiroRsTool: defaultKiroRsToolPatch(),
+    }
   }
   return {
     cacheType: 'current_high_cache',
@@ -1877,6 +1884,30 @@ function KiroRsToolPolicyForm({
   )
 }
 
+function NonStreamCacheToggle({
+  value,
+  fallbackPrefix,
+  onChange,
+}: {
+  value?: ReportedUsagePathPolicy
+  fallbackPrefix: string
+  onChange: (value: ReportedUsagePathPolicy) => void
+}) {
+  const policy = value ?? defaultUsagePatch(fallbackPrefix)
+  return (
+    <div className="rounded-lg border bg-muted/20 p-4">
+      <ToggleField
+        title="非流式请求无缓存"
+        description="开启后，命中此路径的非流式请求不做本系统缓存展示，不写入本地缓存状态，返回和记录都按无缓存 usage 口径；流式请求保持原策略。"
+        checked={Boolean(policy.skipNonStreamUsageProjection)}
+        onCheckedChange={(skipNonStreamUsageProjection) =>
+          onChange({ ...policy, skipNonStreamUsageProjection })
+        }
+      />
+    </div>
+  )
+}
+
 function StrategyTemplateCard({
   title,
   description,
@@ -1923,10 +1954,17 @@ function StrategyTemplateCard({
           </div>
         </>
       ) : (
-        <KiroRsToolPolicyForm
-          value={template.kiroRsTool ?? defaultKiroRsToolPatch()}
-          onChange={setKiroRsTool}
-        />
+        <>
+          <NonStreamCacheToggle
+            value={template.reportedUsage}
+            fallbackPrefix="/v1"
+            onChange={setReportedUsage}
+          />
+          <KiroRsToolPolicyForm
+            value={template.kiroRsTool ?? defaultKiroRsToolPatch()}
+            onChange={setKiroRsTool}
+          />
+        </>
       )}
     </div>
   )
@@ -1934,7 +1972,13 @@ function StrategyTemplateCard({
 
 function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, cacheType: CacheStrategyType): CacheRoutePolicyPatch {
   if (cacheType === 'no_cache') return { cacheType: 'no_cache' }
-  if (cacheType === 'kiro_rs_tool') return { cacheType: 'kiro_rs_tool', kiroRsTool: policy.kiroRsTool ?? defaultKiroRsToolPatch() }
+  if (cacheType === 'kiro_rs_tool') {
+    return {
+      cacheType: 'kiro_rs_tool',
+      reportedUsage: policy.reportedUsage ?? defaultUsagePatch('/v1'),
+      kiroRsTool: policy.kiroRsTool ?? defaultKiroRsToolPatch(),
+    }
+  }
   return {
     cacheType: 'current_high_cache',
     simulation: policy.simulation ?? defaultSimulationPatch(),
@@ -1979,6 +2023,7 @@ function pathPolicyWithStrategyDefaults(
           reportedUsage: policy.reportedUsage ?? template.reportedUsage ?? defaultUsagePatch(prefix),
         }
       : {
+          reportedUsage: policy.reportedUsage ?? template.reportedUsage ?? defaultUsagePatch(prefix),
           kiroRsTool: policy.kiroRsTool ?? template.kiroRsTool ?? defaultKiroRsToolPatch(),
         }),
   }
@@ -2153,6 +2198,11 @@ function PathCachePolicyCard({
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
             这里只展示 Kiro-RS Tool 自己需要的参数，不读取本地模拟缓存策略的参数。
           </p>
+          <NonStreamCacheToggle
+            value={effectivePolicy.reportedUsage}
+            fallbackPrefix={prefix}
+            onChange={(reportedUsage) => patch({ reportedUsage })}
+          />
           <KiroRsToolPolicyForm
             value={effectivePolicy.kiroRsTool ?? defaultKiroRsToolPatch()}
             onChange={(kiroRsTool) => patch({ kiroRsTool })}
@@ -2613,6 +2663,7 @@ export function RuntimeConfigPanel() {
         externalPoolUsageProjectionUpliftPercent: toWhole(draft.externalPools.externalPoolUsageProjectionUpliftPercent),
         externalPoolUsageProjectionOutputUpliftMinTokens: toWhole(draft.externalPools.externalPoolUsageProjectionOutputUpliftMinTokens),
         externalPoolUsageProjectionOutputUpliftPercent: toWhole(draft.externalPools.externalPoolUsageProjectionOutputUpliftPercent),
+        externalPoolStreamResponseMode: draft.externalPools.externalPoolStreamResponseMode,
       },
       highCacheThreshold: toWhole(draft.highCacheThreshold),
     }
@@ -3069,9 +3120,9 @@ export function RuntimeConfigPanel() {
               }
             />
             <ImpactGroupHeader
-              label="本地转换"
+              label="本地协议转换"
               title="本地凭据路径的 Anthropic -> Kiro 转换能力"
-              description="这些开关只影响本地凭据请求。外部池 raw body 透传不会进入这些阶段，外部池 normalized 仍按外部池自己的配置处理。"
+              description="这些开关会改变本地凭据路径最终发往 Kiro 的请求体。外部池 raw body 透传不会进入这些阶段，外部池 normalized 仍按外部池自己的配置处理。"
             />
             {[
               ['toolSchemaNormalization', '工具 schema 规范化', '清理 OpenAPI、Zod、MCP 等工具 schema 中上游容易拒绝的字段。'],
@@ -3445,21 +3496,9 @@ export function RuntimeConfigPanel() {
 
           <ConfigSection
             icon={<Shield className="h-4 w-4" />}
-            title="兼容与诊断"
-            description="控制协议兼容细节和调试信息展示。调试信息只影响响应头或非流式 thinking 解析，不改变凭据调度。"
+            title="模型解析"
+            description="控制请求模型名如何匹配、归一化和映射到实际上游模型。"
           >
-            <SelectField
-              title="兼容模式"
-              description="控制请求转换策略。Claude Code 兼容适合日常 CLI 使用；Anthropic 严格模式会减少代理侧改写；调试模式会默认暴露代理改写告警头。"
-              value={draft.compatProfile}
-              onChange={(compatProfile) => setDraft((prev) => ({ ...prev, compatProfile }))}
-            />
-            <KiroAgentModeSelectField
-              value={draft.kiroAgentModeStrategy}
-              onChange={(kiroAgentModeStrategy) =>
-                setDraft((prev) => ({ ...prev, kiroAgentModeStrategy }))
-              }
-            />
             <ModelResolutionSelectField
               value={draft.modelResolutionMode}
               onChange={(modelResolutionMode) =>
@@ -3471,6 +3510,25 @@ export function RuntimeConfigPanel() {
               defaultRules={defaultModelMappingRules}
               capabilitiesLoading={modelCapabilities.isLoading}
               onChange={(modelMapping) => setDraft((prev) => ({ ...prev, modelMapping }))}
+            />
+          </ConfigSection>
+
+          <ConfigSection
+            icon={<Shield className="h-4 w-4" />}
+            title="接口兼容与诊断"
+            description="控制客户端接口 profile、Kiro 工作模式、thinking 输出和调试信息展示。请求体转换能力在请求体处理里配置。"
+          >
+            <SelectField
+              title="兼容模式"
+              description="选择整体协议 profile。Claude Code 兼容适合日常 CLI 使用；Anthropic 严格模式会减少代理侧改写；调试模式会默认暴露代理改写告警头。"
+              value={draft.compatProfile}
+              onChange={(compatProfile) => setDraft((prev) => ({ ...prev, compatProfile }))}
+            />
+            <KiroAgentModeSelectField
+              value={draft.kiroAgentModeStrategy}
+              onChange={(kiroAgentModeStrategy) =>
+                setDraft((prev) => ({ ...prev, kiroAgentModeStrategy }))
+              }
             />
             <label className="block rounded-md border bg-background p-4">
               <div className="mb-3">
@@ -3491,6 +3549,32 @@ export function RuntimeConfigPanel() {
               >
                 <option value="real_request">按请求触发</option>
                 <option value="always">总是触发</option>
+              </select>
+            </label>
+            <label className="block rounded-md border bg-background p-4">
+              <div className="mb-3">
+                <div className="text-sm font-medium">外部池流式响应</div>
+                <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                  默认原样下发正常 SSE event，只旁路解析 usage 用于本地费用和历史记录；旧客户端依赖流式 usage 改写时再回退到旧行为。
+                </div>
+              </div>
+              <select
+                className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                value={draft.externalPools.externalPoolStreamResponseMode}
+                onChange={(event) =>
+                  setDraft((prev) => ({
+                    ...prev,
+                    externalPools: {
+                      ...defaultExternalPoolsConfig(),
+                      ...prev.externalPools,
+                      externalPoolStreamResponseMode:
+                        event.target.value as RuntimeConfig['externalPools']['externalPoolStreamResponseMode'],
+                    },
+                  }))
+                }
+              >
+                <option value="event_passthrough_capture">事件透传并旁路计量</option>
+                <option value="projected_rewrite">改写流式 Usage</option>
               </select>
             </label>
             <ToggleField

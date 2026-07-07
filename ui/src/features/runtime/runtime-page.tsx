@@ -30,6 +30,7 @@ import { extractErrorMessage } from '@/lib/utils'
 import {
   defaultImageProcessing,
   defaultBodyConversion,
+  defaultExternalPoolsConfig,
   defaultPayloadShaping,
   defaultPromptCacheCreationControl,
   defaultReportedUsage,
@@ -83,10 +84,10 @@ const runtimeSections: Array<{
   { key: 'cooldown', title: '错误恢复 / 冷却', desc: '不同错误类型的暂停策略与退避', icon: <Shield className="h-4 w-4" /> },
   { key: 'scheduler', title: '账号选择权重', desc: '优先使用哪些账号的调度参数', icon: <Gauge className="h-4 w-4" /> },
   { key: 'warmup', title: '新账号预热', desc: '新账号逐步参与请求，稳定后恢复正常', icon: <Sparkles className="h-4 w-4" /> },
-  { key: 'payload', title: '请求体处理', desc: '请求大小保护、历史清理和当前请求兜底', icon: <Wand2 className="h-4 w-4" /> },
+  { key: 'payload', title: '请求体处理', desc: '协议转换、大小保护、历史清理和当前请求兜底', icon: <Wand2 className="h-4 w-4" /> },
   { key: 'cachePolicy', title: '缓存策略', desc: '策略模板默认参数和路径绑定', icon: <Zap className="h-4 w-4" /> },
-  { key: 'modelMapping', title: '模型映射', desc: '客户端模型名到实际模型的映射规则', icon: <Shield className="h-4 w-4" /> },
-  { key: 'compat', title: '兼容行为', desc: '接口兼容模式、模型解析和思考内容行为', icon: <Shield className="h-4 w-4" /> },
+  { key: 'modelMapping', title: '模型解析', desc: '模型名解析策略和映射规则', icon: <Shield className="h-4 w-4" /> },
+  { key: 'compat', title: '接口兼容', desc: '兼容模式、Kiro 工作模式和响应诊断', icon: <Shield className="h-4 w-4" /> },
 ]
 
 // ─── 原子组件 ──────────────────────────────────────────────────────────────────
@@ -227,6 +228,10 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     reportedUsage: normalizeReportedUsage(draft.reportedUsage),
     cachePolicy: normalizeCachePolicy(draft.cachePolicy),
     definedCacheRoutes: normalizeDefinedCacheRoutes(draft.definedCacheRoutes),
+    externalPools: {
+      ...defaultExternalPoolsConfig(),
+      ...draft.externalPools,
+    },
   }
   return next
 }
@@ -250,6 +255,10 @@ export function RuntimePage() {
         imageProcessing: normalizeImageProcessing(config.data.imageProcessing ?? defaultImageProcessing()),
         bodyConversion: normalizeBodyConversion(config.data.bodyConversion ?? defaultBodyConversion()),
         weightedCapacity: normalizeWeightedCapacity(config.data.weightedCapacity ?? defaultWeightedCapacity()),
+        externalPools: {
+          ...defaultExternalPoolsConfig(),
+          ...config.data.externalPools,
+        },
         payloadShaping: { ...defaultPayloadShaping(), ...config.data.payloadShaping },
         promptCacheCreationControl: { ...defaultPromptCacheCreationControl(), ...config.data.promptCacheCreationControl },
         reportedUsage: config.data.reportedUsage ?? defaultReportedUsage(),
@@ -267,6 +276,16 @@ export function RuntimePage() {
       imageProcessing: {
         ...defaultImageProcessing(),
         ...prev.imageProcessing,
+        [k]: v,
+      },
+    }))
+
+  const setExternalPools = <K extends keyof RuntimeConfig['externalPools']>(k: K) => (v: RuntimeConfig['externalPools'][K]) =>
+    setDraft((prev) => ({
+      ...prev,
+      externalPools: {
+        ...defaultExternalPoolsConfig(),
+        ...prev.externalPools,
         [k]: v,
       },
     }))
@@ -633,6 +652,24 @@ export function RuntimePage() {
                 </div>
                 <div className="space-y-3">
                   <div>
+                    <div className="text-sm font-semibold">本地协议转换</div>
+                    <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                      这些开关会改变本地凭据路径最终发往 Kiro 的请求体；外部池 raw body 透传不会进入这些阶段。
+                    </div>
+                  </div>
+                  <TwoCol>
+                    <TogField label="工具 schema 规范化" desc="清理 OpenAPI、Zod、MCP 等工具 schema 中上游容易拒绝的字段。" checked={draft.bodyConversion.toolSchemaNormalization} onChange={setBodyConversion('toolSchemaNormalization')} />
+                    <TogField label="工具名映射" desc="清洗或缩短不符合 Kiro 工具名约束的名称，并记录响应反向映射。" checked={draft.bodyConversion.toolNameMapping} onChange={setBodyConversion('toolNameMapping')} />
+                    <TogField label="tool_choice 引导" desc="按请求的 tool_choice 过滤工具并注入兼容提示。" checked={draft.bodyConversion.toolChoiceSteering} onChange={setBodyConversion('toolChoiceSteering')} />
+                    <TogField label="分块写入策略" desc="给 Write/Edit 工具和系统消息加入分块写入约束。" checked={draft.bodyConversion.chunkedToolPolicy} onChange={setBodyConversion('chunkedToolPolicy')} />
+                    <TogField label="thinking 提示控制" desc="对不支持原生 reasoning 的模型注入 synthetic thinking 控制。" checked={draft.bodyConversion.thinkingPromptControls} onChange={setBodyConversion('thinkingPromptControls')} />
+                    <TogField label="原生 reasoning 字段" desc="对支持的 Kiro 模型上报 additionalModelRequestFields。" checked={draft.bodyConversion.nativeReasoningFields} onChange={setBodyConversion('nativeReasoningFields')} />
+                    <TogField label="工具配对修复" desc="修复或文本化不严格配对的 tool_use/tool_result。" checked={draft.bodyConversion.toolPairingRepair} onChange={setBodyConversion('toolPairingRepair')} />
+                    <TogField label="历史工具占位" desc="历史里出现但当前 tools 缺失时补充占位工具定义。" checked={draft.bodyConversion.historyPlaceholderTools} onChange={setBodyConversion('historyPlaceholderTools')} />
+                  </TwoCol>
+                </div>
+                <div className="space-y-3">
+                  <div>
                     <div className="text-sm font-semibold">历史消息清理</div>
                     <div className="mt-1 text-xs leading-5 text-muted-foreground">
                       负责历史消息和旧工具结果的体积优化。
@@ -657,11 +694,38 @@ export function RuntimePage() {
             )}
 
             {activeSection === 'modelMapping' && (
-              <ModelMappingSection
-                mapping={draft.modelMapping}
-                capabilities={modelCapabilities.data}
-                onChange={(m: ModelMappingConfig) => set('modelMapping')(m)}
-              />
+              <div className="space-y-6">
+                <div className="space-y-3">
+                  <div>
+                    <div className="text-sm font-semibold">模型解析策略</div>
+                    <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                      控制请求模型名在发送上游前如何匹配，不改变响应格式，也不改变账号调度规则。
+                    </div>
+                  </div>
+                  <div className="space-y-1.5">
+                    <Select value={draft.modelResolutionMode} onValueChange={(v) => set('modelResolutionMode')(v as RuntimeConfig['modelResolutionMode'])}>
+                      <SelectTrigger size="sm" className="w-72"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="compatible">默认兼容解析</SelectItem>
+                        <SelectItem value="alias_only">仅精确与显式别名</SelectItem>
+                        <SelectItem value="exact_only">仅完整模型名</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs leading-5 text-muted-foreground">
+                      {draft.modelResolutionMode === 'compatible'
+                        ? '允许常见别名和版本写法，兼容性最好。'
+                        : draft.modelResolutionMode === 'alias_only'
+                          ? '只接受完整模型名和明确配置过的别名。'
+                          : '只接受完整模型名，最严格。'}
+                    </p>
+                  </div>
+                </div>
+                <ModelMappingSection
+                  mapping={draft.modelMapping}
+                  capabilities={modelCapabilities.data}
+                  onChange={(m: ModelMappingConfig) => set('modelMapping')(m)}
+                />
+              </div>
             )}
 
             {activeSection === 'compat' && (
@@ -683,24 +747,6 @@ export function RuntimePage() {
                         : draft.compatProfile === 'anthropic-strict'
                           ? '尽量保持 Anthropic 原始接口格式，少做兼容修正。'
                           : '保留更多排查信息，适合本地调试，不建议用于正式流量。'}
-                    </p>
-                  </div>
-                  <div className="space-y-1.5">
-                    <div className="text-sm font-semibold">模型解析策略</div>
-                    <Select value={draft.modelResolutionMode} onValueChange={(v) => set('modelResolutionMode')(v as RuntimeConfig['modelResolutionMode'])}>
-                      <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="compatible">默认兼容解析</SelectItem>
-                        <SelectItem value="alias_only">仅精确与显式别名</SelectItem>
-                        <SelectItem value="exact_only">仅完整模型名</SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <p className="text-xs leading-5 text-muted-foreground">
-                      {draft.modelResolutionMode === 'compatible'
-                        ? '允许常见别名和版本写法，兼容性最好。'
-                        : draft.modelResolutionMode === 'alias_only'
-                          ? '只接受完整模型名和明确配置过的别名。'
-                          : '只接受完整模型名，最严格。'}
                     </p>
                   </div>
                   <div className="space-y-1.5">
@@ -736,29 +782,31 @@ export function RuntimePage() {
                         : '按 Claude Code CLI 的习惯触发：模型或请求明确需要深度思考时，才会输出思考内容。'}
                     </p>
                   </div>
+                  <div className="space-y-1.5">
+                    <div className="text-sm font-semibold">外部池流式响应</div>
+                    <Select
+                      value={draft.externalPools.externalPoolStreamResponseMode}
+                      onValueChange={(v) =>
+                        setExternalPools('externalPoolStreamResponseMode')(
+                          v as RuntimeConfig['externalPools']['externalPoolStreamResponseMode'],
+                        )
+                      }
+                    >
+                      <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="event_passthrough_capture">事件透传并旁路计量</SelectItem>
+                        <SelectItem value="projected_rewrite">改写流式 Usage</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs leading-5 text-muted-foreground">
+                      默认原样下发正常 SSE event，内部仍记录 usage 和费用；只有回滚兼容旧行为时才选择改写。
+                    </p>
+                  </div>
                 </div>
                 <TwoCol>
                   <TogField label="整理思考内容" desc="把响应里的思考内容单独整理出来，方便客户端按固定格式展示。" checked={draft.extractThinking} onChange={set('extractThinking')} />
                   <TogField label="显示处理告警" desc="把代理处理中的提醒返回给客户端，方便排查问题。" checked={draft.exposeProxyWarnings} onChange={set('exposeProxyWarnings')} />
                 </TwoCol>
-                <div className="space-y-3">
-                  <div>
-                    <div className="text-sm font-semibold">本地 Kiro 转换能力</div>
-                    <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                      只影响本地凭据的 Anthropic 到 Kiro 转换；外部池 raw body 透传不会进入这些阶段。
-                    </div>
-                  </div>
-                  <TwoCol>
-                    <TogField label="工具 schema 规范化" desc="清理 OpenAPI、Zod、MCP 等工具 schema 中上游容易拒绝的字段。" checked={draft.bodyConversion.toolSchemaNormalization} onChange={setBodyConversion('toolSchemaNormalization')} />
-                    <TogField label="工具名映射" desc="清洗或缩短不符合 Kiro 工具名约束的名称，并记录响应反向映射。" checked={draft.bodyConversion.toolNameMapping} onChange={setBodyConversion('toolNameMapping')} />
-                    <TogField label="tool_choice 引导" desc="按请求的 tool_choice 过滤工具并注入兼容提示。" checked={draft.bodyConversion.toolChoiceSteering} onChange={setBodyConversion('toolChoiceSteering')} />
-                    <TogField label="分块写入策略" desc="给 Write/Edit 工具和系统消息加入分块写入约束。" checked={draft.bodyConversion.chunkedToolPolicy} onChange={setBodyConversion('chunkedToolPolicy')} />
-                    <TogField label="thinking 提示控制" desc="对不支持原生 reasoning 的模型注入 synthetic thinking 控制。" checked={draft.bodyConversion.thinkingPromptControls} onChange={setBodyConversion('thinkingPromptControls')} />
-                    <TogField label="原生 reasoning 字段" desc="对支持的 Kiro 模型上报 additionalModelRequestFields。" checked={draft.bodyConversion.nativeReasoningFields} onChange={setBodyConversion('nativeReasoningFields')} />
-                    <TogField label="工具配对修复" desc="修复或文本化不严格配对的 tool_use/tool_result。" checked={draft.bodyConversion.toolPairingRepair} onChange={setBodyConversion('toolPairingRepair')} />
-                    <TogField label="历史工具占位" desc="历史里出现但当前 tools 缺失时补充占位工具定义。" checked={draft.bodyConversion.historyPlaceholderTools} onChange={setBodyConversion('historyPlaceholderTools')} />
-                  </TwoCol>
-                </div>
               </div>
             )}
           </div>

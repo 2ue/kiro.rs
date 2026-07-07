@@ -121,7 +121,11 @@ function defaultPathCachePatch(prefix: string, cacheType: CacheStrategyType): Ca
     return { cacheType: 'no_cache' }
   }
   if (cacheType === 'kiro_rs_tool') {
-    return { cacheType: 'kiro_rs_tool', kiroRsTool: defaultKiroRsToolPatch() }
+    return {
+      cacheType: 'kiro_rs_tool',
+      reportedUsage: defaultUsagePatch(prefix),
+      kiroRsTool: defaultKiroRsToolPatch(),
+    }
   }
   return {
     cacheType: 'current_high_cache',
@@ -483,9 +487,39 @@ function KiroRsToolPolicyForm({
   )
 }
 
+function NonStreamCacheToggle({
+  value,
+  fallbackPrefix,
+  onChange,
+}: {
+  value?: ReportedUsagePathPolicy
+  fallbackPrefix: string
+  onChange: (next: ReportedUsagePathPolicy) => void
+}) {
+  const policy = value ?? defaultUsagePatch(fallbackPrefix)
+  return (
+    <div className="rounded-md border bg-muted/20 p-3">
+      <TogField
+        label="非流式请求无缓存"
+        desc="开启后，命中此路径的非流式请求不做本系统缓存展示，不写入本地缓存状态，返回和记录都按无缓存 usage 口径；流式请求保持原策略。"
+        checked={Boolean(policy.skipNonStreamUsageProjection)}
+        onChange={(skipNonStreamUsageProjection) =>
+          onChange({ ...policy, skipNonStreamUsageProjection })
+        }
+      />
+    </div>
+  )
+}
+
 function cachePolicyForStrategyTemplate(policy: CacheRoutePolicyPatch, cacheType: CacheStrategyType): CacheRoutePolicyPatch {
   if (cacheType === 'no_cache') return { cacheType: 'no_cache' }
-  if (cacheType === 'kiro_rs_tool') return { cacheType: 'kiro_rs_tool', kiroRsTool: policy.kiroRsTool ?? defaultKiroRsToolPatch() }
+  if (cacheType === 'kiro_rs_tool') {
+    return {
+      cacheType: 'kiro_rs_tool',
+      reportedUsage: policy.reportedUsage ?? defaultUsagePatch('/v1'),
+      kiroRsTool: policy.kiroRsTool ?? defaultKiroRsToolPatch(),
+    }
+  }
   return {
     cacheType: 'current_high_cache',
     simulation: policy.simulation ?? defaultSimulationPatch(),
@@ -544,10 +578,17 @@ function StrategyTemplateEditor({
           </div>
         </>
       ) : (
-        <KiroRsToolPolicyForm
-          value={template.kiroRsTool ?? defaultKiroRsToolPatch()}
-          onChange={setKiroRsTool}
-        />
+        <>
+          <NonStreamCacheToggle
+            value={template.reportedUsage}
+            fallbackPrefix="/v1"
+            onChange={setReportedUsage}
+          />
+          <KiroRsToolPolicyForm
+            value={template.kiroRsTool ?? defaultKiroRsToolPatch()}
+            onChange={setKiroRsTool}
+          />
+        </>
       )}
     </div>
   )
@@ -580,6 +621,7 @@ function pathPolicyWithStrategyDefaults(
           reportedUsage: policy.reportedUsage ?? template.reportedUsage ?? defaultUsagePatch(prefix),
         }
       : {
+          reportedUsage: policy.reportedUsage ?? template.reportedUsage ?? defaultUsagePatch(prefix),
           kiroRsTool: policy.kiroRsTool ?? template.kiroRsTool ?? defaultKiroRsToolPatch(),
         }),
   }
@@ -749,6 +791,11 @@ function PathStrategyBindingCard({
               这里只展示 Kiro-RS Tool 自己需要的参数，不读取本地模拟缓存策略的参数。
             </div>
           </div>
+          <NonStreamCacheToggle
+            value={effectivePolicy.reportedUsage}
+            fallbackPrefix={prefix}
+            onChange={(reportedUsage) => patch({ reportedUsage })}
+          />
           <KiroRsToolPolicyForm
             value={effectivePolicy.kiroRsTool ?? defaultKiroRsToolPatch()}
             onChange={(kiroRsTool) => patch({ kiroRsTool })}
@@ -1395,6 +1442,12 @@ function PathPolicyEditor({
         checked={policy.enabled}
         onChange={set('enabled')}
       />
+      <TogField
+        label="非流式请求无缓存"
+        desc="开启后，命中此路径的非流式请求不做本系统缓存展示，不写入本地缓存状态，返回和记录都按无缓存 usage 口径；流式请求保持原策略。"
+        checked={Boolean(policy.skipNonStreamUsageProjection)}
+        onChange={set('skipNonStreamUsageProjection')}
+      />
       {!policy.enabled && (
         <div className="rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-xs leading-5 text-warning">
           当前入口会尽量使用原始用量显示。重新开启后才会使用下面的展示规则。
@@ -1402,12 +1455,6 @@ function PathPolicyEditor({
       )}
       {policy.enabled && (
         <>
-          <TogField
-            label="禁用非流式整形"
-            desc="开启后，命中此路径的非流式请求不会改写返回 usage；流式请求不受影响。此设置是上层拦截，后续外部池等配置不能重新开启本次整形。"
-            checked={Boolean(policy.skipNonStreamUsageProjection)}
-            onChange={set('skipNonStreamUsageProjection')}
-          />
           <FieldPolicyEditor title="展示输入" policy={policy.input} allowMoveDelta onChange={set('input')} />
           <FieldPolicyEditor title="展示输出" policy={policy.output} onChange={set('output')} />
           <FieldPolicyEditor title="展示缓存读取" policy={policy.cacheRead} onChange={set('cacheRead')} />

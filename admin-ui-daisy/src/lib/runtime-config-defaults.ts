@@ -1,4 +1,5 @@
 import type {
+  BodyConversionConfig,
   CachePolicyConfig,
   CacheRoutePolicyPatch,
   ImageProcessingConfig,
@@ -128,6 +129,26 @@ export function normalizeImageProcessing(input?: Partial<ImageProcessingConfig> 
   }
 }
 
+export function defaultBodyConversion(): BodyConversionConfig {
+  return {
+    toolSchemaNormalization: true,
+    toolNameMapping: true,
+    toolChoiceSteering: true,
+    chunkedToolPolicy: true,
+    thinkingPromptControls: true,
+    nativeReasoningFields: true,
+    toolPairingRepair: true,
+    historyPlaceholderTools: true,
+  }
+}
+
+export function normalizeBodyConversion(input?: Partial<BodyConversionConfig> | null): BodyConversionConfig {
+  return {
+    ...defaultBodyConversion(),
+    ...(input ?? {}),
+  }
+}
+
 export function defaultWeightedCapacity(): WeightedCapacityConfig {
   return {
     enabled: false,
@@ -219,6 +240,7 @@ export function defaultExternalPoolsConfig() {
     externalPoolUsageProjectionUpliftPercent: 25,
     externalPoolUsageProjectionOutputUpliftMinTokens: 0,
     externalPoolUsageProjectionOutputUpliftPercent: 0,
+    externalPoolStreamResponseMode: 'event_passthrough_capture' as const,
   }
 }
 
@@ -274,6 +296,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   compressionEnabled: false,
   whitespaceCompression: true,
   imageProcessing: defaultImageProcessing(),
+  bodyConversion: defaultBodyConversion(),
   payloadGuardEnabled: true,
   payloadGuardMode: 'preemptive',
   payloadGuardMaxBytes: 460800,

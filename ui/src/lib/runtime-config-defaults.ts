@@ -240,6 +240,7 @@ export function defaultExternalPoolsConfig() {
     externalPoolUsageProjectionUpliftPercent: 25,
     externalPoolUsageProjectionOutputUpliftMinTokens: 0,
     externalPoolUsageProjectionOutputUpliftPercent: 0,
+    externalPoolStreamResponseMode: 'event_passthrough_capture' as const,
   }
 }
 

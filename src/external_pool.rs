@@ -52,9 +52,9 @@ use crate::{
         },
     },
     model::config::{
-        ExternalPoolCapacityMode, ExternalPoolsConfig, KiroRsToolCachePolicy, ModelMappingRule,
-        PromptCacheCreationControlConfig, PromptCacheSimulationMode, PromptCacheStrategyType,
-        ReportedUsageConfig,
+        ExternalPoolCapacityMode, ExternalPoolStreamResponseMode, ExternalPoolsConfig,
+        KiroRsToolCachePolicy, ModelMappingRule, PromptCacheCreationControlConfig,
+        PromptCacheSimulationMode, PromptCacheStrategyType, ReportedUsageConfig,
     },
     model::model_processing::{
         ModelProcessingConfig, ModelProcessingError, ModelProcessingInput, ModelProcessingMode,
@@ -86,6 +86,7 @@ const DEFAULT_EXTERNAL_POOL_REQUEST_TIMEOUT_SECS: u64 = 180;
 const EXTERNAL_POOL_LEASE_TOUCH_INTERVAL_SECS: u64 = 30;
 const EXTERNAL_POOL_AVAILABILITY_CACHE_TTL: Duration = Duration::from_millis(250);
 const MAX_RECORDED_EXTERNAL_ERROR_MESSAGE_BYTES: usize = 8192;
+const EXTERNAL_POOL_MAX_SSE_EVENT_BUFFER_BYTES: usize = 1024 * 1024;
 const EXTERNAL_POOL_AUTO_DISABLE_REASONS: &[&str] = &[
     "auth_error",
     "security_lock",
@@ -813,6 +814,7 @@ struct ExternalUsageCapture {
     reported: Option<CacheUsage>,
     projected: bool,
     stream_error_message: Option<String>,
+    stream_response_mode: Option<ExternalPoolStreamResponseMode>,
 }
 
 #[derive(Clone)]
@@ -1569,8 +1571,12 @@ impl ExternalPoolManager {
             );
             let stream_idle_timeout = (config.external_pool_stream_idle_timeout_secs > 0)
                 .then(|| Duration::from_secs(config.external_pool_stream_idle_timeout_secs));
+            let stream_response_mode = config.external_pool_stream_response_mode;
             let stream_usage_projection = projection_context.clone();
-            let usage_capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+            let usage_capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
+                stream_response_mode: Some(stream_response_mode),
+                ..ExternalUsageCapture::default()
+            }));
             let stream_usage_capture = usage_capture.clone();
             let latency_trace = route.latency_trace.clone();
             let route_started_at = route.started_at;
@@ -1614,11 +1620,12 @@ impl ExternalPoolManager {
                                                 .mark_first_upstream_chunk(route_started_at);
                                             last_chunk_at = Instant::now();
                                             buffer.extend_from_slice(&chunk);
-                                            let projected = drain_projected_sse_events(
+                                            let projected = drain_sse_events(
                                                 &mut buffer,
                                                 projection_context.as_ref(),
                                                 Some(&usage_capture),
                                                 Some(stream_error_mask.as_ref()),
+                                                stream_response_mode,
                                             );
                                             if !projected.is_empty() {
                                                 return Some((
@@ -1630,6 +1637,31 @@ impl ExternalPoolManager {
                                                         last_touch_at,
                                                         last_chunk_at,
                                                         false,
+                                                    ),
+                                                ));
+                                            }
+                                            if buffer.len() > EXTERNAL_POOL_MAX_SSE_EVENT_BUFFER_BYTES {
+                                                tracing::warn!(
+                                                    request_id = %stream_error_mask.request_id,
+                                                    error_id = %stream_error_mask.error_id,
+                                                    pool_id = stream_error_mask.pool_id,
+                                                    pool_name = %stream_error_mask.pool_name,
+                                                    buffered_bytes = buffer.len(),
+                                                    max_buffered_bytes = EXTERNAL_POOL_MAX_SSE_EVENT_BUFFER_BYTES,
+                                                    "external pool stream event buffer exceeded limit"
+                                                );
+                                                drop(lease);
+                                                return Some((
+                                                    Err(std::io::Error::other(
+                                                        "external stream event exceeded buffer limit".to_string(),
+                                                    )),
+                                                    (
+                                                        body_stream,
+                                                        Vec::new(),
+                                                        None,
+                                                        last_touch_at,
+                                                        last_chunk_at,
+                                                        true,
                                                     ),
                                                 ));
                                             }
@@ -1662,11 +1694,12 @@ impl ExternalPoolManager {
                                             let tail = if buffer.is_empty() {
                                                 Vec::new()
                                             } else {
-                                                maybe_project_sse_event(
+                                                maybe_handle_sse_event(
                                                     &buffer,
                                                     projection_context.as_ref(),
                                                     Some(&usage_capture),
                                                     Some(stream_error_mask.as_ref()),
+                                                    stream_response_mode,
                                                 )
                                             };
                                             drop(lease);
@@ -3932,21 +3965,96 @@ fn maybe_project_sse_event(
     if changed { out } else { event.to_vec() }
 }
 
-fn drain_projected_sse_events(
+fn maybe_capture_passthrough_sse_event(
+    event: &[u8],
+    projection: Option<&ExternalUsageProjectionContext>,
+    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+    stream_error_mask: Option<&ExternalStreamErrorMask>,
+) -> Vec<u8> {
+    if let Some(masked) = maybe_mask_external_stream_error_event(event, capture, stream_error_mask)
+    {
+        return masked;
+    }
+    capture_passthrough_sse_usage(event, projection, capture);
+    event.to_vec()
+}
+
+fn capture_passthrough_sse_usage(
+    event: &[u8],
+    projection: Option<&ExternalUsageProjectionContext>,
+    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+) {
+    let Ok(text) = std::str::from_utf8(event) else {
+        return;
+    };
+    for line in text.split_inclusive('\n') {
+        let trimmed_line_end = line.trim_end_matches(['\r', '\n']);
+        let Some(data) = trimmed_line_end.strip_prefix("data:") else {
+            continue;
+        };
+        let data_json = data.trim();
+        if data_json.is_empty() || data_json == "[DONE]" {
+            continue;
+        }
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data_json) else {
+            continue;
+        };
+        let Some(usage) = value.get_mut("usage") else {
+            continue;
+        };
+        let raw_usage = cache_usage_from_value(usage);
+        let Some(projected_usage) = project_usage_value(usage, projection) else {
+            update_external_usage_capture(capture, raw_usage, raw_usage, raw_usage, false);
+            continue;
+        };
+        update_external_usage_capture_request_input(
+            capture,
+            Some(projected_usage.request_input_tokens),
+        );
+        update_external_usage_capture(
+            capture,
+            raw_usage,
+            Some(projected_usage.shaped),
+            Some(projected_usage.reported),
+            true,
+        );
+    }
+}
+
+fn maybe_handle_sse_event(
+    event: &[u8],
+    projection: Option<&ExternalUsageProjectionContext>,
+    capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
+    stream_error_mask: Option<&ExternalStreamErrorMask>,
+    response_mode: ExternalPoolStreamResponseMode,
+) -> Vec<u8> {
+    match response_mode {
+        ExternalPoolStreamResponseMode::ProjectedRewrite => {
+            maybe_project_sse_event(event, projection, capture, stream_error_mask)
+        }
+        ExternalPoolStreamResponseMode::EventPassthroughCapture => {
+            maybe_capture_passthrough_sse_event(event, projection, capture, stream_error_mask)
+        }
+    }
+}
+
+fn drain_sse_events(
     buffer: &mut Vec<u8>,
     projection: Option<&ExternalUsageProjectionContext>,
     capture: Option<&Arc<SyncMutex<ExternalUsageCapture>>>,
     stream_error_mask: Option<&ExternalStreamErrorMask>,
+    response_mode: ExternalPoolStreamResponseMode,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     while let Some((idx, delimiter_len)) = find_sse_event_delimiter(buffer) {
         let end = idx + delimiter_len;
         let event = buffer.drain(..end).collect::<Vec<u8>>();
-        out.extend(maybe_project_sse_event(
+        out.extend(maybe_handle_sse_event(
             &event,
             projection,
             capture,
             stream_error_mask,
+            response_mode,
         ));
     }
     out
@@ -4354,7 +4462,10 @@ fn external_pool_billing_from_capture(
     let raw = capture.raw?;
     let reported = capture.reported.or(capture.raw)?;
     let shaped = capture.shaped.or(capture.reported).or(capture.raw)?;
-    Some(external_pool_billing(
+    let stream_response_mode = capture
+        .stream_response_mode
+        .map(|mode| mode.as_str().to_string());
+    let mut billing = external_pool_billing(
         route,
         pool,
         capture.request_input_tokens,
@@ -4362,7 +4473,9 @@ fn external_pool_billing_from_capture(
         shaped,
         reported,
         capture.projected,
-    ))
+    );
+    billing.stream_response_mode = stream_response_mode;
+    Some(billing)
 }
 
 fn external_pool_billing_from_capture_ref(
@@ -4430,6 +4543,7 @@ fn external_pool_billing(
         pricing_available,
         pricing_model: Some(reported_estimate.model),
         usage_projection_mode: pool.usage_projection_mode.as_str().to_string(),
+        stream_response_mode: None,
     }
 }
 
@@ -7245,6 +7359,76 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
         assert!(reported.input_tokens <= 96);
         assert_eq!(reported.cache_read_input_tokens, 0);
         assert!(reported.cache_creation_input_tokens > 0);
+    }
+
+    #[test]
+    fn sse_event_passthrough_capture_keeps_body_and_records_projected_usage() {
+        let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}
+
+"#;
+        let capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
+            stream_response_mode: Some(ExternalPoolStreamResponseMode::EventPassthroughCapture),
+            ..ExternalUsageCapture::default()
+        }));
+        let route = test_route("claude-sonnet-4-5");
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+        let projection = projection_context(&route, &pool, 0).expect("projection");
+
+        let passthrough =
+            maybe_capture_passthrough_sse_event(event, Some(&projection), Some(&capture), None);
+
+        assert_eq!(passthrough, event);
+        let capture = capture.lock().clone();
+        assert!(capture.projected);
+        assert_eq!(
+            capture.stream_response_mode,
+            Some(ExternalPoolStreamResponseMode::EventPassthroughCapture)
+        );
+        assert_eq!(capture.raw.expect("raw").input_tokens, 100000);
+        let reported = capture.reported.expect("reported usage");
+        assert!(reported.input_tokens <= 96);
+        assert_eq!(reported.cache_read_input_tokens, 0);
+        assert!(reported.cache_creation_input_tokens > 0);
+    }
+
+    #[test]
+    fn drain_sse_events_respects_response_mode() {
+        let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}
+
+"#;
+        let route = test_route("claude-sonnet-4-5");
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+        let projection = projection_context(&route, &pool, 0).expect("projection");
+
+        let mut rewrite_buffer = event.to_vec();
+        let rewritten = drain_sse_events(
+            &mut rewrite_buffer,
+            Some(&projection),
+            None,
+            None,
+            ExternalPoolStreamResponseMode::ProjectedRewrite,
+        );
+        assert!(rewrite_buffer.is_empty());
+        assert_ne!(rewritten, event);
+        let rewritten_text = std::str::from_utf8(&rewritten).expect("rewritten utf8");
+        assert!(!rewritten_text.contains(r#""input_tokens":100000"#));
+
+        let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+        let mut passthrough_buffer = event.to_vec();
+        let passthrough = drain_sse_events(
+            &mut passthrough_buffer,
+            Some(&projection),
+            Some(&capture),
+            None,
+            ExternalPoolStreamResponseMode::EventPassthroughCapture,
+        );
+        assert!(passthrough_buffer.is_empty());
+        assert_eq!(passthrough, event);
+        assert!(capture.lock().projected);
     }
 
     #[test]

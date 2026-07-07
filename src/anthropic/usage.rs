@@ -126,6 +126,8 @@ pub struct ExternalPoolBilling {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_model: Option<String>,
     pub usage_projection_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_response_mode: Option<String>,
 }
 
 impl ExternalPoolBilling {
