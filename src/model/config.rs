@@ -164,6 +164,64 @@ impl Default for BodyConversionConfig {
     }
 }
 
+pub const DEFAULT_MISSING_MAX_TOKENS_VALUE: i32 = 20_480;
+pub const MAX_MISSING_MAX_TOKENS_VALUE: i32 = 200_000;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MissingMaxTokensPolicy {
+    Reject,
+    #[default]
+    DefaultValue,
+}
+
+/// 入口 Messages 请求缺少顶层 max_tokens 时的兼容策略。
+///
+/// Anthropic Messages 请求使用 max_tokens 表示本次输出上限。默认补一个较小正数，
+/// 只为兼容缺字段客户端；不使用 0，也不补过大的值，避免改变成本和输出语义。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MissingMaxTokensConfig {
+    #[serde(default)]
+    pub policy: MissingMaxTokensPolicy,
+
+    #[serde(default = "default_missing_max_tokens_value")]
+    pub default_value: i32,
+}
+
+impl Default for MissingMaxTokensConfig {
+    fn default() -> Self {
+        Self {
+            policy: MissingMaxTokensPolicy::DefaultValue,
+            default_value: default_missing_max_tokens_value(),
+        }
+    }
+}
+
+impl MissingMaxTokensConfig {
+    pub fn normalized(self) -> Self {
+        let default_value = if (1..=MAX_MISSING_MAX_TOKENS_VALUE).contains(&self.default_value) {
+            self.default_value
+        } else {
+            default_missing_max_tokens_value()
+        };
+        Self {
+            policy: self.policy,
+            default_value,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=MAX_MISSING_MAX_TOKENS_VALUE).contains(&self.default_value) {
+            return Err(format!(
+                "missingMaxTokens.defaultValue 必须在 1 到 {} 之间",
+                MAX_MISSING_MAX_TOKENS_VALUE
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// 调度容量加权配置。
 ///
 /// 默认关闭；关闭时请求热路径不会为了容量加权额外估算 token，也不会改变并发/RPM
@@ -2684,6 +2742,10 @@ pub struct Config {
     #[serde(default)]
     pub body_conversion: BodyConversionConfig,
 
+    /// Messages 请求缺少顶层 max_tokens 时的入口兼容策略。
+    #[serde(default)]
+    pub missing_max_tokens: MissingMaxTokensConfig,
+
     /// Kiro payload shaping 配置。默认只压缩旧历史和明显冗余，不截断当前输入。
     #[serde(default)]
     pub payload_shaping: PayloadShapingConfig,
@@ -3165,6 +3227,10 @@ fn default_payload_guard_enabled() -> bool {
     true
 }
 
+fn default_missing_max_tokens_value() -> i32 {
+    DEFAULT_MISSING_MAX_TOKENS_VALUE
+}
+
 fn default_payload_guard_mode() -> PayloadGuardMode {
     PayloadGuardMode::OnTooLong
 }
@@ -3610,6 +3676,7 @@ impl Default for Config {
             compression: CompressionConfig::default(),
             image_processing: ImageProcessingConfig::default(),
             body_conversion: BodyConversionConfig::default(),
+            missing_max_tokens: MissingMaxTokensConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
             payload_guard_enabled: default_payload_guard_enabled(),
             payload_guard_mode: default_payload_guard_mode(),

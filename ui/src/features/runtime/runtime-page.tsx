@@ -31,6 +31,7 @@ import {
   defaultImageProcessing,
   defaultBodyConversion,
   defaultExternalPoolsConfig,
+  defaultMissingMaxTokens,
   defaultPayloadShaping,
   defaultPromptCacheCreationControl,
   defaultReportedUsage,
@@ -39,6 +40,7 @@ import {
   normalizeCachePolicy,
   normalizeBodyConversion,
   normalizeImageProcessing,
+  normalizeMissingMaxTokens,
   normalizePromptCacheCreationControl,
   normalizeReportedUsage,
   normalizeWeightedCapacity,
@@ -225,6 +227,7 @@ function normalizeConfig(draft: RuntimeConfig): RuntimeConfig {
     promptCacheCreationControl: normalizePromptCacheCreationControl(draft.promptCacheCreationControl),
     imageProcessing: normalizeImageProcessing(draft.imageProcessing),
     bodyConversion: normalizeBodyConversion(draft.bodyConversion),
+    missingMaxTokens: normalizeMissingMaxTokens(draft.missingMaxTokens),
     reportedUsage: normalizeReportedUsage(draft.reportedUsage),
     cachePolicy: normalizeCachePolicy(draft.cachePolicy),
     definedCacheRoutes: normalizeDefinedCacheRoutes(draft.definedCacheRoutes),
@@ -254,6 +257,7 @@ export function RuntimePage() {
         ...config.data,
         imageProcessing: normalizeImageProcessing(config.data.imageProcessing ?? defaultImageProcessing()),
         bodyConversion: normalizeBodyConversion(config.data.bodyConversion ?? defaultBodyConversion()),
+        missingMaxTokens: normalizeMissingMaxTokens(config.data.missingMaxTokens ?? defaultMissingMaxTokens()),
         weightedCapacity: normalizeWeightedCapacity(config.data.weightedCapacity ?? defaultWeightedCapacity()),
         externalPools: {
           ...defaultExternalPoolsConfig(),
@@ -300,6 +304,16 @@ export function RuntimePage() {
       },
     }))
 
+  const setMissingMaxTokens = <K extends keyof RuntimeConfig['missingMaxTokens']>(k: K) => (v: RuntimeConfig['missingMaxTokens'][K]) =>
+    setDraft((prev) => ({
+      ...prev,
+      missingMaxTokens: {
+        ...defaultMissingMaxTokens(),
+        ...prev.missingMaxTokens,
+        [k]: v,
+      },
+    }))
+
   const save = () => {
     const next = normalizeConfig(draft)
     if (next.promptCacheCapJitterMinTokens > next.promptCacheCapJitterMaxTokens)
@@ -308,6 +322,8 @@ export function RuntimePage() {
       return toast.error('处理阈值必须为 0 或不小于 65536 字节')
     if (next.payloadGuardMaxBytes - next.payloadGuardSafetyMarginBytes < 65536 && next.payloadGuardMaxBytes > 0)
       return toast.error('安全余量不能过大,处理阈值减去安全余量需不小于 65536 字节')
+    if (next.missingMaxTokens.defaultValue < 1 || next.missingMaxTokens.defaultValue > 200000)
+      return toast.error('缺失 max_tokens 的补充值必须在 1 到 200000 之间')
     const editable = { ...next }
     delete editable.proxyUrl
     delete editable.proxyUsername
@@ -782,6 +798,34 @@ export function RuntimePage() {
                         : '按 Claude Code CLI 的习惯触发：模型或请求明确需要深度思考时，才会输出思考内容。'}
                     </p>
                   </div>
+                  <div className="space-y-1.5">
+                    <div className="text-sm font-semibold">缺失 max_tokens</div>
+                    <Select
+                      value={draft.missingMaxTokens.policy}
+                      onValueChange={(v) =>
+                        setMissingMaxTokens('policy')(v as RuntimeConfig['missingMaxTokens']['policy'])
+                      }
+                    >
+                      <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="default_value">自动补全</SelectItem>
+                        <SelectItem value="reject">直接拒绝</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs leading-5 text-muted-foreground">
+                      自动补全只处理顶层缺少 max_tokens 的 Messages 请求；无效 JSON 和空模型仍会拒绝并记录到用量日志。
+                    </p>
+                  </div>
+                  <NumField
+                    label="max_tokens 补充值"
+                    desc="自动补全时写入的输出上限；默认 20480，避免补 0 或过大值改变客户端语义。"
+                    value={draft.missingMaxTokens.defaultValue}
+                    min={1}
+                    max={200000}
+                    suffix="tokens"
+                    disabled={draft.missingMaxTokens.policy === 'reject'}
+                    onChange={setMissingMaxTokens('defaultValue')}
+                  />
                   <div className="space-y-1.5">
                     <div className="text-sm font-semibold">外部池默认流式 SSE 转发</div>
                     <Select

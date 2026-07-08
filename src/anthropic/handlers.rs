@@ -16,11 +16,11 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::model::config::{
     BodyConversionConfig, CacheBoundsPolicy, CachePointPolicy, CachePolicyConfig, CacheRoutePolicy,
     CacheSimulationPolicy, CompatProfile, Config, ExternalPoolsConfig, ImageProcessingConfig,
-    KiroRsToolCachePolicy, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
-    PayloadShapingConfig, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
-    PromptCacheStrategyType, ReportedUsageConfig, ReportedUsagePathPolicy,
-    ResolvedCacheRoutePolicy, ThinkingTriggerMode, normalize_defined_cache_route,
-    normalize_defined_cache_routes, resolve_cache_policy_for_path,
+    KiroRsToolCachePolicy, MissingMaxTokensConfig, MissingMaxTokensPolicy, ModelMappingConfig,
+    ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
+    PromptCacheSimulationMode, PromptCacheStrategyType, ReportedUsageConfig,
+    ReportedUsagePathPolicy, ResolvedCacheRoutePolicy, ThinkingTriggerMode,
+    normalize_defined_cache_route, normalize_defined_cache_routes, resolve_cache_policy_for_path,
 };
 use crate::token;
 use anyhow::Error;
@@ -61,7 +61,10 @@ use super::payload_guard_runtime::prepare_kiro_request_body;
 use super::prompt_cache::{
     KiroRsToolPromptCachePlan, PromptCacheBounds, PromptCacheProfile, PromptCacheScope,
 };
-use super::request_facts::raw_messages_body_hints;
+use super::request_facts::{
+    probe_raw_messages_body, raw_messages_body_hints,
+    rewrite_raw_missing_top_level_max_tokens_with_probe,
+};
 use super::stream::{SseEvent, StreamContext};
 use super::tool_format_debug::{ToolFormatDebugEvent, ToolFormatDebugRecorder};
 use super::types::{
@@ -632,6 +635,7 @@ struct RequestRuntimeConfig {
     kiro_upstream_stream_idle_timeout_secs: u64,
     image_processing: ImageProcessingConfig,
     body_conversion: BodyConversionConfig,
+    missing_max_tokens: MissingMaxTokensConfig,
     payload_shaping: PayloadShapingConfig,
     external_pools: ExternalPoolsConfig,
 }
@@ -669,6 +673,7 @@ impl RequestRuntimeConfig {
             kiro_upstream_stream_idle_timeout_secs: state.kiro_upstream_stream_idle_timeout_secs,
             image_processing: state.image_processing.normalized(),
             body_conversion: state.body_conversion,
+            missing_max_tokens: state.missing_max_tokens.normalized(),
             payload_shaping: state.payload_shaping,
             external_pools: state.external_pools.clone(),
         }
@@ -726,6 +731,7 @@ impl RequestRuntimeConfig {
             kiro_upstream_stream_idle_timeout_secs: config.kiro_upstream_stream_idle_timeout_secs,
             image_processing: config.image_processing.normalized(),
             body_conversion: config.body_conversion,
+            missing_max_tokens: config.missing_max_tokens.normalized(),
             payload_shaping: config.payload_shaping,
             external_pools: config.external_pools.clone(),
         }
@@ -1003,7 +1009,9 @@ fn request_image_processing_config(state: &AppState) -> ImageProcessingConfig {
 
 #[cfg(test)]
 fn parse_messages_payload(raw_body: &Bytes) -> Result<MessagesRequest, Response> {
-    request_entry::parse_messages_payload(raw_body)
+    let request_id = envelope::request_id();
+    request_entry::parse_messages_payload(raw_body, &request_id)
+        .map_err(|error| error.to_response(&request_id))
 }
 
 async fn maybe_raw_external_direct_response(
@@ -7270,6 +7278,7 @@ mod tests {
             kiro_upstream_stream_idle_timeout_secs: 180,
             image_processing: ImageProcessingConfig::default(),
             body_conversion: BodyConversionConfig::default(),
+            missing_max_tokens: MissingMaxTokensConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
             external_pools: ExternalPoolsConfig::default(),
         }

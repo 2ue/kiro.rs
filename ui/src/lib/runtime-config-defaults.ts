@@ -3,6 +3,7 @@ import type {
   CacheRoutePolicyPatch,
   BodyConversionConfig,
   ImageProcessingConfig,
+  MissingMaxTokensConfig,
   PayloadShapingConfig,
   PromptCacheCreationControlConfig,
   ReportedUsageConfig,
@@ -125,6 +126,22 @@ export function normalizeBodyConversion(input?: Partial<BodyConversionConfig> | 
   return {
     ...defaultBodyConversion(),
     ...(input ?? {}),
+  }
+}
+
+export function defaultMissingMaxTokens(): MissingMaxTokensConfig {
+  return {
+    policy: 'default_value',
+    defaultValue: 20480,
+  }
+}
+
+export function normalizeMissingMaxTokens(input?: Partial<MissingMaxTokensConfig> | null): MissingMaxTokensConfig {
+  const base = defaultMissingMaxTokens()
+  const policy = input?.policy === 'reject' ? 'reject' : base.policy
+  return {
+    policy,
+    defaultValue: toWhole(input?.defaultValue ?? base.defaultValue, 1, 200000),
   }
 }
 
@@ -297,6 +314,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   whitespaceCompression: true,
   imageProcessing: defaultImageProcessing(),
   bodyConversion: defaultBodyConversion(),
+  missingMaxTokens: defaultMissingMaxTokens(),
   payloadGuardEnabled: true,
   payloadGuardMode: 'preemptive',
   payloadGuardMaxBytes: 460800,

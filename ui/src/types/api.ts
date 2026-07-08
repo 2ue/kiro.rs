@@ -673,6 +673,7 @@ export interface UsageRecord {
   endpoint: string
   stream: boolean
   model: string
+  requestedMaxTokens?: number
   upstreamModel?: string
   externalOutboundModel?: string
   modelResolutionSource?: string
@@ -716,6 +717,10 @@ export interface UsageRecord {
   errorType?: string
   errorMessage?: string
   errorDetail?: string
+  errorStatusCode?: number
+  errorSource?: string
+  errorId?: string
+  errorMetadata?: unknown
   publicErrorStatusCode?: number
   publicErrorType?: string
   publicErrorMessage?: string
@@ -1376,6 +1381,13 @@ export interface WeightedCapacityConfig {
   tiers: WeightedCapacityTier[]
 }
 
+export type MissingMaxTokensPolicy = 'reject' | 'default_value'
+
+export interface MissingMaxTokensConfig {
+  policy: MissingMaxTokensPolicy
+  defaultValue: number
+}
+
 export interface RuntimeConfig {
   proxyUrl?: string | null
   proxyUsername?: string | null
@@ -1421,6 +1433,7 @@ export interface RuntimeConfig {
   whitespaceCompression: boolean
   imageProcessing: ImageProcessingConfig
   bodyConversion: BodyConversionConfig
+  missingMaxTokens: MissingMaxTokensConfig
   payloadGuardEnabled: boolean
   payloadGuardMode: PayloadGuardMode
   payloadGuardMaxBytes: number

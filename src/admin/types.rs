@@ -5,8 +5,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use crate::anthropic::pricing::ModelPricing;
 use crate::model::config::{
     BodyConversionConfig, CachePolicyConfig, CompatProfile, CompressionConfig, ExternalPoolsConfig,
-    ImageProcessingConfig, KiroAgentModeStrategy, ModelMappingConfig, ModelResolutionMode,
-    PayloadGuardMode, PayloadShapingConfig, PayloadShapingConfigPatch,
+    ImageProcessingConfig, KiroAgentModeStrategy, MissingMaxTokensConfig, ModelMappingConfig,
+    ModelResolutionMode, PayloadGuardMode, PayloadShapingConfig, PayloadShapingConfigPatch,
     PromptCacheCreationControlConfig, ReportedUsageConfig, ThinkingTriggerMode,
     WeightedCapacityConfig,
 };
@@ -1380,6 +1380,7 @@ pub struct RuntimeConfigResponse {
     pub whitespace_compression: bool,
     pub image_processing: ImageProcessingConfig,
     pub body_conversion: BodyConversionConfig,
+    pub missing_max_tokens: MissingMaxTokensConfig,
     pub payload_guard_enabled: bool,
     pub payload_guard_mode: PayloadGuardMode,
     pub payload_guard_max_bytes: u64,
@@ -1495,6 +1496,8 @@ pub struct UpdateRuntimeConfigRequest {
     pub image_processing: Option<ImageProcessingConfig>,
     #[serde(default)]
     pub body_conversion: Option<BodyConversionConfig>,
+    #[serde(default)]
+    pub missing_max_tokens: Option<MissingMaxTokensConfig>,
     #[serde(default)]
     pub payload_guard_enabled: Option<bool>,
     #[serde(default)]

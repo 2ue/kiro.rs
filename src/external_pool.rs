@@ -4408,12 +4408,43 @@ fn project_usage_value(
     }
     obj.remove("cache_creation_5m_input_tokens");
     obj.remove("cache_creation_1h_input_tokens");
-    obj.remove("cache_creation");
+    apply_projected_cache_creation_breakdown(obj, projected);
     Some(ProjectedExternalUsage {
         request_input_tokens: projection.raw_input_tokens,
         shaped,
         reported: projected,
     })
+}
+
+fn apply_projected_cache_creation_breakdown(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    usage: CacheUsage,
+) {
+    let cache_creation_input_tokens = usage.cache_creation_input_tokens.max(0);
+    if cache_creation_input_tokens == 0 {
+        obj.remove("cache_creation");
+        return;
+    }
+
+    let cache_creation_1h_input_tokens = usage
+        .cache_creation_1h_input_tokens
+        .max(0)
+        .min(cache_creation_input_tokens);
+    let cache_creation_5m_input_tokens = usage
+        .cache_creation_5m_input_tokens
+        .max(0)
+        .min(cache_creation_input_tokens.saturating_sub(cache_creation_1h_input_tokens));
+    let remainder = cache_creation_input_tokens
+        .saturating_sub(cache_creation_5m_input_tokens)
+        .saturating_sub(cache_creation_1h_input_tokens);
+
+    obj.insert(
+        "cache_creation".to_string(),
+        json!({
+            "ephemeral_5m_input_tokens": cache_creation_5m_input_tokens.saturating_add(remainder),
+            "ephemeral_1h_input_tokens": cache_creation_1h_input_tokens,
+        }),
+    );
 }
 
 trait ExternalPoolUsageUplift {
@@ -4501,10 +4532,27 @@ fn uplift_cache_creation_breakdown(
 fn cache_usage_from_value(value: &serde_json::Value) -> Option<CacheUsage> {
     let input_tokens = usage_i32(value, "input_tokens");
     let output_tokens = usage_i32(value, "output_tokens");
-    let cache_creation_input_tokens = usage_i32(value, "cache_creation_input_tokens");
+    let mut cache_creation_input_tokens = usage_i32(value, "cache_creation_input_tokens");
     let cache_read_input_tokens = usage_i32(value, "cache_read_input_tokens");
-    let cache_creation_5m_input_tokens = usage_i32(value, "cache_creation_5m_input_tokens");
-    let cache_creation_1h_input_tokens = usage_i32(value, "cache_creation_1h_input_tokens");
+    let nested_cache_creation = value.get("cache_creation");
+    let nested_cache_creation_5m_input_tokens = nested_cache_creation
+        .map(|value| usage_i32(value, "ephemeral_5m_input_tokens"))
+        .unwrap_or(0);
+    let nested_cache_creation_1h_input_tokens = nested_cache_creation
+        .map(|value| usage_i32(value, "ephemeral_1h_input_tokens"))
+        .unwrap_or(0);
+    let mut cache_creation_5m_input_tokens = usage_i32(value, "cache_creation_5m_input_tokens")
+        .max(nested_cache_creation_5m_input_tokens);
+    let mut cache_creation_1h_input_tokens = usage_i32(value, "cache_creation_1h_input_tokens")
+        .max(nested_cache_creation_1h_input_tokens);
+    let nested_cache_creation_input_tokens =
+        cache_creation_5m_input_tokens.saturating_add(cache_creation_1h_input_tokens);
+    cache_creation_input_tokens =
+        cache_creation_input_tokens.max(nested_cache_creation_input_tokens);
+    cache_creation_5m_input_tokens =
+        cache_creation_5m_input_tokens.min(cache_creation_input_tokens);
+    cache_creation_1h_input_tokens = cache_creation_1h_input_tokens
+        .min(cache_creation_input_tokens.saturating_sub(cache_creation_5m_input_tokens));
     if input_tokens == 0
         && output_tokens == 0
         && cache_creation_input_tokens == 0
@@ -6511,6 +6559,28 @@ data: {"type":"message_delta","note":"content_block_delta"}
             .expect("usage field")
     }
 
+    fn event_data_value(event: &[u8]) -> serde_json::Value {
+        let text = std::str::from_utf8(event).expect("event utf8");
+        text.lines()
+            .find_map(|line| line.trim_start().strip_prefix("data:"))
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(json.trim()).ok())
+            .expect("event data json")
+    }
+
+    fn assert_projected_cache_creation_consistent(usage: &serde_json::Value) {
+        let aggregate = usage["cache_creation_input_tokens"]
+            .as_i64()
+            .expect("cache_creation_input_tokens");
+        let five_min = usage["cache_creation"]["ephemeral_5m_input_tokens"]
+            .as_i64()
+            .expect("ephemeral_5m_input_tokens");
+        let one_hour = usage["cache_creation"]["ephemeral_1h_input_tokens"]
+            .as_i64()
+            .expect("ephemeral_1h_input_tokens");
+
+        assert_eq!(aggregate, five_min + one_hour);
+    }
+
     #[test]
     fn external_pool_url_adds_single_v1_for_standard_message_path() {
         let config = ExternalPoolsConfig::default();
@@ -7545,6 +7615,133 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
         assert!(reported.input_tokens <= 96);
         assert_eq!(reported.cache_read_input_tokens, 0);
         assert!(reported.cache_creation_input_tokens > 0);
+    }
+
+    #[test]
+    fn sse_usage_projection_rewrites_nested_5m_cache_creation_split() {
+        let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":0,"output_tokens":62,"cache_creation_input_tokens":1300180,"cache_read_input_tokens":37,"cache_creation":{"ephemeral_5m_input_tokens":1300180,"ephemeral_1h_input_tokens":0}}}
+
+"#;
+        let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+        let route = test_route("claude-opus-4-8");
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+        let projection = projection_context(&route, &pool, 0).expect("projection");
+
+        let projected = rewrite_sse_event_usage(event, Some(&projection), Some(&capture));
+        let text = std::str::from_utf8(&projected).expect("projected utf8");
+        assert!(!text.contains("1300180"));
+
+        let value = event_data_value(&projected);
+        let usage = &value["usage"];
+        assert_projected_cache_creation_consistent(usage);
+        assert!(
+            usage["cache_creation_input_tokens"]
+                .as_i64()
+                .expect("projected aggregate")
+                < 1_300_180
+        );
+
+        let capture = capture.lock().clone();
+        let raw = capture.raw.expect("raw usage");
+        assert_eq!(raw.cache_creation_input_tokens, 1_300_180);
+        assert_eq!(raw.cache_creation_5m_input_tokens, 1_300_180);
+        assert_eq!(raw.cache_creation_1h_input_tokens, 0);
+        let reported = capture.reported.expect("reported usage");
+        assert_eq!(
+            reported.cache_creation_input_tokens,
+            usage["cache_creation_input_tokens"].as_i64().unwrap() as i32
+        );
+    }
+
+    #[test]
+    fn sse_usage_projection_rewrites_nested_1h_cache_creation_split() {
+        let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":0,"output_tokens":135,"cache_creation_input_tokens":1998336,"cache_read_input_tokens":17,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":1998336}}}
+
+"#;
+        let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+        let mut route = test_route("claude-opus-4-8");
+        payload_mut(&mut route).stream = true;
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+        let projection = projection_context(&route, &pool, 0).expect("projection");
+
+        let projected = rewrite_sse_event_usage(event, Some(&projection), Some(&capture));
+        let text = std::str::from_utf8(&projected).expect("projected utf8");
+        assert!(!text.contains("1998336"));
+
+        let value = event_data_value(&projected);
+        let usage = &value["usage"];
+        assert_projected_cache_creation_consistent(usage);
+        assert!(
+            usage["cache_creation_input_tokens"]
+                .as_i64()
+                .expect("projected aggregate")
+                < 1_998_336
+        );
+
+        let capture = capture.lock().clone();
+        let raw = capture.raw.expect("raw usage");
+        assert_eq!(raw.cache_creation_input_tokens, 1_998_336);
+        assert_eq!(raw.cache_creation_5m_input_tokens, 0);
+        assert_eq!(raw.cache_creation_1h_input_tokens, 1_998_336);
+    }
+
+    #[test]
+    fn sse_usage_projection_handles_nested_only_cache_creation_split() {
+        let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":0,"output_tokens":62,"cache_creation_input_tokens":0,"cache_read_input_tokens":37,"cache_creation":{"ephemeral_5m_input_tokens":1300180,"ephemeral_1h_input_tokens":0}}}
+
+"#;
+        let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+        let route = test_route("claude-opus-4-8");
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+        let projection = projection_context(&route, &pool, 0).expect("projection");
+
+        let projected = rewrite_sse_event_usage(event, Some(&projection), Some(&capture));
+        let text = std::str::from_utf8(&projected).expect("projected utf8");
+        assert!(!text.contains("1300180"));
+        assert_ne!(projected, event);
+
+        let value = event_data_value(&projected);
+        assert_projected_cache_creation_consistent(&value["usage"]);
+
+        let capture = capture.lock().clone();
+        let raw = capture.raw.expect("raw usage");
+        assert_eq!(raw.cache_creation_input_tokens, 1_300_180);
+        assert_eq!(raw.cache_creation_5m_input_tokens, 1_300_180);
+    }
+
+    #[test]
+    fn sse_event_passthrough_keeps_nested_usage_when_projection_disabled() {
+        let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":0,"output_tokens":62,"cache_creation_input_tokens":1300180,"cache_read_input_tokens":37,"cache_creation":{"ephemeral_5m_input_tokens":1300180,"ephemeral_1h_input_tokens":0}}}
+
+"#;
+        let capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
+            stream_response_mode: Some(ExternalPoolStreamResponseMode::EventPassthrough),
+            ..ExternalUsageCapture::default()
+        }));
+
+        let passthrough = process_sse_event_with_plan(
+            event,
+            None,
+            Some(&capture),
+            None,
+            ExternalStreamProcessingPlan::from_mode(
+                ExternalPoolStreamResponseMode::EventPassthrough,
+            ),
+        );
+
+        assert_eq!(passthrough, event);
+        let capture = capture.lock().clone();
+        assert!(!capture.projected);
+        let raw = capture.raw.expect("raw usage");
+        assert_eq!(raw.cache_creation_input_tokens, 1_300_180);
+        assert_eq!(raw.cache_creation_5m_input_tokens, 1_300_180);
     }
 
     #[test]

@@ -3686,6 +3686,7 @@ impl AdminService {
             whitespace_compression: config.compression.whitespace_compression,
             image_processing: config.image_processing.normalized(),
             body_conversion: config.body_conversion,
+            missing_max_tokens: config.missing_max_tokens.normalized(),
             payload_guard_enabled: config.payload_guard_enabled,
             payload_guard_mode: config.payload_guard_mode,
             payload_guard_max_bytes: config.payload_guard_max_bytes as u64,
@@ -3844,6 +3845,10 @@ impl AdminService {
         let body_conversion = req
             .body_conversion
             .unwrap_or(current_config.body_conversion);
+        let missing_max_tokens = req
+            .missing_max_tokens
+            .unwrap_or(current_config.missing_max_tokens)
+            .normalized();
         let payload_guard_mode = req
             .payload_guard_mode
             .unwrap_or(current_config.payload_guard_mode);
@@ -4045,6 +4050,9 @@ impl AdminService {
         weighted_capacity
             .validate()
             .map_err(AdminServiceError::InvalidCredential)?;
+        missing_max_tokens
+            .validate()
+            .map_err(AdminServiceError::InvalidCredential)?;
         if warmup_selection_percent > 100 {
             return Err(AdminServiceError::InvalidCredential(
                 "credentialWarmupSelectionPercent 不能大于 100".to_string(),
@@ -4210,6 +4218,7 @@ impl AdminService {
                 config.compression = compression.clone();
                 config.image_processing = image_processing;
                 config.body_conversion = body_conversion;
+                config.missing_max_tokens = missing_max_tokens;
                 config.payload_guard_enabled = payload_guard_enabled;
                 config.payload_guard_mode = payload_guard_mode;
                 config.payload_guard_max_bytes = payload_guard_max_bytes;

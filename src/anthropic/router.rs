@@ -14,9 +14,9 @@ use crate::external_pool::ExternalPoolManager;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
     BodyConversionConfig, CachePolicyConfig, CompatProfile, ExternalPoolsConfig,
-    ImageProcessingConfig, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
-    PayloadShapingConfig, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
-    ReportedUsageConfig, ThinkingTriggerMode, ToolFormatDebugConfig,
+    ImageProcessingConfig, MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode,
+    PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
+    PromptCacheSimulationMode, ReportedUsageConfig, ThinkingTriggerMode, ToolFormatDebugConfig,
 };
 
 use super::{
@@ -101,6 +101,7 @@ pub fn create_router_with_provider(
     kiro_upstream_stream_idle_timeout_secs: u64,
     image_processing: ImageProcessingConfig,
     body_conversion: BodyConversionConfig,
+    missing_max_tokens: MissingMaxTokensConfig,
     payload_shaping: PayloadShapingConfig,
     external_pools: ExternalPoolsConfig,
     tool_format_debug: ToolFormatDebugConfig,
@@ -148,6 +149,7 @@ pub fn create_router_with_provider(
         body_conversion,
         payload_shaping,
     )
+    .with_missing_max_tokens(missing_max_tokens)
     .with_external_pools(external_pools)
     .with_tool_format_debug_recorder(tool_format_debug_recorder)
     .with_pricing_catalog(pricing_catalog)
