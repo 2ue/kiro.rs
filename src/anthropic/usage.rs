@@ -1384,39 +1384,42 @@ impl UsageRecorder {
         page: usize,
         limit: usize,
     ) -> UsageRecordsPageResult {
-        let has_generic_text_search = query
-            .q
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|q| !q.is_empty());
-        let should_try_redis =
-            query.request_id.is_some() || !has_generic_text_search || self.postgres_store.is_none();
-
-        if should_try_redis {
-            if let Some(redis) = &self.redis_store {
-                let redis = redis.clone();
-                let redis_query = query.clone();
-                match block_on_usage_store(async move {
-                    redis.usage_records_page(redis_query, page, limit).await
-                }) {
-                    Ok(Some(result)) => return result,
-                    Ok(None) => {}
-                    Err(err) => {
-                        tracing::warn!("分页查询 Redis usage records 失败，回退 PgSQL: {}", err)
-                    }
-                }
-            }
-        }
-
         if let Some(store) = &self.postgres_store {
             let store = store.clone();
             let query_for_fallback = query.clone();
             return block_on_usage_store(async move { store.query_page(query, page, limit).await })
                 .unwrap_or_else(|err| {
-                    tracing::warn!("分页查询 PgSQL usage records 失败，回退内存记录: {}", err);
-                    self.query_page_memory(query_for_fallback, page, limit)
+                    tracing::warn!(
+                        "分页查询 PgSQL usage records 失败，回退 Redis/内存记录: {}",
+                        err
+                    );
+                    self.query_page_without_postgres(query_for_fallback, page, limit)
                 });
         }
+
+        self.query_page_without_postgres(query, page, limit)
+    }
+
+    fn query_page_without_postgres(
+        &self,
+        query: UsageRecordQuery,
+        page: usize,
+        limit: usize,
+    ) -> UsageRecordsPageResult {
+        if let Some(redis) = &self.redis_store {
+            let redis = redis.clone();
+            let redis_query = query.clone();
+            match block_on_usage_store(async move {
+                redis.usage_records_page(redis_query, page, limit).await
+            }) {
+                Ok(Some(result)) => return result,
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!("分页查询 Redis usage records 失败，回退内存记录: {}", err)
+                }
+            }
+        }
+
         self.query_page_memory(query, page, limit)
     }
 

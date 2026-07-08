@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useState, type ReactNode } from 'react'
 import {
   Activity,
   BarChart3,
@@ -6,6 +6,7 @@ import {
   ChevronUp,
   Clock3,
   Database,
+  SlidersHorizontal,
   Info,
   RefreshCw,
   Trash2,
@@ -36,9 +37,6 @@ import {
   LoadingState,
   ErrorState,
   Callout,
-  Toolbar,
-  ToolbarSearch,
-  ToolbarActions,
 } from '@/components/patterns'
 import {
   Badge,
@@ -107,6 +105,23 @@ function routeTargetLabel(record: UsageRecord, credentialLabel?: string): string
 
 function extractRequestId(value: string): string {
   return value.match(REQUEST_ID_PATTERN)?.[0] ?? ''
+}
+
+function FilterField({
+  label,
+  children,
+  className,
+}: {
+  label: string
+  children: ReactNode
+  className?: string
+}) {
+  return (
+    <label className={className}>
+      <span className="mb-1 block text-[0.68rem] font-medium text-muted-foreground">{label}</span>
+      {children}
+    </label>
+  )
 }
 
 // ─── 趋势图区 ─────────────────────────────────────────────────────────────────
@@ -199,6 +214,7 @@ function RecordsView({
   const [source, setSource] = useState<UsageSource | '__all__'>('__all__')
   const [streamMode, setStreamMode] = useState<'all' | 'stream' | 'non_stream'>('all')
   const [minCacheRead, setMinCacheRead] = useState('')
+  const [advancedOpen, setAdvancedOpen] = useState(false)
 
   // 文本筛选项防抖,避免每次按键都触发查询(展示值即时,查询用防抖值)
   const qD = useDebouncedValue(q)
@@ -207,11 +223,16 @@ function RecordsView({
   const endpointD = useDebouncedValue(endpoint)
   const conversationIdD = useDebouncedValue(conversationId)
   const minCacheReadD = useDebouncedValue(minCacheRead)
+  const hasAdvancedFilters =
+    !!q.trim() || status !== '__all__' || source !== '__all__' || streamMode !== 'all' ||
+    !!routeTarget || !!minCacheRead.trim()
+  const showAdvancedFilters = advancedOpen || hasAdvancedFilters
 
-  const credentials = useCredentials({ refetchInterval: autoRefreshInterval })
+  const credentials = useCredentials({ enabled: showAdvancedFilters, refetchInterval: autoRefreshInterval })
   const externalPools = useQuery({
     queryKey: ['external-pools'],
     queryFn: getExternalPools,
+    enabled: showAdvancedFilters,
     refetchInterval: autoRefreshInterval,
   })
 
@@ -270,99 +291,136 @@ function RecordsView({
         description="每次请求的完整记录，点击行查看详情"
         noPadding
       >
-        <div className="px-4 pt-4 pb-2">
-          <Toolbar>
-            <ToolbarSearch value={q} onChange={(v) => { setQ(v); setPage(1) }} placeholder="搜索模型、账号、会话、路径、错误、req_..." />
-            <ToolbarActions>
-              {hasFilters && (
-                <Button variant="ghost" size="sm" onClick={() => { clearFilters(); setPage(1) }}>
-                  <X className="h-3.5 w-3.5" />重置
+        <div className="space-y-3 px-4 pt-4 pb-2">
+          <div className="rounded-xl bg-card p-3 shadow-sm">
+            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-[1.2fr_1fr_1fr_1.2fr_auto]">
+              <FilterField label="请求 ID">
+                <Input
+                  placeholder="req_..."
+                  value={requestId}
+                  onChange={(e) => { setRequestId(e.target.value); setPage(1) }}
+                  className="h-9 font-mono text-xs"
+                />
+              </FilterField>
+              <FilterField label="模型">
+                <Input
+                  placeholder="claude-opus-4.8"
+                  value={model}
+                  onChange={(e) => { setModel(e.target.value); setPage(1) }}
+                  className="h-9 text-xs"
+                />
+              </FilterField>
+              <FilterField label="入口路径">
+                <Input
+                  placeholder="/cc/v1/messages"
+                  value={endpoint}
+                  onChange={(e) => { setEndpoint(e.target.value); setPage(1) }}
+                  className="h-9 text-xs"
+                />
+              </FilterField>
+              <FilterField label="会话 ID">
+                <Input
+                  placeholder="conversation id"
+                  value={conversationId}
+                  onChange={(e) => { setConversationId(e.target.value); setPage(1) }}
+                  className="h-9 font-mono text-xs"
+                />
+              </FilterField>
+              <div className="flex items-end gap-2">
+                <Button
+                  variant={showAdvancedFilters ? 'secondary' : 'outline'}
+                  size="sm"
+                  onClick={() => setAdvancedOpen((v) => !v)}
+                  className="h-9"
+                >
+                  <SlidersHorizontal className="h-3.5 w-3.5" />高级
                 </Button>
-              )}
-              {records.isFetching && <RefreshCw className="size-3.5 animate-spin text-muted-foreground/60" />}
-            </ToolbarActions>
-          </Toolbar>
-
-          <div className="mt-2 rounded-lg bg-muted/30 p-3">
-            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-              <Input
-                placeholder="请求 ID / req_..."
-                value={requestId}
-                onChange={(e) => { setRequestId(e.target.value); setPage(1) }}
-                className="h-8 text-xs font-mono"
-              />
-              <Input
-                placeholder="模型"
-                value={model}
-                onChange={(e) => { setModel(e.target.value); setPage(1) }}
-                className="h-8 text-xs"
-              />
-              <Input
-                placeholder="入口路径，如 /cc/v1/messages"
-                value={endpoint}
-                onChange={(e) => { setEndpoint(e.target.value); setPage(1) }}
-                className="h-8 text-xs"
-              />
-              <Input
-                placeholder="会话 ID"
-                value={conversationId}
-                onChange={(e) => { setConversationId(e.target.value); setPage(1) }}
-                className="h-8 text-xs"
-              />
-              <Input
-                placeholder="最小缓存读取 token"
-                value={minCacheRead}
-                onChange={(e) => { setMinCacheRead(e.target.value); setPage(1) }}
-                className="h-8 text-xs"
-                inputMode="numeric"
-              />
-              <Select value={status} onValueChange={(v) => { setStatus(v as UsageRecordStatus | '__all__'); setPage(1) }}>
-                <SelectTrigger size="sm"><SelectValue placeholder="全部状态" /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="__all__">全部状态</SelectItem>
-                  <SelectItem value="success">成功</SelectItem>
-                  <SelectItem value="error">错误</SelectItem>
-                  <SelectItem value="stream_error">流错误</SelectItem>
-                  <SelectItem value="upstream_timeout">服务超时</SelectItem>
-                  <SelectItem value="client_dropped">客户端断开</SelectItem>
-                </SelectContent>
-              </Select>
-              <Select value={source} onValueChange={(v) => { setSource(v as UsageSource | '__all__'); setPage(1) }}>
-                <SelectTrigger size="sm"><SelectValue placeholder="全部来源" /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="__all__">全部来源</SelectItem>
-                  <SelectItem value="upstream_metadata">服务返回用量</SelectItem>
-                  <SelectItem value="local_prompt_cache">本地缓存估算</SelectItem>
-                  <SelectItem value="context_estimate">上下文估算</SelectItem>
-                  <SelectItem value="request_estimate">请求估算</SelectItem>
-                  <SelectItem value="none">无缓存</SelectItem>
-                </SelectContent>
-              </Select>
-              <Select value={streamMode} onValueChange={(v) => { setStreamMode(v as 'all' | 'stream' | 'non_stream'); setPage(1) }}>
-                <SelectTrigger size="sm"><SelectValue placeholder="全部请求" /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">全部请求</SelectItem>
-                  <SelectItem value="stream">Stream</SelectItem>
-                  <SelectItem value="non_stream">非 Stream</SelectItem>
-                </SelectContent>
-              </Select>
-              <Select value={routeTarget || '__all__'} onValueChange={(v) => { setRouteTarget(v === '__all__' ? '' : v); setPage(1) }}>
-                <SelectTrigger size="sm"><SelectValue placeholder="全部账号/外部账号" /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="__all__">全部账号/外部账号</SelectItem>
-                  {(credentials.data?.credentials ?? []).map((c) => (
-                    <SelectItem key={`credential:${c.id}`} value={`credential:${c.id}`}>
-                      账号 #{c.id} {c.email || c.maskedApiKey || ''}
-                    </SelectItem>
-                  ))}
-                  {(externalPools.data?.pools ?? []).map((p) => (
-                    <SelectItem key={`external:${p.id}`} value={`external:${p.id}`}>
-                      外部账号 #{p.id} {p.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+                {hasFilters && (
+                  <Button variant="ghost" size="sm" onClick={() => { clearFilters(); setPage(1) }} className="h-9">
+                    <X className="h-3.5 w-3.5" />重置
+                  </Button>
+                )}
+                {records.isFetching && <RefreshCw className="size-3.5 animate-spin text-muted-foreground/60" />}
+              </div>
             </div>
+
+            {showAdvancedFilters && (
+              <div className="mt-3 border-t pt-3">
+                <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                  <FilterField label="模糊搜索">
+                    <Input
+                      placeholder="错误、账号、路径、费用等"
+                      value={q}
+                      onChange={(e) => { setQ(e.target.value); setPage(1) }}
+                      className="h-8 text-xs"
+                    />
+                  </FilterField>
+                  <FilterField label="最小缓存读取 token">
+                    <Input
+                      placeholder="如 10000"
+                      value={minCacheRead}
+                      onChange={(e) => { setMinCacheRead(e.target.value); setPage(1) }}
+                      className="h-8 text-xs"
+                      inputMode="numeric"
+                    />
+                  </FilterField>
+                  <FilterField label="状态">
+                    <Select value={status} onValueChange={(v) => { setStatus(v as UsageRecordStatus | '__all__'); setPage(1) }}>
+                      <SelectTrigger size="sm"><SelectValue placeholder="全部状态" /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__all__">全部状态</SelectItem>
+                        <SelectItem value="success">成功</SelectItem>
+                        <SelectItem value="error">错误</SelectItem>
+                        <SelectItem value="stream_error">流错误</SelectItem>
+                        <SelectItem value="upstream_timeout">服务超时</SelectItem>
+                        <SelectItem value="client_dropped">客户端断开</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </FilterField>
+                  <FilterField label="来源">
+                    <Select value={source} onValueChange={(v) => { setSource(v as UsageSource | '__all__'); setPage(1) }}>
+                      <SelectTrigger size="sm"><SelectValue placeholder="全部来源" /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__all__">全部来源</SelectItem>
+                        <SelectItem value="upstream_metadata">服务返回用量</SelectItem>
+                        <SelectItem value="local_prompt_cache">本地缓存估算</SelectItem>
+                        <SelectItem value="context_estimate">上下文估算</SelectItem>
+                        <SelectItem value="request_estimate">请求估算</SelectItem>
+                        <SelectItem value="none">无缓存</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </FilterField>
+                  <FilterField label="请求类型">
+                    <Select value={streamMode} onValueChange={(v) => { setStreamMode(v as 'all' | 'stream' | 'non_stream'); setPage(1) }}>
+                      <SelectTrigger size="sm"><SelectValue placeholder="全部请求" /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="all">全部请求</SelectItem>
+                        <SelectItem value="stream">Stream</SelectItem>
+                        <SelectItem value="non_stream">非 Stream</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </FilterField>
+                  <FilterField label="账号 / 外部池" className="sm:col-span-2 lg:col-span-1">
+                    <Select value={routeTarget || '__all__'} onValueChange={(v) => { setRouteTarget(v === '__all__' ? '' : v); setPage(1) }}>
+                      <SelectTrigger size="sm"><SelectValue placeholder="全部账号/外部账号" /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__all__">全部账号/外部账号</SelectItem>
+                        {(credentials.data?.credentials ?? []).map((c) => (
+                          <SelectItem key={`credential:${c.id}`} value={`credential:${c.id}`}>
+                            账号 #{c.id} {c.email || c.maskedApiKey || ''}
+                          </SelectItem>
+                        ))}
+                        {(externalPools.data?.pools ?? []).map((p) => (
+                          <SelectItem key={`external:${p.id}`} value={`external:${p.id}`}>
+                            外部账号 #{p.id} {p.name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </FilterField>
+                </div>
+              </div>
+            )}
           </div>
         </div>
 
@@ -574,7 +632,7 @@ function RecordsView({
 // ─── 主页 ──────────────────────────────────────────────────────────────────────
 
 export function UsagePage() {
-  const [trendOpen, setTrendOpen] = useState(true)
+  const [trendOpen, setTrendOpen] = useState(false)
   const [selectedRecord, setSelectedRecord] = useState<UsageRecord | null>(null)
   const [cleanupOpen, setCleanupOpen] = useState(false)
 
