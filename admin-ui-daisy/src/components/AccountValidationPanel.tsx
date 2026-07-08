@@ -1,12 +1,19 @@
 import { AlertTriangle, CheckCircle2, FileSearch, FileUp, RefreshCw, Upload, XCircle } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { Button, Checkbox, Input, Loading, Textarea } from 'react-daisyui'
 import { validateExistingCredentials, validateExternalCredentials } from '@/api/credentials'
 import { Badge, EmptyState, SectionCard, Select, StatCard } from '@/components/common'
 import { formatDate, formatNumber, formatQuota } from '@/lib/format'
 import { parseCredentialImportFiles, parseCredentialImportText } from '@/lib/credential-import'
-import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, TEST_MODELS, testModelLabel } from '@/lib/test-models'
+import {
+  buildTestModelOptions,
+  defaultTestModelForOptions,
+  DEFAULT_TEST_MODEL,
+  DEFAULT_TEST_PROMPT,
+  testModelLabel,
+} from '@/lib/test-models'
+import { useModelCapabilities } from '@/hooks/use-usage'
 import { extractErrorMessage } from '@/lib/utils'
 import type { AddCredentialRequest, CredentialValidationGroup, CredentialValidationItem, CredentialValidationResponse } from '@/types/api'
 
@@ -149,11 +156,18 @@ function initialExternalOptions(): ExternalValidationOptions {
 }
 
 export function AccountValidationPanel() {
+  const modelCapabilities = useModelCapabilities()
   const [raw, setRaw] = useState('')
   const [result, setResult] = useState<CredentialValidationResponse | null>(null)
   const [loading, setLoading] = useState(false)
   const [externalOptions, setExternalOptions] = useState<ExternalValidationOptions>(initialExternalOptions)
   const [selectedFiles, setSelectedFiles] = useState<string[]>([])
+  const userSelectedLivenessModelRef = useRef(false)
+  const modelOptions = useMemo(
+    () => buildTestModelOptions(modelCapabilities.data?.models),
+    [modelCapabilities.data?.models]
+  )
+  const defaultLivenessModel = defaultTestModelForOptions(modelOptions)
   const parsedCount = useMemo(() => {
     try {
       return raw.trim() ? parseCredentialImportText(raw).length : 0
@@ -162,6 +176,11 @@ export function AccountValidationPanel() {
     }
   }, [raw])
   const hasExternalAction = externalOptions.querySubscription || externalOptions.queryUsage || externalOptions.checkLiveness
+
+  useEffect(() => {
+    if (userSelectedLivenessModelRef.current) return
+    setExternalOptions((prev) => ({ ...prev, livenessModel: defaultLivenessModel }))
+  }, [defaultLivenessModel])
 
   const validateExisting = async (scope: 'all' | 'enabled' | 'disabled') => {
     setLoading(true)
@@ -307,8 +326,11 @@ export function AccountValidationPanel() {
             <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
               <label className="form-control min-w-0">
                 <span className="label-text mb-1 text-xs font-semibold text-base-content/70">验活模型</span>
-                <Select bordered size="sm" value={externalOptions.livenessModel} disabled={loading || !externalOptions.checkLiveness} onChange={(event) => updateExternalOption('livenessModel', event.target.value)}>
-                  {TEST_MODELS.map((model) => (
+                <Select bordered size="sm" value={externalOptions.livenessModel} disabled={loading || !externalOptions.checkLiveness} onChange={(event) => {
+                  userSelectedLivenessModelRef.current = true
+                  updateExternalOption('livenessModel', event.target.value)
+                }}>
+                  {modelOptions.map((model) => (
                     <Select.Option key={model.id} value={model.id}>{model.label}</Select.Option>
                   ))}
                 </Select>

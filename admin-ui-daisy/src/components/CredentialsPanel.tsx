@@ -33,8 +33,14 @@ import {
   type VerifyResult,
 } from '@/components/CredentialDialogs'
 import { formatCredits, formatFullDate, formatNumber } from '@/lib/format'
-import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
+import {
+  buildTestModelOptions,
+  defaultTestModelForOptions,
+  DEFAULT_TEST_PROMPT,
+  testModelLabel,
+} from '@/lib/test-models'
 import { extractErrorMessage } from '@/lib/utils'
+import { useModelCapabilities } from '@/hooks/use-usage'
 import {
   useCredentials,
   useCredentialAccountInfo,
@@ -160,6 +166,7 @@ function mergeCredentialPlanes(
 }
 
 export function CredentialsPanel() {
+  const modelCapabilities = useModelCapabilities()
   // State
   const [page, setPage] = useState(1)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
@@ -191,6 +198,11 @@ export function CredentialsPanel() {
   const cancelVerifyRef = useRef(false)
   const itemsPerPage = 15
   const confirmDialog = useConfirm()
+  const testModelOptions = useMemo(
+    () => buildTestModelOptions(modelCapabilities.data?.models),
+    [modelCapabilities.data?.models]
+  )
+  const batchTestModel = defaultTestModelForOptions(testModelOptions)
 
   // Hooks
   const queryClient = useQueryClient()
@@ -628,7 +640,7 @@ export function CredentialsPanel() {
       const id = ids[i]
       setVerifyResults((prev) => new Map(prev).set(id, { id, status: 'verifying' }))
       try {
-        const response = await testCredential(id, { model: DEFAULT_TEST_MODEL, prompt: DEFAULT_TEST_PROMPT })
+        const response = await testCredential(id, { model: batchTestModel, prompt: DEFAULT_TEST_PROMPT })
         success += 1
         setVerifyResults((prev) => new Map(prev).set(id, { id, status: 'success', model: testModelLabel(response.model), response: response.response }))
       } catch (error) {

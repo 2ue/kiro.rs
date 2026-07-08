@@ -38,9 +38,12 @@ pub(super) fn build_context(
     if pool.usage_projection_mode != ExternalPoolUsageProjectionMode::CurrentPathPolicy {
         return None;
     }
+    if route.prompt_cache_strategy_type == PromptCacheStrategyType::NoCache {
+        return None;
+    }
     let stream = route.is_stream();
     let reported_usage = route.reported_usage.policy_for_path(&route.endpoint);
-    if !stream && reported_usage.skip_non_stream_usage_projection {
+    if !stream && (!reported_usage.enabled || reported_usage.skip_non_stream_usage_projection) {
         return None;
     }
 
@@ -136,9 +139,6 @@ pub(super) fn build_context(
         _ => (None, None, None),
     };
     let reported_policy = match route.prompt_cache_strategy_type {
-        PromptCacheStrategyType::NoCache if reported_usage.enabled => {
-            ReportedCacheUsagePolicy::from_path_policy(reported_usage, fastrand::u64(..))
-        }
         PromptCacheStrategyType::CurrentHighCache
             if prompt_cache_supported
                 && route.prompt_cache_simulation_mode == PromptCacheSimulationMode::HighCache =>

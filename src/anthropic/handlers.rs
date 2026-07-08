@@ -1122,8 +1122,10 @@ fn raw_external_route_request(
     direct_policy_reason: Option<String>,
     local_preflight: Option<serde_json::Value>,
 ) -> ExternalRouteRequest {
-    let policy = &cache_route.policy;
     let (model_hint, stream_hint) = raw_messages_body_hints(&raw_body);
+    let effective_cache_route =
+        cache_route_for_request_stream(cache_route.clone(), stream_hint.unwrap_or(false));
+    let policy = &effective_cache_route.policy;
     ExternalRouteRequest {
         raw_body,
         headers,
@@ -1147,7 +1149,7 @@ fn raw_external_route_request(
         prompt_cache_creation_controller: state.prompt_cache_creation_controller.clone(),
         prompt_cache_strategy_type: policy.cache_type,
         prompt_cache_simulation_mode: prompt_cache_simulation_mode_for_policy(policy),
-        prompt_cache_route_namespace: cache_route.namespace.clone(),
+        prompt_cache_route_namespace: effective_cache_route.namespace.clone(),
         prompt_cache_target_read_ratio: policy.simulation.target_read_ratio,
         prompt_cache_token_scale: policy.simulation.token_scale,
         prompt_cache_max_simulated_input_tokens: policy.simulation.max_simulated_input_tokens,
@@ -1184,7 +1186,8 @@ fn build_external_fallback_context(
 ) -> Option<ExternalFallbackContext> {
     let manager = state.external_pool_manager.clone()?;
     let config = runtime_config.external_pools.clone();
-    let policy = &cache_route.policy;
+    let effective_cache_route = cache_route_for_request_stream(cache_route.clone(), payload.stream);
+    let policy = &effective_cache_route.policy;
     config
         .external_pools_enabled
         .then_some(ExternalFallbackContext {
@@ -1200,7 +1203,7 @@ fn build_external_fallback_context(
             prompt_cache_creation_controller: state.prompt_cache_creation_controller.clone(),
             prompt_cache_strategy_type: policy.cache_type,
             prompt_cache_simulation_mode: prompt_cache_simulation_mode_for_policy(policy),
-            prompt_cache_route_namespace: cache_route.namespace.clone(),
+            prompt_cache_route_namespace: effective_cache_route.namespace.clone(),
             prompt_cache_target_read_ratio: policy.simulation.target_read_ratio,
             prompt_cache_token_scale: policy.simulation.token_scale,
             prompt_cache_max_simulated_input_tokens: policy.simulation.max_simulated_input_tokens,
@@ -2324,7 +2327,7 @@ fn should_apply_reported_usage(
         return false;
     }
     match strategy_type {
-        PromptCacheStrategyType::NoCache => true,
+        PromptCacheStrategyType::NoCache => false,
         PromptCacheStrategyType::CurrentHighCache => {
             simulation_mode == PromptCacheSimulationMode::HighCache
         }
@@ -7129,6 +7132,108 @@ mod tests {
         );
     }
 
+    #[test]
+    fn raw_external_route_request_applies_non_stream_skip_cache_route() {
+        let mut cache_policy = CachePolicyConfig::default();
+        cache_policy.path_overrides.insert(
+            "/cc".to_string(),
+            CacheRoutePolicyPatch {
+                cache_type: Some(PromptCacheStrategyType::CurrentHighCache),
+                reported_usage: Some(ReportedUsagePathPolicy {
+                    skip_non_stream_usage_projection: true,
+                    input: ReportedUsageFieldPolicy::sample_input_max(1),
+                    ..ReportedUsagePathPolicy::default()
+                }),
+                ..CacheRoutePolicyPatch::default()
+            },
+        );
+        let state = AppState::new(
+            Arc::new(crate::common::auth::RequestApiKeyStore::new(["test-key"])),
+            true,
+            Arc::new(UsageRecorder::new(10)),
+            Arc::new(PromptCacheTracker::default()),
+            Arc::new(PromptCacheCreationController::default()),
+            PromptCacheSimulationMode::HighCache,
+            0.98,
+            CompatProfile::ClaudeCode,
+            false,
+        )
+        .with_cache_policy(cache_policy);
+        let runtime_config = RequestRuntimeConfig::from_app_state(&state);
+        let cache_route = runtime_config.cache_policy_for_path("/cc/v1/messages");
+        assert_eq!(
+            cache_route.policy.cache_type,
+            PromptCacheStrategyType::CurrentHighCache
+        );
+        assert!(
+            cache_route
+                .policy
+                .reported_usage
+                .skip_non_stream_usage_projection
+        );
+
+        let non_stream_route = raw_external_route_request(
+            &state,
+            &runtime_config,
+            &cache_route,
+            HeaderMap::new(),
+            Bytes::from_static(
+                br#"{"model":"client-model","stream":false,"messages":[{"role":"user","content":"hello"}]}"#,
+            ),
+            "/cc/v1/messages",
+            "req_raw_non_stream_skip".to_string(),
+            UsageRouteSubtype::ExternalDirectPolicy,
+            None,
+            Some("direct_policy".to_string()),
+            None,
+        );
+
+        assert_eq!(
+            non_stream_route.prompt_cache_strategy_type,
+            PromptCacheStrategyType::NoCache
+        );
+        assert_eq!(
+            non_stream_route.prompt_cache_simulation_mode,
+            PromptCacheSimulationMode::Disabled
+        );
+        assert!(non_stream_route.prompt_cache_route_namespace.is_none());
+        assert!(!non_stream_route.reported_usage.default.enabled);
+        assert!(
+            non_stream_route
+                .reported_usage
+                .default
+                .skip_non_stream_usage_projection
+        );
+
+        let stream_route = raw_external_route_request(
+            &state,
+            &runtime_config,
+            &cache_route,
+            HeaderMap::new(),
+            Bytes::from_static(
+                br#"{"model":"client-model","stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
+            ),
+            "/cc/v1/messages",
+            "req_raw_stream_skip".to_string(),
+            UsageRouteSubtype::ExternalDirectPolicy,
+            None,
+            Some("direct_policy".to_string()),
+            None,
+        );
+
+        assert_eq!(
+            stream_route.prompt_cache_strategy_type,
+            PromptCacheStrategyType::CurrentHighCache
+        );
+        assert!(stream_route.reported_usage.default.enabled);
+        assert!(
+            stream_route
+                .reported_usage
+                .default
+                .skip_non_stream_usage_projection
+        );
+    }
+
     fn runtime_config_for_payload_guard(
         mode: PayloadGuardMode,
         enabled: bool,
@@ -8690,7 +8795,7 @@ Return a fix plan."#
         assert!(v1_context.reported_cache_usage_policy().is_some());
         assert!(cc_context.reported_cache_usage_policy().is_some());
         assert!(ha_context.reported_cache_usage_policy().is_some());
-        assert!(na_context.reported_cache_usage_policy().is_some());
+        assert!(na_context.reported_cache_usage_policy().is_none());
 
         let v1_reported =
             v1_context.reported_usage_for_downstream(usage, UsageSource::LocalPromptCache);
@@ -8744,13 +8849,17 @@ Return a fix plan."#
         );
         assert_eq!(ha_reported.output_tokens, usage.output_tokens);
 
-        let na_reported =
-            na_context.reported_usage_for_downstream(usage, UsageSource::LocalPromptCache);
-        assert_eq!(na_reported.input_tokens, na_context.input_tokens);
+        let na_raw = cache::RawUsage::uncached(12_345, usage.output_tokens);
+        let na_reported = na_context.reported_usage_for_downstream_with_raw(
+            usage,
+            UsageSource::UpstreamMetadata,
+            na_raw,
+        );
+        assert_eq!(na_reported.input_tokens, 12_345);
         assert_eq!(na_reported.output_tokens, usage.output_tokens);
         assert_eq!(na_reported.cache_creation_input_tokens, 0);
         assert_eq!(na_reported.cache_read_input_tokens, 0);
-        assert_eq!(na_reported.total_input_tokens, na_context.input_tokens);
+        assert_eq!(na_reported.total_input_tokens, 12_345);
     }
 
     #[test]
@@ -9812,7 +9921,7 @@ Return a fix plan."#
     }
 
     #[test]
-    fn builtin_na_path_does_not_build_local_profile_but_keeps_reporting_policy() {
+    fn builtin_na_path_does_not_build_local_profile_or_reporting_policy() {
         let prompt_cache = Arc::new(PromptCacheTracker::default());
         let usage_recorder = Arc::new(UsageRecorder::new(10));
         let state = AppState::new(
@@ -9875,11 +9984,11 @@ Return a fix plan."#
         assert_eq!(context.prompt_cache_route_namespace, None);
         assert!(context.simulated_usage.is_none());
         assert!(context.simulated_source.is_none());
-        assert!(context.reported_cache_usage_policy.is_some());
+        assert!(context.reported_cache_usage_policy.is_none());
     }
 
     #[test]
-    fn no_cache_route_does_not_build_cache_profile_plan_but_shapes_reporting() {
+    fn no_cache_route_does_not_build_cache_profile_plan_or_shape_reporting() {
         let prompt_cache = Arc::new(PromptCacheTracker::default());
         let usage_recorder = Arc::new(UsageRecorder::new(10));
         let mut cache_policy = CachePolicyConfig::default();
@@ -9978,9 +10087,18 @@ Return a fix plan."#
         assert_eq!(context.prompt_cache_route_namespace, None);
         assert!(context.simulated_usage.is_none());
         assert!(context.simulated_source.is_none());
-        assert!(context.reported_cache_usage_policy.is_some());
+        assert!(context.reported_cache_usage_policy.is_none());
 
-        let reported = context.reported_usage_for_downstream(
+        let upstream_raw = CacheUsage {
+            total_input_tokens: 4_165,
+            input_tokens: 4_165,
+            output_tokens: 7,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+        };
+        let reported = context.reported_usage_for_downstream_with_raw(
             cache::CacheUsage {
                 total_input_tokens: 125_000,
                 input_tokens: 100_000,
@@ -9991,8 +10109,9 @@ Return a fix plan."#
                 cache_creation_1h_input_tokens: 0,
             },
             UsageSource::UpstreamMetadata,
+            raw_usage_to_reported_raw(upstream_raw),
         );
-        assert!((1..=32).contains(&reported.input_tokens));
+        assert_eq!(reported.input_tokens, 4_165);
         assert_eq!(reported.output_tokens, 7);
         assert_eq!(reported.cache_creation_input_tokens, 0);
         assert_eq!(reported.cache_read_input_tokens, 0);
@@ -10144,7 +10263,7 @@ Return a fix plan."#
             context.prompt_cache_strategy_type,
             PromptCacheStrategyType::NoCache
         );
-        assert!(context.reported_cache_usage_policy.is_some());
+        assert!(context.reported_cache_usage_policy.is_none());
 
         let context_usage = CacheUsage {
             total_input_tokens: 32_000,

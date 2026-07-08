@@ -1,14 +1,21 @@
 import { AlertCircle, CheckCircle2, Download, Eye, EyeOff, FileUp, Loader2, Play, RotateCw, XCircle } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { Alert, Button, Card, Checkbox, Form, Input, Loading, Modal, Progress, Textarea } from 'react-daisyui'
 import { addCredential, deleteCredential, exportCredentials, getCredentialBalance, setCredentialDisabled, testCredential } from '@/api/credentials'
 import { Badge, FieldLabel, ModalShell, Select } from '@/components/common'
 import { parseCredentialImportFiles, parseCredentialImportText } from '@/lib/credential-import'
 import { parseKamFiles, parseKamJson, type KamAccount } from '@/lib/kam-import'
-import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, TEST_MODELS, testModelLabel } from '@/lib/test-models'
+import {
+  buildTestModelOptions,
+  defaultTestModelForOptions,
+  DEFAULT_TEST_MODEL,
+  DEFAULT_TEST_PROMPT,
+  testModelLabel,
+} from '@/lib/test-models'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 import { useAddCredential, useBatchUpdateCredentials, useDeleteCredential, useProxyResources, useTestCredential } from '@/hooks/use-credentials'
+import { useModelCapabilities } from '@/hooks/use-usage'
 import type {
   AddCredentialRequest,
   BatchUpdateCredentialsRequest,
@@ -173,7 +180,8 @@ function parseOptionalNonNegativeInteger(value: string, label: string): number |
 
 async function verifyImportedCredential(
   credentialId: number,
-  mode: ImportVerificationMode
+  mode: ImportVerificationMode,
+  model: string
 ): Promise<{ model: string; response: string }> {
   if (mode === 'subscription_only') {
     const info = await getCredentialBalance(credentialId)
@@ -183,7 +191,7 @@ async function verifyImportedCredential(
     }
   }
 
-  const tested = await testCredential(credentialId, { model: DEFAULT_TEST_MODEL, prompt: DEFAULT_TEST_PROMPT })
+  const tested = await testCredential(credentialId, { model, prompt: DEFAULT_TEST_PROMPT })
   try {
     await getCredentialBalance(credentialId)
   } catch (error) {
@@ -639,19 +647,38 @@ export function CredentialTestModal({
   open: boolean
   onClose: () => void
 }) {
+  const modelCapabilities = useModelCapabilities()
   const [model, setModel] = useState(DEFAULT_TEST_MODEL)
   const [prompt, setPrompt] = useState(DEFAULT_TEST_PROMPT)
   const [result, setResult] = useState<TestCredentialResponse | null>(null)
   const [error, setError] = useState('')
+  const userSelectedModelRef = useRef(false)
   const test = useTestCredential()
+  const modelOptions = useMemo(
+    () => buildTestModelOptions(modelCapabilities.data?.models, credential?.supportedModels),
+    [modelCapabilities.data?.models, credential?.supportedModels]
+  )
+  const defaultModel = defaultTestModelForOptions(modelOptions)
 
   useEffect(() => {
     if (open) {
       setResult(null)
       setError('')
+      setModel(defaultModel)
       setPrompt(DEFAULT_TEST_PROMPT)
+      userSelectedModelRef.current = false
     }
   }, [open, credential?.id])
+
+  useEffect(() => {
+    if (!open || userSelectedModelRef.current) return
+    setModel(defaultModel)
+  }, [open, defaultModel])
+
+  const selectModel = (value: string) => {
+    userSelectedModelRef.current = true
+    setModel(value)
+  }
 
   const run = () => {
     if (!credential) return
@@ -686,8 +713,8 @@ export function CredentialTestModal({
           </Card>
           <div className="grid gap-3 md:grid-cols-[1fr_240px]">
             <FieldLabel title="测试模型">
-              <Select bordered size="sm" value={model} disabled={test.isPending} onChange={(event) => setModel(event.target.value)}>
-                {TEST_MODELS.map((option) => (
+              <Select bordered size="sm" value={model} disabled={test.isPending} onChange={(event) => selectModel(event.target.value)}>
+                {modelOptions.map((option) => (
                   <Select.Option key={option.id} value={option.id}>
                     {option.label}
                   </Select.Option>
@@ -837,6 +864,12 @@ export function BatchImportModal({
   const [verificationMode, setVerificationMode] = useState<ImportVerificationMode>('subscription_only')
   const proxyResources = useProxyResources()
   const proxyResourceOptions = (proxyResources.data?.resources || []).filter((resource) => resource.enabled)
+  const modelCapabilities = useModelCapabilities()
+  const testModelOptions = useMemo(
+    () => buildTestModelOptions(modelCapabilities.data?.models),
+    [modelCapabilities.data?.models]
+  )
+  const importTestModel = defaultTestModelForOptions(testModelOptions)
 
   const reset = () => {
     setJsonInput('')
@@ -985,7 +1018,7 @@ export function BatchImportModal({
         })
         addedId = added.credentialId
         await new Promise((resolve) => setTimeout(resolve, 1000))
-        const verification = await verifyImportedCredential(added.credentialId, verificationMode)
+        const verification = await verifyImportedCredential(added.credentialId, verificationMode, importTestModel)
         successCount += 1
         if (isApiKeyCred) existingApiKeyHashes.add(hash)
         else existingOauthHashes.add(hash)
@@ -1108,6 +1141,12 @@ export function KamImportModal({
   const [verificationMode, setVerificationMode] = useState<ImportVerificationMode>('subscription_only')
   const proxyResources = useProxyResources()
   const proxyResourceOptions = (proxyResources.data?.resources || []).filter((resource) => resource.enabled)
+  const modelCapabilities = useModelCapabilities()
+  const testModelOptions = useMemo(
+    () => buildTestModelOptions(modelCapabilities.data?.models),
+    [modelCapabilities.data?.models]
+  )
+  const importTestModel = defaultTestModelForOptions(testModelOptions)
 
   const preview = useMemo(() => {
     if (!jsonInput.trim()) return { accounts: [] as KamAccount[], error: '' }
@@ -1234,7 +1273,7 @@ export function KamImportModal({
         const added = await addCredential(mergeCredentialDefaults(baseCredential, { ...defaults, authRegion: '' }))
         addedId = added.credentialId
         await new Promise((resolve) => setTimeout(resolve, 1000))
-        const verification = await verifyImportedCredential(added.credentialId, verificationMode)
+        const verification = await verifyImportedCredential(added.credentialId, verificationMode, importTestModel)
         successCount += 1
         existingTokenHashes.add(tokenHash)
         setResults((prev) =>

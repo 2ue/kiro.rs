@@ -193,7 +193,7 @@ export function modelMappingDescription(mode: ExternalPool['modelMappingMode'] |
 
 export function requestBodyModeDescription(mode: ExternalPool['requestBodyMode'] | undefined): string {
   if (mode === 'raw_passthrough') {
-    return '请求体不进入本系统的消息解析、图片处理、schema 修正和 payload guard。Usage 上报仍按当前外部池的用量展示模式执行；是否改写顶层 model 由下方模型处理配置单独控制。'
+    return '请求体不进入本系统的消息解析、图片处理、schema 修正和 payload guard。Usage 是否投影仍由当前外部账号的 Usage 投影策略决定；是否改写顶层 model 由下方模型处理配置单独控制。'
   }
   return '按当前系统的标准 Anthropic 请求处理链路转发，会应用图片预处理、payload guard、thinking/model 兼容逻辑和 usage 整形上下文。'
 }
@@ -228,19 +228,19 @@ export function poolSupportedModelsSummary(pool: ExternalPool): string {
 
 export function usageProjectionDescription(mode: ExternalPool['usageProjectionMode'] | undefined): string {
   if (mode === 'current_path_policy') {
-    return '按当前入口规则整理用量，并应用全局用量补偿。适合希望外部账号展示方式和本地入口一致的场景。'
+    return '允许当前外部账号的 usage 进入入口缓存策略、字段投影和全局补偿。非流式透传开关命中时会跳过这一步。'
   }
-  return '保持外部账号返回的用量，不应用缓存补偿和输出补偿。适合只做外部连接的场景。'
+  return '保持外部账号返回的 usage，不应用入口缓存策略、字段采样、缓存补偿或输出补偿。'
 }
 
 export function streamResponseDescription(mode: ExternalPoolStreamResponseDraft): string {
   if (mode === 'event_passthrough_capture') {
-    return '普通 SSE event 原样下发；usage event 也保持上游原样，只在系统内部捕获并按入口策略记录费用和历史。适合排查外部上游原始输出。'
+    return '仅影响 stream=true。普通 SSE event 和 usage 字段都按上游原样返回；系统只捕获 usage 用于内部诊断。'
   }
   if (mode === 'event_passthrough_usage_rewrite') {
-    return '普通 SSE event 原样下发；只在最终 usage event 按当前入口缓存策略改写下游可见字段，同时记录内部计量。'
+    return '仅影响 stream=true。文本、thinking、tool 等 SSE event 事件级透传；message_start 和最终 usage 字段在实际有缓存读写时按入口策略投影。'
   }
-  return '不在该外部账号单独指定流式 usage 处理方式，使用全局默认策略。'
+  return '当前外部账号不单独指定流式 usage 返回方式，使用全局默认策略。'
 }
 
 export function poolUsageSummary(pool: ExternalPool, config: ExternalPoolsConfig): string {
@@ -248,7 +248,7 @@ export function poolUsageSummary(pool: ExternalPool, config: ExternalPoolsConfig
     ? ['用量：按入口规则']
     : ['用量：保持原样']
   const streamMode = pool.streamResponseMode || config.externalPoolStreamResponseMode
-  parts.push(streamMode === 'event_passthrough_capture' ? '流式：原样usage' : '流式：整形usage')
+  parts.push(streamMode === 'event_passthrough_capture' ? '流式：原样usage' : '流式：投影usage')
   if (pool.streamResponseMode) {
     parts.push('单池覆盖')
   }

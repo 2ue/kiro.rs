@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useMemo, useState } from 'react'
+import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { CheckCircle2, FlaskConical, Loader2, Pencil, Play, Plus, Power, RefreshCw, RotateCcw, RotateCw, Save, Trash2, XCircle } from 'lucide-react'
 import { toast } from 'sonner'
@@ -30,7 +30,7 @@ import {
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { useModelCapabilities } from '@/hooks/use-usage'
-import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, TEST_MODELS } from '@/lib/test-models'
+import { buildTestModelOptions, defaultTestModelForOptions, DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT } from '@/lib/test-models'
 import type { CredentialListItem, CreateExternalPoolRequest, ExternalPool, ExternalPoolModelMappingRule, ExternalPoolsConfig, ExternalPoolStreamResponseMode, ExternalPoolTestResponse, UpdateExternalPoolRequest } from '@/types/api'
 import { defaultExternalPoolsConfig } from '@/components/runtime-config-panel'
 
@@ -465,7 +465,7 @@ export function ExternalPoolsPanel() {
             <SummaryItem label="入口策略" value={fallbackActive || directPolicyActive ? '已配置' : '未配置'} />
             <SummaryItem label="可调度外部池" value={`${dispatchablePools}/${totalPools}`} />
             <SummaryItem label="外部池并发" value={`${totalInFlight}/${totalCapacity || 0}`} />
-            <SummaryItem label="按路径整形池" value={`${currentPathPoolCount} 个`} />
+            <SummaryItem label="按入口投影池" value={`${currentPathPoolCount} 个`} />
           </div>
 
           <PolicyBlock
@@ -578,14 +578,14 @@ export function ExternalPoolsPanel() {
           <PolicyBlock
             title="5. 返回给下游的 usage"
             active={externalEnabled && usageCompensationActive}
-            description="只影响选择“按路径整形”的外部池。本地凭证和“严格透传”的外部池不会受影响。"
+            description="只影响选择“按入口策略投影”的外部池。本地凭证和“上游原样”的外部池不会受影响。"
           >
             <div className="space-y-4">
               <HintBox>
-                生效条件：请求进入外部池，并且该外部池的 Usage 模式为“按路径整形”。如果外部池是“严格透传”，下面配置不会改写 usage。
+                生效条件：请求进入外部池，并且该外部池的 Usage 投影策略为“按入口策略投影”。如果外部池是“上游原样”，下面配置不会改写 usage。
               </HintBox>
               <div className="grid gap-4 lg:grid-cols-2">
-                <FormSection title="缓存读写补偿" description="按路径整形后，对上报的 cache read/write token 做补偿。">
+                <FormSection title="缓存读写补偿" description="按入口策略投影后，对上报的 cache read/write token 做补偿。">
                   <div className="grid gap-3 sm:grid-cols-2">
                     <Toggle disabled={!externalEnabled} label="启用缓存补偿" checked={cacheUpliftActive} onChange={setCacheUpliftEnabled} />
                     <NumberBox disabled={!cacheUpliftActive} label="放大百分比" value={configDraft.externalPoolUsageProjectionUpliftPercent} onChange={(externalPoolUsageProjectionUpliftPercent) => setConfigDraft((prev) => ({ ...prev, externalPoolUsageProjectionUpliftPercent }))} />
@@ -834,15 +834,15 @@ function ExternalPoolFormDialog({
               </div>
             </FormSection>
 
-            <FormSection title="Usage 与成本" description="只控制当前外部池返回给下游的 usage 口径。">
+            <FormSection title="Usage 投影" description="只决定当前外部池的 usage 是否按入口缓存策略改写；非 usage 内容不受影响。">
               <div className="space-y-3">
-                <SelectBox label="Usage 上报模式" value={draft.usageProjectionMode} disabled={saving} onChange={(usageProjectionMode) => onDraftChange((prev) => ({ ...prev, usageProjectionMode: usageProjectionMode as ExternalPoolFormDraft['usageProjectionMode'] }))}>
-                  <option value="pass_through">严格透传：不改外部池 usage</option>
-                  <option value="current_path_policy">按当前路径整形：重写 usage 并应用全局补偿</option>
+                <SelectBox label="Usage 投影策略" value={draft.usageProjectionMode} disabled={saving} onChange={(usageProjectionMode) => onDraftChange((prev) => ({ ...prev, usageProjectionMode: usageProjectionMode as ExternalPoolFormDraft['usageProjectionMode'] }))}>
+                  <option value="pass_through">上游原样：不改 usage</option>
+                  <option value="current_path_policy">按入口策略投影：应用全局补偿</option>
                 </SelectBox>
                 <HintBox>{usageProjectionDescription(draft.usageProjectionMode)}</HintBox>
                 <SelectBox
-                  label="流式 Usage 处理"
+                  label="流式响应 Usage 返回"
                   value={draft.streamResponseMode}
                   disabled={saving}
                   onChange={(streamResponseMode) => onDraftChange((prev) => ({
@@ -851,7 +851,7 @@ function ExternalPoolFormDialog({
                   }))}
                 >
                   <option value="inherit">继承全局默认</option>
-                  <option value="event_passthrough_usage_rewrite">事件透传 + Usage 按路径整形</option>
+                  <option value="event_passthrough_usage_rewrite">事件透传，usage 按入口投影</option>
                   <option value="event_passthrough_capture">事件完全透传，仅内部计量</option>
                 </SelectBox>
                 <HintBox>{streamResponseDescription(draft.streamResponseMode)}</HintBox>
@@ -1009,22 +1009,12 @@ function ExternalPoolTestDialog({
   const [result, setResult] = useState<ExternalPoolTestResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [running, setRunning] = useState(false)
+  const userSelectedModelRef = useRef(false)
 
   const modelOptions = useMemo(() => {
-    const seen = new Set<string>()
-    const options: { id: string; label: string }[] = []
-    const push = (id: string, label: string) => {
-      const key = id.trim()
-      if (!key || seen.has(key)) return
-      seen.add(key)
-      options.push({ id: key, label })
-    }
-    TEST_MODELS.forEach((item) => push(item.id, item.label))
-    ;[...(modelCapabilities.data?.models || [])]
-      .sort((left, right) => left.model.localeCompare(right.model))
-      .forEach((item) => push(item.model, item.displayName || item.model))
-    return options
-  }, [modelCapabilities.data?.models])
+    return buildTestModelOptions(modelCapabilities.data?.models, pool?.supportedModels)
+  }, [modelCapabilities.data?.models, pool?.supportedModels])
+  const defaultModel = defaultTestModelForOptions(modelOptions)
   const selectedModelLabel = useMemo(
     () => modelOptions.find((option) => option.id === model)?.label || model,
     [model, modelOptions]
@@ -1032,12 +1022,23 @@ function ExternalPoolTestDialog({
 
   useEffect(() => {
     if (!open) return
-    setModel(DEFAULT_TEST_MODEL)
+    setModel(defaultModel)
     setPrompt(DEFAULT_TEST_PROMPT)
     setResult(null)
     setError(null)
     setRunning(false)
+    userSelectedModelRef.current = false
   }, [open, pool?.id])
+
+  useEffect(() => {
+    if (!open || userSelectedModelRef.current) return
+    setModel(defaultModel)
+  }, [open, defaultModel])
+
+  const selectModel = (value: string) => {
+    userSelectedModelRef.current = true
+    setModel(value)
+  }
 
   const run = async () => {
     if (!pool) return
@@ -1100,7 +1101,7 @@ function ExternalPoolTestDialog({
                 <span className="text-sm font-medium">选择测试模型</span>
                 <select
                   value={model}
-                  onChange={(event) => setModel(event.target.value)}
+                  onChange={(event) => selectModel(event.target.value)}
                   disabled={running}
                   className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
                 >
@@ -1375,7 +1376,7 @@ function modelMappingDescription(mode: ExternalPool['modelMappingMode'] | undefi
 
 function requestBodyModeDescription(mode: ExternalPool['requestBodyMode'] | undefined) {
   if (mode === 'raw_passthrough') {
-    return '请求体不进入消息解析、图片处理、schema 修正和 payload guard。Usage 上报仍按当前外部池的 Usage 上报模式执行；是否改写顶层 model 由下方模型处理配置单独控制。'
+    return '请求体不进入消息解析、图片处理、schema 修正和 payload guard。Usage 是否投影仍由当前外部池的 Usage 投影策略决定；是否改写顶层 model 由下方模型处理配置单独控制。'
   }
   return '按标准 Anthropic 请求处理链路转发，会应用图片预处理、payload guard、thinking/model 兼容逻辑和 usage 整形上下文。'
 }
@@ -1403,27 +1404,27 @@ function poolBodyModeSummary(pool: ExternalPool) {
 
 function usageProjectionDescription(mode: ExternalPool['usageProjectionMode'] | undefined) {
   if (mode === 'current_path_policy') {
-    return '按当前请求路径重新整理 usage，并应用全局 usage 补偿。适合希望外部池返回特征和本地路径一致的场景。'
+    return '允许当前外部池的 usage 进入入口缓存策略、字段投影和全局补偿。非流式透传开关命中时会跳过这一步。'
   }
-  return '严格透传外部池返回的 usage，不应用缓存补偿和输出补偿。适合只把外部池当作直接上游。'
+  return '保持外部池返回的 usage，不应用入口缓存策略、字段采样、缓存补偿或输出补偿。'
 }
 
 function streamResponseDescription(mode: ExternalPoolStreamResponseDraft) {
   if (mode === 'event_passthrough_capture') {
-    return '普通 SSE event 原样下发；usage event 也保持上游原样，只在系统内部捕获并按入口策略记录费用和历史。适合排查外部上游原始输出。'
+    return '仅影响 stream=true。普通 SSE event 和 usage 字段都按上游原样返回；系统只捕获 usage 用于内部诊断。'
   }
   if (mode === 'event_passthrough_usage_rewrite') {
-    return '普通 SSE event 原样下发；只在最终 usage event 按当前路径缓存策略改写下游可见字段，同时记录内部计量。'
+    return '仅影响 stream=true。文本、thinking、tool 等 SSE event 事件级透传；message_start 和最终 usage 字段在实际有缓存读写时按入口策略投影。'
   }
-  return '不在该外部池单独指定流式 usage 处理方式，使用全局默认策略。'
+  return '当前外部池不单独指定流式 usage 返回方式，使用全局默认策略。'
 }
 
 function poolUsageSummary(pool: ExternalPool, config: ExternalPoolsConfig) {
   const parts = pool.usageProjectionMode === 'current_path_policy'
-    ? ['Usage: 按路径整形']
+    ? ['Usage: 按入口投影']
     : ['Usage: 严格透传']
   const streamMode = pool.streamResponseMode || config.externalPoolStreamResponseMode
-  parts.push(streamMode === 'event_passthrough_capture' ? '流式: 原样usage' : '流式: 整形usage')
+  parts.push(streamMode === 'event_passthrough_capture' ? '流式: 原样usage' : '流式: 投影usage')
   if (pool.streamResponseMode) {
     parts.push('单池覆盖')
   }

@@ -38,9 +38,15 @@ import {
   useRuntimeConfig,
   useSetLoadBalancingMode,
 } from '@/hooks/use-credentials'
+import { useModelCapabilities } from '@/hooks/use-usage'
 import { getCredentialInfo, refreshCredentialInfo, forceRefreshToken, testCredential } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
-import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
+import {
+  buildTestModelOptions,
+  defaultTestModelForOptions,
+  DEFAULT_TEST_PROMPT,
+  testModelLabel,
+} from '@/lib/test-models'
 import type { BalanceResponse, CredentialListItem, CredentialSortBy, CredentialSortOrder, CredentialStatusItem, LoadBalancingMode } from '@/types/api'
 
 const credentialSortOptions: Array<{ value: CredentialSortBy; label: string }> = [
@@ -95,6 +101,7 @@ interface DashboardProps {
 }
 
 export function Dashboard({ onLogout }: DashboardProps) {
+  const modelCapabilities = useModelCapabilities()
   const [testingCredential, setTestingCredential] = useState<CredentialStatusItem | null>(null)
   const [testDialogOpen, setTestDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
@@ -121,6 +128,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
   const [activeTab, setActiveTab] = useState<'dashboard' | 'credentials' | 'validation' | 'proxies' | 'external' | 'usage' | 'pricing' | 'audit' | 'config'>('credentials')
   const cancelVerifyRef = useRef(false)
+  const testModelOptions = useMemo(
+    () => buildTestModelOptions(modelCapabilities.data?.models),
+    [modelCapabilities.data?.models]
+  )
+  const batchTestModel = defaultTestModelForOptions(testModelOptions)
   const [currentPage, setCurrentPage] = useState(1)
   const itemsPerPage = 12
   const [darkMode, setDarkMode] = useState(() => {
@@ -740,7 +752,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
       try {
         const response = await testCredential(id, {
-          model: DEFAULT_TEST_MODEL,
+          model: batchTestModel,
           prompt: DEFAULT_TEST_PROMPT,
         })
         successCount++

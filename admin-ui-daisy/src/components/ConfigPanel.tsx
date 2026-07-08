@@ -498,8 +498,8 @@ function NonStreamCacheToggle({
   return (
     <div className="rounded-lg border border-base-300 bg-base-100/70 p-4">
       <ToggleField
-        title="非流式请求无缓存"
-        description="开启后，命中此路径的非流式请求不做本系统缓存展示，不写入本地缓存状态，返回和记录都按无缓存 usage 口径；流式请求保持原策略。"
+        title="非流式 Usage 透传"
+        description="开启后，命中此路径的非流式请求不做本系统 usage 投影、input 采样或补偿，也不推进本地缓存状态；外部池同步响应保持上游 usage 原样，本地凭证使用上游原始 metadata usage；流式请求保持原策略。"
         checked={Boolean(policy.skipNonStreamUsageProjection)}
         onChange={(skipNonStreamUsageProjection) =>
           onChange({ ...policy, skipNonStreamUsageProjection })
@@ -1626,8 +1626,8 @@ function ReportedUsagePathEditor({
       </div>
       <div className="mb-3">
         <ToggleField
-          title="非流式请求无缓存"
-          description="开启后，命中此路径的非流式请求不做本系统缓存展示，不写入本地缓存状态，返回和记录都按无缓存 usage 口径；流式请求保持原策略。"
+          title="非流式 Usage 透传"
+          description="开启后，命中此路径的非流式请求不做本系统 usage 投影、input 采样或补偿，也不推进本地缓存状态；外部池同步响应保持上游 usage 原样，本地凭证使用上游原始 metadata usage；流式请求保持原策略。"
           checked={Boolean(value.skipNonStreamUsageProjection)}
           onChange={(skipNonStreamUsageProjection) =>
             onChange({ ...value, skipNonStreamUsageProjection })
@@ -2278,7 +2278,7 @@ export function ConfigPanel() {
                   <Select.Option value="always">总是触发</Select.Option>
                 </Select>
               </FieldLabel>
-              <FieldLabel title="外部池默认流式 Usage 处理" description="作为外部池默认值；单个外部账号可以覆盖。默认只在 usage event 按入口缓存策略整形下游字段，普通 SSE event 仍事件级透传。">
+              <FieldLabel title="外部池默认流式响应 Usage 返回" description="作为外部池默认值；单个外部账号可以覆盖。默认事件级透传普通 SSE，只在实际有缓存读写时按入口策略投影流式 usage。">
                 <Select
                   bordered
                   size="sm"
@@ -2295,7 +2295,7 @@ export function ConfigPanel() {
                     }))
                   }
                 >
-                  <Select.Option value="event_passthrough_usage_rewrite">事件透传 + Usage 按路径整形</Select.Option>
+                  <Select.Option value="event_passthrough_usage_rewrite">事件透传，usage 按入口投影</Select.Option>
                   <Select.Option value="event_passthrough_capture">事件完全透传，仅内部计量</Select.Option>
                 </Select>
               </FieldLabel>

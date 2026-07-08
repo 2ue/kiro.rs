@@ -20,7 +20,7 @@ use crate::kiro::call_trace::{
     AccountRejectReason, RejectedAccountSample, SelectionFailureStage, SelectionFailureSummary,
 };
 use crate::kiro::machine_id;
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::credentials::{KiroCredentials, profile_arn_region};
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
 use crate::storage::postgres::{
@@ -133,6 +133,27 @@ fn apply_optional_string(target: &mut Option<String>, value: Option<String>) {
     if let Some(value) = value {
         *target = trimmed_optional(value);
     }
+}
+
+fn api_region_conflicts_with_profile_arn(credential: &KiroCredentials) -> bool {
+    let Some(profile_region) = credential
+        .profile_arn
+        .as_deref()
+        .and_then(profile_arn_region)
+    else {
+        return false;
+    };
+
+    let Some(api_region) = credential
+        .api_region
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+
+    !api_region.eq_ignore_ascii_case(profile_region)
 }
 
 fn apply_credential_auth_update(credential: &mut KiroCredentials, update: CredentialAuthUpdate) {
@@ -5142,8 +5163,10 @@ impl MultiTokenManager {
             if region_changed && !credential.is_api_key_credential() {
                 credential.access_token = None;
                 credential.expires_at = None;
-                credential.profile_arn = None;
                 credential.subscription_title = None;
+                if api_region_conflicts_with_profile_arn(&credential) {
+                    credential.profile_arn = None;
+                }
             }
             credential
         };
@@ -5161,9 +5184,9 @@ impl MultiTokenManager {
             if !entry.credentials.is_api_key_credential() {
                 entry.credentials.access_token = None;
                 entry.credentials.expires_at = None;
-                entry.credentials.profile_arn = None;
                 entry.credentials.subscription_title = None;
             }
+            entry.credentials.profile_arn = credential.profile_arn;
         }
 
         self.publish_credentials_changed("credential_regions_updated");
@@ -10580,6 +10603,65 @@ mod tests {
         let api_host = format!("q.{}.amazonaws.com", api_region);
 
         assert_eq!(api_host, "q.eu-central-1.amazonaws.com");
+    }
+
+    #[test]
+    fn test_region_update_preserves_matching_profile_arn() {
+        let mut credential = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            access_token: Some("access".to_string()),
+            expires_at: Some("2099-01-01T00:00:00Z".to_string()),
+            profile_arn: Some(
+                "arn:aws:codewhisperer:eu-central-1:123456789012:profile/REAL".to_string(),
+            ),
+            ..Default::default()
+        };
+        credential.id = Some(1);
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+
+        manager
+            .set_credential_regions(1, None, None, Some(Some("eu-central-1".to_string())))
+            .unwrap();
+
+        let entry = manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == 1)
+            .unwrap();
+        assert_eq!(entry.api_region.as_deref(), Some("eu-central-1"));
+        assert_eq!(entry.effective_api_region, "eu-central-1");
+        assert!(entry.has_profile_arn);
+        assert!(entry.expires_at.is_none());
+    }
+
+    #[test]
+    fn test_region_update_clears_conflicting_profile_arn() {
+        let mut credential = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            profile_arn: Some(
+                "arn:aws:codewhisperer:eu-central-1:123456789012:profile/REAL".to_string(),
+            ),
+            ..Default::default()
+        };
+        credential.id = Some(1);
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+
+        manager
+            .set_credential_regions(1, None, None, Some(Some("us-east-1".to_string())))
+            .unwrap();
+
+        let entry = manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == 1)
+            .unwrap();
+        assert_eq!(entry.api_region.as_deref(), Some("us-east-1"));
+        assert_eq!(entry.effective_api_region, "us-east-1");
+        assert!(!entry.has_profile_arn);
     }
 
     #[test]

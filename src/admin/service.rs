@@ -62,7 +62,7 @@ use crate::http_client::{
     ProxyConfig, build_client, response_bytes_with_body_timeout, response_text_with_body_timeout,
     send_with_response_header_timeout,
 };
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::credentials::{KiroCredentials, profile_arn_region};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::{
     ConversationState, CurrentMessage, KiroRequest, UserInputMessage,
@@ -86,7 +86,7 @@ const BALANCE_CACHE_TTL_SECS: i64 = 300;
 const DEFAULT_CREDENTIALS_PAGE_LIMIT: usize = 12;
 const MAX_CREDENTIALS_PAGE_LIMIT: usize = 500;
 const CREDENTIAL_INFO_REFRESH_CONCURRENCY: usize = 16;
-const DEFAULT_VALIDATION_TEST_MODEL: &str = "claude-opus-4-5-20251101";
+const DEFAULT_VALIDATION_TEST_MODEL: &str = "claude-sonnet-4.5";
 const DEFAULT_VALIDATION_TEST_PROMPT: &str = "hi";
 const MAX_MANUAL_MODEL_ID_LEN: usize = 160;
 const USAGE_CLEANUP_DEFAULT_MAX_BATCHES: usize = 10_000;
@@ -1263,6 +1263,15 @@ impl AdminService {
         credentials.canonicalize_auth_method();
         credentials.normalize_supported_models();
         credentials.normalize_external_idp_defaults();
+        if credentials.api_region.as_deref().is_none_or(str::is_empty) {
+            if let Some(region) = credentials
+                .profile_arn
+                .as_deref()
+                .and_then(profile_arn_region)
+            {
+                credentials.api_region = Some(region.to_string());
+            }
+        }
         Ok(credentials)
     }
 

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { CheckCircle2, Loader2, Play, RotateCw, XCircle } from 'lucide-react'
 import { toast } from 'sonner'
 import {
@@ -12,8 +12,15 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { useTestCredential } from '@/hooks/use-credentials'
+import { useModelCapabilities } from '@/hooks/use-usage'
 import { extractErrorMessage } from '@/lib/utils'
-import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, TEST_MODELS, testModelLabel } from '@/lib/test-models'
+import {
+  buildTestModelOptions,
+  defaultTestModelForOptions,
+  DEFAULT_TEST_MODEL,
+  DEFAULT_TEST_PROMPT,
+  testModelLabel,
+} from '@/lib/test-models'
 import type { CredentialStatusItem, TestCredentialResponse } from '@/types/api'
 
 interface CredentialTestDialogProps {
@@ -38,15 +45,22 @@ export function CredentialTestDialog({
   open,
   onOpenChange,
 }: CredentialTestDialogProps) {
+  const modelCapabilities = useModelCapabilities()
   const [model, setModel] = useState(DEFAULT_TEST_MODEL)
   const [prompt, setPrompt] = useState(DEFAULT_TEST_PROMPT)
   const [result, setResult] = useState<TestCredentialResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const userSelectedModelRef = useRef(false)
   const testCredential = useTestCredential()
+  const modelOptions = useMemo(
+    () => buildTestModelOptions(modelCapabilities.data?.models, credential?.supportedModels),
+    [modelCapabilities.data?.models, credential?.supportedModels]
+  )
+  const defaultModel = defaultTestModelForOptions(modelOptions)
 
   const selectedModelLabel = useMemo(
-    () => testModelLabel(model),
-    [model]
+    () => modelOptions.find((option) => option.id === model)?.label || testModelLabel(model),
+    [model, modelOptions]
   )
 
   useEffect(() => {
@@ -55,8 +69,20 @@ export function CredentialTestDialog({
     }
     setResult(null)
     setError(null)
+    setModel(defaultModel)
     setPrompt(DEFAULT_TEST_PROMPT)
+    userSelectedModelRef.current = false
   }, [open, credential?.id])
+
+  useEffect(() => {
+    if (!open || userSelectedModelRef.current) return
+    setModel(defaultModel)
+  }, [open, defaultModel])
+
+  const selectModel = (value: string) => {
+    userSelectedModelRef.current = true
+    setModel(value)
+  }
 
   const handleRun = () => {
     if (!credential) {
@@ -128,11 +154,11 @@ export function CredentialTestDialog({
                 <span className="text-sm font-medium">选择测试模型</span>
                 <select
                   value={model}
-                  onChange={(event) => setModel(event.target.value)}
+                  onChange={(event) => selectModel(event.target.value)}
                   disabled={isRunning}
                   className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                  {TEST_MODELS.map((option) => (
+                  {modelOptions.map((option) => (
                     <option key={option.id} value={option.id}>
                       {option.label}
                     </option>

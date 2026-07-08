@@ -47,7 +47,12 @@ import {
   useConfirm,
 } from '@/components/patterns'
 import { formatCompact, formatCredits, formatFullDate, formatNumber } from '@/lib/format'
-import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
+import {
+  buildTestModelOptions,
+  defaultTestModelForOptions,
+  DEFAULT_TEST_PROMPT,
+  testModelLabel,
+} from '@/lib/test-models'
 import { extractErrorMessage } from '@/lib/utils'
 import {
   useCredentialList,
@@ -67,6 +72,7 @@ import {
   useSetLoadBalancingMode,
 } from '@/hooks/use-credentials'
 import { useDebouncedValue } from '@/hooks/use-debounced-value'
+import { useModelCapabilities } from '@/hooks/use-usage'
 import type {
   CredentialAccountInfoItem,
   CredentialSortBy,
@@ -126,6 +132,7 @@ const SORT_OPTIONS: Array<{ value: CredentialSortBy; label: string }> = [
 // ============================================================================
 
 export function CredentialsPage() {
+  const modelCapabilities = useModelCapabilities()
   const [page, setPage] = useState(1)
   const [allExpanded, setAllExpanded] = useState(true)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
@@ -153,6 +160,11 @@ export function CredentialsPage() {
   const [creditDetailsLoading, setCreditDetailsLoading] = useState(false)
   const [creditDetailRows, setCreditDetailRows] = useState<CreditDetailRow[]>([])
   const cancelVerifyRef = useRef(false)
+  const testModelOptions = useMemo(
+    () => buildTestModelOptions(modelCapabilities.data?.models),
+    [modelCapabilities.data?.models]
+  )
+  const batchTestModel = defaultTestModelForOptions(testModelOptions)
 
   const confirmDialog = useConfirm()
   const queryClient = useQueryClient()
@@ -454,7 +466,7 @@ export function CredentialsPage() {
       const id = ids[i]
       setVerifyResults((prev) => new Map(prev).set(id, { id, status: 'verifying' }))
       try {
-        const res = await testCredential(id, { model: DEFAULT_TEST_MODEL, prompt: DEFAULT_TEST_PROMPT })
+        const res = await testCredential(id, { model: batchTestModel, prompt: DEFAULT_TEST_PROMPT })
         success++
         setVerifyResults((prev) => new Map(prev).set(id, { id, status: 'success', model: testModelLabel(res.model), response: res.response }))
       } catch (e) {
@@ -872,6 +884,7 @@ export function CredentialsPage() {
         verifying={verifying}
         progress={verifyProgress}
         results={verifyResults}
+        testModel={batchTestModel}
         onCancel={() => { cancelVerifyRef.current = true; setVerifying(false) }}
         onClose={() => setVerifyOpen(false)}
       />

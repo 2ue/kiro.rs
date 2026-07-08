@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { CheckCircle2, Loader2, Play, RotateCw, XCircle } from 'lucide-react'
 import { toast } from 'sonner'
 import { testExternalPool } from '@/api/credentials'
 import { useModelCapabilities } from '@/hooks/use-usage'
 import { extractErrorMessage } from '@/lib/utils'
-import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, TEST_MODELS } from '@/lib/test-models'
+import { buildTestModelOptions, defaultTestModelForOptions, DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT } from '@/lib/test-models'
 import type { ExternalPool, ExternalPoolTestResponse } from '@/types/api'
 import { ModalShell } from '@/components/patterns'
 import { Badge, Button, Input, Label } from '@/components/ui'
@@ -33,22 +33,12 @@ export function ExternalPoolTestModal({
   const [result, setResult] = useState<ExternalPoolTestResponse | null>(null)
   const [error, setError] = useState('')
   const [running, setRunning] = useState(false)
+  const userSelectedModelRef = useRef(false)
 
   const modelOptions = useMemo(() => {
-    const seen = new Set<string>()
-    const options: { id: string; label: string }[] = []
-    const push = (id: string, label: string) => {
-      const key = id.trim()
-      if (!key || seen.has(key)) return
-      seen.add(key)
-      options.push({ id: key, label })
-    }
-    TEST_MODELS.forEach((item) => push(item.id, item.label))
-    ;[...(modelCapabilities.data?.models || [])]
-      .sort((a, b) => a.model.localeCompare(b.model))
-      .forEach((item) => push(item.model, item.displayName || item.model))
-    return options
-  }, [modelCapabilities.data?.models])
+    return buildTestModelOptions(modelCapabilities.data?.models, pool?.supportedModels)
+  }, [modelCapabilities.data?.models, pool?.supportedModels])
+  const defaultModel = defaultTestModelForOptions(modelOptions)
 
   const selectedModelLabel = useMemo(
     () => modelOptions.find((o) => o.id === model)?.label || model,
@@ -57,12 +47,23 @@ export function ExternalPoolTestModal({
 
   useEffect(() => {
     if (!open) return
-    setModel(DEFAULT_TEST_MODEL)
+    setModel(defaultModel)
     setPrompt(DEFAULT_TEST_PROMPT)
     setResult(null)
     setError('')
     setRunning(false)
+    userSelectedModelRef.current = false
   }, [open, pool?.id])
+
+  useEffect(() => {
+    if (!open || userSelectedModelRef.current) return
+    setModel(defaultModel)
+  }, [open, defaultModel])
+
+  const selectModel = (value: string) => {
+    userSelectedModelRef.current = true
+    setModel(value)
+  }
 
   const run = async () => {
     if (!pool) return
@@ -113,7 +114,7 @@ export function ExternalPoolTestModal({
           <div className="grid gap-3 sm:grid-cols-[1fr_200px]">
             <div className="space-y-1">
               <Label>测试模型</Label>
-              <Select value={model} onValueChange={setModel} disabled={running}>
+              <Select value={model} onValueChange={selectModel} disabled={running}>
                 <SelectTrigger size="sm"><SelectValue placeholder="选择测试模型" /></SelectTrigger>
                 <SelectContent>
                   {modelOptions.map((option) => (

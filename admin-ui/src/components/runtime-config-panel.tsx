@@ -1403,9 +1403,9 @@ function ReportedUsagePathEditor({
         </div>
       </div>
       <div className="mb-4">
-        <ToggleField
-          title="非流式请求无缓存"
-          description="开启后，命中此路径的非流式请求不做本系统缓存展示，不写入本地缓存状态，返回和记录都按无缓存 usage 口径；流式请求保持原策略。"
+      <ToggleField
+          title="非流式 Usage 透传"
+          description="开启后，命中此路径的非流式请求不做本系统 usage 投影、input 采样或补偿，也不推进本地缓存状态；外部池同步响应保持上游 usage 原样，本地凭证使用上游原始 metadata usage；流式请求保持原策略。"
           checked={Boolean(value.skipNonStreamUsageProjection)}
           onCheckedChange={(skipNonStreamUsageProjection) =>
             onChange({ ...value, skipNonStreamUsageProjection })
@@ -1896,9 +1896,9 @@ function NonStreamCacheToggle({
   const policy = value ?? defaultUsagePatch(fallbackPrefix)
   return (
     <div className="rounded-lg border bg-muted/20 p-4">
-      <ToggleField
-        title="非流式请求无缓存"
-        description="开启后，命中此路径的非流式请求不做本系统缓存展示，不写入本地缓存状态，返回和记录都按无缓存 usage 口径；流式请求保持原策略。"
+        <ToggleField
+        title="非流式 Usage 透传"
+        description="开启后，命中此路径的非流式请求不做本系统 usage 投影、input 采样或补偿，也不推进本地缓存状态；外部池同步响应保持上游 usage 原样，本地凭证使用上游原始 metadata usage；流式请求保持原策略。"
         checked={Boolean(policy.skipNonStreamUsageProjection)}
         onCheckedChange={(skipNonStreamUsageProjection) =>
           onChange({ ...policy, skipNonStreamUsageProjection })
@@ -3553,9 +3553,9 @@ export function RuntimeConfigPanel() {
             </label>
             <label className="block rounded-md border bg-background p-4">
               <div className="mb-3">
-                <div className="text-sm font-medium">外部池默认流式 Usage 处理</div>
+                <div className="text-sm font-medium">外部池默认流式响应 Usage 返回</div>
                 <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                  作为外部池默认值；单个外部池可以覆盖。默认只在 usage event 按路径缓存策略整形下游字段，普通 SSE event 仍事件级透传。
+                  作为外部池默认值；单个外部池可以覆盖。默认事件级透传普通 SSE，只在实际有缓存读写时按入口策略投影流式 usage。
                 </div>
               </div>
               <select
@@ -3573,7 +3573,7 @@ export function RuntimeConfigPanel() {
                   }))
                 }
               >
-                <option value="event_passthrough_usage_rewrite">事件透传 + Usage 按路径整形</option>
+                <option value="event_passthrough_usage_rewrite">事件透传，usage 按入口投影</option>
                 <option value="event_passthrough_capture">事件完全透传，仅内部计量</option>
               </select>
             </label>

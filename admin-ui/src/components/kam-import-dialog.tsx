@@ -10,6 +10,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential, useDeleteCredential, useProxyResources } from '@/hooks/use-credentials'
+import { useModelCapabilities } from '@/hooks/use-usage'
 import {
   CredentialParameterDefaultsPanel,
   initialParameterDefaults,
@@ -18,7 +19,12 @@ import {
 } from '@/components/credential-parameter-defaults'
 import { getCredentialBalance, setCredentialDisabled, testCredential } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
-import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, testModelLabel } from '@/lib/test-models'
+import {
+  buildTestModelOptions,
+  defaultTestModelForOptions,
+  DEFAULT_TEST_PROMPT,
+  testModelLabel,
+} from '@/lib/test-models'
 import { camelizeKeys } from '@/lib/object-keys'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -97,7 +103,8 @@ function timestampToIsoString(value: number): string | undefined {
 
 async function verifyImportedCredential(
   credentialId: number,
-  mode: ImportVerificationMode
+  mode: ImportVerificationMode,
+  model: string
 ): Promise<{ model: string; response: string }> {
   if (mode === 'subscription_only') {
     const info = await getCredentialBalance(credentialId)
@@ -108,7 +115,7 @@ async function verifyImportedCredential(
   }
 
   const testResult = await testCredential(credentialId, {
-    model: DEFAULT_TEST_MODEL,
+    model,
     prompt: DEFAULT_TEST_PROMPT,
   })
   try {
@@ -254,6 +261,12 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   const { mutateAsync: deleteCredential } = useDeleteCredential()
   const proxyResources = useProxyResources()
   const proxyResourceOptions = (proxyResources.data?.resources || []).filter(resource => resource.enabled)
+  const modelCapabilities = useModelCapabilities()
+  const testModelOptions = useMemo(
+    () => buildTestModelOptions(modelCapabilities.data?.models),
+    [modelCapabilities.data?.models]
+  )
+  const importTestModel = defaultTestModelForOptions(testModelOptions)
 
   const rollbackCredential = async (id: number): Promise<{ success: boolean; error?: string }> => {
     try {
@@ -444,7 +457,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
           await new Promise(resolve => setTimeout(resolve, 1000))
 
-          const verification = await verifyImportedCredential(addedCred.credentialId, verificationMode)
+          const verification = await verifyImportedCredential(addedCred.credentialId, verificationMode, importTestModel)
 
           successCount++
           existingTokenHashes.add(tokenHash)

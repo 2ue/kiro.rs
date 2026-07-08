@@ -247,7 +247,7 @@ fn default_external_idp_scopes(client_id: &str) -> String {
     )
 }
 
-fn profile_arn_region(profile_arn: &str) -> Option<&str> {
+pub(crate) fn profile_arn_region(profile_arn: &str) -> Option<&str> {
     let parts: Vec<&str> = profile_arn.trim().splitn(6, ':').collect();
     if parts.len() < 6 || parts[0] != "arn" || parts[2] != "codewhisperer" {
         return None;

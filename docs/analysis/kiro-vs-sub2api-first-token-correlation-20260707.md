@@ -184,26 +184,26 @@
 - 旧逻辑还会检查并屏蔽外部池流式错误事件，避免把内部池、凭证、fallback 等信息暴露给客户端。
 - 因为必须保留错误屏蔽，不能简单改成完全字节级 raw chunk 透传；否则上游中途返回的错误 event 可能泄露内部信息或破坏统一错误格式。
 
-因此，本次优化选择的是“event 级透传 + usage 阶段处理”，不是无条件 raw chunk 透传。普通 SSE event 不重序列化；只有 usage event 按配置进入下游整形或仅内部捕获。
+因此，本次优化选择的是“event 级透传 + usage 阶段处理”，不是无条件 raw chunk 透传。普通 SSE event 不重序列化；只有 usage event 按配置进入下游投影或仅内部捕获。
 
 ### 本次实施的优化
 
 新增全局配置：
 
 - 后端字段：`externalPools.externalPoolStreamResponseMode`
-- 页面入口：新旧运行配置页的“外部池默认流式 Usage 处理”
+- 页面入口：新旧运行配置页的“外部池默认流式响应 Usage 返回”
 - 可选值：
-  - `event_passthrough_usage_rewrite`：默认值。普通文本、thinking、tool 等 SSE event 原样下发给客户端；流式 `message_start.message.usage` 和最终 `message_delta.usage` 会按当前路径缓存策略整形下游可见字段，并同时记录内部费用/历史。`message_start.message.usage` 只做预览整形，不提交缓存状态，避免只有 start usage 的异常流污染下一次请求。
+  - `event_passthrough_usage_rewrite`：默认值。普通文本、thinking、tool 等 SSE event 原样下发给客户端；流式 `message_start.message.usage` 和最终 `message_delta.usage` 在实际有本系统 cache read/write 时按当前路径缓存策略投影下游可见字段，并同时记录内部费用/历史。`message_start.message.usage` 只做预览投影，不提交缓存状态，避免只有 start usage 的异常流污染下一次请求。若本地模拟没有任何 cache read/write，则 usage 保持上游 raw 口径，避免出现 input 被采样到极小但读写缓存均为 0 的伪缓存口径。
   - `event_passthrough_capture`：排查模式。普通 SSE event、`message_start.message.usage` 和最终 usage 都保持上游原样下发，只在内部捕获并按当前路径策略记录费用/历史；流式错误 event 仍会被本地屏蔽。
 
 新增单池覆盖字段：
 
 - 后端字段：`external_upstream_pools.stream_response_mode`
 - API 字段：`externalPool.streamResponseMode`
-- 页面入口：新旧外部账号编辑弹窗的“流式 Usage 处理”
+- 页面入口：新旧外部账号编辑弹窗的“流式响应 Usage 返回”
 - `NULL`/未配置表示继承全局默认。
 
-默认 `event_passthrough_usage_rewrite` 满足下游 usage 仍符合当前路径缓存策略的要求，同时避免对普通文本、thinking、tool 等 SSE event 做重序列化。`event_passthrough_capture` 只适合协议对比和上游排查，因为它会让下游看到上游原始 usage，不满足“下游返回符合路径配置的缓存 usage”这个主要求。
+默认 `event_passthrough_usage_rewrite` 在存在实际 cache read/write 时满足下游 usage 符合当前路径缓存策略的要求，同时避免对普通文本、thinking、tool 等 SSE event 做重序列化。`event_passthrough_capture` 只适合协议对比和上游排查，因为它会让下游看到上游原始 usage，不满足“有缓存读写时下游返回符合路径配置的缓存 usage”这个主要求。
 
 本次还增加了外部池 SSE event 缓冲上限：
 
@@ -247,30 +247,42 @@
 
 ## 2026-07-08 运行配置归属更正
 
-### 非流式请求无缓存
+### 非流式 Usage 透传
 
-之前“非流请求不整形”这个名字容易误导，实际应归入缓存策略里的 usage/cache 展示行为，而不是外部池或兼容模式。
+之前“非流请求不整形”或“非流式请求无缓存”这些名字容易误导，实际应归入缓存策略里的 usage/cache 展示行为，而不是外部池或兼容模式。准确语义是：命中该策略的非流式请求不做本系统 usage 投影，尽量透传上游 usage。
 
 当前正确口径是：
 
 - 配置字段：`reportedUsage.*.skipNonStreamUsageProjection`，在新的 `cachePolicy` 路径策略里也会作为 `reportedUsage` 子配置保存。
-- 页面文案：`非流式请求无缓存`。
+- 页面文案：`非流式 Usage 透传`。
 - 生效范围：只影响命中该路径/策略的非流式请求。
-- 具体效果：非流式请求不做本系统缓存展示投影，不写入本地缓存状态，返回和历史记录尽量按无缓存 usage 口径处理。
+- 具体效果：非流式请求不做本系统 usage 投影、input 采样或补偿，不写入本地缓存状态；外部池同步响应保持上游 usage 原样，本地凭证使用上游 metadata 原始 usage。
 - 不影响：流式请求继续按该路径原有缓存/usage 策略执行；外部池流式响应的 usage rewrite/capture 模式也不由这个开关控制。
 
 这解释了“打开后是不是所有非流请求都没有缓存”的边界：不是全局所有非流请求，而是命中对应默认策略或路径覆盖的非流请求。要让所有内置入口都这么做，需要在默认策略或每个内置路径策略上开启；要只影响 `/cc`、`/ha`、`/dfcache/{name}`，就在对应路径上开启。
+
+### NoCache 的最终语义
+
+`cacheType=no_cache` 不应再表示“只是不维护本地缓存状态，但仍允许 reported usage 整形”。正确语义是：该路径不进入本系统 prompt-cache 计算，也不执行 reported usage 字段投影。
+
+因此，NoCache 现在必须满足：
+
+- 流式和非流式都不生成 `ReportedCacheUsagePolicy`。
+- 即使配置里历史遗留了 `reportedUsage.input/cacheRead/cacheCreation/output`，NoCache 路径也忽略这些字段。
+- 外部池即使单个账号设置了 `usageProjectionMode=current_path_policy`，命中 NoCache 路径时也不构建 usage projection context。
+- 下游 usage 优先保持上游原始 usage；没有上游 usage 时才允许使用普通无缓存估算兜底。
+- NoCache 不会强制第一次请求展示 cache write；没有真实 cache read/write 时，`cache_read_input_tokens=0`、`cache_creation_input_tokens=0` 是合理的。
 
 ### 兼容模式与请求体处理的边界
 
 用户质疑“很多兼容开关实际影响请求体处理，不应该都放在兼容行为里”是正确的。现在应按实际影响面拆分：
 
 - 请求体处理页：压缩、payload guard、图片展开/下载/base64 修复、工具 schema 规范化、工具名映射、tool_choice 引导、历史 thinking 处理、tool_result 配对修复等。这些会改变发往上游的请求体。
-- 缓存策略页：本地模拟缓存、Kiro-RS Tool 缓存、reported usage 字段策略、非流式请求无缓存、路径覆盖。这些改变 usage/cache 展示和本地缓存状态。
+- 缓存策略页：本地模拟缓存、Kiro-RS Tool 缓存、reported usage 字段策略、非流式 Usage 透传、路径覆盖。这些改变 usage/cache 展示和本地缓存状态。
 - 模型解析页：模型名解析、别名/映射规则、自动生成规则。这些改变模型路由和上游模型名。
-- 接口兼容页：客户端接口 profile、Kiro 工作模式、thinking 输出展示、代理告警、外部池默认流式 Usage 处理。这些主要改变响应/协议兼容和诊断行为。
+- 接口兼容页：客户端接口 profile、Kiro 工作模式、thinking 输出展示、代理告警、外部池默认流式响应 Usage 返回。这些主要改变响应/协议兼容和诊断行为。
 
-因此，本次新增的全局 `externalPoolStreamResponseMode` 放在“接口兼容/外部池默认流式 Usage 处理”是合理的：它不改变请求体，也不决定路径缓存策略；它只决定外部池流式响应里的 usage 字段是下游整形还是仅内部捕获。单个外部账号可以覆盖这个默认值。
+因此，本次新增的全局 `externalPoolStreamResponseMode` 放在“接口兼容/外部池默认流式响应 Usage 返回”是合理的：它不改变请求体，也不决定路径缓存策略；它只决定外部池流式响应里的 usage 字段是下游投影还是仅内部捕获。单个外部账号可以覆盖这个默认值。
 
 ### supportedModels 的合理配置
 

@@ -689,10 +689,12 @@ pub struct ReportedUsagePathPolicy {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
-    /// 命中该路径的非流式请求是否禁用本系统缓存投影和本地缓存状态推进。
+    /// 命中该路径的非流式请求是否透传上游 usage。
     ///
-    /// 该字段保留旧的 usage projection 命名以兼容现有配置。开启后，非流式请求按无缓存
-    /// 口径返回和记录 usage，且不会读取或写入本地 prompt-cache 状态；流式请求不受影响。
+    /// 该字段保留旧的 usage projection 命名以兼容现有配置。开启后，非流式请求不进入
+    /// 本系统 usage 字段投影、采样和补偿，也不会读取或写入本地 prompt-cache 状态；
+    /// 外部池非流式响应会保持上游 usage 原样返回，本地凭证会使用上游 metadata 原始 usage。
+    /// 流式请求不受影响。
     /// 全局策略模板里开启会影响继承该模板的路径，路径级配置可单独覆盖。
     #[serde(default)]
     pub skip_non_stream_usage_projection: bool,
@@ -1608,9 +1610,7 @@ impl CacheRoutePolicyPatch {
     }
 
     fn apply_no_cache_fields_to(&self, mut policy: CacheRoutePolicy) -> CacheRoutePolicy {
-        if let Some(reported_usage) = &self.reported_usage {
-            policy.reported_usage = reported_usage.normalized();
-        }
+        policy.reported_usage = ReportedUsagePathPolicy::disabled().normalized();
         policy.normalized()
     }
 
@@ -1809,7 +1809,7 @@ impl CachePolicyConfig {
                 ..base.creation_control
             }
             .normalized(),
-            reported_usage: base.reported_usage,
+            reported_usage: ReportedUsagePathPolicy::disabled().normalized(),
             cache_point: CachePointPolicy {
                 enabled: false,
                 ..base.cache_point
@@ -4806,8 +4806,15 @@ mod tests {
         assert_ne!(plain.policy.simulation.token_scale, 2.0);
         assert!(!plain.policy.creation_control.enabled);
         assert!(!plain.policy.cache_point.enabled);
-        assert_eq!(plain.policy.reported_usage.input.max_tokens, 111);
-        assert_eq!(plain.policy.reported_usage.output.max_tokens, 22);
+        assert!(!plain.policy.reported_usage.enabled);
+        assert_eq!(
+            plain.policy.reported_usage.input.mode,
+            ReportedUsageFieldMode::Raw
+        );
+        assert_eq!(
+            plain.policy.reported_usage.output.mode,
+            ReportedUsageFieldMode::Raw
+        );
         assert_ne!(plain.policy.bounds.max_entries_per_account, 2);
         assert_ne!(plain.policy.kiro_rs_tool.coverage_ratio, 0.2);
 
@@ -5211,6 +5218,7 @@ mod tests {
         assert!(!resolved.policy.simulation.enabled);
         assert!(!resolved.policy.creation_control.enabled);
         assert!(!resolved.policy.cache_point.enabled);
+        assert!(!resolved.policy.reported_usage.enabled);
     }
 
     #[test]

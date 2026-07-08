@@ -175,21 +175,21 @@ export function ExternalPoolFormModal({
             </div>
           </FormSection>
 
-          <FormSection title="用量与成本" description="只控制当前外部账号返回给客户端的用量展示方式。">
+          <FormSection title="Usage 投影" description="只决定当前外部账号的 usage 是否按入口缓存策略改写；非 usage 内容不受影响。">
             <div className="space-y-3">
-              <SelectBox label="用量展示模式" value={draft.usageProjectionMode} disabled={saving} onChange={(v) => set('usageProjectionMode', v as ExternalPoolFormDraft['usageProjectionMode'])}>
-                <SelectItem value="pass_through">保持原样：不改外部账号用量</SelectItem>
-                <SelectItem value="current_path_policy">按入口规则展示：应用全局补偿</SelectItem>
+              <SelectBox label="Usage 投影策略" value={draft.usageProjectionMode} disabled={saving} onChange={(v) => set('usageProjectionMode', v as ExternalPoolFormDraft['usageProjectionMode'])}>
+                <SelectItem value="pass_through">上游原样：不改 usage</SelectItem>
+                <SelectItem value="current_path_policy">按入口策略投影：应用全局补偿</SelectItem>
               </SelectBox>
               <HintBox>{usageProjectionDescription(draft.usageProjectionMode)}</HintBox>
               <SelectBox
-                label="流式 Usage 处理"
+                label="流式响应 Usage 返回"
                 value={draft.streamResponseMode}
                 disabled={saving}
                 onChange={(v) => set('streamResponseMode', v as ExternalPoolFormDraft['streamResponseMode'])}
               >
                 <SelectItem value="inherit">继承全局默认</SelectItem>
-                <SelectItem value="event_passthrough_usage_rewrite">事件透传 + Usage 按路径整形</SelectItem>
+                <SelectItem value="event_passthrough_usage_rewrite">事件透传，usage 按入口投影</SelectItem>
                 <SelectItem value="event_passthrough_capture">事件完全透传，仅内部计量</SelectItem>
               </SelectBox>
               <HintBox>{streamResponseDescription(draft.streamResponseMode)}</HintBox>

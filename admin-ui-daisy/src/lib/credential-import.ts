@@ -16,6 +16,13 @@ function stringField(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined
 }
 
+function profileArnRegion(profileArn: string | undefined): string | undefined {
+  if (!profileArn) return undefined
+  const parts = profileArn.trim().split(':')
+  if (parts.length < 6 || parts[0] !== 'arn' || parts[2] !== 'codewhisperer') return undefined
+  return parts[3]?.trim() || undefined
+}
+
 function stringLikeField(value: unknown): string | undefined {
   if (typeof value === 'string' && value.trim()) {
     const trimmed = value.trim()
@@ -106,7 +113,10 @@ export function normalizeCredentialImportItem(value: unknown): AddCredentialRequ
     stringField(normalized.authRegion) ??
     stringField(nested?.authRegion) ??
     region
-  const apiRegion = stringField(normalized.apiRegion) ?? stringField(nested?.apiRegion)
+  const apiRegion =
+    stringField(normalized.apiRegion) ??
+    stringField(nested?.apiRegion) ??
+    profileArnRegion(profileArn)
   const rawAuthMethod = authMethodField(normalized.authMethod) ?? authMethodField(nested?.authMethod)
   const authMethod: AddCredentialRequest['authMethod'] = kiroApiKey
     ? 'api_key'
