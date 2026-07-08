@@ -2,6 +2,12 @@ FROM node:22-alpine AS frontend-builder
 
 RUN npm install -g pnpm
 
+WORKDIR /app/admin-ui
+COPY admin-ui/package.json admin-ui/pnpm-lock.yaml admin-ui/.npmrc admin-ui/pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY admin-ui ./
+RUN pnpm build
+
 WORKDIR /app/ui
 COPY ui/package.json ui/pnpm-lock.yaml ui/.npmrc ui/pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
@@ -26,6 +32,7 @@ RUN mkdir -p src && printf 'fn main() {}\n' > src/main.rs && cargo fetch --locke
 
 COPY src ./src
 COPY data ./data
+COPY --from=frontend-builder /app/admin-ui/dist /app/admin-ui/dist
 COPY --from=frontend-builder /app/ui/dist /app/ui/dist
 RUN cargo build --release --locked --no-default-features
 
