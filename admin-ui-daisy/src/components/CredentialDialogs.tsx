@@ -1378,6 +1378,8 @@ export function BatchEditCredentialsModal({
   const [concurrencyValue, setConcurrencyValue] = useState('')
   const [updateRpm, setUpdateRpm] = useState(false)
   const [rpmValue, setRpmValue] = useState('')
+  const [updateRateLimitAutoDisable, setUpdateRateLimitAutoDisable] = useState(false)
+  const [rateLimitAutoDisableEnabled, setRateLimitAutoDisableEnabled] = useState(true)
   const [updateProxy, setUpdateProxy] = useState(false)
   const [proxyResourceId, setProxyResourceId] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
@@ -1433,6 +1435,8 @@ export function BatchEditCredentialsModal({
       setConcurrencyValue('')
       setUpdateRpm(false)
       setRpmValue('')
+      setUpdateRateLimitAutoDisable(false)
+      setRateLimitAutoDisableEnabled(true)
       setUpdateProxy(false)
       setProxyResourceId('')
       setProxyUrl('')
@@ -1445,7 +1449,7 @@ export function BatchEditCredentialsModal({
 
   const submit = () => {
     if (!ids.length) return toast.error('请先选择要修改的账号')
-    if (!updatePriority && !updateRegions && !updateConcurrency && !updateRpm && !updateProxy) return toast.error('请选择至少一组要修改的参数')
+    if (!updatePriority && !updateRegions && !updateConcurrency && !updateRpm && !updateRateLimitAutoDisable && !updateProxy) return toast.error('请选择至少一组要修改的参数')
 
     const request: BatchUpdateCredentialsRequest = { ids }
     if (updatePriority) {
@@ -1488,6 +1492,10 @@ export function BatchEditCredentialsModal({
       } catch (error) {
         return toast.error(extractErrorMessage(error))
       }
+    }
+
+    if (updateRateLimitAutoDisable) {
+      request.rateLimitAutoDisable = { enabled: rateLimitAutoDisableEnabled }
     }
 
     if (updateProxy) {
@@ -1578,6 +1586,17 @@ export function BatchEditCredentialsModal({
           <FieldLabel title="账号级 RPM" description="留空改为继承全局，0 表示不限频率。">
             <Input bordered size="sm" type="number" min={0} value={rpmValue} disabled={!updateRpm || batchUpdate.isPending} onChange={(event) => setRpmValue(event.target.value)} />
           </FieldLabel>
+        </div>
+
+        <div className={`rounded-lg border p-3 ${updateRateLimitAutoDisable ? 'border-primary/40 bg-primary/5' : 'border-base-300 bg-base-200/40'}`}>
+          <Form.Label className="mb-3 flex w-fit cursor-pointer items-center gap-2">
+            <Checkbox size="sm" checked={updateRateLimitAutoDisable} disabled={batchUpdate.isPending} onChange={(event) => setUpdateRateLimitAutoDisable(event.target.checked)} />
+            <span className="text-sm font-semibold">修改 429 自动禁用</span>
+          </Form.Label>
+          <Form.Label className="flex w-fit cursor-pointer items-center gap-2 text-sm">
+            <Checkbox size="sm" checked={rateLimitAutoDisableEnabled} disabled={!updateRateLimitAutoDisable || batchUpdate.isPending} onChange={(event) => setRateLimitAutoDisableEnabled(event.target.checked)} />
+            429 临时风控自动禁用账号
+          </Form.Label>
         </div>
 
         <div className={`rounded-lg border p-3 ${updateProxy ? 'border-primary/40 bg-primary/5' : 'border-base-300 bg-base-200/40'}`}>

@@ -943,9 +943,10 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
     authRegion: '',
     apiRegion: '',
   })
+  const [rateLimitAutoDisableEnabled, setRateLimitAutoDisableEnabled] = useState(true)
   const [showProxyUsername, setShowProxyUsername] = useState(false)
   const [showProxyPassword, setShowProxyPassword] = useState(false)
-  const [enableFields, setEnableFields] = useState({ priority: false, concurrency: false, rpm: false, proxy: false, regions: false })
+  const [enableFields, setEnableFields] = useState({ priority: false, concurrency: false, rpm: false, rateLimitAutoDisable: false, proxy: false, regions: false })
   const batchUpdate = useBatchUpdateCredentials()
   const proxyResources = useProxyResources()
   const proxyOptions = proxyResources.data?.resources || []
@@ -963,7 +964,8 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
   useEffect(() => {
     if (!open) {
       setFields({ priority: '', concurrency: '', rpm: '', proxyResourceId: '', proxyUrl: '', proxyUsername: '', proxyPassword: '', region: '', authRegion: '', apiRegion: '' })
-      setEnableFields({ priority: false, concurrency: false, rpm: false, proxy: false, regions: false })
+      setRateLimitAutoDisableEnabled(true)
+      setEnableFields({ priority: false, concurrency: false, rpm: false, rateLimitAutoDisable: false, proxy: false, regions: false })
       setShowProxyUsername(false)
       setShowProxyPassword(false)
     }
@@ -1023,6 +1025,9 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
       }
       req.rpm = { rpm }
     }
+    if (enableFields.rateLimitAutoDisable) {
+      req.rateLimitAutoDisable = { enabled: rateLimitAutoDisableEnabled }
+    }
     batchUpdate.mutate(req, {
       onSuccess: (res) => {
         toast.success(`批量修改完成：成功 ${res.success}，失败 ${res.failed}`)
@@ -1081,6 +1086,21 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
                     onChange={(e) => setFields((p) => ({ ...p, rpm: e.target.value }))}
                     placeholder="留空继承全局"
                   />
+                </div>
+              </Field>
+              <Field label="429自动禁用" description="关闭后，429 临时风控只进入冷却，不自动禁用">
+                <div className="flex items-center gap-2">
+                  <Checkbox checked={enableFields.rateLimitAutoDisable} onCheckedChange={(v) => setEnableFields((p) => ({ ...p, rateLimitAutoDisable: Boolean(v) }))} id="batch-rate-limit-auto-disable" />
+                  <label htmlFor="batch-rate-limit-auto-disable" className="sr-only">修改 429 自动禁用</label>
+                  <Checkbox
+                    checked={rateLimitAutoDisableEnabled}
+                    disabled={!enableFields.rateLimitAutoDisable || batchUpdate.isPending}
+                    onCheckedChange={(v) => setRateLimitAutoDisableEnabled(Boolean(v))}
+                    id="batch-rate-limit-auto-disable-enabled"
+                  />
+                  <label htmlFor="batch-rate-limit-auto-disable-enabled" className="text-sm">
+                    {rateLimitAutoDisableEnabled ? '开启' : '关闭'}
+                  </label>
                 </div>
               </Field>
             </FieldGrid>

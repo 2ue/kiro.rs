@@ -113,6 +113,8 @@ export function BatchEditCredentialsDialog({
   const [concurrencyValue, setConcurrencyValue] = useState('')
   const [updateRpm, setUpdateRpm] = useState(false)
   const [rpmValue, setRpmValue] = useState('')
+  const [updateRateLimitAutoDisable, setUpdateRateLimitAutoDisable] = useState(false)
+  const [rateLimitAutoDisableEnabled, setRateLimitAutoDisableEnabled] = useState(true)
   const [updateProxy, setUpdateProxy] = useState(false)
   const [proxyResourceId, setProxyResourceId] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
@@ -169,6 +171,8 @@ export function BatchEditCredentialsDialog({
     setConcurrencyValue('')
     setUpdateRpm(false)
     setRpmValue('')
+    setUpdateRateLimitAutoDisable(false)
+    setRateLimitAutoDisableEnabled(true)
     setUpdateProxy(false)
     setProxyResourceId('')
     setProxyUrl('')
@@ -185,7 +189,7 @@ export function BatchEditCredentialsDialog({
       toast.error('请先选择要修改的账号')
       return
     }
-    if (!updatePriority && !updateRegions && !updateConcurrency && !updateRpm && !updateProxy) {
+    if (!updatePriority && !updateRegions && !updateConcurrency && !updateRpm && !updateRateLimitAutoDisable && !updateProxy) {
       toast.error('请选择至少一组要修改的参数')
       return
     }
@@ -245,6 +249,10 @@ export function BatchEditCredentialsDialog({
         toast.error(extractErrorMessage(error))
         return
       }
+    }
+
+    if (updateRateLimitAutoDisable) {
+      request.rateLimitAutoDisable = { enabled: rateLimitAutoDisableEnabled }
     }
 
     if (updateProxy) {
@@ -399,6 +407,23 @@ export function BatchEditCredentialsDialog({
                 onChange={(event) => setRpmValue(event.target.value)}
               />
             </label>
+          </div>
+
+          <div className={`rounded-md border p-3 ${updateRateLimitAutoDisable ? 'border-primary bg-primary/5' : 'bg-muted/20'}`}>
+            <ToggleRow
+              checked={updateRateLimitAutoDisable}
+              disabled={batchUpdate.isPending}
+              label="修改 429 自动禁用"
+              onCheckedChange={setUpdateRateLimitAutoDisable}
+            />
+            <div className="mt-3">
+              <ToggleRow
+                checked={rateLimitAutoDisableEnabled}
+                disabled={!updateRateLimitAutoDisable || batchUpdate.isPending}
+                label="429 临时风控自动禁用账号"
+                onCheckedChange={setRateLimitAutoDisableEnabled}
+              />
+            </div>
           </div>
 
           <div className={`rounded-md border p-3 ${updateProxy ? 'border-primary bg-primary/5' : 'bg-muted/20'}`}>

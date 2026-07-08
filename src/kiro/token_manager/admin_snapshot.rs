@@ -129,6 +129,8 @@ pub struct CredentialEntrySnapshot {
     /// 凭据级 RPM 覆盖值。None 表示继承全局；Some(0) 表示该凭据不限 RPM。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpm_override: Option<u32>,
+    /// 429 临时风控是否自动禁用账号。
+    pub rate_limit_auto_disable_enabled: bool,
     /// 并发占用 lease 自动回收阈值。0 表示关闭自动回收。
     pub in_flight_lease_max_secs: u64,
     /// 预热剩余请求数。
@@ -203,6 +205,7 @@ pub struct CredentialBaseSnapshot {
     pub max_concurrent_requests_override: Option<u32>,
     pub rpm: u32,
     pub rpm_override: Option<u32>,
+    pub rate_limit_auto_disable_enabled: bool,
     pub warmup_remaining: u32,
 }
 
@@ -391,6 +394,7 @@ pub(super) fn base_snapshot_from_entry(
         max_concurrent_requests_override: entry.credentials.max_concurrent_requests,
         rpm: effective_rpm(entry, config.credential_rpm.unwrap_or(0)),
         rpm_override: entry.credentials.rpm,
+        rate_limit_auto_disable_enabled: entry.credentials.rate_limit_auto_disable_enabled(),
         warmup_remaining: entry.warmup_remaining,
     }
 }
@@ -505,6 +509,7 @@ pub(super) fn runtime_snapshot_from_entry(
         max_concurrent_requests_override: entry.credentials.max_concurrent_requests,
         rpm: effective_rpm(entry, config.credential_rpm.unwrap_or(0)),
         rpm_override: entry.credentials.rpm,
+        rate_limit_auto_disable_enabled: entry.credentials.rate_limit_auto_disable_enabled(),
         in_flight_lease_max_secs: lease_max_age
             .map(|duration| duration.as_secs())
             .unwrap_or(0),

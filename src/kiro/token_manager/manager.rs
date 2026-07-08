@@ -5076,6 +5076,39 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 设置 429 临时风控自动禁用开关（Admin API）。
+    pub fn set_credential_rate_limit_auto_disable(
+        &self,
+        id: u64,
+        enabled: bool,
+    ) -> anyhow::Result<()> {
+        let credential = {
+            let entries = self.entries.lock();
+            let entry = entries
+                .iter()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            let mut credential = Self::credential_from_entry(entry);
+            credential.rate_limit_auto_disable_enabled = Some(enabled);
+            credential
+        };
+        self.persist_credential_value(&credential)?;
+
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.rate_limit_auto_disable_enabled =
+                credential.rate_limit_auto_disable_enabled;
+        }
+
+        self.notify_dispatch_state_changed();
+        self.publish_credentials_changed("credential_rate_limit_auto_disable_updated");
+        Ok(())
+    }
+
     /// 设置凭据支持模型列表（Admin API）。
     ///
     /// 空列表表示不限制该凭据可调度的模型。
@@ -6179,11 +6212,9 @@ mod tests {
         )
         .unwrap();
 
-        let result =
-            manager.block_on_scheduler_redis_state_sync("测试 Redis 调度状态同步", async move {
-                tokio::time::sleep(SCHEDULER_REDIS_HOT_OP_TIMEOUT + StdDuration::from_millis(10))
-                    .await;
-                Ok::<(), anyhow::Error>(())
+        let result = manager
+            .block_on_scheduler_redis_state_sync("测试 Redis 调度状态同步", async move {
+                std::future::pending::<anyhow::Result<()>>().await
             });
 
         assert!(result.is_none());

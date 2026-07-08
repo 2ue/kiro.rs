@@ -30,14 +30,15 @@ use super::types::{
     ExternalPoolTestRequest, LoadBalancingModeResponse, ManualModelResponse, ProxyResourceResponse,
     ProxyResourceTestRequest, ProxyResourceTestResponse, ProxyResourcesResponse,
     RefreshCredentialInfoRequest, RequestApiKeyItem, RuntimeConfigResponse,
-    SetCredentialConcurrencyRequest, SetCredentialProxyRequest, SetCredentialRegionsRequest,
-    SetCredentialRpmRequest, SetLoadBalancingModeRequest, SetSupportedModelsRequest,
-    SetWarmupRequest, SupportedModelsResponse, SyncSupportedModelsFromCredentialRequest,
-    TestCredentialRequest, TestCredentialResponse, UpdateAdminApiKeyRequest,
-    UpdateCredentialAuthRequest, UpdateProxyResourceRequest, UpdateRequestApiKeyRequest,
-    UpdateRuntimeConfigRequest, UpsertManualModelRequest, UsageCleanupJobStatus, UsageCleanupMode,
-    UsageCleanupPreviewResponse, UsageCleanupRequest, UsageCleanupStatusResponse,
-    ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
+    SetCredentialConcurrencyRequest, SetCredentialProxyRequest,
+    SetCredentialRateLimitAutoDisableRequest, SetCredentialRegionsRequest, SetCredentialRpmRequest,
+    SetLoadBalancingModeRequest, SetSupportedModelsRequest, SetWarmupRequest,
+    SupportedModelsResponse, SyncSupportedModelsFromCredentialRequest, TestCredentialRequest,
+    TestCredentialResponse, UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest,
+    UpdateProxyResourceRequest, UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest,
+    UpsertManualModelRequest, UsageCleanupJobStatus, UsageCleanupMode, UsageCleanupPreviewResponse,
+    UsageCleanupRequest, UsageCleanupStatusResponse, ValidateExistingCredentialsRequest,
+    ValidateExternalCredentialsRequest,
 };
 use crate::anthropic::{
     model_capabilities::{
@@ -1245,6 +1246,7 @@ impl AdminService {
             priority: req.priority,
             max_concurrent_requests: req.max_concurrent_requests,
             rpm: req.rpm,
+            rate_limit_auto_disable_enabled: req.rate_limit_auto_disable_enabled,
             region: req.region,
             auth_region: req.auth_region,
             api_region: req.api_region,
@@ -1738,6 +1740,26 @@ impl AdminService {
             true,
             None,
             json!({ "rpm": req.rpm }),
+        );
+        Ok(())
+    }
+
+    /// 设置 429 临时风控自动禁用开关
+    pub fn set_credential_rate_limit_auto_disable(
+        &self,
+        id: u64,
+        req: SetCredentialRateLimitAutoDisableRequest,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_credential_rate_limit_auto_disable(id, req.enabled)
+            .map_err(|e| self.classify_error(e, id))?;
+        self.audit(
+            "set_credential_rate_limit_auto_disable",
+            "credential",
+            Some(id.to_string()),
+            true,
+            None,
+            json!({ "enabled": req.enabled }),
         );
         Ok(())
     }
@@ -2936,6 +2958,7 @@ impl AdminService {
             && req.regions.is_none()
             && req.concurrency.is_none()
             && req.rpm.is_none()
+            && req.rate_limit_auto_disable.is_none()
             && req.proxy.is_none()
         {
             return Err(AdminServiceError::InvalidCredential(
@@ -2955,6 +2978,7 @@ impl AdminService {
         });
         let concurrency = req.concurrency.map(|value| value.max_concurrent_requests);
         let rpm = req.rpm.map(|value| value.rpm);
+        let rate_limit_auto_disable = req.rate_limit_auto_disable.map(|value| value.enabled);
         let proxy = match req.proxy {
             Some(proxy) => Some((
                 proxy.proxy_resource_id,
@@ -3022,6 +3046,18 @@ impl AdminService {
             }
 
             if error.is_none() {
+                if let Some(enabled) = rate_limit_auto_disable {
+                    if let Err(err) = self
+                        .token_manager
+                        .set_credential_rate_limit_auto_disable(id, enabled)
+                        .map_err(|e| self.classify_error(e, id))
+                    {
+                        error = Some(err.to_string());
+                    }
+                }
+            }
+
+            if error.is_none() {
                 if let Some((proxy_resource_id, proxy_url, proxy_username, proxy_password)) = &proxy
                 {
                     if let Err(err) = self
@@ -3066,6 +3102,7 @@ impl AdminService {
                 "regions": regions.is_some(),
                 "concurrency": concurrency.is_some(),
                 "rpm": rpm.is_some(),
+                "rateLimitAutoDisable": rate_limit_auto_disable.is_some(),
                 "proxy": proxy.is_some(),
             }),
         );
@@ -4830,6 +4867,11 @@ fn apply_batch_import_defaults(
             credential.rpm = rpm;
         }
     }
+    if credential.rate_limit_auto_disable_enabled.is_none() {
+        if let Some(enabled) = defaults.rate_limit_auto_disable_enabled {
+            credential.rate_limit_auto_disable_enabled = Some(enabled);
+        }
+    }
     if credential.provider.as_deref().is_none_or(str::is_empty) {
         credential.provider = defaults.provider.clone();
     }
@@ -5036,6 +5078,7 @@ fn credential_status_item_from_snapshot(
         max_concurrent_requests_override: entry.max_concurrent_requests_override,
         rpm: entry.rpm,
         rpm_override: entry.rpm_override,
+        rate_limit_auto_disable_enabled: entry.rate_limit_auto_disable_enabled,
         in_flight_lease_max_secs: entry.in_flight_lease_max_secs,
         warmup_remaining: entry.warmup_remaining,
         transient_failure_streak: entry.transient_failure_streak,
@@ -5099,6 +5142,7 @@ fn credential_list_item_from_base(
         max_concurrent_requests_override: credential.max_concurrent_requests_override,
         rpm: credential.rpm,
         rpm_override: credential.rpm_override,
+        rate_limit_auto_disable_enabled: credential.rate_limit_auto_disable_enabled,
         warmup_remaining: credential.warmup_remaining,
     }
 }
@@ -6346,6 +6390,7 @@ mod tests {
             max_concurrent_requests_override: None,
             rpm: 0,
             rpm_override: None,
+            rate_limit_auto_disable_enabled: true,
             in_flight_lease_max_secs: 0,
             warmup_remaining: 0,
             transient_failure_streak: 0,

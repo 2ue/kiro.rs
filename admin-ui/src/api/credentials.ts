@@ -18,6 +18,7 @@ import type {
   SystemVersionResponse,
   SetDisabledRequest,
   SetCredentialConcurrencyRequest,
+  SetCredentialRateLimitAutoDisableRequest,
   SetCredentialRpmRequest,
   SetPriorityRequest,
   SetWarmupRequest,
@@ -248,6 +249,14 @@ export async function setCredentialRpm(
   req: SetCredentialRpmRequest
 ): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/rpm`, req)
+  return data
+}
+
+export async function setCredentialRateLimitAutoDisable(
+  id: number,
+  req: SetCredentialRateLimitAutoDisableRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/rate-limit-auto-disable`, req)
   return data
 }
 

@@ -27,6 +27,7 @@ import {
   useSetCredentialProxy,
   useSetCredentialConcurrency,
   useSetCredentialRpm,
+  useSetCredentialRateLimitAutoDisable,
   useSetCredentialRegions,
   useSetCredentialSupportedModels,
   useSyncCredentialSupportedModels,
@@ -277,6 +278,7 @@ export function CredentialCard({
   const setCredentialProxy = useSetCredentialProxy()
   const setCredentialConcurrency = useSetCredentialConcurrency()
   const setCredentialRpm = useSetCredentialRpm()
+  const setCredentialRateLimitAutoDisable = useSetCredentialRateLimitAutoDisable()
   const setCredentialRegions = useSetCredentialRegions()
   const setCredentialSupportedModels = useSetCredentialSupportedModels()
   const syncCredentialSupportedModels = useSyncCredentialSupportedModels()
@@ -486,6 +488,16 @@ export function CredentialCard({
     )
   }
 
+  const toggleRateLimitAutoDisable = (enabled: boolean) => {
+    setCredentialRateLimitAutoDisable.mutate(
+      { id: credential.id, request: { enabled } },
+      {
+        onSuccess: (res) => toast.success(res.message),
+        onError: (error) => toast.error(`429 自动禁用设置失败: ${extractErrorMessage(error)}`),
+      }
+    )
+  }
+
   const saveRegions = () => {
     setCredentialRegions.mutate(
       {
@@ -586,6 +598,9 @@ export function CredentialCard({
               {credential.hasProxy && <Badge tone="info" size="xs">代理</Badge>}
               {typeof credential.maxConcurrentRequestsOverride === 'number' && (
                 <Badge tone="info" size="xs">并发覆盖</Badge>
+              )}
+              {credential.rateLimitAutoDisableEnabled === false && (
+                <Badge tone="warning" size="xs">429 仅冷却</Badge>
               )}
               {supportedModels.length > 0 && (
                 <Badge tone="secondary" size="xs" title={supportedModels.join('\n')}>模型 {supportedModels.length}</Badge>
@@ -825,6 +840,21 @@ export function CredentialCard({
                       {typeof credential.rpmOverride === 'number' ? '账号覆盖' : '继承全局'}
                     </span>
                   </button>
+                }
+              />
+              <MetaItem
+                label="429自动禁用"
+                value={
+                  <label className="flex w-fit items-center gap-2">
+                    <Toggle
+                      color="primary"
+                      size="xs"
+                      checked={credential.rateLimitAutoDisableEnabled !== false}
+                      disabled={setCredentialRateLimitAutoDisable.isPending}
+                      onChange={(event) => toggleRateLimitAutoDisable(event.currentTarget.checked)}
+                    />
+                    <span>{credential.rateLimitAutoDisableEnabled === false ? '关闭' : '开启'}</span>
+                  </label>
                 }
               />
               <MetaItem

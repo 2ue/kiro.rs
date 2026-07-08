@@ -17,14 +17,14 @@ use super::{
         BatchUpdateCredentialsRequest, ClearInFlightRequest, CreateProxyResourceRequest,
         CreateRequestApiKeyRequest, ExportCredentialsQuery, ExternalPoolTestRequest,
         ProxyResourceTestRequest, RefreshCredentialInfoRequest, SetCredentialConcurrencyRequest,
-        SetCredentialProxyRequest, SetCredentialRegionsRequest, SetCredentialRpmRequest,
-        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SetSupportedModelsRequest, SetWarmupRequest, SuccessResponse,
-        SyncSupportedModelsFromCredentialRequest, SystemVersionResponse, TestCredentialRequest,
-        UpdateAdminApiKeyRequest, UpdateCredentialAuthRequest, UpdateProxyResourceRequest,
-        UpdateRequestApiKeyRequest, UpdateRuntimeConfigRequest, UpsertManualModelRequest,
-        UsageCleanupRequest, ValidateExistingCredentialsRequest,
-        ValidateExternalCredentialsRequest,
+        SetCredentialProxyRequest, SetCredentialRateLimitAutoDisableRequest,
+        SetCredentialRegionsRequest, SetCredentialRpmRequest, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SetSupportedModelsRequest,
+        SetWarmupRequest, SuccessResponse, SyncSupportedModelsFromCredentialRequest,
+        SystemVersionResponse, TestCredentialRequest, UpdateAdminApiKeyRequest,
+        UpdateCredentialAuthRequest, UpdateProxyResourceRequest, UpdateRequestApiKeyRequest,
+        UpdateRuntimeConfigRequest, UpsertManualModelRequest, UsageCleanupRequest,
+        ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
     },
 };
 use crate::anthropic::usage::{UsageRecordQuery, UsageRecordStatus, UsageSource};
@@ -390,6 +390,26 @@ pub async fn set_credential_rpm(
 ) -> impl IntoResponse {
     match state.service.set_credential_rpm(id, payload) {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} RPM 限制已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/rate-limit-auto-disable
+/// 设置 429 临时风控自动禁用开关
+pub async fn set_credential_rate_limit_auto_disable(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetCredentialRateLimitAutoDisableRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .set_credential_rate_limit_auto_disable(id, payload)
+    {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} 429 自动禁用开关已更新",
+            id
+        )))
+        .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

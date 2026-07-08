@@ -279,6 +279,8 @@ pub struct CredentialListItem {
     pub rpm: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpm_override: Option<u32>,
+    /// 429 临时风控是否自动禁用账号。
+    pub rate_limit_auto_disable_enabled: bool,
     pub warmup_remaining: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_models: Vec<String>,
@@ -423,6 +425,8 @@ pub struct CredentialStatusItem {
     /// 凭据级 RPM 覆盖值。None 表示继承全局；Some(0) 表示该账号不限 RPM。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpm_override: Option<u32>,
+    /// 429 临时风控是否自动禁用账号。
+    pub rate_limit_auto_disable_enabled: bool,
     /// 并发占用自动回收阈值。0 表示关闭。
     pub in_flight_lease_max_secs: u64,
     /// 预热剩余请求数。
@@ -518,6 +522,13 @@ pub struct SetCredentialRpmRequest {
     /// None 表示继承全局；Some(0) 表示该账号不限 RPM；Some(n) 表示该账号最多 n RPM。
     #[serde(default)]
     pub rpm: Option<u32>,
+}
+
+/// 修改 429 临时风控自动禁用开关。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialRateLimitAutoDisableRequest {
+    pub enabled: bool,
 }
 
 /// 修改支持模型列表。空列表表示不限制模型调度。
@@ -771,6 +782,10 @@ pub struct AddCredentialRequest {
     #[serde(default)]
     pub rpm: Option<u32>,
 
+    /// 429 临时风控是否自动禁用账号。默认 true；false 表示仅进入 429 冷却。
+    #[serde(default)]
+    pub rate_limit_auto_disable_enabled: Option<bool>,
+
     /// 新增后是否禁用启动。默认 false。
     #[serde(default)]
     pub disabled: Option<bool>,
@@ -857,6 +872,8 @@ pub struct BatchCredentialImportDefaults {
     pub max_concurrent_requests: Option<Option<u32>>,
     #[serde(default)]
     pub rpm: Option<Option<u32>>,
+    #[serde(default)]
+    pub rate_limit_auto_disable_enabled: Option<bool>,
     #[serde(default)]
     pub provider: Option<String>,
     #[serde(default)]
@@ -1025,6 +1042,8 @@ pub struct BatchUpdateCredentialsRequest {
     pub concurrency: Option<SetCredentialConcurrencyRequest>,
     #[serde(default)]
     pub rpm: Option<SetCredentialRpmRequest>,
+    #[serde(default)]
+    pub rate_limit_auto_disable: Option<SetCredentialRateLimitAutoDisableRequest>,
     #[serde(default)]
     pub proxy: Option<SetCredentialProxyRequest>,
 }

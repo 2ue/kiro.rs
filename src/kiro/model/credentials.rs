@@ -101,6 +101,13 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpm: Option<u32>,
 
+    /// 429 临时风控是否自动禁用账号。
+    ///
+    /// `None`/`Some(true)` 表示保持默认行为：429 suspicious activity/temporary limits
+    /// 风控响应会禁用账号；`Some(false)` 表示仅进入 429 冷却，不自动禁用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_auto_disable_enabled: Option<bool>,
+
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -344,6 +351,7 @@ impl KiroCredentials {
             && self.priority == other.priority
             && self.max_concurrent_requests == other.max_concurrent_requests
             && self.rpm == other.rpm
+            && self.rate_limit_auto_disable_enabled == other.rate_limit_auto_disable_enabled
             && self.region == other.region
             && self.auth_region == other.auth_region
             && self.api_region == other.api_region
@@ -363,6 +371,11 @@ impl KiroCredentials {
     /// 获取默认凭证文件路径
     pub fn default_credentials_path() -> &'static str {
         "credentials.json"
+    }
+
+    /// 429 临时风控是否自动禁用账号。未配置时默认启用，保持旧行为。
+    pub fn rate_limit_auto_disable_enabled(&self) -> bool {
+        self.rate_limit_auto_disable_enabled.unwrap_or(true)
     }
 
     /// 获取有效的 Auth Region（用于 Token 刷新）
@@ -695,6 +708,25 @@ mod tests {
         let json = r#"{"refreshToken": "test", "priority": 5}"#;
         let creds = KiroCredentials::from_json(json).unwrap();
         assert_eq!(creds.priority, 5);
+    }
+
+    #[test]
+    fn rate_limit_auto_disable_defaults_to_enabled() {
+        let creds = KiroCredentials::default();
+        assert!(creds.rate_limit_auto_disable_enabled());
+
+        let parsed = KiroCredentials::from_json("{}").unwrap();
+        assert!(parsed.rate_limit_auto_disable_enabled());
+    }
+
+    #[test]
+    fn rate_limit_auto_disable_can_be_disabled() {
+        let parsed =
+            KiroCredentials::from_json(r#"{"rateLimitAutoDisableEnabled":false}"#).unwrap();
+        assert!(!parsed.rate_limit_auto_disable_enabled());
+
+        let serialized = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(serialized["rateLimitAutoDisableEnabled"], false);
     }
 
     #[test]

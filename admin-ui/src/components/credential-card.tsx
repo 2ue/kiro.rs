@@ -31,6 +31,7 @@ import {
   useSetCredentialProxy,
   useSetCredentialConcurrency,
   useSetCredentialRpm,
+  useSetCredentialRateLimitAutoDisable,
   useSetCredentialSupportedModels,
   useSyncCredentialSupportedModels,
 } from '@/hooks/use-credentials'
@@ -275,6 +276,7 @@ export function CredentialCard({
   const setCredentialProxy = useSetCredentialProxy()
   const setCredentialConcurrency = useSetCredentialConcurrency()
   const setCredentialRpm = useSetCredentialRpm()
+  const setCredentialRateLimitAutoDisable = useSetCredentialRateLimitAutoDisable()
   const setCredentialRegions = useSetCredentialRegions()
   const setCredentialSupportedModels = useSetCredentialSupportedModels()
   const syncCredentialSupportedModels = useSyncCredentialSupportedModels()
@@ -532,6 +534,19 @@ export function CredentialCard({
     )
   }
 
+  const handleRateLimitAutoDisableToggle = (enabled: boolean) => {
+    setCredentialRateLimitAutoDisable.mutate(
+      {
+        id: credential.id,
+        request: { enabled },
+      },
+      {
+        onSuccess: (res) => toast.success(res.message),
+        onError: (err) => toast.error('429 自动禁用设置失败: ' + extractErrorMessage(err)),
+      }
+    )
+  }
+
   const handleSupportedModelsSave = () => {
     const supportedModels = parseSupportedModelsText(supportedModelsValue)
     setCredentialSupportedModels.mutate(
@@ -713,6 +728,9 @@ export function CredentialCard({
                 {typeof credential.rpmOverride === 'number' && (
                   <Badge variant="outline">RPM 覆盖</Badge>
                 )}
+                {credential.rateLimitAutoDisableEnabled === false && (
+                  <Badge variant="outline">429 仅冷却</Badge>
+                )}
               </CardTitle>
             </div>
             <div className="flex items-center gap-2">
@@ -828,6 +846,19 @@ export function CredentialCard({
                 <Gauge className="h-3.5 w-3.5" />
                 {rpmLimitLabel(credential)}
               </button>
+            </div>
+            <div>
+              <span className="text-muted-foreground">429 自动禁用：</span>
+              <span className="ml-1 inline-flex items-center gap-2 align-middle">
+                <Switch
+                  checked={credential.rateLimitAutoDisableEnabled !== false}
+                  onCheckedChange={handleRateLimitAutoDisableToggle}
+                  disabled={setCredentialRateLimitAutoDisable.isPending}
+                />
+                <span className="font-medium">
+                  {credential.rateLimitAutoDisableEnabled === false ? '关闭' : '开启'}
+                </span>
+              </span>
             </div>
             <div className="col-span-2">
               <span className="text-muted-foreground">支持模型：</span>

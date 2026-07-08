@@ -190,7 +190,14 @@ pub fn build_client(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn local_test_client() -> Client {
+        Client::builder()
+            .no_proxy()
+            .build()
+            .expect("local test client")
+    }
 
     #[test]
     fn test_proxy_config_new() {
@@ -238,7 +245,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(5)).await;
         });
 
-        let client = build_client(None, 30, TlsBackend::Rustls).unwrap();
+        let client = local_test_client();
         let err = send_with_response_header_timeout(client.get(format!("http://{}", addr)), 1)
             .await
             .expect_err("server accepts connection but never sends response headers");
@@ -255,14 +262,16 @@ mod tests {
             let Ok((mut stream, _peer)) = listener.accept().await else {
                 return;
             };
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
             let _ = stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n")
                 .await;
             tokio::time::sleep(Duration::from_secs(5)).await;
         });
 
-        let client = build_client(None, 0, TlsBackend::Rustls).unwrap();
-        let response = send_with_response_header_timeout(client.get(format!("http://{}", addr)), 1)
+        let client = local_test_client();
+        let response = send_with_response_header_timeout(client.get(format!("http://{}", addr)), 5)
             .await
             .expect("response headers should arrive before timeout");
         let err = response_text_with_body_timeout(response, 1)

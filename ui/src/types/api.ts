@@ -144,6 +144,7 @@ export interface CredentialStatusItem {
   unpricedRequests: number
   rpm?: number
   rpmOverride?: number | null
+  rateLimitAutoDisableEnabled: boolean
 }
 
 export type CredentialListItem = Pick<
@@ -179,6 +180,7 @@ export type CredentialListItem = Pick<
   | 'maxConcurrentRequestsOverride'
   | 'rpm'
   | 'rpmOverride'
+  | 'rateLimitAutoDisableEnabled'
   | 'warmupRemaining'
   | 'supportedModels'
 > & {
@@ -463,6 +465,10 @@ export interface SetCredentialRpmRequest {
   rpm?: number | null
 }
 
+export interface SetCredentialRateLimitAutoDisableRequest {
+  enabled: boolean
+}
+
 export interface SetCredentialRegionsRequest {
   region?: string | null
   authRegion?: string | null
@@ -475,6 +481,7 @@ export interface BatchUpdateCredentialsRequest {
   regions?: SetCredentialRegionsRequest
   concurrency?: SetCredentialConcurrencyRequest
   rpm?: SetCredentialRpmRequest
+  rateLimitAutoDisable?: SetCredentialRateLimitAutoDisableRequest
   proxy?: SetCredentialProxyRequest
 }
 
@@ -507,6 +514,7 @@ export interface AddCredentialRequest {
   priority?: number
   maxConcurrentRequests?: number | null
   rpm?: number | null
+  rateLimitAutoDisableEnabled?: boolean | null
   disabled?: boolean | null
   region?: string
   authRegion?: string

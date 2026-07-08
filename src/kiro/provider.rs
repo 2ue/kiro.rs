@@ -486,6 +486,41 @@ mod tests {
     }
 
     #[test]
+    fn downgrades_only_429_temporary_risk_when_credential_opted_out() {
+        let opted_out = KiroCredentials {
+            rate_limit_auto_disable_enabled: Some(false),
+            ..Default::default()
+        };
+        let default_credential = KiroCredentials::default();
+
+        assert!(KiroProvider::should_downgrade_rate_limit_risk_to_cooldown(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            CredentialRiskControlReason::TemporarilySuspended,
+            &opted_out
+        ));
+        assert!(!KiroProvider::should_downgrade_rate_limit_risk_to_cooldown(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            CredentialRiskControlReason::TemporarilySuspended,
+            &default_credential
+        ));
+        assert!(!KiroProvider::should_downgrade_rate_limit_risk_to_cooldown(
+            reqwest::StatusCode::FORBIDDEN,
+            CredentialRiskControlReason::TemporarilySuspended,
+            &opted_out
+        ));
+        assert!(!KiroProvider::should_downgrade_rate_limit_risk_to_cooldown(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            CredentialRiskControlReason::AccountSuspended,
+            &opted_out
+        ));
+        assert!(!KiroProvider::should_downgrade_rate_limit_risk_to_cooldown(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            CredentialRiskControlReason::AccountLocked,
+            &opted_out
+        ));
+    }
+
+    #[test]
     fn classifies_bad_request_protocol_reasons() {
         assert_eq!(
             KiroProvider::classify_bad_request_reason(
@@ -2081,6 +2116,52 @@ impl KiroProvider {
             .unwrap_or_else(|err| format!("<failed to read response body: {}>", err));
 
             if let Some(risk_reason) = Self::detect_risk_control_error(status, &body) {
+                if Self::should_downgrade_rate_limit_risk_to_cooldown(
+                    status,
+                    risk_reason,
+                    &ctx.credentials,
+                ) {
+                    tracing::warn!(
+                        credential_id = ctx.id,
+                        credential_label = %credential_label,
+                        risk_reason = ?risk_reason,
+                        "MCP 请求失败（{}，429 临时风控按账号配置仅进入冷却并切换，尝试 {}/{}）: {} {}",
+                        credential_context,
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+                    if let Err(err) = self.token_manager.report_transient_failure_kind(
+                        ctx.id,
+                        None,
+                        TransientFailureKind::RateLimit,
+                        retry_after,
+                        format!("rate_limit_risk_control {} {}", status, body),
+                    ) {
+                        self.finish_attempt(&mut ctx);
+                        anyhow::bail!(
+                            "MCP 请求失败（{}，调度状态写入失败）: {}",
+                            credential_context,
+                            err
+                        );
+                    }
+                    last_error = Some(anyhow::anyhow!(
+                        "MCP 请求失败（{}）: {} {}",
+                        credential_context,
+                        status,
+                        body
+                    ));
+                    self.maybe_exclude_after_transient_failure(
+                        None,
+                        ctx.id,
+                        &credential_label,
+                        &mut excluded_ids,
+                    );
+                    self.finish_attempt(&mut ctx);
+                    continue;
+                }
+
                 tracing::error!(
                     credential_id = ctx.id,
                     credential_label = %credential_label,
@@ -2775,6 +2856,78 @@ impl KiroProvider {
                     "{} API 请求失败（{}）: {} {}",
                     api_type, credential_context, status, body
                 );
+                if Self::should_downgrade_rate_limit_risk_to_cooldown(
+                    status,
+                    risk_reason,
+                    &ctx.credentials,
+                ) {
+                    tracing::warn!(
+                        credential_id = ctx.id,
+                        credential_label = %credential_label,
+                        risk_reason = ?risk_reason,
+                        "API 请求失败（{}，429 临时风控按账号配置仅进入冷却并切换，尝试 {}/{}）: {} {}",
+                        credential_context,
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+                    Self::push_attempt(
+                        &mut attempts,
+                        attempt,
+                        ctx.id,
+                        &credential_label,
+                        Some(status),
+                        "rate_limit_cooldown_retry",
+                        Some("rate_limit_risk_control"),
+                        Some(message.clone()),
+                        attempt_started_at,
+                        model.as_deref(),
+                    );
+                    last_error = Some(anyhow::anyhow!(message));
+                    if let Err(err) = self.token_manager.report_transient_failure_kind(
+                        ctx.id,
+                        model.as_deref(),
+                        TransientFailureKind::RateLimit,
+                        retry_after,
+                        format!(
+                            "rate_limit_risk_control {} API {} {}",
+                            api_type, status, body
+                        ),
+                    ) {
+                        let final_message = format!(
+                            "{} API 请求失败（{}，调度状态写入失败）: {}",
+                            api_type, credential_context, err
+                        );
+                        if let Some(last) = attempts.last_mut() {
+                            last.action = "fail".to_string();
+                            last.error_type = Some("scheduler_state_error".to_string());
+                            last.error_message = Some(final_message.clone());
+                        }
+                        Self::log_attempt_chain(request_id, api_type, &attempts, "fail");
+                        self.finish_attempt(&mut ctx);
+                        return Err(Self::traced_error(final_message, &attempts));
+                    }
+                    self.maybe_exclude_after_soft_failure(
+                        conversation_id.as_deref(),
+                        model.as_deref(),
+                        ctx.id,
+                        &credential_label,
+                        &mut excluded_ids,
+                    );
+                    self.maybe_exclude_after_transient_failure(
+                        model.as_deref(),
+                        ctx.id,
+                        &credential_label,
+                        &mut excluded_ids,
+                    );
+                    self.finish_attempt(&mut ctx);
+                    if attempt + 1 < max_retries {
+                        sleep(Self::retry_delay(attempt)).await;
+                    }
+                    continue;
+                }
+
                 tracing::error!(
                     credential_id = ctx.id,
                     credential_label = %credential_label,
@@ -3472,6 +3625,16 @@ impl KiroProvider {
         } else {
             Some(Duration::from_secs(seconds as u64))
         }
+    }
+
+    fn should_downgrade_rate_limit_risk_to_cooldown(
+        status: reqwest::StatusCode,
+        reason: CredentialRiskControlReason,
+        credentials: &KiroCredentials,
+    ) -> bool {
+        status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            && reason == CredentialRiskControlReason::TemporarilySuspended
+            && !credentials.rate_limit_auto_disable_enabled()
     }
 
     fn detect_risk_control_error(

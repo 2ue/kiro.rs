@@ -27,6 +27,7 @@ import {
   setCredentialPriority,
   setCredentialProxy,
   setCredentialRegions,
+  setCredentialRateLimitAutoDisable,
   setCredentialRpm,
   setCredentialSupportedModels,
   setCredentialWarmup,
@@ -45,6 +46,7 @@ import type {
   CredentialsPageQuery,
   SetCredentialConcurrencyRequest,
   SetCredentialProxyRequest,
+  SetCredentialRateLimitAutoDisableRequest,
   SetCredentialRegionsRequest,
   SetCredentialRpmRequest,
   SetSupportedModelsRequest,
@@ -244,6 +246,14 @@ export function useSetCredentialRpm() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: ({ id, request }: { id: number; request: SetCredentialRpmRequest }) => setCredentialRpm(id, request),
+    onSuccess: (_data, variables) => invalidateCredentialCaches(queryClient, variables.id),
+  })
+}
+
+export function useSetCredentialRateLimitAutoDisable() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, request }: { id: number; request: SetCredentialRateLimitAutoDisableRequest }) => setCredentialRateLimitAutoDisable(id, request),
     onSuccess: (_data, variables) => invalidateCredentialCaches(queryClient, variables.id),
   })
 }

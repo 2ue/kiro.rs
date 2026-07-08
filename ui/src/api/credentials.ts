@@ -24,6 +24,7 @@ import type {
   AccessKeysResponse,
   RuntimeConfig,
   SetCredentialConcurrencyRequest,
+  SetCredentialRateLimitAutoDisableRequest,
   SetCredentialRpmRequest,
   SetCredentialRegionsRequest,
   SetSupportedModelsRequest,
@@ -173,6 +174,11 @@ export async function setCredentialConcurrency(id: number, req: SetCredentialCon
 
 export async function setCredentialRpm(id: number, req: SetCredentialRpmRequest): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/rpm`, req)
+  return data
+}
+
+export async function setCredentialRateLimitAutoDisable(id: number, req: SetCredentialRateLimitAutoDisableRequest): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/rate-limit-auto-disable`, req)
   return data
 }
 
