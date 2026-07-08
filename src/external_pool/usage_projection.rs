@@ -43,6 +43,11 @@ pub(super) fn build_context(
     if !stream && reported_usage.skip_non_stream_usage_projection {
         return None;
     }
+    if !reported_usage.enabled
+        && route.prompt_cache_strategy_type != PromptCacheStrategyType::NoCache
+    {
+        return None;
+    }
 
     let raw_projection_payload;
     let payload = if let Some(payload) = route.payload() {
@@ -136,9 +141,10 @@ pub(super) fn build_context(
         _ => (None, None, None),
     };
     let reported_policy = match route.prompt_cache_strategy_type {
-        PromptCacheStrategyType::NoCache if reported_usage.enabled => {
-            ReportedCacheUsagePolicy::from_path_policy(reported_usage, fastrand::u64(..))
-        }
+        PromptCacheStrategyType::NoCache => ReportedCacheUsagePolicy::from_path_policy(
+            crate::model::config::ReportedUsagePathPolicy::disabled(),
+            fastrand::u64(..),
+        ),
         PromptCacheStrategyType::CurrentHighCache
             if prompt_cache_supported
                 && route.prompt_cache_simulation_mode == PromptCacheSimulationMode::HighCache =>
@@ -152,9 +158,10 @@ pub(super) fn build_context(
                     ^ fastrand::u64(..),
             )
         }
-        PromptCacheStrategyType::CurrentHighCache
-        | PromptCacheStrategyType::KiroRsTool
-        | PromptCacheStrategyType::NoCache => None,
+        PromptCacheStrategyType::KiroRsTool if prompt_cache_supported => {
+            ReportedCacheUsagePolicy::from_path_policy(reported_usage, fastrand::u64(..))
+        }
+        PromptCacheStrategyType::CurrentHighCache | PromptCacheStrategyType::KiroRsTool => None,
     };
     Some(ExternalUsageProjectionContext {
         mode: pool.usage_projection_mode,

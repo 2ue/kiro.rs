@@ -16,9 +16,10 @@ use crate::external_pool::ExternalPoolManager;
 use crate::kiro::provider::KiroProvider;
 use crate::model::config::{
     BodyConversionConfig, CachePolicyConfig, CompatProfile, ExternalPoolsConfig,
-    ImageProcessingConfig, ModelMappingConfig, ModelResolutionMode, PayloadGuardMode,
-    PayloadShapingConfig, PromptCacheCreationControlConfig, PromptCacheSimulationMode,
-    ReportedUsageConfig, ThinkingTriggerMode, normalize_defined_cache_routes,
+    ImageProcessingConfig, MissingMaxTokensConfig, ModelMappingConfig, ModelResolutionMode,
+    PayloadGuardMode, PayloadShapingConfig, PromptCacheCreationControlConfig,
+    PromptCacheSimulationMode, ReportedUsageConfig, ThinkingTriggerMode,
+    normalize_defined_cache_routes,
 };
 
 use super::{
@@ -114,6 +115,8 @@ pub struct AppState {
     pub image_processing: ImageProcessingConfig,
     /// 本地 Anthropic -> Kiro 转换能力配置
     pub body_conversion: BodyConversionConfig,
+    /// Messages 请求缺少顶层 max_tokens 时的入口兼容策略
+    pub missing_max_tokens: MissingMaxTokensConfig,
     /// payload shaping 配置
     pub payload_shaping: PayloadShapingConfig,
     /// 外部备用号池和直连策略配置。
@@ -175,6 +178,7 @@ impl AppState {
             kiro_upstream_stream_idle_timeout_secs: 180,
             image_processing: ImageProcessingConfig::default(),
             body_conversion: BodyConversionConfig::default(),
+            missing_max_tokens: MissingMaxTokensConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
             external_pools: ExternalPoolsConfig::default(),
             external_pool_manager: None,
@@ -295,6 +299,11 @@ impl AppState {
         self.image_processing = image_processing.normalized();
         self.body_conversion = body_conversion;
         self.payload_shaping = payload_shaping;
+        self
+    }
+
+    pub fn with_missing_max_tokens(mut self, config: MissingMaxTokensConfig) -> Self {
+        self.missing_max_tokens = config.normalized();
         self
     }
 

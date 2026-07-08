@@ -9,10 +9,12 @@
 
 ## Frontend Gates When UI Is Touched
 
-- `pnpm --dir admin-ui build`
-- `pnpm --dir admin-ui-daisy build`
 - `pnpm --dir ui build`
-- `node tools/check-admin-ui-api-parity.mjs`
+
+## Docker Gate Before Tag Release
+
+- `docker build -t kiro-rs:local-release-check .`
+- The Dockerfile must build only the maintained `ui/` frontend. Legacy `admin-ui/` or `admin-ui-daisy/` paths must not be referenced by the active Docker build.
 
 ## Protocol Gates When `/cc/v1` Or Usage Changes
 

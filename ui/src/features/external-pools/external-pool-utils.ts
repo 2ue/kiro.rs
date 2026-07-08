@@ -1,4 +1,4 @@
-import type { ExternalPool, ExternalPoolModelMappingRule, ExternalPoolsConfig, CreateExternalPoolRequest } from '@/types/api'
+import type { ExternalPool, ExternalPoolModelMappingRule, ExternalPoolsConfig, CreateExternalPoolRequest, ExternalPoolStreamResponseMode } from '@/types/api'
 
 export const splitRules = (value: string) => value.split('\n').map((item) => item.trim()).filter(Boolean)
 export const joinRules = (value: string[] = []) => value.join('\n')
@@ -19,6 +19,7 @@ export const parseSupportedModelsText = (value: string): string[] => {
 }
 
 export const DEFAULT_POOL_MODEL_MAPPING_MODE: NonNullable<CreateExternalPoolRequest['modelMappingMode']> = 'processed_mapping'
+export type ExternalPoolStreamResponseDraft = ExternalPoolStreamResponseMode | 'inherit'
 
 export const parseModelMappingRules = (value: string): ExternalPoolModelMappingRule[] => value
   .split('\n')
@@ -95,6 +96,7 @@ export type ExternalPoolFormDraft = {
   requestBodyMode: NonNullable<CreateExternalPoolRequest['requestBodyMode']>
   rawModelMode: NonNullable<CreateExternalPoolRequest['rawModelMode']>
   usageProjectionMode: NonNullable<CreateExternalPoolRequest['usageProjectionMode']>
+  streamResponseMode: ExternalPoolStreamResponseDraft
   autoDisablePolicy: NonNullable<CreateExternalPoolRequest['autoDisablePolicy']>
   preservePath: boolean
   normalizeModelVersionDots: boolean
@@ -116,6 +118,7 @@ export const defaultPoolForm = (): ExternalPoolFormDraft => ({
   requestBodyMode: 'normalized',
   rawModelMode: 'none',
   usageProjectionMode: 'pass_through',
+  streamResponseMode: 'inherit',
   autoDisablePolicy: 'inherit',
   preservePath: true,
   normalizeModelVersionDots: false,
@@ -137,6 +140,7 @@ export const poolFormFromPool = (pool: ExternalPool): ExternalPoolFormDraft => (
   requestBodyMode: pool.requestBodyMode || 'normalized',
   rawModelMode: pool.rawModelMode || 'none',
   usageProjectionMode: pool.usageProjectionMode,
+  streamResponseMode: pool.streamResponseMode || 'inherit',
   autoDisablePolicy: pool.autoDisablePolicy,
   preservePath: pool.preservePath !== false,
   normalizeModelVersionDots: Boolean(pool.normalizeModelVersionDots),
@@ -189,7 +193,7 @@ export function modelMappingDescription(mode: ExternalPool['modelMappingMode'] |
 
 export function requestBodyModeDescription(mode: ExternalPool['requestBodyMode'] | undefined): string {
   if (mode === 'raw_passthrough') {
-    return '请求体不进入本系统的消息解析、图片处理、schema 修正和 payload guard。Usage 上报仍按当前外部池的用量展示模式执行；是否改写顶层 model 由下方模型处理配置单独控制。'
+    return '请求体不进入本系统的消息解析、图片处理、schema 修正和 payload guard。下游 usage 是透传上游还是按入口路径整理，由当前外部账号的下游 usage 口径决定；是否改写顶层 model 由下方模型处理配置单独控制。'
   }
   return '按当前系统的标准 Anthropic 请求处理链路转发，会应用图片预处理、payload guard、thinking/model 兼容逻辑和 usage 整形上下文。'
 }
@@ -224,16 +228,30 @@ export function poolSupportedModelsSummary(pool: ExternalPool): string {
 
 export function usageProjectionDescription(mode: ExternalPool['usageProjectionMode'] | undefined): string {
   if (mode === 'current_path_policy') {
-    return '按当前入口规则整理用量，并应用全局用量补偿。适合希望外部账号展示方式和本地入口一致的场景。'
+    return '返回给下游的 usage 按当前入口路径的缓存策略整理；如果该路径是 no-cache 或非流式 Usage 透传，则保持上游原始 usage。'
   }
-  return '保持外部账号返回的用量，不应用缓存补偿和输出补偿。适合只做外部连接的场景。'
+  return '返回给下游的 usage 保持外部账号上游原始值；不按当前入口路径整理。'
+}
+
+export function streamResponseDescription(mode: ExternalPoolStreamResponseDraft): string {
+  if (mode === 'event_passthrough') {
+    return '仅控制 stream=true 的 SSE 事件转发方式。文本、thinking、tool 等普通事件按上游事件级转发；usage 是否透传上游或按路径整理，由上面的下游 usage 口径决定。'
+  }
+  return '当前外部账号不单独指定流式 SSE 转发方式，使用外部池全局默认值；usage 口径仍由上面的下游 usage 口径决定。'
 }
 
 export function poolUsageSummary(pool: ExternalPool, config: ExternalPoolsConfig): string {
-  if (pool.usageProjectionMode !== 'current_path_policy') {
-    return '用量：保持原样'
+  const parts = pool.usageProjectionMode === 'current_path_policy'
+    ? ['Usage：按路径整理']
+    : ['Usage：透传上游']
+  const streamMode = pool.streamResponseMode || config.externalPoolStreamResponseMode
+  parts.push(streamMode === 'event_passthrough' ? '流式：事件透传' : '流式：继承默认')
+  if (pool.streamResponseMode) {
+    parts.push('单池覆盖')
   }
-  const parts = ['用量：按入口规则']
+  if (pool.usageProjectionMode !== 'current_path_policy') {
+    return parts.join(' · ')
+  }
   if (config.externalPoolUsageProjectionUpliftPercent > 0) {
     parts.push(`缓存 +${config.externalPoolUsageProjectionUpliftPercent}%`)
   }

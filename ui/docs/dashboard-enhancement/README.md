@@ -23,7 +23,7 @@
 
 | 分册 | 内容 | 给谁看 |
 |---|---|---|
-| [00-background.md](./00-background.md) | 背景、三套 UI 关系、**数据契约家底盘点**（每个端点有什么、用了多少） | 实施前必读，判断"能做什么" |
+| [00-background.md](./00-background.md) | 背景、当前 UI 定位、**数据契约家底盘点**（每个端点有什么、用了多少） | 实施前必读，判断"能做什么" |
 | [01-architecture.md](./01-architecture.md) | 页面架构建议：总览页拆成"健康层 + 分析层"双层 | 定方向 |
 | [02-overview-health.md](./02-overview-health.md) | 总览（健康层）5 个模块明细 | 实现健康层 |
 | [03-analytics.md](./03-analytics.md) | 分析（历史层）5 个模块明细 | 实现分析层 |

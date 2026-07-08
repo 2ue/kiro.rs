@@ -57,10 +57,10 @@
   - `POST /credentials/{id}/supported-models/sync`
   - `POST /external-pools/{id}/supported-models`
   - `POST /external-pools/{id}/supported-models/sync`
-- All three admin UIs expose credential and external pool supported-model controls.
+- `/ui` exposes credential and external pool supported-model controls.
 
 ## Verification
 
 - Added unit tests for normalization/matching, credential `supports_model`, and external pool supported-model filtering.
 - `cargo test --locked --no-default-features`: pass.
-- `pnpm --dir ui build`, `pnpm --dir admin-ui build`, and `pnpm --dir admin-ui-daisy build`: pass.
+- `pnpm --dir ui build`: pass.

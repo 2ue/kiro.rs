@@ -7,7 +7,7 @@ import {
   Upload,
   XCircle,
 } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { validateExistingCredentials, validateExternalCredentials } from '@/api/credentials'
@@ -35,9 +35,16 @@ import {
   StatGrid,
 } from '@/components/patterns'
 import { formatCompact, formatDate, formatNumber, formatQuota } from '@/lib/format'
-import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, TEST_MODELS, testModelLabel } from '@/lib/test-models'
+import {
+  buildTestModelOptions,
+  defaultTestModelForOptions,
+  DEFAULT_TEST_MODEL,
+  DEFAULT_TEST_PROMPT,
+  testModelLabel,
+} from '@/lib/test-models'
 import { extractErrorMessage } from '@/lib/utils'
 import { parseCredentialImportFiles, parseCredentialImportText } from '@/lib/credential-import'
+import { useModelCapabilities } from '@/hooks/use-usage'
 import type { AddCredentialRequest, CredentialValidationGroup, CredentialValidationItem, CredentialValidationResponse } from '@/types/api'
 import { pageMeta } from '@/types/ui'
 
@@ -369,9 +376,16 @@ function ExternalValidationSection({
 }: {
   onResult: (r: CredentialValidationResponse) => void
 }) {
+  const modelCapabilities = useModelCapabilities()
   const [raw, setRaw] = useState('')
   const [opts, setOpts] = useState<ExternalOptions>(initialExternalOptions)
   const [selectedFiles, setSelectedFiles] = useState<string[]>([])
+  const userSelectedLivenessModelRef = useRef(false)
+  const modelOptions = useMemo(
+    () => buildTestModelOptions(modelCapabilities.data?.models),
+    [modelCapabilities.data?.models]
+  )
+  const defaultLivenessModel = defaultTestModelForOptions(modelOptions)
 
   const parsedCount = useMemo(() => {
     if (!raw.trim()) return 0
@@ -379,6 +393,11 @@ function ExternalValidationSection({
   }, [raw])
 
   const hasAction = opts.querySubscription || opts.queryUsage || opts.checkLiveness
+
+  useEffect(() => {
+    if (userSelectedLivenessModelRef.current) return
+    setOpts((prev) => ({ ...prev, livenessModel: defaultLivenessModel }))
+  }, [defaultLivenessModel])
 
   const setOpt = <K extends keyof ExternalOptions>(key: K, value: ExternalOptions[K]) =>
     setOpts((prev) => ({ ...prev, [key]: value }))
@@ -509,14 +528,17 @@ function ExternalValidationSection({
               <span className="text-xs font-semibold text-muted-foreground">验活模型</span>
               <Select
                 value={opts.livenessModel}
-                onValueChange={(v) => setOpt('livenessModel', v)}
+                onValueChange={(v) => {
+                  userSelectedLivenessModelRef.current = true
+                  setOpt('livenessModel', v)
+                }}
                 disabled={mutation.isPending || !opts.checkLiveness}
               >
                 <SelectTrigger size="sm">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {TEST_MODELS.map((m) => (
+                  {modelOptions.map((m) => (
                     <SelectItem key={m.id} value={m.id}>{m.label}</SelectItem>
                   ))}
                 </SelectContent>

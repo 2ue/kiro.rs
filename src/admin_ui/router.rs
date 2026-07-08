@@ -1,4 +1,4 @@
-//! Admin UI 路由配置
+//! 管理后台 UI 路由配置
 
 use std::{
     env,
@@ -17,23 +17,7 @@ use axum::{
 #[cfg(not(debug_assertions))]
 use rust_embed::Embed;
 
-/// 嵌入旧版前端构建产物
-#[cfg(not(debug_assertions))]
-#[derive(Embed)]
-#[folder = "admin-ui/dist"]
-struct AdminAsset;
-#[cfg(debug_assertions)]
-struct AdminAsset;
-
-/// 嵌入新版 Daisy 前端构建产物
-#[cfg(not(debug_assertions))]
-#[derive(Embed)]
-#[folder = "admin-ui-daisy/dist"]
-struct ConsoleAsset;
-#[cfg(debug_assertions)]
-struct ConsoleAsset;
-
-/// 嵌入重构版前端构建产物(shadcn + Tailwind v4)
+/// 嵌入新版前端构建产物(shadcn + Tailwind v4)
 #[cfg(not(debug_assertions))]
 #[derive(Embed)]
 #[folder = "ui/dist"]
@@ -45,35 +29,6 @@ trait UiAsset {
     const BUILD_HINT: &'static str;
 
     fn get(path: &str) -> Option<rust_embed::EmbeddedFile>;
-}
-
-impl UiAsset for AdminAsset {
-    const BUILD_HINT: &'static str = "Admin UI not built. Run 'pnpm build' in admin-ui directory.";
-
-    #[cfg(not(debug_assertions))]
-    fn get(path: &str) -> Option<rust_embed::EmbeddedFile> {
-        <Self as rust_embed::RustEmbed>::get(path)
-    }
-
-    #[cfg(debug_assertions)]
-    fn get(_path: &str) -> Option<rust_embed::EmbeddedFile> {
-        None
-    }
-}
-
-impl UiAsset for ConsoleAsset {
-    const BUILD_HINT: &'static str =
-        "Console UI not built. Run 'pnpm build' in admin-ui-daisy directory.";
-
-    #[cfg(not(debug_assertions))]
-    fn get(path: &str) -> Option<rust_embed::EmbeddedFile> {
-        <Self as rust_embed::RustEmbed>::get(path)
-    }
-
-    #[cfg(debug_assertions)]
-    fn get(_path: &str) -> Option<rust_embed::EmbeddedFile> {
-        None
-    }
 }
 
 impl UiAsset for NewUiAsset {
@@ -211,33 +166,7 @@ fn read_ui_env(
     })
 }
 
-/// 创建旧版 Admin UI 路由
-pub fn create_admin_ui_router() -> Router {
-    create_ui_router::<AdminAsset>(UiServeState::from_env(
-        "admin",
-        "/admin",
-        "KIRO_ADMIN_UI",
-        None,
-        "admin-ui/dist",
-        "http://127.0.0.1:9025/admin",
-        AdminAsset::BUILD_HINT,
-    ))
-}
-
-/// 创建新版 Console UI 路由
-pub fn create_console_ui_router() -> Router {
-    create_ui_router::<ConsoleAsset>(UiServeState::from_env(
-        "console",
-        "/console",
-        "KIRO_CONSOLE_UI",
-        None,
-        "admin-ui-daisy/dist",
-        "http://127.0.0.1:9024/console",
-        ConsoleAsset::BUILD_HINT,
-    ))
-}
-
-/// 创建重构版 UI 路由
+/// 创建管理后台 UI 路由
 pub fn create_new_ui_router() -> Router {
     create_ui_router::<NewUiAsset>(UiServeState::from_env(
         "ui",
@@ -546,25 +475,11 @@ mod tests {
 
     #[cfg(not(debug_assertions))]
     #[test]
-    fn embedded_ui_indexes_use_expected_mount_prefixes() {
-        let admin = <AdminAsset as rust_embed::RustEmbed>::get("index.html")
-            .expect("admin-ui index should be embedded");
-        let admin = std::str::from_utf8(admin.data.as_ref()).expect("admin-ui index is utf-8");
-        assert!(admin.contains("/admin/assets/"));
-        assert!(!admin.contains("/console/assets/"));
-
-        let console = <ConsoleAsset as rust_embed::RustEmbed>::get("index.html")
-            .expect("console index should be embedded");
-        let console = std::str::from_utf8(console.data.as_ref()).expect("console index is utf-8");
-        assert!(console.contains("/console/assets/"));
-        assert!(!console.contains("/admin/assets/"));
-
+    fn embedded_ui_index_uses_expected_mount_prefix() {
         let new_ui = <NewUiAsset as rust_embed::RustEmbed>::get("index.html")
             .expect("ui index should be embedded");
         let new_ui = std::str::from_utf8(new_ui.data.as_ref()).expect("ui index is utf-8");
         assert!(new_ui.contains("/ui/assets/"));
-        assert!(!new_ui.contains("/admin/assets/"));
-        assert!(!new_ui.contains("/console/assets/"));
     }
 
     #[test]

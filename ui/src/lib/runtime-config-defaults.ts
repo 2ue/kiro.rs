@@ -3,6 +3,7 @@ import type {
   CacheRoutePolicyPatch,
   BodyConversionConfig,
   ImageProcessingConfig,
+  MissingMaxTokensConfig,
   PayloadShapingConfig,
   PromptCacheCreationControlConfig,
   ReportedUsageConfig,
@@ -128,6 +129,22 @@ export function normalizeBodyConversion(input?: Partial<BodyConversionConfig> | 
   }
 }
 
+export function defaultMissingMaxTokens(): MissingMaxTokensConfig {
+  return {
+    policy: 'default_value',
+    defaultValue: 20480,
+  }
+}
+
+export function normalizeMissingMaxTokens(input?: Partial<MissingMaxTokensConfig> | null): MissingMaxTokensConfig {
+  const base = defaultMissingMaxTokens()
+  const policy = input?.policy === 'reject' ? 'reject' : base.policy
+  return {
+    policy,
+    defaultValue: toWhole(input?.defaultValue ?? base.defaultValue, 1, 200000),
+  }
+}
+
 export function defaultWeightedCapacity(): WeightedCapacityConfig {
   return {
     enabled: false,
@@ -240,6 +257,7 @@ export function defaultExternalPoolsConfig() {
     externalPoolUsageProjectionUpliftPercent: 25,
     externalPoolUsageProjectionOutputUpliftMinTokens: 0,
     externalPoolUsageProjectionOutputUpliftPercent: 0,
+    externalPoolStreamResponseMode: 'event_passthrough' as const,
   }
 }
 
@@ -296,6 +314,7 @@ export const emptyRuntimeConfig: RuntimeConfig = {
   whitespaceCompression: true,
   imageProcessing: defaultImageProcessing(),
   bodyConversion: defaultBodyConversion(),
+  missingMaxTokens: defaultMissingMaxTokens(),
   payloadGuardEnabled: true,
   payloadGuardMode: 'preemptive',
   payloadGuardMaxBytes: 460800,

@@ -10,7 +10,11 @@ use bytes::Bytes;
 pub(crate) struct RawMessagesBodyProbe {
     pub(crate) model: Option<String>,
     pub(crate) stream: Option<bool>,
+    pub(crate) max_tokens_present: bool,
+    pub(crate) complete_top_level_object: bool,
+    object_start_index: Option<usize>,
     model_value_span: Option<std::ops::Range<usize>>,
+    object_end_index: Option<usize>,
 }
 
 pub(crate) fn probe_raw_messages_body(raw_body: &Bytes) -> RawMessagesBodyProbe {
@@ -20,6 +24,38 @@ pub(crate) fn probe_raw_messages_body(raw_body: &Bytes) -> RawMessagesBodyProbe 
 pub(crate) fn raw_messages_body_hints(raw_body: &Bytes) -> (Option<String>, Option<bool>) {
     let probe = probe_raw_messages_body(raw_body);
     (probe.model, probe.stream)
+}
+
+pub(crate) fn rewrite_raw_missing_top_level_max_tokens_with_probe(
+    raw_body: &Bytes,
+    probe: &RawMessagesBodyProbe,
+    default_value: i32,
+) -> Result<Option<Bytes>, String> {
+    if probe.max_tokens_present {
+        return Ok(None);
+    }
+    if !probe.complete_top_level_object {
+        return Ok(None);
+    }
+    let Some(object_start) = probe.object_start_index else {
+        return Ok(None);
+    };
+    let Some(object_end) = probe.object_end_index else {
+        return Ok(None);
+    };
+    let has_existing_fields = raw_body[object_start + 1..object_end]
+        .iter()
+        .any(|byte| !byte.is_ascii_whitespace());
+    let field = if has_existing_fields {
+        format!(r#","max_tokens":{}"#, default_value)
+    } else {
+        format!(r#""max_tokens":{}"#, default_value)
+    };
+    let mut out = Vec::with_capacity(raw_body.len().saturating_add(field.len()));
+    out.extend_from_slice(&raw_body[..object_end]);
+    out.extend_from_slice(field.as_bytes());
+    out.extend_from_slice(&raw_body[object_end..]);
+    Ok(Some(Bytes::from(out)))
 }
 
 pub(crate) fn rewrite_raw_top_level_model(raw_body: &Bytes, model: &str) -> Result<Bytes, String> {
@@ -46,12 +82,21 @@ fn scan_raw_top_level_messages_body(bytes: &[u8]) -> RawMessagesBodyProbe {
     if bytes.get(i) != Some(&b'{') {
         return probe;
     }
+    probe.object_start_index = Some(i);
     i += 1;
 
     loop {
         i = skip_json_ws(bytes, i);
         match bytes.get(i) {
-            Some(b'}') | None => return probe,
+            Some(b'}') => {
+                let doc_end = skip_json_ws(bytes, i + 1);
+                if doc_end == bytes.len() {
+                    probe.complete_top_level_object = true;
+                    probe.object_end_index = Some(i);
+                }
+                return probe;
+            }
+            None => return probe,
             Some(b'"') => {}
             _ => return probe,
         }
@@ -90,6 +135,12 @@ fn scan_raw_top_level_messages_body(bytes: &[u8]) -> RawMessagesBodyProbe {
                 };
                 i = value_end;
             }
+        } else if key == "max_tokens" {
+            probe.max_tokens_present = true;
+            let Some(value_end) = skip_json_value(bytes, value_start) else {
+                return probe;
+            };
+            i = value_end;
         } else {
             let Some(value_end) = skip_json_value(bytes, value_start) else {
                 return probe;
@@ -97,14 +148,18 @@ fn scan_raw_top_level_messages_body(bytes: &[u8]) -> RawMessagesBodyProbe {
             i = value_end;
         }
 
-        if probe.model.is_some() && probe.stream.is_some() {
-            return probe;
-        }
-
         i = skip_json_ws(bytes, i);
         match bytes.get(i) {
             Some(b',') => i += 1,
-            Some(b'}') | None => return probe,
+            Some(b'}') => {
+                let doc_end = skip_json_ws(bytes, i + 1);
+                if doc_end == bytes.len() {
+                    probe.complete_top_level_object = true;
+                    probe.object_end_index = Some(i);
+                }
+                return probe;
+            }
+            None => return probe,
             _ => return probe,
         }
     }
@@ -237,5 +292,59 @@ mod tests {
         assert_eq!(value["model"], "new");
         assert_eq!(value["messages"][0]["content"][0]["text"], "model old");
         assert_eq!(value["stream"], false);
+    }
+
+    #[test]
+    fn raw_probe_detects_missing_max_tokens_and_rewrite_inserts_field() {
+        let raw = Bytes::from_static(
+            br#"{"model":"claude-sonnet-4-5","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        );
+
+        let probe = probe_raw_messages_body(&raw);
+        assert_eq!(probe.model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(probe.stream, Some(true));
+        assert!(!probe.max_tokens_present);
+        assert!(probe.complete_top_level_object);
+
+        let rewritten = rewrite_raw_missing_top_level_max_tokens_with_probe(&raw, &probe, 4096)
+            .expect("rewrite")
+            .expect("missing max tokens");
+        let value: serde_json::Value = serde_json::from_slice(&rewritten).expect("json");
+        assert_eq!(value["max_tokens"], 4096);
+        assert_eq!(value["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn raw_probe_does_not_rewrite_when_max_tokens_exists_or_json_incomplete() {
+        let raw = Bytes::from_static(br#"{"model":"m","max_tokens":16,"messages":[]}"#);
+        let probe = probe_raw_messages_body(&raw);
+        assert!(
+            rewrite_raw_missing_top_level_max_tokens_with_probe(&raw, &probe, 4096)
+                .expect("probe")
+                .is_none()
+        );
+
+        let incomplete = Bytes::from_static(br#"{"model":"m","messages":[]"#);
+        let probe = probe_raw_messages_body(&incomplete);
+        assert!(!probe.complete_top_level_object);
+        assert!(
+            rewrite_raw_missing_top_level_max_tokens_with_probe(&incomplete, &probe, 4096)
+                .expect("probe")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn raw_missing_max_tokens_rewrite_handles_whitespace_around_object() {
+        let raw = Bytes::from_static(br#"  { "model":"m","messages":[] }  "#);
+        let probe = probe_raw_messages_body(&raw);
+
+        let rewritten = rewrite_raw_missing_top_level_max_tokens_with_probe(&raw, &probe, 4096)
+            .expect("rewrite")
+            .expect("missing max tokens");
+        let value: serde_json::Value = serde_json::from_slice(&rewritten).expect("json");
+
+        assert_eq!(value["max_tokens"], 4096);
+        assert_eq!(value["model"], "m");
     }
 }

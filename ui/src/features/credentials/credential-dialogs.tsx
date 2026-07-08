@@ -34,9 +34,16 @@ import {
 import { Field, FieldGrid, ModalShell } from '@/components/patterns'
 import { parseCredentialImportFiles, parseCredentialImportText } from '@/lib/credential-import'
 import { parseKamFiles, parseKamJson, type KamAccount } from '@/lib/kam-import'
-import { DEFAULT_TEST_MODEL, DEFAULT_TEST_PROMPT, TEST_MODELS, testModelLabel } from '@/lib/test-models'
+import {
+  buildTestModelOptions,
+  defaultTestModelForOptions,
+  DEFAULT_TEST_MODEL,
+  DEFAULT_TEST_PROMPT,
+  testModelLabel,
+} from '@/lib/test-models'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 import { useAddCredential, useBatchUpdateCredentials, useProxyResources, useTestCredential } from '@/hooks/use-credentials'
+import { useModelCapabilities } from '@/hooks/use-usage'
 import type {
   AddCredentialRequest,
   BatchUpdateCredentialsRequest,
@@ -244,12 +251,12 @@ function mergeCredentialDefaults(cred: AddCredentialRequest, defaults: Credentia
   }
 }
 
-async function verifyImportedCredential(credentialId: number, mode: ImportVerificationMode): Promise<{ model: string; response: string }> {
+async function verifyImportedCredential(credentialId: number, mode: ImportVerificationMode, model: string): Promise<{ model: string; response: string }> {
   if (mode === 'subscription_only') {
     const info = await getCredentialBalance(credentialId)
     return { model: '订阅查询', response: `订阅: ${info.subscriptionTitle || '未知'}，用量 ${info.currentUsage}/${info.usageLimit}` }
   }
-  const tested = await testCredential(credentialId, { model: DEFAULT_TEST_MODEL, prompt: DEFAULT_TEST_PROMPT })
+  const tested = await testCredential(credentialId, { model, prompt: DEFAULT_TEST_PROMPT })
   try { await getCredentialBalance(credentialId) } catch { /* ignore */ }
   return { model: testModelLabel(tested.model), response: tested.response }
 }
@@ -422,7 +429,9 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
         } catch (err) {
           toast.warning(`${data.message}，但查询订阅失败: ${extractErrorMessage(err)}`)
         }
-        onClose()
+        setForm(initialCredentialForm())
+        setShowPu(false)
+        setShowPp(false)
       },
       onError: (err) => toast.error(`添加失败: ${extractErrorMessage(err)}`),
     })
@@ -535,6 +544,12 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
   const [parseError, setParseError] = useState('')
   const proxyResources = useProxyResources()
   const proxyOptions = proxyResources.data?.resources || []
+  const modelCapabilities = useModelCapabilities()
+  const testModelOptions = useMemo(
+    () => buildTestModelOptions(modelCapabilities.data?.models),
+    [modelCapabilities.data?.models]
+  )
+  const importTestModel = defaultTestModelForOptions(testModelOptions)
   const cancelRef = useRef(false)
 
   useEffect(() => {
@@ -608,7 +623,7 @@ export function BatchImportModal({ open, onClose, existingCredentials, onDone }:
           newResults[i].status = 'verifying'
           if (!isRetry) setResults([...newResults])
           try {
-            const verified = await verifyImportedCredential(res.credentialId, verifyMode)
+            const verified = await verifyImportedCredential(res.credentialId, verifyMode, importTestModel)
             newResults[i] = { ...newResults[i], status: 'success', model: verified.model, response: verified.response }
           } catch (ve) {
             await rollbackCredential(res.credentialId)
@@ -741,6 +756,12 @@ export function KamImportModal({ open, onClose, onDone }: {
   const [results, setResults] = useState<ImportResult[]>([])
   const proxyResources = useProxyResources()
   const proxyOptions = proxyResources.data?.resources || []
+  const modelCapabilities = useModelCapabilities()
+  const testModelOptions = useMemo(
+    () => buildTestModelOptions(modelCapabilities.data?.models),
+    [modelCapabilities.data?.models]
+  )
+  const importTestModel = defaultTestModelForOptions(testModelOptions)
 
   const hasErrorAccounts = accounts.some((a) => a.status === 'error')
 
@@ -813,7 +834,7 @@ export function KamImportModal({ open, onClose, onDone }: {
         newResults[i] = { ...newResults[i], credentialId: res.credentialId, email: res.email, status: 'verifying' }
         setResults([...newResults])
         try {
-          const verified = await verifyImportedCredential(res.credentialId, verifyMode)
+          const verified = await verifyImportedCredential(res.credentialId, verifyMode, importTestModel)
           newResults[i] = { ...newResults[i], status: 'success', model: verified.model, response: verified.response }
         } catch (ve) {
           await rollbackCredential(res.credentialId)
@@ -1190,12 +1211,41 @@ export function BatchEditCredentialsModal({ open, ids, onClose, onDone }: {
 export function CredentialTestModal({ credential, open, onClose }: {
   credential: CredentialStatusItem | null; open: boolean; onClose: () => void
 }) {
+  const modelCapabilities = useModelCapabilities()
   const [model, setModel] = useState(DEFAULT_TEST_MODEL)
   const [prompt, setPrompt] = useState(DEFAULT_TEST_PROMPT)
   const [result, setResult] = useState<TestCredentialResponse | null>(null)
+  const userSelectedModelRef = useRef(false)
   const testMutation = useTestCredential()
+  const modelOptions = useMemo(
+    () => buildTestModelOptions(modelCapabilities.data?.models, credential?.supportedModels),
+    [modelCapabilities.data?.models, credential?.supportedModels]
+  )
+  const defaultModel = defaultTestModelForOptions(modelOptions)
 
-  useEffect(() => { if (!open) { setResult(null); setModel(DEFAULT_TEST_MODEL); setPrompt(DEFAULT_TEST_PROMPT) } }, [open])
+  useEffect(() => {
+    if (!open) {
+      setResult(null)
+      setModel(DEFAULT_TEST_MODEL)
+      setPrompt(DEFAULT_TEST_PROMPT)
+      userSelectedModelRef.current = false
+      return
+    }
+    setResult(null)
+    setModel(defaultModel)
+    setPrompt(DEFAULT_TEST_PROMPT)
+    userSelectedModelRef.current = false
+  }, [open, credential?.id])
+
+  useEffect(() => {
+    if (!open || userSelectedModelRef.current) return
+    setModel(defaultModel)
+  }, [open, defaultModel])
+
+  const selectModel = (value: string) => {
+    userSelectedModelRef.current = true
+    setModel(value)
+  }
 
   const run = () => {
     if (!credential) return
@@ -1211,10 +1261,10 @@ export function CredentialTestModal({ credential, open, onClose }: {
     <ModalShell open={open} title={`测试账号 #${credential.id}`} width="max-w-lg" onClose={onClose}>
       <div className="space-y-3">
         <Field label="测试模型">
-          <Select value={model} onValueChange={setModel} disabled={testMutation.isPending}>
+          <Select value={model} onValueChange={selectModel} disabled={testMutation.isPending}>
             <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
             <SelectContent>
-              {TEST_MODELS.map((m) => <SelectItem key={m.id} value={m.id}>{m.label}</SelectItem>)}
+              {modelOptions.map((m) => <SelectItem key={m.id} value={m.id}>{m.label}</SelectItem>)}
             </SelectContent>
           </Select>
         </Field>
@@ -1244,10 +1294,11 @@ export function CredentialTestModal({ credential, open, onClose }: {
 // BatchVerifyModal
 // ============================================================================
 
-export function BatchVerifyModal({ open, verifying, progress, results, onCancel, onClose }: {
+export function BatchVerifyModal({ open, verifying, progress, results, testModel, onCancel, onClose }: {
   open: boolean; verifying: boolean
   progress: { current: number; total: number }
   results: Map<number, VerifyResult>
+  testModel: string
   onCancel: () => void; onClose: () => void
 }) {
   const items = Array.from(results.values())
@@ -1266,8 +1317,8 @@ export function BatchVerifyModal({ open, verifying, progress, results, onCancel,
     <ModalShell open={open} title="批量验活" width="max-w-lg" onClose={onClose}>
       <div className="space-y-3">
         <div className="rounded-lg bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-          测试模型：<span className="font-semibold text-foreground">{testModelLabel(DEFAULT_TEST_MODEL)}</span>
-          <span className="ml-2 text-muted-foreground/70">（批量验活固定使用默认模型）</span>
+          测试模型：<span className="font-semibold text-foreground">{testModelLabel(testModel)}</span>
+          <span className="ml-2 text-muted-foreground/70">（批量验活使用当前模型列表的默认模型）</span>
         </div>
         {verifying && (
           <div className="space-y-1.5">

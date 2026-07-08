@@ -195,6 +195,7 @@ export function ExternalPoolsPage() {
         name: createForm.name.trim(),
         baseUrl: createForm.baseUrl.trim(),
         apiKey: createForm.apiKey.trim(),
+        streamResponseMode: createForm.streamResponseMode === 'inherit' ? null : createForm.streamResponseMode,
         priority: whole(createForm.priority ?? 100),
         maxConcurrentRequests: whole(createForm.maxConcurrentRequests ?? 10, 1),
         modelMappingRules: parseModelMappingRules(modelMappingRulesText),
@@ -227,6 +228,7 @@ export function ExternalPoolsPage() {
         name: editForm.name.trim(),
         baseUrl: editForm.baseUrl.trim(),
         apiKey: editForm.apiKey?.trim() ? editForm.apiKey.trim() : undefined,
+        streamResponseMode: editForm.streamResponseMode === 'inherit' ? null : editForm.streamResponseMode,
         priority: whole(editForm.priority ?? 100),
         maxConcurrentRequests: whole(editForm.maxConcurrentRequests ?? 10, 1),
         modelMappingRules: parseModelMappingRules(modelMappingRulesText),
@@ -297,7 +299,7 @@ export function ExternalPoolsPage() {
         } />
         <StatCard title="可调度" value={dispatchablePools} tone={dispatchablePools > 0 ? 'success' : 'warning'} />
         <StatCard title="外部并发" value={`${totalInFlight}/${totalCapacity || 0}`} tone="default" />
-        <StatCard title="按入口规则" value={`${currentPathPoolCount} 个`} />
+        <StatCard title="按路径整理 usage" value={`${currentPathPoolCount} 个`} />
         <StatCard
           title="入口策略"
           value={fallbackActive || directPolicyActive ? '已配置' : '未配置'}
@@ -423,7 +425,7 @@ export function ExternalPoolsPage() {
             title="用量补偿"
             titleSuffix={!externalEnabled ? '需先启用外部账号' : undefined}
             active={externalEnabled && usageCompensationActive}
-            description={'仅对用量模式为"按入口规则展示"的外部账号生效；选"保持原样"的账号不受影响。'}
+            description={'仅对下游 usage 口径为“按当前入口路径整理 usage”的外部账号生效；选择“透传上游 usage”的账号不受影响。'}
           >
             <div className="space-y-4">
               <div className="grid gap-4 lg:grid-cols-2">

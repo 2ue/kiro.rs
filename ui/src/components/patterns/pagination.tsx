@@ -8,6 +8,7 @@ interface PaginationProps {
   total?: number
   pageSize?: number
   onPageChange: (page: number) => void
+  pending?: boolean
   className?: string
 }
 
@@ -18,12 +19,13 @@ export function Pagination({
   total,
   pageSize,
   onPageChange,
+  pending = false,
   className,
 }: PaginationProps) {
   if (pageCount <= 1 && !total) return null
 
-  const canPrev = page > 1
-  const canNext = page < pageCount
+  const canPrev = page > 1 && !pending
+  const canNext = page < pageCount && !pending
 
   const rangeStart = total && pageSize ? (page - 1) * pageSize + 1 : undefined
   const rangeEnd = total && pageSize ? Math.min(page * pageSize, total) : undefined
@@ -34,10 +36,12 @@ export function Pagination({
         {total !== undefined ? (
           <span className="tabular-nums">
             {rangeStart}-{rangeEnd} / 共 {total} 条
+            {pending ? ' · 加载中' : ''}
           </span>
         ) : (
           <span className="tabular-nums">
             第 {page} / {pageCount} 页
+            {pending ? ' · 加载中' : ''}
           </span>
         )}
       </div>

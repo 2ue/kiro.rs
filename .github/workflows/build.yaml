@@ -34,25 +34,6 @@ jobs:
         with:
           version: 11
 
-      - name: Check Admin UI API parity
-        run: node tools/check-admin-ui-api-parity.mjs
-
-      - name: Install admin-ui dependencies
-        working-directory: admin-ui
-        run: pnpm install --frozen-lockfile
-
-      - name: Build admin-ui
-        working-directory: admin-ui
-        run: pnpm build
-
-      - name: Install admin-ui-daisy dependencies
-        working-directory: admin-ui-daisy
-        run: pnpm install --frozen-lockfile
-
-      - name: Build admin-ui-daisy
-        working-directory: admin-ui-daisy
-        run: pnpm build
-
       - name: Install ui dependencies
         working-directory: ui
         run: pnpm install --frozen-lockfile

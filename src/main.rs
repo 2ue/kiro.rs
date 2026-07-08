@@ -448,6 +448,7 @@ async fn main() {
         config.kiro_upstream_stream_idle_timeout_secs,
         config.image_processing.normalized(),
         config.body_conversion,
+        config.missing_max_tokens.normalized(),
         config.payload_shaping,
         config.external_pools.clone(),
         config.tool_format_debug.clone(),
@@ -484,22 +485,14 @@ async fn main() {
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 
-            // 创建 Admin UI 路由
-            let admin_ui_app = admin_ui::create_admin_ui_router();
-            let console_ui_app = admin_ui::create_console_ui_router();
+            // 创建管理后台 UI 路由
             let new_ui_app = admin_ui::create_new_ui_router();
 
             tracing::info!("Admin API 已启用");
-            tracing::info!("Admin UI 已启用: /admin");
-            tracing::info!("Console UI 已启用: /console");
-            tracing::info!("New UI 已启用: /ui");
+            tracing::info!("Admin UI 已启用: /ui");
             anthropic_app
                 .nest("/api/admin", admin_app)
-                .route("/admin/", get(admin_ui_index_redirect))
-                .route("/console/", get(console_ui_index_redirect))
                 .route("/ui/", get(new_ui_index_redirect))
-                .nest("/admin", admin_ui_app)
-                .nest("/console", console_ui_app)
                 .nest("/ui", new_ui_app)
         }
     } else {
@@ -553,8 +546,6 @@ async fn main() {
         tracing::info!("  POST /api/admin/credentials/:index/reset");
         tracing::info!("  GET  /api/admin/credentials/:index/balance");
         tracing::info!("Admin UI:");
-        tracing::info!("  GET  /admin");
-        tracing::info!("  GET  /console");
         tracing::info!("  GET  /ui");
     }
 
@@ -701,14 +692,6 @@ async fn readyz(State(state): State<Arc<AppHealthState>>) -> impl IntoResponse {
             "lastRedisSubscribeErrorAtMs": state.runtime_events.last_subscribe_error_at_ms.load(Ordering::Acquire)
         })),
     )
-}
-
-async fn admin_ui_index_redirect() -> Redirect {
-    Redirect::permanent("/admin")
-}
-
-async fn console_ui_index_redirect() -> Redirect {
-    Redirect::permanent("/console")
 }
 
 async fn new_ui_index_redirect() -> Redirect {

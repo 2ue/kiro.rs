@@ -164,6 +164,64 @@ impl Default for BodyConversionConfig {
     }
 }
 
+pub const DEFAULT_MISSING_MAX_TOKENS_VALUE: i32 = 20_480;
+pub const MAX_MISSING_MAX_TOKENS_VALUE: i32 = 200_000;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MissingMaxTokensPolicy {
+    Reject,
+    #[default]
+    DefaultValue,
+}
+
+/// 入口 Messages 请求缺少顶层 max_tokens 时的兼容策略。
+///
+/// Anthropic Messages 请求使用 max_tokens 表示本次输出上限。默认补一个较小正数，
+/// 只为兼容缺字段客户端；不使用 0，也不补过大的值，避免改变成本和输出语义。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MissingMaxTokensConfig {
+    #[serde(default)]
+    pub policy: MissingMaxTokensPolicy,
+
+    #[serde(default = "default_missing_max_tokens_value")]
+    pub default_value: i32,
+}
+
+impl Default for MissingMaxTokensConfig {
+    fn default() -> Self {
+        Self {
+            policy: MissingMaxTokensPolicy::DefaultValue,
+            default_value: default_missing_max_tokens_value(),
+        }
+    }
+}
+
+impl MissingMaxTokensConfig {
+    pub fn normalized(self) -> Self {
+        let default_value = if (1..=MAX_MISSING_MAX_TOKENS_VALUE).contains(&self.default_value) {
+            self.default_value
+        } else {
+            default_missing_max_tokens_value()
+        };
+        Self {
+            policy: self.policy,
+            default_value,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=MAX_MISSING_MAX_TOKENS_VALUE).contains(&self.default_value) {
+            return Err(format!(
+                "missingMaxTokens.defaultValue 必须在 1 到 {} 之间",
+                MAX_MISSING_MAX_TOKENS_VALUE
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// 调度容量加权配置。
 ///
 /// 默认关闭；关闭时请求热路径不会为了容量加权额外估算 token，也不会改变并发/RPM
@@ -578,7 +636,7 @@ impl Default for ReportedUsageFieldMode {
 
 /// 单个 usage 字段的下游上报策略。
 ///
-/// 这些策略只用于把内部计算出的 usage 投影成下游响应和后台记录看到的 usage；
+/// 这些策略只用于把内部计算出的 usage 整理成下游响应和后台记录看到的 usage；
 /// 不参与 prompt-cache tracker、reader 命中或上游请求计算。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -689,10 +747,13 @@ pub struct ReportedUsagePathPolicy {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
-    /// 命中该路径的非流式请求是否跳过 usage 展示整形。
+    /// 命中该路径的非流式请求是否透传上游 usage。
     ///
-    /// 该字段只是否决开关：开启后非流式请求不改写下游 usage；流式请求不受影响。
-    /// 其他层（例如外部池）即使允许非流式整形，也不能覆盖这里的禁用。
+    /// 该字段保留旧的 usage projection 命名以兼容现有配置。开启后，非流式请求不进入
+    /// 本系统 usage 整形、input 采样和补偿，也不会读取或写入本地 prompt-cache 状态；
+    /// 外部池非流式响应会保持上游 usage 原样返回，本地凭证会使用上游 metadata 原始 usage。
+    /// 流式请求不受影响。
+    /// 全局策略模板里开启会影响继承该模板的路径，路径级配置可单独覆盖。
     #[serde(default)]
     pub skip_non_stream_usage_projection: bool,
 
@@ -1607,15 +1668,16 @@ impl CacheRoutePolicyPatch {
     }
 
     fn apply_no_cache_fields_to(&self, mut policy: CacheRoutePolicy) -> CacheRoutePolicy {
-        if let Some(reported_usage) = &self.reported_usage {
-            policy.reported_usage = reported_usage.normalized();
-        }
+        policy.reported_usage = ReportedUsagePathPolicy::disabled().normalized();
         policy.normalized()
     }
 
     fn apply_kiro_rs_tool_fields_to(&self, mut policy: CacheRoutePolicy) -> CacheRoutePolicy {
         if let Some(cache_type) = self.cache_type {
             policy.cache_type = cache_type;
+        }
+        if let Some(reported_usage) = &self.reported_usage {
+            policy.reported_usage = reported_usage.normalized();
         }
         if let Some(patch) = self.cache_point {
             policy.cache_point = patch.apply_to(policy.cache_point);
@@ -1805,7 +1867,7 @@ impl CachePolicyConfig {
                 ..base.creation_control
             }
             .normalized(),
-            reported_usage: base.reported_usage,
+            reported_usage: ReportedUsagePathPolicy::disabled().normalized(),
             cache_point: CachePointPolicy {
                 enabled: false,
                 ..base.cache_point
@@ -2190,6 +2252,45 @@ impl Default for ExternalPoolCapacityMode {
     }
 }
 
+/// 外部池流式响应处理模式。
+///
+/// `event_passthrough` 保持 SSE event 级透传，并会屏蔽上游流式错误事件中的
+/// 内部细节。是否改写下游可见 usage 不由这里决定，而由单个外部池的
+/// `usageProjectionMode` 决定：`pass_through` 原样返回上游 usage，
+/// `current_path_policy` 按入口路径缓存策略整理 usage。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ExternalPoolStreamResponseMode {
+    #[serde(
+        rename = "event_passthrough",
+        alias = "event_passthrough_usage_rewrite",
+        alias = "event_passthrough_capture"
+    )]
+    EventPassthrough,
+}
+
+impl Default for ExternalPoolStreamResponseMode {
+    fn default() -> Self {
+        Self::EventPassthrough
+    }
+}
+
+impl ExternalPoolStreamResponseMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EventPassthrough => "event_passthrough",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "event_passthrough"
+            | "event_passthrough_usage_rewrite"
+            | "event_passthrough_capture" => Self::EventPassthrough,
+            _ => Self::default(),
+        }
+    }
+}
+
 /// 外部备用号池全局策略配置。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -2282,6 +2383,8 @@ pub struct ExternalPoolsConfig {
     pub external_pool_usage_projection_output_uplift_min_tokens: i32,
     #[serde(default)]
     pub external_pool_usage_projection_output_uplift_percent: u32,
+    #[serde(default)]
+    pub external_pool_stream_response_mode: ExternalPoolStreamResponseMode,
 }
 
 impl Default for ExternalPoolsConfig {
@@ -2342,6 +2445,7 @@ impl Default for ExternalPoolsConfig {
                 default_external_pool_usage_projection_uplift_percent(),
             external_pool_usage_projection_output_uplift_min_tokens: 0,
             external_pool_usage_projection_output_uplift_percent: 0,
+            external_pool_stream_response_mode: ExternalPoolStreamResponseMode::default(),
         }
     }
 }
@@ -2638,6 +2742,10 @@ pub struct Config {
     #[serde(default)]
     pub body_conversion: BodyConversionConfig,
 
+    /// Messages 请求缺少顶层 max_tokens 时的入口兼容策略。
+    #[serde(default)]
+    pub missing_max_tokens: MissingMaxTokensConfig,
+
     /// Kiro payload shaping 配置。默认只压缩旧历史和明显冗余，不截断当前输入。
     #[serde(default)]
     pub payload_shaping: PayloadShapingConfig,
@@ -2828,7 +2936,7 @@ pub struct Config {
     #[serde(default = "default_prompt_cache_estimated_bytes_limit")]
     pub prompt_cache_estimated_bytes_limit: u64,
 
-    /// 下游 usage 上报投影配置。
+    /// 下游 usage 上报整理配置。
     ///
     /// 默认策略先应用，再按路径前缀使用最长匹配覆盖；只影响 response usage
     /// 和后台 usage record，不影响 prompt-cache reader 计算、tracker 更新和上游请求。
@@ -3117,6 +3225,10 @@ fn default_current_images_max_bytes() -> usize {
 
 fn default_payload_guard_enabled() -> bool {
     true
+}
+
+fn default_missing_max_tokens_value() -> i32 {
+    DEFAULT_MISSING_MAX_TOKENS_VALUE
 }
 
 fn default_payload_guard_mode() -> PayloadGuardMode {
@@ -3564,6 +3676,7 @@ impl Default for Config {
             compression: CompressionConfig::default(),
             image_processing: ImageProcessingConfig::default(),
             body_conversion: BodyConversionConfig::default(),
+            missing_max_tokens: MissingMaxTokensConfig::default(),
             payload_shaping: PayloadShapingConfig::default(),
             payload_guard_enabled: default_payload_guard_enabled(),
             payload_guard_mode: default_payload_guard_mode(),
@@ -3950,6 +4063,10 @@ mod tests {
             30
         );
         assert_eq!(config.external_pools.external_pool_max_queued_requests, 0);
+        assert_eq!(
+            config.external_pools.external_pool_stream_response_mode,
+            ExternalPoolStreamResponseMode::EventPassthrough
+        );
         assert!(!config.compression.enabled);
         assert!(config.compression.whitespace_compression);
         assert_eq!(
@@ -4141,6 +4258,10 @@ mod tests {
                 .external_pool_auto_disable_on_channel_disabled
         );
         assert_eq!(config.external_pools.external_pool_max_queued_requests, 25);
+        assert_eq!(
+            config.external_pools.external_pool_stream_response_mode,
+            ExternalPoolStreamResponseMode::EventPassthrough
+        );
 
         let wait_config: Config = serde_json::from_str(
             r#"{
@@ -4162,6 +4283,24 @@ mod tests {
                 .external_pools
                 .external_pool_dispatch_max_wait_secs,
             3
+        );
+    }
+
+    #[test]
+    fn external_pool_stream_response_mode_accepts_legacy_capture_value() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "apiKey": "sk-test",
+                "externalPools": {
+                    "externalPoolStreamResponseMode": "event_passthrough_capture"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.external_pools.external_pool_stream_response_mode,
+            ExternalPoolStreamResponseMode::EventPassthrough
         );
     }
 
@@ -4437,8 +4576,8 @@ mod tests {
         assert!(!cc.policy.simulation.enabled);
         assert_eq!(cc.policy.simulation.token_scale, 1.0);
         assert_eq!(cc.policy.simulation.target_read_ratio, 0.98);
-        assert!(!cc.policy.reported_usage.enabled);
-        assert_eq!(cc.policy.reported_usage.input.max_tokens, 0);
+        assert!(cc.policy.reported_usage.enabled);
+        assert_eq!(cc.policy.reported_usage.input.max_tokens, 48);
         assert!(cc.policy.cache_point.enabled);
 
         let ha = config.cache_policy_for_path("/ha/v1/messages");
@@ -4737,8 +4876,15 @@ mod tests {
         assert_ne!(plain.policy.simulation.token_scale, 2.0);
         assert!(!plain.policy.creation_control.enabled);
         assert!(!plain.policy.cache_point.enabled);
-        assert_eq!(plain.policy.reported_usage.input.max_tokens, 111);
-        assert_eq!(plain.policy.reported_usage.output.max_tokens, 22);
+        assert!(!plain.policy.reported_usage.enabled);
+        assert_eq!(
+            plain.policy.reported_usage.input.mode,
+            ReportedUsageFieldMode::Raw
+        );
+        assert_eq!(
+            plain.policy.reported_usage.output.mode,
+            ReportedUsageFieldMode::Raw
+        );
         assert_ne!(plain.policy.bounds.max_entries_per_account, 2);
         assert_ne!(plain.policy.kiro_rs_tool.coverage_ratio, 0.2);
 
@@ -4748,7 +4894,8 @@ mod tests {
         assert!(!tool.policy.simulation.enabled);
         assert_eq!(tool.policy.simulation.token_scale, 1.0);
         assert!(!tool.policy.creation_control.enabled);
-        assert!(!tool.policy.reported_usage.enabled);
+        assert!(tool.policy.reported_usage.enabled);
+        assert_eq!(tool.policy.reported_usage.input.max_tokens, 123);
         assert!(tool.policy.cache_point.enabled);
         assert!(!tool.policy.cache_point.tools_only);
         assert!(tool.policy.cache_point.record_plan);
@@ -4870,6 +5017,13 @@ mod tests {
             resolved.policy.cache_type,
             PromptCacheStrategyType::KiroRsTool
         );
+        assert!(!resolved.policy.reported_usage.enabled);
+        assert!(
+            !resolved
+                .policy
+                .reported_usage
+                .skip_non_stream_usage_projection
+        );
 
         let inherited = config.cache_policy_for_path("/cc/v1/messages");
         assert_eq!(inherited.namespace, None);
@@ -4898,6 +5052,9 @@ mod tests {
         let mut config: Config = serde_json::from_value(serde_json::json!({
             "cachePolicy": {
                 "kiroRsTool": {
+                    "reportedUsage": {
+                        "skipNonStreamUsageProjection": true
+                    },
                     "kiroRsTool": {
                         "coverageRatio": 0.75,
                         "maxCoverageTokens": 12000,
@@ -4939,6 +5096,12 @@ mod tests {
         assert_eq!(
             resolved.policy.cache_type,
             PromptCacheStrategyType::KiroRsTool
+        );
+        assert!(
+            resolved
+                .policy
+                .reported_usage
+                .skip_non_stream_usage_projection
         );
         assert_eq!(resolved.policy.kiro_rs_tool.coverage_ratio, 0.5);
         assert_eq!(resolved.policy.kiro_rs_tool.max_coverage_tokens, 12_000);
@@ -5125,6 +5288,7 @@ mod tests {
         assert!(!resolved.policy.simulation.enabled);
         assert!(!resolved.policy.creation_control.enabled);
         assert!(!resolved.policy.cache_point.enabled);
+        assert!(!resolved.policy.reported_usage.enabled);
     }
 
     #[test]

@@ -63,7 +63,7 @@ use crate::http_client::{
     ProxyConfig, build_client, response_bytes_with_body_timeout, response_text_with_body_timeout,
     send_with_response_header_timeout,
 };
-use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::credentials::{KiroCredentials, profile_arn_region};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::{
     ConversationState, CurrentMessage, KiroRequest, UserInputMessage,
@@ -87,7 +87,7 @@ const BALANCE_CACHE_TTL_SECS: i64 = 300;
 const DEFAULT_CREDENTIALS_PAGE_LIMIT: usize = 12;
 const MAX_CREDENTIALS_PAGE_LIMIT: usize = 500;
 const CREDENTIAL_INFO_REFRESH_CONCURRENCY: usize = 16;
-const DEFAULT_VALIDATION_TEST_MODEL: &str = "claude-opus-4-5-20251101";
+const DEFAULT_VALIDATION_TEST_MODEL: &str = "claude-sonnet-4.5";
 const DEFAULT_VALIDATION_TEST_PROMPT: &str = "hi";
 const MAX_MANUAL_MODEL_ID_LEN: usize = 160;
 const USAGE_CLEANUP_DEFAULT_MAX_BATCHES: usize = 10_000;
@@ -104,6 +104,14 @@ const PROXY_TEST_PREVIEW_CHARS: usize = 300;
 #[derive(Debug, Clone, Default)]
 pub struct CredentialListQuery {
     pub q: Option<String>,
+    pub credential_id: Option<u64>,
+    pub account: Option<String>,
+    pub region: Option<String>,
+    pub model: Option<String>,
+    pub endpoint: Option<String>,
+    pub priority: Option<u32>,
+    pub rpm: Option<u32>,
+    pub concurrency: Option<u32>,
     pub status: Option<String>,
     pub auth_method: Option<String>,
     pub subscription: Option<String>,
@@ -1265,6 +1273,15 @@ impl AdminService {
         credentials.canonicalize_auth_method();
         credentials.normalize_supported_models();
         credentials.normalize_external_idp_defaults();
+        if credentials.api_region.as_deref().is_none_or(str::is_empty) {
+            if let Some(region) = credentials
+                .profile_arn
+                .as_deref()
+                .and_then(profile_arn_region)
+            {
+                credentials.api_region = Some(region.to_string());
+            }
+        }
         Ok(credentials)
     }
 
@@ -3706,6 +3723,7 @@ impl AdminService {
             whitespace_compression: config.compression.whitespace_compression,
             image_processing: config.image_processing.normalized(),
             body_conversion: config.body_conversion,
+            missing_max_tokens: config.missing_max_tokens.normalized(),
             payload_guard_enabled: config.payload_guard_enabled,
             payload_guard_mode: config.payload_guard_mode,
             payload_guard_max_bytes: config.payload_guard_max_bytes as u64,
@@ -3864,6 +3882,10 @@ impl AdminService {
         let body_conversion = req
             .body_conversion
             .unwrap_or(current_config.body_conversion);
+        let missing_max_tokens = req
+            .missing_max_tokens
+            .unwrap_or(current_config.missing_max_tokens)
+            .normalized();
         let payload_guard_mode = req
             .payload_guard_mode
             .unwrap_or(current_config.payload_guard_mode);
@@ -4065,6 +4087,9 @@ impl AdminService {
         weighted_capacity
             .validate()
             .map_err(AdminServiceError::InvalidCredential)?;
+        missing_max_tokens
+            .validate()
+            .map_err(AdminServiceError::InvalidCredential)?;
         if warmup_selection_percent > 100 {
             return Err(AdminServiceError::InvalidCredential(
                 "credentialWarmupSelectionPercent 不能大于 100".to_string(),
@@ -4230,6 +4255,7 @@ impl AdminService {
                 config.compression = compression.clone();
                 config.image_processing = image_processing;
                 config.body_conversion = body_conversion;
+                config.missing_max_tokens = missing_max_tokens;
                 config.payload_guard_enabled = payload_guard_enabled;
                 config.payload_guard_mode = payload_guard_mode;
                 config.payload_guard_max_bytes = payload_guard_max_bytes;
@@ -5420,6 +5446,80 @@ fn credential_matches_query(
     credential: &CredentialStatusItem,
     query: &CredentialListQuery,
 ) -> bool {
+    if let Some(credential_id) = query.credential_id {
+        if credential.id != credential_id {
+            return false;
+        }
+    }
+
+    if let Some(account) = query.account.as_deref() {
+        let account = account.trim().to_lowercase();
+        if !account.is_empty()
+            && !credential_text_fields_match(
+                &account,
+                [
+                    credential.email.as_deref(),
+                    credential.masked_api_key.as_deref(),
+                    credential.refresh_token_hash.as_deref(),
+                    credential.api_key_hash.as_deref(),
+                ],
+            )
+        {
+            return false;
+        }
+    }
+
+    if let Some(region) = query.region.as_deref() {
+        let region = region.trim().to_lowercase();
+        if !region.is_empty()
+            && !credential_text_fields_match(
+                &region,
+                [
+                    credential.region.as_deref(),
+                    credential.auth_region.as_deref(),
+                    credential.api_region.as_deref(),
+                    Some(credential.effective_auth_region.as_str()),
+                    Some(credential.effective_api_region.as_str()),
+                ],
+            )
+        {
+            return false;
+        }
+    }
+
+    if let Some(model) = query.model.as_deref() {
+        if !credential_models_match(&credential.supported_models, model) {
+            return false;
+        }
+    }
+
+    if let Some(endpoint) = query.endpoint.as_deref() {
+        let endpoint = endpoint.trim().to_lowercase();
+        if !endpoint.is_empty() && !credential.endpoint.to_lowercase().contains(&endpoint) {
+            return false;
+        }
+    }
+
+    if let Some(priority) = query.priority {
+        if credential.priority != priority {
+            return false;
+        }
+    }
+
+    if let Some(rpm) = query.rpm {
+        if credential.rpm != rpm && credential.rpm_override != Some(rpm) {
+            return false;
+        }
+    }
+
+    if let Some(concurrency) = query.concurrency {
+        if credential.max_concurrent_requests != concurrency
+            && credential.max_concurrent_requests_override != Some(concurrency)
+        {
+            return false;
+        }
+    }
+
     if let Some(proxy_resource_id) = query.proxy_resource_id {
         if credential.proxy_resource_id != Some(proxy_resource_id) {
             return false;
@@ -5508,6 +5608,80 @@ fn credential_base_matches_query(
     credential: &CredentialListItem,
     query: &CredentialListQuery,
 ) -> bool {
+    if let Some(credential_id) = query.credential_id {
+        if credential.id != credential_id {
+            return false;
+        }
+    }
+
+    if let Some(account) = query.account.as_deref() {
+        let account = account.trim().to_lowercase();
+        if !account.is_empty()
+            && !credential_text_fields_match(
+                &account,
+                [
+                    credential.email.as_deref(),
+                    credential.masked_api_key.as_deref(),
+                    credential.refresh_token_hash.as_deref(),
+                    credential.api_key_hash.as_deref(),
+                ],
+            )
+        {
+            return false;
+        }
+    }
+
+    if let Some(region) = query.region.as_deref() {
+        let region = region.trim().to_lowercase();
+        if !region.is_empty()
+            && !credential_text_fields_match(
+                &region,
+                [
+                    credential.region.as_deref(),
+                    credential.auth_region.as_deref(),
+                    credential.api_region.as_deref(),
+                    Some(credential.effective_auth_region.as_str()),
+                    Some(credential.effective_api_region.as_str()),
+                ],
+            )
+        {
+            return false;
+        }
+    }
+
+    if let Some(model) = query.model.as_deref() {
+        if !credential_models_match(&credential.supported_models, model) {
+            return false;
+        }
+    }
+
+    if let Some(endpoint) = query.endpoint.as_deref() {
+        let endpoint = endpoint.trim().to_lowercase();
+        if !endpoint.is_empty() && !credential.endpoint.to_lowercase().contains(&endpoint) {
+            return false;
+        }
+    }
+
+    if let Some(priority) = query.priority {
+        if credential.priority != priority {
+            return false;
+        }
+    }
+
+    if let Some(rpm) = query.rpm {
+        if credential.rpm != rpm && credential.rpm_override != Some(rpm) {
+            return false;
+        }
+    }
+
+    if let Some(concurrency) = query.concurrency {
+        if credential.max_concurrent_requests != concurrency
+            && credential.max_concurrent_requests_override != Some(concurrency)
+        {
+            return false;
+        }
+    }
+
     if let Some(proxy_resource_id) = query.proxy_resource_id {
         if credential.proxy_resource_id != Some(proxy_resource_id) {
             return false;
@@ -5586,6 +5760,27 @@ fn credential_base_matches_query(
     true
 }
 
+fn credential_text_fields_match<'a>(
+    needle: &str,
+    fields: impl IntoIterator<Item = Option<&'a str>>,
+) -> bool {
+    fields
+        .into_iter()
+        .flatten()
+        .any(|value| value.trim().to_lowercase().contains(needle))
+}
+
+fn credential_models_match(supported_models: &[String], model: &str) -> bool {
+    let model = model.trim().to_lowercase();
+    if model.is_empty() {
+        return true;
+    }
+    supported_models.is_empty()
+        || supported_models
+            .iter()
+            .any(|value| value.to_lowercase().contains(&model))
+}
+
 fn credential_subscription_title(credential: &CredentialStatusItem) -> Option<String> {
     credential
         .account_info
@@ -5614,6 +5809,13 @@ fn credential_search_text(credential: &CredentialStatusItem) -> String {
         credential.last_error_reason.clone(),
         Some(credential.endpoint.clone()),
         credential.auth_method.clone(),
+        credential.provider.clone(),
+        credential.region.clone(),
+        credential.auth_region.clone(),
+        credential.api_region.clone(),
+        Some(credential.effective_auth_region.clone()),
+        Some(credential.effective_api_region.clone()),
+        Some(credential.supported_models.join(" ")),
         Some(format!("priority:{}", credential.priority)),
         Some(format!(
             "concurrency:{}",
@@ -5655,6 +5857,9 @@ fn credential_base_search_text(credential: &CredentialListItem) -> String {
         credential.region.clone(),
         credential.auth_region.clone(),
         credential.api_region.clone(),
+        Some(credential.effective_auth_region.clone()),
+        Some(credential.effective_api_region.clone()),
+        Some(credential.supported_models.join(" ")),
         Some(format!("priority:{}", credential.priority)),
         Some(format!(
             "concurrency:{}",
@@ -6462,6 +6667,9 @@ mod tests {
         credential.max_concurrent_requests_override = Some(7);
         credential.rpm = 60;
         credential.rpm_override = Some(60);
+        credential.api_region = Some("us-west-2".to_string());
+        credential.effective_api_region = "us-west-2".to_string();
+        credential.supported_models = vec!["claude-opus-4.8".to_string()];
 
         for status in [
             "custom_priority",
@@ -6488,6 +6696,37 @@ mod tests {
                 credential_matches_query(&credential, &query),
                 "{q} should match"
             );
+        }
+
+        for query in [
+            CredentialListQuery {
+                credential_id: Some(9),
+                ..Default::default()
+            },
+            CredentialListQuery {
+                account: Some("user9@example.com".to_string()),
+                ..Default::default()
+            },
+            CredentialListQuery {
+                region: Some("us-west-2".to_string()),
+                ..Default::default()
+            },
+            CredentialListQuery {
+                model: Some("opus-4.8".to_string()),
+                ..Default::default()
+            },
+            CredentialListQuery {
+                endpoint: Some("ide".to_string()),
+                ..Default::default()
+            },
+            CredentialListQuery {
+                priority: Some(4),
+                rpm: Some(60),
+                concurrency: Some(7),
+                ..Default::default()
+            },
+        ] {
+            assert!(credential_matches_query(&credential, &query));
         }
     }
 

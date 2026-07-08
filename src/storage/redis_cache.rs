@@ -4260,6 +4260,11 @@ fn usage_record_matches_query(record: &UsageRecord, query: &UsageRecordQuery) ->
             return false;
         }
     }
+    if let Some(route_kind) = query.route_kind {
+        if record.route_kind != Some(route_kind) {
+            return false;
+        }
+    }
     if let Some(model) = query.model.as_deref() {
         if record.model != model
             && record.upstream_model.as_deref() != Some(model)
@@ -4285,6 +4290,14 @@ fn usage_record_matches_query(record: &UsageRecord, query: &UsageRecordQuery) ->
     }
     if let Some(min_cache_read) = query.min_cache_read {
         if record.cache_read_input_tokens < min_cache_read {
+            return false;
+        }
+    }
+    if let Some(min_first_token_latency_ms) = query.min_first_token_latency_ms {
+        if record
+            .first_token_latency_ms
+            .map_or(true, |value| value < min_first_token_latency_ms)
+        {
             return false;
         }
     }
@@ -4686,6 +4699,7 @@ mod tests {
             pricing_available: true,
             pricing_model: Some("claude-sonnet-4-5".to_string()),
             usage_projection_mode: "current_path_policy".to_string(),
+            stream_response_mode: None,
         });
         let error = usage_record(
             "redis-usage-error",

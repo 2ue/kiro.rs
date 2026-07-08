@@ -67,6 +67,14 @@ export interface CredentialsPageQuery {
   page: number
   limit: number
   q?: string
+  credentialId?: number
+  account?: string
+  region?: string
+  model?: string
+  endpoint?: string
+  priority?: number
+  rpm?: number
+  concurrency?: number
   status?: string
   authMethod?: string
   subscription?: string
@@ -628,6 +636,8 @@ export type UsageSource =
   | 'request_estimate'
   | 'none'
 
+export type UsageRouteKindFilter = 'local_credential' | 'external_pool'
+
 export interface UsageLatencyTrace {
   capacityWeightUnits?: number
   estimatedInputTokens?: number
@@ -671,6 +681,7 @@ export interface UsageRecord {
   endpoint: string
   stream: boolean
   model: string
+  requestedMaxTokens?: number
   upstreamModel?: string
   externalOutboundModel?: string
   modelResolutionSource?: string
@@ -714,6 +725,10 @@ export interface UsageRecord {
   errorType?: string
   errorMessage?: string
   errorDetail?: string
+  errorStatusCode?: number
+  errorSource?: string
+  errorId?: string
+  errorMetadata?: unknown
   publicErrorStatusCode?: number
   publicErrorType?: string
   publicErrorMessage?: string
@@ -764,6 +779,7 @@ export interface ExternalPoolBilling {
   pricingAvailable: boolean
   pricingModel?: string
   usageProjectionMode: string
+  streamResponseMode?: ExternalPoolStreamResponseMode
 }
 
 export interface ExternalPoolAttempt {
@@ -984,11 +1000,15 @@ export interface UsageRecordsQuery {
   conversationId?: string
   credentialId?: number
   externalPoolId?: number
+  routeKind?: UsageRouteKindFilter
   model?: string
   status?: UsageRecordStatus
   source?: UsageSource
   stream?: boolean
   minCacheRead?: number
+  minFirstTokenLatencyMs?: number
+  since?: string
+  until?: string
 }
 
 export interface UsageRecordsPageQuery extends UsageRecordsQuery {
@@ -1028,6 +1048,7 @@ export type ModelMappingRuleKind = 'version_equivalent' | 'alias' | 'fallback'
 export type PayloadGuardMode = 'preemptive' | 'on_too_long'
 export type ExternalPoolAuthType = 'bearer' | 'x_api_key'
 export type ExternalPoolUsageProjectionMode = 'pass_through' | 'current_path_policy'
+export type ExternalPoolStreamResponseMode = 'event_passthrough'
 export type ExternalPoolRequestBodyMode = 'normalized' | 'raw_passthrough'
 export type ExternalPoolRawModelMode = 'none' | 'probe_only' | 'rewrite_top_level'
 export type ExternalPoolAutoDisablePolicy = 'inherit' | 'disabled' | 'enabled'
@@ -1236,6 +1257,7 @@ export interface ExternalPoolsConfig {
   externalPoolUsageProjectionUpliftPercent: number
   externalPoolUsageProjectionOutputUpliftMinTokens: number
   externalPoolUsageProjectionOutputUpliftPercent: number
+  externalPoolStreamResponseMode: ExternalPoolStreamResponseMode
 }
 
 export interface ExternalPool {
@@ -1249,6 +1271,7 @@ export interface ExternalPool {
   priority: number
   maxConcurrentRequests: number
   usageProjectionMode: ExternalPoolUsageProjectionMode
+  streamResponseMode?: ExternalPoolStreamResponseMode
   requestBodyMode: ExternalPoolRequestBodyMode
   rawModelMode: ExternalPoolRawModelMode
   autoDisablePolicy: ExternalPoolAutoDisablePolicy
@@ -1294,6 +1317,7 @@ export interface CreateExternalPoolRequest {
   priority?: number
   maxConcurrentRequests?: number
   usageProjectionMode?: ExternalPoolUsageProjectionMode
+  streamResponseMode?: ExternalPoolStreamResponseMode | null
   requestBodyMode?: ExternalPoolRequestBodyMode
   rawModelMode?: ExternalPoolRawModelMode
   autoDisablePolicy?: ExternalPoolAutoDisablePolicy
@@ -1315,6 +1339,7 @@ export interface UpdateExternalPoolRequest {
   priority?: number
   maxConcurrentRequests?: number
   usageProjectionMode?: ExternalPoolUsageProjectionMode
+  streamResponseMode?: ExternalPoolStreamResponseMode | null
   requestBodyMode?: ExternalPoolRequestBodyMode
   rawModelMode?: ExternalPoolRawModelMode
   autoDisablePolicy?: ExternalPoolAutoDisablePolicy
@@ -1364,6 +1389,13 @@ export interface WeightedCapacityConfig {
   tiers: WeightedCapacityTier[]
 }
 
+export type MissingMaxTokensPolicy = 'reject' | 'default_value'
+
+export interface MissingMaxTokensConfig {
+  policy: MissingMaxTokensPolicy
+  defaultValue: number
+}
+
 export interface RuntimeConfig {
   proxyUrl?: string | null
   proxyUsername?: string | null
@@ -1409,6 +1441,7 @@ export interface RuntimeConfig {
   whitespaceCompression: boolean
   imageProcessing: ImageProcessingConfig
   bodyConversion: BodyConversionConfig
+  missingMaxTokens: MissingMaxTokensConfig
   payloadGuardEnabled: boolean
   payloadGuardMode: PayloadGuardMode
   payloadGuardMaxBytes: number

@@ -54,7 +54,6 @@ Static gates:
 - `cargo fmt --check`: pass.
 - `git diff --check`: pass.
 - `pnpm check` in `ui/`: pass.
-- `pnpm exec tsc -b --pretty false` in `admin-ui/`: pass.
 - `CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc cargo test`: pass, 904 main tests and 19 `kiro_loadtest` tests.
 - `CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc cargo build --release`: pass, 3m39s.
 

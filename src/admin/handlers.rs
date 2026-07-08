@@ -27,7 +27,7 @@ use super::{
         ValidateExistingCredentialsRequest, ValidateExternalCredentialsRequest,
     },
 };
-use crate::anthropic::usage::{UsageRecordQuery, UsageRecordStatus, UsageSource};
+use crate::anthropic::usage::{UsageRecordQuery, UsageRecordStatus, UsageRouteKind, UsageSource};
 use crate::external_pool::{
     CreateExternalPoolRequest, SetExternalPoolEnabledRequest, UpdateExternalPoolRequest,
 };
@@ -38,6 +38,16 @@ pub struct CredentialsPageQueryParams {
     pub page: Option<usize>,
     pub limit: Option<usize>,
     pub q: Option<String>,
+    #[serde(alias = "id")]
+    pub credential_id: Option<u64>,
+    #[serde(alias = "email")]
+    pub account: Option<String>,
+    pub region: Option<String>,
+    pub model: Option<String>,
+    pub endpoint: Option<String>,
+    pub priority: Option<u32>,
+    pub rpm: Option<u32>,
+    pub concurrency: Option<u32>,
     pub status: Option<String>,
     pub auth_method: Option<String>,
     pub subscription: Option<String>,
@@ -86,17 +96,20 @@ pub struct AuditLogsQueryParams {
 #[serde(rename_all = "camelCase")]
 pub struct UsageRecordsQueryParams {
     pub limit: Option<usize>,
+    #[serde(alias = "request_id", alias = "reqId", alias = "req_id")]
     pub request_id: Option<String>,
     pub q: Option<String>,
     pub endpoint: Option<String>,
     pub conversation_id: Option<String>,
     pub credential_id: Option<u64>,
     pub external_pool_id: Option<u64>,
+    pub route_kind: Option<String>,
     pub model: Option<String>,
     pub status: Option<String>,
     pub source: Option<String>,
     pub stream: Option<bool>,
     pub min_cache_read: Option<i32>,
+    pub min_first_token_latency_ms: Option<u64>,
     pub since: Option<String>,
     pub until: Option<String>,
 }
@@ -106,17 +119,20 @@ pub struct UsageRecordsQueryParams {
 pub struct UsageRecordsPageQueryParams {
     pub page: Option<usize>,
     pub limit: Option<usize>,
+    #[serde(alias = "request_id", alias = "reqId", alias = "req_id")]
     pub request_id: Option<String>,
     pub q: Option<String>,
     pub endpoint: Option<String>,
     pub conversation_id: Option<String>,
     pub credential_id: Option<u64>,
     pub external_pool_id: Option<u64>,
+    pub route_kind: Option<String>,
     pub model: Option<String>,
     pub status: Option<String>,
     pub source: Option<String>,
     pub stream: Option<bool>,
     pub min_cache_read: Option<i32>,
+    pub min_first_token_latency_ms: Option<u64>,
     pub since: Option<String>,
     pub until: Option<String>,
 }
@@ -143,19 +159,29 @@ pub async fn get_system_version() -> Json<SystemVersionResponse> {
 
 impl UsageRecordsQueryParams {
     fn into_query(self) -> Result<UsageRecordQuery, String> {
+        let mut request_id = non_blank(self.request_id);
+        let mut q = non_blank(self.q);
+        if request_id.is_none() {
+            if let Some(extracted) = q.as_deref().and_then(extract_request_id_token) {
+                request_id = Some(extracted);
+                q = None;
+            }
+        }
         Ok(UsageRecordQuery {
             limit: self.limit.unwrap_or_default(),
-            request_id: non_blank(self.request_id),
-            q: non_blank(self.q),
+            request_id,
+            q,
             endpoint: non_blank(self.endpoint),
             conversation_id: non_blank(self.conversation_id),
             credential_id: self.credential_id,
             external_pool_id: self.external_pool_id,
+            route_kind: parse_optional_usage_route_kind(self.route_kind)?,
             model: non_blank(self.model),
             status: parse_optional_usage_status(self.status)?,
             source: parse_optional_usage_source(self.source)?,
             stream: self.stream,
             min_cache_read: self.min_cache_read,
+            min_first_token_latency_ms: self.min_first_token_latency_ms,
             since: parse_optional_time(self.since)?,
             until: parse_optional_time(self.until)?,
         })
@@ -166,19 +192,29 @@ impl UsageRecordsPageQueryParams {
     fn into_query(self) -> Result<(UsageRecordQuery, usize, usize), String> {
         let page = self.page.unwrap_or_default();
         let limit = self.limit.unwrap_or_default();
+        let mut request_id = non_blank(self.request_id);
+        let mut q = non_blank(self.q);
+        if request_id.is_none() {
+            if let Some(extracted) = q.as_deref().and_then(extract_request_id_token) {
+                request_id = Some(extracted);
+                q = None;
+            }
+        }
         let query = UsageRecordQuery {
             limit,
-            request_id: non_blank(self.request_id),
-            q: non_blank(self.q),
+            request_id,
+            q,
             endpoint: non_blank(self.endpoint),
             conversation_id: non_blank(self.conversation_id),
             credential_id: self.credential_id,
             external_pool_id: self.external_pool_id,
+            route_kind: parse_optional_usage_route_kind(self.route_kind)?,
             model: non_blank(self.model),
             status: parse_optional_usage_status(self.status)?,
             source: parse_optional_usage_source(self.source)?,
             stream: self.stream,
             min_cache_read: self.min_cache_read,
+            min_first_token_latency_ms: self.min_first_token_latency_ms,
             since: parse_optional_time(self.since)?,
             until: parse_optional_time(self.until)?,
         };
@@ -187,7 +223,18 @@ impl UsageRecordsPageQueryParams {
 }
 
 fn non_blank(value: Option<String>) -> Option<String> {
-    value.filter(|v| !v.trim().is_empty())
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn extract_request_id_token(value: &str) -> Option<String> {
+    let start = value.find("req_")?;
+    let token = value[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .collect::<String>();
+    (token.len() > "req_".len()).then_some(token)
 }
 
 fn parse_optional_usage_status(value: Option<String>) -> Result<Option<UsageRecordStatus>, String> {
@@ -198,6 +245,13 @@ fn parse_optional_usage_status(value: Option<String>) -> Result<Option<UsageReco
 fn parse_optional_usage_source(value: Option<String>) -> Result<Option<UsageSource>, String> {
     let value = non_blank(value);
     value.as_deref().map(parse_usage_source).transpose()
+}
+
+fn parse_optional_usage_route_kind(
+    value: Option<String>,
+) -> Result<Option<UsageRouteKind>, String> {
+    let value = non_blank(value);
+    value.as_deref().map(parse_usage_route_kind).transpose()
 }
 
 fn parse_optional_time(value: Option<String>) -> Result<Option<DateTime<Utc>>, String> {
@@ -211,6 +265,14 @@ fn parse_usage_status(value: &str) -> Result<UsageRecordStatus, String> {
 
 fn parse_usage_source(value: &str) -> Result<UsageSource, String> {
     UsageSource::parse(value).ok_or_else(|| format!("无效 source: {}", value))
+}
+
+fn parse_usage_route_kind(value: &str) -> Result<UsageRouteKind, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "local_credential" | "local-credential" | "local" => Ok(UsageRouteKind::LocalCredential),
+        "external_pool" | "external-pool" | "external" => Ok(UsageRouteKind::ExternalPool),
+        _ => Err(format!("无效 routeKind: {}", value)),
+    }
 }
 
 fn parse_time(value: &str) -> Result<DateTime<Utc>, String> {
@@ -237,6 +299,14 @@ pub async fn get_credentials_page(
         params.limit.unwrap_or_default(),
         super::service::CredentialListQuery {
             q: non_blank(params.q),
+            credential_id: params.credential_id,
+            account: non_blank(params.account),
+            region: non_blank(params.region),
+            model: non_blank(params.model),
+            endpoint: non_blank(params.endpoint),
+            priority: params.priority,
+            rpm: params.rpm,
+            concurrency: params.concurrency,
             status: non_blank(params.status),
             auth_method: non_blank(params.auth_method),
             subscription: non_blank(params.subscription),
@@ -258,6 +328,14 @@ pub async fn get_credentials_list(
         params.limit.unwrap_or_default(),
         super::service::CredentialListQuery {
             q: non_blank(params.q),
+            credential_id: params.credential_id,
+            account: non_blank(params.account),
+            region: non_blank(params.region),
+            model: non_blank(params.model),
+            endpoint: non_blank(params.endpoint),
+            priority: params.priority,
+            rpm: params.rpm,
+            concurrency: params.concurrency,
             status: non_blank(params.status),
             auth_method: non_blank(params.auth_method),
             subscription: non_blank(params.subscription),
@@ -1220,12 +1298,14 @@ mod tests {
             conversation_id: Some("   ".to_string()),
             credential_id: Some(7),
             external_pool_id: None,
+            route_kind: Some("external".to_string()),
             model: Some("".to_string()),
             status: Some("".to_string()),
             source: Some("   ".to_string()),
             endpoint: Some("   ".to_string()),
             stream: Some(true),
             min_cache_read: Some(10_000),
+            min_first_token_latency_ms: Some(10_000),
             since: None,
             until: None,
         }
@@ -1236,12 +1316,91 @@ mod tests {
         assert_eq!(query.q, None);
         assert_eq!(query.conversation_id, None);
         assert_eq!(query.credential_id, Some(7));
+        assert_eq!(query.route_kind, Some(UsageRouteKind::ExternalPool));
         assert_eq!(query.model, None);
         assert_eq!(query.status, None);
         assert_eq!(query.source, None);
         assert_eq!(query.endpoint, None);
         assert_eq!(query.stream, Some(true));
         assert_eq!(query.min_cache_read, Some(10_000));
+        assert_eq!(query.min_first_token_latency_ms, Some(10_000));
+    }
+
+    #[test]
+    fn usage_records_query_extracts_request_id_from_search_text() {
+        let query = UsageRecordsQueryParams {
+            limit: None,
+            request_id: None,
+            q: Some("请求 ID: req_01abcXYZ-123，模型 opus".to_string()),
+            conversation_id: None,
+            credential_id: None,
+            external_pool_id: None,
+            route_kind: None,
+            model: None,
+            status: None,
+            source: None,
+            endpoint: None,
+            stream: None,
+            min_cache_read: None,
+            min_first_token_latency_ms: None,
+            since: None,
+            until: None,
+        }
+        .into_query()
+        .expect("valid query");
+
+        assert_eq!(query.request_id.as_deref(), Some("req_01abcXYZ-123"));
+        assert_eq!(query.q, None);
+    }
+
+    #[test]
+    fn usage_records_page_query_accepts_http_request_id_names() {
+        let params: UsageRecordsPageQueryParams = serde_json::from_value(serde_json::json!({
+            "page": 1,
+            "limit": 20,
+            "requestId": " req_01camel "
+        }))
+        .expect("camelCase request id should deserialize");
+        let (query, page, limit) = params.into_query().expect("valid query");
+
+        assert_eq!(page, 1);
+        assert_eq!(limit, 20);
+        assert_eq!(query.request_id.as_deref(), Some("req_01camel"));
+
+        let params: UsageRecordsPageQueryParams = serde_json::from_value(serde_json::json!({
+            "req_id": "req_01snake"
+        }))
+        .expect("snake_case alias should deserialize");
+        let (query, _, _) = params.into_query().expect("valid query");
+
+        assert_eq!(query.request_id.as_deref(), Some("req_01snake"));
+    }
+
+    #[test]
+    fn usage_records_query_keeps_explicit_request_id_over_search_text() {
+        let query = UsageRecordsQueryParams {
+            limit: None,
+            request_id: Some("  req_01explicit  ".to_string()),
+            q: Some("req_01fromq".to_string()),
+            conversation_id: None,
+            credential_id: None,
+            external_pool_id: None,
+            route_kind: None,
+            model: None,
+            status: None,
+            source: None,
+            endpoint: None,
+            stream: None,
+            min_cache_read: None,
+            min_first_token_latency_ms: None,
+            since: None,
+            until: None,
+        }
+        .into_query()
+        .expect("valid query");
+
+        assert_eq!(query.request_id.as_deref(), Some("req_01explicit"));
+        assert_eq!(query.q.as_deref(), Some("req_01fromq"));
     }
 
     #[test]
@@ -1253,12 +1412,14 @@ mod tests {
             conversation_id: None,
             credential_id: None,
             external_pool_id: None,
+            route_kind: None,
             model: None,
             status: Some("ok".to_string()),
             source: None,
             endpoint: None,
             stream: None,
             min_cache_read: None,
+            min_first_token_latency_ms: None,
             since: None,
             until: None,
         }
@@ -1273,12 +1434,14 @@ mod tests {
             conversation_id: None,
             credential_id: None,
             external_pool_id: None,
+            route_kind: None,
             model: None,
             status: None,
             source: Some("cache".to_string()),
             endpoint: None,
             stream: None,
             min_cache_read: None,
+            min_first_token_latency_ms: None,
             since: None,
             until: None,
         }
@@ -1293,12 +1456,14 @@ mod tests {
             conversation_id: None,
             credential_id: None,
             external_pool_id: None,
+            route_kind: None,
             model: None,
             status: None,
             source: None,
             endpoint: None,
             stream: None,
             min_cache_read: None,
+            min_first_token_latency_ms: None,
             since: Some("not-a-time".to_string()),
             until: None,
         }
@@ -1317,12 +1482,14 @@ mod tests {
             conversation_id: Some("session-a".to_string()),
             credential_id: None,
             external_pool_id: None,
+            route_kind: None,
             model: None,
             status: None,
             source: None,
             endpoint: Some("/ha".to_string()),
             stream: None,
             min_cache_read: None,
+            min_first_token_latency_ms: None,
             since: None,
             until: None,
         }

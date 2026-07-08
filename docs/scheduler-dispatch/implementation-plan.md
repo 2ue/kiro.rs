@@ -138,15 +138,15 @@ Implemented UI behavior:
 - runtime config exposes category cooldowns, backoff, jitter, probation, global capacity, queue
   limit, health-score weights, EWMA alpha, and top-K.
 
-## Daisy Admin UI
+## Current `/ui` Admin UI
 
-Files changed under `admin-ui-daisy/`:
+Files changed under `ui/`:
 
 - `src/types/api.ts`
 - `src/api/credentials.ts`
 - `src/lib/runtime-config-defaults.ts`
-- `src/components/CredentialsPanel.tsx`
-- `src/components/ConfigPanel.tsx`
+- `src/features/credentials/`
+- `src/features/runtime/`
 
 Implemented behavior mirrors the old Admin UI:
 

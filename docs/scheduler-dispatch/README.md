@@ -11,7 +11,7 @@ has been applied in this repository.
 - [Final Strategy](./final-strategy.md): the dispatch model, hard filters, health scoring,
   cooldown policy, concurrency controls, observability, and deliberate non-goals.
 - [Implementation Record](./implementation-plan.md): what was changed in backend, Redis state,
-  Admin APIs, the old UI, the Daisy UI, and tests.
+  Admin APIs, the old UI, the current `/ui`, and tests.
 
 ## Implemented scope
 

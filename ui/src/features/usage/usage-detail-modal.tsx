@@ -174,6 +174,9 @@ export function UsageDetailModal({
             {record.publicErrorStatusCode != null && <DetailField label="客户端状态码" value={String(record.publicErrorStatusCode)} />}
             {record.publicErrorMessage && <DetailField label="客户端收到的错误" value={record.publicErrorMessage} />}
             {record.errorType && <DetailField label="错误类型" value={record.errorType} />}
+            {record.errorStatusCode != null && <DetailField label="内部状态码" value={String(record.errorStatusCode)} />}
+            {record.errorSource && <DetailField label="错误阶段" value={record.errorSource} />}
+            {record.errorId && <DetailField label="错误 ID" value={record.errorId} mono />}
             {record.errorMessage && <DetailField label="内部错误信息" value={record.errorMessage} />}
             {record.fallbackReason && <DetailField label="Fallback 原因" value={record.fallbackReason} />}
             {record.directPolicyReason && <DetailField label="直连原因" value={record.directPolicyReason} />}
@@ -386,7 +389,7 @@ export function UsageDetailModal({
                 <div className="text-xs text-muted-foreground">展示计费（shaped）</div>
                 <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.shapedUsage || billing.reportedUsage)}</div>
                 <div className="mt-1 font-medium">{formatUsd(billing.shapedCostUsd ?? billing.reportedCostUsd ?? 0)}</div>
-                <div className="text-xs text-muted-foreground">{billing.usageProjectionApplied ? '已按入口规则展示' : '保持原样'}</div>
+                <div className="text-xs text-muted-foreground">{billing.usageProjectionApplied ? '已按路径整理' : '透传上游'}</div>
               </div>
               <div>
                 <div className="text-xs text-muted-foreground">补偿后计费（uplifted）</div>
@@ -408,7 +411,7 @@ export function UsageDetailModal({
               <div>
                 <div className="text-xs text-muted-foreground">计价模型 / 用量模式</div>
                 <div className="mt-0.5 text-xs">{billing.pricingAvailable ? billing.pricingModel || 'priced' : 'unpriced'}</div>
-                <div className="text-xs text-muted-foreground">{billing.usageProjectionApplied ? '已按入口规则展示' : '保持原样'}</div>
+                <div className="text-xs text-muted-foreground">{billing.usageProjectionApplied ? '已按路径整理' : '透传上游'}</div>
               </div>
             </div>
           </div>
@@ -421,6 +424,15 @@ export function UsageDetailModal({
             {record.errorDetail || record.errorMessage || '-'}
           </pre>
         </div>
+
+        {record.errorMetadata != null && (
+          <div>
+            <SectionTitle>错误元数据</SectionTitle>
+            <pre className="max-h-72 overflow-auto rounded-lg bg-muted/30 p-3 text-xs whitespace-pre-wrap break-words">
+              {formatJsonBlock(record.errorMetadata)}
+            </pre>
+          </div>
+        )}
 
         {/* 请求内容诊断 */}
         {Boolean(record.payloadBreakdown || record.payloadGuardReport) && (

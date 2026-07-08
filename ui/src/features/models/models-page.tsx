@@ -520,7 +520,6 @@ export function ModelsPage() {
       <EditModelDialog
         open={addOpen}
         onClose={() => setAddOpen(false)}
-        onSaved={() => {}}
       />
       {editTarget && (
         <EditModelDialog
@@ -528,7 +527,6 @@ export function ModelsPage() {
           initial={editTarget}
           initialPricing={findPricing(priceIndex, editTarget.model)?.pricing}
           onClose={() => setEditTarget(null)}
-          onSaved={() => setEditTarget(null)}
         />
       )}
     </PageContainer>
@@ -542,10 +540,9 @@ interface EditModelDialogProps {
   initial?: ModelCapabilityItem
   initialPricing?: ModelPricing
   onClose: () => void
-  onSaved: () => void
 }
 
-function EditModelDialog({ open, initial, initialPricing, onClose, onSaved }: EditModelDialogProps) {
+function EditModelDialog({ open, initial, initialPricing, onClose }: EditModelDialogProps) {
   const upsert = useUpsertManualModel()
   const [form, setForm] = useState<ManualModelForm>(() => formFromModel(initial, initialPricing))
 
@@ -574,7 +571,6 @@ function EditModelDialog({ open, initial, initialPricing, onClose, onSaved }: Ed
     upsert.mutate(payload, {
       onSuccess: () => {
         toast.success(`模型 ${payload.model} 已保存`)
-        onSaved()
         onClose()
       },
       onError: (e) => toast.error(`保存失败: ${extractErrorMessage(e)}`),

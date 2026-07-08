@@ -546,7 +546,7 @@ Commands run:
 ```bash
 cargo fmt -- --check
 CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo check
-npm run build # in admin-ui
+pnpm --dir ui build
 CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo test credential_admin_list_options_include_account_info_snapshot
 CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo test credential_default_sort_keeps_enabled_then_newest_created
 CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo test credential_custom_sort_runs_before_pagination_order

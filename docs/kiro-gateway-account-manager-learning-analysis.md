@@ -228,7 +228,7 @@
 - `src/model/config.rs`
 - `src/admin/types.rs`
 - `src/admin/service.rs`
-- 新 UI：`admin-ui-daisy/src/components/ConfigPanel.tsx`
+- 新 UI：`ui/src/features/runtime/runtime-sections.tsx`
 - 旧 UI：`admin-ui/src/components/runtime-config-panel.tsx`
 
 这些配置写入 PgSQL runtime_config，热加载后对新请求生效。
