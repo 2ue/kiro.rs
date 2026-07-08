@@ -761,9 +761,8 @@ cargo check --locked --no-default-features
 前端：
 
 ```bash
-node tools/check-admin-ui-api-parity.mjs
 pnpm --dir admin-ui build
-pnpm --dir admin-ui-daisy build
+pnpm --dir ui build
 ```
 
 如果 macOS 链接器环境需要显式指定：

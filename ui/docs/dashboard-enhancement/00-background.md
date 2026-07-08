@@ -10,7 +10,7 @@
 
 | 目录 | 代号 | 技术栈 | 定位 |
 |---|---|---|---|
-| `admin-ui-daisy/` | daisy 老版 | React + react-daisyui + Tailwind v3 | 功能最全的老版 |
+| `admin-ui/` | 旧版 Admin UI | React + Tailwind | 旧版后台，对照保留 |
 | `admin-ui/` | 中间版 | React + Radix + CVA + Tailwind v3 | 过渡版 |
 | `ui/` | **新版（本方案对象）** | React 18 + shadcn/Radix + Tailwind v4 + react-router v6 + recharts | 最新重构版，四域 IA |
 

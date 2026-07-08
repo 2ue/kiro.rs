@@ -698,9 +698,8 @@ usage: Kiro usage adapter
 
 - `ui`
 - `admin-ui`
-- `admin-ui-daisy`
 
-三套 UI 均提供：
+两套 UI 均提供：
 
 - 外部池请求体模式：标准处理 / Raw 透传。
 - raw body 的顶层 model 写回开关放在现有外部池模型处理区域。

@@ -10,9 +10,7 @@
 ## Frontend Gates When UI Is Touched
 
 - `pnpm --dir admin-ui build`
-- `pnpm --dir admin-ui-daisy build`
 - `pnpm --dir ui build`
-- `node tools/check-admin-ui-api-parity.mjs`
 
 ## Protocol Gates When `/cc/v1` Or Usage Changes
 

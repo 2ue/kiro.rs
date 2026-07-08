@@ -86,6 +86,7 @@ pub struct AuditLogsQueryParams {
 #[serde(rename_all = "camelCase")]
 pub struct UsageRecordsQueryParams {
     pub limit: Option<usize>,
+    #[serde(alias = "request_id", alias = "reqId", alias = "req_id")]
     pub request_id: Option<String>,
     pub q: Option<String>,
     pub endpoint: Option<String>,
@@ -106,6 +107,7 @@ pub struct UsageRecordsQueryParams {
 pub struct UsageRecordsPageQueryParams {
     pub page: Option<usize>,
     pub limit: Option<usize>,
+    #[serde(alias = "request_id", alias = "reqId", alias = "req_id")]
     pub request_id: Option<String>,
     pub q: Option<String>,
     pub endpoint: Option<String>,
@@ -143,10 +145,18 @@ pub async fn get_system_version() -> Json<SystemVersionResponse> {
 
 impl UsageRecordsQueryParams {
     fn into_query(self) -> Result<UsageRecordQuery, String> {
+        let mut request_id = non_blank(self.request_id);
+        let mut q = non_blank(self.q);
+        if request_id.is_none() {
+            if let Some(extracted) = q.as_deref().and_then(extract_request_id_token) {
+                request_id = Some(extracted);
+                q = None;
+            }
+        }
         Ok(UsageRecordQuery {
             limit: self.limit.unwrap_or_default(),
-            request_id: non_blank(self.request_id),
-            q: non_blank(self.q),
+            request_id,
+            q,
             endpoint: non_blank(self.endpoint),
             conversation_id: non_blank(self.conversation_id),
             credential_id: self.credential_id,
@@ -166,10 +176,18 @@ impl UsageRecordsPageQueryParams {
     fn into_query(self) -> Result<(UsageRecordQuery, usize, usize), String> {
         let page = self.page.unwrap_or_default();
         let limit = self.limit.unwrap_or_default();
+        let mut request_id = non_blank(self.request_id);
+        let mut q = non_blank(self.q);
+        if request_id.is_none() {
+            if let Some(extracted) = q.as_deref().and_then(extract_request_id_token) {
+                request_id = Some(extracted);
+                q = None;
+            }
+        }
         let query = UsageRecordQuery {
             limit,
-            request_id: non_blank(self.request_id),
-            q: non_blank(self.q),
+            request_id,
+            q,
             endpoint: non_blank(self.endpoint),
             conversation_id: non_blank(self.conversation_id),
             credential_id: self.credential_id,
@@ -187,7 +205,18 @@ impl UsageRecordsPageQueryParams {
 }
 
 fn non_blank(value: Option<String>) -> Option<String> {
-    value.filter(|v| !v.trim().is_empty())
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn extract_request_id_token(value: &str) -> Option<String> {
+    let start = value.find("req_")?;
+    let token = value[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .collect::<String>();
+    (token.len() > "req_".len()).then_some(token)
 }
 
 fn parse_optional_usage_status(value: Option<String>) -> Result<Option<UsageRecordStatus>, String> {
@@ -1222,6 +1251,79 @@ mod tests {
         assert_eq!(query.endpoint, None);
         assert_eq!(query.stream, Some(true));
         assert_eq!(query.min_cache_read, Some(10_000));
+    }
+
+    #[test]
+    fn usage_records_query_extracts_request_id_from_search_text() {
+        let query = UsageRecordsQueryParams {
+            limit: None,
+            request_id: None,
+            q: Some("请求 ID: req_01abcXYZ-123，模型 opus".to_string()),
+            conversation_id: None,
+            credential_id: None,
+            external_pool_id: None,
+            model: None,
+            status: None,
+            source: None,
+            endpoint: None,
+            stream: None,
+            min_cache_read: None,
+            since: None,
+            until: None,
+        }
+        .into_query()
+        .expect("valid query");
+
+        assert_eq!(query.request_id.as_deref(), Some("req_01abcXYZ-123"));
+        assert_eq!(query.q, None);
+    }
+
+    #[test]
+    fn usage_records_page_query_accepts_http_request_id_names() {
+        let params: UsageRecordsPageQueryParams = serde_json::from_value(serde_json::json!({
+            "page": 1,
+            "limit": 20,
+            "requestId": " req_01camel "
+        }))
+        .expect("camelCase request id should deserialize");
+        let (query, page, limit) = params.into_query().expect("valid query");
+
+        assert_eq!(page, 1);
+        assert_eq!(limit, 20);
+        assert_eq!(query.request_id.as_deref(), Some("req_01camel"));
+
+        let params: UsageRecordsPageQueryParams = serde_json::from_value(serde_json::json!({
+            "req_id": "req_01snake"
+        }))
+        .expect("snake_case alias should deserialize");
+        let (query, _, _) = params.into_query().expect("valid query");
+
+        assert_eq!(query.request_id.as_deref(), Some("req_01snake"));
+    }
+
+    #[test]
+    fn usage_records_query_keeps_explicit_request_id_over_search_text() {
+        let query = UsageRecordsQueryParams {
+            limit: None,
+            request_id: Some("  req_01explicit  ".to_string()),
+            q: Some("req_01fromq".to_string()),
+            conversation_id: None,
+            credential_id: None,
+            external_pool_id: None,
+            model: None,
+            status: None,
+            source: None,
+            endpoint: None,
+            stream: None,
+            min_cache_read: None,
+            since: None,
+            until: None,
+        }
+        .into_query()
+        .expect("valid query");
+
+        assert_eq!(query.request_id.as_deref(), Some("req_01explicit"));
+        assert_eq!(query.q.as_deref(), Some("req_01fromq"));
     }
 
     #[test]

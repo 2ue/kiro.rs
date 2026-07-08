@@ -18,7 +18,7 @@ import {
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { forceRefreshToken, getCredentials, getCredentialAccountInfo, refreshCredentialInfo, testCredential } from '@/api/credentials'
+import { forceRefreshToken, getCredentials, getCredentialAccountInfo, getCredentialInfo, refreshCredentialInfo, testCredential } from '@/api/credentials'
 import {
   Badge,
   Button,
@@ -74,6 +74,7 @@ import {
 import { useDebouncedValue } from '@/hooks/use-debounced-value'
 import { useModelCapabilities } from '@/hooks/use-usage'
 import type {
+  BalanceResponse,
   CredentialAccountInfoItem,
   CredentialSortBy,
   CredentialSortOrder,
@@ -156,6 +157,8 @@ export function CredentialsPage() {
   const [verifyResults, setVerifyResults] = useState<Map<number, VerifyResult>>(new Map())
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [queryingCreditInfo, setQueryingCreditInfo] = useState(false)
+  const [balanceMap, setBalanceMap] = useState<Map<number, BalanceResponse>>(new Map())
+  const [loadingBalanceIds, setLoadingBalanceIds] = useState<Set<number>>(new Set())
   const [creditDetailsOpen, setCreditDetailsOpen] = useState(false)
   const [creditDetailsLoading, setCreditDetailsLoading] = useState(false)
   const [creditDetailRows, setCreditDetailRows] = useState<CreditDetailRow[]>([])
@@ -247,6 +250,51 @@ export function CredentialsPage() {
     queryClient.invalidateQueries({ queryKey: ['credential-credit-summary'] })
   }
 
+  const visibleCredentialIdSet = () => new Set(currentIds)
+
+  const applyBalanceItemsToVisibleCards = (
+    items: Array<{ id: number; ok?: boolean; info?: BalanceResponse | null }>,
+    visibleIds = visibleCredentialIdSet()
+  ) => {
+    const nextBalances: Array<[number, BalanceResponse]> = []
+    for (const item of items) {
+      if (item.ok && item.info && visibleIds.has(item.id)) {
+        nextBalances.push([item.id, item.info])
+      }
+    }
+    if (!nextBalances.length) return
+    setBalanceMap((prev) => {
+      const next = new Map(prev)
+      nextBalances.forEach(([id, info]) => next.set(id, info))
+      return next
+    })
+  }
+
+  const fetchBalanceForCredential = async (id: number) => {
+    setLoadingBalanceIds((prev) => new Set(prev).add(id))
+    try {
+      const balance = await getCredentialInfo(id, true)
+      setBalanceMap((prev) => new Map(prev).set(id, balance))
+      return { ok: true as const, balance }
+    } catch (error) {
+      return { ok: false as const, error }
+    } finally {
+      setLoadingBalanceIds((prev) => {
+        const next = new Set(prev)
+        next.delete(id)
+        return next
+      })
+    }
+  }
+
+  const queryCredentialBalance = async (id: number) => {
+    const result = await fetchBalanceForCredential(id)
+    invalidate()
+    await creditSummary.refetch()
+    if (result.ok) toast.success(`账号 #${id} 信息已更新`)
+    else toast.error(`查询信息失败: ${extractErrorMessage(result.error)}`)
+  }
+
   const loadCreditDetails = async () => {
     setCreditDetailsLoading(true)
     try {
@@ -288,15 +336,27 @@ export function CredentialsPage() {
 
   const updateAllCreditInfo = async () => {
     setQueryingCreditInfo(true)
+    setLoadingBalanceIds((prev) => {
+      const next = new Set(prev)
+      currentIds.forEach((id) => next.add(id))
+      return next
+    })
     try {
       const all = await getCredentials()
       const ids = all.credentials.map((item) => item.id)
       if (!ids.length) { toast.error('没有可查询信息的账号'); return }
       let total = 0; let success = 0; let failed = 0
+      const visibleIds = visibleCredentialIdSet()
       for (let i = 0; i < ids.length; i += CREDIT_INFO_BATCH_SIZE) {
         const batchIds = ids.slice(i, i + CREDIT_INFO_BATCH_SIZE)
         const data = await refreshCredentialInfo(batchIds, true)
         total += data.total; success += data.success; failed += data.failed
+        applyBalanceItemsToVisibleCards(data.items, visibleIds)
+        setLoadingBalanceIds((prev) => {
+          const next = new Set(prev)
+          batchIds.forEach((id) => next.delete(id))
+          return next
+        })
       }
       invalidate()
       await creditSummary.refetch()
@@ -307,6 +367,11 @@ export function CredentialsPage() {
       toast.error(`更新积分统计失败: ${extractErrorMessage(e)}`)
     } finally {
       setQueryingCreditInfo(false)
+      setLoadingBalanceIds((prev) => {
+        const next = new Set(prev)
+        currentIds.forEach((id) => next.delete(id))
+        return next
+      })
     }
   }
 
@@ -314,20 +379,37 @@ export function CredentialsPage() {
     const ids = Array.from(selectedIds)
     if (!ids.length) return toast.error('请先选择要查询积分的账号')
     setQueryingCreditInfo(true)
+    setLoadingBalanceIds((prev) => {
+      const next = new Set(prev)
+      ids.forEach((id) => next.add(id))
+      return next
+    })
     try {
       let success = 0; let failed = 0; let total = 0
       for (let i = 0; i < ids.length; i += CREDIT_INFO_BATCH_SIZE) {
         const batchIds = ids.slice(i, i + CREDIT_INFO_BATCH_SIZE)
         const data = await refreshCredentialInfo(batchIds, true)
         total += data.total; success += data.success; failed += data.failed
+        applyBalanceItemsToVisibleCards(data.items)
+        setLoadingBalanceIds((prev) => {
+          const next = new Set(prev)
+          batchIds.forEach((id) => next.delete(id))
+          return next
+        })
       }
       invalidate()
+      await creditSummary.refetch()
       if (failed === 0) toast.success(`积分查询完成：成功 ${success}/${total}`)
       else toast.warning(`积分查询完成：成功 ${success}，失败 ${failed}`)
     } catch (e) {
       toast.error(`查询积分失败: ${extractErrorMessage(e)}`)
     } finally {
       setQueryingCreditInfo(false)
+      setLoadingBalanceIds((prev) => {
+        const next = new Set(prev)
+        ids.forEach((id) => next.delete(id))
+        return next
+      })
     }
   }
 
@@ -813,9 +895,10 @@ export function CredentialsPage() {
                 credential={credential}
                 selected={selectedIds.has(credential.id)}
                 onToggleSelect={() => toggleSelect(credential.id)}
-                onQueryBalance={() => {}}
+                onQueryBalance={queryCredentialBalance}
                 onTest={setTestingCredential}
-                loadingBalance={false}
+                balance={balanceMap.get(credential.id)}
+                loadingBalance={loadingBalanceIds.has(credential.id)}
                 expanded={allExpanded}
               />
             ))}

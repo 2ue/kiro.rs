@@ -14,9 +14,9 @@
 - 外部池配置结构：`src/model/config.rs`。
 - 外部池持久化：`src/storage/postgres.rs`。
 - 外部池跨实例并发 lease、cooldown 辅助状态：`src/storage/redis_cache.rs`。
+- 新版管理后台入口和配置页：`ui/src/features/external-pools/`。
 - 旧版管理后台入口和配置页：`admin-ui/src/components/external-pools-panel.tsx`。
-- 新版 Daisy 管理后台入口和配置页：`admin-ui-daisy/src/components/ExternalPoolsPanel.tsx`。
-- Usage 路由/外部池链路展示：`admin-ui/src/components/usage-records-panel.tsx`、`admin-ui-daisy/src/components/UsagePanel.tsx`。
+- Usage 路由/外部池链路展示：`ui/src/features/usage/`、`admin-ui/src/components/usage-records-panel.tsx`。
 
 当前第一版明确生效的能力：
 
@@ -34,7 +34,7 @@
 12. 本地 400、请求体过长、context full、improper request、tool schema invalid、JSON invalid、tool_use/tool_result 问题不会 fallback 到外部池。
 13. 外部池自动禁用和人工 `enabled` 分离；自动禁用状态持久化在 Postgres，cooldown/in-flight/本地池熔断状态存 Redis。
 14. Usage record 会记录本地/外部路由类型、路由子类型、fallback/direct 原因、本地尝试链路、外部池尝试链路、最终外部池、是否应用 usage 投影。
-15. 旧版和新版管理后台都有独立 `备用池` 入口，支持策略配置、外部池新增/编辑/启停/删除/测试/清除自动禁用。
+15. 新版 `/ui` 和旧版 `/admin` 管理后台都有独立 `备用池` 入口，支持策略配置、外部池新增/编辑/启停/删除/测试/清除自动禁用。
 
 当前已落地的调度补充：
 
@@ -60,8 +60,7 @@
 
 - `cargo test --locked --no-default-features`：439 个 Rust 测试通过。
 - `pnpm --dir admin-ui build`：通过。
-- `pnpm --dir admin-ui-daisy build`：通过。
-- `node tools/check-admin-ui-api-parity.mjs`：通过，两个前端 API 覆盖一致。
+- `pnpm --dir ui build`：通过。
 
 ## 1. 背景
 

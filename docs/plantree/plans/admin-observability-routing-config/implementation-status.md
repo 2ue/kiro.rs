@@ -20,7 +20,6 @@ Last Verified:
 - `cargo test --locked --no-default-features`: pass with temporary Xcode toolchain env; 920 main tests and 19 `kiro_loadtest` tests passed.
 - `pnpm --dir ui build`: pass.
 - `pnpm --dir admin-ui build`: pass.
-- `pnpm --dir admin-ui-daisy build`: pass.
 - Fake upstream direct reports:
   - `target/loadtest/admin-routing-normal-stream.json`: 6/6 HTTP 200.
   - `target/loadtest/admin-routing-normal-non-stream.json`: 6/6 HTTP 200.

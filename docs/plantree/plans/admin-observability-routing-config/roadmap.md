@@ -18,10 +18,10 @@
 - Added normalized supported-model lists to local credentials and external pools. Empty list means unrestricted.
 - Wired supported-model lists into local credential eligibility and external pool selection before dispatch.
 - Added admin APIs to manually set supported models and sync from a chosen local credential.
-- Updated `ui`, `admin-ui`, and `admin-ui-daisy` with local credential and external pool supported-model controls.
+- Updated `ui` and `admin-ui` with local credential and external pool supported-model controls.
 - Added opt-in runtime config for selected prompt/protocol 400 retry classes with an untried credential and bounded max attempts.
 - Improved external pool form grouping so dispatch eligibility, body processing, model processing, usage projection, and error handling are visually separate.
-- Completed local regression: Rust tests, three frontend builds, and fake upstream smoke/chaos.
+- Completed local regression: Rust tests, frontend builds, and fake upstream smoke/chaos.
 
 ## In Progress
 

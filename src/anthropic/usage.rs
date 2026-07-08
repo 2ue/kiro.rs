@@ -1384,16 +1384,26 @@ impl UsageRecorder {
         page: usize,
         limit: usize,
     ) -> UsageRecordsPageResult {
-        if let Some(redis) = &self.redis_store {
-            let redis = redis.clone();
-            let redis_query = query.clone();
-            match block_on_usage_store(async move {
-                redis.usage_records_page(redis_query, page, limit).await
-            }) {
-                Ok(Some(result)) => return result,
-                Ok(None) => {}
-                Err(err) => {
-                    tracing::warn!("分页查询 Redis usage records 失败，回退 PgSQL: {}", err)
+        let has_generic_text_search = query
+            .q
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|q| !q.is_empty());
+        let should_try_redis =
+            query.request_id.is_some() || !has_generic_text_search || self.postgres_store.is_none();
+
+        if should_try_redis {
+            if let Some(redis) = &self.redis_store {
+                let redis = redis.clone();
+                let redis_query = query.clone();
+                match block_on_usage_store(async move {
+                    redis.usage_records_page(redis_query, page, limit).await
+                }) {
+                    Ok(Some(result)) => return result,
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!("分页查询 Redis usage records 失败，回退 PgSQL: {}", err)
+                    }
                 }
             }
         }

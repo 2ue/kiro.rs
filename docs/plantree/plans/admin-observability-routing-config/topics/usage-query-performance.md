@@ -15,7 +15,7 @@
 ## Implemented Behavior
 
 - Admin usage query DTOs now include `requestId`.
-- New, old, and Daisy usage UIs auto-detect `req_...` search input and send `requestId` instead of generic `q`.
+- `/ui` usage page exposes a dedicated request-id field and also auto-detects `req_...` in the generic search input, then sends `requestId` instead of generic `q`.
 - Memory usage recorder applies exact request id matching before generic search.
 - Redis usage query does direct record GET for `requestId`.
 - PgSQL usage query uses `id = $1` for `requestId`.
@@ -49,5 +49,8 @@
 ## Verification
 
 - Added memory usage recorder tests for exact request id, upstream model, and external outbound model filtering.
-- `cargo test --locked --no-default-features`: pass.
-- Three frontend builds: pass.
+- `cargo test usage_records_query -- --nocapture`: pass.
+- `cargo test usage_records_page_query_accepts_http_request_id_names -- --nocapture`: pass.
+- `cargo test recorder_query_supports_exact_request_id_and_model_aliases -- --nocapture`: pass.
+- `pnpm --dir ui build`: pass.
+- `pnpm --dir admin-ui build`: pass.

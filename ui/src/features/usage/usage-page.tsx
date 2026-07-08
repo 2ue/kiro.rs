@@ -77,7 +77,7 @@ import { UsageCleanupModal } from './usage-cleanup-modal'
 
 const AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:usage'
 const PAGE_SIZE = 20
-const REQUEST_ID_PATTERN = /^req_[A-Za-z0-9_-]+$/
+const REQUEST_ID_PATTERN = /req_[A-Za-z0-9_-]+/
 
 // ─── 工具函数 ──────────────────────────────────────────────────────────────────
 
@@ -103,6 +103,10 @@ function routeTargetLabel(record: UsageRecord, credentialLabel?: string): string
   }
   const label = credentialLabel ? ` ${credentialLabel}` : ''
   return `账号 #${record.credentialId ?? '-'}${label}`
+}
+
+function extractRequestId(value: string): string {
+  return value.match(REQUEST_ID_PATTERN)?.[0] ?? ''
 }
 
 // ─── 趋势图区 ─────────────────────────────────────────────────────────────────
@@ -186,6 +190,7 @@ function RecordsView({
 }) {
   const [page, setPage] = useState(1)
   const [q, setQ] = useState('')
+  const [requestId, setRequestId] = useState('')
   const [model, setModel] = useState('')
   const [endpoint, setEndpoint] = useState('')
   const [conversationId, setConversationId] = useState('')
@@ -197,6 +202,7 @@ function RecordsView({
 
   // 文本筛选项防抖,避免每次按键都触发查询(展示值即时,查询用防抖值)
   const qD = useDebouncedValue(q)
+  const requestIdD = useDebouncedValue(requestId)
   const modelD = useDebouncedValue(model)
   const endpointD = useDebouncedValue(endpoint)
   const conversationIdD = useDebouncedValue(conversationId)
@@ -220,10 +226,13 @@ function RecordsView({
   const query = useMemo<UsageRecordsPageQuery>(() => {
     const next: UsageRecordsPageQuery = { page, limit: PAGE_SIZE }
     const qValue = qD.trim()
-    if (qValue) {
-      if (REQUEST_ID_PATTERN.test(qValue)) next.requestId = qValue
-      else next.q = qValue
+    const requestIdInput = requestIdD.trim()
+    const requestIdValue = extractRequestId(requestIdInput) || requestIdInput || extractRequestId(qValue)
+    if (requestIdValue) {
+      next.requestId = requestIdValue
+      return next
     }
+    if (qValue) next.q = qValue
     if (modelD.trim()) next.model = modelD.trim()
     if (endpointD.trim()) next.endpoint = endpointD.trim()
     if (conversationIdD.trim()) next.conversationId = conversationIdD.trim()
@@ -238,18 +247,18 @@ function RecordsView({
     if (streamMode !== 'all') next.stream = streamMode === 'stream'
     if (minCacheReadD.trim() && Number.isFinite(Number(minCacheReadD))) next.minCacheRead = Number(minCacheReadD)
     return next
-  }, [conversationIdD, endpointD, minCacheReadD, modelD, page, qD, routeTarget, source, status, streamMode])
+  }, [conversationIdD, endpointD, minCacheReadD, modelD, page, qD, requestIdD, routeTarget, source, status, streamMode])
 
   const records = useUsageRecordsPage(query, autoRefreshInterval)
   const items = records.data?.records ?? []
   const hasNext = records.data?.hasNext ?? false
   const hasFilters =
     status !== '__all__' || source !== '__all__' || streamMode !== 'all' ||
-    !!q.trim() || !!model.trim() || !!endpoint.trim() || !!conversationId.trim() ||
+    !!q.trim() || !!requestId.trim() || !!model.trim() || !!endpoint.trim() || !!conversationId.trim() ||
     !!routeTarget || !!minCacheRead.trim()
 
   const clearFilters = () => {
-    setQ(''); setModel(''); setEndpoint(''); setConversationId('')
+    setQ(''); setRequestId(''); setModel(''); setEndpoint(''); setConversationId('')
     setRouteTarget(''); setStatus('__all__'); setSource('__all__')
     setStreamMode('all'); setMinCacheRead('')
   }
@@ -263,7 +272,7 @@ function RecordsView({
       >
         <div className="px-4 pt-4 pb-2">
           <Toolbar>
-            <ToolbarSearch value={q} onChange={(v) => { setQ(v); setPage(1) }} placeholder="搜索模型、账号、会话、路径、错误..." />
+            <ToolbarSearch value={q} onChange={(v) => { setQ(v); setPage(1) }} placeholder="搜索模型、账号、会话、路径、错误、req_..." />
             <ToolbarActions>
               {hasFilters && (
                 <Button variant="ghost" size="sm" onClick={() => { clearFilters(); setPage(1) }}>
@@ -276,6 +285,12 @@ function RecordsView({
 
           <div className="mt-2 rounded-lg bg-muted/30 p-3">
             <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+              <Input
+                placeholder="请求 ID / req_..."
+                value={requestId}
+                onChange={(e) => { setRequestId(e.target.value); setPage(1) }}
+                className="h-8 text-xs font-mono"
+              />
               <Input
                 placeholder="模型"
                 value={model}

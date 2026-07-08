@@ -197,8 +197,8 @@ Aggregate snapshots expose:
 - configured global concurrency limit;
 - configured global queue limit.
 
-Both the old Admin UI and the Daisy Admin UI show these values and expose runtime controls for the
-new scheduler fields.
+Both the old Admin UI and the current `/ui` Admin UI show these values and expose runtime controls
+for the new scheduler fields.
 
 ## Recommended settings
 

@@ -305,7 +305,7 @@ CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo test kiro::provider
 CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo test reported_usage -- --nocapture --test-threads=1
 CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo test sub2api -- --nocapture --test-threads=1
 (cd admin-ui && npm run build)
-(cd admin-ui-daisy && npm run build)
+(cd ui && npm run build)
 ```
 
 结果：
@@ -324,7 +324,7 @@ CC=/usr/bin/clang RUSTFLAGS='-C linker=/usr/bin/clang' cargo test sub2api -- --n
 - `cargo test reported_usage` 通过：23 个测试。
 - `cargo test sub2api` 通过：2 个测试。
 - `admin-ui` production build 通过。
-- `admin-ui-daisy` production build 通过。
+- `ui` production build 通过。
 
 压测观测：
 

@@ -63,4 +63,4 @@
 
 - Added unit tests for normalization/matching, credential `supports_model`, and external pool supported-model filtering.
 - `cargo test --locked --no-default-features`: pass.
-- `pnpm --dir ui build`, `pnpm --dir admin-ui build`, and `pnpm --dir admin-ui-daisy build`: pass.
+- `pnpm --dir ui build` and `pnpm --dir admin-ui build`: pass.

@@ -12,7 +12,7 @@
 | `http://服务器地址:8990/cc/v1` | Claude Code 兼容接口，保持 `/cc` 独立 usage 上报策略 |
 | `http://服务器地址:8990/ha/v1` | high-cache 接口，默认只改写 input 上报 |
 | `http://服务器地址:8990/na/v1` | no-cache usage 上报接口，默认只保留真实上游 cache usage |
-| `http://服务器地址:8990/console` | 新版 Daisy 管理后台 |
+| `http://服务器地址:8990/ui` | 新版管理后台 |
 | `http://服务器地址:8990/admin` | 旧版管理后台 |
 
 当前版本以 PgSQL + Redis 为必需依赖：
@@ -396,10 +396,10 @@ curl http://127.0.0.1:8990/v1/messages \
 浏览器打开：
 
 ```text
-http://服务器地址:8990/console
+http://服务器地址:8990/ui
 ```
 
-输入 `adminApiKey` 登录。新版后台入口是 `/console`，旧版后台仍保留在 `/admin`。两个版本共用同一组 `/api/admin/*` 接口，可管理凭据、测试凭据模型调用、查看余额、查看 usage 记录、修改运行配置、同步模型价格和导出凭据。
+输入 `adminApiKey` 登录。新版后台入口是 `/ui`，旧版后台仍保留在 `/admin`。两个版本共用同一组 `/api/admin/*` 接口，可管理凭据、测试凭据模型调用、查看余额、查看 usage 记录、修改运行配置、同步模型价格和导出凭据。
 
 ## 10. 数据持久化和备份
 

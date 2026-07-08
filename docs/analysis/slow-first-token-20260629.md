@@ -408,8 +408,6 @@ cargo test --locked --no-default-features selection_failure
 
 ```bash
 pnpm --dir admin-ui build
-pnpm --dir admin-ui-daisy install --frozen-lockfile
-pnpm --dir admin-ui-daisy build
 pnpm --dir ui install --frozen-lockfile
 pnpm --dir ui build
 cargo fmt --check
@@ -423,7 +421,7 @@ cargo test --locked --no-default-features -- --skip test_scheduler_state_sync_ti
 结果：
 
 - 合并远端 `origin/main` 到 `451602a` 后无冲突；恢复本地首字优化补丁无冲突。
-- 三个前端构建通过，目的是补齐 RustEmbed 需要的 `admin-ui/dist`、`admin-ui-daisy/dist` 和 `ui/dist`，并确保它们与远端新合入的前端源码一致。
+- 前端构建通过，目的是补齐 RustEmbed 需要的 `admin-ui/dist` 和 `ui/dist`，并确保它们与远端新合入的前端源码一致。
 - `cargo fmt --check` 通过。
 - `git diff --check` 通过，仅有 Git 换行符提示。
 - 新增外部池 retry cap 单测通过。

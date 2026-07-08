@@ -962,7 +962,7 @@ export function CachePolicySettingsSection({
 
   return (
     <div className="space-y-6">
-      <div className="grid gap-4 xl:grid-cols-2">
+      <div className="grid gap-4">
         <StrategyTemplateEditor
           title="本地模拟缓存策略默认参数"
           desc="使用本策略的路径会先读取这里的参数，再合并路径自己的参数。"
