@@ -501,7 +501,7 @@ function NonStreamCacheToggle({
     <div className="rounded-md border bg-muted/20 p-3">
       <TogField
         label="非流式 Usage 透传"
-        desc="开启后，命中此路径的非流式请求不做本系统 usage 投影、input 采样或补偿，也不推进本地缓存状态；外部池同步响应保持上游 usage 原样，本地凭证使用上游原始 metadata usage；流式请求保持原策略。"
+        desc="仅影响非流式请求。开启后，命中此路径时不做本系统 usage 整理、input 采样或补偿，也不推进本地缓存状态；外部池同步响应保持上游 usage 原样，本地凭证使用上游原始 metadata usage。"
         checked={Boolean(policy.skipNonStreamUsageProjection)}
         onChange={(skipNonStreamUsageProjection) =>
           onChange({ ...policy, skipNonStreamUsageProjection })
@@ -1444,7 +1444,7 @@ function PathPolicyEditor({
       />
       <TogField
         label="非流式 Usage 透传"
-        desc="开启后，命中此路径的非流式请求不做本系统 usage 投影、input 采样或补偿，也不推进本地缓存状态；外部池同步响应保持上游 usage 原样，本地凭证使用上游原始 metadata usage；流式请求保持原策略。"
+        desc="仅影响非流式请求。开启后，命中此路径时不做本系统 usage 整理、input 采样或补偿，也不推进本地缓存状态；外部池同步响应保持上游 usage 原样，本地凭证使用上游原始 metadata usage。"
         checked={Boolean(policy.skipNonStreamUsageProjection)}
         onChange={set('skipNonStreamUsageProjection')}
       />

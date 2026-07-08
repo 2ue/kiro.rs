@@ -783,7 +783,7 @@ export function RuntimePage() {
                     </p>
                   </div>
                   <div className="space-y-1.5">
-                    <div className="text-sm font-semibold">外部池默认流式响应 Usage 返回</div>
+                    <div className="text-sm font-semibold">外部池默认流式响应处理</div>
                     <Select
                       value={draft.externalPools.externalPoolStreamResponseMode}
                       onValueChange={(v) =>
@@ -794,12 +794,11 @@ export function RuntimePage() {
                     >
                       <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="event_passthrough_usage_rewrite">事件透传，usage 按入口投影</SelectItem>
-                        <SelectItem value="event_passthrough_capture">事件完全透传，仅内部计量</SelectItem>
+                        <SelectItem value="event_passthrough">事件级透传</SelectItem>
                       </SelectContent>
                     </Select>
                     <p className="text-xs leading-5 text-muted-foreground">
-                      作为外部池默认值；单个外部账号可以覆盖。默认事件级透传普通 SSE，只在实际有缓存读写时按入口策略投影流式 usage。
+                      作为外部池默认值；单个外部账号可以覆盖。仅决定 stream=true 时 SSE 事件如何转发。
                     </p>
                   </div>
                 </div>

@@ -578,7 +578,7 @@ impl Default for ReportedUsageFieldMode {
 
 /// 单个 usage 字段的下游上报策略。
 ///
-/// 这些策略只用于把内部计算出的 usage 投影成下游响应和后台记录看到的 usage；
+/// 这些策略只用于把内部计算出的 usage 整理成下游响应和后台记录看到的 usage；
 /// 不参与 prompt-cache tracker、reader 命中或上游请求计算。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -692,7 +692,7 @@ pub struct ReportedUsagePathPolicy {
     /// 命中该路径的非流式请求是否透传上游 usage。
     ///
     /// 该字段保留旧的 usage projection 命名以兼容现有配置。开启后，非流式请求不进入
-    /// 本系统 usage 字段投影、采样和补偿，也不会读取或写入本地 prompt-cache 状态；
+    /// 本系统 usage 整形、input 采样和补偿，也不会读取或写入本地 prompt-cache 状态；
     /// 外部池非流式响应会保持上游 usage 原样返回，本地凭证会使用上游 metadata 原始 usage。
     /// 流式请求不受影响。
     /// 全局策略模板里开启会影响继承该模板的路径，路径级配置可单独覆盖。
@@ -2196,35 +2196,38 @@ impl Default for ExternalPoolCapacityMode {
 
 /// 外部池流式响应处理模式。
 ///
-/// `event_passthrough_usage_rewrite` 会透传普通 SSE event，只把下游流式 usage
-/// event 改写为当前路径缓存策略口径；
-/// `event_passthrough_capture` 保持正常 SSE event 字节原样下发，只在内部捕获 usage
-/// 用于费用/历史记录。
+/// `event_passthrough` 保持 SSE event 级透传，并会屏蔽上游流式错误事件中的
+/// 内部细节。是否改写下游可见 usage 不由这里决定，而由单个外部池的
+/// `usageProjectionMode` 决定：`pass_through` 原样返回上游 usage，
+/// `current_path_policy` 按入口路径缓存策略整理 usage。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum ExternalPoolStreamResponseMode {
-    EventPassthroughUsageRewrite,
-    EventPassthroughCapture,
+    #[serde(
+        rename = "event_passthrough",
+        alias = "event_passthrough_usage_rewrite",
+        alias = "event_passthrough_capture"
+    )]
+    EventPassthrough,
 }
 
 impl Default for ExternalPoolStreamResponseMode {
     fn default() -> Self {
-        Self::EventPassthroughUsageRewrite
+        Self::EventPassthrough
     }
 }
 
 impl ExternalPoolStreamResponseMode {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::EventPassthroughUsageRewrite => "event_passthrough_usage_rewrite",
-            Self::EventPassthroughCapture => "event_passthrough_capture",
+            Self::EventPassthrough => "event_passthrough",
         }
     }
 
     pub fn parse(value: &str) -> Self {
         match value {
-            "event_passthrough_usage_rewrite" => Self::EventPassthroughUsageRewrite,
-            "event_passthrough_capture" => Self::EventPassthroughCapture,
+            "event_passthrough"
+            | "event_passthrough_usage_rewrite"
+            | "event_passthrough_capture" => Self::EventPassthrough,
             _ => Self::default(),
         }
     }
@@ -2871,7 +2874,7 @@ pub struct Config {
     #[serde(default = "default_prompt_cache_estimated_bytes_limit")]
     pub prompt_cache_estimated_bytes_limit: u64,
 
-    /// 下游 usage 上报投影配置。
+    /// 下游 usage 上报整理配置。
     ///
     /// 默认策略先应用，再按路径前缀使用最长匹配覆盖；只影响 response usage
     /// 和后台 usage record，不影响 prompt-cache reader 计算、tracker 更新和上游请求。
@@ -3995,7 +3998,7 @@ mod tests {
         assert_eq!(config.external_pools.external_pool_max_queued_requests, 0);
         assert_eq!(
             config.external_pools.external_pool_stream_response_mode,
-            ExternalPoolStreamResponseMode::EventPassthroughUsageRewrite
+            ExternalPoolStreamResponseMode::EventPassthrough
         );
         assert!(!config.compression.enabled);
         assert!(config.compression.whitespace_compression);
@@ -4190,7 +4193,7 @@ mod tests {
         assert_eq!(config.external_pools.external_pool_max_queued_requests, 25);
         assert_eq!(
             config.external_pools.external_pool_stream_response_mode,
-            ExternalPoolStreamResponseMode::EventPassthroughUsageRewrite
+            ExternalPoolStreamResponseMode::EventPassthrough
         );
 
         let wait_config: Config = serde_json::from_str(
@@ -4217,7 +4220,7 @@ mod tests {
     }
 
     #[test]
-    fn external_pool_stream_response_mode_can_select_capture_only() {
+    fn external_pool_stream_response_mode_accepts_legacy_capture_value() {
         let config: Config = serde_json::from_str(
             r#"{
                 "apiKey": "sk-test",
@@ -4230,7 +4233,7 @@ mod tests {
 
         assert_eq!(
             config.external_pools.external_pool_stream_response_mode,
-            ExternalPoolStreamResponseMode::EventPassthroughCapture
+            ExternalPoolStreamResponseMode::EventPassthrough
         );
     }
 

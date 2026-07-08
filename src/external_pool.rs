@@ -839,23 +839,15 @@ struct ExternalUsageCapture {
 struct ExternalStreamProcessingPlan {
     response_mode: ExternalPoolStreamResponseMode,
     mask_errors: bool,
-    rewrite_usage_for_downstream: bool,
     capture_usage: bool,
 }
 
 impl ExternalStreamProcessingPlan {
     fn from_mode(response_mode: ExternalPoolStreamResponseMode) -> Self {
         match response_mode {
-            ExternalPoolStreamResponseMode::EventPassthroughUsageRewrite => Self {
+            ExternalPoolStreamResponseMode::EventPassthrough => Self {
                 response_mode,
                 mask_errors: true,
-                rewrite_usage_for_downstream: true,
-                capture_usage: true,
-            },
-            ExternalPoolStreamResponseMode::EventPassthroughCapture => Self {
-                response_mode,
-                mask_errors: true,
-                rewrite_usage_for_downstream: false,
                 capture_usage: true,
             },
         }
@@ -863,10 +855,6 @@ impl ExternalStreamProcessingPlan {
 
     fn for_pool(pool: &ExternalPool, config: &ExternalPoolsConfig) -> Self {
         Self::from_mode(effective_external_pool_stream_response_mode(pool, config))
-    }
-
-    fn needs_usage_projection(self) -> bool {
-        self.rewrite_usage_for_downstream || self.capture_usage
     }
 }
 
@@ -1624,18 +1612,13 @@ impl ExternalPoolManager {
             route.latency_trace.mark_upstream_header(route.started_at);
             let body_stream = response.bytes_stream();
             let stream_plan = ExternalStreamProcessingPlan::for_pool(pool, config);
-            let projection_context = stream_plan
-                .needs_usage_projection()
-                .then(|| {
-                    build_external_usage_projection_context(
-                        route,
-                        pool,
-                        config.external_pool_usage_projection_uplift_percent,
-                        config.external_pool_usage_projection_output_uplift_min_tokens,
-                        config.external_pool_usage_projection_output_uplift_percent,
-                    )
-                })
-                .flatten();
+            let projection_context = build_external_usage_projection_context(
+                route,
+                pool,
+                config.external_pool_usage_projection_uplift_percent,
+                config.external_pool_usage_projection_output_uplift_min_tokens,
+                config.external_pool_usage_projection_output_uplift_percent,
+            );
             let stream_idle_timeout = (config.external_pool_stream_idle_timeout_secs > 0)
                 .then(|| Duration::from_secs(config.external_pool_stream_idle_timeout_secs));
             let stream_usage_projection = projection_context.clone();
@@ -4108,7 +4091,7 @@ fn process_sse_event_with_plan(
             return masked;
         }
     }
-    if plan.rewrite_usage_for_downstream && projection.is_some() {
+    if projection.is_some() {
         return rewrite_sse_event_usage(event, projection, capture);
     }
     if plan.capture_usage {
@@ -5510,7 +5493,7 @@ data: {"type":"error","error":{"type":"api_error","message":"raw external promo 
             Some(&capture),
             Some(&mask),
             ExternalStreamProcessingPlan::from_mode(
-                ExternalPoolStreamResponseMode::EventPassthroughUsageRewrite,
+                ExternalPoolStreamResponseMode::EventPassthrough,
             ),
         );
         let text = std::str::from_utf8(&masked).expect("masked event utf8");
@@ -7607,13 +7590,13 @@ data: {"type":"message_start","message":{"id":"msg_fake","type":"message","role"
     }
 
     #[test]
-    fn sse_capture_mode_keeps_message_start_usage_body_and_records_projection() {
+    fn sse_event_passthrough_rewrites_message_start_usage_when_projection_enabled() {
         let event = br#"event: message_start
 data: {"type":"message_start","message":{"id":"msg_fake","type":"message","role":"assistant","content":[],"model":"fake-sonnet","stop_reason":null,"usage":{"input_tokens":100000,"output_tokens":0,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}}
 
 "#;
         let capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
-            stream_response_mode: Some(ExternalPoolStreamResponseMode::EventPassthroughCapture),
+            stream_response_mode: Some(ExternalPoolStreamResponseMode::EventPassthrough),
             ..ExternalUsageCapture::default()
         }));
         let route = test_route("claude-sonnet-4-5");
@@ -7627,11 +7610,13 @@ data: {"type":"message_start","message":{"id":"msg_fake","type":"message","role"
             Some(&capture),
             None,
             ExternalStreamProcessingPlan::from_mode(
-                ExternalPoolStreamResponseMode::EventPassthroughCapture,
+                ExternalPoolStreamResponseMode::EventPassthrough,
             ),
         );
 
-        assert_eq!(passthrough, event);
+        assert_ne!(passthrough, event);
+        let text = std::str::from_utf8(&passthrough).expect("rewritten utf8");
+        assert!(!text.contains(r#""input_tokens":100000"#));
         let capture = capture.lock().clone();
         assert!(capture.projected);
         assert_eq!(capture.raw.expect("raw").input_tokens, 100000);
@@ -7642,13 +7627,13 @@ data: {"type":"message_start","message":{"id":"msg_fake","type":"message","role"
     }
 
     #[test]
-    fn sse_event_passthrough_capture_keeps_body_and_records_projected_usage() {
+    fn sse_event_passthrough_rewrites_usage_when_projection_enabled() {
         let event = br#"event: message_delta
 data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}
 
 "#;
         let capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
-            stream_response_mode: Some(ExternalPoolStreamResponseMode::EventPassthroughCapture),
+            stream_response_mode: Some(ExternalPoolStreamResponseMode::EventPassthrough),
             ..ExternalUsageCapture::default()
         }));
         let route = test_route("claude-sonnet-4-5");
@@ -7662,16 +7647,18 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
             Some(&capture),
             None,
             ExternalStreamProcessingPlan::from_mode(
-                ExternalPoolStreamResponseMode::EventPassthroughCapture,
+                ExternalPoolStreamResponseMode::EventPassthrough,
             ),
         );
 
-        assert_eq!(passthrough, event);
+        assert_ne!(passthrough, event);
+        let text = std::str::from_utf8(&passthrough).expect("rewritten utf8");
+        assert!(!text.contains(r#""input_tokens":100000"#));
         let capture = capture.lock().clone();
         assert!(capture.projected);
         assert_eq!(
             capture.stream_response_mode,
-            Some(ExternalPoolStreamResponseMode::EventPassthroughCapture)
+            Some(ExternalPoolStreamResponseMode::EventPassthrough)
         );
         assert_eq!(capture.raw.expect("raw").input_tokens, 100000);
         let reported = capture.reported.expect("reported usage");
@@ -7681,31 +7668,57 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
     }
 
     #[test]
+    fn sse_event_passthrough_keeps_usage_body_when_projection_disabled() {
+        let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}
+
+"#;
+        let capture = Arc::new(SyncMutex::new(ExternalUsageCapture {
+            stream_response_mode: Some(ExternalPoolStreamResponseMode::EventPassthrough),
+            ..ExternalUsageCapture::default()
+        }));
+
+        let passthrough = process_sse_event_with_plan(
+            event,
+            None,
+            Some(&capture),
+            None,
+            ExternalStreamProcessingPlan::from_mode(
+                ExternalPoolStreamResponseMode::EventPassthrough,
+            ),
+        );
+
+        assert_eq!(passthrough, event);
+        let capture = capture.lock().clone();
+        assert!(!capture.projected);
+        assert_eq!(capture.raw.expect("raw").input_tokens, 100000);
+        assert_eq!(capture.reported.expect("reported").input_tokens, 100000);
+    }
+
+    #[test]
     fn stream_processing_plan_inherits_global_and_allows_pool_override() {
         let mut config = ExternalPoolsConfig::default();
         config.external_pool_stream_response_mode =
-            ExternalPoolStreamResponseMode::EventPassthroughUsageRewrite;
+            ExternalPoolStreamResponseMode::EventPassthrough;
 
         let inherited = test_pool("http://pool.example.com", false);
         assert_eq!(
             ExternalStreamProcessingPlan::for_pool(&inherited, &config).response_mode,
-            ExternalPoolStreamResponseMode::EventPassthroughUsageRewrite
+            ExternalPoolStreamResponseMode::EventPassthrough
         );
 
         let mut overridden = inherited.clone();
-        overridden.stream_response_mode =
-            Some(ExternalPoolStreamResponseMode::EventPassthroughCapture);
+        overridden.stream_response_mode = Some(ExternalPoolStreamResponseMode::EventPassthrough);
         let plan = ExternalStreamProcessingPlan::for_pool(&overridden, &config);
         assert_eq!(
             plan.response_mode,
-            ExternalPoolStreamResponseMode::EventPassthroughCapture
+            ExternalPoolStreamResponseMode::EventPassthrough
         );
-        assert!(!plan.rewrite_usage_for_downstream);
         assert!(plan.capture_usage);
     }
 
     #[test]
-    fn usage_rewrite_mode_does_not_rewrite_when_projection_is_disabled() {
+    fn stream_passthrough_does_not_rewrite_usage_when_projection_is_disabled() {
         let event = br#"event: message_delta
 data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":50000,"cache_read_input_tokens":0}}
 
@@ -7717,7 +7730,7 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
             Some(&capture),
             None,
             ExternalStreamProcessingPlan::from_mode(
-                ExternalPoolStreamResponseMode::EventPassthroughUsageRewrite,
+                ExternalPoolStreamResponseMode::EventPassthrough,
             ),
         );
 
@@ -7746,7 +7759,7 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
             None,
             None,
             ExternalStreamProcessingPlan::from_mode(
-                ExternalPoolStreamResponseMode::EventPassthroughUsageRewrite,
+                ExternalPoolStreamResponseMode::EventPassthrough,
             ),
         );
         assert!(rewrite_buffer.is_empty());
@@ -7754,20 +7767,20 @@ data: {"type":"message_delta","usage":{"input_tokens":100000,"output_tokens":1,"
         let rewritten_text = std::str::from_utf8(&rewritten).expect("rewritten utf8");
         assert!(!rewritten_text.contains(r#""input_tokens":100000"#));
 
-        let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
         let mut passthrough_buffer = event.to_vec();
-        let passthrough = drain_sse_events(
+        let rewritten_capture_mode = drain_sse_events(
             &mut passthrough_buffer,
             Some(&projection),
-            Some(&capture),
+            None,
             None,
             ExternalStreamProcessingPlan::from_mode(
-                ExternalPoolStreamResponseMode::EventPassthroughCapture,
+                ExternalPoolStreamResponseMode::EventPassthrough,
             ),
         );
         assert!(passthrough_buffer.is_empty());
-        assert_eq!(passthrough, event);
-        assert!(capture.lock().projected);
+        assert_ne!(rewritten_capture_mode, event);
+        let capture_text = std::str::from_utf8(&rewritten_capture_mode).expect("rewritten utf8");
+        assert!(!capture_text.contains(r#""input_tokens":100000"#));
     }
 
     #[test]

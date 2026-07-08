@@ -162,7 +162,7 @@ export function ExternalPoolFormModal({
           </div>
         </FormSection>
 
-        <div className="grid gap-4 lg:grid-cols-2">
+        <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-3">
           <FormSection title="调度设置" description="这些设置只影响当前外部账号，不改变全局排队和冷却策略。">
             <div className="grid gap-3 sm:grid-cols-2">
               <NumberBox label="单账号最大并发" description="当前外部账号同时处理的最大请求数。" suffix="并发" value={draft.maxConcurrentRequests} min={1} disabled={saving} onChange={(v) => set('maxConcurrentRequests', v)} />
@@ -175,22 +175,26 @@ export function ExternalPoolFormModal({
             </div>
           </FormSection>
 
-          <FormSection title="Usage 投影" description="只决定当前外部账号的 usage 是否按入口缓存策略改写；非 usage 内容不受影响。">
+          <FormSection title="Usage 上报口径" description="只决定当前外部账号返回给下游的 usage 是透传上游，还是按当前请求路径整理；非 usage 内容不受影响。">
             <div className="space-y-3">
-              <SelectBox label="Usage 投影策略" value={draft.usageProjectionMode} disabled={saving} onChange={(v) => set('usageProjectionMode', v as ExternalPoolFormDraft['usageProjectionMode'])}>
-                <SelectItem value="pass_through">上游原样：不改 usage</SelectItem>
-                <SelectItem value="current_path_policy">按入口策略投影：应用全局补偿</SelectItem>
+              <SelectBox label="下游 usage" value={draft.usageProjectionMode} disabled={saving} onChange={(v) => set('usageProjectionMode', v as ExternalPoolFormDraft['usageProjectionMode'])}>
+                <SelectItem value="pass_through">透传上游 usage</SelectItem>
+                <SelectItem value="current_path_policy">按当前请求路径整理 usage</SelectItem>
               </SelectBox>
               <HintBox>{usageProjectionDescription(draft.usageProjectionMode)}</HintBox>
+            </div>
+          </FormSection>
+
+          <FormSection title="流式响应处理" description="只决定 stream=true 时 SSE 事件如何转发。">
+            <div className="space-y-3">
               <SelectBox
-                label="流式响应 Usage 返回"
+                label="SSE 事件"
                 value={draft.streamResponseMode}
                 disabled={saving}
                 onChange={(v) => set('streamResponseMode', v as ExternalPoolFormDraft['streamResponseMode'])}
               >
                 <SelectItem value="inherit">继承全局默认</SelectItem>
-                <SelectItem value="event_passthrough_usage_rewrite">事件透传，usage 按入口投影</SelectItem>
-                <SelectItem value="event_passthrough_capture">事件完全透传，仅内部计量</SelectItem>
+                <SelectItem value="event_passthrough">事件级透传</SelectItem>
               </SelectBox>
               <HintBox>{streamResponseDescription(draft.streamResponseMode)}</HintBox>
             </div>

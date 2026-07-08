@@ -260,7 +260,7 @@ export const defaultExternalPoolsConfig = () => ({
   externalPoolUsageProjectionUpliftPercent: 25,
   externalPoolUsageProjectionOutputUpliftMinTokens: 0,
   externalPoolUsageProjectionOutputUpliftPercent: 0,
-  externalPoolStreamResponseMode: 'event_passthrough_usage_rewrite' as const,
+  externalPoolStreamResponseMode: 'event_passthrough' as const,
 })
 
 const defaultModelMappingConfig = (): ModelMappingConfig => ({
@@ -1405,7 +1405,7 @@ function ReportedUsagePathEditor({
       <div className="mb-4">
       <ToggleField
           title="非流式 Usage 透传"
-          description="开启后，命中此路径的非流式请求不做本系统 usage 投影、input 采样或补偿，也不推进本地缓存状态；外部池同步响应保持上游 usage 原样，本地凭证使用上游原始 metadata usage；流式请求保持原策略。"
+          description="仅影响非流式请求。开启后，命中此路径时不做本系统 usage 整理、input 采样或补偿，也不推进本地缓存状态；外部池同步响应保持上游 usage 原样，本地凭证使用上游原始 metadata usage。"
           checked={Boolean(value.skipNonStreamUsageProjection)}
           onCheckedChange={(skipNonStreamUsageProjection) =>
             onChange({ ...value, skipNonStreamUsageProjection })
@@ -1898,7 +1898,7 @@ function NonStreamCacheToggle({
     <div className="rounded-lg border bg-muted/20 p-4">
         <ToggleField
         title="非流式 Usage 透传"
-        description="开启后，命中此路径的非流式请求不做本系统 usage 投影、input 采样或补偿，也不推进本地缓存状态；外部池同步响应保持上游 usage 原样，本地凭证使用上游原始 metadata usage；流式请求保持原策略。"
+        description="仅影响非流式请求。开启后，命中此路径时不做本系统 usage 整理、input 采样或补偿，也不推进本地缓存状态；外部池同步响应保持上游 usage 原样，本地凭证使用上游原始 metadata usage。"
         checked={Boolean(policy.skipNonStreamUsageProjection)}
         onCheckedChange={(skipNonStreamUsageProjection) =>
           onChange({ ...policy, skipNonStreamUsageProjection })
@@ -3553,9 +3553,9 @@ export function RuntimeConfigPanel() {
             </label>
             <label className="block rounded-md border bg-background p-4">
               <div className="mb-3">
-                <div className="text-sm font-medium">外部池默认流式响应 Usage 返回</div>
+                <div className="text-sm font-medium">外部池默认流式响应处理</div>
                 <div className="mt-1 text-xs leading-5 text-muted-foreground">
-                  作为外部池默认值；单个外部池可以覆盖。默认事件级透传普通 SSE，只在实际有缓存读写时按入口策略投影流式 usage。
+                  作为外部池默认值；单个外部池可以覆盖。仅决定 stream=true 时 SSE 事件如何转发。
                 </div>
               </div>
               <select
@@ -3573,8 +3573,7 @@ export function RuntimeConfigPanel() {
                   }))
                 }
               >
-                <option value="event_passthrough_usage_rewrite">事件透传，usage 按入口投影</option>
-                <option value="event_passthrough_capture">事件完全透传，仅内部计量</option>
+                <option value="event_passthrough">事件级透传</option>
               </select>
             </label>
             <ToggleField

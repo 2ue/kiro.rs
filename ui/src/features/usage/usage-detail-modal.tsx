@@ -386,7 +386,7 @@ export function UsageDetailModal({
                 <div className="text-xs text-muted-foreground">展示计费（shaped）</div>
                 <div className="break-all font-mono text-xs">{formatUsageSnapshot(billing.shapedUsage || billing.reportedUsage)}</div>
                 <div className="mt-1 font-medium">{formatUsd(billing.shapedCostUsd ?? billing.reportedCostUsd ?? 0)}</div>
-                <div className="text-xs text-muted-foreground">{billing.usageProjectionApplied ? '已按入口规则展示' : '保持原样'}</div>
+                <div className="text-xs text-muted-foreground">{billing.usageProjectionApplied ? '已按路径整理' : '透传上游'}</div>
               </div>
               <div>
                 <div className="text-xs text-muted-foreground">补偿后计费（uplifted）</div>
@@ -408,7 +408,7 @@ export function UsageDetailModal({
               <div>
                 <div className="text-xs text-muted-foreground">计价模型 / 用量模式</div>
                 <div className="mt-0.5 text-xs">{billing.pricingAvailable ? billing.pricingModel || 'priced' : 'unpriced'}</div>
-                <div className="text-xs text-muted-foreground">{billing.usageProjectionApplied ? '已按入口规则展示' : '保持原样'}</div>
+                <div className="text-xs text-muted-foreground">{billing.usageProjectionApplied ? '已按路径整理' : '透传上游'}</div>
               </div>
             </div>
           </div>

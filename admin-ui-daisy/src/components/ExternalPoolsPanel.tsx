@@ -438,7 +438,7 @@ export function ExternalPoolsPanel() {
             <SummaryItem label="入口策略" value={fallbackActive || directPolicyActive ? '已配置' : '未配置'} />
             <SummaryItem label="可用外部账号" value={`${dispatchablePools}/${totalPools}`} />
             <SummaryItem label="外部账号并发" value={`${totalInFlight}/${totalCapacity || 0}`} />
-            <SummaryItem label="按入口规则" value={`${currentPathPoolCount} 个`} />
+            <SummaryItem label="按路径整理 usage" value={`${currentPathPoolCount} 个`} />
           </div>
 
           <PolicyBlock
@@ -551,14 +551,14 @@ export function ExternalPoolsPanel() {
           <PolicyBlock
             title="5. 返回给客户端的用量"
             active={externalEnabled && usageCompensationActive}
-            description="只影响选择“按入口规则展示”的外部账号。本地账号和“保持原样”的外部账号不会受影响。"
+            description="只影响选择“按当前请求路径整理 usage”的外部账号。本地账号和“透传上游 usage”的外部账号不会受影响。"
           >
             <div className="space-y-4">
               <HintBox>
-                生效条件：请求进入外部账号，并且该外部账号的用量模式为“按入口规则展示”。如果外部账号选择“保持原样”，下面配置不会改动用量展示。
+                生效条件：请求进入外部账号，并且该外部账号的 Usage 上报口径为“按当前请求路径整理 usage”。如果外部账号选择“透传上游 usage”，下面配置不会改动 usage。
               </HintBox>
               <div className="grid gap-4 lg:grid-cols-2">
-                <FormSection title="缓存读写补偿" description="按入口规则展示时，对缓存读写用量做补偿。">
+                <FormSection title="缓存读写补偿" description="按当前请求路径整理 usage 后，对缓存读写用量做补偿。">
                   <div className="grid gap-3 sm:grid-cols-2">
                     <ToggleRow disabled={!externalEnabled} label="启用缓存补偿" checked={cacheUpliftActive} onChange={setCacheUpliftEnabled} />
                     <NumberBox disabled={!cacheUpliftActive} label="放大百分比" suffix="%" value={configDraft.externalPoolUsageProjectionUpliftPercent} onChange={(externalPoolUsageProjectionUpliftPercent) => setConfigDraft((prev) => ({ ...prev, externalPoolUsageProjectionUpliftPercent }))} />
@@ -798,7 +798,7 @@ function ExternalPoolFormModal({
           </div>
         </FormSection>
 
-        <div className="grid gap-4 lg:grid-cols-2">
+        <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-3">
           <FormSection title="调度设置" description="这些设置只影响当前外部账号，不改变全局排队和冷却策略。">
             <div className="grid gap-3 sm:grid-cols-2">
               <NumberBox label="单账号最大并发" description="当前外部账号同时处理的最大请求数。" suffix="并发" value={draft.maxConcurrentRequests} min={1} disabled={saving} onChange={(maxConcurrentRequests) => onDraftChange((prev) => ({ ...prev, maxConcurrentRequests }))} />
@@ -807,15 +807,20 @@ function ExternalPoolFormModal({
             </div>
           </FormSection>
 
-          <FormSection title="Usage 投影" description="只决定当前外部账号的 usage 是否按入口缓存策略改写；非 usage 内容不受影响。">
+          <FormSection title="Usage 上报口径" description="只决定当前外部账号返回给下游的 usage 是透传上游，还是按当前请求路径整理；非 usage 内容不受影响。">
             <div className="space-y-3">
-              <SelectBox label="Usage 投影策略" value={draft.usageProjectionMode} disabled={saving} onChange={(usageProjectionMode) => onDraftChange((prev) => ({ ...prev, usageProjectionMode: usageProjectionMode as ExternalPoolFormDraft['usageProjectionMode'] }))}>
-                <Select.Option value="pass_through">上游原样：不改 usage</Select.Option>
-                <Select.Option value="current_path_policy">按入口策略投影：应用全局补偿</Select.Option>
+              <SelectBox label="下游 usage" value={draft.usageProjectionMode} disabled={saving} onChange={(usageProjectionMode) => onDraftChange((prev) => ({ ...prev, usageProjectionMode: usageProjectionMode as ExternalPoolFormDraft['usageProjectionMode'] }))}>
+                <Select.Option value="pass_through">透传上游 usage</Select.Option>
+                <Select.Option value="current_path_policy">按当前请求路径整理 usage</Select.Option>
               </SelectBox>
               <HintBox>{usageProjectionDescription(draft.usageProjectionMode)}</HintBox>
+            </div>
+          </FormSection>
+
+          <FormSection title="流式响应处理" description="只决定 stream=true 时 SSE 事件如何转发。">
+            <div className="space-y-3">
               <SelectBox
-                label="流式响应 Usage 返回"
+                label="SSE 事件"
                 value={draft.streamResponseMode}
                 disabled={saving}
                 onChange={(streamResponseMode) => onDraftChange((prev) => ({
@@ -824,8 +829,7 @@ function ExternalPoolFormModal({
                 }))}
               >
                 <Select.Option value="inherit">继承全局默认</Select.Option>
-                <Select.Option value="event_passthrough_usage_rewrite">事件透传，usage 按入口投影</Select.Option>
-                <Select.Option value="event_passthrough_capture">事件完全透传，仅内部计量</Select.Option>
+                <Select.Option value="event_passthrough">事件级透传</Select.Option>
               </SelectBox>
               <HintBox>{streamResponseDescription(draft.streamResponseMode)}</HintBox>
             </div>
@@ -1350,7 +1354,7 @@ function modelMappingDescription(mode: ExternalPool['modelMappingMode'] | undefi
 
 function requestBodyModeDescription(mode: ExternalPool['requestBodyMode'] | undefined) {
   if (mode === 'raw_passthrough') {
-    return '请求体不进入消息解析、图片处理、schema 修正和 payload guard。Usage 是否投影仍由当前外部池的 Usage 投影策略决定；是否改写顶层 model 由下方模型处理配置单独控制。'
+    return '请求体不进入消息解析、图片处理、schema 修正和 payload guard。下游 usage 是透传上游还是按路径整理，由当前外部账号的 Usage 上报口径决定；是否改写顶层 model 由下方模型处理配置单独控制。'
   }
   return '按标准 Anthropic 请求处理链路转发，会应用图片预处理、payload guard、thinking/model 兼容逻辑和 usage 整形上下文。'
 }
@@ -1378,27 +1382,24 @@ function poolBodyModeSummary(pool: ExternalPool) {
 
 function usageProjectionDescription(mode: ExternalPool['usageProjectionMode'] | undefined) {
   if (mode === 'current_path_policy') {
-    return '允许当前外部账号的 usage 进入入口缓存策略、字段投影和全局补偿。非流式透传开关命中时会跳过这一步。'
+    return '下游 usage 按当前请求路径的缓存策略整理；缓存读写补偿和输出补偿只会在这个口径下生效。'
   }
-  return '保持外部账号返回的 usage，不应用入口缓存策略、字段采样、缓存补偿或输出补偿。'
+  return '下游 usage 保持外部账号返回的原始值；不按当前请求路径整理，也不应用缓存读写补偿或输出补偿。'
 }
 
 function streamResponseDescription(mode: ExternalPoolStreamResponseDraft) {
-  if (mode === 'event_passthrough_capture') {
-    return '仅影响 stream=true。普通 SSE event 和 usage 字段都按上游原样返回；系统只捕获 usage 用于内部诊断。'
+  if (mode === 'event_passthrough') {
+    return '仅影响 stream=true。文本、thinking、tool 等 SSE event 按上游事件级转发；上游错误事件仍按系统规则脱敏。'
   }
-  if (mode === 'event_passthrough_usage_rewrite') {
-    return '仅影响 stream=true。文本、thinking、tool 等 SSE event 事件级透传；message_start 和最终 usage 字段在实际有缓存读写时按入口策略投影。'
-  }
-  return '当前外部账号不单独指定流式 usage 返回方式，使用全局默认策略。'
+  return '当前外部账号不单独指定流式响应处理方式，使用外部池全局默认值。'
 }
 
 function poolUsageSummary(pool: ExternalPool, config: ExternalPoolsConfig) {
   const parts = pool.usageProjectionMode === 'current_path_policy'
-    ? ['用量：按入口规则']
-    : ['用量：保持原样']
+    ? ['Usage：按路径整理']
+    : ['Usage：透传上游']
   const streamMode = pool.streamResponseMode || config.externalPoolStreamResponseMode
-  parts.push(streamMode === 'event_passthrough_capture' ? '流式：原样usage' : '流式：投影usage')
+  parts.push(streamMode === 'event_passthrough' ? '流式：事件透传' : '流式：继承默认')
   if (pool.streamResponseMode) {
     parts.push('单池覆盖')
   }

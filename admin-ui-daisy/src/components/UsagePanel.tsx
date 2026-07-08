@@ -1014,7 +1014,7 @@ function UsageBillingModal({ record, onClose }: { record: UsageRecord | null; on
                 <div>
                   <div className="text-xs text-base-content/55">计价模型 / 用量模式</div>
                   <div className="break-all">{billing.pricingAvailable ? billing.pricingModel || 'priced' : 'unpriced'}</div>
-                  <div className="text-xs text-base-content/55">{billing.usageProjectionApplied ? '已按入口规则展示' : '保持原样'}</div>
+                  <div className="text-xs text-base-content/55">{billing.usageProjectionApplied ? '已按路径整理' : '透传上游'}</div>
                 </div>
               </div>
             </div>
@@ -1113,7 +1113,7 @@ function UsageDetailModal({ record, onClose }: { record: UsageRecord | null; onC
                     <div>
                       <div className="text-xs text-base-content/55">计价模型 / 用量模式</div>
                       <div className="break-all">{billing.pricingAvailable ? billing.pricingModel || 'priced' : 'unpriced'}</div>
-                      <div className="text-xs text-base-content/55">{billing.usageProjectionApplied ? '已按入口规则展示' : '保持原样'}</div>
+                      <div className="text-xs text-base-content/55">{billing.usageProjectionApplied ? '已按路径整理' : '透传上游'}</div>
                     </div>
                   </div>
                 </div>

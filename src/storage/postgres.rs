@@ -6576,7 +6576,7 @@ mod tests {
                 priority: 1,
                 max_concurrent_requests: 2,
                 usage_projection_mode: ExternalPoolUsageProjectionMode::PassThrough,
-                stream_response_mode: Some(ExternalPoolStreamResponseMode::EventPassthroughCapture),
+                stream_response_mode: Some(ExternalPoolStreamResponseMode::EventPassthrough),
                 request_body_mode: ExternalPoolRequestBodyMode::RawPassthrough,
                 raw_model_mode: ExternalPoolRawModelMode::RewriteTopLevel,
                 auto_disable_policy: ExternalPoolAutoDisablePolicy::Inherit,
@@ -6607,7 +6607,7 @@ mod tests {
         );
         assert_eq!(
             created.stream_response_mode,
-            Some(ExternalPoolStreamResponseMode::EventPassthroughCapture)
+            Some(ExternalPoolStreamResponseMode::EventPassthrough)
         );
 
         let listed = store.list_external_pools(false).await.unwrap();
@@ -6622,7 +6622,7 @@ mod tests {
         );
         assert_eq!(
             listed[0].stream_response_mode,
-            Some(ExternalPoolStreamResponseMode::EventPassthroughCapture)
+            Some(ExternalPoolStreamResponseMode::EventPassthrough)
         );
 
         let loaded = store
@@ -6640,7 +6640,7 @@ mod tests {
         );
         assert_eq!(
             loaded.stream_response_mode,
-            Some(ExternalPoolStreamResponseMode::EventPassthroughCapture)
+            Some(ExternalPoolStreamResponseMode::EventPassthrough)
         );
 
         let updated = store
@@ -6648,7 +6648,7 @@ mod tests {
                 created.id,
                 UpdateExternalPoolRequest {
                     stream_response_mode: Some(Some(
-                        ExternalPoolStreamResponseMode::EventPassthroughUsageRewrite,
+                        ExternalPoolStreamResponseMode::EventPassthrough,
                     )),
                     request_body_mode: Some(ExternalPoolRequestBodyMode::RawPassthrough),
                     raw_model_mode: Some(ExternalPoolRawModelMode::None),
@@ -6665,7 +6665,7 @@ mod tests {
         assert_eq!(updated.raw_model_mode, ExternalPoolRawModelMode::None);
         assert_eq!(
             updated.stream_response_mode,
-            Some(ExternalPoolStreamResponseMode::EventPassthroughUsageRewrite)
+            Some(ExternalPoolStreamResponseMode::EventPassthrough)
         );
 
         let inherited = store

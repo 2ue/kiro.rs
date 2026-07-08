@@ -1066,7 +1066,7 @@ export function UsageRecordsPanel() {
                           <div className="text-xs text-muted-foreground">计价模型 / 整形模式</div>
                           <div className="break-all">{billing.pricingAvailable ? billing.pricingModel || 'priced' : 'unpriced'}</div>
                           <div className="text-xs text-muted-foreground">
-                            {billing.usageProjectionMode} · {billing.usageProjectionApplied ? '已按入口投影' : '未投影/透传'}
+                            {billing.usageProjectionMode} · {billing.usageProjectionApplied ? '已按路径整理' : '透传上游'}
                           </div>
                         </div>
                       </div>
