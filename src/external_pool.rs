@@ -4334,7 +4334,6 @@ fn project_usage_value(
     if projection.mode != ExternalPoolUsageProjectionMode::CurrentPathPolicy {
         return None;
     }
-    let upstream_raw_usage = cache_usage_from_value(usage);
     let output_tokens = usage_i32(usage, "output_tokens");
     let computed = projection
         .simulated_usage
@@ -4366,11 +4365,6 @@ fn project_usage_value(
     } else {
         computed
     };
-    if !crate::anthropic::cache::usage_has_cache(&controlled)
-        && !upstream_raw_usage.is_some_and(|usage| crate::anthropic::cache::usage_has_cache(&usage))
-    {
-        return None;
-    }
     let raw_usage = RawUsage::uncached(projection.raw_input_tokens, output_tokens);
     let shaped = projection
         .reported_policy
@@ -6791,6 +6785,50 @@ data: {"type":"message_delta","note":"content_block_delta"}
     }
 
     #[test]
+    fn usage_projection_shapes_uncached_non_stream_usage_by_path_policy() {
+        let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":4165,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+        );
+        let mut route = test_route("claude-opus-4-6");
+        route.request_input_tokens = 4165;
+        route.prompt_cache_target_read_ratio = 0.5;
+        route.reported_usage.path_overrides.insert(
+            "/cc".to_string(),
+            ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy::sample_input_max(1),
+                ..ReportedUsagePathPolicy::default()
+            },
+        );
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+
+        let projection = projection_context(&route, &pool, 0).expect("projection");
+        let projected = maybe_project_non_stream_usage(body.clone(), Some(&projection));
+
+        assert_ne!(projected.body, body);
+        assert!(projected.usage_capture.projected);
+        let value: serde_json::Value =
+            serde_json::from_slice(&projected.body).expect("projected json");
+        let usage = value.get("usage").expect("usage object");
+        assert_eq!(usage["input_tokens"].as_i64().unwrap(), 1);
+        assert_eq!(usage["output_tokens"].as_i64().unwrap(), 2);
+        assert_eq!(usage["cache_creation_input_tokens"].as_i64().unwrap(), 0);
+        assert_eq!(usage["cache_read_input_tokens"].as_i64().unwrap(), 0);
+        assert!(usage.get("cache_creation").is_none());
+        assert_eq!(
+            projected.usage_capture.raw.map(|usage| usage.input_tokens),
+            Some(4165)
+        );
+        assert_eq!(
+            projected
+                .usage_capture
+                .reported
+                .map(|usage| usage.input_tokens),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn usage_projection_path_skip_non_stream_keeps_external_usage_raw() {
         let body = Bytes::from_static(
             br#"{"type":"message","usage":{"input_tokens":4165,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
@@ -6837,6 +6875,25 @@ data: {"type":"message_delta","note":"content_block_delta"}
     #[test]
     fn usage_projection_disabled_reported_usage_blocks_non_stream_projection() {
         let mut route = test_route("claude-sonnet-4-5");
+        route.reported_usage.path_overrides.insert(
+            "/cc".to_string(),
+            ReportedUsagePathPolicy {
+                enabled: false,
+                input: ReportedUsageFieldPolicy::sample_input_max(1),
+                ..ReportedUsagePathPolicy::default()
+            },
+        );
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+
+        let projection = projection_context(&route, &pool, 0);
+        assert!(projection.is_none());
+    }
+
+    #[test]
+    fn usage_projection_disabled_reported_usage_blocks_stream_projection() {
+        let mut route = test_route("claude-sonnet-4-5");
+        payload_mut(&mut route).stream = true;
         route.reported_usage.path_overrides.insert(
             "/cc".to_string(),
             ReportedUsagePathPolicy {
@@ -6920,13 +6977,21 @@ data: {"type":"message_delta","note":"content_block_delta"}
                 .usage_capture
                 .reported
                 .expect("reported")
+                .input_tokens,
+            count_external_route_input_tokens(payload_ref(&route))
+        );
+        assert_eq!(
+            projected
+                .usage_capture
+                .reported
+                .expect("reported")
                 .cache_creation_input_tokens,
             0
         );
     }
 
     #[test]
-    fn usage_projection_no_cache_route_passthroughs_external_usage() {
+    fn usage_projection_no_cache_route_removes_external_cache_usage() {
         let mut route = test_route("claude-sonnet-4-5");
         route.prompt_cache_strategy_type = PromptCacheStrategyType::NoCache;
         route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
@@ -6942,14 +7007,13 @@ data: {"type":"message_delta","note":"content_block_delta"}
         pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
 
         let projection = projection_context(&route, &pool, 0);
-        assert!(projection.is_none());
+        assert!(projection.is_some());
 
         let body = Bytes::from_static(
-            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":9,"cache_creation_input_tokens":50000,"cache_read_input_tokens":25000}}"#,
+            br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":9,"cache_creation_input_tokens":50000,"cache_read_input_tokens":25000,"cache_creation":{"ephemeral_5m_input_tokens":50000,"ephemeral_1h_input_tokens":0}}}"#,
         );
-        let projected = maybe_project_non_stream_usage(body.clone(), projection.as_ref());
-        assert_eq!(projected.body, body);
-        assert!(!projected.usage_capture.projected);
+        let projected = maybe_project_non_stream_usage(body, projection.as_ref());
+        assert!(projected.usage_capture.projected);
         let value: serde_json::Value =
             serde_json::from_slice(&projected.body).expect("projected json");
         let usage = value.get("usage").expect("usage object");
@@ -6958,7 +7022,7 @@ data: {"type":"message_delta","note":"content_block_delta"}
                 .get("input_tokens")
                 .and_then(|value| value.as_i64())
                 .unwrap_or_default(),
-            100_000
+            count_external_route_input_tokens(payload_ref(&route)) as i64
         );
         assert_eq!(
             usage
@@ -6968,10 +7032,25 @@ data: {"type":"message_delta","note":"content_block_delta"}
             9
         );
         assert_eq!(
+            usage
+                .get("cache_creation_input_tokens")
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default(),
+            0
+        );
+        assert_eq!(
+            usage
+                .get("cache_read_input_tokens")
+                .and_then(|value| value.as_i64())
+                .unwrap_or_default(),
+            0
+        );
+        assert!(usage.get("cache_creation").is_none());
+        assert_eq!(
             projected
                 .usage_capture
-                .reported
-                .expect("reported")
+                .raw
+                .expect("raw")
                 .cache_creation_input_tokens,
             50_000
         );
@@ -6980,8 +7059,16 @@ data: {"type":"message_delta","note":"content_block_delta"}
                 .usage_capture
                 .reported
                 .expect("reported")
+                .cache_creation_input_tokens,
+            0
+        );
+        assert_eq!(
+            projected
+                .usage_capture
+                .reported
+                .expect("reported")
                 .cache_read_input_tokens,
-            25_000
+            0
         );
     }
 
@@ -7409,6 +7496,62 @@ data: {"type":"message_delta","note":"content_block_delta"}
     }
 
     #[test]
+    fn kiro_rs_tool_usage_projection_applies_path_cache_creation_policy() {
+        let body = Bytes::from_static(
+            br#"{"type":"message","usage":{"input_tokens":0,"output_tokens":62,"cache_creation_input_tokens":1300180,"cache_read_input_tokens":37,"cache_creation":{"ephemeral_5m_input_tokens":1300180,"ephemeral_1h_input_tokens":0}}}"#,
+        );
+        let mut route = test_route("claude-opus-4-8");
+        route.endpoint = "/cc/v1/messages".to_string();
+        route.prompt_cache_strategy_type = PromptCacheStrategyType::KiroRsTool;
+        route.prompt_cache_simulation_mode = PromptCacheSimulationMode::Disabled;
+        route.reported_usage.path_overrides.insert(
+            "/cc".to_string(),
+            ReportedUsagePathPolicy {
+                input: ReportedUsageFieldPolicy::sample_input_max(96),
+                cache_creation: ReportedUsageFieldPolicy::sample_max(4_000),
+                ..ReportedUsagePathPolicy::default()
+            },
+        );
+        payload_mut(&mut route).metadata = Some(Metadata {
+            user_id: Some(
+                "user_test_account__session_57f3e60f-2cc6-4e8f-ae7e-e43753320a09".to_string(),
+            ),
+        });
+        payload_mut(&mut route).system = Some(vec![SystemMessage {
+            text: "stable external kiro strategy prompt ".repeat(8_000),
+            cache_control: Some(serde_json::json!({"type": "ephemeral"})),
+        }]);
+        route.request_input_tokens = count_external_route_input_tokens(payload_ref(&route));
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+
+        let projection = projection_context(&route, &pool, 0).expect("projection");
+        let projected = maybe_project_non_stream_usage(body, Some(&projection));
+        let value: serde_json::Value =
+            serde_json::from_slice(&projected.body).expect("projected json");
+        let usage = value.get("usage").expect("usage object");
+        assert_projected_cache_creation_consistent(usage);
+        let reported_creation = usage["cache_creation_input_tokens"]
+            .as_i64()
+            .expect("reported cache creation");
+        assert!(
+            (1..=4_000).contains(&reported_creation),
+            "reported cache creation should follow path policy, got {reported_creation}"
+        );
+        assert!(
+            !std::str::from_utf8(&projected.body)
+                .unwrap()
+                .contains("1300180")
+        );
+
+        let raw = projected.usage_capture.raw.expect("raw usage");
+        assert_eq!(raw.cache_creation_input_tokens, 1_300_180);
+        let reported = projected.usage_capture.reported.expect("reported usage");
+        assert!((1..=4_000).contains(&reported.cache_creation_input_tokens));
+        assert!(projected.usage_capture.projected);
+    }
+
+    #[test]
     fn usage_projection_ignores_external_raw_cache_when_local_policy_reads() {
         let raw_creation_body = Bytes::from_static(
             br#"{"type":"message","usage":{"input_tokens":100000,"output_tokens":1,"cache_creation_input_tokens":80000,"cache_read_input_tokens":0}}"#,
@@ -7555,7 +7698,7 @@ data: [DONE]
     }
 
     #[test]
-    fn sse_usage_projection_keeps_uncached_stream_usage_raw() {
+    fn sse_usage_projection_shapes_uncached_stream_usage_by_path_policy() {
         let event = br#"event: message_delta
 data: {"type":"message_delta","usage":{"input_tokens":4165,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}
 
@@ -7578,11 +7721,31 @@ data: {"type":"message_delta","usage":{"input_tokens":4165,"output_tokens":2,"ca
 
         let projected = rewrite_sse_event_usage(event, Some(&projection), Some(&capture));
 
-        assert_eq!(projected, event);
+        assert_ne!(projected, event);
+        let value = event_data_value(&projected);
+        let usage = &value["usage"];
+        assert_eq!(usage["input_tokens"].as_i64().expect("projected input"), 1);
+        assert_eq!(
+            usage["output_tokens"].as_i64().expect("projected output"),
+            2
+        );
+        assert_eq!(
+            usage["cache_creation_input_tokens"]
+                .as_i64()
+                .expect("projected cache creation"),
+            0
+        );
+        assert_eq!(
+            usage["cache_read_input_tokens"]
+                .as_i64()
+                .expect("projected cache read"),
+            0
+        );
+        assert!(usage.get("cache_creation").is_none());
         let capture = capture.lock().clone();
-        assert!(!capture.projected);
+        assert!(capture.projected);
         assert_eq!(capture.raw.map(|usage| usage.input_tokens), Some(4165));
-        assert_eq!(capture.reported.map(|usage| usage.input_tokens), Some(4165));
+        assert_eq!(capture.reported.map(|usage| usage.input_tokens), Some(1));
         assert_eq!(
             capture
                 .reported
@@ -7681,12 +7844,87 @@ data: {"type":"message_delta","usage":{"input_tokens":0,"output_tokens":135,"cac
                 .expect("projected aggregate")
                 < 1_998_336
         );
+        assert_eq!(
+            usage["cache_creation"]["ephemeral_1h_input_tokens"]
+                .as_i64()
+                .expect("projected 1h cache creation"),
+            0,
+            "external upstream 1h must not leak when the request did not ask for ttl=1h"
+        );
+        assert_eq!(
+            usage["cache_creation"]["ephemeral_5m_input_tokens"]
+                .as_i64()
+                .expect("projected 5m cache creation"),
+            usage["cache_creation_input_tokens"]
+                .as_i64()
+                .expect("projected aggregate"),
+            "default projected cache creation should stay in the 5m bucket"
+        );
 
         let capture = capture.lock().clone();
         let raw = capture.raw.expect("raw usage");
         assert_eq!(raw.cache_creation_input_tokens, 1_998_336);
         assert_eq!(raw.cache_creation_5m_input_tokens, 0);
         assert_eq!(raw.cache_creation_1h_input_tokens, 1_998_336);
+    }
+
+    #[test]
+    fn sse_usage_projection_uses_request_ttl_for_1h_cache_creation_split() {
+        let event = br#"event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":0,"output_tokens":135,"cache_creation_input_tokens":1300180,"cache_read_input_tokens":17,"cache_creation":{"ephemeral_5m_input_tokens":1300180,"ephemeral_1h_input_tokens":0}}}
+
+"#;
+        let capture = Arc::new(SyncMutex::new(ExternalUsageCapture::default()));
+        let mut route = test_route("claude-opus-4-8");
+        payload_mut(&mut route).stream = true;
+        payload_mut(&mut route).system = Some(vec![SystemMessage {
+            text: "stable external ttl one hour prompt ".repeat(8_000),
+            cache_control: Some(serde_json::json!({"type": "ephemeral", "ttl": "1h"})),
+        }]);
+        route.request_input_tokens = count_external_route_input_tokens(payload_ref(&route));
+        let mut pool = test_pool("http://pool.example.com", false);
+        pool.usage_projection_mode = ExternalPoolUsageProjectionMode::CurrentPathPolicy;
+        let projection = projection_context(&route, &pool, 0).expect("projection");
+
+        let projected = rewrite_sse_event_usage(event, Some(&projection), Some(&capture));
+        let text = std::str::from_utf8(&projected).expect("projected utf8");
+        assert!(!text.contains("1300180"));
+
+        let value = event_data_value(&projected);
+        let usage = &value["usage"];
+        assert_projected_cache_creation_consistent(usage);
+        let aggregate = usage["cache_creation_input_tokens"]
+            .as_i64()
+            .expect("projected aggregate");
+        assert!(aggregate > 0);
+        assert!(
+            aggregate < 1_300_180,
+            "projected cache creation should follow the local path policy"
+        );
+        assert_eq!(
+            usage["cache_creation"]["ephemeral_1h_input_tokens"]
+                .as_i64()
+                .expect("projected 1h cache creation"),
+            aggregate,
+            "explicit request ttl=1h should put projected creation in the 1h bucket"
+        );
+        assert_eq!(
+            usage["cache_creation"]["ephemeral_5m_input_tokens"]
+                .as_i64()
+                .expect("projected 5m cache creation"),
+            0
+        );
+
+        let capture = capture.lock().clone();
+        let raw = capture.raw.expect("raw usage");
+        assert_eq!(raw.cache_creation_input_tokens, 1_300_180);
+        assert_eq!(raw.cache_creation_5m_input_tokens, 1_300_180);
+        assert_eq!(raw.cache_creation_1h_input_tokens, 0);
+        let reported = capture.reported.expect("reported usage");
+        assert_eq!(reported.cache_creation_input_tokens as i64, aggregate);
+        assert_eq!(reported.cache_creation_1h_input_tokens as i64, aggregate);
+        assert_eq!(reported.cache_creation_5m_input_tokens, 0);
+        assert!(capture.projected);
     }
 
     #[test]
