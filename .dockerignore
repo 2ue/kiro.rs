@@ -1,15 +1,11 @@
 # Rust build artifacts
 target/
 
+# Removed legacy admin UIs; keep any ignored local leftovers out of Docker context
+admin-ui/
+admin-ui-daisy/
+
 # Node.js dependencies and build artifacts
-admin-ui/node_modules/
-admin-ui/dist/
-admin-ui/tsconfig.tsbuildinfo
-admin-ui/.vite/
-admin-ui-daisy/node_modules/
-admin-ui-daisy/dist/
-admin-ui-daisy/tsconfig.tsbuildinfo
-admin-ui-daisy/.vite/
 ui/node_modules/
 ui/dist/
 ui/tsconfig.tsbuildinfo

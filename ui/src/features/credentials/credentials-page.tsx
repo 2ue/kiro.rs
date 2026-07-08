@@ -15,14 +15,15 @@ import {
   Wallet,
   X,
 } from 'lucide-react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { forceRefreshToken, getCredentials, getCredentialAccountInfo, getCredentialInfo, refreshCredentialInfo, testCredential } from '@/api/credentials'
+import { forceRefreshToken, getCredentialInfo, refreshCredentialInfo, testCredential } from '@/api/credentials'
 import {
   Badge,
   Button,
   Checkbox,
+  Input,
   Select,
   SelectContent,
   SelectItem,
@@ -43,7 +44,6 @@ import {
   StatGrid,
   Toolbar,
   ToolbarActions,
-  ToolbarSearch,
   useConfirm,
 } from '@/components/patterns'
 import { formatCompact, formatCredits, formatFullDate, formatNumber } from '@/lib/format'
@@ -102,6 +102,30 @@ import { mapById, mergeCredentialPlanes } from './credential-utils'
 const PAGE_SIZE = 15
 const CREDIT_INFO_BATCH_SIZE = 500
 
+function CredentialFilterField({
+  label,
+  children,
+  className,
+}: {
+  label: string
+  children: ReactNode
+  className?: string
+}) {
+  return (
+    <label className={className}>
+      <span className="mb-1 block text-[0.68rem] font-medium text-muted-foreground">{label}</span>
+      {children}
+    </label>
+  )
+}
+
+function numericQueryValue(value: string): number | undefined {
+  const trimmed = value.trim().replace(/^#/, '')
+  if (!trimmed) return undefined
+  const parsed = Number(trimmed)
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined
+}
+
 interface CreditDetailRow {
   id: number
   email?: string | null
@@ -138,6 +162,14 @@ export function CredentialsPage() {
   const [allExpanded, setAllExpanded] = useState(true)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [queryText, setQueryText] = useState('')
+  const [credentialIdQuery, setCredentialIdQuery] = useState('')
+  const [accountQuery, setAccountQuery] = useState('')
+  const [regionQuery, setRegionQuery] = useState('')
+  const [modelQuery, setModelQuery] = useState('')
+  const [endpointQuery, setEndpointQuery] = useState('')
+  const [priorityQuery, setPriorityQuery] = useState('')
+  const [rpmQuery, setRpmQuery] = useState('')
+  const [concurrencyQuery, setConcurrencyQuery] = useState('')
   const [statusFilter, setStatusFilter] = useState('__all__')
   const [authFilter, setAuthFilter] = useState('__all__')
   const [subscriptionFilter, setSubscriptionFilter] = useState('__all__')
@@ -174,17 +206,50 @@ export function CredentialsPage() {
 
   // Derived filter params — sentinel '__all__' avoids empty-string in Select
   const debouncedQueryText = useDebouncedValue(queryText)
+  const debouncedCredentialIdQuery = useDebouncedValue(credentialIdQuery)
+  const debouncedAccountQuery = useDebouncedValue(accountQuery)
+  const debouncedRegionQuery = useDebouncedValue(regionQuery)
+  const debouncedModelQuery = useDebouncedValue(modelQuery)
+  const debouncedEndpointQuery = useDebouncedValue(endpointQuery)
+  const debouncedPriorityQuery = useDebouncedValue(priorityQuery)
+  const debouncedRpmQuery = useDebouncedValue(rpmQuery)
+  const debouncedConcurrencyQuery = useDebouncedValue(concurrencyQuery)
   const listQuery = useMemo(() => ({
     page,
     limit: PAGE_SIZE,
     q: debouncedQueryText.trim() || undefined,
+    credentialId: numericQueryValue(debouncedCredentialIdQuery),
+    account: debouncedAccountQuery.trim() || undefined,
+    region: debouncedRegionQuery.trim() || undefined,
+    model: debouncedModelQuery.trim() || undefined,
+    endpoint: debouncedEndpointQuery.trim() || undefined,
+    priority: numericQueryValue(debouncedPriorityQuery),
+    rpm: numericQueryValue(debouncedRpmQuery),
+    concurrency: numericQueryValue(debouncedConcurrencyQuery),
     status: statusFilter !== '__all__' ? statusFilter : undefined,
     authMethod: authFilter !== '__all__' ? authFilter : undefined,
     subscription: subscriptionFilter !== '__all__' ? subscriptionFilter : undefined,
     proxyResourceId: proxyFilter !== '__all__' ? Number(proxyFilter) : undefined,
     sortBy: sortBy !== 'default' ? sortBy : undefined,
     sortOrder: sortBy !== 'default' ? sortOrder : undefined,
-  }), [page, debouncedQueryText, statusFilter, authFilter, subscriptionFilter, proxyFilter, sortBy, sortOrder])
+  }), [
+    page,
+    debouncedQueryText,
+    debouncedCredentialIdQuery,
+    debouncedAccountQuery,
+    debouncedRegionQuery,
+    debouncedModelQuery,
+    debouncedEndpointQuery,
+    debouncedPriorityQuery,
+    debouncedRpmQuery,
+    debouncedConcurrencyQuery,
+    statusFilter,
+    authFilter,
+    subscriptionFilter,
+    proxyFilter,
+    sortBy,
+    sortOrder,
+  ])
 
   const credentials = useCredentialList(listQuery)
   const allCredentials = useCredentials({ enabled: batchOpen || kamOpen })
@@ -217,8 +282,27 @@ export function CredentialsPage() {
   const filteredTotal = credentials.data?.filteredTotal ?? credentials.data?.total ?? 0
   const grandTotal = credentials.data?.total ?? 0
   const disabledCount = credentialSummary.data?.disabled ?? Math.max((credentials.data?.total || 0) - (credentials.data?.available || 0), 0)
+  const pageTransitionPending = Boolean(
+    credentials.data?.page !== undefined &&
+    (credentials.isPlaceholderData || (credentials.isFetching && credentials.data.page !== page))
+  )
+  const hasTextFilters = Boolean(
+    queryText.trim() ||
+    credentialIdQuery.trim() ||
+    accountQuery.trim() ||
+    regionQuery.trim() ||
+    modelQuery.trim() ||
+    endpointQuery.trim() ||
+    priorityQuery.trim() ||
+    rpmQuery.trim() ||
+    concurrencyQuery.trim(),
+  )
   const hasActiveFilters = statusFilter !== '__all__' || authFilter !== '__all__' || subscriptionFilter !== '__all__' || proxyFilter !== '__all__'
-  const activeFilterCount = [statusFilter, authFilter, subscriptionFilter, proxyFilter].filter((f) => f !== '__all__').length
+  const hasAnyFilters = hasTextFilters || hasActiveFilters
+  const activeFilterCount =
+    [statusFilter, authFilter, subscriptionFilter, proxyFilter].filter((f) => f !== '__all__').length +
+    [queryText, credentialIdQuery, accountQuery, regionQuery, modelQuery, endpointQuery, priorityQuery, rpmQuery, concurrencyQuery]
+      .filter((value) => value.trim()).length
   const selectedCredentials = currentCredentials.filter((c) => selectedIds.has(c.id))
   const selectedDisabledCount = selectedCredentials.filter((c) => c.disabled).length
   const selectedPriorityOverrideCount = selectedCredentials.filter((c) => c.priority !== 0).length
@@ -233,7 +317,26 @@ export function CredentialsPage() {
     : '账号未覆盖'
 
   // Reset page on filter change
-  useEffect(() => { setPage(1); setSelectedIds(new Set()) }, [debouncedQueryText, statusFilter, authFilter, subscriptionFilter, proxyFilter, sortBy, sortOrder])
+  useEffect(() => {
+    setPage(1)
+    setSelectedIds(new Set())
+  }, [
+    debouncedQueryText,
+    debouncedCredentialIdQuery,
+    debouncedAccountQuery,
+    debouncedRegionQuery,
+    debouncedModelQuery,
+    debouncedEndpointQuery,
+    debouncedPriorityQuery,
+    debouncedRpmQuery,
+    debouncedConcurrencyQuery,
+    statusFilter,
+    authFilter,
+    subscriptionFilter,
+    proxyFilter,
+    sortBy,
+    sortOrder,
+  ])
   useEffect(() => { setSelectedIds(new Set()) }, [page])
   useEffect(() => {
     if (credentials.data && page > Math.max(credentials.data.totalPages, 1)) setPage(Math.max(credentials.data.totalPages, 1))
@@ -298,17 +401,13 @@ export function CredentialsPage() {
   const loadCreditDetails = async () => {
     setCreditDetailsLoading(true)
     try {
-      const all = await getCredentials()
-      const enabledCredentials = all.credentials
+      const refreshedAccountInfo = await credentialAccountInfo.refetch()
+      const accountItems = refreshedAccountInfo.data?.items ?? credentialAccountInfo.data?.items ?? []
+      const enabledCredentials = currentCredentials
         .filter((item) => !item.disabled)
         .sort((a, b) => a.id - b.id)
-      const ids = enabledCredentials.map((item) => item.id)
       const infoMap = new Map<number, CredentialAccountInfoItem>()
-      for (let i = 0; i < ids.length; i += CREDIT_INFO_BATCH_SIZE) {
-        const batchIds = ids.slice(i, i + CREDIT_INFO_BATCH_SIZE)
-        const data = await getCredentialAccountInfo(batchIds)
-        data.items.forEach((item) => infoMap.set(item.id, item))
-      }
+      accountItems.forEach((item) => infoMap.set(item.id, item))
       setCreditDetailRows(
         enabledCredentials.map((cred) => {
           const info = infoMap.get(cred.id)
@@ -323,7 +422,7 @@ export function CredentialsPage() {
         })
       )
     } catch (e) {
-      toast.error(`加载积分明细失败: ${extractErrorMessage(e)}`)
+      toast.error(`加载当前页积分明细失败: ${extractErrorMessage(e)}`)
     } finally {
       setCreditDetailsLoading(false)
     }
@@ -334,17 +433,16 @@ export function CredentialsPage() {
     loadCreditDetails()
   }
 
-  const updateAllCreditInfo = async () => {
+  const queryCurrentPageCreditInfo = async () => {
+    const ids = currentIds
+    if (!ids.length) { toast.error('当前页没有可查询信息的账号'); return }
     setQueryingCreditInfo(true)
     setLoadingBalanceIds((prev) => {
       const next = new Set(prev)
-      currentIds.forEach((id) => next.add(id))
+      ids.forEach((id) => next.add(id))
       return next
     })
     try {
-      const all = await getCredentials()
-      const ids = all.credentials.map((item) => item.id)
-      if (!ids.length) { toast.error('没有可查询信息的账号'); return }
       let total = 0; let success = 0; let failed = 0
       const visibleIds = visibleCredentialIdSet()
       for (let i = 0; i < ids.length; i += CREDIT_INFO_BATCH_SIZE) {
@@ -361,15 +459,15 @@ export function CredentialsPage() {
       invalidate()
       await creditSummary.refetch()
       if (creditDetailsOpen) await loadCreditDetails()
-      if (failed === 0) toast.success(`积分统计已更新：成功 ${success}/${total}`)
-      else toast.warning(`积分统计更新完成：成功 ${success}，失败 ${failed}`)
+      if (failed === 0) toast.success(`当前页积分已更新：成功 ${success}/${total}`)
+      else toast.warning(`当前页积分更新完成：成功 ${success}，失败 ${failed}`)
     } catch (e) {
-      toast.error(`更新积分统计失败: ${extractErrorMessage(e)}`)
+      toast.error(`查询当前页积分失败: ${extractErrorMessage(e)}`)
     } finally {
       setQueryingCreditInfo(false)
       setLoadingBalanceIds((prev) => {
         const next = new Set(prev)
-        currentIds.forEach((id) => next.delete(id))
+        ids.forEach((id) => next.delete(id))
         return next
       })
     }
@@ -419,7 +517,21 @@ export function CredentialsPage() {
     if (selectedIds.size === currentCredentials.length) setSelectedIds(new Set())
     else setSelectedIds(new Set(currentCredentials.map((c) => c.id)))
   }
-  const clearFilters = () => { setQueryText(''); setStatusFilter('__all__'); setAuthFilter('__all__'); setSubscriptionFilter('__all__'); setProxyFilter('__all__') }
+  const clearFilters = () => {
+    setQueryText('')
+    setCredentialIdQuery('')
+    setAccountQuery('')
+    setRegionQuery('')
+    setModelQuery('')
+    setEndpointQuery('')
+    setPriorityQuery('')
+    setRpmQuery('')
+    setConcurrencyQuery('')
+    setStatusFilter('__all__')
+    setAuthFilter('__all__')
+    setSubscriptionFilter('__all__')
+    setProxyFilter('__all__')
+  }
 
   const setLbMode = (mode: LoadBalancingMode) => {
     const label = mode === 'priority'
@@ -588,9 +700,9 @@ export function CredentialsPage() {
             <Button variant="outline" size="sm" onClick={() => credentials.refetch()}>
               <RefreshCw className={`h-4 w-4 ${credentials.isFetching ? 'animate-spin' : ''}`} />
             </Button>
-            <Button variant="outline" size="sm" onClick={updateAllCreditInfo} disabled={queryingCreditInfo} title="更新积分统计">
+            <Button variant="outline" size="sm" onClick={queryCurrentPageCreditInfo} disabled={queryingCreditInfo || currentIds.length === 0} title="只查询当前页账号信息，不触发全量账号刷新">
               {queryingCreditInfo ? <Spinner size="sm" /> : <Wallet className="h-4 w-4" />}
-              <span className="hidden sm:inline">更新积分</span>
+              <span className="hidden sm:inline">查询当前页积分</span>
             </Button>
             <Button variant="outline" size="sm" onClick={() => setKamOpen(true)}>
               <FileUp className="h-4 w-4" /><span className="hidden sm:inline">KAM</span>
@@ -658,7 +770,7 @@ export function CredentialsPage() {
           type="button"
           className="relative flex min-h-[6.5rem] flex-col justify-between overflow-hidden rounded-xl bg-card p-4 shadow-sm transition-colors hover:shadow-md focus:outline-none focus:ring-2 focus:ring-primary/30 text-left"
           onClick={openCreditDetails}
-          title="查看积分明细"
+          title="查看当前页积分明细"
         >
           <span className="absolute left-0 top-4 h-8 w-1 rounded-r-full bg-success" />
           <div className="flex items-start justify-between gap-2 pl-2.5">
@@ -683,18 +795,56 @@ export function CredentialsPage() {
       <SectionCard
         title="账号列表"
         description={
-          hasActiveFilters || queryText
+          hasAnyFilters
             ? `筛选后 ${filteredTotal} / 共 ${credentialSummary.data?.total ?? grandTotal}`
             : `共 ${credentialSummary.data?.total ?? grandTotal} 个账号`
         }
       >
         {/* Toolbar */}
         <Toolbar className="mb-3">
-          <ToolbarSearch
-            value={queryText}
-            onChange={setQueryText}
-            placeholder="搜索邮箱、#ID、订阅、代理、Region、priority:0、rpm:60..."
-          />
+          <div className="grid min-w-0 flex-1 gap-2 sm:grid-cols-2 xl:grid-cols-5">
+            <CredentialFilterField label="ID">
+              <Input
+                value={credentialIdQuery}
+                onChange={(e) => setCredentialIdQuery(e.target.value)}
+                placeholder="#473"
+                inputMode="numeric"
+                className="h-8 text-xs"
+              />
+            </CredentialFilterField>
+            <CredentialFilterField label="邮箱 / Key">
+              <Input
+                value={accountQuery}
+                onChange={(e) => setAccountQuery(e.target.value)}
+                placeholder="user@example.com / key hash"
+                className="h-8 text-xs"
+              />
+            </CredentialFilterField>
+            <CredentialFilterField label="Region">
+              <Input
+                value={regionQuery}
+                onChange={(e) => setRegionQuery(e.target.value)}
+                placeholder="us-east-1"
+                className="h-8 text-xs"
+              />
+            </CredentialFilterField>
+            <CredentialFilterField label="可用模型">
+              <Input
+                value={modelQuery}
+                onChange={(e) => setModelQuery(e.target.value)}
+                placeholder="claude-opus-4.8"
+                className="h-8 text-xs"
+              />
+            </CredentialFilterField>
+            <CredentialFilterField label="Endpoint">
+              <Input
+                value={endpointQuery}
+                onChange={(e) => setEndpointQuery(e.target.value)}
+                placeholder="ide / kiro"
+                className="h-8 text-xs"
+              />
+            </CredentialFilterField>
+          </div>
           <ToolbarActions>
             <Select value={sortBy} onValueChange={(v) => setSortBy(v as CredentialSortBy)}>
               <SelectTrigger size="sm" className="w-36"><SelectValue /></SelectTrigger>
@@ -712,7 +862,7 @@ export function CredentialsPage() {
             <Button
               variant="outline"
               size="sm"
-              className={hasActiveFilters ? 'border-primary text-primary' : ''}
+              className={hasAnyFilters ? 'border-primary text-primary' : ''}
               onClick={() => setShowFilters((v) => !v)}
             >
               <Filter className="h-3.5 w-3.5" />
@@ -726,6 +876,33 @@ export function CredentialsPage() {
         {showFilters && (
           <div className="mb-3 rounded-lg bg-muted/30 p-3 animate-in fade-in-0 duration-150">
             <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+              <Input
+                value={queryText}
+                onChange={(e) => setQueryText(e.target.value)}
+                placeholder="模糊搜索：订阅、代理、错误、priority:0、rpm:60..."
+                className="h-8 text-xs"
+              />
+              <Input
+                value={priorityQuery}
+                onChange={(e) => setPriorityQuery(e.target.value)}
+                placeholder="优先级 = 0"
+                inputMode="numeric"
+                className="h-8 text-xs"
+              />
+              <Input
+                value={rpmQuery}
+                onChange={(e) => setRpmQuery(e.target.value)}
+                placeholder="RPM = 60"
+                inputMode="numeric"
+                className="h-8 text-xs"
+              />
+              <Input
+                value={concurrencyQuery}
+                onChange={(e) => setConcurrencyQuery(e.target.value)}
+                placeholder="并发 = 3"
+                inputMode="numeric"
+                className="h-8 text-xs"
+              />
               <Select value={statusFilter} onValueChange={setStatusFilter}>
                 <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
                 <SelectContent>
@@ -775,7 +952,7 @@ export function CredentialsPage() {
                 </SelectContent>
               </Select>
             </div>
-            {hasActiveFilters && (
+            {hasAnyFilters && (
               <div className="mt-2 flex justify-end">
                 <Button variant="ghost" size="xs" onClick={clearFilters}>
                   <X className="h-3.5 w-3.5" />清除筛选
@@ -876,9 +1053,9 @@ export function CredentialsPage() {
           <EmptyState
             icon={<Server className="h-12 w-12" />}
             title="暂无账号"
-            description={hasActiveFilters || queryText ? '没有匹配当前筛选条件的账号' : '点击添加按钮创建第一个账号'}
+            description={hasAnyFilters ? '没有匹配当前筛选条件的账号' : '点击添加按钮创建第一个账号'}
             action={
-              hasActiveFilters || queryText ? (
+              hasAnyFilters ? (
                 <Button variant="outline" size="sm" onClick={clearFilters}>清除筛选</Button>
               ) : (
                 <Button size="sm" onClick={() => setAddOpen(true)}>
@@ -914,13 +1091,14 @@ export function CredentialsPage() {
               total={filteredTotal}
               pageSize={PAGE_SIZE}
               onPageChange={setPage}
+              pending={pageTransitionPending}
             />
           </div>
         )}
       </SectionCard>
 
       {/* Modals */}
-      <ModalShell open={creditDetailsOpen} title="剩余可用积分明细" width="max-w-4xl" onClose={() => setCreditDetailsOpen(false)}>
+      <ModalShell open={creditDetailsOpen} title="当前页剩余可用积分明细" width="max-w-4xl" onClose={() => setCreditDetailsOpen(false)}>
         {creditDetailsLoading ? (
           <LoadingState text="加载积分明细..." />
         ) : creditDetailRows.length > 0 ? (

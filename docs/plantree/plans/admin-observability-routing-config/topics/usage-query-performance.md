@@ -67,4 +67,3 @@
 - `cargo test usage_records_page_query_accepts_http_request_id_names -- --nocapture`: pass.
 - `cargo test recorder_query_supports_exact_request_id_and_model_aliases -- --nocapture`: pass.
 - `pnpm --dir ui build`: pass.
-- `pnpm --dir admin-ui build`: pass.

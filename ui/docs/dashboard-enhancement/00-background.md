@@ -1,20 +1,18 @@
 # 00 · 背景与数据契约家底盘点
 
-> 实施前必读。本册回答两个问题：**三套 UI 是什么关系**、**后端到底能提供哪些数据、当前 ui 用了多少**。判断"哪些能力现在就能做"的依据全在这里。
+> 实施前必读。本册回答两个问题：**当前 UI 的定位**、**后端到底能提供哪些数据、当前 ui 用了多少**。判断"哪些能力现在就能做"的依据全在这里。
 
 ---
 
-## 1. 三套 UI 关系
+## 1. UI 定位
 
-仓库根目录有三套并存前端，是同一个 Kiro 控制台的三代实现，后端 API 完全相同：
+仓库只维护 `ui/` 这一套管理后台前端，后端 API 集中在 `src/admin/`：
 
 | 目录 | 代号 | 技术栈 | 定位 |
 |---|---|---|---|
-| `admin-ui/` | 旧版 Admin UI | React + Tailwind | 旧版后台，对照保留 |
-| `admin-ui/` | 中间版 | React + Radix + CVA + Tailwind v3 | 过渡版 |
-| `ui/` | **新版（本方案对象）** | React 18 + shadcn/Radix + Tailwind v4 + react-router v6 + recharts | 最新重构版，四域 IA |
+| `ui/` | 管理后台 | React 18 + shadcn/Radix + Tailwind v4 + react-router v6 + recharts | 当前维护版，四域 IA |
 
-本方案只针对 `ui/`。dashboard 相关代码集中在 `ui/src/features/overview/overview-page.tsx`。
+dashboard 相关代码集中在 `ui/src/features/overview/overview-page.tsx`。
 
 ---
 

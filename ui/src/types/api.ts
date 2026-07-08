@@ -67,6 +67,14 @@ export interface CredentialsPageQuery {
   page: number
   limit: number
   q?: string
+  credentialId?: number
+  account?: string
+  region?: string
+  model?: string
+  endpoint?: string
+  priority?: number
+  rpm?: number
+  concurrency?: number
   status?: string
   authMethod?: string
   subscription?: string
@@ -620,6 +628,8 @@ export type UsageSource =
   | 'request_estimate'
   | 'none'
 
+export type UsageRouteKindFilter = 'local_credential' | 'external_pool'
+
 export interface UsageLatencyTrace {
   capacityWeightUnits?: number
   estimatedInputTokens?: number
@@ -977,11 +987,15 @@ export interface UsageRecordsQuery {
   conversationId?: string
   credentialId?: number
   externalPoolId?: number
+  routeKind?: UsageRouteKindFilter
   model?: string
   status?: UsageRecordStatus
   source?: UsageSource
   stream?: boolean
   minCacheRead?: number
+  minFirstTokenLatencyMs?: number
+  since?: string
+  until?: string
 }
 
 export interface UsageRecordsPageQuery extends UsageRecordsQuery {

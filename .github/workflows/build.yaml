@@ -34,14 +34,6 @@ jobs:
         with:
           version: 11
 
-      - name: Install admin-ui dependencies
-        working-directory: admin-ui
-        run: pnpm install --frozen-lockfile
-
-      - name: Build admin-ui
-        working-directory: admin-ui
-        run: pnpm build
-
       - name: Install ui dependencies
         working-directory: ui
         run: pnpm install --frozen-lockfile

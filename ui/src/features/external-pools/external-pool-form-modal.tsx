@@ -175,26 +175,26 @@ export function ExternalPoolFormModal({
             </div>
           </FormSection>
 
-          <FormSection title="Usage 上报口径" description="只决定当前外部账号返回给下游的 usage 是透传上游，还是按当前请求路径整理；非 usage 内容不受影响。">
+          <FormSection title="下游 usage 口径" description="只决定当前外部账号返回给下游的 usage 是透传上游，还是按当前入口路径整理；非 usage 内容不受影响。">
             <div className="space-y-3">
               <SelectBox label="下游 usage" value={draft.usageProjectionMode} disabled={saving} onChange={(v) => set('usageProjectionMode', v as ExternalPoolFormDraft['usageProjectionMode'])}>
                 <SelectItem value="pass_through">透传上游 usage</SelectItem>
-                <SelectItem value="current_path_policy">按当前请求路径整理 usage</SelectItem>
+                <SelectItem value="current_path_policy">按当前入口路径整理 usage</SelectItem>
               </SelectBox>
               <HintBox>{usageProjectionDescription(draft.usageProjectionMode)}</HintBox>
             </div>
           </FormSection>
 
-          <FormSection title="流式响应处理" description="只决定 stream=true 时 SSE 事件如何转发。">
+          <FormSection title="流式 SSE 转发" description="只决定 stream=true 时 SSE 事件如何转发；usage 口径仍看上面的配置。">
             <div className="space-y-3">
               <SelectBox
-                label="SSE 事件"
+                label="SSE 转发"
                 value={draft.streamResponseMode}
                 disabled={saving}
                 onChange={(v) => set('streamResponseMode', v as ExternalPoolFormDraft['streamResponseMode'])}
               >
                 <SelectItem value="inherit">继承全局默认</SelectItem>
-                <SelectItem value="event_passthrough">事件级透传</SelectItem>
+                <SelectItem value="event_passthrough">SSE 事件级透传</SelectItem>
               </SelectBox>
               <HintBox>{streamResponseDescription(draft.streamResponseMode)}</HintBox>
             </div>

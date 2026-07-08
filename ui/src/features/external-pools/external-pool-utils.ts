@@ -193,7 +193,7 @@ export function modelMappingDescription(mode: ExternalPool['modelMappingMode'] |
 
 export function requestBodyModeDescription(mode: ExternalPool['requestBodyMode'] | undefined): string {
   if (mode === 'raw_passthrough') {
-    return '请求体不进入本系统的消息解析、图片处理、schema 修正和 payload guard。下游 usage 是透传上游还是按路径整理，由当前外部账号的 Usage 上报口径决定；是否改写顶层 model 由下方模型处理配置单独控制。'
+    return '请求体不进入本系统的消息解析、图片处理、schema 修正和 payload guard。下游 usage 是透传上游还是按入口路径整理，由当前外部账号的下游 usage 口径决定；是否改写顶层 model 由下方模型处理配置单独控制。'
   }
   return '按当前系统的标准 Anthropic 请求处理链路转发，会应用图片预处理、payload guard、thinking/model 兼容逻辑和 usage 整形上下文。'
 }
@@ -228,16 +228,16 @@ export function poolSupportedModelsSummary(pool: ExternalPool): string {
 
 export function usageProjectionDescription(mode: ExternalPool['usageProjectionMode'] | undefined): string {
   if (mode === 'current_path_policy') {
-    return '下游 usage 按当前请求路径的缓存策略整理；缓存读写补偿和输出补偿只会在这个口径下生效。'
+    return '返回给下游的 usage 按当前入口路径的缓存策略整理；如果该路径是 no-cache 或非流式 Usage 透传，则保持上游原始 usage。'
   }
-  return '下游 usage 保持外部账号返回的原始值；不按当前请求路径整理，也不应用缓存读写补偿或输出补偿。'
+  return '返回给下游的 usage 保持外部账号上游原始值；不按当前入口路径整理。'
 }
 
 export function streamResponseDescription(mode: ExternalPoolStreamResponseDraft): string {
   if (mode === 'event_passthrough') {
-    return '仅影响 stream=true。文本、thinking、tool 等 SSE event 按上游事件级转发；上游错误事件仍按系统规则脱敏。'
+    return '仅控制 stream=true 的 SSE 事件转发方式。文本、thinking、tool 等普通事件按上游事件级转发；usage 是否透传上游或按路径整理，由上面的下游 usage 口径决定。'
   }
-  return '当前外部账号不单独指定流式响应处理方式，使用外部池全局默认值。'
+  return '当前外部账号不单独指定流式 SSE 转发方式，使用外部池全局默认值；usage 口径仍由上面的下游 usage 口径决定。'
 }
 
 export function poolUsageSummary(pool: ExternalPool, config: ExternalPoolsConfig): string {

@@ -4263,6 +4263,10 @@ fn push_usage_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &UsageRec
         builder.push(" AND data->>'externalPoolId' = ");
         builder.push_bind(external_pool_id.to_string());
     }
+    if let Some(route_kind) = query.route_kind {
+        builder.push(" AND data->>'routeKind' = ");
+        builder.push_bind(usage_route_kind_value(route_kind));
+    }
     if let Some(model) = &query.model {
         builder.push(" AND (model = ");
         builder.push_bind(model.clone());
@@ -4287,6 +4291,15 @@ fn push_usage_filters(builder: &mut QueryBuilder<'_, Postgres>, query: &UsageRec
     if let Some(min_cache_read) = query.min_cache_read {
         builder.push(" AND cache_read_input_tokens >= ");
         builder.push_bind(min_cache_read);
+    }
+    if let Some(min_first_token_latency_ms) = query.min_first_token_latency_ms {
+        let min_first_token_latency_ms = min_first_token_latency_ms.min(i64::MAX as u64) as i64;
+        builder.push(" AND duration_ms >= ");
+        builder.push_bind(min_first_token_latency_ms);
+        builder.push(" AND data ? 'firstTokenLatencyMs'");
+        builder.push(" AND data->>'firstTokenLatencyMs' ~ '^[0-9]+$'");
+        builder.push(" AND (data->>'firstTokenLatencyMs')::bigint >= ");
+        builder.push_bind(min_first_token_latency_ms);
     }
     if let Some(since) = query.since {
         builder.push(" AND created_at >= ");
@@ -4657,6 +4670,13 @@ fn usage_source_value(source: crate::anthropic::usage::UsageSource) -> &'static 
         crate::anthropic::usage::UsageSource::ContextEstimate => "context_estimate",
         crate::anthropic::usage::UsageSource::RequestEstimate => "request_estimate",
         crate::anthropic::usage::UsageSource::None => "none",
+    }
+}
+
+fn usage_route_kind_value(route_kind: UsageRouteKind) -> &'static str {
+    match route_kind {
+        UsageRouteKind::LocalCredential => "local_credential",
+        UsageRouteKind::ExternalPool => "external_pool",
     }
 }
 

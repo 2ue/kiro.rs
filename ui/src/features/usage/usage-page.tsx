@@ -1,22 +1,25 @@
 import { useMemo, useState, type ReactNode } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import {
   Activity,
   BarChart3,
+  Check,
   ChevronDown,
   ChevronUp,
   Clock3,
   Database,
+  Download,
   SlidersHorizontal,
   Info,
   RefreshCw,
+  Search,
   Trash2,
   X,
   Zap,
 } from 'lucide-react'
-import { useQuery } from '@tanstack/react-query'
+import { toast } from 'sonner'
 import { useAutoRefreshPreference } from '@/hooks/use-auto-refresh'
 import { useDebouncedValue } from '@/hooks/use-debounced-value'
-import { useCredentials } from '@/hooks/use-credentials'
 import {
   useUsageDashboardSeries,
   useUsageSummary,
@@ -24,10 +27,11 @@ import {
   useUsageCleanupStatus,
   useRefreshUsageQueriesAfterCleanup,
 } from '@/hooks/use-usage'
-import { getExternalPools } from '@/api/credentials'
+import { getUsageRecords } from '@/api/usage'
+import { getCredentialList, getExternalPools } from '@/api/credentials'
 import { formatDate, formatCompact, formatMeteringUsage, formatNumber, formatPercent, formatUsd, ratio } from '@/lib/format'
-import { extractErrorMessage } from '@/lib/utils'
-import type { UsageRecord, UsageRecordStatus, UsageRecordsPageQuery, UsageSource, UsageSeriesPoint } from '@/types/api'
+import { cn, extractErrorMessage } from '@/lib/utils'
+import type { CredentialListItem, ExternalPool, UsageRecord, UsageRecordStatus, UsageRecordsPageQuery, UsageRecordsQuery, UsageRouteKindFilter, UsageSource, UsageSeriesPoint } from '@/types/api'
 import {
   PageContainer,
   PageHeader,
@@ -42,11 +46,15 @@ import {
   Badge,
   Button,
   Input,
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
+  Spinner,
   Switch,
   Table,
   TableBody,
@@ -75,7 +83,17 @@ import { UsageCleanupModal } from './usage-cleanup-modal'
 
 const AUTO_REFRESH_KEY = 'kiro-admin:auto-refresh:usage'
 const PAGE_SIZE = 20
+const EXPORT_LIMIT = 1000
+const ROUTE_OPTION_LIMIT = 50
 const REQUEST_ID_PATTERN = /req_[A-Za-z0-9_-]+/
+const SLOW_FIRST_TOKEN_MS = 10_000
+
+type RouteSelectionValue = 'all' | `credential:${number}` | `external:${number}`
+
+type ParsedRouteSelection =
+  | { kind: 'all' }
+  | { kind: 'credential'; id: number }
+  | { kind: 'external'; id: number }
 
 // ─── 工具函数 ──────────────────────────────────────────────────────────────────
 
@@ -94,7 +112,7 @@ function usageInputTotal(record: UsageRecord): number {
   return record.compatInputTokens + record.cacheReadInputTokens + record.cacheCreationInputTokens
 }
 
-function routeTargetLabel(record: UsageRecord, credentialLabel?: string): string {
+function routeAccountLabel(record: UsageRecord, credentialLabel?: string): string {
   if (record.routeKind === 'external_pool') {
     const name = record.externalPoolName ? ` ${record.externalPoolName}` : ''
     return `外部账号 #${record.externalPoolId ?? '-'}${name}`
@@ -103,8 +121,167 @@ function routeTargetLabel(record: UsageRecord, credentialLabel?: string): string
   return `账号 #${record.credentialId ?? '-'}${label}`
 }
 
+function parseRouteSelection(value: RouteSelectionValue): ParsedRouteSelection {
+  if (value === 'all') return { kind: 'all' }
+  const [kind, rawId] = value.split(':')
+  const id = Number(rawId)
+  if (!Number.isFinite(id) || id <= 0) return { kind: 'all' }
+  if (kind === 'credential') return { kind: 'credential', id }
+  if (kind === 'external') return { kind: 'external', id }
+  return { kind: 'all' }
+}
+
+function credentialOptionLabel(credential: CredentialListItem): string {
+  const identity = credential.email || credential.maskedApiKey || credential.refreshTokenHash || credential.apiKeyHash || '未命名账号'
+  return `账号 #${credential.id} ${identity}`
+}
+
+function credentialOptionMeta(credential: CredentialListItem): string {
+  const parts = [
+    credential.subscriptionTitle,
+    credential.provider,
+    credential.effectiveApiRegion ? `api ${credential.effectiveApiRegion}` : undefined,
+    credential.disabled ? '已禁用' : undefined,
+  ].filter(Boolean)
+  return parts.join(' · ')
+}
+
+function externalPoolOptionLabel(pool: ExternalPool): string {
+  return `外部池 #${pool.id} ${pool.name || '未命名'}`
+}
+
+function externalPoolOptionMeta(pool: ExternalPool): string {
+  return [pool.enabled ? '启用' : '禁用', pool.baseUrl].filter(Boolean).join(' · ')
+}
+
+function routeSelectionAllLabel(routeKind: UsageRouteKindFilter | '__all__'): string {
+  if (routeKind === 'local_credential') return '全部本地账号'
+  if (routeKind === 'external_pool') return '全部外部池'
+  return '全部账号/外部池'
+}
+
+function routeSelectionFallbackLabel(value: RouteSelectionValue, routeKind: UsageRouteKindFilter | '__all__'): string {
+  const parsed = parseRouteSelection(value)
+  if (parsed.kind === 'credential') return `账号 #${parsed.id}`
+  if (parsed.kind === 'external') return `外部池 #${parsed.id}`
+  return routeSelectionAllLabel(routeKind)
+}
+
 function extractRequestId(value: string): string {
   return value.match(REQUEST_ID_PATTERN)?.[0] ?? ''
+}
+
+function toDatetimeLocalValue(date: Date): string {
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return [
+    date.getFullYear(),
+    '-',
+    pad(date.getMonth() + 1),
+    '-',
+    pad(date.getDate()),
+    ' ',
+    pad(date.getHours()),
+    ':',
+    pad(date.getMinutes()),
+  ].join('')
+}
+
+function datetimeLocalToIso(value: string): string | undefined {
+  const trimmed = value.trim()
+  if (!trimmed) return undefined
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(trimmed)
+    ? trimmed.replace(' ', 'T')
+    : trimmed
+  const date = new Date(normalized)
+  if (Number.isNaN(date.getTime())) return undefined
+  return date.toISOString()
+}
+
+function recentDatetimeLocal(hours: number): string {
+  return toDatetimeLocalValue(new Date(Date.now() - hours * 60 * 60 * 1000))
+}
+
+function csvCell(value: unknown): string {
+  if (value === null || typeof value === 'undefined') return ''
+  const text = String(value)
+  if (!/[",\n\r]/.test(text)) return text
+  return `"${text.replace(/"/g, '""')}"`
+}
+
+function usageRecordsToCsv(records: UsageRecord[]): string {
+  const headers = [
+    'created_at',
+    'request_id',
+    'conversation_id',
+    'status',
+    'stream',
+    'endpoint',
+    'requested_model',
+    'upstream_model',
+    'route_kind',
+    'route_subtype',
+    'credential_id',
+    'credential_label',
+    'external_pool_id',
+    'external_pool_name',
+    'usage_source',
+    'total_input_tokens',
+    'compat_input_tokens',
+    'billable_input_tokens',
+    'output_tokens',
+    'cache_read_input_tokens',
+    'cache_creation_input_tokens',
+    'estimated_cost_usd',
+    'kiro_metering_usage',
+    'pricing_model',
+    'duration_ms',
+    'first_token_latency_ms',
+    'error_type',
+    'error_message',
+  ]
+  const rows = records.map((record) => [
+    record.createdAt,
+    record.id,
+    record.conversationId,
+    record.status,
+    record.stream ? 'stream' : 'non_stream',
+    record.endpoint,
+    record.model,
+    upstreamModelLabel(record) === '-' ? '' : upstreamModelLabel(record),
+    record.routeKind,
+    record.routeSubtype,
+    record.credentialId,
+    record.credentialLabel,
+    record.externalPoolId,
+    record.externalPoolName,
+    record.usageSource,
+    record.totalInputTokens,
+    record.compatInputTokens,
+    record.billableInputTokens,
+    record.outputTokens,
+    record.cacheReadInputTokens,
+    record.cacheCreationInputTokens,
+    record.estimatedCostUsd,
+    record.kiroMeteringUsage,
+    record.pricingModel,
+    record.durationMs,
+    record.firstTokenLatencyMs,
+    record.publicErrorType || record.errorType,
+    record.publicErrorMessage || record.errorMessage,
+  ])
+  return [headers, ...rows].map((row) => row.map(csvCell).join(',')).join('\n')
+}
+
+function downloadTextFile(content: string, filename: string, type: string) {
+  const blob = new Blob([content], { type })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
 }
 
 function FilterField({
@@ -121,6 +298,189 @@ function FilterField({
       <span className="mb-1 block text-[0.68rem] font-medium text-muted-foreground">{label}</span>
       {children}
     </label>
+  )
+}
+
+function RouteTargetSelect({
+  value,
+  routeKind,
+  onChange,
+}: {
+  value: RouteSelectionValue
+  routeKind: UsageRouteKindFilter | '__all__'
+  onChange: (value: RouteSelectionValue) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [search, setSearch] = useState('')
+  const debouncedSearch = useDebouncedValue(search, 250)
+  const searchText = debouncedSearch.trim()
+  const showCredentials = routeKind !== 'external_pool'
+  const showExternalPools = routeKind !== 'local_credential'
+
+  const credentials = useQuery({
+    queryKey: ['usage-route-target-credentials', searchText],
+    queryFn: () => getCredentialList({
+      page: 1,
+      limit: ROUTE_OPTION_LIMIT,
+      q: searchText || undefined,
+    }),
+    enabled: open && showCredentials,
+    staleTime: 30_000,
+  })
+
+  const externalPools = useQuery({
+    queryKey: ['usage-route-target-external-pools'],
+    queryFn: getExternalPools,
+    enabled: open && showExternalPools,
+    staleTime: 30_000,
+  })
+
+  const filteredPools = useMemo(() => {
+    const pools = externalPools.data?.pools ?? []
+    const q = searchText.toLowerCase()
+    if (!q) return pools.slice(0, ROUTE_OPTION_LIMIT)
+    return pools
+      .filter((pool) => {
+        const haystack = [
+          String(pool.id),
+          pool.name,
+          pool.baseUrl,
+          pool.maskedApiKey,
+          pool.supportedModels?.join(' '),
+        ].filter(Boolean).join(' ').toLowerCase()
+        return haystack.includes(q)
+      })
+      .slice(0, ROUTE_OPTION_LIMIT)
+  }, [externalPools.data?.pools, searchText])
+
+  const selectedLabel = useMemo(() => {
+    const parsed = parseRouteSelection(value)
+    if (parsed.kind === 'credential') {
+      const credential = credentials.data?.items.find((item) => item.id === parsed.id)
+      return credential ? credentialOptionLabel(credential) : routeSelectionFallbackLabel(value, routeKind)
+    }
+    if (parsed.kind === 'external') {
+      const pool = externalPools.data?.pools.find((item) => item.id === parsed.id)
+      return pool ? externalPoolOptionLabel(pool) : routeSelectionFallbackLabel(value, routeKind)
+    }
+    return routeSelectionAllLabel(routeKind)
+  }, [credentials.data?.items, externalPools.data?.pools, routeKind, value])
+
+  const selectValue = (next: RouteSelectionValue) => {
+    onChange(next)
+    setOpen(false)
+  }
+
+  const credentialsLoading = showCredentials && credentials.isFetching
+  const poolsLoading = showExternalPools && externalPools.isFetching
+  const hasCredentialItems = (credentials.data?.items.length ?? 0) > 0
+  const hasPoolItems = filteredPools.length > 0
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <Button variant="outline" size="sm" className="h-8 w-full justify-between overflow-hidden px-2 text-left">
+          <span className="min-w-0 truncate">{selectedLabel}</span>
+          <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-60" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent className="w-[min(28rem,calc(100vw-2rem))] p-2" align="start">
+        <div className="relative">
+          <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="搜索账号邮箱、key、外部池名称"
+            className="h-8 pl-7 text-xs"
+          />
+        </div>
+        <div className="mt-2 max-h-72 overflow-y-auto pr-1 scrollbar-thin">
+          <button
+            type="button"
+            className={cn(
+              'flex w-full items-center justify-between rounded-md px-2 py-2 text-left text-xs hover:bg-muted',
+              value === 'all' && 'bg-muted text-primary'
+            )}
+            onClick={() => selectValue('all')}
+          >
+            <span>{routeSelectionAllLabel(routeKind)}</span>
+            {value === 'all' && <Check className="h-3.5 w-3.5" />}
+          </button>
+
+          {showCredentials && (
+            <div className="mt-1">
+              <div className="px-2 py-1 text-[0.65rem] font-medium text-muted-foreground">本地账号</div>
+              {credentialsLoading && (
+                <div className="flex items-center gap-2 px-2 py-2 text-xs text-muted-foreground">
+                  <Spinner size="sm" />加载账号...
+                </div>
+              )}
+              {!credentialsLoading && !hasCredentialItems && (
+                <div className="px-2 py-2 text-xs text-muted-foreground">没有匹配账号</div>
+              )}
+              {(credentials.data?.items ?? []).map((credential) => {
+                const itemValue = `credential:${credential.id}` as RouteSelectionValue
+                return (
+                  <button
+                    key={itemValue}
+                    type="button"
+                    className={cn(
+                      'flex w-full items-start justify-between gap-2 rounded-md px-2 py-2 text-left hover:bg-muted',
+                      value === itemValue && 'bg-muted text-primary'
+                    )}
+                    onClick={() => selectValue(itemValue)}
+                  >
+                    <span className="min-w-0">
+                      <span className="block truncate text-xs font-medium">{credentialOptionLabel(credential)}</span>
+                      <span className="block truncate text-[0.65rem] text-muted-foreground">
+                        {credentialOptionMeta(credential) || credential.endpoint}
+                      </span>
+                    </span>
+                    {value === itemValue && <Check className="mt-0.5 h-3.5 w-3.5 shrink-0" />}
+                  </button>
+                )
+              })}
+            </div>
+          )}
+
+          {showExternalPools && (
+            <div className="mt-1">
+              <div className="px-2 py-1 text-[0.65rem] font-medium text-muted-foreground">外部池</div>
+              {poolsLoading && (
+                <div className="flex items-center gap-2 px-2 py-2 text-xs text-muted-foreground">
+                  <Spinner size="sm" />加载外部池...
+                </div>
+              )}
+              {!poolsLoading && !hasPoolItems && (
+                <div className="px-2 py-2 text-xs text-muted-foreground">没有匹配外部池</div>
+              )}
+              {filteredPools.map((pool) => {
+                const itemValue = `external:${pool.id}` as RouteSelectionValue
+                return (
+                  <button
+                    key={itemValue}
+                    type="button"
+                    className={cn(
+                      'flex w-full items-start justify-between gap-2 rounded-md px-2 py-2 text-left hover:bg-muted',
+                      value === itemValue && 'bg-muted text-primary'
+                    )}
+                    onClick={() => selectValue(itemValue)}
+                  >
+                    <span className="min-w-0">
+                      <span className="block truncate text-xs font-medium">{externalPoolOptionLabel(pool)}</span>
+                      <span className="block truncate text-[0.65rem] text-muted-foreground">
+                        {externalPoolOptionMeta(pool)}
+                      </span>
+                    </span>
+                    {value === itemValue && <Check className="mt-0.5 h-3.5 w-3.5 shrink-0" />}
+                  </button>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      </PopoverContent>
+    </Popover>
   )
 }
 
@@ -209,12 +569,17 @@ function RecordsView({
   const [model, setModel] = useState('')
   const [endpoint, setEndpoint] = useState('')
   const [conversationId, setConversationId] = useState('')
-  const [routeTarget, setRouteTarget] = useState('')
+  const [routeSelection, setRouteSelection] = useState<RouteSelectionValue>('all')
+  const [routeKind, setRouteKind] = useState<UsageRouteKindFilter | '__all__'>('__all__')
   const [status, setStatus] = useState<UsageRecordStatus | '__all__'>('__all__')
   const [source, setSource] = useState<UsageSource | '__all__'>('__all__')
   const [streamMode, setStreamMode] = useState<'all' | 'stream' | 'non_stream'>('all')
   const [minCacheRead, setMinCacheRead] = useState('')
+  const [minFirstTokenLatencyMs, setMinFirstTokenLatencyMs] = useState('')
+  const [since, setSince] = useState('')
+  const [until, setUntil] = useState('')
   const [advancedOpen, setAdvancedOpen] = useState(false)
+  const [exporting, setExporting] = useState(false)
 
   // 文本筛选项防抖,避免每次按键都触发查询(展示值即时,查询用防抖值)
   const qD = useDebouncedValue(q)
@@ -223,26 +588,14 @@ function RecordsView({
   const endpointD = useDebouncedValue(endpoint)
   const conversationIdD = useDebouncedValue(conversationId)
   const minCacheReadD = useDebouncedValue(minCacheRead)
+  const minFirstTokenLatencyMsD = useDebouncedValue(minFirstTokenLatencyMs)
+  const sinceD = useDebouncedValue(since)
+  const untilD = useDebouncedValue(until)
   const hasAdvancedFilters =
     !!q.trim() || status !== '__all__' || source !== '__all__' || streamMode !== 'all' ||
-    !!routeTarget || !!minCacheRead.trim()
+    !!endpoint.trim() || !!conversationId.trim() || routeSelection !== 'all' || !!minCacheRead.trim()
   const showAdvancedFilters = advancedOpen || hasAdvancedFilters
-
-  const credentials = useCredentials({ enabled: showAdvancedFilters, refetchInterval: autoRefreshInterval })
-  const externalPools = useQuery({
-    queryKey: ['external-pools'],
-    queryFn: getExternalPools,
-    enabled: showAdvancedFilters,
-    refetchInterval: autoRefreshInterval,
-  })
-
-  const credentialLabels = useMemo(() => {
-    const labels = new Map<number, string>()
-    for (const c of credentials.data?.credentials ?? []) {
-      labels.set(c.id, c.email || c.maskedApiKey || `账号 #${c.id}`)
-    }
-    return labels
-  }, [credentials.data?.credentials])
+  const selectedRouteTarget = useMemo(() => parseRouteSelection(routeSelection), [routeSelection])
 
   const query = useMemo<UsageRecordsPageQuery>(() => {
     const next: UsageRecordsPageQuery = { page, limit: PAGE_SIZE }
@@ -257,31 +610,108 @@ function RecordsView({
     if (modelD.trim()) next.model = modelD.trim()
     if (endpointD.trim()) next.endpoint = endpointD.trim()
     if (conversationIdD.trim()) next.conversationId = conversationIdD.trim()
-    const [routeType, routeId] = routeTarget.split(':')
-    const parsedRouteId = Number(routeId)
-    if (routeTarget && Number.isFinite(parsedRouteId)) {
-      if (routeType === 'credential') next.credentialId = parsedRouteId
-      if (routeType === 'external') next.externalPoolId = parsedRouteId
-    }
+    if (routeKind !== '__all__') next.routeKind = routeKind
+    if (selectedRouteTarget.kind === 'credential') next.credentialId = selectedRouteTarget.id
+    if (selectedRouteTarget.kind === 'external') next.externalPoolId = selectedRouteTarget.id
     if (status !== '__all__') next.status = status
     if (source !== '__all__') next.source = source
     if (streamMode !== 'all') next.stream = streamMode === 'stream'
     if (minCacheReadD.trim() && Number.isFinite(Number(minCacheReadD))) next.minCacheRead = Number(minCacheReadD)
+    if (minFirstTokenLatencyMsD.trim() && Number.isFinite(Number(minFirstTokenLatencyMsD))) {
+      next.minFirstTokenLatencyMs = Number(minFirstTokenLatencyMsD)
+    }
+    const sinceIso = datetimeLocalToIso(sinceD)
+    const untilIso = datetimeLocalToIso(untilD)
+    if (sinceIso) next.since = sinceIso
+    if (untilIso) next.until = untilIso
     return next
-  }, [conversationIdD, endpointD, minCacheReadD, modelD, page, qD, requestIdD, routeTarget, source, status, streamMode])
+  }, [
+    conversationIdD,
+    endpointD,
+    minCacheReadD,
+    minFirstTokenLatencyMsD,
+    modelD,
+    page,
+    qD,
+    requestIdD,
+    routeKind,
+    selectedRouteTarget,
+    sinceD,
+    source,
+    status,
+    streamMode,
+    untilD,
+  ])
 
   const records = useUsageRecordsPage(query, autoRefreshInterval)
   const items = records.data?.records ?? []
   const hasNext = records.data?.hasNext ?? false
+  const pageTransitionPending = Boolean(
+    records.data?.page !== undefined &&
+    (records.isPlaceholderData || (records.isFetching && records.data.page !== page))
+  )
   const hasFilters =
-    status !== '__all__' || source !== '__all__' || streamMode !== 'all' ||
+    routeKind !== '__all__' || status !== '__all__' || source !== '__all__' || streamMode !== 'all' ||
     !!q.trim() || !!requestId.trim() || !!model.trim() || !!endpoint.trim() || !!conversationId.trim() ||
-    !!routeTarget || !!minCacheRead.trim()
+    routeSelection !== 'all' || !!minCacheRead.trim() ||
+    !!minFirstTokenLatencyMs.trim() || !!since.trim() || !!until.trim()
 
   const clearFilters = () => {
     setQ(''); setRequestId(''); setModel(''); setEndpoint(''); setConversationId('')
-    setRouteTarget(''); setStatus('__all__'); setSource('__all__')
-    setStreamMode('all'); setMinCacheRead('')
+    setRouteSelection('all'); setRouteKind('__all__'); setStatus('__all__'); setSource('__all__')
+    setStreamMode('all'); setMinCacheRead(''); setMinFirstTokenLatencyMs(''); setSince(''); setUntil('')
+  }
+
+  const updateRouteKind = (value: UsageRouteKindFilter | '__all__') => {
+    const selected = parseRouteSelection(routeSelection)
+    if (value === 'local_credential' && selected.kind === 'external') setRouteSelection('all')
+    if (value === 'external_pool' && selected.kind === 'credential') setRouteSelection('all')
+    setRouteKind(value)
+    setPage(1)
+  }
+
+  const updateRouteSelection = (value: RouteSelectionValue) => {
+    setRouteSelection(value)
+    const selected = parseRouteSelection(value)
+    if (selected.kind === 'credential') setRouteKind('local_credential')
+    if (selected.kind === 'external') setRouteKind('external_pool')
+    setPage(1)
+  }
+
+  const applyRecentHours = (hours: number) => {
+    setSince(recentDatetimeLocal(hours))
+    setUntil('')
+    setPage(1)
+  }
+
+  const applySlowFirstTokenPreset = () => {
+    setMinFirstTokenLatencyMs(String(SLOW_FIRST_TOKEN_MS))
+    if (!since.trim() && !until.trim()) setSince(recentDatetimeLocal(6))
+    setPage(1)
+  }
+
+  const exportCurrentQuery = async () => {
+    setExporting(true)
+    try {
+      const { page: _page, ...queryWithoutPage } = query
+      const exportQuery: UsageRecordsQuery = { ...queryWithoutPage, limit: EXPORT_LIMIT }
+      const result = await getUsageRecords(exportQuery)
+      if (result.records.length === 0) {
+        toast.warning('当前筛选条件下没有可导出的用量记录')
+        return
+      }
+      const csv = usageRecordsToCsv(result.records)
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+      downloadTextFile(csv, `kiro-usage-records-${stamp}.csv`, 'text/csv;charset=utf-8')
+      const suffix = result.total > result.records.length
+        ? `（最多导出 ${result.records.length}/${result.total} 条）`
+        : ''
+      toast.success(`已导出 ${result.records.length} 条用量记录${suffix}`)
+    } catch (error) {
+      toast.error(`导出失败: ${extractErrorMessage(error)}`)
+    } finally {
+      setExporting(false)
+    }
   }
 
   return (
@@ -289,11 +719,17 @@ function RecordsView({
       <SectionCard
         title="明细记录"
         description="每次请求的完整记录，点击行查看详情"
+        actions={
+          <Button variant="outline" size="sm" onClick={exportCurrentQuery} disabled={exporting || records.isLoading}>
+            {exporting ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
+            导出 CSV
+          </Button>
+        }
         noPadding
       >
         <div className="space-y-3 px-4 pt-4 pb-2">
           <div className="rounded-xl bg-card p-3 shadow-sm">
-            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-[1.2fr_1fr_1fr_1.2fr_auto]">
+            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-[1.2fr_1fr_1fr_1fr_0.9fr_0.95fr_auto]">
               <FilterField label="请求 ID">
                 <Input
                   placeholder="req_..."
@@ -310,21 +746,40 @@ function RecordsView({
                   className="h-9 text-xs"
                 />
               </FilterField>
-              <FilterField label="入口路径">
+              <FilterField label="起始时间">
                 <Input
-                  placeholder="/cc/v1/messages"
-                  value={endpoint}
-                  onChange={(e) => { setEndpoint(e.target.value); setPage(1) }}
-                  className="h-9 text-xs"
-                />
-              </FilterField>
-              <FilterField label="会话 ID">
-                <Input
-                  placeholder="conversation id"
-                  value={conversationId}
-                  onChange={(e) => { setConversationId(e.target.value); setPage(1) }}
+                  placeholder="YYYY-MM-DD HH:mm"
+                  value={since}
+                  onChange={(e) => { setSince(e.target.value); setPage(1) }}
                   className="h-9 font-mono text-xs"
                 />
+              </FilterField>
+              <FilterField label="结束时间">
+                <Input
+                  placeholder="YYYY-MM-DD HH:mm"
+                  value={until}
+                  onChange={(e) => { setUntil(e.target.value); setPage(1) }}
+                  className="h-9 font-mono text-xs"
+                />
+              </FilterField>
+              <FilterField label="首字不低于 ms">
+                <Input
+                  placeholder="10000"
+                  value={minFirstTokenLatencyMs}
+                  onChange={(e) => { setMinFirstTokenLatencyMs(e.target.value); setPage(1) }}
+                  className="h-9 text-xs"
+                  inputMode="numeric"
+                />
+              </FilterField>
+              <FilterField label="路由">
+                <Select value={routeKind} onValueChange={(v) => updateRouteKind(v as UsageRouteKindFilter | '__all__')}>
+                  <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__all__">全部路由</SelectItem>
+                    <SelectItem value="local_credential">本地账号</SelectItem>
+                    <SelectItem value="external_pool">外部池</SelectItem>
+                  </SelectContent>
+                </Select>
               </FilterField>
               <div className="flex items-end gap-2">
                 <Button
@@ -343,6 +798,13 @@ function RecordsView({
                 {records.isFetching && <RefreshCw className="size-3.5 animate-spin text-muted-foreground/60" />}
               </div>
             </div>
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <Button variant="ghost" size="xs" onClick={() => applyRecentHours(1)}>最近 1h</Button>
+              <Button variant="ghost" size="xs" onClick={() => applyRecentHours(6)}>最近 6h</Button>
+              <Button variant="ghost" size="xs" onClick={applySlowFirstTokenPreset}>慢首字 &gt;10s</Button>
+              <Button variant="ghost" size="xs" onClick={() => { setStatus('error'); setPage(1); setAdvancedOpen(true) }}>错误</Button>
+              <Button variant="ghost" size="xs" onClick={() => updateRouteKind('external_pool')}>外部池</Button>
+            </div>
 
             {showAdvancedFilters && (
               <div className="mt-3 border-t pt-3">
@@ -353,6 +815,22 @@ function RecordsView({
                       value={q}
                       onChange={(e) => { setQ(e.target.value); setPage(1) }}
                       className="h-8 text-xs"
+                    />
+                  </FilterField>
+                  <FilterField label="入口路径">
+                    <Input
+                      placeholder="/cc/v1/messages"
+                      value={endpoint}
+                      onChange={(e) => { setEndpoint(e.target.value); setPage(1) }}
+                      className="h-8 text-xs"
+                    />
+                  </FilterField>
+                  <FilterField label="会话 ID">
+                    <Input
+                      placeholder="conversation id"
+                      value={conversationId}
+                      onChange={(e) => { setConversationId(e.target.value); setPage(1) }}
+                      className="h-8 font-mono text-xs"
                     />
                   </FilterField>
                   <FilterField label="最小缓存读取 token">
@@ -400,23 +878,12 @@ function RecordsView({
                       </SelectContent>
                     </Select>
                   </FilterField>
-                  <FilterField label="账号 / 外部池" className="sm:col-span-2 lg:col-span-1">
-                    <Select value={routeTarget || '__all__'} onValueChange={(v) => { setRouteTarget(v === '__all__' ? '' : v); setPage(1) }}>
-                      <SelectTrigger size="sm"><SelectValue placeholder="全部账号/外部账号" /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="__all__">全部账号/外部账号</SelectItem>
-                        {(credentials.data?.credentials ?? []).map((c) => (
-                          <SelectItem key={`credential:${c.id}`} value={`credential:${c.id}`}>
-                            账号 #{c.id} {c.email || c.maskedApiKey || ''}
-                          </SelectItem>
-                        ))}
-                        {(externalPools.data?.pools ?? []).map((p) => (
-                          <SelectItem key={`external:${p.id}`} value={`external:${p.id}`}>
-                            外部账号 #{p.id} {p.name}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+                  <FilterField label="账号 / 外部池">
+                    <RouteTargetSelect
+                      value={routeSelection}
+                      routeKind={routeKind}
+                      onChange={updateRouteSelection}
+                    />
                   </FilterField>
                 </div>
               </div>
@@ -458,9 +925,7 @@ function RecordsView({
                 </TableHeader>
                 <TableBody>
                   {items.map((record) => {
-                    const label = typeof record.credentialId === 'number'
-                      ? credentialLabels.get(record.credentialId) || record.credentialLabel
-                      : record.credentialLabel
+                    const label = record.credentialLabel
                     const reportedInputTotal = usageInputTotal(record)
                     const rowReadRatio = ratio(record.cacheReadInputTokens, reportedInputTotal)
                     const rowCachedRatio = ratio(
@@ -470,7 +935,7 @@ function RecordsView({
                     const attemptSummary = formatAttemptSummary(record)
                     const attemptChain = formatAttemptChain(record)
                     const externalChain = formatExternalAttemptChain(record)
-                    const targetLabel = routeTargetLabel(record, label)
+                    const targetLabel = routeAccountLabel(record, label)
                     const resolvedModel = upstreamModelLabel(record)
                     const hasModelChange = resolvedModel !== '-' && resolvedModel !== record.model
                     return (
@@ -616,9 +1081,25 @@ function RecordsView({
             {(page > 1 || hasNext) && (
               <div className="px-4 py-3">
                 <div className="flex items-center justify-center gap-3">
-                  <Button variant="outline" size="sm" disabled={page === 1} onClick={() => setPage((v) => Math.max(1, v - 1))}>上一页</Button>
-                  <span className="text-xs text-muted-foreground">第 {page} 页，每页 {PAGE_SIZE} 条</span>
-                  <Button variant="outline" size="sm" disabled={!hasNext} onClick={() => setPage((v) => v + 1)}>下一页</Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={page === 1 || pageTransitionPending}
+                    onClick={() => setPage((v) => Math.max(1, v - 1))}
+                  >
+                    上一页
+                  </Button>
+                  <span className="text-xs text-muted-foreground">
+                    第 {page} 页，每页 {PAGE_SIZE} 条{pageTransitionPending ? ' · 加载中' : ''}
+                  </span>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={!hasNext || pageTransitionPending}
+                    onClick={() => setPage((v) => v + 1)}
+                  >
+                    下一页
+                  </Button>
                 </div>
               </div>
             )}

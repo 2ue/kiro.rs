@@ -16,7 +16,6 @@
 ## Frontend Gates
 
 - `pnpm --dir ui build`
-- `pnpm --dir admin-ui build`
 
 ## Fake Upstream Gates
 
@@ -53,7 +52,6 @@ Static and unit:
 Frontend:
 
 - `pnpm --dir ui build`: pass.
-- `pnpm --dir admin-ui build`: pass.
 
 Fake upstream direct:
 

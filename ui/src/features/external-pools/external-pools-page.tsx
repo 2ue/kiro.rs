@@ -425,7 +425,7 @@ export function ExternalPoolsPage() {
             title="用量补偿"
             titleSuffix={!externalEnabled ? '需先启用外部账号' : undefined}
             active={externalEnabled && usageCompensationActive}
-            description={'仅对 Usage 上报口径为“按当前请求路径整理 usage”的外部账号生效；选择“透传上游 usage”的账号不受影响。'}
+            description={'仅对下游 usage 口径为“按当前入口路径整理 usage”的外部账号生效；选择“透传上游 usage”的账号不受影响。'}
           >
             <div className="space-y-4">
               <div className="grid gap-4 lg:grid-cols-2">

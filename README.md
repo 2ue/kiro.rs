@@ -69,7 +69,6 @@
 
 > **发布/嵌入式构建前置步骤**：如果要重新构建带 embedded 前端的 Rust 二进制，需要先生成前端 `dist`：
 > ```bash
-> pnpm --dir admin-ui install && pnpm --dir admin-ui build
 > pnpm --dir ui install && pnpm --dir ui build
 > ```
 >
@@ -488,18 +487,14 @@ RUST_LOG=debug ./target/release/kiro-rs
 | `KIRO_NEW_UI_MODE` / `KIRO_UI_MODE` | debug: `redirect`; release: `embedded` | 新版 `/ui` 的服务模式：`embedded` / `redirect` / `proxy` / `filesystem` / `disabled` |
 | `KIRO_NEW_UI_DIR` / `KIRO_UI_DIR` | `ui/dist` | `/ui` 使用 `filesystem` 模式时读取的构建目录 |
 | `KIRO_NEW_UI_DEV_SERVER` / `KIRO_UI_DEV_SERVER` | debug: `http://127.0.0.1:9023/ui` | `/ui` 使用 `redirect` 或 `proxy` 时指向的 Vite 服务 |
-| `KIRO_ADMIN_UI_MODE` | debug: `redirect`; release: `embedded` | 旧版 `/admin` 的服务模式，取值同上 |
-| `KIRO_ADMIN_UI_DIR` | `admin-ui/dist` | `/admin` 使用 `filesystem` 模式时读取的构建目录 |
-| `KIRO_ADMIN_UI_DEV_SERVER` | debug: `http://127.0.0.1:9025/admin` | `/admin` 使用 `redirect` 或 `proxy` 时指向的 Vite 服务 |
 
-生产默认使用 `embedded`，前端构建产物编进后端二进制，部署仍是单服务。debug 构建默认不嵌入前端 dist，后端 `/ui`、`/admin` 会重定向到对应 Vite 服务；开发环境统一使用 Vite 热更新，前端通过 `/api` 代理到后端 API。
+生产默认使用 `embedded`，前端构建产物编进后端二进制，部署仍是单服务。debug 构建默认不嵌入前端 dist，后端 `/ui` 会重定向到对应 Vite 服务；开发环境统一使用 Vite 热更新，前端通过 `/api` 代理到后端 API。
 
 本地开发预览地址：
 
 | 前端 | 命令 | 浏览器地址 | 用途 |
 |------|------|------------|------|
 | 新版 UI | `bash scripts/dev-ui.sh ui` | `http://127.0.0.1:9023/ui/runtime` | 当前主要开发入口 |
-| 旧版 Admin UI | `bash scripts/dev-ui.sh admin` | `http://127.0.0.1:9025/admin/` | 旧版对照，打开后点“配置” |
 
 后端 API 示例：
 
@@ -514,7 +509,7 @@ RUST_LOG=debug ./target/release/kiro-rs
 VITE_API_PROXY_TARGET=http://127.0.0.1:8990 bash scripts/dev-ui.sh ui
 ```
 
-日常前端开发可以直接打开上表里的 Vite 地址；如果访问 debug 后端的 `/ui`、`/admin`，后端也会自动重定向到对应 Vite 地址。release 二进制仍默认使用 embedded 页面。
+日常前端开发可以直接打开上表里的 Vite 地址；如果访问 debug 后端的 `/ui`，后端也会自动重定向到对应 Vite 地址。release 二进制仍默认使用 embedded 页面。
 
 ## API 端点
 
@@ -620,8 +615,7 @@ VITE_API_PROXY_TARGET=http://127.0.0.1:8990 bash scripts/dev-ui.sh ui
   - `GET /api/admin/audit-logs` - 分页查询后台审计日志
 
 - **Admin UI**
-  - `GET /ui` - 访问新版管理页面。日常开发看 Vite 地址；该路由默认服务 embedded 发布产物。
-  - `GET /admin` - 访问旧版管理页面。日常开发看 Vite 地址；该路由默认服务 embedded 发布产物。
+  - `GET /ui` - 访问管理页面。日常开发看 Vite 地址；该路由默认服务 embedded 发布产物。
 
 ## 注意事项
 
@@ -681,8 +675,7 @@ kiro-rs/
 │   │   └── redis_cache.rs      # Redis 缓存和调度运行态
 │   └── common/                 # 公共模块
 │       └── auth.rs             # 认证工具函数
-├── ui/                         # 新版 UI 前端工程（开发用 Vite，发布产物可嵌入二进制）
-├── admin-ui/                   # 旧版 Admin UI 前端工程（开发用 Vite，发布产物可嵌入二进制）
+├── ui/                         # UI 前端工程（开发用 Vite，发布产物可嵌入二进制）
 ├── tools/                      # 辅助工具
 ├── Cargo.toml                  # 项目配置
 ├── config.example.json         # 配置示例

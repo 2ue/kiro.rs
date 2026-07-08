@@ -429,7 +429,9 @@ export function AddCredentialModal({ open, onClose }: { open: boolean; onClose: 
         } catch (err) {
           toast.warning(`${data.message}，但查询订阅失败: ${extractErrorMessage(err)}`)
         }
-        onClose()
+        setForm(initialCredentialForm())
+        setShowPu(false)
+        setShowPp(false)
       },
       onError: (err) => toast.error(`添加失败: ${extractErrorMessage(err)}`),
     })

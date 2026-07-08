@@ -408,11 +408,13 @@ pub struct UsageRecordQuery {
     pub conversation_id: Option<String>,
     pub credential_id: Option<u64>,
     pub external_pool_id: Option<u64>,
+    pub route_kind: Option<UsageRouteKind>,
     pub model: Option<String>,
     pub status: Option<UsageRecordStatus>,
     pub source: Option<UsageSource>,
     pub stream: Option<bool>,
     pub min_cache_read: Option<i32>,
+    pub min_first_token_latency_ms: Option<u64>,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
 }
@@ -427,11 +429,13 @@ impl Default for UsageRecordQuery {
             conversation_id: None,
             credential_id: None,
             external_pool_id: None,
+            route_kind: None,
             model: None,
             status: None,
             source: None,
             stream: None,
             min_cache_read: None,
+            min_first_token_latency_ms: None,
             since: None,
             until: None,
         }
@@ -2267,6 +2271,11 @@ fn record_matches(record: &UsageRecord, query: &UsageRecordQuery) -> bool {
             return false;
         }
     }
+    if let Some(route_kind) = query.route_kind {
+        if record.route_kind != Some(route_kind) {
+            return false;
+        }
+    }
     if let Some(model) = &query.model {
         if &record.model != model
             && record.upstream_model.as_ref() != Some(model)
@@ -2292,6 +2301,14 @@ fn record_matches(record: &UsageRecord, query: &UsageRecordQuery) -> bool {
     }
     if let Some(min_cache_read) = query.min_cache_read {
         if record.cache_read_input_tokens < min_cache_read {
+            return false;
+        }
+    }
+    if let Some(min_first_token_latency_ms) = query.min_first_token_latency_ms {
+        if record
+            .first_token_latency_ms
+            .map_or(true, |value| value < min_first_token_latency_ms)
+        {
             return false;
         }
     }
@@ -2631,7 +2648,9 @@ mod tests {
         let recorder = UsageRecorder::new(2);
         recorder.record(record("1", 10, UsageSource::UpstreamMetadata));
         recorder.record(record("2", 20, UsageSource::LocalPromptCache));
-        recorder.record(record("3", 30, UsageSource::LocalPromptCache));
+        let mut slow_record = record("3", 30, UsageSource::LocalPromptCache);
+        slow_record.first_token_latency_ms = Some(12_000);
+        recorder.record(slow_record);
 
         let all = recorder.query(UsageRecordQuery::default());
         assert_eq!(all.total, 2);
@@ -2645,6 +2664,13 @@ mod tests {
         let filtered = recorder.query(query);
         assert_eq!(filtered.total, 1);
         assert_eq!(filtered.records[0].id, "3");
+
+        let slow = recorder.query(UsageRecordQuery {
+            min_first_token_latency_ms: Some(10_000),
+            ..Default::default()
+        });
+        assert_eq!(slow.total, 1);
+        assert_eq!(slow.records[0].id, "3");
     }
 
     #[test]

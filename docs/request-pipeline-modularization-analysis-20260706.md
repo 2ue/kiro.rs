@@ -59,9 +59,7 @@
 - `cargo check`
 - `cargo test`：主服务 896 个测试、`kiro_loadtest` 15 个测试通过。
 - `cargo build --release`
-- `pnpm --dir admin-ui build`
 - `pnpm --dir ui build`
-- `node tools/check-admin-ui-api-parity.mjs`
 - `cargo test raw_hints_ignore_nested_model_without_top_level_model -- --nocapture`
 - `cargo test raw_top_level_model_rewrite_preserves_nested_content -- --nocapture`
 - `cargo test external_pool_raw_body_mode_does_not_apply_payload_guard -- --nocapture`
@@ -1057,7 +1055,7 @@ trait RequestProcessor {
 - raw fallback 是否允许在 after-local-attempt 场景使用原始 raw body，同时 usage 记录带上本地尝试诊断。
 - payload guard 完全关闭时，是否所有入口都不会调用 payload guard runtime。
 - 图片轻量模式和现有模式的配置默认值是什么，是否会改变现网默认行为。
-- UI 旧版 `/admin` 和新版 `/ui` 是否都要同步配置分组和文案。
+- `/ui` 配置分组和文案是否覆盖对应能力。
 
 ## 开放问题
 

@@ -19,7 +19,6 @@ Last Verified:
 - `cargo fmt --check`
 - `git diff --check`
 - `pnpm check` in `ui/`
-- `pnpm exec tsc -b --pretty false` in `admin-ui/`
 - `CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc cargo test`
 - `CC=/usr/bin/cc CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc cargo build --release`
 - Temp proxy on `127.0.0.1:19022` against fake upstream on `127.0.0.1:19080`.

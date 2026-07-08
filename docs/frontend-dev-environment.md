@@ -2,21 +2,19 @@
 
 本文档只解决一个问题：本地开发时到底看哪个地址。
 
-结论很简单：开发看 Vite 热更新地址，后端只当 API 服务用。debug 构建下，后端 `/ui`、`/admin` 默认会重定向到对应 Vite 服务，不再依赖 Rust embedded 页面。
+结论很简单：开发看 Vite 热更新地址，后端只当 API 服务用。debug 构建下，后端 `/ui` 默认会重定向到 Vite 服务，不再依赖 Rust embedded 页面。
 
 ## 固定地址
 
 | 目标 | 地址 | 启动命令 | 说明 |
 |------|------|----------|------|
 | 后端 API | `http://127.0.0.1:9022` | 见下方后端启动命令 | 当前仓库本地 `config.json` 的端口。debug 下 `/ui` 等入口会跳到 Vite。 |
-| 新版 UI | `http://127.0.0.1:9023/ui/runtime` | `bash scripts/dev-ui.sh ui` | 主要开发入口，改源码后热更新。 |
-| 旧版 Admin UI | `http://127.0.0.1:9025/admin/` | `bash scripts/dev-ui.sh admin` | 旧版对照。打开后点顶部“配置”。 |
+| UI | `http://127.0.0.1:9023/ui/runtime` | `bash scripts/dev-ui.sh ui` | 主要开发入口，改源码后热更新。 |
 
 如果后端没有跑在 9022，前端支持用 `VITE_API_PROXY_TARGET` 改代理目标：
 
 ```bash
 VITE_API_PROXY_TARGET=http://127.0.0.1:8990 bash scripts/dev-ui.sh ui
-VITE_API_PROXY_TARGET=http://127.0.0.1:8990 bash scripts/dev-ui.sh admin
 ```
 
 ## 推荐启动顺序
@@ -33,15 +31,13 @@ docker compose -f docker-compose.local-infra.yml up -d
 cargo run -- -c config.json --credentials credentials.json
 ```
 
-这样 `9022` 主要承担 API 后端职责。访问 `http://127.0.0.1:9022/ui`、`/admin` 会自动重定向到对应 Vite 服务。
+这样 `9022` 主要承担 API 后端职责。访问 `http://127.0.0.1:9022/ui` 会自动重定向到对应 Vite 服务。
 
 如果你想直接跑 release 二进制但仍走 Vite，可显式指定：
 
 ```bash
 KIRO_NEW_UI_MODE=redirect \
 KIRO_NEW_UI_DEV_SERVER=http://127.0.0.1:9023/ui \
-KIRO_ADMIN_UI_MODE=redirect \
-KIRO_ADMIN_UI_DEV_SERVER=http://127.0.0.1:9025/admin \
   ./target/release/kiro-rs -c config.json --credentials credentials.json
 ```
 
@@ -73,10 +69,9 @@ debug 构建下，后端 UI 入口默认只是跳转到 Vite：
 
 ```text
 http://127.0.0.1:9022/ui       -> http://127.0.0.1:9023/ui/
-http://127.0.0.1:9022/admin    -> http://127.0.0.1:9025/admin/
 ```
 
-热更新由 Vite 提供，所以浏览器最终停留在 `9023` 或 `9025` 才是正常现象。release 二进制默认不会这样跳转，仍使用 embedded 页面。
+热更新由 Vite 提供，所以浏览器最终停留在 `9023` 才是正常现象。release 二进制默认不会这样跳转，仍使用 embedded 页面。
 
 ## 发布验证
 
@@ -84,7 +79,6 @@ http://127.0.0.1:9022/admin    -> http://127.0.0.1:9025/admin/
 
 ```bash
 pnpm --dir ui build
-pnpm --dir admin-ui build
 ```
 
 再重新构建 Rust：
@@ -97,17 +91,16 @@ cargo build --release
 
 ```text
 http://127.0.0.1:9022/ui
-http://127.0.0.1:9022/admin
 ```
 
 如果只是看源码改动，不要走这条路。
 
 ## 常见误区
 
-不要把临时测试端口当成当前 UI 开发入口。本项目本地开发只认这些端口：后端 API `9022`，新版 UI `9023`，旧版 Admin UI `9025`。
+不要把临时测试端口当成当前 UI 开发入口。本项目本地开发只认这些端口：后端 API `9022`，UI `9023`。
 
 不要在开发时说“我已经 pnpm build 了，为什么页面没变”。开发要看 Vite 热更新地址，`pnpm build` 不是开发预览入口。
 
 不要把 `/cc`、`/cc/v1` 和前端页面混在一起。`/cc` 是 Claude Code API 兼容入口，不是前端预览入口。
 
-不要同时开多个来源不明的 UI 服务来对比同一个问题。先按本文档固定入口复现，再判断问题属于新版 UI、旧 Admin UI 还是后端 API。
+不要同时开多个来源不明的 UI 服务来对比同一个问题。先按本文档固定入口复现，再判断问题属于 UI 还是后端 API。

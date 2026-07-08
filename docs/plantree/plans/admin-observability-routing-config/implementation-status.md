@@ -2,7 +2,7 @@
 
 Current Phase: Locally verified implementation
 
-Last Landed: 2026-07-07 request-id/model usage query fixes, supported-model routing for credentials and external pools, opt-in prompt logic retry, and three admin UI updates.
+Last Landed: 2026-07-07 request-id/model usage query fixes, supported-model routing for credentials and external pools, opt-in prompt logic retry, and UI updates.
 
 Next Target: Optional low-volume real upstream smoke for supported-model sync and one allowed/blocked dispatch case, if explicitly requested.
 
@@ -19,7 +19,6 @@ Last Verified:
 - `git diff --check`: pass.
 - `cargo test --locked --no-default-features`: pass with temporary Xcode toolchain env; 920 main tests and 19 `kiro_loadtest` tests passed.
 - `pnpm --dir ui build`: pass.
-- `pnpm --dir admin-ui build`: pass.
 - Fake upstream direct reports:
   - `target/loadtest/admin-routing-normal-stream.json`: 6/6 HTTP 200.
   - `target/loadtest/admin-routing-normal-non-stream.json`: 6/6 HTTP 200.

@@ -263,7 +263,6 @@ costFloorDelta = 0
    - 执行 usage 明细清理后再次查询 dashboard，确认统计仍保留。
 
 3. 前端：
-   - `admin-ui` build。
    - `ui` build。
 
 ## 实现过程中的自检清单
