@@ -1026,6 +1026,14 @@ impl SseStateManager {
             .is_some_and(|b| b.started && !b.stopped && b.block_type == expected_type)
     }
 
+    pub fn active_open_block_for_keepalive(&self) -> Option<(i32, String)> {
+        self.active_blocks
+            .iter()
+            .filter(|(_, block)| block.started && !block.stopped)
+            .min_by_key(|(index, _)| *index)
+            .map(|(index, block)| (*index, block.block_type.clone()))
+    }
+
     /// 获取下一个块索引
     pub fn next_block_index(&mut self) -> i32 {
         let index = self.next_block_index;
@@ -2332,6 +2340,34 @@ impl StreamContext {
         )
     }
 
+    pub fn claude_code_noop_delta_keepalive_event(&self) -> Option<SseEvent> {
+        let (index, block_type) = self.state_manager.active_open_block_for_keepalive()?;
+        let delta = match block_type.as_str() {
+            "text" => json!({
+                "type": "text_delta",
+                "text": ""
+            }),
+            "thinking" => json!({
+                "type": "thinking_delta",
+                "thinking": ""
+            }),
+            "tool_use" => json!({
+                "type": "input_json_delta",
+                "partial_json": ""
+            }),
+            _ => return None,
+        };
+
+        Some(SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": delta
+            }),
+        ))
+    }
+
     /// 创建官方 Anthropic extended-thinking 签名 delta。
     fn create_signature_delta_event(&self, index: i32, signature: &str) -> SseEvent {
         SseEvent::new(
@@ -2634,6 +2670,13 @@ impl StreamContext {
                 events.extend(self.create_text_delta_events(&buffer_content));
             }
             self.thinking_buffer.clear();
+        }
+
+        if self.stream_error.is_some() {
+            if !self.invoke_sniff_buffer.is_empty() {
+                events.extend(self.drain_invoke_sniff_buffer(true));
+            }
+            events.extend(self.emit_queued_leaked_tool_uses());
         }
 
         if let Some((error_type, raw_message)) = self.stream_error.take() {
@@ -3514,6 +3557,74 @@ mod tests {
         assert!(!message.contains("upstream"));
         assert!(!message.contains("billing"));
         assert!(!message.contains("routing"));
+    }
+
+    #[test]
+    fn stream_error_flushes_held_invoke_sniff_text_before_error() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut all_events = Vec::new();
+        all_events.extend(ctx.process_assistant_response(
+            "visible text before protocol tail <function_calls>\n<inv",
+        ));
+        ctx.record_stream_error("api_error", "upstream stream read error");
+        all_events.extend(ctx.generate_final_events());
+
+        let text = collect_text_content(&all_events);
+        assert!(
+            text.contains("<function_calls>\n<inv"),
+            "held invoke sniff text should be flushed before the stream error: {text:?}"
+        );
+        assert!(
+            all_events
+                .iter()
+                .all(|event| event.event != "message_delta" && event.event != "message_stop"),
+            "error streams should not also emit normal final message events"
+        );
+        let error_index = all_events
+            .iter()
+            .position(|event| event.event == "error")
+            .expect("error event should be present");
+        let flushed_text_index = all_events
+            .iter()
+            .position(|event| {
+                event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "text_delta"
+                    && event.data["delta"]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("<function_calls>\n<inv"))
+            })
+            .expect("flushed text delta should be present");
+        assert!(
+            flushed_text_index < error_index,
+            "buffered text must be emitted before the error event"
+        );
+    }
+
+    #[test]
+    fn claude_code_noop_keepalive_matches_open_block_type() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let _initial_events = ctx.generate_initial_events();
+
+        let text_keepalive = ctx
+            .claude_code_noop_delta_keepalive_event()
+            .expect("initial text block should have keepalive");
+        assert_eq!(text_keepalive.event, "content_block_delta");
+        assert_eq!(text_keepalive.data["delta"]["type"], "text_delta");
+        assert_eq!(text_keepalive.data["delta"]["text"], "");
+
+        let _tool_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "test_tool".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: "{}".to_string(),
+            stop: false,
+        });
+        let tool_keepalive = ctx
+            .claude_code_noop_delta_keepalive_event()
+            .expect("open tool_use block should have keepalive");
+        assert_eq!(tool_keepalive.data["delta"]["type"], "input_json_delta");
+        assert_eq!(tool_keepalive.data["delta"]["partial_json"], "");
     }
 
     #[test]

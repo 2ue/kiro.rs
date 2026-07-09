@@ -4432,6 +4432,8 @@ async fn post_messages_inner(
     usage_context.set_capacity_weight_units(capacity_weight_units);
 
     if payload.stream {
+        let claude_code_noop_delta_keepalive =
+            should_use_claude_code_noop_delta_keepalive(request_user_agent(&headers));
         // 流式响应
         handle_stream_request(
             provider,
@@ -4456,6 +4458,7 @@ async fn post_messages_inner(
             external_fallback,
             runtime_config.kiro_upstream_stream_idle_timeout_secs,
             capacity_weight_units,
+            claude_code_noop_delta_keepalive,
         )
         .await
     } else {
@@ -4704,6 +4707,7 @@ async fn handle_stream_request(
     external_fallback: Option<ExternalFallbackContext>,
     stream_idle_timeout_secs: u64,
     capacity_weight_units: u32,
+    claude_code_noop_delta_keepalive: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let mut usage_context = usage_context;
@@ -5165,6 +5169,7 @@ async fn handle_stream_request(
         completion,
         credential_usage,
         stream_idle_timeout_secs,
+        claude_code_noop_delta_keepalive,
     );
 
     // 返回 SSE 响应
@@ -5181,6 +5186,58 @@ const PING_INTERVAL_SECS: u64 = 5;
 /// 上游 eventstream 默认读空闲超时（180秒）
 const DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECS: u64 = 180;
 const JSON_STREAM_ERROR_SNIFF_MAX_BYTES: usize = 64 * 1024;
+const CLAUDE_CODE_NOOP_DELTA_KEEPALIVE_MIN_VERSION: &str = "2.1.193";
+
+fn request_user_agent(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+}
+
+fn should_use_claude_code_noop_delta_keepalive(user_agent: Option<&str>) -> bool {
+    let Some(version) = user_agent.and_then(extract_claude_code_cli_version) else {
+        return false;
+    };
+    compare_three_part_semver(version, CLAUDE_CODE_NOOP_DELTA_KEEPALIVE_MIN_VERSION)
+        .is_some_and(|ordering| ordering != std::cmp::Ordering::Less)
+}
+
+fn extract_claude_code_cli_version(user_agent: &str) -> Option<&str> {
+    const PREFIX: &str = "claude-cli/";
+    let trimmed = user_agent.trim();
+    let prefix = trimmed.get(..PREFIX.len())?;
+    if !prefix.eq_ignore_ascii_case(PREFIX) {
+        return None;
+    }
+    let rest = &trimmed[PREFIX.len()..];
+    let end = rest
+        .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .unwrap_or(rest.len());
+    let version = &rest[..end];
+    parse_three_part_semver(version).map(|_| version)
+}
+
+fn compare_three_part_semver(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    let a = parse_three_part_semver(a)?;
+    let b = parse_three_part_semver(b)?;
+    Some(a.cmp(&b))
+}
+
+fn parse_three_part_semver(version: &str) -> Option<[u32; 3]> {
+    let mut result = [0_u32; 3];
+    let mut parts = version.split('.');
+    for slot in &mut result {
+        let part = parts.next()?;
+        if part.is_empty() || !part.chars().all(|ch| ch.is_ascii_digit()) {
+            return None;
+        }
+        *slot = part.parse().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(result)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct JsonStreamError {
@@ -5447,6 +5504,7 @@ fn create_sse_stream(
     completion: KiroStreamCompletion,
     usage_context: CredentialUsageContext,
     stream_idle_timeout_secs: u64,
+    claude_code_noop_delta_keepalive: bool,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let usage_guard = StreamUsageGuard::new(usage_context);
     let stream_idle_timeout_secs = normalize_stream_idle_timeout_secs(stream_idle_timeout_secs);
@@ -5479,7 +5537,7 @@ fn create_sse_stream(
             Instant::now() + Duration::from_secs(stream_idle_timeout_secs),
             stream_idle_timeout_secs,
         ),
-        |(
+        move |(
             mut body_stream,
             mut ctx,
             mut decoder,
@@ -5746,8 +5804,23 @@ fn create_sse_stream(
                 }
                 // 发送 ping 保活
                 _ = ping_interval.tick() => {
-                    tracing::trace!("发送 ping 保活事件");
-                    let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
+                    let keepalive = if claude_code_noop_delta_keepalive {
+                        ctx.claude_code_noop_delta_keepalive_event()
+                            .map(|event| Bytes::from(event.to_sse_string()))
+                    } else {
+                        None
+                    };
+                    let bytes = match keepalive {
+                        Some(bytes) => {
+                            tracing::trace!("发送 Claude Code 空 delta 保活事件");
+                            bytes
+                        }
+                        None => {
+                            tracing::trace!("发送 ping 保活事件");
+                            create_ping_sse()
+                        }
+                    };
+                    let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(bytes)];
                     Some((stream::iter(bytes), (body_stream, ctx, decoder, json_sniffer, false, completion, usage_guard, ping_interval, idle_deadline, stream_idle_timeout_secs)))
                 }
             }
@@ -7030,6 +7103,27 @@ mod tests {
             }
             _ => panic!("expected split JSON stream error"),
         }
+    }
+
+    #[test]
+    fn claude_code_noop_delta_keepalive_is_version_gated() {
+        assert_eq!(
+            extract_claude_code_cli_version("claude-cli/2.1.197 (external, cli)"),
+            Some("2.1.197")
+        );
+        assert!(should_use_claude_code_noop_delta_keepalive(Some(
+            "claude-cli/2.1.193 (external, cli)"
+        )));
+        assert!(should_use_claude_code_noop_delta_keepalive(Some(
+            "Claude-CLI/2.1.197 (Claude Code)"
+        )));
+        assert!(!should_use_claude_code_noop_delta_keepalive(Some(
+            "claude-cli/2.1.192 (external, cli)"
+        )));
+        assert!(!should_use_claude_code_noop_delta_keepalive(Some(
+            "curl/8.0"
+        )));
+        assert!(!should_use_claude_code_noop_delta_keepalive(None));
     }
 
     #[tokio::test]

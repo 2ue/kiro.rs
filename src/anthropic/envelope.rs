@@ -136,6 +136,7 @@ pub(crate) fn sse_builder_with_id(request_id: &str) -> axum::http::response::Bui
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
+        .header("x-accel-buffering", "no")
         .header("request-id", request_id)
         .header("anthropic-request-id", request_id)
 }
@@ -166,6 +167,15 @@ mod tests {
 
         assert_eq!(headers["request-id"], "req_existing");
         assert_eq!(headers["anthropic-request-id"], "req_01abc");
+    }
+
+    #[test]
+    fn sse_builder_disables_proxy_buffering() {
+        let response = sse_builder_with_id("req_01abc")
+            .body(())
+            .expect("SSE response should build");
+
+        assert_eq!(response.headers()["x-accel-buffering"], "no");
     }
 
     #[test]

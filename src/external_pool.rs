@@ -1803,6 +1803,7 @@ impl ExternalPoolManager {
             let stream = Body::from_stream(stream);
             let mut builder = Response::builder().status(status);
             apply_forwarded_response_headers(&mut builder, &response_headers, &route.request_id);
+            disable_proxy_buffering_for_stream_response(&mut builder);
             let response = builder.body(stream).map_err(|err| {
                 ExternalForwardError::new(
                     ExternalPoolError {
@@ -3468,6 +3469,16 @@ fn apply_forwarded_response_headers(
     envelope::insert_request_id_headers(out, request_id);
 }
 
+fn disable_proxy_buffering_for_stream_response(builder: &mut axum::http::response::Builder) {
+    let Some(out) = builder.headers_mut() else {
+        return;
+    };
+    out.insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+}
+
 fn external_final_error_from_error(
     pool: Option<&ExternalPool>,
     attempts: Vec<ExternalPoolAttempt>,
@@ -4766,6 +4777,23 @@ mod tests {
             supported_models: Vec::new(),
             notes: None,
         }
+    }
+
+    #[test]
+    fn stream_response_headers_disable_proxy_buffering() {
+        let mut upstream_headers = HeaderMap::new();
+        upstream_headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+
+        let mut builder = Response::builder().status(StatusCode::OK);
+        apply_forwarded_response_headers(&mut builder, &upstream_headers, "req_01abc");
+        disable_proxy_buffering_for_stream_response(&mut builder);
+        let response = builder.body(()).expect("response should build");
+
+        assert_eq!(response.headers()["x-accel-buffering"], "no");
+        assert_eq!(response.headers()["request-id"], "req_01abc");
     }
 
     #[test]
